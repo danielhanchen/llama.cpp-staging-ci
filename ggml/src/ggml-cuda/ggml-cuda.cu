@@ -3646,6 +3646,67 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// Size of one ggml_cuda_q8_1_cache slot for this graph, 0 if no activation is read by more than one
+// mul_mat_vec_q candidate (then the cache stays off and nothing changes).
+static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph) {
+    static const bool disabled = [] {
+        const char * env = getenv("GGML_CUDA_DISABLE_Q8_1_CACHE");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    if (disabled) {
+        return 0;
+    }
+
+    auto is_candidate = [](const ggml_tensor * node) {
+        if ((node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+        const ggml_tensor * src0 = node->src[0];
+        const ggml_tensor * src1 = node->src[1];
+        if (!ggml_is_quantized(src0->type) || src1->type != GGML_TYPE_F32 || src1->data == nullptr) {
+            return false;
+        }
+        // mul_mat_vec_q batch sizes
+        const int64_t ncols = node->op == GGML_OP_MUL_MAT ? src1->ne[1] : src1->ne[2];
+        return ncols <= MMVQ_MAX_BATCH_SIZE && ggml_nrows(src1) <= 8*MMVQ_MAX_BATCH_SIZE;
+    };
+
+    std::unordered_map<const void *, int> n_readers;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (is_candidate(cgraph->nodes[i])) {
+            n_readers[cgraph->nodes[i]->src[1]->data]++;
+        }
+    }
+
+    size_t slot_size = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (!is_candidate(node) || n_readers[node->src[1]->data] < 2) {
+            continue;
+        }
+        const ggml_tensor * src1 = node->src[1];
+        const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+        slot_size = std::max(slot_size, (size_t) (ggml_nrows(src1)*ne10_padded/QK8_1*sizeof(block_q8_1)));
+    }
+    return GGML_PAD(slot_size, 256);
+}
+
+// the nodes [i, i + n) are done: drop the cached q8_1 activations they may have overwritten
+static void ggml_cuda_q8_1_cache_node_done(ggml_cuda_q8_1_cache & cache, const ggml_cgraph * cgraph, int i, int n) {
+    if (!cache.active()) {
+        return;
+    }
+    for (int j = i; j < i + n; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (node->op == GGML_OP_OPT_STEP_ADAMW || node->op == GGML_OP_OPT_STEP_SGD) {
+            cache.invalidate_all(); // update src[0] in place
+        }
+        if (node->data != nullptr) {
+            cache.invalidate(node->data, ggml_nbytes(node));
+        }
+    }
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4538,6 +4599,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            // q8_1 activation cache, see ggml_cuda_q8_1_cache; the arena lives for the whole evaluation
+            ggml_cuda_pool_alloc<char> q8_1_cache_arena(cuda_ctx->pool());
+            {
+                const size_t slot_size = stream_ctx.concurrent_events.empty() ? ggml_cuda_q8_1_cache_slot_size(cgraph) : 0;
+                if (slot_size > 0) {
+                    cuda_ctx->q8_1_cache.begin(q8_1_cache_arena.alloc(ggml_cuda_q8_1_cache::n_slots*slot_size), slot_size);
+                }
+            }
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4589,6 +4659,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
+                    ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, nodes_to_skip + 1);
                     i += nodes_to_skip;
                     continue;
                 }
@@ -4615,10 +4686,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 GGML_ASSERT(ok);
 
+                ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 1);
+
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
             }
+
+            cuda_ctx->q8_1_cache.end();
         }
 
 #ifdef USE_CUDA_GRAPH

@@ -7747,6 +7747,77 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 };
 
+// Several quantized mat-vec products consuming the same activation (Q/K/V, routed + shared experts),
+// optionally with an in-place op overwriting the activation between the consumers.
+struct test_mul_mat_vec_shared_src1 : public test_case {
+    const ggml_type type_a;
+    const ggml_type type_b; // type of the second dense weight (e.g. V of a different quant type)
+    const int64_t m;        // tokens
+    const int64_t n;        // output rows
+    const int64_t k;
+    const bool inplace;     // overwrite the activation in place before the last consumer
+    const bool norm;        // activation produced by a (fused) rms_norm + mul
+
+    static constexpr int n_mats = 8;
+    static constexpr int n_used = 2;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, type_b, m, n, k, inplace, norm);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_VEC_SHARED_SRC1";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_mul_mat_vec_shared_src1(ggml_type type_a, ggml_type type_b, int64_t m, int64_t n, int64_t k, bool inplace, bool norm)
+        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), inplace(inplace), norm(norm) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        ggml_tensor * wa = ggml_new_tensor_2d(ctx, type_a, k, n);
+        ggml_tensor * wb = ggml_new_tensor_2d(ctx, type_b, k, n);
+        ggml_tensor * wc = ggml_new_tensor_2d(ctx, type_a, k, n);
+        ggml_tensor * we = ggml_new_tensor_3d(ctx, type_a, k, n, n_mats);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, m);
+
+        // a non-leaf activation so that it lives in the compute buffer like in a model
+        ggml_tensor * act;
+        if (norm) {
+            ggml_tensor * w_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+            act = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w_norm);
+        } else {
+            act = ggml_scale(ctx, x, 0.5f);
+        }
+
+        ggml_tensor * a = ggml_mul_mat(ctx, wa, act);
+        ggml_tensor * b = ggml_mul_mat(ctx, wb, act);
+        ggml_tensor * e = ggml_mul_mat_id(ctx, we, ggml_reshape_3d(ctx, act, k, 1, m), ids); // [n, n_used, m]
+        ggml_tensor * e0 = ggml_view_2d(ctx, e, n, m, e->nb[2], 0);
+
+        ggml_tensor * out = ggml_add(ctx, ggml_add(ctx, a, b), e0);
+        if (inplace) {
+            // runs after a, b, e: the last consumer must see the scaled activation
+            ggml_tensor * act2 = ggml_scale_inplace(ctx, act, -2.0f);
+            out = ggml_add(ctx, out, ggml_mul_mat(ctx, wc, act2));
+        } else {
+            out = ggml_add(ctx, out, ggml_mul_mat(ctx, wc, act));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+
+    double max_nmse_err() override {
+        return 5e-3;
+    }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -11878,6 +11949,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
+    }
+
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS }) {
+        for (int64_t m : { 1, 3, 8 }) {
+            for (bool inplace : { false, true }) {
+                for (bool norm : { false, true }) {
+                    test_cases.emplace_back(new test_mul_mat_vec_shared_src1(type, type, m, 64, 256, inplace, norm));
+                    test_cases.emplace_back(new test_mul_mat_vec_shared_src1(type, GGML_TYPE_Q6_K, m, 64, 512, inplace, norm));
+                    // rows that are not a multiple of the rms_norm block size, padding of the q8_1 rows
+                    test_cases.emplace_back(new test_mul_mat_vec_shared_src1(type, type, m, 64, 1280, inplace, norm));
+                }
+            }
+        }
     }
 
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.

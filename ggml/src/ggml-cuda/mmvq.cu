@@ -1528,12 +1528,37 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    const size_t  q8_1_size   = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    ggml_cuda_pool_alloc<char> src1_q8_1_alloc(ctx.pool());
+    char * src1_q8_1 = nullptr;
     {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+
+        // reuse the q8_1 copy of src1 if an earlier mul_mat_vec_q of this graph already quantized it
+        bool quantized = false;
+        if (ctx.curr_stream_no == 0) {
+            // the q8_1 rows are written in logical order: a contiguous src1 only depends on the number of rows,
+            // e.g. [ne10, 1, n_tokens] for MUL_MAT_ID and [ne10, n_tokens] for MUL_MAT share one copy
+            const bool    contiguous = ggml_is_contiguous(src1);
+            const int64_t key[ggml_cuda_q8_1_cache::n_key] = {
+                ne10,
+                contiguous ? ne11*ne12*ne13 : ne11,
+                contiguous ? 1 : ne12,
+                contiguous ? 1 : ne13,
+                contiguous || ne11 == 1 ? 0 : s11,
+                contiguous || ne12 == 1 ? 0 : s12,
+                contiguous || ne13 == 1 ? 0 : s13,
+            };
+            src1_q8_1 = ctx.q8_1_cache.get(src1->data, ggml_nbytes(src1), key, q8_1_size, quantized);
+        }
+        if (src1_q8_1 == nullptr) {
+            src1_q8_1 = src1_q8_1_alloc.alloc(q8_1_size);
+        }
+        if (!quantized) {
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1559,7 +1584,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
