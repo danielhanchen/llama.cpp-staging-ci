@@ -637,6 +637,8 @@ static __global__ void mul_mat_vec_q(
     uint32_t channel_y;
     uint32_t sample_dst;
 
+    // let the next kernel launch while this one runs, its ggml_cuda_pdl_sync() still waits for the completion
+    ggml_cuda_pdl_lc();
     ggml_cuda_pdl_sync();
     channel_x  = shared_expert ? 0 : ncols_dst == 1 && ids ? ids[channel_dst] : fastdiv(channel_dst, channel_ratio);
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
