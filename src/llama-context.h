@@ -407,7 +407,8 @@ private:
     bool moe_cache_seed         = false;
     bool moe_cache_seed_prev    = false;
     bool moe_cache_record       = false;
-    bool moe_cache_seed_enabled = true; // LLAMA_MOE_CACHE_SEED
+    bool moe_cache_seed_enabled = true; // LLAMA_MOE_CACHE_SEED != 0
+    bool moe_cache_seed_sync    = false; // LLAMA_MOE_CACHE_SEED=2: a prefetched ubatch without an earlier routing seeds from its own ids
 
     // value of moe_cache_seed when the current graph was allocated: the scheduler plans the copies of the experts with it
     bool moe_cache_seed_graph = false;
