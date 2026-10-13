@@ -39,6 +39,7 @@ public:
 
     // the cache may lend slots (LLAMA_MOE_CACHE_LEND)
     bool lends() const;
+    bool lends_graph() const; // the graph allocator may borrow too (LLAMA_MOE_CACHE_LEND=2)
 
     // the largest ubatch (at most n_small_max tokens) whose experts every cached layer reads from the cache without copying them
     int64_t n_tokens_cached() const;

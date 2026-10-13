@@ -362,7 +362,8 @@ struct llama_moe_cache::impl {
     ggml_context_ptr ctx_views;
 
     // lending (see lend): LLAMA_MOE_CACHE_LEND=0 off, 1 on with one cache device, 2 also with several (not validated)
-    int    lend_mode    = 1;
+    int    lend_mode    = 1;     // LLAMA_MOE_CACHE_LEND: 0 off, 1 staging copies, 2 also the graph allocator (experimental)
+    bool   lend_multi   = false; // LLAMA_MOE_CACHE_LEND_MULTI=1: also with the cache on several devices (not validated)
     bool   lend_off_log = false;
     size_t n_lends      = 0; // graphs whose staging copies used lent slots
     int32_t lend_max    = 0; // most slots lent at once
@@ -403,6 +404,8 @@ struct llama_moe_cache::impl {
         {
             const char * env = getenv("LLAMA_MOE_CACHE_LEND");
             lend_mode = env == nullptr ? 1 : atoi(env);
+            env = getenv("LLAMA_MOE_CACHE_LEND_MULTI");
+            lend_multi = env != nullptr && atoi(env) != 0;
         }
         {
             const char * env = getenv("LLAMA_MOE_CACHE_REFILL");
@@ -902,9 +905,9 @@ struct llama_moe_cache::impl {
         if (lend_mode == 0) {
             return;
         }
-        if (lend_mode != 2 && std::count_if(devices.begin(), devices.end(), [](const device & d) { return d.host_bytes > 0 && d.buf; }) > 1) {
+        if (!lend_multi && std::count_if(devices.begin(), devices.end(), [](const device & d) { return d.host_bytes > 0 && d.buf; }) > 1) {
             if (!lend_off_log) {
-                LLAMA_LOG_INFO("%s: MoE cache on several devices: the cache does not lend slots to the staging copies (LLAMA_MOE_CACHE_LEND=2 to force)\n", __func__);
+                LLAMA_LOG_INFO("%s: MoE cache on several devices: the cache does not lend slots to the staging copies (LLAMA_MOE_CACHE_LEND_MULTI=1 to force)\n", __func__);
                 lend_off_log = true;
             }
             return;
@@ -923,11 +926,12 @@ struct llama_moe_cache::impl {
         }
         group & g = *gl;
 
-        // LLAMA_MOE_CACHE_LEND=3: only the copies (debug), the graph allocator keeps its own buffer
+        // the graph allocator borrows only with LLAMA_MOE_CACHE_LEND=2 (experimental: outputs were seen to differ with the CUDA
+        // copy-queue kernel, see plans/impl_moe_vram_lend.md), by default it keeps its own buffer
         std::vector<ggml_backend_sched_lend_copy> only;
         ggml_backend_sched_lend_copy * all = copies;
         const int n_all = n_copies;
-        if (lend_mode == 3 && n_copies > 0 && copies[0].ordinal < 0) {
+        if (lend_mode != 2 && n_copies > 0 && copies[0].ordinal < 0) {
             only.assign(copies + 1, copies + n_copies);
             copies   = only.data();
             n_copies = (int) only.size();
@@ -1578,6 +1582,10 @@ void llama_moe_cache::lend(ggml_backend_t backend, ggml_backend_sched_lend_copy 
 
 bool llama_moe_cache::lends() const {
     return pimpl->lend_mode != 0;
+}
+
+bool llama_moe_cache::lends_graph() const {
+    return pimpl->lend_mode == 2;
 }
 
 int64_t llama_moe_cache::n_tokens_cached() const {

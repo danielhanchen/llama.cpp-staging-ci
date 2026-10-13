@@ -829,7 +829,7 @@ void llama_context::sched_reserve() {
         // the MoE cache lends memory to larger graphs (see llama_moe_cache::lend), the compute buffer must hold without it the small
         // batches whose experts are all read from the cache (larger ones copy experts, like the prompts, and may borrow)
         const uint32_t n_tokens_small = moe_cache ? std::min<uint32_t>(n_tokens, (uint32_t) moe_cache->n_tokens_cached()) : 0;
-        if (moe_cache && moe_cache->lends() && !model.hparams.no_alloc && n_tokens_small > n_seqs && n_tokens_small % n_seqs == 0) {
+        if (moe_cache && moe_cache->lends_graph() && !model.hparams.no_alloc && n_tokens_small > n_seqs && n_tokens_small % n_seqs == 0) {
             if (!graph_reserve(n_tokens_small, n_seqs, std::min(n_tokens_small, cparams.n_outputs_max), mctx.get())) {
                 throw std::runtime_error("failed to allocate compute small batch buffers");
             }
@@ -859,7 +859,7 @@ void llama_context::sched_reserve() {
 
         // the ubatch that seeds the MoE cache keeps the experts it copies in the graph allocation (see sched_copy_all_experts), it needs
         // more memory: when the cache lends memory to large graphs, this one must fit too, else the compute buffer holds it from the start
-        if (moe_cache && moe_cache->lends() && moe_cache_seed_enabled && !model.hparams.no_alloc && n_tokens > llama_moe_cache::n_small_max) {
+        if (moe_cache && moe_cache->lends_graph() && moe_cache_seed_enabled && !model.hparams.no_alloc && n_tokens > llama_moe_cache::n_small_max) {
             moe_cache_seed = true;
             gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             moe_cache_seed = false;

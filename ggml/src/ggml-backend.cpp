@@ -2396,6 +2396,31 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
             }
         }
         GGML_ASSERT(c == n_copies);
+        // GGML_SCHED_LEND_CHECK=1 (debug): the placements of copies that are live together must not overlap
+        static const bool lend_check = getenv("GGML_SCHED_LEND_CHECK") != nullptr && atoi(getenv("GGML_SCHED_LEND_CHECK")) != 0;
+        if (lend_check && !dry) {
+            int n_bad = 0;
+            for (int i = 0; i < n_copies; i++) {
+                const struct ggml_backend_sched_lend_copy & a = pf->lend_copies[i];
+                if (a.buffer == NULL) {
+                    continue;
+                }
+                for (int j = i + 1; j < n_copies; j++) {
+                    const struct ggml_backend_sched_lend_copy & d = pf->lend_copies[j];
+                    if (d.buffer != a.buffer) {
+                        continue;
+                    }
+                    const bool live = a.ordinal < 0 || d.ordinal < 0 || abs(a.ordinal - d.ordinal) < sched->pf_depth;
+                    if (live && a.offset < d.offset + d.size && d.offset < a.offset + a.size) {
+                        if (n_bad++ < 4) {
+                            GGML_LOG_ERROR("%s: lent placements overlap: [%zu, %zu) ordinal %d and [%zu, %zu) ordinal %d\n", __func__,
+                                a.offset, a.offset + a.size, a.ordinal, d.offset, d.offset + d.size, d.ordinal);
+                        }
+                    }
+                }
+            }
+            GGML_LOG_INFO("%s: lend check: %d copies, %d overlaps\n", __func__, n_copies, n_bad);
+        }
         if (!dry) {
             pf->lent = staging_all - ggml_backend_sched_prefetch_staging(sched, b);
         }
