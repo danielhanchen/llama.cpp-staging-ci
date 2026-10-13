@@ -378,14 +378,15 @@ llama_context::llama_context(
         const char * GGML_SCHED_PREFETCH           = getenv("GGML_SCHED_PREFETCH");
         const char * GGML_SCHED_PREFETCH_MIN_BATCH = getenv("GGML_SCHED_PREFETCH_MIN_BATCH");
         // LLAMA_MOE_CACHE_SEED=0 disables the seed of the MoE cache at the end of a prompt
-        // =2 also seeds a prefetched ubatch from its own ids (its expert copies then wait for the router of each layer)
+        // =2 also seeds a prefetched ubatch from its own ids, read before its copies (they then wait for the router of each layer)
         const char * LLAMA_MOE_CACHE_SEED = getenv("LLAMA_MOE_CACHE_SEED");
         moe_cache_seed_enabled = LLAMA_MOE_CACHE_SEED == nullptr || atoi(LLAMA_MOE_CACHE_SEED) != 0;
         moe_cache_seed_sync    = LLAMA_MOE_CACHE_SEED != nullptr && atoi(LLAMA_MOE_CACHE_SEED) == 2;
-        // =3: no seed from the own ids of a prefetched ubatch (only from the routing of an earlier ubatch of the prompt)
+        // =3: a prefetched ubatch also seeds from its own ids, each layer once it is computed (lagged, the copies do not wait, but the
+        // host waits for each layer two splits back, which can starve the device); default (=1): only from the routing of an earlier ubatch
         // the lagged seed needs the layer of a staged copy to be queued for compute when a later copy reuses its staging slot (depth <= 2)
         const char * GGML_SCHED_PREFETCH_DEPTH = getenv("GGML_SCHED_PREFETCH_DEPTH");
-        moe_cache_seed_lag_ok  = (LLAMA_MOE_CACHE_SEED == nullptr || atoi(LLAMA_MOE_CACHE_SEED) == 1) &&
+        moe_cache_seed_lag_ok  = LLAMA_MOE_CACHE_SEED != nullptr && atoi(LLAMA_MOE_CACHE_SEED) == 3 &&
                                  (GGML_SCHED_PREFETCH_DEPTH == nullptr || atoi(GGML_SCHED_PREFETCH_DEPTH) <= 2);
 
         if (GGML_SCHED_PREFETCH && atoi(GGML_SCHED_PREFETCH) == 0) {
@@ -3134,8 +3135,9 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
     moe_cache_ids.clear();
 
     // the last large ubatch of the batch seeds the cache even without outputs: a caller may run the last prompt tokens as a separate small batch (e.g. server checkpoints)
-    // a prefetched ubatch seeds from the routing of the previous large ubatch, so its copies do not wait for its ids; without one it does not seed
-    // (reading its own ids first would serialize the expert uploads with the compute of every layer), unless LLAMA_MOE_CACHE_SEED=2
+    // a prefetched ubatch seeds from the routing of the previous large ubatch, so its copies do not wait for its ids; without one it does not
+    // seed (reading its own ids first would serialize the expert uploads with the compute of every layer), unless LLAMA_MOE_CACHE_SEED=2
+    // (own ids, read first) or =3 (own ids, lagged)
     // a ubatch below the prefetch threshold reads its ids for its copies anyway, it seeds from them
     moe_cache_record    = large && prefetch_min_batch != INT64_MAX;
     moe_cache_seed      = false;
