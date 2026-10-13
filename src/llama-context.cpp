@@ -1532,6 +1532,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         moe_cache->hybrid_probe(backend_cpu);
         ggml_backend_sched_set_overlap(sched.get(), moe_cache->hybrid_active());
     }
+    // auto mode: the first small batches count the misses of the plain cache, then the hybrid path is turned on or off
+    if (moe_cache && moe_cache->hybrid_window_pending()) {
+        ggml_backend_sched_synchronize(sched.get());
+        if (moe_cache->hybrid_tick(ubatch.n_tokens)) {
+            ggml_backend_sched_set_overlap(sched.get(), true);
+        }
+    }
 
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
@@ -1544,7 +1551,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     // the copies of the experts are planned with the seed mode of the MoE cache (see sched_copy_all_experts)
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams) && moe_cache_seed_graph == moe_cache_seed) {
+    const bool moe_cache_hybrid = moe_cache && moe_cache->hybrid_active();
+    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams) && moe_cache_seed_graph == moe_cache_seed &&
+            moe_cache_hybrid_graph == moe_cache_hybrid) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1581,8 +1590,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        gf_res_prev_active   = res;
-        moe_cache_seed_graph = moe_cache_seed;
+        gf_res_prev_active     = res;
+        moe_cache_seed_graph   = moe_cache_seed;
+        moe_cache_hybrid_graph = moe_cache_hybrid;
     }
 
     // set the input data for the input tensors

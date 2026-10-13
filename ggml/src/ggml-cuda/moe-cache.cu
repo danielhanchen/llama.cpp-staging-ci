@@ -5,12 +5,13 @@
 
 // device-side lookup of the MoE expert cache, see ggml_moe_cache_lookup and llama-moe-cache.cpp
 //
-// state: [0] CLOCK hand, [1] epoch (one per lookup), [2..3] hits, [4..5] misses, [6..7] unused, then key_of, ref and pin [n_slots]
+// state: [0] CLOCK hand, [1] epoch (one per lookup), [2..3] hits, [4..5] misses, [6] filled slots (hybrid only), [7] unused, then key_of, ref and pin [n_slots]
 // key_of: il*n_expert + expert (-1 if empty); ref: CLOCK reference bits; pin: epoch of the last lookup using the slot (that lookup does not evict it)
 // dst:   slots[n_ids], then a row starting with the number of copied experts, then their experts[n_ids] and slots[n_ids]
 //
 // hybrid (ggml_moe_cache_assign): counts [n_expert, n_layer + 1] use counters, last row: [0..1] experts left to the host, [2] fetch accumulator (1/65536)
 // only a share of the missing experts is admitted (fetch_q/65536, error diffused), the ones with the highest counters, ties by expert id
+// (all of them while the cache has empty slots: filling an empty slot evicts nothing)
 // the others keep slot -1 and are written to host_ids, after the slots and the copy list
 
 #define MOE_CACHE_HDR   8
@@ -117,7 +118,7 @@ static __global__ void moe_cache_assign(
     if (counts != nullptr) {
         take_e = victim + n_ids;
         const int64_t acc = (int64_t) (uint32_t) stat[2] + (int64_t) fetch_q*n_miss;
-        n_take = (int) (acc >> 16);
+        n_take = max((int) (acc >> 16), min(n_miss, n_slots - state[6]));
         int n_sel = 0;
         for (int j0 = 0; j0 < n_miss; j0 += MOE_CACHE_LANES) {
             const int j = j0 + lane;
@@ -190,12 +191,15 @@ static __global__ void moe_cache_assign(
     }
 
     // evict and insert
+    int n_new = 0; // empty slots filled
     for (int j = lane; j < n_take; j += MOE_CACHE_LANES) {
         const int32_t s   = victim[j];
         const int32_t e   = take_e[j];
         const int32_t old = key_of[s];
         if (old >= 0) {
             map[old] = -1;
+        } else {
+            n_new++;
         }
         key_of[s] = il*n_expert + e;
         ref[s]    = 1;
@@ -217,8 +221,12 @@ static __global__ void moe_cache_assign(
 
     for (int off = MOE_CACHE_LANES/2; off > 0; off >>= 1) {
         n_hit += __shfl_xor_sync(full, n_hit, off, MOE_CACHE_LANES);
+        n_new += __shfl_xor_sync(full, n_new, off, MOE_CACHE_LANES);
     }
     if (lane == 0) {
+        if (counts != nullptr) {
+            state[6] += n_new;
+        }
         state[0] = h;
         *n_fill  = n_take;
         *(unsigned long long *) (state + 2) += (unsigned long long) n_hit;
