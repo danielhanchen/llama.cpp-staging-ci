@@ -1784,11 +1784,31 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
-    if (params.moe_cache_size > 0 && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
-        // the device lookup of the MoE cache needs pinned host experts and mmap'ed files usually cannot be pinned: load without mmap if the model fits in system memory
+    // n_gpu_layers: -1 is auto, <= -2 is all, 0 keeps every layer on the CPU and 1 offloads only the output layer: the MoE cache then has no repeating layer to serve, keep mmap
+    // the MoE cache only serves experts kept in host memory, which the placement does not do by itself: they get there through a tensor override to a host buffer (-ot, --cpu-moe, --n-cpu-moe) or when --fit moves them, otherwise keep mmap
+    bool host_experts = params.fit_params;
+    for (const auto & ovr : params.tensor_buft_overrides) {
+        host_experts = host_experts || (ovr.pattern != nullptr && ovr.buft != nullptr && ggml_backend_buft_is_host(ovr.buft));
+    }
+    if (params.moe_cache_size > 0 && host_experts && params.load_mode == LLAMA_LOAD_MODE_AUTO && (params.n_gpu_layers < 0 || params.n_gpu_layers > 1)) {
+        // the device lookup of the MoE cache needs pinned host experts and mmap'ed files usually cannot be pinned: load without mmap if the model fits in system memory and a device that will be used can do the lookup (the other backends keep the host lookup, mmap costs them nothing)
+        bool dev_lookup = false;
+        if (!params.devices.empty()) {
+            for (ggml_backend_dev_t dev : params.devices) {
+                dev_lookup = dev_lookup || (dev != nullptr && llama_moe_cache_device_lookup_supported(dev));
+            }
+        } else {
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+                if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    dev_lookup = dev_lookup || llama_moe_cache_device_lookup_supported(dev);
+                }
+            }
+        }
         const char * env = getenv("LLAMA_MOE_CACHE_DEVICE");
         ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        if ((env == nullptr || atoi(env) != 0) && cpu != nullptr) {
+        if (dev_lookup && (env == nullptr || atoi(env) != 0) && cpu != nullptr) {
             size_t mem_free  = 0;
             size_t mem_total = 0;
             ggml_backend_dev_memory(cpu, &mem_free, &mem_total);

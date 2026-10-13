@@ -14,6 +14,16 @@
 #include <unordered_map>
 #include <vector>
 
+bool llama_moe_cache_device_lookup_supported(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    return reg != nullptr &&
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_map")   != nullptr &&
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_unmap") != nullptr;
+}
+
 namespace {
 
 // LRU of the experts of a group of layers, the slot of each expert is kept in the slot map of its layer
@@ -218,6 +228,23 @@ struct llama_moe_cache::impl {
         size_t buf_size = 0;
     };
 
+    // LLAMA_MOE_CACHE_SEED_CHECK=1: after each seeding ubatch, compare the seeded slots with the host experts (debug)
+    struct seed_rec {
+        const ggml_tensor * w;
+        const ggml_tensor * bank;
+        int32_t expert;
+        int32_t slot;
+    };
+
+    // the layer being seeded from a large batch, per group: with several devices the copies of their splits can interleave
+    struct seed_state {
+        int32_t il = -1;
+        std::vector<int32_t> old_slots; // slot map before the seed, the copies of the other expert tensors of the layer read it
+        std::vector<moe_cache_lru::fill> fills;
+        uint32_t done = 0; // expert tensors whose slots were filled
+        std::vector<seed_rec> pending; // LLAMA_MOE_CACHE_SEED_CHECK: copies of the layer being seeded
+    };
+
     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
     struct group {
         int32_t id;                       // device
@@ -227,6 +254,7 @@ struct llama_moe_cache::impl {
         size_t host_bytes = 0;
         int32_t n_slots = 0;
         moe_cache_lru lru;
+        seed_state sd;
 
         // device lookup: slot maps of all layers [n_expert, n_layer] and eviction state, see ggml_moe_cache_lookup
         ggml_tensor * map   = nullptr;
@@ -274,27 +302,12 @@ struct llama_moe_cache::impl {
     stats stats_seed;   // experts admitted from large batches
     size_t n_batches = 0; // batched copy calls (one per expert tensor) for large batches
 
-    // the layer being seeded from a large batch
-    struct seed_state {
-        int32_t il = -1;
-        std::vector<int32_t> old_slots; // slot map before the seed, the copies of the other expert tensors of the layer read it
-        std::vector<moe_cache_lru::fill> fills;
-        uint32_t done = 0; // expert tensors whose slots were filled
-    } sd;
     std::vector<int32_t> seed_ids;
     std::vector<std::vector<int32_t>> seed_counts; // [n_layer] routing of an earlier ubatch of the prompt, see set_seed_counts
     std::vector<ggml_backend_copy_region> seed_regions;
     size_t seed_unstaged = 0; // seeds of a layer dropped because a planned expert was not staged in the copy of an expert tensor
 
-    // LLAMA_MOE_CACHE_SEED_CHECK=1: after each seeding ubatch, compare the seeded slots with the host experts (debug)
-    struct seed_rec {
-        const ggml_tensor * w;
-        const ggml_tensor * bank;
-        int32_t expert;
-        int32_t slot;
-    };
     bool seed_check = false;
-    std::vector<seed_rec> seed_pending;   // the layer being seeded
     std::vector<seed_rec> seed_committed; // seeded layers, not yet checked
     size_t seed_checked    = 0;
     size_t seed_mismatches = 0;
@@ -702,15 +715,13 @@ struct llama_moe_cache::impl {
         }
     }
 
-    using host_map_t   = void * (*)(void *, size_t, bool *);
+    using host_map_t   = void * (*)(ggml_backend_dev_t, void *, size_t, bool *);
     using host_unmap_t = void (*)(void *);
 
     // the device of the group can map host memory and run the lookup of the largest batch
     bool lookup_capable(const group & g) const {
         ggml_backend_t backend = devices[g.id].backend;
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
-        if (ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_map") == nullptr ||
-            ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_unmap") == nullptr) {
+        if (!llama_moe_cache_device_lookup_supported(ggml_backend_get_device(backend))) {
             return false;
         }
         ggml_init_params params = {
@@ -732,8 +743,8 @@ struct llama_moe_cache::impl {
     // the groups of devices without the lookup op or the host_map function (backend capability) keep the host lookups
     void init_device_lookup() {
 
-        // device pointer of each mapped host buffer, per mapping function (a buffer may be read by devices of different backends)
-        std::map<std::pair<host_map_t, ggml_backend_buffer_t>, uint8_t *> dev_base;
+        // device pointer of each mapped host buffer, per device (the device address of a host buffer may differ between devices)
+        std::map<std::pair<ggml_backend_dev_t, ggml_backend_buffer_t>, uint8_t *> dev_base;
 
         for (size_t ig = 0; ig < groups.size(); ++ig) {
             group & g = groups[ig];
@@ -741,7 +752,8 @@ struct llama_moe_cache::impl {
                 continue;
             }
             ggml_backend_t backend = devices[g.id].backend;
-            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
             if (!lookup_capable(g)) {
                 continue;
             }
@@ -752,15 +764,15 @@ struct llama_moe_cache::impl {
             std::vector<std::vector<const void *>> host_dev(g.layers.size());
             for (size_t i = 0; i < g.layers.size() && ok; ++i) {
                 for (const ggml_tensor * t : layers[g.layers[i]].experts) {
-                    auto it = dev_base.find({ host_map, t->buffer });
+                    auto it = dev_base.find({ dev, t->buffer });
                     if (it == dev_base.end()) {
                         void * base = ggml_backend_buffer_get_base(t->buffer);
                         bool registered = false;
-                        void * dev = host_map(base, ggml_backend_buffer_get_size(t->buffer), &registered);
+                        void * dev_ptr = host_map(dev, base, ggml_backend_buffer_get_size(t->buffer), &registered);
                         if (registered) {
                             mapped.emplace_back(host_unmap, base);
                         }
-                        it = dev_base.emplace(std::make_pair(host_map, t->buffer), (uint8_t *) dev).first;
+                        it = dev_base.emplace(std::make_pair(dev, t->buffer), (uint8_t *) dev_ptr).first;
                     }
                     if (it->second == nullptr) {
                         ok = false;
@@ -1137,7 +1149,7 @@ struct llama_moe_cache::impl {
 
         // large batches only read the cache, so the experts used in generation stay in it
         // while a layer is seeded, its slots are filled after its copies, so the copies read the slots it had before
-        const int32_t * slots = b.il == sd.il ? sd.old_slots.data() : g.lru.slot_map[b.il];
+        const int32_t * slots = b.il == g.sd.il ? g.sd.old_slots.data() : g.lru.slot_map[b.il];
         if (slots == nullptr || slots[e] < 0) {
             return 0;
         }
@@ -1282,8 +1294,9 @@ struct llama_moe_cache::impl {
         }
 
         // the first expert tensor of the layer plans the slots of its most used experts, each layer gets an equal share
+        seed_state & sd = g.sd;
         if (b.il != sd.il) {
-            seed_end();
+            seed_end(g);
 
             const int32_t n_expert = g.lru.n_expert;
             const size_t  n_seed   = g.n_slots / g.layers.size();
@@ -1328,7 +1341,7 @@ struct llama_moe_cache::impl {
         }
         if (seed_check) {
             for (const auto & f : fills) {
-                seed_pending.push_back({ w, bank, f.expert, f.slot });
+                sd.pending.push_back({ w, bank, f.expert, f.slot });
             }
         }
 
@@ -1367,15 +1380,15 @@ struct llama_moe_cache::impl {
         sd.done |= 1u << b.ip;
     }
 
-    void seed_end() {
+    void seed_end(group & g) {
+        seed_state & sd = g.sd;
         if (sd.il < 0) {
             return;
         }
         const layer & l = layers[sd.il];
-        group & g = groups[l.ig];
         if (sd.done == (1u << l.experts.size()) - 1) {
             stats_seed.misses += sd.fills.size();
-            seed_committed.insert(seed_committed.end(), seed_pending.begin(), seed_pending.end());
+            seed_committed.insert(seed_committed.end(), sd.pending.begin(), sd.pending.end());
         } else {
             // some expert tensors were copied without filling their slots, drop the experts admitted to the layer
             for (const auto & f : sd.fills) {
@@ -1386,7 +1399,13 @@ struct llama_moe_cache::impl {
         }
         sd.il = -1;
         sd.fills.clear();
-        seed_pending.clear();
+        sd.pending.clear();
+    }
+
+    void seed_end() {
+        for (group & g : groups) {
+            seed_end(g);
+        }
     }
 
     // LLAMA_MOE_CACHE_SEED_CHECK: the device work of the seeding ubatch must be complete
