@@ -5,9 +5,14 @@
 
 // device-side lookup of the MoE expert cache, see ggml_moe_cache_lookup and llama-moe-cache.cpp
 //
-// state: [0] CLOCK hand, [1] epoch (one per lookup), [2..3] hits, [4..5] misses, [6..7] unused, then key_of, ref and pin [n_slots]
+// state: [0] CLOCK hand, [1] epoch (one per lookup), [2..3] hits, [4..5] misses, [6] filled slots, [7] unused, then key_of, ref and pin [n_slots]
 // key_of: il*n_expert + expert (-1 if empty); ref: CLOCK reference bits; pin: epoch of the last lookup using the slot (that lookup does not evict it)
 // dst:   slots[n_ids], then a row starting with the number of copied experts, then their experts[n_ids] and slots[n_ids]
+//
+// hybrid (ggml_moe_cache_assign): counts [n_expert, n_layer + 1] use counters, last row: [0..1] experts left to the host, [2] fetch accumulator (1/65536)
+// only a share of the missing experts is admitted (fetch_q/65536, error diffused), the ones with the highest counters, ties by expert id
+// (all of them while the cache has empty slots: filling an empty slot evicts nothing)
+// the others keep slot -1 and are written to host_ids, after the slots and the copy list
 
 #define MOE_CACHE_HDR   8
 #define MOE_CACHE_LANES 32
@@ -29,10 +34,12 @@ static __device__ __forceinline__ int32_t moe_cache_id(const int32_t * ids, cons
 
 static __global__ void moe_cache_assign(
         const int32_t * __restrict__ ids, int32_t * __restrict__ map, int32_t * __restrict__ state, int32_t * __restrict__ dst,
-        const int n_ids, const int ne0, const int n_expert, const int il, const int n_slots) {
+        const int n_ids, const int ne0, const int n_expert, const int il, const int n_slots,
+        int32_t * __restrict__ counts, const int n_layer, const int fetch_q) {
     extern __shared__ int32_t smem[];
     int32_t * miss_e = smem;         // [n_ids] missing experts, in the order of their first use
     int32_t * victim = smem + n_ids; // [n_ids] slots given to them
+    int32_t * take_e = miss_e;       // the missing experts that are admitted (hybrid: [n_ids] after victim)
 
     const int      lane = threadIdx.x;
     const unsigned full = 0xffffffffu;
@@ -46,6 +53,7 @@ static __global__ void moe_cache_assign(
     int32_t * n_fill = dst + n_ids;
     int32_t * fill_e = dst + n_ids + ne0;
     int32_t * fill_s = fill_e + n_ids;
+    int32_t * cnt    = counts != nullptr ? counts + (int64_t) il*n_expert : nullptr;
 
     uint32_t epoch = (uint32_t) state[1] + 1;
     if (epoch == 0) {
@@ -69,6 +77,10 @@ static __global__ void moe_cache_assign(
             ref[s] = 1;
             if ((uint32_t) atomicExch(&pin[s], (int32_t) epoch) != epoch) {
                 n_hit++;
+                if (cnt != nullptr) {
+                    const int32_t e = moe_cache_id(ids, i, n_expert);
+                    cnt[e] += cnt[e] < 0x7fffffff;
+                }
             }
         }
     }
@@ -92,9 +104,50 @@ static __global__ void moe_cache_assign(
         if (first) {
             row[e] = -2;
             miss_e[n_miss + __popc(m & ((1u << lane) - 1))] = e;
+            if (cnt != nullptr) {
+                cnt[e] += cnt[e] < 0x7fffffff;
+            }
         }
         n_miss += __popc(m);
         __syncthreads();
+    }
+
+    // hybrid: admit the n_take most used missing experts, in the order of their first use
+    int n_take = n_miss;
+    int32_t * stat = counts != nullptr ? counts + (int64_t) n_layer*n_expert : nullptr;
+    if (counts != nullptr) {
+        take_e = victim + n_ids;
+        const int64_t acc = (int64_t) (uint32_t) stat[2] + (int64_t) fetch_q*n_miss;
+        n_take = max((int) (acc >> 16), min(n_miss, n_slots - state[6]));
+        int n_sel = 0;
+        for (int j0 = 0; j0 < n_miss; j0 += MOE_CACHE_LANES) {
+            const int j = j0 + lane;
+            bool take = false;
+            if (j < n_miss) {
+                const int32_t ej = miss_e[j];
+                const int32_t cj = cnt[ej];
+                int rank = 0;
+                for (int i = 0; i < n_miss && rank < n_take; ++i) {
+                    const int32_t ei = miss_e[i];
+                    const int32_t ci = cnt[ei];
+                    rank += ci > cj || (ci == cj && ei < ej);
+                }
+                take = rank < n_take;
+                if (!take) {
+                    row[ej] = -1; // left to the host, not admitted
+                }
+            }
+            const unsigned m = moe_cache_ballot(take);
+            if (take) {
+                take_e[n_sel + __popc(m & ((1u << lane) - 1))] = miss_e[j];
+            }
+            n_sel += __popc(m);
+        }
+        __syncthreads();
+        if (lane == 0) {
+            stat[2] = (int32_t) (acc & 0xffff);
+            *(unsigned long long *) stat += (unsigned long long) (n_miss - n_take);
+        }
     }
 
     // victims: CLOCK sweep, 32 slots at a time, the slots used by this lookup are skipped
@@ -102,7 +155,7 @@ static __global__ void moe_cache_assign(
     int h = state[0];
     const int width = min(MOE_CACHE_LANES, n_slots);
     int found = 0;
-    while (found < n_miss) {
+    while (found < n_take) {
         const bool active = lane < width;
         const int  s      = active ? (h + lane < n_slots ? h + lane : h + lane - n_slots) : 0;
         const bool pinned = active && (uint32_t) pin[s] == epoch;
@@ -110,7 +163,7 @@ static __global__ void moe_cache_assign(
         const bool elig   = active && !pinned && !r;
 
         const unsigned m    = moe_cache_ballot(elig);
-        const int      need = n_miss - found;
+        const int      need = n_take - found;
         int      adv  = width;
         unsigned take = m;
         if (__popc(m) >= need) {
@@ -138,12 +191,15 @@ static __global__ void moe_cache_assign(
     }
 
     // evict and insert
-    for (int j = lane; j < n_miss; j += MOE_CACHE_LANES) {
+    int n_new = 0; // empty slots filled
+    for (int j = lane; j < n_take; j += MOE_CACHE_LANES) {
         const int32_t s   = victim[j];
-        const int32_t e   = miss_e[j];
+        const int32_t e   = take_e[j];
         const int32_t old = key_of[s];
         if (old >= 0) {
             map[old] = -1;
+        } else {
+            n_new++;
         }
         key_of[s] = il*n_expert + e;
         ref[s]    = 1;
@@ -157,16 +213,22 @@ static __global__ void moe_cache_assign(
         if (slots[i] < 0) {
             slots[i] = row[moe_cache_id(ids, i, n_expert)];
         }
+        if (counts != nullptr) {
+            // after the copy list: the experts left to the host
+            fill_s[n_ids + i] = slots[i] < 0 ? moe_cache_id(ids, i, n_expert) : -1;
+        }
     }
 
     for (int off = MOE_CACHE_LANES/2; off > 0; off >>= 1) {
         n_hit += __shfl_xor_sync(full, n_hit, off, MOE_CACHE_LANES);
+        n_new += __shfl_xor_sync(full, n_new, off, MOE_CACHE_LANES);
     }
     if (lane == 0) {
+        state[6] += n_new;
         state[0] = h;
-        *n_fill  = n_miss;
+        *n_fill  = n_take;
         *(unsigned long long *) (state + 2) += (unsigned long long) n_hit;
-        *(unsigned long long *) (state + 4) += (unsigned long long) n_miss;
+        *(unsigned long long *) (state + 4) += (unsigned long long) n_take;
     }
 }
 
@@ -225,8 +287,16 @@ static __global__ void moe_cache_fetch(const int32_t * __restrict__ info, const 
 }
 
 bool ggml_cuda_moe_cache_lookup_supported(const ggml_tensor * op) {
+    const int mode    = ggml_get_op_params_i32(op, 10);
     const int n_banks = ggml_get_op_params_i32(op, 1);
-    if (n_banks < 1 || n_banks > 4) {
+    if (mode == 1) {
+        return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 && op->src[2]->type == GGML_TYPE_I32 &&
+            op->src[3]->type == GGML_TYPE_I32 && ggml_nelements(op->src[0]) <= 4096;
+    }
+    if (mode == 2) {
+        return n_banks >= 1 && n_banks <= 4 && op->src[0]->type == GGML_TYPE_I32;
+    }
+    if (mode != 0 || n_banks < 1 || n_banks > 4) {
         return false;
     }
     const int64_t n_ids = ggml_nelements(op->src[0]);
@@ -234,7 +304,41 @@ bool ggml_cuda_moe_cache_lookup_supported(const ggml_tensor * op) {
         n_ids <= 4096;
 }
 
+static void moe_cache_fetch_launch(cudaStream_t stream, const ggml_tensor * dst, const ggml_tensor * const * banks, const int n_banks, const int32_t * info, const int n_ids, const int ne0) {
+    moe_cache_fetch_args args = {};
+    int64_t max_nb = 0;
+    for (int b = 0; b < n_banks; ++b) {
+        const ggml_tensor * bank = banks[b];
+        memcpy(&args.src[b], (const int32_t *) dst->op_params + 2 + 2*b, sizeof(void *));
+        args.dst[b] = (char *) bank->data;
+        args.nb[b]  = bank->nb[2];
+        max_nb = std::max(max_nb, (int64_t) bank->nb[2]);
+    }
+
+    const int64_t chunk = 64*1024;
+    const dim3 grid(n_ids, n_banks, (unsigned) ((max_nb + chunk - 1)/chunk));
+    moe_cache_fetch<<<grid, 256, 0, stream>>>(info, n_ids, ne0, args, chunk);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const int mode = ggml_get_op_params_i32(dst, 10);
+
+    if (mode == 2) {
+        // fetch the experts admitted by the assign of src[0], the result is its slots
+        const ggml_tensor * res = dst->src[0];
+        const int ne0   = (int) res->ne[0];
+        const int n_ids = (int) ggml_nelements(dst);
+        GGML_ASSERT(ggml_is_contiguous(res) && ggml_is_contiguous(dst));
+        if (n_ids == 0) {
+            return;
+        }
+        cudaStream_t stream = ctx.stream();
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, res->data, n_ids*sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+        moe_cache_fetch_launch(stream, dst, dst->src + 1, ggml_get_op_params_i32(dst, 1), (const int32_t *) res->data, n_ids, ne0);
+        return;
+    }
+
     const ggml_tensor * ids   = dst->src[0];
     ggml_tensor       * map   = dst->src[1];
     ggml_tensor       * state = dst->src[2];
@@ -255,23 +359,24 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
 
     cudaStream_t stream = ctx.stream();
 
-    moe_cache_assign<<<1, MOE_CACHE_LANES, 2*n_ids*sizeof(int32_t), stream>>>(
-        (const int32_t *) ids->data, (int32_t *) map->data, (int32_t *) state->data, (int32_t *) dst->data,
-        n_ids, ne0, n_expert, il, n_slots);
-    CUDA_CHECK(cudaGetLastError());
-
-    moe_cache_fetch_args args = {};
-    int64_t max_nb = 0;
-    for (int b = 0; b < n_banks; ++b) {
-        const ggml_tensor * bank = dst->src[3 + b];
-        memcpy(&args.src[b], (const int32_t *) dst->op_params + 2 + 2*b, sizeof(void *));
-        args.dst[b] = (char *) bank->data;
-        args.nb[b]  = bank->nb[2];
-        max_nb = std::max(max_nb, (int64_t) bank->nb[2]);
+    if (mode == 1) {
+        // hybrid assign: no copies here, see ggml_moe_cache_fetch
+        ggml_tensor * counts = dst->src[3];
+        float fetch;
+        memcpy(&fetch, (const int32_t *) dst->op_params + 11, sizeof(float));
+        const int fetch_q = (int) lrintf(fetch*65536.0f);
+        GGML_ASSERT(ggml_is_contiguous(counts) && fetch_q >= 0 && fetch_q <= 65536);
+        moe_cache_assign<<<1, MOE_CACHE_LANES, 3*n_ids*sizeof(int32_t), stream>>>(
+            (const int32_t *) ids->data, (int32_t *) map->data, (int32_t *) state->data, (int32_t *) dst->data,
+            n_ids, ne0, n_expert, il, n_slots, (int32_t *) counts->data, (int) map->ne[1], fetch_q);
+        CUDA_CHECK(cudaGetLastError());
+        return;
     }
 
-    const int64_t chunk = 64*1024;
-    const dim3 grid(n_ids, n_banks, (unsigned) ((max_nb + chunk - 1)/chunk));
-    moe_cache_fetch<<<grid, 256, 0, stream>>>((const int32_t *) dst->data, n_ids, ne0, args, chunk);
+    moe_cache_assign<<<1, MOE_CACHE_LANES, 2*n_ids*sizeof(int32_t), stream>>>(
+        (const int32_t *) ids->data, (int32_t *) map->data, (int32_t *) state->data, (int32_t *) dst->data,
+        n_ids, ne0, n_expert, il, n_slots, nullptr, 0, 0);
     CUDA_CHECK(cudaGetLastError());
+
+    moe_cache_fetch_launch(stream, dst, dst->src + 3, n_banks, (const int32_t *) dst->data, n_ids, ne0);
 }

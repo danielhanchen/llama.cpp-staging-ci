@@ -927,6 +927,7 @@ extern "C" {
             enum   ggml_type      type);
 
     // dst[i0, i1, i2] = a[i0, i1, i2] + b[i0, ids[i1, i2]]
+    // an id of -1 adds nothing: dst[i0, i1, i2] = a[i0, i1, i2]
     GGML_API struct ggml_tensor * ggml_add_id(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -1499,6 +1500,7 @@ extern "C" {
             enum ggml_op_hint    hint);
 
     // indirect matrix multiplication
+    // an id of -1 skips the slot and zeroes the matching row of the result
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
             struct ggml_context * ctx,
             struct ggml_tensor  * as,
@@ -1522,6 +1524,29 @@ extern "C" {
             const void         ** host,
             int                   n_banks,
             int                   il);
+
+    // hybrid variant of ggml_moe_cache_lookup: assigns the slots but does not copy the experts
+    // counts: I32 [n_expert, n_layer + 1], use counter of each expert of each layer, the last row holds statistics (updated in place)
+    // of the missing experts, a share fetch (0..1, error diffused over the lookups) is admitted: the ones with the highest counters, ties by expert id
+    // the other missing experts get slot -1 and are left to the host
+    // result: I32 [n_expert_used, 4*n_tokens + 1] as ggml_moe_cache_lookup, then [n_expert_used, n_tokens] host ids: the expert of each slot -1, else -1
+    GGML_API struct ggml_tensor * ggml_moe_cache_assign(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * map,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * counts,
+            float                 fetch,
+            int                   il);
+
+    // copies the experts admitted by ggml_moe_cache_assign (res) from host memory to the banks
+    // result: I32 [n_expert_used, n_tokens], the slots for ggml_mul_mat_id with a bank (-1: computed elsewhere)
+    GGML_API struct ggml_tensor * ggml_moe_cache_fetch(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * res,
+            struct ggml_tensor ** banks,
+            const void         ** host,
+            int                   n_banks);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

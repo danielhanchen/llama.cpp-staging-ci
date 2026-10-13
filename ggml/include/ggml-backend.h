@@ -407,6 +407,10 @@ extern "C" {
     // Set a callback that selects how the input weights in host buffers are prefetched
     GGML_API void                 ggml_backend_sched_set_prefetch_callback(ggml_backend_sched_t sched, ggml_backend_sched_prefetch_callback callback, void * user_data);
 
+    // Overlap a CPU split with the next split: after the inputs of the CPU split are copied, the nodes of the next split that read
+    // none of its input copies are launched before the CPU split is computed (single copy, no eval callback, no prefetched splits)
+    GGML_API void                 ggml_backend_sched_set_overlap(ggml_backend_sched_t sched, bool enable);
+
     //
     // Meta backend
     //

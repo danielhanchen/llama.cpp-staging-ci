@@ -733,6 +733,8 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
     ggml_backend_sched_set_prefetch_callback(sched.get(), sched_prefetch_mode, this);
+    // the hybrid MoE cache computes the missing experts on the host while the device computes the cached ones
+    ggml_backend_sched_set_overlap(sched.get(), moe_cache && moe_cache->hybrid_active());
 }
 
 void llama_context::sched_reserve() {
@@ -1533,6 +1535,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // hybrid MoE cache: the fetch share is measured with the threads of the small batches, before their first graph is built
+    if (moe_cache && moe_cache->hybrid_probe_pending() && ubatch.n_tokens <= llama_moe_cache::n_small_max && backend_cpu != nullptr) {
+        ggml_backend_sched_synchronize(sched.get());
+        set_compute_threads(ubatch.n_tokens > 1);
+        moe_cache->hybrid_probe(backend_cpu);
+        ggml_backend_sched_set_overlap(sched.get(), moe_cache->hybrid_active());
+    }
+    // auto mode: the first small batches alternate between the plain cache and the hybrid path, then the faster one is kept
+    if (moe_cache && moe_cache->hybrid_window_pending()) {
+        ggml_backend_sched_synchronize(sched.get());
+        moe_cache->hybrid_tick(ubatch.n_tokens);
+        ggml_backend_sched_set_overlap(sched.get(), moe_cache->hybrid_active());
+    }
+
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -1544,7 +1560,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     // the copies of the experts are planned with the seed mode of the MoE cache (see sched_copy_all_experts)
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams) && moe_cache_seed_graph == moe_cache_seed) {
+    const int moe_cache_hybrid = moe_cache ? moe_cache->hybrid_mode() : 0;
+    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams) && moe_cache_seed_graph == moe_cache_seed &&
+            moe_cache_hybrid_graph == moe_cache_hybrid) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1581,8 +1599,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        gf_res_prev_active   = res;
-        moe_cache_seed_graph = moe_cache_seed;
+        gf_res_prev_active     = res;
+        moe_cache_seed_graph   = moe_cache_seed;
+        moe_cache_hybrid_graph = moe_cache_hybrid;
     }
 
     // set the input data for the input tensors
@@ -2788,9 +2807,7 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
             lctx->n_reallocs_same, lctx->n_reallocs_diff);
 }
 
-ggml_status llama_context::graph_compute(
-            ggml_cgraph * gf,
-                   bool   batched) {
+void llama_context::set_compute_threads(bool batched) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -2806,6 +2823,12 @@ ggml_status llama_context::graph_compute(
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
+}
+
+ggml_status llama_context::graph_compute(
+            ggml_cgraph * gf,
+                   bool   batched) {
+    set_compute_threads(batched);
 
     copy_experts.reset();
 

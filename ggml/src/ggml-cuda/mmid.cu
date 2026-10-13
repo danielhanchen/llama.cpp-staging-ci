@@ -1,6 +1,8 @@
 #include "common.cuh"
 #include "mmid.cuh"
 
+#define CUDA_MM_IDS_ZERO_BLOCK_SIZE 256
+
 // To reduce shared memory use, store "it" and "iex_used" with 22/10 bits each.
 struct mm_ids_helper_store {
     uint32_t data;
@@ -57,9 +59,13 @@ static __global__ void mm_ids_helper(
             int iex_used = -1; // The index at which the expert is used, if any.
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
                 const int expert_used = ids[it*si1 + iex];
-                nex_prev += expert_used < expert;
+                nex_prev += expert_used != -1 && expert_used < expert;
                 if (expert_used == expert) {
                     iex_used = iex;
+                }
+                // a skipped slot belongs to no expert, so the first block marks it in the inverse map
+                if (write_inverse && expert == 0 && expert_used == -1) {
+                    ids_src1[it*n_expert_used + iex] = -1;
                 }
             }
 
@@ -83,7 +89,12 @@ static __global__ void mm_ids_helper(
             const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
                 ids[it*si1 + iex] : INT_MAX;
             const int iex_used = expert_used == expert ? iex : -1;
-            nex_prev += expert_used < expert;
+            nex_prev += expert_used != -1 && expert_used < expert;
+
+            // a skipped slot belongs to no expert, so the first block marks it in the inverse map
+            if (write_inverse && expert == 0 && expert_used == -1) {
+                ids_src1[it*n_expert_used + iex] = -1;
+            }
 
             // Whether the threads at this token position have used the expert:
             const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
@@ -133,6 +144,13 @@ static __global__ void mm_ids_helper(
     }
 
     expert_bounds[gridDim.x] = nex_prev + it_compact;
+
+    // skipped slots shrink the forward map - point the unused tail at row 0 to keep the quantizer in bounds
+    if (!write_inverse) {
+        for (int i = nex_prev + it_compact; i < n_tokens*n_expert_used; ++i) {
+            ids_src1[i] = 0;
+        }
+    }
 }
 
 template <int n_expert_used_template>
@@ -321,6 +339,10 @@ static __global__ void mm_ids_scatter(
             it  = it0 + itl;
             const int e = ids[(size_t) it*si1 + iex];
             expert_used = e >= 0 && e < n_experts ? e : -1;
+            // a skipped slot belongs to no expert, mark it in the inverse map
+            if (write_inverse && e == -1) {
+                ids_src1[it*n_expert_used + iex] = -1;
+            }
         }
 
         // rank by lane among lanes with the same expert: keeps the token-major, slot-minor order of mm_ids_helper
@@ -353,6 +375,13 @@ static __global__ void mm_ids_scatter(
             } else {
                 ids_src1[pos] = it*sis1 + iex % nchannels_y;
             }
+        }
+    }
+
+    // skipped slots shrink the forward map - point the unused tail at row 0 to keep the quantizer in bounds
+    if (!write_inverse && w == 0) {
+        for (int i = expert_bounds[n_experts] + lane; i < n_tokens*n_expert_used; i += warp_size) {
+            ids_src1[i] = 0;
         }
     }
 }
@@ -431,8 +460,33 @@ static bool mm_ids_use_counting_sort(const int n_experts, const int n_tokens, co
     return (int64_t) n_experts*n_tokens >= (1 << 16);
 }
 
+static __global__ void mm_ids_zero_dst(
+        const int32_t * __restrict__ ids, float * __restrict__ dst,
+        const int ne0, const int si1, const int64_t s1, const int64_t s2) {
+    const int it  = blockIdx.x; // token
+    const int iex = blockIdx.y; // slot
+
+    if (ids[it*si1 + iex] != -1) {
+        return;
+    }
+
+    float * dst_row = dst + it*s2 + iex*s1;
+
+    for (int i0 = threadIdx.x; i0 < ne0; i0 += blockDim.x) {
+        dst_row[i0] = 0.0f;
+    }
+}
+
+void ggml_cuda_launch_mm_ids_zero_dst(
+        const int32_t * ids, float * dst,
+        const int n_tokens, const int n_expert_used, const int ne0, const int si1,
+        const int64_t s1, const int64_t s2, cudaStream_t stream) {
+    const dim3 num_blocks(n_tokens, n_expert_used, 1);
+    mm_ids_zero_dst<<<num_blocks, CUDA_MM_IDS_ZERO_BLOCK_SIZE, 0, stream>>>(ids, dst, ne0, si1, s1, s2);
+}
+
 static __global__ void mm_ids_invert(
-        const int32_t * __restrict__ ids_dst, int32_t * __restrict__ ids_inverse, const int n) {
+        const int32_t * __restrict__ ids_dst, int32_t * __restrict__ ids_inverse, const int n, const int n_slots) {
     const int ic = blockIdx.x*blockDim.x + threadIdx.x;
 
     if (ic >= n) {
@@ -441,7 +495,7 @@ static __global__ void mm_ids_invert(
 
     // repeated ids leave holes with garbage in ids_dst on the single-warp path: skip them, no OOB write
     const int32_t id = ids_dst[ic];
-    if (id < 0 || id >= n) {
+    if (id < 0 || id >= n_slots) {
         return;
     }
 
@@ -449,14 +503,43 @@ static __global__ void mm_ids_invert(
 }
 
 void ggml_cuda_launch_mm_ids_invert(
-        const int32_t * ids_dst, int32_t * ids_inverse, const int n, cudaStream_t stream) {
+        const int32_t * ids_dst, int32_t * ids_inverse, const int n, const int n_slots, cudaStream_t stream) {
     if (n <= 0) {
         return;
     }
 
     const int block_size = 256;
     const int num_blocks = (n + block_size - 1) / block_size;
-    mm_ids_invert<<<num_blocks, block_size, 0, stream>>>(ids_dst, ids_inverse, n);
+    mm_ids_invert<<<num_blocks, block_size, 0, stream>>>(ids_dst, ids_inverse, n, n_slots);
+}
+
+static __global__ void mm_ids_count_skipped(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ n_skipped, const int n_tokens, const int n_expert_used, const int si1) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+
+    if (i >= n_tokens*n_expert_used) {
+        return;
+    }
+
+    const int it  = i / n_expert_used;
+    const int iex = i - it*n_expert_used;
+    if (ids[(size_t) it*si1 + iex] == -1) {
+        atomicAdd(n_skipped, 1);
+    }
+}
+
+void ggml_cuda_launch_mm_ids_count_skipped(
+        const int32_t * ids, int32_t * n_skipped, const int n_tokens, const int n_expert_used, const int si1, cudaStream_t stream) {
+    CUDA_CHECK(cudaMemsetAsync(n_skipped, 0, sizeof(int32_t), stream));
+
+    const int n = n_tokens*n_expert_used;
+    if (n <= 0) {
+        return;
+    }
+
+    const int block_size = 256;
+    const int num_blocks = (n + block_size - 1) / block_size;
+    mm_ids_count_skipped<<<num_blocks, block_size, 0, stream>>>(ids, n_skipped, n_tokens, n_expert_used, si1);
 }
 
 bool ggml_cuda_mm_ids_helper_supported(const int n_experts, const int n_tokens, const int n_expert_used) {

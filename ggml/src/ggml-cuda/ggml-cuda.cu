@@ -2065,7 +2065,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ggml_cuda_mm_ids_helper_supported(ne02, ne12, n_expert_used);
 
     if (sort_on_device) {
-        ggml_cuda_pool_alloc<int32_t> expert_bounds_dev(ctx.pool(), ne02 + 1);
+        // expert_bounds, then the number of skipped slots (id -1)
+        ggml_cuda_pool_alloc<int32_t> expert_bounds_dev(ctx.pool(), ne02 + 2);
 
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
@@ -2075,21 +2076,29 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ false, stream);
         CUDA_CHECK(cudaGetLastError());
 
+        ggml_cuda_launch_mm_ids_count_skipped((const int32_t *) ids->data, expert_bounds_dev.ptr + ne02 + 1, ne12, n_expert_used, si1, stream);
+        CUDA_CHECK(cudaGetLastError());
+
         // the GEMMs below need the per-expert token counts on the host
-        std::vector<int32_t> expert_bounds_host(ne02 + 1);
+        std::vector<int32_t> expert_bounds_host(ne02 + 2);
         CUDA_CHECK(cudaMemcpyAsync(expert_bounds_host.data(), expert_bounds_dev.ptr,
-            (ne02 + 1)*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            (ne02 + 2)*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        // fails for out of range ids, and for repeated ids on the single-warp path
-        GGML_ASSERT(expert_bounds_host[ne02] == ne_get_rows);
+        // fails for out of range ids other than -1 (skipped slot), and for repeated ids on the single-warp path
+        const int32_t n_filled = expert_bounds_host[ne02];
+        GGML_ASSERT(n_filled + expert_bounds_host[ne02 + 1] == ne_get_rows);
         GGML_ASSERT(expert_bounds_host[0] == 0);
 
         for (int64_t i02 = 0; i02 < ne02; ++i02) {
             tokens_per_expert[i02] = expert_bounds_host[i02 + 1] - expert_bounds_host[i02];
         }
 
-        ggml_cuda_launch_mm_ids_invert(ids_dst_compact, ids_from_sorted, ne_get_rows, stream);
+        // skipped slots have no compact row: point them at row 0, the final zero_dst overwrites them
+        if (n_filled < ne_get_rows) {
+            CUDA_CHECK(cudaMemsetAsync(ids_from_sorted, 0, ne_get_rows*sizeof(int32_t), stream));
+        }
+        ggml_cuda_launch_mm_ids_invert(ids_dst_compact, ids_from_sorted, n_filled, ne_get_rows, stream);
         CUDA_CHECK(cudaGetLastError());
     } else {
         std::vector<int32_t> ids_to_sorted_host;
@@ -2105,7 +2114,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                     const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
                     // GGML_ASSERT, not assert: plain assert compiles out in a release build
-                    GGML_ASSERT(expert_to_use >= 0 && expert_to_use < ne02);
+                    GGML_ASSERT(expert_to_use == -1 || (expert_to_use >= 0 && expert_to_use < ne02));
                     if (expert_to_use == i02) {
                         ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                         ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
@@ -2115,7 +2124,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 }
             }
         }
-        GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
+        GGML_ASSERT(ids_to_sorted_host.size() <= size_t(ne_get_rows));
+
+        // skipped slots shrink the compact set - pad it so that the get_rows below stay in bounds
+        ids_to_sorted_host.resize(ne_get_rows, 0);
 
         ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
 
@@ -2186,6 +2198,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ne0, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
         nb1, nb2, nb3, stream);
+
+    // the get_rows above copies a placeholder row into the skipped slots, overwrite them with zeros
+    ggml_cuda_launch_mm_ids_zero_dst((const int32_t *) ids->data, (float *) dst->data,
+        ne2, n_expert_used, ne0, ids->nb[1]/sizeof(int32_t), nb1/sizeof(float), nb2/sizeof(float), stream);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {

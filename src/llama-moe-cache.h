@@ -33,6 +33,27 @@ public:
     // before computing a ubatch: moves the state of the cache between the host and the devices if the other side uses it
     void prepare(int64_t n_tokens);
 
+    // hybrid small batches [LLAMA_MOE_CACHE_HYBRID, LLAMA_MOE_CACHE_FETCH]: the GPU computes the cached experts, the host computes the
+    // missing ones it is left; only a share of the missing experts is fetched and admitted
+    // the hybrid lookup of layer il (see ggml_moe_cache_assign), nullptr if the layer does not use it, and the copies of the experts it
+    // admits (see ggml_moe_cache_fetch); host = false: every missing expert is fetched (the use counters are kept while the hybrid path is off)
+    ggml_tensor * hybrid_assign(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch, bool & host) const;
+    ggml_tensor * hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res) const;
+
+    // true if the graphs of small batches may use the hybrid path
+    bool hybrid_active() const;
+    // graph key: 0 = plain lookups, 1 = lookups that keep the use counters, 2 = hybrid
+    int  hybrid_mode() const;
+
+    // the fetch share is measured once, before the first small batch: the host computes the experts of a layer with the decode threads
+    bool hybrid_probe_pending() const;
+    void hybrid_probe(ggml_backend_t backend_cpu);
+
+    // auto mode: before the graph of each ubatch while the trial runs, after the previous ubatch finished (backends synchronized);
+    // switches between the plain and the hybrid path, then keeps the faster one (see hybrid_active)
+    bool hybrid_window_pending() const;
+    void hybrid_tick(int64_t n_tokens);
+
     // device copy of a small per-expert host tensor (scale or bias) of a cached layer, nullptr if there is none
     ggml_tensor * get_resident(const ggml_tensor * t) const;
 

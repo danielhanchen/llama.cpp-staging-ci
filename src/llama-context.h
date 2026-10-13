@@ -268,6 +268,9 @@ public:
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
 
+    // sets the threadpool and the number of threads of the backends for a graph of a batch (batched) or of a single token
+    void set_compute_threads(bool batched);
+
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
@@ -426,6 +429,7 @@ private:
 
     // value of moe_cache_seed when the current graph was allocated: the scheduler plans the copies of the experts with it
     bool moe_cache_seed_graph = false;
+    int  moe_cache_hybrid_graph = 0; // llama_moe_cache::hybrid_mode of the previous graph
 
     // routing outputs of the last computed large ubatch (expert tensor, ids), valid until the next graph is built
     std::vector<std::pair<const ggml_tensor *, const ggml_tensor *>> moe_cache_ids;
