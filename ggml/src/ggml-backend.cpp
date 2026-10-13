@@ -1516,9 +1516,10 @@ static int ggml_backend_sched_ov_reorder(ggml_backend_sched_t sched, struct ggml
             cls[i - ps] = 4;
         }
 
+        // the last node stays last: some users read the result of a graph as its last node
         auto movable = [&](int i) {
             const struct ggml_tensor * t = graph->nodes[i];
-            if (be[i] != G || !ggml_backend_sched_ov_movable_op(t)) {
+            if (be[i] != G || i == n - 1 || !ggml_backend_sched_ov_movable_op(t)) {
                 return false;
             }
             bool ok = true;
