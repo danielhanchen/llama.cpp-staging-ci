@@ -182,6 +182,13 @@ public:
 
     int32_t s_copy(int i) const;
 
+    // During decode (one token per sequence) every sequence usually reads its state from the row it
+    // writes back to, so gathering the states is a copy of the cache onto itself. Returns the first
+    // row of that in-place run when it covers all n_seqs sequences of the ubatch, or -1 when the
+    // states have to be gathered. Only reads the cache bookkeeping: s_copy() clears the rollback
+    // index as a side effect and must still run once per input.
+    int32_t get_rs_alias(const llama_ubatch & ubatch) const;
+
 private:
     const llama_memory_status status;
 

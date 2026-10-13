@@ -1365,6 +1365,51 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
 }
 
+int32_t llama_memory_recurrent_context::get_rs_alias(const llama_ubatch & ubatch) const {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_RS_ALIAS");
+        return env == nullptr || atoi(env) != 0;
+    }();
+
+    if (!enabled || is_full || ubatch.n_seqs == 0 || ubatch.n_tokens != ubatch.n_seqs) {
+        return -1;
+    }
+
+    const uint32_t n = ubatch.n_seqs;
+    if (mem->head + n > mem->size) {
+        return -1;
+    }
+
+    // every sequence must read the row it writes (src0 == its own cell) from the same rollback group,
+    // so that no state is read after another sequence overwrote it
+    int32_t base = -1;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t cell_idx = mem->head + i;
+        const auto &   cell     = mem->cells[cell_idx];
+
+        if (cell.src0 != (int32_t) cell_idx) {
+            return -1;
+        }
+
+        uint32_t idx = 0;
+        if (mem->n_rs_seq != 0 && !cell.seq_id.empty()) {
+            const llama_seq_id seq = *cell.seq_id.begin();
+            if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
+                idx = mem->rs_idx[seq];
+            }
+        }
+
+        const int32_t val = (int32_t)(idx * mem->size) + cell.src0;
+        if (i == 0) {
+            base = val;
+        } else if (val != base + (int32_t) i) {
+            return -1;
+        }
+    }
+
+    return base;
+}
+
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
     const uint32_t cell_idx = i + mem->head;
     const int32_t  src0     = mem->cells[cell_idx].src0;
