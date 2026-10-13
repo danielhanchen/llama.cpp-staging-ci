@@ -591,6 +591,13 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    for (auto & sa : state_async) {
+        if (sa.event) {
+            ggml_backend_event_free(sa.event);
+            sa.event = nullptr;
+        }
+    }
+
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -884,10 +891,13 @@ void llama_context::sched_reserve() {
 
 void llama_context::synchronize() {
     if (!sched) {
+        state_async_wait();
         return;
     }
 
     ggml_backend_sched_synchronize(sched.get());
+
+    state_async_wait();
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1602,6 +1612,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    // an asynchronous state save queued before this call has reached its destination when this call returns
+    struct state_async_join {
+        llama_context * ctx;
+        ~state_async_join() { ctx->state_async_wait(); }
+    } state_async_join_guard { this };
+
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -1841,6 +1857,12 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    // an asynchronous state save queued before this call has reached its destination when this call returns
+    struct state_async_join {
+        llama_context * ctx;
+        ~state_async_join() { ctx->state_async_wait(); }
+    } state_async_join_guard { this };
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -3173,6 +3195,45 @@ private:
     std::vector<write_info> winfos;
 };
 
+// like llama_io_write_host, but the tensor reads are collected for llama_context::state_get_async()
+class llama_io_write_host_async : public llama_io_write_i {
+public:
+    llama_io_write_host_async(uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+
+    void write(const void * src, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+        memcpy(ptr, src, size);
+        ptr += size;
+        size_written += size;
+        buf_size -= size;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+
+        winfos.push_back({tensor, ptr, size, offset});
+
+        ptr += size;
+        size_written += size;
+        buf_size -= size;
+    }
+
+    size_t n_bytes() override {
+        return size_written;
+    }
+
+    std::vector<llama_state_write_info> winfos;
+
+private:
+    uint8_t * ptr;
+    size_t buf_size = 0;
+    size_t size_written = 0;
+};
+
 class llama_io_read_host : public llama_io_read_i {
 public:
     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
@@ -3633,6 +3694,30 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 }
 
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ASYNC) {
+        flags &= ~LLAMA_STATE_SEQ_FLAGS_ASYNC;
+
+        if (!(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
+            llama_io_write_host_async io(dst, size);
+            try {
+                io.write(&io_magic, sizeof(io_magic));
+                io.write(&seq_id, sizeof(seq_id));
+
+                const size_t n = state_seq_write_data(io, seq_id, flags);
+
+                state_get_async(io.winfos);
+
+                return n;
+            } catch (const std::exception & err) {
+                LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+                return 0;
+            }
+        }
+
+        // the device copy below is not asynchronous
+        synchronize();
+    }
+
     std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
@@ -3869,6 +3954,150 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
     }
 
     return io.n_bytes();
+}
+
+void llama_context::state_async_wait() {
+    if (state_async_worker.joinable()) {
+        state_async_worker.join();
+    }
+}
+
+// Read the state rows of an asynchronous save into dst without synchronizing the context.
+// Each row is read on the stream of the backend that owns it, so the read comes after the work already queued there
+// (e.g. the previous ubatch) and before any later graph changes the row. The rows land in a pinned staging buffer per
+// backend (reused across saves); a worker thread waits on an event per backend and copies them to dst, so the host is
+// free to prepare the next ubatch meanwhile. Rows in host buffers, or on a device without async copies and events,
+// take the synchronous path instead.
+void llama_context::state_get_async(const std::vector<llama_state_write_info> & winfos) {
+    // the previous save may still be reading the staging buffers
+    state_async_wait();
+
+    static const bool disabled = [] {
+        const char * e = getenv("LLAMA_STATE_ASYNC");
+        return e != nullptr && atoi(e) == 0;
+    }();
+
+    if (!state_async_init) {
+        state_async_init = true;
+
+        for (auto & backend : backends) {
+            ggml_backend_t b = backend.get();
+            ggml_backend_dev_t dev = ggml_backend_get_device(b);
+            if (b == backend_cpu || dev == nullptr) {
+                continue;
+            }
+
+            // only backends known to support a cross-thread event wait while the host keeps queueing work
+            const char * reg_name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+            if (strcmp(reg_name, "CUDA") != 0 && strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0) {
+                continue;
+            }
+
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            if (!props.caps.async || !props.caps.events || ggml_backend_dev_host_buffer_type(dev) == nullptr) {
+                continue;
+            }
+
+            ggml_backend_event_t event = ggml_backend_event_new(dev);
+            if (event == nullptr) {
+                continue;
+            }
+
+            state_async.push_back({ b, dev, event, nullptr });
+        }
+    }
+
+    // owning backend of each row
+    std::vector<int> owner(winfos.size(), -1);
+    bool ok = !disabled && !state_async.empty();
+    for (size_t i = 0; ok && i < winfos.size(); ++i) {
+        const ggml_tensor * t = winfos[i].tensor;
+        ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+        if (buf == nullptr || ggml_backend_buffer_is_host(buf)) {
+            ok = false;
+            break;
+        }
+
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+        for (size_t b = 0; b < state_async.size(); ++b) {
+            if (ggml_backend_buft_get_device(buft) == state_async[b].dev && ggml_backend_supports_buft(state_async[b].backend, buft)) {
+                owner[i] = (int) b;
+                break;
+            }
+        }
+        ok = owner[i] >= 0;
+    }
+
+    // staging offsets
+    std::vector<size_t> need(state_async.size(), 0);
+    std::vector<size_t> offs(winfos.size(), 0);
+    for (size_t i = 0; ok && i < winfos.size(); ++i) {
+        offs[i] = need[owner[i]];
+        need[owner[i]] += GGML_PAD(winfos[i].size, 64);
+    }
+
+    for (size_t b = 0; ok && b < state_async.size(); ++b) {
+        auto & sa = state_async[b];
+        if (need[b] == 0 || (sa.staging && ggml_backend_buffer_get_size(sa.staging.get()) >= need[b])) {
+            continue;
+        }
+
+        sa.staging.reset();
+        sa.staging.reset(ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(sa.dev), need[b]));
+        if (!sa.staging) {
+            LLAMA_LOG_WARN("%s: failed to allocate a %.2f MiB staging buffer, saving the state synchronously\n", __func__, need[b]/1024.0/1024.0);
+            ok = false;
+            break;
+        }
+        LLAMA_LOG_DEBUG("%s: %s staging buffer %.2f MiB\n", __func__, ggml_backend_dev_name(sa.dev), need[b]/1024.0/1024.0);
+    }
+
+    if (!ok) {
+        synchronize();
+        for (const auto & w : winfos) {
+            ggml_backend_tensor_get(w.tensor, w.dst, w.offset, w.size);
+        }
+        return;
+    }
+
+    struct copy_job {
+        uint8_t       * dst;
+        const uint8_t * src;
+        size_t          size;
+    };
+    std::vector<copy_job> jobs;
+    jobs.reserve(winfos.size());
+
+    for (size_t i = 0; i < winfos.size(); ++i) {
+        auto & sa = state_async[owner[i]];
+        uint8_t * stage = (uint8_t *) ggml_backend_buffer_get_base(sa.staging.get()) + offs[i];
+
+        ggml_backend_tensor_get_async(sa.backend, winfos[i].tensor, stage, winfos[i].offset, winfos[i].size);
+
+        jobs.push_back({ winfos[i].dst, stage, winfos[i].size });
+    }
+
+    std::vector<ggml_backend_event_t> events;
+    for (size_t b = 0; b < state_async.size(); ++b) {
+        if (need[b] > 0) {
+            ggml_backend_event_record(state_async[b].event, state_async[b].backend);
+            events.push_back(state_async[b].event);
+        }
+    }
+
+    if (events.empty()) {
+        return;
+    }
+
+    state_async_worker = std::thread([jobs = std::move(jobs), events = std::move(events)]() {
+        for (auto * ev : events) {
+            ggml_backend_event_synchronize(ev);
+        }
+        for (const auto & j : jobs) {
+            memcpy(j.dst, j.src, j.size);
+        }
+    });
 }
 
 size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -4785,7 +5014,9 @@ size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, ll
 }
 
 size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    ctx->synchronize();
+    if (!(flags & LLAMA_STATE_SEQ_FLAGS_ASYNC)) {
+        ctx->synchronize();
+    }
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
 }

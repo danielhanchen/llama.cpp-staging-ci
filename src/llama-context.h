@@ -14,6 +14,7 @@
 
 #include <array>
 #include <map>
+#include <thread>
 #include <vector>
 
 struct llama_model;
@@ -41,6 +42,14 @@ struct llama_memory_buffer {
 };
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
+
+// one tensor range of a state save: size bytes at offset of tensor go to dst
+struct llama_state_write_info {
+    ggml_tensor * tensor;
+    uint8_t     * dst;
+    size_t        size;
+    size_t        offset;
+};
 
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
@@ -164,6 +173,12 @@ struct llama_context {
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+
+    // LLAMA_STATE_SEQ_FLAGS_ASYNC: queue the tensor reads of a state save without synchronizing (see state_get_async)
+    void state_get_async(const std::vector<llama_state_write_info> & winfos);
+
+    // wait until the last asynchronous state save has reached its destination
+    void state_async_wait();
 
     bool state_load_file(
             const char * filepath,
@@ -459,6 +474,20 @@ private:
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+
+    // asynchronous state saves: per async-capable backend, a pinned staging buffer (reused, grown on demand) that the
+    // device rows are read into in stream order, and an event recorded after the reads
+    struct state_async_backend {
+        ggml_backend_t          backend = nullptr;
+        ggml_backend_dev_t      dev     = nullptr;
+        ggml_backend_event_t    event   = nullptr;
+        ggml_backend_buffer_ptr staging;
+    };
+    std::vector<state_async_backend> state_async;
+    bool state_async_init = false;
+
+    // waits for the events, then copies staging -> destination; joined by state_async_wait()
+    std::thread state_async_worker;
 
     bool has_evaluated_once = false;
 
