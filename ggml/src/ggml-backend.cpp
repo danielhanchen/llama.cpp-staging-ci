@@ -944,6 +944,8 @@ struct ggml_backend_sched_split {
     size_t pf_size; // bytes of its weight copies in the slot
     // copies issued ahead on the copy queue, else the regular path fills the slot (a callback changed since the graph was allocated)
     bool pf_async;
+    // overlap: number of leading nodes that do not depend on the previous (CPU) split, -1 if not computed yet
+    int  ov_prefix;
 };
 
 // host weight prefetch state of a backend: the copies live in a staging arena of `depth` slots outside the graph allocator, so they never alias
@@ -1526,6 +1528,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->n_inputs = 0;
         split->pf_ordinal = -1;
         split->pf_async = false;
+        split->ov_prefix = -1;
         int cur_backend_id = split->backend_id;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
@@ -1577,6 +1580,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->n_inputs = 0;
                 split->pf_ordinal = -1;
                 split->pf_async = false;
+                split->ov_prefix = -1;
                 cur_backend_id = node_backend_id;
             }
 
@@ -2407,7 +2411,7 @@ static int ggml_backend_sched_overlap_prefix(ggml_backend_sched_t sched, const s
     if (split->pf_ordinal >= 0) {
         return 0;
     }
-    auto is_late = [&](const struct ggml_tensor * t) {
+    auto is_late = [&](struct ggml_tensor * t) {
         for (int k = 0; k < split->n_inputs; k++) {
             const struct ggml_tensor * cpy = tensor_copy(split->inputs[k], split->backend_id, sched->cur_copy);
             if (t == cpy || t->view_src == cpy) {
@@ -2428,8 +2432,8 @@ static int ggml_backend_sched_overlap_prefix(ggml_backend_sched_t sched, const s
     };
     for (int j = 0; j < split->graph.n_nodes; j++) {
         const struct ggml_tensor * node = split->graph.nodes[j];
-        if (is_late(node)) {
-            return j;
+        if (ggml_is_view_op(node->op)) {
+            continue; // no work, its users are checked
         }
         for (int s = 0; s < GGML_MAX_SRC; s++) {
             if (node->src[s] != NULL && is_late(node->src[s])) {
@@ -2512,7 +2516,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_backend_sched_split * next = &splits[split_id + 1];
             ggml_backend_t next_backend = sched->backends[next->backend_id];
             if (next->backend_id != split_backend_id && ggml_backend_dev_type(ggml_backend_get_device(next_backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-                const int n_pre = ggml_backend_sched_overlap_prefix(sched, next, split_backend_id);
+                if (next->ov_prefix < 0) {
+                    next->ov_prefix = ggml_backend_sched_overlap_prefix(sched, next, split_backend_id);
+                }
+                const int n_pre = next->ov_prefix;
                 if (n_pre > 0) {
                     struct ggml_cgraph gv = ggml_graph_view(&next->graph, 0, n_pre);
                     enum ggml_status ec = ggml_backend_graph_compute_async(next_backend, &gv);
