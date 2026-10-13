@@ -377,9 +377,18 @@ llama_context::llama_context(
         // smallest ubatch whose host weights the scheduler prefetches (see sched_prefetch_mode)
         const char * GGML_SCHED_PREFETCH           = getenv("GGML_SCHED_PREFETCH");
         const char * GGML_SCHED_PREFETCH_MIN_BATCH = getenv("GGML_SCHED_PREFETCH_MIN_BATCH");
-        // LLAMA_MOE_CACHE_SEED=0 disables the seed of the MoE cache at the end of a prompt
+        // LLAMA_MOE_CACHE_SEED=0 disables the seed of the MoE cache at the end of a prompt; by default (=1) only a ubatch whose expert
+        // copies read its ids seeds (see moe_cache_seed_begin)
+        // =2 also seeds a prefetched ubatch, from the routing of an earlier ubatch or else from its own ids read before its copies
         const char * LLAMA_MOE_CACHE_SEED = getenv("LLAMA_MOE_CACHE_SEED");
         moe_cache_seed_enabled = LLAMA_MOE_CACHE_SEED == nullptr || atoi(LLAMA_MOE_CACHE_SEED) != 0;
+        moe_cache_seed_sync    = LLAMA_MOE_CACHE_SEED != nullptr && atoi(LLAMA_MOE_CACHE_SEED) == 2;
+        // =3: a prefetched ubatch also seeds from its own ids, each layer once it is computed (lagged, the copies do not wait, but the
+        // host waits for each layer two splits back, which can starve the device)
+        // the lagged seed needs the layer of a staged copy to be queued for compute when a later copy reuses its staging slot (depth <= 2)
+        const char * GGML_SCHED_PREFETCH_DEPTH = getenv("GGML_SCHED_PREFETCH_DEPTH");
+        moe_cache_seed_lag_ok  = LLAMA_MOE_CACHE_SEED != nullptr && atoi(LLAMA_MOE_CACHE_SEED) == 3 &&
+                                 (GGML_SCHED_PREFETCH_DEPTH == nullptr || atoi(GGML_SCHED_PREFETCH_DEPTH) <= 2);
 
         if (GGML_SCHED_PREFETCH && atoi(GGML_SCHED_PREFETCH) == 0) {
             prefetch_min_batch = INT64_MAX;
@@ -596,6 +605,15 @@ llama_context::~llama_context() {
             ggml_backend_event_free(sa.event);
             sa.event = nullptr;
         }
+    }
+
+    for (auto & p : moe_seed_lag_pending) {
+        if (p.event != nullptr) {
+            moe_seed_lag_events.push_back(p.event);
+        }
+    }
+    for (ggml_backend_event_t ev : moe_seed_lag_events) {
+        ggml_backend_event_free(ev);
     }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
@@ -2838,6 +2856,11 @@ ggml_status llama_context::graph_compute(
     }
 
     if (moe_cache) {
+        // the layers whose staged copies were not overwritten: seed them after the graph, on the compute backend (the next
+        // graph's copies are ordered after it)
+        while (!moe_seed_lag_pending.empty()) {
+            moe_cache_seed_lag_flush(0, moe_seed_lag_pending[0].backend_ids);
+        }
         moe_cache->seed_end();
     }
 
@@ -2881,6 +2904,11 @@ bool llama_context::sched_copy_all_experts(const ggml_tensor * src, const ggml_t
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
+
+    // lagged seeds: every host weight copy comes here first, so a staged copy is seeded before a later copy overwrites it
+    if (!lctx->moe_seed_lag_pending.empty()) {
+        lctx->moe_cache_seed_lag_step(backend, dst, graph);
+    }
 
     // the slot maps of the MoE cache
     if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
@@ -2943,6 +2971,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
         st.ids = ids;
     }
+
+    const bool cached = lctx->moe_cache && lctx->moe_cache->get_experts(src) != nullptr;
 
     // group consecutive experts and copy them together
     // batched (e.g. CUDA >= 12.8): every cached run is copied from the MoE cache in one call with the uploads
@@ -3014,8 +3044,23 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
     }
 
+    // lagged seed: a copy of every expert, seeded once its layer is computed (see above and moe_cache_seed_lag_flush)
+    // a copy that read the ids (not prefetched) seeds from them now
+    if (cached && lctx->moe_cache_seed_lag) {
+        if (st.all) {
+            auto & pending = lctx->moe_seed_lag_pending;
+            auto it = std::find_if(pending.begin(), pending.end(), [ids](const auto & p) { return p.ids == ids; });
+            if (it == pending.end()) {
+                ggml_backend_t backend_ids = ggml_backend_sched_get_tensor_backend(lctx->sched.get(), const_cast<ggml_tensor *>(ids));
+                pending.push_back({ ids, graph, backend_ids != nullptr ? backend_ids : backend, nullptr, {} });
+                it = pending.end() - 1;
+            }
+            it->copies.emplace_back(src, dst);
+        } else if (!st.counts.empty()) {
+            lctx->moe_cache->seed(backend, src, dst, st.counts, st.used);
+        }
+    } else if (seed && !st.counts.empty()) {
     // st.used: the experts staged in dst, the only ones a seed may copy into the cache
-    if (seed && !st.counts.empty()) {
         lctx->moe_cache->seed(backend, src, dst, st.counts, st.used);
     } else if (lctx->moe_cache_seed_prev && lctx->moe_cache->get_experts(src) != nullptr) {
         // all experts copied (prefetched): use the routing of an earlier ubatch; else the ids of this ubatch were read and only its routed experts staged
@@ -3034,6 +3079,70 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     return true;
 }
 
+void llama_context::moe_cache_seed_lag_step(ggml_backend_t backend, const ggml_tensor * dst, const ggml_cgraph * graph) {
+    auto & pending = moe_seed_lag_pending;
+
+    // the splits of the other pending seeds were queued for compute before this copy was issued (prefetch depth <= 2): an event
+    // behind them lets their seed wait for their ids without waiting for later layers
+    for (auto & p : pending) {
+        if (p.event == nullptr && p.graph != graph) {
+            if (moe_seed_lag_events.empty()) {
+                p.event = ggml_backend_event_new(ggml_backend_get_device(p.backend_ids));
+            } else {
+                p.event = moe_seed_lag_events.back();
+                moe_seed_lag_events.pop_back();
+            }
+            if (p.event != nullptr) {
+                ggml_backend_event_record(p.event, p.backend_ids);
+            }
+        }
+    }
+
+    // a staged copy that this copy overwrites is seeded first, on this backend, so the seed reads it before
+    const uint8_t * d0 = (const uint8_t *) dst->data;
+    const uint8_t * d1 = d0 + ggml_nbytes(dst);
+    for (size_t i = 0; i < pending.size(); ) {
+        const bool overlap = std::any_of(pending[i].copies.begin(), pending[i].copies.end(), [&](const auto & c) {
+            const uint8_t * s0 = (const uint8_t *) c.second->data;
+            return s0 < d1 && d0 < s0 + ggml_nbytes(c.second);
+        });
+        if (overlap) {
+            moe_cache_seed_lag_flush(i, backend);
+        } else {
+            i++;
+        }
+    }
+}
+
+void llama_context::moe_cache_seed_lag_flush(size_t i, ggml_backend_t backend) {
+    moe_seed_pending p = std::move(moe_seed_lag_pending[i]);
+    moe_seed_lag_pending.erase(moe_seed_lag_pending.begin() + i);
+
+    // the ids of the layer: computed once the event (or, without one, all the work queued on their backend) is done
+    if (p.event != nullptr) {
+        ggml_backend_event_synchronize(p.event);
+        moe_seed_lag_events.push_back(p.event);
+    } else {
+        ggml_backend_synchronize(p.backend_ids);
+    }
+    GGML_ASSERT(p.ids->type == GGML_TYPE_I32 && ggml_is_contiguous(p.ids) && p.ids->buffer != nullptr);
+    moe_seed_lag_ids.resize(ggml_nelements(p.ids));
+    ggml_backend_tensor_get(p.ids, moe_seed_lag_ids.data(), 0, ggml_nbytes(p.ids));
+
+    const int64_t n_expert = p.copies[0].first->ne[2];
+    std::vector<int32_t> counts(n_expert, 0);
+    for (const int32_t id : moe_seed_lag_ids) {
+        GGML_ASSERT(id >= 0 && id < n_expert);
+        counts[id]++;
+    }
+    // the expert tensors of a layer are often copied by separate splits, so a layer can be seeded in parts: the first part plans the
+    // layer, the others fill the same slots, and the seed is committed when the next layer starts (or at the end of the graph)
+    const std::vector<bool> staged(n_expert, true); // every expert was copied
+    for (const auto & [w, dst] : p.copies) {
+        moe_cache->seed(backend, w, dst, counts, staged);
+    }
+}
+
 void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_large, int64_t n_outputs_ub) {
     const bool large = ubatch.n_tokens > llama_moe_cache::n_small_max;
     if (!moe_cache_seed_enabled) {
@@ -3049,8 +3158,9 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
     // a ubatch below the prefetch threshold copies only its routed experts, so it seeds from its own ids (a stored routing could name unstaged experts)
     const bool prefetch = ubatch.n_tokens >= prefetch_min_batch;
 
-    // read the routing outputs of the previous large ubatch before this graph replaces them, unless this ubatch records newer ones without seeding
-    if (cont && !moe_cache_ids.empty() && n_outputs_ub == 0 && (!large || (last_large && prefetch))) {
+    // LLAMA_MOE_CACHE_SEED=2: read the routing outputs of the previous large ubatch before this graph replaces them, unless this ubatch
+    // records newer ones without seeding
+    if (moe_cache_seed_sync && cont && !moe_cache_ids.empty() && n_outputs_ub == 0 && (!large || (last_large && prefetch))) {
         ggml_backend_sched_synchronize(sched.get());
         std::vector<int32_t> ids_data;
         std::vector<int32_t> counts;
@@ -3069,27 +3179,38 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
     moe_cache_ids.clear();
 
     // the last large ubatch of the batch seeds the cache even without outputs: a caller may run the last prompt tokens as a separate small batch (e.g. server checkpoints)
-    // with outputs or without an earlier routing it reads its own ids first; otherwise it seeds from the previous large ubatch, so its copies do not wait for its ids
-    moe_cache_record    = large && prefetch_min_batch != INT64_MAX;
+    // a ubatch below the prefetch threshold reads its ids for its copies anyway, it seeds from them
+    // a prefetched ubatch does not seed by default: reading its own ids first serializes the expert uploads with the compute of every
+    // layer, and a seed from the routing of an earlier ubatch rewrites the cache at every ubatch of a long prompt for little gain
+    // LLAMA_MOE_CACHE_SEED=2: as before (earlier routing if any, else own ids read first), =3: own ids, each layer once computed (lagged)
+    moe_cache_record    = large && prefetch_min_batch != INT64_MAX && moe_cache_seed_sync;
     moe_cache_seed      = false;
     moe_cache_seed_prev = false;
+    moe_cache_seed_lag  = false;
     if (last_large) {
-        if (n_outputs_ub == 0 && prefetch && moe_cache->has_seed_counts()) {
-            moe_cache_seed_prev = true;
-        } else {
+        if (!prefetch) {
             moe_cache_seed = true;
+        } else if (moe_cache_seed_lag_ok) {
+            moe_cache_seed_lag = true;
+        } else if (moe_cache_seed_sync) {
+            if (n_outputs_ub == 0 && moe_cache->has_seed_counts()) {
+                moe_cache_seed_prev = true;
+            } else {
+                moe_cache_seed = true;
+            }
         }
     }
 }
 
 void llama_context::moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_outputs_ub) {
-    if (moe_cache->seed_check() && (moe_cache_seed || moe_cache_seed_prev)) {
+    if (moe_cache->seed_check() && (moe_cache_seed || moe_cache_seed_prev || moe_cache_seed_lag)) {
         ggml_backend_sched_synchronize(sched.get());
         moe_cache->seed_verify();
     }
 
     moe_cache_seed      = false;
     moe_cache_seed_prev = false;
+    moe_cache_seed_lag  = false;
     moe_cache_record    = false;
 
     // the prompt ends at a ubatch with outputs (or a failed one), the next one may belong to another prompt

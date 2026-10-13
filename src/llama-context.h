@@ -425,7 +425,25 @@ private:
     bool moe_cache_seed         = false;
     bool moe_cache_seed_prev    = false;
     bool moe_cache_record       = false;
-    bool moe_cache_seed_enabled = true; // LLAMA_MOE_CACHE_SEED
+    bool moe_cache_seed_enabled = true; // LLAMA_MOE_CACHE_SEED != 0
+    bool moe_cache_seed_sync    = false; // LLAMA_MOE_CACHE_SEED=2: a prefetched ubatch seeds (earlier routing, else its own ids read first)
+    bool moe_cache_seed_lag_ok  = false; // LLAMA_MOE_CACHE_SEED=3 with a prefetch depth <= 2, see moe_cache_seed_lag
+
+    // seed_lag: a prefetched ubatch seeds each layer from its own ids once the layer is computed, from its staged copy, before the
+    // copy of a later layer overwrites it (the copies never wait for the ids)
+    bool moe_cache_seed_lag = false;
+    struct moe_seed_pending {
+        const ggml_tensor *  ids         = nullptr;
+        const ggml_cgraph *  graph       = nullptr; // split whose copies staged the experts
+        ggml_backend_t       backend_ids = nullptr;
+        ggml_backend_event_t event       = nullptr; // recorded behind the compute of the layer
+        std::vector<std::pair<const ggml_tensor *, const ggml_tensor *>> copies; // host experts and their staged copies
+    };
+    std::vector<moe_seed_pending>     moe_seed_lag_pending;
+    std::vector<ggml_backend_event_t> moe_seed_lag_events; // pool
+    std::vector<int32_t>              moe_seed_lag_ids;
+    void moe_cache_seed_lag_step(ggml_backend_t backend, const ggml_tensor * dst, const ggml_cgraph * graph);
+    void moe_cache_seed_lag_flush(size_t i, ggml_backend_t backend);
 
     // value of moe_cache_seed when the current graph was allocated: the scheduler plans the copies of the experts with it
     bool moe_cache_seed_graph = false;

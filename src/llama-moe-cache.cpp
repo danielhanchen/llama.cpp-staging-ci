@@ -644,6 +644,14 @@ struct llama_moe_cache::impl {
             }
         }
 
+        // LLAMA_MOE_CACHE_PREFILL=0: the cache starts empty and is filled by generation and prompt seeds
+        if (!model.hparams.no_alloc) {
+            const char * env = getenv("LLAMA_MOE_CACHE_PREFILL");
+            if (env == nullptr || atoi(env) != 0) {
+                prefill();
+            }
+        }
+
         if (device_lookup && !model.hparams.no_alloc) {
             init_device_lookup();
         } else if (device_lookup) {
@@ -706,6 +714,51 @@ struct llama_moe_cache::impl {
 
     ggml_backend_t backend(int32_t il) const {
         return devices[groups[layers[il].ig].id].backend;
+    }
+
+    // fill every slot at load, an equal share of the experts of each layer, so the first prompt reads them from the cache
+    // like the experts a split keeps on the device (an empty cache uploads every expert of a large batch)
+    void prefill() {
+        size_t n_fill  = 0;
+        size_t n_bytes = 0;
+        std::vector<int32_t> fill_ids;
+        for (group & g : groups) {
+            if (g.n_slots == 0) {
+                continue;
+            }
+            const int32_t n_expert = g.lru.n_expert;
+            const size_t  n_layer  = g.layers.size();
+            for (size_t i = 0; i < n_layer; ++i) {
+                const int32_t il = g.layers[i];
+                const int32_t n  = std::min<int32_t>(n_expert, g.n_slots/n_layer + (i < g.n_slots % n_layer ? 1 : 0));
+                fill_ids.resize(n);
+                for (int32_t e = 0; e < n; ++e) {
+                    fill_ids[e] = e;
+                }
+                size_t n_hit = 0;
+                if (n == 0 || !g.lru.plan(il, fill_ids.data(), fill_ids.size(), fills, n_hit)) {
+                    continue;
+                }
+                const layer & l = layers[il];
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    const size_t expert_size = w->nb[2];
+                    for (size_t j = 0; j < fills.size();) {
+                        size_t m = 1;
+                        while (j + m < fills.size() && fills[j + m].expert == fills[j].expert + (int32_t) m && fills[j + m].slot == fills[j].slot + (int32_t) m) {
+                            m++;
+                        }
+                        ggml_backend_tensor_set(g.banks[ip], (const uint8_t *) w->data + fills[j].expert*expert_size, fills[j].slot*expert_size, m*expert_size);
+                        n_bytes += m*expert_size;
+                        j += m;
+                    }
+                }
+                n_fill += fills.size();
+            }
+        }
+        if (n_fill > 0) {
+            LLAMA_LOG_INFO("%s: MoE cache prefilled with %zu experts, %.2f MiB (LLAMA_MOE_CACHE_PREFILL=0 to disable)\n", __func__, n_fill, n_bytes/1024.0/1024.0);
+        }
     }
 
     ~impl() {
