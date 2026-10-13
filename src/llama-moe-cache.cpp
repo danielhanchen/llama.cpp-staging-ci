@@ -322,12 +322,12 @@ struct llama_moe_cache::impl {
     std::vector<std::pair<void (*)(void *), void *>> mapped; // host buffers mapped by the cache, with the function that unmaps them
 
     // hybrid small batches (device lookups only): the host computes the missing experts that are not fetched
-    bool  hybrid       = false; // LLAMA_MOE_CACHE_HYBRID (default auto)
+    bool  hybrid       = false; // LLAMA_MOE_CACHE_HYBRID / LLAMA_MOE_CACHE_FETCH (default off)
     bool  hybrid_probe = false; // the fetch share is measured before the first small batch (LLAMA_MOE_CACHE_FETCH not set)
     bool  hybrid_live  = false; // the graphs of small batches use the hybrid path
     float hybrid_share = 1.0f;  // share of the missing experts that are fetched and admitted, 1 = all (no hybrid path)
 
-    // auto (LLAMA_MOE_CACHE_HYBRID and LLAMA_MOE_CACHE_FETCH not set): trials of 5 blocks of hybrid_block small batches: plain (warm-up,
+    // auto (LLAMA_MOE_CACHE_HYBRID=1): trials of 5 blocks of hybrid_block small batches: plain (warm-up,
     // not counted), plain, hybrid, hybrid, plain (a trend such as the cache warming up cancels out); the time from one small batch to the
     // next is credited to the path of the first, except for the first hybrid_skip batches after a change of path; the hybrid path is
     // kept only if its median is at least hybrid_margin faster, then checked again by a new trial after win_gap small batches (doubled
@@ -376,18 +376,21 @@ struct llama_moe_cache::impl {
             const char * env = getenv("LLAMA_MOE_CACHE_SEED_CHECK");
             seed_check = env != nullptr && atoi(env) != 0;
         }
-        // LLAMA_MOE_CACHE_HYBRID=0 disables the hybrid path, LLAMA_MOE_CACHE_FETCH=0..1 sets the fetch share instead of measuring it
+        // LLAMA_MOE_CACHE_HYBRID: 0 or unset = off, 1 = auto (trials, kept only if faster), 2 = on with the measured share;
+        // LLAMA_MOE_CACHE_FETCH=0..1 turns it on with that share (the same in every run)
+        // off by default: the measured share and the trials depend on timing, so two runs could give different results
         {
-            const char * env = getenv("LLAMA_MOE_CACHE_HYBRID");
-            hybrid = device_lookup && (env == nullptr || atoi(env) != 0) && model.hparams.n_expert >= 4;
+            const char * env   = getenv("LLAMA_MOE_CACHE_HYBRID");
             const char * env_f = getenv("LLAMA_MOE_CACHE_FETCH");
+            const int    mode  = env != nullptr ? atoi(env) : 0;
+            hybrid = device_lookup && (mode > 0 || env_f != nullptr) && model.hparams.n_expert >= 4;
             if (hybrid && env_f != nullptr) {
                 hybrid_share = std::min(1.0f, std::max(0.0f, (float) atof(env_f)));
                 hybrid       = hybrid_share < 1.0f;
                 hybrid_live  = hybrid;
             } else {
                 hybrid_probe = hybrid;
-                hybrid_auto  = env == nullptr;
+                hybrid_auto  = mode == 1;
             }
         }
 
@@ -656,8 +659,8 @@ struct llama_moe_cache::impl {
                 hybrid_probe = false;
             } else if (!model.hparams.no_alloc) {
                 if (hybrid_probe) {
-                    LLAMA_LOG_INFO("%s: hybrid MoE cache: the host computes the missing experts that are not fetched, fetch share measured at the first small batch, %s (LLAMA_MOE_CACHE_FETCH=0..1 to set the share, LLAMA_MOE_CACHE_HYBRID=0/1 to disable/force)\n",
-                        __func__, hybrid_auto ? "used if the misses of the first small batches make it faster" : "forced on");
+                    LLAMA_LOG_INFO("%s: hybrid MoE cache: the host computes the missing experts that are not fetched, fetch share measured at the first small batch, %s (LLAMA_MOE_CACHE_FETCH=0..1 to set the share)\n",
+                        __func__, hybrid_auto ? "auto: kept only if trials of small batches are faster (LLAMA_MOE_CACHE_HYBRID=1)" : "on (LLAMA_MOE_CACHE_HYBRID=2)");
                 } else {
                     LLAMA_LOG_INFO("%s: hybrid MoE cache: the host computes the missing experts that are not fetched, fetch share = %.3f (LLAMA_MOE_CACHE_FETCH)\n", __func__, hybrid_share);
                 }
