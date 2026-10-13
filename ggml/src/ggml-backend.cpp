@@ -931,6 +931,10 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_OV_FUSE_WINDOW 8
 #endif
 
+#ifndef GGML_SCHED_OV_MIN_BYTES_PER_SPLIT
+#define GGML_SCHED_OV_MIN_BYTES_PER_SPLIT (4u*1024u*1024u)
+#endif
+
 #ifndef GGML_SCHED_MAX_PREFETCH_DEPTH
 #define GGML_SCHED_MAX_PREFETCH_DEPTH 8
 #endif
@@ -1057,7 +1061,7 @@ struct ggml_backend_sched {
 
     // CPU/GPU split overlap [GGML_SCHED_OVERLAP]
     int  ov_mode;   // 0 = off, 1 = CUDA-family backends, 2 = any backend with async copies and events
-    int  ov_parts;  // GGML_SCHED_OVERLAP_PARTS bits: 1 = reorder, 2 = copies issued ahead, 4 = uploads without a sync (default 7)
+    int  ov_parts;  // GGML_SCHED_OVERLAP_PARTS bits: 1 = reorder (opt-in), 2 = copies issued ahead, 4 = uploads without a sync (default 6)
     bool ov_active; // the current graph uses the overlap
     int  ov_logged[4];
     struct ggml_backend_sched_overlap ov[GGML_SCHED_MAX_BACKENDS];
@@ -1604,44 +1608,102 @@ static int ggml_backend_sched_ov_reorder(ggml_backend_sched_t sched, struct ggml
         };
         close_h(true);
 
-        // keep possible fusion groups of the device backend whole: a node whose consumers all follow it within
-        // GGML_SCHED_OV_FUSE_WINDOW nodes may be fused with them (e.g. a single-use result and its consumer, or the
-        // top-k / weights group of a MoE router), so such a range stays on one side; the moving nodes are pinned
+        // keep possible fusion groups of the device backend whole (a backend fuses consecutive nodes that consume each
+        // other, e.g. rms_norm + mul, matmul + glu, or the top-k / weights group of a MoE router), so that the moved
+        // nodes leave no group: a node and the next node (views skipped) that consumes it, a node and the next two that
+        // a third one consumes, and a node with several consumers within GGML_SCHED_OV_FUSE_WINDOW nodes stay on one
+        // side; the moving nodes of a mixed group are pinned
+        auto is_mover  = [&](int k) { return cls[k] == 1 || cls[k] == 3; };
+        auto is_stayer = [&](int k) { return cls[k] == 0 || cls[k] == 4; };
+        auto consumes  = [&](const struct ggml_tensor * x, const struct ggml_tensor * y) {
+            bool r = false;
+            for_srcs(x, [&](const struct ggml_tensor * s) {
+                for (const struct ggml_tensor * v = s; v != NULL && !r; v = v->view_src) {
+                    r = v == y;
+                }
+            });
+            return r;
+        };
+        auto pin = [&](int k) {
+            if (cls[k] == 1) {
+                cls[k] = 0;
+            } else if (cls[k] == 3) {
+                cls[k] = 4;
+            }
+        };
+        std::vector<int> seq; // non-view window indices of one region, in order
         for (bool changed = true; changed; ) {
             changed = false;
-            for (int t = 0; t < ne - ps; t++) {
-                if (t >= cs - ps && t < ce - ps) {
-                    continue;
-                }
-                const int lim = t < cs - ps ? cs - ps : ne - ps; // end of the region of t (P or N)
-                auto it = consumers.find(graph->nodes[ps + t]);
-                if (it == consumers.end()) {
-                    continue;
-                }
-                int m = t;
-                bool local = true;
-                for (const struct ggml_tensor * u : it->second) {
-                    auto ip = wpos.find(u);
-                    if (ip == wpos.end() || ip->second <= t || ip->second > t + GGML_SCHED_OV_FUSE_WINDOW) {
-                        local = false;
-                        break;
+            for (int region = 0; region < 2; region++) {
+                const int r0 = region == 0 ? 0 : ce - ps;
+                const int r1 = region == 0 ? cs - ps : ne - ps;
+                seq.clear();
+                for (int k = r0; k < r1; k++) {
+                    if (!ggml_is_view_op(graph->nodes[ps + k]->op)) {
+                        seq.push_back(k);
                     }
-                    m = std::max(m, std::min(ip->second, lim - 1));
                 }
-                if (!local) {
-                    continue;
-                }
-                bool moves = false;
-                bool stays = false;
-                for (int k = t; k <= m; k++) {
-                    moves |= cls[k] == 1 || cls[k] == 3;
-                    stays |= cls[k] == 0 || cls[k] == 4;
-                }
-                if (moves && stays) {
-                    for (int k = t; k <= m; k++) {
-                        cls[k] = cls[k] == 1 ? 0 : cls[k] == 3 ? 4 : cls[k];
+                for (size_t q = 1; q < seq.size(); q++) {
+                    const int a = seq[q - 1];
+                    const int b = seq[q];
+                    bool link = consumes(graph->nodes[ps + b], graph->nodes[ps + a]);
+                    int lo = a;
+                    if (!link && q >= 2) {
+                        const int a2 = seq[q - 2];
+                        if (consumes(graph->nodes[ps + b], graph->nodes[ps + a2]) && consumes(graph->nodes[ps + b], graph->nodes[ps + a])) {
+                            link = true;
+                            lo   = a2;
+                        }
                     }
-                    changed = true;
+                    if (!link) {
+                        continue;
+                    }
+                    bool m = false;
+                    bool st = false;
+                    for (size_t u = 0; u < seq.size(); u++) {
+                        if (seq[u] >= lo && seq[u] <= b) {
+                            m  |= is_mover(seq[u]);
+                            st |= is_stayer(seq[u]);
+                        }
+                    }
+                    if (m && st) {
+                        for (size_t u = 0; u < seq.size(); u++) {
+                            if (seq[u] >= lo && seq[u] <= b) {
+                                pin(seq[u]);
+                            }
+                        }
+                        changed = true;
+                    }
+                }
+                for (int t = r0; t < r1; t++) {
+                    auto it = consumers.find(graph->nodes[ps + t]);
+                    if (it == consumers.end() || it->second.size() < 2) {
+                        continue;
+                    }
+                    bool local = true;
+                    bool m = is_mover(t);
+                    bool st = is_stayer(t);
+                    for (const struct ggml_tensor * u : it->second) {
+                        auto ip = wpos.find(u);
+                        if (ip == wpos.end() || ip->second <= t || ip->second > t + GGML_SCHED_OV_FUSE_WINDOW) {
+                            local = false;
+                            break;
+                        }
+                        if (ip->second < r1) {
+                            m  |= is_mover(ip->second);
+                            st |= is_stayer(ip->second);
+                        }
+                    }
+                    if (local && m && st) {
+                        pin(t);
+                        for (const struct ggml_tensor * u : it->second) {
+                            const int k = wpos[u];
+                            if (k < r1) {
+                                pin(k);
+                            }
+                        }
+                        changed = true;
+                    }
                 }
             }
             if (changed) {
@@ -1650,20 +1712,21 @@ static int ggml_backend_sched_ov_reorder(ggml_backend_sched_t sched, struct ggml
             }
         }
 
-        // worth extra splits only with matrix multiplications to overlap
         int n_a  = 0;
         int n_dh = 0;
-        int n_mm = 0;
+        size_t mm_bytes = 0; // weights read by the moved matrix multiplications
         for (int i = ps; i < ne; i++) {
             const char c = cls[i - ps];
             n_a += c == 0;
             if (c == 1 || c == 3) {
                 n_dh++;
-                const enum ggml_op op = graph->nodes[i]->op;
-                n_mm += op == GGML_OP_MUL_MAT || op == GGML_OP_MUL_MAT_ID;
+                const struct ggml_tensor * t = graph->nodes[i];
+                if (t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) {
+                    mm_bytes += ggml_nbytes(t->src[0]);
+                }
             }
         }
-        if (n_mm == 0) {
+        if (n_dh == 0) {
             continue;
         }
 
@@ -1677,17 +1740,25 @@ static int ggml_backend_sched_ov_reorder(ggml_backend_sched_t sched, struct ggml
         }
         GGML_ASSERT((int) order.size() == ne - ps);
         // a split starts wherever two nodes of the same backend become neighbors, so that no new fusion appears
+        std::vector<const ggml_tensor *> new_cuts;
         for (int k = 1; k < (int) order.size(); k++) {
             if (wpos[order[k]] == wpos[order[k - 1]] + 1) {
                 continue;
             }
             for (int j = k; j < (int) order.size(); j++) {
                 if (!ggml_is_view_op(order[j]->op)) {
-                    cuts.insert(order[j]);
+                    if (be[ps + wpos[order[j]]] == G && (new_cuts.empty() || new_cuts.back() != order[j])) {
+                        new_cuts.push_back(order[j]);
+                    }
                     break;
                 }
             }
         }
+        // each extra split costs a launch: worth it only with enough device work to overlap
+        if (mm_bytes < new_cuts.size() * (size_t) GGML_SCHED_OV_MIN_BYTES_PER_SPLIT) {
+            continue;
+        }
+        cuts.insert(new_cuts.begin(), new_cuts.end());
         for (int i = ps; i < ne; i++) {
             graph->nodes[i] = order[i - ps];
             be[i] = tensor_backend_id(graph->nodes[i]);
@@ -3239,7 +3310,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
         const char * GGML_SCHED_OVERLAP = getenv("GGML_SCHED_OVERLAP");
         sched->ov_mode = GGML_SCHED_OVERLAP ? atoi(GGML_SCHED_OVERLAP) : 1;
         const char * GGML_SCHED_OVERLAP_PARTS = getenv("GGML_SCHED_OVERLAP_PARTS");
-        sched->ov_parts = GGML_SCHED_OVERLAP_PARTS ? atoi(GGML_SCHED_OVERLAP_PARTS) : 7;
+        sched->ov_parts = GGML_SCHED_OVERLAP_PARTS ? atoi(GGML_SCHED_OVERLAP_PARTS) : 6;
     }
 
     ggml_backend_sched_reset(sched);
