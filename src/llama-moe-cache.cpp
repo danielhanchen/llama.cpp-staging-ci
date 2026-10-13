@@ -327,14 +327,19 @@ struct llama_moe_cache::impl {
     bool  hybrid_live  = false; // the graphs of small batches use the hybrid path
     float hybrid_share = 1.0f;  // share of the missing experts that are fetched and admitted, 1 = all (no hybrid path)
 
-    // auto (LLAMA_MOE_CACHE_HYBRID and LLAMA_MOE_CACHE_FETCH not set): the first 4*hybrid_block small batches are a trial in blocks
-    // plain, hybrid, hybrid, plain (a trend such as the cache warming up cancels out); the time from one small batch to the next is
-    // credited to the path of the first, except for the first batch of a block (its graph is rebuilt); then the faster path is kept,
-    // the hybrid path only if its median is at least hybrid_margin faster
+    // auto (LLAMA_MOE_CACHE_HYBRID and LLAMA_MOE_CACHE_FETCH not set): trials of 5 blocks of hybrid_block small batches: plain (warm-up,
+    // not counted), plain, hybrid, hybrid, plain (a trend such as the cache warming up cancels out); the time from one small batch to the
+    // next is credited to the path of the first, except for the first batch of a block (its graph may be rebuilt); the hybrid path is
+    // kept only if its median is at least hybrid_margin faster, then checked again by a new trial after win_gap small batches (doubled
+    // every time, the misses go down as the cache warms up); once the plain cache is faster, the hybrid path stays off
     static constexpr int    hybrid_block  = 8;
     static constexpr double hybrid_margin = 0.03;
+    static constexpr int    hybrid_gap_max = 1024;
     bool    hybrid_auto = false;
-    int     win_done    = -1; // small batches of the trial, -1 if there is no trial (pending or decided)
+    int     win_done    = -1; // small batches of the trial, -1 if there is no trial
+    int     win_wait    = -1; // small batches until the next trial, -1 if there is none
+    int     win_gap     = 64;
+    int     win_n       = 0;  // trials done
     int64_t win_t_prev  = -1; // time of the previous small batch, -1 if it is not counted
     int     win_arm     = 0;  // path of the previous small batch (1 = hybrid)
     std::vector<int64_t> win_t[2];
@@ -823,15 +828,23 @@ struct llama_moe_cache::impl {
         return hybrid && hybrid_live && hybrid_share < 1.0f;
     }
 
-    // auto trial, called before the graph of every ubatch while it runs, after the previous ubatch finished
+    // auto trial, called before the graph of every ubatch while a trial runs or waits, after the previous ubatch finished
     void tick(int64_t n_tokens) {
-        if (!hybrid || win_done < 0) {
+        if (!hybrid || (win_done < 0 && win_wait < 0)) {
             return;
         }
         const int64_t now = ggml_time_us();
         bool small = false;
         for (const group & g : groups) {
             small = small || (g.counts != nullptr && use_device(g, n_tokens) && layers[g.layers[0]].host_dev.size() == g.banks.size());
+        }
+        if (win_done < 0) {
+            if (!small || --win_wait > 0) {
+                return;
+            }
+            win_wait   = -1;
+            win_done   = 0;
+            win_t_prev = -1;
         }
         if (win_t_prev >= 0 && small) {
             win_t[win_arm].push_back(now - win_t_prev);
@@ -840,7 +853,7 @@ struct llama_moe_cache::impl {
         if (!small) {
             return; // the next interval would include this ubatch
         }
-        if (win_done >= 4*hybrid_block) {
+        if (win_done >= 5*hybrid_block) {
             win_done = -1;
             auto median = [](std::vector<int64_t> v) {
                 std::sort(v.begin(), v.end());
@@ -848,19 +861,25 @@ struct llama_moe_cache::impl {
             };
             const double t_plain = median(win_t[0]);
             const double t_hyb   = median(win_t[1]);
-            hybrid_live = win_t[0].size() >= 3 && win_t[1].size() >= 3 && t_hyb < (1.0 - hybrid_margin)*t_plain;
-            hybrid      = hybrid_live;
-            LLAMA_LOG_INFO("llama_moe_cache: hybrid auto: %.2f ms per small batch with the plain cache, %.2f ms with the hybrid path "
+            const bool   on      = win_t[0].size() >= 3 && win_t[1].size() >= 3 && t_hyb < (1.0 - hybrid_margin)*t_plain;
+            win_n++;
+            LLAMA_LOG_INFO("llama_moe_cache: hybrid auto (trial %d): %.2f ms per small batch with the plain cache, %.2f ms with the hybrid path "
                 "(fetch share %.3f, medians of %zu and %zu) -> hybrid path %s\n",
-                t_plain/1e3, t_hyb/1e3, hybrid_share, win_t[0].size(), win_t[1].size(), hybrid_live ? "on" : "off");
+                win_n, t_plain/1e3, t_hyb/1e3, hybrid_share, win_t[0].size(), win_t[1].size(), on ? "on" : "off");
             win_t[0].clear();
             win_t[1].clear();
+            hybrid_live = on;
+            hybrid      = on;
+            if (on) {
+                win_wait = win_gap;
+                win_gap  = std::min(2*win_gap, hybrid_gap_max);
+            }
             return;
         }
         const int blk = win_done/hybrid_block;
-        win_arm     = blk == 1 || blk == 2;
+        win_arm     = blk == 2 || blk == 3;
         hybrid_live = win_arm != 0;
-        if (win_done % hybrid_block != 0) {
+        if (blk > 0 && win_done % hybrid_block != 0) {
             win_t_prev = now;
         }
         win_done++;
@@ -1484,7 +1503,7 @@ void llama_moe_cache::hybrid_probe(ggml_backend_t backend_cpu) {
 }
 
 bool llama_moe_cache::hybrid_window_pending() const {
-    return pimpl->hybrid && pimpl->win_done >= 0;
+    return pimpl->hybrid && (pimpl->win_done >= 0 || pimpl->win_wait >= 0);
 }
 
 void llama_moe_cache::hybrid_tick(int64_t n_tokens) {
