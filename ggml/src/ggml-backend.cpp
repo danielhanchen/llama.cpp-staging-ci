@@ -1928,7 +1928,7 @@ static bool ggml_backend_sched_prefetch_backend_ok(ggml_backend_sched_t sched, i
         }
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
         const char * reg_name = reg ? ggml_backend_reg_name(reg) : "";
-        if (sched->pf_mode == 1) {
+        if (sched->pf_mode != 2) {
             // other backends have not been validated yet, they can be enabled with GGML_SCHED_PREFETCH=2
             if (strcmp(reg_name, "CUDA") != 0 && strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0) {
                 return false;
@@ -2176,10 +2176,12 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
     };
 
     // pipeline parallelism keeps n_copies versions of every input, it is never used together with host weights
-    if (sched->pf_mode == 0 || sched->n_copies > 1) {
+    if (sched->n_copies > 1) {
         lend_end_unused();
         return;
     }
+    // without prefetch (GGML_SCHED_PREFETCH=0) the user may still lend memory to the graph allocator
+    const bool prefetch = sched->pf_mode != 0;
 
     // host weights written by the graph
     std::unordered_set<const ggml_tensor *> written;
@@ -2200,7 +2202,7 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
     // candidate copies, the split that copies them and how
     std::unordered_map<const ggml_tensor *, int> owner;
     std::unordered_set<const ggml_tensor *> sync_copies;
-    for (int i = 0; i < sched->n_splits; i++) {
+    for (int i = 0; i < sched->n_splits && prefetch; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
         if (!ggml_backend_sched_prefetch_backend_ok(sched, split->backend_id)) {
             continue;

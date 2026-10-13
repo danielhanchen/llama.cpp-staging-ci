@@ -324,6 +324,7 @@ struct llama_moe_cache::impl {
     std::vector<int32_t> seed_ids;
     std::vector<std::vector<int32_t>> refill; // [n_layer] experts of the last seed waiting for the lent slots to come back
     bool  refill_enabled = true;
+    bool  verify_enabled = false; // LLAMA_MOE_CACHE_VERIFY=1 (debug): compare the cached experts with host memory
     stats stats_refill;
     std::vector<std::vector<int32_t>> seed_counts; // [n_layer] routing of an earlier ubatch of the prompt, see set_seed_counts
     std::vector<ggml_backend_copy_region> seed_regions;
@@ -406,6 +407,10 @@ struct llama_moe_cache::impl {
         {
             const char * env = getenv("LLAMA_MOE_CACHE_REFILL");
             refill_enabled = env == nullptr || atoi(env) != 0;
+        }
+        {
+            const char * env = getenv("LLAMA_MOE_CACHE_VERIFY");
+            verify_enabled = env != nullptr && atoi(env) != 0;
         }
 
         // only cache layers that keep all of their experts in host memory, on the device the layer is assigned to
@@ -806,6 +811,43 @@ struct llama_moe_cache::impl {
         g.dev_gen = g.lru.gen;
     }
 
+    // debug: every slot the host state maps must hold the bytes of its expert
+    void verify(group & g, const char * tag) {
+        ggml_backend_synchronize(devices[g.id].backend);
+        const int32_t n_expert = g.lru.n_expert;
+        std::vector<uint8_t> buf;
+        size_t n_checked = 0;
+        size_t n_bad = 0;
+        for (int32_t s = 0; s < g.n_slots; ++s) {
+            const int32_t key = g.lru.key_of[s];
+            if (key < 0) {
+                continue;
+            }
+            const int32_t il = key / n_expert;
+            const int32_t e  = key % n_expert;
+            const layer & l = layers[il];
+            for (size_t ip = 0; ip < g.banks.size(); ++ip) {
+                const ggml_tensor * w = l.experts[ip];
+                const size_t sz = w->nb[2];
+                buf.resize(sz);
+                ggml_backend_tensor_get(g.banks[ip], buf.data(), (size_t) s*g.banks[ip]->nb[2], sz);
+                if (memcmp(buf.data(), (const uint8_t *) w->data + (size_t) e*sz, sz) != 0) {
+                    if (n_bad < 8) {
+                        size_t first = 0;
+                        while (first < sz && buf[first] == ((const uint8_t *) w->data)[(size_t) e*sz + first]) {
+                            first++;
+                        }
+                        LLAMA_LOG_WARN("%s: verify %s: slot %d (layer %d, expert %d, bank %zu) differs from byte %zu of %zu (n_lent = %d of %d)\n",
+                            __func__, tag, s, il, e, ip, first, sz, g.lru.n_lent, g.n_slots);
+                    }
+                    n_bad++;
+                }
+            }
+            n_checked++;
+        }
+        LLAMA_LOG_INFO("%s: verify %s: %zu slots checked, %zu bank slots differ\n", __func__, tag, n_checked, n_bad);
+    }
+
     void download(group & g) {
         ggml_backend_synchronize(devices[g.id].backend);
 
@@ -815,6 +857,9 @@ struct llama_moe_cache::impl {
 
         g.dev_gen   = g.lru.gen;
         g.dev_newer = false;
+        if (verify_enabled) {
+            verify(g, "after device lookups");
+        }
     }
 
     void prepare(int64_t n_tokens) {
@@ -857,7 +902,7 @@ struct llama_moe_cache::impl {
         if (lend_mode == 0) {
             return;
         }
-        if (lend_mode == 1 && std::count_if(devices.begin(), devices.end(), [](const device & d) { return d.host_bytes > 0 && d.buf; }) > 1) {
+        if (lend_mode != 2 && std::count_if(devices.begin(), devices.end(), [](const device & d) { return d.host_bytes > 0 && d.buf; }) > 1) {
             if (!lend_off_log) {
                 LLAMA_LOG_INFO("%s: MoE cache on several devices: the cache does not lend slots to the staging copies (LLAMA_MOE_CACHE_LEND=2 to force)\n", __func__);
                 lend_off_log = true;
@@ -877,6 +922,19 @@ struct llama_moe_cache::impl {
             return;
         }
         group & g = *gl;
+
+        // LLAMA_MOE_CACHE_LEND=3: only the copies (debug), the graph allocator keeps its own buffer
+        std::vector<ggml_backend_sched_lend_copy> only;
+        ggml_backend_sched_lend_copy * all = copies;
+        const int n_all = n_copies;
+        if (lend_mode == 3 && n_copies > 0 && copies[0].ordinal < 0) {
+            only.assign(copies + 1, copies + n_copies);
+            copies   = only.data();
+            n_copies = (int) only.size();
+            if (n_copies == 0) {
+                return;
+            }
+        }
 
         // the copies of `depth` consecutive splits are live together, the ones with a negative ordinal (graph allocator) all the time
         size_t need = 0;
@@ -917,6 +975,12 @@ struct llama_moe_cache::impl {
             copies[i].buffer = buf;
             copies[i].offset = offsets[i];
         }
+        if (copies != all) {
+            for (int i = 0; i < n_copies; ++i) {
+                all[n_all - n_copies + i].buffer = buf;
+                all[n_all - n_copies + i].offset = offsets[i];
+            }
+        }
         if (dry) {
             return;
         }
@@ -942,6 +1006,9 @@ struct llama_moe_cache::impl {
     void unlend(group & g) {
         ggml_backend_t backend = devices[g.id].backend;
         ggml_backend_synchronize(backend);
+        if (verify_enabled) {
+            verify(g, "while lent");
+        }
         const int32_t n = g.lru.n_lent;
         for (ggml_tensor * bank : g.banks) {
             ggml_backend_tensor_memset(bank, 0, (size_t) (g.n_slots - n)*bank->nb[2], (size_t) (n + 1)*bank->nb[2]);
@@ -978,6 +1045,9 @@ struct llama_moe_cache::impl {
                 stats_refill.misses += fills.size();
             }
             ids_il.clear();
+        }
+        if (verify_enabled) {
+            verify(g, "after refill");
         }
     }
 
