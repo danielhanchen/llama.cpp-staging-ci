@@ -27,6 +27,8 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <list>
+#include <thread>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -241,6 +243,29 @@ struct server_batch {
         }
     }
 };
+
+// Returning the buffer of a context checkpoint to the OS takes ~10 ms per 200 MiB (munmap), and checkpoints are dropped
+// right before a prompt is processed (invalidated by the new prompt, or evicted to make room for a new one).
+// The dropped checkpoints are freed on a background thread instead; env LLAMA_CKPT_FREE_ASYNC=0 frees them in place.
+static void checkpoints_free_async(std::list<common_prompt_checkpoint> && dropped) {
+    if (dropped.empty()) {
+        return;
+    }
+
+    static const bool disabled = [] {
+        const char * e = getenv("LLAMA_CKPT_FREE_ASYNC");
+        return e != nullptr && atoi(e) == 0;
+    }();
+
+    if (disabled) {
+        dropped.clear();
+        return;
+    }
+
+    std::thread([dropped = std::move(dropped)]() mutable {
+        dropped.clear();
+    }).detach();
+}
 
 struct server_slot {
     int id;
@@ -2537,6 +2562,8 @@ private:
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
+        std::list<common_prompt_checkpoint> dropped;
+
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin();
                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
@@ -2545,7 +2572,9 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
-                it = slot.prompt.checkpoints.erase(it);
+                auto next = std::next(it);
+                dropped.splice(dropped.end(), slot.prompt.checkpoints, it);
+                it = next;
                 continue;
             }
 
@@ -2560,7 +2589,7 @@ private:
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            dropped.splice(dropped.end(), slot.prompt.checkpoints, slot.prompt.checkpoints.begin());
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
@@ -2569,12 +2598,16 @@ private:
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
-                    it = slot.prompt.checkpoints.erase(it);
+                    auto next = std::next(it);
+                    dropped.splice(dropped.end(), slot.prompt.checkpoints, it);
+                    it = next;
                 } else {
                     ++it;
                 }
             }
         }
+
+        checkpoints_free_async(std::move(dropped));
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
@@ -3793,15 +3826,19 @@ private:
 
                             {
                                 // erase any checkpoints with pos_max > pos_next
+                                std::list<common_prompt_checkpoint> dropped;
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
-                                        it = slot.prompt.checkpoints.erase(it);
+                                        auto next = std::next(it);
+                                        dropped.splice(dropped.end(), slot.prompt.checkpoints, it);
+                                        it = next;
                                     } else {
                                         ++it;
                                     }
                                 }
+                                checkpoints_free_async(std::move(dropped));
                             }
                         }
 
