@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cmath>
 #include <map>
 #include <cstdlib>
 #include <cstring>
@@ -234,6 +235,7 @@ struct llama_moe_cache::impl {
         bool     dev_newer = false;      // the device state changed since it was last copied to the host
         size_t   expert_bytes = 0;       // all the expert tensors of one expert
         bool     dev_lookup   = false;   // small batches are looked up on the device (per group, so mixed devices work)
+        ggml_tensor * counts  = nullptr; // hybrid: use counters of the experts [n_expert, n_layer + 1], see ggml_moe_cache_assign
     };
 
     struct layer {
@@ -319,6 +321,11 @@ struct llama_moe_cache::impl {
     bool device_lookup = false; // requested, see LLAMA_MOE_CACHE_DEVICE; each group then checks its device
     std::vector<std::pair<void (*)(void *), void *>> mapped; // host buffers mapped by the cache, with the function that unmaps them
 
+    // hybrid small batches (device lookups only): the host computes the missing experts that are not fetched
+    bool  hybrid       = false; // LLAMA_MOE_CACHE_HYBRID (default on)
+    bool  hybrid_probe = false; // the fetch share is measured before the first small batch (LLAMA_MOE_CACHE_FETCH not set)
+    float hybrid_share = 1.0f;  // share of the missing experts that are fetched and admitted, 1 = all (no hybrid path)
+
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
         for (size_t i = 0; i < backends.size(); ++i) {
@@ -347,6 +354,18 @@ struct llama_moe_cache::impl {
         {
             const char * env = getenv("LLAMA_MOE_CACHE_SEED_CHECK");
             seed_check = env != nullptr && atoi(env) != 0;
+        }
+        // LLAMA_MOE_CACHE_HYBRID=0 disables the hybrid path, LLAMA_MOE_CACHE_FETCH=0..1 sets the fetch share instead of measuring it
+        {
+            const char * env = getenv("LLAMA_MOE_CACHE_HYBRID");
+            hybrid = device_lookup && (env == nullptr || atoi(env) != 0) && model.hparams.n_expert >= 4;
+            const char * env_f = getenv("LLAMA_MOE_CACHE_FETCH");
+            if (hybrid && env_f != nullptr) {
+                hybrid_share = std::min(1.0f, std::max(0.0f, (float) atof(env_f)));
+                hybrid       = hybrid_share < 1.0f;
+            } else {
+                hybrid_probe = hybrid;
+            }
         }
 
         // only cache layers that keep all of their experts in host memory, on the device the layer is assigned to
@@ -450,7 +469,7 @@ struct llama_moe_cache::impl {
                 continue;
             }
             g.lru.init(model.layers.size(), n_expert, g.n_slots);
-            n_tensors[g.id] += g.ref.size()*(1 + g.layers.size()) + (device_lookup ? 2 : 0);
+            n_tensors[g.id] += g.ref.size()*(1 + g.layers.size()) + (device_lookup ? 2 : 0) + (hybrid ? 1 : 0);
             for (int32_t il : g.layers) {
                 n_tensors[g.id] += llama_moe_cache_layer_small(model.layers[il]).size();
             }
@@ -530,6 +549,13 @@ struct llama_moe_cache::impl {
                 ggml_format_name(g.state, "moe_cache.%zu.state", ig);
                 devices[g.id].buf_size += GGML_PAD(ggml_nbytes(g.map), alignment) + GGML_PAD(ggml_nbytes(g.state), alignment);
             }
+            if (hybrid) {
+                // outside of the budget, so the number of slots does not depend on the hybrid path
+                const size_t alignment = ggml_backend_buft_get_alignment(devices[g.id].buft);
+                g.counts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, g.ref[0]->ne[2], model.layers.size() + 1);
+                ggml_format_name(g.counts, "moe_cache.%zu.counts", ig);
+                devices[g.id].buf_size += GGML_PAD(ggml_nbytes(g.counts), alignment);
+            }
         }
 
         if (model.hparams.no_alloc) {
@@ -588,6 +614,29 @@ struct llama_moe_cache::impl {
             }
             for (layer & l : layers) {
                 l.host_dev.assign(l.experts.size(), nullptr);
+            }
+        }
+
+        // the hybrid path needs the device lookup, and one device: the host computes the misses of one device at a time
+        if (hybrid) {
+            std::vector<int32_t> devs;
+            for (const group & g : groups) {
+                if (g.dev_lookup && g.n_slots > 0 && g.counts != nullptr && std::find(devs.begin(), devs.end(), g.id) == devs.end()) {
+                    devs.push_back(g.id);
+                }
+            }
+            if (devs.size() > 1 && !model.hparams.no_alloc) {
+                LLAMA_LOG_INFO("%s: the experts are cached on %zu devices, the hybrid MoE cache path is disabled (single device only)\n", __func__, devs.size());
+            }
+            if (devs.size() != 1) {
+                hybrid       = false;
+                hybrid_probe = false;
+            } else if (!model.hparams.no_alloc) {
+                if (hybrid_probe) {
+                    LLAMA_LOG_INFO("%s: hybrid MoE cache: the host computes the missing experts that are not fetched, fetch share measured at the first small batch (LLAMA_MOE_CACHE_FETCH=0..1 to set it, LLAMA_MOE_CACHE_HYBRID=0 to disable)\n", __func__);
+                } else {
+                    LLAMA_LOG_INFO("%s: hybrid MoE cache: the host computes the missing experts that are not fetched, fetch share = %.3f (LLAMA_MOE_CACHE_FETCH)\n", __func__, hybrid_share);
+                }
             }
         }
 
@@ -724,6 +773,155 @@ struct llama_moe_cache::impl {
         std::vector<ggml_tensor *> banks = g.banks;
         std::vector<const void *>  host  = l.host_dev;
         return ggml_moe_cache_lookup(ctx, ids, g.map, g.state, banks.data(), host.data(), (int) banks.size(), il);
+    }
+
+    float hybrid_fetch(int32_t il, int64_t n_ubatch) const {
+        if (!hybrid || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+            return 1.0f;
+        }
+        const group & g = groups[layers[il].ig];
+        if (g.counts == nullptr || !use_device(g, n_ubatch) || layers[il].host_dev.size() != g.banks.size()) {
+            return 1.0f;
+        }
+        // before the probe (e.g. the reserved graphs) any share below 1 builds the same graph
+        return hybrid_probe ? 0.5f : hybrid_share;
+    }
+
+    ggml_tensor * hybrid_assign(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch) const {
+        const float share = hybrid_fetch(il, n_ubatch);
+        if (share >= 1.0f || ids->ne[1] > n_ubatch || ids->ne[0] > n_expert_used) {
+            return nullptr;
+        }
+        const group & g = groups[layers[il].ig];
+        return ggml_moe_cache_assign(ctx, ids, g.map, g.state, g.counts, share, il);
+    }
+
+    ggml_tensor * hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res) const {
+        const layer & l = layers[il];
+        const group & g = groups[l.ig];
+        std::vector<ggml_tensor *> banks = g.banks;
+        std::vector<const void *>  host  = l.host_dev;
+        return ggml_moe_cache_fetch(ctx, res, banks.data(), host.data(), (int) banks.size());
+    }
+
+    bool hybrid_active() const {
+        return hybrid && (hybrid_probe || hybrid_share < 1.0f);
+    }
+
+    // fetch share: the host and the device finish at the same time when share*t_upload = (1 - share)*t_host per missing expert
+    // t_host: one token through the expert tensors of a cached layer on the host backend, t_upload: copy of an expert from host memory
+    void probe(ggml_backend_t backend_cpu) {
+        hybrid_probe = false;
+        const group * gp = nullptr;
+        for (const group & g : groups) {
+            if (g.dev_lookup && g.n_slots > 0 && g.counts != nullptr) {
+                gp = &g;
+                break;
+            }
+        }
+        if (gp == nullptr || backend_cpu == nullptr) {
+            hybrid = false;
+            return;
+        }
+        const group & g = *gp;
+        const layer & l = layers[g.layers[0]];
+        const int64_t n_expert = g.ref[0]->ne[2];
+        const int     k        = (int) std::max<int64_t>(2, std::min<int64_t>(n_expert_used, n_expert));
+        const int     n_rep    = 7;
+
+        ggml_init_params params = {
+            /*.mem_size   =*/ (4 + 3*l.experts.size())*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(16, false),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx(ggml_init(params));
+        ggml_tensor * ids_k = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, k, 1);
+        ggml_tensor * ids_1 = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, 1);
+        ggml_cgraph * gf_k  = ggml_new_graph_custom(ctx.get(), 16, false);
+        ggml_cgraph * gf_1  = ggml_new_graph_custom(ctx.get(), 16, false);
+        std::vector<ggml_tensor *> xs;
+        for (ggml_tensor * w : l.experts) {
+            ggml_tensor * x = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, w->ne[0], 1, 1);
+            xs.push_back(x);
+            ggml_build_forward_expand(gf_k, ggml_mul_mat_id(ctx.get(), w, x, ids_k));
+            ggml_build_forward_expand(gf_1, ggml_mul_mat_id(ctx.get(), w, x, ids_1));
+        }
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend_cpu));
+        if (!buf) {
+            hybrid = false;
+            return;
+        }
+        for (ggml_tensor * x : xs) {
+            std::vector<float> v(ggml_nelements(x), 0.01f);
+            ggml_backend_tensor_set(x, v.data(), 0, ggml_nbytes(x));
+        }
+
+        // different experts in every repetition, so they are read from memory as in generation
+        int64_t next = 0;
+        auto set_ids = [&](ggml_tensor * ids, int n) {
+            std::vector<int32_t> v(n);
+            for (int i = 0; i < n; ++i) {
+                v[i] = (int32_t) (next++ % n_expert);
+            }
+            ggml_backend_tensor_set(ids, v.data(), 0, n*sizeof(int32_t));
+        };
+        auto median = [](std::vector<int64_t> v) {
+            std::sort(v.begin(), v.end());
+            return (double) v[v.size()/2];
+        };
+        std::vector<int64_t> tk, t1, tu;
+        for (int r = 0; r <= n_rep; ++r) {
+            set_ids(ids_k, k);
+            int64_t t0 = ggml_time_us();
+            ggml_backend_graph_compute(backend_cpu, gf_k);
+            const int64_t dk = ggml_time_us() - t0;
+            set_ids(ids_1, 1);
+            t0 = ggml_time_us();
+            ggml_backend_graph_compute(backend_cpu, gf_1);
+            const int64_t d1 = ggml_time_us() - t0;
+            if (r > 0) {
+                tk.push_back(dk);
+                t1.push_back(d1);
+            }
+        }
+
+        // upload into the spare slot at the end of the banks (never looked up)
+        ggml_backend_t backend = devices[g.id].backend;
+        ggml_backend_synchronize(backend);
+        for (int r = 0; r <= n_rep; ++r) {
+            const int64_t t0 = ggml_time_us();
+            for (int i = 0; i < k; ++i) {
+                const int64_t e = next++ % n_expert;
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const size_t nb = l.experts[ip]->nb[2];
+                    ggml_backend_tensor_set(g.banks[ip], (const uint8_t *) l.experts[ip]->data + e*nb, (size_t) g.n_slots*nb, nb);
+                }
+            }
+            if (r > 0) {
+                tu.push_back(ggml_time_us() - t0);
+            }
+        }
+
+        const double t_k  = median(tk);
+        const double t_1  = median(t1);
+        const double slope = (t_k - t_1)/(k - 1);
+        const double t_host = std::max(slope > 0.0 ? slope : t_k/k, 1e-3);
+        const double t_up   = std::max(median(tu)/k, 1e-3);
+
+        // rounded to 1/8 so close measurements give the same share; the host path is not used when it would take less than 1/4
+        const double share = t_host/(t_host + t_up);
+        float q = (float) std::round(share*8.0)/8.0f;
+        if (q > 0.75f) {
+            q = 1.0f;
+        }
+        q = std::max(q, 0.125f);
+        hybrid_share = q;
+        if (hybrid_share >= 1.0f) {
+            hybrid = false;
+        }
+
+        LLAMA_LOG_INFO("llama_moe_cache: hybrid probe: host %.2f GB/s (%.1f us per expert, %.1f us for %d), upload %.2f GB/s (%.1f us per expert) -> fetch share %.3f%s\n",
+            g.expert_bytes/t_host/1e3, t_host, t_k, k, g.expert_bytes/t_up/1e3, t_up, hybrid_share, hybrid ? "" : " (hybrid path off)");
     }
 
     // header of the device state, see ggml_moe_cache_lookup
@@ -1144,6 +1342,20 @@ struct llama_moe_cache::impl {
                 st.bytes  += cnt[1]*g.expert_bytes;
             }
             log("device lookups (ubatch <= 32)", st);
+            if (hybrid_active() || hybrid_share < 1.0f) {
+                uint64_t n_host = 0;
+                for (const group & g : groups) {
+                    if (g.counts == nullptr || g.counts->data == nullptr || !g.dev_lookup) {
+                        continue;
+                    }
+                    uint64_t cnt = 0;
+                    ggml_backend_tensor_get(g.counts, &cnt, (size_t) g.counts->ne[0]*(g.counts->ne[1] - 1)*sizeof(int32_t), sizeof(cnt));
+                    n_host += cnt;
+                }
+                const size_t n = st.hits + st.misses + n_host;
+                LLAMA_LOG_INFO("llama_moe_cache: hybrid: fetch share = %.3f, %llu missing experts computed on the host (not fetched), hit rate with them = %.2f%%\n",
+                    hybrid_share, (unsigned long long) n_host, n > 0 ? 100.0*st.hits/n : 0.0);
+            }
         }
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
@@ -1175,6 +1387,30 @@ llama_moe_cache::~llama_moe_cache() = default;
 
 ggml_backend_t llama_moe_cache::backend(int32_t il) const {
     return pimpl->backend(il);
+}
+
+float llama_moe_cache::hybrid_fetch(int32_t il, int64_t n_ubatch) const {
+    return pimpl->hybrid_fetch(il, n_ubatch);
+}
+
+ggml_tensor * llama_moe_cache::hybrid_assign(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch) const {
+    return pimpl->hybrid_assign(ctx, il, ids, n_ubatch);
+}
+
+ggml_tensor * llama_moe_cache::hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res) const {
+    return pimpl->hybrid_fetch_experts(ctx, il, res);
+}
+
+bool llama_moe_cache::hybrid_active() const {
+    return pimpl->hybrid_active();
+}
+
+bool llama_moe_cache::hybrid_probe_pending() const {
+    return pimpl->hybrid && pimpl->hybrid_probe;
+}
+
+void llama_moe_cache::hybrid_probe(ggml_backend_t backend_cpu) {
+    pimpl->probe(backend_cpu);
 }
 
 ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, int64_t n_ubatch) const {

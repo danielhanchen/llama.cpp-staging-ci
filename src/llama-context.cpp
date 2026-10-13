@@ -726,6 +726,8 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
     ggml_backend_sched_set_prefetch_callback(sched.get(), sched_prefetch_mode, this);
+    // the hybrid MoE cache computes the missing experts on the host while the device computes the cached ones
+    ggml_backend_sched_set_overlap(sched.get(), moe_cache && moe_cache->hybrid_active());
 }
 
 void llama_context::sched_reserve() {
@@ -1521,6 +1523,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+
+    // hybrid MoE cache: the fetch share is measured with the threads of the small batches, before their first graph is built
+    if (moe_cache && moe_cache->hybrid_probe_pending() && ubatch.n_tokens <= llama_moe_cache::n_small_max && backend_cpu != nullptr) {
+        ggml_backend_sched_synchronize(sched.get());
+        set_compute_threads(ubatch.n_tokens > 1);
+        moe_cache->hybrid_probe(backend_cpu);
+        ggml_backend_sched_set_overlap(sched.get(), moe_cache->hybrid_active());
     }
 
     auto * res = get_gf_res_prev();
@@ -2766,9 +2776,7 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
             lctx->n_reallocs_same, lctx->n_reallocs_diff);
 }
 
-ggml_status llama_context::graph_compute(
-            ggml_cgraph * gf,
-                   bool   batched) {
+void llama_context::set_compute_threads(bool batched) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -2784,6 +2792,12 @@ ggml_status llama_context::graph_compute(
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
+}
+
+ggml_status llama_context::graph_compute(
+            ggml_cgraph * gf,
+                   bool   batched) {
+    set_compute_threads(batched);
 
     copy_experts.reset();
 
