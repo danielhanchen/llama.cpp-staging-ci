@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1461,7 +1462,9 @@ struct ggml_cuda_q8_1_cache {
     char * arena     = nullptr; // n_slots * slot_size bytes, owned by the graph evaluation
     size_t slot_size = 0;
     int    next      = 0;
+    int    pending   = -1; // slot reserved by a producer, see reserve()
     entry  entries[n_slots];
+    std::unordered_set<const void *> norm_targets; // RMS_NORM + MUL outputs read by a mul_mat_vec_q candidate
 
     bool active() const {
         return arena != nullptr;
@@ -1471,11 +1474,13 @@ struct ggml_cuda_q8_1_cache {
         arena     = arena_;
         slot_size = slot_size_;
         next      = 0;
+        pending   = -1;
         invalidate_all();
     }
 
     void end() {
         begin(nullptr, 0);
+        norm_targets.clear();
     }
 
     // returns the slot holding the q8_1 copy of src (quantized == true) or a slot to quantize into
@@ -1500,6 +1505,31 @@ struct ggml_cuda_q8_1_cache {
         std::copy(key, key + n_key, e.key);
         e.valid = true;
         return arena + i*slot_size;
+    }
+
+    // reserve the slot for a q8_1 copy that a producer kernel writes together with src (see ggml_cuda_op_rms_norm_fused);
+    // the entry becomes valid in commit(), after the producing nodes have invalidated what they overwrote
+    char * reserve(const void * src, size_t src_nbytes, const int64_t key[n_key], size_t q8_1_size) {
+        pending = -1;
+        if (!active() || q8_1_size > slot_size) {
+            return nullptr;
+        }
+        const int i = next;
+        next = (next + 1) % n_slots;
+        entry & e = entries[i];
+        e.src_lo = (const char *) src;
+        e.src_hi = (const char *) src + src_nbytes;
+        std::copy(key, key + n_key, e.key);
+        e.valid = false;
+        pending = i;
+        return arena + i*slot_size;
+    }
+
+    void commit() {
+        if (pending >= 0) {
+            entries[pending].valid = true;
+            pending = -1;
+        }
     }
 
     void invalidate(const void * data, size_t nbytes) {

@@ -3646,9 +3646,13 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+static bool ggml_cuda_env_flag(const char * name);
+
 // Size of one ggml_cuda_q8_1_cache slot for this graph, 0 if no activation is read by more than one
-// mul_mat_vec_q candidate (then the cache stays off and nothing changes).
-static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph) {
+// mul_mat_vec_q candidate and none is an RMS_NORM + MUL output (then the cache stays off and nothing changes).
+// norm_targets: the RMS_NORM + MUL outputs whose q8_1 copy the fused norm kernel writes.
+static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::unordered_set<const void *> & norm_targets) {
+    norm_targets.clear();
     static const bool disabled = [] {
         const char * env = getenv("GGML_CUDA_DISABLE_Q8_1_CACHE");
         return env != nullptr && atoi(env) != 0;
@@ -3678,13 +3682,36 @@ static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph) {
         }
     }
 
+    // RMS_NORM + MUL outputs that a candidate reads as a whole contiguous activation: the fused norm kernel writes their
+    // q8_1 copy directly (GGML_CUDA_DISABLE_NORM_Q8_1_FUSION=1 turns this off)
+    static const bool norm_q8_1_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_NORM_Q8_1_FUSION");
+    std::unordered_map<const void *, const ggml_tensor *> norm_outputs;
+    if (!norm_q8_1_disabled) {
+        for (int i = 0; i + 1 < cgraph->n_nodes; ++i) {
+            const ggml_tensor * norm = cgraph->nodes[i];
+            const ggml_tensor * mul  = cgraph->nodes[i + 1];
+            if (norm->op == GGML_OP_RMS_NORM && mul->op == GGML_OP_MUL && (mul->src[0] == norm || mul->src[1] == norm) &&
+                mul->type == GGML_TYPE_F32 && ggml_is_contiguous(mul) && mul->data != nullptr) {
+                norm_outputs[mul->data] = mul;
+            }
+        }
+    }
+
     size_t slot_size = 0;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!is_candidate(node) || n_readers[node->src[1]->data] < 2) {
+        if (!is_candidate(node)) {
             continue;
         }
         const ggml_tensor * src1 = node->src[1];
+        const auto it = norm_outputs.find(src1->data);
+        const bool norm_target = it != norm_outputs.end() && ggml_is_contiguous(src1) && src1->ne[0] == it->second->ne[0] &&
+            ggml_nbytes(src1) == ggml_nbytes(it->second);
+        if (norm_target) {
+            norm_targets.insert(src1->data);
+        } else if (n_readers[src1->data] < 2) {
+            continue;
+        }
         const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
         slot_size = std::max(slot_size, (size_t) (ggml_nrows(src1)*ne10_padded/QK8_1*sizeof(block_q8_1)));
     }
@@ -4615,7 +4642,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        // a mul_mat_vec_q reads this output: write its q8_1 copy in the same kernel (same key as ggml_cuda_mul_mat_vec_q
+        // uses for a contiguous src1)
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+        void * q8_1_out = nullptr;
+        ggml_cuda_q8_1_cache & cache = cuda_ctx->q8_1_cache;
+        if (cache.active() && cuda_ctx->curr_stream_no == 0 && cache.norm_targets.count(mul->data) && ggml_is_contiguous(mul)) {
+            const int64_t ne10_padded = GGML_PAD(mul->ne[0], MATRIX_ROW_PADDING);
+            const int64_t key[ggml_cuda_q8_1_cache::n_key] = { mul->ne[0], ggml_nrows(mul), 1, 1, 0, 0, 0 };
+            q8_1_out = cache.reserve(mul->data, ggml_nbytes(mul), key, ggml_nrows(mul)*ne10_padded/QK8_1*sizeof(block_q8_1));
+        }
+        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, mul, q8_1_out);
         return 1;
     }
 
@@ -4763,9 +4800,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             // q8_1 activation cache, see ggml_cuda_q8_1_cache; the arena lives for the whole evaluation
             ggml_cuda_pool_alloc<char> q8_1_cache_arena(cuda_ctx->pool());
             {
-                const size_t slot_size = stream_ctx.concurrent_events.empty() ? ggml_cuda_q8_1_cache_slot_size(cgraph) : 0;
+                std::unordered_set<const void *> norm_targets;
+                const size_t slot_size = stream_ctx.concurrent_events.empty() ? ggml_cuda_q8_1_cache_slot_size(cgraph, norm_targets) : 0;
                 if (slot_size > 0) {
                     cuda_ctx->q8_1_cache.begin(q8_1_cache_arena.alloc(ggml_cuda_q8_1_cache::n_slots*slot_size), slot_size);
+                    cuda_ctx->q8_1_cache.norm_targets = std::move(norm_targets);
                 }
             }
 
@@ -4821,6 +4860,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
                     ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, nodes_to_skip + 1);
+                    cuda_ctx->q8_1_cache.commit(); // q8_1 copy written by the fused group itself, if any
                     i += nodes_to_skip;
                     continue;
                 }
