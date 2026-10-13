@@ -1237,9 +1237,14 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
     return info;
 }
 
+static struct llama_model_params common_model_params_to_llama_impl(common_params & params, bool fit_deferred);
+static enum llama_load_mode common_moe_cache_load_mode(const common_params & params, enum llama_load_mode load_mode, int32_t n_gpu_layers, bool experts_on_host);
+static bool common_experts_on_offloaded_host(const common_params & params, const llama_model_tensor_buft_override * overrides, int32_t n_gpu_layers);
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
-    auto mparams = common_model_params_to_llama(params);
+    // with --fit the MoE cache load mode is decided after the fit has placed the experts
+    auto mparams = common_model_params_to_llama_impl(params, params.fit_params);
     auto cparams = common_context_params_to_llama(params);
 
     if (params.fit_params) {
@@ -1274,6 +1279,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+        // decide on the params the model is loaded with, whatever the fit status: a failed or skipped fit leaves the user placement, which then decides like the path without --fit
+        // the fitted overrides live in params.tensor_buft_overrides, which mparams points to
+        mparams.load_mode = common_moe_cache_load_mode(params, mparams.load_mode, mparams.n_gpu_layers, common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers));
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1773,7 +1782,149 @@ static uint64_t common_available_memory() {
 #endif
 }
 
-struct llama_model_params common_model_params_to_llama(common_params & params) {
+// number of repeating layers of the model (the <arch>.block_count key the loader reads into n_layer_all), -1 if unknown
+// for a split model the metadata is read from the first split
+static int64_t common_model_n_layer(const std::string & path) {
+    std::string fname = path;
+    static const std::regex re_split("-([0-9]{5})-of-([0-9]{5})\\.gguf$");
+    std::smatch m;
+    if (std::regex_search(path, m, re_split)) {
+        fname = path.substr(0, m.position(0)) + "-00001-of-" + m[2].str() + ".gguf";
+    }
+    struct gguf_init_params gguf_params = {
+        /* .no_alloc = */ true,
+        /* .ctx      = */ nullptr,
+    };
+    gguf_context_ptr gguf_ctx(gguf_init_from_file(fname.c_str(), gguf_params));
+    if (!gguf_ctx) {
+        return -1;
+    }
+    const int64_t arch_id = gguf_find_key(gguf_ctx.get(), "general.architecture");
+    if (arch_id < 0 || gguf_get_kv_type(gguf_ctx.get(), arch_id) != GGUF_TYPE_STRING) {
+        return -1;
+    }
+    const std::string arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
+    const int64_t id = gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str());
+    if (id < 0) {
+        return -1;
+    }
+    int64_t n_layer = -1;
+    switch (gguf_get_kv_type(gguf_ctx.get(), id)) {
+        case GGUF_TYPE_UINT32: n_layer = gguf_get_val_u32(gguf_ctx.get(), id); break;
+        case GGUF_TYPE_INT32:  n_layer = gguf_get_val_i32(gguf_ctx.get(), id); break;
+        default: break;
+    }
+    return n_layer > 0 ? n_layer : -1;
+}
+
+// whether the tensor overrides (terminated by a null pattern, nullptr for none) put every routed expert of some layer in [il_begin, il_end) served by the MoE cache in a host buffer
+// the MoE cache only serves a layer whose expert tensors are all host-resident, so an override of a single expert family is not enough
+// the loader applies the first override whose pattern matches the tensor name (std::regex_search), so try representative expert names
+static bool common_overrides_put_experts_on_host(const llama_model_tensor_buft_override * overrides, int64_t il_begin, int64_t il_end) {
+    std::vector<std::regex> patterns;
+    std::vector<bool> valid;
+    bool any_host = false;
+    for (size_t i = 0; overrides != nullptr && overrides[i].pattern != nullptr; ++i) {
+        const llama_model_tensor_buft_override & ovr = overrides[i];
+        // the loader rejects an invalid pattern anyway, here it matches nothing
+        std::regex re;
+        bool ok = true;
+        try {
+            re = std::regex(ovr.pattern);
+        } catch (const std::regex_error &) {
+            ok = false;
+        }
+        patterns.push_back(std::move(re));
+        valid.push_back(ok);
+        any_host = any_host || (ovr.buft != nullptr && ggml_backend_buft_is_host(ovr.buft));
+    }
+    if (!any_host) {
+        return false;
+    }
+    // whether the first override matching the tensor name puts it in a host buffer
+    const auto is_host = [&](int il, const char * family) {
+        const std::string name = "blk." + std::to_string(il) + "." + family + ".weight";
+        for (size_t i = 0; i < patterns.size(); ++i) {
+            if (valid[i] && std::regex_search(name, patterns[i])) {
+                return overrides[i].buft != nullptr && ggml_backend_buft_is_host(overrides[i].buft);
+            }
+        }
+        return false;
+    };
+    // the expert tensors the MoE cache serves (ffn_*_exps of llama-arch.cpp): a model has either separate gate/up/down experts or fused gate_up/down experts
+    // the tensor set of the model is unknown here, so a layer counts if either complete set is on the host
+    // the layer index matters for per-layer patterns such as --n-cpu-moe
+    for (int64_t il = il_begin; il < il_end; ++il) {
+        const bool down = is_host((int) il, "ffn_down_exps");
+        if (!down) {
+            continue;
+        }
+        if (is_host((int) il, "ffn_gate_up_exps") || (is_host((int) il, "ffn_gate_exps") && is_host((int) il, "ffn_up_exps"))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// whether the overrides put a complete host expert set on a layer the model offloads to a device: the MoE cache rejects layers assigned to the CPU
+// the placement of llama-model.cpp offloads the last n_gpu_layers of the n_layer repeating layers plus the output layer (all of them when n_gpu_layers < 0), so layers [max(n_layer + 1 - n_gpu_layers, 0), n_layer) are on a device
+// the device list and split mode only choose which device serves an offloaded layer, not whether it is offloaded; an empty device list keeps every layer on the CPU but then no device can do the lookup either
+// if the layer count cannot be read, every layer index up to 512 counts as before
+static bool common_experts_on_offloaded_host(const common_params & params, const llama_model_tensor_buft_override * overrides, int32_t n_gpu_layers) {
+    if (params.moe_cache_size <= 0 || !(n_gpu_layers < 0 || n_gpu_layers > 1)) {
+        return false;
+    }
+    const int64_t n_layer = common_model_n_layer(params.model.path);
+    if (n_layer < 0) {
+        return common_overrides_put_experts_on_host(overrides, 0, 512);
+    }
+    const int64_t n_gpu = n_gpu_layers < 0 ? n_layer + 1 : n_gpu_layers;
+    return common_overrides_put_experts_on_host(overrides, std::max<int64_t>(n_layer + 1 - n_gpu, 0), n_layer);
+}
+
+// the load mode for the MoE cache once the expert placement is known: n_gpu_layers and the tensor overrides are the ones the model is loaded with
+// n_gpu_layers: -1 is auto, <= -2 is all, 0 keeps every layer on the CPU and 1 offloads only the output layer: the MoE cache then has no repeating layer to serve, keep mmap
+// the MoE cache only serves experts kept in host memory, which the placement does not do by itself: they get there through a tensor override to a host buffer (-ot, --cpu-moe, --n-cpu-moe or the overrides written by --fit), otherwise keep mmap
+static enum llama_load_mode common_moe_cache_load_mode(const common_params & params, enum llama_load_mode load_mode, int32_t n_gpu_layers, bool experts_on_host) {
+    if (params.moe_cache_size <= 0 || !experts_on_host || load_mode != LLAMA_LOAD_MODE_AUTO || !(n_gpu_layers < 0 || n_gpu_layers > 1)) {
+        return load_mode;
+    }
+    // the device lookup of the MoE cache needs pinned host experts and mmap'ed files usually cannot be pinned: load without mmap if the model fits in system memory and a device that will be used can do the lookup (the other backends keep the host lookup, mmap costs them nothing)
+    bool dev_lookup = false;
+    if (!params.devices.empty()) {
+        for (ggml_backend_dev_t dev : params.devices) {
+            dev_lookup = dev_lookup || (dev != nullptr && llama_moe_cache_device_lookup_supported(dev));
+        }
+    } else {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                dev_lookup = dev_lookup || llama_moe_cache_device_lookup_supported(dev);
+            }
+        }
+    }
+    const char * env = getenv("LLAMA_MOE_CACHE_DEVICE");
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (dev_lookup && (env == nullptr || atoi(env) != 0) && cpu != nullptr) {
+        size_t mem_free  = 0;
+        size_t mem_total = 0;
+        ggml_backend_dev_memory(cpu, &mem_free, &mem_total);
+        uint64_t mem_avail = std::min(mem_free, mem_total);
+        const uint64_t mem_sys = common_available_memory();
+        if (mem_sys > 0) {
+            mem_avail = std::min(mem_avail, mem_sys);
+        }
+        const uint64_t model_bytes = common_model_file_bytes(params.model.path);
+        if (model_bytes > 0 && model_bytes <= 0.8*mem_avail) {
+            return LLAMA_LOAD_MODE_NONE;
+        }
+    }
+    return load_mode;
+}
+
+// fit_deferred: the caller runs common_fit_params() and decides the MoE cache load mode afterwards with common_moe_cache_load_mode() on the fitted params
+static struct llama_model_params common_model_params_to_llama_impl(common_params & params, bool fit_deferred) {
     auto mparams = llama_model_default_params();
 
     if (!params.devices.empty()) {
@@ -1784,44 +1935,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
-    // n_gpu_layers: -1 is auto, <= -2 is all, 0 keeps every layer on the CPU and 1 offloads only the output layer: the MoE cache then has no repeating layer to serve, keep mmap
-    // the MoE cache only serves experts kept in host memory, which the placement does not do by itself: they get there through a tensor override to a host buffer (-ot, --cpu-moe, --n-cpu-moe) or when --fit moves them, otherwise keep mmap
-    bool host_experts = params.fit_params;
-    for (const auto & ovr : params.tensor_buft_overrides) {
-        host_experts = host_experts || (ovr.pattern != nullptr && ovr.buft != nullptr && ggml_backend_buft_is_host(ovr.buft));
-    }
-    if (params.moe_cache_size > 0 && host_experts && params.load_mode == LLAMA_LOAD_MODE_AUTO && (params.n_gpu_layers < 0 || params.n_gpu_layers > 1)) {
-        // the device lookup of the MoE cache needs pinned host experts and mmap'ed files usually cannot be pinned: load without mmap if the model fits in system memory and a device that will be used can do the lookup (the other backends keep the host lookup, mmap costs them nothing)
-        bool dev_lookup = false;
-        if (!params.devices.empty()) {
-            for (ggml_backend_dev_t dev : params.devices) {
-                dev_lookup = dev_lookup || (dev != nullptr && llama_moe_cache_device_lookup_supported(dev));
-            }
-        } else {
-            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-                const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
-                if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                    dev_lookup = dev_lookup || llama_moe_cache_device_lookup_supported(dev);
-                }
-            }
-        }
-        const char * env = getenv("LLAMA_MOE_CACHE_DEVICE");
-        ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        if (dev_lookup && (env == nullptr || atoi(env) != 0) && cpu != nullptr) {
-            size_t mem_free  = 0;
-            size_t mem_total = 0;
-            ggml_backend_dev_memory(cpu, &mem_free, &mem_total);
-            uint64_t mem_avail = std::min(mem_free, mem_total);
-            const uint64_t mem_sys = common_available_memory();
-            if (mem_sys > 0) {
-                mem_avail = std::min(mem_avail, mem_sys);
-            }
-            const uint64_t model_bytes = common_model_file_bytes(params.model.path);
-            if (model_bytes > 0 && model_bytes <= 0.8*mem_avail) {
-                mparams.load_mode = LLAMA_LOAD_MODE_NONE;
-            }
-        }
+    // without a deferred fit decide from the overrides as they are now: a caller that never runs common_fit_params() has no fitted placement, so --fit alone is no proof of host experts
+    if (!fit_deferred) {
+        const bool experts_on_host = common_experts_on_offloaded_host(params, params.tensor_buft_overrides.empty() ? nullptr : params.tensor_buft_overrides.data(), params.n_gpu_layers);
+        mparams.load_mode = common_moe_cache_load_mode(params, mparams.load_mode, params.n_gpu_layers, experts_on_host);
     }
     mparams.lazy_mode = params.lazy_mode;
     mparams.tensor_split    = params.tensor_split;
@@ -1849,6 +1966,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     return mparams;
+}
+
+struct llama_model_params common_model_params_to_llama(common_params & params) {
+    return common_model_params_to_llama_impl(params, false);
 }
 
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
