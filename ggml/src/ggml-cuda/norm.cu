@@ -332,6 +332,95 @@ static void group_norm_f32_cuda(
     }
 }
 
+// rms_norm(x) * mul that also writes the q8_1 copy of its output for the mul_mat_vec_q consumers (see ggml_cuda_q8_1_cache).
+// The f32 output uses the same expressions as rms_norm_f32<block_size, true>; the q8_1 rows are produced from the same
+// f32 values exactly as quantize_q8_1 does (one value per lane, the same 32-lane reductions), so both outputs are
+// bit-identical to the unfused rms_norm + mul + quantize_q8_1 sequence.
+template <int block_size>
+static __global__ void rms_norm_mul_q8_1_f32(const float * x,
+                                             float *       dst,
+                                             void *        vq,
+                                             const int     ncols,
+                                             const int     ncols_padded,
+                                             const int     nchannels,
+                                             const int     nsamples,
+                                             const int64_t stride_row,
+                                             const int64_t stride_channel,
+                                             const int64_t stride_sample,
+                                             const float   eps,
+                                             const float * mul,
+                                             const int64_t mul_stride_row,
+                                             const int64_t mul_stride_channel,
+                                             const int64_t mul_stride_sample,
+                                             const uint3   mul_ncols_packed,
+                                             const uint3   mul_nrows_packed,
+                                             const uint3   mul_nchannels_packed,
+                                             const uint3   mul_nsamples_packed) {
+    static_assert(block_size % QK8_1 == 0, "a warp must cover whole q8_1 blocks");
+    ggml_cuda_pdl_lc();
+    const int nrows = gridDim.x;
+    const int row   = blockIdx.x;
+    const int tid   = threadIdx.x;
+
+    extern __shared__ float s_sum[];
+
+    ggml_cuda_pdl_sync();
+
+    for (int sample = blockIdx.z; sample < nsamples; sample += gridDim.z) {
+        for (int channel = blockIdx.y; channel < nchannels; channel += gridDim.y) {
+            const int64_t irow = ((int64_t) sample*nchannels + channel)*nrows + row;
+            const float * xc   = x   + sample*stride_sample + channel*stride_channel + row*stride_row;
+            float       * dstc = dst + irow*ncols;
+
+            const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+            const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+            const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
+            const float * mulc = mul + mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+
+            float tmp = 0.0f;
+            for (int col = tid; col < ncols; col += block_size) {
+                const float xi = xc[col];
+                tmp += xi * xi;
+            }
+            tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+            const float mean  = tmp / ncols;
+            const float scale = rsqrtf(mean + eps);
+
+            // one pass: element i0 is computed, stored and quantized by the same thread, and lane i0 % QK8_1 of its warp is
+            // the q8_1 lane quantize_q8_1 uses for it (block_size % QK8_1 == 0), so no read-back is needed
+            block_q8_1 * y = (block_q8_1 *) vq + irow*(ncols_padded/QK8_1);
+            for (int i0 = tid; i0 < ncols_padded; i0 += block_size) { // ncols_padded % WARP_SIZE == 0: whole warps
+                float xi = 0.0f;
+                if (i0 < ncols) {
+                    const int mul_col = fastmodulo(i0, mul_ncols_packed);
+                    xi       = scale * xc[i0] * mulc[mul_col];
+                    dstc[i0] = xi;
+                }
+                float amax = fabsf(xi);
+                float sum  = xi;
+
+                amax = warp_reduce_max<QK8_1>(amax);
+                sum  = warp_reduce_sum<QK8_1>(sum);
+
+                const float  d = amax / 127.0f;
+                const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+                const int64_t ib  = i0 / QK8_1;
+                const int     iqs = i0 % QK8_1;
+                y[ib].qs[iqs] = q;
+                if (iqs == 0) {
+                    y[ib].ds = make_half2(d, sum);
+                }
+            }
+
+            if constexpr (block_size > WARP_SIZE) {
+                __syncthreads();
+            }
+        }
+    }
+}
+
 template <bool do_scale = false>
 static void rms_norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
@@ -559,7 +648,7 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
     rms_norm_f32_cuda<true>(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, scale);
 }
 
-void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
+void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor, void * q8_1_out) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     float eps = 0.0f;
 
@@ -608,6 +697,32 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int mul_nrows     = mul_src->ne[1];
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
+
+    if (q8_1_out != nullptr) {
+        GGML_ASSERT(ggml_is_contiguous(mul_tensor));
+        const int ncols_padded = GGML_PAD(ne00, MATRIX_ROW_PADDING);
+        const dim3 blocks_num(ne01, MIN(ne02, UINT16_MAX), MIN(ne03, UINT16_MAX));
+        const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
+        const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
+        const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
+        const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
+        // same block size choice as rms_norm_mul_f32_cuda, so the reduction order (and the f32 output) is unchanged
+        if (ne00 < 1024) {
+            static_assert(MATRIX_ROW_PADDING % 256 == 0, "q8_1 pass must cover whole warps");
+            const dim3 block_dims(256, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32 * sizeof(float), stream};
+            ggml_cuda_kernel_launch(rms_norm_mul_q8_1_f32<256>, launch_params, src0_d, dst_d, q8_1_out, (int) ne00, ncols_padded,
+                (int) ne02, (int) ne03, s01, s02, s03, eps, mul_d, mul_s01, mul_s02, mul_s03,
+                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
+        } else {
+            const dim3 block_dims(1024, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32 * sizeof(float), stream};
+            ggml_cuda_kernel_launch(rms_norm_mul_q8_1_f32<1024>, launch_params, src0_d, dst_d, q8_1_out, (int) ne00, ncols_padded,
+                (int) ne02, (int) ne03, s01, s02, s03, eps, mul_d, mul_s01, mul_s02, mul_s03,
+                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
+        }
+        return;
+    }
 
     rms_norm_mul_f32_cuda(src0_d, mul_d, nullptr, dst_d,
                           ne00, ne01, ne02, ne03,
