@@ -49,10 +49,10 @@ public:
     bool hybrid_probe_pending() const;
     void hybrid_probe(ggml_backend_t backend_cpu);
 
-    // auto mode: before the graph of each ubatch, while the decision window is open (the backends must be synchronized when it closes)
-    // returns true if the hybrid path was turned on
+    // auto mode: before the graph of each ubatch while the trial runs, after the previous ubatch finished (backends synchronized);
+    // switches between the plain and the hybrid path, then keeps the faster one (see hybrid_active)
     bool hybrid_window_pending() const;
-    bool hybrid_tick(int64_t n_tokens);
+    void hybrid_tick(int64_t n_tokens);
 
     // device copy of a small per-expert host tensor (scale or bias) of a cached layer, nullptr if there is none
     ggml_tensor * get_resident(const ggml_tensor * t) const;

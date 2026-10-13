@@ -327,16 +327,17 @@ struct llama_moe_cache::impl {
     bool  hybrid_live  = false; // the graphs of small batches use the hybrid path
     float hybrid_share = 1.0f;  // share of the missing experts that are fetched and admitted, 1 = all (no hybrid path)
 
-    // auto (LLAMA_MOE_CACHE_HYBRID and LLAMA_MOE_CACHE_FETCH not set): the first hybrid_window small batches use the plain cache and
-    // count its misses, then the hybrid path is used if the uploads it saves take longer than its fixed cost per layer
-    static constexpr int hybrid_window = 32;
-    bool     hybrid_auto   = false;
-    int      win_done      = -1; // small batches counted, -1 if there is no window (pending or decided)
-    int64_t  win_lookups   = 0;  // layer lookups in the window
-    uint64_t win_misses0   = 0;  // device misses before the window
-    double   t_host_us     = 0.0; // host time per missing expert
-    double   t_up_us       = 0.0; // upload time per missing expert
-    double   t_fixed_us    = 0.0; // fixed cost of the hybrid path per layer (host graph, copies and synchronizations)
+    // auto (LLAMA_MOE_CACHE_HYBRID and LLAMA_MOE_CACHE_FETCH not set): the first 4*hybrid_block small batches are a trial in blocks
+    // plain, hybrid, hybrid, plain (a trend such as the cache warming up cancels out); the time from one small batch to the next is
+    // credited to the path of the first, except for the first batch of a block (its graph is rebuilt); then the faster path is kept,
+    // the hybrid path only if its median is at least hybrid_margin faster
+    static constexpr int    hybrid_block  = 8;
+    static constexpr double hybrid_margin = 0.03;
+    bool    hybrid_auto = false;
+    int     win_done    = -1; // small batches of the trial, -1 if there is no trial (pending or decided)
+    int64_t win_t_prev  = -1; // time of the previous small batch, -1 if it is not counted
+    int     win_arm     = 0;  // path of the previous small batch (1 = hybrid)
+    std::vector<int64_t> win_t[2];
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
@@ -822,47 +823,47 @@ struct llama_moe_cache::impl {
         return hybrid && hybrid_live && hybrid_share < 1.0f;
     }
 
-    uint64_t device_misses() const {
-        uint64_t res = 0;
+    // auto trial, called before the graph of every ubatch while it runs, after the previous ubatch finished
+    void tick(int64_t n_tokens) {
+        if (!hybrid || win_done < 0) {
+            return;
+        }
+        const int64_t now = ggml_time_us();
+        bool small = false;
         for (const group & g : groups) {
-            if (g.counts != nullptr && g.dev_lookup && g.state != nullptr && g.state->data != nullptr) {
-                uint64_t cnt = 0;
-                ggml_backend_tensor_get(g.state, &cnt, 4*sizeof(int32_t), sizeof(cnt));
-                res += cnt;
-            }
+            small = small || (g.counts != nullptr && use_device(g, n_tokens) && layers[g.layers[0]].host_dev.size() == g.banks.size());
         }
-        return res;
-    }
-
-    // auto: count the window, then decide; the caller synchronized the backends; returns true if the hybrid path was turned on
-    bool tick(int64_t n_tokens) {
-        if (!hybrid || hybrid_live || win_done < 0) {
-            return false;
+        if (win_t_prev >= 0 && small) {
+            win_t[win_arm].push_back(now - win_t_prev);
         }
-        if (win_done >= hybrid_window) {
+        win_t_prev = -1;
+        if (!small) {
+            return; // the next interval would include this ubatch
+        }
+        if (win_done >= 4*hybrid_block) {
             win_done = -1;
-            // per layer: the hybrid path saves the uploads of the missing experts left to the host, the host must not be the slower side
-            const double m    = win_lookups > 0 ? (double) (device_misses() - win_misses0)/win_lookups : 0.0;
-            const double f    = hybrid_share;
-            const double gain = (1.0 - f)*m*t_up_us - t_fixed_us - std::max(0.0, (1.0 - f)*m*t_host_us - f*m*t_up_us);
-            hybrid_live = gain > 0.0;
-            if (!hybrid_live) {
-                hybrid = false;
-            }
-            LLAMA_LOG_INFO("llama_moe_cache: hybrid auto: %.2f missing experts per layer lookup in %d small batches, fetch share %.3f, "
-                "expected gain %.1f us per layer (fixed cost %.1f us) -> hybrid path %s\n",
-                m, hybrid_window, f, gain, t_fixed_us, hybrid_live ? "on" : "off");
-            return hybrid_live;
+            auto median = [](std::vector<int64_t> v) {
+                std::sort(v.begin(), v.end());
+                return v.empty() ? 0.0 : (double) v[v.size()/2];
+            };
+            const double t_plain = median(win_t[0]);
+            const double t_hyb   = median(win_t[1]);
+            hybrid_live = win_t[0].size() >= 3 && win_t[1].size() >= 3 && t_hyb < (1.0 - hybrid_margin)*t_plain;
+            hybrid      = hybrid_live;
+            LLAMA_LOG_INFO("llama_moe_cache: hybrid auto: %.2f ms per small batch with the plain cache, %.2f ms with the hybrid path "
+                "(fetch share %.3f, medians of %zu and %zu) -> hybrid path %s\n",
+                t_plain/1e3, t_hyb/1e3, hybrid_share, win_t[0].size(), win_t[1].size(), hybrid_live ? "on" : "off");
+            win_t[0].clear();
+            win_t[1].clear();
+            return;
         }
-        bool any = false;
-        for (const group & g : groups) {
-            if (g.counts != nullptr && use_device(g, n_tokens) && layers[g.layers[0]].host_dev.size() == g.banks.size()) {
-                win_lookups += (int64_t) g.layers.size();
-                any = true;
-            }
+        const int blk = win_done/hybrid_block;
+        win_arm     = blk == 1 || blk == 2;
+        hybrid_live = win_arm != 0;
+        if (win_done % hybrid_block != 0) {
+            win_t_prev = now;
         }
-        win_done += any ? 1 : 0;
-        return false;
+        win_done++;
     }
 
     // fetch share: the host and the device finish at the same time when share*t_upload = (1 - share)*t_host per missing expert
@@ -959,46 +960,11 @@ struct llama_moe_cache::impl {
             }
         }
 
-        // fixed cost of a hybrid layer: the device -> host copies of its input and ids, the host -> device copy of its result,
-        // each with a synchronization (the sched copies of the host split), plus the launch of two graphs (estimate)
-        double t_rt = 0.0;
-        {
-            const size_t n_embd = l.experts[0]->ne[0];
-            const size_t nb_in  = n_embd*sizeof(float);
-            const size_t nb_out = (size_t) l.experts.back()->ne[1]*k*sizeof(float);
-            ggml_init_params p2 = { ggml_tensor_overhead(), nullptr, true };
-            ggml_context_ptr ctx2(ggml_init(p2));
-            ggml_tensor * t = ggml_new_tensor_1d(ctx2.get(), GGML_TYPE_I8, std::max(nb_in, nb_out));
-            ggml_backend_buffer_ptr buf2(ggml_backend_alloc_ctx_tensors_from_buft(ctx2.get(), devices[g.id].buft));
-            if (buf2) {
-                std::vector<uint8_t> h(ggml_nbytes(t), 0);
-                std::vector<int64_t> tr;
-                for (int r = 0; r <= n_rep; ++r) {
-                    const int64_t t0 = ggml_time_us();
-                    ggml_backend_synchronize(backend);
-                    ggml_backend_tensor_get(t, h.data(), 0, nb_in);
-                    ggml_backend_tensor_get(t, h.data(), 0, k*sizeof(int32_t));
-                    ggml_backend_synchronize(backend);
-                    ggml_backend_tensor_set(t, h.data(), 0, nb_out);
-                    ggml_backend_synchronize(backend);
-                    if (r > 0) {
-                        tr.push_back(ggml_time_us() - t0);
-                    }
-                }
-                t_rt = median(tr);
-            } else {
-                t_rt = 1e9; // cannot measure: no hybrid path
-            }
-        }
-
         const double t_k  = median(tk);
         const double t_1  = median(t1);
         const double slope = (t_k - t_1)/(k - 1);
         const double t_host = std::max(slope > 0.0 ? slope : t_k/k, 1e-3);
         const double t_up   = std::max(median(tu)/k, 1e-3);
-        t_host_us  = t_host;
-        t_up_us    = t_up;
-        t_fixed_us = std::max(0.0, t_1 - t_host) + t_rt + 20.0;
 
         // rounded to 1/8 so close measurements give the same share; the host path is not used when it would take less than 1/4
         const double share = t_host/(t_host + t_up);
@@ -1011,17 +977,16 @@ struct llama_moe_cache::impl {
         if (hybrid_share >= 1.0f) {
             hybrid = false;
         } else if (hybrid_auto) {
-            win_done    = 0;
-            win_lookups = 0;
-            win_misses0 = device_misses();
+            win_done   = 0;
+            win_t_prev = -1;
         } else {
             hybrid_live = true;
         }
 
-        LLAMA_LOG_INFO("llama_moe_cache: hybrid probe: host %.2f GB/s (%.1f us per expert, %.1f us for %d), upload %.2f GB/s (%.1f us per expert), "
-            "fixed cost %.1f us per layer -> fetch share %.3f%s\n",
-            g.expert_bytes/t_host/1e3, t_host, t_k, k, g.expert_bytes/t_up/1e3, t_up, t_fixed_us, hybrid_share,
-            !hybrid ? " (hybrid path off)" : hybrid_auto ? ", deciding after a window of small batches" : "");
+        LLAMA_LOG_INFO("llama_moe_cache: hybrid probe: host %.2f GB/s (%.1f us per expert, %.1f us for %d), upload %.2f GB/s (%.1f us per expert) "
+            "-> fetch share %.3f%s\n",
+            g.expert_bytes/t_host/1e3, t_host, t_k, k, g.expert_bytes/t_up/1e3, t_up, hybrid_share,
+            !hybrid ? " (hybrid path off)" : hybrid_auto ? ", trial of the first small batches" : "");
     }
 
     // header of the device state, see ggml_moe_cache_lookup
@@ -1519,11 +1484,11 @@ void llama_moe_cache::hybrid_probe(ggml_backend_t backend_cpu) {
 }
 
 bool llama_moe_cache::hybrid_window_pending() const {
-    return pimpl->hybrid && !pimpl->hybrid_live && pimpl->win_done >= 0;
+    return pimpl->hybrid && pimpl->win_done >= 0;
 }
 
-bool llama_moe_cache::hybrid_tick(int64_t n_tokens) {
-    return pimpl->tick(n_tokens);
+void llama_moe_cache::hybrid_tick(int64_t n_tokens) {
+    pimpl->tick(n_tokens);
 }
 
 ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, int64_t n_ubatch) const {
