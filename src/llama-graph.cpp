@@ -2283,7 +2283,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
-    // hybrid: the host computes the missing experts that the MoE cache does not fetch (see llama_moe_cache::hybrid_fetch)
+    // hybrid: the host computes the missing experts that the MoE cache does not fetch (see llama_moe_cache::hybrid_assign)
     bool hybrid_ok = moe_cache != nullptr && backend_cpu != nullptr && !weight_before_ffn && arch != LLM_ARCH_GROVEMOE;
     for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
         if (w == nullptr || !hybrid_ok) {
@@ -2582,12 +2582,19 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
         if (!ggml_is_contiguous(ids)) {
             ids = ggml_cont(ctx0, ids);
         }
-        if (ggml_tensor * res = moe_cache->hybrid_assign(ctx0, il, ids, n_tokens)) {
+        bool host = false;
+        if (ggml_tensor * res = moe_cache->hybrid_assign(ctx0, il, ids, n_tokens, host)) {
             ggml_backend_sched_set_tensor_backend(sched, res, moe_cache->backend(il));
             cb(res, "ffn_moe_assign", il);
             ggml_build_forward_expand(gf, res);
-            *hybrid = res;
-            return nullptr;
+            if (host) {
+                *hybrid = res;
+                return nullptr;
+            }
+            ggml_tensor * slots = moe_cache->hybrid_fetch_experts(ctx0, il, res);
+            ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
+            cb(slots, "ffn_moe_slots", il);
+            return slots;
         }
     }
 

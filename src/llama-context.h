@@ -414,7 +414,7 @@ private:
 
     // value of moe_cache_seed when the current graph was allocated: the scheduler plans the copies of the experts with it
     bool moe_cache_seed_graph = false;
-    bool moe_cache_hybrid_graph = false; // the previous graph uses the hybrid MoE cache path
+    int  moe_cache_hybrid_graph = 0; // llama_moe_cache::hybrid_mode of the previous graph
 
     // routing outputs of the last computed large ubatch (expert tensor, ids), valid until the next graph is built
     std::vector<std::pair<const ggml_tensor *, const ggml_tensor *>> moe_cache_ids;

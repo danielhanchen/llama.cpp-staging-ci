@@ -35,15 +35,15 @@ public:
 
     // hybrid small batches [LLAMA_MOE_CACHE_HYBRID, LLAMA_MOE_CACHE_FETCH]: the GPU computes the cached experts, the host computes the
     // missing ones it is left; only a share of the missing experts is fetched and admitted
-    // the share of the missing experts of layer il that are fetched, 1 if the layer does not use the hybrid path
-    float hybrid_fetch(int32_t il, int64_t n_ubatch) const;
-
-    // the hybrid lookup of layer il (see ggml_moe_cache_assign) and the copies of the experts it admits (see ggml_moe_cache_fetch)
-    ggml_tensor * hybrid_assign(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch) const;
+    // the hybrid lookup of layer il (see ggml_moe_cache_assign), nullptr if the layer does not use it, and the copies of the experts it
+    // admits (see ggml_moe_cache_fetch); host = false: every missing expert is fetched (the use counters are kept while the hybrid path is off)
+    ggml_tensor * hybrid_assign(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch, bool & host) const;
     ggml_tensor * hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res) const;
 
     // true if the graphs of small batches may use the hybrid path
     bool hybrid_active() const;
+    // graph key: 0 = plain lookups, 1 = lookups that keep the use counters, 2 = hybrid
+    int  hybrid_mode() const;
 
     // the fetch share is measured once, before the first small batch: the host computes the experts of a layer with the decode threads
     bool hybrid_probe_pending() const;

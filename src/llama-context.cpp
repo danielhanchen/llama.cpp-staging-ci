@@ -1550,7 +1550,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     // the copies of the experts are planned with the seed mode of the MoE cache (see sched_copy_all_experts)
-    const bool moe_cache_hybrid = moe_cache && moe_cache->hybrid_active();
+    const int moe_cache_hybrid = moe_cache ? moe_cache->hybrid_mode() : 0;
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams) && moe_cache_seed_graph == moe_cache_seed &&
             moe_cache_hybrid_graph == moe_cache_hybrid) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
