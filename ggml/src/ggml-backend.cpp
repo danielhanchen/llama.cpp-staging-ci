@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -944,6 +945,13 @@ struct ggml_backend_sched_split {
     size_t pf_size; // bytes of its weight copies in the slot
     // copies issued ahead on the copy queue, else the regular path fills the slot (a callback changed since the graph was allocated)
     bool pf_async;
+    // CPU/GPU overlap: a host split copies its inputs from backend ov_src with async copies and one event (-1 if not),
+    // issued at the start of split ov_issue_at (<= this split), so that the GPU splits in between run while the host split waits or computes
+    int  ov_src;
+    int  ov_issue_at;
+    // index of the host split whose copies are issued at the start of this split (-1 if none)
+    int  ov_issue_for;
+    bool ov_issued; // the copies of this host split were issued during the current compute
 };
 
 // host weight prefetch state of a backend: the copies live in a staging arena of `depth` slots outside the graph allocator, so they never alias
@@ -973,6 +981,16 @@ struct ggml_backend_sched_prefetch {
     int issued;
     int consumed;
     bool pending; // work was queued on the copy queue since it was last synchronized
+};
+
+// CPU/GPU split overlap state of a device backend [GGML_SCHED_OVERLAP]
+struct ggml_backend_sched_overlap {
+    bool checked;
+    bool eligible;
+    ggml_backend_event_t ready;  // recorded after the async copies of the inputs of a host split
+    bool ready_pending;          // copies were queued and their host split has not waited for them yet
+    ggml_backend_event_t upload; // recorded after uploads that read host compute memory without a synchronization
+    bool upload_pending;         // `upload` has not been waited on yet
 };
 
 struct ggml_backend_sched {
@@ -1032,6 +1050,12 @@ struct ggml_backend_sched {
     int  pf_depth;     // number of staging slots per backend
     bool pf_active;    // the current graph has prefetched splits
     struct ggml_backend_sched_prefetch pf[GGML_SCHED_MAX_BACKENDS];
+
+    // CPU/GPU split overlap [GGML_SCHED_OVERLAP]
+    int  ov_mode;   // 0 = off, 1 = CUDA-family backends, 2 = any backend with async copies and events
+    bool ov_active; // the current graph uses the overlap
+    int  ov_logged[4];
+    struct ggml_backend_sched_overlap ov[GGML_SCHED_MAX_BACKENDS];
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -1271,6 +1295,458 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     }
 }
 
+//
+// CPU/GPU split overlap [GGML_SCHED_OVERLAP]
+// a host split (e.g. MoE experts in host memory) waits for one event after async copies of its inputs instead of
+// synchronizing the device per input, and device work that is independent of it is queued before it, so that both run concurrently
+//
+
+static const struct ggml_tensor * ggml_backend_sched_ov_root(const struct ggml_tensor * t) {
+    while (t->view_src != NULL) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+static bool ggml_backend_sched_ov_is_host(ggml_backend_sched_t sched, int backend_id) {
+    return ggml_backend_buft_is_host(sched->bufts[backend_id]);
+}
+
+// device backend whose work can be ordered with events against the host splits
+static bool ggml_backend_sched_ov_backend_ok(ggml_backend_sched_t sched, int backend_id) {
+    struct ggml_backend_sched_overlap * ov = &sched->ov[backend_id];
+    if (!ov->checked) {
+        ov->checked  = true;
+        ov->eligible = false;
+
+        ggml_backend_t     backend = sched->backends[backend_id];
+        ggml_backend_dev_t dev     = backend->device;
+        if (sched->ov_mode == 0 || sched->n_copies > 1 || dev == NULL || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU ||
+            ggml_backend_sched_ov_is_host(sched, backend_id)) {
+            return false;
+        }
+        if (backend->iface.event_record == NULL || backend->iface.get_tensor_async == NULL || backend->iface.set_tensor_async == NULL) {
+            return false;
+        }
+        struct ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        if (!props.caps.async || !props.caps.events) {
+            return false;
+        }
+        // a device that reads host compute memory directly could race with a host split
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (ggml_backend_sched_ov_is_host(sched, b) && ggml_backend_supports_buft(backend, sched->bufts[b])) {
+                return false;
+            }
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        const char * reg_name = reg ? ggml_backend_reg_name(reg) : "";
+        if (sched->ov_mode == 1) {
+            // other backends have not been validated yet, they can be enabled with GGML_SCHED_OVERLAP=2
+            if (strcmp(reg_name, "CUDA") != 0 && strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0) {
+                return false;
+            }
+        }
+        ov->ready  = ggml_backend_event_new(dev);
+        ov->upload = ggml_backend_event_new(dev);
+        if (ov->ready == NULL || ov->upload == NULL) {
+            ggml_backend_event_free(ov->ready);
+            ggml_backend_event_free(ov->upload);
+            ov->ready  = NULL;
+            ov->upload = NULL;
+            return false;
+        }
+        ov->eligible = true;
+    }
+    return ov->eligible;
+}
+
+// ops that may be moved: no hidden reads or writes outside of their sources and their own result
+static bool ggml_backend_sched_ov_movable_op(const struct ggml_tensor * t) {
+    switch (t->op) {
+        case GGML_OP_MAP_CUSTOM1:
+        case GGML_OP_MAP_CUSTOM2:
+        case GGML_OP_MAP_CUSTOM3:
+        case GGML_OP_CUSTOM:
+        case GGML_OP_OPT_STEP_ADAMW:
+        case GGML_OP_OPT_STEP_SGD:
+        case GGML_OP_MOE_CACHE_LOOKUP:
+            return false;
+        default:
+            break;
+    }
+    // writes into another tensor (in-place ops, cpy, set_rows)
+    return t->view_src == NULL || ggml_op_is_empty(t->op);
+}
+
+// the graph has no ops with hidden side effects and no device node reads experts or rows of host weights: their copies
+// may go through the copy callback, which can also write device memory (e.g. the slots of a MoE cache) at the start of a split
+static bool ggml_backend_sched_ov_graph_ok(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+        if (node->op == GGML_OP_MOE_CACHE_LOOKUP || node->op == GGML_OP_CUSTOM ||
+            node->op == GGML_OP_MAP_CUSTOM1 || node->op == GGML_OP_MAP_CUSTOM2 || node->op == GGML_OP_MAP_CUSTOM3) {
+            return false;
+        }
+        if (node->op != GGML_OP_MUL_MAT_ID && node->op != GGML_OP_GET_ROWS) {
+            continue;
+        }
+        const int b = tensor_backend_id(node);
+        if (b < 0 || ggml_backend_sched_ov_is_host(sched, b)) {
+            continue;
+        }
+        const struct ggml_tensor * root = ggml_backend_sched_ov_root(node->src[0]);
+        if (root->buffer != NULL && ggml_backend_buffer_get_usage(root->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+            ggml_backend_buffer_is_host(root->buffer)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// reorders the nodes around each host run C between device runs P and N of the same device backend G:
+//   A (P nodes needed by C, and the P nodes that cannot move with their sources), D (the rest of P),
+//   H (N nodes that need neither C nor the rest of N), C, N \ H
+// a new split starts at D u H, so the copies of the inputs of C are issued after A and C runs while the device computes D u H
+// only independent pure nodes move, so the results are the same; returns the number of reordered windows
+static int ggml_backend_sched_ov_reorder(ggml_backend_sched_t sched, struct ggml_cgraph * graph,
+        std::unordered_set<const ggml_tensor *> & cuts, int & n_moved) {
+    const int n = graph->n_nodes;
+    if (n == 0) {
+        return 0;
+    }
+
+    // roots written by nodes: readers of them keep their place
+    std::unordered_set<const ggml_tensor *> written;
+    for (int i = 0; i < n; i++) {
+        const struct ggml_tensor * node = graph->nodes[i];
+        if (node->view_src != NULL && !ggml_op_is_empty(node->op)) {
+            written.insert(ggml_backend_sched_ov_root(node));
+        }
+    }
+
+    // a source outside the window that a moved node may read: an earlier result, an input or an unmodified weight
+    auto outside_ok = [&](const struct ggml_tensor * s) {
+        const struct ggml_tensor * root = ggml_backend_sched_ov_root(s);
+        if (written.count(root) > 0) {
+            return false;
+        }
+        if (root->op != GGML_OP_NONE) {
+            return true;
+        }
+        if (root->flags & GGML_TENSOR_FLAG_INPUT) {
+            return true;
+        }
+        return root->buffer != NULL && ggml_backend_buffer_get_usage(root->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+    };
+
+    std::vector<int> be(n);
+    for (int i = 0; i < n; i++) {
+        be[i] = tensor_backend_id(graph->nodes[i]);
+    }
+
+    // runs of non-view nodes of the same backend, as split in pass 5 (views belong to the run of the node before them)
+    struct run { int start; int end; int backend; };
+    std::vector<run> runs;
+    auto find_runs = [&]() {
+        runs.clear();
+        for (int i = 0; i < n; i++) {
+            if (ggml_is_view_op(graph->nodes[i]->op)) {
+                continue;
+            }
+            if (runs.empty()) {
+                runs.push_back({0, n, be[i]});
+            } else if (be[i] != runs.back().backend) {
+                runs.back().end = i;
+                runs.push_back({i, n, be[i]});
+            }
+        }
+    };
+
+    std::unordered_map<const ggml_tensor *, int> wpos; // window node -> index in the window
+    std::vector<char> cls;                             // per window index: 0 = A, 1 = D, 2 = C, 3 = H, 4 = N \ H
+    std::vector<int> stack;
+    std::vector<ggml_tensor *> order;
+
+    // srcs of t and its view source
+    auto for_srcs = [](const struct ggml_tensor * t, const std::function<void(const struct ggml_tensor *)> & f) {
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (t->src[j] != NULL) {
+                f(t->src[j]);
+            }
+        }
+        if (t->view_src != NULL) {
+            f(t->view_src);
+        }
+    };
+
+    int n_windows = 0;
+    int pos = 0;
+    while (true) {
+        find_runs();
+        int r = -1;
+        for (int k = 1; k < (int) runs.size(); k++) {
+            if (runs[k].start >= pos && ggml_backend_sched_ov_is_host(sched, runs[k].backend)) {
+                r = k;
+                break;
+            }
+        }
+        if (r < 0) {
+            break;
+        }
+        const int G  = runs[r - 1].backend;
+        const int ps = runs[r - 1].start;
+        const int cs = runs[r].start;
+        const int ce = runs[r].end;
+        const int ne = (r + 1 < (int) runs.size() && runs[r + 1].backend == G) ? runs[r + 1].end : ce;
+        pos = ce;
+        if (ggml_backend_sched_ov_is_host(sched, G) || !ggml_backend_sched_ov_backend_ok(sched, G)) {
+            continue;
+        }
+
+        wpos.clear();
+        for (int i = ps; i < ne; i++) {
+            wpos[graph->nodes[i]] = i - ps;
+        }
+        cls.assign(ne - ps, 1);
+        for (int i = cs; i < ce; i++) {
+            cls[i - ps] = 2;
+        }
+        for (int i = ce; i < ne; i++) {
+            cls[i - ps] = 4;
+        }
+
+        auto movable = [&](int i) {
+            const struct ggml_tensor * t = graph->nodes[i];
+            if (be[i] != G || !ggml_backend_sched_ov_movable_op(t)) {
+                return false;
+            }
+            bool ok = true;
+            for_srcs(t, [&](const struct ggml_tensor * s) {
+                if (wpos.count(s) == 0 && !outside_ok(s)) {
+                    ok = false;
+                }
+            });
+            return ok;
+        };
+
+        // A: ancestors in P of C and of the P nodes that stay
+        stack.clear();
+        for (int i = ps; i < cs; i++) {
+            if (!movable(i)) {
+                cls[i - ps] = 0;
+                stack.push_back(i);
+            }
+        }
+        for (int i = cs; i < ce; i++) {
+            stack.push_back(i);
+        }
+        while (!stack.empty()) {
+            const int i = stack.back();
+            stack.pop_back();
+            for_srcs(graph->nodes[i], [&](const struct ggml_tensor * s) {
+                auto it = wpos.find(s);
+                if (it != wpos.end() && it->second < cs - ps && cls[it->second] == 1) {
+                    cls[it->second] = 0;
+                    stack.push_back(ps + it->second);
+                }
+            });
+        }
+
+        // H: N nodes whose window sources are in P or H
+        for (int i = ce; i < ne; i++) {
+            if (!movable(i)) {
+                continue;
+            }
+            bool ok = true;
+            for_srcs(graph->nodes[i], [&](const struct ggml_tensor * s) {
+                auto it = wpos.find(s);
+                if (it != wpos.end() && it->second >= cs - ps && cls[it->second] != 3) {
+                    ok = false;
+                }
+            });
+            if (ok) {
+                cls[i - ps] = 3;
+            }
+        }
+
+        // worth a split only with matrix multiplications to overlap
+        int n_a  = 0;
+        int n_dh = 0;
+        int n_mm = 0;
+        for (int i = ps; i < ne; i++) {
+            const char c = cls[i - ps];
+            n_a += c == 0;
+            if (c == 1 || c == 3) {
+                n_dh++;
+                const enum ggml_op op = graph->nodes[i]->op;
+                n_mm += op == GGML_OP_MUL_MAT || op == GGML_OP_MUL_MAT_ID;
+            }
+        }
+        if (n_mm == 0) {
+            continue;
+        }
+
+        order.clear();
+        for (char c : { 0, 1, 3, 2, 4 }) {
+            for (int i = ps; i < ne; i++) {
+                if (cls[i - ps] == c) {
+                    order.push_back(graph->nodes[i]);
+                }
+            }
+        }
+        GGML_ASSERT((int) order.size() == ne - ps);
+        const ggml_tensor * cut = NULL;
+        for (int k = n_a; k < n_a + n_dh && cut == NULL; k++) {
+            if (!ggml_is_view_op(order[k]->op)) {
+                cut = order[k];
+            }
+        }
+        for (int i = ps; i < ne; i++) {
+            graph->nodes[i] = order[i - ps];
+            be[i] = tensor_backend_id(graph->nodes[i]);
+        }
+        if (cut != NULL) {
+            cuts.insert(cut);
+        }
+        n_moved += n_dh;
+        n_windows++;
+        // continue after C in the new order
+        pos = ps + n_a + n_dh + (ce - cs);
+    }
+    return n_windows;
+}
+
+// a host split input copied from device backend ov_src with an async copy (decided again at compute time, when the buffers are known)
+static bool ggml_backend_sched_ov_early_input(ggml_backend_sched_t sched, const struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
+    const int G = split->ov_src;
+    if (G < 0 || tensor_backend_id(input) != G) {
+        return false;
+    }
+    for (const struct ggml_tensor * t = input; t != NULL; t = t->view_src) {
+        if (t->flags & GGML_TENSOR_FLAG_INPUT) {
+            return false;
+        }
+    }
+    if (input->data == NULL || input->buffer == NULL ||
+        ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
+        ggml_backend_buffer_get_type(input->buffer) != ggml_backend_get_default_buffer_type(sched->backends[G])) {
+        return false;
+    }
+    const struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
+    return input_cpy != NULL && input_cpy->data != NULL && input_cpy->buffer != NULL && ggml_backend_buffer_is_host(input_cpy->buffer);
+}
+
+// for each host split: the device backend of its inputs and the earliest split at whose start their copies can be issued
+//   the splits in between run on that backend, write none of the copied tensors, and (after the first one) read no host
+//   compute memory, which the copies may overwrite (their destinations are allocated at the host split)
+static void ggml_backend_sched_ov_plan(ggml_backend_sched_t sched, int & n_early, int & n_ahead) {
+    n_early = 0;
+    n_ahead = 0;
+    for (int i = 0; i < sched->n_splits; i++) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        split->ov_src       = -1;
+        split->ov_issue_at  = -1;
+        split->ov_issue_for = -1;
+        split->ov_issued    = false;
+    }
+    if (!sched->ov_active) {
+        return;
+    }
+    std::unordered_set<const ggml_tensor *> roots;
+    for (int s = 0; s < sched->n_splits; s++) {
+        struct ggml_backend_sched_split * split = &sched->splits[s];
+        if (!ggml_backend_sched_ov_is_host(sched, split->backend_id)) {
+            continue;
+        }
+        int G = -1;
+        roots.clear();
+        for (int j = 0; j < split->n_inputs; j++) {
+            struct ggml_tensor * input = split->inputs[j];
+            const int b = tensor_backend_id(input);
+            if (b < 0 || ggml_backend_sched_ov_is_host(sched, b) || !ggml_backend_sched_ov_backend_ok(sched, b) || (G >= 0 && b != G)) {
+                continue;
+            }
+            G = b;
+            roots.insert(ggml_backend_sched_ov_root(input));
+        }
+        if (G < 0) {
+            continue;
+        }
+        int e = s;
+        for (int j = s - 1; j >= 0; j--) {
+            const struct ggml_backend_sched_split * sj = &sched->splits[j];
+            if (sj->backend_id != G) {
+                break;
+            }
+            bool writes = false;
+            for (int k = 0; k < sj->graph.n_nodes && !writes; k++) {
+                writes = roots.count(ggml_backend_sched_ov_root(sj->graph.nodes[k])) > 0;
+            }
+            if (writes) {
+                break;
+            }
+            e = j;
+            bool host_input = false;
+            for (int k = 0; k < sj->n_inputs && !host_input; k++) {
+                const int b = tensor_backend_id(sj->inputs[k]);
+                host_input = b < 0 || (ggml_backend_sched_ov_is_host(sched, b) && ggml_backend_sched_ov_root(sj->inputs[k])->op != GGML_OP_NONE);
+            }
+            if (host_input) {
+                break;
+            }
+        }
+        split->ov_src      = G;
+        split->ov_issue_at = e;
+        if (e < s) {
+            sched->splits[e].ov_issue_for = s;
+            n_ahead++;
+        }
+        n_early++;
+    }
+}
+
+// wait for the uploads that read host compute memory, except those queued on backend `except` (ordered with its later work)
+static void ggml_backend_sched_ov_wait_uploads(ggml_backend_sched_t sched, int except) {
+    for (int b = 0; b < sched->n_backends; b++) {
+        struct ggml_backend_sched_overlap * ov = &sched->ov[b];
+        if (ov->upload_pending && b != except) {
+            ggml_backend_event_synchronize(ov->upload);
+            ov->upload_pending = false;
+        }
+    }
+}
+
+// queue the async copies of the device inputs of host split s and record its event
+static void ggml_backend_sched_ov_issue(ggml_backend_sched_t sched, int s) {
+    struct ggml_backend_sched_split * split = &sched->splits[s];
+    const int G = split->ov_src;
+    ggml_backend_t backend = sched->backends[G];
+    // a pending upload of another backend may still read the host memory that the copies write
+    ggml_backend_sched_ov_wait_uploads(sched, G);
+    for (int j = 0; j < split->n_inputs; j++) {
+        struct ggml_tensor * input = split->inputs[j];
+        if (ggml_backend_sched_ov_early_input(sched, split, input)) {
+            struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
+            ggml_backend_tensor_get_async(backend, input, input_cpy->data, 0, ggml_nbytes(input));
+        }
+    }
+    ggml_backend_event_record(sched->ov[G].ready, backend);
+    sched->ov[G].ready_pending = true;
+    split->ov_issued = true;
+}
+
+// wait for all async copies into host memory (a computation stopped before their host split, or memory is about to be reallocated)
+static void ggml_backend_sched_ov_drain(ggml_backend_sched_t sched) {
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->ov[b].ready_pending) {
+            ggml_backend_event_synchronize(sched->ov[b].ready);
+            sched->ov[b].ready_pending = false;
+        }
+    }
+    ggml_backend_sched_ov_wait_uploads(sched, -1);
+}
+
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
@@ -1504,6 +1980,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         GGML_ASSERT(*cur_backend_id != -1);
     }
 
+    // pass 4b: queue the device work that does not depend on a host split before it [GGML_SCHED_OVERLAP]
+    std::unordered_set<const ggml_tensor *> ov_cuts;
+    int ov_windows = 0;
+    int ov_moved   = 0;
+    sched->ov_active = sched->ov_mode != 0 && sched->n_copies == 1 && ggml_backend_sched_ov_graph_ok(sched, graph);
+    if (sched->ov_active) {
+        ov_windows = ggml_backend_sched_ov_reorder(sched, graph, ov_cuts, ov_moved);
+    }
+
     // pass 5: split graph, find tensors that need to be copied
     {
         int i_split = 0;
@@ -1551,6 +2036,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         }
                     }
                 }
+            }
+
+            // the device work moved ahead of a host split starts its own split
+            if (node_backend_id == cur_backend_id && !ov_cuts.empty() && ov_cuts.count(node) > 0) {
+                need_new_split = true;
             }
 
             if (node_backend_id != cur_backend_id || need_new_split) {
@@ -1690,6 +2180,18 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->graph = ggml_graph_view(graph, split->i_start, split->i_end);
 
         ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph, &opt_params);
+    }
+
+    {
+        int ov_early = 0;
+        int ov_ahead = 0;
+        ggml_backend_sched_ov_plan(sched, ov_early, ov_ahead);
+        const int stats[4] = { ov_early, ov_ahead, ov_windows, ov_moved };
+        if ((ov_early > 0 || ov_windows > 0) && memcmp(stats, sched->ov_logged, sizeof(stats)) != 0) {
+            memcpy(sched->ov_logged, stats, sizeof(stats));
+            GGML_LOG_INFO("%s: sched overlap: %d host splits with async input copies (%d issued ahead), %d windows reordered (%d nodes moved)\n",
+                __func__, ov_early, ov_ahead, ov_windows, ov_moved);
+        }
     }
 
     // each dep is added to graph_copy as a GGML_OP_NONE node with the kept tensors as srcs
@@ -2368,7 +2870,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
 
 // without pipeline parallelism, a host split input is queued as an async upload instead of a sync copy (2 host syncs per input)
 // the caller synchronizes the split backend once after all of them, so the host data can be overwritten when compute_splits moves on
-static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, bool & synced) {
+// with the CPU/GPU overlap, an upload from host compute memory (written only by later host splits) neither waits for the backend
+// nor is waited for here: `relaxed` is set and the caller records an event that host work waits for before it overwrites the memory
+static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, bool & synced, bool & relaxed) {
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
 
@@ -2383,7 +2887,14 @@ static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, st
         return false;
     }
 
-    if (!synced) {
+    bool ov = sched->ov_active && ggml_backend_sched_ov_backend_ok(sched, split_backend_id) &&
+        ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        ggml_backend_sched_ov_root(input)->op != GGML_OP_NONE;
+    for (const struct ggml_tensor * t = input; t != NULL && ov; t = t->view_src) {
+        ov = (t->flags & GGML_TENSOR_FLAG_INPUT) == 0;
+    }
+
+    if (!synced && !ov) {
         // wait for the split backend to finish using its input copies before overwriting them
         ggml_backend_synchronize(split_backend);
         synced = true;
@@ -2393,6 +2904,7 @@ static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, st
         ggml_backend_synchronize(ggml_backend_sched_get_tensor_backend(sched, input));
     }
     ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+    relaxed = ov;
     return true;
 }
 
@@ -2411,6 +2923,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_event_record(pf->start, sched->backends[b]);
             ggml_backend_event_wait(pf->copy_backend, pf->start);
             pf->pending = true;
+        }
+    }
+
+    if (sched->ov_active) {
+        for (int i = 0; i < sched->n_splits; i++) {
+            splits[i].ov_issued = false;
         }
     }
 
@@ -2433,14 +2951,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // host split: its device inputs arrive with async copies and one event, the device keeps computing the work queued after them
+        const bool ov_copies = sched->ov_active && split->ov_src >= 0;
+        if (sched->ov_active && ggml_backend_sched_ov_is_host(sched, split_backend_id)) {
+            if (ov_copies) {
+                if (!split->ov_issued) {
+                    ggml_backend_sched_ov_issue(sched, split_id);
+                }
+                ggml_backend_event_synchronize(sched->ov[split->ov_src].ready);
+                sched->ov[split->ov_src].ready_pending = false;
+            }
+            // the host work of this split may overwrite host memory that pending uploads read
+            ggml_backend_sched_ov_wait_uploads(sched, -1);
+        }
+
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
         bool upload_synced  = false;
         bool upload_pending = false;
+        bool upload_relaxed = false;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
-                if (ggml_backend_sched_upload_input_async(sched, split, split->inputs[input_id], upload_synced)) {
-                    upload_pending = true;
+                if (ov_copies && ggml_backend_sched_ov_early_input(sched, split, split->inputs[input_id])) {
+                    continue; // copied with the event waited above
+                }
+                bool relaxed = false;
+                if (ggml_backend_sched_upload_input_async(sched, split, split->inputs[input_id], upload_synced, relaxed)) {
+                    upload_relaxed |= relaxed;
+                    upload_pending |= !relaxed;
                     continue;
                 }
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
@@ -2449,6 +2987,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (upload_pending) {
             // queued before the wait on the prefetched copies of this split, so it never waits for the copy queue
             ggml_backend_synchronize(split_backend);
+        } else if (upload_relaxed) {
+            ggml_backend_event_record(sched->ov[split_backend_id].upload, split_backend);
+            sched->ov[split_backend_id].upload_pending = true;
         }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
@@ -2457,6 +2998,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
+        }
+
+        // the inputs of a later host split are complete: copy them now, the work of this split overlaps the host split
+        if (sched->ov_active && split->ov_issue_for >= 0) {
+            ggml_backend_sched_ov_issue(sched, split->ov_issue_for);
         }
 
         const bool pf_split = sched->pf_active && split->pf_ordinal >= 0;
@@ -2473,6 +3019,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 ggml_backend_sched_prefetch_drain(sched);
+                ggml_backend_sched_ov_drain(sched);
                 return ec;
             }
         } else {
@@ -2496,6 +3043,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
                     ggml_backend_sched_prefetch_drain(sched);
+                    ggml_backend_sched_ov_drain(sched);
                     return ec;
                 }
 
@@ -2601,6 +3149,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->pf_mode      = GGML_SCHED_PREFETCH           ? atoi(GGML_SCHED_PREFETCH)           : 1;
         sched->pf_depth     = GGML_SCHED_PREFETCH_DEPTH     ? atoi(GGML_SCHED_PREFETCH_DEPTH)     : 2;
         sched->pf_depth     = std::min(std::max(sched->pf_depth, 1), GGML_SCHED_MAX_PREFETCH_DEPTH);
+
+        const char * GGML_SCHED_OVERLAP = getenv("GGML_SCHED_OVERLAP");
+        sched->ov_mode = GGML_SCHED_OVERLAP ? atoi(GGML_SCHED_OVERLAP) : 1;
     }
 
     ggml_backend_sched_reset(sched);
@@ -2618,6 +3169,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         }
     }
     for (int b = 0; b < sched->n_backends; b++) {
+        // the backends may already be freed: the events are released by their devices
+        ggml_backend_event_free(sched->ov[b].ready);
+        ggml_backend_event_free(sched->ov[b].upload);
         if (sched->pf[b].copy_backend != NULL) {
             ggml_backend_synchronize(sched->pf[b].copy_backend);
         }
@@ -2707,6 +3261,9 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
 
+    // the allocation may move host compute memory that pending copies read or write
+    ggml_backend_sched_ov_drain(sched);
+
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
@@ -2751,6 +3308,8 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
+        sched->ov[i].upload_pending = false;
+        sched->ov[i].ready_pending  = false;
     }
     ggml_backend_sched_prefetch_drain(sched);
     if (!sched->is_alloc) {
