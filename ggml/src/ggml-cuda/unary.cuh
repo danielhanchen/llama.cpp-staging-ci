@@ -95,6 +95,29 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
+// chain of single-input f32 elementwise ops (SCALE, CLAMP, SQR, SQRT, SIN, COS, LOG, UNARY), applied in registers
+#define GGML_CUDA_EW_CHAIN_MAX 8
+
+struct ggml_cuda_ew_chain {
+    int   n_ops;
+    int   op[GGML_CUDA_EW_CHAIN_MAX]; // ggml_cuda_ew_chain_op_code()
+    float p0[GGML_CUDA_EW_CHAIN_MAX];
+    float p1[GGML_CUDA_EW_CHAIN_MAX];
+};
+
+// -1 when the node cannot be part of a chain, else the code stored in ggml_cuda_ew_chain::op
+int ggml_cuda_ew_chain_op_code(const ggml_tensor * node);
+
+// dst = ops(src), src and dst contiguous f32 with the same number of elements
+void ggml_cuda_op_ew_chain(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst, const ggml_cuda_ew_chain & chain);
+
+// MUL(other, UNARY(gate)) where gate has one element per row of other (ne0 == 1), e.g. a shared expert gate
+bool ggml_cuda_unary_mul_gate_supported(const ggml_tensor * unary_node);
+void ggml_cuda_op_unary_mul_gate(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
+
+// MUL(UNARY(ADD(a, bias)), scale) with bias and scale one ne0-row each, e.g. the delta-net alpha gate
+void ggml_cuda_op_add_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * unary_node, ggml_tensor * mul_node);
+
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
     return x / (1.0f + expf(-x));
 }

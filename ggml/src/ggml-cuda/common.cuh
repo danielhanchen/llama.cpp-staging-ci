@@ -1443,10 +1443,88 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// q8_1 copies of mul_mat_vec_q activations, valid within one graph evaluation.
+// Several matrix-vector products often consume the same activation (Q/K/V, gate/up of the routed and shared experts,
+// linear-attention projections, ...): the first consumer quantizes into a slot, later ones reuse it.
+// An entry is dropped as soon as any node writes to memory overlapping its source.
+struct ggml_cuda_q8_1_cache {
+    static constexpr int n_slots = 8;
+    static constexpr int n_key   = 7; // ne10, ne11, ne12, ne13, s11, s12, s13 (see ggml_cuda_mul_mat_vec_q)
+
+    struct entry {
+        const char * src_lo = nullptr; // byte range of the f32 source read by the quantization
+        const char * src_hi = nullptr;
+        int64_t      key[n_key] = {};
+        bool         valid  = false;
+    };
+
+    char * arena     = nullptr; // n_slots * slot_size bytes, owned by the graph evaluation
+    size_t slot_size = 0;
+    int    next      = 0;
+    entry  entries[n_slots];
+
+    bool active() const {
+        return arena != nullptr;
+    }
+
+    void begin(char * arena_, size_t slot_size_) {
+        arena     = arena_;
+        slot_size = slot_size_;
+        next      = 0;
+        invalidate_all();
+    }
+
+    void end() {
+        begin(nullptr, 0);
+    }
+
+    // returns the slot holding the q8_1 copy of src (quantized == true) or a slot to quantize into
+    // (quantized == false), nullptr if the activation does not fit
+    char * get(const void * src, size_t src_nbytes, const int64_t key[n_key], size_t q8_1_size, bool & quantized) {
+        quantized = false;
+        if (!active() || q8_1_size > slot_size) {
+            return nullptr;
+        }
+        for (int i = 0; i < n_slots; ++i) {
+            const entry & e = entries[i];
+            if (e.valid && e.src_lo == (const char *) src && std::equal(e.key, e.key + n_key, key)) {
+                quantized = true;
+                return arena + i*slot_size;
+            }
+        }
+        const int i = next;
+        next = (next + 1) % n_slots;
+        entry & e = entries[i];
+        e.src_lo = (const char *) src;
+        e.src_hi = (const char *) src + src_nbytes;
+        std::copy(key, key + n_key, e.key);
+        e.valid = true;
+        return arena + i*slot_size;
+    }
+
+    void invalidate(const void * data, size_t nbytes) {
+        const char * lo = (const char *) data;
+        const char * hi = lo + nbytes;
+        for (entry & e : entries) {
+            if (e.valid && lo < e.src_hi && e.src_lo < hi) {
+                e.valid = false;
+            }
+        }
+    }
+
+    void invalidate_all() {
+        for (entry & e : entries) {
+            e.valid = false;
+        }
+    }
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    ggml_cuda_q8_1_cache q8_1_cache;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
