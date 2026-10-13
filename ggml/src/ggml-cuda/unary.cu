@@ -778,3 +778,246 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
 }
+
+/* fused chains of single-input elementwise ops */
+
+enum ggml_cuda_ew_code {
+    GGML_CUDA_EW_SCALE = 0,
+    GGML_CUDA_EW_CLAMP,
+    GGML_CUDA_EW_SQR,
+    GGML_CUDA_EW_SQRT,
+    GGML_CUDA_EW_SIN,
+    GGML_CUDA_EW_COS,
+    GGML_CUDA_EW_LOG,
+    GGML_CUDA_EW_UNARY, // + ggml_unary_op
+};
+
+int ggml_cuda_ew_chain_op_code(const ggml_tensor * node) {
+    switch (node->op) {
+        case GGML_OP_SCALE: return GGML_CUDA_EW_SCALE;
+        case GGML_OP_CLAMP: return GGML_CUDA_EW_CLAMP;
+        case GGML_OP_SQR:   return GGML_CUDA_EW_SQR;
+        case GGML_OP_SQRT:  return GGML_CUDA_EW_SQRT;
+        case GGML_OP_SIN:   return GGML_CUDA_EW_SIN;
+        case GGML_OP_COS:   return GGML_CUDA_EW_COS;
+        case GGML_OP_LOG:   return GGML_CUDA_EW_LOG;
+        case GGML_OP_UNARY:
+            switch (ggml_get_unary_op(node)) {
+                case GGML_UNARY_OP_ABS:
+                case GGML_UNARY_OP_SGN:
+                case GGML_UNARY_OP_NEG:
+                case GGML_UNARY_OP_STEP:
+                case GGML_UNARY_OP_TANH:
+                case GGML_UNARY_OP_ELU:
+                case GGML_UNARY_OP_RELU:
+                case GGML_UNARY_OP_SIGMOID:
+                case GGML_UNARY_OP_GELU:
+                case GGML_UNARY_OP_GELU_QUICK:
+                case GGML_UNARY_OP_SILU:
+                case GGML_UNARY_OP_HARDSWISH:
+                case GGML_UNARY_OP_HARDSIGMOID:
+                case GGML_UNARY_OP_EXP:
+                case GGML_UNARY_OP_EXPM1:
+                case GGML_UNARY_OP_SOFTPLUS:
+                case GGML_UNARY_OP_GELU_ERF:
+                case GGML_UNARY_OP_FLOOR:
+                case GGML_UNARY_OP_CEIL:
+                case GGML_UNARY_OP_ROUND:
+                case GGML_UNARY_OP_TRUNC:
+                    return GGML_CUDA_EW_UNARY + (int) ggml_get_unary_op(node);
+                default:
+                    return -1;
+            }
+        default:
+            return -1;
+    }
+}
+
+// same expressions as the single-op kernels (scale_f32, op_clamp_kernel, unary_op_kernel), so the result is bit-identical
+static __device__ __forceinline__ float ew_chain_apply(const int code, const float p0, const float p1, const float x) {
+    switch (code) {
+        case GGML_CUDA_EW_SCALE: return p0 * x + p1;
+        case GGML_CUDA_EW_CLAMP: return fminf(fmaxf(x, p0), p1);
+        case GGML_CUDA_EW_SQR:   return op_sqr(x);
+        case GGML_CUDA_EW_SQRT:  return op_sqrt(x);
+        case GGML_CUDA_EW_SIN:   return op_sin(x);
+        case GGML_CUDA_EW_COS:   return op_cos(x);
+        case GGML_CUDA_EW_LOG:   return op_log(x);
+        case GGML_CUDA_EW_UNARY + GGML_UNARY_OP_ABS:         return op_abs(x);
+        case GGML_CUDA_EW_UNARY + GGML_UNARY_OP_SGN:         return op_sgn(x);
+        case GGML_CUDA_EW_UNARY + GGML_UNARY_OP_NEG:         return op_neg(x);
+        case GGML_CUDA_EW_UNARY + GGML_UNARY_OP_STEP:        return op_step(x);
+        case GGML_CUDA_EW_UNARY + GGML_UNARY_OP_TANH:        return op_tanh(x);
+        case GGML_CUDA_EW_UNARY + GGML_UNARY_OP_ELU:         return op_elu(x);
+        case GGML_CUDA_EW_UNARY + GGML_UNARY_OP_RELU:        return op_relu(x);
+        case GGML_CUDA_EW_UNARY + GGML_UNARY_OP_SIGMOID:     return op_sigmoid(x);
+        case GGML_CUDA_EW_UNARY + GGML_UNARY_OP_GELU:        return op_gelu(x);
+        case GGML_CUDA_EW_UNARY + GGML_UNARY_OP_GELU_QUICK:  return op_gelu_quick(x);
+        case GGML_CUDA_EW_UNARY + GGML_UNARY_OP_SILU:        return op_silu(x);
+        case GGML_CUDA_EW_UNARY + GGML_UNARY_OP_HARDSWISH:   return op_hardswish(x);
+        case GGML_CUDA_EW_UNARY + GGML_UNARY_OP_HARDSIGMOID: return op_hardsigmoid(x);
+        case GGML_CUDA_EW_UNARY + GGML_UNARY_OP_EXP:         return op_exp(x);
+        case GGML_CUDA_EW_UNARY + GGML_UNARY_OP_EXPM1:       return op_expm1(x);
+        case GGML_CUDA_EW_UNARY + GGML_UNARY_OP_SOFTPLUS:    return op_softplus(x);
+        case GGML_CUDA_EW_UNARY + GGML_UNARY_OP_GELU_ERF:    return op_gelu_erf(x);
+        case GGML_CUDA_EW_UNARY + GGML_UNARY_OP_FLOOR:       return op_floor(x);
+        case GGML_CUDA_EW_UNARY + GGML_UNARY_OP_CEIL:        return op_ceil(x);
+        case GGML_CUDA_EW_UNARY + GGML_UNARY_OP_ROUND:       return op_round(x);
+        case GGML_CUDA_EW_UNARY + GGML_UNARY_OP_TRUNC:       return op_trunc(x);
+        default: return x; // unreachable: the host only builds chains of supported codes
+    }
+}
+
+static __global__ void ew_chain_f32_kernel(const float * x, float * dst, const int64_t k, const ggml_cuda_ew_chain chain) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    float v = x[i];
+#pragma unroll 1
+    for (int j = 0; j < chain.n_ops; ++j) {
+        v = ew_chain_apply(chain.op[j], chain.p0[j], chain.p1[j], v);
+    }
+    dst[i] = v;
+}
+
+void ggml_cuda_op_ew_chain(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst, const ggml_cuda_ew_chain & chain) {
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_nelements(src) == ggml_nelements(dst));
+    GGML_ASSERT(chain.n_ops > 0 && chain.n_ops <= GGML_CUDA_EW_CHAIN_MAX);
+
+    const int64_t k = ggml_nelements(dst);
+    const int64_t num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(ew_chain_f32_kernel, launch_params, (const float *) src->data, (float *) dst->data, k, chain);
+}
+
+/* fused unary + mul with a one-element-per-row gate */
+
+template <float (*op)(float)>
+static __global__ void unary_mul_gate_f32_kernel(const float * g, const float * x, float * dst, const int64_t k, const int64_t n,
+                                                 const int64_t sg, const int64_t sx) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t row = i / n;
+    ggml_cuda_pdl_sync();
+    // MUL(x, UNARY(g)) is x * op(g); float multiplication commutes, so this equals the unfused result
+    dst[i] = op(g[row*sg]) * x[row*sx + i % n];
+}
+
+template <float (*op)(float)>
+static void unary_mul_gate_f32_cuda(const float * g, const float * x, float * dst, const int64_t k, const int64_t n,
+                                    const int64_t sg, const int64_t sx, cudaStream_t stream) {
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(unary_mul_gate_f32_kernel<op>, launch_params, g, x, dst, k, n, sg, sx);
+}
+
+bool ggml_cuda_unary_mul_gate_supported(const ggml_tensor * unary_node) {
+    if (unary_node->op != GGML_OP_UNARY) {
+        return false;
+    }
+    switch (ggml_get_unary_op(unary_node)) {
+        case GGML_UNARY_OP_SIGMOID:
+        case GGML_UNARY_OP_SILU:
+        case GGML_UNARY_OP_SOFTPLUS:
+        case GGML_UNARY_OP_TANH:
+        case GGML_UNARY_OP_EXP:
+            return true;
+        default:
+            return false;
+    }
+}
+
+void ggml_cuda_op_unary_mul_gate(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
+    const ggml_tensor * g = unary_node->src[0];
+    const ggml_tensor * x = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
+
+    GGML_ASSERT(g->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && mul_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->ne[0] == 1 && ggml_are_same_shape(x, mul_node));
+    GGML_ASSERT(g->ne[1] == x->ne[1] && g->ne[2] == x->ne[2] && g->ne[3] == x->ne[3]);
+    GGML_ASSERT(ggml_is_contiguous_1(g) && ggml_is_contiguous_1(x) && x->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_is_contiguous(mul_node));
+
+    const int64_t k  = ggml_nelements(mul_node);
+    const int64_t n  = x->ne[0];
+    const int64_t sg = g->nb[1] / sizeof(float);
+    const int64_t sx = x->nb[1] / sizeof(float);
+    const float * g_d = (const float *) g->data;
+    const float * x_d = (const float *) x->data;
+    float * dst_d     = (float *) mul_node->data;
+    cudaStream_t stream = ctx.stream();
+
+    switch (ggml_get_unary_op(unary_node)) {
+        case GGML_UNARY_OP_SIGMOID:  unary_mul_gate_f32_cuda<op_sigmoid> (g_d, x_d, dst_d, k, n, sg, sx, stream); break;
+        case GGML_UNARY_OP_SILU:     unary_mul_gate_f32_cuda<op_silu>    (g_d, x_d, dst_d, k, n, sg, sx, stream); break;
+        case GGML_UNARY_OP_SOFTPLUS: unary_mul_gate_f32_cuda<op_softplus>(g_d, x_d, dst_d, k, n, sg, sx, stream); break;
+        case GGML_UNARY_OP_TANH:     unary_mul_gate_f32_cuda<op_tanh>    (g_d, x_d, dst_d, k, n, sg, sx, stream); break;
+        case GGML_UNARY_OP_EXP:      unary_mul_gate_f32_cuda<op_exp>     (g_d, x_d, dst_d, k, n, sg, sx, stream); break;
+        default: GGML_ABORT("unsupported unary op for the fused gate mul");
+    }
+}
+
+/* fused add (bias) + unary + mul (scale), bias and scale broadcast over the rows */
+
+template <float (*op)(float)>
+static __global__ void add_unary_mul_f32_kernel(const float * a, const float * bias, const float * scale, float * dst,
+                                                const int64_t k, const int64_t n) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t h = i % n;
+    ggml_cuda_pdl_sync();
+    // float addition and multiplication commute: equal to ADD, UNARY, MUL run one by one in either operand order
+    dst[i] = op(a[i] + bias[h]) * scale[h];
+}
+
+template <float (*op)(float)>
+static void add_unary_mul_f32_cuda(const float * a, const float * bias, const float * scale, float * dst, const int64_t k,
+                                   const int64_t n, cudaStream_t stream) {
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(add_unary_mul_f32_kernel<op>, launch_params, a, bias, scale, dst, k, n);
+}
+
+void ggml_cuda_op_add_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * unary_node, ggml_tensor * mul_node) {
+    const ggml_tensor * a     = ggml_are_same_shape(add_node->src[0], add_node) ? add_node->src[0] : add_node->src[1];
+    const ggml_tensor * bias  = a == add_node->src[0] ? add_node->src[1] : add_node->src[0];
+    const ggml_tensor * scale = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
+
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && bias->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 && mul_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(a, mul_node) && ggml_is_contiguous(a) && ggml_is_contiguous(mul_node));
+    GGML_ASSERT(bias->ne[0] == a->ne[0] && scale->ne[0] == a->ne[0] && ggml_nrows(bias) == 1 && ggml_nrows(scale) == 1);
+    GGML_ASSERT(ggml_is_contiguous(bias) && ggml_is_contiguous(scale));
+
+    const int64_t k = ggml_nelements(mul_node);
+    const int64_t n = a->ne[0];
+    const float * a_d = (const float *) a->data;
+    const float * b_d = (const float *) bias->data;
+    const float * s_d = (const float *) scale->data;
+    float * dst_d     = (float *) mul_node->data;
+    cudaStream_t stream = ctx.stream();
+
+    switch (ggml_get_unary_op(unary_node)) {
+        case GGML_UNARY_OP_SIGMOID:  add_unary_mul_f32_cuda<op_sigmoid> (a_d, b_d, s_d, dst_d, k, n, stream); break;
+        case GGML_UNARY_OP_SILU:     add_unary_mul_f32_cuda<op_silu>    (a_d, b_d, s_d, dst_d, k, n, stream); break;
+        case GGML_UNARY_OP_SOFTPLUS: add_unary_mul_f32_cuda<op_softplus>(a_d, b_d, s_d, dst_d, k, n, stream); break;
+        case GGML_UNARY_OP_TANH:     add_unary_mul_f32_cuda<op_tanh>    (a_d, b_d, s_d, dst_d, k, n, stream); break;
+        case GGML_UNARY_OP_EXP:      add_unary_mul_f32_cuda<op_exp>     (a_d, b_d, s_d, dst_d, k, n, stream); break;
+        default: GGML_ABORT("unsupported unary op for the fused add + unary + mul");
+    }
+}

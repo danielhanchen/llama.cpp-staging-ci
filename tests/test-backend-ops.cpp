@@ -3543,6 +3543,94 @@ struct test_softcap : public test_case {
     }
 };
 
+// chain of single-input elementwise ops (SCALE / CLAMP / SQR / SQRT / SIN / COS / LOG / UNARY), fused by some backends
+struct test_ew_chain : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const std::string chain; // ops separated by '+', see build_graph()
+    const std::string tail;  // "reuse": the first intermediate is read again past the chain
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "EW_CHAIN";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, ne, chain, tail);
+    }
+
+    test_ew_chain(ggml_type type, std::array<int64_t, 4> ne, std::string chain, std::string tail = "")
+        : type(type), ne(ne), chain(std::move(chain)), tail(std::move(tail)) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // inputs in [0.1, 2] keep sqrt / log defined whatever comes first
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, 0.1f, 2.0f);
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * cur = a;
+        ggml_tensor * first = nullptr;
+        size_t pos = 0;
+        while (pos <= chain.size()) {
+            const size_t end = std::min(chain.find('+', pos), chain.size());
+            const std::string op = chain.substr(pos, end - pos);
+            pos = end + 1;
+            if (op == "scale") {
+                cur = ggml_scale(ctx, cur, 0.75f);
+            } else if (op == "scale_bias") {
+                cur = ggml_scale_bias(ctx, cur, -1.25f, 0.5f);
+            } else if (op == "clamp") {
+                cur = ggml_clamp(ctx, cur, -0.5f, 0.8f);
+            } else if (op == "sqr") {
+                cur = ggml_sqr(ctx, cur);
+            } else if (op == "sqrt") {
+                cur = ggml_sqrt(ctx, ggml_abs(ctx, cur));
+            } else if (op == "sin") {
+                cur = ggml_sin(ctx, cur);
+            } else if (op == "cos") {
+                cur = ggml_cos(ctx, cur);
+            } else if (op == "log") {
+                cur = ggml_log(ctx, ggml_exp(ctx, cur));
+            } else if (op == "silu") {
+                cur = ggml_silu(ctx, cur);
+            } else if (op == "sigmoid") {
+                cur = ggml_sigmoid(ctx, cur);
+            } else if (op == "tanh") {
+                cur = ggml_tanh(ctx, cur);
+            } else if (op == "gelu") {
+                cur = ggml_gelu(ctx, cur);
+            } else if (op == "relu") {
+                cur = ggml_relu(ctx, cur);
+            } else if (op == "neg") {
+                cur = ggml_neg(ctx, cur);
+            } else if (op == "softplus") {
+                cur = ggml_softplus(ctx, cur);
+            } else if (op == "inplace_scale") {
+                cur = ggml_scale_inplace(ctx, cur, 1.5f);
+            } else {
+                GGML_ABORT("unknown op %s", op.c_str());
+            }
+            if (first == nullptr) {
+                first = cur;
+            }
+        }
+        if (tail == "reuse") {
+            cur = ggml_add(ctx, cur, first);
+        } else if (!tail.empty()) {
+            GGML_ABORT("unknown tail %s", tail.c_str());
+        }
+        ggml_set_name(cur, "out");
+        return cur;
+    }
+};
+
 // GGML_OP_SILU_BACK
 struct test_silu_back : public test_case {
     const ggml_type type;
@@ -9722,6 +9810,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, false, "packed", "reuse"));
         }
     }
+
+    // chains of single-input elementwise ops
+    for (const char * chain : { "scale+silu", "scale+sigmoid+scale", "scale_bias+clamp", "sqrt+clamp", "scale+tanh+scale_bias",
+                                "neg+sigmoid+sqr+log+sin+cos+gelu+relu+softplus+scale", "silu+inplace_scale" }) {
+        test_cases.emplace_back(new test_ew_chain(GGML_TYPE_F32, { 4, 1, 1, 1 }, chain));
+        test_cases.emplace_back(new test_ew_chain(GGML_TYPE_F32, { 5, 7, 11, 13 }, chain));
+    }
+    test_cases.emplace_back(new test_ew_chain(GGML_TYPE_F32, { 320, 3, 1, 1 }, "scale+sigmoid+scale", "reuse"));
+    test_cases.emplace_back(new test_ew_chain(GGML_TYPE_F16, { 5, 7, 11, 13 }, "scale+silu"));
 
     // fused add + unary + mul: the delta-net alpha gate, bias and scale broadcast over dim 0
     for (ggml_unary_op op : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SOFTPLUS }) {
