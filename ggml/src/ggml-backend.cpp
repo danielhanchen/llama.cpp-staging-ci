@@ -3230,6 +3230,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
+    // the caller may write graph inputs before the next sched call (llama reuses graphs), and gallocr can place a
+    // freed input at the host memory a pending upload still reads: the uploads finish before returning
+    // (all work is queued by now, so this waits at most for the device work queued before the last upload)
+    if (sched->ov_active) {
+        ggml_backend_sched_ov_wait_uploads(sched, -1);
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
