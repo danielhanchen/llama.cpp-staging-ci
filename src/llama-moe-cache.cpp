@@ -657,6 +657,8 @@ struct llama_moe_cache::impl {
             if (devs.size() != 1) {
                 hybrid       = false;
                 hybrid_probe = false;
+                hybrid_live  = false;
+                hybrid_share = 1.0f; // no hybrid line in the stats
             } else if (!model.hparams.no_alloc) {
                 if (hybrid_probe) {
                     LLAMA_LOG_INFO("%s: hybrid MoE cache: the host computes the missing experts that are not fetched, fetch share measured at the first small batch, %s (LLAMA_MOE_CACHE_FETCH=0..1 to set the share)\n",
