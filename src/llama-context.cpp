@@ -3088,11 +3088,12 @@ void llama_context::moe_cache_seed_lag_flush(size_t i, ggml_backend_t backend) {
         GGML_ASSERT(id >= 0 && id < n_expert);
         counts[id]++;
     }
+    // the expert tensors of a layer are often copied by separate splits, so a layer can be seeded in parts: the first part plans the
+    // layer, the others fill the same slots, and the seed is committed when the next layer starts (or at the end of the graph)
     const std::vector<bool> staged(n_expert, true); // every expert was copied
     for (const auto & [w, dst] : p.copies) {
         moe_cache->seed(backend, w, dst, counts, staged);
     }
-    moe_cache->seed_end();
 }
 
 void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_large, int64_t n_outputs_ub) {
