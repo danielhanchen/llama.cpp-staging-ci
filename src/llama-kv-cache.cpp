@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 
 static bool ggml_is_power_of_2(int n) {
@@ -1564,8 +1565,11 @@ struct args_set_input_kq_mask {
     int64_t n_tps;
 };
 
+// fills the mask rows of the tokens [ii0, ii1) of every stream
+// each row only depends on its own token and the cells, so disjoint row ranges can be filled concurrently;
+// within a range, the first row of each sequence is computed in full and the others are patched from it
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
-static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data) {
+static void set_input_kq_mask_rows(const args_set_input_kq_mask & args, const llama_pos * seq_pos_min, T * data, int64_t ii0, int64_t ii1) {
   //const auto & hparams = args.hparams;
     const auto & ubatch  = args.ubatch;
 
@@ -1582,22 +1586,12 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     const T mask_keep = llama_cast<T>(0.0f);
     const T mask_drop = llama_cast<T>(-INFINITY);
 
-    // the min position in the batch for each sequence
-    llama_pos seq_pos_min[LLAMA_MAX_SEQ];
-    std::fill(seq_pos_min, seq_pos_min + LLAMA_MAX_SEQ, INT32_MAX);
-
-    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
-        const llama_seq_id seq_id = ubatch->seq_id[i][0];
-
-        seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
-    }
-
     for (uint32_t s = 0; s < n_stream; ++s) {
         // bookkeeping of the KQ mask cells that could change for other tokens of the same sequence
         std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
         std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
 
-        for (uint32_t ii = 0; ii < n_tps; ++ii) {
+        for (uint32_t ii = (uint32_t) ii0; ii < (uint32_t) ii1; ++ii) {
             const uint32_t i = s*n_tps + ii;
 
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
@@ -1712,6 +1706,58 @@ skip:
                 data[idst + j] = mask_drop;
             }
         }
+    }
+}
+
+template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
+static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data) {
+    const auto & ubatch = args.ubatch;
+
+    // the min position in the batch for each sequence
+    llama_pos seq_pos_min[LLAMA_MAX_SEQ];
+    std::fill(seq_pos_min, seq_pos_min + LLAMA_MAX_SEQ, INT32_MAX);
+
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+
+        seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
+    }
+
+    // large masks (prompt ubatches) are filled by several threads, each on a contiguous range of rows
+    // env LLAMA_KQ_MASK_THREADS: maximum number of threads (1 = single-threaded)
+    static const int max_threads = [] {
+        const char * e = getenv("LLAMA_KQ_MASK_THREADS");
+        if (e != nullptr) {
+            return std::max(1, atoi(e));
+        }
+        return (int) std::max(1u, std::min(8u, std::thread::hardware_concurrency()/2));
+    }();
+
+    const int64_t n_tps     = args.n_tps;
+    const int64_t n_elem    = args.n_kv*n_tps*args.n_stream;
+    const int64_t min_rows  = 128;
+    const int64_t n_threads = n_elem < (1 << 21) ? 1 : std::min<int64_t>(max_threads, n_tps/min_rows);
+
+    if (n_threads <= 1) {
+        set_input_kq_mask_rows<T, causal, swa, is_2d, alibi>(args, seq_pos_min, data, 0, n_tps);
+        return;
+    }
+
+    std::vector<std::thread> workers;
+    workers.reserve(n_threads - 1);
+    const int64_t chunk = (n_tps + n_threads - 1)/n_threads;
+    for (int64_t t = 1; t < n_threads; ++t) {
+        const int64_t ii0 = std::min(n_tps, t*chunk);
+        const int64_t ii1 = std::min(n_tps, ii0 + chunk);
+        if (ii0 < ii1) {
+            workers.emplace_back([&args, &seq_pos_min, data, ii0, ii1]() {
+                set_input_kq_mask_rows<T, causal, swa, is_2d, alibi>(args, seq_pos_min, data, ii0, ii1);
+            });
+        }
+    }
+    set_input_kq_mask_rows<T, causal, swa, is_2d, alibi>(args, seq_pos_min, data, 0, std::min(n_tps, chunk));
+    for (auto & w : workers) {
+        w.join();
     }
 }
 
