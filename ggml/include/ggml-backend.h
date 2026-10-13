@@ -360,6 +360,20 @@ extern "C" {
     // with a copy callback but no prefetch callback nothing is prefetched; env: GGML_SCHED_PREFETCH (0 = off), GGML_SCHED_PREFETCH_DEPTH
     typedef enum ggml_backend_sched_prefetch_mode (*ggml_backend_sched_prefetch_callback)(const struct ggml_tensor * src, const struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
 
+    // A prefetched copy of a host weight that the user may place in device memory it lends (e.g. free slots of a cache)
+    struct ggml_backend_sched_lend_copy {
+        const struct ggml_tensor * src; // the host weight
+        size_t size;                    // bytes of its copy (allocation size)
+        int    ordinal;                 // prefetch ordinal of its split: copies with ordinals less than `depth` apart are live together and must not overlap
+        ggml_backend_buffer_t buffer;   // out: buffer holding the copy, NULL: the copy uses the staging arena
+        size_t offset;                  // out: offset of the copy in buffer
+    };
+
+    // Callback placing the prefetched copies of a graph on `backend` (in split order) in memory lent by the user, the others use the staging arena
+    // n_copies = 0: the graph prefetches nothing on the backend, the user may take back the memory it lent before
+    // dry: memory measurement, the user must not change its state; the lent memory must not be used by the user until it is taken back
+    typedef void (*ggml_backend_sched_lend_callback)(ggml_backend_t backend, struct ggml_backend_sched_lend_copy * copies, int n_copies, int depth, bool dry, void * user_data);
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
@@ -406,6 +420,9 @@ extern "C" {
 
     // Set a callback that selects how the input weights in host buffers are prefetched
     GGML_API void                 ggml_backend_sched_set_prefetch_callback(ggml_backend_sched_t sched, ggml_backend_sched_prefetch_callback callback, void * user_data);
+
+    // Set a callback that places prefetched copies in memory lent by the user instead of the staging arena
+    GGML_API void                 ggml_backend_sched_set_lend_callback(ggml_backend_sched_t sched, ggml_backend_sched_lend_callback callback, void * user_data);
 
     //
     // Meta backend

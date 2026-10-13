@@ -281,6 +281,9 @@ private:
     // ggml_backend_sched prefetch callback, selects how the weights in host memory are prefetched
     static ggml_backend_sched_prefetch_mode sched_prefetch_mode(const ggml_tensor * src, const ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
+    // places the prefetched copies of large batches in slots lent by the MoE cache
+    static void sched_lend(ggml_backend_t backend, ggml_backend_sched_lend_copy * copies, int n_copies, int depth, bool dry, void * user_data);
+
     // true if the copy of the experts used by a MUL_MAT_ID with these ids may skip reading the ids (all experts are copied)
     bool sched_copy_all_experts(const ggml_tensor * src, const ggml_tensor * ids) const;
 

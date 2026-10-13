@@ -35,6 +35,8 @@ struct moe_cache_lru {
 
     uint64_t gen = 0; // incremented by each change of the slots, so the device copy of the state can be refreshed
 
+    int32_t n_lent = 0; // the last n_lent slots are lent (see set_lent): they are not in the list and hold no expert
+
     void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
         this->n_expert = n_expert;
         this->n_slots  = n_slots;
@@ -49,6 +51,45 @@ struct moe_cache_lru {
         head = 0;
         tail = n_slots - 1;
         seen.assign(n_expert, 0);
+    }
+
+    void unlink(int32_t s) {
+        if (prev[s] >= 0) {
+            next[prev[s]] = next[s];
+        } else {
+            head = next[s];
+        }
+        if (next[s] >= 0) {
+            prev[next[s]] = prev[s];
+        } else {
+            tail = prev[s];
+        }
+        prev[s] = -1;
+        next[s] = -1;
+    }
+
+    // lend the last n slots (their experts are evicted), the slots no longer lent come back empty as the least recently used
+    void set_lent(int32_t n) {
+        GGML_ASSERT(n >= 0 && n < n_slots);
+        for (int32_t s = n_slots - n; s < n_slots - n_lent; ++s) {
+            if (key_of[s] >= 0) {
+                slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
+                key_of[s] = -1;
+            }
+            unlink(s);
+        }
+        for (int32_t s = n_slots - n_lent; s < n_slots - n; ++s) {
+            prev[s] = -1;
+            next[s] = head;
+            if (head >= 0) {
+                prev[head] = s;
+            } else {
+                tail = s;
+            }
+            head = s;
+        }
+        n_lent = n;
+        gen++;
     }
 
     // move slot s to the tail (most recently used)
@@ -92,7 +133,7 @@ struct moe_cache_lru {
                 uniq.push_back(ids[i]);
             }
         }
-        if (uniq.size() > (size_t) n_slots) {
+        if (uniq.size() > (size_t) (n_slots - n_lent)) {
             return false;
         }
 
@@ -128,6 +169,7 @@ struct moe_cache_lru {
     // replace the state with the one computed by the device lookup
     // the slots with the reference bit set were used more recently, they go to the tail
     void load(const std::vector<int32_t> & layers, const int32_t * dev_key_of, const int32_t * dev_ref) {
+        GGML_ASSERT(n_lent == 0);
         for (int32_t il : layers) {
             std::fill(slot_map[il], slot_map[il] + n_expert, -1);
         }
@@ -280,6 +322,9 @@ struct llama_moe_cache::impl {
         uint32_t done = 0; // expert tensors whose slots were filled
     } sd;
     std::vector<int32_t> seed_ids;
+    std::vector<std::vector<int32_t>> refill; // [n_layer] experts of the last seed waiting for the lent slots to come back
+    bool  refill_enabled = true;
+    stats stats_refill;
     std::vector<std::vector<int32_t>> seed_counts; // [n_layer] routing of an earlier ubatch of the prompt, see set_seed_counts
     std::vector<ggml_backend_copy_region> seed_regions;
     size_t seed_unstaged = 0; // seeds of a layer dropped because a planned expert was not staged in the copy of an expert tensor
@@ -315,6 +360,12 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
+    // lending (see lend): LLAMA_MOE_CACHE_LEND=0 off, 1 on with one cache device, 2 also with several (not validated)
+    int    lend_mode    = 1;
+    bool   lend_off_log = false;
+    size_t n_lends      = 0; // graphs whose staging copies used lent slots
+    int32_t lend_max    = 0; // most slots lent at once
+
     // device lookup for small batches: the selected experts stay on the device and the misses are read from mapped host memory
     bool device_lookup = false; // requested, see LLAMA_MOE_CACHE_DEVICE; each group then checks its device
     std::vector<std::pair<void (*)(void *), void *>> mapped; // host buffers mapped by the cache, with the function that unmaps them
@@ -347,6 +398,14 @@ struct llama_moe_cache::impl {
         {
             const char * env = getenv("LLAMA_MOE_CACHE_SEED_CHECK");
             seed_check = env != nullptr && atoi(env) != 0;
+        }
+        {
+            const char * env = getenv("LLAMA_MOE_CACHE_LEND");
+            lend_mode = env == nullptr ? 1 : atoi(env);
+        }
+        {
+            const char * env = getenv("LLAMA_MOE_CACHE_REFILL");
+            refill_enabled = env == nullptr || atoi(env) != 0;
         }
 
         // only cache layers that keep all of their experts in host memory, on the device the layer is assigned to
@@ -775,6 +834,210 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // the scheduler places the prefetched copies of a large batch: they go to the last slots of the largest group of the device, which
+    // are evicted while lent, so the device does not keep a staging arena that only large batches use; n_copies = 0 takes the slots back
+    void lend(ggml_backend_t backend, ggml_backend_sched_lend_copy * copies, int n_copies, int depth, bool dry, int64_t n_tokens) {
+        const auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return d.backend == backend; });
+        if (it_dev == devices.end() || !it_dev->buf) {
+            return;
+        }
+        const int32_t id = (int32_t) (it_dev - devices.begin());
+
+        if (n_copies == 0) {
+            if (!dry) {
+                for (group & g : groups) {
+                    if (g.id == id && g.lru.n_lent > 0) {
+                        unlend(g);
+                    }
+                }
+            }
+            return;
+        }
+
+        if (lend_mode == 0) {
+            return;
+        }
+        if (lend_mode == 1 && std::count_if(devices.begin(), devices.end(), [](const device & d) { return d.host_bytes > 0 && d.buf; }) > 1) {
+            if (!lend_off_log) {
+                LLAMA_LOG_INFO("%s: MoE cache on several devices: the cache does not lend slots to the staging copies (LLAMA_MOE_CACHE_LEND=2 to force)\n", __func__);
+                lend_off_log = true;
+            }
+            return;
+        }
+
+        // the largest group of the device
+        group * gl = nullptr;
+        for (group & g : groups) {
+            if (g.id == id && g.n_slots > 0 && (gl == nullptr || (size_t) g.n_slots*g.expert_bytes > (size_t) gl->n_slots*gl->expert_bytes)) {
+                gl = &g;
+            }
+        }
+        // small batches looked up on the device may use every slot of the group
+        if (gl == nullptr || use_device(*gl, n_tokens)) {
+            return;
+        }
+        group & g = *gl;
+
+        // the copies of `depth` consecutive splits are live together, the ones with a negative ordinal (graph allocator) all the time
+        size_t need = 0;
+        size_t perm = 0;
+        for (int i = 0; i < n_copies; ++i) {
+            if (copies[i].ordinal < 0) {
+                perm += copies[i].size;
+                continue;
+            }
+            size_t live = 0;
+            for (int j = i; j < n_copies && copies[j].ordinal < copies[i].ordinal + depth; ++j) {
+                live += copies[j].size;
+            }
+            need = std::max(need, live);
+        }
+        need += perm;
+
+        // the smallest number of slots that holds every copy, at most half of the slots (large batches also read and seed the cache)
+        const int32_t n_max = g.n_slots / 2;
+        int32_t n = (int32_t) std::min<size_t>((need + g.expert_bytes - 1) / g.expert_bytes, (size_t) n_max + 1);
+        const int32_t step = std::max<int32_t>(1, n / 16);
+        std::vector<size_t> offsets(n_copies);
+        int32_t n_lend = 0;
+        for (; n <= n_max; n = n < n_max ? std::min(n + step, n_max) : n_max + 1) {
+            if (place(g, n, copies, n_copies, depth, offsets)) {
+                n_lend = n;
+                break;
+            }
+        }
+        if (n_lend == 0) {
+            if (!dry && g.lru.n_lent > 0) {
+                unlend(g);
+            }
+            return;
+        }
+        ggml_backend_buffer_t buf = devices[id].buf.get();
+        for (int i = 0; i < n_copies; ++i) {
+            copies[i].buffer = buf;
+            copies[i].offset = offsets[i];
+        }
+        if (dry) {
+            return;
+        }
+        // with device lookups the device state may be newer: the slots to evict are only known after it is copied back
+        if (g.dev_lookup && g.dev_newer) {
+            download(g);
+        }
+        if (g.lru.n_lent > n_lend) {
+            unlend(g);
+        }
+        if (g.lru.n_lent != n_lend) {
+            g.lru.set_lent(n_lend);
+            LLAMA_LOG_INFO("%s: %s: MoE cache lends %d of %d slots (%.2f MiB) to the staging copies of large batches (LLAMA_MOE_CACHE_LEND=0 to disable)\n",
+                __func__, ggml_backend_name(backend), n_lend, g.n_slots, (double) n_lend*g.expert_bytes/1024.0/1024.0);
+        }
+        n_lends++;
+        lend_max = std::max(lend_max, n_lend);
+    }
+
+    // the lent slots come back empty: they are cleared once the work that used them is done, because kernels may read a little past
+    // the end of the expert in the slot before (e.g. CUDA MMQ in the padding of the last row) and the copies left arbitrary bytes there
+    // the experts that a seed could not admit while slots were lent are then uploaded from host memory (LLAMA_MOE_CACHE_REFILL=0 to disable)
+    void unlend(group & g) {
+        ggml_backend_t backend = devices[g.id].backend;
+        ggml_backend_synchronize(backend);
+        const int32_t n = g.lru.n_lent;
+        for (ggml_tensor * bank : g.banks) {
+            ggml_backend_tensor_memset(bank, 0, (size_t) (g.n_slots - n)*bank->nb[2], (size_t) (n + 1)*bank->nb[2]);
+        }
+        g.lru.set_lent(0);
+
+        if (refill.empty() || g.dev_newer) {
+            return;
+        }
+        for (int32_t il : g.layers) {
+            if ((size_t) il >= refill.size() || refill[il].empty()) {
+                continue;
+            }
+            std::vector<int32_t> & ids_il = refill[il];
+            const int32_t * slots = g.lru.slot_map[il];
+            ids_il.erase(std::remove_if(ids_il.begin(), ids_il.end(), [&](int32_t e) { return slots[e] >= 0; }), ids_il.end());
+            size_t n_hit = 0;
+            if (refill_enabled && !ids_il.empty() && g.lru.plan(il, ids_il.data(), ids_il.size(), fills, n_hit)) {
+                const layer & l = layers[il];
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w    = l.experts[ip];
+                    ggml_tensor       * bank = g.banks[ip];
+                    const size_t expert_size = w->nb[2];
+                    for (size_t i = 0; i < fills.size();) {
+                        size_t m = 1;
+                        while (i + m < fills.size() && fills[i + m].expert == fills[i].expert + (int32_t) m && fills[i + m].slot == fills[i].slot + (int32_t) m) {
+                            m++;
+                        }
+                        ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, m*expert_size);
+                        stats_refill.bytes += m*expert_size;
+                        i += m;
+                    }
+                }
+                stats_refill.misses += fills.size();
+            }
+            ids_il.clear();
+        }
+    }
+
+    // best-fit placement of the copies in the last n slots of every bank of g (and the extra slot after them)
+    // a copy must not overlap the copies of the splits less than `depth` ordinals before it, which are live while it is written,
+    // nor a copy with a negative ordinal (live during the whole graph, placed first)
+    bool place(const group & g, int32_t n, const ggml_backend_sched_lend_copy * copies, int n_copies, int depth, std::vector<size_t> & offsets) {
+        const device & d = devices[g.id];
+        const uintptr_t base  = (uintptr_t) ggml_backend_buffer_get_base(d.buf.get());
+        const size_t    align = ggml_backend_buft_get_alignment(d.buft);
+
+        struct region { size_t begin; size_t end; };
+        std::vector<region> regions;
+        for (const ggml_tensor * bank : g.banks) {
+            const size_t begin = (size_t) ((uintptr_t) bank->data - base) + (size_t) (g.n_slots - n)*bank->nb[2];
+            regions.push_back({ begin, begin + (size_t) (n + 1)*bank->nb[2] });
+        }
+        auto align_up = [&](size_t off) {
+            return (size_t) (GGML_PAD(base + off, align) - base);
+        };
+
+        struct live { size_t begin; size_t end; int ordinal; };
+        std::vector<live> lv;
+        std::vector<live> in_region;
+        for (int i = 0; i < n_copies; ++i) {
+            const size_t size = copies[i].size;
+            lv.erase(std::remove_if(lv.begin(), lv.end(), [&](const live & l) { return l.ordinal >= 0 && l.ordinal <= copies[i].ordinal - depth; }), lv.end());
+
+            size_t best_gap = SIZE_MAX;
+            size_t best_off = 0;
+            for (const region & r : regions) {
+                in_region.clear();
+                for (const live & l : lv) {
+                    if (l.begin < r.end && l.end > r.begin) {
+                        in_region.push_back(l);
+                    }
+                }
+                std::sort(in_region.begin(), in_region.end(), [](const live & a, const live & b) { return a.begin < b.begin; });
+                size_t cur = align_up(r.begin);
+                auto consider = [&](size_t gap_end) {
+                    if (gap_end > cur && gap_end - cur >= size && gap_end - cur < best_gap) {
+                        best_gap = gap_end - cur;
+                        best_off = cur;
+                    }
+                };
+                for (const live & l : in_region) {
+                    consider(l.begin);
+                    cur = std::max(cur, align_up(l.end));
+                }
+                consider(r.end);
+            }
+            if (best_gap == SIZE_MAX) {
+                return false;
+            }
+            offsets[i] = best_off;
+            lv.push_back({ best_off, best_off + size, copies[i].ordinal });
+        }
+        return true;
+    }
+
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, int64_t n_ubatch) const {
         if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return nullptr;
@@ -969,7 +1232,9 @@ struct llama_moe_cache::impl {
             seed_end();
 
             const int32_t n_expert = g.lru.n_expert;
-            const size_t  n_seed   = g.n_slots / g.layers.size();
+            // while slots are lent, the experts that the lent slots would hold are uploaded when they come back (see unlend)
+            const size_t  n_seed   = (g.n_slots - g.lru.n_lent) / g.layers.size();
+            const size_t  n_full   = g.n_slots / g.layers.size();
             GGML_ASSERT((int32_t) counts.size() == n_expert && (int32_t) staged.size() == n_expert);
             seed_ids.clear();
             for (int32_t e = 0; e < n_expert; ++e) {
@@ -977,10 +1242,18 @@ struct llama_moe_cache::impl {
                     seed_ids.push_back(e);
                 }
             }
+            auto by_count = [&](int32_t a, int32_t c) {
+                return counts[a] != counts[c] ? counts[a] > counts[c] : a < c;
+            };
+            if (n_full < seed_ids.size()) {
+                std::partial_sort(seed_ids.begin(), seed_ids.begin() + n_full, seed_ids.end(), by_count);
+                seed_ids.resize(n_full);
+            } else if (n_seed < seed_ids.size()) {
+                std::sort(seed_ids.begin(), seed_ids.end(), by_count);
+            }
             if (n_seed < seed_ids.size()) {
-                std::partial_sort(seed_ids.begin(), seed_ids.begin() + n_seed, seed_ids.end(), [&](int32_t a, int32_t c) {
-                    return counts[a] != counts[c] ? counts[a] > counts[c] : a < c;
-                });
+                refill.resize(layers.size());
+                refill[b.il].assign(seed_ids.begin() + n_seed, seed_ids.end());
                 seed_ids.resize(n_seed);
             }
             if (seed_ids.empty()) {
@@ -1161,6 +1434,10 @@ struct llama_moe_cache::impl {
         if (seed_unstaged > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu expert tensor seeds skipped (planned expert not staged)\n", seed_unstaged);
         }
+        if (n_lends > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu graphs used lent slots (at most %d slots lent), %zu experts refilled after them, %.2f MiB\n",
+                n_lends, lend_max, stats_refill.misses, stats_refill.bytes/1024.0/1024.0);
+        }
         if (seed_check) {
             LLAMA_LOG_INFO("llama_moe_cache: seed check total: %zu expert copies verified, %zu mismatches\n", seed_checked, seed_mismatches);
         }
@@ -1223,6 +1500,27 @@ void llama_moe_cache::count_upload(const ggml_tensor * w, size_t n_experts, size
 
 void llama_moe_cache::seed(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * dst, const std::vector<int32_t> & counts, const std::vector<bool> & staged) {
     pimpl->seed(backend, w, dst, counts, staged);
+}
+
+void llama_moe_cache::lend(ggml_backend_t backend, ggml_backend_sched_lend_copy * copies, int n_copies, int depth, bool dry, int64_t n_tokens) {
+    pimpl->lend(backend, copies, n_copies, depth, dry, n_tokens);
+}
+
+bool llama_moe_cache::lends() const {
+    return pimpl->lend_mode != 0;
+}
+
+int64_t llama_moe_cache::n_tokens_cached() const {
+    int64_t n = n_small_max;
+    for (const auto & g : pimpl->groups) {
+        if (g.n_slots == 0) {
+            continue;
+        }
+        while (n > 0 && std::min<int64_t>(n*pimpl->n_expert_used, g.ref[0]->ne[2]) > g.n_slots) {
+            n--;
+        }
+    }
+    return n;
 }
 
 bool llama_moe_cache::seed_check() const {

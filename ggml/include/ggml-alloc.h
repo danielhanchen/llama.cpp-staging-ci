@@ -73,6 +73,18 @@ GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 
+// planned buffer sizes of a graph, without reserving it (the buffers and the current allocation are kept)
+GGML_API void ggml_gallocr_measure_n(
+    ggml_gallocr_t galloc,
+    struct ggml_cgraph * graph,
+    const int * node_buffer_ids,
+    const int * leaf_buffer_ids,
+    size_t * sizes);
+
+// memory lent by the user for a buffer id (NULL: none): the graphs whose allocation fits in it are placed there instead of in
+// the own buffer, which is then not grown for them; the next allocation is planned again when it changes
+GGML_API void ggml_gallocr_set_external(ggml_gallocr_t galloc, int buffer_id, ggml_backend_buffer_t buffer, size_t offset, size_t size);
+
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context
 
