@@ -498,9 +498,14 @@ struct llama_moe_cache::impl {
             verify_enabled = env != nullptr && atoi(env) != 0;
         }
 
+        // LLAMA_MOE_CACHE_FETCH_OVERLAP=0 (or the older LLAMA_MOE_CACHE_OVERLAP=0) disables it: small batches then copy the missing
+        // experts before the expert FFN of the layer; the results are the same either way (each slot is computed once, see build_moe_ffn)
         {
-            const char * env = getenv("LLAMA_MOE_CACHE_OVERLAP");
-            overlap = device_lookup && env != nullptr && atoi(env) != 0 && model.hparams.n_expert >= 4;
+            const char * env = getenv("LLAMA_MOE_CACHE_FETCH_OVERLAP");
+            if (env == nullptr) {
+                env = getenv("LLAMA_MOE_CACHE_OVERLAP");
+            }
+            overlap = device_lookup && (env == nullptr || atoi(env) != 0) && model.hparams.n_expert >= 4;
         }
 
         // only cache layers that keep all of their experts in host memory, on the device the layer is assigned to
@@ -783,7 +788,7 @@ struct llama_moe_cache::impl {
                 hybrid_share = 1.0f; // no hybrid line in the stats
             } else if (!model.hparams.no_alloc) {
                 if (overlap) {
-                    LLAMA_LOG_INFO("%s: MoE cache: small batches compute the cached experts while the missing ones are copied (LLAMA_MOE_CACHE_OVERLAP)\n", __func__);
+                    LLAMA_LOG_INFO("%s: MoE cache: small batches compute the cached experts while the missing ones are copied (LLAMA_MOE_CACHE_FETCH_OVERLAP=0 to disable)\n", __func__);
                 }
                 if (hybrid && hybrid_probe) {
                     LLAMA_LOG_INFO("%s: hybrid MoE cache: the host computes the missing experts that are not fetched, fetch share measured at the first small batch, %s (LLAMA_MOE_CACHE_FETCH=0..1 to set the share)\n",

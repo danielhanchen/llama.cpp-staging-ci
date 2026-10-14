@@ -4982,6 +4982,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->q8_1_cache.end();
         }
 
+        // an overlapped MoE cache fetch whose join is not in this graph (another split): the side stream joins the main stream
+        // here, so a CUDA graph capture never ends with an unjoined stream and the next graph starts after the copies
+        if (cuda_ctx->moe_join_pending) {
+            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), cuda_ctx->moe_join, 0));
+            cuda_ctx->moe_join_pending = false;
+        }
+
 #ifdef USE_CUDA_GRAPH
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
@@ -5148,7 +5155,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 continue;
             }
             for (int j = i + 3; j + 2 < cgraph->n_nodes; ++j) {
-                if (cgraph->nodes[j]->op == GGML_OP_MUL_MAT_ID && cgraph->nodes[j + 1]->op == GGML_OP_MUL_MAT_ID) {
+                // the routed experts of the next layer; a second chain over the same input (the experts fetched by an overlapped
+                // MoE cache lookup, see build_moe_ffn) is skipped, so the shared expert is computed with the first one, beside the copies
+                if (cgraph->nodes[j]->op == GGML_OP_MUL_MAT_ID && cgraph->nodes[j + 1]->op == GGML_OP_MUL_MAT_ID &&
+                        cgraph->nodes[j]->src[1] != cgraph->nodes[i]->src[1]) {
                     break;
                 }
                 if (cgraph->nodes[j]->op != GGML_OP_MUL_MAT || !ggml_cuda_match_shared_expert(cgraph, i, j)) {
