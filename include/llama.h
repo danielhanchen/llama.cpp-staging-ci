@@ -582,6 +582,10 @@ extern "C" {
     LLAMA_API size_t llama_max_parallel_sequences(void);
     LLAMA_API size_t llama_max_tensor_buft_overrides(void);
 
+    // system memory usable without swapping in bytes, 0 if unknown; on Linux MemAvailable capped by the cgroup limits, where the
+    // reclaimable page cache of a cgroup does not count as used
+    LLAMA_API uint64_t llama_available_memory(void);
+
     LLAMA_API bool llama_supports_mmap       (void);
     LLAMA_API bool llama_supports_mlock      (void);
     LLAMA_API bool llama_supports_gpu_offload(void);

@@ -6,6 +6,7 @@
 #include "llama-chat.h"
 #include "llama-context.h"
 #include "llama-mmap.h"
+#include "llama-sysmem.h"
 #include "llama-vocab.h"
 #include "llama-model-loader.h"
 #include "llama-model-saver.h"
@@ -89,6 +90,10 @@ size_t llama_max_devices(void) {
 
 size_t llama_max_tensor_buft_overrides() {
     return 4096;
+}
+
+uint64_t llama_available_memory(void) {
+    return llama_sysmem::available();
 }
 
 bool llama_supports_mmap(void) {
