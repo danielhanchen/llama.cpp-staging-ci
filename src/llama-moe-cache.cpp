@@ -269,6 +269,8 @@ struct llama_moe_cache::impl {
         ggml_context_ptr ctx;
         ggml_backend_buffer_ptr buf;
         size_t buf_size = 0;
+
+        int lend_auto = -1; // automatic lending (LLAMA_MOE_CACHE_LEND unset): -1 not decided yet, 0 off, 1 on
     };
 
     // LLAMA_MOE_CACHE_SEED_CHECK=1: after each seeding ubatch, compare the seeded slots with the host experts (debug)
@@ -389,6 +391,9 @@ struct llama_moe_cache::impl {
 
     // lending (see lend): LLAMA_MOE_CACHE_LEND=0 off, 1 on with one cache device, 2 also with several (not validated)
     int    lend_mode    = 1;     // LLAMA_MOE_CACHE_LEND: 0 off, 1 staging copies, 2 also the graph allocator (experimental)
+    bool   lend_auto    = true;  // LLAMA_MOE_CACHE_LEND unset: lend only if the staging copies are a large share of the cache, see lend
+    bool   seed_own     = false; // prompts seed from their own ids by default (LLAMA_MOE_CACHE_SEED unset or 2), see lend
+    double lend_min_frac = 0.08; // LLAMA_MOE_CACHE_LEND_MIN_FRAC: that share
     bool   lend_multi   = false; // LLAMA_MOE_CACHE_LEND_MULTI=1: also with the cache on several devices (not validated)
     bool   lend_off_log = false;
     size_t n_lends      = 0; // graphs whose staging copies used lent slots
@@ -473,6 +478,13 @@ struct llama_moe_cache::impl {
         {
             const char * env = getenv("LLAMA_MOE_CACHE_LEND");
             lend_mode = env == nullptr ? 1 : atoi(env);
+            lend_auto = env == nullptr;
+            env = getenv("LLAMA_MOE_CACHE_SEED");
+            seed_own = env == nullptr || atoi(env) == 2;
+            env = getenv("LLAMA_MOE_CACHE_LEND_MIN_FRAC");
+            if (env != nullptr) {
+                lend_min_frac = std::max(0.0, atof(env));
+            }
             env = getenv("LLAMA_MOE_CACHE_LEND_MULTI");
             lend_multi = env != nullptr && atoi(env) != 0;
         }
@@ -1321,6 +1333,10 @@ struct llama_moe_cache::impl {
             return;
         }
 
+        if (!lend_auto && !dry && devices[id].lend_auto < 0) {
+            devices[id].lend_auto = lend_mode != 0 ? 1 : 0;
+            LLAMA_LOG_INFO("%s: %s: MoE cache lending %s (LLAMA_MOE_CACHE_LEND=%d)\n", __func__, ggml_backend_name(backend), lend_mode != 0 ? "on" : "off", lend_mode);
+        }
         if (lend_mode == 0) {
             return;
         }
@@ -1360,20 +1376,30 @@ struct llama_moe_cache::impl {
         }
 
         // the copies of `depth` consecutive splits are live together, the ones with a negative ordinal (graph allocator) all the time
-        size_t need = 0;
-        size_t perm = 0;
+        size_t need  = 0;
+        size_t perm  = 0;
+        size_t split = 0; // copies of the largest split
         for (int i = 0; i < n_copies; ++i) {
             if (copies[i].ordinal < 0) {
                 perm += copies[i].size;
                 continue;
             }
             size_t live = 0;
+            size_t own  = 0;
             for (int j = i; j < n_copies && copies[j].ordinal < copies[i].ordinal + depth; ++j) {
                 live += copies[j].size;
+                own  += copies[j].ordinal == copies[i].ordinal ? copies[j].size : 0;
             }
-            need = std::max(need, live);
+            need  = std::max(need, live);
+            split = std::max(split, own);
         }
         need += perm;
+
+        // a prompt that seeds from its own ids holds the copies of a split in the graph allocation (see llama_context::sched_reserve_seed)
+        const size_t graph = (n_all > 0 && all[0].ordinal < 0 ? all[0].size : 0) + (seed_own ? split : 0);
+        if (lend_auto && !lend_decide(id, need, graph, dry)) {
+            return;
+        }
 
         // the smallest number of slots that holds every copy, at most half of the slots (large batches also read and seed the cache)
         const int32_t n_max = g.n_slots / 2;
@@ -1428,6 +1454,52 @@ struct llama_moe_cache::impl {
         }
         n_lends++;
         lend_max = std::max(lend_max, n_lend);
+    }
+
+    // LLAMA_MOE_CACHE_LEND unset: the cache lends `need` bytes only if they are at least lend_min_frac of the cache of the device (a
+    // small share frees little memory for the cache and costs the prompts the slots), or if the staging arena and the graph allocation
+    // (`graph` more bytes, with the copies a seeding prompt holds there) do not fit in the free memory; decided at the first graph that
+    // is allocated
+    bool lend_decide(int32_t id, size_t need, size_t graph, bool dry) {
+        device & d = devices[id];
+        if (d.lend_auto >= 0) {
+            return d.lend_auto != 0;
+        }
+        size_t cache = 0;
+        for (const group & g : groups) {
+            if (g.id == id) {
+                cache += (size_t) g.n_slots*g.expert_bytes;
+            }
+        }
+        const double frac = cache > 0 ? (double) need/cache : 1.0;
+        bool on = frac >= lend_min_frac;
+        if (dry) {
+            // a measurement (e.g. for --fit) counts the memory with lending: when the device is short of memory the cache lends anyway
+            return true;
+        }
+        // headroom for the memory the backends allocate while computing (e.g. the CUDA pool)
+        constexpr size_t margin = 512ull*1024*1024;
+        size_t free  = 0;
+        size_t total = 0;
+        ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);
+        if (!on && dev != nullptr) {
+            ggml_backend_dev_memory(dev, &free, &total);
+        }
+        const bool fit = on || dev == nullptr || free >= need + graph + margin;
+        d.lend_auto = on || !fit ? 1 : 0;
+        if (on) {
+            LLAMA_LOG_INFO("%s: %s: MoE cache lending on: the staging copies of large batches (%.2f MiB) are %.1f%% of the cache (%.2f MiB), at least %.1f%% (LLAMA_MOE_CACHE_LEND_MIN_FRAC)\n",
+                __func__, ggml_backend_name(d.backend), need/1024.0/1024.0, 100.0*frac, cache/1024.0/1024.0, 100.0*lend_min_frac);
+        } else if (!fit) {
+            LLAMA_LOG_INFO("%s: %s: MoE cache lending on: the staging copies of large batches (%.2f MiB) are %.1f%% of the cache (%.2f MiB), below %.1f%%, "
+                "but %.2f MiB free do not hold them next to %.2f MiB of graph allocation (with the copies of a seeding prompt)\n",
+                __func__, ggml_backend_name(d.backend), need/1024.0/1024.0, 100.0*frac, cache/1024.0/1024.0, 100.0*lend_min_frac, free/1024.0/1024.0, graph/1024.0/1024.0);
+        } else {
+            LLAMA_LOG_INFO("%s: %s: MoE cache lending off: the staging copies of large batches (%.2f MiB) are %.1f%% of the cache (%.2f MiB), below %.1f%% "
+                "(LLAMA_MOE_CACHE_LEND_MIN_FRAC, LLAMA_MOE_CACHE_LEND=1 to lend)\n",
+                __func__, ggml_backend_name(d.backend), need/1024.0/1024.0, 100.0*frac, cache/1024.0/1024.0, 100.0*lend_min_frac);
+        }
+        return d.lend_auto != 0;
     }
 
     // the lent slots come back empty: they are cleared once the work that used them is done, because kernels may read a little past
