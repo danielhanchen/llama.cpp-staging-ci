@@ -1791,6 +1791,18 @@ struct llama_moe_cache::impl {
             }
             return;
         }
+        // a graph that needs fewer slots than are lent keeps them (LLAMA_MOE_CACHE_LEND_SHRINK=1 gives them back): giving them back clears
+        // and refills them, and the next larger graph of the prompt (the ubatches grow with the KV cache) evicts them again
+        static const bool lend_shrink = getenv("LLAMA_MOE_CACHE_LEND_SHRINK") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_LEND_SHRINK")) != 0;
+        if (!dry && !lend_shrink && g.lru.n_lent > n_lend && g.lru.n_lent <= n_max) {
+            std::vector<size_t> offsets_k(n_copies);
+            std::vector<size_t> part_sizes_k(n_graph);
+            if (place(g, g.lru.n_lent, copies, n_copies, n_graph, 1, graph_need, depth, guard, offsets_k, part_sizes_k)) {
+                n_lend     = g.lru.n_lent;
+                offsets    = std::move(offsets_k);
+                part_sizes = std::move(part_sizes_k);
+            }
+        }
         ggml_backend_buffer_t buf = devices[id].buf.get();
         for (int i = 0; i < n_copies; ++i) {
             if (i < n_graph && part_sizes[i] == 0) {
