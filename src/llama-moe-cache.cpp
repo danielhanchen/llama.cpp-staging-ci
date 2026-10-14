@@ -842,12 +842,13 @@ struct llama_moe_cache::impl {
                 }
             }
             if (device_lookup) {
-                fixed_of[ig] += GGML_PAD((size_t) n_expert*model.layers.size()*sizeof(int32_t), alignment) + GGML_PAD(8*sizeof(int32_t), alignment);
+                fixed_of[ig] += GGML_PAD((size_t) n_expert*model.layers.size()*sizeof(int32_t), alignment);
             }
             budget_of[ig] = (size_t) ((double) size*d.split/split_sum*g.host_bytes/d.host_bytes);
         }
+        // the device lookup state is padded like the state tensor allocated below
         auto group_size = [&](size_t ig, int32_t n_slots) {
-            return alloc_size(groups[ig], n_slots) + fixed_of[ig] + (device_lookup ? 3*sizeof(int32_t)*(size_t) n_slots : 0);
+            return alloc_size(groups[ig], n_slots) + fixed_of[ig] + (device_lookup ? GGML_PAD((8 + 3*(size_t) n_slots)*sizeof(int32_t), ggml_backend_buft_get_alignment(devices[groups[ig].id].buft)) : 0);
         };
 
         // a small batch (at most max_batch tokens) is read from the cache only if every group holds the experts of all of its tokens in
@@ -2718,8 +2719,15 @@ struct llama_moe_cache::impl {
 
             const int32_t n_expert = g.lru.n_expert;
             // while slots are lent, the experts that the lent slots would hold are uploaded when they come back (see unlend)
-            const size_t  n_seed   = (g.n_slots - g.lru.n_lent) / g.layers.size();
-            const size_t  n_full   = g.n_slots / g.layers.size();
+            const size_t  n_avail  = (size_t) (g.n_slots - g.lru.n_lent);
+            size_t        n_seed   = n_avail / g.layers.size();
+            size_t        n_full   = g.n_slots / g.layers.size();
+            if (n_full == 0) {
+                // fewer slots than layers: one expert for each of the first layers of the group, instead of none
+                const size_t pos = std::find(g.layers.begin(), g.layers.end(), b.il) - g.layers.begin();
+                n_full = pos < (size_t) g.n_slots ? 1 : 0;
+                n_seed = pos < n_avail ? 1 : 0;
+            }
             GGML_ASSERT((int32_t) counts.size() == n_expert && (int32_t) staged.size() == n_expert);
             seed_ids.clear();
             for (int32_t e = 0; e < n_expert; ++e) {
