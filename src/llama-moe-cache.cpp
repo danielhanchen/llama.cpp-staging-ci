@@ -2570,6 +2570,11 @@ void llama_moe_cache::seed_unavailable() {
     }
 }
 
+void llama_moe_cache::prompts_do_not_seed() {
+    pimpl->seed_own = false;
+    seed_unavailable();
+}
+
 void llama_moe_cache::count_seed_skipped() {
     pimpl->seed_skipped++;
 }

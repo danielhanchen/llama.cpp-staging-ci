@@ -474,6 +474,7 @@ private:
     bool moe_cache_record       = false;
     bool moe_cache_seed_enabled = true; // LLAMA_MOE_CACHE_SEED != 0
     bool moe_cache_seed_sync    = true;  // LLAMA_MOE_CACHE_SEED=2 (default): a prefetched ubatch seeds (earlier routing, else its own ids read first)
+    bool moe_cache_seed_auto    = false; // LLAMA_MOE_CACHE_SEED unset, n_ubatch >= LLAMA_MOE_CACHE_SEED_AUTO: as LLAMA_MOE_CACHE_SEED=1
     bool moe_cache_seed_fits    = true;  // the graph of a prefetched ubatch that seeds from its own ids was reserved (see sched_reserve_seed)
 
     // value of moe_cache_seed when the current graph was allocated: the scheduler plans the copies of the experts with it

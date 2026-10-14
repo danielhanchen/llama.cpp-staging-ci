@@ -127,6 +127,10 @@ public:
     // a prompt end that does not seed for that reason (statistics)
     void count_seed_skipped();
 
+    // the context runs as with LLAMA_MOE_CACHE_SEED=1 (see llama_context, LLAMA_MOE_CACHE_SEED_AUTO): prefill the cache now if the
+    // default seeding skipped it, and do not count a seed split in the lent memory
+    void prompts_do_not_seed();
+
     // LLAMA_MOE_CACHE_SEED_CHECK=1 (debug): after the seeding ubatch is synchronized, compare the seeded slots with the host experts
     bool seed_check() const;
     void seed_verify();

@@ -393,6 +393,19 @@ llama_context::llama_context(
         }
         moe_cache_seed_enabled = seed_mode != 0;
         moe_cache_seed_sync    = seed_mode == 2;
+        // LLAMA_MOE_CACHE_SEED unset and a large n_ubatch (LLAMA_MOE_CACHE_SEED_AUTO, default 4096, 0 = off): run as =1 (prefill at load,
+        // prompts do not seed from their own ids). A prompt of one or few large ubatches has no earlier routing to seed from, its own-ids
+        // seed makes every expert upload of the ubatch wait for the routing of its layer, and its seed graph may not fit
+        if (getenv("LLAMA_MOE_CACHE_SEED") == nullptr && cparams.moe_cache_size > 0) {
+            const char * LLAMA_MOE_CACHE_SEED_AUTO = getenv("LLAMA_MOE_CACHE_SEED_AUTO");
+            const int64_t seed_auto_ub = LLAMA_MOE_CACHE_SEED_AUTO == nullptr ? 4096 : atoll(LLAMA_MOE_CACHE_SEED_AUTO);
+            moe_cache_seed_auto = seed_auto_ub > 0 && (int64_t) cparams.n_ubatch >= seed_auto_ub;
+            if (moe_cache_seed_auto) {
+                moe_cache_seed_sync = false;
+                LLAMA_LOG_INFO("%s: MoE cache: n_ubatch = %u >= %" PRId64 ": prompts do not seed the cache from their own ids, it is prefilled at load "
+                    "(LLAMA_MOE_CACHE_SEED_AUTO=0 or LLAMA_MOE_CACHE_SEED=2 to seed)\n", __func__, cparams.n_ubatch, seed_auto_ub);
+            }
+        }
 
         if (GGML_SCHED_PREFETCH && atoi(GGML_SCHED_PREFETCH) == 0) {
             prefetch_min_batch = INT64_MAX;
@@ -581,6 +594,9 @@ llama_context::llama_context(
 
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
+            if (moe_cache_seed_auto) {
+                moe_cache->prompts_do_not_seed();
+            }
         }
 
         sched_reserve();
