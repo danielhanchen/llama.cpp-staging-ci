@@ -26,6 +26,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -1241,6 +1242,59 @@ static struct llama_model_params common_model_params_to_llama_impl(common_params
 static enum llama_load_mode common_moe_cache_load_mode(const common_params & params, enum llama_load_mode load_mode, int32_t n_gpu_layers, bool experts_on_host);
 static bool common_experts_on_offloaded_host(const common_params & params, const llama_model_tensor_buft_override * overrides, int32_t n_gpu_layers);
 
+// bytes of one expert in the MoE cache: the sum over the expert tensors of the layer (the size of a slot) and the largest single tensor (the
+// size of a slot in its bank), with the number of experts, for the layer with the largest experts; false if the GGUF cannot be read
+struct common_moe_slot_bytes { int64_t n_expert = 0; int64_t sum = 0; int64_t max = 0; };
+static bool common_moe_slot_bytes_of(const std::string & path, common_moe_slot_bytes & out) {
+    std::string prefix;
+    int n_split = 1;
+    static const std::regex re_split("-([0-9]{5})-of-([0-9]{5})\\.gguf$");
+    std::smatch m;
+    if (std::regex_search(path, m, re_split)) {
+        prefix  = path.substr(0, m.position(0));
+        n_split = std::stoi(m[2].str());
+    }
+    std::map<long, common_moe_slot_bytes> per_layer;
+    for (int i = 0; i < n_split; ++i) {
+        std::string fname = path;
+        if (n_split > 1) {
+            std::vector<char> split_path(prefix.size() + 32);
+            llama_split_path(split_path.data(), split_path.size(), prefix.c_str(), i, n_split);
+            fname = split_path.data();
+        }
+        ggml_context * meta = nullptr;
+        struct gguf_init_params gp = { /* .no_alloc = */ true, /* .ctx = */ &meta };
+        gguf_context_ptr ctx(gguf_init_from_file(fname.c_str(), gp));
+        if (!ctx) {
+            return false;
+        }
+        ggml_context_ptr meta_ptr(meta);
+        for (int64_t t = 0; t < gguf_get_n_tensors(ctx.get()); ++t) {
+            const char * name = gguf_get_tensor_name(ctx.get(), t);
+            if (strncmp(name, "blk.", 4) != 0 || strstr(name, "_exps.weight") == nullptr) {
+                continue;
+            }
+            char * end = nullptr;
+            const long il = strtol(name + 4, &end, 10);
+            const ggml_tensor * w = ggml_get_tensor(meta, name);
+            if (end == name + 4 || w == nullptr || w->ne[2] <= 1) {
+                continue;
+            }
+            const int64_t b = (int64_t) (ggml_nbytes(w) / w->ne[2]);
+            common_moe_slot_bytes & l = per_layer[il];
+            l.n_expert = std::max<int64_t>(l.n_expert, w->ne[2]);
+            l.sum += b;
+            l.max  = std::max(l.max, b);
+        }
+    }
+    for (const auto & it : per_layer) {
+        if (it.second.sum > out.sum) {
+            out = it.second;
+        }
+    }
+    return out.sum > 0;
+}
+
 // MoE cache mode without -ub: every expert a prompt ubatch does not find in the cache is uploaded once per ubatch, so fewer, larger
 // ubatches upload less; the larger compute buffer (and SWA cache) is taken from the cache, the device memory stays what the default
 // ubatch would use. Picks the largest of 2048/4096/8192 (LLAMA_MOE_PREFILL_UB_MAX) whose compute buffer growth over 2048 is at most LLAMA_MOE_PREFILL_UB_FRAC
@@ -1288,7 +1342,7 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     }
 
     // device memory of a context at ubatch u, summed over the devices: {compute buffers, compute buffers + KV}; < 0 if the measure failed
-    struct mem { int64_t compute; int64_t total; };
+    struct mem { int64_t compute; int64_t total; int n_dev = 0; };
     const auto measure = [&](uint32_t u) -> mem {
         llama_context_params cp = cparams;
         cp.n_ubatch = u;
@@ -1299,9 +1353,9 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             const common_device_memory_data_vec dmd = common_get_device_memory_data(params.model.path.c_str(), &mparams, &cp, devs, hp_ngl, hp_nct, hp_nex,
                 params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
             if (dmd.size() < 2) {
-                return { -1, -1 }; // no device, nothing is cached
+                return { -1, -1, 0 }; // no device, nothing is cached
             }
-            mem m = { 0, 0 };
+            mem m = { 0, 0, (int) dmd.size() - 1 };
             for (size_t i = 0; i + 1 < dmd.size(); ++i) {
                 m.compute += (int64_t) dmd[i].compute;
                 m.total   += (int64_t) (dmd[i].context + dmd[i].compute);
@@ -1309,7 +1363,7 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             return m;
         } catch (const std::exception & e) {
             COM_WRN("memory measure at n_ubatch = %u failed: %s\n", u, e.what());
-            return { -1, -1 };
+            return { -1, -1, 0 };
         }
     };
 
@@ -1326,12 +1380,41 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             (m_ref.total - m_def.total)/1048576.0, cache/1048576.0);
         return;
     }
+    // LLAMA_MOE_CACHE_LEND=2: the graph allocation of a prompt ubatch is lent from the tail of one bank of the cache and given back for
+    // decode, so the cache gives up only the KV growth; a ubatch is taken if its compute buffers fit in one bank tail (every slot but one
+    // layer's experts, see llama_moe_cache lend) with LLAMA_MOE_PREFILL_UB_LEND_FRAC (0.85) of it, a larger one would not be lent and
+    // would need its own buffer next to the cache (single device only: the cache does not lend with several devices)
+    const char * env_l = getenv("LLAMA_MOE_CACHE_LEND");
+    common_moe_slot_bytes sb;
+    bool lend_graph = env_l != nullptr && atoi(env_l) == 2 && force <= 0 && m_def.n_dev == 1 && common_moe_slot_bytes_of(params.model.path, sb);
+    double lend_frac = 0.85;
+    if (const char * env_lf = getenv("LLAMA_MOE_PREFILL_UB_LEND_FRAC")) {
+        lend_frac = std::max(0.0, atof(env_lf));
+    }
+    const auto lend_fits = [&](const mem & m) {
+        const int64_t c       = cache - std::max<int64_t>(0, (m.total - m.compute) - (m_def.total - m_def.compute)); // the cache without the KV growth
+        const int64_t n_slots = c / sb.sum;
+        const int64_t n_keep  = std::min<int64_t>(n_slots / 2, sb.n_expert + 1);
+        const int64_t tail    = (n_slots - n_keep) * sb.max;
+        return (double) m.compute <= lend_frac * (double) tail;
+    };
+    if (lend_graph && !lend_fits(m_ref)) {
+        lend_graph = false;
+    }
+
     // the rule counts the compute buffers; the cache gives up their growth and that of the KV cache (e.g. the SWA cache, sized by n_ubatch)
     uint32_t pick   = cands[0];
     mem      m_pick = m_ref;
     for (size_t i = 1; i < cands.size(); ++i) {
         const mem m = measure(cands[i]);
-        if (m.total < 0 || (force <= 0 && (double) (m.compute - m_ref.compute) > frac*(double) cache_ref) || cache - (m.total - m_def.total) < cache/2) {
+        if (m.total < 0) {
+            break;
+        }
+        if (lend_graph) {
+            if (!lend_fits(m) || cache - ((m.total - m.compute) - (m_def.total - m_def.compute)) < cache/2) {
+                break;
+            }
+        } else if ((force <= 0 && (double) (m.compute - m_ref.compute) > frac*(double) cache_ref) || cache - (m.total - m_def.total) < cache/2) {
             break;
         }
         const bool kv_grows = (m.total - m.compute) > (m_ref.total - m_ref.compute) + (1 << 20);
@@ -1341,7 +1424,13 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         pick   = cands[i];
         m_pick = m;
     }
-    const size_t cache_new = (size_t) (cache - std::max<int64_t>(0, m_pick.total - m_def.total));
+    const size_t cache_new = lend_graph ? (size_t) (cache - std::max<int64_t>(0, (m_pick.total - m_pick.compute) - (m_def.total - m_def.compute)))
+                                        : (size_t) (cache - std::max<int64_t>(0, m_pick.total - m_def.total));
+    if (lend_graph) {
+        COM_INF("MoE cache: LLAMA_MOE_CACHE_LEND=2: n_ubatch %u, compute buffers %.2f MiB lent from one bank tail (slot %.2f MiB, largest tensor %.2f MiB, "
+            "%" PRId64 " experts; at most %.0f%% of the tail, LLAMA_MOE_PREFILL_UB_LEND_FRAC), the cache gives up only the KV growth\n",
+            pick, m_pick.compute/1048576.0, sb.sum/1048576.0, sb.max/1048576.0, sb.n_expert, 100.0*lend_frac);
+    }
 
     COM_INF("MoE cache: n_ubatch = %u (default %u): +%.2f MiB of compute and KV memory taken from the cache, %.2f -> %.2f MiB "
         "(compute growth over n_ubatch %u: %.2f MiB, at most %.0f%% of the cache; -ub or LLAMA_MOE_PREFILL_UB=0 to disable, %.0f ms)\n",
