@@ -1277,6 +1277,11 @@ struct llama_moe_cache::impl {
                 continue;
             }
             if (use_device(g, n_tokens)) {
+                // the device lookup and the hybrid assign treat every slot as a cache entry: the lent slots come back first
+                // the scheduler already took them back when it allocated the graph of this small batch, this only guards the order
+                if (g.lru.n_lent > 0) {
+                    unlend(g);
+                }
                 if (g.dev_gen != g.lru.gen) {
                     GGML_ASSERT(!g.dev_newer);
                     upload(g);
@@ -1398,10 +1403,17 @@ struct llama_moe_cache::impl {
         if (g.dev_lookup && g.dev_newer) {
             download(g);
         }
+        // a seed is planned and committed within one graph (see llama_context::graph_compute), none is open here
+        // closing it anyway keeps its rollback snapshot from outliving the slots it describes
+        seed_end(g);
         if (g.lru.n_lent > n_lend) {
             unlend(g);
         }
         if (g.lru.n_lent != n_lend) {
+            // the experts the lent slots hold (e.g. from the prefill at load) are uploaded again when the slots come back
+            if (n_lend > g.lru.n_lent) {
+                keep_evicted(g, n_lend);
+            }
             g.lru.set_lent(n_lend);
             LLAMA_LOG_INFO("%s: %s: MoE cache lends %d of %d slots (%.2f MiB) to the staging copies of large batches (LLAMA_MOE_CACHE_LEND=0 to disable)\n",
                 __func__, ggml_backend_name(backend), n_lend, g.n_slots, (double) n_lend*g.expert_bytes/1024.0/1024.0);
@@ -1416,6 +1428,7 @@ struct llama_moe_cache::impl {
     void unlend(group & g) {
         ggml_backend_t backend = devices[g.id].backend;
         ggml_backend_synchronize(backend);
+        seed_end(g);
         if (verify_enabled) {
             verify(g, "while lent");
         }
@@ -1428,6 +1441,8 @@ struct llama_moe_cache::impl {
         if (refill.empty() || g.dev_newer) {
             return;
         }
+        // at most the n slots that came back are filled, so the refill never evicts an expert that stayed cached
+        size_t budget = (size_t) n;
         for (int32_t il : g.layers) {
             if ((size_t) il >= refill.size() || refill[il].empty()) {
                 continue;
@@ -1435,6 +1450,10 @@ struct llama_moe_cache::impl {
             std::vector<int32_t> & ids_il = refill[il];
             const int32_t * slots = g.lru.slot_map[il];
             ids_il.erase(std::remove_if(ids_il.begin(), ids_il.end(), [&](int32_t e) { return slots[e] >= 0; }), ids_il.end());
+            if (ids_il.size() > budget) {
+                ids_il.resize(budget);
+            }
+            budget -= ids_il.size();
             size_t n_hit = 0;
             if (refill_enabled && !ids_il.empty() && g.lru.plan(il, ids_il.data(), ids_il.size(), fills, n_hit)) {
                 const layer & l = layers[il];
@@ -1458,6 +1477,23 @@ struct llama_moe_cache::impl {
         }
         if (verify_enabled) {
             verify(g, "after refill");
+        }
+    }
+
+    // the experts held by the slots that become lent (n_lent up to n) wait in refill for the slots to come back
+    // a later seed of the layer replaces them with the experts it could not admit (see seed)
+    void keep_evicted(group & g, int32_t n) {
+        const int32_t n_expert = g.lru.n_expert;
+        for (int32_t s = g.n_slots - n; s < g.n_slots - g.lru.n_lent; ++s) {
+            const int32_t key = g.lru.key_of[s];
+            if (key < 0) {
+                continue;
+            }
+            refill.resize(layers.size());
+            std::vector<int32_t> & ids_il = refill[key / n_expert];
+            if (std::find(ids_il.begin(), ids_il.end(), key % n_expert) == ids_il.end()) {
+                ids_il.push_back(key % n_expert);
+            }
         }
     }
 
