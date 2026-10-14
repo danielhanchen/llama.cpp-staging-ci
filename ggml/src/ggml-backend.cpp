@@ -2464,7 +2464,8 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
 
         // the reserve does not budget the SYNC copies of this graph on top of a larger arena kept from an earlier graph (e.g. the ubatch that seeds the MoE cache)
         // free it, so that the graph allocator can grow into that memory, the arena is allocated again when a graph needs more staging
-        if (!dry && has_sync[b] && pf->arena != NULL && pf->arena_size > pf->staging) {
+        // with a lend callback the graph was measured above: a graph allocator that already holds it (e.g. reserved for it) keeps the arena
+        if (!dry && has_sync[b] && pf->arena != NULL && pf->arena_size > pf->staging && (sched->callback_lend == NULL || gsize[b] > 0)) {
             // the old arena may still be read or written
             ggml_backend_sched_prefetch_sync(sched);
             ggml_backend_buffer_free(pf->arena);
