@@ -20,9 +20,10 @@
 // decayed counts (ggml_moe_cache_set_scores, LLAMA_MOE_CACHE_POLICY=decay): scores [n_expert, n_layer] with growing weights, each
 // distinct selected expert adds w = state[7]; at the first layer of the group (advance) w *= grow/65536 first, and when w reaches
 // MOE_CACHE_W_MAX every counter and w are halved (a pass over the whole table, every few dozen tokens), so a counter decays by
-// 65536/grow per token without touching it; the victim of each missing expert is the lowest score of the experts in the next
-// MOE_CACHE_WINDOW slots from the hand that this lookup does not use (empty slots: -1), ties by hand order, then the hand moves past
-// it; the reference bits are not used. Integer only: the same ids give the same slots.
+// 65536/grow per token without touching it; the victims of the missing experts are the lowest scores of the experts in the next
+// MOE_CACHE_WINDOW slots from the hand that this lookup does not use (empty slots: -1), ties by hand order, read in one pass, then the
+// hand moves past the furthest victim (more than MOE_CACHE_LANES missing experts: one window per missing expert); the reference bits
+// are not used. Integer only: the same ids give the same slots.
 
 #define MOE_CACHE_HDR   8
 #define MOE_CACHE_LANES 32
@@ -199,8 +200,64 @@ static __global__ void moe_cache_assign(
     int h = state[0];
     const int width = min(MOE_CACHE_LANES, n_slots);
     int found = 0;
+    if (scores != nullptr && n_take > 0 && n_take <= MOE_CACHE_LANES) {
+        // decayed counts, one window for all the missing experts: the scores and hand offsets of the first MOE_CACHE_WINDOW unpinned
+        // slots go to shared memory, then n_take rounds of a warp argmin (no global reads)
+        int32_t * cv = smem + (counts != nullptr ? 3 : 2)*n_ids; // [MOE_CACHE_WINDOW] scores
+        int32_t * co = cv + MOE_CACHE_WINDOW;                    // [MOE_CACHE_WINDOW] offsets from the hand
+        int seen = 0;
+        for (int off0 = 0; off0 < n_slots && seen < MOE_CACHE_WINDOW; off0 += MOE_CACHE_LANES) {
+            const int  off    = off0 + lane;
+            const bool active = off < n_slots;
+            const int  s      = active ? (h + off < n_slots ? h + off : h + off - n_slots) : 0;
+            const bool free_s = active && (uint32_t) pin[s] != epoch;
+            const unsigned m  = moe_cache_ballot(free_s);
+            const int rank    = seen + __popc(m & ((1u << lane) - 1));
+            if (free_s && rank < MOE_CACHE_WINDOW) {
+                const int32_t key = key_of[s];
+                cv[rank] = key >= 0 ? scores[key] : -1;
+                co[rank] = off;
+            }
+            seen = min(seen + __popc(m), MOE_CACHE_WINDOW);
+        }
+        __syncthreads();
+        int far = 0;
+        for (; found < n_take; ++found) {
+            int best_v = INT_MAX;
+            int best_o = INT_MAX;
+            int best_i = -1;
+            for (int i = lane; i < seen; i += MOE_CACHE_LANES) {
+                if (cv[i] < best_v || (cv[i] == best_v && co[i] < best_o)) {
+                    best_v = cv[i];
+                    best_o = co[i];
+                    best_i = i;
+                }
+            }
+            for (int o = MOE_CACHE_LANES/2; o > 0; o >>= 1) {
+                const int v2 = __shfl_xor_sync(full, best_v, o, MOE_CACHE_LANES);
+                const int o2 = __shfl_xor_sync(full, best_o, o, MOE_CACHE_LANES);
+                const int i2 = __shfl_xor_sync(full, best_i, o, MOE_CACHE_LANES);
+                if (v2 < best_v || (v2 == best_v && o2 < best_o)) {
+                    best_v = v2;
+                    best_o = o2;
+                    best_i = i2;
+                }
+            }
+            const int s = h + best_o < n_slots ? h + best_o : h + best_o - n_slots;
+            far = max(far, best_o);
+            __syncthreads();
+            if (lane == 0) {
+                victim[found] = s;
+                pin[s]        = (int32_t) epoch;
+                cv[best_i]    = INT_MAX; // taken
+                co[best_i]    = INT_MAX;
+            }
+            __syncthreads();
+        }
+        h = h + far + 1 < n_slots ? h + far + 1 : h + far + 1 - n_slots;
+    }
     if (scores != nullptr) {
-        // decayed counts: one window per missing expert, see the top of the file
+        // decayed counts, more missing experts than lanes (multi-token batches): one window per missing expert
         // there is an unpinned slot in the first n_slots ones from the hand because the distinct ids fit in the slots
         for (; found < n_take; ++found) {
             int best_sc  = INT_MAX;
@@ -513,7 +570,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
         memcpy(&fetch, (const int32_t *) dst->op_params + 11, sizeof(float));
         const int fetch_q = (int) lrintf(fetch*65536.0f);
         GGML_ASSERT(ggml_is_contiguous(counts) && fetch_q >= 0 && fetch_q <= 65536);
-        moe_cache_assign<<<1, MOE_CACHE_LANES, 3*n_ids*sizeof(int32_t), stream>>>(
+        moe_cache_assign<<<1, MOE_CACHE_LANES, (3*n_ids + (scores != nullptr ? 2*MOE_CACHE_WINDOW : 0))*sizeof(int32_t), stream>>>(
             (const int32_t *) ids->data, (int32_t *) map->data, (int32_t *) state->data, (int32_t *) dst->data,
             n_ids, ne0, n_expert, il, n_slots, (int32_t *) counts->data, (int) map->ne[1], fetch_q,
             scores != nullptr ? (int32_t *) scores->data : nullptr, grow, advance, n_scores);
@@ -521,7 +578,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
         return;
     }
 
-    moe_cache_assign<<<1, MOE_CACHE_LANES, 2*n_ids*sizeof(int32_t), stream>>>(
+    moe_cache_assign<<<1, MOE_CACHE_LANES, (2*n_ids + (scores != nullptr ? 2*MOE_CACHE_WINDOW : 0))*sizeof(int32_t), stream>>>(
         (const int32_t *) ids->data, (int32_t *) map->data, (int32_t *) state->data, (int32_t *) dst->data,
         n_ids, ne0, n_expert, il, n_slots, nullptr, 0, 0,
         scores != nullptr ? (int32_t *) scores->data : nullptr, grow, advance, n_scores);
