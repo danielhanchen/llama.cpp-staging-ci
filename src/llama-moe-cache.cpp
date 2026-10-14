@@ -65,6 +65,19 @@ struct moe_cache_lru {
         seen.assign(n_expert, 0);
     }
 
+    // every slot empty, in the order of init
+    void clear() {
+        GGML_ASSERT(n_lent == 0);
+        std::fill(key_of.begin(), key_of.end(), -1);
+        for (int32_t s = 0; s < n_slots; ++s) {
+            prev[s] = s - 1;
+            next[s] = s + 1 < n_slots ? s + 1 : -1;
+        }
+        head = n_slots > 0 ? 0 : -1;
+        tail = n_slots - 1;
+        gen++;
+    }
+
     void unlink(int32_t s) {
         if (prev[s] >= 0) {
             next[prev[s]] = next[s];
@@ -409,6 +422,7 @@ struct llama_moe_cache::impl {
     bool  hybrid_probe = false; // the fetch share is measured before the first small batch (LLAMA_MOE_CACHE_FETCH not set)
     bool  hybrid_live  = false; // the graphs of small batches use the hybrid path
     float hybrid_share = 1.0f;  // share of the missing experts that are fetched and admitted, 1 = all (no hybrid path)
+    bool  hybrid_fixed = false; // the share is set by LLAMA_MOE_CACHE_FETCH: the state is reset for every request (see hybrid_reset)
 
     // auto (LLAMA_MOE_CACHE_HYBRID=1): trials of 5 blocks of hybrid_block small batches: plain (warm-up,
     // not counted), plain, hybrid, hybrid, plain (a trend such as the cache warming up cancels out); the time from one small batch to the
@@ -460,17 +474,19 @@ struct llama_moe_cache::impl {
             seed_check = env != nullptr && atoi(env) != 0;
         }
         // LLAMA_MOE_CACHE_HYBRID: 0 or unset = off, 1 = auto (trials, kept only if faster), 2 = on with the measured share;
-        // LLAMA_MOE_CACHE_FETCH=0..1 turns it on with that share (the same in every run)
+        // LLAMA_MOE_CACHE_FETCH=0..1 turns it on with that share (the same in every run, see hybrid_reset), unless LLAMA_MOE_CACHE_HYBRID=0
         // off by default: the measured share and the trials depend on timing, so two runs could give different results
         {
             const char * env   = getenv("LLAMA_MOE_CACHE_HYBRID");
             const char * env_f = getenv("LLAMA_MOE_CACHE_FETCH");
             const int    mode  = env != nullptr ? atoi(env) : 0;
-            hybrid = device_lookup && (mode > 0 || env_f != nullptr) && model.hparams.n_expert >= 4;
+            // LLAMA_MOE_CACHE_HYBRID=0 turns it off even with LLAMA_MOE_CACHE_FETCH set
+            hybrid = device_lookup && (env != nullptr ? mode > 0 : env_f != nullptr) && model.hparams.n_expert >= 4;
             if (hybrid && env_f != nullptr) {
                 hybrid_share = std::min(1.0f, std::max(0.0f, (float) atof(env_f)));
                 hybrid       = hybrid_share < 1.0f;
                 hybrid_live  = hybrid;
+                hybrid_fixed = hybrid;
             } else {
                 hybrid_probe = hybrid;
                 hybrid_auto  = mode == 1;
@@ -771,6 +787,7 @@ struct llama_moe_cache::impl {
             }
             if (devs.size() != 1) {
                 hybrid       = false;
+                hybrid_fixed = false;
                 hybrid_probe = false;
                 hybrid_live  = false;
                 hybrid_share = 1.0f; // no hybrid line in the stats
@@ -1013,6 +1030,47 @@ struct llama_moe_cache::impl {
 
     bool hybrid_active() const {
         return hybrid && hybrid_live && hybrid_share < 1.0f;
+    }
+
+    // fixed share (LLAMA_MOE_CACHE_FETCH): which missing experts the host computes depends on the cached experts, the use counters and
+    // the rounding residual of the share, which all carry over from earlier batches; the context calls this before a batch whose
+    // sequences are all empty (a new request) and after a state is read, so the output does not depend on earlier requests:
+    // the cache starts empty as in a new process (the plain path computes the same with any cache contents, it is not reset)
+    void hybrid_reset() {
+        if (!hybrid || !hybrid_fixed) {
+            return;
+        }
+        seed_counts.clear();
+        for (group & g : groups) {
+            if (g.n_slots == 0 || !g.dev_lookup || g.counts == nullptr || g.counts->data == nullptr) {
+                continue;
+            }
+            for (int32_t il : g.layers) {
+                if ((size_t) il < refill.size()) {
+                    refill[il].clear();
+                }
+            }
+            if (g.lru.n_lent > 0) {
+                unlend(g);
+            }
+            ggml_backend_synchronize(devices[g.id].backend);
+            seed_end(g);
+            for (int32_t il : g.layers) {
+                std::fill(g.lru.slot_map[il], g.lru.slot_map[il] + g.lru.n_expert, -1);
+            }
+            g.lru.clear();
+            // the banks as allocated (cleared), kernels may read a little past the end of an expert
+            for (ggml_tensor * bank : g.banks) {
+                ggml_backend_tensor_memset(bank, 0, 0, ggml_nbytes(bank));
+            }
+            // the use counters and the residual; the count of experts computed on the host (statistics, stat[0..1]) is kept
+            const size_t n_cnt = (size_t) g.counts->ne[0]*(g.counts->ne[1] - 1);
+            ggml_backend_tensor_memset(g.counts, 0, 0, n_cnt*sizeof(int32_t));
+            ggml_backend_tensor_memset(g.counts, 0, (n_cnt + 2)*sizeof(int32_t), ((size_t) g.counts->ne[0] - 2)*sizeof(int32_t));
+            // the device state is replaced by the empty host state before the next device lookup (see prepare)
+            g.dev_newer = false;
+            g.dev_gen   = UINT64_MAX;
+        }
     }
 
     int hybrid_mode() const {
@@ -2153,6 +2211,14 @@ bool llama_moe_cache::hybrid_probe_pending() const {
 
 void llama_moe_cache::hybrid_probe(ggml_backend_t backend_cpu) {
     pimpl->probe(backend_cpu);
+}
+
+bool llama_moe_cache::hybrid_fixed() const {
+    return pimpl->hybrid && pimpl->hybrid_fixed;
+}
+
+void llama_moe_cache::hybrid_reset() {
+    pimpl->hybrid_reset();
 }
 
 bool llama_moe_cache::hybrid_window_pending() const {
