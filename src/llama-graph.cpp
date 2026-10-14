@@ -2514,7 +2514,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         ggml_backend_t dev = moe_cache->backend(il);
         ggml_tensor * experts_d = nullptr;
-        if (moe_cache->overlap()) {
+        // the overlap needs quantized experts: their single token products (mul_mat_vec_q) compute every slot on its own
+        bool overlap = moe_cache->overlap(n_tokens);
+        for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
+            overlap = overlap && (w == nullptr || ggml_is_quantized(w->type));
+        }
+        if (overlap) {
             // the copies of the admitted experts run beside the hits (cached before this lookup), then the admitted experts are computed
             ggml_tensor * fetched = moe_cache->hybrid_fetch_experts(ctx0, il, hybrid, true);
             ggml_backend_sched_set_tensor_backend(sched, fetched, dev);

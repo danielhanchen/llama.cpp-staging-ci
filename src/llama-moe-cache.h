@@ -40,8 +40,9 @@ public:
     ggml_tensor * hybrid_assign(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch, bool & host) const;
     ggml_tensor * hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res, bool overlap) const;
 
-    // on unless LLAMA_MOE_CACHE_FETCH_OVERLAP=0: the copies of the missing experts run beside the experts already cached (see ggml_moe_cache_fetch)
-    bool overlap() const;
+    // single token ubatches, on unless LLAMA_MOE_CACHE_FETCH_OVERLAP=0: the copies of the missing experts run beside the experts already
+    // cached (see ggml_moe_cache_fetch)
+    bool overlap(int64_t n_ubatch) const;
 
     // true if the graphs of small batches may use the hybrid path
     bool hybrid_active() const;

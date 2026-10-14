@@ -408,7 +408,7 @@ struct llama_moe_cache::impl {
     bool  hybrid_probe = false; // the fetch share is measured before the first small batch (LLAMA_MOE_CACHE_FETCH not set)
     bool  hybrid_live  = false; // the graphs of small batches use the hybrid path
     float hybrid_share = 1.0f;  // share of the missing experts that are fetched and admitted, 1 = all (no hybrid path)
-    bool  overlap      = false; // LLAMA_MOE_CACHE_OVERLAP: small batches compute the hits while the missing experts are copied
+    bool  overlap      = false; // LLAMA_MOE_CACHE_FETCH_OVERLAP: single token ubatches compute the hits while the missing experts are copied
 
     // auto (LLAMA_MOE_CACHE_HYBRID=1): trials of 5 blocks of hybrid_block small batches: plain (warm-up,
     // not counted), plain, hybrid, hybrid, plain (a trend such as the cache warming up cancels out); the time from one small batch to the
@@ -788,7 +788,7 @@ struct llama_moe_cache::impl {
                 hybrid_share = 1.0f; // no hybrid line in the stats
             } else if (!model.hparams.no_alloc) {
                 if (overlap) {
-                    LLAMA_LOG_INFO("%s: MoE cache: small batches compute the cached experts while the missing ones are copied (LLAMA_MOE_CACHE_FETCH_OVERLAP=0 to disable)\n", __func__);
+                    LLAMA_LOG_INFO("%s: MoE cache: single token ubatches compute the cached experts while the missing ones are copied (LLAMA_MOE_CACHE_FETCH_OVERLAP=0 to disable)\n", __func__);
                 }
                 if (hybrid && hybrid_probe) {
                     LLAMA_LOG_INFO("%s: hybrid MoE cache: the host computes the missing experts that are not fetched, fetch share measured at the first small batch, %s (LLAMA_MOE_CACHE_FETCH=0..1 to set the share)\n",
@@ -995,7 +995,7 @@ struct llama_moe_cache::impl {
 
     // the layer can use the hybrid lookup for a ubatch of this size
     bool hybrid_layer(int32_t il, int64_t n_ubatch) const {
-        if (!(hybrid || overlap) || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+        if (!(hybrid || overlap_batch(n_ubatch)) || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return false;
         }
         const group & g = groups[layers[il].ig];
@@ -1024,6 +1024,12 @@ struct llama_moe_cache::impl {
 
     bool hybrid_active() const {
         return hybrid && hybrid_live && hybrid_share < 1.0f;
+    }
+
+    // the overlap only for single token ubatches: their expert matrix products (mul_mat_vec_q) compute every slot on its own, so
+    // splitting the slots between two chains gives the same results; larger ubatches may pick kernels whose tiling depends on the slots
+    bool overlap_batch(int64_t n_ubatch) const {
+        return overlap && n_ubatch == 1;
     }
 
     int hybrid_mode() const {
@@ -2123,8 +2129,8 @@ ggml_tensor * llama_moe_cache::hybrid_fetch_experts(ggml_context * ctx, int32_t 
     return pimpl->hybrid_fetch_experts(ctx, il, res, overlap);
 }
 
-bool llama_moe_cache::overlap() const {
-    return pimpl->overlap;
+bool llama_moe_cache::overlap(int64_t n_ubatch) const {
+    return pimpl->overlap_batch(n_ubatch);
 }
 
 bool llama_moe_cache::hybrid_active() const {
