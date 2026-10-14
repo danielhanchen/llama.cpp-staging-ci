@@ -495,26 +495,11 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
-    ggml_tensor * moe_out =
-        build_moe_ffn(cur,
-            model.layers[il].ffn_gate_inp,
-            model.layers[il].ffn_up_exps,
-            model.layers[il].ffn_gate_exps,
-            model.layers[il].ffn_down_exps,
-            nullptr,
-            n_expert, n_expert_used,
-            LLM_FFN_SILU, true,
-            hparams.expert_weights_scale,
-            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, model.layers[il].ffn_gate_up_exps,
-            model.layers[il].ffn_up_exps_s,
-            model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
-    cb(moe_out, "ffn_moe_out", il);
-
     // Add shared experts if present - following Qwen3Next reference implementation
+    // (built before the routed experts so that an overlapped MoE cache lookup computes it while the missing experts are copied)
+    ggml_tensor * ffn_shexp = nullptr;
     if (model.layers[il].ffn_up_shexp != nullptr) {
-        ggml_tensor * ffn_shexp =
+        ffn_shexp =
             build_ffn(cur,
                 model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
                 model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
@@ -538,6 +523,27 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
         cb(ffn_shexp, "ffn_shexp_gated", il);
 
+        moe_overlap_extra = ffn_shexp;
+    }
+
+    ggml_tensor * moe_out =
+        build_moe_ffn(cur,
+            model.layers[il].ffn_gate_inp,
+            model.layers[il].ffn_up_exps,
+            model.layers[il].ffn_gate_exps,
+            model.layers[il].ffn_down_exps,
+            nullptr,
+            n_expert, n_expert_used,
+            LLM_FFN_SILU, true,
+            hparams.expert_weights_scale,
+            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+            nullptr, model.layers[il].ffn_gate_up_exps,
+            model.layers[il].ffn_up_exps_s,
+            model.layers[il].ffn_gate_exps_s,
+            model.layers[il].ffn_down_exps_s);
+    cb(moe_out, "ffn_moe_out", il);
+
+    if (ffn_shexp != nullptr) {
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
     } else {

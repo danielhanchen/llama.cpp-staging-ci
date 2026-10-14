@@ -2148,6 +2148,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
+    // work of the layer that does not depend on the experts, computed while the missing experts are copied (see moe_overlap_extra)
+    ggml_tensor * const overlap_extra = moe_overlap_extra;
+    moe_overlap_extra = nullptr;
+
     ggml_tensor * logits = nullptr;
 
     if (probs_in == nullptr) {
@@ -2522,6 +2526,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * experts_hit = build_experts(cur, hits, false, up_exps_s, gate_exps_s, down_exps_s, up_exps_b, gate_exps_b, gate_up_exps_b);
             cb(experts_hit, "ffn_moe_down_hits", il);
             ggml_build_forward_expand(gf, experts_hit);
+            if (overlap_extra != nullptr) {
+                ggml_build_forward_expand(gf, overlap_extra);
+            }
 
             ggml_tensor * joined = ggml_moe_cache_join(ctx0, fetched);
             ggml_backend_sched_set_tensor_backend(sched, joined, dev);

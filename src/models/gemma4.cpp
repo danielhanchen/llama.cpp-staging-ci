@@ -328,6 +328,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             ggml_tensor * logits = build_lora_mm(model.layers[il].ffn_gate_inp, tmp); // [n_expert, n_tokens]
             cb(logits, "ffn_moe_logits", il);
 
+            moe_overlap_extra = cur_mlp; // computed beside the copies of the MoE cache
             cur_moe = build_moe_ffn(cur_moe,
                     nullptr, // gate_inp
                     model.layers[il].ffn_up_exps,
