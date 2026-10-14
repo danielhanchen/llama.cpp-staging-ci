@@ -1679,7 +1679,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-ub", "--ubatch-size"}, "N",
         string_format("physical maximum batch size (default: %d; with --moe-cache-mib and experts in host memory chosen at load\n"
-                      "among 2048-16384 from the compute memory it takes from the cache, LLAMA_MOE_PREFILL_UB=0 to disable)", params.n_ubatch),
+                      "among 2048-8192 from the compute memory it takes from the cache, LLAMA_MOE_PREFILL_UB=0 to disable)", params.n_ubatch),
         [](common_params & params, int value) {
             params.n_ubatch = value;
             params.n_ubatch_set = true;

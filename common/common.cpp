@@ -1243,7 +1243,7 @@ static bool common_experts_on_offloaded_host(const common_params & params, const
 
 // MoE cache mode without -ub: every expert a prompt ubatch does not find in the cache is uploaded once per ubatch, so fewer, larger
 // ubatches upload less; the larger compute buffer (and SWA cache) is taken from the cache, the device memory stays what the default
-// ubatch would use. Picks the largest of 2048/4096/8192/16384 whose compute buffer growth over 2048 is at most LLAMA_MOE_PREFILL_UB_FRAC
+// ubatch would use. Picks the largest of 2048/4096/8192 (LLAMA_MOE_PREFILL_UB_MAX) whose compute buffer growth over 2048 is at most LLAMA_MOE_PREFILL_UB_FRAC
 // (0.15) of the cache at 2048 (the decode after the prompt reads from the smaller cache). LLAMA_MOE_PREFILL_UB=0 disables, =N forces N.
 static void common_moe_cache_auto_ubatch(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
     if (params.moe_cache_size == 0 || params.n_ubatch_set || params.embedding || cparams.embeddings || params.speculative.has_dft() ||
@@ -1272,7 +1272,13 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     const uint32_t ub_def = std::min(cparams.n_batch, cparams.n_ubatch == 0 ? cparams.n_batch : cparams.n_ubatch);
     // with causal attention the batch is limited by the context size (0 = the training context, not known here)
     const uint32_t ub_lim = params.n_batch_set ? cparams.n_batch : (params.n_ctx > 0 ? (uint32_t) params.n_ctx : UINT32_MAX);
+    // at most 8192 (LLAMA_MOE_PREFILL_UB_MAX): 12288 measured no faster than 8192 on 8k/16k prompts and 2-6% slower decode
+    uint32_t ub_max = 8192;
+    if (const char * env_m = getenv("LLAMA_MOE_PREFILL_UB_MAX")) {
+        ub_max = (uint32_t) std::max(0, atoi(env_m));
+    }
     std::vector<uint32_t> cands = { 2048, 4096, 8192, 16384 };
+    cands.erase(std::remove_if(cands.begin() + 1, cands.end(), [&](uint32_t u) { return u > ub_max; }), cands.end());
     if (force > 0) {
         cands = { (uint32_t) force };
     }
