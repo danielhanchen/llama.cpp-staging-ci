@@ -19,6 +19,12 @@ static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
 
+// LLAMA_KV_PREFETCH=0 keeps the host KV in pageable memory
+static bool kv_host_pinned() {
+    const char * e = getenv("LLAMA_KV_PREFETCH");
+    return e == nullptr || atoi(e) != 0;
+}
+
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -219,6 +225,19 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+        }
+
+        // host KV of a model with a GPU: pinned memory, so the attention of a prompt can copy it to the GPU by DMA
+        // (LLAMA_KV_PREFETCH=0: pageable memory as before)
+        if (ggml_backend_buft_is_host(buft) && kv_host_pinned()) {
+            for (const auto & d : model.devices) {
+                ggml_backend_buffer_type_t host_buft = d.is_meta ? nullptr : ggml_backend_dev_host_buffer_type(d.dev);
+                if (host_buft != nullptr && ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    buft     = host_buft;
+                    dev_name = ggml_backend_buft_name(host_buft);
+                    break;
+                }
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
