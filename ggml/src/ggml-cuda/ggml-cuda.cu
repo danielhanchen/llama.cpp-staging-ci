@@ -3811,6 +3811,12 @@ static void ggml_cuda_q8_1_cache_node_done(ggml_cuda_q8_1_cache & cache, const g
         if (node->op == GGML_OP_OPT_STEP_ADAMW || node->op == GGML_OP_OPT_STEP_SGD) {
             cache.invalidate_all(); // update src[0] in place
         }
+        if (node->op == GGML_OP_MOE_CACHE_LOOKUP) {
+            // updates its sources in place: the slot maps, the eviction state and the expert banks
+            for (int s = 0; s < GGML_MAX_SRC && node->src[s] != nullptr; ++s) {
+                cache.invalidate(node->src[s]->data, ggml_nbytes(node->src[s]));
+            }
+        }
         if (node->data != nullptr) {
             cache.invalidate(node->data, ggml_nbytes(node));
         }
