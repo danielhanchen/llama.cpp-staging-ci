@@ -1244,7 +1244,7 @@ static bool common_experts_on_offloaded_host(const common_params & params, const
 
 // bytes of one expert in the MoE cache: the sum over the expert tensors of the layer (the size of a slot) and the largest single tensor (the
 // size of a slot in its bank), with the number of experts, for the layer with the largest experts; false if the GGUF cannot be read
-struct common_moe_slot_bytes { int64_t n_expert = 0; int64_t sum = 0; int64_t max = 0; };
+struct common_moe_slot_bytes { int64_t n_expert = 0; int64_t sum = 0; int64_t max = 0; int64_t total = 0; int64_t n_layer = 0; };
 static bool common_moe_slot_bytes_of(const std::string & path, common_moe_slot_bytes & out) {
     std::string prefix;
     int n_split = 1;
@@ -1255,6 +1255,7 @@ static bool common_moe_slot_bytes_of(const std::string & path, common_moe_slot_b
         n_split = std::stoi(m[2].str());
     }
     std::map<long, common_moe_slot_bytes> per_layer;
+    int64_t total = 0;
     for (int i = 0; i < n_split; ++i) {
         std::string fname = path;
         if (n_split > 1) {
@@ -1271,6 +1272,11 @@ static bool common_moe_slot_bytes_of(const std::string & path, common_moe_slot_b
         ggml_context_ptr meta_ptr(meta);
         for (int64_t t = 0; t < gguf_get_n_tensors(ctx.get()); ++t) {
             const char * name = gguf_get_tensor_name(ctx.get(), t);
+            if (strncmp(name, "blk.", 4) == 0 && strstr(name, "_exps") != nullptr) {
+                if (const ggml_tensor * w = ggml_get_tensor(meta, name)) {
+                    total += (int64_t) ggml_nbytes(w); // every expert tensor (weights, biases, scales) of every layer
+                }
+            }
             if (strncmp(name, "blk.", 4) != 0 || strstr(name, "_exps.weight") == nullptr) {
                 continue;
             }
@@ -1292,13 +1298,21 @@ static bool common_moe_slot_bytes_of(const std::string & path, common_moe_slot_b
             out = it.second;
         }
     }
+    out.total   = total;
+    out.n_layer = (int64_t) per_layer.size();
     return out.sum > 0;
 }
 
 // MoE cache mode without -ub: every expert a prompt ubatch does not find in the cache is uploaded once per ubatch, so fewer, larger
-// ubatches upload less; the larger compute buffer (and SWA cache) is taken from the cache, the device memory stays what the default
-// ubatch would use. Picks the largest of 2048/4096/8192 (LLAMA_MOE_PREFILL_UB_MAX) whose compute buffer growth over 2048 is at most LLAMA_MOE_PREFILL_UB_FRAC
-// (0.15) of the cache at 2048 (the decode after the prompt reads from the smaller cache). LLAMA_MOE_PREFILL_UB=0 disables, =N forces N.
+// ubatches upload less. n_ubatch is 2048 instead of the default (512); the growth of the compute buffers and of the KV cache is taken
+// from the cache, so the device memory stays what the default ubatch would use. A larger n_ubatch (4096/8192, LLAMA_MOE_PREFILL_UB_MAX)
+// only when it costs the decode nothing:
+// - the KV cache does not grow with n_ubatch (the SWA cache holds the window plus one ubatch, every later decode step attends over it)
+// - the cache still holds every expert of the model after giving up the growth (so the decode reads the same experts from it)
+// LLAMA_MOE_PREFILL_UB_AUTO=1 (opt-in): the rule measured before (largest n_ubatch whose compute buffer growth over 2048 is at most
+// LLAMA_MOE_PREFILL_UB_FRAC (0.15) of the cache, 4096 at most with a growing KV cache): faster prompts, but -1..-17% decode where the
+// cache does not hold every expert. LLAMA_MOE_CACHE_LEND=2: the compute buffers are lent from the cache, it gives up only the KV growth.
+// LLAMA_MOE_PREFILL_UB=0 disables (n_ubatch stays the default), =N forces N.
 static void common_moe_cache_auto_ubatch(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
     if (params.moe_cache_size == 0 || params.n_ubatch_set || params.embedding || cparams.embeddings || params.speculative.has_dft() ||
         std::any_of(params.speculative.types.begin(), params.speculative.types.end(), [](auto t) { return t != COMMON_SPECULATIVE_TYPE_NONE; })) {
@@ -1312,12 +1326,14 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     if (!common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
         return;
     }
+    const char * env_a = getenv("LLAMA_MOE_PREFILL_UB_AUTO");
+    const bool   rule_frac = env_a != nullptr && atoi(env_a) != 0;
     double frac = 0.15;
     if (const char * env_f = getenv("LLAMA_MOE_PREFILL_UB_FRAC")) {
         frac = std::max(0.0, atof(env_f));
     }
-    // a KV cache sized by n_ubatch (the SWA cache holds the window plus one ubatch) makes every later decode step attend over the
-    // larger cache: measured -14% decode after an 8k prompt at n_ubatch 8192 with every expert cached (gemma-4), so such models stop here
+    // LLAMA_MOE_PREFILL_UB_AUTO=1 with a KV cache sized by n_ubatch: at most 4096 (measured -14% decode after an 8k prompt at n_ubatch 8192
+    // with every expert cached, gemma-4)
     uint32_t ub_max_kv = 4096;
     if (const char * env_s = getenv("LLAMA_MOE_PREFILL_UB_SWA_MAX")) {
         ub_max_kv = (uint32_t) std::max(0, atoi(env_s));
@@ -1342,7 +1358,15 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     }
 
     // device memory of a context at ubatch u, summed over the devices: {compute buffers, compute buffers + KV}; < 0 if the measure failed
+    // the measure counts the compute buffers of the loaded context (LLAMA_MOE_MEASURE_LENT while it runs, see sched_reserve): without the
+    // staging copies, which the cache lends (and which do not change with n_ubatch), with the seed graph of the MoE cache
     struct mem { int64_t compute; int64_t total; int n_dev = 0; };
+    // (not with LLAMA_MOE_CACHE_LEND=2, whose rule counts the staging copies lent together with the graph allocation)
+    const bool lend2_env    = getenv("LLAMA_MOE_CACHE_LEND") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_LEND")) == 2;
+    const bool had_lent_env = getenv("LLAMA_MOE_MEASURE_LENT") != nullptr || lend2_env;
+    if (!had_lent_env) {
+        common_set_env("LLAMA_MOE_MEASURE_LENT", "1");
+    }
     const auto measure = [&](uint32_t u) -> mem {
         llama_context_params cp = cparams;
         cp.n_ubatch = u;
@@ -1366,6 +1390,14 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             return { -1, -1, 0 };
         }
     };
+    struct lent_env_reset {
+        bool had;
+        ~lent_env_reset() {
+            if (!had) {
+                common_set_env("LLAMA_MOE_MEASURE_LENT", "");
+            }
+        }
+    } lent_env_guard = { had_lent_env };
 
     const int64_t t0    = ggml_time_us();
     const mem m_def = measure(ub_def);
@@ -1373,26 +1405,29 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     if (m_def.total < 0 || m_ref.total < 0) {
         return;
     }
-    const int64_t cache    = (int64_t) params.moe_cache_size;
+    const int64_t cache     = (int64_t) params.moe_cache_size;
     const int64_t cache_ref = cache - std::max<int64_t>(0, m_ref.total - m_def.total);
     if (cache_ref < cache/2) {
         COM_INF("MoE cache: n_ubatch stays %u, n_ubatch %u would take %.2f of %.2f MiB from the cache\n", ub_def, cands[0],
             (m_ref.total - m_def.total)/1048576.0, cache/1048576.0);
         return;
     }
+    const auto kv = [](const mem & m) { return m.total - m.compute; };
+
     // LLAMA_MOE_CACHE_LEND=2: the graph allocation of a prompt ubatch is lent from the tail of one bank of the cache and given back for
     // decode, so the cache gives up only the KV growth; a ubatch is taken if its compute buffers fit in one bank tail (every slot but one
     // layer's experts, see llama_moe_cache lend) with LLAMA_MOE_PREFILL_UB_LEND_FRAC (0.85) of it, a larger one would not be lent and
     // would need its own buffer next to the cache (single device only: the cache does not lend with several devices)
     const char * env_l = getenv("LLAMA_MOE_CACHE_LEND");
     common_moe_slot_bytes sb;
-    bool lend_graph = env_l != nullptr && atoi(env_l) == 2 && force <= 0 && m_def.n_dev == 1 && common_moe_slot_bytes_of(params.model.path, sb);
+    const bool have_sb = common_moe_slot_bytes_of(params.model.path, sb);
+    bool lend_graph = env_l != nullptr && atoi(env_l) == 2 && force <= 0 && m_def.n_dev == 1 && have_sb;
     double lend_frac = 0.85;
     if (const char * env_lf = getenv("LLAMA_MOE_PREFILL_UB_LEND_FRAC")) {
         lend_frac = std::max(0.0, atof(env_lf));
     }
     const auto lend_fits = [&](const mem & m) {
-        const int64_t c       = cache - std::max<int64_t>(0, (m.total - m.compute) - (m_def.total - m_def.compute)); // the cache without the KV growth
+        const int64_t c       = cache - std::max<int64_t>(0, kv(m) - kv(m_def)); // the cache without the KV growth
         const int64_t n_slots = c / sb.sum;
         const int64_t n_keep  = std::min<int64_t>(n_slots / 2, sb.n_expert + 1);
         const int64_t tail    = (n_slots - n_keep) * sb.max;
@@ -1401,8 +1436,11 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     if (lend_graph && !lend_fits(m_ref)) {
         lend_graph = false;
     }
+    // the cache holds every expert: all the expert tensors of the model, a slot per layer of slack (the extra slot of each bank, the
+    // device lookup state) and 2%
+    const int64_t all_experts = have_sb ? (int64_t) (1.02*(double) sb.total) + sb.n_layer*sb.sum : INT64_MAX;
+    const char * rule = force > 0 ? "forced" : lend_graph ? "LLAMA_MOE_CACHE_LEND=2" : rule_frac ? "LLAMA_MOE_PREFILL_UB_AUTO=1" : "every expert cached, no KV growth";
 
-    // the rule counts the compute buffers; the cache gives up their growth and that of the KV cache (e.g. the SWA cache, sized by n_ubatch)
     uint32_t pick   = cands[0];
     mem      m_pick = m_ref;
     for (size_t i = 1; i < cands.size(); ++i) {
@@ -1410,32 +1448,38 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         if (m.total < 0) {
             break;
         }
+        const bool kv_grows = kv(m) > kv(m_ref) + (1 << 20);
         if (lend_graph) {
-            if (!lend_fits(m) || cache - ((m.total - m.compute) - (m_def.total - m_def.compute)) < cache/2) {
+            if (!lend_fits(m) || cache - (kv(m) - kv(m_def)) < cache/2) {
                 break;
             }
-        } else if ((force <= 0 && (double) (m.compute - m_ref.compute) > frac*(double) cache_ref) || cache - (m.total - m_def.total) < cache/2) {
-            break;
-        }
-        const bool kv_grows = (m.total - m.compute) > (m_ref.total - m_ref.compute) + (1 << 20);
-        if (force <= 0 && kv_grows && cands[i] > ub_max_kv) {
+        } else if (rule_frac) {
+            if ((double) (m.compute - m_ref.compute) > frac*(double) cache_ref || cache - (m.total - m_def.total) < cache/2) {
+                break;
+            }
+            if (kv_grows && cands[i] > ub_max_kv) {
+                break;
+            }
+        } else if (kv_grows || cache - (m.total - m_def.total) < all_experts) {
             break;
         }
         pick   = cands[i];
         m_pick = m;
     }
-    const size_t cache_new = lend_graph ? (size_t) (cache - std::max<int64_t>(0, (m_pick.total - m_pick.compute) - (m_def.total - m_def.compute)))
-                                        : (size_t) (cache - std::max<int64_t>(0, m_pick.total - m_def.total));
+    const int64_t taken     = std::max<int64_t>(0, lend_graph ? kv(m_pick) - kv(m_def) : m_pick.total - m_def.total);
+    const size_t  cache_new = (size_t) (cache - taken);
     if (lend_graph) {
         COM_INF("MoE cache: LLAMA_MOE_CACHE_LEND=2: n_ubatch %u, compute buffers %.2f MiB lent from one bank tail (slot %.2f MiB, largest tensor %.2f MiB, "
             "%" PRId64 " experts; at most %.0f%% of the tail, LLAMA_MOE_PREFILL_UB_LEND_FRAC), the cache gives up only the KV growth\n",
             pick, m_pick.compute/1048576.0, sb.sum/1048576.0, sb.max/1048576.0, sb.n_expert, 100.0*lend_frac);
     }
 
-    COM_INF("MoE cache: n_ubatch = %u (default %u): +%.2f MiB of compute and KV memory taken from the cache, %.2f -> %.2f MiB "
-        "(compute growth over n_ubatch %u: %.2f MiB, at most %.0f%% of the cache; -ub or LLAMA_MOE_PREFILL_UB=0 to disable, %.0f ms)\n",
-        pick, ub_def, (m_pick.total - m_def.total)/1048576.0, cache/1048576.0, cache_new/1048576.0, cands[0], (m_pick.compute - m_ref.compute)/1048576.0,
-        100.0*frac, (ggml_time_us() - t0)/1000.0);
+    COM_INF("MoE cache: n_ubatch = %u (default %u, rule: %s): +%.2f MiB of compute and KV memory taken from the cache, %.2f -> %.2f MiB "
+        "(measured at n_ubatch %u / %u / %u: compute %.2f / %.2f / %.2f MiB, KV %.2f / %.2f / %.2f MiB; experts %.2f MiB; "
+        "-ub or LLAMA_MOE_PREFILL_UB=0 to disable, LLAMA_MOE_PREFILL_UB_AUTO=1 for larger ubatches, %.0f ms)\n",
+        pick, ub_def, rule, taken/1048576.0, cache/1048576.0, cache_new/1048576.0,
+        ub_def, cands[0], pick, m_def.compute/1048576.0, m_ref.compute/1048576.0, m_pick.compute/1048576.0,
+        kv(m_def)/1048576.0, kv(m_ref)/1048576.0, kv(m_pick)/1048576.0, have_sb ? sb.total/1048576.0 : -1.0, (ggml_time_us() - t0)/1000.0);
 
     params.n_ubatch       = (int32_t) pick;
     cparams.n_ubatch      = pick;

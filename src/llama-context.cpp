@@ -969,6 +969,33 @@ void llama_context::sched_reserve() {
         }
     }
 
+    // the measure of the MoE cache auto n_ubatch (LLAMA_MOE_MEASURE_LENT=1, set by common_moe_cache_auto_ubatch) counts the compute buffer
+    // the loaded context ends up with: the staging copies lent by the MoE cache (none of the arena), and the seed graph when it is larger
+    // than the pp graph (a prompt ubatch that seeds the cache holds the expert copies of its cached layers in the graph allocation), which
+    // a context with room for it reserves (see sched_reserve_seed). Measured with the staging and without the seed, the growth from
+    // n_ubatch 512 to 2048 was 390 MiB where the device sees 254 (Qwen3.6 UD-Q4_K_XL) and 794 where it sees 548 (gemma-4 26B-A4B)
+    if (model.hparams.no_alloc && getenv("LLAMA_MOE_MEASURE_LENT") != nullptr && atoi(getenv("LLAMA_MOE_MEASURE_LENT")) != 0) {
+        std::vector<size_t> graph_sz(backend_ptrs.size());
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            graph_sz[i] = backend_buf_exp_size[i] - std::min(backend_buf_exp_size[i], staging_pp[i]);
+        }
+        if (moe_cache && moe_cache_seed_sync && n_tokens > llama_moe_cache::n_small_max && (int64_t) n_tokens >= prefetch_min_batch) {
+            std::vector<size_t> sizes(backend_ptrs.size(), 0);
+            moe_cache_seed = true;
+            graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), /*split_only =*/ true, sizes.data());
+            moe_cache_seed = false;
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                const size_t st = std::min(sizes[i], ggml_backend_sched_get_staging_size(sched.get(), backend_ptrs[i]));
+                graph_sz[i] = std::max(graph_sz[i], sizes[i] - st);
+            }
+        }
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            LLAMA_LOG_DEBUG("%s: %s: measure: compute %.2f MiB (pp with staging), %.2f MiB lent\n", __func__, ggml_backend_buft_name(backend_buft[i]),
+                backend_buf_exp_size[i]/1024.0/1024.0, graph_sz[i]/1024.0/1024.0);
+            backend_buf_exp_size[i] = graph_sz[i];
+        }
+    }
+
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`

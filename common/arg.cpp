@@ -1678,8 +1678,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_BATCH"));
     add_opt(common_arg(
         {"-ub", "--ubatch-size"}, "N",
-        string_format("physical maximum batch size (default: %d; with --moe-cache-mib and experts in host memory chosen at load\n"
-                      "among 2048-8192 from the compute memory it takes from the cache, LLAMA_MOE_PREFILL_UB=0 to disable)", params.n_ubatch),
+        string_format("physical maximum batch size (default: %d; with --moe-cache-mib and experts in host memory 2048, the growth\n"
+                      "taken from the cache, 4096-8192 if the cache still holds every expert and the KV cache does not grow;\n"
+                      "LLAMA_MOE_PREFILL_UB=0 to disable, LLAMA_MOE_PREFILL_UB_AUTO=1 for larger ubatches from the cache)", params.n_ubatch),
         [](common_params & params, int value) {
             params.n_ubatch = value;
             params.n_ubatch_set = true;
