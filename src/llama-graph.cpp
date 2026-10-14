@@ -3169,8 +3169,9 @@ kv_host_mode llm_graph_context::kv_host_attn_mode(const ggml_tensor * k, const g
         return KV_HOST_NONE;
     }
     if (n_tokens >= min_batch) {
-        // LLAMA_KV_STAGE=0: the prompt's attention reads the host rows through the scheduler's synchronous input copy
-        static const bool stage = getenv("LLAMA_KV_STAGE") == nullptr || atoi(getenv("LLAMA_KV_STAGE")) != 0;
+        // LLAMA_KV_STAGE=1: stage the rows on the GPU so the scheduler can upload them ahead; off by default, the pinned
+        // synchronous input copy measured faster (G4: Qwen3.6 30K prompt 7082 vs 6512 t/s, 100K 6088 vs 5443 t/s)
+        static const bool stage = getenv("LLAMA_KV_STAGE") != nullptr && atoi(getenv("LLAMA_KV_STAGE")) != 0;
         return stage ? KV_HOST_STAGE : KV_HOST_NONE;
     }
     if (strcmp(decode, "gpu") == 0) {
