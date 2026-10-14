@@ -407,8 +407,16 @@ llama_context::llama_context(
             }
         }
 
+        // smallest ubatch whose dense host weights (not MoE experts) are prefetched, below prefetch_min_batch
+        // (e.g. dense FFN weights spilled by --fit, computed on the device from GGML_OP_OFFLOAD_MIN_BATCH = 32 tokens); >= prefetch_min_batch = off
+        const char * GGML_SCHED_PREFETCH_DENSE_MIN = getenv("GGML_SCHED_PREFETCH_DENSE_MIN");
+        if (GGML_SCHED_PREFETCH_DENSE_MIN) {
+            prefetch_dense_min_batch = std::max(1, atoi(GGML_SCHED_PREFETCH_DENSE_MIN));
+        }
+
         if (GGML_SCHED_PREFETCH && atoi(GGML_SCHED_PREFETCH) == 0) {
-            prefetch_min_batch = INT64_MAX;
+            prefetch_min_batch       = INT64_MAX;
+            prefetch_dense_min_batch = INT64_MAX;
         } else if (GGML_SCHED_PREFETCH_MIN_BATCH) {
             prefetch_min_batch = std::max(1, atoi(GGML_SCHED_PREFETCH_MIN_BATCH));
         }
@@ -3241,9 +3249,22 @@ ggml_backend_sched_prefetch_mode llama_context::sched_prefetch_mode(const ggml_t
         return GGML_BACKEND_SCHED_PREFETCH_NONE;
     }
 
-    // small ubatches are not prefetched, their copies reuse the staging arena of the prompt (if any) instead of growing the graph allocator next to it
+    // small ubatches are not prefetched, their copies reuse the staging arena of the prompt (if any) instead of growing the graph allocator next to it,
+    // except the dense host weights of medium ubatches (the experts of MUL_MAT_ID keep the rules below, a medium ubatch never copies whole expert banks)
     if (lctx->prefetch_n_tokens < lctx->prefetch_min_batch) {
-        return GGML_BACKEND_SCHED_PREFETCH_SYNC;
+        if (lctx->prefetch_n_tokens < lctx->prefetch_dense_min_batch) {
+            return GGML_BACKEND_SCHED_PREFETCH_SYNC;
+        }
+        if (lctx->moe_cache && lctx->moe_cache->get_experts(src) != nullptr) {
+            return GGML_BACKEND_SCHED_PREFETCH_SYNC;
+        }
+        for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+            const ggml_tensor * node = ggml_graph_node(graph, i);
+            if ((node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_ADD_ID) && (node->src[0] == dst || node->src[1] == dst || node->src[2] == dst)) {
+                return GGML_BACKEND_SCHED_PREFETCH_SYNC;
+            }
+        }
+        return GGML_BACKEND_SCHED_PREFETCH_ASYNC;
     }
 
     // experts: the copy callback can copy them ahead only if it does not need the ids, which are computed by an earlier split
@@ -3259,6 +3280,10 @@ ggml_backend_sched_prefetch_mode llama_context::sched_prefetch_mode(const ggml_t
 
 void llama_context::sched_lend(ggml_backend_t backend, ggml_backend_sched_lend_copy * copies, int n_copies, int depth, bool dry, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
+    // the dense copies of medium ubatches (see sched_prefetch_mode) use the staging arena, the MoE cache lends only to large ones
+    if (n_copies > 0 && lctx->prefetch_n_tokens < lctx->prefetch_min_batch) {
+        return;
+    }
     if (lctx->moe_cache) {
         lctx->moe_cache->lend(backend, copies, n_copies, depth, dry, lctx->prefetch_n_tokens);
     }

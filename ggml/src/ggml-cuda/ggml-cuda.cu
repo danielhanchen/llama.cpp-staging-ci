@@ -6415,6 +6415,39 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
 #endif
 }
 
+// an event that measures time (the scheduler measures how long splits wait for their prefetched copies), freed with ggml_backend_event_free
+static ggml_backend_event_t ggml_backend_cuda_timer_new(ggml_backend_dev_t dev) {
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *)dev->context;
+
+    ggml_cuda_set_device(dev_ctx->device);
+
+    cudaEvent_t event;
+    if (cudaEventCreate(&event) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+
+    return new ggml_backend_event {
+        /* .device  = */ dev,
+        /* .context = */ event,
+    };
+}
+
+// milliseconds from t0 to t1, false (no wait) if either has not completed yet
+static bool ggml_backend_cuda_timer_elapsed(ggml_backend_event_t t0, ggml_backend_event_t t1, float * ms) {
+    cudaEvent_t e0 = (cudaEvent_t) t0->context;
+    cudaEvent_t e1 = (cudaEvent_t) t1->context;
+    if (cudaEventQuery(e1) != cudaSuccess || cudaEventQuery(e0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (cudaEventElapsedTime(ms, e0, e1) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
 static void ggml_backend_cuda_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     GGML_UNUSED(dev);
 
@@ -6702,6 +6735,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_set_copy_peer") == 0) {
         return (void *)ggml_backend_cuda_set_copy_peer;
+    }
+    if (strcmp(name, "ggml_backend_timer_new") == 0) {
+        return (void *)ggml_backend_cuda_timer_new;
+    }
+    if (strcmp(name, "ggml_backend_timer_elapsed") == 0) {
+        return (void *)ggml_backend_cuda_timer_elapsed;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
