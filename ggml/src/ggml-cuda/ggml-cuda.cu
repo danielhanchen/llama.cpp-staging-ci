@@ -708,6 +708,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             CUDA_CHECK(cudaEventDestroy(ev));
         }
     }
+    if (moe_fork != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(moe_fork));
+        CUDA_CHECK(cudaEventDestroy(moe_join));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -4984,6 +4988,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->q8_1_cache.end();
         }
 
+        // an overlapped MoE cache fetch whose join is not in this graph (another split): the side stream joins the main stream
+        // here, so a CUDA graph capture never ends with an unjoined stream and the next graph starts after the copies
+        if (cuda_ctx->moe_join_pending) {
+            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), cuda_ctx->moe_join, 0));
+            cuda_ctx->moe_join_pending = false;
+        }
+
 #ifdef USE_CUDA_GRAPH
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
@@ -5150,7 +5161,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 continue;
             }
             for (int j = i + 3; j + 2 < cgraph->n_nodes; ++j) {
-                if (cgraph->nodes[j]->op == GGML_OP_MUL_MAT_ID && cgraph->nodes[j + 1]->op == GGML_OP_MUL_MAT_ID) {
+                // the routed experts of the next layer; a second chain over the same input (the experts fetched by an overlapped
+                // MoE cache lookup, see build_moe_ffn) is skipped, so the shared expert is computed with the first one, beside the copies
+                if (cgraph->nodes[j]->op == GGML_OP_MUL_MAT_ID && cgraph->nodes[j + 1]->op == GGML_OP_MUL_MAT_ID &&
+                        cgraph->nodes[j]->src[1] != cgraph->nodes[i]->src[1]) {
                     break;
                 }
                 if (cgraph->nodes[j]->op != GGML_OP_MUL_MAT || !ggml_cuda_match_shared_expert(cgraph, i, j)) {
@@ -6648,8 +6662,41 @@ static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const g
 #endif
 }
 
+// whether an overlapped MoE cache fetch (ggml_moe_cache_fetch with overlap) is expected to be faster on the device dev:
+// measured faster on compute capability 7.5 and 8.9 (T4, L4) at every budget; on 12.0 (RTX PRO 6000), where kernels launch with PDL,
+// the second stream made the experts and the other kernels slower, a loss with few missing experts (up to -11%), so it is off there
+// by default (and on the other PDL and AMD devices, not measured)
+static bool ggml_backend_cuda_moe_fetch_overlap_default(ggml_backend_dev_t dev) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(dev);
+    return false;
+#else
+    const int cc = ggml_cuda_info().devices[((ggml_backend_cuda_device_context *) dev->context)->device].cc;
+    return cc < GGML_CUDA_CC_HOPPER;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
+// the overlap pays when enough expert bytes are copied per layer and token to hide the cost of its extra nodes: none below compute
+// capability 9.0 (faster on T4 and L4 at every measured budget); with PDL (9.0 and newer) the second stream slows the kernels beside it
+// (RTX PRO 6000: -11% with 0.26 missing experts of gemma-4 26B per layer and token, +6% with 3.4), see llama_moe_cache
+static size_t ggml_backend_cuda_moe_fetch_overlap_min_bytes(ggml_backend_dev_t dev) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(dev);
+    return SIZE_MAX;
+#else
+    const int cc = ggml_cuda_info().devices[((ggml_backend_cuda_device_context *) dev->context)->device].cc;
+    return cc < GGML_CUDA_CC_HOPPER ? 0 : (size_t) 4 << 20;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_moe_fetch_overlap_min_bytes") == 0) {
+        return (void *)ggml_backend_cuda_moe_fetch_overlap_min_bytes;
+    }
+    if (strcmp(name, "ggml_backend_moe_fetch_overlap_default") == 0) {
+        return (void *)ggml_backend_cuda_moe_fetch_overlap_default;
+    }
     if (strcmp(name, "ggml_backend_copy_regions_async") == 0) {
         return (void *)ggml_backend_cuda_copy_regions_async;
     }

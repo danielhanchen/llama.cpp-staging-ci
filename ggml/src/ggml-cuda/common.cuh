@@ -1553,6 +1553,9 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+    cudaEvent_t moe_fork   = nullptr; // overlapped MoE cache fetch (see ggml_moe_cache_fetch)
+    cudaEvent_t moe_join   = nullptr;
+    bool        moe_join_pending = false; // moe_join was recorded and the main stream has not waited for it yet
 
     ggml_cuda_q8_1_cache q8_1_cache;
 

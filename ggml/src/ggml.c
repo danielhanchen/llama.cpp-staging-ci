@@ -3499,9 +3499,9 @@ struct ggml_tensor * ggml_moe_cache_assign(
     GGML_ASSERT(n_slots > 0 && ggml_nelements(state) == 8 + 3*n_slots);
     GGML_ASSERT(MIN(ggml_nelements(ids), map->ne[0]) <= n_slots && "more distinct experts than slots");
 
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], 4*ids->ne[1] + 1);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], 5*ids->ne[1] + 1);
 
-    int32_t params[2 + 2*4 + 2] = { il, 0 };
+    int32_t params[2 + 2*4 + 3] = { il, 0 };
     params[10] = 1; // assign only
     memcpy(&params[11], &fetch, sizeof(float));
     static_assert(sizeof(params) <= GGML_MAX_OP_PARAMS, "op params too large");
@@ -3521,22 +3521,24 @@ struct ggml_tensor * ggml_moe_cache_fetch(
         struct ggml_tensor  * res,
         struct ggml_tensor ** banks,
         const void         ** host,
-        int                   n_banks) {
+        int                   n_banks,
+        bool                  overlap) {
     GGML_ASSERT(res->op == GGML_OP_MOE_CACHE_LOOKUP && ggml_get_op_params_i32(res, 10) == 1);
     GGML_ASSERT(n_banks > 0 && n_banks <= 4 && 1 + n_banks <= GGML_MAX_SRC);
-    GGML_ASSERT((res->ne[1] - 1) % 4 == 0);
+    GGML_ASSERT((res->ne[1] - 1) % 5 == 0);
     for (int i = 0; i < n_banks; ++i) {
         GGML_ASSERT(banks[i]->ne[3] == 1 && ggml_is_contiguous(banks[i]));
     }
 
-    const int64_t n_tokens = (res->ne[1] - 1)/4;
+    const int64_t n_tokens = (res->ne[1] - 1)/5;
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, res->ne[0], n_tokens);
 
-    int32_t params[2 + 2*4 + 2] = { ggml_get_op_params_i32(res, 0), n_banks };
+    int32_t params[2 + 2*4 + 3] = { ggml_get_op_params_i32(res, 0), n_banks };
     for (int i = 0; i < n_banks; ++i) {
         memcpy(&params[2 + 2*i], &host[i], sizeof(void *));
     }
     params[10] = 2; // fetch only
+    params[12] = overlap ? 1 : 0;
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_MOE_CACHE_LOOKUP;
@@ -3544,6 +3546,25 @@ struct ggml_tensor * ggml_moe_cache_fetch(
     for (int i = 0; i < n_banks; ++i) {
         result->src[1 + i] = banks[i];
     }
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_cache_join(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(a->op == GGML_OP_MOE_CACHE_LOOKUP && ggml_get_op_params_i32(a, 10) == 2 && ggml_get_op_params_i32(a, 12) == 1);
+
+    // in place: the join only orders the graph after the copies
+    struct ggml_tensor * result = ggml_view_tensor(ctx, a);
+
+    int32_t params[2 + 2*4 + 3] = { ggml_get_op_params_i32(a, 0), 0 };
+    params[10] = 3; // join
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_CACHE_LOOKUP;
+    result->src[0] = a;
+    result->src[1] = a->src[0]; // the assign result is read by the copies, so it must not be reused before the join
 
     return result;
 }

@@ -1210,7 +1210,12 @@ struct llm_graph_context {
 
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
     // for large batches of a cached layer, selected_experts is replaced by a graph output the cache reads after the graph
-    // with hybrid != nullptr, a layer on the hybrid path returns nullptr and sets *hybrid to its lookup (see llama_moe_cache::hybrid_assign)
+    // with assign != nullptr, a layer that uses ggml_moe_cache_assign returns nullptr and sets *assign to it and *host to whether some missing
+    // experts are left to the host (see llama_moe_cache::hybrid_assign)
+    // set by a model before build_moe_ffn: a result of the layer that does not depend on its experts (e.g. a dense FFN beside them);
+    // with an overlapped MoE cache lookup it is computed while the missing experts are copied, otherwise its place in the graph does not change
+    mutable ggml_tensor * moe_overlap_extra = nullptr;
+
     ggml_tensor * build_moe_cache_slots(
              ggml_tensor *& selected_experts,
              ggml_tensor * up_exps,
@@ -1218,7 +1223,8 @@ struct llm_graph_context {
              ggml_tensor * down_exps,
              ggml_tensor * gate_up_exps,
                      int   il,
-             ggml_tensor ** hybrid = nullptr) const;
+             ggml_tensor ** assign = nullptr,
+                    bool * host   = nullptr) const;
 
     //
     // inputs

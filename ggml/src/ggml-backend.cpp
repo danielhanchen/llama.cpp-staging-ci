@@ -3417,8 +3417,8 @@ static int ggml_backend_sched_overlap_prefix(ggml_backend_sched_t sched, const s
                 return true;
             }
         }
-        const struct ggml_tensor * base = t->view_src != NULL ? t->view_src : t;
-        if (ggml_hash_contains(&sched->hash_set, (struct ggml_tensor *) base)) {
+        struct ggml_tensor * base = t->view_src != NULL ? t->view_src : t;
+        if (ggml_hash_contains(&sched->hash_set, base)) {
             const int id = sched->hv_tensor_backend_ids[ggml_hash_find(&sched->hash_set, base)];
             if (id != split->backend_id && (base->buffer == NULL || ggml_backend_buffer_get_usage(base->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
                 return true; // produced on another backend
