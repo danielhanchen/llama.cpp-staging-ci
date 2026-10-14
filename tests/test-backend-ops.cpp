@@ -7315,6 +7315,119 @@ struct test_top_k_inf : public test_top_k {
     }
 };
 
+// top_k over tie-heavy rows with a defined tie order: of the values equal to the k-th largest, the lowest
+// columns are selected (-0.0 == +0.0), so the selected set must match the CPU reference exactly. The op runs
+// n_rep times on the same input in one graph and every repetition must return the same indices in the same
+// order, which catches a selection or order that depends on thread timing.
+//   mode 0: per-block scores repeated over 4 contiguous cells (qwen4exp QSA), a -inf masked tail
+//   mode 1: ReLU-like rows, mostly +0.0/-0.0 with a few positive values
+//   mode 2: every value equal
+struct test_top_k_det : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int k;
+    const int mode;
+    const int n_rep;
+    ggml_tensor * out {};
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "TOP_K";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne, k, mode, n_rep) + ",det=1";
+    }
+
+    test_top_k_det(std::array<int64_t, 4> ne, int k, int mode, int n_rep = 3)
+        : ne(ne), k(k), mode(mode), n_rep(n_rep) {}
+
+    double max_err() override { return 0.0; }
+    // enforced where the tie rule is implemented; the Vulkan and Metal radix paths still place keys with atomics
+    double max_err(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        const char * name = ggml_backend_reg_name(reg);
+        const bool enforced = strcmp(name, "CPU") == 0 || strcmp(name, "CUDA") == 0 ||
+                              strcmp(name, "ROCm") == 0 || strcmp(name, "MUSA") == 0;
+        return enforced ? 0.0 : 1e30;
+    }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+        // one F32 tensor of n_rep * nrows rows, repetition r in rows [r*nrows, (r+1)*nrows)
+        ggml_tensor * flat = ggml_reshape_2d(ctx, a, ne[0], ne[1] * ne[2] * ne[3]);
+        out = nullptr;
+        for (int r = 0; r < n_rep; ++r) {
+            ggml_tensor * t = ggml_cast(ctx, ggml_top_k(ctx, flat, k), GGML_TYPE_F32);
+            out = out ? ggml_concat(ctx, out, t, 1) : t;
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(1234 + mode);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            const int64_t ncols = t->ne[0];
+            std::vector<float> data(ncols);
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                if (mode == 0) {
+                    // few distinct block scores so the k-th value falls inside a tied group
+                    std::uniform_int_distribution<int> score(0, 15);
+                    const int64_t n_valid = ncols - ncols / 8;
+                    for (int64_t b = 0; b < ncols; b += 4) {
+                        const float s = (float) score(rng) * 0.25f;
+                        for (int64_t i = b; i < std::min(b + 4, ncols); i++) {
+                            data[i] = i < n_valid ? s : -INFINITY;
+                        }
+                    }
+                } else if (mode == 1) {
+                    std::uniform_int_distribution<int> pick(0, 15);
+                    for (int64_t i = 0; i < ncols; i++) {
+                        const int p = pick(rng);
+                        data[i] = p == 0 ? (float) (1 + pick(rng)) : (p & 1 ? -0.0f : 0.0f);
+                    }
+                } else {
+                    std::fill(data.begin(), data.end(), 0.5f);
+                }
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], ncols * sizeof(float));
+            }
+        }
+    }
+
+    // a: backend output, b: CPU reference
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t nrows = (size_t) (ne[1] * ne[2] * ne[3]);
+        GGML_ASSERT(n == nrows * k * n_rep);
+        const size_t n1 = nrows * k;
+        double diff = 0.0;
+        for (const float * x : {a, b}) {
+            for (int r = 1; r < n_rep; ++r) {
+                for (size_t i = 0; i < n1; ++i) {
+                    diff += x[i] != x[r * n1 + i]; // repetitions must agree, order included
+                }
+            }
+        }
+        std::vector<int32_t> ia(k), ib(k);
+        for (size_t row = 0; row < nrows; ++row) {
+            for (int c = 0; c < k; ++c) {
+                ia[c] = (int32_t) a[row * k + c];
+                ib[c] = (int32_t) b[row * k + c];
+            }
+            std::sort(ia.begin(), ia.end());
+            std::sort(ib.begin(), ib.end());
+            for (int c = 0; c < k; ++c) {
+                diff += ia[c] != ib[c]; // same set as the lowest-column tie rule
+            }
+        }
+        return diff;
+    }
+};
+
 // qwen4exp QSA indexer top-k fusion: expand per-block scores to cells, add the f16 mask, top-k.
 struct test_topk_qsa : public test_case {
     const int64_t n_blocks;
@@ -11796,6 +11909,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8192,  2, 1, 1 }, 2051, true));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024, 4, 1, 1 }, 2051, true));
 
+    // tie-heavy rows: exact selected set (lowest columns among ties) and repeated-run equality.
+    // Shapes cover the CUDA bitonic, single-row CUB sort, single/few-row radix and many-row radix paths.
+    for (int mode : {0, 1, 2}) {
+        for (auto ne : std::vector<std::array<int64_t, 4>>{
+                 {16, 3, 1, 1}, {500, 2, 1, 1}, {1000, 8, 1, 1}, {2048, 1, 1, 1}, {4096, 1, 1, 1},
+                 {8192, 1, 1, 1}, {16384, 1, 1, 1}, {70000, 1, 1, 1}, {2048, 2, 1, 1}, {4100, 3, 1, 1},
+                 {2048, 64, 1, 1}, {4096, 200, 1, 1}, {8192, 64, 1, 1}, {16384, 32, 1, 1}, {1100, 300, 1, 1}}) {
+            for (int k : {1, 7, 100, 2051}) {
+                if (k <= ne[0]) {
+                    test_cases.emplace_back(new test_top_k_det(ne, k, mode));
+                }
+            }
+        }
+    }
+
     // rows that CUDA processes in several chunks (bitonic, radix)
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 500,  40000, 1, 1 }, 16));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 1100, 33000, 1, 1 }, 16));
@@ -12811,6 +12939,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (auto cols : {8192, 32768, 131072}) {
         for (auto nrows : {1, 2, 4, 8, 16, 32}) {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 2048));
+        }
+    }
+    // qwen4exp prefill: one row per token over n_kv/4 pooled blocks, top 2048/4 blocks
+    for (auto cols : {2048, 4096, 8192, 16384}) {
+        for (auto nrows : {512, 2048}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 512));
         }
     }
     // bitonic vs radix crossover
