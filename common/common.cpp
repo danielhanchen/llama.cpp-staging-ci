@@ -1262,6 +1262,12 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     if (const char * env_f = getenv("LLAMA_MOE_PREFILL_UB_FRAC")) {
         frac = std::max(0.0, atof(env_f));
     }
+    // a KV cache sized by n_ubatch (the SWA cache holds the window plus one ubatch) makes every later decode step attend over the
+    // larger cache: measured -14% decode after an 8k prompt at n_ubatch 8192 with every expert cached (gemma-4), so such models stop here
+    uint32_t ub_max_kv = 4096;
+    if (const char * env_s = getenv("LLAMA_MOE_PREFILL_UB_SWA_MAX")) {
+        ub_max_kv = (uint32_t) std::max(0, atoi(env_s));
+    }
 
     const uint32_t ub_def = std::min(cparams.n_batch, cparams.n_ubatch == 0 ? cparams.n_batch : cparams.n_ubatch);
     // with causal attention the batch is limited by the context size (0 = the training context, not known here)
@@ -1320,6 +1326,10 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     for (size_t i = 1; i < cands.size(); ++i) {
         const mem m = measure(cands[i]);
         if (m.total < 0 || (force <= 0 && (double) (m.compute - m_ref.compute) > frac*(double) cache_ref) || cache - (m.total - m_def.total) < cache/2) {
+            break;
+        }
+        const bool kv_grows = (m.total - m.compute) > (m_ref.total - m_ref.compute) + (1 << 20);
+        if (force <= 0 && kv_grows && cands[i] > ub_max_kv) {
             break;
         }
         pick   = cands[i];
