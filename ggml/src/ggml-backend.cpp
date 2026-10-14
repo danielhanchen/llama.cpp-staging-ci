@@ -1004,6 +1004,9 @@ struct ggml_backend_sched_prefetch {
     size_t lent;      // bytes of the copies and of the graph allocator in lent memory
     size_t lent_prev; // logged value
     size_t ext_prev;  // logged size of the graph allocator in lent memory
+    ggml_backend_buffer_t ext_buf; // lent memory of the graph allocator, its tensors are not prefetched copies
+    size_t ext_offset;
+    size_t ext_size;
     bool   lending;   // the user lent memory for the last graph, it is told when the memory is no longer used
 };
 
@@ -2799,6 +2802,7 @@ static size_t ggml_backend_sched_prefetch_staging(ggml_backend_sched_t sched, in
 static void ggml_backend_sched_lend_end(ggml_backend_sched_t sched, int backend_id) {
     struct ggml_backend_sched_prefetch * pf = &sched->pf[backend_id];
     ggml_gallocr_set_external(sched->galloc, backend_id, NULL, 0, 0);
+    pf->ext_buf = NULL;
     if (pf->lending && sched->callback_lend != NULL) {
         sched->callback_lend(sched->backends[backend_id], NULL, 0, sched->pf_depth, false, sched->callback_lend_user_data);
     }
@@ -2808,6 +2812,13 @@ static void ggml_backend_sched_lend_end(ggml_backend_sched_t sched, int backend_
 }
 
 static bool ggml_backend_sched_is_lent(const struct ggml_backend_sched_prefetch * pf, const struct ggml_tensor * t) {
+    // with LLAMA_MOE_CACHE_LEND=2 the graph allocator places tensors (e.g. other inputs of a prefetched split) in the same buffer
+    if (t->buffer == pf->ext_buf && t->buffer != NULL) {
+        const uintptr_t base = (uintptr_t) ggml_backend_buffer_get_base(t->buffer) + pf->ext_offset;
+        if ((uintptr_t) t->data >= base && (uintptr_t) t->data < base + pf->ext_size) {
+            return false;
+        }
+    }
     for (int i = 0; i < pf->n_lent_bufs; i++) {
         if (t->buffer == pf->lent_bufs[i]) {
             return true;
@@ -2844,6 +2855,7 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         for (int b = 0; b < sched->n_backends; b++) {
             if (!ext[b]) {
                 ggml_gallocr_set_external(sched->galloc, b, NULL, 0, 0);
+                sched->pf[b].ext_buf = NULL;
             }
             if (sched->pf[b].lending && sched->pf[b].n_lent_bufs == 0) {
                 ggml_backend_sched_lend_end(sched, b);
@@ -3045,6 +3057,9 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
             const struct ggml_backend_sched_lend_copy & lc = pf->lend_copies[c++];
             if (!dry && valid(lc)) {
                 ggml_gallocr_set_external(sched->galloc, b, lc.buffer, lc.offset, lc.size);
+                pf->ext_buf    = lc.buffer;
+                pf->ext_offset = lc.offset;
+                pf->ext_size   = lc.size;
                 ext[b] = true;
                 any    = true;
                 if (lc.size != pf->ext_prev) {

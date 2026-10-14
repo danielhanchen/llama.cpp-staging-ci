@@ -317,6 +317,7 @@ struct llama_moe_cache::impl {
         size_t   expert_bytes = 0;       // all the expert tensors of one expert
         bool     dev_lookup   = false;   // small batches are looked up on the device (per group, so mixed devices work)
         ggml_tensor * counts  = nullptr; // hybrid: use counters of the experts [n_expert, n_layer + 1], see ggml_moe_cache_assign
+        bool     host_read    = false;   // the graph being allocated reads the banks through host lookups (see set_graph)
     };
 
     struct layer {
@@ -479,8 +480,7 @@ struct llama_moe_cache::impl {
             const char * env = getenv("LLAMA_MOE_CACHE_LEND");
             lend_mode = env == nullptr ? 1 : atoi(env);
             lend_auto = env == nullptr;
-            env = getenv("LLAMA_MOE_CACHE_SEED");
-            seed_own = env == nullptr || atoi(env) == 2;
+            seed_own = seed_mode() == 2;
             env = getenv("LLAMA_MOE_CACHE_LEND_MIN_FRAC");
             if (env != nullptr) {
                 lend_min_frac = std::max(0.0, atof(env));
@@ -738,12 +738,12 @@ struct llama_moe_cache::impl {
         // with the default seeding a prefilled cache made the first prompts slower, so it starts empty there
         if (!model.hparams.no_alloc) {
             const char * env  = getenv("LLAMA_MOE_CACHE_PREFILL");
-            const char * seed = getenv("LLAMA_MOE_CACHE_SEED");
-            if (env != nullptr ? atoi(env) != 0 : seed != nullptr && atoi(seed) == 1) {
+            const int    seed = seed_mode();
+            if (env != nullptr ? atoi(env) != 0 : seed == 1) {
                 prefill();
             }
             // the default seeding may not fit in the compute buffer, the cache is then prefilled (see seed_unavailable)
-            prefill_deferred = env == nullptr && (seed == nullptr || atoi(seed) == 2);
+            prefill_deferred = env == nullptr && seed == 2;
         }
 
         if (device_lookup && !model.hparams.no_alloc) {
@@ -821,6 +821,10 @@ struct llama_moe_cache::impl {
         for (group & g : groups) {
             if (g.n_slots == 0) {
                 continue;
+            }
+            // a late prefill (see seed_unavailable) after device lookups plans with their slots, the host state is stale
+            if (g.dev_newer) {
+                download(g);
             }
             const int32_t n_expert = g.lru.n_expert;
             const size_t  n_layer  = g.layers.size();
@@ -1350,13 +1354,17 @@ struct llama_moe_cache::impl {
 
         // the largest group of the device
         group * gl = nullptr;
+        bool host_read = false;
         for (group & g : groups) {
             if (g.id == id && g.n_slots > 0 && (gl == nullptr || (size_t) g.n_slots*g.expert_bytes > (size_t) gl->n_slots*gl->expert_bytes)) {
                 gl = &g;
             }
+            host_read = host_read || (g.id == id && g.host_read);
         }
         // small batches looked up on the device may use every slot of the group
-        if (gl == nullptr || use_device(*gl, n_tokens)) {
+        // a host lookup (e.g. the last layer of a prompt cropped to its outputs) may too, and reads the banks of its group as weights
+        // while the scheduler treats the lent buffer, which holds the banks of every group of the device, as a compute buffer
+        if (gl == nullptr || use_device(*gl, n_tokens) || host_read) {
             return;
         }
         group & g = *gl;
@@ -1651,7 +1659,28 @@ struct llama_moe_cache::impl {
         return l.slot_map;
     }
 
+    // the graph about to be allocated: the groups whose banks it reads through host lookups (the get_rows of a slot map)
+    void set_graph(ggml_cgraph * gf) {
+        for (group & g : groups) {
+            g.host_read = false;
+        }
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            const ggml_tensor * node = ggml_graph_node(gf, i);
+            if (node->op != GGML_OP_GET_ROWS) {
+                continue;
+            }
+            const auto it = layer_of.find(node->src[0]);
+            if (it != layer_of.end()) {
+                groups[layers[it->second].ig].host_read = true;
+            }
+        }
+    }
+
     ggml_tensor * get_resident(const ggml_tensor * t) const {
+        // a trainable tensor (see llama_context::opt_init) changes after the copy was made and needs its gradient: use the original
+        if (t != nullptr && (t->flags & GGML_TENSOR_FLAG_PARAM)) {
+            return nullptr;
+        }
         const auto it = t != nullptr ? resident.find(t) : resident.end();
         return it != resident.end() ? it->second : nullptr;
     }
@@ -1937,9 +1966,15 @@ struct llama_moe_cache::impl {
             seed_committed.insert(seed_committed.end(), sd.pending.begin(), sd.pending.end());
         } else {
             // some expert tensors were copied without filling their slots, drop the experts admitted to the layer
+            // a host lookup of another layer may have reassigned a slot since the plan, its new owner stays
+            const int32_t key0 = sd.il*g.lru.n_expert;
             for (const auto & f : sd.fills) {
-                g.lru.slot_map[sd.il][f.expert] = -1;
-                g.lru.key_of[f.slot] = -1;
+                if (g.lru.slot_map[sd.il][f.expert] == f.slot) {
+                    g.lru.slot_map[sd.il][f.expert] = -1;
+                }
+                if (g.lru.key_of[f.slot] == key0 + f.expert) {
+                    g.lru.key_of[f.slot] = -1;
+                }
             }
             // the LRU did not change since the plan: restore its order and, if no slot was written, the experts it evicted
             if (g.lru.gen == sd.gen) {
@@ -2146,6 +2181,17 @@ ggml_tensor * llama_moe_cache::get_resident(const ggml_tensor * t) const {
 
 ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
     return pimpl->get_experts(w);
+}
+
+int llama_moe_cache::seed_mode() {
+    // 3 (a lagged seed of each layer of a prefetched ubatch) was removed: its readiness tracking was not sound
+    const char * env = getenv("LLAMA_MOE_CACHE_SEED");
+    const int mode = env != nullptr ? atoi(env) : 2;
+    return mode == 3 ? 2 : mode;
+}
+
+void llama_moe_cache::set_graph(ggml_cgraph * gf) {
+    pimpl->set_graph(gf);
 }
 
 bool llama_moe_cache::is_slot_map(const ggml_tensor * t) const {
