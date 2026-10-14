@@ -957,6 +957,8 @@ struct ggml_backend_sched_split {
     size_t pf_size; // bytes of its weight copies in the slot
     // copies issued ahead on the copy queue, else the regular path fills the slot (a callback changed since the graph was allocated)
     bool pf_async;
+    // some of its copies are placed in memory lent by the user (see ggml_backend_sched_compute_splits)
+    bool pf_lent;
     // hybrid MoE cache overlap [ggml_backend_sched_set_overlap]: number of leading nodes that do not depend on the previous (CPU) split, -1 if not computed yet
     int  ov_prefix;
     // CPU/GPU overlap: a host split copies its inputs from backend ov_src with async copies and one event (-1 if not),
@@ -1000,7 +1002,9 @@ struct ggml_backend_sched_prefetch {
     struct ggml_backend_sched_lend_copy * lend_copies;
     int    lend_copies_capacity;
     ggml_backend_buffer_t lent_bufs[GGML_SCHED_MAX_LENT_BUFFERS]; // buffers holding copies of the current graph
+    enum ggml_backend_buffer_usage lent_usage[GGML_SCHED_MAX_LENT_BUFFERS]; // their own usage while the splits are computed
     int    n_lent_bufs;
+    bool   lent_all;  // the graph allocator uses lent memory: the lent buffers behave like compute buffers in every split
     size_t lent;      // bytes of the copies and of the graph allocator in lent memory
     size_t lent_prev; // logged value
     size_t ext_prev;  // logged size of the graph allocator in lent memory
@@ -2210,6 +2214,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->n_inputs = 0;
         split->pf_ordinal = -1;
         split->pf_async = false;
+        split->pf_lent  = false;
         split->ov_prefix = -1;
         int cur_backend_id = split->backend_id;
         for (; i < graph->n_nodes; i++) {
@@ -2267,6 +2272,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->n_inputs = 0;
                 split->pf_ordinal = -1;
                 split->pf_async = false;
+                split->pf_lent  = false;
                 split->ov_prefix = -1;
                 cur_backend_id = node_backend_id;
             }
@@ -2864,6 +2870,7 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
     for (int i = 0; i < sched->n_splits; i++) {
         sched->splits[i].pf_ordinal = -1;
         sched->splits[i].pf_async   = false;
+        sched->splits[i].pf_lent    = false;
     }
 
     // backends whose user lent memory for the previous graph and lends none for this one take it back
@@ -3022,9 +3029,15 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
     }
 
     std::unordered_map<const ggml_tensor *, std::pair<ggml_backend_buffer_t, size_t>> lent;
+    for (int i = 0; i < sched->n_splits && !dry; i++) {
+        sched->splits[i].pf_lent = false;
+    }
     for (int b = 0; b < sched->n_backends; b++) {
         struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
         const size_t staging_all = ggml_backend_sched_prefetch_staging(sched, b);
+        if (!dry) {
+            pf->lent_all = false;
+        }
         if (sched->callback_lend == NULL || (pf->n_bound == 0 && gsize[b] == 0) || (!dry && pf->n_bound > 0 && !ggml_backend_sched_prefetch_queue(sched, b))) {
             continue;
         }
@@ -3080,6 +3093,7 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
                 pf->ext_buf    = lc.buffer;
                 pf->ext_offset = lc.offset;
                 pf->ext_size   = lc.size;
+                pf->lent_all   = true;
                 ext[b] = true;
                 any    = true;
                 if (lc.size != pf->ext_prev) {
@@ -3103,6 +3117,7 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
                 }
                 lent[input_cpy] = { lc.buffer, lc.offset };
                 split->pf_size -= lc.size;
+                split->pf_lent = split->pf_lent || !dry;
                 any = true;
             }
         }
@@ -3269,6 +3284,7 @@ static bool ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched) {
         }
         split->pf_ordinal = -1;
         split->pf_async   = false;
+        split->pf_lent    = false;
     }
     sched->pf_active = false;
 
@@ -3445,24 +3461,31 @@ static int ggml_backend_sched_overlap_prefix(ggml_backend_sched_t sched, const s
 
 static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sched_t sched);
 
-// while the splits are queued, lent buffers holding copies behave like compute buffers (e.g. CUDA clears the padding of quantized
-// copies before reading them, as for the arena), the user gets them back with their own usage
+// while a split that reads copies placed in lent memory is queued, the lent buffers behave like compute buffers (e.g. CUDA clears the padding
+// of quantized copies before reading them, as for the arena); the other splits see the user's own usage, they may read the user's tensors
+// in those buffers as weights (e.g. a cache read through host lookups); the user gets them back with their own usage
+static void ggml_backend_sched_lent_usage(ggml_backend_sched_t sched, int backend_id, bool compute) {
+    struct ggml_backend_sched_prefetch * pf = &sched->pf[backend_id];
+    for (int i = 0; i < pf->n_lent_bufs; i++) {
+        ggml_backend_buffer_set_usage(pf->lent_bufs[i], compute || pf->lent_all ? GGML_BACKEND_BUFFER_USAGE_COMPUTE : pf->lent_usage[i]);
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
-    ggml_backend_buffer_t lent[GGML_SCHED_MAX_BACKENDS*GGML_SCHED_MAX_LENT_BUFFERS];
-    enum ggml_backend_buffer_usage usage[GGML_SCHED_MAX_BACKENDS*GGML_SCHED_MAX_LENT_BUFFERS];
-    int n_lent = 0;
     for (int b = 0; b < sched->n_backends; b++) {
-        for (int i = 0; i < sched->pf[b].n_lent_bufs; i++) {
-            lent[n_lent]  = sched->pf[b].lent_bufs[i];
-            usage[n_lent] = ggml_backend_buffer_get_usage(lent[n_lent]);
-            ggml_backend_buffer_set_usage(lent[n_lent], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
-            n_lent++;
+        struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+        for (int i = 0; i < pf->n_lent_bufs; i++) {
+            pf->lent_usage[i] = ggml_backend_buffer_get_usage(pf->lent_bufs[i]);
         }
+        ggml_backend_sched_lent_usage(sched, b, false);
     }
     const enum ggml_status st = ggml_backend_sched_compute_splits_impl(sched);
-    for (int i = n_lent - 1; i >= 0; i--) {
-        ggml_backend_buffer_set_usage(lent[i], usage[i]);
+    for (int b = 0; b < sched->n_backends; b++) {
+        struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+        for (int i = pf->n_lent_bufs - 1; i >= 0; i--) {
+            ggml_backend_buffer_set_usage(pf->lent_bufs[i], pf->lent_usage[i]);
+        }
     }
     return st;
 }
@@ -3591,6 +3614,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
 
         const bool pf_split = sched->pf_active && split->pf_ordinal >= 0;
         const int  pf_slot  = pf_split ? split->pf_ordinal % sched->pf_depth : -1;
+        if (sched->pf[split_backend_id].n_lent_bufs > 0) {
+            ggml_backend_sched_lent_usage(sched, split_backend_id, split->pf_lent);
+        }
         if (pf_split) {
             GGML_ASSERT(sched->pf[split_backend_id].consumed == split->pf_ordinal);
             GGML_ASSERT(sched->pf[split_backend_id].issued    > split->pf_ordinal);

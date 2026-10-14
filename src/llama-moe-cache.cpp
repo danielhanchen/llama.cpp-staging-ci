@@ -331,6 +331,7 @@ struct llama_moe_cache::impl {
         bool     dev_lookup   = false;   // small batches are looked up on the device (per group, so mixed devices work)
         ggml_tensor * counts  = nullptr; // hybrid: use counters of the experts [n_expert, n_layer + 1], see ggml_moe_cache_assign
         bool     host_read    = false;   // the graph being allocated reads the banks through host lookups (see set_graph)
+        int64_t  host_need    = 0;       // the most distinct experts one of its host lookups may need in a layer of the group
     };
 
     struct layer {
@@ -1652,12 +1653,18 @@ struct llama_moe_cache::impl {
             host_read = host_read || (g.id == id && g.host_read);
         }
         // small batches looked up on the device may use every slot of the group
-        // a host lookup (e.g. the last layer of a prompt cropped to its outputs) may too, and reads the banks of its group as weights
-        // while the scheduler treats the lent buffer, which holds the banks of every group of the device, as a compute buffer
-        if (gl == nullptr || use_device(*gl, n_tokens) || host_read) {
+        if (gl == nullptr || use_device(*gl, n_tokens)) {
+            return;
+        }
+        // a host lookup (e.g. the last layer of a prompt cropped to its outputs) reads the banks of its group as weights: the scheduler treats
+        // the lent buffer as a compute buffer only in the splits that read copies placed there (a lookup reads the banks in a split of its own),
+        // and the copies keep away from the slots the lookup may read past (see place); the graph allocator in lent memory (LEND=2) is live in
+        // every split, it is not lent to such a graph
+        if (host_read && lend_mode == 2) {
             return;
         }
         group & g = *gl;
+        const bool guard = g.host_read;
 
         // the graph allocator borrows only with LLAMA_MOE_CACHE_LEND=2 (experimental: outputs were seen to differ with the CUDA
         // copy-queue kernel, see plans/impl_moe_vram_lend.md), by default it keeps its own buffer
@@ -1700,13 +1707,14 @@ struct llama_moe_cache::impl {
         }
 
         // the smallest number of slots that holds every copy, at most half of the slots (large batches also read and seed the cache)
-        const int32_t n_max = g.n_slots / 2;
+        // and with host lookups in the group the slots they need, plus the slot kept empty in front of the copies
+        const int32_t n_max = guard ? (int32_t) std::min<int64_t>(g.n_slots / 2, g.n_slots - g.host_need - 1) : g.n_slots / 2;
         int32_t n = (int32_t) std::min<size_t>((need + g.expert_bytes - 1) / g.expert_bytes, (size_t) n_max + 1);
         const int32_t step = std::max<int32_t>(1, n / 16);
         std::vector<size_t> offsets(n_copies);
         int32_t n_lend = 0;
         for (; n <= n_max; n = n < n_max ? std::min(n + step, n_max) : n_max + 1) {
-            if (place(g, n, copies, n_copies, depth, offsets)) {
+            if (place(g, n, copies, n_copies, depth, guard, offsets)) {
                 n_lend = n;
                 break;
             }
@@ -1734,6 +1742,15 @@ struct llama_moe_cache::impl {
         // with device lookups the device state may be newer: the slots to evict are only known after it is copied back
         if (g.dev_lookup && g.dev_newer) {
             download(g);
+        }
+        // the copies of an earlier graph may have used the slots kept free of copies for the host lookups (see place): the lookups read a little
+        // past the end of a slot, they find cleared memory there
+        if (guard && g.lru.n_lent > 0) {
+            ggml_backend_synchronize(devices[id].backend);
+            for (ggml_tensor * bank : g.banks) {
+                ggml_backend_tensor_memset(bank, 0, (size_t) (g.n_slots - n_lend)*bank->nb[2], bank->nb[2]);
+                ggml_backend_tensor_memset(bank, 0, (size_t) g.n_slots*bank->nb[2], bank->nb[2]);
+            }
         }
         // a seed is planned and committed within one graph (see llama_context::graph_compute), none is open here
         // closing it anyway keeps its rollback snapshot from outliving the slots it describes
@@ -1878,7 +1895,9 @@ struct llama_moe_cache::impl {
     // best-fit placement of the copies in the last n slots of every bank of g (and the extra slot after them)
     // a copy must not overlap the copies of the splits less than `depth` ordinals before it, which are live while it is written,
     // nor a copy with a negative ordinal (live during the whole graph, placed first)
-    bool place(const group & g, int32_t n, const ggml_backend_sched_lend_copy * copies, int n_copies, int depth, std::vector<size_t> & offsets) {
+    // guard: the group is read through host lookups, which may read a little past the end of a slot (e.g. CUDA MMQ in the padding of the last
+    // row): the first lent slot and the slot after the last one stay free of copies
+    bool place(const group & g, int32_t n, const ggml_backend_sched_lend_copy * copies, int n_copies, int depth, bool guard, std::vector<size_t> & offsets) {
         const device & d = devices[g.id];
         const uintptr_t base  = (uintptr_t) ggml_backend_buffer_get_base(d.buf.get());
         const size_t    align = ggml_backend_buft_get_alignment(d.buft);
@@ -1886,8 +1905,8 @@ struct llama_moe_cache::impl {
         struct region { size_t begin; size_t end; };
         std::vector<region> regions;
         for (const ggml_tensor * bank : g.banks) {
-            const size_t begin = (size_t) ((uintptr_t) bank->data - base) + (size_t) (g.n_slots - n)*bank->nb[2];
-            regions.push_back({ begin, begin + (size_t) (n + 1)*bank->nb[2] });
+            const size_t begin = (size_t) ((uintptr_t) bank->data - base) + (size_t) (g.n_slots - n + (guard ? 1 : 0))*bank->nb[2];
+            regions.push_back({ begin, begin + (size_t) (guard ? n - 1 : n + 1)*bank->nb[2] });
         }
         auto align_up = [&](size_t off) {
             return (size_t) (GGML_PAD(base + off, align) - base);
@@ -1954,6 +1973,7 @@ struct llama_moe_cache::impl {
     void set_graph(ggml_cgraph * gf) {
         for (group & g : groups) {
             g.host_read = false;
+            g.host_need = 0;
         }
         for (int i = 0; gf != nullptr && i < ggml_graph_n_nodes(gf); ++i) {
             const ggml_tensor * node = ggml_graph_node(gf, i);
@@ -1962,7 +1982,9 @@ struct llama_moe_cache::impl {
             }
             const auto it = layer_of.find(node->src[0]);
             if (it != layer_of.end()) {
-                groups[layers[it->second].ig].host_read = true;
+                group & g = groups[layers[it->second].ig];
+                g.host_read = true;
+                g.host_need = std::max<int64_t>(g.host_need, std::min<int64_t>(ggml_nelements(node->src[1]), node->src[0]->ne[1]));
             }
         }
     }
