@@ -1332,8 +1332,8 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     if (const char * env_f = getenv("LLAMA_MOE_PREFILL_UB_FRAC")) {
         frac = std::max(0.0, atof(env_f));
     }
-    // LLAMA_MOE_PREFILL_UB_AUTO=1 with a KV cache sized by n_ubatch: at most 4096 (measured -14% decode after an 8k prompt at n_ubatch 8192
-    // with every expert cached, gemma-4)
+    // LLAMA_MOE_PREFILL_UB_AUTO=1 or LLAMA_MOE_CACHE_LEND=2 with a KV cache sized by n_ubatch: at most 4096 (measured -14% decode after an
+    // 8k prompt at n_ubatch 8192 with every expert cached, gemma-4)
     uint32_t ub_max_kv = 4096;
     if (const char * env_s = getenv("LLAMA_MOE_PREFILL_UB_SWA_MAX")) {
         ub_max_kv = (uint32_t) std::max(0, atoi(env_s));
@@ -1449,15 +1449,12 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             break;
         }
         const bool kv_grows = kv(m) > kv(m_ref) + (1 << 20);
-        if (lend_graph) {
-            if (!lend_fits(m) || cache - (kv(m) - kv(m_def)) < cache/2) {
+        if (lend_graph || rule_frac) {
+            if (lend_graph ? (!lend_fits(m) || cache - (kv(m) - kv(m_def)) < cache/2)
+                           : ((double) (m.compute - m_ref.compute) > frac*(double) cache_ref || cache - (m.total - m_def.total) < cache/2)) {
                 break;
             }
-        } else if (rule_frac) {
-            if ((double) (m.compute - m_ref.compute) > frac*(double) cache_ref || cache - (m.total - m_def.total) < cache/2) {
-                break;
-            }
-            if (kv_grows && cands[i] > ub_max_kv) {
+            if (force <= 0 && kv_grows && cands[i] > ub_max_kv) {
                 break;
             }
         } else if (kv_grows || cache - (m.total - m_def.total) < all_experts) {
