@@ -7,6 +7,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cmath>
 #include <map>
 #include <cstdlib>
@@ -696,25 +697,110 @@ struct llama_moe_cache::impl {
         // within a device the budget is split by the size of the experts, so each group caches the same fraction of its experts
         std::vector<size_t> n_tensors(devices.size(), 0);
         size_t n_tensors_host = 0;
-        for (group & g : groups) {
+
+        // the budget also holds the device copies of the small per-expert tensors and the state of the device lookup
+        std::vector<size_t> fixed_of(groups.size(), 0);
+        std::vector<size_t> budget_of(groups.size(), 0);
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            const group  & g = groups[ig];
             const device & d = devices[g.id];
             const int32_t n_expert  = g.ref[0]->ne[2];
-            const size_t  budget    = (size_t) ((double) size*d.split/split_sum*g.host_bytes/d.host_bytes);
-            const int32_t max_slots = g.layers.size()*n_expert;
-
-            // the budget also holds the device copies of the small per-expert tensors and the state of the device lookup
-            const size_t alignment = ggml_backend_buft_get_alignment(d.buft);
-            size_t fixed = 0;
+            const size_t  alignment = ggml_backend_buft_get_alignment(d.buft);
             for (int32_t il : g.layers) {
                 for (const ggml_tensor * t : llama_moe_cache_layer_small(model.layers[il])) {
-                    fixed += GGML_PAD(ggml_nbytes(t), alignment);
+                    fixed_of[ig] += GGML_PAD(ggml_nbytes(t), alignment);
                 }
             }
             if (device_lookup) {
-                fixed += GGML_PAD((size_t) n_expert*model.layers.size()*sizeof(int32_t), alignment) + GGML_PAD(8*sizeof(int32_t), alignment);
+                fixed_of[ig] += GGML_PAD((size_t) n_expert*model.layers.size()*sizeof(int32_t), alignment) + GGML_PAD(8*sizeof(int32_t), alignment);
             }
+            budget_of[ig] = (size_t) ((double) size*d.split/split_sum*g.host_bytes/d.host_bytes);
+        }
+        auto group_size = [&](size_t ig, int32_t n_slots) {
+            return alloc_size(groups[ig], n_slots) + fixed_of[ig] + (device_lookup ? 3*sizeof(int32_t)*(size_t) n_slots : 0);
+        };
+
+        // a small batch (at most max_batch tokens) is read from the cache only if every group holds the experts of all of its tokens in
+        // one layer (see get_slot_map), else its layers in that group compute from host memory, with other results than the device: a
+        // group of few layers (e.g. the one layer of another type) gets few slots from the split by size, and a small cache then gives
+        // other outputs than a large one for the same batch (the server runs the last 4 tokens of a prompt as their own batch). Each
+        // group gets at least the slots of n tokens (LLAMA_MOE_CACHE_GROUP_MIN = n, default max_batch, 0 = off), taken from the
+        // other groups of the device; n is halved down to 1 while that takes more than LLAMA_MOE_CACHE_GROUP_MIN_FRAC (0.10) of the
+        // device budget, or more than the other groups have above their own minimum
+        {
+            int64_t n_min = max_batch;
+            if (const char * env = getenv("LLAMA_MOE_CACHE_GROUP_MIN")) {
+                n_min = std::max<int64_t>(0, std::min<int64_t>(max_batch, atoll(env)));
+            }
+            double min_frac = 0.10;
+            if (const char * env = getenv("LLAMA_MOE_CACHE_GROUP_MIN_FRAC")) {
+                min_frac = std::max(0.0, atof(env));
+            }
+            for (size_t id = 0; id < devices.size() && n_min > 0; ++id) {
+                size_t dev_budget = 0;
+                for (size_t ig = 0; ig < groups.size(); ++ig) {
+                    dev_budget += groups[ig].id == (int) id ? budget_of[ig] : 0;
+                }
+                if (dev_budget == 0) {
+                    continue;
+                }
+                for (int64_t n = n_min; n >= 1; n /= 2) {
+                    std::vector<size_t> need(groups.size(), 0);
+                    size_t extra   = 0; // what the groups below their minimum lack
+                    size_t surplus = 0; // what the others have above it
+                    for (size_t ig = 0; ig < groups.size(); ++ig) {
+                        const group & g = groups[ig];
+                        if (g.id != (int) id) {
+                            continue;
+                        }
+                        const int32_t n_expert = g.ref[0]->ne[2];
+                        const int32_t n_slots  = (int32_t) std::min<int64_t>((int64_t) g.layers.size()*n_expert, std::min<int64_t>(n_expert, n*n_expert_used));
+                        need[ig] = group_size(ig, n_slots);
+                        if (budget_of[ig] < need[ig]) {
+                            extra += need[ig] - budget_of[ig];
+                        } else {
+                            surplus += budget_of[ig] - need[ig];
+                        }
+                    }
+                    if (extra == 0) {
+                        break;
+                    }
+                    if ((double) extra > min_frac*(double) dev_budget || extra > surplus) {
+                        continue;
+                    }
+                    // the others give up the extra in proportion to what they have above their minimum
+                    size_t taken = 0;
+                    for (size_t ig = 0; ig < groups.size(); ++ig) {
+                        if (groups[ig].id != (int) id || budget_of[ig] < need[ig]) {
+                            continue;
+                        }
+                        const size_t t = (size_t) std::ceil((double) extra*(double) (budget_of[ig] - need[ig])/(double) surplus);
+                        const size_t d = std::min(t, budget_of[ig] - need[ig]);
+                        budget_of[ig] -= d;
+                        taken         += d;
+                    }
+                    for (size_t ig = 0; ig < groups.size(); ++ig) {
+                        if (groups[ig].id == (int) id && budget_of[ig] < need[ig]) {
+                            LLAMA_LOG_INFO("%s: %s: MoE cache group of %zu layers (%s): %.2f -> %.2f MiB, the experts of %" PRId64 " tokens per layer "
+                                "(batches of at most %" PRId64 " tokens are read from the cache, LLAMA_MOE_CACHE_GROUP_MIN)\n", __func__,
+                                ggml_backend_name(devices[id].backend), groups[ig].layers.size(), ggml_type_name(groups[ig].ref.back()->type),
+                                budget_of[ig]/1024.0/1024.0, need[ig]/1024.0/1024.0, n, n);
+                            budget_of[ig] = need[ig];
+                        }
+                    }
+                    GGML_UNUSED(taken);
+                    break;
+                }
+            }
+        }
+
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            group & g = groups[ig];
+            const int32_t n_expert  = g.ref[0]->ne[2];
+            const size_t  budget    = budget_of[ig];
+            const int32_t max_slots = g.layers.size()*n_expert;
             auto total_size = [&](int32_t n_slots) {
-                return alloc_size(g, n_slots) + fixed + (device_lookup ? 3*sizeof(int32_t)*(size_t) n_slots : 0);
+                return group_size(ig, n_slots);
             };
             while (g.n_slots < max_slots && total_size(g.n_slots + 1) <= budget) {
                 g.n_slots++;
