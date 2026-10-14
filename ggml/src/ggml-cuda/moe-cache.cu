@@ -375,6 +375,9 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
     if (mode == 3) {
         // join of an overlapped fetch: the main stream waits for its copies, the result is its admitted slots
         const ggml_tensor * a = dst->src[0];
+        if (ggml_nelements(dst) == 0) {
+            return; // nothing was fetched (see mode 2)
+        }
         GGML_ASSERT(ctx.moe_join != nullptr && ggml_is_contiguous(a) && ggml_is_contiguous(dst));
         cudaStream_t stream = ctx.stream();
         CUDA_CHECK(cudaStreamWaitEvent(stream, ctx.moe_join, 0));

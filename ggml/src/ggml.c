@@ -3563,6 +3563,7 @@ struct ggml_tensor * ggml_moe_cache_join(
 
     result->op     = GGML_OP_MOE_CACHE_LOOKUP;
     result->src[0] = a;
+    result->src[1] = a->src[0]; // the assign result is read by the copies, so it must not be reused before the join
 
     return result;
 }
