@@ -2198,6 +2198,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         src1_data_cur += src1_slice.nb[2];
         dst_data_cur  +=  dst_slice.nb[2];
     }
+    // the q8_1 copies of the slices above must not outlive src1_sorted: the pool hands its memory out again
+    ctx.q8_1_cache.invalidate(src1_sorted.ptr, ne12*n_expert_used*ne10*ts_src1_sorted);
 
     get_rows_cuda(dst_sorted.ptr, type_dst_sorted, ids_from_sorted, dst->data, dst->type,
         ne0, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
@@ -3734,10 +3736,8 @@ static bool ggml_cuda_env_flag(const char * name);
 // norm_targets: the RMS_NORM + MUL outputs whose q8_1 copy the fused norm kernel writes.
 static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::unordered_set<const void *> & norm_targets) {
     norm_targets.clear();
-    static const bool disabled = [] {
-        const char * env = getenv("GGML_CUDA_DISABLE_Q8_1_CACHE");
-        return env != nullptr && atoi(env) != 0;
-    }();
+    // GGML_CUDA_DISABLE_FUSION=1 also turns it off, so that it restores the unfused path as a whole
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_Q8_1_CACHE") || ggml_cuda_env_flag("GGML_CUDA_DISABLE_FUSION");
     if (disabled) {
         return 0;
     }
@@ -3808,6 +3808,12 @@ static void ggml_cuda_q8_1_cache_node_done(ggml_cuda_q8_1_cache & cache, const g
         const ggml_tensor * node = cgraph->nodes[j];
         if (node->op == GGML_OP_OPT_STEP_ADAMW || node->op == GGML_OP_OPT_STEP_SGD) {
             cache.invalidate_all(); // update src[0] in place
+        }
+        if (node->op == GGML_OP_MOE_CACHE_LOOKUP) {
+            // updates its sources in place: the slot maps, the eviction state and the expert banks
+            for (int s = 0; s < GGML_MAX_SRC && node->src[s] != nullptr; ++s) {
+                cache.invalidate(node->src[s]->data, ggml_nbytes(node->src[s]));
+            }
         }
         if (node->data != nullptr) {
             cache.invalidate(node->data, ggml_nbytes(node));
@@ -4730,7 +4736,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_q8_1_cache & cache = cuda_ctx->q8_1_cache;
         if (cache.active() && cuda_ctx->curr_stream_no == 0 && cache.norm_targets.count(mul->data) && ggml_is_contiguous(mul)) {
             const int64_t ne10_padded = GGML_PAD(mul->ne[0], MATRIX_ROW_PADDING);
-            const int64_t key[ggml_cuda_q8_1_cache::n_key] = { mul->ne[0], ggml_nrows(mul), 1, 1, 0, 0, 0 };
+            const int64_t key[ggml_cuda_q8_1_cache::n_key] = { mul->ne[0], ggml_nrows(mul), 1, 1, -1, -1, -1 };
             q8_1_out = cache.reserve(mul->data, ggml_nbytes(mul), key, ggml_nrows(mul)*ne10_padded/QK8_1*sizeof(block_q8_1));
         }
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, mul, q8_1_out);

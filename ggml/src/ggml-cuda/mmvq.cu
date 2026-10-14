@@ -1569,16 +1569,17 @@ void ggml_cuda_mul_mat_vec_q(
         bool quantized = false;
         if (ctx.curr_stream_no == 0) {
             // the q8_1 rows are written in logical order: a contiguous src1 only depends on the number of rows,
-            // e.g. [ne10, 1, n_tokens] for MUL_MAT_ID and [ne10, n_tokens] for MUL_MAT share one copy
+            // e.g. [ne10, 1, n_tokens] for MUL_MAT_ID and [ne10, n_tokens] for MUL_MAT share one copy;
+            // its strides are keyed as -1, which no real stride (0 for a broadcast view) can match
             const bool    contiguous = ggml_is_contiguous(src1);
             const int64_t key[ggml_cuda_q8_1_cache::n_key] = {
                 ne10,
                 contiguous ? ne11*ne12*ne13 : ne11,
                 contiguous ? 1 : ne12,
                 contiguous ? 1 : ne13,
-                contiguous || ne11 == 1 ? 0 : s11,
-                contiguous || ne12 == 1 ? 0 : s12,
-                contiguous || ne13 == 1 ? 0 : s13,
+                contiguous ? -1 : ne11 == 1 ? 0 : s11,
+                contiguous ? -1 : ne12 == 1 ? 0 : s12,
+                contiguous ? -1 : ne13 == 1 ? 0 : s13,
             };
             src1_q8_1 = ctx.q8_1_cache.get(src1->data, ggml_nbytes(src1), key, q8_1_size, quantized);
         }
