@@ -249,6 +249,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # the advisory PLE prefetch predicts the rows set_input gathers, on the generated qwen4exp model
+    llama_build(test-ple-prefetch.cpp)
+    llama_test(
+        test-ple-prefetch
+        LABEL main
+        ARGS "${MODEL_DIR}/qwen4exp-moe.gguf"
+    )
+    set_tests_properties(test-ple-prefetch PROPERTIES FIXTURES_REQUIRED generate-models)
+
     llama_build(test-fusion.cpp)
 endif()
 

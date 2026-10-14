@@ -5,6 +5,7 @@
 #include "llama-hparams.h"
 #include "llama-impl.h"
 #include "llama-mmap.h"
+#include "llama-prefetch.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 
@@ -1331,6 +1332,19 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
+    for (auto & [_, lf] : lazy_files) {
+        llama_prefetch_close_fd(lf.fd);
+    }
+}
+
+const ggml_tensor * llama_model::ple_rows(const llama_ubatch & ub, const llama_ubatch * pending,
+        const llama_memory_context_i * mctx, bool reference, std::vector<int32_t> & rows) const {
+    GGML_UNUSED(ub);
+    GGML_UNUSED(pending);
+    GGML_UNUSED(mctx);
+    GGML_UNUSED(reference);
+    rows.clear();
+    return nullptr;
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {
@@ -1853,6 +1867,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);
 
         can_prefetch.insert(per_layer_tok_embd);
+
+        // a separate descriptor for the pread prefetch, the loader closes its files
+        const auto & w = ml.require_weight(ggml_get_name(per_layer_tok_embd));
+        lazy_file lf;
+        lf.fd   = llama_prefetch_reopen_fd(ml.files.at(w.idx)->file_id(), w.offs, ggml_nbytes(per_layer_tok_embd));
+        lf.offs = w.offs;
+        lazy_files[per_layer_tok_embd] = lf;
     }
 
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.

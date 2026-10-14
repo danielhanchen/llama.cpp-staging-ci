@@ -1221,8 +1221,12 @@ public:
     std::vector<llama_token> prev;
 };
 
-void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
-    const auto & hparams = model.hparams;
+// the rows of the PLE table that a ubatch gathers, from its tokens and the n_gram - 1 predecessors of each token
+// prev: per token, oldest first, LLAMA_TOKEN_NULL where missing (see llama_kv_cache::get_prev_tokens())
+// shared by set_input and the advisory prefetch, so both compute the same ids
+static void qwen4exp_ple_idx(const llama_hparams & hparams, const llama_ubatch & ub,
+        const std::vector<llama_token> & prev, std::vector<int32_t> & idx) {
+    const llama_ubatch * ubatch = &ub;
 
     // an image arrives as an embd batch, so ubatch->token is null, but every position still needs a row for ggml_get_rows
     // stand in the image token id that the reference hashes, or EOS if the file has no such key
@@ -1242,17 +1246,7 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     const int64_t eos      = hparams.ple_eos_token_id;
     const int64_t n_prev   = n_gram - 1;
 
-    std::vector<int32_t> idx(n_heads * n_tokens);
-
-    GGML_ASSERT(mctx != nullptr);
-
-    for (int64_t i = 0; i < n_tokens; ++i) {
-        // the preceding tokens would be ambiguous, see get_prev_tokens()
-        GGML_ASSERT(ubatch->n_seq_id[i] == 1 && "PLE n-gram embeddings do not support tokens shared by multiple sequences");
-    }
-
-    // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
-    mctx->get_prev_tokens(*ubatch, n_prev, prev);
+    idx.resize(n_heads * n_tokens);
 
     for (int64_t i = 0; i < n_tokens; ++i) {
         // an EOS in the window resets everything at or before it
@@ -1281,6 +1275,27 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
             }
         }
     }
+}
+
+void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
+    const auto & hparams = model.hparams;
+
+    const int64_t n_tokens = ubatch->n_tokens;
+    const int64_t n_prev   = hparams.ple_ngram_size - 1;
+
+    std::vector<int32_t> idx;
+
+    GGML_ASSERT(mctx != nullptr);
+
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        // the preceding tokens would be ambiguous, see get_prev_tokens()
+        GGML_ASSERT(ubatch->n_seq_id[i] == 1 && "PLE n-gram embeddings do not support tokens shared by multiple sequences");
+    }
+
+    // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
+    mctx->get_prev_tokens(*ubatch, n_prev, prev);
+
+    qwen4exp_ple_idx(hparams, *ubatch, prev, idx);
 
     {
         ggml_tensor * ple = model.per_layer_tok_embd;
@@ -1292,6 +1307,52 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     }
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+}
+
+const ggml_tensor * llama_model_qwen4exp::ple_rows(const llama_ubatch & ub, const llama_ubatch * pending,
+        const llama_memory_context_i * mctx, bool reference, std::vector<int32_t> & rows) const {
+    rows.clear();
+
+    if (!per_layer_tok_embd || hparams.ple_n_heads == 0 || ub.n_tokens == 0) {
+        return nullptr;
+    }
+
+    // the drafter (MTP) contexts have their own memory, they are not predicted
+    const auto * mctx_hyb = dynamic_cast<const llama_memory_hybrid_idx_context *>(mctx);
+    const auto * kv = mctx_hyb ? mctx_hyb->get_attn() : nullptr;
+    if (!kv) {
+        return nullptr;
+    }
+
+    for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+        if (ub.n_seq_id[i] != 1) {
+            return nullptr;
+        }
+    }
+
+    const uint32_t n_prev  = hparams.ple_ngram_size - 1;
+    const int64_t  n_heads = hparams.ple_n_heads;
+
+    std::vector<llama_token> prev;
+    std::vector<uint8_t>     known;
+
+    if (reference) {
+        kv->get_prev_tokens(ub, n_prev, prev);
+    } else if (!kv->get_prev_tokens_ahead(ub, pending, n_prev, prev, known)) {
+        return nullptr;
+    }
+
+    qwen4exp_ple_idx(hparams, ub, prev, rows);
+
+    if (!reference) {
+        for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+            if (!known[i]) {
+                std::fill(rows.begin() + i*n_heads, rows.begin() + (i + 1)*n_heads, -1);
+            }
+        }
+    }
+
+    return per_layer_tok_embd;
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.

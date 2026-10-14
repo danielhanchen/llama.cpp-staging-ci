@@ -444,6 +444,29 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     ggml_build_forward_expand(gf, cur);
 }
 
+// the rows that llm_graph_input_gemma4_ple::set_input gathers: the token ids, or the padding row for an embd ubatch
+const ggml_tensor * llama_model_gemma4::ple_rows(const llama_ubatch & ub, const llama_ubatch * pending,
+        const llama_memory_context_i * mctx, bool reference, std::vector<int32_t> & rows) const {
+    GGML_UNUSED(pending);
+    GGML_UNUSED(mctx);
+    GGML_UNUSED(reference);
+
+    rows.clear();
+
+    if (!per_layer_tok_embd || ub.n_tokens == 0) {
+        return nullptr;
+    }
+
+    if (ub.token) {
+        rows.assign(ub.token, ub.token + ub.n_tokens);
+    } else {
+        // [TAG_GEMMA4_IMG_PADDING]
+        rows.push_back(0);
+    }
+
+    return per_layer_tok_embd;
+}
+
 class llm_graph_input_gemma4_ple : public llm_graph_input_i {
 public:
     llm_graph_input_gemma4_ple(const llama_model & model) : model(model) {}

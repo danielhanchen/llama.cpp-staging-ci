@@ -2723,6 +2723,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LAZY_MODE"));
     add_opt(common_arg(
+        {"--ple-prefetch"}, "MODE",
+        "prefetch the rows of a lazily read per-layer embedding table one ubatch ahead, from worker threads (default: auto = off)\n"
+        "the hints only fill the page cache, the results do not change; env LLAMA_PLE_PREFETCH=0 disables it\n"
+        "- off: no ahead prefetch\n"
+        "- madvise: MADV_WILLNEED on the pages of the rows\n"
+        "- populate: MADV_WILLNEED, then MADV_POPULATE_READ (also maps the pages, Linux >= 5.14)\n"
+        "- pread: buffered pread of the pages into the page cache from a thread pool",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "auto")     { params.ple_prefetch = LLAMA_PLE_PREFETCH_AUTO;     }
+            else if (value == "off")      { params.ple_prefetch = LLAMA_PLE_PREFETCH_OFF;      }
+            else if (value == "madvise")  { params.ple_prefetch = LLAMA_PLE_PREFETCH_MADVISE;  }
+            else if (value == "populate") { params.ple_prefetch = LLAMA_PLE_PREFETCH_POPULATE; }
+            else if (value == "pread")    { params.ple_prefetch = LLAMA_PLE_PREFETCH_PREAD;    }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_PLE_PREFETCH"));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"

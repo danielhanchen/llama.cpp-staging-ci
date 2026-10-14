@@ -16,11 +16,16 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/resource.h>
+#endif
 
 //
 // llama_context
@@ -587,6 +592,40 @@ llama_context::llama_context(
         }
     }
 
+    // advisory PLE prefetch
+    {
+        auto env_on = [](const char * name) {
+            const char * v = getenv(name);
+            return v && atoi(v) != 0;
+        };
+
+        ple.verify = env_on("LLAMA_PLE_PREFETCH_VERIFY");
+        ple.stats  = env_on("LLAMA_PLE_PREFETCH_STATS");
+
+        const enum llama_ple_prefetch_mode mode = llama_ple_prefetch_resolve(params.ple_prefetch);
+
+        const ggml_tensor * t = model.per_layer_tok_embd;
+
+        if (mode != LLAMA_PLE_PREFETCH_OFF && t && model.can_prefetch.count(t) && t->data && t->buffer &&
+            ggml_backend_buffer_is_host(t->buffer) && ggml_is_matrix(t) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+            int    fd   = -1;
+            size_t offs = 0;
+            if (const auto it = model.lazy_files.find(t); it != model.lazy_files.end()) {
+                fd   = it->second.fd;
+                offs = it->second.offs;
+            }
+            const char * env_threads = getenv("LLAMA_PLE_PREFETCH_THREADS");
+            const int n_threads = env_threads ? atoi(env_threads) : 0;
+
+            ple_prefetcher = std::make_unique<llama_row_prefetcher>(mode, n_threads, t, fd, offs);
+
+            LLAMA_LOG_INFO("%s: PLE prefetch of '%s' one ubatch ahead: mode = %s, threads = %d\n", __func__,
+                    t->name, llama_ple_prefetch_mode_name(ple_prefetcher->get_mode()), ple_prefetcher->get_n_threads());
+        }
+
+        ple.enabled = t && (ple_prefetcher || ple.verify);
+    }
+
     // Initialize the full vocabulary token ids for backend samplers.
     {
         const int n_vocab = model.vocab.n_tokens();
@@ -608,6 +647,32 @@ llama_context::~llama_context() {
             sa.event = nullptr;
         }
     }
+
+    if (ple_prefetcher || ple.verify || ple.stats) {
+        const auto & st = ple_prefetcher ? &ple_prefetcher->st : nullptr;
+        LLAMA_LOG_INFO("%s: PLE prefetch: mode = %s, predicted = %" PRIu64 ", unpredicted = %" PRIu64 ", rows = %" PRIu64
+                ", skipped rows = %" PRIu64 ", predict = %.3f ms/ubatch\n", __func__,
+                llama_ple_prefetch_mode_name(ple_prefetcher ? ple_prefetcher->get_mode() : LLAMA_PLE_PREFETCH_OFF),
+                ple.n_predicted, ple.n_unpredicted, ple.n_rows, ple.n_skipped_rows,
+                ple.n_predicted ? ple.t_predict_us/1e3/ple.n_predicted : 0.0);
+        if (st) {
+            LLAMA_LOG_INFO("%s: PLE prefetch: jobs = %" PRIu64 ", dropped = %" PRIu64 ", runs = %" PRIu64 ", %.1f MiB, "
+                    "%.2f ms/job (submit to done), worker majflt = %" PRIu64 ", errors = %" PRIu64 "\n", __func__,
+                    st->n_jobs.load(), st->n_dropped.load(), st->n_runs.load(), st->n_bytes.load()/1024.0/1024.0,
+                    st->n_jobs ? st->t_busy_us.load()/1e3/st->n_jobs.load() : 0.0, st->n_majflt.load(), st->n_errors.load());
+        }
+        LLAMA_LOG_INFO("%s: PLE prefetch: set_inputs = %.2f ms/ubatch over %" PRIu64 ", decode = %.2f ms/call over %" PRIu64
+                ", majflt = %" PRId64 ", minflt = %" PRId64 "\n", __func__,
+                ple.n_set_inputs ? ple.t_set_inputs_us/1e3/ple.n_set_inputs : 0.0, ple.n_set_inputs,
+                ple.n_decode ? ple.t_decode_us/1e3/ple.n_decode : 0.0, ple.n_decode, ple.majflt, ple.minflt);
+        if (ple.verify) {
+            LLAMA_LOG_INFO("%s: PLE prefetch verify: checked = %" PRIu64 " ubatches, mismatched rows = %" PRIu64 "\n", __func__,
+                    ple.n_checked, ple.n_mismatch);
+        }
+    }
+
+    // stop the workers before the model can go
+    ple_prefetcher.reset();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1709,8 +1774,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     {
         //const auto t_start_us = ggml_time_us();
 
+        const int64_t t_set_us = ple.stats ? ggml_time_us() : 0;
+
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
+
+        if (ple.stats) {
+            ple.t_set_inputs_us += ggml_time_us() - t_set_us;
+            ple.n_set_inputs++;
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -1976,12 +2048,54 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+namespace {
+// page faults and wall time of one decode() call, for the PLE prefetch stats
+struct ple_decode_meter {
+    llama_context::ple_state * ple;
+    int64_t t0 = 0;
+    int64_t maj0 = 0;
+    int64_t min0 = 0;
+
+    static void faults(int64_t & maj, int64_t & min) {
+#if defined(__unix__) || defined(__APPLE__)
+        struct rusage ru;
+        if (getrusage(RUSAGE_SELF, &ru) == 0) {
+            maj = ru.ru_majflt;
+            min = ru.ru_minflt;
+            return;
+        }
+#endif
+        maj = min = 0;
+    }
+
+    explicit ple_decode_meter(llama_context::ple_state * ple) : ple(ple) {
+        if (ple) {
+            t0 = ggml_time_us();
+            faults(maj0, min0);
+        }
+    }
+
+    ~ple_decode_meter() {
+        if (ple) {
+            int64_t maj, min;
+            faults(maj, min);
+            ple->t_decode_us += ggml_time_us() - t0;
+            ple->n_decode++;
+            ple->majflt += maj - maj0;
+            ple->minflt += min - min0;
+        }
+    }
+};
+}
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
     // an asynchronous state save queued before this call has reached its destination when this call returns
     struct state_async_join {
         llama_context * ctx;
         ~state_async_join() { ctx->state_async_wait(); }
     } state_async_join_guard { this };
+
+    const ple_decode_meter ple_meter(ple.stats ? &ple : nullptr);
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -2179,6 +2293,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
+        // the PLE rows of the next ubatch (and of this one at the first) while this one is processed
+        if (ple.enabled) {
+            ple_prefetch_ahead(ubatch, mctx.get(), n_tokens_prev == 0);
+        }
+
         // the MoE cache only serves batches of up to 32 tokens, the end of a prompt seeds it for the generation that follows
         if (moe_cache) {
             const bool large      = ubatch.n_tokens > llama_moe_cache::n_small_max;
@@ -2193,6 +2312,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         if (moe_cache) {
             moe_cache_seed_end(ubatch, res ? n_outputs : -1);
+        }
+
+        if (res && ple.verify) {
+            ple_prefetch_verify(ubatch, mctx.get());
         }
 
         if (!res) {
@@ -2927,6 +3050,75 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
     LLAMA_LOG_INFO("%s: graph reallocation: nodes = %d, splits = %d, n_same = %d, n_diff = %d\n",
             __func__, ggml_graph_n_nodes(gf), ggml_backend_sched_get_n_splits(sched),
             lctx->n_reallocs_same, lctx->n_reallocs_diff);
+}
+
+void llama_context::ple_prefetch_ahead(const llama_ubatch & ubatch, const llama_memory_context_i * mctx, bool first) {
+    const int64_t t_start_us = ggml_time_us();
+
+    auto predict = [&](const llama_ubatch & ub, const llama_ubatch * pending, std::vector<int32_t> & out) {
+        out.clear();
+        const ggml_tensor * t = model.ple_rows(ub, pending, mctx, false, ple.scratch);
+        if (!t) {
+            ple.n_unpredicted++;
+            return;
+        }
+        ple.n_predicted++;
+        ple.n_rows += ple.scratch.size();
+        for (const int32_t r : ple.scratch) {
+            ple.n_skipped_rows += r < 0;
+        }
+        if (ple.verify) {
+            out = ple.scratch;
+        }
+        if (ple_prefetcher) {
+            ple_prefetcher->submit(std::move(ple.scratch));
+        }
+        ple.scratch.clear();
+    };
+
+    // the first ubatch: its predecessors are all in the cells already (this is the decode entry for generation)
+    if (first) {
+        predict(ubatch, nullptr, ple.pred_cur);
+    } else {
+        ple.pred_cur = std::move(ple.pred_next);
+    }
+    ple.pred_next.clear();
+
+    // the next one, preceded by this one, which is not applied yet
+    if (const llama_ubatch * next = mctx->peek_ubatch(1)) {
+        predict(*next, &ubatch, ple.pred_next);
+    }
+
+    ple.t_predict_us += ggml_time_us() - t_start_us;
+}
+
+void llama_context::ple_prefetch_verify(const llama_ubatch & ubatch, const llama_memory_context_i * mctx) {
+    if (ple.pred_cur.empty()) {
+        return;
+    }
+
+    std::vector<int32_t> ref;
+    if (!model.ple_rows(ubatch, nullptr, mctx, true, ref)) {
+        return;
+    }
+
+    ple.n_checked++;
+
+    if (ref.size() != ple.pred_cur.size()) {
+        LLAMA_LOG_ERROR("%s: predicted %zu PLE rows, set_input gathers %zu\n", __func__, ple.pred_cur.size(), ref.size());
+        ple.n_mismatch += std::max(ref.size(), ple.pred_cur.size());
+    } else {
+        for (size_t i = 0; i < ref.size(); ++i) {
+            if (ple.pred_cur[i] >= 0 && ple.pred_cur[i] != ref[i]) {
+                if (ple.n_mismatch < 8) {
+                    LLAMA_LOG_ERROR("%s: PLE row %zu of the ubatch: predicted %d, set_input %d\n", __func__, i, ple.pred_cur[i], ref[i]);
+                }
+                ple.n_mismatch++;
+            }
+        }
+    }
+
+    ple.pred_cur.clear();
 }
 
 void llama_context::set_compute_threads(bool batched) {
@@ -4642,6 +4834,7 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.ple_prefetch                =*/ LLAMA_PLE_PREFETCH_AUTO,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

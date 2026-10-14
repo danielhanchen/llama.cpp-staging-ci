@@ -62,6 +62,13 @@ struct llama_memory_context_i {
     // get the current ubatch
     virtual const llama_ubatch & get_ubatch() const = 0;
 
+    // the ubatch k steps after the current one, without consuming anything
+    // nullptr if there is none or the context does not keep its ubatches (only used for advisory prefetching)
+    virtual const llama_ubatch * peek_ubatch(uint32_t k) const {
+        (void) k;
+        return nullptr;
+    }
+
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
 };

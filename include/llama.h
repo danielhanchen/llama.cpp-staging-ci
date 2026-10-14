@@ -222,6 +222,19 @@ extern "C" {
         LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
     };
 
+    // advisory prefetch of the rows that a lazily read per-layer embedding table (PLE) will gather, issued from a
+    // worker thread one ubatch ahead (and at llama_decode entry for the first ubatch); the hints only touch the page
+    // cache, so the results do not change
+    enum llama_ple_prefetch_mode {
+        LLAMA_PLE_PREFETCH_AUTO     = -1, // library default
+        LLAMA_PLE_PREFETCH_OFF      =  0, // no ahead prefetch (set_input still madvises the current ubatch)
+        LLAMA_PLE_PREFETCH_MADVISE  =  1, // MADV_WILLNEED on the merged page runs (PrefetchVirtualMemory on Windows)
+        LLAMA_PLE_PREFETCH_POPULATE =  2, // MADV_WILLNEED, then MADV_POPULATE_READ, also maps the pages (Linux >= 5.14)
+        LLAMA_PLE_PREFETCH_PREAD    =  3, // buffered pread of the page runs into the page cache from a thread pool
+    };
+
+    LLAMA_API const char * llama_ple_prefetch_mode_name(enum llama_ple_prefetch_mode mode);
+
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
         LLAMA_CONTEXT_TYPE_MTP     = 1,
@@ -397,6 +410,8 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+
+        enum llama_ple_prefetch_mode ple_prefetch; // ahead prefetch of lazily read PLE rows, env LLAMA_PLE_PREFETCH overrides [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

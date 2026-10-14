@@ -1951,6 +1951,77 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
     }
 }
 
+bool llama_kv_cache::get_prev_tokens_ahead(const llama_ubatch & ubatch, const llama_ubatch * pending, uint32_t n,
+        std::vector<llama_token> & res, std::vector<uint8_t> & known) const {
+    const uint32_t n_tokens = ubatch.n_tokens;
+
+    res.assign(n_tokens*n, LLAMA_TOKEN_NULL);
+    known.assign(n_tokens, 1);
+
+    // get_prev_tokens() resolves these by ubatch order once applied, not predicted here
+    if (!ubatch.token || ubatch.is_mixed() || (pending && (!pending->token || pending->is_mixed()))) {
+        return false;
+    }
+
+    if (n == 0) {
+        return true;
+    }
+
+    // the tokens that the cells will hold once ub (and pending before it) are applied, by (seq, pos)
+    // ub is inserted last, so it wins over pending for the same position
+    std::unordered_map<uint64_t, llama_token> batch_tok;
+    std::unordered_map<llama_seq_id, llama_pos> pos_min;
+
+    auto add = [&](const llama_ubatch & ub) -> bool {
+        for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+            if (ub.n_seq_id[i] != 1) {
+                return false;
+            }
+            const llama_seq_id s = ub.seq_id[i][0];
+            const llama_pos    p = ub.pos[i];
+            batch_tok[((uint64_t) (uint32_t) s << 32) | (uint32_t) p] = ub.token[i];
+            auto it = pos_min.find(s);
+            if (it == pos_min.end() || p < it->second) {
+                pos_min[s] = p;
+            }
+        }
+        return true;
+    };
+
+    batch_tok.reserve((pending ? pending->n_tokens : 0) + n_tokens);
+    if ((pending && !add(*pending)) || !add(ubatch)) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        const llama_seq_id seq_id = ubatch.seq_id[i][0];
+
+        for (uint32_t j = 0; j < n; ++j) {
+            const llama_pos p = ubatch.pos[i] - (llama_pos) (n - j);
+            if (p < 0) {
+                continue;
+            }
+
+            const auto it = batch_tok.find(((uint64_t) (uint32_t) seq_id << 32) | (uint32_t) p);
+            if (it != batch_tok.end()) {
+                res[i*n + j] = it->second;
+                continue;
+            }
+
+            if (p >= pos_min.at(seq_id)) {
+                // a gap inside the batch: the nearest earlier cell is not known before the apply
+                known[i] = 0;
+                continue;
+            }
+
+            // every batch token of this sequence comes later, so the cells at or before p stay as they are
+            res[i*n + j] = v_cells[seq_to_stream[seq_id]].seq_pos_tok_le(seq_id, p);
+        }
+    }
+
+    return true;
+}
+
 size_t llama_kv_cache::total_size() const {
     size_t size = 0;
 
@@ -2923,6 +2994,14 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
     return ubatches[i_cur];
 }
 
+const llama_ubatch * llama_kv_cache_context::peek_ubatch(uint32_t k) const {
+    if (status != LLAMA_MEMORY_STATUS_SUCCESS || i_cur + k >= ubatches.size()) {
+        return nullptr;
+    }
+
+    return &ubatches[i_cur + k];
+}
+
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
@@ -2997,4 +3076,9 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     kv->get_prev_tokens(ubatch, n, res);
+}
+
+bool llama_kv_cache_context::get_prev_tokens_ahead(const llama_ubatch & ubatch, const llama_ubatch * pending, uint32_t n,
+        std::vector<llama_token> & res, std::vector<uint8_t> & known) const {
+    return kv->get_prev_tokens_ahead(ubatch, pending, n, res, known);
 }

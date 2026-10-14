@@ -16,6 +16,7 @@
 
 struct llama_cparams;
 struct llama_ubatch;
+struct llama_memory_context_i;
 struct llama_model_loader;
 struct llama_model;
 
@@ -788,6 +789,13 @@ struct llama_model {
     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
     std::unordered_set<const ggml_tensor *> can_prefetch;
 
+    // for the pread prefetch of a lazy tensor: an owned read-only descriptor of its file, and the file offset of its data
+    struct lazy_file {
+        int    fd   = -1;
+        size_t offs = 0;
+    };
+    std::unordered_map<const ggml_tensor *, lazy_file> lazy_files;
+
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
 
@@ -836,6 +844,14 @@ struct llama_model {
     llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
+
+    // advisory prefetch of the lazily read PLE table (see llama_ple_prefetch_mode)
+    // the rows that set_input of the arch will gather for ub, per token n entries, -1 where a row is not knowable ahead
+    //   pending:   the ubatch of the same decode right before ub, when it is not applied to the memory yet (else nullptr)
+    //   reference: ub is applied, compute the rows exactly the way set_input does (verification of the prediction)
+    // returns the table, or nullptr when the arch has none or cannot predict this ubatch
+    virtual const ggml_tensor * ple_rows(const llama_ubatch & ub, const llama_ubatch * pending,
+            const llama_memory_context_i * mctx, bool reference, std::vector<int32_t> & rows) const;
 
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;

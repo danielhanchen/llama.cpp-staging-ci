@@ -910,6 +910,9 @@ struct llama_model_gemma4 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    const ggml_tensor * ple_rows(const llama_ubatch & ub, const llama_ubatch * pending,
+            const llama_memory_context_i * mctx, bool reference, std::vector<int32_t> & rows) const override;
+
     struct graph : public llm_graph_context {
         const llama_model & model;
 
@@ -2557,6 +2560,9 @@ struct llama_model_qwen4exp : public llama_model_base {
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+
+    const ggml_tensor * ple_rows(const llama_ubatch & ub, const llama_ubatch * pending,
+            const llama_memory_context_i * mctx, bool reference, std::vector<int32_t> & rows) const override;
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);

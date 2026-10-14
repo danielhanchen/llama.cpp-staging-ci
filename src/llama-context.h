@@ -8,6 +8,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "llama-prefetch.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -338,6 +339,45 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+
+    // advisory prefetch of the lazily read PLE rows, one ubatch ahead (see llama_ple_prefetch_mode)
+    // the rows are predicted on the main thread before the ubatch before them is processed, the workers warm the
+    // page cache meanwhile; set_input still computes the authoritative rows, so nothing here changes the results
+    std::unique_ptr<llama_row_prefetcher> ple_prefetcher;
+
+public:
+    struct ple_state {
+        bool enabled = false; // predict at all (prefetcher or verify)
+        bool verify  = false; // LLAMA_PLE_PREFETCH_VERIFY=1: compare each prediction with the rows of set_input
+        bool stats   = false; // LLAMA_PLE_PREFETCH_STATS=1: print the counters when the context is freed
+
+        // the prediction for the current / the next ubatch (verify only), valid when non-empty
+        std::vector<int32_t> pred_cur;
+        std::vector<int32_t> pred_next;
+        std::vector<int32_t> scratch;
+
+        uint64_t n_predicted    = 0; // ubatches predicted
+        uint64_t n_unpredicted  = 0; // ubatches the arch could not predict ahead
+        uint64_t n_rows         = 0; // rows submitted
+        uint64_t n_skipped_rows = 0; // rows not knowable ahead (-1)
+        uint64_t n_checked      = 0; // ubatches verified
+        uint64_t n_mismatch     = 0; // rows that differ from set_input
+        int64_t  t_predict_us   = 0;
+
+        // timing of set_inputs and page faults, with or without the prefetcher (stats only)
+        int64_t  t_set_inputs_us = 0;
+        uint64_t n_set_inputs    = 0;
+        int64_t  t_decode_us     = 0;
+        uint64_t n_decode        = 0;
+        int64_t  majflt          = 0; // process major faults during decode(), the workers included
+        int64_t  minflt          = 0;
+    };
+
+private:
+    ple_state ple;
+
+    void ple_prefetch_ahead(const llama_ubatch & ubatch, const llama_memory_context_i * mctx, bool first);
+    void ple_prefetch_verify(const llama_ubatch & ubatch, const llama_memory_context_i * mctx);
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

@@ -250,6 +250,13 @@ public:
     // note: used by n-gram input embeddings
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
+    // advisory get_prev_tokens() for a ubatch that is not applied yet (prefetching): the predecessors come from the
+    // ubatch itself, then from `pending` (the ubatch right before it, not applied either, can be null), then from the cells
+    // known[i] = 0 when a predecessor of token i cannot be resolved ahead (a position gap inside the batch)
+    // returns false when positions do not give the token order (embd / mixed ubatch) or a token has several sequences
+    bool get_prev_tokens_ahead(const llama_ubatch & ubatch, const llama_ubatch * pending, uint32_t n,
+            std::vector<llama_token> & res, std::vector<uint8_t> & known) const;
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -393,6 +400,7 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+    const llama_ubatch * peek_ubatch(uint32_t k) const override;
 
     //
     // llama_kv_cache_context specific API
@@ -437,6 +445,10 @@ public:
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+
+    // see llama_kv_cache::get_prev_tokens_ahead()
+    bool get_prev_tokens_ahead(const llama_ubatch & ubatch, const llama_ubatch * pending, uint32_t n,
+            std::vector<llama_token> & res, std::vector<uint8_t> & known) const;
 
 private:
     llama_memory_status status;
