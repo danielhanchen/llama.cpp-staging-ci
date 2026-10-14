@@ -417,9 +417,10 @@ struct llama_moe_cache::impl {
     // ov_gap_max), as the misses change with the cache and the prompts
     static constexpr int    ov_block   = 12;
     static constexpr int    ov_skip    = 3;
-    static constexpr int    ov_first   = 8;
+    static constexpr int    ov_first   = 64; // the misses go down while the cache warms up
     static constexpr int    ov_gap_max = 8192;
     static constexpr double ov_margin  = 0.01;
+    int     ov_mode   = 1;
     bool    ov_auto   = false;
     bool    ov_live   = false; // the graphs of single token ubatches use the overlap
     int     ov_done   = -1;    // single token ubatches of the trial, -1 if there is no trial
@@ -520,16 +521,17 @@ struct llama_moe_cache::impl {
         }
 
         // LLAMA_MOE_CACHE_FETCH_OVERLAP (or the older LLAMA_MOE_CACHE_OVERLAP): 0 = off, single token ubatches copy the missing experts
-        // before the expert FFN of the layer; unset or 1 = auto, kept while trials find it faster (see ov_tick); 2 = on
+        // before the expert FFN of the layer; unset or 1 = on where the backend expects it to be faster (ggml_backend_moe_fetch_overlap_default),
+        // 2 = on, 3 = auto, kept while trials find it faster (see ov_tick)
         // the results are the same either way (each slot is computed once, see build_moe_ffn), only the speed depends on the choice
         {
             const char * env = getenv("LLAMA_MOE_CACHE_FETCH_OVERLAP");
             if (env == nullptr) {
                 env = getenv("LLAMA_MOE_CACHE_OVERLAP");
             }
-            const int mode = env != nullptr ? atoi(env) : 1;
-            overlap = device_lookup && mode != 0 && model.hparams.n_expert >= 4;
-            ov_auto = overlap && mode == 1;
+            ov_mode = env != nullptr ? atoi(env) : 1;
+            overlap = device_lookup && ov_mode != 0 && model.hparams.n_expert >= 4;
+            ov_auto = overlap && ov_mode == 3;
             ov_live = overlap && !ov_auto;
             ov_wait = ov_auto ? ov_first : -1;
         }
@@ -815,9 +817,23 @@ struct llama_moe_cache::impl {
                 hybrid_probe = false;
                 hybrid_live  = false;
                 hybrid_share = 1.0f; // no hybrid line in the stats
-            } else if (!model.hparams.no_alloc) {
+            } else {
+                // default: only where the backend expects the overlap to be faster
+                using overlap_default_t = bool (*)(ggml_backend_dev_t);
+                ggml_backend_dev_t dev = ggml_backend_get_device(devices[devs[0]].backend);
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                auto fn = reg != nullptr ? (overlap_default_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_fetch_overlap_default") : nullptr;
+                if (overlap && ov_mode == 1 && (fn == nullptr || !fn(dev))) {
+                    overlap = false;
+                    ov_live = false;
+                    if (!model.hparams.no_alloc) {
+                        LLAMA_LOG_INFO("%s: MoE cache: no fetch overlap by default on %s (LLAMA_MOE_CACHE_FETCH_OVERLAP=2 on, 3 auto)\n", __func__, ggml_backend_dev_name(dev));
+                    }
+                }
+            }
+            if (devs.size() == 1 && !model.hparams.no_alloc) {
                 if (overlap) {
-                    LLAMA_LOG_INFO("%s: MoE cache: single token ubatches compute the cached experts while the missing ones are copied, %s (LLAMA_MOE_CACHE_FETCH_OVERLAP=0 off, 2 on)\n", __func__,
+                    LLAMA_LOG_INFO("%s: MoE cache: single token ubatches compute the cached experts while the missing ones are copied, %s (LLAMA_MOE_CACHE_FETCH_OVERLAP=0 off, 2 on, 3 auto)\n", __func__,
                         ov_auto ? "auto: kept while trials find it faster" : "on");
                 }
                 if (hybrid && hybrid_probe) {

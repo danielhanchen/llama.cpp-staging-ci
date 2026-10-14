@@ -6656,8 +6656,25 @@ static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const g
 #endif
 }
 
+// whether an overlapped MoE cache fetch (ggml_moe_cache_fetch with overlap) is expected to be faster on the device dev:
+// measured faster on compute capability 7.5 and 8.9 (T4, L4) at every budget; on 12.0 (RTX PRO 6000), where kernels launch with PDL,
+// the second stream made the experts and the other kernels slower, a loss with few missing experts (up to -11%), so it is off there
+// by default (and on the other PDL and AMD devices, not measured)
+static bool ggml_backend_cuda_moe_fetch_overlap_default(ggml_backend_dev_t dev) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(dev);
+    return false;
+#else
+    const int cc = ggml_cuda_info().devices[((ggml_backend_cuda_device_context *) dev->context)->device].cc;
+    return cc < GGML_CUDA_CC_HOPPER;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_moe_fetch_overlap_default") == 0) {
+        return (void *)ggml_backend_cuda_moe_fetch_overlap_default;
+    }
     if (strcmp(name, "ggml_backend_copy_regions_async") == 0) {
         return (void *)ggml_backend_cuda_copy_regions_async;
     }

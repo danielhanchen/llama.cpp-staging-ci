@@ -40,8 +40,9 @@ public:
     ggml_tensor * hybrid_assign(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch, bool & host) const;
     ggml_tensor * hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res, bool overlap) const;
 
-    // single token ubatches, LLAMA_MOE_CACHE_FETCH_OVERLAP (unset/1 auto, 2 on, 0 off): the copies of the missing experts run beside the
-    // experts already cached (see ggml_moe_cache_fetch); true if the graph of a ubatch of n_ubatch tokens uses it now
+    // single token ubatches, LLAMA_MOE_CACHE_FETCH_OVERLAP (unset/1 where the backend expects a gain, 2 on, 3 auto, 0 off): the copies of
+    // the missing experts run beside the experts already cached (see ggml_moe_cache_fetch); true if the graph of a ubatch of n_ubatch
+    // tokens uses it now
     bool overlap(int64_t n_ubatch) const;
 
     // true if the graphs of small batches may use the hybrid path
@@ -57,7 +58,7 @@ public:
     // switches between the plain and the hybrid path, then keeps the faster one (see hybrid_active)
     bool hybrid_window_pending() const;
 
-    // fetch overlap auto (LLAMA_MOE_CACHE_FETCH_OVERLAP unset or 1): true while a trial runs or waits; the tick goes before the graph of
+    // fetch overlap auto (LLAMA_MOE_CACHE_FETCH_OVERLAP=3): true while a trial runs or waits; the tick goes before the graph of
     // every ubatch then, after the previous ubatch finished when overlap_tick_sync() (the backends are synchronized)
     bool overlap_trial_pending() const;
     bool overlap_tick_sync() const;
