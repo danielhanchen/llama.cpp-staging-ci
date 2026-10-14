@@ -317,6 +317,7 @@ struct llama_moe_cache::impl {
         size_t   expert_bytes = 0;       // all the expert tensors of one expert
         bool     dev_lookup   = false;   // small batches are looked up on the device (per group, so mixed devices work)
         ggml_tensor * counts  = nullptr; // hybrid: use counters of the experts [n_expert, n_layer + 1], see ggml_moe_cache_assign
+        bool     host_read    = false;   // the graph being allocated reads the banks through host lookups (see set_graph)
     };
 
     struct layer {
@@ -1354,13 +1355,17 @@ struct llama_moe_cache::impl {
 
         // the largest group of the device
         group * gl = nullptr;
+        bool host_read = false;
         for (group & g : groups) {
             if (g.id == id && g.n_slots > 0 && (gl == nullptr || (size_t) g.n_slots*g.expert_bytes > (size_t) gl->n_slots*gl->expert_bytes)) {
                 gl = &g;
             }
+            host_read = host_read || (g.id == id && g.host_read);
         }
         // small batches looked up on the device may use every slot of the group
-        if (gl == nullptr || use_device(*gl, n_tokens)) {
+        // a host lookup (e.g. the last layer of a prompt cropped to its outputs) may too, and reads the banks of its group as weights
+        // while the scheduler treats the lent buffer, which holds the banks of every group of the device, as a compute buffer
+        if (gl == nullptr || use_device(*gl, n_tokens) || host_read) {
             return;
         }
         group & g = *gl;
@@ -1653,6 +1658,23 @@ struct llama_moe_cache::impl {
             return nullptr;
         }
         return l.slot_map;
+    }
+
+    // the graph about to be allocated: the groups whose banks it reads through host lookups (the get_rows of a slot map)
+    void set_graph(ggml_cgraph * gf) {
+        for (group & g : groups) {
+            g.host_read = false;
+        }
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            const ggml_tensor * node = ggml_graph_node(gf, i);
+            if (node->op != GGML_OP_GET_ROWS) {
+                continue;
+            }
+            const auto it = layer_of.find(node->src[0]);
+            if (it != layer_of.end()) {
+                groups[layers[it->second].ig].host_read = true;
+            }
+        }
     }
 
     ggml_tensor * get_resident(const ggml_tensor * t) const {
@@ -2160,6 +2182,10 @@ ggml_tensor * llama_moe_cache::get_resident(const ggml_tensor * t) const {
 
 ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
     return pimpl->get_experts(w);
+}
+
+void llama_moe_cache::set_graph(ggml_cgraph * gf) {
+    pimpl->set_graph(gf);
 }
 
 bool llama_moe_cache::is_slot_map(const ggml_tensor * t) const {

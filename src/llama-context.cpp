@@ -1693,6 +1693,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         prefetch_n_tokens = ubatch.n_tokens;
+        if (moe_cache) {
+            moe_cache->set_graph(gf);
+        }
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -2846,6 +2849,9 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // initialize scheduler with the specified graph
     prefetch_n_tokens = n_tokens;
+    if (moe_cache) {
+        moe_cache->set_graph(gf);
+    }
     if (split_only) {
         if (sizes) {
             ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
