@@ -9,6 +9,7 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-ext.h"
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
@@ -606,6 +607,60 @@ static int32_t get_logits_mixed(
     return 0;
 }
 
+// exact speculative verify (LLAMA_MTP_EXACT=1, llama_set_verify): verify batches of 3 tokens must give the bytes of single token
+// decodes for every row. Returns 1 = equal, 0 = differs, -1 = not run
+static int check_exact_verify(llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens) {
+    if (!llama_exact_verify_enabled() || llama_get_memory(lctx) == nullptr) {
+        return -1;
+    }
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const uint32_t n       = std::min<uint32_t>(tokens.size(), 48);
+    std::vector<float> single;
+    std::vector<float> verify;
+    for (const uint32_t w : { 1u, 3u }) {
+        std::vector<float> & out = w == 1 ? single : verify;
+        llama_memory_clear(llama_get_memory(lctx), true);
+        for (uint32_t p0 = 0; p0 < n; p0 += w) {
+            const uint32_t nb = std::min(w, n - p0);
+            common_batch batch(lctx);
+            for (uint32_t i = 0; i < nb; i++) {
+                batch.add(tokens[p0 + i], p0 + i, 0, true);
+            }
+            llama_set_verify(lctx, nb > 1);
+            const int32_t rc = llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            llama_set_verify(lctx, false);
+            if (rc != 0) {
+                throw std::runtime_error("failed to decode the verify batch");
+            }
+            for (uint32_t i = 0; i < nb; i++) {
+                const float * l = llama_get_logits_ith(lctx, i);
+                out.insert(out.end(), l, l + n_vocab);
+            }
+        }
+    }
+    const bool equal = memcmp(single.data(), verify.data(), single.size()*sizeof(float)) == 0;
+    if (!equal) {
+        for (size_t i = 0; i < single.size(); ++i) {
+            if (memcmp(&single[i], &verify[i], sizeof(float)) != 0) {
+                LOG_DBG("%s: first difference at row %zu col %zu: %.9g vs %.9g\n", __func__, i/n_vocab, i%n_vocab, single[i], verify[i]);
+                break;
+            }
+        }
+    }
+
+    // leave the memory as the full batch decode left it (the causal toggle check continues from it)
+    llama_memory_clear(llama_get_memory(lctx), true);
+    get_logits(model, lctx, tokens);
+
+    return equal ? 1 : 0;
+}
+
+// archs whose verify batches are not batch invariant yet on every backend: the check is reported (DIFF) but does not fail
+// grok: rows past 32 differ for some seeds on CPU; gemma3n and minimax: their own attention / sparsity paths
+static bool exact_verify_known_variant(const llm_arch arch) {
+    return arch == LLM_ARCH_GROK || arch == LLM_ARCH_GEMMA3N || arch == LLM_ARCH_MINIMAX_01 || arch == LLM_ARCH_MINIMAX_M3;
+}
+
 static bool check_causal_attn_toggle(
         llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -933,15 +988,15 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         max_arch_name_length = std::max(max_arch_name_length, strlen(llm_arch_name(arch)));
     }
 
-    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|%15s|\n";
+    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|%15s|%9s|\n";
     const std::string template_row_cfg = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|";
-    const std::string template_row_res = "%15s %10s|%20s|%15s %10s|\n";
+    const std::string template_row_res = "%15s %10s|%20s|%15s %10s|%20s|\n";
 
     bool all_ok = true;
     size_t n_tests = 0;
     size_t n_failed = 0;
     common_log_flush(common_log_main());
-    LOG(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip", "Mixed batch");
+    LOG(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip", "Mixed batch", "Verify");
     LOG("|");
     for (size_t i = 0; i < max_arch_name_length; i++) {
         LOG("-");
@@ -950,7 +1005,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
     for (size_t i = 0; i < max_device_label_length; i++) {
         LOG("-");
     }
-    LOG("|------|---------------|---------|---------------|\n");
+    LOG("|------|---------------|---------|---------------|---------|\n");
     for (const llm_arch & arch : llm_arch_all()) {
         if (arch == LLM_ARCH_UNKNOWN) {
             continue;
@@ -995,6 +1050,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 std::string status_nmse      = "\033[1;33mSKIP\033[0m";
                 std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
                 std::string status_mixed     = "\033[1;33mSKIP\033[0m";
+                std::string status_verify    = "\033[1;33mSKIP\033[0m";
                 char nmse_str[12] = {0};
                 char mixed_str[12] = {0};
 
@@ -1020,6 +1076,20 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
 
                         // chunked decode matches a single batch only with causal attention over a memory
                         llama_context * lctx_dev = model_and_ctx_dev.second.get();
+                        // exact verify batches (needs causal attention over a memory), before the mixed batch check: the
+                        // causal toggle check below needs the memory that check leaves
+                        if (!encode && llama_get_memory(lctx_dev) != nullptr) {
+                            const int vr = check_exact_verify(model_and_ctx_dev.first.get(), lctx_dev, tokens);
+                            if (vr == 1) {
+                                status_verify = "\033[1;32mOK\033[0m";
+                            } else if (vr == 0 && exact_verify_known_variant(arch)) {
+                                status_verify = "\033[1;33mDIFF\033[0m";
+                            } else if (vr == 0) {
+                                status_verify = "\033[1;31mFAIL\033[0m";
+                                test_ok = false;
+                            }
+                        }
+
                         if (!encode && llama_get_memory(lctx_dev) != nullptr) {
                             std::vector<float> embd_mixed((size_t) llama_model_n_embd_inp(model_and_ctx_dev.first.get())*tokens.size()/4);
                             std::mt19937 gen(seed);
@@ -1098,7 +1168,8 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 }
 
                 // log the results for this test case
-                LOG(template_row_res.c_str(), status_nmse.c_str(), nmse_str, status_roundtrip.c_str(), status_mixed.c_str(), mixed_str);
+                LOG(template_row_res.c_str(), status_nmse.c_str(), nmse_str, status_roundtrip.c_str(), status_mixed.c_str(), mixed_str,
+                    status_verify.c_str());
             }
         }
     }
@@ -1116,6 +1187,14 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
 }
 
 int main(int argc, char ** argv) {
+    // exact speculative verify is checked by default (LLAMA_MTP_EXACT=0 skips the check)
+#ifdef _WIN32
+    if (getenv("LLAMA_MTP_EXACT") == nullptr) {
+        _putenv_s("LLAMA_MTP_EXACT", "1");
+    }
+#else
+    setenv("LLAMA_MTP_EXACT", "1", 0);
+#endif
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
     common_init();

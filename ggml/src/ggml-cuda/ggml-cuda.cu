@@ -1935,6 +1935,33 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
+    // batch invariant (speculative verify batches): every column gets the bytes a single column (ne11 == 1) would get
+    if ((dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) && ne11 > 1) {
+        // the vector kernels compute each column like their single column launch (mmvq: with the warps of that launch)
+        if (ne11 <= MMVF_MAX_BATCH_SIZE && ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, 1)) {
+            ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+            return;
+        }
+        if (ne11 <= MMVQ_MAX_BATCH_SIZE && !ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, 1, false) &&
+                ggml_cuda_should_use_mmvq(src0->type, cc, 1)) {
+            ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+            return;
+        }
+        // any other kernel: one column at a time
+        if (ne11 <= 16 && ne12*ne13 == 1) {
+            for (int64_t j = 0; j < ne11; ++j) {
+                ggml_tensor src1_j = *src1;
+                ggml_tensor dst_j  = *dst;
+                src1_j.ne[1] = 1;
+                dst_j.ne[1]  = 1;
+                src1_j.data = (char *) src1->data + j*src1->nb[1];
+                dst_j.data  = (char *)  dst->data + j* dst->nb[1];
+                ggml_cuda_mul_mat(ctx, src0, &src1_j, &dst_j);
+            }
+            return;
+        }
+    }
+
     if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -1982,7 +2009,8 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 
     if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
         if (ggml_is_quantized(src0->type)) {
-            if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
+            // batch invariant: the single token mul_mat_vec_q per token (see ggml_cuda_mul_mat_id)
+            if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc) || (dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT)) {
                 return false;
             }
         } else if (GGML_CUDA_CC_IS_AMD(cc)) {
@@ -2019,7 +2047,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
-                if (ne2 <= mmvq_mmid_max) {
+                // batch invariant (verify batches): mul_mat_vec_q runs the single token kernel per token
+                if (ne2 <= mmvq_mmid_max || (dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT)) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }

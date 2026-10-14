@@ -1742,10 +1742,68 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
+static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor);
+
+// batch invariant nodes (speculative verify batches): the matrix multiplications pick their kernel by the number of src1 columns
+// (llamafile sgemm, repacked gemm vs gemv, the expert grouping of MUL_MAT_ID), so every column (token) is computed alone, as a batch
+// of one token computes it; returns true when done
+static bool ggml_compute_forward_batch_invariant(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
+    if (!(tensor->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT)) {
+        return false;
+    }
+    struct ggml_tensor * src1 = tensor->src[1];
+    if (tensor->op == GGML_OP_MUL_MAT) {
+        if (src1->ne[1] < 2 || src1->ne[1] > 16 || src1->ne[2]*src1->ne[3] != 1 || tensor->ne[2]*tensor->ne[3] != 1) {
+            return false;
+        }
+        for (int64_t j = 0; j < src1->ne[1]; ++j) {
+            struct ggml_tensor src1_j = *src1;
+            struct ggml_tensor dst_j  = *tensor;
+            src1_j.ne[1] = 1;
+            src1_j.data  = (char *) src1->data + j*src1->nb[1];
+            dst_j.ne[1]  = 1;
+            dst_j.data   = (char *) tensor->data + j*tensor->nb[1];
+            dst_j.src[1] = &src1_j;
+            dst_j.flags &= ~GGML_TENSOR_FLAG_BATCH_INVARIANT;
+            ggml_compute_forward(params, &dst_j);
+            ggml_barrier(params->threadpool);
+        }
+        return true;
+    }
+    if (tensor->op == GGML_OP_MUL_MAT_ID) {
+        struct ggml_tensor * ids = tensor->src[2];
+        if (src1->ne[2] < 2 || src1->ne[2] > 16 || src1->ne[3] != 1 || ids->ne[1] != src1->ne[2]) {
+            return false;
+        }
+        for (int64_t j = 0; j < src1->ne[2]; ++j) {
+            struct ggml_tensor src1_j = *src1;
+            struct ggml_tensor ids_j  = *ids;
+            struct ggml_tensor dst_j  = *tensor;
+            src1_j.ne[2] = 1;
+            src1_j.data  = (char *) src1->data + j*src1->nb[2];
+            ids_j.ne[1]  = 1;
+            ids_j.data   = (char *) ids->data + j*ids->nb[1];
+            dst_j.ne[2]  = 1;
+            dst_j.data   = (char *) tensor->data + j*tensor->nb[2];
+            dst_j.src[1] = &src1_j;
+            dst_j.src[2] = &ids_j;
+            dst_j.flags &= ~GGML_TENSOR_FLAG_BATCH_INVARIANT;
+            ggml_compute_forward(params, &dst_j);
+            ggml_barrier(params->threadpool);
+        }
+        return true;
+    }
+    return false;
+}
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
     if (tensor->op == GGML_OP_NONE || ggml_is_empty(tensor)) {
+        return;
+    }
+
+    if (ggml_compute_forward_batch_invariant(params, tensor)) {
         return;
     }
 

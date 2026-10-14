@@ -3047,6 +3047,32 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+int64_t llm_graph_exact_row_n_kv(const llama_ubatch & ubatch, int64_t i, int64_t n_kv) {
+    // llama_kv_cache::get_n_kv pads the used cells to 256: with one sequence whose cells follow its positions, a decode of
+    // row i alone sees the padding of its own position
+    constexpr int64_t pad = 256;
+    const int64_t p_last = ubatch.pos[ubatch.n_tokens - 1];
+    const int64_t n_last = std::max<int64_t>(pad, GGML_PAD(p_last + 1, pad));
+    if (n_last != n_kv) {
+        return n_kv; // the cells do not follow the positions, or the cache is full: keep the cells of the batch
+    }
+    const int64_t n_i = std::max<int64_t>(pad, GGML_PAD((int64_t) ubatch.pos[i] + 1, pad));
+    return std::min(n_i, n_kv);
+}
+
+uint32_t llm_graph_exact_split(const llama_ubatch & ubatch) {
+    if (ubatch.pos == nullptr || ubatch.n_tokens < 2) {
+        return 0;
+    }
+    constexpr int64_t pad = 256;
+    const int64_t n_last = std::max<int64_t>(pad, GGML_PAD((int64_t) ubatch.pos[ubatch.n_tokens - 1] + 1, pad));
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        n += llm_graph_exact_row_n_kv(ubatch, i, n_last) < n_last;
+    }
+    return n;
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -3091,14 +3117,45 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
-                                  hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
-
-        ggml_flash_attn_ext_add_sinks(cur, sinks);
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
-        ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
-        ggml_prec_set_acc(cur, GGML_PREC_F32);
+
+        // batch invariant verify (LLAMA_MTP_EXACT=1): one attention per query, over the cells a decode of that token alone
+        // would see, so the backend picks the single query kernel and the KV split of that decode for every row
+        const int64_t n_q = q->ne[1];
+        if (cparams.batch_invariant && n_q > 1 && n_stream == 1 && kq_mask != nullptr && kq_mask->ne[1] == n_q &&
+                ubatch.pos != nullptr && (int64_t) ubatch.n_tokens == n_q) {
+            const int64_t n_kv = k->ne[1];
+            cur = nullptr;
+            for (int64_t i = 0; i < n_q; ++i) {
+                const int64_t n_kv_i = llm_graph_exact_row_n_kv(ubatch, i, n_kv);
+
+                ggml_tensor * q_i = ggml_view_4d(ctx0, q, q->ne[0], 1, q->ne[2], q->ne[3], q->nb[1], q->nb[2], q->nb[3], i*q->nb[1]);
+                ggml_tensor * k_i = ggml_view_4d(ctx0, k, k->ne[0], n_kv_i, k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+                ggml_tensor * v_i = ggml_view_4d(ctx0, v, v->ne[0], n_kv_i, v->ne[2], v->ne[3], v->nb[1], v->nb[2], v->nb[3], 0);
+                ggml_tensor * m_i = ggml_view_4d(ctx0, kq_mask, n_kv_i, 1, kq_mask->ne[2], kq_mask->ne[3],
+                        kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], i*kq_mask->nb[1]);
+
+                ggml_tensor * o_i = ggml_flash_attn_ext(ctx0, q_i, k_i, v_i, m_i, kq_scale, hparams.f_max_alibi_bias,
+                                          hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+                if (i == 0) {
+                    res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, o_i, il});
+                }
+                ggml_flash_attn_ext_add_sinks(o_i, sinks);
+                ggml_flash_attn_ext_set_n_kv_max(o_i, static_cast<int32_t>(n_kv_max));
+                ggml_prec_set_acc(o_i, GGML_PREC_F32);
+
+                // [DV, n_head, 1, 1] rows, concatenated along the tokens
+                cur = cur ? ggml_concat(ctx0, cur, o_i, 2) : o_i;
+            }
+        } else {
+            cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                                      hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+
+            ggml_flash_attn_ext_add_sinks(cur, sinks);
+            ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
+            ggml_prec_set_acc(cur, GGML_PREC_F32);
+        }
 
         if (v_mla) {
 #if 0

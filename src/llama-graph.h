@@ -99,6 +99,11 @@ struct llama_cross {
 
 struct llm_graph_params;
 
+// batch invariant verify (LLAMA_MTP_EXACT=1): the KV cells (n_kv) a decode of row i of the ubatch alone attends to, and the
+// number of rows that see fewer cells than the whole ubatch (a ubatch crossing a multiple of the 256 cell padding)
+int64_t  llm_graph_exact_row_n_kv(const llama_ubatch & ubatch, int64_t i, int64_t n_kv);
+uint32_t llm_graph_exact_split(const llama_ubatch & ubatch);
+
 //
 // llm_graph_input
 //
@@ -897,6 +902,9 @@ struct llm_graph_params {
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
+            cparams.batch_invariant         == other.cparams.batch_invariant         &&
+            // a verify ubatch crossing a padding block of the KV cells splits its attention by rows: rebuilt every time
+            cparams.exact_split == 0 && other.cparams.exact_split == 0 &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
             arch  == other.arch  &&
             gtype == other.gtype &&

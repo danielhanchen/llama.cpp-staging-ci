@@ -114,6 +114,15 @@ static void llama_verify_hadamard_graph(
     }
 }
 
+// LLAMA_MTP_EXACT=1: the speculative verify batches (llama_set_verify) are computed batch invariant
+static bool llama_exact_verify_env() {
+    static const bool value = [] {
+        const char * env = getenv("LLAMA_MTP_EXACT");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return value;
+}
+
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
@@ -209,6 +218,9 @@ llama_context::llama_context(
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
+    cparams.verify                  = false;
+    cparams.batch_invariant         = false;
+    cparams.exact_split             = 0;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
@@ -1598,6 +1610,10 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
     cparams.embeddings_nextn_masked = masked;
 }
 
+void llama_context::set_verify(bool value) {
+    cparams.verify = value;
+}
+
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
 
@@ -1828,6 +1844,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
+        }
+
+        // verify batches computed batch invariant: every backend sees the flag on the nodes (it also keys the CUDA graphs)
+        if (cparams.batch_invariant) {
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_graph_node(gf, i)->flags |= GGML_TENSOR_FLAG_BATCH_INVARIANT;
+            }
         }
 
         prefetch_n_tokens = ubatch.n_tokens;
@@ -2302,6 +2325,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
+    // speculative verify batches with LLAMA_MTP_EXACT=1 are computed batch invariant (see llama_set_verify)
+    const bool exact_verify = cparams.verify && llama_exact_verify_env() && n_tokens_all > 1 && cparams.causal_attn && !output_all;
+
     while (true) {
         mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
         if (!mctx) {
@@ -2395,7 +2421,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
 
+        cparams.batch_invariant = exact_verify && ubatch.n_tokens > 1;
+        cparams.exact_split     = cparams.batch_invariant ? llm_graph_exact_split(ubatch) : 0;
+
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+
+        cparams.batch_invariant = false;
+        cparams.exact_split     = 0;
 
         if (moe_cache) {
             moe_cache_seed_end(ubatch, res ? n_outputs : -1);
@@ -5221,6 +5253,14 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
+}
+
+void llama_set_verify(llama_context * ctx, bool value) {
+    ctx->set_verify(value);
+}
+
+bool llama_exact_verify_enabled(void) {
+    return llama_exact_verify_env();
 }
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {

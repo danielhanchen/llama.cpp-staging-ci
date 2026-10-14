@@ -593,6 +593,13 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int device = ggml_cuda_get_device();
 
     if (ggml_cuda_top_k_deterministic()) {
+        if ((dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) && nrows > 1 && nrows <= 16) {
+            // batch invariant: each row takes the path (and output order) of a single row
+            for (int64_t i = 0; i < nrows; ++i) {
+                ggml_cuda_op_top_k_deterministic(pool, src0_d + i*ncols, dst_d + i*k, ncols, 1, k, device, stream);
+            }
+            return;
+        }
         ggml_cuda_op_top_k_deterministic(pool, src0_d, dst_d, ncols, nrows, k, device, stream);
         return;
     }

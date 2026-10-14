@@ -35,6 +35,9 @@ struct llama_cparams {
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
+    bool verify;                  // the caller marks the next batches as speculative verify batches (llama_set_verify)
+    bool batch_invariant;         // the current ubatch is a verify batch computed batch invariant (LLAMA_MTP_EXACT=1)
+    uint32_t exact_split;         // batch invariant ubatch: rows whose attention sees fewer KV cells (llm_graph_exact_split)
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;

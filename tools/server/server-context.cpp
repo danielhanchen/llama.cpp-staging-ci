@@ -13,6 +13,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // staging API: llama_set_verify
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -156,6 +157,9 @@ struct server_batch {
     // track if given slot can be batched with slots already in the batch
     server_slot * slot_batched = nullptr;
 
+    // a slot added speculative draft tokens to verify (see llama_set_verify)
+    bool has_draft = false;
+
     // embedding entries, they can be mixed with tokens if the context supports it
     std::vector<float> embd; // n_embd per row
 
@@ -197,6 +201,7 @@ struct server_batch {
         embd.clear();
         view.clear();
         slot_batched      = nullptr;
+        has_draft         = false;
         alora_scale       = -1.0f;
         alora_disabled_id = 0;
     }
@@ -596,6 +601,8 @@ struct server_slot {
             }
 
             auto pos0 = prompt.tokens.pos_next();
+
+            batch.has_draft = true;
 
             add_ok &= batch.add(id, sampled, pos0++, true, false);
             for (auto token : spec_draft) {
@@ -4268,9 +4275,15 @@ private:
         }
 
         bool has_output = false;
+        bool has_prompt = false;
         for (int i = off; i < off + batch.view.size(); ++i) {
             has_output |= batch.tokens[i].output;
+            has_prompt |= batch.tokens[i].is_prompt;
         }
+
+        // a batch of sampled and draft tokens only is a speculative verify batch: with LLAMA_MTP_EXACT=1 its rows are
+        // computed as single token decodes would compute them, so greedy speculative output equals plain decoding
+        llama_set_verify(ctx_tgt, batch.has_draft && !has_prompt);
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
