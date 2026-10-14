@@ -349,7 +349,7 @@ public:
     struct ple_state {
         bool enabled = false; // predict at all (prefetcher or verify)
         bool verify  = false; // LLAMA_PLE_PREFETCH_VERIFY=1: compare each prediction with the rows of set_input
-        bool stats   = false; // LLAMA_PLE_PREFETCH_STATS=1: print the counters when the context is freed
+        int  stats   = 0;     // LLAMA_PLE_PREFETCH_STATS=1: print the counters when the context is freed, 2: also per decode
 
         // the prediction for the current / the next ubatch (verify only), valid when non-empty
         std::vector<int32_t> pred_cur;

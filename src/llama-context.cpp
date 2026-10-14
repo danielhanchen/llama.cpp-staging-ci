@@ -600,7 +600,7 @@ llama_context::llama_context(
         };
 
         ple.verify = env_on("LLAMA_PLE_PREFETCH_VERIFY");
-        ple.stats  = env_on("LLAMA_PLE_PREFETCH_STATS");
+        ple.stats  = getenv("LLAMA_PLE_PREFETCH_STATS") ? atoi(getenv("LLAMA_PLE_PREFETCH_STATS")) : 0;
 
         const enum llama_ple_prefetch_mode mode = llama_ple_prefetch_resolve(params.ple_prefetch);
 
@@ -2068,10 +2068,16 @@ struct ple_decode_meter {
         maj = min = 0;
     }
 
-    explicit ple_decode_meter(llama_context::ple_state * ple) : ple(ple) {
+    int64_t  t_set0 = 0;
+    uint64_t n_set0 = 0;
+    int64_t  n_tokens = 0;
+
+    explicit ple_decode_meter(llama_context::ple_state * ple, int64_t n_tokens) : ple(ple), n_tokens(n_tokens) {
         if (ple) {
             t0 = ggml_time_us();
             faults(maj0, min0);
+            t_set0 = ple->t_set_inputs_us;
+            n_set0 = ple->n_set_inputs;
         }
     }
 
@@ -2079,10 +2085,16 @@ struct ple_decode_meter {
         if (ple) {
             int64_t maj, min;
             faults(maj, min);
-            ple->t_decode_us += ggml_time_us() - t0;
+            const int64_t t = ggml_time_us() - t0;
+            ple->t_decode_us += t;
             ple->n_decode++;
             ple->majflt += maj - maj0;
             ple->minflt += min - min0;
+            if (ple->stats > 1) {
+                LLAMA_LOG_INFO("ple_stats: decode n_tokens = %" PRId64 ", ubatches = %" PRIu64 ", set_inputs = %.2f ms, "
+                        "majflt = %" PRId64 ", minflt = %" PRId64 ", wall = %.2f ms\n", n_tokens, ple->n_set_inputs - n_set0,
+                        (ple->t_set_inputs_us - t_set0)/1e3, maj - maj0, min - min0, t/1e3);
+            }
         }
     }
 };
@@ -2095,7 +2107,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ~state_async_join() { ctx->state_async_wait(); }
     } state_async_join_guard { this };
 
-    const ple_decode_meter ple_meter(ple.stats ? &ple : nullptr);
+    const ple_decode_meter ple_meter(ple.stats ? &ple : nullptr, (int64_t) batch_inp.tokens.size());
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
