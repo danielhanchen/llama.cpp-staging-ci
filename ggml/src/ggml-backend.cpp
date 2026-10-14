@@ -3471,6 +3471,36 @@ static bool ggml_backend_sched_prefetch_is_bound(ggml_backend_sched_t sched, con
         std::binary_search(pf->lent_copies, pf->lent_copies + pf->n_lent_copies, (const struct ggml_tensor *) input_cpy);
 }
 
+// without a lender (the MoE cache) a staging arena is memory that a measurement (e.g. --fit) did not count (see llama_context::sched_reserve):
+// it only takes what is left, a device with less than GGML_SCHED_PREFETCH_HEADROOM_MIB (512) free after the reserve drops the prefetch,
+// the backends allocate more while computing (e.g. the CUDA pool)
+static bool ggml_backend_sched_prefetch_headroom_ok(ggml_backend_sched_t sched) {
+    static const size_t headroom = [] {
+        const char * env = getenv("GGML_SCHED_PREFETCH_HEADROOM_MIB");
+        return (size_t) (env != NULL ? std::max(0, atoi(env)) : 512) * 1024 * 1024;
+    }();
+    if (sched->callback_lend != NULL || headroom == 0) {
+        return true;
+    }
+    for (int b = 0; b < sched->n_backends; b++) {
+        const struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+        ggml_backend_dev_t dev = sched->backends[b]->device;
+        if (pf->arena == NULL || dev == NULL || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        size_t free  = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        if (total > 0 && free < headroom) {
+            GGML_LOG_WARN("%s: %s: %.2f MiB free after %.2f MiB of staging memory, less than %.0f MiB of headroom: host weight prefetch disabled "
+                "(GGML_SCHED_PREFETCH_HEADROOM_MIB)\n", __func__, ggml_backend_name(sched->backends[b]), free/1024.0/1024.0,
+                pf->arena_size/1024.0/1024.0, headroom/1024.0/1024.0);
+            return false;
+        }
+    }
+    return true;
+}
+
 // the graph allocator failed with the staging arenas allocated: unbind the copies, free the arenas and disable prefetch, so the allocation can retry with that memory
 // returns false if nothing was freed
 static bool ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched) {
@@ -4266,6 +4296,12 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         // retry without the staging memory
         if (!ggml_backend_sched_prefetch_disable(sched) ||
+            !ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+            return false;
+        }
+    } else if (!ggml_backend_sched_prefetch_headroom_ok(sched)) {
+        // the arena would take the memory the backends allocate while computing: drop it
+        if (ggml_backend_sched_prefetch_disable(sched) &&
             !ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
             return false;
         }

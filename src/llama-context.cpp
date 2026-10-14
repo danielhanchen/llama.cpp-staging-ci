@@ -950,9 +950,10 @@ void llama_context::sched_reserve() {
         }
 
         // a memory measurement (e.g. --fit) does not count the staging memory of the host weight prefetch: it only uses memory that is
-        // left after the layers (the reserve drops the prefetch when the compute buffers do not fit with it), so a fit places the same
-        // layers as without the prefetch instead of moving one to the host for the staging copies
-        if (model.hparams.no_alloc) {
+        // left after the layers (the reserve drops the prefetch when the compute buffers do not fit with it or leave no headroom), so a fit
+        // places the same layers as without the prefetch instead of moving one to the host for the staging copies
+        // with the MoE cache the staging may live in lent cache slots and the cache sizing accounts for it: the measurement keeps it
+        if (model.hparams.no_alloc && !moe_cache) {
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
                 backend_buf_exp_size[i] -= std::min(backend_buf_exp_size[i], ggml_backend_sched_get_staging_size(sched.get(), backend_ptrs[i]));
             }
