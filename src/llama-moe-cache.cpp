@@ -410,6 +410,10 @@ struct llama_moe_cache::impl {
     std::vector<int32_t> seed_ids;
     std::vector<std::vector<int32_t>> refill; // [n_layer] experts of the last seed waiting for the lent slots to come back
     bool  refill_enabled = true;
+    // the routing of the end of a prompt that did not seed (see set_refill_counts): the slots that come back after it get its most used experts
+    std::vector<std::vector<int32_t>> refill_counts; // [n_layer]
+    bool   refill_routed   = true; // LLAMA_MOE_CACHE_REFILL_ROUTED=0: the slots get back the experts they held before they were lent
+    size_t n_refill_routed = 0;    // refills that used the routing of a prompt
     bool  verify_enabled = false; // LLAMA_MOE_CACHE_VERIFY=1 (debug): compare the cached experts with host memory
     stats stats_refill;
     std::vector<std::vector<int32_t>> seed_counts; // [n_layer] routing of an earlier ubatch of the prompt, see set_seed_counts
@@ -590,6 +594,8 @@ struct llama_moe_cache::impl {
         {
             const char * env = getenv("LLAMA_MOE_CACHE_REFILL");
             refill_enabled = env == nullptr || atoi(env) != 0;
+            env = getenv("LLAMA_MOE_CACHE_REFILL_ROUTED");
+            refill_routed = env == nullptr || atoi(env) != 0;
         }
         {
             const char * env = getenv("LLAMA_MOE_CACHE_VERIFY");
@@ -1917,9 +1923,62 @@ struct llama_moe_cache::impl {
         }
         g.lru.set_lent(0);
 
+        // the prompt that just ended did not seed the cache: the slots that came back get the experts its last large ubatch used most (over every
+        // layer of the group), then the experts they held before; the same number of uploads as without the routing, it only picks them
+        bool routed = false;
+        if (refill_routed && refill_enabled && !g.dev_newer && !refill_counts.empty()) {
+            struct cand { int32_t count; int32_t il; int32_t e; };
+            std::vector<cand> cands;
+            for (int32_t il : g.layers) {
+                if ((size_t) il >= refill_counts.size() || refill_counts[il].empty()) {
+                    continue;
+                }
+                const std::vector<int32_t> & c = refill_counts[il];
+                const int32_t * slots = g.lru.slot_map[il];
+                for (int32_t e = 0; e < (int32_t) c.size() && e < g.lru.n_expert; ++e) {
+                    if (c[e] > 0 && slots[e] < 0) {
+                        cands.push_back({ c[e], il, e });
+                    }
+                }
+            }
+            if (!cands.empty()) {
+                // ties go to the lower layer and expert, so the pick does not depend on the sort
+                std::sort(cands.begin(), cands.end(), [](const cand & a, const cand & b) {
+                    return a.count != b.count ? a.count > b.count : a.il != b.il ? a.il < b.il : a.e < b.e;
+                });
+                if (cands.size() > (size_t) n) {
+                    cands.resize(n);
+                }
+                std::vector<std::vector<int32_t>> pick(layers.size());
+                for (const cand & c : cands) {
+                    pick[c.il].push_back(c.e);
+                }
+                // the experts held before fill what the routing leaves, so the lists never exceed the slots that came back
+                size_t rest = (size_t) n - cands.size();
+                refill.resize(layers.size());
+                for (int32_t il : g.layers) {
+                    const int32_t * slots = g.lru.slot_map[il];
+                    for (int32_t e : refill[il]) {
+                        if (rest > 0 && slots[e] < 0 && std::find(pick[il].begin(), pick[il].end(), e) == pick[il].end()) {
+                            pick[il].push_back(e);
+                            rest--;
+                        }
+                    }
+                    refill[il] = std::move(pick[il]);
+                }
+                routed = true;
+            }
+        }
+        for (int32_t il : g.layers) {
+            if ((size_t) il < refill_counts.size()) {
+                refill_counts[il].clear();
+            }
+        }
+
         if (refill.empty() || g.dev_newer) {
             return;
         }
+        n_refill_routed += routed ? 1 : 0;
         // at most the n slots that came back are filled, so the refill never evicts an expert that stayed cached
         size_t budget = (size_t) n;
         for (int32_t il : g.layers) {
@@ -2503,6 +2562,15 @@ struct llama_moe_cache::impl {
         seed_counts.clear();
     }
 
+    void set_refill_counts(const ggml_tensor * w, const std::vector<int32_t> & counts) {
+        const auto it = bindings.find(w);
+        if (it == bindings.end() || !refill_routed) {
+            return;
+        }
+        refill_counts.resize(layers.size());
+        refill_counts[it->second.il] = counts;
+    }
+
     bool has_seed_counts() const {
         return std::any_of(seed_counts.begin(), seed_counts.end(), [](const std::vector<int32_t> & c) { return !c.empty(); });
     }
@@ -2565,6 +2633,10 @@ struct llama_moe_cache::impl {
         }
         if (n_lends > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu graphs used lent slots (at most %d slots lent), %zu experts refilled after them, %.2f MiB\n", tag, n_lends, lend_max, stats_refill.misses, stats_refill.bytes/1024.0/1024.0);
+            if (n_refill_routed > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu refills took the experts most used by the end of a prompt (LLAMA_MOE_CACHE_REFILL_ROUTED=0 to disable)\n", tag,
+                    n_refill_routed);
+            }
         }
         if (seed_check) {
             LLAMA_LOG_INFO("llama_moe_cache%s: seed check total: %zu expert copies verified, %zu mismatches\n", tag, seed_checked, seed_mismatches);
@@ -2794,6 +2866,10 @@ void llama_moe_cache::seed_end() {
 
 void llama_moe_cache::set_seed_counts(const ggml_tensor * w, const std::vector<int32_t> & counts) {
     pimpl->set_seed_counts(w, counts);
+}
+
+void llama_moe_cache::set_refill_counts(const ggml_tensor * w, const std::vector<int32_t> & counts) {
+    pimpl->set_refill_counts(w, counts);
 }
 
 const std::vector<int32_t> * llama_moe_cache::get_seed_counts(const ggml_tensor * w) const {

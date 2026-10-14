@@ -472,6 +472,7 @@ private:
     bool moe_cache_seed         = false;
     bool moe_cache_seed_prev    = false;
     bool moe_cache_record       = false;
+    bool moe_cache_seeded       = false; // the last ubatch seeded the MoE cache
     bool moe_cache_seed_enabled = true; // LLAMA_MOE_CACHE_SEED != 0
     bool moe_cache_seed_sync    = true;  // LLAMA_MOE_CACHE_SEED=2 (default): a prefetched ubatch seeds (earlier routing, else its own ids read first)
     bool moe_cache_seed_auto    = false; // LLAMA_MOE_CACHE_SEED unset, n_ubatch >= LLAMA_MOE_CACHE_SEED_AUTO: as LLAMA_MOE_CACHE_SEED=1
@@ -490,6 +491,8 @@ private:
 
     void moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_large, int64_t n_outputs_ub);
     void moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_outputs_ub);
+    // the end of a prompt that did not seed: the lent slots that come back get the experts its last large ubatch used most
+    void moe_cache_refill_from_ids();
 
     // ubatches of at least this many tokens prefetch the host weights on the scheduler copy queue, MoE experts whole [GGML_SCHED_PREFETCH_MIN_BATCH]
     // smaller ubatches (e.g. generation) copy only the routed experts or use the MoE cache, with no staging or event work

@@ -3430,6 +3430,10 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
             moe_cache->set_seed_counts(w, counts);
         }
     }
+    // a ubatch with outputs after a large one that did not seed ends the prompt (e.g. the server runs the last tokens as a separate batch)
+    if (cont && !moe_cache_ids.empty() && n_outputs_ub != 0 && !large && !moe_cache_seeded) {
+        moe_cache_refill_from_ids();
+    }
     moe_cache_ids.clear();
 
     // the last large ubatch of the batch seeds the cache even without outputs: a caller may run the last prompt tokens as a separate small batch (e.g. server checkpoints)
@@ -3461,12 +3465,17 @@ void llama_context::moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_ou
         moe_cache->seed_verify();
     }
 
+    moe_cache_seeded    = moe_cache_seed || moe_cache_seed_prev;
+    const bool recorded = moe_cache_record;
     moe_cache_seed      = false;
     moe_cache_seed_prev = false;
     moe_cache_record    = false;
 
     // the prompt ends at a ubatch with outputs (or a failed one), the next one may belong to another prompt
     if (n_outputs_ub != 0 || ubatch.n_seqs_unq != 1) {
+        if (n_outputs_ub != 0 && recorded && !moe_cache_seeded && !moe_cache_ids.empty()) {
+            moe_cache_refill_from_ids();
+        }
         moe_cache_seq      = -1;
         moe_cache_pos_next = -1;
         moe_cache_ids.clear();
@@ -3479,6 +3488,26 @@ void llama_context::moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_ou
     }
     moe_cache_seq      = ubatch.seq_id_unq[0];
     moe_cache_pos_next = pos_max + 1;
+}
+
+void llama_context::moe_cache_refill_from_ids() {
+    ggml_backend_sched_synchronize(sched.get());
+    std::vector<int32_t> ids_data;
+    std::vector<int32_t> counts;
+    for (const auto & [w, ids] : moe_cache_ids) {
+        if (ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids) || ids->buffer == nullptr) {
+            continue;
+        }
+        ids_data.resize(ggml_nelements(ids));
+        ggml_backend_tensor_get(ids, ids_data.data(), 0, ggml_nbytes(ids));
+        counts.assign(w->ne[2], 0);
+        for (const int32_t id : ids_data) {
+            if (id >= 0 && id < w->ne[2]) {
+                counts[id]++;
+            }
+        }
+        moe_cache->set_refill_counts(w, counts);
+    }
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {

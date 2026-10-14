@@ -157,6 +157,8 @@ public:
 
     // routing of an earlier large ubatch of the prompt, used to seed when the seeding ubatch copies all experts without reading its ids (counts[e] = tokens routed to e)
     void set_seed_counts(const ggml_tensor * w, const std::vector<int32_t> & counts);
+    // the routing of the last large ubatch of a prompt that did not seed: the lent slots that come back get its most used experts
+    void set_refill_counts(const ggml_tensor * w, const std::vector<int32_t> & counts);
     const std::vector<int32_t> * get_seed_counts(const ggml_tensor * w) const; // nullptr if there are none for the layer of w
     void clear_seed_counts();
     bool has_seed_counts() const;
