@@ -609,6 +609,10 @@ llama_context::llama_context(
         } else if (moe_cache_budget > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, moe_cache_budget, moe_cache_set);
         }
+        if (moe_cache) {
+            // the default hybrid path takes its fetch share from the decode threads, so it does not depend on timing
+            moe_cache->hybrid_set_threads((int32_t) cparams.n_threads, model.hparams.no_alloc);
+        }
         if (moe_cache && moe_cache_seed_auto) {
             moe_cache->prompts_do_not_seed();
         }

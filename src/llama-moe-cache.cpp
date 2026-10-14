@@ -558,7 +558,15 @@ struct llama_moe_cache::impl {
     bool  hybrid_probe = false; // the fetch share is measured before the first small batch (LLAMA_MOE_CACHE_FETCH not set)
     bool  hybrid_live  = false; // the graphs of small batches use the hybrid path
     float hybrid_share = 1.0f;  // share of the missing experts that are fetched and admitted, 1 = all (no hybrid path)
-    bool  hybrid_fixed = false; // the share is set by LLAMA_MOE_CACHE_FETCH: the state is reset for every request (see hybrid_reset)
+    bool  hybrid_fixed = false; // the share does not depend on timing: the state is reset for every request (see hybrid_reset)
+    // deterministic share (LLAMA_MOE_CACHE_HYBRID unset or 2): set from the decode threads by hybrid_set_threads, not measured
+    bool  hybrid_det   = false;
+    // default gate (LLAMA_MOE_CACHE_HYBRID unset): on only while the cache holds at most hybrid_max_frac of the host experts' bytes;
+    // measured on Qwen3.8-Flash-Next UD-IQ1_S: +27% decode at 3% of the experts, a tie at 14%, -13% at 24%, -20% at 68%
+    bool   hybrid_gate     = false;
+    double hybrid_max_frac = 0.10; // LLAMA_MOE_CACHE_HYBRID_MAX_FRAC
+    double cache_frac      = -1.0; // cached share of the host experts' bytes, -1 before the slots are sized
+    static constexpr double hybrid_k = 6.0; // see set_threads
     bool  overlap      = false; // LLAMA_MOE_CACHE_FETCH_OVERLAP: single token ubatches compute the hits while the missing experts are copied
 
     // overlap auto: the overlap saves the time of the experts computed beside the copies and costs a few nodes per layer, which is a loss
@@ -670,23 +678,34 @@ struct llama_moe_cache::impl {
             const char * env = getenv("LLAMA_MOE_CACHE_SEED_CHECK");
             seed_check = env != nullptr && atoi(env) != 0;
         }
-        // LLAMA_MOE_CACHE_HYBRID: 0 or unset = off, 1 = auto (trials, kept only if faster), 2 = on with the measured share;
-        // LLAMA_MOE_CACHE_FETCH=0..1 turns it on with that share (the same in every run, see hybrid_reset), unless LLAMA_MOE_CACHE_HYBRID=0
-        // off by default: the measured share and the trials depend on timing, so two runs could give different results
+        // LLAMA_MOE_CACHE_HYBRID: unset = on while the cache holds a small share of the experts (see hybrid_gate), 0 = off,
+        // 2 = on; both with a share from the decode threads (see hybrid_set_threads), so the same request gives the same output in every run;
+        // 1 = auto (timing trials, kept only if faster) and 3 = on with a share measured at the first small batch: both depend on timing,
+        // two runs can give different results;
+        // LLAMA_MOE_CACHE_FETCH=0..1 sets the share (the same in every run, see hybrid_reset), unless LLAMA_MOE_CACHE_HYBRID=0
         {
             const char * env   = getenv("LLAMA_MOE_CACHE_HYBRID");
             const char * env_f = getenv("LLAMA_MOE_CACHE_FETCH");
-            const int    mode  = env != nullptr ? atoi(env) : 0;
+            const char * env_x = getenv("LLAMA_MOE_CACHE_HYBRID_MAX_FRAC");
+            const int    mode  = env != nullptr ? atoi(env) : -1;
+            if (env_x != nullptr) {
+                hybrid_max_frac = std::max(0.0, atof(env_x));
+            }
             // LLAMA_MOE_CACHE_HYBRID=0 turns it off even with LLAMA_MOE_CACHE_FETCH set
-            hybrid = device_lookup && (env != nullptr ? mode > 0 : env_f != nullptr) && model.hparams.n_expert >= 4;
+            hybrid = device_lookup && mode != 0 && model.hparams.n_expert >= 4;
             if (hybrid && env_f != nullptr) {
                 hybrid_share = std::min(1.0f, std::max(0.0f, (float) atof(env_f)));
                 hybrid       = hybrid_share < 1.0f;
                 hybrid_live  = hybrid;
                 hybrid_fixed = hybrid;
-            } else {
-                hybrid_probe = hybrid;
+            } else if (hybrid && (mode == 1 || mode == 3)) {
+                hybrid_probe = true;
                 hybrid_auto  = mode == 1;
+            } else if (hybrid) {
+                // unset, 2 or another value: the share is set by hybrid_set_threads
+                hybrid_det   = true;
+                hybrid_fixed = true;
+                hybrid_gate  = mode < 0;
             }
         }
         {
@@ -938,6 +957,31 @@ struct llama_moe_cache::impl {
             throw std::runtime_error("MoE cache is too small to hold the experts of one token");
         }
 
+        // the share of the host experts' bytes the cache holds (the uncached groups count as host experts), it decides the default hybrid gate
+        {
+            double cached = 0.0;
+            double host   = 0.0;
+            for (const group & g : groups) {
+                size_t eb = 0;
+                for (const ggml_tensor * t : g.ref) {
+                    eb += t->nb[2];
+                }
+                cached += (double) g.n_slots*eb;
+                host   += (double) g.host_bytes;
+            }
+            cache_frac = host > 0.0 ? std::min(1.0, cached/host) : 1.0;
+        }
+        if (hybrid && hybrid_gate && cache_frac > hybrid_max_frac) {
+            // a large cache misses few experts: the host path then costs more (graph splits, slower warm-up) than the copies it saves
+            hybrid       = false;
+            hybrid_det   = false;
+            hybrid_fixed = false;
+        }
+        if (hybrid_gate && !model.hparams.no_alloc) {
+            LLAMA_LOG_INFO("%s: MoE cache holds %.1f%% of the host experts -> hybrid MoE cache %s by default (at most %.1f%%, LLAMA_MOE_CACHE_HYBRID_MAX_FRAC; LLAMA_MOE_CACHE_HYBRID=0 off, 2 on)\n",
+                __func__, 100.0*cache_frac, hybrid ? "on" : "off", 100.0*hybrid_max_frac);
+        }
+
         auto init_ctx = [](size_t n_tensors) {
             ggml_init_params params = {
                 /*.mem_size   =*/ n_tensors*ggml_tensor_overhead(),
@@ -1113,6 +1157,7 @@ struct llama_moe_cache::impl {
                 ov_wait      = -1;
                 hybrid       = false;
                 hybrid_fixed = false;
+                hybrid_det   = false;
                 hybrid_probe = false;
                 hybrid_live  = false;
                 hybrid_share = 1.0f; // no hybrid line in the stats
@@ -1163,8 +1208,8 @@ struct llama_moe_cache::impl {
                 }
                 if (hybrid && hybrid_probe) {
                     LLAMA_LOG_INFO("%s: hybrid MoE cache: the host computes the missing experts that are not fetched, fetch share measured at the first small batch, %s (LLAMA_MOE_CACHE_FETCH=0..1 to set the share)\n",
-                        __func__, hybrid_auto ? "auto: kept only if trials of small batches are faster (LLAMA_MOE_CACHE_HYBRID=1)" : "on (LLAMA_MOE_CACHE_HYBRID=2)");
-                } else if (hybrid) {
+                        __func__, hybrid_auto ? "auto: kept only if trials of small batches are faster (LLAMA_MOE_CACHE_HYBRID=1)" : "on (LLAMA_MOE_CACHE_HYBRID=3)");
+                } else if (hybrid && !hybrid_det) {
                     LLAMA_LOG_INFO("%s: hybrid MoE cache: the host computes the missing experts that are not fetched, fetch share = %.3f (LLAMA_MOE_CACHE_FETCH)\n", __func__, hybrid_share);
                 }
             }
@@ -1419,7 +1464,7 @@ struct llama_moe_cache::impl {
         return hybrid && hybrid_live && hybrid_share < 1.0f;
     }
 
-    // fixed share (LLAMA_MOE_CACHE_FETCH): which missing experts the host computes depends on the cached experts, the use counters and
+    // fixed share (LLAMA_MOE_CACHE_FETCH, or the default share from the threads): which missing experts the host computes depends on the cached experts, the use counters and
     // the rounding residual of the share, which all carry over from earlier batches; the context calls this before a batch whose
     // sequences are all empty (a new request) and after a state is read, so the output does not depend on earlier requests:
     // the cache starts empty as in a new process (the plain path computes the same with any cache contents, it is not reset)
@@ -1665,6 +1710,37 @@ struct llama_moe_cache::impl {
         }
         win_skip = std::max(0, win_skip - 1);
         win_done++;
+    }
+
+    // deterministic share (LLAMA_MOE_CACHE_HYBRID unset or 2): share = k/(k + n_threads), k = 6, rounded to 1/8, at least 1/8; the
+    // host path is off above 3/4; the timed probe (LLAMA_MOE_CACHE_HYBRID=3) found 0.25 with 24 threads (G4: 58-91 GB/s on the host,
+    // 31 GB/s upload) and 0.5 / 0.625 with 6 threads (L4: 13 / 10 GB/s), and the rounded share flipped between launches, which changed
+    // the greedy output; this one depends only on the thread count
+    void set_threads(int n_threads, bool quiet) {
+        if (!hybrid || !hybrid_det) {
+            return;
+        }
+        const int    n     = std::max(1, n_threads);
+        const double share = hybrid_k/(hybrid_k + n);
+        const float  q     = std::max(0.125f, (float) std::round(share*8.0)/8.0f);
+        if (q > 0.75f) {
+            hybrid       = false;
+            hybrid_det   = false;
+            hybrid_fixed = false;
+            hybrid_live  = false;
+            hybrid_share = 1.0f;
+        } else {
+            hybrid_share = q;
+            hybrid_live  = true;
+        }
+        if (!quiet) {
+            if (hybrid) {
+                LLAMA_LOG_INFO("llama_moe_cache: hybrid MoE cache: the host computes the missing experts that are not fetched, fetch share = %.3f "
+                    "(from %d decode threads; LLAMA_MOE_CACHE_FETCH=0..1 sets it)\n", hybrid_share, n);
+            } else {
+                LLAMA_LOG_INFO("llama_moe_cache: hybrid MoE cache off: %d decode threads would fetch a share of %.3f (at most 0.75)\n", n, q);
+            }
+        }
     }
 
     // fetch share: the host and the device finish at the same time when share*t_upload = (1 - share)*t_host per missing expert
@@ -2970,6 +3046,10 @@ bool llama_moe_cache::hybrid_probe_pending() const {
 
 void llama_moe_cache::hybrid_probe(ggml_backend_t backend_cpu) {
     pimpl->probe(backend_cpu);
+}
+
+void llama_moe_cache::hybrid_set_threads(int32_t n_threads, bool quiet) {
+    pimpl->set_threads(n_threads, quiet);
 }
 
 bool llama_moe_cache::hybrid_fixed() const {

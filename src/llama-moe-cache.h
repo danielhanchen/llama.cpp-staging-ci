@@ -75,7 +75,11 @@ public:
     bool hybrid_probe_pending() const;
     void hybrid_probe(ggml_backend_t backend_cpu);
 
-    // fixed share (LLAMA_MOE_CACHE_FETCH): the cache, the use counters and the residual of the share are reset before a batch whose
+    // default and forced hybrid path (LLAMA_MOE_CACHE_HYBRID unset or 2): the fetch share follows from the decode threads, call once after
+    // the constructor; the same inputs then give the same output in every run (see hybrid_fixed)
+    void hybrid_set_threads(int32_t n_threads, bool quiet);
+
+    // fixed share (LLAMA_MOE_CACHE_FETCH, or from the threads): the cache, the use counters and the residual of the share are reset before a batch whose
     // sequences are all empty and after a state is read, so the same request gives the same output as in a new process
     bool hybrid_fixed() const;
     void hybrid_reset();
