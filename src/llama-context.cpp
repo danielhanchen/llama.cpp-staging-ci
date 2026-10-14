@@ -420,6 +420,12 @@ llama_context::llama_context(
         } else if (GGML_SCHED_PREFETCH_MIN_BATCH) {
             prefetch_min_batch = std::max(1, atoi(GGML_SCHED_PREFETCH_MIN_BATCH));
         }
+
+        // by default only if n_ubatch gets the staging arena anyway: the shorter ubatches of a prompt then reuse it, while with a smaller
+        // n_ubatch the arena is reserved in place of weights (--fit keeps fewer of them on the device, which costs generation speed)
+        if (!GGML_SCHED_PREFETCH_DENSE_MIN && (int64_t) cparams.n_ubatch < prefetch_min_batch) {
+            prefetch_dense_min_batch = INT64_MAX;
+        }
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
