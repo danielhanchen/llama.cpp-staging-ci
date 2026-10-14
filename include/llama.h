@@ -933,7 +933,8 @@ extern "C" {
 
 // llama_state_seq_get_data_ext() returns without waiting for the device: the state is copied in stream order (after the
 // work already queued, before any later decode changes it) and dst is complete once the next llama_decode(),
-// llama_encode(), llama_synchronize() or llama_state_* call on the context returns. dst must stay valid until then.
+// llama_encode(), llama_synchronize() or llama_state_* call on the context returns; llama_memory_clear(), llama_memory_seq_rm()
+// and llama_memory_seq_cp() complete it before changing the memory. dst must stay valid until then.
 // Falls back to a synchronous copy where a backend cannot do it. Ignored with LLAMA_STATE_SEQ_FLAGS_ON_DEVICE.
 #define LLAMA_STATE_SEQ_FLAGS_ASYNC 4
 

@@ -508,6 +508,9 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+        if (memory) {
+            memory->wait_state_reads = [this]() { state_async_wait(); };
+        }
     }
 
     // init backends
@@ -3883,6 +3886,8 @@ private:
 };
 
 size_t llama_context::state_get_size() {
+    state_async_wait();
+
     llama_io_write_dummy io(false);
     try {
         return state_write_data(io);
@@ -3916,6 +3921,8 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
 static constexpr uint32_t io_magic = 0xaf143cd8;
 
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
+    state_async_wait();
+
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
         io.write(&io_magic, sizeof(io_magic));
@@ -3933,6 +3940,9 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         flags &= ~LLAMA_STATE_SEQ_FLAGS_ASYNC;
 
         if (!(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
+            // the previous save may still be copying into dst, and must be complete even if this one fails
+            state_async_wait();
+
             llama_io_write_host_async io(dst, size);
             try {
                 io.write(&io_magic, sizeof(io_magic));
@@ -5085,6 +5095,10 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
         return;
     }
 
+    if (data && mem->wait_state_reads) {
+        mem->wait_state_reads();
+    }
+
     mem->clear(data);
 }
 
@@ -5095,6 +5109,11 @@ bool llama_memory_seq_rm(
              llama_pos p1) {
     if (!mem) {
         return true;
+    }
+
+    // some memory types also clear the data of the removed sequence
+    if (mem->wait_state_reads) {
+        mem->wait_state_reads();
     }
 
     return mem->seq_rm(seq_id, p0, p1);
@@ -5108,6 +5127,10 @@ void llama_memory_seq_cp(
              llama_pos p1) {
     if (!mem) {
         return;
+    }
+
+    if (mem->wait_state_reads) {
+        mem->wait_state_reads();
     }
 
     mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
