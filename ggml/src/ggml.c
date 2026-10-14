@@ -3572,19 +3572,21 @@ struct ggml_tensor * ggml_moe_cache_join(
 void ggml_moe_cache_set_scores(
         struct ggml_tensor  * op,
         struct ggml_tensor  * scores,
-        int32_t               decay_q16) {
+        int32_t               grow_q16,
+        bool                  advance) {
     GGML_ASSERT(op->op == GGML_OP_MOE_CACHE_LOOKUP);
     const int mode = ggml_get_op_params_i32(op, 10);
     GGML_ASSERT(mode == 0 || mode == 1);
     GGML_ASSERT(scores->type == GGML_TYPE_I32 && ggml_is_contiguous(scores));
     GGML_ASSERT(scores->ne[0] == op->src[1]->ne[0] && scores->ne[1] == op->src[1]->ne[1]); // the shape of the slot map
-    GGML_ASSERT(decay_q16 > 0 && decay_q16 <= 65536);
+    GGML_ASSERT(grow_q16 > 65536 && grow_q16 <= 2*65536);
 
     // after the banks (lookup) or the counters (assign)
     const int i = mode == 0 ? 3 + ggml_get_op_params_i32(op, 1) : 4;
     GGML_ASSERT(i < GGML_MAX_SRC && op->src[i] == NULL);
     op->src[i] = scores;
-    ggml_set_op_params_i32(op, 13, decay_q16);
+    ggml_set_op_params_i32(op, 13, grow_q16);
+    ggml_set_op_params_i32(op, 14, advance ? 1 : 0);
 }
 
 // ggml_out_prod

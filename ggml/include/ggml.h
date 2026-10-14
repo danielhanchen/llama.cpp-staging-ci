@@ -1559,13 +1559,15 @@ extern "C" {
 
     // decayed-count eviction for a ggml_moe_cache_lookup or ggml_moe_cache_assign (op) instead of the CLOCK
     // scores: I32 [n_expert, n_layer], decayed use counter of each expert of each layer (updated in place), also kept for the
-    // experts that are not cached; each lookup of layer il first multiplies the row il by decay_q16/65536 (integer), then adds
-    // 1024 for each distinct selected expert; a missing expert evicts the lowest counter among the next 64 slots of the hand that
-    // this lookup does not use (empty slots first, ties: the first in hand order)
+    // experts that are not cached, as growing weights: each distinct selected expert adds the weight w (state[7]); a lookup with
+    // advance first multiplies w by grow_q16/65536 (integer, once per token: the first layer of the cache group), and halves every
+    // counter and w when w reaches 2^22, so every counter decays by 65536/grow_q16 per token; a missing expert evicts the lowest
+    // counter among the next 64 slots of the hand that this lookup does not use (empty slots first, ties: the first in hand order)
     GGML_API void ggml_moe_cache_set_scores(
             struct ggml_tensor  * op,
             struct ggml_tensor  * scores,
-            int32_t               decay_q16);
+            int32_t               grow_q16,
+            bool                  advance);
 
     // A: m columns, n rows,
     // B: p columns, n rows,
