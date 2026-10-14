@@ -1012,6 +1012,11 @@ struct ggml_backend_sched_prefetch {
     size_t ext_offset;
     size_t ext_size;
     bool   lending;   // the user lent memory for the last graph, it is told when the memory is no longer used
+    // the prefetched copies placed in lent memory (sorted): with the graph allocator in lent memory too, the buffer alone does not tell
+    // a prefetched copy from a graph tensor (e.g. the copy of an input from another backend, which must not go through the copy queue)
+    const struct ggml_tensor ** lent_copies;
+    int    n_lent_copies;
+    int    lent_copies_capacity;
 };
 
 // CPU/GPU split overlap state of a device backend [GGML_SCHED_OVERLAP]
@@ -2832,8 +2837,9 @@ static void ggml_backend_sched_lend_end(ggml_backend_sched_t sched, int backend_
     if (pf->lending && sched->callback_lend != NULL) {
         sched->callback_lend(sched->backends[backend_id], NULL, 0, sched->pf_depth, false, sched->callback_lend_user_data);
     }
-    pf->lending     = false;
-    pf->n_lent_bufs = 0;
+    pf->lending       = false;
+    pf->n_lent_bufs   = 0;
+    pf->n_lent_copies = 0;
     pf->lent        = 0;
 }
 
@@ -2863,8 +2869,9 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         sched->pf[b].need    = 0;
         sched->pf[b].staging = 0;
         if (!dry) {
-            sched->pf[b].n_lent_bufs = 0;
-            sched->pf[b].lent        = 0;
+            sched->pf[b].n_lent_bufs   = 0;
+            sched->pf[b].n_lent_copies = 0;
+            sched->pf[b].lent          = 0;
         }
     }
     for (int i = 0; i < sched->n_splits; i++) {
@@ -3244,6 +3251,12 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
                     enum ggml_status st = ggml_backend_tensor_alloc(buf, input_cpy, (char *) ggml_backend_buffer_get_base(buf) + it->second.second);
                     ggml_backend_buffer_set_usage(buf, usage);
                     GGML_ASSERT(st == GGML_STATUS_SUCCESS);
+                    if (pf->n_lent_copies >= pf->lent_copies_capacity) {
+                        pf->lent_copies_capacity = std::max(64, 2*pf->lent_copies_capacity);
+                        pf->lent_copies = (const struct ggml_tensor **) realloc((void *) pf->lent_copies, pf->lent_copies_capacity*sizeof(pf->lent_copies[0]));
+                        GGML_ASSERT(pf->lent_copies != NULL);
+                    }
+                    pf->lent_copies[pf->n_lent_copies++] = input_cpy;
                 } else {
                     void * base = ggml_backend_buffer_get_base(pf->arena);
                     enum ggml_status st = ggml_backend_tensor_alloc(pf->arena, input_cpy, (char *) base + offset);
@@ -3255,6 +3268,7 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
             }
         }
         if (!dry) {
+            std::sort(pf->lent_copies, pf->lent_copies + pf->n_lent_copies);
             sched->pf_active = true;
         }
     }
@@ -3266,7 +3280,14 @@ static bool ggml_backend_sched_prefetch_is_bound(ggml_backend_sched_t sched, con
     }
     const struct ggml_backend_sched_prefetch * pf = &sched->pf[split->backend_id];
     const struct ggml_tensor * input_cpy = tensor_copy(const_cast<ggml_tensor *>(input), split->backend_id, sched->cur_copy);
-    return input_cpy->buffer != NULL && (input_cpy->buffer == pf->arena || ggml_backend_sched_is_lent(pf, input_cpy));
+    if (input_cpy->buffer == NULL) {
+        return false;
+    }
+    if (input_cpy->buffer == pf->arena) {
+        return true;
+    }
+    return ggml_backend_sched_is_lent(pf, input_cpy) &&
+        std::binary_search(pf->lent_copies, pf->lent_copies + pf->n_lent_copies, (const struct ggml_tensor *) input_cpy);
 }
 
 // the graph allocator failed with the staging arenas allocated: unbind the copies, free the arenas and disable prefetch, so the allocation can retry with that memory
@@ -3807,6 +3828,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         ggml_backend_sched_prefetch_release(sched, b);
         free(sched->pf[b].split_ids);
         free(sched->pf[b].lend_copies);
+        free((void *) sched->pf[b].lent_copies);
     }
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
