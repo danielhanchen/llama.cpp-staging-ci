@@ -3736,10 +3736,8 @@ static bool ggml_cuda_env_flag(const char * name);
 // norm_targets: the RMS_NORM + MUL outputs whose q8_1 copy the fused norm kernel writes.
 static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::unordered_set<const void *> & norm_targets) {
     norm_targets.clear();
-    static const bool disabled = [] {
-        const char * env = getenv("GGML_CUDA_DISABLE_Q8_1_CACHE");
-        return env != nullptr && atoi(env) != 0;
-    }();
+    // GGML_CUDA_DISABLE_FUSION=1 also turns it off, so that it restores the unfused path as a whole
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_Q8_1_CACHE") || ggml_cuda_env_flag("GGML_CUDA_DISABLE_FUSION");
     if (disabled) {
         return 0;
     }
