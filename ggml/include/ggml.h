@@ -1552,7 +1552,7 @@ extern "C" {
             int                   n_banks,
             bool                  overlap);
 
-    // waits for the copies of an overlapped ggml_moe_cache_fetch (a), result: a copy of a
+    // waits for the copies of an overlapped ggml_moe_cache_fetch (a), result: a (in place)
     GGML_API struct ggml_tensor * ggml_moe_cache_join(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);

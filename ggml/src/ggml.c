@@ -3555,7 +3555,8 @@ struct ggml_tensor * ggml_moe_cache_join(
         struct ggml_tensor  * a) {
     GGML_ASSERT(a->op == GGML_OP_MOE_CACHE_LOOKUP && ggml_get_op_params_i32(a, 10) == 2 && ggml_get_op_params_i32(a, 12) == 1);
 
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, a->ne[0], a->ne[1]);
+    // in place: the join only orders the graph after the copies
+    struct ggml_tensor * result = ggml_view_tensor(ctx, a);
 
     int32_t params[2 + 2*4 + 3] = { ggml_get_op_params_i32(a, 0), 0 };
     params[10] = 3; // join
