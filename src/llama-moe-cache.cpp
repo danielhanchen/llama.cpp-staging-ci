@@ -1666,29 +1666,37 @@ struct llama_moe_cache::impl {
         group & g = *gl;
         const bool guard = g.host_read;
 
-        // the graph allocator borrows only with LLAMA_MOE_CACHE_LEND=2 (experimental: outputs were seen to differ with the CUDA
-        // copy-queue kernel, see plans/impl_moe_vram_lend.md), by default it keeps its own buffer
+        // the graph allocator borrows only with LLAMA_MOE_CACHE_LEND=2 (opt-in, see plans/impl_moe_vram_lend.md), by default it keeps
+        // its own buffer
         std::vector<ggml_backend_sched_lend_copy> only;
         ggml_backend_sched_lend_copy * all = copies;
         const int n_all = n_copies;
-        if (lend_mode != 2 && n_copies > 0 && copies[0].ordinal < 0) {
-            only.assign(copies + 1, copies + n_copies);
+        // the graph allocation comes first, as n_graph entries with a negative ordinal (parts in different regions, see ggml_backend_sched_lend_copy)
+        int n_graph = 0;
+        while (n_graph < n_copies && copies[n_graph].src == nullptr && copies[n_graph].ordinal < 0) {
+            n_graph++;
+        }
+        const size_t graph_all = n_graph > 0 ? copies[0].size : 0; // bytes of the whole graph allocation
+        if (lend_mode != 2 && n_graph > 0) {
+            only.assign(copies + n_graph, copies + n_copies);
             copies   = only.data();
             n_copies = (int) only.size();
+            n_graph  = 0;
             if (n_copies == 0) {
                 return;
             }
         }
+        const size_t graph_need = n_graph > 0 ? graph_all : 0;
+        for (int i = 0; i < n_graph; ++i) {
+            copies[i].buffer = nullptr;
+            copies[i].offset = 0;
+            copies[i].size   = 0;
+        }
 
-        // the copies of `depth` consecutive splits are live together, the ones with a negative ordinal (graph allocator) all the time
+        // the copies of `depth` consecutive splits are live together, the graph allocation all the time
         size_t need  = 0;
-        size_t perm  = 0;
         size_t split = 0; // copies of the largest split
-        for (int i = 0; i < n_copies; ++i) {
-            if (copies[i].ordinal < 0) {
-                perm += copies[i].size;
-                continue;
-            }
+        for (int i = n_graph; i < n_copies; ++i) {
             size_t live = 0;
             size_t own  = 0;
             for (int j = i; j < n_copies && copies[j].ordinal < copies[i].ordinal + depth; ++j) {
@@ -1698,25 +1706,37 @@ struct llama_moe_cache::impl {
             need  = std::max(need, live);
             split = std::max(split, own);
         }
-        need += perm;
+        need += graph_need;
 
         // a prompt that seeds from its own ids holds the copies of a split in the graph allocation (see llama_context::sched_reserve_seed)
-        const size_t graph = (n_all > 0 && all[0].ordinal < 0 ? all[0].size : 0) + (seed_own ? split : 0);
+        const size_t graph = graph_all + (seed_own ? split : 0);
         if (lend_auto && !lend_decide(id, need, graph, dry)) {
             return;
         }
 
-        // the smallest number of slots that holds every copy, at most half of the slots (large batches also read and seed the cache)
-        // and with host lookups in the group the slots they need, plus the slot kept empty in front of the copies
-        const int32_t n_max = guard ? (int32_t) std::min<int64_t>(g.n_slots / 2, g.n_slots - g.host_need - 1) : g.n_slots / 2;
+        // the smallest number of slots that holds every copy (and the graph allocation): at most half of the slots for the copies alone
+        // (large batches also read and seed the cache), and with host lookups in the group the slots they need, plus the slot kept empty in
+        // front of the copies; with the graph allocation (never with host lookups, see above) every slot but those of one layer (a batch
+        // that looks up its experts in the cache needs up to all experts of a layer resident at once)
+        const int32_t n_keep = std::min<int32_t>(g.n_slots / 2, g.lru.n_expert + 1);
+        const int32_t n_max  = guard       ? (int32_t) std::min<int64_t>(g.n_slots / 2, g.n_slots - g.host_need - 1)
+                             : n_graph > 0 ? std::max<int32_t>(g.n_slots / 2, g.n_slots - n_keep)
+                             :               g.n_slots / 2;
         int32_t n = (int32_t) std::min<size_t>((need + g.expert_bytes - 1) / g.expert_bytes, (size_t) n_max + 1);
         const int32_t step = std::max<int32_t>(1, n / 16);
         std::vector<size_t> offsets(n_copies);
+        std::vector<size_t> part_sizes(n_graph);
         int32_t n_lend = 0;
-        for (; n <= n_max; n = n < n_max ? std::min(n + step, n_max) : n_max + 1) {
-            if (place(g, n, copies, n_copies, depth, guard, offsets)) {
-                n_lend = n;
-                break;
+        // the graph allocation in one part if any number of slots allows it (the graph allocator plans a split allocation less tightly);
+        // LLAMA_MOE_CACHE_LEND_PARTS=N > 1 (experimental): else in up to N bank tails
+        static const int max_parts = getenv("LLAMA_MOE_CACHE_LEND_PARTS") ? std::max(1, atoi(getenv("LLAMA_MOE_CACHE_LEND_PARTS"))) : 1;
+        const int32_t n0 = n;
+        for (int multi = 0; multi < (n_graph > 1 && max_parts > 1 ? 2 : 1) && n_lend == 0; ++multi) {
+            for (n = n0; n <= n_max; n = n < n_max ? std::min(n + step, n_max) : n_max + 1) {
+                if (place(g, n, copies, n_copies, n_graph, multi ? std::min(n_graph, max_parts) : 1, graph_need, depth, guard, offsets, part_sizes)) {
+                    n_lend = n;
+                    break;
+                }
             }
         }
         if (n_lend == 0) {
@@ -1727,8 +1747,14 @@ struct llama_moe_cache::impl {
         }
         ggml_backend_buffer_t buf = devices[id].buf.get();
         for (int i = 0; i < n_copies; ++i) {
+            if (i < n_graph && part_sizes[i] == 0) {
+                continue; // part not needed
+            }
             copies[i].buffer = buf;
             copies[i].offset = offsets[i];
+            if (i < n_graph) {
+                copies[i].size = part_sizes[i];
+            }
         }
         if (copies != all) {
             for (int i = 0; i < n_copies; ++i) {
@@ -1894,10 +1920,13 @@ struct llama_moe_cache::impl {
 
     // best-fit placement of the copies in the last n slots of every bank of g (and the extra slot after them)
     // a copy must not overlap the copies of the splits less than `depth` ordinals before it, which are live while it is written,
-    // nor a copy with a negative ordinal (live during the whole graph, placed first)
+    // nor the graph allocation (live during the whole graph, placed first): the first n_graph entries are its parts, at most max_parts
+    // and one per region (bank tail), part_sizes = their sizes (0 = unused); one part in the smallest region that holds it, else the
+    // largest regions with slack for the space the graph allocator cannot use at the end of each part
     // guard: the group is read through host lookups, which may read a little past the end of a slot (e.g. CUDA MMQ in the padding of the last
-    // row): the first lent slot and the slot after the last one stay free of copies
-    bool place(const group & g, int32_t n, const ggml_backend_sched_lend_copy * copies, int n_copies, int depth, bool guard, std::vector<size_t> & offsets) {
+    // row): the first lent slot and the slot after the last one stay free of copies (never with a graph allocation, see lend)
+    bool place(const group & g, int32_t n, const ggml_backend_sched_lend_copy * copies, int n_copies, int n_graph, int max_parts, size_t graph_need, int depth, bool guard,
+            std::vector<size_t> & offsets, std::vector<size_t> & part_sizes) {
         const device & d = devices[g.id];
         const uintptr_t base  = (uintptr_t) ggml_backend_buffer_get_base(d.buf.get());
         const size_t    align = ggml_backend_buft_get_alignment(d.buft);
@@ -1915,7 +1944,61 @@ struct llama_moe_cache::impl {
         struct live { size_t begin; size_t end; int ordinal; };
         std::vector<live> lv;
         std::vector<live> in_region;
-        for (int i = 0; i < n_copies; ++i) {
+
+        // the graph allocation
+        for (int i = 0; i < n_graph; ++i) {
+            part_sizes[i] = 0;
+            offsets[i]    = 0;
+        }
+        if (n_graph > 0 && graph_need > 0) {
+            std::vector<int> order(regions.size());
+            for (size_t r = 0; r < regions.size(); ++r) {
+                order[r] = (int) r;
+            }
+            auto avail = [&](int r) { return regions[r].end - std::min(regions[r].end, align_up(regions[r].begin)); };
+            std::sort(order.begin(), order.end(), [&](int x, int y) { return avail(x) > avail(y); });
+            // smallest region that holds it in one part
+            int one = -1;
+            for (int r : order) {
+                if (avail(r) >= graph_need) {
+                    one = r;
+                }
+            }
+            if (one >= 0) {
+                offsets[0]    = align_up(regions[one].begin);
+                part_sizes[0] = GGML_PAD(graph_need, align);
+            } else if (max_parts <= 1) {
+                return false;
+            } else {
+                // the tensors of a part never move to another one: the parts together need more than the allocation in one piece
+                const size_t slack = graph_need/4 + (size_t) 64*1024*1024;
+                size_t left = graph_need + slack;
+                int k = 0;
+                for (int r : order) {
+                    if (left == 0 || k >= max_parts) {
+                        break;
+                    }
+                    const size_t sz = std::min(avail(r), GGML_PAD(left, align)) / align * align;
+                    if (sz == 0) {
+                        continue;
+                    }
+                    offsets[k]    = align_up(regions[r].begin);
+                    part_sizes[k] = sz;
+                    left -= std::min(left, sz);
+                    k++;
+                }
+                if (left > 0) {
+                    return false;
+                }
+            }
+            for (int i = 0; i < n_graph; ++i) {
+                if (part_sizes[i] > 0) {
+                    lv.push_back({ offsets[i], offsets[i] + part_sizes[i], -1 });
+                }
+            }
+        }
+
+        for (int i = n_graph; i < n_copies; ++i) {
             const size_t size = copies[i].size;
             lv.erase(std::remove_if(lv.begin(), lv.end(), [&](const live & l) { return l.ordinal >= 0 && l.ordinal <= copies[i].ordinal - depth; }), lv.end());
 

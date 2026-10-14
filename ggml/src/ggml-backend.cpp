@@ -11,6 +11,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
+#include "ggml-alloc-ext.h"
 #include "ggml-impl.h"
 
 #include <assert.h>
@@ -918,6 +919,9 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #ifndef GGML_SCHED_MAX_BACKENDS
 #define GGML_SCHED_MAX_BACKENDS 16
 #endif
+
+// parts of the graph allocation in memory lent by the user (see ggml_backend_sched_lend_copy)
+#define GGML_SCHED_MAX_GRAPH_PARTS 4
 
 #ifndef GGML_SCHED_MAX_SPLIT_INPUTS
 #define GGML_SCHED_MAX_SPLIT_INPUTS 30
@@ -3058,8 +3062,11 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
             }
             pf->lend_copies[n_copies++] = lc;
         };
-        // the graph allocator: live during the whole graph
-        if (gsize[b] > 0) {
+        // the graph allocator: live during the whole graph, as GGML_SCHED_MAX_GRAPH_PARTS entries first with src = NULL, ordinal -1 and
+        // size = the bytes of the whole allocation; the user may place it in several parts, at most one per entry, and sets size to the
+        // size of the part (the graph allocator plans the parts in order, a tensor never spans two parts), unused entries keep buffer NULL
+        const int n_graph = gsize[b] > 0 ? GGML_SCHED_MAX_GRAPH_PARTS : 0;
+        for (int k = 0; k < n_graph; k++) {
             push({ NULL, gsize[b], -1, NULL, 0 });
         }
         for (int k = 0; k < pf->n_bound; k++) {
@@ -3093,20 +3100,42 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
 
         int c = 0;
         bool any = false;
-        if (gsize[b] > 0) {
-            const struct ggml_backend_sched_lend_copy & lc = pf->lend_copies[c++];
-            if (!dry && valid(lc)) {
-                ggml_gallocr_set_external(sched->galloc, b, lc.buffer, lc.offset, lc.size);
-                pf->ext_buf    = lc.buffer;
-                pf->ext_offset = lc.offset;
-                pf->ext_size   = lc.size;
+        if (n_graph > 0) {
+            ggml_backend_buffer_t gbuf = NULL;
+            size_t offs [GGML_SCHED_MAX_GRAPH_PARTS];
+            size_t sizes[GGML_SCHED_MAX_GRAPH_PARTS];
+            int n_parts = 0;
+            size_t total = 0;
+            bool ok = true;
+            for (int k = 0; k < n_graph; k++) {
+                const struct ggml_backend_sched_lend_copy & lc = pf->lend_copies[c++];
+                if (lc.buffer == NULL || lc.size == 0) {
+                    continue;
+                }
+                if (dry || !valid(lc) || (gbuf != NULL && lc.buffer != gbuf)) {
+                    ok = false;
+                    continue;
+                }
+                gbuf = lc.buffer;
+                offs [n_parts] = lc.offset;
+                sizes[n_parts] = lc.size;
+                total += lc.size;
+                n_parts++;
+            }
+            if (!dry && ok && n_parts > 0) {
+                ggml_gallocr_set_external_n(sched->galloc, b, gbuf, offs, sizes, n_parts);
+                // the first part (with more parts the list of the prefetched copies tells them apart, see ggml_backend_sched_prefetch_is_bound)
+                pf->ext_buf    = gbuf;
+                pf->ext_offset = offs[0];
+                pf->ext_size   = sizes[0];
                 pf->lent_all   = true;
                 ext[b] = true;
                 any    = true;
-                if (lc.size != pf->ext_prev) {
-                    GGML_LOG_INFO("%s: %s: graph allocation of %.2f MiB in lent memory (own compute buffer %.2f MiB)\n", __func__,
-                        ggml_backend_name(sched->backends[b]), lc.size / 1024.0 / 1024.0, ggml_gallocr_get_buffer_size(sched->galloc, b) / 1024.0 / 1024.0);
-                    pf->ext_prev = lc.size;
+                if (total != pf->ext_prev) {
+                    GGML_LOG_INFO("%s: %s: graph allocation of %.2f MiB in lent memory, %d part%s of %.2f MiB (own compute buffer %.2f MiB)\n", __func__,
+                        ggml_backend_name(sched->backends[b]), gsize[b] / 1024.0 / 1024.0, n_parts, n_parts > 1 ? "s" : "", total / 1024.0 / 1024.0,
+                        ggml_gallocr_get_buffer_size(sched->galloc, b) / 1024.0 / 1024.0);
+                    pf->ext_prev = total;
                 }
             }
         }
