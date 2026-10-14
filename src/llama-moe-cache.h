@@ -40,13 +40,13 @@ public:
     ggml_tensor * hybrid_assign(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch, bool & host) const;
     ggml_tensor * hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res, bool overlap) const;
 
-    // single token ubatches, on unless LLAMA_MOE_CACHE_FETCH_OVERLAP=0: the copies of the missing experts run beside the experts already
-    // cached (see ggml_moe_cache_fetch)
+    // single token ubatches, LLAMA_MOE_CACHE_FETCH_OVERLAP (unset/1 auto, 2 on, 0 off): the copies of the missing experts run beside the
+    // experts already cached (see ggml_moe_cache_fetch); true if the graph of a ubatch of n_ubatch tokens uses it now
     bool overlap(int64_t n_ubatch) const;
 
     // true if the graphs of small batches may use the hybrid path
     bool hybrid_active() const;
-    // graph key: 0 = plain lookups, 1 = lookups that keep the use counters, 2 = hybrid
+    // graph key: 0 = plain lookups, 1 = lookups that keep the use counters, 2 = hybrid, + 4 with the fetch overlap
     int  hybrid_mode() const;
 
     // the fetch share is measured once, before the first small batch: the host computes the experts of a layer with the decode threads
@@ -56,6 +56,12 @@ public:
     // auto mode: before the graph of each ubatch while the trial runs, after the previous ubatch finished (backends synchronized);
     // switches between the plain and the hybrid path, then keeps the faster one (see hybrid_active)
     bool hybrid_window_pending() const;
+
+    // fetch overlap auto (LLAMA_MOE_CACHE_FETCH_OVERLAP unset or 1): true while a trial runs or waits; the tick goes before the graph of
+    // every ubatch then, after the previous ubatch finished when overlap_tick_sync() (the backends are synchronized)
+    bool overlap_trial_pending() const;
+    bool overlap_tick_sync() const;
+    void overlap_tick(int64_t n_tokens);
     void hybrid_tick(int64_t n_tokens);
 
     // ggml_backend_sched lend callback for a ubatch of n_tokens: places the prefetched copies of a large batch and its graph allocation

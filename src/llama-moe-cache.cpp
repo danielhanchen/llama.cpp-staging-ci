@@ -410,6 +410,27 @@ struct llama_moe_cache::impl {
     float hybrid_share = 1.0f;  // share of the missing experts that are fetched and admitted, 1 = all (no hybrid path)
     bool  overlap      = false; // LLAMA_MOE_CACHE_FETCH_OVERLAP: single token ubatches compute the hits while the missing experts are copied
 
+    // overlap auto: the overlap saves the time of the experts computed beside the copies and costs a few nodes per layer, which is a loss
+    // when few experts are missing on a fast device; trials of 4 blocks of ov_block single token ubatches: plain, overlap, overlap, plain
+    // (a trend cancels out), the first ov_skip of a block not counted (the graph is built and captured again); kept only if the median
+    // of the overlap is at least ov_margin faster; trials again after ov_gap single token ubatches (doubled each time, at most
+    // ov_gap_max), as the misses change with the cache and the prompts
+    static constexpr int    ov_block   = 12;
+    static constexpr int    ov_skip    = 3;
+    static constexpr int    ov_first   = 8;
+    static constexpr int    ov_gap_max = 8192;
+    static constexpr double ov_margin  = 0.01;
+    bool    ov_auto   = false;
+    bool    ov_live   = false; // the graphs of single token ubatches use the overlap
+    int     ov_done   = -1;    // single token ubatches of the trial, -1 if there is no trial
+    int     ov_wait   = -1;    // single token ubatches until the next trial, -1 if there is none
+    int     ov_gap    = 256;
+    int     ov_n      = 0;     // trials done
+    int     ov_arm    = 0;     // path of the previous ubatch (1 = overlap)
+    int     ov_skipn  = 0;
+    int64_t ov_t_prev = -1;    // time of the previous counted single token ubatch, -1 if none
+    std::vector<int64_t> ov_t[2];
+
     // auto (LLAMA_MOE_CACHE_HYBRID=1): trials of 5 blocks of hybrid_block small batches: plain (warm-up,
     // not counted), plain, hybrid, hybrid, plain (a trend such as the cache warming up cancels out); the time from one small batch to the
     // next is credited to the path of the first, except for the first hybrid_skip batches after a change of path; the hybrid path is
@@ -498,14 +519,19 @@ struct llama_moe_cache::impl {
             verify_enabled = env != nullptr && atoi(env) != 0;
         }
 
-        // LLAMA_MOE_CACHE_FETCH_OVERLAP=0 (or the older LLAMA_MOE_CACHE_OVERLAP=0) disables it: small batches then copy the missing
-        // experts before the expert FFN of the layer; the results are the same either way (each slot is computed once, see build_moe_ffn)
+        // LLAMA_MOE_CACHE_FETCH_OVERLAP (or the older LLAMA_MOE_CACHE_OVERLAP): 0 = off, single token ubatches copy the missing experts
+        // before the expert FFN of the layer; unset or 1 = auto, kept while trials find it faster (see ov_tick); 2 = on
+        // the results are the same either way (each slot is computed once, see build_moe_ffn), only the speed depends on the choice
         {
             const char * env = getenv("LLAMA_MOE_CACHE_FETCH_OVERLAP");
             if (env == nullptr) {
                 env = getenv("LLAMA_MOE_CACHE_OVERLAP");
             }
-            overlap = device_lookup && (env == nullptr || atoi(env) != 0) && model.hparams.n_expert >= 4;
+            const int mode = env != nullptr ? atoi(env) : 1;
+            overlap = device_lookup && mode != 0 && model.hparams.n_expert >= 4;
+            ov_auto = overlap && mode == 1;
+            ov_live = overlap && !ov_auto;
+            ov_wait = ov_auto ? ov_first : -1;
         }
 
         // only cache layers that keep all of their experts in host memory, on the device the layer is assigned to
@@ -782,13 +808,17 @@ struct llama_moe_cache::impl {
             }
             if (devs.size() != 1) {
                 overlap      = false;
+                ov_auto      = false;
+                ov_live      = false;
+                ov_wait      = -1;
                 hybrid       = false;
                 hybrid_probe = false;
                 hybrid_live  = false;
                 hybrid_share = 1.0f; // no hybrid line in the stats
             } else if (!model.hparams.no_alloc) {
                 if (overlap) {
-                    LLAMA_LOG_INFO("%s: MoE cache: single token ubatches compute the cached experts while the missing ones are copied (LLAMA_MOE_CACHE_FETCH_OVERLAP=0 to disable)\n", __func__);
+                    LLAMA_LOG_INFO("%s: MoE cache: single token ubatches compute the cached experts while the missing ones are copied, %s (LLAMA_MOE_CACHE_FETCH_OVERLAP=0 off, 2 on)\n", __func__,
+                        ov_auto ? "auto: kept while trials find it faster" : "on");
                 }
                 if (hybrid && hybrid_probe) {
                     LLAMA_LOG_INFO("%s: hybrid MoE cache: the host computes the missing experts that are not fetched, fetch share measured at the first small batch, %s (LLAMA_MOE_CACHE_FETCH=0..1 to set the share)\n",
@@ -1029,11 +1059,71 @@ struct llama_moe_cache::impl {
     // the overlap only for single token ubatches: their expert matrix products (mul_mat_vec_q) compute every slot on its own, so
     // splitting the slots between two chains gives the same results; larger ubatches may pick kernels whose tiling depends on the slots
     bool overlap_batch(int64_t n_ubatch) const {
-        return overlap && n_ubatch == 1;
+        return overlap && ov_live && n_ubatch == 1;
+    }
+
+    bool ov_pending() const {
+        return ov_auto && (ov_done >= 0 || ov_wait >= 0);
+    }
+
+    // overlap auto trial, called before the graph of every ubatch while a trial runs or waits; while a trial runs, after the previous
+    // ubatch finished (the time from one single token ubatch to the next is credited to the path of the first)
+    void ov_tick(int64_t n_tokens) {
+        if (!ov_pending()) {
+            return;
+        }
+        const bool single = n_tokens == 1;
+        if (ov_done < 0) {
+            if (!single || --ov_wait > 0) {
+                return;
+            }
+            ov_wait   = -1;
+            ov_done   = 0;
+            ov_t_prev = -1;
+        }
+        const int64_t now = ggml_time_us();
+        if (ov_t_prev >= 0 && single) {
+            ov_t[ov_arm].push_back(now - ov_t_prev);
+        }
+        ov_t_prev = -1;
+        if (!single) {
+            return; // the next interval would include this ubatch
+        }
+        if (ov_done >= 4*ov_block) {
+            auto median = [](std::vector<int64_t> v) {
+                std::sort(v.begin(), v.end());
+                return v.empty() ? 0.0 : (double) v[v.size()/2];
+            };
+            ov_done = -1;
+            const double t_plain = median(ov_t[0]);
+            const double t_ov    = median(ov_t[1]);
+            const bool   on      = ov_t[0].size() >= 4 && ov_t[1].size() >= 4 && t_ov < (1.0 - ov_margin)*t_plain;
+            ov_n++;
+            LLAMA_LOG_INFO("llama_moe_cache: fetch overlap auto (trial %d): %.3f ms per token without, %.3f ms with (medians of %zu and %zu) -> %s\n",
+                ov_n, t_plain/1e3, t_ov/1e3, ov_t[0].size(), ov_t[1].size(), on ? "on" : "off");
+            ov_t[0].clear();
+            ov_t[1].clear();
+            ov_live = on;
+            ov_wait = ov_gap;
+            ov_gap  = std::min(2*ov_gap, ov_gap_max);
+            return;
+        }
+        const int blk = ov_done/ov_block;
+        const int arm = blk == 1 || blk == 2;
+        if (arm != ov_arm || ov_done == 0) {
+            ov_skipn = ov_skip;
+        }
+        ov_arm  = arm;
+        ov_live = arm != 0;
+        if (ov_skipn == 0) {
+            ov_t_prev = now;
+        }
+        ov_skipn = std::max(0, ov_skipn - 1);
+        ov_done++;
     }
 
     int hybrid_mode() const {
-        return !(hybrid || overlap) ? 0 : hybrid_active() ? 2 : 1;
+        return (!hybrid ? 0 : hybrid_active() ? 2 : 1) + (ov_live ? 4 : 0);
     }
 
     // auto trial, called before the graph of every ubatch while a trial runs or waits, after the previous ubatch finished
@@ -2143,6 +2233,18 @@ bool llama_moe_cache::hybrid_probe_pending() const {
 
 void llama_moe_cache::hybrid_probe(ggml_backend_t backend_cpu) {
     pimpl->probe(backend_cpu);
+}
+
+bool llama_moe_cache::overlap_trial_pending() const {
+    return pimpl->ov_pending();
+}
+
+bool llama_moe_cache::overlap_tick_sync() const {
+    return pimpl->ov_done >= 0 || pimpl->ov_wait == 1;
+}
+
+void llama_moe_cache::overlap_tick(int64_t n_tokens) {
+    pimpl->ov_tick(n_tokens);
 }
 
 bool llama_moe_cache::hybrid_window_pending() const {
