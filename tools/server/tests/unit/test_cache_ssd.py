@@ -29,7 +29,8 @@ def make_server(root, preset=ServerPreset.tinyllama2):
     return server
 
 
-def complete(server, prompt, timeout=DEFAULT_REQUEST_TIMEOUT, **kw):
+# tiny models answer in about a second: a short timeout makes a stuck server fail the test instead of hanging it
+def complete(server, prompt, timeout=120, **kw):
     data = {"prompt": prompt, "cache_prompt": True, "n_probs": 4}
     data.update(kw)
     res = server.make_request("POST", "/completion", data=data, timeout=timeout)
