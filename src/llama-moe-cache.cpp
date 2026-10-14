@@ -543,11 +543,12 @@ struct llama_moe_cache::impl {
     // device lookup for small batches: the selected experts stay on the device and the misses are read from mapped host memory
     bool device_lookup = false; // requested, see LLAMA_MOE_CACHE_DEVICE; each group then checks its device
 
-    // eviction policy (LLAMA_MOE_CACHE_POLICY): clock (default) = CLOCK on the device, LRU on the host; decay = decayed use counters
-    // of every expert, the misses evict the lowest ones (see moe_cache_lru and ggml_moe_cache_set_scores), for the groups that cache
-    // less than decay_max_share of their experts, the others keep clock (measured on a G4: 1.04-1.08x decode at 15-16% cached, neutral
-    // at 38-44%, 0.986x with more misses at 41% on Qwen3.8-Flash-Next, more misses at 60%)
-    bool   policy_decay    = false;
+    // eviction policy (LLAMA_MOE_CACHE_POLICY): decay (default) = decayed use counters of every expert, the misses evict the lowest
+    // ones (see moe_cache_lru and ggml_moe_cache_set_scores), for the groups that cache less than decay_max_share of their experts, the
+    // others keep clock; clock = CLOCK on the device, LRU on the host for every group (measured decode vs clock: gemma-4 8 GB 1.084x
+    // on a G4 and 1.051x on a T4, Qwen3.6 8 GB 1.04x on a G4, neutral at 38-44% cached, 0.986x with more misses at 41% on
+    // Qwen3.8-Flash-Next, which the 30% gate keeps on clock; greedy outputs identical)
+    bool   policy_decay    = true;
     double half_life       = 0.0; // LLAMA_MOE_CACHE_HALF_LIFE, in tokens; 0 = clamp(64 x cached share, 8, 64)
     double decay_max_share = 0.3; // LLAMA_MOE_CACHE_DECAY_MAX_SHARE
     std::vector<std::pair<void (*)(void *), void *>> mapped; // host buffers mapped by the cache, with the function that unmaps them
@@ -651,10 +652,10 @@ struct llama_moe_cache::impl {
         }
         {
             const char * env = getenv("LLAMA_MOE_CACHE_POLICY");
-            if (env != nullptr && strcmp(env, "decay") == 0) {
-                policy_decay = true;
-            } else if (env != nullptr && strcmp(env, "clock") != 0 && env[0] != '\0') {
-                LLAMA_LOG_WARN("%s: unknown LLAMA_MOE_CACHE_POLICY=%s (clock or decay), using clock\n", __func__, env);
+            if (env != nullptr && strcmp(env, "clock") == 0) {
+                policy_decay = false;
+            } else if (env != nullptr && strcmp(env, "decay") != 0 && env[0] != '\0') {
+                LLAMA_LOG_WARN("%s: unknown LLAMA_MOE_CACHE_POLICY=%s (clock or decay), using decay\n", __func__, env);
             }
             env = getenv("LLAMA_MOE_CACHE_HALF_LIFE");
             if (env != nullptr) {
