@@ -7927,6 +7927,134 @@ struct test_mul_mat_vec_shared_src1 : public test_case {
     }
 };
 
+// A contiguous activation and a view of it with a zero row stride (every row is row 0) consumed by two quantized
+// mat-vec products: same data pointer and shape, different contents, so the q8_1 copy of one must not be used for the other.
+struct test_mul_mat_vec_shared_src1_stride0 : public test_case {
+    const ggml_type type;
+    const int64_t m; // tokens
+    const int64_t n;
+    const int64_t k;
+    const bool view_first; // the zero-stride view is consumed before the contiguous activation
+    const bool norm;       // activation produced by a (fused) rms_norm + mul
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, m, n, k, view_first, norm);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_VEC_SHARED_SRC1";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_mul_mat_vec_shared_src1_stride0(ggml_type type, int64_t m, int64_t n, int64_t k, bool view_first, bool norm)
+        : type(type), m(m), n(n), k(k), view_first(view_first), norm(norm) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        ggml_tensor * wa = ggml_new_tensor_2d(ctx, type, k, n);
+        ggml_tensor * wb = ggml_new_tensor_2d(ctx, type, k, n);
+
+        ggml_tensor * act;
+        if (norm) {
+            ggml_tensor * w_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+            act = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w_norm);
+        } else {
+            act = ggml_scale(ctx, x, 0.5f);
+        }
+        ggml_tensor * rep = ggml_view_2d(ctx, act, k, m, 0, 0);
+
+        ggml_tensor * a = ggml_mul_mat(ctx, wa, act);
+        ggml_tensor * b = ggml_mul_mat(ctx, wb, rep);
+        ggml_tensor * out = view_first ? ggml_add(ctx, b, a) : ggml_add(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src == nullptr) { // the zero-stride view is smaller than its number of elements
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        return 5e-3;
+    }
+};
+
+// Two MUL_MAT_ID that take the per-expert fallback (more tokens than mul_mat_vec_q handles, a type without MMQ) with
+// the same routing but different activations: the per-expert mat-vec products read slices of a temporary buffer that
+// the second op gets again, while the q8_1 activation cache is active for the two dense consumers of act.
+struct test_mul_mat_id_fallback_shared_src1 : public test_case {
+    const ggml_type type;
+    const int64_t m; // tokens
+    const int64_t n;
+    const int64_t k;
+
+    static constexpr int n_mats = 4;
+    static constexpr int n_used = 2;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, m, n, k);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_FALLBACK_SHARED_SRC1";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_mul_mat_id_fallback_shared_src1(ggml_type type, int64_t m, int64_t n, int64_t k)
+        : type(type), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 8);
+        ggml_tensor * wa  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, k, n);
+        ggml_tensor * wb  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, k, n);
+        ggml_tensor * we  = ggml_new_tensor_3d(ctx, type, k, n, n_mats);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, m);
+        ggml_tensor * y1  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, m);
+        ggml_tensor * y2  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, m);
+
+        ggml_tensor * e1 = ggml_mul_mat_id(ctx, we, y1, ids);
+        ggml_tensor * e2 = ggml_mul_mat_id(ctx, we, y2, ids);
+
+        // an activation with two mul_mat_vec_q consumers: turns the q8_1 cache on, its result does not change out
+        ggml_tensor * act = ggml_scale(ctx, x, 0.5f);
+        ggml_tensor * s   = ggml_sum(ctx, ggml_add(ctx, ggml_mul_mat(ctx, wa, act), ggml_mul_mat(ctx, wb, act)));
+
+        ggml_tensor * out = ggml_add(ctx, ggml_add(ctx, e1, e2), ggml_scale(ctx, s, 0.0f));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            // token i uses experts i and i + 1 (mod n_mats): at most 8 tokens per expert for m <= 16, so the per-expert
+            // products of the fallback are mul_mat_vec_q
+            std::vector<int32_t> data(n_used*m);
+            for (int64_t i = 0; i < m; ++i) {
+                for (int j = 0; j < n_used; ++j) {
+                    data[i*n_used + j] = (i + j) % n_mats;
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+        }
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -12102,6 +12230,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
+        for (int64_t m : { 2, 8 }) {
+            for (bool view_first : { false, true }) {
+                for (bool norm : { false, true }) {
+                    test_cases.emplace_back(new test_mul_mat_vec_shared_src1_stride0(type, m, 64, 256, view_first, norm));
+                }
+            }
+        }
+    }
+    for (int64_t m : { 9, 16 }) {
+        test_cases.emplace_back(new test_mul_mat_id_fallback_shared_src1(GGML_TYPE_IQ1_M, m, 64, 256));
     }
 
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.
