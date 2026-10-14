@@ -753,6 +753,9 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_prefetch_callback(sched.get(), sched_prefetch_mode, this);
     // the hybrid MoE cache computes the missing experts on the host while the device computes the cached ones
     ggml_backend_sched_set_overlap(sched.get(), moe_cache && moe_cache->hybrid_active());
+    if (moe_cache) {
+        ggml_backend_sched_set_lend_callback(sched.get(), sched_lend, this);
+    }
 }
 
 void llama_context::sched_reserve() {
@@ -849,6 +852,15 @@ void llama_context::sched_reserve() {
         n_nodes_tg         = ggml_graph_n_nodes(gf);
         n_inputs_tg        = get_gf_res_reserve()->inputs.size();
         n_input_tensors_tg = this->n_input_tensors;
+
+        // the MoE cache lends memory to larger graphs (see llama_moe_cache::lend), the compute buffer must hold without it the small
+        // batches whose experts are all read from the cache (larger ones copy experts, like the prompts, and may borrow)
+        const uint32_t n_tokens_small = moe_cache ? std::min<uint32_t>(n_tokens, (uint32_t) moe_cache->n_tokens_cached()) : 0;
+        if (moe_cache && moe_cache->lends_graph() && !model.hparams.no_alloc && n_tokens_small > n_seqs && n_tokens_small % n_seqs == 0) {
+            if (!graph_reserve(n_tokens_small, n_seqs, std::min(n_tokens_small, cparams.n_outputs_max), mctx.get())) {
+                throw std::runtime_error("failed to allocate compute small batch buffers");
+            }
+        }
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
@@ -870,6 +882,17 @@ void llama_context::sched_reserve() {
 
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
+        }
+
+        // the ubatch that seeds the MoE cache keeps the experts it copies in the graph allocation (see sched_copy_all_experts), it needs
+        // more memory: when the cache lends memory to large graphs, this one must fit too, else the compute buffer holds it from the start
+        if (moe_cache && moe_cache->lends_graph() && moe_cache_seed_enabled && !model.hparams.no_alloc && n_tokens > llama_moe_cache::n_small_max) {
+            moe_cache_seed = true;
+            gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+            moe_cache_seed = false;
+            if (!gf) {
+                throw std::runtime_error("failed to allocate compute pp buffers");
+            }
         }
     }
 
@@ -2891,6 +2914,13 @@ ggml_backend_sched_prefetch_mode llama_context::sched_prefetch_mode(const ggml_t
     }
 
     return GGML_BACKEND_SCHED_PREFETCH_ASYNC;
+}
+
+void llama_context::sched_lend(ggml_backend_t backend, ggml_backend_sched_lend_copy * copies, int n_copies, int depth, bool dry, void * user_data) {
+    auto * lctx = static_cast<llama_context *>(user_data);
+    if (lctx->moe_cache) {
+        lctx->moe_cache->lend(backend, copies, n_copies, depth, dry, lctx->prefetch_n_tokens);
+    }
 }
 
 bool llama_context::sched_copy_all_experts(const ggml_tensor * src, const ggml_tensor * ids) const {

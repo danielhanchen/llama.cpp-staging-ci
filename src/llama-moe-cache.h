@@ -54,6 +54,17 @@ public:
     bool hybrid_window_pending() const;
     void hybrid_tick(int64_t n_tokens);
 
+    // ggml_backend_sched lend callback for a ubatch of n_tokens: places the prefetched copies of a large batch and its graph allocation
+    // in slots taken from the cache while they are used (never for small batches, which may use every slot)
+    void lend(ggml_backend_t backend, ggml_backend_sched_lend_copy * copies, int n_copies, int depth, bool dry, int64_t n_tokens);
+
+    // the cache may lend slots (LLAMA_MOE_CACHE_LEND)
+    bool lends() const;
+    bool lends_graph() const; // the graph allocator may borrow too (LLAMA_MOE_CACHE_LEND=2)
+
+    // the largest ubatch (at most n_small_max tokens) whose experts every cached layer reads from the cache without copying them
+    int64_t n_tokens_cached() const;
+
     // device copy of a small per-expert host tensor (scale or bias) of a cached layer, nullptr if there is none
     ggml_tensor * get_resident(const ggml_tensor * t) const;
 
