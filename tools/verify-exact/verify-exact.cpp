@@ -15,6 +15,8 @@
 //                                snapshots of a speculative target (VERIFY_RS is then ignored)
 //        VERIFY_REF_RS=0         recurrent snapshots of the reference context (two contexts)
 //        VERIFY_PROMPT_PAD=N     repeat the prompt until it has at least N tokens (to cross a 256 cell boundary)
+//        VERIFY_REJECT=1         the verify batches carry wrong drafts after an accepted prefix (cycling 0..w-1 accepted),
+//                                which are removed from the memory before the next batch (the rollback of a speculative step)
 //        VERIFY_DUMP=1           on the first mismatching width, compare every graph node of the first verify batch
 //                                against the single token decodes and name the first node whose row differs
 // exit code: 0 = every row byte-equal, 1 = a row differs, 2 = setup error
@@ -159,6 +161,7 @@ int main(int argc, char ** argv) {
     const bool one_ctx   = env_int("VERIFY_ONE_CTX", 0) != 0;
     const int  pad_to    = env_int("VERIFY_PROMPT_PAD", 0);
     const bool want_dump = env_int("VERIFY_DUMP", 0) != 0;
+    const bool reject    = env_int("VERIFY_REJECT", 0) != 0;
 
     dump_state dump;
     params.cb_eval           = dump_cb;
@@ -288,11 +291,16 @@ int main(int argc, char ** argv) {
         llama_batch batch = llama_batch_init(std::max(w, 1), 0, 1);
         int n_eq = 0, n_rows = 0, first_bad = -1, n_argmax_bad = 0;
         double max_diff = 0.0;
-        for (int t0 = 0; t0 < n_gen; t0 += w) {
+        int n_chunk = 0;
+        for (int t0 = 0; t0 < n_gen; ) {
             const int n = std::min(w, n_gen - t0);
+            // VERIFY_REJECT: the drafts after the first a are wrong (a cycles over 0..n-1), as when a speculative step rejects
+            // them: rows 0..a are checked, the rest is removed from the memory and the next batch starts at the bonus token
+            const int a = reject ? n_chunk % n : n - 1;
+            n_chunk++;
             batch_clear(batch);
             for (int i = 0; i < n; ++i) {
-                batch_add(batch, toks[t0 + i], P + t0 + i, true);
+                batch_add(batch, i <= a ? toks[t0 + i] : (toks[t0 + i] + 1) % n_vocab, P + t0 + i, true);
             }
             const bool do_dump = want_dump && !dumped && t0 == 0 && n > 1 && !ref_nodes.empty();
             dump.enabled = do_dump;
@@ -307,7 +315,7 @@ int main(int argc, char ** argv) {
                 return 2;
             }
             bool batch_bad = false;
-            for (int i = 0; i < n; ++i) {
+            for (int i = 0; i <= a; ++i) {
                 const float * lg = llama_get_logits_ith(ctx_ver, i);
                 const float * rf = ref.data() + (size_t) (t0 + i)*n_vocab;
                 n_rows++;
@@ -395,11 +403,16 @@ int main(int argc, char ** argv) {
                     printf("  node dump: no node with a token dimension differs (%zu nodes captured)\n", dump.nodes.size());
                 }
             }
+            if (a + 1 < n && !llama_memory_seq_rm(llama_get_memory(ctx_ver), 0, P + t0 + a + 1, -1)) {
+                fprintf(stderr, "seq_rm of the rejected drafts failed at step %d\n", t0);
+                return 2;
+            }
+            t0 += a + 1;
         }
         llama_batch_free(batch);
         const bool eq = n_eq == n_rows;
         all_equal &= eq;
-        printf("width %d: %d/%d rows byte-equal%s", w, n_eq, n_rows, eq ? "" : " MISMATCH");
+        printf("width %d%s: %d/%d rows byte-equal%s", w, reject ? " (rejections)" : "", n_eq, n_rows, eq ? "" : " MISMATCH");
         if (!eq) {
             printf(" (first at step %d = position %d, max |diff| %.3g, argmax differs in %d rows)", first_bad, P + first_bad,
                     max_diff, n_argmax_bad);
