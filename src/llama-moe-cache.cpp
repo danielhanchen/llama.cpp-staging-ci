@@ -421,6 +421,23 @@ struct llama_moe_cache::impl {
     static constexpr int    ov_gap_max = 8192;
     static constexpr double ov_margin  = 0.01;
     int     ov_mode   = 1;
+
+    // default rule (LLAMA_MOE_CACHE_FETCH_OVERLAP unset or 1): on while the bytes of the missing experts per cached layer and single token
+    // ubatch reach ov_min (ggml_backend_moe_fetch_overlap_min_bytes, LLAMA_MOE_CACHE_FETCH_OVERLAP_MIN_MB); ov_min = 0: always on
+    // measured from the device lookup counters (the same for a given prompt and configuration, not a timing) over windows of single
+    // token ubatches: the first ov_rule_win after ov_rule_skip, then ov_rule_win2; off again below ov_rule_hyst*ov_min
+    static constexpr int    ov_rule_skip = 8;
+    static constexpr int    ov_rule_win  = 32;
+    static constexpr int    ov_rule_win2 = 128;
+    static constexpr double ov_rule_hyst = 0.75;
+    bool     ov_rule   = false;
+    double   ov_min    = 0.0;
+    int      ov_seen   = 0;     // single token ubatches seen
+    int      ov_win    = ov_rule_win;
+    int      ov_n1     = 0;     // single token ubatches of the window
+    bool     ov_have0  = false; // the window has started
+    uint64_t ov_m0     = 0;     // bytes of the missing experts at the start of the window
+    int      ov_nwin   = 0;
     bool    ov_auto   = false;
     bool    ov_live   = false; // the graphs of single token ubatches use the overlap
     int     ov_done   = -1;    // single token ubatches of the trial, -1 if there is no trial
@@ -521,8 +538,9 @@ struct llama_moe_cache::impl {
         }
 
         // LLAMA_MOE_CACHE_FETCH_OVERLAP (or the older LLAMA_MOE_CACHE_OVERLAP): 0 = off, single token ubatches copy the missing experts
-        // before the expert FFN of the layer; unset or 1 = on where the backend expects it to be faster (ggml_backend_moe_fetch_overlap_default),
-        // 2 = on, 3 = auto, kept while trials find it faster (see ov_tick)
+        // before the expert FFN of the layer; unset or 1 = on while enough bytes of missing experts are copied per layer and token (see
+        // ov_rule), 2 = on, 3 = auto, kept while timing trials find it faster (see ov_tick), 4 = on where the backend expects a gain
+        // (ggml_backend_moe_fetch_overlap_default)
         // the results are the same either way (each slot is computed once, see build_moe_ffn), only the speed depends on the choice
         {
             const char * env = getenv("LLAMA_MOE_CACHE_FETCH_OVERLAP");
@@ -530,7 +548,7 @@ struct llama_moe_cache::impl {
                 env = getenv("LLAMA_MOE_CACHE_OVERLAP");
             }
             ov_mode = env != nullptr ? atoi(env) : 1;
-            overlap = device_lookup && ov_mode != 0 && model.hparams.n_expert >= 4;
+            overlap = device_lookup && ov_mode != 0 && model.hparams.n_expert >= 4 && ov_mode >= 1 && ov_mode <= 4;
             ov_auto = overlap && ov_mode == 3;
             ov_live = overlap && !ov_auto;
             ov_wait = ov_auto ? ov_first : -1;
@@ -818,23 +836,49 @@ struct llama_moe_cache::impl {
                 hybrid_live  = false;
                 hybrid_share = 1.0f; // no hybrid line in the stats
             } else {
-                // default: only where the backend expects the overlap to be faster
-                using overlap_default_t = bool (*)(ggml_backend_dev_t);
                 ggml_backend_dev_t dev = ggml_backend_get_device(devices[devs[0]].backend);
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-                auto fn = reg != nullptr ? (overlap_default_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_fetch_overlap_default") : nullptr;
-                if (overlap && ov_mode == 1 && (fn == nullptr || !fn(dev))) {
-                    overlap = false;
-                    ov_live = false;
-                    if (!model.hparams.no_alloc) {
-                        LLAMA_LOG_INFO("%s: MoE cache: no fetch overlap by default on %s (LLAMA_MOE_CACHE_FETCH_OVERLAP=2 on, 3 auto)\n", __func__, ggml_backend_dev_name(dev));
+                if (overlap && ov_mode == 4) {
+                    // the device hint alone: on where the backend expects a gain
+                    using overlap_default_t = bool (*)(ggml_backend_dev_t);
+                    auto fn = reg != nullptr ? (overlap_default_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_fetch_overlap_default") : nullptr;
+                    if (fn == nullptr || !fn(dev)) {
+                        overlap = false;
+                        ov_live = false;
+                        if (!model.hparams.no_alloc) {
+                            LLAMA_LOG_INFO("%s: MoE cache: no fetch overlap on %s (LLAMA_MOE_CACHE_FETCH_OVERLAP=4)\n", __func__, ggml_backend_dev_name(dev));
+                        }
+                    }
+                }
+                if (overlap && ov_mode == 1) {
+                    // the default rule: the missing expert bytes per layer and token the device needs to gain (see ov_rule)
+                    using overlap_min_t = size_t (*)(ggml_backend_dev_t);
+                    auto fn = reg != nullptr ? (overlap_min_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_fetch_overlap_min_bytes") : nullptr;
+                    const size_t min_b = fn != nullptr ? fn(dev) : SIZE_MAX;
+                    const char * env_mb = getenv("LLAMA_MOE_CACHE_FETCH_OVERLAP_MIN_MB");
+                    if (env_mb != nullptr) {
+                        ov_min = std::max(0.0, atof(env_mb))*1024.0*1024.0;
+                    } else {
+                        ov_min = min_b == SIZE_MAX ? -1.0 : (double) min_b;
+                    }
+                    if (ov_min < 0.0) {
+                        overlap = false;
+                        ov_live = false;
+                        if (!model.hparams.no_alloc) {
+                            LLAMA_LOG_INFO("%s: MoE cache: no fetch overlap by default on %s (LLAMA_MOE_CACHE_FETCH_OVERLAP=2 on)\n", __func__, ggml_backend_dev_name(dev));
+                        }
+                    } else {
+                        ov_rule = ov_min > 0.0;
+                        ov_live = !ov_rule;
                     }
                 }
             }
             if (devs.size() == 1 && !model.hparams.no_alloc) {
                 if (overlap) {
-                    LLAMA_LOG_INFO("%s: MoE cache: single token ubatches compute the cached experts while the missing ones are copied, %s (LLAMA_MOE_CACHE_FETCH_OVERLAP=0 off, 2 on, 3 auto)\n", __func__,
-                        ov_auto ? "auto: kept while trials find it faster" : "on");
+                    char buf[160];
+                    snprintf(buf, sizeof(buf), "while at least %.2f MiB of missing experts per layer and token are copied", ov_min/1024.0/1024.0);
+                    LLAMA_LOG_INFO("%s: MoE cache: single token ubatches compute the cached experts while the missing ones are copied, %s (LLAMA_MOE_CACHE_FETCH_OVERLAP=0 off, 2 on, 3 auto, 4 device hint)\n", __func__,
+                        ov_auto ? "auto: kept while trials find it faster" : ov_rule ? buf : "on");
                 }
                 if (hybrid && hybrid_probe) {
                     LLAMA_LOG_INFO("%s: hybrid MoE cache: the host computes the missing experts that are not fetched, fetch share measured at the first small batch, %s (LLAMA_MOE_CACHE_FETCH=0..1 to set the share)\n",
@@ -1079,12 +1123,73 @@ struct llama_moe_cache::impl {
     }
 
     bool ov_pending() const {
-        return ov_auto && (ov_done >= 0 || ov_wait >= 0);
+        return ov_rule || (ov_auto && (ov_done >= 0 || ov_wait >= 0));
+    }
+
+    // the next single token tick of the rule reads the device counters (the backends must be synchronized)
+    bool ov_rule_reads() const {
+        return ov_rule && ((!ov_have0 && ov_seen >= ov_rule_skip) || (ov_have0 && ov_n1 + 1 >= ov_win));
+    }
+
+    uint64_t ov_miss_bytes() const {
+        uint64_t b = 0;
+        for (const group & g : groups) {
+            if (!g.dev_lookup || g.n_slots == 0 || g.state == nullptr || g.state->data == nullptr) {
+                continue;
+            }
+            uint64_t cnt[2] = { 0, 0 };
+            ggml_backend_tensor_get(g.state, cnt, 2*sizeof(int32_t), sizeof(cnt));
+            b += cnt[1]*g.expert_bytes;
+        }
+        return b;
+    }
+
+    void ov_rule_tick(int64_t n_tokens) {
+        if (n_tokens != 1) {
+            ov_have0 = false; // the lookups of larger small batches are not counted
+            ov_n1    = 0;
+            return;
+        }
+        if (ov_seen < ov_rule_skip) {
+            ov_seen++;
+            return;
+        }
+        if (!ov_have0) {
+            ov_m0    = ov_miss_bytes();
+            ov_have0 = true;
+            ov_n1    = 0;
+            return;
+        }
+        if (++ov_n1 < ov_win) {
+            return;
+        }
+        size_t n_layers = 0;
+        for (const group & g : groups) {
+            if (g.dev_lookup && g.n_slots > 0) {
+                n_layers += g.layers.size();
+            }
+        }
+        const uint64_t m1  = ov_miss_bytes();
+        const double   per = n_layers > 0 ? (double) (m1 - ov_m0)/((double) ov_n1*n_layers) : 0.0;
+        const bool     on  = ov_live ? per >= ov_rule_hyst*ov_min : per >= ov_min;
+        ov_nwin++;
+        if (ov_nwin <= 4 || on != ov_live) {
+            LLAMA_LOG_INFO("llama_moe_cache: fetch overlap (window %d, %d tokens): %.3f MiB of missing experts per layer and token, threshold %.2f MiB -> %s\n",
+                ov_nwin, ov_n1, per/1024.0/1024.0, (ov_live ? ov_rule_hyst : 1.0)*ov_min/1024.0/1024.0, on ? "on" : "off");
+        }
+        ov_live = on;
+        ov_m0   = m1;
+        ov_n1   = 0;
+        ov_win  = ov_rule_win2;
     }
 
     // overlap auto trial, called before the graph of every ubatch while a trial runs or waits; while a trial runs, after the previous
     // ubatch finished (the time from one single token ubatch to the next is credited to the path of the first)
     void ov_tick(int64_t n_tokens) {
+        if (ov_rule) {
+            ov_rule_tick(n_tokens);
+            return;
+        }
         if (!ov_pending()) {
             return;
         }
@@ -2256,7 +2361,7 @@ bool llama_moe_cache::overlap_trial_pending() const {
 }
 
 bool llama_moe_cache::overlap_tick_sync() const {
-    return pimpl->ov_done >= 0 || pimpl->ov_wait == 1;
+    return pimpl->ov_rule ? pimpl->ov_rule_reads() : (pimpl->ov_done >= 0 || pimpl->ov_wait == 1);
 }
 
 void llama_moe_cache::overlap_tick(int64_t n_tokens) {

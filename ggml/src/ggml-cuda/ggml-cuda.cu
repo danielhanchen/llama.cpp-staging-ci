@@ -6670,8 +6670,24 @@ static bool ggml_backend_cuda_moe_fetch_overlap_default(ggml_backend_dev_t dev) 
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
+// the overlap pays when enough expert bytes are copied per layer and token to hide the cost of its extra nodes: none below compute
+// capability 9.0 (faster on T4 and L4 at every measured budget); with PDL (9.0 and newer) the second stream slows the kernels beside it
+// (RTX PRO 6000: -11% with 0.26 missing experts of gemma-4 26B per layer and token, +6% with 3.4), see llama_moe_cache
+static size_t ggml_backend_cuda_moe_fetch_overlap_min_bytes(ggml_backend_dev_t dev) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(dev);
+    return SIZE_MAX;
+#else
+    const int cc = ggml_cuda_info().devices[((ggml_backend_cuda_device_context *) dev->context)->device].cc;
+    return cc < GGML_CUDA_CC_HOPPER ? 0 : (size_t) 4 << 20;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_moe_fetch_overlap_min_bytes") == 0) {
+        return (void *)ggml_backend_cuda_moe_fetch_overlap_min_bytes;
+    }
     if (strcmp(name, "ggml_backend_moe_fetch_overlap_default") == 0) {
         return (void *)ggml_backend_cuda_moe_fetch_overlap_default;
     }
