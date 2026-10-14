@@ -3632,6 +3632,11 @@ static void ggml_backend_sched_prefetch_adapt(ggml_backend_sched_t sched) {
     }
     const double ratio = sched->pf_acc_stall / sched->pf_acc_busy;
     const int    from  = sched->pf_depth;
+    // staging in lent memory (e.g. slots of a MoE cache): a larger depth borrows more of it, which costs the lender more than the waits it saves
+    bool lent = false;
+    for (int b = 0; b < sched->n_backends; b++) {
+        lent = lent || sched->pf[b].lent > 0;
+    }
     if (sched->pf_adapt_from > 0 && ratio > 0.75*sched->pf_adapt_prev) {
         // the last step did not cut the waits enough: back to the depth before it, and give back the memory of the larger arena
         sched->pf_depth = sched->pf_adapt_from;
@@ -3639,15 +3644,16 @@ static void ggml_backend_sched_prefetch_adapt(ggml_backend_sched_t sched) {
         for (int b = 0; b < sched->n_backends; b++) {
             sched->pf[b].shrink = true;
         }
-    } else if (ratio > 0.02 && sched->pf_depth < sched->pf_adapt_max) {
+    } else if (ratio > 0.02 && sched->pf_depth < sched->pf_adapt_max && !lent) {
         sched->pf_adapt_prev = ratio;
         sched->pf_adapt_from = sched->pf_depth;
         sched->pf_depth++;
     } else {
         sched->pf_adapt = false;
     }
-    GGML_LOG_INFO("%s: host weight prefetch: splits waited %.1f%% of %.1f ms for their copies at depth %d (%d graphs): %s depth %d\n", __func__,
-        100.0*ratio, sched->pf_acc_busy, from, sched->pf_acc_n, sched->pf_adapt ? "trying" : "settled at", sched->pf_depth);
+    GGML_LOG_INFO("%s: host weight prefetch: splits waited %.1f%% of %.1f ms for their copies at depth %d (%d graphs): %s depth %d%s\n", __func__,
+        100.0*ratio, sched->pf_acc_busy, from, sched->pf_acc_n, sched->pf_adapt ? "trying" : "settled at", sched->pf_depth,
+        lent && !sched->pf_adapt ? " (staging in lent memory)" : "");
     sched->pf_acc_stall = 0.0;
     sched->pf_acc_busy  = 0.0;
     sched->pf_acc_n     = 0;
