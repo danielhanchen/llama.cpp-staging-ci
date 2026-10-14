@@ -3770,6 +3770,10 @@ static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, st
     if (input_cpy->buffer == NULL || ggml_backend_buffer_is_host(input_cpy->buffer)) {
         return false;
     }
+    // a meta (tensor parallel) buffer splits the copy by its split state, its async set only handles some of them: the sync copy below
+    if (ggml_backend_buffer_is_meta(input_cpy->buffer)) {
+        return false;
+    }
 
     bool ov = sched->ov_active && (sched->ov_parts & 4) && ggml_backend_sched_ov_backend_ok(sched, split_backend_id) &&
         sched->ov[split_backend_id].relaxed_ok &&
