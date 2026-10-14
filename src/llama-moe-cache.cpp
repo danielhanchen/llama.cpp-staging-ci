@@ -724,11 +724,12 @@ struct llama_moe_cache::impl {
         // one layer (see get_slot_map), else its layers in that group compute from host memory, with other results than the device: a
         // group of few layers (e.g. the one layer of another type) gets few slots from the split by size, and a small cache then gives
         // other outputs than a large one for the same batch (the server runs the last 4 tokens of a prompt as their own batch). Each
-        // group gets at least the slots of n tokens (LLAMA_MOE_CACHE_GROUP_MIN = n, default max_batch, 0 = off), taken from the
-        // other groups of the device; n is halved down to 1 while that takes more than LLAMA_MOE_CACHE_GROUP_MIN_FRAC (0.10) of the
-        // device budget, or more than the other groups have above their own minimum
+        // group gets at least the slots of n tokens (LLAMA_MOE_CACHE_GROUP_MIN = n, at most max_batch, 0 = off), taken from the other
+        // groups of the device; n is halved down to 1 while that takes more than LLAMA_MOE_CACHE_GROUP_MIN_FRAC (0.10) of the device
+        // budget, or more than the other groups have above their own minimum. The default n = 4 covers the decode, the checkpoint tail
+        // of the server and an MTP draft of 3; n = 32 (every small batch) cost gemma-4 26B-A4B 1-4% decode at an 8-12 GB tier (L4)
         {
-            int64_t n_min = max_batch;
+            int64_t n_min = 4;
             if (const char * env = getenv("LLAMA_MOE_CACHE_GROUP_MIN")) {
                 n_min = std::max<int64_t>(0, std::min<int64_t>(max_batch, atoll(env)));
             }
