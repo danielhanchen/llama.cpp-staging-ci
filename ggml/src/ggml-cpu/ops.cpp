@@ -8775,10 +8775,12 @@ void ggml_compute_forward_argsort(
 
 // ggml_compute_forward_top_k
 
+// descending value, ties by ascending index (-0.0 == +0.0): of the values equal to the k-th largest the
+// lowest indices are selected, the same rule as the deterministic CUDA path
 struct cmp_top_k {
     const float * data;
     bool operator()(int32_t a, int32_t b) const {
-        return data[a] > data[b];
+        return data[a] > data[b] || (data[a] == data[b] && a < b);
     }
 };
 

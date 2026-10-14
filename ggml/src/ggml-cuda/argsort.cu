@@ -168,7 +168,17 @@ static inline __device__ void ggml_cuda_swap(T & a, T & b) {
 }
 
 // One compare-exchange of the bitonic network at (k, j) for column col.
-template<ggml_sort_order order>
+// TIE_INDEX: equal values are ordered by ascending column (a strict total order), so of the values tied at the
+// k-th position a top-k keeps the lowest columns. Without it, ties land wherever the network leaves them.
+template<ggml_sort_order order, bool TIE_INDEX>
+static inline __device__ bool bitonic_before(const float * x_row, const int a, const int b) {
+    const float xa = x_row[a];
+    const float xb = x_row[b];
+    const bool  lt = order == GGML_SORT_ORDER_ASC ? xa < xb : xa > xb;
+    return TIE_INDEX ? (lt || (xa == xb && a < b)) : lt;
+}
+
+template<ggml_sort_order order, bool TIE_INDEX>
 static inline __device__ void bitonic_step(const float * x_row, int * dst_row, const int ncols, const int col, const int k, const int j) {
     const int ixj = col ^ j;
     if (ixj <= col) {
@@ -176,18 +186,12 @@ static inline __device__ void bitonic_step(const float * x_row, int * dst_row, c
     }
     if ((col & k) == 0) {
         if (dst_row[col] >= ncols ||
-            (dst_row[ixj] < ncols && (order == GGML_SORT_ORDER_ASC ?
-                x_row[dst_row[col]] > x_row[dst_row[ixj]] :
-                x_row[dst_row[col]] < x_row[dst_row[ixj]]))
-        ) {
+            (dst_row[ixj] < ncols && bitonic_before<order, TIE_INDEX>(x_row, dst_row[ixj], dst_row[col]))) {
             ggml_cuda_swap(dst_row[col], dst_row[ixj]);
         }
     } else {
         if (dst_row[ixj] >= ncols ||
-            (dst_row[col] < ncols && (order == GGML_SORT_ORDER_ASC ?
-                x_row[dst_row[col]] < x_row[dst_row[ixj]] :
-                x_row[dst_row[col]] > x_row[dst_row[ixj]]))
-        ) {
+            (dst_row[col] < ncols && bitonic_before<order, TIE_INDEX>(x_row, dst_row[col], dst_row[ixj]))) {
             ggml_cuda_swap(dst_row[col], dst_row[ixj]);
         }
     }
@@ -198,7 +202,7 @@ static inline __device__ void bitonic_step(const float * x_row, int * dst_row, c
 // shared memory limit) sort with several columns per thread. Every
 // (k, j) stage runs all owned columns before the barrier; a pair
 // (col, col ^ j) is exchanged by the owner of its lower index only.
-template<ggml_sort_order order>
+template<ggml_sort_order order, bool TIE_INDEX>
 static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int ncols, int ncols_pad) {
     const int row = blockIdx.x;
 
@@ -215,7 +219,7 @@ static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int n
     for (int k = 2; k <= ncols_pad; k *= 2) {
         for (int j = k / 2; j > 0; j /= 2) {
             for (int col = threadIdx.x; col < ncols_pad; col += blockDim.x) {
-                bitonic_step<order>(x_row, dst_row, ncols, col, k, j);
+                bitonic_step<order, TIE_INDEX>(x_row, dst_row, ncols, col, k, j);
             }
             __syncthreads();
         }
@@ -240,7 +244,8 @@ void argsort_f32_i32_cuda_bitonic(const float *   x,
                                   const int       ncols,
                                   const int       nrows,
                                   ggml_sort_order order,
-                                  cudaStream_t    stream) {
+                                  cudaStream_t    stream,
+                                  bool            tie_index) {
     // bitonic sort requires ncols to be power of 2
     const int ncols_pad = next_power_of_2(ncols);
 
@@ -254,11 +259,21 @@ void argsort_f32_i32_cuda_bitonic(const float *   x,
     GGML_ASSERT(shared_mem <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
 
     if (order == GGML_SORT_ORDER_ASC) {
-        k_argsort_f32_i32<GGML_SORT_ORDER_ASC>
-            <<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad);
+        if (tie_index) {
+            k_argsort_f32_i32<GGML_SORT_ORDER_ASC, true>
+                <<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad);
+        } else {
+            k_argsort_f32_i32<GGML_SORT_ORDER_ASC, false>
+                <<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad);
+        }
     } else if (order == GGML_SORT_ORDER_DESC) {
-        k_argsort_f32_i32<GGML_SORT_ORDER_DESC>
-            <<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad);
+        if (tie_index) {
+            k_argsort_f32_i32<GGML_SORT_ORDER_DESC, true>
+                <<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad);
+        } else {
+            k_argsort_f32_i32<GGML_SORT_ORDER_DESC, false>
+                <<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad);
+        }
     } else {
         GGML_ABORT("fatal error");
     }
