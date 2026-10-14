@@ -1014,6 +1014,7 @@ struct ggml_backend_sched_prefetch {
 struct ggml_backend_sched_overlap {
     bool checked;
     bool eligible;
+    bool relaxed_ok;             // uploads are ordered after the work queued before them (one queue), they may skip the synchronization
     ggml_backend_event_t ready;  // recorded after the async copies of the inputs of a host split
     bool ready_pending;          // copies were queued and their host split has not waited for them yet
     ggml_backend_event_t upload; // recorded after uploads that read host compute memory without a synchronization
@@ -1377,11 +1378,17 @@ static bool ggml_backend_sched_ov_backend_ok(ggml_backend_sched_t sched, int bac
         }
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
         const char * reg_name = reg ? ggml_backend_reg_name(reg) : "";
-        if (sched->ov_mode == 1) {
+        const bool cuda_family = strcmp(reg_name, "CUDA") == 0 || strcmp(reg_name, "ROCm") == 0 || strcmp(reg_name, "MUSA") == 0;
+        if (sched->ov_mode == 1 && !cuda_family) {
             // other backends have not been validated yet, they can be enabled with GGML_SCHED_OVERLAP=2
-            if (strcmp(reg_name, "CUDA") != 0 && strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0) {
-                return false;
-            }
+            return false;
+        }
+        // the CUDA family queues uploads on the stream of the compute; other backends may upload on a separate queue
+        // (e.g. the Vulkan transfer queue) that does not wait for earlier compute still reading the destination
+        ov->relaxed_ok = cuda_family;
+        if (!cuda_family && (sched->ov_parts & 4)) {
+            GGML_LOG_INFO("%s: sched overlap: %s uploads keep their synchronization (upload ordering with compute not known)\n",
+                __func__, ggml_backend_name(backend));
         }
         ov->ready  = ggml_backend_event_new(dev);
         ov->upload = ggml_backend_event_new(dev);
@@ -1458,6 +1465,14 @@ static int ggml_backend_sched_ov_reorder(ggml_backend_sched_t sched, struct ggml
         const struct ggml_tensor * node = graph->nodes[i];
         if (node->view_src != NULL && !ggml_op_is_empty(node->op)) {
             written.insert(ggml_backend_sched_ov_root(node));
+        }
+        // the optimizer steps also update sources other than their result (e.g. the AdamW moments)
+        if (node->op == GGML_OP_OPT_STEP_ADAMW || node->op == GGML_OP_OPT_STEP_SGD) {
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                if (node->src[j] != NULL) {
+                    written.insert(ggml_backend_sched_ov_root(node->src[j]));
+                }
+            }
         }
     }
 
@@ -1583,7 +1598,8 @@ static int ggml_backend_sched_ov_reorder(ggml_backend_sched_t sched, struct ggml
             }
             bool ok = true;
             for_srcs(t, [&](const struct ggml_tensor * s) {
-                if (wpos.count(s) == 0 && !outside_ok(s)) {
+                // a tensor written in place keeps the order of its readers and writers, also inside the window
+                if (written.count(ggml_backend_sched_ov_root(s)) > 0 || (wpos.count(s) == 0 && !outside_ok(s))) {
                     ok = false;
                 }
             });
@@ -1868,10 +1884,14 @@ static void ggml_backend_sched_ov_plan(ggml_backend_sched_t sched, int & n_early
                 break;
             }
             e = j;
+            // host memory that the graph allocator owns may be where the copies are written: results of earlier splits and
+            // graph inputs (leafs without a buffer, e.g. INPUT tensors, which are freed after their last upload)
             bool host_input = false;
             for (int k = 0; k < sj->n_inputs && !host_input; k++) {
                 const int b = tensor_backend_id(sj->inputs[k]);
-                host_input = b < 0 || (ggml_backend_sched_ov_is_host(sched, b) && ggml_backend_sched_ov_root(sj->inputs[k])->op != GGML_OP_NONE);
+                const struct ggml_tensor * root = ggml_backend_sched_ov_root(sj->inputs[k]);
+                host_input = b < 0 || (ggml_backend_sched_ov_is_host(sched, b) && (root->op != GGML_OP_NONE || root->buffer == NULL ||
+                    ggml_backend_buffer_get_usage(root->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE));
             }
             if (host_input) {
                 break;
@@ -3363,6 +3383,7 @@ static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, st
     }
 
     bool ov = sched->ov_active && (sched->ov_parts & 4) && ggml_backend_sched_ov_backend_ok(sched, split_backend_id) &&
+        sched->ov[split_backend_id].relaxed_ok &&
         ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
         ggml_backend_sched_ov_root(input)->op != GGML_OP_NONE;
     for (const struct ggml_tensor * t = input; t != NULL && ov; t = t->view_src) {
