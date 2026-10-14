@@ -3502,6 +3502,16 @@ ggml_backend_sched_prefetch_mode llama_context::sched_prefetch_mode(const ggml_t
         return GGML_BACKEND_SCHED_PREFETCH_ASYNC;
     }
 
+    // host memory that is not a weight: only the rows of a host KV cache that a prompt's attention reads from its GPU copy
+    // (kv-layer-prefetch, the scheduler checks that no earlier split writes them)
+    const ggml_tensor * root = src;
+    while (root->view_src != nullptr) {
+        root = root->view_src;
+    }
+    if (root->buffer != nullptr && ggml_backend_buffer_get_usage(root->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return strncmp(root->name, "cache_", 6) == 0 ? GGML_BACKEND_SCHED_PREFETCH_ASYNC : GGML_BACKEND_SCHED_PREFETCH_NONE;
+    }
+
     // experts: the copy callback can copy them ahead only if it does not need the ids, which are computed by an earlier split
     for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
         const ggml_tensor * node = ggml_graph_node(graph, i);

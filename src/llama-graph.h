@@ -55,6 +55,13 @@ enum llm_fused_op {
     LLM_FUSED_OP_DSV4_HC_POST,
 };
 
+// where the attention of a layer whose KV cache is in host memory runs (kv-layer-prefetch, LLAMA_KV_PREFETCH=0: as before)
+enum kv_host_mode : int {
+    KV_HOST_NONE,  // not host KV, or the default placement
+    KV_HOST_STAGE, // prompt: attention on the GPU over a staged copy that the scheduler uploads ahead
+    KV_HOST_CPU,   // small batch, long cache: attention on the CPU, where the KV lives
+};
+
 enum llm_ffn_op_type : int {
     LLM_FFN_NONE = 0,           // sentinel: unset; archs must assign before use
     LLM_FFN_SILU,
@@ -1266,6 +1273,11 @@ struct llm_graph_context {
     //
     // attention
     //
+
+    kv_host_mode kv_host_attn_mode(const ggml_tensor * k, const ggml_tensor * v) const;
+
+    // GPU copy of the cached rows `view` [n_embd_head, n_head_kv, n_kv, 1] with the rows `cur` written at `idxs`
+    ggml_tensor * kv_host_stage(ggml_tensor * view, ggml_tensor * cur, ggml_tensor * idxs) const;
 
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]

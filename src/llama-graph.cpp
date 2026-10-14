@@ -3138,6 +3138,64 @@ uint32_t llm_graph_exact_split(const llama_ubatch & ubatch) {
     return n;
 }
 
+static ggml_backend_t kv_host_gpu_backend(ggml_backend_sched_t sched) {
+    if (sched == nullptr || ggml_backend_sched_get_n_backends(sched) < 2) {
+        return nullptr;
+    }
+    ggml_backend_t backend = ggml_backend_sched_get_backend(sched, 0);
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    return dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ? backend : nullptr;
+}
+
+kv_host_mode llm_graph_context::kv_host_attn_mode(const ggml_tensor * k, const ggml_tensor * v) const {
+    // LLAMA_KV_PREFETCH=0: off; LLAMA_KV_PREFETCH_MIN_BATCH (32): smallest batch staged on the GPU;
+    // LLAMA_KV_DECODE=auto|gpu|cpu, LLAMA_KV_STREAM_MAX_MIB (16): below that batch, attention on the CPU when the layer's K+V
+    // views exceed this many MiB (auto), always (cpu) or never (gpu)
+    static const bool    enabled   = getenv("LLAMA_KV_PREFETCH") == nullptr || atoi(getenv("LLAMA_KV_PREFETCH")) != 0;
+    static const int64_t min_batch = getenv("LLAMA_KV_PREFETCH_MIN_BATCH") ? std::max(1, atoi(getenv("LLAMA_KV_PREFETCH_MIN_BATCH"))) : 32;
+    static const char *  decode    = getenv("LLAMA_KV_DECODE") ? getenv("LLAMA_KV_DECODE") : "auto";
+    static const double  max_mib   = getenv("LLAMA_KV_STREAM_MAX_MIB") ? atof(getenv("LLAMA_KV_STREAM_MAX_MIB")) : 16.0;
+
+    if (!enabled || !cparams.flash_attn || k == nullptr || v == nullptr || k->view_src == nullptr || v->view_src == nullptr) {
+        return KV_HOST_NONE;
+    }
+    const ggml_backend_buffer_t kb = k->view_src->buffer;
+    const ggml_backend_buffer_t vb = v->view_src->buffer;
+    if (kb == nullptr || vb == nullptr || !ggml_backend_buffer_is_host(kb) || !ggml_backend_buffer_is_host(vb)) {
+        return KV_HOST_NONE;
+    }
+    // one stream, V not transposed (FA)
+    if (k->ne[3] != 1 || v->ne[3] != 1 || v->nb[1] > v->nb[2] || kv_host_gpu_backend(sched) == nullptr) {
+        return KV_HOST_NONE;
+    }
+    if (n_tokens >= min_batch) {
+        return KV_HOST_STAGE;
+    }
+    if (strcmp(decode, "gpu") == 0) {
+        return KV_HOST_NONE;
+    }
+    if (strcmp(decode, "cpu") == 0) {
+        return KV_HOST_CPU;
+    }
+    return (double) (ggml_nbytes(k) + ggml_nbytes(v)) > max_mib*1024.0*1024.0 ? KV_HOST_CPU : KV_HOST_NONE;
+}
+
+ggml_tensor * llm_graph_context::kv_host_stage(ggml_tensor * view, ggml_tensor * cur, ggml_tensor * idxs) const {
+    ggml_backend_t gpu = kv_host_gpu_backend(sched);
+
+    const int64_t n_embd_gqa = view->ne[0]*view->ne[1];
+    GGML_ASSERT(ggml_row_size(cur->type, cur->ne[0]) == cur->nb[1]);
+
+    ggml_tensor * st = ggml_cont(ctx0, view);
+    ggml_backend_sched_set_tensor_backend(sched, st, gpu);
+
+    ggml_tensor * rows = ggml_view_2d(ctx0, cur, n_embd_gqa, cur->ne[2], cur->nb[2], 0);
+    ggml_tensor * w    = ggml_set_rows(ctx0, ggml_reshape_2d(ctx0, st, n_embd_gqa, view->ne[2]), rows, idxs);
+    ggml_backend_sched_set_tensor_backend(sched, w, gpu);
+
+    return ggml_reshape_4d(ctx0, w, view->ne[0], view->ne[1], view->ne[2], 1);
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -3470,11 +3528,19 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k;
     ggml_tensor * v;
 
+    const kv_host_mode host_mode = cparams.training ? KV_HOST_NONE : kv_host_attn_mode(mctx_cur->get_k(ctx0, il), mctx_cur->get_v(ctx0, il));
+
     if (cparams.training) {
         GGML_ASSERT(mctx_cur->get_n_kv() == n_tokens);
 
         k = k_cur;
         v = v_cur;
+    } else if (host_mode == KV_HOST_STAGE) {
+        // host KV, prompt: the attention reads a GPU copy of the cached rows, which the scheduler can upload ahead
+        // (nothing writes the host rows before the attention), with this ubatch's rows written into the copy on the GPU;
+        // the host rows are written after the attention
+        k = kv_host_stage(mctx_cur->get_k(ctx0, il), k_cur, inp->get_k_idxs());
+        v = kv_host_stage(mctx_cur->get_v(ctx0, il), v_cur, inp->get_v_idxs());
     } else {
         {
             const auto & k_idxs = inp->get_k_idxs();
@@ -3492,6 +3558,22 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
+
+    if (host_mode == KV_HOST_STAGE) {
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il));
+    } else if (host_mode == KV_HOST_CPU) {
+        // host KV, small batch with a long cache: the attention runs where the KV lives instead of streaming it
+        for (ggml_tensor * t = cur; t != nullptr; t = t->src[0]) {
+            if (t->op == GGML_OP_FLASH_ATTN_EXT) {
+                ggml_backend_sched_set_tensor_backend(sched, t, backend_cpu);
+                break;
+            }
+            if (t->op != GGML_OP_RESHAPE && t->op != GGML_OP_VIEW && t->op != GGML_OP_PERMUTE && t->op != GGML_OP_TRANSPOSE) {
+                break;
+            }
+        }
+    }
 
     if (inp->self_v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);

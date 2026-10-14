@@ -2721,16 +2721,29 @@ static const struct ggml_tensor * ggml_backend_sched_view_root(const struct ggml
 }
 
 // written: the host weights that nodes of the graph write to (directly or through a view)
+// first_write: the first split that writes each other host tensor (e.g. a KV cache), split_id: the split that reads input
 static enum ggml_backend_sched_prefetch_mode ggml_backend_sched_prefetch_candidate(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input,
-        const std::unordered_set<const ggml_tensor *> & written) {
-    if (!ggml_backend_sched_is_host_weight(input)) {
-        return GGML_BACKEND_SCHED_PREFETCH_NONE;
-    }
+        const std::unordered_set<const ggml_tensor *> & written, const std::unordered_map<const ggml_tensor *, int> & first_write, int split_id) {
     // inputs from the user (also through views) may be overwritten as soon as the computation is queued
     for (const struct ggml_tensor * t = input; t != NULL; t = t->view_src) {
         if (t->flags & GGML_TENSOR_FLAG_INPUT) {
             return GGML_BACKEND_SCHED_PREFETCH_NONE;
         }
+    }
+    if (!ggml_backend_sched_is_host_weight(input)) {
+        // other host memory only if the user asks for it and no split up to the reader writes it, so the copy can be made early
+        const struct ggml_tensor * root = ggml_backend_sched_view_root(input);
+        if (sched->callback_prefetch == NULL || root->buffer == NULL || !ggml_backend_buffer_is_host(root->buffer) ||
+            ggml_backend_buffer_get_usage(root->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            return GGML_BACKEND_SCHED_PREFETCH_NONE;
+        }
+        auto it = first_write.find(root);
+        if (it != first_write.end() && it->second <= split_id) {
+            return GGML_BACKEND_SCHED_PREFETCH_NONE;
+        }
+        const struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
+        const enum ggml_backend_sched_prefetch_mode mode = sched->callback_prefetch(input, input_cpy, &split->graph, sched->callback_prefetch_user_data);
+        return mode == GGML_BACKEND_SCHED_PREFETCH_ASYNC ? mode : GGML_BACKEND_SCHED_PREFETCH_NONE;
     }
     // the copy of a weight written by the graph must follow the split that writes it
     if (written.count(ggml_backend_sched_view_root(input)) > 0) {
@@ -3115,8 +3128,9 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
     // without prefetch (GGML_SCHED_PREFETCH=0) the user may still lend memory to the graph allocator
     const bool prefetch = sched->pf_mode != 0;
 
-    // host weights written by the graph
+    // host weights written by the graph, and the first split that writes other host tensors
     std::unordered_set<const ggml_tensor *> written;
+    std::unordered_map<const ggml_tensor *, int> first_write;
     for (int i = 0; i < sched->n_splits; i++) {
         const struct ggml_backend_sched_split * split = &sched->splits[i];
         for (int n = 0; n < split->graph.n_nodes; n++) {
@@ -3127,6 +3141,8 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
             const struct ggml_tensor * root = ggml_backend_sched_view_root(node);
             if (ggml_backend_sched_is_host_weight(root)) {
                 written.insert(root);
+            } else if (root != node && root->buffer != NULL && ggml_backend_buffer_is_host(root->buffer)) {
+                first_write.emplace(root, i);
             }
         }
     }
@@ -3141,7 +3157,7 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         }
         for (int j = 0; j < split->n_inputs; j++) {
             struct ggml_tensor * input = split->inputs[j];
-            const enum ggml_backend_sched_prefetch_mode mode = ggml_backend_sched_prefetch_candidate(sched, split, input, written);
+            const enum ggml_backend_sched_prefetch_mode mode = ggml_backend_sched_prefetch_candidate(sched, split, input, written, first_write, i);
             if (mode != GGML_BACKEND_SCHED_PREFETCH_NONE) {
                 const ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
                 owner[input_cpy] = i;
