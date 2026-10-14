@@ -361,6 +361,8 @@ struct llama_moe_cache::impl {
     std::vector<std::vector<int32_t>> seed_counts; // [n_layer] routing of an earlier ubatch of the prompt, see set_seed_counts
     std::vector<ggml_backend_copy_region> seed_regions;
     size_t seed_unstaged = 0; // seeds of a layer dropped because a planned expert was not staged in the copy of an expert tensor
+    size_t seed_skipped  = 0; // prompt ends that did not seed because the graph of the seed did not fit (see seed_unavailable)
+    bool   prefill_deferred = false; // the default seeding skipped the prefill at load, it runs if prompts cannot seed
 
     bool seed_check = false;
     std::vector<seed_rec> seed_committed; // seeded layers, not yet checked
@@ -728,6 +730,8 @@ struct llama_moe_cache::impl {
             if (env != nullptr ? atoi(env) != 0 : seed != nullptr && atoi(seed) == 1) {
                 prefill();
             }
+            // the default seeding may not fit in the compute buffer, the cache is then prefilled (see seed_unavailable)
+            prefill_deferred = env == nullptr && (seed == nullptr || atoi(seed) == 2);
         }
 
         if (device_lookup && !model.hparams.no_alloc) {
@@ -808,9 +812,11 @@ struct llama_moe_cache::impl {
             }
             const int32_t n_expert = g.lru.n_expert;
             const size_t  n_layer  = g.layers.size();
+            // a late prefill (see seed_unavailable) leaves the lent slots to the staging copies
+            const int32_t n_slots  = g.n_slots - g.lru.n_lent;
             for (size_t i = 0; i < n_layer; ++i) {
                 const int32_t il = g.layers[i];
-                const int32_t n  = std::min<int32_t>(n_expert, g.n_slots/n_layer + (i < g.n_slots % n_layer ? 1 : 0));
+                const int32_t n  = std::min<int32_t>(n_expert, n_slots/n_layer + (i < n_slots % n_layer ? 1 : 0));
                 fill_ids.resize(n);
                 for (int32_t e = 0; e < n; ++e) {
                     fill_ids[e] = e;
@@ -1995,6 +2001,9 @@ struct llama_moe_cache::impl {
         if (seed_unstaged > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu expert tensor seeds skipped (planned expert not staged)\n", seed_unstaged);
         }
+        if (seed_skipped > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu prompt ends not seeded (the seeding graph does not fit in the compute buffer)\n", seed_skipped);
+        }
         if (n_lends > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu graphs used lent slots (at most %d slots lent), %zu experts refilled after them, %.2f MiB\n",
                 n_lends, lend_max, stats_refill.misses, stats_refill.bytes/1024.0/1024.0);
@@ -2097,6 +2106,17 @@ void llama_moe_cache::seed(ggml_backend_t backend, const ggml_tensor * w, const 
 
 void llama_moe_cache::lend(ggml_backend_t backend, ggml_backend_sched_lend_copy * copies, int n_copies, int depth, bool dry, int64_t n_tokens) {
     pimpl->lend(backend, copies, n_copies, depth, dry, n_tokens);
+}
+
+void llama_moe_cache::seed_unavailable() {
+    if (pimpl->prefill_deferred) {
+        pimpl->prefill_deferred = false;
+        pimpl->prefill();
+    }
+}
+
+void llama_moe_cache::count_seed_skipped() {
+    pimpl->seed_skipped++;
 }
 
 bool llama_moe_cache::lends() const {

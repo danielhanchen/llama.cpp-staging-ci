@@ -278,6 +278,10 @@ public:
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
+    // reserve the graph of a prefetched ubatch that seeds the MoE cache from its own ids if the devices have room for it (staging_pp:
+    // staging memory of the pp graph per backend), returns false if it does not fit
+    bool sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const std::vector<size_t> & staging_pp);
+
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
@@ -431,6 +435,7 @@ private:
     bool moe_cache_seed_enabled = true; // LLAMA_MOE_CACHE_SEED != 0
     bool moe_cache_seed_sync    = true;  // LLAMA_MOE_CACHE_SEED=2 (default): a prefetched ubatch seeds (earlier routing, else its own ids read first)
     bool moe_cache_seed_lag_ok  = false; // LLAMA_MOE_CACHE_SEED=3 with a prefetch depth <= 2, see moe_cache_seed_lag
+    bool moe_cache_seed_fits    = true;  // the graph of a prefetched ubatch that seeds from its own ids was reserved (see sched_reserve_seed)
 
     // seed_lag: a prefetched ubatch seeds each layer from its own ids once the layer is computed, from its staged copy, before the
     // copy of a later layer overwrites it (the copies never wait for the ids)

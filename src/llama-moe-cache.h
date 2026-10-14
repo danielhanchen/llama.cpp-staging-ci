@@ -99,6 +99,11 @@ public:
     // after the graph is computed: drop the admissions of layers that were not seeded for all of their expert tensors
     void seed_end();
 
+    // the graph of a prefetched ubatch that seeds from its own ids does not fit: prefill the cache now if the default seeding skipped it
+    void seed_unavailable();
+    // a prompt end that does not seed for that reason (statistics)
+    void count_seed_skipped();
+
     // LLAMA_MOE_CACHE_SEED_CHECK=1 (debug): after the seeding ubatch is synchronized, compare the seeded slots with the host experts
     bool seed_check() const;
     void seed_verify();

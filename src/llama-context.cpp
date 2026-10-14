@@ -839,6 +839,12 @@ void llama_context::sched_reserve() {
         n_input_tensors_pp = this->n_input_tensors;
     }
 
+    // the staging memory of the pp graph (the prefetch arena), see the seed graph below
+    std::vector<size_t> staging_pp(backend_ptrs.size());
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        staging_pp[i] = ggml_backend_sched_get_staging_size(sched.get(), backend_ptrs[i]);
+    }
+
     // reserve with tg (token generation) graph to get the number of splits and nodes
     if (cparams.training) {
         // no tg graph for training
@@ -865,6 +871,18 @@ void llama_context::sched_reserve() {
         }
     }
 
+    // a prefetched ubatch that seeds the MoE cache from its own ids copies the experts of the cached layers once the ids are known, the
+    // graph allocator holds these copies instead of the staging memory (see sched_copy_all_experts): reserve this graph too if the
+    // devices have room for it, else such a ubatch does not seed (see moe_cache_seed_begin), before the pp graph that sizes the arena
+    // a memory measurement (e.g. --fit) does not count it: the seed only uses memory that is left, it never moves weights off a device
+    moe_cache_seed_fits = true;
+    if (moe_cache && moe_cache_seed_sync && !model.hparams.no_alloc && n_tokens > llama_moe_cache::n_small_max && (int64_t) n_tokens >= prefetch_min_batch) {
+        moe_cache_seed_fits = sched_reserve_seed(n_tokens, n_seqs, n_outputs_pp, mctx.get(), staging_pp);
+        if (!moe_cache_seed_fits) {
+            moe_cache->seed_unavailable();
+        }
+    }
+
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
@@ -884,17 +902,6 @@ void llama_context::sched_reserve() {
 
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
-        }
-
-        // the ubatch that seeds the MoE cache keeps the experts it copies in the graph allocation (see sched_copy_all_experts), it needs
-        // more memory: when the cache lends memory to large graphs, this one must fit too, else the compute buffer holds it from the start
-        if (moe_cache && moe_cache->lends_graph() && moe_cache_seed_enabled && !model.hparams.no_alloc && n_tokens > llama_moe_cache::n_small_max) {
-            moe_cache_seed = true;
-            gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
-            moe_cache_seed = false;
-            if (!gf) {
-                throw std::runtime_error("failed to allocate compute pp buffers");
-            }
         }
     }
 
@@ -932,6 +939,56 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+}
+
+bool llama_context::sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const std::vector<size_t> & staging_pp) {
+    // headroom for the memory the backends allocate while computing (e.g. the CUDA pool), which a larger compute buffer would take
+    constexpr size_t margin = 512ull*1024*1024;
+
+    // the measure may release a graph allocator buffer that is too small for this graph, the free memory then includes it
+    std::vector<size_t> cur(backend_ptrs.size(), 0);
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        cur[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+    }
+
+    std::vector<size_t> sizes(backend_ptrs.size(), 0);
+    moe_cache_seed = true;
+    graph_reserve(n_tokens, n_seqs, n_outputs, mctx, /*split_only =*/ true, sizes.data());
+    moe_cache_seed = false;
+
+    bool fits = true;
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        const size_t staging = std::min(sizes[i], ggml_backend_sched_get_staging_size(sched.get(), backend_ptrs[i]));
+        const size_t graph   = sizes[i] - staging;
+        const size_t cur_gph  = cur[i] - std::min(cur[i], staging_pp[i]);
+        const size_t released = cur[i] - std::min(cur[i], ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]));
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+        if (graph <= cur_gph || dev == nullptr || ggml_backend_buft_is_host(backend_buft[i])) {
+            continue;
+        }
+        size_t free  = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        free -= std::min(free, released);
+        if (free < graph - cur_gph + margin) {
+            LLAMA_LOG_WARN("%s: %s: the ubatch that seeds the MoE cache needs %.2f MiB more compute buffer, %.2f MiB free (with %.0f MiB of headroom): "
+                "prompts do not seed the cache from their own ids (a smaller --moe-cache-mib keeps the seed)\n", __func__,
+                ggml_backend_buft_name(backend_buft[i]), (graph - cur_gph)/1024.0/1024.0, free/1024.0/1024.0, margin/1024.0/1024.0);
+            fits = false;
+        }
+    }
+    if (!fits) {
+        return false;
+    }
+
+    moe_cache_seed = true;
+    ggml_cgraph * gf = graph_reserve(n_tokens, n_seqs, n_outputs, mctx);
+    moe_cache_seed = false;
+    if (!gf) {
+        LLAMA_LOG_WARN("%s: the ubatch that seeds the MoE cache does not fit, prompts do not seed the cache from their own ids\n", __func__);
+        return false;
+    }
+    return true;
 }
 
 void llama_context::synchronize() {
@@ -3226,8 +3283,11 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
         } else if (moe_cache_seed_sync) {
             if (n_outputs_ub == 0 && moe_cache->has_seed_counts()) {
                 moe_cache_seed_prev = true;
-            } else {
+            } else if (moe_cache_seed_fits) {
                 moe_cache_seed = true;
+            } else {
+                // the graph of this seed was not reserved (see sched_reserve_seed), the ubatch runs as with LLAMA_MOE_CACHE_SEED=1
+                moe_cache->count_seed_skipped();
             }
         }
     }
