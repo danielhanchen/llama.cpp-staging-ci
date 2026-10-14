@@ -4272,15 +4272,23 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
         need[owner[i]] += GGML_PAD(winfos[i].size, 64);
     }
 
+    // staging buffers replaced by larger ones; freed by the worker thread below, after the copies.
+    // Freeing pinned host memory (cudaFreeHost) synchronizes the device, so freeing the old buffer here, before the new
+    // allocation, drained the queued ubatch and left the GPU idle for the whole cudaMallocHost of the new one.
+    std::vector<ggml_backend_buffer_ptr> retired;
+
     for (size_t b = 0; ok && b < state_async.size(); ++b) {
         auto & sa = state_async[b];
         if (need[b] == 0 || (sa.staging && ggml_backend_buffer_get_size(sa.staging.get()) >= need[b])) {
             continue;
         }
 
-        sa.staging.reset();
-        sa.staging.reset(ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(sa.dev), need[b]));
-        if (!sa.staging) {
+        ggml_backend_buffer_ptr grown(ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(sa.dev), need[b]));
+        if (grown) {
+            retired.push_back(std::move(sa.staging));
+            sa.staging = std::move(grown);
+        }
+        if (!sa.staging || ggml_backend_buffer_get_size(sa.staging.get()) < need[b]) {
             LLAMA_LOG_WARN("%s: failed to allocate a %.2f MiB staging buffer, saving the state synchronously\n", __func__, need[b]/1024.0/1024.0);
             ok = false;
             break;
@@ -4325,13 +4333,14 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
         return;
     }
 
-    state_async_worker = std::thread([jobs = std::move(jobs), events = std::move(events)]() {
+    state_async_worker = std::thread([jobs = std::move(jobs), events = std::move(events), retired = std::move(retired)]() mutable {
         for (auto * ev : events) {
             ggml_backend_event_synchronize(ev);
         }
         for (const auto & j : jobs) {
             memcpy(j.dst, j.src, j.size);
         }
+        retired.clear();
     });
 }
 
