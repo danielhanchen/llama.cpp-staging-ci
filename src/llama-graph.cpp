@@ -3169,7 +3169,9 @@ kv_host_mode llm_graph_context::kv_host_attn_mode(const ggml_tensor * k, const g
         return KV_HOST_NONE;
     }
     if (n_tokens >= min_batch) {
-        return KV_HOST_STAGE;
+        // LLAMA_KV_STAGE=0: the prompt's attention reads the host rows through the scheduler's synchronous input copy
+        static const bool stage = getenv("LLAMA_KV_STAGE") == nullptr || atoi(getenv("LLAMA_KV_STAGE")) != 0;
+        return stage ? KV_HOST_STAGE : KV_HOST_NONE;
     }
     if (strcmp(decode, "gpu") == 0) {
         return KV_HOST_NONE;
