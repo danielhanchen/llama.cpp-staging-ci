@@ -1126,7 +1126,7 @@ struct ggml_backend_sched {
     bool   pf_adapt;      // adapting (not settled yet)
     int    pf_adapt_max;  // largest depth tried
     int    pf_adapt_from; // depth before the last step (0: no step taken yet)
-    double pf_adapt_prev; // stall ratio before the last step
+    double pf_adapt_prev; // milliseconds waited per graph before the last step
     double pf_acc_stall;  // milliseconds waited for copies since the last decision
     double pf_acc_busy;   // milliseconds of the timed spans
     int    pf_acc_n;      // graphs measured since the last decision
@@ -3631,13 +3631,14 @@ static void ggml_backend_sched_prefetch_adapt(ggml_backend_sched_t sched) {
         return;
     }
     const double ratio = sched->pf_acc_stall / sched->pf_acc_busy;
+    const double stall = sched->pf_acc_stall / sched->pf_acc_n; // the wait time itself: a deeper prefetch also shortens the graph
     const int    from  = sched->pf_depth;
     // staging in lent memory (e.g. slots of a MoE cache): a larger depth borrows more of it, which costs the lender more than the waits it saves
     bool lent = false;
     for (int b = 0; b < sched->n_backends; b++) {
         lent = lent || sched->pf[b].lent > 0;
     }
-    if (sched->pf_adapt_from > 0 && ratio > 0.75*sched->pf_adapt_prev) {
+    if (sched->pf_adapt_from > 0 && stall > 0.75*sched->pf_adapt_prev) {
         // the last step did not cut the waits enough: back to the depth before it, and give back the memory of the larger arena
         sched->pf_depth = sched->pf_adapt_from;
         sched->pf_adapt = false;
@@ -3645,14 +3646,14 @@ static void ggml_backend_sched_prefetch_adapt(ggml_backend_sched_t sched) {
             sched->pf[b].shrink = true;
         }
     } else if (ratio > 0.02 && sched->pf_depth < sched->pf_adapt_max && !lent) {
-        sched->pf_adapt_prev = ratio;
+        sched->pf_adapt_prev = stall;
         sched->pf_adapt_from = sched->pf_depth;
         sched->pf_depth++;
     } else {
         sched->pf_adapt = false;
     }
-    GGML_LOG_INFO("%s: host weight prefetch: splits waited %.1f%% of %.1f ms for their copies at depth %d (%d graphs): %s depth %d%s\n", __func__,
-        100.0*ratio, sched->pf_acc_busy, from, sched->pf_acc_n, sched->pf_adapt ? "trying" : "settled at", sched->pf_depth,
+    GGML_LOG_INFO("%s: host weight prefetch: splits waited %.1f%% of %.1f ms (%.1f ms per graph) for their copies at depth %d (%d graphs): %s depth %d%s\n", __func__,
+        100.0*ratio, sched->pf_acc_busy, stall, from, sched->pf_acc_n, sched->pf_adapt ? "trying" : "settled at", sched->pf_depth,
         lent && !sched->pf_adapt ? " (staging in lent memory)" : "");
     sched->pf_acc_stall = 0.0;
     sched->pf_acc_busy  = 0.0;
