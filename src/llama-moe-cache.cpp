@@ -545,10 +545,11 @@ struct llama_moe_cache::impl {
 
     // eviction policy (LLAMA_MOE_CACHE_POLICY): clock (default) = CLOCK on the device, LRU on the host; decay = decayed use counters
     // of every expert, the misses evict the lowest ones (see moe_cache_lru and ggml_moe_cache_set_scores), for the groups that cache
-    // less than decay_max_share of their experts (above, measured: as many or more misses than CLOCK), the others keep clock
+    // less than decay_max_share of their experts, the others keep clock (measured on a G4: 1.04-1.08x decode at 15-16% cached, neutral
+    // at 38-44%, 0.986x with more misses at 41% on Qwen3.8-Flash-Next, more misses at 60%)
     bool   policy_decay    = false;
     double half_life       = 0.0; // LLAMA_MOE_CACHE_HALF_LIFE, in tokens; 0 = clamp(64 x cached share, 8, 64)
-    double decay_max_share = 0.5; // LLAMA_MOE_CACHE_DECAY_MAX_SHARE
+    double decay_max_share = 0.3; // LLAMA_MOE_CACHE_DECAY_MAX_SHARE
     std::vector<std::pair<void (*)(void *), void *>> mapped; // host buffers mapped by the cache, with the function that unmaps them
 
     // hybrid small batches (device lookups only): the host computes the missing experts that are not fetched
