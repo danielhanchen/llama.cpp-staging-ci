@@ -1,4 +1,5 @@
 #include "llama-moe-cache.h"
+#include "llama-sysmem.h"
 
 #include "llama-ext.h"
 #include "llama-impl.h"
@@ -10,6 +11,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <map>
+#include <set>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -1355,6 +1357,34 @@ struct llama_moe_cache::impl {
             }
             auto host_map   = (host_map_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_map");
             auto host_unmap = (host_unmap_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_unmap");
+
+            // registering a memory-mapped file pins all of its pages, which must then fit in system memory: when the file buffers this
+            // group would register exceed the available memory (llama_sysmem::available, minus a margin), registering fails only after
+            // faulting in most of them (OOM after 83 s for 37 GiB of experts on a 31 GiB host), so it is not tried
+            // (LLAMA_MOE_CACHE_MAP_CHECK=0 tries anyway); buffers in anonymous memory are resident already and are not counted
+            {
+                const char * env = getenv("LLAMA_MOE_CACHE_MAP_CHECK");
+                if (env == nullptr || atoi(env) != 0) {
+                    std::set<ggml_backend_buffer_t> bufs;
+                    uint64_t need = 0;
+                    for (int32_t il : g.layers) {
+                        for (const ggml_tensor * t : layers[il].experts) {
+                            if (dev_base.count({ dev, t->buffer }) == 0 && bufs.insert(t->buffer).second &&
+                                    strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer)), "CPU_Mapped") == 0) {
+                                need += ggml_backend_buffer_get_size(t->buffer);
+                            }
+                        }
+                    }
+                    const uint64_t avail  = need > 0 ? llama_sysmem::available() : 0;
+                    const uint64_t margin = std::max<uint64_t>(UINT64_C(2) << 30, need/16);
+                    if (need > 0 && avail > 0 && need + margin > avail) {
+                        LLAMA_LOG_WARN("%s: %s: the host experts are memory-mapped files of %.0f MiB, more than the %.0f MiB of system memory "
+                            "available (less a %.0f MiB margin) could pin: the MoE cache uses host lookups for %zu layers (LLAMA_MOE_CACHE_MAP_CHECK=0 tries anyway)\n",
+                            __func__, ggml_backend_name(backend), need/1048576.0, avail/1048576.0, margin/1048576.0, g.layers.size());
+                        continue;
+                    }
+                }
+            }
 
             // the mappings this group adds are appended to mapped, the ones shared with earlier groups stay untouched
             const size_t n_mapped = mapped.size();
