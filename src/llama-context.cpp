@@ -379,8 +379,9 @@ llama_context::llama_context(
         const char * GGML_SCHED_PREFETCH_MIN_BATCH = getenv("GGML_SCHED_PREFETCH_MIN_BATCH");
         // LLAMA_MOE_CACHE_SEED=0 disables the seed of the MoE cache at the end of a prompt; by default (=2) a prefetched ubatch seeds
         // from the routing of an earlier ubatch, or else from its own ids read before its copies (see moe_cache_seed_begin)
-        // =1: only a ubatch whose expert copies read its ids seeds, a prefetched ubatch does not (faster prompts on a fast link, but the
-        // cache keeps less of the prompt's routing for the decode after it, and a slow link pays for the extra uploads)
+        // =1 (also turns on LLAMA_MOE_CACHE_PREFILL): only a ubatch whose expert copies read its ids seeds, a prefetched ubatch does not
+        // (faster prompts on a fast link, but the cache keeps less of the prompt's routing for the decode after it, and a slow link pays
+        // for the extra uploads)
         const char * LLAMA_MOE_CACHE_SEED = getenv("LLAMA_MOE_CACHE_SEED");
         moe_cache_seed_enabled = LLAMA_MOE_CACHE_SEED == nullptr || atoi(LLAMA_MOE_CACHE_SEED) != 0;
         moe_cache_seed_sync    = LLAMA_MOE_CACHE_SEED == nullptr || atoi(LLAMA_MOE_CACHE_SEED) == 2;

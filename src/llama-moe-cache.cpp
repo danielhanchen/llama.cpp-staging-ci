@@ -720,10 +720,12 @@ struct llama_moe_cache::impl {
             }
         }
 
-        // LLAMA_MOE_CACHE_PREFILL=0: the cache starts empty and is filled by generation and prompt seeds
+        // LLAMA_MOE_CACHE_PREFILL=1: fill the cache at load (default only with LLAMA_MOE_CACHE_SEED=1, where prompts do not seed it);
+        // with the default seeding a prefilled cache made the first prompts slower, so it starts empty there
         if (!model.hparams.no_alloc) {
-            const char * env = getenv("LLAMA_MOE_CACHE_PREFILL");
-            if (env == nullptr || atoi(env) != 0) {
+            const char * env  = getenv("LLAMA_MOE_CACHE_PREFILL");
+            const char * seed = getenv("LLAMA_MOE_CACHE_SEED");
+            if (env != nullptr ? atoi(env) != 0 : seed != nullptr && atoi(seed) == 1) {
                 prefill();
             }
         }
