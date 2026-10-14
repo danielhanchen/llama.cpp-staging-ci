@@ -4730,7 +4730,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_q8_1_cache & cache = cuda_ctx->q8_1_cache;
         if (cache.active() && cuda_ctx->curr_stream_no == 0 && cache.norm_targets.count(mul->data) && ggml_is_contiguous(mul)) {
             const int64_t ne10_padded = GGML_PAD(mul->ne[0], MATRIX_ROW_PADDING);
-            const int64_t key[ggml_cuda_q8_1_cache::n_key] = { mul->ne[0], ggml_nrows(mul), 1, 1, 0, 0, 0 };
+            const int64_t key[ggml_cuda_q8_1_cache::n_key] = { mul->ne[0], ggml_nrows(mul), 1, 1, -1, -1, -1 };
             q8_1_out = cache.reserve(mul->data, ggml_nbytes(mul), key, ggml_nrows(mul)*ne10_padded/QK8_1*sizeof(block_q8_1));
         }
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, mul, q8_1_out);
