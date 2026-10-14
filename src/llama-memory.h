@@ -82,6 +82,10 @@ struct llama_memory_i {
 
     virtual ~llama_memory_i() = default;
 
+    // set by the owning context: completes its pending asynchronous state reads (LLAMA_STATE_SEQ_FLAGS_ASYNC)
+    // called before the data buffers are changed outside of a graph
+    std::function<void()> wait_state_reads;
+
     // split the input batch into a set of ubatches and verify that they can fit into the cache
     // return a context object containing the ubatches and memory state required to process them
     // check the llama_memory_context_i::get_status() for the result
