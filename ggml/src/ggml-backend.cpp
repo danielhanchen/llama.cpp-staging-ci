@@ -1002,6 +1002,7 @@ struct ggml_backend_sched_prefetch {
     int  n_timers_cap;
     int  n_timed;   // prefetched splits timed in the last computed graph (2 events each, plus the first and last)
     bool timed;     // the last computed graph recorded timers that were not read yet
+    bool shrink;    // the adaptive depth went back to a smaller depth: reallocate a larger arena at the next binding
 
     // prefetched splits of the current graph
     int * split_ids;
@@ -2832,9 +2833,10 @@ static bool ggml_backend_sched_prefetch_ensure(ggml_backend_sched_t sched, int b
         return true;
     }
 
-    if (pf->arena != NULL && pf->arena_size >= pf->staging) {
+    if (pf->arena != NULL && pf->arena_size >= pf->staging && !(pf->shrink && pf->arena_size > pf->staging)) {
         return true;
     }
+    pf->shrink = false;
 
     // the old arena (if any) may still be read or written
     ggml_backend_sched_prefetch_sync(sched);
@@ -3631,9 +3633,12 @@ static void ggml_backend_sched_prefetch_adapt(ggml_backend_sched_t sched) {
     const double ratio = sched->pf_acc_stall / sched->pf_acc_busy;
     const int    from  = sched->pf_depth;
     if (sched->pf_adapt_from > 0 && ratio > 0.75*sched->pf_adapt_prev) {
-        // the last step did not cut the waits enough: back to the depth before it
+        // the last step did not cut the waits enough: back to the depth before it, and give back the memory of the larger arena
         sched->pf_depth = sched->pf_adapt_from;
         sched->pf_adapt = false;
+        for (int b = 0; b < sched->n_backends; b++) {
+            sched->pf[b].shrink = true;
+        }
     } else if (ratio > 0.02 && sched->pf_depth < sched->pf_adapt_max) {
         sched->pf_adapt_prev = ratio;
         sched->pf_adapt_from = sched->pf_depth;
