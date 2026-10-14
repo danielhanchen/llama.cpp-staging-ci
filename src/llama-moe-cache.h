@@ -49,6 +49,11 @@ public:
     bool hybrid_probe_pending() const;
     void hybrid_probe(ggml_backend_t backend_cpu);
 
+    // fixed share (LLAMA_MOE_CACHE_FETCH): the cache, the use counters and the residual of the share are reset before a batch whose
+    // sequences are all empty and after a state is read, so the same request gives the same output as in a new process
+    bool hybrid_fixed() const;
+    void hybrid_reset();
+
     // auto mode: before the graph of each ubatch while the trial runs, after the previous ubatch finished (backends synchronized);
     // switches between the plain and the hybrid path, then keeps the faster one (see hybrid_active)
     bool hybrid_window_pending() const;

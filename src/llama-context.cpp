@@ -2047,6 +2047,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
+    // hybrid MoE cache with a fixed share: a new request (every sequence of the batch is empty) starts from an empty cache
+    if (moe_cache && moe_cache->hybrid_fixed()) {
+        bool fresh = true;
+        for (const auto & tok : batch_inp.tokens) {
+            for (auto seq_id : tok.seq_ids) {
+                fresh = fresh && memory->seq_pos_max(seq_id) < 0;
+            }
+            if (!fresh) {
+                break;
+            }
+        }
+        if (fresh) {
+            moe_cache->hybrid_reset();
+        }
+    }
+
     if (output_all) {
         // require that all tokens are output
         if (n_outputs_all != n_tokens_all) {
@@ -4168,6 +4184,11 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 size_t llama_context::state_read_data(llama_io_read_i & io) {
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
 
+    // the next batches continue the state read, not the batches before: see llama_moe_cache::hybrid_reset
+    if (moe_cache) {
+        moe_cache->hybrid_reset();
+    }
+
     // read model info
     {
         LLAMA_LOG_DEBUG("%s: - reading model info\n", __func__);
@@ -4353,6 +4374,9 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (moe_cache) {
+        moe_cache->hybrid_reset();
+    }
     if (memory) {
         memory->state_read(io, seq_id, flags);
     }
