@@ -49,6 +49,9 @@ struct server_prompt_ssd {
     // read and validate an entry; on failure the file is deleted (unless read-only) and false is returned
     bool read(const entry & e, server_prompt_cache_state & out);
 
+    // an entry that was read but could not be restored (incompatible state): removed like a corrupt one
+    void drop(const entry & e);
+
     size_t size() const;
     size_t count() const;
 

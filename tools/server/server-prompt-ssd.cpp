@@ -625,6 +625,17 @@ bool server_prompt_ssd::read(const entry & e, server_prompt_cache_state & out) {
     return ok;
 }
 
+void server_prompt_ssd::drop(const entry & e) {
+    std::lock_guard<std::mutex> lock(mtx);
+    for (size_t i = 0; i < index.size(); ++i) {
+        if (index[i].path == e.path) {
+            SRV_WRN("prompt cache: '%s' cannot be restored%s\n", e.path.c_str(), params.readonly ? "" : " - deleted");
+            remove_locked(i);
+            break;
+        }
+    }
+}
+
 //
 // namespace
 //

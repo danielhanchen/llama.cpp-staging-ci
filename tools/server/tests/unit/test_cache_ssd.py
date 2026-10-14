@@ -29,10 +29,10 @@ def make_server(root, preset=ServerPreset.tinyllama2):
     return server
 
 
-def complete(server, prompt, **kw):
+def complete(server, prompt, timeout=DEFAULT_REQUEST_TIMEOUT, **kw):
     data = {"prompt": prompt, "cache_prompt": True, "n_probs": 4}
     data.update(kw)
-    res = server.make_request("POST", "/completion", data=data)
+    res = server.make_request("POST", "/completion", data=data, timeout=timeout)
     assert res.status_code == 200, res.body
     return res.body
 
@@ -229,17 +229,18 @@ def test_hybrid_restart_exact(tmp_path):
         return server
 
     base = "Explain in detail how a binary search tree keeps its keys ordered, and how insertion works. " * 6
+    T = 3600  # CPU-only runs of a 35B model are slow
     server = hybrid_server()
     server.start(timeout_seconds=600)
-    e1 = complete(server, base + "First, describe the search.")
-    e2 = complete(server, base + "Now describe deletion instead.")
+    e1 = complete(server, base + "First, describe the search.", timeout=T)
+    e2 = complete(server, base + "Now describe deletion instead.", timeout=T)
     server.stop()
     assert len(lpc_files(root)) == 1
 
     server = hybrid_server()
     server.start(timeout_seconds=600)
-    a2 = complete(server, base + "Now describe deletion instead.")  # exact prefix of the saved state
+    a2 = complete(server, base + "Now describe deletion instead.", timeout=T)  # exact prefix of the saved state
     assert a2["timings"]["cache_n"] > 0
     assert a2["content"] == e2["content"]
-    a1 = complete(server, base + "First, describe the search.")      # diverges inside: needs a checkpoint
+    a1 = complete(server, base + "First, describe the search.", timeout=T)      # diverges inside: needs a checkpoint
     assert a1["content"] == e1["content"]

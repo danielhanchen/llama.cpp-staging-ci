@@ -1845,12 +1845,14 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                     const size_t size = st.data.main.size();
                     if (llama_state_seq_set_data_ext(ctx_tgt, st.data.main.data(), size, id_slot, 0) != size) {
                         SRV_ERR("failed to restore state with size %zu from the SSD tier\n", size);
+                        ssd->drop(e);
                         return false;
                     }
                     if (!st.data.drft.empty()) {
                         const size_t size_dft = st.data.drft.size();
                         if (ctx_dft == nullptr || llama_state_seq_set_data_ext(ctx_dft, st.data.drft.data(), size_dft, id_slot, 0) != size_dft) {
                             SRV_WRN("failed to restore draft state with size %zu from the SSD tier\n", size_dft);
+                            ssd->drop(e);
                             return false;
                         }
                     }
