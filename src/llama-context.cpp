@@ -377,12 +377,13 @@ llama_context::llama_context(
         // smallest ubatch whose host weights the scheduler prefetches (see sched_prefetch_mode)
         const char * GGML_SCHED_PREFETCH           = getenv("GGML_SCHED_PREFETCH");
         const char * GGML_SCHED_PREFETCH_MIN_BATCH = getenv("GGML_SCHED_PREFETCH_MIN_BATCH");
-        // LLAMA_MOE_CACHE_SEED=0 disables the seed of the MoE cache at the end of a prompt; by default (=1) only a ubatch whose expert
-        // copies read its ids seeds (see moe_cache_seed_begin)
-        // =2 also seeds a prefetched ubatch, from the routing of an earlier ubatch or else from its own ids read before its copies
+        // LLAMA_MOE_CACHE_SEED=0 disables the seed of the MoE cache at the end of a prompt; by default (=2) a prefetched ubatch seeds
+        // from the routing of an earlier ubatch, or else from its own ids read before its copies (see moe_cache_seed_begin)
+        // =1: only a ubatch whose expert copies read its ids seeds, a prefetched ubatch does not (faster prompts on a fast link, but the
+        // cache keeps less of the prompt's routing for the decode after it, and a slow link pays for the extra uploads)
         const char * LLAMA_MOE_CACHE_SEED = getenv("LLAMA_MOE_CACHE_SEED");
         moe_cache_seed_enabled = LLAMA_MOE_CACHE_SEED == nullptr || atoi(LLAMA_MOE_CACHE_SEED) != 0;
-        moe_cache_seed_sync    = LLAMA_MOE_CACHE_SEED != nullptr && atoi(LLAMA_MOE_CACHE_SEED) == 2;
+        moe_cache_seed_sync    = LLAMA_MOE_CACHE_SEED == nullptr || atoi(LLAMA_MOE_CACHE_SEED) == 2;
         // =3: a prefetched ubatch also seeds from its own ids, each layer once it is computed (lagged, the copies do not wait, but the
         // host waits for each layer two splits back, which can starve the device)
         // the lagged seed needs the layer of a staged copy to be queued for compute when a later copy reuses its staging slot (depth <= 2)
@@ -3188,7 +3189,7 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
     // a ubatch below the prefetch threshold copies only its routed experts, so it seeds from its own ids (a stored routing could name unstaged experts)
     const bool prefetch = ubatch.n_tokens >= prefetch_min_batch;
 
-    // LLAMA_MOE_CACHE_SEED=2: read the routing outputs of the previous large ubatch before this graph replaces them, unless this ubatch
+    // LLAMA_MOE_CACHE_SEED=2 (default): read the routing outputs of the previous large ubatch before this graph replaces them, unless this ubatch
     // records newer ones without seeding
     if (moe_cache_seed_sync && cont && !moe_cache_ids.empty() && n_outputs_ub == 0 && (!large || (last_large && prefetch))) {
         ggml_backend_sched_synchronize(sched.get());
@@ -3210,9 +3211,8 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
 
     // the last large ubatch of the batch seeds the cache even without outputs: a caller may run the last prompt tokens as a separate small batch (e.g. server checkpoints)
     // a ubatch below the prefetch threshold reads its ids for its copies anyway, it seeds from them
-    // a prefetched ubatch does not seed by default: reading its own ids first serializes the expert uploads with the compute of every
-    // layer, and a seed from the routing of an earlier ubatch rewrites the cache at every ubatch of a long prompt for little gain
-    // LLAMA_MOE_CACHE_SEED=2: as before (earlier routing if any, else own ids read first), =3: own ids, each layer once computed (lagged)
+    // a prefetched ubatch: =2 (default) seeds from the routing of an earlier ubatch if any, else reads its own ids first (this serializes
+    // its expert uploads with the compute of every layer); =1 does not seed it; =3 seeds from its own ids, each layer once computed (lagged)
     moe_cache_record    = large && prefetch_min_batch != INT64_MAX && moe_cache_seed_sync;
     moe_cache_seed      = false;
     moe_cache_seed_prev = false;

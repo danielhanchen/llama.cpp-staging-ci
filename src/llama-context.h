@@ -429,7 +429,7 @@ private:
     bool moe_cache_seed_prev    = false;
     bool moe_cache_record       = false;
     bool moe_cache_seed_enabled = true; // LLAMA_MOE_CACHE_SEED != 0
-    bool moe_cache_seed_sync    = false; // LLAMA_MOE_CACHE_SEED=2: a prefetched ubatch seeds (earlier routing, else its own ids read first)
+    bool moe_cache_seed_sync    = true;  // LLAMA_MOE_CACHE_SEED=2 (default): a prefetched ubatch seeds (earlier routing, else its own ids read first)
     bool moe_cache_seed_lag_ok  = false; // LLAMA_MOE_CACHE_SEED=3 with a prefetch depth <= 2, see moe_cache_seed_lag
 
     // seed_lag: a prefetched ubatch seeds each layer from its own ids once the layer is computed, from its staged copy, before the
