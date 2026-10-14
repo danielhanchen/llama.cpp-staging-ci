@@ -318,10 +318,13 @@ static void common_params_fit_impl(
 
     // dense models spill FFN tensors before whole layers: a layer that is moved to system memory takes its attention and its KV cache with it,
     // while an FFN tensor in system memory only adds a weight upload (prompt batches) or a CPU matrix-vector product (token generation)
-    // LLAMA_FIT_DENSE_FFN=0 restores the old behaviour, which spilled whole layers; user tensor overrides are kept as constraints
-    const char * fit_dense_ffn_env = getenv("LLAMA_FIT_DENSE_FFN");
-    const bool   fit_dense_ffn     = nd > 0 && hp_nex == 0 &&
-        (fit_dense_ffn_env == nullptr || atoi(fit_dense_ffn_env) != 0);
+    // if the layers do not fit even without their FFN tensors, the layers in device memory keep only their attention, norms and KV cache
+    // and the first layers go to system memory whole: more attention and KV cache stays in device memory than with whole layers
+    // LLAMA_FIT_DENSE_FFN=0 restores the old behaviour, which spilled whole layers, =2 spills whole layers in that case;
+    // user tensor overrides are kept as constraints
+    const char * fit_dense_ffn_env  = getenv("LLAMA_FIT_DENSE_FFN");
+    const int    fit_dense_ffn_mode = fit_dense_ffn_env == nullptr ? 1 : atoi(fit_dense_ffn_env);
+    const bool   fit_dense_ffn      = nd > 0 && hp_nex == 0 && fit_dense_ffn_mode != 0;
 
     // the user overrides come first in every placement written below: the first matching pattern wins
     std::vector<llama_model_tensor_buft_override> tbo_user;
@@ -697,8 +700,7 @@ static void common_params_fit_impl(
     // step 3: iteratively fill the back to front with "dense" layers
     //   - for a dense model simply fill full layers, giving each device a contiguous slice of the model
     //   - for a MoE model, same as dense model but with all MoE tensors in system memory
-    //   - for a dense model with fit_dense_ffn, same as a MoE model with the FFN tensors in the place of the MoE tensors,
-    //     unless the layers do not fit in device memory even without their FFN tensors, then full layers are filled as before
+    //   - for a dense model with fit_dense_ffn, same as a MoE model with the FFN tensors in the place of the MoE tensors
 
     // utility function that returns a static C string matching the tensors for a specific layer index and layer fraction:
     auto get_overflow_pattern = [&](const size_t il, const common_layer_fraction_t lf) -> const char * {
@@ -957,10 +959,13 @@ static void common_params_fit_impl(
             global_surplus_cpu_moe += dmds_cpu_ffn[id].free;
             global_surplus_cpu_moe -= int64_t(dmds_cpu_ffn[id].mb.total()) + margins[id];
         }
-        partial_layers = global_surplus_cpu_moe > 0;
-        if (partial_layers) {
+        partial_layers = global_surplus_cpu_moe > 0 || fit_dense_ffn_mode != 2;
+        if (global_surplus_cpu_moe > 0) {
             LOG_TRC("%s: with the FFN tensors in system memory there is a total surplus of %" PRId64 " MiB, spilling FFN tensors before layers\n",
                 __func__, global_surplus_cpu_moe/MiB);
+        } else if (partial_layers) {
+            LOG_TRC("%s: with the FFN tensors in system memory there is still a total deficit of %" PRId64 " MiB, "
+                "spilling the FFN tensors of the layers in device memory and the other layers whole\n", __func__, -global_surplus_cpu_moe/MiB);
         } else {
             LOG_TRC("%s: with the FFN tensors in system memory there is still a total deficit of %" PRId64 " MiB, spilling whole layers\n",
                 __func__, -global_surplus_cpu_moe/MiB);
