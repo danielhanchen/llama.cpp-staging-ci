@@ -3149,11 +3149,11 @@ static ggml_backend_t kv_host_gpu_backend(ggml_backend_sched_t sched) {
 
 kv_host_mode llm_graph_context::kv_host_attn_mode(const ggml_tensor * k, const ggml_tensor * v) const {
     // LLAMA_KV_PREFETCH=0: off; LLAMA_KV_PREFETCH_MIN_BATCH (32): smallest batch staged on the GPU;
-    // LLAMA_KV_DECODE=auto|gpu|cpu, LLAMA_KV_STREAM_MAX_MIB (16): below that batch, attention on the CPU when the layer's K+V
-    // views exceed this many MiB (auto), always (cpu) or never (gpu)
+    // LLAMA_KV_DECODE=gpu|auto|cpu, LLAMA_KV_STREAM_MAX_MIB (16): below that batch, attention on the CPU never (gpu, default:
+    // the pinned stream measured faster than the CPU FA on an L4 VM), when the layer's K+V views exceed this many MiB (auto), always (cpu)
     static const bool    enabled   = getenv("LLAMA_KV_PREFETCH") == nullptr || atoi(getenv("LLAMA_KV_PREFETCH")) != 0;
     static const int64_t min_batch = getenv("LLAMA_KV_PREFETCH_MIN_BATCH") ? std::max(1, atoi(getenv("LLAMA_KV_PREFETCH_MIN_BATCH"))) : 32;
-    static const char *  decode    = getenv("LLAMA_KV_DECODE") ? getenv("LLAMA_KV_DECODE") : "auto";
+    static const char *  decode    = getenv("LLAMA_KV_DECODE") ? getenv("LLAMA_KV_DECODE") : "gpu";
     static const double  max_mib   = getenv("LLAMA_KV_STREAM_MAX_MIB") ? atof(getenv("LLAMA_KV_STREAM_MAX_MIB")) : 16.0;
 
     if (!enabled || !cparams.flash_attn || k == nullptr || v == nullptr || k->view_src == nullptr || v->view_src == nullptr) {

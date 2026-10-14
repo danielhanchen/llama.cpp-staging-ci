@@ -84,7 +84,11 @@ llama_memory_recurrent::llama_memory_recurrent(
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
-        if (offload) {
+        // the recurrent states are small and every token reads and writes all of them, so they stay with their layer
+        // even when the KV cache is kept in host memory (-nkvo); LLAMA_KV_PREFETCH=0: they follow -nkvo as before
+        static const bool keep_on_device = getenv("LLAMA_KV_PREFETCH") == nullptr || atoi(getenv("LLAMA_KV_PREFETCH")) != 0;
+
+        if (offload || keep_on_device) {
             auto * dev = model.dev_layer(i);
             buft = ggml_backend_dev_buffer_type(dev);
 
