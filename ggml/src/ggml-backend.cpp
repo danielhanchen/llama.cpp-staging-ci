@@ -1114,8 +1114,13 @@ struct ggml_backend_sched {
     bool pf_active;    // the current graph has prefetched splits
     int  pf_depth0;    // depth at the start (GGML_SCHED_PREFETCH_DEPTH or the default)
     bool pf_window;    // depth > 2: byte ring layout sized by the live bytes of `depth` consecutive splits [GGML_SCHED_PREFETCH_WINDOW]
-    bool pf_cross;     // cross-graph arm of the first copies [GGML_SCHED_PREFETCH_CROSS]
+    int  pf_cross;     // cross-graph arm of the first copies [GGML_SCHED_PREFETCH_CROSS]: 0 off, 1 when the binding is expected to be
+                       // computed again (the previous binding was computed more times than this one so far), 2 after every computation
     uint32_t pf_gen;   // incremented by every binding of a graph
+    int  pf_runs;      // computations of the current binding
+    int  pf_prev_runs; // computations of the previous binding (llama reuses the graph of a ubatch while the KV window does not grow)
+    int64_t pf_n_armed;    // stats: splits armed
+    int64_t pf_n_arm_used; // stats: armed splits the next computation used
     // adaptive depth [GGML_SCHED_PREFETCH_ADAPT]: grow the depth while splits wait for their copies, keep a step only if it cuts the waits
     bool   pf_adapt;      // adapting (not settled yet)
     int    pf_adapt_max;  // largest depth tried
@@ -2993,6 +2998,10 @@ static bool ggml_backend_sched_is_lent(const struct ggml_backend_sched_prefetch 
 static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dry) {
     sched->pf_active = false;
     sched->pf_gen++;
+    if (!dry) {
+        sched->pf_prev_runs = sched->pf_runs;
+        sched->pf_runs      = 0;
+    }
     for (int b = 0; b < sched->n_backends; b++) {
         sched->pf[b].depth   = sched->pf_depth;
         sched->pf[b].ring    = false;
@@ -3579,6 +3588,7 @@ static void ggml_backend_sched_prefetch_arm(ggml_backend_sched_t sched) {
             }
             ggml_backend_sched_prefetch_copy(sched, b, split, k % pf->depth, k == 0 ? wait : NULL);
             pf->armed++;
+            sched->pf_n_armed++;
         }
         pf->armed_gen = sched->pf_gen;
     }
@@ -3820,11 +3830,13 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
     int prev_backend_id = -1;
 
     ggml_backend_sched_prefetch_adapt(sched);
+    sched->pf_runs++;
     bool timing[GGML_SCHED_MAX_BACKENDS] = { false };
     for (int b = 0; b < sched->n_backends; b++) {
         struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
         // copies armed after the previous computation of this binding are already queued
         pf->issued   = sched->pf_active && sched->pf_cross && pf->armed > 0 && pf->armed_gen == sched->pf_gen ? pf->armed : 0;
+        sched->pf_n_arm_used += pf->issued;
         pf->armed    = 0;
         pf->consumed = 0;
         pf->n_timed  = 0;
@@ -4043,7 +4055,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         ggml_backend_sched_ov_wait_uploads(sched, -1);
     }
 
-    if (sched->pf_active && sched->pf_cross) {
+    if (sched->pf_active && (sched->pf_cross == 2 || (sched->pf_cross == 1 && sched->pf_runs < sched->pf_prev_runs))) {
         ggml_backend_sched_prefetch_arm(sched);
     }
 
@@ -4128,7 +4140,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
         const char * GGML_SCHED_PREFETCH_CROSS  = getenv("GGML_SCHED_PREFETCH_CROSS");
         const char * GGML_SCHED_PREFETCH_ADAPT  = getenv("GGML_SCHED_PREFETCH_ADAPT");
         sched->pf_window    = GGML_SCHED_PREFETCH_WINDOW ? atoi(GGML_SCHED_PREFETCH_WINDOW) != 0 : true;
-        sched->pf_cross     = GGML_SCHED_PREFETCH_CROSS  ? atoi(GGML_SCHED_PREFETCH_CROSS)  != 0 : true;
+        sched->pf_cross     = GGML_SCHED_PREFETCH_CROSS  ? atoi(GGML_SCHED_PREFETCH_CROSS)       : 1;
         // an explicit depth is kept as is
         sched->pf_adapt     = (GGML_SCHED_PREFETCH_ADAPT ? atoi(GGML_SCHED_PREFETCH_ADAPT) != 0 : true) && GGML_SCHED_PREFETCH_DEPTH == NULL && sched->pf_mode != 0;
         sched->pf_adapt_max = std::min(4, GGML_SCHED_MAX_PREFETCH_DEPTH);
@@ -4147,6 +4159,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    if (sched->pf_n_armed > 0) {
+        GGML_LOG_INFO("%s: host weight prefetch: cross-graph arm: %lld splits armed, %lld used\n", __func__,
+            (long long) sched->pf_n_armed, (long long) sched->pf_n_arm_used);
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
