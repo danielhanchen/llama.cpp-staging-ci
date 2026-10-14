@@ -1241,6 +1241,107 @@ static struct llama_model_params common_model_params_to_llama_impl(common_params
 static enum llama_load_mode common_moe_cache_load_mode(const common_params & params, enum llama_load_mode load_mode, int32_t n_gpu_layers, bool experts_on_host);
 static bool common_experts_on_offloaded_host(const common_params & params, const llama_model_tensor_buft_override * overrides, int32_t n_gpu_layers);
 
+// MoE cache mode without -ub: every expert a prompt ubatch does not find in the cache is uploaded once per ubatch, so fewer, larger
+// ubatches upload less; the larger compute buffer (and SWA cache) is taken from the cache, the device memory stays what the default
+// ubatch would use. Picks the largest of 2048/4096/8192/16384 whose compute buffer growth over 2048 is at most LLAMA_MOE_PREFILL_UB_FRAC
+// (0.15) of the cache at 2048 (the decode after the prompt reads from the smaller cache). LLAMA_MOE_PREFILL_UB=0 disables, =N forces N.
+static void common_moe_cache_auto_ubatch(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
+    if (params.moe_cache_size == 0 || params.n_ubatch_set || params.embedding || cparams.embeddings || params.speculative.has_dft() ||
+        std::any_of(params.speculative.types.begin(), params.speculative.types.end(), [](auto t) { return t != COMMON_SPECULATIVE_TYPE_NONE; })) {
+        return;
+    }
+    const char * env = getenv("LLAMA_MOE_PREFILL_UB");
+    const int    force = env != nullptr ? atoi(env) : -1;
+    if (force == 0) {
+        return;
+    }
+    if (!common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
+        return;
+    }
+    double frac = 0.15;
+    if (const char * env_f = getenv("LLAMA_MOE_PREFILL_UB_FRAC")) {
+        frac = std::max(0.0, atof(env_f));
+    }
+
+    const uint32_t ub_def = std::min(cparams.n_batch, cparams.n_ubatch == 0 ? cparams.n_batch : cparams.n_ubatch);
+    // with causal attention the batch is limited by the context size (0 = the training context, not known here)
+    const uint32_t ub_lim = params.n_batch_set ? cparams.n_batch : (params.n_ctx > 0 ? (uint32_t) params.n_ctx : UINT32_MAX);
+    std::vector<uint32_t> cands = { 2048, 4096, 8192, 16384 };
+    if (force > 0) {
+        cands = { (uint32_t) force };
+    }
+    cands.erase(std::remove_if(cands.begin(), cands.end(), [&](uint32_t u) { return u <= ub_def || u > ub_lim; }), cands.end());
+    if (cands.empty()) {
+        return;
+    }
+
+    // device memory of a context at ubatch u, summed over the devices: {compute buffers, compute buffers + KV}; < 0 if the measure failed
+    struct mem { int64_t compute; int64_t total; };
+    const auto measure = [&](uint32_t u) -> mem {
+        llama_context_params cp = cparams;
+        cp.n_ubatch = u;
+        cp.n_batch  = std::max(cp.n_batch, u);
+        std::vector<ggml_backend_dev_t> devs;
+        uint32_t hp_ngl = 0, hp_nct = 0, hp_nex = 0;
+        try {
+            const common_device_memory_data_vec dmd = common_get_device_memory_data(params.model.path.c_str(), &mparams, &cp, devs, hp_ngl, hp_nct, hp_nex,
+                params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            if (dmd.size() < 2) {
+                return { -1, -1 }; // no device, nothing is cached
+            }
+            mem m = { 0, 0 };
+            for (size_t i = 0; i + 1 < dmd.size(); ++i) {
+                m.compute += (int64_t) dmd[i].compute;
+                m.total   += (int64_t) (dmd[i].context + dmd[i].compute);
+            }
+            return m;
+        } catch (const std::exception & e) {
+            COM_WRN("memory measure at n_ubatch = %u failed: %s\n", u, e.what());
+            return { -1, -1 };
+        }
+    };
+
+    const int64_t t0    = ggml_time_us();
+    const mem m_def = measure(ub_def);
+    const mem m_ref = measure(cands[0]);
+    if (m_def.total < 0 || m_ref.total < 0) {
+        return;
+    }
+    const int64_t cache    = (int64_t) params.moe_cache_size;
+    const int64_t cache_ref = cache - std::max<int64_t>(0, m_ref.total - m_def.total);
+    if (cache_ref < cache/2) {
+        COM_INF("MoE cache: n_ubatch stays %u, n_ubatch %u would take %.2f of %.2f MiB from the cache\n", ub_def, cands[0],
+            (m_ref.total - m_def.total)/1048576.0, cache/1048576.0);
+        return;
+    }
+    // the rule counts the compute buffers; the cache gives up their growth and that of the KV cache (e.g. the SWA cache, sized by n_ubatch)
+    uint32_t pick   = cands[0];
+    mem      m_pick = m_ref;
+    for (size_t i = 1; i < cands.size(); ++i) {
+        const mem m = measure(cands[i]);
+        if (m.total < 0 || (force <= 0 && (double) (m.compute - m_ref.compute) > frac*(double) cache_ref) || cache - (m.total - m_def.total) < cache/2) {
+            break;
+        }
+        pick   = cands[i];
+        m_pick = m;
+    }
+    const size_t cache_new = (size_t) (cache - std::max<int64_t>(0, m_pick.total - m_def.total));
+
+    COM_INF("MoE cache: n_ubatch = %u (default %u): +%.2f MiB of compute and KV memory taken from the cache, %.2f -> %.2f MiB "
+        "(compute growth over n_ubatch %u: %.2f MiB, at most %.0f%% of the cache; -ub or LLAMA_MOE_PREFILL_UB=0 to disable, %.0f ms)\n",
+        pick, ub_def, (m_pick.total - m_def.total)/1048576.0, cache/1048576.0, cache_new/1048576.0, cands[0], (m_pick.compute - m_ref.compute)/1048576.0,
+        100.0*frac, (ggml_time_us() - t0)/1000.0);
+
+    params.n_ubatch       = (int32_t) pick;
+    cparams.n_ubatch      = pick;
+    if (!params.n_batch_set) {
+        params.n_batch  = std::max<int32_t>(params.n_batch, (int32_t) pick);
+        cparams.n_batch = std::max<uint32_t>(cparams.n_batch, pick);
+    }
+    params.moe_cache_size  = cache_new;
+    cparams.moe_cache_size = cache_new;
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     // with --fit the MoE cache load mode is decided after the fit has placed the experts
@@ -1283,6 +1384,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         // decide on the params the model is loaded with, whatever the fit status: a failed or skipped fit leaves the user placement, which then decides like the path without --fit
         // the fitted overrides live in params.tensor_buft_overrides, which mparams points to
         mparams.load_mode = common_moe_cache_load_mode(params, mparams.load_mode, mparams.n_gpu_layers, common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers));
+    }
+
+    if (!model_only) {
+        common_moe_cache_auto_ubatch(params, mparams, cparams);
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
