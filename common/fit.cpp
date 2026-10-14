@@ -490,6 +490,87 @@ static void common_params_fit_impl(
 
     // step 2: try reducing memory use by reducing the context size
 
+    // MoE models can move their experts to system memory in step 3, the KV cache only pays for context.
+    // Before the context is cut below the kept size (LLAMA_FIT_CTX_KEEP, default 32768, 0 = training context),
+    // check whether that context fits with all experts in system memory; if so keep it and let step 3 spill instead.
+    // LLAMA_FIT_CTX_FIRST=1 restores the old order (context first).
+    // Returns true if cparams->n_ctx was set to a context > n_ctx_reduced, in which case step 3 has to run.
+    auto keep_ctx_by_spilling = [&](const uint32_t n_ctx_reduced, const int64_t sum_used_target) -> bool {
+        if (hp_nex == 0 || nd == 0) {
+            return false;
+        }
+        const char * env_first = getenv("LLAMA_FIT_CTX_FIRST");
+        if (env_first != nullptr && atoi(env_first) != 0) {
+            return false;
+        }
+        // step 3 can only spill if it is allowed to change the weight placement:
+        if (mparams->n_gpu_layers != default_mparams.n_gpu_layers || !tensor_buft_overrides ||
+                (mparams->tensor_buft_overrides && (mparams->tensor_buft_overrides->pattern || mparams->tensor_buft_overrides->buft) && tbo_user.empty()) ||
+                (nd > 1 && (!tensor_split || mparams->split_mode == LLAMA_SPLIT_MODE_ROW))) {
+            return false;
+        }
+        uint64_t keep = 32768;
+        if (const char * env_keep = getenv("LLAMA_FIT_CTX_KEEP")) {
+            keep = strtoull(env_keep, nullptr, 10);
+            if (keep == 0) {
+                keep = hp_nct;
+            }
+        }
+        const uint32_t n_ctx_keep = (uint32_t) std::min<uint64_t>(n_ctx_max, std::max<uint64_t>(n_ctx_min_total, keep * n_streams));
+        if (n_ctx_keep <= n_ctx_reduced) {
+            return false;
+        }
+
+        static const std::string pattern_moe_all = "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps"; // matches all MoE tensors
+        // the user overrides stay first, the MoE cache is left out: it only gets what remains after the layers and the context
+        std::vector<llama_model_tensor_buft_override> tbo_spill = tbo_user;
+        tbo_spill.push_back({pattern_moe_all.c_str(), ggml_backend_cpu_buffer_type()});
+        tbo_spill.push_back({nullptr, nullptr});
+        llama_model_params mparams_spill = *mparams;
+        mparams_spill.tensor_buft_overrides = tbo_spill.data();
+        llama_context_params cparams_spill = *cparams;
+        if (fit_moe_cache) {
+            cparams_spill.moe_cache_size = 0;
+        }
+        auto used_with_experts_on_host = [&](const uint32_t n_ctx) -> int64_t {
+            cparams->n_ctx      = n_ctx; // the extra model follows it
+            cparams_spill.n_ctx = n_ctx;
+            dmds_t dmds_spill = common_get_device_memory_data_impl(
+                path_model, &mparams_spill, &cparams_spill, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            add_extra_memory(dmds_spill);
+            int64_t sum = 0;
+            for (size_t id = 0; id < nd; id++) {
+                sum += dmds_spill[id].mb.total();
+            }
+            return sum;
+        };
+
+        LOG_TRC("%s: getting device memory data with all MoE tensors in system memory and context %" PRIu32 ":\n", __func__, n_ctx_keep);
+        const int64_t used_keep = used_with_experts_on_host(n_ctx_keep);
+        if (used_keep <= sum_used_target) {
+            cparams->n_ctx = n_ctx_keep;
+            LOG_TRC("%s: context size %" PRIu32 " fits with MoE tensors in system memory (%" PRId64 " <= %" PRId64 " MiB) -> keeping it, spilling weights instead of reducing it to %" PRIu32 "\n",
+                __func__, n_ctx_keep, used_keep/MiB, sum_used_target/MiB, n_ctx_reduced);
+            return true;
+        }
+        const int64_t used_min = used_with_experts_on_host(n_ctx_min_total);
+        uint32_t n_ctx = n_ctx_min_total;
+        if (sum_used_target > used_min && used_keep > used_min) {
+            n_ctx += uint32_t(int64_t(n_ctx_keep - n_ctx_min_total) * (sum_used_target - used_min) / (used_keep - used_min));
+            const uint32_t align = 256 * n_streams;
+            n_ctx = std::max(n_ctx - n_ctx % align, n_ctx_min_total);
+        }
+        if (n_ctx <= n_ctx_reduced) {
+            cparams->n_ctx = n_ctx_reduced;
+            LOG_TRC("%s: even with MoE tensors in system memory only a context of %" PRIu32 " fits -> no gain from spilling\n", __func__, n_ctx);
+            return false;
+        }
+        cparams->n_ctx = n_ctx;
+        LOG_TRC("%s: with MoE tensors in system memory a context of %" PRIu32 " fits (instead of %" PRIu32 ") -> spilling weights\n",
+            __func__, n_ctx, n_ctx_reduced);
+        return true;
+    };
+
     {
         int64_t global_surplus = sum_projected_free;
         if (nd == 0) {
@@ -551,15 +632,18 @@ static void common_params_fit_impl(
                         const int64_t memory_reduction = (n_ctx_max - cparams->n_ctx) * bytes_per_ctx;
                         LOG_TRC("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
                             __func__, n_ctx_max, cparams->n_ctx, memory_reduction/MiB);
-                        if (nd <= 1) {
-                            LOG_TRC("%s: entire model can be fit by reducing context\n", __func__);
-                            return;
+                        if (!keep_ctx_by_spilling(cparams->n_ctx, sum_used_target)) {
+                            if (nd <= 1) {
+                                LOG_TRC("%s: entire model can be fit by reducing context\n", __func__);
+                                return;
+                            }
+                            LOG_TRC("%s: entire model should be fit across devices by reducing context\n", __func__);
                         }
-                        LOG_TRC("%s: entire model should be fit across devices by reducing context\n", __func__);
                     } else {
                         const int64_t memory_reduction = sum_projected_used - sum_projected_used_min_ctx;
                         LOG_TRC("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
                             __func__, n_ctx_max, cparams->n_ctx, memory_reduction/MiB);
+                        keep_ctx_by_spilling(cparams->n_ctx, sum_used_target);
                     }
                 } else {
                     if (n_ctx_min == UINT32_MAX) {
