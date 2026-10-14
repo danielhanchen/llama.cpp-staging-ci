@@ -1115,7 +1115,7 @@ struct ggml_backend_sched {
     bool pf_active;    // the current graph has prefetched splits
     int  pf_depth0;    // depth at the start (GGML_SCHED_PREFETCH_DEPTH or the default)
     bool pf_window;    // depth > 2: byte ring layout sized by the live bytes of `depth` consecutive splits [GGML_SCHED_PREFETCH_WINDOW]
-    int  pf_cross;     // cross-graph arm of the first copies [GGML_SCHED_PREFETCH_CROSS]: 0 off, 1 when the binding is expected to be
+    int  pf_cross;     // cross-graph arm of the first copies [GGML_SCHED_PREFETCH_CROSS]: 0 off (default), 1 when the binding is expected to be
                        // computed again (the previous binding was computed more times than this one so far), 2 after every computation
     uint32_t pf_gen;   // incremented by every binding of a graph
     int  pf_runs;      // computations of the current binding
@@ -4151,8 +4151,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
         const char * GGML_SCHED_PREFETCH_WINDOW = getenv("GGML_SCHED_PREFETCH_WINDOW");
         const char * GGML_SCHED_PREFETCH_CROSS  = getenv("GGML_SCHED_PREFETCH_CROSS");
         const char * GGML_SCHED_PREFETCH_ADAPT  = getenv("GGML_SCHED_PREFETCH_ADAPT");
-        sched->pf_window    = GGML_SCHED_PREFETCH_WINDOW ? atoi(GGML_SCHED_PREFETCH_WINDOW) != 0 : true;
-        sched->pf_cross     = GGML_SCHED_PREFETCH_CROSS  ? atoi(GGML_SCHED_PREFETCH_CROSS)       : 1;
+        // off by default: the byte ring only differs from uniform slots for splits of different sizes, and the cross-graph arm
+        // did not change prompt speed where it engaged (copy-bound medium ubatches)
+        sched->pf_window    = GGML_SCHED_PREFETCH_WINDOW ? atoi(GGML_SCHED_PREFETCH_WINDOW) != 0 : false;
+        sched->pf_cross     = GGML_SCHED_PREFETCH_CROSS  ? atoi(GGML_SCHED_PREFETCH_CROSS)       : 0;
         // an explicit depth is kept as is
         sched->pf_adapt     = (GGML_SCHED_PREFETCH_ADAPT ? atoi(GGML_SCHED_PREFETCH_ADAPT) != 0 : true) && GGML_SCHED_PREFETCH_DEPTH == NULL && sched->pf_mode != 0;
         sched->pf_adapt_max = std::min(4, GGML_SCHED_MAX_PREFETCH_DEPTH);
