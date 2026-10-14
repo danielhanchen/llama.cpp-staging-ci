@@ -822,6 +822,10 @@ struct llama_moe_cache::impl {
             if (g.n_slots == 0) {
                 continue;
             }
+            // a late prefill (see seed_unavailable) after device lookups plans with their slots, the host state is stale
+            if (g.dev_newer) {
+                download(g);
+            }
             const int32_t n_expert = g.lru.n_expert;
             const size_t  n_layer  = g.layers.size();
             // a late prefill (see seed_unavailable) leaves the lent slots to the staging copies
