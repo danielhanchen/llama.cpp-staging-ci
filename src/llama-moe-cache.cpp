@@ -50,9 +50,22 @@ struct moe_cache_lru {
 
     int32_t n_lent = 0; // the last n_lent slots are lent (see set_lent): they are not in the list and hold no expert
 
-    void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
-        this->n_expert = n_expert;
-        this->n_slots  = n_slots;
+    // LLAMA_MOE_CACHE_POLICY=decay: decayed use counters of all experts [n_layer*n_expert], also kept for the experts that are not
+    // cached, shared with the device lookup (ggml_moe_cache_set_scores); each plan of layer il multiplies the row il by decay_q16/65536
+    // and adds score_unit per distinct expert; the misses evict the slots with the lowest counters (empty first), ties by LRU order
+    static constexpr int32_t score_unit = 1024;
+    static constexpr int32_t score_max  = 1 << 30;
+    int32_t decay_q16 = 0; // 0: LRU
+    std::vector<int32_t> scores;
+    std::vector<uint32_t> pinned; // [n_slots] seen_gen of the plan whose hits use the slot
+    std::vector<std::pair<int64_t, int32_t>> cand;
+
+    void init(int32_t n_layer, int32_t n_expert, int32_t n_slots, int32_t decay_q16 = 0) {
+        this->n_expert  = n_expert;
+        this->n_slots   = n_slots;
+        this->decay_q16 = decay_q16;
+        scores.assign(decay_q16 > 0 ? (size_t) n_layer*n_expert : 0, 0);
+        pinned.assign(decay_q16 > 0 ? n_slots : 0, 0);
         slot_map.assign(n_layer, nullptr);
         key_of.assign(n_slots, -1);
         prev.resize(n_slots);
@@ -70,6 +83,7 @@ struct moe_cache_lru {
     void clear() {
         GGML_ASSERT(n_lent == 0);
         std::fill(key_of.begin(), key_of.end(), -1);
+        std::fill(scores.begin(), scores.end(), 0);
         for (int32_t s = 0; s < n_slots; ++s) {
             prev[s] = s - 1;
             next[s] = s + 1 < n_slots ? s + 1 : -1;
@@ -149,6 +163,7 @@ struct moe_cache_lru {
 
         if (++seen_gen == 0) {
             std::fill(seen.begin(), seen.end(), 0);
+            std::fill(pinned.begin(), pinned.end(), 0);
             seen_gen = 1;
         }
         uniq.clear();
@@ -167,15 +182,64 @@ struct moe_cache_lru {
 
         int32_t * slots = slot_map[il];
 
+        if (decay_q16 > 0) {
+            int32_t * sc = scores.data() + (size_t) il*n_expert;
+            for (int32_t e = 0; e < n_expert; ++e) {
+                sc[e] = (int32_t) (((int64_t) sc[e]*decay_q16) >> 16);
+            }
+            for (int32_t e : uniq) {
+                sc[e] = std::min(sc[e] + score_unit, score_max);
+            }
+        }
+
         // hits go to the tail first, so the head can be evicted below
         for (int32_t e : uniq) {
             if (slots[e] >= 0) {
+                if (decay_q16 > 0) {
+                    pinned[slots[e]] = seen_gen;
+                }
                 touch(slots[e]);
                 n_hit++;
             }
         }
         // sorted misses usually get consecutive slots, so the uploads can be merged
         std::sort(uniq.begin(), uniq.end());
+        if (decay_q16 > 0) {
+            // the victims: the lowest counters of the slots not used by the hits (empty: -1), ties by LRU order (the head first);
+            // given to the sorted misses in slot order, so the uploads can still be merged
+            const size_t n_miss = uniq.size() - n_hit;
+            if (n_miss == 0) {
+                return true;
+            }
+            cand.clear();
+            int64_t pos = 0;
+            for (int32_t s = head; s >= 0; s = next[s], ++pos) {
+                if (pinned[s] == seen_gen) {
+                    continue;
+                }
+                const int64_t v = key_of[s] >= 0 ? scores[key_of[s]] : -1;
+                cand.push_back({ (v + 1) << 32 | pos, s }); // v + 1 >= 0 and pos < 2^31
+            }
+            GGML_ASSERT(cand.size() >= n_miss);
+            std::nth_element(cand.begin(), cand.begin() + (n_miss - 1), cand.end());
+            cand.resize(n_miss);
+            std::sort(cand.begin(), cand.end(), [](const auto & a, const auto & b) { return a.second < b.second; });
+            size_t j = 0;
+            for (int32_t e : uniq) {
+                if (slots[e] >= 0) {
+                    continue;
+                }
+                const int32_t s = cand[j++].second;
+                if (key_of[s] >= 0) {
+                    slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
+                }
+                key_of[s] = il*n_expert + e;
+                slots[e] = s;
+                touch(s);
+                fills.push_back({ e, s });
+            }
+            return true;
+        }
         for (int32_t e : uniq) {
             if (slots[e] >= 0) {
                 continue;
@@ -194,8 +258,11 @@ struct moe_cache_lru {
 
     // replace the state with the one computed by the device lookup
     // the slots with the reference bit set were used more recently, they go to the tail
-    void load(const std::vector<int32_t> & layers, const int32_t * dev_key_of, const int32_t * dev_ref) {
+    void load(const std::vector<int32_t> & layers, const int32_t * dev_key_of, const int32_t * dev_ref, const int32_t * dev_scores = nullptr) {
         GGML_ASSERT(n_lent == 0);
+        if (dev_scores != nullptr) {
+            std::copy(dev_scores, dev_scores + scores.size(), scores.begin());
+        }
         for (int32_t il : layers) {
             std::fill(slot_map[il], slot_map[il] + n_expert, -1);
         }
@@ -344,6 +411,7 @@ struct llama_moe_cache::impl {
         std::vector<int32_t> old_key_of;
         std::vector<int32_t> old_prev;
         std::vector<int32_t> old_next;
+        std::vector<int32_t> old_scores; // LLAMA_MOE_CACHE_POLICY=decay: the counters of the layer
         int32_t  old_head = -1;
         int32_t  old_tail = -1;
         uint64_t gen      = 0; // generation of the LRU after the plan, the snapshot is only valid while it is unchanged
@@ -368,6 +436,7 @@ struct llama_moe_cache::impl {
         size_t   expert_bytes = 0;       // all the expert tensors of one expert
         bool     dev_lookup   = false;   // small batches are looked up on the device (per group, so mixed devices work)
         ggml_tensor * counts  = nullptr; // hybrid: use counters of the experts [n_expert, n_layer + 1], see ggml_moe_cache_assign
+        ggml_tensor * scores  = nullptr; // LLAMA_MOE_CACHE_POLICY=decay: decayed use counters [n_expert, n_layer], see ggml_moe_cache_set_scores
         bool     host_read    = false;   // the graph being allocated reads the banks through host lookups (see set_graph)
         int64_t  host_need    = 0;       // the most distinct experts one of its host lookups may need in a layer of the group
     };
@@ -458,6 +527,11 @@ struct llama_moe_cache::impl {
 
     // device lookup for small batches: the selected experts stay on the device and the misses are read from mapped host memory
     bool device_lookup = false; // requested, see LLAMA_MOE_CACHE_DEVICE; each group then checks its device
+
+    // eviction policy (LLAMA_MOE_CACHE_POLICY): clock (default) = CLOCK on the device, LRU on the host; decay = decayed use counters
+    // of every expert, the misses evict the lowest ones (see moe_cache_lru and ggml_moe_cache_set_scores)
+    bool   policy_decay = false;
+    double half_life    = 0.0; // LLAMA_MOE_CACHE_HALF_LIFE, in lookups of a layer (tokens); 0 = clamp(64 x cached share, 8, 64)
     std::vector<std::pair<void (*)(void *), void *>> mapped; // host buffers mapped by the cache, with the function that unmaps them
 
     // hybrid small batches (device lookups only): the host computes the missing experts that are not fetched
@@ -556,6 +630,18 @@ struct llama_moe_cache::impl {
         {
             const char * env = getenv("LLAMA_MOE_CACHE_DEVICE");
             device_lookup = env == nullptr || atoi(env) != 0;
+        }
+        {
+            const char * env = getenv("LLAMA_MOE_CACHE_POLICY");
+            if (env != nullptr && strcmp(env, "decay") == 0) {
+                policy_decay = true;
+            } else if (env != nullptr && strcmp(env, "clock") != 0 && env[0] != '\0') {
+                LLAMA_LOG_WARN("%s: unknown LLAMA_MOE_CACHE_POLICY=%s (clock or decay), using clock\n", __func__, env);
+            }
+            env = getenv("LLAMA_MOE_CACHE_HALF_LIFE");
+            if (env != nullptr) {
+                half_life = std::max(0.0, atof(env));
+            }
         }
         {
             const char * env = getenv("LLAMA_MOE_CACHE_SEED_CHECK");
@@ -811,8 +897,15 @@ struct llama_moe_cache::impl {
                 g.n_slots = 0;
                 continue;
             }
-            g.lru.init(model.layers.size(), n_expert, g.n_slots);
-            n_tensors[g.id] += g.ref.size()*(1 + g.layers.size()) + (device_lookup ? 2 : 0) + (hybrid || overlap ? 1 : 0);
+            int32_t decay_q16 = 0;
+            if (policy_decay) {
+                // half-life in lookups of a layer: a small cache turns over faster, so it forgets faster (fit on decode traces)
+                const double hl = half_life > 0.0 ? half_life : std::min(64.0, std::max(8.0, 64.0*g.n_slots/max_slots));
+                decay_q16 = (int32_t) std::min(65536.0, std::max(1.0, std::round(65536.0*std::exp2(-1.0/hl))));
+            }
+            g.lru.init(model.layers.size(), n_expert, g.n_slots, decay_q16);
+            n_tensors[g.id] += g.ref.size()*(1 + g.layers.size()) + (device_lookup ? 2 : 0) + (hybrid || overlap ? 1 : 0) +
+                (device_lookup && policy_decay ? 1 : 0);
             for (int32_t il : g.layers) {
                 n_tensors[g.id] += llama_moe_cache_layer_small(model.layers[il]).size();
             }
@@ -898,6 +991,13 @@ struct llama_moe_cache::impl {
                 g.counts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, g.ref[0]->ne[2], model.layers.size() + 1);
                 ggml_format_name(g.counts, "moe_cache.%zu.counts", ig);
                 devices[g.id].buf_size += GGML_PAD(ggml_nbytes(g.counts), alignment);
+            }
+            if (device_lookup && policy_decay) {
+                // outside of the budget too: the same number of slots with either policy
+                const size_t alignment = ggml_backend_buft_get_alignment(devices[g.id].buft);
+                g.scores = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, g.ref[0]->ne[2], model.layers.size());
+                ggml_format_name(g.scores, "moe_cache.%zu.scores", ig);
+                devices[g.id].buf_size += GGML_PAD(ggml_nbytes(g.scores), alignment);
             }
         }
 
@@ -1066,6 +1166,10 @@ struct llama_moe_cache::impl {
                 if (g.id == (int32_t) id) {
                     LLAMA_LOG_INFO("%s%s: %2zu layers, %s: %5d slots (%.1f%%)\n", __func__, tag,
                         g.layers.size(), ggml_type_name(g.ref.back()->type), g.n_slots, 100.0*g.n_slots/(g.layers.size()*g.ref[0]->ne[2]));
+                    if (g.lru.decay_q16 > 0) {
+                        LLAMA_LOG_INFO("%s: MoE cache policy decay: half-life %.1f lookups of a layer (decay %d/65536 per lookup), victim = lowest counter (LLAMA_MOE_CACHE_POLICY=clock for CLOCK/LRU)\n",
+                            __func__, -1.0/std::log2(g.lru.decay_q16/65536.0), g.lru.decay_q16);
+                    }
                 }
             }
         }
@@ -1154,6 +1258,9 @@ struct llama_moe_cache::impl {
         std::vector<const void *> host(g.banks.size(), nullptr);
         std::vector<ggml_tensor *> banks = g.banks;
         ggml_tensor * op = ggml_moe_cache_lookup(ctx.get(), ids, g.map, g.state, banks.data(), host.data(), (int) banks.size(), g.layers[0]);
+        if (g.scores != nullptr) {
+            ggml_moe_cache_set_scores(op, g.scores, g.lru.decay_q16);
+        }
         return ggml_backend_supports_op(backend, op);
     }
 
@@ -1242,7 +1349,11 @@ struct llama_moe_cache::impl {
         }
         std::vector<ggml_tensor *> banks = g.banks;
         std::vector<const void *>  host  = l.host_dev;
-        return ggml_moe_cache_lookup(ctx, ids, g.map, g.state, banks.data(), host.data(), (int) banks.size(), il);
+        ggml_tensor * op = ggml_moe_cache_lookup(ctx, ids, g.map, g.state, banks.data(), host.data(), (int) banks.size(), il);
+        if (g.scores != nullptr) {
+            ggml_moe_cache_set_scores(op, g.scores, g.lru.decay_q16);
+        }
+        return op;
     }
 
     // the layer can use the hybrid lookup for a ubatch of this size
@@ -1263,7 +1374,11 @@ struct llama_moe_cache::impl {
         }
         host = hybrid_active();
         const group & g = groups[layers[il].ig];
-        return ggml_moe_cache_assign(ctx, ids, g.map, g.state, g.counts, host ? hybrid_share : 1.0f, il);
+        ggml_tensor * op = ggml_moe_cache_assign(ctx, ids, g.map, g.state, g.counts, host ? hybrid_share : 1.0f, il);
+        if (g.scores != nullptr) {
+            ggml_moe_cache_set_scores(op, g.scores, g.lru.decay_q16);
+        }
+        return op;
     }
 
     ggml_tensor * hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res, bool ov) const {
@@ -1671,6 +1786,9 @@ struct llama_moe_cache::impl {
         std::vector<int32_t> buf(3*(size_t) g.n_slots, 0);
         std::copy(g.lru.key_of.begin(), g.lru.key_of.end(), buf.begin());
         ggml_backend_tensor_set(g.state, buf.data(), n_hdr*sizeof(int32_t), buf.size()*sizeof(int32_t));
+        if (g.scores != nullptr) {
+            ggml_backend_tensor_set(g.scores, g.lru.scores.data(), 0, g.lru.scores.size()*sizeof(int32_t));
+        }
 
         g.dev_gen = g.lru.gen;
     }
@@ -1717,7 +1835,12 @@ struct llama_moe_cache::impl {
 
         std::vector<int32_t> buf(2*(size_t) g.n_slots);
         ggml_backend_tensor_get(g.state, buf.data(), n_hdr*sizeof(int32_t), buf.size()*sizeof(int32_t));
-        g.lru.load(g.layers, buf.data(), buf.data() + g.n_slots);
+        std::vector<int32_t> sc;
+        if (g.scores != nullptr) {
+            sc.resize(g.lru.scores.size());
+            ggml_backend_tensor_get(g.scores, sc.data(), 0, sc.size()*sizeof(int32_t));
+        }
+        g.lru.load(g.layers, buf.data(), buf.data() + g.n_slots, g.scores != nullptr ? sc.data() : nullptr);
 
         g.dev_gen   = g.lru.gen;
         g.dev_newer = false;
@@ -2496,6 +2619,10 @@ struct llama_moe_cache::impl {
             sd.old_next   = g.lru.next;
             sd.old_head   = g.lru.head;
             sd.old_tail   = g.lru.tail;
+            if (g.lru.decay_q16 > 0) {
+                const int32_t * sc = g.lru.scores.data() + (size_t) b.il*n_expert;
+                sd.old_scores.assign(sc, sc + n_expert);
+            }
             size_t n_hit = 0;
             const bool ok = g.lru.plan(b.il, seed_ids.data(), seed_ids.size(), sd.fills, n_hit);
             GGML_ASSERT(ok);
@@ -2592,6 +2719,9 @@ struct llama_moe_cache::impl {
                 g.lru.next = sd.old_next;
                 g.lru.head = sd.old_head;
                 g.lru.tail = sd.old_tail;
+                if (g.lru.decay_q16 > 0) {
+                    std::copy(sd.old_scores.begin(), sd.old_scores.end(), g.lru.scores.begin() + (size_t) sd.il*g.lru.n_expert);
+                }
             }
             g.lru.gen++; // the device copy of the state is refreshed before the next device lookup
         }

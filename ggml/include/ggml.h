@@ -1557,6 +1557,16 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
+    // decayed-count eviction for a ggml_moe_cache_lookup or ggml_moe_cache_assign (op) instead of the CLOCK
+    // scores: I32 [n_expert, n_layer], decayed use counter of each expert of each layer (updated in place), also kept for the
+    // experts that are not cached; each lookup of layer il first multiplies the row il by decay_q16/65536 (integer), then adds
+    // 1024 for each distinct selected expert; a missing expert evicts the lowest counter among the next 64 slots of the hand that
+    // this lookup does not use (empty slots first, ties: the first in hand order)
+    GGML_API void ggml_moe_cache_set_scores(
+            struct ggml_tensor  * op,
+            struct ggml_tensor  * scores,
+            int32_t               decay_q16);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows
