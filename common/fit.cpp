@@ -316,9 +316,16 @@ static void common_params_fit_impl(
     const bool   fit_moe_cache     = nd > 0 && hp_nex > 0 && cparams->moe_cache_size > 0 &&
         (fit_moe_cache_env == nullptr || atoi(fit_moe_cache_env) != 0);
 
+    // dense models spill FFN tensors before whole layers: a layer that is moved to system memory takes its attention and its KV cache with it,
+    // while an FFN tensor in system memory only adds a weight upload (prompt batches) or a CPU matrix-vector product (token generation)
+    // LLAMA_FIT_DENSE_FFN=0 restores the old behaviour, which spilled whole layers; user tensor overrides are kept as constraints
+    const char * fit_dense_ffn_env = getenv("LLAMA_FIT_DENSE_FFN");
+    const bool   fit_dense_ffn     = nd > 0 && hp_nex == 0 &&
+        (fit_dense_ffn_env == nullptr || atoi(fit_dense_ffn_env) != 0);
+
     // the user overrides come first in every placement written below: the first matching pattern wins
     std::vector<llama_model_tensor_buft_override> tbo_user;
-    if (fit_moe_cache && mparams->tensor_buft_overrides) {
+    if ((fit_moe_cache || fit_dense_ffn) && mparams->tensor_buft_overrides) {
         for (const llama_model_tensor_buft_override * tbo = mparams->tensor_buft_overrides; tbo->pattern != nullptr; tbo++) {
             tbo_user.push_back(*tbo);
         }
@@ -690,12 +697,34 @@ static void common_params_fit_impl(
     // step 3: iteratively fill the back to front with "dense" layers
     //   - for a dense model simply fill full layers, giving each device a contiguous slice of the model
     //   - for a MoE model, same as dense model but with all MoE tensors in system memory
+    //   - for a dense model with fit_dense_ffn, same as a MoE model with the FFN tensors in the place of the MoE tensors,
+    //     unless the layers do not fit in device memory even without their FFN tensors, then full layers are filled as before
 
     // utility function that returns a static C string matching the tensors for a specific layer index and layer fraction:
     auto get_overflow_pattern = [&](const size_t il, const common_layer_fraction_t lf) -> const char * {
         constexpr size_t n_strings = 1000;
         if (il >= n_strings) {
             throw std::runtime_error("at most " + std::to_string(n_strings) + " model layers are supported");
+        }
+        if (hp_nex == 0) {
+            // dense FFN tensors, anchored at the end of the tensor type so that e.g. ffn_norm is never matched:
+            //   ATTN and MOE: up, gate and down in system memory, UP: gate and down, GATE: down
+            static std::array<std::string, n_strings> patterns_all;
+            static std::array<std::string, n_strings> patterns_up;
+            static std::array<std::string, n_strings> patterns_gate;
+            std::string * p     = nullptr;
+            const char  * types = nullptr;
+            switch (lf) {
+                case LAYER_FRACTION_ATTN:
+                case LAYER_FRACTION_MOE:  p = &patterns_all[il];  types = "(up|gate|down)"; break;
+                case LAYER_FRACTION_UP:   p = &patterns_up[il];   types = "(gate|down)";    break;
+                case LAYER_FRACTION_GATE: p = &patterns_gate[il]; types = "down";           break;
+                default: GGML_ABORT("fatal error");
+            }
+            if (p->empty()) {
+                *p = "blk\\." + std::to_string(il) + "\\.ffn_" + types + "\\.";
+            }
+            return p->c_str();
         }
         switch (lf) {
             case LAYER_FRACTION_ATTN: {
@@ -818,7 +847,8 @@ static void common_params_fit_impl(
         return ret;
     };
 
-    int64_t global_surplus_cpu_moe = 0;
+    int64_t global_surplus_cpu_moe = 0; // total surplus with all MoE tensors (dense: FFN tensors) in system memory
+    bool    partial_layers         = hp_nex > 0; // whether layers may keep their MoE (dense: FFN) tensors in system memory
     if (hp_nex > 0) {
         const static std::string pattern_moe_all = "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps"; // matches all MoE tensors
         ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
@@ -904,6 +934,41 @@ static void common_params_fit_impl(
         // reset
         tensor_buft_overrides[n_user] = {nullptr, nullptr};
         mparams->tensor_buft_overrides = tensor_buft_overrides;
+    } else if (fit_dense_ffn) {
+        const static std::string pattern_ffn_all = "blk\\.\\d+\\.ffn_(up|gate|down)\\."; // matches all dense FFN tensors
+        ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+        const size_t n_user = tbo_user.size();
+        if (n_user + 2 > llama_max_tensor_buft_overrides()) {
+            throw common_params_fit_exception("too many tensor_buft_overrides set by user, abort");
+        }
+        for (size_t i = 0; i < n_user; i++) {
+            tensor_buft_overrides[i] = tbo_user[i];
+        }
+        tensor_buft_overrides[n_user + 0] = {pattern_ffn_all.c_str(), cpu_buft};
+        tensor_buft_overrides[n_user + 1] = {nullptr, nullptr};
+        mparams->tensor_buft_overrides = tensor_buft_overrides;
+
+        LOG_TRC("%s: getting device memory data with all FFN tensors moved to system memory:\n", __func__);
+        dmds_t dmds_cpu_ffn = common_get_device_memory_data_impl(
+            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+        add_extra_memory(dmds_cpu_ffn);
+
+        for (size_t id = 0; id < nd; id++) {
+            global_surplus_cpu_moe += dmds_cpu_ffn[id].free;
+            global_surplus_cpu_moe -= int64_t(dmds_cpu_ffn[id].mb.total()) + margins[id];
+        }
+        partial_layers = global_surplus_cpu_moe > 0;
+        if (partial_layers) {
+            LOG_TRC("%s: with the FFN tensors in system memory there is a total surplus of %" PRId64 " MiB, spilling FFN tensors before layers\n",
+                __func__, global_surplus_cpu_moe/MiB);
+        } else {
+            LOG_TRC("%s: with the FFN tensors in system memory there is still a total deficit of %" PRId64 " MiB, spilling whole layers\n",
+                __func__, -global_surplus_cpu_moe/MiB);
+        }
+
+        // reset to the user overrides
+        tensor_buft_overrides[n_user] = {nullptr, nullptr};
+        mparams->tensor_buft_overrides = tensor_buft_overrides;
     }
 
     std::vector<int64_t> targets; // maximum acceptable memory use per device
@@ -929,10 +994,12 @@ static void common_params_fit_impl(
     //   - check memory use of our guess, replace either the low or high bound
     //   - once we only have a difference of a single layer, stop and return the lower bound that just barely still fits
     //   - the last device has the output layer, which cannot be a partial layer
-    if (hp_nex == 0) {
-        LOG_TRC("%s: filling dense layers back-to-front:\n", __func__);
-    } else {
+    if (hp_nex > 0) {
         LOG_TRC("%s: filling dense-only layers back-to-front:\n", __func__);
+    } else if (partial_layers) {
+        LOG_TRC("%s: filling layers without FFN tensors back-to-front:\n", __func__);
+    } else {
+        LOG_TRC("%s: filling dense layers back-to-front:\n", __func__);
     }
     for (int id = nd - 1; id >= 0; id--) {
         uint32_t n_unassigned = hp_ngl + 1;
@@ -943,7 +1010,7 @@ static void common_params_fit_impl(
 
         std::vector<ngl_t> ngl_per_device_high = ngl_per_device;
         ngl_per_device_high[id].n_layer = n_unassigned;
-        if (hp_nex > 0) {
+        if (partial_layers) {
             ngl_per_device_high[id].n_part = size_t(id) < nd - 1 ? ngl_per_device_high[id].n_layer : ngl_per_device_high[id].n_layer - 1;
         }
         if (ngl_per_device_high[id].n_layer > 0) {
@@ -959,7 +1026,7 @@ static void common_params_fit_impl(
 
                     std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
                     ngl_per_device_test[id].n_layer += step_size;
-                    if (hp_nex) {
+                    if (partial_layers) {
                         ngl_per_device_test[id].n_part += size_t(id) == nd - 1 && ngl_per_device_test[id].n_part == 0 ?
                             step_size - 1 : step_size; // the first layer is the output layer which must always be full
                     }
@@ -989,12 +1056,12 @@ static void common_params_fit_impl(
             "%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
     }
-    if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
+    if (!partial_layers || global_surplus_cpu_moe <= 0) {
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
         return;
     }
 
-    // step 4: for a MoE model where all dense tensors fit,
+    // step 4: for a MoE model where all dense tensors fit (dense model: all tensors but the FFN tensors),
     //     convert the dense-only layers in the back to full layers in the front until all devices are full
     // essentially the same procedure as for the dense-only layers except front-to-back
     // also, try fitting at least part of one more layer to reduce waste for "small" GPUs with e.g. 24 GiB VRAM
@@ -1106,7 +1173,7 @@ static void common_params_fit_impl(
                     LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", GATE), id_dense_start=%zu\n",
                         __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
                 }
-            } else {
+            } else if (hp_nex > 0) { // for a dense model LAYER_FRACTION_ATTN is the placement of the other partial layers
                 ngl_per_device_test[id].overflow_type = LAYER_FRACTION_ATTN;
                 LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_ATTN\n", __func__);
                 mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
