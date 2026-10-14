@@ -2990,8 +2990,8 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
                 async = false;
             }
         }
-        // a split with a SYNC copy is not prefetched (the graph allocator holds its copies), slots and the copy queue exist only for splits copied ahead
-        if (bytes == 0 || !async) {
+        // a split with a SYNC copy is not prefetched: its copies are made when it starts, like the regular path, but still in a staging slot
+        if (bytes == 0) {
             continue;
         }
 
@@ -3005,6 +3005,18 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         split->pf_size    = bytes; // bytes in the arena, without the copies placed in lent memory below
         pf->split_ids[pf->n_bound++] = i;
         pf->n_async += async ? 1 : 0;
+    }
+
+    // only SYNC copies and no arena to reuse: the graph allocator holds them (e.g. prefetch disabled by the threshold), no arena is created for them
+    // (decided before the lending below, so that the user is not asked to place copies that are not bound)
+    for (int b = 0; b < sched->n_backends; b++) {
+        struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+        if (pf->n_bound > 0 && pf->n_async == 0 && (dry || pf->arena == NULL)) {
+            for (int k = 0; k < pf->n_bound; k++) {
+                sched->splits[pf->split_ids[k]].pf_ordinal = -1;
+            }
+            pf->n_bound = 0;
+        }
     }
 
     // memory lent by the user (e.g. free slots of a cache): the copies it places do not use the arena
@@ -3195,36 +3207,26 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
     // arena size: two consecutive splits are live at once with depth = 2 (the copy of k + 1 overlaps the compute of k)
     for (int b = 0; b < sched->n_backends; b++) {
         struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+        if (pf->n_async == 0) {
+            // the SYNC copies of a split are made on the compute stream after the previous split, so all of them can use the same slot
+            // the arena of an earlier graph holds them: the graph allocator never stages the same weights next to it (e.g. small batches, the ubatch that seeds the MoE cache)
+            // (a graph with only SYNC copies and no arena to reuse was unbound before the lending above)
+            for (int k = 0; k < pf->n_bound; k++) {
+                pf->need = std::max(pf->need, sched->splits[pf->split_ids[k]].pf_size);
+            }
+            pf->staging = pf->need;
+            continue;
+        }
         for (int k = 0; k < pf->n_bound; k++) {
             pf->need = std::max(pf->need, sched->splits[pf->split_ids[k]].pf_size);
         }
         pf->staging = ggml_backend_sched_prefetch_staging(sched, b);
     }
 
-    // backends with SYNC copies, which the graph allocator holds
-    std::vector<bool> has_sync(sched->n_backends, false);
-    for (const ggml_tensor * t : sync_copies) {
-        auto it = owner.find(t);
-        if (it != owner.end() && shared.count(t) == 0) {
-            has_sync[sched->splits[it->second].backend_id] = true;
-        }
-    }
-
     static char dry_placeholder;
 
     for (int b = 0; b < sched->n_backends; b++) {
         struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
-
-        // the reserve does not budget the SYNC copies of this graph on top of a larger arena kept from an earlier graph (e.g. the ubatch that seeds the MoE cache)
-        // free it, so that the graph allocator can grow into that memory, the arena is allocated again when a graph needs more staging
-        // with a lend callback the graph was measured above: a graph allocator that already holds it (e.g. reserved for it) keeps the arena
-        if (!dry && has_sync[b] && pf->arena != NULL && pf->arena_size > pf->staging && (sched->callback_lend == NULL || gsize[b] > 0)) {
-            // the old arena may still be read or written
-            ggml_backend_sched_prefetch_sync(sched);
-            ggml_backend_buffer_free(pf->arena);
-            pf->arena      = NULL;
-            pf->arena_size = 0;
-        }
 
         if (pf->n_bound == 0) {
             continue;
@@ -3260,7 +3262,9 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
             struct ggml_backend_sched_split * split = &sched->splits[pf->split_ids[k]];
             // depth = 2: odd ordinals end at the arena end so consecutive splits never overlap (the arena size is only known when not dry)
             size_t offset = (size_t) (k % sched->pf_depth) * pf->need;
-            if (sched->pf_depth == 2) {
+            if (pf->n_async == 0) {
+                offset = 0;
+            } else if (sched->pf_depth == 2) {
                 offset = k % 2 == 0 ? 0 : (dry ? pf->staging : pf->arena_size) - split->pf_size;
             }
             for (int j = 0; j < split->n_inputs; j++) {
@@ -3553,7 +3557,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         pf->issued   = 0;
         pf->consumed = 0;
         // the copies of this graph run after the work queued on the backend before it (e.g. earlier graphs writing memory a copy callback reads)
-        if (sched->pf_active && pf->n_bound > 0 && pf->start != NULL) {
+        if (sched->pf_active && pf->n_async > 0 && pf->start != NULL) {
             ggml_backend_event_record(pf->start, sched->backends[b]);
             ggml_backend_event_wait(pf->copy_backend, pf->start);
             pf->pending = true;
@@ -3912,6 +3916,9 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
             sizes[b] += sched->pf[b].staging;
         }
     }
+
+    // like ggml_backend_sched_reserve: the copies of the measured graph hold placeholder addresses
+    ggml_backend_sched_reset(sched);
 }
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
