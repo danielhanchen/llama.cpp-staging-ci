@@ -2198,6 +2198,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         src1_data_cur += src1_slice.nb[2];
         dst_data_cur  +=  dst_slice.nb[2];
     }
+    // the q8_1 copies of the slices above must not outlive src1_sorted: the pool hands its memory out again
+    ctx.q8_1_cache.invalidate(src1_sorted.ptr, ne12*n_expert_used*ne10*ts_src1_sorted);
 
     get_rows_cuda(dst_sorted.ptr, type_dst_sorted, ids_from_sorted, dst->data, dst->type,
         ne0, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
