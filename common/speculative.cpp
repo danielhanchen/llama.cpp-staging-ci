@@ -2565,8 +2565,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 
-    // the MoE cache is only used by the target context
-    result.moe_cache_size = 0;
+    // the MoE cache of a separate draft model is not supported; an MTP context runs on the weights of the target model and caches its
+    // NextN layers with its share of the same budget (see llama_moe_cache::budget, LLAMA_MOE_CACHE_MTP=0 disables it)
+    const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    result.moe_cache_size = spec_mtp && !has_draft ? params.moe_cache_size : 0;
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types

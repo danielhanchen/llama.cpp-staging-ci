@@ -592,11 +592,25 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
-            if (moe_cache_seed_auto) {
-                moe_cache->prompts_do_not_seed();
+        // the main context caches the layers of its graph, an MTP context the NextN layers with its share of the same budget
+        // (LLAMA_MOE_CACHE_MTP=0: the main context caches all layers, an MTP context none)
+        const bool ctx_mtp = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+        const auto moe_cache_set = llama_moe_cache::select_layers(model, ctx_mtp);
+        const size_t moe_cache_budget = cparams.moe_cache_size == 0 || (ctx_mtp && moe_cache_set != llama_moe_cache::layer_set::nextn) ? 0 :
+            llama_moe_cache::budget(model, cparams.moe_cache_size, moe_cache_set);
+        if (moe_cache_budget > 0 && moe_cache_set == llama_moe_cache::layer_set::nextn) {
+            // the MTP cache is optional: the draft runs without it if its share is too small
+            try {
+                moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, moe_cache_budget, moe_cache_set);
+            } catch (const std::exception & e) {
+                LLAMA_LOG_WARN("%s: no MoE cache for the MTP layers (%.2f MiB): %s\n", __func__, moe_cache_budget/1024.0/1024.0, e.what());
+                moe_cache.reset();
             }
+        } else if (moe_cache_budget > 0) {
+            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, moe_cache_budget, moe_cache_set);
+        }
+        if (moe_cache && moe_cache_seed_auto) {
+            moe_cache->prompts_do_not_seed();
         }
 
         sched_reserve();

@@ -268,6 +268,43 @@ static std::vector<ggml_tensor *> llama_moe_cache_layer_small(const llama_layer 
     return res;
 }
 
+
+// the cache of a layer set holds layer il
+static bool llama_moe_cache_in_set(const llama_model & model, llama_moe_cache::layer_set set, size_t il) {
+    switch (set) {
+        case llama_moe_cache::layer_set::trunk: return il <  model.hparams.n_layer();
+        case llama_moe_cache::layer_set::nextn: return il >= model.hparams.n_layer();
+        default:                                return true;
+    }
+}
+
+// the experts of layer il that a cache can hold: all of them in host memory, the layer assigned to a GPU
+static bool llama_moe_cache_layer_cacheable(const llama_model & model, size_t il, std::vector<ggml_tensor *> & experts) {
+    experts = llama_moe_cache_layer_experts(model.layers[il]);
+    if (experts.empty() || !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
+        return false;
+    }
+    ggml_backend_dev_t dev = model.dev_layer((int) il);
+    if (dev == nullptr) {
+        return false;
+    }
+    const auto type = ggml_backend_dev_type(dev);
+    return type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+}
+
+// host bytes of the experts that the cache of a layer set can hold
+static size_t llama_moe_cache_set_bytes(const llama_model & model, llama_moe_cache::layer_set set) {
+    size_t res = 0;
+    std::vector<ggml_tensor *> experts;
+    for (size_t il = 0; il < model.layers.size(); ++il) {
+        if (llama_moe_cache_in_set(model, set, il) && llama_moe_cache_layer_cacheable(model, il, experts)) {
+            for (const ggml_tensor * t : experts) {
+                res += ggml_nbytes(t);
+            }
+        }
+    }
+    return res;
+}
 }
 
 struct llama_moe_cache::impl {
@@ -485,8 +522,13 @@ struct llama_moe_cache::impl {
     static constexpr int hybrid_skip = 3;
     std::vector<int64_t> win_t[2];
 
-    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
+    // " (mtp)" for the cache of an MTP context, in its log lines
+    const char * tag = "";
+
+    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
+            layer_set set) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
+        tag = set == layer_set::nextn ? " (mtp)" : "";
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -572,7 +614,11 @@ struct llama_moe_cache::impl {
         }
 
         // only cache layers that keep all of their experts in host memory, on the device the layer is assigned to
+        // and only the layers that the graphs of the context run (see layer_set)
         for (size_t il = 0; il < model.layers.size(); ++il) {
+            if (!llama_moe_cache_in_set(model, set, il)) {
+                continue;
+            }
             auto experts = llama_moe_cache_layer_experts(model.layers[il]);
             if (experts.empty() || !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
                 continue;
@@ -920,11 +966,11 @@ struct llama_moe_cache::impl {
             if (d.host_bytes == 0) {
                 continue;
             }
-            LLAMA_LOG_INFO("%s: %10s MoE cache size = %8.2f MiB for %.2f MiB of host experts\n", __func__,
+            LLAMA_LOG_INFO("%s%s: %10s MoE cache size = %8.2f MiB for %.2f MiB of host experts\n", __func__, tag,
                 ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0);
             for (const group & g : groups) {
                 if (g.id == (int32_t) id) {
-                    LLAMA_LOG_INFO("%s: %2zu layers, %s: %5d slots (%.1f%%)\n", __func__,
+                    LLAMA_LOG_INFO("%s%s: %2zu layers, %s: %5d slots (%.1f%%)\n", __func__, tag,
                         g.layers.size(), ggml_type_name(g.ref.back()->type), g.n_slots, 100.0*g.n_slots/(g.layers.size()*g.ref[0]->ne[2]));
                 }
             }
@@ -2450,13 +2496,13 @@ struct llama_moe_cache::impl {
     }
 
     void log_stats() {
-        auto log = [](const char * name, const stats & st) {
+        auto log = [this](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
             if (n == 0) {
                 return;
             }
-            LLAMA_LOG_INFO("llama_moe_cache: %s: hits = %zu, misses = %zu, hit rate = %.2f%%, uploaded = %.2f MiB\n",
-                name, st.hits, st.misses, 100.0*st.hits/n, st.bytes/1024.0/1024.0);
+            LLAMA_LOG_INFO("llama_moe_cache%s: %s: hits = %zu, misses = %zu, hit rate = %.2f%%, uploaded = %.2f MiB\n",
+                tag, name, st.hits, st.misses, 100.0*st.hits/n, st.bytes/1024.0/1024.0);
         };
         log("ubatch <= 8", stats_small);
         log("ubatch  > 8", stats_large);
@@ -2484,41 +2530,80 @@ struct llama_moe_cache::impl {
                     n_host += cnt;
                 }
                 const size_t n = st.hits + st.misses + n_host;
-                LLAMA_LOG_INFO("llama_moe_cache: hybrid: fetch share = %.3f, %llu missing experts computed on the host (not fetched), hit rate with them = %.2f%%\n",
-                    hybrid_share, (unsigned long long) n_host, n > 0 ? 100.0*st.hits/n : 0.0);
+                LLAMA_LOG_INFO("llama_moe_cache%s: hybrid: fetch share = %.3f, %llu missing experts computed on the host (not fetched), hit rate with them = %.2f%%\n", tag, hybrid_share, (unsigned long long) n_host, n > 0 ? 100.0*st.hits/n : 0.0);
             }
         }
         if (stats_copy.hits > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
+            LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu experts copied from the cache, %.2f MiB\n", tag, stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
         }
         if (stats_upload.misses > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts uploaded, %.2f MiB\n", stats_upload.misses, stats_upload.bytes/1024.0/1024.0);
+            LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu experts uploaded, %.2f MiB\n", tag, stats_upload.misses, stats_upload.bytes/1024.0/1024.0);
         }
         if (n_large_ubatches > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu ubatches, copies per ubatch: %.1f from the cache, %.1f uploads, in %.1f batched calls\n",
-                n_large_ubatches, (double) stats_copy.calls/n_large_ubatches, (double) stats_upload.calls/n_large_ubatches, (double) n_batches/n_large_ubatches);
+            LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu ubatches, copies per ubatch: %.1f from the cache, %.1f uploads, in %.1f batched calls\n", tag, n_large_ubatches, (double) stats_copy.calls/n_large_ubatches, (double) stats_upload.calls/n_large_ubatches, (double) n_batches/n_large_ubatches);
         }
         if (stats_seed.misses > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts admitted to the cache, %.2f MiB\n", stats_seed.misses, stats_seed.bytes/1024.0/1024.0);
+            LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu experts admitted to the cache, %.2f MiB\n", tag, stats_seed.misses, stats_seed.bytes/1024.0/1024.0);
         }
         if (seed_unstaged > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu expert tensor seeds skipped (planned expert not staged)\n", seed_unstaged);
+            LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu expert tensor seeds skipped (planned expert not staged)\n", tag, seed_unstaged);
         }
         if (seed_skipped > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu prompt ends not seeded (the seeding graph does not fit in the compute buffer)\n", seed_skipped);
+            LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu prompt ends not seeded (the seeding graph does not fit in the compute buffer)\n", tag, seed_skipped);
         }
         if (n_lends > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu graphs used lent slots (at most %d slots lent), %zu experts refilled after them, %.2f MiB\n",
-                n_lends, lend_max, stats_refill.misses, stats_refill.bytes/1024.0/1024.0);
+            LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu graphs used lent slots (at most %d slots lent), %zu experts refilled after them, %.2f MiB\n", tag, n_lends, lend_max, stats_refill.misses, stats_refill.bytes/1024.0/1024.0);
         }
         if (seed_check) {
-            LLAMA_LOG_INFO("llama_moe_cache: seed check total: %zu expert copies verified, %zu mismatches\n", seed_checked, seed_mismatches);
+            LLAMA_LOG_INFO("llama_moe_cache%s: seed check total: %zu expert copies verified, %zu mismatches\n", tag, seed_checked, seed_mismatches);
         }
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
-    pimpl(new impl(model, backends, bufts, size)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
+        layer_set set) :
+    pimpl(new impl(model, backends, bufts, size, set)) {
+}
+
+bool llama_moe_cache::mtp_enabled() {
+    const char * env = getenv("LLAMA_MOE_CACHE_MTP");
+    return env == nullptr || atoi(env) != 0;
+}
+
+llama_moe_cache::layer_set llama_moe_cache::select_layers(const llama_model & model, bool ctx_mtp) {
+    const auto & hp = model.hparams;
+    // as the KV cache filters of the NextN layers: not for a router layer the trunk attends or a model made only of NextN layers
+    if (!mtp_enabled() || hp.n_layer_nextn == 0 || hp.n_layer() == 0 || hp.router_layer >= 0) {
+        return layer_set::all;
+    }
+    return ctx_mtp ? layer_set::nextn : layer_set::trunk;
+}
+
+size_t llama_moe_cache::budget(const llama_model & model, size_t size, layer_set set) {
+    if (set == layer_set::all) {
+        return size;
+    }
+    const size_t bytes_trunk = llama_moe_cache_set_bytes(model, layer_set::trunk);
+    const size_t bytes_nextn = llama_moe_cache_set_bytes(model, layer_set::nextn);
+    if (bytes_nextn == 0 || bytes_trunk == 0) {
+        // one of the caches has nothing to hold, the other gets the whole budget
+        return (set == layer_set::nextn ? bytes_nextn : bytes_trunk) > 0 ? size : 0;
+    }
+
+    // the memory to hold all experts of a set, with room for the small per-expert tensors, the lookup state and the alignment
+    auto need = [](size_t bytes) { return bytes + bytes/32 + (size_t) 64*1024*1024; };
+
+    // the MTP cache gets the share of its experts in the budget (the share its layers had in a single cache), or what the main cache
+    // leaves once it holds all of its experts, at most what holds all of the MTP experts
+    size_t mtp = (size_t) ((double) size*bytes_nextn/(bytes_trunk + bytes_nextn));
+    if (size > need(bytes_trunk)) {
+        mtp = std::max(mtp, size - need(bytes_trunk));
+    }
+    mtp = std::min({ mtp, need(bytes_nextn), size });
+    if (const char * env = getenv("LLAMA_MOE_CACHE_MTP_MIB")) {
+        mtp = std::min(size, (size_t) std::max(0, atoi(env))*1024*1024);
+    }
+    return set == layer_set::nextn ? mtp : size - mtp;
 }
 
 llama_moe_cache::~llama_moe_cache() = default;

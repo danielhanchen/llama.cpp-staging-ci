@@ -15,8 +15,28 @@ public:
     // the cache serves the ubatches of up to this many tokens, the larger ones (prompts) copy the experts they use
     static constexpr int64_t n_small_max = 32;
 
+    // the layers a context caches: a main context never runs the NextN (MTP) layers, an MTP draft context runs only those
+    enum class layer_set {
+        all,   // every layer (models without NextN layers, or LLAMA_MOE_CACHE_MTP=0)
+        trunk, // the layers of the main graph
+        nextn, // the NextN (MTP) layers, run by the MTP draft context
+    };
+
+    // LLAMA_MOE_CACHE_MTP=0 restores the single cache of the main context over all layers, with no cache in the MTP context
+    static bool mtp_enabled();
+
+    // the layers that a context of type ctx_type caches
+    static layer_set select_layers(const llama_model & model, bool ctx_mtp);
+
+    // the share of the total budget size (--moe-cache-mib) that the cache of the given layers gets: the main and the MTP cache split the
+    // budget by the host bytes of their experts, the MTP cache also gets what the main cache cannot use once it holds all of its experts
+    // (LLAMA_MOE_CACHE_MTP_MIB=N sets the MTP share); the same for both contexts, so --fit measures the same caches the contexts create
+    static size_t budget(const llama_model & model, size_t size, layer_set set);
+
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
-    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size);
+    // size is already the share of the layer set (see budget)
+    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
+            layer_set set = layer_set::all);
     ~llama_moe_cache();
 
     // the device that caches layer il
