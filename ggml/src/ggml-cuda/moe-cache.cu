@@ -9,6 +9,7 @@
 // key_of: il*n_expert + expert (-1 if empty); ref: CLOCK reference bits; pin: epoch of the last lookup using the slot (that lookup does not evict it)
 // dst:   slots[n_ids], then a row starting with the number of copied experts, then their experts[n_ids] and slots[n_ids]
 //
+// assign result rows (ne0 = n_expert_used, T tokens): slots [T], fill count [1], fill experts [T], fill slots [T], host ids [T], hit slots [T]
 // hybrid (ggml_moe_cache_assign): counts [n_expert, n_layer + 1] use counters, last row: [0..1] experts left to the host, [2] fetch accumulator (1/65536)
 // only a share of the missing experts is admitted (fetch_q/65536, error diffused), the ones with the highest counters, ties by expert id
 // (all of them while the cache has empty slots: filling an empty slot evicts nothing)
@@ -73,6 +74,9 @@ static __global__ void moe_cache_assign(
     for (int i = lane; i < n_ids; i += MOE_CACHE_LANES) {
         const int32_t s = row[moe_cache_id(ids, i, n_expert)];
         slots[i] = s;
+        if (counts != nullptr) {
+            fill_s[2*n_ids + i] = s; // hit slots: the slot of an expert cached before this lookup, else -1
+        }
         if (s >= 0) {
             ref[s] = 1;
             if ((uint32_t) atomicExch(&pin[s], (int32_t) epoch) != epoch) {
@@ -286,6 +290,16 @@ static __global__ void moe_cache_fetch(const int32_t * __restrict__ info, const 
     }
 }
 
+// the slots admitted by an assign (res): its slot where the expert was not cached before (hit slot -1), else -1
+static __global__ void moe_cache_admitted(const int32_t * __restrict__ res, int32_t * __restrict__ dst, const int n_ids, const int ne0) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n_ids) {
+        return;
+    }
+    const int32_t * hit = res + 4*n_ids + ne0; // see the assign result layout
+    dst[i] = hit[i] < 0 ? res[i] : -1;
+}
+
 bool ggml_cuda_moe_cache_lookup_supported(const ggml_tensor * op) {
     const int mode    = ggml_get_op_params_i32(op, 10);
     const int n_banks = ggml_get_op_params_i32(op, 1);
@@ -295,6 +309,9 @@ bool ggml_cuda_moe_cache_lookup_supported(const ggml_tensor * op) {
     }
     if (mode == 2) {
         return n_banks >= 1 && n_banks <= 4 && op->src[0]->type == GGML_TYPE_I32;
+    }
+    if (mode == 3) {
+        return op->src[0]->type == GGML_TYPE_I32;
     }
     if (mode != 0 || n_banks < 1 || n_banks > 4) {
         return false;
@@ -334,8 +351,34 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
             return;
         }
         cudaStream_t stream = ctx.stream();
-        CUDA_CHECK(cudaMemcpyAsync(dst->data, res->data, n_ids*sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
-        moe_cache_fetch_launch(stream, dst, dst->src + 1, ggml_get_op_params_i32(dst, 1), (const int32_t *) res->data, n_ids, ne0);
+        if (ggml_get_op_params_i32(dst, 12) == 0) {
+            CUDA_CHECK(cudaMemcpyAsync(dst->data, res->data, n_ids*sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+            moe_cache_fetch_launch(stream, dst, dst->src + 1, ggml_get_op_params_i32(dst, 1), (const int32_t *) res->data, n_ids, ne0);
+            return;
+        }
+        // overlap: the copies run on a side stream after the assign, ggml_moe_cache_join makes the main stream wait for them;
+        // the hits only read slots cached before this lookup, which the copies (into its victims) never touch
+        if (ctx.moe_fork == nullptr) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&ctx.moe_fork, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&ctx.moe_join, cudaEventDisableTiming));
+        }
+        cudaStream_t side = ctx.stream(ctx.device, GGML_CUDA_MAX_STREAMS - 1);
+        CUDA_CHECK(cudaEventRecord(ctx.moe_fork, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(side, ctx.moe_fork, 0));
+        moe_cache_fetch_launch(side, dst, dst->src + 1, ggml_get_op_params_i32(dst, 1), (const int32_t *) res->data, n_ids, ne0);
+        moe_cache_admitted<<<(n_ids + 255)/256, 256, 0, side>>>((const int32_t *) res->data, (int32_t *) dst->data, n_ids, ne0);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(ctx.moe_join, side));
+        return;
+    }
+
+    if (mode == 3) {
+        // join of an overlapped fetch: the main stream waits for its copies, the result is its admitted slots
+        const ggml_tensor * a = dst->src[0];
+        GGML_ASSERT(ctx.moe_join != nullptr && ggml_is_contiguous(a) && ggml_is_contiguous(dst));
+        cudaStream_t stream = ctx.stream();
+        CUDA_CHECK(cudaStreamWaitEvent(stream, ctx.moe_join, 0));
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, a->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, stream));
         return;
     }
 

@@ -2296,7 +2296,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             hybrid_ok = hybrid_ok && lora.first->get_weight(w) == nullptr;
         }
     }
-    ggml_tensor * hybrid = nullptr;
+    ggml_tensor * hybrid = nullptr;  // assign result of the lookup (see build_moe_cache_slots)
+    bool          hybrid_host = false; // some missing experts are left to the host
 
     // the host path reads the host copies of the per-expert scales and biases
     ggml_tensor * const up_exps_s_h      = up_exps_s;
@@ -2307,7 +2308,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * const gate_up_exps_b_h = gate_up_exps_b;
 
     // the experts of host-resident layers may be read from the MoE cache
-    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il, hybrid_ok ? &hybrid : nullptr);
+    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il, hybrid_ok ? &hybrid : nullptr, &hybrid_host);
     if (slots != nullptr || hybrid != nullptr) {
         // the per-expert scales and biases are read from their device copies, so the layer does not go back to the host
         for (ggml_tensor ** t : { &up_exps_s, &gate_exps_s, &down_exps_s, &up_exps_b, &gate_exps_b, &down_exps_b, &gate_up_exps_b }) {
@@ -2485,30 +2486,58 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (hybrid == nullptr) {
         experts = build_experts(cur, slots, false, up_exps_s, gate_exps_s, down_exps_s, up_exps_b, gate_exps_b, gate_up_exps_b);
     } else {
-        // the host path is added first: the scheduler starts the copies and the device path while the host computes (see ggml_backend_sched_set_overlap)
+        // assign result rows: slots, fill count, fill experts, fill slots, host ids, hit slots (see ggml_moe_cache_assign)
         const int64_t n_used = hybrid->ne[0];
-        const int64_t n_rows = (hybrid->ne[1] - 1)/4;
-        ggml_tensor * host_ids = ggml_view_2d(ctx0, hybrid, n_used, n_rows, hybrid->nb[1], (3*n_rows + 1)*hybrid->nb[1]);
-        cb(host_ids, "ffn_moe_host_ids", il);
+        const int64_t n_rows = (hybrid->ne[1] - 1)/5;
 
-        const int n0 = ggml_graph_n_nodes(gf);
-        ggml_tensor * experts_h = build_experts(cur, host_ids, true, up_exps_s_h, gate_exps_s_h, down_exps_s_h, up_exps_b_h, gate_exps_b_h, gate_up_exps_b_h);
-        cb(experts_h, "ffn_moe_down_host", il);
-        ggml_build_forward_expand(gf, experts_h);
-        for (int i = n0; i < ggml_graph_n_nodes(gf); ++i) {
-            ggml_tensor * node = ggml_graph_node(gf, i);
-            if (node->op != GGML_OP_VIEW && node->op != GGML_OP_RESHAPE && node->op != GGML_OP_PERMUTE && node->op != GGML_OP_TRANSPOSE) {
-                ggml_backend_sched_set_tensor_backend(sched, node, backend_cpu);
+        // the host path is added first: the scheduler starts the copies and the device path while the host computes (see ggml_backend_sched_set_overlap)
+        ggml_tensor * experts_h = nullptr;
+        if (hybrid_host) {
+            ggml_tensor * host_ids = ggml_view_2d(ctx0, hybrid, n_used, n_rows, hybrid->nb[1], (3*n_rows + 1)*hybrid->nb[1]);
+            cb(host_ids, "ffn_moe_host_ids", il);
+
+            const int n0 = ggml_graph_n_nodes(gf);
+            experts_h = build_experts(cur, host_ids, true, up_exps_s_h, gate_exps_s_h, down_exps_s_h, up_exps_b_h, gate_exps_b_h, gate_up_exps_b_h);
+            cb(experts_h, "ffn_moe_down_host", il);
+            ggml_build_forward_expand(gf, experts_h);
+            for (int i = n0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                if (node->op != GGML_OP_VIEW && node->op != GGML_OP_RESHAPE && node->op != GGML_OP_PERMUTE && node->op != GGML_OP_TRANSPOSE) {
+                    ggml_backend_sched_set_tensor_backend(sched, node, backend_cpu);
+                }
             }
         }
 
-        slots = moe_cache->hybrid_fetch_experts(ctx0, il, hybrid);
-        ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
-        cb(slots, "ffn_moe_slots", il);
-        ggml_tensor * experts_d = build_experts(cur, slots, false, up_exps_s, gate_exps_s, down_exps_s, up_exps_b, gate_exps_b, gate_up_exps_b);
+        ggml_backend_t dev = moe_cache->backend(il);
+        ggml_tensor * experts_d = nullptr;
+        if (moe_cache->overlap()) {
+            // the copies of the admitted experts run beside the hits (cached before this lookup), then the admitted experts are computed
+            ggml_tensor * fetched = moe_cache->hybrid_fetch_experts(ctx0, il, hybrid, true);
+            ggml_backend_sched_set_tensor_backend(sched, fetched, dev);
+            cb(fetched, "ffn_moe_fetch", il);
+            ggml_build_forward_expand(gf, fetched);
 
-        // every slot is computed by exactly one side, the other side's row is 0
-        experts = ggml_add(ctx0, experts_d, experts_h);
+            ggml_tensor * hits = ggml_view_2d(ctx0, hybrid, n_used, n_rows, hybrid->nb[1], (4*n_rows + 1)*hybrid->nb[1]);
+            cb(hits, "ffn_moe_hit_slots", il);
+            ggml_tensor * experts_hit = build_experts(cur, hits, false, up_exps_s, gate_exps_s, down_exps_s, up_exps_b, gate_exps_b, gate_up_exps_b);
+            cb(experts_hit, "ffn_moe_down_hits", il);
+            ggml_build_forward_expand(gf, experts_hit);
+
+            ggml_tensor * joined = ggml_moe_cache_join(ctx0, fetched);
+            ggml_backend_sched_set_tensor_backend(sched, joined, dev);
+            cb(joined, "ffn_moe_slots", il);
+            ggml_tensor * experts_f = build_experts(cur, joined, false, up_exps_s, gate_exps_s, down_exps_s, up_exps_b, gate_exps_b, gate_up_exps_b);
+            cb(experts_f, "ffn_moe_down_fetched", il);
+            experts_d = ggml_add(ctx0, experts_hit, experts_f);
+        } else {
+            ggml_tensor * fslots = moe_cache->hybrid_fetch_experts(ctx0, il, hybrid, false);
+            ggml_backend_sched_set_tensor_backend(sched, fslots, dev);
+            cb(fslots, "ffn_moe_slots", il);
+            experts_d = build_experts(cur, fslots, false, up_exps_s, gate_exps_s, down_exps_s, up_exps_b, gate_exps_b, gate_up_exps_b);
+        }
+
+        // every slot is computed by exactly one side, the other sides' rows are 0
+        experts = experts_h != nullptr ? ggml_add(ctx0, experts_d, experts_h) : experts_d;
         cb(experts, "ffn_moe_down_hybrid", il);
     }
 
@@ -2565,7 +2594,8 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
          ggml_tensor * down_exps,
          ggml_tensor * gate_up_exps,
                  int   il,
-         ggml_tensor ** hybrid) const {
+         ggml_tensor ** assign,
+                bool * host) const {
     if (moe_cache == nullptr) {
         return nullptr;
     }
@@ -2577,24 +2607,21 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     }
 
     // hybrid small batches: the lookup only assigns the slots, the caller builds the host path and then the copies (see build_moe_ffn)
-    if (hybrid != nullptr) {
+    if (assign != nullptr) {
         ggml_tensor * ids = selected_experts;
         if (!ggml_is_contiguous(ids)) {
             ids = ggml_cont(ctx0, ids);
         }
-        bool host = false;
-        if (ggml_tensor * res = moe_cache->hybrid_assign(ctx0, il, ids, n_tokens, host)) {
+        bool use_host = false;
+        if (ggml_tensor * res = moe_cache->hybrid_assign(ctx0, il, ids, n_tokens, use_host)) {
             ggml_backend_sched_set_tensor_backend(sched, res, moe_cache->backend(il));
             cb(res, "ffn_moe_assign", il);
             ggml_build_forward_expand(gf, res);
-            if (host) {
-                *hybrid = res;
-                return nullptr;
+            *assign = res;
+            if (host != nullptr) {
+                *host = use_host;
             }
-            ggml_tensor * slots = moe_cache->hybrid_fetch_experts(ctx0, il, res);
-            ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
-            cb(slots, "ffn_moe_slots", il);
-            return slots;
+            return nullptr;
         }
     }
 

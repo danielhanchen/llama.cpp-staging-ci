@@ -1529,7 +1529,8 @@ extern "C" {
     // counts: I32 [n_expert, n_layer + 1], use counter of each expert of each layer, the last row holds statistics (updated in place)
     // of the missing experts, a share fetch (0..1, error diffused over the lookups) is admitted: the ones with the highest counters, ties by expert id
     // the other missing experts get slot -1 and are left to the host
-    // result: I32 [n_expert_used, 4*n_tokens + 1] as ggml_moe_cache_lookup, then [n_expert_used, n_tokens] host ids: the expert of each slot -1, else -1
+    // result: I32 [n_expert_used, 5*n_tokens + 1] as ggml_moe_cache_lookup, then [n_expert_used, n_tokens] host ids: the expert of each slot -1,
+    // else -1, then [n_expert_used, n_tokens] hit slots: the slot of each expert that was cached before this lookup, else -1
     GGML_API struct ggml_tensor * ggml_moe_cache_assign(
             struct ggml_context * ctx,
             struct ggml_tensor  * ids,
@@ -1541,12 +1542,20 @@ extern "C" {
 
     // copies the experts admitted by ggml_moe_cache_assign (res) from host memory to the banks
     // result: I32 [n_expert_used, n_tokens], the slots for ggml_mul_mat_id with a bank (-1: computed elsewhere)
+    // overlap: the copies run beside the graph (CUDA: a second stream) and the result holds only the admitted slots (hits -1);
+    // the hits can be computed meanwhile from the hit slots of res; the result must go through ggml_moe_cache_join before it is used
     GGML_API struct ggml_tensor * ggml_moe_cache_fetch(
             struct ggml_context * ctx,
             struct ggml_tensor  * res,
             struct ggml_tensor ** banks,
             const void         ** host,
-            int                   n_banks);
+            int                   n_banks,
+            bool                  overlap);
+
+    // waits for the copies of an overlapped ggml_moe_cache_fetch (a), result: a copy of a
+    GGML_API struct ggml_tensor * ggml_moe_cache_join(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

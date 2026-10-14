@@ -408,6 +408,7 @@ struct llama_moe_cache::impl {
     bool  hybrid_probe = false; // the fetch share is measured before the first small batch (LLAMA_MOE_CACHE_FETCH not set)
     bool  hybrid_live  = false; // the graphs of small batches use the hybrid path
     float hybrid_share = 1.0f;  // share of the missing experts that are fetched and admitted, 1 = all (no hybrid path)
+    bool  overlap      = false; // LLAMA_MOE_CACHE_OVERLAP: small batches compute the hits while the missing experts are copied
 
     // auto (LLAMA_MOE_CACHE_HYBRID=1): trials of 5 blocks of hybrid_block small batches: plain (warm-up,
     // not counted), plain, hybrid, hybrid, plain (a trend such as the cache warming up cancels out); the time from one small batch to the
@@ -495,6 +496,11 @@ struct llama_moe_cache::impl {
         {
             const char * env = getenv("LLAMA_MOE_CACHE_VERIFY");
             verify_enabled = env != nullptr && atoi(env) != 0;
+        }
+
+        {
+            const char * env = getenv("LLAMA_MOE_CACHE_OVERLAP");
+            overlap = device_lookup && env != nullptr && atoi(env) != 0 && model.hparams.n_expert >= 4;
         }
 
         // only cache layers that keep all of their experts in host memory, on the device the layer is assigned to
@@ -598,7 +604,7 @@ struct llama_moe_cache::impl {
                 continue;
             }
             g.lru.init(model.layers.size(), n_expert, g.n_slots);
-            n_tensors[g.id] += g.ref.size()*(1 + g.layers.size()) + (device_lookup ? 2 : 0) + (hybrid ? 1 : 0);
+            n_tensors[g.id] += g.ref.size()*(1 + g.layers.size()) + (device_lookup ? 2 : 0) + (hybrid || overlap ? 1 : 0);
             for (int32_t il : g.layers) {
                 n_tensors[g.id] += llama_moe_cache_layer_small(model.layers[il]).size();
             }
@@ -678,7 +684,7 @@ struct llama_moe_cache::impl {
                 ggml_format_name(g.state, "moe_cache.%zu.state", ig);
                 devices[g.id].buf_size += GGML_PAD(ggml_nbytes(g.map), alignment) + GGML_PAD(ggml_nbytes(g.state), alignment);
             }
-            if (hybrid) {
+            if (hybrid || overlap) {
                 // outside of the budget, so the number of slots does not depend on the hybrid path
                 const size_t alignment = ggml_backend_buft_get_alignment(devices[g.id].buft);
                 g.counts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, g.ref[0]->ne[2], model.layers.size() + 1);
@@ -759,7 +765,7 @@ struct llama_moe_cache::impl {
         }
 
         // the hybrid path needs the device lookup, and one device: the host computes the misses of one device at a time
-        if (hybrid) {
+        if (hybrid || overlap) {
             std::vector<int32_t> devs;
             for (const group & g : groups) {
                 if (g.dev_lookup && g.n_slots > 0 && g.counts != nullptr && std::find(devs.begin(), devs.end(), g.id) == devs.end()) {
@@ -770,15 +776,19 @@ struct llama_moe_cache::impl {
                 LLAMA_LOG_INFO("%s: the experts are cached on %zu devices, the hybrid MoE cache path is disabled (single device only)\n", __func__, devs.size());
             }
             if (devs.size() != 1) {
+                overlap      = false;
                 hybrid       = false;
                 hybrid_probe = false;
                 hybrid_live  = false;
                 hybrid_share = 1.0f; // no hybrid line in the stats
             } else if (!model.hparams.no_alloc) {
-                if (hybrid_probe) {
+                if (overlap) {
+                    LLAMA_LOG_INFO("%s: MoE cache: small batches compute the cached experts while the missing ones are copied (LLAMA_MOE_CACHE_OVERLAP)\n", __func__);
+                }
+                if (hybrid && hybrid_probe) {
                     LLAMA_LOG_INFO("%s: hybrid MoE cache: the host computes the missing experts that are not fetched, fetch share measured at the first small batch, %s (LLAMA_MOE_CACHE_FETCH=0..1 to set the share)\n",
                         __func__, hybrid_auto ? "auto: kept only if trials of small batches are faster (LLAMA_MOE_CACHE_HYBRID=1)" : "on (LLAMA_MOE_CACHE_HYBRID=2)");
-                } else {
+                } else if (hybrid) {
                     LLAMA_LOG_INFO("%s: hybrid MoE cache: the host computes the missing experts that are not fetched, fetch share = %.3f (LLAMA_MOE_CACHE_FETCH)\n", __func__, hybrid_share);
                 }
             }
@@ -980,7 +990,7 @@ struct llama_moe_cache::impl {
 
     // the layer can use the hybrid lookup for a ubatch of this size
     bool hybrid_layer(int32_t il, int64_t n_ubatch) const {
-        if (!hybrid || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+        if (!(hybrid || overlap) || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return false;
         }
         const group & g = groups[layers[il].ig];
@@ -999,12 +1009,12 @@ struct llama_moe_cache::impl {
         return ggml_moe_cache_assign(ctx, ids, g.map, g.state, g.counts, host ? hybrid_share : 1.0f, il);
     }
 
-    ggml_tensor * hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res) const {
+    ggml_tensor * hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res, bool ov) const {
         const layer & l = layers[il];
         const group & g = groups[l.ig];
         std::vector<ggml_tensor *> banks = g.banks;
         std::vector<const void *>  host  = l.host_dev;
-        return ggml_moe_cache_fetch(ctx, res, banks.data(), host.data(), (int) banks.size());
+        return ggml_moe_cache_fetch(ctx, res, banks.data(), host.data(), (int) banks.size(), ov);
     }
 
     bool hybrid_active() const {
@@ -1012,7 +1022,7 @@ struct llama_moe_cache::impl {
     }
 
     int hybrid_mode() const {
-        return !hybrid ? 0 : hybrid_active() ? 2 : 1;
+        return !(hybrid || overlap) ? 0 : hybrid_active() ? 2 : 1;
     }
 
     // auto trial, called before the graph of every ubatch while a trial runs or waits, after the previous ubatch finished
@@ -2104,8 +2114,12 @@ ggml_tensor * llama_moe_cache::hybrid_assign(ggml_context * ctx, int32_t il, ggm
     return pimpl->hybrid_assign(ctx, il, ids, n_ubatch, host);
 }
 
-ggml_tensor * llama_moe_cache::hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res) const {
-    return pimpl->hybrid_fetch_experts(ctx, il, res);
+ggml_tensor * llama_moe_cache::hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res, bool overlap) const {
+    return pimpl->hybrid_fetch_experts(ctx, il, res, overlap);
+}
+
+bool llama_moe_cache::overlap() const {
+    return pimpl->overlap;
 }
 
 bool llama_moe_cache::hybrid_active() const {

@@ -38,7 +38,10 @@ public:
     // the hybrid lookup of layer il (see ggml_moe_cache_assign), nullptr if the layer does not use it, and the copies of the experts it
     // admits (see ggml_moe_cache_fetch); host = false: every missing expert is fetched (the use counters are kept while the hybrid path is off)
     ggml_tensor * hybrid_assign(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch, bool & host) const;
-    ggml_tensor * hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res) const;
+    ggml_tensor * hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res, bool overlap) const;
+
+    // LLAMA_MOE_CACHE_OVERLAP=1: the copies of the missing experts run beside the experts already cached (see ggml_moe_cache_fetch)
+    bool overlap() const;
 
     // true if the graphs of small batches may use the hybrid path
     bool hybrid_active() const;

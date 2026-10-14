@@ -708,6 +708,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             CUDA_CHECK(cudaEventDestroy(ev));
         }
     }
+    if (moe_fork != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(moe_fork));
+        CUDA_CHECK(cudaEventDestroy(moe_join));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
