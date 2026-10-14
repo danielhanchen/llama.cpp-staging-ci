@@ -58,6 +58,9 @@ public:
     // in slots taken from the cache while they are used (never for small batches, which may use every slot)
     void lend(ggml_backend_t backend, ggml_backend_sched_lend_copy * copies, int n_copies, int depth, bool dry, int64_t n_tokens);
 
+    // LLAMA_MOE_CACHE_SEED: 0 off, 1 only ubatches whose copies read their ids, 2 (default) also prefetched ubatches
+    static int seed_mode();
+
     // the graph that is allocated next, before its lend callbacks
     void set_graph(ggml_cgraph * gf);
 

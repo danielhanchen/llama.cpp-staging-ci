@@ -480,8 +480,7 @@ struct llama_moe_cache::impl {
             const char * env = getenv("LLAMA_MOE_CACHE_LEND");
             lend_mode = env == nullptr ? 1 : atoi(env);
             lend_auto = env == nullptr;
-            env = getenv("LLAMA_MOE_CACHE_SEED");
-            seed_own = env == nullptr || atoi(env) == 2;
+            seed_own = seed_mode() == 2;
             env = getenv("LLAMA_MOE_CACHE_LEND_MIN_FRAC");
             if (env != nullptr) {
                 lend_min_frac = std::max(0.0, atof(env));
@@ -739,12 +738,12 @@ struct llama_moe_cache::impl {
         // with the default seeding a prefilled cache made the first prompts slower, so it starts empty there
         if (!model.hparams.no_alloc) {
             const char * env  = getenv("LLAMA_MOE_CACHE_PREFILL");
-            const char * seed = getenv("LLAMA_MOE_CACHE_SEED");
-            if (env != nullptr ? atoi(env) != 0 : seed != nullptr && atoi(seed) == 1) {
+            const int    seed = seed_mode();
+            if (env != nullptr ? atoi(env) != 0 : seed == 1) {
                 prefill();
             }
             // the default seeding may not fit in the compute buffer, the cache is then prefilled (see seed_unavailable)
-            prefill_deferred = env == nullptr && (seed == nullptr || atoi(seed) == 2);
+            prefill_deferred = env == nullptr && seed == 2;
         }
 
         if (device_lookup && !model.hparams.no_alloc) {
@@ -2182,6 +2181,13 @@ ggml_tensor * llama_moe_cache::get_resident(const ggml_tensor * t) const {
 
 ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
     return pimpl->get_experts(w);
+}
+
+int llama_moe_cache::seed_mode() {
+    // 3 (a lagged seed of each layer of a prefetched ubatch) was removed: its readiness tracking was not sound
+    const char * env = getenv("LLAMA_MOE_CACHE_SEED");
+    const int mode = env != nullptr ? atoi(env) : 2;
+    return mode == 3 ? 2 : mode;
 }
 
 void llama_moe_cache::set_graph(ggml_cgraph * gf) {
