@@ -343,6 +343,13 @@ struct common_params_speculative_draft {
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
+    // --fit with a separate draft model next to a MoE cache (see common_init_result): fit_on_cpu is set when the draft model would not
+    // fit beside the main model and its cache and is placed on the CPU (n_gpu_layers = 0); a caller that can run without drafting
+    // sets fit_can_drop (llama-server), the fit then leaves the draft model out and sets fit_off, unless LLAMA_FIT_DRAFT_CPU=1
+    bool fit_can_drop = false;
+    bool fit_on_cpu   = false;
+    bool fit_off      = false;
+
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 

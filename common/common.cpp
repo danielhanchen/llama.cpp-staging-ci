@@ -1488,6 +1488,63 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     cparams.moe_cache_size = cache_new;
 }
 
+// --fit with a separate draft model and a MoE cache: true if the draft model should run on the CPU (see common_init_result)
+// the main model is fitted alone with an unbounded cache (on copies of the parameters), which gives the memory left after its layers;
+// the draft model's device memory at that context size must fit in what the requested cache leaves, plus at most max_frac of the cache
+static bool common_fit_draft_on_cpu(
+        const common_params & params, const llama_model_params & mparams, const llama_context_params & cparams,
+        const llama_model_params & mparams_dft, llama_context_params cparams_dft, const std::string & path_dft, ggml_log_level log_level) {
+    constexpr double MiB = 1024.0*1024.0;
+    double max_frac = 0.25;
+    if (const char * env = getenv("LLAMA_FIT_DRAFT_MAX_CACHE_FRAC")) {
+        max_frac = std::max(0.0, atof(env));
+    }
+
+    llama_model_params   mp = mparams;
+    llama_context_params cp = cparams;
+    std::vector<float> ts(params.tensor_split, params.tensor_split + 128);
+    std::vector<llama_model_tensor_buft_override> tbo = params.tensor_buft_overrides;
+    if (mp.tensor_split == params.tensor_split) {
+        mp.tensor_split = ts.data();
+    }
+    if (mp.tensor_buft_overrides != nullptr && !params.tensor_buft_overrides.empty()) {
+        mp.tensor_buft_overrides = tbo.data();
+    }
+    std::vector<size_t> margins = params.fit_params_target;
+    const size_t requested = cparams.moe_cache_size;
+    cp.moe_cache_size = std::max<size_t>(requested, (size_t) 1 << 40);
+
+    LOG_INF("%s: --fit with a draft model: fitting the main model and its MoE cache first\n", __func__);
+    const auto status = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(), tbo.empty() ? nullptr : tbo.data(),
+        margins.data(), params.fit_params_min_ctx, nullptr, log_level);
+    if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+        LOG_INF("%s: the main model alone does not fit, the draft model is placed on the CPU\n", __func__);
+        return true;
+    }
+    const size_t pot   = cp.moe_cache_size;            // memory the cache gets once the layers are placed
+    const size_t cache = std::min(requested, pot);     // what it would hold without the draft model
+    const size_t free_ = pot - cache;                  // memory the cache leaves unused
+
+    cparams_dft.n_ctx = cp.n_ctx;
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t ngl = 0, nct = 0, nex = 0;
+    size_t dft = 0;
+    try {
+        const auto dmds = common_get_device_memory_data(path_dft.c_str(), &mparams_dft, &cparams_dft, devs, ngl, nct, nex, log_level);
+        for (size_t i = 0; i < devs.size() && i < dmds.size(); i++) {
+            dft += dmds[i].model + dmds[i].context + dmds[i].compute;
+        }
+    } catch (const std::exception & e) {
+        LOG_WRN("%s: failed to measure the draft model, keeping the old placement: %s\n", __func__, e.what());
+        return false;
+    }
+    const bool gpu = (double) dft <= (double) free_ + max_frac*(double) cache;
+    LOG_INF("%s: draft model needs %.0f MiB of device memory; the MoE cache gets %.0f MiB (%.0f MiB left over) -> draft model on the %s "
+        "(it may take at most %.0f%% of the cache, LLAMA_FIT_DRAFT_MAX_CACHE_FRAC; LLAMA_FIT_DRAFT_LAST=0 for the old order)\n",
+        __func__, dft/MiB, cache/MiB, free_/MiB, gpu ? "GPU" : "CPU", 100.0*max_frac);
+    return !gpu;
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     // with --fit the MoE cache load mode is decided after the fit has placed the experts
@@ -1518,14 +1575,43 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             /*.cparams      =*/ &cparams_dft,
             /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
         };
+        const ggml_log_level fit_log_level = params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR;
+
+        // a separate draft model next to a MoE cache goes last: the main model's layers and its cache are placed first, and the draft
+        // model gets the GPU only if it fits in the memory the cache does not use, or takes at most LLAMA_FIT_DRAFT_MAX_CACHE_FRAC
+        // (default 0.25) of the memory the cache would get; otherwise it runs on the CPU, or, if the caller can run without it
+        // (fit_can_drop), it is left out and drafting is off unless LLAMA_FIT_DRAFT_CPU=1 (drafting on the CPU is slower than none)
+        // the old order (the draft model first, the main model around it) with LLAMA_FIT_DRAFT_LAST=0, or when -ngld is set
+        bool draft_cpu = false;
+        {
+            const char * env_last = getenv("LLAMA_FIT_DRAFT_LAST");
+            const bool   last     = has_draft && params.moe_cache_size > 0 && params.speculative.draft.n_gpu_layers == -1 &&
+                (env_last == nullptr || atoi(env_last) != 0);
+            if (last) {
+                draft_cpu = common_fit_draft_on_cpu(params, mparams, cparams, mparams_dft, cparams_dft, params_dft.model.path, fit_log_level);
+            }
+        }
+        const char * env_dcpu  = getenv("LLAMA_FIT_DRAFT_CPU");
+        const bool   draft_off = draft_cpu && params.speculative.draft.fit_can_drop && (env_dcpu == nullptr || atoi(env_dcpu) == 0);
+        if (draft_cpu) {
+            mparams_dft.n_gpu_layers = 0;
+            params.speculative.draft.n_gpu_layers = 0;
+            params.speculative.draft.fit_on_cpu   = true;
+            params.speculative.draft.fit_off      = draft_off;
+            if (draft_off) {
+                // fitted and run as without a draft model, the caller turns drafting off
+                cparams.n_rs_seq = 0;
+                mparams.load_mtp = params.load_mtp;
+            }
+        }
 
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
-            has_draft || spec_mtp ? &extra : nullptr,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            (has_draft || spec_mtp) && !draft_off ? &extra : nullptr,
+            fit_log_level);
 
         // the fit may have reduced the MoE cache (it gets the memory left after the layers), the load mode below follows the fitted size
         params.moe_cache_size = cparams.moe_cache_size;

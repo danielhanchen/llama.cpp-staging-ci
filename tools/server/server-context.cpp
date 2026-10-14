@@ -1154,7 +1154,7 @@ private:
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-        const bool has_spec = has_draft || spec_mtp;
+        bool       has_spec = has_draft || spec_mtp;
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1238,6 +1238,9 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        // --fit may leave a draft model that does not fit on the GPU out, see common_init_result
+        params_base.speculative.draft.fit_can_drop = true;
+
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();
@@ -1263,6 +1266,16 @@ private:
         }
 
         n_ctx = llama_n_ctx(ctx_tgt);
+
+        // --fit placed the draft model on the CPU, where drafting is slower than none (see common_init_result)
+        if (has_spec && params_base.speculative.draft.fit_off) {
+            SRV_WRN("%s", "--fit: the draft model does not fit on the GPU beside the main model and its MoE cache, speculative decoding is off "
+                "(LLAMA_FIT_DRAFT_CPU=1 drafts on the CPU, LLAMA_FIT_DRAFT_LAST=0 restores the old placement)\n");
+            has_spec = false;
+            params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+            params_base.speculative.draft.mparams = {};
+            load_progress_callback(1.0f, &load_progress_spec);
+        }
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
