@@ -2255,6 +2255,17 @@ static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
 static void clear_numa_thread_affinity(void) {}
 #endif
 
+// GET_ROWS with at least this many rows runs on all threads (GGML_CPU_GET_ROWS_MT_MIN, 0 = always one thread)
+static int64_t ggml_cpu_get_rows_mt_min(void) {
+    static int64_t v = -1;
+    if (v < 0) {
+        const char * e = getenv("GGML_CPU_GET_ROWS_MT_MIN");
+        const int64_t x = e ? atoll(e) : 4096;
+        v = x <= 0 ? INT64_MAX : x;
+    }
+    return v;
+}
+
 static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
     int n_tasks = 0;
 
@@ -2373,11 +2384,15 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_GET_ROWS:
+            {
+                // the cost of launching additional threads decreases performance with GPU offloading for small gathers,
+                // but a large one (e.g. the per-layer embedding rows of a whole prompt, read from a mapped file) is
+                // bound by its page faults and cache misses, which threads overlap
+                // every row is dequantized on its own, so splitting the rows does not change the result
+                n_tasks = ggml_nelements(node->src[1]) >= ggml_cpu_get_rows_mt_min() ? n_threads : 1;
+            } break;
         case GGML_OP_SET_ROWS:
             {
-                // FIXME: get_rows can use additional threads, but the cost of launching additional threads
-                // decreases performance with GPU offloading
-                //n_tasks = n_threads;
                 n_tasks = 1;
             } break;
         case GGML_OP_SCALE:
