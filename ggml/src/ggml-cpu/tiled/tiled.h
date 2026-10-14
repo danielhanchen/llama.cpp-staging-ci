@@ -7,6 +7,9 @@
 extern "C" {
 #endif
 
+// tiled kernels forced at every batch size (GGML_CPU_TILED_MM_FORCE=1)
+bool ggml_tiled_mm_forced(void);
+
 // Amount of wdata to reserve for tiled workspaces
 size_t ggml_tiled_wdata_size(int n_tasks, struct ggml_tensor * dst);
 

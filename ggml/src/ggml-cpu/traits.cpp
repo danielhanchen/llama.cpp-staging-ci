@@ -22,6 +22,18 @@ bool ggml_cpu_extra_compute_forward(struct ggml_compute_params * params, struct 
     return false;
 }
 
+bool ggml_cpu_extra_has_op(const struct ggml_tensor * op) {
+    for (auto extra : ggml_backend_cpu_get_extra_buffer_types()) {
+        if (extra && extra->context) {
+            auto buf_extra = (ggml::cpu::extra_buffer_type *) extra->context;
+            if (buf_extra->get_tensor_traits(op) != nullptr) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 bool ggml_cpu_extra_work_size(int n_threads, const struct ggml_tensor * op, size_t * size) {
     for (auto extra : ggml_backend_cpu_get_extra_buffer_types()) {
         if (extra && extra->context) {

@@ -1199,6 +1199,10 @@ static bool ggml_tiled_matmul_type_dispatch(const struct ggml_compute_params * p
     }
 }
 
+bool ggml_tiled_mm_forced(void) {
+    return ggml_tiled_matmul_forced();
+}
+
 static bool ggml_tiled_min_batch(int64_t rows) {
     //  Profitable at rows >= 8, take even when unprofitable if we're forced
     return rows >= 8 || ggml_tiled_matmul_forced();

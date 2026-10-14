@@ -1745,8 +1745,8 @@ static void ggml_compute_forward_mul_mat_id(
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor);
 
 // batch invariant nodes (speculative verify batches): the matrix multiplications pick their kernel by the number of src1 columns
-// (llamafile sgemm, repacked gemm vs gemv, the expert grouping of MUL_MAT_ID), so every column (token) is computed alone, as a batch
-// of one token computes it; returns true when done
+// (llamafile sgemm, repacked gemm vs gemv, the tiled kernels from 8 rows per expert), so every column (token) is computed alone, as a
+// batch of one token computes it; returns true when done
 static bool ggml_compute_forward_batch_invariant(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     if (!(tensor->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT)) {
         return false;
@@ -1773,6 +1773,11 @@ static bool ggml_compute_forward_batch_invariant(struct ggml_compute_params * pa
     if (tensor->op == GGML_OP_MUL_MAT_ID) {
         struct ggml_tensor * ids = tensor->src[2];
         if (src1->ne[2] < 2 || src1->ne[2] > 16 || src1->ne[3] != 1 || ids->ne[1] != src1->ne[2]) {
+            return false;
+        }
+        // the stock path is already exact while no expert gets enough rows for the tiled kernel (8): one vec_dot per weight row
+        // and token, the same as for a single token; the extra buffer types (repacked gemm vs gemv) still need the column loop
+        if (src1->ne[2] < 8 && !ggml_tiled_mm_forced() && !ggml_cpu_extra_has_op(tensor)) {
             return false;
         }
         for (int64_t j = 0; j < src1->ne[2]; ++j) {
