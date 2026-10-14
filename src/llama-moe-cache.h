@@ -78,7 +78,7 @@ public:
     // LLAMA_MOE_CACHE_SEED: 0 off, 1 only ubatches whose copies read their ids, 2 (default) also prefetched ubatches
     static int seed_mode();
 
-    // the graph that is allocated next, before its lend callbacks
+    // the graph that is allocated next, before its lend callbacks (nullptr for a reserved graph, which does not run)
     void set_graph(ggml_cgraph * gf);
 
     // the cache may lend slots (LLAMA_MOE_CACHE_LEND)

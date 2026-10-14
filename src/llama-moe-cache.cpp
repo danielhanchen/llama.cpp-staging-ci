@@ -1950,11 +1950,12 @@ struct llama_moe_cache::impl {
     }
 
     // the graph about to be allocated: the groups whose banks it reads through host lookups (the get_rows of a slot map)
+    // nullptr: a graph that is only measured or reserved, which never runs and reads nothing
     void set_graph(ggml_cgraph * gf) {
         for (group & g : groups) {
             g.host_read = false;
         }
-        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        for (int i = 0; gf != nullptr && i < ggml_graph_n_nodes(gf); ++i) {
             const ggml_tensor * node = ggml_graph_node(gf, i);
             if (node->op != GGML_OP_GET_ROWS) {
                 continue;

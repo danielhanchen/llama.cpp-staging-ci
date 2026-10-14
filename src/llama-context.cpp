@@ -2863,8 +2863,10 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // initialize scheduler with the specified graph
     prefetch_n_tokens = n_tokens;
+    // a reserved graph sizes the memory with lending: the guard against lending to a graph that reads the cache through host
+    // lookups applies when such a graph is allocated to run (see process_ubatch), which then takes the staging arena
     if (moe_cache) {
-        moe_cache->set_graph(gf);
+        moe_cache->set_graph(nullptr);
     }
     if (split_only) {
         if (sizes) {
