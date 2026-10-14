@@ -146,7 +146,10 @@ static __global__ void moe_cache_assign(
         __syncthreads();
         if (lane == 0) {
             stat[2] = (int32_t) (acc & 0xffff);
-            *(unsigned long long *) stat += (unsigned long long) (n_miss - n_take);
+            // the row of the statistics starts at n_layer*n_expert: only 4-byte aligned, so the 64-bit counter is read and written as two words
+            const unsigned long long n_host = ((unsigned long long) (uint32_t) stat[1] << 32 | (uint32_t) stat[0]) + (unsigned long long) (n_miss - n_take);
+            stat[0] = (int32_t) (uint32_t) n_host;
+            stat[1] = (int32_t) (uint32_t) (n_host >> 32);
         }
     }
 
