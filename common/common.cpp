@@ -1581,11 +1581,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         // model gets the GPU only if it fits in the memory the cache does not use, or takes at most LLAMA_FIT_DRAFT_MAX_CACHE_FRAC
         // (default 0.25) of the memory the cache would get; otherwise it runs on the CPU, or, if the caller can run without it
         // (fit_can_drop), it is left out and drafting is off unless LLAMA_FIT_DRAFT_CPU=1 (drafting on the CPU is slower than none)
-        // the old order (the draft model first, the main model around it) with LLAMA_FIT_DRAFT_LAST=0, or when -ngld is set
+        // the old order (the draft model first, the main model around it) with LLAMA_FIT_DRAFT_LAST=0, or when -ngld or -devd is set
         bool draft_cpu = false;
         {
             const char * env_last = getenv("LLAMA_FIT_DRAFT_LAST");
             const bool   last     = has_draft && params.moe_cache_size > 0 && params.speculative.draft.n_gpu_layers == -1 &&
+                params.speculative.draft.devices.empty() &&
                 (env_last == nullptr || atoi(env_last) != 0);
             if (last) {
                 draft_cpu = common_fit_draft_on_cpu(params, mparams, cparams, mparams_dft, cparams_dft, params_dft.model.path, fit_log_level);
@@ -1594,8 +1595,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         const char * env_dcpu  = getenv("LLAMA_FIT_DRAFT_CPU");
         const bool   draft_off = draft_cpu && params.speculative.draft.fit_can_drop && (env_dcpu == nullptr || atoi(env_dcpu) == 0);
         if (draft_cpu) {
-            mparams_dft.n_gpu_layers = 0;
+            // no device at all (-devd none): with only n_gpu_layers = 0 its context still reserves a device compute buffer for the
+            // offloaded ops of large batches (2.4 GiB for the MTP drafter at -ub 2048), which pushed the main layers off the GPU
+            params.speculative.draft.devices      = { nullptr };
             params.speculative.draft.n_gpu_layers = 0;
+            mparams_dft.devices      = params.speculative.draft.devices.data();
+            mparams_dft.n_gpu_layers = 0;
             params.speculative.draft.fit_on_cpu   = true;
             params.speculative.draft.fit_off      = draft_off;
             if (draft_off) {
