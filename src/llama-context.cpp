@@ -4528,8 +4528,13 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
                 continue;
             }
 
-            // only backends known to support a cross-thread event wait while the host keeps queueing work
-            const char * reg_name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+            // only backends known to support a cross-thread event wait while the host keeps queueing work.
+            // A meta device (-sm tensor) has no registry: its rows take the synchronous path.
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            if (reg == nullptr) {
+                continue;
+            }
+            const char * reg_name = ggml_backend_reg_name(reg);
             if (strcmp(reg_name, "CUDA") != 0 && strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0) {
                 continue;
             }
