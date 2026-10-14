@@ -412,7 +412,7 @@ struct llama_moe_cache::impl {
     bool  refill_enabled = true;
     // the routing of the end of a prompt that did not seed (see set_refill_counts): the slots that come back after it get its most used experts
     std::vector<std::vector<int32_t>> refill_counts; // [n_layer]
-    bool   refill_routed   = true; // LLAMA_MOE_CACHE_REFILL_ROUTED=0: the slots get back the experts they held before they were lent
+    bool   refill_routed   = false; // LLAMA_MOE_CACHE_REFILL_ROUTED=1 (opt-in): else the slots get back the experts they held before they were lent
     size_t n_refill_routed = 0;    // refills that used the routing of a prompt
     bool  verify_enabled = false; // LLAMA_MOE_CACHE_VERIFY=1 (debug): compare the cached experts with host memory
     stats stats_refill;
@@ -594,8 +594,9 @@ struct llama_moe_cache::impl {
         {
             const char * env = getenv("LLAMA_MOE_CACHE_REFILL");
             refill_enabled = env == nullptr || atoi(env) != 0;
+            // opt-in: measured +0.2-0.4% decode and about -0.5% on 2k prompts (Qwen3.8-Flash-Next IQ1_S), not a clear gain
             env = getenv("LLAMA_MOE_CACHE_REFILL_ROUTED");
-            refill_routed = env == nullptr || atoi(env) != 0;
+            refill_routed = env != nullptr && atoi(env) != 0;
         }
         {
             const char * env = getenv("LLAMA_MOE_CACHE_VERIFY");
@@ -2634,7 +2635,7 @@ struct llama_moe_cache::impl {
         if (n_lends > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu graphs used lent slots (at most %d slots lent), %zu experts refilled after them, %.2f MiB\n", tag, n_lends, lend_max, stats_refill.misses, stats_refill.bytes/1024.0/1024.0);
             if (n_refill_routed > 0) {
-                LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu refills took the experts most used by the end of a prompt (LLAMA_MOE_CACHE_REFILL_ROUTED=0 to disable)\n", tag,
+                LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu refills took the experts most used by the end of a prompt (LLAMA_MOE_CACHE_REFILL_ROUTED=1)\n", tag,
                     n_refill_routed);
             }
         }
@@ -2866,6 +2867,10 @@ void llama_moe_cache::seed_end() {
 
 void llama_moe_cache::set_seed_counts(const ggml_tensor * w, const std::vector<int32_t> & counts) {
     pimpl->set_seed_counts(w, counts);
+}
+
+bool llama_moe_cache::refills_routed() const {
+    return pimpl->refill_routed;
 }
 
 void llama_moe_cache::set_refill_counts(const ggml_tensor * w, const std::vector<int32_t> & counts) {

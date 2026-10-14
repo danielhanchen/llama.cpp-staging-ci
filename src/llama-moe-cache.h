@@ -159,6 +159,7 @@ public:
     void set_seed_counts(const ggml_tensor * w, const std::vector<int32_t> & counts);
     // the routing of the last large ubatch of a prompt that did not seed: the lent slots that come back get its most used experts
     void set_refill_counts(const ggml_tensor * w, const std::vector<int32_t> & counts);
+    bool refills_routed() const; // LLAMA_MOE_CACHE_REFILL_ROUTED=1 (opt-in)
     const std::vector<int32_t> * get_seed_counts(const ggml_tensor * w) const; // nullptr if there are none for the layer of w
     void clear_seed_counts();
     bool has_seed_counts() const;

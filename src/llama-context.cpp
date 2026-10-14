@@ -3431,7 +3431,7 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
         }
     }
     // a ubatch with outputs after a large one that did not seed ends the prompt (e.g. the server runs the last tokens as a separate batch)
-    if (cont && !moe_cache_ids.empty() && n_outputs_ub != 0 && !large && !moe_cache_seeded) {
+    if (cont && !moe_cache_ids.empty() && n_outputs_ub != 0 && !large && !moe_cache_seeded && moe_cache->refills_routed()) {
         moe_cache_refill_from_ids();
     }
     moe_cache_ids.clear();
@@ -3473,7 +3473,7 @@ void llama_context::moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_ou
 
     // the prompt ends at a ubatch with outputs (or a failed one), the next one may belong to another prompt
     if (n_outputs_ub != 0 || ubatch.n_seqs_unq != 1) {
-        if (n_outputs_ub != 0 && recorded && !moe_cache_seeded && !moe_cache_ids.empty()) {
+        if (n_outputs_ub != 0 && recorded && !moe_cache_seeded && !moe_cache_ids.empty() && moe_cache->refills_routed()) {
             moe_cache_refill_from_ids();
         }
         moe_cache_seq      = -1;
