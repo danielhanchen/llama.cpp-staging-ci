@@ -619,9 +619,14 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // the KV cells were shifted (context shift, cache reuse): positions no longer follow the token list, so the state
+    // must not be content-addressed by its tokens (see server_prompt_ssd)
+    bool kv_shifted = false;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        kv_shifted = false;
     }
 
     int n_tokens() const {
@@ -632,6 +637,7 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            kv_shifted,
         };
     }
 };
@@ -660,6 +666,8 @@ struct server_prompt_cache_state {
     }
 };
 
+struct server_prompt_ssd;
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
@@ -667,6 +675,12 @@ struct server_prompt_cache {
     }
 
     std::list<server_prompt_cache_state> states;
+
+    // optional SSD tier: evicted states are written there, and load() looks there after the RAM cache (not owned)
+    server_prompt_ssd * ssd = nullptr;
+
+    // remove the oldest state, handing it to the SSD tier if there is one
+    void evict_front();
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;

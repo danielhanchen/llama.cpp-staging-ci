@@ -1728,6 +1728,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-ssd-dir"}, "PATH",
+        "directory of the SSD tier of the prompt cache: prompts evicted from --cache-ram are written there and reused, also "
+        "after a restart (default: disabled, requires --cache-ram)",
+        [](common_params & params, const std::string & value) {
+            params.cache_ssd_dir = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_DIR").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-ssd-mib"}, "N",
+        string_format("size limit of the SSD tier of the prompt cache in MiB, least recently used prompts are removed first "
+            "(default: %d, 0 - no limit)", params.cache_ssd_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-ssd-mib must be non-negative");
+            }
+            params.cache_ssd_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-ssd-readonly"},
+        "read prompts from the SSD tier of the prompt cache but never write or delete there (default: disabled)",
+        [](common_params & params) {
+            params.cache_ssd_readonly = true;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_READONLY").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

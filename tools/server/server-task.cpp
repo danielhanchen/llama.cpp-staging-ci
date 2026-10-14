@@ -1,4 +1,5 @@
 #include "server-task.h"
+#include "server-prompt-ssd.h"
 
 #include "build-info.h"
 #include "server-chat.h"
@@ -1756,7 +1757,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            evict_front();
         }
     }
 
@@ -1783,6 +1784,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ prompt.checkpoints,
+            /*.kv_shifted  =*/ prompt.kv_shifted,
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
@@ -1822,6 +1824,45 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             f_sim_best  = f_sim_cur;
 
             it_best = it;
+        }
+    }
+
+    // then the SSD tier, by the same rule: it is used only if it beats both the slot and the best RAM entry
+    if (ssd != nullptr) {
+        server_prompt_ssd::entry e;
+        const int lcp_ssd = ssd->find(tokens_new, e);
+        if (lcp_ssd > 0) {
+            const float f_keep_ssd = float(lcp_ssd) / e.tokens.size();
+            const float f_sim_ssd  = float(lcp_ssd) / tokens_new.size();
+
+            SRV_TRC("   - SSD prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", e.tokens.size(), lcp_ssd, f_keep_ssd, f_sim_ssd);
+
+            if (f_keep_ssd >= 0.25f && f_keep_best < f_keep_ssd && f_sim_best < f_sim_ssd) {
+                const int64_t t0 = ggml_time_us();
+
+                server_prompt_cache_state st;
+                if (ssd->read(e, st)) {
+                    const size_t size = st.data.main.size();
+                    if (llama_state_seq_set_data_ext(ctx_tgt, st.data.main.data(), size, id_slot, 0) != size) {
+                        SRV_ERR("failed to restore state with size %zu from the SSD tier\n", size);
+                        return false;
+                    }
+                    if (!st.data.drft.empty()) {
+                        const size_t size_dft = st.data.drft.size();
+                        if (ctx_dft == nullptr || llama_state_seq_set_data_ext(ctx_dft, st.data.drft.data(), size_dft, id_slot, 0) != size_dft) {
+                            SRV_WRN("failed to restore draft state with size %zu from the SSD tier\n", size_dft);
+                            return false;
+                        }
+                    }
+
+                    SRV_INF("prompt cache: restored %zu tokens (%.3f MiB) from the SSD tier in %.1f ms\n",
+                            e.tokens.size(), st.size() / (1024.0*1024.0), (ggml_time_us() - t0) / 1000.0);
+                    SRV_DBG("%s", "__TEST_TAG_CACHE_SSD_HIT__\n");
+
+                    prompt = std::move(st.prompt);
+                    return true;
+                }
+            }
         }
     }
 
@@ -1870,12 +1911,22 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     return true;
 }
 
+void server_prompt_cache::evict_front() {
+    if (states.empty()) {
+        return;
+    }
+    if (ssd != nullptr) {
+        ssd->put(std::move(states.front()));
+    }
+    states.pop_front();
+}
+
 void server_prompt_cache::update() {
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            evict_front();
         }
     }
 
@@ -1890,7 +1941,7 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            evict_front();
         }
     }
 

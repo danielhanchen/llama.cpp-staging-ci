@@ -4,6 +4,7 @@
 #include "server-decision.h"
 #include "server-http.h"
 #include "server-task.h"
+#include "server-prompt-ssd.h"
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
@@ -992,10 +993,31 @@ public:
 
     ~server_context_impl() {
         if (!sleeping) {
+            prompt_ssd_save_all();
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
             destroy();
         }
+        prompt_ssd.reset();
+    }
+
+    // write the slots and the RAM prompt cache to the SSD tier and wait for it (shutdown, sleep)
+    void prompt_ssd_save_all() {
+        if (!prompt_ssd || !prompt_cache || ctx_tgt == nullptr) {
+            return;
+        }
+        const int64_t t0 = ggml_time_us();
+        for (auto & slot : slots) {
+            if (slot.prompt.tokens.size() > 0) {
+                slot.prompt_save(*prompt_cache);
+            }
+        }
+        while (!prompt_cache->states.empty()) {
+            prompt_cache->evict_front();
+        }
+        prompt_ssd->flush();
+        SRV_INF("prompt cache: SSD tier holds %zu prompts (%.3f MiB), saving took %.1f ms\n",
+                prompt_ssd->count(), prompt_ssd->size() / (1024.0*1024.0), (ggml_time_us() - t0) / 1000.0);
     }
 
     server_metrics get_metrics() const {
@@ -1046,6 +1068,7 @@ private:
 
     int n_empty_consecutive = 0;
 
+    std::unique_ptr<server_prompt_ssd>   prompt_ssd; // SSD tier of the prompt cache (--cache-ssd-dir)
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
@@ -1093,6 +1116,8 @@ private:
                 // note: for sleeping == false, event is emitted by load_model()
             }
             SRV_INF("%s", "server is entering sleeping state\n");
+            prompt_ssd_save_all();
+            prompt_ssd.reset();
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
@@ -1537,9 +1562,23 @@ private:
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
         } else {
+            if (!params_base.cache_ssd_dir.empty()) {
+                SRV_WRN("%s", "--cache-ssd-dir requires the RAM prompt cache (--cache-ram), disabling the SSD tier\n");
+            }
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
+
+        prompt_ssd.reset();
+        if (prompt_cache && !params_base.cache_ssd_dir.empty()) {
+            server_prompt_ssd_params sp;
+            sp.dir        = params_base.cache_ssd_dir;
+            sp.limit_size = params_base.cache_ssd_mib > 0 ? 1024ull*1024ull*params_base.cache_ssd_mib : 0;
+            sp.readonly   = params_base.cache_ssd_readonly;
+            const std::string ns = server_prompt_ssd_namespace(params_base, model_tgt, ctx_tgt, model_dft, ctx_dft);
+            prompt_ssd = std::make_unique<server_prompt_ssd>(sp, ns, mctx != nullptr);
+            prompt_cache->ssd = prompt_ssd.get();
+        }
 
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
@@ -3377,6 +3416,9 @@ private:
                     slot.prompt.tokens.insert(new_tokens);
                 }
 
+                // the remaining cells were shifted and attended to the discarded ones: not the state of these tokens
+                slot.prompt.kv_shifted = true;
+
                 slot.truncated = true;
             }
         });
@@ -3710,6 +3752,7 @@ private:
 
                                             slot.mem.seq_rm (slot.id, head_p, head_c);
                                             slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
+                                            slot.prompt.kv_shifted = true;
 
                                             for (size_t i = 0; i < n_match; i++) {
                                                 slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);

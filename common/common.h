@@ -649,6 +649,9 @@ struct common_params {
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    std::string cache_ssd_dir;           // SSD tier of the prompt cache, empty = disabled
+    int32_t cache_ssd_mib       = 16384; // size limit of the SSD tier in MiB, 0 = no limit
+    bool    cache_ssd_readonly  = false; // use the SSD tier without writing to it
 
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
