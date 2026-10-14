@@ -703,6 +703,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    for (cudaEvent_t ev : copy_peer_events) {
+        if (ev != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(ev));
+        }
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -2629,6 +2634,63 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
+// The device-to-device copies of a copy-only instance (the scheduler copy queue) run on the stream of its compute instance.
+// With device work (a copy kernel or a copy engine device copy) on a second stream of the process, every later kernel launch
+// of the process was 0.3 to 0.5 us slower on compute capability 12.0 (the next kernel no longer starts before the previous one
+// ends, PDL included), so generation stayed ~7% slower after the first prompt that used the copy queue; uploads alone do not
+// do it. The copies keep the order of the copy queue: they wait for its earlier work, and its later work waits for them.
+static cudaStream_t ggml_cuda_copy_peer_begin(ggml_backend_cuda_context * ctx) {
+    ggml_backend_cuda_context * peer = ctx->copy_peer;
+    if (peer == nullptr || ctx->computes) {
+        return ctx->stream();
+    }
+    cudaStream_t ps = peer->stream(peer->device, 0);
+#if !defined(GGML_USE_HIP) // the copy peer is never set on HIP
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(ps, &capture));
+    if (capture != cudaStreamCaptureStatusNone) {
+        return ctx->stream();
+    }
+#endif // !defined(GGML_USE_HIP)
+    ggml_cuda_set_device(ctx->device);
+    for (cudaEvent_t & ev : ctx->copy_peer_events) {
+        if (ev == nullptr) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+        }
+    }
+    CUDA_CHECK(cudaEventRecord(ctx->copy_peer_events[0], ctx->stream()));
+    CUDA_CHECK(cudaStreamWaitEvent(ps, ctx->copy_peer_events[0], 0));
+    return ps;
+}
+
+static void ggml_cuda_copy_peer_end(ggml_backend_cuda_context * ctx, cudaStream_t stream) {
+    if (stream == ctx->stream()) {
+        return;
+    }
+    CUDA_CHECK(cudaEventRecord(ctx->copy_peer_events[1], stream));
+    CUDA_CHECK(cudaStreamWaitEvent(ctx->stream(), ctx->copy_peer_events[1], 0));
+}
+
+static void ggml_backend_cuda_set_copy_peer(ggml_backend_t copy_backend, ggml_backend_t compute_backend) {
+#if defined(GGML_USE_HIP)
+    GGML_UNUSED(copy_backend);
+    GGML_UNUSED(compute_backend);
+#else
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_COPY_PEER");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled || !ggml_backend_is_cuda(copy_backend) || !ggml_backend_is_cuda(compute_backend) || copy_backend == compute_backend) {
+        return;
+    }
+    ggml_backend_cuda_context * ctx  = (ggml_backend_cuda_context *) copy_backend->context;
+    ggml_backend_cuda_context * peer = (ggml_backend_cuda_context *) compute_backend->context;
+    if (ctx->device == peer->device) {
+        ctx->copy_peer = peer;
+    }
+#endif // defined(GGML_USE_HIP)
+}
+
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
@@ -2683,7 +2745,9 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
     } else {
         // src and dst are on the same backend
-        CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+        cudaStream_t stream = ggml_cuda_copy_peer_begin(cuda_ctx_src);
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, stream));
+        ggml_cuda_copy_peer_end(cuda_ctx_src, stream);
     }
     return true;
 }
@@ -6528,8 +6592,9 @@ static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const g
         }
         void       * d = (char *) r.dst->data + r.dst_offset;
         const void * s = (const char *) r.src->data + r.src_offset;
-        // a copy-only instance uses the kernel only where the copy engines are slow for device copies (see above)
-        if (src_dev && d2d_kernel && (cuda_ctx->computes || ggml_cuda_copy_queue_kernel(cuda_ctx->device))) {
+        // a copy-only instance uses the kernel only where the copy engines are slow for device copies (see above), its device copies
+        // that run on the compute instance (ggml_cuda_copy_peer_begin) use the kernel as the compute instance does
+        if (src_dev && d2d_kernel && (cuda_ctx->computes || cuda_ctx->copy_peer != nullptr || ggml_cuda_copy_queue_kernel(cuda_ctx->device))) {
             d2d_dsts.push_back(d);
             d2d_srcs.push_back(s);
             d2d_sizes.push_back(r.size);
@@ -6547,8 +6612,23 @@ static bool ggml_backend_cuda_copy_regions_async(ggml_backend_t backend, const g
 
     ggml_cuda_set_device(cuda_ctx->device);
     if (!d2d_dsts.empty()) {
-        ggml_cuda_copy_regions_d2d(cuda_ctx->stream(), ggml_cuda_info().devices[cuda_ctx->device].nsm,
+        // the device copies and the uploads write different regions, the uploads do not wait for the device copies
+        cudaStream_t stream = ggml_cuda_copy_peer_begin(cuda_ctx);
+        ggml_cuda_copy_regions_d2d(stream, ggml_cuda_info().devices[cuda_ctx->device].nsm,
             d2d_dsts.data(), d2d_srcs.data(), d2d_sizes.data(), (int) d2d_dsts.size());
+        if (stream != cuda_ctx->stream()) {
+            // the uploads are queued before the copy queue waits for the device copies
+            if (!dsts.empty()) {
+#if CUDART_VERSION >= 13000
+                CUDA_CHECK(cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), dsts.size(), &attr, &attr_idx, 1, cuda_ctx->stream()));
+#else
+                size_t fail_idx = 0;
+                CUDA_CHECK(cudaMemcpyBatchAsync(dsts.data(), const_cast<void **>(srcs.data()), sizes.data(), dsts.size(), &attr, &attr_idx, 1, &fail_idx, cuda_ctx->stream()));
+#endif
+                dsts.clear();
+            }
+            ggml_cuda_copy_peer_end(cuda_ctx, stream);
+        }
     }
     if (!dsts.empty()) {
 #if CUDART_VERSION >= 13000
@@ -6566,6 +6646,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_copy_regions_async") == 0) {
         return (void *)ggml_backend_cuda_copy_regions_async;
+    }
+    if (strcmp(name, "ggml_backend_set_copy_peer") == 0) {
+        return (void *)ggml_backend_cuda_set_copy_peer;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;

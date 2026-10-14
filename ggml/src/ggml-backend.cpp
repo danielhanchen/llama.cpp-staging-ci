@@ -2709,6 +2709,14 @@ static bool ggml_backend_sched_prefetch_queue(ggml_backend_sched_t sched, int ba
         pf->retire[s] = ggml_backend_event_new(backend->device);
         ok = pf->ready[s] != NULL && pf->retire[s] != NULL;
     }
+    if (ok) {
+        // the copy queue may run its device-to-device copies on the backend (e.g. CUDA, see ggml_backend_cuda_set_copy_peer)
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(backend->device);
+        auto set_copy_peer = (void (*)(ggml_backend_t, ggml_backend_t)) (reg ? ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_copy_peer") : NULL);
+        if (set_copy_peer != NULL) {
+            set_copy_peer(pf->copy_backend, backend);
+        }
+    }
     if (!ok) {
         GGML_LOG_WARN("%s: %s: cannot create a copy queue, host weight prefetch disabled\n", __func__, ggml_backend_name(backend));
         ggml_backend_sched_prefetch_release(sched, backend_id);

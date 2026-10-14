@@ -1566,6 +1566,10 @@ struct ggml_backend_cuda_context {
     // a graph was computed with this instance (a copy-only instance, e.g. the scheduler copy queue, is not a compute instance)
     bool computes = false;
 
+    // copy-only instance: the compute instance whose stream runs its device-to-device copies (ggml_backend_cuda_set_copy_peer)
+    ggml_backend_cuda_context * copy_peer = nullptr;
+    cudaEvent_t copy_peer_events[2] = { nullptr, nullptr };
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
