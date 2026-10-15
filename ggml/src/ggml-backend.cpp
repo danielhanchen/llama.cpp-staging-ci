@@ -2865,11 +2865,14 @@ static bool ggml_backend_sched_prefetch_ensure(ggml_backend_sched_t sched, int b
     }
 
     // a step of the adaptive depth grows the arena past the memory reserved for the graph: only with headroom left on the device for the
-    // memory the backends allocate while computing (e.g. the CUDA pool, GGML_SCHED_PREFETCH_ADAPT_HEADROOM_MIB, default 512), else this
-    // binding and the next ones use the depth before the step (the copies stay in the arena, never in the graph allocator)
+    // memory the backends allocate while computing (e.g. the CUDA pool, GGML_SCHED_PREFETCH_ADAPT_HEADROOM_MIB, default 128), else this
+    // binding and the next ones use the depth before the step (the copies stay in the arena, never in the graph allocator). The growth
+    // itself is exact, the headroom only covers the backends: Qwen3.6 MTP on a 12 GB T4 with 498 MiB free stepped both contexts with 0
+    // and ran 16k prompts with 104 MiB left (without the check a 320 MiB arena failed), 512 blocked the step of Flash-Next IQ1_S on 8 GB
+    // (694 MiB of growth, 890 MiB free)
     if (pf->depth > sched->pf_depth0 && pf->staging > pf->arena_size) {
         static const size_t headroom = (size_t) std::max(0, getenv("GGML_SCHED_PREFETCH_ADAPT_HEADROOM_MIB") ?
-            atoi(getenv("GGML_SCHED_PREFETCH_ADAPT_HEADROOM_MIB")) : 512) * 1024 * 1024;
+            atoi(getenv("GGML_SCHED_PREFETCH_ADAPT_HEADROOM_MIB")) : 128) * 1024 * 1024;
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
         size_t free = 0, total = 0;
         if (dev != NULL) {
