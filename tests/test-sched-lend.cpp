@@ -11,7 +11,6 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
 #include "../ggml/src/ggml-backend-impl.h"
 
 #include <algorithm>
@@ -420,7 +419,13 @@ int main() {
     setenv("GGML_SCHED_PREFETCH", "2", 1);      // any backend with async copies and events (the mock is not CUDA)
     setenv("GGML_SCHED_PREFETCH_ADAPT", "0", 1); // fixed depth 2
 
-    ggml_backend_t cpu = ggml_backend_cpu_init();
+    // the CPU backend can be a dynamically loaded module (GGML_BACKEND_DL), so resolve it through the registry
+    ggml_backend_load_all();
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (cpu == nullptr) {
+        printf("test-sched-lend: skipped, no CPU backend\n");
+        return 0;
+    }
     model m = make_model();
     const size_t copy_bytes = GGML_PAD(ggml_nbytes(m.w[0]), k_align);
 
