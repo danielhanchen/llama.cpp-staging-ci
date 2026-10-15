@@ -438,9 +438,227 @@ static __global__ void moe_cache_fetch(const int32_t * __restrict__ info, const 
     }
 }
 
+// device seed (ggml_moe_cache_seed_plan), one block: count the uses of each expert, rank the used ones (most used first, ties by expert id),
+// keep the hits of the n_seed first, give the missing ones slots below n_victim in hand order (empty slots first, then CLOCK reference
+// bit 0, then 1), skipping the slots pinned by this seed or the pos seeds before it in the graph, and the slots of the layers after il,
+// whose copies may still read them. Block-wide scans only (no warp intrinsics), so the result does not depend on the warp size.
+#define MOE_SEED_THREADS 1024
+
+static __device__ int moe_seed_scan(int * buf, const int v) {
+    // inclusive block scan of v over MOE_SEED_THREADS threads, buf: [MOE_SEED_THREADS]
+    const int t = threadIdx.x;
+    buf[t] = v;
+    __syncthreads();
+    for (int off = 1; off < MOE_SEED_THREADS; off <<= 1) {
+        const int add = t >= off ? buf[t - off] : 0;
+        __syncthreads();
+        buf[t] += add;
+        __syncthreads();
+    }
+    const int r = buf[t];
+    __syncthreads();
+    return r;
+}
+
+static __global__ void moe_cache_seed_plan(
+        const int32_t * __restrict__ ids, const int n_ids, int32_t * __restrict__ map, int32_t * __restrict__ state,
+        int32_t * __restrict__ scores, int32_t * __restrict__ out, const int n_expert, const int il, const int n_slots,
+        const int n_victim, const int n_seed, const int n_seed_max, const int pos) {
+    extern __shared__ int32_t smem[];
+    int32_t * cnt  = smem;                    // [n_expert] uses of each expert
+    int32_t * sel  = cnt + n_expert;          // [n_seed] the selected experts by rank, -1 none
+    int32_t * miss = sel + n_seed;            // [n_seed] the missing ones among them, in rank order
+    int32_t * vic  = miss + n_seed;           // [n_seed] their slots
+    int32_t * scan = vic + n_seed;            // [MOE_SEED_THREADS]
+    __shared__ int s_miss;
+    __shared__ int s_found;
+    __shared__ int s_new;
+
+    const int t = threadIdx.x;
+
+    int32_t * key_of = state + MOE_CACHE_HDR;
+    int32_t * ref    = key_of + n_slots;
+    int32_t * pin    = ref + n_slots;
+    int32_t * row    = map + (int64_t) il*n_expert;
+    int32_t * sc     = scores != nullptr ? scores + (int64_t) il*n_expert : nullptr;
+
+    int32_t * fill_e = out + 1;
+    int32_t * fill_s = out + 1 + n_seed_max;
+
+    for (int e = t; e < n_expert; e += MOE_SEED_THREADS) {
+        cnt[e] = 0;
+    }
+    for (int j = t; j < n_seed; j += MOE_SEED_THREADS) {
+        sel[j] = -1;
+    }
+    if (t == 0) {
+        s_miss  = 0;
+        s_found = 0;
+        s_new   = 0;
+    }
+    __syncthreads();
+    if (n_seed == 0 || n_victim == 0) {
+        if (t == 0) {
+            out[0] = 0;
+        }
+        return;
+    }
+    for (int i = t; i < n_ids; i += MOE_SEED_THREADS) {
+        atomicAdd(&cnt[moe_cache_id(ids, i, n_expert)], 1);
+    }
+
+    uint32_t epoch = (uint32_t) state[1] + 1;
+    __syncthreads();
+    if (epoch == 0) {
+        for (int s = t; s < n_slots; s += MOE_SEED_THREADS) {
+            pin[s] = 0;
+        }
+        epoch = 1;
+    }
+    const int32_t w = sc != nullptr ? (state[7] > 0 ? state[7] : MOE_CACHE_W_INIT) : 0;
+    __syncthreads();
+
+    // rank of each used expert
+    for (int e = t; e < n_expert; e += MOE_SEED_THREADS) {
+        const int32_t c = cnt[e];
+        if (c == 0) {
+            continue;
+        }
+        int rank = 0;
+        for (int k = 0; k < n_expert && rank < n_seed; ++k) {
+            const int32_t ck = cnt[k];
+            rank += ck > c || (ck == c && k < e);
+        }
+        if (rank < n_seed) {
+            sel[rank] = e;
+        }
+    }
+    __syncthreads();
+
+    // hits: keep them (reference bit, pin); the missing ones in rank order (sel is filled from rank 0, -1 after the used experts)
+    for (int j0 = 0; j0 < n_seed; j0 += MOE_SEED_THREADS) {
+        const int j = j0 + t;
+        const int32_t e = j < n_seed ? sel[j] : -1;
+        const int32_t s = e >= 0 ? row[e] : -1;
+        if (s >= 0) {
+            ref[s] = 1;
+            pin[s] = (int32_t) epoch;
+            if (sc != nullptr) {
+                sc[e] = min(sc[e] + w, MOE_CACHE_SCORE_MAX);
+            }
+        }
+        const bool m    = e >= 0 && s < 0;
+        const int  incl = moe_seed_scan(scan, m ? 1 : 0);
+        const int  base = s_miss;
+        if (m) {
+            miss[base + incl - 1] = e;
+        }
+        const int total = scan[MOE_SEED_THREADS - 1];
+        __syncthreads();
+        if (t == 0) {
+            s_miss = base + total;
+        }
+        __syncthreads();
+    }
+    const int n_miss = s_miss;
+
+    // victims, in hand order by class: 0 empty, 1 reference bit 0, 2 reference bit 1
+    const int h = state[0] >= 0 && state[0] < n_victim ? state[0] : 0;
+    for (int cls = 0; cls < 3 && s_found < n_miss; ++cls) {
+        for (int off0 = 0; off0 < n_victim && s_found < n_miss; off0 += MOE_SEED_THREADS) {
+            const int off = off0 + t;
+            bool elig = false;
+            int  s    = 0;
+            if (off < n_victim) {
+                s = h + off < n_victim ? h + off : h + off - n_victim;
+                const int32_t  key = key_of[s];
+                const uint32_t p   = (uint32_t) pin[s];
+                const bool pinned  = p != 0 && epoch - p <= (uint32_t) pos;
+                const int  c       = key < 0 ? 0 : (ref[s] == 0 ? 1 : 2);
+                elig = !pinned && c == cls && (key < 0 || key/n_expert <= il);
+            }
+            const int incl  = moe_seed_scan(scan, elig ? 1 : 0);
+            const int base  = s_found;
+            const int total = scan[MOE_SEED_THREADS - 1];
+            if (elig && base + incl - 1 < n_miss) {
+                vic[base + incl - 1] = s;
+            }
+            __syncthreads();
+            if (t == 0) {
+                s_found = min(base + total, n_miss);
+            }
+            __syncthreads();
+        }
+    }
+    const int n_take = s_found;
+
+    // evict and insert
+    for (int j = t; j < n_take; j += MOE_SEED_THREADS) {
+        const int32_t s   = vic[j];
+        const int32_t e   = miss[j];
+        const int32_t old = key_of[s];
+        if (old >= 0) {
+            map[old] = -1;
+        } else {
+            atomicAdd(&s_new, 1);
+        }
+        key_of[s] = il*n_expert + e;
+        ref[s]    = 1;
+        pin[s]    = (int32_t) epoch;
+        row[e]    = s;
+        if (sc != nullptr) {
+            sc[e] = min(sc[e] + w, MOE_CACHE_SCORE_MAX);
+        }
+        fill_e[j] = e;
+        fill_s[j] = s;
+    }
+    __syncthreads();
+    if (t == 0) {
+        state[1]  = (int32_t) epoch;
+        state[6] += s_new;
+        out[0]    = n_take;
+    }
+}
+
+// the experts admitted by a seed plan, from the experts of the matrix product (src) to the bank, block x: the x-th admitted expert
+static __global__ void moe_cache_seed_fill(const int32_t * __restrict__ plan, const int n_seed_max, const char * __restrict__ src,
+        char * __restrict__ dst, const int64_t nb, const int64_t chunk) {
+    const int j = blockIdx.x;
+    if (j >= plan[0]) {
+        return;
+    }
+    const char * s = src + (int64_t) plan[1 + j]*nb;
+    char       * d = dst + (int64_t) plan[1 + n_seed_max + j]*nb;
+    for (int64_t beg = blockIdx.z*chunk; beg < nb; beg += gridDim.z*chunk) {
+        const int64_t end = min(beg + chunk, nb);
+        if ((((uintptr_t) (s + beg)) | ((uintptr_t) (d + beg)) | (uintptr_t) (end - beg)) % 16 == 0) {
+            const int4 * s4 = (const int4 *) (s + beg);
+            int4       * d4 = (int4 *) (d + beg);
+            const int64_t n = (end - beg)/16;
+            for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+                d4[i] = s4[i];
+            }
+        } else {
+            for (int64_t i = beg + threadIdx.x; i < end; i += blockDim.x) {
+                d[i] = s[i];
+            }
+        }
+    }
+}
+
 bool ggml_cuda_moe_cache_lookup_supported(const ggml_tensor * op) {
     const int mode    = ggml_get_op_params_i32(op, 10);
     const int n_banks = ggml_get_op_params_i32(op, 1);
+    if (mode == 4) {
+        const int n_expert   = (int) op->src[1]->ne[0];
+        const int n_seed_max = ggml_get_op_params_i32(op, 2);
+        return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 && op->src[2]->type == GGML_TYPE_I32 &&
+            (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_I32) &&
+            (size_t) (n_expert + 3*n_seed_max + MOE_SEED_THREADS)*sizeof(int32_t) <= 48*1024;
+    }
+    if (mode == 5) {
+        return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->op == GGML_OP_MUL_MAT_ID;
+    }
     if (mode == 1) {
         return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 && op->src[2]->type == GGML_TYPE_I32 &&
             op->src[3]->type == GGML_TYPE_I32 && ggml_nelements(op->src[0]) <= 4096 &&
@@ -487,6 +705,53 @@ static void moe_cache_fetch_launch(cudaStream_t stream, const ggml_tensor * dst,
 
 void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int mode = ggml_get_op_params_i32(dst, 10);
+
+    if (mode == 4) {
+        // device seed plan, see ggml_moe_cache_seed_plan
+        const ggml_tensor * ids    = dst->src[0];
+        ggml_tensor       * map    = dst->src[1];
+        ggml_tensor       * state  = dst->src[2];
+        ggml_tensor       * scores = dst->src[3];
+        const int il         = ggml_get_op_params_i32(dst, 0);
+        const int n_seed_max = ggml_get_op_params_i32(dst, 2);
+        const int pos        = ggml_get_op_params_i32(dst, 3);
+        const int n_expert   = (int) map->ne[0];
+        const int n_slots    = (int) ((ggml_nelements(state) - MOE_CACHE_HDR)/3);
+        const int n_ids      = (int) ggml_nelements(ids);
+        const int n_seed     = n_ids > 0 ? std::min(ggml_get_op_params_i32(dst, 4), std::min(n_seed_max, n_expert)) : 0;
+        const int n_victim   = std::min(ggml_get_op_params_i32(dst, 5), n_slots);
+        GGML_ASSERT(ggml_is_contiguous(ids) && ggml_is_contiguous(dst) && ggml_nelements(dst) == 1 + 2*(int64_t) n_seed_max);
+        const size_t smem = (size_t) (n_expert + 3*std::max(n_seed, 1) + MOE_SEED_THREADS)*sizeof(int32_t);
+        moe_cache_seed_plan<<<1, MOE_SEED_THREADS, smem, ctx.stream()>>>(
+            (const int32_t *) ids->data, n_ids, (int32_t *) map->data, (int32_t *) state->data,
+            scores != nullptr ? (int32_t *) scores->data : nullptr, (int32_t *) dst->data, n_expert, il, n_slots,
+            n_victim, n_seed, n_seed_max, pos);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    if (mode == 5) {
+        // device seed fill: from the experts mm read (src[0] of mm when it ran, the device copy of host experts) to the bank
+        const ggml_tensor * plan = dst->src[0];
+        const ggml_tensor * mm   = dst->src[1];
+        const ggml_tensor * w    = mm->src[0];
+        ggml_tensor       * bank = dst->src[2];
+        const int n_seed_max = (int) ((ggml_nelements(plan) - 1)/2);
+        GGML_ASSERT(w->data != nullptr && w->nb[2] == bank->nb[2] && w->type == bank->type);
+        // the experts must be in memory of this device: the plan was made for a layer whose copies are on it
+        {
+            cudaPointerAttributes attr = {};
+            CUDA_CHECK(cudaPointerGetAttributes(&attr, w->data));
+            GGML_ASSERT(attr.type == cudaMemoryTypeDevice && attr.device == ctx.device);
+        }
+        const int64_t nb    = bank->nb[2];
+        const int64_t chunk = 64*1024;
+        const dim3 grid(n_seed_max, 1, (unsigned) std::max<int64_t>((nb + chunk - 1)/chunk, 1));
+        moe_cache_seed_fill<<<grid, 256, 0, ctx.stream()>>>((const int32_t *) plan->data, n_seed_max, (const char *) w->data,
+            (char *) bank->data, nb, chunk);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
 
     if (mode == 2) {
         // fetch the experts admitted by the assign of src[0], the result is its slots

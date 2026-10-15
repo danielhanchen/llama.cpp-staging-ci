@@ -657,6 +657,19 @@ llama_context::llama_context(
             // the default hybrid path takes its fetch share from the decode threads, so it does not depend on timing
             moe_cache->hybrid_set_threads((int32_t) cparams.n_threads, model.hparams.no_alloc);
         }
+        // LLAMA_MOE_CACHE_DEVSEED (default 1, 0 = off): with the default seeding (=2) a prefetched ubatch seeds the cache on the device from
+        // its own routing (see llama_moe_cache::devseed_plan): its expert uploads never wait for the host to read the routing, and it needs
+        // no stored routing of an earlier ubatch nor a larger seed graph; groups without device lookups keep the host seed
+        if (moe_cache && llama_moe_cache::seed_mode() == 2 && prefetch_min_batch != INT64_MAX) {
+            const char * env = getenv("LLAMA_MOE_CACHE_DEVSEED");
+            if ((env == nullptr || atoi(env) != 0) && moe_cache->devseed_init(prefetch_min_batch)) {
+                moe_cache_devseed_on = true;
+                moe_cache_seed_sync  = false;
+                moe_cache_seed_auto  = false;
+                LLAMA_LOG_INFO("%s: MoE cache: prompt ubatches of %" PRId64 "+ tokens seed the cache on the device (LLAMA_MOE_CACHE_DEVSEED=0 to disable)\n",
+                    __func__, prefetch_min_batch);
+            }
+        }
         if (moe_cache && moe_cache_seed_auto) {
             moe_cache->prompts_do_not_seed();
         }
@@ -1892,7 +1905,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the copies of the experts are planned with the seed mode of the MoE cache (see sched_copy_all_experts)
     const int moe_cache_hybrid = moe_cache ? moe_cache->hybrid_mode() : 0;
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams) && moe_cache_seed_graph == moe_cache_seed &&
-            moe_cache_hybrid_graph == moe_cache_hybrid) {
+            moe_cache_hybrid_graph == moe_cache_hybrid && moe_cache_devseed_graph == moe_cache_devseed) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1942,6 +1955,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active     = res;
         moe_cache_seed_graph   = moe_cache_seed;
         moe_cache_hybrid_graph = moe_cache_hybrid;
+        // the seed plans are enabled in the op params of the graph, a reused graph keeps them (and may be replayed as captured)
+        moe_cache_devseed_graph = moe_cache_devseed;
     }
 
     // set the input data for the input tensors
@@ -1963,9 +1978,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     if (moe_cache) {
         moe_cache->prepare(ubatch.n_tokens);
+        if (moe_cache_devseed_on) {
+            moe_cache->devseed_prepare(res->get_gf(), moe_cache_devseed);
+        }
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (moe_cache && moe_cache_devseed_on && moe_cache_devseed && status == GGML_STATUS_SUCCESS) {
+        moe_cache->devseed_end(res->get_gf());
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -3620,9 +3641,12 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
     moe_cache_record    = large && prefetch_min_batch != INT64_MAX && moe_cache_seed_sync;
     moe_cache_seed      = false;
     moe_cache_seed_prev = false;
+    moe_cache_devseed   = false;
     if (last_large) {
         if (!prefetch) {
             moe_cache_seed = true;
+        } else if (moe_cache_devseed_on) {
+            moe_cache_devseed = true;
         } else if (moe_cache_seed_sync) {
             if (n_outputs_ub == 0 && moe_cache->has_seed_counts()) {
                 moe_cache_seed_prev = true;
@@ -3642,7 +3666,8 @@ void llama_context::moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_ou
         moe_cache->seed_verify();
     }
 
-    moe_cache_seeded    = moe_cache_seed || moe_cache_seed_prev;
+    moe_cache_seeded    = moe_cache_seed || moe_cache_seed_prev || moe_cache_devseed;
+    moe_cache_devseed   = false;
     const bool recorded = moe_cache_record;
     moe_cache_seed      = false;
     moe_cache_seed_prev = false;
@@ -4993,6 +5018,9 @@ void llama_context::opt_epoch_iter(
             // like process_ubatch: the device lookups of small ubatches need the slot map state on the device
             if (moe_cache) {
                 moe_cache->prepare(ubatch.n_tokens);
+                if (moe_cache_devseed_on) {
+                    moe_cache->devseed_prepare(gf, false);
+                }
             }
             copy_experts.reset();
             ggml_opt_eval(opt_ctx, result);

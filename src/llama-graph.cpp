@@ -1701,6 +1701,22 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         ggml_mul_mat_id(ctx0, w, cur, ids) :
         ggml_mul_mat_id(ctx0, slots_host ? w : moe_cache->get_experts(w), cur, slots);
 
+    // device seed: the slots planned for the layer are filled from the experts this product reads (the device copy of the host experts),
+    // in the split of the product, before that copy is reused
+    if (slots == nullptr && !moe_seed_plans.empty()) {
+        int32_t il_w = -1;
+        if (ggml_tensor * bank = moe_cache->devseed_bank(w, il_w)) {
+            const auto it = moe_seed_plans.find(il_w);
+            if (it != moe_seed_plans.end()) {
+                ggml_build_forward_expand(gf, res);
+                ggml_tensor * fill = ggml_moe_cache_seed_fill(ctx0, it->second, res, bank);
+                ggml_backend_sched_set_tensor_backend(sched, fill, moe_cache->backend(il_w));
+                cb(fill, "ffn_moe_seed_fill", il_w);
+                ggml_build_forward_expand(gf, fill);
+            }
+        }
+    }
+
     if (prec_policy) {
         prec_policy->apply(res);
     }
@@ -2697,6 +2713,15 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
         selected_experts = ggml_cont(ctx0, selected_experts);
         ggml_set_output(selected_experts);
         cb(selected_experts, "ffn_moe_topk_out", il);
+
+        // prefetched large batches: the seed of the cache is planned on the device from the routing, the expert products fill it (see build_lora_mm_id)
+        if (ggml_tensor * plan = moe_cache->devseed_plan(ctx0, il, selected_experts, n_tokens)) {
+            ggml_backend_sched_set_tensor_backend(sched, plan, moe_cache->backend(il));
+            ggml_set_output(plan); // read after the graph (statistics)
+            cb(plan, "ffn_moe_seed_plan", il);
+            ggml_build_forward_expand(gf, plan);
+            moe_seed_plans[il] = plan;
+        }
     }
 
     ggml_tensor * slot_map = moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0], n_tokens);

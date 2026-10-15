@@ -99,6 +99,18 @@ public:
     // in slots taken from the cache while they are used (never for small batches, which may use every slot)
     void lend(ggml_backend_t backend, ggml_backend_sched_lend_copy * copies, int n_copies, int depth, bool dry, int64_t n_tokens);
 
+    // device seed (LLAMA_MOE_CACHE_DEVSEED, see ggml_moe_cache_seed_plan): a prefetched large ubatch seeds the cache on the device from its
+    // own routing, without reading it on the host; devseed_init: whether any group can (device lookups and a backend that runs the plan)
+    // min_tokens: the graphs of ubatches of at least that many tokens get the seed plans (the prefetch threshold), INT64_MAX: none
+    bool devseed_init(int64_t min_tokens);
+    // the seed plan of layer il for the routing ids of a large batch of n_tokens, nullptr if its group is not seeded on the device
+    ggml_tensor * devseed_plan(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_tokens) const;
+    // the bank that the device seed fills for the cached expert tensor w and its layer, nullptr if none
+    ggml_tensor * devseed_bank(const ggml_tensor * w, int32_t & il) const;
+    // the graph gf (allocated) is about to run: enable or disable its seed plans; after it ran: the seeded groups come back to the host
+    void devseed_prepare(ggml_cgraph * gf, bool enable);
+    void devseed_end(ggml_cgraph * gf);
+
     // LLAMA_MOE_CACHE_SEED: 0 off, 1 only ubatches whose copies read their ids, 2 (default) also prefetched ubatches
     static int seed_mode();
 

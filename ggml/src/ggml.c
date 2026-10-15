@@ -3569,6 +3569,90 @@ struct ggml_tensor * ggml_moe_cache_join(
     return result;
 }
 
+// seed plan op params: il, 0, n_seed_max, pos, n_seed, n_victim, mode (4) at 10
+struct ggml_tensor * ggml_moe_cache_seed_plan(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * map,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * scores,
+        int                   n_seed_max,
+        int                   il,
+        int                   pos) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && map->type == GGML_TYPE_I32 && state->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(ids) && ggml_is_contiguous(map) && ggml_is_contiguous(state));
+    GGML_ASSERT(il >= 0 && il < map->ne[1] && n_seed_max > 0 && pos >= 0);
+    GGML_ASSERT(scores == NULL || (scores->type == GGML_TYPE_I32 && ggml_is_contiguous(scores) && ggml_nelements(scores) == ggml_nelements(map)));
+    const int64_t n_slots = (ggml_nelements(state) - 8)/3;
+    GGML_ASSERT(n_slots > 0 && ggml_nelements(state) == 8 + 3*n_slots);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1 + 2*(int64_t) n_seed_max);
+
+    int32_t params[11] = { il, 0, n_seed_max, pos, 0, 0, 0, 0, 0, 0, 4 };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_CACHE_LOOKUP;
+    result->src[0] = ids;
+    result->src[1] = map;
+    result->src[2] = state;
+    result->src[3] = scores;
+
+    return result;
+}
+
+void ggml_moe_cache_seed_set(
+        struct ggml_tensor  * plan,
+        int                   n_seed,
+        int                   n_victim) {
+    GGML_ASSERT(plan->op == GGML_OP_MOE_CACHE_LOOKUP && ggml_get_op_params_i32(plan, 10) == 4);
+    GGML_ASSERT(n_seed >= 0 && n_seed <= ggml_get_op_params_i32(plan, 2));
+    const int64_t n_slots = (ggml_nelements(plan->src[2]) - 8)/3;
+    GGML_ASSERT(n_victim >= 0 && n_victim <= n_slots);
+    ggml_set_op_params_i32(plan, 4, n_seed);
+    ggml_set_op_params_i32(plan, 5, n_victim);
+}
+
+bool ggml_moe_cache_seed_info(
+        const struct ggml_tensor * t,
+        int                      * il,
+        int                      * pos,
+        int                      * n_seed_max,
+        int                      * n_seed) {
+    if (t->op != GGML_OP_MOE_CACHE_LOOKUP || ggml_get_op_params_i32(t, 10) != 4) {
+        return false;
+    }
+    *il         = ggml_get_op_params_i32(t, 0);
+    *pos        = ggml_get_op_params_i32(t, 3);
+    *n_seed_max = ggml_get_op_params_i32(t, 2);
+    *n_seed     = ggml_get_op_params_i32(t, 4);
+    return true;
+}
+
+struct ggml_tensor * ggml_moe_cache_seed_fill(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * plan,
+        struct ggml_tensor  * mm,
+        struct ggml_tensor  * bank) {
+    GGML_ASSERT(plan->op == GGML_OP_MOE_CACHE_LOOKUP && ggml_get_op_params_i32(plan, 10) == 4);
+    GGML_ASSERT(mm->op == GGML_OP_MUL_MAT_ID);
+    const struct ggml_tensor * w = mm->src[0];
+    GGML_ASSERT(ggml_is_contiguous(bank) && bank->ne[3] == 1 && bank->type == w->type);
+    GGML_ASSERT(bank->ne[0] == w->ne[0] && bank->ne[1] == w->ne[1] && bank->nb[2] == w->nb[2]);
+
+    // in place: the fill writes the banks, the view orders it after mm
+    struct ggml_tensor * result = ggml_view_tensor(ctx, bank);
+
+    int32_t params[11] = { ggml_get_op_params_i32(plan, 0), 0, 0, 0, 0, 0, 0, 0, 0, 0, 5 };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_CACHE_LOOKUP;
+    result->src[0] = plan;
+    result->src[1] = mm;
+    result->src[2] = bank;
+
+    return result;
+}
+
 void ggml_moe_cache_set_scores(
         struct ggml_tensor  * op,
         struct ggml_tensor  * scores,

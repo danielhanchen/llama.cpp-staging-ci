@@ -478,6 +478,9 @@ private:
     bool moe_cache_seed_enabled = true; // LLAMA_MOE_CACHE_SEED != 0
     bool moe_cache_seed_sync    = true;  // LLAMA_MOE_CACHE_SEED=2 (default): a prefetched ubatch seeds (earlier routing, else its own ids read first)
     bool moe_cache_seed_auto    = false; // LLAMA_MOE_CACHE_SEED unset, n_ubatch >= LLAMA_MOE_CACHE_SEED_AUTO: as LLAMA_MOE_CACHE_SEED=1
+    bool moe_cache_devseed_on   = false; // LLAMA_MOE_CACHE_DEVSEED: prefetched ubatches seed the cache on the device (see llama_moe_cache::devseed_plan)
+    bool moe_cache_devseed      = false; // the ubatch being computed seeds on the device
+    bool moe_cache_devseed_graph = false; // the graph last built had its seed plans enabled
     bool moe_cache_seed_fits    = true;  // the graph of a prefetched ubatch that seeds from its own ids was reserved (see sched_reserve_seed)
 
     // device memory kept free for a model or context created after this one, per backend (llama_context_params::mem_reserve); only

@@ -1064,6 +1064,8 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    // device seed plans of the layers of this graph (see llama_moe_cache::devseed_plan), filled by the expert products that follow them
+    mutable std::map<int32_t, ggml_tensor *> moe_seed_plans;
 
     const llama_prec_policy * prec_policy;
 

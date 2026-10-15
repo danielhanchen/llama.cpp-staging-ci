@@ -1560,6 +1560,43 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
+    // device-side seed of the cache from the routing of a large batch, with no read of the routing by the host
+    // ids: I32 [n_expert_used, n_tokens] the experts selected in layer il; map, state: as ggml_moe_cache_lookup; scores: optional (decayed counts)
+    // admits the n_seed most used experts of layer il (ties by expert id) that are not cached, into slots below n_victim that hold no expert or an
+    // expert of a layer <= il (the copies of the later layers of the same graph read the others), never into the slots admitted by the seeds of the
+    // pos earlier layers of the graph; n_seed and n_victim are set with ggml_moe_cache_seed_set before each computation (default 0: nothing)
+    // result: I32 [1 + 2*n_seed_max] the number of admitted experts, then their experts [n_seed_max] and their slots [n_seed_max]
+    GGML_API struct ggml_tensor * ggml_moe_cache_seed_plan(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * map,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * scores,
+            int                   n_seed_max,
+            int                   il,
+            int                   pos);
+
+    GGML_API void ggml_moe_cache_seed_set(
+            struct ggml_tensor  * plan,
+            int                   n_seed,
+            int                   n_victim);
+
+    // t is a seed plan: its layer, position, most experts and the current number of experts it admits
+    GGML_API bool ggml_moe_cache_seed_info(
+            const struct ggml_tensor * t,
+            int                      * il,
+            int                      * pos,
+            int                      * n_seed_max,
+            int                      * n_seed);
+
+    // copies the experts admitted by plan into bank from the experts read by the expert matrix product mm (its src[0] when it runs,
+    // e.g. the device copy of host experts), so it must run after mm and before the memory of that copy is reused; result: a view of bank
+    GGML_API struct ggml_tensor * ggml_moe_cache_seed_fill(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * plan,
+            struct ggml_tensor  * mm,
+            struct ggml_tensor  * bank);
+
     // decayed-count eviction for a ggml_moe_cache_lookup or ggml_moe_cache_assign (op) instead of the CLOCK
     // scores: I32 [n_expert, n_layer], decayed use counter of each expert of each layer (updated in place), also kept for the
     // experts that are not cached, as growing weights: each distinct selected expert adds the weight w (state[7]); a lookup with
