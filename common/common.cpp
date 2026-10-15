@@ -1314,8 +1314,7 @@ static bool common_moe_slot_bytes_of(const std::string & path, common_moe_slot_b
 // cache does not hold every expert. LLAMA_MOE_CACHE_LEND=2: the compute buffers are lent from the cache, it gives up only the KV growth.
 // LLAMA_MOE_PREFILL_UB=0 disables (n_ubatch stays the default), =N forces N.
 static void common_moe_cache_auto_ubatch(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
-    if (params.moe_cache_size == 0 || params.n_ubatch_set || params.embedding || cparams.embeddings || params.speculative.has_dft() ||
-        std::any_of(params.speculative.types.begin(), params.speculative.types.end(), [](auto t) { return t != COMMON_SPECULATIVE_TYPE_NONE; })) {
+    if (params.moe_cache_size == 0 || params.n_ubatch_set || params.embedding || cparams.embeddings) {
         return;
     }
     const char * env = getenv("LLAMA_MOE_PREFILL_UB");
@@ -1360,13 +1359,56 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     // device memory of a context at ubatch u, summed over the devices: {compute buffers, compute buffers + KV}; < 0 if the measure failed
     // the measure counts the compute buffers of the loaded context (LLAMA_MOE_MEASURE_LENT while it runs, see sched_reserve): without the
     // staging copies, which the cache lends (and which do not change with n_ubatch), with the seed graph of the MoE cache
-    struct mem { int64_t compute; int64_t total; int n_dev = 0; };
+    struct mem { int64_t compute; int64_t total; int n_dev = 0; int64_t dft = 0; }; // dft: the draft context (in total)
     // (not with LLAMA_MOE_CACHE_LEND=2, whose rule counts the staging copies lent together with the graph allocation)
     const bool lend2_env    = getenv("LLAMA_MOE_CACHE_LEND") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_LEND")) == 2;
     const bool had_lent_env = getenv("LLAMA_MOE_MEASURE_LENT") != nullptr || lend2_env;
     if (!had_lent_env) {
         common_set_env("LLAMA_MOE_MEASURE_LENT", "1");
     }
+    // speculative decoding: the draft context (an MTP context on the weights of the main model, or a draft model) is created from the
+    // same params, so it runs at the same n_ubatch: its compute buffers and KV cache are counted too, as for --fit (a failed measure of it
+    // keeps the default n_ubatch)
+    const bool has_draft = params.speculative.has_dft();
+    const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const bool has_spec  = has_draft || std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+        [](auto t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
+    common_params        params_dft;
+    llama_model_params   mparams_dft  = mparams;
+    llama_context_params cparams_dft  = cparams;
+    if (has_draft || spec_mtp) {
+        params_dft  = common_base_params_to_speculative(params);
+        mparams_dft = has_draft ? common_model_params_to_llama(params_dft) : mparams;
+        cparams_dft = common_context_params_to_llama(params_dft);
+        if (spec_mtp) {
+            cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        }
+        cparams_dft.n_rs_seq = 0;
+    }
+    const auto measure_dft = [&](uint32_t u, int64_t & ctx_compute) -> bool {
+        ctx_compute = 0;
+        if (!(has_draft || spec_mtp)) {
+            return true;
+        }
+        llama_context_params cp = cparams_dft;
+        cp.n_ctx    = cparams.n_ctx;
+        cp.n_ubatch = u;
+        cp.n_batch  = std::max(cp.n_batch, u);
+        std::vector<ggml_backend_dev_t> devs;
+        uint32_t hp_ngl = 0, hp_nct = 0, hp_nex = 0;
+        try {
+            const common_device_memory_data_vec dmd = common_get_device_memory_data(has_draft ? params_dft.model.path.c_str() : params.model.path.c_str(),
+                &mparams_dft, &cp, devs, hp_ngl, hp_nct, hp_nex, params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            for (size_t i = 0; i + 1 < dmd.size(); ++i) {
+                ctx_compute += (int64_t) (dmd[i].context + dmd[i].compute);
+            }
+            return true;
+        } catch (const std::exception & e) {
+            COM_WRN("memory measure of the draft context at n_ubatch = %u failed: %s\n", u, e.what());
+            return false;
+        }
+    };
     const auto measure = [&](uint32_t u) -> mem {
         llama_context_params cp = cparams;
         cp.n_ubatch = u;
@@ -1384,6 +1426,13 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
                 m.compute += (int64_t) dmd[i].compute;
                 m.total   += (int64_t) (dmd[i].context + dmd[i].compute);
             }
+            // the draft context: counted in the total (the growth taken from the cache), not in the compute of the main context
+            int64_t dft = 0;
+            if (!measure_dft(u, dft)) {
+                return { -1, -1, 0 };
+            }
+            m.total += dft;
+            m.dft    = dft;
             return m;
         } catch (const std::exception & e) {
             COM_WRN("memory measure at n_ubatch = %u failed: %s\n", u, e.what());
@@ -1412,7 +1461,7 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             (m_ref.total - m_def.total)/1048576.0, cache/1048576.0);
         return;
     }
-    const auto kv = [](const mem & m) { return m.total - m.compute; };
+    const auto kv = [](const mem & m) { return m.total - m.compute - m.dft; };
 
     // LLAMA_MOE_CACHE_LEND=2: the graph allocation of a prompt ubatch is lent from the tail of one bank of the cache and given back for
     // decode, so the cache gives up only the KV growth; a ubatch is taken if its compute buffers fit in one bank tail (every slot but one
@@ -1427,7 +1476,7 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         lend_frac = std::max(0.0, atof(env_lf));
     }
     const auto lend_fits = [&](const mem & m) {
-        const int64_t c       = cache - std::max<int64_t>(0, kv(m) - kv(m_def)); // the cache without the KV growth
+        const int64_t c       = cache - std::max<int64_t>(0, kv(m) - kv(m_def) + (m.dft - m_def.dft)); // the cache without the KV (and draft context) growth
         const int64_t n_slots = c / sb.sum;
         const int64_t n_keep  = std::min<int64_t>(n_slots / 2, sb.n_expert + 1);
         const int64_t tail    = (n_slots - n_keep) * sb.max;
@@ -1463,7 +1512,7 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         pick   = cands[i];
         m_pick = m;
     }
-    const int64_t taken     = std::max<int64_t>(0, lend_graph ? kv(m_pick) - kv(m_def) : m_pick.total - m_def.total);
+    const int64_t taken     = std::max<int64_t>(0, lend_graph ? kv(m_pick) - kv(m_def) + (m_pick.dft - m_def.dft) : m_pick.total - m_def.total);
     const size_t  cache_new = (size_t) (cache - taken);
     if (lend_graph) {
         COM_INF("MoE cache: LLAMA_MOE_CACHE_LEND=2: n_ubatch %u, compute buffers %.2f MiB lent from one bank tail (slot %.2f MiB, largest tensor %.2f MiB, "
@@ -1477,6 +1526,11 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         pick, ub_def, rule, taken/1048576.0, cache/1048576.0, cache_new/1048576.0,
         ub_def, cands[0], pick, m_def.compute/1048576.0, m_ref.compute/1048576.0, m_pick.compute/1048576.0,
         kv(m_def)/1048576.0, kv(m_ref)/1048576.0, kv(m_pick)/1048576.0, have_sb ? sb.total/1048576.0 : -1.0, (ggml_time_us() - t0)/1000.0);
+
+    if (has_spec) {
+        COM_INF("MoE cache: speculative decoding: the draft context at n_ubatch %u / %u takes %.2f / %.2f MiB (counted above)\n",
+            ub_def, pick, m_def.dft/1048576.0, m_pick.dft/1048576.0);
+    }
 
     params.n_ubatch       = (int32_t) pick;
     cparams.n_ubatch      = pick;
