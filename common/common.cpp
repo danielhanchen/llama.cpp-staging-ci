@@ -1520,13 +1520,17 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     // GGML_SCHED_PREFETCH_MIN_BATCH tokens stages every expert of every cached layer (the copies run ahead of the routing), so each ubatch
     // uploads all the experts the cache misses: a prompt of P tokens uploads them ceil(P/n_ubatch) times. A larger n_ubatch uploads them once
     // per n_ubatch tokens (an 8k prompt at 8192 instead of 4 times at 2048), so n_ubatch grows up to LLAMA_MOE_PREFILL_UB_MAX while the memory
-    // it takes from the cache is at most LLAMA_MOE_PREFILL_UB_SPILL_FRAC (0.15) of the cache and the KV cache does not grow (decode reads the
-    // cache: a small share costs it little). A n_ubatch >= LLAMA_MOE_CACHE_SEED_AUTO (4096) also skips the own-ids seed of each prompt (see
-    // llama_context). LLAMA_MOE_PREFILL_UB_SPILL=0 disables (the rule before: n_ubatch grows only while every expert stays cached)
+    // it takes from the cache is at most LLAMA_MOE_PREFILL_UB_SPILL_FRAC (0.15) of the cache and the KV cache does not grow (decode then reads a
+    // smaller cache). A n_ubatch >= LLAMA_MOE_CACHE_SEED_AUTO (4096) also skips the own-ids seed of each prompt (see llama_context).
+    // OPT-IN, LLAMA_MOE_PREFILL_UB_SPILL=1 (G4 RTX PRO 6000, 3 reps + A/A): Qwen3.8-Flash-Next UD-IQ4_XS at 32 GB 8k prompt +78% over pinned
+    // experts alone (2610 -> 4641 tok/s), decode -2%; but Qwen3.6-35B-A3B UD-Q4_K_XL at 12 / 16 GB decode -5..-7% after a 2k prompt (the
+    // smaller cache and the skipped seed), so it is not the default. Unset or 0: the rule before (n_ubatch grows only while every expert
+    // stays cached)
     bool rule_spill = !rule_frac && !lend_graph && force <= 0 && have_sb && cache_ref < all_experts;
     double spill_frac = 0.15;
-    if (const char * env_sp = getenv("LLAMA_MOE_PREFILL_UB_SPILL")) {
-        rule_spill = rule_spill && atoi(env_sp) != 0;
+    {
+        const char * env_sp = getenv("LLAMA_MOE_PREFILL_UB_SPILL");
+        rule_spill = rule_spill && env_sp != nullptr && atoi(env_sp) != 0;
     }
     if (const char * env_sf = getenv("LLAMA_MOE_PREFILL_UB_SPILL_FRAC")) {
         spill_frac = std::max(0.0, atof(env_sf));
