@@ -380,6 +380,9 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp LINK ggml)
+
+    # Needs non-public ggml-backend-impl.h: host weight prefetch with a lender on a mock device with a capacity
+    llama_build_and_test(test-sched-lend.cpp LINK ggml)
 endif()
 
 llama_build(test-export-graph-ops.cpp)
