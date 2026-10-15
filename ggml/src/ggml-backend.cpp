@@ -3564,10 +3564,16 @@ static void ggml_backend_sched_prefetch_copy(ggml_backend_sched_t sched, int b, 
     pf->pending = true;
 }
 
+// splits issued ahead of the computed ones: the depth of the binding (its staging slots), or a smaller depth the adaptive depth went
+// back to since the binding (a step that did not pay ends at once, not at the next binding: llama reuses the graph of a prompt's ubatches)
+static int ggml_backend_sched_prefetch_ahead(ggml_backend_sched_t sched, const struct ggml_backend_sched_prefetch * pf) {
+    return std::max(std::min(pf->depth, sched->pf_depth) - 1, 1);
+}
+
 static void ggml_backend_sched_prefetch_issue(ggml_backend_sched_t sched) {
     for (int b = 0; b < sched->n_backends; b++) {
         struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
-        const int ahead = std::max(pf->depth - 1, 1);
+        const int ahead = ggml_backend_sched_prefetch_ahead(sched, pf);
         while (pf->issued < pf->n_bound && pf->issued < pf->consumed + ahead) {
             struct ggml_backend_sched_split * split = &sched->splits[pf->split_ids[pf->issued]];
             if (split->pf_async) {
@@ -3614,7 +3620,7 @@ static void ggml_backend_sched_prefetch_arm(ggml_backend_sched_t sched) {
         if (pf->n_bound == 0 || pf->copy_backend == NULL || pf->consumed != pf->n_bound) {
             continue;
         }
-        const int ahead = std::min(std::max(pf->depth - 1, 1), pf->n_bound);
+        const int ahead = std::min(ggml_backend_sched_prefetch_ahead(sched, pf), pf->n_bound);
         ggml_backend_event_t wait = pf->retire[(pf->n_bound - 1) % pf->depth];
         for (int k = 0; k < ahead; k++) {
             struct ggml_backend_sched_split * split = &sched->splits[pf->split_ids[k]];
