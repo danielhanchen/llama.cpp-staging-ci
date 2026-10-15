@@ -1516,7 +1516,23 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     // the cache holds every expert: all the expert tensors of the model, a slot per layer of slack (the extra slot of each bank, the
     // device lookup state) and 2%
     const int64_t all_experts = have_sb ? (int64_t) (1.02*(double) sb.total) + sb.n_layer*sb.sum : INT64_MAX;
-    const char * rule = force > 0 ? "forced" : lend_graph ? "LLAMA_MOE_CACHE_LEND=2" : rule_frac ? "LLAMA_MOE_PREFILL_UB_AUTO=1" : "every expert cached, no KV growth";
+    // spilled experts: the cache cannot hold every expert of the model even at the reference n_ubatch. A prompt ubatch of at least
+    // GGML_SCHED_PREFETCH_MIN_BATCH tokens stages every expert of every cached layer (the copies run ahead of the routing), so each ubatch
+    // uploads all the experts the cache misses: a prompt of P tokens uploads them ceil(P/n_ubatch) times. A larger n_ubatch uploads them once
+    // per n_ubatch tokens (an 8k prompt at 8192 instead of 4 times at 2048), so n_ubatch grows up to LLAMA_MOE_PREFILL_UB_MAX while the memory
+    // it takes from the cache is at most LLAMA_MOE_PREFILL_UB_SPILL_FRAC (0.15) of the cache and the KV cache does not grow (decode reads the
+    // cache: a small share costs it little). A n_ubatch >= LLAMA_MOE_CACHE_SEED_AUTO (4096) also skips the own-ids seed of each prompt (see
+    // llama_context). LLAMA_MOE_PREFILL_UB_SPILL=0 disables (the rule before: n_ubatch grows only while every expert stays cached)
+    bool rule_spill = !rule_frac && !lend_graph && force <= 0 && have_sb && cache_ref < all_experts;
+    double spill_frac = 0.15;
+    if (const char * env_sp = getenv("LLAMA_MOE_PREFILL_UB_SPILL")) {
+        rule_spill = rule_spill && atoi(env_sp) != 0;
+    }
+    if (const char * env_sf = getenv("LLAMA_MOE_PREFILL_UB_SPILL_FRAC")) {
+        spill_frac = std::max(0.0, atof(env_sf));
+    }
+    const char * rule = force > 0 ? "forced" : lend_graph ? "LLAMA_MOE_CACHE_LEND=2" : rule_frac ? "LLAMA_MOE_PREFILL_UB_AUTO=1" :
+        rule_spill ? "experts spill, at most LLAMA_MOE_PREFILL_UB_SPILL_FRAC of the cache, no KV growth" : "every expert cached, no KV growth";
 
     uint32_t pick   = cands[0];
     mem      m_pick = m_ref;
@@ -1532,6 +1548,10 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
                 break;
             }
             if (force <= 0 && kv_grows && cands[i] > ub_max_kv) {
+                break;
+            }
+        } else if (rule_spill) {
+            if (kv_grows || (double) (m.total - m_def.total) > spill_frac*(double) cache || cache - (m.total - m_def.total) < cache/2) {
                 break;
             }
         } else if (kv_grows || cache - (m.total - m_def.total) < all_experts) {
