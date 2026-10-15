@@ -1410,13 +1410,11 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             return false;
         }
     };
-    // the main context at ubatch u, with LLAMA_MOE_MEASURE_LENT as given (lent: the staging copies are not counted); both count the seed graph
-    // (LLAMA_MOE_MEASURE_LENT=2 keeps the staging copies), so their difference is the staging: without the seed graph the measure with
-    // the copies could come out smaller than the lent one (gemma-4 26B-A4B at n_ubatch 512: 187 vs 520 MiB), the copies looked like 0 MiB,
-    // the cache seemed not to lend (it lends 22% of itself) and 280 MiB more than the device needs were taken from the cache
-    const auto measure_main = [&](uint32_t u, bool lent) -> mem {
+    // the main context at ubatch u with LLAMA_MOE_MEASURE_LENT = mode: "1" lent (without the staging copies, with the seed graph), "2" the same
+    // with the copies, "" the copies without the seed graph (the compute buffers as allocated next to an arena)
+    const auto measure_main = [&](uint32_t u, const char * mode) -> mem {
         if (!had_lent_env) {
-            common_set_env("LLAMA_MOE_MEASURE_LENT", lent ? "1" : "2");
+            common_set_env("LLAMA_MOE_MEASURE_LENT", mode);
         }
         llama_context_params cp = cparams;
         cp.n_ubatch = u;
@@ -1448,19 +1446,25 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         lend_min_frac = std::max(0.0, atof(e));
     }
     const auto measure = [&](uint32_t u) -> mem {
-        mem m = measure_main(u, true);
+        mem m = measure_main(u, "1");
         if (m.total < 0) {
             return m;
         }
         if (!had_lent_env) {
-            const mem m_full = measure_main(u, false);
-            if (m_full.total < 0) {
-                return m_full;
+            // the staging copies: "2" minus "1" (both with the seed graph). Taken from "" instead, which has no seed graph, the copies
+            // could look like 0 MiB (gemma-4 26B-A4B at n_ubatch 512: 187 MiB without the seed graph, 520 MiB lent with it), the cache
+            // seemed not to lend them (it lends 22% of itself) and 280 MiB more than the device needs were taken from the cache
+            const mem m_st = env_lend != nullptr ? m : measure_main(u, "2");
+            if (m_st.total < 0) {
+                return m_st;
             }
-            const int64_t staging = std::max<int64_t>(0, m_full.compute - m.compute);
+            const int64_t staging = std::max<int64_t>(0, m_st.compute - m.compute);
             const bool lends = env_lend != nullptr ? atoi(env_lend) != 0 : (double) staging >= lend_min_frac*(double) params.moe_cache_size;
             if (!lends) {
-                m = m_full;
+                m = measure_main(u, "");
+                if (m.total < 0) {
+                    return m;
+                }
             }
         }
         // the draft context, with its staging copies (an MTP context lends little: its own cache holds the experts of one layer): counted
