@@ -1123,10 +1123,13 @@ struct ggml_backend_sched {
     int64_t pf_n_armed;    // stats: splits armed
     int64_t pf_n_arm_used; // stats: armed splits the next computation used
     // adaptive depth [GGML_SCHED_PREFETCH_ADAPT]: grow the depth while splits wait for their copies, keep a step only if it cuts the waits
+    // and makes the graphs faster (fewer waits alone do not pay when the deeper prefetch slows the work around them)
     bool   pf_adapt;      // adapting (not settled yet)
     int    pf_adapt_max;  // largest depth tried
     int    pf_adapt_from; // depth before the last step (0: no step taken yet)
     double pf_adapt_prev; // milliseconds waited per graph before the last step
+    double pf_adapt_prev_busy; // milliseconds per timed graph span before the last step
+    double pf_adapt_gain; // a step is kept only if the timed graph span gets at least this much shorter [GGML_SCHED_PREFETCH_ADAPT_GAIN]
     double pf_acc_stall;  // milliseconds waited for copies since the last decision
     double pf_acc_busy;   // milliseconds of the timed spans
     int    pf_acc_n;      // graphs measured since the last decision
@@ -3668,22 +3671,36 @@ static void ggml_backend_sched_prefetch_adapt(ggml_backend_sched_t sched) {
     for (int b = 0; b < sched->n_backends; b++) {
         lent = lent || sched->pf[b].lent > 0;
     }
-    if (sched->pf_adapt_from > 0 && stall > 0.75*sched->pf_adapt_prev) {
-        // the last step did not cut the waits enough: back to the depth before it, and give back the memory of the larger arena
+    const double busy  = sched->pf_acc_busy / sched->pf_acc_n;  // the timed span per graph (first wait to the end of the last prefetched split)
+    // a step is judged by the graph span, not only by the waits: fewer waits can come with slower work around them (a deeper prefetch
+    // overlaps more copies with the compute, and its larger arena takes device memory), so the graph does not get faster;
+    // the measured graphs of a step come from later computations (often later in a prompt, with more context), which favours the old depth
+    const bool   stepped  = sched->pf_adapt_from > 0;
+    const bool   no_waits = stepped && stall > 0.75*sched->pf_adapt_prev;
+    const bool   no_gain  = stepped && busy > (1.0 - sched->pf_adapt_gain)*sched->pf_adapt_prev_busy;
+    if (no_waits || no_gain) {
+        // the last step did not cut the waits enough or did not make the graphs faster: back to the depth before it, and give back the
+        // memory of the larger arena
         sched->pf_depth = sched->pf_adapt_from;
         sched->pf_adapt = false;
         for (int b = 0; b < sched->n_backends; b++) {
             sched->pf[b].shrink = true;
         }
     } else if (ratio > 0.02 && sched->pf_depth < sched->pf_adapt_max && !lent) {
-        sched->pf_adapt_prev = stall;
-        sched->pf_adapt_from = sched->pf_depth;
+        sched->pf_adapt_prev      = stall;
+        sched->pf_adapt_prev_busy = busy;
+        sched->pf_adapt_from      = sched->pf_depth;
         sched->pf_depth++;
     } else {
         sched->pf_adapt = false;
     }
-    GGML_LOG_INFO("%s: host weight prefetch: splits waited %.1f%% of %.1f ms (%.1f ms per graph) for their copies at depth %d (%d graphs): %s depth %d%s\n", __func__,
-        100.0*ratio, sched->pf_acc_busy, stall, from, sched->pf_acc_n, sched->pf_adapt ? "trying" : "settled at", sched->pf_depth,
+    char judged[160] = "";
+    if (stepped) {
+        snprintf(judged, sizeof(judged), ", graph %.1f -> %.1f ms (%+.1f%%, a step needs %.1f%% less)%s", sched->pf_adapt_prev_busy, busy,
+            100.0*(busy/sched->pf_adapt_prev_busy - 1.0), 100.0*sched->pf_adapt_gain, no_waits ? ", waits not cut" : no_gain ? ", no gain" : "");
+    }
+    GGML_LOG_INFO("%s: host weight prefetch: splits waited %.1f%% of %.1f ms (%.1f ms per graph) for their copies at depth %d (%d graphs%s): %s depth %d%s\n", __func__,
+        100.0*ratio, sched->pf_acc_busy, stall, from, sched->pf_acc_n, judged, sched->pf_adapt ? "trying" : "settled at", sched->pf_depth,
         lent && !sched->pf_adapt ? " (staging in lent memory)" : "");
     sched->pf_acc_stall = 0.0;
     sched->pf_acc_busy  = 0.0;
@@ -4192,6 +4209,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
         // an explicit depth is kept as is
         sched->pf_adapt     = (GGML_SCHED_PREFETCH_ADAPT ? atoi(GGML_SCHED_PREFETCH_ADAPT) != 0 : true) && GGML_SCHED_PREFETCH_DEPTH == NULL && sched->pf_mode != 0;
         sched->pf_adapt_max = std::min(4, GGML_SCHED_MAX_PREFETCH_DEPTH);
+        const char * GGML_SCHED_PREFETCH_ADAPT_GAIN = getenv("GGML_SCHED_PREFETCH_ADAPT_GAIN");
+        sched->pf_adapt_gain = GGML_SCHED_PREFETCH_ADAPT_GAIN ? atof(GGML_SCHED_PREFETCH_ADAPT_GAIN) : 0.01;
 
         const char * GGML_SCHED_OVERLAP = getenv("GGML_SCHED_OVERLAP");
         sched->ov_mode = GGML_SCHED_OVERLAP ? atoi(GGML_SCHED_OVERLAP) : 1;
