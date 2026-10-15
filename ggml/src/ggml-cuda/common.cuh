@@ -1589,6 +1589,12 @@ struct ggml_backend_cuda_context {
     cudaEvent_t moe_join   = nullptr;
     bool        moe_join_pending = false; // moe_join was recorded and the main stream has not waited for it yet
 
+    // small matrix-vector products that graph_optimize moved next to their inputs, run on a side stream until their first
+    // reader (see ggml_cuda_side_mv_plan): node -> first reader
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *> side_mv;
+    cudaEvent_t              side_mv_fork = nullptr;
+    std::vector<cudaEvent_t> side_mv_join;
+
     ggml_cuda_q8_1_cache q8_1_cache;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };

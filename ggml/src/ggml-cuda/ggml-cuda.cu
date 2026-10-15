@@ -712,6 +712,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         CUDA_CHECK(cudaEventDestroy(moe_fork));
         CUDA_CHECK(cudaEventDestroy(moe_join));
     }
+    if (side_mv_fork != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(side_mv_fork));
+    }
+    for (cudaEvent_t ev : side_mv_join) {
+        CUDA_CHECK(cudaEventDestroy(ev));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -4928,6 +4934,35 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// Side-stream matrix-vector products. In single-token decode some products have only a few rows (a hyper-connection inject
+// weight, a shared-expert gate, ...): they run on a handful of SMs for several microseconds while the rest of the GPU waits,
+// although their result is read only much later. Such a product is moved right after the last node it reads (before the
+// allocation, so the allocator places its output accordingly; its sources are kept alive until its first reader), and the
+// evaluation runs it on a side stream that the main stream joins before that reader. Every node computes the same values in
+// the same order: only the overlap changes. GGML_CUDA_DISABLE_SIDE_MATVEC=1 turns it off.
+static constexpr int GGML_CUDA_SIDE_MV_STREAM    = GGML_CUDA_MAX_STREAMS - 2; // GGML_CUDA_MAX_STREAMS - 1: MoE cache copies
+static constexpr int GGML_CUDA_SIDE_MV_MAX_ROWS  = 64;
+static constexpr int GGML_CUDA_SIDE_MV_MIN_GAP   = 24; // nodes between the moved product and its first reader
+static constexpr int GGML_CUDA_SIDE_MV_LOOKAHEAD = 16; // the join is placed this many nodes early (a fused group may start there)
+
+// planning only looks at the weight and the topology, not at the batch size: the prompt and decode graphs of a model then get
+// the same node order and the same allocation dependencies, so switching between them does not force a new allocation plan.
+// The side stream itself is only used for single-row products (ggml_cuda_side_mv_run).
+static bool ggml_cuda_side_mv_candidate(const ggml_tensor * node) {
+    if (node->op != GGML_OP_MUL_MAT || !(node->flags & GGML_TENSOR_FLAG_COMPUTE) || node->view_src != nullptr) {
+        return false;
+    }
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+    return (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) && src1->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(src0) && src0->ne[1] <= GGML_CUDA_SIDE_MV_MAX_ROWS && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+        src1->ne[2] == 1 && src1->ne[3] == 1 && node->type == GGML_TYPE_F32;
+}
+
+static bool ggml_cuda_side_mv_run(const ggml_tensor * node) {
+    return ggml_cuda_side_mv_candidate(node) && node->src[1]->ne[1] == 1;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -5037,8 +5072,67 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
             }
 
+            // side-stream matrix-vector products of this graph (see ggml_cuda_side_mv_plan): node index -> join index
+            std::unordered_map<int, int> side_mv_at;
+            std::vector<std::pair<int, cudaEvent_t>> side_mv_pending; // join index, event
+            if (!cuda_ctx->side_mv.empty() && stream_ctx.concurrent_events.empty()) {
+                std::unordered_map<const ggml_tensor *, int> idx;
+                for (int i = 0; i < cgraph->n_nodes; ++i) {
+                    idx[cgraph->nodes[i]] = i;
+                }
+                for (const auto & [mv, reader] : cuda_ctx->side_mv) {
+                    const auto a = idx.find(mv);
+                    const auto b = idx.find(reader);
+                    if (a != idx.end() && b != idx.end() && b->second - a->second >= GGML_CUDA_SIDE_MV_MIN_GAP &&
+                        ggml_cuda_side_mv_run(mv)) {
+                        side_mv_at[a->second] = b->second;
+                    }
+                }
+                if (!side_mv_at.empty() && cuda_ctx->side_mv_fork == nullptr) {
+                    CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx->side_mv_fork, cudaEventDisableTiming));
+                }
+            }
+            size_t side_mv_n_events = 0;
+            const auto side_mv_join_until = [&](int last) {
+                for (size_t k = 0; k < side_mv_pending.size();) {
+                    if (side_mv_pending[k].first <= last) {
+                        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(cuda_ctx->device, 0), side_mv_pending[k].second, 0));
+                        side_mv_pending.erase(side_mv_pending.begin() + k);
+                    } else {
+                        ++k;
+                    }
+                }
+            };
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (!side_mv_pending.empty()) {
+                    // a fused group starting here may cover the reader, so join a few nodes early
+                    side_mv_join_until(i + GGML_CUDA_SIDE_MV_LOOKAHEAD);
+                }
+                if (!side_mv_at.empty()) {
+                    const auto it = side_mv_at.find(i);
+                    if (it != side_mv_at.end()) {
+                        if (side_mv_n_events == cuda_ctx->side_mv_join.size()) {
+                            cudaEvent_t ev;
+                            CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+                            cuda_ctx->side_mv_join.push_back(ev);
+                        }
+                        cudaEvent_t join = cuda_ctx->side_mv_join[side_mv_n_events++];
+                        cudaStream_t side = cuda_ctx->stream(cuda_ctx->device, GGML_CUDA_SIDE_MV_STREAM);
+                        CUDA_CHECK(cudaEventRecord(cuda_ctx->side_mv_fork, cuda_ctx->stream(cuda_ctx->device, 0)));
+                        CUDA_CHECK(cudaStreamWaitEvent(side, cuda_ctx->side_mv_fork, 0));
+                        cuda_ctx->curr_stream_no = GGML_CUDA_SIDE_MV_STREAM;
+                        const bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                        GGML_ASSERT(ok);
+                        cuda_ctx->curr_stream_no = 0;
+                        CUDA_CHECK(cudaEventRecord(join, side));
+                        side_mv_pending.push_back({ it->second, join });
+                        ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 1);
+                        prev_i = i;
+                        continue;
+                    }
+                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -5124,6 +5218,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                }
             }
 
+            // a capture must not end with unjoined work on the side stream
+            side_mv_join_until(INT_MAX);
             cuda_ctx->q8_1_cache.end();
         }
 
@@ -5273,6 +5369,52 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
     }
 }
 
+static void ggml_cuda_side_mv_plan(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+    std::unordered_map<const ggml_tensor *, int> idx;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        idx[cgraph->nodes[i]] = i;
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (!ggml_cuda_side_mv_candidate(node)) {
+            continue;
+        }
+        int p = -1; // the last node it reads
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const auto it = node->src[k] ? idx.find(node->src[k]) : idx.end();
+            if (it != idx.end()) {
+                p = std::max(p, it->second);
+            }
+        }
+        int c = -1; // its first reader
+        for (int j = i + 1; j < cgraph->n_nodes && c < 0; ++j) {
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                if (cgraph->nodes[j]->src[k] == node) {
+                    c = j;
+                    break;
+                }
+            }
+        }
+        if (c < 0 || (node->flags & GGML_TENSOR_FLAG_OUTPUT) || c - p < GGML_CUDA_SIDE_MV_MIN_GAP) {
+            continue;
+        }
+        if (i > p + 1) {
+            std::rotate(cgraph->nodes + p + 1, cgraph->nodes + i, cgraph->nodes + i + 1);
+            for (int j = p + 1; j <= i; ++j) {
+                idx[cgraph->nodes[j]] = j;
+            }
+        }
+        // the main stream may reuse the memory of the sources once their last reader in the node order is done
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            if (node->src[k] != nullptr) {
+                params->add_alloc_dep(params->user_data, node->src[k], cgraph->nodes[c]);
+            }
+        }
+        params->add_alloc_dep(params->user_data, node, cgraph->nodes[c]);
+        cuda_ctx->side_mv[node] = cgraph->nodes[c];
+    }
+}
+
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -5290,6 +5432,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
     };
+
+    // the side-stream matrix-vector products of the previous graph do not apply to this one
+    cuda_ctx->side_mv.clear();
 
     if (!disable_fusion) {
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
@@ -5386,6 +5531,15 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     }
                 }
             }
+        }
+    }
+
+    {
+        static const bool side_mv_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_SIDE_MATVEC");
+        // GGML_CUDA_GRAPH_OPT=1 runs its own concurrent streams
+        const char * graph_opt = getenv("GGML_CUDA_GRAPH_OPT");
+        if (!disable_fusion && !side_mv_disabled && !(graph_opt != nullptr && atoi(graph_opt) == 1)) {
+            ggml_cuda_side_mv_plan(cuda_ctx, cgraph, params);
         }
     }
 
