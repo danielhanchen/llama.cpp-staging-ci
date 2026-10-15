@@ -5538,7 +5538,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         static const bool side_mv_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_SIDE_MATVEC");
         // GGML_CUDA_GRAPH_OPT=1 runs its own concurrent streams
         const char * graph_opt = getenv("GGML_CUDA_GRAPH_OPT");
-        if (!disable_fusion && !side_mv_disabled && !(graph_opt != nullptr && atoi(graph_opt) == 1)) {
+        // the side stream only pays where a few-row product leaves SMs idle long enough to cover the fork/join events:
+        // measured slower on Turing (T4), so it is on for NVIDIA Ampere and newer only (GGML_CUDA_DISABLE_SIDE_MATVEC=1 still turns it off)
+        const int side_mv_cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        const bool side_mv_arch_ok = GGML_CUDA_CC_IS_NVIDIA(side_mv_cc) && side_mv_cc >= GGML_CUDA_CC_AMPERE;
+        if (!disable_fusion && !side_mv_disabled && side_mv_arch_ok && !(graph_opt != nullptr && atoi(graph_opt) == 1)) {
             ggml_cuda_side_mv_plan(cuda_ctx, cgraph, params);
         }
     }
