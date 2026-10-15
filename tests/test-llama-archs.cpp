@@ -895,6 +895,67 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
     return 0;
 }
 
+// qwen4exp MTP draft context (a separate drafter, LLAMA_CONTEXT_TYPE_MTP): the NextN block with compress ratio 4 runs QSA, with ratio 0
+// (the MTP/ sidecar of unsloth/Qwen3.8-Flash-Next-GGUF before 766911a6) it attends densely and must not build k-pool inputs that no op
+// reads (they stay unallocated and aborted in set_input with GGML_ASSERT(buffer)). Decodes 2 tokens on zero hidden states, as
+// common_context_can_seq_rm does right after the draft context is created.
+static int check_qwen4exp_mtp_ctx(const size_t seed, const float stdev) {
+    int ret = 0;
+    for (const uint32_t ratio_nextn : { 0u, 4u }) {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+        const std::string arch = llm_arch_name(LLM_ARCH_QWEN4EXP);
+        const int64_t kid = gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str());
+        GGML_ASSERT(kid >= 0);
+        const uint32_t n_layer = gguf_get_val_u32(gguf_ctx.get(), kid);
+        gguf_set_val_u32(gguf_ctx.get(), (arch + ".block_count").c_str(), n_layer + 1);
+        gguf_set_val_u32(gguf_ctx.get(), (arch + ".nextn_predict_layers").c_str(), 1);
+        std::vector<uint32_t> ratios(n_layer, 4);
+        ratios.push_back(ratio_nextn);
+        gguf_set_arr_data(gguf_ctx.get(), (arch + ".attention.compress_ratios").c_str(), GGUF_TYPE_UINT32, ratios.data(), ratios.size());
+
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback = silent_model_load_progress;
+        std::vector<ggml_backend_dev_t> devs = { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr };
+        model_params.devices = devs.data();
+        model_params.use_extra_bufts = false;
+        model_params.load_mtp        = true;
+        tensor_data_params tensor_params = { seed, stdev };
+        llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
+        if (!model) {
+            fprintf(stderr, "%s: qwen4exp MTP (NextN ratio %u): failed to create the model\n", __func__, ratio_nextn);
+            ret = 1;
+            continue;
+        }
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx           = 256;
+        ctx_params.n_ubatch        = 64;
+        ctx_params.n_threads       = 4;
+        ctx_params.n_threads_batch = 4;
+        ctx_params.ctx_type        = LLAMA_CONTEXT_TYPE_MTP;
+        llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+        if (!lctx) {
+            fprintf(stderr, "%s: qwen4exp MTP (NextN ratio %u): failed to create the MTP context\n", __func__, ratio_nextn);
+            ret = 1;
+            continue;
+        }
+        common_batch batch(lctx.get());
+        std::vector<float> zeros(llama_model_n_embd_out(model.get()), 0.0f);
+        for (int32_t i = 0; i < 2; ++i) {
+            batch.add(0, i, 0, true);
+            batch.set_embd_state(i, { zeros.data(), 1, zeros.size() });
+        }
+        const int32_t rc = llama_process(lctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        const float * logits = rc == 0 ? llama_get_logits_ith(lctx.get(), 1) : nullptr;
+        const bool ok = rc == 0 && logits != nullptr && std::isfinite(logits[0]);
+        printf("|%15s|%30s|%6s|%15s|%9s|\n", arch.c_str(), ratio_nextn ? "MTP draft context (QSA)" : "MTP draft context (dense)", "-", "-",
+            ok ? "\033[1;32mOK\033[0m" : "\033[1;31mFAIL\033[0m");
+        if (!ok) {
+            ret = 1;
+        }
+    }
+    return ret;
+}
+
 static int test_backends(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const char * target_backend) {
     struct user_data_t {
         struct {
@@ -1290,7 +1351,12 @@ int main(int argc, char ** argv) {
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
         }
-        return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
+        int ret = 0;
+        if (arch_matches(arch_filter, LLM_ARCH_QWEN4EXP) && target_backend == nullptr) {
+            ret |= check_qwen4exp_mtp_ctx(seed, stdev);
+        }
+        ret |= test_backends(arch_filter, seed, stdev, verbosity, target_backend);
+        return ret;
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;
