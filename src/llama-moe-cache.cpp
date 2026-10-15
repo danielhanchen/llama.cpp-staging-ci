@@ -518,6 +518,7 @@ struct llama_moe_cache::impl {
     size_t seed_skipped  = 0; // prompt ends that did not seed because the graph of the seed did not fit (see seed_unavailable)
     int64_t devseed_min     = INT64_MAX; // graphs of ubatches of at least this many tokens get the seed plans
     size_t devseed_graphs   = 0; // graphs seeded on the device
+    size_t devseed_disabled = 0; // seed plans not run: their fills are not all on the device (see devseed_prepare)
     size_t devseed_admitted = 0; // experts they admitted
     size_t devseed_bytes    = 0;
     bool   prefill_deferred = false; // the default seeding skipped the prefill at load, it runs if prompts cannot seed
@@ -2725,6 +2726,37 @@ struct llama_moe_cache::impl {
         }
     }
 
+    static int32_t ggml_get_seed_layer(const ggml_tensor * plan) {
+        int il = -1, pos = 0, n_seed_max = 0, n_seed = 0;
+        GGML_ASSERT(ggml_moe_cache_seed_info(plan, &il, &pos, &n_seed_max, &n_seed));
+        return il;
+    }
+
+    // every slot of the group empty (host and device), as after a failed graph that seeded it in part
+    void devseed_clear(group & g) {
+        ggml_backend_synchronize(devices[g.id].backend);
+        seed_end(g);
+        for (int32_t il : g.layers) {
+            if ((size_t) il < refill.size()) {
+                refill[il].clear();
+            }
+        }
+        if (g.lru.n_lent > 0) {
+            unlend(g);
+        }
+        for (int32_t il : g.layers) {
+            std::fill(g.lru.slot_map[il], g.lru.slot_map[il] + g.lru.n_expert, -1);
+        }
+        g.lru.clear();
+        for (ggml_tensor * bank : g.banks) {
+            ggml_backend_tensor_memset(bank, 0, 0, ggml_nbytes(bank));
+        }
+        g.dev_newer = false;
+        g.dev_gen   = UINT64_MAX;
+        LLAMA_LOG_WARN("%s: %s: a graph that seeds the MoE cache on the device failed, the cache of %zu layers is cleared\n",
+            __func__, ggml_backend_name(devices[g.id].backend), g.layers.size());
+    }
+
     // device seed (LLAMA_MOE_CACHE_DEVSEED): the groups whose device state can be seeded by the graph
     bool devseed_init(int64_t min_tokens) {
         devseed_min = std::max<int64_t>(min_tokens, max_batch + 1);
@@ -2782,6 +2814,48 @@ struct llama_moe_cache::impl {
     // groups it seeds is brought up to date with the host first
     void devseed_prepare(ggml_cgraph * gf, bool enable) {
         std::vector<bool> used(groups.size(), false);
+        // a plan runs only if every bank of its group gets exactly one fill after it, from an expert product the scheduler left on the
+        // group device that reads a device copy of the experts (else, e.g. without op offload, it is disabled and its fills copy nothing),
+        // and the plans of a group come in layer order (a plan may evict the slots of earlier layers only)
+        std::map<const ggml_tensor *, std::vector<int>> fills; // plan -> fills per bank
+        std::map<const ggml_tensor *, bool> fill_ok;
+        std::vector<int32_t> last_il(groups.size(), -1);
+        std::map<const ggml_tensor *, bool> order_ok;
+        if (enable) {
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                const ggml_tensor * node = ggml_graph_node(gf, i);
+                int il = -1, pos = 0, n_seed_max = 0, n_cur = 0;
+                if (ggml_moe_cache_seed_info(node, &il, &pos, &n_seed_max, &n_cur)) {
+                    const int32_t ig = layers[il].ig;
+                    order_ok[node] = ig >= 0 && il > last_il[ig];
+                    if (ig >= 0) {
+                        last_il[ig] = std::max(last_il[ig], il);
+                    }
+                    fills[node].assign(groups[ig].banks.size(), 0);
+                    fill_ok[node] = true;
+                    continue;
+                }
+                if (node->op != GGML_OP_MOE_CACHE_LOOKUP || node->view_src == nullptr || node->src[0] == nullptr) {
+                    continue;
+                }
+                const auto it = fills.find(node->src[0]);
+                if (it == fills.end()) {
+                    continue;
+                }
+                const group & g = groups[layers[ggml_get_seed_layer(node->src[0])].ig];
+                const ggml_tensor * mm = node->src[1];
+                const ggml_tensor * w  = mm != nullptr && mm->op == GGML_OP_MUL_MAT_ID ? mm->src[0] : nullptr;
+                const ggml_backend_buffer_t buf = w != nullptr ? (w->view_src ? w->view_src->buffer : w->buffer) : nullptr;
+                const bool dev_ok = buf != nullptr && w->data != nullptr && !ggml_backend_buffer_is_host(buf) &&
+                    ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf)) == ggml_backend_get_device(devices[g.id].backend);
+                const auto ib = std::find(g.banks.begin(), g.banks.end(), node->src[2]);
+                if (!dev_ok || ib == g.banks.end()) {
+                    fill_ok[node->src[0]] = false;
+                    continue;
+                }
+                it->second[ib - g.banks.begin()]++;
+            }
+        }
         for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
             ggml_tensor * node = ggml_graph_node(gf, i);
             int il = -1, pos = 0, n_seed_max = 0, n_cur = 0;
@@ -2790,7 +2864,14 @@ struct llama_moe_cache::impl {
             }
             const int32_t ig = layers[il].ig;
             group & g = groups[ig];
-            if (!enable) {
+            bool ok = enable && order_ok[node] && fill_ok[node];
+            for (int n : fills[node]) {
+                ok = ok && n == 1;
+            }
+            if (!ok) {
+                if (enable) {
+                    devseed_disabled++;
+                }
                 ggml_moe_cache_seed_set(node, 0, 0);
                 continue;
             }
@@ -2816,7 +2897,7 @@ struct llama_moe_cache::impl {
     }
 
     // after the graph ran: the seeded groups come back to the host, so the copies of the next large batch read the new slots
-    void devseed_end(ggml_cgraph * gf) {
+    void devseed_end(ggml_cgraph * gf, bool ok) {
         std::vector<bool> used(groups.size(), false);
         bool any = false;
         std::vector<int32_t> n_fill(1);
@@ -2833,11 +2914,24 @@ struct llama_moe_cache::impl {
             }
             used[ig] = true;
             any = true;
+            ggml_moe_cache_seed_set(node, 0, 0);
+            if (!ok) {
+                continue;
+            }
             ggml_backend_tensor_get(node, n_fill.data(), 0, sizeof(int32_t));
             devseed_admitted += n_fill[0];
             devseed_bytes    += (size_t) n_fill[0]*g.expert_bytes;
         }
         if (!any) {
+            return;
+        }
+        if (!ok) {
+            // some plans may have run without their fills: the device map may name slots that do not hold their experts
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                if (used[ig]) {
+                    devseed_clear(groups[ig]);
+                }
+            }
             return;
         }
         devseed_graphs++;
@@ -3147,6 +3241,9 @@ struct llama_moe_cache::impl {
         if (stats_seed.misses > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu experts admitted to the cache, %.2f MiB\n", tag, stats_seed.misses, stats_seed.bytes/1024.0/1024.0);
         }
+        if (devseed_disabled > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu device seed plans not run (expert products not on the cache device)\n", tag, devseed_disabled);
+        }
         if (devseed_graphs > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu ubatches seeded on the device, %zu experts admitted, %.2f MiB\n", tag,
                 devseed_graphs, devseed_admitted, devseed_bytes/1024.0/1024.0);
@@ -3318,8 +3415,8 @@ void llama_moe_cache::devseed_prepare(ggml_cgraph * gf, bool enable) {
     pimpl->devseed_prepare(gf, enable);
 }
 
-void llama_moe_cache::devseed_end(ggml_cgraph * gf) {
-    pimpl->devseed_end(gf);
+void llama_moe_cache::devseed_end(ggml_cgraph * gf, bool ok) {
+    pimpl->devseed_end(gf, ok);
 }
 
 int llama_moe_cache::seed_mode() {

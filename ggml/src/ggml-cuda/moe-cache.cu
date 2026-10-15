@@ -734,16 +734,14 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
         // device seed fill: from the experts mm read (src[0] of mm when it ran, the device copy of host experts) to the bank
         const ggml_tensor * plan = dst->src[0];
         const ggml_tensor * mm   = dst->src[1];
-        const ggml_tensor * w    = mm->src[0];
         ggml_tensor       * bank = dst->src[2];
-        const int n_seed_max = (int) ((ggml_nelements(plan) - 1)/2);
-        GGML_ASSERT(w->data != nullptr && w->nb[2] == bank->nb[2] && w->type == bank->type);
-        // the experts must be in memory of this device: the plan was made for a layer whose copies are on it
-        {
-            cudaPointerAttributes attr = {};
-            CUDA_CHECK(cudaPointerGetAttributes(&attr, w->data));
-            GGML_ASSERT(attr.type == cudaMemoryTypeDevice && attr.device == ctx.device);
+        // the scheduler replaced the product by a copy (it runs on another backend): the host disabled the plan (see devseed_prepare)
+        if (mm->op != GGML_OP_MUL_MAT_ID || mm->src[0] == nullptr || mm->src[0]->data == nullptr) {
+            return;
         }
+        const ggml_tensor * w = mm->src[0];
+        const int n_seed_max = (int) ((ggml_nelements(plan) - 1)/2);
+        GGML_ASSERT(w->nb[2] == bank->nb[2] && w->type == bank->type);
         const int64_t nb    = bank->nb[2];
         const int64_t chunk = 64*1024;
         const dim3 grid(n_seed_max, 1, (unsigned) std::max<int64_t>((nb + chunk - 1)/chunk, 1));

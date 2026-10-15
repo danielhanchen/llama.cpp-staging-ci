@@ -659,7 +659,7 @@ llama_context::llama_context(
         }
         // LLAMA_MOE_CACHE_DEVSEED (default 1, 0 = off): with the default seeding (=2) a prefetched ubatch seeds the cache on the device from
         // its own routing (see llama_moe_cache::devseed_plan): its expert uploads never wait for the host to read the routing, and it needs
-        // no stored routing of an earlier ubatch nor a larger seed graph; groups without device lookups keep the host seed
+        // no stored routing of an earlier ubatch nor a larger seed graph; groups without device lookups are not seeded by prefetched ubatches
         if (moe_cache && llama_moe_cache::seed_mode() == 2 && prefetch_min_batch != INT64_MAX) {
             const char * env = getenv("LLAMA_MOE_CACHE_DEVSEED");
             if ((env == nullptr || atoi(env) != 0) && moe_cache->devseed_init(prefetch_min_batch)) {
@@ -1984,8 +1984,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
-    if (moe_cache && moe_cache_devseed_on && moe_cache_devseed && status == GGML_STATUS_SUCCESS) {
-        moe_cache->devseed_end(res->get_gf());
+    if (moe_cache && moe_cache_devseed_on && moe_cache_devseed) {
+        // a failed graph may have run only some of its seed plans and fills: the groups it seeds are cleared
+        moe_cache->devseed_end(res->get_gf(), status == GGML_STATUS_SUCCESS);
     }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -2382,6 +2383,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
         if (fresh) {
             moe_cache->hybrid_reset();
+        // the reset takes back the lent slots without a new allocation: a reused graph would keep its copies bound to them
+        gf_res_prev_active = nullptr;
         }
     }
 
@@ -4570,6 +4573,8 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
     // the next batches continue the state read, not the batches before: see llama_moe_cache::hybrid_reset
     if (moe_cache) {
         moe_cache->hybrid_reset();
+        // the reset takes back the lent slots without a new allocation: a reused graph would keep its copies bound to them
+        gf_res_prev_active = nullptr;
     }
 
     // read model info
@@ -4764,6 +4769,8 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (moe_cache) {
         moe_cache->hybrid_reset();
+        // the reset takes back the lent slots without a new allocation: a reused graph would keep its copies bound to them
+        gf_res_prev_active = nullptr;
     }
     if (memory) {
         memory->state_read(io, seq_id, flags);

@@ -109,7 +109,8 @@ public:
     ggml_tensor * devseed_bank(const ggml_tensor * w, int32_t & il) const;
     // the graph gf (allocated) is about to run: enable or disable its seed plans; after it ran: the seeded groups come back to the host
     void devseed_prepare(ggml_cgraph * gf, bool enable);
-    void devseed_end(ggml_cgraph * gf);
+    // ok = false (the graph failed): the groups it may have seeded in part are cleared
+    void devseed_end(ggml_cgraph * gf, bool ok);
 
     // LLAMA_MOE_CACHE_SEED: 0 off, 1 only ubatches whose copies read their ids, 2 (default) also prefetched ubatches
     static int seed_mode();
