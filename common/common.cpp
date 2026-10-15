@@ -1410,9 +1410,8 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             return false;
         }
     };
-    // the main context at ubatch u with LLAMA_MOE_MEASURE_LENT = mode: "1" lent (without the staging copies, with the seed graph), "2" the same
-    // with the copies, "" the copies without the seed graph (the compute buffers as allocated next to an arena)
-    const auto measure_main = [&](uint32_t u, const char * mode) -> mem {
+    // the main context at ubatch u with LLAMA_MOE_MEASURE_LENT = mode ("1" lent, "" with the staging copies, "auto:<bytes>" see below)
+    const auto measure_main = [&](uint32_t u, const std::string & mode) -> mem {
         if (!had_lent_env) {
             common_set_env("LLAMA_MOE_MEASURE_LENT", mode);
         }
@@ -1438,34 +1437,22 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             return { -1, -1, 0 };
         }
     };
-    // the staging copies are left out only if the cache will lend them: LLAMA_MOE_CACHE_LEND=1/2, or unset and the copies are at least
-    // LLAMA_MOE_CACHE_LEND_MIN_FRAC (0.08) of the cache (see llama_moe_cache lend_decide); without lending they are an arena next to the cache
     const char * env_lend = getenv("LLAMA_MOE_CACHE_LEND");
     double lend_min_frac = 0.08;
     if (const char * e = getenv("LLAMA_MOE_CACHE_LEND_MIN_FRAC")) {
         lend_min_frac = std::max(0.0, atof(e));
     }
+    // the staging copies are left out only if the cache will lend them: LLAMA_MOE_CACHE_LEND=1/2, or unset and the copies are at least
+    // LLAMA_MOE_CACHE_LEND_MIN_FRAC of the cache, decided in the measured context from its own staging copies (auto:<bytes>). A decision
+    // from the difference of a measure with and one without the copies failed: only the lent one counts the seed graph, so the copies
+    // looked like 0 MiB (gemma-4 26B-A4B, 8 GB, n_ubatch 512: 187 MiB with the copies, 520 lent) and a cache lending 22% of itself was
+    // measured as one that does not, 280 MiB more than the device needs were taken from it (decode -7%)
+    const std::string lent_mode = env_lend != nullptr ? (atoi(env_lend) != 0 ? "1" : "") :
+        "auto:" + std::to_string((uint64_t) (lend_min_frac*(double) params.moe_cache_size));
     const auto measure = [&](uint32_t u) -> mem {
-        mem m = measure_main(u, "1");
+        mem m = measure_main(u, lent_mode);
         if (m.total < 0) {
             return m;
-        }
-        if (!had_lent_env) {
-            // the staging copies: "2" minus "1" (both with the seed graph). Taken from "" instead, which has no seed graph, the copies
-            // could look like 0 MiB (gemma-4 26B-A4B at n_ubatch 512: 187 MiB without the seed graph, 520 MiB lent with it), the cache
-            // seemed not to lend them (it lends 22% of itself) and 280 MiB more than the device needs were taken from the cache
-            const mem m_st = env_lend != nullptr ? m : measure_main(u, "2");
-            if (m_st.total < 0) {
-                return m_st;
-            }
-            const int64_t staging = std::max<int64_t>(0, m_st.compute - m.compute);
-            const bool lends = env_lend != nullptr ? atoi(env_lend) != 0 : (double) staging >= lend_min_frac*(double) params.moe_cache_size;
-            if (!lends) {
-                m = measure_main(u, "");
-                if (m.total < 0) {
-                    return m;
-                }
-            }
         }
         // the draft context, with its staging copies (an MTP context lends little: its own cache holds the experts of one layer): counted
         // in the total (the growth taken from the cache), not in the compute of the main context
