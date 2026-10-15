@@ -1369,7 +1369,8 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     // speculative decoding: the draft context (an MTP context on the weights of the main model, or a draft model) is created from the
     // same params, so it runs at the same n_ubatch: its compute buffers and KV cache are counted too, as for --fit (a failed measure of it
     // keeps the default n_ubatch)
-    const bool has_draft = params.speculative.has_dft();
+    // (a draft model that --fit left out, fit_off, runs no context)
+    const bool has_draft = params.speculative.has_dft() && !params.speculative.draft.fit_off;
     const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     const bool has_spec  = has_draft || std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
