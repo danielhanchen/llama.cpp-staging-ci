@@ -1136,6 +1136,8 @@ struct ggml_backend_sched {
     int    pf_acc_n;      // graphs measured since the last decision
     ggml_backend_event_t (*pf_timer_new)(ggml_backend_dev_t);
     bool (*pf_timer_elapsed)(ggml_backend_event_t, ggml_backend_event_t, float *);
+    bool pf_check;     // a staging arena was allocated since the headroom was last checked
+    size_t pf_headroom; // free device memory a reserve / graph allocation must leave with a staging arena, else the prefetch is dropped
     struct ggml_backend_sched_prefetch pf[GGML_SCHED_MAX_BACKENDS];
 
     // CPU/GPU split overlap [GGML_SCHED_OVERLAP]
@@ -2579,7 +2581,16 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 }
 
+static bool ggml_backend_sched_prefetch_headroom_ok(ggml_backend_sched_t sched);
+static bool ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched);
+
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+    // like ggml_backend_sched_reserve: a staging arena allocated for this graph must leave the headroom, also when the graph fits the current buffers
+    if (sched->pf_check && !ggml_backend_sched_prefetch_headroom_ok(sched)) {
+        ggml_backend_sched_prefetch_disable(sched);
+    }
+    sched->pf_check = false;
+
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
@@ -2629,6 +2640,12 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         }
 
         if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+            GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
+            return false;
+        }
+        // the larger graph buffers next to the staging arena must leave the headroom, else drop the arena and reserve again
+        if (!ggml_backend_sched_prefetch_headroom_ok(sched) && ggml_backend_sched_prefetch_disable(sched) &&
+            !ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
             GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
             return false;
         }
@@ -2902,6 +2919,7 @@ static bool ggml_backend_sched_prefetch_ensure(ggml_backend_sched_t sched, int b
     // the copies behave like graph allocator tensors (e.g. kernels clear the padding of quantized tensors in compute buffers)
     ggml_backend_buffer_set_usage(pf->arena, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
     pf->arena_size = pf->staging;
+    sched->pf_check = true;
 
     GGML_LOG_INFO("%s: %s host weight prefetch: depth = %d, staging = %.2f MiB (largest split %.2f MiB), %.2f MiB in lent memory, eligible splits = %d (%d async) of %d\n",
         __func__, ggml_backend_name(backend), pf->depth, pf->arena_size / 1024.0 / 1024.0, pf->need / 1024.0 / 1024.0,
@@ -3513,10 +3531,7 @@ static bool ggml_backend_sched_prefetch_is_bound(ggml_backend_sched_t sched, con
 // it only takes what is left, a device with less than GGML_SCHED_PREFETCH_HEADROOM_MIB (512) free after the reserve drops the prefetch,
 // the backends allocate more while computing (e.g. the CUDA pool)
 static bool ggml_backend_sched_prefetch_headroom_ok(ggml_backend_sched_t sched) {
-    static const size_t headroom = [] {
-        const char * env = getenv("GGML_SCHED_PREFETCH_HEADROOM_MIB");
-        return (size_t) (env != NULL ? std::max(0, atoi(env)) : 512) * 1024 * 1024;
-    }();
+    const size_t headroom = sched->pf_headroom;
     if (sched->callback_lend != NULL || headroom == 0) {
         return true;
     }
@@ -4244,6 +4259,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->pf_depth     = GGML_SCHED_PREFETCH_DEPTH     ? atoi(GGML_SCHED_PREFETCH_DEPTH)     : 2;
         sched->pf_depth     = std::min(std::max(sched->pf_depth, 1), GGML_SCHED_MAX_PREFETCH_DEPTH);
         sched->pf_depth0    = sched->pf_depth;
+        const char * GGML_SCHED_PREFETCH_HEADROOM_MIB = getenv("GGML_SCHED_PREFETCH_HEADROOM_MIB");
+        sched->pf_headroom  = (size_t) (GGML_SCHED_PREFETCH_HEADROOM_MIB ? std::max(0, atoi(GGML_SCHED_PREFETCH_HEADROOM_MIB)) : 512)*1024*1024;
         const char * GGML_SCHED_PREFETCH_WINDOW = getenv("GGML_SCHED_PREFETCH_WINDOW");
         const char * GGML_SCHED_PREFETCH_CROSS  = getenv("GGML_SCHED_PREFETCH_CROSS");
         const char * GGML_SCHED_PREFETCH_ADAPT  = getenv("GGML_SCHED_PREFETCH_ADAPT");
@@ -4376,6 +4393,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
             return false;
         }
     }
+    sched->pf_check = false;
 
     ggml_backend_sched_reset(sched);
 
@@ -4542,6 +4560,11 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
         size += ggml_backend_buffer_get_size(sched->pf[backend_index].arena);
     }
     return size;
+}
+
+void ggml_backend_sched_set_prefetch_headroom(ggml_backend_sched_t sched, size_t headroom) {
+    GGML_ASSERT(sched);
+    sched->pf_headroom = headroom;
 }
 
 size_t ggml_backend_sched_get_staging_size(ggml_backend_sched_t sched, ggml_backend_t backend) {

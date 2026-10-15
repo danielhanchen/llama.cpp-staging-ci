@@ -393,6 +393,9 @@ extern "C" {
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
     // staging memory of the host weight prefetch needed by the last graph reserved, allocated or measured on backend (part of the buffer size once allocated)
     GGML_API size_t                     ggml_backend_sched_get_staging_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+    // a reserve or graph allocation that leaves less than `headroom` bytes free on a device with a staging arena drops the host weight
+    // prefetch (0 = never), default GGML_SCHED_PREFETCH_HEADROOM_MIB (512); not checked while the MoE cache lends memory to the staging
+    GGML_API void                       ggml_backend_sched_set_prefetch_headroom(ggml_backend_sched_t sched, size_t headroom);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
