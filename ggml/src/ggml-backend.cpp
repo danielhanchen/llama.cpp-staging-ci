@@ -1130,6 +1130,7 @@ struct ggml_backend_sched {
     double pf_adapt_prev; // milliseconds waited per graph before the last step
     double pf_adapt_prev_busy; // milliseconds per timed graph span before the last step
     double pf_adapt_gain; // a step is kept only if the timed graph span gets at least this much shorter [GGML_SCHED_PREFETCH_ADAPT_GAIN]
+    double pf_adapt_min_wait; // a step is tried only while the splits wait more than this share of the graph [GGML_SCHED_PREFETCH_ADAPT_MIN_WAIT]
     double pf_acc_stall;  // milliseconds waited for copies since the last decision
     double pf_acc_busy;   // milliseconds of the timed spans
     int    pf_acc_n;      // graphs measured since the last decision
@@ -3666,7 +3667,9 @@ static void ggml_backend_sched_prefetch_adapt(ggml_backend_sched_t sched) {
         sched->pf_acc_busy  += busy;
         sched->pf_acc_n++;
     }
-    if (!sched->pf_adapt || sched->pf_acc_n < 3) {
+    // 3 graphs before the first step, 2 to judge a step: its graphs run at the deeper depth until the decision (a trial that does not
+    // pay costs its graphs)
+    if (!sched->pf_adapt || sched->pf_acc_n < (sched->pf_adapt_from > 0 ? 2 : 3)) {
         return;
     }
     const double ratio = sched->pf_acc_stall / sched->pf_acc_busy;
@@ -3692,7 +3695,9 @@ static void ggml_backend_sched_prefetch_adapt(ggml_backend_sched_t sched) {
         for (int b = 0; b < sched->n_backends; b++) {
             sched->pf[b].shrink = true;
         }
-    } else if (ratio > 0.02 && sched->pf_depth < sched->pf_adapt_max && !lent) {
+    } else if (ratio > sched->pf_adapt_min_wait && sched->pf_depth < sched->pf_adapt_max && !lent) {
+        // a step can at most save the waits: below a few percent of the graph it does not pay for its trial (and the deeper prefetch
+        // tends to slow the work around the copies by more)
         sched->pf_adapt_prev      = stall;
         sched->pf_adapt_prev_busy = busy;
         sched->pf_adapt_from      = sched->pf_depth;
@@ -4217,6 +4222,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->pf_adapt_max = std::min(4, GGML_SCHED_MAX_PREFETCH_DEPTH);
         const char * GGML_SCHED_PREFETCH_ADAPT_GAIN = getenv("GGML_SCHED_PREFETCH_ADAPT_GAIN");
         sched->pf_adapt_gain = GGML_SCHED_PREFETCH_ADAPT_GAIN ? atof(GGML_SCHED_PREFETCH_ADAPT_GAIN) : 0.01;
+        const char * GGML_SCHED_PREFETCH_ADAPT_MIN_WAIT = getenv("GGML_SCHED_PREFETCH_ADAPT_MIN_WAIT");
+        sched->pf_adapt_min_wait = GGML_SCHED_PREFETCH_ADAPT_MIN_WAIT ? atof(GGML_SCHED_PREFETCH_ADAPT_MIN_WAIT) : 0.05;
 
         const char * GGML_SCHED_OVERLAP = getenv("GGML_SCHED_OVERLAP");
         sched->ov_mode = GGML_SCHED_OVERLAP ? atoi(GGML_SCHED_OVERLAP) : 1;
