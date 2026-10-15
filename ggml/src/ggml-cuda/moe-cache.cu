@@ -794,6 +794,13 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
             return; // nothing was fetched (see mode 2)
         }
         GGML_ASSERT(ctx.moe_join != nullptr && dst->view_src == dst->src[0] && dst->data == dst->src[0]->data);
+        if (!ctx.moe_join_pending) {
+            // the fetch was in another split: the end of its graph already made this stream wait for the copies (see
+            // ggml_cuda_graph_evaluate_and_capture), and that wait is part of its CUDA graph, so a replay keeps it. Waiting on
+            // moe_join again here would wait on an event last recorded in that other graph's capture, which CUDA rejects while
+            // this split is captured (invalid argument)
+            return;
+        }
         CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), ctx.moe_join, 0));
         ctx.moe_join_pending = false;
         return;
