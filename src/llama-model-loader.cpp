@@ -10,6 +10,8 @@
 #include <array>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <regex>
@@ -1269,9 +1271,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
-        // avoid using a host buffer when using mmap
+        // avoid using a host buffer when using mmap, except for the expert tensors of a layer whose large batches a GPU computes (see pin_expert)
         auto * buft_dev = ggml_backend_buft_get_device(buft);
-        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev) && !(op == GGML_OP_MUL_MAT_ID && pin_expert(ggml_nbytes(t_meta)))) {
             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
             if (!cpu_dev) {
                 throw std::runtime_error("no CPU backend found");
@@ -1402,6 +1404,10 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
         }
         LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
                 __func__, n_created, n_tensors);
+    }
+    if (n_experts_pinned > 0) {
+        LLAMA_LOG_INFO("%s: %zu expert tensors (%.2f MiB) in pinned host memory instead of the mapped file: prompt batches upload them to the GPU "
+            "(LLAMA_MOE_PIN_EXPERTS=0 to disable)\n", __func__, n_experts_pinned, experts_pinned_bytes/1024.0/1024.0);
     }
     if (n_tensors_moved > 0) {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",
@@ -1810,4 +1816,48 @@ void llama_model_loader::print_info() const {
     } else {
         LLAMA_LOG_INFO("%s: file size   = %.2f GiB (%.2f BPW) \n", __func__, n_bytes/1024.0/1024.0/1024.0, n_bytes*8.0/n_elements);
     }
+}
+
+// An expert tensor (read by GGML_OP_MUL_MAT_ID) kept in host memory while a GPU device exists (--cpu-moe, --fit, -ot ...=CPU, MoE cache):
+// every large batch (a prompt ubatch) uploads it to the GPU, and a mapped file uploads ~20% slower than pinned host memory (G4,
+// RTX PRO 6000, Flash-Next IQ4_XS: 45 vs 56 GB/s, from a tmpfs mapping). With mmap the tensor is then read into the host buffer of the
+// GPU device (pinned) instead of being mapped, as long as the pinned bytes stay within the available RAM less a reserve:
+// LLAMA_MOE_PIN_EXPERTS unset: Linux only, budget MemAvailable - max(4 GiB, 10% of MemTotal) (read once per load); 0: never; 1: always
+bool llama_model_loader::pin_expert(size_t nbytes) {
+    if (experts_pin_budget < 0) {
+        experts_pin_budget = 0;
+        const char * env = getenv("LLAMA_MOE_PIN_EXPERTS");
+        const int mode = env != nullptr ? atoi(env) : -1;
+        if (mode == 1) {
+            experts_pin_budget = INT64_MAX;
+        } else if (mode != 0) {
+#if defined(__linux__)
+            FILE * f = fopen("/proc/meminfo", "r");
+            if (f != nullptr) {
+                char line[256];
+                int64_t total = -1;
+                int64_t avail = -1;
+                while (fgets(line, sizeof(line), f) != nullptr) {
+                    long long kb = 0;
+                    if (sscanf(line, "MemTotal: %lld kB", &kb) == 1) {
+                        total = (int64_t) kb*1024;
+                    } else if (sscanf(line, "MemAvailable: %lld kB", &kb) == 1) {
+                        avail = (int64_t) kb*1024;
+                    }
+                }
+                fclose(f);
+                if (total > 0 && avail > 0) {
+                    const int64_t reserve = std::max<int64_t>((int64_t) 4 << 30, total/10);
+                    experts_pin_budget = std::max<int64_t>(0, avail - reserve);
+                }
+            }
+#endif
+        }
+    }
+    if ((int64_t) (experts_pinned_bytes + nbytes) > experts_pin_budget) {
+        return false;
+    }
+    experts_pinned_bytes += nbytes;
+    n_experts_pinned++;
+    return true;
 }
