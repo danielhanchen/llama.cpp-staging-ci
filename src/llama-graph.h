@@ -293,6 +293,7 @@ public:
     // and shared across layers which use build_rs
     ggml_tensor * s_copy_main; // I32 [n_seqs]
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
+    ggml_tensor * s_copy_rows; // I32 [n_rs], or [n_rs - n_seqs] when alias >= 0 (see build_rs)
 
     const llama_memory_recurrent_context * mctx;
 

@@ -388,7 +388,7 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     const int64_t n_rs = mctx->get_n_rs();
 
     if (s_copy) {
-        // when every layer reads its states in place (see get_rs_alias) nothing reads s_copy and it has no buffer,
+        // s_copy has no buffer when no node reads it (build_rs reads it also when the states are read in place),
         // but s_copy() still has to run: it clears the rollback index of the sequences
         int32_t * data = nullptr;
         if (s_copy->buffer) {
@@ -1172,7 +1172,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
-        // when every layer reads its states in place (see get_rs_alias) nothing reads s_copy and it has no buffer,
+        // s_copy has no buffer when no node reads it (build_rs reads it also when the states are read in place),
         // but s_copy() still has to run: it clears the rollback index of the sequences
         int32_t * data = nullptr;
         if (inp_rs->s_copy->buffer) {
@@ -1224,7 +1224,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
-        // when every layer reads its states in place (see get_rs_alias) nothing reads s_copy and it has no buffer,
+        // s_copy has no buffer when no node reads it (build_rs reads it also when the states are read in place),
         // but s_copy() still has to run: it clears the rollback index of the sequences
         int32_t * data = nullptr;
         if (inp_rs->s_copy->buffer) {
@@ -1306,7 +1306,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
-        // when every layer reads its states in place (see get_rs_alias) nothing reads s_copy and it has no buffer,
+        // s_copy has no buffer when no node reads it (build_rs reads it also when the states are read in place),
         // but s_copy() still has to run: it clears the rollback index of the sequences
         int32_t * data = nullptr;
         if (inp_rs->s_copy->buffer) {
@@ -4036,30 +4036,26 @@ ggml_tensor * llm_graph_context::build_rs(
     // {state_size, rs_size} -> {state_size, n_rs - i0}
     const int64_t i0 = n_rs - state_copy->ne[0];
 
-    // decode with every sequence already in its own row: the gather would copy the states onto
-    // themselves, so read them in place and gather only the extra states. rs_alias comes from host
-    // side cache bookkeeping, so this adds no device synchronisation.
-    if (rs_alias >= 0 && !get_state_rows && i0 == 0) {
-        ggml_tensor * output_states = ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], (size_t) rs_alias*states->nb[1]);
-        ggml_build_forward_expand(gf, output_states);
+    // decode with every sequence already in its own row (rs_alias >= 0, from host side cache bookkeeping, so no device
+    // synchronisation): the gather would copy the states onto themselves, so they are read in place and state_copy only
+    // holds the extra states (i0 == n_seqs: nothing is gathered in a single sequence decode)
+    const bool in_place = rs_alias >= 0 && !get_state_rows;
+    GGML_ASSERT(!in_place || i0 == n_seqs);
 
-        if (n_rs > (uint32_t) n_seqs) {
-            ggml_tensor * extra_ids    = ggml_view_1d(ctx0, state_copy, n_rs - n_seqs, n_seqs*state_copy->nb[0]);
-            ggml_tensor * states_extra = ggml_get_rows(ctx0, states, extra_ids);
-            ggml_build_forward_expand(gf,
-                ggml_cpy(ctx0,
-                    states_extra,
-                    ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
-        }
-
-        return output_states;
-    }
-
+    // the gather keeps its place in the graph when the states are read in place (then it is empty or holds only the extra
+    // states): the decode and prompt graphs have the same nodes and leafs, so the graph allocator keeps the reservation of
+    // the largest graph instead of reallocating, with a device synchronisation, at every prompt ubatch after a decode
     ggml_tensor * states_all = ggml_get_rows(ctx0, states, state_copy);
 
-    ggml_tensor * output_states = get_state_rows ?
-        get_state_rows(ctx0, states, state_copy_main) :
-        ggml_view_2d(ctx0, states_all, state_size, n_seqs, states_all->nb[1], 0);
+    ggml_tensor * output_states = nullptr;
+    if (in_place) {
+        ggml_build_forward_expand(gf, states_all); // the node order of the gather below
+        output_states = ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], (size_t) rs_alias*states->nb[1]);
+    } else {
+        output_states = get_state_rows ?
+            get_state_rows(ctx0, states, state_copy_main) :
+            ggml_view_2d(ctx0, states_all, state_size, n_seqs, states_all->nb[1], 0);
+    }
     ggml_build_forward_expand(gf, output_states);
 
     // copy extra states which won't be changed further (between n_seqs and n_rs)
@@ -4096,6 +4092,12 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         LLAMA_LOG_DEBUG("%s: recurrent states of %d sequences read in place from row %d\n", __func__, (int) n_seqs, inp->alias);
     }
 
+    // the ids of the gather in build_rs: every state, or only the extra states when the states of the ubatch are read in place;
+    // a view in both cases, so that both graphs have the same nodes
+    inp->s_copy_rows = inp->alias >= 0 ?
+        ggml_view_1d(ctx0, inp->s_copy, n_rs - n_seqs, n_seqs*inp->s_copy->nb[0]) :
+        ggml_view_1d(ctx0, inp->s_copy, n_rs, 0);
+
     return inp;
 }
 
@@ -4117,7 +4119,7 @@ ggml_tensor * llm_graph_context::build_rs(
 
     // a custom getter reads the states of the ubatch straight from the cache, so the gather skips the first
     // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch
-    ggml_tensor * state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy;
+    ggml_tensor * state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy_rows;
 
     return build_rs(s, state_copy, inp->s_copy_main, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
