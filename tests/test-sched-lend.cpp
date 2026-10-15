@@ -2,8 +2,10 @@
 //
 // graph A (a "large ubatch"): every host weight copy is ASYNC and placed in lent memory, so no staging arena exists afterwards
 // graph B (a "medium ubatch", e.g. the last ubatch of a prompt): the same weights with only SYNC copies
-// without GGML_SCHED_LEND_SYNC (default on) the lender places B's copies too and the graph allocator does not grow by them;
-// with GGML_SCHED_LEND_SYNC=0 (the old behaviour) the graph allocator has to hold every copy of B, which the device cannot hold
+// GGML_SCHED_LEND_SYNC unset (=1): when the graph allocator cannot grow by B's copies (free memory less than the growth + 512 MiB of
+// headroom) the lender places them too and the graph allocator does not grow; when it can, the old path is kept (the lender is not asked);
+// with GGML_SCHED_LEND_SYNC=0 (the old behaviour) the graph allocator has to hold every copy of B, which the device cannot hold;
+// GGML_SCHED_LEND_SYNC=2 always offers them (a lender that places none reverts to the old path)
 // (cudaMalloc failed on a 1725 MiB compute buffer after a 16k prompt at -ub 512 on G4, see plans/impl_moe_vram_lend.md)
 
 #include "ggml.h"
@@ -463,9 +465,17 @@ int main() {
     check(!fix.overlap, "fix: no live copies overlap");
     check(fix.peak <= cap, "fix: device memory stayed within the capacity");
 
-    // 4. a lender that places none of B's copies: the scheduler reverts to the old path (graph allocator holds them) on a device that has room
+    // 4. a device with room for the growth: the old path, the lender is not asked for B's copies
+    result fits = run(m, cpu, SIZE_MAX/2, copy_bytes);
+    print("fix, growth fits", fits);
+    check(fits.ok_a && fits.ok_b && fits.n_failed == 0, "fits: A and B allocate and compute");
+    check(fits.lend_b_asked == 0 && fits.lend_b_placed == 0, "fits: the lender is not asked for B's SYNC copies");
+    check(fits.gbuf_b == cal.gbuf_b, "fits: B's graph allocation equals the old behaviour");
+
+    // 5. GGML_SCHED_LEND_SYNC=2 and a lender that places none of B's copies: the scheduler reverts to the old path (graph allocator holds them)
+    setenv("GGML_SCHED_LEND_SYNC", "2", 1);
     result rev = run(m, cpu, SIZE_MAX/2, copy_bytes, /*refuse_sync =*/ true);
-    print("fix, lender refuses B", rev);
+    print("LEND_SYNC=2, lender refuses B", rev);
     check(rev.ok_a && rev.ok_b, "revert: A and B allocate and compute");
     check(rev.lend_b_asked == N_LAYER && rev.lend_b_placed == 0 && rev.lend_b_depth == 1, "revert: the lender was asked (depth 1) and placed nothing");
     check(rev.gbuf_b == cal.gbuf_b, "revert: B's graph allocation equals the old behaviour");

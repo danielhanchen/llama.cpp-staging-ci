@@ -3395,11 +3395,12 @@ ggml_backend_sched_prefetch_mode llama_context::sched_prefetch_mode(const ggml_t
 void llama_context::sched_lend(ggml_backend_t backend, ggml_backend_sched_lend_copy * copies, int n_copies, int depth, bool dry, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
     // the copies of medium ubatches (see sched_prefetch_mode) use the staging arena of the large ones, the MoE cache lends only to large
-    // ones; except on a device where it lends to the large ones: no arena exists there, and a medium ubatch that copies its experts (e.g.
-    // the last, shorter ubatch of a prompt) would grow the graph allocator by all of its copies after the prompt's ubatches gave their
-    // memory back to the cache, which the device may not hold; small ubatches that read every expert from the cache are left as they are
+    // ones; except the SYNC copies the scheduler offers (depth 1) on a device where the cache lends to the large ones: no arena exists
+    // there, and the graph allocator cannot grow by the copies of a medium ubatch that copies its experts (e.g. the last, shorter ubatch
+    // of a prompt); small ubatches that read every expert from the cache are left as they are
     if (n_copies > 0 && lctx->prefetch_n_tokens < lctx->prefetch_min_batch) {
-        const bool medium = lctx->moe_cache && lctx->moe_cache->lends_on(backend) && lctx->prefetch_n_tokens > lctx->moe_cache->n_tokens_cached();
+        const bool medium = depth == 1 && lctx->moe_cache && lctx->moe_cache->lends_on(backend) &&
+            lctx->prefetch_n_tokens > lctx->moe_cache->n_tokens_cached();
         if (!medium) {
             return;
         }

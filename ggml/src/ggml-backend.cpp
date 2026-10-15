@@ -1031,6 +1031,7 @@ struct ggml_backend_sched_prefetch {
     size_t ext_offset;
     size_t ext_size;
     bool   lending;   // the user lent memory for the last graph, it is told when the memory is no longer used
+    bool   sync_lend_log; // logged that SYNC copies are placed in lent memory (the graph allocator could not grow by them)
     // the prefetched copies placed in lent memory (sorted): with the graph allocator in lent memory too, the buffer alone does not tell
     // a prefetched copy from a graph tensor (e.g. the copy of an input from another backend, which must not go through the copy queue)
     const struct ggml_tensor ** lent_copies;
@@ -1107,7 +1108,7 @@ struct ggml_backend_sched {
     int  pre_nodes;
 
     ggml_backend_sched_lend_callback callback_lend;
-    bool lend_sync; // bindings with only SYNC copies and no arena are offered to the lender (GGML_SCHED_LEND_SYNC, default 1)
+    int  lend_sync; // bindings with only SYNC copies and no arena are offered to the lender: 0 never, 1 (default) if the graph allocator cannot grow, 2 always (GGML_SCHED_LEND_SYNC)
     void * callback_lend_user_data;
 
     // host weight prefetch [GGML_SCHED_PREFETCH]
@@ -3211,11 +3212,67 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
     // allocator would have to grow by every copy of the graph after the lent memory was handed out (e.g. the last, shorter ubatch of a
     // prompt), which the device may not hold; the lender is asked to place them first (they share one slot, see sync_lend below), and only
     // if it does not place all of them they go to the graph allocator as before
+    // GGML_SCHED_LEND_SYNC=1 (default): only when the growth of the graph allocator does not fit in the free memory of the device (with
+    // GGML_SCHED_PREFETCH_HEADROOM_MIB, default 512, for what the backends allocate while computing), so a binding the graph allocator
+    // already holds (e.g. the reserved seeding ubatch of the MoE cache) or can hold keeps the old path; 2: always; 0: never
     bool sync_lend[GGML_SCHED_MAX_BACKENDS] = { false };
+    bool any_sync_lend = false;
+    for (int b = 0; b < sched->n_backends; b++) {
+        const struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+        sync_lend[b] = pf->n_bound > 0 && pf->n_async == 0 && !dry && pf->arena == NULL && sched->callback_lend != NULL && sched->lend_sync != 0;
+        any_sync_lend = any_sync_lend || sync_lend[b];
+    }
+    if (any_sync_lend && sched->lend_sync == 1) {
+        // the graph allocation with the SYNC copies of these backends in it (the bound copies of the other backends are not allocated by it)
+        static char sync_placeholder;
+        std::vector<ggml_tensor *> bound;
+        for (int b = 0; b < sched->n_backends; b++) {
+            const struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+            for (int k = 0; k < pf->n_bound && !sync_lend[b]; k++) {
+                const struct ggml_backend_sched_split * split = &sched->splits[pf->split_ids[k]];
+                for (int j = 0; j < split->n_inputs; j++) {
+                    struct ggml_tensor * input_cpy = tensor_copy(split->inputs[j], b, sched->cur_copy);
+                    if (is_split_copy(input_cpy, pf->split_ids[k]) && input_cpy->data == NULL) {
+                        input_cpy->data = &sync_placeholder;
+                        bound.push_back(input_cpy);
+                    }
+                }
+            }
+        }
+        size_t sizes[GGML_SCHED_MAX_BACKENDS] = { 0 };
+        ggml_gallocr_measure_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+        for (ggml_tensor * t : bound) {
+            t->data = NULL;
+        }
+        static const size_t headroom = [] {
+            const char * env = getenv("GGML_SCHED_PREFETCH_HEADROOM_MIB");
+            return (size_t) (env != NULL ? std::max(0, atoi(env)) : 512) * 1024 * 1024;
+        }();
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (!sync_lend[b]) {
+                continue;
+            }
+            const size_t cur  = ggml_gallocr_get_buffer_size(sched->galloc, b);
+            const size_t grow = sizes[b] > cur ? sizes[b] - cur : 0;
+            size_t free = 0, total = 0;
+            ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
+            if (grow > 0 && dev != NULL) {
+                ggml_backend_dev_memory(dev, &free, &total);
+            }
+            const bool fits = grow == 0 || dev == NULL || total == 0 || free >= grow + headroom;
+            if (fits) {
+                sync_lend[b] = false;
+            } else if (!sched->pf[b].sync_lend_log) {
+                GGML_LOG_INFO("%s: %s: the SYNC copies of a graph need %.2f MiB more graph allocation, %.2f MiB free (headroom %.0f MiB): "
+                    "they are placed in lent memory (GGML_SCHED_LEND_SYNC=0 to disable)\n", __func__, ggml_backend_name(sched->backends[b]),
+                    grow/1024.0/1024.0, free/1024.0/1024.0, headroom/1024.0/1024.0);
+                sched->pf[b].sync_lend_log = true;
+            }
+        }
+    }
     for (int b = 0; b < sched->n_backends; b++) {
         struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
-        if (pf->n_bound > 0 && pf->n_async == 0 && !dry && pf->arena == NULL && sched->callback_lend != NULL && sched->lend_sync) {
-            sync_lend[b] = true;
+        if (sync_lend[b]) {
             continue;
         }
         if (pf->n_bound > 0 && pf->n_async == 0 && (dry || pf->arena == NULL)) {
@@ -4301,9 +4358,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
         const char * GGML_SCHED_PREFETCH_HEADROOM_MIB = getenv("GGML_SCHED_PREFETCH_HEADROOM_MIB");
         sched->pf_headroom  = (size_t) (GGML_SCHED_PREFETCH_HEADROOM_MIB ? std::max(0, atoi(GGML_SCHED_PREFETCH_HEADROOM_MIB)) : 512)*1024*1024;
         // GGML_SCHED_LEND_SYNC=0: bindings with only SYNC copies are not offered to the lender (their copies go to the graph allocator
-        // when no arena exists, see ggml_backend_sched_prefetch_bind)
+        // when no arena exists, see ggml_backend_sched_prefetch_bind); 1 (default) only if the graph allocator cannot grow by them; 2 always
         const char * GGML_SCHED_LEND_SYNC = getenv("GGML_SCHED_LEND_SYNC");
-        sched->lend_sync    = GGML_SCHED_LEND_SYNC ? atoi(GGML_SCHED_LEND_SYNC) != 0 : true;
+        sched->lend_sync    = GGML_SCHED_LEND_SYNC ? atoi(GGML_SCHED_LEND_SYNC) : 1;
         const char * GGML_SCHED_PREFETCH_WINDOW = getenv("GGML_SCHED_PREFETCH_WINDOW");
         const char * GGML_SCHED_PREFETCH_CROSS  = getenv("GGML_SCHED_PREFETCH_CROSS");
         const char * GGML_SCHED_PREFETCH_ADAPT  = getenv("GGML_SCHED_PREFETCH_ADAPT");
