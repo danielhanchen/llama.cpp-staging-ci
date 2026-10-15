@@ -388,6 +388,68 @@ static void ggml_cpy_f32_iq4_nl_cuda(
 
 // check if a same-type copy reduces to a 2D strided copy (height rows of width
 // contiguous bytes), so it can use cudaMemcpy2DAsync instead of the scalar kernel
+template <typename T, bool single_row>
+static __global__ void copy_rows_kernel(char * dst, const size_t dpitch, const char * src, const size_t spitch,
+        const int64_t n_per_row, const int64_t n) {
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    // one flat index over all rows, so that many short rows do not get a block each
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x*blockDim.x) {
+        if constexpr (single_row) {
+            ((T *) dst)[i] = ((const T *) src)[i];
+        } else {
+            const int64_t row = i / n_per_row;
+            const int64_t col = i - row*n_per_row;
+            ((T *) (dst + row*dpitch))[col] = ((const T *) (src + row*spitch))[col];
+        }
+    }
+}
+
+void ggml_cuda_memcpy_d2d(void * dst, size_t dpitch, const void * src, size_t spitch, size_t width, size_t height, cudaStream_t stream) {
+    static const bool disabled = [] {
+        const char * env = getenv("GGML_CUDA_DISABLE_COPY_KERNEL");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    if (width == 0 || height == 0) {
+        return;
+    }
+    if (disabled) {
+        if (height == 1) {
+            CUDA_CHECK(cudaMemcpyAsync(dst, src, width, cudaMemcpyDeviceToDevice, stream));
+        } else {
+            CUDA_CHECK(cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, cudaMemcpyDeviceToDevice, stream));
+        }
+        return;
+    }
+    if (height == 1) {
+        dpitch = spitch = width;
+    }
+    const uintptr_t align = (uintptr_t) dst | (uintptr_t) src | dpitch | spitch | width;
+    const auto launch = [&](auto tag) {
+        using T = decltype(tag);
+        const int64_t n_per_row  = width / sizeof(T);
+        const int64_t n          = n_per_row * (int64_t) height;
+        const int     block_size = 256;
+        const int64_t n_blocks   = std::min<int64_t>((n + block_size - 1) / block_size, 4096);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
+            dim3((unsigned) n_blocks, 1, 1), dim3(block_size, 1, 1), 0, stream);
+        if (height == 1) {
+            ggml_cuda_kernel_launch(copy_rows_kernel<T, true>, launch_params, (char *) dst, dpitch, (const char *) src, spitch, n_per_row, n);
+        } else {
+            ggml_cuda_kernel_launch(copy_rows_kernel<T, false>, launch_params, (char *) dst, dpitch, (const char *) src, spitch, n_per_row, n);
+        }
+    };
+    if (align % 16 == 0) {
+        launch(int4{});
+    } else if (align % 8 == 0) {
+        launch(int2{});
+    } else if (align % 4 == 0) {
+        launch(int{});
+    } else {
+        launch(char{});
+    }
+}
+
 static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tensor * src1,
         size_t & width, size_t & height, size_t & spitch, size_t & dpitch) {
     // require matching shape: a reshaped copy maps elements by flat order, which the
@@ -472,11 +534,10 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         } else
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
         {
-            CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, ggml_nbytes(src0), cudaMemcpyDeviceToDevice, main_stream));
+            ggml_cuda_memcpy_d2d(src1_ddc, ggml_nbytes(src0), src0_ddc, ggml_nbytes(src0), ggml_nbytes(src0), 1, main_stream);
         }
     } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
-        CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
-                                     mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
+        ggml_cuda_memcpy_d2d(src1_ddc, mc_dpitch, src0_ddc, mc_spitch, mc_width, mc_height, main_stream);
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         if (can_be_transposed) {
             ggml_cpy_scalar_cuda<float, float, true>

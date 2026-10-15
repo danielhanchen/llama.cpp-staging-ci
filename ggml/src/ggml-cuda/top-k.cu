@@ -1,5 +1,6 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
+#include "cpy.cuh"
 
 // Adjusted implementation thresholds from #28547, can be overridden at build time
 #ifndef GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC
@@ -524,8 +525,7 @@ static void top_k_argsort_cuda(
         } else {
             argsort_f32_i32_cuda_bitonic(src, tmp, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream, tie_index);
         }
-        CUDA_CHECK(cudaMemcpy2DAsync(dst, k * sizeof(int), tmp, ncols * sizeof(int), k * sizeof(int), iter_nrows,
-                                     cudaMemcpyDeviceToDevice, stream));
+        ggml_cuda_memcpy_d2d(dst, k * sizeof(int), tmp, ncols * sizeof(int), k * sizeof(int), iter_nrows, stream);
 
         src += (size_t) ncols * iter_nrows;
         dst += (size_t) k     * iter_nrows;
