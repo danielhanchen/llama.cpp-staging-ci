@@ -605,6 +605,12 @@ struct common_params {
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
 
     enum llama_ple_prefetch_mode ple_prefetch = LLAMA_PLE_PREFETCH_AUTO; // ahead prefetch of lazily read PLE rows
+    // uploads of the mapped host weights from the model files through a pinned ring (llama_context_params::weight_stream*)
+    int32_t  weight_stream         = 1; // 0 off, 1 auto, 2 on
+    int32_t  weight_stream_io      = 0; // 0 auto, 1 buffered, 2 direct
+    int32_t  weight_stream_threads = 0;
+    uint32_t weight_stream_ram_mib = 0;
+    int32_t  moe_host_cache_mib    = -1; // RAM tier of the streamed experts behind --moe-cache-mib, -1 auto, 0 off
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

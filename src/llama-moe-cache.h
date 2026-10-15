@@ -7,6 +7,7 @@
 #include <vector>
 
 struct llama_model;
+class llama_weight_store;
 
 // keeps the most recently used experts of host-resident MoE layers in a device buffer
 // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
@@ -35,8 +36,10 @@ public:
 
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     // size is already the share of the layer set (see budget)
+    // ws: the weight store that reads the misses of host lookups from the model files (see set_weight_store), nullptr if none
+    // host_mib: MiB of the RAM tier of the experts the weight store streams (pinned slots behind the device slots), -1 = auto, 0 = off
     llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
-            layer_set set = layer_set::all);
+            layer_set set = layer_set::all, llama_weight_store * ws = nullptr, int64_t host_mib = -1);
     ~llama_moe_cache();
 
     // the device that caches layer il
@@ -142,6 +145,9 @@ public:
 
     // true if t is a slot map (host memory that changes between graph computations)
     bool is_slot_map(const ggml_tensor * t) const;
+
+    // the misses of the host lookups are read from the model files by the weight store (nullptr: copied from the mapping)
+    void set_weight_store(llama_weight_store * ws);
 
     // ggml_backend_sched copy callback, returns false if src is not a slot map
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);

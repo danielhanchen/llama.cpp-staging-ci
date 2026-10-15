@@ -374,6 +374,14 @@ extern "C" {
     // dry: memory measurement, the user must not change its state; the lent memory must not be used by the user until it is taken back
     typedef void (*ggml_backend_sched_lend_callback)(ggml_backend_t backend, struct ggml_backend_sched_lend_copy * copies, int n_copies, int depth, bool dry, void * user_data);
 
+    // Callback receiving, when a graph with prefetched copies starts computing, the host weights its prefetched copies read in the order the
+    // copy queues issue them (n_srcs = 0: the graph prefetches nothing), so that the user can read them ahead (e.g. from the model files)
+    typedef void (*ggml_backend_sched_prefetch_plan_callback)(const struct ggml_tensor * const * srcs, int n_srcs, void * user_data);
+
+    // Callback supplying the bytes of a prefetched copy that the copy callback did not make: uploads `size` bytes of `src` at `offset` to
+    // `dst` at `offset` on `backend` (the copy queue) and returns true, or returns false to let the scheduler upload them from src->data
+    typedef bool (*ggml_backend_sched_prefetch_source_callback)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, size_t offset, size_t size, void * user_data);
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
@@ -433,6 +441,10 @@ extern "C" {
 
     // Set a callback that places prefetched copies in memory lent by the user instead of the staging arena
     GGML_API void                 ggml_backend_sched_set_lend_callback(ggml_backend_sched_t sched, ggml_backend_sched_lend_callback callback, void * user_data);
+
+    // Set the callbacks that read the prefetched host weights ahead and supply their bytes (see ggml_backend_sched_prefetch_plan_callback)
+    GGML_API void                 ggml_backend_sched_set_prefetch_plan_callback(ggml_backend_sched_t sched, ggml_backend_sched_prefetch_plan_callback callback, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_prefetch_source_callback(ggml_backend_sched_t sched, ggml_backend_sched_prefetch_source_callback callback, void * user_data);
 
     //
     // Meta backend

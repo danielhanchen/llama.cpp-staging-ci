@@ -412,6 +412,14 @@ extern "C" {
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
 
         enum llama_ple_prefetch_mode ple_prefetch; // ahead prefetch of lazily read PLE rows, env LLAMA_PLE_PREFETCH overrides [EXPERIMENTAL]
+        // uploads of the host weights mapped from the model files through pinned memory filled with parallel file reads [EXPERIMENTAL]
+        // (env LLAMA_WEIGHT_STREAM=0 disables it whatever these say)
+        int32_t  weight_stream;         // 0 = off, 1 = auto (only when the mapped host weights do not fit in the available RAM), 2 = on
+        int32_t  weight_stream_io;      // 0 = auto (prompts: resident pages from the mapping, the rest O_DIRECT; the rest buffered), 1 = buffered, 2 = direct (O_DIRECT)
+        int32_t  weight_stream_threads; // IO threads, 0 = default
+        uint32_t weight_stream_ram_mib; // MiB of pinned staging, 0 = default (1/16 of the available RAM, 512 MiB to 4 GiB)
+        int32_t  moe_host_cache_mib;    // MiB of pinned RAM slots for the streamed experts behind moe_cache_size, -1 = auto, 0 = off
+                                        // (env LLAMA_MOE_HOST_CACHE=0 disables it) [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

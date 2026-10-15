@@ -378,6 +378,12 @@ llama_context::llama_context(
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
 
+    cparams.weight_stream         = params.weight_stream;
+    cparams.weight_stream_io      = params.weight_stream_io;
+    cparams.weight_stream_threads = params.weight_stream_threads;
+    cparams.weight_stream_ram_mib = params.weight_stream_ram_mib;
+    cparams.moe_host_cache_mib    = params.moe_host_cache_mib;
+
     // initialized later
     cparams.pipeline_parallel = false;
     cparams.training = false;
@@ -636,6 +642,37 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        // the host weights read from the mapping are uploaded from pinned memory filled with parallel file reads (only with a GPU to upload to)
+        // (not in an MTP draft context: its NextN cache runs without a weight store or a RAM tier of its own)
+        if (model.weight_extents && !model.hparams.no_alloc && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+            const bool has_gpu = std::any_of(backend_ptrs.begin(), backend_ptrs.end(), [](ggml_backend_t b) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(b);
+                return dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+                    ggml_backend_dev_host_buffer_type(dev) != nullptr;
+            });
+            const size_t bytes = model.weight_extents->bytes_streamable();
+            const size_t avail = llama_weight_store::ram_available();
+            if (has_gpu && llama_weight_store::enabled(cparams.weight_stream, bytes, avail)) {
+                llama_weight_store_params wp;
+                wp.io        = cparams.weight_stream_io;
+                wp.ring_size = (size_t) cparams.weight_stream_ram_mib << 20;
+                wp.n_threads = cparams.weight_stream_threads;
+                wp.ram_avail = avail;
+                if (const char * e = getenv("LLAMA_WEIGHT_STREAM_VERIFY")) {
+                    wp.verify = atoi(e) != 0;
+                }
+                if (const char * e = getenv("LLAMA_WEIGHT_STREAM_WRAP")) {
+                    wp.wrap = atoi(e) != 0;
+                }
+                if (const char * e = getenv("LLAMA_WEIGHT_STREAM_CHUNK_MIB")) {
+                    wp.chunk = (size_t) std::max(1, atoi(e)) << 20;
+                }
+                wstore = std::make_unique<llama_weight_store>(model.weight_extents, wp);
+                LLAMA_LOG_INFO("%s: weight stream on: %.1f MiB of mapped host weights, %.1f MiB of RAM available%s\n", __func__,
+                        bytes/1048576.0, avail/1048576.0, wp.verify ? ", VERIFY" : "");
+            }
+        }
+
         // the main context caches the layers of its graph, an MTP context the NextN layers with its share of the same budget
         // (LLAMA_MOE_CACHE_MTP=0: the main context caches all layers, an MTP context none)
         const bool ctx_mtp = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
@@ -645,13 +682,13 @@ llama_context::llama_context(
         if (moe_cache_budget > 0 && moe_cache_set == llama_moe_cache::layer_set::nextn) {
             // the MTP cache is optional: the draft runs without it if its share is too small
             try {
-                moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, moe_cache_budget, moe_cache_set);
+                moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, moe_cache_budget, moe_cache_set, wstore.get(), cparams.moe_host_cache_mib);
             } catch (const std::exception & e) {
                 LLAMA_LOG_WARN("%s: no MoE cache for the MTP layers (%.2f MiB): %s\n", __func__, moe_cache_budget/1024.0/1024.0, e.what());
                 moe_cache.reset();
             }
         } else if (moe_cache_budget > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, moe_cache_budget, moe_cache_set);
+            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, moe_cache_budget, moe_cache_set, wstore.get(), cparams.moe_host_cache_mib);
         }
         if (moe_cache) {
             // the default hybrid path takes its fetch share from the decode threads, so it does not depend on timing
@@ -803,6 +840,11 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+
+    // the weight store is destroyed before the MoE cache whose RAM tier it reads through
+    if (wstore) {
+        wstore->set_tier(nullptr);
+    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -933,6 +975,10 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
         if (sched_pf_headroom_def > 0) {
             ggml_backend_sched_set_prefetch_headroom(sched.get(), sched_pf_headroom_def + reserve_max);
         }
+    }
+    if (wstore) {
+        ggml_backend_sched_set_prefetch_plan_callback(sched.get(), sched_stream_plan, this);
+        ggml_backend_sched_set_prefetch_source_callback(sched.get(), sched_stream_source, this);
     }
 }
 
@@ -2513,6 +2559,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         if (ple.enabled) {
             ple_prefetch_ahead(ubatch, mctx.get(), n_tokens_prev == 0);
         }
+        // a ubatch that outputs only some of its tokens ends a prompt: the generation that follows prefetches nothing, so the weight
+        // store does not read the next graph's copies ahead
+        if (wstore) {
+            wstore->set_wrap(!(n_outputs > 0 && n_outputs < ubatch.n_tokens));
+        }
 
         // the MoE cache only serves batches of up to 32 tokens, the end of a prompt seeds it for the generation that follows
         if (moe_cache) {
@@ -3419,6 +3470,16 @@ ggml_backend_sched_prefetch_mode llama_context::sched_prefetch_mode(const ggml_t
     return GGML_BACKEND_SCHED_PREFETCH_ASYNC;
 }
 
+void llama_context::sched_stream_plan(const ggml_tensor * const * srcs, int n_srcs, void * user_data) {
+    auto * lctx = static_cast<llama_context *>(user_data);
+    lctx->wstore->plan(srcs, n_srcs);
+}
+
+bool llama_context::sched_stream_source(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, size_t offset, size_t size, void * user_data) {
+    auto * lctx = static_cast<llama_context *>(user_data);
+    return lctx->wstore->upload(backend, src, dst, offset, offset, size);
+}
+
 void llama_context::sched_lend(ggml_backend_t backend, ggml_backend_sched_lend_copy * copies, int n_copies, int depth, bool dry, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
     // the copies of medium ubatches (see sched_prefetch_mode) use the staging arena of the large ones, the MoE cache lends only to large
@@ -3456,13 +3517,22 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     auto & st = lctx->copy_experts;
 
+    // the scheduler passes its copy queue backend only for prefetched copies
+    const bool on_copy_queue = std::none_of(lctx->backends.begin(), lctx->backends.end(),
+            [backend](const ggml_backend_ptr & b) { return b.get() == backend; });
+
+    // other host weights: on the regular path the weight store reads them from the model file (prefetched copies go through the source callback)
+    auto copy_whole = [&]() {
+        return !on_copy_queue && lctx->wstore && lctx->wstore->covers(src) && lctx->wstore->upload(backend, src, dst, 0, 0, ggml_nbytes(src));
+    };
+
     // the ids must be computed before the split starts, so only the first node of the split is considered
     if (ggml_graph_n_nodes(graph) == 0) {
-        return false;
+        return copy_whole();
     }
     const ggml_tensor * node = ggml_graph_node(graph, 0);
     if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
-        return false;
+        return copy_whole();
     }
 
     const ggml_tensor * ids = node->src[2];
@@ -3478,8 +3548,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     // the scheduler passes its copy queue backend only for prefetched copies (nearly all experts used), which may run before the ids exist: copy all
     // on the regular path the ids are known: copy only the used experts
-    const bool all = std::none_of(lctx->backends.begin(), lctx->backends.end(),
-            [backend](const ggml_backend_ptr & b) { return b.get() == backend; });
+    const bool all = on_copy_queue;
 
     if (ids != st.ids || (int64_t) st.used.size() != n_expert || (seed && st.counts.empty()) || all != st.all) {
         st.all = all;
@@ -3576,8 +3645,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     }
     if (!done) {
         plan(false);
-        for (const auto & [offset, size] : st.uploads) {
-            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+        // the weight store reads the uploads from the model file (prefetched ahead into its ring, or all of them at once)
+        if (!lctx->wstore || !lctx->wstore->covers(src) || !lctx->wstore->upload_runs(backend, src, dst, st.uploads)) {
+            for (const auto & [offset, size] : st.uploads) {
+                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+            }
         }
     }
 
@@ -5126,6 +5198,11 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
         /*.ple_prefetch                =*/ LLAMA_PLE_PREFETCH_AUTO,
+        /*.weight_stream               =*/ 1,
+        /*.weight_stream_io            =*/ 0,
+        /*.weight_stream_threads       =*/ 0,
+        /*.weight_stream_ram_mib       =*/ 0,
+        /*.moe_host_cache_mib          =*/ -1,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

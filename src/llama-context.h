@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
 #include "llama-prefetch.h"
+#include "llama-weight-store.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -306,6 +307,10 @@ private:
     // ggml_backend_sched prefetch callback, selects how the weights in host memory are prefetched
     static ggml_backend_sched_prefetch_mode sched_prefetch_mode(const ggml_tensor * src, const ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
+    // weight store: the host weights of the prefetched copies of a graph, read ahead from the model files, and the bytes of the copies
+    static void sched_stream_plan(const ggml_tensor * const * srcs, int n_srcs, void * user_data);
+    static bool sched_stream_source(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, size_t offset, size_t size, void * user_data);
+
     // places the prefetched copies of large batches in slots lent by the MoE cache
     static void sched_lend(ggml_backend_t backend, ggml_backend_sched_lend_copy * copies, int n_copies, int depth, bool dry, void * user_data);
 
@@ -514,6 +519,10 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    // uploads of the mapped host weights from the model files through pinned memory [--weight-stream], nullptr if off
+    // (declared after the backends and the scheduler: freed before them)
+    std::unique_ptr<llama_weight_store> wstore;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

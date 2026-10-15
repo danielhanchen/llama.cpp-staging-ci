@@ -2834,6 +2834,72 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
+        {"--weight-stream"}, "off|auto|on",
+        "upload the host weights mapped from the model files (e.g. --n-cpu-moe with mmap) from pinned memory filled with large\n"
+        "parallel file reads instead of page faults; auto: only when they do not fit in the available RAM\n"
+        "(env LLAMA_WEIGHT_STREAM=0 disables it) (default: auto)",
+        [](common_params & params, const std::string & value) {
+            if (value == "off") {
+                params.weight_stream = 0;
+            } else if (value == "auto") {
+                params.weight_stream = 1;
+            } else if (value == "on") {
+                params.weight_stream = 2;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_WEIGHT_STREAM"));
+    add_opt(common_arg(
+        {"--weight-stream-ram-mib"}, "N",
+        "MiB of pinned memory for --weight-stream (default: 0 = 1/16 of the available RAM, 512 to 4096)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.weight_stream_ram_mib = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_WEIGHT_STREAM_RAM_MIB"));
+    add_opt(common_arg(
+        {"--weight-stream-io"}, "buffered|direct|auto",
+        "file reads of --weight-stream: buffered (page cache), direct (O_DIRECT, buffered where unsupported) or auto: prompt\n"
+        "reads copy the pages in the page cache from the mapping and read the others unbuffered, the rest buffered (default: auto)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.weight_stream_io = 0;
+            } else if (value == "buffered") {
+                params.weight_stream_io = 1;
+            } else if (value == "direct") {
+                params.weight_stream_io = 2;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_WEIGHT_STREAM_IO"));
+    add_opt(common_arg(
+        {"--moe-host-cache-mib"}, "N",
+        "MiB of pinned RAM slots that keep the MoE experts streamed by --weight-stream behind the --moe-cache-mib device cache\n"
+        "(exclusive with the device cache unless all experts fit; env LLAMA_MOE_HOST_CACHE=0 disables it, =1 forces the auto budget,\n"
+        "LLAMA_MOE_HOST_CACHE_POLICY=exclusive|inclusive) (default: -1 = auto, the available RAM minus max(4 GiB, 15%) and the prefetch\n"
+        "ring, on only when it and the device cache hold more experts than the page cache would; 0 = off)",
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_host_cache_mib = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_HOST_CACHE_MIB"));
+    add_opt(common_arg(
+        {"--weight-stream-threads"}, "N",
+        "IO threads of --weight-stream (default: 0 = min(8, CPUs - 1), at least 2)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.weight_stream_threads = value;
+        }
+    ).set_env("LLAMA_ARG_WEIGHT_STREAM_THREADS"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

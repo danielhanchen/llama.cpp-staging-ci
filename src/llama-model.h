@@ -19,6 +19,7 @@ struct llama_ubatch;
 struct llama_memory_context_i;
 struct llama_model_loader;
 struct llama_model;
+struct llama_weight_extents;
 
 // available models
 enum llm_type {
@@ -693,6 +694,9 @@ struct llama_model {
 
     // for classifier models
     std::vector<std::string> classifier_labels;
+
+    // file extents of the host weights mapped from the model files (see llama_weight_store), nullptr if nothing is mapped
+    std::shared_ptr<llama_weight_extents> weight_extents;
 
     struct ggml_tensor * tok_embd   = nullptr;
     struct ggml_tensor * type_embd  = nullptr;

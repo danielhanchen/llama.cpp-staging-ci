@@ -60,6 +60,12 @@ struct llama_cparams {
 
     size_t moe_cache_size;
 
+    int32_t  weight_stream;
+    int32_t  weight_stream_io;
+    int32_t  weight_stream_threads;
+    uint32_t weight_stream_ram_mib;
+    int32_t  moe_host_cache_mib;
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;

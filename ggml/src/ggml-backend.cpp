@@ -1111,6 +1111,13 @@ struct ggml_backend_sched {
     int  lend_sync; // bindings with only SYNC copies and no arena are offered to the lender: 0 never, 1 (default) if the graph allocator cannot grow, 2 always (GGML_SCHED_LEND_SYNC)
     void * callback_lend_user_data;
 
+    // reads of the prefetched host weights ahead [ggml_backend_sched_set_prefetch_plan_callback]
+    ggml_backend_sched_prefetch_plan_callback callback_plan;
+    void * callback_plan_user_data;
+    ggml_backend_sched_prefetch_source_callback callback_source;
+    void * callback_source_user_data;
+    std::vector<const struct ggml_tensor *> * plan_srcs;
+
     // host weight prefetch [GGML_SCHED_PREFETCH]
     int  pf_mode;      // 0 = off, 1 = CUDA-family backends, 2 = any backend with async copies and events
     int  pf_depth;     // number of staging slots per backend (the target of the next binding)
@@ -3702,7 +3709,11 @@ static void ggml_backend_sched_prefetch_copy(ggml_backend_sched_t sched, int b, 
             // the copy callback may copy parts of the weight from device memory (e.g. a cache of MoE experts)
             if (sched->callback_copy == NULL ||
                 !sched->callback_copy(pf->copy_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
-                ggml_backend_tensor_set_async(pf->copy_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                // the source callback may supply the bytes from elsewhere (e.g. read ahead from the model file into pinned memory)
+                if (sched->callback_source == NULL ||
+                    !sched->callback_source(pf->copy_backend, input, input_cpy, 0, ggml_nbytes(input), sched->callback_source_user_data)) {
+                    ggml_backend_tensor_set_async(pf->copy_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                }
             }
         }
     }
@@ -4040,6 +4051,42 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     return st;
 }
 
+// the host weights read by the prefetched copies of the graph in the order ggml_backend_sched_prefetch_issue issues them
+// (same loop as the compute: the copies are issued before each split and after each prefetched split is queued)
+static void ggml_backend_sched_prefetch_plan(ggml_backend_sched_t sched) {
+    std::vector<const struct ggml_tensor *> & srcs = *sched->plan_srcs;
+    srcs.clear();
+    if (sched->pf_active) {
+        const int ahead = std::max(sched->pf_depth - 1, 1);
+        int issued[GGML_SCHED_MAX_BACKENDS]   = { 0 };
+        int consumed[GGML_SCHED_MAX_BACKENDS] = { 0 };
+        auto issue = [&]() {
+            for (int b = 0; b < sched->n_backends; b++) {
+                const struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+                while (issued[b] < pf->n_bound && issued[b] < consumed[b] + ahead) {
+                    const struct ggml_backend_sched_split * split = &sched->splits[pf->split_ids[issued[b]]];
+                    if (split->pf_async) {
+                        for (int j = 0; j < split->n_inputs; j++) {
+                            if (ggml_backend_sched_prefetch_is_bound(sched, split, split->inputs[j])) {
+                                srcs.push_back(split->inputs[j]);
+                            }
+                        }
+                    }
+                    issued[b]++;
+                }
+            }
+        };
+        for (int i = 0; i < sched->n_splits; i++) {
+            issue();
+            if (sched->splits[i].pf_ordinal >= 0) {
+                consumed[sched->splits[i].backend_id]++;
+                issue();
+            }
+        }
+    }
+    sched->callback_plan(srcs.data(), (int) srcs.size(), sched->callback_plan_user_data);
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sched_t sched) {
     struct ggml_backend_sched_split * splits = sched->splits;
 
@@ -4051,6 +4098,10 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
     ggml_backend_sched_prefetch_adapt(sched);
     sched->pf_runs++;
     bool timing[GGML_SCHED_MAX_BACKENDS] = { false };
+    if (sched->callback_plan != NULL) {
+        ggml_backend_sched_prefetch_plan(sched);
+    }
+
     for (int b = 0; b < sched->n_backends; b++) {
         struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
         // copies armed after the previous computation of this binding are already queued
@@ -4293,6 +4344,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     GGML_ASSERT(ggml_backend_dev_type(ggml_backend_get_device(backends[n_backends - 1])) == GGML_BACKEND_DEVICE_TYPE_CPU);
 
     struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
+    sched->plan_srcs = new std::vector<const struct ggml_tensor *>();
 
     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
@@ -4429,6 +4481,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->context_buffer);
     free(sched->graph.nodes);
     free(sched->graph.leafs);
+    delete sched->plan_srcs;
     free(sched);
 }
 
@@ -4610,6 +4663,18 @@ void ggml_backend_sched_set_lend_callback(ggml_backend_sched_t sched, ggml_backe
     }
     sched->callback_lend = callback;
     sched->callback_lend_user_data = user_data;
+}
+
+void ggml_backend_sched_set_prefetch_plan_callback(ggml_backend_sched_t sched, ggml_backend_sched_prefetch_plan_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_plan           = callback;
+    sched->callback_plan_user_data = user_data;
+}
+
+void ggml_backend_sched_set_prefetch_source_callback(ggml_backend_sched_t sched, ggml_backend_sched_prefetch_source_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_source           = callback;
+    sched->callback_source_user_data = user_data;
 }
 
 void ggml_backend_sched_set_prefetch_callback(ggml_backend_sched_t sched, ggml_backend_sched_prefetch_callback callback, void * user_data) {

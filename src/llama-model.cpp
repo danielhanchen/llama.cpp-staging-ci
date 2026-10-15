@@ -8,6 +8,11 @@
 #include "llama-prefetch.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-weight-store.h"
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -2031,6 +2036,53 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
+        }
+    }
+
+    // the file extents of the host weights read from the mapping, while the loader knows the file offsets (llama_weight_store)
+    if (use_mmap_buffer && !ml.mappings.empty()) {
+        auto ext = std::make_shared<llama_weight_extents>();
+        for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+            llama_weight_file f;
+            f.path = idx < ml.file_paths.size() ? ml.file_paths[idx] : std::string();
+            f.size = ml.files[idx]->size();
+            if (idx < ml.mappings.size() && ml.mappings[idx]) {
+                f.map_addr = (const uint8_t *) ml.mappings[idx]->addr();
+                f.map_size = ml.mappings[idx]->size();
+            }
+#ifndef _WIN32
+            if (f.path.empty()) {
+                f.fd = dup(ml.files[idx]->file_id());
+            }
+#endif
+            ext->files.push_back(f);
+        }
+        for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                if (t->data == nullptr || t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer) || t->view_src != nullptr) {
+                    continue;
+                }
+                const llama_model_loader::llama_tensor_weight * w = ml.get_weight(ggml_get_name(t));
+                if (w == nullptr || w->idx >= ext->files.size()) {
+                    continue;
+                }
+                const llama_weight_file & f = ext->files[w->idx];
+                // only the tensors read in place from the mapping (with mmap the host buffers are views of the file)
+                if (f.map_addr == nullptr || (const uint8_t *) t->data != f.map_addr + w->offs || w->offs + ggml_nbytes(t) > f.map_size) {
+                    continue;
+                }
+                llama_weight_extent e;
+                e.file = w->idx;
+                e.offs = w->offs;
+                e.size = ggml_nbytes(t);
+                e.lazy = ml.lazy.has(t);
+                ext->tensors.emplace(t, e);
+            }
+        }
+        if (!ext->tensors.empty()) {
+            weight_extents = std::move(ext);
+            LLAMA_LOG_DEBUG("%s: %zu mapped host tensors, %.1f MiB not lazy\n", __func__, weight_extents->tensors.size(),
+                    weight_extents->bytes_streamable()/1048576.0);
         }
     }
 

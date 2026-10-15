@@ -2530,6 +2530,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.moe_cache_size = params.moe_cache_size;
     cparams.ple_prefetch   = params.ple_prefetch;
 
+    cparams.weight_stream         = params.weight_stream;
+    cparams.weight_stream_io      = params.weight_stream_io;
+    cparams.weight_stream_threads = params.weight_stream_threads;
+    cparams.weight_stream_ram_mib = params.weight_stream_ram_mib;
+    cparams.moe_host_cache_mib    = params.moe_host_cache_mib;
+
     return cparams;
 }
 

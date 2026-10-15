@@ -1,0 +1,200 @@
+#pragma once
+
+// RAM tier of the MoE cache: a byte-budgeted set of slots in pinned host memory behind the device slots of llama_moe_cache, each slot
+// holds one expert of one layer for every expert tensor of the layer (a bundle, e.g. gate + up + down)
+// the copies are issued by the caller; this keeps the slots, their index, the eviction order and the events that guard the memory
+// exact: a slot only ever holds bytes read from the model files (verified with LLAMA_WEIGHT_STREAM_VERIFY=1) or copied back from a
+// device slot that holds them
+
+#include "ggml.h"
+#include "ggml-backend.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+enum llama_moe_host_policy {
+    LLAMA_MOE_HOST_INCLUSIVE = 0, // the RAM tier keeps what it reads, whether the device caches it or not
+    LLAMA_MOE_HOST_EXCLUSIVE = 1, // the RAM tier keeps the experts the device does not: device evictions move into it, promotions leave it
+};
+
+// whether and how big. Auto (host_mib < 0, not forced) needs the device slots to hold the experts of at least
+// LLAMA_MOE_HOST_MIN_TOKENS tokens (token_bytes: what one token routes over the streamed layers, n_expert_used experts each). Below that
+// nearly every routed expert misses the device, and with the exclusive policy every miss also evicts a device slot that is copied back
+// into RAM: the pinned slots then mostly replace the page cache the run had and the copies cost what the RAM hits save (L4, the experts of
+// 1.4 tokens on the device: 38% device hits, 84% RAM hits, SSD bytes -3..-5%, 28k copies back, decode after 8k -14%; the experts of 6.9
+// tokens: 71% device hits, SSD bytes -25%, 8k prompt -27%, decode +22..93%; 10.7 and 12.4 tokens: 8k prompt -48% / -40%)
+#define LLAMA_MOE_HOST_MIN_TOKENS 4
+
+struct llama_moe_host_plan {
+    bool        on       = false;
+    size_t      budget   = 0;
+    int         policy   = 1;    // llama_moe_host_policy
+    double      tokens   = 0.0;  // device slots / token_bytes
+    const char * why     = "";
+};
+
+// e_bytes: host bytes of the streamed experts, v_bytes: their device slots, mapped: every mapped host weight the page cache serves,
+// avail: MemAvailable, token_bytes: bytes one token routes over the streamed layers, host_mib: --moe-host-cache-mib (-1 auto, 0 off),
+// policy_env: -1 or a forced llama_moe_host_policy, force: LLAMA_MOE_HOST_CACHE=1 (the auto budget even below the device minimum)
+llama_moe_host_plan llama_moe_host_decide(size_t e_bytes, size_t v_bytes, size_t mapped, size_t avail, size_t token_bytes, int64_t host_mib,
+        int policy_env, bool force);
+
+class llama_moe_host_cache {
+public:
+    // layer_sizes[il]: bytes of one expert of each expert tensor of layer il (nb[2]), empty if the layer is not cached
+    // buft: host buffer type of the slots (pinned memory of the device, plain host memory in tests)
+    // the budget is split among the layouts like the experts, the slot memory is allocated in chunks when it is first needed
+    llama_moe_host_cache(ggml_backend_buffer_type_t buft, size_t budget, int policy, int32_t n_expert, const std::vector<std::vector<size_t>> & layer_sizes,
+            size_t chunk_size = 0);
+    ~llama_moe_host_cache();
+
+    llama_moe_host_cache(const llama_moe_host_cache &) = delete;
+    llama_moe_host_cache & operator=(const llama_moe_host_cache &) = delete;
+
+    bool    exclusive() const { return policy == LLAMA_MOE_HOST_EXCLUSIVE; }
+    int32_t n_slots() const;   // slots of the budget (allocated or not)
+    size_t  pinned_bytes() const { return bytes_alloc; }
+    size_t  budget_bytes() const { return budget; }
+    bool    caches(int32_t il) const { return il >= 0 && (size_t) il < layer_class.size() && layer_class[il] >= 0; }
+
+    // the slot of expert e of layer il if it holds the expert (a copy back from the device is waited for), -1 otherwise
+    // counts a use (decayed count) when touch
+    int32_t find(int32_t il, int32_t e, bool touch = true);
+    bool    contains(int32_t il, int32_t e) const; // also while it is being filled
+    int32_t slot_of_key(int32_t il, int32_t e) const { return caches(il) ? slot_of[il][e] : -1; }
+    // the slot if it holds the expert or a copy back into it is committed (not waited for), -1 otherwise
+    int32_t held(int32_t il, int32_t e) const;
+
+    // a slot for expert e of layer il (not held), being filled: evicts the expert with the lowest decayed count (CLOCK) that is not
+    // pinned, leased or being filled if no slot is free, and waits for the copies that still read the slot; -1 if none can be taken
+    // evict = false: only a free slot (or memory still in the budget)
+    int32_t reserve(int32_t il, int32_t e, bool evict = true);
+    void    publish(int32_t s);  // the slot holds its expert
+    void    abort(int32_t s);    // the slot is free again
+    void    release(int32_t s);  // drops the expert (exclusive promotion), the slot is reused once the copies that read it are done
+    void    release_key(int32_t il, int32_t e);
+
+    // memory of expert tensor ip of the slot: the area starts 4 KiB aligned, holds the expert at area + lead (lead < 4096) and has room
+    // for an unbuffered read of the expert at any lead
+    uint8_t * area(int32_t s, int ip) const;
+    size_t    area_size(int32_t s, int ip) const;
+    void      set_lead(int32_t s, int ip, size_t lead);
+    uint8_t * data(int32_t s, int ip) const; // area + lead
+    size_t    expert_size(int32_t s, int ip) const;
+    int       n_tensors(int32_t s) const;
+    int32_t   key(int32_t s) const { return slots[s].key; }
+
+    // experts routed by the current call: never evicted until the next begin_call
+    void begin_call();
+    void pin(int32_t s);
+
+    // the held experts the reads ahead of the current plan skip: never evicted until the next new_plan, which also drops the bundles
+    // that were being filled from the uploads of the plan and did not complete
+    void new_plan();
+    void lease(int32_t s);
+
+    // filling a slot from pieces (uploads of a prompt): bytes [off, off + n) of the expert of tensor ip; the slot is published once
+    // every tensor is complete; pieces must arrive in order per tensor, others are ignored; returns true when the slot completes
+    bool fill_piece(int32_t s, int ip, size_t off, const uint8_t * p, size_t n);
+    bool filling(int32_t s) const;
+
+    // events: the copies that read slots (mark_read) or write them (mark_write, e.g. device -> host) since the last commit are recorded
+    // on backend; a slot is reused or read by the host only after them
+    void mark_read(int32_t s);
+    void mark_write(int32_t s);
+    void commit(ggml_backend_t backend);
+
+    // generation of the held set, changes with every publish, release and eviction
+    uint64_t generation() const { return gen; }
+
+    struct stats {
+        uint64_t hits       = 0; // find() of a held expert
+        uint64_t misses     = 0; // find() of an expert not held
+        uint64_t reserved   = 0;
+        uint64_t evicted    = 0;
+        uint64_t no_slot    = 0; // reserve() failures
+        uint64_t published  = 0;
+        uint64_t aborted    = 0;
+        uint64_t released   = 0;
+        uint64_t waits      = 0; // event waits before a slot was reused or read
+        uint64_t alloc_fail = 0;
+        uint64_t alloc_us   = 0; // time spent allocating (pinning) slot memory
+        size_t   peak_held  = 0; // most slots holding an expert at once
+    };
+    stats st;
+
+    std::string describe() const;
+
+private:
+    enum slot_state : uint8_t { SLOT_FREE = 0, SLOT_FILLING = 1, SLOT_VALID = 2, SLOT_WRITING = 3 };
+
+    struct slot_t {
+        int32_t  key      = -1; // il*n_expert + e
+        uint8_t  state    = SLOT_FREE;
+        uint8_t  count    = 0;  // decayed use count (CLOCK)
+        uint8_t  done     = 0;  // fill_piece: mask of the complete tensors
+        uint8_t  pieces   = 0;  // the slot is filled from pieces
+        uint32_t pin      = 0;  // call epoch that pinned it
+        uint32_t lease_id = 0;  // plan that leased it
+        uint64_t read_seq  = 0; // last commit that reads it
+        uint64_t write_seq = 0; // last commit that writes it
+    };
+
+    struct klass {
+        std::vector<size_t> sizes;  // per tensor: bytes of one expert
+        std::vector<size_t> offs;   // per tensor: offset of its area in a slot
+        std::vector<size_t> caps;   // per tensor: area size
+        size_t  slot_bytes = 0;
+        int32_t first   = 0; // first slot id
+        int32_t n       = 0; // slots of the budget
+        int32_t n_alloc = 0; // slots with memory
+        int32_t per_chunk = 0;
+        int32_t hand    = 0; // CLOCK hand (relative)
+        std::vector<ggml_backend_buffer_t> chunks;
+        std::vector<int32_t> free_list;
+    };
+
+    struct inflight {
+        uint64_t seq;
+        ggml_backend_event_t ev;
+        ggml_backend_dev_t   dev;
+    };
+
+    ggml_backend_buffer_type_t buft;
+    size_t  budget;
+    int     policy;
+    int32_t n_expert;
+    size_t  chunk_size;
+
+    std::vector<int32_t> layer_class;              // [n_layer] class or -1
+    std::vector<std::vector<int32_t>> slot_of;     // [n_layer][n_expert] slot or -1
+    std::vector<klass>   classes;
+    std::vector<slot_t>  slots;
+    std::vector<int32_t> slot_class;
+    std::vector<uint16_t> leads;   // [slot][max_tensors]
+    std::vector<uint32_t> got;     // [slot][max_tensors] fill_piece progress
+    int max_tensors = 0;
+
+    uint32_t call_epoch = 1;
+    uint32_t plan_id    = 1;
+    uint64_t gen        = 0;
+    size_t   n_held     = 0;
+    size_t   bytes_alloc = 0;
+
+    uint64_t seq_next = 1;      // seq of the next commit
+    bool     marks    = false;  // marks since the last commit
+    std::deque<inflight> pending;
+    std::vector<int32_t> deferred; // released slots read by copies that are not committed yet
+    std::unordered_map<ggml_backend_dev_t, std::vector<ggml_backend_event_t>> ev_pool;
+    std::vector<ggml_backend_event_t> ev_all;
+    uint64_t seq_done = 0;      // every commit up to it is complete
+
+    bool alloc_chunk(klass & c);
+    void wait_seq(uint64_t seq);
+    void evict(int32_t s);
+    void set_key(int32_t s, int32_t key);
+};
