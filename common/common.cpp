@@ -1409,7 +1409,11 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             return false;
         }
     };
-    const auto measure = [&](uint32_t u) -> mem {
+    // the main context at ubatch u, with LLAMA_MOE_MEASURE_LENT as given (lent: the staging copies are not counted)
+    const auto measure_main = [&](uint32_t u, bool lent) -> mem {
+        if (!had_lent_env) {
+            common_set_env("LLAMA_MOE_MEASURE_LENT", lent ? "1" : "");
+        }
         llama_context_params cp = cparams;
         cp.n_ubatch = u;
         cp.n_batch  = std::max(cp.n_batch, u);
@@ -1426,18 +1430,47 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
                 m.compute += (int64_t) dmd[i].compute;
                 m.total   += (int64_t) (dmd[i].context + dmd[i].compute);
             }
-            // the draft context: counted in the total (the growth taken from the cache), not in the compute of the main context
-            int64_t dft = 0;
-            if (!measure_dft(u, dft)) {
-                return { -1, -1, 0 };
-            }
-            m.total += dft;
-            m.dft    = dft;
             return m;
         } catch (const std::exception & e) {
             COM_WRN("memory measure at n_ubatch = %u failed: %s\n", u, e.what());
             return { -1, -1, 0 };
         }
+    };
+    // the staging copies are left out only if the cache will lend them: LLAMA_MOE_CACHE_LEND=1/2, or unset and the copies are at least
+    // LLAMA_MOE_CACHE_LEND_MIN_FRAC (0.08) of the cache (see llama_moe_cache lend_decide); without lending they are an arena next to the cache
+    const char * env_lend = getenv("LLAMA_MOE_CACHE_LEND");
+    double lend_min_frac = 0.08;
+    if (const char * e = getenv("LLAMA_MOE_CACHE_LEND_MIN_FRAC")) {
+        lend_min_frac = std::max(0.0, atof(e));
+    }
+    const auto measure = [&](uint32_t u) -> mem {
+        mem m = measure_main(u, true);
+        if (m.total < 0) {
+            return m;
+        }
+        if (!had_lent_env) {
+            const mem m_full = measure_main(u, false);
+            if (m_full.total < 0) {
+                return m_full;
+            }
+            const int64_t staging = std::max<int64_t>(0, m_full.compute - m.compute);
+            const bool lends = env_lend != nullptr ? atoi(env_lend) != 0 : (double) staging >= lend_min_frac*(double) params.moe_cache_size;
+            if (!lends) {
+                m = m_full;
+            }
+        }
+        // the draft context, with its staging copies (an MTP context lends little: its own cache holds the experts of one layer): counted
+        // in the total (the growth taken from the cache), not in the compute of the main context
+        if (!had_lent_env) {
+            common_set_env("LLAMA_MOE_MEASURE_LENT", "");
+        }
+        int64_t dft = 0;
+        if (!measure_dft(u, dft)) {
+            return { -1, -1, 0 };
+        }
+        m.total += dft;
+        m.dft    = dft;
+        return m;
     };
     struct lent_env_reset {
         bool had;
