@@ -1410,10 +1410,13 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             return false;
         }
     };
-    // the main context at ubatch u, with LLAMA_MOE_MEASURE_LENT as given (lent: the staging copies are not counted)
+    // the main context at ubatch u, with LLAMA_MOE_MEASURE_LENT as given (lent: the staging copies are not counted); both count the seed graph
+    // (LLAMA_MOE_MEASURE_LENT=2 keeps the staging copies), so their difference is the staging: without the seed graph the measure with
+    // the copies could come out smaller than the lent one (gemma-4 26B-A4B at n_ubatch 512: 187 vs 520 MiB), the copies looked like 0 MiB,
+    // the cache seemed not to lend (it lends 22% of itself) and 280 MiB more than the device needs were taken from the cache
     const auto measure_main = [&](uint32_t u, bool lent) -> mem {
         if (!had_lent_env) {
-            common_set_env("LLAMA_MOE_MEASURE_LENT", lent ? "1" : "");
+            common_set_env("LLAMA_MOE_MEASURE_LENT", lent ? "1" : "2");
         }
         llama_context_params cp = cparams;
         cp.n_ubatch = u;

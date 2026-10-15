@@ -1015,10 +1015,13 @@ void llama_context::sched_reserve() {
     // than the pp graph (a prompt ubatch that seeds the cache holds the expert copies of its cached layers in the graph allocation), which
     // a context with room for it reserves (see sched_reserve_seed). Measured with the staging and without the seed, the growth from
     // n_ubatch 512 to 2048 was 390 MiB where the device sees 254 (Qwen3.6 UD-Q4_K_XL) and 794 where it sees 548 (gemma-4 26B-A4B)
-    if (model.hparams.no_alloc && getenv("LLAMA_MOE_MEASURE_LENT") != nullptr && atoi(getenv("LLAMA_MOE_MEASURE_LENT")) != 0) {
+    // LLAMA_MOE_MEASURE_LENT=2 counts the same with the staging copies (an arena next to the cache when the cache does not lend them)
+    const int measure_lent = model.hparams.no_alloc && getenv("LLAMA_MOE_MEASURE_LENT") != nullptr ? atoi(getenv("LLAMA_MOE_MEASURE_LENT")) : 0;
+    if (measure_lent != 0) {
+        const bool keep_staging = measure_lent == 2;
         std::vector<size_t> graph_sz(backend_ptrs.size());
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-            graph_sz[i] = backend_buf_exp_size[i] - std::min(backend_buf_exp_size[i], staging_pp[i]);
+            graph_sz[i] = backend_buf_exp_size[i] - (keep_staging ? 0 : std::min(backend_buf_exp_size[i], staging_pp[i]));
         }
         if (moe_cache && moe_cache_seed_sync && n_tokens > llama_moe_cache::n_small_max && (int64_t) n_tokens >= prefetch_min_batch) {
             std::vector<size_t> sizes(backend_ptrs.size(), 0);
@@ -1026,7 +1029,7 @@ void llama_context::sched_reserve() {
             graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), /*split_only =*/ true, sizes.data());
             moe_cache_seed = false;
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-                const size_t st = std::min(sizes[i], ggml_backend_sched_get_staging_size(sched.get(), backend_ptrs[i]));
+                const size_t st = keep_staging ? 0 : std::min(sizes[i], ggml_backend_sched_get_staging_size(sched.get(), backend_ptrs[i]));
                 graph_sz[i] = std::max(graph_sz[i], sizes[i] - st);
             }
         }
