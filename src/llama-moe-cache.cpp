@@ -405,6 +405,7 @@ struct llama_moe_cache::impl {
         size_t buf_size = 0;
 
         int lend_auto = -1; // automatic lending (LLAMA_MOE_CACHE_LEND unset): -1 not decided yet, 0 off, 1 on
+        size_t dry_need = 0; // the largest staging need a measurement (dry lend) asked for, see lend_need_max
     };
 
     // LLAMA_MOE_CACHE_SEED_CHECK=1: after each seeding ubatch, compare the seeded slots with the host experts (debug)
@@ -2226,6 +2227,7 @@ struct llama_moe_cache::impl {
         const double frac = cache > 0 ? (double) need/cache : 1.0;
         bool on = frac >= lend_min_frac;
         if (dry) {
+            d.dry_need = std::max(d.dry_need, need);
             // a measurement (e.g. for --fit) counts the memory with lending: when the device is short of memory the cache lends anyway
             return true;
         }
@@ -3212,6 +3214,14 @@ bool llama_moe_cache::lends() const {
 
 bool llama_moe_cache::lends_graph() const {
     return pimpl->lend_mode == 2;
+}
+
+size_t llama_moe_cache::lend_need_max() const {
+    size_t need = 0;
+    for (const auto & d : pimpl->devices) {
+        need = std::max(need, d.dry_need);
+    }
+    return need;
 }
 
 int64_t llama_moe_cache::n_tokens_cached() const {

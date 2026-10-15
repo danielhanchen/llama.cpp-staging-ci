@@ -1017,8 +1017,7 @@ void llama_context::sched_reserve() {
     // n_ubatch 512 to 2048 was 390 MiB where the device sees 254 (Qwen3.6 UD-Q4_K_XL) and 794 where it sees 548 (gemma-4 26B-A4B)
     // LLAMA_MOE_MEASURE_LENT=auto:<bytes>: lent only if the staging copies are at least <bytes>, the share of the cache from which the cache
     // lends them (LLAMA_MOE_CACHE_LEND_MIN_FRAC, see llama_moe_cache lend_decide); else the copies stay in the measure, as an arena next to it.
-    // The copies are those of the pp graph or, when only the seed graph binds them (gemma-4 26B-A4B: none in the pp graph, 454 MiB in the
-    // seed graph), of the seed graph
+    // The copies are those the cache was asked to lend (a measurement always lends them, the arenas stay empty) or those of an arena
     const char * measure_env  = model.hparams.no_alloc ? getenv("LLAMA_MOE_MEASURE_LENT") : nullptr;
     const bool   measure_auto = measure_env != nullptr && strncmp(measure_env, "auto:", 5) == 0;
     int          measure_lent = measure_env != nullptr && !measure_auto ? atoi(measure_env) : 0;
@@ -1036,7 +1035,8 @@ void llama_context::sched_reserve() {
         }
         if (measure_auto) {
             const size_t min_bytes = (size_t) strtoull(measure_env + 5, nullptr, 10);
-            size_t staging = 0;
+            // the cache lends in a measurement (dry), which leaves no staging in the arena: the copies are what it was asked to lend
+            size_t staging = moe_cache ? moe_cache->lend_need_max() : 0;
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
                 staging = std::max({ staging, staging_pp[i], staging_seed[i] });
             }
