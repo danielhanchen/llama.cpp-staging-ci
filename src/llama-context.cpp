@@ -1016,36 +1016,45 @@ void llama_context::sched_reserve() {
     // a context with room for it reserves (see sched_reserve_seed). Measured with the staging and without the seed, the growth from
     // n_ubatch 512 to 2048 was 390 MiB where the device sees 254 (Qwen3.6 UD-Q4_K_XL) and 794 where it sees 548 (gemma-4 26B-A4B)
     // LLAMA_MOE_MEASURE_LENT=auto:<bytes>: lent only if the staging copies are at least <bytes>, the share of the cache from which the cache
-    // lends them (LLAMA_MOE_CACHE_LEND_MIN_FRAC, see llama_moe_cache lend_decide); else the copies stay in the measure, as an arena next to it
+    // lends them (LLAMA_MOE_CACHE_LEND_MIN_FRAC, see llama_moe_cache lend_decide); else the copies stay in the measure, as an arena next to it.
+    // The copies are those of the pp graph or, when only the seed graph binds them (gemma-4 26B-A4B: none in the pp graph, 454 MiB in the
+    // seed graph), of the seed graph
     const char * measure_env  = model.hparams.no_alloc ? getenv("LLAMA_MOE_MEASURE_LENT") : nullptr;
-    int          measure_lent = measure_env != nullptr ? atoi(measure_env) : 0;
-    if (measure_env != nullptr && strncmp(measure_env, "auto:", 5) == 0) {
-        const size_t min_bytes = (size_t) strtoull(measure_env + 5, nullptr, 10);
-        size_t staging = 0;
-        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-            staging = std::max(staging, staging_pp[i]);
-        }
-        measure_lent = staging > 0 && staging >= min_bytes ? 1 : 0;
-    }
-    if (measure_lent != 0) {
-        std::vector<size_t> graph_sz(backend_ptrs.size());
-        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-            graph_sz[i] = backend_buf_exp_size[i] - std::min(backend_buf_exp_size[i], staging_pp[i]);
-        }
-        if (moe_cache && moe_cache_seed_sync && n_tokens > llama_moe_cache::n_small_max && (int64_t) n_tokens >= prefetch_min_batch) {
-            std::vector<size_t> sizes(backend_ptrs.size(), 0);
+    const bool   measure_auto = measure_env != nullptr && strncmp(measure_env, "auto:", 5) == 0;
+    int          measure_lent = measure_env != nullptr && !measure_auto ? atoi(measure_env) : 0;
+    if (measure_env != nullptr && (measure_lent != 0 || measure_auto)) {
+        const bool seeds = moe_cache && moe_cache_seed_sync && n_tokens > llama_moe_cache::n_small_max && (int64_t) n_tokens >= prefetch_min_batch;
+        std::vector<size_t> sizes(backend_ptrs.size(), 0);
+        std::vector<size_t> staging_seed(backend_ptrs.size(), 0);
+        if (seeds) {
             moe_cache_seed = true;
             graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), /*split_only =*/ true, sizes.data());
             moe_cache_seed = false;
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-                const size_t st = std::min(sizes[i], ggml_backend_sched_get_staging_size(sched.get(), backend_ptrs[i]));
-                graph_sz[i] = std::max(graph_sz[i], sizes[i] - st);
+                staging_seed[i] = std::min(sizes[i], ggml_backend_sched_get_staging_size(sched.get(), backend_ptrs[i]));
             }
         }
-        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-            LLAMA_LOG_DEBUG("%s: %s: measure: compute %.2f MiB (pp with staging), %.2f MiB lent\n", __func__, ggml_backend_buft_name(backend_buft[i]),
-                backend_buf_exp_size[i]/1024.0/1024.0, graph_sz[i]/1024.0/1024.0);
-            backend_buf_exp_size[i] = graph_sz[i];
+        if (measure_auto) {
+            const size_t min_bytes = (size_t) strtoull(measure_env + 5, nullptr, 10);
+            size_t staging = 0;
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                staging = std::max({ staging, staging_pp[i], staging_seed[i] });
+            }
+            measure_lent = staging > 0 && staging >= min_bytes ? 1 : 0;
+            LLAMA_LOG_DEBUG("%s: measure: staging copies %.2f MiB, the cache lends from %.2f MiB: %s\n", __func__, staging/1024.0/1024.0,
+                min_bytes/1024.0/1024.0, measure_lent ? "lent" : "counted");
+        }
+        if (measure_lent != 0) {
+            std::vector<size_t> graph_sz(backend_ptrs.size());
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                graph_sz[i] = backend_buf_exp_size[i] - std::min(backend_buf_exp_size[i], staging_pp[i]);
+                if (seeds) {
+                    graph_sz[i] = std::max(graph_sz[i], sizes[i] - staging_seed[i]);
+                }
+                LLAMA_LOG_DEBUG("%s: %s: measure: compute %.2f MiB (pp with staging), %.2f MiB lent\n", __func__, ggml_backend_buft_name(backend_buft[i]),
+                    backend_buf_exp_size[i]/1024.0/1024.0, graph_sz[i]/1024.0/1024.0);
+                backend_buf_exp_size[i] = graph_sz[i];
+            }
         }
     }
 
