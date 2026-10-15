@@ -3964,6 +3964,83 @@ static int ggml_cuda_try_fuse_ew_chain(ggml_backend_cuda_context * cuda_ctx, ggm
     return n - 1;
 }
 
+// elementwise chain -> DSV4_HC_POST (no comb) where the chain computes the post weights: one kernel, the chain applied to the
+// weight each thread reads. Returns the number of extra nodes covered (0 = no fusion).
+// GGML_CUDA_DISABLE_HC_POST_CHAIN_FUSION=1 turns it off.
+static int ggml_cuda_try_fuse_hc_post_chain(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_HC_POST_CHAIN_FUSION");
+    if (disabled) {
+        return 0;
+    }
+
+    const auto chain_node_ok = [&](const ggml_tensor * t) {
+        return ggml_cuda_ew_chain_op_code(t) >= 0 && t->type == GGML_TYPE_F32 && t->src[0] != nullptr &&
+               t->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_is_contiguous(t->src[0]) &&
+               ggml_are_same_shape(t, t->src[0]) && (t->flags & GGML_TENSOR_FLAG_COMPUTE);
+    };
+
+    if (!chain_node_ok(cgraph->nodes[i])) {
+        return 0;
+    }
+    int n_chain = 1;
+    while (n_chain < GGML_CUDA_EW_CHAIN_MAX && i + n_chain < cgraph->n_nodes && chain_node_ok(cgraph->nodes[i + n_chain]) &&
+           cgraph->nodes[i + n_chain]->src[0] == cgraph->nodes[i + n_chain - 1]) {
+        n_chain++;
+    }
+    const int ip = i + n_chain;
+    if (ip >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * hc_post = cgraph->nodes[ip];
+    if (hc_post->op != GGML_OP_DSV4_HC_POST || hc_post->src[3] != nullptr || hc_post->src[2] != cgraph->nodes[ip - 1] ||
+        !(hc_post->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        return 0;
+    }
+    for (int j = i; j < ip; ++j) {
+        if (!ggml_node_has_n_uses(cgraph, j, 1) || (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+    }
+
+    const ggml_tensor * x        = hc_post->src[0];
+    const ggml_tensor * residual = hc_post->src[1];
+    const ggml_tensor * post_src = cgraph->nodes[i]->src[0];
+    for (const ggml_tensor * t : { x, residual, post_src, (const ggml_tensor *) hc_post }) {
+        if (t->type != GGML_TYPE_F32 || t->data == nullptr) {
+            return 0;
+        }
+    }
+    const int64_t hc       = residual->ne[1];
+    const int64_t n_tokens = x->ne[1];
+    if (post_src->ne[0] != hc || ggml_nelements(post_src) != hc*n_tokens) {
+        return 0;
+    }
+    // the chain source is read by every thread while others write the output: they must not overlap
+    {
+        const char * a0 = (const char *) hc_post->data;
+        const char * b0 = (const char *) post_src->data;
+        if (a0 < b0 + ggml_nbytes(post_src) && b0 < a0 + ggml_nbytes(hc_post)) {
+            return 0;
+        }
+    }
+
+    ggml_cuda_ew_chain chain{};
+    chain.n_ops = n_chain;
+    for (int j = 0; j < n_chain; ++j) {
+        const ggml_tensor * t = cgraph->nodes[i + j];
+        chain.op[j] = ggml_cuda_ew_chain_op_code(t);
+        chain.p0[j] = 0.0f;
+        chain.p1[j] = 0.0f;
+        if (t->op == GGML_OP_SCALE || t->op == GGML_OP_CLAMP) {
+            memcpy(&chain.p0[j], (const float *) t->op_params + 0, sizeof(float));
+            memcpy(&chain.p1[j], (const float *) t->op_params + 1, sizeof(float));
+        }
+    }
+
+    ggml_cuda_op_hc_post_chain(*cuda_ctx, chain, post_src, hc_post);
+    return n_chain;
+}
+
 // UNARY(gate) -> MUL(x, gate) where gate has one element per row of x: shared expert gates
 static bool ggml_cuda_try_fuse_unary_mul_gate(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_GATE_MUL_FUSION");
@@ -4838,6 +4915,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_UNARY && ggml_cuda_try_fuse_unary_mul_gate(cuda_ctx, cgraph, i)) {
         return 1;
+    }
+
+    if (const int n_skip = ggml_cuda_try_fuse_hc_post_chain(cuda_ctx, cgraph, i); n_skip > 0) {
+        return n_skip;
     }
 
     if (const int n_skip = ggml_cuda_try_fuse_ew_chain(cuda_ctx, cgraph, i); n_skip > 0) {

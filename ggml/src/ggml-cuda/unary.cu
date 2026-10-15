@@ -947,6 +947,71 @@ void ggml_cuda_op_ew_chain(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     ggml_cuda_kernel_launch(ew_chain_f32_kernel, launch_params, (const float *) src->data, (float *) dst->data, k, chain);
 }
 
+/* elementwise chain -> DSV4_HC_POST (no comb): the chain that turns the injection logits into the post weights (2*sigmoid(x/hc)
+   in qwen4exp) is applied once per (stream, token) row, with the expressions of ew_chain_f32_kernel, and the update itself is
+   the expression of dsv4_hc_post_f32<false>, so the output is bit-identical to the unfused sequence. One block row (y) per
+   (stream, token) row, so the chain runs once per block and the per-element work is that of dsv4_hc_post_f32. */
+static __global__ void hc_post_chain_f32(
+        const float * x, const float * residual, const float * post, const ggml_cuda_ew_chain chain, float * dst,
+        const int64_t n_embd, const int64_t hc, const int64_t n_tokens,
+        const int64_t sx0, const int64_t sx1, const int64_t sr0, const int64_t sr1, const int64_t sr2,
+        const int64_t sd0, const int64_t sd1, const int64_t sd2) {
+    ggml_cuda_pdl_lc();
+    __shared__ float wv_s;
+    const int64_t i0 = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+
+    for (int64_t r = blockIdx.y; r < hc*n_tokens; r += gridDim.y) {
+        const int64_t idst = r % hc;
+        const int64_t it   = r / hc;
+
+        if (threadIdx.x == 0) {
+            // the chain source is contiguous [hc, n_tokens], as ew_chain_f32_kernel reads it
+            float wv = post[r];
+            // constant indices: a dynamically indexed parameter struct is copied to the stack by every thread
+#pragma unroll
+            for (int j = 0; j < GGML_CUDA_EW_CHAIN_MAX; ++j) {
+                if (j < chain.n_ops) {
+                    wv = ew_chain_apply(chain.op[j], chain.p0[j], chain.p1[j], wv);
+                }
+            }
+            wv_s = wv;
+        }
+        __syncthreads();
+        const float wv = wv_s;
+        if (i0 < n_embd) {
+            float sum = x[i0*sx0 + it*sx1] * wv;
+            sum += residual[i0*sr0 + idst*sr1 + it*sr2];
+            dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
+        }
+        __syncthreads(); // wv_s is rewritten for the next row
+    }
+}
+
+void ggml_cuda_op_hc_post_chain(ggml_backend_cuda_context & ctx, const ggml_cuda_ew_chain & chain, const ggml_tensor * post_src,
+        ggml_tensor * hc_post) {
+    const ggml_tensor * x        = hc_post->src[0];
+    const ggml_tensor * residual = hc_post->src[1];
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t n_tokens = x->ne[1];
+    const int64_t hc       = residual->ne[1];
+    GGML_ASSERT(ggml_is_contiguous(post_src) && ggml_nelements(post_src) == hc*n_tokens);
+
+    const int block_size = 256;
+    const dim3 block_dims(block_size, 1, 1);
+    const dim3 grid_dims((n_embd + block_size - 1) / block_size, (unsigned) std::min<int64_t>(hc*n_tokens, 65535), 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+
+    ggml_cuda_kernel_launch(hc_post_chain_f32, launch_params,
+        (const float *) x->data, (const float *) residual->data, (const float *) post_src->data, chain, (float *) hc_post->data,
+        n_embd, hc, n_tokens,
+        (int64_t) (x->nb[0] / sizeof(float)), (int64_t) (x->nb[1] / sizeof(float)),
+        (int64_t) (residual->nb[0] / sizeof(float)), (int64_t) (residual->nb[1] / sizeof(float)), (int64_t) (residual->nb[2] / sizeof(float)),
+        (int64_t) (hc_post->nb[0] / sizeof(float)), (int64_t) (hc_post->nb[1] / sizeof(float)), (int64_t) (hc_post->nb[2] / sizeof(float)));
+}
+
 /* fused unary + mul with a one-element-per-row gate */
 
 template <float (*op)(float)>

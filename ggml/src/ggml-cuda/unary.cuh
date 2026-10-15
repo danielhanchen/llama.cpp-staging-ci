@@ -118,6 +118,10 @@ void ggml_cuda_op_ew_chain(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 bool ggml_cuda_unary_mul_gate_supported(const ggml_tensor * unary_node);
 void ggml_cuda_op_unary_mul_gate(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
 
+// [chain ->] DSV4_HC_POST(x, residual, post) without comb: post = chain(post_src), applied by the hc_post kernel itself
+void ggml_cuda_op_hc_post_chain(ggml_backend_cuda_context & ctx, const ggml_cuda_ew_chain & chain, const ggml_tensor * post_src,
+        ggml_tensor * hc_post);
+
 // MUL(UNARY(ADD(a, bias)), scale) with bias and scale one ne0-row each, e.g. the delta-net alpha gate
 void ggml_cuda_op_add_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * unary_node, ggml_tensor * mul_node);
 
