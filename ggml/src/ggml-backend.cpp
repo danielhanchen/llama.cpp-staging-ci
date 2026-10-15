@@ -2839,10 +2839,13 @@ static bool ggml_backend_sched_prefetch_ensure(ggml_backend_sched_t sched, int b
         return true;
     }
 
-    if (pf->arena != NULL && pf->arena_size >= pf->staging && !(pf->shrink && pf->arena_size > pf->staging)) {
+    // a binding with only SYNC copies reuses the arena kept from an earlier graph: only an async binding gives the larger arena back
+    if (pf->arena != NULL && pf->arena_size >= pf->staging && !(pf->shrink && pf->n_async > 0 && pf->arena_size > pf->staging)) {
         return true;
     }
-    pf->shrink = false;
+    if (pf->n_async > 0) {
+        pf->shrink = false;
+    }
 
     // a step of the adaptive depth grows the arena past the memory reserved for the graph: only with headroom left on the device for the
     // memory the backends allocate while computing (e.g. the CUDA pool, GGML_SCHED_PREFETCH_ADAPT_HEADROOM_MIB, default 512), else this
@@ -3181,7 +3184,7 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
     }
 
     // only SYNC copies and no arena to reuse: the graph allocator holds them (e.g. prefetch disabled by the threshold), no arena is created for them
-    // (decided before the lending below, so that the user is not asked to place copies that are not bound)
+    // (before the lend below, which then neither measures nor places them)
     for (int b = 0; b < sched->n_backends; b++) {
         struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
         if (pf->n_bound > 0 && pf->n_async == 0 && (dry || pf->arena == NULL)) {
@@ -3189,6 +3192,7 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
                 sched->splits[pf->split_ids[k]].pf_ordinal = -1;
             }
             pf->n_bound = 0;
+            pf->need    = 0;
         }
     }
 
@@ -3380,18 +3384,14 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
     // arena size: two consecutive splits are live at once with depth = 2 (the copy of k + 1 overlaps the compute of k)
     for (int b = 0; b < sched->n_backends; b++) {
         struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
-        if (pf->n_async == 0) {
-            // the SYNC copies of a split are made on the compute stream after the previous split, so all of them can use the same slot
-            // the arena of an earlier graph holds them: the graph allocator never stages the same weights next to it (e.g. small batches, the ubatch that seeds the MoE cache)
-            // (a graph with only SYNC copies and no arena to reuse was unbound before the lending above)
-            for (int k = 0; k < pf->n_bound; k++) {
-                pf->need = std::max(pf->need, sched->splits[pf->split_ids[k]].pf_size);
-            }
-            pf->staging = pf->need;
-            continue;
-        }
         for (int k = 0; k < pf->n_bound; k++) {
             pf->need = std::max(pf->need, sched->splits[pf->split_ids[k]].pf_size);
+        }
+        if (pf->n_bound > 0 && pf->n_async == 0) {
+            // the SYNC copies of a split are made on the compute stream after the previous split, so all of them can use the same slot
+            // the arena of an earlier graph holds them: the graph allocator never stages the same weights next to it (e.g. small batches, the ubatch that seeds the MoE cache)
+            pf->staging = pf->need;
+            continue;
         }
         pf->staging = ggml_backend_sched_prefetch_staging(sched, b);
     }
@@ -3421,6 +3421,12 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         // like the graph allocator, release the per-tensor state of the previous graph (e.g. tensor extras)
         if (!dry && pf->arena != NULL) {
             ggml_backend_buffer_reset(pf->arena);
+        }
+
+        // only SYNC copies: they are written on the compute stream, which does not wait for the copy queue (e.g. the copies armed for another binding)
+        if (!dry && pf->n_async == 0 && pf->pending && pf->copy_backend != NULL) {
+            ggml_backend_synchronize(pf->copy_backend);
+            pf->pending = false;
         }
 
         if (!dry && pf->lent != pf->lent_prev) {
