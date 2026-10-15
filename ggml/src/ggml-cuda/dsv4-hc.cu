@@ -145,6 +145,75 @@ static __global__ void dsv4_hc_pre_f32(
     dst[i0*sd0 + it*sd1] = scale * sum;
 }
 
+// dsv4_hc_pre_f32 for a contiguous dst, plus the q8_1 copy of dst (rows of n_embd values padded to n_embd_padded) for the
+// mul_mat_vec_q consumers: value ir of the padded rows is computed and quantized by thread ir, as quantize_q8_1 does it
+// (one value per lane, the same 32-lane reductions; n_embd_padded % QK8_1 == 0), so both outputs are bit-identical to the
+// unfused dsv4_hc_pre + quantize_q8_1 sequence
+template <bool gated>
+static __global__ void dsv4_hc_pre_q8_1_f32(
+        const float * x,
+        const float * weights,
+        float * dst,
+        void * vq,
+        int64_t n_embd,
+        int64_t n_embd_padded,
+        int64_t hc,
+        int64_t n_tokens,
+        int64_t sx0,
+        int64_t sx1,
+        int64_t sx2,
+        int64_t sw0,
+        int64_t sw1,
+        int64_t sw2,
+        float   scale) {
+    ggml_cuda_pdl_lc();
+    const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t nr = n_embd_padded * n_tokens;
+
+    if (ir >= nr) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+
+    const int64_t i0 = ir % n_embd_padded;
+    const int64_t it = ir / n_embd_padded;
+
+    float xi = 0.0f;
+    if (i0 < n_embd) {
+        float sum = 0.0f;
+        for (int64_t ih = 0; ih < hc; ++ih) {
+            const float xv = x[i0*sx0 + ih*sx1 + it*sx2];
+            float wv;
+            if constexpr (gated) {
+                wv = 1.0f / (1.0f + expf(-weights[i0*sw0 + ih*sw1 + it*sw2]));
+            } else {
+                wv = weights[ih*sw0 + it*sw1];
+            }
+            sum += xv * wv;
+        }
+        xi = scale * sum;
+        dst[it*n_embd + i0] = xi;
+    }
+
+    float amax = fabsf(xi);
+    float qsum = xi;
+
+    amax = warp_reduce_max<QK8_1>(amax);
+    qsum = warp_reduce_sum<QK8_1>(qsum);
+
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    block_q8_1 * y = (block_q8_1 *) vq;
+    const int64_t ib  = ir / QK8_1;
+    const int     iqs = ir % QK8_1;
+    y[ib].qs[iqs] = q;
+    if (iqs == 0) {
+        y[ib].ds = make_half2(d, qsum);
+    }
+}
+
 template <bool has_comb>
 static __global__ void dsv4_hc_post_f32(
         const float * x,
@@ -261,6 +330,30 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const dim3 block_dims(block_size, 1, 1);
     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+
+    // a mul_mat_vec_q reads dst: write its q8_1 copy in the same kernel (see ggml_cuda_q8_1_cache)
+    ggml_cuda_q8_1_cache & cache = ctx.q8_1_cache;
+    if (cache.active() && ctx.curr_stream_no == 0 && cache.norm_targets.count(dst) && ggml_is_contiguous(dst) &&
+        (n_tokens == 1 || n_embd % MATRIX_ROW_PADDING == 0)) {
+        const int64_t n_embd_padded = GGML_PAD(n_embd, MATRIX_ROW_PADDING);
+        int64_t key[ggml_cuda_q8_1_cache::n_key];
+        ggml_cuda_q8_1_cache::key_contiguous(n_embd, n_tokens, key);
+        void * q8_1_out = cache.reserve(dst->data, ggml_nbytes(dst), key, n_tokens*n_embd_padded/QK8_1*sizeof(block_q8_1));
+        if (q8_1_out != nullptr) {
+            static_assert(256 % QK8_1 == 0, "a warp must cover whole q8_1 blocks");
+            const int64_t nrq = n_embd_padded * n_tokens;
+            const dim3 grid_q((nrq + block_size - 1) / block_size, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params_q = ggml_cuda_kernel_launch_params(grid_q, block_dims, 0, ctx.stream());
+            auto kernel_q = gated ? dsv4_hc_pre_q8_1_f32<true> : dsv4_hc_pre_q8_1_f32<false>;
+            ggml_cuda_kernel_launch(kernel_q, launch_params_q,
+                    (const float *) x->data, (const float *) weights->data, (float *) dst->data, q8_1_out,
+                    n_embd, n_embd_padded, hc, n_tokens,
+                    nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
+                    nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
+                    scale);
+            return;
+        }
+    }
 
     auto kernel = gated ? dsv4_hc_pre_f32<true> : dsv4_hc_pre_f32<false>;
     ggml_cuda_kernel_launch(kernel, launch_params,

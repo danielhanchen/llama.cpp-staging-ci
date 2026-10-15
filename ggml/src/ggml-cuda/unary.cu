@@ -885,13 +885,63 @@ static __global__ void ew_chain_f32_kernel(const float * x, float * dst, const i
     dst[i] = v;
 }
 
-void ggml_cuda_op_ew_chain(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst, const ggml_cuda_ew_chain & chain) {
+// ew_chain_f32_kernel plus the q8_1 copy of the output: element i is computed and quantized by thread i, as quantize_q8_1
+// does it (one value per lane, the same 32-lane reductions; CUDA_NEG_BLOCK_SIZE % QK8_1 == 0), padding values are 0
+static __global__ void ew_chain_q8_1_f32_kernel(const float * x, float * dst, void * vq, const int64_t k, const int64_t kq,
+        const ggml_cuda_ew_chain chain) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= kq) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    float v = 0.0f;
+    if (i < k) {
+        v = x[i];
+#pragma unroll 1
+        for (int j = 0; j < chain.n_ops; ++j) {
+            v = ew_chain_apply(chain.op[j], chain.p0[j], chain.p1[j], v);
+        }
+        dst[i] = v;
+    }
+
+    float amax = fabsf(v);
+    float sum  = v;
+
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+
+    block_q8_1 * y = (block_q8_1 *) vq;
+    const int64_t ib  = i / QK8_1;
+    const int     iqs = i % QK8_1;
+    y[ib].qs[iqs] = q;
+    if (iqs == 0) {
+        y[ib].ds = make_half2(d, sum);
+    }
+}
+
+void ggml_cuda_op_ew_chain(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst, const ggml_cuda_ew_chain & chain,
+        void * q8_1_out) {
     GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
     GGML_ASSERT(ggml_nelements(src) == ggml_nelements(dst));
     GGML_ASSERT(chain.n_ops > 0 && chain.n_ops <= GGML_CUDA_EW_CHAIN_MAX);
 
     const int64_t k = ggml_nelements(dst);
+    if (q8_1_out != nullptr) {
+        static_assert(CUDA_NEG_BLOCK_SIZE % QK8_1 == 0, "a warp must cover whole q8_1 blocks");
+        GGML_ASSERT(ggml_nrows(dst) == 1 || dst->ne[0] % MATRIX_ROW_PADDING == 0);
+        const int64_t kq = ggml_nrows(dst) * GGML_PAD(dst->ne[0], MATRIX_ROW_PADDING);
+        const int64_t num_blocks = (kq + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+        ggml_cuda_kernel_launch(ew_chain_q8_1_f32_kernel, launch_params, (const float *) src->data, (float *) dst->data, q8_1_out, k, kq, chain);
+        return;
+    }
     const int64_t num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
     ggml_cuda_kernel_launch(ew_chain_f32_kernel, launch_params, (const float *) src->data, (float *) dst->data, k, chain);

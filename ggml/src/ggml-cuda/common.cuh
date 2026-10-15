@@ -1464,7 +1464,7 @@ struct ggml_cuda_q8_1_cache {
     int    next      = 0;
     int    pending   = -1; // slot reserved by a producer, see reserve()
     entry  entries[n_slots];
-    std::unordered_set<const void *> norm_targets; // RMS_NORM + MUL outputs read by a mul_mat_vec_q candidate
+    std::unordered_set<const void *> norm_targets; // producer tensors whose kernel writes the q8_1 copy (see ggml_cuda_q8_1_cache_slot_size)
 
     bool active() const {
         return arena != nullptr;
@@ -1546,6 +1546,38 @@ struct ggml_cuda_q8_1_cache {
         for (entry & e : entries) {
             e.valid = false;
         }
+    }
+
+    // key of a contiguous activation of nrows rows of ne10 values. When ne10 is a multiple of MATRIX_ROW_PADDING the rows
+    // carry no padding, so the q8_1 copy only depends on the number of values: [ne10, nrows] and its reshape
+    // [ne10*nrows, 1] (e.g. a grouped norm over hc streams read as one hc*n_embd row) share one copy.
+    // GGML_CUDA_DISABLE_Q8_1_RESHAPE=1 keys them apart again.
+    static bool reshape_disabled() {
+        static const bool disabled = [] {
+            const char * env = getenv("GGML_CUDA_DISABLE_Q8_1_RESHAPE");
+            return env != nullptr && atoi(env) != 0;
+        }();
+        return disabled;
+    }
+
+    static void key_contiguous(int64_t ne10, int64_t nrows, int64_t key[n_key]) {
+        if (!reshape_disabled() && ne10 % MATRIX_ROW_PADDING == 0) {
+            ne10 *= nrows;
+            nrows = 1;
+        }
+        key[0] = ne10;
+        key[1] = nrows;
+        key[2] = 1;
+        key[3] = 1;
+        key[4] = -1;
+        key[5] = -1;
+        key[6] = -1;
+    }
+
+    // a contiguous activation with rows of ne10_a values and its reshape to rows of ne10_b values have the same q8_1 copy
+    static bool same_copy_rows(int64_t ne10_a, int64_t ne10_b) {
+        return ne10_a == ne10_b ||
+            (!reshape_disabled() && ne10_a % MATRIX_ROW_PADDING == 0 && ne10_b % MATRIX_ROW_PADDING == 0);
     }
 };
 

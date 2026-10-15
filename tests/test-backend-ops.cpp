@@ -4608,6 +4608,80 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 };
 
 
+// DSV4_HC_POST -> RMS_NORM -> MUL [-> reshape -> MUL_MAT], the hyper-connection update followed by the next grouped norm
+// (qwen4exp build_hc_combine + build_hc_mix); backends may run it as one kernel
+struct test_hc_post_norm : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t n_tokens;
+    const bool    gated; // post = 2*sigmoid(post/hc), computed by an elementwise chain
+    const bool    mm;    // the normalized streams feed a quantized and an f32 matrix-vector product as one hc*n_embd row
+
+    ggml_tensor * hc_out = nullptr;
+    ggml_tensor * normed = nullptr;
+    ggml_tensor * mm_q   = nullptr;
+    ggml_tensor * mm_f   = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_POST_NORM";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_embd, hc, n_tokens, gated, mm);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (mm) {
+            return { hc_out, normed, mm_q, mm_f };
+        }
+        return { hc_out, normed };
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    test_hc_post_norm(int64_t n_embd = 2560, int64_t hc = 4, int64_t n_tokens = 1, bool gated = true, bool mm = false)
+        : n_embd(n_embd), hc(hc), n_tokens(n_tokens), gated(gated), mm(mm) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(post, "post");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(w, "w");
+
+        if (gated) {
+            post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) hc)), 2.0f);
+        }
+        hc_out = ggml_dsv4_hc_post(ctx, x, residual, post, nullptr);
+        ggml_set_name(hc_out, "hc_out");
+
+        normed = ggml_mul(ctx, ggml_rms_norm(ctx, hc_out, 1e-6f), w);
+        ggml_set_name(normed, "normed");
+        if (!mm) {
+            return normed;
+        }
+
+        ggml_tensor * flat = ggml_reshape_2d(ctx, normed, n_embd*hc, n_tokens);
+        ggml_tensor * wq = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd*hc, 64);
+        ggml_set_name(wq, "wq");
+        ggml_tensor * wf = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, hc);
+        ggml_set_name(wf, "wf");
+        mm_q = ggml_mul_mat(ctx, wq, flat);
+        ggml_set_name(mm_q, "mm_q");
+        mm_f = ggml_mul_mat(ctx, wf, flat);
+        ggml_set_name(mm_f, "mm_f");
+        ggml_tensor * out = ggml_add(ctx, ggml_sum(ctx, mm_q), ggml_sum(ctx, mm_f));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -10143,6 +10217,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
+    for (bool gated : {false, true}) {
+        for (bool mm : {false, true}) {
+            test_cases.emplace_back(new test_hc_post_norm(2560, 4, 1, gated, mm));
+            test_cases.emplace_back(new test_hc_post_norm(512, 4, 2, gated, mm));
+        }
+        test_cases.emplace_back(new test_hc_post_norm(31, 4, 17, gated, false));
+        test_cases.emplace_back(new test_hc_post_norm(1024, 3, 5, gated, false));
+        test_cases.emplace_back(new test_hc_post_norm(4096, 4, 7, gated, false));
+    }
+    test_cases.emplace_back(new test_hc_post_norm(300, 4, 2048, true, false));  // prompt-sized
+    test_cases.emplace_back(new test_hc_post_norm(40, 4, 16500, true, false));  // more than 65535 (stream, token) rows
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
