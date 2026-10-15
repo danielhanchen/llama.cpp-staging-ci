@@ -657,16 +657,19 @@ llama_context::llama_context(
             // the default hybrid path takes its fetch share from the decode threads, so it does not depend on timing
             moe_cache->hybrid_set_threads((int32_t) cparams.n_threads, model.hparams.no_alloc);
         }
-        // LLAMA_MOE_CACHE_DEVSEED (default 1, 0 = off): with the default seeding (=2) a prefetched ubatch seeds the cache on the device from
+        // LLAMA_MOE_CACHE_DEVSEED=1 (opt-in, default 0): with the default seeding (=2) a prefetched ubatch seeds the cache on the device from
         // its own routing (see llama_moe_cache::devseed_plan): its expert uploads never wait for the host to read the routing, and it needs
         // no stored routing of an earlier ubatch nor a larger seed graph; groups without device lookups are not seeded by prefetched ubatches
         if (moe_cache && llama_moe_cache::seed_mode() == 2 && prefetch_min_batch != INT64_MAX) {
             const char * env = getenv("LLAMA_MOE_CACHE_DEVSEED");
-            if ((env == nullptr || atoi(env) != 0) && moe_cache->devseed_init(prefetch_min_batch)) {
+            // opt-in: measured faster prompts at 8-32 GB on fast links (L4 gemma +4..+30%, G4 Flash-Next IQ4_XS +7..+18%), but slower first
+            // prompts on a throttled link (the #268 seed uploads only the routed experts of a single-ubatch prompt) and 2-3% slower decode
+            // after a prompt on the G4 (a different cache mix than the host LRU seed)
+            if (env != nullptr && atoi(env) != 0 && moe_cache->devseed_init(prefetch_min_batch)) {
                 moe_cache_devseed_on = true;
                 moe_cache_seed_sync  = false;
                 moe_cache_seed_auto  = false;
-                LLAMA_LOG_INFO("%s: MoE cache: prompt ubatches of %" PRId64 "+ tokens seed the cache on the device (LLAMA_MOE_CACHE_DEVSEED=0 to disable)\n",
+                LLAMA_LOG_INFO("%s: MoE cache: prompt ubatches of %" PRId64 "+ tokens seed the cache on the device (LLAMA_MOE_CACHE_DEVSEED=1)\n",
                     __func__, prefetch_min_batch);
             }
         }
