@@ -1107,6 +1107,7 @@ struct ggml_backend_sched {
     int  pre_nodes;
 
     ggml_backend_sched_lend_callback callback_lend;
+    bool lend_sync; // bindings with only SYNC copies and no arena are offered to the lender (GGML_SCHED_LEND_SYNC, default 1)
     void * callback_lend_user_data;
 
     // host weight prefetch [GGML_SCHED_PREFETCH]
@@ -3206,8 +3207,17 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
 
     // only SYNC copies and no arena to reuse: the graph allocator holds them (e.g. prefetch disabled by the threshold), no arena is created for them
     // (before the lend below, which then neither measures nor places them)
+    // with a lender the arena is missing because the copies of the large graphs live in lent memory (e.g. MoE cache slots): the graph
+    // allocator would have to grow by every copy of the graph after the lent memory was handed out (e.g. the last, shorter ubatch of a
+    // prompt), which the device may not hold; the lender is asked to place them first (they share one slot, see sync_lend below), and only
+    // if it does not place all of them they go to the graph allocator as before
+    bool sync_lend[GGML_SCHED_MAX_BACKENDS] = { false };
     for (int b = 0; b < sched->n_backends; b++) {
         struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+        if (pf->n_bound > 0 && pf->n_async == 0 && !dry && pf->arena == NULL && sched->callback_lend != NULL && sched->lend_sync) {
+            sync_lend[b] = true;
+            continue;
+        }
         if (pf->n_bound > 0 && pf->n_async == 0 && (dry || pf->arena == NULL)) {
             for (int k = 0; k < pf->n_bound; k++) {
                 sched->splits[pf->split_ids[k]].pf_ordinal = -1;
@@ -3290,7 +3300,10 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
                 push({ split->inputs[j], GGML_PAD(ggml_backend_buft_get_alloc_size(sched->bufts[b], input_cpy), align), k, NULL, 0 });
             }
         }
-        sched->callback_lend(sched->backends[b], pf->lend_copies, n_copies, pf->depth, dry, sched->callback_lend_user_data);
+        // SYNC copies are written on the compute stream when their split starts, after the splits before it: like in the arena (offset 0
+        // for every split) the copies of different splits may share bytes, depth 1 for the lender
+        const int lend_depth = sync_lend[b] ? 1 : pf->depth;
+        sched->callback_lend(sched->backends[b], pf->lend_copies, n_copies, lend_depth, dry, sched->callback_lend_user_data);
 
         // a dry run only measures, the user may not have allocated its memory (e.g. no_alloc)
         auto valid = [&](const struct ggml_backend_sched_lend_copy & lc) {
@@ -3382,7 +3395,7 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
                     if (d.buffer != a.buffer) {
                         continue;
                     }
-                    const bool live = a.ordinal < 0 || d.ordinal < 0 || abs(a.ordinal - d.ordinal) < pf->depth;
+                    const bool live = a.ordinal < 0 || d.ordinal < 0 || abs(a.ordinal - d.ordinal) < lend_depth;
                     if (live && a.offset < d.offset + d.size && d.offset < a.offset + a.size) {
                         if (n_bad++ < 4) {
                             GGML_LOG_ERROR("%s: lent placements overlap: [%zu, %zu) ordinal %d and [%zu, %zu) ordinal %d\n", __func__,
@@ -3393,8 +3406,31 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
             }
             GGML_LOG_INFO("%s: lend check: %d copies, %d overlaps\n", __func__, n_copies, n_bad);
         }
+        // SYNC copies the lender did not all place: no arena is created for them, the graph allocator holds all of them (as without a lender)
+        if (sync_lend[b]) {
+            bool all_placed = true;
+            for (int k = 0; k < pf->n_bound; k++) {
+                all_placed = all_placed && sched->splits[pf->split_ids[k]].pf_size == 0;
+            }
+            if (!all_placed) {
+                for (int k = 0; k < pf->n_bound; k++) {
+                    struct ggml_backend_sched_split * split = &sched->splits[pf->split_ids[k]];
+                    for (int j = 0; j < split->n_inputs; j++) {
+                        lent.erase(tensor_copy(split->inputs[j], b, sched->cur_copy));
+                    }
+                    split->pf_lent    = false;
+                    split->pf_ordinal = -1;
+                }
+                pf->n_bound = 0;
+                pf->need    = 0;
+                if (!ext[b]) {
+                    pf->n_lent_bufs = 0;
+                    any = false;
+                }
+            }
+        }
         if (!dry) {
-            pf->lent = staging_all - ggml_backend_sched_prefetch_staging(sched, b);
+            pf->lent = pf->n_bound > 0 ? staging_all - ggml_backend_sched_prefetch_staging(sched, b) : 0;
         }
         if (!dry && any) {
             pf->lending = true;
@@ -4264,6 +4300,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->pf_depth0    = sched->pf_depth;
         const char * GGML_SCHED_PREFETCH_HEADROOM_MIB = getenv("GGML_SCHED_PREFETCH_HEADROOM_MIB");
         sched->pf_headroom  = (size_t) (GGML_SCHED_PREFETCH_HEADROOM_MIB ? std::max(0, atoi(GGML_SCHED_PREFETCH_HEADROOM_MIB)) : 512)*1024*1024;
+        // GGML_SCHED_LEND_SYNC=0: bindings with only SYNC copies are not offered to the lender (their copies go to the graph allocator
+        // when no arena exists, see ggml_backend_sched_prefetch_bind)
+        const char * GGML_SCHED_LEND_SYNC = getenv("GGML_SCHED_LEND_SYNC");
+        sched->lend_sync    = GGML_SCHED_LEND_SYNC ? atoi(GGML_SCHED_LEND_SYNC) != 0 : true;
         const char * GGML_SCHED_PREFETCH_WINDOW = getenv("GGML_SCHED_PREFETCH_WINDOW");
         const char * GGML_SCHED_PREFETCH_CROSS  = getenv("GGML_SCHED_PREFETCH_CROSS");
         const char * GGML_SCHED_PREFETCH_ADAPT  = getenv("GGML_SCHED_PREFETCH_ADAPT");

@@ -2210,6 +2210,14 @@ struct llama_moe_cache::impl {
         lend_max = std::max(lend_max, n_lend);
     }
 
+    bool lends_on(ggml_backend_t backend) const {
+        const auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return d.backend == backend; });
+        if (it_dev == devices.end() || !it_dev->buf || lend_mode == 0) {
+            return false;
+        }
+        return it_dev->lend_auto == 1;
+    }
+
     // LLAMA_MOE_CACHE_LEND unset: the cache lends `need` bytes only if they are at least lend_min_frac of the cache of the device (a
     // small share frees little memory for the cache and costs the prompts the slots), or if the staging arena and the graph allocation
     // (`graph` more bytes, with the copies a seeding prompt holds there) do not fit in the free memory; decided at the first graph that
@@ -3213,6 +3221,10 @@ void llama_moe_cache::count_seed_skipped() {
 
 bool llama_moe_cache::lends() const {
     return pimpl->lend_mode != 0;
+}
+
+bool llama_moe_cache::lends_on(ggml_backend_t backend) const {
+    return pimpl->lends_on(backend);
 }
 
 bool llama_moe_cache::lends_graph() const {

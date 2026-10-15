@@ -107,6 +107,8 @@ public:
 
     // the cache may lend slots (LLAMA_MOE_CACHE_LEND)
     bool lends() const;
+    // the cache lends slots on the device of backend (decided by the first large graph, see lend): the staging arena is not allocated there
+    bool lends_on(ggml_backend_t backend) const;
     bool lends_graph() const; // the graph allocator may borrow too (LLAMA_MOE_CACHE_LEND=2)
 
     // the largest staging memory (the copies of large batches) a measurement asked the cache to lend, on any device (0 if none)
