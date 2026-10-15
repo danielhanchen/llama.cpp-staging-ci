@@ -2822,6 +2822,8 @@ static bool ggml_backend_sched_prefetch_queue(ggml_backend_sched_t sched, int ba
 }
 
 // make sure that the arena of a backend can hold pf->staging bytes (none if every copy is in lent memory)
+static size_t ggml_backend_sched_prefetch_staging(ggml_backend_sched_t sched, int backend_id);
+
 static bool ggml_backend_sched_prefetch_ensure(ggml_backend_sched_t sched, int backend_id) {
     struct ggml_backend_sched_prefetch * pf = &sched->pf[backend_id];
     ggml_backend_t backend = sched->backends[backend_id];
@@ -2841,6 +2843,32 @@ static bool ggml_backend_sched_prefetch_ensure(ggml_backend_sched_t sched, int b
         return true;
     }
     pf->shrink = false;
+
+    // a step of the adaptive depth grows the arena past the memory reserved for the graph: only with headroom left on the device for the
+    // memory the backends allocate while computing (e.g. the CUDA pool, GGML_SCHED_PREFETCH_ADAPT_HEADROOM_MIB, default 512), else this
+    // binding and the next ones use the depth before the step (the copies stay in the arena, never in the graph allocator)
+    if (pf->depth > sched->pf_depth0 && pf->staging > pf->arena_size) {
+        static const size_t headroom = (size_t) std::max(0, getenv("GGML_SCHED_PREFETCH_ADAPT_HEADROOM_MIB") ?
+            atoi(getenv("GGML_SCHED_PREFETCH_ADAPT_HEADROOM_MIB")) : 512) * 1024 * 1024;
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        size_t free = 0, total = 0;
+        if (dev != NULL) {
+            ggml_backend_dev_memory(dev, &free, &total);
+        }
+        if (dev != NULL && total > 0 && free < pf->staging - pf->arena_size + headroom) {
+            const int back = sched->pf_adapt_from > 0 && sched->pf_adapt_from < pf->depth ? sched->pf_adapt_from : sched->pf_depth0;
+            GGML_LOG_INFO("%s: %s: depth %d needs %.2f MiB more staging memory, %.2f MiB free (headroom %.0f MiB): settled at depth %d\n", __func__,
+                ggml_backend_name(backend), pf->depth, (pf->staging - pf->arena_size) / 1024.0 / 1024.0, free / 1024.0 / 1024.0,
+                headroom / 1024.0 / 1024.0, back);
+            sched->pf_depth = back;
+            sched->pf_adapt = false;
+            pf->depth   = back;
+            pf->staging = ggml_backend_sched_prefetch_staging(sched, backend_id);
+            if (pf->arena != NULL && pf->arena_size >= pf->staging) {
+                return true;
+            }
+        }
+    }
 
     // the old arena (if any) may still be read or written
     ggml_backend_sched_prefetch_sync(sched);
