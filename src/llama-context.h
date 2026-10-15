@@ -14,6 +14,7 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <cstdint>
 #include <map>
 #include <thread>
 #include <vector>
@@ -478,6 +479,11 @@ private:
     bool moe_cache_seed_sync    = true;  // LLAMA_MOE_CACHE_SEED=2 (default): a prefetched ubatch seeds (earlier routing, else its own ids read first)
     bool moe_cache_seed_auto    = false; // LLAMA_MOE_CACHE_SEED unset, n_ubatch >= LLAMA_MOE_CACHE_SEED_AUTO: as LLAMA_MOE_CACHE_SEED=1
     bool moe_cache_seed_fits    = true;  // the graph of a prefetched ubatch that seeds from its own ids was reserved (see sched_reserve_seed)
+
+    // device memory kept free for a model or context created after this one, per backend (llama_context_params::mem_reserve); only
+    // while the context is created, 0 afterwards
+    std::vector<size_t> mem_reserve;
+    size_t sched_pf_headroom_def = SIZE_MAX; // the prefetch headroom of the scheduler without the reserve (SIZE_MAX: not raised)
 
     // value of moe_cache_seed when the current graph was allocated: the scheduler plans the copies of the experts with it
     bool moe_cache_seed_graph = false;

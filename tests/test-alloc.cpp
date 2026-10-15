@@ -845,6 +845,7 @@ static size_t run_prefetch_headroom(size_t total, size_t workspace, size_t headr
     ggml_backend_buffer_type_t bufts[2] = { &mock.buft, ggml_backend_cpu_buffer_type() };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, bufts, 2, 256, false, true);
     ggml_backend_sched_set_prefetch_headroom(sched, headroom);
+    GGML_ASSERT(ggml_backend_sched_get_prefetch_headroom(sched) == headroom);
 
     const int n = 512;
     ggml_init_params wparams = { 4*ggml_tensor_overhead(), nullptr, true };
@@ -949,6 +950,12 @@ static void test_prefetch_headroom() {
     for (mock_alloc mode : modes) {
         GGML_ASSERT(run_prefetch_headroom(4*MiB, 2*MiB + MiB/2, 2*MiB + MiB/2, false, mode, &n_pf_log) == used_off);
         GGML_ASSERT(run_prefetch_headroom(4*MiB, 2*MiB + MiB/2, 2*MiB + MiB/2, true,  mode, &n_pf_log) == used_off);
+    }
+
+    // memory kept free for a later context (llama_context_params::mem_reserve raises the headroom by it while the context is
+    // created): the 64 MiB device that holds the arena above drops the prefetch when 60 MiB more must stay free
+    for (mock_alloc mode : modes) {
+        GGML_ASSERT(run_prefetch_headroom(64*MiB, 2*MiB + MiB/2, 2*MiB + MiB/2 + 60*MiB, true, mode, &n_pf_log) == used_off);
     }
 
     // 6 MiB device, 3.5 MiB workspace: the reserve of a small batch leaves it next to the arena, the graph buffers of a 256 batch do not

@@ -4570,6 +4570,11 @@ void ggml_backend_sched_set_prefetch_headroom(ggml_backend_sched_t sched, size_t
     sched->pf_headroom = headroom;
 }
 
+size_t ggml_backend_sched_get_prefetch_headroom(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->pf_headroom;
+}
+
 size_t ggml_backend_sched_get_staging_size(ggml_backend_sched_t sched, ggml_backend_t backend) {
     GGML_ASSERT(sched);
     int backend_index = ggml_backend_sched_backend_id(sched, backend);

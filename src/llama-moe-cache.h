@@ -112,6 +112,10 @@ public:
     // the largest staging memory (the copies of large batches) a measurement asked the cache to lend, on any device (0 if none)
     size_t lend_need_max() const;
 
+    // device memory of backend kept free for a model or context created later (e.g. a draft): the automatic lending decision
+    // counts it as used (see lend_decide)
+    void set_mem_reserve(ggml_backend_t backend, size_t bytes);
+
     // the largest ubatch (at most n_small_max tokens) whose experts every cached layer reads from the cache without copying them
     int64_t n_tokens_cached() const;
 

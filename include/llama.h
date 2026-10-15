@@ -440,6 +440,14 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // device memory that a model or context created after this one takes (e.g. the draft model and context of speculative
+        // decoding): what this context places in the free device memory while it is created (the MoE cache lending decision, the seed
+        // graph, the host weight prefetch staging) leaves mem_reserve[i] bytes free on mem_reserve_devs[i] [EXPERIMENTAL]
+        // (the caller keeps both arrays alive while the context is created; nullptr / 0 = nothing reserved)
+        const ggml_backend_dev_t * mem_reserve_devs;
+        const size_t *             mem_reserve;
+        size_t                     n_mem_reserve;
     };
 
     struct llama_model_tensor_override {

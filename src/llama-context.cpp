@@ -583,6 +583,23 @@ llama_context::llama_context(
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
+        // device memory a model or context created after this one takes (e.g. the draft of speculative decoding, see
+        // llama_context_params::mem_reserve): kept free by what this context places in the free memory while it is created
+        mem_reserve.assign(backend_ptrs.size(), 0);
+        if (!model.hparams.no_alloc && params.mem_reserve != nullptr && params.mem_reserve_devs != nullptr) {
+            for (size_t j = 0; j < params.n_mem_reserve; ++j) {
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    if (params.mem_reserve[j] > 0 && ggml_backend_get_device(backend_ptrs[i]) == params.mem_reserve_devs[j] &&
+                        !ggml_backend_buft_is_host(backend_buft[i])) {
+                        mem_reserve[i] += params.mem_reserve[j];
+                        LLAMA_LOG_INFO("%s: %s: %.2f MiB of device memory kept free for a later model or context (the draft of speculative "
+                            "decoding, LLAMA_DRAFT_MEM_RESERVE=0 to disable)\n", __func__, ggml_backend_name(backend_ptrs[i]),
+                            params.mem_reserve[j]/1024.0/1024.0);
+                    }
+                }
+            }
+        }
+
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
         bool pipeline_parallel =
@@ -643,8 +660,25 @@ llama_context::llama_context(
         if (moe_cache && moe_cache_seed_auto) {
             moe_cache->prompts_do_not_seed();
         }
+        if (moe_cache) {
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                moe_cache->set_mem_reserve(backend_ptrs[i], mem_reserve[i]);
+            }
+        }
 
         sched_reserve();
+
+        // the later model or context now takes its memory itself: a later reserve sees it in the free memory of the devices
+        // (the lending decision of the MoE cache was made at the first graph allocation, in the reserve above)
+        std::fill(mem_reserve.begin(), mem_reserve.end(), 0);
+        if (moe_cache) {
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                moe_cache->set_mem_reserve(backend_ptrs[i], 0);
+            }
+        }
+        if (sched && sched_pf_headroom_def != SIZE_MAX) {
+            ggml_backend_sched_set_prefetch_headroom(sched.get(), sched_pf_headroom_def);
+        }
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
@@ -874,6 +908,15 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_overlap(sched.get(), moe_cache && moe_cache->hybrid_active());
     if (moe_cache) {
         ggml_backend_sched_set_lend_callback(sched.get(), sched_lend, this);
+    }
+    // a staging arena without a lender (see ggml_backend_sched_prefetch_headroom_ok) also leaves the memory reserved for a later
+    // model or context (one headroom for every device: the largest reserve)
+    const size_t reserve_max = mem_reserve.empty() ? 0 : *std::max_element(mem_reserve.begin(), mem_reserve.end());
+    if (reserve_max > 0) {
+        sched_pf_headroom_def = ggml_backend_sched_get_prefetch_headroom(sched.get());
+        if (sched_pf_headroom_def > 0) {
+            ggml_backend_sched_set_prefetch_headroom(sched.get(), sched_pf_headroom_def + reserve_max);
+        }
     }
 }
 
@@ -1145,6 +1188,7 @@ bool llama_context::sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint3
         size_t total = 0;
         ggml_backend_dev_memory(dev, &free, &total);
         free -= std::min(free, released);
+        free -= std::min(free, i < mem_reserve.size() ? mem_reserve[i] : (size_t) 0);
         if (free < graph - cur_gph + margin) {
             LLAMA_LOG_WARN("%s: %s: the ubatch that seeds the MoE cache needs %.2f MiB more compute buffer, %.2f MiB free (with %.0f MiB of headroom): "
                 "prompts do not seed the cache from their own ids (a smaller --moe-cache-mib keeps the seed)\n", __func__,
@@ -5048,6 +5092,9 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.mem_reserve_devs            =*/ nullptr,
+        /*.mem_reserve                 =*/ nullptr,
+        /*.n_mem_reserve               =*/ 0,
     };
 
     return result;

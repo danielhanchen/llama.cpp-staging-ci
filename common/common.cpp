@@ -1627,6 +1627,50 @@ static bool common_fit_draft_on_cpu(
     return !gpu;
 }
 
+// speculative decoding: the draft model and its context are created after the main context (common_speculative_init_result), which
+// until then sees the device memory that --fit gave them as free. What the main context places in free memory while it is created
+// (the automatic MoE cache lending decision, the seed graph, a staging arena without a lender) took it: Qwen3.8-Flash-Next UD-IQ4_XS
+// with an MTP draft on 32 GB, --fit on --moe-cache-mib 200000: the cache did not lend its 1275 MiB of staging copies because 5 GiB
+// looked free, and the draft context then failed to allocate its 778 MiB compute buffer. The draft is measured at the params it is
+// created with (as in common_moe_cache_auto_ubatch) and that memory is kept free in the main context while it is created
+// (llama_context_params::mem_reserve). LLAMA_DRAFT_MEM_RESERVE=0 disables.
+static void common_draft_mem_reserve(const common_params & params, const llama_model_params & mparams, const llama_context_params & cparams,
+        std::vector<ggml_backend_dev_t> & devs, std::vector<size_t> & bytes) {
+    devs.clear();
+    bytes.clear();
+    if (const char * env = getenv("LLAMA_DRAFT_MEM_RESERVE"); env != nullptr && atoi(env) == 0) {
+        return;
+    }
+    const bool has_draft = params.speculative.has_dft() && !params.speculative.draft.fit_off;
+    const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end() && !params.speculative.draft.fit_off;
+    if (!has_draft && !spec_mtp) {
+        return;
+    }
+    common_params        params_dft  = common_base_params_to_speculative(params);
+    llama_model_params   mparams_dft = has_draft ? common_model_params_to_llama(params_dft) : mparams;
+    llama_context_params cparams_dft = common_context_params_to_llama(params_dft);
+    if (spec_mtp) {
+        cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    }
+    cparams_dft.n_rs_seq = 0;
+    cparams_dft.n_ctx    = cparams.n_ctx;
+    uint32_t hp_ngl = 0, hp_nct = 0, hp_nex = 0;
+    try {
+        const common_device_memory_data_vec dmd = common_get_device_memory_data(has_draft ? params_dft.model.path.c_str() : params.model.path.c_str(),
+            &mparams_dft, &cparams_dft, devs, hp_ngl, hp_nct, hp_nex, params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        // the weights of a draft model are loaded after the main context too, an MTP context runs on the weights of the main model
+        for (size_t i = 0; i < devs.size() && i + 1 < dmd.size(); ++i) {
+            bytes.push_back((size_t) ((has_draft ? dmd[i].model : 0) + dmd[i].context + dmd[i].compute));
+        }
+        devs.resize(bytes.size());
+    } catch (const std::exception & e) {
+        COM_WRN("memory measure of the draft for the memory the main context keeps free failed, nothing kept free: %s\n", e.what());
+        devs.clear();
+        bytes.clear();
+    }
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     // with --fit the MoE cache load mode is decided after the fit has placed the experts
@@ -1805,7 +1849,19 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    std::vector<ggml_backend_dev_t> reserve_devs;
+    std::vector<size_t>             reserve_bytes;
+    common_draft_mem_reserve(params, mparams, cparams, reserve_devs, reserve_bytes);
+    if (!reserve_bytes.empty()) {
+        cparams.mem_reserve_devs = reserve_devs.data();
+        cparams.mem_reserve      = reserve_bytes.data();
+        cparams.n_mem_reserve    = reserve_bytes.size();
+    }
+
     llama_context * lctx = llama_init_from_model(model, cparams);
+    cparams.mem_reserve_devs = nullptr;
+    cparams.mem_reserve      = nullptr;
+    cparams.n_mem_reserve    = 0;
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return;

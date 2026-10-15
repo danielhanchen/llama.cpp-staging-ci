@@ -406,6 +406,7 @@ struct llama_moe_cache::impl {
 
         int lend_auto = -1; // automatic lending (LLAMA_MOE_CACHE_LEND unset): -1 not decided yet, 0 off, 1 on
         size_t dry_need = 0; // the largest staging need a measurement (dry lend) asked for, see lend_need_max
+        size_t mem_reserve = 0; // device memory kept free for a later model or context (set_mem_reserve), not free for lend_decide
     };
 
     // LLAMA_MOE_CACHE_SEED_CHECK=1: after each seeding ubatch, compare the seeded slots with the host experts (debug)
@@ -2238,6 +2239,8 @@ struct llama_moe_cache::impl {
         ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);
         if (!on && dev != nullptr) {
             ggml_backend_dev_memory(dev, &free, &total);
+            // the draft of speculative decoding is created after this context: the memory --fit gave it is not free for the copies
+            free -= std::min(free, d.mem_reserve);
         }
         const bool fit = on || dev == nullptr || free >= need + graph + margin;
         d.lend_auto = on || !fit ? 1 : 0;
@@ -3222,6 +3225,14 @@ size_t llama_moe_cache::lend_need_max() const {
         need = std::max(need, d.dry_need);
     }
     return need;
+}
+
+void llama_moe_cache::set_mem_reserve(ggml_backend_t backend, size_t bytes) {
+    for (auto & d : pimpl->devices) {
+        if (d.backend == backend) {
+            d.mem_reserve = bytes;
+        }
+    }
 }
 
 int64_t llama_moe_cache::n_tokens_cached() const {
