@@ -258,6 +258,10 @@ struct moe_cache_lru {
                 const int32_t s = cand[j++].second;
                 if (key_of[s] >= 0) {
                     slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
+                    // the exclusive RAM tier copies these back before their slots are overwritten (without them it only drains)
+                    if (evicted != nullptr) {
+                        evicted->emplace_back(s, key_of[s]);
+                    }
                 }
                 key_of[s] = il*n_expert + e;
                 slots[e] = s;
