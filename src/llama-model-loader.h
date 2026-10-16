@@ -175,14 +175,15 @@ struct llama_model_loader {
     bool pin_expert(size_t nbytes);
     int64_t experts_pin_avail = -1; // MemAvailable when the pinning started (bytes), -1: unknown
 
-    // file ranges of the pinned experts, whose page cache drop_pinned_cache may drop after the load
+    // file ranges of the pinned experts and of the tensors that stay mapped, see settle_pinned_cache
     struct pinned_range {
         uint32_t idx;
         size_t   offs;
         size_t   size;
     };
     std::vector<pinned_range> pinned_ranges;
-    void drop_pinned_cache();
+    std::vector<pinned_range> mapped_ranges;
+    void settle_pinned_cache();
     std::string first_tensor_moved_name;
     std::string first_tensor_moved_type_name;
     ggml_backend_buffer_type_t first_moved_from_buft = nullptr;
