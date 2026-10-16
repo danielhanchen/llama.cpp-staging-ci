@@ -2657,8 +2657,9 @@ struct llama_moe_cache::impl {
         need += graph_need;
 
         // a prompt that seeds from its own ids holds the copies of a split in the graph allocation (see llama_context::sched_reserve_seed)
-        const size_t graph = graph_all + (seed_own ? split : 0);
-        if (lend_auto && !lend_decide(id, need, graph, dry)) {
+        const size_t seed  = seed_own ? split : 0;
+        const size_t graph = graph_all + seed;
+        if (lend_auto && !lend_decide(id, need, graph, seed, dry)) {
             return;
         }
 
@@ -2778,8 +2779,10 @@ struct llama_moe_cache::impl {
     // LLAMA_MOE_CACHE_LEND unset: the cache lends `need` bytes only if they are at least lend_min_frac of the cache of the device (a
     // small share frees little memory for the cache and costs the prompts the slots), or if the staging arena and the graph allocation
     // (`graph` more bytes, with the copies a seeding prompt holds there) do not fit in the free memory; decided at the first graph that
-    // is allocated
-    bool lend_decide(int32_t id, size_t need, size_t graph, bool dry) {
+    // is allocated; the memory kept free for a later model or context (set_mem_reserve) is held against the copies and the graph
+    // allocation without the copies of a seeding prompt (`seed` bytes of `graph`): a seed that does not fit is dropped by itself (see
+    // llama_context::sched_reserve_seed), lending for it costs the prompts the slots
+    bool lend_decide(int32_t id, size_t need, size_t graph, size_t seed, bool dry) {
         device & d = devices[id];
         if (d.lend_auto >= 0) {
             return d.lend_auto != 0;
@@ -2802,12 +2805,24 @@ struct llama_moe_cache::impl {
         size_t free  = 0;
         size_t total = 0;
         ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);
+        size_t free_rs = 0; // free memory less the memory kept free for a later model or context
         if (!on && dev != nullptr) {
             ggml_backend_dev_memory(dev, &free, &total);
             // the draft of speculative decoding is created after this context: the memory --fit gave it is not free for the copies
-            free -= std::min(free, d.mem_reserve);
+            // (LLAMA_DRAFT_MEM_RESERVE=0: the rule above alone)
+            free_rs = free - std::min(free, d.mem_reserve);
         }
-        const bool fit = on || dev == nullptr || free >= need + graph + margin;
+        const bool fit = on || dev == nullptr ||
+            (free >= need + graph + margin && free_rs >= need + (graph - std::min(graph, seed)) + margin);
+        if (!on && dev != nullptr && d.mem_reserve > 0) {
+            free = free_rs; // the message reports what the copies could use
+            if (fit) {
+                LLAMA_LOG_INFO("%s: %s: %.2f MiB kept free for a later model or context leave %.2f MiB for the staging copies (%.2f MiB) "
+                    "and %.2f MiB of graph allocation without the copies of a seeding prompt (%.2f MiB, dropped if they do not fit)\n",
+                    __func__, ggml_backend_name(d.backend), d.mem_reserve/1024.0/1024.0, free_rs/1024.0/1024.0, need/1024.0/1024.0,
+                    (graph - std::min(graph, seed))/1024.0/1024.0, seed/1024.0/1024.0);
+            }
+        }
         d.lend_auto = on || !fit ? 1 : 0;
         if (on) {
             LLAMA_LOG_INFO("%s: %s: MoE cache lending on: the staging copies of large batches (%.2f MiB) are %.1f%% of the cache (%.2f MiB), at least %.1f%% (LLAMA_MOE_CACHE_LEND_MIN_FRAC)\n",
