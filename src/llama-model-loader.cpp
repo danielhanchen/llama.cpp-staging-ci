@@ -16,6 +16,10 @@
 #include <future>
 #include <regex>
 
+#if defined(__linux__)
+#include <fcntl.h>
+#endif
+
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
@@ -1676,6 +1680,10 @@ bool llama_model_loader::load_all_data(
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
+                // with mmap, only the pinned experts are in host buffers that are not the mapping (see pin_expert)
+                if (n_experts_pinned > 0 && cur->buffer != nullptr && ggml_backend_buffer_is_host(cur->buffer)) {
+                    pinned_ranges.push_back({ weight->idx, weight->offs, n_size });
+                }
             }
         } else {
             const auto & file = files.at(weight->idx);
@@ -1793,6 +1801,7 @@ bool llama_model_loader::load_all_data(
                     mapping->unmap_fragment(mmap_used.second, mapping->size());
                 }
             }
+            drop_pinned_cache();
         }
         if (progress_callback) {
             // Even though the model is done loading, we still honor
@@ -1823,16 +1832,16 @@ void llama_model_loader::print_info() const {
 // RTX PRO 6000, Flash-Next IQ4_XS: 45 vs 56 GB/s, from a tmpfs mapping). With mmap the tensor is then read into the host buffer of the
 // GPU device (pinned) instead of being mapped, as long as the pinned bytes stay within the available RAM less a reserve:
 // opt-in (it reads the experts at load instead of mapping them, ~9 s more for Flash-Next IQ4_XS, and pins up to the budget; the gain
-// was measured with the model in a tmpfs): LLAMA_MOE_PIN_EXPERTS unset or 0: never; 1: Linux only, budget MemAvailable - max(4 GiB,
-// 10% of MemTotal) (read once per load); 2: always, without the RAM check
+// was measured with the model in a tmpfs). On a Kaggle T4 (31 GB RAM) Qwen3.6-35B-A3B UD-Q5_K_XL with 22.7 GB pinned read prompts
+// 5-10% slower until the file pages of the pinned experts were dropped after the load (see drop_pinned_cache).
+// LLAMA_MOE_PIN_EXPERTS unset or 0: never; 1: Linux only, budget MemAvailable - max(4 GiB, 10% of MemTotal) (read once per load);
+// 2: always, without the RAM check
 bool llama_model_loader::pin_expert(size_t nbytes) {
     if (experts_pin_budget < 0) {
         experts_pin_budget = 0;
         const char * env = getenv("LLAMA_MOE_PIN_EXPERTS");
         const int mode = env != nullptr ? atoi(env) : 0;
-        if (mode == 2) {
-            experts_pin_budget = INT64_MAX;
-        } else if (mode == 1) {
+        if (mode == 1 || mode == 2) {
 #if defined(__linux__)
             FILE * f = fopen("/proc/meminfo", "r");
             if (f != nullptr) {
@@ -1849,11 +1858,17 @@ bool llama_model_loader::pin_expert(size_t nbytes) {
                 }
                 fclose(f);
                 if (total > 0 && avail > 0) {
-                    const int64_t reserve = std::max<int64_t>((int64_t) 4 << 30, total/10);
-                    experts_pin_budget = std::max<int64_t>(0, avail - reserve);
+                    experts_pin_avail = avail;
+                    if (mode == 1) {
+                        const int64_t reserve = std::max<int64_t>((int64_t) 4 << 30, total/10);
+                        experts_pin_budget = std::max<int64_t>(0, avail - reserve);
+                    }
                 }
             }
 #endif
+            if (mode == 2) {
+                experts_pin_budget = INT64_MAX;
+            }
         }
     }
     if ((int64_t) (experts_pinned_bytes + nbytes) > experts_pin_budget) {
@@ -1862,4 +1877,42 @@ bool llama_model_loader::pin_expert(size_t nbytes) {
     experts_pinned_bytes += nbytes;
     n_experts_pinned++;
     return true;
+}
+
+// The file pages a pinned expert was copied from are not read again, but on a host whose RAM cannot hold the file beside the pinned
+// copy (the pinned memory is shmem, not reclaimable) they fill the rest of the page cache: free memory then sits at the kswapd
+// watermark and the pages that are still read through the mapping (the token embeddings of every prompt ubatch, read by the CPU)
+// are evicted between ubatches and faulted back from disk. Kaggle T4, 31 GB RAM, Qwen3.6-35B-A3B UD-Q5_K_XL, 22.7 GB pinned: ~150
+// major faults (40-70 MB read) per 2048-token ubatch, GPU idle +206 ms at 2k / +370 ms at 8k (nsys), prompt -5-10%.
+// The ranges are dropped from the page cache (POSIX_FADV_DONTNEED; pages still mapped are kept by the kernel) when the pinned bytes
+// plus the files exceed the RAM available when the pinning started. LLAMA_MOE_PIN_DROP_CACHE=0: never, 1: always
+void llama_model_loader::drop_pinned_cache() {
+    if (pinned_ranges.empty()) {
+        return;
+    }
+#if defined(__linux__)
+    const char * env = getenv("LLAMA_MOE_PIN_DROP_CACHE");
+    bool drop = false;
+    if (env != nullptr) {
+        drop = atoi(env) != 0;
+    } else {
+        int64_t file_bytes = 0;
+        for (const auto & file : files) {
+            file_bytes += (int64_t) file->size();
+        }
+        drop = experts_pin_avail > 0 && (int64_t) experts_pinned_bytes + file_bytes > experts_pin_avail;
+    }
+    if (drop) {
+        size_t n_bytes = 0;
+        for (const auto & r : pinned_ranges) {
+            if (r.idx < files.size() && posix_fadvise(files[r.idx]->file_id(), (off_t) r.offs, (off_t) r.size, POSIX_FADV_DONTNEED) == 0) {
+                n_bytes += r.size;
+            }
+        }
+        LLAMA_LOG_INFO("%s: dropped the page cache of %zu pinned expert tensors (%.2f MiB): the RAM available at load (%.2f MiB) cannot hold "
+            "the files beside the pinned copy (LLAMA_MOE_PIN_DROP_CACHE=0 to keep it)\n", __func__, pinned_ranges.size(), n_bytes/1024.0/1024.0,
+            experts_pin_avail/1024.0/1024.0);
+    }
+#endif
+    pinned_ranges.clear();
 }
