@@ -1407,7 +1407,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
     if (n_experts_pinned > 0) {
         LLAMA_LOG_INFO("%s: %zu expert tensors (%.2f MiB) in pinned host memory instead of the mapped file: prompt batches upload them to the GPU "
-            "(LLAMA_MOE_PIN_EXPERTS=0 to disable)\n", __func__, n_experts_pinned, experts_pinned_bytes/1024.0/1024.0);
+            "(LLAMA_MOE_PIN_EXPERTS=1)\n", __func__, n_experts_pinned, experts_pinned_bytes/1024.0/1024.0);
     }
     if (n_tensors_moved > 0) {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",
@@ -1822,15 +1822,17 @@ void llama_model_loader::print_info() const {
 // every large batch (a prompt ubatch) uploads it to the GPU, and a mapped file uploads ~20% slower than pinned host memory (G4,
 // RTX PRO 6000, Flash-Next IQ4_XS: 45 vs 56 GB/s, from a tmpfs mapping). With mmap the tensor is then read into the host buffer of the
 // GPU device (pinned) instead of being mapped, as long as the pinned bytes stay within the available RAM less a reserve:
-// LLAMA_MOE_PIN_EXPERTS unset: Linux only, budget MemAvailable - max(4 GiB, 10% of MemTotal) (read once per load); 0: never; 1: always
+// opt-in (it reads the experts at load instead of mapping them, ~9 s more for Flash-Next IQ4_XS, and pins up to the budget; the gain
+// was measured with the model in a tmpfs): LLAMA_MOE_PIN_EXPERTS unset or 0: never; 1: Linux only, budget MemAvailable - max(4 GiB,
+// 10% of MemTotal) (read once per load); 2: always, without the RAM check
 bool llama_model_loader::pin_expert(size_t nbytes) {
     if (experts_pin_budget < 0) {
         experts_pin_budget = 0;
         const char * env = getenv("LLAMA_MOE_PIN_EXPERTS");
-        const int mode = env != nullptr ? atoi(env) : -1;
-        if (mode == 1) {
+        const int mode = env != nullptr ? atoi(env) : 0;
+        if (mode == 2) {
             experts_pin_budget = INT64_MAX;
-        } else if (mode != 0) {
+        } else if (mode == 1) {
 #if defined(__linux__)
             FILE * f = fopen("/proc/meminfo", "r");
             if (f != nullptr) {
