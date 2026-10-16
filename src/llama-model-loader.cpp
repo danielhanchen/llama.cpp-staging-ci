@@ -19,6 +19,7 @@
 #if defined(__linux__)
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 #endif
 
@@ -1893,23 +1894,29 @@ bool llama_model_loader::pin_expert(size_t nbytes) {
 // pinned, registered-mapping and anonymous registered memory (11.8 GB/s).
 // When the pinned bytes plus the files exceed the RAM available when the pinning started, the ranges of the pinned experts are
 // dropped from the page cache (POSIX_FADV_DONTNEED; pages still mapped are kept by the kernel) and the mapped tensors are read back
-// (MADV_POPULATE_READ, else a read per page). LLAMA_MOE_PIN_DROP_CACHE=0: never, 1: always
+// (MADV_POPULATE_READ, else a read per page); not for files in tmpfs. LLAMA_MOE_PIN_DROP_CACHE=0: never, 1: always
 void llama_model_loader::settle_pinned_cache() {
     if (pinned_ranges.empty()) {
         mapped_ranges.clear();
         return;
     }
 #if defined(__linux__)
+    // files in tmpfs are memory already (not page cache that can be dropped or evicted): left alone
+    bool in_tmpfs = false;
+    int64_t file_bytes = 0;
+    for (const auto & file : files) {
+        struct statfs sfs;
+        if (fstatfs(file->file_id(), &sfs) == 0 && (unsigned long) sfs.f_type == 0x01021994UL) { // TMPFS_MAGIC
+            in_tmpfs = true;
+        }
+        file_bytes += (int64_t) file->size();
+    }
     const char * env = getenv("LLAMA_MOE_PIN_DROP_CACHE");
     bool tight = false;
     if (env != nullptr) {
         tight = atoi(env) != 0;
     } else {
-        int64_t file_bytes = 0;
-        for (const auto & file : files) {
-            file_bytes += (int64_t) file->size();
-        }
-        tight = experts_pin_avail > 0 && (int64_t) experts_pinned_bytes + file_bytes > experts_pin_avail;
+        tight = !in_tmpfs && experts_pin_avail > 0 && (int64_t) experts_pinned_bytes + file_bytes > experts_pin_avail;
     }
     if (tight) {
         size_t n_dropped = 0;
