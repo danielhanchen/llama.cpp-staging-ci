@@ -1590,6 +1590,12 @@ private:
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
+
+            // the checkpoints of the target are saved asynchronously (create_checkpoint): allocate their pinned staging buffer
+            // now, so the first long prompt does not allocate it between two of its ubatches
+            if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS || n_swa > 0) {
+                llama_state_seq_reserve_async(ctx_tgt, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
         }

@@ -987,6 +987,13 @@ extern "C" {
                     llama_seq_id   seq_id,
            llama_state_seq_flags   flags);
 
+    // Allocates now the staging buffers that asynchronous saves (LLAMA_STATE_SEQ_FLAGS_ASYNC) with these flags need at most, so the
+    // first such save does not allocate pinned host memory while the device has work queued. Call it while the context is idle,
+    // e.g. after loading. Only LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY is supported. Returns the bytes allocated (0: nothing to do).
+    LLAMA_API size_t llama_state_seq_reserve_async(
+            struct llama_context * ctx,
+           llama_state_seq_flags   flags);
+
     LLAMA_API size_t llama_state_seq_set_data_ext(
             struct llama_context * ctx,
                    const uint8_t * src,

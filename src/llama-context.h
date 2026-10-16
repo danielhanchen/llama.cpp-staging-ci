@@ -184,6 +184,11 @@ struct llama_context {
     // wait until the last asynchronous state save has reached its destination
     void state_async_wait();
 
+    // allocate the staging buffers of asynchronous saves with these flags up front (see llama_state_seq_reserve_async)
+    size_t state_async_reserve(llama_state_seq_flags flags);
+
+    void state_async_init_backends();
+
     bool state_load_file(
             const char * filepath,
            llama_token * tokens_out,
