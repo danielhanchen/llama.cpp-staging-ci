@@ -7,6 +7,11 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-recurrent.h"
+#include "llama-kv-cache-iswa.h"
+#include "llama-kv-cache-dsa-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -4681,21 +4686,16 @@ void llama_context::state_async_wait() {
     }
 }
 
-// Read the state rows of an asynchronous save into dst without synchronizing the context.
-// Each row is read on the stream of the backend that owns it, so the read comes after the work already queued there
-// (e.g. the previous ubatch) and before any later graph changes the row. The rows land in a pinned staging buffer per
-// backend (reused across saves); a worker thread waits on an event per backend and copies them to dst, so the host is
-// free to prepare the next ubatch meanwhile. Rows in host buffers, or on a device without async copies and events,
-// take the synchronous path instead.
-void llama_context::state_get_async(const std::vector<llama_state_write_info> & winfos) {
-    // the previous save may still be reading the staging buffers
-    state_async_wait();
-
+static bool state_async_disabled() {
     static const bool disabled = [] {
         const char * e = getenv("LLAMA_STATE_ASYNC");
         return e != nullptr && atoi(e) == 0;
     }();
+    return disabled;
+}
 
+// the async-capable backends of state_get_async(), found on first use
+void llama_context::state_async_init_backends() {
     if (!state_async_init) {
         state_async_init = true;
 
@@ -4731,6 +4731,132 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
             state_async.push_back({ b, dev, event, nullptr });
         }
     }
+}
+
+// The device bytes a PARTIAL_ONLY save of one sequence can read at most, per buffer type: the share of one sequence in the
+// buffers of the parts of the memory such a save writes. False for the memory types without a known bound (their staging
+// buffers grow on demand).
+static bool state_partial_bound(const llama_memory_i * mem, uint32_t n_swa, uint32_t n_ubatch, std::map<ggml_backend_buffer_type_t, size_t> & out) {
+    auto add = [&out](const std::map<ggml_backend_buffer_type_t, size_t> & mb, double frac) {
+        for (const auto & [buft, size] : mb) {
+            out[buft] += (size_t) std::ceil(size * frac);
+        }
+    };
+    // a sequence holds at most n_swa + n_ubatch cells of the SWA cache, in one of its streams
+    auto add_swa = [&](const llama_kv_cache * kv) {
+        const double cells = std::min<double>(kv->get_size(), (double) n_swa + n_ubatch + 256);
+        add(kv->memory_breakdown(), cells / std::max<uint32_t>(1, kv->get_size()) / std::max<uint32_t>(1, kv->get_n_stream()));
+    };
+    // a recurrent sequence owns one cell
+    auto add_recr = [&](const llama_memory_recurrent * mr) {
+        add(mr->memory_breakdown(), 1.0 / std::max<uint32_t>(1, mr->size));
+    };
+    if (const auto * m = dynamic_cast<const llama_memory_hybrid_iswa *>(mem)) {
+        add_swa(m->get_mem_attn()->get_swa());
+        add_recr(m->get_mem_recr());
+        return true;
+    }
+    if (const auto * m = dynamic_cast<const llama_memory_hybrid *>(mem)) {
+        // also llama_memory_hybrid_idx: its indexer is written only with the attention cache
+        add_recr(m->get_mem_recr());
+        return true;
+    }
+    if (const auto * m = dynamic_cast<const llama_kv_cache_iswa *>(mem)) {
+        add_swa(m->get_swa());
+        return true;
+    }
+    if (const auto * m = dynamic_cast<const llama_kv_cache_dsa_iswa *>(mem)) {
+        add_swa(m->get_swa());
+        return true;
+    }
+    if (const auto * m = dynamic_cast<const llama_memory_recurrent *>(mem)) {
+        add_recr(m);
+        return true;
+    }
+    return false;
+}
+
+// Allocate the staging buffers of asynchronous PARTIAL_ONLY saves at their largest size now, while the context is idle.
+// Grown on demand inside a save instead, the first large save paid for the pinned allocation (cudaMallocHost: page pinning
+// plus an implicit synchronization) on the critical path of its prompt, with the device draining meanwhile.
+// LLAMA_STATE_ASYNC_RESERVE=N caps each buffer at N MiB (default 1024; 0 = off: staging buffers grow on demand, as before).
+size_t llama_context::state_async_reserve(llama_state_seq_flags flags) {
+    static const size_t cap = [] {
+        const char * e = getenv("LLAMA_STATE_ASYNC_RESERVE");
+        return (size_t) (e != nullptr ? std::max(0, atoi(e)) : 1024) * 1024 * 1024;
+    }();
+
+    if (state_async_disabled() || cap == 0 || !memory || (flags & ~LLAMA_STATE_SEQ_FLAGS_ASYNC) != LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) {
+        return 0;
+    }
+
+    std::map<ggml_backend_buffer_type_t, size_t> bound;
+    if (!state_partial_bound(memory.get(), model.hparams.n_swa, cparams.n_ubatch, bound)) {
+        return 0;
+    }
+
+    state_async_wait();
+    state_async_init_backends();
+
+    // per backend, as in state_get_async(); a row no backend can read asynchronously sends every save down the
+    // synchronous path, so nothing is reserved then
+    std::vector<size_t> need(state_async.size(), 0);
+    for (const auto & [buft, size] : bound) {
+        if (size == 0) {
+            continue;
+        }
+        if (ggml_backend_buft_is_host(buft)) {
+            return 0;
+        }
+        size_t b = 0;
+        for (; b < state_async.size(); ++b) {
+            if (ggml_backend_buft_get_device(buft) == state_async[b].dev && ggml_backend_supports_buft(state_async[b].backend, buft)) {
+                break;
+            }
+        }
+        if (b == state_async.size()) {
+            return 0;
+        }
+        need[b] += size;
+    }
+
+    size_t total = 0;
+    for (size_t b = 0; b < state_async.size(); ++b) {
+        auto & sa = state_async[b];
+        if (need[b] == 0) {
+            continue;
+        }
+        // room for the 64-byte alignment of each row in the staging buffer
+        const size_t size = std::min(cap, GGML_PAD(need[b] + need[b]/32 + 1024*1024, 4096));
+        if (sa.staging && ggml_backend_buffer_get_size(sa.staging.get()) >= size) {
+            continue;
+        }
+        ggml_backend_buffer_ptr buf(ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(sa.dev), size));
+        if (!buf) {
+            LLAMA_LOG_WARN("%s: failed to allocate a %.2f MiB staging buffer, it is allocated by the first save that needs it\n", __func__, size/1024.0/1024.0);
+            continue;
+        }
+        sa.staging = std::move(buf);
+        total += size;
+        LLAMA_LOG_INFO("%s: %s: %.2f MiB pinned staging buffer for asynchronous state saves\n", __func__, ggml_backend_dev_name(sa.dev), size/1024.0/1024.0);
+    }
+
+    return total;
+}
+
+// Read the state rows of an asynchronous save into dst without synchronizing the context.
+// Each row is read on the stream of the backend that owns it, so the read comes after the work already queued there
+// (e.g. the previous ubatch) and before any later graph changes the row. The rows land in a pinned staging buffer per
+// backend (reused across saves); a worker thread waits on an event per backend and copies them to dst, so the host is
+// free to prepare the next ubatch meanwhile. Rows in host buffers, or on a device without async copies and events,
+// take the synchronous path instead.
+void llama_context::state_get_async(const std::vector<llama_state_write_info> & winfos) {
+    // the previous save may still be reading the staging buffers
+    state_async_wait();
+
+    const bool disabled = state_async_disabled();
+
+    state_async_init_backends();
 
     // owning backend of each row
     std::vector<int> owner(winfos.size(), -1);
@@ -5786,6 +5912,10 @@ size_t llama_state_seq_set_data(llama_context * ctx, const uint8_t * src, size_t
 
 size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) {
     return ctx->state_seq_get_size(seq_id, flags);
+}
+
+size_t llama_state_seq_reserve_async(llama_context * ctx, llama_state_seq_flags flags) {
+    return ctx->state_async_reserve(flags);
 }
 
 size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
