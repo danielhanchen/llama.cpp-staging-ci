@@ -4733,34 +4733,44 @@ void llama_context::state_async_init_backends() {
     }
 }
 
-// The device bytes a PARTIAL_ONLY save of one sequence can read at most, per buffer type: the buffers of the parts of the
-// memory such a save writes. False for the memory types without a known bound (their staging buffers grow on demand).
-static bool state_partial_bound(const llama_memory_i * mem, std::map<ggml_backend_buffer_type_t, size_t> & out) {
-    auto add = [&out](const std::map<ggml_backend_buffer_type_t, size_t> & mb) {
+// The device bytes a PARTIAL_ONLY save of one sequence can read at most, per buffer type: the share of one sequence in the
+// buffers of the parts of the memory such a save writes. False for the memory types without a known bound (their staging
+// buffers grow on demand).
+static bool state_partial_bound(const llama_memory_i * mem, uint32_t n_swa, uint32_t n_ubatch, std::map<ggml_backend_buffer_type_t, size_t> & out) {
+    auto add = [&out](const std::map<ggml_backend_buffer_type_t, size_t> & mb, double frac) {
         for (const auto & [buft, size] : mb) {
-            out[buft] += size;
+            out[buft] += (size_t) std::ceil(size * frac);
         }
     };
+    // a sequence holds at most n_swa + n_ubatch cells of the SWA cache, in one of its streams
+    auto add_swa = [&](const llama_kv_cache * kv) {
+        const double cells = std::min<double>(kv->get_size(), (double) n_swa + n_ubatch + 256);
+        add(kv->memory_breakdown(), cells / std::max<uint32_t>(1, kv->get_size()) / std::max<uint32_t>(1, kv->get_n_stream()));
+    };
+    // a recurrent sequence owns one cell
+    auto add_recr = [&](const llama_memory_recurrent * mr) {
+        add(mr->memory_breakdown(), 1.0 / std::max<uint32_t>(1, mr->size));
+    };
     if (const auto * m = dynamic_cast<const llama_memory_hybrid_iswa *>(mem)) {
-        add(m->get_mem_attn()->get_swa()->memory_breakdown());
-        add(m->get_mem_recr()->memory_breakdown());
+        add_swa(m->get_mem_attn()->get_swa());
+        add_recr(m->get_mem_recr());
         return true;
     }
     if (const auto * m = dynamic_cast<const llama_memory_hybrid *>(mem)) {
         // also llama_memory_hybrid_idx: its indexer is written only with the attention cache
-        add(m->get_mem_recr()->memory_breakdown());
+        add_recr(m->get_mem_recr());
         return true;
     }
     if (const auto * m = dynamic_cast<const llama_kv_cache_iswa *>(mem)) {
-        add(m->get_swa()->memory_breakdown());
+        add_swa(m->get_swa());
         return true;
     }
     if (const auto * m = dynamic_cast<const llama_kv_cache_dsa_iswa *>(mem)) {
-        add(m->get_swa()->memory_breakdown());
+        add_swa(m->get_swa());
         return true;
     }
     if (const auto * m = dynamic_cast<const llama_memory_recurrent *>(mem)) {
-        add(m->memory_breakdown());
+        add_recr(m);
         return true;
     }
     return false;
@@ -4781,7 +4791,7 @@ size_t llama_context::state_async_reserve(llama_state_seq_flags flags) {
     }
 
     std::map<ggml_backend_buffer_type_t, size_t> bound;
-    if (!state_partial_bound(memory.get(), bound)) {
+    if (!state_partial_bound(memory.get(), model.hparams.n_swa, cparams.n_ubatch, bound)) {
         return 0;
     }
 
