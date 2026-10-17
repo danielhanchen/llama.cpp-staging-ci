@@ -1244,7 +1244,7 @@ static bool common_experts_on_offloaded_host(const common_params & params, const
 
 // bytes of one expert in the MoE cache: the sum over the expert tensors of the layer (the size of a slot) and the largest single tensor (the
 // size of a slot in its bank), with the number of experts, for the layer with the largest experts; false if the GGUF cannot be read
-struct common_moe_slot_bytes { int64_t n_expert = 0; int64_t sum = 0; int64_t max = 0; int64_t total = 0; int64_t n_layer = 0; };
+struct common_moe_slot_bytes { int64_t n_expert = 0; int64_t sum = 0; int64_t max = 0; int64_t total = 0; int64_t n_layer = 0; int64_t n_used = 0; };
 static bool common_moe_slot_bytes_of(const std::string & path, common_moe_slot_bytes & out) {
     std::string prefix;
     int n_split = 1;
@@ -1270,6 +1270,18 @@ static bool common_moe_slot_bytes_of(const std::string & path, common_moe_slot_b
             return false;
         }
         ggml_context_ptr meta_ptr(meta);
+        if (i == 0) { // experts per token (<arch>.expert_used_count), 0 if absent
+            const int64_t arch_id = gguf_find_key(ctx.get(), "general.architecture");
+            if (arch_id >= 0 && gguf_get_kv_type(ctx.get(), arch_id) == GGUF_TYPE_STRING) {
+                const std::string key = std::string(gguf_get_val_str(ctx.get(), arch_id)) + ".expert_used_count";
+                const int64_t kid = gguf_find_key(ctx.get(), key.c_str());
+                if (kid >= 0 && gguf_get_kv_type(ctx.get(), kid) == GGUF_TYPE_UINT32) {
+                    out.n_used = gguf_get_val_u32(ctx.get(), kid);
+                } else if (kid >= 0 && gguf_get_kv_type(ctx.get(), kid) == GGUF_TYPE_INT32) {
+                    out.n_used = gguf_get_val_i32(ctx.get(), kid);
+                }
+            }
+        }
         for (int64_t t = 0; t < gguf_get_n_tensors(ctx.get()); ++t) {
             const char * name = gguf_get_tensor_name(ctx.get(), t);
             if (strncmp(name, "blk.", 4) == 0 && strstr(name, "_exps") != nullptr) {
@@ -1293,11 +1305,13 @@ static bool common_moe_slot_bytes_of(const std::string & path, common_moe_slot_b
             l.max  = std::max(l.max, b);
         }
     }
+    const int64_t n_used = out.n_used;
     for (const auto & it : per_layer) {
         if (it.second.sum > out.sum) {
             out = it.second;
         }
     }
+    out.n_used  = n_used;
     out.total   = total;
     out.n_layer = (int64_t) per_layer.size();
     return out.sum > 0;
@@ -1484,6 +1498,67 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     }
     const int64_t cache     = (int64_t) params.moe_cache_size;
     const int64_t cache_ref = cache - std::max<int64_t>(0, m_ref.total - m_def.total);
+
+    // tiny cache: the cache holds the experts of fewer than LLAMA_MOE_PREFILL_UB_TINY_TOKENS (4, the minimum of the RAM tier,
+    // LLAMA_MOE_HOST_MIN_TOKENS) tokens of a model whose experts spill. A prompt ubatch then uploads every expert of every layer from the
+    // host (none from the cache) and decode misses most experts anyway, so the cache buys little, while every ubatch reads all the experts
+    // again: from disk when they do not fit in RAM. Qwen3.8-Flash-Next UD-IQ1_S on a T4 at 8 GB (31 GB RAM, the experts of 1.6 tokens on
+    // the device): an 8k prompt at n_ubatch 512 read 594 GB in 16 ubatches and ran 21% slower than the base, which keeps 6 whole layers
+    // on the device. Here n_ubatch grows (1024 ... LLAMA_MOE_PREFILL_UB_MAX) while the cache keeps at least
+    // LLAMA_MOE_PREFILL_UB_TINY_KEEP (0.25) of itself and the KV cache does not grow. LLAMA_MOE_PREFILL_UB_TINY=0 off, =N forces N here
+    {
+        common_moe_slot_bytes sbt;
+        const char * env_t   = getenv("LLAMA_MOE_PREFILL_UB_TINY");
+        const int    force_t = env_t != nullptr ? atoi(env_t) : -1;
+        double tiny_tokens = 4.0;
+        if (const char * e = getenv("LLAMA_MOE_PREFILL_UB_TINY_TOKENS")) {
+            tiny_tokens = std::max(0.0, atof(e));
+        }
+        double keep = 0.25;
+        if (const char * e = getenv("LLAMA_MOE_PREFILL_UB_TINY_KEEP")) {
+            keep = std::min(1.0, std::max(0.0, atof(e)));
+        }
+        if (force_t != 0 && force <= 0 && !rule_frac && common_moe_slot_bytes_of(params.model.path, sbt) && sbt.n_used > 0 && sbt.n_layer > 0) {
+            const double  token_bytes = (double) sbt.n_layer*(double) sbt.n_used*(double) sbt.sum;
+            const double  tokens      = (double) cache/token_bytes;
+            const int64_t all_exp     = (int64_t) (1.02*(double) sbt.total) + sbt.n_layer*sbt.sum;
+            if (tokens < tiny_tokens && cache < all_exp) {
+                std::vector<uint32_t> ct = { 1024, 2048, 4096, 8192 };
+                if (force_t > 0) {
+                    ct = { (uint32_t) force_t };
+                }
+                ct.erase(std::remove_if(ct.begin(), ct.end(), [&](uint32_t u) { return u <= ub_def || u > ub_lim || (force_t <= 0 && u > ub_max); }), ct.end());
+                uint32_t pick_t = ub_def;
+                mem      m_t    = m_def;
+                for (uint32_t u : ct) {
+                    const mem m = u == cands[0] ? m_ref : measure(u);
+                    const auto kv_t = [](const mem & x) { return x.total - x.compute - x.dft; };
+                    if (m.total < 0 || kv_t(m) > kv_t(m_def) + (1 << 20) || (double) (cache - (m.total - m_def.total)) < keep*(double) cache) {
+                        break;
+                    }
+                    pick_t = u;
+                    m_t    = m;
+                }
+                if (pick_t != ub_def) {
+                    const int64_t taken_t = std::max<int64_t>(0, m_t.total - m_def.total);
+                    COM_INF("MoE cache: n_ubatch = %u (default %u, rule: tiny cache, the experts of %.1f tokens < %.1f, experts spill): +%.2f MiB of compute "
+                        "and KV memory taken from the cache, %.2f -> %.2f MiB (the experts of %.1f tokens; LLAMA_MOE_PREFILL_UB_TINY=0 to disable)\n",
+                        pick_t, ub_def, tokens, tiny_tokens, taken_t/1048576.0, cache/1048576.0, (cache - taken_t)/1048576.0, (cache - taken_t)/token_bytes);
+                    params.n_ubatch  = (int32_t) pick_t;
+                    cparams.n_ubatch = pick_t;
+                    if (!params.n_batch_set) {
+                        params.n_batch  = std::max<int32_t>(params.n_batch, (int32_t) pick_t);
+                        cparams.n_batch = std::max<uint32_t>(cparams.n_batch, pick_t);
+                    }
+                    params.moe_cache_size  = (size_t) (cache - taken_t);
+                    cparams.moe_cache_size = (size_t) (cache - taken_t);
+                    return;
+                }
+                COM_INF("MoE cache: tiny cache (the experts of %.1f tokens < %.1f) but no larger n_ubatch keeps %.0f%% of it, n_ubatch stays %u\n",
+                    tokens, tiny_tokens, 100.0*keep, ub_def);
+            }
+        }
+    }
     if (cache_ref < cache/2) {
         COM_INF("MoE cache: n_ubatch stays %u, n_ubatch %u would take %.2f of %.2f MiB from the cache\n", ub_def, cands[0],
             (m_ref.total - m_def.total)/1048576.0, cache/1048576.0);
