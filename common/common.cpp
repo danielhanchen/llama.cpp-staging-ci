@@ -1606,9 +1606,33 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     // gained +13% / +94% / +107% (2k / 8k / 16k) but the decode after it lost 4.5% / 9.3% / 0% (the cache is 18% smaller there and the
     // graph lends 29% of it during a prompt)
     const int  spill_lend_mode = getenv("LLAMA_MOE_SPILL_LEND") != nullptr ? atoi(getenv("LLAMA_MOE_SPILL_LEND")) : 1;
+    // and only while the experts left on the host are at most LLAMA_MOE_SPILL_LEND_MAX_RAM_FRAC (0.5) of the RAM (Linux): the slots lent to a
+    // prompt graph are refilled from the host experts after it, which on a host whose page cache cannot keep them reads them from the
+    // disk again (L4 24 GB, 52 GB RAM, Flash-Next UD-IQ4_XS from the VM disk: decode after an 8k prompt 12.5 -> 7.6 tok/s)
+    bool spill_lend_ram = true;
+#ifdef __linux__
+    {
+        double ram_frac = 0.5;
+        if (const char * e = getenv("LLAMA_MOE_SPILL_LEND_MAX_RAM_FRAC")) {
+            ram_frac = std::max(0.0, atof(e));
+        }
+        if (FILE * fm = fopen("/proc/meminfo", "r")) {
+            char line[256];
+            long long total_kb = 0;
+            while (fgets(line, sizeof(line), fm)) {
+                if (sscanf(line, "MemTotal: %lld kB", &total_kb) == 1) {
+                    break;
+                }
+            }
+            fclose(fm);
+            const double host_experts = std::max(0.0, (double) sb.total - (double) cache_ref);
+            spill_lend_ram = total_kb <= 0 || host_experts <= ram_frac*(double) total_kb*1024.0;
+        }
+    }
+#endif
     const bool spill_lend = env_l == nullptr && !rule_frac && have_sb && cache_ref < all_experts &&
         (double) cache_ref <= spill_lend_max_frac*(double) sb.total &&
-        (spill_lend_mode >= 2 || (spill_lend_mode == 1 && !has_spec)) &&
+        (spill_lend_mode >= 2 || (spill_lend_mode == 1 && !has_spec && spill_lend_ram)) &&
         !(getenv("LLAMA_MOE_PREFILL_UB_SPILL") != nullptr && atoi(getenv("LLAMA_MOE_PREFILL_UB_SPILL")) != 0);
     bool lend_graph = ((env_l != nullptr && atoi(env_l) == 2) || spill_lend) && force <= 0 && m_def.n_dev == 1 && have_sb;
     double lend_frac = 0.85;
