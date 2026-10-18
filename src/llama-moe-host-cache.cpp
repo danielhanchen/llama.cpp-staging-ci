@@ -51,8 +51,8 @@ llama_moe_host_plan llama_moe_host_decide(size_t e_bytes, size_t v_bytes, size_t
 }
 
 llama_moe_host_cache::llama_moe_host_cache(ggml_backend_buffer_type_t buft, size_t budget, int policy, int32_t n_expert,
-        const std::vector<std::vector<size_t>> & layer_sizes, size_t chunk_size) :
-        buft(buft), budget(budget), policy(policy), n_expert(n_expert), chunk_size(chunk_size ? chunk_size : (size_t) 256 << 20) {
+        const std::vector<std::vector<size_t>> & layer_sizes, size_t chunk_size, ggml_backend_buffer_type_t buft_pageable, size_t pin_cap) :
+        buft(buft), buft_pageable(buft_pageable), pin_cap(pin_cap), budget(budget), policy(policy), n_expert(n_expert), chunk_size(chunk_size ? chunk_size : (size_t) 256 << 20) {
     layer_class.assign(layer_sizes.size(), -1);
     slot_of.resize(layer_sizes.size());
     std::vector<int32_t> n_layers;
@@ -136,16 +136,36 @@ bool llama_moe_host_cache::alloc_chunk(klass & c) {
         return false;
     }
     const int32_t n = std::min(c.per_chunk, c.n - c.n_alloc);
+    const size_t  size = (size_t) n*c.slot_bytes + k_page;
     const int64_t t0 = ggml_time_us();
-    ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(buft, (size_t) n*c.slot_bytes + k_page);
-    if (b != nullptr && ggml_backend_buffer_get_type(b) != buft) {
-        // e.g. the CUDA host buffer type falls back to pageable memory when pinning fails: slow copies, the tier stops growing
-        ggml_backend_buffer_free(b);
-        b = nullptr;
+    ggml_backend_buffer_t b = nullptr;
+    bool pageable = false;
+    if (!pin_failed && pinned_bytes() + size <= pin_cap) {
+        b = ggml_backend_buft_alloc_buffer(buft, size);
+        if (b != nullptr && ggml_backend_buffer_get_type(b) != buft) {
+            // e.g. the CUDA host buffer type falls back to pageable memory when pinning fails: no more pinning tries
+            pin_failed = true;
+            if (buft_pageable != nullptr) {
+                pageable = true; // plain host memory: keep it
+            } else {
+                ggml_backend_buffer_free(b); // slow copies: the tier stops growing
+                b = nullptr;
+            }
+        } else if (b == nullptr) {
+            pin_failed = true;
+        }
+    }
+    if (b == nullptr && buft_pageable != nullptr && (pin_failed || pinned_bytes() + size > pin_cap)) {
+        b = ggml_backend_buft_alloc_buffer(buft_pageable, size);
+        pageable = b != nullptr;
+    }
+    if (pageable) {
+        st.pin_fallbacks++;
+        bytes_pageable += ggml_backend_buffer_get_size(b);
     }
     st.alloc_us += ggml_time_us() - t0;
     if (b == nullptr) {
-        // no more pinned memory: the tier keeps what it has
+        // no more (pinned) memory: the tier keeps what it has
         st.alloc_fail++;
         c.n = c.n_alloc;
         return false;
@@ -258,7 +278,7 @@ void llama_moe_host_cache::evict(int32_t s) {
     gen++;
 }
 
-int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict) {
+int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict, uint32_t min_age) {
     if (!caches(il) || slot_of[il][e] >= 0) {
         return -1;
     }
@@ -281,6 +301,9 @@ int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict) {
             // copies back from the device count once committed (reserve waits for them before the slot is written)
             if ((sl.state != SLOT_VALID && sl.state != SLOT_WRITING) || sl.pin == call_epoch || sl.lease_id == plan_id ||
                     sl.read_seq == seq_next || sl.write_seq == seq_next) {
+                continue;
+            }
+            if (min_age > 0 && std::max(sl.read_seq, sl.write_seq) + min_age >= seq_next && std::max(sl.read_seq, sl.write_seq) > seq_done) {
                 continue;
             }
             if (sl.count > 0) {
@@ -306,6 +329,7 @@ int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict) {
     sl.count  = 1;
     sl.done   = 0;
     sl.pieces = 0;
+    sl.async  = 0;
     for (int ip = 0; ip < max_tensors; ++ip) {
         leads[(size_t) s*max_tensors + ip] = 0;
         got[(size_t) s*max_tensors + ip]   = 0;
@@ -322,6 +346,7 @@ void llama_moe_host_cache::publish(int32_t s) {
     }
     sl.state = sl.state == SLOT_WRITING ? SLOT_WRITING : SLOT_VALID;
     sl.pieces = 0;
+    sl.async  = 0;
     st.published++;
     st.peak_held = std::max(st.peak_held, n_held);
     gen++;
@@ -333,6 +358,7 @@ void llama_moe_host_cache::abort(int32_t s) {
     set_key(s, -1);
     sl.state  = SLOT_FREE;
     sl.pieces = 0;
+    sl.async  = 0;
     classes[slot_class[s]].free_list.push_back(s);
     st.aborted++;
 }
@@ -343,6 +369,7 @@ void llama_moe_host_cache::release(int32_t s) {
         return;
     }
     if (sl.state == SLOT_FILLING) {
+        GGML_ASSERT(!sl.async && "moe host cache: a slot being read asynchronously is released");
         abort(s);
         return;
     }
@@ -374,7 +401,7 @@ void llama_moe_host_cache::pin(int32_t s) {
 void llama_moe_host_cache::new_plan() {
     plan_id++;
     for (size_t s = 0; s < slots.size(); ++s) {
-        if (slots[s].state == SLOT_FILLING && slots[s].pieces) {
+        if (slots[s].state == SLOT_FILLING && slots[s].pieces && !slots[s].async) {
             abort((int32_t) s);
         }
     }
@@ -388,9 +415,16 @@ bool llama_moe_host_cache::filling(int32_t s) const {
     return slots[s].state == SLOT_FILLING;
 }
 
+void llama_moe_host_cache::set_async(int32_t s, uint8_t count) {
+    slot_t & sl = slots[s];
+    GGML_ASSERT(sl.state == SLOT_FILLING && !sl.pieces);
+    sl.async = 1;
+    sl.count = count;
+}
+
 bool llama_moe_host_cache::fill_piece(int32_t s, int ip, size_t off, const uint8_t * p, size_t n) {
     slot_t & sl = slots[s];
-    if (sl.state != SLOT_FILLING) {
+    if (sl.state != SLOT_FILLING || sl.async) {
         return false;
     }
     sl.pieces = 1;

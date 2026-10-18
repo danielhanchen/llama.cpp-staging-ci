@@ -61,7 +61,7 @@ static ggml_backend_buffer_t other_type_alloc(ggml_backend_buffer_type_t, size_t
 }
 
 struct fault {
-    std::atomic<int> mode { 0 }; // 0 none, 4 corrupt one byte of the second read, 5 EIO always
+    std::atomic<int> mode { 0 }; // 0 none, 4 corrupt one byte of the second read, 5 EIO always, 6 slow (2 ms per read)
     std::atomic<int> calls { 0 };
 };
 
@@ -70,6 +70,9 @@ static int64_t read_hook(int fd, void * buf, size_t n, uint64_t off, bool, void 
     const int c = f->calls.fetch_add(1);
     if (f->mode.load() == 5) {
         return -EIO;
+    }
+    if (f->mode.load() == 6) {
+        usleep(2000);
     }
     const ssize_t r = pread(fd, buf, n, (off_t) off);
     if (r < 0) {
@@ -333,6 +336,93 @@ static void test_slots(ggml_backend_t backend) {
         llama_moe_host_cache hc(&fb, 4*24576, LLAMA_MOE_HOST_EXCLUSIVE, n_expert, { {}, {}, { 3000, 3000 } });
         CHECK(hc.reserve(2, 0) < 0);
         CHECK(hc.st.alloc_fail == 1 && hc.pinned_bytes() == 0);
+    }
+
+    // pin guard: pinning fails -> pageable chunks (the tier keeps growing); a pin cap -> pageable past it
+    {
+        ggml_backend_buffer_type fb = *ggml_backend_cpu_buffer_type();
+        fb.iface.alloc_buffer = other_type_alloc;
+        llama_moe_host_cache hc(&fb, 4*24576, LLAMA_MOE_HOST_EXCLUSIVE, n_expert, { {}, {}, { 3000, 3000 } }, 0, ggml_backend_cpu_buffer_type());
+        for (int32_t e = 0; e < 4; ++e) {
+            const int32_t s = hc.reserve(2, e);
+            CHECK(s >= 0);
+            if (s >= 0) {
+                hc.publish(s);
+            }
+        }
+        CHECK(hc.st.alloc_fail == 0 && hc.pinned_bytes() == 0 && hc.pageable_bytes() > 0 && hc.st.pin_fallbacks >= 1);
+    }
+    {
+        ggml_backend_buffer_type fb = *ggml_backend_cpu_buffer_type();
+        fb.iface.alloc_buffer = failing_alloc;
+        g_alloc_limit = 1 << 30;
+        g_alloc_count = 0;
+        // chunks of 2 slots (2*24576 + 4 KiB each), at most one chunk pinned
+        llama_moe_host_cache hc(&fb, 8*24576, LLAMA_MOE_HOST_EXCLUSIVE, n_expert, { {}, {}, { 3000, 3000 } }, 2*24576, ggml_backend_cpu_buffer_type(),
+                2*24576 + 4096);
+        for (int32_t e = 0; e < 8; ++e) {
+            const int32_t s = hc.reserve(2, e);
+            CHECK(s >= 0);
+            if (s >= 0) {
+                hc.publish(s);
+            }
+        }
+        CHECK(g_alloc_count == 1);
+        CHECK(hc.pinned_bytes() == 2*24576 + 4096 && hc.pageable_bytes() == 3*(2*24576 + 4096) && hc.st.pin_fallbacks == 3);
+        int held = 0;
+        for (int32_t e = 0; e < 8; ++e) {
+            held += hc.find(2, e, false) >= 0;
+        }
+        CHECK(held == 8);
+        // no pageable memory either: the tier stops growing at the cap
+        g_alloc_count = 0;
+        llama_moe_host_cache hc2(&fb, 8*24576, LLAMA_MOE_HOST_EXCLUSIVE, n_expert, { {}, {}, { 3000, 3000 } }, 2*24576, nullptr, 2*24576 + 4096);
+        for (int32_t e = 0; e < 3; ++e) {
+            const int32_t s = hc2.reserve(2, e);
+            if (s >= 0) {
+                hc2.publish(s);
+            }
+        }
+        CHECK(hc2.st.alloc_fail == 1 && hc2.pinned_bytes() == 2*24576 + 4096 && hc2.pageable_bytes() == 0);
+    }
+
+    // a slot filled by an asynchronous read: pieces, new_plan and eviction leave it alone; min_age keeps the slots of recent commits
+    {
+        llama_moe_host_cache hc(ggml_backend_cpu_buffer_type(), 2*24576, LLAMA_MOE_HOST_INCLUSIVE, n_expert, { {}, {}, { 3000, 3000 } });
+        CHECK(hc.n_slots() == 2);
+        const int32_t sa = hc.reserve(2, 5);
+        CHECK(sa >= 0);
+        hc.set_async(sa, 1);
+        CHECK(hc.is_async(sa));
+        uint8_t junk[3000] = {};
+        CHECK(!hc.fill_piece(sa, 0, 0, junk, 3000));
+        hc.new_plan();
+        CHECK(hc.filling(sa) && hc.contains(2, 5) && hc.find(2, 5, false) < 0);
+        const int32_t sb = hc.reserve(2, 6);
+        CHECK(sb >= 0 && sb != sa);
+        hc.publish(sb);
+        const int32_t s7r = hc.reserve(2, 7); // evicts sb (the only valid slot), never sa
+        CHECK(s7r == sb);
+        CHECK(hc.contains(2, 5) && hc.filling(sa));
+        hc.publish(sa);
+        CHECK(!hc.is_async(sa) && hc.find(2, 5, false) == sa);
+        // sa read by the last commit: min_age only skips slots whose copies are not known to be done (the CPU backend completes them at
+        // the commit), so the reservation takes a slot without waiting
+        hc.mark_read(sa);
+        hc.commit(backend);
+        const int32_t s7 = hc.slot_of_key(2, 7);
+        if (s7 >= 0) {
+            hc.abort(s7);
+        }
+        const int32_t sb2 = hc.reserve(2, 3);
+        CHECK(sb2 >= 0);
+        if (sb2 >= 0) {
+            hc.publish(sb2);
+            hc.mark_read(sb2);
+            hc.commit(backend);
+        }
+        CHECK(hc.reserve(2, 4, true, 4) >= 0);
+        CHECK(hc.st.waits == 0);
     }
 
     // no budget
@@ -605,6 +695,94 @@ int main(int argc, char ** argv) {
             if (fmode == 5) {
                 CHECK(st.fallback_bytes > 0);
             }
+        }
+    }
+
+    // speculative reads into slots (reads ahead): exact with faults, VERIFY repairs, done / wait, demand reads go first, the store's
+    // destructor completes the reads it was not asked to wait for
+    for (int fmode : { 0, 4, 5, 6 }) {
+        fault flt;
+        flt.mode = fmode;
+        llama_moe_host_cache hc(ggml_backend_cpu_buffer_type(), 16*slot_bytes, LLAMA_MOE_HOST_INCLUSIVE, n_expert, sizes);
+        std::vector<int32_t> sl(n_expert, -1);
+        std::vector<std::vector<llama_weight_store::host_read>> rd(n_expert);
+        std::vector<uint64_t> tk(n_expert, 0);
+        auto check_slot = [&](int32_t e, const char * what) {
+            for (int t = 0; t < 3; ++t) {
+                hc.set_lead(sl[e], t, rd[e][t].lead);
+                if (memcmp(hc.data(sl[e], t), file_bytes(t, e), src[t]->nb[2]) != 0) {
+                    fprintf(stderr, "%s fault %d: expert %d tensor %d differs\n", what, fmode, e, t);
+                    n_fail++;
+                }
+            }
+        };
+        {
+            llama_weight_store_params p;
+            p.io = LLAMA_WEIGHT_STREAM_IO_AUTO; p.n_threads = 2; p.verify = fmode == 4; p.ram_avail = (size_t) 1 << 30;
+            llama_weight_store ws(ext, p);
+            if (fmode) {
+                ws.set_read_fn(read_hook, &flt);
+            }
+            for (int32_t e = 0; e < n_expert; ++e) {
+                sl[e] = hc.reserve(0, e);
+                CHECK(sl[e] >= 0);
+                for (int t = 0; t < 3; ++t) {
+                    rd[e].push_back({ src[t], (size_t) e*src[t]->nb[2], src[t]->nb[2], hc.area(sl[e], t), 0 });
+                }
+            }
+            for (int32_t e = 0; e < 12; ++e) {
+                tk[e] = ws.read_host_async(rd[e].data(), rd[e].size(), true);
+                CHECK(tk[e] != 0);
+                hc.set_async(sl[e], 1);
+            }
+            // a demand read while the speculative ones are queued: it goes first and is exact
+            CHECK(ws.read_host(rd[15].data(), rd[15].size(), true));
+            check_slot(15, "demand behind speculative");
+            hc.publish(sl[15]);
+            // wait for the last one queued (moved in front), poll the others
+            ws.host_wait(tk[11]);
+            check_slot(11, "speculative waited");
+            hc.publish(sl[11]);
+            for (int32_t e = 0; e < 11; ++e) {
+                if (e % 2 == 0) {
+                    ws.host_wait(tk[e]);
+                } else {
+                    while (!ws.host_done(tk[e])) {
+                        usleep(100);
+                    }
+                }
+                CHECK(ws.host_done(tk[e])); // collected: done
+                check_slot(e, "speculative");
+                hc.publish(sl[e]);
+            }
+            // not waited for: the store's destructor completes them
+            tk[12] = ws.read_host_async(rd[12].data(), rd[12].size(), false);
+            tk[13] = ws.read_host_async(rd[13].data(), rd[13].size(), true);
+            CHECK(tk[12] != 0 && tk[13] != 0);
+            const auto st = ws.get_stats();
+            CHECK(st.spec_bytes == 14*(src[0]->nb[2] + src[1]->nb[2] + src[2]->nb[2]));
+            if (fmode == 6) {
+                CHECK(st.spec_boosted >= 1);
+            }
+            if (fmode == 4) {
+                CHECK(st.verify_mismatch == 1);
+            }
+            if (fmode == 5) {
+                CHECK(st.fallback_bytes > 0);
+            }
+            printf("speculative fault %d: %llu reads, %.2f MiB, %llu boosted, %.1f ms waiting\n", fmode, (unsigned long long) st.spec_reads,
+                    st.spec_bytes/1048576.0, (unsigned long long) st.spec_boosted, st.spec_wait_us/1000.0);
+        }
+        check_slot(12, "speculative at destruction");
+        check_slot(13, "speculative at destruction");
+        // an uncovered source: no ticket, nothing read
+        {
+            llama_weight_store_params p;
+            p.n_threads = 1; p.ram_avail = (size_t) 1 << 30;
+            llama_weight_store ws(ext, p);
+            llama_weight_store::host_read bad = { dst[0], 0, 100, hc.area(sl[14], 0), 0 };
+            CHECK(ws.read_host_async(&bad, 1, true) == 0);
+            CHECK(ws.host_done(0));
         }
     }
 

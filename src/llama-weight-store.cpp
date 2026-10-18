@@ -344,6 +344,15 @@ struct llama_weight_store::impl {
     std::vector<const ggml_tensor *> cur_plan;
     std::vector<ws_plan_entry>       plan_entries;
     std::deque<ws_task *> demand;
+    // speculative reads into host memory (read_host_async): taken only when no demand read waits and the ring has nothing to read
+    struct spec_req {
+        std::vector<ws_task> tasks;
+        std::atomic<int>     remaining{0};
+        size_t               bytes = 0;
+    };
+    std::deque<ws_task *> spec;
+    std::unordered_map<uint64_t, std::unique_ptr<spec_req>> spec_reqs; // tickets not collected yet (main thread)
+    uint64_t spec_next = 1;
 
     std::vector<std::thread> threads;
 
@@ -359,6 +368,7 @@ struct llama_weight_store::impl {
     llama_weight_tier * tier = nullptr;
     uint64_t plan_tier_gen = 0; // generation of the tier when the plan was built
     std::atomic<uint64_t> s_tier_skipped{0}, s_tier_uploaded{0}, s_host_reads{0}, s_host_read_bytes{0}, s_device_skipped{0};
+    std::atomic<uint64_t> s_spec_reads{0}, s_spec_bytes{0}, s_spec_boosted{0}, s_spec_wait_us{0};
 
     impl(std::shared_ptr<const llama_weight_extents> e, const llama_weight_store_params & p) : ext(std::move(e)), params(p) {
         if (params.chunk == 0) {
@@ -388,7 +398,22 @@ struct llama_weight_store::impl {
 
     ~impl() {
         {
-            std::lock_guard<std::mutex> lock(mtx);
+            // the speculative reads write memory of the caller: every one is done before the store goes
+            std::unique_lock<std::mutex> lock(mtx);
+            while (!spec.empty()) {
+                demand.push_back(spec.front());
+                spec.pop_front();
+            }
+            cv_io.notify_all();
+            cv_main.wait(lock, [&]() {
+                for (const auto & [id, r] : spec_reqs) {
+                    if (r->remaining.load() != 0) {
+                        return false;
+                    }
+                }
+                return true;
+            });
+            spec_reqs.clear();
             stop = true;
         }
         cv_io.notify_all();
@@ -832,6 +857,18 @@ struct llama_weight_store::impl {
                     continue;
                 }
             }
+            if (!spec.empty()) {
+                ws_task * t = spec.front();
+                spec.pop_front();
+                lock.unlock();
+                read_exact(t->file, t->foff, t->len, t->base, t->lead, t->direct && file_direct_ok(t->file));
+                s_spec_reads++;
+                lock.lock();
+                if (t->remaining->fetch_sub(1) == 1) {
+                    cv_main.notify_all();
+                }
+                continue;
+            }
             cv_io.wait(lock);
         }
     }
@@ -1021,6 +1058,82 @@ struct llama_weight_store::impl {
             s_host_read_bytes += reads[i].size;
         }
         return true;
+    }
+
+    // speculative reads into host memory, see llama_weight_store::read_host_async
+    uint64_t read_host_async(host_read * reads, size_t n, bool direct) {
+        auto req = std::make_unique<spec_req>();
+        req->tasks.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            uint64_t offs = 0;
+            const llama_weight_extent * e = ext->find(reads[i].src, &offs);
+            if (e == nullptr || reads[i].src_off + reads[i].size > ggml_nbytes(reads[i].src)) {
+                s_not_covered++;
+                return 0;
+            }
+            const uint64_t foff = offs + reads[i].src_off;
+            reads[i].lead = (size_t) (foff % k_align);
+            req->tasks.push_back({ e->file, foff, reads[i].size, reads[i].lead, reads[i].area, direct, &req->remaining });
+            req->bytes += reads[i].size;
+        }
+        if (n == 0) {
+            return 0;
+        }
+        req->remaining.store((int) n);
+        std::lock_guard<std::mutex> lock(mtx);
+        const uint64_t id = spec_next++;
+        for (auto & t : req->tasks) {
+            spec.push_back(&t);
+        }
+        s_spec_bytes += req->bytes;
+        spec_reqs.emplace(id, std::move(req));
+        cv_io.notify_all();
+        return id;
+    }
+
+    bool host_done(uint64_t id) {
+        std::lock_guard<std::mutex> lock(mtx);
+        const auto it = spec_reqs.find(id);
+        if (it == spec_reqs.end()) {
+            return true;
+        }
+        if (it->second->remaining.load() != 0) {
+            return false;
+        }
+        spec_reqs.erase(it);
+        return true;
+    }
+
+    void host_wait(uint64_t id) {
+        std::unique_lock<std::mutex> lock(mtx);
+        const auto it = spec_reqs.find(id);
+        if (it == spec_reqs.end()) {
+            return;
+        }
+        spec_req & r = *it->second;
+        if (r.remaining.load() != 0) {
+            // its reads that did not start go in front of the demand reads: the caller needs them now
+            const ws_task * b = r.tasks.data();
+            const ws_task * e = b + r.tasks.size();
+            bool moved = false;
+            for (auto q = spec.begin(); q != spec.end(); ) {
+                if (*q >= b && *q < e) {
+                    demand.push_front(*q);
+                    q = spec.erase(q);
+                    moved = true;
+                } else {
+                    ++q;
+                }
+            }
+            if (moved) {
+                s_spec_boosted++;
+                cv_io.notify_all();
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            cv_main.wait(lock, [&]() { return r.remaining.load() == 0; });
+            s_spec_wait_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+        }
+        spec_reqs.erase(id);
     }
 
     // demand reads: all regions read in parallel into a half of the demand area, then uploaded
@@ -1376,6 +1489,26 @@ bool llama_weight_store::read_host(host_read * reads, size_t n, bool direct) {
     return pimpl->read_host(reads, n, direct);
 }
 
+uint64_t llama_weight_store::read_host_async(host_read * reads, size_t n, bool direct) {
+    for (size_t i = 0; i < n; ++i) {
+        if (!covers(reads[i].src)) {
+            pimpl->s_not_covered++;
+            return 0;
+        }
+    }
+    return pimpl->read_host_async(reads, n, direct);
+}
+
+bool llama_weight_store::host_done(uint64_t ticket) {
+    return ticket == 0 || pimpl->host_done(ticket);
+}
+
+void llama_weight_store::host_wait(uint64_t ticket) {
+    if (ticket != 0) {
+        pimpl->host_wait(ticket);
+    }
+}
+
 void llama_weight_store::set_tier(llama_weight_tier * tier) {
     pimpl->tier = tier;
     pimpl->cur_plan.clear(); // the next plan is built with it
@@ -1407,6 +1540,10 @@ llama_weight_store::stats llama_weight_store::get_stats() const {
     s.wait_us         = d.s_wait_us;
     s.not_covered     = d.s_not_covered;
     s.cached_bytes    = d.s_cached_bytes;
+    s.spec_reads      = d.s_spec_reads;
+    s.spec_bytes      = d.s_spec_bytes;
+    s.spec_boosted    = d.s_spec_boosted;
+    s.spec_wait_us    = d.s_spec_wait_us;
     return s;
 }
 
@@ -1422,6 +1559,10 @@ void llama_weight_store::log_stats() const {
     if (s.tier_skipped > 0 || s.tier_uploaded > 0 || s.host_reads > 0) {
         LLAMA_LOG_INFO("%s: host tier: %.1f MiB skipped by the reads ahead, %.1f MiB uploaded from it, %llu reads into it = %.1f MiB, %.1f MiB skipped as held by the device\n", __func__,
                 s.tier_skipped*mib, s.tier_uploaded*mib, (unsigned long long) s.host_reads, s.host_read_bytes*mib, pimpl->s_device_skipped.load()*mib);
+    }
+    if (s.spec_bytes > 0) {
+        LLAMA_LOG_INFO("%s: speculative reads into the host tier: %llu reads, %.1f MiB, %llu waited for before they started, %.1f ms waiting\n", __func__,
+                (unsigned long long) s.spec_reads, s.spec_bytes*mib, (unsigned long long) s.spec_boosted, s.spec_wait_us/1000.0);
     }
     if (pimpl->params.verify) {
         LLAMA_LOG_INFO("%s: VERIFY %llu regions, %.1f MiB, %llu mismatches\n", __func__, (unsigned long long) s.verify_regions, s.verify_bytes*mib,

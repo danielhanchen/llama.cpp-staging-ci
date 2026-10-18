@@ -146,6 +146,13 @@ public:
     };
     bool read_host(host_read * reads, size_t n, bool direct);
 
+    // the same reads, speculative (e.g. the experts a layer ahead is expected to route): queued behind every demand read and read
+    // ahead, returns at once with a ticket (0: a source is not covered, nothing is read); the areas must stay valid until the ticket
+    // is done or waited for (the store's destructor also waits for them)
+    uint64_t read_host_async(host_read * reads, size_t n, bool direct);
+    bool     host_done(uint64_t ticket); // true once its reads are complete (the ticket is then collected), never blocks
+    void     host_wait(uint64_t ticket); // its reads that did not start move in front of the demand reads, then waits (collects it)
+
     // the tier in front of the model files, nullptr = none
     void set_tier(llama_weight_tier * tier);
 
@@ -173,6 +180,10 @@ public:
         uint64_t wait_us         = 0; // main thread waiting for reads
         uint64_t not_covered     = 0;
         uint64_t cached_bytes    = 0; // prefetched bytes copied from the resident pages of the mapping (auto)
+        uint64_t spec_reads      = 0; // read_host_async reads done
+        uint64_t spec_bytes      = 0; // read_host_async bytes issued
+        uint64_t spec_boosted    = 0; // tickets waited for before all of their reads started
+        uint64_t spec_wait_us    = 0; // main thread waiting in host_wait
     };
     stats get_stats() const;
     void  log_stats() const;

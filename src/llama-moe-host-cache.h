@@ -48,8 +48,10 @@ public:
     // layer_sizes[il]: bytes of one expert of each expert tensor of layer il (nb[2]), empty if the layer is not cached
     // buft: host buffer type of the slots (pinned memory of the device, plain host memory in tests)
     // the budget is split among the layouts like the experts, the slot memory is allocated in chunks when it is first needed
+    // pin guard: at most pin_cap bytes come from buft; past it, or once buft cannot pin (it returns another type), the chunks come from
+    // buft_pageable (plain host memory: slower copies, but RAM hits instead of reads), nullptr = the tier stops growing there
     llama_moe_host_cache(ggml_backend_buffer_type_t buft, size_t budget, int policy, int32_t n_expert, const std::vector<std::vector<size_t>> & layer_sizes,
-            size_t chunk_size = 0);
+            size_t chunk_size = 0, ggml_backend_buffer_type_t buft_pageable = nullptr, size_t pin_cap = SIZE_MAX);
     ~llama_moe_host_cache();
 
     llama_moe_host_cache(const llama_moe_host_cache &) = delete;
@@ -57,7 +59,8 @@ public:
 
     bool    exclusive() const { return policy == LLAMA_MOE_HOST_EXCLUSIVE; }
     int32_t n_slots() const;   // slots of the budget (allocated or not)
-    size_t  pinned_bytes() const { return bytes_alloc; }
+    size_t  pinned_bytes() const { return bytes_alloc - bytes_pageable; }
+    size_t  pageable_bytes() const { return bytes_pageable; }
     size_t  budget_bytes() const { return budget; }
     bool    caches(int32_t il) const { return il >= 0 && (size_t) il < layer_class.size() && layer_class[il] >= 0; }
 
@@ -71,8 +74,9 @@ public:
 
     // a slot for expert e of layer il (not held), being filled: evicts the expert with the lowest decayed count (CLOCK) that is not
     // pinned, leased or being filled if no slot is free, and waits for the copies that still read the slot; -1 if none can be taken
-    // evict = false: only a free slot (or memory still in the budget)
-    int32_t reserve(int32_t il, int32_t e, bool evict = true);
+    // evict = false: only a free slot (or memory still in the budget); min_age > 0: never evicts a slot read or written by the last
+    // min_age commits (the reservation then never waits for the device)
+    int32_t reserve(int32_t il, int32_t e, bool evict = true, uint32_t min_age = 0);
     void    publish(int32_t s);  // the slot holds its expert
     void    abort(int32_t s);    // the slot is free again
     void    release(int32_t s);  // drops the expert (exclusive promotion), the slot is reused once the copies that read it are done
@@ -102,6 +106,11 @@ public:
     bool fill_piece(int32_t s, int ip, size_t off, const uint8_t * p, size_t n);
     bool filling(int32_t s) const;
 
+    // a reserved slot filled by an asynchronous read (e.g. a read ahead of the routing): fill_piece and new_plan leave it alone until
+    // it is published or aborted; count: its decayed count (0: the first to go if it is not used)
+    void set_async(int32_t s, uint8_t count);
+    bool is_async(int32_t s) const { return slots[s].async != 0; }
+
     // events: the copies that read slots (mark_read) or write them (mark_write, e.g. device -> host) since the last commit are recorded
     // on backend; a slot is reused or read by the host only after them
     void mark_read(int32_t s);
@@ -123,6 +132,7 @@ public:
         uint64_t waits      = 0; // event waits before a slot was reused or read
         uint64_t alloc_fail = 0;
         uint64_t alloc_us   = 0; // time spent allocating (pinning) slot memory
+        uint64_t pin_fallbacks = 0; // chunks allocated pageable (pin cap reached or pinning failed)
         size_t   peak_held  = 0; // most slots holding an expert at once
     };
     stats st;
@@ -138,6 +148,7 @@ private:
         uint8_t  count    = 0;  // decayed use count (CLOCK)
         uint8_t  done     = 0;  // fill_piece: mask of the complete tensors
         uint8_t  pieces   = 0;  // the slot is filled from pieces
+        uint8_t  async    = 0;  // filled by an asynchronous read (see set_async)
         uint32_t pin      = 0;  // call epoch that pinned it
         uint32_t lease_id = 0;  // plan that leased it
         uint64_t read_seq  = 0; // last commit that reads it
@@ -165,6 +176,10 @@ private:
     };
 
     ggml_backend_buffer_type_t buft;
+    ggml_backend_buffer_type_t buft_pageable;
+    size_t  pin_cap;
+    bool    pin_failed = false;
+    size_t  bytes_pageable = 0;
     size_t  budget;
     int     policy;
     int32_t n_expert;
