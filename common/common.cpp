@@ -2720,7 +2720,28 @@ static enum llama_load_mode common_moe_cache_load_mode(const common_params & par
         }
         const uint64_t model_bytes = common_model_file_bytes(params.model.path);
         if (model_bytes > 0 && model_bytes <= 0.8*mem_avail) {
-            return LLAMA_LOAD_MODE_NONE;
+            // with host experts the load without mmap copies them into pinned memory, which is not reclaimable, while the page cache
+            // still holds the file it reads them from: where both do not fit, the copy evicts the file it reads and the load reads it
+            // from the disk again (L4, 53 GB RAM, Qwen3.6-35B-A3B UD-Q4_K_XL 21 GB at a 12 GB cap: 56 s vs 10.6 s with mmap). With mmap the
+            // device lookup registers the mapped pages in place (no second copy). So without mmap only if the host experts and the file fit
+            // in LLAMA_MOE_LOAD_NONE_RAM_FRAC (0.8) of the available memory; with every expert on a device nothing is pinned, the rule above
+            double none_frac = 0.8;
+            if (const char * e = getenv("LLAMA_MOE_LOAD_NONE_RAM_FRAC")) {
+                none_frac = std::max(0.0, atof(e));
+            }
+            const bool host_experts = common_experts_on_offloaded_host(params, params.tensor_buft_overrides.empty() ? nullptr :
+                params.tensor_buft_overrides.data(), n_gpu_layers);
+            uint64_t expert_bytes = 0;
+            if (host_experts) {
+                common_moe_slot_bytes sb;
+                expert_bytes = common_moe_slot_bytes_of(params.model.path, sb) && sb.total > 0 ? (uint64_t) sb.total : model_bytes;
+            }
+            if (!host_experts || (double) (model_bytes + expert_bytes) <= none_frac*(double) mem_avail) {
+                return LLAMA_LOAD_MODE_NONE;
+            }
+            COM_INF("MoE cache: load with mmap: the host experts (%.0f MiB) and the model file (%.0f MiB) do not both fit in %.0f%% of the "
+                "available memory (%.0f MiB) for a load without mmap (--load-mode none forces it, LLAMA_MOE_LOAD_NONE_RAM_FRAC)\n",
+                expert_bytes/1048576.0, model_bytes/1048576.0, 100.0*none_frac, mem_avail/1048576.0);
         }
     }
     return load_mode;
