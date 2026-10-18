@@ -1875,8 +1875,30 @@ static void common_draft_mem_reserve(const common_params & params, const llama_m
     }
 }
 
+// the request --moe-cache-mib auto stands for: larger than any device, so that the fit gives the cache what the layers leave
+// (the fit caps the cache at the bytes of the host experts and at the free device memory)
+static constexpr size_t COMMON_MOE_CACHE_AUTO_BYTES = (size_t) 1 << 40;
+
+bool common_moe_cache_auto_resolve(common_params & params, bool fit) {
+    if (!params.moe_cache_auto) {
+        return false;
+    }
+    params.moe_cache_auto = false;
+    if (!fit) {
+        COM_WRN("%s: --moe-cache-mib auto needs --fit on, not using a MoE cache\n", __func__);
+        params.moe_cache_size = 0;
+        return false;
+    }
+    params.moe_cache_size = COMMON_MOE_CACHE_AUTO_BYTES;
+    return true;
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    // --moe-cache-mib auto: the fit sizes the cache (the fitted size is kept in params, so that a reload from params, e.g. the server
+    // waking from sleep, gets the same cache)
+    const bool moe_cache_auto = common_moe_cache_auto_resolve(params, params.fit_params);
+
     // with --fit the MoE cache load mode is decided after the fit has placed the experts
     auto mparams = common_model_params_to_llama_impl(params, params.fit_params);
     auto cparams = common_context_params_to_llama(params);
@@ -1940,13 +1962,22 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             }
         }
 
-        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
+        const common_params_fit_status fit_status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             (has_draft || spec_mtp) && !draft_off ? &extra : nullptr,
             fit_log_level);
+
+        // --moe-cache-mib auto that the fit did not size (a failed or skipped fit, no host experts on a device) is no cache, as with
+        // the release: the unbounded request must never reach the context
+        if (moe_cache_auto && (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS || cparams.moe_cache_size >= COMMON_MOE_CACHE_AUTO_BYTES)) {
+            COM_WRN("%s: --moe-cache-mib auto: the fit did not size the MoE cache, not using one\n", __func__);
+            cparams.moe_cache_size = 0;
+        } else if (moe_cache_auto) {
+            COM_INF("%s: --moe-cache-mib auto: MoE cache %zu MiB\n", __func__, cparams.moe_cache_size/(1024*1024));
+        }
 
         // the fit may have reduced the MoE cache (it gets the memory left after the layers), the load mode below follows the fitted size
         params.moe_cache_size = cparams.moe_cache_size;

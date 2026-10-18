@@ -604,6 +604,7 @@ struct common_params {
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
+    bool   moe_cache_auto = false; // --moe-cache-mib auto: --fit sizes the MoE cache (see common_moe_cache_auto_resolve)
 
     enum llama_ple_prefetch_mode ple_prefetch = LLAMA_PLE_PREFETCH_AUTO; // ahead prefetch of lazily read PLE rows
     // uploads of the mapped host weights from the model files through a pinned ring (llama_context_params::weight_stream*)
@@ -972,6 +973,11 @@ bool common_is_tty(FILE * file);
 //
 // n_ubatch of the draft context of speculative decoding for a target context at n_ubatch u (see common.cpp)
 uint32_t common_draft_n_ubatch(const common_params & params, uint32_t u);
+
+// --moe-cache-mib auto (or -1): with fit set the MoE cache request becomes unbounded (COMMON_MOE_CACHE_AUTO_BYTES), so that --fit gives the
+// cache the device memory left after the layers, as for a large explicit size; without the fit there is no cache. Clears moe_cache_auto.
+// Returns true if the request was resolved to the unbounded size.
+bool common_moe_cache_auto_resolve(common_params & params, bool fit);
 
 // Model utils
 //

@@ -27,6 +27,9 @@ int llama_fit_params(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
+    // --moe-cache-mib auto: the fit below sizes the cache, the fitted size is printed
+    const bool moe_cache_auto = common_moe_cache_auto_resolve(params, !params.fit_params_print);
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -67,7 +70,10 @@ int llama_fit_params(int argc, char ** argv) {
             any_tbo = true;
         }
         printf("%s", any_tbo ? "\"" : "");
-        if (params.moe_cache_size > 0) {
+        if (moe_cache_auto && cparams.moe_cache_size >= params.moe_cache_size) {
+            // auto that the fit did not size: no cache
+            printf(" --moe-cache-mib 0");
+        } else if (params.moe_cache_size > 0) {
             // the fit may reduce the MoE cache, print the fitted size
             printf(" --moe-cache-mib %zu", cparams.moe_cache_size/(1024*1024));
         }
