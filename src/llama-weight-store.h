@@ -152,6 +152,7 @@ public:
     uint64_t read_host_async(host_read * reads, size_t n, bool direct);
     bool     host_done(uint64_t ticket); // true once its reads are complete (the ticket is then collected), never blocks
     void     host_wait(uint64_t ticket); // its reads that did not start move in front of the demand reads, then waits (collects it)
+    bool     host_cancel(uint64_t ticket); // true: none of its reads had started, none will (collected); false: it completes as issued
 
     // the tier in front of the model files, nullptr = none
     void set_tier(llama_weight_tier * tier);
@@ -184,6 +185,7 @@ public:
         uint64_t spec_bytes      = 0; // read_host_async bytes issued
         uint64_t spec_boosted    = 0; // tickets waited for before all of their reads started
         uint64_t spec_wait_us    = 0; // main thread waiting in host_wait
+        uint64_t spec_cancelled_bytes = 0; // read_host_async bytes cancelled before they were read
     };
     stats get_stats() const;
     void  log_stats() const;

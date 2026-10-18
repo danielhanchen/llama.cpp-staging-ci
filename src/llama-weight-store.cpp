@@ -368,7 +368,7 @@ struct llama_weight_store::impl {
     llama_weight_tier * tier = nullptr;
     uint64_t plan_tier_gen = 0; // generation of the tier when the plan was built
     std::atomic<uint64_t> s_tier_skipped{0}, s_tier_uploaded{0}, s_host_reads{0}, s_host_read_bytes{0}, s_device_skipped{0};
-    std::atomic<uint64_t> s_spec_reads{0}, s_spec_bytes{0}, s_spec_boosted{0}, s_spec_wait_us{0};
+    std::atomic<uint64_t> s_spec_reads{0}, s_spec_bytes{0}, s_spec_boosted{0}, s_spec_wait_us{0}, s_spec_cancelled_bytes{0};
 
     impl(std::shared_ptr<const llama_weight_extents> e, const llama_weight_store_params & p) : ext(std::move(e)), params(p) {
         if (params.chunk == 0) {
@@ -1104,6 +1104,29 @@ struct llama_weight_store::impl {
         return true;
     }
 
+    bool host_cancel(uint64_t id) {
+        std::lock_guard<std::mutex> lock(mtx);
+        const auto it = spec_reqs.find(id);
+        if (it == spec_reqs.end()) {
+            return false;
+        }
+        spec_req & r = *it->second;
+        // only if every read is still queued (remaining counts completions only: a read in progress is off the queue)
+        const ws_task * b = r.tasks.data();
+        const ws_task * e = b + r.tasks.size();
+        size_t n = 0;
+        for (const ws_task * t : spec) {
+            n += t >= b && t < e;
+        }
+        if (n != r.tasks.size()) {
+            return false; // a read started (or all are done): it completes
+        }
+        spec.erase(std::remove_if(spec.begin(), spec.end(), [&](const ws_task * t) { return t >= b && t < e; }), spec.end());
+        s_spec_cancelled_bytes += r.bytes;
+        spec_reqs.erase(it);
+        return true;
+    }
+
     void host_wait(uint64_t id) {
         std::unique_lock<std::mutex> lock(mtx);
         const auto it = spec_reqs.find(id);
@@ -1503,6 +1526,10 @@ bool llama_weight_store::host_done(uint64_t ticket) {
     return ticket == 0 || pimpl->host_done(ticket);
 }
 
+bool llama_weight_store::host_cancel(uint64_t ticket) {
+    return ticket != 0 && pimpl->host_cancel(ticket);
+}
+
 void llama_weight_store::host_wait(uint64_t ticket) {
     if (ticket != 0) {
         pimpl->host_wait(ticket);
@@ -1544,6 +1571,7 @@ llama_weight_store::stats llama_weight_store::get_stats() const {
     s.spec_bytes      = d.s_spec_bytes;
     s.spec_boosted    = d.s_spec_boosted;
     s.spec_wait_us    = d.s_spec_wait_us;
+    s.spec_cancelled_bytes = d.s_spec_cancelled_bytes;
     return s;
 }
 
@@ -1561,8 +1589,8 @@ void llama_weight_store::log_stats() const {
                 s.tier_skipped*mib, s.tier_uploaded*mib, (unsigned long long) s.host_reads, s.host_read_bytes*mib, pimpl->s_device_skipped.load()*mib);
     }
     if (s.spec_bytes > 0) {
-        LLAMA_LOG_INFO("%s: speculative reads into the host tier: %llu reads, %.1f MiB, %llu waited for before they started, %.1f ms waiting\n", __func__,
-                (unsigned long long) s.spec_reads, s.spec_bytes*mib, (unsigned long long) s.spec_boosted, s.spec_wait_us/1000.0);
+        LLAMA_LOG_INFO("%s: speculative reads into the host tier: %llu reads, %.1f MiB, %llu waited for before they started, %.1f ms waiting, %.1f MiB cancelled before they started\n", __func__,
+                (unsigned long long) s.spec_reads, s.spec_bytes*mib, (unsigned long long) s.spec_boosted, s.spec_wait_us/1000.0, s.spec_cancelled_bytes*mib);
     }
     if (pimpl->params.verify) {
         LLAMA_LOG_INFO("%s: VERIFY %llu regions, %.1f MiB, %llu mismatches\n", __func__, (unsigned long long) s.verify_regions, s.verify_bytes*mib,

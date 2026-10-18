@@ -755,12 +755,26 @@ int main(int argc, char ** argv) {
                 check_slot(e, "speculative");
                 hc.publish(sl[e]);
             }
+            // cancel: a queued read (slow reads, one ticket per expert, the last queued) is dropped, a completed one is not
+            if (fmode == 6) {
+                const uint64_t c1 = ws.read_host_async(rd[14].data(), rd[14].size(), true);
+                const uint64_t c2 = ws.read_host_async(rd[14].data(), rd[14].size(), true);
+                CHECK(c1 != 0 && c2 != 0);
+                CHECK(ws.host_cancel(c2));    // behind c1: not started
+                CHECK(!ws.host_cancel(c2));   // collected
+                usleep(1000);                 // 2 IO threads, 2 ms per read: 2 of the 3 reads of c1 are in progress, 1 is queued
+                CHECK(!ws.host_cancel(c1));   // partly started: it completes as issued
+                ws.host_wait(c1);
+                CHECK(!ws.host_cancel(c1));   // done and collected
+                CHECK(ws.get_stats().spec_cancelled_bytes == src[0]->nb[2] + src[1]->nb[2] + src[2]->nb[2]);
+                check_slot(14, "speculative after a cancel");
+            }
             // not waited for: the store's destructor completes them
             tk[12] = ws.read_host_async(rd[12].data(), rd[12].size(), false);
             tk[13] = ws.read_host_async(rd[13].data(), rd[13].size(), true);
             CHECK(tk[12] != 0 && tk[13] != 0);
             const auto st = ws.get_stats();
-            CHECK(st.spec_bytes == 14*(src[0]->nb[2] + src[1]->nb[2] + src[2]->nb[2]));
+            CHECK(st.spec_bytes == (fmode == 6 ? 16 : 14)*(src[0]->nb[2] + src[1]->nb[2] + src[2]->nb[2]));
             if (fmode == 6) {
                 CHECK(st.spec_boosted >= 1);
             }

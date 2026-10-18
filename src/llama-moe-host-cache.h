@@ -91,6 +91,7 @@ public:
     size_t    expert_size(int32_t s, int ip) const;
     int       n_tensors(int32_t s) const;
     int32_t   key(int32_t s) const { return slots[s].key; }
+    int32_t   n_expert_of() const { return n_expert; } // keys are il*n_expert + e
 
     // experts routed by the current call: never evicted until the next begin_call
     void begin_call();
