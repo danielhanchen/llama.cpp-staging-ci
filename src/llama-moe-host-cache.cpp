@@ -33,9 +33,11 @@ llama_moe_host_plan llama_moe_host_decide(size_t e_bytes, size_t v_bytes, size_t
     if (policy_env >= 0) {
         p.policy = policy_env;
     }
-    // no more than the experts it can hold: all of them, or (exclusive) those the device does not
+    // no more than the experts it can hold; exclusive too: the copies of experts the device also holds are kept in the spare slots as the
+    // first to go (a capacity of only the experts the device does not hold left 17 GiB of RAM unused at V32 / R29: the prompt seeds
+    // the device, the RAM copies left, decode refilled few: 23% RAM hits, more disk bytes per token than without the tier)
     const size_t slack = (size_t) 64 << 20;
-    budget = std::min(budget, p.policy == 1 ? (e_bytes > v_bytes ? e_bytes - v_bytes : 0) + slack : e_bytes + slack);
+    budget = std::min(budget, e_bytes + slack);
     p.budget = budget;
     if (budget == 0) {
         p.why = "no budget";
@@ -275,7 +277,16 @@ void llama_moe_host_cache::evict(int32_t s) {
     }
     set_key(s, -1);
     sl.state = SLOT_FREE;
+    sl.dup   = 0;
     gen++;
+}
+
+void llama_moe_host_cache::set_dup(int32_t s, bool dup) {
+    slot_t & sl = slots[s];
+    if (dup && !sl.dup && (sl.state == SLOT_VALID || sl.state == SLOT_WRITING)) {
+        classes[slot_class[s]].dups.push_back(s);
+    }
+    sl.dup = dup && (sl.state == SLOT_VALID || sl.state == SLOT_WRITING) ? 1 : 0;
 }
 
 int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict, uint32_t min_age) {
@@ -291,6 +302,27 @@ int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict, u
     if (!c.free_list.empty() || alloc_chunk(c)) {
         s = c.free_list.back();
         c.free_list.pop_back();
+    }
+    // a duplicate of an expert the device holds goes first (newest first; the stale entries are pruned)
+    for (size_t i = c.dups.size(); s < 0 && allow_evict && i-- > 0; ) {
+        const int32_t cand = c.dups[i];
+        slot_t & sl = slots[cand];
+        if (!sl.dup || (sl.state != SLOT_VALID && sl.state != SLOT_WRITING)) {
+            c.dups.erase(c.dups.begin() + i);
+            continue;
+        }
+        if (sl.pin == call_epoch || sl.lease_id == plan_id || sl.read_seq == seq_next || sl.write_seq == seq_next ||
+                (min_age > 0 && std::max(sl.read_seq, sl.write_seq) + min_age >= seq_next && std::max(sl.read_seq, sl.write_seq) > seq_done)) {
+            continue;
+        }
+        c.dups.erase(c.dups.begin() + i);
+        s = cand;
+        evict(s);
+        st.evicted++;
+        st.dup_taken++;
+    }
+    if (s >= 0) {
+        // taken from the duplicates
     } else if (allow_evict && c.n_alloc > 0) {
         // CLOCK over the decayed counts: the hand lowers the count of each slot it passes, the first at zero is evicted
         const int64_t max_steps = (int64_t) c.n_alloc*9;
@@ -330,6 +362,7 @@ int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict, u
     sl.done   = 0;
     sl.pieces = 0;
     sl.async  = 0;
+    sl.dup    = 0;
     for (int ip = 0; ip < max_tensors; ++ip) {
         leads[(size_t) s*max_tensors + ip] = 0;
         got[(size_t) s*max_tensors + ip]   = 0;

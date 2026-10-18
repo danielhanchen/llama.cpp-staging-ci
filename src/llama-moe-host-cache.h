@@ -110,6 +110,10 @@ public:
     // a reserved slot filled by an asynchronous read (e.g. a read ahead of the routing): fill_piece and new_plan leave it alone until
     // it is published or aborted; count: its decayed count (0: the first to go if it is not used)
     void set_async(int32_t s, uint8_t count);
+    // exclusive: a held slot whose expert the device also holds (a duplicate) is the first a reservation takes, before the CLOCK;
+    // set_dup(s, false) once RAM holds the only copy again (the device evicted it)
+    void set_dup(int32_t s, bool dup);
+    bool is_dup(int32_t s) const { return slots[s].dup != 0; }
     bool is_async(int32_t s) const { return slots[s].async != 0; }
 
     // events: the copies that read slots (mark_read) or write them (mark_write, e.g. device -> host) since the last commit are recorded
@@ -134,6 +138,7 @@ public:
         uint64_t alloc_fail = 0;
         uint64_t alloc_us   = 0; // time spent allocating (pinning) slot memory
         uint64_t pin_fallbacks = 0; // chunks allocated pageable (pin cap reached or pinning failed)
+        uint64_t dup_taken  = 0; // reservations that took a duplicate
         size_t   peak_held  = 0; // most slots holding an expert at once
     };
     stats st;
@@ -150,6 +155,7 @@ private:
         uint8_t  done     = 0;  // fill_piece: mask of the complete tensors
         uint8_t  pieces   = 0;  // the slot is filled from pieces
         uint8_t  async    = 0;  // filled by an asynchronous read (see set_async)
+        uint8_t  dup      = 0;  // the device also holds the expert (see set_dup)
         uint32_t pin      = 0;  // call epoch that pinned it
         uint32_t lease_id = 0;  // plan that leased it
         uint64_t read_seq  = 0; // last commit that reads it
@@ -168,6 +174,7 @@ private:
         int32_t hand    = 0; // CLOCK hand (relative)
         std::vector<ggml_backend_buffer_t> chunks;
         std::vector<int32_t> free_list;
+        std::vector<int32_t> dups;      // slots marked dup (lazily pruned)
     };
 
     struct inflight {

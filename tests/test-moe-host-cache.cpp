@@ -134,8 +134,8 @@ static void test_decide() {
         const llama_moe_host_plan p = decide(4000, 64000);
         CHECK(p.on && p.policy == 0 && p.budget == e + mib(64));
     }
-    // exclusive: the budget is capped at the experts the device does not hold
-    CHECK(decide(20000, 64000, -1, 1).budget == mib(18000) + mib(64));
+    // exclusive: the budget is capped at the experts too (the spare slots keep copies of experts the device holds, the first to go)
+    CHECK(decide(20000, 64000, -1, 1).budget == e + mib(64));
     // no RAM to spare, off by 0 (also forced)
     CHECK(!decide(9000, 4000).on);                      // below the room: no budget
     CHECK( decide(9000, 5000).on && decide(9000, 5000).budget < mib(1024));
@@ -800,15 +800,19 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // decode simulation: a device LRU of 4 slots and a RAM tier of 6 over 16 experts, 2 routed per step (skewed); the misses of the
-    // device follow llama_moe_cache::upload_fills: RAM hit -> upload from RAM (exclusive: the RAM slot is freed), RAM miss -> read into
-    // a RAM slot (inclusive) or read for the device only (exclusive), device evictions copied back into RAM (exclusive)
-    uint64_t reads[2] = { 0, 0 };
-    for (int pol : { LLAMA_MOE_HOST_EXCLUSIVE, LLAMA_MOE_HOST_INCLUSIVE }) {
+    // decode simulation: a device LRU of 4 slots and a RAM tier of 6 (or 12) over 16 experts, 2 routed per step (skewed); the misses of
+    // the device follow llama_moe_cache::upload_fills: RAM hit -> upload from RAM, RAM miss -> read into a RAM slot (inclusive: evicting;
+    // exclusive: a free slot only) or for the device only, device evictions copied back into RAM (exclusive). Exclusive keeps the copy
+    // of a promoted expert as the first to go (variant 2, the old exclusive: the RAM slot is freed, misses are never admitted)
+    uint64_t reads[2][3] = { { 0, 0, 0 }, { 0, 0, 0 } };
+    for (int big : { 0, 1 })
+    for (int var : { 0, 1, 2 }) {
+        const int pol = var == 1 ? LLAMA_MOE_HOST_INCLUSIVE : LLAMA_MOE_HOST_EXCLUSIVE;
+        const bool old_excl = var == 2;
         llama_weight_store_params p;
         p.io = LLAMA_WEIGHT_STREAM_IO_BUFFERED; p.n_threads = 2; p.ram_avail = (size_t) 1 << 30;
         llama_weight_store ws(ext, p);
-        llama_moe_host_cache hc(ggml_backend_cpu_buffer_type(), 6*slot_bytes, pol, n_expert, sizes);
+        llama_moe_host_cache hc(ggml_backend_cpu_buffer_type(), (big ? 12 : 6)*slot_bytes, pol, n_expert, sizes);
         const int n_dev = 4;
         std::vector<int32_t> dev_key(n_dev, -1);
         std::list<int32_t> lru; // device slots, front = least recently used
@@ -860,6 +864,10 @@ int main(int argc, char ** argv) {
             if (hc.exclusive()) {
                 for (const auto & [s, key] : evicted) {
                     if (hc.contains(0, key)) {
+                        const int32_t h = hc.held(0, key);
+                        if (h >= 0 && !old_excl) {
+                            hc.set_dup(h, false);
+                        }
                         continue;
                     }
                     const int32_t r = hc.reserve(0, key);
@@ -886,11 +894,15 @@ int main(int argc, char ** argv) {
                     }
                     hc.mark_read(r);
                     if (hc.exclusive()) {
-                        hc.release(r);
+                        if (old_excl) {
+                            hc.release(r);
+                        } else {
+                            hc.set_dup(r, true);
+                        }
                     }
                     continue;
                 }
-                const int32_t q = hc.exclusive() ? -1 : hc.reserve(0, e);
+                const int32_t q = old_excl ? -1 : hc.reserve(0, e, !hc.exclusive());
                 if (q >= 0) {
                     for (int t = 0; t < 3; ++t) {
                         rd.push_back({ src[t], (size_t) e*src[t]->nb[2], src[t]->nb[2], hc.area(q, t), 0 });
@@ -912,6 +924,9 @@ int main(int argc, char ** argv) {
                     }
                     hc.publish(q);
                     hc.mark_read(q);
+                    if (hc.exclusive()) {
+                        hc.set_dup(q, true);
+                    }
                     ssd++;
                 }
             }
@@ -931,8 +946,8 @@ int main(int argc, char ** argv) {
                     ggml_backend_tensor_get(dst[t], got.data(), (size_t) s*src[t]->nb[2], got.size());
                     exact = exact && memcmp(got.data(), file_bytes(t, dev_key[s]), got.size()) == 0;
                 }
-                if (hc.exclusive() && hc.contains(0, dev_key[s])) {
-                    disjoint = false;
+                if (old_excl && hc.contains(0, dev_key[s])) {
+                    disjoint = false; // the old exclusive tiers are disjoint
                 }
             }
             for (int32_t e = 0; e < n_expert; ++e) {
@@ -955,13 +970,19 @@ int main(int argc, char ** argv) {
         CHECK(exact);
         CHECK(disjoint);
         CHECK(pinned_ok);
-        reads[pol] = ssd;
-        printf("simulation %s: %llu device misses, %llu RAM hits, %llu read from the file, %llu evicted, peak %zu held\n",
-                pol == LLAMA_MOE_HOST_EXCLUSIVE ? "exclusive" : "inclusive", (unsigned long long) misses, (unsigned long long) ram_hits,
+        reads[big][var] = ssd;
+        printf("simulation %d RAM slots %s: %llu device misses, %llu RAM hits, %llu read from the file, %llu evicted, peak %zu held\n", big ? 12 : 6,
+                var == 0 ? "exclusive" : var == 1 ? "inclusive" : "exclusive (old)", (unsigned long long) misses, (unsigned long long) ram_hits,
                 (unsigned long long) ssd, (unsigned long long) hc.st.evicted, hc.st.peak_held);
     }
-    // 4 device + 6 RAM slots over 16 experts: the exclusive tiers hold up to 10 distinct experts, the inclusive ones 6
-    CHECK(reads[LLAMA_MOE_HOST_EXCLUSIVE] < reads[LLAMA_MOE_HOST_INCLUSIVE]);
+    // 4 device + 6 RAM slots over 16 experts: the exclusive tiers hold up to 10 distinct experts, the inclusive ones 6; 4 + 12 slots
+    // hold all 16 exclusive (the misses fill the spare slots), the old exclusive only filled RAM by device evictions
+    // (this simulation has no prompt seeding: the old exclusive refilled RAM from the many evictions of a 4-slot device; at V32 / R29
+    // the device evicts rarely and the old exclusive kept 23% RAM hits)
+    CHECK(reads[0][0] < reads[0][1]);
+    CHECK(reads[0][0] <= reads[0][2] + reads[0][2]/10);
+    CHECK(reads[1][0] < reads[1][1]);
+    CHECK(reads[1][0] <= reads[1][2] + reads[1][2]/10);
 
     ggml_backend_buffer_free(dst_buf);
     ggml_backend_buffer_free(src_buf);

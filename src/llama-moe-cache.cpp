@@ -430,6 +430,7 @@ struct llama_moe_cache::impl {
         uint64_t hits = 0, misses = 0;        // device misses of small batches (and refills) found / not found in RAM
         uint64_t read = 0, read_bytes = 0;    // RAM misses read into a slot (inclusive)
         uint64_t demoted = 0, demote_bytes = 0, demote_skip = 0; // device evictions copied back into RAM (exclusive)
+        uint64_t demote_kept = 0;             // device evictions RAM still held a copy of (no copy back)
         uint64_t promoted = 0;                // RAM experts moved to the device (exclusive: their slots are freed)
         uint64_t up_bytes = 0;                // bytes uploaded from RAM by small batches and refills
         uint64_t admitted = 0;                // experts admitted from the uploads of prompts
@@ -2105,7 +2106,16 @@ struct llama_moe_cache::impl {
         for (const auto & [s, key] : ev) {
             const int32_t il = key / n_expert;
             const int32_t e  = key % n_expert;
-            if (!host_layer(il) || host->contains(il, e)) {
+            if (!host_layer(il)) {
+                continue;
+            }
+            if (host->contains(il, e)) {
+                // RAM kept a copy when it was promoted: now its only copy, no copy back
+                const int32_t h = host->held(il, e);
+                if (h >= 0) {
+                    host->set_dup(h, false);
+                    hst.demote_kept++;
+                }
                 continue;
             }
             const int32_t r = host->reserve(il, e);
@@ -2165,13 +2175,15 @@ struct llama_moe_cache::impl {
                         ahead_key[s] = -1;
                     }
                     if (host->exclusive()) {
-                        host->release(s);
+                        // promoted: the copy stays in its slot as the first to go (a device eviction then needs no copy back)
+                        host->set_dup(s, true);
                         hst.promoted++;
                     }
                     continue;
                 }
                 hst.misses++;
-                const int32_t r = host->exclusive() ? -1 : host->reserve(il, f.expert);
+                // exclusive: into a free slot only (a copy of an expert the device is about to hold never evicts another)
+                const int32_t r = host->reserve(il, f.expert, !host->exclusive());
                 if (r >= 0) {
                     for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                         const ggml_tensor * w = l.experts[ip];
@@ -2195,6 +2207,9 @@ struct llama_moe_cache::impl {
                         }
                         host->publish(r);
                         host->mark_read(r);
+                        if (host->exclusive()) {
+                            host->set_dup(r, true);
+                        }
                         hst.read++;
                     }
                 } else {
@@ -2256,7 +2271,15 @@ struct llama_moe_cache::impl {
         for (const auto & [s, key] : ev) {
             const int32_t il = key / n_expert;
             const int32_t e  = key % n_expert;
-            if (!host_layer(il) || host->contains(il, e)) {
+            if (!host_layer(il)) {
+                continue;
+            }
+            if (host->contains(il, e)) {
+                const int32_t h = host->held(il, e);
+                if (h >= 0) {
+                    host->set_dup(h, false);
+                    hst.demote_kept++;
+                }
                 continue;
             }
             const int32_t r = host->reserve(il, e);
@@ -4116,10 +4139,11 @@ struct llama_moe_cache::impl {
         if (sd.done == (1u << l.experts.size()) - 1) {
             stats_seed.misses += sd.fills.size();
             if (host_layer(sd.il) && host->exclusive()) {
-                // exclusive: promoted to the device, the RAM copies go (the uploads that read them are guarded by their events)
+                // exclusive: promoted to the device, the RAM copies stay as the first to go
                 for (const auto & f : sd.fills) {
-                    if (host->contains(sd.il, f.expert)) {
-                        host->release_key(sd.il, f.expert);
+                    const int32_t h = host->held(sd.il, f.expert);
+                    if (h >= 0) {
+                        host->set_dup(h, true);
                         hst.promoted++;
                     }
                 }
@@ -4313,10 +4337,10 @@ struct llama_moe_cache::impl {
             const auto & hs = host->st;
             const uint64_t n = hst.hits + hst.misses;
             LLAMA_LOG_INFO("llama_moe_cache: host tier: %s, device misses: %llu RAM hits, %llu RAM misses, RAM hit rate = %.2f%%, uploaded from RAM = %.2f MiB, "
-                    "read into RAM = %llu (%.2f MiB), demoted = %llu (%.2f MiB, %llu without a slot), promoted = %llu, admitted from prompts = %llu\n",
+                    "read into RAM = %llu (%.2f MiB), demoted = %llu (%.2f MiB, %llu without a slot), promoted = %llu, admitted from prompts = %llu, %llu evictions kept in RAM\n",
                     host->exclusive() ? "exclusive" : "inclusive", (unsigned long long) hst.hits, (unsigned long long) hst.misses, n ? 100.0*hst.hits/n : 0.0,
                     hst.up_bytes/1048576.0, (unsigned long long) hst.read, hst.read_bytes/1048576.0, (unsigned long long) hst.demoted, hst.demote_bytes/1048576.0,
-                    (unsigned long long) hst.demote_skip, (unsigned long long) hst.promoted, (unsigned long long) hst.admitted);
+                    (unsigned long long) hst.demote_skip, (unsigned long long) hst.promoted, (unsigned long long) hst.admitted, (unsigned long long) hst.demote_kept);
             LLAMA_LOG_INFO("llama_moe_cache: host tier: %d slots, peak %zu held, %llu evicted, %llu without a slot, %llu waits, pinned = %.2f MiB of a %.2f MiB budget, "
                     "registered expert buffers = %.2f MiB, MemAvailable %.1f MiB at start, %.1f MiB now\n",
                     host->n_slots(), hs.peak_held, (unsigned long long) hs.evicted, (unsigned long long) hs.no_slot, (unsigned long long) hs.waits,
