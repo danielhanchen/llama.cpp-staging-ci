@@ -1594,8 +1594,16 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     // disables). A larger n_ubatch then costs the decode no cache (its compute buffers are taken from the cache only while a prompt
     // ubatch runs), unlike LLAMA_MOE_PREFILL_UB_SPILL=1, which shrinks the cache for good. G4 (RTX PRO 6000) at 32 GB, Qwen3.8-Flash-Next
     // UD-IQ4_XS, 2 reps: 8k / 16k prompt 1933 / 1931 -> 3583 / 4247 tok/s (3927 / 4252 with 3 splits of prefetch), decode 81.7 / 81.1 -> 84.2 / 82.3
-    // (not with the opt-in LLAMA_MOE_PREFILL_UB_SPILL=1 rule)
+    // (not with the opt-in LLAMA_MOE_PREFILL_UB_SPILL=1 rule). Only while the cache holds at most LLAMA_MOE_SPILL_LEND_MAX_FRAC (0.5) of
+    // the experts: a cache holding most of them already makes a small share of each prompt pass, and its decode hit rate is sensitive
+    // to the cache state a prompt leaves; there lending cost the decode after a single-ubatch prompt (Qwen3.6-35B-A3B UD-Q4_K_XL at 16 GB,
+    // 66% cached, G4: decode after a 2k prompt 214.3 -> 202.3 tok/s, hit rate 96.9 -> 96.1%), while at 12 GB (44%) it was within 0.3%
+    double spill_lend_max_frac = 0.5;
+    if (const char * e = getenv("LLAMA_MOE_SPILL_LEND_MAX_FRAC")) {
+        spill_lend_max_frac = std::max(0.0, atof(e));
+    }
     const bool spill_lend = env_l == nullptr && !rule_frac && have_sb && cache_ref < all_experts &&
+        (double) cache_ref <= spill_lend_max_frac*(double) sb.total &&
         (getenv("LLAMA_MOE_SPILL_LEND") == nullptr || atoi(getenv("LLAMA_MOE_SPILL_LEND")) != 0) &&
         !(getenv("LLAMA_MOE_PREFILL_UB_SPILL") != nullptr && atoi(getenv("LLAMA_MOE_PREFILL_UB_SPILL")) != 0);
     bool lend_graph = ((env_l != nullptr && atoi(env_l) == 2) || spill_lend) && force <= 0 && m_def.n_dev == 1 && have_sb;
