@@ -1239,7 +1239,7 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
 }
 
 static struct llama_model_params common_model_params_to_llama_impl(common_params & params, bool fit_deferred);
-static enum llama_load_mode common_moe_cache_load_mode(const common_params & params, enum llama_load_mode load_mode, int32_t n_gpu_layers, bool experts_on_host);
+static enum llama_load_mode common_moe_cache_load_mode(const common_params & params, enum llama_load_mode load_mode, int32_t n_gpu_layers);
 static bool common_experts_on_offloaded_host(const common_params & params, const llama_model_tensor_buft_override * overrides, int32_t n_gpu_layers);
 
 // bytes of one expert in the MoE cache: the sum over the expert tensors of the layer (the size of a slot) and the largest single tensor (the
@@ -1848,7 +1848,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
         // decide on the params the model is loaded with, whatever the fit status: a failed or skipped fit leaves the user placement, which then decides like the path without --fit
         // the fitted overrides live in params.tensor_buft_overrides, which mparams points to
-        mparams.load_mode = common_moe_cache_load_mode(params, mparams.load_mode, mparams.n_gpu_layers, common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers));
+        mparams.load_mode = common_moe_cache_load_mode(params, mparams.load_mode, mparams.n_gpu_layers);
     }
 
     if (!model_only) {
@@ -2488,6 +2488,15 @@ static bool common_experts_on_offloaded_host(const common_params & params, const
     if (params.moe_cache_size <= 0 || !(n_gpu_layers < 0 || n_gpu_layers > 1)) {
         return false;
     }
+    // without an override to a host buffer no expert is on the host: answer before reading the GGUF, whose metadata takes ~0.1 s to parse
+    // (Gemma-4 26B-A4B, a 262k-token vocabulary) on every load that keeps every expert on a device
+    bool any_host = false;
+    for (size_t i = 0; overrides != nullptr && overrides[i].pattern != nullptr && !any_host; ++i) {
+        any_host = overrides[i].buft != nullptr && ggml_backend_buft_is_host(overrides[i].buft);
+    }
+    if (!any_host) {
+        return false;
+    }
     std::vector<uint8_t> experts;
     const int64_t n_layer = common_model_n_layer(params.model.path, experts);
     if (n_layer < 0) {
@@ -2497,11 +2506,23 @@ static bool common_experts_on_offloaded_host(const common_params & params, const
     return common_overrides_put_experts_on_host(overrides, std::max<int64_t>(n_layer + 1 - n_gpu, 0), n_layer, experts);
 }
 
-// the load mode for the MoE cache once the expert placement is known: n_gpu_layers and the tensor overrides are the ones the model is loaded with
+// whether the weight stream is forced on (--weight-stream on, LLAMA_WEIGHT_STREAM=N != 0): it uploads the host weights read in place from the mapping, so it needs mmap
+// (auto turns it on only when those weights do not fit in 80% of the available RAM, which the model size check below already rules out; the RAM tier of the MoE cache reads through it)
+static bool common_weight_stream_forced(const common_params & params) {
+    const char * env = getenv("LLAMA_WEIGHT_STREAM");
+    if (env != nullptr) {
+        return atoi(env) != 0;
+    }
+    return params.weight_stream == 2;
+}
+
+// the load mode for the MoE cache once the expert placement is known: n_gpu_layers is the one the model is loaded with
 // n_gpu_layers: -1 is auto, <= -2 is all, 0 keeps every layer on the CPU and 1 offloads only the output layer: the MoE cache then has no repeating layer to serve, keep mmap
-// the MoE cache only serves experts kept in host memory, which the placement does not do by itself: they get there through a tensor override to a host buffer (-ot, --cpu-moe, --n-cpu-moe or the overrides written by --fit), otherwise keep mmap
-static enum llama_load_mode common_moe_cache_load_mode(const common_params & params, enum llama_load_mode load_mode, int32_t n_gpu_layers, bool experts_on_host) {
-    if (params.moe_cache_size <= 0 || !experts_on_host || load_mode != LLAMA_LOAD_MODE_AUTO || !(n_gpu_layers < 0 || n_gpu_layers > 1)) {
+// with host experts the device lookup needs them pinned; with every expert on a device nothing reads the mapping after the load, and without mmap the device weights
+// are uploaded from pinned staging buffers (Gemma-4 26B-A4B on an L4: 6.0 s vs 7.0-8.2 s with mmap): load without mmap in both cases, as before the host expert check
+// mmap stays only where a feature that is on reads the mapping: the weight stream forced on (and the RAM tier behind it) or a device without the device lookup
+static enum llama_load_mode common_moe_cache_load_mode(const common_params & params, enum llama_load_mode load_mode, int32_t n_gpu_layers) {
+    if (params.moe_cache_size <= 0 || load_mode != LLAMA_LOAD_MODE_AUTO || !(n_gpu_layers < 0 || n_gpu_layers > 1) || common_weight_stream_forced(params)) {
         return load_mode;
     }
     // the device lookup of the MoE cache needs pinned host experts and mmap'ed files usually cannot be pinned: load without mmap if the model fits in system memory and a device that will be used can do the lookup (the other backends keep the host lookup, mmap costs them nothing)
@@ -2553,10 +2574,9 @@ static struct llama_model_params common_model_params_to_llama_impl(common_params
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
-    // without a deferred fit decide from the overrides as they are now: a caller that never runs common_fit_params() has no fitted placement, so --fit alone is no proof of host experts
+    // without a deferred fit decide from the params as they are now (a deferred fit decides after it has set n_gpu_layers and the MoE cache size)
     if (!fit_deferred) {
-        const bool experts_on_host = common_experts_on_offloaded_host(params, params.tensor_buft_overrides.empty() ? nullptr : params.tensor_buft_overrides.data(), params.n_gpu_layers);
-        mparams.load_mode = common_moe_cache_load_mode(params, mparams.load_mode, params.n_gpu_layers, experts_on_host);
+        mparams.load_mode = common_moe_cache_load_mode(params, mparams.load_mode, params.n_gpu_layers);
     }
     mparams.lazy_mode = params.lazy_mode;
     mparams.tensor_split    = params.tensor_split;
