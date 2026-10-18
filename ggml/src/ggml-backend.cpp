@@ -4727,6 +4727,13 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     return size;
 }
 
+void ggml_backend_sched_set_prefetch_depth_init(ggml_backend_sched_t sched, int depth) {
+    if (getenv("GGML_SCHED_PREFETCH_DEPTH") != NULL || sched->pf_mode == 0 || depth <= sched->pf_depth) {
+        return;
+    }
+    sched->pf_depth = std::min(depth, GGML_SCHED_MAX_PREFETCH_DEPTH);
+}
+
 void ggml_backend_sched_set_prefetch_headroom(ggml_backend_sched_t sched, size_t headroom) {
     GGML_ASSERT(sched);
     sched->pf_headroom = headroom;

@@ -136,6 +136,8 @@ public:
 
     // the largest ubatch (at most n_small_max tokens) whose experts every cached layer reads from the cache without copying them
     int64_t n_tokens_cached() const;
+    // share of the host experts' bytes the cache holds (-1 before the slots are sized)
+    double cached_frac() const;
 
     // device copy of a small per-expert host tensor (scale or bias) of a cached layer, nullptr if there is none
     ggml_tensor * get_resident(const ggml_tensor * t) const;

@@ -972,6 +972,18 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     if (moe_cache) {
         ggml_backend_sched_set_lend_callback(sched.get(), sched_lend, this);
     }
+    // spilled experts (the MoE cache holds less than the host experts): every prompt ubatch uploads the experts the cache misses in
+    // every layer, and with the staging in lent cache slots the adaptive depth never steps past 2. Copies of 3 splits in flight hide
+    // them better: G4 (RTX PRO 6000) at 32 GB, Qwen3.8-Flash-Next UD-IQ4_XS, 2 reps: 2k prompt 1857 -> 1925 tok/s, 8k at n_ubatch 8192
+    // 3951 -> 4290 (3583 -> 3927 with LLAMA_MOE_CACHE_LEND=2), decode unchanged. LLAMA_MOE_PREFETCH_DEPTH_SPILL=N sets the depth
+    // (0 = the scheduler default); GGML_SCHED_PREFETCH_DEPTH still wins
+    // (not for a tiny cache, the experts of fewer than 4 tokens: its slots are too few to lend a deeper staging)
+    if (moe_cache && moe_cache->cached_frac() >= 0.0 && moe_cache->cached_frac() < 0.98 && moe_cache->n_tokens_cached() >= 4) {
+        static const int depth_spill = getenv("LLAMA_MOE_PREFETCH_DEPTH_SPILL") != nullptr ? atoi(getenv("LLAMA_MOE_PREFETCH_DEPTH_SPILL")) : 3;
+        if (depth_spill > 0) {
+            ggml_backend_sched_set_prefetch_depth_init(sched.get(), depth_spill);
+        }
+    }
     // a staging arena without a lender (see ggml_backend_sched_prefetch_headroom_ok) also leaves the memory reserved for a later
     // model or context (one headroom for every device: the largest reserve)
     const size_t reserve_max = mem_reserve.empty() ? 0 : *std::max_element(mem_reserve.begin(), mem_reserve.end());
@@ -3531,13 +3543,35 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         return !on_copy_queue && lctx->wstore && lctx->wstore->covers(src) && lctx->wstore->upload(backend, src, dst, 0, 0, ggml_nbytes(src));
     };
 
-    // the ids must be computed before the split starts, so only the first node of the split is considered
-    if (ggml_graph_n_nodes(graph) == 0) {
+    // the ids must be computed before the split starts. The product that reads the copy usually is the first node of the split, but a
+    // backend may reorder the nodes of a split: the CUDA side-stream plan (ggml_cuda_side_mv_plan) moves a few-row product whose sources
+    // come from an earlier split (e.g. the shared expert gate of Qwen3-Next style models) to its front. Taking only the first node then
+    // uploaded the whole down_exps tensor of every layer, cached experts included (Qwen3.8-Flash-Next UD-IQ4_XS, G4 32 GB: 46.6 instead of
+    // 36.9 GB per prompt ubatch, 2k prompt -15%). So the split is searched for the product, and its ids must not be computed in the split.
+    // LLAMA_MOE_COPY_SCAN=0: only the first node (as before)
+    const int n_nodes = ggml_graph_n_nodes(graph);
+    if (n_nodes == 0) {
         return copy_whole();
     }
-    const ggml_tensor * node = ggml_graph_node(graph, 0);
-    if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
+    static const bool scan = getenv("LLAMA_MOE_COPY_SCAN") == nullptr || atoi(getenv("LLAMA_MOE_COPY_SCAN")) != 0;
+    const ggml_tensor * node = nullptr;
+    for (int i = 0; i < (scan ? n_nodes : 1) && node == nullptr; i++) {
+        const ggml_tensor * t = ggml_graph_node(graph, i);
+        if (t->op == GGML_OP_MUL_MAT_ID && t->src[0] == dst) {
+            node = t;
+        }
+    }
+    if (node == nullptr) {
         return copy_whole();
+    }
+    if (node != ggml_graph_node(graph, 0)) {
+        const ggml_tensor * ids_n = node->src[2];
+        for (int i = 0; i < n_nodes; i++) {
+            const ggml_tensor * t = ggml_graph_node(graph, i);
+            if (t == ids_n || (ids_n->view_src != nullptr && t == ids_n->view_src)) {
+                return copy_whole();
+            }
+        }
     }
 
     const ggml_tensor * ids = node->src[2];
