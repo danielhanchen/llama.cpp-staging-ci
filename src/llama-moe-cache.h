@@ -138,6 +138,8 @@ public:
     int64_t n_tokens_cached() const;
     // share of the host experts' bytes the cache holds (-1 before the slots are sized)
     double cached_frac() const;
+    // bytes of the host experts the cache cannot hold (0 before the slots are sized)
+    double host_uncached_bytes() const;
 
     // device copy of a small per-expert host tensor (scale or bias) of a cached layer, nullptr if there is none
     ggml_tensor * get_resident(const ggml_tensor * t) const;

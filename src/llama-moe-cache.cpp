@@ -635,6 +635,7 @@ struct llama_moe_cache::impl {
     bool   hybrid_gate     = false;
     double hybrid_max_frac = 0.10; // LLAMA_MOE_CACHE_HYBRID_MAX_FRAC
     double cache_frac      = -1.0; // cached share of the host experts' bytes, -1 before the slots are sized
+    double host_uncached   = 0.0;  // bytes of the host experts the slots cannot hold (host experts minus slots, uncached groups count whole)
     static constexpr double hybrid_k = 6.0; // see set_threads
     bool  overlap      = false; // LLAMA_MOE_CACHE_FETCH_OVERLAP: single token ubatches compute the hits while the missing experts are copied
 
@@ -1039,7 +1040,8 @@ struct llama_moe_cache::impl {
                 cached += (double) g.n_slots*eb;
                 host   += (double) g.host_bytes;
             }
-            cache_frac = host > 0.0 ? std::min(1.0, cached/host) : 1.0;
+            cache_frac    = host > 0.0 ? std::min(1.0, cached/host) : 1.0;
+            host_uncached = std::max(0.0, host - cached);
         }
         if (hybrid && hybrid_gate && cache_frac > hybrid_max_frac) {
             // a large cache misses few experts: the host path then costs more (graph splits, slower warm-up) than the copies it saves
@@ -4109,6 +4111,10 @@ void llama_moe_cache::set_mem_reserve(ggml_backend_t backend, size_t bytes) {
 
 double llama_moe_cache::cached_frac() const {
     return pimpl->cache_frac;
+}
+
+double llama_moe_cache::host_uncached_bytes() const {
+    return pimpl->host_uncached;
 }
 
 int64_t llama_moe_cache::n_tokens_cached() const {

@@ -15,6 +15,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-sysmem.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -978,9 +979,30 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     // 3951 -> 4290 (3583 -> 3927 with LLAMA_MOE_CACHE_LEND=2), decode unchanged. LLAMA_MOE_PREFETCH_DEPTH_SPILL=N sets the depth
     // (0 = the scheduler default); GGML_SCHED_PREFETCH_DEPTH still wins
     // (not for a tiny cache, the experts of fewer than 4 tokens: its slots are too few to lend a deeper staging)
+    // and, like the spill lending (common_moe_cache_auto_ubatch), only while the host experts the cache cannot hold are at most
+    // LLAMA_MOE_PREFETCH_DEPTH_SPILL_MAX_RAM_FRAC (0.5) of the RAM (MemTotal, Linux): there the deeper staging reads more of them per
+    // ubatch than the page cache keeps, so they come from the disk again (L4 24 GB, 52 GB RAM, Flash-Next UD-IQ4_XS: 2k decode 13.2 ->
+    // 10.2 tok/s with depth 3, host-RAM misses 2536 -> 3529); an explicit LLAMA_MOE_PREFETCH_DEPTH_SPILL skips the RAM check
     if (moe_cache && moe_cache->cached_frac() >= 0.0 && moe_cache->cached_frac() < 0.98 && moe_cache->n_tokens_cached() >= 4) {
-        static const int depth_spill = getenv("LLAMA_MOE_PREFETCH_DEPTH_SPILL") != nullptr ? atoi(getenv("LLAMA_MOE_PREFETCH_DEPTH_SPILL")) : 3;
-        if (depth_spill > 0) {
+        const char * env_depth = getenv("LLAMA_MOE_PREFETCH_DEPTH_SPILL");
+        static const int depth_spill = env_depth != nullptr ? atoi(env_depth) : 3;
+        bool ram_ok = true;
+        if (env_depth == nullptr) {
+            double ram_frac = 0.5;
+            if (const char * e = getenv("LLAMA_MOE_PREFETCH_DEPTH_SPILL_MAX_RAM_FRAC")) {
+                ram_frac = std::max(0.0, atof(e));
+            }
+            const uint64_t ram_total = llama_sysmem::total();
+            ram_ok = ram_total == 0 || moe_cache->host_uncached_bytes() <= ram_frac*(double) ram_total;
+            static bool logged = false;
+            if (!ram_ok && !logged) {
+                logged = true;
+                LLAMA_LOG_INFO("%s: MoE cache: host weight prefetch keeps the default depth: the uncached host experts (%.0f MiB) are more than "
+                    "%.0f%% of the RAM (%.0f MiB; LLAMA_MOE_PREFETCH_DEPTH_SPILL=N forces depth N)\n", __func__,
+                    moe_cache->host_uncached_bytes()/1048576.0, 100.0*ram_frac, ram_total/1048576.0);
+            }
+        }
+        if (depth_spill > 0 && ram_ok) {
             ggml_backend_sched_set_prefetch_depth_init(sched.get(), depth_spill);
         }
     }

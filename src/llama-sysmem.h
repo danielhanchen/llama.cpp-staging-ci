@@ -113,6 +113,30 @@ inline uint64_t meminfo_available(const std::string & meminfo) {
     return 0;
 }
 
+// MemTotal of a /proc/meminfo file in bytes, 0 if it is missing
+inline uint64_t meminfo_total(const std::string & meminfo) {
+    std::ifstream f(meminfo);
+    std::string key;
+    uint64_t value = 0;
+    std::string unit;
+    while (f >> key >> value) {
+        std::getline(f, unit);
+        if (key == "MemTotal:") {
+            return value*1024;
+        }
+    }
+    return 0;
+}
+
+// MemTotal of the host (Linux), 0 if unknown
+inline uint64_t total() {
+#if defined(__linux__)
+    return meminfo_total("/proc/meminfo");
+#else
+    return 0;
+#endif
+}
+
 // see the top of the file; 0 if unknown
 inline uint64_t available(const std::string & meminfo, const std::string & proc_cgroup, const std::string & sys_root) {
     const uint64_t m = meminfo_available(meminfo);
