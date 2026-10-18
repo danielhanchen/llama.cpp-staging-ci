@@ -4107,6 +4107,10 @@ void llama_moe_cache::set_mem_reserve(ggml_backend_t backend, size_t bytes) {
     }
 }
 
+double llama_moe_cache::cached_frac() const {
+    return pimpl->cache_frac;
+}
+
 int64_t llama_moe_cache::n_tokens_cached() const {
     int64_t n = n_small_max;
     for (const auto & g : pimpl->groups) {

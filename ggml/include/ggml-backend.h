@@ -404,6 +404,9 @@ extern "C" {
     // a reserve or graph allocation that leaves less than `headroom` bytes free on a device with a staging arena drops the host weight
     // prefetch (0 = never), default GGML_SCHED_PREFETCH_HEADROOM_MIB (512); not checked while the MoE cache lends memory to the staging
     GGML_API void                       ggml_backend_sched_set_prefetch_headroom(ggml_backend_sched_t sched, size_t headroom);
+    // starting depth of the host weight prefetch (copies of that many splits in flight), unless GGML_SCHED_PREFETCH_DEPTH is set; the
+    // adaptive depth continues from it and a staging arena that does not fit goes back to the default depth
+    GGML_API void                       ggml_backend_sched_set_prefetch_depth_init(ggml_backend_sched_t sched, int depth);
     GGML_API size_t                     ggml_backend_sched_get_prefetch_headroom(ggml_backend_sched_t sched);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
