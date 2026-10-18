@@ -1025,7 +1025,7 @@ struct llama_moe_cache::impl {
             n_tensors_host  += g.layers.size();
         }
         if (n_tensors_host == 0) {
-            throw std::runtime_error("MoE cache is too small to hold the experts of one token");
+            throw llama_moe_cache_too_small();
         }
 
         // the share of the host experts' bytes the cache holds (the uncached groups count as host experts), it decides the default hybrid gate

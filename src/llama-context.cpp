@@ -5508,6 +5508,13 @@ llama_context * llama_init_from_model(
         }
 
         return ctx;
+    } catch (const llama_moe_cache_too_small & err) {
+        // a memory probe (no_alloc, e.g. the --fit search for a MoE cache size) tries sizes below the minimum and handles the failure
+        if (model->hparams.no_alloc) {
+            LLAMA_LOG_INFO("%s: memory probe: %s\n", __func__, err.what());
+        } else {
+            LLAMA_LOG_ERROR("%s: failed to initialize the context: %s\n", __func__, err.what());
+        }
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to initialize the context: %s\n", __func__, err.what());
     }

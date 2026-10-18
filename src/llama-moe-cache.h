@@ -11,6 +11,13 @@ class llama_weight_store;
 
 // keeps the most recently used experts of host-resident MoE layers in a device buffer
 // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
+#include <stdexcept>
+
+// thrown by the constructor when the budget cannot hold the experts of one token in any layer (a fit probe tries such sizes)
+struct llama_moe_cache_too_small : std::runtime_error {
+    llama_moe_cache_too_small() : std::runtime_error("MoE cache is too small to hold the experts of one token") {}
+};
+
 class llama_moe_cache {
 public:
     // the cache serves the ubatches of up to this many tokens, the larger ones (prompts) copy the experts they use
