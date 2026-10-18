@@ -1244,7 +1244,11 @@ static bool common_experts_on_offloaded_host(const common_params & params, const
 
 // bytes of one expert in the MoE cache: the sum over the expert tensors of the layer (the size of a slot) and the largest single tensor (the
 // size of a slot in its bank), with the number of experts, for the layer with the largest experts; false if the GGUF cannot be read
-struct common_moe_slot_bytes { int64_t n_expert = 0; int64_t sum = 0; int64_t max = 0; int64_t total = 0; int64_t n_layer = 0; int64_t n_used = 0; };
+// lend_*: the group of layers with the same expert sizes that holds the most expert bytes (the MoE cache splits its budget between such
+// groups by their host bytes and lends a graph allocation from a bank tail of its largest group, see llama_moe_cache lend): its slot,
+// its largest tensor per expert and its share of the expert bytes of the model
+struct common_moe_slot_bytes { int64_t n_expert = 0; int64_t sum = 0; int64_t max = 0; int64_t total = 0; int64_t n_layer = 0; int64_t n_used = 0;
+    int64_t lend_sum = 0; int64_t lend_max = 0; double lend_share = 1.0; };
 static bool common_moe_slot_bytes_of(const std::string & path, common_moe_slot_bytes & out) {
     std::string prefix;
     int n_split = 1;
@@ -1306,11 +1310,24 @@ static bool common_moe_slot_bytes_of(const std::string & path, common_moe_slot_b
         }
     }
     const int64_t n_used = out.n_used;
+    std::map<std::pair<int64_t, int64_t>, int64_t> group_bytes; // (slot, largest tensor) -> expert bytes of its layers
+    int64_t layer_bytes = 0;
     for (const auto & it : per_layer) {
         if (it.second.sum > out.sum) {
             out = it.second;
         }
+        group_bytes[{ it.second.sum, it.second.max }] += it.second.n_expert*it.second.sum;
+        layer_bytes += it.second.n_expert*it.second.sum;
     }
+    int64_t lend_bytes = 0;
+    for (const auto & it : group_bytes) {
+        if (it.second > lend_bytes) {
+            lend_bytes   = it.second;
+            out.lend_sum = it.first.first;
+            out.lend_max = it.first.second;
+        }
+    }
+    out.lend_share = layer_bytes > 0 ? (double) lend_bytes/(double) layer_bytes : 1.0;
     out.n_used  = n_used;
     out.total   = total;
     out.n_layer = (int64_t) per_layer.size();
@@ -1641,11 +1658,22 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     }
     const auto lend_fits = [&](const mem & m) {
         const int64_t c       = cache - std::max<int64_t>(0, kv(m) - kv(m_def) + (m.dft - m_def.dft)); // the cache without the KV (and draft context) growth
-        const int64_t n_slots = c / sb.sum;
+        // in the bank tail of the largest group of layers with the same expert sizes, from its share of the cache (a model with
+        // mixed expert types, e.g. Qwen3.8-Flash-Next UD-IQ4_XS, lends from a group with smaller slots than its largest layer: an
+        // estimate from the largest layer took an n_ubatch 8192 graph of all-token outputs (llama-perplexity, 8770 MiB) that the
+        // cache could not lend, and the context failed to allocate it; LLAMA_MOE_LEND_FIT_LARGEST=1 restores that estimate)
+        static const bool largest = getenv("LLAMA_MOE_LEND_FIT_LARGEST") != nullptr && atoi(getenv("LLAMA_MOE_LEND_FIT_LARGEST")) != 0;
+        const bool    grp     = !largest && sb.lend_sum > 0 && sb.lend_max > 0;
+        const int64_t c_g     = grp ? (int64_t) ((double) c*sb.lend_share) : c;
+        const int64_t n_slots = c_g / (grp ? sb.lend_sum : sb.sum);
         const int64_t n_keep  = std::min<int64_t>(n_slots / 2, sb.n_expert + 1);
-        const int64_t tail    = (n_slots - n_keep) * sb.max;
+        const int64_t tail    = (n_slots - n_keep) * (grp ? sb.lend_max : sb.max);
         return (double) m.compute <= lend_frac * (double) tail;
     };
+    if (lend_graph) {
+        COM_INF("MoE cache: graph lending group: slot %.2f MiB, largest tensor %.2f MiB, %.1f%% of the expert bytes (largest layer: slot %.2f MiB, "
+            "largest tensor %.2f MiB)\n", sb.lend_sum/1048576.0, sb.lend_max/1048576.0, 100.0*sb.lend_share, sb.sum/1048576.0, sb.max/1048576.0);
+    }
     if (lend_graph && !lend_fits(m_ref)) {
         lend_graph = false;
     }
@@ -1711,7 +1739,8 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     if (lend_graph) {
         COM_INF("MoE cache: LLAMA_MOE_CACHE_LEND=2: n_ubatch %u, compute buffers %.2f MiB lent from one bank tail (slot %.2f MiB, largest tensor %.2f MiB, "
             "%" PRId64 " experts; at most %.0f%% of the tail, LLAMA_MOE_PREFILL_UB_LEND_FRAC), the cache gives up only the KV growth\n",
-            pick, m_pick.compute/1048576.0, sb.sum/1048576.0, sb.max/1048576.0, sb.n_expert, 100.0*lend_frac);
+            pick, m_pick.compute/1048576.0, (sb.lend_sum > 0 ? sb.lend_sum : sb.sum)/1048576.0, (sb.lend_max > 0 ? sb.lend_max : sb.max)/1048576.0,
+            sb.n_expert, 100.0*lend_frac);
     }
 
     COM_INF("MoE cache: n_ubatch = %u (default %u, rule: %s): +%.2f MiB of compute and KV memory taken from the cache, %.2f -> %.2f MiB "
