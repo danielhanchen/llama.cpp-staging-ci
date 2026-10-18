@@ -3913,8 +3913,6 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
-static bool ggml_cuda_env_flag(const char * name);
-
 // Size of one ggml_cuda_q8_1_cache slot for this graph, 0 if no activation is read by more than one
 // mul_mat_vec_q candidate and none is an RMS_NORM + MUL output (then the cache stays off and nothing changes).
 // norm_targets: the producer tensors (RMS_NORM + MUL outputs, elementwise chain ends, DSV4_HC_PRE) whose q8_1 copy their
@@ -4022,11 +4020,7 @@ static void ggml_cuda_q8_1_cache_node_done(ggml_cuda_q8_1_cache & cache, const g
     }
 }
 
-// elementwise fusions of small decode-time op chains; each one has its own kill switch
-static bool ggml_cuda_env_flag(const char * name) {
-    const char * env = getenv(name);
-    return env != nullptr && atoi(env) != 0;
-}
+// elementwise fusions of small decode-time op chains; each one has its own kill switch (ggml_cuda_env_flag)
 
 // true when [a, a + size(a)) and [b, b + size(b)) overlap
 static bool ggml_cuda_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b) {
