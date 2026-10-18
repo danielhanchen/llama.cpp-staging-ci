@@ -4938,16 +4938,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 // weight, a shared-expert gate, ...): they run on a handful of SMs for several microseconds while the rest of the GPU waits,
 // although their result is read only much later. Such a product is moved right after the last node it reads (before the
 // allocation, so the allocator places its output accordingly; its sources are kept alive until its first reader), and the
-// evaluation runs it on a side stream that the main stream joins before that reader. Every node computes the same values in
+// evaluation that captures the CUDA graph runs it on a side stream that the main stream joins before that reader (a graph
+// evaluated without capture runs it in place, on the main stream). Every node computes the same values in
 // the same order: only the overlap changes. GGML_CUDA_DISABLE_SIDE_MATVEC=1 turns it off.
 static constexpr int GGML_CUDA_SIDE_MV_STREAM    = GGML_CUDA_MAX_STREAMS - 2; // GGML_CUDA_MAX_STREAMS - 1: MoE cache copies
 static constexpr int GGML_CUDA_SIDE_MV_MAX_ROWS  = 64;
 static constexpr int GGML_CUDA_SIDE_MV_MIN_GAP   = 24; // nodes between the moved product and its first reader
 static constexpr int GGML_CUDA_SIDE_MV_LOOKAHEAD = 16; // the join is placed this many nodes early (a fused group may start there)
+static constexpr int GGML_CUDA_SIDE_MV_MAX_COLS  = 64; // a graph with a planned product over more columns (a prompt) does not use the side stream
 
 // planning only looks at the weight and the topology, not at the batch size: the prompt and decode graphs of a model then get
-// the same node order and the same allocation dependencies, so switching between them does not force a new allocation plan.
-// The side stream itself is only used for single-row products (ggml_cuda_side_mv_run).
+// the same node order and the same allocation dependencies, so switching between them does not force a new allocation plan
+// (planning only the decode graphs was measured: the scheduler then re-reserves and synchronizes at every prompt ubatch).
+// The side stream itself is only used for single-row products (ggml_cuda_side_mv_run), see ggml_cuda_side_mv_use for when.
 static bool ggml_cuda_side_mv_candidate(const ggml_tensor * node) {
     if (node->op != GGML_OP_MUL_MAT || !(node->flags & GGML_TENSOR_FLAG_COMPUTE) || node->view_src != nullptr) {
         return false;
@@ -4961,6 +4964,23 @@ static bool ggml_cuda_side_mv_candidate(const ggml_tensor * node) {
 
 static bool ggml_cuda_side_mv_run(const ggml_tensor * node) {
     return ggml_cuda_side_mv_candidate(node) && node->src[1]->ne[1] == 1;
+}
+
+// The side stream is only used while a decode-sized graph is captured into a CUDA graph. Used eagerly, it cost more than it saved:
+// on an RTX PRO 6000 (sm_120) the main-stream kernels issued afterwards, also those of the next prompt, started later (about
+// 0.25 us more per kernel boundary in an nsys trace): Qwen3.6-35B-A3B 8k prompt -1.8% / -1.9% vs GGML_CUDA_DISABLE_SIDE_MATVEC=1,
+// and with CUDA graphs off decode -7%. The same branches inside a captured graph cost nothing. A prompt graph (a planned product
+// over more than GGML_CUDA_SIDE_MV_MAX_COLS columns) runs all of them on the main stream, as there is nothing to overlap.
+static bool ggml_cuda_side_mv_use(const std::unordered_map<const ggml_tensor *, const ggml_tensor *> & side_mv, const bool capturing) {
+    if (side_mv.empty() || !capturing) {
+        return false;
+    }
+    for (const auto & [mv, reader] : side_mv) {
+        if (mv->src[1]->ne[1] > GGML_CUDA_SIDE_MV_MAX_COLS) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
@@ -5075,7 +5095,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             // side-stream matrix-vector products of this graph (see ggml_cuda_side_mv_plan): node index -> join index
             std::unordered_map<int, int> side_mv_at;
             std::vector<std::pair<int, cudaEvent_t>> side_mv_pending; // join index, event
-            if (!cuda_ctx->side_mv.empty() && stream_ctx.concurrent_events.empty()) {
+            if (stream_ctx.concurrent_events.empty() && ggml_cuda_side_mv_use(cuda_ctx->side_mv, use_cuda_graph && cuda_graph_update_required)) {
                 std::unordered_map<const ggml_tensor *, int> idx;
                 for (int i = 0; i < cgraph->n_nodes; ++i) {
                     idx[cgraph->nodes[i]] = i;
