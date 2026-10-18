@@ -1735,13 +1735,41 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         m_pick = m;
     }
     // the spill lending only pays with a larger n_ubatch than the reference one: else the rule before (the growth taken from the cache)
+    bool lend_ref = false; // the spill lending was possible at the reference n_ubatch
     if (spill_lend && lend_graph && pick == cands[0]) {
         lend_graph = false;
-        rule = "every expert cached, no KV growth";
+        lend_ref   = true;
+        rule = "reference n_ubatch, no KV growth";
+    }
+    // the reference n_ubatch takes its compute (and KV) growth from the cache for good. Where the cache then no longer holds every
+    // expert, every decode step reads a smaller cache: gpt-oss-20B Q2_K at a 6 GB cap (G4), 3299 -> 2936 MiB (-11%, the experts of 2.7
+    // tokens), decode 77.9 tok/s vs 83.6 for the release at n_ubatch 512, while the prompt gains far more (2k: 7768 vs 1724 tok/s; at 512
+    // every ubatch uploads the missed experts again). Then the growth is lent from the cache for the prompt ubatches where the spill
+    // lending rule allows it (the cache gives up only the KV growth), else n_ubatch stays the default if the growth is more than
+    // LLAMA_MOE_PREFILL_UB_SHRINK_MAX_FRAC (0.05) of the cache (a smaller share costs the decode little and the prompt keeps uploading
+    // the missed experts 4x less often). LLAMA_MOE_PREFILL_UB_SHRINK=1 takes the growth from the cache as before
+    if (!lend_graph && !rule_frac && !rule_spill && force <= 0 && pick == cands[0] && have_sb) {
+        static const bool shrink_ok = getenv("LLAMA_MOE_PREFILL_UB_SHRINK") != nullptr && atoi(getenv("LLAMA_MOE_PREFILL_UB_SHRINK")) != 0;
+        double shrink_max = 0.05;
+        if (const char * e = getenv("LLAMA_MOE_PREFILL_UB_SHRINK_MAX_FRAC")) {
+            shrink_max = std::max(0.0, atof(e));
+        }
+        const int64_t growth = std::max<int64_t>(0, m_pick.total - m_def.total);
+        if (!shrink_ok && growth > 0 && cache - growth < all_experts) {
+            if (lend_ref) {
+                lend_graph = true;
+                rule = "reference n_ubatch, compute buffers lent from the cache, which does not shrink for the decode (LLAMA_MOE_PREFILL_UB_SHRINK=1 takes them from it)";
+            } else if ((double) growth > shrink_max*(double) cache) {
+                COM_INF("MoE cache: n_ubatch stays %u: n_ubatch %u would take %.2f MiB (%.1f%%) from a cache of %.2f MiB that does not hold every "
+                    "expert (%.2f MiB), the decode would read the smaller cache (LLAMA_MOE_PREFILL_UB_SHRINK=1 or -ub to override)\n", ub_def, cands[0],
+                    growth/1048576.0, 100.0*growth/(double) cache, cache/1048576.0, all_experts/1048576.0);
+                return;
+            }
+        }
     }
     const int64_t taken     = std::max<int64_t>(0, lend_graph ? kv(m_pick) - kv(m_def) + (m_pick.dft - m_def.dft) : m_pick.total - m_def.total);
     const size_t  cache_new = (size_t) (cache - taken);
-    if (lend_graph && spill_lend && pick != cands[0]) {
+    if (lend_graph && spill_lend) {
         // the cache and the scheduler read the lending mode from the environment
         common_set_env("LLAMA_MOE_CACHE_LEND", "2");
     }
