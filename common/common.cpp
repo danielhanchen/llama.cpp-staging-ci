@@ -2488,6 +2488,15 @@ static bool common_experts_on_offloaded_host(const common_params & params, const
     if (params.moe_cache_size <= 0 || !(n_gpu_layers < 0 || n_gpu_layers > 1)) {
         return false;
     }
+    // without an override to a host buffer no expert is on the host: answer before reading the GGUF, whose metadata takes ~0.1 s to parse
+    // (Gemma-4 26B-A4B, a 262k-token vocabulary) on every load that keeps every expert on a device
+    bool any_host = false;
+    for (size_t i = 0; overrides != nullptr && overrides[i].pattern != nullptr && !any_host; ++i) {
+        any_host = overrides[i].buft != nullptr && ggml_backend_buft_is_host(overrides[i].buft);
+    }
+    if (!any_host) {
+        return false;
+    }
     std::vector<uint8_t> experts;
     const int64_t n_layer = common_model_n_layer(params.model.path, experts);
     if (n_layer < 0) {
