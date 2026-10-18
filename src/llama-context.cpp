@@ -3531,13 +3531,35 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         return !on_copy_queue && lctx->wstore && lctx->wstore->covers(src) && lctx->wstore->upload(backend, src, dst, 0, 0, ggml_nbytes(src));
     };
 
-    // the ids must be computed before the split starts, so only the first node of the split is considered
-    if (ggml_graph_n_nodes(graph) == 0) {
+    // the ids must be computed before the split starts. The product that reads the copy usually is the first node of the split, but a
+    // backend may reorder the nodes of a split: the CUDA side-stream plan (ggml_cuda_side_mv_plan) moves a few-row product whose sources
+    // come from an earlier split (e.g. the shared expert gate of Qwen3-Next style models) to its front. Taking only the first node then
+    // uploaded the whole down_exps tensor of every layer, cached experts included (Qwen3.8-Flash-Next UD-IQ4_XS, G4 32 GB: 46.6 instead of
+    // 36.9 GB per prompt ubatch, 2k prompt -15%). So the split is searched for the product, and its ids must not be computed in the split.
+    // LLAMA_MOE_COPY_SCAN=0: only the first node (as before)
+    const int n_nodes = ggml_graph_n_nodes(graph);
+    if (n_nodes == 0) {
         return copy_whole();
     }
-    const ggml_tensor * node = ggml_graph_node(graph, 0);
-    if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
+    static const bool scan = getenv("LLAMA_MOE_COPY_SCAN") == nullptr || atoi(getenv("LLAMA_MOE_COPY_SCAN")) != 0;
+    const ggml_tensor * node = nullptr;
+    for (int i = 0; i < (scan ? n_nodes : 1) && node == nullptr; i++) {
+        const ggml_tensor * t = ggml_graph_node(graph, i);
+        if (t->op == GGML_OP_MUL_MAT_ID && t->src[0] == dst) {
+            node = t;
+        }
+    }
+    if (node == nullptr) {
         return copy_whole();
+    }
+    if (node != ggml_graph_node(graph, 0)) {
+        const ggml_tensor * ids_n = node->src[2];
+        for (int i = 0; i < n_nodes; i++) {
+            const ggml_tensor * t = ggml_graph_node(graph, i);
+            if (t == ids_n || (ids_n->view_src != nullptr && t == ids_n->view_src)) {
+                return copy_whole();
+            }
+        }
     }
 
     const ggml_tensor * ids = node->src[2];
