@@ -1587,7 +1587,18 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     const char * env_l = getenv("LLAMA_MOE_CACHE_LEND");
     common_moe_slot_bytes sb;
     const bool have_sb = common_moe_slot_bytes_of(params.model.path, sb);
-    bool lend_graph = env_l != nullptr && atoi(env_l) == 2 && force <= 0 && m_def.n_dev == 1 && have_sb;
+    // the cache holds every expert: all the expert tensors of the model, a slot per layer of slack (the extra slot of each bank, the
+    // device lookup state) and 2%
+    const int64_t all_experts = have_sb ? (int64_t) (1.02*(double) sb.total) + sb.n_layer*sb.sum : INT64_MAX;
+    // spilled experts, LLAMA_MOE_CACHE_LEND unset: the graph allocation is lent as with LLAMA_MOE_CACHE_LEND=2 (LLAMA_MOE_SPILL_LEND=0
+    // disables). A larger n_ubatch then costs the decode no cache (its compute buffers are taken from the cache only while a prompt
+    // ubatch runs), unlike LLAMA_MOE_PREFILL_UB_SPILL=1, which shrinks the cache for good. G4 (RTX PRO 6000) at 32 GB, Qwen3.8-Flash-Next
+    // UD-IQ4_XS, 2 reps: 8k / 16k prompt 1933 / 1931 -> 3583 / 4247 tok/s (3927 / 4252 with 3 splits of prefetch), decode 81.7 / 81.1 -> 84.2 / 82.3
+    // (not with the opt-in LLAMA_MOE_PREFILL_UB_SPILL=1 rule)
+    const bool spill_lend = env_l == nullptr && !rule_frac && have_sb && cache_ref < all_experts &&
+        (getenv("LLAMA_MOE_SPILL_LEND") == nullptr || atoi(getenv("LLAMA_MOE_SPILL_LEND")) != 0) &&
+        !(getenv("LLAMA_MOE_PREFILL_UB_SPILL") != nullptr && atoi(getenv("LLAMA_MOE_PREFILL_UB_SPILL")) != 0);
+    bool lend_graph = ((env_l != nullptr && atoi(env_l) == 2) || spill_lend) && force <= 0 && m_def.n_dev == 1 && have_sb;
     double lend_frac = 0.85;
     if (const char * env_lf = getenv("LLAMA_MOE_PREFILL_UB_LEND_FRAC")) {
         lend_frac = std::max(0.0, atof(env_lf));
@@ -1602,9 +1613,6 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     if (lend_graph && !lend_fits(m_ref)) {
         lend_graph = false;
     }
-    // the cache holds every expert: all the expert tensors of the model, a slot per layer of slack (the extra slot of each bank, the
-    // device lookup state) and 2%
-    const int64_t all_experts = have_sb ? (int64_t) (1.02*(double) sb.total) + sb.n_layer*sb.sum : INT64_MAX;
     // spilled experts: the cache cannot hold every expert of the model even at the reference n_ubatch. A prompt ubatch of at least
     // GGML_SCHED_PREFETCH_MIN_BATCH tokens stages every expert of every cached layer (the copies run ahead of the routing), so each ubatch
     // uploads all the experts the cache misses: a prompt of P tokens uploads them ceil(P/n_ubatch) times. A larger n_ubatch uploads them once
@@ -1624,7 +1632,7 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     if (const char * env_sf = getenv("LLAMA_MOE_PREFILL_UB_SPILL_FRAC")) {
         spill_frac = std::max(0.0, atof(env_sf));
     }
-    const char * rule = force > 0 ? "forced" : lend_graph ? "LLAMA_MOE_CACHE_LEND=2" : rule_frac ? "LLAMA_MOE_PREFILL_UB_AUTO=1" :
+    const char * rule = force > 0 ? "forced" : lend_graph ? (spill_lend ? "experts spill, compute buffers lent from the cache (LLAMA_MOE_SPILL_LEND=0 to disable)" : "LLAMA_MOE_CACHE_LEND=2") : rule_frac ? "LLAMA_MOE_PREFILL_UB_AUTO=1" :
         rule_spill ? "experts spill, at most LLAMA_MOE_PREFILL_UB_SPILL_FRAC of the cache, no KV growth" : "every expert cached, no KV growth";
 
     uint32_t pick   = cands[0];
@@ -1653,8 +1661,17 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         pick   = cands[i];
         m_pick = m;
     }
+    // the spill lending only pays with a larger n_ubatch than the reference one: else the rule before (the growth taken from the cache)
+    if (spill_lend && lend_graph && pick == cands[0]) {
+        lend_graph = false;
+        rule = "every expert cached, no KV growth";
+    }
     const int64_t taken     = std::max<int64_t>(0, lend_graph ? kv(m_pick) - kv(m_def) + (m_pick.dft - m_def.dft) : m_pick.total - m_def.total);
     const size_t  cache_new = (size_t) (cache - taken);
+    if (lend_graph && spill_lend && pick != cands[0]) {
+        // the cache and the scheduler read the lending mode from the environment
+        common_set_env("LLAMA_MOE_CACHE_LEND", "2");
+    }
     if (lend_graph) {
         COM_INF("MoE cache: LLAMA_MOE_CACHE_LEND=2: n_ubatch %u, compute buffers %.2f MiB lent from one bank tail (slot %.2f MiB, largest tensor %.2f MiB, "
             "%" PRId64 " experts; at most %.0f%% of the tail, LLAMA_MOE_PREFILL_UB_LEND_FRAC), the cache gives up only the KV growth\n",
