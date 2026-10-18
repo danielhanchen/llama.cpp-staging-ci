@@ -257,6 +257,9 @@ public:
     bool get_prev_tokens_ahead(const llama_ubatch & ubatch, const llama_ubatch * pending, uint32_t n,
             std::vector<llama_token> & res, std::vector<uint8_t> & known) const;
 
+    // token of seq_id at the largest cached position <= p, LLAMA_TOKEN_NULL if none or no cell ext
+    llama_token seq_pos_tok_le(llama_seq_id seq_id, llama_pos p) const;
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
