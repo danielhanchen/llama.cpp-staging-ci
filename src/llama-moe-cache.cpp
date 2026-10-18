@@ -1583,10 +1583,16 @@ struct llama_moe_cache::impl {
     // otherwise evict those pages and the first prompt would read them again (LLAMA_MOE_HOST_CACHE_PREFILL=0 off)
     void prefill_resident() {
 #if defined(__linux__) || defined(__APPLE__)
-        if (const char * e = getenv("LLAMA_MOE_HOST_CACHE_PREFILL"); e != nullptr && atoi(e) == 0) {
+        const char * env_pf = getenv("LLAMA_MOE_HOST_CACHE_PREFILL");
+        if (env_pf != nullptr && atoi(env_pf) == 0) {
             return;
         }
+        // LLAMA_MOE_HOST_CACHE_PREFILL=2: also read the experts that are not in the page cache, layer by layer from the model files
+        // (readahead of each layer's expert tensors first), skipping the experts the device slots hold: with the device cache prefilled
+        // (LLAMA_MOE_CACHE_PREFILL=1) the first prompt then reads nothing from the files when RAM + VRAM hold every expert (low-RAM boxes)
+        const bool from_file = env_pf != nullptr && atoi(env_pf) >= 2;
         const int64_t t0 = ggml_time_us();
+        size_t n_file = 0;
         const size_t pg = (size_t) std::max(4096L, sysconf(_SC_PAGESIZE));
         std::vector<unsigned char> vec;
         std::vector<std::vector<bool>> res;
@@ -1600,6 +1606,13 @@ struct llama_moe_cache::impl {
             for (int32_t il : groups[ig].layers) {
                 const layer & l = layers[il];
                 const int32_t n_expert = (int32_t) l.experts[0]->ne[2];
+                const int32_t * dev_slots = il < (int32_t) groups[ig].lru.slot_map.size() ? groups[ig].lru.slot_map[il] : nullptr;
+                if (from_file) {
+                    for (const ggml_tensor * w : l.experts) {
+                        const uintptr_t p0 = (uintptr_t) w->data / pg * pg;
+                        madvise((void *) p0, (uintptr_t) w->data + ggml_nbytes(w) - p0, MADV_WILLNEED);
+                    }
+                }
                 // residency of each expert of each tensor
                 res.assign(l.experts.size(), std::vector<bool>(n_expert, false));
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
@@ -1630,7 +1643,10 @@ struct llama_moe_cache::impl {
                     for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                         all = all && res[ip][e];
                     }
-                    if (!all || host->contains(il, e)) {
+                    const bool on_dev = dev_slots != nullptr && dev_slots[e] >= 0;
+                    const bool file = from_file && !all && !on_dev;
+                    all = all || file;
+                    if (!all || host->contains(il, e) || (from_file && on_dev)) {
                         continue;
                     }
                     const int32_t s = host->reserve(il, e, false);
@@ -1646,12 +1662,14 @@ struct llama_moe_cache::impl {
                     }
                     host->publish(s);
                     n_fill++;
+                    n_file += file ? 1 : 0;
                 }
             }
         }
         hst.prefilled = n_fill;
-        LLAMA_LOG_INFO("%s: MoE host cache: %zu experts (%.1f MiB) copied from the page cache into RAM slots in %.1f ms (LLAMA_MOE_HOST_CACHE_PREFILL=0 off)\n",
-                __func__, n_fill, n_bytes/1048576.0, (ggml_time_us() - t0)/1000.0);
+        LLAMA_LOG_INFO("%s: MoE host cache: %zu experts (%.1f MiB) copied from the page cache into RAM slots in %.1f ms, %zu of them read from the files"
+                " (LLAMA_MOE_HOST_CACHE_PREFILL=0 off, 2 also reads the experts that are not in the page cache)\n",
+                __func__, n_fill, n_bytes/1048576.0, (ggml_time_us() - t0)/1000.0, n_file);
 #endif
     }
 
