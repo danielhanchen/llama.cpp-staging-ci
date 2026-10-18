@@ -2723,8 +2723,11 @@ static enum llama_load_mode common_moe_cache_load_mode(const common_params & par
             // still holds the file it reads them from: where both do not fit, the copy evicts the file it reads and the load reads it
             // from the disk again (L4, 53 GB RAM, Qwen3.6-35B-A3B UD-Q4_K_XL 21 GB at a 12 GB cap: 56 s vs 10.6 s with mmap). With mmap the
             // device lookup registers the mapped pages in place (no second copy). So without mmap only if the host experts and the file fit
-            // in LLAMA_MOE_LOAD_NONE_RAM_FRAC (0.8) of the available memory; with every expert on a device nothing is pinned, the rule above
-            double none_frac = 0.8;
+            // in LLAMA_MOE_LOAD_NONE_RAM_FRAC (0.7) of the available memory; with every expert on a device nothing is pinned, the rule above.
+            // G4 with a host RAM ballast (MemAvailable 49 GB, the same model at 12 GB): without mmap (41 GB = 84% of it) the load took 48.8 s
+            // vs 5.9 s with mmap, while the registered mapping reads slower: decode 164.8 vs 179.2 tok/s, 2k prompt 5212 vs 7326 tok/s
+            // (--load-mode none keeps the faster steady state at the cost of the load)
+            double none_frac = 0.7;
             if (const char * e = getenv("LLAMA_MOE_LOAD_NONE_RAM_FRAC")) {
                 none_frac = std::max(0.0, atof(e));
             }
