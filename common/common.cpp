@@ -1602,9 +1602,13 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     if (const char * e = getenv("LLAMA_MOE_SPILL_LEND_MAX_FRAC")) {
         spill_lend_max_frac = std::max(0.0, atof(e));
     }
+    // Not with speculative decoding unless LLAMA_MOE_SPILL_LEND=2: with an MTP draft (Flash-Next + MTP Q8_0 at 32 GB, G4) the prompt
+    // gained +13% / +94% / +107% (2k / 8k / 16k) but the decode after it lost 4.5% / 9.3% / 0% (the cache is 18% smaller there and the
+    // graph lends 29% of it during a prompt)
+    const int  spill_lend_mode = getenv("LLAMA_MOE_SPILL_LEND") != nullptr ? atoi(getenv("LLAMA_MOE_SPILL_LEND")) : 1;
     const bool spill_lend = env_l == nullptr && !rule_frac && have_sb && cache_ref < all_experts &&
         (double) cache_ref <= spill_lend_max_frac*(double) sb.total &&
-        (getenv("LLAMA_MOE_SPILL_LEND") == nullptr || atoi(getenv("LLAMA_MOE_SPILL_LEND")) != 0) &&
+        (spill_lend_mode >= 2 || (spill_lend_mode == 1 && !has_spec)) &&
         !(getenv("LLAMA_MOE_PREFILL_UB_SPILL") != nullptr && atoi(getenv("LLAMA_MOE_PREFILL_UB_SPILL")) != 0);
     bool lend_graph = ((env_l != nullptr && atoi(env_l) == 2) || spill_lend) && force <= 0 && m_def.n_dev == 1 && have_sb;
     double lend_frac = 0.85;
