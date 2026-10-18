@@ -1317,6 +1317,20 @@ static bool common_moe_slot_bytes_of(const std::string & path, common_moe_slot_b
     return out.sum > 0;
 }
 
+// n_ubatch of the draft context of speculative decoding (an MTP context or a draft model) for a target context at n_ubatch u: the MoE
+// cache rules grow the target's n_ubatch so that a prompt uploads the experts it misses fewer times (common_moe_cache_auto_ubatch).
+// The draft gains nothing from that (a draft model's weights are on the device or never uploaded per ubatch, an MTP context processes
+// the prompt in chunks of its own n_ubatch over one layer), but its compute buffers grow with it and are counted against the cache: at
+// 32 GB with Qwen3.8-Flash-Next + MTP the spill rule stopped at 4096 instead of 8192 because of them, so an 8k prompt was uploaded twice.
+// Without -ub the draft keeps LLAMA_MOE_DRAFT_UB_MAX (2048; 0 = the target's n_ubatch, as before)
+uint32_t common_draft_n_ubatch(const common_params & params, uint32_t u) {
+    if (params.n_ubatch_set || params.moe_cache_size == 0) {
+        return u;
+    }
+    static const int64_t cap = getenv("LLAMA_MOE_DRAFT_UB_MAX") != nullptr ? atoll(getenv("LLAMA_MOE_DRAFT_UB_MAX")) : 2048;
+    return cap > 0 ? std::min<uint32_t>(u, (uint32_t) cap) : u;
+}
+
 // MoE cache mode without -ub: every expert a prompt ubatch does not find in the cache is uploaded once per ubatch, so fewer, larger
 // ubatches upload less. n_ubatch is 2048 instead of the default (512); the growth of the compute buffers and of the KV cache is taken
 // from the cache, so the device memory stays what the default ubatch would use. A larger n_ubatch (4096/8192, LLAMA_MOE_PREFILL_UB_MAX)
@@ -1408,7 +1422,7 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         }
         llama_context_params cp = cparams_dft;
         cp.n_ctx    = cparams.n_ctx;
-        cp.n_ubatch = u;
+        cp.n_ubatch = common_draft_n_ubatch(params, u);
         cp.n_batch  = std::max(cp.n_batch, u);
         std::vector<ggml_backend_dev_t> devs;
         uint32_t hp_ngl = 0, hp_nct = 0, hp_nex = 0;

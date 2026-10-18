@@ -968,6 +968,9 @@ bool tty_enable_ansi(); // false when stdout or stderr is a console that cannot 
 bool common_is_tty(FILE * file);
 
 //
+// n_ubatch of the draft context of speculative decoding for a target context at n_ubatch u (see common.cpp)
+uint32_t common_draft_n_ubatch(const common_params & params, uint32_t u);
+
 // Model utils
 //
 
