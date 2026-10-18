@@ -994,8 +994,8 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
             }
             const uint64_t ram_total = llama_sysmem::total();
             ram_ok = ram_total == 0 || moe_cache->host_uncached_bytes() <= ram_frac*(double) ram_total;
-            static bool logged = false;
-            if (!ram_ok && !logged) {
+            static bool logged = false; // once per process, not for a memory probe (no_alloc), whose log the fit silences
+            if (!ram_ok && !logged && !model.hparams.no_alloc) {
                 logged = true;
                 LLAMA_LOG_INFO("%s: MoE cache: host weight prefetch keeps the default depth: the uncached host experts (%.0f MiB) are more than "
                     "%.0f%% of the RAM (%.0f MiB; LLAMA_MOE_PREFETCH_DEPTH_SPILL=N forces depth N)\n", __func__,
