@@ -11,7 +11,9 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <map>
 #include <set>
 #include <cstdlib>
@@ -439,6 +441,41 @@ struct llama_moe_cache::impl {
     std::vector<std::pair<int32_t, int32_t>> evicted_tmp;
     std::vector<llama_weight_store::host_read> host_reads;
     std::vector<std::pair<int32_t, moe_cache_lru::fill>> host_pending;
+
+    // layer-ahead reads of the RAM tier (LLAMA_MOE_HOST_CACHE_AHEAD=N, 1..4, 0 = off): small batches, host lookups only. The router
+    // input of layer p (read with the ids of p) is scored on the host with the routers of layers p+1..p+N, while the device computes
+    // split p (before the next lookup synchronizes); the top experts that neither the device nor RAM hold are read into RAM slots by
+    // the IO threads behind every demand read. A lookup that routes an expert still being read waits for that read only.
+    // Exact: only which RAM slots hold (file) bytes changes, never what a lookup computes with
+    struct ahead_router {
+        std::vector<uint16_t> w;  // bf16 [n_expert][n_embd] (rows of ffn_gate_inp)
+        std::vector<float>    b;  // ffn_gate_inp_b, empty if none
+        std::vector<float>    pb; // ffn_exp_probs_b, empty if none
+    };
+    int     ahead_depth   = 0;
+    int     ahead_topk    = 0;
+    int     ahead_gating  = 0;
+    int64_t ahead_n_embd  = 0;
+    static constexpr int64_t ahead_max_tokens = 4; // small batches of more tokens are not predicted
+    std::vector<ahead_router>        routers;  // [n_layer]
+    std::vector<const ggml_tensor *> router_w; // [n_layer] ffn_gate_inp of the layer
+    std::vector<float>    ahead_x;             // router input of layer ahead_il, [ahead_nt][n_embd]
+    int64_t  ahead_nt    = 0;
+    int32_t  ahead_il    = -1;
+    uint64_t ahead_epoch   = 1; // ubatch being computed (see prepare): the lookups of one ubatch follow the layers in order
+    uint64_t ahead_x_epoch = 0; // ubatch of the router input in ahead_x
+    std::vector<uint64_t> ahead_ticket;        // [slot] weight store ticket of its read ahead, 0 = none
+    std::vector<int32_t>  ahead_key;           // [slot] key read ahead and not used yet, -1 = none
+    std::vector<int32_t>  ahead_inflight;      // slots with a ticket
+    std::vector<std::vector<int32_t>> ahead_pred; // [n_layer] experts last predicted for the layer (recall)
+    std::vector<float>    ahead_scores;
+    std::vector<std::pair<float, int32_t>> ahead_rank;
+    std::vector<llama_weight_store::host_read> ahead_reads;
+    size_t ahead_router_bytes = 0;
+    struct ahead_stats {
+        uint64_t layers = 0, predicted = 0, issued = 0, bytes = 0, used = 0, late = 0, no_slot = 0, waited_us = 0, routed = 0, recalled = 0,
+                 held = 0, predict_us = 0;
+    } ast;
     std::vector<moe_cache_lru::fill> fills_rest;
 
     // the tier the weight store sees: the expert tensors of the RAM tier layers, at expert granularity
@@ -1201,6 +1238,7 @@ struct llama_moe_cache::impl {
 
         if (!model.hparams.no_alloc) {
             init_host_cache(host_mib);
+            init_ahead(model);
         }
 
         if (device_lookup && !model.hparams.no_alloc) {
@@ -1378,7 +1416,8 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
-        // the weight store is detached by llama_context (it is destroyed first)
+        // the weight store is destroyed first (llama_context): its destructor completes the reads ahead into the RAM slots, which are
+        // still allocated then; wstore is not used here
         log_stats();
         for (const auto & [unmap, buf] : mapped) {
             unmap(buf);
@@ -1394,6 +1433,26 @@ struct llama_moe_cache::impl {
 
     static size_t meminfo_avail() {
         return llama_weight_store::ram_available();
+    }
+
+    // WSL 2 (the GPU through WDDM) or Windows
+    static bool host_is_wddm() {
+#if defined(_WIN32)
+        return true;
+#else
+        FILE * f = fopen("/proc/sys/kernel/osrelease", "r");
+        if (f == nullptr) {
+            return false;
+        }
+        char buf[256] = {};
+        const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[n] = 0;
+        for (char * c = buf; *c; ++c) {
+            *c = (char) tolower((unsigned char) *c);
+        }
+        return strstr(buf, "microsoft") != nullptr || strstr(buf, "wsl") != nullptr;
+#endif
     }
 
     // the groups whose experts the weight store streams get a RAM tier when it is on and the budget holds at least one bundle
@@ -1469,7 +1528,25 @@ struct llama_moe_cache::impl {
         for (const group & g : groups) {
             n_expert = std::max<int32_t>(n_expert, (int32_t) g.ref[0]->ne[2]);
         }
-        host = std::make_unique<llama_moe_host_cache>(buft, budget, policy, n_expert, sizes);
+        // pin guard: pinned slots up to a cap (WSL / Windows: WDDM limits page-locked memory, 1 GiB by default), plain host memory past it
+        // or once pinning fails (LLAMA_MOE_HOST_CACHE_PIN_MIB caps it, LLAMA_MOE_HOST_CACHE_PAGEABLE=0: the tier stops growing instead)
+        size_t pin_cap = SIZE_MAX;
+        const bool wddm = host_is_wddm();
+        if (wddm) {
+            pin_cap = (size_t) 1024 << 20;
+        }
+        if (const char * e = getenv("LLAMA_MOE_HOST_CACHE_PIN_MIB"); e != nullptr && atoll(e) >= 0) {
+            pin_cap = (size_t) atoll(e) << 20;
+        }
+        ggml_backend_buffer_type_t buft_pageable = ggml_backend_cpu_buffer_type();
+        if (const char * e = getenv("LLAMA_MOE_HOST_CACHE_PAGEABLE"); e != nullptr && atoi(e) == 0) {
+            buft_pageable = nullptr;
+        }
+        host = std::make_unique<llama_moe_host_cache>(buft, budget, policy, n_expert, sizes, 0, buft_pageable, pin_cap);
+        if (pin_cap != SIZE_MAX) {
+            LLAMA_LOG_INFO("%s: MoE host cache: at most %.1f MiB pinned%s, %s past it\n", __func__, pin_cap/1048576.0, wddm ? " (WSL / WDDM)" : "",
+                    buft_pageable ? "pageable" : "no more slots");
+        }
         if (host->n_slots() == 0) {
             LLAMA_LOG_INFO("%s: MoE host cache off: %.1f MiB budget holds no expert (%.1f MiB available)\n", __func__, budget/1048576.0, avail/1048576.0);
             host.reset();
@@ -1563,6 +1640,316 @@ struct llama_moe_cache::impl {
         LLAMA_LOG_INFO("%s: MoE host cache: %zu experts (%.1f MiB) copied from the page cache into RAM slots in %.1f ms (LLAMA_MOE_HOST_CACHE_PREFILL=0 off)\n",
                 __func__, n_fill, n_bytes/1048576.0, (ggml_time_us() - t0)/1000.0);
 #endif
+    }
+
+    //
+    // layer-ahead reads of the RAM tier
+    //
+
+    static float bf16_to_f32(uint16_t h) {
+        const uint32_t u = (uint32_t) h << 16;
+        float f;
+        memcpy(&f, &u, sizeof(f));
+        return f;
+    }
+
+    void init_ahead(const llama_model & model) {
+        const char * env = getenv("LLAMA_MOE_HOST_CACHE_AHEAD");
+        ahead_depth = env != nullptr ? std::max(0, std::min(4, atoi(env))) : 0;
+        if (!host || ahead_depth == 0) {
+            ahead_depth = 0;
+            return;
+        }
+        if (model.hparams.n_group_experts > 1) {
+            LLAMA_LOG_INFO("%s: MoE host cache: no reads ahead (grouped expert ids)\n", __func__);
+            ahead_depth = 0;
+            return;
+        }
+        const char * env_k = getenv("LLAMA_MOE_HOST_CACHE_AHEAD_TOPK");
+        ahead_topk   = env_k != nullptr ? std::max(1, atoi(env_k)) : (int) n_expert_used;
+        ahead_gating = (int) model.hparams.expert_gating_func;
+        const int64_t t0 = ggml_time_us();
+        routers.assign(layers.size(), {});
+        router_w.assign(layers.size(), nullptr);
+        ahead_pred.assign(layers.size(), {});
+        std::vector<uint8_t> raw;
+        std::vector<float>   row;
+        size_t n_layers = 0;
+        for (size_t il = 0; il < layers.size() && il < model.layers.size(); ++il) {
+            if (!host_layer((int32_t) il)) {
+                continue;
+            }
+            const ggml_tensor * w = model.layers[il].ffn_gate_inp;
+            const int64_t n_expert = layers[il].experts[0]->ne[2];
+            if (w == nullptr || w->buffer == nullptr || ggml_n_dims(w) != 2 || w->ne[1] != n_expert || (ahead_n_embd != 0 && w->ne[0] != ahead_n_embd)) {
+                continue;
+            }
+            const auto * tt = ggml_get_type_traits(w->type);
+            if (w->type != GGML_TYPE_F32 && (tt == nullptr || tt->to_float == nullptr)) {
+                continue;
+            }
+            ahead_n_embd = w->ne[0];
+            raw.resize(ggml_nbytes(w));
+            ggml_backend_tensor_get(w, raw.data(), 0, raw.size());
+            ahead_router & r = routers[il];
+            r.w.resize((size_t) n_expert*ahead_n_embd);
+            row.resize(ahead_n_embd);
+            for (int64_t e = 0; e < n_expert; ++e) {
+                const uint8_t * src = raw.data() + (size_t) e*w->nb[1];
+                if (w->type == GGML_TYPE_F32) {
+                    memcpy(row.data(), src, ahead_n_embd*sizeof(float));
+                } else {
+                    tt->to_float(src, row.data(), ahead_n_embd);
+                }
+                for (int64_t i = 0; i < ahead_n_embd; ++i) {
+                    r.w[(size_t) e*ahead_n_embd + i] = ggml_fp32_to_bf16(row[i]).bits;
+                }
+            }
+            auto get_bias = [&](const ggml_tensor * b, std::vector<float> & out) {
+                if (b != nullptr && b->buffer != nullptr && b->type == GGML_TYPE_F32 && ggml_nelements(b) == n_expert && ggml_is_contiguous(b)) {
+                    out.resize(n_expert);
+                    ggml_backend_tensor_get(b, out.data(), 0, n_expert*sizeof(float));
+                }
+            };
+            get_bias(model.layers[il].ffn_gate_inp_b, r.b);
+            get_bias(model.layers[il].ffn_exp_probs_b, r.pb);
+            router_w[il] = w;
+            ahead_router_bytes += r.w.size()*sizeof(uint16_t) + (r.b.size() + r.pb.size())*sizeof(float);
+            n_layers++;
+        }
+        if (n_layers == 0) {
+            LLAMA_LOG_INFO("%s: MoE host cache: no reads ahead (no router of a streamed layer can be read)\n", __func__);
+            ahead_depth = 0;
+            routers.clear();
+            return;
+        }
+        ahead_ticket.assign(host->n_slots(), 0);
+        ahead_key.assign(host->n_slots(), -1);
+        LLAMA_LOG_INFO("%s: MoE host cache: reads ahead of %d layer%s (top %d experts per token, LLAMA_MOE_HOST_CACHE_AHEAD=0 off), host routers of %zu layers = %.1f MiB in %.1f ms\n",
+                __func__, ahead_depth, ahead_depth > 1 ? "s" : "", ahead_topk, n_layers, ahead_router_bytes/1048576.0, (ggml_time_us() - t0)/1000.0);
+    }
+
+    bool ahead_on() const {
+        return ahead_depth > 0 && host && wstore != nullptr;
+    }
+
+    // the router input of layer il: src[1] of the matmul with its ffn_gate_inp that the selected experts sel derive from (nullptr if none)
+    const ggml_tensor * ahead_router_input(int32_t il, const ggml_tensor * sel) const {
+        if (il < 0 || (size_t) il >= router_w.size() || router_w[il] == nullptr) {
+            return nullptr;
+        }
+        const ggml_tensor * stack[64];
+        int n = 0;
+        int visited = 0;
+        stack[n++] = sel;
+        while (n > 0 && visited < 64) {
+            const ggml_tensor * t = stack[--n];
+            visited++;
+            if (t->op == GGML_OP_MUL_MAT && t->src[0] == router_w[il]) {
+                return t->src[1];
+            }
+            for (int i = 0; i < GGML_MAX_SRC && n < 63; ++i) {
+                if (t->src[i] != nullptr) {
+                    stack[n++] = t->src[i];
+                }
+            }
+            if (t->view_src != nullptr && n < 63) {
+                stack[n++] = t->view_src;
+            }
+        }
+        return nullptr;
+    }
+
+    // the experts of layer j the router input of layer ahead_il selects (top ahead_topk per token, union)
+    void ahead_predict(int32_t j, std::vector<int32_t> & out) {
+        out.clear();
+        const ahead_router & r = routers[j];
+        const int64_t n_expert = (int64_t) (r.w.size()/ahead_n_embd);
+        const int64_t k = std::min<int64_t>(ahead_topk, n_expert);
+        ahead_scores.resize(n_expert);
+        for (int64_t t = 0; t < ahead_nt; ++t) {
+            const float * x = ahead_x.data() + t*ahead_n_embd;
+            for (int64_t e = 0; e < n_expert; ++e) {
+                const uint16_t * w = r.w.data() + (size_t) e*ahead_n_embd;
+                float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+                int64_t i = 0;
+                for (; i + 4 <= ahead_n_embd; i += 4) {
+                    s0 += bf16_to_f32(w[i + 0])*x[i + 0];
+                    s1 += bf16_to_f32(w[i + 1])*x[i + 1];
+                    s2 += bf16_to_f32(w[i + 2])*x[i + 2];
+                    s3 += bf16_to_f32(w[i + 3])*x[i + 3];
+                }
+                for (; i < ahead_n_embd; ++i) {
+                    s0 += bf16_to_f32(w[i])*x[i];
+                }
+                ahead_scores[e] = (s0 + s1) + (s2 + s3) + (r.b.empty() ? 0.0f : r.b[e]);
+            }
+            if (!r.pb.empty()) {
+                // the selection bias is added to the probabilities
+                if (ahead_gating == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX) {
+                    float mx = -INFINITY;
+                    for (int64_t e = 0; e < n_expert; ++e) {
+                        mx = std::max(mx, ahead_scores[e]);
+                    }
+                    float sum = 0.0f;
+                    for (int64_t e = 0; e < n_expert; ++e) {
+                        ahead_scores[e] = expf(ahead_scores[e] - mx);
+                        sum += ahead_scores[e];
+                    }
+                    for (int64_t e = 0; e < n_expert; ++e) {
+                        ahead_scores[e] = ahead_scores[e]/sum + r.pb[e];
+                    }
+                } else {
+                    for (int64_t e = 0; e < n_expert; ++e) {
+                        ahead_scores[e] = 1.0f/(1.0f + expf(-ahead_scores[e])) + r.pb[e];
+                    }
+                }
+            }
+            ahead_rank.resize(n_expert);
+            for (int64_t e = 0; e < n_expert; ++e) {
+                ahead_rank[e] = { -ahead_scores[e], (int32_t) e };
+            }
+            std::nth_element(ahead_rank.begin(), ahead_rank.begin() + (k - 1), ahead_rank.end());
+            std::sort(ahead_rank.begin(), ahead_rank.begin() + k);
+            for (int64_t i = 0; i < k; ++i) {
+                if (std::find(out.begin(), out.end(), ahead_rank[i].second) == out.end()) {
+                    out.push_back(ahead_rank[i].second);
+                }
+            }
+        }
+    }
+
+    // a read ahead completed: the slot holds its expert
+    void ahead_complete(int32_t s) {
+        host->publish(s);
+        ahead_ticket[s] = 0;
+        ahead_key[s] = host->key(s);
+    }
+
+    // the reads ahead that are done publish their slots (never blocks)
+    void ahead_reap() {
+        size_t o = 0;
+        for (size_t i = 0; i < ahead_inflight.size(); ++i) {
+            const int32_t s = ahead_inflight[i];
+            if (wstore->host_done(ahead_ticket[s])) {
+                ahead_complete(s);
+            } else {
+                ahead_inflight[o++] = s;
+            }
+        }
+        ahead_inflight.resize(o);
+    }
+
+    // every read ahead is waited for (before a large batch, a detach of the store, or the end)
+    void ahead_drain() {
+        if (!host || ahead_inflight.empty() || wstore == nullptr) {
+            return;
+        }
+        for (const int32_t s : ahead_inflight) {
+            wstore->host_wait(ahead_ticket[s]);
+            ahead_complete(s);
+        }
+        ahead_inflight.clear();
+    }
+
+    // the routed experts of layer il that are being read ahead: wait for those reads (their unstarted pieces go first)
+    void ahead_wait_routed(int32_t il) {
+        bool any = false;
+        for (const int32_t e : ids) {
+            if (e < 0) {
+                continue;
+            }
+            const int32_t s = host->slot_of_key(il, e);
+            if (s < 0 || ahead_ticket[s] == 0) {
+                continue;
+            }
+            if (!wstore->host_done(ahead_ticket[s])) {
+                const int64_t t0 = ggml_time_us();
+                wstore->host_wait(ahead_ticket[s]);
+                ast.waited_us += ggml_time_us() - t0;
+                ast.late++;
+            }
+            ahead_complete(s);
+            any = true;
+        }
+        if (any) {
+            size_t o = 0;
+            for (size_t i = 0; i < ahead_inflight.size(); ++i) {
+                if (ahead_ticket[ahead_inflight[i]] != 0) {
+                    ahead_inflight[o++] = ahead_inflight[i];
+                }
+            }
+            ahead_inflight.resize(o);
+        }
+        // recall of the last prediction of the layer
+        auto & pred = ahead_pred[il];
+        if (!pred.empty()) {
+            std::vector<int32_t> & seen = ahead_rank_ids();
+            seen.clear();
+            for (const int32_t e : ids) {
+                if (e < 0 || std::find(seen.begin(), seen.end(), e) != seen.end()) {
+                    continue;
+                }
+                seen.push_back(e);
+                ast.routed++;
+                ast.recalled += std::find(pred.begin(), pred.end(), e) != pred.end();
+            }
+            pred.clear();
+        }
+    }
+
+    static std::vector<int32_t> & ahead_rank_ids() {
+        static thread_local std::vector<int32_t> v;
+        return v;
+    }
+
+    // at a lookup of layer il, before it synchronizes: the reads ahead for layers il .. ahead_il + depth from the router input of ahead_il
+    void ahead_issue(int32_t il) {
+        const int32_t p = ahead_il;
+        for (int32_t j = std::max(il, p + 1); j <= p + ahead_depth && (size_t) j < layers.size(); ++j) {
+            if (!host_layer(j) || routers[j].w.empty()) {
+                continue;
+            }
+            std::vector<int32_t> & pred = ahead_pred[j];
+            const int64_t t0 = ggml_time_us();
+            ahead_predict(j, pred);
+            ast.predict_us += ggml_time_us() - t0;
+            ast.layers++;
+            ast.predicted += pred.size();
+            const layer & l = layers[j];
+            for (const int32_t e : pred) {
+                if (in_device(j, e) || host->contains(j, e)) {
+                    ast.held++;
+                    continue;
+                }
+                // never a slot that a copy of the last few lookups may still read: the reservation would wait for the device
+                const int32_t s = host->reserve(j, e, true, 4);
+                if (s < 0) {
+                    ast.no_slot++;
+                    break;
+                }
+                ahead_reads.clear();
+                size_t nb_all = 0;
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    ahead_reads.push_back({ w, (size_t) e*w->nb[2], w->nb[2], host->area(s, (int) ip), 0 });
+                    nb_all += w->nb[2];
+                }
+                const uint64_t t = wstore->read_host_async(ahead_reads.data(), ahead_reads.size(), true);
+                if (t == 0) {
+                    host->abort(s);
+                    continue;
+                }
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    host->set_lead(s, (int) ip, ahead_reads[ip].lead);
+                }
+                host->set_async(s, 1);
+                ahead_ticket[s] = t;
+                ahead_inflight.push_back(s);
+                ast.issued++;
+                ast.bytes += nb_all;
+            }
+        }
     }
 
     bool host_layer(int32_t il) const {
@@ -1732,6 +2119,10 @@ struct llama_moe_cache::impl {
                     }
                     host->mark_read(s);
                     hst.hits++;
+                    if (!ahead_key.empty() && ahead_key[s] >= 0) {
+                        ast.used += ahead_key[s] == host->key(s);
+                        ahead_key[s] = -1;
+                    }
                     if (host->exclusive()) {
                         host->release(s);
                         hst.promoted++;
@@ -2541,6 +2932,12 @@ struct llama_moe_cache::impl {
     }
 
     void prepare(int64_t n_tokens) {
+        ahead_epoch++;
+        // a large batch plans the reads of its uploads with the RAM tier as it is: every read ahead is complete first
+        if (ahead_on() && n_tokens > n_small_max) {
+            ahead_drain();
+            ahead_il = -1;
+        }
         for (group & g : groups) {
             if (g.n_slots == 0 || !g.dev_lookup) {
                 continue;
@@ -3221,11 +3618,49 @@ struct llama_moe_cache::impl {
         GGML_ASSERT(ggml_is_contiguous(sel));
 
         ids.resize(ggml_nelements(sel));
+        const bool tiered = host_layer(il);
+
+        // reads ahead: issued while the device still computes the previous split, from the router input of the previous lookup of this graph
+        const bool ahead = tiered && ahead_on();
+        const ggml_tensor * xin = nullptr;
+        bool xin_async = false;
+        if (ahead) {
+            ahead_reap();
+            if (ahead_x_epoch == ahead_epoch && ahead_il >= 0 && il > ahead_il) {
+                ahead_issue(il);
+            }
+            ahead_il = -1;
+            xin = ahead_router_input(il, sel);
+            if (xin != nullptr && (xin->type != GGML_TYPE_F32 || !ggml_is_contiguous(xin) || xin->ne[0] != ahead_n_embd || xin->ne[1] > ahead_max_tokens ||
+                    ggml_nrows(xin) != xin->ne[1] || xin->buffer == nullptr || xin->data == nullptr)) {
+                xin = nullptr;
+            }
+            if (xin != nullptr) {
+                ahead_x.resize(ggml_nelements(xin));
+                if (ggml_backend_buffer_get_type(xin->buffer) == ggml_backend_get_default_buffer_type(backend)) {
+                    ggml_backend_tensor_get_async(backend, xin, ahead_x.data(), 0, ggml_nbytes(xin));
+                    xin_async = true;
+                }
+            }
+        }
+
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         ggml_backend_synchronize(backend);
 
+        if (ahead) {
+            ahead_wait_routed(il);
+            if (xin != nullptr && !xin_async) {
+                // computed by another backend in an earlier split (done before this split's inputs are copied)
+                ggml_backend_tensor_get(xin, ahead_x.data(), 0, ggml_nbytes(xin));
+            }
+            if (xin != nullptr) {
+                ahead_il    = il;
+                ahead_nt    = xin->ne[1];
+                ahead_x_epoch = ahead_epoch;
+            }
+        }
+
         // RAM tier: the experts routed by this call keep their RAM slots while it runs
-        const bool tiered = host_layer(il);
         if (tiered) {
             host->begin_call();
             for (int32_t e : ids) {
@@ -3845,7 +4280,15 @@ struct llama_moe_cache::impl {
                     "registered expert buffers = %.2f MiB, MemAvailable %.1f MiB at start, %.1f MiB now\n",
                     host->n_slots(), hs.peak_held, (unsigned long long) hs.evicted, (unsigned long long) hs.no_slot, (unsigned long long) hs.waits,
                     host->pinned_bytes()/1048576.0, host->budget_bytes()/1048576.0, hst.registered/1048576.0, hst.avail_init/1048576.0, meminfo_avail()/1048576.0);
-            LLAMA_LOG_INFO("llama_moe_cache: host tier: %.1f ms pinning slot memory, %llu allocation failures\n", hs.alloc_us/1000.0, (unsigned long long) hs.alloc_fail);
+            LLAMA_LOG_INFO("llama_moe_cache: host tier: %.1f ms pinning slot memory, %llu allocation failures, %.2f MiB pageable (%llu chunks past the pin cap or a failed pin)\n",
+                    hs.alloc_us/1000.0, (unsigned long long) hs.alloc_fail, host->pageable_bytes()/1048576.0, (unsigned long long) hs.pin_fallbacks);
+            if (ahead_depth > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache: host tier reads ahead (%d layers): %llu layer predictions, %llu experts predicted, %llu already held, %llu read ahead = %.2f MiB, "
+                        "%llu used, %llu waited for (%.1f ms), %llu without a slot, recall %.2f%% (%llu of %llu routed), predicting %.1f ms\n", ahead_depth,
+                        (unsigned long long) ast.layers, (unsigned long long) ast.predicted, (unsigned long long) ast.held, (unsigned long long) ast.issued,
+                        ast.bytes/1048576.0, (unsigned long long) ast.used, (unsigned long long) ast.late, ast.waited_us/1000.0, (unsigned long long) ast.no_slot,
+                        ast.routed ? 100.0*ast.recalled/ast.routed : 0.0, (unsigned long long) ast.recalled, (unsigned long long) ast.routed, ast.predict_us/1000.0);
+            }
             if (host_verify) {
                 LLAMA_LOG_INFO("llama_moe_cache: host tier VERIFY %llu regions, %.1f MiB, %llu mismatches\n", (unsigned long long) hst.verify_regions,
                         hst.verify_bytes/1048576.0, (unsigned long long) hst.verify_mismatch);
@@ -4024,8 +4467,10 @@ bool llama_moe_cache::is_slot_map(const ggml_tensor * t) const {
 }
 
 void llama_moe_cache::set_weight_store(llama_weight_store * ws) {
-    // the RAM tier reads through the store: it moves with it (and is dropped without one)
+    // the RAM tier reads through the store: it moves with it (and is dropped without one); its reads ahead complete first
     if (pimpl->host && pimpl->wstore != nullptr && pimpl->wstore != ws) {
+        pimpl->ahead_drain();
+        pimpl->ahead_il = -1;
         pimpl->wstore->set_tier(nullptr);
     }
     pimpl->wstore = ws;
