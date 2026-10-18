@@ -2528,6 +2528,15 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
     return spec->synth_probs;
 }
 
+// LLAMA_DRAFT_UBATCH_MAX: the largest ubatch of the context of a separate MTP drafter (default 512, 0 = the target's n_ubatch)
+uint32_t common_draft_ubatch_max() {
+    static const uint32_t v = [] {
+        const char * env = getenv("LLAMA_DRAFT_UBATCH_MAX");
+        return env != nullptr ? (uint32_t) std::max(0, atoi(env)) : 512u;
+    }();
+    return v;
+}
+
 common_params common_base_params_to_speculative(const common_params & params) {
     const bool has_draft = params.speculative.has_dft();
 
@@ -2571,6 +2580,17 @@ common_params common_base_params_to_speculative(const common_params & params) {
     const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     result.moe_cache_size = spec_mtp && !has_draft ? params.moe_cache_size : 0;
+
+    // a separate MTP drafter (-md) is one block: its context reads the prompt in ubatches of at most common_draft_ubatch_max()
+    // tokens (it splits the target's larger ubatches itself), so its compute buffer stays small and the MoE cache of the target
+    // keeps the difference (808 -> 225 MiB on Qwen3.8-Flash-Next at -ub 2048); n_batch is kept, so a target ubatch is one decode
+    if (spec_mtp && has_draft) {
+        const uint32_t cap = common_draft_ubatch_max();
+        if (cap > 0 && (uint32_t) result.n_ubatch > cap) {
+            result.n_ubatch = (int32_t) cap;
+            result.n_batch  = std::max(result.n_batch, params.n_ubatch);
+        }
+    }
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types

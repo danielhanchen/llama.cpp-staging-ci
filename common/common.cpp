@@ -1441,6 +1441,10 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         cp.n_ctx    = cparams.n_ctx;
         cp.n_ubatch = common_draft_n_ubatch(params, u);
         cp.n_batch  = std::max(cp.n_batch, u);
+        // a separate MTP drafter reads the prompt in ubatches of at most common_draft_ubatch_max() (see common_base_params_to_speculative)
+        if (has_draft && spec_mtp && common_draft_ubatch_max() > 0) {
+            cp.n_ubatch = std::min(u, common_draft_ubatch_max());
+        }
         std::vector<ggml_backend_dev_t> devs;
         uint32_t hp_ngl = 0, hp_nct = 0, hp_nex = 0;
         try {

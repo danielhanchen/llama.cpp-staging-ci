@@ -37,6 +37,9 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
 
 common_params common_base_params_to_speculative(const common_params & params);
 
+// the largest ubatch of the context of a separate MTP drafter (LLAMA_DRAFT_UBATCH_MAX, default 512, 0 = no cap)
+uint32_t common_draft_ubatch_max();
+
 struct common_speculative_output_limits {
     int32_t total;
     int32_t per_seq;
