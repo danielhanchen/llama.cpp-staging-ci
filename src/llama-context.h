@@ -323,7 +323,7 @@ private:
     bool sched_copy_all_experts(const ggml_tensor * src, const ggml_tensor * ids) const;
 
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
-    static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * graph, bool backend_ids_changed, bool graph_size_changed, void * user_data);
+    static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -449,6 +449,10 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+
+    // whether the reserve graph has a logits tensor, set in sched_reserve()
+    // true until then, because the first output_reserve() runs before any graph is reserved
+    bool graph_has_logits = true;
 
     // state of sched_copy_experts, reset before each graph compute
     struct copy_experts_info {

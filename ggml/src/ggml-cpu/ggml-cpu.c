@@ -2443,6 +2443,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_OUT_PROD:
+        case GGML_OP_SET_ROWS:
             {
                 n_tasks = n_threads;
             } break;
@@ -2453,10 +2454,6 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 // bound by its page faults and cache misses, which threads overlap
                 // every row is dequantized on its own, so splitting the rows does not change the result
                 n_tasks = ggml_nelements(node->src[1]) >= ggml_cpu_get_rows_mt_min() ? n_threads : 1;
-            } break;
-        case GGML_OP_SET_ROWS:
-            {
-                n_tasks = 1;
             } break;
         case GGML_OP_SCALE:
         case GGML_OP_SET:

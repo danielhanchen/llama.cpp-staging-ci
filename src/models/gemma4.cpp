@@ -440,8 +440,6 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
 }
 
 // the rows that llm_graph_input_gemma4_ple::set_input gathers: the token ids, or the padding row for an embd ubatch

@@ -95,11 +95,15 @@ static void test(void) {
         common_params base;
         base.n_parallel = 4;
         base.n_outputs_max_per_seq = 8;
+        base.n_ubatch = 512;
 
-        const auto draft = common_base_params_to_speculative(base);
-        assert(draft.n_outputs_max == 4);
-        assert(draft.n_outputs_max_per_seq == 1);
-        assert(draft.moe_cache_size == 0);
+        {
+            const auto draft = common_base_params_to_speculative(base);
+            assert(draft.n_outputs_max == 4);
+            assert(draft.n_outputs_max_per_seq == 1);
+            assert(draft.n_ubatch == 512); // inherits the target by default
+            assert(draft.moe_cache_size == 0);
+        }
 
         // an MTP context shares the MoE cache budget of the target (it caches the NextN layers), a separate draft model does not
         base.moe_cache_size = 1024*1024*1024;
@@ -107,6 +111,13 @@ static void test(void) {
         assert(common_base_params_to_speculative(base).moe_cache_size == base.moe_cache_size);
         base.speculative.types = { COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE };
         assert(common_base_params_to_speculative(base).moe_cache_size == 0);
+        base.moe_cache_size = 0;
+
+        base.speculative.draft.n_ubatch = 8;
+        {
+            const auto draft = common_base_params_to_speculative(base);
+            assert(draft.n_ubatch == 8);
+        }
     }
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");

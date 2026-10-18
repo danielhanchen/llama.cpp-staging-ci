@@ -1176,6 +1176,7 @@ static const std::map<common_decision_type, std::string> COMMON_DECISION_TYPE_NA
     { COMMON_DECISION_TYPE_VLLM_D3,        "vllm-d3"        },
     { COMMON_DECISION_TYPE_LFM2_D1,        "lfm2-d1"       },
     { COMMON_DECISION_TYPE_LFM2_D1_OMNI,   "lfm2-d1-omni"  },
+    { COMMON_DECISION_TYPE_GRANITE_SWITCH, "granite-switch"},
     // for future models, ALWAYS add org name prefix to avoid name collisions, e.g. "orgname-modelname"
 };
 
@@ -1443,7 +1444,11 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         cp.n_batch  = std::max(cp.n_batch, u);
         // a separate MTP drafter reads the prompt in ubatches of at most common_draft_ubatch_max() (see common_base_params_to_speculative)
         if (has_draft && spec_mtp && common_draft_ubatch_max() > 0) {
-            cp.n_ubatch = std::min(u, common_draft_ubatch_max());
+            cp.n_ubatch = std::min(cp.n_ubatch, common_draft_ubatch_max());
+        }
+        // an explicit draft ubatch wins, as in common_base_params_to_speculative
+        if (params.speculative.draft.n_ubatch > 0) {
+            cp.n_ubatch = (uint32_t) params.speculative.draft.n_ubatch;
         }
         std::vector<ggml_backend_dev_t> devs;
         uint32_t hp_ngl = 0, hp_nct = 0, hp_nex = 0;
