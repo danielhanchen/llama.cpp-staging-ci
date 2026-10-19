@@ -29,6 +29,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/resource.h>
@@ -401,6 +402,20 @@ llama_context::llama_context(
 
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
+        }
+    }
+
+    {
+        // layer-major prompts (opt-in prototype): see decode_layer_major
+        const char * env = getenv("LLAMA_MOE_LAYER_MAJOR");
+        lm_enabled = env != nullptr && atoi(env) != 0 && cparams.moe_cache_size > 0;
+        if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX")) {
+            lm_ub_max = std::max(1, atoi(e));
+        }
+        lm_verbose = getenv("LLAMA_MOE_LAYER_MAJOR_LOG") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_LOG")) != 0;
+        if (lm_enabled) {
+            LLAMA_LOG_INFO("%s: MoE cache: layer-major prompts, up to %d ubatches of %u tokens per graph (LLAMA_MOE_LAYER_MAJOR_UB_MAX)\n",
+                __func__, lm_ub_max, cparams.n_ubatch);
         }
     }
 
@@ -1064,7 +1079,8 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
-    sched_new(max_nodes, cparams.pipeline_parallel);
+    // a layer-major graph holds the graphs of up to lm_ub_max ubatches
+    sched_new(lm_enabled ? max_nodes*(size_t) (lm_ub_max + 1) : max_nodes, cparams.pipeline_parallel);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -2635,7 +2651,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
-    do {
+    for (bool more = true; more; ) {
+        // layer-major prompts: the next ubatches as one graph; afterwards `more` says whether mctx is at a ubatch not processed yet
+        if (lm_enabled) {
+            int lm_ret = 0;
+            const int n_lm = decode_layer_major(mctx.get(), n_outputs_all, n_tokens_all, n_outputs_prev, n_tokens_prev, more, lm_ret);
+            if (n_lm < 0) {
+                return lm_ret;
+            }
+            if (n_lm > 0) {
+                continue;
+            }
+        }
+        {
         const auto & ubatch = mctx->get_ubatch();
 
         // count the outputs in this ubatch
@@ -2853,7 +2881,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
-    } while (mctx->next());
+        }
+        more = mctx->next();
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2909,6 +2939,473 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     //synchronize();
 
     return 0;
+}
+
+//
+// layer-major prompts (LLAMA_MOE_LAYER_MAJOR=1)
+//
+// A prompt of K ubatches normally runs K graphs one after the other, and every graph copies every host expert it uses to the device: the
+// experts that the MoE cache does not hold cross PCIe K times per prompt. Here the graphs of up to lm_ub_max consecutive ubatches are built
+// as usual (each with its own inputs, KV view lengths and kernels) and merged into one graph, layer by layer: the nodes of each graph are cut
+// before every first use of a host weight, and the merged graph runs piece s of every ubatch before piece s+1 of any. A host weight is then
+// used only by the pieces that follow its cut, all in the split that copies it (ggml_backend_sched_set_reuse_weight_copies), so it is copied
+// once for the group. Within a piece the ubatches run in order, so the KV rows and recurrent states one ubatch writes in a layer are there
+// when the next ubatch of the group reads them in that layer, exactly as in the ubatch-by-ubatch order. Nothing of the math changes: the same
+// ops on the same shapes in the same order per ubatch (only interleaved with the other ubatches), so the outputs are bit-identical.
+// The prompt does not change the MoE cache (no seed, no lent slots): the decode after it finds the cache as it was.
+int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_outputs_all, int64_t n_tokens_all, int64_t & n_outputs_prev,
+        int64_t & n_tokens_prev, bool & more, int & ret) {
+    const auto & hparams = model.hparams;
+    const int64_t n_vocab = model.vocab.n_tokens();
+
+    // ubatches that can run layer-major: prompt ubatches whose host experts are prefetched whole (the copy is the same for every ubatch)
+    auto eligible = [&](const llama_ubatch & ub) {
+        return ub.n_tokens > llama_moe_cache::n_small_max && (int64_t) ub.n_tokens >= prefetch_min_batch && ub.n_seqs_unq == 1;
+    };
+    if (!moe_cache || !sampling.samplers.empty() || cparams.embeddings || !cparams.causal_attn || cparams.verify || ple.enabled ||
+            std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool b) { return b; }) ||
+            n_tokens_all - n_tokens_prev <= (int64_t) cparams.n_ubatch || !eligible(mctx->get_ubatch()) ||
+            moe_cache->lends_graph_to(mctx->get_ubatch().n_tokens) || moe_cache->hybrid_fixed()) {
+        return 0;
+    }
+
+    const int64_t t0_us = ggml_time_us();
+    const auto gtype = ctx_type_to_graph_type(cparams.ctx_type);
+
+    // the ubatches of the group: graphs built, inputs set in host memory of their own
+    struct lm_ub {
+        const llama_ubatch * ub;
+        llm_graph_result   * res;
+        ggml_cgraph        * gf;
+        int32_t              n_outputs;
+        size_t               n_leafs;
+    };
+    std::vector<lm_ub> group;
+
+    gf_res_prev_active = nullptr;
+    moe_cache_ids.clear();
+    ggml_backend_sched_reset(sched.get());
+    ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+    // the prompt does not seed the cache and records no routing
+    moe_cache_seed      = false;
+    moe_cache_seed_prev = false;
+    moe_cache_record    = false;
+    moe_cache_devseed   = false;
+
+    ggml_backend_buffer_type_t inp_buft = ggml_backend_cpu_buffer_type();
+    if (auto * dev = model.dev_output()) {
+        if (auto * hb = ggml_backend_dev_host_buffer_type(dev)) {
+            inp_buft = hb;
+        }
+    }
+
+    int64_t n_outputs_group = 0;
+    more = true;
+    while ((int) group.size() < lm_ub_max) {
+        const auto & ub = mctx->get_ubatch();
+        if (!group.empty() && !eligible(ub)) {
+            break;
+        }
+        int32_t n_out = 0;
+        if (n_outputs_all == n_tokens_all) {
+            n_out = ub.n_tokens;
+        } else {
+            for (uint32_t i = 0; i < ub.n_tokens; i++) {
+                n_out += (int32_t) (ub.output[i] != 0);
+            }
+        }
+        // the outputs stay allocated until the merged graph ends: at most a quarter of a ubatch worth of logits per group
+        if (!group.empty() && n_outputs_group + n_out > std::max<int64_t>(1, cparams.n_ubatch/4)) {
+            break;
+        }
+        n_outputs = n_out;
+
+        if (!mctx->apply()) {
+            LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+            ret = -3;
+            return -1;
+        }
+
+        const size_t k = group.size();
+        if (lm_res.size() <= k) {
+            lm_res.resize(k + 1);
+            lm_inp_buf.resize(k + 1);
+        }
+        if (!lm_res[k]) {
+            lm_res[k].reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+        }
+        auto * res = lm_res[k].get();
+        res->reset();
+        ggml_cgraph * gf = model.build_graph(graph_params(res, ub, mctx, gtype));
+        if (!gf) {
+            LLAMA_LOG_ERROR("%s: failed to build the graph of ubatch %zu\n", __func__, k);
+            ret = -3;
+            return -1;
+        }
+
+        // the inputs: allocated here, in host memory, and set now (later ubatches of the group change the memory state they read)
+        std::vector<ggml_tensor *> inps;
+        size_t inp_size = 0;
+        const size_t align = ggml_backend_buft_get_alignment(inp_buft);
+        auto add_inp = [&](ggml_tensor * t) {
+            if ((t->flags & GGML_TENSOR_FLAG_INPUT) && t->data == nullptr && t->view_src == nullptr && t->buffer == nullptr &&
+                    std::find(inps.begin(), inps.end(), t) == inps.end()) {
+                inps.push_back(t);
+                inp_size += GGML_PAD(ggml_backend_buft_get_alloc_size(inp_buft, t), align);
+            }
+        };
+        // the graph's leaves are the sources of its nodes that are not nodes themselves (no public accessor for the leaf list)
+        size_t n_leafs = 0;
+        {
+            std::unordered_set<const ggml_tensor *> srcs;
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                add_inp(node);
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    ggml_tensor * src = node->src[j];
+                    if (src != nullptr && src->op == GGML_OP_NONE && srcs.insert(src).second) {
+                        add_inp(src);
+                        n_leafs++;
+                    }
+                }
+            }
+        }
+        inp_size += align;
+        auto & ib = lm_inp_buf[k];
+        if (!ib || ggml_backend_buffer_get_size(ib.get()) < inp_size) {
+            ib.reset();
+            ib.reset(ggml_backend_buft_alloc_buffer(inp_buft, inp_size + inp_size/4));
+            if (!ib) {
+                LLAMA_LOG_ERROR("%s: failed to allocate %.2f MiB of inputs\n", __func__, inp_size/1048576.0);
+                ret = -2;
+                return -1;
+            }
+        }
+        {
+            ggml_tallocr ta = ggml_tallocr_new(ib.get());
+            for (ggml_tensor * t : inps) {
+                if (ggml_tallocr_alloc(&ta, t) != GGML_STATUS_SUCCESS) {
+                    LLAMA_LOG_ERROR("%s: failed to place an input\n", __func__);
+                    ret = -2;
+                    return -1;
+                }
+            }
+        }
+        res->set_inputs(&ub);
+
+        group.push_back({ &ub, res, gf, n_out, n_leafs });
+        n_outputs_group += n_out;
+        moe_cache->count_large_ubatch();
+
+        if (!mctx->next()) {
+            more = false;
+            break;
+        }
+        // a ubatch with outputs narrows its last layer to them, and so few rows take the MoE cache lookup: its slot maps are host tensors
+        // shared by every graph and filled for the ids of one, so such a ubatch ends the group
+        if (n_out > 0) {
+            break;
+        }
+    }
+
+    // the pieces of each graph: cut before the first use of every host weight
+    auto host_weight = [](const ggml_tensor * t) -> const ggml_tensor * {
+        while (t->view_src != nullptr) {
+            t = t->view_src;
+        }
+        return t->buffer != nullptr && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+            ggml_backend_buffer_is_host(t->buffer) ? t : nullptr;
+    };
+    std::vector<std::vector<int>>               cuts(group.size()); // first node of each piece
+    std::vector<std::vector<const ggml_tensor *>> cw(group.size());   // the weight that starts each piece (nullptr: the first piece)
+    bool aligned = true;
+    size_t n_total = 0;
+    for (size_t k = 0; k < group.size(); ++k) {
+        ggml_cgraph * gf = group[k].gf;
+        std::unordered_set<const ggml_tensor *> seen;
+        cuts[k].push_back(0);
+        cw[k].push_back(nullptr);
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            const ggml_tensor * node = ggml_graph_node(gf, i);
+            const ggml_tensor * w = nullptr;
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                if (node->src[j] != nullptr) {
+                    const ggml_tensor * hw = host_weight(node->src[j]);
+                    if (hw != nullptr && seen.insert(hw).second && w == nullptr) {
+                        w = hw;
+                    }
+                }
+            }
+            if (w != nullptr) {
+                if (i > 0) {
+                    cuts[k].push_back(i);
+                    cw[k].push_back(w);
+                } else {
+                    cw[k][0] = w;
+                }
+            }
+        }
+        n_total += (size_t) ggml_graph_n_nodes(gf) + group[k].n_leafs;
+    }
+    // the pieces of all graphs in one order: the cuts of the first graph, a cut of a later graph at the same weight runs with it, a cut
+    // the first graph does not have (e.g. the MoE cache lookup of a last layer narrowed to the outputs) right after the graph's previous one
+    std::vector<const ggml_tensor *> order = cw[0];
+    std::vector<std::vector<size_t>> slot(group.size());   // index of each piece in `order` (after all insertions)
+    {
+        std::vector<std::vector<int64_t>> ids(group.size());   // stable ids of the entries of order
+        std::vector<int64_t> oid(order.size());
+        for (size_t i = 0; i < order.size(); ++i) {
+            oid[i] = (int64_t) i;
+        }
+        int64_t next_id = (int64_t) order.size();
+        ids[0] = oid;
+        for (size_t k = 1; k < group.size() && aligned; ++k) {
+            size_t p = 0;
+            for (size_t j = 0; j < cw[k].size(); ++j) {
+                const ggml_tensor * w = cw[k][j];
+                size_t q = p;
+                while (q < order.size() && order[q] != w) {
+                    q++;
+                }
+                if (j == 0 && q != 0) {
+                    aligned = false; // the first pieces do not start alike
+                    break;
+                }
+                if (q == order.size()) {
+                    order.insert(order.begin() + (std::ptrdiff_t) p, w);
+                    oid.insert(oid.begin() + (std::ptrdiff_t) p, next_id++);
+                    q = p;
+                }
+                ids[k].push_back(oid[q]);
+                p = q + 1;
+            }
+        }
+        std::unordered_map<int64_t, size_t> pos;
+        for (size_t i = 0; i < oid.size(); ++i) {
+            pos[oid[i]] = i;
+        }
+        for (size_t k = 0; k < group.size() && aligned; ++k) {
+            for (int64_t id : ids[k]) {
+                slot[k].push_back(pos[id]);
+            }
+        }
+    }
+    std::vector<const ggml_tensor *> & cut_w = order;
+
+    // host memory other than weights and the inputs set above (e.g. MoE cache slot maps, a host KV cache) read by more than one graph
+    // would be copied once for all of them: such a group runs one graph after the other
+    if (aligned && group.size() > 1) {
+        std::unordered_map<const ggml_tensor *, size_t> owner;
+        for (size_t k = 0; k < group.size() && aligned; ++k) {
+            ggml_cgraph * gf = group[k].gf;
+            for (int i = 0; i < ggml_graph_n_nodes(gf) && aligned; ++i) {
+                const ggml_tensor * node = ggml_graph_node(gf, i);
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    const ggml_tensor * t = node->src[j];
+                    while (t != nullptr && t->view_src != nullptr) {
+                        t = t->view_src;
+                    }
+                    if (t == nullptr || t->op != GGML_OP_NONE || t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer) ||
+                            ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                            t->buffer == lm_inp_buf[k].get()) {
+                        continue;
+                    }
+                    auto it = owner.emplace(t, k).first;
+                    if (it->second != k) {
+                        LLAMA_LOG_WARN("%s: host tensor %s is read by ubatches %zu and %zu of the group\n", __func__, t->name, it->second, k);
+                        aligned = false;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // the merged graph
+    ggml_cgraph * gm = nullptr;
+    ggml_context_ptr ctx_m;
+    if (aligned && group.size() > 1) {
+        const size_t size = n_total + 64;
+        const size_t meta = ggml_graph_overhead_custom(size, false) + ggml_tensor_overhead();
+        if (lm_meta.size() < meta) {
+            lm_meta.resize(meta);
+        }
+        ggml_init_params ip = { lm_meta.size(), lm_meta.data(), true };
+        ctx_m.reset(ggml_init(ip));
+        gm = ggml_new_graph_custom(ctx_m.get(), size, false);
+        const size_t n_pieces = order.size();
+        std::vector<size_t> next(group.size(), 0); // the next piece of each graph
+        for (size_t s = 0; s < n_pieces; ++s) {
+            for (size_t k = 0; k < group.size(); ++k) {
+                const size_t j = next[k];
+                if (j >= slot[k].size() || slot[k][j] != s) {
+                    continue;
+                }
+                ggml_cgraph * gf = group[k].gf;
+                const int i0 = cuts[k][j];
+                const int i1 = j + 1 < cuts[k].size() ? cuts[k][j + 1] : ggml_graph_n_nodes(gf);
+                for (int i = i0; i < i1; ++i) {
+                    ggml_build_forward_expand(gm, ggml_graph_node(gf, i));
+                }
+                next[k]++;
+            }
+        }
+        for (size_t k = 0; k < group.size(); ++k) {
+            GGML_ASSERT(next[k] == slot[k].size());
+        }
+        // every node of every graph is in the merged graph once: a node that two graphs share (none expected) would run only in the first
+        {
+            size_t n_nodes_sum = 0;
+            for (const auto & g : group) {
+                n_nodes_sum += (size_t) ggml_graph_n_nodes(g.gf);
+            }
+            if ((size_t) ggml_graph_n_nodes(gm) != n_nodes_sum) {
+                std::unordered_set<const ggml_tensor *> first;
+                for (int i = 0; i < ggml_graph_n_nodes(group[0].gf); ++i) {
+                    first.insert(ggml_graph_node(group[0].gf, i));
+                }
+                int n_shared = 0;
+                for (int i = 0; i < ggml_graph_n_nodes(group[1].gf) && n_shared < 8; ++i) {
+                    const ggml_tensor * t = ggml_graph_node(group[1].gf, i);
+                    if (first.count(t)) {
+                        LLAMA_LOG_WARN("%s: node shared by the graphs: %s (%s)\n", __func__, t->name, ggml_op_name(t->op));
+                        n_shared++;
+                    }
+                }
+                LLAMA_LOG_WARN("%s: merged graph has %d nodes, the graphs %zu\n", __func__, ggml_graph_n_nodes(gm), n_nodes_sum);
+            }
+        }
+    }
+
+    ggml_status status = GGML_STATUS_SUCCESS;
+    const int64_t t1_us = ggml_time_us();
+    int64_t n_tokens_max = 0;
+    for (const auto & g : group) {
+        n_tokens_max = std::max<int64_t>(n_tokens_max, g.ub->n_tokens);
+    }
+    if (wstore) {
+        const auto & last = group.back();
+        wstore->set_wrap(!(last.n_outputs > 0 && (uint32_t) last.n_outputs < last.ub->n_tokens));
+    }
+
+    auto run = [&](ggml_cgraph * g) {
+        prefetch_n_tokens = n_tokens_max;
+        moe_cache->set_graph(g);
+        ggml_backend_sched_set_reuse_weight_copies(sched.get(), true);
+        const bool ok = ggml_backend_sched_alloc_graph(sched.get(), g);
+        ggml_backend_sched_set_reuse_weight_copies(sched.get(), false);
+        if (!ok) {
+            LLAMA_LOG_ERROR("%s: failed to allocate the graph of %zu ubatches\n", __func__, group.size());
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+        moe_cache->prepare(n_tokens_max);
+        return graph_compute(g, true);
+    };
+
+    if (gm != nullptr) {
+        status = run(gm);
+        lm_n_graphs++;
+        lm_n_ubatches += (int64_t) group.size();
+    } else {
+        // one ubatch, or graphs that do not cut alike: one after the other, as usual
+        if (group.size() > 1) {
+            lm_n_fallback++;
+            LLAMA_LOG_WARN("%s: the graphs of %zu ubatches do not cut alike, computed one after the other\n", __func__, group.size());
+        }
+        for (size_t k = 0; k < group.size(); ++k) {
+            if (k > 0) {
+                ggml_backend_sched_reset(sched.get());
+            }
+            status = run(group[k].gf);
+            if (status != GGML_STATUS_SUCCESS) {
+                break;
+            }
+        }
+    }
+    if (lm_verbose) {
+        LLAMA_LOG_INFO("%s: %zu ubatches (%" PRId64 " tokens each at most), %zu pieces, %d nodes, %d splits: build %.2f ms, compute (queued) %.2f ms%s\n",
+            __func__, group.size(), n_tokens_max, cut_w.size(), gm ? ggml_graph_n_nodes(gm) : -1, ggml_backend_sched_get_n_splits(sched.get()),
+            (t1_us - t0_us)/1000.0, (ggml_time_us() - t1_us)/1000.0, gm ? "" : " (one by one)");
+    }
+
+    moe_cache_seq      = -1;
+    moe_cache_pos_next = -1;
+    moe_cache_ids.clear();
+    moe_cache->clear_seed_counts();
+
+    if (status != GGML_STATUS_SUCCESS) {
+        llama_pos pos_min[LLAMA_MAX_SEQ];
+        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            pos_min[s] = std::numeric_limits<llama_pos>::max();
+        }
+        for (const auto & g : group) {
+            for (uint32_t i = 0; i < g.ub->n_tokens; ++i) {
+                const auto & seq_id = g.ub->seq_id[i][0];
+                pos_min[seq_id] = std::min(pos_min[seq_id], g.ub->pos[i]);
+            }
+        }
+        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            if (pos_min[s] != std::numeric_limits<llama_pos>::max()) {
+                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
+                memory->seq_rm(s, pos_min[s], -1);
+            }
+        }
+        switch (status) {
+            case GGML_STATUS_ABORTED:      ret =  2; break;
+            case GGML_STATUS_ALLOC_FAILED: ret = -2; break;
+            default:                       ret = -3; break;
+        }
+        return -1;
+    }
+
+    // the outputs of each ubatch, as decode() extracts them
+    for (const auto & g : group) {
+        const llama_ubatch & ubatch = *g.ub;
+        auto * res = g.res;
+        n_outputs = g.n_outputs;
+
+        auto * t_logits  = res->get_logits();
+        auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn() : nullptr;
+
+        if (logits.data && t_logits && n_outputs > 0) {
+            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+            GGML_ASSERT(backend_res != nullptr);
+            GGML_ASSERT(n_outputs_prev + n_outputs <= n_outputs_all);
+            GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
+            ggml_backend_tensor_get_async(backend_res, t_logits, logits.data + n_outputs_prev*n_vocab, 0, n_outputs*n_vocab*sizeof(float));
+        }
+
+        bool extract_all_idxs = false;
+        {
+            const bool masked    = cparams.embeddings_nextn_masked;
+            const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
+            const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
+
+            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+                GGML_ASSERT(backend_h != nullptr);
+                const uint32_t n_embd  = hparams.n_embd_out();
+                GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
+                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data + offset*n_embd, 0, n_rows*n_embd*sizeof(float));
+                extract_all_idxs = !masked;
+            }
+        }
+        if (extract_all_idxs) {
+            GGML_ASSERT(ubatch.data && ubatch.data->batch_idxs.size() == ubatch.n_tokens);
+            GGML_ASSERT(embd_batch_idxs.size() == (size_t) n_tokens_prev);
+            const auto & batch_idxs = ubatch.data->batch_idxs;
+            embd_batch_idxs.insert(embd_batch_idxs.end(), batch_idxs.begin(), batch_idxs.end());
+        }
+
+        n_outputs_prev += n_outputs;
+        n_tokens_prev  += ubatch.n_tokens;
+    }
+
+    // the next graph is built anew
+    gf_res_prev_active = nullptr;
+
+    return (int) group.size();
 }
 
 //

@@ -1112,6 +1112,8 @@ struct ggml_backend_sched {
 
     // overlap of a CPU split with the next split [ggml_backend_sched_set_overlap]
     bool overlap;
+    // a host weight whose copy exists on the node's backend does not start a new split (ggml_backend_sched_set_reuse_weight_copies)
+    bool reuse_weight_copies;
     int  pre_split; // split whose first pre_nodes nodes were launched before the CPU split preceding it, -1 if none
     int  pre_nodes;
 
@@ -2306,7 +2308,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     // by starting a new split, the memory of the previously offloaded weights can be reused
                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                         int src_backend_id = tensor_backend_id(src);
-                        if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                        if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id) &&
+                                !(sched->reuse_weight_copies && tensor_id_copy(hash_id(src), cur_backend_id, 0) != NULL)) {
                             need_new_split = true;
                             break;
                         }
@@ -4431,6 +4434,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->hash_set    = ggml_hash_set_new(graph_size);
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+    // the sparse reset of a large table keeps the entries that are not in use at -1 / NULL (see ggml_backend_sched_reset)
+    memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+    memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
     const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
@@ -4556,9 +4562,26 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     // reset state for the next run
     if (!sched->is_reset) {
-        ggml_hash_set_reset(&sched->hash_set);
-        memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
-        memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+        if (sched->hash_set.size > (1u << 18)) {
+            // a large table (sized for graphs of several ubatches, see ggml_backend_sched_set_reuse_weight_copies) clears only the entries
+            // in use: every entry of the per-tensor arrays is written through hash_id, which marks it used
+            const size_t n_words = ggml_bitset_size(sched->hash_set.size);
+            const size_t per     = (size_t) sched->n_backends * sched->n_copies;
+            for (size_t w = 0; w < n_words; ++w) {
+                ggml_bitset_t bits = sched->hash_set.used[w];
+                while (bits) {
+                    const size_t i = (w << BITSET_SHR) + (size_t) __builtin_ctz(bits);
+                    bits &= bits - 1;
+                    sched->hv_tensor_backend_ids[i] = -1;
+                    memset(sched->hv_tensor_copies + i*per, 0, per * sizeof(struct ggml_tensor *));
+                }
+            }
+            ggml_hash_set_reset(&sched->hash_set);
+        } else {
+            ggml_hash_set_reset(&sched->hash_set);
+            memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+            memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+        }
         sched->is_reset = true;
     }
     sched->is_alloc = false;
@@ -4736,6 +4759,11 @@ void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_ba
 void ggml_backend_sched_set_overlap(ggml_backend_sched_t sched, bool enable) {
     GGML_ASSERT(sched);
     sched->overlap = enable;
+}
+
+void ggml_backend_sched_set_reuse_weight_copies(ggml_backend_sched_t sched, bool enable) {
+    GGML_ASSERT(sched);
+    sched->reuse_weight_copies = enable;
 }
 
 void ggml_backend_sched_set_lend_callback(ggml_backend_sched_t sched, ggml_backend_sched_lend_callback callback, void * user_data) {

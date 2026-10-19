@@ -442,6 +442,10 @@ extern "C" {
     // none of its input copies are launched before the CPU split is computed (single copy, no eval callback, no prefetched splits)
     GGML_API void                 ggml_backend_sched_set_overlap(ggml_backend_sched_t sched, bool enable);
 
+    // A host weight whose copy already exists on the node's backend does not start a new split (default false): a graph that runs
+    // several ubatches layer by layer (llama LLAMA_MOE_LAYER_MAJOR) keeps every use of a weight copy in the split that copies it
+    GGML_API void                 ggml_backend_sched_set_reuse_weight_copies(ggml_backend_sched_t sched, bool enable);
+
     // Set a callback that places prefetched copies in memory lent by the user instead of the staging arena
     GGML_API void                 ggml_backend_sched_set_lend_callback(ggml_backend_sched_t sched, ggml_backend_sched_lend_callback callback, void * user_data);
 

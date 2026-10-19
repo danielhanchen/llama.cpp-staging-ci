@@ -523,6 +523,20 @@ private:
     llama_seq_id moe_cache_seq     = -1;
     llama_pos    moe_cache_pos_next = -1;
 
+    // layer-major prompts (LLAMA_MOE_LAYER_MAJOR=1): consecutive prompt ubatches of one decode() call run as one graph, layer by layer
+    // (every ubatch through a layer before any goes on to the next), so each host expert is copied to the device once for all of them
+    // while every ubatch keeps its own graph, kernels and order of operations (bit-identical to the ubatches run one after the other)
+    bool lm_enabled = false;
+    int  lm_ub_max  = 16;     // ubatches per layer-major graph [LLAMA_MOE_LAYER_MAJOR_UB_MAX]
+    bool lm_verbose = false;  // [LLAMA_MOE_LAYER_MAJOR_LOG]
+    std::vector<llm_graph_result_ptr>    lm_res;      // the graph of each ubatch of the group
+    std::vector<ggml_backend_buffer_ptr> lm_inp_buf;  // the inputs of each ubatch (host memory, set before the group is computed)
+    std::vector<uint8_t>                 lm_meta;     // the merged graph
+    int64_t lm_n_graphs = 0, lm_n_ubatches = 0, lm_n_fallback = 0;
+    // returns the number of ubatches it processed (0: none, the caller processes the current ubatch), < 0 on error (ret = decode() return)
+    int decode_layer_major(llama_memory_context_i * mctx, int64_t n_outputs_all, int64_t n_tokens_all, int64_t & n_outputs_prev,
+            int64_t & n_tokens_prev, bool & more, int & ret);
+
     void moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_large, int64_t n_outputs_ub);
     void moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_outputs_ub);
     // the end of a prompt that did not seed: the lent slots that come back get the experts its last large ubatch used most
