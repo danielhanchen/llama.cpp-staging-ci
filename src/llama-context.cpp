@@ -3344,8 +3344,10 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 ggml_cgraph * gf = group[k].gf;
                 const int i0 = cuts[k][j];
                 const int i1 = j + 1 < cuts[k].size() ? cuts[k][j + 1] : ggml_graph_n_nodes(gf);
+                // order only: the compute flags stay as each graph set them (an input path that ggml_build_forward_select did not pick
+                // is in the graph but not computed; expand would mark it computed, running e.g. the mixed-batch set_rows on unset indices)
                 for (int i = i0; i < i1; ++i) {
-                    ggml_build_forward_expand(gm, ggml_graph_node(gf, i));
+                    ggml_build_forward_order(gm, ggml_graph_node(gf, i));
                 }
                 next[k]++;
             }
@@ -3463,6 +3465,40 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         wstore->set_wrap(!(last.n_outputs > 0 && (uint32_t) last.n_outputs < last.ub->n_tokens));
     }
 
+    // LLAMA_MOE_LAYER_MAJOR_CHECK=1 (debug): the KV row indices of every set_rows are inside the cache, checked on the host inputs
+    static const bool lm_check = getenv("LLAMA_MOE_LAYER_MAJOR_CHECK") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_CHECK")) != 0;
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> lm_sr; // (set_rows node, its index tensor before the scheduler replaces it)
+    if (lm_check && gm != nullptr) {
+        int n_bad = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(gm); ++i) {
+            ggml_tensor * node = ggml_graph_node(gm, i);
+            if (node->op != GGML_OP_SET_ROWS || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                continue;
+            }
+            ggml_tensor * c = node->src[1];
+            ggml_tensor * a = node->src[2];
+            lm_sr.emplace_back(node, c);
+            const ggml_tensor * root = c;
+            while (root->view_src) root = root->view_src;
+            if (c->type != GGML_TYPE_I64 || root->data == nullptr || !ggml_backend_buffer_is_host(root->buffer) || !ggml_is_contiguous(c)) {
+                if (n_bad++ < 4) {
+                    LLAMA_LOG_WARN("%s: check: set_rows %s indices %s not a host I64 input (data %p)\n", __func__, node->name, c->name, root->data);
+                }
+                continue;
+            }
+            const int64_t * d = (const int64_t *) c->data;
+            for (int64_t j = 0; j < ggml_nelements(c); ++j) {
+                if (d[j] < 0 || d[j] >= a->ne[1]) {
+                    if (n_bad++ < 4) {
+                        LLAMA_LOG_WARN("%s: check: set_rows %s index %" PRId64 " = %" PRId64 " outside [0, %" PRId64 ")\n", __func__, node->name, j, d[j], a->ne[1]);
+                    }
+                    break;
+                }
+            }
+        }
+        LLAMA_LOG_INFO("%s: check: %zu set_rows, %d bad\n", __func__, lm_sr.size(), n_bad);
+    }
+
     auto run = [&](ggml_cgraph * g) {
         prefetch_n_tokens = n_tokens_max;
         moe_cache->set_graph(g);
@@ -3474,6 +3510,20 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             return GGML_STATUS_ALLOC_FAILED;
         }
         moe_cache->prepare(n_tokens_max);
+        if (lm_check) {
+            // the device copies of the indices: where they are, and whether two set_rows of different ubatches share one
+            std::unordered_map<const void *, const ggml_tensor *> at;
+            int n_same = 0;
+            for (auto & [node, c] : lm_sr) {
+                ggml_tensor * cc = node->src[1];
+                auto it = at.emplace(cc->data, c);
+                if (!it.second && it.first->second != c && n_same++ < 4) {
+                    LLAMA_LOG_WARN("%s: check: indices %s and %s share device address %p (copy %s, buffer %s)\n", __func__,
+                        it.first->second->name, c->name, cc->data, cc->name, cc->buffer ? ggml_backend_buffer_name(cc->buffer) : "-");
+                }
+            }
+            LLAMA_LOG_INFO("%s: check: %zu index copies at %zu addresses, %d shared by different inputs\n", __func__, lm_sr.size(), at.size(), n_same);
+        }
         return graph_compute(g, true);
     };
 

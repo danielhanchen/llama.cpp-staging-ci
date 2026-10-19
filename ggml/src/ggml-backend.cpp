@@ -4565,7 +4565,8 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     // reset state for the next run
     if (!sched->is_reset) {
-        if (sched->hash_set.size > (1u << 18)) {
+        static const bool sparse_env = getenv("GGML_SCHED_SPARSE_RESET") == nullptr || atoi(getenv("GGML_SCHED_SPARSE_RESET")) != 0;
+        if (sparse_env && sched->hash_set.size > (1u << 18)) {
             // a large table (sized for graphs of several ubatches, see ggml_backend_sched_set_reuse_weight_copies) clears only the entries
             // in use: every entry of the per-tensor arrays is written through hash_id, which marks it used
             const size_t n_words = ggml_bitset_size(sched->hash_set.size);
