@@ -1721,7 +1721,9 @@ struct llama_moe_cache::impl {
                     }
                     const int32_t s = host->reserve(il, e, false);
                     if (s < 0) {
-                        full = true;
+                        // the slots of this layer's expert layout are used up; the file fill goes on with the layers of the other
+                        // layouts (Flash-Next IQ2_XS has three: stopping at the first full one left 3137 RAM slots empty)
+                        full = !from_file;
                         break;
                     }
                     for (size_t ip = 0; ip < l.experts.size(); ++ip) {
