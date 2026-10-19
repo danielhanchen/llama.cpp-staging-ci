@@ -1615,19 +1615,28 @@ struct llama_moe_cache::impl {
             const char * e_res = getenv("LLAMA_MOE_RESIDENT");
             const char * e_dp  = getenv("LLAMA_MOE_CACHE_PREFILL");
             const int    m_res = e_res != nullptr ? atoi(e_res) : -1;
-            resident_mode = m_res != 0 && getenv("LLAMA_MOE_HOST_CACHE_PREFILL") == nullptr && n_streamed > 0 && (m_res >= 1 || n_hold >= n_streamed);
+            // "every expert" up to the slot rounding: the budget is split among the expert layouts in whole slots of 4 KiB-aligned areas,
+            // which loses ~1% of the slots a byte count gives (low-RAM G4: 18.7 GB of device slots + 15.1 GB of RAM budget for 33.8 GB of
+            // experts = 99.2% of the experts in slots; the few left are read on demand, 1.5 MiB in a whole run), so at least
+            // LLAMA_MOE_RESIDENT_MIN_FRAC (0.98) of them
+            double min_frac = 0.98;
+            if (const char * e = getenv("LLAMA_MOE_RESIDENT_MIN_FRAC")) {
+                min_frac = std::max(0.0, atof(e));
+            }
+            resident_mode = m_res != 0 && getenv("LLAMA_MOE_HOST_CACHE_PREFILL") == nullptr && n_streamed > 0 &&
+                (m_res >= 1 || (double) n_hold >= min_frac*(double) n_streamed);
             if (resident_mode) {
                 if (!prefilled_dev && (e_dp == nullptr || atoi(e_dp) != 0)) {
                     prefill();
                 }
                 prefill_deferred = false;
-                LLAMA_LOG_INFO("%s: MoE cache resident mode: %zu RAM slots + %zu device slots hold the %zu streamed experts: device slots %s, "
+                LLAMA_LOG_INFO("%s: MoE cache resident mode: %zu RAM slots + %zu device slots for the %zu streamed experts: device slots %s, "
                         "the RAM tier is filled from the model files at load (LLAMA_MOE_RESIDENT=0 off)\n", __func__,
                         (size_t) host->n_slots(), n_dev, n_streamed, prefilled_dev ? "prefilled" : "not prefilled (LLAMA_MOE_CACHE_PREFILL=0)");
             } else if (m_res != 0 && getenv("LLAMA_MOE_HOST_CACHE_PREFILL") == nullptr) {
-                LLAMA_LOG_INFO("%s: MoE cache resident mode off: %zu RAM slots + %zu device slots hold %.1f%% of the %zu streamed experts "
-                        "(LLAMA_MOE_RESIDENT=1 forces it)\n", __func__, (size_t) host->n_slots(), n_dev,
-                        100.0*n_hold/n_streamed, n_streamed);
+                LLAMA_LOG_INFO("%s: MoE cache resident mode off: %zu RAM slots + %zu device slots hold %.1f%% of the %zu streamed experts, "
+                        "below %.0f%% (LLAMA_MOE_RESIDENT=1 forces it)\n", __func__, (size_t) host->n_slots(), n_dev,
+                        100.0*n_hold/n_streamed, n_streamed, 100.0*min_frac);
             }
         }
         prefill_resident();
