@@ -21,6 +21,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
@@ -3550,10 +3551,45 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         return graph_compute(g, true);
     };
 
+    size_t buf_before = 0, buf_after = 0;
+    for (auto & b : backend_ptrs) {
+        buf_before += ggml_backend_sched_get_buffer_size(sched.get(), b);
+    }
     if (gm != nullptr) {
+        // the scheduler replaces node sources with its copies while it splits a graph: kept to undo them if the merged graph does not
+        // allocate and the member graphs are split again one by one
+        std::vector<std::pair<ggml_tensor *, std::array<ggml_tensor *, GGML_MAX_SRC>>> srcs;
+        srcs.reserve(ggml_graph_n_nodes(gm));
+        for (int i = 0; i < ggml_graph_n_nodes(gm); ++i) {
+            ggml_tensor * node = ggml_graph_node(gm, i);
+            std::array<ggml_tensor *, GGML_MAX_SRC> a;
+            std::copy(node->src, node->src + GGML_MAX_SRC, a.begin());
+            srcs.emplace_back(node, a);
+        }
         status = run(gm);
+        if (status == GGML_STATUS_ALLOC_FAILED) {
+            for (auto & [node, a] : srcs) {
+                std::copy(a.begin(), a.end(), node->src);
+            }
+        }
         lm_n_graphs++;
         lm_n_ubatches += (int64_t) group.size();
+        if (status == GGML_STATUS_ALLOC_FAILED) {
+            // the merged graph needs more compute memory than the device has: the graphs one after the other, as usual
+            LLAMA_LOG_WARN("%s: the graph of %zu ubatches did not allocate, computed one after the other\n", __func__, group.size());
+            lm_n_fallback++;
+            lm_seed_active = false;
+            moe_cache_seed_prev = false;
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+            gm = nullptr;
+            for (size_t k = 0; k < group.size(); ++k) {
+                ggml_backend_sched_reset(sched.get());
+                status = run(group[k].gf);
+                if (status != GGML_STATUS_SUCCESS) {
+                    break;
+                }
+            }
+        }
     } else {
         // one ubatch, or graphs that do not cut alike: one after the other, as usual
         if (group.size() > 1) {
@@ -3570,7 +3606,11 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             }
         }
     }
+    for (auto & b : backend_ptrs) {
+        buf_after += ggml_backend_sched_get_buffer_size(sched.get(), b);
+    }
     if (lm_verbose) {
+        LLAMA_LOG_INFO("%s: compute buffers %.2f -> %.2f MiB\n", __func__, buf_before/1048576.0, buf_after/1048576.0);
         LLAMA_LOG_INFO("%s: %zu ubatches (%" PRId64 " tokens each at most), %zu pieces, %d nodes, %d splits: build %.2f ms (graphs %.2f, inputs %.2f), "
             "compute (queued) %.2f ms%s\n",
             __func__, group.size(), n_tokens_max, cut_w.size(), gm ? ggml_graph_n_nodes(gm) : -1, ggml_backend_sched_get_n_splits(sched.get()),
