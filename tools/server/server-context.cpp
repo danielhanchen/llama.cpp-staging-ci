@@ -4643,7 +4643,16 @@ private:
 
             // verify and try to accept the draft
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                // the sampler is saved only for a checkpoint restore (below), which a rollback of at most n_draft tokens needs only
+                // when the context cannot remove them itself; the clone copies the n_vocab candidates (LLAMA_SPEC_LAZY_CLONE=0: always)
+                static const bool lazy_clone = [] {
+                    const char * e = getenv("LLAMA_SPEC_LAZY_CLONE");
+                    return e == nullptr || atoi(e) != 0;
+                }();
+                const bool may_restore = !lazy_clone ||
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
+                common_sampler_ptr smpl_save(may_restore ? common_sampler_clone(slot.smpl.get()) : nullptr);
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
@@ -4699,6 +4708,7 @@ private:
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                        GGML_ASSERT(smpl_save && "speculative checkpoint restore without a saved sampler");
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
 
                         return;
