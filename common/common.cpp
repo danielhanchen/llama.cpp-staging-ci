@@ -1720,7 +1720,7 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             fix2_cond = (double) growth > shrink_max*(double) cache && cache - growth < all_experts && tokens >= tiny_tokens;
             // with the spill lending on, the pick below decides (it keeps lending at the reference n_ubatch, see there)
             if (fix2_cond && !lend_graph) {
-                const bool gate_ok = f2_mode >= 2 || (!has_spec && spill_lend_ram);
+                const bool gate_ok = f2_mode >= 2 || ((!has_spec || spill_lend_spec) && spill_lend_ram); // strata-gap: with a draft too (LLAMA_MOE_SPILL_LEND_SPEC=0: as k6)
                 if (gate_ok && m_def.n_dev == 1 && lend_fits(m_ref)) {
                     fix2_lend  = true;
                     lend_graph = true;
