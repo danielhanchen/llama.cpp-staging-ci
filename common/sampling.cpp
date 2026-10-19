@@ -196,13 +196,12 @@ std::string common_params_sampling::print() const {
     return std::string(result);
 }
 
-// LLAMA_SAMPLE_GREEDY_FAST: 0 = off (the chain), 1 = one running max over logits + bias, 2 = the max in 16 independent lanes over
-// the raw logits with the biased tokens handled from the sparse bias list, 3 (default) = 2 on a copy of the row: the output buffer
-// is pinned host memory, which some hosts map uncached, so it is read once with memcpy instead of element by element
+// LLAMA_SAMPLE_GREEDY_FAST: 0 = off (the chain), 1 = one running max over logits + bias, 2 (default) = the max in 16 independent
+// lanes over the raw logits with the biased tokens handled from the sparse bias list, 3 = 2 on a memcpy copy of the row
 static int common_sampler_greedy_fast_mode() {
     static const int mode = [] {
         const char * e = getenv("LLAMA_SAMPLE_GREEDY_FAST");
-        return e == nullptr ? 3 : atoi(e);
+        return e == nullptr ? 2 : atoi(e);
     }();
     return mode;
 }
