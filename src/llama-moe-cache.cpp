@@ -1595,7 +1595,7 @@ struct llama_moe_cache::impl {
         tier.m = this;
         wstore->set_tier(&tier);
         // resident mode (the layout of Strata's --resident-experts): when the RAM tier and the device slots can hold every streamed
-        // expert (exclusive: RAM slots + device slots, inclusive: RAM slots), the device slots are prefilled at load (unless
+        // expert (RAM slots + device slots), the device slots are prefilled at load (unless
         // LLAMA_MOE_CACHE_PREFILL=0) and the RAM tier is filled from the model files with every expert the device does not hold, so no
         // prompt or decode step reads the files afterwards. Low-RAM G4 (32 GiB RAM, 24 GB VRAM, Flash-Next IQ2_XS 68 GB, 2k prompt / decode):
         // 55.7 / 43.1 tok/s filled on demand vs 164.1 / 62.2 resident (Strata resident 176.7 / 61.9), +45 s of load.
@@ -1610,7 +1610,8 @@ struct llama_moe_cache::impl {
                     n_dev      += (size_t) groups[ig].n_slots;
                 }
             }
-            const size_t n_hold = (size_t) host->n_slots() + (host->exclusive() ? n_dev : 0);
+            // the file fill skips the experts the device holds under both policies, so the device slots count for both
+            const size_t n_hold = (size_t) host->n_slots() + n_dev;
             const char * e_res = getenv("LLAMA_MOE_RESIDENT");
             const char * e_dp  = getenv("LLAMA_MOE_CACHE_PREFILL");
             const int    m_res = e_res != nullptr ? atoi(e_res) : -1;
@@ -1625,7 +1626,7 @@ struct llama_moe_cache::impl {
                         (size_t) host->n_slots(), n_dev, n_streamed, prefilled_dev ? "prefilled" : "not prefilled (LLAMA_MOE_CACHE_PREFILL=0)");
             } else if (m_res != 0 && getenv("LLAMA_MOE_HOST_CACHE_PREFILL") == nullptr) {
                 LLAMA_LOG_INFO("%s: MoE cache resident mode off: %zu RAM slots + %zu device slots hold %.1f%% of the %zu streamed experts "
-                        "(LLAMA_MOE_RESIDENT=1 forces it)\n", __func__, (size_t) host->n_slots(), host->exclusive() ? n_dev : 0,
+                        "(LLAMA_MOE_RESIDENT=1 forces it)\n", __func__, (size_t) host->n_slots(), n_dev,
                         100.0*n_hold/n_streamed, n_streamed);
             }
         }
