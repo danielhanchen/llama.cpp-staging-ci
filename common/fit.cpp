@@ -320,10 +320,12 @@ static void common_params_fit_impl(
     // while an FFN tensor in system memory only adds a weight upload (prompt batches) or a CPU matrix-vector product (token generation)
     // if the layers do not fit even without their FFN tensors, the layers in device memory keep only their attention, norms and KV cache
     // and the first layers go to system memory whole: more attention and KV cache stays in device memory than with whole layers
-    // LLAMA_FIT_DENSE_FFN=0 restores the old behaviour, which spilled whole layers, =2 spills whole layers in that case;
+    // opt-in, LLAMA_FIT_DENSE_FFN=1 (=2 spills whole layers in that case); unset or 0: whole layers, as before. G4 (RTX PRO 6000),
+    // gemma-4 E2B UD-IQ2_M at a 2 GB cap, -c 16384, medians of 3: FFN first (34/36 layers) decoded 121.0 tok/s vs 131.6 with whole
+    // layers (11/36) for 2k prompts at 13641 vs 11048 tok/s; the earlier dense data only showed a decode gain at long contexts.
     // user tensor overrides are kept as constraints
     const char * fit_dense_ffn_env  = getenv("LLAMA_FIT_DENSE_FFN");
-    const int    fit_dense_ffn_mode = fit_dense_ffn_env == nullptr ? 1 : atoi(fit_dense_ffn_env);
+    const int    fit_dense_ffn_mode = fit_dense_ffn_env == nullptr ? 0 : atoi(fit_dense_ffn_env);
     const bool   fit_dense_ffn      = nd > 0 && hp_nex == 0 && fit_dense_ffn_mode != 0;
 
     // the user overrides come first in every placement written below: the first matching pattern wins
