@@ -3025,10 +3025,17 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     auto eligible = [&](const llama_ubatch & ub) {
         return ub.n_tokens > llama_moe_cache::n_small_max && (int64_t) ub.n_tokens >= prefetch_min_batch && ub.n_seqs_unq == 1;
     };
-    if (!moe_cache || !sampling.samplers.empty() || cparams.embeddings || !cparams.causal_attn || cparams.verify || ple.enabled ||
+    if (!moe_cache || cparams.embeddings || !cparams.causal_attn || cparams.verify || ple.enabled ||
             std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool b) { return b; }) ||
             n_tokens_all - n_tokens_prev <= (int64_t) cparams.n_ubatch + llama_moe_cache::n_small_max || !eligible(mctx->get_ubatch()) ||
             moe_cache->lends_graph_to(mctx->get_ubatch().n_tokens) || moe_cache->hybrid_fixed() || moe_cache_devseed_on) {
+        if (lm_verbose && moe_cache && n_tokens_all - n_tokens_prev > (int64_t) cparams.n_ubatch + llama_moe_cache::n_small_max) {
+            const auto & ub = mctx->get_ubatch();
+            LLAMA_LOG_INFO("%s: not layer-major: samplers %d embeddings %d causal %d verify %d ple %d ubatch %u (eligible %d, seqs %u, embd %d) "
+                "lends %d hybrid_fixed %d devseed %d\n", __func__, (int) !sampling.samplers.empty(), (int) cparams.embeddings,
+                (int) cparams.causal_attn, (int) cparams.verify, (int) ple.enabled, ub.n_tokens, (int) eligible(ub), ub.n_seqs_unq,
+                (int) (ub.embd != nullptr), (int) moe_cache->lends_graph_to(ub.n_tokens), (int) moe_cache->hybrid_fixed(), (int) moe_cache_devseed_on);
+        }
         return 0;
     }
     // a first ubatch with outputs would be a group of one
@@ -3699,7 +3706,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         auto * t_logits  = res->get_logits();
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn() : nullptr;
 
-        if (logits.data && t_logits && n_outputs > 0) {
+        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(n_outputs_prev + n_outputs <= n_outputs_all);
@@ -3727,6 +3734,15 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             GGML_ASSERT(embd_batch_idxs.size() == (size_t) n_tokens_prev);
             const auto & batch_idxs = ubatch.data->batch_idxs;
             embd_batch_idxs.insert(embd_batch_idxs.end(), batch_idxs.begin(), batch_idxs.end());
+        }
+
+        // backend samplers (e.g. the greedy draft of an MTP context): only the last ubatch of a group has outputs
+        if (!sampling.samplers.empty()) {
+            const auto stride = n_vocab;
+            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
+            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
+            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
+            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
         }
 
         n_outputs_prev += n_outputs;
