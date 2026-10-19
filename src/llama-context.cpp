@@ -743,6 +743,28 @@ llama_context::llama_context(
 
         sched_reserve();
 
+        // layer-major prompts: the host arena of the group inputs (mostly the KQ masks), allocated now so that the first prompt does not
+        // pay for pinning it: up to LLAMA_MOE_LAYER_MAJOR_ARENA_MIB (256) for lm_ub_max ubatches at the full context, grown on demand
+        if (lm_enabled && moe_cache) {
+            ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+            if (auto * dev = model.dev_output()) {
+                if (auto * hb = ggml_backend_dev_host_buffer_type(dev)) {
+                    buft = hb;
+                }
+            }
+            const size_t cap  = (size_t) (getenv("LLAMA_MOE_LAYER_MAJOR_ARENA_MIB") ? atoll(getenv("LLAMA_MOE_LAYER_MAJOR_ARENA_MIB")) : 256) << 20;
+            const size_t want = std::min(cap, (size_t) lm_ub_max*((size_t) cparams.n_ctx*cparams.n_ubatch*sizeof(float) + (1u << 20)));
+            if (want > 0) {
+                lm_arena.reset(ggml_backend_buft_alloc_buffer(buft, want));
+            }
+            // the graph results of the group, created (and their metadata buffers touched) at load as well
+            lm_res.resize(lm_ub_max);
+            lm_inp_buf.resize(lm_ub_max);
+            for (auto & r : lm_res) {
+                r.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+            }
+        }
+
         // the later model or context now takes its memory itself: a later reserve sees it in the free memory of the devices
         // (the lending decision of the MoE cache was made at the first graph allocation, in the reserve above)
         std::fill(mem_reserve.begin(), mem_reserve.end(), 0);
@@ -2941,6 +2963,46 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     return 0;
 }
 
+bool llama_context::lm_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
+    auto * lctx = static_cast<llama_context *>(user_data);
+    const auto it = lctx->lm_ask.find(t);
+    const bool mine = it != lctx->lm_ask.end() && !it->second.done;
+    if (ask) {
+        return mine || (lctx->cparams.cb_eval && lctx->cparams.cb_eval(t, true, lctx->cparams.cb_eval_user_data));
+    }
+    if (mine) {
+        // the scheduler synchronized the backend after t: the routing of the source ubatch for this layer is computed
+        auto & L = it->second;
+        L.done = true;
+        const ggml_tensor * ids = L.ids;
+        const int64_t n_expert = L.w_first->ne[2];
+        std::vector<int32_t> ids_data(ggml_nelements(ids));
+        ggml_backend_tensor_get(ids, ids_data.data(), 0, ggml_nbytes(ids));
+        std::vector<int32_t> counts(n_expert, 0);
+        for (const int32_t id : ids_data) {
+            GGML_ASSERT(id >= 0 && id < n_expert);
+            counts[id]++;
+        }
+        lctx->moe_cache->set_seed_counts(L.w_first, counts);
+        // the expert copies of the layer issued so far: their seeds go on the copy queue behind them (the later ones seed when issued)
+        for (const ggml_tensor * w : L.ws) {
+            const auto st = lctx->lm_staged.find(w);
+            if (st == lctx->lm_staged.end() || lctx->lm_seeded.count(w) > 0) {
+                continue;
+            }
+            const std::vector<int32_t> * c = lctx->moe_cache->get_seed_counts(w);
+            if (c != nullptr && !c->empty()) {
+                lctx->lm_seeded.insert(w);
+                lctx->moe_cache->seed(st->second.first, w, st->second.second, *c, std::vector<bool>(w->ne[2], true));
+            }
+        }
+    }
+    if (lctx->cparams.cb_eval && lctx->cparams.cb_eval(t, true, lctx->cparams.cb_eval_user_data)) {
+        return lctx->cparams.cb_eval(t, false, lctx->cparams.cb_eval_user_data);
+    }
+    return true;
+}
+
 //
 // layer-major prompts (LLAMA_MOE_LAYER_MAJOR=1)
 //
@@ -2964,8 +3026,19 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     };
     if (!moe_cache || !sampling.samplers.empty() || cparams.embeddings || !cparams.causal_attn || cparams.verify || ple.enabled ||
             std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool b) { return b; }) ||
-            n_tokens_all - n_tokens_prev <= (int64_t) cparams.n_ubatch || !eligible(mctx->get_ubatch()) ||
-            moe_cache->lends_graph_to(mctx->get_ubatch().n_tokens) || moe_cache->hybrid_fixed()) {
+            n_tokens_all - n_tokens_prev <= (int64_t) cparams.n_ubatch + llama_moe_cache::n_small_max || !eligible(mctx->get_ubatch()) ||
+            moe_cache->lends_graph_to(mctx->get_ubatch().n_tokens) || moe_cache->hybrid_fixed() || moe_cache_devseed_on) {
+        return 0;
+    }
+    // a first ubatch with outputs would be a group of one
+    if (n_outputs_all != n_tokens_all) {
+        const auto & ub0 = mctx->get_ubatch();
+        for (uint32_t i = 0; i < ub0.n_tokens; i++) {
+            if (ub0.output[i]) {
+                return 0;
+            }
+        }
+    } else {
         return 0;
     }
 
@@ -2979,6 +3052,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         ggml_cgraph        * gf;
         int32_t              n_outputs;
         size_t               n_leafs;
+        int64_t              n_tokens_before; // tokens of the batch before this ubatch
     };
     std::vector<lm_ub> group;
 
@@ -3000,7 +3074,11 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
     }
 
+    lm_arena_used = 0;
+    lm_arena_old.clear();
     int64_t n_outputs_group = 0;
+    int64_t n_tokens_group  = 0;
+    int64_t t_build_us = 0, t_set_us = 0;
     more = true;
     while ((int) group.size() < lm_ub_max) {
         const auto & ub = mctx->get_ubatch();
@@ -3037,7 +3115,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
         auto * res = lm_res[k].get();
         res->reset();
+        const int64_t tb0 = ggml_time_us();
         ggml_cgraph * gf = model.build_graph(graph_params(res, ub, mctx, gtype));
+        t_build_us += ggml_time_us() - tb0;
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to build the graph of ubatch %zu\n", __func__, k);
             ret = -3;
@@ -3072,29 +3152,47 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             }
         }
         inp_size += align;
+        // one host arena for the inputs of the group (pinned where the device has a host buffer type), kept for the next prompts: the
+        // scheduler copies user inputs synchronously, so the arena is free again when the previous group's compute call has returned.
+        // A group that needs more starts a larger arena (the earlier members keep the old one until the group is computed)
         auto & ib = lm_inp_buf[k];
-        if (!ib || ggml_backend_buffer_get_size(ib.get()) < inp_size) {
-            ib.reset();
-            ib.reset(ggml_backend_buft_alloc_buffer(inp_buft, inp_size + inp_size/4));
-            if (!ib) {
-                LLAMA_LOG_ERROR("%s: failed to allocate %.2f MiB of inputs\n", __func__, inp_size/1048576.0);
+        ib.reset();
+        if (!lm_arena || lm_arena_used + inp_size > ggml_backend_buffer_get_size(lm_arena.get())) {
+            const size_t want = std::max<size_t>(inp_size*(size_t) (lm_ub_max - k), lm_arena ? ggml_backend_buffer_get_size(lm_arena.get())*3/2 : 0);
+            if (lm_arena) {
+                lm_arena_old.push_back(std::move(lm_arena));
+            }
+            lm_arena.reset(ggml_backend_buft_alloc_buffer(inp_buft, want));
+            lm_arena_used = 0;
+            if (!lm_arena) {
+                LLAMA_LOG_ERROR("%s: failed to allocate %.2f MiB of inputs\n", __func__, want/1048576.0);
                 ret = -2;
                 return -1;
             }
+            if (lm_verbose) {
+                LLAMA_LOG_INFO("%s: input arena of %.2f MiB\n", __func__, want/1048576.0);
+            }
         }
         {
-            ggml_tallocr ta = ggml_tallocr_new(ib.get());
+            uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(lm_arena.get());
+            size_t off = lm_arena_used;
             for (ggml_tensor * t : inps) {
-                if (ggml_tallocr_alloc(&ta, t) != GGML_STATUS_SUCCESS) {
+                off = GGML_PAD(off, align);
+                if (ggml_backend_tensor_alloc(lm_arena.get(), t, base + off) != GGML_STATUS_SUCCESS) {
                     LLAMA_LOG_ERROR("%s: failed to place an input\n", __func__);
                     ret = -2;
                     return -1;
                 }
+                off += ggml_backend_buft_get_alloc_size(inp_buft, t);
             }
+            lm_arena_used = GGML_PAD(off, align);
         }
+        const int64_t ts0 = ggml_time_us();
         res->set_inputs(&ub);
+        t_set_us += ggml_time_us() - ts0;
 
-        group.push_back({ &ub, res, gf, n_out, n_leafs });
+        group.push_back({ &ub, res, gf, n_out, n_leafs, n_tokens_prev + n_tokens_group });
+        n_tokens_group += ub.n_tokens;
         n_outputs_group += n_out;
         moe_cache->count_large_ubatch();
 
@@ -3208,7 +3306,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                     }
                     if (t == nullptr || t->op != GGML_OP_NONE || t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer) ||
                             ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
-                            t->buffer == lm_inp_buf[k].get()) {
+                            t->buffer == lm_arena.get() || std::any_of(lm_arena_old.begin(), lm_arena_old.end(),
+                                [&](const ggml_backend_buffer_ptr & b) { return b.get() == t->buffer; })) {
                         continue;
                     }
                     auto it = owner.emplace(t, k).first;
@@ -3278,6 +3377,81 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
     }
 
+    // the seed of the MoE cache, as moe_cache_seed_begin plans it for the ubatch-by-ubatch order: the last large ubatch of the batch seeds,
+    // from the routing of the ubatch before it if it has no outputs, else from its own (if its seed graph fits); every member of the group
+    // is large and prefetched, so the seed copies from the shared expert copies (all experts staged)
+    lm_ask.clear();
+    lm_staged.clear();
+    lm_seeded.clear();
+    moe_cache->clear_seed_counts();
+    int seed_k = -1, src_k = -1;
+    static const bool lm_seed_env = getenv("LLAMA_MOE_LAYER_MAJOR_SEED") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_SEED")) != 0;
+    if (lm_seed_env && moe_cache_seed_enabled && moe_cache_seed_sync && !moe_cache_seed_auto) {
+        for (size_t k = 0; k < group.size(); ++k) {
+            const int64_t nt = group[k].ub->n_tokens;
+            if (nt > llama_moe_cache::n_small_max && n_tokens_all - group[k].n_tokens_before - nt <= llama_moe_cache::n_small_max) {
+                seed_k = (int) k;
+            }
+        }
+        if (seed_k >= 1 && group[seed_k].n_outputs == 0) {
+            src_k = seed_k - 1;
+        } else if (seed_k >= 1 && moe_cache_seed_fits) {
+            src_k = seed_k;
+        } else if (seed_k >= 1) {
+            moe_cache->count_seed_skipped();
+        }
+    }
+    if (src_k >= 0) {
+        ggml_cgraph * gf = group[src_k].gf;
+        std::unordered_map<const ggml_tensor *, int> index;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            index[ggml_graph_node(gf, i)] = i;
+        }
+        std::unordered_map<const ggml_tensor *, lm_seed_layer *> by_ids;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            if (node->op != GGML_OP_MUL_MAT_ID) {
+                continue;
+            }
+            const ggml_tensor * w = host_weight(node->src[0]);
+            if (w == nullptr || moe_cache->get_experts(w) == nullptr) {
+                continue;
+            }
+            ggml_tensor * ids = node->src[2];
+            while (ids->view_src != nullptr && index.count(ids) == 0) {
+                ids = ids->view_src;
+            }
+            if (!ggml_is_contiguous(ids) || ids->type != GGML_TYPE_I32 || index.count(ids) == 0) {
+                continue;
+            }
+            auto bi = by_ids.find(ids);
+            if (bi == by_ids.end()) {
+                // the last node of the piece of the source graph that computes the routing
+                const int at = index[ids];
+                const auto & c = cuts[src_k];
+                const size_t j = (size_t) (std::upper_bound(c.begin(), c.end(), at) - c.begin()) - 1;
+                const int last = (j + 1 < c.size() ? c[j + 1] : ggml_graph_n_nodes(gf)) - 1;
+                lm_seed_layer L;
+                L.ids     = ids;
+                L.w_first = w;
+                auto & ref = lm_ask[ggml_graph_node(gf, last)];
+                if (!ref.ws.empty()) {
+                    continue; // two routings end the same piece (not expected): the second does not seed
+                }
+                ref = L;
+                bi = by_ids.emplace(ids, &ref).first;
+            }
+            if (std::find(bi->second->ws.begin(), bi->second->ws.end(), w) == bi->second->ws.end()) {
+                bi->second->ws.push_back(w);
+            }
+        }
+        lm_seed_active      = !lm_ask.empty();
+        moe_cache_seed_prev = lm_seed_active;
+        if (lm_seed_active) {
+            ggml_backend_sched_set_eval_callback(sched.get(), lm_eval_cb, this);
+        }
+    }
+
     ggml_status status = GGML_STATUS_SUCCESS;
     const int64_t t1_us = ggml_time_us();
     int64_t n_tokens_max = 0;
@@ -3324,15 +3498,63 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
     }
     if (lm_verbose) {
-        LLAMA_LOG_INFO("%s: %zu ubatches (%" PRId64 " tokens each at most), %zu pieces, %d nodes, %d splits: build %.2f ms, compute (queued) %.2f ms%s\n",
+        LLAMA_LOG_INFO("%s: %zu ubatches (%" PRId64 " tokens each at most), %zu pieces, %d nodes, %d splits: build %.2f ms (graphs %.2f, inputs %.2f), "
+            "compute (queued) %.2f ms%s\n",
             __func__, group.size(), n_tokens_max, cut_w.size(), gm ? ggml_graph_n_nodes(gm) : -1, ggml_backend_sched_get_n_splits(sched.get()),
-            (t1_us - t0_us)/1000.0, (ggml_time_us() - t1_us)/1000.0, gm ? "" : " (one by one)");
+            (t1_us - t0_us)/1000.0, t_build_us/1000.0, t_set_us/1000.0, (ggml_time_us() - t1_us)/1000.0, gm ? "" : " (one by one)");
     }
 
-    moe_cache_seq      = -1;
-    moe_cache_pos_next = -1;
+    const bool seeded = lm_seed_active && !lm_seeded.empty();
+    if (seeded) {
+        lm_n_seeded++;
+    }
+    if (lm_verbose && src_k >= 0) {
+        size_t n_ws = 0;
+        for (const auto & a : lm_ask) {
+            n_ws += a.second.ws.size();
+        }
+        LLAMA_LOG_INFO("%s: seed from the routing of ubatch %d of the group (seeding ubatch %d): %zu layers, %zu of %zu expert tensors seeded\n",
+            __func__, src_k, seed_k, lm_ask.size(), lm_seeded.size(), n_ws);
+    }
+    lm_seed_active      = false;
+    moe_cache_seed_prev = false;
+    lm_ask.clear();
+    lm_staged.clear();
+    lm_seeded.clear();
+    ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+    // the state moe_cache_seed_end leaves after the last ubatch of the group: its routing is kept for a later seed while the prompt goes on
     moe_cache_ids.clear();
-    moe_cache->clear_seed_counts();
+    moe_cache_seeded = seeded;
+    {
+        const auto & last = group.back();
+        if (status == GGML_STATUS_SUCCESS && last.n_outputs == 0 && last.ub->n_seqs_unq == 1 && moe_cache_seed_sync) {
+            ggml_cgraph * gf = last.gf;
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                const ggml_tensor * node = ggml_graph_node(gf, i);
+                if (node->op != GGML_OP_MUL_MAT_ID) {
+                    continue;
+                }
+                const ggml_tensor * w = host_weight(node->src[0]);
+                const ggml_tensor * ids = node->src[2];
+                if (w != nullptr && moe_cache->get_experts(w) != nullptr && (ids->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                        std::none_of(moe_cache_ids.begin(), moe_cache_ids.end(), [&](const auto & r) { return r.second == ids; })) {
+                    moe_cache_ids.emplace_back(w, ids);
+                }
+            }
+            llama_pos pos_max = last.ub->pos[0];
+            for (uint32_t i = 1; i < last.ub->n_tokens; ++i) {
+                pos_max = std::max(pos_max, last.ub->pos[i]);
+            }
+            moe_cache_seq      = last.ub->seq_id_unq[0];
+            moe_cache_pos_next = pos_max + 1;
+        } else {
+            moe_cache_seq      = -1;
+            moe_cache_pos_next = -1;
+            moe_cache_ids.clear();
+            moe_cache->clear_seed_counts();
+        }
+    }
 
     if (status != GGML_STATUS_SUCCESS) {
         llama_pos pos_min[LLAMA_MAX_SEQ];
@@ -4292,9 +4514,13 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     } else if (lctx->moe_cache_seed_prev && lctx->moe_cache->get_experts(src) != nullptr) {
         // all experts copied (prefetched): use the routing of an earlier ubatch; else the ids of this ubatch were read and only its routed experts staged
         const std::vector<int32_t> * counts = st.all ? lctx->moe_cache->get_seed_counts(src) : &st.counts;
-        if (counts != nullptr && !counts->empty()) {
+        if (counts != nullptr && !counts->empty() && (!lctx->lm_seed_active || lctx->lm_seeded.insert(src).second)) {
             lctx->moe_cache->seed(backend, src, dst, *counts, st.used);
         }
+    }
+    // layer-major graph: the routing that seeds this layer may come later, the seed then copies from this copy (see lm_eval_cb)
+    if (lctx->lm_seed_active && lctx->moe_cache->get_experts(src) != nullptr) {
+        lctx->lm_staged[src] = { backend, dst };
     }
 
     // the routing of a large ubatch is kept for a later seed, once per layer (the expert tensors of a layer share their ids)

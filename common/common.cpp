@@ -1367,6 +1367,26 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     if (params.moe_cache_size == 0 || params.n_ubatch_set || params.embedding || cparams.embeddings) {
         return;
     }
+    // layer-major prompts (LLAMA_MOE_LAYER_MAJOR=1): the ubatches of one batch upload each host expert once, so n_ubatch stays the default
+    // (no compute buffer growth taken from the cache) and the batch holds up to LLAMA_MOE_LAYER_MAJOR_BATCH (8192) tokens, at most the
+    // context and lm_ub_max ubatches
+    if (getenv("LLAMA_MOE_LAYER_MAJOR") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR")) != 0 &&
+            common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
+        if (!params.n_batch_set) {
+            int64_t want = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH") != nullptr ? atoll(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH")) : 8192;
+            const int64_t ub_max = getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX") != nullptr ? std::max(1, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX"))) : 16;
+            want = std::min<int64_t>(want, ub_max*(int64_t) cparams.n_ubatch);
+            if (params.n_ctx > 0) {
+                want = std::min<int64_t>(want, params.n_ctx);
+            }
+            if (want > (int64_t) cparams.n_batch) {
+                params.n_batch  = (int32_t) want;
+                cparams.n_batch = (uint32_t) want;
+            }
+        }
+        COM_INF("MoE cache: layer-major prompts: n_ubatch stays %u, n_batch %u (LLAMA_MOE_LAYER_MAJOR)\n", cparams.n_ubatch, cparams.n_batch);
+        return;
+    }
     const char * env = getenv("LLAMA_MOE_PREFILL_UB");
     const int    force = env != nullptr ? atoi(env) : -1;
     if (force == 0) {

@@ -17,6 +17,8 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <unordered_set>
+#include <unordered_map>
 #include <thread>
 #include <vector>
 
@@ -530,9 +532,27 @@ private:
     int  lm_ub_max  = 16;     // ubatches per layer-major graph [LLAMA_MOE_LAYER_MAJOR_UB_MAX]
     bool lm_verbose = false;  // [LLAMA_MOE_LAYER_MAJOR_LOG]
     std::vector<llm_graph_result_ptr>    lm_res;      // the graph of each ubatch of the group
-    std::vector<ggml_backend_buffer_ptr> lm_inp_buf;  // the inputs of each ubatch (host memory, set before the group is computed)
+    std::vector<ggml_backend_buffer_ptr> lm_inp_buf;  // unused (kept for the per-ubatch layout)
+    ggml_backend_buffer_ptr              lm_arena;    // the inputs of the group's ubatches (host memory, set before the group is computed)
+    std::vector<ggml_backend_buffer_ptr> lm_arena_old;
+    size_t                               lm_arena_used = 0;
     std::vector<uint8_t>                 lm_meta;     // the merged graph
-    int64_t lm_n_graphs = 0, lm_n_ubatches = 0, lm_n_fallback = 0;
+    int64_t lm_n_graphs = 0, lm_n_ubatches = 0, lm_n_fallback = 0, lm_n_seeded = 0;
+    // the seed of the MoE cache at the end of a prompt, as the ubatch-by-ubatch order does it (moe_cache_seed_begin): the last large ubatch
+    // seeds from the routing of the ubatch before it. In the merged graph that routing exists only once the graph reaches it, so the seed
+    // of a layer is issued from the eval callback after that routing (or, for expert copies issued later, from the copy callback), on the
+    // copy queue behind the expert copies it reads
+    struct lm_seed_layer {
+        ggml_tensor * ids;                      // the routing [n_expert_used, n_tokens] of the source ubatch
+        const ggml_tensor * w_first;            // the expert tensor that keys the layer's seed counts
+        std::vector<const ggml_tensor *> ws;    // the cached expert tensors of the layer
+        bool done = false;
+    };
+    bool lm_seed_active = false;
+    std::unordered_map<const ggml_tensor *, lm_seed_layer> lm_ask;                                // ask node -> layer
+    std::unordered_map<const ggml_tensor *, std::pair<ggml_backend_t, const ggml_tensor *>> lm_staged; // expert tensor -> (copy backend, copy)
+    std::unordered_set<const ggml_tensor *> lm_seeded;
+    static bool lm_eval_cb(ggml_tensor * t, bool ask, void * user_data);
     // returns the number of ubatches it processed (0: none, the caller processes the current ubatch), < 0 on error (ret = decode() return)
     int decode_layer_major(llama_memory_context_i * mctx, int64_t n_outputs_all, int64_t n_tokens_all, int64_t & n_outputs_prev,
             int64_t & n_tokens_prev, bool & more, int & ret);

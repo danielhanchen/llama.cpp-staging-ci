@@ -4358,7 +4358,10 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 }
 
                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
-                ggml_backend_synchronize(split_backend);
+                // (a range that ends without a node the user asked for needs no synchronization)
+                if (need) {
+                    ggml_backend_synchronize(split_backend);
+                }
 
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
                     break;
