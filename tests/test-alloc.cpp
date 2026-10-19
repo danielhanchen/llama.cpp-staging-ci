@@ -15,6 +15,19 @@
 static int setenv(const char * name, const char * value, int /*overwrite*/) { return _putenv_s(name, value); }
 static int unsetenv(const char * name) { return _putenv_s(name, ""); }
 #endif
+
+// the CPU backend can be a dynamically loaded module (GGML_BACKEND_DL: ggml_backend_cpu_init is not linked), so resolve it
+// through the registry, as test-sched-lend does
+static ggml_backend_t cpu_backend_new() {
+    static bool loaded = false;
+    if (!loaded) {
+        ggml_backend_load_all();
+        loaded = true;
+    }
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    GGML_ASSERT(cpu != nullptr && "no CPU backend");
+    return cpu;
+}
 #include <memory>
 #include <vector>
 
@@ -773,7 +786,7 @@ static ggml_backend_t mock_backend_init(ggml_backend_dev_t dev, const char *) {
     iface.graph_compute    = mock_graph_compute;
     iface.event_record     = mock_event_record;
     iface.event_wait       = mock_event_wait;
-    return new ggml_backend { &guid, iface, dev, ggml_backend_cpu_init() };
+    return new ggml_backend { &guid, iface, dev, cpu_backend_new() };
 }
 
 static const char * mock_dev_get_name(ggml_backend_dev_t) { return "MockGPU"; }
@@ -846,7 +859,7 @@ static size_t run_prefetch_headroom(size_t total, size_t workspace, size_t headr
 
     setenv("GGML_SCHED_PREFETCH", prefetch ? "2" : "0", 1);
     ggml_backend_t gpu = mock_backend_init(&mock.dev, nullptr);
-    ggml_backend_t cpu = ggml_backend_cpu_init();
+    ggml_backend_t cpu = cpu_backend_new();
     ggml_backend_t backends[2] = { gpu, cpu };
     ggml_backend_buffer_type_t bufts[2] = { &mock.buft, ggml_backend_cpu_buffer_type() };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, bufts, 2, 256, false, true);
