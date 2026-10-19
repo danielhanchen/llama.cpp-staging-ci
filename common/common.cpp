@@ -1828,7 +1828,14 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             return;
         }
     }
-    const int64_t taken     = std::max<int64_t>(0, lend_graph ? kv(m_pick) - kv(m_def) + (m_pick.dft - m_def.dft) : m_pick.total - m_def.total);
+    // strata-gap: a lent prompt graph with a draft keeps the draft context at the n_ubatch of the default (its compute buffer is not lent:
+    // the growth would come out of the cache). G4, Qwen3.6-35B-A3B UD-Q4_K_XL + its MTP at 12 / 16 GB: the main context lent at n_ubatch 8192
+    // grew the MTP context to 2048 (+293 MiB of compute), the cache shrank 7812 -> 7525 MiB, hit rate 87.5 -> 86.6% and chat decode -2.3% /
+    // -1.7% (same tokens and acceptance). LLAMA_MOE_LEND_DRAFT_UB_KEEP=0: the draft grows with the main n_ubatch as before
+    static const bool dft_keep_env = getenv("LLAMA_MOE_LEND_DRAFT_UB_KEEP") == nullptr || atoi(getenv("LLAMA_MOE_LEND_DRAFT_UB_KEEP")) != 0;
+    const bool dft_keep = dft_keep_env && has_spec && spill_lend_spec && lend_graph && ((spill_lend && pick != cands[0]) || fix2_lend) &&
+        params.speculative.draft.n_ubatch <= 0 && m_pick.dft > m_def.dft;
+    const int64_t taken     = std::max<int64_t>(0, lend_graph ? kv(m_pick) - kv(m_def) + (dft_keep ? 0 : m_pick.dft - m_def.dft) : m_pick.total - m_def.total);
     const size_t  cache_new = (size_t) (cache - taken);
     if (lend_graph && ((spill_lend && pick != cands[0]) || fix2_lend)) {
         // the cache and the scheduler read the lending mode from the environment
@@ -1836,6 +1843,12 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         // strata-gap: with a draft the lent prompt does not seed the cache (n_ubatch >= LLAMA_MOE_CACHE_SEED_AUTO) and the verify batches lost
         // 9.8% decode after a 2k prompt (G4, Flash-Next + Q4_K_M drafter: miss fetch 2.8 -> 6.1 ms/token): the slots that come back after the
         // prompt are refilled with the experts its last ubatch routed most (LLAMA_MOE_CACHE_REFILL_ROUTED, set here unless given)
+        if (dft_keep) {
+            params.speculative.draft.n_ubatch = (int32_t) common_draft_n_ubatch(params, ub_def);
+            COM_INF("MoE cache: lent prompt graphs with a draft: the draft context keeps n_ubatch %d (%.2f MiB of compute instead of %.2f MiB at "
+                "n_ubatch %u stay in the cache; LLAMA_MOE_LEND_DRAFT_UB_KEEP=0 to disable)\n", params.speculative.draft.n_ubatch,
+                m_def.dft/1048576.0, m_pick.dft/1048576.0, pick);
+        }
         if (has_spec && spill_lend_spec && getenv("LLAMA_MOE_CACHE_REFILL_ROUTED") == nullptr) {
             common_set_env("LLAMA_MOE_CACHE_REFILL_ROUTED", "1");
             COM_INF("MoE cache: lent prompt graphs with a draft: the lent slots are refilled with the prompt's most routed experts (%s=0 to disable)\n", "LLAMA_MOE_CACHE_REFILL_ROUTED");
