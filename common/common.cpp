@@ -64,6 +64,10 @@
 #include <sys/systemcfg.h>
 #endif
 
+#if defined(__linux__)
+#include <sys/vfs.h>
+#endif
+
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
@@ -2538,6 +2542,21 @@ static uint64_t common_model_file_bytes(const std::string & path) {
     return res;
 }
 
+// whether the model file lives in memory already (tmpfs / ramfs, Linux): its pages are not reclaimable page cache, so they are neither in
+// the available memory nor evicted (and read from the disk again) by a load that copies from them
+static bool common_model_file_in_ram(const std::string & path) {
+#if defined(__linux__)
+    struct statfs sfs;
+    if (statfs(path.c_str(), &sfs) == 0) {
+        const unsigned long t = (unsigned long) sfs.f_type;
+        return t == 0x01021994UL || t == 0x858458f6UL; // TMPFS_MAGIC, RAMFS_MAGIC
+    }
+#else
+    GGML_UNUSED(path);
+#endif
+    return false;
+}
+
 // system memory usable without swapping, 0 if unknown (the CPU backend reports total memory as free on Linux and macOS)
 // on Linux MemAvailable capped by the cgroup limits, without counting a cgroup's reclaimable page cache as used, see llama_available_memory
 static uint64_t common_available_memory() {
@@ -2826,12 +2845,24 @@ static enum llama_load_mode common_moe_cache_load_mode(const common_params & par
                 common_moe_slot_bytes sb;
                 expert_bytes = common_moe_slot_bytes_of(params.model.path, sb) && sb.total > 0 ? (uint64_t) sb.total : model_bytes;
             }
-            if (!host_experts || (double) (model_bytes + expert_bytes) <= none_frac*(double) mem_avail) {
+            // a model file in tmpfs / ramfs is memory already, outside the available memory, and the copy cannot evict it: only the pinned
+            // copy of the host experts counts there (G4, Flash-Next UD-IQ1_S in /dev/shm at 8 GB: 38000 + 69186 MiB against 50% of 108171 MiB
+            // took the mmap load, 2k decode 60.4 vs 64.4 tok/s and prompt 1946 vs 2270 tok/s without mmap). LLAMA_MOE_LOAD_NONE_TMPFS=0 counts the file
+            const char * env_tmpfs = getenv("LLAMA_MOE_LOAD_NONE_TMPFS");
+            const bool file_in_ram = (env_tmpfs == nullptr || atoi(env_tmpfs) != 0) && common_model_file_in_ram(params.model.path);
+            const uint64_t file_need = file_in_ram ? 0 : model_bytes;
+            if (!host_experts || (double) (file_need + expert_bytes) <= none_frac*(double) mem_avail) {
                 return LLAMA_LOAD_MODE_NONE;
             }
-            COM_INF("MoE cache: load with mmap: the host experts (%.0f MiB) and the model file (%.0f MiB) do not both fit in %.0f%% of the "
-                "available memory (%.0f MiB) for a load without mmap (--load-mode none forces it, LLAMA_MOE_LOAD_NONE_RAM_FRAC)\n",
-                expert_bytes/1048576.0, model_bytes/1048576.0, 100.0*none_frac, mem_avail/1048576.0);
+            if (file_in_ram) {
+                COM_INF("MoE cache: load with mmap: the host experts (%.0f MiB, the model file is in tmpfs) do not fit in %.0f%% of the "
+                    "available memory (%.0f MiB) for a load without mmap (--load-mode none forces it, LLAMA_MOE_LOAD_NONE_RAM_FRAC)\n",
+                    expert_bytes/1048576.0, 100.0*none_frac, mem_avail/1048576.0);
+            } else {
+                COM_INF("MoE cache: load with mmap: the host experts (%.0f MiB) and the model file (%.0f MiB) do not both fit in %.0f%% of the "
+                    "available memory (%.0f MiB) for a load without mmap (--load-mode none forces it, LLAMA_MOE_LOAD_NONE_RAM_FRAC)\n",
+                    expert_bytes/1048576.0, model_bytes/1048576.0, 100.0*none_frac, mem_avail/1048576.0);
+            }
         }
     }
     return load_mode;
