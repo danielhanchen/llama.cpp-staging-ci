@@ -3996,10 +3996,20 @@ static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, st
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
 
-    // GGML_SCHED_ASYNC_UPLOAD=0: every host input takes the synchronous copy below (the upstream path)
-    static const bool async_upload = getenv("GGML_SCHED_ASYNC_UPLOAD") == NULL || atoi(getenv("GGML_SCHED_ASYNC_UPLOAD")) != 0;
-    if (!async_upload) {
+    // GGML_SCHED_ASYNC_UPLOAD: unset = the CUDA family only (as the overlap and the prefetch: other backends have not been validated;
+    // Metal wraps every async upload in a new MTLBuffer, measured 2x slower decode on macOS 15 than the sync copy), 1 = every backend
+    // with set_tensor_async, 0 = never (every host input takes the synchronous copy below, the upstream path)
+    static const int async_upload = getenv("GGML_SCHED_ASYNC_UPLOAD") != NULL ? atoi(getenv("GGML_SCHED_ASYNC_UPLOAD")) : -1;
+    if (async_upload == 0) {
         return false;
+    }
+    if (async_upload < 0) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(split_backend);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : NULL;
+        const char * reg_name = reg ? ggml_backend_reg_name(reg) : "";
+        if (strcmp(reg_name, "CUDA") != 0 && strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0) {
+            return false;
+        }
     }
     if (sched->events[split_backend_id][sched->cur_copy] != NULL || split_backend->iface.set_tensor_async == NULL) {
         return false;
