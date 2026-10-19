@@ -131,6 +131,7 @@ struct common_sampler {
     std::vector<float> bias_dense; // empty: no bias
     std::vector<std::pair<llama_token, float>> bias_sparse; // the tokens with a bias (summed), ascending ids
     std::vector<float> bias_saved;                          // scratch: their raw logits during the scan
+    std::vector<float> row;                                 // scratch: a copy of the logits row (mode 3)
 
     void reset() {
         prev.clear();
@@ -195,12 +196,13 @@ std::string common_params_sampling::print() const {
     return std::string(result);
 }
 
-// LLAMA_SAMPLE_GREEDY_FAST: 0 = off (the chain), 1 = one running max over logits + bias, 2 (default) = the max in 16 independent
-// lanes over the raw logits with the biased tokens handled from the sparse bias list
+// LLAMA_SAMPLE_GREEDY_FAST: 0 = off (the chain), 1 = one running max over logits + bias, 2 = the max in 16 independent lanes over
+// the raw logits with the biased tokens handled from the sparse bias list, 3 (default) = 2 on a copy of the row: the output buffer
+// is pinned host memory, which some hosts map uncached, so it is read once with memcpy instead of element by element
 static int common_sampler_greedy_fast_mode() {
     static const int mode = [] {
         const char * e = getenv("LLAMA_SAMPLE_GREEDY_FAST");
-        return e == nullptr ? 2 : atoi(e);
+        return e == nullptr ? 3 : atoi(e);
     }();
     return mode;
 }
@@ -611,6 +613,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .bias_dense  = */ gsmpl->bias_dense,
         /* .bias_sparse = */ gsmpl->bias_sparse,
         /* .bias_saved  = */ {},
+        /* .row         = */ {},
     };
 }
 
@@ -728,6 +731,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             // logit; the scan keeps 16 running maxima (one running max is a dependency chain as long as the vocab), then the lowest
             // id holding the max is searched
             float * lg = const_cast<float *>(logits);
+            if (common_sampler_greedy_fast_mode() >= 3) {
+                gsmpl->row.resize(n_vocab);
+                memcpy(gsmpl->row.data(), logits, (size_t) n_vocab*sizeof(float));
+                lg = gsmpl->row.data();
+            }
             auto & bs  = gsmpl->bias_sparse;
             gsmpl->bias_saved.resize(bs.size());
             for (size_t k = 0; k < bs.size(); ++k) {
