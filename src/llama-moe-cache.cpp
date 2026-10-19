@@ -2145,6 +2145,30 @@ struct llama_moe_cache::impl {
 
     // uploads the experts the device plan admitted to layer il: from the RAM tier where it holds them (exclusive: they leave it), else read into a
     // RAM slot first (inclusive), else read by the weight store (or copied from the mapping); returns the bytes uploaded
+    // strata-gap: the uploads of missing experts (the refill of lent slots after a prompt, seeds, host lookups) go out as one batched copy
+    // per call (cudaMemcpyBatchAsync) instead of one cudaMemcpyAsync per expert run: the refill after an 8k Flash-Next prompt is ~3800
+    // copies of 0.3-1.7 MB, which reached ~40 GB/s busy (B200 nsys) against 52 GB/s for the batched prompt copies. Same bytes, same slots,
+    // same stream order. LLAMA_MOE_FILL_BATCH=0: one copy per run, as before
+    std::vector<ggml_backend_copy_region> fill_regions;
+    bool fill_batch = [] {
+        const char * env = getenv("LLAMA_MOE_FILL_BATCH");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    size_t n_fill_batches = 0;
+    void flush_fill_regions(ggml_backend_t backend) {
+        if (fill_regions.empty()) {
+            return;
+        }
+        if (ggml_backend_tensor_copy_regions_async(backend, fill_regions.data(), fill_regions.size())) {
+            n_fill_batches++;
+        } else {
+            for (const auto & r : fill_regions) {
+                ggml_backend_tensor_set_async(backend, r.dst, (const uint8_t *) r.src->data + r.src_offset, r.dst_offset, r.size);
+            }
+        }
+        fill_regions.clear();
+    }
+
     size_t upload_fills(ggml_backend_t backend, int32_t il, const std::vector<moe_cache_lru::fill> & fl, const std::vector<std::pair<int32_t, int32_t>> * ev) {
         const layer & l = layers[il];
         group & g = groups[l.ig];
@@ -2254,6 +2278,8 @@ struct llama_moe_cache::impl {
                 }
                 if (ws) {
                     ws_regions.push_back({ w, fr[i].expert*expert_size, bank, fr[i].slot*expert_size, n*expert_size });
+                } else if (fill_batch) {
+                    fill_regions.push_back({ w, fr[i].expert*expert_size, bank, fr[i].slot*expert_size, n*expert_size });
                 } else {
                     ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fr[i].expert*expert_size, fr[i].slot*expert_size, n*expert_size);
                 }
@@ -2266,6 +2292,7 @@ struct llama_moe_cache::impl {
                 ggml_backend_tensor_set_async(backend, r.dst, (const uint8_t *) r.src->data + r.src_off, r.dst_off, r.size);
             }
         }
+        flush_fill_regions(backend);
         return bytes;
     }
 
@@ -4342,7 +4369,7 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu prompt ends not seeded (the seeding graph does not fit in the compute buffer)\n", tag, seed_skipped);
         }
         if (n_lends > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu graphs used lent slots (at most %d slots lent), %zu experts refilled after them, %.2f MiB\n", tag, n_lends, lend_max, stats_refill.misses, stats_refill.bytes/1024.0/1024.0);
+            LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu graphs used lent slots (at most %d slots lent), %zu experts refilled after them, %.2f MiB (%zu batched fill calls)\n", tag, n_lends, lend_max, stats_refill.misses, stats_refill.bytes/1024.0/1024.0, n_fill_batches);
             if (n_refill_routed > 0) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu refills took the experts most used by the end of a prompt (LLAMA_MOE_CACHE_REFILL_ROUTED=1)\n", tag,
                     n_refill_routed);
