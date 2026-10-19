@@ -1686,6 +1686,49 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     if (lend_graph && !lend_fits(m_ref)) {
         lend_graph = false;
     }
+    // where the rule below (fix 2) would keep the default n_ubatch, because the growth of the reference n_ubatch is more than
+    // LLAMA_MOE_PREFILL_UB_SHRINK_MAX_FRAC of a spilling cache that holds the experts of at least LLAMA_MOE_PREFILL_UB_TINY_TOKENS tokens,
+    // the compute buffers of the larger n_ubatch are lent from the cache instead (the LLAMA_MOE_CACHE_LEND=2 behaviour): the cache gives
+    // up only the KV growth, so decode keeps the cache fix 2 kept, and prompts keep the larger ubatch the k5 rule gave them. Measured with
+    // LLAMA_MOE_CACHE_LEND=2 forced (decode / 2k prompt, k6 -> lent): gpt-oss-20B Q2_K at 8 GB, G4 183.3 / 5262 -> 172.8 / 11846, L4
+    // 58.3 / 1197 -> 55.1 / 2856, T4 38.0 / 891 -> 35.9 / 1211; Qwen3.6-35B-A3B UD-Q4_K_XL at 8 GB, T4 33.8 / 361 -> 33.5 / 753.
+    // Only with the conditions of the spill lending (single device, the graph fits a bank tail, no speculative decoding, the host experts
+    // at most LLAMA_MOE_SPILL_LEND_MAX_RAM_FRAC of the RAM); a host whose RAM fails that gate takes the growth from the cache as the k5 rule
+    // does (the slots lent to a prompt would be refilled from the disk). LLAMA_MOE_PREFILL_UB_SHRINK_LEND=0: fix 2 as before (n_ubatch
+    // stays the default); =2: lend also past the RAM gate and with speculative decoding. LLAMA_MOE_PREFILL_UB_SHRINK=1: the k5 rule.
+    bool fix2_lend = false, fix2_take = false;
+    {
+        static const bool shrink_ok = getenv("LLAMA_MOE_PREFILL_UB_SHRINK") != nullptr && atoi(getenv("LLAMA_MOE_PREFILL_UB_SHRINK")) != 0;
+        const int f2_mode = getenv("LLAMA_MOE_PREFILL_UB_SHRINK_LEND") != nullptr ? atoi(getenv("LLAMA_MOE_PREFILL_UB_SHRINK_LEND")) : 1;
+        double shrink_max = 0.05;
+        if (const char * e = getenv("LLAMA_MOE_PREFILL_UB_SHRINK_MAX_FRAC")) {
+            shrink_max = std::max(0.0, atof(e));
+        }
+        double tiny_tokens = 4.0;
+        if (const char * e = getenv("LLAMA_MOE_PREFILL_UB_TINY_TOKENS")) {
+            tiny_tokens = std::max(0.0, atof(e));
+        }
+        const bool rule_spill_env = getenv("LLAMA_MOE_PREFILL_UB_SPILL") != nullptr && atoi(getenv("LLAMA_MOE_PREFILL_UB_SPILL")) != 0;
+        if (f2_mode != 0 && !shrink_ok && !lend_graph && !rule_frac && !rule_spill_env && force <= 0 && env_l == nullptr && have_sb &&
+            sb.n_layer > 0 && sb.n_used > 0) {
+            const double  tokens = (double) cache/((double) sb.n_layer*(double) sb.n_used*(double) sb.sum);
+            const int64_t growth = std::max<int64_t>(0, m_ref.total - m_def.total);
+            if ((double) growth > shrink_max*(double) cache && cache - growth < all_experts && tokens >= tiny_tokens) {
+                const bool gate_ok = f2_mode >= 2 || (!has_spec && spill_lend_ram);
+                if (gate_ok && m_def.n_dev == 1 && lend_fits(m_ref)) {
+                    fix2_lend  = true;
+                    lend_graph = true;
+                } else if (f2_mode < 2 && !has_spec && !spill_lend_ram) {
+                    fix2_take = true;
+                }
+                COM_INF("MoE cache: n_ubatch %u would take %.2f MiB (%.1f%%) from a cache of %.2f MiB (the experts of %.1f tokens) that does not "
+                    "hold every expert: %s (LLAMA_MOE_PREFILL_UB_SHRINK_LEND=0 keeps n_ubatch %u)\n", cands[0], growth/1048576.0,
+                    100.0*growth/(double) cache, cache/1048576.0, tokens, fix2_lend ? "its compute buffers are lent from the cache" :
+                    fix2_take ? "taken from the cache (the host experts are more than LLAMA_MOE_SPILL_LEND_MAX_RAM_FRAC of the RAM)" :
+                    "n_ubatch stays the default", ub_def);
+            }
+        }
+    }
     // spilled experts: the cache cannot hold every expert of the model even at the reference n_ubatch. A prompt ubatch of at least
     // GGML_SCHED_PREFETCH_MIN_BATCH tokens stages every expert of every cached layer (the copies run ahead of the routing), so each ubatch
     // uploads all the experts the cache misses: a prompt of P tokens uploads them ceil(P/n_ubatch) times. A larger n_ubatch uploads them once
@@ -1705,7 +1748,9 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     if (const char * env_sf = getenv("LLAMA_MOE_PREFILL_UB_SPILL_FRAC")) {
         spill_frac = std::max(0.0, atof(env_sf));
     }
-    const char * rule = force > 0 ? "forced" : lend_graph ? (spill_lend ? "experts spill, compute buffers lent from the cache (LLAMA_MOE_SPILL_LEND=0 to disable)" : "LLAMA_MOE_CACHE_LEND=2") : rule_frac ? "LLAMA_MOE_PREFILL_UB_AUTO=1" :
+    const char * rule = force > 0 ? "forced" : lend_graph ? (spill_lend ? "experts spill, compute buffers lent from the cache (LLAMA_MOE_SPILL_LEND=0 to disable)" :
+        fix2_lend ? "the growth would shrink a spilling cache, compute buffers lent from the cache (LLAMA_MOE_PREFILL_UB_SHRINK_LEND=0 to disable)" :
+        "LLAMA_MOE_CACHE_LEND=2") : rule_frac ? "LLAMA_MOE_PREFILL_UB_AUTO=1" : fix2_take ? "the growth taken from the cache (k5 rule, RAM gate)" :
         rule_spill ? "experts spill, at most LLAMA_MOE_PREFILL_UB_SPILL_FRAC of the cache, no KV growth" : "every expert cached, no KV growth";
 
     uint32_t pick   = cands[0];
@@ -1747,7 +1792,7 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     // cache than the decode keeps, and both lose (gpt-oss-20B at 6 GB, the experts of 2.7 tokens: decode 84.5 -> 66.2 tok/s, hit rate
     // 68.6 -> 60.8%, 2k prompt 7700 -> 3594; lending the growth instead: 65.9 tok/s, the refilled slots miss). LLAMA_MOE_PREFILL_UB_SHRINK=1
     // takes the growth from the cache in every case
-    if (!lend_graph && !rule_frac && !rule_spill && force <= 0 && pick == cands[0] && have_sb && sb.n_layer > 0 && sb.n_used > 0) {
+    if (!lend_graph && !fix2_take && !rule_frac && !rule_spill && force <= 0 && pick == cands[0] && have_sb && sb.n_layer > 0 && sb.n_used > 0) {
         static const bool shrink_ok = getenv("LLAMA_MOE_PREFILL_UB_SHRINK") != nullptr && atoi(getenv("LLAMA_MOE_PREFILL_UB_SHRINK")) != 0;
         double shrink_max = 0.05;
         if (const char * e = getenv("LLAMA_MOE_PREFILL_UB_SHRINK_MAX_FRAC")) {
@@ -1768,7 +1813,7 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     }
     const int64_t taken     = std::max<int64_t>(0, lend_graph ? kv(m_pick) - kv(m_def) + (m_pick.dft - m_def.dft) : m_pick.total - m_def.total);
     const size_t  cache_new = (size_t) (cache - taken);
-    if (lend_graph && spill_lend && pick != cands[0]) {
+    if (lend_graph && ((spill_lend && pick != cands[0]) || fix2_lend)) {
         // the cache and the scheduler read the lending mode from the environment
         common_set_env("LLAMA_MOE_CACHE_LEND", "2");
     }
