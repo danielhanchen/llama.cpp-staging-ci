@@ -3420,6 +3420,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 continue;
             }
             ggml_tensor * ids = node->src[2];
+            if (ggml_nelements(ids) == 0) {
+                continue; // a layer narrowed to no rows copies and seeds nothing
+            }
             while (ids->view_src != nullptr && index.count(ids) == 0) {
                 ids = ids->view_src;
             }
@@ -3451,6 +3454,26 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         moe_cache_seed_prev = lm_seed_active;
         if (lm_seed_active) {
             ggml_backend_sched_set_eval_callback(sched.get(), lm_eval_cb, this);
+        }
+    }
+
+    // the routing that sched_copy_experts would record for the last ubatch of the group (moe_cache_record), taken before the scheduler
+    // replaces the weight sources of the nodes with their copies
+    std::vector<std::pair<const ggml_tensor *, const ggml_tensor *>> lm_record;
+    {
+        ggml_cgraph * gf = group.back().gf;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            const ggml_tensor * node = ggml_graph_node(gf, i);
+            if (node->op != GGML_OP_MUL_MAT_ID) {
+                continue;
+            }
+            const ggml_tensor * w = host_weight(node->src[0]);
+            const ggml_tensor * ids = node->src[2];
+            // not the empty routing of a layer narrowed to no outputs (it copies nothing, so nothing records it)
+            if (w != nullptr && moe_cache->get_experts(w) != nullptr && (ids->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_nelements(ids) > 0 &&
+                    std::none_of(lm_record.begin(), lm_record.end(), [&](const auto & r) { return r.second == ids; })) {
+                lm_record.emplace_back(w, ids);
+            }
         }
     }
 
@@ -3563,8 +3586,16 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         for (const auto & a : lm_ask) {
             n_ws += a.second.ws.size();
         }
-        LLAMA_LOG_INFO("%s: seed from the routing of ubatch %d of the group (seeding ubatch %d): %zu layers, %zu of %zu expert tensors seeded\n",
-            __func__, src_k, seed_k, lm_ask.size(), lm_seeded.size(), n_ws);
+        std::string miss;
+        for (const auto & a : lm_ask) {
+            for (const ggml_tensor * w : a.second.ws) {
+                if (lm_seeded.count(w) == 0 && miss.size() < 200) {
+                    miss += std::string(" ") + w->name + (lm_staged.count(w) ? "(staged)" : "(not staged)") + (a.second.done ? "" : "(no routing)");
+                }
+            }
+        }
+        LLAMA_LOG_INFO("%s: seed from the routing of ubatch %d of the group (seeding ubatch %d): %zu layers, %zu of %zu expert tensors seeded%s%s\n",
+            __func__, src_k, seed_k, lm_ask.size(), lm_seeded.size(), n_ws, miss.empty() ? "" : "; not:", miss.c_str());
     }
     lm_seed_active      = false;
     moe_cache_seed_prev = false;
@@ -3579,19 +3610,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     {
         const auto & last = group.back();
         if (status == GGML_STATUS_SUCCESS && last.n_outputs == 0 && last.ub->n_seqs_unq == 1 && moe_cache_seed_sync) {
-            ggml_cgraph * gf = last.gf;
-            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-                const ggml_tensor * node = ggml_graph_node(gf, i);
-                if (node->op != GGML_OP_MUL_MAT_ID) {
-                    continue;
-                }
-                const ggml_tensor * w = host_weight(node->src[0]);
-                const ggml_tensor * ids = node->src[2];
-                if (w != nullptr && moe_cache->get_experts(w) != nullptr && (ids->flags & GGML_TENSOR_FLAG_OUTPUT) &&
-                        std::none_of(moe_cache_ids.begin(), moe_cache_ids.end(), [&](const auto & r) { return r.second == ids; })) {
-                    moe_cache_ids.emplace_back(w, ids);
-                }
-            }
+            moe_cache_ids = lm_record;
             llama_pos pos_max = last.ub->pos[0];
             for (uint32_t i = 1; i < last.ub->n_tokens; ++i) {
                 pos_max = std::max(pos_max, last.ub->pos[i]);
@@ -4613,6 +4632,11 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
                 counts[id]++;
             }
             moe_cache->set_seed_counts(w, counts);
+            if (lm_verbose) {
+                uint64_t h = 1469598103934665603ull;
+                for (const int32_t c : counts) { h ^= (uint64_t) c; h *= 1099511628211ull; }
+                LLAMA_LOG_INFO("%s: seed counts %s from %s: %016llx\n", __func__, w->name, ids->name, (unsigned long long) h);
+            }
         }
     }
     // a ubatch with outputs after a large one that did not seed ends the prompt (e.g. the server runs the last tokens as a separate batch)
