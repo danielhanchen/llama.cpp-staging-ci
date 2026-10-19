@@ -16,7 +16,7 @@ enum common_params_fit_status {
 //   - KV-resident: every layer keeps its attention and its KV cache (at the requested context) in device memory, the FFN tensors
 //     of the last layers go to system memory first
 enum common_fit_kv_resident {
-    COMMON_FIT_KV_RESIDENT_AUTO = 0, // KV-resident if the whole-layer placement would spill a lot of KV cache per byte of weights (default)
+    COMMON_FIT_KV_RESIDENT_AUTO = 0, // KV-resident if the whole-layer placement would spill little KV cache per byte of weights (default)
     COMMON_FIT_KV_RESIDENT_ON   = 1, // KV-resident whenever the model does not fit
     COMMON_FIT_KV_RESIDENT_OFF  = 2, // whole layers only
 };

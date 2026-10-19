@@ -25,11 +25,16 @@ enum common_layer_fraction_t {
     LAYER_FRACTION_MOE  = 4, // everything but sparse MoE weights
 };
 
-// --fit-kv-resident auto: use the KV-resident placement for a dense model if the whole-layer placement would put at least this much KV
-// cache (incl. recurrent state) in system memory per byte of weights it puts there. Calibrated on fit-kv-resident (T4 2/4 cores, RTX PRO 6000
-// 6/48 cores, B200; Qwen3.8-27B, gemma-4-31B, gemma-4-E2B): at a ratio >= 0.15 decode near a full context was 1.24-2.2x faster and prompt
-// processing 0.95-1.10x, below it decode near a full context gained 1.00-1.32x while an almost empty context decoded up to 15% slower.
-static constexpr double FIT_KV_RESIDENT_AUTO_MIN_KV_RATIO = 0.15;
+// --fit-kv-resident auto: use the KV-resident placement for a dense model only if the whole-layer placement would put less than this much
+// KV cache (incl. recurrent state) in system memory per byte of weights it puts there. Making room in device memory for that KV cache moves
+// as many bytes of FFN weights to system memory, which every token reads, while the whole-layer placement reads only the used cells.
+// Calibrated on k6 (Colab G4 RTX PRO 6000, EPYC 9B45 48 vCPU at -t 24 and pinned to 8 / 6 physical cores; Qwen3.8-27B, gemma-4-12B,
+// gemma-4-31B, Llama-3.1-8B; VRAM 4-16 GB, -c 8192 / 32768; llama-server, 2048-token prompt, medians of 3): below 0.13 (ratios
+// 0.045-0.120, 8 cells x 3 thread counts) FFN first decoded +0.0..+8.8% faster and processed prompts +0.8..+21% faster; from 0.141 up
+// (0.141-1.012, 8 cells) it decoded up to 34% slower: slower in every cell at 6 threads (-0.6..-33%), faster only in the two
+// Qwen3.8-27B 32K cells at 24 threads (+2.2 / +3.1%) and 8 threads (+0.1%). After a 16384-token prompt at -c 32768 FFN first decoded
+// +5..+45% faster in every cell auto decides: see LLAMA_FIT_KV_RESIDENT_CTX.
+static constexpr double FIT_KV_RESIDENT_AUTO_MAX_KV_RATIO = 0.13;
 
 class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
@@ -331,11 +336,13 @@ static void common_params_fit_impl(
     // norms and KV cache and the first layers go to system memory whole.
     //   - off:  whole layers, as before
     //   - on:   FFN first
-    //   - auto: FFN first if the layers fit without their FFN tensors and the whole-layer placement would put at least
-    //           FIT_KV_RESIDENT_AUTO_MIN_KV_RATIO bytes of KV cache in system memory per byte of weights, otherwise whole layers.
-    //           The KV cache is counted at the requested context, which is never cut for it; LLAMA_FIT_KV_RESIDENT_CTX=N counts it at an
-    //           expected used context of N tokens per sequence instead (decode reads only the used cells: Qwen3.8-27B at -c 131072 / 16 GB
-    //           decoded 11.9 t/s after a 2K prompt with the KV cache resident vs 18.4 with whole layers, break-even near 30K used cells).
+    //   - auto: FFN first if the layers fit without their FFN tensors and the whole-layer placement would put less than
+    //           FIT_KV_RESIDENT_AUTO_MAX_KV_RATIO bytes of KV cache in system memory per byte of weights, otherwise whole layers.
+    //           The KV cache is counted at the requested context, which is never cut for it. Decode reads only the used cells, so a
+    //           context that is mostly used favours FFN first at any ratio: LLAMA_FIT_KV_RESIDENT_CTX=N declares an expected used context
+    //           of N tokens per sequence, and N at least half the context per sequence picks FFN first (Qwen3.8-27B at -c 131072 / 16 GB,
+    //           ratio 0.62, decoded 11.9 t/s after a 2K prompt with the KV cache resident vs 18.4 with whole layers, break-even near 30K
+    //           used cells; at -c 32768 every cell auto decides decoded faster with FFN first after a 16K prompt).
     //           User tensor overrides make auto behave as off.
     // LLAMA_FIT_DENSE_FFN overrides kv_resident (kill switch): 0 = off, 1 = on, 2 = on but whole layers if the layers do not fit without
     // their FFN tensors. With on, user tensor overrides are kept as constraints.
@@ -1119,21 +1126,22 @@ static void common_params_fit_impl(
             kv_spill += int64_t(dmds_ref[id].mb.context) - int64_t(dmds_base[id].mb.context);
             w_spill  += int64_t(dmds_ref[id].mb.model)   - int64_t(dmds_base[id].mb.model);
         }
+        // an expected used context of at least half the context per sequence: FFN first whatever the ratio
+        bool long_ctx = false;
         if (const char * env_ctx = getenv("LLAMA_FIT_KV_RESIDENT_CTX")) {
             const uint64_t n_ctx_used = strtoull(env_ctx, nullptr, 10) * n_streams;
-            if (n_ctx_used > 0 && n_ctx_used < cparams->n_ctx) {
-                kv_spill = int64_t(double(kv_spill) * double(n_ctx_used) / double(cparams->n_ctx));
-            }
+            long_ctx = n_ctx_used > 0 && 2*n_ctx_used >= cparams->n_ctx;
         }
         const double ratio   = w_spill > 0 ? double(kv_spill) / double(w_spill) : 0.0;
-        const bool   use_kvr = ratio >= FIT_KV_RESIDENT_AUTO_MIN_KV_RATIO;
+        const bool   use_kvr = long_ctx || ratio < FIT_KV_RESIDENT_AUTO_MAX_KV_RATIO;
         uint32_t n_layer_dev = 0;
         for (size_t id = 0; id < nd; id++) {
             n_layer_dev += ngl_per_device[id].n_layer;
         }
         LOG_INF("%s: --fit-kv-resident auto: at a context of %" PRIu32 " the whole-layer placement (%" PRIu32 "/%" PRIu32 " layers) spills "
-            "%" PRId64 " MiB of weights and %" PRId64 " MiB of KV cache (ratio %.3f, threshold %.3f) -> %s\n", __func__, cparams->n_ctx,
-            n_layer_dev, hp_ngl + 1, w_spill/MiB, kv_spill/MiB, ratio, FIT_KV_RESIDENT_AUTO_MIN_KV_RATIO,
+            "%" PRId64 " MiB of weights and %" PRId64 " MiB of KV cache (ratio %.3f, FFN first below %.3f%s) -> %s\n", __func__, cparams->n_ctx,
+            n_layer_dev, hp_ngl + 1, w_spill/MiB, kv_spill/MiB, ratio, FIT_KV_RESIDENT_AUTO_MAX_KV_RATIO,
+            long_ctx ? ", LLAMA_FIT_KV_RESIDENT_CTX: long context" : "",
             use_kvr ? "FFN tensors first (KV-resident)" : "whole layers");
         if (!use_kvr) {
             set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);

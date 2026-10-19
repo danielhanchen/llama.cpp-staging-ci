@@ -3056,7 +3056,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         { "-fitkv", "--fit-kv-resident" }, "[auto|on|off]",
         "for a dense model that does not fit: keep every layer's attention and the KV cache (at the requested context) in device\n"
         "memory and move FFN weights to system memory first, instead of whole layers ('auto': only if the whole-layer placement\n"
-        "would spill a lot of KV cache per byte of weights, 'on' or 'off', default: 'auto'; LLAMA_FIT_DENSE_FFN=0|1|2 overrides it)",
+        "would spill little KV cache per byte of weights, 'on' or 'off', default: 'auto'; LLAMA_FIT_DENSE_FFN=0|1|2 overrides it)",
         [](common_params & params, const std::string & value) {
             if (value == "auto") {
                 params.fit_kv_resident = COMMON_FIT_KV_RESIDENT_AUTO;
