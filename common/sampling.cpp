@@ -129,6 +129,8 @@ struct common_sampler {
     // takes the argmax of the logits + bias_dense instead of building and sorting n_vocab candidates
     bool greedy_fast = false;
     std::vector<float> bias_dense; // empty: no bias
+    std::vector<std::pair<llama_token, float>> bias_sparse; // the tokens with a bias (summed), ascending ids
+    std::vector<float> bias_saved;                          // scratch: their raw logits during the scan
 
     void reset() {
         prev.clear();
@@ -193,14 +195,20 @@ std::string common_params_sampling::print() const {
     return std::string(result);
 }
 
+// LLAMA_SAMPLE_GREEDY_FAST: 0 = off (the chain), 1 = one running max over logits + bias, 2 (default) = the max in 16 independent
+// lanes over the raw logits with the biased tokens handled from the sparse bias list
+static int common_sampler_greedy_fast_mode() {
+    static const int mode = [] {
+        const char * e = getenv("LLAMA_SAMPLE_GREEDY_FAST");
+        return e == nullptr ? 2 : atoi(e);
+    }();
+    return mode;
+}
+
 // whether every sampler of the chain built from params keeps the token with the highest (biased) logit and the chain ends in
 // greedy: then the sampled token is the argmax of the biased logits. LLAMA_SAMPLE_GREEDY_FAST=0 disables it.
 static bool common_sampler_greedy_fast(const common_params_sampling & params, const llama_sampler * grmr, const llama_sampler * rbudget) {
-    static const bool enabled = [] {
-        const char * e = getenv("LLAMA_SAMPLE_GREEDY_FAST");
-        return e == nullptr || atoi(e) != 0;
-    }();
-    if (!enabled || grmr != nullptr || rbudget != nullptr || params.mirostat != 0 || params.n_probs != 0 || params.samplers.empty()) {
+    if (common_sampler_greedy_fast_mode() == 0 || grmr != nullptr || rbudget != nullptr || params.mirostat != 0 || params.n_probs != 0 || params.samplers.empty()) {
         return false;
     }
     const bool greedy =
@@ -510,6 +518,11 @@ struct common_sampler * common_sampler_init(
                 result->bias_dense[lb.token] += lb.bias;
             }
         }
+        for (int32_t i = 0; i < n_vocab; ++i) {
+            if (result->bias_dense[i] != 0.0f) {
+                result->bias_sparse.emplace_back(i, result->bias_dense[i]);
+            }
+        }
     }
 
     return result;
@@ -596,6 +609,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .rng     = */ gsmpl->rng,
         /* .greedy_fast = */ gsmpl->greedy_fast,
         /* .bias_dense  = */ gsmpl->bias_dense,
+        /* .bias_sparse = */ gsmpl->bias_sparse,
+        /* .bias_saved  = */ {},
     };
 }
 
@@ -620,6 +635,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->t_total_us = src->t_total_us;
     dst->greedy_fast = src->greedy_fast;
     dst->bias_dense  = src->bias_dense;
+    dst->bias_sparse = src->bias_sparse;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -695,22 +711,65 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         const float * logits  = llama_get_logits_ith(ctx, idx);
         GGML_ASSERT(logits != nullptr);
         const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
-        const float * bias    = gsmpl->bias_dense.empty() ? nullptr : gsmpl->bias_dense.data();
         int32_t best   = 0;
-        float   best_v = bias ? logits[0] + bias[0] : logits[0];
-        if (bias) {
+        float   best_v = -INFINITY;
+        if (common_sampler_greedy_fast_mode() == 1) {
+            const float * bias = gsmpl->bias_dense.empty() ? nullptr : gsmpl->bias_dense.data();
+            best_v = bias ? logits[0] + bias[0] : logits[0];
             for (int32_t i = 1; i < n_vocab; ++i) {
-                const float v = logits[i] + bias[i];
+                const float v = bias ? logits[i] + bias[i] : logits[i];
                 if (v > best_v) {
                     best_v = v;
                     best   = i;
                 }
             }
         } else {
-            for (int32_t i = 1; i < n_vocab; ++i) {
-                if (logits[i] > best_v) {
-                    best_v = logits[i];
-                    best   = i;
+            // the biased tokens leave the raw scan (their logit is set to -inf and restored after it) and compete with their biased
+            // logit; the scan keeps 16 running maxima (one running max is a dependency chain as long as the vocab), then the lowest
+            // id holding the max is searched
+            float * lg = const_cast<float *>(logits);
+            auto & bs  = gsmpl->bias_sparse;
+            gsmpl->bias_saved.resize(bs.size());
+            for (size_t k = 0; k < bs.size(); ++k) {
+                gsmpl->bias_saved[k] = lg[bs[k].first];
+                lg[bs[k].first] = -INFINITY;
+            }
+            float lane[16];
+            for (int j = 0; j < 16; ++j) {
+                lane[j] = -INFINITY;
+            }
+            const int32_t n16 = n_vocab - n_vocab % 16;
+            for (int32_t i = 0; i < n16; i += 16) {
+                for (int j = 0; j < 16; ++j) {
+                    lane[j] = lg[i + j] > lane[j] ? lg[i + j] : lane[j];
+                }
+            }
+            float raw_v = -INFINITY;
+            for (int j = 0; j < 16; ++j) {
+                raw_v = lane[j] > raw_v ? lane[j] : raw_v;
+            }
+            for (int32_t i = n16; i < n_vocab; ++i) {
+                raw_v = lg[i] > raw_v ? lg[i] : raw_v;
+            }
+            int32_t raw_i = -1;
+            for (int32_t i = 0; i < n_vocab; ++i) {
+                if (lg[i] == raw_v) {
+                    raw_i = i;
+                    break;
+                }
+            }
+            for (size_t k = 0; k < bs.size(); ++k) {
+                lg[bs[k].first] = gsmpl->bias_saved[k];
+            }
+            best   = raw_i < 0 ? 0 : raw_i;
+            best_v = raw_v;
+            // a biased token wins if its biased logit is larger, or equal with a lower id (the lowest id on a tie)
+            for (size_t k = 0; k < bs.size(); ++k) {
+                const float v = gsmpl->bias_saved[k] + bs[k].second;
+                if (v > best_v || (v == best_v && (raw_i < 0 || bs[k].first < best))) {
+                    best_v = v;
+                    best   = bs[k].first;
+                    raw_i  = best;
                 }
             }
         }
