@@ -1659,7 +1659,12 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     // strata-gap: with speculative decoding too (LLAMA_MOE_SPILL_LEND_SPEC=0 restores the k6 gate). B200 ballasted to 32 GB, Flash-Next
     // UD-IQ4_XS + Q4_K_M MTP drafter: the spec gate left the prompt at n_ubatch 2048, four expert passes per 8k prompt (169 GB H2D vs
     // Strata's 41 GB, 8k prompt 1630 vs 4566 tok/s); see plans/strata_gap_profile.md
-    static const bool spill_lend_spec = getenv("LLAMA_MOE_SPILL_LEND_SPEC") == nullptr || atoi(getenv("LLAMA_MOE_SPILL_LEND_SPEC")) != 0;
+    // LLAMA_MOE_SPILL_LEND_SPEC unset: with a separate drafter (-md) only; 0: never (the k6 gate); 1: with any draft. A built-in MTP head
+    // (Qwen3.6-35B-A3B UD-Q4_K_XL on G4 at 12 / 16 GB, where k6 keeps n_ubatch 512) lost 5.5-6% of the decode after a lent 2k prompt (on a
+    // different text: n_ubatch rounding; no seeding variant recovered it) for a 2.8-2.9x 2k prompt, so it stays off there by default;
+    // Flash-Next + its Q4_K_M drafter at 32 GB (k6 at 2048): 2k decode 84.7 -> 87.0 tok/s with the auto pinned experts, same text
+    static const int spill_lend_spec_mode = getenv("LLAMA_MOE_SPILL_LEND_SPEC") != nullptr ? atoi(getenv("LLAMA_MOE_SPILL_LEND_SPEC")) : -1;
+    const bool spill_lend_spec = spill_lend_spec_mode > 0 || (spill_lend_spec_mode < 0 && has_draft);
     const bool spill_lend = env_l == nullptr && !rule_frac && have_sb && cache_ref < all_experts &&
         (double) cache_ref <= spill_lend_max_frac*(double) sb.total &&
         (spill_lend_mode >= 2 || (spill_lend_mode == 1 && (!has_spec || spill_lend_spec) && spill_lend_ram)) &&
