@@ -1096,14 +1096,21 @@ struct llm_graph_context {
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
 
+    // a prompt ubatch with outputs whose graph allocation the MoE cache lends (LLAMA_MOE_CACHE_LEND=2) keeps its last layer at full width
+    // and narrows to the output rows after it: narrowed, the last layer's experts are looked up on the host, which reads the cache banks
+    // as weights, and the cache then lends nothing to the graph, which allocates on its own and fails on a full device (G4 at 32 GB,
+    // Flash-Next, --ctx-checkpoints 0: "allocating 1352.53 MiB ... cudaMalloc failed" on the first request; with checkpoints the
+    // prompt ubatches carry no outputs). Costs one layer's FFN for the non-output rows of such ubatches only. LLAMA_MOE_LEND_FULL_LAST=0 off
+    bool crop_full_last() const;
+
     // true when the last layer must be narrowed to the output rows before the nextn hidden state is captured
     bool crop_before_nextn(const ggml_tensor * inp_out_ids) const {
-        return inp_out_ids != nullptr && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
+        return inp_out_ids != nullptr && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked) && !crop_full_last();
     }
 
     // true when the nextn hidden state must be narrowed to the output rows after it is captured
     bool crop_after_nextn(const ggml_tensor * inp_out_ids) const {
-        return inp_out_ids != nullptr && cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
+        return inp_out_ids != nullptr && ((cparams.embeddings_nextn && !cparams.embeddings_nextn_masked) || crop_full_last());
     }
 
     //

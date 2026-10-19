@@ -4737,6 +4737,25 @@ bool llama_moe_cache::lends_graph() const {
     return pimpl->lend_mode == 2;
 }
 
+bool llama_moe_cache::lends_graph_to(int64_t n_tokens) const {
+    if (pimpl->lend_mode != 2) {
+        return false;
+    }
+    // the largest group of each device lends (see impl::lend): a batch its device lookup serves does not borrow
+    for (size_t id = 0; id < pimpl->devices.size(); ++id) {
+        const impl::group * gl = nullptr;
+        for (const auto & g : pimpl->groups) {
+            if (g.id == (int32_t) id && g.n_slots > 0 && (gl == nullptr || (size_t) g.n_slots*g.expert_bytes > (size_t) gl->n_slots*gl->expert_bytes)) {
+                gl = &g;
+            }
+        }
+        if (gl != nullptr && pimpl->devices[id].buf && !pimpl->use_device(*gl, n_tokens)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 size_t llama_moe_cache::lend_need_max() const {
     size_t need = 0;
     for (const auto & d : pimpl->devices) {

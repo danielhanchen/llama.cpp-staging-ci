@@ -1569,6 +1569,11 @@ void llm_graph_result::set_params(const llm_graph_params & params) {
 // llm_graph_context
 //
 
+bool llm_graph_context::crop_full_last() const {
+    static const bool on = getenv("LLAMA_MOE_LEND_FULL_LAST") == nullptr || atoi(getenv("LLAMA_MOE_LEND_FULL_LAST")) != 0;
+    return on && moe_cache != nullptr && n_outputs > 0 && (int64_t) n_outputs < (int64_t) n_tokens && moe_cache->lends_graph_to(n_tokens);
+}
+
 llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     arch             (params.arch),
     hparams          (params.hparams),
