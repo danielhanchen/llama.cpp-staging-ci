@@ -621,6 +621,8 @@ struct llama_moe_cache::impl {
     size_t devseed_admitted = 0; // experts they admitted
     size_t devseed_bytes    = 0;
     bool   prefill_deferred = false; // the default seeding skipped the prefill at load, it runs if prompts cannot seed
+    bool   prefilled_dev    = false; // prefill() filled device slots
+    bool   resident_mode    = false; // resident mode: device slots and RAM tier filled at load (see init_host_cache)
 
     bool seed_check = false;
     std::vector<seed_rec> seed_committed; // seeded layers, not yet checked
@@ -1373,8 +1375,28 @@ struct llama_moe_cache::impl {
         return devices[groups[layers[il].ig].id].backend;
     }
 
+    // the experts of layer il, most routed first: by the routing a prompt recorded (refill counts, see set_refill_counts, else the
+    // seed counts), ties and layers without a record by id. A fresh load has no record, so the load-time fills go by id there.
+    std::vector<int32_t> fill_order(int32_t il, int32_t n_expert) const {
+        std::vector<int32_t> ids(n_expert);
+        for (int32_t e = 0; e < n_expert; ++e) {
+            ids[e] = e;
+        }
+        const std::vector<int32_t> * c = nullptr;
+        if ((size_t) il < refill_counts.size() && (int32_t) refill_counts[il].size() == n_expert) {
+            c = &refill_counts[il];
+        } else if ((size_t) il < seed_counts.size() && (int32_t) seed_counts[il].size() == n_expert) {
+            c = &seed_counts[il];
+        }
+        if (c != nullptr) {
+            std::stable_sort(ids.begin(), ids.end(), [c](int32_t a, int32_t b) { return (*c)[a] > (*c)[b]; });
+        }
+        return ids;
+    }
+
     // fill every slot at load, an equal share of the experts of each layer, so the first prompt reads them from the cache
-    // like the experts a split keeps on the device (an empty cache uploads every expert of a large batch)
+    // like the experts a split keeps on the device (an empty cache uploads every expert of a large batch); most routed first where
+    // a prompt recorded the routing (a late prefill, see seed_unavailable), else the lowest ids
     void prefill() {
         size_t n_fill  = 0;
         size_t n_bytes = 0;
@@ -1394,10 +1416,10 @@ struct llama_moe_cache::impl {
             for (size_t i = 0; i < n_layer; ++i) {
                 const int32_t il = g.layers[i];
                 const int32_t n  = std::min<int32_t>(n_expert, n_slots/n_layer + (i < n_slots % n_layer ? 1 : 0));
+                fill_ids = fill_order(il, n_expert);
                 fill_ids.resize(n);
-                for (int32_t e = 0; e < n; ++e) {
-                    fill_ids[e] = e;
-                }
+                // the plan copies runs of consecutive ids and slots: keep the chosen experts in id order
+                std::sort(fill_ids.begin(), fill_ids.end());
                 size_t n_hit = 0;
                 if (n == 0 || !g.lru.plan(il, fill_ids.data(), fill_ids.size(), fills, n_hit)) {
                     continue;
@@ -1420,6 +1442,7 @@ struct llama_moe_cache::impl {
             }
         }
         if (n_fill > 0) {
+            prefilled_dev = true;
             LLAMA_LOG_INFO("%s: MoE cache prefilled with %zu experts, %.2f MiB (LLAMA_MOE_CACHE_PREFILL=0 to disable)\n", __func__, n_fill, n_bytes/1024.0/1024.0);
         }
     }
@@ -1571,6 +1594,41 @@ struct llama_moe_cache::impl {
         }
         tier.m = this;
         wstore->set_tier(&tier);
+        // resident mode (the layout of Strata's --resident-experts): when the RAM tier and the device slots can hold every streamed
+        // expert (exclusive: RAM slots + device slots, inclusive: RAM slots), the device slots are prefilled at load (unless
+        // LLAMA_MOE_CACHE_PREFILL=0) and the RAM tier is filled from the model files with every expert the device does not hold, so no
+        // prompt or decode step reads the files afterwards. Low-RAM G4 (32 GiB RAM, 24 GB VRAM, Flash-Next IQ2_XS 68 GB, 2k prompt / decode):
+        // 55.7 / 43.1 tok/s filled on demand vs 164.1 / 62.2 resident (Strata resident 176.7 / 61.9), +45 s of load.
+        // Otherwise unchanged (the page-cache prefill below). LLAMA_MOE_RESIDENT=0 off, 1 forces it (fills what fits);
+        // an explicit LLAMA_MOE_HOST_CACHE_PREFILL also leaves it off (0, 1 as before, 2 = the file fill without the device prefill rule)
+        {
+            size_t n_streamed = 0;
+            size_t n_dev      = 0;
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                if (host_group[ig]) {
+                    n_streamed += groups[ig].layers.size()*(size_t) groups[ig].lru.n_expert;
+                    n_dev      += (size_t) groups[ig].n_slots;
+                }
+            }
+            const size_t n_hold = (size_t) host->n_slots() + (host->exclusive() ? n_dev : 0);
+            const char * e_res = getenv("LLAMA_MOE_RESIDENT");
+            const char * e_dp  = getenv("LLAMA_MOE_CACHE_PREFILL");
+            const int    m_res = e_res != nullptr ? atoi(e_res) : -1;
+            resident_mode = m_res != 0 && getenv("LLAMA_MOE_HOST_CACHE_PREFILL") == nullptr && n_streamed > 0 && (m_res >= 1 || n_hold >= n_streamed);
+            if (resident_mode) {
+                if (!prefilled_dev && (e_dp == nullptr || atoi(e_dp) != 0)) {
+                    prefill();
+                }
+                prefill_deferred = false;
+                LLAMA_LOG_INFO("%s: MoE cache resident mode: %zu RAM slots + %zu device slots hold the %zu streamed experts: device slots %s, "
+                        "the RAM tier is filled from the model files at load (LLAMA_MOE_RESIDENT=0 off)\n", __func__,
+                        (size_t) host->n_slots(), n_dev, n_streamed, prefilled_dev ? "prefilled" : "not prefilled (LLAMA_MOE_CACHE_PREFILL=0)");
+            } else if (m_res != 0 && getenv("LLAMA_MOE_HOST_CACHE_PREFILL") == nullptr) {
+                LLAMA_LOG_INFO("%s: MoE cache resident mode off: %zu RAM slots + %zu device slots hold %.1f%% of the %zu streamed experts "
+                        "(LLAMA_MOE_RESIDENT=1 forces it)\n", __func__, (size_t) host->n_slots(), host->exclusive() ? n_dev : 0,
+                        100.0*n_hold/n_streamed, n_streamed);
+            }
+        }
         prefill_resident();
         LLAMA_LOG_INFO("%s: MoE host cache on: %s, budget %.1f MiB (%s) for %.1f MiB of streamed experts (of %.1f MiB mapped), %.1f MiB in device slots, "
                 "the experts of %.1f tokens, MemAvailable %.1f MiB, pinned on first use (%s)%s (LLAMA_MOE_HOST_CACHE=0 off)\n", __func__,
@@ -1590,7 +1648,7 @@ struct llama_moe_cache::impl {
         // LLAMA_MOE_HOST_CACHE_PREFILL=2: also read the experts that are not in the page cache, layer by layer from the model files
         // (readahead of each layer's expert tensors first), skipping the experts the device slots hold: with the device cache prefilled
         // (LLAMA_MOE_CACHE_PREFILL=1) the first prompt then reads nothing from the files when RAM + VRAM hold every expert (low-RAM boxes)
-        const bool from_file = env_pf != nullptr && atoi(env_pf) >= 2;
+        const bool from_file = (env_pf != nullptr && atoi(env_pf) >= 2) || resident_mode;
         const int64_t t0 = ggml_time_us();
         size_t n_file = 0;
         const size_t pg = (size_t) std::max(4096L, sysconf(_SC_PAGESIZE));
@@ -1638,7 +1696,9 @@ struct llama_moe_cache::impl {
                         res[ip][e] = all;
                     }
                 }
-                for (int32_t e = 0; e < n_expert && !full; ++e) {
+                const std::vector<int32_t> order = fill_order(il, n_expert);
+                for (int32_t k = 0; k < n_expert && !full; ++k) {
+                    const int32_t e = order[k];
                     bool all = true;
                     for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                         all = all && res[ip][e];
