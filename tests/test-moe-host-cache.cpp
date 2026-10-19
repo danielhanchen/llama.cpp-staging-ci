@@ -136,6 +136,10 @@ static void test_decide() {
     }
     // exclusive: the budget is capped at the experts too (the spare slots keep copies of experts the device holds, the first to go)
     CHECK(decide(20000, 64000, -1, 1).budget == e + mib(64));
+    CHECK(decide(20000, 64000, -1, 1).spare);
+    // V16 / R29 (9.2 GiB of slots, 22.2 GiB budget) and V32 / R29 (25.6 GiB, 22.6 GiB): spare room only at V32
+    CHECK(!decide(9210.8, 29058.2).spare && decide(9210.8, 29058.2).policy == 1);
+    CHECK( decide(25598.0, 29039.9).spare && decide(25598.0, 29039.9).policy == 1);
     // no RAM to spare, off by 0 (also forced)
     CHECK(!decide(9000, 4000).on);                      // below the room: no budget
     CHECK( decide(9000, 5000).on && decide(9000, 5000).budget < mib(1024));
@@ -808,7 +812,9 @@ int main(int argc, char ** argv) {
     for (int big : { 0, 1 })
     for (int var : { 0, 1, 2 }) {
         const int pol = var == 1 ? LLAMA_MOE_HOST_INCLUSIVE : LLAMA_MOE_HOST_EXCLUSIVE;
-        const bool old_excl = var == 2;
+        // like llama_moe_cache: duplicates are kept only with spare room (RAM + device slots >= experts), else the old exclusive
+        const bool spare = (big ? 12 : 6) + 4 >= n_expert;
+        const bool old_excl = pol == LLAMA_MOE_HOST_EXCLUSIVE && (var == 2 || !spare);
         llama_weight_store_params p;
         p.io = LLAMA_WEIGHT_STREAM_IO_BUFFERED; p.n_threads = 2; p.ram_avail = (size_t) 1 << 30;
         llama_weight_store ws(ext, p);
@@ -980,9 +986,9 @@ int main(int argc, char ** argv) {
     // (this simulation has no prompt seeding: the old exclusive refilled RAM from the many evictions of a 4-slot device; at V32 / R29
     // the device evicts rarely and the old exclusive kept 23% RAM hits)
     CHECK(reads[0][0] < reads[0][1]);
-    CHECK(reads[0][0] <= reads[0][2] + reads[0][2]/10);
+    CHECK(reads[0][0] == reads[0][2]); // no spare room: the old exclusive
     CHECK(reads[1][0] < reads[1][1]);
-    CHECK(reads[1][0] <= reads[1][2] + reads[1][2]/10);
+    CHECK(reads[1][0] <= reads[1][2]);
 
     ggml_backend_buffer_free(dst_buf);
     ggml_backend_buffer_free(src_buf);

@@ -425,6 +425,10 @@ struct llama_moe_cache::impl {
     // --moe-host-cache-mib (-1 auto), LLAMA_MOE_HOST_CACHE=0 off, LLAMA_MOE_HOST_CACHE_POLICY=exclusive|inclusive
     std::unique_ptr<llama_moe_host_cache> host;
     std::vector<bool> host_group; // [group] served by the RAM tier (host lookups, never mapped for the device)
+    // exclusive with spare room (budget + device slots >= streamed experts): promoted experts keep their RAM copy as a duplicate (the
+    // first to go) and RAM misses fill free slots; without spare room promotions free the RAM slot and misses go to the device only
+    // (V16 / R29 and the T4 at R31: keeping duplicates there cost the prompts their RAM admissions, decode -53% / -32%)
+    bool host_spare = false;
     bool host_verify = false;     // LLAMA_WEIGHT_STREAM_VERIFY=1: every upload from the tier is compared with the mapping
     struct host_stats {
         uint64_t hits = 0, misses = 0;        // device misses of small batches (and refills) found / not found in RAM
@@ -1529,6 +1533,10 @@ struct llama_moe_cache::impl {
         }
         const size_t budget = plan.budget;
         const int    policy = plan.policy;
+        host_spare = policy == LLAMA_MOE_HOST_EXCLUSIVE && plan.spare;
+        if (const char * e = getenv("LLAMA_MOE_HOST_CACHE_SPARE"); e != nullptr) {
+            host_spare = policy == LLAMA_MOE_HOST_EXCLUSIVE && atoi(e) != 0;
+        }
         int32_t n_expert = 0;
         for (const group & g : groups) {
             n_expert = std::max<int32_t>(n_expert, (int32_t) g.ref[0]->ne[2]);
@@ -1566,7 +1574,7 @@ struct llama_moe_cache::impl {
         prefill_resident();
         LLAMA_LOG_INFO("%s: MoE host cache on: %s, budget %.1f MiB (%s) for %.1f MiB of streamed experts (of %.1f MiB mapped), %.1f MiB in device slots, "
                 "the experts of %.1f tokens, MemAvailable %.1f MiB, pinned on first use (%s)%s (LLAMA_MOE_HOST_CACHE=0 off)\n", __func__,
-                policy == LLAMA_MOE_HOST_EXCLUSIVE ? "exclusive" : "inclusive", budget/1048576.0, plan.why,
+                policy == LLAMA_MOE_HOST_EXCLUSIVE ? (host_spare ? "exclusive (spare room: duplicates kept)" : "exclusive") : "inclusive", budget/1048576.0, plan.why,
                 e_bytes/1048576.0, mapped/1048576.0, v_bytes/1048576.0, plan.tokens, avail/1048576.0,
                 host->describe().c_str(), host_verify ? ", VERIFY" : "");
     }
@@ -2175,15 +2183,19 @@ struct llama_moe_cache::impl {
                         ahead_key[s] = -1;
                     }
                     if (host->exclusive()) {
-                        // promoted: the copy stays in its slot as the first to go (a device eviction then needs no copy back)
-                        host->set_dup(s, true);
+                        if (host_spare) {
+                            // promoted: the copy stays in its slot as the first to go (a device eviction then needs no copy back)
+                            host->set_dup(s, true);
+                        } else {
+                            host->release(s);
+                        }
                         hst.promoted++;
                     }
                     continue;
                 }
                 hst.misses++;
-                // exclusive: into a free slot only (a copy of an expert the device is about to hold never evicts another)
-                const int32_t r = host->reserve(il, f.expert, !host->exclusive());
+                // exclusive with spare room: into a free slot only (a copy of an expert the device is about to hold never evicts another)
+                const int32_t r = !host->exclusive() ? host->reserve(il, f.expert) : host_spare ? host->reserve(il, f.expert, false) : -1;
                 if (r >= 0) {
                     for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                         const ggml_tensor * w = l.experts[ip];
@@ -4139,11 +4151,17 @@ struct llama_moe_cache::impl {
         if (sd.done == (1u << l.experts.size()) - 1) {
             stats_seed.misses += sd.fills.size();
             if (host_layer(sd.il) && host->exclusive()) {
-                // exclusive: promoted to the device, the RAM copies stay as the first to go
+                // exclusive: promoted to the device, the RAM copies go (spare room: they stay as the first to go); the uploads that read
+                // them are guarded by their events
                 for (const auto & f : sd.fills) {
-                    const int32_t h = host->held(sd.il, f.expert);
-                    if (h >= 0) {
-                        host->set_dup(h, true);
+                    if (host_spare) {
+                        const int32_t h = host->held(sd.il, f.expert);
+                        if (h >= 0) {
+                            host->set_dup(h, true);
+                            hst.promoted++;
+                        }
+                    } else if (host->contains(sd.il, f.expert)) {
+                        host->release_key(sd.il, f.expert);
                         hst.promoted++;
                     }
                 }

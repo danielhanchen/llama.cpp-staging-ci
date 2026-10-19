@@ -33,9 +33,11 @@ llama_moe_host_plan llama_moe_host_decide(size_t e_bytes, size_t v_bytes, size_t
     if (policy_env >= 0) {
         p.policy = policy_env;
     }
-    // no more than the experts it can hold; exclusive too: the copies of experts the device also holds are kept in the spare slots as the
+    p.spare = budget + v_bytes >= e_bytes;
+    // no more than the experts it can hold; exclusive with spare room too: the copies of experts the device also holds are kept as the
     // first to go (a capacity of only the experts the device does not hold left 17 GiB of RAM unused at V32 / R29: the prompt seeds
-    // the device, the RAM copies left, decode refilled few: 23% RAM hits, more disk bytes per token than without the tier)
+    // the device, the RAM copies left, decode refilled few: 23% RAM hits, more disk bytes per token than without the tier); without
+    // spare room the budget is below that cap anyway
     const size_t slack = (size_t) 64 << 20;
     budget = std::min(budget, e_bytes + slack);
     p.budget = budget;
@@ -303,8 +305,8 @@ int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict, u
         s = c.free_list.back();
         c.free_list.pop_back();
     }
-    // a duplicate of an expert the device holds goes first (newest first; the stale entries are pruned)
-    for (size_t i = c.dups.size(); s < 0 && allow_evict && i-- > 0; ) {
+    // a duplicate of an expert the device holds goes first, it is as good as a free slot (newest first; stale entries are pruned)
+    for (size_t i = c.dups.size(); s < 0 && i-- > 0; ) {
         const int32_t cand = c.dups[i];
         slot_t & sl = slots[cand];
         if (!sl.dup || (sl.state != SLOT_VALID && sl.state != SLOT_WRITING)) {

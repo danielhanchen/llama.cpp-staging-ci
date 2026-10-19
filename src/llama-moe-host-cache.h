@@ -34,6 +34,7 @@ struct llama_moe_host_plan {
     size_t      budget   = 0;
     int         policy   = 1;    // llama_moe_host_policy
     double      tokens   = 0.0;  // device slots / token_bytes
+    bool        spare    = false; // exclusive: the budget and the device slots together exceed the streamed experts (see set_dup)
     const char * why     = "";
 };
 
