@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -186,6 +187,64 @@ static void test_penalties(
     DUMP(&tester.cur_p);
 
     tester.check();
+}
+
+// the penalties on the whole vocabulary in token order (visits only the penalized tokens) == the lookup per candidate (any other
+// layout: reversed, truncated, sorted), on a 128k vocabulary with random logits and a 64-token window with repeats
+static void test_penalties_layouts() {
+    const int32_t n_vocab = 128000;
+    const int32_t last_n  = 64;
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> ul(-8.0f, 8.0f);
+    std::uniform_int_distribution<int32_t> ut(0, n_vocab - 1);
+
+    std::vector<float> logits(n_vocab);
+    for (auto & l : logits) {
+        l = ul(rng);
+    }
+    std::vector<llama_token> last;
+    for (int i = 0; i < 100; i++) {
+        last.push_back(i % 5 == 0 && !last.empty() ? last[ut(rng) % last.size()] : ut(rng));   // repeats + the window drops 36
+    }
+    last.push_back(n_vocab - 1);   // the last vocabulary entry
+
+    const float pen[3][3] = { { 1.05f, 0.0f, 0.0f }, { 1.3f, 0.2f, 0.1f }, { 0.9f, 0.0f, 0.5f } };
+    for (const auto & pp : pen) {
+        auto run = [&](std::vector<llama_token_data> data, bool sorted) {
+            llama_token_data_array cur_p = { data.data(), data.size(), -1, sorted };
+            auto * smpl = llama_sampler_init_penalties(n_vocab, last_n, pp[0], pp[1], pp[2]);
+            for (const auto t : last) {
+                llama_sampler_accept(smpl, t);
+            }
+            llama_sampler_apply(smpl, &cur_p);
+            llama_sampler_free(smpl);
+            std::vector<float> by_id(n_vocab, NAN);
+            for (size_t i = 0; i < cur_p.size; i++) {
+                by_id[cur_p.data[i].id] = cur_p.data[i].logit;
+            }
+            return by_id;
+        };
+
+        std::vector<llama_token_data> ident(n_vocab);
+        for (int32_t i = 0; i < n_vocab; i++) {
+            ident[i] = { i, logits[i], 0.0f };
+        }
+        std::vector<llama_token_data> rev(ident.rbegin(), ident.rend());
+        std::vector<llama_token_data> part(ident.begin(), ident.begin() + n_vocab / 2);
+
+        const auto a = run(ident, false);    // direct
+        const auto b = run(rev, false);      // lookup per candidate
+        const auto c = run(ident, true);     // sorted flag: lookup per candidate
+        const auto d = run(part, false);     // penalized tokens past the end: lookup per candidate
+        int n_changed = 0;
+        for (int32_t i = 0; i < n_vocab; i++) {
+            GGML_ASSERT(a[i] == b[i] && a[i] == c[i]);
+            GGML_ASSERT(i >= n_vocab / 2 || a[i] == d[i]);
+            n_changed += a[i] != logits[i];
+        }
+        GGML_ASSERT(n_changed > 0 && n_changed <= last_n);
+        printf("test_penalties_layouts: penalties %.2f %.2f %.2f: %d tokens penalized, layouts agree\n", pp[0], pp[1], pp[2], n_changed);
+    }
 }
 
 static void test_dry(
@@ -376,6 +435,8 @@ int main(void) {
 
     test_typical({0.97f, 0.01f, 0.01f, 0.01f}, {0.97f},            0.5f);
     test_typical({0.4f, 0.2f, 0.2f, 0.2f},     {0.2f, 0.2f, 0.2f}, 0.5f);
+
+    test_penalties_layouts();
 
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0}, {0, 0.25f, 0.25f, 0.25f, 0.25f},   50.0f, 0.0f, 0.0f);
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2}, {0, 0, 0, 0.5f, 0.5f},       50.0f, 0.0f, 0.0f);

@@ -2960,26 +2960,53 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
         return;
     }
 
-    // Apply frequency and presence penalties to the cur_p
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
-        if (token_iter == ctx->token_count.end()) {
-            continue;
-        }
-
-        const int count = token_iter->second;
-
+    const auto apply = [ctx](llama_token_data & td, int count) {
         assert(count > 0 && count <= ctx->penalty_last_n);
 
         // The academic publication that described this technique actually just only divided, but that would cause tokens with negative logits to become more likely, which is obviously wrong.
         // This is common fix for this problem, which is to multiply by the penalty instead of dividing.
-        if (cur_p->data[i].logit <= 0) {
-            cur_p->data[i].logit *= ctx->penalty_repeat;
+        if (td.logit <= 0) {
+            td.logit *= ctx->penalty_repeat;
         } else {
-            cur_p->data[i].logit /= ctx->penalty_repeat;
+            td.logit /= ctx->penalty_repeat;
         }
 
-        cur_p->data[i].logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+        td.logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+    };
+
+    // the candidates of a fresh sampling step are the whole vocabulary in token order (cur_p->data[id].id == id): then only the
+    // (at most penalty_last_n) penalized tokens are visited, instead of a hash lookup per vocabulary entry (128k lookups per token
+    // cost about 0.3 ms of host time per generated token on a 128k vocab, about 10% of the decode of a small MoE on a fast GPU)
+    // LLAMA_SAMPLER_PENALTIES_DIRECT=0: the lookup per candidate, as before
+    static const bool direct_ok = [] {
+        const char * env = getenv("LLAMA_SAMPLER_PENALTIES_DIRECT");
+        return env == nullptr || atoi(env) != 0;
+    }();
+
+    bool direct = direct_ok && !cur_p->sorted && cur_p->size > 0;
+    if (direct) {
+        for (const auto & [token, count] : ctx->token_count) {
+            if (token < 0 || (size_t) token >= cur_p->size || cur_p->data[token].id != token) {
+                direct = false;
+                break;
+            }
+        }
+    }
+
+    if (direct) {
+        for (const auto & [token, count] : ctx->token_count) {
+            apply(cur_p->data[token], count);
+        }
+    } else {
+        // Apply frequency and presence penalties to the cur_p
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
+            if (token_iter == ctx->token_count.end()) {
+                continue;
+            }
+
+            apply(cur_p->data[i], token_iter->second);
+        }
     }
 
     cur_p->sorted = false;
