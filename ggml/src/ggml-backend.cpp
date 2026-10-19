@@ -3673,6 +3673,34 @@ static bool ggml_backend_sched_prefetch_headroom_ok(ggml_backend_sched_t sched) 
     return true;
 }
 
+// a starting depth above the default (ggml_backend_sched_set_prefetch_depth_init, no adaptive step taken yet) whose arena, with the graph
+// buffers reserved next to it, leaves less than the prefetch headroom free on a device. ggml_backend_sched_prefetch_headroom_ok skips the
+// check while a lender is set, also when it lends nothing, and the memory fit measures the arena at the default depth: L4 (22.5 GB),
+// Qwen3.8-Flash-Next UD-IQ1_S + MTP drafter, --fit on -c 16384: depth 3 took 1350 MiB (lending off), 16 MiB stayed free and the first
+// request failed to allocate the cuBLAS workspace (out of memory); depth 2 (656 MiB) left 710 MiB
+static bool ggml_backend_sched_prefetch_depth_init_short(ggml_backend_sched_t sched) {
+    if (sched->pf_depth <= sched->pf_depth0 || sched->pf_adapt_from > 0 || sched->pf_headroom == 0) {
+        return false;
+    }
+    for (int b = 0; b < sched->n_backends; b++) {
+        const struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+        ggml_backend_dev_t dev = sched->backends[b]->device;
+        if (pf->arena == NULL || pf->depth <= sched->pf_depth0 || dev == NULL || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        size_t free  = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        if (total > 0 && free < sched->pf_headroom) {
+            GGML_LOG_INFO("%s: %s: %.2f MiB free after %.2f MiB of staging memory at depth %d, less than %.0f MiB of headroom: starting at depth %d\n",
+                __func__, ggml_backend_name(sched->backends[b]), free/1024.0/1024.0, pf->arena_size/1024.0/1024.0, pf->depth,
+                sched->pf_headroom/1024.0/1024.0, sched->pf_depth0);
+            return true;
+        }
+    }
+    return false;
+}
+
 // the graph allocator failed with the staging arenas allocated: unbind the copies, free the arenas and disable prefetch, so the allocation can retry with that memory
 // returns false if nothing was freed
 static bool ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched) {
@@ -4561,6 +4589,24 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
             !ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
             return false;
         }
+    } else if (ggml_backend_sched_prefetch_depth_init_short(sched)) {
+        // the starting depth raised by ggml_backend_sched_set_prefetch_depth_init leaves less than the headroom: start at the default
+        // depth, whose smaller arena is what the memory fit measured
+        sched->pf_depth = sched->pf_depth0;
+        ggml_backend_sched_prefetch_sync(sched);
+        for (int b = 0; b < sched->n_backends; b++) {
+            struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+            if (pf->arena != NULL) {
+                ggml_backend_buffer_free(pf->arena);
+                pf->arena      = NULL;
+                pf->arena_size = 0;
+            }
+        }
+        // split and bind again from fresh tensor copies (the bound copies of this graph hold arena addresses); the depth is now the
+        // default, so this does not come back here
+        sched->pf_check = false;
+        ggml_backend_sched_reset(sched);
+        return ggml_backend_sched_reserve(sched, measure_graph);
     }
     sched->pf_check = false;
 
