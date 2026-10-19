@@ -408,6 +408,11 @@ size_t ggml_backend_get_max_size(ggml_backend_t backend) {
 void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
+    // like ggml_backend_tensor_set: nothing to copy (an empty graph input, e.g. a recurrent state copy list of 0 rows);
+    // Metal cannot wrap a 0-byte host range (newBufferWithBytes returns nil -> GGML_ASSERT(buf_src))
+    if (size == 0) {
+        return;
+    }
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
 
@@ -422,6 +427,9 @@ void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * 
 void ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
+    if (size == 0) {
+        return;
+    }
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
 
@@ -3988,6 +3996,11 @@ static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, st
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+    // GGML_SCHED_ASYNC_UPLOAD=0: every host input takes the synchronous copy below (the upstream path)
+    static const bool async_upload = getenv("GGML_SCHED_ASYNC_UPLOAD") == NULL || atoi(getenv("GGML_SCHED_ASYNC_UPLOAD")) != 0;
+    if (!async_upload) {
+        return false;
+    }
     if (sched->events[split_backend_id][sched->cur_copy] != NULL || split_backend->iface.set_tensor_async == NULL) {
         return false;
     }
