@@ -2038,7 +2038,30 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (moe_cache) {
             moe_cache->set_graph(gf);
         }
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        bool alloc_ok = ggml_backend_sched_alloc_graph(sched.get(), gf);
+        // a prompt ubatch with outputs whose graph the MoE cache would lend but cannot (its narrowed last layer reads the cache banks on
+        // the host): built again with that layer at full width, so the cache lends its allocation (see llm_graph_context::crop_full_last)
+        static const int full_last_env = getenv("LLAMA_MOE_LEND_FULL_LAST") != nullptr ? atoi(getenv("LLAMA_MOE_LEND_FULL_LAST")) : 1;
+        if (!alloc_ok && full_last_env == 1 && !moe_full_last && moe_cache && n_outputs > 0 && (uint32_t) n_outputs < ubatch.n_tokens &&
+                moe_cache->lends_graph_to(ubatch.n_tokens)) {
+            LLAMA_LOG_WARN("%s: a lent prompt graph of %u tokens with %d outputs did not allocate: built again with the last layer at full width "
+                "so the MoE cache lends its allocation (from now on; LLAMA_MOE_LEND_FULL_LAST=0 to disable)\n", __func__, ubatch.n_tokens, n_outputs);
+            moe_full_last = true;
+            res->reset();
+            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+            gf = model.build_graph(graph_params(res, ubatch, mctx, gtype));
+            if (gf && cparams.batch_invariant) {
+                for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                    ggml_graph_node(gf, i)->flags |= GGML_TENSOR_FLAG_BATCH_INVARIANT;
+                }
+            }
+            if (gf && moe_cache) {
+                moe_cache->set_graph(gf);
+            }
+            alloc_ok = gf != nullptr && ggml_backend_sched_alloc_graph(sched.get(), gf);
+        }
+        if (!alloc_ok) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -3344,6 +3367,7 @@ llm_graph_params llama_context::graph_params(
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
+        /*.moe_full_last =*/ moe_full_last || (getenv("LLAMA_MOE_LEND_FULL_LAST") != nullptr && atoi(getenv("LLAMA_MOE_LEND_FULL_LAST")) >= 2),
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };

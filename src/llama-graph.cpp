@@ -1570,8 +1570,7 @@ void llm_graph_result::set_params(const llm_graph_params & params) {
 //
 
 bool llm_graph_context::crop_full_last() const {
-    static const bool on = getenv("LLAMA_MOE_LEND_FULL_LAST") == nullptr || atoi(getenv("LLAMA_MOE_LEND_FULL_LAST")) != 0;
-    return on && moe_cache != nullptr && n_outputs > 0 && (int64_t) n_outputs < (int64_t) n_tokens && moe_cache->lends_graph_to(n_tokens);
+    return moe_full_last && moe_cache != nullptr && n_outputs > 0 && (int64_t) n_outputs < (int64_t) n_tokens && moe_cache->lends_graph_to(n_tokens);
 }
 
 llm_graph_context::llm_graph_context(const llm_graph_params & params) :
@@ -1602,6 +1601,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     norm_rms_eps     (hparams.f_norm_rms_eps),
     n_tokens         (ubatch.n_tokens),
     n_outputs        (params.n_outputs),
+    moe_full_last    (params.moe_full_last),
     n_ctx_orig       (cparams.n_ctx_orig_yarn),
     pooling_type     (cparams.pooling_type),
     rope_type        (hparams.rope_type),

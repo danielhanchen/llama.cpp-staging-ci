@@ -495,6 +495,9 @@ private:
     bool moe_cache_devseed_on   = false; // LLAMA_MOE_CACHE_DEVSEED: prefetched ubatches seed the cache on the device (see llama_moe_cache::devseed_plan)
     bool moe_cache_devseed      = false; // the ubatch being computed seeds on the device
     bool moe_cache_devseed_graph = false; // the graph last built had its seed plans enabled
+    // set once a lent prompt graph with outputs failed to allocate: such graphs keep their last layer at full width from then on (see
+    // llm_graph_context::crop_full_last; LLAMA_MOE_LEND_FULL_LAST=0 never, 2 from the start)
+    bool moe_full_last = false;
     bool moe_cache_seed_fits    = true;  // the graph of a prefetched ubatch that seeds from its own ids was reserved (see sched_reserve_seed)
 
     // device memory kept free for a model or context created after this one, per backend (llama_context_params::mem_reserve); only
