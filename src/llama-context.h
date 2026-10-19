@@ -72,6 +72,10 @@ struct llama_context {
 
     void synchronize();
 
+    // synchronize() unless nothing was queued since the last one (see sync_pending): the output getters call this, so that
+    // reading several outputs of one decode costs one stream synchronization instead of one per getter (LLAMA_SYNC_SKIP=0: always)
+    void synchronize_outputs();
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -183,6 +187,9 @@ struct llama_context {
 
     // wait until the last asynchronous state save has reached its destination
     void state_async_wait();
+
+    // set when backend work is queued (graph_compute, async state copies), cleared by synchronize()
+    bool sync_pending = true;
 
     // allocate the staging buffers of asynchronous saves with these flags up front (see llama_state_seq_reserve_async)
     size_t state_async_reserve(llama_state_seq_flags flags);

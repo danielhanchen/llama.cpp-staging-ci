@@ -1313,9 +1313,25 @@ bool llama_context::sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint3
     return true;
 }
 
+static bool llama_sync_skip_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_SYNC_SKIP");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+void llama_context::synchronize_outputs() {
+    if (!sync_pending && llama_sync_skip_enabled()) {
+        return;
+    }
+    synchronize();
+}
+
 void llama_context::synchronize() {
     if (!sched) {
         state_async_wait();
+        sync_pending = false;
         return;
     }
 
@@ -1348,6 +1364,8 @@ void llama_context::synchronize() {
 
     n_queued_tokens = 0;
     t_compute_start_us = 0;
+
+    sync_pending = false;
 }
 
 const llama_model & llama_context::get_model() const {
@@ -3486,6 +3504,8 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
 
+    sync_pending = true;
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -5043,6 +5063,8 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
         return;
     }
 
+    sync_pending = true;
+
     state_async_worker = std::thread([jobs = std::move(jobs), events = std::move(events), retired = std::move(retired)]() mutable {
         for (auto * ev : events) {
             ggml_backend_event_synchronize(ev);
@@ -5648,13 +5670,13 @@ void llama_synchronize(llama_context * ctx) {
 }
 
 float * llama_get_logits(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_logits();
 }
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     float * res = nullptr;
 
@@ -5668,19 +5690,19 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
 }
 
 float * llama_get_embeddings(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings();
 }
 
 float * llama_get_embeddings_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings_ith(i);
 }
 
 float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings_seq(seq_id);
 }
@@ -5714,19 +5736,19 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings_nextn();
 }
 
 float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings_nextn_ith(i);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings_layer_inp(lid);
 }
@@ -5736,43 +5758,43 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_sampled_token_ith(i);
 }
 
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_sampled_probs_ith(i);
 }
 
 float * llama_get_sampled_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_sampled_logits_ith(i);
 }
 
 llama_token * llama_get_sampled_candidates_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return const_cast<llama_token *>(ctx->get_sampled_candidates_ith(i));
 }
 
 uint32_t llama_get_sampled_candidates_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return static_cast<uint32_t>(ctx->get_sampled_candidates_count(i));
 }
 
 uint32_t llama_get_sampled_logits_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return static_cast<uint32_t>(ctx->get_sampled_logits_count(i));
 }
 
 uint32_t llama_get_sampled_probs_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
 }
@@ -6073,6 +6095,7 @@ int32_t llama_encode(
         llama_context * ctx,
           llama_batch   batch) {
     const int ret = ctx->encode(batch);
+    ctx->sync_pending = true; // the output copies queued after the last graph may still run
     if (ret != 0) {
         LLAMA_LOG_ERROR("%s: failed to encode, ret = %d\n", __func__, ret);
     }
@@ -6084,6 +6107,7 @@ int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
     const int ret = ctx->decode(batch);
+    ctx->sync_pending = true; // the output copies queued after the last graph may still run
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }
@@ -6158,11 +6182,13 @@ void llama_opt_epoch(
 }
 
 int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_ext * batch) {
+    int32_t ret = -1;
     switch (type) {
-        case LLAMA_PROCESS_TYPE_ENCODE: return ctx->encode(*batch);
-        case LLAMA_PROCESS_TYPE_DECODE: return ctx->decode(*batch);
+        case LLAMA_PROCESS_TYPE_ENCODE: ret = ctx->encode(*batch); break;
+        case LLAMA_PROCESS_TYPE_DECODE: ret = ctx->decode(*batch); break;
     }
-    return -1;
+    ctx->sync_pending = true; // the output copies queued after the last graph may still run
+    return ret;
 }
 
 //
