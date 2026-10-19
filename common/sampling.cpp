@@ -508,6 +508,11 @@ struct common_sampler * common_sampler_init(
         /* .cur_p   = */ {},
         // mix it, the chain and the draft are seeded from this one too
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
+        /* .greedy_fast = */ false,
+        /* .bias_dense  = */ {},
+        /* .bias_sparse = */ {},
+        /* .bias_saved  = */ {},
+        /* .row         = */ {},
     };
 
     result->greedy_fast = common_sampler_greedy_fast(params, grmr, rbudget);
