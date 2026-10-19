@@ -19,6 +19,29 @@
 #include <cstring>
 #include <vector>
 
+#ifdef _WIN32
+// POSIX environment helpers for the MSVC CRT (getenv sees _putenv_s; an empty value removes the variable)
+static int setenv(const char * name, const char * value, int /*overwrite*/) { return _putenv_s(name, value); }
+static int unsetenv(const char * name) { return _putenv_s(name, ""); }
+#endif
+
+// aligned host memory for the mock device buffers
+static void * aligned_alloc_mock(size_t align, size_t size) {
+#ifdef _WIN32
+    return _aligned_malloc(size, align);
+#else
+    void * mem = NULL;
+    return posix_memalign(&mem, align, size) == 0 ? mem : NULL;
+#endif
+}
+static void aligned_free_mock(void * mem) {
+#ifdef _WIN32
+    _aligned_free(mem);
+#else
+    free(mem);
+#endif
+}
+
 //
 // mock "GPU" device: host memory behind a non-host buffer type, a capacity, events that do nothing (everything is synchronous)
 //
@@ -42,7 +65,7 @@ static const size_t k_align = 64;
 static void mock_buffer_free(ggml_backend_buffer_t buffer) {
     mock_buffer_ctx * bc = (mock_buffer_ctx *) buffer->context;
     g_dev_ctx.used -= bc->size;
-    free(bc->mem);
+    aligned_free_mock(bc->mem);
     delete bc;
 }
 static void * mock_buffer_get_base(ggml_backend_buffer_t buffer) {
@@ -86,8 +109,8 @@ static ggml_backend_buffer_t mock_buft_alloc_buffer(ggml_backend_buffer_type_t b
         fprintf(stderr, "mock: allocating %zu bytes: out of device memory (%zu of %zu used)\n", size, g_dev_ctx.used, g_dev_ctx.cap);
         return NULL;
     }
-    void * mem = NULL;
-    if (posix_memalign(&mem, k_align, std::max<size_t>(size, k_align)) != 0) {
+    void * mem = aligned_alloc_mock(k_align, std::max<size_t>(size, k_align));
+    if (mem == NULL) {
         return NULL;
     }
     g_dev_ctx.used += size;

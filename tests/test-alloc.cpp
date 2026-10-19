@@ -9,6 +9,12 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+
+#ifdef _WIN32
+// POSIX environment helpers for the MSVC CRT (getenv sees _putenv_s; an empty value removes the variable)
+static int setenv(const char * name, const char * value, int /*overwrite*/) { return _putenv_s(name, value); }
+static int unsetenv(const char * name) { return _putenv_s(name, ""); }
+#endif
 #include <memory>
 #include <vector>
 
