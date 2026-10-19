@@ -1656,9 +1656,13 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         }
     }
 #endif
+    // strata-gap: with speculative decoding too (LLAMA_MOE_SPILL_LEND_SPEC=0 restores the k6 gate). B200 ballasted to 32 GB, Flash-Next
+    // UD-IQ4_XS + Q4_K_M MTP drafter: the spec gate left the prompt at n_ubatch 2048, four expert passes per 8k prompt (169 GB H2D vs
+    // Strata's 41 GB, 8k prompt 1630 vs 4566 tok/s); see plans/strata_gap_profile.md
+    static const bool spill_lend_spec = getenv("LLAMA_MOE_SPILL_LEND_SPEC") == nullptr || atoi(getenv("LLAMA_MOE_SPILL_LEND_SPEC")) != 0;
     const bool spill_lend = env_l == nullptr && !rule_frac && have_sb && cache_ref < all_experts &&
         (double) cache_ref <= spill_lend_max_frac*(double) sb.total &&
-        (spill_lend_mode >= 2 || (spill_lend_mode == 1 && !has_spec && spill_lend_ram)) &&
+        (spill_lend_mode >= 2 || (spill_lend_mode == 1 && (!has_spec || spill_lend_spec) && spill_lend_ram)) &&
         !(getenv("LLAMA_MOE_PREFILL_UB_SPILL") != nullptr && atoi(getenv("LLAMA_MOE_PREFILL_UB_SPILL")) != 0);
     bool lend_graph = ((env_l != nullptr && atoi(env_l) == 2) || spill_lend) && force <= 0 && m_def.n_dev == 1 && have_sb;
     double lend_frac = 0.85;
