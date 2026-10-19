@@ -4224,7 +4224,14 @@ private:
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            // layer-major prompts (LLAMA_MOE_LAYER_MAJOR=1) read a whole batch of ubatches in one expert pass: a checkpoint one
+                            // ubatch before the end would cost that ubatch a pass of its own, so it goes one batch before the end
+                            // (LLAMA_MOE_LAYER_MAJOR_CKPT=0 keeps it one ubatch before; LLAMA_SERVER_CKPT_BATCH=1 moves it without layer-major
+                            // prompts, for an A/B with the same batches)
+                            static const bool lm = (getenv("LLAMA_MOE_LAYER_MAJOR") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR")) != 0 &&
+                                (getenv("LLAMA_MOE_LAYER_MAJOR_CKPT") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_CKPT")) != 0)) ||
+                                (getenv("LLAMA_SERVER_CKPT_BATCH") != nullptr && atoi(getenv("LLAMA_SERVER_CKPT_BATCH")) != 0);
+                            const int checkpoint_offsets[] = {4 + (lm ? n_batch : n_ubatch), 4};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
