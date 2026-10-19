@@ -1103,8 +1103,10 @@ struct llm_graph_context {
     // and narrows to the output rows after it: narrowed, the last layer's experts are looked up on the host, which reads the cache banks
     // as weights, and the cache then lends nothing to the graph, which allocates on its own and fails on a full device (G4 at 32 GB,
     // Flash-Next, --ctx-checkpoints 0: "allocating 1352.53 MiB ... cudaMalloc failed" on the first request; with checkpoints the
-    // prompt ubatches carry no outputs). Only after such a graph failed to allocate (llama_context::process_ubatch retries it this way,
-    // moe_full_last): where the unlent graph fits, the run is the one before. LLAMA_MOE_LEND_FULL_LAST=0 never, 2 always
+    // prompt ubatches carry no outputs). LLAMA_MOE_LEND_FULL_LAST unset or 2: always; 1: only after such a graph failed to allocate
+    // (llama_context::process_ubatch retries it, moe_full_last; this does not catch the Flash-Next case, whose warm-up already turned the
+    // host weight prefetch off when its staging copies could not be lent); 0: never. Costs where the unlent graph fits (Qwen3.6-35B-A3B
+    // UD-Q4_K_XL at 12 GB, --ctx-checkpoints 0): 2k prompt 7185 -> 8905 tok/s, decode after it 174.0 -> 170.5, 101-token prompt 424 -> 377
     bool moe_full_last;
     bool crop_full_last() const;
 

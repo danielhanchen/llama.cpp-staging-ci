@@ -3367,7 +3367,7 @@ llm_graph_params llama_context::graph_params(
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
-        /*.moe_full_last =*/ moe_full_last || (getenv("LLAMA_MOE_LEND_FULL_LAST") != nullptr && atoi(getenv("LLAMA_MOE_LEND_FULL_LAST")) >= 2),
+        /*.moe_full_last =*/ moe_full_last || getenv("LLAMA_MOE_LEND_FULL_LAST") == nullptr || atoi(getenv("LLAMA_MOE_LEND_FULL_LAST")) >= 2,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
