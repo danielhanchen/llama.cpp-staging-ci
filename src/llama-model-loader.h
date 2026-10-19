@@ -172,6 +172,9 @@ struct llama_model_loader {
     int64_t experts_pin_budget   = -1; // bytes; -1: not decided yet
     bool pin_expert(size_t nbytes);
     int64_t experts_pin_avail = -1; // MemAvailable when the pinning started (bytes), -1: unknown
+    int     experts_pin_mode  = -1; // LLAMA_MOE_PIN_EXPERTS, -1: unset (auto)
+    std::string experts_pin_why;    // the auto budget's inputs (log)
+    int64_t pin_auto_budget(int64_t avail, int64_t total, std::string & why) const;
 
     // file ranges of the pinned experts and of the tensors that stay mapped, see settle_pinned_cache
     struct pinned_range {

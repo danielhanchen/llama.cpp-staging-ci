@@ -5,9 +5,11 @@
 #include "gguf.h"
 #include "llama-hparams.h"
 #include "llama.h"
+#include "llama-sysmem.h"
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -1415,7 +1417,12 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
     if (n_experts_pinned > 0) {
         LLAMA_LOG_INFO("%s: %zu expert tensors (%.2f MiB) in pinned host memory instead of the mapped file: prompt batches upload them to the GPU "
-            "(LLAMA_MOE_PIN_EXPERTS=1)\n", __func__, n_experts_pinned, experts_pinned_bytes/1024.0/1024.0);
+            "(%s%s%s)\n", __func__, n_experts_pinned, experts_pinned_bytes/1024.0/1024.0,
+            experts_pin_mode < 0 ? "auto, " : "LLAMA_MOE_PIN_EXPERTS set", experts_pin_mode < 0 ? experts_pin_why.c_str() : "",
+            experts_pin_mode < 0 ? "; LLAMA_MOE_PIN_EXPERTS=0 off" : "");
+    } else if (experts_pin_mode < 0 && experts_pin_budget >= 0) {
+        LLAMA_LOG_INFO("%s: host experts stay mapped: the auto pin budget is %.0f MiB (%s; LLAMA_MOE_PIN_EXPERTS=1 or 2 forces pinning)\n", __func__,
+            experts_pin_budget/1048576.0, experts_pin_why.c_str());
     }
     if (n_tensors_moved > 0) {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",
@@ -1906,14 +1913,74 @@ void llama_model_loader::print_info() const {
 // opt-in (it reads the experts at load instead of mapping them, ~9 s more for Flash-Next IQ4_XS, and pins up to the budget; the gain
 // was measured with the model in a tmpfs). On a Kaggle T4 (31 GB RAM) Qwen3.6-35B-A3B UD-Q5_K_XL with 22.7 GB pinned read prompts
 // 5-10% slower: the load evicts the tensors that stay mapped (see settle_pinned_cache).
-// LLAMA_MOE_PIN_EXPERTS unset or 0: never; 1: Linux only, budget MemAvailable - max(4 GiB, 10% of MemTotal) (read once per load);
-// 2: always, without the RAM check
+// LLAMA_MOE_PIN_EXPERTS=0: never; 1: Linux only, budget MemAvailable - max(4 GiB, 10% of MemTotal) (read once per load);
+// 2: always, without the RAM check; unset: auto, see pin_auto_budget
+// whether the kernel is WSL's (its pinned memory is backed by the Windows host, which caps and pages it: auto stays off there)
+static bool llama_is_wsl() {
+#if defined(__linux__)
+    FILE * f = fopen("/proc/sys/kernel/osrelease", "r");
+    if (f == nullptr) {
+        return false;
+    }
+    char buf[256] = {};
+    const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    std::string r(buf, n);
+    std::transform(r.begin(), r.end(), r.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+    return r.find("microsoft") != std::string::npos || r.find("wsl") != std::string::npos;
+#else
+    return false;
+#endif
+}
+
+// auto pinning (LLAMA_MOE_PIN_EXPERTS unset): pinned host experts upload ~20% faster than the registered mapping (G4, Flash-Next
+// UD-IQ4_XS at 32 GB, MTP off: 2k / 8k prompt +13% / +6%, decode +6% / +7%, output identical; H2D 46-49 -> 55-57 GB/s), but the pinned
+// copy is not reclaimable while the page cache still serves the rest of the files: on a Kaggle T4 (31 GB RAM) 22.7 GB pinned beside a
+// 26 GB file made prompts 5-10% slower (the load evicted the mapped tensors, see settle_pinned_cache), and a low-RAM box needs that RAM
+// for the MoE RAM tier. So auto pins only where the pinned experts and every model file outside tmpfs fit in the memory left after a
+// reserve, with avail = MemAvailable capped by the cgroup limits (llama_sysmem::available):
+//   budget = min(avail - max(4 GiB, 10% of MemTotal), LLAMA_MOE_PIN_AUTO_FRAC (0.75) * avail) - file bytes outside tmpfs
+// (the 0.75 keeps the mapped rest below the 80% at which the weight stream and its RAM tier turn on). Off on WSL, without Linux, and
+// with the weight stream forced (LLAMA_WEIGHT_STREAM != 0): the RAM tier then owns the host memory. Experts past the budget stay mapped.
+int64_t llama_model_loader::pin_auto_budget(int64_t avail, int64_t total, std::string & why) const {
+    if (llama_is_wsl()) {
+        why = "WSL";
+        return 0;
+    }
+    if (const char * e = getenv("LLAMA_WEIGHT_STREAM"); e != nullptr && atoi(e) != 0) {
+        why = "the weight stream is forced on (its RAM tier owns the host memory)";
+        return 0;
+    }
+    int64_t file_bytes = 0;
+#if defined(__linux__)
+    for (const auto & file : files) {
+        struct statfs sfs;
+        const bool in_tmpfs = fstatfs(file->file_id(), &sfs) == 0 && (unsigned long) sfs.f_type == 0x01021994UL; // TMPFS_MAGIC
+        if (!in_tmpfs) {
+            file_bytes += (int64_t) file->size();
+        }
+    }
+#endif
+    double frac = 0.75;
+    if (const char * e = getenv("LLAMA_MOE_PIN_AUTO_FRAC")) {
+        frac = std::max(0.0, std::min(1.0, atof(e)));
+    }
+    const int64_t reserve = std::max<int64_t>((int64_t) 4 << 30, total/10);
+    const int64_t budget  = std::min<int64_t>(avail - reserve, (int64_t) (frac*(double) avail)) - file_bytes;
+    char buf[256];
+    snprintf(buf, sizeof(buf), "available %.0f MiB, reserve %.0f MiB, %.0f%% cap, model files outside tmpfs %.0f MiB",
+        avail/1048576.0, reserve/1048576.0, 100.0*frac, file_bytes/1048576.0);
+    why = buf;
+    return std::max<int64_t>(0, budget);
+}
+
 bool llama_model_loader::pin_expert(size_t nbytes) {
     if (experts_pin_budget < 0) {
         experts_pin_budget = 0;
         const char * env = getenv("LLAMA_MOE_PIN_EXPERTS");
-        const int mode = env != nullptr ? atoi(env) : 0;
-        if (mode == 1 || mode == 2) {
+        const int mode = env != nullptr ? atoi(env) : -1;
+        experts_pin_mode = mode;
+        if (mode == 1 || mode == 2 || mode < 0) {
 #if defined(__linux__)
             FILE * f = fopen("/proc/meminfo", "r");
             if (f != nullptr) {
@@ -1934,12 +2001,19 @@ bool llama_model_loader::pin_expert(size_t nbytes) {
                     if (mode == 1) {
                         const int64_t reserve = std::max<int64_t>((int64_t) 4 << 30, total/10);
                         experts_pin_budget = std::max<int64_t>(0, avail - reserve);
+                    } else if (mode < 0) {
+                        const uint64_t sys = llama_sysmem::available();
+                        const int64_t  av  = sys > 0 ? std::min<int64_t>(avail, (int64_t) std::min<uint64_t>(sys, (uint64_t) INT64_MAX)) : avail;
+                        experts_pin_budget = pin_auto_budget(av, total, experts_pin_why);
                     }
                 }
             }
 #endif
             if (mode == 2) {
                 experts_pin_budget = INT64_MAX;
+            }
+            if (mode < 0 && experts_pin_why.empty()) {
+                experts_pin_why = "MemAvailable unknown (auto pins on Linux only)";
             }
         }
     }
