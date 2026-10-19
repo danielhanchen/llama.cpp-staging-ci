@@ -973,36 +973,18 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     if (moe_cache) {
         ggml_backend_sched_set_lend_callback(sched.get(), sched_lend, this);
     }
-    // spilled experts (the MoE cache holds less than the host experts): every prompt ubatch uploads the experts the cache misses in
-    // every layer, and with the staging in lent cache slots the adaptive depth never steps past 2. Copies of 3 splits in flight hide
-    // them better: G4 (RTX PRO 6000) at 32 GB, Qwen3.8-Flash-Next UD-IQ4_XS, 2 reps: 2k prompt 1857 -> 1925 tok/s, 8k at n_ubatch 8192
-    // 3951 -> 4290 (3583 -> 3927 with LLAMA_MOE_CACHE_LEND=2), decode unchanged. LLAMA_MOE_PREFETCH_DEPTH_SPILL=N sets the depth
-    // (0 = the scheduler default); GGML_SCHED_PREFETCH_DEPTH still wins
-    // (not for a tiny cache, the experts of fewer than 4 tokens: its slots are too few to lend a deeper staging)
-    // and, like the spill lending (common_moe_cache_auto_ubatch), only while the host experts the cache cannot hold are at most
-    // LLAMA_MOE_PREFETCH_DEPTH_SPILL_MAX_RAM_FRAC (0.5) of the RAM (MemTotal, Linux): there the deeper staging reads more of them per
-    // ubatch than the page cache keeps, so they come from the disk again (L4 24 GB, 52 GB RAM, Flash-Next UD-IQ4_XS: 2k decode 13.2 ->
-    // 10.2 tok/s with depth 3, host-RAM misses 2536 -> 3529); an explicit LLAMA_MOE_PREFETCH_DEPTH_SPILL skips the RAM check
+    // spilled experts (the MoE cache holds less than the host experts): LLAMA_MOE_PREFETCH_DEPTH_SPILL=N starts the host weight
+    // prefetch at depth N (GGML_SCHED_PREFETCH_DEPTH still wins; not for a tiny cache, the experts of fewer than 4 tokens: its
+    // slots are too few to lend a deeper staging). Unset or 0 = the scheduler default (depth 2). Depth 3 was the default before:
+    // G4 (RTX PRO 6000) 32 GB Flash-Next UD-IQ4_XS 2k prompt 1857 -> 1925 tok/s, 8k at n_ubatch 8192 3951 -> 4290 with the staging
+    // lent; but where its own staging does not fit beside a drafter the depth falls back after the allocation and the cache is
+    // seeded empty instead of prefilled at load (G4 64 GB, Studio argv: chat decode -13%, 2k prompt -39%), it costs the fit cache
+    // on a small GPU (Flash-Next IQ1_S 8 GB: n_ubatch 4096 -> 2048, -2.8% decode), and it reads more from the disk when the uncached
+    // experts do not fit the page cache (L4 52 GB RAM: 2k decode 13.2 -> 10.2 tok/s)
     if (moe_cache && moe_cache->cached_frac() >= 0.0 && moe_cache->cached_frac() < 0.98 && moe_cache->n_tokens_cached() >= 4) {
         const char * env_depth = getenv("LLAMA_MOE_PREFETCH_DEPTH_SPILL");
-        static const int depth_spill = env_depth != nullptr ? atoi(env_depth) : 3;
-        bool ram_ok = true;
-        if (env_depth == nullptr) {
-            double ram_frac = 0.5;
-            if (const char * e = getenv("LLAMA_MOE_PREFETCH_DEPTH_SPILL_MAX_RAM_FRAC")) {
-                ram_frac = std::max(0.0, atof(e));
-            }
-            const uint64_t ram_total = llama_sysmem::total();
-            ram_ok = ram_total == 0 || moe_cache->host_uncached_bytes() <= ram_frac*(double) ram_total;
-            static bool logged = false; // once per process, not for a memory probe (no_alloc), whose log the fit silences
-            if (!ram_ok && !logged && !model.hparams.no_alloc) {
-                logged = true;
-                LLAMA_LOG_INFO("%s: MoE cache: host weight prefetch keeps the default depth: the uncached host experts (%.0f MiB) are more than "
-                    "%.0f%% of the RAM (%.0f MiB; LLAMA_MOE_PREFETCH_DEPTH_SPILL=N forces depth N)\n", __func__,
-                    moe_cache->host_uncached_bytes()/1048576.0, 100.0*ram_frac, ram_total/1048576.0);
-            }
-        }
-        if (depth_spill > 0 && ram_ok) {
+        static const int depth_spill = env_depth != nullptr ? atoi(env_depth) : 0;
+        if (depth_spill > 0) {
             ggml_backend_sched_set_prefetch_depth_init(sched.get(), depth_spill);
         }
     }
