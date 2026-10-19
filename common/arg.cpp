@@ -3053,6 +3053,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FIT_TARGET"));
     add_opt(common_arg(
+        { "-fitkv", "--fit-kv-resident" }, "[auto|on|off]",
+        "for a dense model that does not fit: keep every layer's attention and the KV cache (at the requested context) in device\n"
+        "memory and move FFN weights to system memory first, instead of whole layers ('auto': only if the whole-layer placement\n"
+        "would spill a lot of KV cache per byte of weights, 'on' or 'off', default: 'auto'; LLAMA_FIT_DENSE_FFN=0|1|2 overrides it)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.fit_kv_resident = COMMON_FIT_KV_RESIDENT_AUTO;
+            } else if (is_truthy(value)) {
+                params.fit_kv_resident = COMMON_FIT_KV_RESIDENT_ON;
+            } else if (is_falsey(value)) {
+                params.fit_kv_resident = COMMON_FIT_KV_RESIDENT_OFF;
+            } else {
+                throw std::runtime_error(
+                    string_format("error: unknown value for --fit-kv-resident: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_env("LLAMA_ARG_FIT_KV_RESIDENT"));
+    add_opt(common_arg(
         { "-fitc", "--fit-ctx" }, "N",
         string_format("minimum ctx size that can be set by --fit option, default: %" PRIu32, params.fit_params_min_ctx),
         [](common_params & params, int value) {

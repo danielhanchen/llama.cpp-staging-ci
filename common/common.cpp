@@ -2053,7 +2053,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             (has_draft || spec_mtp) && !draft_off ? &extra : nullptr,
-            fit_log_level);
+            fit_log_level,
+            params.fit_kv_resident);
 
         // --moe-cache-mib auto that the fit did not size (a failed or skipped fit, no host experts on a device) is no cache, as with
         // the release: the unbounded request must never reach the context

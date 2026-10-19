@@ -3,6 +3,7 @@
 #pragma once
 
 #include "llama-cpp.h"
+#include "fit.h"
 
 #include "ggml-opt.h"
 #include "ggml.h"
@@ -491,6 +492,7 @@ struct common_params {
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
+    enum common_fit_kv_resident fit_kv_resident = COMMON_FIT_KV_RESIDENT_AUTO; // dense models: keep KV cache in VRAM, spill FFN first
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);

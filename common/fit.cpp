@@ -25,6 +25,12 @@ enum common_layer_fraction_t {
     LAYER_FRACTION_MOE  = 4, // everything but sparse MoE weights
 };
 
+// --fit-kv-resident auto: use the KV-resident placement for a dense model if the whole-layer placement would put at least this much KV
+// cache (incl. recurrent state) in system memory per byte of weights it puts there. Calibrated on fit-kv-resident (T4 2/4 cores, RTX PRO 6000
+// 6/48 cores, B200; Qwen3.8-27B, gemma-4-31B, gemma-4-E2B): at a ratio >= 0.15 decode near a full context was 1.24-2.2x faster and prompt
+// processing 0.95-1.10x, below it decode near a full context gained 1.00-1.32x while an almost empty context decoded up to 15% slower.
+static constexpr double FIT_KV_RESIDENT_AUTO_MIN_KV_RATIO = 0.15;
+
 class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
@@ -181,7 +187,8 @@ common_device_memory_data_vec common_get_device_memory_data(
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
+        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level,
+        enum common_fit_kv_resident kv_resident) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
@@ -316,17 +323,36 @@ static void common_params_fit_impl(
     const bool   fit_moe_cache     = nd > 0 && hp_nex > 0 && cparams->moe_cache_size > 0 &&
         (fit_moe_cache_env == nullptr || atoi(fit_moe_cache_env) != 0);
 
-    // dense models spill FFN tensors before whole layers: a layer that is moved to system memory takes its attention and its KV cache with it,
-    // while an FFN tensor in system memory only adds a weight upload (prompt batches) or a CPU matrix-vector product (token generation)
-    // if the layers do not fit even without their FFN tensors, the layers in device memory keep only their attention, norms and KV cache
-    // and the first layers go to system memory whole: more attention and KV cache stays in device memory than with whole layers
-    // opt-in, LLAMA_FIT_DENSE_FFN=1 (=2 spills whole layers in that case); unset or 0: whole layers, as before. G4 (RTX PRO 6000),
-    // gemma-4 E2B UD-IQ2_M at a 2 GB cap, -c 16384, medians of 3: FFN first (34/36 layers) decoded 121.0 tok/s vs 131.6 with whole
-    // layers (11/36) for 2k prompts at 13641 vs 11048 tok/s; the earlier dense data only showed a decode gain at long contexts.
-    // user tensor overrides are kept as constraints
-    const char * fit_dense_ffn_env  = getenv("LLAMA_FIT_DENSE_FFN");
-    const int    fit_dense_ffn_mode = fit_dense_ffn_env == nullptr ? 0 : atoi(fit_dense_ffn_env);
-    const bool   fit_dense_ffn      = nd > 0 && hp_nex == 0 && fit_dense_ffn_mode != 0;
+    // dense models that do not fit (--fit-kv-resident, kv_resident): a layer that is moved to system memory takes its attention and its
+    // KV cache with it, while an FFN tensor in system memory only adds a weight upload (prompt batches) or a CPU matrix-vector product
+    // (token generation). The KV-resident placement (FFN first) takes the MoE path of the fit with the FFN tensors in the place of the
+    // experts: every layer keeps its attention, norms and KV cache in device memory and the FFN tensors of the last layers are moved to
+    // system memory; if the layers do not fit even without their FFN tensors, the layers in device memory keep only their attention,
+    // norms and KV cache and the first layers go to system memory whole.
+    //   - off:  whole layers, as before
+    //   - on:   FFN first
+    //   - auto: FFN first if the layers fit without their FFN tensors and the whole-layer placement would put at least
+    //           FIT_KV_RESIDENT_AUTO_MIN_KV_RATIO bytes of KV cache in system memory per byte of weights, otherwise whole layers.
+    //           The KV cache is counted at the requested context, which is never cut for it; LLAMA_FIT_KV_RESIDENT_CTX=N counts it at an
+    //           expected used context of N tokens per sequence instead (decode reads only the used cells: Qwen3.8-27B at -c 131072 / 16 GB
+    //           decoded 11.9 t/s after a 2K prompt with the KV cache resident vs 18.4 with whole layers, break-even near 30K used cells).
+    //           User tensor overrides make auto behave as off.
+    // LLAMA_FIT_DENSE_FFN overrides kv_resident (kill switch): 0 = off, 1 = on, 2 = on but whole layers if the layers do not fit without
+    // their FFN tensors. With on, user tensor overrides are kept as constraints.
+    // G4 (RTX PRO 6000), gemma-4 E2B UD-IQ2_M at a 2 GB cap, -c 16384, medians of 3: FFN first (34/36 layers) decoded 121.0 tok/s vs 131.6
+    // with whole layers (11/36) for 2k prompts at 13641 vs 11048 tok/s, so on is not the default; auto keeps whole layers there.
+    enum { DENSE_FFN_OFF = 0, DENSE_FFN_ON = 1, DENSE_FFN_STRICT = 2, DENSE_FFN_AUTO = 3 };
+    int fit_dense_ffn_mode = kv_resident == COMMON_FIT_KV_RESIDENT_ON   ? DENSE_FFN_ON   :
+                             kv_resident == COMMON_FIT_KV_RESIDENT_AUTO ? DENSE_FFN_AUTO : DENSE_FFN_OFF;
+    if (const char * fit_dense_ffn_env = getenv("LLAMA_FIT_DENSE_FFN")) {
+        const int v = atoi(fit_dense_ffn_env);
+        fit_dense_ffn_mode = v == 0 ? DENSE_FFN_OFF : v == 2 ? DENSE_FFN_STRICT : DENSE_FFN_ON;
+    }
+    if (fit_dense_ffn_mode == DENSE_FFN_AUTO && mparams->tensor_buft_overrides &&
+            (mparams->tensor_buft_overrides->pattern || mparams->tensor_buft_overrides->buft)) {
+        fit_dense_ffn_mode = DENSE_FFN_OFF;
+    }
+    const bool fit_dense_ffn = nd > 0 && hp_nex == 0 && fit_dense_ffn_mode != DENSE_FFN_OFF;
 
     // the user overrides come first in every placement written below: the first matching pattern wins
     std::vector<llama_model_tensor_buft_override> tbo_user;
@@ -823,17 +849,25 @@ static void common_params_fit_impl(
         mparams.tensor_buft_overrides = tensor_buft_overrides;
     };
 
-    // utility function that returns the memory use per device for given numbers of layers per device
-    auto get_memory_for_layers = [&](
-            const char * func_name,
+    // utility function that returns the memory data per device (+ system memory) for given numbers of layers per device
+    auto get_dmds_for_layers = [&](
             const std::vector<ngl_t> & ngl_per_device,
-            const std::vector<ggml_backend_buffer_type_t> & overflow_bufts) -> std::vector<int64_t> {
+            const std::vector<ggml_backend_buffer_type_t> & overflow_bufts) -> dmds_t {
         llama_model_params mparams_copy = *mparams;
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy);
 
         dmds_t dmd_nl = common_get_device_memory_data_impl(
             path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
         add_extra_memory(dmd_nl);
+        return dmd_nl;
+    };
+
+    // utility function that returns the memory use per device for given numbers of layers per device
+    auto get_memory_for_layers = [&](
+            const char * func_name,
+            const std::vector<ngl_t> & ngl_per_device,
+            const std::vector<ggml_backend_buffer_type_t> & overflow_bufts) -> std::vector<int64_t> {
+        const dmds_t dmd_nl = get_dmds_for_layers(ngl_per_device, overflow_bufts);
 
         LOG_TRC("%s: memory for test allocation by device:\n", func_name);
         for (size_t id = 0; id < nd; id++) {
@@ -961,7 +995,7 @@ static void common_params_fit_impl(
             global_surplus_cpu_moe += dmds_cpu_ffn[id].free;
             global_surplus_cpu_moe -= int64_t(dmds_cpu_ffn[id].mb.total()) + margins[id];
         }
-        partial_layers = global_surplus_cpu_moe > 0 || fit_dense_ffn_mode != 2;
+        partial_layers = global_surplus_cpu_moe > 0 || fit_dense_ffn_mode == DENSE_FFN_ON;
         if (global_surplus_cpu_moe > 0) {
             LOG_TRC("%s: with the FFN tensors in system memory there is a total surplus of %" PRId64 " MiB, spilling FFN tensors before layers\n",
                 __func__, global_surplus_cpu_moe/MiB);
@@ -994,74 +1028,120 @@ static void common_params_fit_impl(
     std::vector<ngl_t> ngl_per_device(nd);
     std::vector<int64_t> mem = get_memory_for_layers(__func__, ngl_per_device, overflow_bufts);
 
-    // optimize the number of layers per device using the method of false position:
-    //   - ngl_per_device has 0 layers for each device, lower bound
-    //   - try a "high" configuration where a device is given all unassigned layers
-    //   - interpolate the memory use / layer between low and high linearly to get a guess where it meets our target
-    //   - check memory use of our guess, replace either the low or high bound
-    //   - once we only have a difference of a single layer, stop and return the lower bound that just barely still fits
-    //   - the last device has the output layer, which cannot be a partial layer
-    if (hp_nex > 0) {
-        LOG_TRC("%s: filling dense-only layers back-to-front:\n", __func__);
-    } else if (partial_layers) {
-        LOG_TRC("%s: filling layers without FFN tensors back-to-front:\n", __func__);
-    } else {
-        LOG_TRC("%s: filling dense layers back-to-front:\n", __func__);
-    }
-    for (int id = nd - 1; id >= 0; id--) {
-        uint32_t n_unassigned = hp_ngl + 1;
-        for (size_t jd = id + 1; jd < nd; ++jd) {
-            assert(n_unassigned >= ngl_per_device[jd].n_layer);
-            n_unassigned -= ngl_per_device[jd].n_layer;
+    // fills ngl_per_device and mem, part: layers may keep their MoE (dense: FFN) tensors in system memory
+    const char * fit_func = __func__; // __func__ inside a lambda would be operator()
+    auto fill_back_to_front = [&](const bool part) {
+        // optimize the number of layers per device using the method of false position:
+        //   - ngl_per_device has 0 layers for each device, lower bound
+        //   - try a "high" configuration where a device is given all unassigned layers
+        //   - interpolate the memory use / layer between low and high linearly to get a guess where it meets our target
+        //   - check memory use of our guess, replace either the low or high bound
+        //   - once we only have a difference of a single layer, stop and return the lower bound that just barely still fits
+        //   - the last device has the output layer, which cannot be a partial layer
+        if (hp_nex > 0) {
+            LOG_TRC("%s: filling dense-only layers back-to-front:\n", fit_func);
+        } else if (part) {
+            LOG_TRC("%s: filling layers without FFN tensors back-to-front:\n", fit_func);
+        } else {
+            LOG_TRC("%s: filling dense layers back-to-front:\n", fit_func);
         }
+        for (int id = nd - 1; id >= 0; id--) {
+            uint32_t n_unassigned = hp_ngl + 1;
+            for (size_t jd = id + 1; jd < nd; ++jd) {
+                assert(n_unassigned >= ngl_per_device[jd].n_layer);
+                n_unassigned -= ngl_per_device[jd].n_layer;
+            }
 
-        std::vector<ngl_t> ngl_per_device_high = ngl_per_device;
-        ngl_per_device_high[id].n_layer = n_unassigned;
-        if (partial_layers) {
-            ngl_per_device_high[id].n_part = size_t(id) < nd - 1 ? ngl_per_device_high[id].n_layer : ngl_per_device_high[id].n_layer - 1;
-        }
-        if (ngl_per_device_high[id].n_layer > 0) {
-            std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts);
-            if (mem_high[id] > targets[id]) {
-                assert(ngl_per_device_high[id].n_layer > ngl_per_device[id].n_layer);
-                uint32_t delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
-                LOG_TRC("%s: start filling device %" PRIu32 ", delta=%" PRIu32 "\n", __func__, id, delta);
-                while (delta > 1) {
-                    uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
-                    step_size = std::max(step_size, uint32_t(1));
-                    step_size = std::min(step_size, delta - 1);
+            std::vector<ngl_t> ngl_per_device_high = ngl_per_device;
+            ngl_per_device_high[id].n_layer = n_unassigned;
+            if (part) {
+                ngl_per_device_high[id].n_part = size_t(id) < nd - 1 ? ngl_per_device_high[id].n_layer : ngl_per_device_high[id].n_layer - 1;
+            }
+            if (ngl_per_device_high[id].n_layer > 0) {
+                std::vector<int64_t> mem_high = get_memory_for_layers(fit_func, ngl_per_device_high, overflow_bufts);
+                if (mem_high[id] > targets[id]) {
+                    assert(ngl_per_device_high[id].n_layer > ngl_per_device[id].n_layer);
+                    uint32_t delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
+                    LOG_TRC("%s: start filling device %" PRIu32 ", delta=%" PRIu32 "\n", fit_func, id, delta);
+                    while (delta > 1) {
+                        uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
+                        step_size = std::max(step_size, uint32_t(1));
+                        step_size = std::min(step_size, delta - 1);
 
-                    std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
-                    ngl_per_device_test[id].n_layer += step_size;
-                    if (partial_layers) {
-                        ngl_per_device_test[id].n_part += size_t(id) == nd - 1 && ngl_per_device_test[id].n_part == 0 ?
-                            step_size - 1 : step_size; // the first layer is the output layer which must always be full
+                        std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
+                        ngl_per_device_test[id].n_layer += step_size;
+                        if (part) {
+                            ngl_per_device_test[id].n_part += size_t(id) == nd - 1 && ngl_per_device_test[id].n_part == 0 ?
+                                step_size - 1 : step_size; // the first layer is the output layer which must always be full
+                        }
+                        const std::vector<int64_t> mem_test = get_memory_for_layers(fit_func, ngl_per_device_test, overflow_bufts);
+
+                        if (mem_test[id] <= targets[id]) {
+                            ngl_per_device = ngl_per_device_test;
+                            mem            = mem_test;
+                            LOG_TRC("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", fit_func, id, ngl_per_device[id].n_layer);
+                        } else {
+                            ngl_per_device_high = ngl_per_device_test;
+                            mem_high            = mem_test;
+                            LOG_TRC("%s: set ngl_per_device_high[%d].n_layer=%" PRIu32 "\n", fit_func, id, ngl_per_device_high[id].n_layer);
+                        }
+                        delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
                     }
-                    const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts);
-
-                    if (mem_test[id] <= targets[id]) {
-                        ngl_per_device = ngl_per_device_test;
-                        mem            = mem_test;
-                        LOG_TRC("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
-                    } else {
-                        ngl_per_device_high = ngl_per_device_test;
-                        mem_high            = mem_test;
-                        LOG_TRC("%s: set ngl_per_device_high[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device_high[id].n_layer);
-                    }
-                    delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
+                } else {
+                    assert(ngl_per_device_high[id].n_layer == n_unassigned);
+                    ngl_per_device = ngl_per_device_high;
+                    mem            = mem_high;
+                    LOG_TRC("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", fit_func, id, ngl_per_device[id].n_layer);
                 }
-            } else {
-                assert(ngl_per_device_high[id].n_layer == n_unassigned);
-                ngl_per_device = ngl_per_device_high;
-                mem            = mem_high;
-                LOG_TRC("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
+            }
+
+            const int64_t projected_margin = dmds_full[id].free - mem[id];
+            LOG_TRC(
+                "%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
+                fit_func, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
+        }
+    };
+    // dense auto: fill whole layers first, then decide whether to refill with the FFN tensors first
+    const bool kvr_auto = fit_dense_ffn && partial_layers && fit_dense_ffn_mode == DENSE_FFN_AUTO;
+    fill_back_to_front(partial_layers && !kvr_auto);
+
+    if (kvr_auto) {
+        // auto: compare the device memory of the whole-layer placement just filled with every layer in device memory, the difference is
+        // what it puts in system memory (counted on the device side: weights in a CPU buffer that is not a host buffer, e.g. repacked
+        // weights, are not part of the system memory data)
+        std::vector<ngl_t> ngl_ref(nd);
+        ngl_ref[nd - 1].n_layer = hp_ngl + 1;
+        const dmds_t dmds_ref  = get_dmds_for_layers(ngl_ref,        overflow_bufts);
+        const dmds_t dmds_base = get_dmds_for_layers(ngl_per_device, overflow_bufts);
+        int64_t kv_spill = 0;
+        int64_t w_spill  = 0;
+        for (size_t id = 0; id < nd; id++) {
+            kv_spill += int64_t(dmds_ref[id].mb.context) - int64_t(dmds_base[id].mb.context);
+            w_spill  += int64_t(dmds_ref[id].mb.model)   - int64_t(dmds_base[id].mb.model);
+        }
+        if (const char * env_ctx = getenv("LLAMA_FIT_KV_RESIDENT_CTX")) {
+            const uint64_t n_ctx_used = strtoull(env_ctx, nullptr, 10) * n_streams;
+            if (n_ctx_used > 0 && n_ctx_used < cparams->n_ctx) {
+                kv_spill = int64_t(double(kv_spill) * double(n_ctx_used) / double(cparams->n_ctx));
             }
         }
-
-        const int64_t projected_margin = dmds_full[id].free - mem[id];
-        LOG_TRC(
-            "%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
-            __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
+        const double ratio   = w_spill > 0 ? double(kv_spill) / double(w_spill) : 0.0;
+        const bool   use_kvr = ratio >= FIT_KV_RESIDENT_AUTO_MIN_KV_RATIO;
+        uint32_t n_layer_dev = 0;
+        for (size_t id = 0; id < nd; id++) {
+            n_layer_dev += ngl_per_device[id].n_layer;
+        }
+        LOG_INF("%s: --fit-kv-resident auto: at a context of %" PRIu32 " the whole-layer placement (%" PRIu32 "/%" PRIu32 " layers) spills "
+            "%" PRId64 " MiB of weights and %" PRId64 " MiB of KV cache (ratio %.3f, threshold %.3f) -> %s\n", __func__, cparams->n_ctx,
+            n_layer_dev, hp_ngl + 1, w_spill/MiB, kv_spill/MiB, ratio, FIT_KV_RESIDENT_AUTO_MIN_KV_RATIO,
+            use_kvr ? "FFN tensors first (KV-resident)" : "whole layers");
+        if (!use_kvr) {
+            set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+            return;
+        }
+        ngl_per_device = std::vector<ngl_t>(nd);
+        mem            = get_memory_for_layers(__func__, ngl_per_device, overflow_bufts);
+        fill_back_to_front(true);
     }
     if (!partial_layers || global_surplus_cpu_moe <= 0) {
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
@@ -1221,11 +1301,12 @@ enum common_params_fit_status common_fit_params(
         size_t * margins,
         uint32_t n_ctx_min,
         const common_fit_extra_model * extra,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        common_fit_kv_resident kv_resident) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
+        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level, kv_resident);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());

@@ -11,6 +11,16 @@ enum common_params_fit_status {
     COMMON_PARAMS_FIT_STATUS_ERROR   = 2, // a hard error occurred, e.g. because no model could be found at the specified path
 };
 
+// --fit-kv-resident: placement for a dense model that does not fit entirely in device memory
+//   - whole layers: the first layers go to system memory with their KV cache, attention over that KV cache runs on the CPU
+//   - KV-resident: every layer keeps its attention and its KV cache (at the requested context) in device memory, the FFN tensors
+//     of the last layers go to system memory first
+enum common_fit_kv_resident {
+    COMMON_FIT_KV_RESIDENT_AUTO = 0, // KV-resident if the whole-layer placement would spill a lot of KV cache per byte of weights (default)
+    COMMON_FIT_KV_RESIDENT_ON   = 1, // KV-resident whenever the model does not fit
+    COMMON_FIT_KV_RESIDENT_OFF  = 2, // whole layers only
+};
+
 // a second model that shares the devices of the main model, e.g. a draft model
 //   - its context follows the context of the main model, so its memory is measured again whenever that context changes
 //   - shares_model tells the fit that the weights are already counted in the main model, as for an MTP context
@@ -35,7 +45,8 @@ common_params_fit_status common_fit_params(
                              size_t * margins,               // margins of memory to leave per device in bytes
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
-                     ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
+                     ggml_log_level   log_level,             // minimum log level to print during fitting, lower levels go to debug log
+             common_fit_kv_resident   kv_resident = COMMON_FIT_KV_RESIDENT_AUTO); // placement for dense models that do not fit
 
 // print estimated memory to stdout
 void common_fit_print(
