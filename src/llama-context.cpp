@@ -3791,7 +3791,8 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
     // a ubatch below the prefetch threshold reads its ids for its copies anyway, it seeds from them
     // a prefetched ubatch: =2 (default) seeds from the routing of an earlier ubatch if any, else reads its own ids first (this serializes
     // its expert uploads with the compute of every layer); =1 does not seed it
-    moe_cache_record    = large && prefetch_min_batch != INT64_MAX && moe_cache_seed_sync;
+    // strata-gap: also when prompts do not seed (n_ubatch >= LLAMA_MOE_CACHE_SEED_AUTO) but the lent slots are refilled by routing
+    moe_cache_record    = large && prefetch_min_batch != INT64_MAX && (moe_cache_seed_sync || moe_cache->refills_routed());
     moe_cache_seed      = false;
     moe_cache_seed_prev = false;
     moe_cache_devseed   = false;

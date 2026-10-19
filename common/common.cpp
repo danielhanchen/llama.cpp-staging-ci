@@ -1833,6 +1833,13 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     if (lend_graph && ((spill_lend && pick != cands[0]) || fix2_lend)) {
         // the cache and the scheduler read the lending mode from the environment
         common_set_env("LLAMA_MOE_CACHE_LEND", "2");
+        // strata-gap: with a draft the lent prompt does not seed the cache (n_ubatch >= LLAMA_MOE_CACHE_SEED_AUTO) and the verify batches lost
+        // 9.8% decode after a 2k prompt (G4, Flash-Next + Q4_K_M drafter: miss fetch 2.8 -> 6.1 ms/token): the slots that come back after the
+        // prompt are refilled with the experts its last ubatch routed most (LLAMA_MOE_CACHE_REFILL_ROUTED, set here unless given)
+        if (has_spec && spill_lend_spec && getenv("LLAMA_MOE_CACHE_REFILL_ROUTED") == nullptr) {
+            common_set_env("LLAMA_MOE_CACHE_REFILL_ROUTED", "1");
+            COM_INF("MoE cache: lent prompt graphs with a draft: the lent slots are refilled with the prompt's most routed experts (%s=0 to disable)\n", "LLAMA_MOE_CACHE_REFILL_ROUTED");
+        }
     }
     if (lend_graph) {
         COM_INF("MoE cache: LLAMA_MOE_CACHE_LEND=2: n_ubatch %u, compute buffers %.2f MiB lent from one bank tail (slot %.2f MiB, largest tensor %.2f MiB, "
