@@ -125,6 +125,11 @@ struct common_sampler {
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
 
+    // greedy_fast: the chain can only pick the highest biased logit (see common_sampler_greedy_fast), so common_sampler_sample
+    // takes the argmax of the logits + bias_dense instead of building and sorting n_vocab candidates
+    bool greedy_fast = false;
+    std::vector<float> bias_dense; // empty: no bias
+
     void reset() {
         prev.clear();
 
@@ -188,6 +193,57 @@ std::string common_params_sampling::print() const {
     return std::string(result);
 }
 
+// whether every sampler of the chain built from params keeps the token with the highest (biased) logit and the chain ends in
+// greedy: then the sampled token is the argmax of the biased logits. LLAMA_SAMPLE_GREEDY_FAST=0 disables it.
+static bool common_sampler_greedy_fast(const common_params_sampling & params, const llama_sampler * grmr, const llama_sampler * rbudget) {
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_SAMPLE_GREEDY_FAST");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (!enabled || grmr != nullptr || rbudget != nullptr || params.mirostat != 0 || params.n_probs != 0 || params.samplers.empty()) {
+        return false;
+    }
+    const bool greedy =
+        (params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
+        (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1);
+    if (!greedy) {
+        return false;
+    }
+    for (const auto & t : params.samplers) {
+        switch (t) {
+            case COMMON_SAMPLER_TYPE_TOP_K:       // keep the top k
+            case COMMON_SAMPLER_TYPE_TOP_P:       // keep the most probable tokens up to p
+            case COMMON_SAMPLER_TYPE_MIN_P:       // keep p >= min_p * p_max
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA: // keep logits within n sigma of the max
+            case COMMON_SAMPLER_TYPE_TEMPERATURE: // temp 0 (checked above for the last one): keeps the max
+                break;
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                if (params.penalty_last_n != 0 && (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) {
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (params.dry_multiplier != 0.0f && params.dry_base >= 1.0f && params.dry_penalty_last_n != 0) {
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TYPICAL_P: // can drop the most probable token
+                if (params.typ_p < 1.0f) {
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_XTC: // can drop the most probable tokens
+                if (params.xtc_probability > 0.0f) {
+                    return false;
+                }
+                break;
+            default: // infill, adaptive-p, ...
+                return false;
+        }
+    }
+    return true;
+}
+
 struct common_sampler * common_sampler_init(
         const struct llama_model * model,
         struct common_params_sampling & params) {
@@ -212,6 +268,7 @@ struct common_sampler * common_sampler_init(
     llama_sampler * chain = llama_sampler_chain_init(lparams);
 
     std::vector<llama_sampler *> samplers;
+    std::vector<llama_logit_bias> merged_bias;
 
     const std::string & grammar_str = common_grammar_value(params.grammar);
     if (grammar_str.compare(0, 11, "%llguidance") == 0) {
@@ -339,6 +396,7 @@ struct common_sampler * common_sampler_init(
         if (!merged.empty()) {
             samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged.size(), merged.data()));
         }
+        merged_bias = std::move(merged);
     }
 
     if (params.mirostat == 0) {
@@ -443,6 +501,17 @@ struct common_sampler * common_sampler_init(
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
     };
 
+    result->greedy_fast = common_sampler_greedy_fast(params, grmr, rbudget);
+    if (result->greedy_fast && !merged_bias.empty()) {
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+        result->bias_dense.assign(n_vocab, 0.0f);
+        for (const auto & lb : merged_bias) {
+            if (lb.token >= 0 && lb.token < n_vocab) {
+                result->bias_dense[lb.token] += lb.bias;
+            }
+        }
+    }
+
     return result;
 }
 
@@ -525,6 +594,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
         /* .rng     = */ gsmpl->rng,
+        /* .greedy_fast = */ gsmpl->greedy_fast,
+        /* .bias_dense  = */ gsmpl->bias_dense,
     };
 }
 
@@ -547,6 +618,8 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->rng        = src->rng;
     dst->t_total_us = src->t_total_us;
+    dst->greedy_fast = src->greedy_fast;
+    dst->bias_dense  = src->bias_dense;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -615,6 +688,37 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & rbudget = gsmpl->rbudget;
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+
+    // greedy chain on the full logits (no backend sampler output): the argmax of the biased logits, the lowest id on a tie
+    if (gsmpl->greedy_fast && llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL && llama_get_sampled_probs_ith(ctx, idx) == nullptr &&
+            llama_get_sampled_logits_ith(ctx, idx) == nullptr) {
+        const float * logits  = llama_get_logits_ith(ctx, idx);
+        GGML_ASSERT(logits != nullptr);
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        const float * bias    = gsmpl->bias_dense.empty() ? nullptr : gsmpl->bias_dense.data();
+        int32_t best   = 0;
+        float   best_v = bias ? logits[0] + bias[0] : logits[0];
+        if (bias) {
+            for (int32_t i = 1; i < n_vocab; ++i) {
+                const float v = logits[i] + bias[i];
+                if (v > best_v) {
+                    best_v = v;
+                    best   = i;
+                }
+            }
+        } else {
+            for (int32_t i = 1; i < n_vocab; ++i) {
+                if (logits[i] > best_v) {
+                    best_v = logits[i];
+                    best   = i;
+                }
+            }
+        }
+        gsmpl->cur.resize(1);
+        gsmpl->cur[0] = llama_token_data{best, best_v, 1.0f};
+        cur_p = { gsmpl->cur.data(), 1, 0, false };
+        return best;
+    }
 
     gsmpl->set_logits(ctx, idx);
 
