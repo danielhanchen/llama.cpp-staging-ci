@@ -1467,6 +1467,16 @@ private:
             slots.emplace_back();
         }
 
+        // a draft model (-md) that no requested draft type uses (none given, or only ngram types) is released before the probe below:
+        // its token-only test decode can abort on a draft that needs more input (a gemma-4 assistant needs the target's state embedding)
+        if (ctx_dft && !common_speculative_uses_draft_ctx(params_base.speculative.types)) {
+            SRV_WRN("%s", "the draft model is not used by any --spec-type (e.g. draft-simple, draft-mtp), unloading it\n");
+            params_base.speculative.draft.ctx_dft = nullptr;
+            ctx_dft   = nullptr;
+            model_dft = nullptr;
+            spec_init.reset();
+        }
+
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {

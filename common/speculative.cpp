@@ -2410,6 +2410,15 @@ std::vector<common_speculative_type> common_speculative_types_from_gguf(const st
     }
 
     const std::string arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
+
+    // a gemma-4 assistant is an MTP head on the target's hidden state (its graph needs the state embedding of the target), it has no
+    // nextn tensors: without this, -md with no --spec-type loaded it as a plain draft and the server aborted in its first test decode
+    if (arch == "gemma4-assistant") {
+        SPC_INF("auto-detected speculative type '%s' from the draft model metadata (%s)\n",
+                common_speculative_type_to_str(COMMON_SPECULATIVE_TYPE_DRAFT_MTP).c_str(), arch.c_str());
+        return { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    }
+
     if (arch != "dflash") {
         const uint32_t block_count = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str()));
 
@@ -2428,6 +2437,22 @@ std::vector<common_speculative_type> common_speculative_types_from_gguf(const st
     SPC_INF("auto-detected speculative type '%s' from the draft model metadata\n", common_speculative_type_to_str(type).c_str());
 
     return { type };
+}
+
+bool common_speculative_uses_draft_ctx(const std::vector<common_speculative_type> & types) {
+    for (const auto type : types) {
+        switch (type) {
+            case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+                return true;
+            default:
+                break;
+        }
+    }
+    return false;
 }
 
 static uint32_t common_get_enabled_speculative_configs(const std::vector<common_speculative_type> & configs) {
