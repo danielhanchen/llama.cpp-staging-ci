@@ -693,7 +693,14 @@ static void moe_cache_fetch_launch(cudaStream_t stream, const ggml_tensor * dst,
         max_nb = std::max(max_nb, (int64_t) bank->nb[2]);
     }
 
-    const int64_t chunk = 64*1024;
+    // GGML_CUDA_MOE_FETCH_CHUNK: bytes per block of the copies (default 64 KiB); smaller chunks put more blocks, and so more host
+    // memory reads, in flight at once (the copy is the same, only the split of the work changes)
+    static const int64_t chunk_env = [] {
+        const char * env = getenv("GGML_CUDA_MOE_FETCH_CHUNK");
+        const int64_t v = env != nullptr ? atoll(env) : 0;
+        return v >= 4096 ? (v/4096)*4096 : (int64_t) 64*1024;
+    }();
+    const int64_t chunk = max_z > 0 ? (int64_t) 64*1024 : chunk_env;
     int64_t n_z = (max_nb + chunk - 1)/chunk;
     if (max_z > 0) {
         n_z = std::min<int64_t>(n_z, max_z);
