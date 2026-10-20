@@ -296,6 +296,9 @@ public:
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
+    // the host seed of a prompt does not fit: large prompt ubatches seed the MoE cache on the device instead (see the definition)
+    void moe_cache_devseed_fallback();
+
     // reserve the graph of a prefetched ubatch that seeds the MoE cache from its own ids if the devices have room for it (staging_pp:
     // staging memory of the pp graph per backend), returns false if it does not fit
     bool sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const std::vector<size_t> & staging_pp);

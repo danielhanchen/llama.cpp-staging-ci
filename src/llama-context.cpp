@@ -1228,6 +1228,7 @@ void llama_context::sched_reserve() {
     if (moe_cache && moe_cache_seed_sync && !model.hparams.no_alloc && n_tokens > llama_moe_cache::n_small_max && (int64_t) n_tokens >= prefetch_min_batch) {
         moe_cache_seed_fits = sched_reserve_seed(n_tokens, n_seqs, n_outputs_pp, mctx.get(), staging_pp);
         if (!moe_cache_seed_fits) {
+            moe_cache_devseed_fallback();
             moe_cache->seed_unavailable();
         }
     }
@@ -1336,6 +1337,63 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+}
+
+// the host seed of a prompt (its own ids read before its copies) does not fit in the compute buffer: such a context prefills the cache at
+// load and its prompts do not seed it, so the decode after a prompt reads the experts of the prefill. With a cache of at most
+// LLAMA_MOE_CACHE_DEVSEED_FALLBACK_MAX_FRAC (0.5) of the host experts, and of at least LLAMA_MOE_CACHE_DEVSEED_FALLBACK_MIN_TOKENS (4)
+// tokens' experts over all layers, the large prompt ubatches (see min_ub below; never decode / verify) seed the cache on the device
+// from their staged copies instead (as LLAMA_MOE_CACHE_DEVSEED=1, on top of the prefill): no larger graph, no wait for the routing, no
+// lent slots. G4 (RTX PRO 6000) Flash-Next UD-IQ4_XS 32 GB, Studio argv (MTP drafter), 2k prompt + 256 decode: decode hit rate after
+// the prompt 87.8% -> 90.3%, decode 95.7 -> 98.0 tok/s, prompt 2204 -> 2243; the host seed (lent at depth 3, or at depth 2) gets the same
+// decode but costs the prompt 11-14% (its uploads wait for the routing of each layer, the lent slots are refilled after the prompt).
+// A cache of most experts (Flash-Next 64 GB, 92%) keeps the prefill alone: there the decode reads 98.8% from it already.
+// LLAMA_MOE_CACHE_DEVSEED_FALLBACK=0 keeps the prefill without seeding; an explicit LLAMA_MOE_CACHE_DEVSEED or LLAMA_MOE_CACHE_SEED wins
+void llama_context::moe_cache_devseed_fallback() {
+    if (!moe_cache || moe_cache_devseed_on || model.hparams.no_alloc || prefetch_min_batch == INT64_MAX ||
+        getenv("LLAMA_MOE_CACHE_DEVSEED") != nullptr || getenv("LLAMA_MOE_CACHE_SEED") != nullptr) {
+        return;
+    }
+    const char * env = getenv("LLAMA_MOE_CACHE_DEVSEED_FALLBACK");
+    if (env != nullptr && atoi(env) == 0) {
+        return;
+    }
+    double max_frac = 0.5;
+    if (const char * e = getenv("LLAMA_MOE_CACHE_DEVSEED_FALLBACK_MAX_FRAC")) {
+        max_frac = atof(e);
+    }
+    double min_tokens = 4.0;
+    if (const char * e = getenv("LLAMA_MOE_CACHE_DEVSEED_FALLBACK_MIN_TOKENS")) {
+        min_tokens = std::max(0.0, atof(e));
+    }
+    const double frac = moe_cache->cached_frac();
+    // the experts of one token over all layers are n_expert_used / n_expert of the host experts (as for the prefetch depth of spilled experts)
+    const uint32_t n_used = model.hparams.n_expert_used_max();
+    const double tokens = n_used > 0 && frac > 0.0 ? frac*(double) model.hparams.n_expert/(double) n_used : 0.0;
+    // only prompt ubatches of at least LLAMA_MOE_CACHE_DEVSEED_FALLBACK_MIN_UBATCH (1024) tokens seed: the routing of a chat-sized prompt
+    // replaced the prefill for the next one (the 527-token warmup seed: chat decode -0.3% Flash-Next 32 GB, -1.2% Qwen3.6 8 GB MTP)
+    int64_t min_ub = 1024;
+    if (const char * e = getenv("LLAMA_MOE_CACHE_DEVSEED_FALLBACK_MIN_UBATCH")) {
+        min_ub = std::max<int64_t>(1, atoll(e));
+    }
+    min_ub = std::max(min_ub, prefetch_min_batch);
+    const bool on = frac >= 0.0 && frac <= max_frac && tokens >= min_tokens && (int64_t) cparams.n_ubatch >= min_ub;
+    if (on && moe_cache->devseed_init(min_ub)) {
+        moe_cache_devseed_on = true;
+        moe_cache_seed_sync  = false;
+    }
+    static bool logged_off = false; // the message without the device seed once per process (every reserve of such a context repeats it)
+    if (!moe_cache_devseed_on && logged_off) {
+        return;
+    }
+    logged_off = logged_off || !moe_cache_devseed_on;
+    LLAMA_LOG_INFO("%s: MoE cache: the host seed of a prompt does not fit: %s (cache = %.1f%% of the host experts, the experts of %.1f tokens; "
+        "LLAMA_MOE_CACHE_DEVSEED_FALLBACK=0 keeps the prefill alone)\n", __func__,
+        moe_cache_devseed_on ? "prompt ubatches seed the cache on the device, on top of the prefill" : "the cache is prefilled, prompts do not seed it",
+        100.0*frac, tokens);
+    if (moe_cache_devseed_on) {
+        LLAMA_LOG_INFO("%s: MoE cache: device seed from prompt ubatches of %" PRId64 "+ tokens (LLAMA_MOE_CACHE_DEVSEED_FALLBACK_MIN_UBATCH)\n", __func__, min_ub);
+    }
 }
 
 bool llama_context::sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const std::vector<size_t> & staging_pp) {
