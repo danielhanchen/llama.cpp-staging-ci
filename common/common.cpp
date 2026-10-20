@@ -2236,6 +2236,47 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     // with --fit the MoE cache load mode is decided after the fit has placed the experts
+    // k9-prompt-pass: unified memory (every offload device an integrated GPU, e.g. AMD Strix Halo gfx1151): spilled experts are not copied
+    // over a PCIe link, so the discrete-GPU rule that keeps n_ubatch at 512 while the cache does not hold every expert does not apply there.
+    // Measured on gfx1151 (Qwen3.6-35B-A3B UD-Q3_K_M + MTP, 8 GB budget, plans/k9_platforms.md): -ub 2048 vs the default 2k prompt
+    // 1252 -> 1373 (Linux) / 1125 -> 1185 (Windows), decode after it 65.0 -> 72.3 / 57.7 -> 66.8, chat decode equal. Without -ub and with
+    // a MoE cache asked for, n_ubatch = LLAMA_MOE_UMA_UB (2048) there, set before the fit and handled as a given -ub (the fit, the draft
+    // context and layer-major see it as such). LLAMA_MOE_UMA_UB=0 off; LLAMA_MOE_UMA=1 / 0 forces the unified-memory decision
+    if (!model_only && !params.n_ubatch_set && !params.embedding && (moe_cache_auto || params.moe_cache_size > 0)) {
+        const char * env_ub  = getenv("LLAMA_MOE_UMA_UB");
+        const int64_t uma_ub = env_ub != nullptr ? atoll(env_ub) : 2048;
+        bool uma = false;
+        if (const char * e = getenv("LLAMA_MOE_UMA")) {
+            uma = atoi(e) != 0;
+        } else {
+            int n_gpu = 0, n_igpu = 0;
+            const auto count = [&](ggml_backend_dev_t dev) {
+                const auto t = ggml_backend_dev_type(dev);
+                n_gpu  += t == GGML_BACKEND_DEVICE_TYPE_GPU;
+                n_igpu += t == GGML_BACKEND_DEVICE_TYPE_IGPU;
+            };
+            if (!params.devices.empty()) {
+                for (ggml_backend_dev_t dev : params.devices) {
+                    if (dev != nullptr) {
+                        count(dev);
+                    }
+                }
+            } else {
+                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                    count(ggml_backend_dev_get(i));
+                }
+            }
+            uma = n_igpu > 0 && n_gpu == 0;
+        }
+        if (uma && uma_ub > params.n_ubatch && (params.n_ctx <= 0 || uma_ub <= params.n_ctx) && (!params.n_batch_set || params.n_batch >= uma_ub)) {
+            COM_INF("%s: MoE cache on unified memory: n_ubatch = %" PRId64 " (default %d; LLAMA_MOE_UMA_UB=0 keeps the default)\n", __func__,
+                uma_ub, params.n_ubatch);
+            params.n_ubatch     = (int32_t) uma_ub;
+            params.n_ubatch_set = true;
+            params.n_batch      = std::max<int32_t>(params.n_batch, (int32_t) uma_ub);
+        }
+    }
+
     auto mparams = common_model_params_to_llama_impl(params, params.fit_params);
     auto cparams = common_context_params_to_llama(params);
 
