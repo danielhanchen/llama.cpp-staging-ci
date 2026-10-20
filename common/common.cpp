@@ -1412,9 +1412,10 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         // default 2048, so a batch held one ubatch, layer-major never engaged and a long prompt copied every spilled expert once per
         // ubatch (G4, Flash-Next UD-IQ4_XS 32 GB, 8k prompt: 4 passes, 147.7 GB). The ubatch stays as given (none of the rules below runs),
         // only the batch grows to hold several ubatches, under the same conditions as layer-major auto (or LLAMA_MOE_LAYER_MAJOR=1).
-        // LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB=0 keeps n_batch
+        // LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB=0 keeps n_batch. Not on unified memory (params.moe_uma) unless LLAMA_MOE_LAYER_MAJOR=1: there
+        // no expert crosses a PCIe link and groups of large ubatches were slower than one ubatch per graph (see common_init_result)
         static const bool env_x = getenv("LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB")) != 0;
-        if (!env_x || lm == 0 || params.n_batch_set || !(lm == 1 || common_spec_draft_model(params)) ||
+        if (!env_x || lm == 0 || params.n_batch_set || (params.moe_uma && lm != 1) || !(lm == 1 || common_spec_draft_model(params)) ||
                 !common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
             return;
         }
@@ -2241,8 +2242,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // Measured on gfx1151 (Qwen3.6-35B-A3B UD-Q3_K_M + MTP, 8 GB budget, plans/k9_platforms.md): -ub 2048 vs the default 2k prompt
     // 1252 -> 1373 (Linux) / 1125 -> 1185 (Windows), decode after it 65.0 -> 72.3 / 57.7 -> 66.8, chat decode equal. Without -ub and with
     // a MoE cache asked for, n_ubatch = LLAMA_MOE_UMA_UB (2048) there, set before the fit and handled as a given -ub (the fit, the draft
-    // context and layer-major see it as such). LLAMA_MOE_UMA_UB=0 off; LLAMA_MOE_UMA=1 / 0 forces the unified-memory decision
-    if (!model_only && !params.n_ubatch_set && !params.embedding && (moe_cache_auto || params.moe_cache_size > 0)) {
+    // context see it as such). LLAMA_MOE_UMA_UB=0 off; LLAMA_MOE_UMA=1 / 0 forces the unified-memory decision. There n_batch stays as it
+    // is (params.moe_uma, common_moe_cache_auto_ubatch): layer-major groups of 2048-token ubatches lost to one ubatch per graph on gfx1151
+    // (Windows, same cell, 8k prompt: groups of 4 x 2048 1257 tok/s vs 1368 with n_batch 2048, +1.5 GB working set, +13 GB commit)
+    if (!model_only && !params.embedding && (moe_cache_auto || params.moe_cache_size > 0)) {
         const char * env_ub  = getenv("LLAMA_MOE_UMA_UB");
         const int64_t uma_ub = env_ub != nullptr ? atoll(env_ub) : 2048;
         bool uma = false;
@@ -2268,7 +2271,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             }
             uma = n_igpu > 0 && n_gpu == 0;
         }
-        if (uma && uma_ub > params.n_ubatch && (params.n_ctx <= 0 || uma_ub <= params.n_ctx) && (!params.n_batch_set || params.n_batch >= uma_ub)) {
+        params.moe_uma = uma;
+        if (uma && !params.n_ubatch_set && uma_ub > params.n_ubatch && (params.n_ctx <= 0 || uma_ub <= params.n_ctx) && (!params.n_batch_set || params.n_batch >= uma_ub)) {
             COM_INF("%s: MoE cache on unified memory: n_ubatch = %" PRId64 " (default %d; LLAMA_MOE_UMA_UB=0 keeps the default)\n", __func__,
                 uma_ub, params.n_ubatch);
             params.n_ubatch     = (int32_t) uma_ub;
