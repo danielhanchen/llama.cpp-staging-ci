@@ -529,6 +529,7 @@ private:
     // (every ubatch through a layer before any goes on to the next), so each host expert is copied to the device once for all of them
     // while every ubatch keeps its own graph, kernels and order of operations (bit-identical to the ubatches run one after the other)
     bool lm_enabled = false;
+    bool lm_auto    = false;  // LLAMA_MOE_LAYER_MAJOR unset: on beside speculative decoding with a model
     int  lm_ub_max  = 16;     // ubatches per layer-major graph [LLAMA_MOE_LAYER_MAJOR_UB_MAX]
     bool lm_verbose = false;  // [LLAMA_MOE_LAYER_MAJOR_LOG]
     std::vector<llm_graph_result_ptr>    lm_res;      // the graph of each ubatch of the group

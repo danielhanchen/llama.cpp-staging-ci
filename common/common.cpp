@@ -1363,15 +1363,29 @@ uint32_t common_draft_n_ubatch(const common_params & params, uint32_t u) {
 // LLAMA_MOE_PREFILL_UB_FRAC (0.15) of the cache, 4096 at most with a growing KV cache): faster prompts, but -1..-17% decode where the
 // cache does not hold every expert. LLAMA_MOE_CACHE_LEND=2: the compute buffers are lent from the cache, it gives up only the KV growth.
 // LLAMA_MOE_PREFILL_UB=0 disables (n_ubatch stays the default), =N forces N.
+// speculative decoding with a model (a -md draft model, or a draft type that runs one: the built-in MTP heads, Eagle3, DFlash, DSpark)
+static bool common_spec_draft_model(const common_params & params) {
+    return params.speculative.has_dft() || std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+        [](auto t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
+                            t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; });
+}
+
+static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_model_params & mparams, llama_context_params & cparams);
+
+// layer-major prompts (llama_context::decode_layer_major): the ubatches of one batch upload each host expert once, so n_ubatch stays the
+// default (no compute buffer growth taken from the cache) and the batch holds up to LLAMA_MOE_LAYER_MAJOR_BATCH (8192) tokens, at most the
+// context and lm_ub_max ubatches. LLAMA_MOE_LAYER_MAJOR=1 forces it for spilled experts, =0 turns it off; unset (auto): on for spilled
+// experts with speculative decoding by a model (the built-in MTP heads, a -md draft), where the rules below keep the default n_ubatch
+// (no lending beside a draft: G4, Qwen3.6-35B-A3B UD-Q3_K_M + MTP at 8 GB, 2k / 8k prompt 2288 -> 3709 / 2430 -> 6609 tok/s, same text);
+// where they grow n_ubatch (a lent graph) the prompt stays ubatch by ubatch
 static void common_moe_cache_auto_ubatch(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
     if (params.moe_cache_size == 0 || params.n_ubatch_set || params.embedding || cparams.embeddings) {
         return;
     }
-    // layer-major prompts (LLAMA_MOE_LAYER_MAJOR=1): the ubatches of one batch upload each host expert once, so n_ubatch stays the default
-    // (no compute buffer growth taken from the cache) and the batch holds up to LLAMA_MOE_LAYER_MAJOR_BATCH (8192) tokens, at most the
-    // context and lm_ub_max ubatches
-    if (getenv("LLAMA_MOE_LAYER_MAJOR") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR")) != 0 &&
-            common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
+    const char * env_lm = getenv("LLAMA_MOE_LAYER_MAJOR");
+    const int    lm     = env_lm == nullptr || strcmp(env_lm, "auto") == 0 ? -1 : (atoi(env_lm) != 0 ? 1 : 0);
+    const bool   spill  = lm != 0 && common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers);
+    const auto   set_batch = [&]() {
         if (!params.n_batch_set) {
             int64_t want = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH") != nullptr ? atoll(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH")) : 8192;
             const int64_t ub_max = getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX") != nullptr ? std::max(1, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX"))) : 16;
@@ -1384,9 +1398,22 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
                 cparams.n_batch = (uint32_t) want;
             }
         }
-        COM_INF("MoE cache: layer-major prompts: n_ubatch stays %u, n_batch %u (LLAMA_MOE_LAYER_MAJOR)\n", cparams.n_ubatch, cparams.n_batch);
+    };
+    if (lm == 1 && spill) {
+        set_batch();
+        COM_INF("MoE cache: layer-major prompts: n_ubatch stays %u, n_batch %u (LLAMA_MOE_LAYER_MAJOR=1)\n", cparams.n_ubatch, cparams.n_batch);
         return;
     }
+    const uint32_t ub0 = cparams.n_ubatch;
+    common_moe_cache_auto_ubatch_rules(params, mparams, cparams);
+    if (lm == -1 && spill && common_spec_draft_model(params) && cparams.n_ubatch == ub0) {
+        set_batch();
+        COM_INF("MoE cache: layer-major prompts beside speculative decoding: n_ubatch stays %u, n_batch %u (LLAMA_MOE_LAYER_MAJOR=0 disables)\n",
+            cparams.n_ubatch, cparams.n_batch);
+    }
+}
+
+static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
     const char * env = getenv("LLAMA_MOE_PREFILL_UB");
     const int    force = env != nullptr ? atoi(env) : -1;
     if (force == 0) {
@@ -2977,9 +3004,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
     // speculative decoding with a model (a -md draft model, or a draft type that runs one: the built-in MTP heads, Eagle3, DFlash)
-    cparams.spec_draft        = params.speculative.has_dft() || std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
-        [](auto t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
-                            t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; });
+    cparams.spec_draft        = common_spec_draft_model(params);
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

@@ -408,17 +408,16 @@ llama_context::llama_context(
     }
 
     {
-        // layer-major prompts (opt-in prototype): see decode_layer_major
+        // layer-major prompts (see decode_layer_major): LLAMA_MOE_LAYER_MAJOR=1 forces them with a MoE cache, =0 turns them off; unset
+        // (auto) they run beside speculative decoding with a model (cparams.spec_draft) when the cache does not hold every host expert
+        // and a batch holds at least two ubatches (checked once the cache exists)
         const char * env = getenv("LLAMA_MOE_LAYER_MAJOR");
-        lm_enabled = env != nullptr && atoi(env) != 0 && cparams.moe_cache_size > 0;
+        lm_auto    = env == nullptr || strcmp(env, "auto") == 0;
+        lm_enabled = (lm_auto ? cparams.spec_draft && cparams.n_batch >= 2*cparams.n_ubatch : atoi(env) != 0) && cparams.moe_cache_size > 0;
         if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX")) {
             lm_ub_max = std::max(1, atoi(e));
         }
         lm_verbose = getenv("LLAMA_MOE_LAYER_MAJOR_LOG") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_LOG")) != 0;
-        if (lm_enabled) {
-            LLAMA_LOG_INFO("%s: MoE cache: layer-major prompts, up to %d ubatches of %u tokens per graph (LLAMA_MOE_LAYER_MAJOR_UB_MAX)\n",
-                __func__, lm_ub_max, cparams.n_ubatch);
-        }
     }
 
     {
@@ -717,6 +716,14 @@ llama_context::llama_context(
         if (lm_enabled && !moe_cache) {
             // nothing on the host is cached: no layer-major prompts, and the scheduler keeps its usual size
             lm_enabled = false;
+        }
+        if (lm_enabled && lm_auto && !(moe_cache->cached_frac() >= 0.0 && moe_cache->cached_frac() < 0.98)) {
+            // the cache holds (nearly) every host expert: a prompt uploads (nearly) nothing, nothing to share
+            lm_enabled = false;
+        }
+        if (lm_enabled && !model.hparams.no_alloc) {
+            LLAMA_LOG_INFO("%s: MoE cache: layer-major prompts%s, up to %d ubatches of %u tokens per graph (LLAMA_MOE_LAYER_MAJOR_UB_MAX; "
+                "LLAMA_MOE_LAYER_MAJOR=0 disables)\n", __func__, lm_auto ? " beside speculative decoding" : "", lm_ub_max, cparams.n_ubatch);
         }
         if (moe_cache) {
             // the default hybrid path takes its fetch share from the decode threads, so it does not depend on timing
@@ -1107,8 +1114,9 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
-    // a layer-major graph holds the graphs of up to lm_ub_max ubatches
-    sched_new(lm_enabled ? max_nodes*(size_t) (lm_ub_max + 1) : max_nodes, cparams.pipeline_parallel);
+    // a layer-major graph holds the graphs of up to lm_ub_max ubatches (LLAMA_MOE_LAYER_MAJOR_SCHED_PAD=1, debug: that size without them)
+    static const bool lm_sched_pad = getenv("LLAMA_MOE_LAYER_MAJOR_SCHED_PAD") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_SCHED_PAD")) != 0;
+    sched_new(lm_enabled || (lm_sched_pad && moe_cache) ? max_nodes*(size_t) (lm_ub_max + 1) : max_nodes, cparams.pipeline_parallel);
 
     llama_memory_context_ptr mctx;
     if (memory) {
