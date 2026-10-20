@@ -1117,6 +1117,13 @@ void llama_context::sched_reserve() {
     // a layer-major graph holds the graphs of up to lm_ub_max ubatches (LLAMA_MOE_LAYER_MAJOR_SCHED_PAD=1, debug: that size without them)
     static const bool lm_sched_pad = getenv("LLAMA_MOE_LAYER_MAJOR_SCHED_PAD") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_SCHED_PAD")) != 0;
     sched_new(lm_enabled || (lm_sched_pad && moe_cache) ? max_nodes*(size_t) (lm_ub_max + 1) : max_nodes, cparams.pipeline_parallel);
+    // the usual graphs (decode, a ubatch alone) keep a table of their own size: the table sized for a merged graph cost the decode
+    // 0.2-0.3% (G4, Qwen3.6-35B-A3B UD-Q3_K_M + MTP, LLAMA_MOE_LAYER_MAJOR_SCHED_PAD=1); decode_layer_major asks for the full one
+    // (LLAMA_MOE_LAYER_MAJOR_SMALL_HASH=0: the full table for every graph)
+    static const bool lm_small_hash = getenv("LLAMA_MOE_LAYER_MAJOR_SMALL_HASH") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_SMALL_HASH")) != 0;
+    if ((lm_enabled || (lm_sched_pad && moe_cache)) && lm_small_hash) {
+        ggml_backend_sched_set_hash_size_small(sched.get(), max_nodes);
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -3084,6 +3091,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     gf_res_prev_active = nullptr;
     moe_cache_ids.clear();
     ggml_backend_sched_reset(sched.get());
+    ggml_backend_sched_use_full_hash(sched.get());
     ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
     // the prompt does not seed the cache and records no routing
@@ -3649,6 +3657,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     std::function<ggml_status(size_t, size_t)> run_range = [&](size_t a, size_t b) -> ggml_status {
         if (!first_run) {
             ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_use_full_hash(sched.get());
         }
         first_run = false;
         if (b - a == 1) {
@@ -3695,6 +3704,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             std::copy(arr.begin(), arr.end(), node->src);
         }
         ggml_backend_sched_reset(sched.get());
+        ggml_backend_sched_use_full_hash(sched.get());
         // halves (the seed source may end up in an earlier graph than the ubatch it seeds: the seed reads the routing and the expert
         // copies of the source graph, so the cache ends up the same)
         const size_t mid = a + (b - a)/2;
@@ -3738,6 +3748,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             gm = nullptr;
             for (size_t k = n_done; k < group.size(); ++k) {
                 ggml_backend_sched_reset(sched.get());
+                ggml_backend_sched_use_full_hash(sched.get());
                 status = run(group[k].gf);
                 if (status != GGML_STATUS_SUCCESS) {
                     break;
@@ -3754,6 +3765,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         for (size_t k = 0; k < group.size(); ++k) {
             if (k > 0) {
                 ggml_backend_sched_reset(sched.get());
+                ggml_backend_sched_use_full_hash(sched.get());
             }
             status = run(group[k].gf);
             if (status != GGML_STATUS_SUCCESS) {

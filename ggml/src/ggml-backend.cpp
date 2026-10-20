@@ -1070,6 +1070,10 @@ struct ggml_backend_sched {
 
     // hash map of the nodes in the graph
     struct ggml_hash_set  hash_set;
+    // hash_set.size is the size in use: hash_size_full as allocated, or hash_size_small (if set) after every reset, for the usual
+    // graphs; a larger graph asks for the full size after its reset (ggml_backend_sched_use_full_hash)
+    size_t                hash_size_full;
+    size_t                hash_size_small;
     int                 * hv_tensor_backend_ids; // [hash_set.size]
     struct ggml_tensor ** hv_tensor_copies;      // [hash_set.size][n_backends][n_copies]
 
@@ -4439,6 +4443,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
     sched->hash_set    = ggml_hash_set_new(graph_size);
+    sched->hash_size_full  = sched->hash_set.size;
+    sched->hash_size_small = 0;
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
     // the sparse reset of a large table keeps the entries that are not in use at -1 / NULL (see ggml_backend_sched_reset)
@@ -4592,7 +4598,26 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         }
         sched->is_reset = true;
     }
+    // the table is clean: the usual graphs use the small size again
+    if (sched->hash_size_small > 0) {
+        sched->hash_set.size = sched->hash_size_small;
+    }
     sched->is_alloc = false;
+}
+
+void ggml_backend_sched_set_hash_size_small(ggml_backend_sched_t sched, size_t graph_size) {
+    GGML_ASSERT(sched);
+    ggml_backend_sched_reset(sched);
+    const size_t s = graph_size > 0 ? ggml_hash_size(graph_size) : 0;
+    sched->hash_size_small = s > 0 && s < sched->hash_size_full ? s : 0;
+    sched->hash_set.size   = sched->hash_size_small > 0 ? sched->hash_size_small : sched->hash_size_full;
+}
+
+void ggml_backend_sched_use_full_hash(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    // only on a clean table (nothing inserted since the reset): the entries keep their index
+    GGML_ASSERT(sched->is_reset && "ggml_backend_sched_use_full_hash: call it right after ggml_backend_sched_reset");
+    sched->hash_set.size = sched->hash_size_full;
 }
 
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {

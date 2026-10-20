@@ -446,6 +446,12 @@ extern "C" {
     // several ubatches layer by layer (llama LLAMA_MOE_LAYER_MAJOR) keeps every use of a weight copy in the split that copies it
     GGML_API void                 ggml_backend_sched_set_reuse_weight_copies(ggml_backend_sched_t sched, bool enable);
 
+    // A scheduler made for graphs much larger than the usual ones (llama LLAMA_MOE_LAYER_MAJOR): after every reset the node table is
+    // used at the size of a graph of graph_size nodes (0 = always the full size), so the usual graphs keep the cache footprint of a
+    // small table; ggml_backend_sched_use_full_hash, right after a reset, gives the next graph the full table
+    GGML_API void                 ggml_backend_sched_set_hash_size_small(ggml_backend_sched_t sched, size_t graph_size);
+    GGML_API void                 ggml_backend_sched_use_full_hash(ggml_backend_sched_t sched);
+
     // While enabled, ggml_backend_sched_alloc_graph returns false without allocating (prefetch kept) if the compute buffer of a device
     // would grow by more than max_grow bytes or leave less than the prefetch headroom free (64 MiB with a lender); ggml_backend_sched_get_alloc_over then
     // returns the growth the graph needed (0 after an allocation that was not refused)
