@@ -1434,7 +1434,7 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             // ran as 2 + 2 and read the experts twice). With LLAMA_MOE_LAYER_MAJOR_RESERVE_FRAC (default 0.025 when the server checkpoint is
             // one batch back, LLAMA_MOE_LAYER_MAJOR_CKPT=1, else 0) the cache gives up min(frac of itself, (k - 1) x the estimate of one
             // member: n_ubatch x 4 B x (4 n_embd + 4 n_expert_used n_ff_exp)); LLAMA_MOE_LAYER_MAJOR_RESERVE_MIB=N takes N MiB.
-            // Not by default: with the checkpoint one ubatch back an 8k prompt is a group of 3 (fits) + the checkpoint ubatch, and the 768 MiB
+            // Not by default: with the checkpoint one ubatch back an 8k prompt is a group of 3 (fits) + the checkpoint ubatch, and the 481 MiB
             // the cache gave up there cost the decode after it 1.9% (hit rate 86.84 -> 86.62%) for no prompt gain (same G4 VM, 8k cell)
             int64_t reserve = -1;
             if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_RESERVE_MIB")) {
