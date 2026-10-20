@@ -809,6 +809,21 @@ struct llama_moe_cache::impl {
     // short prompts do not take it either
     static constexpr double cmt_host_bad = 1.25;
     bool     cmt_host_ok = true;
+    // warm phase: a trial in a cache that is still filling compares the paths at a miss rate that is about to fall, and the host path
+    // admits fewer experts, so it fills slower (G4 Qwen3.6 UD-Q4_K_XL 12 GB MTP: trial 1 on at a 41.6% miss rate, then off at 15.2%,
+    // chat decode -10%): small batches fetch every miss and windows of cm_win1 batches measure the miss rate until it stops falling (a
+    // window at least cmw_flat of the one before) or cmw_max batches, then the first trial starts
+    static constexpr double cmw_flat = 0.85;
+    static constexpr int    cmw_max  = 160;
+    bool     cmw_on   = false;
+    double   cmw_prev = -1.0;
+    int      cmw_n    = 0;
+    // short prompts (above max_batch): the plain cache pipelines the copies of their spilled experts with the compute of the layers
+    // before (prefetch), which the cost model of the per layer fetch does not see, and each split moves the activations of the batch
+    // both ways (G4 gpt-oss-20b Q2_K 8 GB, 95-token prompt: -19% with the margin of the small batches): the gain must beat
+    // cm_margin_p*(cm_split + n*cm_act)
+    static constexpr double cm_margin_p = 4.0;
+    double   cm_act   = 0.0;   // us per token: its activations to the host and its expert output back
 
     // " (mtp)" for the cache of an MTP context, in its log lines
     const char * tag = "";
@@ -3335,6 +3350,13 @@ struct llama_moe_cache::impl {
         cm_dt    = std::max(0.0, (d_t - d_a)/((double) ka*(T - 1)));
         cm_tup   = std::max(median(tu)/ka, 0.05);
         cm_split = std::max(0.0, d_a - ka*cm_t1) + 2.0*median(trt);
+        {
+            int64_t n_embd = 0;
+            for (const ggml_tensor * t : g.ref) {
+                n_embd = std::max<int64_t>(n_embd, t->ne[0]);
+            }
+            cm_act = 2.0*n_embd*sizeof(float)/std::max(1e-3, g.expert_bytes/cm_tup);
+        }
         GGML_UNUSED(attempt);
 
         cm_share.assign(cm_max + 1, 1.0f);
@@ -3355,9 +3377,15 @@ struct llama_moe_cache::impl {
             cm_rate = std::max(0.01, std::min(1.0, std::pow(1.0 - std::max(0.0, std::min(1.0, cache_frac)), 4.0)));
             cm_decide();
         }
-        if (cm_trial) {
-            cmt_done   = 0;
-            cmt_t_prev = -1;
+        if (cm_trial && !cm_force) {
+            // warm phase first (see cmw_on): small batches off, the first trial starts in cm_tick
+            cmt_done      = -1;
+            cmt_t_prev    = -1;
+            cmw_on        = true;
+            cmw_prev      = -1.0;
+            cmw_n         = 0;
+            cm_small_live = false;
+            cm_gen++;
         }
         if (cm_force) {
             for (int64_t n = 1; n <= cm_max; ++n) {
@@ -3542,6 +3570,20 @@ struct llama_moe_cache::impl {
         cm_rate = miss/(hits + miss);
         cm_decide();
         cm_measured = true;
+        if (cmw_on) {
+            cmw_n += cm_win1;
+            const bool flat = cmw_prev >= 0.0 && cm_rate >= cmw_flat*cmw_prev;
+            if (flat || cmw_n >= cmw_max) {
+                cmw_on        = false;
+                cmt_done      = 0;
+                cmt_t_prev    = -1;
+                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: warm phase over after %d small batches (miss rate %.1f%%, before %.1f%%), "
+                    "the first trial starts\n", tag, cmw_n, 100.0*cm_rate, 100.0*cmw_prev);
+            } else {
+                cm_win = cm_win1;
+            }
+            cmw_prev = cm_rate;
+        }
     }
 
     // per batch size: on where the expected time saved per layer beats the cost of the host split
@@ -3568,7 +3610,8 @@ struct llama_moe_cache::impl {
                 const double f    = cm_share[n];
                 const double m    = cm_rate*D;
                 const double gain = m*(cm_tup - std::max(f*cm_tup, (1.0 - f)*tc));
-                const double need = cm_margin*cm_split*(cm_on[n] && cm_measured ? cm_hyst : 1.0);
+                const double need = (n <= max_batch ? cm_margin*cm_split : cm_margin_p*(cm_split + n*cm_act))*
+                                    (cm_on[n] && cm_measured ? cm_hyst : 1.0);
                 // a batch above max_batch runs the host path in the groups whose slots hold its experts (see use_device), the
                 // other groups copy its experts as a prompt does
                 bool fits = false;
