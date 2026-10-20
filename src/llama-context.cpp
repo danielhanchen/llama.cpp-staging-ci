@@ -2116,9 +2116,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     // hybrid MoE cache: the fetch share is measured with the threads of the small batches, before their first graph is built
-    if (moe_cache && moe_cache->hybrid_probe_pending() && ubatch.n_tokens <= llama_moe_cache::n_small_max && backend_cpu != nullptr) {
+    // (CPU misses: at the first ubatch of any size, with the decode threads, so that the first prompt can use the host path)
+    if (moe_cache && moe_cache->hybrid_probe_pending() && (ubatch.n_tokens <= llama_moe_cache::n_small_max || moe_cache->cpu_miss_enabled()) &&
+            backend_cpu != nullptr) {
         ggml_backend_sched_synchronize(sched.get());
-        set_compute_threads(ubatch.n_tokens > 1);
+        set_compute_threads(moe_cache->cpu_miss_enabled() ? false : ubatch.n_tokens > 1);
         moe_cache->hybrid_probe(backend_cpu);
         ggml_backend_sched_set_overlap(sched.get(), moe_cache->hybrid_active());
     }

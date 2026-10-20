@@ -782,6 +782,7 @@ struct llama_moe_cache::impl {
     uint64_t cm_c0[3] = { 0, 0, 0 }; // hits, fetched, left to the host at the start of the window
     int      cm_nwin  = 0;
     double   cm_rate  = -1.0;  // miss rate of the distinct experts looked up in the last window
+    bool     cm_measured = false; // the decisions come from a measured miss rate (before: the prior, see cm_calibrate)
 
     // " (mtp)" for the cache of an MTP context, in its log lines
     const char * tag = "";
@@ -3311,6 +3312,12 @@ struct llama_moe_cache::impl {
             cm_share[n] = raw <= 0.177 ? 0.125f : raw <= 0.354 ? 0.25f : raw <= 0.612 ? 0.5f : raw <= 0.80 ? 0.75f : 1.0f;
         }
         cm_cal = true;
+        // the first prompt and tokens run before any measured miss rate: decided from the misses of a cache that holds cache_frac of
+        // the experts with no reuse (an upper bound of the miss rate), the first measured window corrects it without the hysteresis
+        if (!cm_force) {
+            cm_rate = std::max(0.02, std::min(1.0, 1.0 - std::max(0.0, cache_frac)));
+            cm_decide();
+        }
         if (cm_force) {
             for (int64_t n = 1; n <= cm_max; ++n) {
                 cm_share[n] = std::min(cm_share[n], 0.75f);
@@ -3324,7 +3331,7 @@ struct llama_moe_cache::impl {
         }
         LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: host %.1f us per expert (%.2f GB/s, %.2f us per further token), upload %.1f us per expert "
             "(%.2f GB/s), host split %.1f us; fetch share %.3f (1 token), %.3f (%d), %.3f (%" PRId64 "), host path possible up to %" PRId64 " tokens; "
-            "decided from the miss rate after %d small batches (%.1f ms)\n", tag,
+            "decided from a prior miss rate, then from the measured one after %d small batches (%.1f ms)\n", tag,
             cm_t1, g.expert_bytes/cm_t1/1e3, cm_dt, cm_tup, g.expert_bytes/cm_tup/1e3, cm_split, cm_share[1], cm_share[std::min<int64_t>(4, cm_max)],
             (int) std::min<int64_t>(4, cm_max), cm_share[cm_max], cm_max, n_max_share, cm_skip + cm_win1, (ggml_time_us() - t_start)/1e3);
     }
@@ -3394,6 +3401,7 @@ struct llama_moe_cache::impl {
         }
         cm_rate = miss/(hits + miss);
         cm_decide();
+        cm_measured = true;
     }
 
     // per batch size: on where the expected time saved per layer beats the cost of the host split
@@ -3420,12 +3428,13 @@ struct llama_moe_cache::impl {
                 const double f    = cm_share[n];
                 const double m    = cm_rate*D;
                 const double gain = m*(cm_tup - std::max(f*cm_tup, (1.0 - f)*tc));
-                const double need = cm_margin*cm_split*(cm_on[n] ? cm_hyst : 1.0);
-                // a batch above max_batch must fit the slots of every group (see use_device)
-                bool fits = true;
+                const double need = cm_margin*cm_split*(cm_on[n] && cm_measured ? cm_hyst : 1.0);
+                // a batch above max_batch runs the host path in the groups whose slots hold its experts (see use_device), the
+                // other groups copy its experts as a prompt does
+                bool fits = false;
                 for (const group & g : groups) {
                     if (g.dev_lookup && g.n_slots > 0) {
-                        fits = fits && std::min<int64_t>(n*n_expert_used, g.ref[0]->ne[2]) <= g.n_slots;
+                        fits = fits || std::min<int64_t>(n*n_expert_used, g.ref[0]->ne[2]) <= g.n_slots;
                     }
                 }
                 on = gain > need && (n <= max_batch || fits) ? 1 : 0;
@@ -5128,6 +5137,10 @@ bool llama_moe_cache::overlap(int64_t n_ubatch) const {
 
 bool llama_moe_cache::hybrid_active() const {
     return pimpl->hybrid_active();
+}
+
+bool llama_moe_cache::cpu_miss_enabled() const {
+    return pimpl->cm;
 }
 
 bool llama_moe_cache::cpu_miss_tick_sync(int64_t n_tokens) const {
