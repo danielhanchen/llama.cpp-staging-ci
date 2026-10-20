@@ -5,9 +5,11 @@
 // one emitted step to the next (draft + verify + sampling + server work; a checkpoint replay folds into the step that emits) and the
 // tokens it emitted, on both sides. After TensorSharp's SpeculationCostGovernor (TensorSharp.Runtime/Speculative/
 // SpeculationCostGovernor.cs): a round measures drafted steps, then a plain block, and judges by the ratio of sums (ms per token); a
-// loss parks drafting for 32 steps, doubling up to 256 while it keeps losing; a win holds for 64 steps while a window of the last 8
-// drafted steps is watched against the round's plain cost; a probe whose first 4 measured steps accepted nothing ends as a loss; a
-// new request caps a park at the first interval and keeps at most one counted loss. The first sample of each side after a change is
+// loss parks drafting for 32 steps, doubling up to 256 while it keeps losing; a win holds for 64 steps, doubling up to 1024 while it
+// keeps winning, and a window of the last 8 drafted steps is watched against the round's plain cost; a probe whose first 4 measured
+// steps accepted nothing ends as a loss, and so does a hold whose last 8 drafted steps accepted nothing; a new request caps a park at
+// the first interval and keeps at most one counted loss, and a winning hold carries over (TensorSharp keeps it too; measured on G4,
+// Qwen3.6 + MTP: re-measuring a plain block at every request cost 2-5% of the decode where drafting wins). The first sample of each side after a change is
 // dropped (it pays the graph rebuild), and so is the worst drafted sample of a round.
 //
 // From plans/mtp_adapt.md (an EMA of step costs carried the warm-up and costs of another context into later decisions): every
@@ -35,6 +37,7 @@ struct common_spec_governor {
     int park_first   = 32;
     int park_max     = 256;
     int win_hold     = 64;
+    int win_hold_max = 1024;
     static constexpr int WIN_WINDOW = 8;
     double margin      = 1.03;
     double win_margin  = 1.10;   // a held win parks when its last WIN_WINDOW drafted steps are this much slower than the round's plain
@@ -45,6 +48,8 @@ struct common_spec_governor {
     int  parked       = 0;   // steps left parked (plain)
     int  hold         = 0;   // steps left in a winning hold
     int  losses_run   = 0;   // consecutive losses
+    int  wins_run     = 0;   // consecutive wins (the hold doubles with them)
+    int  hold_zero    = 0;   // drafted steps in a row that accepted nothing while holding
     bool spec_wins    = true;
 
     // round samples (ratio of sums)
@@ -133,8 +138,14 @@ struct common_spec_governor {
         }
         parked = std::min(parked, park_first);
         losses_run = std::min(losses_run, 1);
-        hold = 0;
+        if (hold > 0 && spec_wins) {
+            // a winning hold carries over, without its watch: the round's plain cost belongs to the previous context
+            plain_ms_tok = 0.0;
+        } else {
+            hold = 0;
+        }
         spec_wins = true;
+        hold_zero = 0;
         reset_round();
         reset_tail();   // plain costs of the previous context say nothing about this one
     }
@@ -143,6 +154,8 @@ struct common_spec_governor {
         spec_wins = false;
         n_losses++;
         losses_run++;
+        wins_run = 0;
+        hold_zero = 0;
         parked = std::min(park_max, park_first << std::min(losses_run - 1, 5));
         hold = 0;
         reset_round();
@@ -159,7 +172,9 @@ struct common_spec_governor {
             spec_wins    = true;
             n_wins++;
             losses_run   = 0;
-            hold         = win_hold;
+            hold         = std::min(win_hold_max, win_hold << std::min(wins_run, 4));
+            wins_run++;
+            hold_zero    = 0;
             plain_ms_tok = plain_ms;
             reset_round();
             reset_tail();
@@ -195,6 +210,16 @@ struct common_spec_governor {
         }
         if (hold > 0) {
             hold--;
+            if (drafted) {
+                hold_zero = n_tok <= 1 ? hold_zero + 1 : 0;
+                if (hold_zero >= WIN_WINDOW) {
+                    if (log) {
+                        fprintf(stderr, "spec governor: hold: %d drafted steps in a row accepted nothing -> park\n", hold_zero);
+                    }
+                    park();
+                    return;
+                }
+            }
             if (drafted && plain_ms_tok > 0.0) {
                 win_us[win_head] = us; win_tok[win_head] = n_tok;
                 win_head = (win_head + 1) % WIN_WINDOW;

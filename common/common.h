@@ -438,8 +438,9 @@ struct common_params_speculative {
     }
 
     // k9-draft: the longest ngram-suffix draft (0 without that type). LLAMA_SPEC_SUFFIX_N_MAX sets it; else ngram_suffix.n_max (7)
-    // alone, and max(draft n_max, 4) beside a model drafter: every kept position of a recurrent model costs one state snapshot
-    // (Qwen3.6-35B-A3B: 63 MiB each, taken from the MoE cache), and the model drafter covers the short rounds
+    // alone, and the model drafter's n_max beside one: the suffix draft then takes a model round when it is sure, with no new verify
+    // shape and no extra recurrent snapshots (each kept position of Qwen3.6-35B-A3B is a 63 MiB state taken from the MoE cache; G4,
+    // a window of 4 beside MTP 2 lost 1-7% decode at 8 / 32 GB against MTP alone, rep cell included)
     int32_t suffix_n_max() const {
         if (std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX) == types.end()) {
             return 0;
@@ -451,7 +452,7 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
-        return model ? std::max(std::max(1, draft.n_max), 4) : std::max(1, ngram_suffix.n_max);
+        return model ? std::max(1, draft.n_max) : std::max(1, ngram_suffix.n_max);
     }
 };
 
