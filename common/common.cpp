@@ -1431,14 +1431,17 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             cparams.n_batch = (uint32_t) want;
             // a merged graph of k ubatches keeps what crosses its cuts for every member; at a large ubatch that is more than the fit leaves
             // free (G4, Flash-Next UD-IQ4_XS 32 GB + Q8_0 MTP drafter, -ub 2048: 4 ubatches needed 755 MiB, 744 MiB were free, so the group
-            // ran as 2 + 2 and read the experts twice). The cache gives up min(LLAMA_MOE_LAYER_MAJOR_RESERVE_FRAC (0.025) of itself,
-            // (k - 1) x the estimate of one member: n_ubatch x 4 B x (4 n_embd + 4 n_expert_used n_ff_exp)); LLAMA_MOE_LAYER_MAJOR_RESERVE_MIB=N
-            // takes N MiB (0: nothing)
+            // ran as 2 + 2 and read the experts twice). With LLAMA_MOE_LAYER_MAJOR_RESERVE_FRAC (default 0.025 when the server checkpoint is
+            // one batch back, LLAMA_MOE_LAYER_MAJOR_CKPT=1, else 0) the cache gives up min(frac of itself, (k - 1) x the estimate of one
+            // member: n_ubatch x 4 B x (4 n_embd + 4 n_expert_used n_ff_exp)); LLAMA_MOE_LAYER_MAJOR_RESERVE_MIB=N takes N MiB.
+            // Not by default: with the checkpoint one ubatch back an 8k prompt is a group of 3 (fits) + the checkpoint ubatch, and the 768 MiB
+            // the cache gave up there cost the decode after it 1.9% (hit rate 86.84 -> 86.62%) for no prompt gain (same G4 VM, 8k cell)
             int64_t reserve = -1;
             if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_RESERVE_MIB")) {
                 reserve = std::max<int64_t>(0, atoll(e)) << 20;
             } else {
-                double frac = 0.025;
+                const bool ckpt_batch = getenv("LLAMA_MOE_LAYER_MAJOR_CKPT") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_CKPT")) != 0;
+                double frac = ckpt_batch ? 0.025 : 0.0;
                 if (const char * ef = getenv("LLAMA_MOE_LAYER_MAJOR_RESERVE_FRAC")) {
                     frac = std::max(0.0, atof(ef));
                 }
