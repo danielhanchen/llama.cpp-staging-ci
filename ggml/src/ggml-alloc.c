@@ -741,8 +741,30 @@ static int get_node_buffer_id(const int * node_buffer_ids, int i) {
 
 static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
     // clear hash tables
-    ggml_hash_set_reset(&galloc->hash_set);
-    memset(galloc->hash_values, 0, sizeof(struct hash_node) * galloc->hash_set.size);
+    // the table only grows (ggml_gallocr_plan): after one large graph (e.g. llama's layer-major prompts, the graphs of up to 16 ubatches
+    // merged) every later plan of a small graph would clear the whole table, so a large table clears only the entries in use (the
+    // entries not in use are kept zero: the values are allocated zeroed and written only through ggml_gallocr_hash_get, which marks them
+    // used). GGML_GALLOCR_SPARSE_RESET=0 clears the whole table
+    static int sparse_env = -1;
+    if (sparse_env < 0) {
+        const char * e = getenv("GGML_GALLOCR_SPARSE_RESET");
+        sparse_env = e == NULL || atoi(e) != 0;
+    }
+    if (sparse_env && galloc->hash_set.size > (1u << 15)) {
+        const size_t n_words = ggml_bitset_size(galloc->hash_set.size);
+        for (size_t w = 0; w < n_words; ++w) {
+            ggml_bitset_t bits = galloc->hash_set.used[w];
+            while (bits) {
+                const size_t i = (w << BITSET_SHR) + (size_t) ggml_bitset_ctz(bits);
+                bits &= bits - 1;
+                memset(&galloc->hash_values[i], 0, sizeof(struct hash_node));
+            }
+        }
+        ggml_hash_set_reset(&galloc->hash_set);
+    } else {
+        ggml_hash_set_reset(&galloc->hash_set);
+        memset(galloc->hash_values, 0, sizeof(struct hash_node) * galloc->hash_set.size);
+    }
 
     // allocate leafs
     // these may be tensors that the application is not using in the graph, but may still want to allocate for other purposes
@@ -859,7 +881,7 @@ static void ggml_gallocr_plan(ggml_gallocr_t galloc, struct ggml_cgraph * graph,
         GGML_ASSERT(galloc->hash_set.keys != NULL);
 
         free(galloc->hash_values);
-        galloc->hash_values = malloc(sizeof(struct hash_node) * galloc->hash_set.size);
+        galloc->hash_values = calloc(galloc->hash_set.size, sizeof(struct hash_node));
         GGML_ASSERT(galloc->hash_values != NULL);
     }
 

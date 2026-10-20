@@ -218,6 +218,20 @@ static size_t ggml_bitset_size(size_t n) {
     return (n + BITSET_MASK) >> BITSET_SHR;
 }
 
+// index of the lowest set bit of a non-zero word
+static inline int ggml_bitset_ctz(ggml_bitset_t x) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_ctz(x);
+#else
+    int n = 0;
+    while (!(x & 1u)) {
+        x >>= 1;
+        n++;
+    }
+    return n;
+#endif
+}
+
 static inline bool ggml_bitset_get(const ggml_bitset_t * bitset, size_t i) {
     return !!(bitset[i >> BITSET_SHR] & (1u << (i & BITSET_MASK)));
 }

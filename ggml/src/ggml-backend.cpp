@@ -4578,7 +4578,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
             for (size_t w = 0; w < n_words; ++w) {
                 ggml_bitset_t bits = sched->hash_set.used[w];
                 while (bits) {
-                    const size_t i = (w << BITSET_SHR) + (size_t) __builtin_ctz(bits);
+                    const size_t i = (w << BITSET_SHR) + (size_t) ggml_bitset_ctz(bits);
                     bits &= bits - 1;
                     sched->hv_tensor_backend_ids[i] = -1;
                     memset(sched->hv_tensor_copies + i*per, 0, per * sizeof(struct ggml_tensor *));
