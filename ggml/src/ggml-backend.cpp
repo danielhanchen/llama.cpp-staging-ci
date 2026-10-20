@@ -3859,6 +3859,13 @@ static void ggml_backend_sched_prefetch_arm(ggml_backend_sched_t sched) {
     }
 }
 
+// GGML_SCHED_PREFETCH_STATS=1 (diagnostic, default off): time the waits of every prefetched graph, also after the adaptive depth settled,
+// and log them per graph (depth, waits, staging and lent bytes)
+static bool ggml_backend_sched_prefetch_stats() {
+    static const bool on = getenv("GGML_SCHED_PREFETCH_STATS") != NULL && atoi(getenv("GGML_SCHED_PREFETCH_STATS")) != 0;
+    return on;
+}
+
 // adaptive depth: read the timers of the last computed graph if they completed (never waits), and decide on a step every few graphs
 static void ggml_backend_sched_prefetch_adapt(ggml_backend_sched_t sched) {
     if (sched->pf_timer_elapsed == NULL) {
@@ -3870,7 +3877,7 @@ static void ggml_backend_sched_prefetch_adapt(ggml_backend_sched_t sched) {
             continue;
         }
         pf->timed = false;
-        if (!sched->pf_adapt || pf->n_timed == 0) {
+        if ((!sched->pf_adapt && !ggml_backend_sched_prefetch_stats()) || pf->n_timed == 0) {
             continue;
         }
         float stall = 0.0f;
@@ -3884,6 +3891,14 @@ static void ggml_backend_sched_prefetch_adapt(ggml_backend_sched_t sched) {
         // first wait to the end of the last timed split
         ok = ok && sched->pf_timer_elapsed(pf->timers[0], pf->timers[2*pf->n_timed], &busy);
         if (!ok || busy <= 0.0f) {
+            continue;
+        }
+        if (ggml_backend_sched_prefetch_stats()) {
+            GGML_LOG_INFO("%s: prefetch stats: depth %d, %d splits (%d async, %d timed), waited %.2f of %.2f ms (%.1f%%), staging %.2f MiB, lent %.2f MiB\n",
+                __func__, pf->depth, pf->n_bound, pf->n_async, pf->n_timed, stall, busy, 100.0*stall/busy, pf->staging/1024.0/1024.0,
+                pf->lent/1024.0/1024.0);
+        }
+        if (!sched->pf_adapt) {
             continue;
         }
         sched->pf_acc_stall += stall;
@@ -4193,7 +4208,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         pf->consumed = 0;
         pf->n_timed  = 0;
         // time the waits of this graph while adapting the depth (only a graph bound at the depth being evaluated)
-        timing[b] = sched->pf_active && sched->pf_adapt && pf->n_async > 0 && pf->depth == sched->pf_depth && sched->pf_timer_new != NULL &&
+        timing[b] = sched->pf_active && (sched->pf_adapt || ggml_backend_sched_prefetch_stats()) && pf->n_async > 0 && (pf->depth == sched->pf_depth || ggml_backend_sched_prefetch_stats()) && sched->pf_timer_new != NULL &&
             ggml_backend_sched_prefetch_timers(sched, b);
         // the copies of this graph run after the work queued on the backend before it (e.g. earlier graphs writing memory a copy callback reads)
         if (sched->pf_active && pf->n_async > 0 && pf->start != NULL) {
