@@ -2226,6 +2226,7 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         , with_model(with_model) {
         params.n_max        = params_all.suffix_n_max();
         params.n_min_match  = std::max(3, env_i("LLAMA_SPEC_SUFFIX_MIN_MATCH", params.n_min_match));
+        params.n_min_draft  = std::max(params.n_min_match, env_i("LLAMA_SPEC_SUFFIX_MIN_DRAFT", params.n_min_draft));
         params.n_max_short  = std::max(1, env_i("LLAMA_SPEC_SUFFIX_N_MAX_SHORT", params.n_max_short));
         params.n_long_match = std::max(params.n_min_match, env_i("LLAMA_SPEC_SUFFIX_LONG_MATCH", params.n_long_match));
         params.p_cut        = env_f("LLAMA_SPEC_SUFFIX_P_CUT", params.p_cut);
@@ -2234,8 +2235,8 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         params.n_max_short  = std::min(params.n_max_short, params.n_max);
         this->n_max = params.n_max;
         sinfos.resize(n_seq);
-        SPC_INF("ngram-suffix: min match %d, n_max %d (%d below a match of %d), p_cut %.2f, %s %.2f\n", params.n_min_match, params.n_max,
-                params.n_max_short, params.n_long_match, params.p_cut,
+        SPC_INF("ngram-suffix: min match %d (%d to draft alone), n_max %d (%d below a match of %d), p_cut %.2f, %s %.2f\n", params.n_min_match,
+                params.n_min_draft, params.n_max, params.n_max_short, params.n_long_match, params.p_cut,
                 with_model ? "beside a model drafter: drafts a full window when q >=" : "alone, p_take unused", params.p_take);
     }
 
@@ -2431,7 +2432,9 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
                 // a full window from a class that is right most of the time, else the model drafts this round
                 k = (offered >= win && q >= params.p_take) ? win : 0;
             } else {
-                k = q >= params.p_cut ? std::min(offered, win) : 0;
+                // a short repeat (under n_min_draft tokens) is in any text and drafts alone only rarely pay: a drafted step between
+                // plain ones changes the graph twice (LLAMA_SPEC_SUFFIX_MIN_DRAFT=3: every match of the index drafts)
+                k = (match >= params.n_min_draft && q >= params.p_cut) ? std::min(offered, win) : 0;
             }
             if (k == 0) {
                 si.ok[b]  *= DRIFT;
