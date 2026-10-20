@@ -2956,6 +2956,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    // speculative decoding with a model (a -md draft model, or a draft type that runs one: the built-in MTP heads, Eagle3, DFlash)
+    cparams.spec_draft        = params.speculative.has_dft() || std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+        [](auto t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
+                            t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; });
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

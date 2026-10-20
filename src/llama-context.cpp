@@ -385,6 +385,7 @@ llama_context::llama_context(
     cparams.moe_cache_size = params.moe_cache_size;
 
     cparams.weight_stream         = params.weight_stream;
+    cparams.spec_draft            = params.spec_draft;
     cparams.weight_stream_io      = params.weight_stream_io;
     cparams.weight_stream_threads = params.weight_stream_threads;
     cparams.weight_stream_ram_mib = params.weight_stream_ram_mib;
@@ -973,17 +974,51 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     if (moe_cache) {
         ggml_backend_sched_set_lend_callback(sched.get(), sched_lend, this);
     }
-    // spilled experts (the MoE cache holds less than the host experts): LLAMA_MOE_PREFETCH_DEPTH_SPILL=N starts the host weight
-    // prefetch at depth N (GGML_SCHED_PREFETCH_DEPTH still wins; not for a tiny cache, the experts of fewer than 4 tokens: its
-    // slots are too few to lend a deeper staging). Unset or 0 = the scheduler default (depth 2). Depth 3 was the default before:
-    // G4 (RTX PRO 6000) 32 GB Flash-Next UD-IQ4_XS 2k prompt 1857 -> 1925 tok/s, 8k at n_ubatch 8192 3951 -> 4290 with the staging
-    // lent; but where its own staging does not fit beside a drafter the depth falls back after the allocation and the cache is
-    // seeded empty instead of prefilled at load (G4 64 GB, Studio argv: chat decode -13%, 2k prompt -39%), it costs the fit cache
-    // on a small GPU (Flash-Next IQ1_S 8 GB: n_ubatch 4096 -> 2048, -2.8% decode), and it reads more from the disk when the uncached
-    // experts do not fit the page cache (L4 52 GB RAM: 2k decode 13.2 -> 10.2 tok/s)
+    // spilled experts (the MoE cache holds less than the host experts): every prompt ubatch uploads the experts the cache misses in
+    // every layer, and copies of 3 splits in flight hide them better than the default 2 when the staging is lent from the cache.
+    // Start depth (GGML_SCHED_PREFETCH_DEPTH still wins; never for a cache of fewer than 4 tokens' experts in one bank, n_tokens_cached):
+    // - LLAMA_MOE_PREFETCH_DEPTH_SPILL=N: N (0 = the scheduler default), no other check
+    // - else 3 when no speculative decoding with a model runs beside this context (cparams.spec_draft: a -md draft or built-in MTP
+    //   heads), the cache holds the experts of at least LLAMA_MOE_PREFETCH_DEPTH_SPILL_MIN_TOKENS (4) tokens over all layers, and the
+    //   uncached host experts are at most LLAMA_MOE_PREFETCH_DEPTH_SPILL_MAX_RAM_FRAC (0.5) of the RAM; otherwise the default 2.
+    //   LLAMA_MOE_PREFETCH_DEPTH_RULE=0 keeps the default 2 everywhere.
+    // Why (G4 RTX PRO 6000, 3 reps, A/A <= 0.3%): no draft, staging lent: gpt-oss-20B Q2_K 8 GB 2k / 8k prompt 10864 -> 12487 /
+    // 14409 -> 16276 tok/s, Qwen3.6-35B-A3B 8 GB 8k 9083 -> 10586, decode unchanged. With a drafter the depth-3 staging competes with
+    // the draft: Flash-Next UD-IQ4_XS 64 GB (Studio argv) 2k prompt 3647 -> 2291, chat decode 163 -> 142 (the depth falls back after the
+    // allocation and the cache is seeded empty instead of prefilled). A tiny cache (Flash-Next UD-IQ1_S 8 GB, the experts of 1.0 tokens)
+    // pays the deeper staging with cache: n_ubatch 4096 -> 2048, prompt -1.8%, decode -1.5%. Uncached experts beyond the page cache read
+    // more from the disk at depth 3 (L4 52 GB RAM, Flash-Next UD-IQ4_XS: 2k decode 13.2 -> 10.2)
     if (moe_cache && moe_cache->cached_frac() >= 0.0 && moe_cache->cached_frac() < 0.98 && moe_cache->n_tokens_cached() >= 4) {
         const char * env_depth = getenv("LLAMA_MOE_PREFETCH_DEPTH_SPILL");
-        static const int depth_spill = env_depth != nullptr ? atoi(env_depth) : 0;
+        int depth_spill = 0;
+        if (env_depth != nullptr) {
+            depth_spill = atoi(env_depth);
+        } else if (getenv("LLAMA_MOE_PREFETCH_DEPTH_RULE") == nullptr || atoi(getenv("LLAMA_MOE_PREFETCH_DEPTH_RULE")) != 0) {
+            double min_tokens = 4.0;
+            if (const char * e = getenv("LLAMA_MOE_PREFETCH_DEPTH_SPILL_MIN_TOKENS")) {
+                min_tokens = std::max(0.0, atof(e));
+            }
+            double ram_frac = 0.5;
+            if (const char * e = getenv("LLAMA_MOE_PREFETCH_DEPTH_SPILL_MAX_RAM_FRAC")) {
+                ram_frac = std::max(0.0, atof(e));
+            }
+            // the experts of one token over all layers are n_expert_used / n_expert of the host experts
+            const uint32_t n_used = model.hparams.n_expert_used_max();
+            const double tokens = n_used > 0 ? moe_cache->cached_frac()*(double) model.hparams.n_expert/(double) n_used : 0.0;
+            const uint64_t ram_total = llama_sysmem::total();
+            const bool ram_ok = ram_total == 0 || moe_cache->host_uncached_bytes() <= ram_frac*(double) ram_total;
+            const char * why = cparams.spec_draft ? "speculative decoding with a draft model or MTP heads" :
+                tokens < min_tokens ? "the cache holds the experts of fewer tokens than LLAMA_MOE_PREFETCH_DEPTH_SPILL_MIN_TOKENS" :
+                !ram_ok ? "the uncached host experts are more than LLAMA_MOE_PREFETCH_DEPTH_SPILL_MAX_RAM_FRAC of the RAM" : nullptr;
+            depth_spill = why == nullptr ? 3 : 0;
+            static bool logged = false; // once per process, not for a memory probe (no_alloc), whose log the fit silences
+            if (!logged && !model.hparams.no_alloc) {
+                logged = true;
+                LLAMA_LOG_INFO("%s: MoE cache: host weight prefetch of the spilled experts starts at depth %s (cache = the experts of %.1f "
+                    "tokens%s%s; LLAMA_MOE_PREFETCH_DEPTH_SPILL=N forces N, LLAMA_MOE_PREFETCH_DEPTH_RULE=0 keeps the default)\n", __func__,
+                    why == nullptr ? "3" : "the default", tokens, why ? ": " : "", why ? why : "");
+            }
+        }
         if (depth_spill > 0) {
             ggml_backend_sched_set_prefetch_depth_init(sched.get(), depth_spill);
         }
@@ -5442,6 +5477,7 @@ llama_context_params llama_context_default_params() {
         /*.mem_reserve_devs            =*/ nullptr,
         /*.mem_reserve                 =*/ nullptr,
         /*.n_mem_reserve               =*/ 0,
+        /*.spec_draft                  =*/ false,
     };
 
     return result;

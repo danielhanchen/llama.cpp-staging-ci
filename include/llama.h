@@ -456,6 +456,10 @@ extern "C" {
         const ggml_backend_dev_t * mem_reserve_devs;
         const size_t *             mem_reserve;
         size_t                     n_mem_reserve;
+
+        // a draft model or a built-in MTP head runs speculative decoding beside this context: spilled MoE experts then keep the
+        // default host weight prefetch depth instead of the deeper start (llama_context::sched_new) [EXPERIMENTAL]
+        bool spec_draft;
     };
 
     struct llama_model_tensor_override {

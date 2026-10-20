@@ -61,6 +61,7 @@ struct llama_cparams {
     size_t moe_cache_size;
 
     int32_t  weight_stream;
+    bool     spec_draft; // llama_context_params::spec_draft
     int32_t  weight_stream_io;
     int32_t  weight_stream_threads;
     uint32_t weight_stream_ram_mib;
