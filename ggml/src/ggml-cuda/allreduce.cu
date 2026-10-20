@@ -6,6 +6,7 @@
 #include "ggml-impl.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -681,7 +682,87 @@ static bool ggml_cuda_ar_p2p_probe(ggml_cuda_ar_pipeline * p, char * why, size_t
 }
 #endif // !defined(GGML_USE_HIP)
 
-// Decides the P2P path: GGML_CUDA_AR_P2P=0 disables it; otherwise it is used when both
+#if !defined(GGML_USE_HIP)
+// Wall time (microseconds per AllReduce) of `iters` back-to-back decode-sized F32 AllReduces
+// (`count` elements) on both GPUs, through the P2P kernel (p2p = true) or the host-staged
+// kernel. Uses its own token range and resets the arrival / flag rings afterwards.
+static double ggml_cuda_ar_time_decode(ggml_cuda_ar_pipeline * p, bool p2p, float * const buf[2], int count, int iters) {
+    for (int i = 0; i < 2; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        CUDA_CHECK(cudaStreamSynchronize(p->streams[i]));
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int it = 0; it < iters; ++it) {
+        const int slot  = it % GGML_CUDA_AR_POOL_SIZE;
+        const int token = it + 1;
+        for (int i = 0; i < 2; ++i) {
+            const int peer = 1 - i;
+            ggml_cuda_set_device(p->devices[i]);
+            if (p2p) {
+                ggml_cuda_ar_p2p_kernel<float, float><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, p->streams[i]>>>(
+                    buf[i], buf[i],
+                    reinterpret_cast<float *>(p->p2p_inbox[peer] + (size_t) slot * p->buf_bytes),
+                    reinterpret_cast<const float *>(p->p2p_inbox[i] + (size_t) slot * p->buf_bytes),
+                    count, ggml_cuda_ar_p2p_flag_ptr(p, slot, peer), ggml_cuda_ar_p2p_flag_ptr(p, slot, i), token, 0LL, nullptr);
+            } else {
+                ggml_cuda_ar_kernel<float, float><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, p->streams[i]>>>(
+                    buf[i], buf[i],
+                    reinterpret_cast<float *>(p->host_buf[i].dev + (size_t) slot * p->buf_bytes),
+                    reinterpret_cast<const float *>(p->host_buf[peer].dev + (size_t) slot * p->buf_bytes),
+                    count, ggml_cuda_ar_arrival_ptr(p, slot, i), ggml_cuda_ar_arrival_ptr(p, slot, peer), token);
+            }
+        }
+    }
+    for (int i = 0; i < 2; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        CUDA_CHECK(cudaStreamSynchronize(p->streams[i]));
+    }
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / iters;
+    const size_t arrival_bytes = (size_t) GGML_CUDA_AR_POOL_SIZE * p->n_devices * GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    const size_t flag_bytes    = (size_t) GGML_CUDA_AR_POOL_SIZE * GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    ggml_cuda_set_device(p->devices[0]);
+    CUDA_CHECK(cudaMemset(p->arrival.dev, 0, arrival_bytes));
+    for (int i = 0; i < 2; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        CUDA_CHECK(cudaMemset(p->p2p_flags[i], 0, flag_bytes));
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    return us;
+}
+
+// Auto mode: P2P only when it is measurably faster than host staging for a decode-sized
+// AllReduce on this machine (median of 3 trials each, P2P must win by >= 3%). On 2x T4
+// over a PCIe host bridge (Kaggle) P2P measured no decode gain (plans/multi_gpu_dense.md).
+static bool ggml_cuda_ar_p2p_faster(ggml_cuda_ar_pipeline * p, double * us_p2p, double * us_host) {
+    const int count = 8192; // 32 KiB of F32: a decode-sized hidden state
+    float * buf[2] = {};
+    for (int i = 0; i < 2; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        CUDA_CHECK(cudaMalloc((void **) &buf[i], count * sizeof(float)));
+        CUDA_CHECK(cudaMemset(buf[i], 0, count * sizeof(float)));
+    }
+    double tp[3], th[3];
+    ggml_cuda_ar_time_decode(p, true, buf, count, 16);   // warm-up
+    ggml_cuda_ar_time_decode(p, false, buf, count, 16);
+    for (int t = 0; t < 3; ++t) {
+        tp[t] = ggml_cuda_ar_time_decode(p, true, buf, count, 200);
+        th[t] = ggml_cuda_ar_time_decode(p, false, buf, count, 200);
+    }
+    std::sort(tp, tp + 3);
+    std::sort(th, th + 3);
+    *us_p2p  = tp[1];
+    *us_host = th[1];
+    for (int i = 0; i < 2; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        CUDA_CHECK(cudaFree(buf[i]));
+    }
+    return tp[1] < 0.97 * th[1];
+}
+#endif // !defined(GGML_USE_HIP)
+
+// Decides the P2P path: GGML_CUDA_AR_P2P=0 disables it, =1 uses it whenever the probe passes;
+// unset (auto) also requires it to be faster than host staging (ggml_cuda_ar_p2p_faster). It is
+// only considered when both
 // directions report peer access, peer access can be enabled and the probe passes.
 static bool ggml_cuda_ar_p2p_setup(ggml_cuda_ar_pipeline * p, char * why, size_t why_n) {
 #if defined(GGML_USE_HIP)
@@ -740,7 +821,20 @@ static bool ggml_cuda_ar_p2p_setup(ggml_cuda_ar_pipeline * p, char * why, size_t
         ggml_cuda_ar_p2p_release(p);
         return false;
     }
-    snprintf(why, why_n, "probe passed (4 kernel rounds + %zu MiB peer copy each way)", p->copy_bytes >> 20);
+    const bool forced = env != nullptr && strcmp(env, "1") == 0;
+    if (forced) {
+        snprintf(why, why_n, "probe passed (4 kernel rounds + %zu MiB peer copy each way), forced by GGML_CUDA_AR_P2P=1", p->copy_bytes >> 20);
+        return true;
+    }
+    double us_p2p = 0.0, us_host = 0.0;
+    if (!ggml_cuda_ar_p2p_faster(p, &us_p2p, &us_host)) {
+        snprintf(why, why_n, "probe passed, but a 32 KiB AllReduce takes %.1f us P2P vs %.1f us host-staged; GGML_CUDA_AR_P2P=1 forces P2P",
+                 us_p2p, us_host);
+        ggml_cuda_ar_p2p_release(p);
+        return false;
+    }
+    snprintf(why, why_n, "probe passed (4 kernel rounds + %zu MiB peer copy each way), 32 KiB AllReduce %.1f us P2P vs %.1f us host-staged",
+             p->copy_bytes >> 20, us_p2p, us_host);
     return true;
 #endif // defined(GGML_USE_HIP)
 }
