@@ -3894,9 +3894,9 @@ static void ggml_backend_sched_prefetch_adapt(ggml_backend_sched_t sched) {
             continue;
         }
         if (ggml_backend_sched_prefetch_stats()) {
-            GGML_LOG_INFO("%s: prefetch stats: depth %d, %d splits (%d async, %d timed), waited %.2f of %.2f ms (%.1f%%), staging %.2f MiB, lent %.2f MiB\n",
-                __func__, pf->depth, pf->n_bound, pf->n_async, pf->n_timed, stall, busy, 100.0*stall/busy, pf->staging/1024.0/1024.0,
-                pf->lent/1024.0/1024.0);
+            // the binding may have changed since the graph ran (the next graph is bound before this is read): only the timers are its own
+            GGML_LOG_INFO("%s: prefetch stats: depth %d, %d timed splits waited %.2f of %.2f ms (%.1f%%) for their copies\n",
+                __func__, pf->depth, pf->n_timed, stall, busy, 100.0*stall/busy);
         }
         if (!sched->pf_adapt) {
             continue;
