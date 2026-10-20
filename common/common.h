@@ -377,7 +377,7 @@ struct common_params_speculative_ngram_mod {
 // drafts only when q >= p_take and the window is full, else the model drafts (LLAMA_SPEC_SUFFIX_* env tune it)
 struct common_params_speculative_ngram_suffix {
     int32_t n_min_match  = 3;
-    int32_t n_min_draft  = 6;   // alone: the shortest match that drafts (sparse short repeats cost two graph changes each for little)
+    int32_t n_min_draft  = 12;  // alone: the shortest match that drafts (sparse short repeats cost two graph changes each for little)
     int32_t n_max        = 7;   // verify batches of at most 8 rows: the per-column (MMVQ) kernels of a decode, so LLAMA_MTP_EXACT=1 stays bit exact
     int32_t n_max_short  = 3;
     int32_t n_long_match = 8;

@@ -18,7 +18,9 @@
 // are dropped when a request ends.
 //
 // Steps where drafting was allowed but produced no draft (an n-gram drafter without a match) are not samples of either side.
-// LLAMA_SPEC_GOVERNOR=0: off (drafting always allowed, the code path of the k9 tip). LLAMA_SPEC_GOVERNOR_MARGIN (1.03): drafting stays
+// OPT-IN, LLAMA_SPEC_GOVERNOR=1 (unset / 0: off, drafting always allowed, the code path of the k9 tip): on G4 (RTX PRO 6000) it cost
+// 0-5% decode beside a winning MTP head (Qwen3.6-35B-A3B, gemma-4-26B-A4B + its assistant, n_max 2) and did not recover the n-gram
+// losses on LFM2.5 (plans/k9_draft.md). LLAMA_SPEC_GOVERNOR_MARGIN (1.03): drafting stays
 // on while its ms per token is at most margin x the plain one; LLAMA_SPEC_GOVERNOR_LOG=1 logs every verdict.
 
 #include <algorithm>
@@ -75,7 +77,7 @@ struct common_spec_governor {
 
     common_spec_governor() {
         const char * e = getenv("LLAMA_SPEC_GOVERNOR");
-        enabled = e == nullptr || atoi(e) != 0;
+        enabled = e != nullptr && atoi(e) != 0;
         if (const char * m = getenv("LLAMA_SPEC_GOVERNOR_MARGIN")) {
             margin = std::max(0.5, atof(m));
         }

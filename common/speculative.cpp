@@ -32,17 +32,18 @@
 
 // Rebuild seq_id's draft sampler at the target's temperature: rejection weighs q against p, so
 // both have to sample alike. Only temp and seed carry over; the draft keeps its own top_k.
-// k9-draft: the probabilistic draft samples from the target's own truncation (top-k, top-p, min-p, then the temperature), so its
-// distribution q is close to the target's p and min(1, p/q) accepts more; the draft stays exact for any q (rejection sampling).
-// LLAMA_SPEC_DRAFT_MIRROR=0: the earlier draft sampler (top-k 10 and the temperature only). The draft's top-k is capped at
-// LLAMA_SPEC_DRAFT_TOPK_MAX (40) so the candidate list the verifier scans stays short.
+// k9-draft: OPT-IN, LLAMA_SPEC_DRAFT_MIRROR=1: the probabilistic draft samples from the target's own truncation (top-k, top-p, min-p,
+// then the temperature; top-k capped at LLAMA_SPEC_DRAFT_TOPK_MAX, 40). The draft stays exact for any q (rejection sampling), but the
+// mirrored q accepted less than the default top-k 10 + temperature (Qwen3.6-35B-A3B + MTP, Studio's presence penalty 1.5 moves p and
+// not q: B200 acceptance over 4-6 x 256 tokens 0.61 vs 0.64 at T 1.0, 0.62 vs 0.64 at T 0.6, 0.61 vs 0.63 at T 0.7; G4 chat_s / chat_t
+// decode below the default), so the default keeps the earlier sampler.
 static void spec_retune(
         std::vector<common_sampler_ptr> & smpls,
         std::vector<common_params_sampling> & cfg,
         const llama_model * model,
         llama_seq_id seq_id,
         const common_speculative_draft_params & dp) {
-    static const bool mirror = getenv("LLAMA_SPEC_DRAFT_MIRROR") == nullptr || atoi(getenv("LLAMA_SPEC_DRAFT_MIRROR")) != 0;
+    static const bool mirror = getenv("LLAMA_SPEC_DRAFT_MIRROR") != nullptr && atoi(getenv("LLAMA_SPEC_DRAFT_MIRROR")) != 0;
     static const int  k_max  = getenv("LLAMA_SPEC_DRAFT_TOPK_MAX") != nullptr ? std::max(1, atoi(getenv("LLAMA_SPEC_DRAFT_TOPK_MAX"))) : 40;
 
     const float temp  = dp.temp;
