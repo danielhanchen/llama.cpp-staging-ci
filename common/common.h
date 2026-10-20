@@ -377,7 +377,7 @@ struct common_params_speculative_ngram_mod {
 // drafts only when q >= p_take and the window is full, else the model drafts (LLAMA_SPEC_SUFFIX_* env tune it)
 struct common_params_speculative_ngram_suffix {
     int32_t n_min_match  = 3;
-    int32_t n_max        = 8;
+    int32_t n_max        = 7;   // verify batches of at most 8 rows: the per-column (MMVQ) kernels of a decode, so LLAMA_MTP_EXACT=1 stays bit exact
     int32_t n_max_short  = 3;
     int32_t n_long_match = 8;
     float   p_cut        = 0.6f;
@@ -436,7 +436,7 @@ struct common_params_speculative {
         return n;
     }
 
-    // k9-draft: the longest ngram-suffix draft (0 without that type). LLAMA_SPEC_SUFFIX_N_MAX sets it; else ngram_suffix.n_max (8)
+    // k9-draft: the longest ngram-suffix draft (0 without that type). LLAMA_SPEC_SUFFIX_N_MAX sets it; else ngram_suffix.n_max (7)
     // alone, and max(draft n_max, 4) beside a model drafter: every kept position of a recurrent model costs one state snapshot
     // (Qwen3.6-35B-A3B: 63 MiB each, taken from the MoE cache), and the model drafter covers the short rounds
     int32_t suffix_n_max() const {
