@@ -3270,15 +3270,17 @@ struct llama_moe_cache::impl {
         std::vector<int64_t> tu, trt;
         ggml_backend_t backend = devices[g.id].backend;
         ggml_backend_synchronize(backend);
+        // the uploads of ka experts are queued together and waited for once, as the fetches of a layer (one copy latency, not ka)
         for (int r = 0; r <= n_rep; ++r) {
             const int64_t t0 = ggml_time_us();
             for (int i = 0; i < ka; ++i) {
                 const int64_t e = next++ % n_expert;
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                     const size_t nb = l.experts[ip]->nb[2];
-                    ggml_backend_tensor_set(g.banks[ip], (const uint8_t *) l.experts[ip]->data + e*nb, (size_t) g.n_slots*nb, nb);
+                    ggml_backend_tensor_set_async(backend, g.banks[ip], (const uint8_t *) l.experts[ip]->data + e*nb, (size_t) g.n_slots*nb, nb);
                 }
             }
+            ggml_backend_synchronize(backend);
             if (r > 0) {
                 tu.push_back(ggml_time_us() - t0);
             }
