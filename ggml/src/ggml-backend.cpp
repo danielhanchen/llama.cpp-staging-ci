@@ -4703,8 +4703,9 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
         }
         // the free memory left: the prefetch headroom (at least 512 MiB), as ggml_backend_sched_alloc_splits checks after a reallocation;
-        // with a lender set that check is skipped (the lender keeps its own reserve): GGML_SCHED_ALLOC_LIMIT_FREE_MIB (128)
-        static const size_t lend_free = (size_t) (getenv("GGML_SCHED_ALLOC_LIMIT_FREE_MIB") ? std::max(0, atoi(getenv("GGML_SCHED_ALLOC_LIMIT_FREE_MIB"))) : 128) << 20;
+        // with a lender set that check is skipped (the lender keeps its own reserve): GGML_SCHED_ALLOC_LIMIT_FREE_MIB (64;
+        // the memory fit already left its target free before: Qwen3.6 UD-Q3_K_M on G4 at 8 GB, server with MTP, grew 16 ubatches by 306 MiB)
+        static const size_t lend_free = (size_t) (getenv("GGML_SCHED_ALLOC_LIMIT_FREE_MIB") ? std::max(0, atoi(getenv("GGML_SCHED_ALLOC_LIMIT_FREE_MIB"))) : 64) << 20;
         const size_t headroom = sched->callback_lend != NULL ? lend_free : std::max<size_t>(sched->pf_headroom, (size_t) 512 << 20);
         size_t over = 0;
         for (int b = 0; b < sched->n_backends; b++) {
