@@ -786,8 +786,8 @@ struct llama_moe_cache::impl {
     // small batches (at most max_batch tokens): the cost model gives the candidate sizes and the share, a timing trial keeps the host path only
     // where it is faster: the time of a split boundary (device sync, host threads, copies, the CUDA graph cut in two) is not something the
     // calibration sees (G4: modelled 25 us per layer, measured 60-70 us: Qwen3.6 UD-Q4_K_XL 12 GB without a draft -20% decode with the model
-    // alone). Trial = 5 blocks of cmt_block small batches: host path off (warm-up, not counted), off, on, on, off; the time from one small batch
-    // to the next goes to the path of the first, the first cmt_skip of a block are not counted (graphs rebuilt); on if the median is at least
+    // alone). Trial = 5 blocks of cmt_block small batches: host path off (warm-up, not counted), off, on, on, off; each counted small batch is
+    // timed from before its graph to its end (synchronized), the first cmt_skip of a block are not counted (graphs rebuilt); on if the median is at least
     // cmt_margin faster; trials again after cmt_gap small batches (doubled each time, at most cmt_gap_max) since the misses change with the
     // cache and the prompts. LLAMA_MOE_CPU_MISS_TRIAL=0: the model alone decides
     static constexpr int    cmt_block   = 8;
@@ -3390,27 +3390,35 @@ struct llama_moe_cache::impl {
         return n_tokens >= 1 && n_tokens <= max_batch && n_tokens <= cm_max && cm_on[n_tokens] != 0;
     }
 
-    // before the graph of every ubatch while a trial runs or waits, after the previous ubatch finished (backends synchronized)
+    // the ubatch timed by the trial was computed (backends synchronized): its time from the tick (graph build + compute; the time of
+    // the other contexts, e.g. an MTP draft between two verify batches, is not in it)
+    bool cmt_timed() const {
+        return cmt_t_prev >= 0;
+    }
+    void cmt_end() {
+        if (cmt_t_prev >= 0) {
+            cmt_t[cmt_arm].push_back(ggml_time_us() - cmt_t_prev);
+            cmt_t_prev = -1;
+        }
+    }
+
+    // before the graph of every ubatch while a trial runs or waits
     void cmt_tick(int64_t n_tokens) {
         if (!cmt_pending()) {
             return;
         }
         const bool counted = cmt_counted(n_tokens);
         const int64_t now = ggml_time_us();
+        cmt_t_prev = -1;
         if (cmt_done < 0) {
             if (!counted || --cmt_wait > 0) {
                 return;
             }
             cmt_wait   = -1;
             cmt_done   = 0;
-            cmt_t_prev = -1;
         }
-        if (cmt_t_prev >= 0 && counted) {
-            cmt_t[cmt_arm].push_back(now - cmt_t_prev);
-        }
-        cmt_t_prev = -1;
         if (!counted) {
-            return; // the next interval would include this ubatch
+            return;
         }
         auto median = [](std::vector<int64_t> v) {
             std::sort(v.begin(), v.end());
@@ -5325,7 +5333,15 @@ bool llama_moe_cache::hybrid_window_pending() const {
 }
 
 bool llama_moe_cache::hybrid_tick_sync() const {
-    return !pimpl->cm || pimpl->cmt_done >= 0 || pimpl->cmt_wait == 1;
+    return !pimpl->cm; // CPU misses: each timed ubatch is synchronized at its end (see hybrid_tick_end)
+}
+
+bool llama_moe_cache::hybrid_tick_timed() const {
+    return pimpl->cm && pimpl->cmt_timed();
+}
+
+void llama_moe_cache::hybrid_tick_end() {
+    pimpl->cmt_end();
 }
 
 void llama_moe_cache::hybrid_tick(int64_t n_tokens) {

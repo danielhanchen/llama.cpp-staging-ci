@@ -108,6 +108,9 @@ public:
     bool hybrid_window_pending() const;
     // the next tick times the ubatches (synchronize the backends before it); CPU misses: only while a trial runs or is about to start
     bool hybrid_tick_sync() const;
+    // CPU misses trial: the ubatch after the tick is timed; synchronize after its graph is computed, then hybrid_tick_end
+    bool hybrid_tick_timed() const;
+    void hybrid_tick_end();
 
     // fetch overlap rule (default) or auto (LLAMA_MOE_CACHE_FETCH_OVERLAP=3): true while a window or trial runs or waits; the tick goes before the graph of
     // every ubatch then, after the previous ubatch finished when overlap_tick_sync() (the backends are synchronized)

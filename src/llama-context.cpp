@@ -2255,6 +2255,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    // CPU misses trial: the ubatch is timed to its end, without the work of other contexts
+    if (moe_cache && status == GGML_STATUS_SUCCESS && moe_cache->hybrid_tick_timed()) {
+        ggml_backend_sched_synchronize(sched.get());
+        moe_cache->hybrid_tick_end();
+    }
     if (moe_cache && moe_cache_devseed_on && moe_cache_devseed) {
         // a failed graph may have run only some of its seed plans and fills: the groups it seeds are cleared
         moe_cache->devseed_end(res->get_gf(), status == GGML_STATUS_SUCCESS);
