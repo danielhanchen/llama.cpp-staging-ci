@@ -2919,11 +2919,15 @@ static bool ggml_backend_sched_prefetch_ensure(ggml_backend_sched_t sched, int b
         if (dev != NULL) {
             ggml_backend_dev_memory(dev, &free, &total);
         }
-        if (dev != NULL && total > 0 && free < pf->staging - pf->arena_size + headroom) {
+        // nor during a graph whose allocation was checked against the free memory before this step (ggml_backend_sched_set_alloc_limit,
+        // a merged layer-major graph): the arena would take the memory its compute buffers were measured to fit in (G4, Qwen3.6-35B-A3B
+        // UD-Q3_K_M + MTP at 8 GB: the MTP context stepped to depth 3 after a chat, its 432 MiB arena was allocated with the 8k prompt's
+        // merged graph, whose compute buffers then failed, which turned the prefetch off for good)
+        if (dev != NULL && total > 0 && (free < pf->staging - pf->arena_size + headroom || sched->alloc_limit_on)) {
             const int back = sched->pf_adapt_from > 0 && sched->pf_adapt_from < pf->depth ? sched->pf_adapt_from : sched->pf_depth0;
-            GGML_LOG_INFO("%s: %s: depth %d needs %.2f MiB more staging memory, %.2f MiB free (headroom %.0f MiB): settled at depth %d\n", __func__,
+            GGML_LOG_INFO("%s: %s: depth %d needs %.2f MiB more staging memory, %.2f MiB free (headroom %.0f MiB%s): settled at depth %d\n", __func__,
                 ggml_backend_name(backend), pf->depth, (pf->staging - pf->arena_size) / 1024.0 / 1024.0, free / 1024.0 / 1024.0,
-                headroom / 1024.0 / 1024.0, back);
+                headroom / 1024.0 / 1024.0, sched->alloc_limit_on ? ", in a graph with an allocation limit" : "", back);
             sched->pf_depth = back;
             sched->pf_adapt = false;
             pf->depth   = back;
