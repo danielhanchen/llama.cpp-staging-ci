@@ -3494,6 +3494,63 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
     }
 
+    // the outputs of the members [n_extracted, n) (in order), right after the graph that computed them: the compute buffer of a later
+    // graph of the group reuses their memory
+    size_t n_extracted = 0;
+    auto extract_upto = [&](size_t n) {
+        for (; n_extracted < n; ++n_extracted) {
+            const auto & g = group[n_extracted];
+            const llama_ubatch & ubatch = *g.ub;
+            auto * res = g.res;
+            n_outputs = g.n_outputs;
+
+            auto * t_logits  = res->get_logits();
+            auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn() : nullptr;
+
+            if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+                ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+                GGML_ASSERT(backend_res != nullptr);
+                GGML_ASSERT(n_outputs_prev + n_outputs <= n_outputs_all);
+                GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
+                ggml_backend_tensor_get_async(backend_res, t_logits, logits.data + n_outputs_prev*n_vocab, 0, n_outputs*n_vocab*sizeof(float));
+            }
+
+            bool extract_all_idxs = false;
+            {
+                const bool masked    = cparams.embeddings_nextn_masked;
+                const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
+                const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
+
+                if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+                    ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+                    GGML_ASSERT(backend_h != nullptr);
+                    const uint32_t n_embd  = hparams.n_embd_out();
+                    GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
+                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data + offset*n_embd, 0, n_rows*n_embd*sizeof(float));
+                    extract_all_idxs = !masked;
+                }
+            }
+            if (extract_all_idxs) {
+                GGML_ASSERT(ubatch.data && ubatch.data->batch_idxs.size() == ubatch.n_tokens);
+                GGML_ASSERT(embd_batch_idxs.size() == (size_t) n_tokens_prev);
+                const auto & batch_idxs = ubatch.data->batch_idxs;
+                embd_batch_idxs.insert(embd_batch_idxs.end(), batch_idxs.begin(), batch_idxs.end());
+            }
+
+            // backend samplers (e.g. the greedy draft of an MTP context): only the last ubatch of a group has outputs
+            if (!sampling.samplers.empty()) {
+                const auto stride = n_vocab;
+                copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
+                copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
+                copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
+                copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+            }
+
+            n_outputs_prev += n_outputs;
+            n_tokens_prev  += ubatch.n_tokens;
+        }
+    };
+
     ggml_status status = GGML_STATUS_SUCCESS;
     const int64_t t1_us = ggml_time_us();
     int64_t n_tokens_max = 0;
@@ -3591,6 +3648,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             if (st == GGML_STATUS_SUCCESS) {
                 n_sub++;
                 n_done = b;
+                extract_upto(n_done);
             }
             return st;
         }
@@ -3620,6 +3678,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             n_sub++;
             if (st == GGML_STATUS_SUCCESS) {
                 n_done = b;
+                extract_upto(n_done);
             }
             return st;
         }
@@ -3637,8 +3696,17 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         lm_n_split++;
         lm_refused_min = std::min(lm_refused_min, b - a);
         if (lm_verbose) {
-            LLAMA_LOG_INFO("%s: the graph of ubatches [%zu, %zu) would grow the compute buffers by %.2f MiB: split at %zu\n", __func__, a, b,
-                over/1048576.0, mid);
+            size_t free_min = SIZE_MAX;
+            for (auto & bk : backend_ptrs) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(bk);
+                if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    size_t fr = 0, tot = 0;
+                    ggml_backend_dev_memory(dev, &fr, &tot);
+                    free_min = std::min(free_min, fr);
+                }
+            }
+            LLAMA_LOG_INFO("%s: the graph of ubatches [%zu, %zu) would grow the compute buffers by %.2f MiB (%.2f MiB free): split at %zu\n",
+                __func__, a, b, over/1048576.0, free_min == SIZE_MAX ? -1.0 : free_min/1048576.0, mid);
         }
         st = run_range(a, mid);
         if (st != GGML_STATUS_SUCCESS) {
@@ -3666,6 +3734,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 if (status != GGML_STATUS_SUCCESS) {
                     break;
                 }
+                extract_upto(k + 1);
             }
         }
     } else {
@@ -3682,6 +3751,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             if (status != GGML_STATUS_SUCCESS) {
                 break;
             }
+            extract_upto(k + 1);
         }
     }
     for (auto & b : backend_ptrs) {
@@ -3768,57 +3838,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         return -1;
     }
 
-    // the outputs of each ubatch, as decode() extracts them
-    for (const auto & g : group) {
-        const llama_ubatch & ubatch = *g.ub;
-        auto * res = g.res;
-        n_outputs = g.n_outputs;
-
-        auto * t_logits  = res->get_logits();
-        auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn() : nullptr;
-
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
-            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
-            GGML_ASSERT(backend_res != nullptr);
-            GGML_ASSERT(n_outputs_prev + n_outputs <= n_outputs_all);
-            GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-            ggml_backend_tensor_get_async(backend_res, t_logits, logits.data + n_outputs_prev*n_vocab, 0, n_outputs*n_vocab*sizeof(float));
-        }
-
-        bool extract_all_idxs = false;
-        {
-            const bool masked    = cparams.embeddings_nextn_masked;
-            const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
-            const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
-
-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
-                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
-                GGML_ASSERT(backend_h != nullptr);
-                const uint32_t n_embd  = hparams.n_embd_out();
-                GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data + offset*n_embd, 0, n_rows*n_embd*sizeof(float));
-                extract_all_idxs = !masked;
-            }
-        }
-        if (extract_all_idxs) {
-            GGML_ASSERT(ubatch.data && ubatch.data->batch_idxs.size() == ubatch.n_tokens);
-            GGML_ASSERT(embd_batch_idxs.size() == (size_t) n_tokens_prev);
-            const auto & batch_idxs = ubatch.data->batch_idxs;
-            embd_batch_idxs.insert(embd_batch_idxs.end(), batch_idxs.begin(), batch_idxs.end());
-        }
-
-        // backend samplers (e.g. the greedy draft of an MTP context): only the last ubatch of a group has outputs
-        if (!sampling.samplers.empty()) {
-            const auto stride = n_vocab;
-            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
-            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
-            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
-            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
-        }
-
-        n_outputs_prev += n_outputs;
-        n_tokens_prev  += ubatch.n_tokens;
-    }
+    extract_upto(group.size()); // (none left: each graph extracts its members)
 
     // the next graph is built anew
     gf_res_prev_active = nullptr;

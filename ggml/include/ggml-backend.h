@@ -447,7 +447,7 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_reuse_weight_copies(ggml_backend_sched_t sched, bool enable);
 
     // While enabled, ggml_backend_sched_alloc_graph returns false without allocating (prefetch kept) if the compute buffer of a device
-    // would grow by more than max_grow bytes or leave less than the prefetch headroom free; ggml_backend_sched_get_alloc_over then
+    // would grow by more than max_grow bytes or leave less than the prefetch headroom free (128 MiB with a lender); ggml_backend_sched_get_alloc_over then
     // returns the growth the graph needed (0 after an allocation that was not refused)
     GGML_API void                 ggml_backend_sched_set_alloc_limit(ggml_backend_sched_t sched, bool enable, size_t max_grow);
     GGML_API size_t               ggml_backend_sched_get_alloc_over(ggml_backend_sched_t sched);
