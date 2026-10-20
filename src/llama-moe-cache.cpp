@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -746,6 +747,42 @@ struct llama_moe_cache::impl {
     static constexpr int hybrid_skip = 3;
     std::vector<int64_t> win_t[2];
 
+    // CPU computes the misses [LLAMA_MOE_CPU_MISS] (see cm_calibrate and cm_rule): per batch size n (1..cm_max tokens), the host computes
+    // the missing experts that are not fetched when a measured cost model says it is faster than fetching them all
+    //   t_cpu(n) = cm_t1 + (tbar(n) - 1)*cm_dt   host time per missing expert, tbar(n) = tokens per distinct expert of a batch of n
+    //   share(n) = t_cpu/(t_cpu + cm_tup), on log levels 1/8, 1/4, 1/2, 3/4 (the device fetches that share, the host computes the rest)
+    //   on(n): m(n)*(cm_tup - max(share*cm_tup, (1 - share)*t_cpu)) > cm_margin*cm_split, m(n) = missing experts per layer of a batch of n,
+    //          from the measured miss rate of the distinct experts looked up (device counters: the same inputs give the same decisions)
+    // the cache state carries over between requests (no reset as with a fixed share), so layer-major prompts keep running
+    static constexpr int64_t cm_max_limit = 255; // below the default prefetch threshold (256): prefetched prompts keep the k9 path
+    bool    cm      = false;
+    bool    cm_dbg  = false;  // LLAMA_MOE_CPU_MISS_LOG=1: every rule window
+    bool    cm_force = false; // LLAMA_MOE_CPU_MISS=2: on for every batch size, no rule
+    size_t  cm_n_prompt = 0;  // batches above max_batch served by the host path
+    size_t  cm_n_small  = 0;  // batches of at most max_batch tokens with the host path on
+    bool    cm_cal  = false;  // calibrated
+    int64_t cm_max  = 128;    // LLAMA_MOE_CPU_MISS_MAX_TOKENS: largest batch the host path may serve (> 32: short prompts)
+    double  cm_t1    = 0.0;   // us, host: one missing expert of one token
+    double  cm_dt    = 0.0;   // us, host: each further token of that expert
+    double  cm_tup   = 0.0;   // us, upload of one expert
+    double  cm_split = 0.0;   // us per layer: the device-host-device round trip of a host split
+    static constexpr double cm_margin = 1.5;
+    static constexpr double cm_hyst   = 0.5; // a size that is on stays on until the gain falls below cm_hyst*the threshold
+    std::vector<float>   cm_share; // [cm_max + 1]
+    std::vector<uint8_t> cm_on;    // [cm_max + 1]
+    uint32_t cm_gen  = 0;          // changes with every decision (graph key)
+    // rule windows over small batches: skip cm_skip, then windows of cm_win1, then cm_win2 batches
+    static constexpr int cm_skip = 4;
+    static constexpr int cm_win1 = 16;
+    static constexpr int cm_win2 = 128;
+    int      cm_seen  = 0;
+    int      cm_nb    = 0;     // batches in the window
+    int      cm_win   = cm_win1;
+    bool     cm_have0 = false;
+    uint64_t cm_c0[3] = { 0, 0, 0 }; // hits, fetched, left to the host at the start of the window
+    int      cm_nwin  = 0;
+    double   cm_rate  = -1.0;  // miss rate of the distinct experts looked up in the last window
+
     // " (mtp)" for the cache of an MTP context, in its log lines
     const char * tag = "";
 
@@ -775,6 +812,8 @@ struct llama_moe_cache::impl {
         {
             const char * env = getenv("LLAMA_MOE_CACHE_DEVICE");
             device_lookup = env == nullptr || atoi(env) != 0;
+            env = getenv("LLAMA_MOE_PIN_RANGES");
+            pin_mode = env == nullptr ? 1 : std::max(0, std::min(2, atoi(env)));
         }
         {
             const char * env = getenv("LLAMA_MOE_CACHE_POLICY");
@@ -811,7 +850,23 @@ struct llama_moe_cache::impl {
             }
             // LLAMA_MOE_CACHE_HYBRID=0 turns it off even with LLAMA_MOE_CACHE_FETCH set
             hybrid = device_lookup && mode != 0 && model.hparams.n_expert >= 4;
-            if (hybrid && env_f != nullptr) {
+            // LLAMA_MOE_CPU_MISS (unset or 1 = on, 0 = off): with LLAMA_MOE_CACHE_HYBRID and LLAMA_MOE_CACHE_FETCH unset, the host computes
+            // the missing experts per batch size where a calibration at the first small batch says it is faster (see cm_calibrate, cm_rule)
+            {
+                const char * env_cm = getenv("LLAMA_MOE_CPU_MISS");
+                cm = hybrid && env == nullptr && env_f == nullptr && (env_cm == nullptr || atoi(env_cm) != 0);
+                // =2 (diagnostic, KLD gates): on for every batch size once calibrated, without the rule (the share is at most 3/4)
+                cm_force = cm && env_cm != nullptr && atoi(env_cm) == 2;
+                const char * env_p = getenv("LLAMA_MOE_CPU_MISS_MAX_TOKENS");
+                cm_max = std::max<int64_t>(1, std::min<int64_t>(cm_max_limit, env_p != nullptr ? atoll(env_p) : cm_max));
+                cm_dbg = getenv("LLAMA_MOE_CPU_MISS_LOG") != nullptr && atoi(getenv("LLAMA_MOE_CPU_MISS_LOG")) != 0;
+            }
+            if (cm) {
+                // no fixed share and no reset: the host computes misses only where the rule turns it on
+                hybrid_probe = true;
+                hybrid_auto  = false;
+                hybrid_live  = false;
+            } else if (hybrid && env_f != nullptr) {
                 hybrid_share = std::min(1.0f, std::max(0.0f, (float) atof(env_f)));
                 hybrid       = hybrid_share < 1.0f;
                 hybrid_live  = hybrid;
@@ -1286,6 +1341,7 @@ struct llama_moe_cache::impl {
                 hybrid_probe = false;
                 hybrid_live  = false;
                 hybrid_share = 1.0f; // no hybrid line in the stats
+                cm           = false;
             } else {
                 ggml_backend_dev_t dev = ggml_backend_get_device(devices[devs[0]].backend);
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
@@ -1331,7 +1387,10 @@ struct llama_moe_cache::impl {
                     LLAMA_LOG_INFO("%s: MoE cache: single token ubatches compute the cached experts while the missing ones are copied, %s (LLAMA_MOE_CACHE_FETCH_OVERLAP=0 off, 2 on, 3 auto, 4 device hint)\n", __func__,
                         ov_auto ? "auto: kept while trials find it faster" : ov_rule ? buf : "on");
                 }
-                if (hybrid && hybrid_probe) {
+                if (cm) {
+                    LLAMA_LOG_INFO("%s: MoE cache: the host computes missing experts of batches of up to %" PRId64 " tokens where a calibration at the "
+                        "first small batch and the measured miss rate say it is faster (LLAMA_MOE_CPU_MISS=0 off, LLAMA_MOE_CPU_MISS_MAX_TOKENS)\n", __func__, cm_max);
+                } else if (hybrid && hybrid_probe) {
                     LLAMA_LOG_INFO("%s: hybrid MoE cache: the host computes the missing experts that are not fetched, fetch share measured at the first small batch, %s (LLAMA_MOE_CACHE_FETCH=0..1 to set the share)\n",
                         __func__, hybrid_auto ? "auto: kept only if trials of small batches are faster (LLAMA_MOE_CACHE_HYBRID=1)" : "on (LLAMA_MOE_CACHE_HYBRID=3)");
                 } else if (hybrid && !hybrid_det) {
@@ -1458,6 +1517,129 @@ struct llama_moe_cache::impl {
 
     using host_map_t   = void * (*)(ggml_backend_dev_t, void *, size_t, bool *);
     using host_unmap_t = void (*)(void *);
+    using host_map_range_t    = void * (*)(ggml_backend_dev_t, void *, size_t, void **, bool *);
+    using host_mapped_bytes_t = size_t (*)(void);
+
+    // pinned expert ranges [LLAMA_MOE_PIN_RANGES]: where the whole file buffers cannot be mapped (more than the available memory could pin,
+    // or the registration fails), the pages of the expert tensors alone are registered read-only, one range per layer (its expert tensors
+    // and the small gaps between them), layer by layer while the budget lasts: min(LLAMA_MOE_PIN_MAX_FRAC (0.6) x MemTotal - host memory
+    // pinned already (every mapping of the backend, both contexts, and the slots of the RAM tier), available - margin), or
+    // LLAMA_MOE_PIN_MAX_MIB. A group whose layers are all pinned gets the device lookups; with only some layers pinned its misses and the
+    // copies of prompts still read those layers at pinned speed. Each range holds whole tensors, so a copy of experts lies in one mapping.
+    // LLAMA_MOE_PIN_RANGES: unset/1 = as the fallback, 2 = instead of the whole buffers (diagnostic), 0 = off (k9: host lookups, pageable)
+    int    pin_mode = 1;
+    size_t pin_bytes = 0;      // registered by the ranges of this cache
+    size_t pin_layers = 0;     // layers pinned by ranges
+    size_t pin_layers_want = 0;
+
+    // pins the expert ranges of the layers of group g in order; returns true if every layer is pinned (host_dev set for all)
+    bool pin_ranges(group & g, ggml_backend_dev_t dev, ggml_backend_reg_t reg, std::vector<std::vector<const void *>> & host_dev) {
+        auto map_range = (host_map_range_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_map_range");
+        auto mapped_b  = (host_mapped_bytes_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_mapped_bytes");
+        auto unmap     = (host_unmap_t)        ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_unmap");
+        host_dev.assign(g.layers.size(), {});
+        if (map_range == nullptr || unmap == nullptr) {
+            return false;
+        }
+        const uint64_t total  = llama_sysmem::total();
+        const uint64_t avail  = llama_sysmem::available();
+        double frac = 0.6;
+        if (const char * env = getenv("LLAMA_MOE_PIN_MAX_FRAC")) {
+            frac = std::max(0.0, std::min(0.95, atof(env)));
+        }
+        const uint64_t pinned = (mapped_b != nullptr ? mapped_b() : 0) + (host ? host->pinned_bytes() : 0);
+        const uint64_t margin = UINT64_C(2) << 30;
+        int64_t budget = INT64_MAX;
+        if (const char * env = getenv("LLAMA_MOE_PIN_MAX_MIB")) {
+            budget = std::max<int64_t>(0, atoll(env))*1048576 - (int64_t) pin_bytes;
+        } else {
+            if (total > 0) {
+                budget = std::min<int64_t>(budget, (int64_t) (frac*(double) total) - (int64_t) pinned);
+            }
+            if (avail > 0) {
+                budget = std::min<int64_t>(budget, (int64_t) avail - (int64_t) margin);
+            }
+        }
+        const uintptr_t page = 4096;
+        size_t n_ok = 0;
+        size_t bytes = 0;
+        pin_layers_want += g.layers.size();
+        auto host_map = (host_map_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_map");
+        for (size_t i = 0; i < g.layers.size(); ++i) {
+            const layer & l = layers[g.layers[i]];
+            // the ranges of the layer: runs of its mapped expert tensors with small gaps between them (one mapping per run: a copy of
+            // experts never spans two), tensors in other host buffers (pinned already, e.g. LLAMA_MOE_PIN_EXPERTS) are mapped whole
+            // as before, without a new pin
+            bool fail = false;
+            std::vector<const void *> devp(l.experts.size(), nullptr);
+            // runs of one buffer only: the gaps between its tensors are mapped too (separate mappings may have holes between them)
+            std::vector<std::tuple<const void *, uintptr_t, uintptr_t>> runs;
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                const ggml_tensor * t = l.experts[ip];
+                if (strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer)), "CPU_Mapped") == 0) {
+                    runs.emplace_back((const void *) t->buffer, (uintptr_t) t->data, (uintptr_t) t->data + ggml_nbytes(t));
+                    devp[ip] = t->data; // the device reads registered memory at its host address (checked by map_range)
+                    continue;
+                }
+                bool reg_whole = false;
+                void * base = ggml_backend_buffer_get_base(t->buffer);
+                uint8_t * dp = host_map != nullptr ? (uint8_t *) host_map(dev, base, ggml_backend_buffer_get_size(t->buffer), &reg_whole) : nullptr;
+                if (reg_whole) {
+                    mapped.emplace_back(unmap, base);
+                }
+                if (dp == nullptr) {
+                    fail = true;
+                    break;
+                }
+                devp[ip] = dp + ((const uint8_t *) t->data - (const uint8_t *) base);
+            }
+            if (fail) {
+                break;
+            }
+            std::sort(runs.begin(), runs.end());
+            std::vector<std::pair<uintptr_t, uintptr_t>> merged;
+            const void * buf_prev = nullptr;
+            for (const auto & [buf, lo, hi] : runs) {
+                if (!merged.empty() && buf == buf_prev && lo <= merged.back().second + (UINT64_C(16) << 20)) {
+                    merged.back().second = std::max(merged.back().second, hi);
+                } else {
+                    merged.emplace_back(lo, hi);
+                }
+                buf_prev = buf;
+            }
+            size_t need = 0;
+            for (const auto & r : merged) {
+                need += ((r.second + page - 1) & ~(page - 1)) - (r.first & ~(page - 1));
+            }
+            if ((int64_t) (bytes + need) > budget) {
+                break;
+            }
+            for (const auto & r : merged) {
+                void * key = nullptr;
+                bool registered = false;
+                if (map_range(dev, (void *) r.first, r.second - r.first, &key, &registered) == nullptr) {
+                    fail = true;
+                    break;
+                }
+                if (registered) {
+                    mapped.emplace_back(unmap, key);
+                }
+            }
+            if (fail) {
+                break;
+            }
+            bytes += need;
+            host_dev[i] = devp;
+            n_ok++;
+        }
+        pin_bytes  += bytes;
+        pin_layers += n_ok;
+        LLAMA_LOG_INFO("%s: MoE cache: pinned the expert ranges of %zu of %zu layers (%.0f MiB; budget %.0f MiB = min(%.2f x %.0f MiB - %.0f MiB pinned, "
+            "%.0f MiB available - %.0f MiB)): %s (LLAMA_MOE_PIN_RANGES=0 off, LLAMA_MOE_PIN_MAX_MIB)\n", __func__, n_ok, g.layers.size(), bytes/1048576.0,
+            budget == INT64_MAX ? -1.0 : budget/1048576.0, frac, total/1048576.0, pinned/1048576.0, avail/1048576.0, margin/1048576.0,
+            n_ok == g.layers.size() ? "device lookups" : "host lookups, the pinned layers are copied at pinned speed");
+        return n_ok == g.layers.size();
+    }
 
     //
     // RAM tier
@@ -2497,6 +2679,7 @@ struct llama_moe_cache::impl {
             auto host_map   = (host_map_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_map");
             auto host_unmap = (host_unmap_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_unmap");
 
+            bool use_ranges = pin_mode == 2;
             // registering a memory-mapped file pins all of its pages, which must then fit in system memory: when the file buffers this
             // group would register exceed the available memory (llama_sysmem::available, minus a margin), registering fails only after
             // faulting in most of them (OOM after 83 s for 37 GiB of experts on a 31 GiB host), so it is not tried
@@ -2518,9 +2701,13 @@ struct llama_moe_cache::impl {
                     const uint64_t margin = std::max<uint64_t>(UINT64_C(2) << 30, need/16);
                     if (need > 0 && avail > 0 && need + margin > avail) {
                         LLAMA_LOG_WARN("%s: %s: the host experts are memory-mapped files of %.0f MiB, more than the %.0f MiB of system memory "
-                            "available (less a %.0f MiB margin) could pin: the MoE cache uses host lookups for %zu layers (LLAMA_MOE_CACHE_MAP_CHECK=0 tries anyway)\n",
-                            __func__, ggml_backend_name(backend), need/1048576.0, avail/1048576.0, margin/1048576.0, g.layers.size());
-                        continue;
+                            "available (less a %.0f MiB margin) could pin: %s for %zu layers (LLAMA_MOE_CACHE_MAP_CHECK=0 tries anyway)\n",
+                            __func__, ggml_backend_name(backend), need/1048576.0, avail/1048576.0, margin/1048576.0,
+                            pin_mode != 0 ? "the expert ranges are pinned instead" : "the MoE cache uses host lookups", g.layers.size());
+                        if (pin_mode == 0) {
+                            continue;
+                        }
+                        use_ranges = true;
                     }
                 }
             }
@@ -2529,7 +2716,7 @@ struct llama_moe_cache::impl {
             const size_t n_mapped = mapped.size();
             std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_t>> added;
 
-            bool ok = true;
+            bool ok = !use_ranges;
             std::vector<std::vector<const void *>> host_dev(g.layers.size());
             for (size_t i = 0; i < g.layers.size() && ok; ++i) {
                 for (const ggml_tensor * t : layers[g.layers[i]].experts) {
@@ -2561,9 +2748,13 @@ struct llama_moe_cache::impl {
                 for (const auto & key : added) {
                     dev_base.erase(key);
                 }
-                LLAMA_LOG_WARN("%s: %s cannot map the host experts (pageable or memory-mapped), the MoE cache uses host lookups for %zu layers\n",
-                    __func__, ggml_backend_name(backend), g.layers.size());
-                continue;
+                if (!use_ranges) {
+                    LLAMA_LOG_WARN("%s: %s cannot map the host experts (pageable or memory-mapped), %s for %zu layers\n",
+                        __func__, ggml_backend_name(backend), pin_mode != 0 ? "pinning their ranges" : "the MoE cache uses host lookups", g.layers.size());
+                }
+                if (pin_mode == 0 || !pin_ranges(g, dev, reg, host_dev)) {
+                    continue;
+                }
             }
             for (size_t i = 0; i < g.layers.size(); ++i) {
                 layers[g.layers[i]].host_dev = std::move(host_dev[i]);
@@ -2575,8 +2766,31 @@ struct llama_moe_cache::impl {
     }
 
     bool use_device(const group & g, int64_t n_tokens) const {
-        return g.dev_lookup && g.n_slots > 0 && n_tokens > 0 && n_tokens <= max_batch &&
+        return g.dev_lookup && g.n_slots > 0 && n_tokens > 0 && (n_tokens <= max_batch || cm_serves(n_tokens)) &&
             std::min<int64_t>(n_tokens*n_expert_used, g.ref[0]->ne[2]) <= g.n_slots;
+    }
+
+    // a batch of more than max_batch tokens (a short prompt) that the host path serves: it is looked up on the device like a small batch
+    bool cm_serves(int64_t n_tokens) const {
+        return cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_max && cm_on[n_tokens] != 0;
+    }
+
+    // the host computes the misses of a batch of n_tokens: the fetch share, 1 = every missing expert is fetched
+    float cm_share_of(int64_t n_tokens) const {
+        if (!cm || !cm_cal || n_tokens < 1 || n_tokens > cm_max || cm_on[n_tokens] == 0) {
+            return 1.0f;
+        }
+        return cm_share[n_tokens];
+    }
+
+    bool cm_any_on() const {
+        return cm && cm_cal && std::any_of(cm_on.begin(), cm_on.end(), [](uint8_t v) { return v != 0; });
+    }
+
+    // distinct experts of a layer that a batch of n tokens routes to (independent uniform routing), and the tokens of each
+    double cm_distinct(int64_t n, int64_t n_expert) const {
+        const double k = (double) std::min<int64_t>(n_expert_used, n_expert);
+        return (double) n_expert*(1.0 - std::pow(1.0 - k/n_expert, (double) n));
     }
 
     ggml_tensor * lookup(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch) const {
@@ -2602,6 +2816,10 @@ struct llama_moe_cache::impl {
         if (!(hybrid || overlap_batch(n_ubatch)) || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return false;
         }
+        // CPU misses off for this batch size: the graph of k9 (plain lookup, or the fetch overlap of single tokens)
+        if (cm && cm_share_of(n_ubatch) >= 1.0f && !overlap_batch(n_ubatch)) {
+            return false;
+        }
         const group & g = groups[layers[il].ig];
         return g.counts != nullptr && use_device(g, n_ubatch) && layers[il].host_dev.size() == g.banks.size();
     }
@@ -2613,9 +2831,16 @@ struct llama_moe_cache::impl {
         if (!hybrid_layer(il, n_ubatch) || ids->ne[1] > n_ubatch || ids->ne[0] > n_expert_used) {
             return nullptr;
         }
-        host = hybrid_active();
+        float share = 1.0f;
+        if (cm) {
+            share = cm_share_of(n_ubatch);
+            host  = share < 1.0f;
+        } else {
+            host  = hybrid_active();
+            share = host ? hybrid_share : 1.0f;
+        }
         const group & g = groups[layers[il].ig];
-        ggml_tensor * op = ggml_moe_cache_assign(ctx, ids, g.map, g.state, g.counts, host ? hybrid_share : 1.0f, il);
+        ggml_tensor * op = ggml_moe_cache_assign(ctx, ids, g.map, g.state, g.counts, share, il);
         if (g.scores != nullptr) {
             ggml_moe_cache_set_scores(op, g.scores, g.lru.grow_q16, il == g.layers[0]);
         }
@@ -2631,6 +2856,9 @@ struct llama_moe_cache::impl {
     }
 
     bool hybrid_active() const {
+        if (cm) {
+            return cm_any_on();
+        }
         return hybrid && hybrid_live && hybrid_share < 1.0f;
     }
 
@@ -2803,6 +3031,10 @@ struct llama_moe_cache::impl {
     }
 
     int hybrid_mode() const {
+        if (cm) {
+            // the decisions of every batch size are in the graph: a new decision rebuilds the graphs
+            return 3 + (ov_live ? 4 : 0) + 8*(int) (cm_gen & 0xfffff);
+        }
         return (!hybrid ? 0 : hybrid_active() ? 2 : 1) + (ov_live ? 4 : 0);
     }
 
@@ -2913,9 +3145,317 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // ---- CPU misses [LLAMA_MOE_CPU_MISS] ------------------------------------------------------------------------------------------
+    // calibration, once before the first small batch, with the threads of small batches: the host times one layer's expert tensors for 1
+    // expert x 1 token, k experts x 1 token and k experts x T tokens (other experts every repetition, as they are read in generation),
+    // the device times uploads of k experts from the host experts and a small synchronous read (the round trip of a host split)
+    void cm_calibrate(ggml_backend_t backend_cpu) {
+        hybrid_probe = false;
+        const int64_t t_start = ggml_time_us();
+        const group * gp = nullptr;
+        for (const group & g : groups) {
+            if (g.dev_lookup && g.n_slots > 0 && g.counts != nullptr) {
+                gp = &g;
+                break;
+            }
+        }
+        if (gp == nullptr || backend_cpu == nullptr) {
+            cm     = false;
+            hybrid = false;
+            return;
+        }
+        const group & g = *gp;
+        const layer & l = layers[g.layers[0]];
+        const int64_t n_expert = g.ref[0]->ne[2];
+        // ka experts and kb > ka experts of one token (the slope is the time of one expert, the rest the cost of a host graph),
+        // ka experts of T tokens each (the time of a further token)
+        const int     ka       = (int) std::max<int64_t>(1, std::min<int64_t>(n_expert_used, n_expert/2));
+        const int     kb       = (int) std::min<int64_t>(4*ka, n_expert);
+        const int     T        = 8;
+        const int     n_rep    = 11;
+
+        ggml_init_params params = {
+            /*.mem_size   =*/ (8 + 6*l.experts.size())*ggml_tensor_overhead() + 3*ggml_graph_overhead_custom(16, false),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx(ggml_init(params));
+        ggml_tensor * ids_a = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, ka, 1);
+        ggml_tensor * ids_b = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, kb, 1);
+        ggml_tensor * ids_t = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, ka, T);
+        ggml_cgraph * gf_a  = ggml_new_graph_custom(ctx.get(), 16, false);
+        ggml_cgraph * gf_b  = ggml_new_graph_custom(ctx.get(), 16, false);
+        ggml_cgraph * gf_t  = ggml_new_graph_custom(ctx.get(), 16, false);
+        std::vector<ggml_tensor *> xs;
+        for (ggml_tensor * w : l.experts) {
+            ggml_tensor * x1 = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, w->ne[0], 1, 1);
+            ggml_tensor * xt = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, w->ne[0], 1, T);
+            xs.push_back(x1);
+            xs.push_back(xt);
+            ggml_build_forward_expand(gf_a, ggml_mul_mat_id(ctx.get(), w, x1, ids_a));
+            ggml_build_forward_expand(gf_b, ggml_mul_mat_id(ctx.get(), w, x1, ids_b));
+            ggml_build_forward_expand(gf_t, ggml_mul_mat_id(ctx.get(), w, xt, ids_t));
+        }
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend_cpu));
+        if (!buf) {
+            cm     = false;
+            hybrid = false;
+            return;
+        }
+        for (ggml_tensor * x : xs) {
+            std::vector<float> v(ggml_nelements(x));
+            for (size_t i = 0; i < v.size(); ++i) {
+                v[i] = 0.01f*(float) ((i*7919) % 13) - 0.06f;
+            }
+            ggml_backend_tensor_set(x, v.data(), 0, ggml_nbytes(x));
+        }
+        int64_t next = 0;
+        // distinct experts within a graph, other experts every repetition (read from memory as in generation)
+        auto set_ids = [&](ggml_tensor * ids, int n, int rows) {
+            std::vector<int32_t> v((size_t) n*rows);
+            for (int i = 0; i < n; ++i) {
+                v[i] = (int32_t) ((next + i) % n_expert);
+            }
+            next += n;
+            for (int r = 1; r < rows; ++r) {
+                std::copy(v.begin(), v.begin() + n, v.begin() + (size_t) r*n);
+            }
+            ggml_backend_tensor_set(ids, v.data(), 0, v.size()*sizeof(int32_t));
+        };
+        auto median = [](std::vector<int64_t> v) {
+            std::sort(v.begin(), v.end());
+            return (double) v[v.size()/2];
+        };
+        auto timed = [&](ggml_cgraph * gf) {
+            const int64_t t0 = ggml_time_us();
+            ggml_backend_graph_compute(backend_cpu, gf);
+            return ggml_time_us() - t0;
+        };
+
+        // a busy host gives inconsistent times (more experts not slower, an implausible bandwidth): measured again, at most 3 times
+        double d_a = 0.0, d_b = 0.0, d_t = 0.0, slope = 0.0;
+        bool ok = false;
+        int attempt = 0;
+        for (; attempt < 3 && !ok; ++attempt) {
+            std::vector<int64_t> ta, tb, tt;
+            for (int r = 0; r <= n_rep; ++r) {
+                set_ids(ids_a, ka, 1);
+                const int64_t da = timed(gf_a);
+                set_ids(ids_b, kb, 1);
+                const int64_t db = timed(gf_b);
+                set_ids(ids_t, ka, T);
+                const int64_t dt = timed(gf_t);
+                if (r > 0) {
+                    ta.push_back(da);
+                    tb.push_back(db);
+                    tt.push_back(dt);
+                }
+            }
+            d_a = median(ta);
+            d_b = median(tb);
+            d_t = median(tt);
+            slope = kb > ka ? (d_b - d_a)/(kb - ka) : d_a/ka;
+            const double gbs = slope > 0.0 ? g.expert_bytes/slope/1e3 : 0.0;
+            ok = slope > 0.0 && gbs >= 0.2 && gbs <= 400.0 && d_t >= 0.9*d_a;
+        }
+        if (!ok) {
+            LLAMA_LOG_WARN("llama_moe_cache%s: CPU misses off: the host timings are inconsistent (%.1f us for %d experts, %.1f us for %d, %.1f us for %d x %d tokens; "
+                "a busy host), the missing experts are fetched\n", tag, d_a, ka, d_b, kb, d_t, ka, T);
+            cm     = false;
+            hybrid = false;
+            return;
+        }
+
+        // uploads into the spare slot at the end of the banks (never looked up), then a small synchronous read
+        std::vector<int64_t> tu, trt;
+        ggml_backend_t backend = devices[g.id].backend;
+        ggml_backend_synchronize(backend);
+        for (int r = 0; r <= n_rep; ++r) {
+            const int64_t t0 = ggml_time_us();
+            for (int i = 0; i < ka; ++i) {
+                const int64_t e = next++ % n_expert;
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const size_t nb = l.experts[ip]->nb[2];
+                    ggml_backend_tensor_set(g.banks[ip], (const uint8_t *) l.experts[ip]->data + e*nb, (size_t) g.n_slots*nb, nb);
+                }
+            }
+            if (r > 0) {
+                tu.push_back(ggml_time_us() - t0);
+            }
+        }
+        for (int r = 0; r <= n_rep; ++r) {
+            int32_t tmp[16];
+            const int64_t t0 = ggml_time_us();
+            ggml_backend_tensor_get(g.state, tmp, 0, sizeof(tmp));
+            if (r > 0) {
+                trt.push_back(ggml_time_us() - t0);
+            }
+        }
+
+        cm_t1    = std::max(slope, 0.05);
+        cm_dt    = std::max(0.0, (d_t - d_a)/((double) ka*(T - 1)));
+        cm_tup   = std::max(median(tu)/ka, 0.05);
+        cm_split = std::max(0.0, d_a - ka*cm_t1) + 2.0*median(trt);
+        GGML_UNUSED(attempt);
+
+        cm_share.assign(cm_max + 1, 1.0f);
+        cm_on.assign(cm_max + 1, 0);
+        for (int64_t n = 1; n <= cm_max; ++n) {
+            const double D    = cm_distinct(n, n_expert);
+            const double tbar = std::max(1.0, (double) n*std::min<int64_t>(n_expert_used, n_expert)/D);
+            const double tc   = cm_t1 + (tbar - 1.0)*cm_dt;
+            const double raw  = tc/(tc + cm_tup);
+            // log levels: two calibrations a little apart rarely fall on two sides of a level
+            cm_share[n] = raw <= 0.177 ? 0.125f : raw <= 0.354 ? 0.25f : raw <= 0.612 ? 0.5f : raw <= 0.80 ? 0.75f : 1.0f;
+        }
+        cm_cal = true;
+        if (cm_force) {
+            for (int64_t n = 1; n <= cm_max; ++n) {
+                cm_share[n] = std::min(cm_share[n], 0.75f);
+                cm_on[n]    = 1;
+            }
+            cm_gen++;
+        }
+        int64_t n_max_share = 0;
+        for (int64_t n = 1; n <= cm_max; ++n) {
+            n_max_share = cm_share[n] < 1.0f ? n : n_max_share;
+        }
+        LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: host %.1f us per expert (%.2f GB/s, %.2f us per further token), upload %.1f us per expert "
+            "(%.2f GB/s), host split %.1f us; fetch share %.3f (1 token), %.3f (%d), %.3f (%" PRId64 "), host path possible up to %" PRId64 " tokens; "
+            "decided from the miss rate after %d small batches (%.1f ms)\n", tag,
+            cm_t1, g.expert_bytes/cm_t1/1e3, cm_dt, cm_tup, g.expert_bytes/cm_tup/1e3, cm_split, cm_share[1], cm_share[std::min<int64_t>(4, cm_max)],
+            (int) std::min<int64_t>(4, cm_max), cm_share[cm_max], cm_max, n_max_share, cm_skip + cm_win1, (ggml_time_us() - t_start)/1e3);
+    }
+
+    // reads the device counters of the lookups: distinct hits, fetched misses, misses left to the host
+    void cm_counters(uint64_t c[3]) const {
+        c[0] = c[1] = c[2] = 0;
+        for (const group & g : groups) {
+            if (!g.dev_lookup || g.n_slots == 0 || g.state == nullptr || g.state->data == nullptr) {
+                continue;
+            }
+            uint64_t cnt[2] = { 0, 0 };
+            ggml_backend_tensor_get(g.state, cnt, 2*sizeof(int32_t), sizeof(cnt));
+            c[0] += cnt[0];
+            c[1] += cnt[1];
+            if (g.counts != nullptr && g.counts->data != nullptr) {
+                uint64_t h = 0;
+                ggml_backend_tensor_get(g.counts, &h, (size_t) g.counts->ne[0]*(g.counts->ne[1] - 1)*sizeof(int32_t), sizeof(h));
+                c[2] += h;
+            }
+        }
+    }
+
+    // the batch runs device lookups (and moves the counters)
+    bool cm_counted(int64_t n_tokens) const {
+        return n_tokens >= 1 && (n_tokens <= max_batch || cm_serves(n_tokens));
+    }
+
+    bool cm_tick_reads(int64_t n_tokens) const {
+        return cm && cm_cal && !cm_force && cm_counted(n_tokens) && cm_seen >= cm_skip && (!cm_have0 || cm_nb + 1 >= cm_win);
+    }
+
+    // before the graph of every ubatch (backends synchronized when cm_tick_reads)
+    void cm_tick(int64_t n_tokens) {
+        if (!cm || !cm_cal || !cm_counted(n_tokens)) {
+            return;
+        }
+        if (cm_share_of(n_tokens) < 1.0f) {
+            (n_tokens > max_batch ? cm_n_prompt : cm_n_small)++;
+        }
+        if (cm_force) {
+            return;
+        }
+        if (cm_seen < cm_skip) {
+            cm_seen++;
+            return;
+        }
+        if (!cm_have0) {
+            cm_counters(cm_c0);
+            cm_have0 = true;
+            cm_nb    = 0;
+            return;
+        }
+        if (++cm_nb < cm_win) {
+            return;
+        }
+        uint64_t c1[3];
+        cm_counters(c1);
+        const double hits = (double) (c1[0] - cm_c0[0]);
+        const double miss = (double) (c1[1] - cm_c0[1]) + (double) (c1[2] - cm_c0[2]);
+        std::copy(c1, c1 + 3, cm_c0);
+        cm_nb  = 0;
+        cm_win = cm_win2;
+        cm_nwin++;
+        if (hits + miss <= 0.0) {
+            return;
+        }
+        cm_rate = miss/(hits + miss);
+        cm_decide();
+    }
+
+    // per batch size: on where the expected time saved per layer beats the cost of the host split
+    void cm_decide() {
+        const group * gp = nullptr;
+        for (const group & g : groups) {
+            if (g.dev_lookup && g.n_slots > 0 && g.counts != nullptr) {
+                gp = &g;
+                break;
+            }
+        }
+        if (gp == nullptr || cm_rate < 0.0) {
+            return;
+        }
+        const int64_t n_expert = gp->ref[0]->ne[2];
+        bool changed = false;
+        int64_t n_on = 0, lo = 0, hi = 0;
+        for (int64_t n = 1; n <= cm_max; ++n) {
+            uint8_t on = 0;
+            if (cm_share[n] < 1.0f) {
+                const double D    = cm_distinct(n, n_expert);
+                const double tbar = std::max(1.0, (double) n*std::min<int64_t>(n_expert_used, n_expert)/D);
+                const double tc   = cm_t1 + (tbar - 1.0)*cm_dt;
+                const double f    = cm_share[n];
+                const double m    = cm_rate*D;
+                const double gain = m*(cm_tup - std::max(f*cm_tup, (1.0 - f)*tc));
+                const double need = cm_margin*cm_split*(cm_on[n] ? cm_hyst : 1.0);
+                // a batch above max_batch must fit the slots of every group (see use_device)
+                bool fits = true;
+                for (const group & g : groups) {
+                    if (g.dev_lookup && g.n_slots > 0) {
+                        fits = fits && std::min<int64_t>(n*n_expert_used, g.ref[0]->ne[2]) <= g.n_slots;
+                    }
+                }
+                on = gain > need && (n <= max_batch || fits) ? 1 : 0;
+            }
+            changed = changed || on != cm_on[n];
+            cm_on[n] = on;
+            if (on) {
+                n_on++;
+                lo = lo == 0 ? n : lo;
+                hi = n;
+            }
+        }
+        if (changed) {
+            cm_gen++;
+        }
+        if (changed || cm_dbg || cm_nwin <= 2) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses (window %d): miss rate %.1f%% of the distinct experts looked up -> host path %s",
+                tag, cm_nwin, 100.0*cm_rate, n_on == 0 ? "off" : "on");
+            if (n_on > 0) {
+                LLAMA_LOG_CONT(" for %" PRId64 " batch sizes in [%" PRId64 ", %" PRId64 "] (fetch share %.3f at %" PRId64 ")", n_on, lo, hi, cm_share[lo], lo);
+            }
+            LLAMA_LOG_CONT("\n");
+        }
+    }
+
     // fetch share: the host and the device finish at the same time when share*t_upload = (1 - share)*t_host per missing expert
     // t_host: one token through the expert tensors of a cached layer on the host backend, t_upload: copy of an expert from host memory
     void probe(ggml_backend_t backend_cpu) {
+        if (cm) {
+            cm_calibrate(backend_cpu);
+            return;
+        }
         hybrid_probe = false;
         const group * gp = nullptr;
         for (const group & g : groups) {
@@ -4396,6 +4936,9 @@ struct llama_moe_cache::impl {
     }
 
     void log_stats() {
+        if (pin_layers_want > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: pinned expert ranges: %zu of %zu layers, %.2f MiB\n", tag, pin_layers, pin_layers_want, pin_bytes/1048576.0);
+        }
         auto log = [this](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
             if (n == 0) {
@@ -4419,6 +4962,19 @@ struct llama_moe_cache::impl {
                 st.bytes  += cnt[1]*g.expert_bytes;
             }
             log("device lookups (ubatch <= 32)", st);
+            if (cm && cm_cal) {
+                uint64_t c[3];
+                cm_counters(c);
+                const uint64_t n = c[0] + c[1] + c[2];
+                int64_t n_on = 0;
+                for (int64_t i = 1; i <= cm_max; ++i) {
+                    n_on += cm_on[i] != 0;
+                }
+                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: %llu missing experts computed on the host (%.2f MiB not fetched), hit rate with them = %.2f%%, "
+                    "host path on for %" PRId64 " batch sizes now, %d decisions, last miss rate %.1f%%, ubatches on the host path: %zu small, %zu above %" PRId64 " tokens\n",
+                    tag, (unsigned long long) c[2], (double) c[2]*(groups.empty() ? 0.0 : (double) groups[0].expert_bytes)/1048576.0, n > 0 ? 100.0*c[0]/n : 0.0,
+                    n_on, (int) cm_gen, 100.0*cm_rate, cm_n_small, cm_n_prompt, max_batch);
+            }
             if (hybrid_share < 1.0f) {
                 uint64_t n_host = 0;
                 for (const group & g : groups) {
@@ -4570,6 +5126,18 @@ bool llama_moe_cache::overlap(int64_t n_ubatch) const {
 
 bool llama_moe_cache::hybrid_active() const {
     return pimpl->hybrid_active();
+}
+
+bool llama_moe_cache::cpu_miss_tick_sync(int64_t n_tokens) const {
+    return pimpl->cm_tick_reads(n_tokens);
+}
+
+void llama_moe_cache::cpu_miss_tick(int64_t n_tokens) {
+    pimpl->cm_tick(n_tokens);
+}
+
+bool llama_moe_cache::small_batch(int64_t n_tokens) const {
+    return n_tokens <= n_small_max || pimpl->cm_serves(n_tokens);
 }
 
 bool llama_moe_cache::hybrid_probe_pending() const {

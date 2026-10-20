@@ -2797,7 +2797,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         // the MoE cache only serves batches of up to 32 tokens, the end of a prompt seeds it for the generation that follows
         if (moe_cache) {
-            const bool large      = ubatch.n_tokens > llama_moe_cache::n_small_max;
+            // CPU misses: the rule decides per batch size from the miss rate of the device lookups (see llama_moe_cache::cpu_miss_tick),
+            // before anything of this ubatch depends on the decision
+            if (moe_cache->cpu_miss_tick_sync(ubatch.n_tokens)) {
+                ggml_backend_sched_synchronize(sched.get());
+            }
+            const bool was = moe_cache->hybrid_active();
+            moe_cache->cpu_miss_tick(ubatch.n_tokens);
+            if (moe_cache->hybrid_active() != was) {
+                ggml_backend_sched_set_overlap(sched.get(), moe_cache->hybrid_active());
+            }
+            const bool large      = !moe_cache->small_batch(ubatch.n_tokens);
             const bool last_large = large && n_tokens_all - n_tokens_prev - ubatch.n_tokens <= llama_moe_cache::n_small_max;
             moe_cache_seed_begin(ubatch, last_large, n_outputs);
             if (large) {
@@ -4828,7 +4838,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 }
 
 void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_large, int64_t n_outputs_ub) {
-    const bool large = ubatch.n_tokens > llama_moe_cache::n_small_max;
+    const bool large = !moe_cache->small_batch(ubatch.n_tokens);
     if (!moe_cache_seed_enabled) {
         return;
     }
