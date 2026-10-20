@@ -772,8 +772,8 @@ struct llama_moe_cache::impl {
     std::vector<uint8_t> cm_on;    // [cm_max + 1]
     uint32_t cm_gen  = 0;          // changes with every decision (graph key)
     // rule windows over small batches: skip cm_skip, then windows of cm_win1, then cm_win2 batches
-    static constexpr int cm_skip = 4;
-    static constexpr int cm_win1 = 16;
+    static constexpr int cm_skip = 2;
+    static constexpr int cm_win1 = 8;
     static constexpr int cm_win2 = 128;
     int      cm_seen  = 0;
     int      cm_nb    = 0;     // batches in the window
@@ -793,7 +793,7 @@ struct llama_moe_cache::impl {
     static constexpr int    cmt_block   = 8;
     static constexpr int    cmt_skip    = 3;
     static constexpr double cmt_margin  = 0.03;
-    static constexpr int    cmt_gap_max = 2048;
+    static constexpr int    cmt_gap_max = 4096;
     bool     cm_trial      = true;
     bool     cm_small_ok   = true;  // the last trial kept the host path for small batches
     bool     cm_small_live = true;  // the graphs of small batches use it now
@@ -3348,10 +3348,11 @@ struct llama_moe_cache::impl {
             cm_share[n] = raw <= 0.177 ? 0.125f : raw <= 0.354 ? 0.25f : raw <= 0.612 ? 0.5f : raw <= 0.80 ? 0.75f : 1.0f;
         }
         cm_cal = true;
-        // the first prompt and tokens run before any measured miss rate: decided from the misses of a cache that holds cache_frac of
-        // the experts with no reuse (an upper bound of the miss rate), the first measured window corrects it without the hysteresis
+        // the first prompt and tokens run before any measured miss rate: a prior from the cached share c of the experts, (1 - c)^4
+        // (decode miss rates measured on a G4: Qwen3.6-35B-A3B UD-Q4_K_XL c = 0.17 -> 0.29-0.47, c = 0.39 -> 0.16; gpt-oss-20b Q2_K
+        // c = 0.54 -> 0.007), the first measured window corrects it without the hysteresis
         if (!cm_force) {
-            cm_rate = std::max(0.02, std::min(1.0, 1.0 - std::max(0.0, cache_frac)));
+            cm_rate = std::max(0.01, std::min(1.0, std::pow(1.0 - std::max(0.0, std::min(1.0, cache_frac)), 4.0)));
             cm_decide();
         }
         if (cm_trial) {
@@ -3453,7 +3454,9 @@ struct llama_moe_cache::impl {
             }
             cmt_host_ok = host_ok;
             cmt_wait = cmt_gap;
-            cmt_gap  = std::min(2*cmt_gap, cmt_gap_max);
+            // a clear loss is checked again much later: each trial runs 2 blocks on the slower path, and their fewer admissions leave
+            // the cache colder for a while (G4 Qwen3.6 UD-Q4_K_XL 12 GB, gpt-oss-20b 8 GB: -4..-8% decode with the path off but re-tried)
+            cmt_gap  = std::min(on || t_on < 1.05*t_off ? 2*cmt_gap : std::max(4*cmt_gap, 512), cmt_gap_max);
             return;
         }
         const int blk = cmt_done/cmt_block;
