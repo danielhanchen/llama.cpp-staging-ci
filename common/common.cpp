@@ -2017,6 +2017,14 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // waking from sleep, gets the same cache)
     const bool moe_cache_auto = common_moe_cache_auto_resolve(params, params.fit_params);
 
+    // --weight-stream on means what LLAMA_WEIGHT_STREAM=1 does for the automatic expert pinning of the model loader (which reads the
+    // environment, it has no weight stream parameter): the experts stay mapped, so the weight stream and its RAM tier serve them instead
+    // of a pinned copy taking that RAM. An explicit LLAMA_MOE_PIN_EXPERTS still wins
+    if (params.weight_stream == 2 && getenv("LLAMA_WEIGHT_STREAM") == nullptr && getenv("LLAMA_MOE_PIN_EXPERTS") == nullptr) {
+        COM_INF("%s: --weight-stream on: automatic expert pinning off (LLAMA_MOE_PIN_EXPERTS=1 or 2 to pin anyway)\n", __func__);
+        common_set_env("LLAMA_MOE_PIN_EXPERTS", "0");
+    }
+
     // with --fit the MoE cache load mode is decided after the fit has placed the experts
     auto mparams = common_model_params_to_llama_impl(params, params.fit_params);
     auto cparams = common_context_params_to_llama(params);
