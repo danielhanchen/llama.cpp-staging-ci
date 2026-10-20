@@ -106,6 +106,8 @@ public:
     // auto mode: before the graph of each ubatch while the trial runs, after the previous ubatch finished (backends synchronized);
     // switches between the plain and the hybrid path, then keeps the faster one (see hybrid_active)
     bool hybrid_window_pending() const;
+    // the next tick times the ubatches (synchronize the backends before it); CPU misses: only while a trial runs or is about to start
+    bool hybrid_tick_sync() const;
 
     // fetch overlap rule (default) or auto (LLAMA_MOE_CACHE_FETCH_OVERLAP=3): true while a window or trial runs or waits; the tick goes before the graph of
     // every ubatch then, after the previous ubatch finished when overlap_tick_sync() (the backends are synchronized)

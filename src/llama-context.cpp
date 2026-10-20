@@ -2133,7 +2133,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
     // auto mode: the first small batches alternate between the plain cache and the hybrid path, then the faster one is kept
     if (moe_cache && moe_cache->hybrid_window_pending()) {
-        ggml_backend_sched_synchronize(sched.get());
+        if (moe_cache->hybrid_tick_sync()) {
+            ggml_backend_sched_synchronize(sched.get());
+        }
         moe_cache->hybrid_tick(ubatch.n_tokens);
         ggml_backend_sched_set_overlap(sched.get(), moe_cache->hybrid_active());
     }

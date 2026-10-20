@@ -783,6 +783,32 @@ struct llama_moe_cache::impl {
     int      cm_nwin  = 0;
     double   cm_rate  = -1.0;  // miss rate of the distinct experts looked up in the last window
     bool     cm_measured = false; // the decisions come from a measured miss rate (before: the prior, see cm_calibrate)
+    // small batches (at most max_batch tokens): the cost model gives the candidate sizes and the share, a timing trial keeps the host path only
+    // where it is faster: the time of a split boundary (device sync, host threads, copies, the CUDA graph cut in two) is not something the
+    // calibration sees (G4: modelled 25 us per layer, measured 60-70 us: Qwen3.6 UD-Q4_K_XL 12 GB without a draft -20% decode with the model
+    // alone). Trial = 5 blocks of cmt_block small batches: host path off (warm-up, not counted), off, on, on, off; the time from one small batch
+    // to the next goes to the path of the first, the first cmt_skip of a block are not counted (graphs rebuilt); on if the median is at least
+    // cmt_margin faster; trials again after cmt_gap small batches (doubled each time, at most cmt_gap_max) since the misses change with the
+    // cache and the prompts. LLAMA_MOE_CPU_MISS_TRIAL=0: the model alone decides
+    static constexpr int    cmt_block   = 8;
+    static constexpr int    cmt_skip    = 3;
+    static constexpr double cmt_margin  = 0.03;
+    static constexpr int    cmt_gap_max = 2048;
+    bool     cm_trial      = true;
+    bool     cm_small_ok   = true;  // the last trial kept the host path for small batches
+    bool     cm_small_live = true;  // the graphs of small batches use it now
+    int      cmt_done   = -1;       // small batches of the running trial, -1 if none
+    int      cmt_wait   = -1;       // small batches until the next trial
+    int      cmt_gap    = 64;
+    int      cmt_n      = 0;
+    int      cmt_arm    = 0;
+    int      cmt_skipn  = 0;
+    int64_t  cmt_t_prev = -1;
+    std::vector<int64_t> cmt_t[2];
+    // the host is not as fast as calibrated (a busy host: the last trial found the host path cmt_host_bad times slower or worse): the
+    // short prompts do not take it either
+    static constexpr double cmt_host_bad = 1.25;
+    bool     cmt_host_ok = true;
 
     // " (mtp)" for the cache of an MTP context, in its log lines
     const char * tag = "";
@@ -858,6 +884,8 @@ struct llama_moe_cache::impl {
                 cm = hybrid && env == nullptr && env_f == nullptr && (env_cm == nullptr || atoi(env_cm) != 0);
                 // =2 (diagnostic, KLD gates): on for every batch size once calibrated, without the rule (the share is at most 3/4)
                 cm_force = cm && env_cm != nullptr && atoi(env_cm) == 2;
+                const char * env_t = getenv("LLAMA_MOE_CPU_MISS_TRIAL");
+                cm_trial = !cm_force && (env_t == nullptr || atoi(env_t) != 0);
                 const char * env_p = getenv("LLAMA_MOE_CPU_MISS_MAX_TOKENS");
                 cm_max = std::max<int64_t>(1, std::min<int64_t>(cm_max_limit, env_p != nullptr ? atoll(env_p) : cm_max));
                 cm_dbg = getenv("LLAMA_MOE_CPU_MISS_LOG") != nullptr && atoi(getenv("LLAMA_MOE_CPU_MISS_LOG")) != 0;
@@ -2773,19 +2801,27 @@ struct llama_moe_cache::impl {
 
     // a batch of more than max_batch tokens (a short prompt) that the host path serves: it is looked up on the device like a small batch
     bool cm_serves(int64_t n_tokens) const {
-        return cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_max && cm_on[n_tokens] != 0;
+        return cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_max && cm_on[n_tokens] != 0 && cmt_host_ok;
     }
 
     // the host computes the misses of a batch of n_tokens: the fetch share, 1 = every missing expert is fetched
     float cm_share_of(int64_t n_tokens) const {
-        if (!cm || !cm_cal || n_tokens < 1 || n_tokens > cm_max || cm_on[n_tokens] == 0) {
+        if (!cm || !cm_cal || n_tokens < 1 || n_tokens > cm_max || cm_on[n_tokens] == 0 || (n_tokens <= max_batch && !cm_small_live)) {
             return 1.0f;
         }
         return cm_share[n_tokens];
     }
 
     bool cm_any_on() const {
-        return cm && cm_cal && std::any_of(cm_on.begin(), cm_on.end(), [](uint8_t v) { return v != 0; });
+        if (!cm || !cm_cal) {
+            return false;
+        }
+        for (int64_t n = 1; n <= cm_max; ++n) {
+            if (cm_on[n] != 0 && (n > max_batch || cm_small_live)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // distinct experts of a layer that a batch of n tokens routes to (independent uniform routing), and the tokens of each
@@ -3318,6 +3354,10 @@ struct llama_moe_cache::impl {
             cm_rate = std::max(0.02, std::min(1.0, 1.0 - std::max(0.0, cache_frac)));
             cm_decide();
         }
+        if (cm_trial) {
+            cmt_done   = 0;
+            cmt_t_prev = -1;
+        }
         if (cm_force) {
             for (int64_t n = 1; n <= cm_max; ++n) {
                 cm_share[n] = std::min(cm_share[n], 0.75f);
@@ -3334,6 +3374,95 @@ struct llama_moe_cache::impl {
             "decided from a prior miss rate, then from the measured one after %d small batches (%.1f ms)\n", tag,
             cm_t1, g.expert_bytes/cm_t1/1e3, cm_dt, cm_tup, g.expert_bytes/cm_tup/1e3, cm_split, cm_share[1], cm_share[std::min<int64_t>(4, cm_max)],
             (int) std::min<int64_t>(4, cm_max), cm_share[cm_max], cm_max, n_max_share, cm_skip + cm_win1, (ggml_time_us() - t_start)/1e3);
+    }
+
+    // true if the host path took at least cmt_host_bad times as long as the plain cache
+    static bool cmt_host_slow(double t_on, double t_off) {
+        return t_off > 0.0 && t_on >= cmt_host_bad*t_off;
+    }
+
+    bool cmt_pending() const {
+        return cm && cm_cal && cm_trial && (cmt_done >= 0 || cmt_wait >= 0);
+    }
+
+    // a small batch whose size the model lets the host path take (the trial times only those)
+    bool cmt_counted(int64_t n_tokens) const {
+        return n_tokens >= 1 && n_tokens <= max_batch && n_tokens <= cm_max && cm_on[n_tokens] != 0;
+    }
+
+    // before the graph of every ubatch while a trial runs or waits, after the previous ubatch finished (backends synchronized)
+    void cmt_tick(int64_t n_tokens) {
+        if (!cmt_pending()) {
+            return;
+        }
+        const bool counted = cmt_counted(n_tokens);
+        const int64_t now = ggml_time_us();
+        if (cmt_done < 0) {
+            if (!counted || --cmt_wait > 0) {
+                return;
+            }
+            cmt_wait   = -1;
+            cmt_done   = 0;
+            cmt_t_prev = -1;
+        }
+        if (cmt_t_prev >= 0 && counted) {
+            cmt_t[cmt_arm].push_back(now - cmt_t_prev);
+        }
+        cmt_t_prev = -1;
+        if (!counted) {
+            return; // the next interval would include this ubatch
+        }
+        auto median = [](std::vector<int64_t> v) {
+            std::sort(v.begin(), v.end());
+            return v.empty() ? 0.0 : (double) v[v.size()/2];
+        };
+        // the host path much slower than without it ends the trial early
+        if (cmt_t[0].size() >= 4 && cmt_t[1].size() >= 4 &&
+                *std::min_element(cmt_t[1].begin(), cmt_t[1].end()) > (1.0 + 8*cmt_margin)*median(cmt_t[0])) {
+            cmt_done = 5*cmt_block;
+        }
+        if (cmt_done >= 5*cmt_block) {
+            cmt_done = -1;
+            const double t_off = median(cmt_t[0]);
+            const double t_on  = median(cmt_t[1]);
+            const bool   on    = cmt_t[0].size() >= 3 && cmt_t[1].size() >= 3 && t_on < (1.0 - cmt_margin)*t_off;
+            cmt_n++;
+            if (cmt_n <= 4 || on != cm_small_ok || cm_dbg) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses trial %d: %.3f ms per small batch without the host path, %.3f ms with it (medians of %zu and %zu) -> %s for small batches%s\n",
+                    tag, cmt_n, t_off/1e3, t_on/1e3, cmt_t[0].size(), cmt_t[1].size(), on ? "on" : "off",
+                    cmt_host_slow(t_on, t_off) ? ", off for short prompts (the host is slower than calibrated)" : "");
+            }
+            cmt_t[0].clear();
+            cmt_t[1].clear();
+            if (on != cm_small_live) {
+                cm_gen++;
+            }
+            cm_small_ok   = on;
+            cm_small_live = on;
+            const bool host_ok = !cmt_host_slow(t_on, t_off);
+            if (host_ok != cmt_host_ok) {
+                cm_gen++;
+            }
+            cmt_host_ok = host_ok;
+            cmt_wait = cmt_gap;
+            cmt_gap  = std::min(2*cmt_gap, cmt_gap_max);
+            return;
+        }
+        const int blk = cmt_done/cmt_block;
+        const int arm = blk == 2 || blk == 3;
+        if (arm != cmt_arm || cmt_done == 0) {
+            cmt_skipn = cmt_skip;
+        }
+        if ((arm != 0) != cm_small_live) {
+            cm_gen++;
+        }
+        cmt_arm       = arm;
+        cm_small_live = arm != 0;
+        if (blk > 0 && cmt_skipn == 0) {
+            cmt_t_prev = now;
+        }
+        cmt_skipn = std::max(0, cmt_skipn - 1);
+        cmt_done++;
     }
 
     // reads the device counters of the lookups: distinct hits, fetched misses, misses left to the host
@@ -4982,9 +5111,10 @@ struct llama_moe_cache::impl {
                     n_on += cm_on[i] != 0;
                 }
                 LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: %llu missing experts computed on the host (%.2f MiB not fetched), hit rate with them = %.2f%%, "
-                    "host path on for %" PRId64 " batch sizes now, %d decisions, last miss rate %.1f%%, ubatches on the host path: %zu small, %zu above %" PRId64 " tokens\n",
+                    "host path on for %" PRId64 " batch sizes now, %d decisions, last miss rate %.1f%%, ubatches on the host path: %zu small, %zu above %" PRId64 " tokens; "
+                    "%d trials, small batches %s\n",
                     tag, (unsigned long long) c[2], (double) c[2]*(groups.empty() ? 0.0 : (double) groups[0].expert_bytes)/1048576.0, n > 0 ? 100.0*c[0]/n : 0.0,
-                    n_on, (int) cm_gen, 100.0*cm_rate, cm_n_small, cm_n_prompt, max_batch);
+                    n_on, (int) cm_gen, 100.0*cm_rate, cm_n_small, cm_n_prompt, max_batch, cmt_n, cm_small_ok ? "on" : "off");
             }
             if (hybrid_share < 1.0f) {
                 uint64_t n_host = 0;
@@ -5188,10 +5318,21 @@ void llama_moe_cache::overlap_tick(int64_t n_tokens) {
 }
 
 bool llama_moe_cache::hybrid_window_pending() const {
+    if (pimpl->cm) {
+        return pimpl->cmt_pending();
+    }
     return pimpl->hybrid && (pimpl->win_done >= 0 || pimpl->win_wait >= 0);
 }
 
+bool llama_moe_cache::hybrid_tick_sync() const {
+    return !pimpl->cm || pimpl->cmt_done >= 0 || pimpl->cmt_wait == 1;
+}
+
 void llama_moe_cache::hybrid_tick(int64_t n_tokens) {
+    if (pimpl->cm) {
+        pimpl->cmt_tick(n_tokens);
+        return;
+    }
     pimpl->tick(n_tokens);
 }
 
