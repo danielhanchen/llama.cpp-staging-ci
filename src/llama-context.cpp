@@ -3853,6 +3853,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     for (auto & b : backend_ptrs) {
         buf_after += ggml_backend_sched_get_buffer_size(sched.get(), b);
     }
+    // the arenas a growing group outgrew: their inputs were copied when the graphs that read them returned
+    lm_arena_old.clear();
     if (lm_verbose) {
         LLAMA_LOG_INFO("%s: compute buffers %.2f -> %.2f MiB\n", __func__, buf_before/1048576.0, buf_after/1048576.0);
         LLAMA_LOG_INFO("%s: %zu ubatches (%" PRId64 " tokens each at most), %zu pieces, %d nodes, %d splits: build %.2f ms (graphs %.2f, inputs %.2f), "

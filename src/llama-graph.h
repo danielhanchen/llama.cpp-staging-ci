@@ -1001,7 +1001,10 @@ public:
     ggml_context_ptr ctx_compute;
 
     // memory buffers used to evaluate the model
-    std::vector<uint8_t> buf_compute_meta;
+    // not zero-filled (a std::vector would touch every byte): only the pages the graph uses become resident. The layer-major graph
+    // results (16 per context) held ~290 MiB of zeroed metadata in k9 (Qwen3.6-35B-A3B + MTP), most of it never used
+    std::unique_ptr<uint8_t[]> buf_compute_meta;
+    size_t                     buf_compute_meta_size = 0;
 
     ggml_cgraph * gf;
 
