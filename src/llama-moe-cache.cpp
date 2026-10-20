@@ -2815,13 +2815,20 @@ struct llama_moe_cache::impl {
     }
 
     // a batch of more than max_batch tokens (a short prompt) that the host path serves: it is looked up on the device like a small batch
+    // short prompts take the host path only once a trial found it faster for the small batches on this host and model (without a
+    // trial: the model alone). G4 gpt-oss-20b Q2_K 8 GB and T4 Qwen3.6 UD-Q4_K_XL 8 GB without a draft: trials off, the 95-token chat
+    // prompt -19% / -26% on the host path from the prior; where the trials kept it (Qwen3.6 8 GB MTP: G4 +18%, T4 +6%) it gained
+    bool cm_prompt_ok() const {
+        return cmt_host_ok && (!cm_trial || (cmt_n > 0 && cm_small_ok));
+    }
+
     bool cm_serves(int64_t n_tokens) const {
-        return cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_max && cm_on[n_tokens] != 0 && cmt_host_ok;
+        return cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_max && cm_on[n_tokens] != 0 && cm_prompt_ok();
     }
 
     // the host computes the misses of a batch of n_tokens: the fetch share, 1 = every missing expert is fetched
     float cm_share_of(int64_t n_tokens) const {
-        if (!cm || !cm_cal || n_tokens < 1 || n_tokens > cm_max || cm_on[n_tokens] == 0 || (n_tokens <= max_batch && !cm_small_live)) {
+        if (!cm || !cm_cal || n_tokens < 1 || n_tokens > cm_max || cm_on[n_tokens] == 0 || (n_tokens <= max_batch ? !cm_small_live : !cm_prompt_ok())) {
             return 1.0f;
         }
         return cm_share[n_tokens];
@@ -2832,7 +2839,7 @@ struct llama_moe_cache::impl {
             return false;
         }
         for (int64_t n = 1; n <= cm_max; ++n) {
-            if (cm_on[n] != 0 && (n > max_batch || cm_small_live)) {
+            if (cm_on[n] != 0 && (n > max_batch ? cm_prompt_ok() : cm_small_live)) {
                 return true;
             }
         }
@@ -3471,9 +3478,7 @@ struct llama_moe_cache::impl {
             }
             cmt_t[0].clear();
             cmt_t[1].clear();
-            if (on != cm_small_live) {
-                cm_gen++;
-            }
+            cm_gen++; // the small batches and the short prompts (cm_prompt_ok) may change
             cm_small_ok   = on;
             cm_small_live = on;
             const bool host_ok = !cmt_host_slow(t_on, t_off);
