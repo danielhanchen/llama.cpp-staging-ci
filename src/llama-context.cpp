@@ -418,6 +418,12 @@ llama_context::llama_context(
             lm_ub_max = std::max(1, atoi(e));
         }
         lm_verbose = getenv("LLAMA_MOE_LAYER_MAJOR_LOG") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_LOG")) != 0;
+        // k9-prompt-pass: a context whose prompt ubatches seed the cache on the device (the device-seed fallback, n_ubatch >= 1024, e.g.
+        // Studio's -ub 2048) refused every group, so an 8k prompt copied each spilled expert once per ubatch (G4, Flash-Next UD-IQ4_XS
+        // 32 GB: 147.7 GB in 4 passes). The group runs there too: its members do not seed on the device, a ubatch run alone after it
+        // (the server's checkpoint batch) still does, and a group that ends the prompt seeds from the routing of its last but one member
+        lm_devseed      = getenv("LLAMA_MOE_LAYER_MAJOR_DEVSEED") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_DEVSEED")) != 0;
+        lm_devseed_seed = getenv("LLAMA_MOE_LAYER_MAJOR_DEVSEED_SEED") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_DEVSEED_SEED")) != 0;
     }
 
     {
@@ -3110,7 +3116,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     if (!moe_cache || cparams.embeddings || !cparams.causal_attn || cparams.verify || ple.enabled ||
             std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool b) { return b; }) ||
             n_tokens_all - n_tokens_prev <= (int64_t) cparams.n_ubatch + llama_moe_cache::n_small_max || !eligible(mctx->get_ubatch()) ||
-            moe_cache->lends_graph_to(mctx->get_ubatch().n_tokens) || moe_cache->hybrid_fixed() || moe_cache_devseed_on) {
+            moe_cache->lends_graph_to(mctx->get_ubatch().n_tokens) || moe_cache->hybrid_fixed() || (moe_cache_devseed_on && !lm_devseed)) {
         if (lm_verbose && moe_cache && n_tokens_all - n_tokens_prev > (int64_t) cparams.n_ubatch + llama_moe_cache::n_small_max) {
             const auto & ub = mctx->get_ubatch();
             LLAMA_LOG_INFO("%s: not layer-major: samplers %d embeddings %d causal %d verify %d ple %d ubatch %u (eligible %d, seqs %u, embd %d) "
@@ -3479,7 +3485,10 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     moe_cache->clear_seed_counts();
     int seed_k = -1, src_k = -1;
     static const bool lm_seed_env = getenv("LLAMA_MOE_LAYER_MAJOR_SEED") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_SEED")) != 0;
-    if (lm_seed_env && moe_cache_seed_enabled && moe_cache_seed_sync && !moe_cache_seed_auto) {
+    // beside the device seed (seed_sync off: the host seed of a ubatch's own ids does not fit) only the seed from an earlier member's
+    // routing, which needs no larger graph
+    const bool lm_seed_dev = moe_cache_devseed_on && lm_devseed_seed;
+    if (lm_seed_env && moe_cache_seed_enabled && (moe_cache_seed_sync || lm_seed_dev) && !moe_cache_seed_auto) {
         for (size_t k = 0; k < group.size(); ++k) {
             const int64_t nt = group[k].ub->n_tokens;
             if (nt > llama_moe_cache::n_small_max && n_tokens_all - group[k].n_tokens_before - nt <= llama_moe_cache::n_small_max) {
@@ -3488,7 +3497,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
         if (seed_k >= 1 && group[seed_k].n_outputs == 0) {
             src_k = seed_k - 1;
-        } else if (seed_k >= 1 && moe_cache_seed_fits) {
+        } else if (seed_k >= 1 && moe_cache_seed_fits && moe_cache_seed_sync) {
             src_k = seed_k;
         } else if (seed_k >= 1) {
             moe_cache->count_seed_skipped();
