@@ -3173,8 +3173,14 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     moe_cache_record    = false;
     moe_cache_devseed   = false;
 
+    // the arena is pinned only when it is made at load (LLAMA_MOE_LAYER_MAJOR_EAGER=1): made by a prompt, pinning it cost that prompt
+    // 2.6% (2k) / 3.5% (8k) on G4 (Qwen3.6-35B-A3B UD-Q4_K_XL + MTP, 8 GB, fresh process per prompt), while the inputs it holds (mostly
+    // KQ masks of a few MiB per ubatch) are copied synchronously either way; pageable memory is also not locked on a low-RAM machine.
+    // LLAMA_MOE_LAYER_MAJOR_ARENA_PINNED=1 pins it anyway
+    static const bool lm_pin = (getenv("LLAMA_MOE_LAYER_MAJOR_EAGER") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_EAGER")) != 0) ||
+        (getenv("LLAMA_MOE_LAYER_MAJOR_ARENA_PINNED") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_ARENA_PINNED")) != 0);
     ggml_backend_buffer_type_t inp_buft = ggml_backend_cpu_buffer_type();
-    if (auto * dev = model.dev_output()) {
+    if (auto * dev = model.dev_output(); dev != nullptr && lm_pin) {
         if (auto * hb = ggml_backend_dev_host_buffer_type(dev)) {
             inp_buft = hb;
         }
