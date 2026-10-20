@@ -201,6 +201,140 @@ static __global__ void ggml_cuda_ar_kernel(
     }
 }
 
+#if !defined(GGML_USE_HIP)
+// ---------------------------------------------------------------------------
+// Chunked kernel AllReduce, P2P variant -- same three phases as
+// ggml_cuda_ar_kernel, but the data and the arrival token are written
+// straight into the PEER's device memory (peer_inbox / peer_flag, reachable
+// through cudaDeviceEnablePeerAccess), and each GPU reads its own inbox and
+// polls its own flag in local device memory.  One PCIe (or NVLink) crossing
+// per element instead of two (D2H into pinned host memory, then the peer's
+// read of it), and the spin polls local memory instead of host memory.
+//
+// Release: every thread's peer stores are fenced (__threadfence_system),
+// the block syncs, then thread 0 stores the token into the peer's flag.
+// Acquire: thread 0 spins on its local flag (volatile), the block syncs and
+// fences, then the inbox is read with cache-volatile loads (ld.global.cv) so
+// no stale line from an earlier AR on this slot can be returned.
+//
+// spin_limit_cycles > 0 bounds the spin (integrity probe only): on timeout
+// the kernel sets *timeout_flag and carries on with whatever is in the inbox,
+// which the probe then reports as a mismatch.  0 = spin until the token
+// arrives, like the host-staged kernel.
+// ---------------------------------------------------------------------------
+template <typename T_dst, typename T_wire>
+static __global__ void ggml_cuda_ar_p2p_kernel(
+        const T_dst  *              sendbuf,
+        T_dst        *              recvbuf,
+        T_wire       * __restrict__ peer_inbox,
+        const T_wire * __restrict__ my_inbox,
+        int                         count,
+        int *                       peer_flag,
+        const int *                 my_flag,
+        int                         token,
+        long long                   spin_limit_cycles,
+        int *                       timeout_flag) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(T_wire);
+    constexpr int ARRIVAL_INTS  = (int)(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
+    static_assert(ELEMS_PER_VEC * sizeof(T_wire) == sizeof(int4), "P2P AllReduce expects 16-byte vectors");
+
+    const int tid       = threadIdx.x;
+    const int nt        = blockDim.x;
+    const int bid       = blockIdx.x;
+    const int gtid      = bid * nt + tid;
+    const int gnt       = gridDim.x * nt;
+    const int count_vec = count / ELEMS_PER_VEC;
+    const int tail      = count_vec * ELEMS_PER_VEC;
+
+    // Phase 1: cast sendbuf -> T_wire and store into the peer's inbox.
+    for (int i = gtid; i < count_vec; i += gnt) {
+        const int off = i * ELEMS_PER_VEC;
+        T_wire wire[ELEMS_PER_VEC];
+#pragma unroll
+        for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+            wire[k] = ggml_cuda_cast<T_wire>(sendbuf[off + k]);
+        }
+        ggml_cuda_memcpy_1<sizeof(wire)>(&peer_inbox[off], wire);
+    }
+    if (bid == 0 && tid < count - tail) {
+        peer_inbox[tail + tid] = ggml_cuda_cast<T_wire>(sendbuf[tail + tid]);
+    }
+
+    __threadfence_system();
+    __syncthreads();
+
+    // Phase 2: signal the peer (remote store), wait for the peer's signal (local load).
+    if (tid == 0) {
+        ggml_cuda_ar_signal_set(peer_flag + bid * ARRIVAL_INTS, token);
+        __threadfence_system();
+
+        const int *     slot  = my_flag + bid * ARRIVAL_INTS;
+        const long long start = spin_limit_cycles > 0 ? clock64() : 0;
+        while (ggml_cuda_ar_signal_get(slot) != token) {
+            __nanosleep(100);
+            if (spin_limit_cycles > 0 && clock64() - start > spin_limit_cycles) {
+                *(volatile int *) timeout_flag = 1;
+                break;
+            }
+        }
+    }
+
+    __syncthreads();
+    __threadfence_system();
+
+    // Phase 3: read the peer's contribution from the local inbox and sum, both sides rounded through T_wire.
+    for (int i = gtid; i < count_vec; i += gnt) {
+        const int off = i * ELEMS_PER_VEC;
+        const int4 v = __ldcv(reinterpret_cast<const int4 *>(&my_inbox[off]));
+        T_wire wire[ELEMS_PER_VEC];
+        memcpy(wire, &v, sizeof(v));
+#pragma unroll
+        for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+            const T_wire d_low = ggml_cuda_cast<T_wire>(sendbuf[off + k]);
+            recvbuf[off + k] = ggml_cuda_cast<T_dst>(
+                ggml_cuda_cast<float>(d_low) + ggml_cuda_cast<float>(wire[k]));
+        }
+    }
+    if (bid == 0 && tid < count - tail) {
+        const T_wire d_low = ggml_cuda_cast<T_wire>(sendbuf[tail + tid]);
+        const T_wire other = *(const volatile T_wire *) &my_inbox[tail + tid];
+        recvbuf[tail + tid] = ggml_cuda_cast<T_dst>(ggml_cuda_cast<float>(d_low) + ggml_cuda_cast<float>(other));
+    }
+#else
+    GGML_UNUSED_VARS(sendbuf, recvbuf, peer_inbox, my_inbox, count, peer_flag, my_flag, token, spin_limit_cycles, timeout_flag);
+    NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+}
+
+// Integrity probe helpers: deterministic, exactly representable test values
+// (multiples of 0.25 below 2^11) so that every fp32 sum is exact.
+static __device__ __forceinline__ float ggml_cuda_ar_probe_value(int idx, int rank, int round) {
+    return (float) ((idx * 7 + round * 131 + rank * 1009) % 2039) * 0.25f;
+}
+
+static __global__ void ggml_cuda_ar_probe_fill(float * dst, int count, int rank, int round) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += gridDim.x * blockDim.x) {
+        dst[i] = ggml_cuda_ar_probe_value(i, rank, round);
+    }
+}
+
+// Counts elements of buf that differ from probe_value(i, 0, round) + probe_value(i, 1, round)
+// (sum_both = true) or from probe_value(i, rank, round) (sum_both = false).
+static __global__ void ggml_cuda_ar_probe_check(const float * buf, int count, int rank, int round, bool sum_both, unsigned int * n_bad) {
+    unsigned int bad = 0;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += gridDim.x * blockDim.x) {
+        const float want = sum_both ?
+            ggml_cuda_ar_probe_value(i, 0, round) + ggml_cuda_ar_probe_value(i, 1, round) :
+            ggml_cuda_ar_probe_value(i, rank, round);
+        bad += buf[i] != want;
+    }
+    if (bad) {
+        atomicAdd(n_bad, bad);
+    }
+}
+#endif // !defined(GGML_USE_HIP)
+
 // Combined load-convert-add kernel.  The peer's contribution arrives as T_src
 // (which may be a lower-precision type than T_dst when the BF16 round-trip is
 // active).  For bit-equivalence between the two GPUs, dst is first rounded
@@ -335,7 +469,23 @@ struct ggml_cuda_ar_pipeline {
     // memory; CPU never reads/writes -- only the kernel and cudaMemset.
     // Use ggml_cuda_ar_arrival_ptr() to index.
     ggml_cuda_ar_host_mapping arrival;
+
+    // P2P direct-write path (set only when both directions report
+    // cudaDeviceCanAccessPeer, peer access could be enabled and the
+    // integrity probe passed).  p2p_inbox[i] / p2p_flags[i] live in device
+    // i's memory and are written by the peer; dev_tmp[i] is filled by the
+    // peer's cudaMemcpyPeerAsync on the copy-engine path.
+    bool                     p2p;
+    bool                     p2p_enabled_here[GGML_CUDA_MAX_DEVICES]; // we enabled peer access (undo on free)
+    char *                   p2p_inbox[GGML_CUDA_MAX_DEVICES];        // POOL_SIZE * buf_bytes
+    int *                    p2p_flags[GGML_CUDA_MAX_DEVICES];        // POOL_SIZE * KERNEL_BLOCKS * ARRIVAL_STRIDE bytes
+    cudaEvent_t              p2p_pushed[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_POOL_SIZE]; // my data is in the peer's dev_tmp
 };
+
+static int * ggml_cuda_ar_p2p_flag_ptr(const ggml_cuda_ar_pipeline * p, int slot, int rank) {
+    const size_t offset = (size_t) slot * GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    return reinterpret_cast<int *>(reinterpret_cast<char *>(p->p2p_flags[rank]) + offset);
+}
 
 // Base pointer for the (slot, rank) per-block token block.  The kernel adds
 // blockIdx.x * (ARRIVAL_STRIDE/sizeof(int)) internally to land on its own slot.
@@ -394,6 +544,208 @@ static void ggml_cuda_ar_wait_for_compute(
 }
 
 // ---------------------------------------------------------------------------
+// P2P setup + integrity probe
+// ---------------------------------------------------------------------------
+
+static void ggml_cuda_ar_p2p_release(ggml_cuda_ar_pipeline * p) {
+    for (int i = 0; i < p->n_devices; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        if (p->p2p_inbox[i]) { CUDA_CHECK(cudaFree(p->p2p_inbox[i])); p->p2p_inbox[i] = nullptr; }
+        if (p->p2p_flags[i]) { CUDA_CHECK(cudaFree(p->p2p_flags[i])); p->p2p_flags[i] = nullptr; }
+        for (int s = 0; s < GGML_CUDA_AR_POOL_SIZE; ++s) {
+            if (p->p2p_pushed[i][s]) { CUDA_CHECK(cudaEventDestroy(p->p2p_pushed[i][s])); p->p2p_pushed[i][s] = nullptr; }
+        }
+        if (p->p2p_enabled_here[i]) {
+            (void) cudaDeviceDisablePeerAccess(p->devices[1 - i]);
+            (void) cudaGetLastError();
+            p->p2p_enabled_here[i] = false;
+        }
+    }
+    p->p2p = false;
+}
+
+#if !defined(GGML_USE_HIP)
+// Runs the production P2P kernel (bounded spin) for a few rounds on known data and checks
+// every element of the result, then checks one full-size cudaMemcpyPeerAsync each way.
+// Returns true when every value arrived exactly; otherwise fills why.
+static bool ggml_cuda_ar_p2p_probe(ggml_cuda_ar_pipeline * p, char * why, size_t why_n) {
+    const int    n_chunk   = (int) (p->buf_bytes / sizeof(float));
+    const int    n_copy    = (int) (p->copy_bytes / sizeof(float));
+    float *      buf[2]    = {};
+    unsigned *   n_bad[2]  = {};
+    int *        tmo[2]    = {};
+    bool         ok        = true;
+    const long long spin_limit = 4000000000LL; // ~2-3 s at T4 / B200 clocks
+
+    for (int i = 0; i < 2 && ok; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        ok = cudaMalloc((void **) &buf[i], p->copy_bytes) == cudaSuccess &&
+             cudaMalloc((void **) &n_bad[i], sizeof(unsigned)) == cudaSuccess &&
+             cudaMalloc((void **) &tmo[i], sizeof(int)) == cudaSuccess &&
+             cudaMemset(tmo[i], 0, sizeof(int)) == cudaSuccess;
+    }
+    if (!ok) {
+        snprintf(why, why_n, "probe allocation failed");
+    }
+
+    // Chunked kernel: 4 rounds alternating the two slots, full chunk and a tail-sized count.
+    for (int r = 0; r < 4 && ok; ++r) {
+        const int slot  = r % GGML_CUDA_AR_POOL_SIZE;
+        const int count = (r & 2) ? n_chunk - 3 : n_chunk;
+        for (int i = 0; i < 2; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            ggml_cuda_ar_probe_fill<<<256, 256, 0, p->streams[i]>>>(buf[i], count, i, r);
+        }
+        for (int i = 0; i < 2; ++i) {
+            CUDA_CHECK(cudaStreamSynchronize(p->streams[i]));
+        }
+        for (int i = 0; i < 2; ++i) {
+            const int peer = 1 - i;
+            ggml_cuda_set_device(p->devices[i]);
+            ggml_cuda_ar_p2p_kernel<float, float><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, p->streams[i]>>>(
+                buf[i], buf[i],
+                reinterpret_cast<float *>(p->p2p_inbox[peer] + (size_t) slot * p->buf_bytes),
+                reinterpret_cast<const float *>(p->p2p_inbox[i] + (size_t) slot * p->buf_bytes),
+                count, ggml_cuda_ar_p2p_flag_ptr(p, slot, peer), ggml_cuda_ar_p2p_flag_ptr(p, slot, i),
+                r + 1, spin_limit, tmo[i]);
+        }
+        for (int i = 0; i < 2 && ok; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            if (cudaStreamSynchronize(p->streams[i]) != cudaSuccess) {
+                (void) cudaGetLastError();
+                snprintf(why, why_n, "probe kernel failed on device %d", p->devices[i]);
+                ok = false;
+            }
+        }
+        for (int i = 0; i < 2 && ok; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            CUDA_CHECK(cudaMemsetAsync(n_bad[i], 0, sizeof(unsigned), p->streams[i]));
+            ggml_cuda_ar_probe_check<<<256, 256, 0, p->streams[i]>>>(buf[i], count, i, r, true, n_bad[i]);
+            unsigned bad = 0;
+            int      timed_out = 0;
+            CUDA_CHECK(cudaMemcpyAsync(&bad, n_bad[i], sizeof(bad), cudaMemcpyDeviceToHost, p->streams[i]));
+            CUDA_CHECK(cudaMemcpyAsync(&timed_out, tmo[i], sizeof(timed_out), cudaMemcpyDeviceToHost, p->streams[i]));
+            CUDA_CHECK(cudaStreamSynchronize(p->streams[i]));
+            if (bad || timed_out) {
+                snprintf(why, why_n, "probe round %d on device %d: %u of %d values wrong%s",
+                         r, p->devices[i], bad, count, timed_out ? ", peer signal never arrived" : "");
+                ok = false;
+            }
+        }
+    }
+
+    // Copy engine: one full copy_bytes cudaMemcpyPeerAsync each way into the peer's dev_tmp.
+    for (int i = 0; i < 2 && ok; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        ggml_cuda_ar_probe_fill<<<1024, 256, 0, p->streams[i]>>>(buf[i], n_copy, i, 7);
+        CUDA_CHECK(cudaStreamSynchronize(p->streams[i]));
+    }
+    for (int i = 0; i < 2 && ok; ++i) {
+        const int peer = 1 - i;
+        ggml_cuda_set_device(p->devices[i]);
+        if (cudaMemcpyPeerAsync(p->dev_tmp[peer], p->devices[peer], buf[i], p->devices[i], p->copy_bytes, p->streams[i]) != cudaSuccess) {
+            (void) cudaGetLastError();
+            snprintf(why, why_n, "probe cudaMemcpyPeerAsync %d -> %d failed", p->devices[i], p->devices[peer]);
+            ok = false;
+        }
+    }
+    for (int i = 0; i < 2; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        CUDA_CHECK(cudaStreamSynchronize(p->streams[i]));
+    }
+    for (int i = 0; i < 2 && ok; ++i) {
+        const int peer = 1 - i;
+        ggml_cuda_set_device(p->devices[i]);
+        CUDA_CHECK(cudaMemsetAsync(n_bad[i], 0, sizeof(unsigned), p->streams[i]));
+        ggml_cuda_ar_probe_check<<<1024, 256, 0, p->streams[i]>>>(reinterpret_cast<const float *>(p->dev_tmp[i]), n_copy, peer, 7, false, n_bad[i]);
+        unsigned bad = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&bad, n_bad[i], sizeof(bad), cudaMemcpyDeviceToHost, p->streams[i]));
+        CUDA_CHECK(cudaStreamSynchronize(p->streams[i]));
+        if (bad) {
+            snprintf(why, why_n, "probe peer copy %d -> %d: %u of %d values wrong", p->devices[peer], p->devices[i], bad, n_copy);
+            ok = false;
+        }
+    }
+
+    // Reset the flags so production tokens (1, 2, ...) start from a clean ring.
+    const size_t flag_bytes = (size_t) GGML_CUDA_AR_POOL_SIZE * GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    for (int i = 0; i < 2; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        CUDA_CHECK(cudaMemset(p->p2p_flags[i], 0, flag_bytes));
+        if (buf[i])   { CUDA_CHECK(cudaFree(buf[i])); }
+        if (n_bad[i]) { CUDA_CHECK(cudaFree(n_bad[i])); }
+        if (tmo[i])   { CUDA_CHECK(cudaFree(tmo[i])); }
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    return ok;
+}
+#endif // !defined(GGML_USE_HIP)
+
+// Decides the P2P path: GGML_CUDA_AR_P2P=0 disables it; otherwise it is used when both
+// directions report peer access, peer access can be enabled and the probe passes.
+static bool ggml_cuda_ar_p2p_setup(ggml_cuda_ar_pipeline * p, char * why, size_t why_n) {
+#if defined(GGML_USE_HIP)
+    snprintf(why, why_n, "not implemented for HIP");
+    GGML_UNUSED(p);
+    return false;
+#else
+    const char * env = getenv("GGML_CUDA_AR_P2P");
+    if (env != nullptr && strcmp(env, "0") == 0) {
+        snprintf(why, why_n, "disabled by GGML_CUDA_AR_P2P=0");
+        return false;
+    }
+    for (int i = 0; i < 2; ++i) {
+        int can = 0;
+        if (cudaDeviceCanAccessPeer(&can, p->devices[i], p->devices[1 - i]) != cudaSuccess) {
+            (void) cudaGetLastError();
+            can = 0;
+        }
+        if (!can) {
+            snprintf(why, why_n, "cudaDeviceCanAccessPeer(%d -> %d) = 0", p->devices[i], p->devices[1 - i]);
+            return false;
+        }
+    }
+    for (int i = 0; i < 2; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        const cudaError_t rc = cudaDeviceEnablePeerAccess(p->devices[1 - i], 0);
+        if (rc == cudaSuccess) {
+            p->p2p_enabled_here[i] = true;
+        } else if (rc == cudaErrorPeerAccessAlreadyEnabled) {
+            (void) cudaGetLastError();
+        } else {
+            (void) cudaGetLastError();
+            snprintf(why, why_n, "cudaDeviceEnablePeerAccess(%d -> %d): %s", p->devices[i], p->devices[1 - i], cudaGetErrorString(rc));
+            ggml_cuda_ar_p2p_release(p);
+            return false;
+        }
+    }
+    const size_t inbox_bytes = (size_t) GGML_CUDA_AR_POOL_SIZE * p->buf_bytes;
+    const size_t flag_bytes  = (size_t) GGML_CUDA_AR_POOL_SIZE * GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    for (int i = 0; i < 2; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        bool ok = cudaMalloc((void **) &p->p2p_inbox[i], inbox_bytes) == cudaSuccess &&
+                  cudaMalloc((void **) &p->p2p_flags[i], flag_bytes) == cudaSuccess &&
+                  cudaMemset(p->p2p_flags[i], 0, flag_bytes) == cudaSuccess;
+        for (int s = 0; ok && s < GGML_CUDA_AR_POOL_SIZE; ++s) {
+            ok = cudaEventCreateWithFlags(&p->p2p_pushed[i][s], cudaEventDisableTiming) == cudaSuccess;
+        }
+        if (!ok) {
+            (void) cudaGetLastError();
+            snprintf(why, why_n, "P2P buffer allocation failed on device %d", p->devices[i]);
+            ggml_cuda_ar_p2p_release(p);
+            return false;
+        }
+    }
+    if (!ggml_cuda_ar_p2p_probe(p, why, why_n)) {
+        ggml_cuda_ar_p2p_release(p);
+        return false;
+    }
+    snprintf(why, why_n, "probe passed (4 kernel rounds + %zu MiB peer copy each way)", p->copy_bytes >> 20);
+    return true;
+#endif // defined(GGML_USE_HIP)
+}
+
+// ---------------------------------------------------------------------------
 // Init / free
 // ---------------------------------------------------------------------------
 
@@ -432,7 +784,10 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // Default 1: BF16 round-trip is always on for F32 inputs (any non-zero
     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
     // byte threshold to opt out for small tensors.
+    // On the P2P path the default is 0 (FP32 on the wire, exact for 2 GPUs);
+    // the value is fixed after the P2P decision below unless the env var is set.
     p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
+    const bool bf16_threshold_from_env = getenv("GGML_CUDA_AR_BF16_THRESHOLD") != nullptr;
     for (size_t i = 0; i < n_devices; ++i) {
         p->devices[i] = devices[i];
     }
@@ -532,9 +887,18 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
     }
 
+    char p2p_why[256] = {};
+    p->p2p = ggml_cuda_ar_p2p_setup(p, p2p_why, sizeof(p2p_why));
+    if (p->p2p && !bf16_threshold_from_env) {
+        p->bf16_threshold = 0;
+    }
+
     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
                   "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU\n",
                   __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20);
+    GGML_LOG_INFO("%s: AllReduce transport: %s (%s), wire %s\n", __func__,
+                  p->p2p ? "P2P direct write" : "host-staged", p2p_why,
+                  p->bf16_threshold > 0 ? "BF16 for F32" : "native (F32 exact)");
 
     return p;
 }
@@ -581,6 +945,7 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
             CUDA_CHECK(cudaStreamDestroy(p->streams[i]));
         }
     }
+    ggml_cuda_ar_p2p_release(p);
     p->arrival.free();
     delete p;
 }
@@ -588,6 +953,64 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
+
+#if !defined(GGML_USE_HIP)
+// P2P copy-engine variant: each GPU pushes its whole contribution straight into the
+// peer's dev_tmp with one cudaMemcpyPeerAsync (no host bounce), then each GPU's
+// compute stream adds dev_tmp into dst once the peer's push has landed.
+//   AR stream i:      wait compute(i) -> wait add_done(peer, previous AR) -> push src(i) -> dev_tmp(peer) -> record pushed(i)
+//   compute stream i: wait pushed(peer) (data arrived) + pushed(i) (src(i) read before the in-place add) -> add -> record add_done(i)
+template <typename T_src, typename T_dst>
+static bool ggml_cuda_ar_allreduce_copy_impl_p2p(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        T_src * const           src_buf[GGML_CUDA_MAX_DEVICES],
+        T_dst * const           dst_buf[GGML_CUDA_MAX_DEVICES],
+        const bool              compute[GGML_CUDA_MAX_DEVICES],
+        int64_t                 ne,
+        size_t                  nbytes) {
+    const int slot = ggml_cuda_ar_acquire_slot(p).slot;
+    ggml_backend_cuda_context * cuda_ctx[2] = {};
+
+    for (int i = 0; i < 2; ++i) {
+        const int peer = 1 - i;
+        ggml_cuda_set_device(p->devices[i]);
+        cuda_ctx[i] = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+        GGML_ASSERT(cuda_ctx[i]->device == p->devices[i]);
+
+        ggml_cuda_ar_wait_for_compute(p, cuda_ctx[i], i, slot);
+        if (p->dev_tmp_kernel_done_valid) {
+            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->dev_tmp_kernel_done[peer]));
+        }
+        if (!compute[i]) {
+            CUDA_CHECK(cudaMemsetAsync(src_buf[i], 0, nbytes, p->streams[i]));
+        }
+        CUDA_CHECK(cudaMemcpyPeerAsync(p->dev_tmp[peer], p->devices[peer], src_buf[i], p->devices[i], nbytes, p->streams[i]));
+        CUDA_CHECK(cudaEventRecord(p->p2p_pushed[i][slot], p->streams[i]));
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        const int peer = 1 - i;
+        ggml_cuda_set_device(p->devices[i]);
+        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx[i]->stream(), p->p2p_pushed[peer][slot]));
+        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx[i]->stream(), p->p2p_pushed[i][slot]));
+
+        const int block_size = 256;
+        int n_blocks = (int) ((ne + block_size - 1) / block_size);
+        if (n_blocks > 1024) {
+            n_blocks = 1024;
+        }
+        ggml_cuda_ar_add_kernel<T_dst, T_src><<<n_blocks, block_size, 0, cuda_ctx[i]->stream()>>>(
+            dst_buf[i], reinterpret_cast<const T_src *>(p->dev_tmp[i]), (int) ne);
+        CUDA_CHECK(cudaGetLastError());
+
+        CUDA_CHECK(cudaEventRecord(p->dev_tmp_kernel_done[i], cuda_ctx[i]->stream()));
+        CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, cuda_ctx[i]->stream()));
+    }
+    p->dev_tmp_kernel_done_valid = true;
+    return true;
+}
+#endif // !defined(GGML_USE_HIP)
 
 // Asymmetric copy_impl: data sent over PCIe in T_src precision (one element of
 // nbytes per ne element); accumulated locally into a T_dst buffer.  When
@@ -607,6 +1030,12 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
     GGML_ASSERT(p->n_devices == 2);
     GGML_ASSERT(nbytes <= p->copy_bytes);
     GGML_ASSERT(ne <= std::numeric_limits<int>::max());
+
+#if !defined(GGML_USE_HIP)
+    if (p->p2p) {
+        return ggml_cuda_ar_allreduce_copy_impl_p2p<T_src, T_dst>(p, backends, src_buf, dst_buf, compute, ne, nbytes);
+    }
+#endif // !defined(GGML_USE_HIP)
 
     const size_t chunk_bytes = ggml_cuda_ar_chunk_bytes(p, nbytes);
     GGML_ASSERT(chunk_bytes > 0);
@@ -921,7 +1350,24 @@ bool ggml_cuda_ar_allreduce(
                     CUDA_CHECK(cudaMemsetAsync(data, 0, chunk_dst_bytes, stream));
                 }
 
+#if !defined(GGML_USE_HIP)
+#define LAUNCH_AR_KERNEL_P2P(T_dst, T_wire) \
+                ggml_cuda_ar_p2p_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
+                    reinterpret_cast<const T_dst *>(data), \
+                    reinterpret_cast<T_dst *>(data), \
+                    reinterpret_cast<T_wire *>(p->p2p_inbox[peer] + (size_t) slot * p->buf_bytes), \
+                    reinterpret_cast<const T_wire *>(p->p2p_inbox[i] + (size_t) slot * p->buf_bytes), \
+                    static_cast<int>(chunk_elems), \
+                    ggml_cuda_ar_p2p_flag_ptr(p, slot, peer), \
+                    ggml_cuda_ar_p2p_flag_ptr(p, slot, i), \
+                    token, 0LL, nullptr)
+#else
+#define LAUNCH_AR_KERNEL_P2P(T_dst, T_wire) GGML_ABORT("P2P AllReduce is not available on HIP")
+#endif // !defined(GGML_USE_HIP)
 #define LAUNCH_AR_KERNEL(T_dst, T_wire) \
+                if (p->p2p) { \
+                    LAUNCH_AR_KERNEL_P2P(T_dst, T_wire); \
+                } else { \
                 ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
                     reinterpret_cast<const T_dst *>(data), \
                     reinterpret_cast<T_dst *>(data), \
@@ -930,7 +1376,8 @@ bool ggml_cuda_ar_allreduce(
                     static_cast<int>(chunk_elems), \
                     ggml_cuda_ar_arrival_ptr(p, slot, i), \
                     ggml_cuda_ar_arrival_ptr(p, slot, peer), \
-                    token)
+                    token); \
+                }
 
                 if (use_bf16) {
                     GGML_ASSERT(input_type == GGML_TYPE_F32);
@@ -945,6 +1392,7 @@ bool ggml_cuda_ar_allreduce(
                 }
 
 #undef LAUNCH_AR_KERNEL
+#undef LAUNCH_AR_KERNEL_P2P
                 CUDA_CHECK(cudaGetLastError());
 
                 if (last_chunk) {
