@@ -3030,6 +3030,10 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     auto eligible = [&](const llama_ubatch & ub) {
         return ub.n_tokens > llama_moe_cache::n_small_max && (int64_t) ub.n_tokens >= prefetch_min_batch && ub.n_seqs_unq == 1;
     };
+    // a merged graph of two ubatches was refused for its compute buffer growth: every graph would run alone, as usual
+    if (lm_refused_min <= 2) {
+        return 0;
+    }
     if (!moe_cache || cparams.embeddings || !cparams.causal_attn || cparams.verify || ple.enabled ||
             std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool b) { return b; }) ||
             n_tokens_all - n_tokens_prev <= (int64_t) cparams.n_ubatch + llama_moe_cache::n_small_max || !eligible(mctx->get_ubatch()) ||
@@ -3575,6 +3579,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     // (gpt-oss-20b MXFP4, G4 8 GB tier: 16 ubatches of 512 grew the compute buffer 455 -> 1164 MiB)
     static const size_t lm_grow_max = (size_t) (getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB"))) : 1024) << 20;
     int n_sub = 0;
+    size_t n_done = 0; // the members computed (in order): a fallback must not compute them again (recurrent states would advance twice)
     bool first_run = true;
     std::function<ggml_status(size_t, size_t)> run_range = [&](size_t a, size_t b) -> ggml_status {
         if (!first_run) {
@@ -3582,8 +3587,18 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
         first_run = false;
         if (b - a == 1) {
-            n_sub++;
-            return run(group[a].gf);
+            const ggml_status st = run(group[a].gf);
+            if (st == GGML_STATUS_SUCCESS) {
+                n_sub++;
+                n_done = b;
+            }
+            return st;
+        }
+        if (b - a >= lm_refused_min) {
+            // a graph of as many ubatches was refused before (the growth only rises with the context): split without measuring
+            const size_t mid = a + (b - a)/2;
+            const ggml_status st = run_range(a, mid);
+            return st != GGML_STATUS_SUCCESS ? st : run_range(mid, b);
         }
         ggml_cgraph * g = (a == 0 && b == group.size()) ? gm : build_merged(a, b);
         // the scheduler replaces node sources with its copies while it splits a graph: kept to undo them if the merged graph does not
@@ -3603,6 +3618,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         lm_merged_active = false;
         if (st != GGML_STATUS_ALLOC_FAILED) {
             n_sub++;
+            if (st == GGML_STATUS_SUCCESS) {
+                n_done = b;
+            }
             return st;
         }
         const size_t over = ggml_backend_sched_get_alloc_over(sched.get());
@@ -3610,15 +3628,14 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             std::copy(arr.begin(), arr.end(), node->src);
         }
         ggml_backend_sched_reset(sched.get());
-        // halves, keeping the seed source with the ubatch it seeds (src_k = seed_k - 1)
-        size_t mid = a + (b - a)/2; // > a: 0 below means the pair alone
-        if (src_k >= 0 && src_k + 1 == seed_k && (size_t) seed_k == mid) {
-            mid = (size_t) src_k > a ? (size_t) src_k : ((size_t) seed_k + 1 < b ? (size_t) seed_k + 1 : 0);
-        }
-        if (over == 0 || mid == 0) {
-            return GGML_STATUS_ALLOC_FAILED; // out of memory, or the seed pair alone does not fit: one by one, unseeded (below)
+        // halves (the seed source may end up in an earlier graph than the ubatch it seeds: the seed reads the routing and the expert
+        // copies of the source graph, so the cache ends up the same)
+        const size_t mid = a + (b - a)/2;
+        if (over == 0) {
+            return GGML_STATUS_ALLOC_FAILED; // out of memory: the members not computed yet one by one, unseeded (below)
         }
         lm_n_split++;
+        lm_refused_min = std::min(lm_refused_min, b - a);
         if (lm_verbose) {
             LLAMA_LOG_INFO("%s: the graph of ubatches [%zu, %zu) would grow the compute buffers by %.2f MiB: split at %zu\n", __func__, a, b,
                 over/1048576.0, mid);
@@ -3635,15 +3652,15 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         lm_n_graphs += n_sub;
         lm_n_ubatches += (int64_t) group.size();
         if (status == GGML_STATUS_ALLOC_FAILED) {
-            // the merged graphs need more compute memory than the device has: the graphs one after the other, as usual (also those of
-            // a part of the group already computed: they compute the same again)
-            LLAMA_LOG_WARN("%s: the graph of %zu ubatches did not allocate, computed one after the other\n", __func__, group.size());
+            // the merged graphs need more compute memory than the device has: the members not computed yet one after the other, as usual
+            LLAMA_LOG_WARN("%s: the graph of %zu ubatches did not allocate, ubatches %zu.. computed one after the other\n", __func__,
+                group.size(), n_done);
             lm_n_fallback++;
             lm_seed_active = false;
             moe_cache_seed_prev = false;
             ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
             gm = nullptr;
-            for (size_t k = 0; k < group.size(); ++k) {
+            for (size_t k = n_done; k < group.size(); ++k) {
                 ggml_backend_sched_reset(sched.get());
                 status = run(group[k].gf);
                 if (status != GGML_STATUS_SUCCESS) {
