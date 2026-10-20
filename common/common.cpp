@@ -1372,6 +1372,29 @@ static bool common_spec_draft_model(const common_params & params) {
 
 static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_model_params & mparams, llama_context_params & cparams);
 
+// <arch>.<key> of a GGUF as an integer (u32 / i32 / u64), -1 if absent or unreadable
+static int64_t common_gguf_u32(const std::string & path, const char * key) {
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context_ptr ctx(gguf_init_from_file(path.c_str(), gp));
+    if (!ctx) {
+        return -1;
+    }
+    const int64_t arch_id = gguf_find_key(ctx.get(), "general.architecture");
+    if (arch_id < 0 || gguf_get_kv_type(ctx.get(), arch_id) != GGUF_TYPE_STRING) {
+        return -1;
+    }
+    const int64_t kid = gguf_find_key(ctx.get(), (std::string(gguf_get_val_str(ctx.get(), arch_id)) + "." + key).c_str());
+    if (kid < 0) {
+        return -1;
+    }
+    switch (gguf_get_kv_type(ctx.get(), kid)) {
+        case GGUF_TYPE_UINT32: return gguf_get_val_u32(ctx.get(), kid);
+        case GGUF_TYPE_INT32:  return gguf_get_val_i32(ctx.get(), kid);
+        case GGUF_TYPE_UINT64: return (int64_t) gguf_get_val_u64(ctx.get(), kid);
+        default:               return -1;
+    }
+}
+
 // layer-major prompts (llama_context::decode_layer_major): the ubatches of one batch upload each host expert once, so n_ubatch stays the
 // default (no compute buffer growth taken from the cache) and the batch holds up to LLAMA_MOE_LAYER_MAJOR_BATCH (8192) tokens, at most the
 // context and lm_ub_max ubatches. LLAMA_MOE_LAYER_MAJOR=1 forces it for spilled experts, =0 turns it off; unset (auto): on for spilled
@@ -1402,10 +1425,41 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             want = std::min<int64_t>(want, params.n_ctx);
         }
         if (want >= 2*(int64_t) cparams.n_ubatch && want > (int64_t) cparams.n_batch) {
+            // the server clamps its checkpoint offsets to the old n_batch: the same batches and ubatches as without the raise
+            params.n_batch_ckpt = (int32_t) cparams.n_batch;
             params.n_batch  = (int32_t) want;
             cparams.n_batch = (uint32_t) want;
-            COM_INF("MoE cache: layer-major prompts at the given n_ubatch %u: n_batch %u (LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB=0 keeps it)\n",
-                cparams.n_ubatch, cparams.n_batch);
+            // a merged graph of k ubatches keeps what crosses its cuts for every member; at a large ubatch that is more than the fit leaves
+            // free (G4, Flash-Next UD-IQ4_XS 32 GB + Q8_0 MTP drafter, -ub 2048: 4 ubatches needed 755 MiB, 744 MiB were free, so the group
+            // ran as 2 + 2 and read the experts twice). The cache gives up min(LLAMA_MOE_LAYER_MAJOR_RESERVE_FRAC (0.025) of itself,
+            // (k - 1) x the estimate of one member: n_ubatch x 4 B x (4 n_embd + 4 n_expert_used n_ff_exp)); LLAMA_MOE_LAYER_MAJOR_RESERVE_MIB=N
+            // takes N MiB (0: nothing)
+            int64_t reserve = -1;
+            if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_RESERVE_MIB")) {
+                reserve = std::max<int64_t>(0, atoll(e)) << 20;
+            } else {
+                double frac = 0.025;
+                if (const char * ef = getenv("LLAMA_MOE_LAYER_MAJOR_RESERVE_FRAC")) {
+                    frac = std::max(0.0, atof(ef));
+                }
+                const int64_t n_embd = common_gguf_u32(params.model.path, "embedding_length");
+                const int64_t n_ff   = common_gguf_u32(params.model.path, "expert_feed_forward_length");
+                const int64_t n_used = common_gguf_u32(params.model.path, "expert_used_count");
+                const int64_t k      = (int64_t) cparams.n_batch/(int64_t) cparams.n_ubatch;
+                if (n_embd > 0 && n_ff > 0 && n_used > 0 && k > 1) {
+                    const int64_t est = (int64_t) cparams.n_ubatch*4*(4*n_embd + 4*n_used*n_ff);
+                    reserve = std::min<int64_t>((int64_t) (frac*(double) params.moe_cache_size), (k - 1)*est);
+                }
+            }
+            if (reserve > 0 && (int64_t) params.moe_cache_size > 2*reserve) {
+                params.moe_cache_size  -= (size_t) reserve;
+                cparams.moe_cache_size  = params.moe_cache_size;
+            } else {
+                reserve = 0;
+            }
+            COM_INF("MoE cache: layer-major prompts at the given n_ubatch %u: n_batch %u, %.2f MiB of the cache kept free for their graphs "
+                "(LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB=0 keeps n_batch, LLAMA_MOE_LAYER_MAJOR_RESERVE_MIB=0 the cache)\n",
+                cparams.n_ubatch, cparams.n_batch, reserve/1048576.0);
         }
         return;
     }

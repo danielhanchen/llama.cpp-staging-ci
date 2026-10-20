@@ -466,6 +466,7 @@ struct common_params {
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
     bool    n_batch_set           = false; // -b / LLAMA_ARG_BATCH was given (the MoE cache auto ubatch leaves n_batch alone then)
     bool    n_ubatch_set          = false; // -ub / LLAMA_ARG_UBATCH was given (no MoE cache auto ubatch then)
+    int32_t n_batch_ckpt          =     0; // > 0: the n_batch the server's checkpoint offsets are clamped to (n_batch raised for layer-major prompts at an explicit -ub)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
