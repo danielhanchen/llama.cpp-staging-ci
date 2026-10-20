@@ -417,6 +417,11 @@ llama_context::llama_context(
         if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX")) {
             lm_ub_max = std::max(1, atoi(e));
         }
+        // k9-prompt-pass: a batch holds at most ceil(n_batch / n_ubatch) ubatches, so no group is larger: the scheduler and the per-ubatch
+        // graph results are sized for that (at -ub 2048 -b 8192: 4, not 16)
+        if (cparams.n_ubatch > 0) {
+            lm_ub_max = std::max(1, std::min<int>(lm_ub_max, (int) ((cparams.n_batch + cparams.n_ubatch - 1)/cparams.n_ubatch)));
+        }
         lm_verbose = getenv("LLAMA_MOE_LAYER_MAJOR_LOG") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_LOG")) != 0;
         // k9-prompt-pass: a context whose prompt ubatches seed the cache on the device (the device-seed fallback, n_ubatch >= 1024, e.g.
         // Studio's -ub 2048) refused every group, so an 8k prompt copied each spilled expert once per ubatch (G4, Flash-Next UD-IQ4_XS
@@ -762,9 +767,13 @@ llama_context::llama_context(
 
         sched_reserve();
 
-        // layer-major prompts: the host arena of the group inputs (mostly the KQ masks), allocated now so that the first prompt does not
-        // pay for pinning it: up to LLAMA_MOE_LAYER_MAJOR_ARENA_MIB (256) for lm_ub_max ubatches at the full context, grown on demand
-        if (lm_enabled && moe_cache) {
+        // layer-major prompts: the host arena of the group inputs (mostly the KQ masks) and the graph results of the members. k9 made them
+        // at load so that the first prompt does not pay for them: 2 x 256 MiB of pinned memory (main + MTP context) and ~290 MiB of zeroed
+        // graph metadata (16 results per context) in every such process, also one that never reads a long prompt (k9 vs k8 host RSS +805 MiB
+        // at idle on a B200, +884 MiB on gfx1151; plans/k9_prompt_pass.md). Now both are made by the first group, the arena sized by what
+        // it needs (decode_layer_major grows it); LLAMA_MOE_LAYER_MAJOR_EAGER=1 allocates them here as before
+        static const bool lm_eager = getenv("LLAMA_MOE_LAYER_MAJOR_EAGER") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_EAGER")) != 0;
+        if (lm_enabled && moe_cache && lm_eager) {
             ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
             if (auto * dev = model.dev_output()) {
                 if (auto * hb = ggml_backend_dev_host_buffer_type(dev)) {
