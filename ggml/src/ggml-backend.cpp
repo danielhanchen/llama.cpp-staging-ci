@@ -1114,6 +1114,10 @@ struct ggml_backend_sched {
     bool overlap;
     // a host weight whose copy exists on the node's backend does not start a new split (ggml_backend_sched_set_reuse_weight_copies)
     bool reuse_weight_copies;
+    // the next allocations fail without allocating if a device compute buffer would grow too much (ggml_backend_sched_set_alloc_limit)
+    bool   alloc_limit_on;
+    size_t alloc_limit;
+    size_t alloc_over; // growth the last refused allocation needed, 0 if it was not refused
     int  pre_split; // split whose first pre_nodes nodes were launched before the CPU split preceding it, -1 if none
     int  pre_nodes;
 
@@ -4566,7 +4570,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     // reset state for the next run
     if (!sched->is_reset) {
         static const bool sparse_env = getenv("GGML_SCHED_SPARSE_RESET") == nullptr || atoi(getenv("GGML_SCHED_SPARSE_RESET")) != 0;
-        if (sparse_env && sched->hash_set.size > (1u << 18)) {
+        if (sparse_env && sched->hash_set.size > (1u << 15)) {
             // a large table (sized for graphs of several ubatches, see ggml_backend_sched_set_reuse_weight_copies) clears only the entries
             // in use: every entry of the per-tensor arrays is written through hash_id, which marks it used
             const size_t n_words = ggml_bitset_size(sched->hash_set.size);
@@ -4673,10 +4677,46 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     // the allocation may move host compute memory that pending copies read or write
     ggml_backend_sched_ov_drain(sched);
 
+    const int cur_copy_prev = sched->cur_copy;
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
     ggml_backend_sched_split_graph(sched, graph);
+
+    sched->alloc_over = 0;
+    if (sched->alloc_limit_on) {
+        // the planned compute buffers of the graph (the current ones and their allocation are kept): refused, nothing allocated and the
+        // prefetch kept, if a device buffer would grow by more than the limit or leave less than the prefetch headroom (512 MiB at least)
+        // free. Without the check a large graph that allocates drops the prefetch for good (ggml_backend_sched_alloc_splits)
+        size_t sizes[GGML_SCHED_MAX_BACKENDS] = { 0 };
+        ggml_gallocr_measure_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+        const size_t headroom = std::max<size_t>(sched->pf_headroom, (size_t) 512 << 20);
+        size_t over = 0;
+        for (int b = 0; b < sched->n_backends; b++) {
+            ggml_backend_dev_t dev = sched->backends[b]->device;
+            if (dev == NULL || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                continue;
+            }
+            const size_t cur = ggml_gallocr_get_buffer_size(sched->galloc, b);
+            if (sizes[b] <= cur) {
+                continue;
+            }
+            const size_t grow = sizes[b] - cur;
+            size_t free  = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            const size_t allow = std::min(sched->alloc_limit, free > headroom ? free - headroom : 0);
+            if (grow > allow) {
+                over = std::max(over, grow);
+            }
+        }
+        if (over > 0) {
+            sched->alloc_over = over;
+            sched->next_copy  = sched->cur_copy;
+            sched->cur_copy   = cur_copy_prev;
+            return false;
+        }
+    }
 
     ggml_backend_sched_prefetch_bind(sched, /*dry =*/ false);
 
@@ -4768,6 +4808,17 @@ void ggml_backend_sched_set_overlap(ggml_backend_sched_t sched, bool enable) {
 void ggml_backend_sched_set_reuse_weight_copies(ggml_backend_sched_t sched, bool enable) {
     GGML_ASSERT(sched);
     sched->reuse_weight_copies = enable;
+}
+
+void ggml_backend_sched_set_alloc_limit(ggml_backend_sched_t sched, bool enable, size_t max_grow) {
+    GGML_ASSERT(sched);
+    sched->alloc_limit_on = enable;
+    sched->alloc_limit    = max_grow;
+}
+
+size_t ggml_backend_sched_get_alloc_over(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->alloc_over;
 }
 
 void ggml_backend_sched_set_lend_callback(ggml_backend_sched_t sched, ggml_backend_sched_lend_callback callback, void * user_data) {

@@ -446,6 +446,12 @@ extern "C" {
     // several ubatches layer by layer (llama LLAMA_MOE_LAYER_MAJOR) keeps every use of a weight copy in the split that copies it
     GGML_API void                 ggml_backend_sched_set_reuse_weight_copies(ggml_backend_sched_t sched, bool enable);
 
+    // While enabled, ggml_backend_sched_alloc_graph returns false without allocating (prefetch kept) if the compute buffer of a device
+    // would grow by more than max_grow bytes or leave less than the prefetch headroom free; ggml_backend_sched_get_alloc_over then
+    // returns the growth the graph needed (0 after an allocation that was not refused)
+    GGML_API void                 ggml_backend_sched_set_alloc_limit(ggml_backend_sched_t sched, bool enable, size_t max_grow);
+    GGML_API size_t               ggml_backend_sched_get_alloc_over(ggml_backend_sched_t sched);
+
     // Set a callback that places prefetched copies in memory lent by the user instead of the staging arena
     GGML_API void                 ggml_backend_sched_set_lend_callback(ggml_backend_sched_t sched, ggml_backend_sched_lend_callback callback, void * user_data);
 

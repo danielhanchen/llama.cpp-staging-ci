@@ -31,6 +31,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <functional>
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/resource.h>
@@ -712,6 +713,10 @@ llama_context::llama_context(
             }
         } else if (moe_cache_budget > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, moe_cache_budget, moe_cache_set, wstore.get(), cparams.moe_host_cache_mib);
+        }
+        if (lm_enabled && !moe_cache) {
+            // nothing on the host is cached: no layer-major prompts, and the scheduler keeps its usual size
+            lm_enabled = false;
         }
         if (moe_cache) {
             // the default hybrid path takes its fetch share from the decode threads, so it does not depend on timing
@@ -3329,22 +3334,24 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
     }
 
-    // the merged graph
-    ggml_cgraph * gm = nullptr;
+    // the merged graph of the members [a, b) of the group: piece s of every member (in ubatch order) before piece s + 1
     ggml_context_ptr ctx_m;
-    if (aligned && group.size() > 1) {
-        const size_t size = n_total + 64;
+    auto build_merged = [&](size_t a, size_t b) -> ggml_cgraph * {
+        size_t size = 64;
+        for (size_t k = a; k < b; ++k) {
+            size += (size_t) ggml_graph_n_nodes(group[k].gf) + group[k].n_leafs;
+        }
         const size_t meta = ggml_graph_overhead_custom(size, false) + ggml_tensor_overhead();
         if (lm_meta.size() < meta) {
             lm_meta.resize(meta);
         }
         ggml_init_params ip = { lm_meta.size(), lm_meta.data(), true };
         ctx_m.reset(ggml_init(ip));
-        gm = ggml_new_graph_custom(ctx_m.get(), size, false);
+        ggml_cgraph * g = ggml_new_graph_custom(ctx_m.get(), size, false);
         const size_t n_pieces = order.size();
         std::vector<size_t> next(group.size(), 0); // the next piece of each graph
         for (size_t s = 0; s < n_pieces; ++s) {
-            for (size_t k = 0; k < group.size(); ++k) {
+            for (size_t k = a; k < b; ++k) {
                 const size_t j = next[k];
                 if (j >= slot[k].size() || slot[k][j] != s) {
                     continue;
@@ -3355,37 +3362,35 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 // order only: the compute flags stay as each graph set them (an input path that ggml_build_forward_select did not pick
                 // is in the graph but not computed; expand would mark it computed, running e.g. the mixed-batch set_rows on unset indices)
                 for (int i = i0; i < i1; ++i) {
-                    ggml_build_forward_order(gm, ggml_graph_node(gf, i));
+                    ggml_build_forward_order(g, ggml_graph_node(gf, i));
                 }
                 next[k]++;
             }
         }
-        for (size_t k = 0; k < group.size(); ++k) {
+        size_t n_nodes_sum = 0;
+        for (size_t k = a; k < b; ++k) {
             GGML_ASSERT(next[k] == slot[k].size());
+            n_nodes_sum += (size_t) ggml_graph_n_nodes(group[k].gf);
         }
         // every node of every graph is in the merged graph once: a node that two graphs share (none expected) would run only in the first
-        {
-            size_t n_nodes_sum = 0;
-            for (const auto & g : group) {
-                n_nodes_sum += (size_t) ggml_graph_n_nodes(g.gf);
+        if ((size_t) ggml_graph_n_nodes(g) != n_nodes_sum) {
+            std::unordered_set<const ggml_tensor *> first;
+            for (int i = 0; i < ggml_graph_n_nodes(group[a].gf); ++i) {
+                first.insert(ggml_graph_node(group[a].gf, i));
             }
-            if ((size_t) ggml_graph_n_nodes(gm) != n_nodes_sum) {
-                std::unordered_set<const ggml_tensor *> first;
-                for (int i = 0; i < ggml_graph_n_nodes(group[0].gf); ++i) {
-                    first.insert(ggml_graph_node(group[0].gf, i));
+            int n_shared = 0;
+            for (int i = 0; i < ggml_graph_n_nodes(group[a + 1].gf) && n_shared < 8; ++i) {
+                const ggml_tensor * t = ggml_graph_node(group[a + 1].gf, i);
+                if (first.count(t)) {
+                    LLAMA_LOG_WARN("%s: node shared by the graphs: %s (%s)\n", __func__, t->name, ggml_op_name(t->op));
+                    n_shared++;
                 }
-                int n_shared = 0;
-                for (int i = 0; i < ggml_graph_n_nodes(group[1].gf) && n_shared < 8; ++i) {
-                    const ggml_tensor * t = ggml_graph_node(group[1].gf, i);
-                    if (first.count(t)) {
-                        LLAMA_LOG_WARN("%s: node shared by the graphs: %s (%s)\n", __func__, t->name, ggml_op_name(t->op));
-                        n_shared++;
-                    }
-                }
-                LLAMA_LOG_WARN("%s: merged graph has %d nodes, the graphs %zu\n", __func__, ggml_graph_n_nodes(gm), n_nodes_sum);
             }
+            LLAMA_LOG_WARN("%s: merged graph has %d nodes, the graphs %zu\n", __func__, ggml_graph_n_nodes(g), n_nodes_sum);
         }
-    }
+        return g;
+    };
+    ggml_cgraph * gm = aligned && group.size() > 1 ? build_merged(0, group.size()) : nullptr;
 
     // the seed of the MoE cache, as moe_cache_seed_begin plans it for the ubatch-by-ubatch order: the last large ubatch of the batch seeds,
     // from the routing of the ubatch before it if it has no outputs, else from its own (if its seed graph fits); every member of the group
@@ -3533,11 +3538,14 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     auto run = [&](ggml_cgraph * g) {
         prefetch_n_tokens = n_tokens_max;
         moe_cache->set_graph(g);
+        lm_staged.clear(); // the expert copies a seed reads are those of this graph
         ggml_backend_sched_set_reuse_weight_copies(sched.get(), true);
         const bool ok = ggml_backend_sched_alloc_graph(sched.get(), g);
         ggml_backend_sched_set_reuse_weight_copies(sched.get(), false);
         if (!ok) {
-            LLAMA_LOG_ERROR("%s: failed to allocate the graph of %zu ubatches\n", __func__, group.size());
+            if (ggml_backend_sched_get_alloc_over(sched.get()) == 0) {
+                LLAMA_LOG_ERROR("%s: failed to allocate the graph of %zu ubatches\n", __func__, group.size());
+            }
             return GGML_STATUS_ALLOC_FAILED;
         }
         moe_cache->prepare(n_tokens_max);
@@ -3562,27 +3570,73 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     for (auto & b : backend_ptrs) {
         buf_before += ggml_backend_sched_get_buffer_size(sched.get(), b);
     }
-    if (gm != nullptr) {
+    // the compute buffers of a device may grow by at most LLAMA_MOE_LAYER_MAJOR_GROW_MIB (default 1024) for a merged graph, and must
+    // leave the prefetch headroom free: a larger graph is split in two (and again), else its allocation would drop the prefetch for good
+    // (gpt-oss-20b MXFP4, G4 8 GB tier: 16 ubatches of 512 grew the compute buffer 455 -> 1164 MiB)
+    static const size_t lm_grow_max = (size_t) (getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB"))) : 1024) << 20;
+    int n_sub = 0;
+    bool first_run = true;
+    std::function<ggml_status(size_t, size_t)> run_range = [&](size_t a, size_t b) -> ggml_status {
+        if (!first_run) {
+            ggml_backend_sched_reset(sched.get());
+        }
+        first_run = false;
+        if (b - a == 1) {
+            n_sub++;
+            return run(group[a].gf);
+        }
+        ggml_cgraph * g = (a == 0 && b == group.size()) ? gm : build_merged(a, b);
         // the scheduler replaces node sources with its copies while it splits a graph: kept to undo them if the merged graph does not
-        // allocate and the member graphs are split again one by one
+        // allocate and its members are split again
         std::vector<std::pair<ggml_tensor *, std::array<ggml_tensor *, GGML_MAX_SRC>>> srcs;
-        srcs.reserve(ggml_graph_n_nodes(gm));
-        for (int i = 0; i < ggml_graph_n_nodes(gm); ++i) {
-            ggml_tensor * node = ggml_graph_node(gm, i);
-            std::array<ggml_tensor *, GGML_MAX_SRC> a;
-            std::copy(node->src, node->src + GGML_MAX_SRC, a.begin());
-            srcs.emplace_back(node, a);
+        srcs.reserve(ggml_graph_n_nodes(g));
+        for (int i = 0; i < ggml_graph_n_nodes(g); ++i) {
+            ggml_tensor * node = ggml_graph_node(g, i);
+            std::array<ggml_tensor *, GGML_MAX_SRC> arr;
+            std::copy(node->src, node->src + GGML_MAX_SRC, arr.begin());
+            srcs.emplace_back(node, arr);
         }
-        status = run(gm);
-        if (status == GGML_STATUS_ALLOC_FAILED) {
-            for (auto & [node, a] : srcs) {
-                std::copy(a.begin(), a.end(), node->src);
-            }
+        lm_merged_active = true;
+        ggml_backend_sched_set_alloc_limit(sched.get(), true, lm_grow_max);
+        ggml_status st = run(g);
+        ggml_backend_sched_set_alloc_limit(sched.get(), false, 0);
+        lm_merged_active = false;
+        if (st != GGML_STATUS_ALLOC_FAILED) {
+            n_sub++;
+            return st;
         }
-        lm_n_graphs++;
+        const size_t over = ggml_backend_sched_get_alloc_over(sched.get());
+        for (auto & [node, arr] : srcs) {
+            std::copy(arr.begin(), arr.end(), node->src);
+        }
+        ggml_backend_sched_reset(sched.get());
+        // halves, keeping the seed source with the ubatch it seeds (src_k = seed_k - 1)
+        size_t mid = a + (b - a)/2; // > a: 0 below means the pair alone
+        if (src_k >= 0 && src_k + 1 == seed_k && (size_t) seed_k == mid) {
+            mid = (size_t) src_k > a ? (size_t) src_k : ((size_t) seed_k + 1 < b ? (size_t) seed_k + 1 : 0);
+        }
+        if (over == 0 || mid == 0) {
+            return GGML_STATUS_ALLOC_FAILED; // out of memory, or the seed pair alone does not fit: one by one, unseeded (below)
+        }
+        lm_n_split++;
+        if (lm_verbose) {
+            LLAMA_LOG_INFO("%s: the graph of ubatches [%zu, %zu) would grow the compute buffers by %.2f MiB: split at %zu\n", __func__, a, b,
+                over/1048576.0, mid);
+        }
+        st = run_range(a, mid);
+        if (st != GGML_STATUS_SUCCESS) {
+            return st;
+        }
+        return run_range(mid, b);
+    };
+
+    if (gm != nullptr) {
+        status = run_range(0, group.size());
+        lm_n_graphs += n_sub;
         lm_n_ubatches += (int64_t) group.size();
         if (status == GGML_STATUS_ALLOC_FAILED) {
-            // the merged graph needs more compute memory than the device has: the graphs one after the other, as usual
+            // the merged graphs need more compute memory than the device has: the graphs one after the other, as usual (also those of
+            // a part of the group already computed: they compute the same again)
             LLAMA_LOG_WARN("%s: the graph of %zu ubatches did not allocate, computed one after the other\n", __func__, group.size());
             lm_n_fallback++;
             lm_seed_active = false;
@@ -3619,9 +3673,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     if (lm_verbose) {
         LLAMA_LOG_INFO("%s: compute buffers %.2f -> %.2f MiB\n", __func__, buf_before/1048576.0, buf_after/1048576.0);
         LLAMA_LOG_INFO("%s: %zu ubatches (%" PRId64 " tokens each at most), %zu pieces, %d nodes, %d splits: build %.2f ms (graphs %.2f, inputs %.2f), "
-            "compute (queued) %.2f ms%s\n",
+            "compute (queued) %.2f ms%s, %d graphs\n",
             __func__, group.size(), n_tokens_max, cut_w.size(), gm ? ggml_graph_n_nodes(gm) : -1, ggml_backend_sched_get_n_splits(sched.get()),
-            (t1_us - t0_us)/1000.0, t_build_us/1000.0, t_set_us/1000.0, (ggml_time_us() - t1_us)/1000.0, gm ? "" : " (one by one)");
+            (t1_us - t0_us)/1000.0, t_build_us/1000.0, t_set_us/1000.0, (ggml_time_us() - t1_us)/1000.0, gm ? "" : " (one by one)", n_sub);
     }
 
     const bool seeded = lm_seed_active && !lm_seeded.empty();
@@ -4528,7 +4582,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     // the scheduler passes its copy queue backend only for prefetched copies (nearly all experts used), which may run before the ids exist: copy all
     // on the regular path the ids are known: copy only the used experts
-    const bool all = on_copy_queue;
+    // a graph of several ubatches (decode_layer_major) reads the copy for all of them, the product found routes only the first: copy all
+    const bool all = on_copy_queue || lctx->lm_merged_active;
 
     if (ids != st.ids || (int64_t) st.used.size() != n_expert || (seed && st.counts.empty()) || all != st.all) {
         st.all = all;

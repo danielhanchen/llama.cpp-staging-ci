@@ -537,7 +537,10 @@ private:
     std::vector<ggml_backend_buffer_ptr> lm_arena_old;
     size_t                               lm_arena_used = 0;
     std::vector<uint8_t>                 lm_meta;     // the merged graph
-    int64_t lm_n_graphs = 0, lm_n_ubatches = 0, lm_n_fallback = 0, lm_n_seeded = 0;
+    int64_t lm_n_graphs = 0, lm_n_ubatches = 0, lm_n_fallback = 0, lm_n_seeded = 0, lm_n_split = 0;
+    // a graph of several ubatches is being allocated or computed: a weight copy on the regular path copies all experts (its split reads
+    // the copy for every ubatch, the first product of the split routes only its own ubatch)
+    bool lm_merged_active = false;
     // the seed of the MoE cache at the end of a prompt, as the ubatch-by-ubatch order does it (moe_cache_seed_begin): the last large ubatch
     // seeds from the routing of the ubatch before it. In the merged graph that routing exists only once the graph reaches it, so the seed
     // of a layer is issued from the eval callback after that routing (or, for expert copies issued later, from the copy callback), on the
