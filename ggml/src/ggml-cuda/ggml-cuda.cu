@@ -2895,35 +2895,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
-// The graphs of one context share their first node (the same graph memory), so a context whose ubatch shape alternates (speculative
-// decoding with a varying draft length: verify batches of 1 .. n_max + 1 tokens) would re-capture its single CUDA graph at every
-// change, after an uncaptured warm-up run. The key also hashes the node count, the shapes of the first and last node and the node
-// addresses, so each shape keeps its own captured graph and a return to it is a replay (GGML_CUDA_GRAPH_KEY_SHAPE=0: the first
-// node only).
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    static const bool by_shape = [] {
-        const char * e = getenv("GGML_CUDA_GRAPH_KEY_SHAPE");
-        return e == nullptr || atoi(e) != 0;
-    }();
-    if (!by_shape || cgraph->n_nodes == 0) {
-        return cgraph->nodes[0];
-    }
-    const ggml_tensor * a = cgraph->nodes[0];
-    const ggml_tensor * b = cgraph->nodes[cgraph->n_nodes - 1];
-    uint64_t h = 1469598103934665603ull;
-    auto mix = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
-    mix((uint64_t) cgraph->n_nodes);
-    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-        mix((uint64_t) a->ne[i]);
-        mix((uint64_t) b->ne[i]);
-    }
-    // the node addresses too: a recurrent state read in place sits in the row its sequence holds (it moves after a speculative
-    // verify); the other shapes (KV views growing with the context) stay out, so those changes update the captured graph in place
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        mix((uint64_t) (uintptr_t) cgraph->nodes[i]->data);
-    }
-    // keep the first node pointer as the base (distinct split graphs stay distinct), perturbed by the shape hash
-    return (const void *) ((uintptr_t) a ^ (uintptr_t) (h << 4));
+    return cgraph->nodes[0];
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
