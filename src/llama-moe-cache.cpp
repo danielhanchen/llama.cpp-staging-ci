@@ -823,6 +823,11 @@ struct llama_moe_cache::impl {
     // both ways (G4 gpt-oss-20b Q2_K 8 GB, 95-token prompt: -19% with the margin of the small batches): the gain must beat
     // cm_margin_p*(cm_split + n*cm_act)
     static constexpr double cm_margin_p = 4.0;
+    // small batches: the split boundary costs more than the calibration sees (G4 trials: modelled 25-50 us per layer, measured 60-70 us),
+    // and a trial is not free (2 of its 5 blocks run the slower path, every counted batch is synchronized): the model makes a size a
+    // candidate (and so a trial possible) only if its gain beats cm_split_scale times the calibrated split (G4 Qwen3.6 UD-Q3_K_M 12 GB
+    // MTP: 14 host batches per launch, every trial off, -7% decode from the trials alone). LLAMA_MOE_CPU_MISS_SPLIT_SCALE (3)
+    double   cm_split_scale = 3.0;
     double   cm_act   = 0.0;   // us per token: its activations to the host and its expert output back
 
     // " (mtp)" for the cache of an MTP context, in its log lines
@@ -904,6 +909,9 @@ struct llama_moe_cache::impl {
                 const char * env_p = getenv("LLAMA_MOE_CPU_MISS_MAX_TOKENS");
                 cm_max = std::max<int64_t>(1, std::min<int64_t>(cm_max_limit, env_p != nullptr ? atoll(env_p) : cm_max));
                 cm_dbg = getenv("LLAMA_MOE_CPU_MISS_LOG") != nullptr && atoi(getenv("LLAMA_MOE_CPU_MISS_LOG")) != 0;
+                if (const char * env_s = getenv("LLAMA_MOE_CPU_MISS_SPLIT_SCALE")) {
+                    cm_split_scale = std::max(0.0, atof(env_s));
+                }
             }
             if (cm) {
                 // no fixed share and no reset: the host computes misses only where the rule turns it on
@@ -3615,7 +3623,7 @@ struct llama_moe_cache::impl {
                 const double f    = cm_share[n];
                 const double m    = cm_rate*D;
                 const double gain = m*(cm_tup - std::max(f*cm_tup, (1.0 - f)*tc));
-                const double need = (n <= max_batch ? cm_margin*cm_split : cm_margin_p*(cm_split + n*cm_act))*
+                const double need = (n <= max_batch ? cm_margin*cm_split_scale*cm_split : cm_margin_p*(cm_split + n*cm_act))*
                                     (cm_on[n] && cm_measured ? cm_hyst : 1.0);
                 // a batch above max_batch runs the host path in the groups whose slots hold its experts (see use_device), the
                 // other groups copy its experts as a prompt does
