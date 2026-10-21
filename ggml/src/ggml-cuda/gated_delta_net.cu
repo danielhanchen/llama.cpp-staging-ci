@@ -334,7 +334,7 @@ gated_delta_net_tiled_cuda(const float * q,
     }
 }
 
-// GGML_CUDA_GDN_TILED: 0 = never, 1 = on every arch (tests / timing), unset = the per-arch default (on for RDNA3.5)
+// GGML_CUDA_GDN_TILED: 0 = never, 1 = on every arch (tests / timing), unset = the per-arch default (RDNA3.5 at 1024+ tokens and 16+ heads)
 static int ggml_cuda_gdn_tiled_env() {
     static const int value = []() {
         const char * env = getenv("GGML_CUDA_GDN_TILED");
@@ -346,8 +346,14 @@ static int ggml_cuda_gdn_tiled_env() {
 static constexpr int gdn_tiled_min_tokens = 16;
 static constexpr int gdn_tiled_token_tile = 16;
 
-// whether the token-tiled kernel runs a non-KDA op of this shape (the caller already let the chunked MMA kernel decline)
-static bool gdn_use_tiled(int device, int64_t S_v, int64_t n_tokens) {
+// RDNA3.5 default (gfx1151 test-backend-ops, Linux + Windows): the tiled kernel wins from about 1024 tokens with 16+
+// value heads per launch, loses ~10% at 64 tokens, mixed at 256 - 512, and loses 35-40% with 4 heads (too few blocks)
+static constexpr int gdn_tiled_rdna3_5_min_tokens = 1024;
+static constexpr int gdn_tiled_rdna3_5_min_heads  = 16;
+
+// whether the token-tiled kernel runs a non-KDA op of this shape (the caller already let the chunked MMA kernel decline);
+// n_heads = value heads * sequences, the blocks per column slice
+static bool gdn_use_tiled(int device, int64_t S_v, int64_t n_heads, int64_t n_tokens) {
     if (n_tokens < gdn_tiled_min_tokens || (S_v != 64 && S_v != 128)) {
         return false;
     }
@@ -359,7 +365,8 @@ static bool gdn_use_tiled(int device, int64_t S_v, int64_t n_tokens) {
     if (env >= 0) {
         return env != 0;
     }
-    return GGML_CUDA_CC_IS_RDNA3_5(info.cc);
+    return GGML_CUDA_CC_IS_RDNA3_5(info.cc) && n_tokens >= gdn_tiled_rdna3_5_min_tokens &&
+        n_heads >= gdn_tiled_rdna3_5_min_heads;
 }
 
 template <int S_v, bool keep_rs_t, int num_warps>
@@ -439,7 +446,7 @@ static void launch_gated_delta_net(
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
 
     if constexpr (!KDA) {
-        if (gdn_use_tiled(ggml_cuda_get_device(), S_v, n_tokens)) {
+        if (gdn_use_tiled(ggml_cuda_get_device(), S_v, H*n_seqs, n_tokens)) {
             // GGML_CUDA_GDN_TILED_LOG=1: every launch (test-gdn-tiled-exact counts them), else the first one
             static const bool log_all = getenv("GGML_CUDA_GDN_TILED_LOG") != nullptr && atoi(getenv("GGML_CUDA_GDN_TILED_LOG")) != 0;
             static std::atomic<bool> logged {false};
