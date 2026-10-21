@@ -1176,6 +1176,7 @@ struct ggml_backend_sched {
 
     char * context_buffer;
     size_t context_buffer_size;
+    size_t context_graph_size; // the graph_size of ggml_backend_sched_new: the most nodes the context is sized for
 
     bool op_offload;
 
@@ -2039,13 +2040,30 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->is_reset = false;
     sched->pf_active = false;
 
+    ggml_free(sched->ctx);
+    sched->ctx = NULL;
+
+    // the context holds the tensors made while splitting (input copies, views): sized for this graph by the same bound as before
+    // (at most one split per node), grown only, at most the scheduler's graph_size. A scheduler sized for merged layer-major graphs
+    // (17x the nodes) reserved 7.9 GB here per context at load (Qwen3.6-35B-A3B + MTP: VmData +11.9 GB, Windows commit +16 GB) that
+    // only a merged graph can use. GGML_SCHED_CTX_FULL=1: the full size at the first split, as before
+    {
+        static const bool full = getenv("GGML_SCHED_CTX_FULL") != nullptr && atoi(getenv("GGML_SCHED_CTX_FULL")) != 0;
+        const size_t n    = full ? sched->context_graph_size : std::min(sched->context_graph_size, (size_t) std::max(graph->n_nodes, graph->n_leafs) + 1);
+        const size_t need = n*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(n, false);
+        if (sched->context_buffer == NULL || sched->context_buffer_size < need) {
+            free(sched->context_buffer);
+            sched->context_buffer_size = need;
+            sched->context_buffer = (char *) malloc(need);
+            GGML_ASSERT(sched->context_buffer != NULL);
+        }
+    }
+
     struct ggml_init_params params = {
         /* .mem_size =   */ sched->context_buffer_size,
         /* .mem_buffer = */ sched->context_buffer,
         /* .no_alloc =   */ true
     };
-
-    ggml_free(sched->ctx);
 
     sched->ctx = ggml_init(params);
     if (sched->ctx == NULL) {
@@ -4480,8 +4498,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->graph_size      = 0;
     sched->prev_graph_size = 0;
 
-    sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
-    sched->context_buffer = (char *) malloc(sched->context_buffer_size);
+    // allocated by the first ggml_backend_sched_split_graph, sized for its graph (at most graph_size nodes)
+    GGML_UNUSED(ggml_sched_max_splits);
+    sched->context_graph_size  = graph_size;
+    sched->context_buffer_size = 0;
+    sched->context_buffer      = NULL;
 
     const int initial_splits_capacity = 16;
     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));

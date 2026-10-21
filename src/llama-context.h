@@ -535,6 +535,10 @@ private:
     bool lm_auto    = false;  // LLAMA_MOE_LAYER_MAJOR unset: on beside speculative decoding with a model
     int  lm_ub_max  = 16;     // ubatches per layer-major graph [LLAMA_MOE_LAYER_MAJOR_UB_MAX]
     bool lm_verbose = false;  // [LLAMA_MOE_LAYER_MAJOR_LOG]
+    // beside the device seed of prompt ubatches (moe_cache_devseed_on): groups run [LLAMA_MOE_LAYER_MAJOR_DEVSEED, default 1] and the
+    // group seeds from the routing of the ubatch before its last one, as with the host seed [LLAMA_MOE_LAYER_MAJOR_DEVSEED_SEED, default 1]
+    bool lm_devseed      = true;
+    bool lm_devseed_seed = true;
     std::vector<llm_graph_result_ptr>    lm_res;      // the graph of each ubatch of the group
     std::vector<ggml_backend_buffer_ptr> lm_inp_buf;  // unused (kept for the per-ubatch layout)
     ggml_backend_buffer_ptr              lm_arena;    // the inputs of the group's ubatches (host memory, set before the group is computed)

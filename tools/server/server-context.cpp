@@ -4232,9 +4232,12 @@ private:
                                 (getenv("LLAMA_SERVER_CKPT_BATCH") != nullptr && atoi(getenv("LLAMA_SERVER_CKPT_BATCH")) != 0);
                             const int checkpoint_offsets[] = {4 + (lm ? n_batch : n_ubatch), 4};
 
+                            // k9-prompt-pass: n_batch raised for layer-major prompts at an explicit -ub (common_moe_cache_auto_ubatch): the
+                            // offsets are clamped to the n_batch given, so the prompt splits into the same batches and ubatches as before
+                            const int n_batch_clamp = !lm && params_base.n_batch_ckpt > 0 ? std::min<int>(n_batch, params_base.n_batch_ckpt) : n_batch;
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
-                                const int n_last = std::min(n_batch, offset);
+                                const int n_last = std::min(n_batch_clamp, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
                                     break;

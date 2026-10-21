@@ -1372,6 +1372,29 @@ static bool common_spec_draft_model(const common_params & params) {
 
 static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_model_params & mparams, llama_context_params & cparams);
 
+// <arch>.<key> of a GGUF as an integer (u32 / i32 / u64), -1 if absent or unreadable
+static int64_t common_gguf_u32(const std::string & path, const char * key) {
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context_ptr ctx(gguf_init_from_file(path.c_str(), gp));
+    if (!ctx) {
+        return -1;
+    }
+    const int64_t arch_id = gguf_find_key(ctx.get(), "general.architecture");
+    if (arch_id < 0 || gguf_get_kv_type(ctx.get(), arch_id) != GGUF_TYPE_STRING) {
+        return -1;
+    }
+    const int64_t kid = gguf_find_key(ctx.get(), (std::string(gguf_get_val_str(ctx.get(), arch_id)) + "." + key).c_str());
+    if (kid < 0) {
+        return -1;
+    }
+    switch (gguf_get_kv_type(ctx.get(), kid)) {
+        case GGUF_TYPE_UINT32: return gguf_get_val_u32(ctx.get(), kid);
+        case GGUF_TYPE_INT32:  return gguf_get_val_i32(ctx.get(), kid);
+        case GGUF_TYPE_UINT64: return (int64_t) gguf_get_val_u64(ctx.get(), kid);
+        default:               return -1;
+    }
+}
+
 // layer-major prompts (llama_context::decode_layer_major): the ubatches of one batch upload each host expert once, so n_ubatch stays the
 // default (no compute buffer growth taken from the cache) and the batch holds up to LLAMA_MOE_LAYER_MAJOR_BATCH (8192) tokens, at most the
 // context and lm_ub_max ubatches. LLAMA_MOE_LAYER_MAJOR=1 forces it for spilled experts, =0 turns it off; unset (auto): on for spilled
@@ -1379,11 +1402,71 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
 // (no lending beside a draft: G4, Qwen3.6-35B-A3B UD-Q3_K_M + MTP at 8 GB, 2k / 8k prompt 2288 -> 3709 / 2430 -> 6609 tok/s, same text);
 // where they grow n_ubatch (a lent graph) the prompt stays ubatch by ubatch
 static void common_moe_cache_auto_ubatch(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
-    if (params.moe_cache_size == 0 || params.n_ubatch_set || params.embedding || cparams.embeddings) {
+    if (params.moe_cache_size == 0 || params.embedding || cparams.embeddings) {
         return;
     }
     const char * env_lm = getenv("LLAMA_MOE_LAYER_MAJOR");
     const int    lm     = env_lm == nullptr || strcmp(env_lm, "auto") == 0 ? -1 : (atoi(env_lm) != 0 ? 1 : 0);
+    if (params.n_ubatch_set) {
+        // k9-prompt-pass: an explicit -ub without -b (Unsloth Studio passes --ubatch-size 2048 for a vision projector) kept n_batch at its
+        // default 2048, so a batch held one ubatch, layer-major never engaged and a long prompt copied every spilled expert once per
+        // ubatch (G4, Flash-Next UD-IQ4_XS 32 GB, 8k prompt: 4 passes, 147.7 GB). The ubatch stays as given (none of the rules below runs),
+        // only the batch grows to hold several ubatches, under the same conditions as layer-major auto (or LLAMA_MOE_LAYER_MAJOR=1).
+        // LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB=0 keeps n_batch. Not on unified memory under Windows (params.moe_uma_keep_batch) unless
+        // LLAMA_MOE_LAYER_MAJOR=1: groups of large ubatches were slower there than one ubatch per graph (see common_init_result)
+        static const bool env_x = getenv("LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB")) != 0;
+        if (!env_x || lm == 0 || params.n_batch_set || (params.moe_uma_keep_batch && lm != 1) || !(lm == 1 || common_spec_draft_model(params)) ||
+                !common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
+            return;
+        }
+        int64_t want = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH") != nullptr ? atoll(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH")) : 8192;
+        const int64_t ub_max = getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX") != nullptr ? std::max(1, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX"))) : 16;
+        want = std::min<int64_t>(want, ub_max*(int64_t) cparams.n_ubatch);
+        if (params.n_ctx > 0) {
+            want = std::min<int64_t>(want, params.n_ctx);
+        }
+        if (want >= 2*(int64_t) cparams.n_ubatch && want > (int64_t) cparams.n_batch) {
+            // the server clamps its checkpoint offsets to the old n_batch: the same batches and ubatches as without the raise
+            params.n_batch_ckpt = (int32_t) cparams.n_batch;
+            params.n_batch  = (int32_t) want;
+            cparams.n_batch = (uint32_t) want;
+            // a merged graph of k ubatches keeps what crosses its cuts for every member; at a large ubatch that is more than the fit leaves
+            // free (G4, Flash-Next UD-IQ4_XS 32 GB + Q8_0 MTP drafter, -ub 2048: 4 ubatches needed 755 MiB, 744 MiB were free, so the group
+            // ran as 2 + 2 and read the experts twice). With LLAMA_MOE_LAYER_MAJOR_RESERVE_FRAC (default 0.025 when the server checkpoint is
+            // one batch back, LLAMA_MOE_LAYER_MAJOR_CKPT=1, else 0) the cache gives up min(frac of itself, (k - 1) x the estimate of one
+            // member: n_ubatch x 4 B x (4 n_embd + 4 n_expert_used n_ff_exp)); LLAMA_MOE_LAYER_MAJOR_RESERVE_MIB=N takes N MiB.
+            // Not by default: with the checkpoint one ubatch back an 8k prompt is a group of 3 (fits) + the checkpoint ubatch, and the 481 MiB
+            // the cache gave up there cost the decode after it 1.9% (hit rate 86.84 -> 86.62%) for no prompt gain (same G4 VM, 8k cell)
+            int64_t reserve = -1;
+            if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_RESERVE_MIB")) {
+                reserve = std::max<int64_t>(0, atoll(e)) << 20;
+            } else {
+                const bool ckpt_batch = getenv("LLAMA_MOE_LAYER_MAJOR_CKPT") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_CKPT")) != 0;
+                double frac = ckpt_batch ? 0.025 : 0.0;
+                if (const char * ef = getenv("LLAMA_MOE_LAYER_MAJOR_RESERVE_FRAC")) {
+                    frac = std::max(0.0, atof(ef));
+                }
+                const int64_t n_embd = common_gguf_u32(params.model.path, "embedding_length");
+                const int64_t n_ff   = common_gguf_u32(params.model.path, "expert_feed_forward_length");
+                const int64_t n_used = common_gguf_u32(params.model.path, "expert_used_count");
+                const int64_t k      = (int64_t) cparams.n_batch/(int64_t) cparams.n_ubatch;
+                if (n_embd > 0 && n_ff > 0 && n_used > 0 && k > 1) {
+                    const int64_t est = (int64_t) cparams.n_ubatch*4*(4*n_embd + 4*n_used*n_ff);
+                    reserve = std::min<int64_t>((int64_t) (frac*(double) params.moe_cache_size), (k - 1)*est);
+                }
+            }
+            if (reserve > 0 && (int64_t) params.moe_cache_size > 2*reserve) {
+                params.moe_cache_size  -= (size_t) reserve;
+                cparams.moe_cache_size  = params.moe_cache_size;
+            } else {
+                reserve = 0;
+            }
+            COM_INF("MoE cache: layer-major prompts at the given n_ubatch %u: n_batch %u, %.2f MiB of the cache kept free for their graphs "
+                "(LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB=0 keeps n_batch, LLAMA_MOE_LAYER_MAJOR_RESERVE_MIB=0 the cache)\n",
+                cparams.n_ubatch, cparams.n_batch, reserve/1048576.0);
+        }
+        return;
+    }
     const bool   spill  = lm != 0 && common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers);
     const auto   set_batch = [&]() {
         if (!params.n_batch_set) {
@@ -2040,6 +2123,87 @@ static void common_draft_mem_reserve(const common_params & params, const llama_m
     }
 }
 
+// true if the model has sliding-window attention layers (<arch>.attention.sliding_window > 0): their KV cache holds the window plus one ubatch
+static bool common_gguf_has_swa(const std::string & path) {
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context_ptr ctx(gguf_init_from_file(path.c_str(), gp));
+    if (!ctx) {
+        return true; // unknown: as with the window
+    }
+    const int64_t arch_id = gguf_find_key(ctx.get(), "general.architecture");
+    if (arch_id < 0 || gguf_get_kv_type(ctx.get(), arch_id) != GGUF_TYPE_STRING) {
+        return true;
+    }
+    const int64_t kid = gguf_find_key(ctx.get(), (std::string(gguf_get_val_str(ctx.get(), arch_id)) + ".attention.sliding_window").c_str());
+    if (kid < 0) {
+        return false;
+    }
+    switch (gguf_get_kv_type(ctx.get(), kid)) {
+        case GGUF_TYPE_UINT32: return gguf_get_val_u32(ctx.get(), kid) > 0;
+        case GGUF_TYPE_INT32:  return gguf_get_val_i32(ctx.get(), kid) > 0;
+        default:               return true;
+    }
+}
+
+// k9-prompt-pass: the prompt ubatch of a MoE model whose experts are all on the device (see the call in common_init_result)
+static void common_moe_resident_ubatch(common_params & params, llama_model_params & mparams, llama_context_params & cparams,
+        const common_fit_extra_model * extra, ggml_log_level log_level) {
+    const char * env = getenv("LLAMA_MOE_RESIDENT_UB");
+    const int64_t want = env != nullptr ? atoll(env) : 2048;
+    const uint32_t ub_def = cparams.n_ubatch;
+    if (want <= (int64_t) ub_def || (params.n_ctx > 0 && want > params.n_ctx) || (params.n_batch_set && (int64_t) cparams.n_batch < want)) {
+        return;
+    }
+    const uint32_t u = (uint32_t) want;
+    common_moe_slot_bytes sbt;
+    if (!common_moe_slot_bytes_of(params.model.path, sbt) || sbt.n_expert <= 1) {
+        return; // not a MoE model
+    }
+    const char * env_swa = getenv("LLAMA_MOE_RESIDENT_UB_SWA");
+    if ((env_swa == nullptr || atoi(env_swa) == 0) && common_gguf_has_swa(params.model.path)) {
+        COM_INF("MoE experts on the device: n_ubatch stays %u (sliding-window layers: their KV cache grows with n_ubatch; LLAMA_MOE_RESIDENT_UB_SWA=1 "
+            "to grow it anyway)\n", ub_def);
+        return;
+    }
+    // the fit again at the larger ubatch, on copies: every expert must stay on the device
+    llama_model_params   mp = mparams;
+    llama_context_params cp = cparams;
+    cp.n_ubatch = u;
+    cp.n_batch  = std::max(cp.n_batch, u);
+    std::vector<float> ts(params.tensor_split, params.tensor_split + 128);
+    std::vector<llama_model_tensor_buft_override> tbo = params.tensor_buft_overrides;
+    if (mp.tensor_split == params.tensor_split) {
+        mp.tensor_split = ts.data();
+    }
+    if (mp.tensor_buft_overrides != nullptr && !params.tensor_buft_overrides.empty()) {
+        mp.tensor_buft_overrides = tbo.data();
+    }
+    std::vector<size_t> margins = params.fit_params_target;
+    const auto status = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(), tbo.empty() ? nullptr : tbo.data(),
+        margins.data(), params.fit_params_min_ctx, extra, log_level, params.fit_kv_resident);
+    if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS || cp.n_ubatch != u || cp.n_ctx != cparams.n_ctx || mp.n_gpu_layers != mparams.n_gpu_layers ||
+            common_experts_on_offloaded_host(params, mp.tensor_buft_overrides, mp.n_gpu_layers) ||
+            (tbo.size() != params.tensor_buft_overrides.size()) ||
+            !std::equal(tbo.begin(), tbo.end(), params.tensor_buft_overrides.begin(), [](const auto & a, const auto & b) {
+                return a.pattern == b.pattern && a.buft == b.buft; })) {
+        COM_INF("MoE experts on the device: n_ubatch stays %u (at n_ubatch %u the fit does not keep every expert on the device)\n", ub_def, u);
+        return;
+    }
+    // the draft context keeps the ubatch it was fitted with (the MTP context reads the prompt over one layer; a draft model's compute
+    // buffer would grow for nothing)
+    if (extra != nullptr && params.speculative.draft.n_ubatch <= 0) {
+        params.speculative.draft.n_ubatch = (int32_t) extra->cparams->n_ubatch;
+    }
+    params.n_ubatch  = (int32_t) u;
+    cparams.n_ubatch = u;
+    if (cparams.n_batch < u) {
+        params.n_batch  = (int32_t) u;
+        cparams.n_batch = u;
+    }
+    COM_INF("MoE experts on the device: n_ubatch = %u (default %u; draft context %d; LLAMA_MOE_RESIDENT_UB=0 keeps the default)\n", u, ub_def,
+        extra != nullptr ? params.speculative.draft.n_ubatch : -1);
+}
+
 // the request --moe-cache-mib auto stands for: larger than any device, so that the fit gives the cache what the layers leave
 // (the fit caps the cache at the bytes of the host experts and at the free device memory)
 static constexpr size_t COMMON_MOE_CACHE_AUTO_BYTES = (size_t) 1 << 40;
@@ -2073,6 +2237,59 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     // with --fit the MoE cache load mode is decided after the fit has placed the experts
+    // k9-prompt-pass: unified memory (every offload device an integrated GPU, e.g. AMD Strix Halo gfx1151): spilled experts are not copied
+    // over a PCIe link, so the discrete-GPU rule that keeps n_ubatch at 512 while the cache does not hold every expert does not apply there.
+    // Measured on gfx1151 (Qwen3.6-35B-A3B UD-Q3_K_M + MTP, 8 GB budget, plans/k9_platforms.md): -ub 2048 vs the default 2k prompt
+    // 1252 -> 1373 (Linux) / 1125 -> 1185 (Windows), decode after it 65.0 -> 72.3 / 57.7 -> 66.8, chat decode equal. Without -ub and with
+    // a MoE cache asked for, n_ubatch = LLAMA_MOE_UMA_UB (2048) there, set before the fit and handled as a given -ub (the fit, the draft
+    // context see it as such). LLAMA_MOE_UMA_UB=0 off; LLAMA_MOE_UMA=1 / 0 forces the unified-memory decision.
+    // On Windows n_batch stays as it is there (params.moe_uma_keep_batch, common_moe_cache_auto_ubatch): gfx1151, same cell, 8k prompt, layer-major
+    // groups of 4 x 2048 vs one ubatch per graph: Windows 1257 vs 1368 tok/s (+1.5 GB working set), Linux 1508 vs 1458 (amd-ci kpp run)
+    if (!model_only && !params.embedding && (moe_cache_auto || params.moe_cache_size > 0)) {
+        const char * env_ub  = getenv("LLAMA_MOE_UMA_UB");
+        const int64_t uma_ub = env_ub != nullptr ? atoll(env_ub) : 2048;
+        bool uma = false;
+        if (const char * e = getenv("LLAMA_MOE_UMA")) {
+            uma = atoi(e) != 0;
+        } else {
+            int n_gpu = 0, n_igpu = 0;
+            const auto count = [&](ggml_backend_dev_t dev) {
+                const auto t = ggml_backend_dev_type(dev);
+                n_gpu  += t == GGML_BACKEND_DEVICE_TYPE_GPU;
+                n_igpu += t == GGML_BACKEND_DEVICE_TYPE_IGPU;
+            };
+            if (!params.devices.empty()) {
+                for (ggml_backend_dev_t dev : params.devices) {
+                    if (dev != nullptr) {
+                        count(dev);
+                    }
+                }
+            } else {
+                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                    count(ggml_backend_dev_get(i));
+                }
+            }
+            uma = n_igpu > 0 && n_gpu == 0;
+        }
+        // LLAMA_MOE_UMA_KEEP_BATCH=1 / 0: keep n_batch on unified memory (default: Windows only)
+#ifdef _WIN32
+        bool keep_batch = true;
+#else
+        bool keep_batch = false;
+#endif
+        if (const char * e = getenv("LLAMA_MOE_UMA_KEEP_BATCH")) {
+            keep_batch = atoi(e) != 0;
+        }
+        params.moe_uma_keep_batch = uma && keep_batch;
+        if (uma && !params.n_ubatch_set && uma_ub > params.n_ubatch && (params.n_ctx <= 0 || uma_ub <= params.n_ctx) && (!params.n_batch_set || params.n_batch >= uma_ub)) {
+            COM_INF("%s: MoE cache on unified memory: n_ubatch = %" PRId64 " (default %d; LLAMA_MOE_UMA_UB=0 keeps the default)\n", __func__,
+                uma_ub, params.n_ubatch);
+            params.n_ubatch     = (int32_t) uma_ub;
+            params.n_ubatch_set = true;
+            params.n_batch      = std::max<int32_t>(params.n_batch, (int32_t) uma_ub);
+        }
+    }
+
     auto mparams = common_model_params_to_llama_impl(params, params.fit_params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -2155,6 +2372,18 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
         // the fit may have reduced the MoE cache (it gets the memory left after the layers), the load mode below follows the fitted size
         params.moe_cache_size = cparams.moe_cache_size;
+
+        // k9-prompt-pass: every expert on the device (the MoE cache was asked for and has nothing to hold): the prompt runs at
+        // LLAMA_MOE_RESIDENT_UB (2048) instead of the default n_ubatch when the fit still places every expert on the device at that
+        // ubatch, the KV cache does not grow with it (no sliding-window layers: their cache holds the window plus one ubatch, which every
+        // later decode step reads) and the draft context keeps its ubatch. The MoE kernels of a 512-token ubatch run far below their
+        // peak (G4, Qwen3.6-35B-A3B UD-Q4_K_XL 32 GB, -ub 2048: 2k / 8k prompt +49 / +52%). LLAMA_MOE_RESIDENT_UB=0 off, =N that ubatch;
+        // LLAMA_MOE_RESIDENT_UB_SWA=1 also with sliding-window layers
+        if (!model_only && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && (moe_cache_auto || params.moe_cache_size > 0) &&
+                !params.n_ubatch_set && !params.embedding && !cparams.embeddings &&
+                !common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
+            common_moe_resident_ubatch(params, mparams, cparams, (has_draft || spec_mtp) && !draft_off ? &extra : nullptr, fit_log_level);
+        }
 
         // decide on the params the model is loaded with, whatever the fit status: a failed or skipped fit leaves the user placement, which then decides like the path without --fit
         // the fitted overrides live in params.tensor_buft_overrides, which mparams points to
