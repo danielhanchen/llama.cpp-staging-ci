@@ -17,6 +17,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "spec-governor.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -296,6 +297,12 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+
+    // k9-draft: speculation cost governor (common/spec-governor.h); gov_step: what the current step is for it
+    // (0 = not governed, 1 = plain because the governor held drafting back, 2 = a draft is verified, 3 = drafting gave no draft)
+    common_spec_governor gov;
+    int64_t gov_t_last = 0;
+    int     gov_step   = 0;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
@@ -756,6 +763,10 @@ struct server_slot {
             SLT_INF(*this,
                     "draft acceptance = %0.5f (%5d accepted / %5d generated), mean len = %5.2f\n",
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
+            if (gov.enabled) {
+                SLT_INF(*this, "spec governor: %" PRId64 " wins, %" PRId64 " losses, %" PRId64 " parked steps, %" PRId64 " drafted / %" PRId64
+                        " plain steps (session)\n", gov.n_wins, gov.n_losses, gov.n_parked, gov.n_spec_steps, gov.n_plain_steps);
+            }
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
         }
@@ -3574,7 +3585,14 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                int n_draft_max = slot.get_n_draft_max();
+
+                slot.gov_step = 0;
+                // a partial draft to replay is verified whatever the governor says (it restores a state)
+                if (n_draft_max > 0 && slot.spec_draft.empty() && !slot.gov.allows()) {
+                    n_draft_max   = 0;
+                    slot.gov_step = 1;
+                }
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -3613,6 +3631,9 @@ private:
                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                             /* .temp     = */ slot.task->params.sampling.temp,
                             /* .seed     = */ slot.task->params.sampling.seed,
+                            /* .top_k    = */ slot.task->params.sampling.top_k,
+                            /* .top_p    = */ slot.task->params.sampling.top_p,
+                            /* .min_p    = */ slot.task->params.sampling.min_p,
                         };
 
                         drafting.push_back(&slot);
@@ -3632,6 +3653,8 @@ private:
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
+
+            slot.gov_step = draft.empty() ? 3 : 2;
 
             slot.stats.n_draft_tokens += draft.size();
 
@@ -4582,6 +4605,8 @@ private:
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                    slot.gov.new_sequence();
+                    slot.gov_t_last = 0;
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;
@@ -4613,7 +4638,10 @@ private:
                 slot.stats.update_prompt_last();
                 slot.t_print_last = t_now;
                 slot.n_gen_last = 0;
+            } else if (slot.gov_step == 1 && slot.gov_t_last > 0) {
+                slot.gov.record(false, 1, t_now - slot.gov_t_last);
             }
+            slot.gov_t_last = t_now;
 
             slot.stats.update_gen_last();
 
@@ -4761,6 +4789,14 @@ private:
 
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
+
+            {
+                const int64_t t_now = ggml_time_us();
+                if (slot.gov_t_last > 0) {
+                    slot.gov.record(true, (int) ids.size(), t_now - slot.gov_t_last);
+                }
+                slot.gov_t_last = t_now;
+            }
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
 

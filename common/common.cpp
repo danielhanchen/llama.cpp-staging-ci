@@ -1553,8 +1553,14 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
     const bool has_draft = params.speculative.has_dft() && !params.speculative.draft.fit_off;
     const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    // k9-draft: n-gram drafts (no draft context, verify batches of a few tokens) leave the prompt rules as without speculative decoding:
+    // the k6 spec gate was measured with model drafters (the decode after a lent prompt with an MTP head lost 5.5-6%), and with it
+    // ngram-mod's prompts lost 68-82% (LFM2.5 at 8 GB, plans/k9_vs_competitors.md); LLAMA_MOE_SPILL_LEND_NGRAM=0 restores the gate
+    static const bool lend_ngram = getenv("LLAMA_MOE_SPILL_LEND_NGRAM") == nullptr || atoi(getenv("LLAMA_MOE_SPILL_LEND_NGRAM")) != 0;
     const bool has_spec  = has_draft || std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
-        [](auto t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
+        [](auto t) { return t != COMMON_SPECULATIVE_TYPE_NONE && (!lend_ngram || t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE ||
+            t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+            t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK); });
     common_params        params_dft;
     llama_model_params   mparams_dft  = mparams;
     llama_context_params cparams_dft  = cparams;

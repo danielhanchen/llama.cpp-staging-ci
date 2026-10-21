@@ -32,13 +32,26 @@
 
 // Rebuild seq_id's draft sampler at the target's temperature: rejection weighs q against p, so
 // both have to sample alike. Only temp and seed carry over; the draft keeps its own top_k.
+// k9-draft: OPT-IN, LLAMA_SPEC_DRAFT_MIRROR=1: the probabilistic draft samples from the target's own truncation (top-k, top-p, min-p,
+// then the temperature; top-k capped at LLAMA_SPEC_DRAFT_TOPK_MAX, 40). The draft stays exact for any q (rejection sampling), but the
+// mirrored q accepted less than the default top-k 10 + temperature (Qwen3.6-35B-A3B + MTP, Studio's presence penalty 1.5 moves p and
+// not q: B200 acceptance over 4-6 x 256 tokens 0.61 vs 0.64 at T 1.0, 0.62 vs 0.64 at T 0.6, 0.61 vs 0.63 at T 0.7; G4 chat_s / chat_t
+// decode below the default), so the default keeps the earlier sampler.
 static void spec_retune(
         std::vector<common_sampler_ptr> & smpls,
         std::vector<common_params_sampling> & cfg,
         const llama_model * model,
         llama_seq_id seq_id,
-        float temp,
-        uint32_t seed) {
+        const common_speculative_draft_params & dp) {
+    static const bool mirror = getenv("LLAMA_SPEC_DRAFT_MIRROR") != nullptr && atoi(getenv("LLAMA_SPEC_DRAFT_MIRROR")) != 0;
+    static const int  k_max  = getenv("LLAMA_SPEC_DRAFT_TOPK_MAX") != nullptr ? std::max(1, atoi(getenv("LLAMA_SPEC_DRAFT_TOPK_MAX"))) : 40;
+
+    const float temp  = dp.temp;
+    const uint32_t seed = dp.seed;
+    const int32_t top_k = mirror ? (dp.top_k > 0 ? std::min<int32_t>(dp.top_k, k_max) : k_max) : 10;
+    const float   top_p = mirror ? dp.top_p : 1.0f;
+    const float   min_p = mirror ? dp.min_p : 0.0f;
+
     if (cfg.size() != smpls.size()) {
         const size_t n_old = cfg.size();
         cfg.resize(smpls.size());
@@ -51,20 +64,29 @@ static void spec_retune(
 
     auto & cur = cfg[seq_id];
 
-    if (cur.temp == temp && cur.seed == seed) {
+    if (cur.temp == temp && cur.seed == seed && cur.top_k == top_k && cur.top_p == top_p && cur.min_p == min_p) {
         return;
     }
 
-    cur.temp = temp;
-    cur.seed = seed;
+    cur.temp  = temp;
+    cur.seed  = seed;
+    cur.top_k = top_k;
+    cur.top_p = top_p;
+    cur.min_p = min_p;
 
     common_params_sampling sparams;
     sparams.no_perf  = false;
-    sparams.top_k    = 10;
+    sparams.top_k    = top_k;
+    sparams.top_p    = top_p;
+    sparams.min_p    = min_p;
     sparams.temp     = cur.temp;
     // must be explicit, the default reseeds at random; mixed so it differs from the target's
     sparams.seed     = cur.seed == LLAMA_DEFAULT_SEED ? cur.seed : cur.seed ^ 0x85ebca6bu;
-    sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TEMPERATURE };
+    if (mirror) {
+        sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TOP_P, COMMON_SAMPLER_TYPE_MIN_P, COMMON_SAMPLER_TYPE_TEMPERATURE };
+    } else {
+        sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TEMPERATURE };
+    }
 
     smpls[seq_id].reset(common_sampler_init(model, sparams));
 }
@@ -80,7 +102,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"ngram-suffix",  COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX}
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -372,7 +395,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
             // result_q is only set when the caller wants rejection, so it also gates the retune
             if (dp.result_q) {
-                spec_retune(smpls, smpls_cfg, llama_get_model(ctx_dft), seq_id, dp.temp, dp.seed);
+                spec_retune(smpls, smpls_cfg, llama_get_model(ctx_dft), seq_id, dp);
             }
 
             // a reset reseeds the chain, which breaks probabilistic drafting
@@ -1715,7 +1738,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             // result_q is only set when the caller wants rejection, so it also gates the retune
             if (dp.result_q) {
-                spec_retune(smpls, smpls_cfg, llama_get_model(ctx_dft), seq_id, dp.temp, dp.seed);
+                spec_retune(smpls, smpls_cfg, llama_get_model(ctx_dft), seq_id, dp);
             }
 
             // a reset reseeds the chain, which breaks probabilistic drafting
@@ -2147,6 +2170,303 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     }
 };
 
+// k9-draft: ngram-suffix. The draft is what followed the longest earlier repeat (at least n_min_match, at most 64 tokens) of the last
+// tokens of the prompt + output, found through a hash of trigrams that keeps the last 4 places of each (the suffix lookup of
+// PolyStrata: src/spec/suffix_drafter.cpp:47-87, --lookup 3 by default in src/poly/main.cpp:1127). Its length follows the decayed
+// acceptance of earlier suffix drafts of the same match-length class, q per token, with PolyStrata's priors (src/spec/draft_policy.cpp:
+// 13-19, 26-33): k tokens while q^k >= p_cut, at most n_max_short below a match of n_long_match tokens and n_max from there (its
+// window of 4 for short repeats and the full window for a copy of 8 or more, src/poly/main.cpp:68-73, 489). Beside a model drafter
+// (later in the priority list: MTP, -md, eagle3, dflash) it drafts only a full window from a match class right at least p_take of the
+// time and otherwise leaves the round to the model (main.cpp:491-494); the model's rounds still see the verify rows (process()), so
+// both compose. The verifier accepts a suffix token only if the target samples it, so the output distribution is unchanged.
+struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
+    static constexpr int    WAYS      = 4;
+    static constexpr int    MAX_MATCH = 64;
+    static constexpr int    N_BUCKET  = 4;
+    static constexpr double PRIOR_N   = 4.0;
+    static constexpr double DECAY     = 0.97;  // per verified suffix draft
+    static constexpr double DRIFT     = 0.99;  // per match not drafted: the class drifts back to its prior, so a low class is retried
+
+    common_params_speculative_ngram_suffix params;
+    bool with_model = false;
+
+    struct slot_t {
+        uint64_t key = 0;
+        uint32_t pos[WAYS] = {};
+        uint8_t  n = 0;
+    };
+
+    struct seq_info {
+        std::vector<llama_token> hist;
+        std::vector<slot_t>      table;
+        size_t mask   = 0;
+        size_t n_used = 0;
+        double ok[N_BUCKET]  = {};
+        double bad[N_BUCKET] = {};
+        int bucket_last = -1;
+        int k_last      = 0;
+        int match_last  = 0;
+        // per request counters (logged when the next request begins)
+        int64_t n_lookups = 0, n_matches = 0, n_drafts = 0, n_drafted = 0, n_accepted = 0, n_yield = 0;
+    };
+
+    std::vector<seq_info> sinfos;
+
+    static int env_i(const char * name, int def) {
+        const char * e = getenv(name);
+        return e ? atoi(e) : def;
+    }
+    static float env_f(const char * name, float def) {
+        const char * e = getenv(name);
+        return e ? (float) atof(e) : def;
+    }
+
+    common_speculative_impl_ngram_suffix(const common_params_speculative & params_all, uint32_t n_seq, bool with_model)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX, n_seq, params_all.suffix_n_max())
+        , params(params_all.ngram_suffix)
+        , with_model(with_model) {
+        params.n_max        = params_all.suffix_n_max();
+        params.n_min_match  = std::max(3, env_i("LLAMA_SPEC_SUFFIX_MIN_MATCH", params.n_min_match));
+        params.n_min_draft  = std::max(params.n_min_match, env_i("LLAMA_SPEC_SUFFIX_MIN_DRAFT", params.n_min_draft));
+        params.n_max_short  = std::max(1, env_i("LLAMA_SPEC_SUFFIX_N_MAX_SHORT", params.n_max_short));
+        params.n_long_match = std::max(params.n_min_match, env_i("LLAMA_SPEC_SUFFIX_LONG_MATCH", params.n_long_match));
+        params.p_cut        = env_f("LLAMA_SPEC_SUFFIX_P_CUT", params.p_cut);
+        params.p_take       = env_f("LLAMA_SPEC_SUFFIX_P_TAKE", params.p_take);
+        params.n_max        = std::max(1, params.n_max);
+        params.n_max_short  = std::min(params.n_max_short, params.n_max);
+        this->n_max = params.n_max;
+        sinfos.resize(n_seq);
+        SPC_INF("ngram-suffix: min match %d (%d to draft alone), n_max %d (%d below a match of %d), p_cut %.2f, %s %.2f\n", params.n_min_match,
+                params.n_min_draft, params.n_max, params.n_max_short, params.n_long_match, params.p_cut,
+                with_model ? "beside a model drafter: drafts a full window when q >=" : "alone, p_take unused", params.p_take);
+    }
+
+    static int bucket(int match) {
+        return match < 6 ? 0 : match < 12 ? 1 : match < 24 ? 2 : 3;
+    }
+
+    double rate(const seq_info & si, int b) const {
+        static constexpr double prior[N_BUCKET] = { 0.75, 0.88, 0.93, 0.96 };
+        return (si.ok[b] + PRIOR_N*prior[b]) / (si.ok[b] + si.bad[b] + PRIOR_N);
+    }
+
+    static uint64_t mix(uint64_t x) {
+        x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull; return x ^ (x >> 33);
+    }
+
+    static uint64_t key_at(const std::vector<llama_token> & h, size_t end) {
+        const uint64_t a = (uint32_t) h[end - 2], b = (uint32_t) h[end - 1], c = (uint32_t) h[end];
+        return mix(a*0x9E3779B97F4A7C15ull ^ mix(b + 0x632BE59BD9B4E019ull) ^ (c << 1)) | 1ull;
+    }
+
+    static slot_t * find(seq_info & si, uint64_t key, bool insert) {
+        if (si.table.empty()) {
+            return nullptr;
+        }
+        for (size_t i = key & si.mask, probes = 0; probes <= si.mask; i = (i + 1) & si.mask, ++probes) {
+            slot_t & s = si.table[i];
+            if (s.key == key) {
+                return &s;
+            }
+            if (s.key == 0) {
+                if (!insert) {
+                    return nullptr;
+                }
+                s.key = key;
+                si.n_used++;
+                return &s;
+            }
+        }
+        return nullptr;
+    }
+
+    static bool indexable(const seq_info & si, size_t end) {
+        const auto & h = si.hist;
+        return end >= 2 && h[end] != LLAMA_TOKEN_NULL && h[end - 1] != LLAMA_TOKEN_NULL && h[end - 2] != LLAMA_TOKEN_NULL;
+    }
+
+    static void insert_at(seq_info & si, size_t end) {
+        slot_t * s = find(si, key_at(si.hist, end), true);
+        if (s == nullptr) {
+            return;
+        }
+        for (int w = WAYS - 1; w > 0; --w) {
+            s->pos[w] = s->pos[w - 1];
+        }
+        s->pos[0] = (uint32_t) end;
+        if (s->n < WAYS) {
+            s->n++;
+        }
+    }
+
+    static void index_at(seq_info & si, size_t end) {
+        if (!indexable(si, end)) {
+            return;
+        }
+        if (2*(si.n_used + 1) > si.table.size()) {
+            // grow: every key again at twice the size (load factor <= 0.5)
+            const size_t cap = std::max<size_t>(8192, si.table.size()*2);
+            si.table.assign(cap, slot_t{});
+            si.mask   = cap - 1;
+            si.n_used = 0;
+            for (size_t e = 2; e < end; ++e) {
+                if (indexable(si, e)) {
+                    insert_at(si, e);
+                }
+            }
+        }
+        insert_at(si, end);
+    }
+
+    static void clear(seq_info & si) {
+        si.hist.clear();
+        si.table.clear();
+        si.mask   = 0;
+        si.n_used = 0;
+    }
+
+    // bring the history up to the prompt (the slot's tokens: accepted tokens are appended; a new request or a truncation rebuilds)
+    static void sync(seq_info & si, const llama_tokens & prompt) {
+        const size_t n = si.hist.size();
+        bool same = n <= prompt.size();
+        if (same && n > 0) {
+            same = si.hist[0] == prompt[0] && si.hist[n - 1] == prompt[n - 1] && si.hist[n/2] == prompt[n/2];
+        }
+        if (!same) {
+            clear(si);
+        }
+        for (size_t i = si.hist.size(); i < prompt.size(); ++i) {
+            si.hist.push_back(prompt[i]);
+            index_at(si, si.hist.size() - 1);
+        }
+    }
+
+    // the continuation of the longest earlier repeat of the history + id_last, at most max_k tokens; sets match
+    int propose(seq_info & si, llama_token id_last, int max_k, llama_tokens & out, int & match) const {
+        match = 0;
+        si.hist.push_back(id_last);
+        const size_t n = si.hist.size();
+        int k = 0;
+        if (n >= 4 && max_k > 0 && indexable(si, n - 1)) {
+            const size_t cur = n - 1;
+            const slot_t * s = find(si, key_at(si.hist, cur), false);
+            if (s != nullptr) {
+                size_t best_end = 0;
+                int    best_len = 0;
+                for (int w = 0; w < s->n; ++w) {
+                    const size_t p = s->pos[w];
+                    if (p >= cur) {
+                        continue;
+                    }
+                    int len = 0;
+                    while (len < MAX_MATCH && len <= (int) p && si.hist[p - len] == si.hist[cur - len]) {
+                        ++len;
+                    }
+                    if (len > best_len) {   // most recent first, so a tie keeps the newer place
+                        best_len = len;
+                        best_end = p;
+                    }
+                }
+                if (best_len >= params.n_min_match) {
+                    match = best_len;
+                    // the continuation may run into the current suffix (periodic text): reading up to cur is valid
+                    for (size_t q = best_end + 1; q <= cur && k < max_k; ++q) {
+                        if (si.hist[q] == LLAMA_TOKEN_NULL) {
+                            break;
+                        }
+                        out.push_back(si.hist[q]);
+                        ++k;
+                    }
+                }
+            }
+        }
+        si.hist.pop_back();
+        return k;
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        auto & si = sinfos[seq_id];
+        if (si.n_lookups > 0) {
+            SPC_INF("ngram-suffix seq %d (last request): %" PRId64 " lookups, %" PRId64 " matches, %" PRId64 " drafts of %" PRId64 " tokens, %"
+                    PRId64 " accepted, %" PRId64 " left to the model drafter; q by match class %.2f %.2f %.2f %.2f\n", seq_id, si.n_lookups,
+                    si.n_matches, si.n_drafts, si.n_drafted, si.n_accepted, si.n_yield, rate(si, 0), rate(si, 1), rate(si, 2), rate(si, 3));
+        }
+        si.n_lookups = si.n_matches = si.n_drafts = si.n_drafted = si.n_accepted = si.n_yield = 0;
+        si.k_last = 0;
+        clear(si);
+        sync(si, prompt);
+    }
+
+    bool process(const common_batch & /*batch*/) override {
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+            auto & si = sinfos[seq_id];
+            si.k_last = 0;
+            sync(si, *dp.prompt);
+            si.n_lookups++;
+
+            int cap = params.n_max;
+            if (dp.n_max > 0) {
+                cap = std::min(cap, dp.n_max);
+            }
+            llama_tokens cand;
+            int match = 0;
+            const int offered = propose(si, dp.id_last, cap, cand, match);
+            if (offered == 0) {
+                continue;
+            }
+            si.n_matches++;
+            const int    b   = bucket(match);
+            const double q   = rate(si, b);
+            const int    win = match >= params.n_long_match ? cap : std::min(cap, params.n_max_short);
+            // the draft is the whole window (fewer tokens only where the repeat runs out): every verify length is a graph of its own
+            // (a change of length rebuilds the target graph, 10-15 ms on G4, plans/mtp_adapt.md), so the lengths stay few
+            int k = 0;
+            if (with_model) {
+                // a full window from a class that is right most of the time, else the model drafts this round
+                k = (offered >= win && q >= params.p_take) ? win : 0;
+            } else {
+                // a short repeat (under n_min_draft tokens) is in any text and drafts alone only rarely pay: a drafted step between
+                // plain ones changes the graph twice (LLAMA_SPEC_SUFFIX_MIN_DRAFT=3: every match of the index drafts)
+                k = (match >= params.n_min_draft && q >= params.p_cut) ? std::min(offered, win) : 0;
+            }
+            if (k == 0) {
+                si.ok[b]  *= DRIFT;
+                si.bad[b] *= DRIFT;
+                if (with_model) {
+                    si.n_yield++;
+                }
+                continue;
+            }
+            dp.result->assign(cand.begin(), cand.begin() + k);
+            si.k_last      = k;
+            si.bucket_last = b;
+            si.match_last  = match;
+            si.n_drafts++;
+            si.n_drafted += k;
+        }
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        auto & si = sinfos[seq_id];
+        if (!is_other && si.k_last > 0 && si.bucket_last >= 0) {
+            const int b = si.bucket_last;
+            const int a = std::min<int>(n_accepted, si.k_last);
+            si.ok[b]  = DECAY*si.ok[b] + a;
+            si.bad[b] = DECAY*si.bad[b] + (a < si.k_last ? 1.0 : 0.0);
+            si.n_accepted += a;
+        }
+        si.k_last = 0;
+    }
+};
+
 struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     common_params_speculative_ngram_cache params;
 
@@ -2362,6 +2682,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX:  return "ngram-suffix";
         default:                                    return "unknown";
     }
 }
@@ -2489,6 +2810,9 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
                 n_max = std::max(n_max, (int32_t) 8);
+                break;
+            case COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX:
+                n_max = std::max(n_max, spec->suffix_n_max());
                 break;
             case COMMON_SPECULATIVE_TYPE_NONE:
             case COMMON_SPECULATIVE_TYPE_COUNT:
@@ -2792,7 +3116,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 11);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -2801,6 +3125,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX);
 
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
@@ -2869,6 +3194,16 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             case COMMON_SPECULATIVE_TYPE_NGRAM_MOD: {
                 impls.push_back(
                         std::make_unique<common_speculative_impl_ngram_mod>(config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX: {
+                // a model drafter later in the list takes the rounds the suffix draft is not sure of
+                const bool with_model = std::any_of(configs.begin(), configs.end(), [](const common_speculative_config & c) {
+                    return c.type == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || c.type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                           c.type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP    || c.type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                           c.type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+                });
+                impls.push_back(std::make_unique<common_speculative_impl_ngram_suffix>(config.params, n_seq, with_model));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE: {

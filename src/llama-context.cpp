@@ -4291,6 +4291,12 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
     }
 
+    // k9-draft: recurrent per-token snapshots (n_rs_seq) add copies per recurrent layer and kept position; the 8 x n_tensors budget
+    // of e.g. LFM2 ran out at n_rs_seq 8 (ngram-suffix drafts of 8 tokens: GGML_ASSERT(obj_new) in build_moe_ffn)
+    if (cparams.n_rs_seq > 0) {
+        res += 16u * cparams.n_rs_seq * model.hparams.n_layer();
+    }
+
     if (cparams.training) {
         res *= 4;
     }

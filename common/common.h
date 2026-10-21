@@ -184,6 +184,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX,  // suffix match over the prompt + output, gated by its measured acceptance, composes with a model drafter
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -370,6 +371,20 @@ struct common_params_speculative_ngram_mod {
     int32_t n_min = 48;
 };
 
+// ngram-suffix: the continuation of the longest earlier repeat (3 to 64 tokens) of the last tokens of the prompt + output is the draft:
+// a window of n_max_short tokens for a match shorter than n_long_match and n_max otherwise, drafted while the decayed acceptance of
+// earlier suffix drafts with a match of the same length class (q per token) is at least p_cut. Beside a model drafter (MTP, -md) it
+// drafts only when q >= p_take and the window is full, else the model drafts (LLAMA_SPEC_SUFFIX_* env tune it)
+struct common_params_speculative_ngram_suffix {
+    int32_t n_min_match  = 3;
+    int32_t n_min_draft  = 12;  // alone: the shortest match that drafts (sparse short repeats cost two graph changes each for little)
+    int32_t n_max        = 7;   // verify batches of at most 8 rows: the per-column (MMVQ) kernels of a decode, so LLAMA_MTP_EXACT=1 stays bit exact
+    int32_t n_max_short  = 3;
+    int32_t n_long_match = 8;
+    float   p_cut        = 0.6f;
+    float   p_take       = 0.9f;
+};
+
 struct common_params_speculative_ngram_map {
     uint16_t size_n   = 12; // ngram size for lookup
     uint16_t size_m   = 48; // mgram size for speculative tokens
@@ -397,6 +412,8 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
+    common_params_speculative_ngram_suffix ngram_suffix;
+
     bool has_dft() const {
         return !draft.mparams.empty();
     }
@@ -410,7 +427,32 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        uint32_t n = needs_rs_seq ? (uint32_t) std::max(0, draft.n_max) : 0u;
+        // k9-draft: suffix drafts are verified in one batch too; a recurrent model rolls them back from per-token snapshots instead
+        // of a state checkpoint per verify (LLAMA_SPEC_SUFFIX_RS=0: as before, the snapshots cover the model drafter only)
+        static const bool suffix_rs = getenv("LLAMA_SPEC_SUFFIX_RS") == nullptr || atoi(getenv("LLAMA_SPEC_SUFFIX_RS")) != 0;
+        if (suffix_rs) {
+            n = std::max(n, (uint32_t) suffix_n_max());
+        }
+        return n;
+    }
+
+    // k9-draft: the longest ngram-suffix draft (0 without that type). LLAMA_SPEC_SUFFIX_N_MAX sets it; else ngram_suffix.n_max (7)
+    // alone, and the model drafter's n_max beside one: the suffix draft then takes a model round when it is sure, with no new verify
+    // shape and no extra recurrent snapshots (each kept position of Qwen3.6-35B-A3B is a 63 MiB state taken from the MoE cache; G4,
+    // a window of 4 beside MTP 2 lost 1-7% decode at 8 / 32 GB against MTP alone, rep cell included)
+    int32_t suffix_n_max() const {
+        if (std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX) == types.end()) {
+            return 0;
+        }
+        if (const char * e = getenv("LLAMA_SPEC_SUFFIX_N_MAX")) {
+            return std::max(1, atoi(e));
+        }
+        const bool model = std::any_of(types.begin(), types.end(), [&](auto t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        });
+        return model ? std::max(1, draft.n_max) : std::max(1, ngram_suffix.n_max);
     }
 };
 
