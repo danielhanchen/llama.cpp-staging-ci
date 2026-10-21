@@ -179,13 +179,14 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
 }
 
-// RDNA3 (incl. RDNA3.5): head size 256 with float VKQ accumulators (mma_tile_sizes<256, ncols> below) and tile sizes for
-// that register budget; RDNA4 keeps ggml_cuda_fattn_mma_get_config_rdna. GGML_HIP_FA_RDNA3_D256_HALF_VKQ restores the half2 path.
+// RDNA3 (incl. RDNA3.5): compile-time opt-in GGML_HIP_FA_RDNA3_D256_FLOAT_VKQ gives head size 256 float VKQ accumulators
+// (mma_tile_sizes<256, ncols> below) and tile sizes for that register budget. Off by default: on gfx1151 it was 5-25% slower
+// in head-256 prefill and ~8% slower in MTP decode after a 2k prompt, with no prefill gain. RDNA4 is unaffected.
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_rdna3(const int DKQ, const int DV, const int ncols) {
-#ifndef GGML_HIP_FA_RDNA3_D256_HALF_VKQ
+#ifdef GGML_HIP_FA_RDNA3_D256_FLOAT_VKQ
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  64, 128, 128,  64, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 1,  32, 128,  64,  64, 1, false);
-#endif // GGML_HIP_FA_RDNA3_D256_HALF_VKQ
+#endif // GGML_HIP_FA_RDNA3_D256_FLOAT_VKQ
 
     return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols);
 }
@@ -1154,7 +1155,7 @@ template<int ncols> struct mma_tile_sizes<112, ncols> {
     using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
     using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
 };
-#ifndef GGML_HIP_FA_RDNA3_D256_HALF_VKQ
+#ifdef GGML_HIP_FA_RDNA3_D256_FLOAT_VKQ
 // head size 256: float VKQ accumulators (more precise than half2 over long rows), see ggml_cuda_fattn_mma_get_config_rdna3
 template<int ncols> struct mma_tile_sizes<256, ncols> {
     using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
@@ -1164,7 +1165,7 @@ template<int ncols> struct mma_tile_sizes<256, ncols> {
     using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
     using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
 };
-#endif // GGML_HIP_FA_RDNA3_D256_HALF_VKQ
+#endif // GGML_HIP_FA_RDNA3_D256_FLOAT_VKQ
 #else
 template<int DKQ, int ncols> struct mma_tile_sizes {
     using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR>;           // row-major
