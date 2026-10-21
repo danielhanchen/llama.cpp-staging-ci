@@ -2123,8 +2123,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 // back to the full vocabulary with -inf elsewhere (llm_graph_context::build_draft_head), so nothing downstream changes and the
 // output stays exact: a greedy draft is an argmax over the subset, a sampled draft's q is its softmax over the subset (0 off it),
 // and the verifier's residual max(0, p - q) covers the target tokens outside it.
-//   LLAMA_MTP_DRAFT_VOCAB=n (default 32768, 0: off), LLAMA_MTP_DRAFT_VOCAB_FILE=path (int32 token ids, as open-jet's
-//   draft_vocab_32k.bin), else the GGUF array tokenizer.ggml.draft_vocab, else llama_vocab::draft_vocab (merge rank / score)
+//   LLAMA_MTP_DRAFT_VOCAB=n (default 65536, 0: off; 32768 lost 2-3% on Qwen3.6 8 GB chat), LLAMA_MTP_DRAFT_VOCAB_FILE=path
+//   (int32 token ids, as open-jet's draft_vocab_32k.bin), else the GGUF array tokenizer.ggml.draft_vocab, else llama_vocab::draft_vocab (merge rank / score)
 void llama_model_base::load_tensors_draft_head(llama_model_loader & ml, bool dry) {
     draft_head = {};
     if (hparams.n_layer_nextn == 0) {
@@ -2132,7 +2132,7 @@ void llama_model_base::load_tensors_draft_head(llama_model_loader & ml, bool dry
     }
     const char * env_n = getenv("LLAMA_MTP_DRAFT_VOCAB");
     const int32_t n_vocab = (int32_t) vocab.n_tokens();
-    int32_t n_sub = env_n ? atoi(env_n) : 32768;
+    int32_t n_sub = env_n ? atoi(env_n) : 65536;
     if (n_sub <= 0) {
         return;
     }
