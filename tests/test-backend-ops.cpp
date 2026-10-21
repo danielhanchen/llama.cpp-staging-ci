@@ -13282,6 +13282,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // FLASH_ATTN_EXT head size 256 prefill at Qwen3.5 / Qwen3.6 / Flash-Next shapes (2 KV heads, GQA 8 / 4), F16 KV
+    for (int64_t nb : { 512, 2048 }) {
+        for (int64_t kv : { 2048, 8192 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+
     // CONCAT of the GDN conv state with transpose(x) at Qwen3.5 / Qwen3.6 prefill shapes (channels 6144 / 8192 / 12288)
     for (int64_t ch : { 6144, 8192, 12288 }) {
         for (int64_t n_tok : { 512, 2048 }) {
