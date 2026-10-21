@@ -2181,6 +2181,11 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         }
     }
 
+    // MMQ / MMF sort the ids on the device: only where the helper fits the shared memory of the device (see ggml_cuda_mul_mat_id)
+    if (!ggml_cuda_mm_ids_helper_supported(src0->ne[2], src1->ne[2], dst->src[2]->ne[0])) {
+        return true;
+    }
+
     if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
         return false;
     }
@@ -2223,12 +2228,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        // MMQ / MMF sort the ids with ggml_cuda_launch_mm_ids_helper, which needs either n_experts or n_tokens ids in shared
+        // memory: a device that holds neither (huge expert count AND a ubatch beyond smpbo/4 tokens) takes the host sort below
+        const bool ids_on_device = ggml_cuda_mm_ids_helper_supported(ne02, ne12, ids->ne[0]);
+
+        if (ids_on_device && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
-        if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+        if (ids_on_device && ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }

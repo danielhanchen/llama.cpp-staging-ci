@@ -11899,6 +11899,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 1, false, 512, 1, 256));
     }
 
+    // MoE ubatches beyond the shared memory of the single-warp ids helper (n_tokens*4 bytes: 16384 tokens on 64 KB LDS,
+    // e.g. gfx1151, 58112 on 227 KB): the ids are sorted by the counting sort, or on the host where neither fits
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_F16}) {
+        for (int n : {16384, 16385, 20000, 60000}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 2, false, 32, n, 256));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 32, 20000, 256));
+    }
+
     for (ggml_type type_a : other_types) {
         for (ggml_type type_b : {GGML_TYPE_F32}) {
             if (ggml_blck_size(type_a) != 256) {
