@@ -11,6 +11,9 @@
 #include <cassert>
 #include <cmath>
 #include <ctime>
+#if defined(__linux__)
+#include <sys/resource.h>
+#endif
 #include <cstring>
 #include <limits>
 #include <map>
@@ -1594,10 +1597,11 @@ struct args_set_input_kq_mask {
 // fills the mask rows of the tokens [ii0, ii1) of every stream
 // each row only depends on its own token and the cells, so disjoint row ranges can be filled concurrently;
 // within a range, the first row of each sequence is computed in full and the others are patched from it
-// sorted: causal masks without SWA / M-RoPE / ALiBi start a row that follows another row of its sequence from that previous row and
-// patch only the recorded cells whose position lies between the two rows' positions (found in the recorded cells sorted by position),
-// instead of copying the first row and patching every recorded cell: a cell p0 of the sequence is kept in a row p1 iff p0 <= p1,
-// so the two rows differ exactly there (the cells that are not recorded are the same in every row of the sequence)
+// sorted: causal masks without SWA / ALiBi start a row that follows another row of its sequence from that previous row and recompute
+// only the recorded cells whose position p0 lies in [min(p1, p1'), max(p1, p1')] for the two rows' positions p1, p1' (found in the
+// recorded cells sorted by position), instead of copying the first row and recomputing every recorded cell: a recorded cell is kept
+// in a row iff p0 < p1, or p0 == p1 and (M-RoPE) its 2D position is not after the row's, so cells outside that interval are the same
+// in both rows (and the cells that are not recorded are the same in every row of the sequence)
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
 static void set_input_kq_mask_rows(const args_set_input_kq_mask & args, const llama_pos * seq_pos_min, T * data, int64_t ii0, int64_t ii1, bool sorted) {
   //const auto & hparams = args.hparams;
@@ -1616,7 +1620,7 @@ static void set_input_kq_mask_rows(const args_set_input_kq_mask & args, const ll
     const T mask_keep = llama_cast<T>(0.0f);
     const T mask_drop = llama_cast<T>(-INFINITY);
 
-    constexpr bool can_sort = causal && !swa && !is_2d && !alibi;
+    constexpr bool can_sort = causal && !swa && !alibi;
     sorted = sorted && can_sort;
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -1671,9 +1675,14 @@ static void set_input_kq_mask_rows(const args_set_input_kq_mask & args, const ll
 
                         const llama_pos lo = std::min(last.second, p1);
                         const llama_pos hi = std::max(last.second, p1);
-                        auto it = std::upper_bound(srt.begin(), srt.end(), std::make_pair(lo, UINT32_MAX));
+                        auto it = std::lower_bound(srt.begin(), srt.end(), std::make_pair(lo, (uint32_t) 0));
                         for (; it != srt.end() && it->first <= hi; ++it) {
-                            data[idst + it->second] = it->first > p1 ? mask_drop : mask_keep;
+                            const llama_pos q0 = it->first;
+                            bool keep = q0 <= p1;
+                            if (is_2d && keep && q0 == p1) {
+                                keep = !cells.ext_get(it->second).is_2d_gt(p1_x, p1_y);
+                            }
+                            data[idst + it->second] = keep ? mask_keep : mask_drop;
                         }
                         last = { i, p1 };
                         continue;
@@ -1883,6 +1892,17 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
+// minor page faults of the calling thread so far (Linux; 0 elsewhere)
+static long kq_mask_thread_minflt() {
+#if defined(__linux__) && defined(RUSAGE_THREAD)
+    rusage ru {};
+    getrusage(RUSAGE_THREAD, &ru);
+    return ru.ru_minflt;
+#else
+    return 0;
+#endif
+}
+
 static double kq_mask_thread_cpu_ms() {
 #if defined(CLOCK_THREAD_CPUTIME_ID)
     timespec ts {};
@@ -1915,6 +1935,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     const int64_t t_start = llama_mtp_handoff_trace() && n_tokens >= 64 ? ggml_time_us() : 0;
     // the calling thread's CPU time (all of the work with LLAMA_KQ_MASK_THREADS=1): wall time moves with the host load
     const double cpu0 = t_start ? kq_mask_thread_cpu_ms() : 0.0;
+    const long   flt0 = t_start ? kq_mask_thread_minflt() : 0;
 
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
@@ -1935,8 +1956,9 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     }
 
     if (t_start) {
-        LLAMA_LOG_INFO("mtp_trace kq_mask cache=%p n=%u n_kv=%lld %.2f ms (cpu %.2f ms)\n", (const void *) this, n_tokens, (long long) n_kv,
-                (ggml_time_us() - t_start)/1e3, kq_mask_thread_cpu_ms() - cpu0);
+        LLAMA_LOG_INFO("mtp_trace kq_mask cache=%p n=%u n_kv=%lld %.2f ms (cpu %.2f ms) minflt=%ld buf=%s\n", (const void *) this, n_tokens,
+                (long long) n_kv, (ggml_time_us() - t_start)/1e3, kq_mask_thread_cpu_ms() - cpu0, kq_mask_thread_minflt() - flt0,
+                ggml_backend_buffer_name(dst->buffer));
     }
 }
 
