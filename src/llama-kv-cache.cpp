@@ -10,6 +10,7 @@
 #include <cinttypes>
 #include <cassert>
 #include <cmath>
+#include <ctime>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -1593,9 +1594,10 @@ struct args_set_input_kq_mask {
 // fills the mask rows of the tokens [ii0, ii1) of every stream
 // each row only depends on its own token and the cells, so disjoint row ranges can be filled concurrently;
 // within a range, the first row of each sequence is computed in full and the others are patched from it
-// sorted: causal masks without SWA / M-RoPE / ALiBi patch, in a row that follows the first row of its sequence, only the recorded
-// cells whose position lies between the two rows' positions (found in the recorded cells sorted by position), instead of every
-// recorded cell: a cell p0 of the sequence is kept in a row p1 iff p0 <= p1, so the two rows differ exactly there
+// sorted: causal masks without SWA / M-RoPE / ALiBi start a row that follows another row of its sequence from that previous row and
+// patch only the recorded cells whose position lies between the two rows' positions (found in the recorded cells sorted by position),
+// instead of copying the first row and patching every recorded cell: a cell p0 of the sequence is kept in a row p1 iff p0 <= p1,
+// so the two rows differ exactly there (the cells that are not recorded are the same in every row of the sequence)
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
 static void set_input_kq_mask_rows(const args_set_input_kq_mask & args, const llama_pos * seq_pos_min, T * data, int64_t ii0, int64_t ii1, bool sorted) {
   //const auto & hparams = args.hparams;
@@ -1621,9 +1623,9 @@ static void set_input_kq_mask_rows(const args_set_input_kq_mask & args, const ll
         // bookkeeping of the KQ mask cells that could change for other tokens of the same sequence
         std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
         std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
-        // sorted: the recorded cells of the sequence as (position, cell), by position, and the position of its first row
+        // sorted: the recorded cells of the sequence as (position, cell), by position, and its last row so far (row, position)
         std::unordered_map<llama_seq_id, std::vector<std::pair<llama_pos, uint32_t>>> seq_sorted;
-        std::unordered_map<llama_seq_id, llama_pos>                                   seq_p1;
+        std::unordered_map<llama_seq_id, std::pair<uint32_t, llama_pos>>             seq_last;
 
         for (uint32_t ii = (uint32_t) ii0; ii < (uint32_t) ii1; ++ii) {
             const uint32_t i = s*n_tps + ii;
@@ -1653,16 +1655,9 @@ static void set_input_kq_mask_rows(const args_set_input_kq_mask & args, const ll
 
             if (!alibi) {
                 if (seq_srct.find(seq_id) != seq_srct.end()) {
-                    const uint32_t srct = seq_srct[seq_id];
-
-                    const uint64_t idst_prev = n_kv*srct;
-
-                    std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
-
-                    prev = true;
-
                     if (can_sort && sorted) {
-                        auto & srt = seq_sorted[seq_id];
+                        auto & srt  = seq_sorted[seq_id];
+                        auto & last = seq_last[seq_id];
                         if (srt.size() != idxs.size()) {
                             srt.clear();
                             srt.reserve(idxs.size());
@@ -1671,21 +1666,32 @@ static void set_input_kq_mask_rows(const args_set_input_kq_mask & args, const ll
                             }
                             std::sort(srt.begin(), srt.end());
                         }
-                        const llama_pos p1_first = seq_p1[seq_id];
-                        const llama_pos lo = std::min(p1_first, p1);
-                        const llama_pos hi = std::max(p1_first, p1);
+
+                        std::copy(data + n_kv*last.first, data + n_kv*last.first + n_kv, data + idst);
+
+                        const llama_pos lo = std::min(last.second, p1);
+                        const llama_pos hi = std::max(last.second, p1);
                         auto it = std::upper_bound(srt.begin(), srt.end(), std::make_pair(lo, UINT32_MAX));
                         for (; it != srt.end() && it->first <= hi; ++it) {
                             data[idst + it->second] = it->first > p1 ? mask_drop : mask_keep;
                         }
+                        last = { i, p1 };
                         continue;
                     }
+
+                    const uint32_t srct = seq_srct[seq_id];
+
+                    const uint64_t idst_prev = n_kv*srct;
+
+                    std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
+
+                    prev = true;
                 } else {
                     idxs.clear();
                     idxs.reserve(ubatch->n_tokens + n_swa + 32);
 
                     seq_srct[seq_id] = i;
-                    seq_p1[seq_id]   = p1;
+                    seq_last[seq_id] = { i, p1 };
                 }
             }
 
@@ -1877,6 +1883,16 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
+static double kq_mask_thread_cpu_ms() {
+#if defined(CLOCK_THREAD_CPUTIME_ID)
+    timespec ts {};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return ts.tv_sec*1e3 + ts.tv_nsec/1e6;
+#else
+    return 0.0;
+#endif
+}
+
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
@@ -1897,6 +1913,8 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     }
 
     const int64_t t_start = llama_mtp_handoff_trace() && n_tokens >= 64 ? ggml_time_us() : 0;
+    // the calling thread's CPU time (all of the work with LLAMA_KQ_MASK_THREADS=1): wall time moves with the host load
+    const double cpu0 = t_start ? kq_mask_thread_cpu_ms() : 0.0;
 
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
@@ -1917,7 +1935,8 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     }
 
     if (t_start) {
-        LLAMA_LOG_INFO("mtp_trace kq_mask cache=%p n=%u n_kv=%lld %.2f ms\n", (const void *) this, n_tokens, (long long) n_kv, (ggml_time_us() - t_start)/1e3);
+        LLAMA_LOG_INFO("mtp_trace kq_mask cache=%p n=%u n_kv=%lld %.2f ms (cpu %.2f ms)\n", (const void *) this, n_tokens, (long long) n_kv,
+                (ggml_time_us() - t_start)/1e3, kq_mask_thread_cpu_ms() - cpu0);
     }
 }
 
