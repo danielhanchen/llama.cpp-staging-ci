@@ -2,6 +2,7 @@
 #include "cpy.cuh"
 
 #include <stdint.h>
+#include <cstdlib>
 
 // contiguous kernels
 template <typename T, int dim>
@@ -80,6 +81,96 @@ static void concat_cont_cuda(const T * x,
     concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
 }
 
+// dim 0 concat of a row-contiguous src0 with a transposed src1 (src1 = ggml_transpose of a contiguous tensor, e.g. the conv
+// state of GDN / Mamba prefill: concat(state, transpose(x), 0)). The generic non-contiguous kernel reads src1 with a stride of
+// ne11 elements per thread; here a 32x32 tile goes through shared memory so both the src1 reads and the dst writes coalesce.
+// Pure copy, bit-identical to the generic kernels. GGML_CUDA_CONCAT_TRANSPOSED=0 disables it.
+template <typename T>
+static __global__ void concat_transposed_src1_dim0(
+        const char * __restrict__ src0, const char * __restrict__ src1, char * __restrict__ dst,
+        const int64_t ne00, const int64_t ne10, const int64_t ne11,
+        const uint64_t nb01, const uint64_t nb02,
+        const uint64_t nb10, const uint64_t nb12,
+        const uint64_t nb1, const uint64_t nb2) {
+    constexpr int tile = 32;
+    __shared__ T values[tile][tile + 1];
+
+    const int     tx       = threadIdx.x;
+    const int     ty       = threadIdx.y;
+    const int64_t channel0 = (int64_t) blockIdx.x * tile;
+    const int64_t token0   = (int64_t) blockIdx.y * tile;
+    const int64_t i2       = blockIdx.z;
+
+    ggml_cuda_pdl_sync();
+    // src1 element (token, channel) sits at channel*sizeof(T) + token*nb10: consecutive tx = consecutive channels
+    for (int j = 0; j < tile; j += blockDim.y) {
+        const int64_t token   = token0 + ty + j;
+        const int64_t channel = channel0 + tx;
+        if (token < ne10 && channel < ne11) {
+            values[ty + j][tx] = *(const T *) (src1 + i2*nb12 + channel*sizeof(T) + token*nb10);
+        }
+    }
+    __syncthreads();
+
+    // dst row = channel, columns ne00 + token: consecutive tx = consecutive tokens
+    for (int j = 0; j < tile; j += blockDim.y) {
+        const int64_t token   = token0 + tx;
+        const int64_t channel = channel0 + ty + j;
+        if (token < ne10 && channel < ne11) {
+            *(T *) (dst + i2*nb2 + channel*nb1 + (ne00 + token)*sizeof(T)) = values[tx][ty + j];
+        }
+    }
+
+    // the src0 part of the rows of this block, once per channel tile
+    if (blockIdx.y == 0) {
+        for (int j = 0; j < tile; j += blockDim.y) {
+            const int64_t channel = channel0 + ty + j;
+            if (channel < ne11) {
+                for (int64_t i0 = tx; i0 < ne00; i0 += tile) {
+                    *(T *) (dst + i2*nb2 + channel*nb1 + i0*sizeof(T)) = *(const T *) (src0 + i2*nb02 + channel*nb01 + i0*sizeof(T));
+                }
+            }
+        }
+    }
+}
+
+static bool concat_transposed_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_CUDA_CONCAT_TRANSPOSED");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// shape gate (any arch): dim 0, every tensor 3D (ne3 == 1), src0 and dst with contiguous rows, src1 the transpose of a
+// tensor with contiguous rows (channels contiguous, tokens strided), at least 32 src1 columns (tokens)
+template <typename T>
+static bool concat_transposed_src1_dim0_ok(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int dim) {
+    return dim == 0 && concat_transposed_enabled() &&
+        src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1 &&
+        src1->ne[0] >= 32 &&
+        src0->ne[1] == src1->ne[1] && src0->ne[2] == src1->ne[2] && src1->ne[2] <= 65535 &&
+        src0->nb[0] == sizeof(T) && dst->nb[0] == sizeof(T) &&
+        src1->nb[1] == sizeof(T) && src1->nb[0] >= (size_t) src1->ne[1]*sizeof(T) &&
+        (src1->ne[0] + 31)/32 <= 65535;
+}
+
+template <typename T>
+static void concat_transposed_src1_dim0_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, cudaStream_t stream) {
+    constexpr int tile = 32;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int tile_y = GGML_CUDA_CC_IS_RDNA3_5(cc) ? 16 : 8;
+    const dim3 block_dims(tile, tile_y, 1);
+    const dim3 block_nums((src1->ne[1] + tile - 1) / tile, (src1->ne[0] + tile - 1) / tile, src1->ne[2]);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+    ggml_cuda_kernel_launch(concat_transposed_src1_dim0<T>, launch_params,
+        (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+        src0->ne[0], src1->ne[0], src1->ne[1],
+        (uint64_t) src0->nb[1], (uint64_t) src0->nb[2],
+        (uint64_t) src1->nb[0], (uint64_t) src1->nb[2],
+        (uint64_t) dst->nb[1], (uint64_t) dst->nb[2]);
+}
+
 // non-contiguous kernel (slow)
 template <typename T, int dim>
 static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
@@ -142,6 +233,10 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
 
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
+    if (!ggml_is_quantized(src0->type) && concat_transposed_src1_dim0_ok<T>(src0, src1, dst, dim)) {
+        concat_transposed_src1_dim0_cuda<T>(src0, src1, dst, stream);
+        return;
+    }
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
         const T * src0_d = (const T *) src0->data;
         const T * src1_d = (const T *) src1->data;

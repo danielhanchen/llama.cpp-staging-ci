@@ -7211,7 +7211,7 @@ struct test_concat : public test_case {
     const std::array<int64_t, 4> ne_a;
     const int64_t ne_b_d;
     const int dim;
-    const int v; // view (1 << 0: non-cont a (first 3 dim), 1 << 1: non-cont b (first 3 dim), 1 << 2: non-cont a (last 2 dim), 1 << 3: non-cont b (last 2 dim))
+    const int v; // view (1 << 0: non-cont a (first 3 dim), 1 << 1: non-cont b (first 3 dim), 1 << 2: non-cont a (last 2 dim), 1 << 3: non-cont b (last 2 dim), 1 << 4: b transposed)
 
     std::string vars() override {
         return VARS_TO_STR5(type, ne_a, ne_b_d, dim, v);
@@ -7260,6 +7260,14 @@ struct test_concat : public test_case {
 
             b = ggml_view_4d(ctx, b, ne_b[0], ne_b[1], ne_b[2], ne_b[3], b->nb[1], b->nb[2], b->nb[3], 0);
             ggml_set_name(b, "view_of_b");
+        } else if (v & 16) {
+            // b = the transpose of a contiguous tensor (the conv state concat of GDN / Mamba prefill: concat(state, transpose(x), 0))
+            auto ne = ne_b; std::swap(ne[0], ne[1]);
+            b = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_name(b, "b");
+
+            b = ggml_transpose(ctx, b);
+            ggml_set_name(b, "transpose_of_b");
         } else {
             b = ggml_new_tensor(ctx, type, 4, ne_b.data());
             ggml_set_name(b, "b");
@@ -12442,6 +12450,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_concat(GGML_TYPE_Q8_0, {8192, 2, 1, 1}, dim == 0 ? 4096 : 1, dim, 0));
     }
 
+    // dim 0 concat with a transposed src1, ne3 == 1 (GDN / Mamba conv state + transpose(x)): tokens below, at and above the
+    // 32-token tile, channels not a multiple of 32, several sequences, 2- and 4-byte types
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        for (int64_t n_tok : { 7, 31, 32, 77, 512 }) {
+            test_cases.emplace_back(new test_concat(type, {3, 8192, 1, 1}, n_tok, 0, 16));
+            test_cases.emplace_back(new test_concat(type, {3, 1000, 2, 1}, n_tok, 0, 16));
+        }
+        test_cases.emplace_back(new test_concat(type, {3, 33, 3, 1}, 2047, 0, 16));
+        test_cases.emplace_back(new test_concat(type, {3, 4096, 1, 2}, 64, 0, 16)); // ne3 == 2: generic path
+    }
+
     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
         for (uint32_t i = 4; i <= 1024*1024; i *= 2) {
             test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {i-1, 1, 1, 1}));
@@ -13260,6 +13279,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
         for (auto mk : std::vector<std::array<int64_t, 2>>{ { 4, 10240 }, { 48, 2560 }, { 512, 2560 }, { 1, 2560 } }) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
+        }
+    }
+
+    // CONCAT of the GDN conv state with transpose(x) at Qwen3.5 / Qwen3.6 prefill shapes (channels 6144 / 8192 / 12288)
+    for (int64_t ch : { 6144, 8192, 12288 }) {
+        for (int64_t n_tok : { 512, 2048 }) {
+            test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, ch, 1, 1}, n_tok, 0, 16));
         }
     }
 
