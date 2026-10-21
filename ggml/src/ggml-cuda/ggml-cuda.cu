@@ -2895,14 +2895,68 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
-static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+// CUDA graph cache key. llama.cpp builds graphs of different batch sizes in the same node memory, so the first node alone
+// (the key before GGML_CUDA_GRAPH_SHAPE_KEY) puts decode, speculative verify windows of every size and multi-sequence decode
+// steps into one slot: each size change resets the slot's warmup and the next steps run without a graph or re-capture.
+// Small batches (at most GGML_CUDA_GRAPH_SHAPE_KEY_ROWS rows, default 64, in the first and last node) get one slot per
+// shape signature: node count + first/last node shapes (batch-dependent, KV-length independent, so a slot is reused as
+// the context grows). Larger batches (prompt ubatches) keep the first-node key: capturing their graphs is pure cost.
+// The key only selects a slot; ggml_cuda_graph_update_required still compares every node, so outputs cannot change.
+// GGML_CUDA_GRAPH_SHAPE_KEY=0 restores the first-node key; GGML_CUDA_GRAPH_SHAPE_KEY_MAX (default 8) bounds the shape
+// slots kept per first node.
+static int64_t ggml_cuda_graph_key_rows(const ggml_tensor * t) {
+    return t->ne[1] * t->ne[2] * t->ne[3];
+}
+
+static const void * ggml_cuda_graph_get_key(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+    const void * base = cgraph->nodes[0];
+#ifdef USE_CUDA_GRAPH
+    static const bool    shape_key  = ggml_cuda_env_int("GGML_CUDA_GRAPH_SHAPE_KEY", 1) != 0;
+    static const int64_t max_rows   = ggml_cuda_env_int("GGML_CUDA_GRAPH_SHAPE_KEY_ROWS", 64);
+    static const int     max_shapes = std::max(1, ggml_cuda_env_int("GGML_CUDA_GRAPH_SHAPE_KEY_MAX", 8));
+
+    if (!shape_key || cgraph->n_nodes <= 0) {
+        return base;
+    }
+
+    const ggml_tensor * first = cgraph->nodes[0];
+    const ggml_tensor * last  = cgraph->nodes[cgraph->n_nodes - 1];
+    if (ggml_cuda_graph_key_rows(first) > max_rows || ggml_cuda_graph_key_rows(last) > max_rows) {
+        return base;
+    }
+
+    // FNV-1a over the signature, then the top bit set so a shape key never equals a first-node key (a user-space pointer)
+    uint64_t h = 1469598103934665603ULL;
+    auto mix = [&h](uint64_t v) {
+        h ^= v;
+        h *= 1099511628211ULL;
+    };
+    mix((uint64_t) cgraph->n_nodes);
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        mix((uint64_t) first->ne[i]);
+        mix((uint64_t) last->ne[i]);
+    }
+    mix((uint64_t) (uintptr_t) base);
+    const void * key = (const void *) (uintptr_t) (h | (1ULL << 63));
+
+    if (ggml_cuda_graph_debug_enabled() && cuda_ctx->cuda_graphs.find(key) == cuda_ctx->cuda_graphs.end()) {
+        GGML_LOG_DEBUG("%s: new shape key %p (base %p, n_nodes %d, first %s %s [%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64
+                       "], last %s [%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "])\n",
+                       __func__, key, base, cgraph->n_nodes, ggml_op_desc(first), first->name, first->ne[0], first->ne[1],
+                       first->ne[2], first->ne[3], ggml_op_desc(last), last->ne[0], last->ne[1], last->ne[2], last->ne[3]);
+    }
+    cuda_ctx->cuda_graph(key, base, max_shapes);
+    return key;
+#else
+    GGML_UNUSED(cuda_ctx);
+    return base;
+#endif // USE_CUDA_GRAPH
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     bool res = false;
 
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const void * graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (cgraph->uid != 0 &&
@@ -5459,7 +5513,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
-    graph_key = ggml_cuda_graph_get_key(cgraph);
+    graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
@@ -5716,7 +5770,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 
 #ifdef USE_CUDA_GRAPH
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const void * graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph);
     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 #else
     const bool use_cuda_graph = false;
