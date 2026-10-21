@@ -1489,6 +1489,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // LLAMA_MTP_HANDOFF_COPY=0: the verify rows are copied row by row, as before
+    const bool handoff_copy = common_mtp_handoff_on("COPY");
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1631,6 +1634,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        const int64_t t_tr0 = common_mtp_handoff_trace() && n_tokens >= 64 ? ggml_time_us() : 0;
+        int64_t t_tr_sync  = 0;
+        int64_t t_tr_build = 0;
+        int64_t t_tr_dft   = 0;
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
             batch.clear();
@@ -1642,6 +1650,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            if (t_tr0) {
+                t_tr_sync = ggml_time_us();
+            }
 
             for (int k = 0; k < n_tokens; ++k) {
                 const auto & t = batch_in.tokens[k];
@@ -1661,6 +1672,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
+
+            if (t_tr0) {
+                t_tr_build = ggml_time_us();
+            }
 
             bool ok = true;
             for (int head = 0; head < n_mtp_layers; ++head) {
@@ -1690,6 +1705,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (!ok) {
                 return false;
             }
+            if (t_tr0) {
+                t_tr_dft = ggml_time_us();
+            }
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1699,15 +1717,33 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
-            for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+            // the rows of one sequence are consecutive in the target's nextn buffer: one copy into a buffer that only grows (a
+            // prompt ubatch is n_rows*n_embd floats) instead of a zero-filled resize and a synchronizing lookup per row
+            const float * h_beg = handoff_copy ? llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id]) : nullptr;
+            const float * h_end = handoff_copy ? llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_end[seq_id]) : nullptr;
+            if (h_beg && h_end == h_beg + (size_t) (n_rows - 1) * n_embd) {
+                if (verify_h[seq_id].size() < (size_t) n_rows * n_embd) {
+                    verify_h[seq_id].resize((size_t) n_rows * n_embd);
+                }
+                std::memcpy(verify_h[seq_id].data(), h_beg, (size_t) n_rows * row_bytes);
+            } else {
+                verify_h[seq_id].resize((size_t) n_rows * n_embd);
+
+                for (int32_t i = 0; i < n_rows; ++i) {
+                    const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                    std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+                }
             }
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+        }
+
+        if (t_tr0 && t_tr_dft) {
+            const int64_t t_tr_end = ggml_time_us();
+            SPC_INF("mtp_trace process n=%d sync=%.2f build=%.2f dft_decode=%.2f verify_h=%.2f ms\n", n_tokens, (t_tr_sync - t_tr0)/1e3,
+                    (t_tr_build - t_tr_sync)/1e3, (t_tr_dft - t_tr_build)/1e3, (t_tr_end - t_tr_dft)/1e3);
         }
 
         return true;

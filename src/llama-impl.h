@@ -104,6 +104,11 @@ void replace_all(std::string & s, const std::string & search, const std::string 
 LLAMA_ATTRIBUTE_FORMAT(1, 2)
 std::string format(const char * fmt, ...);
 
+// MTP prompt handoff levers (see llama_batch_allocr, llama_kv_cache::set_input_kq_mask): LLAMA_MTP_HANDOFF_<lever>=0 turns one off,
+// LLAMA_MTP_HANDOFF=0 all of them; LLAMA_MTP_HANDOFF_TRACE=1 logs the host time of the prompt handoff steps
+bool llama_mtp_handoff_on(const char * lever);
+bool llama_mtp_handoff_trace();
+
 std::string llama_format_tensor_shape(const std::vector<int64_t> & ne);
 std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 

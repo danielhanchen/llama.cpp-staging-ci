@@ -155,7 +155,12 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(ubatch->embd_state && "this graph requires a state embedding, see llama_batch_ext_set_embd_state()");
     GGML_ASSERT(n_embd_state == h->ne[0]);
 
+    const int64_t t0 = llama_mtp_handoff_trace() && n_tokens >= 64 ? ggml_time_us() : 0;
     ggml_backend_tensor_set(h, ubatch->embd_state, 0, n_tokens*n_embd_state*ggml_element_size(h));
+    if (t0) {
+        LLAMA_LOG_INFO("mtp_trace h_set n=%lld %.1f MiB host=%d %.2f ms\n", (long long) n_tokens, n_tokens*n_embd_state*ggml_element_size(h)/1048576.0,
+                (int) ggml_backend_buffer_is_host(h->buffer), (ggml_time_us() - t0)/1e3);
+    }
 }
 
 bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {

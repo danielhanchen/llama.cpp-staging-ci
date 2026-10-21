@@ -2155,6 +2155,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_set_overlap(sched.get(), moe_cache->hybrid_active());
     }
 
+    const int64_t t_tr0 = llama_mtp_handoff_trace() && ubatch.n_tokens >= 64 ? ggml_time_us() : 0;
+    int64_t t_tr_graph = 0;
+    int64_t t_tr_set   = 0;
+
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -2245,6 +2249,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         moe_cache_devseed_graph = moe_cache_devseed;
     }
 
+    if (t_tr0) {
+        t_tr_graph = ggml_time_us();
+    }
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -2261,6 +2269,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+    if (t_tr0) {
+        t_tr_set = ggml_time_us();
+    }
 
     if (moe_cache) {
         moe_cache->prepare(ubatch.n_tokens);
@@ -2270,6 +2281,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (t_tr0) {
+        const int64_t t_tr_end = ggml_time_us();
+        LLAMA_LOG_INFO("mtp_trace ubatch ctx=%p n=%u state=%d graph=%.2f set_inputs=%.2f compute_launch=%.2f ms\n", (void *) this, ubatch.n_tokens,
+                ubatch.embd_state != nullptr, (t_tr_graph - t_tr0)/1e3, (t_tr_set - t_tr_graph)/1e3, (t_tr_end - t_tr_set)/1e3);
+    }
     // CPU misses trial: the ubatch is timed to its end, without the work of other contexts
     if (moe_cache && status == GGML_STATUS_SUCCESS && moe_cache->hybrid_tick_timed()) {
         ggml_backend_sched_synchronize(sched.get());
@@ -2596,6 +2612,21 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     const ple_decode_meter ple_meter(ple.stats ? &ple : nullptr, (int64_t) batch_inp.tokens.size());
 
+    struct handoff_trace {
+        const llama_context * ctx;
+        int64_t n;
+        int64_t t0;
+        int64_t t_init  = 0;
+        int64_t t_split = 0;
+        ~handoff_trace() {
+            if (t0) {
+                const int64_t t1 = ggml_time_us();
+                LLAMA_LOG_INFO("mtp_trace decode ctx=%p n=%" PRId64 " init=%.2f split=%.2f total=%.2f ms\n", (const void *) ctx, n,
+                        t_init ? (t_init - t0)/1e3 : 0.0, t_split && t_init ? (t_split - t_init)/1e3 : 0.0, (t1 - t0)/1e3);
+            }
+        }
+    } handoff_tr { this, (int64_t) batch_inp.tokens.size(), llama_mtp_handoff_trace() && batch_inp.tokens.size() >= 64 ? ggml_time_us() : 0 };
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2656,6 +2687,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (!balloc->init(batch_inp, vocab, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
+    }
+
+    if (handoff_tr.t0) {
+        handoff_tr.t_init = ggml_time_us();
     }
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
@@ -2760,6 +2795,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         break;
+    }
+
+    if (handoff_tr.t0) {
+        handoff_tr.t_split = ggml_time_us();
     }
 
     // reserve output buffer

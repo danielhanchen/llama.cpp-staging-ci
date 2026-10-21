@@ -3674,6 +3674,21 @@ bool common_replay_last_token(struct llama_context * ctx, llama_token last_token
     return true;
 }
 
+static bool common_env_flag(const char * name, bool def) {
+    const char * e = getenv(name);
+    return e == nullptr || *e == '\0' ? def : atoi(e) != 0;
+}
+
+bool common_mtp_handoff_on(const char * lever) {
+    static const bool all = common_env_flag("LLAMA_MTP_HANDOFF", true);
+    return all && common_env_flag(("LLAMA_MTP_HANDOFF_" + std::string(lever)).c_str(), true);
+}
+
+bool common_mtp_handoff_trace() {
+    static const bool on = common_env_flag("LLAMA_MTP_HANDOFF_TRACE", false);
+    return on;
+}
+
 common_batch::common_batch(llama_context * ctx) : batch(llama_batch_ext_init(ctx)) {
     const auto rope_type = llama_model_rope_type(llama_get_model(ctx));
     n_pos = rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE ? GGML_MROPE_SECTIONS : 1;
@@ -3889,6 +3904,11 @@ void common_prompt_checkpoint::update_pos(
     this->pos_max  = pos_max;
 }
 
+static bool ckpt_no_zero_fill() {
+    static const bool on = common_mtp_handoff_on("CKPT");
+    return on;
+}
+
 void common_prompt_checkpoint::update_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
@@ -3900,6 +3920,9 @@ void common_prompt_checkpoint::update_tgt(
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
     data_tgt.resize(ckpt_size);
+    if (!ckpt_no_zero_fill()) {
+        std::fill(data_tgt.begin(), data_tgt.end(), 0); // LLAMA_MTP_HANDOFF_CKPT=0: zero-filled as before
+    }
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
@@ -3918,6 +3941,9 @@ void common_prompt_checkpoint::update_dft(
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
     data_dft.resize(ckpt_size);
+    if (!ckpt_no_zero_fill()) {
+        std::fill(data_dft.begin(), data_dft.end(), 0); // LLAMA_MTP_HANDOFF_CKPT=0: zero-filled as before
+    }
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {

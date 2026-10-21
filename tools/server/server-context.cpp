@@ -2714,11 +2714,19 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        const int64_t t_tr0 = common_mtp_handoff_trace() ? ggml_time_us() : 0;
+
         // the next llama_decode() is queued while the state is still being copied: the copy is complete when it returns
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ASYNC);
+        const int64_t t_tr1 = t_tr0 ? ggml_time_us() : 0;
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+
+        if (t_tr0) {
+            SLT_INF(slot, "mtp_trace ckpt tgt=%.1f MiB %.2f ms, dft=%.1f MiB + spec %.2f ms\n", cur.data_tgt.size()/1048576.0, (t_tr1 - t_tr0)/1e3,
+                    cur.data_dft.size()/1048576.0, (ggml_time_us() - t_tr1)/1e3);
+        }
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -2739,7 +2747,8 @@ private:
         return true;
     }
 
-    static bool ckpt_read_buf(std::ifstream & ifs, std::vector<uint8_t> & buf, size_t n_avail, size_t & n_read) {
+    template <typename Buf>
+    static bool ckpt_read_buf(std::ifstream & ifs, Buf & buf, size_t n_avail, size_t & n_read) {
         uint64_t n = 0;
         // check the size against the bytes left in the file before allocating, the size field may be corrupted
         if (!ckpt_read(ifs, &n, sizeof(n), n_read) || n > n_avail - n_read) {
@@ -2754,7 +2763,8 @@ private:
         n_written += size;
     }
 
-    static void ckpt_write_buf(std::ofstream & ofs, const std::vector<uint8_t> & buf, size_t & n_written) {
+    template <typename Buf>
+    static void ckpt_write_buf(std::ofstream & ofs, const Buf & buf, size_t & n_written) {
         const uint64_t n = buf.size();
         ckpt_write(ofs, &n, sizeof(n), n_written);
         if (n > 0) {
