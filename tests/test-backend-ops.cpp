@@ -13316,6 +13316,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // GATED_DELTA_NET prefill at Qwen3.5 dense (16 / 16 heads), Qwen3.6-35B (16 q/k, 32 v) and Flash-Next (16 q/k, 48 v) shapes,
+    // head size 128: ubatches of 512, the 1756 / 2000 / 2047-token tails of a 2048 ubatch split, and 2048
+    for (int v_repeat : { 1, 2, 3 }) {
+        for (int64_t n_tok : { 64, 512, 1756, 2047, 2048 }) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tok, 1, v_repeat));
+        }
+    }
+
     // CONCAT of the GDN conv state with transpose(x) at Qwen3.5 / Qwen3.6 prefill shapes (channels 6144 / 8192 / 12288)
     for (int64_t ch : { 6144, 8192, 12288 }) {
         for (int64_t n_tok : { 512, 2048 }) {
