@@ -203,7 +203,10 @@ int main(int argc, char ** argv) {
         const std::string path = std::string(argc > 1 ? argv[1] : ".") + "/gdn_tiled_exact_" + std::to_string(mode) + ".bin";
         set_env("GGML_CUDA_GDN_TILED", mode ? "1" : "0");
         set_env("GGML_CUDA_GDN_TILED_LOG", "1");
-        const std::string cmd = "\"" + std::string(argv[0]) + "\" --child " + std::to_string(mode) + " \"" + path + "\"";
+        std::string cmd = "\"" + std::string(argv[0]) + "\" --child " + std::to_string(mode) + " \"" + path + "\"";
+#ifdef _WIN32
+        cmd = "\"" + cmd + "\""; // cmd.exe /c strips the outer pair of quotes of a line with more than two
+#endif
         const int rc = std::system(cmd.c_str());
         if (rc != 0 || !read_dump(path, outs[mode], n_logs[mode], sh.size())) {
             fprintf(stderr, "FAIL: child mode %d rc %d\n", mode, rc);
