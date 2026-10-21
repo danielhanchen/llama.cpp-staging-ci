@@ -6133,6 +6133,99 @@ static void * ggml_cuda_host_map(int device, void * buffer, size_t size, bool * 
     return dev_ptr;
 }
 
+// maps the pages of [ptr, ptr + size) (a part of a host buffer, e.g. the expert tensors of a memory-mapped model file) read-only into
+// the device address space: the pages at either end that a mapping of this module already holds are skipped (cudaHostRegister refuses
+// any overlap, and neighbouring tensors share their boundary pages), so [ptr, ptr + size) may span up to three mappings. Returns ptr
+// as the device pointer (only where the device reads registered memory at its host address, else nullptr) and in *base the key of the
+// mapping that holds the reference to release with ggml_backend_cuda_host_unmap (*registered); nullptr if any part could not be mapped
+static void * ggml_cuda_host_map_range(int device, void * ptr, size_t size, void ** base, bool * registered) {
+    *registered = false;
+    *base       = nullptr;
+    if (ptr == nullptr || size == 0) {
+        return nullptr;
+    }
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    // not validated there: the whole buffers are mapped or nothing
+    GGML_UNUSED(device);
+    return nullptr;
+#else
+    int can_host_ptr = 0;
+    if (cudaDeviceGetAttribute(&can_host_ptr, cudaDevAttrCanUseHostPointerForRegisteredMem, device) != cudaSuccess || !can_host_ptr) {
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+#endif
+    const uintptr_t page = 4096;
+    uintptr_t b = (uintptr_t) ptr & ~(page - 1);
+    uintptr_t e = ((uintptr_t) ptr + size + page - 1) & ~(page - 1);
+
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_mappings_mutex());
+    auto & mappings = ggml_cuda_host_mappings();
+    ggml_cuda_set_device(device);
+    // clip the ends to the mappings already there; a mapping strictly inside the range is not supported
+    for (int pass = 0; pass < 2; ++pass) {
+        for (auto & [mb, m] : mappings) {
+            const uintptr_t lo = (uintptr_t) mb;
+            const uintptr_t hi = lo + m.size;
+            if (b >= lo && e <= hi) {
+                // already mapped whole: one more reference on that mapping
+                m.refs++;
+                *base       = mb;
+                *registered = true;
+                return ptr;
+            }
+            if (b >= lo && b < hi) {
+                b = (hi + page - 1) & ~(page - 1);
+            }
+            if (e > lo && e <= hi) {
+                e = lo & ~(page - 1);
+            }
+        }
+    }
+    for (const auto & [mb, m] : mappings) {
+        const uintptr_t lo = (uintptr_t) mb;
+        if (lo >= b && lo < e) {
+            return nullptr;
+        }
+    }
+    if (b >= e) {
+        return nullptr; // only boundary pages, held by two other mappings: no reference to take
+    }
+    void * pb = (void *) b;
+    const size_t len = e - b;
+    const unsigned int flags = cudaHostRegisterPortable | cudaHostRegisterMapped;
+    bool read_only_ok = false;
+#if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
+    read_only_ok = cudaHostRegister(pb, len, flags | cudaHostRegisterReadOnly) == cudaSuccess;
+    if (!read_only_ok) {
+        (void)cudaGetLastError();
+    }
+#endif
+    if (!read_only_ok && cudaHostRegister(pb, len, flags) != cudaSuccess) {
+        (void)cudaGetLastError();
+        GGML_LOG_WARN("%s: failed to map %.2f MiB of host memory\n", __func__, len/1024.0/1024.0);
+        return nullptr;
+    }
+    ggml_cuda_host_mapping & m = mappings[pb];
+    m = {};
+    m.size = len;
+    m.dev_ptr[device] = pb;
+    m.refs = 1;
+    *base       = pb;
+    *registered = true;
+    return ptr;
+}
+
+// bytes of host memory registered by ggml_backend_cuda_host_map and ggml_backend_cuda_host_map_range (all devices)
+static size_t ggml_backend_cuda_host_mapped_bytes(void) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_mappings_mutex());
+    size_t n = 0;
+    for (const auto & [mb, m] : ggml_cuda_host_mappings()) {
+        n += m.size;
+    }
+    return n;
+}
+
 // releases a reference taken by ggml_backend_cuda_host_map, the memory is unregistered with the last one
 static void ggml_backend_cuda_host_unmap(void * buffer) {
     std::lock_guard<std::mutex> lock(ggml_cuda_host_mappings_mutex());
@@ -6174,6 +6267,11 @@ struct ggml_backend_cuda_device_context {
 static void * ggml_backend_cuda_host_map(ggml_backend_dev_t dev, void * buffer, size_t size, bool * registered) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
     return ggml_cuda_host_map(ctx->device, buffer, size, registered);
+}
+
+static void * ggml_backend_cuda_host_map_range(ggml_backend_dev_t dev, void * ptr, size_t size, void ** base, bool * registered) {
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
+    return ggml_cuda_host_map_range(ctx->device, ptr, size, base, registered);
 }
 
 static const char * ggml_backend_cuda_device_get_name(ggml_backend_dev_t dev) {
@@ -7215,6 +7313,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_host_map") == 0) {
         return (void *)ggml_backend_cuda_host_map;
+    }
+    if (strcmp(name, "ggml_backend_host_map_range") == 0) {
+        return (void *)ggml_backend_cuda_host_map_range;
+    }
+    if (strcmp(name, "ggml_backend_host_mapped_bytes") == 0) {
+        return (void *)ggml_backend_cuda_host_mapped_bytes;
     }
     if (strcmp(name, "ggml_backend_host_unmap") == 0) {
         return (void *)ggml_backend_cuda_host_unmap;

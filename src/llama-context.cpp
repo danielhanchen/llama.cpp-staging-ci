@@ -2131,9 +2131,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     // hybrid MoE cache: the fetch share is measured with the threads of the small batches, before their first graph is built
-    if (moe_cache && moe_cache->hybrid_probe_pending() && ubatch.n_tokens <= llama_moe_cache::n_small_max && backend_cpu != nullptr) {
+    // (CPU misses: at the first ubatch of any size, with the decode threads, so that the first prompt can use the host path)
+    if (moe_cache && moe_cache->hybrid_probe_pending() && (ubatch.n_tokens <= llama_moe_cache::n_small_max || moe_cache->cpu_miss_enabled()) &&
+            backend_cpu != nullptr) {
         ggml_backend_sched_synchronize(sched.get());
-        set_compute_threads(ubatch.n_tokens > 1);
+        set_compute_threads(moe_cache->cpu_miss_enabled() ? false : ubatch.n_tokens > 1);
         moe_cache->hybrid_probe(backend_cpu);
         ggml_backend_sched_set_overlap(sched.get(), moe_cache->hybrid_active());
     }
@@ -2146,7 +2148,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
     // auto mode: the first small batches alternate between the plain cache and the hybrid path, then the faster one is kept
     if (moe_cache && moe_cache->hybrid_window_pending()) {
-        ggml_backend_sched_synchronize(sched.get());
+        if (moe_cache->hybrid_tick_sync()) {
+            ggml_backend_sched_synchronize(sched.get());
+        }
         moe_cache->hybrid_tick(ubatch.n_tokens);
         ggml_backend_sched_set_overlap(sched.get(), moe_cache->hybrid_active());
     }
@@ -2266,6 +2270,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    // CPU misses trial: the ubatch is timed to its end, without the work of other contexts
+    if (moe_cache && status == GGML_STATUS_SUCCESS && moe_cache->hybrid_tick_timed()) {
+        ggml_backend_sched_synchronize(sched.get());
+        moe_cache->hybrid_tick_end();
+    }
     if (moe_cache && moe_cache_devseed_on && moe_cache_devseed) {
         // a failed graph may have run only some of its seed plans and fills: the groups it seeds are cleared
         moe_cache->devseed_end(res->get_gf(), status == GGML_STATUS_SUCCESS);
@@ -2812,7 +2821,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         // the MoE cache only serves batches of up to 32 tokens, the end of a prompt seeds it for the generation that follows
         if (moe_cache) {
-            const bool large      = ubatch.n_tokens > llama_moe_cache::n_small_max;
+            // CPU misses: the rule decides per batch size from the miss rate of the device lookups (see llama_moe_cache::cpu_miss_tick),
+            // before anything of this ubatch depends on the decision
+            if (moe_cache->cpu_miss_tick_sync(ubatch.n_tokens)) {
+                ggml_backend_sched_synchronize(sched.get());
+            }
+            const bool was = moe_cache->hybrid_active();
+            moe_cache->cpu_miss_tick(ubatch.n_tokens);
+            if (moe_cache->hybrid_active() != was) {
+                ggml_backend_sched_set_overlap(sched.get(), moe_cache->hybrid_active());
+            }
+            const bool large      = !moe_cache->small_batch(ubatch.n_tokens);
             const bool last_large = large && n_tokens_all - n_tokens_prev - ubatch.n_tokens <= llama_moe_cache::n_small_max;
             moe_cache_seed_begin(ubatch, last_large, n_outputs);
             if (large) {
@@ -4854,7 +4873,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 }
 
 void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_large, int64_t n_outputs_ub) {
-    const bool large = ubatch.n_tokens > llama_moe_cache::n_small_max;
+    const bool large = !moe_cache->small_batch(ubatch.n_tokens);
     if (!moe_cache_seed_enabled) {
         return;
     }

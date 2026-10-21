@@ -76,6 +76,15 @@ public:
     // tokens uses it now
     bool overlap(int64_t n_ubatch) const;
 
+    // CPU misses [LLAMA_MOE_CPU_MISS]: the rule reads the device counters before the graph of some ubatches (synchronize the backends
+    // first when cpu_miss_tick_sync), the tick goes before the graph of every ubatch
+    bool cpu_miss_enabled() const; // LLAMA_MOE_CPU_MISS is on for this cache (until a failed calibration turns it off)
+    bool cpu_miss_tick_sync(int64_t n_tokens) const;
+    void cpu_miss_tick(int64_t n_tokens);
+    // the ubatch of n_tokens is looked up on the device like a small batch: at most n_small_max tokens, or a short prompt whose missing
+    // experts the host computes (the large batch path, its copies and its seed do not apply)
+    bool small_batch(int64_t n_tokens) const;
+
     // true if the graphs of small batches may use the hybrid path
     bool hybrid_active() const;
     // graph key: 0 = plain lookups, 1 = lookups that keep the use counters, 2 = hybrid, + 4 with the fetch overlap
@@ -97,6 +106,11 @@ public:
     // auto mode: before the graph of each ubatch while the trial runs, after the previous ubatch finished (backends synchronized);
     // switches between the plain and the hybrid path, then keeps the faster one (see hybrid_active)
     bool hybrid_window_pending() const;
+    // the next tick times the ubatches (synchronize the backends before it); CPU misses: only while a trial runs or is about to start
+    bool hybrid_tick_sync() const;
+    // CPU misses trial: the ubatch after the tick is timed; synchronize after its graph is computed, then hybrid_tick_end
+    bool hybrid_tick_timed() const;
+    void hybrid_tick_end();
 
     // fetch overlap rule (default) or auto (LLAMA_MOE_CACHE_FETCH_OVERLAP=3): true while a window or trial runs or waits; the tick goes before the graph of
     // every ubatch then, after the previous ubatch finished when overlap_tick_sync() (the backends are synchronized)
