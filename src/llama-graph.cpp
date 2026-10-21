@@ -1711,6 +1711,37 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     return res;
 }
 
+ggml_tensor * llm_graph_context::build_draft_head(
+    const llama_model & model,
+          ggml_tensor * w,
+          ggml_tensor * cur,
+          ggml_tensor * w_s) const {
+    const auto & dh = model.draft_head;
+    if (dh.w == nullptr || dh.src != w) {
+        return build_lora_mm(w, cur, w_s);
+    }
+    cur = build_hadamard_input(w, cur);
+    ggml_tensor * res = ggml_mul_mat(ctx0, dh.w, cur); // [n_sub, n_outputs]
+    if (prec_policy) {
+        prec_policy->apply(res);
+    }
+    if (dh.w->type == GGML_TYPE_NVFP4) {
+        ggml_prec_set_acc(res, GGML_PREC_BF16);
+    }
+    if (w_s) {
+        res = ggml_mul(ctx0, res, w_s); // a single scale (per-row scales keep the full head, see load_tensors_draft_head)
+    }
+    cb(res, "mtp_draft_head_logits", -1);
+    const int64_t n_sub     = res->ne[0];
+    const int64_t n_outputs = res->ne[1];
+    const int64_t n_vocab   = w->ne[1];
+    ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_outputs), -INFINITY);
+    full = ggml_set_rows(ctx0, full,
+            ggml_reshape_3d(ctx0, res,    1,     n_sub, n_outputs),
+            ggml_reshape_3d(ctx0, dh.d2t, n_sub, 1,     1));
+    return ggml_reshape_2d(ctx0, full, n_vocab, n_outputs);
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b

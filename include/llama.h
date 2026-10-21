@@ -640,6 +640,11 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_embd_inp   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
+
+    // k9-draft: the restricted-vocabulary MTP draft head (LLAMA_MTP_DRAFT_VOCAB) gets rows for these tokens if it lacks them
+    // (up to LLAMA_MTP_DRAFT_VOCAB_CTX of them, oldest replaced first). Returns the number of rows written; 0 without the head.
+    // Call between decodes of the contexts of this model.
+    LLAMA_API int32_t llama_model_draft_head_add(const struct llama_model * model, const llama_token * tokens, int32_t n_tokens);
     LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
