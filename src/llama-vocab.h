@@ -163,6 +163,10 @@ struct llama_vocab {
     int find_bpe_rank(const std::string & token_left, const std::string & token_right) const;
     std::vector<std::string> get_bpe_merges() const;
 
+    // up to n token ids, most frequent first, for a restricted draft vocabulary: every control / user-defined token, then the
+    // byte-level tokens, then the BPE tokens by merge rank (SPM: by score; other vocabularies: by id)
+    std::vector<llama_token> draft_vocab(int32_t n) const;
+
     std::vector<char> get_precompiled_charsmap() const;
 
     int32_t tokenize(

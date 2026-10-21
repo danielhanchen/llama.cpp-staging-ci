@@ -1139,6 +1139,14 @@ struct llm_graph_context {
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr) const;
 
+    // the LM head of an MTP draft step: build_lora_mm(w, cur, w_s), or, when the model has a restricted draft head for w
+    // (llama_model::draft_head), the projection onto its rows scattered back to the full vocabulary (-inf elsewhere)
+    ggml_tensor * build_draft_head(
+        const struct llama_model & model,
+              ggml_tensor * w,
+              ggml_tensor * cur,
+              ggml_tensor * w_s = nullptr) const;
+
     // do mat_mul_id, while optionally apply lora and per-expert scale
     // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)
     // or, with slots_host, slots selects the experts of w instead of ids (-1 skips the slot, the scales still use ids)

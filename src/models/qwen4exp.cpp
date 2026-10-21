@@ -617,7 +617,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_draft_head(model, model.output, cur, model.output_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }

@@ -4370,6 +4370,64 @@ std::vector<std::string> llama_vocab::get_bpe_merges() const {
     return result;
 }
 
+std::vector<llama_token> llama_vocab::draft_vocab(int32_t n) const {
+    const int32_t n_vocab = (int32_t) pimpl->id_to_token.size();
+    std::vector<llama_token> out;
+    if (n <= 0) {
+        return out;
+    }
+    out.resize(n_vocab);
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        out[i] = i;
+    }
+    if (n >= n_vocab) {
+        return out;
+    }
+    // (group, key), lower first. Group 0: control and user-defined tokens (chat template, end of generation, think tags): the
+    // target samples them at every turn, and there are few. Group 1: ranked tokens. Group 2: the rest. Group 3: unused.
+    std::vector<std::pair<int, double>> key(n_vocab, { 2, 0.0 });
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        const auto attr = pimpl->id_to_token[i].attr;
+        if (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) {
+            key[i] = { 0, (double) i };
+        } else if (attr & LLAMA_TOKEN_ATTR_UNUSED) {
+            key[i] = { 3, (double) i };
+        } else {
+            key[i] = { 2, (double) i };
+        }
+    }
+    if (pimpl->type == LLAMA_VOCAB_TYPE_BPE && !pimpl->bpe_ranks.empty()) {
+        // a BPE token exists because a merge made it, and the earlier merges were the more frequent pairs of the training corpus
+        for (const auto & [pair, rank] : pimpl->bpe_ranks) {
+            const auto it = pimpl->token_to_id.find(pair.first + pair.second);
+            if (it == pimpl->token_to_id.end() || it->second < 0 || it->second >= n_vocab) {
+                continue;
+            }
+            auto & k = key[it->second];
+            if (k.first == 2 || (k.first == 1 && (double) rank < k.second)) {
+                k = { 1, (double) rank };
+            }
+        }
+        // a normal token no merge makes is a symbol of the byte-level alphabet: before every merge
+        for (int32_t i = 0; i < n_vocab; ++i) {
+            if (key[i].first == 2 && pimpl->id_to_token[i].text.size() <= 4) {
+                key[i] = { 1, -1.0 };
+            }
+        }
+    } else if (pimpl->type == LLAMA_VOCAB_TYPE_SPM || pimpl->type == LLAMA_VOCAB_TYPE_UGM) {
+        // the score is the token's log-probability in the unigram model
+        for (int32_t i = 0; i < n_vocab; ++i) {
+            if (key[i].first == 2) {
+                key[i] = { 1, -(double) pimpl->id_to_token[i].score };
+            }
+        }
+    }
+    std::stable_sort(out.begin(), out.end(), [&](llama_token a, llama_token b) { return key[a] < key[b]; });
+    out.resize(n);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
 std::vector<char> llama_vocab::get_precompiled_charsmap() const {
     return pimpl->precompiled_charsmap;
 }
