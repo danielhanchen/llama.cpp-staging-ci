@@ -758,6 +758,9 @@ struct llama_moe_cache::impl {
     bool    cm      = false;
     bool    cm_dbg  = false;  // LLAMA_MOE_CPU_MISS_LOG=1: every rule window
     bool    cm_force = false; // LLAMA_MOE_CPU_MISS=2: on for every batch size, no rule
+    // k10: with LLAMA_MOE_CACHE_HYBRID unset, a cache that holds at most hybrid_max_frac of the host experts keeps k9's default hybrid gate
+    // (deterministic share) instead of the CPU-miss rule [LLAMA_MOE_CPU_MISS_GATE=0: the rule there too]
+    bool    cm_gate  = false;
     size_t  cm_n_prompt = 0;  // batches above max_batch served by the host path
     size_t  cm_n_small  = 0;  // batches of at most max_batch tokens with the host path on
     bool    cm_cal  = false;  // calibrated
@@ -913,6 +916,10 @@ struct llama_moe_cache::impl {
                     cm_split_scale = std::max(0.0, atof(env_s));
                 }
             }
+            // k10: k9's default gate (below) keeps its own domain, a cache of at most hybrid_max_frac of the host experts (decided once the
+            // slots are sized): G4, Qwen3.8-Flash-Next UD-IQ1_S at 8 GB (2.2% cached), the rule kept batch size 1 off in some launches and
+            // fetched every miss, decode 65.7 -> 49.6 tok/s against the gate's fixed share
+            cm_gate = cm && !cm_force && mode < 0 && (getenv("LLAMA_MOE_CPU_MISS_GATE") == nullptr || atoi(getenv("LLAMA_MOE_CPU_MISS_GATE")) != 0);
             if (cm) {
                 // no fixed share and no reset: the host computes misses only where the rule turns it on
                 hybrid_probe = true;
@@ -1197,6 +1204,19 @@ struct llama_moe_cache::impl {
             }
             cache_frac    = host > 0.0 ? std::min(1.0, cached/host) : 1.0;
             host_uncached = std::max(0.0, host - cached);
+        }
+        if (hybrid && cm && cm_gate && cache_frac <= hybrid_max_frac) {
+            // the cache holds a small share of the experts: k9's default hybrid gate, deterministic share from the decode threads
+            cm           = false;
+            hybrid_probe = false;
+            hybrid_auto  = false;
+            hybrid_det   = true;
+            hybrid_fixed = true;
+            hybrid_gate  = true;
+            if (!model.hparams.no_alloc) {
+                LLAMA_LOG_INFO("%s: MoE cache: CPU misses off at %.1f%% of the host experts cached: the default hybrid gate computes the misses "
+                    "(LLAMA_MOE_CPU_MISS_GATE=0 keeps the CPU-miss rule)\n", __func__, 100.0*cache_frac);
+            }
         }
         if (hybrid && hybrid_gate && cache_frac > hybrid_max_frac) {
             // a large cache misses few experts: the host path then costs more (graph splits, slower warm-up) than the copies it saves
