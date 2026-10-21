@@ -13193,6 +13193,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Keep the WebGPU dispatch below 65535 workgroups (32 per token for this shape).
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2047, 2, 3));
 
+    // token-tiled kernel window (16+ tokens the chunked kernel does not take): H = 16 / 32 / 48 value heads, head size 128,
+    // q / k heads 16 (the models' layout, MMA-eligible from 64 tokens on NVIDIA) and != 16 (never MMA), 1 and 2 sequences
+    for (int64_t nt : {16, 64, 512, 2047}) {
+        for (int64_t ns : {1, 2}) {
+            for (int vr : {1, 2, 3}) {
+                test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, ns, vr));
+            }
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8, 128, nt, ns, 2));
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, nt, ns, 1));
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 24, 128, nt, ns, 2));
+        }
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 24, 128, nt, 2, 2, false, false, /*K=*/4));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 2, 3, true));
+    }
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 64, 512, 2, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 64, 100, 1, 2, false, false, /*K=*/4));
+
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
     // exact-match cases (K == n_seq_tokens):
