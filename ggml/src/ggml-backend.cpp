@@ -1121,6 +1121,7 @@ struct ggml_backend_sched {
     // the next allocations fail without allocating if a device compute buffer would grow too much (ggml_backend_sched_set_alloc_limit)
     bool   alloc_limit_on;
     size_t alloc_limit;
+    bool   alloc_lend_graph; // k11: growth past the free memory may be lent (ggml_backend_sched_set_alloc_lend_graph)
     size_t alloc_over; // growth the last refused allocation needed, 0 if it was not refused
     int  pre_split; // split whose first pre_nodes nodes were launched before the CPU split preceding it, -1 if none
     int  pre_nodes;
@@ -4749,6 +4750,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     ggml_backend_sched_split_graph(sched, graph);
 
     sched->alloc_over = 0;
+    size_t lend_need[GGML_SCHED_MAX_BACKENDS] = { 0 };
     if (sched->alloc_limit_on) {
         // the planned compute buffers of the graph (the current ones and their allocation are kept): refused, nothing allocated and the
         // prefetch kept, if a device buffer would grow by more than the limit or leave less than the prefetch headroom (512 MiB at least)
@@ -4774,6 +4776,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
         const size_t headroom = sched->callback_lend != NULL ? lend_free : std::max<size_t>(sched->pf_headroom, (size_t) 512 << 20);
         size_t over = 0;
         for (int b = 0; b < sched->n_backends; b++) {
+            lend_need[b] = 0;
             ggml_backend_dev_t dev = sched->backends[b]->device;
             if (dev == NULL || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
                 continue;
@@ -4788,6 +4791,10 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
             ggml_backend_dev_memory(dev, &free, &total);
             const size_t allow = std::min(sched->alloc_limit, free > headroom ? free - headroom : 0);
             if (grow > allow) {
+                if (sched->alloc_lend_graph && sched->callback_lend != NULL) {
+                    lend_need[b] = grow; // decided after the lender placed the graph (below)
+                    continue;
+                }
                 over = std::max(over, grow);
             }
         }
@@ -4800,6 +4807,23 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     ggml_backend_sched_prefetch_bind(sched, /*dry =*/ false);
+
+    // k11: a growth past the free memory that the lender did not take is refused as by the limit (the caller splits the graph)
+    {
+        size_t over = 0;
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (lend_need[b] > 0 && !sched->pf[b].lent_all) {
+                over = std::max(over, lend_need[b]);
+            }
+        }
+        if (over > 0) {
+            // as a failed allocation below: the caller resets the scheduler, which binds the copies again for the next graph
+            sched->alloc_over = over;
+            sched->next_copy  = sched->cur_copy;
+            sched->cur_copy   = cur_copy_prev;
+            return false;
+        }
+    }
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         // retry without the staging memory
@@ -4895,6 +4919,13 @@ void ggml_backend_sched_set_alloc_limit(ggml_backend_sched_t sched, bool enable,
     GGML_ASSERT(sched);
     sched->alloc_limit_on = enable;
     sched->alloc_limit    = max_grow;
+    if (!enable) {
+        sched->alloc_lend_graph = false;
+    }
+}
+
+void ggml_backend_sched_set_alloc_lend_graph(ggml_backend_sched_t sched, bool enable) {
+    sched->alloc_lend_graph = enable;
 }
 
 size_t ggml_backend_sched_get_alloc_over(ggml_backend_sched_t sched) {

@@ -420,6 +420,8 @@ static size_t llama_moe_cache_set_bytes(const llama_model & model, llama_moe_cac
 
 struct llama_moe_cache::impl {
     llama_weight_store * wstore = nullptr;
+    // k11: the graph allocation of the graph allocated next may be lent too (a merged layer-major group, see llama_moe_cache::set_graph_lend)
+    bool graph_lend_scope = false;
     std::vector<llama_weight_store::region> ws_regions;
 
     // RAM tier (see llama_moe_host_cache): experts of the groups streamed from the model files, behind the device slots
@@ -3971,7 +3973,8 @@ struct llama_moe_cache::impl {
         // the lent buffer as a compute buffer only in the splits that read copies placed there (a lookup reads the banks in a split of its own),
         // and the copies keep away from the slots the lookup may read past (see place); the graph allocator in lent memory (LEND=2) is live in
         // every split, it is not lent to such a graph
-        if (host_read && lend_mode == 2) {
+        const bool lend_graph_now = lend_mode == 2 || graph_lend_scope;
+        if (host_read && lend_graph_now) {
             return;
         }
         group & g = *gl;
@@ -3988,7 +3991,7 @@ struct llama_moe_cache::impl {
             n_graph++;
         }
         const size_t graph_all = n_graph > 0 ? copies[0].size : 0; // bytes of the whole graph allocation
-        if (lend_mode != 2 && n_graph > 0) {
+        if (!lend_graph_now && n_graph > 0) {
             only.assign(copies + n_graph, copies + n_copies);
             copies   = only.data();
             n_copies = (int) only.size();
@@ -5559,6 +5562,19 @@ bool llama_moe_cache::lends() const {
 
 bool llama_moe_cache::lends_on(ggml_backend_t backend) const {
     return pimpl->lends_on(backend);
+}
+
+void llama_moe_cache::set_graph_lend(bool on) {
+    pimpl->graph_lend_scope = on;
+}
+
+bool llama_moe_cache::lends_on_any() const {
+    for (const auto & d : pimpl->devices) {
+        if (d.buf && pimpl->lend_mode != 0 && d.lend_auto == 1) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool llama_moe_cache::lends_graph() const {

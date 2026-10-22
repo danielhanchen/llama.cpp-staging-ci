@@ -3821,7 +3821,19 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
         lm_merged_active = true;
         ggml_backend_sched_set_alloc_limit(sched.get(), true, lm_grow_max);
+        // k11 (LLAMA_MOE_LM_LEND=0 off): a merged graph whose compute buffers would grow past the free memory borrows its allocation from the
+        // MoE cache (slots lent for the group and refilled after it, as its staging copies are) instead of being split; the merged graph
+        // runs the same ubatches, only where its tensors live changes
+        static const bool lm_lend = getenv("LLAMA_MOE_LM_LEND") == nullptr || atoi(getenv("LLAMA_MOE_LM_LEND")) != 0;
+        const bool lend_g = lm_lend && moe_cache->lends_on_any();
+        if (lend_g) {
+            moe_cache->set_graph_lend(true);
+            ggml_backend_sched_set_alloc_lend_graph(sched.get(), true);
+        }
         ggml_status st = run(g);
+        if (lend_g) {
+            moe_cache->set_graph_lend(false);
+        }
         ggml_backend_sched_set_alloc_limit(sched.get(), false, 0);
         lm_merged_active = false;
         if (st != GGML_STATUS_ALLOC_FAILED) {

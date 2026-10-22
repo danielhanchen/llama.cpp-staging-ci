@@ -457,6 +457,10 @@ extern "C" {
     // returns the growth the graph needed (0 after an allocation that was not refused)
     GGML_API void                 ggml_backend_sched_set_alloc_limit(ggml_backend_sched_t sched, bool enable, size_t max_grow);
     GGML_API size_t               ggml_backend_sched_get_alloc_over(ggml_backend_sched_t sched);
+    // k11: with the allocation limit on, a device compute buffer that would grow past the free memory may instead be placed in memory the
+    // lender lends (the graph allocation entries of ggml_backend_sched_lend_copy); the graph is refused (as by the limit) only if the
+    // lender does not take it
+    GGML_API void                 ggml_backend_sched_set_alloc_lend_graph(ggml_backend_sched_t sched, bool enable);
 
     // Set a callback that places prefetched copies in memory lent by the user instead of the staging arena
     GGML_API void                 ggml_backend_sched_set_lend_callback(ggml_backend_sched_t sched, ggml_backend_sched_lend_callback callback, void * user_data);

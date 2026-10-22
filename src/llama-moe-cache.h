@@ -146,6 +146,11 @@ public:
 
     // the cache may lend slots (LLAMA_MOE_CACHE_LEND)
     bool lends() const;
+    // k11 (LLAMA_MOE_LM_LEND): while on, the cache also lends its slots to the graph allocation of the graphs allocated (a merged layer-major
+    // group whose compute buffers would grow past the free memory), not only to their staging copies
+    void set_graph_lend(bool on);
+    // the cache lends slots on some device (decided by the first large graph)
+    bool lends_on_any() const;
     // the cache lends slots on the device of backend (decided by the first large graph, see lend): the staging arena is not allocated there
     bool lends_on(ggml_backend_t backend) const;
     bool lends_graph() const; // the graph allocator may borrow too (LLAMA_MOE_CACHE_LEND=2)
