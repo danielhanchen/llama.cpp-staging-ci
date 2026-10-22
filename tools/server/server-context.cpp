@@ -367,10 +367,11 @@ struct server_slot {
             return false;
         }
 
-        // k11 (LLAMA_PROMPT_SAVE_ASYNC=0 turns it off): the device copies are queued in stream order before the next decode, the host
+        // k11 (LLAMA_PROMPT_SAVE_ASYNC=1, opt-in: on G4 it took 5 ms off the chat TTFT but the copies then delay the prompt's first
+        // ubatch, Qwen3.6 MTP 32 GB pp -35% chat .. -3% 2k with md5 unchanged): the device copies are queued in stream order before the next decode, the host
         // copy into the cache entry runs on the context's state worker; the cache waits for it before it reads, erases or evicts
         // the entry (server_prompt_cache::wait_inflight). Larger states than LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB (512) are saved as before.
-        static const bool async_on = getenv("LLAMA_PROMPT_SAVE_ASYNC") == nullptr || atoi(getenv("LLAMA_PROMPT_SAVE_ASYNC")) != 0;
+        static const bool async_on = getenv("LLAMA_PROMPT_SAVE_ASYNC") != nullptr && atoi(getenv("LLAMA_PROMPT_SAVE_ASYNC")) != 0;
         static const size_t async_max = (size_t) (getenv("LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB") ? std::max(0, atoi(getenv("LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB"))) : 512) << 20;
         const llama_state_seq_flags fl = async_on && cur_size <= async_max ? LLAMA_STATE_SEQ_FLAGS_ASYNC : LLAMA_STATE_SEQ_FLAGS_NONE;
 
