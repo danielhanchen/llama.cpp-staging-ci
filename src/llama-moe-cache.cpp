@@ -174,6 +174,37 @@ struct moe_cache_lru {
         int32_t slot;
     };
 
+    // k11 VRAM ahead (see impl::va_issue): slots a plan must not evict while guard_on (their experts are read by the split in flight or
+    // written by the copy queue of the device), and plans that leave the decay scores alone (no_score); both off = the plan as before
+    std::vector<uint32_t> guard;
+    uint32_t guard_gen = 0;
+    bool guard_on = false;
+    bool no_score = false;
+    void guard_reset() {
+        if (guard.size() != (size_t) n_slots) {
+            guard.assign(n_slots, 0);
+        }
+        if (++guard_gen == 0) {
+            std::fill(guard.begin(), guard.end(), 0);
+            guard_gen = 1;
+        }
+        guard_on = true;
+    }
+    void guard_row(int32_t il) {
+        const int32_t * r = il >= 0 && (size_t) il < slot_map.size() ? slot_map[il] : nullptr;
+        if (r == nullptr) {
+            return;
+        }
+        for (int32_t e = 0; e < n_expert; ++e) {
+            if (r[e] >= 0) {
+                guard[r[e]] = guard_gen;
+            }
+        }
+    }
+    bool guarded(int32_t s) const {
+        return guard_on && guard[s] == guard_gen;
+    }
+
     // give a slot to each expert selected by ids in layer il, the misses evict the least recently used experts
     // returns false if the ids select more distinct experts than there are slots
     // evicted: the slots whose expert the misses replace and that expert's key (il*n_expert + e), if not nullptr
@@ -205,7 +236,7 @@ struct moe_cache_lru {
 
         int32_t * slots = slot_map[il];
 
-        if (grow_q16 > 0) {
+        if (grow_q16 > 0 && !no_score) {
             if (il == first_layer) {
                 w = (int32_t) (((int64_t) w*grow_q16) >> 16);
                 if (w >= w_max) {
@@ -243,11 +274,14 @@ struct moe_cache_lru {
             cand.clear();
             int64_t pos = 0;
             for (int32_t s = head; s >= 0; s = next[s], ++pos) {
-                if (pinned[s] == seen_gen) {
+                if (pinned[s] == seen_gen || guarded(s)) {
                     continue;
                 }
                 const int64_t v = key_of[s] >= 0 ? scores[key_of[s]] : -1;
                 cand.push_back({ (v + 1) << 32 | pos, s }); // v + 1 >= 0 and pos < 2^31
+            }
+            if (guard_on && cand.size() < n_miss) {
+                return false;
             }
             GGML_ASSERT(cand.size() >= n_miss);
             std::nth_element(cand.begin(), cand.begin() + (n_miss - 1), cand.end());
@@ -277,7 +311,13 @@ struct moe_cache_lru {
             if (slots[e] >= 0) {
                 continue;
             }
-            const int32_t s = head;
+            int32_t s = head;
+            while (guard_on && s >= 0 && guard[s] == guard_gen) {
+                s = next[s];
+            }
+            if (s < 0) {
+                return false;
+            }
             if (key_of[s] >= 0) {
                 slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
                 if (evicted != nullptr) {
@@ -1529,6 +1569,7 @@ struct llama_moe_cache::impl {
     // like the experts a split keeps on the device (an empty cache uploads every expert of a large batch); most routed first where
     // a prompt recorded the routing (a late prefill, see seed_unavailable), else the lowest ids
     void prefill() {
+        va_sync_all();
         size_t n_fill  = 0;
         size_t n_bytes = 0;
         std::vector<int32_t> fill_ids;
@@ -1581,6 +1622,7 @@ struct llama_moe_cache::impl {
     ~impl() {
         // the weight store is destroyed first (llama_context): its destructor completes the reads ahead into the RAM slots, which are
         // still allocated then; wstore is not used here
+        va_free();
         log_stats();
         for (const auto & [unmap, buf] : mapped) {
             unmap(buf);
@@ -2513,6 +2555,214 @@ struct llama_moe_cache::impl {
         fill_regions.clear();
     }
 
+    // k11 VRAM ahead [LLAMA_MOE_VRAM_AHEAD=N, default 1, 0 = off]: a ubatch whose experts go through the copy callback (more tokens than
+    // the device lookup serves, fewer than the prefetch threshold, e.g. a short chat prompt) uploads the missing routed experts of a layer
+    // on the compute stream once its router has run, serialized with the kernels. With at least LLAMA_MOE_VRAM_AHEAD_COVER (2.0) x n_expert
+    // routed rows nearly every expert of a layer is used, so the callback of layer il also uploads every expert of the next N layers of
+    // its group that the cache does not hold, on a copy queue of the device (a second backend instance), before the kernels of il are
+    // queued; at the callback of such a layer the compute stream waits for its upload (event), and its own plan then finds the experts
+    // cached. Same experts in the slots the slot map names, same kernels: the output is exact. The slots of the layer in flight and of the
+    // layers with an upload pending are kept from eviction (moe_cache_lru::guard); anything else that changes the slots first waits for
+    // every pending upload (va_sync_all). Needs room for N + 2 whole layers in the group; a RAM tier or weight store layer is skipped.
+    int32_t va_depth = [] {
+        const char * env = getenv("LLAMA_MOE_VRAM_AHEAD");
+        return env == nullptr ? 1 : std::max(0, atoi(env));
+    }();
+    double va_cover = [] {
+        const char * env = getenv("LLAMA_MOE_VRAM_AHEAD_COVER");
+        return env == nullptr ? 2.0 : atof(env);
+    }();
+    std::vector<ggml_backend_t> va_backend;     // per device
+    std::vector<ggml_backend_event_t> va_event; // per layer
+    std::vector<int8_t> va_pending;             // per layer
+    std::vector<int32_t> va_all;
+    std::vector<moe_cache_lru::fill> va_fills;
+    std::vector<ggml_backend_copy_region> va_regions;
+    bool   va_any    = false;
+    bool   va_failed = false;
+    size_t va_n_layers = 0, va_n_experts = 0, va_bytes = 0, va_n_waits = 0, va_n_cap = 0, va_n_sync = 0;
+
+    ggml_backend_t va_queue(int32_t id) {
+        if (va_backend.size() < devices.size()) {
+            va_backend.resize(devices.size(), nullptr);
+        }
+        if (va_backend[id] == nullptr && !va_failed) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(devices[id].backend);
+            va_backend[id] = dev != nullptr ? ggml_backend_dev_init(dev, nullptr) : nullptr;
+            if (va_backend[id] == nullptr) {
+                va_failed = true;
+                LLAMA_LOG_WARN("%s: no copy queue for the VRAM ahead uploads of the MoE cache, off\n", __func__);
+            }
+        }
+        return va_failed ? nullptr : va_backend[id];
+    }
+
+    void va_guard(group & g, int32_t il_cur) {
+        g.lru.guard_reset();
+        if (il_cur >= 0) {
+            g.lru.guard_row(il_cur);
+        }
+        for (int32_t jl : g.layers) {
+            if ((size_t) jl < va_pending.size() && va_pending[jl]) {
+                g.lru.guard_row(jl);
+            }
+        }
+    }
+
+    // every pending upload complete (the host waits), before anything else changes the slots or their maps
+    void va_sync_all() {
+        if (!va_any) {
+            return;
+        }
+        for (ggml_backend_t b : va_backend) {
+            if (b != nullptr) {
+                ggml_backend_synchronize(b);
+            }
+        }
+        std::fill(va_pending.begin(), va_pending.end(), 0);
+        for (group & g : groups) {
+            g.lru.guard_on = false;
+        }
+        va_any = false;
+        va_n_sync++;
+    }
+
+    // at the callback of layer il: the compute stream waits for its upload; an upload pending for an earlier layer of the group (its
+    // callback did not come) is waited for by the host
+    void va_wait(ggml_backend_t backend, int32_t il) {
+        if (!va_any) {
+            return;
+        }
+        const group & g = groups[layers[il].ig];
+        for (int32_t jl : g.layers) {
+            if (jl < il && va_pending[jl]) {
+                va_sync_all();
+                return;
+            }
+        }
+        if (va_pending[il]) {
+            ggml_backend_event_wait(backend, va_event[il]);
+            va_pending[il] = 0;
+            va_n_waits++;
+            va_any = std::find(va_pending.begin(), va_pending.end(), (int8_t) 1) != va_pending.end();
+        }
+    }
+
+    void va_issue(int32_t il, size_t n_ids) {
+        if (va_depth <= 0 || va_failed) {
+            return;
+        }
+        const layer & l = layers[il];
+        group & g = groups[l.ig];
+        const int32_t n_expert = g.lru.n_expert;
+        if ((double) n_ids < va_cover*n_expert || g.host_read || g.devseed || host_layer(il)) {
+            return;
+        }
+        if (wstore != nullptr) {
+            for (const ggml_tensor * w : l.experts) {
+                if (wstore->covers(w)) {
+                    return;
+                }
+            }
+        }
+        const auto it = std::find(g.layers.begin(), g.layers.end(), il);
+        if (it == g.layers.end()) {
+            return;
+        }
+        if (va_pending.size() < layers.size()) {
+            va_pending.assign(layers.size(), 0);
+            va_event.assign(layers.size(), nullptr);
+        }
+        int64_t n_pend = 0;
+        for (int32_t jl : g.layers) {
+            n_pend += va_pending[jl];
+        }
+        const size_t pos = it - g.layers.begin();
+        ggml_backend_t q = nullptr;
+        for (int32_t k = 1; k <= va_depth && pos + k < g.layers.size(); ++k) {
+            const int32_t jl = g.layers[pos + k];
+            if (va_pending[jl]) {
+                continue;
+            }
+            if (host_layer(jl)) {
+                break;
+            }
+            // room: the layer in flight, the pending ones and this one, a whole layer each
+            if ((int64_t) (2 + n_pend)*n_expert > (int64_t) g.n_slots - g.lru.n_lent) {
+                va_n_cap++;
+                break;
+            }
+            if (q == nullptr && (q = va_queue(g.id)) == nullptr) {
+                return;
+            }
+            va_guard(g, il);
+            va_all.resize(n_expert);
+            for (int32_t e = 0; e < n_expert; ++e) {
+                va_all[e] = e;
+            }
+            size_t n_hit = 0;
+            g.lru.no_score = true;
+            const bool ok = g.lru.plan(jl, va_all.data(), va_all.size(), va_fills, n_hit, nullptr);
+            g.lru.no_score = false;
+            g.lru.guard_on = false;
+            if (!ok) {
+                break;
+            }
+            if (va_fills.empty()) {
+                continue;
+            }
+            const layer & lj = layers[jl];
+            va_regions.clear();
+            size_t bytes = 0;
+            for (size_t ip = 0; ip < lj.experts.size(); ++ip) {
+                const ggml_tensor * w = lj.experts[ip];
+                ggml_tensor * bank = g.banks[ip];
+                const size_t nb = w->nb[2];
+                for (size_t i = 0; i < va_fills.size();) {
+                    size_t n = 1;
+                    while (i + n < va_fills.size() && va_fills[i + n].expert == va_fills[i].expert + (int32_t) n && va_fills[i + n].slot == va_fills[i].slot + (int32_t) n) {
+                        n++;
+                    }
+                    va_regions.push_back({ w, va_fills[i].expert*nb, bank, va_fills[i].slot*nb, n*nb });
+                    bytes += n*nb;
+                    i += n;
+                }
+            }
+            if (!ggml_backend_tensor_copy_regions_async(q, va_regions.data(), va_regions.size())) {
+                for (const auto & r : va_regions) {
+                    ggml_backend_tensor_set_async(q, r.dst, (const uint8_t *) r.src->data + r.src_offset, r.dst_offset, r.size);
+                }
+            }
+            if (va_event[jl] == nullptr) {
+                va_event[jl] = ggml_backend_event_new(ggml_backend_get_device(q));
+                GGML_ASSERT(va_event[jl] != nullptr);
+            }
+            ggml_backend_event_record(va_event[jl], q);
+            va_pending[jl] = 1;
+            va_any = true;
+            n_pend++;
+            va_n_layers++;
+            va_n_experts += va_fills.size();
+            va_bytes += bytes;
+        }
+    }
+
+    void va_free() {
+        va_sync_all();
+        for (ggml_backend_event_t & ev : va_event) {
+            if (ev != nullptr) {
+                ggml_backend_event_free(ev);
+                ev = nullptr;
+            }
+        }
+        for (ggml_backend_t & b : va_backend) {
+            if (b != nullptr) {
+                ggml_backend_free(b);
+                b = nullptr;
+            }
+        }
+    }
+
     size_t upload_fills(ggml_backend_t backend, int32_t il, const std::vector<moe_cache_lru::fill> & fl, const std::vector<std::pair<int32_t, int32_t>> * ev) {
         const layer & l = layers[il];
         group & g = groups[l.ig];
@@ -2957,6 +3207,7 @@ struct llama_moe_cache::impl {
         if (!hybrid || !hybrid_fixed) {
             return;
         }
+        va_sync_all();
         seed_counts.clear();
         for (group & g : groups) {
             if (g.n_slots == 0 || !g.dev_lookup || g.counts == nullptr || g.counts->data == nullptr) {
@@ -3871,6 +4122,7 @@ struct llama_moe_cache::impl {
     }
 
     void download(group & g) {
+        va_sync_all();
         ggml_backend_synchronize(devices[g.id].backend);
 
         std::vector<int32_t> buf(2*(size_t) g.n_slots);
@@ -3922,6 +4174,7 @@ struct llama_moe_cache::impl {
     // the scheduler places the prefetched copies of a large batch: they go to the last slots of the largest group of the device, which
     // are evicted while lent, so the device does not keep a staging arena that only large batches use; n_copies = 0 takes the slots back
     void lend(ggml_backend_t backend, ggml_backend_sched_lend_copy * copies, int n_copies, int depth, bool dry, int64_t n_tokens) {
+        va_sync_all();
         const auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return d.backend == backend; });
         if (it_dev == devices.end() || !it_dev->buf) {
             return;
@@ -4206,6 +4459,7 @@ struct llama_moe_cache::impl {
     // the end of the expert in the slot before (e.g. CUDA MMQ in the padding of the last row) and the copies left arbitrary bytes there
     // the experts that a seed could not admit while slots were lent are then uploaded from host memory (LLAMA_MOE_CACHE_REFILL=0 to disable)
     void unlend(group & g) {
+        va_sync_all();
         ggml_backend_t backend = devices[g.id].backend;
         ggml_backend_synchronize(backend);
         seed_end(g);
@@ -4631,8 +4885,15 @@ struct llama_moe_cache::impl {
             }
         }
 
+        // k11 VRAM ahead: this layer's upload, if any, before its kernels; the pending ones keep their slots
+        va_wait(backend, il);
+        if (va_any) {
+            va_guard(g, -1);
+        }
         size_t n_hit = 0;
-        if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit, tiered && host->exclusive() ? &evicted_tmp : nullptr)) {
+        const bool planned = g.lru.plan(il, ids.data(), ids.size(), fills, n_hit, tiered && host->exclusive() ? &evicted_tmp : nullptr);
+        g.lru.guard_on = false;
+        if (!planned) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
 
@@ -4646,6 +4907,9 @@ struct llama_moe_cache::impl {
 
         // the next copy synchronizes the backend before it changes the slot map again
         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+
+        // k11 VRAM ahead: the next layers' experts on the copy queue while this layer computes
+        va_issue(il, ids.size());
 
         return true;
     }
@@ -4684,6 +4948,7 @@ struct llama_moe_cache::impl {
 
     // every slot of the group empty (host and device), as after a failed graph that seeded it in part
     void devseed_clear(group & g) {
+        va_sync_all();
         ggml_backend_synchronize(devices[g.id].backend);
         seed_end(g);
         for (int32_t il : g.layers) {
@@ -4897,6 +5162,7 @@ struct llama_moe_cache::impl {
     }
 
     void seed(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * dst, const std::vector<int32_t> & counts, const std::vector<bool> & staged) {
+        va_sync_all();
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
             return;
@@ -5091,6 +5357,7 @@ struct llama_moe_cache::impl {
     }
 
     void seed_end() {
+        va_sync_all();
         for (group & g : groups) {
             seed_end(g);
         }
@@ -5241,6 +5508,10 @@ struct llama_moe_cache::impl {
         }
         if (seed_skipped > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu prompt ends not seeded (the seeding graph does not fit in the compute buffer)\n", tag, seed_skipped);
+        }
+        if (va_n_layers > 0 || va_n_cap > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: VRAM ahead: %zu layer uploads on the copy queue (%zu experts, %.2f MiB), %zu waited for at their layer, %zu host waits, %zu skipped for room\n",
+                tag, va_n_layers, va_n_experts, va_bytes/1024.0/1024.0, va_n_waits, va_n_sync, va_n_cap);
         }
         if (n_lends > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu graphs used lent slots (at most %d slots lent), %zu experts refilled after them, %.2f MiB (%zu batched fill calls)\n", tag, n_lends, lend_max, stats_refill.misses, stats_refill.bytes/1024.0/1024.0, n_fill_batches);
