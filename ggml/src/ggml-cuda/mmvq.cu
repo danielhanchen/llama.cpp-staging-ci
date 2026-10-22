@@ -663,9 +663,14 @@ static __global__ void mul_mat_vec_q(
     // let the next kernel launch while this one runs, its ggml_cuda_pdl_sync() still waits for the completion
     ggml_cuda_pdl_lc();
     ggml_cuda_pdl_sync();
+    sample_dst = blockIdx.z;
+    // k11-decode: a single column MUL_MAT_ID launch over several tokens (batch invariant verify) takes the tokens as samples:
+    // token z reads the experts of its ids row (one sample, z = 0: as before)
+    if (ncols_dst == 1 && ids) {
+        ids += sample_dst*ids_stride;
+    }
     channel_x  = shared_expert ? 0 : ncols_dst == 1 && ids ? ids[channel_dst] : fastdiv(channel_dst, channel_ratio);
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
-    sample_dst = blockIdx.z;
 
     // the selected expert is uniform in the block, so the whole block leaves on a skipped slot
     if (!shared_expert && ncols_dst == 1 && ids && ids[channel_dst] == -1) {
@@ -1292,6 +1297,20 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, false);
         };
+        // k11-decode: MUL_MAT_ID without a shared expert or biases: one launch of the single token kernel, the tokens as samples (grid z),
+        // so every block computes what it computes in the token's own launch (GGML_CUDA_MMVQ_EXACT_IDS_MERGE=0: one launch per token)
+        static const bool ids_merge = [] {
+            const char * e = getenv("GGML_CUDA_MMVQ_EXACT_IDS_MERGE");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        if (ids != nullptr && ids_merge && fusion.shared_up == nullptr && fusion.x_bias == nullptr && fusion.gate_bias == nullptr &&
+                nsamples_x == 1 && nsamples_dst == 1) {
+            mul_mat_vec_q_switch_ncols_dst<type>(
+                vx, vy, ids, fusion, dst, ncols_x, nrows_x, 1, stride_row_x, stride_col_y, stride_col_dst,
+                nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                1, ncols_dst, stride_sample_x, stride_col_y, stride_col_dst, ids_stride, stream, false);
+            return;
+        }
         if (ids != nullptr) {
             // MUL_MAT_ID: the single token kernel per token (the experts differ per token, there is little to share), fusion
             // included: the shared expert of the fused path is written per token too

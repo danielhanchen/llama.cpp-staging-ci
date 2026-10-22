@@ -50,6 +50,7 @@
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
+#include "ggml-cuda/shortconv-fused.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
@@ -4260,6 +4261,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // k11-decode: LFM2 short-conv window (b * x into the conv window) and conv * c, small batches (GGML_CUDA_SHORTCONV_FUSE=0: off)
+    if (node->op == GGML_OP_MUL) {
+        if (const int n = ggml_cuda_try_fuse_shortconv_window(*cuda_ctx, cgraph, i)) {
+            return n;
+        }
+    } else if (node->op == GGML_OP_SSM_CONV) {
+        if (const int n = ggml_cuda_try_fuse_shortconv_conv_mul(*cuda_ctx, cgraph, i)) {
+            return n;
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
