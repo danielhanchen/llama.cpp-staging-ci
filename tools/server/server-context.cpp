@@ -4315,9 +4315,19 @@ private:
                             // k9-prompt-pass: n_batch raised for layer-major prompts at an explicit -ub (common_moe_cache_auto_ubatch): the
                             // offsets are clamped to the n_batch given, so the prompt splits into the same batches and ubatches as before
                             const int n_batch_clamp = !lm && params_base.n_batch_ckpt > 0 ? std::min<int>(n_batch, params_base.n_batch_ckpt) : n_batch;
+                            // k11: LLAMA_SERVER_CKPT_SINGLE_MAX=N (opt-in, default 0 = off): a prompt whose part still to process when its
+                            // batch starts is at most N tokens (and fits one ubatch) runs in one pass, without the separate pass of its last 4
+                            // tokens; its checkpoint is then made at the end of the prompt, so a next prompt that differs in those last tokens
+                            // is processed again from the previous checkpoint. Other ubatch shapes, so other numerics (KLD-gated, not md5-equal)
+                            static const int ckpt_single_max = getenv("LLAMA_SERVER_CKPT_SINGLE_MAX") ? atoi(getenv("LLAMA_SERVER_CKPT_SINGLE_MAX")) : 0;
+                            const int n_rest_batch = slot.task->n_tokens() - (slot.prompt.n_tokens() - (int) (batch.size() - n_tokens_prev));
+                            const bool ckpt_single = ckpt_single_max > 0 && n_rest_batch <= std::min<int>(ckpt_single_max, n_ubatch);
                             bool should_break = false;
                             for (int k = 0; k < 2; ++k) {
                                 const int offset = checkpoint_offsets[k];
+                                if (offset == 4 && ckpt_single) {
+                                    continue;
+                                }
                                 const int n_last = std::min(n_batch_clamp, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     // k11: under layer-major prompts the batch goes on past the far checkpoint, its ubatches end there
