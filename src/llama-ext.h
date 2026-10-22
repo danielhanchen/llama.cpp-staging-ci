@@ -121,6 +121,10 @@ LLAMA_API void llama_set_verify_exact(struct llama_context * ctx, bool value);
 // token is tens of MiB), -1 unknown
 LLAMA_API int32_t llama_arch_rollback_state(const char * arch_name);
 
+// k11-decode: every layer weight of the context's model is in device memory and no MoE cache runs: the placement where batch
+// invariant verify gives the bytes of single token decodes
+LLAMA_API bool llama_verify_exact_placement(const struct llama_context * ctx);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).

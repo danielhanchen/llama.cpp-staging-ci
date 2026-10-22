@@ -79,6 +79,7 @@ struct llama_context {
     void synchronize_outputs();
 
     const llama_model   & get_model()   const;
+    bool moe_cache_active() const { return moe_cache != nullptr; } // k11-decode
     const llama_cparams & get_cparams() const;
 
     ggml_backend_sched_t get_sched() const;

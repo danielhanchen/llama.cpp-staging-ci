@@ -6929,6 +6929,20 @@ void llama_set_verify_exact(llama_context * ctx, bool value) {
     ctx->set_verify_exact(value);
 }
 
+bool llama_verify_exact_placement(const llama_context * ctx) {
+    // a MoE cache computes misses on the host or reads them per batch, and host weights run CPU kernels whose batch path is not the
+    // single token path: verify rows there do not give the bytes of single token decodes (G4, LFM2.5 8 GB: other text)
+    if (ctx == nullptr || ctx->moe_cache_active()) {
+        return false;
+    }
+    for (const auto & [name, t] : ctx->get_model().tensors_by_name) {
+        if (t != nullptr && t->buffer != nullptr && name.rfind("blk.", 0) == 0 && ggml_backend_buffer_is_host(t->buffer)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 int32_t llama_arch_rollback_state(const char * arch_name) {
     if (arch_name == nullptr) {
         return -1;

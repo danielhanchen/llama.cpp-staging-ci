@@ -36,14 +36,23 @@ struct common_spec_cost_policy {
     static constexpr int    SKIP    = 2;      // the first rounds of a size build its graph and capture it: not its cost
 
     double margin = 0.03;
+    bool   gain_gate = true;   // LLAMA_SPEC_POLICY_GAIN=0: off
 
     std::array<double, MAX_T + 1> cost{}, cost_n{}, last{};
     std::array<int, MAX_T + 1>    seen{};
+    // realized gain of drafted rounds by window size: tokens committed per ms of the round (with its switch back) over a plain round's
+    // tokens per ms, an EMA; a size whose drafts lose (gain < 1 over GAIN_N rounds) is not drafted until it is stale and re-probed
+    static constexpr double GAIN_ALPHA = 0.25;
+    static constexpr int    GAIN_N     = 4;
+    std::array<double, MAX_T + 1> gain{}, gain_n{};
     double rounds = 0.0;
 
     common_spec_cost_policy() {
         if (const char * e = getenv("LLAMA_SPEC_POLICY_MARGIN")) {
             margin = atof(e);
+        }
+        if (const char * e = getenv("LLAMA_SPEC_POLICY_GAIN")) {
+            gain_gate = atoi(e) != 0;
         }
     }
 
@@ -89,6 +98,22 @@ struct common_spec_cost_policy {
         last[t]    = rounds;
     }
 
+    // a drafted round of window t committed `tokens` in ms (its switch back included)
+    void observe_gain(int t, int tokens, double ms) {
+        t = std::clamp(t, 1, MAX_T);
+        if (!(ms > 0.0) || cost_n[1] <= 0) {
+            return;
+        }
+        const double g = (tokens/ms)/(1.0/cost_ms(1));
+        gain[t]    = gain_n[t] > 0 ? (1.0 - GAIN_ALPHA)*gain[t] + GAIN_ALPHA*g : g;
+        gain_n[t] += 1.0;
+    }
+
+    bool losing(int t) const {
+        t = std::clamp(t, 1, MAX_T);
+        return gain_gate && gain_n[t] >= GAIN_N && gain[t] < 1.0 && !stale(t);
+    }
+
     // expected tokens per ms of a window of k drafts at per-token acceptance q
     double rate(int k, double q) const {
         double e = 1.0, qi = 1.0;
@@ -110,6 +135,9 @@ struct common_spec_cost_policy {
         int    best_k = 0;
         double best   = 0.0;
         for (int k : { k_short, k_full }) {
+            if (losing(k + 1)) {
+                continue;
+            }
             const double r = rate(k, q);
             if (r > best) {
                 best   = r;
@@ -125,6 +153,9 @@ struct common_spec_cost_policy {
         // a size not measured enough (q >= P_PROBE) or not measured for a while (q >= P_STALE) is tried: verification keeps the output,
         // only this round's speed is at stake
         for (int k : { k_full, k_short }) {
+            if (losing(k + 1)) {
+                continue;
+            }
             if ((cost_n[k + 1] < PROBES && q >= P_PROBE) || (stale(k + 1) && q >= P_STALE)) {
                 return k;
             }
@@ -140,12 +171,16 @@ struct common_spec_round_timer {
     int     w_last    = 1;   // the window of that round
     int     w_pend    = 0;   // a drafted round waiting for the next one (0: none)
     double  ms_pend   = 0.0;
+    int     acc_last  = 0;   // drafted tokens accepted in the last verified round (set by accept())
+    int     acc_pend  = 0;
 
     void reset() {
         t_last_us = 0;
         w_last    = 1;
         w_pend    = 0;
         ms_pend   = 0.0;
+        acc_last  = 0;
+        acc_pend  = 0;
     }
 
     // called at a draft() call (now_us), before the choice of this round's window (then set with next())
@@ -155,12 +190,15 @@ struct common_spec_round_timer {
             if (w_last > 1) {
                 if (w_pend > 0) {
                     pol.observe(w_pend, ms_pend);
+                    pol.observe_gain(w_pend, acc_pend + 1, ms_pend);
                 }
-                w_pend  = w_last;
-                ms_pend = ms;
+                w_pend   = w_last;
+                ms_pend  = ms;
+                acc_pend = acc_last;
             } else if (w_pend > 0) {
                 const double extra = pol.cost_n[1] > 0 ? std::max(0.0, ms - pol.cost_ms(1)) : 0.0;
                 pol.observe(w_pend, ms_pend + extra);
+                pol.observe_gain(w_pend, acc_pend + 1, ms_pend + extra);
                 w_pend = 0;
             } else {
                 pol.observe(1, ms);

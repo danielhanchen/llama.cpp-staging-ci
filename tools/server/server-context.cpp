@@ -1510,9 +1510,16 @@ private:
 
         if (spec) {
             SRV_TRC("%s", "speculative decoding context initialized\n");
-            // k11-decode: the default drafts are verified batch invariant, so greedy output stays that of plain decoding
+            // k11-decode: the default drafts are verified batch invariant, so greedy output stays that of plain decoding; where the
+            // placement cannot give single token bytes (host experts, a MoE cache) they stay off (LLAMA_SPEC_AUTO_EXACT=0 keeps them)
             if (params_base.speculative.ngram_suffix.auto_mode && server_spec_auto_exact()) {
-                llama_set_verify_exact(ctx_tgt, true);
+                if (llama_verify_exact_placement(ctx_tgt)) {
+                    llama_set_verify_exact(ctx_tgt, true);
+                } else {
+                    SRV_INF("%s", "n-gram drafting by default stays off: host weights or a MoE cache, where verify rows are not computed as single "
+                        "token decodes (LLAMA_SPEC_AUTO_EXACT=0 drafts there, with other greedy text)\n");
+                    spec.reset();
+                }
             }
         } else {
             spec_init.reset();

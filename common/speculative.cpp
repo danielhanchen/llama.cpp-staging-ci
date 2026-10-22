@@ -2413,10 +2413,11 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
                     si.n_matches, si.n_drafts, si.n_drafted, si.n_accepted, si.n_yield, rate(si, 0), rate(si, 1), rate(si, 2), rate(si, 3));
         }
         if (policy_on && si.n_lookups > 0) {
-            SPC_INF("ngram-suffix seq %d: round ms by window 1 / %d / %d: %.2f (%.0f) / %.2f (%.0f) / %.2f (%.0f), %" PRId64 " probes\n", seq_id,
-                    params.n_max_short + 1, params.n_max + 1, policy.cost_ms(1), policy.cost_n[1], policy.cost_ms(params.n_max_short + 1),
-                    policy.cost_n[std::min(params.n_max_short + 1, common_spec_cost_policy::MAX_T)], policy.cost_ms(params.n_max + 1),
-                    policy.cost_n[std::min(params.n_max + 1, common_spec_cost_policy::MAX_T)], si.n_probe);
+            const int ts = std::min(params.n_max_short + 1, common_spec_cost_policy::MAX_T);
+            const int tl = std::min(params.n_max + 1, common_spec_cost_policy::MAX_T);
+            SPC_INF("ngram-suffix seq %d: round ms by window 1 / %d / %d: %.2f (%.0f) / %.2f (%.0f) / %.2f (%.0f), realized gain %.2f (%.0f) / %.2f (%.0f), %"
+                    PRId64 " probes\n", seq_id, ts, tl, policy.cost_ms(1), policy.cost_n[1], policy.cost_ms(ts), policy.cost_n[ts], policy.cost_ms(tl),
+                    policy.cost_n[tl], policy.gain[ts], policy.gain_n[ts], policy.gain[tl], policy.gain_n[tl], si.n_probe);
         }
         si.n_lookups = si.n_matches = si.n_drafts = si.n_drafted = si.n_accepted = si.n_yield = 0;
         si.n_probe = 0;
@@ -2504,6 +2505,7 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
             si.ok[b]  = DECAY*si.ok[b] + a;
             si.bad[b] = DECAY*si.bad[b] + (a < si.k_last ? 1.0 : 0.0);
             si.n_accepted += a;
+            si.timer.acc_last = a;
         }
         si.k_last = 0;
     }
