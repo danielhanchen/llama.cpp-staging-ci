@@ -4325,12 +4325,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    if (node->op == GGML_OP_CPY) {
-        if (const int n = ggml_cuda_try_fuse_cpy_batch(*cuda_ctx, cgraph, i)) {
-            return n;
-        }
-    }
-
     if (node->op == GGML_OP_MUL_MAT_ID) {
         if (const int n = ggml_cuda_try_fuse_moe_cache_glu(cuda_ctx, cgraph, i)) {
             return n;
