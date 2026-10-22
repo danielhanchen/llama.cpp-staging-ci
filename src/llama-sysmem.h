@@ -12,6 +12,7 @@
 #include <fstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #if defined(__linux__)
 #include <sched.h>
@@ -213,6 +214,64 @@ inline uint32_t cgroup_cpus(const std::string & proc_cgroup, const std::string &
             path = p == 0 || p == std::string::npos ? "/" : path.substr(0, p);
         }
     }
+    return res;
+}
+
+// one logical CPU per physical core this process may run on (the lowest allowed SMT sibling of each core, Linux sysfs topology), at most
+// the cgroup CPU quota and n_max of them; empty where the topology or the affinity mask cannot be read
+inline std::vector<int> physical_cpus(int n_max) {
+    std::vector<int> res;
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) != 0) {
+        return res;
+    }
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &set)) {
+            continue;
+        }
+        std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings_list");
+        std::string list;
+        if (!std::getline(f, list) || list.empty()) {
+            return {};
+        }
+        // "0,24" or "0-1": the first allowed sibling of the core keeps it
+        int first = -1;
+        size_t p = 0;
+        while (p < list.size() && first < 0) {
+            const size_t e = list.find_first_of(",", p);
+            const std::string tok = list.substr(p, e == std::string::npos ? std::string::npos : e - p);
+            const size_t d = tok.find('-');
+            int a = -1;
+            int b = -1;
+            try {
+                a = std::stoi(tok.substr(0, d));
+                b = d == std::string::npos ? a : std::stoi(tok.substr(d + 1));
+            } catch (...) {
+                return {};
+            }
+            for (int c = a; c <= b && first < 0; ++c) {
+                if (c >= 0 && c < CPU_SETSIZE && CPU_ISSET(c, &set)) {
+                    first = c;
+                }
+            }
+            p = e == std::string::npos ? list.size() : e + 1;
+        }
+        if (first == cpu) {
+            res.push_back(cpu);
+        }
+    }
+    const uint32_t q = cgroup_cpus("/proc/self/cgroup", "/sys/fs/cgroup");
+    size_t n = res.size();
+    if (q > 0) {
+        n = std::min<size_t>(n, q);
+    }
+    n = std::min<size_t>(n, (size_t) std::max(0, n_max));
+    res.resize(n);
+#else
+    (void) n_max;
+#endif
     return res;
 }
 

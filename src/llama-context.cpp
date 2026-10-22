@@ -874,7 +874,9 @@ llama_context::~llama_context() {
                 set_threadpool_fn(backend_cpu, nullptr);
             }
         }
-        threadpool_host_free(threadpool_host);
+        if (threadpool_host_free != nullptr) {
+            threadpool_host_free(threadpool_host);
+        }
         threadpool_host = nullptr;
     }
 
@@ -4630,8 +4632,26 @@ void llama_context::vram_watch_sample(bool force) {
     }
 }
 
+// LLAMA_MOE_HOST_PIN=1 (opt-in, k11; the dedicated pool of ggml-org/llama.cpp#30971): the host-miss ubatches run on an own ggml
+// threadpool, one worker per physical core (the first allowed SMT sibling, at most 32 and the cgroup quota), each pinned to its CPU
+// (strict_cpu), polling LLAMA_MOE_HOST_POLL (default 50) before it sleeps; GGML_CPU_PIN_CALLER=1 also pins the calling thread to
+// worker 0's CPU. Only builds without OpenMP use the pool's CPU masks (GGML_OPENMP=OFF); with OpenMP the team ignores them.
+static const std::vector<int> & host_pin_cpus() {
+    static const std::vector<int> cpus = [] {
+        const char * e = getenv("LLAMA_MOE_HOST_PIN");
+        return e != nullptr && atoi(e) != 0 ? llama_sysmem::physical_cpus(32) : std::vector<int>();
+    }();
+    return cpus;
+}
+
 int32_t llama_context::host_threads_init() const {
     const char * env = getenv("LLAMA_MOE_HOST_THREADS");
+    const std::vector<int> & pin = host_pin_cpus();
+    if (!pin.empty()) {
+        // the pinned pool: its own threads even at the decode thread count (=N caps it)
+        const int32_t n = env != nullptr && atoi(env) > 0 ? std::min<int32_t>(atoi(env), (int32_t) pin.size()) : (int32_t) pin.size();
+        return n;
+    }
     if (env != nullptr && strcmp(env, "auto") == 0) {
         // every usable logical CPU (affinity, cgroup quota), only when that is more than the decode threads
         const int32_t n = (int32_t) llama_sysmem::usable_cpus();
@@ -4667,8 +4687,39 @@ void llama_context::set_compute_threads(bool batched) {
                 if (new_fn != nullptr && free_fn != nullptr) {
                     ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads_host);
                     tpp.paused = true;
-                    threadpool_host      = new_fn(&tpp);
-                    threadpool_host_free = free_fn;
+                    const std::vector<int> & pin = host_pin_cpus();
+                    // one pinned pool for every context of the process (the MTP draft context computes between the target's graphs):
+                    // two pools spinning on the same cores would compete, so it is shared and lives until the process exits
+                    static ggml_threadpool_t pin_pool   = nullptr;
+                    static int32_t           pin_pool_n = 0;
+                    if (!pin.empty() && pin_pool != nullptr && pin_pool_n == n_threads_host) {
+                        threadpool_host      = pin_pool;
+                        threadpool_host_free = nullptr;
+                    } else if (!pin.empty()) {
+                        std::string list;
+                        for (int32_t i = 0; i < n_threads_host && i < (int32_t) pin.size(); ++i) {
+                            if (pin[i] < GGML_MAX_N_THREADS) {
+                                tpp.cpumask[pin[i]] = true;
+                                list += (list.empty() ? "" : ",") + std::to_string(pin[i]);
+                            }
+                        }
+                        tpp.strict_cpu = true;
+                        const char * poll = getenv("LLAMA_MOE_HOST_POLL");
+                        tpp.poll = poll != nullptr ? (uint32_t) std::max(0, std::min(100, atoi(poll))) : 50;
+                        LLAMA_LOG_INFO("%s: MoE host-miss pool: %d threads pinned to CPUs %s, poll %u (LLAMA_MOE_HOST_PIN)\n",
+                            __func__, n_threads_host, list.c_str(), tpp.poll);
+                        threadpool_host      = new_fn(&tpp);
+                        threadpool_host_free = nullptr;
+                        if (pin_pool == nullptr) {
+                            pin_pool   = threadpool_host;
+                            pin_pool_n = n_threads_host;
+                        } else {
+                            threadpool_host_free = free_fn;
+                        }
+                    } else {
+                        threadpool_host      = new_fn(&tpp);
+                        threadpool_host_free = free_fn;
+                    }
                 }
             }
             if (threadpool_host != nullptr) {
