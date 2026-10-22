@@ -1602,7 +1602,16 @@ struct ggml_cuda_src1_memo {
     size_t              size       = 0;
     ggml_cuda_pool *    pool       = nullptr;
 
+    // a fused RMS_NORM + MUL writes the copy for its consumers (ggml_cuda_src1_memo_plan_norm): its output tensor, the copy
+    // (0 / 1 = q8_1 MMQ D4 / DS4, 2 = BF16), the products' [K_out, N_out] view, and whether the norm wrote it
+    const ggml_tensor * producer      = nullptr;
+    int                 producer_mode = 0;
+    int64_t             K_out         = 0;
+    int64_t             N_out         = 0;
+    bool                produced      = false;
+
     int64_t n_reused      = 0;
+    int64_t n_produced    = 0;
     int64_t bytes_skipped = 0;
 
     void note_reuse(const ggml_tensor * src1_) {

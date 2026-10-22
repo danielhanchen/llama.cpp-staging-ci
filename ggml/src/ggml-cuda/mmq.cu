@@ -1,5 +1,8 @@
 #include "common.cuh"
 #include "mmq.cuh"
+
+// rms_norm_mul_conv_f32 (norm.cu) writes these blocks by offset
+static_assert(sizeof(block_q8_1_mmq) == 144 && offsetof(block_q8_1_mmq, qs) == 16, "block_q8_1_mmq layout changed");
 #include "quantize.cuh"
 #include "mmid.cuh"
 
@@ -263,8 +266,9 @@ void ggml_cuda_mul_mat_q(
                 memo_quantized = true;
                 memo.note_reuse(src1);
             } else {
-                memo.release();
+                // a held copy this product does not read stays for its own reader (released after this node if none)
                 if (memo.share_next) {
+                    memo.release();
                     // the largest padding of any tile width, so that the next product can read it whatever its tile
                     const size_t max_padding = 128*sizeof(block_q8_1_mmq) + 64*sizeof(int);
                     memo_q8_1 = (const char *) memo.hold(ctx.pool(), 1, src1, key,
@@ -344,10 +348,10 @@ void ggml_cuda_mul_mat_q(
         (int64_t) (intptr_t) ids, ne10_padded };
     const bool memo_top  = !use_native_fp4 && memo.top(dst);
     const bool memo_hit  = memo_top && memo.match(3, src1, memo_key);
-    if (memo_top && !memo_hit) {
+    const bool memo_hold = memo_top && !memo_hit && memo.share_next;
+    if (memo_hold) {
         memo.release();
     }
-    const bool memo_hold = memo_top && !memo_hit && memo.share_next;
 
     const size_t memo_n_ids_dst = ne_get_rows + 127; // the padding of the widest tile
     const size_t memo_off_dst   = GGML_PAD(ne_get_rows*sizeof(int32_t), 256);
