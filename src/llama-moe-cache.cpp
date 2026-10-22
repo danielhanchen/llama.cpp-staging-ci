@@ -1643,6 +1643,7 @@ struct llama_moe_cache::impl {
         std::thread          thr;
         std::atomic<bool>    stop{false};
         ggml_backend_ptr     cpu;
+        int                  threads = 1;
         std::atomic<int64_t> kick_us{0};
         std::mutex              mtx;
         std::condition_variable cv;
@@ -1672,8 +1673,12 @@ struct llama_moe_cache::impl {
             }
             ggml_backend_reg_t creg = ggml_backend_dev_backend_reg(ggml_backend_get_device(h.cpu.get()));
             auto set_n = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(creg, "ggml_backend_set_n_threads");
+            // LLAMA_MOE_SINGLE_THREADS (default: the decode threads - 1): the caller of the graph waits on the device beside this team,
+            // so a team as large as the decode threads puts two threads on one core
+            const char * e = getenv("LLAMA_MOE_SINGLE_THREADS");
+            h.threads = e != nullptr && atoi(e) > 0 ? atoi(e) : std::max(1, single_threads - 1);
             if (set_n != nullptr) {
-                set_n(h.cpu.get(), std::max(1, single_threads));
+                set_n(h.cpu.get(), h.threads);
             }
         }
         h.owners.push_back(this);
@@ -1683,7 +1688,7 @@ struct llama_moe_cache::impl {
             h.thr = std::thread(single_service);
         }
         LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses on (LLAMA_MOE_SINGLE): batches of up to %d tokens, %d host threads "
-            "(one host thread for every cache of the process), timeout %d ms\n", tag, GGML_MOE_MAILBOX_MAX_TOKENS, std::max(1, single_threads),
+            "(one host thread for every cache of the process), timeout %d ms\n", tag, GGML_MOE_MAILBOX_MAX_TOKENS, h.threads,
             single_timeout_ms);
         return true;
     }
