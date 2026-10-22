@@ -117,6 +117,18 @@ LLAMA_API bool llama_exact_verify_enabled(void);
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// LLAMA_MTP_DEV_H: the MTP prompt handoff on the device (llama_mtp_dev_h in src/llama-context.h). attach: ctx_dft allocates a device
+// sink of n_rows + 1 rows and ctx_tgt writes the h_nextn rows of single-sequence batches of LLAMA_MTP_DEV_H_MIN (64) .. n_rows tokens
+// there instead of to the host (false: the host path stays). last_rows: rows ctx_tgt's last decode wrote (0 = the host buffer holds
+// them). begin / end bracket a ctx_dft decode that reads its h rows from the sink (row i = batch entry i, row 0 the pending row), end
+// copies row pending_row to row 0. get_row / set_row: blocking copies of one sink row.
+LLAMA_API bool    llama_mtp_dev_h_attach   (struct llama_context * ctx_dft, struct llama_context * ctx_tgt, int32_t n_rows);
+LLAMA_API int32_t llama_mtp_dev_h_last_rows(struct llama_context * ctx_tgt);
+LLAMA_API bool    llama_mtp_dev_h_begin    (struct llama_context * ctx_dft);
+LLAMA_API void    llama_mtp_dev_h_end      (struct llama_context * ctx_dft, int32_t pending_row);
+LLAMA_API bool    llama_mtp_dev_h_get_row  (struct llama_context * ctx_dft, int32_t row, float * dst);
+LLAMA_API bool    llama_mtp_dev_h_set_row  (struct llama_context * ctx_dft, int32_t row, const float * src);
+
 // Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
 // A run of entries with the same value is one span, spans must be separated by entries with value 0

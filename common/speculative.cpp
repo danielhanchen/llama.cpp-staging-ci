@@ -1495,6 +1495,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // LLAMA_MTP_HANDOFF_VH=0: verify_h keeps every row of a prompt ubatch, as before
     const bool verify_h_trim = handoff_copy && common_mtp_handoff_on("VH");
 
+    // LLAMA_MTP_DEV_H=0: the target's hidden rows of a prompt batch go to the host and back up to the drafter, as before. Otherwise
+    // (single-sequence batches of LLAMA_MTP_DEV_H_MIN = 64 tokens or more) they stay on the device (llama_mtp_dev_h_attach) and the
+    // drafter's pass is queued without waiting on the target from the host.
+    bool dev_h = false;
+    llama_seq_id dev_seq = -1;            // the sequence whose pending row is in sink row 0
+    std::vector<uint8_t> pending_dev;     // per seq: its pending row is sink row 0 (pending_h is stale)
+    std::vector<uint8_t> verify_dev;      // per seq: the verify rows are sink rows 1 .. verify_h_rows (verify_h is unused)
+
+    // the pending row of seq back on the host (a blocking copy of one row)
+    void pending_to_host(llama_seq_id seq_id) {
+        if (dev_h && pending_dev[seq_id]) {
+            GGML_ASSERT(dev_seq == seq_id);
+            GGML_ASSERT(llama_mtp_dev_h_get_row(params.ctx_dft, 0, pending_h[seq_id].data()));
+            pending_dev[seq_id] = 0;
+        }
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1570,6 +1587,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
         verify_h_kept.assign(n_seq, 0);
+
+        pending_dev.assign(n_seq, 0);
+        verify_dev.assign(n_seq, 0);
+        if (!is_mem_shared && !chain_heads && common_mtp_handoff_on("DEV_H") && !(getenv("LLAMA_MTP_DEV_H") && atoi(getenv("LLAMA_MTP_DEV_H")) == 0)) {
+            dev_h = llama_mtp_dev_h_attach(ctx_dft, ctx_tgt, (int32_t) llama_n_batch(ctx_tgt));
+        }
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1650,6 +1673,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         int64_t t_tr_build = 0;
         int64_t t_tr_dft   = 0;
 
+        // LLAMA_MTP_DEV_H: the target wrote this batch's hidden rows to the device sink (one sequence)
+        const int32_t dev_rows = dev_h ? llama_mtp_dev_h_last_rows(ctx_tgt) : 0;
+        const bool dev = dev_rows > 0;
+        llama_seq_id dev_s = -1;
+        if (dev) {
+            GGML_ASSERT(dev_rows == n_tokens && "MTP device handoff: the target wrote part of the batch");
+            dev_s = batch_in.tokens[0].seq_id;
+            GGML_ASSERT(i_batch_beg[dev_s] == 0 && i_batch_end[dev_s] == n_tokens - 1);
+        }
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_batch_beg[seq_id] < 0) {
+                continue;
+            }
+            verify_dev[seq_id] = 0;
+            if (seq_id != dev_s) {
+                pending_to_host(seq_id); // a host-path batch pairs its first row with pending_h
+            }
+        }
+        if (dev && !(dev_seq == dev_s && pending_dev[dev_s])) {
+            // the first row of this batch pairs with the host's pending row (another sequence held sink row 0, or a host-path batch ran)
+            if (dev_seq >= 0 && dev_seq != dev_s) {
+                pending_to_host(dev_seq);
+            }
+            GGML_ASSERT(llama_mtp_dev_h_set_row(ctx_dft, 0, pending_h[dev_s].data()));
+        }
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
             batch.clear();
@@ -1660,7 +1709,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
-            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            // the device path reads no host rows: no sync on the target here
+            const float * h_tgt = dev ? nullptr : llama_get_embeddings_nextn(ctx_tgt);
             if (t_tr0) {
                 t_tr_sync = ggml_time_us();
             }
@@ -1674,6 +1724,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const int32_t idx = t.id != LLAMA_TOKEN_NULL
                     ? batch.add(t.id, t.pos[0], seq_id, false)
                     : batch.add_embd(t.embd, t.pos.data(), seq_id, false);
+
+                if (dev) {
+                    continue; // row k of the sink
+                }
 
                 const float * h_row = k == i_batch_beg[seq_id]
                     ? pending_h[seq_id].data()
@@ -1701,7 +1755,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
+                if (dev) {
+                    GGML_ASSERT(llama_mtp_dev_h_begin(ctx_dft));
+                }
                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                if (dev) {
+                    // sink row n_tokens = the target's last row: the next batch's first row
+                    llama_mtp_dev_h_end(ctx_dft, n_tokens);
+                    pending_dev[dev_s] = 1;
+                    dev_seq = dev_s;
+                }
                 if (rc != 0) {
                     SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.tokens[0].pos[0]);
@@ -1721,6 +1784,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        if (dev && is_mem_shared) {
+            GGML_ABORT("MTP device handoff with a shared KV draft");
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
                 continue;
@@ -1728,6 +1795,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             verify_h_rows[seq_id] = n_rows;
+
+            if (dev) {
+                // the verify rows stay in the sink (rows 1 .. n_rows), the last one is already the pending row 0
+                verify_dev[seq_id]    = 1;
+                verify_h_kept[seq_id] = n_rows;
+                continue;
+            }
 
             // the rows of one sequence are consecutive in the target's nextn buffer: one copy into a buffer that only grows (a
             // prompt ubatch is n_rows*n_embd floats) instead of a zero-filled resize and a synchronizing lookup per row
@@ -1801,6 +1875,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_sampler_reset(smpls[seq_id].get());
             }
 
+            pending_to_host(seq_id);
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
             batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
 
@@ -1945,6 +2020,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+        if (verify_dev[seq_id]) {
+            // the last row is the pending row 0 already; another row comes from the sink
+            if (i_h < n_rows - 1) {
+                if (dev_seq != seq_id) {
+                    // another sequence's prompt batch has overwritten the sink since (not seen in the server's flow: a verify batch
+                    // runs process() before its accept())
+                    SPC_WRN("MTP device handoff: seq %d accepted row %d of a prompt batch the sink no longer holds\n", (int) seq_id, (int) i_h);
+                    return;
+                }
+                GGML_ASSERT(llama_mtp_dev_h_get_row(params.ctx_dft, 1 + i_h, pending_h[seq_id].data()));
+                pending_dev[seq_id] = 0;
+            }
+            return;
+        }
         if (i_h >= verify_h_kept[seq_id]) {
             // only the last row is past the kept ones (n_accepted <= n_max < n_keep), and process() left it in pending_h
             GGML_ASSERT(i_h == n_rows - 1 && "MTP verify_h: accepted row was not kept");
