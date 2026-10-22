@@ -96,8 +96,8 @@ public:
             ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down) const;
     // the device rows dev [n_embd, n_expert_used, n_tokens] plus the host rows of the publish pub
     ggml_tensor * single_merge(ggml_context * ctx, ggml_tensor * dev, ggml_tensor * pub) const;
-    // before the graph of every ubatch: wakes the host thread, turns the path off after a failure
-    void single_kick();
+    // before the graph of every ubatch of n_tokens: wakes the host thread (batches that may publish), turns the path off after a failure
+    void single_kick(int64_t n_tokens);
 
     // graph key: 0 = plain lookups, 1 = lookups that keep the use counters, 2 = hybrid, + 4 with the fetch overlap
     int  hybrid_mode() const;

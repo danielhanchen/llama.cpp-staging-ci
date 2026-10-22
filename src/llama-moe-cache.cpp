@@ -1628,21 +1628,64 @@ struct llama_moe_cache::impl {
     bool single_off     = false;  // a mailbox failed: back to the split for good
     bool single_no_alloc = false; // a context that only measures memory: no mailboxes
     int  single_threads = 0;
+    bool single_reg     = false;  // registered with the hub
     std::vector<std::unique_ptr<mailbox>> mboxes; // by layer, owned (created by the graph builder)
     std::unique_ptr<std::atomic<mailbox *>[]> mbox_live; // by layer, read by the host thread
     size_t mbox_n = 0;
-    ggml_backend_ptr single_cpu;
-    std::thread      single_thr;
-    std::atomic<bool>    single_stop{false};
-    std::atomic<bool>    single_failed{false};
-    std::atomic<int64_t> single_kick_us{0};
-    std::mutex              single_mtx;
-    std::condition_variable single_cv;
+    std::atomic<bool> single_failed{false};
     uint64_t single_batches = 0;
-    uint64_t single_rows    = 0;
+
+    // one host thread and one CPU backend for every cache of the process (the target and its MTP draft context alternate, two threads
+    // with a CPU team each would compete for the same cores): the thread serves the mailboxes of the registered caches
+    struct single_hub_t {
+        std::mutex           reg_mtx; // the owners; held by the thread while it serves them
+        std::vector<impl *>  owners;
+        std::thread          thr;
+        std::atomic<bool>    stop{false};
+        ggml_backend_ptr     cpu;
+        std::atomic<int64_t> kick_us{0};
+        std::mutex              mtx;
+        std::condition_variable cv;
+    };
+    static single_hub_t & single_hub() {
+        static single_hub_t h;
+        return h;
+    }
+    static int64_t single_now_us() {
+        return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
 
     bool single_usable(int64_t n_tokens) const {
         return single_req && !single_off && !single_no_alloc && n_tokens >= 1 && n_tokens <= GGML_MOE_MAILBOX_MAX_TOKENS;
+    }
+
+    bool single_register() {
+        if (single_reg) {
+            return true;
+        }
+        single_hub_t & h = single_hub();
+        std::lock_guard<std::mutex> lock(h.reg_mtx);
+        if (!h.cpu) {
+            h.cpu.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+            if (!h.cpu) {
+                return false;
+            }
+            ggml_backend_reg_t creg = ggml_backend_dev_backend_reg(ggml_backend_get_device(h.cpu.get()));
+            auto set_n = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(creg, "ggml_backend_set_n_threads");
+            if (set_n != nullptr) {
+                set_n(h.cpu.get(), std::max(1, single_threads));
+            }
+        }
+        h.owners.push_back(this);
+        single_reg = true;
+        if (!h.thr.joinable()) {
+            h.stop.store(false, std::memory_order_relaxed);
+            h.thr = std::thread(single_service);
+        }
+        LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses on (LLAMA_MOE_SINGLE): batches of up to %d tokens, %d host threads "
+            "(one host thread for every cache of the process), timeout %d ms\n", tag, GGML_MOE_MAILBOX_MAX_TOKENS, std::max(1, single_threads),
+            single_timeout_ms);
+        return true;
     }
 
     mailbox * single_mailbox(int32_t il, int n_used, int n_embd, ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down) {
@@ -1669,18 +1712,6 @@ struct llama_moe_cache::impl {
             single_off = true;
             return nullptr;
         }
-        if (!single_cpu) {
-            single_cpu.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
-            if (!single_cpu) {
-                single_off = true;
-                return nullptr;
-            }
-            ggml_backend_reg_t creg = ggml_backend_dev_backend_reg(ggml_backend_get_device(single_cpu.get()));
-            auto set_n = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(creg, "ggml_backend_set_n_threads");
-            if (set_n != nullptr) {
-                set_n(single_cpu.get(), std::max(1, single_threads));
-            }
-        }
         auto mb = std::make_unique<mailbox>();
         const size_t size = ggml_moe_mailbox_size(n_used, n_embd);
         mb->host = alloc(dev, size, &mb->mdev, &mb->ctl);
@@ -1698,16 +1729,15 @@ struct llama_moe_cache::impl {
         mb->buf.reset(ggml_backend_cpu_buffer_from_ptr(mb->host, size));
         mboxes[il] = std::move(mb);
         mbox_live[il].store(mboxes[il].get(), std::memory_order_release);
-        if (!single_thr.joinable()) {
-            single_thr = std::thread([this] { single_service(); });
-            LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses on (LLAMA_MOE_SINGLE): batches of up to %d tokens, %d host threads, "
-                "timeout %d ms\n", tag, GGML_MOE_MAILBOX_MAX_TOKENS, std::max(1, single_threads), single_timeout_ms);
+        if (!single_register()) {
+            single_off = true;
+            return nullptr;
         }
         return mboxes[il].get();
     }
 
     // the plan of n_tokens tokens of a mailbox: the experts of the host ids, reading and writing the mailbox
-    bool single_plan_get(mailbox & mb, int n_tokens, single_plan *& out) {
+    static bool single_plan_get(mailbox & mb, int n_tokens, single_plan *& out) {
         single_plan & p = mb.plans[n_tokens];
         if (p.gf == nullptr) {
             ggml_init_params ip = { ggml_tensor_overhead()*16 + ggml_graph_overhead_custom(16, false), nullptr, true };
@@ -1740,99 +1770,117 @@ struct llama_moe_cache::impl {
         return true;
     }
 
-    void single_service() {
-        using clk = std::chrono::steady_clock;
-        int64_t last_work = 0;
+    // one pass over the mailboxes of this cache, true if one had work
+    bool single_poll(ggml_backend_t cpu) {
         // LLAMA_MOE_SINGLE_DEBUG_STALL=N (test of the timeout): the thread stops answering after N batches, as if it died
         static const int64_t stall_after = [] {
             const char * e = getenv("LLAMA_MOE_SINGLE_DEBUG_STALL");
             return e != nullptr ? atoll(e) : -1;
         }();
-        while (!single_stop.load(std::memory_order_acquire)) {
-            bool work = false;
-            for (size_t i = 0; i < mbox_n; ++i) {
-                mailbox * mbp = mbox_live[i].load(std::memory_order_acquire);
-                if (mbp == nullptr) {
-                    continue;
-                }
-                mailbox & mb = *mbp;
-                auto * hdr = (ggml_moe_mailbox_hdr *) mb.host;
-                const uint32_t req = __atomic_load_n(&hdr->request, __ATOMIC_ACQUIRE);
-                if (req == mb.done) {
-                    continue;
-                }
-                if (stall_after >= 0 && (int64_t) single_batches >= stall_after) {
-                    continue;
-                }
-                work = true;
-                bool ok = false;
-                const int n_tokens = hdr->n_tokens;
-                single_plan * p = nullptr;
-                if (!single_failed.load(std::memory_order_relaxed) && n_tokens >= 1 && n_tokens <= GGML_MOE_MAILBOX_MAX_TOKENS &&
-                        single_plan_get(mb, n_tokens, p)) {
-                    ok = ggml_backend_graph_compute(single_cpu.get(), p->gf) == GGML_STATUS_SUCCESS;
-                }
-                if (!ok) {
-                    single_failed.store(true, std::memory_order_relaxed);
-                    __atomic_store_n(&hdr->error, 2u, __ATOMIC_RELEASE);
-                }
-                single_batches++;
-                mb.done = req;
-                __atomic_store_n(&hdr->completed, req, __ATOMIC_RELEASE);
+        bool work = false;
+        for (size_t i = 0; i < mbox_n; ++i) {
+            mailbox * mbp = mbox_live[i].load(std::memory_order_acquire);
+            if (mbp == nullptr) {
+                continue;
             }
-            const int64_t now = std::chrono::duration_cast<std::chrono::microseconds>(clk::now().time_since_epoch()).count();
+            mailbox & mb = *mbp;
+            auto * hdr = (ggml_moe_mailbox_hdr *) mb.host;
+            const uint32_t req = __atomic_load_n(&hdr->request, __ATOMIC_ACQUIRE);
+            if (req == mb.done || (stall_after >= 0 && (int64_t) single_batches >= stall_after)) {
+                continue;
+            }
+            work = true;
+            bool ok = false;
+            const int n_tokens = hdr->n_tokens;
+            single_plan * p = nullptr;
+            if (!single_failed.load(std::memory_order_relaxed) && n_tokens >= 1 && n_tokens <= GGML_MOE_MAILBOX_MAX_TOKENS &&
+                    single_plan_get(mb, n_tokens, p)) {
+                ok = ggml_backend_graph_compute(cpu, p->gf) == GGML_STATUS_SUCCESS;
+            }
+            if (!ok) {
+                single_failed.store(true, std::memory_order_relaxed);
+                __atomic_store_n(&hdr->error, 2u, __ATOMIC_RELEASE);
+            }
+            single_batches++;
+            mb.done = req;
+            __atomic_store_n(&hdr->completed, req, __ATOMIC_RELEASE);
+        }
+        return work;
+    }
+
+    static void single_service() {
+        single_hub_t & h = single_hub();
+        int64_t last_work = 0;
+        while (!h.stop.load(std::memory_order_acquire)) {
+            bool work = false;
+            {
+                std::lock_guard<std::mutex> lock(h.reg_mtx);
+                for (impl * o : h.owners) {
+                    work = o->single_poll(h.cpu.get()) || work;
+                }
+            }
+            const int64_t now = single_now_us();
             if (work) {
                 last_work = now;
+            } else if (now - std::max(last_work, h.kick_us.load(std::memory_order_relaxed)) > 20000) {
+                // no decode graph started for 20 ms: sleep until the next one (single_kick)
+                std::unique_lock<std::mutex> lock(h.mtx);
+                h.cv.wait_for(lock, std::chrono::milliseconds(100));
             } else {
-                if (now - std::max(last_work, single_kick_us.load(std::memory_order_relaxed)) > 20000) {
-                    // no graph started for 20 ms: sleep until the next one (single_kick)
-                    std::unique_lock<std::mutex> lock(single_mtx);
-                    single_cv.wait_for(lock, std::chrono::milliseconds(100));
-                } else {
 #if defined(__x86_64__) || defined(_M_X64)
-                    __builtin_ia32_pause();
+                __builtin_ia32_pause();
 #else
-                    std::this_thread::yield();
+                std::this_thread::yield();
 #endif
-                }
             }
         }
     }
 
-    // before the graph of a ubatch: wakes the host thread; a failed mailbox turns the path off (the graphs are rebuilt)
-    void single_kick() {
-        if (!single_thr.joinable()) {
+    // before the graph of a ubatch of n_tokens: wakes the host thread for the batches that may publish; a failed mailbox turns the path
+    // off (the graphs are rebuilt)
+    void single_kick(int64_t n_tokens) {
+        if (!single_reg || single_off) {
             return;
         }
-        if (single_failed.load(std::memory_order_relaxed) || [this] {
-                for (auto & mb : mboxes) {
-                    if (mb && __atomic_load_n(&((ggml_moe_mailbox_hdr *) mb->host)->error, __ATOMIC_ACQUIRE) != 0) {
-                        return true;
-                    }
-                }
-                return false;
-            }()) {
-            if (!single_off) {
-                LLAMA_LOG_ERROR("llama_moe_cache%s: single-graph host misses failed (a merge waited %d ms or the host thread failed): "
-                    "the split path from now on\n", tag, single_timeout_ms);
-                single_off = true;
-                cm_gen++;
-            }
+        bool failed = single_failed.load(std::memory_order_relaxed);
+        for (auto & mb : mboxes) {
+            failed = failed || (mb && __atomic_load_n(&((ggml_moe_mailbox_hdr *) mb->host)->error, __ATOMIC_ACQUIRE) != 0);
+        }
+        if (failed) {
+            LLAMA_LOG_ERROR("llama_moe_cache%s: single-graph host misses failed (a merge waited %d ms or the host thread failed): "
+                "the split path from now on\n", tag, single_timeout_ms);
+            single_off = true;
+            cm_gen++;
             return;
         }
-        const int64_t now = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-        const int64_t prev = single_kick_us.exchange(now, std::memory_order_relaxed);
+        if (n_tokens < 1 || n_tokens > GGML_MOE_MAILBOX_MAX_TOKENS) {
+            return;
+        }
+        single_hub_t & h = single_hub();
+        const int64_t now  = single_now_us();
+        const int64_t prev = h.kick_us.exchange(now, std::memory_order_relaxed);
         if (now - prev > 20000) {
-            single_cv.notify_one();
+            h.cv.notify_one();
         }
     }
 
     void single_stop_all() {
         // the context synchronized its backends before it frees the cache (they may be gone here)
-        if (single_thr.joinable()) {
-            single_stop.store(true, std::memory_order_release);
-            single_cv.notify_one();
-            single_thr.join();
+        if (single_reg) {
+            single_hub_t & h = single_hub();
+            bool last = false;
+            {
+                std::lock_guard<std::mutex> lock(h.reg_mtx);
+                h.owners.erase(std::remove(h.owners.begin(), h.owners.end(), this), h.owners.end());
+                last = h.owners.empty();
+            }
+            if (last && h.thr.joinable()) {
+                h.stop.store(true, std::memory_order_release);
+                h.cv.notify_one();
+                h.thr.join();
+                h.cpu.reset();
+            }
+            single_reg = false;
             if (single_batches > 0) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses: %" PRIu64 " host batches\n", tag, single_batches);
             }
@@ -5726,8 +5774,8 @@ ggml_tensor * llama_moe_cache::single_merge(ggml_context * ctx, ggml_tensor * de
     return ggml_moe_mailbox_merge(ctx, dev, pub, pimpl->single_timeout_ms);
 }
 
-void llama_moe_cache::single_kick() {
-    pimpl->single_kick();
+void llama_moe_cache::single_kick(int64_t n_tokens) {
+    pimpl->single_kick(n_tokens);
 }
 
 bool llama_moe_cache::hybrid_fixed() const {

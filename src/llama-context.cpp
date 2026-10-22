@@ -4750,7 +4750,7 @@ ggml_status llama_context::graph_compute(
     set_compute_threads(batched);
 
     if (moe_cache) {
-        moe_cache->single_kick();
+        moe_cache->single_kick(compute_n_tokens);
     }
 
     copy_experts.reset();
