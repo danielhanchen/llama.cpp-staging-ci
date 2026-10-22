@@ -64,6 +64,7 @@
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/moe-cache.cuh"
+#include "ggml-moe-mailbox.h"
 #include "ggml-cuda/copy-regions.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
@@ -6304,6 +6305,45 @@ struct ggml_backend_cuda_device_context {
 };
 
 // maps host memory into the address space of the device dev (see ggml_cuda_host_map)
+// single-graph MoE mailbox (k11, see ggml-moe-mailbox.h): mapped host memory the device writes and reads, and its device control block
+static void * ggml_backend_cuda_moe_mailbox_alloc(void * dev, size_t size, void ** mbox_dev, void ** ctl_dev) {
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)((ggml_backend_dev_t) dev)->context;
+    ggml_cuda_set_device(ctx->device);
+    void * host = nullptr;
+    *mbox_dev = nullptr;
+    *ctl_dev  = nullptr;
+    if (cudaHostAlloc(&host, size, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+    memset(host, 0, size);
+    if (cudaHostGetDevicePointer(mbox_dev, host, 0) != cudaSuccess || *mbox_dev == nullptr ||
+            cudaMalloc(ctl_dev, sizeof(ggml_moe_mailbox_ctl)) != cudaSuccess ||
+            cudaMemset(*ctl_dev, 0, sizeof(ggml_moe_mailbox_ctl)) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (*ctl_dev != nullptr) {
+            (void)cudaFree(*ctl_dev);
+        }
+        (void)cudaFreeHost(host);
+        *mbox_dev = nullptr;
+        *ctl_dev  = nullptr;
+        return nullptr;
+    }
+    return host;
+}
+
+static void ggml_backend_cuda_moe_mailbox_free(void * dev, void * host, void * ctl_dev) {
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)((ggml_backend_dev_t) dev)->context;
+    ggml_cuda_set_device(ctx->device);
+    if (ctl_dev != nullptr) {
+        (void)cudaFree(ctl_dev);
+    }
+    if (host != nullptr) {
+        (void)cudaFreeHost(host);
+    }
+    (void)cudaGetLastError();
+}
+
 static void * ggml_backend_cuda_host_map(ggml_backend_dev_t dev, void * buffer, size_t size, bool * registered) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
     return ggml_cuda_host_map(ctx->device, buffer, size, registered);
@@ -7366,6 +7406,16 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_host_map") == 0) {
         return (void *)ggml_backend_cuda_host_map;
+    }
+    if (strcmp(name, "ggml_backend_moe_mailbox_alloc") == 0) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        return (void *)ggml_backend_cuda_moe_mailbox_alloc;
+#else
+        return nullptr;
+#endif
+    }
+    if (strcmp(name, "ggml_backend_moe_mailbox_free") == 0) {
+        return (void *)ggml_backend_cuda_moe_mailbox_free;
     }
     if (strcmp(name, "ggml_backend_host_map_range") == 0) {
         return (void *)ggml_backend_cuda_host_map_range;

@@ -1565,6 +1565,27 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
+    // single-graph host misses (k11, LLAMA_MOE_SINGLE): instead of a graph split per layer, the device publishes the host ids and the
+    // activations of a small batch to a mailbox in host memory mapped into the device, a host thread computes those experts, and the
+    // merge waits for it on the device. mbox: device pointer of the mapped mailbox (layout: ggml_moe_mailbox_hdr, see ggml-moe-mailbox.h),
+    // ctl: device memory of the mailbox (sequence, pending), timeout_ms: the merge gives up after it (NaN output, error flag)
+    // publish: host_ids I32 [n_expert_used, n_tokens] (-1: not on the host), x F32 [n_embd, ..., n_tokens] contiguous; result: I32 [1]
+    GGML_API struct ggml_tensor * ggml_moe_mailbox_publish(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * host_ids,
+            struct ggml_tensor  * x,
+            void                * mbox,
+            void                * ctl,
+            int                   il);
+
+    // merge: dev F32 [n_embd, n_expert_used, n_tokens] (the device rows, 0 where the host computes), pub = the publish result;
+    // result: dev + the host rows (in a new tensor)
+    GGML_API struct ggml_tensor * ggml_moe_mailbox_merge(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * dev,
+            struct ggml_tensor  * pub,
+            int                   timeout_ms);
+
     // device-side seed of the cache from the routing of a large batch, with no read of the routing by the host
     // ids: I32 [n_expert_used, n_tokens] the experts selected in layer il; map, state: as ggml_moe_cache_lookup; scores: optional (decayed counts)
     // admits the n_seed most used experts of layer il (ties by expert id) that are not cached, into slots below n_victim that hold no expert or an

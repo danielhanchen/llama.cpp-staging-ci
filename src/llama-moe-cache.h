@@ -89,6 +89,16 @@ public:
     bool hybrid_active() const;
     // the host computes some missing experts of a ubatch of n_tokens now (CPU misses on for that size, or the hybrid path)
     bool host_computes(int64_t n_tokens) const;
+    // single-graph host misses [LLAMA_MOE_SINGLE=1, opt-in]: the host experts of a small batch (up to GGML_MOE_MAILBOX_MAX_TOKENS tokens)
+    // go through a mapped mailbox instead of a graph split (see ggml_moe_mailbox_publish); up, gate, down: the host expert tensors of
+    // layer il (separate gate and up, SiLU, no biases or scales); nullptr if not used, then build the split path
+    ggml_tensor * single_publish(ggml_context * ctx, int32_t il, ggml_tensor * host_ids, ggml_tensor * x,
+            ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down) const;
+    // the device rows dev [n_embd, n_expert_used, n_tokens] plus the host rows of the publish pub
+    ggml_tensor * single_merge(ggml_context * ctx, ggml_tensor * dev, ggml_tensor * pub) const;
+    // before the graph of every ubatch: wakes the host thread, turns the path off after a failure
+    void single_kick();
+
     // graph key: 0 = plain lookups, 1 = lookups that keep the use counters, 2 = hybrid, + 4 with the fetch overlap
     int  hybrid_mode() const;
 

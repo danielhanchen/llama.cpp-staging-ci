@@ -2621,9 +2621,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         // the host path is added first: the scheduler starts the copies and the device path while the host computes (see ggml_backend_sched_set_overlap)
         ggml_tensor * experts_h = nullptr;
+        ggml_tensor * single_pub = nullptr;
         if (hybrid_host) {
             ggml_tensor * host_ids = ggml_view_2d(ctx0, hybrid, n_used, n_rows, hybrid->nb[1], (3*n_rows + 1)*hybrid->nb[1]);
             cb(host_ids, "ffn_moe_host_ids", il);
+
+            // k11 single-graph host misses (LLAMA_MOE_SINGLE): the host experts go through a mapped mailbox, no graph split; only the
+            // expert form the host thread computes (separate gate and up, SiLU, no biases, scales or clamp)
+            const bool single_form = type_op == LLM_FFN_SILU && up_exps && gate_exps && !gate_up_exps && !up_exps_s_h && !gate_exps_s_h &&
+                !down_exps_s && !up_exps_b_h && !gate_exps_b_h && !gate_up_exps_b_h && !(il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f);
+            if (single_form) {
+                single_pub = moe_cache->single_publish(ctx0, il, host_ids, cur, up_exps, gate_exps, down_exps);
+            }
+            if (single_pub != nullptr) {
+                ggml_backend_sched_set_tensor_backend(sched, single_pub, moe_cache->backend(il));
+                cb(single_pub, "ffn_moe_host_publish", il);
+                ggml_build_forward_expand(gf, single_pub);
+            }
+        }
+        if (hybrid_host && single_pub == nullptr) {
+            ggml_tensor * host_ids = ggml_view_2d(ctx0, hybrid, n_used, n_rows, hybrid->nb[1], (3*n_rows + 1)*hybrid->nb[1]);
 
             const int n0 = ggml_graph_n_nodes(gf);
             experts_h = build_experts(cur, host_ids, true, up_exps_s_h, gate_exps_s_h, down_exps_s_h, up_exps_b_h, gate_exps_b_h, gate_up_exps_b_h);
@@ -2674,7 +2691,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         // every slot is computed by exactly one side, the other sides' rows are 0
-        experts = experts_h != nullptr ? ggml_add(ctx0, experts_d, experts_h) : experts_d;
+        if (single_pub != nullptr) {
+            experts = moe_cache->single_merge(ctx0, ggml_is_contiguous(experts_d) ? experts_d : ggml_cont(ctx0, experts_d), single_pub);
+            ggml_backend_sched_set_tensor_backend(sched, experts, dev);
+            cb(experts, "ffn_moe_host_merge", il);
+        } else {
+            experts = experts_h != nullptr ? ggml_add(ctx0, experts_d, experts_h) : experts_d;
+        }
         cb(experts, "ffn_moe_down_hybrid", il);
     }
 

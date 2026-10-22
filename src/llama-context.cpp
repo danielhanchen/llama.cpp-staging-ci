@@ -4749,6 +4749,10 @@ ggml_status llama_context::graph_compute(
                    bool   batched) {
     set_compute_threads(batched);
 
+    if (moe_cache) {
+        moe_cache->single_kick();
+    }
+
     copy_experts.reset();
 
     sync_pending = true;
