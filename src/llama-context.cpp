@@ -2830,6 +2830,32 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // handle any pending shifts/copies
     memory_update(false);
 
+    // k11-decode: a small graph re-planned the graph allocator (speculative verify windows have their own node counts), so the ubatches
+    // of a prompt would each re-plan it again as the KV view grows, every time with a synchronization of all backends (G4: prompts
+    // 2-7% slower with n-gram drafting on). The prompt restores the worst-case pp plan of sched_reserve once instead. The allocator
+    // only plans addresses: outputs cannot change. LLAMA_PP_RERESERVE=0: off.
+    {
+        static const bool pp_rereserve = getenv("LLAMA_PP_RERESERVE") == nullptr || atoi(getenv("LLAMA_PP_RERESERVE")) != 0;
+        if (pp_rereserve && sched_plan_small && memory && !moe_cache && !cparams.verify && n_tokens_all > 2*GF_SMALL_MAX &&
+                !model.hparams.no_alloc) {
+            sched_plan_small = false;
+            synchronize();
+            auto mctx_full = memory->init_full();
+            if (mctx_full) {
+                const uint32_t n_seqs_r     = (model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_MINIMAX_01) ? 1 : cparams.n_seq_max;
+                const uint32_t n_tokens_r   = std::min(cparams.n_ctx, cparams.n_ubatch);
+                const uint32_t n_outputs_r  = std::min(n_tokens_r, cparams.n_outputs_max);
+                if (graph_reserve(n_tokens_r, n_seqs_r, n_outputs_r, mctx_full.get()) == nullptr) {
+                    LLAMA_LOG_WARN("%s: re-reserving the pp graph failed\n", __func__);
+                }
+                if (++n_pp_rereserve == 1 || n_pp_rereserve % 100 == 0) {
+                    LLAMA_LOG_INFO("%s: a small graph re-planned the graph allocator: the prompt reserved the pp graph again (%" PRId64 " times; LLAMA_PP_RERESERVE=0: off)\n",
+                            __func__, n_pp_rereserve);
+                }
+            }
+        }
+    }
+
     llama_memory_context_ptr mctx;
 
     // speculative verify batches with LLAMA_MTP_EXACT=1 are computed batch invariant (see llama_set_verify)
@@ -4589,12 +4615,16 @@ llm_graph_params llama_context::graph_params(
 }
 
 void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {
+    auto * lctx = static_cast<llama_context *>(user_data);
+
+    if (lctx->prefetch_n_tokens <= 2*GF_SMALL_MAX) {
+        lctx->sched_plan_small = true;
+    }
+
     // reallocating after the backend assignments changed is expected, trace only the unexpected ones
     if (backend_ids_changed) {
         return;
     }
-
-    auto * lctx = static_cast<llama_context *>(user_data);
 
     if (graph_size_changed) {
         lctx->n_reallocs_diff++;

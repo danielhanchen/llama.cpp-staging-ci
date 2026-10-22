@@ -493,6 +493,10 @@ private:
     // graph reallocations during inference where the backend assignments did not change, split by whether the
     // graph size is the same as the previously scheduled one (unexpected) or different
     int32_t n_reallocs_same = 0;
+    // k11-decode: the graph allocator was re-planned for a small graph (a decode step or a verify window) since the worst-case pp
+    // reservation: the next prompt reserves the pp graph again before its first ubatch (LLAMA_PP_RERESERVE=0: off)
+    bool sched_plan_small = false;
+    int64_t n_pp_rereserve = 0;
     int32_t n_reallocs_diff = 0;
 
     // the MoE cache admits the most used experts at the end of a prompt (see moe_cache_seed_begin):
