@@ -2582,14 +2582,6 @@ struct llama_moe_cache::impl {
     bool   va_failed = false;
     size_t va_n_layers = 0, va_n_experts = 0, va_bytes = 0, va_n_waits = 0, va_n_cap = 0, va_n_sync = 0;
 
-    bool va_medium(int32_t il, int64_t n_ubatch) const {
-        if (va_depth <= 0 || va_failed || n_ubatch <= max_batch || host_layer(il)) {
-            return false;
-        }
-        const group & g = groups[layers[il].ig];
-        return (double) n_ubatch*n_expert_used >= va_cover*g.lru.n_expert;
-    }
-
     ggml_backend_t va_queue(int32_t id) {
         if (va_backend.size() < devices.size()) {
             va_backend.resize(devices.size(), nullptr);
@@ -2663,7 +2655,7 @@ struct llama_moe_cache::impl {
         const layer & l = layers[il];
         group & g = groups[l.ig];
         const int32_t n_expert = g.lru.n_expert;
-        if ((double) n_ids < va_cover*n_expert || g.devseed || host_layer(il)) {
+        if ((double) n_ids < va_cover*n_expert || g.host_read || g.devseed || host_layer(il)) {
             return;
         }
         if (wstore != nullptr) {
@@ -3174,11 +3166,6 @@ struct llama_moe_cache::impl {
     ggml_tensor * hybrid_assign(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch, bool & host) const {
         host = false;
         if (!hybrid_layer(il, n_ubatch) || ids->ne[1] > n_ubatch || ids->ne[0] > n_expert_used) {
-            return nullptr;
-        }
-        // k11 VRAM ahead: a ubatch above the device lookups that routes nearly every expert goes through the copy callback (slot maps),
-        // which uploads the next layers ahead (see va_issue), instead of the hybrid fetch of its misses on the compute stream
-        if (va_medium(il, n_ubatch)) {
             return nullptr;
         }
         float share = 1.0f;
