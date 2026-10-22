@@ -1583,6 +1583,59 @@ struct ggml_cuda_q8_1_cache {
     }
 };
 
+// Converted src1 shared by back-to-back matrix products (prompt batches): when the next compute node of the graph is a
+// MUL_MAT that reads the same src1 tensor, the first one keeps its q8_1 (MMQ) or F16 / BF16 (cuBLAS) copy of src1 and the next
+// one reuses it instead of converting again. Same conversion of the same data, so the results do not change.
+// Only noop / view nodes run in between, so the source is not overwritten. The buffer is a pool allocation made first in
+// the producer and released after the consumer, which keeps the pool's allocations in stack order.
+// GGML_CUDA_SRC1_MEMO=0 turns it off.
+struct ggml_cuda_src1_memo {
+    static constexpr int n_key = 10;
+
+    bool                share_next = false; // set per node: the next compute node is a MUL_MAT reading the same src1
+    const ggml_tensor * node_dst   = nullptr; // the graph node being computed unfused: only its own product may use the memo
+    bool                held       = false;
+    int                 kind       = 0;     // 1 = MMQ q8_1, 2 = cuBLAS F16 / BF16
+    const ggml_tensor * src1       = nullptr;
+    int64_t             key[n_key] = {};
+    void *              ptr        = nullptr;
+    size_t              size       = 0;
+    ggml_cuda_pool *    pool       = nullptr;
+
+    int64_t n_reused      = 0;
+    int64_t bytes_skipped = 0;
+
+    bool match(int kind_, const ggml_tensor * src1_, const int64_t key_[n_key]) const {
+        return held && kind == kind_ && src1 == src1_ && std::equal(key, key + n_key, key_);
+    }
+
+    // the product writing dst is the graph node itself (not a product nested inside another op or a fused group)
+    bool top(const ggml_tensor * dst) const {
+        return dst != nullptr && dst == node_dst;
+    }
+
+    void release() {
+        if (held) {
+            pool->free(ptr, size);
+            held = false;
+            ptr  = nullptr;
+            src1 = nullptr;
+        }
+    }
+
+    // allocate the shared copy (must be the first pool allocation of the producer)
+    void * hold(ggml_cuda_pool & pool_, int kind_, const ggml_tensor * src1_, const int64_t key_[n_key], size_t nbytes) {
+        GGML_ASSERT(!held);
+        pool = &pool_;
+        ptr  = pool->alloc(nbytes, &size);
+        held = true;
+        kind = kind_;
+        src1 = src1_;
+        std::copy(key_, key_ + n_key, key);
+        return ptr;
+    }
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1598,6 +1651,7 @@ struct ggml_backend_cuda_context {
     std::vector<cudaEvent_t> side_mv_join;
 
     ggml_cuda_q8_1_cache q8_1_cache;
+    ggml_cuda_src1_memo  src1_memo;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
