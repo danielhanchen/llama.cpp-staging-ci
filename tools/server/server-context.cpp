@@ -3418,6 +3418,11 @@ private:
 
                 metrics_flush_idle();
 
+                // k11-decode: the next prompt starts from the worst-case pp plan (a verify window may have re-planned it)
+                if (ctx_tgt) {
+                    llama_prepare_prompt_plan(ctx_tgt);
+                }
+
                 return; // skip further processing
 
             } else {

@@ -2172,7 +2172,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     bool ub_reused = false;
 
     // k11-decode: a small output ubatch uses the kept graph of its size (see gf_res_small)
-    static const bool small_cache_env = getenv("LLAMA_GRAPH_SMALL_CACHE") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_CACHE")) != 0;
+    // (only while n-gram drafting verifies exactly, see llama_set_verify_exact: without drafts the kept graphs bought nothing and cost
+    // the next short prompt 7-8% on G4; LLAMA_GRAPH_SMALL_CACHE=2 keeps them always, =0 never)
+    static const int  small_cache_mode = getenv("LLAMA_GRAPH_SMALL_CACHE") == nullptr ? 1 : atoi(getenv("LLAMA_GRAPH_SMALL_CACHE"));
+    const bool small_cache_env = small_cache_mode == 2 || (small_cache_mode == 1 && cparams.verify_exact);
     // (single token decodes and speculative verify windows only: a prompt's short tail keeps the shared graph, as before; G4 LFM2.5
     // 32 GB: with the tails kept too, chat / code prompts were 3 / 9% slower)
     const uint32_t n_small = small_cache_env && moe_cache == nullptr && !graph_reuse_disable && n_outputs > 0 &&
@@ -2830,30 +2833,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // handle any pending shifts/copies
     memory_update(false);
 
-    // k11-decode: a small graph re-planned the graph allocator (speculative verify windows have their own node counts), so the ubatches
-    // of a prompt would each re-plan it again as the KV view grows, every time with a synchronization of all backends (G4: prompts
-    // 2-7% slower with n-gram drafting on). The prompt restores the worst-case pp plan of sched_reserve once instead. The allocator
-    // only plans addresses: outputs cannot change. LLAMA_PP_RERESERVE=0: off.
-    {
-        static const bool pp_rereserve = getenv("LLAMA_PP_RERESERVE") == nullptr || atoi(getenv("LLAMA_PP_RERESERVE")) != 0;
-        if (pp_rereserve && sched_plan_small && memory && !moe_cache && !cparams.verify && n_tokens_all > 2*GF_SMALL_MAX &&
-                !model.hparams.no_alloc) {
-            sched_plan_small = false;
-            synchronize();
-            auto mctx_full = memory->init_full();
-            if (mctx_full) {
-                const uint32_t n_seqs_r     = (model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_MINIMAX_01) ? 1 : cparams.n_seq_max;
-                const uint32_t n_tokens_r   = std::min(cparams.n_ctx, cparams.n_ubatch);
-                const uint32_t n_outputs_r  = std::min(n_tokens_r, cparams.n_outputs_max);
-                if (graph_reserve(n_tokens_r, n_seqs_r, n_outputs_r, mctx_full.get()) == nullptr) {
-                    LLAMA_LOG_WARN("%s: re-reserving the pp graph failed\n", __func__);
-                }
-                if (++n_pp_rereserve == 1 || n_pp_rereserve % 100 == 0) {
-                    LLAMA_LOG_INFO("%s: a small graph re-planned the graph allocator: the prompt reserved the pp graph again (%" PRId64 " times; LLAMA_PP_RERESERVE=0: off)\n",
-                            __func__, n_pp_rereserve);
-                }
-            }
-        }
+    // k11-decode: a prompt of several ubatches after a small graph re-planned the graph allocator restores the worst-case pp plan once
+    // (see restore_pp_plan); the server restores it when its slots go idle, so this is the fallback
+    if (n_tokens_all > cparams.n_ubatch && !cparams.verify) {
+        restore_pp_plan();
     }
 
     llama_memory_context_ptr mctx;
@@ -4612,6 +4595,35 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
+}
+
+// k11-decode: a small graph (a speculative verify window has its own node count) re-plans the graph allocator, so the ubatches of the
+// next prompt would each re-plan it again as the KV view grows, every time with a synchronization of all backends (G4: prompts 2-7%
+// slower with n-gram drafting on). This restores the worst-case pp plan of sched_reserve once. The allocator only plans addresses:
+// outputs cannot change. LLAMA_PP_RERESERVE=0: off.
+bool llama_context::restore_pp_plan() {
+    static const bool pp_rereserve = getenv("LLAMA_PP_RERESERVE") == nullptr || atoi(getenv("LLAMA_PP_RERESERVE")) != 0;
+    if (!pp_rereserve || !sched_plan_small || !memory || moe_cache || model.hparams.no_alloc || sched_need_reserve) {
+        return false;
+    }
+    sched_plan_small = false;
+    synchronize();
+    auto mctx_full = memory->init_full();
+    if (!mctx_full) {
+        return false;
+    }
+    const uint32_t n_seqs_r    = (model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_MINIMAX_01) ? 1 : cparams.n_seq_max;
+    const uint32_t n_tokens_r  = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_outputs_r = std::min(n_tokens_r, cparams.n_outputs_max);
+    if (graph_reserve(n_tokens_r, n_seqs_r, n_outputs_r, mctx_full.get()) == nullptr) {
+        LLAMA_LOG_WARN("%s: re-reserving the pp graph failed\n", __func__);
+        return false;
+    }
+    if (++n_pp_rereserve == 1 || n_pp_rereserve % 100 == 0) {
+        LLAMA_LOG_INFO("%s: a small graph re-planned the graph allocator: the pp graph is reserved again (%" PRId64 " times; LLAMA_PP_RERESERVE=0: off)\n",
+                __func__, n_pp_rereserve);
+    }
+    return true;
 }
 
 void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {
@@ -6955,6 +6967,10 @@ void llama_set_verify(llama_context * ctx, bool value) {
 
 bool llama_exact_verify_enabled(void) {
     return llama_exact_verify_env();
+}
+
+bool llama_prepare_prompt_plan(llama_context * ctx) {
+    return ctx->restore_pp_plan();
 }
 
 void llama_set_verify_exact(llama_context * ctx, bool value) {

@@ -116,6 +116,10 @@ LLAMA_API bool llama_exact_verify_enabled(void);
 // automatic n-gram drafting sets it, so drafting on by default leaves greedy output byte equal to plain decoding)
 LLAMA_API void llama_set_verify_exact(struct llama_context * ctx, bool value);
 
+// k11-decode: restore the worst-case prompt plan of the graph allocator if a small graph (a verify window) re-planned it; a server
+// calls it when its slots go idle, so the next prompt does not pay for it (no-op otherwise; LLAMA_PP_RERESERVE=0: off)
+LLAMA_API bool llama_prepare_prompt_plan(struct llama_context * ctx);
+
 // k11-decode: what a speculative rollback of the architecture (general.architecture) keeps: 0 nothing but KV cells, 1 a small
 // recurrent state (LFM2 short conv), 2 a large recurrent / compressor state (Mamba, GDN, DeepSeek-V4: a snapshot per drafted
 // token is tens of MiB), -1 unknown

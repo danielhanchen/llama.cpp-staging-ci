@@ -140,6 +140,7 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_verify(bool value);
     void set_verify_exact(bool value);
+    bool restore_pp_plan(); // k11-decode (see the definition)
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
