@@ -3425,7 +3425,30 @@ struct llama_moe_cache::impl {
             cm_rate = std::max(0.01, std::min(1.0, std::pow(1.0 - std::max(0.0, std::min(1.0, cache_frac)), 4.0)));
             cm_decide();
         }
-        if (cm_trial && !cm_force) {
+        // k11 (LLAMA_MOE_CPU_MISS_TRIAL_FRAC, default 0.25; 0 = the trials of k10 everywhere): a cache that holds less than this share
+        // of the host experts runs no warm phase and no timing trials, so small batches follow the cost model from the calibration on;
+        // short prompts stay on the plain cache (they need a trial that kept the host path, see cm_prompt_ok). G4 Qwen3.6 UD-Q4_K_XL
+        // 8 GB + MTP (17% cached): the trials turned the draft context's host path off (0.467 vs 0.501 ms per small batch) and ran their
+        // blocks without it, decode -6..-15% against the cost model alone. The cells the trials were made for keep them: Qwen3.6 12 GB
+        // (39% cached, the split costs more than modelled) and gpt-oss-20b Q2_K 8 GB (54%)
+        static const double trial_frac = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC");
+            return e != nullptr ? std::max(0.0, atof(e)) : 0.25;
+        }();
+        const bool trial_skip = cm_trial && !cm_force && cache_frac >= 0.0 && cache_frac < trial_frac;
+        if (trial_skip) {
+            cmt_done      = -1;
+            cmt_wait      = -1;
+            cmt_t_prev    = -1;
+            cmw_on        = false;
+            cm_small_ok   = true;
+            cm_small_live = true;
+            cm_gen++;
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no timing trials at %.1f%% of the host experts cached (below %.0f%%): small batches "
+                "follow the cost model, short prompts stay on the plain cache (LLAMA_MOE_CPU_MISS_TRIAL_FRAC=0 restores the trials)\n",
+                tag, 100.0*cache_frac, 100.0*trial_frac);
+        }
+        if (cm_trial && !cm_force && !trial_skip) {
             // warm phase first (see cmw_on): small batches off, the first trial starts in cm_tick
             cmt_done      = -1;
             cmt_t_prev    = -1;
