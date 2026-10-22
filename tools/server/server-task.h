@@ -648,8 +648,9 @@ struct server_prompt {
 };
 
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    // k11: pooled buffers without a zero-fill (common_state_buf_take / _recycle / _prefault)
+    common_state_buf main;
+    common_state_buf drft;
 
     size_t size() const {
         return main.size() + drft.size();
