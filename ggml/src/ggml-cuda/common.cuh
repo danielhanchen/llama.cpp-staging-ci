@@ -1745,6 +1745,7 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    int prefetch = 0; // k11-decode: mul_mat_vec_f issues the loads of a few iterations together (exact, GGML_CUDA_MMVF_PREFETCH)
 };
 
 struct ggml_cuda_kernel_launch_params {

@@ -147,7 +147,37 @@ static __global__ void mul_mat_vec_f(
             }
         }
 
-        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+        int col2_beg = tid;
+        if constexpr (!has_fusion) {
+            // k11-decode: the loads of MMVF_PREFETCH iterations are issued before their multiply-adds (a few rows with a long K, e.g. the
+            // [10240, 4] F32 HC injections, are latency bound: one load round trip per iteration). Every sum takes the same values in
+            // the same order, so the result is the bytes of the loop below. GGML_CUDA_MMVF_PREFETCH=0: off.
+            constexpr int MMVF_PREFETCH = 4;
+            if (fusion.prefetch) {
+                for (; col2_beg + (MMVF_PREFETCH - 1)*block_size < ncols2; col2_beg += MMVF_PREFETCH*block_size) {
+                    float2 px[MMVF_PREFETCH];
+                    float2 py[MMVF_PREFETCH][ncols_dst];
+#pragma unroll
+                    for (int u = 0; u < MMVF_PREFETCH; ++u) {
+                        px[u] = x2[col2_beg + u*block_size];
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) {
+                            py[u][j] = y2[j*stride_col_y2 + col2_beg + u*block_size];
+                        }
+                    }
+#pragma unroll
+                    for (int u = 0; u < MMVF_PREFETCH; ++u) {
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) {
+                            ggml_cuda_mad(sumf[j], px[u].x, py[u][j].x);
+                            ggml_cuda_mad(sumf[j], px[u].y, py[u][j].y);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (int col2 = col2_beg; col2 < ncols2; col2 += block_size) {
             const float2 tmpx = x2[col2];
             float2 tmpx_gate = make_float2(0.0f, 0.0f);
             if constexpr (has_fusion) {
@@ -669,6 +699,10 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     float         *  dst_d =       (float         *)  dst->data;
 
     ggml_cuda_mm_fusion_args_device fusion_local{};
+    {
+        static const bool prefetch = getenv("GGML_CUDA_MMVF_PREFETCH") == nullptr || atoi(getenv("GGML_CUDA_MMVF_PREFETCH")) != 0;
+        fusion_local.prefetch = prefetch ? 1 : 0;
+    }
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
