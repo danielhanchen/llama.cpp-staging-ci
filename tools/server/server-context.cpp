@@ -259,6 +259,12 @@ static void checkpoints_free_async(std::list<common_prompt_checkpoint> && droppe
         return;
     }
 
+    // their buffers go back to the checkpoint pool first (common_state_buf_recycle, LLAMA_CKPT_POOL)
+    for (auto & ckpt : dropped) {
+        common_state_buf_recycle(std::move(ckpt.data_tgt));
+        common_state_buf_recycle(std::move(ckpt.data_dft));
+    }
+
     static const bool disabled = [] {
         const char * e = getenv("LLAMA_CKPT_FREE_ASYNC");
         return e != nullptr && atoi(e) == 0;

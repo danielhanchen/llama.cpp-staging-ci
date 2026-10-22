@@ -14,6 +14,7 @@
 #include "speculative.h"
 #include "unicode.h"
 
+#include <mutex>
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
@@ -3953,6 +3954,47 @@ void common_prompt_checkpoint::update_pos(
     this->pos_max  = pos_max;
 }
 
+static bool ckpt_pool_on() {
+    static const bool on = getenv("LLAMA_CKPT_POOL") == nullptr || atoi(getenv("LLAMA_CKPT_POOL")) != 0;
+    return on;
+}
+
+static std::mutex                    g_ckpt_pool_mutex;
+static std::vector<common_state_buf> g_ckpt_pool;
+
+void common_state_buf_recycle(common_state_buf && buf) {
+    if (!ckpt_pool_on() || buf.capacity() < (1u << 20)) {
+        return; // small buffers are not worth keeping (buf is freed by its owner)
+    }
+    std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
+    g_ckpt_pool.push_back(std::move(buf));
+    if (g_ckpt_pool.size() > 4) {
+        auto it = std::min_element(g_ckpt_pool.begin(), g_ckpt_pool.end(),
+            [](const common_state_buf & a, const common_state_buf & b) { return a.capacity() < b.capacity(); });
+        g_ckpt_pool.erase(it);
+    }
+}
+
+bool common_state_buf_take(common_state_buf & buf, size_t n) {
+    if (!ckpt_pool_on() || buf.capacity() >= n) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
+    // the smallest that fits
+    auto best = g_ckpt_pool.end();
+    for (auto it = g_ckpt_pool.begin(); it != g_ckpt_pool.end(); ++it) {
+        if (it->capacity() >= n && (best == g_ckpt_pool.end() || it->capacity() < best->capacity())) {
+            best = it;
+        }
+    }
+    if (best == g_ckpt_pool.end()) {
+        return false;
+    }
+    buf = std::move(*best);
+    g_ckpt_pool.erase(best);
+    return true;
+}
+
 static bool ckpt_no_zero_fill() {
     static const bool on = common_mtp_handoff_on("CKPT");
     return on;
@@ -3968,6 +4010,7 @@ void common_prompt_checkpoint::update_tgt(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
+    common_state_buf_take(data_tgt, ckpt_size);
     data_tgt.resize(ckpt_size);
     if (!ckpt_no_zero_fill()) {
         std::fill(data_tgt.begin(), data_tgt.end(), 0); // LLAMA_MTP_HANDOFF_CKPT=0: zero-filled as before
@@ -3989,6 +4032,7 @@ void common_prompt_checkpoint::update_dft(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
+    common_state_buf_take(data_dft, ckpt_size);
     data_dft.resize(ckpt_size);
     if (!ckpt_no_zero_fill()) {
         std::fill(data_dft.begin(), data_dft.end(), 0); // LLAMA_MTP_HANDOFF_CKPT=0: zero-filled as before

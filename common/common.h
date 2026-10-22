@@ -1367,6 +1367,13 @@ struct common_default_init_allocator : std::allocator<T> {
 
 using common_state_buf = std::vector<uint8_t, common_default_init_allocator<uint8_t>>;
 
+// k11 (LLAMA_CKPT_POOL, default on, =0 off): freed checkpoint buffers are kept (at most 4, the largest) and given to the next checkpoint
+// that fits, so its pages are resident: without the zero-fill the state save's host copy otherwise faults every page of a fresh buffer
+// on the save worker, and the next decode() waits for it (G4 Qwen3.6 32 GB, no MTP: 42..600-token prompts -5..-9% vs k10)
+void common_state_buf_recycle(common_state_buf && buf);
+// a buffer of at least n bytes from the pool into buf, if buf is smaller (returns true when one was taken)
+bool common_state_buf_take(common_state_buf & buf, size_t n);
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
