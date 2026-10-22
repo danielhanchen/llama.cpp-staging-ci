@@ -1485,12 +1485,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
+    std::vector<int32_t> verify_h_kept; // rows of verify_h that hold data (the last row is also in pending_h)
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
     // LLAMA_MTP_HANDOFF_COPY=0: the verify rows are copied row by row, as before
     const bool handoff_copy = common_mtp_handoff_on("COPY");
+    // LLAMA_MTP_HANDOFF_VH=0: verify_h keeps every row of a prompt ubatch, as before
+    const bool verify_h_trim = handoff_copy && common_mtp_handoff_on("VH");
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
@@ -1566,6 +1569,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+        verify_h_kept.assign(n_seq, 0);
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1723,11 +1727,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const float * h_beg = handoff_copy ? llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id]) : nullptr;
             const float * h_end = handoff_copy ? llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_end[seq_id]) : nullptr;
             if (h_beg && h_end == h_beg + (size_t) (n_rows - 1) * n_embd) {
-                if (verify_h[seq_id].size() < (size_t) n_rows * n_embd) {
-                    verify_h[seq_id].resize((size_t) n_rows * n_embd);
+                // accept() reads row min(n_accepted, n_rows - 1) and n_accepted <= n_max: a prompt ubatch (thousands of rows,
+                // 160 MiB at 4096 x 10240 floats) keeps its first n_keep rows and the last one (in pending_h), not all of them;
+                // the copy ran on the main thread after the draft was queued, with the GPU idle (LLAMA_MTP_HANDOFF_VH=0: all rows)
+                const int32_t n_keep = verify_h_trim ? std::min<int32_t>(n_rows, std::max<int32_t>(256, n_max + 2)) : n_rows;
+                verify_h_kept[seq_id] = n_keep;
+                if (verify_h[seq_id].size() < (size_t) n_keep * n_embd) {
+                    verify_h[seq_id].resize((size_t) n_keep * n_embd);
                 }
-                std::memcpy(verify_h[seq_id].data(), h_beg, (size_t) n_rows * row_bytes);
+                std::memcpy(verify_h[seq_id].data(), h_beg, (size_t) n_keep * row_bytes);
+                std::memcpy(pending_h[seq_id].data(), h_end, row_bytes);
+                continue;
             } else {
+                verify_h_kept[seq_id] = n_rows;
                 verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
                 for (int32_t i = 0; i < n_rows; ++i) {
@@ -1926,6 +1938,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+        if (i_h >= verify_h_kept[seq_id]) {
+            // only the last row is past the kept ones (n_accepted <= n_max < n_keep), and process() left it in pending_h
+            GGML_ASSERT(i_h == n_rows - 1 && "MTP verify_h: accepted row was not kept");
+            return;
+        }
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
     }
@@ -3010,7 +3027,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // a separate MTP drafter (-md) is one block: its context reads the prompt in ubatches of at most common_draft_ubatch_max()
     // tokens (it splits the target's larger ubatches itself), so its compute buffer stays small and the MoE cache of the target
     // keeps the difference (808 -> 225 MiB on Qwen3.8-Flash-Next at -ub 2048); n_batch is kept, so a target ubatch is one decode
-    if (spec_mtp && has_draft) {
+    // the cap only saves MoE cache memory: without a MoE cache (all experts resident) the drafter reads each target ubatch in one
+    // pass (8 passes of 512 rows per 4096-row ubatch cost ~1.9x its kernel time plus 8 host round trips per ubatch); an explicit
+    // LLAMA_DRAFT_UBATCH_MAX still applies everywhere, LLAMA_MTP_HANDOFF_DUB=0 restores the cap without a MoE cache
+    const bool dub_cap = params.moe_cache_size > 0 || getenv("LLAMA_DRAFT_UBATCH_MAX") != nullptr || !common_mtp_handoff_on("DUB");
+    if (spec_mtp && has_draft && dub_cap) {
         const uint32_t cap = common_draft_ubatch_max();
         if (cap > 0 && (uint32_t) result.n_ubatch > cap) {
             result.n_ubatch = (int32_t) cap;
