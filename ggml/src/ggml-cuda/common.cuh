@@ -1280,8 +1280,6 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
-    // first node of the graphs that share this entry when it is keyed by shape (GGML_CUDA_GRAPH_SHAPE_KEY), else nullptr
-    const void * shape_base = nullptr;
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
@@ -1622,10 +1620,7 @@ struct ggml_backend_cuda_context {
 
     int64_t last_graph_eviction_sweep = 0;
 
-    // shape_base != nullptr: the key is a shape-keyed slot of the graphs whose first node is shape_base. At most
-    // shape_key_max such slots are kept per first node (the least recently used one is dropped when a new size arrives),
-    // so the cache holds at most shape_key_max times the graphs it held before shape keys.
-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr, const void * shape_base = nullptr, int shape_key_max = 0) {
+    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
         const int64_t time_now = ggml_time_us();
 
         // sweep every 5s, evicting cuda graphs unused for >=10s
@@ -1642,23 +1637,7 @@ struct ggml_backend_cuda_context {
 
         auto it = cuda_graphs.find(first_node_ptr);
         if (it == cuda_graphs.end()) {
-            if (shape_base != nullptr && shape_key_max > 0) {
-                int  n_same = 0;
-                auto lru    = cuda_graphs.end();
-                for (auto jt = cuda_graphs.begin(); jt != cuda_graphs.end(); ++jt) {
-                    if (jt->second->shape_base == shape_base) {
-                        n_same++;
-                        if (lru == cuda_graphs.end() || jt->second->last_used_time < lru->second->last_used_time) {
-                            lru = jt;
-                        }
-                    }
-                }
-                if (n_same >= shape_key_max && lru != cuda_graphs.end()) {
-                    cuda_graphs.erase(lru);
-                }
-            }
             it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
-            it->second->shape_base = shape_base;
         }
         it->second->last_used_time = time_now;
         return it->second.get();
