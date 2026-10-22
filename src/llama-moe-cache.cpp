@@ -3398,13 +3398,24 @@ struct llama_moe_cache::impl {
 
         cm_share.assign(cm_max + 1, 1.0f);
         cm_on.assign(cm_max + 1, 0);
+        // k11 LLAMA_MOE_CPU_MISS_FETCH_SCALE=s (opt-in, unset = 1): the fetched share scaled by s before the levels, with a level of 1/16
+        // below 1/8. The balance above treats a fetch as running beside the device work, but the fetch kernel reads host memory in the
+        // device stream (G4 q4x + MTP 8 GB nsys: 45% of the decode window), so the device side of the balance is slower than cm_tup says;
+        // G4 with a fixed share of 0.1 instead of 0.25: decode +13.5 / +16.1 / +4.7% (chat / 2k / 8k)
+        static const double fetch_scale = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_FETCH_SCALE");
+            return e != nullptr ? std::max(0.0, atof(e)) : 1.0;
+        }();
         for (int64_t n = 1; n <= cm_max; ++n) {
             const double D    = cm_distinct(n, n_expert);
             const double tbar = std::max(1.0, (double) n*std::min<int64_t>(n_expert_used, n_expert)/D);
             const double tc   = cm_t1 + (tbar - 1.0)*cm_dt;
-            const double raw  = tc/(tc + cm_tup);
+            const double raw  = tc/(tc + cm_tup)*fetch_scale;
             // log levels: two calibrations a little apart rarely fall on two sides of a level
             cm_share[n] = raw <= 0.177 ? 0.125f : raw <= 0.354 ? 0.25f : raw <= 0.612 ? 0.5f : raw <= 0.80 ? 0.75f : 1.0f;
+            if (fetch_scale != 1.0 && raw <= 0.088) {
+                cm_share[n] = 0.0625f;
+            }
         }
         cm_cal = true;
         // the first prompt and tokens run before any measured miss rate: a prior from the cached share c of the experts, (1 - c)^4
