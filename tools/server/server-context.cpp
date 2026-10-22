@@ -367,9 +367,19 @@ struct server_slot {
             return false;
         }
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        // k11 (LLAMA_PROMPT_SAVE_ASYNC=0 turns it off): the device copies are queued in stream order before the next decode, the host
+        // copy into the cache entry runs on the context's state worker; the cache waits for it before it reads, erases or evicts
+        // the entry (server_prompt_cache::wait_inflight). Larger states than LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB (512) are saved as before.
+        static const bool async_on = getenv("LLAMA_PROMPT_SAVE_ASYNC") == nullptr || atoi(getenv("LLAMA_PROMPT_SAVE_ASYNC")) != 0;
+        static const size_t async_max = (size_t) (getenv("LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB") ? std::max(0, atoi(getenv("LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB"))) : 512) << 20;
+        const llama_state_seq_flags fl = async_on && cur_size <= async_max ? LLAMA_STATE_SEQ_FLAGS_ASYNC : LLAMA_STATE_SEQ_FLAGS_NONE;
+
+        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, fl);
         if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, fl);
+        }
+        if (fl & LLAMA_STATE_SEQ_FLAGS_ASYNC) {
+            prompt_cache.inflight = cur;
         }
 
         return true;
@@ -1123,6 +1133,9 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        if (prompt_cache) {
+            prompt_cache->wait_inflight(); // an asynchronous prompt save is complete before the contexts go
+        }
         spec.reset();
         spec_init.reset();
 
@@ -1608,6 +1621,12 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache->wait_reads = [this]() {
+                llama_state_seq_async_wait(ctx_tgt);
+                if (ctx_dft) {
+                    llama_state_seq_async_wait(ctx_dft);
+                }
+            };
         } else {
             if (!params_base.cache_ssd_dir.empty()) {
                 SRV_WRN("%s", "--cache-ssd-dir requires the RAM prompt cache (--cache-ram), disabling the SSD tier\n");

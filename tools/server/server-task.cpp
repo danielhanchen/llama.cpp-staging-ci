@@ -1749,6 +1749,8 @@ static std::list<common_prompt_checkpoint> prompt_checkpoints_clone(const std::l
 }
 
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+    wait_inflight(); // the previous save is complete before entries are compared, erased or evicted
+
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -1917,6 +1919,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
+        if (&*it_best == inflight) {
+            wait_inflight();
+        }
+
         {
             auto & data = it_best->data.main;
 
@@ -1965,6 +1971,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 void server_prompt_cache::evict_front() {
     if (states.empty()) {
         return;
+    }
+    if (&states.front() == inflight) {
+        wait_inflight();
     }
     if (ssd != nullptr) {
         ssd->put(std::move(states.front()));
