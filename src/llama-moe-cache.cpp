@@ -1620,7 +1620,9 @@ struct llama_moe_cache::impl {
         const char * e = getenv("LLAMA_MOE_SINGLE_TIMEOUT_MS");
         return e != nullptr ? std::max(1, atoi(e)) : 1000;
     }();
-    // the split the rule weighs for these batches: a publish and a merge instead of a graph split (LLAMA_MOE_SINGLE_SPLIT_FRAC)
+    // the split the rule weighs for these batches: a publish and a merge instead of a graph split (LLAMA_MOE_SINGLE_SPLIT_FRAC), only
+    // once this cache has a mailbox (a form the host thread computes: G4 gpt-oss-20b Q2_K, with biases, kept the split and lost 18-20%
+    // decode when the rule weighed it as a mailbox)
     const double single_split_frac = [] {
         const char * e = getenv("LLAMA_MOE_SINGLE_SPLIT_FRAC");
         return e != nullptr ? std::max(0.0, atof(e)) : 0.2;
@@ -4038,7 +4040,7 @@ struct llama_moe_cache::impl {
                 const double f    = cm_share[n];
                 const double m    = cm_rate*D;
                 const double gain = m*(cm_tup - std::max(f*cm_tup, (1.0 - f)*tc));
-                const double need = (n <= max_batch ? cm_margin*cm_split_scale*cm_split*(single_usable(n) ? single_split_frac : 1.0) :
+                const double need = (n <= max_batch ? cm_margin*cm_split_scale*cm_split*(single_reg && single_usable(n) ? single_split_frac : 1.0) :
                                      cm_margin_p*(cm_split + n*cm_act))*
                                     (cm_on[n] && cm_measured ? cm_hyst : 1.0);
                 // a batch above max_batch runs the host path in the groups whose slots hold its experts (see use_device), the
