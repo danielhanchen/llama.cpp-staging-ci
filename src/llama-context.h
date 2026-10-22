@@ -603,8 +603,8 @@ private:
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
 
-    // k11 (LLAMA_MOE_HOST_THREADS): the threads of the ubatches whose missing experts the host may compute (CPU misses, hybrid MoE
-    // cache): every logical CPU the process may use (affinity, cgroup quota) instead of the decode threads; 0 = off
+    // k11 (LLAMA_MOE_HOST_THREADS=N | auto, opt-in): the threads of the ubatches whose missing experts the host computes (CPU misses,
+    // hybrid MoE cache) instead of the decode threads; auto = every logical CPU the process may use (affinity, cgroup quota); 0 = off
     int32_t           n_threads_host       = 0;
     ggml_threadpool_t threadpool_host      = nullptr; // own pool when the caller attached threadpools (sized to their threads)
     void (*threadpool_host_free)(ggml_threadpool_t) = nullptr;

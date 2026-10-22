@@ -58,14 +58,15 @@ static int64_t common_fit_moe_margin(int64_t m) {
     if (!g_moe_margin_auto || m < m_default) {
         return m;
     }
+    // opt-in (k11 G4 timing): the 8 GB tiers use the default margin at run time (layer-major groups, prefetch depth, the MTP context's
+    // staging, the CUDA pools: 70 MiB free at the low point of Qwen3.6 UD-Q4_K_XL + MTP); 384 MiB ran out of device memory there and on
+    // Flash-Next UD-IQ1_S, and halved the 8k prompt of Qwen3.6 Q3_K_M
     const char * env = getenv("LLAMA_MOE_FIT_MARGIN");
-    if (env != nullptr && atoi(env) == 0) {
+    const char * e   = getenv("LLAMA_MOE_FIT_MARGIN_MIB");
+    if ((env != nullptr && atoi(env) == 0) || e == nullptr) {
         return m;
     }
-    int64_t keep = 384*MiB_;
-    if (const char * e = getenv("LLAMA_MOE_FIT_MARGIN_MIB")) {
-        keep = std::max<int64_t>(0, atoll(e))*MiB_;
-    }
+    const int64_t keep = std::max<int64_t>(0, atoll(e))*MiB_;
     // what was added to the default (e.g. a multimodal projector) stays
     return m - m_default + std::min(keep, m_default);
 }

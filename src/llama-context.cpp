@@ -740,7 +740,7 @@ llama_context::llama_context(
             n_threads_host = host_threads_init();
             if (n_threads_host > 0 && !model.hparams.no_alloc) {
                 LLAMA_LOG_INFO("%s: MoE cache: ubatches whose missing experts the host may compute run on %d threads instead of %d "
-                    "(LLAMA_MOE_HOST_THREADS=0 off, =N sets them)\n", __func__, n_threads_host, (int) cparams.n_threads);
+                    "(LLAMA_MOE_HOST_THREADS, opt-in)\n", __func__, n_threads_host, (int) cparams.n_threads);
             }
             // the default hybrid path takes its fetch share from the decode threads, so it does not depend on timing
             moe_cache->hybrid_set_threads(n_threads_host > 0 ? n_threads_host : (int32_t) cparams.n_threads, model.hparams.no_alloc);
@@ -4620,14 +4620,19 @@ void llama_context::vram_watch_sample(bool force) {
 
 int32_t llama_context::host_threads_init() const {
     const char * env = getenv("LLAMA_MOE_HOST_THREADS");
+    if (env != nullptr && strcmp(env, "auto") == 0) {
+        // every usable logical CPU (affinity, cgroup quota), only when that is more than the decode threads
+        const int32_t n = (int32_t) llama_sysmem::usable_cpus();
+        return n > (int32_t) cparams.n_threads ? n : 0;
+    }
     if (env != nullptr) {
         // =N: N threads (=0 off: the decode threads, as before k11)
         const int32_t n = atoi(env);
         return n > 0 && n != (int32_t) cparams.n_threads ? n : 0;
     }
-    // default: every usable logical CPU, only when that is more than the decode threads
-    const int32_t n = (int32_t) llama_sysmem::usable_cpus();
-    return n > (int32_t) cparams.n_threads ? n : 0;
+    // opt-in: every usable logical CPU lost 8-9% decode on a G4 (48 vCPU, 24 -> 48 threads, Qwen3.6 UD-Q4_K_XL 8 GB + MTP, the same
+    // host experts and text); =auto takes them anyway
+    return 0;
 }
 
 bool llama_context::host_threads_for(int64_t n_tokens) const {
