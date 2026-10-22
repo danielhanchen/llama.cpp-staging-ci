@@ -4291,7 +4291,8 @@ private:
                                 const int n_last = std::min(n_batch_clamp, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     // k11: under layer-major prompts the batch goes on past the far checkpoint, its ubatches end there
-                                    if (k == 0 && offset != 4 && lm_ckpt_merge_ok(slot, n_tokens_prev, lm)) {
+                                    // (only when the rest up to the near checkpoint fits this batch: else the batches, so the ubatches, would differ)
+                                    if (k == 0 && offset != 4 && batch.size() + (n_last - 4) <= n_batch && lm_ckpt_merge_ok(slot, n_tokens_prev, lm)) {
                                         lm_breaks.push_back(batch.size());
                                         break;
                                     }
