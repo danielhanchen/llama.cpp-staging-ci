@@ -1605,6 +1605,15 @@ struct ggml_cuda_src1_memo {
     int64_t n_reused      = 0;
     int64_t bytes_skipped = 0;
 
+    void note_reuse(const ggml_tensor * src1_) {
+        n_reused++;
+        bytes_skipped += ggml_nbytes(src1_);
+        if (n_reused == 1 || n_reused == 1000 || n_reused == 100000) {
+            GGML_LOG_INFO("ggml_cuda_src1_memo: %lld conversions of src1 reused so far (%.1f MiB not converted again; GGML_CUDA_SRC1_MEMO=0 turns it off)\n",
+                (long long) n_reused, bytes_skipped / 1048576.0);
+        }
+    }
+
     bool match(int kind_, const ggml_tensor * src1_, const int64_t key_[n_key]) const {
         return held && kind == kind_ && src1 == src1_ && std::equal(key, key + n_key, key_);
     }

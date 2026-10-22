@@ -1558,8 +1558,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     } else if (memo_ok && (memo.held || memo.share_next)) {
         const bool converted = memo.held;
         if (converted) {
-            memo.n_reused++;
-            memo.bytes_skipped += ggml_nbytes(src1);
+            memo.note_reuse(src1);
         } else {
             memo.hold(ctx.pool(), 2, src1, memo_key, ggml_nelements(src1)*sizeof(cuda_t));
             const auto convert_func = traits::convert(src1->type);

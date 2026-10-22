@@ -261,8 +261,7 @@ void ggml_cuda_mul_mat_q(
             if (memo.match(1, src1, key)) {
                 memo_q8_1      = (const char *) memo.ptr;
                 memo_quantized = true;
-                memo.n_reused++;
-                memo.bytes_skipped += ggml_nbytes(src1);
+                memo.note_reuse(src1);
             } else {
                 memo.release();
                 if (memo.share_next) {
@@ -401,8 +400,7 @@ void ggml_cuda_mul_mat_q(
     const int64_t ne13_flat = 1;
 
     if (memo_hit) {
-        memo.n_reused++;
-        memo.bytes_skipped += ggml_nbytes(src1);
+        memo.note_reuse(src1);
     } else {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
