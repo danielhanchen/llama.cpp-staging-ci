@@ -11,6 +11,11 @@
 #include <cstdint>
 #include <fstream>
 #include <string>
+#include <thread>
+
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 #if defined(__APPLE__) && defined(__MACH__)
 #include <mach/mach.h>
@@ -159,6 +164,73 @@ inline uint64_t available() {
 #else
     return 0;
 #endif
+}
+
+// CPUs a cgroup quota allows (cpu.max "quota period" on v2, cpu.cfs_quota_us / cpu.cfs_period_us on v1, the tightest of the cgroup and
+// its parents, rounded up), 0 if there is no quota
+inline uint32_t cgroup_cpus(const std::string & proc_cgroup, const std::string & sys_root) {
+    uint32_t res = 0;
+    std::ifstream f(proc_cgroup);
+    std::string line;
+    while (std::getline(f, line)) {
+        const size_t a = line.find(':');
+        const size_t b = a == std::string::npos ? a : line.find(':', a + 1);
+        if (b == std::string::npos) {
+            continue;
+        }
+        const std::string ctrl = line.substr(a + 1, b - a - 1);
+        std::string path = line.substr(b + 1);
+        const bool v2 = line.compare(0, a, "0") == 0 && ctrl.empty();
+        if (!v2 && ("," + ctrl + ",").find(",cpu,") == std::string::npos) {
+            continue;
+        }
+        const std::string root = v2 ? sys_root : sys_root + "/cpu";
+        while (true) {
+            const std::string dir = root + (path == "/" ? "" : path);
+            uint64_t quota = 0;
+            uint64_t period = 0;
+            bool ok = false;
+            if (v2) {
+                std::ifstream fm(dir + "/cpu.max");
+                std::string q;
+                if (fm >> q >> period && q != "max") {
+                    try { quota = std::stoull(q); ok = true; } catch (...) { ok = false; }
+                }
+            } else {
+                long long q = -1;
+                std::ifstream fq(dir + "/cpu.cfs_quota_us");
+                ok = (bool) (fq >> q) && q > 0 && read_u64(dir + "/cpu.cfs_period_us", period);
+                quota = ok ? (uint64_t) q : 0;
+            }
+            if (ok && period > 0 && quota > 0) {
+                const uint32_t n = (uint32_t) std::max<uint64_t>(1, (quota + period - 1)/period);
+                res = res == 0 ? n : std::min(res, n);
+            }
+            if (path.empty() || path == "/") {
+                break;
+            }
+            const size_t p = path.find_last_of('/');
+            path = p == 0 || p == std::string::npos ? "/" : path.substr(0, p);
+        }
+    }
+    return res;
+}
+
+// logical CPUs this process may run on: the affinity mask (Linux), capped by a cgroup CPU quota
+inline uint32_t usable_cpus() {
+    uint32_t n = std::max(1u, std::thread::hardware_concurrency());
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        n = std::max(1, CPU_COUNT(&set));
+    }
+    const uint32_t q = cgroup_cpus("/proc/self/cgroup", "/sys/fs/cgroup");
+    if (q > 0) {
+        n = std::min(n, q);
+    }
+#endif
+    return n;
 }
 
 } // namespace llama_sysmem

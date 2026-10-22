@@ -87,6 +87,8 @@ public:
 
     // true if the graphs of small batches may use the hybrid path
     bool hybrid_active() const;
+    // the host computes some missing experts of a ubatch of n_tokens now (CPU misses on for that size, or the hybrid path)
+    bool host_computes(int64_t n_tokens) const;
     // graph key: 0 = plain lookups, 1 = lookups that keep the use counters, 2 = hybrid, + 4 with the fetch overlap
     int  hybrid_mode() const;
 

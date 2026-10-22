@@ -1583,6 +1583,9 @@ struct ggml_cuda_q8_1_cache {
     }
 };
 
+// device memory this process allocated (ggml-cuda.cu, GGML_CUDA_FAKE_FREE_MIB)
+void ggml_cuda_own_add(int device, int64_t bytes);
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1698,6 +1701,7 @@ struct ggml_backend_cuda_context {
                 cublas_workspace_sizes[device] = (cc >= GGML_CUDA_CC_HOPPER) ? 32 * 1024 * 1024 : 4 * 1024 * 1024;
             }
             CUDA_CHECK(cudaMalloc(&cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
+            ggml_cuda_own_add(device, (int64_t) cublas_workspace_sizes[device]);
             CUBLAS_CHECK(cublasSetWorkspace(cublas_handles[device][curr_stream_no], cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
 #endif
         }

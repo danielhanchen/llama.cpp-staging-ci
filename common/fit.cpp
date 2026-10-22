@@ -40,6 +40,36 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+static bool    g_moe_margin_auto = true;
+static int64_t g_moe_margin_gain = 0;
+
+void common_fit_set_moe_margin_auto(bool auto_margin) {
+    g_moe_margin_auto = auto_margin;
+}
+
+int64_t common_fit_moe_margin_gain() {
+    return g_moe_margin_gain;
+}
+
+// the margin of a device beside a MoE cache for the default margin m (see common_fit_set_moe_margin_auto)
+static int64_t common_fit_moe_margin(int64_t m) {
+    constexpr int64_t MiB_ = 1024*1024;
+    constexpr int64_t m_default = 1024*MiB_;
+    if (!g_moe_margin_auto || m < m_default) {
+        return m;
+    }
+    const char * env = getenv("LLAMA_MOE_FIT_MARGIN");
+    if (env != nullptr && atoi(env) == 0) {
+        return m;
+    }
+    int64_t keep = 384*MiB_;
+    if (const char * e = getenv("LLAMA_MOE_FIT_MARGIN_MIB")) {
+        keep = std::max<int64_t>(0, atoll(e))*MiB_;
+    }
+    // what was added to the default (e.g. a multimodal projector) stays
+    return m - m_default + std::min(keep, m_default);
+}
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
@@ -374,6 +404,7 @@ static void common_params_fit_impl(
     // with several devices every device must meet its own target: the cache is split over the devices of its layers, so a device short of
     // memory needs the total shrunk by its deficit scaled by its share of the cache (a total surplus can hide a device that misses its target)
     auto fit_moe_cache_size = [&](dmds_t & dmds, const llama_model_params * mp, const bool use_margins) -> int64_t {
+        g_moe_margin_gain = 0; // the last sizing of the cache decides
         auto margin_of = [&](size_t id) -> int64_t {
             return use_margins ? int64_t(margins[id]) : 0;
         };
@@ -413,6 +444,13 @@ static void common_params_fit_impl(
         if (cache_bytes <= 0) {
             return surplus; // no layer of this placement uses the cache
         }
+        // k11: the part of the margin beside the cache it may take once every other decision is made (common_fit_moe_margin_gain)
+        int64_t margin_gain = 0;
+        for (size_t id = 0; id < nd; id++) {
+            if (use_margins && int64_t(dmds[id].mb.total()) > int64_t(dmds_nc[id].mb.total())) {
+                margin_gain += int64_t(margins[id]) - common_fit_moe_margin(int64_t(margins[id]));
+            }
+        }
 
         // bytes of cache to give back so that the total and every device meet their targets, INT64_MAX if a device misses its target
         // even without its share of the cache
@@ -450,6 +488,9 @@ static void common_params_fit_impl(
             if (need <= 0) {
                 LOG_TRC("%s: MoE cache reduced from %" PRId64 " to %" PRId64 " MiB to keep the layers in device memory\n",
                     __func__, size_requested/MiB, size/MiB);
+                if (margin_gain > 0) {
+                    g_moe_margin_gain = std::min<int64_t>(margin_gain, size_requested - size);
+                }
                 dmds = dmds_test;
                 return surplus_of(dmds_test);
             }
@@ -1313,6 +1354,7 @@ enum common_params_fit_status common_fit_params(
         common_fit_kv_resident kv_resident) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
+    g_moe_margin_gain = 0;
     try {
         common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level, kv_resident);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);

@@ -48,6 +48,16 @@ common_params_fit_status common_fit_params(
                      ggml_log_level   log_level,             // minimum log level to print during fitting, lower levels go to debug log
              common_fit_kv_resident   kv_resident = COMMON_FIT_KV_RESIDENT_AUTO); // placement for dense models that do not fit
 
+// k11 (LLAMA_MOE_FIT_MARGIN): the margin the fit keeps free beside a MoE cache. The fit sizes the cache with the full margin
+// (--fit-target, default 1024 MiB), so every decision that follows the cache size (n_ubatch, lending, the resident rule) is the same as
+// before; then the cache gets the part of the default margin beyond LLAMA_MOE_FIT_MARGIN_MIB (default 384): a spilled context takes far
+// less than 1 GiB after the fit (compute buffers, KV and caches are measured). An explicit --fit-target is kept as given;
+// LLAMA_MOE_FIT_MARGIN=0 keeps the full margin.
+//   - auto = false: the user gave --fit-target (call before each fit)
+//   - common_fit_moe_margin_gain: bytes of the margin the last fit leaves to its MoE cache (0 if the fit did not shrink a cache)
+void    common_fit_set_moe_margin_auto(bool auto_margin);
+int64_t common_fit_moe_margin_gain();
+
 // print estimated memory to stdout
 void common_fit_print(
                          const char * path_model,

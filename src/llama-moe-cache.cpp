@@ -5356,6 +5356,13 @@ bool llama_moe_cache::hybrid_active() const {
     return pimpl->hybrid_active();
 }
 
+bool llama_moe_cache::host_computes(int64_t n_tokens) const {
+    if (pimpl->cm) {
+        return pimpl->cm_share_of(n_tokens) < 1.0f;
+    }
+    return n_tokens <= n_small_max && pimpl->hybrid_active();
+}
+
 bool llama_moe_cache::cpu_miss_enabled() const {
     return pimpl->cm;
 }

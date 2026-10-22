@@ -2060,6 +2060,7 @@ static bool common_fit_draft_on_cpu(
         mp.tensor_buft_overrides = tbo.data();
     }
     std::vector<size_t> margins = params.fit_params_target;
+    common_fit_set_moe_margin_auto(!params.fit_params_target_set);
     const size_t requested = cparams.moe_cache_size;
     cp.moe_cache_size = std::max<size_t>(requested, (size_t) 1 << 40);
 
@@ -2194,6 +2195,7 @@ static void common_moe_resident_ubatch(common_params & params, llama_model_param
         mp.tensor_buft_overrides = tbo.data();
     }
     std::vector<size_t> margins = params.fit_params_target;
+    common_fit_set_moe_margin_auto(!params.fit_params_target_set);
     const auto status = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(), tbo.empty() ? nullptr : tbo.data(),
         margins.data(), params.fit_params_min_ctx, extra, log_level, params.fit_kv_resident);
     if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS || cp.n_ubatch != u || cp.n_ctx != cparams.n_ctx || mp.n_gpu_layers != mparams.n_gpu_layers ||
@@ -2242,6 +2244,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // --moe-cache-mib auto: the fit sizes the cache (the fitted size is kept in params, so that a reload from params, e.g. the server
     // waking from sleep, gets the same cache)
     const bool moe_cache_auto = common_moe_cache_auto_resolve(params, params.fit_params);
+    int64_t moe_margin_gain = 0; // the part of the fitted MoE cache that came from the reduced margin beside it (common_fit_moe_margin_gain)
 
     // --weight-stream on means what LLAMA_WEIGHT_STREAM=1 does for the automatic expert pinning of the model loader (which reads the
     // environment, it has no weight stream parameter): the experts stay mapped, so the weight stream and its RAM tier serve them instead
@@ -2367,6 +2370,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             }
         }
 
+        common_fit_set_moe_margin_auto(!params.fit_params_target_set);
         const common_params_fit_status fit_status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
@@ -2375,6 +2379,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             (has_draft || spec_mtp) && !draft_off ? &extra : nullptr,
             fit_log_level,
             params.fit_kv_resident);
+        moe_margin_gain = fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS ? common_fit_moe_margin_gain() : 0;
 
         // --moe-cache-mib auto that the fit did not size (a failed or skipped fit, no host experts on a device) is no cache, as with
         // the release: the unbounded request must never reach the context
@@ -2407,6 +2412,17 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     if (!model_only) {
         common_moe_cache_auto_ubatch(params, mparams, cparams);
+    }
+
+    // k11 (LLAMA_MOE_FIT_MARGIN): once n_ubatch, lending and the load mode follow the cache the fit sized with the full margin, the
+    // cache takes the part of the default margin a spilled context does not need (see common_fit_moe_margin_gain)
+    if (!model_only && moe_margin_gain > 0 && cparams.moe_cache_size > 0 && cparams.moe_cache_size < COMMON_MOE_CACHE_AUTO_BYTES) {
+        cparams.moe_cache_size += (size_t) moe_margin_gain;
+        params.moe_cache_size   = cparams.moe_cache_size;
+        COM_INF("%s: MoE cache %zu MiB: +%" PRId64 " MiB of the fit margin beside it (LLAMA_MOE_FIT_MARGIN_MIB, LLAMA_MOE_FIT_MARGIN=0 off)\n",
+            __func__, cparams.moe_cache_size/(1024*1024), moe_margin_gain/(1024*1024));
+    } else {
+        moe_margin_gain = 0;
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -2511,7 +2527,20 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_mem_reserve    = reserve_bytes.size();
     }
 
+    // -t given: the threads that compute missing experts on the host are the user's too (k11 LLAMA_MOE_HOST_THREADS)
+    if (params.n_threads_set && getenv("LLAMA_MOE_HOST_THREADS") == nullptr) {
+        common_set_env("LLAMA_MOE_HOST_THREADS", "0");
+    }
     llama_context * lctx = llama_init_from_model(model, cparams);
+    if (lctx == NULL && moe_margin_gain > 0 && cparams.moe_cache_size > (size_t) moe_margin_gain) {
+        // the MoE cache got memory of the default margin (common_fit_moe_margin_gain) and the context does not fit: the cache of the
+        // full margin
+        cparams.moe_cache_size -= (size_t) moe_margin_gain;
+        params.moe_cache_size   = cparams.moe_cache_size;
+        COM_WRN("%s: the context does not fit beside the MoE cache with the reduced margin: retrying with a MoE cache of %zu MiB "
+            "(LLAMA_MOE_FIT_MARGIN=0 keeps the full margin)\n", __func__, cparams.moe_cache_size/(1024*1024));
+        lctx = llama_init_from_model(model, cparams);
+    }
     cparams.mem_reserve_devs = nullptr;
     cparams.mem_reserve      = nullptr;
     cparams.n_mem_reserve    = 0;
