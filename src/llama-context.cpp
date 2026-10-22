@@ -2603,10 +2603,11 @@ struct ple_decode_meter {
 };
 }
 
-// k11: an asynchronous state save queued before a decode() call completes at the next synchronize() / state call /
-// llama_state_seq_async_wait(), so its host copy overlaps the GPU work of that decode (LLAMA_STATE_ASYNC_LAZY=0: when decode() returns, as before)
+// k11 (LLAMA_STATE_ASYNC_LAZY=1, opt-in): an asynchronous state save queued before a decode() call completes at the next synchronize() /
+// state call / llama_state_seq_async_wait() instead of when decode() returns. No gain measured (G4 Qwen3.6 32 GB chat / c400 within
+// noise): the worker's copy into a fresh checkpoint buffer outlasts the 4-token decode it would overlap, so the sync for its logits waits anyway
 static bool state_async_lazy() {
-    static const bool on = getenv("LLAMA_STATE_ASYNC_LAZY") == nullptr || atoi(getenv("LLAMA_STATE_ASYNC_LAZY")) != 0;
+    static const bool on = getenv("LLAMA_STATE_ASYNC_LAZY") != nullptr && atoi(getenv("LLAMA_STATE_ASYNC_LAZY")) != 0;
     return on;
 }
 

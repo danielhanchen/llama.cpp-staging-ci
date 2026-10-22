@@ -3391,10 +3391,14 @@ private:
     };
 #endif
 
-    // k11 (LLAMA_LM_CKPT_MERGE, default on): see lm_breaks. Only for a slot alone in the batch, a target with layer-major prompts,
-    // no mtmd input and speculative impls that read the target rows of a segment (MTP, draft models, n-gram)
+    // k11 (LLAMA_LM_CKPT_MERGE=1, opt-in): see lm_breaks. Only for a slot alone in the batch, a target with layer-major prompts,
+    // no mtmd input and speculative impls that read the target rows of a segment (MTP, draft models, n-gram).
+    // Opt-in: the prompt's ubatches and kernels are those of the separate calls, but the MoE cache is seeded once (from the
+    // routing of the ubatch before the last) instead of once per call, so the cache holds other experts after the prompt; where
+    // the host computes misses or the fetch overlap splits a layer by hit / miss, the decode that follows then differs from k10
+    // (G4 Qwen3.6 UD-Q4_K_XL + MTP 8 GB: other text from token 14 / 31 / >64 of the 2k / 4.6k / 8k cells)
     bool lm_ckpt_merge_ok(const server_slot & slot, int32_t n_tokens_prev, bool lm_ckpt) const {
-        static const bool on = getenv("LLAMA_LM_CKPT_MERGE") == nullptr || atoi(getenv("LLAMA_LM_CKPT_MERGE")) != 0;
+        static const bool on = getenv("LLAMA_LM_CKPT_MERGE") != nullptr && atoi(getenv("LLAMA_LM_CKPT_MERGE")) != 0;
         return on && !lm_ckpt && n_tokens_prev == 0 && !slot.task->tokens.has_mtmd && llama_layer_major_on(ctx_tgt) &&
             common_speculative_rows_ok(spec.get());
     }
