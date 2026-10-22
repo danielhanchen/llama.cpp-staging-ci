@@ -138,6 +138,7 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_verify(bool value);
+    void set_verify_exact(bool value);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
@@ -611,6 +612,32 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // k11-decode: the graphs of small output ubatches (1..8 tokens: decode and speculative verify windows) are kept per size, so a
+    // switch between a decode and a verify window re-allocates the kept graph instead of building it again (LLAMA_GRAPH_SMALL_CACHE=0:
+    // one graph for all sizes, as before). gf_res_epoch counts every invalidation of the kept graphs (memory updates, reserves)
+    // four kept graphs per size: after a recurrent rollback the state cells and the restore copy differ for a few decodes
+    static constexpr uint32_t GF_SMALL_MAX  = 8;
+    static constexpr uint32_t GF_SMALL_WAYS = 4;
+    static constexpr uint32_t GF_SMALL_N    = (GF_SMALL_MAX + 1)*GF_SMALL_WAYS;
+    std::array<llm_graph_result_ptr, GF_SMALL_N> gf_res_small;
+    std::array<uint64_t, GF_SMALL_N>             gf_res_small_epoch{};
+    std::array<bool, GF_SMALL_N>                 gf_res_small_built{};
+    std::array<uint64_t, GF_SMALL_N>             gf_res_small_used{};
+    uint64_t gf_res_epoch = 1;
+    uint64_t n_small_swaps = 0;
+    uint64_t n_small_uses  = 0;
+    // the scheduler rewrites a graph it allocates (split input copies in its own context, tensor addresses): each kept graph's
+    // tensors as built, restored before the graph is allocated again, so the allocation sees the graph a build would give
+    struct gf_tensor_state {
+        ggml_tensor * t;
+        ggml_tensor * src[GGML_MAX_SRC];
+        void * data;
+        ggml_backend_buffer_t buffer;
+        void * extra;
+        int32_t flags;
+    };
+    std::array<std::vector<gf_tensor_state>, GF_SMALL_N> gf_res_small_state;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

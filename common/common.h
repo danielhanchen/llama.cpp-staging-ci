@@ -383,6 +383,10 @@ struct common_params_speculative_ngram_suffix {
     int32_t n_long_match = 8;
     float   p_cut        = 0.6f;
     float   p_take       = 0.9f;
+    // k11-decode: alone, the cost-priced window choice (common/spec-cost-policy.h) replaces the n_min_draft / p_cut gate.
+    // auto_mode: the server turned this drafter on by itself (no --spec-type given, LLAMA_SPEC_AUTO); policy is on there
+    // (LLAMA_SPEC_SUFFIX_POLICY=0 restores the k9 gate, =1 also prices an explicit --spec-type ngram-suffix)
+    bool    auto_mode    = false;
 };
 
 struct common_params_speculative_ngram_map {
