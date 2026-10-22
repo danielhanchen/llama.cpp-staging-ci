@@ -36,7 +36,7 @@ struct common_spec_cost_policy {
     static constexpr int    SKIP    = 2;      // the first rounds of a size build its graph and capture it: not its cost
 
     double margin = 0.03;
-    bool   gain_gate = true;   // LLAMA_SPEC_POLICY_GAIN=0: off
+    bool   gain_gate = false;  // LLAMA_SPEC_POLICY_GAIN=1: on (G4 LFM2.5 32 GB: it stopped the short window of a repeat, rep -5%; no cell gained)
     int    short_k   = 3;      // the drafts of the short window (the gain gate's window)
 
     std::array<double, MAX_T + 1> cost{}, cost_n{}, last{};
