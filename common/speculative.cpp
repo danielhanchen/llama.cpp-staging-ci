@@ -229,6 +229,11 @@ struct common_speculative_impl {
 
     virtual bool process(const common_batch & batch) = 0;
 
+    // k11 (LLAMA_LM_CKPT_MERGE): process() reads the target's rows from this batch index on (a segment of a merged prompt batch);
+    // impls that read target features without honouring it say so
+    int32_t nextn_row_offset = 0;
+    virtual bool row_offset_ok() const { return true; }
+
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
@@ -535,6 +540,8 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 //      in verify mode, have process() only stash features and let draft() seed run
 //      encoder+decoder on n_accepted+1 rows).
 struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
+    bool row_offset_ok() const override { return false; }
+
     common_params_speculative_draft params;
     common_batch batch;     // decoder input, (token, g_embd) pairs
     common_batch batch_enc; // encoder input, built from the extracted target features
@@ -1003,6 +1010,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+    bool row_offset_ok() const override { return false; }
+
     common_params_speculative_draft params;
 
     common_batch batch;        // noise tokens
@@ -1660,7 +1669,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
-            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt) + (size_t) nextn_row_offset * n_embd;
             if (t_tr0) {
                 t_tr_sync = ggml_time_us();
             }
@@ -1731,8 +1740,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             // the rows of one sequence are consecutive in the target's nextn buffer: one copy into a buffer that only grows (a
             // prompt ubatch is n_rows*n_embd floats) instead of a zero-filled resize and a synchronizing lookup per row
-            const float * h_beg = handoff_copy ? llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id]) : nullptr;
-            const float * h_end = handoff_copy ? llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_end[seq_id]) : nullptr;
+            const float * h_beg = handoff_copy ? llama_get_embeddings_nextn_ith(ctx_tgt, nextn_row_offset + i_batch_beg[seq_id]) : nullptr;
+            const float * h_end = handoff_copy ? llama_get_embeddings_nextn_ith(ctx_tgt, nextn_row_offset + i_batch_end[seq_id]) : nullptr;
             if (h_beg && h_end == h_beg + (size_t) (n_rows - 1) * n_embd) {
                 // accept() reads row min(n_accepted, n_rows - 1) and n_accepted <= n_max: a prompt ubatch (thousands of rows,
                 // 160 MiB at 4096 x 10240 floats) keeps its first n_keep rows and the last one (in pending_h), not all of them;
@@ -1750,7 +1759,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
                 for (int32_t i = 0; i < n_rows; ++i) {
-                    const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                    const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, nextn_row_offset + i_batch_beg[seq_id] + i);
                     std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
                 }
             }
@@ -3350,6 +3359,34 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
     }
+}
+
+bool common_speculative_rows_ok(const common_speculative * spec) {
+    if (spec == nullptr) {
+        return true;
+    }
+    for (const auto & impl : spec->impls) {
+        if (!impl->row_offset_ok()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool common_speculative_process_rows(common_speculative * spec, const common_batch & batch, int32_t row_offset) {
+    bool result = true;
+
+    if (spec == nullptr) {
+        return result;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->nextn_row_offset = row_offset;
+        result = result && impl->process(batch);
+        impl->nextn_row_offset = 0;
+    }
+
+    return result;
 }
 
 bool common_speculative_process(common_speculative * spec, const common_batch & batch) {

@@ -2603,11 +2603,18 @@ struct ple_decode_meter {
 };
 }
 
+// k11: an asynchronous state save queued before a decode() call completes at the next synchronize() / state call /
+// llama_state_seq_async_wait(), so its host copy overlaps the GPU work of that decode (LLAMA_STATE_ASYNC_LAZY=0: when decode() returns, as before)
+static bool state_async_lazy() {
+    static const bool on = getenv("LLAMA_STATE_ASYNC_LAZY") == nullptr || atoi(getenv("LLAMA_STATE_ASYNC_LAZY")) != 0;
+    return on;
+}
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
-    // an asynchronous state save queued before this call has reached its destination when this call returns
+    // an asynchronous state save queued before this call has reached its destination when this call returns (LLAMA_STATE_ASYNC_LAZY=0)
     struct state_async_join {
         llama_context * ctx;
-        ~state_async_join() { ctx->state_async_wait(); }
+        ~state_async_join() { if (!state_async_lazy()) { ctx->state_async_wait(); } }
     } state_async_join_guard { this };
 
     const ple_decode_meter ple_meter(ple.stats ? &ple : nullptr, (int64_t) batch_inp.tokens.size());
@@ -2684,6 +2691,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     }
 
+    // k11 (LLAMA_LM_CKPT_MERGE): the breaks apply to this batch only
+    struct ubatch_breaks_reset {
+        llama_batch_allocr * b;
+        ~ubatch_breaks_reset() { b->ubatch_breaks.clear(); }
+    } ubatch_breaks_reset_guard { balloc.get() };
+    std::vector<int32_t> ub_breaks = std::move(ubatch_breaks_next);
+    ubatch_breaks_next.clear();
     if (!balloc->init(batch_inp, vocab, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
@@ -2695,6 +2709,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
+    balloc->ubatch_breaks = std::move(ub_breaks);
 
     // hybrid MoE cache with a fixed share: a new request (every sequence of the batch is empty) starts from an empty cache
     if (moe_cache && moe_cache->hybrid_fixed()) {
@@ -6844,6 +6859,26 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 
 void llama_set_verify(llama_context * ctx, bool value) {
     ctx->set_verify(value);
+}
+
+void llama_context::set_ubatch_breaks(const int32_t * breaks, int32_t n) {
+    ubatch_breaks_next.assign(breaks, breaks + std::max(0, n));
+}
+
+bool llama_context::layer_major_on() const {
+    return lm_enabled && moe_cache != nullptr;
+}
+
+void llama_state_seq_async_wait(llama_context * ctx) {
+    ctx->state_async_wait();
+}
+
+void llama_set_ubatch_breaks(llama_context * ctx, const int32_t * breaks, int32_t n) {
+    ctx->set_ubatch_breaks(breaks, n);
+}
+
+bool llama_layer_major_on(const llama_context * ctx) {
+    return ctx->layer_major_on();
 }
 
 bool llama_exact_verify_enabled(void) {

@@ -281,6 +281,10 @@ private:
     //
 
 public:
+    // k11 (LLAMA_LM_CKPT_MERGE)
+    void set_ubatch_breaks(const int32_t * breaks, int32_t n);
+    bool layer_major_on() const;
+
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
@@ -532,6 +536,8 @@ private:
     // (every ubatch through a layer before any goes on to the next), so each host expert is copied to the device once for all of them
     // while every ubatch keeps its own graph, kernels and order of operations (bit-identical to the ubatches run one after the other)
     bool lm_enabled = false;
+    // k11 (LLAMA_LM_CKPT_MERGE): ubatch breaks of the next decode() (batch indices), see llama_set_ubatch_breaks
+    std::vector<int32_t> ubatch_breaks_next;
     bool lm_auto    = false;  // LLAMA_MOE_LAYER_MAJOR unset: on beside speculative decoding with a model
     int  lm_ub_max  = 16;     // ubatches per layer-major graph [LLAMA_MOE_LAYER_MAJOR_UB_MAX]
     bool lm_verbose = false;  // [LLAMA_MOE_LAYER_MAJOR_LOG]

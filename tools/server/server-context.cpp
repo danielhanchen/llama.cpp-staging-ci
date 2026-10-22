@@ -1090,6 +1090,11 @@ private:
     std::unique_ptr<server_prompt_ssd>   prompt_ssd; // SSD tier of the prompt cache (--cache-ssd-dir)
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // k11 (LLAMA_LM_CKPT_MERGE): absolute batch indices where the server would have ended a prompt batch for the checkpoint
+    // 4 + n_ubatch tokens before the end; the batch goes on, its ubatches still end there (llama_set_ubatch_breaks), so a
+    // layer-major prompt reads the host experts once for both (the checkpoint itself is not made)
+    std::vector<int32_t> lm_breaks;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -2655,6 +2660,9 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // the previous checkpoint's asynchronous copy may still be running (LLAMA_STATE_ASYNC_LAZY): done before any is evicted
+        llama_state_seq_async_wait(ctx_tgt);
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -3383,6 +3391,14 @@ private:
     };
 #endif
 
+    // k11 (LLAMA_LM_CKPT_MERGE, default on): see lm_breaks. Only for a slot alone in the batch, a target with layer-major prompts,
+    // no mtmd input and speculative impls that read the target rows of a segment (MTP, draft models, n-gram)
+    bool lm_ckpt_merge_ok(const server_slot & slot, int32_t n_tokens_prev, bool lm_ckpt) const {
+        static const bool on = getenv("LLAMA_LM_CKPT_MERGE") == nullptr || atoi(getenv("LLAMA_LM_CKPT_MERGE")) != 0;
+        return on && !lm_ckpt && n_tokens_prev == 0 && !slot.task->tokens.has_mtmd && llama_layer_major_on(ctx_tgt) &&
+            common_speculative_rows_ok(spec.get());
+    }
+
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -3567,6 +3583,7 @@ private:
 
         // start populating the batch for this iteration
         batch.clear();
+        lm_breaks.clear();
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
@@ -4269,9 +4286,15 @@ private:
                             // offsets are clamped to the n_batch given, so the prompt splits into the same batches and ubatches as before
                             const int n_batch_clamp = !lm && params_base.n_batch_ckpt > 0 ? std::min<int>(n_batch, params_base.n_batch_ckpt) : n_batch;
                             bool should_break = false;
-                            for (int offset : checkpoint_offsets) {
+                            for (int k = 0; k < 2; ++k) {
+                                const int offset = checkpoint_offsets[k];
                                 const int n_last = std::min(n_batch_clamp, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                    // k11: under layer-major prompts the batch goes on past the far checkpoint, its ubatches end there
+                                    if (k == 0 && offset != 4 && lm_ckpt_merge_ok(slot, n_tokens_prev, lm)) {
+                                        lm_breaks.push_back(batch.size());
+                                        break;
+                                    }
                                     should_break = true;
                                     break;
                                 }
@@ -4446,6 +4469,17 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        // k11 (LLAMA_LM_CKPT_MERGE): the breaks inside this view, relative to it
+        std::vector<int32_t> seg_breaks;
+        for (const int32_t b : lm_breaks) {
+            if (b > off && b < off + batch.view.size()) {
+                seg_breaks.push_back(b - off);
+            }
+        }
+        if (!seg_breaks.empty()) {
+            llama_set_ubatch_breaks(ctx_tgt, seg_breaks.data(), (int32_t) seg_breaks.size());
+            SRV_DBG("k11 merged prompt batch of %d tokens, %zu ubatch breaks (first at %d)\n", batch.view.size(), seg_breaks.size(), seg_breaks[0]);
+        }
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
@@ -4512,7 +4546,20 @@ private:
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
-                ok = common_speculative_process(spec.get(), batch.view);
+                if (seg_breaks.empty()) {
+                    ok = common_speculative_process(spec.get(), batch.view);
+                } else {
+                    // the segments one at a time, as the separate batches would have been (the draft keeps its own batches)
+                    int32_t a = 0;
+                    for (size_t k = 0; k <= seg_breaks.size() && ok; ++k) {
+                        const int32_t b = k < seg_breaks.size() ? seg_breaks[k] : batch.view.size();
+                        common_batch seg;
+                        seg.n_pos = batch.view.n_pos;
+                        seg.tokens.assign(batch.view.tokens.begin() + a, batch.view.tokens.begin() + b);
+                        ok = common_speculative_process_rows(spec.get(), seg, a);
+                        a = b;
+                    }
+                }
             });
 
             if (!ok) {

@@ -590,6 +590,15 @@ void llama_batch_allocr::split_reset() {
     used.resize(get_n_tokens(), false);
 }
 
+int32_t llama_batch_allocr::break_after(int32_t idx) const {
+    for (const int32_t b : ubatch_breaks) {
+        if (b > idx) {
+            return b;
+        }
+    }
+    return (int32_t) get_n_tokens();
+}
+
 llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
     // find the first unused token
     uint32_t cur_idx = 0;
@@ -604,6 +613,9 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
 
     std::vector<int32_t> idxs;
 
+    // a segment ends at the next break (k11 LLAMA_LM_CKPT_MERGE)
+    const uint32_t seg_end = ubatch_breaks.empty() ? (uint32_t) used.size() : (uint32_t) break_after((int32_t) cur_idx);
+
     while (true) {
         idxs.push_back(cur_idx);
 
@@ -612,7 +624,7 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
 
         ++cur_idx;
 
-        if (cur_idx >= used.size()) {
+        if (cur_idx >= used.size() || cur_idx >= seg_end) {
             break;
         }
 
@@ -687,6 +699,15 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
     // at the end we will concat these to get the final ubatch
     std::vector<idx_vec_t> idxs_per_seq(n_seqs);
 
+    // k11 (LLAMA_LM_CKPT_MERGE): one sequence set, its segment ends at the next break (batch index == index in the set, checked)
+    int32_t seg_end = -1;
+    if (!ubatch_breaks.empty() && n_seqs == 1) {
+        const auto & m = seq_set_map[cur_seq_set[0]];
+        if ((int32_t) m.size() == batch.n_tokens && m.front() == 0 && m.back() == batch.n_tokens - 1) {
+            seg_end = break_after(cur_idx[0]);
+        }
+    }
+
     while (true) {
         // we can only add new n_seq_tokens tokens if all the sequence sets have at least 1 more unused tokens and
         //   if we haven't reached n_ubatch
@@ -700,6 +721,9 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         }
 
         if (!can_expand) {
+            break;
+        }
+        if (seg_end >= 0 && cur_idx[0] >= seg_end) {
             break;
         }
 
@@ -726,6 +750,10 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         GGML_ASSERT(n_ubatch > n_keep_tail);
 
         auto n_remaining = [&](uint32_t s) {
+            // within a segment (k11): as if the segment were the whole batch
+            if (seg_end >= 0 && s == 0) {
+                return (uint32_t) (seg_end - cur_idx[s]);
+            }
             return (uint32_t) (seq_set_map[cur_seq_set[s]].size() - cur_idx[s]);
         };
 

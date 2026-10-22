@@ -177,6 +177,11 @@ public:
     // call once before splitting the batch to reset the internal state
     void split_reset();
 
+    // k11 (LLAMA_LM_CKPT_MERGE): batch indices where a ubatch must end (each segment between two breaks is split as if it were a batch
+    // of its own), set for one batch and cleared by init(); only single sequence batches honour them
+    std::vector<int32_t> ubatch_breaks;
+    int32_t break_after(int32_t idx) const; // the first break > idx, or the number of tokens
+
     // simple split, unknown number of sequence sets of unequal lengths
     llama_ubatch split_simple(uint32_t n_ubatch);
 

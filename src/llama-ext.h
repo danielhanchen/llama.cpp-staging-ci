@@ -109,6 +109,14 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // output of plain decoding. Prompt batches and single token decodes are not affected.
 LLAMA_API void llama_set_verify(struct llama_context * ctx, bool value);
 
+// k11 (LLAMA_LM_CKPT_MERGE): the next llama_decode() of a single sequence batch ends ubatches at these batch indices (each segment is split as
+// a batch of its own would be: the same ubatches as separate decode() calls, in one layer-major group); cleared by that call
+LLAMA_API void llama_set_ubatch_breaks(struct llama_context * ctx, const int32_t * breaks, int32_t n);
+// layer-major prompt groups can run in this context (a MoE cache with layer-major prompts on)
+LLAMA_API bool llama_layer_major_on(const struct llama_context * ctx);
+// k11: wait for the asynchronous state save in flight (LLAMA_STATE_SEQ_FLAGS_ASYNC), before its destination is read or freed
+LLAMA_API void llama_state_seq_async_wait(struct llama_context * ctx);
+
 // LLAMA_MTP_EXACT=1 is set (read once)
 LLAMA_API bool llama_exact_verify_enabled(void);
 
