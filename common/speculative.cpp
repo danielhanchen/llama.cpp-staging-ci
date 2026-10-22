@@ -1504,7 +1504,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // LLAMA_MTP_HANDOFF_VH=0: verify_h keeps every row of a prompt ubatch, as before
     const bool verify_h_trim = handoff_copy && common_mtp_handoff_on("VH");
 
-    // LLAMA_MTP_DEV_H=0: the target's hidden rows of a prompt batch go to the host and back up to the drafter, as before. Otherwise
+    // LLAMA_MTP_DEV_H=1 (opt-in: decode -0.7..-1.0% on Qwen3.6 at 32 GB, Flash-Next 8k prompt -8% on G4; default = host rows, as before):
     // (single-sequence batches of LLAMA_MTP_DEV_H_MIN = 64 tokens or more) they stay on the device (llama_mtp_dev_h_attach) and the
     // drafter's pass is queued without waiting on the target from the host.
     bool dev_h = false;
@@ -1601,7 +1601,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         pending_dev.assign(n_seq, 0);
         verify_dev.assign(n_seq, 0);
-        if (!is_mem_shared && !chain_heads && common_mtp_handoff_on("DEV_H") && !(getenv("LLAMA_MTP_DEV_H") && atoi(getenv("LLAMA_MTP_DEV_H")) == 0)) {
+        if (!is_mem_shared && !chain_heads && common_mtp_handoff_on("DEV_H") && getenv("LLAMA_MTP_DEV_H") && atoi(getenv("LLAMA_MTP_DEV_H")) != 0) {
             dev_h = llama_mtp_dev_h_attach(ctx_dft, ctx_tgt, (int32_t) llama_n_batch(ctx_tgt));
         }
     }
