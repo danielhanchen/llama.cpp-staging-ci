@@ -526,15 +526,6 @@ private:
 
         std::vector<std::pair<size_t, size_t>> uploads; // offset and size of the uploads of the current copy
         std::vector<ggml_backend_copy_region>   regions; // the copies of the current copy, when the backend batches them
-        std::vector<ggml_backend_copy_region>   up_regions; // LLAMA_MOE_COPY_QUEUE: the uploads, issued on the copy queue
-
-        // LLAMA_MOE_COPY_QUEUE (see sched_copy_experts): a second backend instance of the device and its two events
-        ggml_backend_t       q_backend = nullptr; // the compute backend it serves
-        ggml_backend_t       q         = nullptr;
-        ggml_backend_event_t q_ev_c    = nullptr; // recorded on the compute backend, waited for by the queue
-        ggml_backend_event_t q_ev_q    = nullptr; // recorded on the queue, waited for by the compute backend
-        bool                 q_failed  = false;
-        size_t               q_n = 0, q_bytes = 0;
 
         void reset() {
             ids = nullptr;

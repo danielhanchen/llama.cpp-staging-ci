@@ -861,18 +861,6 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
-    if (copy_experts.q != nullptr) {
-        ggml_backend_synchronize(copy_experts.q);
-        if (copy_experts.q_n > 0) {
-            LLAMA_LOG_INFO("%s: expert uploads on the copy queue: %zu copies, %.2f MiB (LLAMA_MOE_COPY_QUEUE=0 to disable)\n", __func__,
-                copy_experts.q_n, copy_experts.q_bytes/1024.0/1024.0);
-        }
-        ggml_backend_event_free(copy_experts.q_ev_c);
-        ggml_backend_event_free(copy_experts.q_ev_q);
-        ggml_backend_free(copy_experts.q);
-        copy_experts.q = nullptr;
-    }
-
     if (mtp_dev_h_sink && mtp_dev_h_sink->tgt == this) {
         mtp_dev_h_sink->tgt = nullptr;
         mtp_dev_h_sink = nullptr;
@@ -5145,78 +5133,16 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
     };
 
-    // k11 (LLAMA_MOE_COPY_QUEUE, default on, =0 off): on the regular (not prefetched) path the uploads from host memory and the copies
-    // of the cached experts were issued together on the compute stream, so the device-to-device copies waited for the uploads (LFM2.5
-    // 24B-A2B 8 GB, a 34-token prompt ubatch: 113 ms of uploads + 23 ms of cache copies, serialized). The uploads go on a copy queue of
-    // the device instead (a second backend instance; it first waits for the compute stream, which may still read what dst held), the
-    // cache copies stay on the compute stream, and the compute stream waits for the uploads before the split computes. Same bytes into
-    // the same places, the split reads them after both: the output is exact
-    static const bool copy_queue = getenv("LLAMA_MOE_COPY_QUEUE") == nullptr || atoi(getenv("LLAMA_MOE_COPY_QUEUE")) != 0;
-    auto queue_for = [&]() -> ggml_backend_t {
-        if (!copy_queue || st.q_failed || on_copy_queue) {
-            return nullptr;
-        }
-        if (st.q_backend != backend) {
-            if (st.q != nullptr) {
-                ggml_backend_synchronize(st.q);
-                ggml_backend_event_free(st.q_ev_c);
-                ggml_backend_event_free(st.q_ev_q);
-                ggml_backend_free(st.q);
-                st.q = nullptr;
-            }
-            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-            st.q = dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU ? ggml_backend_dev_init(dev, nullptr) : nullptr;
-            st.q_ev_c = st.q ? ggml_backend_event_new(dev) : nullptr;
-            st.q_ev_q = st.q ? ggml_backend_event_new(dev) : nullptr;
-            if (st.q == nullptr || st.q_ev_c == nullptr || st.q_ev_q == nullptr) {
-                st.q_failed = true;
-                LLAMA_LOG_WARN("%s: no copy queue for the expert uploads on %s, they stay on the compute stream\n", __func__, ggml_backend_name(backend));
-                return nullptr;
-            }
-            st.q_backend = backend;
-        }
-        return st.q;
-    };
-
     bool done = false;
     if (batch) {
         plan(true);
-        ggml_backend_t q = st.uploads.empty() || st.regions.empty() ? nullptr : queue_for();
-        if (q != nullptr) {
-            st.up_regions.clear();
-            size_t up_bytes = 0;
-            for (const auto & [offset, size] : st.uploads) {
-                st.up_regions.push_back({ src, offset, dst, offset, size });
-                up_bytes += size;
-            }
-            // the cache copies and the uploads write disjoint ranges of dst; the queue starts after what the compute stream queued before
-            ggml_backend_event_record(st.q_ev_c, backend);
-            if (ggml_backend_tensor_copy_regions_async(backend, st.regions.data(), st.regions.size())) {
-                ggml_backend_event_wait(q, st.q_ev_c);
-                if (ggml_backend_tensor_copy_regions_async(q, st.up_regions.data(), st.up_regions.size())) {
-                    ggml_backend_event_record(st.q_ev_q, q);
-                    ggml_backend_event_wait(backend, st.q_ev_q);
-                    st.q_n++;
-                    st.q_bytes += up_bytes;
-                } else if (!ggml_backend_tensor_copy_regions_async(backend, st.up_regions.data(), st.up_regions.size())) {
-                    for (const auto & r : st.up_regions) {
-                        ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + r.src_offset, r.dst_offset, r.size);
-                    }
-                }
-                st.regions.insert(st.regions.end(), st.up_regions.begin(), st.up_regions.end());
-                lctx->moe_cache->count_batch(src, st.regions);
-                done = true;
-            }
+        for (const auto & [offset, size] : st.uploads) {
+            st.regions.push_back({ src, offset, dst, offset, size });
         }
-        if (!done) {
-            for (const auto & [offset, size] : st.uploads) {
-                st.regions.push_back({ src, offset, dst, offset, size });
-            }
-            // fails (nothing copied) e.g. when the host weights are not pinned
-            if (ggml_backend_tensor_copy_regions_async(backend, st.regions.data(), st.regions.size())) {
-                lctx->moe_cache->count_batch(src, st.regions);
-                done = true;
-            }
+        // fails (nothing copied) e.g. when the host weights are not pinned
+        if (ggml_backend_tensor_copy_regions_async(backend, st.regions.data(), st.regions.size())) {
+            lctx->moe_cache->count_batch(src, st.regions);
+            done = true;
         }
     }
     if (!done) {
