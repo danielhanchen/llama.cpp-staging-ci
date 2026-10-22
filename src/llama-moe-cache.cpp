@@ -1743,6 +1743,11 @@ struct llama_moe_cache::impl {
     void single_service() {
         using clk = std::chrono::steady_clock;
         int64_t last_work = 0;
+        // LLAMA_MOE_SINGLE_DEBUG_STALL=N (test of the timeout): the thread stops answering after N batches, as if it died
+        static const int64_t stall_after = [] {
+            const char * e = getenv("LLAMA_MOE_SINGLE_DEBUG_STALL");
+            return e != nullptr ? atoll(e) : -1;
+        }();
         while (!single_stop.load(std::memory_order_acquire)) {
             bool work = false;
             for (size_t i = 0; i < mbox_n; ++i) {
@@ -1754,6 +1759,9 @@ struct llama_moe_cache::impl {
                 auto * hdr = (ggml_moe_mailbox_hdr *) mb.host;
                 const uint32_t req = __atomic_load_n(&hdr->request, __ATOMIC_ACQUIRE);
                 if (req == mb.done) {
+                    continue;
+                }
+                if (stall_after >= 0 && (int64_t) single_batches >= stall_after) {
                     continue;
                 }
                 work = true;
