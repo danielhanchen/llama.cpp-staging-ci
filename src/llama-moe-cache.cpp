@@ -1850,9 +1850,11 @@ struct llama_moe_cache::impl {
             if (work) {
                 last_work = now;
             } else if (now - std::max(last_work, h.kick_us.load(std::memory_order_relaxed)) > 20000) {
-                // no decode graph started for 20 ms: sleep until the next one (single_kick)
+                // no decode graph started for 20 ms: sleep until the next one (single_kick), at most 1 ms at a time, since a graph
+                // that publishes without a kick (layer-major, a draft context's first graph) would wait for this sleep (G4 nsys: the
+                // first decode forward after an 8k prompt waited 100 ms in the merges with a 100 ms sleep, -8.6% prompt)
                 std::unique_lock<std::mutex> lock(h.mtx);
-                h.cv.wait_for(lock, std::chrono::milliseconds(100));
+                h.cv.wait_for(lock, std::chrono::milliseconds(1));
             } else {
 #if defined(__x86_64__) || defined(_M_X64)
                 __builtin_ia32_pause();
