@@ -1634,6 +1634,8 @@ struct llama_moe_cache::impl {
     size_t mbox_n = 0;
     std::atomic<bool> single_failed{false};
     uint64_t single_batches = 0;
+    uint64_t single_rows    = 0; // host expert rows computed
+    int64_t  single_us      = 0; // time in the host graphs
 
     // one host thread and one CPU backend for every cache of the process (the target and its MTP draft context alternate, two threads
     // with a CPU team each would compete for the same cores): the thread serves the mailboxes of the registered caches
@@ -1800,7 +1802,13 @@ struct llama_moe_cache::impl {
             single_plan * p = nullptr;
             if (!single_failed.load(std::memory_order_relaxed) && n_tokens >= 1 && n_tokens <= GGML_MOE_MAILBOX_MAX_TOKENS &&
                     single_plan_get(mb, n_tokens, p)) {
+                const int64_t t0 = single_now_us();
                 ok = ggml_backend_graph_compute(cpu, p->gf) == GGML_STATUS_SUCCESS;
+                single_us += single_now_us() - t0;
+                const int32_t * ids = (const int32_t *) ((const char *) mb.host + ggml_moe_mailbox_off_ids());
+                for (int j = 0; j < mb.n_used*n_tokens; ++j) {
+                    single_rows += ids[j] >= 0;
+                }
             }
             if (!ok) {
                 single_failed.store(true, std::memory_order_relaxed);
@@ -1887,7 +1895,9 @@ struct llama_moe_cache::impl {
             }
             single_reg = false;
             if (single_batches > 0) {
-                LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses: %" PRIu64 " host batches\n", tag, single_batches);
+                LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses: %" PRIu64 " host batches, %" PRIu64 " expert rows, %.1f us per batch "
+                    "(%.2f us per row)\n", tag, single_batches, single_rows, (double) single_us/single_batches,
+                    single_rows > 0 ? (double) single_us/single_rows : 0.0);
             }
         }
         for (auto & mb : mboxes) {
