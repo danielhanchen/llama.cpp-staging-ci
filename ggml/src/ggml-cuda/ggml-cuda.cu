@@ -4258,9 +4258,10 @@ static bool ggml_cuda_try_fuse_add_unary_mul(ggml_backend_cuda_context * cuda_ct
 // product ({MUL_MAT_ID, VIEW, MUL_MAT_ID, GLU}), so the gate + up + GLU fusion below never matched them (k10: three launches per expert
 // FFN). The fused launch is the one the {MUL_MAT_ID, MUL_MAT_ID, GLU} pattern makes: mul_mat_vec_q with the gate in its fusion
 // arguments, whose up and gate sums are the sums of the unfused products and whose GLU is the GLU op's expression, so the output is
-// the bytes of the three launches (batch invariant verify included: the GLU node carries the flag). GGML_CUDA_MOE_CACHE_GLU_FUSE=0: off.
+// the bytes of the three launches (batch invariant verify included: the GLU node carries the flag). GGML_CUDA_MOE_CACHE_GLU_FUSE=1: on.
 static int ggml_cuda_try_fuse_moe_cache_glu(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
-    static const bool on = getenv("GGML_CUDA_MOE_CACHE_GLU_FUSE") == nullptr || atoi(getenv("GGML_CUDA_MOE_CACHE_GLU_FUSE")) != 0;
+    // off by default: G4 Flash-Next (Studio argv / no drafter) and Qwen3.6 MTP / LFM2.5 at 8 GB moved within the A/A spread
+    static const bool on = getenv("GGML_CUDA_MOE_CACHE_GLU_FUSE") != nullptr && atoi(getenv("GGML_CUDA_MOE_CACHE_GLU_FUSE")) != 0;
     if (!on || i + 3 >= cgraph->n_nodes || !cuda_ctx->stream_context().concurrent_events.empty()) {
         return 0;
     }
@@ -4299,7 +4300,7 @@ static int ggml_cuda_try_fuse_moe_cache_glu(ggml_backend_cuda_context * cuda_ctx
     static bool logged = false;
     if (!logged) {
         logged = true;
-        GGML_LOG_INFO("%s: MoE cache experts: gate + up + GLU in one launch (%lld tokens; GGML_CUDA_MOE_CACHE_GLU_FUSE=0: off)\n", __func__,
+        GGML_LOG_INFO("%s: MoE cache experts: gate + up + GLU in one launch (%lld tokens; GGML_CUDA_MOE_CACHE_GLU_FUSE=1)\n", __func__,
                 (long long) up->ne[2]);
     }
     return 3;
@@ -4320,6 +4321,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     } else if (node->op == GGML_OP_SSM_CONV) {
         if (const int n = ggml_cuda_try_fuse_shortconv_conv_mul(*cuda_ctx, cgraph, i)) {
+            return n;
+        }
+    }
+
+    if (node->op == GGML_OP_CPY) {
+        if (const int n = ggml_cuda_try_fuse_cpy_batch(*cuda_ctx, cgraph, i)) {
             return n;
         }
     }
