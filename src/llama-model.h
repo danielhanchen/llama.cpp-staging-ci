@@ -721,6 +721,21 @@ struct llama_model {
 
     llama_hadamard hdmd;
 
+    // restricted-vocabulary MTP draft head (load_tensors_draft_head): the rows of `src` (the LM head the MTP graph projects
+    // with) for the n most frequent tokens, and their token ids in `d2t`; build_draft_head scatters its logits back to the full
+    // vocabulary (-inf elsewhere), so the samplers and the verifier see full-vocabulary logits. LLAMA_MTP_DRAFT_VOCAB=0: off
+    // The last n_ctx rows hold tokens of the requests that the list lacks (llama_model_draft_head_add), replaced oldest first.
+    struct {
+        ggml_tensor * src = nullptr;
+        ggml_tensor * w   = nullptr;
+        ggml_tensor * d2t = nullptr;
+        int32_t n_base = 0;              // rows of the frequent-token list
+        int32_t n_ctx  = 0;              // rows for request tokens after them (LLAMA_MTP_DRAFT_VOCAB_CTX, default 4096)
+        int32_t next   = 0;              // the request-token row written next (ring)
+        std::vector<int64_t> ids;        // host copy of d2t
+        std::vector<uint8_t> in;         // per token id: has a row
+    } draft_head;
+
     // see llama_model_set_attn_rot
     bool attn_rot = true;
 
@@ -984,6 +999,9 @@ struct llama_model_base : public llama_model {
 
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
+
+    // helper: make the restricted-vocabulary MTP draft head (draft_head); dry: sizes only (no_alloc loads, --fit)
+    void load_tensors_draft_head(llama_model_loader & ml, bool dry);
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);

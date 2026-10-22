@@ -1587,6 +1587,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        {
+            // the restricted draft head (LLAMA_MTP_DRAFT_VOCAB) gets rows for the prompt's tokens it lacks
+            const int32_t n_add = llama_model_draft_head_add(llama_get_model(params.ctx_dft), prompt.data(), (int32_t) prompt.size());
+            if (n_add > 0) {
+                SPC_DBG("%s: draft head: %d prompt tokens added\n", __func__, n_add);
+            }
+        }
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
 

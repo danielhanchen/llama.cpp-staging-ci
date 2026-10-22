@@ -1246,6 +1246,7 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
 static struct llama_model_params common_model_params_to_llama_impl(common_params & params, bool fit_deferred);
 static enum llama_load_mode common_moe_cache_load_mode(const common_params & params, enum llama_load_mode load_mode, int32_t n_gpu_layers);
 static bool common_experts_on_offloaded_host(const common_params & params, const llama_model_tensor_buft_override * overrides, int32_t n_gpu_layers);
+static bool common_moe_hybrid_gate_on(const common_params & params, const llama_model_tensor_buft_override * overrides, int32_t n_gpu_layers);
 
 // bytes of one expert in the MoE cache: the sum over the expert tensors of the layer (the size of a slot) and the largest single tensor (the
 // size of a slot in its bank), with the number of experts, for the layer with the largest experts; false if the GGUF cannot be read
@@ -1417,6 +1418,14 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         static const bool env_x = getenv("LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB")) != 0;
         if (!env_x || lm == 0 || params.n_batch_set || (params.moe_uma_keep_batch && lm != 1) || !(lm == 1 || common_spec_draft_model(params)) ||
                 !common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
+            return;
+        }
+        // k10: not where the MoE cache's default hybrid gate will run (it holds at most LLAMA_MOE_CACHE_HYBRID_MAX_FRAC of the host experts):
+        // that path refuses every layer-major group, so the raise only changed the batches (local B200, Qwen3.6 UD-Q4_K_XL + MTP, 1500 MiB
+        // cache, -ub 2048: 8k text differs from k9 with no group run)
+        if (lm != 1 && common_moe_hybrid_gate_on(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
+            COM_INF("MoE cache: n_batch stays %u at the given n_ubatch %u (the cache holds a small share of the host experts: the hybrid gate, "
+                "no layer-major groups)\n", cparams.n_batch, cparams.n_ubatch);
             return;
         }
         int64_t want = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH") != nullptr ? atoll(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH")) : 8192;
@@ -3064,6 +3073,46 @@ static bool common_experts_on_offloaded_host(const common_params & params, const
     }
     const int64_t n_gpu = n_gpu_layers < 0 ? n_layer + 1 : n_gpu_layers;
     return common_overrides_put_experts_on_host(overrides, std::max<int64_t>(n_layer + 1 - n_gpu, 0), n_layer, experts);
+}
+
+// k10: whether the MoE cache will take its default hybrid gate (llama_moe_cache: LLAMA_MOE_CACHE_HYBRID unset and the slots hold at most
+// LLAMA_MOE_CACHE_HYBRID_MAX_FRAC (0.10) of the host experts' bytes). Estimated from the fitted cache size and the expert bytes of the layers
+// whose experts the overrides (or n_gpu_layers) leave on the host, all expert layers of the same size
+static bool common_moe_hybrid_gate_on(const common_params & params, const llama_model_tensor_buft_override * overrides, int32_t n_gpu_layers) {
+    if (params.moe_cache_size <= 0 || getenv("LLAMA_MOE_CACHE_HYBRID") != nullptr || getenv("LLAMA_MOE_CACHE_FETCH") != nullptr) {
+        return false;
+    }
+    // the CPU-miss rule instead of the gate: forced (LLAMA_MOE_CPU_MISS=2) or kept at small caches (LLAMA_MOE_CPU_MISS_GATE=0)
+    const char * env_cm = getenv("LLAMA_MOE_CPU_MISS");
+    const char * env_cg = getenv("LLAMA_MOE_CPU_MISS_GATE");
+    if ((env_cm != nullptr && atoi(env_cm) == 2) || ((env_cm == nullptr || atoi(env_cm) != 0) && env_cg != nullptr && atoi(env_cg) == 0)) {
+        return false;
+    }
+    double max_frac = 0.10;
+    if (const char * e = getenv("LLAMA_MOE_CACHE_HYBRID_MAX_FRAC")) {
+        max_frac = std::max(0.0, atof(e));
+    }
+    common_moe_slot_bytes sbt;
+    std::vector<uint8_t> experts;
+    const int64_t n_layer = common_model_n_layer(params.model.path, experts);
+    if (n_layer <= 0 || (int64_t) experts.size() < n_layer || !common_moe_slot_bytes_of(params.model.path, sbt) || sbt.total <= 0) {
+        return false;
+    }
+    const int64_t n_gpu  = n_gpu_layers < 0 ? n_layer + 1 : n_gpu_layers;
+    const int64_t il_gpu = std::max<int64_t>(n_layer + 1 - n_gpu, 0); // layers below run on the CPU: their experts are host experts
+    int64_t n_exp = 0, n_host = 0;
+    for (int64_t il = 0; il < n_layer; ++il) {
+        if (experts[il] == 0) {
+            continue;
+        }
+        n_exp++;
+        n_host += il < il_gpu || common_overrides_put_experts_on_host(overrides, il, il + 1, experts);
+    }
+    if (n_exp == 0 || n_host == 0) {
+        return false;
+    }
+    const double host = (double) sbt.total*(double) n_host/(double) n_exp;
+    return (double) params.moe_cache_size <= max_frac*host;
 }
 
 // whether the weight stream is forced on (--weight-stream on, LLAMA_WEIGHT_STREAM=N != 0): it uploads the host weights read in place from the mapping, so it needs mmap
