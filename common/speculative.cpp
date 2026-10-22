@@ -2252,6 +2252,7 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         {
             const char * e = getenv("LLAMA_SPEC_SUFFIX_POLICY");
             policy_on = !with_model && (e != nullptr ? atoi(e) != 0 : params.auto_mode);
+            policy.short_k = params.n_max_short;
         }
         if (policy_on) {
             SPC_INF("ngram-suffix: cost-priced windows of %d / %d drafts (margin %.2f)%s; LLAMA_SPEC_SUFFIX_POLICY=0 for the fixed gate\n",
@@ -2423,6 +2424,9 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         si.n_probe = 0;
         si.k_last = 0;
         si.timer.reset();
+        if (policy_on && n_seq == 1) {
+            policy.reset_gain();
+        }
         clear(si);
         sync(si, prompt);
     }

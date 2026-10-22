@@ -37,13 +37,14 @@ struct common_spec_cost_policy {
 
     double margin = 0.03;
     bool   gain_gate = true;   // LLAMA_SPEC_POLICY_GAIN=0: off
+    int    short_k   = 3;      // the drafts of the short window (the gain gate's window)
 
     std::array<double, MAX_T + 1> cost{}, cost_n{}, last{};
     std::array<int, MAX_T + 1>    seen{};
     // realized gain of drafted rounds by window size: tokens committed per ms of the round (with its switch back) over a plain round's
     // tokens per ms, an EMA; a size whose drafts lose (gain < 1 over GAIN_N rounds) is not drafted until it is stale and re-probed
     static constexpr double GAIN_ALPHA = 0.25;
-    static constexpr int    GAIN_N     = 4;
+    static constexpr int    GAIN_N     = 3;
     std::array<double, MAX_T + 1> gain{}, gain_n{};
     double rounds = 0.0;
 
@@ -101,7 +102,8 @@ struct common_spec_cost_policy {
     // a drafted round of window t committed `tokens` in ms (its switch back included)
     void observe_gain(int t, int tokens, double ms) {
         t = std::clamp(t, 1, MAX_T);
-        if (!(ms > 0.0) || cost_n[1] <= 0) {
+        // not while the size still builds and captures its graphs (its warm-up rounds are not its cost either)
+        if (!(ms > 0.0) || cost_n[1] <= 0 || cost_n[t] <= 0) {
             return;
         }
         const double g = (tokens/ms)/(1.0/cost_ms(1));
@@ -111,7 +113,13 @@ struct common_spec_cost_policy {
 
     bool losing(int t) const {
         t = std::clamp(t, 1, MAX_T);
-        return gain_gate && gain_n[t] >= GAIN_N && gain[t] < 1.0 && !stale(t);
+        return gain_gate && gain_n[t] >= GAIN_N && gain[t] < 1.0;
+    }
+
+    // the realized gain is per request (a code answer must not stop the drafts of the next request's copy): cleared at begin()
+    void reset_gain() {
+        gain.fill(0.0);
+        gain_n.fill(0.0);
     }
 
     // expected tokens per ms of a window of k drafts at per-token acceptance q
@@ -135,7 +143,7 @@ struct common_spec_cost_policy {
         int    best_k = 0;
         double best   = 0.0;
         for (int k : { k_short, k_full }) {
-            if (losing(k + 1)) {
+            if (k <= short_k && losing(k + 1)) {   // the gate is for the short window (short repeats: chat, code); a copy keeps its window
                 continue;
             }
             const double r = rate(k, q);
@@ -153,7 +161,7 @@ struct common_spec_cost_policy {
         // a size not measured enough (q >= P_PROBE) or not measured for a while (q >= P_STALE) is tried: verification keeps the output,
         // only this round's speed is at stake
         for (int k : { k_full, k_short }) {
-            if (losing(k + 1)) {
+            if (k <= short_k && losing(k + 1)) {
                 continue;
             }
             if ((cost_n[k + 1] < PROBES && q >= P_PROBE) || (stale(k + 1) && q >= P_STALE)) {

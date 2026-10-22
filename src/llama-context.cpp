@@ -2173,8 +2173,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // k11-decode: a small output ubatch uses the kept graph of its size (see gf_res_small)
     static const bool small_cache_env = getenv("LLAMA_GRAPH_SMALL_CACHE") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_CACHE")) != 0;
+    // (single token decodes and speculative verify windows only: a prompt's short tail keeps the shared graph, as before; G4 LFM2.5
+    // 32 GB: with the tails kept too, chat / code prompts were 3 / 9% slower)
     const uint32_t n_small = small_cache_env && moe_cache == nullptr && !graph_reuse_disable && n_outputs > 0 &&
-        ubatch.n_tokens >= 1 && ubatch.n_tokens <= GF_SMALL_MAX ? ubatch.n_tokens : 0;
+        (ubatch.n_tokens == 1 || cparams.verify) && ubatch.n_tokens <= GF_SMALL_MAX ? ubatch.n_tokens : 0;
 
     llm_graph_result * res = nullptr;
     uint32_t i_small = 0; // the kept graph used: n_small*GF_SMALL_WAYS + way
