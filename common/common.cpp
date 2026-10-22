@@ -3811,6 +3811,13 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
 
     llama_batch_ext * res = batch.get();
     llama_batch_ext_clear(res);
+    {
+        int32_t n_state = 0;
+        for (int32_t i = off; i < off + n; ++i) {
+            n_state += tokens[i].state.data != nullptr;
+        }
+        llama_batch_ext_reserve(res, n, n_state);
+    }
 
     for (int32_t i = off; i < off + n; ++i) {
         const token & t = tokens[i];

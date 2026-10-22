@@ -1209,6 +1209,22 @@ llama_batch_ext::llama_batch_ext(llama_context * ctx) :
         n_vocab(llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)))),
         n_pos_per_embd(llama_get_model(ctx)->hparams.n_pos_per_embd()) {
     clear();
+    // k11 (LLAMA_BATCH_STATE_PREFAULT=0 turns it off): the state rows of a full batch are allocated and faulted in here, at load,
+    // instead of by the first long prompt: an 8k-token Flash-Next MTP prompt grew this vector to 335 MiB by insertion, ~240 ms of
+    // reallocation and page faults on the main thread between the target's last ubatch and the drafter (G4 nsys). At most 1 GiB.
+    static const bool prefault = getenv("LLAMA_BATCH_STATE_PREFAULT") == nullptr || atoi(getenv("LLAMA_BATCH_STATE_PREFAULT")) != 0;
+    const size_t n_state = n_tokens_max*n_embd_state;
+    if (prefault && n_state > 0 && n_state*sizeof(float) <= (1ull << 30)) {
+        state.resize(n_state);
+        state.clear(); // the capacity (and its resident pages) stays
+    }
+}
+
+void llama_batch_ext::reserve(size_t n_tokens, size_t n_state_tokens) {
+    tokens.reserve(n_tokens);
+    if (n_embd_state > 0 && n_state_tokens > 0) {
+        state.reserve(n_state_tokens*n_embd_state); // one allocation instead of a doubling per growth
+    }
 }
 
 llama_batch_ext::llama_batch_ext(
@@ -1394,6 +1410,10 @@ void llama_batch_ext_free(llama_batch_ext * batch) {
 
 void llama_batch_ext_clear(llama_batch_ext * batch) {
     batch->clear();
+}
+
+void llama_batch_ext_reserve(llama_batch_ext * batch, int32_t n_tokens, int32_t n_state_tokens) {
+    batch->reserve(n_tokens, n_state_tokens);
 }
 
 int32_t llama_batch_ext_add(llama_batch_ext * batch, llama_seq_id seq_id) {

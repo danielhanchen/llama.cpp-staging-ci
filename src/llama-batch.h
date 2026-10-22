@@ -145,6 +145,7 @@ struct llama_batch_ext {
     bool set_token_id(int32_t idx, llama_token id);
     bool set_token_embd(int32_t idx, llama_embd embd_in);
     bool set_token_state(int32_t idx, llama_embd state_in);
+    void reserve(size_t n_tokens, size_t n_state_tokens);
     bool set_token_pos(int32_t idx, const llama_pos * pos_in);
     bool set_output(int32_t idx, bool output_last);
     bool set_decision_order(int32_t idx, int32_t order);
