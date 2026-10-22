@@ -31,7 +31,8 @@ struct common_spec_cost_policy {
     static constexpr double ALPHA  = 0.1;     // EMA weight of a new round time
     static constexpr int    PROBES = 3;       // a size is drafted this often (q >= P_PROBE) before its guessed cost can veto it
     static constexpr double P_PROBE = 0.85;
-    static constexpr double STALE   = 300.0;  // rounds after which a measured size is re-probed when a confident draft could use it
+    static constexpr double STALE   = 200.0;  // rounds after which a measured size is re-probed when a likely draft could use it
+    static constexpr double P_STALE = 0.7;    // (a size priced high in one slow stretch, a cold start or a busy host, is measured again)
     static constexpr int    SKIP    = 2;      // the first rounds of a size build its graph and capture it: not its cost
 
     double margin = 0.03;
@@ -75,9 +76,13 @@ struct common_spec_cost_policy {
             last[t] = rounds;
             return;
         }
-        // a round far above the size's cost is not a round of decode (a request boundary, a stall of the host): left out
+        // a round far above the size's cost is not a round of decode (a request boundary, a stall of the host): left out; one well
+        // above it counts at three times the cost, so a few slow rounds cannot price a size out
         if (cost_n[t] >= 4 && ms > 20.0*cost[t]) {
             return;
+        }
+        if (cost_n[t] >= 2) {
+            ms = std::min(ms, 3.0*cost[t]);
         }
         cost[t]   = cost_n[t] > 0 ? (1.0 - ALPHA)*cost[t] + ALPHA*ms : ms;
         cost_n[t] += 1.0;
@@ -117,8 +122,12 @@ struct common_spec_cost_policy {
             }
             return best_k;
         }
-        if ((cost_n[k_full + 1] < PROBES || stale(k_full + 1)) && q >= P_PROBE) {
-            return k_full;
+        // a size not measured enough (q >= P_PROBE) or not measured for a while (q >= P_STALE) is tried: verification keeps the output,
+        // only this round's speed is at stake
+        for (int k : { k_full, k_short }) {
+            if ((cost_n[k + 1] < PROBES && q >= P_PROBE) || (stale(k + 1) && q >= P_STALE)) {
+                return k;
+            }
         }
         return 0;
     }
