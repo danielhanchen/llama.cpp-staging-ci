@@ -113,8 +113,6 @@ public:
     // fixed share (LLAMA_MOE_CACHE_FETCH, or from the threads): the cache, the use counters and the residual of the share are reset before a batch whose
     // sequences are all empty and after a state is read, so the same request gives the same output as in a new process
     bool hybrid_fixed() const;
-    // k13-small: the cached share of the host experts' bytes (-1 before the slots are sized)
-    double cache_frac() const;
     void hybrid_reset();
 
     // auto mode: before the graph of each ubatch while the trial runs, after the previous ubatch finished (backends synchronized);
