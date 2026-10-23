@@ -1272,8 +1272,8 @@ static __global__ void mul_mat_q(
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1)/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
-        const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds, float * __restrict__ dst,
-        float * __restrict__ tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
+        const int32_t * ids_dst, const int32_t * expert_bounds, float * dst,
+        float * tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
         const int stride_col_dst, const uint3 nchannels_y, const int stride_channel_dst, const uint3 nsamples_y,
         const int stride_sample_dst, const uint3 ntx, const int nexperts_compact) {
     constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
@@ -1282,6 +1282,10 @@ static __global__ void mul_mat_q_stream_k_fixup(
     constexpr int qk              = ggml_cuda_type_traits<type>::qk;
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback, prec_src1);
     constexpr int blocks_per_iter = ITER_K / qk;
+
+    // k13-pp: launched with PDL (programmatic dependent launch) behind the stream-k kernel, so its launch overlaps that kernel's tail:
+    // wait here for the stream-k kernel's partial sums (a no-op without PDL)
+    ggml_cuda_pdl_sync();
 
     float sum[J / nwarps] = {0.0f};
     const int i = blockIdx.y*warp_size + threadIdx.x;
@@ -1485,7 +1489,10 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
-    if (!config.stream_k) {
+    // k13-pp: GGML_CUDA_MMQ_TILING_MAX_N=N (opt-in, 0 = off): dense products (no ids) of at most N columns use the tiling (one block per
+    // output tile, no stream-k fixup kernel). Other k split, so other rounding (KLD-gated)
+    static const int tiling_max_n = getenv("GGML_CUDA_MMQ_TILING_MAX_N") ? atoi(getenv("GGML_CUDA_MMQ_TILING_MAX_N")) : 0;
+    if (!config.stream_k || (tiling_max_n > 0 && args.ids_dst == nullptr && args.expert_bounds == nullptr && args.ncols_dst <= tiling_max_n)) {
         mul_mat_q<type, J, fallback, prec_src1><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
@@ -1527,6 +1534,16 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     }
 
     CUDA_CHECK(cudaGetLastError());
+    // k13-pp: the fixup is launched with PDL where available (GGML_CUDA_MMQ_FIXUP_PDL=0: a plain launch, as before; same results either way)
+    static const bool fixup_pdl = getenv("GGML_CUDA_MMQ_FIXUP_PDL") == nullptr || atoi(getenv("GGML_CUDA_MMQ_FIXUP_PDL")) != 0;
+    if (fixup_pdl) {
+        ggml_cuda_kernel_launch(mul_mat_q_stream_k_fixup<type, J, fallback, prec_src1>,
+            ggml_cuda_kernel_launch_params(block_nums_fixup, block_dims_fixup, 0, stream),
+            (const int32_t *) args.ids_dst, (const int32_t *) args.expert_bounds, (float *) args.dst, (float *) tmp_fixup.ptr, blocks_per_ne00_fd,
+            (int) args.nrows_x, (int) args.ncols_dst, (int) args.nrows_dst, nchannels_y_fd, (int) args.stride_channel_dst, nsamples_y_fd,
+            (int) args.stride_sample_dst, ntx_fd, (int) nexperts_compact);
+        return;
+    }
     mul_mat_q_stream_k_fixup<type, J, fallback, prec_src1><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
         (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
          args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,

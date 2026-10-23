@@ -1714,6 +1714,9 @@ private:
             // now, so the first long prompt does not allocate it between two of its ubatches
             if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS || n_swa > 0) {
                 llama_state_seq_reserve_async(ctx_tgt, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                if (ctx_dft) {
+                    llama_state_seq_reserve_async(ctx_dft, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                }
             }
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
@@ -2747,6 +2750,9 @@ private:
 
         // the previous checkpoint's asynchronous copy may still be running (LLAMA_STATE_ASYNC_LAZY): done before any is evicted
         llama_state_seq_async_wait(ctx_tgt);
+        if (ctx_dft) {
+            llama_state_seq_async_wait(ctx_dft); // k13-pp: the draft part is saved asynchronously too (ckpt_dft_async)
+        }
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
@@ -2812,7 +2818,12 @@ private:
         // the next llama_decode() is queued while the state is still being copied: the copy is complete when it returns
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ASYNC);
         const int64_t t_tr1 = t_tr0 ? ggml_time_us() : 0;
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        // k13-pp: the draft's rows are read on the draft's own stream after its queued prompt pass, so the target's next ubatch is
+        // queued while the draft still computes (the synchronous read waited for the draft pass, ~1.5 ms per chat prompt on G4);
+        // the save is complete when the draft's next decode() returns, or at any state call / synchronize of the draft context.
+        // LLAMA_CKPT_DFT_ASYNC=0: the synchronous read as before.
+        static const bool ckpt_dft_async = getenv("LLAMA_CKPT_DFT_ASYNC") == nullptr || atoi(getenv("LLAMA_CKPT_DFT_ASYNC")) != 0;
+        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | (ckpt_dft_async ? LLAMA_STATE_SEQ_FLAGS_ASYNC : 0));
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
@@ -2870,6 +2881,11 @@ private:
         n_written = 0;
         if (slot.prompt.checkpoints.empty()) {
             return true;
+        }
+        // asynchronous checkpoint saves (target and draft parts) must have landed before their buffers are written out
+        llama_state_seq_async_wait(ctx_tgt);
+        if (ctx_dft) {
+            llama_state_seq_async_wait(ctx_dft);
         }
         std::ofstream ofs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app);
         if (!ofs) {
@@ -4385,9 +4401,19 @@ private:
                             // batch starts is at most N tokens (and fits one ubatch) runs in one pass, without the separate pass of its last 4
                             // tokens; its checkpoint is then made at the end of the prompt, so a next prompt that differs in those last tokens
                             // is processed again from the previous checkpoint. Other ubatch shapes, so other numerics (KLD-gated, not md5-equal)
+                            // k13-pp: only where a next prompt pays at most this batch again: the whole prompt is at most N tokens, or the
+                            // batch starts at the last user message (a checkpoint is made there). A single-pass prompt makes no checkpoint of
+                            // its own (the memory is empty before its only pass), so without that bound a raw prompt that grows by a few
+                            // tokens per turn found no usable checkpoint and ran again from the start. LLAMA_SERVER_CKPT_SINGLE_ANY=1: the
+                            // k11 rule (any prompt whose rest is at most N). Still opt-in: the KLD gate (plans/k11.md) failed on G4 for
+                            // Qwen3.6-35B-A3B Q4 (first-token p99 0.0058 vs 0.0024 for -fa off), LFM2.5 (first-token mean 0.24 vs 0.065) and
+                            // gemma-4 26B (decode top-1 98.9 vs 99.7%), plans/k13_pp.md section 7
                             static const int ckpt_single_max = getenv("LLAMA_SERVER_CKPT_SINGLE_MAX") ? atoi(getenv("LLAMA_SERVER_CKPT_SINGLE_MAX")) : 0;
-                            const int n_rest_batch = slot.task->n_tokens() - (slot.prompt.n_tokens() - (int) (batch.size() - n_tokens_prev));
-                            const bool ckpt_single = ckpt_single_max > 0 && n_rest_batch <= std::min<int>(ckpt_single_max, n_ubatch);
+                            static const bool ckpt_single_any = getenv("LLAMA_SERVER_CKPT_SINGLE_ANY") != nullptr && atoi(getenv("LLAMA_SERVER_CKPT_SINGLE_ANY")) != 0;
+                            const int n_batch_start = slot.prompt.n_tokens() - (int) (batch.size() - n_tokens_prev);
+                            const int n_rest_batch = slot.task->n_tokens() - n_batch_start;
+                            const bool ckpt_single = ckpt_single_max > 0 && n_rest_batch <= std::min<int>(ckpt_single_max, n_ubatch) &&
+                                (ckpt_single_any || slot.task->n_tokens() <= ckpt_single_max || (last_user_pos > 0 && n_batch_start == last_user_pos));
                             bool should_break = false;
                             for (int k = 0; k < 2; ++k) {
                                 const int offset = checkpoint_offsets[k];

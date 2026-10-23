@@ -168,14 +168,94 @@ static __global__ void mul_mat_f(
     }
 
 
+    // k13-pp: the global loads of the next k chunk are issued before the current chunk goes through shared memory and the mma,
+    // so that a warp with few chunks (small batches: the 4-token prompt tail, K = 2048 over 8 warps) does not wait for the
+    // memory latency once per chunk. The values written to shared memory, the mma sequence and the reduction are unchanged.
+    // GGML_CUDA_MMF_PREFETCH=0 (compile time) restores the plain loop.
+#ifndef GGML_CUDA_MMF_PREFETCH
+#define GGML_CUDA_MMF_PREFETCH 1
+#endif // GGML_CUDA_MMF_PREFETCH
+    using y_load_t = std::conditional_t<std::is_same_v<T, float>, float, float2>;
+    [[maybe_unused]] T        xa_next[GGML_CUDA_MMF_PREFETCH ? ntA : 1][tile_A::I];
+    [[maybe_unused]] y_load_t yb_next[GGML_CUDA_MMF_PREFETCH ? ntB : 1][tile_B::I];
+    auto load_x = [&](const int c, const int itA, const int i) -> T {
+        return x[(itA*tile_A::I + i)*stride_row + c];
+    };
+    auto load_y = [&](const int c, const int itB, const int j0) -> y_load_t {
+        const int j = j0 + itB*tile_B::I;
+        if constexpr (std::is_same_v<T, float>) {
+            if constexpr (!has_ids) {
+                return j < cols_per_block ? y[j*stride_col_y + c] : 0.0f;
+            } else {
+                const bool valid = j < cols_per_block && (col_base + j) < ncols_dst_total && slot_map[j] >= 0;
+                return valid ? y[slot_map[j]*stride_channel_y + j*stride_col_y + c] : 0.0f;
+            }
+        } else {
+            if constexpr (!has_ids) {
+                return j < cols_per_block ? y2[j*stride_col_y + c] : make_float2(0.0f, 0.0f);
+            } else {
+                const bool valid = j < cols_per_block && (col_base + j) < ncols_dst_total && slot_map[j] >= 0;
+                return valid ? *(const float2*) &y[slot_map[j]*stride_channel_y + 2*(j*stride_col_y + c)] : make_float2(0.0f, 0.0f);
+            }
+        }
+    };
+    auto load_next = [&](const int c) {
+        if constexpr (GGML_CUDA_MMF_PREFETCH) {
+#pragma unroll
+            for (int itA = 0; itA < ntA; ++itA) {
+#pragma unroll
+                for (int i = 0; i < tile_A::I; ++i) {
+                    xa_next[itA][i] = load_x(c, itA, i);
+                }
+            }
+#pragma unroll
+            for (int itB = 0; itB < ntB; ++itB) {
+#pragma unroll
+                for (int j0 = 0; j0 < tile_B::I; ++j0) {
+                    yb_next[itB][j0] = load_y(c, itB, j0);
+                }
+            }
+        }
+    };
+    static_assert(std::is_same_v<T, float> || std::is_same_v<T, half2> || std::is_same_v<T, nv_bfloat162>, "unsupported type");
+
+    if (GGML_CUDA_MMF_PREFETCH && threadIdx.y*warp_size + threadIdx.x < ncols) {
+        load_next(threadIdx.y*warp_size + threadIdx.x);
+    }
+
     for (int col = threadIdx.y*warp_size + threadIdx.x; col < ncols; col += nwarps*warp_size) {
+        [[maybe_unused]] T        xa_cur[GGML_CUDA_MMF_PREFETCH ? ntA : 1][tile_A::I];
+        [[maybe_unused]] y_load_t yb_cur[GGML_CUDA_MMF_PREFETCH ? ntB : 1][tile_B::I];
+        if constexpr (GGML_CUDA_MMF_PREFETCH) {
+#pragma unroll
+            for (int itA = 0; itA < ntA; ++itA) {
+#pragma unroll
+                for (int i = 0; i < tile_A::I; ++i) {
+                    xa_cur[itA][i] = xa_next[itA][i];
+                }
+            }
+#pragma unroll
+            for (int itB = 0; itB < ntB; ++itB) {
+#pragma unroll
+                for (int j0 = 0; j0 < tile_B::I; ++j0) {
+                    yb_cur[itB][j0] = yb_next[itB][j0];
+                }
+            }
+            if (col + nwarps*warp_size < ncols) {
+                load_next(col + nwarps*warp_size);
+            }
+        }
         tile_A A[ntA][warp_size / tile_A::J];
 #pragma unroll
         for (int itA = 0; itA < ntA; ++itA) {
             ggml_cuda_syncwarp();
 #pragma unroll
             for (int i = 0; i < tile_A::I; ++i) {
-                tile_xy[i*tile_k_padded + threadIdx.x] = x[(itA*tile_A::I + i)*stride_row  + col];
+                if constexpr (GGML_CUDA_MMF_PREFETCH) {
+                    tile_xy[i*tile_k_padded + threadIdx.x] = xa_cur[itA][i];
+                } else {
+                    tile_xy[i*tile_k_padded + threadIdx.x] = load_x(col, itA, i);
+                }
             }
             ggml_cuda_syncwarp();
 #pragma unroll
@@ -187,34 +267,14 @@ static __global__ void mul_mat_f(
 #pragma unroll
         for (int itB = 0; itB < ntB; ++itB) {
             ggml_cuda_syncwarp();
-            if constexpr (std::is_same_v<T, float>) {
 #pragma unroll
-                for (int j0 = 0; j0 < tile_B::I; ++j0) {
-                    const int j = j0 + itB*tile_B::I;
-
-                    if constexpr (!has_ids) {
-                        tile_xy[j0*tile_k_padded + threadIdx.x] = j < cols_per_block ? y[j*stride_col_y + col] : 0.0f;
-                    } else {
-                        const bool valid = j < cols_per_block && (col_base + j) < ncols_dst_total && slot_map[j] >= 0;
-                        tile_xy[j0*tile_k_padded + threadIdx.x] = valid ? y[slot_map[j]*stride_channel_y + j*stride_col_y + col] : 0.0f;
-                    }
+            for (int j0 = 0; j0 < tile_B::I; ++j0) {
+                const y_load_t v = GGML_CUDA_MMF_PREFETCH ? yb_cur[GGML_CUDA_MMF_PREFETCH ? itB : 0][j0] : load_y(col, itB, j0);
+                if constexpr (std::is_same_v<T, float>) {
+                    tile_xy[j0*tile_k_padded + threadIdx.x] = v;
+                } else {
+                    tile_xy[j0*tile_k_padded + threadIdx.x] = ggml_cuda_cast<T>(v);
                 }
-            } else if constexpr (std::is_same_v<T, half2> || std::is_same_v<T, nv_bfloat162>) {
-#pragma unroll
-                for (int j0 = 0; j0 < tile_B::I; ++j0) {
-                    const int j = j0 + itB*tile_B::I;
-
-                    if constexpr (!has_ids) {
-                        const float2 tmp = j < cols_per_block ? y2[j*stride_col_y + col] : make_float2(0.0f, 0.0f);
-                        tile_xy[j0*tile_k_padded + threadIdx.x] = ggml_cuda_cast<T>(tmp);
-                    } else {
-                        const bool valid = j < cols_per_block && (col_base + j) < ncols_dst_total && slot_map[j] >= 0;
-                        float2 tmp = valid ? *(const float2*) &y[slot_map[j]*stride_channel_y + 2*(j*stride_col_y + col)] : make_float2(0.0f, 0.0f);
-                        tile_xy[j0*tile_k_padded + threadIdx.x] = ggml_cuda_cast<T>(tmp);
-                    }
-                }
-            } else {
-                static_assert(std::is_same_v<T, void>, "unsupported type");
             }
             ggml_cuda_syncwarp();
 #pragma unroll

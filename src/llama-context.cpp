@@ -4008,6 +4008,11 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     lm_seeded.clear();
     moe_cache->clear_seed_counts();
     int seed_k = -1, src_k = -1;
+    // k13-pp: LLAMA_MOE_LAYER_MAJOR_SEED=0 (opt-in) turns the seed off. The seed reads the source routing of every layer in an eval callback,
+    // which synchronizes the device once per layer, so the next layer's expert copies are queued only after its router has run and the copy
+    // engine idles through every layer's attention (G4, Qwen3.6-35B-A3B Q4 + MTP at 12 GB, 2k prompt: 42 gaps of ~2 ms in a 357 ms pass).
+    // Off: G4 12 GB 2k +7.1%, 8 GB 2k +10.9% / 8k +5.7%; but L4 8 GB 8k -4.5% (the prompt after an unseeded one misses more experts on a
+    // copy-bound link), so it stays opt-in until the seed reads the routing without a device sync (plans/k13_pp.md section 9)
     static const bool lm_seed_env = getenv("LLAMA_MOE_LAYER_MAJOR_SEED") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_SEED")) != 0;
     // beside the device seed (seed_sync off: the host seed of a ubatch's own ids does not fit) only the seed from an earlier member's
     // routing, which needs no larger graph

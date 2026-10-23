@@ -2124,6 +2124,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
+    // k13-pp: GGML_CUDA_DENSE_CUBLAS_MIN=N (opt-in, 0 = off): quantized dense products of at least N columns are dequantized to FP16 and
+    // multiplied by cuBLAS instead of MMQ (Strata's prompt path for dense layers). Other rounding (KLD-gated)
+    static const int dense_cublas_min = getenv("GGML_CUDA_DENSE_CUBLAS_MIN") ? atoi(getenv("GGML_CUDA_DENSE_CUBLAS_MIN")) : 0;
+    if (dense_cublas_min > 0 && ggml_is_quantized(src0->type) && ne11 >= dense_cublas_min && GGML_CUDA_CC_IS_NVIDIA(cc)) {
+        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        return;
+    }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;

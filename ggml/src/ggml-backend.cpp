@@ -1173,6 +1173,8 @@ struct ggml_backend_sched {
     int  ov_parts;  // GGML_SCHED_OVERLAP_PARTS bits: 1 = reorder (opt-in), 2 = copies issued ahead, 4 = uploads without a sync (default 6)
     bool ov_active; // the current graph uses the overlap
     int  ov_logged[4];
+    int64_t n_input_relaxed; // k13-pp: graph-input uploads queued without a device sync (GGML_SCHED_INPUT_RELAXED)
+    bool    input_relax_ok;  // k13-pp: the current graph has no host split after a device split (set in compute_splits)
     struct ggml_backend_sched_overlap ov[GGML_SCHED_MAX_BACKENDS];
 
     char * context_buffer;
@@ -4075,12 +4077,33 @@ static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, st
         return false;
     }
 
-    bool ov = sched->ov_active && (sched->ov_parts & 4) && ggml_backend_sched_ov_backend_ok(sched, split_backend_id) &&
+    // k13-pp: graph inputs (leaves set by the caller before the compute, e.g. positions, masks, token ids) take the same relaxed
+    // upload: it is queued on the compute stream behind the previous graph (CUDA family: relaxed_ok), its event is waited
+    // before this compute returns (ov_wait_uploads at the end of compute_splits), so the caller cannot overwrite the host data
+    // before the copy has read it. The host then queues this graph while the previous one still runs instead of waiting for
+    // it before the first upload. GGML_SCHED_INPUT_RELAXED=0: graph inputs synchronize the device first (as before).
+    static const bool input_relaxed = getenv("GGML_SCHED_INPUT_RELAXED") == NULL || atoi(getenv("GGML_SCHED_INPUT_RELAXED")) != 0;
+    const bool ov_ok = sched->ov_active && (sched->ov_parts & 4) && ggml_backend_sched_ov_backend_ok(sched, split_backend_id) &&
         sched->ov[split_backend_id].relaxed_ok &&
-        ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
-        ggml_backend_sched_ov_root(input)->op != GGML_OP_NONE;
+        ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE;
+    bool ov = ov_ok && ggml_backend_sched_ov_root(input)->op != GGML_OP_NONE;
     for (const struct ggml_tensor * t = input; t != NULL && ov; t = t->view_src) {
         ov = (t->flags & GGML_TENSOR_FLAG_INPUT) == 0;
+    }
+    // a graph input, or a view of one (e.g. the recurrent-state copy indices rs_s_copy): the copy reads the caller's host data
+    const struct ggml_tensor * in_root = ggml_backend_sched_ov_root(input);
+    if (!ov && ov_ok && input_relaxed && sched->input_relax_ok && in_root->op == GGML_OP_NONE && (in_root->flags & GGML_TENSOR_FLAG_INPUT) &&
+            in_root->buffer == input->buffer) {
+        ov = true;
+        sched->n_input_relaxed++;
+    }
+    // GGML_SCHED_INPUT_RELAXED_LOG=N: the first N uploads that still synchronize the device are logged (debug)
+    static const int relaxed_log = getenv("GGML_SCHED_INPUT_RELAXED_LOG") ? atoi(getenv("GGML_SCHED_INPUT_RELAXED_LOG")) : 0;
+    static int n_logged = 0;
+    if (!ov && relaxed_log && n_logged < relaxed_log) {
+        n_logged++;
+        GGML_LOG_INFO("%s: synchronized upload of %s (op %s, view %d, flags %d, usage %d, ov_active %d, ov_ok %d)\n", __func__, input->name,
+            ggml_op_name(input->op), input->view_src != NULL, input->flags, (int) ggml_backend_buffer_get_usage(input->buffer), sched->ov_active, ov_ok);
     }
 
     if (!synced && !ov) {
@@ -4208,6 +4231,25 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
 
     sched->pre_split = -1;
     sched->pre_nodes = 0;
+
+    // k13-pp: graph inputs take the relaxed upload only when no host split follows a device split. A later host split (e.g. MoE
+    // experts computed on the host) would wait for the relaxed upload at its start, i.e. for the previous graph, which moves
+    // that wait into the host split's own time (the CPU-miss calibration times host splits). Graphs whose only host split is
+    // the leading input split (token embeddings on the host, everything else on the device) keep the lever.
+    {
+        bool seen_device = false;
+        sched->input_relax_ok = true;
+        for (int i = 0; i < sched->n_splits; i++) {
+            if (ggml_backend_buft_is_host(sched->bufts[sched->splits[i].backend_id])) {
+                if (seen_device) {
+                    sched->input_relax_ok = false;
+                    break;
+                }
+            } else {
+                seen_device = true;
+            }
+        }
+    }
 
     int prev_backend_id = -1;
 
@@ -4569,6 +4611,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    if (sched->n_input_relaxed > 0) {
+        GGML_LOG_INFO("%s: %lld graph-input uploads queued behind the previous graph without a device sync (GGML_SCHED_INPUT_RELAXED=0: off)\n",
+            __func__, (long long) sched->n_input_relaxed);
     }
     if (sched->pf_n_armed > 0) {
         GGML_LOG_INFO("%s: host weight prefetch: cross-graph arm: %lld splits armed, %lld used\n", __func__,
