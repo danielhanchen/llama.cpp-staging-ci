@@ -1866,6 +1866,31 @@ struct llama_moe_cache::impl {
         return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     }
 
+    // the rule weighs the cheaper split once this cache has a mailbox, or before the first one when every MoE layer the graphs built
+    // has the form the host plans compute and the device can map mailboxes: a decode of one token at a time (no draft) only gets a
+    // mailbox once the rule turns the host path on for it, which it did not while it weighed a full split (G4 LFM2.5 8 GB: 0 host
+    // experts, while a fixed share with the mailbox gave +46..+69% decode)
+    int  single_form_state = 0; // 0: no MoE layer seen, 1: every one has the form, -1: one does not (or no mailboxes on its device)
+    void single_note_form(int32_t il, bool ok) {
+        if (!ok) {
+            single_form_state = -1;
+        } else if (single_form_state == 0) {
+            ggml_backend_dev_t dev = il >= 0 && il < (int32_t) layers.size() && layers[il].ig >= 0 ? ggml_backend_get_device(backend(il)) : nullptr;
+            ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            const bool alloc = reg != nullptr && ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_mailbox_alloc") != nullptr &&
+                (!single_auto || strcmp(ggml_backend_reg_name(reg), "CUDA") == 0);
+            single_form_state = alloc ? 1 : -1;
+        }
+    }
+    bool single_weigh() const {
+        return single_reg || (single_weigh_early && single_form_state == 1 && single_req && !single_off && !single_no_alloc);
+    }
+    // LLAMA_MOE_SINGLE_WEIGH_EARLY=0: weigh the cheaper split only once a mailbox exists (k11 round 16 behaviour)
+    const bool single_weigh_early = [] {
+        const char * e = getenv("LLAMA_MOE_SINGLE_WEIGH_EARLY");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
     bool single_usable(int64_t n_tokens) const {
         return single_req && !single_off && !single_no_alloc && n_tokens >= 1 && n_tokens <= GGML_MOE_MAILBOX_MAX_TOKENS;
     }
@@ -4247,7 +4272,7 @@ struct llama_moe_cache::impl {
                 const double f    = cm_share[n];
                 const double m    = cm_rate*D;
                 const double gain = m*(cm_tup - std::max(f*cm_tup, (1.0 - f)*tc));
-                const double need = (n <= max_batch ? cm_margin*cm_split_scale*cm_split*(single_reg && single_usable(n) ? single_split_frac : 1.0) :
+                const double need = (n <= max_batch ? cm_margin*cm_split_scale*cm_split*(single_weigh() && single_usable(n) ? single_split_frac : 1.0) :
                                      cm_margin_p*(cm_split + n*cm_act))*
                                     (cm_on[n] && cm_measured ? cm_hyst : 1.0);
                 // a batch above max_batch runs the host path in the groups whose slots hold its experts (see use_device), the
@@ -6016,6 +6041,10 @@ ggml_tensor * llama_moe_cache::single_publish(ggml_context * ctx, int32_t il, gg
         return nullptr;
     }
     return ggml_moe_mailbox_publish(ctx, host_ids, x, mb->mdev, mb->ctl, il);
+}
+
+void llama_moe_cache::single_note_form(int32_t il, bool ok) const {
+    pimpl->single_note_form(il, ok);
 }
 
 ggml_tensor * llama_moe_cache::single_merge(ggml_context * ctx, ggml_tensor * dev, ggml_tensor * pub) const {

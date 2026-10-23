@@ -96,6 +96,8 @@ public:
             ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down) const;
     // the device rows dev [n_embd, n_expert_used, n_tokens] plus the host rows of the publish pub
     ggml_tensor * single_merge(ggml_context * ctx, ggml_tensor * dev, ggml_tensor * pub) const;
+    // the graph builder tells whether layer il has the expert form the host plans compute (see single_weigh)
+    void single_note_form(int32_t il, bool ok) const;
     // before the graph of every ubatch of n_tokens: wakes the host thread (batches that may publish), turns the path off after a failure
     void single_kick(int64_t n_tokens);
 

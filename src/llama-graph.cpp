@@ -2622,14 +2622,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // the host path is added first: the scheduler starts the copies and the device path while the host computes (see ggml_backend_sched_set_overlap)
         ggml_tensor * experts_h = nullptr;
         ggml_tensor * single_pub = nullptr;
+        // k11 single-graph host misses (LLAMA_MOE_SINGLE): the host experts go through a mapped mailbox, no graph split; only the
+        // expert form the host thread computes (separate gate and up, SiLU, no biases, scales or clamp)
+        const bool single_form = type_op == LLM_FFN_SILU && up_exps && gate_exps && !gate_up_exps && !up_exps_s_h && !gate_exps_s_h &&
+            !down_exps_s && !up_exps_b_h && !gate_exps_b_h && !gate_up_exps_b_h && !(il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f);
+        moe_cache->single_note_form(il, single_form);
         if (hybrid_host) {
             ggml_tensor * host_ids = ggml_view_2d(ctx0, hybrid, n_used, n_rows, hybrid->nb[1], (3*n_rows + 1)*hybrid->nb[1]);
             cb(host_ids, "ffn_moe_host_ids", il);
 
-            // k11 single-graph host misses (LLAMA_MOE_SINGLE): the host experts go through a mapped mailbox, no graph split; only the
-            // expert form the host thread computes (separate gate and up, SiLU, no biases, scales or clamp)
-            const bool single_form = type_op == LLM_FFN_SILU && up_exps && gate_exps && !gate_up_exps && !up_exps_s_h && !gate_exps_s_h &&
-                !down_exps_s && !up_exps_b_h && !gate_exps_b_h && !gate_up_exps_b_h && !(il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f);
             if (single_form) {
                 single_pub = moe_cache->single_publish(ctx0, il, host_ids, cur, up_exps, gate_exps, down_exps);
             }
