@@ -4906,6 +4906,7 @@ private:
             const auto ids = std::move(slot.spec_draft);
 
             size_t n_accepted = ids.size() - 1;
+            const bool spec_replayed = slot.spec_is_replay; // (k13: the rows of a replayed draft are not those of ids)
             if (slot.spec_is_replay && n_accepted > 0) {
                 n_accepted--;
             }
@@ -4949,7 +4950,11 @@ private:
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
                 result.prob         = 1.0f; // set later
 
-                // TODO: set result.probs
+                // k13: the probabilities of an accepted draft token come from its verify row (the KLD gate reads them; they were left
+                // empty, so drafted positions looked like a uniform distribution)
+                if (slot.task->params.sampling.n_probs > 0 && !spec_replayed && i < slot.spec_i_batch.size()) {
+                    populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, slot.spec_i_batch[i]);
+                }
 
                 slot.stats.n_gen += 1;
 
