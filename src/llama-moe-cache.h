@@ -79,6 +79,8 @@ public:
     // CPU misses [LLAMA_MOE_CPU_MISS]: the rule reads the device counters before the graph of some ubatches (synchronize the backends
     // first when cpu_miss_tick_sync), the tick goes before the graph of every ubatch
     bool cpu_miss_enabled() const; // LLAMA_MOE_CPU_MISS is on for this cache (until a failed calibration turns it off)
+    // k13: the host never computes an expert of this cache (no hybrid path, no CPU misses): every expert runs on the device from a slot
+    bool host_never() const;
     bool cpu_miss_tick_sync(int64_t n_tokens) const;
     void cpu_miss_tick(int64_t n_tokens);
     // the ubatch of n_tokens is looked up on the device like a small batch: at most n_small_max tokens, or a short prompt whose missing

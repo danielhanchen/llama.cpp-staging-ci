@@ -7472,11 +7472,27 @@ void llama_set_verify_exact(llama_context * ctx, bool value) {
 bool llama_verify_exact_placement(const llama_context * ctx) {
     // a MoE cache computes misses on the host or reads them per batch, and host weights run CPU kernels whose batch path is not the
     // single token path: verify rows there do not give the bytes of single token decodes (G4, LFM2.5 8 GB: other text)
-    if (ctx == nullptr || ctx->moe_cache_active()) {
+    if (ctx == nullptr) {
         return false;
+    }
+    // k13: a MoE cache whose host never computes an expert (no hybrid path, no CPU misses) runs every expert on the device from a slot,
+    // with the kernels of the resident case: its host expert tensors are only the source of the uploads (LLAMA_SPEC_EXACT_CACHE=0: off)
+    bool cache_ok = false;
+    if (ctx->moe_cache_active()) {
+        static const bool env_ok = [] {
+            const char * e = getenv("LLAMA_SPEC_EXACT_CACHE");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        if (!env_ok || !ctx->get_moe_cache()->host_never()) {
+            return false;
+        }
+        cache_ok = true;
     }
     for (const auto & [name, t] : ctx->get_model().tensors_by_name) {
         if (t != nullptr && t->buffer != nullptr && name.rfind("blk.", 0) == 0 && ggml_backend_buffer_is_host(t->buffer)) {
+            if (cache_ok && name.find("_exps") != std::string::npos) {
+                continue;
+            }
             return false;
         }
     }
