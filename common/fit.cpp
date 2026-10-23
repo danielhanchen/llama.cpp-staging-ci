@@ -51,6 +51,12 @@ int64_t common_fit_moe_margin_gain() {
     return g_moe_margin_gain;
 }
 
+static bool g_small_device = false;
+
+bool common_fit_small_device() {
+    return g_small_device;
+}
+
 // the margin of a device beside a MoE cache for the default margin m (see common_fit_set_moe_margin_auto)
 static int64_t common_fit_moe_margin(int64_t m) {
     constexpr int64_t MiB_ = 1024*1024;
@@ -975,12 +981,23 @@ static void common_params_fit_impl(
                 const char * e_sm = getenv("LLAMA_FIT_SMALL_MARGIN_MIB");
                 const int64_t small_mib = e_sm != nullptr ? std::max<int64_t>(0, atoll(e_sm)) : 256;
                 constexpr int64_t m_default = 1024*MiB;
-                if (small_mib > 0 && small_mib*MiB < m_default && margins[0] >= m_default) {
+                // the cache of a small device is capped (LLAMA_FIT_SMALL_CACHE_MIB, 48; 0 = no cap): it holds under 1% of the experts
+                // either way, and what it does not take stays free for the layer-major prompt groups, which read each host expert once
+                // per group instead of once per ubatch (G4 4 GB q3m: 76 MiB free with a 99 MiB cache, every group of 2+ ubatches split)
+                const char * e_sc = getenv("LLAMA_FIT_SMALL_CACHE_MIB");
+                const int64_t cap_mib = e_sc != nullptr ? std::max<int64_t>(0, atoll(e_sc)) : 48;
+                if (g_moe_margin_auto && small_mib > 0 && small_mib*MiB < m_default && margins[0] >= m_default) {
                     const int64_t margin_saved = margins[0];
                     const dmds_t  dmds_nc_saved = dmds_cpu_moe;
                     margins[0] = margin_saved - m_default + small_mib*MiB; // what was added to the default (a projector) stays
                     dmds_cpu_moe = dmds_cpu_moe_req;
                     cparams->moe_cache_size = size_before;
+                    if (cap_mib > 0 && size_t(cap_mib)*MiB < size_before) {
+                        // measured at the cap: the cache then keeps that size if it fits, else the sizing below shrinks it
+                        cparams->moe_cache_size = size_t(cap_mib)*MiB;
+                        dmds_cpu_moe = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                        add_extra_memory(dmds_cpu_moe);
+                    }
                     fit_moe_cache_size(dmds_cpu_moe, mparams, true);
                     const bool ok = cparams->moe_cache_size > 0 && cparams->moe_cache_size != size_before &&
                         int64_t(dmds_cpu_moe[0].free) - int64_t(dmds_cpu_moe[0].mb.total()) >= margins[0];
@@ -989,6 +1006,7 @@ static void common_params_fit_impl(
                             "%" PRId64 " to %" PRId64 " MiB (otherwise layers move to the CPU; LLAMA_FIT_SMALL_MARGIN_MIB=0 keeps that)\n",
                             __func__, cparams->moe_cache_size/MiB, margin_saved/MiB, margins[0]/MiB);
                         fits_per_device = true;
+                        g_small_device  = true;
                     } else {
                         margins[0] = margin_saved;
                         dmds_cpu_moe = dmds_nc_saved;
