@@ -98,6 +98,8 @@ public:
     ggml_tensor * single_merge(ggml_context * ctx, ggml_tensor * dev, ggml_tensor * pub) const;
     // the graph builder tells whether layer il has the expert form the host plans compute (see single_weigh)
     void single_note_form(int32_t il, bool ok) const;
+    // the context marks each decode: a prompt batch (tokens without outputs) keeps every ubatch off the CPU-miss host path
+    void set_prompt_batch(bool prompt);
     // before the graph of every ubatch of n_tokens: wakes the host thread (batches that may publish), turns the path off after a failure
     void single_kick(int64_t n_tokens);
 
