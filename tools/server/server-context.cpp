@@ -259,6 +259,12 @@ static void checkpoints_free_async(std::list<common_prompt_checkpoint> && droppe
         return;
     }
 
+    // their buffers go back to the checkpoint pool first (common_state_buf_recycle, LLAMA_CKPT_POOL)
+    for (auto & ckpt : dropped) {
+        common_state_buf_recycle(std::move(ckpt.data_tgt));
+        common_state_buf_recycle(std::move(ckpt.data_dft));
+    }
+
     static const bool disabled = [] {
         const char * e = getenv("LLAMA_CKPT_FREE_ASYNC");
         return e != nullptr && atoi(e) == 0;
@@ -361,9 +367,20 @@ struct server_slot {
             return false;
         }
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        // k11 (LLAMA_PROMPT_SAVE_ASYNC=1, opt-in: on G4 it took 5 ms off the chat TTFT but the copies then delay the prompt's first
+        // ubatch, Qwen3.6 MTP 32 GB pp -35% chat .. -3% 2k with md5 unchanged): the device copies are queued in stream order before the next decode, the host
+        // copy into the cache entry runs on the context's state worker; the cache waits for it before it reads, erases or evicts
+        // the entry (server_prompt_cache::wait_inflight). Larger states than LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB (512) are saved as before.
+        static const bool async_on = getenv("LLAMA_PROMPT_SAVE_ASYNC") != nullptr && atoi(getenv("LLAMA_PROMPT_SAVE_ASYNC")) != 0;
+        static const size_t async_max = (size_t) (getenv("LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB") ? std::max(0, atoi(getenv("LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB"))) : 512) << 20;
+        const llama_state_seq_flags fl = async_on && cur_size <= async_max ? LLAMA_STATE_SEQ_FLAGS_ASYNC : LLAMA_STATE_SEQ_FLAGS_NONE;
+
+        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, fl);
         if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, fl);
+        }
+        if (fl & LLAMA_STATE_SEQ_FLAGS_ASYNC) {
+            prompt_cache.inflight = cur;
         }
 
         return true;
@@ -1090,6 +1107,11 @@ private:
     std::unique_ptr<server_prompt_ssd>   prompt_ssd; // SSD tier of the prompt cache (--cache-ssd-dir)
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // k11 (LLAMA_LM_CKPT_MERGE): absolute batch indices where the server would have ended a prompt batch for the checkpoint
+    // 4 + n_ubatch tokens before the end; the batch goes on, its ubatches still end there (llama_set_ubatch_breaks), so a
+    // layer-major prompt reads the host experts once for both (the checkpoint itself is not made)
+    std::vector<int32_t> lm_breaks;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1112,6 +1134,9 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        if (prompt_cache) {
+            prompt_cache->wait_inflight(); // an asynchronous prompt save is complete before the contexts go
+        }
         spec.reset();
         spec_init.reset();
 
@@ -1597,6 +1622,12 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache->wait_reads = [this]() {
+                llama_state_seq_async_wait(ctx_tgt);
+                if (ctx_dft) {
+                    llama_state_seq_async_wait(ctx_dft);
+                }
+            };
         } else {
             if (!params_base.cache_ssd_dir.empty()) {
                 SRV_WRN("%s", "--cache-ssd-dir requires the RAM prompt cache (--cache-ram), disabling the SSD tier\n");
@@ -2655,6 +2686,9 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // the previous checkpoint's asynchronous copy may still be running (LLAMA_STATE_ASYNC_LAZY): done before any is evicted
+        llama_state_seq_async_wait(ctx_tgt);
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -2714,11 +2748,19 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        const int64_t t_tr0 = common_mtp_handoff_trace() ? ggml_time_us() : 0;
+
         // the next llama_decode() is queued while the state is still being copied: the copy is complete when it returns
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ASYNC);
+        const int64_t t_tr1 = t_tr0 ? ggml_time_us() : 0;
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+
+        if (t_tr0) {
+            SLT_INF(slot, "mtp_trace ckpt tgt=%.1f MiB %.2f ms, dft=%.1f MiB + spec %.2f ms\n", cur.data_tgt.size()/1048576.0, (t_tr1 - t_tr0)/1e3,
+                    cur.data_dft.size()/1048576.0, (ggml_time_us() - t_tr1)/1e3);
+        }
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -2739,7 +2781,8 @@ private:
         return true;
     }
 
-    static bool ckpt_read_buf(std::ifstream & ifs, std::vector<uint8_t> & buf, size_t n_avail, size_t & n_read) {
+    template <typename Buf>
+    static bool ckpt_read_buf(std::ifstream & ifs, Buf & buf, size_t n_avail, size_t & n_read) {
         uint64_t n = 0;
         // check the size against the bytes left in the file before allocating, the size field may be corrupted
         if (!ckpt_read(ifs, &n, sizeof(n), n_read) || n > n_avail - n_read) {
@@ -2754,7 +2797,8 @@ private:
         n_written += size;
     }
 
-    static void ckpt_write_buf(std::ofstream & ofs, const std::vector<uint8_t> & buf, size_t & n_written) {
+    template <typename Buf>
+    static void ckpt_write_buf(std::ofstream & ofs, const Buf & buf, size_t & n_written) {
         const uint64_t n = buf.size();
         ckpt_write(ofs, &n, sizeof(n), n_written);
         if (n > 0) {
@@ -3373,6 +3417,18 @@ private:
     };
 #endif
 
+    // k11 (LLAMA_LM_CKPT_MERGE=1, opt-in): see lm_breaks. Only for a slot alone in the batch, a target with layer-major prompts,
+    // no mtmd input and speculative impls that read the target rows of a segment (MTP, draft models, n-gram).
+    // Opt-in: the prompt's ubatches and kernels are those of the separate calls, but the MoE cache is seeded once (from the
+    // routing of the ubatch before the last) instead of once per call, so the cache holds other experts after the prompt; where
+    // the host computes misses or the fetch overlap splits a layer by hit / miss, the decode that follows then differs from k10
+    // (G4 Qwen3.6 UD-Q4_K_XL + MTP 8 GB: other text from token 14 / 31 / >64 of the 2k / 4.6k / 8k cells)
+    bool lm_ckpt_merge_ok(const server_slot & slot, int32_t n_tokens_prev, bool lm_ckpt) const {
+        static const bool on = getenv("LLAMA_LM_CKPT_MERGE") != nullptr && atoi(getenv("LLAMA_LM_CKPT_MERGE")) != 0;
+        return on && !lm_ckpt && n_tokens_prev == 0 && !slot.task->tokens.has_mtmd && llama_layer_major_on(ctx_tgt) &&
+            common_speculative_rows_ok(spec.get());
+    }
+
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -3557,6 +3613,7 @@ private:
 
         // start populating the batch for this iteration
         batch.clear();
+        lm_breaks.clear();
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
@@ -4258,10 +4315,27 @@ private:
                             // k9-prompt-pass: n_batch raised for layer-major prompts at an explicit -ub (common_moe_cache_auto_ubatch): the
                             // offsets are clamped to the n_batch given, so the prompt splits into the same batches and ubatches as before
                             const int n_batch_clamp = !lm && params_base.n_batch_ckpt > 0 ? std::min<int>(n_batch, params_base.n_batch_ckpt) : n_batch;
+                            // k11: LLAMA_SERVER_CKPT_SINGLE_MAX=N (opt-in, default 0 = off): a prompt whose part still to process when its
+                            // batch starts is at most N tokens (and fits one ubatch) runs in one pass, without the separate pass of its last 4
+                            // tokens; its checkpoint is then made at the end of the prompt, so a next prompt that differs in those last tokens
+                            // is processed again from the previous checkpoint. Other ubatch shapes, so other numerics (KLD-gated, not md5-equal)
+                            static const int ckpt_single_max = getenv("LLAMA_SERVER_CKPT_SINGLE_MAX") ? atoi(getenv("LLAMA_SERVER_CKPT_SINGLE_MAX")) : 0;
+                            const int n_rest_batch = slot.task->n_tokens() - (slot.prompt.n_tokens() - (int) (batch.size() - n_tokens_prev));
+                            const bool ckpt_single = ckpt_single_max > 0 && n_rest_batch <= std::min<int>(ckpt_single_max, n_ubatch);
                             bool should_break = false;
-                            for (int offset : checkpoint_offsets) {
+                            for (int k = 0; k < 2; ++k) {
+                                const int offset = checkpoint_offsets[k];
+                                if (offset == 4 && ckpt_single) {
+                                    continue;
+                                }
                                 const int n_last = std::min(n_batch_clamp, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                    // k11: under layer-major prompts the batch goes on past the far checkpoint, its ubatches end there
+                                    // (only when the rest up to the near checkpoint fits this batch: else the batches, so the ubatches, would differ)
+                                    if (k == 0 && offset != 4 && batch.size() + (n_last - 4) <= n_batch && lm_ckpt_merge_ok(slot, n_tokens_prev, lm)) {
+                                        lm_breaks.push_back(batch.size());
+                                        break;
+                                    }
                                     should_break = true;
                                     break;
                                 }
@@ -4436,6 +4510,17 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        // k11 (LLAMA_LM_CKPT_MERGE): the breaks inside this view, relative to it
+        std::vector<int32_t> seg_breaks;
+        for (const int32_t b : lm_breaks) {
+            if (b > off && b < off + batch.view.size()) {
+                seg_breaks.push_back(b - off);
+            }
+        }
+        if (!seg_breaks.empty()) {
+            llama_set_ubatch_breaks(ctx_tgt, seg_breaks.data(), (int32_t) seg_breaks.size());
+            SRV_DBG("k11 merged prompt batch of %d tokens, %zu ubatch breaks (first at %d)\n", batch.view.size(), seg_breaks.size(), seg_breaks[0]);
+        }
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
@@ -4502,7 +4587,20 @@ private:
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
-                ok = common_speculative_process(spec.get(), batch.view);
+                if (seg_breaks.empty()) {
+                    ok = common_speculative_process(spec.get(), batch.view);
+                } else {
+                    // the segments one at a time, as the separate batches would have been (the draft keeps its own batches)
+                    int32_t a = 0;
+                    for (size_t k = 0; k <= seg_breaks.size() && ok; ++k) {
+                        const int32_t b = k < seg_breaks.size() ? seg_breaks[k] : batch.view.size();
+                        common_batch seg;
+                        seg.n_pos = batch.view.n_pos;
+                        seg.tokens.assign(batch.view.tokens.begin() + a, batch.view.tokens.begin() + b);
+                        ok = common_speculative_process_rows(spec.get(), seg, a);
+                        a = b;
+                    }
+                }
             });
 
             if (!ok) {

@@ -767,6 +767,13 @@ struct llama_moe_cache::impl {
     bool    cm      = false;
     bool    cm_dbg  = false;  // LLAMA_MOE_CPU_MISS_LOG=1: every rule window
     bool    cm_force = false; // LLAMA_MOE_CPU_MISS=2: on for every batch size, no rule
+    // k11 LLAMA_MOE_CPU_MISS_PROMPT=N (opt-in, default 0 = off): prompt ubatches of max_batch + 1 .. N tokens always take the host path
+    // once calibrated, at the rule's fetch share but at most 1/4 (the host computes at least three quarters of the misses, the experts
+    // with the fewest uses), without waiting for a trial on the small batches. G4, LFM2.5-24B-A2B 8 GB, a 38-token prompt: 6.1 GB of uploads
+    // (PCIe-bound) -> 0.4 GB. The host's expert products are not the device's bit for bit: other text, KLD-gated
+    int64_t cm_prompt_force = 0;
+    // LLAMA_MOE_CPU_MISS_PROMPT_SHARE=f: the fetch share of those ubatches instead of the rule's (0 < f <= 1; the host computes the rest)
+    float   cm_prompt_share = -1.0f;
     // k10: with LLAMA_MOE_CACHE_HYBRID unset, a cache that holds at most hybrid_max_frac of the host experts keeps k9's default hybrid gate
     // (deterministic share) instead of the CPU-miss rule [LLAMA_MOE_CPU_MISS_GATE=0: the rule there too]
     bool    cm_gate  = false;
@@ -956,6 +963,13 @@ struct llama_moe_cache::impl {
                 cm_trial = !cm_force && (env_t == nullptr || atoi(env_t) != 0);
                 const char * env_p = getenv("LLAMA_MOE_CPU_MISS_MAX_TOKENS");
                 cm_max = std::max<int64_t>(1, std::min<int64_t>(cm_max_limit, env_p != nullptr ? atoll(env_p) : cm_max));
+                if (const char * env_pf = getenv("LLAMA_MOE_CPU_MISS_PROMPT"); cm && env_pf != nullptr && atoll(env_pf) > max_batch) {
+                    cm_prompt_force = std::min<int64_t>(cm_max_limit, atoll(env_pf));
+                    cm_max = std::max(cm_max, cm_prompt_force);
+                    if (const char * env_ps = getenv("LLAMA_MOE_CPU_MISS_PROMPT_SHARE"); env_ps != nullptr && atof(env_ps) > 0.0) {
+                        cm_prompt_share = (float) std::min(1.0, atof(env_ps));
+                    }
+                }
                 cm_dbg = getenv("LLAMA_MOE_CPU_MISS_LOG") != nullptr && atoi(getenv("LLAMA_MOE_CPU_MISS_LOG")) != 0;
                 if (const char * env_s = getenv("LLAMA_MOE_CPU_MISS_SPLIT_SCALE")) {
                     cm_split_scale = std::max(0.0, atof(env_s));
@@ -3419,11 +3433,16 @@ struct llama_moe_cache::impl {
     }
 
     bool cm_serves(int64_t n_tokens) const {
-        return cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_max && cm_on[n_tokens] != 0 && cm_prompt_ok();
+        return cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_max && (n_tokens <= cm_prompt_force || (cm_on[n_tokens] != 0 && cm_prompt_ok()));
     }
 
     // the host computes the misses of a batch of n_tokens: the fetch share, 1 = every missing expert is fetched
     float cm_share_of(int64_t n_tokens) const {
+        if (cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_prompt_force) {
+            // default: at most 1/4 fetched. The rule's share (capped at 3/4) left 71 ms of zero-copy fetch kernels in a 38-token LFM2.5 8 GB
+            // prompt of 122 ms; G4 k11pgW at 1/4: LFM2.5 chat 444 tok/s (339 at the rule's share), Qwen3.6 360 (329); 1/8: LFM2.5 415
+            return cm_prompt_share > 0.0f ? cm_prompt_share : std::min(cm_share[n_tokens], 0.25f);
+        }
         if (!cm || !cm_cal || n_tokens < 1 || n_tokens > cm_max || cm_on[n_tokens] == 0 || (n_tokens <= max_batch ? !cm_small_live : !cm_prompt_ok())) {
             return 1.0f;
         }

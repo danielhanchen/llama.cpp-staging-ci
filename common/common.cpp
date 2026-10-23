@@ -14,6 +14,8 @@
 #include "speculative.h"
 #include "unicode.h"
 
+#include <mutex>
+#include <condition_variable>
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
@@ -3752,6 +3754,21 @@ bool common_replay_last_token(struct llama_context * ctx, llama_token last_token
     return true;
 }
 
+static bool common_env_flag(const char * name, bool def) {
+    const char * e = getenv(name);
+    return e == nullptr || *e == '\0' ? def : atoi(e) != 0;
+}
+
+bool common_mtp_handoff_on(const char * lever) {
+    static const bool all = common_env_flag("LLAMA_MTP_HANDOFF", true);
+    return all && common_env_flag(("LLAMA_MTP_HANDOFF_" + std::string(lever)).c_str(), true);
+}
+
+bool common_mtp_handoff_trace() {
+    static const bool on = common_env_flag("LLAMA_MTP_HANDOFF_TRACE", false);
+    return on;
+}
+
 common_batch::common_batch(llama_context * ctx) : batch(llama_batch_ext_init(ctx)) {
     const auto rope_type = llama_model_rope_type(llama_get_model(ctx));
     n_pos = rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE ? GGML_MROPE_SECTIONS : 1;
@@ -3823,6 +3840,13 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
 
     llama_batch_ext * res = batch.get();
     llama_batch_ext_clear(res);
+    {
+        int32_t n_state = 0;
+        for (int32_t i = off; i < off + n; ++i) {
+            n_state += tokens[i].state.data != nullptr;
+        }
+        llama_batch_ext_reserve(res, n, n_state);
+    }
 
     for (int32_t i = off; i < off + n; ++i) {
         const token & t = tokens[i];
@@ -3967,6 +3991,158 @@ void common_prompt_checkpoint::update_pos(
     this->pos_max  = pos_max;
 }
 
+static bool ckpt_pool_on() {
+    static const bool on = getenv("LLAMA_CKPT_POOL") == nullptr || atoi(getenv("LLAMA_CKPT_POOL")) != 0;
+    return on;
+}
+
+static std::mutex                    g_ckpt_pool_mutex;
+static std::vector<common_state_buf> g_ckpt_pool;
+
+// k11: the pool keeps at most this many bytes (LLAMA_STATE_POOL_MIB, default 1024) and 8 buffers
+static size_t ckpt_pool_limit() {
+    static const size_t lim = (size_t) (getenv("LLAMA_STATE_POOL_MIB") ? std::max(0, atoi(getenv("LLAMA_STATE_POOL_MIB"))) : 1024) << 20;
+    return lim;
+}
+
+// keep the pool within its limits: drop the smallest buffers first (the lock is held by the caller)
+static void ckpt_pool_trim() {
+    auto total = [] { size_t t = 0; for (const auto & b : g_ckpt_pool) { t += b.capacity(); } return t; };
+    while (!g_ckpt_pool.empty() && (g_ckpt_pool.size() > 8 || total() > ckpt_pool_limit())) {
+        auto it = std::min_element(g_ckpt_pool.begin(), g_ckpt_pool.end(),
+            [](const common_state_buf & a, const common_state_buf & b) { return a.capacity() < b.capacity(); });
+        g_ckpt_pool.erase(it);
+    }
+}
+
+void common_state_buf_recycle(common_state_buf && buf) {
+    if (!ckpt_pool_on() || buf.capacity() < (1u << 20)) {
+        return; // small buffers are not worth keeping (buf is freed by its owner)
+    }
+    std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
+    g_ckpt_pool.push_back(std::move(buf));
+    ckpt_pool_trim();
+}
+
+// k11 (LLAMA_STATE_PREFAULT, default on with the pool, =0 off): a background thread keeps buffers whose pages are already resident
+// in the pool, so the prompt-cache save and the checkpoints of the next request do not fault in fresh memory on the TTFT path
+static bool state_prefault_on() {
+    static const bool on = ckpt_pool_on() && (getenv("LLAMA_STATE_PREFAULT") == nullptr || atoi(getenv("LLAMA_STATE_PREFAULT")) != 0);
+    return on;
+}
+
+namespace {
+struct state_prefault_worker {
+    std::mutex              m;
+    std::condition_variable cv;
+    std::vector<std::pair<size_t, int>> want; // (bytes, count)
+    bool        stop = false;
+    std::thread th;
+
+    void request(size_t n, int count) {
+        std::lock_guard<std::mutex> lock(m);
+        if (stop) {
+            return;
+        }
+        want.push_back({ n, count });
+        if (!th.joinable()) {
+            th = std::thread([this] { run(); });
+        }
+        cv.notify_one();
+    }
+
+    void run() {
+        std::unique_lock<std::mutex> lock(m);
+        while (true) {
+            cv.wait(lock, [this] { return stop || !want.empty(); });
+            if (stop) {
+                return;
+            }
+            auto w = std::move(want);
+            want.clear();
+            lock.unlock();
+            for (const auto & [n, count] : w) {
+                fill(n, count);
+            }
+            lock.lock();
+        }
+    }
+
+    void fill(size_t n, int count) {
+        const size_t n_alloc = n + n/16; // room for a slightly longer prompt
+        while (true) {
+            {
+                std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
+                int    have  = 0;
+                size_t total = 0;
+                for (const auto & b : g_ckpt_pool) {
+                    have  += b.capacity() >= n;
+                    total += b.capacity();
+                }
+                if (have >= count || g_ckpt_pool.size() >= 8 || total + n_alloc > ckpt_pool_limit()) {
+                    return;
+                }
+            }
+            common_state_buf b;
+            try {
+                b.resize(n_alloc);
+            } catch (const std::bad_alloc &) {
+                return;
+            }
+            memset(b.data(), 0, b.size()); // fault the pages in here, not on the save path
+            std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
+            g_ckpt_pool.push_back(std::move(b));
+            ckpt_pool_trim();
+        }
+    }
+
+    ~state_prefault_worker() {
+        {
+            std::lock_guard<std::mutex> lock(m);
+            stop = true;
+        }
+        cv.notify_one();
+        if (th.joinable()) {
+            th.join();
+        }
+    }
+};
+}
+
+// constructed after the pool, so destroyed (joined) before it
+static state_prefault_worker g_state_prefault;
+
+void common_state_buf_prefault(size_t n, int count) {
+    if (state_prefault_on() && n >= (1u << 20) && count > 0) {
+        g_state_prefault.request(n, count);
+    }
+}
+
+bool common_state_buf_take(common_state_buf & buf, size_t n) {
+    if (!ckpt_pool_on() || buf.capacity() >= n) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
+    // the smallest that fits
+    auto best = g_ckpt_pool.end();
+    for (auto it = g_ckpt_pool.begin(); it != g_ckpt_pool.end(); ++it) {
+        if (it->capacity() >= n && (best == g_ckpt_pool.end() || it->capacity() < best->capacity())) {
+            best = it;
+        }
+    }
+    if (best == g_ckpt_pool.end()) {
+        return false;
+    }
+    buf = std::move(*best);
+    g_ckpt_pool.erase(best);
+    return true;
+}
+
+static bool ckpt_no_zero_fill() {
+    static const bool on = common_mtp_handoff_on("CKPT");
+    return on;
+}
+
 void common_prompt_checkpoint::update_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
@@ -3977,7 +4153,12 @@ void common_prompt_checkpoint::update_tgt(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
+    common_state_buf_take(data_tgt, ckpt_size);
+    common_state_buf_prefault(ckpt_size, 2);
     data_tgt.resize(ckpt_size);
+    if (!ckpt_no_zero_fill()) {
+        std::fill(data_tgt.begin(), data_tgt.end(), 0); // LLAMA_MTP_HANDOFF_CKPT=0: zero-filled as before
+    }
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
@@ -3995,7 +4176,11 @@ void common_prompt_checkpoint::update_dft(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
+    common_state_buf_take(data_dft, ckpt_size);
     data_dft.resize(ckpt_size);
+    if (!ckpt_no_zero_fill()) {
+        std::fill(data_dft.begin(), data_dft.end(), 0); // LLAMA_MTP_HANDOFF_CKPT=0: zero-filled as before
+    }
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {

@@ -134,7 +134,15 @@ bool llama_batch_allocr::init(
     }
 
     if (has_state) {
-        state_vec = batch_inp.state;
+        // the input batch outlives every ubatch split from it (they are consumed inside the same decode call), so its state rows
+        // are read in place; LLAMA_MTP_HANDOFF_COPY=0: copied first, as before
+        static const bool no_copy = llama_mtp_handoff_on("COPY");
+        if (no_copy) {
+            state_src = batch_inp.state.data();
+        } else {
+            state_vec = batch_inp.state;
+            state_src = state_vec.data();
+        }
     }
 
     //
@@ -305,7 +313,7 @@ bool llama_batch_allocr::init(
             /*.n_pos        =*/ n_pos_per_embd,
             /*.token        =*/ batch.token,
             /*.embd         =*/ batch.embd,
-            /*.embd_state   =*/ state_vec.empty() ? nullptr : state_vec.data(),
+            /*.embd_state   =*/ const_cast<float *>(state_src),
             /*.pos          =*/ batch.pos,
             /*.n_seq_id     =*/ batch.n_seq_id,
             /*.seq_id       =*/ batch.seq_id,
@@ -582,6 +590,15 @@ void llama_batch_allocr::split_reset() {
     used.resize(get_n_tokens(), false);
 }
 
+int32_t llama_batch_allocr::break_after(int32_t idx) const {
+    for (const int32_t b : ubatch_breaks) {
+        if (b > idx) {
+            return b;
+        }
+    }
+    return (int32_t) get_n_tokens();
+}
+
 llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
     // find the first unused token
     uint32_t cur_idx = 0;
@@ -596,6 +613,9 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
 
     std::vector<int32_t> idxs;
 
+    // a segment ends at the next break (k11 LLAMA_LM_CKPT_MERGE)
+    const uint32_t seg_end = ubatch_breaks.empty() ? (uint32_t) used.size() : (uint32_t) break_after((int32_t) cur_idx);
+
     while (true) {
         idxs.push_back(cur_idx);
 
@@ -604,7 +624,7 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
 
         ++cur_idx;
 
-        if (cur_idx >= used.size()) {
+        if (cur_idx >= used.size() || cur_idx >= seg_end) {
             break;
         }
 
@@ -679,6 +699,15 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
     // at the end we will concat these to get the final ubatch
     std::vector<idx_vec_t> idxs_per_seq(n_seqs);
 
+    // k11 (LLAMA_LM_CKPT_MERGE): one sequence set, its segment ends at the next break (batch index == index in the set, checked)
+    int32_t seg_end = -1;
+    if (!ubatch_breaks.empty() && n_seqs == 1) {
+        const auto & m = seq_set_map[cur_seq_set[0]];
+        if ((int32_t) m.size() == batch.n_tokens && m.front() == 0 && m.back() == batch.n_tokens - 1) {
+            seg_end = break_after(cur_idx[0]);
+        }
+    }
+
     while (true) {
         // we can only add new n_seq_tokens tokens if all the sequence sets have at least 1 more unused tokens and
         //   if we haven't reached n_ubatch
@@ -692,6 +721,9 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         }
 
         if (!can_expand) {
+            break;
+        }
+        if (seg_end >= 0 && cur_idx[0] >= seg_end) {
             break;
         }
 
@@ -718,6 +750,10 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         GGML_ASSERT(n_ubatch > n_keep_tail);
 
         auto n_remaining = [&](uint32_t s) {
+            // within a segment (k11): as if the segment were the whole batch
+            if (seg_end >= 0 && s == 0) {
+                return (uint32_t) (seg_end - cur_idx[s]);
+            }
             return (uint32_t) (seq_set_map[cur_seq_set[s]].size() - cur_idx[s]);
         };
 
@@ -838,6 +874,7 @@ void llama_batch_allocr::clear() {
     embd_vec    .clear();
     is_embd_vec .clear();
     state_vec   .clear();
+    state_src = nullptr;
     seq_id_data .clear();
     pos         .clear();
     n_seq_id    .clear();
@@ -880,10 +917,18 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     const bool mixed     = mixed_batch && n_embd_rows > 0 && n_embd_rows < n_tokens;
     const bool use_token = batch.token && !(mixed_batch && n_embd_rows == n_tokens);
     const bool use_embd  = batch.embd  && !(mixed_batch && n_embd_rows == 0);
-    const bool has_state = !state_vec.empty();
+    const bool has_state = state_src != nullptr;
+
+    // the state rows of consecutive batch entries are already laid out as the ubatch needs them: the ubatch points at them
+    // instead of a zero-filled copy (a prompt ubatch of the MTP draft carries n_tokens*n_embd floats of target hidden state)
+    static const bool state_in_place = llama_mtp_handoff_on("COPY");
+    bool state_view = has_state && state_in_place;
+    for (size_t i = 1; state_view && i < idxs.size(); ++i) {
+        state_view = idxs[i] == idxs[0] + (int32_t) i;
+    }
 
     const int64_t n_embd_all  = use_embd  ? (int64_t) n_tokens*n_embd       : 0;
-    const int64_t n_state_all = has_state ? (int64_t) n_tokens*n_embd_state : 0;
+    const int64_t n_state_all = has_state && !state_view ? (int64_t) n_tokens*n_embd_state : 0;
     const int64_t n_pos_all   =             (int64_t) n_tokens*n_pos_per_embd;
 
     udata->token     .resize(n_tokens);
@@ -916,8 +961,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
             udata->type[i] = is_embd_vec[idxs[i]];
         }
 
-        if (has_state) {
-            memcpy(udata->embd_state.data() + i*n_embd_state, state_vec.data() + (int64_t) idxs[i]*n_embd_state, n_embd_state*sizeof(float));
+        if (has_state && !state_view) {
+            memcpy(udata->embd_state.data() + i*n_embd_state, state_src + (int64_t) idxs[i]*n_embd_state, n_embd_state*sizeof(float));
         }
 
         for (size_t j = 0; j < (size_t)n_pos_per_embd; ++j) {
@@ -966,7 +1011,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
         /*.token        =*/ use_token ? udata->token.data() : nullptr,
         /*.embd         =*/ use_embd  ? udata->embd.data()  : nullptr,
-        /*.embd_state   =*/ has_state ? udata->embd_state.data() : nullptr,
+        /*.embd_state   =*/ !has_state ? nullptr : state_view ? const_cast<float *>(state_src + (int64_t) idxs[0]*n_embd_state) : udata->embd_state.data(),
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
         /*.seq_id       =*/ udata->seq_id.data(),
@@ -1164,6 +1209,22 @@ llama_batch_ext::llama_batch_ext(llama_context * ctx) :
         n_vocab(llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)))),
         n_pos_per_embd(llama_get_model(ctx)->hparams.n_pos_per_embd()) {
     clear();
+    // k11 (LLAMA_BATCH_STATE_PREFAULT=0 turns it off): the state rows of a full batch are allocated and faulted in here, at load,
+    // instead of by the first long prompt: an 8k-token Flash-Next MTP prompt grew this vector to 335 MiB by insertion, ~240 ms of
+    // reallocation and page faults on the main thread between the target's last ubatch and the drafter (G4 nsys). At most 1 GiB.
+    static const bool prefault = getenv("LLAMA_BATCH_STATE_PREFAULT") == nullptr || atoi(getenv("LLAMA_BATCH_STATE_PREFAULT")) != 0;
+    const size_t n_state = n_tokens_max*n_embd_state;
+    if (prefault && n_state > 0 && n_state*sizeof(float) <= (1ull << 30)) {
+        state.resize(n_state);
+        state.clear(); // the capacity (and its resident pages) stays
+    }
+}
+
+void llama_batch_ext::reserve(size_t n_tokens, size_t n_state_tokens) {
+    tokens.reserve(n_tokens);
+    if (n_embd_state > 0 && n_state_tokens > 0) {
+        state.reserve(n_state_tokens*n_embd_state); // one allocation instead of a doubling per growth
+    }
 }
 
 llama_batch_ext::llama_batch_ext(
@@ -1349,6 +1410,10 @@ void llama_batch_ext_free(llama_batch_ext * batch) {
 
 void llama_batch_ext_clear(llama_batch_ext * batch) {
     batch->clear();
+}
+
+void llama_batch_ext_reserve(llama_batch_ext * batch, int32_t n_tokens, int32_t n_state_tokens) {
+    batch->reserve(n_tokens, n_state_tokens);
 }
 
 int32_t llama_batch_ext_add(llama_batch_ext * batch, llama_seq_id seq_id) {

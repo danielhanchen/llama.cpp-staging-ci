@@ -16,6 +16,9 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <memory>
+#include <type_traits>
+#include <utility>
 #include <map>
 #include <algorithm>
 #include <filesystem>
@@ -1149,6 +1152,10 @@ struct common_memory {
 
 // wrapper around llama_batch_ext that provide getter functions for downstream code
 // entries can exceed n_batch, use get_sub_batch() to decode them in chunks
+// MTP prompt handoff levers: LLAMA_MTP_HANDOFF_<lever>=0 turns one off, LLAMA_MTP_HANDOFF=0 all of them (cache the result)
+bool common_mtp_handoff_on(const char * lever);
+bool common_mtp_handoff_trace(); // LLAMA_MTP_HANDOFF_TRACE=1
+
 struct common_batch {
     struct token {
         llama_token  id;
@@ -1350,6 +1357,27 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// a byte buffer whose resize() leaves new bytes uninitialized: a checkpoint is overwritten in full by the state save, and the
+// zero-fill of a fresh multi-MiB buffer (page faults included) otherwise ran on the main thread before the save was queued
+template <typename T>
+struct common_default_init_allocator : std::allocator<T> {
+    using std::allocator<T>::allocator;
+    template <typename U> struct rebind { using other = common_default_init_allocator<U>; };
+    template <typename U> void construct(U * p) noexcept(std::is_nothrow_default_constructible<U>::value) { ::new ((void *) p) U; }
+    template <typename U, typename... Args> void construct(U * p, Args &&... args) { ::new ((void *) p) U(std::forward<Args>(args)...); }
+};
+
+using common_state_buf = std::vector<uint8_t, common_default_init_allocator<uint8_t>>;
+
+// k11 (LLAMA_CKPT_POOL, default on, =0 off): freed checkpoint buffers are kept (at most 4, the largest) and given to the next checkpoint
+// that fits, so its pages are resident: without the zero-fill the state save's host copy otherwise faults every page of a fresh buffer
+// on the save worker, and the next decode() waits for it (G4 Qwen3.6 32 GB, no MTP: 42..600-token prompts -5..-9% vs k10)
+void common_state_buf_recycle(common_state_buf && buf);
+// a buffer of at least n bytes from the pool into buf, if buf is smaller (returns true when one was taken)
+bool common_state_buf_take(common_state_buf & buf, size_t n);
+// k11 (LLAMA_STATE_PREFAULT=0 turns it off): ask a background thread to keep count pooled buffers of at least n bytes with resident pages
+void common_state_buf_prefault(size_t n, int count);
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1359,8 +1387,8 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
-    std::vector<uint8_t> data_tgt;
-    std::vector<uint8_t> data_dft;
+    common_state_buf data_tgt;
+    common_state_buf data_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)

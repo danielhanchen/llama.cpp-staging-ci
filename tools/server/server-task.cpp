@@ -1712,7 +1712,45 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
+// k11: give the buffers of a dropped cache entry back to the state pool (the next save takes them, already resident)
+static void prompt_state_recycle(server_prompt_cache_state & st) {
+    common_state_buf_recycle(std::move(st.data.main));
+    common_state_buf_recycle(std::move(st.data.drft));
+    for (auto & c : st.prompt.checkpoints) {
+        common_state_buf_recycle(std::move(c.data_tgt));
+        common_state_buf_recycle(std::move(c.data_dft));
+    }
+}
+
+// k11: a copy of the checkpoints into pooled buffers (a plain copy faults in every page of a fresh allocation)
+static std::list<common_prompt_checkpoint> prompt_checkpoints_clone(const std::list<common_prompt_checkpoint> & src) {
+    std::list<common_prompt_checkpoint> dst;
+    for (const auto & c : src) {
+        common_prompt_checkpoint d;
+        d.n_tokens = c.n_tokens;
+        d.id_task  = c.id_task;
+        d.pos_min  = c.pos_min;
+        d.pos_max  = c.pos_max;
+        common_state_buf_take(d.data_tgt, c.data_tgt.size());
+        d.data_tgt.resize(c.data_tgt.size());
+        if (!c.data_tgt.empty()) {
+            memcpy(d.data_tgt.data(), c.data_tgt.data(), c.data_tgt.size());
+        }
+        common_state_buf_take(d.data_dft, c.data_dft.size());
+        d.data_dft.resize(c.data_dft.size());
+        if (!c.data_dft.empty()) {
+            memcpy(d.data_dft.data(), c.data_dft.data(), c.data_dft.size());
+        }
+        d.data_spec = c.data_spec;
+        common_state_buf_prefault(c.data_tgt.size(), 2);
+        dst.push_back(std::move(d));
+    }
+    return dst;
+}
+
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+    wait_inflight(); // the previous save is complete before entries are compared, erased or evicted
+
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -1745,6 +1783,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         if (len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
+            prompt_state_recycle(*it);
             it = states.erase(it);
         } else {
             ++it;
@@ -1761,13 +1800,22 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
+    common_state_buf state_data_tgt;
+    common_state_buf state_data_dft;
 
     // check if we can allocate enough memory for the new state
     try {
+        common_state_buf_take(state_data_tgt, state_size_tgt);
+        common_state_buf_take(state_data_dft, state_size_dft);
         state_data_tgt.resize(state_size_tgt);
         state_data_dft.resize(state_size_dft);
+        if (getenv("LLAMA_STATE_PREFAULT") != nullptr && atoi(getenv("LLAMA_STATE_PREFAULT")) == 0) {
+            // as before: value-initialized
+            std::fill(state_data_tgt.begin(), state_data_tgt.end(), 0);
+            std::fill(state_data_dft.begin(), state_data_dft.end(), 0);
+        }
+        common_state_buf_prefault(state_size_tgt, 2);
+        common_state_buf_prefault(state_size_dft, 1);
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
@@ -1783,7 +1831,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
+            /*.checkpoints =*/ prompt_checkpoints_clone(prompt.checkpoints),
             /*.kv_shifted  =*/ prompt.kv_shifted,
         },
         /*.data   =*/ {
@@ -1871,6 +1919,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
+        if (&*it_best == inflight) {
+            wait_inflight();
+        }
+
         {
             auto & data = it_best->data.main;
 
@@ -1882,6 +1934,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 return false;
             }
 
+            common_state_buf_recycle(std::move(data));
             data.clear();
             data.shrink_to_fit();
         }
@@ -1900,6 +1953,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                     return false;
                 }
 
+                common_state_buf_recycle(std::move(data));
+
                 data.clear();
                 data.shrink_to_fit();
             }
@@ -1917,8 +1972,13 @@ void server_prompt_cache::evict_front() {
     if (states.empty()) {
         return;
     }
+    if (&states.front() == inflight) {
+        wait_inflight();
+    }
     if (ssd != nullptr) {
         ssd->put(std::move(states.front()));
+    } else {
+        prompt_state_recycle(states.front());
     }
     states.pop_front();
 }

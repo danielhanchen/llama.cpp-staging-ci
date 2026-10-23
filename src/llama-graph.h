@@ -177,6 +177,11 @@ public:
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd_state, n_batch]
 
+    // LLAMA_MTP_DEV_H: the hidden state rows are read on the device from h_src (the MTP handoff sink the target wrote), row
+    // h_idx[i] = the batch index of ubatch row i (row 0 = the pending row of the previous batch); h is then not in the graph
+    ggml_tensor * h_idx  = nullptr; // I32 [n_batch]
+    ggml_tensor * h_src  = nullptr; // F32 [n_embd_state, n_rows_max + 1], device buffer
+
     const int64_t n_embd       = 0;
     const int64_t n_embd_state = 0;
 };
@@ -850,6 +855,9 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // LLAMA_MTP_DEV_H: the device rows the MTP input hidden state is read from (nullptr = ubatch.embd_state on the host)
+    ggml_tensor * h_dev_src = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -883,6 +891,10 @@ struct llm_graph_params {
         }
 
         if (!can_reuse_ubatch) {
+            return false;
+        }
+
+        if (h_dev_src != other.h_dev_src) {
             return false;
         }
 
@@ -1090,6 +1102,8 @@ struct llm_graph_context {
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
+    ggml_tensor * h_dev_src = nullptr; // see llm_graph_params::h_dev_src
+
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
@@ -1284,6 +1298,10 @@ struct llm_graph_context {
 
     // tok_scale: applied to token rows only
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f) const;
+
+    // the MTP input hidden state [n_embd_h, n_tokens]: inp->h (an input filled from ubatch.embd_state) or, with a device source
+    // (LLAMA_MTP_DEV_H), the rows of that source picked by inp->h_idx
+    ggml_tensor * build_inp_h_state(llm_graph_input_embd_h * inp, int64_t n_embd_h) const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;

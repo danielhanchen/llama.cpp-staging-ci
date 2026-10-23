@@ -136,7 +136,8 @@ struct ssd_writer {
     template <typename T>
     void put_val(const T & v) { put(&v, sizeof(v)); }
 
-    void put_buf(const std::vector<uint8_t> & b) {
+    template <typename Buf>
+    void put_buf(const Buf & b) {
         const uint64_t n = b.size();
         put_val(n);
         put(b.data(), b.size());
@@ -162,7 +163,8 @@ struct ssd_reader {
     template <typename T>
     bool get_val(T & v) { return get(&v, sizeof(v)); }
 
-    bool get_buf(std::vector<uint8_t> & b) {
+    template <typename Buf>
+    bool get_buf(Buf & b) {
         uint64_t n = 0;
         // the length field may be corrupted: check it against the bytes left before allocating
         if (!get_val(n) || n > n_left) {

@@ -152,10 +152,22 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
     }
 
+    if (h_idx) {
+        // LLAMA_MTP_DEV_H: the rows come from the device sink; row of ubatch entry i = its batch index
+        GGML_ASSERT(ubatch->data && ubatch->data->batch_idxs.size() == n_tokens);
+        ggml_backend_tensor_set(h_idx, ubatch->data->batch_idxs.data(), 0, n_tokens*sizeof(int32_t));
+        return;
+    }
+
     GGML_ASSERT(ubatch->embd_state && "this graph requires a state embedding, see llama_batch_ext_set_embd_state()");
     GGML_ASSERT(n_embd_state == h->ne[0]);
 
+    const int64_t t0 = llama_mtp_handoff_trace() && n_tokens >= 64 ? ggml_time_us() : 0;
     ggml_backend_tensor_set(h, ubatch->embd_state, 0, n_tokens*n_embd_state*ggml_element_size(h));
+    if (t0) {
+        LLAMA_LOG_INFO("mtp_trace h_set n=%lld %.1f MiB host=%d %.2f ms\n", (long long) n_tokens, n_tokens*n_embd_state*ggml_element_size(h)/1048576.0,
+                (int) ggml_backend_buffer_is_host(h->buffer), (ggml_time_us() - t0)/1e3);
+    }
 }
 
 bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
@@ -164,6 +176,8 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     res &= (!params.ubatch.token)      || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)       || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd_state) || (h      && h->ne[1]      == params.ubatch.n_tokens);
+    res &= (h_idx != nullptr) == (params.h_dev_src != nullptr);
+    res &= (!h_idx) || (h_idx->ne[0] == params.ubatch.n_tokens && h_src == params.h_dev_src);
 
     return res;
 }
@@ -1617,6 +1631,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_cache        (params.moe_cache),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
+    h_dev_src        (params.h_dev_src),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -3022,6 +3037,23 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     ggml_build_forward_expand(gf, cur);
 
     return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_h_state(llm_graph_input_embd_h * inp, int64_t n_embd_h) const {
+    const int64_t n_tokens = ubatch.n_tokens;
+    if (h_dev_src && !ubatch.embd_state && h_dev_src->ne[0] == n_embd_h) {
+        inp->h_src = h_dev_src;
+        inp->h_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp->h_idx);
+        ggml_set_name(inp->h_idx, "mtp_h_idx");
+        ggml_tensor * h = ggml_get_rows(ctx0, h_dev_src, inp->h_idx);
+        ggml_set_name(h, "mtp_h_input");
+        return h;
+    }
+    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_h, n_tokens);
+    ggml_set_input(inp->h);
+    ggml_set_name(inp->h, "mtp_h_input");
+    return inp->h;
 }
 
 ggml_tensor * llm_graph_context::build_inp_pos() const {

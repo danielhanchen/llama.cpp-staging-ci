@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
+#include <cstdlib>
 #include <cstdarg>
 #include <cstring>
 #include <vector>
@@ -201,4 +202,19 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i) {
         default:
             return gguf_data_to_str(type, gguf_get_val_data(ctx_gguf, i), 0);
     }
+}
+
+static bool llama_env_flag(const char * name, bool def) {
+    const char * e = getenv(name);
+    return e == nullptr || *e == '\0' ? def : atoi(e) != 0;
+}
+
+bool llama_mtp_handoff_on(const char * lever) {
+    static const bool all = llama_env_flag("LLAMA_MTP_HANDOFF", true);
+    return all && llama_env_flag(("LLAMA_MTP_HANDOFF_" + std::string(lever)).c_str(), true);
+}
+
+bool llama_mtp_handoff_trace() {
+    static const bool on = llama_env_flag("LLAMA_MTP_HANDOFF_TRACE", false);
+    return on;
 }

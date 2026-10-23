@@ -785,6 +785,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    if (src1_memo.n_reused > 0 || src1_memo.n_produced > 0) {
+        GGML_LOG_INFO("%s: src1 memo: %lld conversions reused (%.1f MiB of src1 not converted again), %lld written by the norm "
+            "(GGML_CUDA_SRC1_MEMO=0 / GGML_CUDA_NORM_CONV=0 turn it off)\n",
+            __func__, (long long) src1_memo.n_reused, src1_memo.bytes_skipped / 1048576.0, (long long) src1_memo.n_produced);
+    }
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -1553,6 +1559,20 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
     bool is_src1_cont_2 = ggml_is_contiguous_2(src1);
 
+    // k11: an F16 / BF16 copy of src1 shared with the next MUL_MAT of the graph (see ggml_cuda_src1_memo); only when src0 needs
+    // no conversion, so that the shared copy is the first pool allocation of this product
+    ggml_cuda_src1_memo & memo = ctx.src1_memo;
+    const bool memo_ok = memo.top(dst) && compute_type != GGML_TYPE_F32 && src0->type == compute_type && src1->type == GGML_TYPE_F32 &&
+        ggml_is_contiguously_allocated(src1);
+    const int64_t memo_key[ggml_cuda_src1_memo::n_key] = { (int64_t) compute_type, ne10, ne11, ne12, ne13,
+        (int64_t) nb11, (int64_t) nb12, (int64_t) nb13, 0, 0 };
+    const bool memo_hit  = memo_ok && memo.match(2, src1, memo_key);
+    const bool memo_hold = memo_ok && !memo_hit && memo.share_next;
+    // a held copy this product does not read stays for its own reader, unless this product keeps one itself
+    if (memo_hold) {
+        memo.release();
+    }
+
     if (src0->type == compute_type) {
         src0_ptr = (const cuda_t *) src0->data;
     } else {
@@ -1580,6 +1600,20 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 
     if (src1->type == compute_type) {
         src1_ptr = (const cuda_t *) src1->data;
+    } else if (memo_hit || memo_hold) {
+        if (memo_hit) {
+            memo.note_reuse(src1);
+        } else {
+            memo.hold(ctx.pool(), 2, src1, memo_key, ggml_nelements(src1)*sizeof(cuda_t));
+            const auto convert_func = traits::convert(src1->type);
+            GGML_ASSERT(convert_func != nullptr);
+            convert_func(src1->data, (cuda_t *) memo.ptr, ggml_nelements(src1), main_stream);
+        }
+        src1_ptr = (const cuda_t *) memo.ptr;
+        const size_t src1_bs = ggml_blck_size(src1->type);
+        s11 *= src1_bs;
+        s12 *= src1_bs;
+        s13 *= src1_bs;
     } else {
         src1_alloc.alloc(ggml_nelements(src1));
 
@@ -5168,6 +5202,123 @@ static bool ggml_cuda_side_mv_use(const std::unordered_map<const ggml_tensor *, 
     return true;
 }
 
+// k11: see ggml_cuda_src1_memo. Called before node i runs: drop a held copy that node i does not read, and note whether
+// node i should keep its converted src1 for the next compute node.
+static bool ggml_cuda_src1_memo_begin(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int i, bool allowed) {
+    static const bool disabled = getenv("GGML_CUDA_SRC1_MEMO") != nullptr && atoi(getenv("GGML_CUDA_SRC1_MEMO")) == 0;
+    ggml_cuda_src1_memo & memo = ctx->src1_memo;
+    const ggml_tensor * node = cgraph->nodes[i];
+    memo.share_next = false;
+    const bool is_mm = node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID;
+    if (memo.held && !(is_mm && node->src[1] == memo.src1)) {
+        memo.release();
+    }
+    if (disabled || !allowed || ctx->curr_stream_no != 0 || !is_mm || node->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 8; ++j) {
+        const ggml_tensor * next = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(next) || (next->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        return next->op == node->op && next->src[1] == node->src[1] &&
+            (node->op == GGML_OP_MUL_MAT || next->src[2] == node->src[2]);
+    }
+    return false;
+}
+
+static void ggml_cuda_src1_memo_end(ggml_backend_cuda_context * ctx) {
+    ggml_cuda_src1_memo & memo = ctx->src1_memo;
+    if (!memo.share_next) {
+        memo.release();
+    }
+    memo.share_next = false;
+}
+
+// k11: a fused RMS_NORM + MUL at node i whose output the next matrix products convert (prompt batches): reserve the copy the
+// first converting product would make and let the norm kernel write it (rms_norm_mul_conv_f32), see ggml_cuda_src1_memo.
+// The products only use it when their own key matches, so a wrong guess here costs the extra writes, not correctness.
+// GGML_CUDA_NORM_CONV=0 turns this part off.
+static const ggml_tensor * ggml_cuda_src1_memo_base(const ggml_tensor * t) {
+    while (t->view_src != nullptr && t->view_offs == 0 && ggml_nbytes(t) == ggml_nbytes(t->view_src)) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+static void ggml_cuda_src1_memo_plan_norm(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool disabled = (getenv("GGML_CUDA_SRC1_MEMO") != nullptr && atoi(getenv("GGML_CUDA_SRC1_MEMO")) == 0) ||
+        (getenv("GGML_CUDA_NORM_CONV") != nullptr && atoi(getenv("GGML_CUDA_NORM_CONV")) == 0) ||
+        getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE") != nullptr;
+    ggml_cuda_src1_memo & memo = ctx->src1_memo;
+    memo.producer = nullptr;
+    memo.produced = false;
+    if (disabled || i + 1 >= cgraph->n_nodes || ctx->curr_stream_no != 0) {
+        return;
+    }
+    const ggml_tensor * norm = cgraph->nodes[i];
+    const ggml_tensor * mul  = cgraph->nodes[i + 1];
+    if (norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || (mul->src[0] != norm && mul->src[1] != norm) ||
+            mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul) || mul->data == nullptr) {
+        return;
+    }
+    const int cc = ggml_cuda_info().devices[ctx->device].cc;
+    for (int j = i + 2; j < cgraph->n_nodes && j <= i + 12; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (node->op != GGML_OP_MUL_MAT || ggml_cuda_src1_memo_base(node->src[1]) != mul) {
+            return; // the copy is only shared by the products right after the norm
+        }
+        const ggml_tensor * src0 = node->src[0];
+        const ggml_tensor * src1 = node->src[1];
+        if (!ggml_is_contiguous(src1) || src1->ne[2] != 1 || src1->ne[3] != 1 || (node->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) ||
+                ggml_cuda_op_mul_mat_use_fwht(node)) {
+            continue;
+        }
+        const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1];
+        int     kind = 0, mode = 0;
+        int64_t key[ggml_cuda_src1_memo::n_key] = {};
+        size_t  nbytes = 0;
+        if (ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_NVFP4 && src0->type != GGML_TYPE_MXFP4 &&
+                ne11 > MMVQ_MAX_BATCH_SIZE && ggml_cuda_should_use_mmq(src0->type, cc, ne11, 0)) {
+            const mmq_q8_1_ds_layout layout = mmq_get_q8_1_ds_layout(src0->type);
+            if (layout != MMQ_Q8_1_DS_LAYOUT_D4 && layout != MMQ_Q8_1_DS_LAYOUT_DS4) {
+                continue;
+            }
+            const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+            if (ne10_padded != ne10) {
+                continue;
+            }
+            kind = 1;
+            mode = layout == MMQ_Q8_1_DS_LAYOUT_D4 ? 0 : 1;
+            const int64_t k1[ggml_cuda_src1_memo::n_key] = { (int64_t) layout, ne10, ne11, 1, 1,
+                (int64_t) src1->nb[1], (int64_t) src1->nb[2], (int64_t) src1->nb[3], ne10_padded, 0 };
+            std::copy(k1, k1 + ggml_cuda_src1_memo::n_key, key);
+            nbytes = ne11*ne10_padded/QK8_1_MMQ*sizeof(block_q8_1_mmq) + 128*sizeof(block_q8_1_mmq) + 64*sizeof(int);
+        } else if (src0->type == GGML_TYPE_BF16 && fast_bf16_hardware_available(cc) && ne11 > MMVF_MAX_BATCH_SIZE &&
+                ggml_get_op_params_i32(node, 0) == GGML_PREC_DEFAULT &&
+                !ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, ne11, false)) {
+            kind = 2;
+            mode = 2;
+            const int64_t k2[ggml_cuda_src1_memo::n_key] = { (int64_t) GGML_TYPE_BF16, ne10, ne11, 1, 1,
+                (int64_t) src1->nb[1], (int64_t) src1->nb[2], (int64_t) src1->nb[3], 0, 0 };
+            std::copy(k2, k2 + ggml_cuda_src1_memo::n_key, key);
+            nbytes = ne10*ne11*sizeof(nv_bfloat16);
+        } else {
+            continue;
+        }
+        memo.release();
+        memo.hold(ctx->pool(), kind, src1, key, nbytes);
+        memo.producer      = mul;
+        memo.producer_mode = mode;
+        memo.K_out         = ne10;
+        memo.N_out         = ne11;
+        return;
+    }
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -5327,6 +5478,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         cudaStream_t side = cuda_ctx->stream(cuda_ctx->device, GGML_CUDA_SIDE_MV_STREAM);
                         CUDA_CHECK(cudaEventRecord(cuda_ctx->side_mv_fork, cuda_ctx->stream(cuda_ctx->device, 0)));
                         CUDA_CHECK(cudaStreamWaitEvent(side, cuda_ctx->side_mv_fork, 0));
+                        cuda_ctx->src1_memo.release();
+                        cuda_ctx->src1_memo.share_next = false;
                         cuda_ctx->curr_stream_no = GGML_CUDA_SIDE_MV_STREAM;
                         const bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                         GGML_ASSERT(ok);
@@ -5378,9 +5531,34 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // the share flag is set only for the unfused node: a fused group may hold pool memory around its products
+                const bool memo_share = ggml_cuda_src1_memo_begin(cuda_ctx, cgraph, i, !is_concurrent_event_active && stream_ctx.concurrent_events.empty());
+
+                if (node->op == GGML_OP_RMS_NORM && !is_concurrent_event_active && stream_ctx.concurrent_events.empty()) {
+                    ggml_cuda_src1_memo_plan_norm(cuda_ctx, cgraph, i);
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
+                {
+                    // a copy reserved for the norm and not written (another fusion ran, or the kernel did not apply) is dropped
+                    ggml_cuda_src1_memo & memo = cuda_ctx->src1_memo;
+                    const bool produced = memo.producer != nullptr && memo.produced && nodes_to_skip != 0;
+                    if (memo.producer != nullptr && !produced) {
+                        memo.release();
+                    }
+                    if (produced) {
+                        memo.n_produced++;
+                    }
+                    memo.producer = nullptr;
+                    memo.produced = false;
+                    if (nodes_to_skip != 0 && !produced) {
+                        memo.release();
+                    }
+                }
+
                 if (nodes_to_skip != 0) {
+                    cuda_ctx->src1_memo.share_next = false;
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -5409,11 +5587,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                cuda_ctx->src1_memo.share_next = memo_share;
+                cuda_ctx->src1_memo.node_dst   = node;
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                cuda_ctx->src1_memo.node_dst   = nullptr;
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                ggml_cuda_src1_memo_end(cuda_ctx);
 
                 ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 1);
                 cuda_ctx->q8_1_cache.commit(); // q8_1 copy written by the node itself (DSV4_HC_PRE), if any
@@ -5425,6 +5607,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             // a capture must not end with unjoined work on the side stream
             side_mv_join_until(INT_MAX);
+            cuda_ctx->src1_memo.release();
+            cuda_ctx->src1_memo.share_next = false;
             cuda_ctx->q8_1_cache.end();
         }
 

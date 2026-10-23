@@ -109,6 +109,14 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // output of plain decoding. Prompt batches and single token decodes are not affected.
 LLAMA_API void llama_set_verify(struct llama_context * ctx, bool value);
 
+// k11 (LLAMA_LM_CKPT_MERGE): the next llama_decode() of a single sequence batch ends ubatches at these batch indices (each segment is split as
+// a batch of its own would be: the same ubatches as separate decode() calls, in one layer-major group); cleared by that call
+LLAMA_API void llama_set_ubatch_breaks(struct llama_context * ctx, const int32_t * breaks, int32_t n);
+// layer-major prompt groups can run in this context (a MoE cache with layer-major prompts on)
+LLAMA_API bool llama_layer_major_on(const struct llama_context * ctx);
+// k11: wait for the asynchronous state save in flight (LLAMA_STATE_SEQ_FLAGS_ASYNC), before its destination is read or freed
+LLAMA_API void llama_state_seq_async_wait(struct llama_context * ctx);
+
 // LLAMA_MTP_EXACT=1 is set (read once)
 LLAMA_API bool llama_exact_verify_enabled(void);
 
@@ -116,6 +124,18 @@ LLAMA_API bool llama_exact_verify_enabled(void);
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
+
+// LLAMA_MTP_DEV_H: the MTP prompt handoff on the device (llama_mtp_dev_h in src/llama-context.h). attach: ctx_dft allocates a device
+// sink of n_rows + 1 rows and ctx_tgt writes the h_nextn rows of single-sequence batches of LLAMA_MTP_DEV_H_MIN (64) .. n_rows tokens
+// there instead of to the host (false: the host path stays). last_rows: rows ctx_tgt's last decode wrote (0 = the host buffer holds
+// them). begin / end bracket a ctx_dft decode that reads its h rows from the sink (row i = batch entry i, row 0 the pending row), end
+// copies row pending_row to row 0. get_row / set_row: blocking copies of one sink row.
+LLAMA_API bool    llama_mtp_dev_h_attach   (struct llama_context * ctx_dft, struct llama_context * ctx_tgt, int32_t n_rows);
+LLAMA_API int32_t llama_mtp_dev_h_last_rows(struct llama_context * ctx_tgt);
+LLAMA_API bool    llama_mtp_dev_h_begin    (struct llama_context * ctx_dft);
+LLAMA_API void    llama_mtp_dev_h_end      (struct llama_context * ctx_dft, int32_t pending_row);
+LLAMA_API bool    llama_mtp_dev_h_get_row  (struct llama_context * ctx_dft, int32_t row, float * dst);
+LLAMA_API bool    llama_mtp_dev_h_set_row  (struct llama_context * ctx_dft, int32_t row, const float * src);
 
 // Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
@@ -129,6 +149,9 @@ enum llama_decision_order {
     LLAMA_DECISION_ORDER_OPTION          = 4, // text of an option
 };
 // The embeddings output has one value per entry: row i is the score of option i
+// k11: room for n_tokens entries, n_state_tokens of them with a state row, before they are added
+LLAMA_API void llama_batch_ext_reserve(struct llama_batch_ext * batch, int32_t n_tokens, int32_t n_state_tokens);
+
 LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch, int32_t idx, enum llama_decision_order order);
 
 // mirrors:

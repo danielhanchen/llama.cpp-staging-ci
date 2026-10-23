@@ -56,6 +56,32 @@ struct llama_state_write_info {
     size_t        offset;
 };
 
+// LLAMA_MTP_DEV_H: the MTP handoff on the device. The draft context owns `sink` [n_embd, n_rows + 1]; the target writes the h_nextn row of
+// batch entry j to sink row 1 + j (device to device, on its own stream, after waiting ev_dft) instead of copying it to the host, and
+// records ev_tgt; the draft graph reads its rows from the sink (row 0 = the pending row of the previous batch) after waiting ev_tgt,
+// then copies its last row to row 0 and records ev_dft. No host copy of the hidden state and no host sync on the target in between.
+struct llama_mtp_dev_h {
+    llama_context * tgt = nullptr;
+    llama_context * dft = nullptr;
+    ggml_context * meta = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_tensor * sink = nullptr;
+    ggml_backend_t backend_dft = nullptr; // the draft context's backend of the sink's device
+    ggml_backend_dev_t dev = nullptr;
+    ggml_backend_event_t ev_tgt = nullptr;
+    ggml_backend_event_t ev_dft = nullptr;
+    bool ev_tgt_rec = false;
+    bool ev_dft_rec = false;
+    bool usable = true;      // false after a target graph that cannot write the sink (other device, host buffer, layout)
+    int32_t n_rows   = 0;    // batch rows the sink holds (row 0 is the pending row)
+    int32_t min_rows = 64;   // smaller batches (decode, verify) keep the host path [LLAMA_MTP_DEV_H_MIN]
+    int32_t last_rows = 0;   // rows the target's last decode wrote to the sink, 0 = the host path
+    int64_t n_batches = 0;   // drafter passes that read the sink (engagement count, logged when the drafter is freed)
+    int64_t n_rows_dev = 0;
+
+    ~llama_mtp_dev_h();
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -140,6 +166,26 @@ struct llama_context {
     void set_verify(bool value);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+
+    // LLAMA_MTP_DEV_H (see llama_mtp_dev_h); the draft context calls these
+    bool    mtp_dev_h_attach(llama_context * tgt, int32_t n_rows);
+    bool    mtp_dev_h_begin();
+    void    mtp_dev_h_end(int32_t pending_row);
+    bool    mtp_dev_h_get_row(int32_t row, float * dst);
+    bool    mtp_dev_h_set_row(int32_t row, const float * src);
+    int32_t mtp_dev_h_last_rows() const; // the target context
+
+    std::unique_ptr<llama_mtp_dev_h> mtp_dev_h_own;  // draft: the sink it owns
+    llama_mtp_dev_h * mtp_dev_h_sink   = nullptr;    // target: the sink of its drafter
+    ggml_tensor     * mtp_dev_h_src    = nullptr;    // draft: the graph reads h from here while set (llm_graph_params::h_dev_src)
+    bool              mtp_dev_h_this   = false;      // target: the current decode writes the sink
+    bool              mtp_dev_h_waited = false;      // target: the current decode waited ev_dft
+    int32_t           mtp_dev_h_done   = 0;          // target: rows of the current decode written to the sink
+    std::vector<std::array<int64_t, 3>> mtp_dev_h_runs; // target: (host row offset, batch index, rows) written this decode
+
+    // target: write the h_nextn rows of `ubatch` (host offset `offset`) to the sink; false = the host path for this ubatch
+    bool mtp_dev_h_store(ggml_backend_t backend_h, ggml_tensor * t_h_nextn, const llama_ubatch & ubatch, int64_t offset);
+    void mtp_dev_h_decode_begin(const llama_batch_ext & batch_inp);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -281,6 +327,10 @@ private:
     //
 
 public:
+    // k11 (LLAMA_LM_CKPT_MERGE)
+    void set_ubatch_breaks(const int32_t * breaks, int32_t n);
+    bool layer_major_on() const;
+
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
@@ -539,6 +589,8 @@ private:
     // (every ubatch through a layer before any goes on to the next), so each host expert is copied to the device once for all of them
     // while every ubatch keeps its own graph, kernels and order of operations (bit-identical to the ubatches run one after the other)
     bool lm_enabled = false;
+    // k11 (LLAMA_LM_CKPT_MERGE): ubatch breaks of the next decode() (batch indices), see llama_set_ubatch_breaks
+    std::vector<int32_t> ubatch_breaks_next;
     bool lm_auto    = false;  // LLAMA_MOE_LAYER_MAJOR unset: on beside speculative decoding with a model
     int  lm_ub_max  = 16;     // ubatches per layer-major graph [LLAMA_MOE_LAYER_MAJOR_UB_MAX]
     bool lm_verbose = false;  // [LLAMA_MOE_LAYER_MAJOR_LOG]

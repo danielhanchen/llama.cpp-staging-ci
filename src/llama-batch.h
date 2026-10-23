@@ -145,6 +145,7 @@ struct llama_batch_ext {
     bool set_token_id(int32_t idx, llama_token id);
     bool set_token_embd(int32_t idx, llama_embd embd_in);
     bool set_token_state(int32_t idx, llama_embd state_in);
+    void reserve(size_t n_tokens, size_t n_state_tokens);
     bool set_token_pos(int32_t idx, const llama_pos * pos_in);
     bool set_output(int32_t idx, bool output_last);
     bool set_decision_order(int32_t idx, int32_t order);
@@ -176,6 +177,11 @@ public:
 
     // call once before splitting the batch to reset the internal state
     void split_reset();
+
+    // k11 (LLAMA_LM_CKPT_MERGE): batch indices where a ubatch must end (each segment between two breaks is split as if it were a batch
+    // of its own), set for one batch and cleared by init(); only single sequence batches honour them
+    std::vector<int32_t> ubatch_breaks;
+    int32_t break_after(int32_t idx) const; // the first break > idx, or the number of tokens
 
     // simple split, unknown number of sequence sets of unequal lengths
     llama_ubatch split_simple(uint32_t n_ubatch);
@@ -223,6 +229,7 @@ private:
     std::vector<float>          embd_vec;     // owned embeddings built from llama_batch_ext
     std::vector<int8_t>         is_embd_vec;  // mixed batch only (= 1 if embd, 0 if text token)
     std::vector<float>          state_vec;    // owned state embeddings built from llama_batch_ext, llama_batch has no slot for them
+    const float *               state_src = nullptr; // the state rows of the batch: state_vec, or the input batch itself (no copy)
     std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below
 
     std::vector<llama_pos>      pos;

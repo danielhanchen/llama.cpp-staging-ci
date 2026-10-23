@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_set>
 #include <list>
+#include <functional>
 #include <map>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
@@ -648,8 +649,9 @@ struct server_prompt {
 };
 
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    // k11: pooled buffers without a zero-fill (common_state_buf_take / _recycle / _prefault)
+    common_state_buf main;
+    common_state_buf drft;
 
     size_t size() const {
         return main.size() + drft.size();
@@ -683,6 +685,17 @@ struct server_prompt_cache {
 
     // optional SSD tier: evicted states are written there, and load() looks there after the RAM cache (not owned)
     server_prompt_ssd * ssd = nullptr;
+
+    // k11: the entry whose state is still being copied by an asynchronous save (server_slot::prompt_save), and how to wait for it
+    const server_prompt_cache_state * inflight = nullptr;
+    std::function<void()>             wait_reads;
+
+    void wait_inflight() {
+        if (inflight != nullptr && wait_reads) {
+            wait_reads();
+        }
+        inflight = nullptr;
+    }
 
     // remove the oldest state, handing it to the SSD tier if there is one
     void evict_front();
