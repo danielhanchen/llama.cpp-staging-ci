@@ -3584,8 +3584,18 @@ bool llama_context::lm_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
 // when the next ubatch of the group reads them in that layer, exactly as in the ubatch-by-ubatch order. Nothing of the math changes: the same
 // ops on the same shapes in the same order per ubatch (only interleaved with the other ubatches), so the outputs are bit-identical.
 // The prompt does not change the MoE cache (no seed, no lent slots): the decode after it finds the cache as it was.
+// k13-small: the hybrid gate's fixed share (a cache of at most LLAMA_MOE_CACHE_HYBRID_MAX_FRAC of the host experts) computes the misses of
+// small batches only, the prompt ubatches a layer-major group runs copy their experts as before. A cache below LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC
+// (0.05) of the host experts runs its prompts layer-major too: G4 at 4 GB, Qwen3.6 Q3_K_M + MTP (0.7% cached) copied every host expert once
+// per 512-token ubatch, 55 GB of copies for a 2k prompt (PolyStrata: 13.6 GB, one per prompt). LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC=0: k12
+static bool lm_hybrid_frac_ok(double frac) {
+    static const double max_frac = getenv("LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC") ? std::max(0.0, atof(getenv("LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC"))) : 0.05;
+    return frac >= 0.0 && frac < max_frac;
+}
+
 int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_outputs_all, int64_t n_tokens_all, int64_t & n_outputs_prev,
         int64_t & n_tokens_prev, bool & more, int & ret) {
+    auto lm_hybrid_ok = [&]() { return lm_hybrid_frac_ok(moe_cache->cache_frac()); };
     const auto & hparams = model.hparams;
     const int64_t n_vocab = model.vocab.n_tokens();
 
@@ -3600,7 +3610,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     if (!moe_cache || cparams.embeddings || !cparams.causal_attn || cparams.verify || ple.enabled ||
             std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool b) { return b; }) ||
             n_tokens_all - n_tokens_prev <= (int64_t) cparams.n_ubatch + llama_moe_cache::n_small_max || !eligible(mctx->get_ubatch()) ||
-            moe_cache->lends_graph_to(mctx->get_ubatch().n_tokens) || moe_cache->hybrid_fixed() || (moe_cache_devseed_on && !lm_devseed)) {
+            moe_cache->lends_graph_to(mctx->get_ubatch().n_tokens) || (moe_cache->hybrid_fixed() && !lm_hybrid_ok()) ||
+            (moe_cache_devseed_on && !lm_devseed)) {
         if (lm_verbose && moe_cache && n_tokens_all - n_tokens_prev > (int64_t) cparams.n_ubatch + llama_moe_cache::n_small_max) {
             const auto & ub = mctx->get_ubatch();
             LLAMA_LOG_INFO("%s: not layer-major: samplers %d embeddings %d causal %d verify %d ple %d ubatch %u (eligible %d, seqs %u, embd %d) "
