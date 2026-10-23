@@ -3826,13 +3826,14 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     // beside the device seed (seed_sync off: the host seed of a ubatch's own ids does not fit) only the seed from an earlier member's
     // routing, which needs no larger graph
     const bool lm_seed_dev = moe_cache_devseed_on && lm_devseed_seed;
-    // k11 (LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY, on unless =0; only with the opt-in LLAMA_LM_CKPT_MERGE): a group merged across a ubatch break
+    // k11 (LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY=1, opt-in, default off: no model / tier has passed the KLD gate with it yet, plans/k11_prompt.md
+    // 3n; it acts wherever the checkpoint merge is on, which other branches may turn on by default): a group merged across a ubatch break
     // (llama_set_ubatch_breaks) whose last member is the only ubatch after it, a prefetched large one without outputs that would end its own
     // batch: run by themselves, the members before the break seed as the batch they were (host seed from the routing of an earlier member),
     // then the last one seeds on the device from its own routing (moe_cache_devseed_on). The merged graph does the first seed as that batch
     // would, and the device seed of the last member runs after it (llama_moe_cache::devseed_replay), on the state the separate graph would
     // have seen, so the cache ends up as with the separate batches
-    static const bool lm_replay_env = getenv("LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY")) != 0;
+    static const bool lm_replay_env = getenv("LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY")) != 0;
     size_t rp_k = 0; // members before the break (0: no replay)
     if (lm_replay_env && moe_cache_devseed_on && !moe_cache_seed_sync && group.size() >= 3 && !balloc->ubatch_breaks.empty()) {
         const auto & last = group.back();
@@ -4249,7 +4250,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         if (lm_verbose || !lm_replay_logged) {
             lm_replay_logged = true;
             LLAMA_LOG_INFO("%s: device seed of ubatch %zu (%" PRId64 " tokens, after the break at %" PRId64 ") replayed after the merged graph: %s, "
-                "%zu layers, %.2f MiB uploaded again in %.2f ms (LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY=0 to disable)\n", __func__, rp_k, nt,
+                "%zu layers, %.2f MiB uploaded again in %.2f ms (LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY=1)\n", __func__, rp_k, nt,
                 group[rp_k].n_tokens_before, replayed ? "done" : "not done", rec.size(), rp_bytes/1048576.0, rp_ms);
         }
     }
