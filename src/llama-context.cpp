@@ -15,7 +15,6 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
-#include "ggml-moe-mailbox.h"
 #include "llama-sysmem.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
@@ -2666,13 +2665,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     compute_n_tokens = ubatch.n_tokens;
     const int64_t t_ub2 = ub_timing ? ggml_time_us() : 0;
-    auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     compute_n_tokens = 0;
-    // k11 single-graph host misses: a merge that gave up wrote NaN rows, the ubatch fails (its positions are removed by the caller)
-    // instead of being committed, and the next graphs take the split path
-    if (moe_cache && status == GGML_STATUS_SUCCESS && ubatch.n_tokens <= GGML_MOE_MAILBOX_MAX_TOKENS && moe_cache->single_check()) {
-        status = GGML_STATUS_FAILED;
-    }
     if (t_tr0) {
         const int64_t t_tr_end = ggml_time_us();
         LLAMA_LOG_INFO("mtp_trace ubatch ctx=%p n=%u state=%d graph=%.2f set_inputs=%.2f compute_launch=%.2f ms\n", (void *) this, ubatch.n_tokens,
@@ -3303,32 +3297,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         cparams.exact_split     = cparams.batch_invariant ? llm_graph_exact_split(ubatch) : 0;
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
-
-        // k11 single-graph host misses: a merge gave up (see llama_moe_cache::single_check), so this ubatch was not committed; its
-        // positions are removed from the memory module and the same ubatch is computed again on the split path (the result the
-        // mailbox would have given). Only if every removal succeeded (a recurrent state goes back through its per-token snapshots)
-        if (!res && moe_cache && moe_cache->single_take_failure()) {
-            llama_pos pos_min[LLAMA_MAX_SEQ];
-            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                pos_min[s] = std::numeric_limits<llama_pos>::max();
-            }
-            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                const auto & seq_id = ubatch.seq_id[i][0];
-                pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
-            }
-            bool rm_ok = true;
-            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                if (pos_min[s] != std::numeric_limits<llama_pos>::max()) {
-                    rm_ok = memory->seq_rm(s, pos_min[s], -1) && rm_ok;
-                }
-            }
-            if (rm_ok) {
-                LLAMA_LOG_WARN("%s: single-graph merge gave up: the ubatch of %u tokens is computed again on the split path\n", __func__, ubatch.n_tokens);
-                res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
-            } else {
-                LLAMA_LOG_ERROR("%s: single-graph merge gave up and the memory module cannot take the ubatch back: the ubatch fails\n", __func__);
-            }
-        }
 
         cparams.batch_invariant = false;
         cparams.exact_split     = 0;
