@@ -3593,6 +3593,12 @@ static bool lm_hybrid_frac_ok(double frac) {
     return frac >= 0.0 && frac < max_frac;
 }
 
+// a cache below LLAMA_MOE_LM_RELEASE_FRAC (0.05) of the host experts (k13-small: see the release of the banks in decode_layer_major)
+static bool lm_tiny_cache(double frac) {
+    static const double max_frac = getenv("LLAMA_MOE_LM_RELEASE_FRAC") ? std::max(0.0, atof(getenv("LLAMA_MOE_LM_RELEASE_FRAC"))) : 0.05;
+    return frac >= 0.0 && frac < max_frac;
+}
+
 int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_outputs_all, int64_t n_tokens_all, int64_t & n_outputs_prev,
         int64_t & n_tokens_prev, bool & more, int & ret) {
     auto lm_hybrid_ok = [&]() { return lm_hybrid_frac_ok(moe_cache->cache_frac()); };
@@ -3980,6 +3986,17 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     // the seed of the MoE cache, as moe_cache_seed_begin plans it for the ubatch-by-ubatch order: the last large ubatch of the batch seeds,
     // from the routing of the ubatch before it if it has no outputs, else from its own (if its seed graph fits); every member of the group
     // is large and prefetched, so the seed copies from the shared expert copies (all experts staged)
+    // k13-small: a cache below LLAMA_MOE_LM_RELEASE_FRAC (0.05) of the host experts frees its banks while the group runs (the compute
+    // buffers grow in that memory), they are allocated again after it and refilled (see llama_moe_cache::release and the end of the group):
+    // the slots of so small a cache are too few to lend the growth (G4 at 4 GB, Qwen3.6 Q3_K_M + MTP: 111 MiB in three bank tails of at most
+    // 33 MiB, a 4-ubatch group grows by 68 MiB with 77 MiB free and 64 MiB of headroom, it was split in single ubatches: one pass over
+    // every host expert per 512 tokens). The group does not seed the cache. LLAMA_MOE_LM_RELEASE=0 off
+    static const bool lm_release_env = getenv("LLAMA_MOE_LM_RELEASE") == nullptr || atoi(getenv("LLAMA_MOE_LM_RELEASE")) != 0;
+    bool lm_released = false;
+    if (lm_release_env && group.size() >= 2 && lm_tiny_cache(moe_cache->cache_frac())) {
+        ggml_backend_sched_synchronize(sched.get());
+        lm_released = moe_cache->release();
+    }
     lm_ask.clear();
     lm_staged.clear();
     lm_seeded.clear();
@@ -3989,7 +4006,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     // beside the device seed (seed_sync off: the host seed of a ubatch's own ids does not fit) only the seed from an earlier member's
     // routing, which needs no larger graph
     const bool lm_seed_dev = moe_cache_devseed_on && lm_devseed_seed;
-    if (lm_seed_env && moe_cache_seed_enabled && (moe_cache_seed_sync || lm_seed_dev) && !moe_cache_seed_auto) {
+    if (!lm_released && lm_seed_env && moe_cache_seed_enabled && (moe_cache_seed_sync || lm_seed_dev) && !moe_cache_seed_auto) {
         for (size_t k = 0; k < group.size(); ++k) {
             const int64_t nt = group[k].ub->n_tokens;
             if (nt > llama_moe_cache::n_small_max && n_tokens_all - group[k].n_tokens_before - nt <= llama_moe_cache::n_small_max) {
@@ -4436,6 +4453,26 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             moe_cache_ids.clear();
             moe_cache->clear_seed_counts();
         }
+    }
+
+    if (lm_released) {
+        // the slots come back with the experts the last ubatch of the group used most (its routing, read before the compute buffers are
+        // freed), LLAMA_MOE_LM_RELEASE_ROUTED=0: with those they held before
+        static const bool lm_release_routed = getenv("LLAMA_MOE_LM_RELEASE_ROUTED") == nullptr || atoi(getenv("LLAMA_MOE_LM_RELEASE_ROUTED")) != 0;
+        if (lm_release_routed && status == GGML_STATUS_SUCCESS) {
+            moe_cache->set_refill_routed_once(true);
+            moe_cache_ids = lm_record;
+            moe_cache_refill_from_ids();
+        }
+        // the routing of the group is in its compute buffers, which are freed: no later seed reads it
+        moe_cache_ids.clear();
+        moe_cache_seq      = -1;
+        moe_cache_pos_next = -1;
+        moe_cache->clear_seed_counts();
+        // the compute buffers shrink back to what the next graph needs before the banks take their memory again
+        ggml_backend_sched_free_device_buffers(sched.get());
+        moe_cache->restore();
+        lm_n_released++;
     }
 
     if (status != GGML_STATUS_SUCCESS) {

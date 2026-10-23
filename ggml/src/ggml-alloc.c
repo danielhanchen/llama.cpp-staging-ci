@@ -1072,6 +1072,23 @@ void ggml_gallocr_measure_n(
     }
 }
 
+void ggml_gallocr_free_buffer(ggml_gallocr_t galloc, int buffer_id) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    struct vbuffer * buf = galloc->buffers[buffer_id];
+    if (buf == NULL) {
+        return;
+    }
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (galloc->buffers[i] == buf) {
+            galloc->buffers[i] = NULL;
+        }
+    }
+    ggml_vbuffer_free(buf);
+    // the assignments point into the freed buffer: the next allocation plans again
+    galloc->n_nodes = 0;
+    galloc->n_leafs = 0;
+}
+
 void ggml_gallocr_set_external_n(ggml_gallocr_t galloc, int buffer_id, ggml_backend_buffer_t buffer, const size_t * offsets, const size_t * sizes, int n) {
     GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
     GGML_ASSERT(n >= 0 && n <= GGML_GALLOCR_MAX_EXTERNAL);

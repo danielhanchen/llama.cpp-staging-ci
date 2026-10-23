@@ -4928,6 +4928,23 @@ void ggml_backend_sched_set_alloc_lend_graph(ggml_backend_sched_t sched, bool en
     sched->alloc_lend_graph = enable;
 }
 
+void ggml_backend_sched_free_device_buffers(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    ggml_backend_sched_synchronize(sched);
+    ggml_backend_sched_reset(sched);
+    for (int b = 0; b < sched->n_backends; b++) {
+        ggml_backend_dev_t dev = sched->backends[b]->device;
+        if (dev == NULL || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        if (sched->pf[b].ext_buf != NULL) {
+            ggml_gallocr_set_external(sched->galloc, b, NULL, 0, 0);
+            sched->pf[b].ext_buf = NULL;
+        }
+        ggml_gallocr_free_buffer(sched->galloc, b);
+    }
+}
+
 size_t ggml_backend_sched_get_alloc_over(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->alloc_over;
