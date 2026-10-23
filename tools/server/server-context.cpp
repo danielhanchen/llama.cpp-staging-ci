@@ -1524,7 +1524,7 @@ private:
                 !llama_verify_exact_placement(ctx_tgt) &&
                 server_spec_spill_mode(server_spec_auto_arch(params_base.model.path), llama_moe_host_mode(ctx_tgt)) > 0) {
             auto & ns = params_base.speculative.ngram_suffix;
-            const int mm = server_spec_spill_min_match();
+            const int mm = server_spec_spill_min_match(llama_moe_host_mode(ctx_tgt));
             if (mm > ns.n_min_match) {
                 SRV_INF("n-gram drafting under the MoE cache: drafts from repeats of at least %d tokens (LLAMA_SPEC_SPILL_MIN_MATCH)\n", mm);
                 ns.n_min_match = mm;

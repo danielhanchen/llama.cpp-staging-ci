@@ -21,21 +21,27 @@
 #include <algorithm>
 #include <string>
 
-// k13: default spill drafting modes per model and host path (see server_spec_spill_mode)
+// k13: default spill drafting modes per model and host path (see server_spec_spill_mode), from the KLD gate of plans/k11.md and the G4
+// timing of plans/k13_lfm.md section 10:
+//   - LFM2.5 with the hybrid gate (small caches, G4 4 GB): mode 1, repeats of at least 12 tokens (chat inside its spread, 2k +50%);
+//   - LFM2.5 with the CPU-miss rule (G4 8 GB): mode 3 (chat +28%, 2k +45%, 8k +42%);
+//   - gemma-4: off (mode 1 loses chat by 1% on G4 8 GB, LLAMA_SPEC_SPILL=1 for its 2k +30% / 8k +43%).
 #ifndef SPEC_SPILL_LFM_GATE
-#define SPEC_SPILL_LFM_GATE   0
-#define SPEC_SPILL_LFM_CM     0
+#define SPEC_SPILL_LFM_GATE   1
+#define SPEC_SPILL_LFM_CM     3
 #define SPEC_SPILL_GEMMA4_GATE 0
 #define SPEC_SPILL_GEMMA4_CM  0
 #endif
-#ifndef SPEC_SPILL_MIN_MATCH
-#define SPEC_SPILL_MIN_MATCH  3
+#ifndef SPEC_SPILL_MIN_MATCH_GATE
+#define SPEC_SPILL_MIN_MATCH_GATE 12
+#define SPEC_SPILL_MIN_MATCH_CM   3
 #endif
 
-// k13: the shortest repeat the default spill drafts take (LLAMA_SPEC_SPILL_MIN_MATCH; 3 = every match of the index)
-static int server_spec_spill_min_match() {
+// k13: the shortest repeat the default spill drafts take (LLAMA_SPEC_SPILL_MIN_MATCH; 3 = every match of the index). host_mode 1 (the
+// hybrid gate) verifies a window with the fixed host share of every row, so short repeats lose there (G4 LFM2.5 4 GB chat -2%)
+static int server_spec_spill_min_match(int32_t host_mode) {
     const char * e = getenv("LLAMA_SPEC_SPILL_MIN_MATCH");
-    return std::max(3, e != nullptr ? atoi(e) : SPEC_SPILL_MIN_MATCH);
+    return std::max(3, e != nullptr ? atoi(e) : host_mode == 1 ? SPEC_SPILL_MIN_MATCH_GATE : SPEC_SPILL_MIN_MATCH_CM);
 }
 
 static int server_spec_auto_env() {
