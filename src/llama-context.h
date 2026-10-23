@@ -289,6 +289,13 @@ public:
     // sets the threadpool and the number of threads of the backends for a graph of a batch (batched) or of a single token
     void set_compute_threads(bool batched);
 
+    // LLAMA_VRAM_WATCH=1 (diagnostic): the least free memory of each GPU seen after a graph computation (every 32 graphs and at the
+    // end), logged when the context is freed
+    void vram_watch_sample(bool force);
+    int     vram_watch = -1; // -1 = not read yet
+    int64_t vram_watch_n = 0;
+    std::vector<size_t> vram_watch_min;
+
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
@@ -595,6 +602,15 @@ private:
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
+
+    // k11 (LLAMA_MOE_HOST_THREADS=N | auto, opt-in): the threads of the ubatches whose missing experts the host computes (CPU misses,
+    // hybrid MoE cache) instead of the decode threads; auto = every logical CPU the process may use (affinity, cgroup quota); 0 = off
+    int32_t           n_threads_host       = 0;
+    ggml_threadpool_t threadpool_host      = nullptr; // own pool when the caller attached threadpools (sized to their threads)
+    void (*threadpool_host_free)(ggml_threadpool_t) = nullptr;
+    int64_t           compute_n_tokens     = 0; // tokens of the ubatch whose graph is computed next
+    int32_t host_threads_init() const;
+    bool    host_threads_for(int64_t n_tokens) const;
 
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;

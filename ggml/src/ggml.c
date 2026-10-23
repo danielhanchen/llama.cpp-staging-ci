@@ -3580,6 +3580,60 @@ struct ggml_tensor * ggml_moe_cache_join(
     return result;
 }
 
+// mailbox op params: il, 0, mbox (2 x i32), ctl (2 x i32), timeout_ms, 0, 0, 0, mode (6 publish, 7 merge) at 10
+struct ggml_tensor * ggml_moe_mailbox_publish(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * host_ids,
+        struct ggml_tensor  * x,
+        void                * mbox,
+        void                * ctl,
+        int                   il) {
+    GGML_ASSERT(host_ids->type == GGML_TYPE_I32 && ggml_is_contiguous(host_ids));
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x));
+    GGML_ASSERT(mbox != NULL && ctl != NULL);
+    GGML_ASSERT(ggml_nelements(x) % host_ids->ne[1] == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+
+    int32_t params[11] = { il, 0 };
+    memcpy(&params[2], &mbox, sizeof(void *));
+    memcpy(&params[4], &ctl,  sizeof(void *));
+    params[10] = 6;
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_CACHE_LOOKUP;
+    result->src[0] = host_ids;
+    result->src[1] = x;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_mailbox_merge(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * dev,
+        struct ggml_tensor  * pub,
+        int                   timeout_ms) {
+    GGML_ASSERT(pub->op == GGML_OP_MOE_CACHE_LOOKUP && ggml_get_op_params_i32(pub, 10) == 6);
+    GGML_ASSERT(dev->type == GGML_TYPE_F32 && ggml_is_contiguous(dev));
+    const struct ggml_tensor * host_ids = pub->src[0];
+    GGML_ASSERT(dev->ne[1] == host_ids->ne[0] && dev->ne[2] == host_ids->ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, dev->ne);
+
+    int32_t params[11];
+    memcpy(params, pub->op_params, sizeof(params));
+    params[6]  = timeout_ms;
+    params[10] = 7;
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_CACHE_LOOKUP;
+    result->src[0] = dev;
+    result->src[1] = pub;
+    result->src[2] = pub->src[0];
+
+    return result;
+}
+
 // seed plan op params: il, 0, n_seed_max, pos, n_seed, n_victim, mode (4) at 10
 struct ggml_tensor * ggml_moe_cache_seed_plan(
         struct ggml_context * ctx,

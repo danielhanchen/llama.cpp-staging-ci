@@ -8,8 +8,15 @@
 #include "llama-moe-host-cache.h"
 
 #include "ggml-cpp.h"
+#include "ggml-alloc.h"
+#include "ggml-moe-mailbox.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <cinttypes>
 #include <cctype>
 #include <cmath>
@@ -420,6 +427,8 @@ static size_t llama_moe_cache_set_bytes(const llama_model & model, llama_moe_cac
 
 struct llama_moe_cache::impl {
     llama_weight_store * wstore = nullptr;
+    // k11: the graph allocation of the graph allocated next may be lent too (a merged layer-major group, see llama_moe_cache::set_graph_lend)
+    bool graph_lend_scope = false;
     std::vector<llama_weight_store::region> ws_regions;
 
     // RAM tier (see llama_moe_host_cache): experts of the groups streamed from the model files, behind the device slots
@@ -836,10 +845,43 @@ struct llama_moe_cache::impl {
     // " (mtp)" for the cache of an MTP context, in its log lines
     const char * tag = "";
 
+    // warm start from a routing profile (k11, opt-in): LLAMA_MOE_CACHE_PROFILE=<path> fills the device slots at load from the ranked
+    // (layer, expert) list a run saved with LLAMA_MOE_CACHE_PROFILE_SAVE=<path> (its resident experts by decayed use, then the other used
+    // ones), the most routed first over the whole group instead of an equal share per layer (Strata v0.2.2 --expert-profile). The file is
+    // <path>.<n_layer>.<n_expert>[.mtp], so a draft model or an MTP context keeps its own. Only where experts sit changes: a cached and a
+    // fetched expert compute the same, so the output is unchanged unless experts are computed on the host (CPU misses), whose split follows
+    // the residency. LLAMA_MOE_CACHE_PROFILE_SEED (1): the share of each layer a prompt may still seed with its routing when a profile
+    // was loaded (0: prompts do not seed, the profile set stays until decode misses replace it)
+    struct prof_entry {
+        int32_t il;
+        int32_t e;
+        float   heat;
+    };
+    std::string profile_file;      // load
+    std::string profile_save_file; // save at exit
+    std::vector<prof_entry> profile;
+    bool   profile_loaded = false;
+    double profile_seed   = 1.0;
+    size_t profile_filled = 0;
+
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
             layer_set set, llama_weight_store * ws, int64_t host_mib) :
             wstore(ws), n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
         tag = set == layer_set::nextn ? " (mtp)" : "";
+        single_no_alloc = model.hparams.no_alloc;
+        {
+            const std::string sfx = "." + std::to_string(model.layers.size()) + "." + std::to_string(model.hparams.n_expert) +
+                (set == layer_set::nextn ? ".mtp" : "");
+            if (const char * e = getenv("LLAMA_MOE_CACHE_PROFILE"); e != nullptr && *e) {
+                profile_file = e + sfx;
+            }
+            if (const char * e = getenv("LLAMA_MOE_CACHE_PROFILE_SAVE"); e != nullptr && *e && !model.hparams.no_alloc) {
+                profile_save_file = e + sfx;
+            }
+            if (const char * e = getenv("LLAMA_MOE_CACHE_PROFILE_SEED")) {
+                profile_seed = std::min(1.0, std::max(0.0, atof(e)));
+            }
+        }
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -850,6 +892,9 @@ struct llama_moe_cache::impl {
         }
         if (devices.empty()) {
             throw std::runtime_error("MoE cache requires a GPU backend");
+        }
+        if (single_auto && devices.size() != 1) {
+            single_req = false; // the default single-graph host misses: one GPU only (multi-GPU is untested)
         }
         if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
             throw std::runtime_error("MoE cache does not support tensor parallelism");
@@ -1367,11 +1412,13 @@ struct llama_moe_cache::impl {
         if (!model.hparams.no_alloc) {
             const char * env  = getenv("LLAMA_MOE_CACHE_PREFILL");
             const int    seed = seed_mode();
-            if (env != nullptr ? atoi(env) != 0 : seed == 1) {
+            if (!profile_file.empty() && profile_read() && prefill_profile()) {
+                profile_loaded = true;
+            } else if (env != nullptr ? atoi(env) != 0 : seed == 1) {
                 prefill();
             }
             // the default seeding may not fit in the compute buffer, the cache is then prefilled (see seed_unavailable)
-            prefill_deferred = env == nullptr && seed == 2;
+            prefill_deferred = env == nullptr && seed == 2 && !profile_loaded;
         }
 
         if (!model.hparams.no_alloc) {
@@ -1578,9 +1625,530 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // the ranked (layer, expert) list of profile_file, see prof_entry; false (and a warning) if it is missing or does not match
+    bool profile_read() {
+        FILE * f = fopen(profile_file.c_str(), "r");
+        if (f == nullptr) {
+            LLAMA_LOG_WARN("llama_moe_cache%s: LLAMA_MOE_CACHE_PROFILE: no profile %s, the cache starts empty\n", tag, profile_file.c_str());
+            return false;
+        }
+        int ver = 0;
+        long n_layer = 0;
+        bool ok = fscanf(f, "moe-cache-profile %d %ld", &ver, &n_layer) == 2 && ver == 1 && n_layer == (long) layers.size();
+        profile.clear();
+        std::set<int64_t> seen;
+        prof_entry p;
+        while (ok && fscanf(f, "%d %d %f", &p.il, &p.e, &p.heat) == 3) {
+            if (p.il < 0 || p.il >= (int32_t) layers.size() || layers[p.il].ig < 0 || p.e < 0 || p.e >= groups[layers[p.il].ig].lru.n_expert ||
+                    !seen.insert((int64_t) p.il << 32 | p.e).second) {
+                ok = false;
+                break;
+            }
+            profile.push_back(p);
+        }
+        fclose(f);
+        if (!ok || profile.empty()) {
+            LLAMA_LOG_WARN("llama_moe_cache%s: LLAMA_MOE_CACHE_PROFILE: %s does not match this model's cache, ignored\n", tag, profile_file.c_str());
+            profile.clear();
+            return false;
+        }
+        return true;
+    }
+
+    // fill the device slots of each group at load with the first profile entries of its layers (as many as it has slots)
+    bool prefill_profile() {
+        size_t n_fill  = 0;
+        size_t n_bytes = 0;
+        std::vector<std::vector<int32_t>> by_layer(layers.size());
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            group & g = groups[ig];
+            if (g.n_slots == 0) {
+                continue;
+            }
+            const int32_t n_avail = g.n_slots - g.lru.n_lent;
+            int32_t n_take = 0;
+            for (const prof_entry & p : profile) {
+                if (layers[p.il].ig == (int32_t) ig && n_take < n_avail) {
+                    by_layer[p.il].push_back(p.e);
+                    n_take++;
+                }
+            }
+            for (int32_t il : g.layers) {
+                std::vector<int32_t> & ids = by_layer[il];
+                std::sort(ids.begin(), ids.end());
+                size_t n_hit = 0;
+                if (ids.empty() || !g.lru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
+                    continue;
+                }
+                const layer & l = layers[il];
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    const size_t expert_size = w->nb[2];
+                    for (size_t j = 0; j < fills.size();) {
+                        size_t m = 1;
+                        while (j + m < fills.size() && fills[j + m].expert == fills[j].expert + (int32_t) m && fills[j + m].slot == fills[j].slot + (int32_t) m) {
+                            m++;
+                        }
+                        ggml_backend_tensor_set(g.banks[ip], (const uint8_t *) w->data + fills[j].expert*expert_size, fills[j].slot*expert_size, m*expert_size);
+                        n_bytes += m*expert_size;
+                        j += m;
+                    }
+                }
+                n_fill += fills.size();
+            }
+            // the decay counters start from the profile's heat (relative to the weight of one use), so the first misses evict the coldest
+            if (g.lru.grow_q16 > 0) {
+                g.lru.w = moe_cache_lru::w_init;
+                std::fill(g.lru.scores.begin(), g.lru.scores.end(), 0);
+                for (const prof_entry & p : profile) {
+                    if (layers[p.il].ig == (int32_t) ig) {
+                        const double v = std::min<double>(moe_cache_lru::score_max, std::max(0.0, (double) p.heat)*moe_cache_lru::w_init);
+                        g.lru.scores[(size_t) p.il*g.lru.n_expert + p.e] = (int32_t) v;
+                    }
+                }
+                g.lru.gen++;
+            }
+        }
+        profile_filled = n_fill;
+        if (n_fill > 0) {
+            prefilled_dev = true;
+        }
+        LLAMA_LOG_INFO("llama_moe_cache%s: MoE cache warm start from %s: %zu of %zu profile experts in the device slots, %.2f MiB, prompts seed %.0f%% "
+                "of their share (LLAMA_MOE_CACHE_PROFILE_SEED; unset LLAMA_MOE_CACHE_PROFILE to disable)\n", tag, profile_file.c_str(), n_fill,
+                profile.size(), n_bytes/1048576.0, 100.0*profile_seed);
+        return n_fill > 0;
+    }
+
+    // at exit (LLAMA_MOE_CACHE_PROFILE_SAVE): the resident experts of every group by decayed use (the device state when the device
+    // lookup planned last), then the used experts that are not resident; heat = counter / weight of one use (resident without the
+    // decay policy: 1)
+    void profile_save() {
+        if (profile_save_file.empty()) {
+            return;
+        }
+        std::vector<prof_entry> out_res;
+        std::vector<prof_entry> out_rest;
+        for (group & g : groups) {
+            if (g.n_slots == 0) {
+                continue;
+            }
+            const int32_t n_expert = g.lru.n_expert;
+            std::vector<int32_t> key_of = g.lru.key_of;
+            std::vector<int32_t> sc     = g.lru.scores;
+            int32_t w = g.lru.w;
+            if (g.dev_newer && g.state != nullptr && g.state->data != nullptr) {
+                ggml_backend_tensor_get(g.state, key_of.data(), n_hdr*sizeof(int32_t), key_of.size()*sizeof(int32_t));
+                if (g.scores != nullptr && g.scores->data != nullptr) {
+                    ggml_backend_tensor_get(g.scores, sc.data(), 0, sc.size()*sizeof(int32_t));
+                    ggml_backend_tensor_get(g.state, &w, 7*sizeof(int32_t), sizeof(int32_t));
+                }
+            }
+            const bool decay = !sc.empty() && w > 0;
+            std::vector<bool> res((size_t) layers.size()*n_expert, false);
+            for (int32_t k : key_of) {
+                if (k >= 0 && k < (int32_t) res.size()) {
+                    res[k] = true;
+                    out_res.push_back({ k / n_expert, k % n_expert, decay ? (float) sc[k]/w : 1.0f });
+                }
+            }
+            if (decay) {
+                for (int32_t il : g.layers) {
+                    for (int32_t e = 0; e < n_expert; ++e) {
+                        const size_t k = (size_t) il*n_expert + e;
+                        if (!res[k] && sc[k] > 0) {
+                            out_rest.push_back({ il, e, (float) sc[k]/w });
+                        }
+                    }
+                }
+            }
+        }
+        auto by_heat = [](const prof_entry & a, const prof_entry & b) {
+            return a.heat != b.heat ? a.heat > b.heat : a.il != b.il ? a.il < b.il : a.e < b.e;
+        };
+        std::sort(out_res.begin(), out_res.end(), by_heat);
+        std::sort(out_rest.begin(), out_rest.end(), by_heat);
+        const std::string tmp = profile_save_file + ".tmp";
+        FILE * f = fopen(tmp.c_str(), "w");
+        if (f == nullptr) {
+            LLAMA_LOG_WARN("llama_moe_cache%s: LLAMA_MOE_CACHE_PROFILE_SAVE: cannot write %s\n", tag, tmp.c_str());
+            return;
+        }
+        fprintf(f, "moe-cache-profile 1 %zu\n", layers.size());
+        for (const auto * v : { &out_res, &out_rest }) {
+            for (const prof_entry & p : *v) {
+                fprintf(f, "%d %d %.6g\n", p.il, p.e, p.heat);
+            }
+        }
+        const bool ok = fclose(f) == 0 && rename(tmp.c_str(), profile_save_file.c_str()) == 0;
+        LLAMA_LOG_INFO("llama_moe_cache%s: MoE cache profile %s %s: %zu resident + %zu other used experts\n", tag, ok ? "saved to" : "NOT saved to",
+                profile_save_file.c_str(), out_res.size(), out_rest.size());
+    }
+
+    // single-graph host misses (k11, LLAMA_MOE_SINGLE=1, opt-in): batches of up to GGML_MOE_MAILBOX_MAX_TOKENS tokens publish the host ids
+    // and activations of each layer to a mailbox in mapped host memory (ggml_moe_mailbox_publish) instead of a graph split; a host
+    // thread (single_service) computes those experts with the ops of the split path (mul_mat_id up / gate, swiglu, mul_mat_id down), on
+    // a CPU backend of single_threads threads, so the results are the ones of the split; the merge waits for it on the device. A merge
+    // that waits longer than LLAMA_MOE_SINGLE_TIMEOUT_MS (1000) writes NaN and flags the mailbox: the next ubatches take the split again.
+    struct single_plan {
+        ggml_context_ptr ctx;
+        ggml_cgraph    * gf     = nullptr;
+        ggml_gallocr_t   galloc = nullptr;
+    };
+    struct mailbox {
+        ggml_backend_dev_t dev  = nullptr;
+        void * host   = nullptr;
+        void * mdev   = nullptr;
+        void * ctl    = nullptr;
+        int    n_used = 0;
+        int    n_embd = 0;
+        ggml_tensor * w_up   = nullptr;
+        ggml_tensor * w_gate = nullptr;
+        ggml_tensor * w_down = nullptr;
+        ggml_backend_buffer_ptr buf; // the mailbox as a CPU buffer (the inputs and output of the plans)
+        uint32_t done = 0;
+        single_plan plans[GGML_MOE_MAILBOX_MAX_TOKENS + 1];
+    };
+    // LLAMA_MOE_SINGLE unset: on where it was tested (k11 round 16): CUDA (the backend has mapped mailboxes: not HIP / MUSA), one GPU
+    // in the context, not Windows, and only the expert form the host plans compute (separate gate / up, SiLU: see build_moe_ffn);
+    // everything else keeps the split. LLAMA_MOE_SINGLE=0 off, =1 forces the request on any device with mailboxes
+    const bool single_auto = getenv("LLAMA_MOE_SINGLE") == nullptr;
+    bool single_req = [] {
+        const char * e = getenv("LLAMA_MOE_SINGLE");
+#if defined(_WIN32)
+        return e != nullptr && atoi(e) != 0;
+#else
+        return e == nullptr || atoi(e) != 0;
+#endif
+    }();
+    const int single_timeout_ms = [] {
+        const char * e = getenv("LLAMA_MOE_SINGLE_TIMEOUT_MS");
+        return e != nullptr ? std::max(1, atoi(e)) : 1000;
+    }();
+    // the split the rule weighs for these batches: a publish and a merge instead of a graph split (LLAMA_MOE_SINGLE_SPLIT_FRAC), only
+    // once this cache has a mailbox (a form the host thread computes: G4 gpt-oss-20b Q2_K, with biases, kept the split and lost 18-20%
+    // decode when the rule weighed it as a mailbox)
+    const double single_split_frac = [] {
+        const char * e = getenv("LLAMA_MOE_SINGLE_SPLIT_FRAC");
+        return e != nullptr ? std::max(0.0, atof(e)) : 0.2;
+    }();
+    bool single_off     = false;  // a mailbox failed: back to the split for good
+    bool single_no_alloc = false; // a context that only measures memory: no mailboxes
+    int  single_threads = 0;
+    bool single_reg     = false;  // registered with the hub
+    std::vector<std::unique_ptr<mailbox>> mboxes; // by layer, owned (created by the graph builder)
+    std::unique_ptr<std::atomic<mailbox *>[]> mbox_live; // by layer, read by the host thread
+    size_t mbox_n = 0;
+    std::atomic<bool> single_failed{false};
+    uint64_t single_batches = 0;
+    uint64_t single_rows    = 0; // host expert rows computed
+    int64_t  single_us      = 0; // time in the host graphs
+    int64_t  single_max_us  = 0;
+    uint64_t single_slow    = 0; // host graphs above 1 ms
+
+    // one host thread and one CPU backend for every cache of the process (the target and its MTP draft context alternate, two threads
+    // with a CPU team each would compete for the same cores): the thread serves the mailboxes of the registered caches
+    struct single_hub_t {
+        std::mutex           reg_mtx; // the owners; held by the thread while it serves them
+        std::vector<impl *>  owners;
+        std::thread          thr;
+        std::atomic<bool>    stop{false};
+        ggml_backend_ptr     cpu;
+        int                  threads = 1;
+        std::atomic<int64_t> kick_us{0};
+        std::mutex              mtx;
+        std::condition_variable cv;
+    };
+    static single_hub_t & single_hub() {
+        static single_hub_t h;
+        return h;
+    }
+    static int64_t single_now_us() {
+        return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    bool single_usable(int64_t n_tokens) const {
+        return single_req && !single_off && !single_no_alloc && n_tokens >= 1 && n_tokens <= GGML_MOE_MAILBOX_MAX_TOKENS;
+    }
+
+    bool single_register() {
+        if (single_reg) {
+            return true;
+        }
+        single_hub_t & h = single_hub();
+        std::lock_guard<std::mutex> lock(h.reg_mtx);
+        if (!h.cpu) {
+            h.cpu.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+            if (!h.cpu) {
+                return false;
+            }
+            ggml_backend_reg_t creg = ggml_backend_dev_backend_reg(ggml_backend_get_device(h.cpu.get()));
+            auto set_n = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(creg, "ggml_backend_set_n_threads");
+            // LLAMA_MOE_SINGLE_THREADS (default: the decode threads - 1): the caller of the graph waits on the device beside this team,
+            // so a team as large as the decode threads puts two threads on one core
+            const char * e = getenv("LLAMA_MOE_SINGLE_THREADS");
+            h.threads = e != nullptr && atoi(e) > 0 ? atoi(e) : std::max(1, single_threads - 1);
+            if (set_n != nullptr) {
+                set_n(h.cpu.get(), h.threads);
+            }
+        }
+        h.owners.push_back(this);
+        single_reg = true;
+        if (!h.thr.joinable()) {
+            h.stop.store(false, std::memory_order_relaxed);
+            h.thr = std::thread(single_service);
+        }
+        LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses on (LLAMA_MOE_SINGLE): batches of up to %d tokens, %d host threads "
+            "(one host thread for every cache of the process), timeout %d ms\n", tag, GGML_MOE_MAILBOX_MAX_TOKENS, h.threads,
+            single_timeout_ms);
+        return true;
+    }
+
+    mailbox * single_mailbox(int32_t il, int n_used, int n_embd, ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down) {
+        if (il < 0 || il >= (int32_t) layers.size()) {
+            return nullptr;
+        }
+        if (!mbox_live) {
+            mboxes.resize(layers.size());
+            mbox_live.reset(new std::atomic<mailbox *>[layers.size()]);
+            for (size_t i = 0; i < layers.size(); ++i) {
+                mbox_live[i].store(nullptr, std::memory_order_relaxed);
+            }
+            mbox_n = layers.size();
+        }
+        if (mboxes[il]) {
+            mailbox & mb = *mboxes[il];
+            return mb.n_used == n_used && mb.n_embd == n_embd && mb.w_up == up && mb.w_gate == gate && mb.w_down == down ? &mb : nullptr;
+        }
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend(il));
+        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto alloc = reg != nullptr ? (ggml_backend_moe_mailbox_alloc_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_mailbox_alloc") : nullptr;
+        if (alloc == nullptr || (single_auto && strcmp(ggml_backend_reg_name(reg), "CUDA") != 0)) {
+            if (!single_auto) {
+                LLAMA_LOG_WARN("llama_moe_cache%s: LLAMA_MOE_SINGLE: the device backend has no mapped mailboxes, the split path stays\n", tag);
+            }
+            single_off = true;
+            return nullptr;
+        }
+        auto mb = std::make_unique<mailbox>();
+        const size_t size = ggml_moe_mailbox_size(n_used, n_embd);
+        mb->host = alloc(dev, size, &mb->mdev, &mb->ctl);
+        if (mb->host == nullptr) {
+            LLAMA_LOG_WARN("llama_moe_cache%s: LLAMA_MOE_SINGLE: no mapped mailbox (%zu bytes), the split path stays\n", tag, size);
+            single_off = true;
+            return nullptr;
+        }
+        mb->dev    = dev;
+        mb->n_used = n_used;
+        mb->n_embd = n_embd;
+        mb->w_up   = up;
+        mb->w_gate = gate;
+        mb->w_down = down;
+        mb->buf.reset(ggml_backend_cpu_buffer_from_ptr(mb->host, size));
+        // the plans of every batch size now, not in the first batch the device waits for
+        for (int n = 1; n <= GGML_MOE_MAILBOX_MAX_TOKENS; ++n) {
+            single_plan * p = nullptr;
+            if (!single_plan_get(*mb, n, p)) {
+                LLAMA_LOG_WARN("llama_moe_cache%s: LLAMA_MOE_SINGLE: no host plan for layer %d, the split path stays\n", tag, il);
+                single_off = true;
+                return nullptr;
+            }
+        }
+        mboxes[il] = std::move(mb);
+        mbox_live[il].store(mboxes[il].get(), std::memory_order_release);
+        if (!single_register()) {
+            single_off = true;
+            return nullptr;
+        }
+        return mboxes[il].get();
+    }
+
+    // the plan of n_tokens tokens of a mailbox: the experts of the host ids, reading and writing the mailbox
+    static bool single_plan_get(mailbox & mb, int n_tokens, single_plan *& out) {
+        single_plan & p = mb.plans[n_tokens];
+        if (p.gf == nullptr) {
+            ggml_init_params ip = { ggml_tensor_overhead()*16 + ggml_graph_overhead_custom(16, false), nullptr, true };
+            p.ctx.reset(ggml_init(ip));
+            ggml_context * c = p.ctx.get();
+            ggml_tensor * x   = ggml_new_tensor_3d(c, GGML_TYPE_F32, mb.n_embd, 1, n_tokens);
+            ggml_tensor * ids = ggml_new_tensor_2d(c, GGML_TYPE_I32, mb.n_used, n_tokens);
+            ggml_tensor * up   = ggml_mul_mat_id(c, mb.w_up,   x, ids);
+            ggml_tensor * gate = ggml_mul_mat_id(c, mb.w_gate, x, ids);
+            ggml_tensor * act  = ggml_swiglu_split(c, gate, up);
+            ggml_tensor * dn   = ggml_mul_mat_id(c, mb.w_down, act, ids);
+            if (dn->ne[0] != mb.n_embd || dn->ne[1] != mb.n_used || dn->ne[2] != n_tokens || !ggml_is_contiguous(dn)) {
+                return false;
+            }
+            char * base = (char *) mb.host;
+            for (auto [t, off] : { std::pair<ggml_tensor *, size_t>{ x, ggml_moe_mailbox_off_x(mb.n_used) },
+                                   { ids, ggml_moe_mailbox_off_ids() }, { dn, ggml_moe_mailbox_off_out(mb.n_used, mb.n_embd) } }) {
+                if (ggml_backend_tensor_alloc(mb.buf.get(), t, base + off) != GGML_STATUS_SUCCESS) {
+                    return false;
+                }
+            }
+            p.gf = ggml_new_graph_custom(c, 16, false);
+            ggml_build_forward_expand(p.gf, dn);
+            p.galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+            if (p.galloc == nullptr || !ggml_gallocr_alloc_graph(p.galloc, p.gf)) {
+                return false;
+            }
+        }
+        out = &p;
+        return true;
+    }
+
+    // one pass over the mailboxes of this cache, true if one had work
+    bool single_poll(ggml_backend_t cpu) {
+        // LLAMA_MOE_SINGLE_DEBUG_STALL=N (test of the timeout): the thread stops answering after N batches, as if it died
+        static const int64_t stall_after = [] {
+            const char * e = getenv("LLAMA_MOE_SINGLE_DEBUG_STALL");
+            return e != nullptr ? atoll(e) : -1;
+        }();
+        bool work = false;
+        for (size_t i = 0; i < mbox_n; ++i) {
+            mailbox * mbp = mbox_live[i].load(std::memory_order_acquire);
+            if (mbp == nullptr) {
+                continue;
+            }
+            mailbox & mb = *mbp;
+            auto * hdr = (ggml_moe_mailbox_hdr *) mb.host;
+            const uint32_t req = __atomic_load_n(&hdr->request, __ATOMIC_ACQUIRE);
+            if (req == mb.done || (stall_after >= 0 && (int64_t) single_batches >= stall_after)) {
+                continue;
+            }
+            work = true;
+            bool ok = false;
+            const int n_tokens = hdr->n_tokens;
+            single_plan * p = nullptr;
+            if (!single_failed.load(std::memory_order_relaxed) && n_tokens >= 1 && n_tokens <= GGML_MOE_MAILBOX_MAX_TOKENS &&
+                    single_plan_get(mb, n_tokens, p)) {
+                const int64_t t0 = single_now_us();
+                ok = ggml_backend_graph_compute(cpu, p->gf) == GGML_STATUS_SUCCESS;
+                const int64_t dt = single_now_us() - t0;
+                single_us += dt;
+                single_slow += dt > 1000;
+                single_max_us = std::max(single_max_us, dt);
+                const int32_t * ids = (const int32_t *) ((const char *) mb.host + ggml_moe_mailbox_off_ids());
+                for (int j = 0; j < mb.n_used*n_tokens; ++j) {
+                    single_rows += ids[j] >= 0;
+                }
+            }
+            if (!ok) {
+                single_failed.store(true, std::memory_order_relaxed);
+                __atomic_store_n(&hdr->error, 2u, __ATOMIC_RELEASE);
+            }
+            single_batches++;
+            mb.done = req;
+            __atomic_store_n(&hdr->completed, req, __ATOMIC_RELEASE);
+        }
+        return work;
+    }
+
+    static void single_service() {
+        single_hub_t & h = single_hub();
+        int64_t last_work = 0;
+        while (!h.stop.load(std::memory_order_acquire)) {
+            bool work = false;
+            {
+                std::lock_guard<std::mutex> lock(h.reg_mtx);
+                for (impl * o : h.owners) {
+                    work = o->single_poll(h.cpu.get()) || work;
+                }
+            }
+            const int64_t now = single_now_us();
+            if (work) {
+                last_work = now;
+            } else if (now - std::max(last_work, h.kick_us.load(std::memory_order_relaxed)) > 20000) {
+                // no decode graph started for 20 ms: sleep until the next one (single_kick), at most 1 ms at a time, since a graph
+                // that publishes without a kick (layer-major, a draft context's first graph) would wait for this sleep (G4 nsys: the
+                // first decode forward after an 8k prompt waited 100 ms in the merges with a 100 ms sleep, -8.6% prompt)
+                std::unique_lock<std::mutex> lock(h.mtx);
+                h.cv.wait_for(lock, std::chrono::milliseconds(1));
+            } else {
+#if defined(__x86_64__) || defined(_M_X64)
+                __builtin_ia32_pause();
+#else
+                std::this_thread::yield();
+#endif
+            }
+        }
+    }
+
+    // before the graph of a ubatch of n_tokens: wakes the host thread for the batches that may publish; a failed mailbox turns the path
+    // off (the graphs are rebuilt)
+    void single_kick(int64_t n_tokens) {
+        if (!single_reg || single_off) {
+            return;
+        }
+        bool failed = single_failed.load(std::memory_order_relaxed);
+        for (auto & mb : mboxes) {
+            failed = failed || (mb && __atomic_load_n(&((ggml_moe_mailbox_hdr *) mb->host)->error, __ATOMIC_ACQUIRE) != 0);
+        }
+        if (failed) {
+            LLAMA_LOG_ERROR("llama_moe_cache%s: single-graph host misses failed (a merge waited %d ms or the host thread failed): "
+                "the split path from now on\n", tag, single_timeout_ms);
+            single_off = true;
+            cm_gen++;
+            return;
+        }
+        if (n_tokens < 1 || n_tokens > GGML_MOE_MAILBOX_MAX_TOKENS) {
+            return;
+        }
+        single_hub_t & h = single_hub();
+        const int64_t now  = single_now_us();
+        const int64_t prev = h.kick_us.exchange(now, std::memory_order_relaxed);
+        if (now - prev > 20000) {
+            h.cv.notify_one();
+        }
+    }
+
+    void single_stop_all() {
+        // the context synchronized its backends before it frees the cache (they may be gone here)
+        if (single_reg) {
+            single_hub_t & h = single_hub();
+            bool last = false;
+            {
+                std::lock_guard<std::mutex> lock(h.reg_mtx);
+                h.owners.erase(std::remove(h.owners.begin(), h.owners.end(), this), h.owners.end());
+                last = h.owners.empty();
+            }
+            if (last && h.thr.joinable()) {
+                h.stop.store(true, std::memory_order_release);
+                h.cv.notify_one();
+                h.thr.join();
+                h.cpu.reset();
+            }
+            single_reg = false;
+            if (single_batches > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses: %" PRIu64 " host batches, %" PRIu64 " expert rows, %.1f us per batch "
+                    "(%.2f us per row), %" PRIu64 " above 1 ms, at most %.1f ms\n", tag, single_batches, single_rows, (double) single_us/single_batches,
+                    single_rows > 0 ? (double) single_us/single_rows : 0.0, single_slow, single_max_us/1e3);
+            }
+        }
+        for (auto & mb : mboxes) {
+            if (!mb) {
+                continue;
+            }
+            for (auto & p : mb->plans) {
+                if (p.galloc != nullptr) {
+                    ggml_gallocr_free(p.galloc);
+                    p.galloc = nullptr;
+                }
+            }
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(mb->dev);
+            auto fr = (ggml_backend_moe_mailbox_free_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_mailbox_free");
+            mb->buf.reset();
+            if (fr != nullptr) {
+                fr(mb->dev, mb->host, mb->ctl);
+            }
+        }
+        mboxes.clear();
+    }
+
     ~impl() {
         // the weight store is destroyed first (llama_context): its destructor completes the reads ahead into the RAM slots, which are
         // still allocated then; wstore is not used here
+        single_stop_all();
+        profile_save();
         log_stats();
         for (const auto & [unmap, buf] : mapped) {
             unmap(buf);
@@ -3396,13 +3964,24 @@ struct llama_moe_cache::impl {
 
         cm_share.assign(cm_max + 1, 1.0f);
         cm_on.assign(cm_max + 1, 0);
+        // k11 LLAMA_MOE_CPU_MISS_FETCH_SCALE=s (opt-in, unset = 1): the fetched share scaled by s before the levels, with a level of 1/16
+        // below 1/8. The balance above treats a fetch as running beside the device work, but the fetch kernel reads host memory in the
+        // device stream (G4 q4x + MTP 8 GB nsys: 45% of the decode window), so the device side of the balance is slower than cm_tup says;
+        // G4 with a fixed share of 0.1 instead of 0.25: decode +13.5 / +16.1 / +4.7% (chat / 2k / 8k)
+        static const double fetch_scale = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_FETCH_SCALE");
+            return e != nullptr ? std::max(0.0, atof(e)) : 1.0;
+        }();
         for (int64_t n = 1; n <= cm_max; ++n) {
             const double D    = cm_distinct(n, n_expert);
             const double tbar = std::max(1.0, (double) n*std::min<int64_t>(n_expert_used, n_expert)/D);
             const double tc   = cm_t1 + (tbar - 1.0)*cm_dt;
-            const double raw  = tc/(tc + cm_tup);
+            const double raw  = tc/(tc + cm_tup)*fetch_scale;
             // log levels: two calibrations a little apart rarely fall on two sides of a level
             cm_share[n] = raw <= 0.177 ? 0.125f : raw <= 0.354 ? 0.25f : raw <= 0.612 ? 0.5f : raw <= 0.80 ? 0.75f : 1.0f;
+            if (fetch_scale != 1.0 && raw <= 0.088) {
+                cm_share[n] = 0.0625f;
+            }
         }
         cm_cal = true;
         // the first prompt and tokens run before any measured miss rate: a prior from the cached share c of the experts, (1 - c)^4
@@ -3412,7 +3991,32 @@ struct llama_moe_cache::impl {
             cm_rate = std::max(0.01, std::min(1.0, std::pow(1.0 - std::max(0.0, std::min(1.0, cache_frac)), 4.0)));
             cm_decide();
         }
-        if (cm_trial && !cm_force) {
+        // k11 (LLAMA_MOE_CPU_MISS_TRIAL_FRAC, default 0.20; 0 = the trials of k10 everywhere): a cache that holds less than this share
+        // of the host experts runs no warm phase and no timing trials, so small batches follow the cost model from the calibration on;
+        // short prompts stay on the plain cache (they need a trial that kept the host path, see cm_prompt_ok). G4 Qwen3.6 UD-Q4_K_XL
+        // 8 GB + MTP (17% cached): the trials turned the draft context's host path off (0.467 vs 0.501 ms per small batch) and ran their
+        // blocks without it, decode -6..-15% against the cost model alone. The cells the trials were made for keep them: Qwen3.6 12 GB
+        // (39% cached, the split costs more than modelled) and gpt-oss-20b Q2_K 8 GB (54%). Round 9 (G4 / L4 / T4, k10 on the same VM):
+        // Qwen3.6 UD-Q4_K_XL 8 GB + MTP (16.8%) decode +5.6..+13.2% G4, +10.7..+21.0% L4; Q3_K_M 8 GB (23.8%) -1..-2% on G4, T4 UD-Q4_K_XL
+        // 8 GB without a draft (22.2%) inside its spread: both stay above 0.20
+        static const double trial_frac = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC");
+            return e != nullptr ? std::max(0.0, atof(e)) : 0.20;
+        }();
+        const bool trial_skip = cm_trial && !cm_force && cache_frac >= 0.0 && cache_frac < trial_frac;
+        if (trial_skip) {
+            cmt_done      = -1;
+            cmt_wait      = -1;
+            cmt_t_prev    = -1;
+            cmw_on        = false;
+            cm_small_ok   = true;
+            cm_small_live = true;
+            cm_gen++;
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no timing trials at %.1f%% of the host experts cached (below %.0f%%): small batches "
+                "follow the cost model, short prompts stay on the plain cache (LLAMA_MOE_CPU_MISS_TRIAL_FRAC=0 restores the trials)\n",
+                tag, 100.0*cache_frac, 100.0*trial_frac);
+        }
+        if (cm_trial && !cm_force && !trial_skip) {
             // warm phase first (see cmw_on): small batches off, the first trial starts in cm_tick
             cmt_done      = -1;
             cmt_t_prev    = -1;
@@ -3643,7 +4247,8 @@ struct llama_moe_cache::impl {
                 const double f    = cm_share[n];
                 const double m    = cm_rate*D;
                 const double gain = m*(cm_tup - std::max(f*cm_tup, (1.0 - f)*tc));
-                const double need = (n <= max_batch ? cm_margin*cm_split_scale*cm_split : cm_margin_p*(cm_split + n*cm_act))*
+                const double need = (n <= max_batch ? cm_margin*cm_split_scale*cm_split*(single_reg && single_usable(n) ? single_split_frac : 1.0) :
+                                     cm_margin_p*(cm_split + n*cm_act))*
                                     (cm_on[n] && cm_measured ? cm_hyst : 1.0);
                 // a batch above max_batch runs the host path in the groups whose slots hold its experts (see use_device), the
                 // other groups copy its experts as a prompt does
@@ -3971,7 +4576,8 @@ struct llama_moe_cache::impl {
         // the lent buffer as a compute buffer only in the splits that read copies placed there (a lookup reads the banks in a split of its own),
         // and the copies keep away from the slots the lookup may read past (see place); the graph allocator in lent memory (LEND=2) is live in
         // every split, it is not lent to such a graph
-        if (host_read && lend_mode == 2) {
+        const bool lend_graph_now = lend_mode == 2 || graph_lend_scope;
+        if (host_read && lend_graph_now) {
             return;
         }
         group & g = *gl;
@@ -3988,7 +4594,7 @@ struct llama_moe_cache::impl {
             n_graph++;
         }
         const size_t graph_all = n_graph > 0 ? copies[0].size : 0; // bytes of the whole graph allocation
-        if (lend_mode != 2 && n_graph > 0) {
+        if (!lend_graph_now && n_graph > 0) {
             only.assign(copies + n_graph, copies + n_copies);
             copies   = only.data();
             n_copies = (int) only.size();
@@ -4923,6 +5529,14 @@ struct llama_moe_cache::impl {
                 n_full = pos < (size_t) g.n_slots ? 1 : 0;
                 n_seed = pos < n_avail ? 1 : 0;
             }
+            if (profile_loaded && profile_seed < 1.0) {
+                // a warm start (LLAMA_MOE_CACHE_PROFILE): the prompt seeds only this share of each layer, the profile keeps the rest
+                n_full = (size_t) (n_full*profile_seed);
+                n_seed = std::min(n_seed, n_full);
+                if (n_full == 0) {
+                    return;
+                }
+            }
             GGML_ASSERT((int32_t) counts.size() == n_expert && (int32_t) staged.size() == n_expert);
             seed_ids.clear();
             for (int32_t e = 0; e < n_expert; ++e) {
@@ -5356,6 +5970,13 @@ bool llama_moe_cache::hybrid_active() const {
     return pimpl->hybrid_active();
 }
 
+bool llama_moe_cache::host_computes(int64_t n_tokens) const {
+    if (pimpl->cm) {
+        return pimpl->cm_share_of(n_tokens) < 1.0f;
+    }
+    return n_tokens <= n_small_max && pimpl->hybrid_active();
+}
+
 bool llama_moe_cache::cpu_miss_enabled() const {
     return pimpl->cm;
 }
@@ -5381,7 +6002,28 @@ void llama_moe_cache::hybrid_probe(ggml_backend_t backend_cpu) {
 }
 
 void llama_moe_cache::hybrid_set_threads(int32_t n_threads, bool quiet) {
+    pimpl->single_threads = n_threads;
     pimpl->set_threads(n_threads, quiet);
+}
+
+ggml_tensor * llama_moe_cache::single_publish(ggml_context * ctx, int32_t il, ggml_tensor * host_ids, ggml_tensor * x,
+        ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down) const {
+    if (!pimpl->single_usable(host_ids->ne[1]) || host_ids->type != GGML_TYPE_I32 || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x)) {
+        return nullptr;
+    }
+    auto * mb = pimpl->single_mailbox(il, (int) host_ids->ne[0], (int) x->ne[0], up, gate, down);
+    if (mb == nullptr) {
+        return nullptr;
+    }
+    return ggml_moe_mailbox_publish(ctx, host_ids, x, mb->mdev, mb->ctl, il);
+}
+
+ggml_tensor * llama_moe_cache::single_merge(ggml_context * ctx, ggml_tensor * dev, ggml_tensor * pub) const {
+    return ggml_moe_mailbox_merge(ctx, dev, pub, pimpl->single_timeout_ms);
+}
+
+void llama_moe_cache::single_kick(int64_t n_tokens) {
+    pimpl->single_kick(n_tokens);
 }
 
 bool llama_moe_cache::hybrid_fixed() const {
@@ -5552,6 +6194,19 @@ bool llama_moe_cache::lends() const {
 
 bool llama_moe_cache::lends_on(ggml_backend_t backend) const {
     return pimpl->lends_on(backend);
+}
+
+void llama_moe_cache::set_graph_lend(bool on) {
+    pimpl->graph_lend_scope = on;
+}
+
+bool llama_moe_cache::lends_on_any() const {
+    for (const auto & d : pimpl->devices) {
+        if (d.buf && pimpl->lend_mode != 0 && d.lend_auto == 1) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool llama_moe_cache::lends_graph() const {

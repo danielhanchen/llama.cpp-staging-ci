@@ -64,6 +64,7 @@
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/moe-cache.cuh"
+#include "ggml-moe-mailbox.h"
 #include "ggml-cuda/copy-regions.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
@@ -185,7 +186,45 @@ static int ggml_cuda_op_offload_min_batch() {
     return min_batch;
 }
 
+// debug (GGML_CUDA_FAKE_FREE_MIB): the device memory this process allocated, per device (cudaMalloc through ggml_cuda_device_malloc, the
+// virtual memory pool, the cuBLAS workspaces), so a test on a shared card sees N MiB minus its own allocations as free
+static std::mutex                     ggml_cuda_own_mutex;
+static std::map<void *, std::pair<int, size_t>> ggml_cuda_own_ptrs;
+static int64_t                        ggml_cuda_own_bytes[GGML_CUDA_MAX_DEVICES] = {};
+
+void ggml_cuda_own_add(int device, int64_t bytes) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_own_mutex);
+    ggml_cuda_own_bytes[device] += bytes;
+}
+
+static void ggml_cuda_device_free(void * ptr) {
+    if (ptr == nullptr) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_own_mutex);
+        auto it = ggml_cuda_own_ptrs.find(ptr);
+        if (it != ggml_cuda_own_ptrs.end()) {
+            ggml_cuda_own_bytes[it->second.first] -= (int64_t) it->second.second;
+            ggml_cuda_own_ptrs.erase(it);
+        }
+    }
+    CUDA_CHECK(cudaFree(ptr));
+}
+
+static cudaError_t ggml_cuda_device_malloc_impl(void ** ptr, size_t size, int device);
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
+    const cudaError_t err = ggml_cuda_device_malloc_impl(ptr, size, device);
+    if (err == cudaSuccess && *ptr != nullptr) {
+        std::lock_guard<std::mutex> lock(ggml_cuda_own_mutex);
+        ggml_cuda_own_ptrs[*ptr] = { device, size };
+        ggml_cuda_own_bytes[device] += (int64_t) size;
+    }
+    return err;
+}
+
+static cudaError_t ggml_cuda_device_malloc_impl(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
     if (ggml_cuda_unified_memory_enabled()) {
@@ -483,7 +522,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer & b = buffer_pool[i];
             if (b.ptr != nullptr) {
-                CUDA_CHECK(cudaFree(b.ptr));
+                ggml_cuda_device_free(b.ptr);
                 pool_size -= b.size;
                 b.ptr  = nullptr;
                 b.size = 0;
@@ -567,7 +606,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         }
         GGML_LOG_DEBUG(GGML_CUDA_NAME " buffer pool full, increase MAX_CUDA_BUFFERS\n");
         ggml_cuda_set_device(device);
-        CUDA_CHECK(cudaFree(ptr));
+        ggml_cuda_device_free(ptr);
         pool_size -= size;
     }
 };
@@ -604,6 +643,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             CU_CHECK(cuMemUnmap(pool_addr, pool_size));
 #endif
             CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
+            ggml_cuda_own_add(device, -(int64_t) pool_size);
         }
     }
 
@@ -628,6 +668,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
             CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
+            ggml_cuda_own_add(device, (int64_t) reserve_size);
 
             // reserve virtual address space (if not already reserved)
             if (pool_addr == 0) {
@@ -791,7 +832,7 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        ggml_cuda_device_free(dev_ptr);
     }
 };
 
@@ -6264,6 +6305,45 @@ struct ggml_backend_cuda_device_context {
 };
 
 // maps host memory into the address space of the device dev (see ggml_cuda_host_map)
+// single-graph MoE mailbox (k11, see ggml-moe-mailbox.h): mapped host memory the device writes and reads, and its device control block
+static void * ggml_backend_cuda_moe_mailbox_alloc(void * dev, size_t size, void ** mbox_dev, void ** ctl_dev) {
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)((ggml_backend_dev_t) dev)->context;
+    ggml_cuda_set_device(ctx->device);
+    void * host = nullptr;
+    *mbox_dev = nullptr;
+    *ctl_dev  = nullptr;
+    if (cudaHostAlloc(&host, size, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+    memset(host, 0, size);
+    if (cudaHostGetDevicePointer(mbox_dev, host, 0) != cudaSuccess || *mbox_dev == nullptr ||
+            cudaMalloc(ctl_dev, sizeof(ggml_moe_mailbox_ctl)) != cudaSuccess ||
+            cudaMemset(*ctl_dev, 0, sizeof(ggml_moe_mailbox_ctl)) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (*ctl_dev != nullptr) {
+            (void)cudaFree(*ctl_dev);
+        }
+        (void)cudaFreeHost(host);
+        *mbox_dev = nullptr;
+        *ctl_dev  = nullptr;
+        return nullptr;
+    }
+    return host;
+}
+
+static void ggml_backend_cuda_moe_mailbox_free(void * dev, void * host, void * ctl_dev) {
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)((ggml_backend_dev_t) dev)->context;
+    ggml_cuda_set_device(ctx->device);
+    if (ctl_dev != nullptr) {
+        (void)cudaFree(ctl_dev);
+    }
+    if (host != nullptr) {
+        (void)cudaFreeHost(host);
+    }
+    (void)cudaGetLastError();
+}
+
 static void * ggml_backend_cuda_host_map(ggml_backend_dev_t dev, void * buffer, size_t size, bool * registered) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
     return ggml_cuda_host_map(ctx->device, buffer, size, registered);
@@ -6398,6 +6478,19 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
     const int share_count = ggml_cuda_physical_device_share_count(ctx->device);
     *free  /= share_count;
     *total /= share_count;
+
+    // debug (tests on a shared card): GGML_CUDA_FAKE_FREE_MIB=N reports N MiB less what this process allocated (ggml_cuda_own_bytes; the
+    // CUDA context and CUDA graphs are not counted), at most the real free memory
+    static const char * fake_env = getenv("GGML_CUDA_FAKE_FREE_MIB");
+    if (fake_env != nullptr && atoll(fake_env) > 0) {
+        int64_t own = 0;
+        {
+            std::lock_guard<std::mutex> lock(ggml_cuda_own_mutex);
+            own = ggml_cuda_own_bytes[ctx->device];
+        }
+        const int64_t cap = (int64_t) atoll(fake_env) << 20;
+        *free = (size_t) std::max<int64_t>(0, std::min<int64_t>(cap - own, (int64_t) *free));
+    }
 }
 
 static enum ggml_backend_dev_type ggml_backend_cuda_device_get_type(ggml_backend_dev_t dev) {
@@ -7313,6 +7406,16 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_host_map") == 0) {
         return (void *)ggml_backend_cuda_host_map;
+    }
+    if (strcmp(name, "ggml_backend_moe_mailbox_alloc") == 0) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        return (void *)ggml_backend_cuda_moe_mailbox_alloc;
+#else
+        return nullptr;
+#endif
+    }
+    if (strcmp(name, "ggml_backend_moe_mailbox_free") == 0) {
+        return (void *)ggml_backend_cuda_moe_mailbox_free;
     }
     if (strcmp(name, "ggml_backend_host_map_range") == 0) {
         return (void *)ggml_backend_cuda_host_map_range;

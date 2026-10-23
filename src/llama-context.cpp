@@ -737,8 +737,13 @@ llama_context::llama_context(
                 "LLAMA_MOE_LAYER_MAJOR=0 disables)\n", __func__, lm_auto ? " beside speculative decoding" : "", lm_ub_max, cparams.n_ubatch);
         }
         if (moe_cache) {
+            n_threads_host = host_threads_init();
+            if (n_threads_host > 0 && !model.hparams.no_alloc) {
+                LLAMA_LOG_INFO("%s: MoE cache: ubatches whose missing experts the host may compute run on %d threads instead of %d "
+                    "(LLAMA_MOE_HOST_THREADS, opt-in)\n", __func__, n_threads_host, (int) cparams.n_threads);
+            }
             // the default hybrid path takes its fetch share from the decode threads, so it does not depend on timing
-            moe_cache->hybrid_set_threads((int32_t) cparams.n_threads, model.hparams.no_alloc);
+            moe_cache->hybrid_set_threads(n_threads_host > 0 ? n_threads_host : (int32_t) cparams.n_threads, model.hparams.no_alloc);
         }
         // LLAMA_MOE_CACHE_DEVSEED=1 (opt-in, default 0): with the default seeding (=2) a prefetched ubatch seeds the cache on the device from
         // its own routing (see llama_moe_cache::devseed_plan): its expert uploads never wait for the host to read the routing, and it needs
@@ -860,6 +865,30 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (threadpool_host != nullptr) {
+        if (backend_cpu != nullptr) {
+            auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+            auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+            if (set_threadpool_fn) {
+                set_threadpool_fn(backend_cpu, nullptr);
+            }
+        }
+        if (threadpool_host_free != nullptr) {
+            threadpool_host_free(threadpool_host);
+        }
+        threadpool_host = nullptr;
+    }
+
+    if (vram_watch > 0) {
+        vram_watch_sample(true);
+        for (size_t i = 0; i < vram_watch_min.size(); ++i) {
+            if (vram_watch_min[i] != SIZE_MAX) {
+                LLAMA_LOG_INFO("%s: VRAM watch: %s least free %.1f MiB over %" PRId64 " graphs (LLAMA_VRAM_WATCH)\n", __func__,
+                        ggml_backend_dev_name(model.devices[i].dev), vram_watch_min[i]/1048576.0, vram_watch_n);
+            }
+        }
+    }
 
     for (auto & sa : state_async) {
         if (sa.event) {
@@ -2135,7 +2164,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (moe_cache && moe_cache->hybrid_probe_pending() && (ubatch.n_tokens <= llama_moe_cache::n_small_max || moe_cache->cpu_miss_enabled()) &&
             backend_cpu != nullptr) {
         ggml_backend_sched_synchronize(sched.get());
+        // the calibration times the host with the threads that compute the missing experts (k11 host threads when on)
+        compute_n_tokens = -1;
         set_compute_threads(moe_cache->cpu_miss_enabled() ? false : ubatch.n_tokens > 1);
+        compute_n_tokens = 0;
         moe_cache->hybrid_probe(backend_cpu);
         ggml_backend_sched_set_overlap(sched.get(), moe_cache->hybrid_active());
     }
@@ -2269,7 +2301,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    compute_n_tokens = ubatch.n_tokens;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    compute_n_tokens = 0;
     // CPU misses trial: the ubatch is timed to its end, without the work of other contexts
     if (moe_cache && status == GGML_STATUS_SUCCESS && moe_cache->hybrid_tick_timed()) {
         ggml_backend_sched_synchronize(sched.get());
@@ -3789,7 +3823,19 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
         lm_merged_active = true;
         ggml_backend_sched_set_alloc_limit(sched.get(), true, lm_grow_max);
+        // k11 (LLAMA_MOE_LM_LEND=0 off): a merged graph whose compute buffers would grow past the free memory borrows its allocation from the
+        // MoE cache (slots lent for the group and refilled after it, as its staging copies are) instead of being split; the merged graph
+        // runs the same ubatches, only where its tensors live changes
+        static const bool lm_lend = getenv("LLAMA_MOE_LM_LEND") == nullptr || atoi(getenv("LLAMA_MOE_LM_LEND")) != 0;
+        const bool lend_g = lm_lend && moe_cache->lends_on_any();
+        if (lend_g) {
+            moe_cache->set_graph_lend(true);
+            ggml_backend_sched_set_alloc_lend_graph(sched.get(), true);
+        }
         ggml_status st = run(g);
+        if (lend_g) {
+            moe_cache->set_graph_lend(false);
+        }
         ggml_backend_sched_set_alloc_limit(sched.get(), false, 0);
         lm_merged_active = false;
         if (st != GGML_STATUS_ALLOC_FAILED) {
@@ -4560,9 +4606,129 @@ void llama_context::ple_prefetch_verify(const llama_ubatch & ubatch, const llama
     ple.pred_cur.clear();
 }
 
+void llama_context::vram_watch_sample(bool force) {
+    if (vram_watch < 0) {
+        const char * env = getenv("LLAMA_VRAM_WATCH");
+        vram_watch = env != nullptr && atoi(env) != 0 ? 1 : 0;
+    }
+    if (vram_watch == 0 || (!force && (vram_watch_n++ % 32) != 0)) {
+        return;
+    }
+    if (vram_watch_min.size() != model.devices.size()) {
+        vram_watch_min.assign(model.devices.size(), SIZE_MAX);
+    }
+    for (size_t i = 0; i < model.devices.size(); ++i) {
+        ggml_backend_dev_t dev = model.devices[i].dev;
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        // the servers are usually killed, not freed: a new low (by 16 MiB or more) is logged when it is seen
+        if (vram_watch_min[i] == SIZE_MAX || free + (16u << 20) <= vram_watch_min[i]) {
+            LLAMA_LOG_INFO("%s: VRAM watch: %s free %.1f MiB after %" PRId64 " graphs\n", __func__, ggml_backend_dev_name(dev), free/1048576.0, vram_watch_n);
+            vram_watch_min[i] = free;
+        }
+    }
+}
+
+// LLAMA_MOE_HOST_PIN=1 (opt-in, k11; the dedicated pool of ggml-org/llama.cpp#30971): the host-miss ubatches run on an own ggml
+// threadpool, one worker per physical core (the first allowed SMT sibling, at most 32 and the cgroup quota), each pinned to its CPU
+// (strict_cpu), polling LLAMA_MOE_HOST_POLL (default 50) before it sleeps; GGML_CPU_PIN_CALLER=1 also pins the calling thread to
+// worker 0's CPU. Only builds without OpenMP use the pool's CPU masks (GGML_OPENMP=OFF); with OpenMP the team ignores them.
+static const std::vector<int> & host_pin_cpus() {
+    static const std::vector<int> cpus = [] {
+        const char * e = getenv("LLAMA_MOE_HOST_PIN");
+        return e != nullptr && atoi(e) != 0 ? llama_sysmem::physical_cpus(32) : std::vector<int>();
+    }();
+    return cpus;
+}
+
+int32_t llama_context::host_threads_init() const {
+    const char * env = getenv("LLAMA_MOE_HOST_THREADS");
+    const std::vector<int> & pin = host_pin_cpus();
+    if (!pin.empty()) {
+        // the pinned pool: its own threads even at the decode thread count (=N caps it)
+        const int32_t n = env != nullptr && atoi(env) > 0 ? std::min<int32_t>(atoi(env), (int32_t) pin.size()) : (int32_t) pin.size();
+        return n;
+    }
+    if (env != nullptr && strcmp(env, "auto") == 0) {
+        // every usable logical CPU (affinity, cgroup quota), only when that is more than the decode threads
+        const int32_t n = (int32_t) llama_sysmem::usable_cpus();
+        return n > (int32_t) cparams.n_threads ? n : 0;
+    }
+    if (env != nullptr) {
+        // =N: N threads (=0 off: the decode threads, as before k11)
+        const int32_t n = atoi(env);
+        return n > 0 && n != (int32_t) cparams.n_threads ? n : 0;
+    }
+    // opt-in: every usable logical CPU lost 8-9% decode on a G4 (48 vCPU, 24 -> 48 threads, Qwen3.6 UD-Q4_K_XL 8 GB + MTP, the same
+    // host experts and text); =auto takes them anyway
+    return 0;
+}
+
+bool llama_context::host_threads_for(int64_t n_tokens) const {
+    // n_tokens < 0: the calibration of the host path
+    return n_threads_host > 0 && moe_cache && n_tokens != 0 && (n_tokens < 0 || moe_cache->host_computes(n_tokens));
+}
+
 void llama_context::set_compute_threads(bool batched) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
+
+    if (backend_cpu != nullptr && host_threads_for(compute_n_tokens)) {
+        n_threads = n_threads_host;
+        if (tp != nullptr) {
+            // the attached pools have the threads of the caller: a pool of the host threads
+            if (threadpool_host == nullptr) {
+                auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+                auto * new_fn  = (decltype(ggml_threadpool_new)  *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
+                auto * free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
+                if (new_fn != nullptr && free_fn != nullptr) {
+                    ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads_host);
+                    tpp.paused = true;
+                    const std::vector<int> & pin = host_pin_cpus();
+                    // one pinned pool for every context of the process (the MTP draft context computes between the target's graphs):
+                    // two pools spinning on the same cores would compete, so it is shared and lives until the process exits
+                    static ggml_threadpool_t pin_pool   = nullptr;
+                    static int32_t           pin_pool_n = 0;
+                    if (!pin.empty() && pin_pool != nullptr && pin_pool_n == n_threads_host) {
+                        threadpool_host      = pin_pool;
+                        threadpool_host_free = nullptr;
+                    } else if (!pin.empty()) {
+                        std::string list;
+                        for (int32_t i = 0; i < n_threads_host && i < (int32_t) pin.size(); ++i) {
+                            if (pin[i] < GGML_MAX_N_THREADS) {
+                                tpp.cpumask[pin[i]] = true;
+                                list += (list.empty() ? "" : ",") + std::to_string(pin[i]);
+                            }
+                        }
+                        tpp.strict_cpu = true;
+                        const char * poll = getenv("LLAMA_MOE_HOST_POLL");
+                        tpp.poll = poll != nullptr ? (uint32_t) std::max(0, std::min(100, atoi(poll))) : 50;
+                        LLAMA_LOG_INFO("%s: MoE host-miss pool: %d threads pinned to CPUs %s, poll %u (LLAMA_MOE_HOST_PIN)\n",
+                            __func__, n_threads_host, list.c_str(), tpp.poll);
+                        threadpool_host      = new_fn(&tpp);
+                        threadpool_host_free = nullptr;
+                        if (pin_pool == nullptr) {
+                            pin_pool   = threadpool_host;
+                            pin_pool_n = n_threads_host;
+                        } else {
+                            threadpool_host_free = free_fn;
+                        }
+                    } else {
+                        threadpool_host      = new_fn(&tpp);
+                        threadpool_host_free = free_fn;
+                    }
+                }
+            }
+            if (threadpool_host != nullptr) {
+                tp = threadpool_host;
+            } else {
+                n_threads = batched ? cparams.n_threads_batch : cparams.n_threads;
+            }
+        }
+    }
 
     if (backend_cpu != nullptr) {
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
@@ -4583,6 +4749,10 @@ ggml_status llama_context::graph_compute(
                    bool   batched) {
     set_compute_threads(batched);
 
+    if (moe_cache) {
+        moe_cache->single_kick(compute_n_tokens);
+    }
+
     copy_experts.reset();
 
     sync_pending = true;
@@ -4595,6 +4765,8 @@ ggml_status llama_context::graph_compute(
     if (moe_cache) {
         moe_cache->seed_end();
     }
+
+    vram_watch_sample(false);
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 

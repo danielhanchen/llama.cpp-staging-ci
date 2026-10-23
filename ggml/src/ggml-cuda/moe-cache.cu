@@ -2,8 +2,13 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
 #include "moe-cache.cuh"
+#include "ggml-moe-mailbox.h"
 
 #include <climits>
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#define MOE_MAILBOX_OK 1 // single-graph host misses (ggml_moe_mailbox_publish)
+#endif
 
 // device-side lookup of the MoE expert cache, see ggml_moe_cache_lookup and llama-moe-cache.cpp
 //
@@ -659,6 +664,16 @@ bool ggml_cuda_moe_cache_lookup_supported(const ggml_tensor * op) {
     if (mode == 5) {
         return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->op == GGML_OP_MUL_MAT_ID;
     }
+    if (mode == 6 || mode == 7) {
+#if defined(MOE_MAILBOX_OK)
+        if (mode == 6) {
+            return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[1] <= GGML_MOE_MAILBOX_MAX_TOKENS;
+        }
+        return op->src[0]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32;
+#else
+        return false;
+#endif
+    }
     if (mode == 1) {
         return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 && op->src[2]->type == GGML_TYPE_I32 &&
             op->src[3]->type == GGML_TYPE_I32 && ggml_nelements(op->src[0]) <= 4096 &&
@@ -710,8 +725,156 @@ static void moe_cache_fetch_launch(cudaStream_t stream, const ggml_tensor * dst,
     CUDA_CHECK(cudaGetLastError());
 }
 
+// single-graph host misses (k11, see ggml_moe_mailbox_publish): flags of the mapped mailbox at system scope
+#if defined(MOE_MAILBOX_OK)
+static __device__ __forceinline__ uint32_t moe_mailbox_load_acquire(const uint32_t * p) {
+    uint32_t v;
+#if __CUDA_ARCH__ >= 700
+    asm volatile("ld.acquire.sys.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+#else
+    v = *(const volatile uint32_t *) p;
+    __threadfence_system();
+#endif
+    return v;
+}
+
+static __device__ __forceinline__ void moe_mailbox_store_release(uint32_t * p, const uint32_t v) {
+#if __CUDA_ARCH__ >= 700
+    asm volatile("st.release.sys.u32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
+#else
+    __threadfence_system();
+    *(volatile uint32_t *) p = v;
+#endif
+}
+
+static __device__ __forceinline__ uint64_t moe_mailbox_ns() {
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+// one block: copies the host ids and the activations when any id is on the host, then publishes the next sequence
+static __global__ void moe_mailbox_publish(const int32_t * hid, const int n_ids, const int n_tokens, const float * x, const int n_x,
+        char * mbox, const int n_used, const int n_embd, ggml_moe_mailbox_ctl * ctl, int32_t * dst) {
+    __shared__ int cnt;
+    if (threadIdx.x == 0) {
+        cnt = 0;
+    }
+    __syncthreads();
+    int local = 0;
+    for (int i = threadIdx.x; i < n_ids; i += blockDim.x) {
+        local += hid[i] >= 0;
+    }
+    if (local > 0) {
+        atomicAdd(&cnt, local);
+    }
+    __syncthreads();
+    if (cnt == 0) {
+        if (threadIdx.x == 0) {
+            ctl->pending = 0;
+            dst[0] = 0;
+        }
+        return;
+    }
+    int32_t * m_ids = (int32_t *) (mbox + ggml_moe_mailbox_off_ids());
+    float   * m_x   = (float   *) (mbox + ggml_moe_mailbox_off_x(n_used));
+    for (int i = threadIdx.x; i < n_ids; i += blockDim.x) {
+        m_ids[i] = hid[i];
+    }
+    for (int i = threadIdx.x; i < n_x; i += blockDim.x) {
+        m_x[i] = x[i];
+    }
+    ggml_moe_mailbox_hdr * hdr = (ggml_moe_mailbox_hdr *) mbox;
+    if (threadIdx.x == 0) {
+        hdr->n_tokens = n_tokens;
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const uint32_t seq = ctl->seq + 1;
+        ctl->seq     = seq;
+        ctl->pending = 1;
+        dst[0]       = 1;
+        moe_mailbox_store_release(&hdr->request, seq);
+    }
+    GGML_UNUSED(n_embd);
+}
+
+// one block per row [n_embd] of dev: rows on the host wait for the host and add its result
+static __global__ void moe_mailbox_merge(const float * d, const int32_t * hid, const int n_embd, const char * mbox, const int n_used,
+        ggml_moe_mailbox_ctl * ctl, float * dst, const uint64_t timeout_ns) {
+    const int row = blockIdx.x;
+    __shared__ int st;
+    if (threadIdx.x == 0) {
+        int s = 0;
+        if (ctl->pending) {
+            ggml_moe_mailbox_hdr * hdr = (ggml_moe_mailbox_hdr *) mbox;
+            const uint32_t seq = ctl->seq;
+            if (hid[row] >= 0) {
+                const uint64_t t0 = moe_mailbox_ns();
+                s = 1;
+                while (moe_mailbox_load_acquire(&hdr->completed) != seq) {
+                    if (moe_mailbox_load_acquire(&hdr->error) != 0) {
+                        s = 2;
+                        break;
+                    }
+                    if (moe_mailbox_ns() - t0 > timeout_ns) {
+                        moe_mailbox_store_release(&hdr->error, 1);
+                        ctl->failed = 1;
+                        s = 2;
+                        break;
+                    }
+                    __nanosleep(100);
+                }
+            }
+        }
+        if (ctl->failed) {
+            s = 2;
+        }
+        st = s;
+    }
+    __syncthreads();
+    const float * h = (const float *) (mbox + ggml_moe_mailbox_off_out(n_used, n_embd)) + (int64_t) row*n_embd;
+    const float * dr = d + (int64_t) row*n_embd;
+    float * o = dst + (int64_t) row*n_embd;
+    for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
+        o[i] = st == 2 ? NAN : st == 1 ? dr[i] + __ldcv(h + i) : dr[i];
+    }
+}
+#endif
+
 void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int mode = ggml_get_op_params_i32(dst, 10);
+
+#if defined(MOE_MAILBOX_OK)
+    if (mode == 6 || mode == 7) {
+        void * mbox = nullptr;
+        void * ctl  = nullptr;
+        memcpy(&mbox, (const int32_t *) dst->op_params + 2, sizeof(void *));
+        memcpy(&ctl,  (const int32_t *) dst->op_params + 4, sizeof(void *));
+        if (mode == 6) {
+            const ggml_tensor * hid = dst->src[0];
+            const ggml_tensor * x   = dst->src[1];
+            const int n_used   = (int) hid->ne[0];
+            const int n_tokens = (int) hid->ne[1];
+            GGML_ASSERT(n_tokens <= GGML_MOE_MAILBOX_MAX_TOKENS && ggml_is_contiguous(hid) && ggml_is_contiguous(x));
+            moe_mailbox_publish<<<1, 256, 0, ctx.stream()>>>((const int32_t *) hid->data, (int) ggml_nelements(hid), n_tokens,
+                (const float *) x->data, (int) ggml_nelements(x), (char *) mbox, n_used, (int) (ggml_nelements(x)/n_tokens),
+                (ggml_moe_mailbox_ctl *) ctl, (int32_t *) dst->data);
+        } else {
+            const ggml_tensor * d   = dst->src[0];
+            const ggml_tensor * hid = dst->src[2];
+            const int n_embd = (int) d->ne[0];
+            const int n_rows = (int) (ggml_nelements(d)/n_embd);
+            GGML_ASSERT(ggml_is_contiguous(d) && ggml_is_contiguous(dst) && n_rows == (int) ggml_nelements(hid));
+            const uint64_t timeout_ns = (uint64_t) std::max(1, ggml_get_op_params_i32(dst, 6))*1000000ull;
+            moe_mailbox_merge<<<n_rows, 256, 0, ctx.stream()>>>((const float *) d->data, (const int32_t *) hid->data, n_embd,
+                (const char *) mbox, (int) d->ne[1], (ggml_moe_mailbox_ctl *) ctl, (float *) dst->data, timeout_ns);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+#endif
 
     if (mode == 4) {
         // device seed plan, see ggml_moe_cache_seed_plan

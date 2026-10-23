@@ -1521,6 +1521,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("number of CPU threads to use during generation (default: %d)", params.cpuparams.n_threads),
         [](common_params & params, int value) {
             params.cpuparams.n_threads = value;
+            params.n_threads_set = true;
             if (params.cpuparams.n_threads <= 0) {
                 params.cpuparams.n_threads = std::thread::hardware_concurrency();
             }
@@ -3043,6 +3044,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                     string_format("got %zu input configs, but system only has %zu devices", split_arg.size(), llama_max_devices())
                 );
             }
+            params.fit_params_target_set = true;
             if (split_arg.size() == 1) {
                 std::fill(params.fit_params_target.begin(), params.fit_params_target.end(), std::stoull(split_arg[0]) * 1024*1024);
                 return;
