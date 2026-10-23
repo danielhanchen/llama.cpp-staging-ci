@@ -763,6 +763,8 @@ struct llama_moe_cache::impl {
     // fewest uses), without waiting for a trial on the small batches. G4, LFM2.5-24B-A2B 8 GB, a 38-token prompt: 6.1 GB of uploads
     // (PCIe-bound) -> 0.4 GB. The host's expert products are not the device's bit for bit: other text, KLD-gated
     int64_t cm_prompt_force = 0;
+    // LLAMA_MOE_CPU_MISS_PROMPT_SHARE=f: the fetch share of those ubatches instead of the rule's (0 < f <= 1; the host computes the rest)
+    float   cm_prompt_share = -1.0f;
     // k10: with LLAMA_MOE_CACHE_HYBRID unset, a cache that holds at most hybrid_max_frac of the host experts keeps k9's default hybrid gate
     // (deterministic share) instead of the CPU-miss rule [LLAMA_MOE_CPU_MISS_GATE=0: the rule there too]
     bool    cm_gate  = false;
@@ -919,6 +921,9 @@ struct llama_moe_cache::impl {
                 if (const char * env_pf = getenv("LLAMA_MOE_CPU_MISS_PROMPT"); cm && env_pf != nullptr && atoll(env_pf) > max_batch) {
                     cm_prompt_force = std::min<int64_t>(cm_max_limit, atoll(env_pf));
                     cm_max = std::max(cm_max, cm_prompt_force);
+                    if (const char * env_ps = getenv("LLAMA_MOE_CPU_MISS_PROMPT_SHARE"); env_ps != nullptr && atof(env_ps) > 0.0) {
+                        cm_prompt_share = (float) std::min(1.0, atof(env_ps));
+                    }
                 }
                 cm_dbg = getenv("LLAMA_MOE_CPU_MISS_LOG") != nullptr && atoi(getenv("LLAMA_MOE_CPU_MISS_LOG")) != 0;
                 if (const char * env_s = getenv("LLAMA_MOE_CPU_MISS_SPLIT_SCALE")) {
@@ -2866,7 +2871,7 @@ struct llama_moe_cache::impl {
     // the host computes the misses of a batch of n_tokens: the fetch share, 1 = every missing expert is fetched
     float cm_share_of(int64_t n_tokens) const {
         if (cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_prompt_force) {
-            return std::min(cm_share[n_tokens], 0.75f);
+            return cm_prompt_share > 0.0f ? cm_prompt_share : std::min(cm_share[n_tokens], 0.75f);
         }
         if (!cm || !cm_cal || n_tokens < 1 || n_tokens > cm_max || cm_on[n_tokens] == 0 || (n_tokens <= max_batch ? !cm_small_live : !cm_prompt_ok())) {
             return 1.0f;
