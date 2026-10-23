@@ -4478,11 +4478,12 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     } else if (buf_after > buf_before) {
         // k13-small: a group that grew the compute buffers leaves them at its size, and the decode after it computes in what is left: G4 at
         // 4 GB, Qwen3.6 Q3_K_M + MTP with LLAMA_MOE_LM_RELEASE=0, a fresh server's first request (2100 tokens): the group grew 502 -> 534 MiB
-        // inside the 64 MiB headroom, 10.6 MiB stayed free and the decode ran out of device memory in the CUDA pool. With less than
-        // LLAMA_MOE_LM_SHRINK_FREE_MIB (512) free after the group the device compute buffers are freed (the next graph allocates what it
-        // needs, as without the merge); the routing kept for the seed of the next ubatch is copied to host memory first, so nothing else
-        // changes. 0 off
-        static const size_t lm_shrink_free = (size_t) (getenv("LLAMA_MOE_LM_SHRINK_FREE_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LM_SHRINK_FREE_MIB"))) : 512) << 20;
+        // inside the 64 MiB headroom with 118 MiB left after it, the staging copies of the next graphs took the rest and the decode ran out
+        // of device memory in the CUDA pool. With less than LLAMA_MOE_LM_SHRINK_FREE_MIB (192) free after the group the device compute
+        // buffers are freed (the next graph allocates what it needs, as without the merge); the routing kept for the seed of the next ubatch
+        // is copied to host memory first. At 512 the 8 GB cells (234-436 MiB left) shrank too, and the chat prompt after a long one lost
+        // 8-12% to the reallocation (G4 run k13s6). 0 off
+        static const size_t lm_shrink_free = (size_t) (getenv("LLAMA_MOE_LM_SHRINK_FREE_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LM_SHRINK_FREE_MIB"))) : 192) << 20;
         size_t free_min = SIZE_MAX;
         for (auto & bk : backend_ptrs) {
             ggml_backend_dev_t dev = ggml_backend_get_device(bk);
@@ -4496,7 +4497,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             ggml_backend_sched_synchronize(sched.get());
             lm_ids_host_keep();
             ggml_backend_sched_free_device_buffers(sched.get());
-            if (lm_n_shrunk++ < 2) {
+            if (lm_n_shrunk++ < 8) {
                 LLAMA_LOG_INFO("%s: the group grew the compute buffers %.2f -> %.2f MiB with %.2f MiB free left: device compute buffers freed "
                     "(LLAMA_MOE_LM_SHRINK_FREE_MIB=0 keeps them)\n", __func__, buf_before/1048576.0, buf_after/1048576.0, free_min/1048576.0);
             }
