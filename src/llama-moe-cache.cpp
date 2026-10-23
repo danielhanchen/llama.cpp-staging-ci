@@ -896,6 +896,16 @@ struct llama_moe_cache::impl {
         if (single_auto && devices.size() != 1) {
             single_req = false; // the default single-graph host misses: one GPU only (multi-GPU is untested)
         }
+        // and at least LLAMA_MOE_SINGLE_MIN_CPUS (12) usable CPUs: the host thread waits beside a team of the decode threads - 1, which
+        // on a small VM computes slower than the split's full team (Colab T4, 8 vCPUs, 4 decode threads: -2..-5% decode against the
+        // split, the same host experts; Colab L4, 12 vCPUs: +3..+5%)
+        if (single_auto && single_req) {
+            const char * e = getenv("LLAMA_MOE_SINGLE_MIN_CPUS");
+            const uint32_t min_cpus = e != nullptr ? (uint32_t) std::max(0, atoi(e)) : 12u;
+            if (llama_sysmem::usable_cpus() < min_cpus) {
+                single_req = false;
+            }
+        }
         if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
             throw std::runtime_error("MoE cache does not support tensor parallelism");
         }
