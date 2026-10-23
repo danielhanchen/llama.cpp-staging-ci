@@ -9,6 +9,7 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "spec-cost-policy.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
@@ -2349,6 +2350,9 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
 
     common_params_speculative_ngram_suffix params;
     bool with_model = false;
+    // k11-decode: cost-priced windows alone (common/spec-cost-policy.h); one cost table for every sequence
+    bool policy_on  = false;
+    common_spec_cost_policy policy;
 
     struct slot_t {
         uint64_t key = 0;
@@ -2368,6 +2372,8 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         int match_last  = 0;
         // per request counters (logged when the next request begins)
         int64_t n_lookups = 0, n_matches = 0, n_drafts = 0, n_drafted = 0, n_accepted = 0, n_yield = 0;
+        common_spec_round_timer timer;   // k11-decode: round times of this sequence (policy_on)
+        int64_t n_probe = 0;
     };
 
     std::vector<seq_info> sinfos;
@@ -2396,6 +2402,15 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         params.n_max_short  = std::min(params.n_max_short, params.n_max);
         this->n_max = params.n_max;
         sinfos.resize(n_seq);
+        {
+            const char * e = getenv("LLAMA_SPEC_SUFFIX_POLICY");
+            policy_on = !with_model && (e != nullptr ? atoi(e) != 0 : params.auto_mode);
+            policy.short_k = params.n_max_short;
+        }
+        if (policy_on) {
+            SPC_INF("ngram-suffix: cost-priced windows of %d / %d drafts (margin %.2f)%s; LLAMA_SPEC_SUFFIX_POLICY=0 for the fixed gate\n",
+                    params.n_max_short, params.n_max, policy.margin, params.auto_mode ? ", on by default (LLAMA_SPEC_AUTO=0: off)" : "");
+        }
         SPC_INF("ngram-suffix: min match %d (%d to draft alone), n_max %d (%d below a match of %d), p_cut %.2f, %s %.2f\n", params.n_min_match,
                 params.n_min_draft, params.n_max, params.n_max_short, params.n_long_match, params.p_cut,
                 with_model ? "beside a model drafter: drafts a full window when q >=" : "alone, p_take unused", params.p_take);
@@ -2551,8 +2566,20 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
                     PRId64 " accepted, %" PRId64 " left to the model drafter; q by match class %.2f %.2f %.2f %.2f\n", seq_id, si.n_lookups,
                     si.n_matches, si.n_drafts, si.n_drafted, si.n_accepted, si.n_yield, rate(si, 0), rate(si, 1), rate(si, 2), rate(si, 3));
         }
+        if (policy_on && si.n_lookups > 0) {
+            const int ts = std::min(params.n_max_short + 1, common_spec_cost_policy::MAX_T);
+            const int tl = std::min(params.n_max + 1, common_spec_cost_policy::MAX_T);
+            SPC_INF("ngram-suffix seq %d: round ms by window 1 / %d / %d: %.2f (%.0f) / %.2f (%.0f) / %.2f (%.0f), realized gain %.2f (%.0f) / %.2f (%.0f), %"
+                    PRId64 " probes\n", seq_id, ts, tl, policy.cost_ms(1), policy.cost_n[1], policy.cost_ms(ts), policy.cost_n[ts], policy.cost_ms(tl),
+                    policy.cost_n[tl], policy.gain[ts], policy.gain_n[ts], policy.gain[tl], policy.gain_n[tl], si.n_probe);
+        }
         si.n_lookups = si.n_matches = si.n_drafts = si.n_drafted = si.n_accepted = si.n_yield = 0;
+        si.n_probe = 0;
         si.k_last = 0;
+        si.timer.reset();
+        if (policy_on && n_seq == 1) {
+            policy.reset_gain();
+        }
         clear(si);
         sync(si, prompt);
     }
@@ -2569,6 +2596,9 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
             }
             auto & si = sinfos[seq_id];
             si.k_last = 0;
+            if (policy_on) {
+                si.timer.tick(policy, ggml_time_us());
+            }
             sync(si, *dp.prompt);
             si.n_lookups++;
 
@@ -2592,6 +2622,13 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
             if (with_model) {
                 // a full window from a class that is right most of the time, else the model drafts this round
                 k = (offered >= win && q >= params.p_take) ? win : 0;
+            } else if (policy_on) {
+                // k11-decode: the window that commits the most tokens per measured ms, or none (common/spec-cost-policy.h)
+                const int k_full = std::min(offered, win);
+                k = policy.choose(k_full, std::min(k_full, params.n_max_short), q);
+                if (k > 0 && policy.cost_n[std::min(k + 1, common_spec_cost_policy::MAX_T)] < common_spec_cost_policy::PROBES) {
+                    si.n_probe++;
+                }
             } else {
                 // a short repeat (under n_min_draft tokens) is in any text and drafts alone only rarely pay: a drafted step between
                 // plain ones changes the graph twice (LLAMA_SPEC_SUFFIX_MIN_DRAFT=3: every match of the index drafts)
@@ -2606,6 +2643,9 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
                 continue;
             }
             dp.result->assign(cand.begin(), cand.begin() + k);
+            if (policy_on) {
+                si.timer.next(k + 1);
+            }
             si.k_last      = k;
             si.bucket_last = b;
             si.match_last  = match;
@@ -2622,6 +2662,7 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
             si.ok[b]  = DECAY*si.ok[b] + a;
             si.bad[b] = DECAY*si.bad[b] + (a < si.k_last ? 1.0 : 0.0);
             si.n_accepted += a;
+            si.timer.acc_last = a;
         }
         si.k_last = 0;
     }

@@ -50,6 +50,7 @@
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
+#include "ggml-cuda/shortconv-fused.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
@@ -4328,6 +4329,58 @@ static bool ggml_cuda_try_fuse_add_unary_mul(ggml_backend_cuda_context * cuda_ct
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// k11-decode: the experts of the MoE cache are read through a view of its expert bank, and that VIEW node sits between the gate and the up
+// product ({MUL_MAT_ID, VIEW, MUL_MAT_ID, GLU}), so the gate + up + GLU fusion below never matched them (k10: three launches per expert
+// FFN). The fused launch is the one the {MUL_MAT_ID, MUL_MAT_ID, GLU} pattern makes: mul_mat_vec_q with the gate in its fusion
+// arguments, whose up and gate sums are the sums of the unfused products and whose GLU is the GLU op's expression, so the output is
+// the bytes of the three launches (batch invariant verify included: the GLU node carries the flag). GGML_CUDA_MOE_CACHE_GLU_FUSE=1: on.
+static int ggml_cuda_try_fuse_moe_cache_glu(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    // off by default: G4 Flash-Next (Studio argv / no drafter) and Qwen3.6 MTP / LFM2.5 at 8 GB moved within the A/A spread
+    static const bool on = getenv("GGML_CUDA_MOE_CACHE_GLU_FUSE") != nullptr && atoi(getenv("GGML_CUDA_MOE_CACHE_GLU_FUSE")) != 0;
+    if (!on || i + 3 >= cgraph->n_nodes || !cuda_ctx->stream_context().concurrent_events.empty()) {
+        return 0;
+    }
+    ggml_tensor * a   = cgraph->nodes[i];
+    ggml_tensor * v   = cgraph->nodes[i + 1];
+    ggml_tensor * b   = cgraph->nodes[i + 2];
+    ggml_tensor * glu = cgraph->nodes[i + 3];
+    if (a->op != GGML_OP_MUL_MAT_ID || v->op != GGML_OP_VIEW || b->op != GGML_OP_MUL_MAT_ID || glu->op != GGML_OP_GLU || b->src[0] != v) {
+        return 0;
+    }
+    ggml_tensor * gate = nullptr;
+    ggml_tensor * up   = nullptr;
+    if (glu->src[0] == a && glu->src[1] == b) {
+        gate = a;
+        up   = b;
+    } else if (glu->src[0] == b && glu->src[1] == a) {
+        gate = b;
+        up   = a;
+    } else {
+        return 0;
+    }
+    if (!ggml_cuda_should_fuse_mul_mat(up, gate, glu) || !ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+        return 0;
+    }
+    const int     idx[3]  = { i, i + 2, i + 3 };
+    const ggml_op ops[3]  = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
+    const int     outs[1] = { i + 3 };
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idx, 3, ops, outs, 1) || !ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, outs, 1)) {
+        return 0;
+    }
+    ggml_cuda_mm_fusion_args_host fusion_data{};
+    fusion_data.gate      = gate->src[0];
+    fusion_data.glu_op    = ggml_get_glu_op(glu);
+    fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
+    ggml_cuda_mul_mat_vec_q(*cuda_ctx, up->src[0], up->src[1], up->src[2], glu, &fusion_data);
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        GGML_LOG_INFO("%s: MoE cache experts: gate + up + GLU in one launch (%lld tokens; GGML_CUDA_MOE_CACHE_GLU_FUSE=1)\n", __func__,
+                (long long) up->ne[2]);
+    }
+    return 3;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -4335,6 +4388,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // k11-decode: LFM2 short-conv window (b * x into the conv window) and conv * c, small batches (GGML_CUDA_SHORTCONV_FUSE=0: off)
+    if (node->op == GGML_OP_MUL) {
+        if (const int n = ggml_cuda_try_fuse_shortconv_window(*cuda_ctx, cgraph, i)) {
+            return n;
+        }
+    } else if (node->op == GGML_OP_SSM_CONV) {
+        if (const int n = ggml_cuda_try_fuse_shortconv_conv_mul(*cuda_ctx, cgraph, i)) {
+            return n;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        if (const int n = ggml_cuda_try_fuse_moe_cache_glu(cuda_ctx, cgraph, i)) {
+            return n;
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&

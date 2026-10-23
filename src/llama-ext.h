@@ -120,6 +120,23 @@ LLAMA_API void llama_state_seq_async_wait(struct llama_context * ctx);
 // LLAMA_MTP_EXACT=1 is set (read once)
 LLAMA_API bool llama_exact_verify_enabled(void);
 
+// k11-decode: this context computes its verify batches batch invariant as LLAMA_MTP_EXACT=1 does, without the env (the server's
+// automatic n-gram drafting sets it, so drafting on by default leaves greedy output byte equal to plain decoding)
+LLAMA_API void llama_set_verify_exact(struct llama_context * ctx, bool value);
+
+// k11-decode: restore the worst-case prompt plan of the graph allocator if a small graph (a verify window) re-planned it; a server
+// calls it when its slots go idle, so the next prompt does not pay for it (no-op otherwise; LLAMA_PP_RERESERVE=0: off)
+LLAMA_API bool llama_prepare_prompt_plan(struct llama_context * ctx);
+
+// k11-decode: what a speculative rollback of the architecture (general.architecture) keeps: 0 nothing but KV cells, 1 a small
+// recurrent state (LFM2 short conv), 2 a large recurrent / compressor state (Mamba, GDN, DeepSeek-V4: a snapshot per drafted
+// token is tens of MiB), -1 unknown
+LLAMA_API int32_t llama_arch_rollback_state(const char * arch_name);
+
+// k11-decode: every layer weight of the context's model is in device memory and no MoE cache runs: the placement where batch
+// invariant verify gives the bytes of single token decodes
+LLAMA_API bool llama_verify_exact_placement(const struct llama_context * ctx);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).

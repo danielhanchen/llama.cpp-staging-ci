@@ -229,6 +229,7 @@ llama_context::llama_context(
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
     cparams.verify                  = false;
+    cparams.verify_exact            = false;
     cparams.batch_invariant         = false;
     cparams.exact_split             = 0;
     cparams.offload_kqv             = params.offload_kqv;
@@ -1170,7 +1171,7 @@ void llama_context::sched_reserve() {
         res.reset();
     }
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
-    gf_res_prev_active = nullptr;
+    gf_res_prev_active = nullptr; gf_res_epoch++;
 
     // a layer-major graph holds the graphs of up to lm_ub_max ubatches (LLAMA_MOE_LAYER_MAJOR_SCHED_PAD=1, debug: that size without them)
     static const bool lm_sched_pad = getenv("LLAMA_MOE_LAYER_MAJOR_SCHED_PAD") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_SCHED_PAD")) != 0;
@@ -1636,7 +1637,13 @@ bool llama_context::memory_update(bool optimize) {
                 res->reset();
             }
         }
+        // (k11: the kept small graphs stay: a swap-in allocates them in the scheduler again and checks them with can_reuse; a recurrent
+        // rollback after a rejected draft comes here every time, LLAMA_GRAPH_SMALL_KEEP_UPDATE=0 drops them as before)
+        static const bool keep_update = getenv("LLAMA_GRAPH_SMALL_KEEP_UPDATE") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_KEEP_UPDATE")) != 0;
         gf_res_prev_active = nullptr;
+        if (!keep_update) {
+            gf_res_epoch++;
+        }
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -2003,6 +2010,10 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
 void llama_context::set_verify(bool value) {
     cparams.verify = value;
+}
+
+void llama_context::set_verify_exact(bool value) {
+    cparams.verify_exact = value;
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
@@ -2430,7 +2441,57 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     int64_t t_tr_graph = 0;
     int64_t t_tr_set   = 0;
 
-    auto * res = get_gf_res_prev();
+    // k11-decode: LLAMA_UBATCH_TIMING=1 logs the host time of each small ubatch (graph build + alloc, inputs, compute launch)
+    static const bool ub_timing = getenv("LLAMA_UBATCH_TIMING") != nullptr && atoi(getenv("LLAMA_UBATCH_TIMING")) != 0;
+    const int64_t t_ub0 = ub_timing ? ggml_time_us() : 0;
+    bool ub_reused = false;
+
+    // k11-decode: a small output ubatch uses the kept graph of its size (see gf_res_small)
+    // (only while n-gram drafting verifies exactly, see llama_set_verify_exact: without drafts the kept graphs bought nothing and cost
+    // the next short prompt 7-8% on G4; LLAMA_GRAPH_SMALL_CACHE=2 keeps them always, =0 never)
+    static const int  small_cache_mode = getenv("LLAMA_GRAPH_SMALL_CACHE") == nullptr ? 1 : atoi(getenv("LLAMA_GRAPH_SMALL_CACHE"));
+    const bool small_cache_env = small_cache_mode == 2 || (small_cache_mode == 1 && cparams.verify_exact);
+    // (single token decodes and speculative verify windows only: a prompt's short tail keeps the shared graph, as before; G4 LFM2.5
+    // 32 GB: with the tails kept too, chat / code prompts were 3 / 9% slower)
+    const uint32_t n_small = small_cache_env && moe_cache == nullptr && !graph_reuse_disable && n_outputs > 0 &&
+        (ubatch.n_tokens == 1 || cparams.verify) && ubatch.n_tokens <= GF_SMALL_MAX ? ubatch.n_tokens : 0;
+
+    llm_graph_result * res = nullptr;
+    uint32_t i_small = 0; // the kept graph used: n_small*GF_SMALL_WAYS + way
+    if (n_small > 0) {
+        int way = -1;
+        for (uint32_t w = 0; w < GF_SMALL_WAYS && way < 0; ++w) {
+            const auto & r = gf_res_small[n_small*GF_SMALL_WAYS + w];
+            if (r && r.get() == gf_res_prev_active) {
+                way = (int) w;
+            }
+        }
+        for (uint32_t w = 0; w < GF_SMALL_WAYS && way < 0; ++w) {
+            const uint32_t i = n_small*GF_SMALL_WAYS + w;
+            if (gf_res_small[i] && gf_res_small_built[i] && gf_res_small_epoch[i] == gf_res_epoch &&
+                    gf_res_small[i]->can_reuse(graph_params(gf_res_small[i].get(), ubatch, mctx, gtype))) {
+                way = (int) w;
+            }
+        }
+        if (way < 0) {
+            way = 0;
+            for (uint32_t w = 1; w < GF_SMALL_WAYS; ++w) {
+                if (gf_res_small_used[n_small*GF_SMALL_WAYS + w] < gf_res_small_used[n_small*GF_SMALL_WAYS + way]) {
+                    way = (int) w;
+                }
+            }
+        }
+        i_small = n_small*GF_SMALL_WAYS + (uint32_t) way;
+        auto & r = gf_res_small[i_small];
+        if (!r) {
+            r.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+            gf_res_small_built[i_small] = false;
+        }
+        gf_res_small_used[i_small] = ++n_small_uses;
+        res = r.get();
+    } else {
+        res = get_gf_res_prev();
+    }
     auto * gf  = res->get_gf();
 
     // the routing outputs of the previous graph were read before, if needed (see moe_cache_seed_begin)
@@ -2442,6 +2503,34 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the copies of the experts are planned with the seed mode of the MoE cache (see sched_copy_all_experts)
     const int moe_cache_hybrid = moe_cache ? moe_cache->hybrid_mode() : 0;
+
+    // k11-decode: a kept small graph built for these parameters goes back into the scheduler: only its allocation is redone (the same
+    // graph allocates to the same addresses, so its CUDA graph is replayed as captured)
+    auto small_swap_in = [&]() -> bool {
+        if (n_small == 0 || gf == nullptr || !gf_res_small_built[i_small] || gf_res_small_epoch[i_small] != gf_res_epoch ||
+                moe_cache_seed_graph != moe_cache_seed || moe_cache_hybrid_graph != moe_cache_hybrid || moe_cache_devseed_graph != moe_cache_devseed ||
+                !res->can_reuse(gparams)) {
+            return false;
+        }
+        gf_res_prev_active = nullptr; // (k11: not an invalidation of the kept small graphs)
+        ggml_backend_sched_reset(sched.get());
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        for (const auto & st : gf_res_small_state[i_small]) {
+            memcpy(st.t->src, st.src, sizeof(st.src));
+            st.t->data   = st.data;
+            st.t->buffer = st.buffer;
+            st.t->extra  = st.extra;
+            st.t->flags  = st.flags;
+        }
+        prefetch_n_tokens = ubatch.n_tokens;
+        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+            gf_res_small_built[i_small] = false;
+            return false;
+        }
+        gf_res_prev_active = res;
+        return true;
+    };
+
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams) && moe_cache_seed_graph == moe_cache_seed &&
             moe_cache_hybrid_graph == moe_cache_hybrid && moe_cache_devseed_graph == moe_cache_devseed) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -2454,8 +2543,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        ub_reused = true;
+    } else if (small_swap_in()) {
+        n_small_swaps++;
+        ub_reused = true;
     } else {
-        gf_res_prev_active = nullptr;
+        gf_res_prev_active = nullptr; // (k11: not an invalidation of the kept small graphs)
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -2481,6 +2574,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         prefetch_n_tokens = ubatch.n_tokens;
+        if (n_small > 0) {
+            auto & sv = gf_res_small_state[i_small];
+            sv.clear();
+            for (ggml_tensor * t = ggml_get_first_tensor(res->get_ctx()); t != nullptr; t = ggml_get_next_tensor(res->get_ctx(), t)) {
+                gf_tensor_state st;
+                st.t = t;
+                memcpy(st.src, t->src, sizeof(st.src));
+                st.data   = t->data;
+                st.buffer = t->buffer;
+                st.extra  = t->extra;
+                st.flags  = t->flags;
+                sv.push_back(st);
+            }
+        }
         if (moe_cache) {
             moe_cache->set_graph(gf);
         }
@@ -2514,6 +2621,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active     = res;
+        if (n_small > 0) {
+            gf_res_small_built[i_small] = true;
+            gf_res_small_epoch[i_small] = gf_res_epoch;
+        }
         moe_cache_seed_graph   = moe_cache_seed;
         moe_cache_hybrid_graph = moe_cache_hybrid;
         // the seed plans are enabled in the op params of the graph, a reused graph keeps them (and may be replayed as captured)
@@ -2523,6 +2634,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (t_tr0) {
         t_tr_graph = ggml_time_us();
     }
+    const int64_t t_ub1 = ub_timing ? ggml_time_us() : 0;
 
     // set the input data for the input tensors
     {
@@ -2552,12 +2664,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     compute_n_tokens = ubatch.n_tokens;
+    const int64_t t_ub2 = ub_timing ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     compute_n_tokens = 0;
     if (t_tr0) {
         const int64_t t_tr_end = ggml_time_us();
         LLAMA_LOG_INFO("mtp_trace ubatch ctx=%p n=%u state=%d graph=%.2f set_inputs=%.2f compute_launch=%.2f ms\n", (void *) this, ubatch.n_tokens,
                 ubatch.embd_state != nullptr, (t_tr_graph - t_tr0)/1e3, (t_tr_set - t_tr_graph)/1e3, (t_tr_end - t_tr_set)/1e3);
+    }
+    if (ub_timing && ubatch.n_tokens <= 16) {
+        const int64_t t_ub3 = ggml_time_us();
+        LLAMA_LOG_INFO("%s: ubatch %u tokens %s: graph %.3f ms, inputs %.3f ms, compute launch %.3f ms\n", __func__, ubatch.n_tokens,
+                       ub_reused ? "reused" : "built", (t_ub1 - t_ub0)/1000.0, (t_ub2 - t_ub1)/1000.0, (t_ub3 - t_ub2)/1000.0);
     }
     // CPU misses trial: the ubatch is timed to its end, without the work of other contexts
     if (moe_cache && status == GGML_STATUS_SUCCESS && moe_cache->hybrid_tick_timed()) {
@@ -3001,7 +3119,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         if (fresh) {
             moe_cache->hybrid_reset();
         // the reset takes back the lent slots without a new allocation: a reused graph would keep its copies bound to them
-        gf_res_prev_active = nullptr;
+        gf_res_prev_active = nullptr; gf_res_epoch++;
         }
     }
 
@@ -3040,10 +3158,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // handle any pending shifts/copies
     memory_update(false);
 
+    // k11-decode: a prompt of several ubatches after a small graph re-planned the graph allocator restores the worst-case pp plan once
+    // (see restore_pp_plan); the server restores it when its slots go idle, so this is the fallback
+    if (n_tokens_all > cparams.n_ubatch && !cparams.verify) {
+        restore_pp_plan();
+    }
+
     llama_memory_context_ptr mctx;
 
     // speculative verify batches with LLAMA_MTP_EXACT=1 are computed batch invariant (see llama_set_verify)
-    const bool exact_verify = cparams.verify && llama_exact_verify_env() && n_tokens_all > 1 && cparams.causal_attn && !output_all;
+    const bool exact_verify = cparams.verify && (llama_exact_verify_env() || cparams.verify_exact) && n_tokens_all > 1 && cparams.causal_attn && !output_all;
 
     while (true) {
         mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
@@ -3512,7 +3636,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     };
     std::vector<lm_ub> group;
 
-    gf_res_prev_active = nullptr;
+    gf_res_prev_active = nullptr; gf_res_epoch++;
     moe_cache_ids.clear();
     ggml_backend_sched_reset(sched.get());
     ggml_backend_sched_use_full_hash(sched.get());
@@ -4310,7 +4434,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     extract_upto(group.size()); // (none left: each graph extracts its members)
 
     // the next graph is built anew
-    gf_res_prev_active = nullptr;
+    gf_res_prev_active = nullptr; gf_res_epoch++;
 
     return (int) group.size();
 }
@@ -4738,7 +4862,7 @@ ggml_cgraph * llama_context::graph_reserve(
             res->reset();
         }
     }
-    gf_res_prev_active = nullptr;
+    gf_res_prev_active = nullptr; gf_res_epoch++;
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -4819,13 +4943,46 @@ llm_graph_params llama_context::graph_params(
     };
 }
 
+// k11-decode: a small graph (a speculative verify window has its own node count) re-plans the graph allocator, so the ubatches of the
+// next prompt would each re-plan it again as the KV view grows, every time with a synchronization of all backends (G4: prompts 2-7%
+// slower with n-gram drafting on). This restores the worst-case pp plan of sched_reserve once. The allocator only plans addresses:
+// outputs cannot change. LLAMA_PP_RERESERVE=0: off.
+bool llama_context::restore_pp_plan() {
+    static const bool pp_rereserve = getenv("LLAMA_PP_RERESERVE") == nullptr || atoi(getenv("LLAMA_PP_RERESERVE")) != 0;
+    if (!pp_rereserve || !sched_plan_small || !memory || moe_cache || model.hparams.no_alloc || sched_need_reserve) {
+        return false;
+    }
+    sched_plan_small = false;
+    synchronize();
+    auto mctx_full = memory->init_full();
+    if (!mctx_full) {
+        return false;
+    }
+    const uint32_t n_seqs_r    = (model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_MINIMAX_01) ? 1 : cparams.n_seq_max;
+    const uint32_t n_tokens_r  = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_outputs_r = std::min(n_tokens_r, cparams.n_outputs_max);
+    if (graph_reserve(n_tokens_r, n_seqs_r, n_outputs_r, mctx_full.get()) == nullptr) {
+        LLAMA_LOG_WARN("%s: re-reserving the pp graph failed\n", __func__);
+        return false;
+    }
+    if (++n_pp_rereserve == 1 || n_pp_rereserve % 100 == 0) {
+        LLAMA_LOG_INFO("%s: a small graph re-planned the graph allocator: the pp graph is reserved again (%" PRId64 " times; LLAMA_PP_RERESERVE=0: off)\n",
+                __func__, n_pp_rereserve);
+    }
+    return true;
+}
+
 void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {
+    auto * lctx = static_cast<llama_context *>(user_data);
+
+    if (lctx->prefetch_n_tokens <= 2*GF_SMALL_MAX) {
+        lctx->sched_plan_small = true;
+    }
+
     // reallocating after the backend assignments changed is expected, trace only the unexpected ones
     if (backend_ids_changed) {
         return;
     }
-
-    auto * lctx = static_cast<llama_context *>(user_data);
 
     if (graph_size_changed) {
         lctx->n_reallocs_diff++;
@@ -6333,7 +6490,7 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
     if (moe_cache) {
         moe_cache->hybrid_reset();
         // the reset takes back the lent slots without a new allocation: a reused graph would keep its copies bound to them
-        gf_res_prev_active = nullptr;
+        gf_res_prev_active = nullptr; gf_res_epoch++;
     }
 
     // read model info
@@ -6652,7 +6809,7 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
     if (moe_cache) {
         moe_cache->hybrid_reset();
         // the reset takes back the lent slots without a new allocation: a reused graph would keep its copies bound to them
-        gf_res_prev_active = nullptr;
+        gf_res_prev_active = nullptr; gf_res_epoch++;
     }
     if (memory) {
         memory->state_read(io, seq_id, flags);
@@ -6872,7 +7029,7 @@ void llama_context::opt_epoch_iter(
             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
 
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
-            gf_res_prev_active = nullptr;
+            gf_res_prev_active = nullptr; gf_res_epoch++;
             res->reset();
 
             moe_cache_ids.clear();
@@ -7302,6 +7459,42 @@ bool llama_layer_major_on(const llama_context * ctx) {
 
 bool llama_exact_verify_enabled(void) {
     return llama_exact_verify_env();
+}
+
+bool llama_prepare_prompt_plan(llama_context * ctx) {
+    return ctx->restore_pp_plan();
+}
+
+void llama_set_verify_exact(llama_context * ctx, bool value) {
+    ctx->set_verify_exact(value);
+}
+
+bool llama_verify_exact_placement(const llama_context * ctx) {
+    // a MoE cache computes misses on the host or reads them per batch, and host weights run CPU kernels whose batch path is not the
+    // single token path: verify rows there do not give the bytes of single token decodes (G4, LFM2.5 8 GB: other text)
+    if (ctx == nullptr || ctx->moe_cache_active()) {
+        return false;
+    }
+    for (const auto & [name, t] : ctx->get_model().tensors_by_name) {
+        if (t != nullptr && t->buffer != nullptr && name.rfind("blk.", 0) == 0 && ggml_backend_buffer_is_host(t->buffer)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int32_t llama_arch_rollback_state(const char * arch_name) {
+    if (arch_name == nullptr) {
+        return -1;
+    }
+    const llm_arch arch = llm_arch_from_string(arch_name);
+    if (arch == LLM_ARCH_UNKNOWN) {
+        return -1;
+    }
+    if (arch == LLM_ARCH_LFM2 || arch == LLM_ARCH_LFM2MOE) {
+        return 1;   // a short-conv state of a few KiB per layer: per-token snapshots cost nothing
+    }
+    return llm_arch_is_recurrent(arch) || llm_arch_is_hybrid(arch) ? 2 : 0;
 }
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {

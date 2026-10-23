@@ -18,6 +18,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "spec-governor.h"
+#include "server-spec-auto.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -1213,6 +1214,9 @@ private:
 
         const bool is_resume = sleeping;
 
+        // k11-decode: n-gram drafting on by default where nothing else drafts (server-spec-auto.h, LLAMA_SPEC_AUTO=0: off)
+        server_spec_auto_apply(params);
+
         params_base = params;
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
@@ -1531,6 +1535,17 @@ private:
 
         if (spec) {
             SRV_TRC("%s", "speculative decoding context initialized\n");
+            // k11-decode: the default drafts are verified batch invariant, so greedy output stays that of plain decoding; where the
+            // placement cannot give single token bytes (host experts, a MoE cache) they stay off (LLAMA_SPEC_AUTO_EXACT=0 keeps them)
+            if (params_base.speculative.ngram_suffix.auto_mode && server_spec_auto_exact()) {
+                if (llama_verify_exact_placement(ctx_tgt)) {
+                    llama_set_verify_exact(ctx_tgt, true);
+                } else {
+                    SRV_INF("%s", "n-gram drafting by default stays off: host weights or a MoE cache, where verify rows are not computed as single "
+                        "token decodes (LLAMA_SPEC_AUTO_EXACT=0 drafts there, with other greedy text)\n");
+                    spec.reset();
+                }
+            }
         } else {
             spec_init.reset();
             ctx_dft   = nullptr;
@@ -3458,6 +3473,11 @@ private:
                 SRV_TRC("%s", "all slots are idle\n");
 
                 metrics_flush_idle();
+
+                // k11-decode: the next prompt starts from the worst-case pp plan (a verify window may have re-planned it)
+                if (ctx_tgt) {
+                    llama_prepare_prompt_plan(ctx_tgt);
+                }
 
                 return; // skip further processing
 
