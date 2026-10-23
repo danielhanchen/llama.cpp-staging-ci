@@ -845,11 +845,43 @@ struct llama_moe_cache::impl {
     // " (mtp)" for the cache of an MTP context, in its log lines
     const char * tag = "";
 
+    // warm start from a routing profile (k11, opt-in): LLAMA_MOE_CACHE_PROFILE=<path> fills the device slots at load from the ranked
+    // (layer, expert) list a run saved with LLAMA_MOE_CACHE_PROFILE_SAVE=<path> (its resident experts by decayed use, then the other used
+    // ones), the most routed first over the whole group instead of an equal share per layer (Strata v0.2.2 --expert-profile). The file is
+    // <path>.<n_layer>.<n_expert>[.mtp], so a draft model or an MTP context keeps its own. Only where experts sit changes: a cached and a
+    // fetched expert compute the same, so the output is unchanged unless experts are computed on the host (CPU misses), whose split follows
+    // the residency. LLAMA_MOE_CACHE_PROFILE_SEED (1): the share of each layer a prompt may still seed with its routing when a profile
+    // was loaded (0: prompts do not seed, the profile set stays until decode misses replace it)
+    struct prof_entry {
+        int32_t il;
+        int32_t e;
+        float   heat;
+    };
+    std::string profile_file;      // load
+    std::string profile_save_file; // save at exit
+    std::vector<prof_entry> profile;
+    bool   profile_loaded = false;
+    double profile_seed   = 1.0;
+    size_t profile_filled = 0;
+
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
             layer_set set, llama_weight_store * ws, int64_t host_mib) :
             wstore(ws), n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
         tag = set == layer_set::nextn ? " (mtp)" : "";
         single_no_alloc = model.hparams.no_alloc;
+        {
+            const std::string sfx = "." + std::to_string(model.layers.size()) + "." + std::to_string(model.hparams.n_expert) +
+                (set == layer_set::nextn ? ".mtp" : "");
+            if (const char * e = getenv("LLAMA_MOE_CACHE_PROFILE"); e != nullptr && *e) {
+                profile_file = e + sfx;
+            }
+            if (const char * e = getenv("LLAMA_MOE_CACHE_PROFILE_SAVE"); e != nullptr && *e && !model.hparams.no_alloc) {
+                profile_save_file = e + sfx;
+            }
+            if (const char * e = getenv("LLAMA_MOE_CACHE_PROFILE_SEED")) {
+                profile_seed = std::min(1.0, std::max(0.0, atof(e)));
+            }
+        }
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -1377,11 +1409,13 @@ struct llama_moe_cache::impl {
         if (!model.hparams.no_alloc) {
             const char * env  = getenv("LLAMA_MOE_CACHE_PREFILL");
             const int    seed = seed_mode();
-            if (env != nullptr ? atoi(env) != 0 : seed == 1) {
+            if (!profile_file.empty() && profile_read() && prefill_profile()) {
+                profile_loaded = true;
+            } else if (env != nullptr ? atoi(env) != 0 : seed == 1) {
                 prefill();
             }
             // the default seeding may not fit in the compute buffer, the cache is then prefilled (see seed_unavailable)
-            prefill_deferred = env == nullptr && seed == 2;
+            prefill_deferred = env == nullptr && seed == 2 && !profile_loaded;
         }
 
         if (!model.hparams.no_alloc) {
@@ -1586,6 +1620,165 @@ struct llama_moe_cache::impl {
             prefilled_dev = true;
             LLAMA_LOG_INFO("%s: MoE cache prefilled with %zu experts, %.2f MiB (LLAMA_MOE_CACHE_PREFILL=0 to disable)\n", __func__, n_fill, n_bytes/1024.0/1024.0);
         }
+    }
+
+    // the ranked (layer, expert) list of profile_file, see prof_entry; false (and a warning) if it is missing or does not match
+    bool profile_read() {
+        FILE * f = fopen(profile_file.c_str(), "r");
+        if (f == nullptr) {
+            LLAMA_LOG_WARN("llama_moe_cache%s: LLAMA_MOE_CACHE_PROFILE: no profile %s, the cache starts empty\n", tag, profile_file.c_str());
+            return false;
+        }
+        int ver = 0;
+        long n_layer = 0;
+        bool ok = fscanf(f, "moe-cache-profile %d %ld", &ver, &n_layer) == 2 && ver == 1 && n_layer == (long) layers.size();
+        profile.clear();
+        std::set<int64_t> seen;
+        prof_entry p;
+        while (ok && fscanf(f, "%d %d %f", &p.il, &p.e, &p.heat) == 3) {
+            if (p.il < 0 || p.il >= (int32_t) layers.size() || layers[p.il].ig < 0 || p.e < 0 || p.e >= groups[layers[p.il].ig].lru.n_expert ||
+                    !seen.insert((int64_t) p.il << 32 | p.e).second) {
+                ok = false;
+                break;
+            }
+            profile.push_back(p);
+        }
+        fclose(f);
+        if (!ok || profile.empty()) {
+            LLAMA_LOG_WARN("llama_moe_cache%s: LLAMA_MOE_CACHE_PROFILE: %s does not match this model's cache, ignored\n", tag, profile_file.c_str());
+            profile.clear();
+            return false;
+        }
+        return true;
+    }
+
+    // fill the device slots of each group at load with the first profile entries of its layers (as many as it has slots)
+    bool prefill_profile() {
+        size_t n_fill  = 0;
+        size_t n_bytes = 0;
+        std::vector<std::vector<int32_t>> by_layer(layers.size());
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            group & g = groups[ig];
+            if (g.n_slots == 0) {
+                continue;
+            }
+            const int32_t n_avail = g.n_slots - g.lru.n_lent;
+            int32_t n_take = 0;
+            for (const prof_entry & p : profile) {
+                if (layers[p.il].ig == (int32_t) ig && n_take < n_avail) {
+                    by_layer[p.il].push_back(p.e);
+                    n_take++;
+                }
+            }
+            for (int32_t il : g.layers) {
+                std::vector<int32_t> & ids = by_layer[il];
+                std::sort(ids.begin(), ids.end());
+                size_t n_hit = 0;
+                if (ids.empty() || !g.lru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
+                    continue;
+                }
+                const layer & l = layers[il];
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    const size_t expert_size = w->nb[2];
+                    for (size_t j = 0; j < fills.size();) {
+                        size_t m = 1;
+                        while (j + m < fills.size() && fills[j + m].expert == fills[j].expert + (int32_t) m && fills[j + m].slot == fills[j].slot + (int32_t) m) {
+                            m++;
+                        }
+                        ggml_backend_tensor_set(g.banks[ip], (const uint8_t *) w->data + fills[j].expert*expert_size, fills[j].slot*expert_size, m*expert_size);
+                        n_bytes += m*expert_size;
+                        j += m;
+                    }
+                }
+                n_fill += fills.size();
+            }
+            // the decay counters start from the profile's heat (relative to the weight of one use), so the first misses evict the coldest
+            if (g.lru.grow_q16 > 0) {
+                g.lru.w = moe_cache_lru::w_init;
+                std::fill(g.lru.scores.begin(), g.lru.scores.end(), 0);
+                for (const prof_entry & p : profile) {
+                    if (layers[p.il].ig == (int32_t) ig) {
+                        const double v = std::min<double>(moe_cache_lru::score_max, std::max(0.0, (double) p.heat)*moe_cache_lru::w_init);
+                        g.lru.scores[(size_t) p.il*g.lru.n_expert + p.e] = (int32_t) v;
+                    }
+                }
+                g.lru.gen++;
+            }
+        }
+        profile_filled = n_fill;
+        if (n_fill > 0) {
+            prefilled_dev = true;
+        }
+        LLAMA_LOG_INFO("llama_moe_cache%s: MoE cache warm start from %s: %zu of %zu profile experts in the device slots, %.2f MiB, prompts seed %.0f%% "
+                "of their share (LLAMA_MOE_CACHE_PROFILE_SEED; unset LLAMA_MOE_CACHE_PROFILE to disable)\n", tag, profile_file.c_str(), n_fill,
+                profile.size(), n_bytes/1048576.0, 100.0*profile_seed);
+        return n_fill > 0;
+    }
+
+    // at exit (LLAMA_MOE_CACHE_PROFILE_SAVE): the resident experts of every group by decayed use (the device state when the device
+    // lookup planned last), then the used experts that are not resident; heat = counter / weight of one use (resident without the
+    // decay policy: 1)
+    void profile_save() {
+        if (profile_save_file.empty()) {
+            return;
+        }
+        std::vector<prof_entry> out_res;
+        std::vector<prof_entry> out_rest;
+        for (group & g : groups) {
+            if (g.n_slots == 0) {
+                continue;
+            }
+            const int32_t n_expert = g.lru.n_expert;
+            std::vector<int32_t> key_of = g.lru.key_of;
+            std::vector<int32_t> sc     = g.lru.scores;
+            int32_t w = g.lru.w;
+            if (g.dev_newer && g.state != nullptr && g.state->data != nullptr) {
+                ggml_backend_tensor_get(g.state, key_of.data(), n_hdr*sizeof(int32_t), key_of.size()*sizeof(int32_t));
+                if (g.scores != nullptr && g.scores->data != nullptr) {
+                    ggml_backend_tensor_get(g.scores, sc.data(), 0, sc.size()*sizeof(int32_t));
+                    ggml_backend_tensor_get(g.state, &w, 7*sizeof(int32_t), sizeof(int32_t));
+                }
+            }
+            const bool decay = !sc.empty() && w > 0;
+            std::vector<bool> res((size_t) layers.size()*n_expert, false);
+            for (int32_t k : key_of) {
+                if (k >= 0 && k < (int32_t) res.size()) {
+                    res[k] = true;
+                    out_res.push_back({ k / n_expert, k % n_expert, decay ? (float) sc[k]/w : 1.0f });
+                }
+            }
+            if (decay) {
+                for (int32_t il : g.layers) {
+                    for (int32_t e = 0; e < n_expert; ++e) {
+                        const size_t k = (size_t) il*n_expert + e;
+                        if (!res[k] && sc[k] > 0) {
+                            out_rest.push_back({ il, e, (float) sc[k]/w });
+                        }
+                    }
+                }
+            }
+        }
+        auto by_heat = [](const prof_entry & a, const prof_entry & b) {
+            return a.heat != b.heat ? a.heat > b.heat : a.il != b.il ? a.il < b.il : a.e < b.e;
+        };
+        std::sort(out_res.begin(), out_res.end(), by_heat);
+        std::sort(out_rest.begin(), out_rest.end(), by_heat);
+        const std::string tmp = profile_save_file + ".tmp";
+        FILE * f = fopen(tmp.c_str(), "w");
+        if (f == nullptr) {
+            LLAMA_LOG_WARN("llama_moe_cache%s: LLAMA_MOE_CACHE_PROFILE_SAVE: cannot write %s\n", tag, tmp.c_str());
+            return;
+        }
+        fprintf(f, "moe-cache-profile 1 %zu\n", layers.size());
+        for (const auto * v : { &out_res, &out_rest }) {
+            for (const prof_entry & p : *v) {
+                fprintf(f, "%d %d %.6g\n", p.il, p.e, p.heat);
+            }
+        }
+        const bool ok = fclose(f) == 0 && rename(tmp.c_str(), profile_save_file.c_str()) == 0;
+        LLAMA_LOG_INFO("llama_moe_cache%s: MoE cache profile %s %s: %zu resident + %zu other used experts\n", tag, ok ? "saved to" : "NOT saved to",
+                profile_save_file.c_str(), out_res.size(), out_rest.size());
     }
 
     // single-graph host misses (k11, LLAMA_MOE_SINGLE=1, opt-in): batches of up to GGML_MOE_MAILBOX_MAX_TOKENS tokens publish the host ids
@@ -1942,6 +2135,7 @@ struct llama_moe_cache::impl {
         // the weight store is destroyed first (llama_context): its destructor completes the reads ahead into the RAM slots, which are
         // still allocated then; wstore is not used here
         single_stop_all();
+        profile_save();
         log_stats();
         for (const auto & [unmap, buf] : mapped) {
             unmap(buf);
@@ -5321,6 +5515,14 @@ struct llama_moe_cache::impl {
                 const size_t pos = std::find(g.layers.begin(), g.layers.end(), b.il) - g.layers.begin();
                 n_full = pos < (size_t) g.n_slots ? 1 : 0;
                 n_seed = pos < n_avail ? 1 : 0;
+            }
+            if (profile_loaded && profile_seed < 1.0) {
+                // a warm start (LLAMA_MOE_CACHE_PROFILE): the prompt seeds only this share of each layer, the profile keeps the rest
+                n_full = (size_t) (n_full*profile_seed);
+                n_seed = std::min(n_seed, n_full);
+                if (n_full == 0) {
+                    return;
+                }
             }
             GGML_ASSERT((int32_t) counts.size() == n_expert && (int32_t) staged.size() == n_expert);
             seed_ids.clear();
