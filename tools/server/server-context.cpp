@@ -4355,9 +4355,17 @@ private:
                             // batch starts is at most N tokens (and fits one ubatch) runs in one pass, without the separate pass of its last 4
                             // tokens; its checkpoint is then made at the end of the prompt, so a next prompt that differs in those last tokens
                             // is processed again from the previous checkpoint. Other ubatch shapes, so other numerics (KLD-gated, not md5-equal)
-                            static const int ckpt_single_max = getenv("LLAMA_SERVER_CKPT_SINGLE_MAX") ? atoi(getenv("LLAMA_SERVER_CKPT_SINGLE_MAX")) : 0;
-                            const int n_rest_batch = slot.task->n_tokens() - (slot.prompt.n_tokens() - (int) (batch.size() - n_tokens_prev));
-                            const bool ckpt_single = ckpt_single_max > 0 && n_rest_batch <= std::min<int>(ckpt_single_max, n_ubatch);
+                            // k13-pp: on by default (N = 512) under the KLD gate (plans/k13_pp.md section 7), =0 turns it off. Only where the
+                            // checkpoint at the end costs a next prompt at most this batch again: the whole prompt is at most N tokens, or
+                            // the batch starts at the last user message (a checkpoint is made there). Without that bound a raw prompt that
+                            // keeps growing by a few tokens per turn would find no usable checkpoint and be processed again from the start.
+                            // LLAMA_SERVER_CKPT_SINGLE_ANY=1: the k11 opt-in rule (any prompt whose rest is at most N)
+                            static const int ckpt_single_max = getenv("LLAMA_SERVER_CKPT_SINGLE_MAX") ? atoi(getenv("LLAMA_SERVER_CKPT_SINGLE_MAX")) : 512;
+                            static const bool ckpt_single_any = getenv("LLAMA_SERVER_CKPT_SINGLE_ANY") != nullptr && atoi(getenv("LLAMA_SERVER_CKPT_SINGLE_ANY")) != 0;
+                            const int n_batch_start = slot.prompt.n_tokens() - (int) (batch.size() - n_tokens_prev);
+                            const int n_rest_batch = slot.task->n_tokens() - n_batch_start;
+                            const bool ckpt_single = ckpt_single_max > 0 && n_rest_batch <= std::min<int>(ckpt_single_max, n_ubatch) &&
+                                (ckpt_single_any || slot.task->n_tokens() <= ckpt_single_max || (last_user_pos > 0 && n_batch_start == last_user_pos));
                             bool should_break = false;
                             for (int k = 0; k < 2; ++k) {
                                 const int offset = checkpoint_offsets[k];
