@@ -981,11 +981,15 @@ static void common_params_fit_impl(
                 const char * e_sm = getenv("LLAMA_FIT_SMALL_MARGIN_MIB");
                 const int64_t small_mib = e_sm != nullptr ? std::max<int64_t>(0, atoll(e_sm)) : 256;
                 constexpr int64_t m_default = 1024*MiB;
-                // the cache of a small device is capped (LLAMA_FIT_SMALL_CACHE_MIB, 48; 0 = no cap): it holds under 1% of the experts
-                // either way, and what it does not take stays free for the layer-major prompt groups, which read each host expert once
-                // per group instead of once per ubatch (G4 4 GB q3m: 76 MiB free with a 99 MiB cache, every group of 2+ ubatches split)
+                // the cache of a small device that holds only a few experts anyway is capped (LLAMA_FIT_SMALL_CACHE_MIB, 48; 0 = no cap)
+                // where the uncapped fit gives it at most LLAMA_FIT_SMALL_CACHE_CAP_BELOW_MIB (256): what it does not take stays free for
+                // the layer-major prompt groups, which read each host expert once per group instead of once per ubatch. G4 4 GB q3m + MTP
+                // (111 MiB uncapped, 76 MiB free, every group of 2+ ubatches split): prompt 2k 1885 -> 4712, 8k 1937 -> 4103 tok/s,
+                // decode -9 / -2 / -5% (chat / 2k / 8k, the smaller cache); gpt-oss-20b 4 GB (476 MiB) lost 4-10% decode capped: not capped
                 const char * e_sc = getenv("LLAMA_FIT_SMALL_CACHE_MIB");
                 const int64_t cap_mib = e_sc != nullptr ? std::max<int64_t>(0, atoll(e_sc)) : 48;
+                const char * e_cb = getenv("LLAMA_FIT_SMALL_CACHE_CAP_BELOW_MIB");
+                const int64_t cap_below_mib = e_cb != nullptr ? std::max<int64_t>(0, atoll(e_cb)) : 256;
                 // opt-in second, smaller margin when the first one leaves no cache (LLAMA_FIT_SMALL_MARGIN_MIN_MIB=N): G4 4 GB Qwen3.6
                 // UD-Q4_K_XL + MTP placed every layer at 128 MiB but ran out of device memory in its first request (CUDA error, run k13r2)
                 const char * e_sm2 = getenv("LLAMA_FIT_SMALL_MARGIN_MIN_MIB");
@@ -993,28 +997,35 @@ static void common_params_fit_impl(
                 if (g_moe_margin_auto && small_mib > 0 && small_mib*MiB < m_default && margins[0] >= m_default) {
                     const int64_t margin_saved = margins[0];
                     const dmds_t  dmds_nc_saved = dmds_cpu_moe;
-                    size_t cache_req = size_before;
-                    dmds_t dmds_req  = dmds_cpu_moe_req;
-                    if (cap_mib > 0 && size_t(cap_mib)*MiB < size_before) {
-                        // measured at the cap: the cache then keeps that size if it fits, else the sizing below shrinks it
-                        cache_req = size_t(cap_mib)*MiB;
-                        cparams->moe_cache_size = cache_req;
-                        dmds_req = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
-                        add_extra_memory(dmds_req);
-                    }
-                    bool ok = false;
-                    for (const int64_t m_mib : { small_mib, small_min_mib }) {
-                        if (ok || m_mib <= 0) {
-                            continue;
-                        }
+                    // one sizing of the cache from the measurement d at the requested size req, margin m_mib: ok if every layer fits
+                    auto try_fit = [&](size_t req, const dmds_t & d, int64_t m_mib) {
                         margins[0] = margin_saved - m_default + m_mib*MiB; // what was added to the default (a projector) stays
-                        dmds_cpu_moe = dmds_req;
-                        cparams->moe_cache_size = cache_req;
+                        dmds_cpu_moe = d;
+                        cparams->moe_cache_size = req;
                         fit_moe_cache_size(dmds_cpu_moe, mparams, true);
-                        ok = cparams->moe_cache_size > 0 && cparams->moe_cache_size != size_before &&
+                        return cparams->moe_cache_size > 0 && cparams->moe_cache_size != size_before &&
                             int64_t(dmds_cpu_moe[0].free) - int64_t(dmds_cpu_moe[0].mb.total()) >= margins[0];
-                        if (small_min_mib == small_mib) {
-                            break;
+                    };
+                    bool    ok    = false;
+                    int64_t m_ok  = 0;
+                    for (const int64_t m_mib : { small_mib, small_min_mib }) {
+                        if (!ok && m_mib > 0) {
+                            ok   = try_fit(size_before, dmds_cpu_moe_req, m_mib);
+                            m_ok = m_mib;
+                        }
+                    }
+                    if (ok && cap_mib > 0 && cparams->moe_cache_size > size_t(cap_mib)*MiB && cparams->moe_cache_size <= size_t(cap_below_mib)*MiB) {
+                        const size_t  size_unc = cparams->moe_cache_size;
+                        const dmds_t  dmds_unc = dmds_cpu_moe;
+                        const int64_t gain_unc = g_moe_margin_gain;
+                        cparams->moe_cache_size = size_t(cap_mib)*MiB;
+                        dmds_t dmds_cap = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                        add_extra_memory(dmds_cap);
+                        if (!try_fit(size_t(cap_mib)*MiB, dmds_cap, m_ok)) {
+                            margins[0] = margin_saved - m_default + m_ok*MiB;
+                            cparams->moe_cache_size = size_unc;
+                            dmds_cpu_moe = dmds_unc;
+                            g_moe_margin_gain = gain_unc;
                         }
                     }
                     if (ok) {
