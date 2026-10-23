@@ -819,6 +819,9 @@ struct llama_moe_cache::impl {
     // the cache the prompts left, so a verify window splits each token as its single token decode does
     static constexpr int64_t cm_frozen_max = 8;
     bool     cm_frozen     = false;
+    // LLAMA_MOE_CPU_MISS_FROZEN_FETCH=1: the freeze pins only the decisions (host path on for the frozen sizes, no trials or windows);
+    // small batches still fetch their share and the assign still admits, so the cache follows the decode (not exact under drafts)
+    bool     cm_frozen_fetch = false;
     bool     cm_small_ok   = true;  // the last trial kept the host path for small batches
     bool     cm_small_live = true;  // the graphs of small batches use it now
     int      cmt_done   = -1;       // small batches of the running trial, -1 if none
@@ -3483,6 +3486,7 @@ struct llama_moe_cache::impl {
             return cm_frozen;
         }
         cm_frozen     = true;
+        cm_frozen_fetch = getenv("LLAMA_MOE_CPU_MISS_FROZEN_FETCH") != nullptr && atoi(getenv("LLAMA_MOE_CPU_MISS_FROZEN_FETCH")) != 0;
         cm_trial      = false;
         cmt_done      = -1;
         cmt_wait      = -1;
@@ -3496,8 +3500,10 @@ struct llama_moe_cache::impl {
             cm_on[n] = n <= std::min<int64_t>({ cm_frozen_max, max_batch }) ? 1 : 0;
         }
         cm_gen++;
-        LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: small batches of up to %d tokens frozen: nothing fetched, the host computes every miss, "
-            "no timing trials (LLAMA_MOE_CPU_MISS_FROZEN=0 off)\n", tag, (int) std::min<int64_t>({ cm_frozen_max, max_batch, cm_max }));
+        LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: small batches of up to %d tokens frozen: %s, "
+            "no timing trials (LLAMA_MOE_CPU_MISS_FROZEN=0 off)\n", tag, (int) std::min<int64_t>({ cm_frozen_max, max_batch, cm_max }),
+            cm_frozen_fetch ? "host path pinned on, the fetch share and admissions kept (LLAMA_MOE_CPU_MISS_FROZEN_FETCH=1)" :
+                              "nothing fetched, the host computes every miss");
         return true;
     }
 
@@ -3560,7 +3566,7 @@ struct llama_moe_cache::impl {
 
     // the host computes the misses of a batch of n_tokens: the fetch share, 1 = every missing expert is fetched
     float cm_share_of(int64_t n_tokens) const {
-        if (cm_frozen && cm && cm_cal && n_tokens >= 1 && n_tokens <= std::min<int64_t>({ cm_frozen_max, max_batch, cm_max })) {
+        if (cm_frozen && !cm_frozen_fetch && cm && cm_cal && n_tokens >= 1 && n_tokens <= std::min<int64_t>({ cm_frozen_max, max_batch, cm_max })) {
             return 0.0f;
         }
         if (cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_prompt_force) {
@@ -3654,7 +3660,7 @@ struct llama_moe_cache::impl {
     // fetched and the assign admits nothing, not even to free slots (LLAMA_MOE_CACHE_FETCH=0 keeps its k12 behaviour: it fills free
     // slots, so it is not frozen)
     bool split_frozen() const {
-        return cm && cm_frozen;
+        return cm && cm_frozen && !cm_frozen_fetch;
     }
 
     ggml_tensor * hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res, bool ov) const {

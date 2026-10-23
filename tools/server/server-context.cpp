@@ -1555,7 +1555,7 @@ private:
                                           server_spec_spill_mode(server_spec_auto_arch(params_base.model.path), host_mode);
                 if (spill < 0) {
                     llama_set_verify_exact(ctx_tgt, true);
-                } else if (spill == 2 && llama_moe_freeze_small(ctx_tgt)) {
+                } else if (spill == 2 && getenv("LLAMA_MOE_CPU_MISS_FROZEN_FETCH") == nullptr && llama_moe_freeze_small(ctx_tgt)) {
                     // k13: frozen small batches, drafts verified batch invariant (exact against this frozen cache)
                     llama_set_verify_exact(ctx_tgt, true);
                     SRV_INF("%s", "n-gram drafting by default under the MoE cache: small batches frozen, drafts verified exactly against them "
