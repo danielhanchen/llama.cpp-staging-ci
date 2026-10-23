@@ -3580,10 +3580,21 @@ struct llama_moe_cache::impl {
         }
         const group & g = groups[layers[il].ig];
         ggml_tensor * op = ggml_moe_cache_assign(ctx, ids, g.map, g.state, g.counts, share, il);
-        if (g.scores != nullptr) {
+        if (host && split_frozen()) {
+            // k13: frozen small batches admit nothing between prompts, not even to the empty slots a lent graph left: the n-gram
+            // drafts of a verify window (rejected ones too) would admit experts a single token decode never sees
+            ggml_moe_cache_assign_freeze(op);
+        } else if (g.scores != nullptr) {
             ggml_moe_cache_set_scores(op, g.scores, g.lru.grow_q16, il == g.layers[0]);
         }
         return op;
+    }
+
+    // k13: frozen small batches of the CPU-miss rule (cm_freeze): the host computes every missing expert of a small batch, nothing is
+    // fetched and the assign admits nothing, not even to free slots (LLAMA_MOE_CACHE_FETCH=0 keeps its k12 behaviour: it fills free
+    // slots, so it is not frozen)
+    bool split_frozen() const {
+        return cm && cm_frozen;
     }
 
     ggml_tensor * hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res, bool ov) const {
@@ -6084,7 +6095,7 @@ bool llama_moe_cache::host_never() const {
 }
 
 bool llama_moe_cache::host_split_frozen() const {
-    return (pimpl->hybrid && pimpl->hybrid_fixed && !pimpl->cm && !pimpl->hybrid_auto && pimpl->hybrid_share <= 0.0f) || (pimpl->cm && pimpl->cm_frozen);
+    return pimpl->split_frozen();
 }
 
 bool llama_moe_cache::freeze_small() {

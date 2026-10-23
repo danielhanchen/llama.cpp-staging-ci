@@ -81,9 +81,9 @@ public:
     bool cpu_miss_enabled() const; // LLAMA_MOE_CPU_MISS is on for this cache (until a failed calibration turns it off)
     // k13: the host never computes an expert of this cache (no hybrid path, no CPU misses): every expert runs on the device from a slot
     bool host_never() const;
-    // k13: the host computes the missing experts of small batches with a fixed fetch share of 0 (LLAMA_MOE_CACHE_FETCH=0): nothing is
-    // fetched or admitted between prompts, so which expert of a token the host computes depends on the token's own ids and the cache
-    // as the prompt left it, the same in a verify window as in a single token decode
+    // k13: frozen small batches (freeze_small): the host computes every miss of a small batch, nothing is fetched or admitted between
+    // prompts (the assign is frozen, see ggml_moe_cache_assign_freeze), so which expert of a token the host computes depends on the
+    // token's own ids and the cache as the prompts left it, the same in a verify window as in a single token decode
     bool host_split_frozen() const;
     // k13: CPU misses: small batches (up to 8 tokens) fetch nothing and the host computes every miss, without trials; true if frozen
     bool freeze_small();
