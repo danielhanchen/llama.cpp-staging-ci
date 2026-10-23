@@ -555,6 +555,7 @@ private:
     // k11-decode: the graph allocator was re-planned for a small graph (a decode step or a verify window) since the worst-case pp
     // reservation: the next prompt reserves the pp graph again before its first ubatch (LLAMA_PP_RERESERVE=0: off)
     bool sched_plan_small = false;
+    bool reserve_keeps_small = false; // k13: graph_reserve keeps the kept small graphs valid (restore_pp_plan; they re-allocate on swap-in)
     int64_t n_pp_rereserve = 0;
     int32_t n_reallocs_diff = 0;
 
@@ -691,9 +692,11 @@ private:
     // k11-decode: the graphs of small output ubatches (1..8 tokens: decode and speculative verify windows) are kept per size, so a
     // switch between a decode and a verify window re-allocates the kept graph instead of building it again (LLAMA_GRAPH_SMALL_CACHE=0:
     // one graph for all sizes, as before). gf_res_epoch counts every invalidation of the kept graphs (memory updates, reserves)
-    // four kept graphs per size: after a recurrent rollback the state cells and the restore copy differ for a few decodes
+    // twelve kept graphs per size (k13; four before): after a recurrent rollback of r tokens (1..n_rs_seq) the restore row (the rs
+    // alias, baked into the graph) differs for one decode, so a decode size needs one graph per rollback length beside its plain
+    // one; with four ways those graphs evicted each other (G4 LFM2.5: ~20 rebuilds per 256-token chat request)
     static constexpr uint32_t GF_SMALL_MAX  = 8;
-    static constexpr uint32_t GF_SMALL_WAYS = 4;
+    static constexpr uint32_t GF_SMALL_WAYS = 12;
     static constexpr uint32_t GF_SMALL_N    = (GF_SMALL_MAX + 1)*GF_SMALL_WAYS;
     std::array<llm_graph_result_ptr, GF_SMALL_N> gf_res_small;
     std::array<uint64_t, GF_SMALL_N>             gf_res_small_epoch{};
