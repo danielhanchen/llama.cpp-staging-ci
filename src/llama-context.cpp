@@ -1455,6 +1455,12 @@ bool llama_context::sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint3
         ggml_backend_dev_memory(dev, &free, &total);
         free -= std::min(free, released);
         free -= std::min(free, i < mem_reserve.size() ? mem_reserve[i] : (size_t) 0);
+        // k11: the cache memory kept for layer-major graphs (common, LLAMA_MOE_LAYER_MAJOR_RESERVE_*) is not free for the seed
+        // (LLAMA_MOE_LAYER_MAJOR_RESERVE_SEED=1: counted as free, as before)
+        static const size_t lm_reserved = getenv("LLAMA_MOE_LAYER_MAJOR_RESERVED_BYTES") != nullptr &&
+            (getenv("LLAMA_MOE_LAYER_MAJOR_RESERVE_SEED") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_RESERVE_SEED")) == 0) ?
+            (size_t) atoll(getenv("LLAMA_MOE_LAYER_MAJOR_RESERVED_BYTES")) : 0;
+        free -= std::min(free, lm_reserved);
         if (free < graph - cur_gph + margin) {
             LLAMA_LOG_WARN("%s: %s: the ubatch that seeds the MoE cache needs %.2f MiB more compute buffer, %.2f MiB free (with %.0f MiB of headroom): "
                 "prompts do not seed the cache from their own ids (a smaller --moe-cache-mib keeps the seed)\n", __func__,

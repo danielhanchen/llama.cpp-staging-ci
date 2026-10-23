@@ -1469,6 +1469,11 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             if (reserve > 0 && (int64_t) params.moe_cache_size > 2*reserve) {
                 params.moe_cache_size  -= (size_t) reserve;
                 cparams.moe_cache_size  = params.moe_cache_size;
+                // k11: the memory given up here is for the merged graphs only. The check whether a prompt's host seed fits
+                // (llama_context::sched_reserve_seed) must not count it as free: with it counted, a 128 MiB reserve made the host seed fit
+                // and replaced the device seed of Flash-Next UD-IQ4_XS 32 GB (Studio argv), whose 2k prompt then waited on the routing of
+                // each layer (G4 k11pgAA: 2k -8.5%, 20004 instead of 5731 uploads per ubatch)
+                common_set_env("LLAMA_MOE_LAYER_MAJOR_RESERVED_BYTES", std::to_string(reserve));
             } else {
                 reserve = 0;
             }
