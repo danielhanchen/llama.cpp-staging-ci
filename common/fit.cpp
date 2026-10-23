@@ -986,21 +986,37 @@ static void common_params_fit_impl(
                 // per group instead of once per ubatch (G4 4 GB q3m: 76 MiB free with a 99 MiB cache, every group of 2+ ubatches split)
                 const char * e_sc = getenv("LLAMA_FIT_SMALL_CACHE_MIB");
                 const int64_t cap_mib = e_sc != nullptr ? std::max<int64_t>(0, atoll(e_sc)) : 48;
+                // a second, smaller margin when the first one leaves no cache (LLAMA_FIT_SMALL_MARGIN_MIN_MIB, 128; G4 4 GB Qwen3.6
+                // UD-Q4_K_XL + MTP: at 256 MiB the dense layers, the context and a 48 MiB cache miss by 120 MiB)
+                const char * e_sm2 = getenv("LLAMA_FIT_SMALL_MARGIN_MIN_MIB");
+                const int64_t small_min_mib = std::min<int64_t>(small_mib, e_sm2 != nullptr ? std::max<int64_t>(0, atoll(e_sm2)) : 128);
                 if (g_moe_margin_auto && small_mib > 0 && small_mib*MiB < m_default && margins[0] >= m_default) {
                     const int64_t margin_saved = margins[0];
                     const dmds_t  dmds_nc_saved = dmds_cpu_moe;
-                    margins[0] = margin_saved - m_default + small_mib*MiB; // what was added to the default (a projector) stays
-                    dmds_cpu_moe = dmds_cpu_moe_req;
-                    cparams->moe_cache_size = size_before;
+                    size_t cache_req = size_before;
+                    dmds_t dmds_req  = dmds_cpu_moe_req;
                     if (cap_mib > 0 && size_t(cap_mib)*MiB < size_before) {
                         // measured at the cap: the cache then keeps that size if it fits, else the sizing below shrinks it
-                        cparams->moe_cache_size = size_t(cap_mib)*MiB;
-                        dmds_cpu_moe = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
-                        add_extra_memory(dmds_cpu_moe);
+                        cache_req = size_t(cap_mib)*MiB;
+                        cparams->moe_cache_size = cache_req;
+                        dmds_req = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                        add_extra_memory(dmds_req);
                     }
-                    fit_moe_cache_size(dmds_cpu_moe, mparams, true);
-                    const bool ok = cparams->moe_cache_size > 0 && cparams->moe_cache_size != size_before &&
-                        int64_t(dmds_cpu_moe[0].free) - int64_t(dmds_cpu_moe[0].mb.total()) >= margins[0];
+                    bool ok = false;
+                    for (const int64_t m_mib : { small_mib, small_min_mib }) {
+                        if (ok || m_mib <= 0) {
+                            continue;
+                        }
+                        margins[0] = margin_saved - m_default + m_mib*MiB; // what was added to the default (a projector) stays
+                        dmds_cpu_moe = dmds_req;
+                        cparams->moe_cache_size = cache_req;
+                        fit_moe_cache_size(dmds_cpu_moe, mparams, true);
+                        ok = cparams->moe_cache_size > 0 && cparams->moe_cache_size != size_before &&
+                            int64_t(dmds_cpu_moe[0].free) - int64_t(dmds_cpu_moe[0].mb.total()) >= margins[0];
+                        if (small_min_mib == small_mib) {
+                            break;
+                        }
+                    }
                     if (ok) {
                         LOG_INF("%s: small device: every layer stays in device memory beside a MoE cache of %zu MiB, the fit margin drops from "
                             "%" PRId64 " to %" PRId64 " MiB (otherwise layers move to the CPU; LLAMA_FIT_SMALL_MARGIN_MIB=0 keeps that)\n",
