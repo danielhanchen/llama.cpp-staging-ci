@@ -4331,6 +4331,11 @@ struct llama_moe_cache::impl {
 
     // per batch size: on where the expected time saved per layer beats the cost of the host split
     void cm_decide() {
+        // k13: frozen small batches keep every per-size decision as it was at the freeze (a decision from the miss rate of a window
+        // would follow the drafts: their verify windows look up other tokens than single token decodes)
+        if (cm_frozen) {
+            return;
+        }
         const group * gp = nullptr;
         for (const group & g : groups) {
             if (g.dev_lookup && g.n_slots > 0 && g.counts != nullptr) {
