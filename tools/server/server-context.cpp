@@ -1547,7 +1547,7 @@ private:
             if (params_base.speculative.ngram_suffix.auto_mode && server_spec_auto_exact()) {
                 // k13: a MoE cache with CPU misses verifies exactly once its small batches are frozen
                 if (!llama_verify_exact_placement(ctx_tgt) && moe_frozen_env != 0 && server_spec_exact_frozen() && llama_moe_freeze_small(ctx_tgt)) {
-                    SRV_INF("%s", "MoE cache: small batches frozen so the default n-gram drafts verify exactly (LLAMA_SPEC_EXACT_FROZEN=1, "
+                    SRV_INF("%s", "MoE cache: small batches frozen for the default n-gram drafts (experiment, not byte-exact yet; LLAMA_SPEC_EXACT_FROZEN=1, "
                         "LLAMA_MOE_CPU_MISS_FROZEN=0: off)\n");
                 }
                 if (llama_verify_exact_placement(ctx_tgt)) {

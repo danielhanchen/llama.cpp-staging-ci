@@ -72,7 +72,7 @@ static bool server_spec_auto_exact() {
 }
 
 // k13: the default drafts freeze the small batches of a MoE cache with CPU misses so that they verify exactly (llama_moe_freeze_small);
-// opt-in (LLAMA_SPEC_EXACT_FROZEN=1) until the host path of a verify window is shown to give the bytes of single token decodes
+// opt-in experiment (LLAMA_SPEC_EXACT_FROZEN=1): NOT byte-exact yet, the drafted text differs from plain decoding (plans/k13_lfm.md)
 static bool server_spec_exact_frozen() {
     const char * e = getenv("LLAMA_SPEC_EXACT_FROZEN");
     return e != nullptr && atoi(e) != 0;

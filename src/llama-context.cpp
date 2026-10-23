@@ -7503,8 +7503,9 @@ bool llama_verify_exact_placement(const llama_context * ctx) {
             const char * e = getenv("LLAMA_SPEC_EXACT_CACHE");
             return e == nullptr || atoi(e) != 0;
         }();
-        // a frozen host split (the host computes the misses of small batches) only with LLAMA_SPEC_EXACT_FROZEN=1: its verify windows do
-        // not give the bytes of single token decodes yet (local B200, LFM2.5, fetch share 0: chat / 2k / 8k differ, rep equal)
+        // frozen small batches (the host computes the misses of small batches) only with LLAMA_SPEC_EXACT_FROZEN=1, an experiment: their
+        // verify windows do NOT give the bytes of single token decodes yet (k13, local B200, LFM2.5 5.5 GB cache: chat / rep / 2k / 8k
+        // differ even with the frozen assign, so some cache state still follows the ubatches; see plans/k13_lfm.md)
         static const bool frozen_ok = [] {
             const char * e = getenv("LLAMA_SPEC_EXACT_FROZEN");
             return e != nullptr && atoi(e) != 0;
