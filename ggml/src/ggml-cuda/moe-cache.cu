@@ -842,7 +842,9 @@ static __global__ void moe_mailbox_merge(const float * d, const int32_t * hid, c
     const float * dr = d + (int64_t) row*n_embd;
     float * o = dst + (int64_t) row*n_embd;
     for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
-        o[i] = st == 2 ? NAN : st == 1 ? dr[i] + __ldcv(h + i) : dr[i];
+        // a merge that gave up keeps the device rows only: finite values, since the ubatch is taken back or failed anyway (see
+        // single_check) and NaN rows would stay in the KV cells it wrote, which masked attention of later requests still reads
+        o[i] = st == 1 ? dr[i] + __ldcv(h + i) : dr[i];
     }
 }
 #endif

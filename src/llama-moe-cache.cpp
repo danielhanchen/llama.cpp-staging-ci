@@ -1798,7 +1798,7 @@ struct llama_moe_cache::impl {
     // and activations of each layer to a mailbox in mapped host memory (ggml_moe_mailbox_publish) instead of a graph split; a host
     // thread (single_service) computes those experts with the ops of the split path (mul_mat_id up / gate, swiglu, mul_mat_id down), on
     // a CPU backend of single_threads threads, so the results are the ones of the split; the merge waits for it on the device. A merge
-    // that waits longer than LLAMA_MOE_SINGLE_TIMEOUT_MS (1000) writes NaN and flags the mailbox: the next ubatches take the split again.
+    // with a LLAMA_MOE_SINGLE_TIMEOUT_MS (debug, default none) gives up, keeps the device rows and flags the mailbox: see single_check.
     struct single_plan {
         ggml_context_ptr ctx;
         ggml_cgraph    * gf     = nullptr;
@@ -2124,7 +2124,7 @@ struct llama_moe_cache::impl {
         }
     }
 
-    // after a graph of up to GGML_MOE_MAILBOX_MAX_TOKENS tokens: true if a merge of it gave up (its rows are NaN), the caller then fails
+    // after a graph of up to GGML_MOE_MAILBOX_MAX_TOKENS tokens: true if a merge of it gave up (its host rows are missing), the caller then fails
     // the ubatch so it is never committed; the split path from then on. Waits for the device only when this cache has mailboxes
     bool single_check() {
         // without a timeout a merge only gives up when the host thread failed a graph (error 2, flagged here first)
@@ -3846,7 +3846,9 @@ struct llama_moe_cache::impl {
             // the decisions of every batch size are in the graph: a new decision rebuilds the graphs
             return 3 + (ov_live ? 4 : 0) + 8*(int) (cm_gen & 0xfffff);
         }
-        return (!hybrid ? 0 : hybrid_active() ? 2 : 1) + (ov_live ? 4 : 0);
+        // a single-graph failure (single_off) rebuilds the graphs without their mailboxes: a reused graph would keep merging from a
+        // mailbox whose control block says failed (wrong rows in every later ubatch with a pinned fetch share, LLAMA_MOE_CACHE_FETCH)
+        return (!hybrid ? 0 : hybrid_active() ? 2 : 1) + (ov_live ? 4 : 0) + (single_off ? 8 : 0);
     }
 
     // auto trial, called before the graph of every ubatch while a trial runs or waits, after the previous ubatch finished
