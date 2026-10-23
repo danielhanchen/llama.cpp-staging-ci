@@ -15,6 +15,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "ggml-moe-mailbox.h"
 #include "llama-sysmem.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
@@ -2302,8 +2303,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     compute_n_tokens = ubatch.n_tokens;
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     compute_n_tokens = 0;
+    // k11 single-graph host misses: a merge that gave up wrote NaN rows, the ubatch fails (its positions are removed by the caller)
+    // instead of being committed, and the next graphs take the split path
+    if (moe_cache && status == GGML_STATUS_SUCCESS && ubatch.n_tokens <= GGML_MOE_MAILBOX_MAX_TOKENS && moe_cache->single_check()) {
+        status = GGML_STATUS_FAILED;
+    }
     // CPU misses trial: the ubatch is timed to its end, without the work of other contexts
     if (moe_cache && status == GGML_STATUS_SUCCESS && moe_cache->hybrid_tick_timed()) {
         ggml_backend_sched_synchronize(sched.get());
