@@ -7503,7 +7503,13 @@ bool llama_verify_exact_placement(const llama_context * ctx) {
             const char * e = getenv("LLAMA_SPEC_EXACT_CACHE");
             return e == nullptr || atoi(e) != 0;
         }();
-        if (!env_ok || !(ctx->get_moe_cache()->host_never() || ctx->get_moe_cache()->host_split_frozen())) {
+        // a frozen host split (the host computes the misses of small batches) only with LLAMA_SPEC_EXACT_FROZEN=1: its verify windows do
+        // not give the bytes of single token decodes yet (local B200, LFM2.5, fetch share 0: chat / 2k / 8k differ, rep equal)
+        static const bool frozen_ok = [] {
+            const char * e = getenv("LLAMA_SPEC_EXACT_FROZEN");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (!env_ok || !(ctx->get_moe_cache()->host_never() || (frozen_ok && ctx->get_moe_cache()->host_split_frozen()))) {
             return false;
         }
         cache_ok = true;
