@@ -893,6 +893,9 @@ struct llama_moe_cache::impl {
         if (devices.empty()) {
             throw std::runtime_error("MoE cache requires a GPU backend");
         }
+        if (single_auto && devices.size() != 1) {
+            single_req = false; // the default single-graph host misses: one GPU only (multi-GPU is untested)
+        }
         if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
             throw std::runtime_error("MoE cache does not support tensor parallelism");
         }
@@ -1805,9 +1808,17 @@ struct llama_moe_cache::impl {
         uint32_t done = 0;
         single_plan plans[GGML_MOE_MAILBOX_MAX_TOKENS + 1];
     };
-    const bool single_req = [] {
+    // LLAMA_MOE_SINGLE unset: on where it was tested (k11 round 16): CUDA (the backend has mapped mailboxes: not HIP / MUSA), one GPU
+    // in the context, not Windows, and only the expert form the host plans compute (separate gate / up, SiLU: see build_moe_ffn);
+    // everything else keeps the split. LLAMA_MOE_SINGLE=0 off, =1 forces the request on any device with mailboxes
+    const bool single_auto = getenv("LLAMA_MOE_SINGLE") == nullptr;
+    bool single_req = [] {
         const char * e = getenv("LLAMA_MOE_SINGLE");
+#if defined(_WIN32)
         return e != nullptr && atoi(e) != 0;
+#else
+        return e == nullptr || atoi(e) != 0;
+#endif
     }();
     const int single_timeout_ms = [] {
         const char * e = getenv("LLAMA_MOE_SINGLE_TIMEOUT_MS");
@@ -1911,8 +1922,10 @@ struct llama_moe_cache::impl {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend(il));
         ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
         auto alloc = reg != nullptr ? (ggml_backend_moe_mailbox_alloc_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_mailbox_alloc") : nullptr;
-        if (alloc == nullptr) {
-            LLAMA_LOG_WARN("llama_moe_cache%s: LLAMA_MOE_SINGLE: the device backend has no mapped mailboxes, the split path stays\n", tag);
+        if (alloc == nullptr || (single_auto && strcmp(ggml_backend_reg_name(reg), "CUDA") != 0)) {
+            if (!single_auto) {
+                LLAMA_LOG_WARN("llama_moe_cache%s: LLAMA_MOE_SINGLE: the device backend has no mapped mailboxes, the split path stays\n", tag);
+            }
             single_off = true;
             return nullptr;
         }
