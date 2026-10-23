@@ -76,6 +76,8 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <array>
 #include <atomic>
 #include <charconv>
@@ -2989,6 +2991,26 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
     cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &errorNode, &result_info);
 #endif // CUDART_VERSION >= 12000
 
+    // k11: GGML_CUDA_GRAPH_UPDATE_FAULT=N (debug) makes every Nth update fail as if the device were out of memory
+    static const int update_fault = getenv("GGML_CUDA_GRAPH_UPDATE_FAULT") ? atoi(getenv("GGML_CUDA_GRAPH_UPDATE_FAULT")) : 0;
+    static int64_t n_update = 0;
+    if (update_fault > 0 && stat == cudaSuccess && ++n_update % update_fault == 0) {
+        stat = cudaErrorMemoryAllocation;
+    }
+
+    // k11 (GGML_CUDA_GRAPH_UPDATE_RETRY=0 restores the assert): an update can also fail with another error than an update failure, e.g.
+    // out of memory on a card other processes filled (seen on shared B200s with master, k10 and k11 builds alike). Such an error is not
+    // sticky: it is cleared and the graph is instantiated again, as for an update failure. A sticky error (an earlier kernel fault)
+    // fails the instantiation below with its own message
+    static const bool update_retry = getenv("GGML_CUDA_GRAPH_UPDATE_RETRY") == nullptr || atoi(getenv("GGML_CUDA_GRAPH_UPDATE_RETRY")) != 0;
+    if (stat != cudaSuccess && stat != cudaErrorGraphExecUpdateFailure && update_retry) {
+        static int n_logged = 0;
+        if (n_logged++ < 4) {
+            GGML_LOG_WARN("%s: CUDA graph update failed with %s (%d): instantiating the graph again\n", __func__, cudaGetErrorString(stat), (int) stat);
+        }
+        stat = cudaErrorGraphExecUpdateFailure;
+    }
+
     if (stat == cudaErrorGraphExecUpdateFailure) {
         if (ggml_cuda_graph_debug_enabled()) {
             GGML_LOG_DEBUG("%s: CUDA graph update failed\n", __func__);
@@ -2999,8 +3021,18 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
-        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        cudaError_t inst = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+        // k11: out of memory may pass once other processes free some; a few tries before the error is fatal
+        for (int k = 0; k < 20 && inst == cudaErrorMemoryAllocation && update_retry; ++k) {
+            (void)cudaGetLastError();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            inst = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+        }
+        CUDA_CHECK(inst);
     } else {
+        if (stat != cudaSuccess) {
+            GGML_LOG_ERROR("%s: CUDA graph update failed with %s (%d)\n", __func__, cudaGetErrorString(stat), (int) stat);
+        }
         GGML_ASSERT(stat == cudaSuccess);
     }
 }
