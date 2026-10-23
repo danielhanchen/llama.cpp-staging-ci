@@ -21,24 +21,26 @@
 #include <algorithm>
 #include <string>
 
-// k13: default spill drafting modes per model and host path (see server_spec_spill_mode), from the KLD gate of plans/k11.md and the G4
-// timing of plans/k13_lfm.md section 10:
-//   - LFM2.5 with the hybrid gate (small caches, G4 4 GB): mode 1, repeats of at least 12 tokens (chat inside its spread, 2k +50%);
-//   - LFM2.5 with the CPU-miss rule (G4 8 GB): mode 3 (chat +28%, 2k +45%, 8k +42%);
-//   - gemma-4: off (mode 1 loses chat by 1% on G4 8 GB, LLAMA_SPEC_SPILL=1 for its 2k +30% / 8k +43%).
+// k13: default spill drafting modes per model and host path (see server_spec_spill_mode), gated by the KLD gate of plans/k11.md and the
+// G4 timing of plans/k13_lfm.md section 10 (both must pass):
+//   - LFM2.5 with the hybrid gate (small caches, G4 4 GB): mode 1 from repeats of at least 16 tokens (chat = kill switch, 2k +35%,
+//     8k +5%; decode KLD inside the -fa off band, first token unchanged);
+//   - LFM2.5 with the CPU-miss rule (G4 8 GB): off. Mode 3 (chat +28%, 2k +45%, 8k +39%) fails the first-token top-1 (0.875 vs 0.938),
+//     mode 3 from repeats of 12+ its first-token p99 (0.242 vs 0.233): LLAMA_SPEC_SPILL=3 opts in;
+//   - gemma-4: off (mode 1 loses chat by 1-1.7% on G4 8 GB; LLAMA_SPEC_SPILL=1 opts in).
 #ifndef SPEC_SPILL_LFM_GATE
 #define SPEC_SPILL_LFM_GATE   1
-#define SPEC_SPILL_LFM_CM     3
+#define SPEC_SPILL_LFM_CM     0
 #define SPEC_SPILL_GEMMA4_GATE 0
 #define SPEC_SPILL_GEMMA4_CM  0
 #endif
 #ifndef SPEC_SPILL_MIN_MATCH_GATE
-#define SPEC_SPILL_MIN_MATCH_GATE 12
+#define SPEC_SPILL_MIN_MATCH_GATE 16
 #define SPEC_SPILL_MIN_MATCH_CM   3
 #endif
 
 // k13: the shortest repeat the default spill drafts take (LLAMA_SPEC_SPILL_MIN_MATCH; 3 = every match of the index). host_mode 1 (the
-// hybrid gate) verifies a window with the fixed host share of every row, so short repeats lose there (G4 LFM2.5 4 GB chat -2%)
+// hybrid gate) verifies a window with the fixed host share of every row, so short repeats lose there (G4 LFM2.5 4 GB chat: -2% from 3, -0.5..-0.9% from 12, = kill switch from 16)
 static int server_spec_spill_min_match(int32_t host_mode) {
     const char * e = getenv("LLAMA_SPEC_SPILL_MIN_MATCH");
     return std::max(3, e != nullptr ? atoi(e) : host_mode == 1 ? SPEC_SPILL_MIN_MATCH_GATE : SPEC_SPILL_MIN_MATCH_CM);
