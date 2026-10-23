@@ -4089,9 +4089,20 @@ static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, st
     for (const struct ggml_tensor * t = input; t != NULL && ov; t = t->view_src) {
         ov = (t->flags & GGML_TENSOR_FLAG_INPUT) == 0;
     }
-    if (!ov && ov_ok && input_relaxed && input->view_src == NULL && input->op == GGML_OP_NONE && (input->flags & GGML_TENSOR_FLAG_INPUT)) {
+    // a graph input, or a view of one (e.g. the recurrent-state copy indices rs_s_copy): the copy reads the caller's host data
+    const struct ggml_tensor * in_root = ggml_backend_sched_ov_root(input);
+    if (!ov && ov_ok && input_relaxed && in_root->op == GGML_OP_NONE && (in_root->flags & GGML_TENSOR_FLAG_INPUT) &&
+            in_root->buffer == input->buffer) {
         ov = true;
         sched->n_input_relaxed++;
+    }
+    // GGML_SCHED_INPUT_RELAXED_LOG=N: the first N uploads that still synchronize the device are logged (debug)
+    static const int relaxed_log = getenv("GGML_SCHED_INPUT_RELAXED_LOG") ? atoi(getenv("GGML_SCHED_INPUT_RELAXED_LOG")) : 0;
+    static int n_logged = 0;
+    if (!ov && relaxed_log && n_logged < relaxed_log) {
+        n_logged++;
+        GGML_LOG_INFO("%s: synchronized upload of %s (op %s, view %d, flags %d, usage %d, ov_active %d, ov_ok %d)\n", __func__, input->name,
+            ggml_op_name(input->op), input->view_src != NULL, input->flags, (int) ggml_backend_buffer_get_usage(input->buffer), sched->ov_active, ov_ok);
     }
 
     if (!synced && !ov) {
