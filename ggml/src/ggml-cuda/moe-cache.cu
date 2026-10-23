@@ -822,7 +822,7 @@ static __global__ void moe_mailbox_merge(const float * d, const int32_t * hid, c
                     }
                     if (moe_mailbox_load_acquire(&hdr->started) == seq || moe_mailbox_load_acquire(&hdr->busy) != 0) {
                         t0 = moe_mailbox_ns();
-                    } else if (moe_mailbox_ns() - t0 > timeout_ns) {
+                    } else if (timeout_ns != 0 && moe_mailbox_ns() - t0 > timeout_ns) {
                         moe_mailbox_store_release(&hdr->error, 1);
                         ctl->failed = 1;
                         s = 2;
@@ -871,7 +871,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
             const int n_embd = (int) d->ne[0];
             const int n_rows = (int) (ggml_nelements(d)/n_embd);
             GGML_ASSERT(ggml_is_contiguous(d) && ggml_is_contiguous(dst) && n_rows == (int) ggml_nelements(hid));
-            const uint64_t timeout_ns = (uint64_t) std::max(1, ggml_get_op_params_i32(dst, 6))*1000000ull;
+            const uint64_t timeout_ns = (uint64_t) std::max(0, ggml_get_op_params_i32(dst, 6))*1000000ull; // 0: no timeout
             moe_mailbox_merge<<<n_rows, 256, 0, ctx.stream()>>>((const float *) d->data, (const int32_t *) hid->data, n_embd,
                 (const char *) mbox, (int) d->ne[1], (ggml_moe_mailbox_ctl *) ctl, (float *) dst->data, timeout_ns);
         }

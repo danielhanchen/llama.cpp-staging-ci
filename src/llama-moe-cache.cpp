@@ -1830,9 +1830,14 @@ struct llama_moe_cache::impl {
         return e == nullptr || atoi(e) != 0;
 #endif
     }();
+    // LLAMA_MOE_SINGLE_TIMEOUT_MS (default 0: none): the merges wait for the host thread as long as it computes, like the split path
+    // waits for its host graph, so the result is always the split's (k12 report: a 1000 ms timeout on a host at load 500-1100 wrote NaN
+    // rows into the ubatch it gave up on). A timeout > 0 (debug) applies only while the host thread neither computes the batch nor
+    // another one; a ubatch whose merge gave up is checked after its graph (a device sync per small ubatch, see single_check), taken
+    // back and computed again on the split path, or failed if the memory module cannot take it back; it is never committed
     const int single_timeout_ms = [] {
         const char * e = getenv("LLAMA_MOE_SINGLE_TIMEOUT_MS");
-        return e != nullptr ? std::max(1, atoi(e)) : 10000;
+        return e != nullptr ? std::max(0, atoi(e)) : 0;
     }();
     // the split the rule weighs for these batches: a publish and a merge instead of a graph split (LLAMA_MOE_SINGLE_SPLIT_FRAC), only
     // once this cache has a mailbox (a form the host thread computes: G4 gpt-oss-20b Q2_K, with biases, kept the split and lost 18-20%
@@ -1941,7 +1946,7 @@ struct llama_moe_cache::impl {
             h.thr = std::thread(single_service);
         }
         LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses on (LLAMA_MOE_SINGLE): batches of up to %d tokens, %d host threads "
-            "(one host thread for every cache of the process), timeout %d ms\n", tag, GGML_MOE_MAILBOX_MAX_TOKENS, h.threads,
+            "(one host thread for every cache of the process), merge timeout %d ms (0: none)\n", tag, GGML_MOE_MAILBOX_MAX_TOKENS, h.threads,
             single_timeout_ms);
         return true;
     }
@@ -2122,7 +2127,8 @@ struct llama_moe_cache::impl {
     // after a graph of up to GGML_MOE_MAILBOX_MAX_TOKENS tokens: true if a merge of it gave up (its rows are NaN), the caller then fails
     // the ubatch so it is never committed; the split path from then on. Waits for the device only when this cache has mailboxes
     bool single_check() {
-        if (!single_reg || single_off || mboxes.empty()) {
+        // without a timeout a merge only gives up when the host thread failed a graph (error 2, flagged here first)
+        if (!single_reg || single_off || mboxes.empty() || (single_timeout_ms == 0 && !single_failed.load(std::memory_order_acquire))) {
             return false;
         }
         for (const device & d : devices) {
