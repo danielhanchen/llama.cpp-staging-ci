@@ -3490,8 +3490,10 @@ struct llama_moe_cache::impl {
         cmw_on        = false;
         cm_small_ok   = true;
         cm_small_live = true;
-        for (int64_t n = 1; n <= std::min<int64_t>({ cm_frozen_max, max_batch, cm_max }); ++n) {
-            cm_on[n] = 1;
+        for (int64_t n = 1; n <= cm_max; ++n) {
+            // batches above the frozen sizes (short prompts) keep the plain cache: their calibrated host path is timing-driven, and
+            // a frozen cache gives the same text in every run
+            cm_on[n] = n <= std::min<int64_t>({ cm_frozen_max, max_batch }) ? 1 : 0;
         }
         cm_gen++;
         LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: small batches of up to %d tokens frozen: nothing fetched, the host computes every miss, "
