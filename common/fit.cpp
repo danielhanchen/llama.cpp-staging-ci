@@ -1075,6 +1075,16 @@ static void common_params_fit_impl(
                 mparams->tensor_buft_overrides = tensor_buft_overrides;
             }
             if (keep) {
+                // k13-small: the same placement reached under an explicit --fit-target (Studio sends one, at least 512 MiB) is a small
+                // device too when it leaves less than the default 1024 MiB free beside a cache of at most 256 MiB: the run-time rules keyed
+                // on common_fit_small_device (no n_ubatch growth, the checkpoint merge) then apply there as well. The margin itself is the
+                // caller's and is not touched.
+                if (!g_small_device && nd == 1 && cparams->moe_cache_size <= size_t(256)*MiB &&
+                        int64_t(dmds_cpu_moe[0].free) - int64_t(dmds_cpu_moe[0].mb.total()) < 1024*MiB) {
+                    g_small_device = true;
+                    LOG_INF("%s: small device: every layer stays in device memory beside a MoE cache of %zu MiB within the margin of %" PRId64 " MiB\n",
+                        __func__, cparams->moe_cache_size/MiB, margins[0]/MiB);
+                }
                 // every layer in device memory with all experts in system memory and the cache: the placement of --cpu-moe
                 LOG_TRC("%s: all layers in device memory, MoE tensors in system memory, MoE cache of %zu MiB\n",
                     __func__, cparams->moe_cache_size/MiB);
