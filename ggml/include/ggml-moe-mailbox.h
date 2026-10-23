@@ -20,6 +20,8 @@ struct ggml_moe_mailbox_hdr {
     uint32_t completed; uint32_t pad1[31]; // host -> device: sequence of the last computed batch
     uint32_t error;     uint32_t pad2[31]; // 1: the device gave up waiting, 2: the host failed
     int32_t  n_tokens;  int32_t  pad3[31]; // tokens of the published batch
+    uint32_t started;   uint32_t pad4[31]; // host -> device: sequence of the batch the host computes now (picked up)
+    uint32_t busy;      uint32_t pad5[31]; // host -> device: nonzero while the host thread computes a batch of any mailbox
 };
 
 // device memory of a mailbox (zeroed at allocation)
