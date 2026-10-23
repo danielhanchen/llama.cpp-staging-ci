@@ -981,13 +981,14 @@ static void common_params_fit_impl(
                 const char * e_sm = getenv("LLAMA_FIT_SMALL_MARGIN_MIB");
                 const int64_t small_mib = e_sm != nullptr ? std::max<int64_t>(0, atoll(e_sm)) : 256;
                 constexpr int64_t m_default = 1024*MiB;
-                // the cache of a small device that holds only a few experts anyway is capped (LLAMA_FIT_SMALL_CACHE_MIB, 48; 0 = no cap)
+                // opt-in: the cache of a small device that holds only a few experts anyway is capped (LLAMA_FIT_SMALL_CACHE_MIB=48)
                 // where the uncapped fit gives it at most LLAMA_FIT_SMALL_CACHE_CAP_BELOW_MIB (256): what it does not take stays free for
                 // the layer-major prompt groups, which read each host expert once per group instead of once per ubatch. G4 4 GB q3m + MTP
                 // (111 MiB uncapped, 76 MiB free, every group of 2+ ubatches split): prompt 2k 1885 -> 4712, 8k 1937 -> 4103 tok/s,
-                // decode -9 / -2 / -5% (chat / 2k / 8k, the smaller cache); gpt-oss-20b 4 GB (476 MiB) lost 4-10% decode capped: not capped
+                // decode -9 / -2 / -5% (chat / 2k / 8k, the smaller cache); gpt-oss-20b 4 GB (476 MiB) lost 4-10% decode capped: not capped.
+                // Off by default: the server KLD run (k13kld3, 8k prompts) ran out of device memory in a merged prompt group at the cap
                 const char * e_sc = getenv("LLAMA_FIT_SMALL_CACHE_MIB");
-                const int64_t cap_mib = e_sc != nullptr ? std::max<int64_t>(0, atoll(e_sc)) : 48;
+                const int64_t cap_mib = e_sc != nullptr ? std::max<int64_t>(0, atoll(e_sc)) : 0; // opt-in (LLAMA_FIT_SMALL_CACHE_MIB=48): see below
                 const char * e_cb = getenv("LLAMA_FIT_SMALL_CACHE_CAP_BELOW_MIB");
                 const int64_t cap_below_mib = e_cb != nullptr ? std::max<int64_t>(0, atoll(e_cb)) : 256;
                 // opt-in second, smaller margin when the first one leaves no cache (LLAMA_FIT_SMALL_MARGIN_MIN_MIB=N): G4 4 GB Qwen3.6

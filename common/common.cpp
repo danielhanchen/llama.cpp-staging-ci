@@ -1513,6 +1513,13 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
     if (force == 0) {
         return;
     }
+    // k13-small: no larger n_ubatch beside the small-device placement (common_fit_small_device): its 256 MiB margin has no room for the
+    // run-time buffers of a larger ubatch. G4 4 GB q3m without a draft: "every expert cached" took n_ubatch 2048 (compute 804 MiB) and the
+    // first 2k prompt ran out of device memory (CUDA error). LLAMA_MOE_PREFILL_UB=N still forces N
+    if (force < 0 && common_fit_small_device()) {
+        COM_INF("MoE cache: small device: n_ubatch stays %u (LLAMA_MOE_PREFILL_UB=N forces N)\n", cparams.n_ubatch);
+        return;
+    }
     if (!common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
         return;
     }
