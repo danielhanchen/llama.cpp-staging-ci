@@ -1518,6 +1518,20 @@ private:
             spec_init.reset();
         }
 
+        // k13: default drafts where the host computes experts (server_spec_spill_mode) draft only from repeats of at least
+        // server_spec_spill_min_match tokens (short repeats cost a verify window of host experts for little)
+        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO && params_base.speculative.ngram_suffix.auto_mode && server_spec_auto_exact() &&
+                !llama_verify_exact_placement(ctx_tgt) &&
+                server_spec_spill_mode(server_spec_auto_arch(params_base.model.path), llama_moe_host_mode(ctx_tgt)) > 0) {
+            auto & ns = params_base.speculative.ngram_suffix;
+            const int mm = server_spec_spill_min_match();
+            if (mm > ns.n_min_match) {
+                SRV_INF("n-gram drafting under the MoE cache: drafts from repeats of at least %d tokens (LLAMA_SPEC_SPILL_MIN_MATCH)\n", mm);
+                ns.n_min_match = mm;
+                ns.n_min_draft = std::max(ns.n_min_draft, mm);
+            }
+        }
+
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
@@ -1561,7 +1575,12 @@ private:
                     llama_set_verify_exact(ctx_tgt, true);
                     SRV_INF("%s", "n-gram drafting by default under the MoE cache: small batches frozen, drafts verified exactly against them "
                         "(KLD-gated default, LLAMA_SPEC_SPILL=0: off)\n");
-                } else if (spill == 1) {
+                } else if (spill == 3 && llama_moe_pin_small(ctx_tgt)) {
+                    // k13: small batches always take the host path (no timing trials), fetch share and admissions kept; drafts verified
+                    // as ordinary batches: other greedy text, KLD-gated per model
+                    SRV_INF("%s", "n-gram drafting by default under the MoE cache: small-batch host path pinned on, drafts verified as ordinary "
+                        "batches (KLD-gated default, LLAMA_SPEC_SPILL=0: off)\n");
+                } else if (spill == 1 || spill == 3) {
                     // k13: drafts verified as ordinary batches with the host path: other greedy text, KLD-gated per model
                     SRV_INF("%s", "n-gram drafting by default under the MoE cache: drafts verified as ordinary batches with the host path "
                         "(KLD-gated default, LLAMA_SPEC_SPILL=0: off)\n");

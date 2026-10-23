@@ -87,6 +87,9 @@ public:
     bool host_split_frozen() const;
     // k13: CPU misses: small batches (up to 8 tokens) fetch nothing and the host computes every miss, without trials; true if frozen
     bool freeze_small();
+    // k13: CPU misses: small batches (up to 8 tokens) take the host path without trials or miss-rate windows, but still fetch their
+    // share and admit (the cache follows the decode; not exact under drafts); true if pinned
+    bool pin_small();
     // k13: who computes the missing experts of small batches: 0 = never the host (every miss fetched), 1 = the hybrid path with a fixed
     // share (the default gate of small caches, or LLAMA_MOE_CACHE_FETCH), 2 = the CPU-miss rule
     int host_mode() const;

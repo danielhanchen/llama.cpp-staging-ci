@@ -129,6 +129,10 @@ LLAMA_API void llama_set_verify_exact(struct llama_context * ctx, bool value);
 // Returns true if frozen (false without such a cache or before its calibration)
 LLAMA_API bool llama_moe_freeze_small(struct llama_context * ctx);
 
+// k13: like llama_moe_freeze_small for the decisions only: small batches always take the host path for their misses (no timing trials,
+// no miss-rate windows), but still fetch their share and admit, so the cache follows the decode. Not exact under drafts. True if pinned
+LLAMA_API bool llama_moe_pin_small(struct llama_context * ctx);
+
 // k13: 0 = no MoE cache or its host never computes an expert, 1 = hybrid path with a fixed share (small caches), 2 = CPU-miss rule
 LLAMA_API int32_t llama_moe_host_mode(const struct llama_context * ctx);
 

@@ -7473,6 +7473,14 @@ bool llama_moe_freeze_small(llama_context * ctx) {
     return ctx != nullptr && ctx->moe_freeze_small();
 }
 
+bool llama_context::moe_pin_small() {
+    return moe_cache != nullptr && moe_cache->pin_small();
+}
+
+bool llama_moe_pin_small(llama_context * ctx) {
+    return ctx != nullptr && ctx->moe_pin_small();
+}
+
 int32_t llama_moe_host_mode(const llama_context * ctx) {
     return ctx != nullptr && ctx->get_moe_cache() != nullptr ? ctx->get_moe_cache()->host_mode() : 0;
 }

@@ -28,6 +28,15 @@
 #define SPEC_SPILL_GEMMA4_GATE 0
 #define SPEC_SPILL_GEMMA4_CM  0
 #endif
+#ifndef SPEC_SPILL_MIN_MATCH
+#define SPEC_SPILL_MIN_MATCH  3
+#endif
+
+// k13: the shortest repeat the default spill drafts take (LLAMA_SPEC_SPILL_MIN_MATCH; 3 = every match of the index)
+static int server_spec_spill_min_match() {
+    const char * e = getenv("LLAMA_SPEC_SPILL_MIN_MATCH");
+    return std::max(3, e != nullptr ? atoi(e) : SPEC_SPILL_MIN_MATCH);
+}
 
 static int server_spec_auto_env() {
     const char * e = getenv("LLAMA_SPEC_AUTO");
@@ -89,11 +98,12 @@ static bool server_spec_exact_frozen() {
 
 // k13: default n-gram drafts where a MoE cache's host computes experts (text changes, so a model gets it only after the KLD gate of
 // plans/k11.md passed for it, plans/k13_lfm.md). host_mode: llama_moe_host_mode. Returns 0 = no drafts (the k12 behaviour), 1 = drafts
-// verified as ordinary batches with the host path, 2 = frozen small batches with drafts verified exactly against them.
-// LLAMA_SPEC_SPILL=0 off, 1 / 2 force that mode for any model.
+// verified as ordinary batches with the host path, 2 = frozen small batches with drafts verified exactly against them, 3 = as 1 with the
+// small-batch host path of the CPU-miss rule pinned on (llama_moe_pin_small; 1 where the cache has no CPU-miss rule).
+// LLAMA_SPEC_SPILL=0 off, 1 / 2 / 3 force that mode for any model.
 static int server_spec_spill_mode(const std::string & arch, int32_t host_mode) {
     if (const char * e = getenv("LLAMA_SPEC_SPILL")) {
-        return std::max(0, std::min(2, atoi(e)));
+        return std::max(0, std::min(3, atoi(e)));
     }
     if (host_mode == 0) {
         return 0;

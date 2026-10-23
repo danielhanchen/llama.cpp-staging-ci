@@ -3529,12 +3529,13 @@ struct llama_moe_cache::impl {
     }
 
     // k13: see cm_frozen; only once calibrated (the warm-up decode calibrates), returns false otherwise or without CPU misses
-    bool cm_freeze() {
+    // keep_fetch (cm_frozen_fetch, llama_moe_pin_small): pin the decisions only
+    bool cm_freeze(bool keep_fetch = false) {
         if (!cm || !cm_cal || cm_frozen) {
-            return cm_frozen;
+            return cm_frozen && cm_frozen_fetch == keep_fetch;
         }
         cm_frozen     = true;
-        cm_frozen_fetch = getenv("LLAMA_MOE_CPU_MISS_FROZEN_FETCH") != nullptr && atoi(getenv("LLAMA_MOE_CPU_MISS_FROZEN_FETCH")) != 0;
+        cm_frozen_fetch = keep_fetch || (getenv("LLAMA_MOE_CPU_MISS_FROZEN_FETCH") != nullptr && atoi(getenv("LLAMA_MOE_CPU_MISS_FROZEN_FETCH")) != 0);
         cm_trial      = false;
         cmt_done      = -1;
         cmt_wait      = -1;
@@ -6239,6 +6240,10 @@ bool llama_moe_cache::host_split_frozen() const {
 
 bool llama_moe_cache::freeze_small() {
     return pimpl->cm_freeze();
+}
+
+bool llama_moe_cache::pin_small() {
+    return pimpl->cm_freeze(true);
 }
 
 int llama_moe_cache::host_mode() const {
