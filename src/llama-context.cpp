@@ -4456,9 +4456,11 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     }
 
     if (lm_released) {
-        // the slots come back with the experts the last ubatch of the group used most (its routing, read before the compute buffers are
-        // freed), LLAMA_MOE_LM_RELEASE_ROUTED=0: with those they held before
-        static const bool lm_release_routed = getenv("LLAMA_MOE_LM_RELEASE_ROUTED") == nullptr || atoi(getenv("LLAMA_MOE_LM_RELEASE_ROUTED")) != 0;
+        // the slots come back with the experts they held before; LLAMA_MOE_LM_RELEASE_ROUTED=1: with those the last ubatch of the group
+        // used most (its routing, read before the compute buffers are freed). G4 4 GB, Qwen3.6 Q3_K_M + MTP 2, 3 launches: decode 2k / 8k
+        // 136.1 / 150.0 tok/s held before, 138.0 / 146.1 routed (release off 133.6 / 149.3); long-prompt KLD against the all-device run,
+        // first token mean 0.00076 held before, 0.00134 routed (the -fa off band 0.00031, k12 0.00118)
+        static const bool lm_release_routed = getenv("LLAMA_MOE_LM_RELEASE_ROUTED") != nullptr && atoi(getenv("LLAMA_MOE_LM_RELEASE_ROUTED")) != 0;
         if (lm_release_routed && status == GGML_STATUS_SUCCESS) {
             moe_cache->set_refill_routed_once(true);
             moe_cache_ids = lm_record;
