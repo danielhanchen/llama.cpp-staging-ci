@@ -4355,12 +4355,14 @@ private:
                             // batch starts is at most N tokens (and fits one ubatch) runs in one pass, without the separate pass of its last 4
                             // tokens; its checkpoint is then made at the end of the prompt, so a next prompt that differs in those last tokens
                             // is processed again from the previous checkpoint. Other ubatch shapes, so other numerics (KLD-gated, not md5-equal)
-                            // k13-pp: on by default (N = 512) under the KLD gate (plans/k13_pp.md section 7), =0 turns it off. Only where the
-                            // checkpoint at the end costs a next prompt at most this batch again: the whole prompt is at most N tokens, or
-                            // the batch starts at the last user message (a checkpoint is made there). Without that bound a raw prompt that
-                            // keeps growing by a few tokens per turn would find no usable checkpoint and be processed again from the start.
-                            // LLAMA_SERVER_CKPT_SINGLE_ANY=1: the k11 opt-in rule (any prompt whose rest is at most N)
-                            static const int ckpt_single_max = getenv("LLAMA_SERVER_CKPT_SINGLE_MAX") ? atoi(getenv("LLAMA_SERVER_CKPT_SINGLE_MAX")) : 512;
+                            // k13-pp: only where a next prompt pays at most this batch again: the whole prompt is at most N tokens, or the
+                            // batch starts at the last user message (a checkpoint is made there). A single-pass prompt makes no checkpoint of
+                            // its own (the memory is empty before its only pass), so without that bound a raw prompt that grows by a few
+                            // tokens per turn found no usable checkpoint and ran again from the start. LLAMA_SERVER_CKPT_SINGLE_ANY=1: the
+                            // k11 rule (any prompt whose rest is at most N). Still opt-in: the KLD gate (plans/k11.md) failed on G4 for
+                            // Qwen3.6-35B-A3B Q4 (first-token p99 0.0058 vs 0.0024 for -fa off), LFM2.5 (first-token mean 0.24 vs 0.065) and
+                            // gemma-4 26B (decode top-1 98.9 vs 99.7%), plans/k13_pp.md section 7
+                            static const int ckpt_single_max = getenv("LLAMA_SERVER_CKPT_SINGLE_MAX") ? atoi(getenv("LLAMA_SERVER_CKPT_SINGLE_MAX")) : 0;
                             static const bool ckpt_single_any = getenv("LLAMA_SERVER_CKPT_SINGLE_ANY") != nullptr && atoi(getenv("LLAMA_SERVER_CKPT_SINGLE_ANY")) != 0;
                             const int n_batch_start = slot.prompt.n_tokens() - (int) (batch.size() - n_tokens_prev);
                             const int n_rest_batch = slot.task->n_tokens() - n_batch_start;
