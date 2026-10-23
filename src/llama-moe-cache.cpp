@@ -6064,6 +6064,10 @@ bool llama_moe_cache::hybrid_fixed() const {
     return pimpl->hybrid && pimpl->hybrid_fixed;
 }
 
+double llama_moe_cache::cache_frac() const {
+    return pimpl->cache_frac;
+}
+
 void llama_moe_cache::hybrid_reset() {
     pimpl->hybrid_reset();
 }
