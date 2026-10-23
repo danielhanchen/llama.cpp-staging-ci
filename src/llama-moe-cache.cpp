@@ -1909,8 +1909,16 @@ struct llama_moe_cache::impl {
             const bool alloc = reg != nullptr && ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_mailbox_alloc") != nullptr &&
                 (!single_auto || strcmp(ggml_backend_reg_name(reg), "CUDA") == 0);
             single_form_state = alloc ? 1 : -1;
+            if (single_form_state == 1) {
+                cm_skip_trials(true);
+            }
         }
     }
+    // LLAMA_MOE_SINGLE_KICK_GATE=0: kick the host thread for every small graph (k11 round 16-19 behaviour)
+    const bool single_kick_gate = [] {
+        const char * e = getenv("LLAMA_MOE_SINGLE_KICK_GATE");
+        return e == nullptr || atoi(e) != 0;
+    }();
     bool single_weigh() const {
         return single_reg || (single_weigh_early && single_form_state == 1 && single_req && !single_off && !single_no_alloc);
     }
@@ -2145,6 +2153,11 @@ struct llama_moe_cache::impl {
             return;
         }
         if (n_tokens < 1 || n_tokens > GGML_MOE_MAILBOX_MAX_TOKENS) {
+            return;
+        }
+        // no publish while the CPU-miss rule has the host path off for this batch size: the host thread sleeps instead of polling
+        // (G4 Flash-Next UD-IQ4_XS 32 GB, trials turned small batches off: 8k decode -3.5% against LLAMA_MOE_SINGLE=0 in 6 of 6 launches)
+        if (cm && single_kick_gate && cm_share_of(n_tokens) >= 1.0f) {
             return;
         }
         single_hub_t & h = single_hub();
@@ -3490,6 +3503,51 @@ struct llama_moe_cache::impl {
     // short prompts take the host path only once a trial found it faster for the small batches on this host and model (without a
     // trial: the model alone). G4 gpt-oss-20b Q2_K 8 GB and T4 Qwen3.6 UD-Q4_K_XL 8 GB without a draft: trials off, the 95-token chat
     // prompt -19% / -26% on the host path from the prior; where the trials kept it (Qwen3.6 8 GB MTP: G4 +18%, T4 +6%) it gained
+    // k11 (LLAMA_MOE_CPU_MISS_TRIAL_FRAC, default 0.20; 0 = the trials of k10 everywhere): a cache that holds less than this share of
+    // the host experts runs no warm phase and no timing trials (see cm_calibrate for the cells). Round 19
+    // (LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE, default 0.50): a cache whose host misses go through the single-graph mailbox (see
+    // single_weigh) skips them up to this share, since the trials judged the graph split the mailbox replaces. G4 8 GB / 32 GB, k10 on
+    // the same VM: no trials below 50% gave Qwen3.6 UD-Q3_K_M 8 GB (23.8%) +17% decode over the 20% rule and Flash-Next UD-IQ4_XS 32 GB
+    // (33.5%; "3 trials, small batches off") +9..+19% 2k / 8k, while gemma-4 8 GB (GELU experts: graph split, no mailbox) lost 3-12%
+    // without its trials, so it keeps them. An explicit LLAMA_MOE_CPU_MISS_TRIAL_FRAC sets both. The mailbox form is known from the
+    // first graph with the hybrid path, usually after the calibration: single_note_form calls this again (late) then, once, if no
+    // trial has completed
+    bool cm_trials_late_done = false;
+    bool cm_trials_skipped   = false;
+    bool cm_skip_trials(bool late) {
+        static const double trial_frac_env = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC");
+            return e != nullptr ? std::max(0.0, atof(e)) : -1.0;
+        }();
+        static const double trial_frac_single = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE");
+            return e != nullptr ? std::max(0.0, atof(e)) : 0.50;
+        }();
+        if (late && (cm_trials_late_done || !cm || !cm_cal || trial_frac_env >= 0.0 || cmt_n > 0 || cm_trials_skipped)) {
+            return false;
+        }
+        const bool mailbox = single_weigh() && single_usable(1);
+        const double trial_frac = trial_frac_env >= 0.0 ? trial_frac_env : (mailbox ? std::max(0.20, trial_frac_single) : 0.20);
+        const bool skip = cm_trial && !cm_force && cache_frac >= 0.0 && cache_frac < trial_frac;
+        if (late) {
+            cm_trials_late_done = true;
+        }
+        if (skip) {
+            cm_trials_skipped = true;
+            cmt_done      = -1;
+            cmt_wait      = -1;
+            cmt_t_prev    = -1;
+            cmw_on        = false;
+            cm_small_ok   = true;
+            cm_small_live = true;
+            cm_gen++;
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no timing trials at %.1f%% of the host experts cached (below %.0f%%%s%s): small "
+                "batches follow the cost model, short prompts stay on the plain cache (LLAMA_MOE_CPU_MISS_TRIAL_FRAC=0 restores the trials)\n",
+                tag, 100.0*cache_frac, 100.0*trial_frac, mailbox ? ", single-graph mailbox" : "", late ? ", from now on" : "");
+        }
+        return skip;
+    }
+
     bool cm_prompt_ok() const {
         return cmt_host_ok && (!cm_trial || (cmt_n > 0 && cm_small_ok));
     }
@@ -4094,34 +4152,7 @@ struct llama_moe_cache::impl {
         // (39% cached, the split costs more than modelled) and gpt-oss-20b Q2_K 8 GB (54%). Round 9 (G4 / L4 / T4, k10 on the same VM):
         // Qwen3.6 UD-Q4_K_XL 8 GB + MTP (16.8%) decode +5.6..+13.2% G4, +10.7..+21.0% L4; Q3_K_M 8 GB (23.8%) -1..-2% on G4, T4 UD-Q4_K_XL
         // 8 GB without a draft (22.2%) inside its spread: both stay above 0.20
-        static const double trial_frac_env = [] {
-            const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC");
-            return e != nullptr ? std::max(0.0, atof(e)) : -1.0;
-        }();
-        // k11 round 19 (LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE, default 0.50): a cache whose host misses go through the single-graph
-        // mailbox (see single_weigh) skips the trials up to this share; the trials judged the graph split, which the mailbox replaces.
-        // G4 8 GB / 32 GB, k10 on the same VM: no trials below 50% gave Qwen3.6 UD-Q3_K_M 8 GB (23.8%) +17% decode over the 20% rule and
-        // Flash-Next UD-IQ4_XS 32 GB (33.5%; "3 trials, small batches off") +9..+19% 2k / 8k, while gemma-4 8 GB (GELU experts: graph
-        // split, no mailbox) lost 3-12% without its trials, so it keeps them. An explicit LLAMA_MOE_CPU_MISS_TRIAL_FRAC sets both
-        static const double trial_frac_single = [] {
-            const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE");
-            return e != nullptr ? std::max(0.0, atof(e)) : 0.50;
-        }();
-        const double trial_frac = trial_frac_env >= 0.0 ? trial_frac_env :
-            (single_weigh() && single_usable(1) ? std::max(0.20, trial_frac_single) : 0.20);
-        const bool trial_skip = cm_trial && !cm_force && cache_frac >= 0.0 && cache_frac < trial_frac;
-        if (trial_skip) {
-            cmt_done      = -1;
-            cmt_wait      = -1;
-            cmt_t_prev    = -1;
-            cmw_on        = false;
-            cm_small_ok   = true;
-            cm_small_live = true;
-            cm_gen++;
-            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no timing trials at %.1f%% of the host experts cached (below %.0f%%): small batches "
-                "follow the cost model, short prompts stay on the plain cache (LLAMA_MOE_CPU_MISS_TRIAL_FRAC=0 restores the trials)\n",
-                tag, 100.0*cache_frac, 100.0*trial_frac);
-        }
+        const bool trial_skip = cm_skip_trials(false);
         if (cm_trial && !cm_force && !trial_skip) {
             // warm phase first (see cmw_on): small batches off, the first trial starts in cm_tick
             cmt_done      = -1;
