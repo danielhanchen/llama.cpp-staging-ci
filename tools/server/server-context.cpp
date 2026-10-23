@@ -3540,6 +3540,10 @@ private:
                 if (ctx_tgt) {
                     llama_prepare_prompt_plan(ctx_tgt);
                 }
+                // k13-fn: the draft context's MoE cache re-calibrates between requests too
+                if (ctx_dft && ctx_dft != ctx_tgt) {
+                    llama_prepare_prompt_plan(ctx_dft);
+                }
 
                 return; // skip further processing
 

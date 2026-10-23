@@ -2456,10 +2456,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // (only while n-gram drafting verifies exactly, see llama_set_verify_exact: without drafts the kept graphs bought nothing and cost
     // the next short prompt 7-8% on G4; LLAMA_GRAPH_SMALL_CACHE=2 keeps them always, =0 never)
     static const int  small_cache_mode = getenv("LLAMA_GRAPH_SMALL_CACHE") == nullptr ? 1 : atoi(getenv("LLAMA_GRAPH_SMALL_CACHE"));
-    const bool small_cache_env = small_cache_mode == 2 || (small_cache_mode == 1 && cparams.verify_exact);
+    // k13-fn: =3 also with a MoE cache (verify windows of changing size each keep their graph, so their CUDA graphs stay captured)
+    const bool small_cache_env = small_cache_mode == 2 || small_cache_mode == 3 || (small_cache_mode == 1 && cparams.verify_exact);
     // (single token decodes and speculative verify windows only: a prompt's short tail keeps the shared graph, as before; G4 LFM2.5
     // 32 GB: with the tails kept too, chat / code prompts were 3 / 9% slower)
-    const uint32_t n_small = small_cache_env && moe_cache == nullptr && !graph_reuse_disable && n_outputs > 0 &&
+    const uint32_t n_small = small_cache_env && (moe_cache == nullptr || small_cache_mode == 3) && !graph_reuse_disable && n_outputs > 0 &&
         (ubatch.n_tokens == 1 || cparams.verify) && ubatch.n_tokens <= GF_SMALL_MAX ? ubatch.n_tokens : 0;
 
     llm_graph_result * res = nullptr;
@@ -5114,6 +5115,14 @@ llm_graph_params llama_context::graph_params(
 // slower with n-gram drafting on). This restores the worst-case pp plan of sched_reserve once. The allocator only plans addresses:
 // outputs cannot change. LLAMA_PP_RERESERVE=0: off.
 bool llama_context::restore_pp_plan() {
+    // k13-fn: the slots are idle: the MoE cache's pending re-calibration of the CPU-miss host timings runs now, not inside a reply
+    if (moe_cache && backend_cpu != nullptr && moe_cache->recal_pending()) {
+        synchronize();
+        compute_n_tokens = -1;
+        set_compute_threads(false);
+        compute_n_tokens = 0;
+        moe_cache->recal(backend_cpu);
+    }
     static const bool pp_rereserve = getenv("LLAMA_PP_RERESERVE") == nullptr || atoi(getenv("LLAMA_PP_RERESERVE")) != 0;
     if (!pp_rereserve || !sched_plan_small || !memory || moe_cache || model.hparams.no_alloc || sched_need_reserve) {
         return false;

@@ -813,6 +813,12 @@ struct llama_moe_cache::impl {
     static constexpr int cm_win1 = 8;
     static constexpr int cm_win2 = 128;
     int      cm_seen  = 0;
+    // k13-fn: one re-calibration of the host timings after cm_recal_after small batches (LLAMA_MOE_CPU_MISS_RECAL=N, 0 = off), kept
+    // only if it disagrees with the start-up one by more than cm_recal_tol (then the faster host time wins)
+    int      cm_recal_after = 64;
+    int      cm_recal_wait  = -1;
+    static constexpr double cm_recal_tol = 0.20;
+    bool     cm_recal_pending = false; // (timed only between requests: 2 x ~40 ms inside a reply cost chat decode 2% on G4)
     int      cm_nb    = 0;     // batches in the window
     int      cm_win   = cm_win1;
     bool     cm_have0 = false;
@@ -1009,6 +1015,9 @@ struct llama_moe_cache::impl {
                 cm_dbg = getenv("LLAMA_MOE_CPU_MISS_LOG") != nullptr && atoi(getenv("LLAMA_MOE_CPU_MISS_LOG")) != 0;
                 if (const char * env_s = getenv("LLAMA_MOE_CPU_MISS_SPLIT_SCALE")) {
                     cm_split_scale = std::max(0.0, atof(env_s));
+                }
+                if (const char * env_r = getenv("LLAMA_MOE_CPU_MISS_RECAL")) {
+                    cm_recal_after = std::max(0, atoi(env_r));
                 }
             }
             // k10: k9's default gate (below) keeps its own domain, a cache of at most hybrid_max_frac of the host experts (decided once the
@@ -4070,6 +4079,8 @@ struct llama_moe_cache::impl {
     void cm_calibrate(ggml_backend_t backend_cpu) {
         hybrid_probe = false;
         const int64_t t_start = ggml_time_us();
+        // k13-fn: the second call is the re-calibration after warm-up (see cm_recal_wait): host timings only, see below
+        const bool recal = cm_cal;
         const group * gp = nullptr;
         for (const group & g : groups) {
             if (g.dev_lookup && g.n_slots > 0 && g.counts != nullptr) {
@@ -4176,6 +4187,10 @@ struct llama_moe_cache::impl {
             const double gbs = slope > 0.0 ? g.expert_bytes/slope/1e3 : 0.0;
             ok = slope > 0.0 && gbs >= 0.2 && gbs <= 400.0 && d_t >= 0.9*d_a;
         }
+        if (!ok && recal) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: re-calibration inconsistent, the start-up calibration stays\n", tag);
+            return;
+        }
         if (!ok) {
             LLAMA_LOG_WARN("llama_moe_cache%s: CPU misses off: the host timings are inconsistent (%.1f us for %d experts, %.1f us for %d, %.1f us for %d x %d tokens; "
                 "a busy host), the missing experts are fetched\n", tag, d_a, ka, d_b, kb, d_t, ka, T);
@@ -4212,10 +4227,30 @@ struct llama_moe_cache::impl {
             }
         }
 
-        cm_t1    = std::max(slope, 0.05);
-        cm_dt    = std::max(0.0, (d_t - d_a)/((double) ka*(T - 1)));
-        cm_tup   = std::max(median(tu)/ka, 0.05);
-        cm_split = std::max(0.0, d_a - ka*cm_t1) + 2.0*median(trt);
+        if (recal) {
+            // k13-fn: one start-up sample set (11 repetitions of one layer, before any request) can be slow as a whole: on the file
+            // tier (G4 Flash-Next UD-IQ4_XS 16 GB / 64 GiB RAM) 2 of 3 launches measured 33.3 instead of 23.1 us per expert, the fetch
+            // share went from 0.25 to 0.5 and 8k decode lost 4-9%. After warm-up the host is timed again; if the two disagree by more
+            // than 20%, the faster host time is kept (a slow sample comes from a cold page cache or a busy host, not a slower path)
+            const double t1_new = std::max(slope, 0.05);
+            const double dt_new = std::max(0.0, (d_t - d_a)/((double) ka*(T - 1)));
+            const double rel    = std::fabs(t1_new - cm_t1)/std::max(cm_t1, 1e-3);
+            if (rel <= cm_recal_tol) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: re-calibration %.1f us per expert agrees with %.1f (within %.0f%%)\n", tag,
+                    t1_new, cm_t1, 100.0*cm_recal_tol);
+                return;
+            }
+            const double t1_old = cm_t1;
+            cm_t1 = std::min(cm_t1, t1_new);
+            cm_dt = t1_new < t1_old ? dt_new : cm_dt;
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: re-calibration %.1f us per expert vs %.1f at start-up (%.0f%% apart): host %.1f us "
+                "per expert kept\n", tag, t1_new, t1_old, 100.0*rel, cm_t1);
+        } else {
+            cm_t1    = std::max(slope, 0.05);
+            cm_dt    = std::max(0.0, (d_t - d_a)/((double) ka*(T - 1)));
+            cm_tup   = std::max(median(tu)/ka, 0.05);
+            cm_split = std::max(0.0, d_a - ka*cm_t1) + 2.0*median(trt);
+        }
         {
             int64_t n_embd = 0;
             for (const ggml_tensor * t : g.ref) {
@@ -4246,7 +4281,21 @@ struct llama_moe_cache::impl {
                 cm_share[n] = 0.0625f;
             }
         }
+        if (recal) {
+            cm_gen++;
+            if (!cm_force) {
+                cm_decide();
+            } else {
+                for (int64_t n = 1; n <= cm_max; ++n) {
+                    cm_share[n] = std::min(cm_share[n], 0.75f);
+                    cm_on[n]    = 1;
+                }
+            }
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: fetch share now %.3f (1 token), %.3f (4)\n", tag, cm_share[1], cm_share[std::min<int64_t>(4, cm_max)]);
+            return;
+        }
         cm_cal = true;
+        cm_recal_wait = cm_recal_after;
         // the first prompt and tokens run before any measured miss rate: a prior from the cached share c of the experts, (1 - c)^4
         // (decode miss rates measured on a G4: Qwen3.6-35B-A3B UD-Q4_K_XL c = 0.17 -> 0.29-0.47, c = 0.39 -> 0.16; gpt-oss-20b Q2_K
         // c = 0.54 -> 0.007), the first measured window corrects it without the hysteresis
@@ -4423,6 +4472,10 @@ struct llama_moe_cache::impl {
         }
         if (cm_share_of(n_tokens) < 1.0f) {
             (n_tokens > max_batch ? cm_n_prompt : cm_n_small)++;
+        }
+        if (cm_recal_wait > 0 && n_tokens <= max_batch && --cm_recal_wait == 0) {
+            cm_recal_pending = true; // served when the server goes idle (llama_context::restore_pp_plan): cm_calibrate re-times the host
+            cm_recal_wait    = -1;
         }
         if (cm_force) {
             return;
@@ -6590,6 +6643,15 @@ void llama_moe_cache::cpu_miss_tick(int64_t n_tokens) {
 
 bool llama_moe_cache::small_batch(int64_t n_tokens) const {
     return n_tokens <= n_small_max || pimpl->cm_serves(n_tokens);
+}
+
+bool llama_moe_cache::recal_pending() const {
+    return pimpl->cm && pimpl->cm_cal && pimpl->cm_recal_pending;
+}
+
+void llama_moe_cache::recal(ggml_backend_t backend_cpu) {
+    pimpl->cm_recal_pending = false;
+    pimpl->cm_calibrate(backend_cpu);
 }
 
 bool llama_moe_cache::hybrid_probe_pending() const {
