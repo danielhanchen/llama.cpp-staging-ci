@@ -759,8 +759,8 @@ struct llama_moe_cache::impl {
     bool    cm_dbg  = false;  // LLAMA_MOE_CPU_MISS_LOG=1: every rule window
     bool    cm_force = false; // LLAMA_MOE_CPU_MISS=2: on for every batch size, no rule
     // k11 LLAMA_MOE_CPU_MISS_PROMPT=N (opt-in, default 0 = off): prompt ubatches of max_batch + 1 .. N tokens always take the host path
-    // once calibrated, at the rule's fetch share (at most 3/4: the host computes at least a quarter of the misses, the experts with the
-    // fewest uses), without waiting for a trial on the small batches. G4, LFM2.5-24B-A2B 8 GB, a 38-token prompt: 6.1 GB of uploads
+    // once calibrated, at the rule's fetch share but at most 1/4 (the host computes at least three quarters of the misses, the experts
+    // with the fewest uses), without waiting for a trial on the small batches. G4, LFM2.5-24B-A2B 8 GB, a 38-token prompt: 6.1 GB of uploads
     // (PCIe-bound) -> 0.4 GB. The host's expert products are not the device's bit for bit: other text, KLD-gated
     int64_t cm_prompt_force = 0;
     // LLAMA_MOE_CPU_MISS_PROMPT_SHARE=f: the fetch share of those ubatches instead of the rule's (0 < f <= 1; the host computes the rest)
@@ -2871,7 +2871,9 @@ struct llama_moe_cache::impl {
     // the host computes the misses of a batch of n_tokens: the fetch share, 1 = every missing expert is fetched
     float cm_share_of(int64_t n_tokens) const {
         if (cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_prompt_force) {
-            return cm_prompt_share > 0.0f ? cm_prompt_share : std::min(cm_share[n_tokens], 0.75f);
+            // default: at most 1/4 fetched. The rule's share (1/2 at 38 tokens, LFM2.5 8 GB) left 71 ms of zero-copy fetch kernels in a
+            // 122 ms prompt; G4 k11pgW at 1/4: LFM2.5 chat 444 tok/s (339 at the rule's share), Qwen3.6 360 (329); 1/8: LFM2.5 415
+            return cm_prompt_share > 0.0f ? cm_prompt_share : std::min(cm_share[n_tokens], 0.25f);
         }
         if (!cm || !cm_cal || n_tokens < 1 || n_tokens > cm_max || cm_on[n_tokens] == 0 || (n_tokens <= max_batch ? !cm_small_live : !cm_prompt_ok())) {
             return 1.0f;
