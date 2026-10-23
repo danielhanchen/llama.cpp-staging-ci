@@ -1670,6 +1670,9 @@ private:
             // now, so the first long prompt does not allocate it between two of its ubatches
             if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS || n_swa > 0) {
                 llama_state_seq_reserve_async(ctx_tgt, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                if (ctx_dft) {
+                    llama_state_seq_reserve_async(ctx_dft, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                }
             }
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
@@ -2703,6 +2706,9 @@ private:
 
         // the previous checkpoint's asynchronous copy may still be running (LLAMA_STATE_ASYNC_LAZY): done before any is evicted
         llama_state_seq_async_wait(ctx_tgt);
+        if (ctx_dft) {
+            llama_state_seq_async_wait(ctx_dft); // k13-pp: the draft part is saved asynchronously too (ckpt_dft_async)
+        }
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
@@ -2768,7 +2774,12 @@ private:
         // the next llama_decode() is queued while the state is still being copied: the copy is complete when it returns
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ASYNC);
         const int64_t t_tr1 = t_tr0 ? ggml_time_us() : 0;
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        // k13-pp: the draft's rows are read on the draft's own stream after its queued prompt pass, so the target's next ubatch is
+        // queued while the draft still computes (the synchronous read waited for the draft pass, ~1.5 ms per chat prompt on G4);
+        // the save is complete when the draft's next decode() returns, or at any state call / synchronize of the draft context.
+        // LLAMA_CKPT_DFT_ASYNC=0: the synchronous read as before.
+        static const bool ckpt_dft_async = getenv("LLAMA_CKPT_DFT_ASYNC") == nullptr || atoi(getenv("LLAMA_CKPT_DFT_ASYNC")) != 0;
+        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | (ckpt_dft_async ? LLAMA_STATE_SEQ_FLAGS_ASYNC : 0));
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
@@ -2826,6 +2837,11 @@ private:
         n_written = 0;
         if (slot.prompt.checkpoints.empty()) {
             return true;
+        }
+        // asynchronous checkpoint saves (target and draft parts) must have landed before their buffers are written out
+        llama_state_seq_async_wait(ctx_tgt);
+        if (ctx_dft) {
+            llama_state_seq_async_wait(ctx_dft);
         }
         std::ofstream ofs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app);
         if (!ofs) {
