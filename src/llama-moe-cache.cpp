@@ -812,6 +812,11 @@ struct llama_moe_cache::impl {
     static constexpr int    cmt_block   = 8;
     static constexpr int    cmt_skip    = 3;
     static constexpr double cmt_margin  = 0.03;
+    // k13-fn: with the single-graph mailbox (no split), a trial keeps the host path unless the plain cache is cmt_margin faster (before:
+    // the host path had to be cmt_margin faster). Its 5-batch blocks do not see the cost of the plain path: it fetches and admits every
+    // miss, which the host blocks after it inherit as hits (G4 Flash-Next UD-IQ4_XS 32 GB: trials of 16.6 vs 16.2 ms turned it off,
+    // the host path at a fixed share was 17-24% faster at 2k / 8k). LLAMA_MOE_CPU_MISS_TRIAL_KEEP=0: the old rule
+    bool cmt_keep = true;
     static constexpr int    cmt_gap_max = 4096;
     bool     cm_trial      = true;
     bool     cm_small_ok   = true;  // the last trial kept the host path for small batches
@@ -847,6 +852,11 @@ struct llama_moe_cache::impl {
     // candidate (and so a trial possible) only if its gain beats cm_split_scale times the calibrated split (G4 Qwen3.6 UD-Q3_K_M 12 GB
     // MTP: 14 host batches per launch, every trial off, -7% decode from the trials alone). LLAMA_MOE_CPU_MISS_SPLIT_SCALE (3)
     double   cm_split_scale = 3.0;
+    // k13-fn: the same for a size whose host experts go through the single-graph mailbox (a publish and a merge, no graph split, no CUDA
+    // graph cut in two: the boundary costs above do not apply). G4 Qwen3.8-Flash-Next UD-IQ4_XS 32 GB (33% of the host experts cached),
+    // MTP verify batches of 3: the scale of 3 kept them off at 8-19% misses, every miss fetched (8.5 ms per verify round at 8k);
+    // LLAMA_MOE_CPU_MISS_SINGLE_SCALE (default 1)
+    double   cm_single_scale = 1.0;
     double   cm_act   = 0.0;   // us per token: its activations to the host and its expert output back
 
     // " (mtp)" for the cache of an MTP context, in its log lines
@@ -973,6 +983,12 @@ struct llama_moe_cache::impl {
                 cm_dbg = getenv("LLAMA_MOE_CPU_MISS_LOG") != nullptr && atoi(getenv("LLAMA_MOE_CPU_MISS_LOG")) != 0;
                 if (const char * env_s = getenv("LLAMA_MOE_CPU_MISS_SPLIT_SCALE")) {
                     cm_split_scale = std::max(0.0, atof(env_s));
+                }
+                if (const char * env_s = getenv("LLAMA_MOE_CPU_MISS_SINGLE_SCALE")) {
+                    cm_single_scale = std::max(0.0, atof(env_s));
+                }
+                if (const char * env_k = getenv("LLAMA_MOE_CPU_MISS_TRIAL_KEEP")) {
+                    cmt_keep = atoi(env_k) != 0;
                 }
             }
             // k10: k9's default gate (below) keeps its own domain, a cache of at most hybrid_max_frac of the host experts (decided once the
@@ -4120,7 +4136,9 @@ struct llama_moe_cache::impl {
             cmt_done = -1;
             const double t_off = median(cmt_t[0]);
             const double t_on  = median(cmt_t[1]);
-            const bool   on    = cmt_t[0].size() >= 3 && cmt_t[1].size() >= 3 && t_on < (1.0 - cmt_margin)*t_off;
+            const bool   keep  = cmt_keep && single_reg && !single_off;
+            const bool   on    = cmt_t[0].size() >= 3 && cmt_t[1].size() >= 3 &&
+                                 (keep ? !(t_off < (1.0 - cmt_margin)*t_on) : t_on < (1.0 - cmt_margin)*t_off);
             cmt_n++;
             if (cmt_n <= 4 || on != cm_small_ok || cm_dbg) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses trial %d: %.3f ms per small batch without the host path, %.3f ms with it (medians of %zu and %zu) -> %s for small batches%s\n",
@@ -4266,7 +4284,8 @@ struct llama_moe_cache::impl {
                 const double f    = cm_share[n];
                 const double m    = cm_rate*D;
                 const double gain = m*(cm_tup - std::max(f*cm_tup, (1.0 - f)*tc));
-                const double need = (n <= max_batch ? cm_margin*cm_split_scale*cm_split*(single_reg && single_usable(n) ? single_split_frac : 1.0) :
+                const bool   sgl  = single_reg && single_usable(n);
+                const double need = (n <= max_batch ? cm_margin*(sgl ? cm_single_scale : cm_split_scale)*cm_split*(sgl ? single_split_frac : 1.0) :
                                      cm_margin_p*(cm_split + n*cm_act))*
                                     (cm_on[n] && cm_measured ? cm_hyst : 1.0);
                 // a batch above max_batch runs the host path in the groups whose slots hold its experts (see use_device), the
