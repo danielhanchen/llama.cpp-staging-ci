@@ -2136,10 +2136,12 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_ERROR("llama_moe_cache%s: single-graph host misses failed (the host thread did not pick a batch up within %d ms, or "
                 "failed): this ubatch is not committed, the split path from now on\n", tag, single_timeout_ms);
             single_off = true;
+            single_failure_pending = true;
             cm_gen++;
         }
         return failed;
     }
+    bool single_failure_pending = false; // single_check failed a ubatch the caller has not taken back yet (single_take_failure)
 
     static void single_service() {
         single_hub_t & h = single_hub();
@@ -6156,6 +6158,12 @@ void llama_moe_cache::single_note_form(int32_t il, bool ok) const {
 
 bool llama_moe_cache::single_check() {
     return pimpl->single_check();
+}
+
+bool llama_moe_cache::single_take_failure() {
+    const bool f = pimpl->single_failure_pending;
+    pimpl->single_failure_pending = false;
+    return f;
 }
 
 ggml_tensor * llama_moe_cache::single_merge(ggml_context * ctx, ggml_tensor * dev, ggml_tensor * pub) const {

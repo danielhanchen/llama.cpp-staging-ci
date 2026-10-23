@@ -100,6 +100,8 @@ public:
     void single_note_form(int32_t il, bool ok) const;
     // after a small graph: true if a single-graph merge gave up (the ubatch must not be committed), see impl::single_check
     bool single_check();
+    // true once after single_check failed a ubatch: the caller takes it back and computes it again on the split path
+    bool single_take_failure();
     // before the graph of every ubatch of n_tokens: wakes the host thread (batches that may publish), turns the path off after a failure
     void single_kick(int64_t n_tokens);
 

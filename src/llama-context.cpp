@@ -2884,6 +2884,32 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
+        // k11 single-graph host misses: a merge gave up (see llama_moe_cache::single_check), so this ubatch was not committed; its
+        // positions are removed from the memory module and the same ubatch is computed again on the split path (the result the
+        // mailbox would have given). Only if every removal succeeded (a recurrent state goes back through its per-token snapshots)
+        if (!res && moe_cache && moe_cache->single_take_failure()) {
+            llama_pos pos_min[LLAMA_MAX_SEQ];
+            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                pos_min[s] = std::numeric_limits<llama_pos>::max();
+            }
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                const auto & seq_id = ubatch.seq_id[i][0];
+                pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
+            }
+            bool rm_ok = true;
+            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (pos_min[s] != std::numeric_limits<llama_pos>::max()) {
+                    rm_ok = memory->seq_rm(s, pos_min[s], -1) && rm_ok;
+                }
+            }
+            if (rm_ok) {
+                LLAMA_LOG_WARN("%s: single-graph merge gave up: the ubatch of %u tokens is computed again on the split path\n", __func__, ubatch.n_tokens);
+                res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+            } else {
+                LLAMA_LOG_ERROR("%s: single-graph merge gave up and the memory module cannot take the ubatch back: the ubatch fails\n", __func__);
+            }
+        }
+
         cparams.batch_invariant = false;
         cparams.exact_split     = 0;
 
