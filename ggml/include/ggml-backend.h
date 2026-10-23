@@ -461,6 +461,8 @@ extern "C" {
     // lender lends (the graph allocation entries of ggml_backend_sched_lend_copy); the graph is refused (as by the limit) only if the
     // lender does not take it
     GGML_API void                 ggml_backend_sched_set_alloc_lend_graph(ggml_backend_sched_t sched, bool enable);
+    // k13-small: frees the compute buffers of the devices (not the host ones): the next graph allocates them at the size it needs
+    GGML_API void                 ggml_backend_sched_free_device_buffers(ggml_backend_sched_t sched);
 
     // Set a callback that places prefetched copies in memory lent by the user instead of the staging arena
     GGML_API void                 ggml_backend_sched_set_lend_callback(ggml_backend_sched_t sched, ggml_backend_sched_lend_callback callback, void * user_data);

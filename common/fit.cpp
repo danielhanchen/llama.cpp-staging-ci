@@ -51,6 +51,12 @@ int64_t common_fit_moe_margin_gain() {
     return g_moe_margin_gain;
 }
 
+static bool g_small_device = false;
+
+bool common_fit_small_device() {
+    return g_small_device;
+}
+
 // the margin of a device beside a MoE cache for the default margin m (see common_fit_set_moe_margin_auto)
 static int64_t common_fit_moe_margin(int64_t m) {
     constexpr int64_t MiB_ = 1024*1024;
@@ -958,10 +964,84 @@ static void common_params_fit_impl(
         if (fit_moe_cache) {
             // order: the dense weights of all layers, then the cache (up to the requested size), then experts in device memory
             const size_t size_before = cparams->moe_cache_size;
+            const dmds_t dmds_cpu_moe_req = dmds_cpu_moe; // k13-small: the measurement at the requested cache size, for the retry below
             fit_moe_cache_size(dmds_cpu_moe, mparams, true);
             bool fits_per_device = cparams->moe_cache_size > 0;
             for (size_t id = 0; id < nd; id++) {
                 fits_per_device = fits_per_device && int64_t(dmds_cpu_moe[id].free) - int64_t(dmds_cpu_moe[id].mb.total()) >= margins[id];
+            }
+            // k13-small: a small device (G4 ballasted to 4 GB, Qwen3.6-35B-A3B Q3_K_M + MTP: the dense weights of every layer, the context and
+            // a cache fit only inside the 1024 MiB margin). Without this the fit moves 13 of 41 whole layers (attention, KV, recurrent state)
+            // to the CPU and drops the cache, so every token pays a graph split per CPU layer and per MoE layer (k12: 91 tok/s against
+            // PolyStrata's 177, which keeps every dense layer on the device). Here the margin of the one device drops to
+            // LLAMA_FIT_SMALL_MARGIN_MIB (256) instead: every layer stays on the device beside a small cache, whose host misses the
+            // single-graph path computes (no graph split). The placement is the one of -fitt 256; one GPU only, default margin only (an
+            // explicit smaller -fitt is the user's), LLAMA_FIT_SMALL_MARGIN_MIB=0 keeps the k12 placement.
+            if (!fits_per_device && nd == 1 && size_before > 0) {
+                const char * e_sm = getenv("LLAMA_FIT_SMALL_MARGIN_MIB");
+                const int64_t small_mib = e_sm != nullptr ? std::max<int64_t>(0, atoll(e_sm)) : 256;
+                constexpr int64_t m_default = 1024*MiB;
+                // opt-in: the cache of a small device that holds only a few experts anyway is capped (LLAMA_FIT_SMALL_CACHE_MIB=48)
+                // where the uncapped fit gives it at most LLAMA_FIT_SMALL_CACHE_CAP_BELOW_MIB (256): what it does not take stays free for
+                // the layer-major prompt groups, which read each host expert once per group instead of once per ubatch. G4 4 GB q3m + MTP
+                // (111 MiB uncapped, 76 MiB free, every group of 2+ ubatches split): prompt 2k 1885 -> 4712, 8k 1937 -> 4103 tok/s,
+                // decode -9 / -2 / -5% (chat / 2k / 8k, the smaller cache); gpt-oss-20b 4 GB (476 MiB) lost 4-10% decode capped: not capped.
+                // Off by default: the server KLD run (k13kld3, 8k prompts) ran out of device memory in a merged prompt group at the cap
+                const char * e_sc = getenv("LLAMA_FIT_SMALL_CACHE_MIB");
+                const int64_t cap_mib = e_sc != nullptr ? std::max<int64_t>(0, atoll(e_sc)) : 0; // opt-in (LLAMA_FIT_SMALL_CACHE_MIB=48): see below
+                const char * e_cb = getenv("LLAMA_FIT_SMALL_CACHE_CAP_BELOW_MIB");
+                const int64_t cap_below_mib = e_cb != nullptr ? std::max<int64_t>(0, atoll(e_cb)) : 256;
+                // opt-in second, smaller margin when the first one leaves no cache (LLAMA_FIT_SMALL_MARGIN_MIN_MIB=N): G4 4 GB Qwen3.6
+                // UD-Q4_K_XL + MTP placed every layer at 128 MiB but ran out of device memory in its first request (CUDA error, run k13r2)
+                const char * e_sm2 = getenv("LLAMA_FIT_SMALL_MARGIN_MIN_MIB");
+                const int64_t small_min_mib = std::min<int64_t>(small_mib, e_sm2 != nullptr ? std::max<int64_t>(0, atoll(e_sm2)) : small_mib);
+                if (g_moe_margin_auto && small_mib > 0 && small_mib*MiB < m_default && margins[0] >= m_default) {
+                    const int64_t margin_saved = margins[0];
+                    const dmds_t  dmds_nc_saved = dmds_cpu_moe;
+                    // one sizing of the cache from the measurement d at the requested size req, margin m_mib: ok if every layer fits
+                    auto try_fit = [&](size_t req, const dmds_t & d, int64_t m_mib) {
+                        margins[0] = margin_saved - m_default + m_mib*MiB; // what was added to the default (a projector) stays
+                        dmds_cpu_moe = d;
+                        cparams->moe_cache_size = req;
+                        fit_moe_cache_size(dmds_cpu_moe, mparams, true);
+                        return cparams->moe_cache_size > 0 && cparams->moe_cache_size != size_before &&
+                            int64_t(dmds_cpu_moe[0].free) - int64_t(dmds_cpu_moe[0].mb.total()) >= margins[0];
+                    };
+                    bool    ok    = false;
+                    int64_t m_ok  = 0;
+                    for (const int64_t m_mib : { small_mib, small_min_mib }) {
+                        if (!ok && m_mib > 0) {
+                            ok   = try_fit(size_before, dmds_cpu_moe_req, m_mib);
+                            m_ok = m_mib;
+                        }
+                    }
+                    if (ok && cap_mib > 0 && cparams->moe_cache_size > size_t(cap_mib)*MiB && cparams->moe_cache_size <= size_t(cap_below_mib)*MiB) {
+                        const size_t  size_unc = cparams->moe_cache_size;
+                        const dmds_t  dmds_unc = dmds_cpu_moe;
+                        const int64_t gain_unc = g_moe_margin_gain;
+                        cparams->moe_cache_size = size_t(cap_mib)*MiB;
+                        dmds_t dmds_cap = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                        add_extra_memory(dmds_cap);
+                        if (!try_fit(size_t(cap_mib)*MiB, dmds_cap, m_ok)) {
+                            margins[0] = margin_saved - m_default + m_ok*MiB;
+                            cparams->moe_cache_size = size_unc;
+                            dmds_cpu_moe = dmds_unc;
+                            g_moe_margin_gain = gain_unc;
+                        }
+                    }
+                    if (ok) {
+                        LOG_INF("%s: small device: every layer stays in device memory beside a MoE cache of %zu MiB, the fit margin drops from "
+                            "%" PRId64 " to %" PRId64 " MiB (otherwise layers move to the CPU; LLAMA_FIT_SMALL_MARGIN_MIB=0 keeps that)\n",
+                            __func__, cparams->moe_cache_size/MiB, margin_saved/MiB, margins[0]/MiB);
+                        fits_per_device = true;
+                        g_small_device  = true;
+                    } else {
+                        margins[0] = margin_saved;
+                        dmds_cpu_moe = dmds_nc_saved;
+                        cparams->moe_cache_size = 0;
+                        g_moe_margin_gain = 0;
+                    }
+                }
             }
             bool keep = fits_per_device && cparams->moe_cache_size != size_before;
             if (fits_per_device && !keep) {
@@ -995,6 +1075,16 @@ static void common_params_fit_impl(
                 mparams->tensor_buft_overrides = tensor_buft_overrides;
             }
             if (keep) {
+                // k13-small: the same placement reached under an explicit --fit-target (Studio sends one, at least 512 MiB) is a small
+                // device too when it leaves less than the default 1024 MiB free beside a cache of at most 256 MiB: the run-time rules keyed
+                // on common_fit_small_device (no n_ubatch growth, the checkpoint merge) then apply there as well. The margin itself is the
+                // caller's and is not touched.
+                if (!g_small_device && nd == 1 && cparams->moe_cache_size <= size_t(256)*MiB &&
+                        int64_t(dmds_cpu_moe[0].free) - int64_t(dmds_cpu_moe[0].mb.total()) < 1024*MiB) {
+                    g_small_device = true;
+                    LOG_INF("%s: small device: every layer stays in device memory beside a MoE cache of %zu MiB within the margin of %" PRId64 " MiB\n",
+                        __func__, cparams->moe_cache_size/MiB, margins[0]/MiB);
+                }
                 // every layer in device memory with all experts in system memory and the cache: the placement of --cpu-moe
                 LOG_TRC("%s: all layers in device memory, MoE tensors in system memory, MoE cache of %zu MiB\n",
                     __func__, cparams->moe_cache_size/MiB);

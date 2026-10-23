@@ -3439,7 +3439,9 @@ private:
     // the host computes misses or the fetch overlap splits a layer by hit / miss, the decode that follows then differs from k10
     // (G4 Qwen3.6 UD-Q4_K_XL + MTP 8 GB: other text from token 14 / 31 / >64 of the 2k / 4.6k / 8k cells)
     bool lm_ckpt_merge_ok(const server_slot & slot, int32_t n_tokens_prev, bool lm_ckpt) const {
-        static const bool on = getenv("LLAMA_LM_CKPT_MERGE") != nullptr && atoi(getenv("LLAMA_LM_CKPT_MERGE")) != 0;
+        // k13-small: on by default where the fit kept every layer on a small device (common_fit_small_device): there each extra prompt
+        // call reads all host experts again (G4 4 GB q3m 2k: [1532] [512] [4] = two passes of 13.6 GB); LLAMA_LM_CKPT_MERGE=0 off
+        static const bool on = getenv("LLAMA_LM_CKPT_MERGE") != nullptr ? atoi(getenv("LLAMA_LM_CKPT_MERGE")) != 0 : common_fit_small_device();
         return on && !lm_ckpt && n_tokens_prev == 0 && !slot.task->tokens.has_mtmd && llama_layer_major_on(ctx_tgt) &&
             common_speculative_rows_ok(spec.get());
     }

@@ -3590,8 +3590,24 @@ bool llama_context::lm_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
 // when the next ubatch of the group reads them in that layer, exactly as in the ubatch-by-ubatch order. Nothing of the math changes: the same
 // ops on the same shapes in the same order per ubatch (only interleaved with the other ubatches), so the outputs are bit-identical.
 // The prompt does not change the MoE cache (no seed, no lent slots): the decode after it finds the cache as it was.
+// k13-small: the hybrid gate's fixed share (a cache of at most LLAMA_MOE_CACHE_HYBRID_MAX_FRAC of the host experts) computes the misses of
+// small batches only, the prompt ubatches a layer-major group runs copy their experts as before. A cache below LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC
+// (0.05) of the host experts runs its prompts layer-major too: G4 at 4 GB, Qwen3.6 Q3_K_M + MTP (0.7% cached) copied every host expert once
+// per 512-token ubatch, 55 GB of copies for a 2k prompt (PolyStrata: 13.6 GB, one per prompt). LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC=0: k12
+static bool lm_hybrid_frac_ok(double frac) {
+    static const double max_frac = getenv("LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC") ? std::max(0.0, atof(getenv("LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC"))) : 0.05;
+    return frac >= 0.0 && frac < max_frac;
+}
+
+// a cache below LLAMA_MOE_LM_RELEASE_FRAC (0.05) of the host experts (k13-small: see the release of the banks in decode_layer_major)
+static bool lm_tiny_cache(double frac) {
+    static const double max_frac = getenv("LLAMA_MOE_LM_RELEASE_FRAC") ? std::max(0.0, atof(getenv("LLAMA_MOE_LM_RELEASE_FRAC"))) : 0.05;
+    return frac >= 0.0 && frac < max_frac;
+}
+
 int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_outputs_all, int64_t n_tokens_all, int64_t & n_outputs_prev,
         int64_t & n_tokens_prev, bool & more, int & ret) {
+    auto lm_hybrid_ok = [&]() { return lm_hybrid_frac_ok(moe_cache->cache_frac()); };
     const auto & hparams = model.hparams;
     const int64_t n_vocab = model.vocab.n_tokens();
 
@@ -3606,7 +3622,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     if (!moe_cache || cparams.embeddings || !cparams.causal_attn || cparams.verify || ple.enabled ||
             std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool b) { return b; }) ||
             n_tokens_all - n_tokens_prev <= (int64_t) cparams.n_ubatch + llama_moe_cache::n_small_max || !eligible(mctx->get_ubatch()) ||
-            moe_cache->lends_graph_to(mctx->get_ubatch().n_tokens) || moe_cache->hybrid_fixed() || (moe_cache_devseed_on && !lm_devseed)) {
+            moe_cache->lends_graph_to(mctx->get_ubatch().n_tokens) || (moe_cache->hybrid_fixed() && !lm_hybrid_ok()) ||
+            (moe_cache_devseed_on && !lm_devseed)) {
         if (lm_verbose && moe_cache && n_tokens_all - n_tokens_prev > (int64_t) cparams.n_ubatch + llama_moe_cache::n_small_max) {
             const auto & ub = mctx->get_ubatch();
             LLAMA_LOG_INFO("%s: not layer-major: samplers %d embeddings %d causal %d verify %d ple %d ubatch %u (eligible %d, seqs %u, embd %d) "
@@ -3975,6 +3992,17 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     // the seed of the MoE cache, as moe_cache_seed_begin plans it for the ubatch-by-ubatch order: the last large ubatch of the batch seeds,
     // from the routing of the ubatch before it if it has no outputs, else from its own (if its seed graph fits); every member of the group
     // is large and prefetched, so the seed copies from the shared expert copies (all experts staged)
+    // k13-small: a cache below LLAMA_MOE_LM_RELEASE_FRAC (0.05) of the host experts frees its banks while the group runs (the compute
+    // buffers grow in that memory), they are allocated again after it and refilled (see llama_moe_cache::release and the end of the group):
+    // the slots of so small a cache are too few to lend the growth (G4 at 4 GB, Qwen3.6 Q3_K_M + MTP: 111 MiB in three bank tails of at most
+    // 33 MiB, a 4-ubatch group grows by 68 MiB with 77 MiB free and 64 MiB of headroom, it was split in single ubatches: one pass over
+    // every host expert per 512 tokens). The group does not seed the cache. LLAMA_MOE_LM_RELEASE=0 off
+    static const bool lm_release_env = getenv("LLAMA_MOE_LM_RELEASE") == nullptr || atoi(getenv("LLAMA_MOE_LM_RELEASE")) != 0;
+    bool lm_released = false;
+    if (lm_release_env && group.size() >= 2 && lm_tiny_cache(moe_cache->cache_frac())) {
+        ggml_backend_sched_synchronize(sched.get());
+        lm_released = moe_cache->release();
+    }
     lm_ask.clear();
     lm_staged.clear();
     lm_seeded.clear();
@@ -3993,7 +4021,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     // have seen, so the cache ends up as with the separate batches
     static const bool lm_replay_env = getenv("LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY")) != 0;
     size_t rp_k = 0; // members before the break (0: no replay)
-    if (lm_replay_env && moe_cache_devseed_on && !moe_cache_seed_sync && group.size() >= 3 && !balloc->ubatch_breaks.empty()) {
+    // k14 merge: a group whose cache banks were released (k13-small) seeds nothing, so it replays nothing either
+    if (!lm_released && lm_replay_env && moe_cache_devseed_on && !moe_cache_seed_sync && group.size() >= 3 && !balloc->ubatch_breaks.empty()) {
         const auto & last = group.back();
         const int64_t b = last.n_tokens_before;
         const auto & brk = balloc->ubatch_breaks;
@@ -4003,7 +4032,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             rp_k = group.size() - 1;
         }
     }
-    if (lm_seed_env && moe_cache_seed_enabled && (moe_cache_seed_sync || lm_seed_dev) && !moe_cache_seed_auto) {
+    if (!lm_released && lm_seed_env && moe_cache_seed_enabled && (moe_cache_seed_sync || lm_seed_dev) && !moe_cache_seed_auto) {
         // with the replay: the seed of the batch that ends at the break
         const int64_t n_seed_all = rp_k > 0 ? group[rp_k].n_tokens_before : n_tokens_all;
         for (size_t k = 0; k < (rp_k > 0 ? rp_k : group.size()); ++k) {
@@ -4294,13 +4323,34 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         // MoE cache (slots lent for the group and refilled after it, as its staging copies are) instead of being split; the merged graph
         // runs the same ubatches, only where its tensors live changes
         static const bool lm_lend = getenv("LLAMA_MOE_LM_LEND") == nullptr || atoi(getenv("LLAMA_MOE_LM_LEND")) != 0;
-        const bool lend_g = lm_lend && moe_cache->lends_on_any();
+        // k13-small: the graph borrows only once its growth did not fit: the lend scope places the whole graph allocation in cache slots,
+        // which were lent (and their experts refilled after the group) even where the compute buffers could grow in free memory. G4
+        // gemma-4 26B-A4B Q3_K_M + drafter at 8 GB, 2k: 393 instead of 241 slots lent, a different cache after the prompt (another text than
+        // k10) and 287 instead of 325 tok/s decode, prompt 4815 instead of 5014 (LLAMA_MOE_LM_LEND=0). LLAMA_MOE_LM_LEND_FIRST=1: lend at once (k12)
+        static const bool lm_lend_first = getenv("LLAMA_MOE_LM_LEND_FIRST") != nullptr && atoi(getenv("LLAMA_MOE_LM_LEND_FIRST")) != 0;
+        const bool lend_ok = lm_lend && moe_cache->lends_on_any();
+        bool lend_g = lend_ok && lm_lend_first;
         if (lend_g) {
             moe_cache->set_graph_lend(true);
             ggml_backend_sched_set_alloc_lend_graph(sched.get(), true);
         }
         ggml_status st = run(g);
         if (lend_g) {
+            moe_cache->set_graph_lend(false);
+        }
+        if (st == GGML_STATUS_ALLOC_FAILED && lend_ok && !lend_g && ggml_backend_sched_get_alloc_over(sched.get()) > 0) {
+            // the growth did not fit in free memory: as the split below would, undo the scheduler's copies, then the same graph with the
+            // allocation lent by the cache
+            for (auto & [node, arr] : srcs) {
+                std::copy(arr.begin(), arr.end(), node->src);
+            }
+            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_use_full_hash(sched.get());
+            ggml_backend_sched_set_alloc_limit(sched.get(), true, lm_grow_max);
+            lend_g = true;
+            moe_cache->set_graph_lend(true);
+            ggml_backend_sched_set_alloc_lend_graph(sched.get(), true);
+            st = run(g);
             moe_cache->set_graph_lend(false);
         }
         ggml_backend_sched_set_alloc_limit(sched.get(), false, 0);
@@ -4465,6 +4515,55 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             moe_cache_pos_next = -1;
             moe_cache_ids.clear();
             moe_cache->clear_seed_counts();
+        }
+    }
+
+    if (lm_released) {
+        // the slots come back with the experts they held before; LLAMA_MOE_LM_RELEASE_ROUTED=1: with those the last ubatch of the group
+        // used most (its routing, read before the compute buffers are freed). G4 4 GB, Qwen3.6 Q3_K_M + MTP 2, 3 launches: decode 2k / 8k
+        // 136.1 / 150.0 tok/s held before, 138.0 / 146.1 routed (release off 133.6 / 149.3); long-prompt KLD against the all-device run,
+        // first token mean 0.00076 held before, 0.00134 routed (the -fa off band 0.00031, k12 0.00118)
+        static const bool lm_release_routed = getenv("LLAMA_MOE_LM_RELEASE_ROUTED") != nullptr && atoi(getenv("LLAMA_MOE_LM_RELEASE_ROUTED")) != 0;
+        if (lm_release_routed && status == GGML_STATUS_SUCCESS) {
+            moe_cache->set_refill_routed_once(true);
+            moe_cache_ids = lm_record;
+            moe_cache_refill_from_ids();
+        }
+        // the routing of the group is in its compute buffers, which are freed: no later seed reads it
+        moe_cache_ids.clear();
+        moe_cache_seq      = -1;
+        moe_cache_pos_next = -1;
+        moe_cache->clear_seed_counts();
+        // the compute buffers shrink back to what the next graph needs before the banks take their memory again
+        ggml_backend_sched_free_device_buffers(sched.get());
+        moe_cache->restore();
+        lm_n_released++;
+    } else if (buf_after > buf_before) {
+        // k13-small: a group that grew the compute buffers leaves them at its size, and the decode after it computes in what is left: G4 at
+        // 4 GB, Qwen3.6 Q3_K_M + MTP with LLAMA_MOE_LM_RELEASE=0, a fresh server's first request (2100 tokens): the group grew 502 -> 534 MiB
+        // inside the 64 MiB headroom with 118 MiB left after it, the staging copies of the next graphs took the rest and the decode ran out
+        // of device memory in the CUDA pool. With less than LLAMA_MOE_LM_SHRINK_FREE_MIB (192) free after the group the device compute
+        // buffers are freed (the next graph allocates what it needs, as without the merge); the routing kept for the seed of the next ubatch
+        // is copied to host memory first. At 512 the 8 GB cells (234-436 MiB left) shrank too, and the chat prompt after a long one lost
+        // 8-12% to the reallocation (G4 run k13s6). 0 off
+        static const size_t lm_shrink_free = (size_t) (getenv("LLAMA_MOE_LM_SHRINK_FREE_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LM_SHRINK_FREE_MIB"))) : 192) << 20;
+        size_t free_min = SIZE_MAX;
+        for (auto & bk : backend_ptrs) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(bk);
+            if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                size_t fr = 0, tot = 0;
+                ggml_backend_dev_memory(dev, &fr, &tot);
+                free_min = std::min(free_min, fr);
+            }
+        }
+        if (free_min < lm_shrink_free) {
+            ggml_backend_sched_synchronize(sched.get());
+            lm_ids_host_keep();
+            ggml_backend_sched_free_device_buffers(sched.get());
+            if (lm_n_shrunk++ < 8) {
+                LLAMA_LOG_INFO("%s: the group grew the compute buffers %.2f -> %.2f MiB with %.2f MiB free left: device compute buffers freed "
+                    "(LLAMA_MOE_LM_SHRINK_FREE_MIB=0 keeps them)\n", __func__, buf_before/1048576.0, buf_after/1048576.0, free_min/1048576.0);
+            }
         }
     }
 
@@ -5671,6 +5770,35 @@ void llama_context::moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_ou
     }
     moe_cache_seq      = ubatch.seq_id_unq[0];
     moe_cache_pos_next = pos_max + 1;
+}
+
+void llama_context::lm_ids_host_keep() {
+    if (moe_cache_ids.empty()) {
+        return;
+    }
+    ggml_init_params params = { moe_cache_ids.size()*ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx(ggml_init(params));
+    std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> copies;
+    for (const auto & [w, ids] : moe_cache_ids) {
+        ggml_tensor * c = ggml_dup_tensor(ctx.get(), ids);
+        ggml_set_name(c, ids->name);
+        copies.emplace_back(w, c);
+    }
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type()));
+    if (!buf) {
+        moe_cache_ids.clear();
+        return;
+    }
+    std::vector<uint8_t> tmp;
+    for (size_t i = 0; i < copies.size(); ++i) {
+        const ggml_tensor * src = moe_cache_ids[i].second;
+        tmp.resize(ggml_nbytes(src));
+        ggml_backend_tensor_get(src, tmp.data(), 0, tmp.size());
+        ggml_backend_tensor_set(copies[i].second, tmp.data(), 0, tmp.size());
+        moe_cache_ids[i].second = copies[i].second;
+    }
+    lm_ids_ctx = std::move(ctx);
+    lm_ids_buf = std::move(buf);
 }
 
 void llama_context::moe_cache_refill_from_ids() {

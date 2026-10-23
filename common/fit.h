@@ -58,6 +58,9 @@ common_params_fit_status common_fit_params(
 void    common_fit_set_moe_margin_auto(bool auto_margin);
 int64_t common_fit_moe_margin_gain();
 
+// k13-small: the fit kept every layer on a small device with the reduced margin (LLAMA_FIT_SMALL_MARGIN_MIB); set once per process
+bool    common_fit_small_device();
+
 // print estimated memory to stdout
 void common_fit_print(
                          const char * path_model,

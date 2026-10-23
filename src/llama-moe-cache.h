@@ -115,6 +115,8 @@ public:
     // fixed share (LLAMA_MOE_CACHE_FETCH, or from the threads): the cache, the use counters and the residual of the share are reset before a batch whose
     // sequences are all empty and after a state is read, so the same request gives the same output as in a new process
     bool hybrid_fixed() const;
+    // k13-small: the cached share of the host experts' bytes (-1 before the slots are sized)
+    double cache_frac() const;
     void hybrid_reset();
 
     // auto mode: before the graph of each ubatch while the trial runs, after the previous ubatch finished (backends synchronized);
@@ -165,6 +167,13 @@ public:
     // k11 (LLAMA_MOE_LM_LEND): while on, the cache also lends its slots to the graph allocation of the graphs allocated (a merged layer-major
     // group whose compute buffers would grow past the free memory), not only to their staging copies
     void set_graph_lend(bool on);
+    // k13-small: the banks are freed for the graphs of a prompt (every slot emptied, its expert kept for the refill), restore allocates
+    // them again and refills the slots; nothing may look up or upload experts in between (the layer-major group does neither)
+    bool release();
+    void restore();
+    bool released() const;
+    // the next restore refills the slots with the experts the recorded routing used most (set_refill_counts), as LLAMA_MOE_CACHE_REFILL_ROUTED=1
+    void set_refill_routed_once(bool on);
     // the cache lends slots on some device (decided by the first large graph)
     bool lends_on_any() const;
     // the cache lends slots on the device of backend (decided by the first large graph, see lend): the staging arena is not allocated there

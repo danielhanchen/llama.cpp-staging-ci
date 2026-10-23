@@ -612,7 +612,11 @@ private:
     std::vector<ggml_backend_buffer_ptr> lm_arena_old;
     size_t                               lm_arena_used = 0;
     std::vector<uint8_t>                 lm_meta;     // the merged graph
-    int64_t lm_n_graphs = 0, lm_n_ubatches = 0, lm_n_fallback = 0, lm_n_seeded = 0, lm_n_split = 0;
+    int64_t lm_n_graphs = 0, lm_n_ubatches = 0, lm_n_fallback = 0, lm_n_seeded = 0, lm_n_split = 0, lm_n_released = 0, lm_n_shrunk = 0;
+    // k13-small: host copies of the routing kept for the next seed when the compute buffers are freed after a group (lm_ids_host_keep)
+    ggml_context_ptr lm_ids_ctx;
+    ggml_backend_buffer_ptr lm_ids_buf;
+    void lm_ids_host_keep();
     // a graph of several ubatches is being allocated or computed: a weight copy on the regular path copies all experts (its split reads
     // the copy for every ubatch, the first product of the split routes only its own ubatch)
     bool lm_merged_active = false;

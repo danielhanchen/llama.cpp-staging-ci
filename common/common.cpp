@@ -1518,6 +1518,13 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
     if (force == 0) {
         return;
     }
+    // k13-small: no larger n_ubatch beside the small-device placement (common_fit_small_device): its 256 MiB margin has no room for the
+    // run-time buffers of a larger ubatch. G4 4 GB q3m without a draft: "every expert cached" took n_ubatch 2048 (compute 804 MiB) and the
+    // first 2k prompt ran out of device memory (CUDA error). LLAMA_MOE_PREFILL_UB=N still forces N
+    if (force < 0 && common_fit_small_device()) {
+        COM_INF("MoE cache: small device: n_ubatch stays %u (LLAMA_MOE_PREFILL_UB=N forces N)\n", cparams.n_ubatch);
+        return;
+    }
     if (!common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
         return;
     }
@@ -1714,7 +1721,11 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
         if (const char * e = getenv("LLAMA_MOE_PREFILL_UB_TINY_KEEP")) {
             keep = std::min(1.0, std::max(0.0, atof(e)));
         }
-        if (force_t != 0 && force <= 0 && !rule_frac && common_moe_slot_bytes_of(params.model.path, sbt) && sbt.n_used > 0 && sbt.n_layer > 0) {
+        // k13-small: not beside the small-device placement (common_fit_small_device), whose 256 MiB margin has no room for the larger
+        // ubatch's run-time buffers: G4 4 GB q3m without a draft grew to n_ubatch 2048 (compute 804 MiB) and ran out of device memory
+        // in a request (CUDA error); LLAMA_MOE_PREFILL_UB_TINY=N still forces N
+        const bool small_dev = common_fit_small_device() && force_t <= 0;
+        if (force_t != 0 && !small_dev && force <= 0 && !rule_frac && common_moe_slot_bytes_of(params.model.path, sbt) && sbt.n_used > 0 && sbt.n_layer > 0) {
             const double  token_bytes = (double) sbt.n_layer*(double) sbt.n_used*(double) sbt.sum;
             const double  tokens      = (double) cache/token_bytes;
             const int64_t all_exp     = (int64_t) (1.02*(double) sbt.total) + sbt.n_layer*sbt.sum;
