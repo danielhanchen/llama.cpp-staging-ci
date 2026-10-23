@@ -2707,6 +2707,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         // every slot is computed by exactly one side, the other sides' rows are 0
         if (single_pub != nullptr) {
+            // k13-fn: the work of the layer that does not depend on the experts (the shared expert, see moe_overlap_extra) goes after the
+            // device experts and before the merge, so the device computes it while the host still computes its missing experts (the
+            // merge waited for them first, then the shared expert ran); the same nodes and values, only their order (LLAMA_MOE_SINGLE_EXTRA=0: off)
+            static const bool single_extra = getenv("LLAMA_MOE_SINGLE_EXTRA") == nullptr || atoi(getenv("LLAMA_MOE_SINGLE_EXTRA")) != 0;
+            if (single_extra && overlap_extra != nullptr) {
+                ggml_build_forward_expand(gf, experts_d);
+                ggml_build_forward_expand(gf, overlap_extra);
+            }
             experts = moe_cache->single_merge(ctx0, ggml_is_contiguous(experts_d) ? experts_d : ggml_cont(ctx0, experts_d), single_pub);
             ggml_backend_sched_set_tensor_backend(sched, experts, dev);
             cb(experts, "ffn_moe_host_merge", il);
