@@ -1174,6 +1174,7 @@ struct ggml_backend_sched {
     bool ov_active; // the current graph uses the overlap
     int  ov_logged[4];
     int64_t n_input_relaxed; // k13-pp: graph-input uploads queued without a device sync (GGML_SCHED_INPUT_RELAXED)
+    bool    input_relax_ok;  // k13-pp: the current graph has no host split after a device split (set in compute_splits)
     struct ggml_backend_sched_overlap ov[GGML_SCHED_MAX_BACKENDS];
 
     char * context_buffer;
@@ -4091,7 +4092,7 @@ static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, st
     }
     // a graph input, or a view of one (e.g. the recurrent-state copy indices rs_s_copy): the copy reads the caller's host data
     const struct ggml_tensor * in_root = ggml_backend_sched_ov_root(input);
-    if (!ov && ov_ok && input_relaxed && in_root->op == GGML_OP_NONE && (in_root->flags & GGML_TENSOR_FLAG_INPUT) &&
+    if (!ov && ov_ok && input_relaxed && sched->input_relax_ok && in_root->op == GGML_OP_NONE && (in_root->flags & GGML_TENSOR_FLAG_INPUT) &&
             in_root->buffer == input->buffer) {
         ov = true;
         sched->n_input_relaxed++;
@@ -4230,6 +4231,25 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
 
     sched->pre_split = -1;
     sched->pre_nodes = 0;
+
+    // k13-pp: graph inputs take the relaxed upload only when no host split follows a device split. A later host split (e.g. MoE
+    // experts computed on the host) would wait for the relaxed upload at its start, i.e. for the previous graph, which moves
+    // that wait into the host split's own time (the CPU-miss calibration times host splits). Graphs whose only host split is
+    // the leading input split (token embeddings on the host, everything else on the device) keep the lever.
+    {
+        bool seen_device = false;
+        sched->input_relax_ok = true;
+        for (int i = 0; i < sched->n_splits; i++) {
+            if (ggml_backend_buft_is_host(sched->bufts[sched->splits[i].backend_id])) {
+                if (seen_device) {
+                    sched->input_relax_ok = false;
+                    break;
+                }
+            } else {
+                seen_device = true;
+            }
+        }
+    }
 
     int prev_backend_id = -1;
 
