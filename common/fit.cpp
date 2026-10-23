@@ -958,10 +958,44 @@ static void common_params_fit_impl(
         if (fit_moe_cache) {
             // order: the dense weights of all layers, then the cache (up to the requested size), then experts in device memory
             const size_t size_before = cparams->moe_cache_size;
+            const dmds_t dmds_cpu_moe_req = dmds_cpu_moe; // k13-small: the measurement at the requested cache size, for the retry below
             fit_moe_cache_size(dmds_cpu_moe, mparams, true);
             bool fits_per_device = cparams->moe_cache_size > 0;
             for (size_t id = 0; id < nd; id++) {
                 fits_per_device = fits_per_device && int64_t(dmds_cpu_moe[id].free) - int64_t(dmds_cpu_moe[id].mb.total()) >= margins[id];
+            }
+            // k13-small: a small device (G4 ballasted to 4 GB, Qwen3.6-35B-A3B Q3_K_M + MTP: the dense weights of every layer, the context and
+            // a cache fit only inside the 1024 MiB margin). Without this the fit moves 13 of 41 whole layers (attention, KV, recurrent state)
+            // to the CPU and drops the cache, so every token pays a graph split per CPU layer and per MoE layer (k12: 91 tok/s against
+            // PolyStrata's 177, which keeps every dense layer on the device). Here the margin of the one device drops to
+            // LLAMA_FIT_SMALL_MARGIN_MIB (256) instead: every layer stays on the device beside a small cache, whose host misses the
+            // single-graph path computes (no graph split). The placement is the one of -fitt 256; one GPU only, default margin only (an
+            // explicit smaller -fitt is the user's), LLAMA_FIT_SMALL_MARGIN_MIB=0 keeps the k12 placement.
+            if (!fits_per_device && nd == 1 && size_before > 0) {
+                const char * e_sm = getenv("LLAMA_FIT_SMALL_MARGIN_MIB");
+                const int64_t small_mib = e_sm != nullptr ? std::max<int64_t>(0, atoll(e_sm)) : 256;
+                constexpr int64_t m_default = 1024*MiB;
+                if (small_mib > 0 && small_mib*MiB < m_default && margins[0] >= m_default) {
+                    const int64_t margin_saved = margins[0];
+                    const dmds_t  dmds_nc_saved = dmds_cpu_moe;
+                    margins[0] = margin_saved - m_default + small_mib*MiB; // what was added to the default (a projector) stays
+                    dmds_cpu_moe = dmds_cpu_moe_req;
+                    cparams->moe_cache_size = size_before;
+                    fit_moe_cache_size(dmds_cpu_moe, mparams, true);
+                    const bool ok = cparams->moe_cache_size > 0 && cparams->moe_cache_size != size_before &&
+                        int64_t(dmds_cpu_moe[0].free) - int64_t(dmds_cpu_moe[0].mb.total()) >= margins[0];
+                    if (ok) {
+                        LOG_INF("%s: small device: every layer stays in device memory beside a MoE cache of %zu MiB, the fit margin drops from "
+                            "%" PRId64 " to %" PRId64 " MiB (otherwise layers move to the CPU; LLAMA_FIT_SMALL_MARGIN_MIB=0 keeps that)\n",
+                            __func__, cparams->moe_cache_size/MiB, margin_saved/MiB, margins[0]/MiB);
+                        fits_per_device = true;
+                    } else {
+                        margins[0] = margin_saved;
+                        dmds_cpu_moe = dmds_nc_saved;
+                        cparams->moe_cache_size = 0;
+                        g_moe_margin_gain = 0;
+                    }
+                }
             }
             bool keep = fits_per_device && cparams->moe_cache_size != size_before;
             if (fits_per_device && !keep) {
