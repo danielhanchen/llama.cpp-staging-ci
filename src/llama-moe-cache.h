@@ -81,6 +81,10 @@ public:
     bool cpu_miss_enabled() const; // LLAMA_MOE_CPU_MISS is on for this cache (until a failed calibration turns it off)
     // k13: the host never computes an expert of this cache (no hybrid path, no CPU misses): every expert runs on the device from a slot
     bool host_never() const;
+    // k13: the host computes the missing experts of small batches with a fixed fetch share of 0 (LLAMA_MOE_CACHE_FETCH=0): nothing is
+    // fetched or admitted between prompts, so which expert of a token the host computes depends on the token's own ids and the cache
+    // as the prompt left it, the same in a verify window as in a single token decode
+    bool host_split_frozen() const;
     bool cpu_miss_tick_sync(int64_t n_tokens) const;
     void cpu_miss_tick(int64_t n_tokens);
     // the ubatch of n_tokens is looked up on the device like a small batch: at most n_small_max tokens, or a short prompt whose missing

@@ -7483,7 +7483,7 @@ bool llama_verify_exact_placement(const llama_context * ctx) {
             const char * e = getenv("LLAMA_SPEC_EXACT_CACHE");
             return e == nullptr || atoi(e) != 0;
         }();
-        if (!env_ok || !ctx->get_moe_cache()->host_never()) {
+        if (!env_ok || !(ctx->get_moe_cache()->host_never() || ctx->get_moe_cache()->host_split_frozen())) {
             return false;
         }
         cache_ok = true;

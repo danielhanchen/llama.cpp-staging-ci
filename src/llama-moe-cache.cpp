@@ -6050,6 +6050,10 @@ bool llama_moe_cache::host_never() const {
     return !pimpl->hybrid && !pimpl->cm;
 }
 
+bool llama_moe_cache::host_split_frozen() const {
+    return pimpl->hybrid && pimpl->hybrid_fixed && !pimpl->cm && !pimpl->hybrid_auto && pimpl->hybrid_share <= 0.0f;
+}
+
 bool llama_moe_cache::cpu_miss_tick_sync(int64_t n_tokens) const {
     return pimpl->cm_tick_reads(n_tokens);
 }
