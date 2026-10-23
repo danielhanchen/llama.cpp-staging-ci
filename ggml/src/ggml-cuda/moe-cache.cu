@@ -811,8 +811,8 @@ static __global__ void moe_mailbox_merge(const float * d, const int32_t * hid, c
             ggml_moe_mailbox_hdr * hdr = (ggml_moe_mailbox_hdr *) mbox;
             const uint32_t seq = ctl->seq;
             if (hid[row] >= 0) {
-                // the timeout runs only while the host thread neither computes this batch (started) nor another one (busy): a slow
-                // but live host is waited for, so its result is always the split's (a timed-out ubatch is failed, see single_check)
+                // timeout_ns 0 (what llama_moe_cache passes): wait for the host as long as it takes, so the result is the split's; a
+                // nonzero timeout runs only while the host thread neither computes this batch (started) nor another one (busy)
                 uint64_t t0 = moe_mailbox_ns();
                 s = 1;
                 while (moe_mailbox_load_acquire(&hdr->completed) != seq) {
