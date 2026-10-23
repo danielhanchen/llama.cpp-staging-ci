@@ -986,10 +986,10 @@ static void common_params_fit_impl(
                 // per group instead of once per ubatch (G4 4 GB q3m: 76 MiB free with a 99 MiB cache, every group of 2+ ubatches split)
                 const char * e_sc = getenv("LLAMA_FIT_SMALL_CACHE_MIB");
                 const int64_t cap_mib = e_sc != nullptr ? std::max<int64_t>(0, atoll(e_sc)) : 48;
-                // a second, smaller margin when the first one leaves no cache (LLAMA_FIT_SMALL_MARGIN_MIN_MIB, 128; G4 4 GB Qwen3.6
-                // UD-Q4_K_XL + MTP: at 256 MiB the dense layers, the context and a 48 MiB cache miss by 120 MiB)
+                // opt-in second, smaller margin when the first one leaves no cache (LLAMA_FIT_SMALL_MARGIN_MIN_MIB=N): G4 4 GB Qwen3.6
+                // UD-Q4_K_XL + MTP placed every layer at 128 MiB but ran out of device memory in its first request (CUDA error, run k13r2)
                 const char * e_sm2 = getenv("LLAMA_FIT_SMALL_MARGIN_MIN_MIB");
-                const int64_t small_min_mib = std::min<int64_t>(small_mib, e_sm2 != nullptr ? std::max<int64_t>(0, atoll(e_sm2)) : 128);
+                const int64_t small_min_mib = std::min<int64_t>(small_mib, e_sm2 != nullptr ? std::max<int64_t>(0, atoll(e_sm2)) : small_mib);
                 if (g_moe_margin_auto && small_mib > 0 && small_mib*MiB < m_default && margins[0] >= m_default) {
                     const int64_t margin_saved = margins[0];
                     const dmds_t  dmds_nc_saved = dmds_cpu_moe;
