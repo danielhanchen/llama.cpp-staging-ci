@@ -135,6 +135,10 @@ public:
     void devseed_prepare(ggml_cgraph * gf, bool enable);
     // ok = false (the graph failed): the groups it may have seeded in part are cleared
     void devseed_end(ggml_cgraph * gf, bool ok);
+    // k11 (LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY): the device seed of a prefetched large ubatch that ran inside a merged layer-major graph, after
+    // that graph, from its routing (per layer in layer order: the routing outputs of the ubatch, still on the device where that graph left
+    // them); the admitted experts are uploaded from host memory; bytes / ms: what it uploaded and its time; false if nothing is seeded
+    bool devseed_replay(const std::vector<std::pair<int32_t, ggml_tensor *>> & rec, int64_t n_tokens, size_t & bytes, double & ms);
 
     // LLAMA_MOE_CACHE_SEED: 0 off, 1 only ubatches whose copies read their ids, 2 (default) also prefetched ubatches
     static int seed_mode();
