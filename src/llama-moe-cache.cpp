@@ -3813,7 +3813,17 @@ struct llama_moe_cache::impl {
         }
         const int    n     = std::max(1, n_threads);
         const double share = hybrid_k/(hybrid_k + n);
-        const float  q     = std::max(0.125f, (float) std::round(share*8.0)/8.0f);
+        float        q     = std::max(0.125f, (float) std::round(share*8.0)/8.0f);
+        // k13-small: a cache that holds almost none of the experts gains nothing from the fetched share: every fetched expert is copied
+        // over PCIe and evicted again (G4 4 GB q3m + MTP, 0.3% cached: 62 GB uploaded in 768 decode tokens, hit rate 7.8%); below
+        // LLAMA_MOE_CACHE_FETCH_MIN_FRAC (0.05) of the host experts cached the host computes every missing expert (share 0)
+        {
+            const char * e = getenv("LLAMA_MOE_CACHE_FETCH_MIN_FRAC");
+            const double min_frac = e != nullptr ? std::max(0.0, atof(e)) : 0.05;
+            if (cache_frac >= 0.0 && cache_frac < min_frac) {
+                q = 0.0f;
+            }
+        }
         if (q > 0.75f) {
             hybrid       = false;
             hybrid_det   = false;
