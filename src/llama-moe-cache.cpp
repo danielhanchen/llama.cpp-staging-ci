@@ -795,7 +795,6 @@ struct llama_moe_cache::impl {
     static constexpr int cm_win1 = 8;
     static constexpr int cm_win2 = 128;
     int      cm_seen  = 0;
-    bool     cm_rewin = true;  // k13-fn: a short rule window after every prompt (see cm_tick, LLAMA_MOE_CPU_MISS_PROMPT_REWIN)
     int      cm_nb    = 0;     // batches in the window
     int      cm_win   = cm_win1;
     bool     cm_have0 = false;
@@ -984,9 +983,6 @@ struct llama_moe_cache::impl {
                 cm_dbg = getenv("LLAMA_MOE_CPU_MISS_LOG") != nullptr && atoi(getenv("LLAMA_MOE_CPU_MISS_LOG")) != 0;
                 if (const char * env_s = getenv("LLAMA_MOE_CPU_MISS_SPLIT_SCALE")) {
                     cm_split_scale = std::max(0.0, atof(env_s));
-                }
-                if (const char * env_r = getenv("LLAMA_MOE_CPU_MISS_PROMPT_REWIN")) {
-                    cm_rewin = atoi(env_r) != 0;
                 }
             }
             // k10: k9's default gate (below) keeps its own domain, a cache of at most hybrid_max_frac of the host experts (decided once the
@@ -4336,21 +4332,7 @@ struct llama_moe_cache::impl {
 
     // before the graph of every ubatch (backends synchronized when cm_tick_reads)
     void cm_tick(int64_t n_tokens) {
-        if (!cm || !cm_cal) {
-            return;
-        }
-        if (!cm_counted(n_tokens)) {
-            // k13-fn: a prompt that the small-batch path does not serve rewrites the cache (copies, seeds, lent slots), so the miss rate
-            // of the windows before it no longer holds: the next window is a short one (cm_win1) that starts after the prompt. With the
-            // long window (cm_win2 = 128 small batches) a 256-token reply after a long prompt never saw a new decision: G4 Qwen3.8-Flash-Next
-            // UD-IQ4_XS 32 GB, a fresh server whose first request is an 8k prompt kept MTP verify batches of 3 off from a 7.6% miss rate
-            // measured on the warm-up request (20% after the prompt), every miss fetched, 92 tok/s. Counter based, so the same inputs give
-            // the same decisions. LLAMA_MOE_CPU_MISS_PROMPT_REWIN=0: the old windows
-            if (cm_rewin && !cm_force && cm_have0 && n_tokens > max_batch) {
-                cm_have0 = false;
-                cm_nb    = 0;
-                cm_win   = cm_win1;
-            }
+        if (!cm || !cm_cal || !cm_counted(n_tokens)) {
             return;
         }
         if (cm_share_of(n_tokens) < 1.0f) {
