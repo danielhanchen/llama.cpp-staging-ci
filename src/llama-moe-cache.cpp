@@ -4667,6 +4667,51 @@ struct llama_moe_cache::impl {
                 download(g);
             }
         }
+        // k13 diagnostic (LLAMA_MOE_CACHE_STATE_LOG=1): a hash of every group's slot map and state as the ubatch of n_tokens starts,
+        // logged when it changed; verify windows and single token decodes must see the same sequence of states
+        static const bool state_log = getenv("LLAMA_MOE_CACHE_STATE_LOG") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_STATE_LOG")) != 0;
+        if (state_log) {
+            static uint64_t n_ub = 0;
+            n_ub++;
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                group & g = groups[ig];
+                if (g.n_slots == 0 || !g.dev_lookup || g.map == nullptr) {
+                    continue;
+                }
+                std::vector<uint8_t> buf;
+                uint64_t h[3] = { 1469598103934665603ULL, 1469598103934665603ULL, 1469598103934665603ULL };
+                ggml_tensor * ts[3] = { g.map, g.state, g.counts };
+                ggml_backend_synchronize(devices[g.id].backend);
+                for (int k = 0; k < 3; ++k) {
+                    if (ts[k] == nullptr || ts[k]->buffer == nullptr) {
+                        continue;
+                    }
+                    buf.resize(ggml_nbytes(ts[k]));
+                    if (g.dev_newer || k > 0) {
+                        ggml_backend_tensor_get(ts[k], buf.data(), 0, buf.size());
+                    } else {
+                        // host state newer: the slot maps of the LRU
+                        buf.clear();
+                        for (int32_t il : g.layers) {
+                            const uint8_t * p = (const uint8_t *) g.lru.slot_map[il];
+                            buf.insert(buf.end(), p, p + g.lru.n_expert*sizeof(int32_t));
+                        }
+                    }
+                    for (uint8_t b : buf) {
+                        h[k] = (h[k] ^ b)*1099511628211ULL;
+                    }
+                }
+                static std::vector<uint64_t> last;
+                if (last.size() < 3*groups.size()) {
+                    last.resize(3*groups.size(), 0);
+                }
+                if (h[0] != last[3*ig] || h[1] != last[3*ig + 1]) { // (the counts carry statistics that every lookup writes)
+                    LLAMA_LOG_INFO("moe_cache_state: ub %llu n %lld group %zu dev %d map %016llx state %016llx counts %016llx\n", (unsigned long long) n_ub,
+                        (long long) n_tokens, ig, (int) g.dev_newer, (unsigned long long) h[0], (unsigned long long) h[1], (unsigned long long) h[2]);
+                    last[3*ig] = h[0]; last[3*ig + 1] = h[1]; last[3*ig + 2] = h[2];
+                }
+            }
+        }
     }
 
     // the scheduler places the prefetched copies of a large batch: they go to the last slots of the largest group of the device, which
