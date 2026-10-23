@@ -4475,6 +4475,32 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         ggml_backend_sched_free_device_buffers(sched.get());
         moe_cache->restore();
         lm_n_released++;
+    } else if (buf_after > buf_before) {
+        // k13-small: a group that grew the compute buffers leaves them at its size, and the decode after it computes in what is left: G4 at
+        // 4 GB, Qwen3.6 Q3_K_M + MTP with LLAMA_MOE_LM_RELEASE=0, a fresh server's first request (2100 tokens): the group grew 502 -> 534 MiB
+        // inside the 64 MiB headroom, 10.6 MiB stayed free and the decode ran out of device memory in the CUDA pool. With less than
+        // LLAMA_MOE_LM_SHRINK_FREE_MIB (512) free after the group the device compute buffers are freed (the next graph allocates what it
+        // needs, as without the merge); the routing kept for the seed of the next ubatch is copied to host memory first, so nothing else
+        // changes. 0 off
+        static const size_t lm_shrink_free = (size_t) (getenv("LLAMA_MOE_LM_SHRINK_FREE_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LM_SHRINK_FREE_MIB"))) : 512) << 20;
+        size_t free_min = SIZE_MAX;
+        for (auto & bk : backend_ptrs) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(bk);
+            if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                size_t fr = 0, tot = 0;
+                ggml_backend_dev_memory(dev, &fr, &tot);
+                free_min = std::min(free_min, fr);
+            }
+        }
+        if (free_min < lm_shrink_free) {
+            ggml_backend_sched_synchronize(sched.get());
+            lm_ids_host_keep();
+            ggml_backend_sched_free_device_buffers(sched.get());
+            if (lm_n_shrunk++ < 2) {
+                LLAMA_LOG_INFO("%s: the group grew the compute buffers %.2f -> %.2f MiB with %.2f MiB free left: device compute buffers freed "
+                    "(LLAMA_MOE_LM_SHRINK_FREE_MIB=0 keeps them)\n", __func__, buf_before/1048576.0, buf_after/1048576.0, free_min/1048576.0);
+            }
+        }
     }
 
     if (status != GGML_STATUS_SUCCESS) {
@@ -5680,6 +5706,35 @@ void llama_context::moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_ou
     }
     moe_cache_seq      = ubatch.seq_id_unq[0];
     moe_cache_pos_next = pos_max + 1;
+}
+
+void llama_context::lm_ids_host_keep() {
+    if (moe_cache_ids.empty()) {
+        return;
+    }
+    ggml_init_params params = { moe_cache_ids.size()*ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx(ggml_init(params));
+    std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> copies;
+    for (const auto & [w, ids] : moe_cache_ids) {
+        ggml_tensor * c = ggml_dup_tensor(ctx.get(), ids);
+        ggml_set_name(c, ids->name);
+        copies.emplace_back(w, c);
+    }
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type()));
+    if (!buf) {
+        moe_cache_ids.clear();
+        return;
+    }
+    std::vector<uint8_t> tmp;
+    for (size_t i = 0; i < copies.size(); ++i) {
+        const ggml_tensor * src = moe_cache_ids[i].second;
+        tmp.resize(ggml_nbytes(src));
+        ggml_backend_tensor_get(src, tmp.data(), 0, tmp.size());
+        ggml_backend_tensor_set(copies[i].second, tmp.data(), 0, tmp.size());
+        moe_cache_ids[i].second = copies[i].second;
+    }
+    lm_ids_ctx = std::move(ctx);
+    lm_ids_buf = std::move(buf);
 }
 
 void llama_context::moe_cache_refill_from_ids() {
