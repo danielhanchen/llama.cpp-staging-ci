@@ -903,6 +903,16 @@ struct llama_moe_cache::impl {
         if (single_auto && devices.size() != 1) {
             single_req = false; // the default single-graph host misses: one GPU only (multi-GPU is untested)
         }
+        // and at least LLAMA_MOE_SINGLE_MIN_CPUS (12) usable CPUs: the host thread waits beside a team of the decode threads - 1, which
+        // on a small VM computes slower than the split's full team (Colab T4, 8 vCPUs, 4 decode threads: -2..-5% decode against the
+        // split, the same host experts; Colab L4, 12 vCPUs: +3..+5%)
+        if (single_auto && single_req) {
+            const char * e = getenv("LLAMA_MOE_SINGLE_MIN_CPUS");
+            const uint32_t min_cpus = e != nullptr ? (uint32_t) std::max(0, atoi(e)) : 12u;
+            if (llama_sysmem::usable_cpus() < min_cpus) {
+                single_req = false;
+            }
+        }
         if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
             throw std::runtime_error("MoE cache does not support tensor parallelism");
         }
@@ -1880,6 +1890,39 @@ struct llama_moe_cache::impl {
         return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     }
 
+    // the rule weighs the cheaper split once this cache has a mailbox, or before the first one when every MoE layer the graphs built
+    // has the form the host plans compute and the device can map mailboxes: a decode of one token at a time (no draft) only gets a
+    // mailbox once the rule turns the host path on for it, which it did not while it weighed a full split (G4 LFM2.5 8 GB: 0 host
+    // experts, while a fixed share with the mailbox gave +46..+69% decode)
+    int  single_form_state = 0; // 0: no MoE layer seen, 1: every one has the form, -1: one does not (or no mailboxes on its device)
+    void single_note_form(int32_t il, bool ok) {
+        if (!ok) {
+            single_form_state = -1;
+        } else if (single_form_state == 0) {
+            ggml_backend_dev_t dev = il >= 0 && il < (int32_t) layers.size() && layers[il].ig >= 0 ? ggml_backend_get_device(backend(il)) : nullptr;
+            ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            const bool alloc = reg != nullptr && ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_mailbox_alloc") != nullptr &&
+                (!single_auto || strcmp(ggml_backend_reg_name(reg), "CUDA") == 0);
+            single_form_state = alloc ? 1 : -1;
+            if (single_form_state == 1) {
+                cm_skip_trials(true);
+            }
+        }
+    }
+    // LLAMA_MOE_SINGLE_KICK_GATE=0: kick the host thread for every small graph (k11 round 16-19 behaviour)
+    const bool single_kick_gate = [] {
+        const char * e = getenv("LLAMA_MOE_SINGLE_KICK_GATE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    bool single_weigh() const {
+        return single_reg || (single_weigh_early && single_form_state == 1 && single_req && !single_off && !single_no_alloc);
+    }
+    // LLAMA_MOE_SINGLE_WEIGH_EARLY=0: weigh the cheaper split only once a mailbox exists (k11 round 16 behaviour)
+    const bool single_weigh_early = [] {
+        const char * e = getenv("LLAMA_MOE_SINGLE_WEIGH_EARLY");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
     bool single_usable(int64_t n_tokens) const {
         return single_req && !single_off && !single_no_alloc && n_tokens >= 1 && n_tokens <= GGML_MOE_MAILBOX_MAX_TOKENS;
     }
@@ -2105,6 +2148,11 @@ struct llama_moe_cache::impl {
             return;
         }
         if (n_tokens < 1 || n_tokens > GGML_MOE_MAILBOX_MAX_TOKENS) {
+            return;
+        }
+        // no publish while the CPU-miss rule has the host path off for this batch size: the host thread sleeps instead of polling
+        // (G4 Flash-Next UD-IQ4_XS 32 GB, trials turned small batches off: 8k decode -3.5% against LLAMA_MOE_SINGLE=0 in 6 of 6 launches)
+        if (cm && single_kick_gate && cm_share_of(n_tokens) >= 1.0f) {
             return;
         }
         single_hub_t & h = single_hub();
@@ -3428,6 +3476,51 @@ struct llama_moe_cache::impl {
     // short prompts take the host path only once a trial found it faster for the small batches on this host and model (without a
     // trial: the model alone). G4 gpt-oss-20b Q2_K 8 GB and T4 Qwen3.6 UD-Q4_K_XL 8 GB without a draft: trials off, the 95-token chat
     // prompt -19% / -26% on the host path from the prior; where the trials kept it (Qwen3.6 8 GB MTP: G4 +18%, T4 +6%) it gained
+    // k11 (LLAMA_MOE_CPU_MISS_TRIAL_FRAC, default 0.20; 0 = the trials of k10 everywhere): a cache that holds less than this share of
+    // the host experts runs no warm phase and no timing trials (see cm_calibrate for the cells). Round 19
+    // (LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE, default 0.50): a cache whose host misses go through the single-graph mailbox (see
+    // single_weigh) skips them up to this share, since the trials judged the graph split the mailbox replaces. G4 8 GB / 32 GB, k10 on
+    // the same VM: no trials below 50% gave Qwen3.6 UD-Q3_K_M 8 GB (23.8%) +17% decode over the 20% rule and Flash-Next UD-IQ4_XS 32 GB
+    // (33.5%; "3 trials, small batches off") +9..+19% 2k / 8k, while gemma-4 8 GB (GELU experts: graph split, no mailbox) lost 3-12%
+    // without its trials, so it keeps them. An explicit LLAMA_MOE_CPU_MISS_TRIAL_FRAC sets both. The mailbox form is known from the
+    // first graph with the hybrid path, usually after the calibration: single_note_form calls this again (late) then, once, if no
+    // trial has completed
+    bool cm_trials_late_done = false;
+    bool cm_trials_skipped   = false;
+    bool cm_skip_trials(bool late) {
+        static const double trial_frac_env = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC");
+            return e != nullptr ? std::max(0.0, atof(e)) : -1.0;
+        }();
+        static const double trial_frac_single = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE");
+            return e != nullptr ? std::max(0.0, atof(e)) : 0.50;
+        }();
+        if (late && (cm_trials_late_done || !cm || !cm_cal || trial_frac_env >= 0.0 || cmt_n > 0 || cm_trials_skipped)) {
+            return false;
+        }
+        const bool mailbox = single_weigh() && single_usable(1);
+        const double trial_frac = trial_frac_env >= 0.0 ? trial_frac_env : (mailbox ? std::max(0.20, trial_frac_single) : 0.20);
+        const bool skip = cm_trial && !cm_force && cache_frac >= 0.0 && cache_frac < trial_frac;
+        if (late) {
+            cm_trials_late_done = true;
+        }
+        if (skip) {
+            cm_trials_skipped = true;
+            cmt_done      = -1;
+            cmt_wait      = -1;
+            cmt_t_prev    = -1;
+            cmw_on        = false;
+            cm_small_ok   = true;
+            cm_small_live = true;
+            cm_gen++;
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no timing trials at %.1f%% of the host experts cached (below %.0f%%%s%s): small "
+                "batches follow the cost model, short prompts stay on the plain cache (LLAMA_MOE_CPU_MISS_TRIAL_FRAC=0 restores the trials)\n",
+                tag, 100.0*cache_frac, 100.0*trial_frac, mailbox ? ", single-graph mailbox" : "", late ? ", from now on" : "");
+        }
+        return skip;
+    }
+
     bool cm_prompt_ok() const {
         return cmt_host_ok && (!cm_trial || (cmt_n > 0 && cm_small_ok));
     }
@@ -4018,23 +4111,7 @@ struct llama_moe_cache::impl {
         // (39% cached, the split costs more than modelled) and gpt-oss-20b Q2_K 8 GB (54%). Round 9 (G4 / L4 / T4, k10 on the same VM):
         // Qwen3.6 UD-Q4_K_XL 8 GB + MTP (16.8%) decode +5.6..+13.2% G4, +10.7..+21.0% L4; Q3_K_M 8 GB (23.8%) -1..-2% on G4, T4 UD-Q4_K_XL
         // 8 GB without a draft (22.2%) inside its spread: both stay above 0.20
-        static const double trial_frac = [] {
-            const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC");
-            return e != nullptr ? std::max(0.0, atof(e)) : 0.20;
-        }();
-        const bool trial_skip = cm_trial && !cm_force && cache_frac >= 0.0 && cache_frac < trial_frac;
-        if (trial_skip) {
-            cmt_done      = -1;
-            cmt_wait      = -1;
-            cmt_t_prev    = -1;
-            cmw_on        = false;
-            cm_small_ok   = true;
-            cm_small_live = true;
-            cm_gen++;
-            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no timing trials at %.1f%% of the host experts cached (below %.0f%%): small batches "
-                "follow the cost model, short prompts stay on the plain cache (LLAMA_MOE_CPU_MISS_TRIAL_FRAC=0 restores the trials)\n",
-                tag, 100.0*cache_frac, 100.0*trial_frac);
-        }
+        const bool trial_skip = cm_skip_trials(false);
         if (cm_trial && !cm_force && !trial_skip) {
             // warm phase first (see cmw_on): small batches off, the first trial starts in cm_tick
             cmt_done      = -1;
@@ -4266,7 +4343,7 @@ struct llama_moe_cache::impl {
                 const double f    = cm_share[n];
                 const double m    = cm_rate*D;
                 const double gain = m*(cm_tup - std::max(f*cm_tup, (1.0 - f)*tc));
-                const double need = (n <= max_batch ? cm_margin*cm_split_scale*cm_split*(single_reg && single_usable(n) ? single_split_frac : 1.0) :
+                const double need = (n <= max_batch ? cm_margin*cm_split_scale*cm_split*(single_weigh() && single_usable(n) ? single_split_frac : 1.0) :
                                      cm_margin_p*(cm_split + n*cm_act))*
                                     (cm_on[n] && cm_measured ? cm_hyst : 1.0);
                 // a batch above max_batch runs the host path in the groups whose slots hold its experts (see use_device), the
@@ -6035,6 +6112,10 @@ ggml_tensor * llama_moe_cache::single_publish(ggml_context * ctx, int32_t il, gg
         return nullptr;
     }
     return ggml_moe_mailbox_publish(ctx, host_ids, x, mb->mdev, mb->ctl, il);
+}
+
+void llama_moe_cache::single_note_form(int32_t il, bool ok) const {
+    pimpl->single_note_form(il, ok);
 }
 
 ggml_tensor * llama_moe_cache::single_merge(ggml_context * ctx, ggml_tensor * dev, ggml_tensor * pub) const {
