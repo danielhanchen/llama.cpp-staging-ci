@@ -2871,8 +2871,8 @@ struct llama_moe_cache::impl {
     // the host computes the misses of a batch of n_tokens: the fetch share, 1 = every missing expert is fetched
     float cm_share_of(int64_t n_tokens) const {
         if (cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_prompt_force) {
-            // default: at most 1/4 fetched. The rule's share (1/2 at 38 tokens, LFM2.5 8 GB) left 71 ms of zero-copy fetch kernels in a
-            // 122 ms prompt; G4 k11pgW at 1/4: LFM2.5 chat 444 tok/s (339 at the rule's share), Qwen3.6 360 (329); 1/8: LFM2.5 415
+            // default: at most 1/4 fetched. The rule's share (capped at 3/4) left 71 ms of zero-copy fetch kernels in a 38-token LFM2.5 8 GB
+            // prompt of 122 ms; G4 k11pgW at 1/4: LFM2.5 chat 444 tok/s (339 at the rule's share), Qwen3.6 360 (329); 1/8: LFM2.5 415
             return cm_prompt_share > 0.0f ? cm_prompt_share : std::min(cm_share[n_tokens], 0.25f);
         }
         if (!cm || !cm_cal || n_tokens < 1 || n_tokens > cm_max || cm_on[n_tokens] == 0 || (n_tokens <= max_batch ? !cm_small_live : !cm_prompt_ok())) {
