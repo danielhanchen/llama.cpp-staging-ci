@@ -1485,6 +1485,12 @@ bool llama_context::sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint3
         ggml_backend_dev_memory(dev, &free, &total);
         free -= std::min(free, released);
         free -= std::min(free, i < mem_reserve.size() ? mem_reserve[i] : (size_t) 0);
+        // k11: the cache memory kept for layer-major graphs (common, LLAMA_MOE_LAYER_MAJOR_RESERVE_*) is not free for the seed
+        // (LLAMA_MOE_LAYER_MAJOR_RESERVE_SEED=1: counted as free, as before)
+        static const size_t lm_reserved = getenv("LLAMA_MOE_LAYER_MAJOR_RESERVED_BYTES") != nullptr &&
+            (getenv("LLAMA_MOE_LAYER_MAJOR_RESERVE_SEED") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_RESERVE_SEED")) == 0) ?
+            (size_t) atoll(getenv("LLAMA_MOE_LAYER_MAJOR_RESERVED_BYTES")) : 0;
+        free -= std::min(free, lm_reserved);
         if (free < graph - cur_gph + margin) {
             LLAMA_LOG_WARN("%s: %s: the ubatch that seeds the MoE cache needs %.2f MiB more compute buffer, %.2f MiB free (with %.0f MiB of headroom): "
                 "prompts do not seed the cache from their own ids (a smaller --moe-cache-mib keeps the seed)\n", __func__,
@@ -3978,10 +3984,31 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     // beside the device seed (seed_sync off: the host seed of a ubatch's own ids does not fit) only the seed from an earlier member's
     // routing, which needs no larger graph
     const bool lm_seed_dev = moe_cache_devseed_on && lm_devseed_seed;
+    // k11 (LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY=1, opt-in, default off: no model / tier has passed the KLD gate with it yet, plans/k11_prompt.md
+    // 3n; it acts wherever the checkpoint merge is on, which other branches may turn on by default): a group merged across a ubatch break
+    // (llama_set_ubatch_breaks) whose last member is the only ubatch after it, a prefetched large one without outputs that would end its own
+    // batch: run by themselves, the members before the break seed as the batch they were (host seed from the routing of an earlier member),
+    // then the last one seeds on the device from its own routing (moe_cache_devseed_on). The merged graph does the first seed as that batch
+    // would, and the device seed of the last member runs after it (llama_moe_cache::devseed_replay), on the state the separate graph would
+    // have seen, so the cache ends up as with the separate batches
+    static const bool lm_replay_env = getenv("LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY")) != 0;
+    size_t rp_k = 0; // members before the break (0: no replay)
+    if (lm_replay_env && moe_cache_devseed_on && !moe_cache_seed_sync && group.size() >= 3 && !balloc->ubatch_breaks.empty()) {
+        const auto & last = group.back();
+        const int64_t b = last.n_tokens_before;
+        const auto & brk = balloc->ubatch_breaks;
+        if (std::find(brk.begin(), brk.end(), (int32_t) b) != brk.end() && last.n_outputs == 0 &&
+                (int64_t) last.ub->n_tokens >= prefetch_min_batch && n_tokens_all - b - (int64_t) last.ub->n_tokens <= llama_moe_cache::n_small_max &&
+                b - group[0].n_tokens_before > (int64_t) cparams.n_ubatch + llama_moe_cache::n_small_max) {
+            rp_k = group.size() - 1;
+        }
+    }
     if (lm_seed_env && moe_cache_seed_enabled && (moe_cache_seed_sync || lm_seed_dev) && !moe_cache_seed_auto) {
-        for (size_t k = 0; k < group.size(); ++k) {
+        // with the replay: the seed of the batch that ends at the break
+        const int64_t n_seed_all = rp_k > 0 ? group[rp_k].n_tokens_before : n_tokens_all;
+        for (size_t k = 0; k < (rp_k > 0 ? rp_k : group.size()); ++k) {
             const int64_t nt = group[k].ub->n_tokens;
-            if (nt > llama_moe_cache::n_small_max && n_tokens_all - group[k].n_tokens_before - nt <= llama_moe_cache::n_small_max) {
+            if (nt > llama_moe_cache::n_small_max && n_seed_all - group[k].n_tokens_before - nt <= llama_moe_cache::n_small_max) {
                 seed_k = (int) k;
             }
         }
@@ -4064,6 +4091,22 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                     std::none_of(lm_record.begin(), lm_record.end(), [&](const auto & r) { return r.second == ids; })) {
                 lm_record.emplace_back(w, ids);
             }
+        }
+    }
+
+    // the routing of the last member per layer, for the replayed device seed (the same outputs as lm_record, one per layer)
+    std::vector<std::pair<int32_t, const ggml_tensor *>> rp_ids;
+    if (rp_k > 0) {
+        for (const auto & [w, ids] : lm_record) {
+            int32_t il = -1;
+            if (moe_cache->devseed_bank(w, il) != nullptr && il >= 0 && ids->type == GGML_TYPE_I32 && ggml_is_contiguous(ids) &&
+                    std::none_of(rp_ids.begin(), rp_ids.end(), [&](const auto & r) { return r.first == il; })) {
+                rp_ids.emplace_back(il, ids);
+            }
+        }
+        std::sort(rp_ids.begin(), rp_ids.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+        if (rp_ids.empty()) {
+            rp_k = 0;
         }
     }
 
@@ -4358,9 +4401,28 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             (t1_us - t0_us)/1000.0, t_build_us/1000.0, t_set_us/1000.0, (ggml_time_us() - t1_us)/1000.0, gm ? "" : " (one by one)", n_sub);
     }
 
-    const bool seeded = lm_seed_active && !lm_seeded.empty();
+    bool seeded = lm_seed_active && !lm_seeded.empty();
     if (seeded) {
         lm_n_seeded++;
+    }
+    // the device seed of the last member, as its own graph would have done it (see rp_k), from its routing where the graph left it
+    bool replayed = false;
+    if (rp_k > 0 && gm != nullptr && status == GGML_STATUS_SUCCESS) {
+        ggml_backend_sched_synchronize(sched.get());
+        std::vector<std::pair<int32_t, ggml_tensor *>> rec;
+        for (const auto & [il, ids] : rp_ids) {
+            rec.emplace_back(il, const_cast<ggml_tensor *>(ids));
+        }
+        const int64_t nt = group.back().ub->n_tokens;
+        size_t rp_bytes = 0;
+        double rp_ms    = 0.0;
+        replayed = moe_cache->devseed_replay(rec, nt, rp_bytes, rp_ms);
+        if (lm_verbose || !lm_replay_logged) {
+            lm_replay_logged = true;
+            LLAMA_LOG_INFO("%s: device seed of ubatch %zu (%" PRId64 " tokens, after the break at %" PRId64 ") replayed after the merged graph: %s, "
+                "%zu layers, %.2f MiB uploaded again in %.2f ms (LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY=1)\n", __func__, rp_k, nt,
+                group[rp_k].n_tokens_before, replayed ? "done" : "not done", rec.size(), rp_bytes/1048576.0, rp_ms);
+        }
     }
     if (lm_verbose && src_k >= 0) {
         size_t n_ws = 0;
@@ -4387,7 +4449,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
 
     // the state moe_cache_seed_end leaves after the last ubatch of the group: its routing is kept for a later seed while the prompt goes on
     moe_cache_ids.clear();
-    moe_cache_seeded = seeded;
+    moe_cache_seeded = seeded || replayed;
     {
         const auto & last = group.back();
         if (status == GGML_STATUS_SUCCESS && last.n_outputs == 0 && last.ub->n_seqs_unq == 1 && moe_cache_seed_sync) {

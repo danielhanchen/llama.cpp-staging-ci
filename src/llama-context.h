@@ -601,6 +601,7 @@ private:
     bool lm_auto    = false;  // LLAMA_MOE_LAYER_MAJOR unset: on beside speculative decoding with a model
     int  lm_ub_max  = 16;     // ubatches per layer-major graph [LLAMA_MOE_LAYER_MAJOR_UB_MAX]
     bool lm_verbose = false;  // [LLAMA_MOE_LAYER_MAJOR_LOG]
+    bool lm_replay_logged = false; // k11: the first replayed device seed is logged (see decode_layer_major)
     // beside the device seed of prompt ubatches (moe_cache_devseed_on): groups run [LLAMA_MOE_LAYER_MAJOR_DEVSEED, default 1] and the
     // group seeds from the routing of the ubatch before its last one, as with the host seed [LLAMA_MOE_LAYER_MAJOR_DEVSEED_SEED, default 1]
     bool lm_devseed      = true;

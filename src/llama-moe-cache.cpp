@@ -630,6 +630,10 @@ struct llama_moe_cache::impl {
     size_t devseed_disabled = 0; // seed plans not run: their fills are not all on the device (see devseed_prepare)
     size_t devseed_admitted = 0; // experts they admitted
     size_t devseed_bytes    = 0;
+    size_t  devseed_replays      = 0; // device seeds replayed after a merged layer-major graph (devseed_replay)
+    size_t  devseed_replay_bytes = 0; // bytes they uploaded from host memory
+    int64_t devseed_replay_us    = 0; // their time (plans + uploads), synchronous
+    int64_t devseed_replay_up_us = 0; // of which the uploads
     bool   prefill_deferred = false; // the default seeding skipped the prefill at load, it runs if prompts cannot seed
     bool   prefilled_dev    = false; // prefill() filled device slots
     bool   resident_mode    = false; // resident mode: device slots and RAM tier filled at load (see init_host_cache)
@@ -4642,7 +4646,34 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // LLAMA_MOE_CACHE_STATE_LOG=1 (debug, k11 3l): a hash of the host cache state (slots, LRU order, scores) at the first small batch
+    // after large ones, i.e. what a prompt left for the decode
+    bool st_after_large = false;
+    void state_log() {
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&](int64_t v) { h ^= (uint64_t) v; h *= 1099511628211ull; };
+        bool stale = false;
+        for (const group & g : groups) {
+            stale = stale || g.dev_newer;
+            for (int32_t k : g.lru.key_of) { mix(k); }
+            for (int32_t k : g.lru.prev)   { mix(k); }
+            for (int32_t k : g.lru.next)   { mix(k); }
+            mix(g.lru.head); mix(g.lru.tail); mix(g.lru.w);
+            for (int32_t k : g.lru.scores) { mix(k); }
+        }
+        LLAMA_LOG_INFO("llama_moe_cache: state after the prompt: %016llx%s\n", (unsigned long long) h, stale ? " (device newer)" : "");
+    }
+
     void prepare(int64_t n_tokens) {
+        static const bool st_log = getenv("LLAMA_MOE_CACHE_STATE_LOG") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_STATE_LOG")) != 0;
+        if (st_log) {
+            if (n_tokens > n_small_max) {
+                st_after_large = true;
+            } else if (st_after_large) {
+                st_after_large = false;
+                state_log();
+            }
+        }
         ahead_epoch++;
         // a large batch plans the reads of its uploads with the RAM tier as it is: every read ahead is complete first
         if (ahead_on() && n_tokens > n_small_max) {
@@ -5648,6 +5679,170 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // k11 (LLAMA_MOE_LAYER_MAJOR_SEED_REPLAY): the device seed that a prefetched large ubatch run by itself does (devseed_prepare / the plans of
+    // its graph / devseed_end), for a ubatch that ran inside a merged layer-major graph without it: after that graph, from its routing (rec:
+    // per layer, in layer order, the routing outputs that graph left on the device). The plans run in layer order on the device state that the ubatch's
+    // own graph would have started from (the host state uploaded as devseed_prepare does), with the same seed shares; the experts they admit
+    // are uploaded from host memory (the graph's copies of them are gone) instead of filled from the expert products
+    bool devseed_replay(const std::vector<std::pair<int32_t, ggml_tensor *>> & rec, int64_t n_tokens, size_t & bytes_out, double & ms_out) {
+        bytes_out = 0;
+        ms_out    = 0.0;
+        if (n_tokens < devseed_min || rec.empty()) {
+            return false;
+        }
+        const int64_t t0 = ggml_time_us();
+        ggml_init_params params = { (2*rec.size() + 4)*ggml_tensor_overhead() + ggml_graph_overhead_custom(4*rec.size() + 16, false), nullptr, true };
+        ggml_context_ptr ctx { ggml_init(params) };
+        struct item { int32_t il; ggml_tensor * plan; };
+        std::vector<item> items;
+        int32_t last_il = -1;
+        ggml_backend_t backend = nullptr;
+        for (const auto & [il, ids] : rec) {
+            // the plans of a group come in layer order; the routing is read where the graph left it, on the device of the group
+            if (il <= last_il || ids == nullptr || ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids) || ids->ne[1] != n_tokens ||
+                    ids->data == nullptr || ids->buffer == nullptr || ggml_backend_buffer_is_host(ids->buffer)) {
+                return false;
+            }
+            last_il = il;
+            // a leaf over the routing output (the plan graph does not compute it again)
+            ggml_tensor * leaf = ggml_new_tensor(ctx.get(), ids->type, GGML_MAX_DIMS, ids->ne);
+            if (ggml_backend_tensor_alloc(ids->buffer, leaf, ids->data) != GGML_STATUS_SUCCESS) {
+                return false;
+            }
+            ggml_tensor * plan = devseed_plan(ctx.get(), il, leaf, n_tokens);
+            if (plan == nullptr) {
+                continue;
+            }
+            const ggml_backend_t b = devices[groups[layers[il].ig].id].backend;
+            if ((backend != nullptr && b != backend) ||
+                    ggml_backend_buft_get_device(ggml_backend_buffer_get_type(ids->buffer)) != ggml_backend_get_device(b)) {
+                return false;
+            }
+            backend = b;
+            items.push_back({ il, plan });
+        }
+        if (items.empty()) {
+            return false;
+        }
+        // the plan results in a buffer kept for the next replay
+        const size_t align = ggml_backend_get_alignment(backend);
+        size_t need = 0;
+        for (const auto & it : items) {
+            need += GGML_PAD(ggml_nbytes(it.plan), align);
+        }
+        if (!replay_buf || ggml_backend_buffer_get_size(replay_buf.get()) < need ||
+                ggml_backend_buffer_get_type(replay_buf.get()) != ggml_backend_get_default_buffer_type(backend)) {
+            replay_buf.reset(ggml_backend_alloc_buffer(backend, need));
+            if (!replay_buf) {
+                return false;
+            }
+        }
+        // all plan results, read back at once
+        ggml_tensor * all = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, (int64_t) (need/sizeof(int32_t)));
+        {
+            uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(replay_buf.get());
+            if (ggml_backend_tensor_alloc(replay_buf.get(), all, base) != GGML_STATUS_SUCCESS) {
+                return false;
+            }
+            size_t off = 0;
+            for (const auto & it : items) {
+                if (ggml_backend_tensor_alloc(replay_buf.get(), it.plan, base + off) != GGML_STATUS_SUCCESS) {
+                    return false;
+                }
+                off += GGML_PAD(ggml_nbytes(it.plan), align);
+            }
+        }
+        const int64_t ta = ggml_time_us();
+        std::vector<bool> used(groups.size(), false);
+        for (const auto & it : items) {
+            const int32_t ig = layers[it.il].ig;
+            group & g = groups[ig];
+            if (!used[ig]) {
+                used[ig] = true;
+                if (g.dev_newer) {
+                    download(g);
+                }
+                if (g.dev_gen != g.lru.gen) {
+                    upload(g);
+                }
+            }
+            int il = -1, pos = 0, n_seed_max = 0, n_cur = 0;
+            GGML_ASSERT(ggml_moe_cache_seed_info(it.plan, &il, &pos, &n_seed_max, &n_cur));
+            const int32_t n_avail = g.n_slots - g.lru.n_lent;
+            const int32_t n_layer = (int32_t) g.layers.size();
+            int32_t n_seed = n_avail / n_layer;
+            if (n_seed == 0) {
+                n_seed = pos < n_avail ? 1 : 0;
+            }
+            n_seed = std::min<int32_t>(n_seed, n_seed_max);
+            ggml_moe_cache_seed_set(it.plan, std::max(0, n_seed), std::max(0, n_avail));
+        }
+        const int64_t tb = ggml_time_us();
+        // one graph, the plans in layer order (as in the graph of the ubatch: they read and write one device state)
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), 4*rec.size() + 16, false);
+        for (const auto & it : items) {
+            ggml_build_forward_expand(gf, it.plan);
+        }
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                if (used[ig]) {
+                    devseed_clear(groups[ig]);
+                }
+            }
+            return false;
+        }
+        // the admitted experts and their slots: one read of all plan results
+        std::vector<int32_t> out(need/sizeof(int32_t));
+        ggml_backend_tensor_get(all, out.data(), 0, need);
+        const int64_t t1 = ggml_time_us();
+        // into their slots, in layer order (a later layer may evict a slot an earlier one filled: its upload comes later)
+        std::vector<moe_cache_lru::fill> fl;
+        size_t bytes = 0;
+        size_t off = 0;
+        for (const auto & it : items) {
+            const group & g = groups[layers[it.il].ig];
+            const int32_t * r = out.data() + off/sizeof(int32_t);
+            off += GGML_PAD(ggml_nbytes(it.plan), align);
+            const int32_t n_seed_max = (int32_t) (ggml_nelements(it.plan) - 1)/2;
+            const int32_t n = std::min(r[0], n_seed_max);
+            fl.clear();
+            for (int32_t j = 0; j < n; ++j) {
+                fl.push_back({ r[1 + j], r[1 + n_seed_max + j] });
+            }
+            std::sort(fl.begin(), fl.end(), [](const moe_cache_lru::fill & a, const moe_cache_lru::fill & b) { return a.expert < b.expert; });
+            if (!fl.empty()) {
+                bytes += upload_fills(backend, it.il, fl, nullptr);
+            }
+            devseed_admitted += n;
+            devseed_bytes    += (size_t) n*g.expert_bytes;
+        }
+        ggml_backend_synchronize(backend);
+        const int64_t t2 = ggml_time_us();
+        devseed_graphs++;
+        devseed_replays++;
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            if (used[ig]) {
+                group & g = groups[ig];
+                download(g);
+                if (seed_check && !verify_enabled) {
+                    verify(g, "after the replayed device seed");
+                }
+            }
+        }
+        const int64_t t3 = ggml_time_us();
+        if (getenv("LLAMA_MOE_LAYER_MAJOR_LOG") != nullptr) {
+            LLAMA_LOG_INFO("%s: replay: setup %.2f ms, state upload %.2f ms, plans %.2f ms, expert uploads %.2f ms, download %.2f ms\n", __func__,
+                (ta - t0)/1000.0, (tb - ta)/1000.0, (t1 - tb)/1000.0, (t2 - t1)/1000.0, (t3 - t2)/1000.0);
+        }
+        bytes_out = bytes;
+        ms_out    = (t3 - t0)/1000.0;
+        devseed_replay_us += t3 - t0;
+        devseed_replay_up_us += t2 - t1;
+        devseed_replay_bytes += bytes;
+        return true;
+    }
+    ggml_backend_buffer_ptr replay_buf; // the plan results of devseed_replay
+
     void seed(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * dst, const std::vector<int32_t> & counts, const std::vector<bool> & staged) {
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
@@ -5996,6 +6191,10 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu ubatches seeded on the device, %zu experts admitted, %.2f MiB\n", tag,
                 devseed_graphs, devseed_admitted, devseed_bytes/1024.0/1024.0);
         }
+        if (devseed_replays > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: %zu device seeds replayed after merged layer-major graphs: %.2f MiB uploaded again, %.2f ms (uploads %.2f ms)\n", tag,
+                devseed_replays, devseed_replay_bytes/1024.0/1024.0, devseed_replay_us/1000.0, devseed_replay_up_us/1000.0);
+        }
         if (seed_unstaged > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu expert tensor seeds skipped (planned expert not staged)\n", tag, seed_unstaged);
         }
@@ -6261,6 +6460,10 @@ void llama_moe_cache::devseed_prepare(ggml_cgraph * gf, bool enable) {
 
 void llama_moe_cache::devseed_end(ggml_cgraph * gf, bool ok) {
     pimpl->devseed_end(gf, ok);
+}
+
+bool llama_moe_cache::devseed_replay(const std::vector<std::pair<int32_t, ggml_tensor *>> & rec, int64_t n_tokens, size_t & bytes, double & ms) {
+    return pimpl->devseed_replay(rec, n_tokens, bytes, ms);
 }
 
 int llama_moe_cache::seed_mode() {
