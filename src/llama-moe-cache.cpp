@@ -800,6 +800,7 @@ struct llama_moe_cache::impl {
     int      cm_recal_after = 64;
     int      cm_recal_wait  = -1;
     static constexpr double cm_recal_tol = 0.20;
+    bool     cm_recal_pending = false; // (timed only between requests: 2 x ~40 ms inside a reply cost chat decode 2% on G4)
     int      cm_nb    = 0;     // batches in the window
     int      cm_win   = cm_win1;
     bool     cm_have0 = false;
@@ -4387,8 +4388,8 @@ struct llama_moe_cache::impl {
             (n_tokens > max_batch ? cm_n_prompt : cm_n_small)++;
         }
         if (cm_recal_wait > 0 && n_tokens <= max_batch && --cm_recal_wait == 0) {
-            hybrid_probe  = true; // the context calls probe before the next small batch: cm_calibrate re-times the host
-            cm_recal_wait = -1;
+            cm_recal_pending = true; // served when the server goes idle (llama_context::restore_pp_plan): cm_calibrate re-times the host
+            cm_recal_wait    = -1;
         }
         if (cm_force) {
             return;
@@ -6204,6 +6205,15 @@ void llama_moe_cache::cpu_miss_tick(int64_t n_tokens) {
 
 bool llama_moe_cache::small_batch(int64_t n_tokens) const {
     return n_tokens <= n_small_max || pimpl->cm_serves(n_tokens);
+}
+
+bool llama_moe_cache::recal_pending() const {
+    return pimpl->cm && pimpl->cm_cal && pimpl->cm_recal_pending;
+}
+
+void llama_moe_cache::recal(ggml_backend_t backend_cpu) {
+    pimpl->cm_recal_pending = false;
+    pimpl->cm_calibrate(backend_cpu);
 }
 
 bool llama_moe_cache::hybrid_probe_pending() const {

@@ -4981,6 +4981,14 @@ llm_graph_params llama_context::graph_params(
 // slower with n-gram drafting on). This restores the worst-case pp plan of sched_reserve once. The allocator only plans addresses:
 // outputs cannot change. LLAMA_PP_RERESERVE=0: off.
 bool llama_context::restore_pp_plan() {
+    // k13-fn: the slots are idle: the MoE cache's pending re-calibration of the CPU-miss host timings runs now, not inside a reply
+    if (moe_cache && backend_cpu != nullptr && moe_cache->recal_pending()) {
+        synchronize();
+        compute_n_tokens = -1;
+        set_compute_threads(false);
+        compute_n_tokens = 0;
+        moe_cache->recal(backend_cpu);
+    }
     static const bool pp_rereserve = getenv("LLAMA_PP_RERESERVE") == nullptr || atoi(getenv("LLAMA_PP_RERESERVE")) != 0;
     if (!pp_rereserve || !sched_plan_small || !memory || moe_cache || model.hparams.no_alloc || sched_need_reserve) {
         return false;
