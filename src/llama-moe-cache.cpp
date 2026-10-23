@@ -1264,6 +1264,21 @@ struct llama_moe_cache::impl {
             cache_frac    = host > 0.0 ? std::min(1.0, cached/host) : 1.0;
             host_uncached = std::max(0.0, host - cached);
         }
+        // k13-small: the default single-graph host misses need a cache that holds a real share of the experts. With almost every expert
+        // on the host (G4 at 4 GB, Qwen3.6 Q3_K_M + MTP, 0.7% cached) the split decodes faster: 155 / 131 tok/s chat / 2k against 129 /
+        // 120 with single-graph, same text (LLAMA_MOE_SINGLE=0 vs default at -fitt 256). The 8 GB tiers it was built for cache 17-38%.
+        // LLAMA_MOE_SINGLE_MIN_FRAC (0.05) is that share; an explicit LLAMA_MOE_SINGLE keeps its meaning.
+        if (single_auto && single_req) {
+            const char * e = getenv("LLAMA_MOE_SINGLE_MIN_FRAC");
+            const double min_frac = e != nullptr ? std::max(0.0, atof(e)) : 0.05;
+            if (cache_frac >= 0.0 && cache_frac < min_frac) {
+                single_req = false;
+                if (!model.hparams.no_alloc) {
+                    LLAMA_LOG_INFO("%s: MoE cache holds %.1f%% of the host experts: single-graph host misses off, the split computes them (below "
+                        "%.1f%%, LLAMA_MOE_SINGLE_MIN_FRAC)\n", __func__, 100.0*cache_frac, 100.0*min_frac);
+                }
+            }
+        }
         if (hybrid && cm && cm_gate && cache_frac <= hybrid_max_frac) {
             // the cache holds a small share of the experts: k9's default hybrid gate, deterministic share from the decode threads
             cm           = false;
