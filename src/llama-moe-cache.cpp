@@ -6185,6 +6185,10 @@ bool llama_moe_cache::freeze_small() {
     return pimpl->cm_freeze();
 }
 
+int llama_moe_cache::host_mode() const {
+    return pimpl->cm ? 2 : pimpl->hybrid ? 1 : 0;
+}
+
 bool llama_moe_cache::cpu_miss_tick_sync(int64_t n_tokens) const {
     return pimpl->cm_tick_reads(n_tokens);
 }

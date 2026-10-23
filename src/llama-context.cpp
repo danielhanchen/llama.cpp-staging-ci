@@ -7473,6 +7473,10 @@ bool llama_moe_freeze_small(llama_context * ctx) {
     return ctx != nullptr && ctx->moe_freeze_small();
 }
 
+int32_t llama_moe_host_mode(const llama_context * ctx) {
+    return ctx != nullptr && ctx->get_moe_cache() != nullptr ? ctx->get_moe_cache()->host_mode() : 0;
+}
+
 void llama_set_verify_exact(llama_context * ctx, bool value) {
     ctx->set_verify_exact(value);
 }

@@ -87,6 +87,9 @@ public:
     bool host_split_frozen() const;
     // k13: CPU misses: small batches (up to 8 tokens) fetch nothing and the host computes every miss, without trials; true if frozen
     bool freeze_small();
+    // k13: who computes the missing experts of small batches: 0 = never the host (every miss fetched), 1 = the hybrid path with a fixed
+    // share (the default gate of small caches, or LLAMA_MOE_CACHE_FETCH), 2 = the CPU-miss rule
+    int host_mode() const;
     bool cpu_miss_tick_sync(int64_t n_tokens) const;
     void cpu_miss_tick(int64_t n_tokens);
     // the ubatch of n_tokens is looked up on the device like a small batch: at most n_small_max tokens, or a short prompt whose missing

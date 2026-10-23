@@ -1550,11 +1550,23 @@ private:
                     SRV_INF("%s", "MoE cache: small batches frozen so the default n-gram drafts verify exactly (LLAMA_SPEC_EXACT_FROZEN=1, "
                         "LLAMA_MOE_CPU_MISS_FROZEN=0: off)\n");
                 }
-                if (llama_verify_exact_placement(ctx_tgt)) {
+                const int32_t host_mode = llama_moe_host_mode(ctx_tgt);
+                const int     spill     = llama_verify_exact_placement(ctx_tgt) ? -1 :
+                                          server_spec_spill_mode(server_spec_auto_arch(params_base.model.path), host_mode);
+                if (spill < 0) {
                     llama_set_verify_exact(ctx_tgt, true);
+                } else if (spill == 2 && llama_moe_freeze_small(ctx_tgt)) {
+                    // k13: frozen small batches, drafts verified batch invariant (exact against this frozen cache)
+                    llama_set_verify_exact(ctx_tgt, true);
+                    SRV_INF("%s", "n-gram drafting by default under the MoE cache: small batches frozen, drafts verified exactly against them "
+                        "(KLD-gated default, LLAMA_SPEC_SPILL=0: off)\n");
+                } else if (spill == 1) {
+                    // k13: drafts verified as ordinary batches with the host path: other greedy text, KLD-gated per model
+                    SRV_INF("%s", "n-gram drafting by default under the MoE cache: drafts verified as ordinary batches with the host path "
+                        "(KLD-gated default, LLAMA_SPEC_SPILL=0: off)\n");
                 } else {
                     SRV_INF("%s", "n-gram drafting by default stays off: host weights or a MoE cache, where verify rows are not computed as single "
-                        "token decodes (LLAMA_SPEC_AUTO_EXACT=0 drafts there, with other greedy text)\n");
+                        "token decodes (LLAMA_SPEC_AUTO_EXACT=0 drafts there, with other greedy text; LLAMA_SPEC_SPILL=1 / 2)\n");
                     spec.reset();
                 }
             }

@@ -18,7 +18,16 @@
 #include "../../src/llama-ext.h"
 
 #include <cstdlib>
+#include <algorithm>
 #include <string>
+
+// k13: default spill drafting modes per model and host path (see server_spec_spill_mode)
+#ifndef SPEC_SPILL_LFM_GATE
+#define SPEC_SPILL_LFM_GATE   0
+#define SPEC_SPILL_LFM_CM     0
+#define SPEC_SPILL_GEMMA4_GATE 0
+#define SPEC_SPILL_GEMMA4_CM  0
+#endif
 
 static int server_spec_auto_env() {
     const char * e = getenv("LLAMA_SPEC_AUTO");
@@ -76,4 +85,25 @@ static bool server_spec_auto_exact() {
 static bool server_spec_exact_frozen() {
     const char * e = getenv("LLAMA_SPEC_EXACT_FROZEN");
     return e != nullptr && atoi(e) != 0;
+}
+
+// k13: default n-gram drafts where a MoE cache's host computes experts (text changes, so a model gets it only after the KLD gate of
+// plans/k11.md passed for it, plans/k13_lfm.md). host_mode: llama_moe_host_mode. Returns 0 = no drafts (the k12 behaviour), 1 = drafts
+// verified as ordinary batches with the host path, 2 = frozen small batches with drafts verified exactly against them.
+// LLAMA_SPEC_SPILL=0 off, 1 / 2 force that mode for any model.
+static int server_spec_spill_mode(const std::string & arch, int32_t host_mode) {
+    if (const char * e = getenv("LLAMA_SPEC_SPILL")) {
+        return std::max(0, std::min(2, atoi(e)));
+    }
+    if (host_mode == 0) {
+        return 0;
+    }
+    // per (model, host path) after the KLD gate and the G4 timing (plans/k13_lfm.md section 10)
+    if (arch == "lfm2moe") {
+        return host_mode == 1 ? SPEC_SPILL_LFM_GATE : SPEC_SPILL_LFM_CM;
+    }
+    if (arch == "gemma4") {
+        return host_mode == 1 ? SPEC_SPILL_GEMMA4_GATE : SPEC_SPILL_GEMMA4_CM;
+    }
+    return 0;
 }
