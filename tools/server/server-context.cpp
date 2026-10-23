@@ -302,6 +302,7 @@ struct server_slot {
     std::vector<std::vector<llama_token_data>> spec_draft_q;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
+    std::vector<completion_token_output> spec_probs; // k13: n_probs of the accepted tokens, read from their verify rows before any rollback
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
 
@@ -1517,6 +1518,20 @@ private:
             spec_init.reset();
         }
 
+        // k13: default drafts where the host computes experts (server_spec_spill_mode) draft only from repeats of at least
+        // server_spec_spill_min_match tokens (short repeats cost a verify window of host experts for little)
+        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO && params_base.speculative.ngram_suffix.auto_mode && server_spec_auto_exact() &&
+                !llama_verify_exact_placement(ctx_tgt) &&
+                server_spec_spill_mode(server_spec_auto_arch(params_base.model.path), llama_moe_host_mode(ctx_tgt)) > 0) {
+            auto & ns = params_base.speculative.ngram_suffix;
+            const int mm = server_spec_spill_min_match(llama_moe_host_mode(ctx_tgt));
+            if (mm > ns.n_min_match) {
+                SRV_INF("n-gram drafting under the MoE cache: drafts from repeats of at least %d tokens (LLAMA_SPEC_SPILL_MIN_MATCH)\n", mm);
+                ns.n_min_match = mm;
+                ns.n_min_draft = std::max(ns.n_min_draft, mm);
+            }
+        }
+
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
@@ -1533,16 +1548,45 @@ private:
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
         }
 
+        // k13: LLAMA_MOE_CPU_MISS_FROZEN=1 freezes the small batches of a MoE cache with CPU misses (see llama_moe_freeze_small) with or
+        // without drafts; unset: only where it lets the default n-gram drafts verify exactly (below, LLAMA_SPEC_EXACT_FROZEN); 0: never
+        const int moe_frozen_env = getenv("LLAMA_MOE_CPU_MISS_FROZEN") != nullptr ? atoi(getenv("LLAMA_MOE_CPU_MISS_FROZEN")) : -1;
+        if (moe_frozen_env == 1 && llama_moe_freeze_small(ctx_tgt)) {
+            SRV_INF("%s", "MoE cache: small batches frozen (LLAMA_MOE_CPU_MISS_FROZEN=1)\n");
+        }
+
         if (spec) {
             SRV_TRC("%s", "speculative decoding context initialized\n");
             // k11-decode: the default drafts are verified batch invariant, so greedy output stays that of plain decoding; where the
             // placement cannot give single token bytes (host experts, a MoE cache) they stay off (LLAMA_SPEC_AUTO_EXACT=0 keeps them)
             if (params_base.speculative.ngram_suffix.auto_mode && server_spec_auto_exact()) {
-                if (llama_verify_exact_placement(ctx_tgt)) {
+                // k13: a MoE cache with CPU misses verifies exactly once its small batches are frozen
+                if (!llama_verify_exact_placement(ctx_tgt) && moe_frozen_env != 0 && server_spec_exact_frozen() && llama_moe_freeze_small(ctx_tgt)) {
+                    SRV_INF("%s", "MoE cache: small batches frozen so the default n-gram drafts verify exactly (LLAMA_SPEC_EXACT_FROZEN=1, "
+                        "LLAMA_MOE_CPU_MISS_FROZEN=0: off)\n");
+                }
+                const int32_t host_mode = llama_moe_host_mode(ctx_tgt);
+                const int     spill     = llama_verify_exact_placement(ctx_tgt) ? -1 :
+                                          server_spec_spill_mode(server_spec_auto_arch(params_base.model.path), host_mode);
+                if (spill < 0) {
                     llama_set_verify_exact(ctx_tgt, true);
+                } else if (spill == 2 && getenv("LLAMA_MOE_CPU_MISS_FROZEN_FETCH") == nullptr && llama_moe_freeze_small(ctx_tgt)) {
+                    // k13: frozen small batches, drafts verified batch invariant (exact against this frozen cache)
+                    llama_set_verify_exact(ctx_tgt, true);
+                    SRV_INF("%s", "n-gram drafting by default under the MoE cache: small batches frozen, drafts verified exactly against them "
+                        "(KLD-gated default, LLAMA_SPEC_SPILL=0: off)\n");
+                } else if (spill == 3 && llama_moe_pin_small(ctx_tgt)) {
+                    // k13: small batches always take the host path (no timing trials), fetch share and admissions kept; drafts verified
+                    // as ordinary batches: other greedy text, KLD-gated per model
+                    SRV_INF("%s", "n-gram drafting by default under the MoE cache: small-batch host path pinned on, drafts verified as ordinary "
+                        "batches (KLD-gated default, LLAMA_SPEC_SPILL=0: off)\n");
+                } else if (spill == 1 || spill == 3) {
+                    // k13: drafts verified as ordinary batches with the host path: other greedy text, KLD-gated per model
+                    SRV_INF("%s", "n-gram drafting by default under the MoE cache: drafts verified as ordinary batches with the host path "
+                        "(KLD-gated default, LLAMA_SPEC_SPILL=0: off)\n");
                 } else {
                     SRV_INF("%s", "n-gram drafting by default stays off: host weights or a MoE cache, where verify rows are not computed as single "
-                        "token decodes (LLAMA_SPEC_AUTO_EXACT=0 drafts there, with other greedy text)\n");
+                        "token decodes (LLAMA_SPEC_AUTO_EXACT=0 drafts there, with other greedy text; LLAMA_SPEC_SPILL=1 / 2)\n");
                     spec.reset();
                 }
             }
@@ -4831,6 +4875,18 @@ private:
                 } else {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 }
+                // k13: the probabilities of the accepted tokens come from their verify rows, read now (a rollback below may decode
+                // again); they were left empty, so drafted positions looked like a uniform distribution to the KLD gate
+                slot.spec_probs.clear();
+                if (slot.task->params.sampling.n_probs > 0 && !slot.spec_is_replay && synth_probs.empty()) {
+                    for (size_t i = 0; i < accepted.size() && i < slot.spec_i_batch.size(); ++i) {
+                        completion_token_output r;
+                        r.tok  = accepted[i];
+                        r.prob = 1.0f;
+                        populate_token_probs(slot, r, slot.task->params.post_sampling_probs, params_base.special, slot.spec_i_batch[i]);
+                        slot.spec_probs.push_back(std::move(r));
+                    }
+                }
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -4927,7 +4983,11 @@ private:
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
                 result.prob         = 1.0f; // set later
 
-                // TODO: set result.probs
+                // k13: see spec_probs (filled at the verify, before the rollback)
+                if (i < slot.spec_probs.size() && slot.spec_probs[i].tok == result.tok) {
+                    result.prob  = slot.spec_probs[i].prob;
+                    result.probs = std::move(slot.spec_probs[i].probs);
+                }
 
                 slot.stats.n_gen += 1;
 

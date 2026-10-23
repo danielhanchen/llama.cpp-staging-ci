@@ -56,7 +56,7 @@ static __global__ void moe_cache_assign(
         const int32_t * __restrict__ ids, int32_t * __restrict__ map, int32_t * __restrict__ state, int32_t * __restrict__ dst,
         const int n_ids, const int ne0, const int n_expert, const int il, const int n_slots,
         int32_t * __restrict__ counts, const int n_layer, const int fetch_q,
-        int32_t * __restrict__ scores, const int grow, const int advance, const int n_scores) {
+        int32_t * __restrict__ scores, const int grow, const int advance, const int n_scores, const int frozen = 0) {
     extern __shared__ int32_t smem[];
     int32_t * miss_e = smem;         // [n_ids] missing experts, in the order of their first use
     int32_t * victim = smem + n_ids; // [n_ids] slots given to them
@@ -76,6 +76,35 @@ static __global__ void moe_cache_assign(
     int32_t * fill_s = fill_e + n_ids;
     int32_t * cnt    = counts != nullptr ? counts + (int64_t) il*n_expert : nullptr;
     int32_t * sc     = scores != nullptr ? scores + (int64_t) il*n_expert : nullptr;
+
+    // frozen (ggml_moe_cache_assign_freeze, hybrid only): the cached experts are hits, every other one goes to the host; nothing is
+    // admitted and the state, counters and scores are not written (only the statistics), so a token gets the same slots in any batch
+    if (frozen && counts != nullptr) {
+        int n_hit = 0;
+        int n_mis = 0;
+        for (int i = lane; i < n_ids; i += MOE_CACHE_LANES) {
+            const int32_t e = moe_cache_id(ids, i, n_expert);
+            const int32_t s = row[e];
+            slots[i]             = s;
+            fill_s[2*n_ids + i]  = s;
+            fill_s[n_ids + i]    = s < 0 ? e : -1;
+            n_hit += s >= 0;
+            n_mis += s < 0;
+        }
+        for (int off = MOE_CACHE_LANES/2; off > 0; off >>= 1) {
+            n_hit += __shfl_xor_sync(full, n_hit, off, MOE_CACHE_LANES);
+            n_mis += __shfl_xor_sync(full, n_mis, off, MOE_CACHE_LANES);
+        }
+        if (lane == 0) {
+            *n_fill = 0;
+            *(unsigned long long *) (state + 2) += (unsigned long long) n_hit;
+            int32_t * stat = counts + (int64_t) n_layer*n_expert;
+            const unsigned long long n_host = ((unsigned long long) (uint32_t) stat[1] << 32 | (uint32_t) stat[0]) + (unsigned long long) n_mis;
+            stat[0] = (int32_t) (uint32_t) n_host;
+            stat[1] = (int32_t) (uint32_t) (n_host >> 32);
+        }
+        return;
+    }
 
     uint32_t epoch = (uint32_t) state[1] + 1;
     if (epoch == 0) {
@@ -1019,7 +1048,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
         moe_cache_assign<<<1, MOE_CACHE_LANES, (3*n_ids + (scores != nullptr ? 2*MOE_CACHE_WINDOW : 0))*sizeof(int32_t), stream>>>(
             (const int32_t *) ids->data, (int32_t *) map->data, (int32_t *) state->data, (int32_t *) dst->data,
             n_ids, ne0, n_expert, il, n_slots, (int32_t *) counts->data, (int) map->ne[1], fetch_q,
-            scores != nullptr ? (int32_t *) scores->data : nullptr, grow, advance, n_scores);
+            scores != nullptr ? (int32_t *) scores->data : nullptr, grow, advance, n_scores, ggml_get_op_params_i32(dst, 15));
         CUDA_CHECK(cudaGetLastError());
         return;
     }

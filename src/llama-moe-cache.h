@@ -79,6 +79,20 @@ public:
     // CPU misses [LLAMA_MOE_CPU_MISS]: the rule reads the device counters before the graph of some ubatches (synchronize the backends
     // first when cpu_miss_tick_sync), the tick goes before the graph of every ubatch
     bool cpu_miss_enabled() const; // LLAMA_MOE_CPU_MISS is on for this cache (until a failed calibration turns it off)
+    // k13: the host never computes an expert of this cache (no hybrid path, no CPU misses): every expert runs on the device from a slot
+    bool host_never() const;
+    // k13: frozen small batches (freeze_small): the host computes every miss of a small batch, nothing is fetched or admitted between
+    // prompts (the assign is frozen, see ggml_moe_cache_assign_freeze), so which expert of a token the host computes depends on the
+    // token's own ids and the cache as the prompts left it, the same in a verify window as in a single token decode
+    bool host_split_frozen() const;
+    // k13: CPU misses: small batches (up to 8 tokens) fetch nothing and the host computes every miss, without trials; true if frozen
+    bool freeze_small();
+    // k13: CPU misses: small batches (up to 8 tokens) take the host path without trials or miss-rate windows, but still fetch their
+    // share and admit (the cache follows the decode; not exact under drafts); true if pinned
+    bool pin_small();
+    // k13: who computes the missing experts of small batches: 0 = never the host (every miss fetched), 1 = the hybrid path with a fixed
+    // share (the default gate of small caches, or LLAMA_MOE_CACHE_FETCH), 2 = the CPU-miss rule
+    int host_mode() const;
     bool cpu_miss_tick_sync(int64_t n_tokens) const;
     void cpu_miss_tick(int64_t n_tokens);
     // the ubatch of n_tokens is looked up on the device like a small batch: at most n_small_max tokens, or a short prompt whose missing

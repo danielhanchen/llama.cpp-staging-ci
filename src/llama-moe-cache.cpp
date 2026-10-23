@@ -832,6 +832,14 @@ struct llama_moe_cache::impl {
     static constexpr double cmt_margin  = 0.03;
     static constexpr int    cmt_gap_max = 4096;
     bool     cm_trial      = true;
+    // k13: frozen small batches (cm_freeze): batches of at most cm_frozen_max tokens fetch nothing, the host computes every miss, no
+    // timing trial or miss-rate window changes that; which expert of a token the host computes then depends only on its own ids and
+    // the cache the prompts left, so a verify window splits each token as its single token decode does
+    static constexpr int64_t cm_frozen_max = 8;
+    bool     cm_frozen     = false;
+    // LLAMA_MOE_CPU_MISS_FROZEN_FETCH=1: the freeze pins only the decisions (host path on for the frozen sizes, no trials or windows);
+    // small batches still fetch their share and the assign still admits, so the cache follows the decode (not exact under drafts)
+    bool     cm_frozen_fetch = false;
     bool     cm_small_ok   = true;  // the last trial kept the host path for small batches
     bool     cm_small_live = true;  // the graphs of small batches use it now
     int      cmt_done   = -1;       // small batches of the running trial, -1 if none
@@ -3571,6 +3579,34 @@ struct llama_moe_cache::impl {
             std::min<int64_t>(n_tokens*n_expert_used, g.ref[0]->ne[2]) <= g.n_slots;
     }
 
+    // k13: see cm_frozen; only once calibrated (the warm-up decode calibrates), returns false otherwise or without CPU misses
+    // keep_fetch (cm_frozen_fetch, llama_moe_pin_small): pin the decisions only
+    bool cm_freeze(bool keep_fetch = false) {
+        if (!cm || !cm_cal || cm_frozen) {
+            return cm_frozen && cm_frozen_fetch == keep_fetch;
+        }
+        cm_frozen     = true;
+        cm_frozen_fetch = keep_fetch || (getenv("LLAMA_MOE_CPU_MISS_FROZEN_FETCH") != nullptr && atoi(getenv("LLAMA_MOE_CPU_MISS_FROZEN_FETCH")) != 0);
+        cm_trial      = false;
+        cmt_done      = -1;
+        cmt_wait      = -1;
+        cmt_t_prev    = -1;
+        cmw_on        = false;
+        cm_small_ok   = true;
+        cm_small_live = true;
+        for (int64_t n = 1; n <= cm_max; ++n) {
+            // batches above the frozen sizes (short prompts) keep the plain cache: their calibrated host path is timing-driven, and
+            // a frozen cache gives the same text in every run
+            cm_on[n] = n <= std::min<int64_t>({ cm_frozen_max, max_batch }) ? 1 : 0;
+        }
+        cm_gen++;
+        LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: small batches of up to %d tokens frozen: %s, "
+            "no timing trials (LLAMA_MOE_CPU_MISS_FROZEN=0 off)\n", tag, (int) std::min<int64_t>({ cm_frozen_max, max_batch, cm_max }),
+            cm_frozen_fetch ? "host path pinned on, the fetch share and admissions kept (LLAMA_MOE_CPU_MISS_FROZEN_FETCH=1)" :
+                              "nothing fetched, the host computes every miss");
+        return true;
+    }
+
     // a batch of more than max_batch tokens (a short prompt) that the host path serves: it is looked up on the device like a small batch
     // short prompts take the host path only once a trial found it faster for the small batches on this host and model (without a
     // trial: the model alone). G4 gpt-oss-20b Q2_K 8 GB and T4 Qwen3.6 UD-Q4_K_XL 8 GB without a draft: trials off, the 95-token chat
@@ -3630,6 +3666,9 @@ struct llama_moe_cache::impl {
 
     // the host computes the misses of a batch of n_tokens: the fetch share, 1 = every missing expert is fetched
     float cm_share_of(int64_t n_tokens) const {
+        if (cm_frozen && !cm_frozen_fetch && cm && cm_cal && n_tokens >= 1 && n_tokens <= std::min<int64_t>({ cm_frozen_max, max_batch, cm_max })) {
+            return 0.0f;
+        }
         if (cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_prompt_force) {
             // default: at most 1/4 fetched. The rule's share (capped at 3/4) left 71 ms of zero-copy fetch kernels in a 38-token LFM2.5 8 GB
             // prompt of 122 ms; G4 k11pgW at 1/4: LFM2.5 chat 444 tok/s (339 at the rule's share), Qwen3.6 360 (329); 1/8: LFM2.5 415
@@ -3707,10 +3746,21 @@ struct llama_moe_cache::impl {
         }
         const group & g = groups[layers[il].ig];
         ggml_tensor * op = ggml_moe_cache_assign(ctx, ids, g.map, g.state, g.counts, share, il);
-        if (g.scores != nullptr) {
+        if (host && split_frozen()) {
+            // k13: frozen small batches admit nothing between prompts, not even to the empty slots a lent graph left: the n-gram
+            // drafts of a verify window (rejected ones too) would admit experts a single token decode never sees
+            ggml_moe_cache_assign_freeze(op);
+        } else if (g.scores != nullptr) {
             ggml_moe_cache_set_scores(op, g.scores, g.lru.grow_q16, il == g.layers[0]);
         }
         return op;
+    }
+
+    // k13: frozen small batches of the CPU-miss rule (cm_freeze): the host computes every missing expert of a small batch, nothing is
+    // fetched and the assign admits nothing, not even to free slots (LLAMA_MOE_CACHE_FETCH=0 keeps its k12 behaviour: it fills free
+    // slots, so it is not frozen)
+    bool split_frozen() const {
+        return cm && cm_frozen && !cm_frozen_fetch;
     }
 
     ggml_tensor * hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res, bool ov) const {
@@ -4422,6 +4472,11 @@ struct llama_moe_cache::impl {
 
     // per batch size: on where the expected time saved per layer beats the cost of the host split
     void cm_decide() {
+        // k13: frozen small batches keep every per-size decision as it was at the freeze (a decision from the miss rate of a window
+        // would follow the drafts: their verify windows look up other tokens than single token decodes)
+        if (cm_frozen) {
+            return;
+        }
         const group * gp = nullptr;
         for (const group & g : groups) {
             if (g.dev_lookup && g.n_slots > 0 && g.counts != nullptr) {
@@ -4456,6 +4511,9 @@ struct llama_moe_cache::impl {
                     }
                 }
                 on = gain > need && (n <= max_batch || fits) ? 1 : 0;
+            }
+            if (cm_frozen && n <= std::min<int64_t>(cm_frozen_max, max_batch)) {
+                on = 1;
             }
             changed = changed || on != cm_on[n];
             cm_on[n] = on;
@@ -4744,6 +4802,51 @@ struct llama_moe_cache::impl {
                 g.dev_newer = true;
             } else if (g.dev_newer) {
                 download(g);
+            }
+        }
+        // k13 diagnostic (LLAMA_MOE_CACHE_STATE_LOG=1): a hash of every group's slot map and state as the ubatch of n_tokens starts,
+        // logged when it changed; verify windows and single token decodes must see the same sequence of states
+        static const bool state_log = getenv("LLAMA_MOE_CACHE_STATE_LOG") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_STATE_LOG")) != 0;
+        if (state_log) {
+            static uint64_t n_ub = 0;
+            n_ub++;
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                group & g = groups[ig];
+                if (g.n_slots == 0 || !g.dev_lookup || g.map == nullptr) {
+                    continue;
+                }
+                std::vector<uint8_t> buf;
+                uint64_t h[3] = { 1469598103934665603ULL, 1469598103934665603ULL, 1469598103934665603ULL };
+                ggml_tensor * ts[3] = { g.map, g.state, g.counts };
+                ggml_backend_synchronize(devices[g.id].backend);
+                for (int k = 0; k < 3; ++k) {
+                    if (ts[k] == nullptr || ts[k]->buffer == nullptr) {
+                        continue;
+                    }
+                    buf.resize(ggml_nbytes(ts[k]));
+                    if (g.dev_newer || k > 0) {
+                        ggml_backend_tensor_get(ts[k], buf.data(), 0, buf.size());
+                    } else {
+                        // host state newer: the slot maps of the LRU
+                        buf.clear();
+                        for (int32_t il : g.layers) {
+                            const uint8_t * p = (const uint8_t *) g.lru.slot_map[il];
+                            buf.insert(buf.end(), p, p + g.lru.n_expert*sizeof(int32_t));
+                        }
+                    }
+                    for (uint8_t b : buf) {
+                        h[k] = (h[k] ^ b)*1099511628211ULL;
+                    }
+                }
+                static std::vector<uint64_t> last;
+                if (last.size() < 3*groups.size()) {
+                    last.resize(3*groups.size(), 0);
+                }
+                if (h[0] != last[3*ig] || h[1] != last[3*ig + 1]) { // (the counts carry statistics that every lookup writes)
+                    LLAMA_LOG_INFO("moe_cache_state: ub %llu n %lld group %zu dev %d map %016llx state %016llx counts %016llx\n", (unsigned long long) n_ub,
+                        (long long) n_tokens, ig, (int) g.dev_newer, (unsigned long long) h[0], (unsigned long long) h[1], (unsigned long long) h[2]);
+                    last[3*ig] = h[0]; last[3*ig + 1] = h[1]; last[3*ig + 2] = h[2];
+                }
             }
         }
     }
@@ -6455,6 +6558,26 @@ bool llama_moe_cache::host_computes(int64_t n_tokens) const {
 
 bool llama_moe_cache::cpu_miss_enabled() const {
     return pimpl->cm;
+}
+
+bool llama_moe_cache::host_never() const {
+    return !pimpl->hybrid && !pimpl->cm;
+}
+
+bool llama_moe_cache::host_split_frozen() const {
+    return pimpl->split_frozen();
+}
+
+bool llama_moe_cache::freeze_small() {
+    return pimpl->cm_freeze();
+}
+
+bool llama_moe_cache::pin_small() {
+    return pimpl->cm_freeze(true);
+}
+
+int llama_moe_cache::host_mode() const {
+    return pimpl->cm ? 2 : pimpl->hybrid ? 1 : 0;
 }
 
 bool llama_moe_cache::cpu_miss_tick_sync(int64_t n_tokens) const {

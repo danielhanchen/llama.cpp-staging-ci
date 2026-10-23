@@ -106,6 +106,9 @@ struct llama_context {
 
     const llama_model   & get_model()   const;
     bool moe_cache_active() const { return moe_cache != nullptr; } // k11-decode
+    const llama_moe_cache * get_moe_cache() const { return moe_cache.get(); } // k13
+    bool moe_freeze_small(); // k13: see llama_moe_freeze_small
+    bool moe_pin_small();    // k13: see llama_moe_pin_small
     const llama_cparams & get_cparams() const;
 
     ggml_backend_sched_t get_sched() const;

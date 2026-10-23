@@ -2765,12 +2765,17 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
         return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     }
 
-    if (llama_n_rs_seq(ctx) > 0) {
+    // k13: with frozen MoE-cache small batches (LLAMA_MOE_CPU_MISS_FROZEN=1 / LLAMA_SPEC_EXACT_FROZEN=1) the probe decode below runs for
+    // recurrent rollback contexts too: its two tokens fill free cache slots before the freeze, so a context with drafts (rollback
+    // snapshots, no probe before) started from another cache than the same context without them, and the texts differed
+    const bool rs = llama_n_rs_seq(ctx) > 0;
+    const auto env_on = [](const char * n) { const char * e = getenv(n); return e != nullptr && atoi(e) != 0; };
+    if (rs && !(env_on("LLAMA_MOE_CPU_MISS_FROZEN") || env_on("LLAMA_SPEC_EXACT_FROZEN"))) {
         COM_TRC("%s", "the context supports bounded partial sequence removal\n");
         return COMMON_CONTEXT_SEQ_RM_TYPE_RS;
     }
 
-    common_context_seq_rm_type res = COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+    common_context_seq_rm_type res = rs ? COMMON_CONTEXT_SEQ_RM_TYPE_RS : COMMON_CONTEXT_SEQ_RM_TYPE_PART;
 
     llama_memory_clear(mem, true);
 
@@ -2793,7 +2798,7 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     }
 
     // try to remove the last tokens
-    if (!llama_memory_seq_rm(mem, 0, 1, -1)) {
+    if (!rs && !llama_memory_seq_rm(mem, 0, 1, -1)) {
         COM_TRC("%s", "the context does not support partial sequence removal\n");
         res = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
         goto done;

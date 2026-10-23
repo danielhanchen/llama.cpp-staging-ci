@@ -7655,6 +7655,26 @@ bool llama_prepare_prompt_plan(llama_context * ctx) {
     return ctx->restore_pp_plan();
 }
 
+bool llama_context::moe_freeze_small() {
+    return moe_cache != nullptr && moe_cache->freeze_small();
+}
+
+bool llama_moe_freeze_small(llama_context * ctx) {
+    return ctx != nullptr && ctx->moe_freeze_small();
+}
+
+bool llama_context::moe_pin_small() {
+    return moe_cache != nullptr && moe_cache->pin_small();
+}
+
+bool llama_moe_pin_small(llama_context * ctx) {
+    return ctx != nullptr && ctx->moe_pin_small();
+}
+
+int32_t llama_moe_host_mode(const llama_context * ctx) {
+    return ctx != nullptr && ctx->get_moe_cache() != nullptr ? ctx->get_moe_cache()->host_mode() : 0;
+}
+
 void llama_set_verify_exact(llama_context * ctx, bool value) {
     ctx->set_verify_exact(value);
 }
@@ -7662,11 +7682,34 @@ void llama_set_verify_exact(llama_context * ctx, bool value) {
 bool llama_verify_exact_placement(const llama_context * ctx) {
     // a MoE cache computes misses on the host or reads them per batch, and host weights run CPU kernels whose batch path is not the
     // single token path: verify rows there do not give the bytes of single token decodes (G4, LFM2.5 8 GB: other text)
-    if (ctx == nullptr || ctx->moe_cache_active()) {
+    if (ctx == nullptr) {
         return false;
+    }
+    // k13: a MoE cache whose host never computes an expert (no hybrid path, no CPU misses) runs every expert on the device from a slot,
+    // with the kernels of the resident case: its host expert tensors are only the source of the uploads (LLAMA_SPEC_EXACT_CACHE=0: off)
+    bool cache_ok = false;
+    if (ctx->moe_cache_active()) {
+        static const bool env_ok = [] {
+            const char * e = getenv("LLAMA_SPEC_EXACT_CACHE");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        // frozen small batches (the host computes the misses of small batches, nothing admitted) only with LLAMA_SPEC_EXACT_FROZEN=1:
+        // exact (k13, local B200, LFM2.5 5.5 GB cache: drafts = plain decode in chat / rep / 2k / 8k), opt-in because the frozen cache
+        // does not follow the decode (G4 LFM2.5 8 GB: chat +13%, 2k +16%, 8k -22% against the default)
+        static const bool frozen_ok = [] {
+            const char * e = getenv("LLAMA_SPEC_EXACT_FROZEN");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (!env_ok || !(ctx->get_moe_cache()->host_never() || (frozen_ok && ctx->get_moe_cache()->host_split_frozen()))) {
+            return false;
+        }
+        cache_ok = true;
     }
     for (const auto & [name, t] : ctx->get_model().tensors_by_name) {
         if (t != nullptr && t->buffer != nullptr && name.rfind("blk.", 0) == 0 && ggml_backend_buffer_is_host(t->buffer)) {
+            if (cache_ok && name.find("_exps") != std::string::npos) {
+                continue;
+            }
             return false;
         }
     }

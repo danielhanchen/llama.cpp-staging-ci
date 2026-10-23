@@ -3718,6 +3718,11 @@ struct ggml_tensor * ggml_moe_cache_seed_fill(
     return result;
 }
 
+void ggml_moe_cache_assign_freeze(struct ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_MOE_CACHE_LOOKUP && ggml_get_op_params_i32(op, 10) == 1);
+    ggml_set_op_params_i32(op, 15, 1);
+}
+
 void ggml_moe_cache_set_scores(
         struct ggml_tensor  * op,
         struct ggml_tensor  * scores,

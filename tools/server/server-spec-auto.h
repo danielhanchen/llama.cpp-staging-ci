@@ -18,7 +18,33 @@
 #include "../../src/llama-ext.h"
 
 #include <cstdlib>
+#include <algorithm>
 #include <string>
+
+// k13: default spill drafting modes per model and host path (see server_spec_spill_mode), gated by the KLD gate of plans/k11.md and the
+// G4 timing of plans/k13_lfm.md section 10 (both must pass):
+//   - LFM2.5 with the hybrid gate (small caches, G4 4 GB): mode 1 from repeats of at least 16 tokens (chat = kill switch, 2k +35%,
+//     8k +5%; decode KLD inside the -fa off band, first token unchanged);
+//   - LFM2.5 with the CPU-miss rule (G4 8 GB): off. Mode 3 (chat +28%, 2k +45%, 8k +39%) fails the first-token top-1 (0.875 vs 0.938),
+//     mode 3 from repeats of 12+ its first-token p99 (0.242 vs 0.233): LLAMA_SPEC_SPILL=3 opts in;
+//   - gemma-4: off (mode 1 loses chat by 1-1.7% on G4 8 GB; LLAMA_SPEC_SPILL=1 opts in).
+#ifndef SPEC_SPILL_LFM_GATE
+#define SPEC_SPILL_LFM_GATE   1
+#define SPEC_SPILL_LFM_CM     0
+#define SPEC_SPILL_GEMMA4_GATE 0
+#define SPEC_SPILL_GEMMA4_CM  0
+#endif
+#ifndef SPEC_SPILL_MIN_MATCH_GATE
+#define SPEC_SPILL_MIN_MATCH_GATE 16
+#define SPEC_SPILL_MIN_MATCH_CM   3
+#endif
+
+// k13: the shortest repeat the default spill drafts take (LLAMA_SPEC_SPILL_MIN_MATCH; 3 = every match of the index). host_mode 1 (the
+// hybrid gate) verifies a window with the fixed host share of every row, so short repeats lose there (G4 LFM2.5 4 GB chat: -2% from 3, -0.5..-0.9% from 12, = kill switch from 16)
+static int server_spec_spill_min_match(int32_t host_mode) {
+    const char * e = getenv("LLAMA_SPEC_SPILL_MIN_MATCH");
+    return std::max(3, e != nullptr ? atoi(e) : host_mode == 1 ? SPEC_SPILL_MIN_MATCH_GATE : SPEC_SPILL_MIN_MATCH_CM);
+}
 
 static int server_spec_auto_env() {
     const char * e = getenv("LLAMA_SPEC_AUTO");
@@ -69,4 +95,33 @@ static bool server_spec_auto_apply(common_params & params) {
 static bool server_spec_auto_exact() {
     const char * e = getenv("LLAMA_SPEC_AUTO_EXACT");
     return e == nullptr || atoi(e) != 0;
+}
+
+// k13: the default drafts freeze the small batches of a MoE cache with CPU misses so that they verify exactly (llama_moe_freeze_small);
+// opt-in (LLAMA_SPEC_EXACT_FROZEN=1): exact, but the frozen cache stops following the decode, a loss at long prompts (plans/k13_lfm.md)
+static bool server_spec_exact_frozen() {
+    const char * e = getenv("LLAMA_SPEC_EXACT_FROZEN");
+    return e != nullptr && atoi(e) != 0;
+}
+
+// k13: default n-gram drafts where a MoE cache's host computes experts (text changes, so a model gets it only after the KLD gate of
+// plans/k11.md passed for it, plans/k13_lfm.md). host_mode: llama_moe_host_mode. Returns 0 = no drafts (the k12 behaviour), 1 = drafts
+// verified as ordinary batches with the host path, 2 = frozen small batches with drafts verified exactly against them, 3 = as 1 with the
+// small-batch host path of the CPU-miss rule pinned on (llama_moe_pin_small; 1 where the cache has no CPU-miss rule).
+// LLAMA_SPEC_SPILL=0 off, 1 / 2 / 3 force that mode for any model.
+static int server_spec_spill_mode(const std::string & arch, int32_t host_mode) {
+    if (const char * e = getenv("LLAMA_SPEC_SPILL")) {
+        return std::max(0, std::min(3, atoi(e)));
+    }
+    if (host_mode == 0) {
+        return 0;
+    }
+    // per (model, host path) after the KLD gate and the G4 timing (plans/k13_lfm.md section 10)
+    if (arch == "lfm2moe") {
+        return host_mode == 1 ? SPEC_SPILL_LFM_GATE : SPEC_SPILL_LFM_CM;
+    }
+    if (arch == "gemma4") {
+        return host_mode == 1 ? SPEC_SPILL_GEMMA4_GATE : SPEC_SPILL_GEMMA4_CM;
+    }
+    return 0;
 }

@@ -124,6 +124,18 @@ LLAMA_API bool llama_exact_verify_enabled(void);
 // automatic n-gram drafting sets it, so drafting on by default leaves greedy output byte equal to plain decoding)
 LLAMA_API void llama_set_verify_exact(struct llama_context * ctx, bool value);
 
+// k13: a MoE cache with CPU misses (LLAMA_MOE_CPU_MISS) freezes its small batches (up to 8 tokens): nothing is fetched there, the host
+// computes every miss, no timing trials; the split of a token is then the same in a verify window as in its single token decode.
+// Returns true if frozen (false without such a cache or before its calibration)
+LLAMA_API bool llama_moe_freeze_small(struct llama_context * ctx);
+
+// k13: like llama_moe_freeze_small for the decisions only: small batches always take the host path for their misses (no timing trials,
+// no miss-rate windows), but still fetch their share and admit, so the cache follows the decode. Not exact under drafts. True if pinned
+LLAMA_API bool llama_moe_pin_small(struct llama_context * ctx);
+
+// k13: 0 = no MoE cache or its host never computes an expert, 1 = hybrid path with a fixed share (small caches), 2 = CPU-miss rule
+LLAMA_API int32_t llama_moe_host_mode(const struct llama_context * ctx);
+
 // k11-decode: restore the worst-case prompt plan of the graph allocator if a small graph (a verify window) re-planned it; a server
 // calls it when its slots go idle, so the next prompt does not pay for it (no-op otherwise; LLAMA_PP_RERESERVE=0: off)
 LLAMA_API bool llama_prepare_prompt_plan(struct llama_context * ctx);

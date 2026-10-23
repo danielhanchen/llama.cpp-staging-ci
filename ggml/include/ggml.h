@@ -1548,6 +1548,11 @@ extern "C" {
             float                 fetch,
             int                   il);
 
+    // frozen ggml_moe_cache_assign (op): no expert is admitted, not even to an empty slot, and the cache state, the use counters and
+    // the scores are not written (only the statistics), so the slots and host ids of a token depend on its own ids alone, the same
+    // in a batch of several tokens as in one of a single token, whatever earlier lookups saw
+    GGML_API void ggml_moe_cache_assign_freeze(struct ggml_tensor * op);
+
     // copies the experts admitted by ggml_moe_cache_assign (res) from host memory to the banks
     // result: I32 [n_expert_used, n_tokens], the slots for ggml_mul_mat_id with a bank (-1: computed elsewhere)
     // overlap: the copies run beside the graph (CUDA: a second stream) and the result holds only the admitted slots (hits -1);
