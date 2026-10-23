@@ -4024,10 +4024,21 @@ struct llama_moe_cache::impl {
         // (39% cached, the split costs more than modelled) and gpt-oss-20b Q2_K 8 GB (54%). Round 9 (G4 / L4 / T4, k10 on the same VM):
         // Qwen3.6 UD-Q4_K_XL 8 GB + MTP (16.8%) decode +5.6..+13.2% G4, +10.7..+21.0% L4; Q3_K_M 8 GB (23.8%) -1..-2% on G4, T4 UD-Q4_K_XL
         // 8 GB without a draft (22.2%) inside its spread: both stay above 0.20
-        static const double trial_frac = [] {
+        static const double trial_frac_env = [] {
             const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC");
-            return e != nullptr ? std::max(0.0, atof(e)) : 0.20;
+            return e != nullptr ? std::max(0.0, atof(e)) : -1.0;
         }();
+        // k11 round 19 (LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE, default 0.50): a cache whose host misses go through the single-graph
+        // mailbox (see single_weigh) skips the trials up to this share; the trials judged the graph split, which the mailbox replaces.
+        // G4 8 GB / 32 GB, k10 on the same VM: no trials below 50% gave Qwen3.6 UD-Q3_K_M 8 GB (23.8%) +17% decode over the 20% rule and
+        // Flash-Next UD-IQ4_XS 32 GB (33.5%; "3 trials, small batches off") +9..+19% 2k / 8k, while gemma-4 8 GB (GELU experts: graph
+        // split, no mailbox) lost 3-12% without its trials, so it keeps them. An explicit LLAMA_MOE_CPU_MISS_TRIAL_FRAC sets both
+        static const double trial_frac_single = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE");
+            return e != nullptr ? std::max(0.0, atof(e)) : 0.50;
+        }();
+        const double trial_frac = trial_frac_env >= 0.0 ? trial_frac_env :
+            (single_weigh() && single_usable(1) ? std::max(0.20, trial_frac_single) : 0.20);
         const bool trial_skip = cm_trial && !cm_force && cache_frac >= 0.0 && cache_frac < trial_frac;
         if (trial_skip) {
             cmt_done      = -1;
