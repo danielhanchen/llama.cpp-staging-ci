@@ -1820,7 +1820,7 @@ struct llama_moe_cache::impl {
     // and activations of each layer to a mailbox in mapped host memory (ggml_moe_mailbox_publish) instead of a graph split; a host
     // thread (single_service) computes those experts with the ops of the split path (mul_mat_id up / gate, swiglu, mul_mat_id down), on
     // a CPU backend of single_threads threads, so the results are the ones of the split; the merge waits for it on the device. A merge
-    // that waits longer than LLAMA_MOE_SINGLE_TIMEOUT_MS (1000) writes NaN and flags the mailbox: the next ubatches take the split again.
+    // never gives up (see single_timeout_ms).
     struct single_plan {
         ggml_context_ptr ctx;
         ggml_cgraph    * gf     = nullptr;
@@ -1852,9 +1852,13 @@ struct llama_moe_cache::impl {
         return e == nullptr || atoi(e) != 0;
 #endif
     }();
+    // LLAMA_MOE_SINGLE_TIMEOUT_MS (default 1000): only a warning. The merges never give up: they wait for the host thread as long as it
+    // computes, like the split path waits for its host graph, so the result is always the split's (k12 report: a 1000 ms timeout on a
+    // host at load 500-1100 wrote NaN rows into the ubatch it gave up on, and into the KV cells later requests read). The host thread
+    // logs a batch that took longer than this; a host graph that fails is computed again, and a second failure aborts
     const int single_timeout_ms = [] {
         const char * e = getenv("LLAMA_MOE_SINGLE_TIMEOUT_MS");
-        return e != nullptr ? std::max(1, atoi(e)) : 1000;
+        return e != nullptr ? std::max(0, atoi(e)) : 1000;
     }();
     // the split the rule weighs for these batches: a publish and a merge instead of a graph split (LLAMA_MOE_SINGLE_SPLIT_FRAC), only
     // once this cache has a mailbox (a form the host thread computes: G4 gpt-oss-20b Q2_K, with biases, kept the split and lost 18-20%
@@ -1864,6 +1868,7 @@ struct llama_moe_cache::impl {
         return e != nullptr ? std::max(0.0, atof(e)) : 0.2;
     }();
     bool single_off     = false;  // a mailbox failed: back to the split for good
+    int  single_warned  = 0;      // slow host batches logged
     bool single_no_alloc = false; // a context that only measures memory: no mailboxes
     int  single_threads = 0;
     bool single_reg     = false;  // registered with the hub
@@ -1963,7 +1968,7 @@ struct llama_moe_cache::impl {
             h.thr = std::thread(single_service);
         }
         LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses on (LLAMA_MOE_SINGLE): batches of up to %d tokens, %d host threads "
-            "(one host thread for every cache of the process), timeout %d ms\n", tag, GGML_MOE_MAILBOX_MAX_TOKENS, h.threads,
+            "(one host thread for every cache of the process), slow-batch warning above %d ms (merges never time out)\n", tag, GGML_MOE_MAILBOX_MAX_TOKENS, h.threads,
             single_timeout_ms);
         return true;
     }
@@ -2080,18 +2085,34 @@ struct llama_moe_cache::impl {
             if (req == mb.done || (stall_after >= 0 && (int64_t) single_batches >= stall_after)) {
                 continue;
             }
+            // LLAMA_MOE_SINGLE_DEBUG_DELAY_PHASE=1 (test): the delay before the pickup, as if the host thread were not scheduled
+            single_debug_delay(false);
             work = true;
             bool ok = false;
             const int n_tokens = hdr->n_tokens;
             single_plan * p = nullptr;
+            // picked up: the merge on the device waits for this batch without a timeout from now on (see moe_mailbox_merge)
+            __atomic_store_n(&hdr->started, req, __ATOMIC_RELEASE);
             if (!single_failed.load(std::memory_order_relaxed) && n_tokens >= 1 && n_tokens <= GGML_MOE_MAILBOX_MAX_TOKENS &&
                     single_plan_get(mb, n_tokens, p)) {
                 const int64_t t0 = single_now_us();
+                single_hub_busy(true);
+                single_debug_delay(true);
                 ok = ggml_backend_graph_compute(cpu, p->gf) == GGML_STATUS_SUCCESS;
+                if (!ok) {
+                    // the device waits for this batch: computed again, a second failure is fatal (never a wrong row)
+                    ok = ggml_backend_graph_compute(cpu, p->gf) == GGML_STATUS_SUCCESS;
+                    GGML_ASSERT(ok && "single-graph host misses: the host graph failed twice");
+                }
+                single_hub_busy(false);
                 const int64_t dt = single_now_us() - t0;
                 single_us += dt;
                 single_slow += dt > 1000;
                 single_max_us = std::max(single_max_us, dt);
+                if (single_timeout_ms > 0 && dt > 1000*(int64_t) single_timeout_ms && single_warned++ < 8) {
+                    LLAMA_LOG_WARN("llama_moe_cache%s: single-graph host misses: a host batch took %.1f ms (above %d ms, "
+                        "LLAMA_MOE_SINGLE_TIMEOUT_MS); the device waited for it\n", tag, dt/1000.0, single_timeout_ms);
+                }
                 const int32_t * ids = (const int32_t *) ((const char *) mb.host + ggml_moe_mailbox_off_ids());
                 for (int j = 0; j < mb.n_used*n_tokens; ++j) {
                     single_rows += ids[j] >= 0;
@@ -2107,6 +2128,33 @@ struct llama_moe_cache::impl {
         }
         return work;
     }
+
+    // nonzero busy in every mailbox of the process while the host thread computes one batch: merges waiting on another mailbox
+    // (an MTP context) do not time out behind it. Called by the host thread with reg_mtx held
+    static void single_hub_busy(bool on) {
+        single_hub_t & h = single_hub();
+        for (impl * o : h.owners) {
+            for (size_t i = 0; i < o->mbox_n; ++i) {
+                mailbox * mbp = o->mbox_live[i].load(std::memory_order_acquire);
+                if (mbp != nullptr) {
+                    __atomic_store_n(&((ggml_moe_mailbox_hdr *) mbp->host)->busy, on ? 1u : 0u, __ATOMIC_RELEASE);
+                }
+            }
+        }
+    }
+
+    // test only: LLAMA_MOE_SINGLE_DEBUG_DELAY_MS=D sleeps D ms in every LLAMA_MOE_SINGLE_DEBUG_DELAY_EVERY-th (25) host batch, after
+    // the pickup (a slow host batch, the default: the merge must keep waiting) or before it (LLAMA_MOE_SINGLE_DEBUG_DELAY_PHASE=1:
+    // a host thread that is not scheduled; a delay above LLAMA_MOE_SINGLE_TIMEOUT_MS then times the merge out)
+    void single_debug_delay(bool picked) {
+        static const int delay_ms = [] { const char * e = getenv("LLAMA_MOE_SINGLE_DEBUG_DELAY_MS"); return e != nullptr ? atoi(e) : 0; }();
+        static const int every    = [] { const char * e = getenv("LLAMA_MOE_SINGLE_DEBUG_DELAY_EVERY"); return e != nullptr ? std::max(1, atoi(e)) : 25; }();
+        static const int phase    = [] { const char * e = getenv("LLAMA_MOE_SINGLE_DEBUG_DELAY_PHASE"); return e != nullptr ? atoi(e) : 0; }();
+        if (delay_ms > 0 && (phase == 1) != picked && (single_batches + 1) % every == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        }
+    }
+
 
     static void single_service() {
         single_hub_t & h = single_hub();
@@ -3851,7 +3899,9 @@ struct llama_moe_cache::impl {
             // the decisions of every batch size are in the graph: a new decision rebuilds the graphs
             return 3 + (ov_live ? 4 : 0) + 8*(int) (cm_gen & 0xfffff);
         }
-        return (!hybrid ? 0 : hybrid_active() ? 2 : 1) + (ov_live ? 4 : 0);
+        // a single-graph failure (single_off) rebuilds the graphs without their mailboxes: a reused graph would keep merging from a
+        // mailbox whose control block says failed (wrong rows in every later ubatch with a pinned fetch share, LLAMA_MOE_CACHE_FETCH)
+        return (!hybrid ? 0 : hybrid_active() ? 2 : 1) + (ov_live ? 4 : 0) + (single_off ? 8 : 0);
     }
 
     // auto trial, called before the graph of every ubatch while a trial runs or waits, after the previous ubatch finished
@@ -6237,7 +6287,7 @@ void llama_moe_cache::single_note_form(int32_t il, bool ok) const {
 }
 
 ggml_tensor * llama_moe_cache::single_merge(ggml_context * ctx, ggml_tensor * dev, ggml_tensor * pub) const {
-    return ggml_moe_mailbox_merge(ctx, dev, pub, pimpl->single_timeout_ms);
+    return ggml_moe_mailbox_merge(ctx, dev, pub, 0); // no timeout: the merge waits for the host (see single_timeout_ms)
 }
 
 void llama_moe_cache::single_kick(int64_t n_tokens) {
