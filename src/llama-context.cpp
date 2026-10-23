@@ -4251,13 +4251,34 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         // MoE cache (slots lent for the group and refilled after it, as its staging copies are) instead of being split; the merged graph
         // runs the same ubatches, only where its tensors live changes
         static const bool lm_lend = getenv("LLAMA_MOE_LM_LEND") == nullptr || atoi(getenv("LLAMA_MOE_LM_LEND")) != 0;
-        const bool lend_g = lm_lend && moe_cache->lends_on_any();
+        // k13-small: the graph borrows only once its growth did not fit: the lend scope places the whole graph allocation in cache slots,
+        // which were lent (and their experts refilled after the group) even where the compute buffers could grow in free memory. G4
+        // gemma-4 26B-A4B Q3_K_M + drafter at 8 GB, 2k: 393 instead of 241 slots lent, a different cache after the prompt (another text than
+        // k10) and 287 instead of 325 tok/s decode, prompt 4815 instead of 5014 (LLAMA_MOE_LM_LEND=0). LLAMA_MOE_LM_LEND_FIRST=1: lend at once (k12)
+        static const bool lm_lend_first = getenv("LLAMA_MOE_LM_LEND_FIRST") != nullptr && atoi(getenv("LLAMA_MOE_LM_LEND_FIRST")) != 0;
+        const bool lend_ok = lm_lend && moe_cache->lends_on_any();
+        bool lend_g = lend_ok && lm_lend_first;
         if (lend_g) {
             moe_cache->set_graph_lend(true);
             ggml_backend_sched_set_alloc_lend_graph(sched.get(), true);
         }
         ggml_status st = run(g);
         if (lend_g) {
+            moe_cache->set_graph_lend(false);
+        }
+        if (st == GGML_STATUS_ALLOC_FAILED && lend_ok && !lend_g && ggml_backend_sched_get_alloc_over(sched.get()) > 0) {
+            // the growth did not fit in free memory: as the split below would, undo the scheduler's copies, then the same graph with the
+            // allocation lent by the cache
+            for (auto & [node, arr] : srcs) {
+                std::copy(arr.begin(), arr.end(), node->src);
+            }
+            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_use_full_hash(sched.get());
+            ggml_backend_sched_set_alloc_limit(sched.get(), true, lm_grow_max);
+            lend_g = true;
+            moe_cache->set_graph_lend(true);
+            ggml_backend_sched_set_alloc_lend_graph(sched.get(), true);
+            st = run(g);
             moe_cache->set_graph_lend(false);
         }
         ggml_backend_sched_set_alloc_limit(sched.get(), false, 0);
