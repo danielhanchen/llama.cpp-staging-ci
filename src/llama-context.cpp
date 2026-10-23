@@ -4862,13 +4862,7 @@ ggml_cgraph * llama_context::graph_reserve(
             res->reset();
         }
     }
-    // k13: the kept small graphs stay valid across the pp plan restore of an idle server (restore_pp_plan): a swap-in allocates them
-    // again in the re-planned scheduler, so only the shared graph is dropped (G4 LFM2.5 32 GB: every request rebuilt its decode and
-    // verify graphs and captured their CUDA graphs again)
-    gf_res_prev_active = nullptr;
-    if (!reserve_keeps_small) {
-        gf_res_epoch++;
-    }
+    gf_res_prev_active = nullptr; gf_res_epoch++;
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -4967,14 +4961,8 @@ bool llama_context::restore_pp_plan() {
     const uint32_t n_seqs_r    = (model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_MINIMAX_01) ? 1 : cparams.n_seq_max;
     const uint32_t n_tokens_r  = std::min(cparams.n_ctx, cparams.n_ubatch);
     const uint32_t n_outputs_r = std::min(n_tokens_r, cparams.n_outputs_max);
-    // (LLAMA_GRAPH_SMALL_KEEP_PP=0: the kept small graphs are built again after the restore, as before k13)
-    static const bool keep_small = getenv("LLAMA_GRAPH_SMALL_KEEP_PP") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_KEEP_PP")) != 0;
-    reserve_keeps_small = keep_small;
-    ggml_cgraph * gf_r = graph_reserve(n_tokens_r, n_seqs_r, n_outputs_r, mctx_full.get());
-    reserve_keeps_small = false;
-    if (gf_r == nullptr) {
+    if (graph_reserve(n_tokens_r, n_seqs_r, n_outputs_r, mctx_full.get()) == nullptr) {
         LLAMA_LOG_WARN("%s: re-reserving the pp graph failed\n", __func__);
-        gf_res_epoch++;
         return false;
     }
     if (++n_pp_rereserve == 1 || n_pp_rereserve % 100 == 0) {
