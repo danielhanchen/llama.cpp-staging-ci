@@ -1533,11 +1533,23 @@ private:
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
         }
 
+        // k13: LLAMA_MOE_CPU_MISS_FROZEN=1 freezes the small batches of a MoE cache with CPU misses (see llama_moe_freeze_small) with or
+        // without drafts; unset: only where it lets the default n-gram drafts verify exactly (below, LLAMA_SPEC_EXACT_FROZEN); 0: never
+        const int moe_frozen_env = getenv("LLAMA_MOE_CPU_MISS_FROZEN") != nullptr ? atoi(getenv("LLAMA_MOE_CPU_MISS_FROZEN")) : -1;
+        if (moe_frozen_env == 1 && llama_moe_freeze_small(ctx_tgt)) {
+            SRV_INF("%s", "MoE cache: small batches frozen (LLAMA_MOE_CPU_MISS_FROZEN=1)\n");
+        }
+
         if (spec) {
             SRV_TRC("%s", "speculative decoding context initialized\n");
             // k11-decode: the default drafts are verified batch invariant, so greedy output stays that of plain decoding; where the
             // placement cannot give single token bytes (host experts, a MoE cache) they stay off (LLAMA_SPEC_AUTO_EXACT=0 keeps them)
             if (params_base.speculative.ngram_suffix.auto_mode && server_spec_auto_exact()) {
+                // k13: a MoE cache with CPU misses verifies exactly once its small batches are frozen
+                if (!llama_verify_exact_placement(ctx_tgt) && moe_frozen_env != 0 && server_spec_exact_frozen() && llama_moe_freeze_small(ctx_tgt)) {
+                    SRV_INF("%s", "MoE cache: small batches frozen so the default n-gram drafts verify exactly (LLAMA_SPEC_EXACT_FROZEN=1, "
+                        "LLAMA_MOE_CPU_MISS_FROZEN=0: off)\n");
+                }
                 if (llama_verify_exact_placement(ctx_tgt)) {
                     llama_set_verify_exact(ctx_tgt, true);
                 } else {

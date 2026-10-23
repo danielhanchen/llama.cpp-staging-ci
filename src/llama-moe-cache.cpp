@@ -814,6 +814,11 @@ struct llama_moe_cache::impl {
     static constexpr double cmt_margin  = 0.03;
     static constexpr int    cmt_gap_max = 4096;
     bool     cm_trial      = true;
+    // k13: frozen small batches (cm_freeze): batches of at most cm_frozen_max tokens fetch nothing, the host computes every miss, no
+    // timing trial or miss-rate window changes that; which expert of a token the host computes then depends only on its own ids and
+    // the cache the prompts left, so a verify window splits each token as its single token decode does
+    static constexpr int64_t cm_frozen_max = 8;
+    bool     cm_frozen     = false;
     bool     cm_small_ok   = true;  // the last trial kept the host path for small batches
     bool     cm_small_live = true;  // the graphs of small batches use it now
     int      cmt_done   = -1;       // small batches of the running trial, -1 if none
@@ -3459,6 +3464,28 @@ struct llama_moe_cache::impl {
             std::min<int64_t>(n_tokens*n_expert_used, g.ref[0]->ne[2]) <= g.n_slots;
     }
 
+    // k13: see cm_frozen; only once calibrated (the warm-up decode calibrates), returns false otherwise or without CPU misses
+    bool cm_freeze() {
+        if (!cm || !cm_cal || cm_frozen) {
+            return cm_frozen;
+        }
+        cm_frozen     = true;
+        cm_trial      = false;
+        cmt_done      = -1;
+        cmt_wait      = -1;
+        cmt_t_prev    = -1;
+        cmw_on        = false;
+        cm_small_ok   = true;
+        cm_small_live = true;
+        for (int64_t n = 1; n <= std::min<int64_t>({ cm_frozen_max, max_batch, cm_max }); ++n) {
+            cm_on[n] = 1;
+        }
+        cm_gen++;
+        LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: small batches of up to %d tokens frozen: nothing fetched, the host computes every miss, "
+            "no timing trials (LLAMA_MOE_CPU_MISS_FROZEN=0 off)\n", tag, (int) std::min<int64_t>({ cm_frozen_max, max_batch, cm_max }));
+        return true;
+    }
+
     // a batch of more than max_batch tokens (a short prompt) that the host path serves: it is looked up on the device like a small batch
     // short prompts take the host path only once a trial found it faster for the small batches on this host and model (without a
     // trial: the model alone). G4 gpt-oss-20b Q2_K 8 GB and T4 Qwen3.6 UD-Q4_K_XL 8 GB without a draft: trials off, the 95-token chat
@@ -3473,6 +3500,9 @@ struct llama_moe_cache::impl {
 
     // the host computes the misses of a batch of n_tokens: the fetch share, 1 = every missing expert is fetched
     float cm_share_of(int64_t n_tokens) const {
+        if (cm_frozen && cm && cm_cal && n_tokens >= 1 && n_tokens <= std::min<int64_t>({ cm_frozen_max, max_batch, cm_max })) {
+            return 0.0f;
+        }
         if (cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_prompt_force) {
             // default: at most 1/4 fetched. The rule's share (capped at 3/4) left 71 ms of zero-copy fetch kernels in a 38-token LFM2.5 8 GB
             // prompt of 122 ms; G4 k11pgW at 1/4: LFM2.5 chat 444 tok/s (339 at the rule's share), Qwen3.6 360 (329); 1/8: LFM2.5 415
@@ -4324,6 +4354,9 @@ struct llama_moe_cache::impl {
                     }
                 }
                 on = gain > need && (n <= max_batch || fits) ? 1 : 0;
+            }
+            if (cm_frozen && n <= std::min<int64_t>(cm_frozen_max, max_batch)) {
+                on = 1;
             }
             changed = changed || on != cm_on[n];
             cm_on[n] = on;
@@ -6051,7 +6084,11 @@ bool llama_moe_cache::host_never() const {
 }
 
 bool llama_moe_cache::host_split_frozen() const {
-    return pimpl->hybrid && pimpl->hybrid_fixed && !pimpl->cm && !pimpl->hybrid_auto && pimpl->hybrid_share <= 0.0f;
+    return (pimpl->hybrid && pimpl->hybrid_fixed && !pimpl->cm && !pimpl->hybrid_auto && pimpl->hybrid_share <= 0.0f) || (pimpl->cm && pimpl->cm_frozen);
+}
+
+bool llama_moe_cache::freeze_small() {
+    return pimpl->cm_freeze();
 }
 
 bool llama_moe_cache::cpu_miss_tick_sync(int64_t n_tokens) const {

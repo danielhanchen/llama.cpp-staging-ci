@@ -7477,6 +7477,14 @@ bool llama_prepare_prompt_plan(llama_context * ctx) {
     return ctx->restore_pp_plan();
 }
 
+bool llama_context::moe_freeze_small() {
+    return moe_cache != nullptr && moe_cache->freeze_small();
+}
+
+bool llama_moe_freeze_small(llama_context * ctx) {
+    return ctx != nullptr && ctx->moe_freeze_small();
+}
+
 void llama_set_verify_exact(llama_context * ctx, bool value) {
     ctx->set_verify_exact(value);
 }
