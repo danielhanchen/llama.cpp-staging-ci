@@ -302,6 +302,7 @@ struct server_slot {
     std::vector<std::vector<llama_token_data>> spec_draft_q;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
+    std::vector<completion_token_output> spec_probs; // k13: n_probs of the accepted tokens, read from their verify rows before any rollback
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
 
@@ -4853,6 +4854,18 @@ private:
                 } else {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 }
+                // k13: the probabilities of the accepted tokens come from their verify rows, read now (a rollback below may decode
+                // again); they were left empty, so drafted positions looked like a uniform distribution to the KLD gate
+                slot.spec_probs.clear();
+                if (slot.task->params.sampling.n_probs > 0 && !slot.spec_is_replay && synth_probs.empty()) {
+                    for (size_t i = 0; i < accepted.size() && i < slot.spec_i_batch.size(); ++i) {
+                        completion_token_output r;
+                        r.tok  = accepted[i];
+                        r.prob = 1.0f;
+                        populate_token_probs(slot, r, slot.task->params.post_sampling_probs, params_base.special, slot.spec_i_batch[i]);
+                        slot.spec_probs.push_back(std::move(r));
+                    }
+                }
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -4906,7 +4919,6 @@ private:
             const auto ids = std::move(slot.spec_draft);
 
             size_t n_accepted = ids.size() - 1;
-            const bool spec_replayed = slot.spec_is_replay; // (k13: the rows of a replayed draft are not those of ids)
             if (slot.spec_is_replay && n_accepted > 0) {
                 n_accepted--;
             }
@@ -4950,10 +4962,10 @@ private:
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
                 result.prob         = 1.0f; // set later
 
-                // k13: the probabilities of an accepted draft token come from its verify row (the KLD gate reads them; they were left
-                // empty, so drafted positions looked like a uniform distribution)
-                if (slot.task->params.sampling.n_probs > 0 && !spec_replayed && i < slot.spec_i_batch.size()) {
-                    populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, slot.spec_i_batch[i]);
+                // k13: see spec_probs (filled at the verify, before the rollback)
+                if (i < slot.spec_probs.size() && slot.spec_probs[i].tok == result.tok) {
+                    result.prob  = slot.spec_probs[i].prob;
+                    result.probs = std::move(slot.spec_probs[i].probs);
                 }
 
                 slot.stats.n_gen += 1;
