@@ -8040,7 +8040,7 @@ bool llama_context::cap_prepare() {
             return false;
         }
         buft = ggml_backend_buffer_get_type(t->buffer);
-        rg.push_back({ t, (size_t) row*row_bytes, row_bytes, nullptr });
+        rg.push_back({ t, (size_t) row*row_bytes, row_bytes, nullptr, nullptr });
         total += GGML_PAD(row_bytes, 256);
         return true;
     };
@@ -8060,11 +8060,11 @@ bool llama_context::cap_prepare() {
         if (!cap_buf) {
             return false;
         }
-        ggml_init_params ip = { (rg.size() + 8)*ggml_tensor_overhead(), nullptr, true };
+        ggml_init_params ip = { (2*rg.size() + 8)*ggml_tensor_overhead(), nullptr, true };
         cap_ctx.reset(ggml_init(ip));
     } else {
         ggml_free(cap_ctx.release());
-        ggml_init_params ip = { (rg.size() + 8)*ggml_tensor_overhead(), nullptr, true };
+        ggml_init_params ip = { (2*rg.size() + 8)*ggml_tensor_overhead(), nullptr, true };
         cap_ctx.reset(ggml_init(ip));
     }
     uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(cap_buf.get());
@@ -8076,6 +8076,7 @@ bool llama_context::cap_prepare() {
         if (ggml_backend_tensor_alloc(cap_buf.get(), r.snap, base + off) != GGML_STATUS_SUCCESS) {
             return false;
         }
+        r.view = ggml_view_1d(cap_ctx.get(), r.t, (int64_t) (r.size/ggml_type_size(r.t->type)), r.off);
         off += r.size;
     }
     cap_cell    = (uint32_t) cell;
@@ -8087,11 +8088,27 @@ void llama_context::cap_now(llama_pos pos) {
     if (!cap_prepare()) {
         return;
     }
-    ggml_backend_sched_synchronize(sched.get());
-    for (const auto & r : cap_regions) {
-        std::vector<uint8_t> tmp(r.size);
-        ggml_backend_tensor_get(r.t, tmp.data(), r.off, r.size);
-        ggml_backend_tensor_set(r.snap, tmp.data(), 0, r.size);
+    // device copies in stream order on the backend that holds the rows (after the ubatches queued so far, before the next one),
+    // else through host memory after a sync
+    ggml_backend_t be = nullptr;
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cap_buf.get()));
+    for (const auto & b : backends) {
+        if (ggml_backend_get_device(b.get()) == dev) {
+            be = b.get();
+            break;
+        }
+    }
+    if (be != nullptr) {
+        for (const auto & r : cap_regions) {
+            ggml_backend_tensor_copy_async(be, be, r.view, r.snap);
+        }
+    } else {
+        ggml_backend_sched_synchronize(sched.get());
+        for (const auto & r : cap_regions) {
+            std::vector<uint8_t> tmp(r.size);
+            ggml_backend_tensor_get(r.t, tmp.data(), r.off, r.size);
+            ggml_backend_tensor_set(r.snap, tmp.data(), 0, r.size);
+        }
     }
     cap_done = true;
     cap_pos  = pos;

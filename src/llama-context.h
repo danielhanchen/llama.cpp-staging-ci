@@ -657,6 +657,7 @@ private:
         size_t        off;   // the row of the sequence's cell
         size_t        size;
         ggml_tensor * snap;  // its copy before the capture token
+        ggml_tensor * view;  // the row as a tensor (view of t)
     };
     llama_seq_id cap_seq     = -1;
     int32_t      cap_idx     = -1;    // batch token index of the next / current decode
