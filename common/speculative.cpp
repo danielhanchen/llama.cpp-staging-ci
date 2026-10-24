@@ -2353,9 +2353,6 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
     // k11-decode: cost-priced windows alone (common/spec-cost-policy.h); one cost table for every sequence
     bool policy_on  = false;
     common_spec_cost_policy policy;
-    // k15: one held window size, switches priced apart (common_spec_hold_policy); LLAMA_SPEC_SUFFIX_HOLD=0 turns it off
-    bool hold_on    = false;
-    common_spec_hold_policy hold;
 
     struct slot_t {
         uint64_t key = 0;
@@ -2377,10 +2374,6 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         int64_t n_lookups = 0, n_matches = 0, n_drafts = 0, n_drafted = 0, n_accepted = 0, n_yield = 0;
         common_spec_round_timer timer;   // k11-decode: round times of this sequence (policy_on)
         int64_t n_probe = 0;
-        // k15 window hold (hold_on): the windows of the last two rounds, when the last one began, the current run of drafted rounds,
-        // the real (unpadded) drafts of the last window
-        int     h_w_cur = 1, h_w_before = 1, h_run = 0, k_real = 0;
-        int64_t h_t_last = 0, n_filler = 0;
     };
 
     std::vector<seq_info> sinfos;
@@ -2413,14 +2406,6 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
             const char * e = getenv("LLAMA_SPEC_SUFFIX_POLICY");
             policy_on = !with_model && (e != nullptr ? atoi(e) != 0 : params.auto_mode);
             policy.short_k = params.n_max_short;
-        }
-        {
-            const char * e = getenv("LLAMA_SPEC_SUFFIX_HOLD");
-            hold_on = policy_on && (e == nullptr || atoi(e) != 0);
-        }
-        if (hold_on) {
-            SPC_INF("ngram-suffix: one held window of %d drafts (short matches padded), size switches priced apart; LLAMA_SPEC_SUFFIX_HOLD=0 for "
-                    "the two-window policy\n", params.n_max);
         }
         if (policy_on) {
             SPC_INF("ngram-suffix: cost-priced windows of %d / %d drafts (margin %.2f)%s; LLAMA_SPEC_SUFFIX_POLICY=0 for the fixed gate\n",
@@ -2588,16 +2573,6 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
                     PRId64 " probes\n", seq_id, ts, tl, policy.cost_ms(1), policy.cost_n[1], policy.cost_ms(ts), policy.cost_n[ts], policy.cost_ms(tl),
                     policy.cost_n[tl], policy.gain[ts], policy.gain_n[ts], policy.gain[tl], policy.gain_n[tl], si.n_probe);
         }
-        if (hold_on && si.n_lookups > 0) {
-            SPC_INF("ngram-suffix seq %d hold: steady ms by window 1 / %d: %.2f (%.0f) / %.2f (%.0f), switch %.2f ms (%.0f), run %.1f, hit %.2f, "
-                    "%" PRId64 " filler-only rounds\n", seq_id, std::min(params.n_max + 1, common_spec_hold_policy::MAX_T), hold.cost_ms(1),
-                    hold.steady_n[1], hold.cost_ms(params.n_max + 1), hold.steady_n[std::min(params.n_max + 1, common_spec_hold_policy::MAX_T)],
-                    hold.switch_ms(), hold.sw_n, hold.run, hold.hit, si.n_filler);
-        }
-        si.h_w_cur = si.h_w_before = 1;
-        si.h_run = si.k_real = 0;
-        si.h_t_last = 0;
-        si.n_filler = 0;
         si.n_lookups = si.n_matches = si.n_drafts = si.n_drafted = si.n_accepted = si.n_yield = 0;
         si.n_probe = 0;
         si.k_last = 0;
@@ -2613,67 +2588,6 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         return true;
     }
 
-    // k15 window hold (see common_spec_hold_policy): one drafted window size, short matches padded with filler
-    void draft_hold(seq_info & si, common_speculative_draft_params & dp) {
-        const int64_t now = ggml_time_us();
-        if (si.h_t_last > 0) {
-            hold.observe(si.h_w_cur, si.h_w_before, (now - si.h_t_last)/1000.0);
-        }
-        si.h_t_last = now;
-        sync(si, *dp.prompt);
-        si.n_lookups++;
-
-        int cap = params.n_max;
-        if (dp.n_max > 0) {
-            cap = std::min(cap, dp.n_max);
-        }
-        cap = std::min(cap, common_spec_hold_policy::MAX_T - 1);
-        const int T = cap + 1;
-        llama_tokens cand;
-        int match = 0;
-        const int offered = cap > 0 ? propose(si, dp.id_last, cap, cand, match) : 0;
-        hold.observe_hit(offered > 0);
-        const bool in_run = si.h_w_cur == T && T > 1;
-        double q = 0.0;
-        int    b = -1;
-        if (offered > 0) {
-            si.n_matches++;
-            b = bucket(match);
-            q = rate(si, b);
-        }
-        const bool take = T > 1 && hold.choose(T, offered, q, in_run);
-        int w = 1;
-        if (take) {
-            // pad to the window: the verifier rejects filler like any wrong draft, and the size stays the same
-            const llama_token fill = offered > 0 ? cand.back() : dp.id_last;
-            while ((int) cand.size() < cap) {
-                cand.push_back(fill);
-            }
-            dp.result->assign(cand.begin(), cand.begin() + cap);
-            si.k_last      = cap;
-            si.k_real      = offered;
-            si.bucket_last = b;
-            si.match_last  = match;
-            si.n_drafts++;
-            si.n_drafted  += offered;
-            si.n_filler   += offered == 0 ? 1 : 0;
-            si.h_run       = in_run ? si.h_run + 1 : 1;
-            w = T;
-        } else {
-            if (b >= 0) {
-                si.ok[b]  *= DRIFT;
-                si.bad[b] *= DRIFT;
-            }
-            if (in_run) {
-                hold.observe_run(si.h_run);
-                si.h_run = 0;
-            }
-            si.k_real = 0;
-        }
-        si.h_w_before = si.h_w_cur;
-        si.h_w_cur    = w;
-    }
-
     void draft(common_speculative_draft_params_vec & dparams) override {
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
@@ -2682,10 +2596,6 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
             }
             auto & si = sinfos[seq_id];
             si.k_last = 0;
-            if (hold_on) {
-                draft_hold(si, dp);
-                continue;
-            }
             if (policy_on) {
                 si.timer.tick(policy, ggml_time_us());
             }
@@ -2746,18 +2656,6 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         auto & si = sinfos[seq_id];
-        if (hold_on && !is_other && si.k_last > 0) {
-            // a padded window: only the real drafts count for the match class (filler is expected to be rejected)
-            if (si.k_real > 0 && si.bucket_last >= 0) {
-                const int b = si.bucket_last;
-                const int a = std::min<int>(n_accepted, si.k_real);
-                si.ok[b]  = DECAY*si.ok[b] + a;
-                si.bad[b] = DECAY*si.bad[b] + (a < si.k_real ? 1.0 : 0.0);
-            }
-            si.n_accepted += std::min<int>(n_accepted, si.k_last);
-            si.k_last = 0;
-            return;
-        }
         if (!is_other && si.k_last > 0 && si.bucket_last >= 0) {
             const int b = si.bucket_last;
             const int a = std::min<int>(n_accepted, si.k_last);
