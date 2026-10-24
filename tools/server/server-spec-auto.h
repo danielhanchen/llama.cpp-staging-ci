@@ -61,12 +61,26 @@ static int server_spec_spill_long_prompt() {
     return std::max(1, e != nullptr ? atoi(e) : 4096);
 }
 
+// k15-spec: with the CPU-miss rule (mode 3, G4 LFM2.5 8 GB) a long prompt takes no drafts: their verify windows read host-spilled experts
+// (4 rows 13.4 ms, 8 rows 33 ms against a 4.5 ms plain round), and the pinned host path alone is what wins (G4 8 GB 8k: pinned without
+// drafts 221.3 tok/s, with drafts 196.1, mode 0 206.0; chat 170.7 / 170.0). A repeat no longer than the longest match (64) never drafts.
+// The text is that of the pinned path without drafts (KLD-gated, plans/k15_models.md). LLAMA_SPEC_SPILL_LONG_CM=3: drafts from 3+ (as before)
+#ifndef SPEC_SPILL_MIN_MATCH_LONG_CM
+#define SPEC_SPILL_MIN_MATCH_LONG_CM 65
+#endif
 static int server_spec_spill_min_match_long(int32_t host_mode, int min_match) {
     const char * e = getenv("LLAMA_SPEC_SPILL_MIN_MATCH_LONG");
     if (e != nullptr) {
         return std::max(3, atoi(e));
     }
-    return host_mode == 1 && getenv("LLAMA_SPEC_SPILL_MIN_MATCH") == nullptr ? SPEC_SPILL_MIN_MATCH_LONG_GATE : min_match;
+    if (getenv("LLAMA_SPEC_SPILL_MIN_MATCH") != nullptr) {
+        return min_match;
+    }
+    if (host_mode == 1) {
+        return SPEC_SPILL_MIN_MATCH_LONG_GATE;
+    }
+    const char * c = getenv("LLAMA_SPEC_SPILL_LONG_CM");
+    return c != nullptr ? std::max(3, atoi(c)) : SPEC_SPILL_MIN_MATCH_LONG_CM;
 }
 
 static int server_spec_auto_env() {
