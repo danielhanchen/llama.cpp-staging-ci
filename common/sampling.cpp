@@ -132,6 +132,9 @@ struct common_sampler {
     std::vector<std::pair<llama_token, float>> bias_sparse; // the tokens with a bias (summed), ascending ids
     std::vector<float> bias_saved;                          // scratch: their raw logits during the scan
     std::vector<float> row;                                 // scratch: a copy of the logits row (mode 3)
+    bool pen_fast = false;                                  // k15: the fast path applies the repetition penalties (common_sampler_penalty_fast)
+    std::vector<std::pair<llama_token, int>> pen_cnt;       // scratch: the window's tokens and their counts
+    std::vector<std::pair<llama_token, float>> sp;          // scratch: biased and penalized tokens with their bias, ascending ids
 
     void reset() {
         prev.clear();
@@ -206,6 +209,34 @@ static int common_sampler_greedy_fast_mode() {
     return mode;
 }
 
+static bool common_sampler_penalty_active(const common_params_sampling & params) {
+    return params.penalty_last_n != 0 && (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f);
+}
+
+// k15: repetition penalties keep greedy sampling an argmax: the penalties sampler changes only the logits of the tokens of its window
+// (the last penalty_last_n accepted tokens, the same ones common_sampler::prev holds when the window fits its ring), and the samplers
+// after it keep the highest logit; that needs the penalties before every truncating sampler (top-k / top-p / min-p / top-n-sigma would
+// otherwise pick among the unpenalized top). G4 LFM2.5 (its GGUF sets repeat penalty 1.05): the full chain built and sorted 128k
+// candidates per sampled row. LLAMA_SAMPLE_GREEDY_PENALTY=0: the full chain, as before
+static bool common_sampler_penalty_fast(const common_params_sampling & params) {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_SAMPLE_GREEDY_PENALTY");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (!on || common_sampler_greedy_fast_mode() < 2 || params.penalty_last_n <= 0 || params.penalty_last_n > std::max(32, params.n_prev)) {
+        return false;
+    }
+    for (const auto & t : params.samplers) {
+        if (t == COMMON_SAMPLER_TYPE_PENALTIES) {
+            return true;
+        }
+        if (t == COMMON_SAMPLER_TYPE_TOP_K || t == COMMON_SAMPLER_TYPE_TOP_P || t == COMMON_SAMPLER_TYPE_MIN_P || t == COMMON_SAMPLER_TYPE_TOP_N_SIGMA) {
+            return false;
+        }
+    }
+    return false;
+}
+
 // whether every sampler of the chain built from params keeps the token with the highest (biased) logit and the chain ends in
 // greedy: then the sampled token is the argmax of the biased logits. LLAMA_SAMPLE_GREEDY_FAST=0 disables it.
 static bool common_sampler_greedy_fast(const common_params_sampling & params, const llama_sampler * grmr, const llama_sampler * rbudget) {
@@ -227,7 +258,7 @@ static bool common_sampler_greedy_fast(const common_params_sampling & params, co
             case COMMON_SAMPLER_TYPE_TEMPERATURE: // temp 0 (checked above for the last one): keeps the max
                 break;
             case COMMON_SAMPLER_TYPE_PENALTIES:
-                if (params.penalty_last_n != 0 && (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) {
+                if (common_sampler_penalty_active(params) && !common_sampler_penalty_fast(params)) {
                     return false;
                 }
                 break;
@@ -513,9 +544,13 @@ struct common_sampler * common_sampler_init(
         /* .bias_sparse = */ {},
         /* .bias_saved  = */ {},
         /* .row         = */ {},
+        /* .pen_fast    = */ false,
+        /* .pen_cnt     = */ {},
+        /* .sp          = */ {},
     };
 
     result->greedy_fast = common_sampler_greedy_fast(params, grmr, rbudget);
+    result->pen_fast    = result->greedy_fast && common_sampler_penalty_active(params);
     if (result->greedy_fast && !merged_bias.empty()) {
         const int32_t n_vocab = llama_vocab_n_tokens(vocab);
         result->bias_dense.assign(n_vocab, 0.0f);
@@ -618,6 +653,9 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .bias_sparse = */ gsmpl->bias_sparse,
         /* .bias_saved  = */ {},
         /* .row         = */ {},
+        /* .pen_fast    = */ gsmpl->pen_fast,
+        /* .pen_cnt     = */ {},
+        /* .sp          = */ {},
     };
 }
 
@@ -643,6 +681,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->greedy_fast = src->greedy_fast;
     dst->bias_dense  = src->bias_dense;
     dst->bias_sparse = src->bias_sparse;
+    dst->pen_fast    = src->pen_fast;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -740,7 +779,37 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
                 memcpy(gsmpl->row.data(), logits, (size_t) n_vocab*sizeof(float));
                 lg = gsmpl->row.data();
             }
-            auto & bs  = gsmpl->bias_sparse;
+            const std::vector<std::pair<llama_token, float>> * bsp = &gsmpl->bias_sparse;
+            if (gsmpl->pen_fast) {
+                // the penalties window: the last penalty_last_n accepted tokens (common_sampler_accept feeds the chain and prev alike)
+                auto & pc = gsmpl->pen_cnt;
+                pc.clear();
+                const size_t n_win = std::min<size_t>((size_t) gsmpl->params.penalty_last_n, gsmpl->prev.size());
+                for (size_t i = 0; i < n_win; ++i) {
+                    const llama_token t = gsmpl->prev.rat(i);
+                    bool found = false;
+                    for (auto & e : pc) {
+                        if (e.first == t) {
+                            e.second++;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        pc.emplace_back(t, 1);
+                    }
+                }
+                auto & sp = gsmpl->sp;
+                sp = gsmpl->bias_sparse;
+                for (const auto & e : pc) {
+                    if (e.first >= 0 && e.first < n_vocab && (gsmpl->bias_dense.empty() || gsmpl->bias_dense[e.first] == 0.0f)) {
+                        sp.emplace_back(e.first, 0.0f);
+                    }
+                }
+                std::sort(sp.begin(), sp.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+                bsp = &sp;
+            }
+            const auto & bs = *bsp;
             gsmpl->bias_saved.resize(bs.size());
             for (size_t k = 0; k < bs.size(); ++k) {
                 gsmpl->bias_saved[k] = lg[bs[k].first];
@@ -775,9 +844,28 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             }
             best   = raw_i < 0 ? 0 : raw_i;
             best_v = raw_v;
-            // a biased token wins if its biased logit is larger, or equal with a lower id (the lowest id on a tie)
+            // a biased token wins if its biased logit is larger, or equal with a lower id (the lowest id on a tie); a token of the
+            // penalties window competes with its biased logit penalized as llama_sampler_penalties_apply does it
             for (size_t k = 0; k < bs.size(); ++k) {
-                const float v = gsmpl->bias_saved[k] + bs[k].second;
+                float v = gsmpl->bias_saved[k] + bs[k].second;
+                if (gsmpl->pen_fast) {
+                    int count = 0;
+                    for (const auto & e : gsmpl->pen_cnt) {
+                        if (e.first == bs[k].first) {
+                            count = e.second;
+                            break;
+                        }
+                    }
+                    if (count > 0) {
+                        const auto & pp = gsmpl->params;
+                        if (v <= 0) {
+                            v *= pp.penalty_repeat;
+                        } else {
+                            v /= pp.penalty_repeat;
+                        }
+                        v -= float(count) * pp.penalty_freq + float(count > 0) * pp.penalty_present;
+                    }
+                }
                 if (v > best_v || (v == best_v && (raw_i < 0 || bs[k].first < best))) {
                     best_v = v;
                     best   = bs[k].first;
