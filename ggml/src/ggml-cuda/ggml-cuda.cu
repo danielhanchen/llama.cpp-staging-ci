@@ -4483,6 +4483,40 @@ static int ggml_cuda_try_fuse_moe_cache_glu(ggml_backend_cuda_context * cuda_ctx
     return 3;
 }
 
+// gate + up + GLU (MUL_MAT, single column) whose GLU output the allocator placed over the shared activation src1, which the
+// unfused GLU may overwrite because both products have read it by then. ggml_cuda_check_fusion_memory_ranges refuses that, but
+// the mul_mat_vec_q fusion reads only the q8_1 copy of src1 (quantized, or taken from the q8_1 cache, before the kernel that
+// writes the output), so the alias is harmless there. Any other overlap still refuses. Shared experts and dense FFNs of MoE
+// models hit this (e.g. Flint's MoE layers). GGML_CUDA_DISABLE_GLU_SRC1_ALIAS_FUSION=1 turns it off.
+static bool ggml_cuda_glu_mmvq_src1_alias_ok(const ggml_cgraph * cgraph, int i) {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_GLU_SRC1_ALIAS_FUSION");
+    if (disabled || i + 2 >= cgraph->n_nodes ||
+        !ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, { i + 2 })) {
+        return false;
+    }
+    const ggml_tensor * glu  = cgraph->nodes[i + 2];
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    if (!((gate == cgraph->nodes[i] && up == cgraph->nodes[i + 1]) || (gate == cgraph->nodes[i + 1] && up == cgraph->nodes[i]))) {
+        return false;
+    }
+    if (!ggml_cuda_should_fuse_mul_mat(up, gate, glu) || !ggml_is_quantized(up->src[0]->type) || !ggml_cuda_should_fuse_mul_mat_vec_q(up) ||
+        ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
+        return false;
+    }
+    const ggml_tensor * src1 = up->src[1];
+    for (int j = i; j < i + 3; ++j) {
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = cgraph->nodes[j]->src[s];
+            if (src == nullptr || src == src1 || src == gate || src == up || !ggml_cuda_tensors_overlap(glu, src)) {
+                continue;
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -5044,7 +5078,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fused_node_count  = 5;
                 break;
             }
-        } else if (ggml_cuda_can_fuse(cgraph, i, { op, op, GGML_OP_GLU }, {})) {
+        } else if (const bool src1_alias = !ggml_cuda_can_fuse(cgraph, i, { op, op, GGML_OP_GLU }, {});
+                   !src1_alias || (op == GGML_OP_MUL_MAT && ggml_cuda_glu_mmvq_src1_alias_ok(cgraph, i))) {
             ggml_tensor * glu  = cgraph->nodes[i + 2];
             ggml_tensor * gate = glu->src[0];
             ggml_tensor * up   = glu->src[1];
@@ -5060,7 +5095,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * src1 = up->src[1];
             const ggml_tensor * ids  = up->src[2];
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
+            if (!src1_alias && ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
