@@ -4920,6 +4920,7 @@ struct ggml_backend_sched_plan {
     std::vector<struct ggml_tensor *>                graph_inputs;
     int  pre_split, pre_nodes;
     bool input_relax_ok;
+    bool ov_active;            // the host-split overlap plan is in the splits (ov_src, ov_issue_at, ...)
     size_t bytes;
 };
 
@@ -4930,7 +4931,7 @@ static bool ggml_backend_sched_plan_debug() {
 
 ggml_backend_sched_plan_t ggml_backend_sched_plan_save(ggml_backend_sched_t sched) {
     const char * why = sched == NULL ? "no scheduler" : !sched->is_alloc ? "not allocated" : sched->n_copies != 1 ? "pipeline copies" :
-        sched->pf_active ? "prefetch" : sched->ov_active ? "overlap" : sched->ctx == NULL ? "no split context" :
+        sched->pf_active ? "prefetch" : sched->ctx == NULL ? "no split context" :
         ggml_gallocr_has_external(sched->galloc) ? "lent memory" : nullptr;
     for (int b = 0; why == nullptr && b < sched->n_backends; b++) {
         if (sched->pf[b].n_lent_bufs > 0 || sched->pf[b].lent > 0) {
@@ -4984,6 +4985,7 @@ ggml_backend_sched_plan_t ggml_backend_sched_plan_save(ggml_backend_sched_t sche
     p->pre_split      = sched->pre_split;
     p->pre_nodes      = sched->pre_nodes;
     p->input_relax_ok = sched->input_relax_ok;
+    p->ov_active      = sched->ov_active;
     p->bytes = sizeof(*p) + p->ctx_bytes.size() + p->h_idx.size()*(sizeof(uint32_t) + sizeof(void *) + sizeof(int) + per*sizeof(void *)) +
         (p->nodes.size() + p->leafs.size())*(sizeof(void *) + 2*sizeof(int)) + p->splits.size()*sizeof(struct ggml_backend_sched_split) +
         p->graph_inputs.size()*sizeof(void *);
@@ -5071,7 +5073,10 @@ bool ggml_backend_sched_plan_restore(ggml_backend_sched_t sched, ggml_backend_sc
     sched->pre_nodes      = p->pre_nodes;
     sched->input_relax_ok = p->input_relax_ok;
     sched->pf_active      = false;
-    sched->ov_active      = false;
+    sched->ov_active      = p->ov_active;
+    for (int i = 0; i < n_splits; i++) {
+        sched->splits[i].ov_issued = false;
+    }
     sched->is_reset       = false;
     sched->is_alloc       = true;
     return true;
