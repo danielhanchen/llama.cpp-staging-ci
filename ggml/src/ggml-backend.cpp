@@ -1177,6 +1177,16 @@ struct ggml_backend_sched {
     bool    input_relax_ok;  // k13-pp: the current graph has no host split after a device split (set in compute_splits)
     struct ggml_backend_sched_overlap ov[GGML_SCHED_MAX_BACKENDS];
 
+    // k15 [GGML_SCHED_HOST_SYNC_MERGE]: graphs without the overlap (e.g. hybrid MoE cache graphs): the device inputs of a host split are
+    // read with async copies and one device sync, and the upload of a host split's output to the device is not waited for at once
+    // (the next host split's sync, or the end of the graph, waits for it)
+    int     hsm_mode;          // 0 = off, 1 = CUDA family (default)
+    bool    hsm_active;        // the current graph uses it
+    int     hsm_pending;       // backend id with an upload not yet waited for, -1 = none
+    ggml_backend_event_t hsm_event[GGML_SCHED_MAX_BACKENDS]; // recorded after that upload (NULL: the end of the graph synchronizes)
+    bool    hsm_event_tried[GGML_SCHED_MAX_BACKENDS];
+    int64_t hsm_n_reads, hsm_n_defer; // inputs read without their own syncs, uploads not waited for at once
+
     char * context_buffer;
     size_t context_buffer_size;
     size_t context_graph_size; // the graph_size of ggml_backend_sched_new: the most nodes the context is sized for
@@ -4039,6 +4049,31 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 }
 
+// k15: a CUDA-family device backend (one in-order stream: an async copy queued on it runs after the work queued before it)
+static bool ggml_backend_sched_hsm_backend_ok(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = backend != NULL ? ggml_backend_get_device(backend) : NULL;
+    if (dev == NULL || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    const char * reg_name = reg ? ggml_backend_reg_name(reg) : "";
+    return strcmp(reg_name, "CUDA") == 0 || strcmp(reg_name, "ROCm") == 0 || strcmp(reg_name, "MUSA") == 0;
+}
+
+// k15: wait for an upload left pending by ggml_backend_sched_compute_splits_impl (its event if it has one, else the backend)
+static void ggml_backend_sched_hsm_wait(ggml_backend_sched_t sched) {
+    if (sched->hsm_pending < 0) {
+        return;
+    }
+    const int b = sched->hsm_pending;
+    if (sched->hsm_event[b] != NULL) {
+        ggml_backend_event_synchronize(sched->hsm_event[b]);
+    } else {
+        ggml_backend_synchronize(sched->backends[b]);
+    }
+    sched->hsm_pending = -1;
+}
+
 // without pipeline parallelism, a host split input is queued as an async upload instead of a sync copy (2 host syncs per input)
 // the caller synchronizes the split backend once after all of them, so the host data can be overwritten when compute_splits moves on
 // with the CPU/GPU overlap, an upload from host compute memory (written only by later host splits) neither waits for the backend
@@ -4106,8 +4141,9 @@ static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, st
             ggml_op_name(input->op), input->view_src != NULL, input->flags, (int) ggml_backend_buffer_get_usage(input->buffer), sched->ov_active, ov_ok);
     }
 
-    if (!synced && !ov) {
+    if (!synced && !ov && !(sched->hsm_active && ggml_backend_sched_hsm_backend_ok(split_backend))) {
         // wait for the split backend to finish using its input copies before overwriting them
+        // (k15 hsm: not needed on a CUDA-family backend, the upload is queued on its stream behind the work that reads them)
         ggml_backend_synchronize(split_backend);
         synced = true;
     }
@@ -4253,6 +4289,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
 
     int prev_backend_id = -1;
 
+    sched->hsm_active = sched->hsm_mode != 0 && !sched->ov_active && sched->n_copies == 1 && sched->callback_eval == NULL;
+    sched->hsm_pending = -1;
+
     ggml_backend_sched_prefetch_adapt(sched);
     sched->pf_runs++;
     bool timing[GGML_SCHED_MAX_BACKENDS] = { false };
@@ -4318,6 +4357,40 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             ggml_backend_sched_ov_wait_uploads(sched, -1);
         }
 
+        // k15 hsm: a host split reads its device inputs with async copies on their backends and one sync of each (which also waits for
+        // an upload left pending), instead of a backend sync and a synchronous read for every input
+        bool hsm_read[GGML_SCHED_MAX_SPLIT_INPUTS] = { false };
+        if (sched->hsm_active && ggml_backend_sched_ov_is_host(sched, split_backend_id) && !sched->pf_active) {
+            bool queued[GGML_SCHED_MAX_BACKENDS] = { false };
+            for (int input_id = 0; input_id < split->n_inputs && input_id < GGML_SCHED_MAX_SPLIT_INPUTS; input_id++) {
+                struct ggml_tensor * input = split->inputs[input_id];
+                if (ggml_backend_sched_is_host_weight(input) || (input->flags & GGML_TENSOR_FLAG_INPUT)) {
+                    continue;
+                }
+                ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+                const int ib = input_backend != NULL ? ggml_backend_sched_backend_id(sched, input_backend) : -1;
+                struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+                if (ib < 0 || ib == split_backend_id || !ggml_backend_sched_hsm_backend_ok(input_backend) || input_backend->iface.get_tensor_async == NULL ||
+                        input->buffer == NULL || ggml_backend_buffer_is_host(input->buffer) || input_cpy->buffer == NULL ||
+                        !ggml_backend_buffer_is_host(input_cpy->buffer) || ggml_nbytes(input_cpy) != ggml_nbytes(input)) {
+                    continue;
+                }
+                ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
+                queued[ib] = true;
+                hsm_read[input_id] = true;
+                sched->hsm_n_reads++;
+            }
+            for (int b = 0; b < sched->n_backends; b++) {
+                if (queued[b]) {
+                    ggml_backend_synchronize(sched->backends[b]);
+                    if (sched->hsm_pending == b) {
+                        sched->hsm_pending = -1;
+                    }
+                }
+            }
+            ggml_backend_sched_hsm_wait(sched);
+        }
+
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
         bool upload_synced  = false;
@@ -4328,6 +4401,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 if (ov_copies && ggml_backend_sched_ov_early_input(sched, split, split->inputs[input_id])) {
                     continue; // copied with the event waited above
                 }
+                if (input_id < GGML_SCHED_MAX_SPLIT_INPUTS && hsm_read[input_id]) {
+                    continue; // read above
+                }
                 bool relaxed = false;
                 if (ggml_backend_sched_upload_input_async(sched, split, split->inputs[input_id], upload_synced, relaxed)) {
                     upload_relaxed |= relaxed;
@@ -4337,7 +4413,22 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
         }
-        if (upload_pending) {
+        if (upload_pending && sched->hsm_active && ggml_backend_sched_hsm_backend_ok(split_backend)) {
+            // k15 hsm: the host data the upload reads is next written by a later host split, which syncs this backend first, or by the
+            // caller after this graph, which waits for the event below
+            if (sched->hsm_pending >= 0 && sched->hsm_pending != split_backend_id) {
+                ggml_backend_sched_hsm_wait(sched);
+            }
+            if (!sched->hsm_event_tried[split_backend_id]) {
+                sched->hsm_event_tried[split_backend_id] = true;
+                sched->hsm_event[split_backend_id] = ggml_backend_event_new(ggml_backend_get_device(split_backend));
+            }
+            if (sched->hsm_event[split_backend_id] != NULL) {
+                ggml_backend_event_record(sched->hsm_event[split_backend_id], split_backend);
+            }
+            sched->hsm_pending = split_backend_id;
+            sched->hsm_n_defer++;
+        } else if (upload_pending) {
             // queued before the wait on the prefetched copies of this split, so it never waits for the copy queue
             ggml_backend_synchronize(split_backend);
         } else if (upload_relaxed) {
@@ -4485,6 +4576,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
     if (sched->ov_active) {
         ggml_backend_sched_ov_wait_uploads(sched, -1);
     }
+    ggml_backend_sched_hsm_wait(sched);
 
     if (sched->pf_active && (sched->pf_cross == 2 || (sched->pf_cross == 1 && sched->pf_runs < sched->pf_prev_runs))) {
         ggml_backend_sched_prefetch_arm(sched);
@@ -4599,6 +4691,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
         const char * GGML_SCHED_OVERLAP = getenv("GGML_SCHED_OVERLAP");
         sched->ov_mode = GGML_SCHED_OVERLAP ? atoi(GGML_SCHED_OVERLAP) : 1;
+        const char * GGML_SCHED_HOST_SYNC_MERGE = getenv("GGML_SCHED_HOST_SYNC_MERGE");
+        sched->hsm_mode    = GGML_SCHED_HOST_SYNC_MERGE ? atoi(GGML_SCHED_HOST_SYNC_MERGE) : 1;
+        sched->hsm_pending = -1;
         const char * GGML_SCHED_OVERLAP_PARTS = getenv("GGML_SCHED_OVERLAP_PARTS");
         sched->ov_parts = GGML_SCHED_OVERLAP_PARTS ? atoi(GGML_SCHED_OVERLAP_PARTS) : 6;
     }
@@ -4615,6 +4710,15 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched->n_input_relaxed > 0) {
         GGML_LOG_INFO("%s: %lld graph-input uploads queued behind the previous graph without a device sync (GGML_SCHED_INPUT_RELAXED=0: off)\n",
             __func__, (long long) sched->n_input_relaxed);
+    }
+    if (sched->hsm_n_reads > 0 || sched->hsm_n_defer > 0) {
+        GGML_LOG_INFO("%s: host splits: %lld device inputs read with one sync per split, %lld uploads waited for later (GGML_SCHED_HOST_SYNC_MERGE=0: off)\n",
+            __func__, (long long) sched->hsm_n_reads, (long long) sched->hsm_n_defer);
+    }
+    for (int b = 0; b < GGML_SCHED_MAX_BACKENDS; b++) {
+        if (sched->hsm_event[b] != NULL) {
+            ggml_backend_event_free(sched->hsm_event[b]);
+        }
     }
     if (sched->pf_n_armed > 0) {
         GGML_LOG_INFO("%s: host weight prefetch: cross-graph arm: %lld splits armed, %lld used\n", __func__,
