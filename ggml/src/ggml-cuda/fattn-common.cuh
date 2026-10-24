@@ -1238,6 +1238,11 @@ void launch_fattn(
     } else {
         // parallel_blocks must not be larger than what the tensor size allows:
         parallel_blocks = std::min(parallel_blocks, ntiles_KV);
+        // k15 (experiment, changes the bits): GGML_CUDA_FA_PB_MAX=N caps the parallel KV blocks (unset: as upstream)
+        static const int pb_max = [] {
+            const char * e = getenv("GGML_CUDA_FA_PB_MAX");
+            return e == nullptr ? 0 : atoi(e);
+        }();
 
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
@@ -1261,6 +1266,9 @@ void launch_fattn(
             }
         }
 
+        if (pb_max > 0) {
+            parallel_blocks = std::min(parallel_blocks, pb_max);
+        }
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];

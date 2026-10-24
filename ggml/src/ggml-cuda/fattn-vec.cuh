@@ -586,13 +586,15 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     if (Q->ne[1] == 1) {
         constexpr int cols_per_block = 1;
         // k15: GQA 4 (LFM2.5: 32 query heads on 8 KV heads, head size 64, f16 KV), one block per KV head. GGML_CUDA_FA_VEC_GQA:
-        // 1 (default) = 4 thread groups per block, each running the per-head kernel for one of the 4 query heads (K / V rows shared
-        // through L1); 2 = one 4-column block reading K / V once for its 4 heads (fewer, longer blocks: slower at long context on
-        // B200); 0 = one block per query head, as before. Same KV split and the same bits in all three
+        // 0 (default) = one block per query head, as before; 1 = 4 thread groups per block, each running the per-head kernel for one
+        // of the 4 query heads (K / V rows shared through L1); 2 = one 4-column block reading K / V once for its 4 heads. Same KV split
+        // and the same bits in all three, but 1 and 2 are slower at 8k on B200 (PDL off: 151-171 / 193 vs 123 us per token) and no
+        // faster on G4: the split launch_fattn picks leaves each block a single 128-cell KV tile, so the per-block fixed cost, not
+        // the K / V reads, sets the time, and fewer or larger blocks only lose occupancy
         if constexpr (D == 64 && type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16) {
             static const int gqa_mode = [] {
                 const char * e = getenv("GGML_CUDA_FA_VEC_GQA");
-                return e == nullptr ? 1 : atoi(e);
+                return e == nullptr ? 0 : atoi(e);
             }();
             const ggml_tensor * K = dst->src[1];
             float max_bias;
