@@ -2103,8 +2103,32 @@ static bool common_fit_draft_on_cpu(
             dft += dmds[i].model + dmds[i].context + dmds[i].compute;
         }
     } catch (const std::exception & e) {
-        LOG_WRN("%s: failed to measure the draft model, keeping the old placement: %s\n", __func__, e.what());
-        return false;
+        // k15-small4: a draft that needs the target's context to be created (a gemma-4 assistant shares the target's KV cache and token
+        // embeddings, "requires ctx_other") cannot be measured on its own. Keeping the old placement put it on the GPU unmeasured:
+        // T4 4 GB, gemma-4-26B-A4B UD-Q3_K_M + its Q8_0 assistant, the fit left 258 MiB free and the draft's 425 MiB of weights failed
+        // to allocate, so the server exited. Its weights are the tensor data of its GGUF, its context the target's (shared); its compute
+        // buffer is LLAMA_FIT_DRAFT_EST_COMPUTE_MIB (default 128; the gemma-4 assistant measured 76.5 MiB at n_ubatch 512 once created).
+        // LLAMA_FIT_DRAFT_ESTIMATE=0: the old placement
+        const char * env_est = getenv("LLAMA_FIT_DRAFT_ESTIMATE");
+        size_t weights = 0;
+        if (env_est == nullptr || atoi(env_est) != 0) {
+            gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+            gguf_context_ptr gctx(gguf_init_from_file(path_dft.c_str(), gp));
+            if (gctx) {
+                for (int64_t i = 0; i < gguf_get_n_tensors(gctx.get()); i++) {
+                    weights += gguf_get_tensor_size(gctx.get(), i);
+                }
+            }
+        }
+        if (weights == 0) {
+            LOG_WRN("%s: failed to measure the draft model, keeping the old placement: %s\n", __func__, e.what());
+            return false;
+        }
+        const char * env_c = getenv("LLAMA_FIT_DRAFT_EST_COMPUTE_MIB");
+        const size_t compute = (size_t) (env_c != nullptr ? std::max(0.0, atof(env_c)) : 128.0) * 1024 * 1024;
+        dft = weights + compute;
+        LOG_INF("%s: the draft model cannot be measured on its own (%s): estimated as its weights %.0f MiB + %.0f MiB of compute buffer "
+            "(LLAMA_FIT_DRAFT_EST_COMPUTE_MIB; LLAMA_FIT_DRAFT_ESTIMATE=0 keeps the old placement)\n", __func__, e.what(), weights/MiB, compute/MiB);
     }
     const bool gpu = (double) dft <= (double) free_ + max_frac*(double) cache;
     LOG_INF("%s: draft model needs %.0f MiB of device memory; the MoE cache gets %.0f MiB (%.0f MiB left over) -> draft model on the %s "
