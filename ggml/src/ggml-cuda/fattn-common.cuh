@@ -1192,13 +1192,16 @@ void launch_fattn(
         // parallel_blocks must not be larger than what the tensor size allows:
         parallel_blocks = std::min(parallel_blocks, ntiles_KV);
 
+        // batch invariant one column tiles (k15-fv): the KV split of a launch with one query, so every query is split as it alone is
+        const int ntiles_dst_pb = (KQV->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) && ncols == 1 ? ntiles_dst / ntiles_x : ntiles_dst;
+
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
         const int blocks_per_wave = nsm * max_blocks_per_sm;
         int nwaves_best = 0;
         int efficiency_percent_best = 0;
         for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
-            const int nblocks_total = ntiles_dst * parallel_blocks_test;
+            const int nblocks_total = ntiles_dst_pb * parallel_blocks_test;
             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
 

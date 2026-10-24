@@ -756,6 +756,50 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    // k15-fv: batch invariant node over several queries (speculative verify, the queries of one KV length): every query gets what
+    // the node of that query alone gets. The vector kernel at one column per block takes all of them in one launch with the KV
+    // split of a single query; any other kernel runs once per query
+    const ggml_tensor * Q = dst->src[0];
+    if ((dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) && Q->ne[1] > 1) {
+        const ggml_tensor * mask = dst->src[3];
+        ggml_tensor q1 = *Q;
+        q1.ne[1] = 1;
+        ggml_tensor m1;
+        if (mask) {
+            m1 = *mask;
+            m1.ne[1] = 1;
+        }
+        ggml_tensor d1 = *dst;
+        d1.src[0] = &q1;
+        d1.src[3] = mask ? &m1 : nullptr;
+        d1.ne[2]  = 1;
+        d1.flags &= ~GGML_TENSOR_FLAG_BATCH_INVARIANT;
+        const best_fattn_kernel k1 = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), &d1);
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * V = dst->src[2];
+        GGML_ASSERT(K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16); // no staged K / V copy behind the output (llama-graph)
+        if (k1 == BEST_FATTN_KERNEL_VEC && Q->ne[3] == 1) {
+            ggml_cuda_flash_attn_ext_vec(ctx, dst);
+            return;
+        }
+        for (int64_t i = 0; i < Q->ne[1]; ++i) {
+            ggml_tensor q_i = q1;
+            q_i.data = (char *) Q->data + i*Q->nb[1];
+            ggml_tensor m_i;
+            if (mask) {
+                m_i = m1;
+                m_i.data = (char *) mask->data + i*mask->nb[1];
+            }
+            ggml_tensor d_i = d1;
+            d_i.src[0] = &q_i;
+            d_i.src[3] = mask ? &m_i : nullptr;
+            d_i.data   = (char *) dst->data + i*dst->nb[2];
+            ggml_cuda_flash_attn_ext(ctx, &d_i);
+        }
+        return;
+    }
+
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

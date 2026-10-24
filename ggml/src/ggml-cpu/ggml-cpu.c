@@ -1784,6 +1784,35 @@ static bool ggml_compute_forward_batch_invariant(struct ggml_compute_params * pa
         return false;
     }
     struct ggml_tensor * src1 = tensor->src[1];
+    // k15-fv: an attention node over several queries of one KV length (llama-graph, exact verify): one query at a time, as the
+    // node of that query alone (the tiled kernel takes 8+ queries)
+    if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
+        struct ggml_tensor * q    = tensor->src[0];
+        struct ggml_tensor * mask = tensor->src[3];
+        if (q->ne[1] < 2 || q->ne[3] != 1) {
+            return false;
+        }
+        for (int64_t i = 0; i < q->ne[1]; ++i) {
+            struct ggml_tensor q_i   = *q;
+            struct ggml_tensor m_i;
+            struct ggml_tensor dst_i = *tensor;
+            q_i.ne[1] = 1;
+            q_i.data  = (char *) q->data + i*q->nb[1];
+            if (mask) {
+                m_i = *mask;
+                m_i.ne[1] = 1;
+                m_i.data  = (char *) mask->data + i*mask->nb[1];
+            }
+            dst_i.ne[2]  = 1;
+            dst_i.data   = (char *) tensor->data + i*tensor->nb[2];
+            dst_i.src[0] = &q_i;
+            dst_i.src[3] = mask ? &m_i : NULL;
+            dst_i.flags &= ~GGML_TENSOR_FLAG_BATCH_INVARIANT;
+            ggml_compute_forward(params, &dst_i);
+            ggml_barrier(params->threadpool);
+        }
+        return true;
+    }
     if (tensor->op == GGML_OP_MUL_MAT) {
         if (src1->ne[1] < 2 || src1->ne[1] > 16 || src1->ne[2]*src1->ne[3] != 1 || tensor->ne[2]*tensor->ne[3] != 1) {
             return false;

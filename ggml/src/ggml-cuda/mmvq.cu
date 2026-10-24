@@ -1,4 +1,6 @@
 #include "mmvq.cuh"
+
+#define MMVQ_EXACT_GROUP_MAX 8 // tokens of a grouped batch invariant MUL_MAT_ID launch (k15-fv)
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -619,7 +621,11 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
 }
 
 // c_nwarps > 0 overrides the number of warps (batch invariant verify: the K split and the reduction of one column)
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int c_nwarps = 0>
+// c_group > 0 (k15-fv, batch invariant MUL_MAT_ID over up to c_group tokens, ncols_dst == 1, grid z = tokens): the block of the first
+// token that selects an expert at some slot computes that expert's rows for every token that selects it, each token's sums in the
+// order of its own single token launch (same K split, warps, reduction), so the expert's weights are read once for all of them;
+// the blocks of the later tokens with that expert leave at once
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int c_nwarps = 0, int c_group = 0>
 __launch_bounds__((c_nwarps > 0 ? c_nwarps : calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters))*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -664,6 +670,9 @@ static __global__ void mul_mat_vec_q(
     ggml_cuda_pdl_lc();
     ggml_cuda_pdl_sync();
     sample_dst = blockIdx.z;
+    static_assert(c_group == 0 || ncols_dst == 1, "grouped launches are single column launches");
+    constexpr int NC = c_group > 0 ? c_group : ncols_dst; // accumulator columns: tokens of the group, or the columns
+    [[maybe_unused]] const int32_t * ids_all = ids;
     // k11-decode: a single column MUL_MAT_ID launch over several tokens (batch invariant verify) takes the tokens as samples:
     // token z reads the experts of its ids row (one sample, z = 0: as before)
     if (ncols_dst == 1 && ids) {
@@ -691,6 +700,42 @@ static __global__ void mul_mat_vec_q(
 
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
+
+    // grouped: this block's (token, slot) leads its expert when no earlier token selects it; members = (token, slot) pairs of the
+    // expert in token order, the leader first
+    [[maybe_unused]] int      nmem = 1;
+    [[maybe_unused]] uint32_t mem_tok [NC];
+    [[maybe_unused]] uint32_t mem_slot[NC];
+    if constexpr (c_group > 0) {
+        const int32_t  e      = (int32_t) channel_x;
+        const uint32_t nslots = gridDim.y;
+        for (uint32_t t = 0; t < sample_dst; ++t) {
+            for (uint32_t s = 0; s < nslots; ++s) {
+                if (ids_all[t*ids_stride + s] == e) {
+                    return; // an earlier token's block computes this expert for this token
+                }
+            }
+        }
+        mem_tok[0] = sample_dst; mem_slot[0] = channel_dst;
+#pragma unroll
+        for (int m = 1; m < NC; ++m) {
+            mem_tok[m] = sample_dst; mem_slot[m] = channel_dst;
+        }
+        for (uint32_t t = sample_dst + 1; t < gridDim.z && nmem < NC; ++t) {
+            for (uint32_t s = 0; s < nslots; ++s) {
+                if (ids_all[t*ids_stride + s] == e) {
+#pragma unroll
+                    for (int m = 1; m < NC; ++m) {
+                        if (m == nmem) {
+                            mem_tok[m] = t; mem_slot[m] = s;
+                        }
+                    }
+                    ++nmem;
+                    break;
+                }
+            }
+        }
+    }
 
     bool use_gate = false;
     bool use_bias = false;
@@ -723,8 +768,8 @@ static __global__ void mul_mat_vec_q(
     }
 
 
-    [[maybe_unused]] float x_biases[ncols_dst]    = { 0.0f };
-    [[maybe_unused]] float gate_biases[ncols_dst] = { 0.0f };
+    [[maybe_unused]] float x_biases[NC]    = { 0.0f };
+    [[maybe_unused]] float gate_biases[NC] = { 0.0f };
     [[maybe_unused]] float x_scales = 1.0f;
     [[maybe_unused]] float gate_scales = 1.0f;
     if constexpr (has_fusion) {
@@ -759,11 +804,18 @@ static __global__ void mul_mat_vec_q(
     }
 
     // partial sum for each thread
-    float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
-    float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
+    float tmp[NC][rows_per_cuda_block] = {{0.0f}};
+    float tmp_gate[NC][rows_per_cuda_block] = {{0.0f}};
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+    [[maybe_unused]] const block_q8_1 * y_mem[NC];
+    if constexpr (c_group > 0) {
+#pragma unroll
+        for (int m = 0; m < NC; ++m) {
+            y_mem[m] = ((const block_q8_1 *) vy) + mem_tok[m]*stride_sample_y + fastmodulo(mem_slot[m], nchannels_y)*stride_channel_y;
+        }
+    }
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
@@ -793,27 +845,31 @@ static __global__ void mul_mat_vec_q(
 #endif
 
 #pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
+        for (int j = 0; j < NC; ++j) {
+            if (c_group > 0 && j >= nmem) {
+                break;
+            }
+            const block_q8_1 * y_j = c_group > 0 ? y_mem[j] : y + j*stride_col_y;
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    vx, &y_j[kby], kbx_offset + i*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
                     if (use_gate) {
                         tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                            vgate, &y_j[kby], kbx_offset + i*stride_row_x + kbx, kqs);
                     }
                 }
             }
         }
     }
 
-    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
-    [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][NC][rows_per_cuda_block][warp_size];
+    [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][NC][rows_per_cuda_block][warp_size];
 
     if (threadIdx.y > 0) {
 #pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
+        for (int j = 0; j < NC; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
@@ -830,11 +886,16 @@ static __global__ void mul_mat_vec_q(
         return;
     }
 
+    float * dst_base = dst;
     dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
 
     // sum up partial sums and write back result
 #pragma unroll
-    for (int j = 0; j < ncols_dst; ++j) {
+    for (int j = 0; j < NC; ++j) {
+        if (c_group > 0 && j >= nmem) {
+            break;
+        }
+        float * dst_j = c_group > 0 ? dst_base + mem_tok[j]*stride_sample_dst + mem_slot[j]*stride_channel_dst + row0 : dst + j*stride_col_dst;
 #pragma unroll
         for (int i = 0; i < rows_per_cuda_block; ++i) {
 #pragma unroll
@@ -885,7 +946,7 @@ static __global__ void mul_mat_vec_q(
                         }
                     }
                 }
-                dst[j*stride_col_dst + i] = result;
+                dst_j[i] = result;
             }
         }
     }
@@ -1078,7 +1139,7 @@ static std::pair<dim3, dim3> calc_launch_params(
     return {block_nums, block_dims};
 }
 
-template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, int c_nwarps = 0>
+template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, int c_nwarps = 0, int c_group = 0>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -1093,7 +1154,7 @@ static void mul_mat_vec_q_switch_fusion(
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, 0, c_group>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1104,7 +1165,7 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, c_nwarps>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, c_nwarps, c_group>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1283,10 +1344,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int nchannels_x, const int nchannels_y, const int nchannels_dst,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride, cudaStream_t stream, const bool exact = false) {
+        const int ids_stride, cudaStream_t stream, const bool exact = false, const bool group = false) {
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
     GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
+    GGML_ASSERT(!group || (ncols_dst == 1 && ids != nullptr && nsamples_dst <= MMVQ_EXACT_GROUP_MAX));
 
     // batch invariant (verify batches, GGML_TENSOR_FLAG_BATCH_INVARIANT): every column gets the bytes of a single column launch
     if (exact && ncols_dst > 1) {
@@ -1303,12 +1365,19 @@ static void mul_mat_vec_q_switch_ncols_dst(
             const char * e = getenv("GGML_CUDA_MMVQ_EXACT_IDS_MERGE");
             return e == nullptr || atoi(e) != 0;
         }();
+        // k15-fv: grouped by expert (GGML_CUDA_MMVQ_EXACT_GROUP=0: off): the block of an expert's first token computes it for every
+        // token of the batch that selects it, each token's sums as its own launch computes them, so a shared expert is read once
+        static const bool ids_group = [] {
+            const char * e = getenv("GGML_CUDA_MMVQ_EXACT_GROUP");
+            return e == nullptr || atoi(e) != 0;
+        }();
         if (ids != nullptr && ids_merge && fusion.shared_up == nullptr && fusion.x_bias == nullptr && fusion.gate_bias == nullptr &&
                 nsamples_x == 1 && nsamples_dst == 1) {
             mul_mat_vec_q_switch_ncols_dst<type>(
                 vx, vy, ids, fusion, dst, ncols_x, nrows_x, 1, stride_row_x, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                1, ncols_dst, stride_sample_x, stride_col_y, stride_col_dst, ids_stride, stream, false);
+                1, ncols_dst, stride_sample_x, stride_col_y, stride_col_dst, ids_stride, stream, false,
+                ids_group && ncols_dst <= MMVQ_EXACT_GROUP_MAX);
             return;
         }
         if (ids != nullptr) {
@@ -1449,6 +1518,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
                 const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst + (fusion.shared_up != nullptr),
                                                                               nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
+                if (group) {
+                    mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters, 0, MMVQ_EXACT_GROUP_MAX>(
+                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                        stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
+                        stream);
+                    return;
+                }
                 mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
