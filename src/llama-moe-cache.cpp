@@ -1291,10 +1291,14 @@ struct llama_moe_cache::impl {
         // k13-small: the default single-graph host misses need a cache that holds a real share of the experts. With almost every expert
         // on the host (G4 at 4 GB, Qwen3.6 Q3_K_M + MTP, 0.7% cached) the split decodes faster: 155 / 131 tok/s chat / 2k against 129 /
         // 120 with single-graph, same text (LLAMA_MOE_SINGLE=0 vs default at -fitt 256). The 8 GB tiers it was built for cache 17-38%.
-        // LLAMA_MOE_SINGLE_MIN_FRAC (0.05) is that share; an explicit LLAMA_MOE_SINGLE keeps its meaning.
+        // LLAMA_MOE_SINGLE_MIN_FRAC (0.015) is that share; an explicit LLAMA_MOE_SINGLE keeps its meaning. 5% (the first value) lost
+        // where more is cached: G4, single-graph on vs off, same text: Qwen3.6 Q3_K_M no draft 4 GB (4.7% cached) 137.1 / 133.0 / 132.6 vs
+        // 118.7 / 115.1 / 114.7 tok/s, LFM2.5 4 GB (4.0%) 118.0 / 119.8 / 119.0 vs 103.1 / 104.3 / 102.9, Flash-Next UD-IQ1_S 8 GB (2.2%,
+        // k14 re-bench) 78.1 / 78.2 / 76.8 vs 65.5 / 65.7 / 65.0, gpt-oss 4 GB (4.4%) equal; at 0.7% (Q3_K_M + MTP 4 GB) the split still
+        // wins, 154.6 / 136.7 / 149.4 vs 138.9 / 112.7 / 131.0 (chat / 2k / 8k, G4 run k13r7a)
         if (single_auto && single_req) {
             const char * e = getenv("LLAMA_MOE_SINGLE_MIN_FRAC");
-            const double min_frac = e != nullptr ? std::max(0.0, atof(e)) : 0.05;
+            const double min_frac = e != nullptr ? std::max(0.0, atof(e)) : 0.015;
             if (cache_frac >= 0.0 && cache_frac < min_frac) {
                 single_req = false;
                 if (!model.hparams.no_alloc) {
