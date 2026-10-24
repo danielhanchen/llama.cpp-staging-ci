@@ -3820,9 +3820,10 @@ static int ggml_backend_sched_prefetch_ahead(ggml_backend_sched_t sched, const s
 // was last read by split c - 1, whose retire event is recorded), so the copies are the same, only queued before this split's work. A split
 // that stops the host part-way (an eval callback that synchronizes, e.g. the layer-major seed of the MoE cache in the split that holds a
 // layer's router) then no longer holds back the next layer's copies: G4, Qwen3.6-35B-A3B Q4 + MTP at 12 GB, 2k prompt: 42 copy-engine gaps
-// of ~2 ms in a 357 ms layer-major pass. GGML_SCHED_PREFETCH_EARLY=0: issued only after the previous prefetched split, as before
+// of ~2 ms in a 357 ms layer-major pass. Opt-in (GGML_SCHED_PREFETCH_EARLY=1): on k14 it made G4 q4x 12 GB 2k -8%, 8k -12% (the
+// [512] pass that follows the layer-major group lost most), plans/k15_pp.md
 static void ggml_backend_sched_prefetch_issue_ex(ggml_backend_sched_t sched, bool early) {
-    static const bool early_env = getenv("GGML_SCHED_PREFETCH_EARLY") == nullptr || atoi(getenv("GGML_SCHED_PREFETCH_EARLY")) != 0;
+    static const bool early_env = getenv("GGML_SCHED_PREFETCH_EARLY") != nullptr && atoi(getenv("GGML_SCHED_PREFETCH_EARLY")) != 0;
     for (int b = 0; b < sched->n_backends; b++) {
         struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
         int ahead = ggml_backend_sched_prefetch_ahead(sched, pf);
