@@ -417,6 +417,15 @@ extern "C" {
 
     // Allocate and compute graph on the backend scheduler
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
+    // k15-fn: the scheduler's split and allocation of the graph it allocated last, saved so that the same graph (same tensors, same
+    // topology) can be made current again without splitting and allocating it: plan_save after a successful alloc_graph (NULL if the
+    // graph uses prefetch, lent memory, overlap or pipeline copies), plan_restore after a reset (false if the plan is no longer valid:
+    // a buffer of the graph allocator or the split context was replaced, then the caller allocates as usual)
+    typedef struct ggml_backend_sched_plan * ggml_backend_sched_plan_t;
+    GGML_API ggml_backend_sched_plan_t ggml_backend_sched_plan_save   (ggml_backend_sched_t sched);
+    GGML_API bool                      ggml_backend_sched_plan_restore(ggml_backend_sched_t sched, ggml_backend_sched_plan_t plan);
+    GGML_API void                      ggml_backend_sched_plan_free   (ggml_backend_sched_plan_t plan);
+    GGML_API size_t                    ggml_backend_sched_plan_bytes  (ggml_backend_sched_plan_t plan); // host memory of the plan
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);

@@ -504,6 +504,9 @@ struct ggml_gallocr {
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
 
+    // k15-fn: incremented whenever a buffer of the allocator is replaced or lent memory changes (ggml_gallocr_get_generation)
+    uint64_t gen;
+
     // memory lent by the user for a buffer (see ggml_gallocr_set_external)
     struct gallocr_external {
         ggml_backend_buffer_t buffer;
@@ -1042,6 +1045,7 @@ static bool ggml_gallocr_reserve_n_impl(
             }
 #endif
             ggml_vbuffer_free(galloc->buffers[i]);
+            galloc->gen++;
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
             } else {
@@ -1084,6 +1088,7 @@ void ggml_gallocr_free_buffer(ggml_gallocr_t galloc, int buffer_id) {
         }
     }
     ggml_vbuffer_free(buf);
+    galloc->gen++;
     // the assignments point into the freed buffer: the next allocation plans again
     galloc->n_nodes = 0;
     galloc->n_leafs = 0;
@@ -1103,6 +1108,7 @@ void ggml_gallocr_set_external_n(ggml_gallocr_t galloc, int buffer_id, ggml_back
     }
     if (changed) {
         galloc->ext_changed = true;
+        galloc->gen++;
     }
     e->buffer = buffer;
     e->n      = n;
@@ -1277,6 +1283,19 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
     }
 
     return true;
+}
+
+uint64_t ggml_gallocr_get_generation(ggml_gallocr_t galloc) {
+    return galloc->gen;
+}
+
+bool ggml_gallocr_has_external(ggml_gallocr_t galloc) {
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (galloc->ext[i].buffer != NULL) {
+            return true;
+        }
+    }
+    return false;
 }
 
 size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {

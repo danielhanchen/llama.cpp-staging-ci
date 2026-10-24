@@ -863,7 +863,28 @@ llama_context::llama_context(
     }
 }
 
+void llama_context::small_plan_free(uint32_t i) {
+    if (gf_res_small_plan[i] != nullptr) {
+        ggml_backend_sched_plan_free(gf_res_small_plan[i]);
+        gf_res_small_plan[i] = nullptr;
+    }
+}
+
 llama_context::~llama_context() {
+    if (n_plan_saves > 0) {
+        size_t bytes = 0;
+        int    n     = 0;
+        for (auto * p : gf_res_small_plan) {
+            bytes += ggml_backend_sched_plan_bytes(p);
+            n     += p != nullptr;
+        }
+        LLAMA_LOG_INFO("%s: kept graph allocations (LLAMA_SCHED_SIZE_CACHE): %" PRIu64 " restored, %" PRIu64 " saved, %" PRIu64 " no longer valid, "
+            "%d held, %.2f MiB of host memory, no device memory\n", __func__, n_plan_restores, n_plan_saves, n_plan_invalid, n, bytes/1048576.0);
+    }
+    for (uint32_t i = 0; i < GF_SMALL_N; ++i) {
+        small_plan_free(i);
+    }
+
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -2463,11 +2484,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // (LLAMA_GRAPH_SMALL_CACHE_DRAFT=0: as before)
     static const bool small_cache_draft = getenv("LLAMA_GRAPH_SMALL_CACHE_DRAFT") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_CACHE_DRAFT")) != 0;
     const bool small_cache_dft = small_cache_mode == 1 && small_cache_draft && cparams.embeddings_nextn_masked && moe_cache == nullptr;
-    const bool small_cache_env = small_cache_mode == 2 || small_cache_mode == 3 || (small_cache_mode == 1 && cparams.verify_exact) || small_cache_dft;
+    // k15-fn: with the saved allocations (LLAMA_SCHED_SIZE_CACHE=0: off) a target with a drafter keeps its decode and verify graphs
+    // per size also with a MoE cache: a window of another size restores its own split, allocation and CUDA graph
+    static const bool size_cache = getenv("LLAMA_SCHED_SIZE_CACHE") == nullptr || atoi(getenv("LLAMA_SCHED_SIZE_CACHE")) != 0;
+    const bool small_cache_tgt = small_cache_mode == 1 && size_cache && cparams.spec_draft && (ubatch.n_tokens == 1 || cparams.verify);
+    const bool small_cache_env = small_cache_mode == 2 || small_cache_mode == 3 || (small_cache_mode == 1 && cparams.verify_exact) || small_cache_dft ||
+        small_cache_tgt;
     // (single token decodes and speculative verify windows only: a prompt's short tail keeps the shared graph, as before; G4 LFM2.5
     // 32 GB: with the tails kept too, chat / code prompts were 3 / 9% slower)
     // (the drafter's catch-up batch has no outputs: it only writes the KV of the accepted rows)
-    const uint32_t n_small = small_cache_env && (moe_cache == nullptr || small_cache_mode == 3) && !graph_reuse_disable && (n_outputs > 0 || small_cache_dft) &&
+    const uint32_t n_small = small_cache_env && (moe_cache == nullptr || small_cache_mode == 3 || small_cache_tgt) && !graph_reuse_disable && (n_outputs > 0 || small_cache_dft) &&
         (ubatch.n_tokens == 1 || cparams.verify || small_cache_dft) && ubatch.n_tokens <= GF_SMALL_MAX ? ubatch.n_tokens : 0;
 
     llm_graph_result * res = nullptr;
@@ -2529,6 +2555,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = nullptr; // (k11: not an invalidation of the kept small graphs)
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        // k15-fn: the saved split and allocation of this graph: its tensors are as they were after that allocation (no other graph
+        // writes them), the split context and tables go back in place
+        if (size_cache && gf_res_small_plan[i_small] != nullptr) {
+            if (ggml_backend_sched_plan_restore(sched.get(), gf_res_small_plan[i_small])) {
+                prefetch_n_tokens  = ubatch.n_tokens;
+                gf_res_prev_active = res;
+                n_plan_restores++;
+                return true;
+            }
+            small_plan_free(i_small);
+            n_plan_invalid++;
+        }
         for (const auto & st : gf_res_small_state[i_small]) {
             memcpy(st.t->src, st.src, sizeof(st.src));
             st.t->data   = st.data;
@@ -2540,6 +2578,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             gf_res_small_built[i_small] = false;
             return false;
+        }
+        if (size_cache) {
+            gf_res_small_plan[i_small] = ggml_backend_sched_plan_save(sched.get());
+            n_plan_saves += gf_res_small_plan[i_small] != nullptr;
         }
         gf_res_prev_active = res;
         return true;
@@ -2563,6 +2605,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ub_reused = true;
     } else {
         gf_res_prev_active = nullptr; // (k11: not an invalidation of the kept small graphs)
+        if (n_small > 0) {
+            small_plan_free(i_small); // its tensors go now
+        }
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -2638,6 +2683,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (n_small > 0) {
             gf_res_small_built[i_small] = true;
             gf_res_small_epoch[i_small] = gf_res_epoch;
+            if (size_cache) {
+                gf_res_small_plan[i_small] = ggml_backend_sched_plan_save(sched.get());
+                n_plan_saves += gf_res_small_plan[i_small] != nullptr;
+            }
         }
         moe_cache_seed_graph   = moe_cache_seed;
         moe_cache_hybrid_graph = moe_cache_hybrid;
