@@ -1312,10 +1312,12 @@ struct llama_moe_cache::impl {
         // k13-small: the default single-graph host misses need a cache that holds a real share of the experts. With almost every expert
         // on the host (G4 at 4 GB, Qwen3.6 Q3_K_M + MTP, 0.7% cached) the split decodes faster: 155 / 131 tok/s chat / 2k against 129 /
         // 120 with single-graph, same text (LLAMA_MOE_SINGLE=0 vs default at -fitt 256). The 8 GB tiers it was built for cache 17-38%.
-        // LLAMA_MOE_SINGLE_MIN_FRAC (0.05) is that share; an explicit LLAMA_MOE_SINGLE keeps its meaning.
+        // LLAMA_MOE_SINGLE_MIN_FRAC is that share; an explicit LLAMA_MOE_SINGLE keeps its meaning. k15: 0.015 (was 0.05, k14 re-bench
+        // on G4: at 0.05 it also turned single-graph off for LFM2.5 4 GB (4.0% cached, chat 104 vs 118 tok/s with 0) and Flash-Next
+        // UD-IQ1_S 8 GB (2.2%, 65.7 vs 78.1); q3m 4 GB, the cell it was tuned on, caches 0.7% and stays below)
         if (single_auto && single_req) {
             const char * e = getenv("LLAMA_MOE_SINGLE_MIN_FRAC");
-            const double min_frac = e != nullptr ? std::max(0.0, atof(e)) : 0.05;
+            const double min_frac = e != nullptr ? std::max(0.0, atof(e)) : 0.015;
             if (cache_frac >= 0.0 && cache_frac < min_frac) {
                 single_req = false;
                 if (!model.hparams.no_alloc) {
@@ -3669,12 +3671,33 @@ struct llama_moe_cache::impl {
         return cmt_host_ok && (!cm_trial || (cmt_n > 0 && cm_small_ok));
     }
 
+    // k15 (port of k11-spill arm P, 43a25ef811): the ubatches of a prompt batch (tokens without outputs, its last partial ubatch
+    // included) stay off the CPU-miss host path, so the first token after a prompt carries no host-computed expert. On by default
+    // only while the small batches are pinned (llama_moe_pin_small, spill mode 3: G4 LFM2.5 8 GB first-token KLD came from the
+    // prompt's small checkpoint tail ubatch taking the pinned host path). LLAMA_MOE_PIN_PROMPT_DEV=0: off there;
+    // LLAMA_MOE_CPU_MISS_PROMPT_DEV=1: also without the pin (test arm)
+    bool cm_prompt_now = false; // set by the context around each decode (set_prompt_batch)
+    bool cm_prompt_off() const {
+        static const bool pin_dev = [] {
+            const char * e = getenv("LLAMA_MOE_PIN_PROMPT_DEV");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        static const bool all_dev = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_PROMPT_DEV");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        return cm_prompt_now && cm && ((cm_frozen && cm_frozen_fetch && pin_dev) || all_dev);
+    }
+
     bool cm_serves(int64_t n_tokens) const {
-        return cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_max && (n_tokens <= cm_prompt_force || (cm_on[n_tokens] != 0 && cm_prompt_ok()));
+        return cm && cm_cal && !cm_prompt_off() && n_tokens > max_batch && n_tokens <= cm_max && (n_tokens <= cm_prompt_force || (cm_on[n_tokens] != 0 && cm_prompt_ok()));
     }
 
     // the host computes the misses of a batch of n_tokens: the fetch share, 1 = every missing expert is fetched
     float cm_share_of(int64_t n_tokens) const {
+        if (cm_prompt_off()) {
+            return 1.0f;
+        }
         if (cm_frozen && !cm_frozen_fetch && cm && cm_cal && n_tokens >= 1 && n_tokens <= std::min<int64_t>({ cm_frozen_max, max_batch, cm_max })) {
             return 0.0f;
         }
@@ -3958,7 +3981,7 @@ struct llama_moe_cache::impl {
     int hybrid_mode() const {
         if (cm) {
             // the decisions of every batch size are in the graph: a new decision rebuilds the graphs
-            return 3 + (ov_live ? 4 : 0) + 8*(int) (cm_gen & 0xfffff);
+            return 3 + (ov_live ? 4 : 0) + 8*(int) (cm_gen & 0xfffff) + (cm_prompt_off() ? (1 << 28) : 0);
         }
         // a single-graph failure (single_off) rebuilds the graphs without their mailboxes: a reused graph would keep merging from a
         // mailbox whose control block says failed (wrong rows in every later ubatch with a pinned fetch share, LLAMA_MOE_CACHE_FETCH)
@@ -6600,6 +6623,10 @@ bool llama_moe_cache::overlap(int64_t n_ubatch) const {
 
 bool llama_moe_cache::hybrid_active() const {
     return pimpl->hybrid_active();
+}
+
+void llama_moe_cache::set_prompt_batch(bool prompt) {
+    pimpl->cm_prompt_now = prompt;
 }
 
 bool llama_moe_cache::host_computes(int64_t n_tokens) const {
