@@ -108,6 +108,11 @@ public:
 
     std::vector<mem_cell> cells;
 
+    // k15-pp: a state write of one sequence's cell reads these tensors in place of the cell's rows and writes this position (the state
+    // llama_set_state_capture kept); set around one state_write by llama_context, the io may read the tensors later
+    const std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> * cap_map = nullptr;
+    llama_pos cap_pos = -1;
+
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;

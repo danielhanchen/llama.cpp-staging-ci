@@ -669,8 +669,6 @@ private:
     ggml_backend_buffer_ptr cap_buf;
     bool cap_prepare();             // the regions of the sequence's cell and their snapshot tensors; false: unsupported
     void cap_now(llama_pos pos);    // synchronize, then copy the regions (state before the next ubatch)
-    void cap_swap(llama_pos pos);   // exchange the rows with the snapshot (twice = back), set the cell's position
-    llama_pos cap_pos_saved = -1;
     bool lm_seed_async = false;
     ggml_backend_dev_t lm_async_dev = nullptr;
     std::vector<lm_seed_pending> lm_pending;

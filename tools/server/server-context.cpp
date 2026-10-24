@@ -2843,7 +2843,7 @@ private:
         const int64_t t_tr0 = common_mtp_handoff_trace() ? ggml_time_us() : 0;
 
         // the next llama_decode() is queued while the state is still being copied: the copy is complete when it returns
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | (captured ? LLAMA_STATE_SEQ_FLAGS_CAPTURED : LLAMA_STATE_SEQ_FLAGS_ASYNC));
+        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ASYNC | (captured ? LLAMA_STATE_SEQ_FLAGS_CAPTURED : 0));
         const int64_t t_tr1 = t_tr0 ? ggml_time_us() : 0;
         // k13-pp: the draft's rows are read on the draft's own stream after its queued prompt pass, so the target's next ubatch is
         // queued while the draft still computes (the synchronous read waited for the draft pass, ~1.5 ms per chat prompt on G4);

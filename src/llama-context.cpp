@@ -6717,12 +6717,24 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
             LLAMA_LOG_ERROR("%s: no captured state for sequence %d\n", __func__, seq_id);
             return 0;
         }
-        flags &= ~(LLAMA_STATE_SEQ_FLAGS_CAPTURED | LLAMA_STATE_SEQ_FLAGS_ASYNC | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
-        state_async_wait();
-        synchronize();
-        cap_swap(cap_pos);
-        const size_t n = state_seq_get_data(seq_id, dst, size, flags);
-        cap_swap(cap_pos_saved);
+        // the snapshot tensors are read in place of the rows (asynchronously too: a later capture overwrites them in stream order)
+        flags &= ~(LLAMA_STATE_SEQ_FLAGS_CAPTURED | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+        auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get());
+        auto * rec = hyb ? hyb->get_mem_recr() : dynamic_cast<llama_memory_recurrent *>(memory.get());
+        std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> map;
+        for (const auto & r : cap_regions) {
+            map.emplace_back(r.t, r.snap);
+        }
+        rec->cap_map = &map;
+        rec->cap_pos = cap_pos;
+        size_t n = 0;
+        try {
+            n = state_seq_get_data(seq_id, dst, size, flags);
+        } catch (...) {
+            rec->cap_map = nullptr;
+            throw;
+        }
+        rec->cap_map = nullptr;
         return n;
     }
     if (flags & LLAMA_STATE_SEQ_FLAGS_ASYNC) {
@@ -7317,8 +7329,7 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
             LLAMA_LOG_INFO("%s: cap_debug %s seq %d cell %u row %u pos %d:%s\n", __func__, what, seq_id, i, row, rec->cells[i].pos, line.c_str());
         }
     };
-    // k15-pp: a size query of the captured state (state_seq_get_data exchanges the rows around the whole write, whose host copies
-    // are made when the io is destroyed)
+    // k15-pp: a size query of the captured state: its rows have the sizes of the current ones (state_seq_get_data reads the snapshots)
     flags &= ~LLAMA_STATE_SEQ_FLAGS_CAPTURED;
     debug_rows("current");
     if (memory) {
@@ -8086,21 +8097,6 @@ void llama_context::cap_now(llama_pos pos) {
     cap_pos  = pos;
 }
 
-void llama_context::cap_swap(llama_pos pos) {
-    auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get());
-    auto * rec = hyb ? hyb->get_mem_recr() : dynamic_cast<llama_memory_recurrent *>(memory.get());
-    std::vector<uint8_t> a, b;
-    for (const auto & r : cap_regions) {
-        a.resize(r.size);
-        b.resize(r.size);
-        ggml_backend_tensor_get(r.t, a.data(), r.off, r.size);
-        ggml_backend_tensor_get(r.snap, b.data(), 0, r.size);
-        ggml_backend_tensor_set(r.t, b.data(), r.off, r.size);
-        ggml_backend_tensor_set(r.snap, a.data(), 0, r.size);
-    }
-    std::swap(rec->cells[cap_cell].pos, pos);
-    cap_pos_saved = pos;
-}
 
 bool llama_context::layer_major_on() const {
     return lm_enabled && moe_cache != nullptr;
