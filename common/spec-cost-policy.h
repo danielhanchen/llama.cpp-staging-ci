@@ -21,7 +21,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
-#include <cstdio>
 
 struct common_spec_cost_policy {
     static constexpr int MAX_T = 8;
@@ -37,7 +36,6 @@ struct common_spec_cost_policy {
     static constexpr int    SKIP    = 2;      // the first rounds of a size build its graph and capture it: not its cost
 
     double margin = 0.03;
-    int    switch_rounds = 1;  // k15-spec: plain rounds after a drafted round booked to it (common_spec_switch_rounds where drafts verify exactly)
     bool   gain_gate = false;  // LLAMA_SPEC_POLICY_GAIN=1: on (G4 LFM2.5 32 GB: it stopped the short window of a repeat, rep -5%; no cell gained)
     int    short_k   = 3;      // the drafts of the short window (the gain gate's window)
 
@@ -176,29 +174,13 @@ struct common_spec_cost_policy {
 
 // the round timer of one sequence: the time between two draft() calls is one round (verify + sampling) of the window drafted at
 // the first; a drafted round's cost is booked one round late, with the extra time of a plain round that follows it
-// k15-spec: the switch back from a drafted round costs more than its first plain round: the 1-token graph is rebuilt after a rollback
-// and its CUDA graph is warmed up and captured again over the next plain rounds (G4 LFM2.5 32 GB 8k: plain rounds 2.83-2.90 ms in a
-// drafted request, 2.43 ms without drafts, with the second and third plain rounds after each drafted one booked as plain). The extra
-// time of the SWITCH_ROUNDS plain rounds after a drafted round is booked to it, and only later plain rounds price the plain round.
-// Where drafts verify exactly only (spill drafts change text: their KLD-gated cost policy is kept). LLAMA_SPEC_SWITCH_ROUNDS=1: the first
-// one only (k11 behaviour).
-static inline int common_spec_switch_rounds() {
-    static const int n = [] {
-        const char * e = getenv("LLAMA_SPEC_SWITCH_ROUNDS");
-        return e != nullptr ? std::max(1, atoi(e)) : 3;
-    }();
-    return n;
-}
-
 struct common_spec_round_timer {
     int64_t t_last_us = 0;   // the previous draft() call of this sequence (0: none since the request began)
     int     w_last    = 1;   // the window of that round
-    int     w_pend    = 0;   // a drafted round waiting for the plain rounds after it (0: none)
+    int     w_pend    = 0;   // a drafted round waiting for the next one (0: none)
     double  ms_pend   = 0.0;
     int     acc_last  = 0;   // drafted tokens accepted in the last verified round (set by accept())
     int     acc_pend  = 0;
-    int     n_sw      = 0;   // plain rounds after the pending drafted round
-    double  ms_sw     = 0.0; // their time above a plain round's
 
     void reset() {
         t_last_us = 0;
@@ -207,16 +189,6 @@ struct common_spec_round_timer {
         ms_pend   = 0.0;
         acc_last  = 0;
         acc_pend  = 0;
-        n_sw      = 0;
-        ms_sw     = 0.0;
-    }
-
-    void book(common_spec_cost_policy & pol) {
-        pol.observe(w_pend, ms_pend + ms_sw);
-        pol.observe_gain(w_pend, acc_pend + 1, ms_pend + ms_sw);
-        w_pend = 0;
-        n_sw   = 0;
-        ms_sw  = 0.0;
     }
 
     // called at a draft() call (now_us), before the choice of this round's window (then set with next())
@@ -225,16 +197,17 @@ struct common_spec_round_timer {
             const double ms = (now_us - t_last_us)/1000.0;
             if (w_last > 1) {
                 if (w_pend > 0) {
-                    book(pol);
+                    pol.observe(w_pend, ms_pend);
+                    pol.observe_gain(w_pend, acc_pend + 1, ms_pend);
                 }
                 w_pend   = w_last;
                 ms_pend  = ms;
                 acc_pend = acc_last;
             } else if (w_pend > 0) {
-                ms_sw += pol.cost_n[1] > 0 ? std::max(0.0, ms - pol.cost_ms(1)) : 0.0;
-                if (++n_sw >= pol.switch_rounds) {
-                    book(pol);
-                }
+                const double extra = pol.cost_n[1] > 0 ? std::max(0.0, ms - pol.cost_ms(1)) : 0.0;
+                pol.observe(w_pend, ms_pend + extra);
+                pol.observe_gain(w_pend, acc_pend + 1, ms_pend + extra);
+                w_pend = 0;
             } else {
                 pol.observe(1, ms);
             }
@@ -247,115 +220,5 @@ struct common_spec_round_timer {
     // the window this round verifies (1 = plain)
     void next(int w) {
         w_last = std::max(1, w);
-    }
-};
-
-// k15-spec: stand-down of a match class whose drafts lose measured time. The cost policy prices a window from its measured cost and the
-// class's acceptance, but before a size is measured its cost is the guessed shape (2.05x a plain round for 4 rows) and its first rounds
-// (graph builds, captures) are not booked, while on a model whose drafts checkpoint and replay the state (Flint's SWA, LFM2.5's short
-// convolutions) a drafted round of 4 rows costs 2.7-4.5x a plain one (G4 Flint Q4_K_XL 4K: 3-5 drafts, all from repeats of 3-5 tokens,
-// -3..-4% against drafting off). This books, per sequence and match class, the measured time each drafted round saved: the tokens it
-// committed (history growth between two draft() calls) times the plain round's measured cost, minus the round's measured time with
-// the extra time of the plain round after it (the graph switch back), in plain rounds, as an EMA. A class below -DEBT plain rounds
-// stands down: its matches stay plain, and each match of it not drafted decays its EMA toward zero (DECAY), so it is re-probed after
-// ~log(DEBT/|saved|)/log(DECAY) matches. Kept across requests, as the class acceptance is. A class that saves time is not touched, so a
-// copy (long repeats) keeps its drafts. Output is unchanged where drafts verify exactly (only which rounds draft changes); the server
-// keeps it off where they do not (spill drafts change text, KLD-gated as they are). LLAMA_SPEC_STANDDOWN=0: off.
-struct common_spec_standdown {
-    static constexpr int N_CLS = 4;
-    double DEBT  = 1.0;    // LLAMA_SPEC_STANDDOWN_DEBT / _DECAY / _ALPHA: tuning only
-    double DECAY = 0.98;
-    double ALPHA = 0.5;
-    static constexpr double MAX_LOSS = 4.0;
-
-    bool    enabled  = true;
-    bool    log      = false;   // LLAMA_SPEC_STANDDOWN_LOG=1: every booked round
-    int64_t t_last   = 0;       // the previous draft() call (0: none in this request)
-    size_t  n_last   = 0;       // the history length then
-    int     k_last   = 0;       // the drafts of that round
-    int     b_last   = 0;       // and its match class
-    int     k_pend   = 0;       // a drafted round waiting for the round after it (its switch back)
-    int     b_pend   = 0;
-    double  ms_pend  = 0.0;
-    int     tok_pend = 0;
-    int     n_sw     = 0;
-    double  ms_sw    = 0.0;
-    double  saved[N_CLS] = {};  // EMA of plain rounds saved per drafted round, by class
-    int     n_cls[N_CLS] = {};
-    // per request counters (logged)
-    int64_t n_held = 0, n_booked = 0;
-    double  net = 0.0;          // ms saved by drafted rounds in this request
-
-    common_spec_standdown() {
-        if (const char * e = getenv("LLAMA_SPEC_STANDDOWN"))       { enabled = atoi(e) != 0; }
-        if (const char * e = getenv("LLAMA_SPEC_STANDDOWN_DEBT"))  { DEBT  = atof(e); }
-        if (const char * e = getenv("LLAMA_SPEC_STANDDOWN_DECAY")) { DECAY = atof(e); }
-        if (const char * e = getenv("LLAMA_SPEC_STANDDOWN_ALPHA")) { ALPHA = atof(e); }
-        if (const char * e = getenv("LLAMA_SPEC_STANDDOWN_LOG"))   { log = atoi(e) != 0; }
-    }
-
-    // a new request: the round timing restarts, the class EMAs stay
-    void begin() {
-        t_last = 0; n_last = 0; k_last = 0; k_pend = 0; ms_pend = 0.0; tok_pend = 0; n_sw = 0; ms_sw = 0.0;
-        n_held = n_booked = 0; net = 0.0;
-    }
-
-    void book(int k, int b, double tok, double ms, double c1) {
-        // one stalled round (a busy host, a request boundary) counts at most MAX_LOSS plain rounds lost
-        const double sv = std::max((tok*c1 - ms)/c1, -MAX_LOSS);
-        saved[b] = n_cls[b] > 0 ? (1.0 - ALPHA)*saved[b] + ALPHA*sv : sv;
-        n_cls[b]++;
-        n_booked++;
-        net += tok*c1 - ms;
-        if (log) {
-            fprintf(stderr, "standdown: class %d k %d tok %.0f ms %.2f c1 %.2f saved %.2f rounds, class EMA %.2f\n", b, k, tok, ms, c1, sv, saved[b]);
-        }
-    }
-
-    // at a draft() call: books the round since the last call (it committed n_hist - n_last tokens in now - t_last)
-    void tick(const common_spec_cost_policy & pol, int64_t now_us, size_t n_hist) {
-        if (!enabled) {
-            return;
-        }
-        if (t_last > 0 && n_hist >= n_last) {
-            const double ms  = (now_us - t_last)/1000.0;
-            const int    tok = (int) (n_hist - n_last);
-            // the plain cost is measured before anything is booked; a size's first rounds (graph builds, captures) are booked too
-            const bool   ok  = pol.cost_n[1] >= 4;
-            const double c1  = pol.cost_ms(1);
-            if (k_last > 0) {
-                if (k_pend > 0 && ok) {
-                    book(k_pend, b_pend, tok_pend + n_sw, ms_pend + ms_sw + n_sw*c1, c1);
-                }
-                k_pend = k_last; b_pend = b_last; ms_pend = ms; tok_pend = tok; n_sw = 0; ms_sw = 0.0;
-            } else if (k_pend > 0) {
-                // the switch rounds after it (common_spec_switch_rounds): their time above a plain round's is the drafted round's
-                ms_sw += std::max(0.0, ms - c1);
-                if (++n_sw >= pol.switch_rounds) {
-                    if (ok) {
-                        book(k_pend, b_pend, tok_pend + n_sw, ms_pend + ms_sw + n_sw*c1, c1);
-                    }
-                    k_pend = 0; n_sw = 0; ms_sw = 0.0;
-                }
-            }
-        }
-        t_last = now_us;
-        n_last = n_hist;
-        k_last = 0;
-    }
-
-    // a match of class b: true when it must stay plain (its EMA decays toward zero, the re-probe)
-    bool hold(int b) {
-        if (!enabled || n_cls[b] == 0 || saved[b] >= -DEBT) {
-            return false;
-        }
-        saved[b] *= DECAY;
-        n_held++;
-        return saved[b] < -DEBT;
-    }
-
-    void next(int k, int b) {
-        k_last = k;
-        b_last = b;
     }
 };

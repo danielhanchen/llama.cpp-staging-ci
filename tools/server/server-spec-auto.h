@@ -47,12 +47,14 @@ static int server_spec_spill_min_match(int32_t host_mode) {
     return std::max(3, e != nullptr ? atoi(e) : host_mode == 1 ? SPEC_SPILL_MIN_MATCH_GATE : SPEC_SPILL_MIN_MATCH_CM);
 }
 
-// k15-spec: the shortest repeat the default spill drafts take on a long prompt (LLAMA_SPEC_SPILL_LONG_PROMPT tokens, default 4096): a long
-// prompt (a document, code to edit) is copied in long runs, where a repeat of a few tokens already predicts the next ones (G4 LFM2.5 4 GB
-// 8k: drafting from 16+ commits 4% of what drafts from 3+ could). host_mode 1 only (the CPU-miss rule's mode 3 already takes every
-// match); chat prompts keep server_spec_spill_min_match. Changes text: KLD-gated (plans/k15_models.md). LLAMA_SPEC_SPILL_MIN_MATCH_LONG=16: off.
+// k15-spec: the shortest repeat the default spill drafts take on a long prompt (LLAMA_SPEC_SPILL_LONG_PROMPT tokens, default 4096). A long
+// prompt (a document, code to edit) is copied in long runs, where a repeat of a few tokens already predicts the next ones; the cost
+// policy still prices each window. host_mode 1 (the hybrid gate, G4 LFM2.5 4 GB) only: the CPU-miss rule's mode 3 (8 GB) already takes
+// every match; chat prompts keep server_spec_spill_min_match (16). Changes text, KLD-gated (plans/k15_models.md, G4 k15spec kld4:
+// short192 + long48 inside the calibrated band, = the 16+ default) and timed (G4 4 GB 8k 122-124 -> 164-166 tok/s, chat unchanged).
+// LLAMA_SPEC_SPILL_MIN_MATCH_LONG=16: off.
 #ifndef SPEC_SPILL_MIN_MATCH_LONG_GATE
-#define SPEC_SPILL_MIN_MATCH_LONG_GATE 16
+#define SPEC_SPILL_MIN_MATCH_LONG_GATE 4
 #endif
 static int server_spec_spill_long_prompt() {
     const char * e = getenv("LLAMA_SPEC_SPILL_LONG_PROMPT");

@@ -1530,14 +1530,12 @@ private:
                 ns.n_min_match = mm;
                 ns.n_min_draft = std::max(ns.n_min_draft, mm);
             }
-            // k15-spec: long prompts draft from shorter repeats (server_spec_spill_min_match_long); the stand-down stays off here: spill
-            // drafts change text, and their KLD gate was passed with every round's drafts as the cost policy chose them
+            // k15-spec: long prompts draft from shorter repeats (server_spec_spill_min_match_long)
             ns.long_prompt      = server_spec_spill_long_prompt();
             ns.n_min_match_long = server_spec_spill_min_match_long(llama_moe_host_mode(ctx_tgt), ns.n_min_match);
-            ns.standdown        = false;
             if (ns.n_min_match_long != ns.n_min_match) {
                 SRV_INF("n-gram drafting under the MoE cache: prompts of %d+ tokens draft from repeats of at least %d tokens "
-                        "(LLAMA_SPEC_SPILL_MIN_MATCH_LONG, LLAMA_SPEC_SPILL_LONG_PROMPT)\n", ns.long_prompt, ns.n_min_match_long);
+                        "(KLD-gated default, LLAMA_SPEC_SPILL_MIN_MATCH_LONG=16: off)\n", ns.long_prompt, ns.n_min_match_long);
             }
         }
 
