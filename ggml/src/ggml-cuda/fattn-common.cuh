@@ -1022,7 +1022,9 @@ void launch_fattn(
     // k15: the number of parallel KV blocks is the one a launch of pb_kernel with pb_ncols2 query heads per block would pick (its
     // occupancy and output tiles), so a kernel that packs the query heads of a KV head (ncols2 > 1) splits the KV exactly as the
     // per-head kernel does and its outputs are bit-identical (fattn-vec.cuh, GGML_CUDA_FA_VEC_GQA)
-    fattn_kernel_t pb_kernel = nullptr, const int pb_ncols2 = 1
+    fattn_kernel_t pb_kernel = nullptr, const int pb_ncols2 = 1,
+    // k15: thread groups per block (blockDim.z; fattn-vec.cuh grouped heads), the occupancy then is that of pb_kernel's group size
+    const int block_z = 1
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1173,9 +1175,11 @@ void launch_fattn(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    const dim3 block_dim(warp_size, nwarps, 1);
+    const dim3 block_dim(warp_size, nwarps, block_z);
+    GGML_ASSERT(block_z == 1 || pb_kernel != nullptr);
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, pb_kernel ? pb_kernel : fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, pb_kernel ? pb_kernel : fattn_kernel,
+        pb_kernel ? block_dim.x * block_dim.y : block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
     GGML_ASSERT(max_blocks_per_sm > 0);
     GGML_ASSERT(pb_kernel == nullptr || !stream_k);
     const int ntiles_dst_pb = pb_kernel ? ntiles_x * ((gqa_ratio + pb_ncols2 - 1) / pb_ncols2) * K->ne[2] * Q->ne[3] : ntiles_dst;

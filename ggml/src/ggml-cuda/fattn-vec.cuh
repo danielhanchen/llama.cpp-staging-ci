@@ -19,8 +19,11 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 // k15: ngqa > 1 (= ncols, one token per block): the ncols columns of a block are the ngqa query heads of one KV head instead of ncols
 // tokens of one head, so K / V are read once per KV head. Each column computes exactly what the ncols = 1 kernel computes for its head
 // (same operations per column, same KV split from launch_fattn's pb_kernel), so the output is bit-identical
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, int ngqa = 1> // D == head size
-__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
+// ngrp > 1 (ncols = 1, ngqa = 1): one block of ngrp thread groups (threadIdx.z) runs the ncols = 1 kernel for the ngrp query heads of
+// one KV head side by side: every group does exactly the per-head kernel's work for its head (same code, same KV split), while the
+// groups' reads of the same K / V rows share the SM's L1 instead of each going to L2
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, int ngqa = 1, int ngrp = 1> // D == head size
+__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device()*ngrp, 1)
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
         const char * K_ptr,
@@ -105,10 +108,13 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
 
     static_assert(ngqa == 1 || ngqa == ncols, "a GQA block holds the ncols query heads of one token");
+    static_assert(ngrp == 1 || (ncols == 1 && ngqa == 1), "grouped heads run the one-column kernel per group");
+    const int grp = ngrp > 1 ? (int) threadIdx.z : 0;
     const int ic0 = ngqa > 1 ? blockIdx.x : blockIdx.x * ncols; // Index of the Q/QKV column to work on.
 
-    const int sequence = ngqa > 1 ? blockIdx.z / ne12 : blockIdx.z / ne02;
-    const int head = ngqa > 1 ? (blockIdx.z - sequence*ne12)*ngqa : blockIdx.z - sequence*ne02; // (the first head of the block)
+    const int sequence = ngqa > 1 || ngrp > 1 ? blockIdx.z / ne12 : blockIdx.z / ne02;
+    const int head = ngqa > 1 ? (blockIdx.z - sequence*ne12)*ngqa :
+                     ngrp > 1 ? (blockIdx.z - sequence*ne12)*ngrp + grp : blockIdx.z - sequence*ne02; // (the first head of the block)
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
     const int q_col_nb  = ngqa > 1 ? nb02 : nb01; // stride between the columns of a block
     Q += nb03*sequence + nb02* head              + nb01*ic0;
@@ -128,10 +134,14 @@ static __global__ void flash_attn_ext_vec(
     constexpr int ne_combine = nwarps*V_cols_per_iter*D;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     half2            VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
-    __shared__ half   KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
+    constexpr int ne_KQ_s = ne_KQ > ne_combine ? ne_KQ : ne_combine;
+    __shared__ half   KQ_s[ngrp*ne_KQ_s];
+    half * KQ = KQ_s + grp*ne_KQ_s;
 #else
     float2           VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
-    __shared__ float  KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
+    constexpr int ne_KQ_s = ne_KQ > ne_combine ? ne_KQ : ne_combine;
+    __shared__ float  KQ_s[ngrp*ne_KQ_s];
+    float * KQ = KQ_s + grp*ne_KQ_s;
 #endif // V_DOT2_F32_F16_AVAILABLE
 
     float KQ_max[ncols];
@@ -429,8 +439,10 @@ static __global__ void flash_attn_ext_vec(
         }
     }
 
-    __shared__ float KQ_max_shared[ncols][WARP_SIZE];
-    __shared__ float KQ_sum_shared[ncols][WARP_SIZE];
+    __shared__ float KQ_max_shared_s[ngrp][ncols][WARP_SIZE];
+    __shared__ float KQ_sum_shared_s[ngrp][ncols][WARP_SIZE];
+    float (*KQ_max_shared)[WARP_SIZE] = KQ_max_shared_s[grp];
+    float (*KQ_sum_shared)[WARP_SIZE] = KQ_sum_shared_s[grp];
 #pragma unroll
     for (int j = 0; j < ncols; ++j) {
         if (threadIdx.y == 0) {
@@ -573,23 +585,30 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
 
     if (Q->ne[1] == 1) {
         constexpr int cols_per_block = 1;
-        // k15: GQA 4 (LFM2.5: 32 query heads on 8 KV heads, head size 64, f16 KV): one block per KV head reads its K / V once for its
-        // 4 query heads (GGML_CUDA_FA_VEC_GQA=0: one block per query head, as before; same bits either way)
+        // k15: GQA 4 (LFM2.5: 32 query heads on 8 KV heads, head size 64, f16 KV), one block per KV head. GGML_CUDA_FA_VEC_GQA:
+        // 1 (default) = 4 thread groups per block, each running the per-head kernel for one of the 4 query heads (K / V rows shared
+        // through L1); 2 = one 4-column block reading K / V once for its 4 heads (fewer, longer blocks: slower at long context on
+        // B200); 0 = one block per query head, as before. Same KV split and the same bits in all three
         if constexpr (D == 64 && type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16) {
-            static const bool gqa_on = [] {
+            static const int gqa_mode = [] {
                 const char * e = getenv("GGML_CUDA_FA_VEC_GQA");
-                return e == nullptr || atoi(e) != 0;
+                return e == nullptr ? 1 : atoi(e);
             }();
             const ggml_tensor * K = dst->src[1];
             float max_bias;
             memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
-            if (gqa_on && logit_softcap == 0.0f && max_bias == 0.0f && dst->src[4] == nullptr && K->ne[2] > 0 && Q->ne[2] == 4*K->ne[2]) {
+            if (gqa_mode != 0 && logit_softcap == 0.0f && max_bias == 0.0f && dst->src[4] == nullptr && K->ne[2] > 0 && Q->ne[2] == 4*K->ne[2]) {
                 const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
                 const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
                 const int nwarps   = nthreads / WARP_SIZE;
-                fattn_kernel_t kernel_gqa  = flash_attn_ext_vec<D, 4, type_K, type_V, false, 4>;
                 fattn_kernel_t kernel_head = flash_attn_ext_vec<D, 1, type_K, type_V, false, 1>;
-                launch_fattn<D, 1, 4>(ctx, dst, kernel_gqa, nwarps, 0, D, true, true, false, false, WARP_SIZE, false, kernel_head, 1);
+                if (gqa_mode == 2) {
+                    fattn_kernel_t kernel_gqa = flash_attn_ext_vec<D, 4, type_K, type_V, false, 4>;
+                    launch_fattn<D, 1, 4>(ctx, dst, kernel_gqa, nwarps, 0, D, true, true, false, false, WARP_SIZE, false, kernel_head, 1);
+                } else {
+                    fattn_kernel_t kernel_grp = flash_attn_ext_vec<D, 1, type_K, type_V, false, 1, 4>;
+                    launch_fattn<D, 1, 4>(ctx, dst, kernel_grp, nwarps, 0, D, true, true, false, false, WARP_SIZE, false, kernel_head, 1, 4);
+                }
                 return;
             }
         }
