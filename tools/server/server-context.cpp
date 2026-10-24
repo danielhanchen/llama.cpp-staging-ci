@@ -1373,18 +1373,33 @@ private:
                 model_dft = spec_init->model();
                 ctx_dft   = spec_init->context();
 
+                // k15-small4: a draft that does not load or whose context does not allocate (device memory the fit could not see:
+                // a draft it cannot measure on its own, memory another process took) is dropped and the server runs without speculative
+                // decoding, as --fit does when the draft does not fit; the main model and its context are already up.
+                // LLAMA_DRAFT_FAIL_HARD=1: exit, as before
+                const char * env_hard = getenv("LLAMA_DRAFT_FAIL_HARD");
+                const bool   hard     = env_hard != nullptr && atoi(env_hard) != 0;
+                const bool   failed   = (has_draft && model_dft == nullptr) || ctx_dft == nullptr;
                 if (has_draft && model_dft == nullptr) {
                     SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
-                    return false;
-                }
-
-                if (ctx_dft == nullptr) {
+                } else if (ctx_dft == nullptr) {
                     SRV_ERR("%s", "failed to create MTP context\n");
+                }
+                if (failed && hard) {
                     return false;
                 }
-
-                params_base.speculative.draft.ctx_tgt = ctx_tgt;
-                params_base.speculative.draft.ctx_dft = ctx_dft;
+                if (failed) {
+                    SRV_WRN("%s", "the draft could not be created: speculative decoding is off (LLAMA_DRAFT_FAIL_HARD=1 exits instead)\n");
+                    spec_init.reset();
+                    model_dft = nullptr;
+                    ctx_dft   = nullptr;
+                    has_spec  = false;
+                    params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+                    params_base.speculative.draft.mparams = {};
+                } else {
+                    params_base.speculative.draft.ctx_tgt = ctx_tgt;
+                    params_base.speculative.draft.ctx_dft = ctx_dft;
+                }
             }
 
             load_progress_callback(1.0f, &load_progress_spec);
