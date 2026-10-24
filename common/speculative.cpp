@@ -2586,8 +2586,8 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
                     PRId64 " probes\n", seq_id, ts, tl, policy.cost_ms(1), policy.cost_n[1], policy.cost_ms(ts), policy.cost_n[ts], policy.cost_ms(tl),
                     policy.cost_n[tl], policy.gain[ts], policy.gain_n[ts], policy.gain[tl], policy.gain_n[tl], si.n_probe);
             if (si.sd.enabled && params.standdown) {
-                SPC_INF("ngram-suffix seq %d: stand-down %" PRId64 " times, %" PRId64 " plain rounds parked, %" PRId64 " drafted rounds booked, ledger %.2f ms (min match %d)\n",
-                        seq_id, si.sd.n_stand, si.sd.n_parked, si.sd.n_booked, si.sd.ledger, si.min_match);
+                SPC_INF("ngram-suffix seq %d: stand-down %" PRId64 " times, %" PRId64 " plain rounds parked, %" PRId64 " drafted rounds booked, ledger %.2f ms, net %.2f ms (min match %d)\n",
+                        seq_id, si.sd.n_stand, si.sd.n_parked, si.sd.n_booked, si.sd.ledger, si.sd.net, si.min_match);
             }
         }
         si.n_lookups = si.n_matches = si.n_drafts = si.n_drafted = si.n_accepted = si.n_yield = 0;

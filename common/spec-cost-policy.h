@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 
 struct common_spec_cost_policy {
     static constexpr int MAX_T = 8;
@@ -234,10 +235,10 @@ struct common_spec_round_timer {
 // the backoff. Output is unchanged where drafts verify exactly (only which rounds draft changes); the server keeps it off where they
 // do not (spill drafts change text, KLD-gated as they are). LLAMA_SPEC_STANDDOWN=0: off.
 struct common_spec_standdown {
-    static constexpr double CREDIT   = 4.0;
-    static constexpr double DEBT     = 2.0;
-    static constexpr int    PARK     = 64;
-    static constexpr int    PARK_MAX = 1024;
+    double CREDIT   = 4.0;    // LLAMA_SPEC_STANDDOWN_CREDIT / _DEBT / _PARK: tuning only
+    double DEBT     = 1.5;
+    int    PARK     = 64;
+    int    PARK_MAX = 1024;
 
     bool    enabled  = true;
     int64_t t_last   = 0;     // the previous draft() call (0: none in this request)
@@ -248,13 +249,22 @@ struct common_spec_standdown {
     int     tok_pend = 0;
     double  ledger   = 0.0;   // ms saved by drafting in this request (clamped)
     int     park     = 0;     // plain rounds left standing down
-    int     backoff  = PARK;
+    int     backoff  = 64;
     // per request counters (logged)
     int64_t n_stand = 0, n_parked = 0, n_booked = 0;
+    double  net = 0.0;    // unclamped ms saved (logged)
+    bool    log = false;  // LLAMA_SPEC_STANDDOWN_LOG=1: every booked round
 
     common_spec_standdown() {
         if (const char * e = getenv("LLAMA_SPEC_STANDDOWN")) {
             enabled = atoi(e) != 0;
+        }
+        if (const char * e = getenv("LLAMA_SPEC_STANDDOWN_CREDIT")) { CREDIT = atof(e); }
+        if (const char * e = getenv("LLAMA_SPEC_STANDDOWN_DEBT"))   { DEBT   = atof(e); }
+        if (const char * e = getenv("LLAMA_SPEC_STANDDOWN_PARK"))   { PARK   = std::max(1, atoi(e)); }
+        backoff = PARK;
+        if (const char * e = getenv("LLAMA_SPEC_STANDDOWN_LOG")) {
+            log = atoi(e) != 0;
         }
     }
 
@@ -262,11 +272,16 @@ struct common_spec_standdown {
         t_last = 0; n_last = 0; k_last = 0; k_pend = 0; ms_pend = 0.0; tok_pend = 0;
         ledger = 0.0; park = 0; backoff = PARK;
         n_stand = n_parked = n_booked = 0;
+        net = 0.0;
     }
 
-    void book(double tok, double ms, double c1) {
+    void book(int k, double tok, double ms, double c1) {
         ledger = std::min(ledger + tok*c1 - ms, CREDIT*c1);
+        net   += tok*c1 - ms;
         n_booked++;
+        if (log) {
+            fprintf(stderr, "standdown: k %d tok %.0f ms %.2f c1 %.2f saved %.2f ledger %.2f\n", k, tok, ms, c1, tok*c1 - ms, ledger);
+        }
         if (ledger >= 0.5*CREDIT*c1) {
             backoff = PARK;
         }
@@ -287,17 +302,18 @@ struct common_spec_standdown {
         if (t_last > 0 && n_hist >= n_last) {
             const double ms  = (now_us - t_last)/1000.0;
             const int    tok = (int) (n_hist - n_last);
-            // the plain cost is measured (and every size's warm-up rounds, graph builds and captures, are past) before anything is booked
+            // the plain cost is measured before anything is booked; a size's first rounds (graph builds, captures) are booked too:
+            // this request pays them
             const bool   ok  = pol.cost_n[1] >= 4;
             const double c1  = pol.cost_ms(1);
             if (k_last > 0) {
                 if (k_pend > 0 && ok) {
-                    book(tok_pend, ms_pend, c1);
+                    book(k_pend, tok_pend, ms_pend, c1);
                 }
                 k_pend = k_last; ms_pend = ms; tok_pend = tok;
             } else if (k_pend > 0) {
-                if (ok && pol.cost_n[std::min(k_pend + 1, common_spec_cost_policy::MAX_T)] > 0) {
-                    book(tok_pend, ms_pend + std::max(0.0, ms - c1), c1);
+                if (ok) {
+                    book(k_pend, tok_pend, ms_pend + std::max(0.0, ms - c1), c1);
                 }
                 k_pend = 0;
             }
