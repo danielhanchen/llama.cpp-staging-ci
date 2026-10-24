@@ -879,7 +879,8 @@ llama_context::~llama_context() {
             n     += p != nullptr;
         }
         LLAMA_LOG_INFO("%s: kept graph allocations (LLAMA_SCHED_SIZE_CACHE): %" PRIu64 " restored, %" PRIu64 " saved, %" PRIu64 " no longer valid, "
-            "%d held, %.2f MiB of host memory, no device memory\n", __func__, n_plan_restores, n_plan_saves, n_plan_invalid, n, bytes/1048576.0);
+            "%d held, %.2f MiB of host memory, no device memory; kept graph swap-ins %" PRIu64 ", graph reuses %d\n", __func__, n_plan_restores,
+            n_plan_saves, n_plan_invalid, n, bytes/1048576.0, n_small_swaps, (int) n_reused);
     }
     for (uint32_t i = 0; i < GF_SMALL_N; ++i) {
         small_plan_free(i);

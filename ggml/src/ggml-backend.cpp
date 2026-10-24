@@ -4923,15 +4923,25 @@ struct ggml_backend_sched_plan {
     size_t bytes;
 };
 
+static bool ggml_backend_sched_plan_debug() {
+    static const bool on = getenv("GGML_SCHED_PLAN_DEBUG") != nullptr && atoi(getenv("GGML_SCHED_PLAN_DEBUG")) != 0;
+    return on;
+}
+
 ggml_backend_sched_plan_t ggml_backend_sched_plan_save(ggml_backend_sched_t sched) {
-    if (sched == NULL || !sched->is_alloc || sched->n_copies != 1 || sched->pf_active || sched->ov_active || sched->ctx == NULL ||
-            ggml_gallocr_has_external(sched->galloc)) {
-        return NULL;
-    }
-    for (int b = 0; b < sched->n_backends; b++) {
+    const char * why = sched == NULL ? "no scheduler" : !sched->is_alloc ? "not allocated" : sched->n_copies != 1 ? "pipeline copies" :
+        sched->pf_active ? "prefetch" : sched->ov_active ? "overlap" : sched->ctx == NULL ? "no split context" :
+        ggml_gallocr_has_external(sched->galloc) ? "lent memory" : nullptr;
+    for (int b = 0; why == nullptr && b < sched->n_backends; b++) {
         if (sched->pf[b].n_lent_bufs > 0 || sched->pf[b].lent > 0) {
-            return NULL;
+            why = "lent prefetch buffers";
         }
+    }
+    if (why != nullptr) {
+        if (ggml_backend_sched_plan_debug()) {
+            GGML_LOG_INFO("%s: not saved (%s), %d nodes\n", __func__, why, sched ? sched->graph.n_nodes : 0);
+        }
+        return NULL;
     }
     auto * p = new ggml_backend_sched_plan();
     p->sched     = sched;
@@ -4984,9 +4994,15 @@ ggml_backend_sched_plan_t ggml_backend_sched_plan_save(ggml_backend_sched_t sche
 }
 
 bool ggml_backend_sched_plan_restore(ggml_backend_sched_t sched, ggml_backend_sched_plan_t p) {
-    if (p == NULL || p->sched != sched || p->gen != ggml_gallocr_get_generation(sched->galloc) || ggml_gallocr_has_external(sched->galloc) ||
-            p->ctx_base != sched->context_buffer || p->ctx_size != sched->context_buffer_size || p->hash_size != sched->hash_set.size ||
-            sched->graph.size < std::max(p->n_nodes, p->n_leafs) || sched->n_copies != 1 || sched->is_alloc) {
+    const char * why = p == NULL ? "no plan" : p->sched != sched ? "other scheduler" : p->gen != ggml_gallocr_get_generation(sched->galloc) ?
+        "graph buffers replaced" : ggml_gallocr_has_external(sched->galloc) ? "lent memory" :
+        p->ctx_base != sched->context_buffer || p->ctx_size != sched->context_buffer_size ? "split context replaced" :
+        p->hash_size != sched->hash_set.size ? "hash size" : sched->graph.size < std::max(p->n_nodes, p->n_leafs) ? "graph size" :
+        sched->n_copies != 1 ? "pipeline copies" : sched->is_alloc ? "allocated" : nullptr;
+    if (why != nullptr) {
+        if (ggml_backend_sched_plan_debug()) {
+            GGML_LOG_INFO("%s: not restored (%s)\n", __func__, why);
+        }
         return false;
     }
     for (int b = 0; b < sched->n_backends; b++) {
