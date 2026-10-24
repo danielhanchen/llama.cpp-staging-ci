@@ -925,7 +925,8 @@ static __global__ void flash_attn_combine_results(
         const float  * VKQ_parts_ptr,
         const float2 * VKQ_meta_ptr,
         float * dst_ptr,
-        const int parallel_blocks) {
+        const int parallel_blocks,
+        const int prefetch = 0) {
     ggml_cuda_pdl_lc();
     const float  * GGML_CUDA_RESTRICT VKQ_parts = VKQ_parts_ptr;
     const float2 * GGML_CUDA_RESTRICT VKQ_meta  = VKQ_meta_ptr;
@@ -963,6 +964,42 @@ static __global__ void flash_attn_combine_results(
     float kqmax = meta[0].x;
     for (int l = 1; l < parallel_blocks; ++l) {
         kqmax = max(kqmax, meta[l].x);
+    }
+
+    // k15: the scales are computed once per block (the same expf of the same values; meta[l].x is no longer read after this), and the
+    // sums run in the same order with 8 loads in flight (the loop was one dependent global load per step: ~14 us per call at 8k on G4,
+    // 64 parallel blocks). GGML_CUDA_FA_COMBINE_PREFETCH=0: the loop as before
+    static constexpr int unroll = 8;
+    if (prefetch) {
+        __syncthreads();
+        for (int l = tid; l < parallel_blocks; l += D) {
+            meta[l].x = expf(meta[l].x - kqmax);
+        }
+        __syncthreads();
+
+        float VKQ_numerator   = 0.0f;
+        float VKQ_denominator = 0.0f;
+        int l = 0;
+        for (; l + unroll <= parallel_blocks; l += unroll) {
+            float part[unroll];
+#pragma unroll
+            for (int u = 0; u < unroll; ++u) {
+                part[u] = VKQ_parts[(l + u)*D + tid];
+            }
+#pragma unroll
+            for (int u = 0; u < unroll; ++u) {
+                const float KQ_max_scale = meta[l + u].x;
+                VKQ_numerator   += KQ_max_scale * part[u];
+                VKQ_denominator += KQ_max_scale * meta[l + u].y;
+            }
+        }
+        for (; l < parallel_blocks; ++l) {
+            const float KQ_max_scale = meta[l].x;
+            VKQ_numerator   += KQ_max_scale * VKQ_parts[l*D + tid];
+            VKQ_denominator += KQ_max_scale * meta[l].y;
+        }
+        dst[tid] = VKQ_numerator / VKQ_denominator;
+        return;
     }
 
     float VKQ_numerator   = 0.0f;
@@ -1316,8 +1353,12 @@ void launch_fattn(
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
 
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
+        static const int combine_prefetch = [] {
+            const char * e = getenv("GGML_CUDA_FA_COMBINE_PREFETCH");
+            return e == nullptr || atoi(e) != 0 ? 1 : 0;
+        }();
         ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
-            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks, combine_prefetch);
     }
     CUDA_CHECK(cudaGetLastError());
 }
