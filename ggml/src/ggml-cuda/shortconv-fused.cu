@@ -132,11 +132,18 @@ int ggml_cuda_try_fuse_shortconv_window(ggml_backend_cuda_context & ctx, ggml_cg
                     dsn->ne[3] != 1 || dsn->nb[0] != sizeof(float) || node->data != dsn->data) {
                 break;
             }
-            // the snapshot must not overlap what the kernel reads or the window it copies from
+            // the snapshot must not overlap what the kernel reads or the window it copies from; the one exception is the state cell
+            // it was read from (decode overwrites the cell in place): with the same element addresses, element (c, ch, s) is read
+            // and then written by the same thread (ch, s) only, the reads first
             const char * d0 = (const char *) dsn->data;
             const char * d1 = d0 + (n_s - 1)*dsn->nb[1] + d*nr*sizeof(float);
+            const bool same_cell = d0 == (const char *) state->data && state->nb[0] == sizeof(float) &&
+                state->nb[1] == (size_t) d*sizeof(float) && (n_s == 1 || state->nb[2] == dsn->nb[1]);
             bool clash = false;
-            for (const ggml_tensor * t : { b, x, state, (const ggml_tensor *) cat }) {
+            for (const ggml_tensor * t : { b, x, same_cell ? nullptr : state, (const ggml_tensor *) cat }) {
+                if (t == nullptr) {
+                    continue;
+                }
                 const char * a0 = (const char *) t->data;
                 const char * a1 = a0 + ggml_nbytes(t);
                 clash = clash || (a0 < d1 && d0 < a1);
