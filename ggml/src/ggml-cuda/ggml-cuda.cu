@@ -4444,8 +4444,17 @@ static int ggml_cuda_try_fuse_add_rms_norm(ggml_backend_cuda_context * cuda_ctx,
     if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
             !ggml_are_same_shape(a, add) || !ggml_are_same_shape(b, add) || !ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(add) ||
             !ggml_is_contiguous(mul) || !ggml_are_same_shape(rms, mul) ||
-            !ggml_cuda_is_aligned(a, 16) || !ggml_cuda_is_aligned(b, 16) || !ggml_cuda_is_aligned(add, 16) ||
-            a->data == add->data || b->data == add->data) {
+            !ggml_cuda_is_aligned(a, 16) || !ggml_cuda_is_aligned(b, 16) || !ggml_cuda_is_aligned(add, 16)) {
+        return 0;
+    }
+    // in place (a or b at add's address) is fine: each element is read and written by the same thread and the norm pass reads after
+    // a barrier; any other overlap is not
+    const auto overlaps = [add](const ggml_tensor * t) {
+        const char * lo = (const char *) t->data;
+        const char * al = (const char *) add->data;
+        return t->data != add->data && lo < al + ggml_nbytes(add) && al < lo + ggml_nbytes(t);
+    };
+    if (overlaps(a) || overlaps(b)) {
         return 0;
     }
     const ggml_tensor * mul_other = mul->src[0] == rms ? mul->src[1] : mul->src[0];
