@@ -16,3 +16,11 @@ void ggml_cuda_op_mul_mat_vec_q(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream);
+
+// k15-mm: whether ggml_cuda_mul_mat_vec_q_multi has a kernel for this type, K and number of columns that gives every output the bytes
+// of its own ggml_cuda_mul_mat_vec_q (exact = batch invariant verify columns)
+bool ggml_cuda_mul_mat_vec_q_multi_ok(ggml_type type, int64_t ncols_x, int64_t ncols_dst, bool exact, int cc);
+
+// n (2..GGML_CUDA_MMVQ_MULTI_MAX) dense quantized matrices of one type and K over the same contiguous src1, one launch
+void ggml_cuda_mul_mat_vec_q_multi(ggml_backend_cuda_context & ctx, int n, const ggml_tensor * const * src0, const ggml_tensor * src1,
+    ggml_tensor * const * dst);

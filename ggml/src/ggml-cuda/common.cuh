@@ -1672,6 +1672,8 @@ struct ggml_backend_cuda_context {
     std::vector<cudaEvent_t> side_mv_join;
 
     ggml_cuda_q8_1_cache q8_1_cache;
+    // k15-mm: products of this graph evaluation already computed by an earlier multi-matrix mul_mat_vec_q launch (ggml_cuda_try_fuse_mmvq_multi)
+    std::unordered_set<const ggml_tensor *> mmvq_done_early;
     ggml_cuda_src1_memo  src1_memo;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
@@ -1809,6 +1811,8 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;
 };
+#define GGML_CUDA_MMVQ_MULTI_MAX 3 // matrices sharing one activation in one mul_mat_vec_q launch
+
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
     const void * gate = nullptr;
@@ -1821,6 +1825,12 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    // multi-matrix mul_mat_vec_q (n_multi > 1, see ggml_cuda_mul_mat_vec_q_multi): matrix m owns the blocks
+    // [multi_block0[m], multi_block0[m + 1]) of grid x, its weights at multi_x[m], its contiguous output at multi_dst[m]
+    const void * multi_x[GGML_CUDA_MMVQ_MULTI_MAX] = {};
+    float * multi_dst[GGML_CUDA_MMVQ_MULTI_MAX] = {};
+    uint32_t multi_nrows[GGML_CUDA_MMVQ_MULTI_MAX] = {};
+    uint32_t multi_block0[GGML_CUDA_MMVQ_MULTI_MAX] = {};
 };
 
 struct ggml_cuda_kernel_launch_params {
