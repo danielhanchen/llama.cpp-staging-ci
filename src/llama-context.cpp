@@ -4069,7 +4069,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             cap_seen.assign(cap_regions.size(), false);
             size += 3*cap_regions.size();
         }
-        const size_t meta = ggml_graph_overhead_custom(size, false) + ggml_tensor_overhead();
+        // k15-pp: the capture copies are tensors of this context too (a view of the state, the copy and its view of the snapshot)
+        const size_t meta = ggml_graph_overhead_custom(size, false) + (1 + (cap_in_graph ? 4*cap_regions.size() : 0))*ggml_tensor_overhead();
         if (lm_meta.size() < meta) {
             lm_meta.resize(meta);
         }
