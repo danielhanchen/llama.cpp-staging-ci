@@ -120,6 +120,8 @@ LLAMA_API void llama_set_ubatch_breaks(struct llama_context * ctx, const int32_t
 #define LLAMA_STATE_SEQ_FLAGS_CAPTURED 8
 LLAMA_API bool llama_set_state_capture(struct llama_context * ctx, llama_seq_id seq_id, int32_t i_batch);
 LLAMA_API bool llama_state_seq_captured(const struct llama_context * ctx, llama_seq_id seq_id, llama_pos * pos_max);
+// k15-ttft: whether llama_set_state_capture can take a capture in this context (a recurrent memory, beside a non-SWA KV cache if hybrid)
+LLAMA_API bool llama_state_capture_supported(const struct llama_context * ctx);
 // layer-major prompt groups can run in this context (a MoE cache with layer-major prompts on)
 LLAMA_API bool llama_layer_major_on(const struct llama_context * ctx);
 // k11: wait for the asynchronous state save in flight (LLAMA_STATE_SEQ_FLAGS_ASYNC), before its destination is read or freed
