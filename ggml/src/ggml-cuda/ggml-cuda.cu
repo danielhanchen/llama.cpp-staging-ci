@@ -4078,6 +4078,18 @@ static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::un
             }
         }
     }
+    // the x / scale output of the fused amax rescale (ggml_cuda_try_fuse_amax_rescale), GGML_CUDA_DISABLE_AMAX_Q8_1=1 turns this off
+    static const bool amax_q8_1_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_AMAX_Q8_1");
+    if (!producer_q8_1_disabled && !amax_q8_1_disabled) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (node->op == GGML_OP_DIV && node->type == GGML_TYPE_F32 && ggml_is_contiguous(node) && node->data != nullptr &&
+                (node->flags & GGML_TENSOR_FLAG_COMPUTE) && node->src[1] != nullptr && node->src[1]->op == GGML_OP_UNARY &&
+                ggml_get_unary_op(node->src[1]) == GGML_UNARY_OP_EXP) {
+                norm_outputs.insert(node);
+            }
+        }
+    }
     if (!producer_q8_1_disabled) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const ggml_tensor * node = cgraph->nodes[i];
@@ -4283,7 +4295,17 @@ static int ggml_cuda_try_fuse_amax_rescale(ggml_backend_cuda_context * cuda_ctx,
             memcpy(&chain.p1[j], (const float *) t->op_params + 1, sizeof(float));
         }
     }
-    ggml_cuda_op_amax_rescale(*cuda_ctx, x, prev, dv, chain);
+    // a mul_mat_vec_q reads x / scale (the down projection): write its q8_1 copy in the same kernel (see the q8_1 cache planner)
+    void * q8_1_out = nullptr;
+    ggml_cuda_q8_1_cache & cache = cuda_ctx->q8_1_cache;
+    if (cache.active() && cuda_ctx->curr_stream_no == 0 && cache.norm_targets.count(dv) &&
+        (ggml_nrows(dv) == 1 || dv->ne[0] % MATRIX_ROW_PADDING == 0)) {
+        const int64_t ne10_padded = GGML_PAD(dv->ne[0], MATRIX_ROW_PADDING);
+        int64_t key[ggml_cuda_q8_1_cache::n_key];
+        ggml_cuda_q8_1_cache::key_contiguous(dv->ne[0], ggml_nrows(dv), key);
+        q8_1_out = cache.reserve(dv->data, ggml_nbytes(dv), key, ggml_nrows(dv)*ne10_padded/QK8_1*sizeof(block_q8_1));
+    }
+    ggml_cuda_op_amax_rescale(*cuda_ctx, x, prev, dv, chain, q8_1_out);
     return id - i;
 }
 
