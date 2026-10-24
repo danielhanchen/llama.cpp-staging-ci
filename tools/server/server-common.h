@@ -225,6 +225,8 @@ public:
     const llama_tokens & get_tokens() const;
 
     llama_tokens get_text_tokens() const;
+    // k15-spec: the same into out, reusing its buffer (the drafter's copy of a 30k-token prompt every decode round)
+    void get_text_tokens_into(llama_tokens & out) const;
 
     std::vector<char> serialize() const;
     static server_tokens deserialize(const llama_tokens & packed, bool has_mtmd);

@@ -1083,6 +1083,7 @@ private:
     llama_context * ctx_dft   = nullptr;
 
     common_speculative_init_result_ptr spec_init;
+    int spec_draft_inline = -1;   // k15-spec: n-gram drafts looked up without a queue yield (-1: not decided yet)
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -3769,7 +3770,7 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        slot.prompt.tokens.get_text_tokens_into(slot.spec_prompt);
 
                         const bool spec_reject = slot.use_spec_rejection();
 
@@ -3796,9 +3797,22 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
-            queue_tasks.yield_to_queue([&]() {
+            // k15-spec: n-gram drafters only (no draft model) look up in microseconds: drafted here, without handing the task queue to
+            // the worker thread and back (two thread wake-ups every decode round, 0.05-0.1 ms on G4: 2-3% of a 2.4 ms LFM2.5 round, paid
+            // with or without a draft). LLAMA_SPEC_DRAFT_YIELD=1: yield always (as before)
+            if (spec_draft_inline < 0) {
+                const char * e = getenv("LLAMA_SPEC_DRAFT_YIELD");
+                spec_draft_inline = (e != nullptr && atoi(e) != 0) || common_speculative_uses_draft_ctx(params_base.speculative.types) ? 0 : 1;
+                SRV_INF("speculative drafts %s\n", spec_draft_inline ? "looked up inline (n-gram only; LLAMA_SPEC_DRAFT_YIELD=1: yield to the task queue)" :
+                        "made while the task queue runs");
+            }
+            if (spec_draft_inline) {
                 common_speculative_draft(spec.get());
-            });
+            } else {
+                queue_tasks.yield_to_queue([&]() {
+                    common_speculative_draft(spec.get());
+                });
+            }
         }
 
         // make checkpoints if needed
