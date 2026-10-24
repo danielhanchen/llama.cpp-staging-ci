@@ -4490,7 +4490,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         // gemma-4 26B-A4B Q3_K_M + drafter at 8 GB, 2k: 393 instead of 241 slots lent, a different cache after the prompt (another text than
         // k10) and 287 instead of 325 tok/s decode, prompt 4815 instead of 5014 (LLAMA_MOE_LM_LEND=0). LLAMA_MOE_LM_LEND_FIRST=1: lend at once (k12)
         static const bool lm_lend_first = getenv("LLAMA_MOE_LM_LEND_FIRST") != nullptr && atoi(getenv("LLAMA_MOE_LM_LEND_FIRST")) != 0;
-        const bool lend_ok = lm_lend && moe_cache->lends_on_any();
+        const bool lend_ok = lm_lend && moe_cache->lends_graph_any();
         bool lend_g = lend_ok && lm_lend_first;
         if (lend_g) {
             moe_cache->set_graph_lend(true);
