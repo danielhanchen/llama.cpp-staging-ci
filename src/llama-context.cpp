@@ -2466,7 +2466,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const bool small_cache_env = small_cache_mode == 2 || small_cache_mode == 3 || (small_cache_mode == 1 && cparams.verify_exact) || small_cache_dft;
     // (single token decodes and speculative verify windows only: a prompt's short tail keeps the shared graph, as before; G4 LFM2.5
     // 32 GB: with the tails kept too, chat / code prompts were 3 / 9% slower)
-    const uint32_t n_small = small_cache_env && (moe_cache == nullptr || small_cache_mode == 3) && !graph_reuse_disable && n_outputs > 0 &&
+    // (the drafter's catch-up batch has no outputs: it only writes the KV of the accepted rows)
+    const uint32_t n_small = small_cache_env && (moe_cache == nullptr || small_cache_mode == 3) && !graph_reuse_disable && (n_outputs > 0 || small_cache_dft) &&
         (ubatch.n_tokens == 1 || cparams.verify || small_cache_dft) && ubatch.n_tokens <= GF_SMALL_MAX ? ubatch.n_tokens : 0;
 
     llm_graph_result * res = nullptr;
