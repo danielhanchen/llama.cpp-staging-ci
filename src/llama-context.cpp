@@ -2457,7 +2457,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the next short prompt 7-8% on G4; LLAMA_GRAPH_SMALL_CACHE=2 keeps them always, =0 never)
     static const int  small_cache_mode = getenv("LLAMA_GRAPH_SMALL_CACHE") == nullptr ? 1 : atoi(getenv("LLAMA_GRAPH_SMALL_CACHE"));
     // k13-fn: =3 also with a MoE cache (verify windows of changing size each keep their graph, so their CUDA graphs stay captured)
-    const bool small_cache_env = small_cache_mode == 2 || small_cache_mode == 3 || (small_cache_mode == 1 && cparams.verify_exact);
+    // k15-fn: also the MTP drafter's own context (no MoE cache): its single-token draft steps alternate with the catch-up batch of the
+    // accepted rows, which rebuilt the shared graph every round, so the step's CUDA graph was re-captured instead of replayed
+    // (LLAMA_GRAPH_SMALL_CACHE_DRAFT=0: as before)
+    static const bool small_cache_draft = getenv("LLAMA_GRAPH_SMALL_CACHE_DRAFT") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_CACHE_DRAFT")) != 0;
+    const bool small_cache_env = small_cache_mode == 2 || small_cache_mode == 3 || (small_cache_mode == 1 && cparams.verify_exact) ||
+        (small_cache_mode == 1 && small_cache_draft && cparams.embeddings_nextn_masked && moe_cache == nullptr);
     // (single token decodes and speculative verify windows only: a prompt's short tail keeps the shared graph, as before; G4 LFM2.5
     // 32 GB: with the tails kept too, chat / code prompts were 3 / 9% slower)
     const uint32_t n_small = small_cache_env && (moe_cache == nullptr || small_cache_mode == 3) && !graph_reuse_disable && n_outputs > 0 &&
