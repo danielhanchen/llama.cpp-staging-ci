@@ -21,6 +21,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
+#include <string>
 
 struct common_spec_cost_policy {
     static constexpr int MAX_T = 8;
@@ -220,5 +222,193 @@ struct common_spec_round_timer {
     // the window this round verifies (1 = plain)
     void next(int w) {
         w_last = std::max(1, w);
+    }
+};
+
+// k15-fn: LLAMA_SPEC_COST=1, the cost-aware MTP window (Strata's STRATA_SPEC_COST, src/spec/draft_policy.cpp keep_draft at
+// 7ddc17a3). While the MTP drafts, each draft's top-1 probability p is mapped to a measured acceptance a(p) (8 probability
+// buckets, decayed counts; before data a(p) = p), the chain's expected committed tokens E(rows) = 1 + a1 + a1 a2 + ... are
+// priced by the measured round time of a window of that many rows (an EMA per context bucket and size, kept across requests),
+// and the window keeps the rows with the best E / cost. Drafting stops when one or two more drafts as likely as the last could
+// not beat the best so far. A size never measured is tried a few times when the chain is likely to reach it. Greedy verify keeps
+// the output only where verify is batch invariant; elsewhere the window size changes the target's numerics (KLD-gated).
+struct common_spec_mtp_cost {
+    static constexpr int MAX_T = 8;
+    static constexpr int CTX   = 4;     // context buckets: < 1536, < 6144, < 24576, longer
+    static constexpr int PB    = 8;     // probability buckets
+    static constexpr double SHAPE[MAX_T + 1] = { 0.0, 1.0, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6 };
+    static constexpr double ALPHA    = 0.1;
+    static constexpr double CAL_DECAY = 0.995;
+    static constexpr double PRIOR_N  = 4.0;
+    static constexpr int    PROBES   = 3;
+    static constexpr int    SKIP     = 2;    // the first rounds of a size build / capture its graphs
+
+    double margin = 0.03;
+    std::array<std::array<double, MAX_T + 1>, CTX> cost{}, cost_n{};
+    std::array<std::array<int, MAX_T + 1>, CTX>    seen{};
+    std::array<double, PB> pa_ok{}, pa_n{};
+    std::array<double, MAX_T + 1> n_rounds{};   // rounds per size (stats)
+    int bk = 0;
+
+    struct chain_state {
+        double q = 1.0, e = 1.0, best_v = 0.0;
+        int    best_rows = 1;
+    };
+
+    common_spec_mtp_cost() {
+        if (const char * e = getenv("LLAMA_SPEC_COST_MARGIN")) {
+            margin = atof(e);
+        }
+    }
+
+    static int ctx_bucket(int64_t pos) {
+        return pos < 1536 ? 0 : pos < 6144 ? 1 : pos < 24576 ? 2 : 3;
+    }
+
+    void set_context(int64_t pos) {
+        const int nb = ctx_bucket(pos);
+        if (nb == bk) {
+            return;
+        }
+        bool has = false;
+        for (int t = 1; t <= MAX_T; ++t) {
+            has = has || cost_n[nb][t] > 0;
+        }
+        if (!has) {   // nothing measured at this length yet: the nearest bucket with data is the prior (one sample's worth)
+            for (int d = 1; d < CTX && !has; ++d) {
+                for (const int src : { nb - d, nb + d }) {
+                    if (src < 0 || src >= CTX || has) {
+                        continue;
+                    }
+                    for (int t = 1; t <= MAX_T; ++t) {
+                        if (cost_n[src][t] > 0) {
+                            cost[nb][t]   = cost[src][t];
+                            cost_n[nb][t] = 1.0;
+                            has = true;
+                        }
+                    }
+                }
+            }
+        }
+        bk = nb;
+    }
+
+    double cost_ms(int t) const {
+        t = std::clamp(t, 1, MAX_T);
+        if (cost_n[bk][t] > 0) {
+            return cost[bk][t];
+        }
+        double num = 0.0, den = 0.0;
+        for (int u = 1; u <= MAX_T; ++u) {
+            if (cost_n[bk][u] > 0) {
+                const double w = std::min(cost_n[bk][u], 20.0);
+                num += w*cost[bk][u]*SHAPE[t]/SHAPE[u];
+                den += w;
+            }
+        }
+        return den > 0 ? num/den : SHAPE[t];
+    }
+
+    void observe(int t, double ms) {
+        t = std::clamp(t, 1, MAX_T);
+        n_rounds[t] += 1.0;
+        if (!(ms > 0.0) || seen[bk][t]++ < SKIP) {
+            return;
+        }
+        const double n = cost_n[bk][t];
+        if (n >= 4 && ms > 20.0*cost[bk][t]) {   // a request boundary or a host stall, not a round
+            return;
+        }
+        if (n >= 2) {
+            ms = std::min(ms, 2.0*cost[bk][t]);
+        }
+        const double alpha = std::max(ALPHA, 1.0/(n + 1.0));   // a running mean for the first samples
+        cost[bk][t]   = n > 0 ? (1.0 - alpha)*cost[bk][t] + alpha*ms : ms;
+        cost_n[bk][t] = n + 1.0;
+    }
+
+    static int p_bucket(double p) {
+        const int b = (int) (p*PB);
+        return b < 0 ? 0 : b >= PB ? PB - 1 : b;
+    }
+
+    double draft_rate(double p) const {
+        const int b = p_bucket(p);
+        return (pa_ok[b] + PRIOR_N*std::clamp(p, 0.0, 1.0))/(pa_n[b] + PRIOR_N);
+    }
+
+    // the drafts of a verified window (their probabilities) and how many of them held
+    void observe_probs(const float * p, int n, int accepted) {
+        for (int j = 0; j < n && j <= accepted; ++j) {
+            const int b = p_bucket(p[j]);
+            pa_ok[b] = CAL_DECAY*pa_ok[b] + (j < accepted ? 1.0 : 0.0);
+            pa_n[b]  = CAL_DECAY*pa_n[b] + 1.0;
+        }
+    }
+
+    // after draft idx (0-based) with probability p: updates the best window (st.best_rows) and returns whether to draft another
+    bool keep_draft(chain_state & st, int idx, double p, int cap) const {
+        cap = std::clamp(cap, 1, MAX_T);
+        if (idx == 0) {
+            st = chain_state{};
+            st.best_v = 1.0/cost_ms(1);
+        }
+        const double a = draft_rate(p);
+        st.q *= a;
+        st.e += st.q;
+        const int rows = idx + 2;
+        if (rows <= cap) {
+            const double v = st.e/cost_ms(rows);
+            if (v > st.best_v*(1.0 + margin/3.0)) {
+                st.best_v    = v;
+                st.best_rows = rows;
+            }
+            if (cost_n[bk][rows] < PROBES && st.q >= 0.15) {
+                st.best_rows = rows;
+            }
+        }
+        if (rows + 1 > cap) {
+            return false;
+        }
+        const double v1 = (st.e + st.q*a)/cost_ms(rows + 1);
+        const double v2 = rows + 2 <= cap ? (st.e + st.q*a + st.q*a*a)/cost_ms(rows + 2) : 0.0;
+        return std::max(v1, v2) > st.best_v*(1.0 + margin/3.0) || (cost_n[bk][rows + 1] < PROBES && st.q*a >= 0.15);
+    }
+
+    std::string text() const {
+        std::string out;
+        char b[96];
+        for (int k = 0; k < CTX; ++k) {
+            bool any = false;
+            for (int t = 1; t <= MAX_T; ++t) {
+                any = any || cost_n[k][t] > 0;
+            }
+            if (!any) {
+                continue;
+            }
+            snprintf(b, sizeof(b), "%sctx%d:", out.empty() ? "" : " | ", k);
+            out += b;
+            for (int t = 1; t <= MAX_T; ++t) {
+                if (cost_n[k][t] > 0) {
+                    snprintf(b, sizeof(b), " T%d %.2f(n=%.0f)", t, cost[k][t], cost_n[k][t]);
+                    out += b;
+                }
+            }
+        }
+        out += " | rounds:";
+        for (int t = 1; t <= MAX_T; ++t) {
+            if (n_rounds[t] > 0) {
+                snprintf(b, sizeof(b), " T%d=%.0f", t, n_rounds[t]);
+                out += b;
+            }
+        }
+        out += " | a(p):";
+        for (int i = 0; i < PB; ++i) {
+            if (pa_n[i] > 0.5) {
+                snprintf(b, sizeof(b), " %.2f:%.2f(%.0f)", (i + 0.5)/PB, pa_ok[i]/pa_n[i], pa_n[i]);
+                out += b;
+            }
+        }
+        return out;
     }
 };
