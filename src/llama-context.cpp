@@ -3539,12 +3539,106 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     return 0;
 }
 
+void llama_context::lm_seed_resolve(lm_seed_pending & p) {
+    auto & L = *p.L;
+    const int64_t n_expert = L.w_first->ne[2];
+    std::vector<int32_t> ids_data(ggml_nelements(L.ids));
+    if (p.ev >= 0) {
+        const int64_t t0 = ggml_time_us();
+        ggml_backend_event_synchronize(lm_async_ev[p.ev].get());
+        lm_n_async_wait_us += ggml_time_us() - t0;
+        memcpy(ids_data.data(), (const uint8_t *) ggml_backend_buffer_get_base(lm_async_buf.get()) + p.off, ggml_nbytes(L.ids));
+    } else {
+        ggml_backend_tensor_get(L.ids, ids_data.data(), 0, ggml_nbytes(L.ids));
+    }
+    std::vector<int32_t> counts(n_expert, 0);
+    for (const int32_t id : ids_data) {
+        GGML_ASSERT(id >= 0 && id < n_expert);
+        counts[id]++;
+    }
+    moe_cache->set_seed_counts(L.w_first, counts);
+    // the expert copies of the layer queued so far, in the order the synchronous seed issues them (the later ones seed when issued)
+    for (const ggml_tensor * w : L.ws) {
+        const auto st = lm_staged.find(w);
+        if (st == lm_staged.end() || lm_seeded.count(w) > 0) {
+            continue;
+        }
+        const std::vector<int32_t> * c = moe_cache->get_seed_counts(w);
+        if (c != nullptr && !c->empty()) {
+            lm_seeded.insert(w);
+            moe_cache->seed(st->second.first, w, st->second.second, *c, std::vector<bool>(w->ne[2], true));
+        }
+    }
+}
+
+// a layer seeds (waiting for its routing, which the device computed by then or soon) once all of its expert copies are queued, or once the
+// copies of a later split are queued after them (their seed must be queued before a copy that may reuse the staging slot: before the copies
+// of the split after that one); pre: before the copies of a split, only the layers staged two or more splits back
+void llama_context::lm_seed_resolve_due(bool pre) {
+    for (size_t i = 0; i < lm_pending.size();) {
+        auto & p = lm_pending[i];
+        int64_t seq = -1;
+        bool all = true;
+        for (const ggml_tensor * w : p.L->ws) {
+            const auto it = lm_staged_seq.find(w);
+            if (it == lm_staged_seq.end()) {
+                all = false;
+            } else if (seq < 0 || it->second < seq) {
+                seq = it->second;
+            }
+        }
+        const bool due = seq >= 0 && (pre ? seq < lm_copy_seq - 1 : (all || seq < lm_copy_seq));
+        if (!due) {
+            i++;
+            continue;
+        }
+        lm_seed_resolve(p);
+        lm_pending.erase(lm_pending.begin() + i);
+    }
+}
+
+void llama_context::lm_seed_resolve_all() {
+    for (auto & p : lm_pending) {
+        lm_seed_resolve(p);
+    }
+    lm_pending.clear();
+    lm_async_used = 0;
+    lm_async_nev  = 0;
+}
+
 bool llama_context::lm_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
     const auto it = lctx->lm_ask.find(t);
     const bool mine = it != lctx->lm_ask.end() && !it->second.done;
     if (ask) {
         return mine || (lctx->cparams.cb_eval && lctx->cparams.cb_eval(t, true, lctx->cparams.cb_eval_user_data));
+    }
+    if (mine && lctx->lm_seed_async) {
+        // k15-pp: the nodes up to t are queued, not computed: read the routing behind them, the copy callback seeds the layer
+        auto & L = it->second;
+        L.done = true;
+        const size_t nb = ggml_nbytes(L.ids);
+        ggml_backend_t be = ggml_backend_sched_get_tensor_backend(lctx->sched.get(), L.ids);
+        const size_t off = GGML_PAD(lctx->lm_async_used, 64);
+        const int ev = lctx->lm_async_nev;
+        if (be != nullptr && ggml_backend_get_device(be) == lctx->lm_async_dev && lctx->lm_async_buf &&
+                off + nb <= ggml_backend_buffer_get_size(lctx->lm_async_buf.get()) &&
+                ev < (int) lctx->lm_async_ev.size()) {
+            ggml_backend_tensor_get_async(be, L.ids, (uint8_t *) ggml_backend_buffer_get_base(lctx->lm_async_buf.get()) + off, 0, nb);
+            ggml_backend_event_record(lctx->lm_async_ev[ev].get(), be);
+            lctx->lm_async_used = off + nb;
+            lctx->lm_async_nev++;
+            lctx->lm_pending.push_back({ &L, ev, off, be });
+            lctx->lm_n_async++;
+            lctx->lm_seed_resolve_due(false); // the layer's copies may all be queued already
+            return true;
+        }
+        // no room (not expected): read it now
+        ggml_backend_sched_synchronize(lctx->sched.get());
+        lctx->lm_pending.push_back({ &L, -1, 0, nullptr });
+        lctx->lm_seed_resolve(lctx->lm_pending.back());
+        lctx->lm_pending.pop_back();
+        return true;
     }
     if (mine) {
         // the scheduler synchronized the backend after t: the routing of the source ubatch for this layer is computed
@@ -4106,6 +4200,52 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         moe_cache_seed_prev = lm_seed_active;
         if (lm_seed_active) {
             ggml_backend_sched_set_eval_callback(sched.get(), lm_eval_cb, this);
+            // k15-pp: LLAMA_MOE_LM_SEED_ASYNC=0 reads the routing in the callback after a device sync (k14). The sync held back the next
+            // layer's expert copies until its router had run, so the copy engine idled through every layer's attention
+            static const bool lm_async_env = getenv("LLAMA_MOE_LM_SEED_ASYNC") == nullptr || atoi(getenv("LLAMA_MOE_LM_SEED_ASYNC")) != 0;
+            lm_seed_async = false;
+            lm_pending.clear();
+            lm_staged_seq.clear();
+            lm_copy_graph = nullptr;
+            lm_async_used = 0;
+            lm_async_nev  = 0;
+            if (lm_async_env && cparams.cb_eval == nullptr) {
+                size_t need = 0;
+                ggml_backend_dev_t dev = nullptr;
+                bool ok = true;
+                for (const auto & a : lm_ask) {
+                    need += GGML_PAD(ggml_nbytes(a.second.ids), 64);
+                }
+                // the device of the first GPU backend (the routing of an offloaded MoE layer is computed there)
+                for (const auto & b : backends) {
+                    ggml_backend_dev_t d = ggml_backend_get_device(b.get());
+                    if (d != nullptr && ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        dev = d;
+                        break;
+                    }
+                }
+                ggml_backend_buffer_type_t host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+                if (host_buft == nullptr) {
+                    ok = false;
+                }
+                if (ok && (!lm_async_buf || ggml_backend_buffer_get_size(lm_async_buf.get()) < need)) {
+                    lm_async_buf.reset(ggml_backend_buft_alloc_buffer(host_buft, need + (need >> 2)));
+                    ok = lm_async_buf != nullptr;
+                }
+                while (ok && lm_async_ev.size() < lm_ask.size()) {
+                    ggml_backend_event_t e = ggml_backend_event_new(dev);
+                    if (e == nullptr) {
+                        ok = false;
+                        break;
+                    }
+                    lm_async_ev.emplace_back(e);
+                }
+                lm_seed_async = ok;
+                lm_async_dev  = dev;
+                if (ok) {
+                    ggml_backend_sched_set_eval_callback_sync(sched.get(), false);
+                }
+            }
         }
     }
 
@@ -4252,7 +4392,12 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     auto run = [&](ggml_cgraph * g) {
         prefetch_n_tokens = n_tokens_max;
         moe_cache->set_graph(g);
+        if (!lm_pending.empty()) {
+            lm_seed_resolve_all();
+        }
         lm_staged.clear(); // the expert copies a seed reads are those of this graph
+        lm_staged_seq.clear();
+        lm_copy_graph = nullptr;
         ggml_backend_sched_set_reuse_weight_copies(sched.get(), true);
         const bool ok = ggml_backend_sched_alloc_graph(sched.get(), g);
         ggml_backend_sched_set_reuse_weight_copies(sched.get(), false);
@@ -4277,7 +4422,18 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             }
             LLAMA_LOG_INFO("%s: check: %zu index copies at %zu addresses, %d shared by different inputs\n", __func__, lm_sr.size(), at.size(), n_same);
         }
-        return graph_compute(g, true);
+        const auto st = graph_compute(g, true);
+        if (lm_seed_async && !lm_pending.empty()) {
+            // the layers whose copies the graph queued last (their staging slots hold the copies until the next graph)
+            if (st == GGML_STATUS_SUCCESS) {
+                lm_seed_resolve_all();
+            } else {
+                lm_pending.clear();
+            }
+        }
+        lm_async_used = 0;
+        lm_async_nev  = 0;
+        return st;
     };
 
     size_t buf_before = 0, buf_after = 0;
@@ -4496,6 +4652,13 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         LLAMA_LOG_INFO("%s: seed from the routing of ubatch %d of the group (seeding ubatch %d): %zu layers, %zu of %zu expert tensors seeded%s%s\n",
             __func__, src_k, seed_k, lm_ask.size(), lm_seeded.size(), n_ws, miss.empty() ? "" : "; not:", miss.c_str());
     }
+    if (lm_verbose && lm_seed_async) {
+        LLAMA_LOG_INFO("%s: async seed: %" PRId64 " routings read without a sync, %.2f ms waited for them in total\n", __func__, lm_n_async,
+            lm_n_async_wait_us/1000.0);
+    }
+    lm_pending.clear();
+    lm_staged_seq.clear();
+    lm_seed_async       = false;
     lm_seed_active      = false;
     moe_cache_seed_prev = false;
     lm_ask.clear();
@@ -5490,7 +5653,27 @@ bool llama_context::sched_copy_all_experts(const ggml_tensor * src, const ggml_t
     return ids->ne[1] >= prefetch_min_batch || ggml_nelements(ids) >= 8*src->ne[2];
 }
 
+// k15-pp: the seeds of the layer-major group whose routing the eval callback reads asynchronously are issued here, on the copy queue
+// behind the layer's expert copies (as the synchronous seed issues them), see lm_seed_resolve_due
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
+    auto * lctx = static_cast<llama_context *>(user_data);
+    if (!lctx->lm_seed_async || !lctx->lm_seed_active) {
+        return sched_copy_experts_body(backend, src, dst, graph, user_data);
+    }
+    if (graph != lctx->lm_copy_graph) {
+        lctx->lm_copy_graph = graph;
+        lctx->lm_copy_seq++;
+    }
+    lctx->lm_seed_resolve_due(true);
+    const bool ok = sched_copy_experts_body(backend, src, dst, graph, user_data);
+    if (lctx->lm_staged.count(src) > 0 && lctx->lm_staged_seq.count(src) == 0) {
+        lctx->lm_staged_seq[src] = lctx->lm_copy_seq;
+    }
+    lctx->lm_seed_resolve_due(false);
+    return ok;
+}
+
+bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
     // the slot maps of the MoE cache

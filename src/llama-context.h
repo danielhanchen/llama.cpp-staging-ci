@@ -384,6 +384,7 @@ private:
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
+    static bool sched_copy_experts_body(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
     // ggml_backend_sched prefetch callback, selects how the weights in host memory are prefetched
     static ggml_backend_sched_prefetch_mode sched_prefetch_mode(const ggml_tensor * src, const ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
@@ -640,6 +641,30 @@ private:
     std::unordered_map<const ggml_tensor *, std::pair<ggml_backend_t, const ggml_tensor *>> lm_staged; // expert tensor -> (copy backend, copy)
     std::unordered_set<const ggml_tensor *> lm_seeded;
     static bool lm_eval_cb(ggml_tensor * t, bool ask, void * user_data);
+    // k15-pp (LLAMA_MOE_LM_SEED_ASYNC, default on): the eval callback reads the routing without a device sync, into pinned memory behind an
+    // event, and the seed of the layer is issued from the copy callback once the layer's expert copies are queued (lm_seed_resolve_due)
+    struct lm_seed_pending {
+        lm_seed_layer * L;
+        int             ev;      // lm_async_ev
+        size_t          off;     // bytes into lm_async_buf
+        ggml_backend_t  be_ids;  // the backend that computes the routing
+    };
+    bool lm_seed_async = false;
+    ggml_backend_dev_t lm_async_dev = nullptr;
+    std::vector<lm_seed_pending> lm_pending;
+    std::vector<ggml_backend_event_ptr> lm_async_ev;
+    ggml_backend_buffer_ptr lm_async_buf;
+    size_t lm_async_used = 0;
+    int    lm_async_nev  = 0;
+    const ggml_cgraph * lm_copy_graph = nullptr; // the split graph of the last expert copy, lm_copy_seq counts its changes
+    int64_t lm_copy_seq = 0;
+    std::unordered_map<const ggml_tensor *, int64_t> lm_staged_seq; // expert tensor -> lm_copy_seq of its copy
+    int64_t lm_n_async_wait_us = 0;
+    int64_t lm_n_async = 0;
+    void lm_seed_resolve(lm_seed_pending & p);
+    // pre = true: before the copies of a split (only the layers whose staged copies the split may overwrite); false: after them
+    void lm_seed_resolve_due(bool pre);
+    void lm_seed_resolve_all();
     // returns the number of ubatches it processed (0: none, the caller processes the current ubatch), < 0 on error (ret = decode() return)
     int decode_layer_major(llama_memory_context_i * mctx, int64_t n_outputs_all, int64_t n_tokens_all, int64_t & n_outputs_prev,
             int64_t & n_tokens_prev, bool & more, int & ret);

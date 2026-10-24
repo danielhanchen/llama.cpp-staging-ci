@@ -1104,6 +1104,7 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
+    bool callback_eval_nosync; // see ggml_backend_sched_set_eval_callback_sync
 
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
@@ -4462,7 +4463,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
 
                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
                 // (a range that ends without a node the user asked for needs no synchronization)
-                if (need) {
+                if (need && !sched->callback_eval_nosync) {
                     ggml_backend_synchronize(split_backend);
                 }
 
@@ -4939,6 +4940,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+    sched->callback_eval_nosync = false;
+}
+
+void ggml_backend_sched_set_eval_callback_sync(ggml_backend_sched_t sched, bool sync) {
+    GGML_ASSERT(sched);
+    sched->callback_eval_nosync = !sync;
 }
 
 // the copies of the allocated graph were selected with the old callbacks: the regular path fills their slots until the next allocation
