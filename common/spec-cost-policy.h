@@ -240,6 +240,7 @@ struct common_spec_standdown {
     double DEBT  = 1.0;    // LLAMA_SPEC_STANDDOWN_DEBT / _DECAY / _ALPHA: tuning only
     double DECAY = 0.98;
     double ALPHA = 0.5;
+    static constexpr double MAX_LOSS = 4.0;
 
     bool    enabled  = true;
     bool    log      = false;   // LLAMA_SPEC_STANDDOWN_LOG=1: every booked round
@@ -272,7 +273,8 @@ struct common_spec_standdown {
     }
 
     void book(int k, int b, double tok, double ms, double c1) {
-        const double sv = (tok*c1 - ms)/c1;
+        // one stalled round (a busy host, a request boundary) counts at most MAX_LOSS plain rounds lost
+        const double sv = std::max((tok*c1 - ms)/c1, -MAX_LOSS);
         saved[b] = n_cls[b] > 0 ? (1.0 - ALPHA)*saved[b] + ALPHA*sv : sv;
         n_cls[b]++;
         n_booked++;
