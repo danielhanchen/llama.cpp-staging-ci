@@ -4484,6 +4484,70 @@ static void ggml_vec_dot_iq2_xxs_q8_K_multi(int n, float * GGML_RESTRICT s, cons
     }
 }
 
+static inline __attribute__((always_inline)) void ggml_vec_dot_iq4_xs_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+    const block_iq4_xs * GGML_RESTRICT x = vx;
+    const int nb = n / QK_K;
+    const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_iq4nl);
+    const __m128i m4b  = _mm_set1_epi8(0x0f);
+    __m256 accum[GGML_VDM_MAX];
+    for (int c = 0; c < nc; ++c) {
+        accum[c] = _mm256_setzero_ps();
+    }
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const uint8_t * qs = x[ibl].qs;
+        uint16_t sh = x[ibl].scales_h;
+        __m256i sumi1[GGML_VDM_MAX];
+        __m256i sumi2[GGML_VDM_MAX];
+        for (int c = 0; c < nc; ++c) {
+            sumi1[c] = _mm256_setzero_si256();
+            sumi2[c] = _mm256_setzero_si256();
+        }
+        for (int ib = 0; ib < QK_K/32; ib += 2) {
+            const __m128i q4bits_1 = _mm_loadu_si128((const __m128i*)qs);  qs += 16;
+            const __m128i q4bits_2 = _mm_loadu_si128((const __m128i*)qs);  qs += 16;
+            const __m256i q4b_1 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_1, 4), m4b)),
+                                                  _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_1, m4b)));
+            const __m256i q4b_2 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_2, 4), m4b)),
+                                                  _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_2, m4b)));
+            const int16_t ls1 = ((x[ibl].scales_l[ib/2] & 0xf) | ((sh << 4) & 0x30)) - 32;
+            const int16_t ls2 = ((x[ibl].scales_l[ib/2] >>  4) | ((sh << 2) & 0x30)) - 32;
+            sh >>= 4;
+            const __m256i sc1 = _mm256_set1_epi16(ls1);
+            const __m256i sc2 = _mm256_set1_epi16(ls2);
+            for (int c = 0; c < nc; ++c) {
+                const int8_t * q8 = ((const block_q8_K *) vy[c])[ibl].qs + 32*ib;
+                const __m256i q8b_1 = _mm256_loadu_si256((const __m256i *)q8);
+                const __m256i q8b_2 = _mm256_loadu_si256((const __m256i *)(q8 + 32));
+                const __m256i p16_1 = mul_add_epi8(q4b_1, q8b_1);
+                const __m256i p16_2 = mul_add_epi8(q4b_2, q8b_2);
+                sumi1[c] = _mm256_add_epi32(_mm256_madd_epi16(p16_1, sc1), sumi1[c]);
+                sumi2[c] = _mm256_add_epi32(_mm256_madd_epi16(p16_2, sc2), sumi2[c]);
+            }
+        }
+        const float xd = GGML_CPU_FP16_TO_FP32(x[ibl].d);
+        for (int c = 0; c < nc; ++c) {
+            accum[c] = _mm256_fmadd_ps(_mm256_set1_ps(xd*((const block_q8_K *) vy[c])[ibl].d),
+                    _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1[c], sumi2[c])), accum[c]);
+        }
+    }
+    for (int c = 0; c < nc; ++c) {
+        s[c] = hsum_float_8(accum[c]);
+    }
+}
+
+static void ggml_vec_dot_iq4_xs_q8_K_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
+    switch (nc) {
+        case 2:  ggml_vec_dot_iq4_xs_q8_K_multi_n(n, s, vx, vy, 2); break;
+        case 3:  ggml_vec_dot_iq4_xs_q8_K_multi_n(n, s, vx, vy, 3); break;
+        case 4:  ggml_vec_dot_iq4_xs_q8_K_multi_n(n, s, vx, vy, 4); break;
+        case 5:  ggml_vec_dot_iq4_xs_q8_K_multi_n(n, s, vx, vy, 5); break;
+        case 6:  ggml_vec_dot_iq4_xs_q8_K_multi_n(n, s, vx, vy, 6); break;
+        case 7:  ggml_vec_dot_iq4_xs_q8_K_multi_n(n, s, vx, vy, 7); break;
+        case 8:  ggml_vec_dot_iq4_xs_q8_K_multi_n(n, s, vx, vy, 8); break;
+        default: ggml_vec_dot_iq4_xs_q8_K_multi_n(n, s, vx, vy, nc); break;
+    }
+}
+
 ggml_vec_dot_multi_t ggml_cpu_vec_dot_multi(enum ggml_type type) {
     static int on = -1;
     if (on < 0) {
@@ -4498,6 +4562,7 @@ ggml_vec_dot_multi_t ggml_cpu_vec_dot_multi(enum ggml_type type) {
         case GGML_TYPE_IQ4_NL: return ggml_vec_dot_iq4_nl_q8_0_multi;
         case GGML_TYPE_IQ1_S:   return ggml_vec_dot_iq1_s_q8_K_multi;
         case GGML_TYPE_IQ2_XXS: return ggml_vec_dot_iq2_xxs_q8_K_multi;
+        case GGML_TYPE_IQ4_XS:  return ggml_vec_dot_iq4_xs_q8_K_multi;
         default:               return NULL;
     }
 }
