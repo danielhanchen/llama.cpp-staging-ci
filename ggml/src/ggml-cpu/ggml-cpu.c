@@ -1508,6 +1508,38 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     float tmp[16];
 
+#if defined(__AVX2__)
+    // k15-fn: an expert routed to 2 or more rows of the batch: each weight row is decoded once for up to 8 of them (results
+    // bit-identical to the loop below; GGML_CPU_MMID_MULTI=0: the loop)
+    const ggml_vec_dot_multi_t vdm = ir1_end - ir1_start >= 2 ? ggml_cpu_vec_dot_multi(type) : NULL;
+    if (vdm != NULL) {
+        for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += 8) {
+            const int nc = (int) MIN(8, ir1_end - iir1);
+            const void * cols[8];
+            float      * dsts[8];
+            for (int c = 0; c < nc; ++c) {
+                const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, iir1 + c);
+                const int     id  = row_mapping.i1;
+                const int64_t i11 = id % ne11;
+                const int64_t i12 = row_mapping.i2;
+                cols[c] = (const char *) wdata +
+                    (src1_cont || src1->type != vec_dot_type
+                    ? (i11      + i12*ne11)*row_size
+                    : (i11*nb11 + i12*nb12));
+                dsts[c] = (float *) ((char *) dst->data + ((int64_t) id*nb1 + i12*nb2));
+            }
+            for (int64_t ir0 = ir0_start; ir0 < ir0_end; ++ir0) {
+                float r[8];
+                vdm((int) ne00, r, src0_cur + ir0*nb01, cols, nc);
+                for (int c = 0; c < nc; ++c) {
+                    dsts[c][ir0] = r[c];
+                }
+            }
+        }
+        return;
+    }
+#endif
+
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
