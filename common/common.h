@@ -390,6 +390,11 @@ struct common_params_speculative_ngram_suffix {
     // auto_mode: the server turned this drafter on by itself (no --spec-type given, LLAMA_SPEC_AUTO); policy is on there
     // (LLAMA_SPEC_SUFFIX_POLICY=0 restores the k9 gate, =1 also prices an explicit --spec-type ngram-suffix)
     bool    auto_mode    = false;
+    // k15-spec: the stand-down of a request whose drafts lose (common/spec-cost-policy.h); the server turns it off where drafts change text
+    bool    standdown    = true;
+    // k15-spec: prompts of at least long_prompt tokens draft from repeats of at least n_min_match_long tokens (0: n_min_match)
+    int32_t long_prompt      = 0;
+    int32_t n_min_match_long = 0;
 };
 
 struct common_params_speculative_ngram_map {

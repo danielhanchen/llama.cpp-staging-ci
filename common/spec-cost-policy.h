@@ -222,3 +222,98 @@ struct common_spec_round_timer {
         w_last = std::max(1, w);
     }
 };
+
+// k15-spec: stand-down of a request whose drafts lose. The cost policy prices a window from its measured cost and the match class's
+// acceptance, but a class's prior (0.75-0.96 per token) is a guess about this text; where the text does not continue its repeats
+// (G4 Flint Q4_K_XL 4K: 5 drafts of 15 tokens, 3 accepted, -4% against drafting off; LFM2.5 32 GB 8k -6.5%) every probe and wide
+// window is paid for. This books, per sequence, the measured time each drafted round saved: the tokens it committed (prompt growth
+// between two draft() calls) times the plain round's measured cost, minus the round's measured time with the extra time of the plain
+// round after it (the graph switch back). The ledger is clamped at +CREDIT plain rounds (a won copy does not pay for a long losing
+// stretch after it); below -DEBT plain rounds the sequence stands down: plain rounds only, for a backoff that starts at PARK rounds and
+// doubles with each stand-down in a row (at most PARK_MAX), then the next drafted round re-probes. A ledger back at +CREDIT/2 resets
+// the backoff. Output is unchanged where drafts verify exactly (only which rounds draft changes); the server keeps it off where they
+// do not (spill drafts change text, KLD-gated as they are). LLAMA_SPEC_STANDDOWN=0: off.
+struct common_spec_standdown {
+    static constexpr double CREDIT   = 4.0;
+    static constexpr double DEBT     = 2.0;
+    static constexpr int    PARK     = 64;
+    static constexpr int    PARK_MAX = 1024;
+
+    bool    enabled  = true;
+    int64_t t_last   = 0;     // the previous draft() call (0: none in this request)
+    size_t  n_last   = 0;     // the history length then
+    int     k_last   = 0;     // the drafts of that round
+    int     k_pend   = 0;     // a drafted round waiting for the round after it (its switch back)
+    double  ms_pend  = 0.0;
+    int     tok_pend = 0;
+    double  ledger   = 0.0;   // ms saved by drafting in this request (clamped)
+    int     park     = 0;     // plain rounds left standing down
+    int     backoff  = PARK;
+    // per request counters (logged)
+    int64_t n_stand = 0, n_parked = 0, n_booked = 0;
+
+    common_spec_standdown() {
+        if (const char * e = getenv("LLAMA_SPEC_STANDDOWN")) {
+            enabled = atoi(e) != 0;
+        }
+    }
+
+    void reset() {
+        t_last = 0; n_last = 0; k_last = 0; k_pend = 0; ms_pend = 0.0; tok_pend = 0;
+        ledger = 0.0; park = 0; backoff = PARK;
+        n_stand = n_parked = n_booked = 0;
+    }
+
+    void book(double tok, double ms, double c1) {
+        ledger = std::min(ledger + tok*c1 - ms, CREDIT*c1);
+        n_booked++;
+        if (ledger >= 0.5*CREDIT*c1) {
+            backoff = PARK;
+        }
+        if (ledger < -DEBT*c1) {
+            park    = backoff;
+            backoff = std::min(2*backoff, PARK_MAX);
+            ledger  = 0.0;
+            n_stand++;
+        }
+    }
+
+    // at a draft() call: the round since the last call committed n_hist - n_last tokens in (now - t_last); returns true when this
+    // round must stay plain
+    bool tick(const common_spec_cost_policy & pol, int64_t now_us, size_t n_hist) {
+        if (!enabled) {
+            return false;
+        }
+        if (t_last > 0 && n_hist >= n_last) {
+            const double ms  = (now_us - t_last)/1000.0;
+            const int    tok = (int) (n_hist - n_last);
+            // the plain cost is measured (and every size's warm-up rounds, graph builds and captures, are past) before anything is booked
+            const bool   ok  = pol.cost_n[1] >= 4;
+            const double c1  = pol.cost_ms(1);
+            if (k_last > 0) {
+                if (k_pend > 0 && ok) {
+                    book(tok_pend, ms_pend, c1);
+                }
+                k_pend = k_last; ms_pend = ms; tok_pend = tok;
+            } else if (k_pend > 0) {
+                if (ok && pol.cost_n[std::min(k_pend + 1, common_spec_cost_policy::MAX_T)] > 0) {
+                    book(tok_pend, ms_pend + std::max(0.0, ms - c1), c1);
+                }
+                k_pend = 0;
+            }
+        }
+        t_last = now_us;
+        n_last = n_hist;
+        k_last = 0;
+        if (park > 0) {
+            park--;
+            n_parked++;
+            return true;
+        }
+        return false;
+    }
+
+    void next(int k) {
+        k_last = k;
+    }
+};

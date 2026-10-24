@@ -47,6 +47,26 @@ static int server_spec_spill_min_match(int32_t host_mode) {
     return std::max(3, e != nullptr ? atoi(e) : host_mode == 1 ? SPEC_SPILL_MIN_MATCH_GATE : SPEC_SPILL_MIN_MATCH_CM);
 }
 
+// k15-spec: the shortest repeat the default spill drafts take on a long prompt (LLAMA_SPEC_SPILL_LONG_PROMPT tokens, default 4096): a long
+// prompt (a document, code to edit) is copied in long runs, where a repeat of a few tokens already predicts the next ones (G4 LFM2.5 4 GB
+// 8k: drafting from 16+ commits 4% of what drafts from 3+ could). host_mode 1 only (the CPU-miss rule's mode 3 already takes every
+// match); chat prompts keep server_spec_spill_min_match. Changes text: KLD-gated (plans/k15_models.md). LLAMA_SPEC_SPILL_MIN_MATCH_LONG=16: off.
+#ifndef SPEC_SPILL_MIN_MATCH_LONG_GATE
+#define SPEC_SPILL_MIN_MATCH_LONG_GATE 16
+#endif
+static int server_spec_spill_long_prompt() {
+    const char * e = getenv("LLAMA_SPEC_SPILL_LONG_PROMPT");
+    return std::max(1, e != nullptr ? atoi(e) : 4096);
+}
+
+static int server_spec_spill_min_match_long(int32_t host_mode, int min_match) {
+    const char * e = getenv("LLAMA_SPEC_SPILL_MIN_MATCH_LONG");
+    if (e != nullptr) {
+        return std::max(3, atoi(e));
+    }
+    return host_mode == 1 && getenv("LLAMA_SPEC_SPILL_MIN_MATCH") == nullptr ? SPEC_SPILL_MIN_MATCH_LONG_GATE : min_match;
+}
+
 static int server_spec_auto_env() {
     const char * e = getenv("LLAMA_SPEC_AUTO");
     return e != nullptr ? atoi(e) : 1;
