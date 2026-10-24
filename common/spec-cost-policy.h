@@ -37,6 +37,7 @@ struct common_spec_cost_policy {
     static constexpr int    SKIP    = 2;      // the first rounds of a size build its graph and capture it: not its cost
 
     double margin = 0.03;
+    int    switch_rounds = 1;  // k15-spec: plain rounds after a drafted round booked to it (common_spec_switch_rounds where drafts verify exactly)
     bool   gain_gate = false;  // LLAMA_SPEC_POLICY_GAIN=1: on (G4 LFM2.5 32 GB: it stopped the short window of a repeat, rep -5%; no cell gained)
     int    short_k   = 3;      // the drafts of the short window (the gain gate's window)
 
@@ -179,7 +180,8 @@ struct common_spec_cost_policy {
 // and its CUDA graph is warmed up and captured again over the next plain rounds (G4 LFM2.5 32 GB 8k: plain rounds 2.83-2.90 ms in a
 // drafted request, 2.43 ms without drafts, with the second and third plain rounds after each drafted one booked as plain). The extra
 // time of the SWITCH_ROUNDS plain rounds after a drafted round is booked to it, and only later plain rounds price the plain round.
-// LLAMA_SPEC_SWITCH_ROUNDS=1: the first one only (k11 behaviour).
+// Where drafts verify exactly only (spill drafts change text: their KLD-gated cost policy is kept). LLAMA_SPEC_SWITCH_ROUNDS=1: the first
+// one only (k11 behaviour).
 static inline int common_spec_switch_rounds() {
     static const int n = [] {
         const char * e = getenv("LLAMA_SPEC_SWITCH_ROUNDS");
@@ -230,7 +232,7 @@ struct common_spec_round_timer {
                 acc_pend = acc_last;
             } else if (w_pend > 0) {
                 ms_sw += pol.cost_n[1] > 0 ? std::max(0.0, ms - pol.cost_ms(1)) : 0.0;
-                if (++n_sw >= common_spec_switch_rounds()) {
+                if (++n_sw >= pol.switch_rounds) {
                     book(pol);
                 }
             } else {
@@ -329,7 +331,7 @@ struct common_spec_standdown {
             } else if (k_pend > 0) {
                 // the switch rounds after it (common_spec_switch_rounds): their time above a plain round's is the drafted round's
                 ms_sw += std::max(0.0, ms - c1);
-                if (++n_sw >= common_spec_switch_rounds()) {
+                if (++n_sw >= pol.switch_rounds) {
                     if (ok) {
                         book(k_pend, b_pend, tok_pend + n_sw, ms_pend + ms_sw + n_sw*c1, c1);
                     }
