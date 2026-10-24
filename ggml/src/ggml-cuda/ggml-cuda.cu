@@ -4224,6 +4224,69 @@ static int ggml_cuda_try_fuse_ew_chain(ggml_backend_cuda_context * cuda_ctx, ggm
     return n - 1;
 }
 
+// ABS -> POOL_1D(MAX, kernel = stride = ne0, no padding) -> elementwise chain -> DIV(x, chain): build_amax_src1_f16 (the Flint
+// MoE down-projection rescale) as one kernel that writes the chain output (the scale, read again after the matmul) and x / scale.
+// Returns the number of extra nodes covered (0 = no fusion). GGML_CUDA_DISABLE_AMAX_RESCALE_FUSION=1 turns it off.
+static int ggml_cuda_try_fuse_amax_rescale(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_AMAX_RESCALE_FUSION");
+    if (disabled) {
+        return 0;
+    }
+    const auto f32c = [](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && (t->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+               !(t->flags & GGML_TENSOR_FLAG_OUTPUT);
+    };
+    ggml_tensor * ab = cgraph->nodes[i];
+    if (ab->op != GGML_OP_UNARY || ggml_get_unary_op(ab) != GGML_UNARY_OP_ABS || !f32c(ab) || ab->src[0] == nullptr ||
+        ab->src[0]->type != GGML_TYPE_F32 || !ggml_is_contiguous(ab->src[0]) || i + 3 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * x  = ab->src[0];
+    ggml_tensor * pl = cgraph->nodes[i + 1];
+    if (pl->op != GGML_OP_POOL_1D || pl->src[0] != ab || !f32c(pl) || !ggml_node_has_n_uses(cgraph, i, 1)) {
+        return 0;
+    }
+    const int32_t * pp = (const int32_t *) pl->op_params; // op, k0, s0, p0
+    if (pp[0] != GGML_OP_POOL_MAX || pp[1] != x->ne[0] || pp[2] != x->ne[0] || pp[3] != 0 || pl->ne[0] != 1 ||
+        ggml_nelements(pl) != ggml_nrows(x)) {
+        return 0;
+    }
+    int n = 0;
+    ggml_tensor * prev = pl;
+    while (n < GGML_CUDA_EW_CHAIN_MAX && i + 2 + n < cgraph->n_nodes) {
+        ggml_tensor * t = cgraph->nodes[i + 2 + n];
+        if (ggml_cuda_ew_chain_op_code(t) < 0 || t->src[0] != prev || !f32c(t) || !ggml_are_same_shape(t, prev) ||
+            !ggml_node_has_n_uses(cgraph, i + 1 + n, 1)) {
+            break;
+        }
+        prev = t;
+        n++;
+    }
+    const int id = i + 2 + n;
+    if (n == 0 || id >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * dv = cgraph->nodes[id];
+    if (dv->op != GGML_OP_DIV || dv->src[0] != x || dv->src[1] != prev || dv->type != GGML_TYPE_F32 || !ggml_is_contiguous(dv) ||
+        !ggml_are_same_shape(dv, x) || !(dv->flags & GGML_TENSOR_FLAG_COMPUTE) || !ggml_cuda_elementwise_alias_ok(dv, x)) {
+        return 0;
+    }
+    ggml_cuda_ew_chain chain{};
+    chain.n_ops = n;
+    for (int j = 0; j < n; ++j) {
+        const ggml_tensor * t = cgraph->nodes[i + 2 + j];
+        chain.op[j] = ggml_cuda_ew_chain_op_code(t);
+        chain.p0[j] = 0.0f;
+        chain.p1[j] = 0.0f;
+        if (t->op == GGML_OP_SCALE || t->op == GGML_OP_CLAMP) {
+            memcpy(&chain.p0[j], (const float *) t->op_params + 0, sizeof(float));
+            memcpy(&chain.p1[j], (const float *) t->op_params + 1, sizeof(float));
+        }
+    }
+    ggml_cuda_op_amax_rescale(*cuda_ctx, x, prev, dv, chain);
+    return id - i;
+}
+
 // elementwise chain -> DSV4_HC_POST (no comb) where the chain computes the post weights: one kernel, the chain applied to the
 // weight each thread reads. Returns the number of extra nodes covered (0 = no fusion).
 // GGML_CUDA_DISABLE_HC_POST_CHAIN_FUSION=1 turns it off.
@@ -5249,6 +5312,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_UNARY && ggml_cuda_try_fuse_unary_mul_gate(cuda_ctx, cgraph, i)) {
         return 1;
+    }
+
+    if (const int n_skip = ggml_cuda_try_fuse_amax_rescale(cuda_ctx, cgraph, i); n_skip > 0) {
+        return n_skip;
     }
 
     if (const int n_skip = ggml_cuda_try_fuse_hc_post_chain(cuda_ctx, cgraph, i); n_skip > 0) {

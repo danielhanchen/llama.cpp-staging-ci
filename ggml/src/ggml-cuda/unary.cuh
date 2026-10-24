@@ -111,6 +111,10 @@ int ggml_cuda_ew_chain_op_code(const ggml_tensor * node);
 // dst = ops(src), src and dst contiguous f32 with the same number of elements
 // q8_1_out != nullptr: also writes the q8_1 copy of dst (one row, or rows of a multiple of MATRIX_ROW_PADDING values) for the
 // mul_mat_vec_q consumers, bit-identical to quantize_q8_1
+// e[row] = chain(max|x[row,:]|), dst = x / e (row broadcast): the fused ABS -> POOL_1D -> chain -> DIV of build_amax_src1_f16
+void ggml_cuda_op_amax_rescale(ggml_backend_cuda_context & ctx, const ggml_tensor * x, ggml_tensor * e, ggml_tensor * dst,
+        const ggml_cuda_ew_chain & chain);
+
 void ggml_cuda_op_ew_chain(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst, const ggml_cuda_ew_chain & chain,
         void * q8_1_out = nullptr);
 
