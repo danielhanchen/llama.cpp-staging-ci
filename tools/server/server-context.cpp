@@ -3550,6 +3550,27 @@ private:
             common_speculative_rows_ok(spec.get());
     }
 
+    // k15-ttft (LLAMA_CKPT_NEAR_MERGE=0: off): the near prompt checkpoint (4 tokens before the end) from a capture inside the prompt's
+    // decode. Only for a slot alone in the batch, no mtmd input, speculative impls that read the target rows of a segment, a memory
+    // whose partial state is the recurrent rows (llama_state_capture_supported), and where create_checkpoint_captured can make the
+    // checkpoint: a draft without a partial state and no speculative state stashed per checkpoint (else the separate call, as before)
+    bool near_ckpt_merge_ok(const server_slot & slot, int32_t n_tokens_prev) const {
+        static const bool on = getenv("LLAMA_CKPT_NEAR_MERGE") == nullptr || atoi(getenv("LLAMA_CKPT_NEAR_MERGE")) != 0;
+        static const bool cap_env = getenv("LLAMA_LM_CKPT_CAPTURE") == nullptr || atoi(getenv("LLAMA_LM_CKPT_CAPTURE")) != 0;
+        if (!on || !cap_env || n_tokens_prev != 0 || slot.task->tokens.has_mtmd || !llama_state_capture_supported(ctx_tgt) ||
+                !common_speculative_rows_ok(spec.get())) {
+            return false;
+        }
+        if (ctx_dft && llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) > 16) {
+            return false;
+        }
+        std::vector<uint8_t> ds;
+        if (common_speculative_get_state(spec.get(), slot.id, ds) && !ds.empty()) {
+            return false;
+        }
+        return true;
+    }
+
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -4486,6 +4507,17 @@ private:
                                             lm_cap_n_tokens = slot.prompt.n_tokens();
                                             lm_cap_batch    = batch.size();
                                         }
+                                        break;
+                                    }
+                                    // k15-ttft: the checkpoint 4 tokens before the end is taken inside this decode (llama_set_state_capture)
+                                    // instead of after a decode of its own: the same ubatches (the last 4 tokens still run as one), one call,
+                                    // no host gap between them, and under layer-major prompts one expert pass (see near_ckpt_merge_ok)
+                                    if (k == 1 && do_checkpoint && lm_cap_slot < 0 && batch.size() + n_last <= n_batch &&
+                                            near_ckpt_merge_ok(slot, n_tokens_prev)) {
+                                        lm_breaks.push_back(batch.size());
+                                        lm_cap_slot     = slot.id;
+                                        lm_cap_n_tokens = slot.prompt.n_tokens();
+                                        lm_cap_batch    = batch.size();
                                         break;
                                     }
                                     should_break = true;

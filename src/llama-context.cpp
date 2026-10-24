@@ -7976,6 +7976,16 @@ void llama_context::set_ubatch_breaks(const int32_t * breaks, int32_t n) {
 }
 
 // k15-pp: llama_set_state_capture
+bool llama_context::state_capture_supported() const {
+    static const bool env = getenv("LLAMA_STATE_CAPTURE") == nullptr || atoi(getenv("LLAMA_STATE_CAPTURE")) != 0;
+    if (!env || memory == nullptr) {
+        return false;
+    }
+    auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    auto * rec = hyb ? hyb->get_mem_recr() : dynamic_cast<llama_memory_recurrent *>(memory.get());
+    return rec != nullptr && !(hyb && model.hparams.swa_type != LLAMA_SWA_TYPE_NONE);
+}
+
 bool llama_context::set_state_capture(llama_seq_id seq_id, int32_t i_batch) {
     static const bool env = getenv("LLAMA_STATE_CAPTURE") == nullptr || atoi(getenv("LLAMA_STATE_CAPTURE")) != 0;
     if (!env || memory == nullptr || i_batch <= 0) {
@@ -8142,6 +8152,10 @@ void llama_state_seq_async_wait(llama_context * ctx) {
 
 void llama_set_ubatch_breaks(llama_context * ctx, const int32_t * breaks, int32_t n) {
     ctx->set_ubatch_breaks(breaks, n);
+}
+
+bool llama_state_capture_supported(const llama_context * ctx) {
+    return ctx->state_capture_supported();
 }
 
 bool llama_set_state_capture(llama_context * ctx, llama_seq_id seq_id, int32_t i_batch) {
