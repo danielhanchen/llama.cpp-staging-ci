@@ -28,12 +28,23 @@ static bool shortconv_f32(const ggml_tensor * t) {
 
 // ---------------------------------------------------------------------------------------------------------- 1. b * x into the window
 // out[t, ch, s] = t < d ? state[t, ch, s] : b[ch, t - d, s] * x[ch, t - d, s]
+// k15: + the conv state snapshots (the CPYs of views of the window into the recurrent cache that follow it, lfm2.cpp): snapshot k
+// writes dst[k] + s*dst_nb1[k] + (ch*d + c)*4 = out[off[k] + c, ch, s], the values this thread just wrote (GGML_CUDA_SHORTCONV_STATE=0: off)
+struct shortconv_snaps {
+    static constexpr int n_max = 8;
+    char *  dst[n_max];
+    int64_t dst_nb1[n_max];
+    int64_t off[n_max];
+    int     n;
+};
+
 static __global__ void shortconv_window_f32(const char * state, const char * b, const char * x, char * out,
                                             const int64_t d, const int64_t n_t, const int64_t nr,
                                             const int64_t st_nb0, const int64_t st_nb1, const int64_t st_nb2,
                                             const int64_t b_nb0, const int64_t b_nb1, const int64_t b_nb2,
                                             const int64_t x_nb0, const int64_t x_nb1, const int64_t x_nb2,
-                                            const int64_t o_nb0, const int64_t o_nb1, const int64_t o_nb2) {
+                                            const int64_t o_nb0, const int64_t o_nb1, const int64_t o_nb2,
+                                            const shortconv_snaps snaps) {
     const int64_t ch = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     const int64_t s  = blockIdx.y;
     if (ch >= nr) {
@@ -46,6 +57,12 @@ static __global__ void shortconv_window_f32(const char * state, const char * b, 
         const float bv = *(const float *) (b + ch*b_nb0 + t*b_nb1 + s*b_nb2);
         const float xv = *(const float *) (x + ch*x_nb0 + t*x_nb1 + s*x_nb2);
         *(float *) (out + (d + t)*o_nb0 + ch*o_nb1 + s*o_nb2) = bv * xv;
+    }
+    for (int k = 0; k < snaps.n; ++k) {
+        for (int64_t c = 0; c < d; ++c) {
+            *(float *) (snaps.dst[k] + s*snaps.dst_nb1[k] + (ch*d + c)*sizeof(float)) =
+                *(const float *) (out + (snaps.off[k] + c)*o_nb0 + ch*o_nb1 + s*o_nb2);
+        }
     }
 }
 
@@ -93,18 +110,60 @@ int ggml_cuda_try_fuse_shortconv_window(ggml_backend_cuda_context & ctx, ggml_cg
             return 0;
         }
     }
+    // k15: the state snapshots right after the window (views and CPYs; any other node ends the scan)
+    static const bool state_on = [] {
+        const char * e = getenv("GGML_CUDA_SHORTCONV_STATE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    shortconv_snaps snaps = {};
+    int n_extra = 0;
+    if (state_on) {
+        for (int j = i + 3; j < cgraph->n_nodes && snaps.n < shortconv_snaps::n_max; ++j) {
+            const ggml_tensor * node = cgraph->nodes[j];
+            if (node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE) {
+                continue;
+            }
+            const ggml_tensor * src = node->src[0];
+            const ggml_tensor * dsn = node->src[1];
+            if (node->op != GGML_OP_CPY || src == nullptr || dsn == nullptr || src->view_src != cat || src->type != GGML_TYPE_F32 ||
+                    dsn->type != GGML_TYPE_F32 || src->ne[0] != d || src->ne[1] != nr || src->ne[2] != n_s || src->ne[3] != 1 ||
+                    src->nb[0] != (size_t) cat->nb[0] || src->nb[1] != cat->nb[1] || src->nb[2] != cat->nb[2] || src->view_offs % cat->nb[0] != 0 ||
+                    (int64_t) (src->view_offs / cat->nb[0]) + d > cat->ne[0] || dsn->ne[0] != d*nr || dsn->ne[1] != n_s || dsn->ne[2] != 1 ||
+                    dsn->ne[3] != 1 || dsn->nb[0] != sizeof(float) || node->data != dsn->data) {
+                break;
+            }
+            // the snapshot must not overlap what the kernel reads or the window it copies from
+            const char * d0 = (const char *) dsn->data;
+            const char * d1 = d0 + (n_s - 1)*dsn->nb[1] + d*nr*sizeof(float);
+            bool clash = false;
+            for (const ggml_tensor * t : { b, x, state, (const ggml_tensor *) cat }) {
+                const char * a0 = (const char *) t->data;
+                const char * a1 = a0 + ggml_nbytes(t);
+                clash = clash || (a0 < d1 && d0 < a1);
+            }
+            if (clash) {
+                break;
+            }
+            snaps.dst[snaps.n]     = (char *) dsn->data;
+            snaps.dst_nb1[snaps.n] = dsn->nb[1];
+            snaps.off[snaps.n]     = src->view_offs / cat->nb[0];
+            snaps.n++;
+            n_extra = j - (i + 2);
+        }
+    }
     const int threads = 128;
     const dim3 blocks((unsigned) ((nr + threads - 1)/threads), (unsigned) n_s, 1);
     shortconv_window_f32<<<blocks, threads, 0, ctx.stream()>>>((const char *) state->data, (const char *) b->data, (const char *) x->data,
         (char *) cat->data, d, n_t, nr, state->nb[0], state->nb[1], state->nb[2], b->nb[0], b->nb[1], b->nb[2],
-        x->nb[0], x->nb[1], x->nb[2], cat->nb[0], cat->nb[1], cat->nb[2]);
+        x->nb[0], x->nb[1], x->nb[2], cat->nb[0], cat->nb[1], cat->nb[2], snaps);
     CUDA_CHECK(cudaGetLastError());
     static bool logged = false;
     if (!logged) {
         logged = true;
-        GGML_LOG_INFO("%s: LFM2 short-conv window fused (b * x into the conv window, %lld tokens; GGML_CUDA_SHORTCONV_FUSE=0: off)\n", __func__, (long long) n_t);
+        GGML_LOG_INFO("%s: LFM2 short-conv window fused (b * x into the conv window, %lld tokens, %d state snapshots; GGML_CUDA_SHORTCONV_FUSE=0: off)\n",
+            __func__, (long long) n_t, snaps.n);
     }
-    return 2;
+    return 2 + n_extra;
 }
 
 // ---------------------------------------------------------------------------------------------------------- 2. ssm_conv * c
