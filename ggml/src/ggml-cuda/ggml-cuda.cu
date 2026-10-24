@@ -4079,6 +4079,15 @@ static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::un
         }
     }
     if (!producer_q8_1_disabled) {
+        // k15: the LFM2 short conv * c product (shortconv-fused.cu writes its q8_1 copy)
+        for (int i = 0; i + 1 < cgraph->n_nodes; ++i) {
+            const ggml_tensor * conv = cgraph->nodes[i];
+            const ggml_tensor * mul  = cgraph->nodes[i + 1];
+            if (conv->op == GGML_OP_SSM_CONV && mul->op == GGML_OP_MUL && (mul->src[0] == conv || mul->src[1] == conv) &&
+                mul->type == GGML_TYPE_F32 && ggml_is_contiguous(mul) && mul->data != nullptr) {
+                norm_outputs.insert(mul);
+            }
+        }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const ggml_tensor * node = cgraph->nodes[i];
             if ((ggml_cuda_ew_chain_op_code(node) >= 0 || node->op == GGML_OP_DSV4_HC_PRE) && node->type == GGML_TYPE_F32 &&

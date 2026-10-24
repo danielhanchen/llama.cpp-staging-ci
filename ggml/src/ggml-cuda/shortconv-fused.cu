@@ -114,7 +114,10 @@ static __global__ void shortconv_conv_mul_f32(const float * __restrict__ src0, c
                                               const int src0_nb1, const int src0_nb2, const int src1_nb1,
                                               const int64_t c_nb0, const int64_t c_nb1, const int64_t c_nb2,
                                               float * __restrict__ dst, const int dst_nb0, const int dst_nb1, const int dst_nb2,
-                                              const int64_t n_t) {
+                                              const int64_t n_t, void * __restrict__ vq = nullptr, const int ncols_padded = 0) {
+    // k15: vq (nullable): the q8_1 copy of the output for the out_proj mul_mat_vec_q (ggml_cuda_q8_1_cache), rows = tokens; a warp holds
+    // 32 consecutive channels of a token, lane = element of its q8_1 block, the same 32-lane reductions as quantize_q8_1, so the copy is
+    // bit-identical to quantizing the f32 output
     const int tid  = threadIdx.x;
     const int bidx = blockIdx.x;
     const int bidy = blockIdx.y;
@@ -155,7 +158,23 @@ static __global__ void shortconv_conv_mul_f32(const float * __restrict__ src0, c
         }
         sumf += b;
         const float cv = *(const float *) (c_block + i * c_nb1);
-        y_block[i * stride_y + tid] = cv * sumf;
+        const float yv = cv * sumf;
+        y_block[i * stride_y + tid] = yv;
+        if (vq != nullptr) {
+            float amax = fabsf(yv);
+            float sum  = yv;
+            amax = warp_reduce_max<QK8_1>(amax);
+            sum  = warp_reduce_sum<QK8_1>(sum);
+            const float  d = amax / 127.0f;
+            const int8_t q = amax == 0.0f ? 0 : roundf(yv / d);
+            const int64_t ch  = (int64_t) bidy * split_d_inner + tid;
+            block_q8_1 * yq = (block_q8_1 *) vq + ((int64_t) bidx * n_t + i) * (ncols_padded / QK8_1) + ch / QK8_1;
+            const int iqs = ch % QK8_1;
+            yq->qs[iqs] = q;
+            if (iqs == 0) {
+                yq->ds = make_half2(d, sum);
+            }
+        }
     }
 }
 
@@ -206,10 +225,25 @@ int ggml_cuda_try_fuse_shortconv_conv_mul(ggml_backend_cuda_context & ctx, ggml_
             return 0;
         }
     }
+    // k15: the q8_1 copy of the product for the out_proj reader (GGML_CUDA_SHORTCONV_Q8_1=0: off)
+    static const bool q8_on = [] {
+        const char * e = getenv("GGML_CUDA_SHORTCONV_Q8_1");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    void * q8_1_out = nullptr;
+    const int ncols_padded = (int) GGML_PAD(mul->ne[0], MATRIX_ROW_PADDING);
+    ggml_cuda_q8_1_cache & cache = ctx.q8_1_cache;
+    // (rows without padding only: the padding blocks would need zeros the kernel does not write)
+    if (q8_on && cache.active() && ctx.curr_stream_no == 0 && cache.norm_targets.count(mul) && ggml_is_contiguous(mul) && ncols_padded == mul->ne[0] &&
+            mul->nb[0] == sizeof(float)) {
+        int64_t key[ggml_cuda_q8_1_cache::n_key];
+        ggml_cuda_q8_1_cache::key_contiguous(mul->ne[0], ggml_nrows(mul), key);
+        q8_1_out = cache.reserve(mul->data, ggml_nbytes(mul), key, ggml_nrows(mul)*ncols_padded/QK8_1*sizeof(block_q8_1));
+    }
     const dim3 blocks((unsigned) n_s, (unsigned) ((nr + threads - 1)/threads), 1);
     shortconv_conv_mul_f32<threads, 3><<<blocks, threads, 0, ctx.stream()>>>((const float *) src0->data, (const float *) src1->data,
         (const char *) c->data, (int) src0->nb[1], (int) src0->nb[2], (int) src1->nb[1], c->nb[0], c->nb[1], c->nb[2],
-        (float *) mul->data, (int) mul->nb[0], (int) mul->nb[1], (int) mul->nb[2], n_t);
+        (float *) mul->data, (int) mul->nb[0], (int) mul->nb[1], (int) mul->nb[2], n_t, q8_1_out, ncols_padded);
     CUDA_CHECK(cudaGetLastError());
     static bool logged = false;
     if (!logged) {
