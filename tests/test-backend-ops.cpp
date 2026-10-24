@@ -8096,6 +8096,105 @@ struct test_mul_mat_vec_fusion : public test_case {
 
 // Several quantized mat-vec products consuming the same activation (Q/K/V, routed + shared experts),
 // optionally with an in-place op overwriting the activation between the consumers.
+// The per-row power-of-two rescale of a MoE down-projection src1 (llm_graph_context::build_amax_src1_f16, Flint): ABS, POOL_1D,
+// scale/log/scale/ceil/clamp/scale/exp, DIV, then MUL_MAT_ID and the MUL by the scale. The CUDA backend fuses the rescale into one
+// kernel that also writes the q8_1 copy of the quotient for the mat-vec product. amax > 1024 exercises rows that get rescaled.
+struct test_moe_amax_rescale : public test_case {
+    const ggml_type type;
+    const int64_t m;    // tokens
+    const int64_t n;    // output rows
+    const int64_t k;    // n_ff
+    const float   amax;
+
+    static constexpr int n_mats = 8;
+    static constexpr int n_used = 4;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, m, n, k, amax);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_AMAX_RESCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_moe_amax_rescale(ggml_type type, int64_t m, int64_t n, int64_t k, float amax)
+        : type(type), m(m), n(n), k(k), amax(amax) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, m);
+        ggml_tensor * w   = ggml_new_tensor_3d(ctx, type, k, n, n_mats);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, m);
+
+        ggml_tensor * cur = ggml_scale(ctx, x, 1.0f); // a non-leaf activation, as in a model
+
+        constexpr float k_log2_e = 1.4426950408889634f;
+        constexpr float k_ln_2   = 0.6931471805599453f;
+        ggml_tensor * e = ggml_pool_1d(ctx, ggml_abs(ctx, cur), GGML_OP_POOL_MAX, k, k, 0);
+        e = ggml_scale(ctx, e, 1.0f/1024.0f);
+        e = ggml_log  (ctx, e);
+        e = ggml_scale(ctx, e, k_log2_e);
+        e = ggml_ceil (ctx, e);
+        e = ggml_clamp(ctx, e, 0.0f, 127.0f);
+        e = ggml_scale(ctx, e, k_ln_2);
+        e = ggml_exp  (ctx, e);
+        cur = ggml_div(ctx, cur, e);
+
+        ggml_tensor * out = ggml_mul_mat_id(ctx, w, cur, ids); // [n, n_used, m]
+        out = ggml_mul(ctx, out, e);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats, false, amax);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+};
+
+// gate + up + GLU mat-vec products followed by a down product, the activation produced by a (fused) rms_norm + mul: the GLU
+// output can be placed over the activation, which the mat-vec GLU fusion then reads through its q8_1 copy only.
+struct test_glu_src1_alias : public test_case {
+    const ggml_type type;
+    const int64_t m;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, m, k);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GLU_SRC1_ALIAS";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_glu_src1_alias(ggml_type type, int64_t m, int64_t k) : type(type), m(m), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        ggml_tensor * wn = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+        ggml_tensor * wg = ggml_new_tensor_2d(ctx, type, k, k);
+        ggml_tensor * wu = ggml_new_tensor_2d(ctx, type, k, k);
+        ggml_tensor * wd = ggml_new_tensor_2d(ctx, type, k, k);
+        ggml_tensor * act = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), wn);
+        ggml_tensor * glu = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, wg, act), ggml_mul_mat(ctx, wu, act));
+        ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, wd, glu), x);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+};
+
 struct test_mul_mat_vec_shared_src1 : public test_case {
     const ggml_type type_a;
     const ggml_type type_b; // type of the second dense weight (e.g. V of a different quant type)
@@ -12541,6 +12640,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
+    }
+
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ2_XXS }) {
+        for (int64_t m : { 1, 3, 64 }) {
+            for (float amax : { 1.0f, 50000.0f }) {
+                test_cases.emplace_back(new test_moe_amax_rescale(type, m, 64, 512, amax));
+            }
+        }
+        for (int64_t m : { 1, 4 }) {
+            test_cases.emplace_back(new test_glu_src1_alias(type, m, 512));
+        }
     }
 
     for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS }) {
