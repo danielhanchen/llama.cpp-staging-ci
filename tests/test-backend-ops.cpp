@@ -8195,6 +8195,78 @@ struct test_glu_src1_alias : public test_case {
     }
 };
 
+// k15-mm: dense quantized products over one activation that the CUDA backend runs as one multi-matrix mul_mat_vec_q.
+// pattern 0: q, k, v adjacent; 1: the attention order (q, a view of it, rms_norm * w, then k, v: moved next to q before allocation);
+// 2: v of another type (only q + k share a launch); 3: k and v followed by bias adds (gpt-oss: those keep their own fusion);
+// 4: two products (gated delta net qkv + gate) with a reshape between them. Rows of q / k / v are not multiples of the rows per block.
+struct test_mul_mat_vec_multi : public test_case {
+    const ggml_type type;
+    const int64_t m;  // tokens
+    const int64_t k;
+    const int pattern;
+    const bool exact; // batch invariant flag on the products
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, m, k, pattern, exact);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_VEC_MULTI";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_mul_mat_vec_multi(ggml_type type, int64_t m, int64_t k, int pattern, bool exact)
+        : type(type), m(m), k(k), pattern(pattern), exact(exact) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t nq = pattern == 1 ? 2*96 : 2*96 + 2, nk = 67, nv = 33;
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        ggml_tensor * wn = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+        ggml_tensor * wq = ggml_new_tensor_2d(ctx, type, k, nq);
+        ggml_tensor * wk = ggml_new_tensor_2d(ctx, type, k, nk);
+        ggml_tensor * wv = ggml_new_tensor_2d(ctx, pattern == 2 ? GGML_TYPE_Q6_K : type, k, nv);
+        ggml_tensor * act = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), wn);
+        const auto flag = [&](ggml_tensor * t) {
+            if (exact) {
+                t->flags |= GGML_TENSOR_FLAG_BATCH_INVARIANT;
+            }
+            return t;
+        };
+        ggml_tensor * out;
+        if (pattern == 4) {
+            ggml_tensor * qkv = flag(ggml_mul_mat(ctx, wq, act));
+            qkv = ggml_reshape_3d(ctx, qkv, nq, m, 1);
+            ggml_tensor * z = flag(ggml_mul_mat(ctx, wk, act));
+            out = ggml_concat(ctx, ggml_reshape_2d(ctx, qkv, nq, m), ggml_silu(ctx, z), 0);
+        } else {
+            ggml_tensor * q = flag(ggml_mul_mat(ctx, wq, act));
+            ggml_tensor * kc;
+            ggml_tensor * vc;
+            if (pattern == 1) {
+                ggml_tensor * wqn = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 96);
+                ggml_tensor * qv  = ggml_view_2d(ctx, q, 96, 2*m, q->nb[1]/2, 0);
+                q = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_cont(ctx, qv), 1e-6f), wqn);
+                q = ggml_reshape_2d(ctx, q, 2*96, m);
+            }
+            kc = flag(ggml_mul_mat(ctx, wk, act));
+            vc = flag(ggml_mul_mat(ctx, wv, act));
+            if (pattern == 3) {
+                kc = ggml_add(ctx, kc, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nk));
+                vc = ggml_add(ctx, vc, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nv));
+            }
+            out = ggml_concat(ctx, ggml_concat(ctx, q, ggml_scale(ctx, kc, 0.5f), 0), vc, 0);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+};
+
 struct test_mul_mat_vec_shared_src1 : public test_case {
     const ggml_type type_a;
     const ggml_type type_b; // type of the second dense weight (e.g. V of a different quant type)
@@ -12653,6 +12725,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q4_0 }) {
+        for (int64_t m : { 1, 2, 3, 5, 8 }) {
+            for (int pattern : { 0, 1, 2, 3, 4 }) {
+                for (bool exact : { false, true }) {
+                    test_cases.emplace_back(new test_mul_mat_vec_multi(type, m, 512, pattern, exact));
+                }
+            }
+        }
+        // a K the small-K single column launch takes, and a long K
+        test_cases.emplace_back(new test_mul_mat_vec_multi(type, 1, 256, 0, false));
+        test_cases.emplace_back(new test_mul_mat_vec_multi(type, 3, 2560, 1, false));
+        // the unrolled K loop (few rows, long K) and the batch rows per block (short K, rows a multiple of 4: 1024; or not: 1023)
+        for (int64_t m : { 1, 3, 8 }) {
+            test_cases.emplace_back(new test_mul_mat_vec_multi(type, m, 10240, 0, m == 3));
+            for (int64_t rows : { 67, 320, 1000 }) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, rows, m, 10240, {1, 1}, {1, 1}));
+            }
+            for (int64_t rows : { 1024, 1023 }) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, rows, m, type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0 ? 320 : 256, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS }) {
         for (int64_t m : { 1, 3, 8 }) {
             for (bool inplace : { false, true }) {
@@ -12838,6 +12933,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // k15-mm: Flash-Next (qwen4exp) decode projections at 1 and 3 columns (an MTP verify window): hyper-connection down / up / inject,
+    // gated delta net qkv / gate / out, attention q, shared expert, router and the linear-attention alpha / beta
+    for (int64_t n : { 1, 3 }) {
+        for (auto mk : std::vector<std::array<int64_t, 2>>{ { 320, 10240 }, { 10240, 320 }, { 10240, 2560 }, { 6144, 2560 }, { 2560, 6144 },
+                                                             { 12288, 2560 }, { 640, 2560 }, { 2560, 640 } }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
+        }
+        for (auto mk : std::vector<std::array<int64_t, 2>>{ { 4, 10240 }, { 48, 2560 }, { 512, 2560 }, { 1, 2560 } }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
