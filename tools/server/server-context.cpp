@@ -3492,16 +3492,19 @@ private:
     };
 #endif
 
-    // k11 (LLAMA_LM_CKPT_MERGE=1, opt-in): see lm_breaks. Only for a slot alone in the batch, a target with layer-major prompts,
+    // k11 (LLAMA_LM_CKPT_MERGE): see lm_breaks. Only for a slot alone in the batch, a target with layer-major prompts,
     // no mtmd input and speculative impls that read the target rows of a segment (MTP, draft models, n-gram).
-    // Opt-in: the prompt's ubatches and kernels are those of the separate calls, but the MoE cache is seeded once (from the
-    // routing of the ubatch before the last) instead of once per call, so the cache holds other experts after the prompt; where
-    // the host computes misses or the fetch overlap splits a layer by hit / miss, the decode that follows then differs from k10
-    // (G4 Qwen3.6 UD-Q4_K_XL + MTP 8 GB: other text from token 14 / 31 / >64 of the 2k / 4.6k / 8k cells)
+    // The prompt's ubatches and kernels are those of the separate calls, but the MoE cache is seeded once (from the routing of
+    // the ubatch before the last) instead of once per call, and the checkpoint 4 + n_ubatch tokens before the end is not made (the
+    // one 4 tokens before the end is). k11 saw other decode text after the merged prompt where the host computes misses or the
+    // fetch overlap splits a layer by hit / miss (G4 Qwen3.6 UD-Q4_K_XL + MTP 8 GB, from token 14 / 31 / >64 of 2k / 4.6k / 8k).
+    // k15-pp: on by default wherever prompts run layer-major (k13-small: was only on a small device, common_fit_small_device).
+    // Separate, the last ubatch before that checkpoint ran alone and streamed every host expert a second time: G4 Qwen3.6-35B-A3B
+    // Q4 + MTP at 12 GB, 2k prompt [1532] [512] [4] = 28.8 GB of uploads for a 12.3 GB pass (Strata: ~20 GB). Merged, the decode
+    // after it is md5-equal with the misses pinned on the device (LLAMA_MOE_CPU_MISS=0) and, in the k15 runs, with them on the host
+    // too, at the same device hit rate (plans/k15_pp.md section 6). LLAMA_LM_CKPT_MERGE=0: the separate calls
     bool lm_ckpt_merge_ok(const server_slot & slot, int32_t n_tokens_prev, bool lm_ckpt) const {
-        // k13-small: on by default where the fit kept every layer on a small device (common_fit_small_device): there each extra prompt
-        // call reads all host experts again (G4 4 GB q3m 2k: [1532] [512] [4] = two passes of 13.6 GB); LLAMA_LM_CKPT_MERGE=0 off
-        static const bool on = getenv("LLAMA_LM_CKPT_MERGE") != nullptr ? atoi(getenv("LLAMA_LM_CKPT_MERGE")) != 0 : common_fit_small_device();
+        static const bool on = getenv("LLAMA_LM_CKPT_MERGE") == nullptr || atoi(getenv("LLAMA_LM_CKPT_MERGE")) != 0;
         return on && !lm_ckpt && n_tokens_prev == 0 && !slot.task->tokens.has_mtmd && llama_layer_major_on(ctx_tgt) &&
             common_speculative_rows_ok(spec.get());
     }
