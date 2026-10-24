@@ -408,7 +408,11 @@ static __global__ void rms_norm_mul_q8_1_f32(const float * x,
                                              const uint3   mul_ncols_packed,
                                              const uint3   mul_nrows_packed,
                                              const uint3   mul_nchannels_packed,
-                                             const uint3   mul_nsamples_packed) {
+                                             const uint3   mul_nsamples_packed,
+                                             const float * ra = nullptr,
+                                             const float * rb = nullptr) {
+    // k15: ra / rb (both or neither): x = ra + rb is computed here (the ADD before the norm, a residual add) and stored to x, with the
+    // same float add as k_bin_bcast's op_add; the norm reads the same values, so every output is bit-identical to ADD + RMS_NORM + MUL
     static_assert(block_size % QK8_1 == 0, "a warp must cover whole q8_1 blocks");
     ggml_cuda_pdl_lc();
     const int nrows = gridDim.x;
@@ -431,6 +435,7 @@ static __global__ void rms_norm_mul_q8_1_f32(const float * x,
             const float * mulc = mul + mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
 
             float tmp = 0.0f;
+            const int64_t xoff = sample*stride_sample + channel*stride_channel + row*stride_row;
             if constexpr (do_vec) {
                 const int      ncols4 = ncols / 4;
                 const float4 * x4     = (const float4 *) xc;
@@ -438,17 +443,34 @@ static __global__ void rms_norm_mul_q8_1_f32(const float * x,
                 for (int k = 0; k < vpt; k++) {
                     const int i = tid + k*block_size;
                     if (i < ncols4) {
-                        const float4 xs = x4[i];
+                        float4 xs;
+                        if (ra != nullptr) {
+                            const float4 a = ((const float4 *) (ra + xoff))[i];
+                            const float4 b = ((const float4 *) (rb + xoff))[i];
+                            xs = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+                            ((float4 *) const_cast<float *>(xc))[i] = xs;
+                        } else {
+                            xs = x4[i];
+                        }
                         tmp += xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
                     }
                 }
             } else {
                 for (int col = tid; col < ncols; col += block_size) {
-                    const float xi = xc[col];
+                    float xi;
+                    if (ra != nullptr) {
+                        xi = ra[xoff + col] + rb[xoff + col];
+                        const_cast<float *>(xc)[col] = xi;
+                    } else {
+                        xi = xc[col];
+                    }
                     tmp += xi * xi;
                 }
             }
             tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+            if (ra != nullptr) {
+                __syncthreads(); // the second pass reads elements other threads stored
+            }
 
             const float mean  = tmp / ncols;
             const float scale = rsqrtf(mean + eps);
@@ -922,8 +944,11 @@ static bool rms_norm_mul_conv_launch(ggml_backend_cuda_context & ctx, const ggml
     return true;
 }
 
-void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor, void * q8_1_out) {
+void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor, void * q8_1_out,
+                                 const ggml_tensor * add_tensor) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
+    // k15: add_tensor (the ADD producing rms_norm_src, fused before it): only with the q8_1 output (see ggml_cuda_try_fuse_add_rms_norm)
+    GGML_ASSERT(add_tensor == nullptr || (add_tensor == rms_norm_src && q8_1_out != nullptr));
     float eps = 0.0f;
 
     memcpy(&eps, dst->op_params, sizeof(float));
@@ -970,7 +995,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     // k11: the next products' conversion of this output, written by the norm (see ggml_cuda_src1_memo)
     ggml_cuda_src1_memo & memo = ctx.src1_memo;
-    if (q8_1_out == nullptr && memo.producer == mul_tensor && memo.held && ggml_is_contiguous(mul_tensor) &&
+    if (q8_1_out == nullptr && add_tensor == nullptr && memo.producer == mul_tensor && memo.held && ggml_is_contiguous(mul_tensor) &&
             ggml_are_same_shape(rms_norm_src, mul_tensor) && ggml_is_contiguous(rms_norm_src)) {
         if (rms_norm_mul_conv_launch(ctx, rms_norm_src, mul_src, dst_d, memo.producer_mode, memo.ptr, memo.K_out, memo.N_out, eps)) {
             memo.produced = true;
@@ -991,6 +1016,8 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
         const float * src0_d = (const float *) rms_norm_src->data;
         const float * mul_d  = (const float *) mul_src->data;
         static_assert(MATRIX_ROW_PADDING % WARP_SIZE == 0, "q8_1 pass must cover whole warps");
+        const float * ra_d = add_tensor ? (const float *) add_tensor->src[0]->data : nullptr;
+        const float * rb_d = add_tensor ? (const float *) add_tensor->src[1]->data : nullptr;
         bool vec = ne00 % 4 == 0 && ne00 > 0 && ((uintptr_t) dst_d & 15) == 0;
         vec = vec && ggml_cuda_is_aligned(rms_norm_src, 16) && mul_ncols == ne00 && ggml_cuda_is_aligned(mul_src, 16);
         const int64_t n4 = ne00 / 4;
@@ -1000,7 +1027,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
             const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32 * sizeof(float), stream}; \
             ggml_cuda_kernel_launch(rms_norm_mul_q8_1_f32<BLOCK_SIZE, VPT, VEC>, launch_params, src0_d, dst_d, q8_1_out, (int) ne00, ncols_padded, \
                 (int) ne02, (int) ne03, s01, s02, s03, eps, mul_d, mul_s01, mul_s02, mul_s03, \
-                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed); \
+                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, ra_d, rb_d); \
         } while (0)
         if (vec) {
             if (n4 <= 32) {
