@@ -2586,15 +2586,15 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
                     PRId64 " probes\n", seq_id, ts, tl, policy.cost_ms(1), policy.cost_n[1], policy.cost_ms(ts), policy.cost_n[ts], policy.cost_ms(tl),
                     policy.cost_n[tl], policy.gain[ts], policy.gain_n[ts], policy.gain[tl], policy.gain_n[tl], si.n_probe);
             if (si.sd.enabled && params.standdown) {
-                SPC_INF("ngram-suffix seq %d: stand-down %" PRId64 " times, %" PRId64 " plain rounds parked, %" PRId64 " drafted rounds booked, ledger %.2f ms, net %.2f ms (min match %d)\n",
-                        seq_id, si.sd.n_stand, si.sd.n_parked, si.sd.n_booked, si.sd.ledger, si.sd.net, si.min_match);
+                SPC_INF("ngram-suffix seq %d: stand-down: %" PRId64 " matches held plain, %" PRId64 " drafted rounds booked, net %.2f ms, saved by class %.2f %.2f %.2f %.2f plain rounds (min match %d)\n",
+                        seq_id, si.sd.n_held, si.sd.n_booked, si.sd.net, si.sd.saved[0], si.sd.saved[1], si.sd.saved[2], si.sd.saved[3], si.min_match);
             }
         }
         si.n_lookups = si.n_matches = si.n_drafts = si.n_drafted = si.n_accepted = si.n_yield = 0;
         si.n_probe = 0;
         si.k_last = 0;
         si.timer.reset();
-        si.sd.reset();
+        si.sd.begin();
         si.min_match = (params.long_prompt > 0 && params.n_min_match_long > 0 && (int64_t) prompt.size() >= params.long_prompt) ?
                        params.n_min_match_long : params.n_min_match;
         if (policy_on && n_seq == 1) {
@@ -2616,12 +2616,11 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
             }
             auto & si = sinfos[seq_id];
             si.k_last = 0;
-            bool parked = false;
             if (policy_on) {
                 const int64_t now = ggml_time_us();
                 si.timer.tick(policy, now);
                 if (params.standdown) {
-                    parked = si.sd.tick(policy, now, dp.prompt->size());
+                    si.sd.tick(policy, now, dp.prompt->size());
                 }
             }
             sync(si, *dp.prompt);
@@ -2650,7 +2649,7 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
             } else if (policy_on) {
                 // k11-decode: the window that commits the most tokens per measured ms, or none (common/spec-cost-policy.h)
                 const int k_full = std::min(offered, win);
-                k = parked ? 0 : policy.choose(k_full, std::min(k_full, params.n_max_short), q);
+                k = (params.standdown && si.sd.hold(b)) ? 0 : policy.choose(k_full, std::min(k_full, params.n_max_short), q);
                 if (k > 0 && policy.cost_n[std::min(k + 1, common_spec_cost_policy::MAX_T)] < common_spec_cost_policy::PROBES) {
                     si.n_probe++;
                 }
@@ -2670,7 +2669,7 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
             dp.result->assign(cand.begin(), cand.begin() + k);
             if (policy_on) {
                 si.timer.next(k + 1);
-                si.sd.next(k);
+                si.sd.next(k, b);
             }
             si.k_last      = k;
             si.bucket_last = b;
