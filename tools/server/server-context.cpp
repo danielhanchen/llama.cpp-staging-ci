@@ -3500,9 +3500,10 @@ private:
     // fetch overlap splits a layer by hit / miss (G4 Qwen3.6 UD-Q4_K_XL + MTP 8 GB, from token 14 / 31 / >64 of 2k / 4.6k / 8k).
     // k15-pp: on by default wherever prompts run layer-major (k13-small: was only on a small device, common_fit_small_device).
     // Separate, the last ubatch before that checkpoint ran alone and streamed every host expert a second time: G4 Qwen3.6-35B-A3B
-    // Q4 + MTP at 12 GB, 2k prompt [1532] [512] [4] = 28.8 GB of uploads for a 12.3 GB pass (Strata: ~20 GB). Merged, the decode
-    // after it is md5-equal with the misses pinned on the device (LLAMA_MOE_CPU_MISS=0) and, in the k15 runs, with them on the host
-    // too, at the same device hit rate (plans/k15_pp.md section 6). LLAMA_LM_CKPT_MERGE=0: the separate calls
+    // Q4 + MTP at 12 GB, 2k prompt [1532] [512] [4] = 27.7 GB of uploads, 16.0 merged, 3188 -> 5226 tok/s. Merged, the output is
+    // md5-equal with the misses pinned on the device (LLAMA_MOE_CPU_MISS=0) and decode speed is unchanged; with the misses on the host
+    // the decode after the prompt may take another text (Qwen3.8-Flash-Next 32 GB 8k), as the cache is seeded once (plans/k15_pp.md
+    // section 6). LLAMA_LM_CKPT_MERGE=0: the separate calls
     bool lm_ckpt_merge_ok(const server_slot & slot, int32_t n_tokens_prev, bool lm_ckpt) const {
         static const bool on = getenv("LLAMA_LM_CKPT_MERGE") == nullptr || atoi(getenv("LLAMA_LM_CKPT_MERGE")) != 0;
         return on && !lm_ckpt && n_tokens_prev == 0 && !slot.task->tokens.has_mtmd && llama_layer_major_on(ctx_tgt) &&
