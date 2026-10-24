@@ -4793,7 +4793,22 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
+    // k15-fn: GGML_SCHED_ALLOC_TIMING=1 logs where the host time of allocating a graph of more than 1000 nodes goes (diagnostic)
+    static const bool alloc_timing = getenv("GGML_SCHED_ALLOC_TIMING") != nullptr && atoi(getenv("GGML_SCHED_ALLOC_TIMING")) != 0;
+    const bool at_on = alloc_timing && graph->n_nodes > 1000;
+    const int64_t at0 = at_on ? ggml_time_us() : 0;
     ggml_backend_sched_split_graph(sched, graph);
+    const int64_t at1 = at_on ? ggml_time_us() : 0;
+    struct at_log {
+        bool on; int64_t t0, t1; int n_nodes; int n_splits;
+        ~at_log() {
+            if (on) {
+                const int64_t t2 = ggml_time_us();
+                GGML_LOG_INFO("ggml_backend_sched_alloc_graph: %d nodes, %d splits: split %.3f ms, measure + bind + alloc %.3f ms\n", n_nodes, n_splits,
+                    (t1 - t0)/1000.0, (t2 - t1)/1000.0);
+            }
+        }
+    } at_l = { at_on, at0, at1, graph->n_nodes, sched->n_splits };
 
     sched->alloc_over = 0;
     size_t lend_need[GGML_SCHED_MAX_BACKENDS] = { 0 };
