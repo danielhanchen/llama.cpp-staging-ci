@@ -2980,31 +2980,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
-// k15-spec: the key also carries the graph's shape (node count, the first and last nodes' sizes), so graphs of different batch sizes
-// on the same first node (a decode of 1 token and a verify window of 4 or 8 rebuilt in the same graph context) keep CUDA graphs of their
-// own: before, a verify window overwrote the 1-token graph's recorded properties, and the next plain decodes ran without a CUDA graph
-// until two of them matched again, then captured it anew (G4 LFM2.5 32 GB 8k: plain rounds 2.90 ms with drafts vs 2.47 ms without).
-// GGML_CUDA_GRAPH_KEY_SHAPE=0: the first node alone (as before).
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    static const bool shape_key = [] {
-        const char * e = getenv("GGML_CUDA_GRAPH_KEY_SHAPE");
-        return e == nullptr || atoi(e) != 0;
-    }();
-    if (!shape_key || cgraph->n_nodes <= 0) {
-        return cgraph->nodes[0];
-    }
-    const ggml_tensor * a = cgraph->nodes[0];
-    const ggml_tensor * b = cgraph->nodes[cgraph->n_nodes - 1];
-    uint64_t h = (uint64_t) (uintptr_t) a;
-    auto mix = [&h](uint64_t v) {
-        h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
-    };
-    mix((uint64_t) cgraph->n_nodes);
-    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-        mix((uint64_t) a->ne[i]);
-        mix((uint64_t) b->ne[i]);
-    }
-    return (const void *) (uintptr_t) h;
+    return cgraph->nodes[0];
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
