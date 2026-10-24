@@ -1,6 +1,7 @@
 #include "mmvq.cuh"
 
-#define MMVQ_EXACT_GROUP_MAX 8 // tokens of a grouped batch invariant MUL_MAT_ID launch (k15-fv)
+#define MMVQ_EXACT_GROUP_MAX 8    // tokens of a grouped batch invariant MUL_MAT_ID launch (k15-fv)
+#define MMVQ_EXACT_GROUP_SLOTS 32 // and expert slots per token
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -673,6 +674,15 @@ static __global__ void mul_mat_vec_q(
     static_assert(c_group == 0 || ncols_dst == 1, "grouped launches are single column launches");
     constexpr int NC = c_group > 0 ? c_group : ncols_dst; // accumulator columns: tokens of the group, or the columns
     [[maybe_unused]] const int32_t * ids_all = ids;
+    // grouped: the ids of all tokens in shared memory first (one load per block; the scans below would chain global loads)
+    [[maybe_unused]] __shared__ int32_t s_ids[c_group > 0 ? c_group*MMVQ_EXACT_GROUP_SLOTS : 1];
+    if constexpr (c_group > 0) {
+        const uint32_t n_ids = gridDim.z*gridDim.y;
+        for (uint32_t k = warp_size*threadIdx.y + threadIdx.x; k < n_ids; k += nwarps*warp_size) {
+            s_ids[k] = ids_all[(k / gridDim.y)*ids_stride + k % gridDim.y];
+        }
+        __syncthreads();
+    }
     // k11-decode: a single column MUL_MAT_ID launch over several tokens (batch invariant verify) takes the tokens as samples:
     // token z reads the experts of its ids row (one sample, z = 0: as before)
     if (ncols_dst == 1 && ids) {
@@ -704,30 +714,29 @@ static __global__ void mul_mat_vec_q(
     // grouped: this block's (token, slot) leads its expert when no earlier token selects it; members = (token, slot) pairs of the
     // expert in token order, the leader first
     [[maybe_unused]] int      nmem = 1;
-    [[maybe_unused]] uint32_t mem_tok [NC];
-    [[maybe_unused]] uint32_t mem_slot[NC];
+    [[maybe_unused]] uint32_t y_off[NC]; // member's q8_1 column (blocks from vy)
+    [[maybe_unused]] uint32_t d_off[NC]; // member's dst row start
     if constexpr (c_group > 0) {
         const int32_t  e      = (int32_t) channel_x;
         const uint32_t nslots = gridDim.y;
-        for (uint32_t t = 0; t < sample_dst; ++t) {
-            for (uint32_t s = 0; s < nslots; ++s) {
-                if (ids_all[t*ids_stride + s] == e) {
-                    return; // an earlier token's block computes this expert for this token
-                }
+        for (uint32_t k = 0; k < sample_dst*nslots; ++k) {
+            if (s_ids[k] == e) {
+                return; // an earlier token's block computes this expert for this token
             }
         }
-        mem_tok[0] = sample_dst; mem_slot[0] = channel_dst;
 #pragma unroll
-        for (int m = 1; m < NC; ++m) {
-            mem_tok[m] = sample_dst; mem_slot[m] = channel_dst;
+        for (int m = 0; m < NC; ++m) {
+            y_off[m] = sample_dst*stride_sample_y + fastmodulo(channel_dst, nchannels_y)*stride_channel_y;
+            d_off[m] = sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
         }
         for (uint32_t t = sample_dst + 1; t < gridDim.z && nmem < NC; ++t) {
             for (uint32_t s = 0; s < nslots; ++s) {
-                if (ids_all[t*ids_stride + s] == e) {
+                if (s_ids[t*nslots + s] == e) {
 #pragma unroll
                     for (int m = 1; m < NC; ++m) {
                         if (m == nmem) {
-                            mem_tok[m] = t; mem_slot[m] = s;
+                            y_off[m] = t*stride_sample_y + fastmodulo(s, nchannels_y)*stride_channel_y;
+                            d_off[m] = t*stride_sample_dst + s*stride_channel_dst + row0;
                         }
                     }
                     ++nmem;
@@ -809,13 +818,6 @@ static __global__ void mul_mat_vec_q(
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
-    [[maybe_unused]] const block_q8_1 * y_mem[NC];
-    if constexpr (c_group > 0) {
-#pragma unroll
-        for (int m = 0; m < NC; ++m) {
-            y_mem[m] = ((const block_q8_1 *) vy) + mem_tok[m]*stride_sample_y + fastmodulo(mem_slot[m], nchannels_y)*stride_channel_y;
-        }
-    }
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
@@ -849,7 +851,7 @@ static __global__ void mul_mat_vec_q(
             if (c_group > 0 && j >= nmem) {
                 break;
             }
-            const block_q8_1 * y_j = c_group > 0 ? y_mem[j] : y + j*stride_col_y;
+            const block_q8_1 * y_j = c_group > 0 ? (const block_q8_1 *) vy + y_off[j] : y + j*stride_col_y;
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 tmp[j][i] += vec_dot_q_cuda(
@@ -895,7 +897,7 @@ static __global__ void mul_mat_vec_q(
         if (c_group > 0 && j >= nmem) {
             break;
         }
-        float * dst_j = c_group > 0 ? dst_base + mem_tok[j]*stride_sample_dst + mem_slot[j]*stride_channel_dst + row0 : dst + j*stride_col_dst;
+        float * dst_j = c_group > 0 ? dst_base + d_off[j] : dst + j*stride_col_dst;
 #pragma unroll
         for (int i = 0; i < rows_per_cuda_block; ++i) {
 #pragma unroll
@@ -1377,7 +1379,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 vx, vy, ids, fusion, dst, ncols_x, nrows_x, 1, stride_row_x, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                 1, ncols_dst, stride_sample_x, stride_col_y, stride_col_dst, ids_stride, stream, false,
-                ids_group && ncols_dst <= MMVQ_EXACT_GROUP_MAX);
+                ids_group && ncols_dst <= MMVQ_EXACT_GROUP_MAX && nchannels_dst <= MMVQ_EXACT_GROUP_SLOTS);
             return;
         }
         if (ids != nullptr) {
