@@ -436,6 +436,23 @@ bool llama_memory_recurrent::rollback_copy(uint32_t cell, uint32_t group) {
     if (!enabled || group == 0 || group > n_rs_seq || cell >= size) {
         return false;
     }
+    // only small states (LFM2.5's short convolutions: 16 KiB per layer): a copy synchronises once per tensor, so for large ones (the
+    // delta-net states of Flash-Next fn4, MiBs per layer) the copies cost more than the graph rebuild they save (G4 fn4 32 GB chat -0.35%)
+    static const size_t max_bytes = [] {
+        const char * e = getenv("LLAMA_RS_ROLLBACK_COPY_MAX_KB");
+        return (size_t) (e != nullptr ? atof(e) : 1024.0)*1024;
+    }();
+    size_t bytes = 0;
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        for (ggml_tensor * t : { r_l[il], s_l[il], il < p_l.size() ? p_l[il] : nullptr }) {
+            if (t != nullptr && t->ne[1] > 0) {
+                bytes += t->nb[1];
+            }
+        }
+    }
+    if (bytes > max_bytes) {
+        return false;
+    }
     // views of the two rows of every state tensor, in a context of views only (no allocation)
     const size_t n_views = 2*3*(size_t) r_l.size() + 8;
     ggml_init_params ip = { n_views*ggml_tensor_overhead(), nullptr, true };
