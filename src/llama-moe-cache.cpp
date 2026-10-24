@@ -5043,9 +5043,17 @@ struct llama_moe_cache::impl {
         // LLAMA_MOE_CACHE_LEND_PARTS=N > 1 (experimental): else in up to N bank tails
         static const int max_parts = getenv("LLAMA_MOE_CACHE_LEND_PARTS") ? std::max(1, atoi(getenv("LLAMA_MOE_CACHE_LEND_PARTS"))) : 1;
         const int32_t n0 = n;
-        for (int multi = 0; multi < (n_graph > 1 && max_parts > 1 ? 2 : 1) && n_lend == 0; ++multi) {
+        // k15-pp (LLAMA_MOE_LM_LEND_GRAPH_PARTS=0 off): a graph-only lend tries one part per bank first. In one part the graph had to fit
+        // the tail of a single bank, so the slots lent (and refilled after the group) were ~2.6x the graph: G4 Qwen3.8-Flash-Next 32 GB 8k,
+        // a 1740 MiB graph took 2009 slots (4463 MiB); Qwen3.6 q4x local, 509 MiB took 740 slots (1341 MiB)
+        static const bool graph_parts_env = getenv("LLAMA_MOE_LM_LEND_GRAPH_PARTS") == nullptr || atoi(getenv("LLAMA_MOE_LM_LEND_GRAPH_PARTS")) != 0;
+        const bool parts_first = graph_only && graph_parts_env && n_graph > 1 && g.banks.size() > 1;
+        const int  mp          = parts_first ? std::max<int>(max_parts, (int) g.banks.size()) : max_parts;
+        const int  n_pass      = parts_first || (n_graph > 1 && max_parts > 1) ? 2 : 1;
+        for (int pass = 0; pass < n_pass && n_lend == 0; ++pass) {
+            const int multi = parts_first ? 1 - pass : pass;
             for (n = n0; n <= n_max; n = n < n_max ? std::min(n + step, n_max) : n_max + 1) {
-                if (place(g, n, copies, n_copies, n_graph, multi ? std::min(n_graph, max_parts) : 1, graph_need, depth, guard, offsets, part_sizes)) {
+                if (place(g, n, copies, n_copies, n_graph, multi ? std::min(n_graph, mp) : 1, graph_need, depth, guard, offsets, part_sizes)) {
                     n_lend = n;
                     break;
                 }
