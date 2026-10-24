@@ -4285,10 +4285,18 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         // k10) and 287 instead of 325 tok/s decode, prompt 4815 instead of 5014 (LLAMA_MOE_LM_LEND=0). LLAMA_MOE_LM_LEND_FIRST=1: lend at once (k12)
         static const bool lm_lend_first = getenv("LLAMA_MOE_LM_LEND_FIRST") != nullptr && atoi(getenv("LLAMA_MOE_LM_LEND_FIRST")) != 0;
         const bool lend_ok = lm_lend && moe_cache->lends_on_any();
-        bool lend_g = lend_ok && lm_lend_first;
+        // k13-small round 7: the growth-first rule only up to LLAMA_MOE_LM_LEND_FIRST_GROW_MIB of growth (0 = any growth) and for groups
+        // starting before position LLAMA_MOE_LM_LEND_FIRST_POS (0 = any position); past either the group borrows at once (k12)
+        static const size_t  lf_grow = (size_t) (getenv("LLAMA_MOE_LM_LEND_FIRST_GROW_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LM_LEND_FIRST_GROW_MIB"))) : 0) << 20;
+        static const int64_t lf_pos  = getenv("LLAMA_MOE_LM_LEND_FIRST_POS") ? std::max(0, atoi(getenv("LLAMA_MOE_LM_LEND_FIRST_POS"))) : 0;
+        bool lend_g = lend_ok && (lm_lend_first || (lf_pos > 0 && group[a].ub->pos[0] >= lf_pos));
         if (lend_g) {
             moe_cache->set_graph_lend(true);
             ggml_backend_sched_set_alloc_lend_graph(sched.get(), true);
+        }
+        const bool lf_capped = lend_ok && !lend_g && lf_grow > 0 && lf_grow < lm_grow_max;
+        if (lf_capped) {
+            ggml_backend_sched_set_alloc_limit(sched.get(), true, lf_grow);
         }
         ggml_status st = run(g);
         if (lend_g) {
@@ -4308,6 +4316,16 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             ggml_backend_sched_set_alloc_lend_graph(sched.get(), true);
             st = run(g);
             moe_cache->set_graph_lend(false);
+            if (st == GGML_STATUS_ALLOC_FAILED && lf_capped) {
+                // the cache did not take it: the growth in free memory as without the cap
+                for (auto & [node, arr] : srcs) {
+                    std::copy(arr.begin(), arr.end(), node->src);
+                }
+                ggml_backend_sched_reset(sched.get());
+                ggml_backend_sched_use_full_hash(sched.get());
+                ggml_backend_sched_set_alloc_limit(sched.get(), true, lm_grow_max);
+                st = run(g);
+            }
         }
         ggml_backend_sched_set_alloc_limit(sched.get(), false, 0);
         lm_merged_active = false;
