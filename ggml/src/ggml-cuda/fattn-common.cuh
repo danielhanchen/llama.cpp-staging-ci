@@ -1240,7 +1240,10 @@ void launch_fattn(
     const uint32_t n_head_log2 = 1u << uint32_t(floorf(log2f(float(n_head))));
 
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
-    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+    // m1 is read only for ALiBi (max_bias > 0); without ALiBi a negative m1 tells the vector kernel not to skip KV tiles whose
+    // mask is -inf for every column (GGML_CUDA_FA_VEC_SKIP_MASKED=0, the kill switch of that skip)
+    static const bool vec_skip_masked = !getenv("GGML_CUDA_FA_VEC_SKIP_MASKED") || atoi(getenv("GGML_CUDA_FA_VEC_SKIP_MASKED")) != 0;
+    const float m1 = max_bias <= 0.0f && !vec_skip_masked ? -1.0f : powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
     // TODO other tensor dimensions after removal of WMMA kernel:
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);

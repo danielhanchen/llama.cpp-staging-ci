@@ -255,6 +255,21 @@ static __global__ void flash_attn_ext_vec(
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
 
+        // A warp's 32 KV of this iteration that are masked (-inf) for every column add exactly nothing (KQ_max and the scale stay,
+        // exp(-inf) = 0): skip their K/V reads. SWA layers read a KV window of n_swa + n_ubatch cells of which only n_swa are live.
+        if (mask && max_bias <= 0.0f && m1 >= 0.0f) {
+            bool live = false;
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                if (ncols == 1 || ic0 + j < int(ne01.z)) {
+                    live |= __half2float(maskh[j*ne11 + threadIdx.y*WARP_SIZE + threadIdx.x]) != -INFINITY;
+                }
+            }
+            if (!__any_sync(0xFFFFFFFF, live)) {
+                continue;
+            }
+        }
+
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
 
