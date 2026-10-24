@@ -112,6 +112,14 @@ LLAMA_API void llama_set_verify(struct llama_context * ctx, bool value);
 // k11 (LLAMA_LM_CKPT_MERGE): the next llama_decode() of a single sequence batch ends ubatches at these batch indices (each segment is split as
 // a batch of its own would be: the same ubatches as separate decode() calls, in one layer-major group); cleared by that call
 LLAMA_API void llama_set_ubatch_breaks(struct llama_context * ctx, const int32_t * breaks, int32_t n);
+// k15-pp: the next llama_decode() keeps the partial state of seq_id (the recurrent rows) as it is before batch token i_batch, for a
+// checkpoint there that the decode does not stop at (the merged prompt checkpoint of llama-server, LLAMA_LM_CKPT_MERGE). After the
+// decode, llama_state_seq_captured() says whether it was taken, and llama_state_seq_get_size_ext / get_data_ext with
+// LLAMA_STATE_SEQ_FLAGS_CAPTURED serialise it as the state of the sequence at that position (PARTIAL_ONLY only, no SWA KV cache).
+// Unsupported memories (SWA attention, several cells per sequence) take nothing. Cleared by the decode after the next one
+#define LLAMA_STATE_SEQ_FLAGS_CAPTURED 8
+LLAMA_API bool llama_set_state_capture(struct llama_context * ctx, llama_seq_id seq_id, int32_t i_batch);
+LLAMA_API bool llama_state_seq_captured(const struct llama_context * ctx, llama_seq_id seq_id, llama_pos * pos_max);
 // layer-major prompt groups can run in this context (a MoE cache with layer-major prompts on)
 LLAMA_API bool llama_layer_major_on(const struct llama_context * ctx);
 // k11: wait for the asynchronous state save in flight (LLAMA_STATE_SEQ_FLAGS_ASYNC), before its destination is read or freed

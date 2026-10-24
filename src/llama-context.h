@@ -335,6 +335,8 @@ private:
 public:
     // k11 (LLAMA_LM_CKPT_MERGE)
     void set_ubatch_breaks(const int32_t * breaks, int32_t n);
+    bool set_state_capture(llama_seq_id seq_id, int32_t i_batch);
+    bool state_captured(llama_seq_id seq_id, llama_pos * pos_max) const;
     bool layer_major_on() const;
 
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
@@ -649,6 +651,26 @@ private:
         size_t          off;     // bytes into lm_async_buf
         ggml_backend_t  be_ids;  // the backend that computes the routing
     };
+    // k15-pp: llama_set_state_capture
+    struct cap_region {
+        ggml_tensor * t;     // a recurrent state tensor of the memory
+        size_t        off;   // the row of the sequence's cell
+        size_t        size;
+        ggml_tensor * snap;  // its copy before the capture token
+    };
+    llama_seq_id cap_seq     = -1;
+    int32_t      cap_idx     = -1;    // batch token index of the next / current decode
+    bool         cap_pending = false; // set for the next decode
+    bool         cap_done    = false;
+    llama_pos    cap_pos     = -1;    // position of the last token before cap_idx
+    uint32_t     cap_cell    = 0;
+    std::vector<cap_region> cap_regions;
+    ggml_context_ptr        cap_ctx;
+    ggml_backend_buffer_ptr cap_buf;
+    bool cap_prepare();             // the regions of the sequence's cell and their snapshot tensors; false: unsupported
+    void cap_now(llama_pos pos);    // synchronize, then copy the regions (state before the next ubatch)
+    void cap_swap(llama_pos pos);   // exchange the rows with the snapshot (twice = back), set the cell's position
+    llama_pos cap_pos_saved = -1;
     bool lm_seed_async = false;
     ggml_backend_dev_t lm_async_dev = nullptr;
     std::vector<lm_seed_pending> lm_pending;
