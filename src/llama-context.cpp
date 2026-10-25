@@ -765,6 +765,23 @@ llama_context::llama_context(
         if (moe_cache && moe_cache_seed_auto) {
             moe_cache->prompts_do_not_seed();
         }
+        // k15-pp3: the capture snapshots fit counted (cap_reserve_bytes) are allocated at the first capture: held free here too, so the
+        // lending decision of the reserve below sees the memory fit left for the cache's neighbours (G4 q4x 12 GB + MTP: with the
+        // 124.5 MiB of snapshots in the free memory, the staging copies stayed outside the cache, lending off, and the process ended
+        // with 188 MiB free instead of 408)
+        if (moe_cache && !model.hparams.no_alloc) {
+            ggml_backend_buffer_type_t cb = nullptr;
+            const size_t cbytes = cap_planned_bytes(&cb);
+            ggml_backend_dev_t cdev = cb != nullptr ? ggml_backend_buft_get_device(cb) : nullptr;
+            for (size_t i = 0; cbytes > 0 && cdev != nullptr && i < backend_ptrs.size(); ++i) {
+                if (ggml_backend_get_device(backend_ptrs[i]) == cdev && !ggml_backend_buft_is_host(backend_buft[i])) {
+                    mem_reserve[i] += cbytes;
+                    LLAMA_LOG_INFO("%s: %s: %.2f MiB of device memory kept free for the state capture snapshots (LLAMA_FIT_CAPTURE=0 to "
+                        "disable)\n", __func__, ggml_backend_name(backend_ptrs[i]), cbytes/1024.0/1024.0);
+                    break;
+                }
+            }
+        }
         if (moe_cache) {
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
                 moe_cache->set_mem_reserve(backend_ptrs[i], mem_reserve[i]);
@@ -8481,6 +8498,11 @@ size_t llama_context::cap_reserve_bytes(ggml_backend_buffer_type_t * buft_out) c
         }
         return n;
     }
+    return cap_planned_bytes(buft_out);
+}
+
+size_t llama_context::cap_planned_bytes(ggml_backend_buffer_type_t * buft_out) const {
+    *buft_out = nullptr;
     // planned: captures happen where prompts run layer-major (a target with a draft whose experts spill to the host, see lm_enabled) on
     // a recurrent memory the server captures (llama_state_capture_supported, LLAMA_LM_CKPT_CAPTURE): one snapshot of a sequence's
     // recurrent rows per capture. The condition leaves out what fit varies between its measurements (the MoE cache size, n_ubatch), so
