@@ -1509,6 +1509,18 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         set_batch();
         COM_INF("MoE cache: layer-major prompts beside speculative decoding: n_ubatch stays %u, n_batch %u (LLAMA_MOE_LAYER_MAJOR=0 disables)\n",
             cparams.n_ubatch, cparams.n_batch);
+    } else if (lm == -1 && spill && !common_spec_draft_model(params) && cparams.n_ubatch == ub0) {
+        // k15-small4: without a draft too, wherever the rules above keep the default n_ubatch with spilled experts (the small-device
+        // placement keeps it for good): every ubatch otherwise uploads the experts the cache misses again. T4 4 GB, Qwen3.6-35B-A3B
+        // UD-Q4_K_XL, no MTP: 2k / 8k prompt 163 / 167 tok/s ubatch by ubatch against 590 / 911 in layer-major groups (the same ubatches,
+        // layer by layer). LLAMA_MOE_LAYER_MAJOR_NODRAFT=0 keeps the prompt ubatch by ubatch
+        static const bool nd_on = getenv("LLAMA_MOE_LAYER_MAJOR_NODRAFT") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_NODRAFT")) != 0;
+        if (nd_on) {
+            set_batch();
+            common_set_env("LLAMA_MOE_LAYER_MAJOR_AUTO_NODRAFT", "1");
+            COM_INF("MoE cache: layer-major prompts without a draft: n_ubatch stays %u, n_batch %u (LLAMA_MOE_LAYER_MAJOR_NODRAFT=0 disables)\n",
+                cparams.n_ubatch, cparams.n_batch);
+        }
     }
 }
 

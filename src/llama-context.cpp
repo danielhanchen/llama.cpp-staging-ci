@@ -414,7 +414,11 @@ llama_context::llama_context(
         // and a batch holds at least two ubatches (checked once the cache exists)
         const char * env = getenv("LLAMA_MOE_LAYER_MAJOR");
         lm_auto    = env == nullptr || strcmp(env, "auto") == 0;
-        lm_enabled = (lm_auto ? cparams.spec_draft && cparams.n_batch >= 2*cparams.n_ubatch : atoi(env) != 0) && cparams.moe_cache_size > 0;
+        // k15-small4: LLAMA_MOE_LAYER_MAJOR_AUTO_NODRAFT=1 (set by common where its rules keep the default n_ubatch with spilled experts,
+        // see common_moe_cache_auto_ubatch): auto also without a draft
+        const char * env_nd = getenv("LLAMA_MOE_LAYER_MAJOR_AUTO_NODRAFT");
+        const bool   lm_nd  = env_nd != nullptr && atoi(env_nd) != 0;
+        lm_enabled = (lm_auto ? (cparams.spec_draft || lm_nd) && cparams.n_batch >= 2*cparams.n_ubatch : atoi(env) != 0) && cparams.moe_cache_size > 0;
         if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX")) {
             lm_ub_max = std::max(1, atoi(e));
         }
@@ -735,7 +739,7 @@ llama_context::llama_context(
         }
         if (lm_enabled && !model.hparams.no_alloc) {
             LLAMA_LOG_INFO("%s: MoE cache: layer-major prompts%s, up to %d ubatches of %u tokens per graph (LLAMA_MOE_LAYER_MAJOR_UB_MAX; "
-                "LLAMA_MOE_LAYER_MAJOR=0 disables)\n", __func__, lm_auto ? " beside speculative decoding" : "", lm_ub_max, cparams.n_ubatch);
+                "LLAMA_MOE_LAYER_MAJOR=0 disables)\n", __func__, lm_auto ? (cparams.spec_draft ? " beside speculative decoding" : " without a draft") : "", lm_ub_max, cparams.n_ubatch);
         }
         if (moe_cache) {
             n_threads_host = host_threads_init();
