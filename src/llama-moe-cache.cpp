@@ -684,7 +684,7 @@ struct llama_moe_cache::impl {
     double lend_min_frac = 0.08; // LLAMA_MOE_CACHE_LEND_MIN_FRAC: that share
     bool   lend_save     = false; // k15-fn LLAMA_MOE_CACHE_LEND_SAVE=1 (opt-in): also lend where it frees lend_save_min bytes, see lend_saves
     size_t lend_save_min = 256ull*1024*1024; // LLAMA_MOE_CACHE_LEND_SAVE_MIB
-    bool   lend_save_refill = false; // LLAMA_MOE_CACHE_LEND_SAVE_REFILL=1: slots lent for lend_saves are refilled when they come back, see unlend
+    bool   lend_save_refill = true; // LLAMA_MOE_CACHE_LEND_SAVE_REFILL=0: slots lent for lend_saves come back empty (lazy), see unlend
     bool   lend_multi   = false; // LLAMA_MOE_CACHE_LEND_MULTI=1: also with the cache on several devices (not validated)
     bool   lend_off_log = false;
     size_t n_lends      = 0; // graphs whose staging copies used lent slots
@@ -1066,7 +1066,7 @@ struct llama_moe_cache::impl {
             env = getenv("LLAMA_MOE_CACHE_LEND_SAVE");
             lend_save = env != nullptr && atoi(env) != 0;
             env = getenv("LLAMA_MOE_CACHE_LEND_SAVE_REFILL");
-            lend_save_refill = env != nullptr && atoi(env) != 0;
+            lend_save_refill = env == nullptr || atoi(env) != 0;
             env = getenv("LLAMA_MOE_CACHE_LEND_SAVE_MIB");
             if (env != nullptr) {
                 lend_save_min = (size_t) std::max(0ll, atoll(env))*1024*1024;
@@ -5434,10 +5434,10 @@ struct llama_moe_cache::impl {
             }
         }
 
-        // k15-fn: slots lent for the memory lending frees (lend_saves) come back empty: decode misses fill them as they are needed. The
-        // refill uploaded every expert they held before the prompt (G4 Qwen3.8-Flash-Next UD-IQ4_XS + MTP at 32 GB: 994 slots, 2208 MiB,
-        // after every 2k prompt, in its last ubatch: 2441 -> 2313 tok/s); the outputs do not depend on what the cache holds.
-        // LLAMA_MOE_CACHE_LEND_SAVE_REFILL=1 refills them
+        // k15-fn LLAMA_MOE_CACHE_LEND_SAVE_REFILL=0 (opt-in): slots lent for the memory lending frees (lend_saves) come back empty and
+        // misses fill them, instead of uploading every expert they held before the prompt (G4 Qwen3.8-Flash-Next UD-IQ4_XS + MTP at
+        // 32 GB: 994 slots, 2208 MiB after every 2k prompt). k15gn_g4: the 2k prompt loss of lending went from -5.3% to -2.0%, but the
+        // next short prompt reads the experts back: chat TTFT 320 -> 342 ms (refilled: 318). Residency only, the outputs do not change
         if (devices[g.id].lend_saving && !lend_save_refill) {
             for (int32_t il : g.layers) {
                 if ((size_t) il < refill.size()) {
