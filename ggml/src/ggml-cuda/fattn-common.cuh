@@ -726,6 +726,15 @@ static __global__ void flash_attn_mask_to_KV_max(
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
+bool ggml_cuda_qsa_maskless_gather_ok(const ggml_cuda_qsa_maskless & qsa);
+// GGML_CUDA_QSA_MASKLESS: 0 builds the dense mask in the graph (kill switch), 1 (default) gathers from the selection,
+// 2 skips the graph's mask nodes but always rebuilds the dense mask (tests the fallback)
+int  ggml_cuda_qsa_maskless_mode();
+void ggml_cuda_qsa_maskless_compact(
+        const ggml_cuda_qsa_maskless & qsa, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max,
+        cudaStream_t stream);
+void ggml_cuda_qsa_maskless_materialize(const ggml_cuda_qsa_maskless & qsa, half * mask, cudaStream_t stream);
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -1016,6 +1025,28 @@ void launch_fattn(
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
+
+    // k15-mm2 QSA maskless: the graph did not build this node's dense selection mask. A gather takes its lists from the selected
+    // cells and reads the causal mask, which equals the dense one at every listed cell; any other kernel gets the dense mask now
+    const ggml_cuda_qsa_maskless * qsa = nullptr;
+    if (!ctx.qsa_maskless.empty()) {
+        const auto it = ctx.qsa_maskless.find(dst);
+        if (it != ctx.qsa_maskless.end()) {
+            qsa = &it->second;
+        }
+    }
+    const bool qsa_gather = qsa && use_sparse && ggml_cuda_qsa_maskless_gather_ok(*qsa) && ggml_cuda_qsa_maskless_mode() == 1;
+    // the mask node's buffer may hold the selection or the causal mask (the allocator reused it), then a pool copy takes the mask;
+    // allocated before the kernel's pool buffers, freed after them
+    ggml_cuda_pool_alloc<half> qsa_mask(pool);
+    const char * mask_data = mask ? (const char *) mask->data : nullptr;
+    if (qsa_gather) {
+        mask_data = (const char *) qsa->kq->data;
+    } else if (qsa) {
+        half * m = qsa->alias ? qsa_mask.alloc(ggml_nelements(mask)) : (half *) mask->data;
+        ggml_cuda_qsa_maskless_materialize(*qsa, m, main_stream);
+        mask_data = (const char *) m;
+    }
     const int id  = ggml_cuda_get_device();
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
@@ -1117,7 +1148,13 @@ void launch_fattn(
         const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
 
         KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        if (qsa_gather) {
+            ggml_cuda_qsa_maskless_compact(*qsa, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        } else {
+            ggml_tensor mask_m = *mask; // the QSA maskless rebuild may live in a pool copy
+            mask_m.data = (void *) mask_data;
+            ggml_cuda_flash_attn_ext_compact_mask(&mask_m, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        }
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
@@ -1137,7 +1174,7 @@ void launch_fattn(
         KV_max.alloc(ne_KV_max);
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
-            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+            (const half2 *) mask_data, KV_max.ptr, iter_k, s31, s33);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -1298,7 +1335,7 @@ void launch_fattn(
         (const char *) Q->data,
         K_data,
         V_data,
-        mask ? ((const char *) mask->data) : nullptr,
+        mask_data,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,

@@ -1657,6 +1657,14 @@ struct ggml_cuda_src1_memo {
     }
 };
 
+// k15-mm2: a QSA flash attention node whose dense selection mask is not built: the selected cells per token (I32 [n_sel, n_tokens],
+// dead slots >= n_kv) and the causal mask the dense one adds them to
+struct ggml_cuda_qsa_maskless {
+    const ggml_tensor * idx;
+    const ggml_tensor * kq;
+    bool alias; // the mask node's buffer overlaps idx or kq
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1674,6 +1682,9 @@ struct ggml_backend_cuda_context {
     ggml_cuda_q8_1_cache q8_1_cache;
     // k15-mm: products of this graph evaluation already computed by an earlier multi-matrix mul_mat_vec_q launch (ggml_cuda_try_fuse_mmvq_multi)
     std::unordered_set<const ggml_tensor *> mmvq_done_early;
+    // k15-mm2: QSA maskless (ggml_cuda_qsa_maskless_plan): flash attention node -> its selection, and the dense mask nodes not run
+    std::unordered_map<const ggml_tensor *, ggml_cuda_qsa_maskless> qsa_maskless;
+    std::unordered_set<const ggml_tensor *> qsa_skip;
     ggml_cuda_src1_memo  src1_memo;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};

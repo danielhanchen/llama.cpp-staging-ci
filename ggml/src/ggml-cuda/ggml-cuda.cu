@@ -4752,6 +4752,145 @@ static bool ggml_cuda_mmvq_multi_overlap(const ggml_tensor * a, const ggml_tenso
 
 // node i and the products after it that share its activation: one launch. Returns -1 if not taken, else the number of nodes right
 // after i that the launch covered (the others are in mmvq_done_early).
+// k15-mm2 QSA maskless. qwen4exp builds a dense selection mask per QSA layer (llama_model_qwen4exp::graph::build_qsa_sel):
+//   sel = add(view(set_rows(repeat(fill(-inf)), repeat(fill(0)), idx)), kq_mask)
+// and the sparse flash attention gather compacts its finite entries into index lists. The lists are the selected cells
+// (idx < n_kv, dead slots point at dump rows >= n_kv) where kq_mask is finite, so launch_fattn builds them from idx and kq_mask
+// directly and the mask nodes are not run; a kernel that does not gather rebuilds the dense mask in one launch instead
+static int32_t ggml_cuda_graph_use_count(const ggml_cgraph * cgraph, const ggml_tensor * t) {
+    const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+    if (pos == GGML_HASHSET_FULL || !ggml_bitset_get(cgraph->visited_hash_set.used, pos) ||
+        cgraph->visited_hash_set.keys[pos] != t) {
+        return -1;
+    }
+    return cgraph->use_counts[pos];
+}
+
+static bool ggml_cuda_qsa_private(const ggml_cgraph * cgraph, const ggml_tensor * t) {
+    return t != nullptr && (t->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && ggml_cuda_graph_use_count(cgraph, t) == 1;
+}
+
+// t is (reshapes of) repeat(fill(c)), F16, every node used once: collect the nodes
+static bool ggml_cuda_qsa_fill_chain(const ggml_cgraph * cgraph, const ggml_tensor * t, const bool neg_inf,
+        std::vector<const ggml_tensor *> & nodes) {
+    while (t != nullptr && t->op == GGML_OP_RESHAPE) {
+        if (!ggml_cuda_qsa_private(cgraph, t)) {
+            return false;
+        }
+        nodes.push_back(t);
+        t = t->src[0];
+    }
+    if (t == nullptr || t->op != GGML_OP_REPEAT || t->type != GGML_TYPE_F16 || !ggml_cuda_qsa_private(cgraph, t)) {
+        return false;
+    }
+    nodes.push_back(t);
+    const ggml_tensor * f = t->src[0];
+    if (f == nullptr || f->op != GGML_OP_FILL || f->type != GGML_TYPE_F16 || !ggml_cuda_qsa_private(cgraph, f)) {
+        return false;
+    }
+    const float c = ggml_get_op_params_f32(f, 0);
+    if (neg_inf ? !(std::isinf(c) && c < 0.0f) : c != 0.0f) {
+        return false;
+    }
+    nodes.push_back(f);
+    return true;
+}
+
+#define GGML_CUDA_QSA_MASKLESS_MAX_TOKENS 16
+
+static void ggml_cuda_qsa_maskless_plan(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph) {
+    cuda_ctx->qsa_maskless.clear();
+    cuda_ctx->qsa_skip.clear();
+    if (ggml_cuda_qsa_maskless_mode() == 0) {
+        return;
+    }
+    std::vector<const ggml_tensor *> nodes;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * fa = cgraph->nodes[i];
+        if (fa->op != GGML_OP_FLASH_ATTN_EXT || (fa->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) || ggml_get_op_params_i32(fa, 4) <= 0) {
+            continue;
+        }
+        const ggml_tensor * add = fa->src[3];
+        if (add == nullptr || add->op != GGML_OP_ADD || add->type != GGML_TYPE_F16 || !ggml_cuda_qsa_private(cgraph, add)) {
+            continue;
+        }
+        const ggml_tensor * view = add->src[0];
+        const ggml_tensor * kq   = add->src[1];
+        if (view == nullptr || kq == nullptr || view->op != GGML_OP_VIEW || kq->type != GGML_TYPE_F16 ||
+            !ggml_cuda_qsa_private(cgraph, view) || !ggml_is_contiguous(add) || kq->ne[2] != 1 || kq->nb[0] != sizeof(half)) {
+            continue;
+        }
+        bool same = true;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            same = same && view->ne[d] == kq->ne[d] && add->ne[d] == kq->ne[d] && add->nb[d] == kq->nb[d];
+        }
+        const ggml_tensor * sr = view->src[0];
+        if (!same || sr == nullptr || sr->op != GGML_OP_SET_ROWS || sr->type != GGML_TYPE_F16 || view->view_offs != sr->view_offs ||
+            !ggml_cuda_qsa_private(cgraph, sr)) {
+            continue;
+        }
+        // set_rows dst [1, n_kv + n_sel, n_tokens]: the plane of token t = q + ne1*seq is mask row (q, seq)
+        const int64_t n_kv   = kq->ne[0];
+        const int64_t n_tok  = kq->ne[1]*kq->ne[3];
+        // decode and verify windows: a dense kernel's pool copy of the mask stays small, and no mask scan (one stream)
+        if (n_tok > GGML_CUDA_QSA_MASKLESS_MAX_TOKENS || kq->ne[3] != 1) {
+            continue;
+        }
+        const ggml_tensor * idx = sr->src[1]; // set_rows: src[0] rows, src[1] indices, src[2] dst
+        if (sr->ne[0] != 1 || sr->ne[1] < n_kv || sr->ne[2] != n_tok || sr->ne[3] != 1 || !ggml_is_contiguous(sr) ||
+            view->nb[1] != sr->nb[2] || view->nb[3] != sr->nb[2]*kq->ne[1] ||
+            idx == nullptr || idx->type != GGML_TYPE_I32 || idx->nb[0] != sizeof(int32_t) || idx->ne[1] != n_tok || idx->ne[2] != 1 ||
+            idx->ne[3] != 1) {
+            continue;
+        }
+        nodes.clear();
+        if (!ggml_cuda_qsa_fill_chain(cgraph, sr->src[2], true, nodes) || !ggml_cuda_qsa_fill_chain(cgraph, sr->src[0], false, nodes)) {
+            continue;
+        }
+        const ggml_tensor * zeros = sr->src[0];
+        if (zeros->ne[0] != 1 || zeros->ne[1] != idx->ne[0] || zeros->ne[2] != n_tok) {
+            continue;
+        }
+        nodes.push_back(sr);
+        nodes.push_back(view);
+        nodes.push_back(add);
+        // idx is read after its last graph reader (set_rows) and kq maybe after its last one (the add): the nodes up to the
+        // attention, and its output for kq, must not have been given their memory
+        int i_sr = -1;
+        for (int j = i - 1; j >= 0 && i_sr < 0; --j) {
+            i_sr = cgraph->nodes[j] == sr ? j : -1;
+        }
+        if (i_sr < 0) {
+            continue;
+        }
+        const auto hits = [](const char * r0, const char * r1, const ggml_tensor * t) {
+            return r0 < (const char *) t->data + ggml_nbytes(t) && (const char *) t->data < r1;
+        };
+        const auto overlaps = [&](const ggml_tensor * a, const ggml_tensor * b) {
+            return hits((const char *) a->data, (const char *) a->data + ggml_nbytes(a), b);
+        };
+        bool clobbered = false;
+        for (int j = i_sr + 1; j < i && !clobbered; ++j) {
+            const ggml_tensor * t = cgraph->nodes[j];
+            if (ggml_cuda_is_view_or_noop(t) || std::find(nodes.begin(), nodes.end(), t) != nodes.end()) {
+                continue;
+            }
+            clobbered = overlaps(t, idx) || overlaps(t, kq);
+        }
+        // the attention writes its F16 K / V copies behind its output before the list build reads idx, and its output after;
+        // it reads kq throughout
+        const char * fa0 = (const char *) fa->data;
+        const char * fa1 = fa0 + ggml_cuda_flash_attn_ext_get_alloc_size(cuda_ctx->device, fa);
+        const char * fo1 = fa0 + ggml_nbytes(fa);
+        clobbered = clobbered || hits(fo1, fa1, idx) || hits(fa0, fa1, kq);
+        if (clobbered) {
+            continue;
+        }
+        cuda_ctx->qsa_maskless[fa] = { idx, kq, overlaps(add, idx) || overlaps(add, kq) };
+        cuda_ctx->qsa_skip.insert(nodes.begin(), nodes.end());
+    }
+}
+
 static int ggml_cuda_try_fuse_mmvq_multi(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     if (ggml_cuda_mmvq_multi_disabled() || ggml_cuda_fusion_disabled() || !cuda_ctx->stream_context().concurrent_events.empty() ||
             cuda_ctx->curr_stream_no != 0) {
@@ -6122,6 +6261,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             };
 
             cuda_ctx->mmvq_done_early.clear();
+            ggml_cuda_qsa_maskless_plan(cuda_ctx, cgraph);
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (!side_mv_pending.empty()) {
@@ -6190,6 +6330,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+
+                if (!cuda_ctx->qsa_skip.empty() && cuda_ctx->qsa_skip.count(node)) {
+                    // a QSA selection mask node, its flash attention reads the selection instead (ggml_cuda_qsa_maskless_plan)
+                    ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 1);
                     continue;
                 }
 
