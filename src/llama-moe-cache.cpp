@@ -3180,6 +3180,7 @@ struct llama_moe_cache::impl {
     uint64_t ua_restored = 0;
     std::vector<uint8_t> ua_prot;
     int ua_protect = 4;
+    bool ua_share = false;
     std::vector<uint8_t> ua_busy;
     std::vector<std::pair<int64_t, int32_t>> ua_cand;
     int  ua_victims = 2;
@@ -3211,7 +3212,8 @@ struct llama_moe_cache::impl {
         const char * env_p = getenv("LLAMA_MOE_UPLOAD_AHEAD_PROTECT");
         ua_protect = env_p != nullptr ? std::max(0, atoi(env_p)) : 4;
         const char * env_r = getenv("LLAMA_MOE_UPLOAD_AHEAD_RESTORE");
-        ua_restore_on = env_r == nullptr || atoi(env_r) != 0;
+        ua_restore_on = env_r != nullptr && atoi(env_r) != 0;
+        ua_share = getenv("LLAMA_MOE_UPLOAD_AHEAD_SHARE") != nullptr && atoi(getenv("LLAMA_MOE_UPLOAD_AHEAD_SHARE")) != 0;
         ua_verify  = getenv("LLAMA_MOE_UPLOAD_AHEAD_VERIFY") != nullptr && atoi(getenv("LLAMA_MOE_UPLOAD_AHEAD_VERIFY")) != 0;
         ua_gating = (int) model.hparams.expert_gating_func;
         ua_router.assign(layers.size(), nullptr);
@@ -3916,10 +3918,22 @@ struct llama_moe_cache::impl {
         std::vector<int32_t> & want = ua_want;
         want.clear();
         for (int32_t e = 0; e < n_expert; ++e) {
-            if (ua_cnt[e] > 0 && slots[e] < 0) {
+            if (ua_cnt[e] > 0) {
                 want.push_back(e);
             }
         }
+        // LLAMA_MOE_UPLOAD_AHEAD_SHARE=1: only within the seed's share of the layer (the most predicted n_full, as the seed admits the
+        // most routed n_full), so the cache ends the ubatch as the seed would leave it
+        if (ua_share && !g.layers.empty()) {
+            const size_t n_full = (size_t) std::max<int32_t>(1, g.n_slots / (int32_t) g.layers.size());
+            std::sort(want.begin(), want.end(), [&](int32_t a, int32_t c) {
+                return ua_cnt[a] != ua_cnt[c] ? ua_cnt[a] > ua_cnt[c] : ua_w[a] != ua_w[c] ? ua_w[a] > ua_w[c] : a < c;
+            });
+            if (want.size() > n_full) {
+                want.resize(n_full);
+            }
+        }
+        want.erase(std::remove_if(want.begin(), want.end(), [&](int32_t e) { return slots[e] >= 0; }), want.end());
         std::sort(want.begin(), want.end(), [&](int32_t a, int32_t c) {
             return ua_cnt[a] != ua_cnt[c] ? ua_cnt[a] > ua_cnt[c] : ua_w[a] != ua_w[c] ? ua_w[a] > ua_w[c] : a < c;
         });
@@ -3967,6 +3981,9 @@ struct llama_moe_cache::impl {
                 cls = 3;
             } else {
                 continue;
+            }
+            if (ua_victims == 3 && cls > 0) {
+                cls = 1; // one class: the policy's order over every allowed slot
             }
             cand.push_back({ (cls << 58) + (v << 24) + pos, s });
         }
