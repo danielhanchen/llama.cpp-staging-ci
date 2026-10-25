@@ -572,7 +572,8 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
-    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
+    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false,
+        WARP_SIZE, false, nullptr, 1, 1, /*vec_kv_cap=*/true);
 }
 
 template <int D, ggml_type type_K, ggml_type type_V>
@@ -607,10 +608,10 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
                 fattn_kernel_t kernel_head = flash_attn_ext_vec<D, 1, type_K, type_V, false, 1>;
                 if (gqa_mode == 2) {
                     fattn_kernel_t kernel_gqa = flash_attn_ext_vec<D, 4, type_K, type_V, false, 4>;
-                    launch_fattn<D, 1, 4>(ctx, dst, kernel_gqa, nwarps, 0, D, true, true, false, false, WARP_SIZE, false, kernel_head, 1);
+                    launch_fattn<D, 1, 4>(ctx, dst, kernel_gqa, nwarps, 0, D, true, true, false, false, WARP_SIZE, false, kernel_head, 1, 1, true);
                 } else {
                     fattn_kernel_t kernel_grp = flash_attn_ext_vec<D, 1, type_K, type_V, false, 1, 4>;
-                    launch_fattn<D, 1, 4>(ctx, dst, kernel_grp, nwarps, 0, D, true, true, false, false, WARP_SIZE, false, kernel_head, 1, 4);
+                    launch_fattn<D, 1, 4>(ctx, dst, kernel_grp, nwarps, 0, D, true, true, false, false, WARP_SIZE, false, kernel_head, 1, 4, true);
                 }
                 return;
             }
