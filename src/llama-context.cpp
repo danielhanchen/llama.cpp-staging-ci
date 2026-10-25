@@ -8518,7 +8518,9 @@ size_t llama_context::cap_planned_bytes(ggml_backend_buffer_type_t * buft_out) c
     // a recurrent memory the server captures (llama_state_capture_supported, LLAMA_LM_CKPT_CAPTURE): one snapshot of a sequence's
     // recurrent rows per capture. The condition leaves out what fit varies between its measurements (the MoE cache size, n_ubatch), so
     // every measurement of one placement counts the same bytes: the n_ubatch rule compares two of them (common_fit_moe_cache)
-    static const bool fit_env = getenv("LLAMA_FIT_CAPTURE") == nullptr || atoi(getenv("LLAMA_FIT_CAPTURE")) != 0;
+    // LLAMA_FIT_CAPTURE: off by default for now (=1 counts them; pending a decision: +124.5 MiB headroom at q4x 12 GB for 1-8% default
+    // decode). Off, the snapshots are allocated at the first capture, uncounted, as in k15-pp2
+    static const bool fit_env = getenv("LLAMA_FIT_CAPTURE") != nullptr && atoi(getenv("LLAMA_FIT_CAPTURE")) != 0;
     static const bool srv_env = getenv("LLAMA_LM_CKPT_CAPTURE") == nullptr || atoi(getenv("LLAMA_LM_CKPT_CAPTURE")) != 0;
     static const bool lm_env  = getenv("LLAMA_MOE_LAYER_MAJOR") == nullptr || strcmp(getenv("LLAMA_MOE_LAYER_MAJOR"), "auto") == 0 ||
         atoi(getenv("LLAMA_MOE_LAYER_MAJOR")) != 0;
