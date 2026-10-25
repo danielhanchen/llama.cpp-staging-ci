@@ -4499,7 +4499,11 @@ private:
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     // k11: under layer-major prompts the batch goes on past the far checkpoint, its ubatches end there
                                     // (only when the rest up to the near checkpoint fits this batch: else the batches, so the ubatches, would differ)
-                                    if (k == 0 && offset != 4 && batch.size() + (n_last - 4) <= n_batch && lm_ckpt_merge_ok(slot, n_tokens_prev, lm)) {
+                                    // k15-pp (LLAMA_LM_CKPT_MERGE_SPAN=0 off): only where the group spans the break; elsewhere the separate
+                                    // calls seed the cache between them and the merge only lost that (q4x 12 GB 640-token prompt: +14% uploads)
+                                    static const bool lm_span_env = getenv("LLAMA_LM_CKPT_MERGE_SPAN") == nullptr || atoi(getenv("LLAMA_LM_CKPT_MERGE_SPAN")) != 0;
+                                    if (k == 0 && offset != 4 && batch.size() + (n_last - 4) <= n_batch && lm_ckpt_merge_ok(slot, n_tokens_prev, lm) &&
+                                            (!lm_span_env || llama_layer_major_spans(ctx_tgt, (int32_t) batch.size(), n_last - 4))) {
                                         lm_breaks.push_back(batch.size());
                                         if (lm_cap_slot < 0 && do_checkpoint) {
                                             lm_cap_slot     = slot.id;

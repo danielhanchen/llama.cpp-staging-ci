@@ -339,6 +339,7 @@ public:
     bool state_capture_supported() const;
     bool state_captured(llama_seq_id seq_id, llama_pos * pos_max) const;
     bool layer_major_on() const;
+    bool layer_major_spans(int64_t n_before, int64_t n_after) const;
 
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
 
