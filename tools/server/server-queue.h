@@ -117,7 +117,7 @@ public:
 
     // k15-ttft: work for an idle server (the MoE cache's re-calibration, the prompt plan restore) that a request arriving right after
     // the slots go idle should not wait for: request_idle_work() from update_slots(); start_loop() runs the callback once no task has
-    // arrived for idle_work_delay_ms (LLAMA_SERVER_IDLE_WORK_DELAY_MS, default 200; 0 = at once, as before), and a task that arrives
+    // arrived for idle_work_delay_ms (LLAMA_SERVER_IDLE_WORK_DELAY_MS, opt-in; default 0 = at once, as before), and a task that arrives
     // first is processed first (the work stays pending until the next idle period). Main thread only.
     void on_idle_work(std::function<void(void)> callback) {
         callback_idle_work = std::move(callback);

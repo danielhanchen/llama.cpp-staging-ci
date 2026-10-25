@@ -287,7 +287,9 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
     worker.thread = std::thread([this]() { worker_loop(); });
 
     constexpr auto max_wait_time = std::chrono::seconds(1);
-    static const int64_t idle_work_delay_ms = getenv("LLAMA_SERVER_IDLE_WORK_DELAY_MS") ? std::max(0, atoi(getenv("LLAMA_SERVER_IDLE_WORK_DELAY_MS"))) : 200;
+    // opt-in (default 0 = the idle work runs at once, as before): on G4 q4x 12 GB the 2k prompt was 10% slower with 200 (4684 vs 5222
+    // tok/s, 3 launches; not explained yet) and the bench cells showed no TTFT gain
+    static const int64_t idle_work_delay_ms = getenv("LLAMA_SERVER_IDLE_WORK_DELAY_MS") ? std::max(0, atoi(getenv("LLAMA_SERVER_IDLE_WORK_DELAY_MS"))) : 0;
     auto should_sleep = [&]() -> bool {
         // caller must hold mutex_tasks
         if (idle_sleep_ms < 0) {
