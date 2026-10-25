@@ -3172,6 +3172,7 @@ struct llama_moe_cache::impl {
     int  ua_victims = 2;
     bool ua_verify  = false;
     uint64_t ua_verified = 0, ua_bad = 0;
+    size_t   ua_up_last = 0;
     bool ua_off = false; // an upload could not be issued: no more uploads ahead (the admitted ones are dropped by the drain)
     struct ua_stats_t {
         uint64_t layers = 0, admitted = 0, hit = 0, waste = 0, lost = 0, miss_rest = 0, bytes = 0, waste_bytes = 0, fallback = 0;
@@ -3180,6 +3181,8 @@ struct llama_moe_cache::impl {
     void init_upload_ahead(const llama_model & model) {
         const char * env = getenv("LLAMA_MOE_UPLOAD_AHEAD");
         ua_mode = env != nullptr ? atoi(env) : 1;
+        const char * env_l0 = getenv("LLAMA_MOE_UPLOAD_AHEAD_LOG");
+        ua_log = env_l0 != nullptr ? atoi(env_l0) : 0;
         if (ua_mode <= 0 || groups.empty()) {
             ua_mode = 0;
             return;
@@ -3436,6 +3439,10 @@ struct llama_moe_cache::impl {
     // before a graph: the uploads ahead are complete on the compute stream, the admissions not resolved by a routing are dropped
     void ua_drain() {
         if (ua_mode <= 0) {
+            if (ua_log > 1 && stats_upload.bytes != ua_up_last) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead off; copies uploaded %.1f MiB\n", tag, (stats_upload.bytes - ua_up_last)/1048576.0);
+            }
+            ua_up_last = stats_upload.bytes;
             return;
         }
         for (size_t id = 0; id < ua_devs.size(); ++id) {
@@ -3488,11 +3495,13 @@ struct llama_moe_cache::impl {
         if (ua_verify && ua_verified > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead verified: %" PRIu64 " expert tensors, %" PRIu64 " mismatches\n", tag, ua_verified, ua_bad);
         }
-        if (ua_log > 0 && ua_st_ub.layers > 0) {
+        if (ua_log > 0 && (ua_st_ub.layers > 0 || (ua_log > 1 && stats_upload.bytes != ua_up_last))) {
             LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead: %" PRIu64 " layers, %" PRIu64 " admitted, %" PRIu64 " right, %" PRIu64 " wrong, %" PRIu64
-                " hits lost, %" PRIu64 " misses left, %.1f MiB ahead, %.1f MiB wasted, %" PRIu64 " fallbacks\n", tag, ua_st_ub.layers, ua_st_ub.admitted,
-                ua_st_ub.hit, ua_st_ub.waste, ua_st_ub.lost, ua_st_ub.miss_rest, ua_st_ub.bytes/1048576.0, ua_st_ub.waste_bytes/1048576.0, ua_st_ub.fallback);
+                " hits lost, %" PRIu64 " misses left, %.1f MiB ahead, %.1f MiB wasted, %" PRIu64 " fallbacks; copies uploaded %.1f MiB\n", tag, ua_st_ub.layers, ua_st_ub.admitted,
+                ua_st_ub.hit, ua_st_ub.waste, ua_st_ub.lost, ua_st_ub.miss_rest, ua_st_ub.bytes/1048576.0, ua_st_ub.waste_bytes/1048576.0, ua_st_ub.fallback,
+                (stats_upload.bytes - ua_up_last)/1048576.0);
         }
+        ua_up_last = stats_upload.bytes;
         ua_st.layers += ua_st_ub.layers; ua_st.admitted += ua_st_ub.admitted; ua_st.hit += ua_st_ub.hit; ua_st.waste += ua_st_ub.waste;
         ua_st.lost += ua_st_ub.lost; ua_st.miss_rest += ua_st_ub.miss_rest; ua_st.bytes += ua_st_ub.bytes; ua_st.waste_bytes += ua_st_ub.waste_bytes;
         ua_st.fallback += ua_st_ub.fallback;
