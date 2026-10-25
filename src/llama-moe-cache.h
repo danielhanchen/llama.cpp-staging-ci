@@ -41,6 +41,9 @@ public:
     // (LLAMA_MOE_CACHE_MTP_MIB=N sets the MTP share); the same for both contexts, so --fit measures the same caches the contexts create
     static size_t budget(const llama_model & model, size_t size, layer_set set);
 
+    // k15-pp3: host bytes of the experts a cache of the trunk layers could hold (0: every expert is on a device)
+    static size_t host_bytes(const llama_model & model);
+
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     // size is already the share of the layer set (see budget)
     // ws: the weight store that reads the misses of host lookups from the model files (see set_weight_store), nullptr if none

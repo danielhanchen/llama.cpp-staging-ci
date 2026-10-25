@@ -6603,6 +6603,10 @@ size_t llama_moe_cache::budget(const llama_model & model, size_t size, layer_set
     return set == layer_set::nextn ? mtp : size - mtp;
 }
 
+size_t llama_moe_cache::host_bytes(const llama_model & model) {
+    return llama_moe_cache_set_bytes(model, layer_set::trunk);
+}
+
 llama_moe_cache::~llama_moe_cache() = default;
 
 ggml_backend_t llama_moe_cache::backend(int32_t il) const {

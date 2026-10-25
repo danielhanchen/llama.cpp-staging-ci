@@ -7672,6 +7672,15 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
+    // k15-pp3 (LLAMA_FIT_CAPTURE=0 off): the state capture snapshots, allocated at the first capture (cap_prepare), after fit placed
+    // the model: planned in a context that only measures memory, the allocated ones otherwise
+    {
+        ggml_backend_buffer_type_t cb = nullptr;
+        const size_t cbytes = cap_reserve_bytes(&cb);
+        if (cb != nullptr && cbytes > 0) {
+            ret[cb].context += cbytes;
+        }
+    }
     if (model.hparams.no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
@@ -8353,6 +8362,60 @@ void llama_context::cap_record(int s, ggml_backend_t be) {
         ggml_backend_event_record(C.ev, be);
         C.ev_set = true;
     }
+}
+
+size_t llama_context::cap_reserve_bytes(ggml_backend_buffer_type_t * buft_out) const {
+    *buft_out = nullptr;
+    if (!model.hparams.no_alloc) {
+        size_t n = 0;
+        for (const auto & c : cap) {
+            if (c.buf) {
+                *buft_out = ggml_backend_buffer_get_type(c.buf.get());
+                n += ggml_backend_buffer_get_size(c.buf.get());
+            }
+        }
+        return n;
+    }
+    // planned: captures happen where prompts run layer-major (a target with a draft whose experts spill to the host, see lm_enabled) on
+    // a recurrent memory the server captures (llama_state_capture_supported, LLAMA_LM_CKPT_CAPTURE): one snapshot of a sequence's
+    // recurrent rows per capture. The condition leaves out what fit varies between its measurements (the MoE cache size, n_ubatch), so
+    // every measurement of one placement counts the same bytes: the n_ubatch rule compares two of them (common_fit_moe_cache)
+    static const bool fit_env = getenv("LLAMA_FIT_CAPTURE") == nullptr || atoi(getenv("LLAMA_FIT_CAPTURE")) != 0;
+    static const bool srv_env = getenv("LLAMA_LM_CKPT_CAPTURE") == nullptr || atoi(getenv("LLAMA_LM_CKPT_CAPTURE")) != 0;
+    static const bool lm_env  = getenv("LLAMA_MOE_LAYER_MAJOR") == nullptr || strcmp(getenv("LLAMA_MOE_LAYER_MAJOR"), "auto") == 0 ||
+        atoi(getenv("LLAMA_MOE_LAYER_MAJOR")) != 0;
+    static const int  n_cap   = getenv("LLAMA_STATE_CAPTURE_MAX") ? std::max(1, std::min(cap_max, atoi(getenv("LLAMA_STATE_CAPTURE_MAX")))) : cap_max;
+    if (!fit_env || !srv_env || !lm_env || !cparams.spec_draft || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
+            llama_moe_cache::host_bytes(model) == 0 || !state_capture_supported()) {
+        return 0;
+    }
+    auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    auto * rec = hyb ? hyb->get_mem_recr() : dynamic_cast<llama_memory_recurrent *>(memory.get());
+    if (rec == nullptr) {
+        return 0;
+    }
+    const auto & hp = model.hparams;
+    ggml_backend_buffer_type_t buft = nullptr;
+    size_t total = 0;
+    auto add = [&](const ggml_tensor * t, size_t row_bytes) {
+        if (t == nullptr || row_bytes == 0 || t->buffer == nullptr) {
+            return;
+        }
+        if (buft == nullptr) {
+            buft = ggml_backend_buffer_get_type(t->buffer);
+        }
+        total += GGML_PAD(row_bytes, 256);
+    };
+    for (uint32_t il = 0; il < hp.n_layer(); ++il) {
+        if (il < rec->r_l.size() && rec->r_l[il]) { add(rec->r_l[il], ggml_row_size(rec->r_l[il]->type, hp.n_embd_r())); }
+        if (il < rec->p_l.size() && rec->p_l[il]) { add(rec->p_l[il], ggml_row_size(rec->p_l[il]->type, hp.ple_conv_state())); }
+        if (il < rec->s_l.size() && rec->s_l[il]) { add(rec->s_l[il], ggml_row_size(rec->s_l[il]->type, hp.n_embd_s())); }
+    }
+    if (buft == nullptr || total == 0) {
+        return 0;
+    }
+    *buft_out = buft;
+    return (size_t) n_cap*(total + 4096);
 }
 
 bool llama_context::cap_prepare(int s) {
