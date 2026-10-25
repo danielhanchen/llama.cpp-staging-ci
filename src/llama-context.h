@@ -685,6 +685,7 @@ private:
     int      cap_sel = -1;                     // the capture a LLAMA_STATE_SEQ_FLAGS_CAPTURED read takes (llama_state_seq_captured_at)
     bool cap_prepare(int s);                   // the regions of the sequence's cell and their snapshot tensors; false: unsupported
     size_t cap_reserve_bytes(ggml_backend_buffer_type_t * buft) const; // k15-pp3: the snapshots fit counts (memory_breakdown)
+    size_t cap_planned_bytes(ggml_backend_buffer_type_t * buft) const; // k15-pp3: the snapshots captures will allocate (0: none planned)
     void cap_now(int s, llama_pos pos);        // copy the regions in stream order (state before the next ubatch)
     bool cap_any() const { for (const auto & c : cap) { if (c.idx >= 0 && !c.done) { return true; } } return false; }
     // k15-pp2 (LLAMA_STATE_CAPTURE_SIDE=0 off): the read of a captured state's snapshots runs on a stream of its own, after an event
