@@ -41,6 +41,12 @@ public:
     // (LLAMA_MOE_CACHE_MTP_MIB=N sets the MTP share); the same for both contexts, so --fit measures the same caches the contexts create
     static size_t budget(const llama_model & model, size_t size, layer_set set);
 
+    // k15-pp3: host bytes of the experts a cache of the trunk layers could hold (0: every expert is on a device)
+    static size_t host_bytes(const llama_model & model);
+
+    // the share of the host experts below which a mailbox cache skips its timing trials (LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE, 0.50)
+    static double trial_frac_single();
+
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     // size is already the share of the layer set (see budget)
     // ws: the weight store that reads the misses of host lookups from the model files (see set_weight_store), nullptr if none
@@ -90,6 +96,8 @@ public:
     // k13: CPU misses: small batches (up to 8 tokens) take the host path without trials or miss-rate windows, but still fetch their
     // share and admit (the cache follows the decode; not exact under drafts); true if pinned
     bool pin_small();
+    // k15-lfm2: see llama_moe_cpu_miss_drop_slow
+    bool cpu_miss_drop_slow();
     // k13: who computes the missing experts of small batches: 0 = never the host (every miss fetched), 1 = the hybrid path with a fixed
     // share (the default gate of small caches, or LLAMA_MOE_CACHE_FETCH), 2 = the CPU-miss rule
     int host_mode() const;
@@ -98,6 +106,10 @@ public:
     // the ubatch of n_tokens is looked up on the device like a small batch: at most n_small_max tokens, or a short prompt whose missing
     // experts the host computes (the large batch path, its copies and its seed do not apply)
     bool small_batch(int64_t n_tokens) const;
+    // k15-pp2: while set, every ubatch is treated as a large one (no device lookup, slot map, host path or CPU misses): its MUL_MAT_ID
+    // read the layer's host experts as the large ubatches do (the last ubatch of a prompt as a member of a layer-major group)
+    void set_force_large(bool on);
+    bool force_large() const;
 
     // true if the graphs of small batches may use the hybrid path
     bool hybrid_active() const;

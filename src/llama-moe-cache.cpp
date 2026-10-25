@@ -435,6 +435,7 @@ static size_t llama_moe_cache_set_bytes(const llama_model & model, llama_moe_cac
 }
 
 struct llama_moe_cache::impl {
+    bool force_large = false; // k15-pp2: see llama_moe_cache::set_force_large
     llama_weight_store * wstore = nullptr;
     // k11: the graph allocation of the graph allocated next may be lent too (a merged layer-major group, see llama_moe_cache::set_graph_lend)
     bool graph_lend_scope = false;
@@ -3588,8 +3589,32 @@ struct llama_moe_cache::impl {
     }
 
     bool use_device(const group & g, int64_t n_tokens) const {
-        return g.dev_lookup && g.n_slots > 0 && n_tokens > 0 && (n_tokens <= max_batch || cm_serves(n_tokens)) &&
+        return !force_large && g.dev_lookup && g.n_slots > 0 && n_tokens > 0 && (n_tokens <= max_batch || cm_serves(n_tokens)) &&
             std::min<int64_t>(n_tokens*n_expert_used, g.ref[0]->ne[2]) <= g.n_slots;
+    }
+
+    // k15-lfm2: llama_moe_cpu_miss_drop_slow. Once calibrated: where the cache holds at least LLAMA_MOE_CPU_MISS_DROP_FRAC (0.75) of the
+    // host experts' bytes, the host has at most LLAMA_MOE_CPU_MISS_DROP_THREADS (4) small-batch threads and its time per expert is at
+    // least LLAMA_MOE_CPU_MISS_DROP_RATIO (0.5) of an upload, the rule is turned off as a failed calibration does (the misses are
+    // fetched). Kaggle T4x2 LFM2.5 16 GB (2 threads, host 640-660 us per expert, upload 520-940 us, 86% cached): the rule itself
+    // computed nothing on the host there, while the pinned small-batch host path of the default drafts (spill mode 3) cost 2.5 ms
+    // per token (62 vs 72 tok/s). LLAMA_MOE_CPU_MISS_DROP=0: never
+    bool cm_drop_slow() {
+        static const bool   on      = [] { const char * e = getenv("LLAMA_MOE_CPU_MISS_DROP"); return e == nullptr || atoi(e) != 0; }();
+        static const double frac    = [] { const char * e = getenv("LLAMA_MOE_CPU_MISS_DROP_FRAC"); return e != nullptr ? atof(e) : 0.75; }();
+        static const double ratio   = [] { const char * e = getenv("LLAMA_MOE_CPU_MISS_DROP_RATIO"); return e != nullptr ? atof(e) : 0.5; }();
+        static const int    threads = [] { const char * e = getenv("LLAMA_MOE_CPU_MISS_DROP_THREADS"); return e != nullptr ? atoi(e) : 4; }();
+        if (!on || !cm || !cm_cal || cm_force || cm_frozen || cache_frac < frac || single_threads <= 0 || single_threads > threads ||
+                cm_t1 < ratio*cm_tup) {
+            return false;
+        }
+        cm     = false;
+        hybrid = false;
+        cm_gen++;
+        LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses off: %.1f%% of the host experts cached, %d host threads, host %.1f us per expert vs "
+            "upload %.1f us: the missing experts are fetched (LLAMA_MOE_CPU_MISS_DROP=0: keep the rule)\n", tag, 100.0*cache_frac,
+            single_threads, cm_t1, cm_tup);
+        return true;
     }
 
     // k13: see cm_frozen; only once calibrated (the warm-up decode calibrates), returns false otherwise or without CPU misses
@@ -3640,10 +3665,7 @@ struct llama_moe_cache::impl {
             const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC");
             return e != nullptr ? std::max(0.0, atof(e)) : -1.0;
         }();
-        static const double trial_frac_single = [] {
-            const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE");
-            return e != nullptr ? std::max(0.0, atof(e)) : 0.50;
-        }();
+        const double trial_frac_single = llama_moe_cache::trial_frac_single();
         if (late && (cm_trials_late_done || !cm || !cm_cal || trial_frac_env >= 0.0 || cmt_n > 0 || cm_trials_skipped)) {
             return false;
         }
@@ -3692,7 +3714,7 @@ struct llama_moe_cache::impl {
     }
 
     bool cm_serves(int64_t n_tokens) const {
-        return cm && cm_cal && !cm_prompt_off() && n_tokens > max_batch && n_tokens <= cm_max && (n_tokens <= cm_prompt_force || (cm_on[n_tokens] != 0 && cm_prompt_ok()));
+        return !force_large && cm && cm_cal && !cm_prompt_off() && n_tokens > max_batch && n_tokens <= cm_max && (n_tokens <= cm_prompt_force || (cm_on[n_tokens] != 0 && cm_prompt_ok()));
     }
 
     // the host computes the misses of a batch of n_tokens: the fetch share, 1 = every missing expert is fetched
@@ -3752,7 +3774,7 @@ struct llama_moe_cache::impl {
 
     // the layer can use the hybrid lookup for a ubatch of this size
     bool hybrid_layer(int32_t il, int64_t n_ubatch) const {
-        if (!(hybrid || overlap_batch(n_ubatch)) || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+        if (force_large || !(hybrid || overlap_batch(n_ubatch)) || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return false;
         }
         // CPU misses off for this batch size: the graph of k9 (plain lookup, or the fetch overlap of single tokens)
@@ -4577,7 +4599,17 @@ struct llama_moe_cache::impl {
                 const double f    = cm_share[n];
                 const double m    = cm_rate*D;
                 const double gain = m*(cm_tup - std::max(f*cm_tup, (1.0 - f)*tc));
-                const double need = (n <= max_batch ? cm_margin*cm_split_scale*cm_split*(single_weigh() && single_usable(n) ? single_split_frac : 1.0) :
+                // k15-np (LLAMA_MOE_SINGLE_MIN_MISSES, default 0 = off): the mailbox's cheaper split (single_split_frac) only where a
+                // batch misses at least this many distinct experts per layer at the measured miss rate. Off by default: G4 k15g4n at 1.5
+                // still turned the host path on at q3m 12 GB and q4x 16 GB + MTP, whose first windows miss 7-12% (m(3) 1.8-2.8) before
+                // settling at 4-6%, against 13.5%+ (3.4) where the host path wins; the cache-share gate on the early note (llama-graph.cpp,
+                // LLAMA_MOE_SINGLE_NOTE_PLAIN_MAX_FRAC) separates those cells instead. Kept as an override
+                static const double mb_min_misses = [] {
+                    const char * e = getenv("LLAMA_MOE_SINGLE_MIN_MISSES");
+                    return e != nullptr ? std::max(0.0, atof(e)) : 0.0;
+                }();
+                const bool mb_cheap = n <= max_batch && single_weigh() && single_usable(n) && m >= mb_min_misses;
+                const double need = (n <= max_batch ? cm_margin*cm_split_scale*cm_split*(mb_cheap ? single_split_frac : 1.0) :
                                      cm_margin_p*(cm_split + n*cm_act))*
                                     (cm_on[n] && cm_measured ? cm_hyst : 1.0);
                 // a batch above max_batch runs the host path in the groups whose slots hold its experts (see use_device), the
@@ -5562,7 +5594,7 @@ struct llama_moe_cache::impl {
             return nullptr;
         }
         // with device lookups, ubatches that do not use the device use the host state (see prepare), a ubatch that uses the device keeps the state there
-        if (use_device(groups[layers[il].ig], n_ubatch)) {
+        if (force_large || use_device(groups[layers[il].ig], n_ubatch)) {
             return nullptr;
         }
         const layer & l = layers[il];
@@ -6627,6 +6659,18 @@ size_t llama_moe_cache::budget(const llama_model & model, size_t size, layer_set
     return set == layer_set::nextn ? mtp : size - mtp;
 }
 
+double llama_moe_cache::trial_frac_single() {
+    static const double v = [] {
+        const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE");
+        return e != nullptr ? std::max(0.0, atof(e)) : 0.50;
+    }();
+    return v;
+}
+
+size_t llama_moe_cache::host_bytes(const llama_model & model) {
+    return llama_moe_cache_set_bytes(model, layer_set::trunk);
+}
+
 llama_moe_cache::~llama_moe_cache() = default;
 
 ggml_backend_t llama_moe_cache::backend(int32_t il) const {
@@ -6658,10 +6702,13 @@ void llama_moe_cache::set_prompt_batch(bool prompt) {
 }
 
 bool llama_moe_cache::host_computes(int64_t n_tokens) const {
+    if (pimpl->force_large) {
+        return false;
+    }
     if (pimpl->cm) {
         return pimpl->cm_share_of(n_tokens) < 1.0f;
     }
-    return n_tokens <= n_small_max && pimpl->hybrid_active();
+    return !pimpl->force_large && n_tokens <= n_small_max && pimpl->hybrid_active();
 }
 
 bool llama_moe_cache::cpu_miss_enabled() const {
@@ -6682,6 +6729,10 @@ bool llama_moe_cache::freeze_small() {
 
 bool llama_moe_cache::pin_small() {
     return pimpl->cm_freeze(true);
+}
+
+bool llama_moe_cache::cpu_miss_drop_slow() {
+    return pimpl->cm_drop_slow();
 }
 
 int llama_moe_cache::host_mode() const {
@@ -6716,7 +6767,15 @@ void llama_moe_cache::cpu_miss_tick(int64_t n_tokens) {
 }
 
 bool llama_moe_cache::small_batch(int64_t n_tokens) const {
-    return n_tokens <= n_small_max || pimpl->cm_serves(n_tokens);
+    return !pimpl->force_large && (n_tokens <= n_small_max || pimpl->cm_serves(n_tokens));
+}
+
+void llama_moe_cache::set_force_large(bool on) {
+    pimpl->force_large = on;
+}
+
+bool llama_moe_cache::force_large() const {
+    return pimpl->force_large;
 }
 
 bool llama_moe_cache::recal_pending() const {

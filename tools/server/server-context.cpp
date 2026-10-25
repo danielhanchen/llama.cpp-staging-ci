@@ -1114,9 +1114,18 @@ private:
     // layer-major prompt reads the host experts once for both (the checkpoint itself is not made)
     std::vector<int32_t> lm_breaks;
     // k15-pp: the checkpoint at the first merged break, taken inside the decode (llama_set_state_capture): slot, its token count there
-    int     lm_cap_slot     = -1;
-    int64_t lm_cap_n_tokens = -1;
-    int32_t lm_cap_batch    = -1; // absolute batch index of the break
+    // k15-pp2: up to two (the far and the near checkpoint of one prompt batch)
+    struct lm_cap_req_t {
+        int     slot;
+        int64_t n_tokens;
+        int32_t batch;    // absolute batch index of the break
+    };
+    std::vector<lm_cap_req_t> lm_caps;
+    // LLAMA_STATE_CAPTURE_MAX=1: one capture per decode (the near checkpoint is then a separate call beside a far capture)
+    int lm_cap_max() const {
+        static const int n = getenv("LLAMA_STATE_CAPTURE_MAX") ? std::max(1, std::min(2, atoi(getenv("LLAMA_STATE_CAPTURE_MAX")))) : 2;
+        return n;
+    }
 
     server_metrics metrics;
 
@@ -1535,6 +1544,13 @@ private:
             ctx_dft   = nullptr;
             model_dft = nullptr;
             spec_init.reset();
+        }
+
+        // k15-lfm2: a weak host (few threads, not faster than an upload) with most experts cached drops the CPU-miss rule, so the
+        // default drafts verify exactly (llama_moe_cpu_miss_drop_slow; LLAMA_MOE_CPU_MISS_DROP=0: off)
+        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO && params_base.speculative.ngram_suffix.auto_mode && server_spec_auto_exact() &&
+                !llama_verify_exact_placement(ctx_tgt) && llama_moe_cpu_miss_drop_slow(ctx_tgt)) {
+            SRV_INF("%s", "MoE cache: CPU misses off on this host (weak host, most experts cached): drafts verified exactly\n");
         }
 
         // k13: default drafts where the host computes experts (server_spec_spill_mode) draft only from repeats of at least
@@ -3790,9 +3806,7 @@ private:
         // start populating the batch for this iteration
         batch.clear();
         lm_breaks.clear();
-        lm_cap_slot = -1;
-        lm_cap_n_tokens = -1;
-        lm_cap_batch = -1;
+        lm_caps.clear();
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
@@ -4540,22 +4554,20 @@ private:
                                     if (k == 0 && offset != 4 && batch.size() + (n_last - 4) <= n_batch && lm_ckpt_merge_ok(slot, n_tokens_prev, lm) &&
                                             (!lm_span_env || llama_layer_major_spans(ctx_tgt, (int32_t) batch.size(), n_last - 4))) {
                                         lm_breaks.push_back(batch.size());
-                                        if (lm_cap_slot < 0 && do_checkpoint) {
-                                            lm_cap_slot     = slot.id;
-                                            lm_cap_n_tokens = slot.prompt.n_tokens();
-                                            lm_cap_batch    = batch.size();
+                                        if (lm_caps.empty() && do_checkpoint) {
+                                            lm_caps.push_back({ slot.id, (int64_t) slot.prompt.n_tokens(), (int32_t) batch.size() });
                                         }
                                         break;
                                     }
                                     // k15-ttft: the checkpoint 4 tokens before the end is taken inside this decode (llama_set_state_capture)
                                     // instead of after a decode of its own: the same ubatches (the last 4 tokens still run as one), one call,
                                     // no host gap between them, and under layer-major prompts one expert pass (see near_ckpt_merge_ok)
-                                    if (k == 1 && do_checkpoint && lm_cap_slot < 0 && batch.size() + n_last <= n_batch &&
+                                    // k15-pp2: beside the far capture of this batch too (two captures per decode)
+                                    if (k == 1 && do_checkpoint && (int) lm_caps.size() < lm_cap_max() &&
+                                            (lm_caps.empty() || lm_caps[0].slot == slot.id) && batch.size() + n_last <= n_batch &&
                                             near_ckpt_merge_ok(slot, n_tokens_prev)) {
                                         lm_breaks.push_back(batch.size());
-                                        lm_cap_slot     = slot.id;
-                                        lm_cap_n_tokens = slot.prompt.n_tokens();
-                                        lm_cap_batch    = batch.size();
+                                        lm_caps.push_back({ slot.id, (int64_t) slot.prompt.n_tokens(), (int32_t) batch.size() });
                                         break;
                                     }
                                     should_break = true;
@@ -4573,12 +4585,12 @@ private:
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
-                    // k15-small4: a layer-major batch merged across the far checkpoint (lm_cap_*) ends, for this rule, where that checkpoint
+                    // k15-small4: a layer-major batch merged across the far checkpoint (lm_caps[0]) ends, for this rule, where that checkpoint
                     // is captured, as the batches without the merge do: else the batch before it counted as near the end and made a checkpoint
                     // of its own at its start (q3m 4 GB, 8k prompt at n_batch 8192: 3 checkpoints of 62.8 MiB instead of 2, RssAnon +63 MiB
                     // per long prompt). LLAMA_SERVER_CKPT_MERGED_END=0: the end of the merged batch, as before
                     static const bool ckpt_merged_end = getenv("LLAMA_SERVER_CKPT_MERGED_END") == nullptr || atoi(getenv("LLAMA_SERVER_CKPT_MERGED_END")) != 0;
-                    const int64_t n_tokens_end = ckpt_merged_end && lm_cap_slot == slot.id && lm_cap_n_tokens > 0 ? lm_cap_n_tokens : slot.prompt.n_tokens();
+                    const int64_t n_tokens_end = ckpt_merged_end && !lm_caps.empty() && lm_caps[0].slot == slot.id && lm_caps[0].n_tokens > 0 ? lm_caps[0].n_tokens : slot.prompt.n_tokens();
                     const bool near_prompt_end = slot.task->n_tokens() < n_tokens_end + n_ubatch;
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
@@ -4748,8 +4760,12 @@ private:
         // k15-pp (LLAMA_LM_CKPT_CAPTURE=0 off): the checkpoint the merged break skips is taken inside the decode
         static const bool lm_cap_env = getenv("LLAMA_LM_CKPT_CAPTURE") == nullptr || atoi(getenv("LLAMA_LM_CKPT_CAPTURE")) != 0;
         bool lm_cap_req = false;
-        if (lm_cap_env && lm_cap_slot >= 0 && lm_cap_batch > off && lm_cap_batch < off + batch.view.size()) {
-            lm_cap_req = llama_set_state_capture(ctx_tgt, lm_cap_slot, lm_cap_batch - off);
+        std::vector<lm_cap_req_t> caps_req;   // the captures asked for this view
+        for (const auto & c : lm_caps) {
+            if (lm_cap_env && c.batch > off && c.batch < off + batch.view.size() && llama_set_state_capture(ctx_tgt, c.slot, c.batch - off)) {
+                caps_req.push_back(c);
+                lm_cap_req = true;
+            }
         }
         if (!seg_breaks.empty()) {
             llama_set_ubatch_breaks(ctx_tgt, seg_breaks.data(), (int32_t) seg_breaks.size());
@@ -4759,29 +4775,86 @@ private:
         // overlap the ubatches still computing (made after the wait, the near checkpoint's merge cost G4 Qwen3.6 32 GB chat 6 ms of TTFT);
         // LLAMA_CKPT_CAP_EARLY=0: after the wait, as k15-pp did
         static const bool cap_early = getenv("LLAMA_CKPT_CAP_EARLY") == nullptr || atoi(getenv("LLAMA_CKPT_CAP_EARLY")) != 0;
-        auto cap_checkpoint = [&]() {
-            llama_pos cap_pos = -1;
-            if (ret == 0 && llama_state_seq_captured(ctx_tgt, lm_cap_slot, &cap_pos)) {
-                for (auto & slot : slots) {
-                    if (slot.id == lm_cap_slot && slot.task) {
-                        create_checkpoint_captured(slot, lm_cap_n_tokens, cap_pos);
+        // k15-pp3: the overlap below makes the checkpoints up to a segment's end before it gives that segment to the drafter
+        size_t caps_done = 0;
+        auto cap_checkpoint_upto = [&](int64_t b_rel) {
+            // in batch order: a checkpoint list keeps the order the separate calls made them in
+            for (; caps_done < caps_req.size() && caps_req[caps_done].batch - off <= b_rel; ++caps_done) {
+                const auto & c = caps_req[caps_done];
+                llama_pos cap_pos = -1;
+                if (ret == 0 && llama_state_seq_captured_at(ctx_tgt, c.slot, c.batch - off, &cap_pos)) {
+                    for (auto & slot : slots) {
+                        if (slot.id == c.slot && slot.task) {
+                            create_checkpoint_captured(slot, c.n_tokens, cap_pos);
+                        }
                     }
                 }
             }
-            lm_cap_slot = -1;
         };
-        const bool sync_after = lm_cap_req && cap_early;   // the checkpoint (slot state) is made on this thread, outside the yield
+        auto cap_checkpoint = [&]() {
+            cap_checkpoint_upto(INT64_MAX);
+            lm_caps.erase(std::remove_if(lm_caps.begin(), lm_caps.end(), [&](const lm_cap_req_t & c) {
+                return c.batch > off && c.batch < off + batch.view.size(); }), lm_caps.end());
+        };
+        // k15-pp3 (LLAMA_MTP_PROMPT_OVERLAP=0 off): see below
+        static const bool overlap_env = getenv("LLAMA_MTP_PROMPT_OVERLAP") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_OVERLAP")) != 0;
+        const bool caps_sorted  = std::is_sorted(caps_req.begin(), caps_req.end(), [](const lm_cap_req_t & a, const lm_cap_req_t & b) {
+            return a.batch < b.batch; });
+        const bool spec_overlap = overlap_env && spec && has_output && !seg_breaks.empty() && common_speculative_rows_early_ok(spec.get()) &&
+            (!lm_cap_req || (cap_early && caps_sorted));
+        // the checkpoint (slot state) is made on this thread, outside the yield; with the overlap, the drafter's early segments too
+        const bool sync_after = (lm_cap_req && cap_early) || spec_overlap;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output && !sync_after) {
                 llama_synchronize(ctx_tgt);
             }
         });
-        if (lm_cap_req) {
+        if (lm_cap_req && !(spec_overlap && ret == 0)) {
             cap_checkpoint();
         }
+        // k15-pp3 (LLAMA_MTP_PROMPT_OVERLAP=0 off): the drafter's own pass over the segments whose target rows are already on the host
+        // (a layer-major group followed by more ubatches in this decode, e.g. [1532] [512] then the [4] before the near checkpoint) runs
+        // while the target still computes the rest, instead of after the target's wait. Same segments, same rows, same order: the
+        // drafter's KV and outputs are those of the separate pass
+        int32_t spec_seg_done = 0; // segments of seg_breaks the drafter has processed
+        int32_t spec_seg_a    = 0; // where the next segment starts
+        bool    spec_early_ok = true;
+        {
+            if (spec_overlap && ret == 0) {
+                const int64_t t_ov0 = common_mtp_handoff_trace() ? ggml_time_us() : 0;
+                // on this thread, outside the yield, like the checkpoints made in between: each checkpoint's asynchronous read then
+                // runs under the drafter's next segment instead of under the wait of the next checkpoint or of the target
+                // a segment [a, b) reads the target rows [a, b) (its first token pairs with the pending row of the one before)
+                for (; spec_seg_done < (int32_t) seg_breaks.size() && spec_early_ok; ++spec_seg_done) {
+                    const int32_t b = seg_breaks[spec_seg_done];
+                    if (llama_nextn_rows_wait(ctx_tgt, b) < b) {
+                        break;
+                    }
+                    if (lm_cap_req) {
+                        cap_checkpoint_upto(b);
+                    }
+                    common_batch seg;
+                    seg.n_pos = batch.view.n_pos;
+                    seg.tokens.assign(batch.view.tokens.begin() + spec_seg_a, batch.view.tokens.begin() + b);
+                    spec_early_ok = common_speculative_process_rows_early(spec.get(), seg, spec_seg_a);
+                    spec_seg_a = b;
+                }
+                if (lm_cap_req) {
+                    cap_checkpoint();
+                }
+                if (t_ov0) {
+                    SRV_INF("mtp_trace prompt overlap: %d of %zu segments (%d rows) before the target's wait, %.2f ms\n", spec_seg_done,
+                            seg_breaks.size() + 1, spec_seg_a, (ggml_time_us() - t_ov0)/1e3);
+                }
+            }
+        }
         if (sync_after && ret == 0 && has_output) {
+            const int64_t t_w0 = common_mtp_handoff_trace() && spec_overlap ? ggml_time_us() : 0;
             llama_synchronize(ctx_tgt);
+            if (t_w0) {
+                SRV_INF("mtp_trace target wait after the overlap %.2f ms\n", (ggml_time_us() - t_w0)/1e3);
+            }
         }
 
         if (ret != 0) {
@@ -4841,14 +4914,18 @@ private:
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
-            bool ok = true;
+            bool ok = spec_early_ok;
             queue_tasks.yield_to_queue([&]() {
+                if (!ok) {
+                    return;
+                }
                 if (seg_breaks.empty()) {
                     ok = common_speculative_process(spec.get(), batch.view);
                 } else {
-                    // the segments one at a time, as the separate batches would have been (the draft keeps its own batches)
-                    int32_t a = 0;
-                    for (size_t k = 0; k <= seg_breaks.size() && ok; ++k) {
+                    // the segments one at a time, as the separate batches would have been (the draft keeps its own batches);
+                    // k15-pp3: from the first one the overlap above did not process
+                    int32_t a = spec_seg_a;
+                    for (size_t k = spec_seg_done; k <= seg_breaks.size() && ok; ++k) {
                         const int32_t b = k < seg_breaks.size() ? seg_breaks[k] : batch.view.size();
                         common_batch seg;
                         seg.n_pos = batch.view.n_pos;
