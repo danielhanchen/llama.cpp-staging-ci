@@ -8221,7 +8221,10 @@ struct test_glu_src1_alias : public test_case {
     }
 
     double max_nmse_err() override {
-        return 5e-4;
+        // three chained q4_0 products of q8 activations: the CPU reference and CUDA differ by quantization alone (k15: 80 runs,
+        // NMSE up to 7.8e-4 with the src1-alias fusion and 6.3e-4 with it off, GGML_CUDA_DISABLE_GLU_SRC1_ALIAS_FUSION=1); a wrong
+        // fusion gives NMSE of order 1
+        return type == GGML_TYPE_Q4_0 ? 2e-3 : 5e-4;
     }
 };
 
