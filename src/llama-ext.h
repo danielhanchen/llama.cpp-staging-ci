@@ -69,6 +69,7 @@ struct llama_memory_breakdown_data {
     size_t model   = 0; // memory allocated for the model
     size_t context = 0; // memory allocated for the context
     size_t compute = 0; // memory allocated for temporary compute buffers
+    size_t lend_freed = 0; // k15-fn: of a measurement (no_alloc), what compute leaves out because the MoE cache lends, not in total()
 
     size_t total() const {
         return model + context + compute;

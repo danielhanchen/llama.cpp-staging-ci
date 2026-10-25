@@ -142,6 +142,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
                 ret[i].mb.model   += mb.model;
                 ret[i].mb.context += mb.context;
                 ret[i].mb.compute += mb.compute;
+                ret[i].mb.lend_freed += mb.lend_freed;
                 break;
             }
         }
@@ -499,8 +500,19 @@ static void common_params_fit_impl(
                 // +338 / +532 MiB of cache at 12 / 16 GB gave +7..+10% decode at 2k-16k (12 GB) and +-2% (16 GB), but a 42-token prompt's
                 // TTFT went 165 -> 178 ms and 125 -> 139 ms; Flash-Next UD-IQ4_XS at 16 / 32 GB and LFM2.5 16 GB had no surplus to fill
                 static const bool fill = getenv("LLAMA_MOE_FIT_FILL") != nullptr && atoi(getenv("LLAMA_MOE_FIT_FILL")) != 0;
-                for (int g = 0; fill && g < 3 && size < size_requested; g++) {
-                    const int64_t extra = std::min<int64_t>(surplus_of(dmds_test) - 16*MiB, size_requested - size);
+                // k15-fn: where the cache lends because that frees memory (llama_moe_cache lend_saves), the measure counts the compute
+                // that much lower (mb.lend_freed). That is a fixed amount, not one that grows with the cache, so the first size, which
+                // takes the whole difference to the measure without the cache as the cache's, misses it: grow by it (at most), as the
+                // fill does by any surplus. LLAMA_MOE_CACHE_LEND_SAVE=0 off (no lending for it, nothing freed)
+                int64_t lent_left = 0;
+                for (size_t id = 0; id < nd; id++) {
+                    lent_left += int64_t(dmds_test[id].mb.lend_freed);
+                }
+                for (int g = 0; (fill || lent_left >= 64*MiB) && g < 3 && size < size_requested; g++) {
+                    int64_t extra = std::min<int64_t>(surplus_of(dmds_test) - 16*MiB, size_requested - size);
+                    if (!fill) {
+                        extra = std::min(extra, lent_left);
+                    }
                     if (extra < 64*MiB || !devices_ok(dmds_test)) {
                         break;
                     }
@@ -514,9 +526,11 @@ static void common_params_fit_impl(
                     if (shortfall(dmds_grow) > 0) {
                         break;
                     }
-                    LOG_TRC("%s: MoE cache grown by %" PRId64 " MiB into the measured surplus\n", __func__, extra/MiB);
+                    LOG_TRC("%s: MoE cache grown by %" PRId64 " MiB into the measured surplus%s\n", __func__, extra/MiB,
+                        fill ? "" : " the lent staging copies leave");
                     size      = size + extra;
                     dmds_test = dmds_grow;
+                    lent_left -= extra;
                 }
                 cparams->moe_cache_size = size;
                 LOG_TRC("%s: MoE cache reduced from %" PRId64 " to %" PRId64 " MiB to keep the layers in device memory\n",

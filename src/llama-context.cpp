@@ -1369,6 +1369,45 @@ void llama_context::sched_reserve() {
         }
     }
 
+    // k15-fn: the fit's measure (no LLAMA_MOE_MEASURE_LENT) leaves the staging arena out (see above: it only uses memory that is left).
+    // Where the cache lends because that frees memory (llama_moe_cache lend_saves, or LLAMA_MOE_CACHE_LEND=1) the loaded context has
+    // no arena, and a prompt that seeds the cache holds the copies of its split in the graph allocation instead: the context then
+    // needs `staging - seed growth` bytes less than one without lending, and the measure gives them to the cache (it counts the compute
+    // that much below the graph alone, so the margin the fit keeps for the arena stays the same). G4 Qwen3.8-Flash-Next UD-IQ4_XS + MTP
+    // at 32 GB: 2274 MiB of compute without lending, 1481 lent (k15l_g4, plans/k15_fn.md section 18). LLAMA_MOE_CACHE_LEND_SAVE=0 off
+    if (model.hparams.no_alloc) {
+        backend_lend_freed.assign(backend_ptrs.size(), 0);
+    }
+    if (model.hparams.no_alloc && moe_cache && measure_env == nullptr) {
+        std::vector<size_t> save(backend_ptrs.size(), 0);
+        bool any = false;
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            save[i] = moe_cache->lend_save_need(backend_ptrs[i]);
+            any = any || save[i] > 0;
+        }
+        if (any) {
+            const bool seeds = moe_cache_seed_sync && n_tokens > llama_moe_cache::n_small_max && (int64_t) n_tokens >= prefetch_min_batch;
+            std::vector<size_t> sizes(backend_ptrs.size(), 0);
+            if (seeds) {
+                moe_cache_seed = true;
+                graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), /*split_only =*/ true, sizes.data());
+                moe_cache_seed = false;
+            }
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                if (save[i] == 0) {
+                    continue;
+                }
+                const size_t grow  = seeds ? sizes[i] - std::min(sizes[i], backend_buf_exp_size[i]) : 0;
+                const size_t freed = save[i] - std::min(save[i], grow);
+                LLAMA_LOG_DEBUG("%s: %s: measure: compute %.2f MiB, the cache lends %.2f MiB of staging, a seeding prompt's graph %.2f MiB larger: "
+                    "%.2f MiB to the cache\n", __func__, ggml_backend_buft_name(backend_buft[i]), backend_buf_exp_size[i]/1024.0/1024.0,
+                    save[i]/1024.0/1024.0, grow/1024.0/1024.0, freed/1024.0/1024.0);
+                backend_lend_freed[i] = std::min(backend_buf_exp_size[i], freed);
+                backend_buf_exp_size[i] -= backend_lend_freed[i];
+            }
+        }
+    }
+
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
@@ -7514,6 +7553,7 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ggml_backend_t             backend = backends[i].get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
             ret[buft].compute += backend_buf_exp_size[i];
+            ret[buft].lend_freed += i < backend_lend_freed.size() ? backend_lend_freed[i] : 0;
         }
     } else {
         for (const auto & backend_ptr : backends) {
