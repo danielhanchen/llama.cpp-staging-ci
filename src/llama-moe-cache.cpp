@@ -3832,6 +3832,18 @@ struct llama_moe_cache::impl {
                 g.lru.key_of[r.slot] = r.vkey;
                 g.lru.slot_map[q][r.vkey % ne] = r.slot;
                 ua_restored++;
+                if (ua_verify) {
+                    ggml_backend_synchronize(devices[g.id].backend);
+                    std::vector<uint8_t> buf;
+                    for (size_t ip = 0; ip < layers[q].experts.size(); ++ip) {
+                        const ggml_tensor * w = layers[q].experts[ip];
+                        const size_t nb = w->nb[2];
+                        buf.resize(nb);
+                        ggml_backend_tensor_get(g.banks[ip], buf.data(), (size_t) r.slot*nb, nb);
+                        ua_verified++;
+                        ua_bad += memcmp(buf.data(), (const uint8_t *) w->data + (size_t) (r.vkey % ne)*nb, nb) != 0;
+                    }
+                }
             } else {
                 g.lru.key_of[r.slot] = -1;
                 g.lru.to_head(r.slot);
