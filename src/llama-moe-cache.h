@@ -244,6 +244,8 @@ public:
     bool prompt_copy(ggml_backend_t backend, int32_t il, ggml_tensor * dst, const std::vector<int32_t> * counts);
     void prompt_flush();
     void prompt_inplace_block(bool blocked);
+    void prompt_ubatch(bool ok);    // this ubatch may read its experts in place (it does not seed the cache)
+    bool prompt_inplace_on() const; // LLAMA_MOE_PROMPT_INPLACE
 
     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
     // returns the number of experts copied, 0 if expert e is not in the cache, -n if a run of n cached experts is too short to copy

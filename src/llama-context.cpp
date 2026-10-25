@@ -2554,6 +2554,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     auto small_swap_in = [&]() -> bool {
         if (n_small == 0 || gf == nullptr || !gf_res_small_built[i_small] || gf_res_small_epoch[i_small] != gf_res_epoch ||
                 moe_cache_seed_graph != moe_cache_seed || moe_cache_hybrid_graph != moe_cache_hybrid || moe_cache_devseed_graph != moe_cache_devseed ||
+                moe_inplace_graph != moe_inplace_ok ||
                 !res->can_reuse(gparams)) {
             return false;
         }
@@ -2593,6 +2594,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     };
 
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams) && moe_cache_seed_graph == moe_cache_seed &&
+            moe_inplace_graph == moe_inplace_ok &&
             moe_cache_hybrid_graph == moe_cache_hybrid && moe_cache_devseed_graph == moe_cache_devseed) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -2694,6 +2696,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
         }
         moe_cache_seed_graph   = moe_cache_seed;
+        moe_inplace_graph      = moe_inplace_ok;
         moe_cache_hybrid_graph = moe_cache_hybrid;
         // the seed plans are enabled in the op params of the graph, a reused graph keeps them (and may be replayed as captured)
         moe_cache_devseed_graph = moe_cache_devseed;
@@ -5761,8 +5764,13 @@ ggml_backend_sched_prefetch_mode llama_context::sched_prefetch_mode(const ggml_t
     auto * lctx = static_cast<llama_context *>(user_data);
 
     // the slot maps of the MoE cache change between graph computations, they must go through the copy callback
-    if (lctx->moe_cache && (lctx->moe_cache->is_slot_map(src) || lctx->moe_cache->prompt_layer(src) >= 0)) {
+    if (lctx->moe_cache && lctx->moe_cache->is_slot_map(src)) {
         return GGML_BACKEND_SCHED_PREFETCH_NONE;
+    }
+    // k15-lfm2: the prompt maps of in-place prompts: prefetched with the large ubatches (each staging slot of the copy queue has its own ring
+    // of lent slots, see llama_moe_cache::prompt_copy), copied when the split starts otherwise
+    if (lctx->moe_cache && lctx->moe_cache->prompt_layer(src) >= 0) {
+        return lctx->prefetch_n_tokens >= lctx->prefetch_min_batch ? GGML_BACKEND_SCHED_PREFETCH_ASYNC : GGML_BACKEND_SCHED_PREFETCH_NONE;
     }
 
     // small ubatches are not prefetched, their copies reuse the staging arena of the prompt (if any) instead of growing the graph allocator next to it,
@@ -6063,6 +6071,8 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
 }
 
 void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_large, int64_t n_outputs_ub) {
+    moe_inplace_ok = true; // k15-lfm2: unless this ubatch seeds (below)
+    moe_cache->prompt_ubatch(true);
     const bool large = !moe_cache->small_batch(ubatch.n_tokens);
     if (!moe_cache_seed_enabled) {
         return;
@@ -6131,6 +6141,9 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
             }
         }
     }
+    // k15-lfm2: a ubatch that seeds the cache keeps the staging copies (the seed reads them), the others may read in place
+    moe_inplace_ok = !(moe_cache_seed || moe_cache_seed_prev || moe_cache_devseed);
+    moe_cache->prompt_ubatch(moe_inplace_ok);
 }
 
 bool llama_context::moe_prompt_copy(ggml_backend_t backend, ggml_tensor * dst, ggml_cgraph * graph, int32_t il) {
@@ -6154,31 +6167,8 @@ bool llama_context::moe_prompt_copy(ggml_backend_t backend, ggml_tensor * dst, g
             }
         }
     }
-    // the seed of the last large ubatch: from the routing of an earlier ubatch, or from its own (read now, as the staging copy does)
-    std::vector<int32_t> counts;
-    bool seed = false;
-    if (!experts.empty() && moe_cache_seed_prev) {
-        if (const std::vector<int32_t> * c = moe_cache->get_seed_counts(experts[0])) {
-            counts = *c;
-            seed   = !counts.empty();
-        }
-    } else if (!experts.empty() && moe_cache_seed && sel_ok) {
-        ggml_backend_t backend_ids = ggml_backend_sched_get_tensor_backend(sched.get(), const_cast<ggml_tensor *>(sel));
-        if (backend_ids == nullptr) {
-            backend_ids = backend;
-        }
-        std::vector<int32_t> ids_data(ggml_nelements(sel));
-        ggml_backend_tensor_get_async(backend_ids, sel, ids_data.data(), 0, ggml_nbytes(sel));
-        ggml_backend_synchronize(backend_ids);
-        counts.assign(experts[0]->ne[2], 0);
-        for (const int32_t id : ids_data) {
-            if (id >= 0 && id < (int32_t) counts.size()) {
-                counts[id]++;
-            }
-        }
-        seed = true;
-    }
-    return moe_cache->prompt_copy(backend, il, dst, seed ? &counts : nullptr);
+    // (a ubatch that seeds the cache is staged, see moe_cache_seed_begin)
+    return moe_cache->prompt_copy(backend, il, dst, nullptr);
 }
 
 void llama_context::moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_outputs_ub) {

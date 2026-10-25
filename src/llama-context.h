@@ -595,6 +595,8 @@ private:
 
     // value of moe_cache_seed when the current graph was allocated: the scheduler plans the copies of the experts with it
     bool moe_cache_seed_graph = false;
+    bool moe_inplace_ok       = false; // k15-lfm2: this ubatch may read its experts in place (see moe_cache_seed_begin)
+    bool moe_inplace_graph    = false;
     int  moe_cache_hybrid_graph = 0; // llama_moe_cache::hybrid_mode of the previous graph
 
     // routing outputs of the last computed large ubatch (expert tensor, ids), valid until the next graph is built
