@@ -351,7 +351,9 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    // ckpt_keep_max >= -1 (k15-ttft): the caller knows the next prompt of this slot drops every checkpoint with pos_max above it, so
+    // those are moved into the cache entry instead of copied (LLAMA_PCS_MOVE_CKPT=0: copied as before)
+    bool prompt_save(server_prompt_cache & prompt_cache, llama_pos ckpt_keep_max = -2) {
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -364,7 +366,9 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        static const bool move_ckpt = getenv("LLAMA_PCS_MOVE_CKPT") == nullptr || atoi(getenv("LLAMA_PCS_MOVE_CKPT")) != 0;
+        const bool mv = move_ckpt && ckpt_keep_max >= -1;
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, mv ? &prompt.checkpoints : nullptr, ckpt_keep_max);
         if (cur == nullptr) {
             return false;
         }
@@ -2028,7 +2032,13 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                // the checkpoints past the common prefix with the new prompt are erased when it starts (pos_next <= n_past <= the
+                // common prefix; not with chunk reuse, which can move n_past past it, nor with multimodal positions)
+                llama_pos keep_max = -2;
+                if (task.params.n_cache_reuse == 0 && !task.tokens.has_mtmd && !ret->prompt.tokens.has_mtmd) {
+                    keep_max = (llama_pos) ret->prompt.tokens.get_common_prefix(task.tokens);
+                }
+                ret->prompt_save(*prompt_cache, keep_max);
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
