@@ -397,9 +397,10 @@ struct server_slot {
     // 640-token prompt: 77 MiB state + 2 x 62 MiB checkpoints, 80-290 ms against 8-16 ms into resident buffers). Once the prompt is
     // processed (and again when the slot goes idle) the prefault worker is asked for resident pool buffers of the sizes the next save
     // needs, so it runs while the slot generates or waits. Same copies into other buffers: the saved bytes are unchanged.
-    // LLAMA_PCS_PREFAULT_NEXT=0: off
+    // Opt-in (LLAMA_PCS_PREFAULT_NEXT=1): the prepared buffers stay resident while the slot idles (G4 q4x 32 GB: +113 MiB RSS), and
+    // the 2 MiB pages of common_state_thp_alloc take most of the fault cost without holding memory
     void prefault_next_save() const {
-        static const bool on = getenv("LLAMA_PCS_PREFAULT_NEXT") == nullptr || atoi(getenv("LLAMA_PCS_PREFAULT_NEXT")) != 0;
+        static const bool on = getenv("LLAMA_PCS_PREFAULT_NEXT") != nullptr && atoi(getenv("LLAMA_PCS_PREFAULT_NEXT")) != 0;
         if (!on || prompt.tokens.size() == 0) {
             return;
         }

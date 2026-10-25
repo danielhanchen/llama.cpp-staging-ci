@@ -23,6 +23,9 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstring>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -4043,6 +4046,36 @@ void common_state_buf_recycle(common_state_buf && buf) {
     std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
     g_ckpt_pool.push_back(std::move(buf));
     ckpt_pool_trim();
+}
+
+bool common_state_thp_on() {
+#if defined(__linux__)
+    static const bool on = getenv("LLAMA_STATE_THP") == nullptr || atoi(getenv("LLAMA_STATE_THP")) != 0;
+    return on;
+#else
+    return false;
+#endif
+}
+
+void * common_state_thp_alloc(size_t bytes) {
+#if defined(__linux__)
+    void * p = nullptr;
+    if (posix_memalign(&p, 2u << 20, bytes) != 0 || p == nullptr) {
+        throw std::bad_alloc();
+    }
+    madvise(p, bytes, MADV_HUGEPAGE);
+    return p;
+#else
+    return ::operator new(bytes);
+#endif
+}
+
+void common_state_thp_free(void * p) {
+#if defined(__linux__)
+    free(p);
+#else
+    ::operator delete(p);
+#endif
 }
 
 // k11 (LLAMA_STATE_PREFAULT, default on with the pool, =0 off): a background thread keeps buffers whose pages are already resident
