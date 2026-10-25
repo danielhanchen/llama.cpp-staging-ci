@@ -2060,7 +2060,8 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
 // the draft model's device memory at that context size must fit in what the requested cache leaves, plus at most max_frac of the cache
 static bool common_fit_draft_on_cpu(
         const common_params & params, const llama_model_params & mparams, const llama_context_params & cparams,
-        const llama_model_params & mparams_dft, llama_context_params cparams_dft, const std::string & path_dft, ggml_log_level log_level) {
+        const llama_model_params & mparams_dft, llama_context_params cparams_dft, const std::string & path_dft, ggml_log_level log_level,
+        bool * needs_target = nullptr) {
     constexpr double MiB = 1024.0*1024.0;
     double max_frac = 0.25;
     if (const char * env = getenv("LLAMA_FIT_DRAFT_MAX_CACHE_FRAC")) {
@@ -2127,6 +2128,9 @@ static bool common_fit_draft_on_cpu(
         const char * env_c = getenv("LLAMA_FIT_DRAFT_EST_COMPUTE_MIB");
         const size_t compute = (size_t) (env_c != nullptr ? std::max(0.0, atof(env_c)) : 128.0) * 1024 * 1024;
         dft = weights + compute;
+        if (needs_target != nullptr) {
+            *needs_target = true;
+        }
         LOG_INF("%s: the draft model cannot be measured on its own (%s): estimated as its weights %.0f MiB + %.0f MiB of compute buffer "
             "(LLAMA_FIT_DRAFT_EST_COMPUTE_MIB; LLAMA_FIT_DRAFT_ESTIMATE=0 keeps the old placement)\n", __func__, e.what(), weights/MiB, compute/MiB);
     }
@@ -2385,17 +2389,25 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         // (fit_can_drop), it is left out and drafting is off unless LLAMA_FIT_DRAFT_CPU=1 (drafting on the CPU is slower than none)
         // the old order (the draft model first, the main model around it) with LLAMA_FIT_DRAFT_LAST=0, or when -ngld or -devd is set
         bool draft_cpu = false;
+        bool draft_needs_target = false;
         {
             const char * env_last = getenv("LLAMA_FIT_DRAFT_LAST");
             const bool   last     = has_draft && params.moe_cache_size > 0 && params.speculative.draft.n_gpu_layers == -1 &&
                 params.speculative.draft.devices.empty() &&
                 (env_last == nullptr || atoi(env_last) != 0);
             if (last) {
-                draft_cpu = common_fit_draft_on_cpu(params, mparams, cparams, mparams_dft, cparams_dft, params_dft.model.path, fit_log_level);
+                draft_cpu = common_fit_draft_on_cpu(params, mparams, cparams, mparams_dft, cparams_dft, params_dft.model.path, fit_log_level,
+                    &draft_needs_target);
             }
         }
         const char * env_dcpu  = getenv("LLAMA_FIT_DRAFT_CPU");
-        const bool   draft_off = draft_cpu && params.speculative.draft.fit_can_drop && (env_dcpu == nullptr || atoi(env_dcpu) == 0);
+        // k15-small4: a draft that runs on the target's context (a gemma-4 assistant reads the target's KV cache) cannot run on the CPU
+        // while that cache is on the device: T4 4 GB with LLAMA_FIT_DRAFT_CPU=1 aborted in its first graph reservation (a CPU context
+        // with a pre-allocated CUDA tensor). It is left out instead
+        if (draft_cpu && draft_needs_target && env_dcpu != nullptr && atoi(env_dcpu) != 0) {
+            COM_WRN("%s: LLAMA_FIT_DRAFT_CPU=1: the draft model runs on the target's KV cache and cannot run on the CPU beside it, it is left out\n", __func__);
+        }
+        const bool   draft_off = draft_cpu && params.speculative.draft.fit_can_drop && (env_dcpu == nullptr || atoi(env_dcpu) == 0 || draft_needs_target);
         if (draft_cpu) {
             // no device at all (-devd none): with only n_gpu_layers = 0 its context still reserves a device compute buffer for the
             // offloaded ops of large batches (2.4 GiB for the MTP drafter at -ub 2048), which pushed the main layers off the GPU
