@@ -3550,12 +3550,15 @@ private:
             common_speculative_rows_ok(spec.get());
     }
 
-    // k15-ttft (LLAMA_CKPT_NEAR_MERGE=0: off): the near prompt checkpoint (4 tokens before the end) from a capture inside the prompt's
+    // k15-ttft (LLAMA_CKPT_NEAR_MERGE=1: on, opt-in): the near prompt checkpoint (4 tokens before the end) from a capture inside the prompt's
     // decode. Only for a slot alone in the batch, no mtmd input, speculative impls that read the target rows of a segment, a memory
     // whose partial state is the recurrent rows (llama_state_capture_supported), and where create_checkpoint_captured can make the
     // checkpoint: a draft without a partial state and no speculative state stashed per checkpoint (else the separate call, as before)
     bool near_ckpt_merge_ok(const server_slot & slot, int32_t n_tokens_prev) const {
-        static const bool on = getenv("LLAMA_CKPT_NEAR_MERGE") == nullptr || atoi(getenv("LLAMA_CKPT_NEAR_MERGE")) != 0;
+        // opt-in (LLAMA_CKPT_NEAR_MERGE=1): exact and multi-turn reuse unchanged, but slower on G4 (Qwen3.6 MTP 32 GB chat 1413 -> 1269
+        // prompt tok/s, TTFT 54 -> 61 ms; 2k -2.4%; 12 GB chat -2.6%): the merged decode is GPU-bound for longer after its last launch
+        // than the two separate calls (plans/k15_models.md round 11)
+        static const bool on = getenv("LLAMA_CKPT_NEAR_MERGE") != nullptr && atoi(getenv("LLAMA_CKPT_NEAR_MERGE")) != 0;
         static const bool cap_env = getenv("LLAMA_LM_CKPT_CAPTURE") == nullptr || atoi(getenv("LLAMA_LM_CKPT_CAPTURE")) != 0;
         if (!on || !cap_env || n_tokens_prev != 0 || slot.task->tokens.has_mtmd || !llama_state_capture_supported(ctx_tgt) ||
                 !common_speculative_rows_ok(spec.get())) {
