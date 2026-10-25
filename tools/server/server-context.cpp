@@ -1114,9 +1114,18 @@ private:
     // layer-major prompt reads the host experts once for both (the checkpoint itself is not made)
     std::vector<int32_t> lm_breaks;
     // k15-pp: the checkpoint at the first merged break, taken inside the decode (llama_set_state_capture): slot, its token count there
-    int     lm_cap_slot     = -1;
-    int64_t lm_cap_n_tokens = -1;
-    int32_t lm_cap_batch    = -1; // absolute batch index of the break
+    // k15-pp2: up to two (the far and the near checkpoint of one prompt batch)
+    struct lm_cap_req_t {
+        int     slot;
+        int64_t n_tokens;
+        int32_t batch;    // absolute batch index of the break
+    };
+    std::vector<lm_cap_req_t> lm_caps;
+    // LLAMA_STATE_CAPTURE_MAX=1: one capture per decode (the near checkpoint is then a separate call beside a far capture)
+    int lm_cap_max() const {
+        static const int n = getenv("LLAMA_STATE_CAPTURE_MAX") ? std::max(1, std::min(2, atoi(getenv("LLAMA_STATE_CAPTURE_MAX")))) : 2;
+        return n;
+    }
 
     server_metrics metrics;
 
@@ -3765,9 +3774,7 @@ private:
         // start populating the batch for this iteration
         batch.clear();
         lm_breaks.clear();
-        lm_cap_slot = -1;
-        lm_cap_n_tokens = -1;
-        lm_cap_batch = -1;
+        lm_caps.clear();
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
@@ -4502,22 +4509,20 @@ private:
                                     if (k == 0 && offset != 4 && batch.size() + (n_last - 4) <= n_batch && lm_ckpt_merge_ok(slot, n_tokens_prev, lm) &&
                                             (!lm_span_env || llama_layer_major_spans(ctx_tgt, (int32_t) batch.size(), n_last - 4))) {
                                         lm_breaks.push_back(batch.size());
-                                        if (lm_cap_slot < 0 && do_checkpoint) {
-                                            lm_cap_slot     = slot.id;
-                                            lm_cap_n_tokens = slot.prompt.n_tokens();
-                                            lm_cap_batch    = batch.size();
+                                        if (lm_caps.empty() && do_checkpoint) {
+                                            lm_caps.push_back({ slot.id, (int64_t) slot.prompt.n_tokens(), (int32_t) batch.size() });
                                         }
                                         break;
                                     }
                                     // k15-ttft: the checkpoint 4 tokens before the end is taken inside this decode (llama_set_state_capture)
                                     // instead of after a decode of its own: the same ubatches (the last 4 tokens still run as one), one call,
                                     // no host gap between them, and under layer-major prompts one expert pass (see near_ckpt_merge_ok)
-                                    if (k == 1 && do_checkpoint && lm_cap_slot < 0 && batch.size() + n_last <= n_batch &&
+                                    // k15-pp2: beside the far capture of this batch too (two captures per decode)
+                                    if (k == 1 && do_checkpoint && (int) lm_caps.size() < lm_cap_max() &&
+                                            (lm_caps.empty() || lm_caps[0].slot == slot.id) && batch.size() + n_last <= n_batch &&
                                             near_ckpt_merge_ok(slot, n_tokens_prev)) {
                                         lm_breaks.push_back(batch.size());
-                                        lm_cap_slot     = slot.id;
-                                        lm_cap_n_tokens = slot.prompt.n_tokens();
-                                        lm_cap_batch    = batch.size();
+                                        lm_caps.push_back({ slot.id, (int64_t) slot.prompt.n_tokens(), (int32_t) batch.size() });
                                         break;
                                     }
                                     should_break = true;
@@ -4704,8 +4709,12 @@ private:
         // k15-pp (LLAMA_LM_CKPT_CAPTURE=0 off): the checkpoint the merged break skips is taken inside the decode
         static const bool lm_cap_env = getenv("LLAMA_LM_CKPT_CAPTURE") == nullptr || atoi(getenv("LLAMA_LM_CKPT_CAPTURE")) != 0;
         bool lm_cap_req = false;
-        if (lm_cap_env && lm_cap_slot >= 0 && lm_cap_batch > off && lm_cap_batch < off + batch.view.size()) {
-            lm_cap_req = llama_set_state_capture(ctx_tgt, lm_cap_slot, lm_cap_batch - off);
+        std::vector<lm_cap_req_t> caps_req;   // the captures asked for this view
+        for (const auto & c : lm_caps) {
+            if (lm_cap_env && c.batch > off && c.batch < off + batch.view.size() && llama_set_state_capture(ctx_tgt, c.slot, c.batch - off)) {
+                caps_req.push_back(c);
+                lm_cap_req = true;
+            }
         }
         if (!seg_breaks.empty()) {
             llama_set_ubatch_breaks(ctx_tgt, seg_breaks.data(), (int32_t) seg_breaks.size());
@@ -4716,15 +4725,19 @@ private:
         // LLAMA_CKPT_CAP_EARLY=0: after the wait, as k15-pp did
         static const bool cap_early = getenv("LLAMA_CKPT_CAP_EARLY") == nullptr || atoi(getenv("LLAMA_CKPT_CAP_EARLY")) != 0;
         auto cap_checkpoint = [&]() {
-            llama_pos cap_pos = -1;
-            if (ret == 0 && llama_state_seq_captured(ctx_tgt, lm_cap_slot, &cap_pos)) {
-                for (auto & slot : slots) {
-                    if (slot.id == lm_cap_slot && slot.task) {
-                        create_checkpoint_captured(slot, lm_cap_n_tokens, cap_pos);
+            // in batch order: a checkpoint list keeps the order the separate calls made them in
+            for (const auto & c : caps_req) {
+                llama_pos cap_pos = -1;
+                if (ret == 0 && llama_state_seq_captured_at(ctx_tgt, c.slot, c.batch - off, &cap_pos)) {
+                    for (auto & slot : slots) {
+                        if (slot.id == c.slot && slot.task) {
+                            create_checkpoint_captured(slot, c.n_tokens, cap_pos);
+                        }
                     }
                 }
             }
-            lm_cap_slot = -1;
+            lm_caps.erase(std::remove_if(lm_caps.begin(), lm_caps.end(), [&](const lm_cap_req_t & c) {
+                return c.batch > off && c.batch < off + batch.view.size(); }), lm_caps.end());
         };
         const bool sync_after = lm_cap_req && cap_early;   // the checkpoint (slot state) is made on this thread, outside the yield
         queue_tasks.yield_to_queue([&]() {

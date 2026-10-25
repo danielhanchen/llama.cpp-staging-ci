@@ -911,6 +911,21 @@ llama_context::~llama_context() {
             sa.event = nullptr;
         }
     }
+    for (auto & c : cap) {
+        if (c.ev) {
+            ggml_backend_event_free(c.ev);
+            c.ev = nullptr;
+        }
+    }
+    if (cap_side_ev) {
+        ggml_backend_event_free(cap_side_ev);
+        cap_side_ev = nullptr;
+    }
+    if (cap_side) {
+        ggml_backend_synchronize(cap_side);
+        ggml_backend_free(cap_side);
+        cap_side = nullptr;
+    }
 
     if (ple_prefetcher || ple.verify || ple.stats) {
         const auto & st = ple_prefetcher ? &ple_prefetcher->st : nullptr;
@@ -3097,15 +3112,28 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     } ubatch_breaks_reset_guard { balloc.get() };
     std::vector<int32_t> ub_breaks = std::move(ubatch_breaks_next);
     ubatch_breaks_next.clear();
-    // k15-pp: a capture asked for this decode (llama_set_state_capture); the one of an earlier decode is dropped
-    const bool cap_active = cap_pending;
-    cap_pending = false;
-    if (cap_active || cap_done) {
-        cap_done = false;
-        cap_regions.clear();
+    // k15-pp: the captures asked for this decode (llama_set_state_capture); those of an earlier decode are dropped
+    bool cap_active = false;
+    for (auto & c : cap) {
+        const bool act = c.pending;
+        c.pending = false;
+        if (act || c.done) {
+            c.done   = false;
+            c.ev_set = false;
+            c.regions.clear();
+        }
+        if (!act) {
+            c.idx = -1;
+        }
+        cap_active |= act;
     }
-    if (!cap_active) {
-        cap_idx = -1;
+    cap_sel = -1;
+    // k15-pp2: a snapshot is overwritten only after the side stream has read it for the save of an earlier decode
+    if (cap_active && cap_side_pending) {
+        if (ggml_backend_t be = cap_backend()) {
+            ggml_backend_event_wait(be, cap_side_ev);
+        }
+        cap_side_pending = false;
     }
     if (!balloc->init(batch_inp, vocab, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
@@ -3249,8 +3277,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     for (bool more = true; more; ) {
         // k15-pp: the state before the ubatch that starts at the capture index (a layer-major group captures inside its graph)
-        if (cap_idx >= 0 && !cap_done && n_tokens_prev == cap_idx) {
-            cap_now(mctx->get_ubatch().pos[0] - 1);
+        for (int s = 0; s < cap_max; ++s) {
+            if (cap[s].idx >= 0 && !cap[s].done && n_tokens_prev == cap[s].idx) {
+                cap_now(s, mctx->get_ubatch().pos[0] - 1);
+            }
         }
         // layer-major prompts: the next ubatches as one graph; afterwards `more` says whether mctx is at a ubatch not processed yet
         if (lm_enabled) {
@@ -4043,34 +4073,52 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     // the merged graph of the members [a, b) of the group: piece s of every member (in ubatch order) before piece s + 1
     ggml_context_ptr ctx_m;
     // k15-pp: the member that starts at the capture index, if a merged graph has to take the state before it
-    int cap_k_group = -1;
-    if (cap_idx >= 0 && !cap_done) {
-        for (size_t k = 1; k < group.size(); ++k) {
-            if (group[k].n_tokens_before == cap_idx) {
-                cap_k_group = (int) k;
+    int cap_k_group[cap_max];
+    for (int c = 0; c < cap_max; ++c) {
+        cap_k_group[c] = -1;
+        if (cap[c].idx >= 0 && !cap[c].done) {
+            for (size_t k = 1; k < group.size(); ++k) {
+                if (group[k].n_tokens_before == cap[c].idx) {
+                    cap_k_group[c] = (int) k;
+                }
             }
         }
     }
-    int  cap_k = -1;            // the member build_merged inserts the copies for
-    bool cap_in_graph = false;  // the merged graph being computed takes the capture
-    std::vector<bool> cap_seen;
+    int  cap_k[cap_max];             // the member build_merged inserts the copies of capture c for
+    bool cap_in_graph = false;       // the merged graph being computed takes a capture
+    std::vector<bool> cap_seen[cap_max];
+    for (int c = 0; c < cap_max; ++c) {
+        cap_k[c] = -1;
+    }
     int n_cap_nodes = 0;
+    // the captures the members [a, b) take before one of them, run as separate graphs (between graphs, in stream order)
+    auto cap_before = [&](size_t k) {
+        for (int c = 0; c < cap_max; ++c) {
+            if (cap_k_group[c] == (int) k && !cap[c].done) {
+                cap_now(c, group[k].ub->pos[0] - 1);
+            }
+        }
+    };
     auto build_merged = [&](size_t a, size_t b) -> ggml_cgraph * {
         size_t size = 64;
         for (size_t k = a; k < b; ++k) {
             size += (size_t) ggml_graph_n_nodes(group[k].gf) + group[k].n_leafs;
         }
-        cap_k = -1;
         cap_in_graph = false;
         n_cap_nodes = 0;
-        if (cap_k_group > (int) a && cap_k_group < (int) b && cap_prepare()) {
-            cap_k = cap_k_group;
-            cap_in_graph = true;
-            cap_seen.assign(cap_regions.size(), false);
-            size += 3*cap_regions.size();
+        size_t n_cap_regions = 0;
+        for (int c = 0; c < cap_max; ++c) {
+            cap_k[c] = -1;
+            if (cap_k_group[c] > (int) a && cap_k_group[c] < (int) b && !cap[c].done && cap_prepare(c)) {
+                cap_k[c] = cap_k_group[c];
+                cap_in_graph = true;
+                cap_seen[c].assign(cap[c].regions.size(), false);
+                size += 3*cap[c].regions.size();
+                n_cap_regions += cap[c].regions.size();
+            }
         }
         // k15-pp: the capture copies are tensors of this context too (a view of the state, the copy and its view of the snapshot)
-        const size_t meta = ggml_graph_overhead_custom(size, false) + (1 + (cap_in_graph ? 4*cap_regions.size() : 0))*ggml_tensor_overhead();
+        const size_t meta = ggml_graph_overhead_custom(size, false) + (1 + 4*n_cap_regions)*ggml_tensor_overhead();
         if (lm_meta.size() < meta) {
             lm_meta.resize(meta);
         }
@@ -4092,20 +4140,23 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 // is in the graph but not computed; expand would mark it computed, running e.g. the mixed-batch set_rows on unset indices)
                 for (int i = i0; i < i1; ++i) {
                     ggml_tensor * node = ggml_graph_node(gf, i);
-                    if ((int) k == cap_k) {
+                    for (int c = 0; c < cap_max; ++c) {
+                        if ((int) k != cap_k[c]) {
+                            continue;
+                        }
                         // k15-pp: the state rows as the members before this one left them, before its first node that reads or writes them
+                        auto & rg = cap[c].regions;
                         for (int sj = 0; sj < GGML_MAX_SRC + 1; ++sj) {
                             const ggml_tensor * t = sj == 0 ? node : node->src[sj - 1];
                             while (t != nullptr && t->view_src != nullptr) {
                                 t = t->view_src;
                             }
-                            for (size_t r = 0; t != nullptr && r < cap_regions.size(); ++r) {
-                                if (cap_regions[r].t == t && !cap_seen[r]) {
-                                    cap_seen[r] = true;
-                                    ggml_tensor * src = ggml_view_1d(ctx_m.get(), cap_regions[r].t, cap_regions[r].size/ggml_type_size(t->type),
-                                        cap_regions[r].off);
+                            for (size_t r = 0; t != nullptr && r < rg.size(); ++r) {
+                                if (rg[r].t == t && !cap_seen[c][r]) {
+                                    cap_seen[c][r] = true;
+                                    ggml_tensor * src = ggml_view_1d(ctx_m.get(), rg[r].t, rg[r].size/ggml_type_size(t->type), rg[r].off);
                                     const int n0 = ggml_graph_n_nodes(g);
-                                    ggml_build_forward_expand(g, ggml_cpy(ctx_m.get(), src, cap_regions[r].snap));
+                                    ggml_build_forward_expand(g, ggml_cpy(ctx_m.get(), src, rg[r].snap));
                                     n_cap_nodes += ggml_graph_n_nodes(g) - n0;
                                 }
                             }
@@ -4123,9 +4174,11 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
         if (cap_in_graph) {
             n_nodes_sum += (size_t) n_cap_nodes;
-            if (cap_k >= 0 && std::count(cap_seen.begin(), cap_seen.end(), true) != (std::ptrdiff_t) cap_seen.size()) {
-                LLAMA_LOG_WARN("%s: capture: %zu of %zu state rows not used by ubatch %d of the group\n", __func__,
-                    (size_t) std::count(cap_seen.begin(), cap_seen.end(), false), cap_seen.size(), cap_k);
+            for (int c = 0; c < cap_max; ++c) {
+                if (cap_k[c] >= 0 && std::count(cap_seen[c].begin(), cap_seen[c].end(), true) != (std::ptrdiff_t) cap_seen[c].size()) {
+                    LLAMA_LOG_WARN("%s: capture: %zu of %zu state rows not used by ubatch %d of the group\n", __func__,
+                        (size_t) std::count(cap_seen[c].begin(), cap_seen[c].end(), false), cap_seen[c].size(), cap_k[c]);
+                }
             }
         }
         // every node of every graph is in the merged graph once: a node that two graphs share (none expected) would run only in the first
@@ -4517,9 +4570,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             ggml_backend_sched_use_full_hash(sched.get());
         }
         first_run = false;
-        if (cap_k_group == (int) a && !cap_done) {
-            cap_now(group[a].ub->pos[0] - 1);
-        }
+        cap_before(a);
         if (b - a == 1) {
             cap_in_graph = false;
             const ggml_status st = run(group[a].gf);
@@ -4590,9 +4641,12 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             if (st == GGML_STATUS_SUCCESS) {
                 n_done = b;
                 extract_upto(n_done);
-                if (cap_in_graph && cap_k >= 0) {
-                    cap_done = true;
-                    cap_pos  = group[cap_k].ub->pos[0] - 1;
+                for (int c = 0; cap_in_graph && c < cap_max; ++c) {
+                    if (cap_k[c] >= 0) {
+                        cap[c].done = true;
+                        cap[c].pos  = group[cap_k[c]].ub->pos[0] - 1;
+                        cap_record(c, cap_backend());
+                    }
                 }
             }
             cap_in_graph = false;
@@ -4649,9 +4703,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             for (size_t k = n_done; k < group.size(); ++k) {
                 ggml_backend_sched_reset(sched.get());
                 ggml_backend_sched_use_full_hash(sched.get());
-                if ((int) k == cap_k_group && !cap_done) {
-                    cap_now(group[k].ub->pos[0] - 1);
-                }
+                cap_before(k);
                 status = run(group[k].gf);
                 if (status != GGML_STATUS_SUCCESS) {
                     break;
@@ -4670,9 +4722,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 ggml_backend_sched_reset(sched.get());
                 ggml_backend_sched_use_full_hash(sched.get());
             }
-            if ((int) k == cap_k_group && !cap_done) {
-                cap_now(group[k].ub->pos[0] - 1);
-            }
+            cap_before(k);
             status = run(group[k].gf);
             if (status != GGML_STATUS_SUCCESS) {
                 break;
@@ -6713,7 +6763,15 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
     if (flags & LLAMA_STATE_SEQ_FLAGS_CAPTURED) {
         // k15-pp: the captured rows and position in place of the current ones for the whole write, then back (synchronous)
-        if (!cap_done || seq_id != cap_seq || cap_regions.empty()) {
+        int cs = cap_sel >= 0 && cap[cap_sel].done && cap[cap_sel].seq == seq_id && !cap[cap_sel].regions.empty() ? cap_sel : -1;
+        if (cs < 0) {
+            for (int c = 0; c < cap_max; ++c) {
+                if (cap[c].done && cap[c].seq == seq_id && !cap[c].regions.empty() && (cs < 0 || cap[c].idx < cap[cs].idx)) {
+                    cs = c;
+                }
+            }
+        }
+        if (cs < 0) {
             LLAMA_LOG_ERROR("%s: no captured state for sequence %d\n", __func__, seq_id);
             return 0;
         }
@@ -6722,19 +6780,22 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get());
         auto * rec = hyb ? hyb->get_mem_recr() : dynamic_cast<llama_memory_recurrent *>(memory.get());
         std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> map;
-        for (const auto & r : cap_regions) {
+        for (const auto & r : cap[cs].regions) {
             map.emplace_back(r.t, r.snap);
         }
         rec->cap_map = &map;
-        rec->cap_pos = cap_pos;
+        rec->cap_pos = cap[cs].pos;
+        cap_save = cs;
         size_t n = 0;
         try {
             n = state_seq_get_data(seq_id, dst, size, flags);
         } catch (...) {
             rec->cap_map = nullptr;
+            cap_save = -1;
             throw;
         }
         rec->cap_map = nullptr;
+        cap_save = -1;
         return n;
     }
     if (flags & LLAMA_STATE_SEQ_FLAGS_ASYNC) {
@@ -7256,20 +7317,52 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
     std::vector<copy_job> jobs;
     jobs.reserve(winfos.size());
 
+    // k15-pp2: a captured state (every row a snapshot of capture cap_save, on one device) is read on a side stream after the
+    // event recorded right after its snapshot copies, so the reads overlap the ubatches queued since and the output wait of the
+    // decode does not wait for them (LLAMA_STATE_CAPTURE_SIDE=0: on the compute stream, as k15-pp)
+    static const bool side_env = getenv("LLAMA_STATE_CAPTURE_SIDE") == nullptr || atoi(getenv("LLAMA_STATE_CAPTURE_SIDE")) != 0;
+    ggml_backend_t side = nullptr;
+    if (side_env && cap_save >= 0 && cap[cap_save].ev_set && !winfos.empty()) {
+        const int b0 = owner[0];
+        bool one = true;
+        for (size_t i = 0; i < winfos.size(); ++i) {
+            one = one && owner[i] == b0;
+        }
+        if (one) {
+            if (cap_side == nullptr) {
+                cap_side    = ggml_backend_dev_init(state_async[b0].dev, nullptr);
+                cap_side_ev = cap_side ? ggml_backend_event_new(state_async[b0].dev) : nullptr;
+                if (cap_side == nullptr || cap_side_ev == nullptr) {
+                    LLAMA_LOG_WARN("%s: no side stream for captured state reads, they run on the compute stream\n", __func__);
+                }
+            }
+            if (cap_side != nullptr && cap_side_ev != nullptr && ggml_backend_get_device(cap_side) == state_async[b0].dev) {
+                side = cap_side;
+                ggml_backend_event_wait(side, cap[cap_save].ev);
+            }
+        }
+    }
+
     for (size_t i = 0; i < winfos.size(); ++i) {
         auto & sa = state_async[owner[i]];
         uint8_t * stage = (uint8_t *) ggml_backend_buffer_get_base(sa.staging.get()) + offs[i];
 
-        ggml_backend_tensor_get_async(sa.backend, winfos[i].tensor, stage, winfos[i].offset, winfos[i].size);
+        ggml_backend_tensor_get_async(side ? side : sa.backend, winfos[i].tensor, stage, winfos[i].offset, winfos[i].size);
 
         jobs.push_back({ winfos[i].dst, stage, winfos[i].size });
     }
 
     std::vector<ggml_backend_event_t> events;
-    for (size_t b = 0; b < state_async.size(); ++b) {
-        if (need[b] > 0) {
-            ggml_backend_event_record(state_async[b].event, state_async[b].backend);
-            events.push_back(state_async[b].event);
+    if (side) {
+        ggml_backend_event_record(cap_side_ev, side);
+        events.push_back(cap_side_ev);
+        cap_side_pending = true;
+    } else {
+        for (size_t b = 0; b < state_async.size(); ++b) {
+            if (need[b] > 0) {
+                ggml_backend_event_record(state_async[b].event, state_async[b].backend);
+                events.push_back(state_async[b].event);
+            }
         }
     }
 
@@ -7997,26 +8090,95 @@ bool llama_context::set_state_capture(llama_seq_id seq_id, int32_t i_batch) {
     if (rec == nullptr || (hyb && model.hparams.swa_type != LLAMA_SWA_TYPE_NONE)) {
         return false;
     }
-    cap_seq     = seq_id;
-    cap_idx     = i_batch;
-    cap_pending = true;
+    // k15-pp2: one slot per (sequence, index) for the next decode, up to cap_max (LLAMA_STATE_CAPTURE_MAX=1: one, as k15-pp)
+    static const int n_max = getenv("LLAMA_STATE_CAPTURE_MAX") ? std::max(1, std::min(cap_max, atoi(getenv("LLAMA_STATE_CAPTURE_MAX")))) : cap_max;
+    int s = -1;
+    for (int c = 0; c < n_max && s < 0; ++c) {
+        if (cap[c].pending && cap[c].seq == seq_id && cap[c].idx == i_batch) {
+            s = c;
+        }
+    }
+    for (int c = 0; c < n_max && s < 0; ++c) {
+        if (!cap[c].pending) {
+            s = c;
+        }
+    }
+    if (s < 0) {
+        return false;
+    }
+    cap[s].seq     = seq_id;
+    cap[s].idx     = i_batch;
+    cap[s].pending = true;
     return true;
 }
 
+// the first capture of the sequence taken by the last decode (the one at the lowest index); it is also the one a CAPTURED read takes
 bool llama_context::state_captured(llama_seq_id seq_id, llama_pos * pos_max) const {
-    if (!cap_done || seq_id != cap_seq) {
+    int best = -1;
+    for (int c = 0; c < cap_max; ++c) {
+        if (cap[c].done && cap[c].seq == seq_id && !cap[c].regions.empty() && (best < 0 || cap[c].idx < cap[best].idx)) {
+            best = c;
+        }
+    }
+    if (best < 0) {
         return false;
     }
     if (pos_max) {
-        *pos_max = cap_pos;
+        *pos_max = cap[best].pos;
     }
     return true;
 }
 
-bool llama_context::cap_prepare() {
-    if (!cap_regions.empty()) {
+// the capture of the sequence at batch index i_batch taken by the last decode; selects it for the next LLAMA_STATE_SEQ_FLAGS_CAPTURED read
+bool llama_context::state_captured_at(llama_seq_id seq_id, int32_t i_batch, llama_pos * pos_max) {
+    for (int c = 0; c < cap_max; ++c) {
+        if (cap[c].done && cap[c].seq == seq_id && cap[c].idx == i_batch && !cap[c].regions.empty()) {
+            cap_sel = c;
+            if (pos_max) {
+                *pos_max = cap[c].pos;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+ggml_backend_t llama_context::cap_backend() const {
+    for (const auto & c : cap) {
+        if (c.buf) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(c.buf.get()));
+            for (const auto & b : backends) {
+                if (ggml_backend_get_device(b.get()) == dev) {
+                    return b.get();
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
+// k15-pp2: an event on the compute stream right after the snapshot copies of capture s, for the side-stream read of its save
+void llama_context::cap_record(int s, ggml_backend_t be) {
+    auto & C = cap[s];
+    C.ev_set = false;
+    if (be == nullptr) {
+        return;
+    }
+    if (C.ev == nullptr) {
+        C.ev = ggml_backend_event_new(ggml_backend_get_device(be));
+    }
+    if (C.ev != nullptr) {
+        ggml_backend_event_record(C.ev, be);
+        C.ev_set = true;
+    }
+}
+
+bool llama_context::cap_prepare(int s) {
+    auto & C = cap[s];
+    if (!C.regions.empty()) {
         return true;
     }
+    const llama_seq_id cap_seq = C.seq;
     auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get());
     auto * rec = hyb ? hyb->get_mem_recr() : dynamic_cast<llama_memory_recurrent *>(memory.get());
     if (rec == nullptr || cap_seq < 0) {
@@ -8064,44 +8226,45 @@ bool llama_context::cap_prepare() {
     if (rg.empty()) {
         return false;
     }
-    if (!cap_buf || ggml_backend_buffer_get_size(cap_buf.get()) < total + 4096 || ggml_backend_buffer_get_type(cap_buf.get()) != buft ||
-            !cap_ctx || ggml_get_mem_size(cap_ctx.get()) < (rg.size() + 1)*ggml_tensor_overhead()) {
-        cap_buf.reset(ggml_backend_buft_alloc_buffer(buft, total + 4096));
-        if (!cap_buf) {
+    if (!C.buf || ggml_backend_buffer_get_size(C.buf.get()) < total + 4096 || ggml_backend_buffer_get_type(C.buf.get()) != buft ||
+            !C.ctx || ggml_get_mem_size(C.ctx.get()) < (rg.size() + 1)*ggml_tensor_overhead()) {
+        C.buf.reset(ggml_backend_buft_alloc_buffer(buft, total + 4096));
+        if (!C.buf) {
             return false;
         }
         ggml_init_params ip = { (2*rg.size() + 8)*ggml_tensor_overhead(), nullptr, true };
-        cap_ctx.reset(ggml_init(ip));
+        C.ctx.reset(ggml_init(ip));
     } else {
-        ggml_free(cap_ctx.release());
+        ggml_free(C.ctx.release());
         ggml_init_params ip = { (2*rg.size() + 8)*ggml_tensor_overhead(), nullptr, true };
-        cap_ctx.reset(ggml_init(ip));
+        C.ctx.reset(ggml_init(ip));
     }
-    uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(cap_buf.get());
+    uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(C.buf.get());
     const size_t align = ggml_backend_buft_get_alignment(buft);
     size_t off = 0;
     for (auto & r : rg) {
         off = GGML_PAD(off, std::max<size_t>(align, 256));
-        r.snap = ggml_new_tensor_1d(cap_ctx.get(), r.t->type, (int64_t) (r.size/ggml_type_size(r.t->type)));
-        if (ggml_backend_tensor_alloc(cap_buf.get(), r.snap, base + off) != GGML_STATUS_SUCCESS) {
+        r.snap = ggml_new_tensor_1d(C.ctx.get(), r.t->type, (int64_t) (r.size/ggml_type_size(r.t->type)));
+        if (ggml_backend_tensor_alloc(C.buf.get(), r.snap, base + off) != GGML_STATUS_SUCCESS) {
             return false;
         }
-        r.view = ggml_view_1d(cap_ctx.get(), r.t, (int64_t) (r.size/ggml_type_size(r.t->type)), r.off);
+        r.view = ggml_view_1d(C.ctx.get(), r.t, (int64_t) (r.size/ggml_type_size(r.t->type)), r.off);
         off += r.size;
     }
-    cap_cell    = (uint32_t) cell;
-    cap_regions = std::move(rg);
+    C.cell    = (uint32_t) cell;
+    C.regions = std::move(rg);
     return true;
 }
 
-void llama_context::cap_now(llama_pos pos) {
-    if (!cap_prepare()) {
+void llama_context::cap_now(int s, llama_pos pos) {
+    if (!cap_prepare(s)) {
         return;
     }
+    auto & C = cap[s];
     // device copies in stream order on the backend that holds the rows (after the ubatches queued so far, before the next one),
     // else through host memory after a sync
     ggml_backend_t be = nullptr;
-    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cap_buf.get()));
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(C.buf.get()));
     for (const auto & b : backends) {
         if (ggml_backend_get_device(b.get()) == dev) {
             be = b.get();
@@ -8109,19 +8272,20 @@ void llama_context::cap_now(llama_pos pos) {
         }
     }
     if (be != nullptr) {
-        for (const auto & r : cap_regions) {
+        for (const auto & r : C.regions) {
             ggml_backend_tensor_copy_async(be, be, r.view, r.snap);
         }
+        cap_record(s, be);
     } else {
         ggml_backend_sched_synchronize(sched.get());
-        for (const auto & r : cap_regions) {
+        for (const auto & r : C.regions) {
             std::vector<uint8_t> tmp(r.size);
             ggml_backend_tensor_get(r.t, tmp.data(), r.off, r.size);
             ggml_backend_tensor_set(r.snap, tmp.data(), 0, r.size);
         }
     }
-    cap_done = true;
-    cap_pos  = pos;
+    C.done = true;
+    C.pos  = pos;
 }
 
 
@@ -8160,6 +8324,10 @@ bool llama_state_capture_supported(const llama_context * ctx) {
 
 bool llama_set_state_capture(llama_context * ctx, llama_seq_id seq_id, int32_t i_batch) {
     return ctx->set_state_capture(seq_id, i_batch);
+}
+
+bool llama_state_seq_captured_at(llama_context * ctx, llama_seq_id seq_id, int32_t i_batch, llama_pos * pos_max) {
+    return ctx->state_captured_at(seq_id, i_batch, pos_max);
 }
 
 bool llama_state_seq_captured(const llama_context * ctx, llama_seq_id seq_id, llama_pos * pos_max) {

@@ -120,6 +120,9 @@ LLAMA_API void llama_set_ubatch_breaks(struct llama_context * ctx, const int32_t
 #define LLAMA_STATE_SEQ_FLAGS_CAPTURED 8
 LLAMA_API bool llama_set_state_capture(struct llama_context * ctx, llama_seq_id seq_id, int32_t i_batch);
 LLAMA_API bool llama_state_seq_captured(const struct llama_context * ctx, llama_seq_id seq_id, llama_pos * pos_max);
+// k15-pp2: up to two captures per decode (llama_set_state_capture once per index; LLAMA_STATE_CAPTURE_MAX=1: one). The capture at
+// batch index i_batch taken by the last decode; selects it for the next LLAMA_STATE_SEQ_FLAGS_CAPTURED read (default: the lowest index)
+LLAMA_API bool llama_state_seq_captured_at(struct llama_context * ctx, llama_seq_id seq_id, int32_t i_batch, llama_pos * pos_max);
 // k15-ttft: whether llama_set_state_capture can take a capture in this context (a recurrent memory, beside a non-SWA KV cache if hybrid)
 LLAMA_API bool llama_state_capture_supported(const struct llama_context * ctx);
 // layer-major prompt groups can run in this context (a MoE cache with layer-major prompts on)
