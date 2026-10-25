@@ -3177,6 +3177,7 @@ struct llama_moe_cache::impl {
     bool ua_verify  = false;
     uint64_t ua_verified = 0, ua_bad = 0;
     size_t   ua_up_last = 0;
+    size_t   ua_copy_last = 0;
     bool ua_skip = false;        // no predictions in this ubatch (see prepare)
     int64_t ua_prev_tokens = 0;
     bool ua_off = false; // an upload could not be issued: no more uploads ahead (the admitted ones are dropped by the drain)
@@ -3464,11 +3465,12 @@ struct llama_moe_cache::impl {
             if (ua_log > 2) {
                 for (const group & g : groups) {
                     const int64_t n_mapped = std::count_if(g.lru.key_of.begin(), g.lru.key_of.end(), [](int32_t k) { return k >= 0; });
-                    LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead off: group of %zu layers: %" PRId64 " of %d slots mapped, %d lent, dev_newer %d\n", tag,
-                        g.layers.size(), n_mapped, g.n_slots, g.lru.n_lent, (int) g.dev_newer);
+                    LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead off: group of %zu layers: %" PRId64 " of %d slots mapped, %d lent, dev_newer %d; copied from the cache %.1f MiB, lends %d (max %d)\n", tag,
+                        g.layers.size(), n_mapped, g.n_slots, g.lru.n_lent, (int) g.dev_newer, (stats_copy.bytes - ua_copy_last)/1048576.0, (int) n_lends, (int) lend_max);
                 }
             }
             ua_up_last = stats_upload.bytes;
+            ua_copy_last = stats_copy.bytes;
             return;
         }
         for (size_t id = 0; id < ua_devs.size(); ++id) {
@@ -3537,11 +3539,12 @@ struct llama_moe_cache::impl {
         if (ua_log > 2) {
             for (const group & g : groups) {
                 const int64_t n_mapped = std::count_if(g.lru.key_of.begin(), g.lru.key_of.end(), [](int32_t k) { return k >= 0; });
-                LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead: group of %zu layers: %" PRId64 " of %d slots mapped, %d lent, dev_newer %d, %" PRIu64 " reads blocked\n", tag,
-                    g.layers.size(), n_mapped, g.n_slots, g.lru.n_lent, (int) g.dev_newer, ua_st_ub.blocked);
+                LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead: group of %zu layers: %" PRId64 " of %d slots mapped, %d lent, dev_newer %d, %" PRIu64 " reads blocked; copied from the cache %.1f MiB, lends %d (max %d)\n", tag,
+                    g.layers.size(), n_mapped, g.n_slots, g.lru.n_lent, (int) g.dev_newer, ua_st_ub.blocked, (stats_copy.bytes - ua_copy_last)/1048576.0, (int) n_lends, (int) lend_max);
             }
         }
         ua_up_last = stats_upload.bytes;
+        ua_copy_last = stats_copy.bytes;
         ua_st.layers += ua_st_ub.layers; ua_st.admitted += ua_st_ub.admitted; ua_st.hit += ua_st_ub.hit; ua_st.waste += ua_st_ub.waste;
         ua_st.lost += ua_st_ub.lost; ua_st.miss_rest += ua_st_ub.miss_rest; ua_st.bytes += ua_st_ub.bytes; ua_st.waste_bytes += ua_st_ub.waste_bytes;
         ua_st.fallback += ua_st_ub.fallback;
