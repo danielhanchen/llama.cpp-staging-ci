@@ -3461,6 +3461,13 @@ struct llama_moe_cache::impl {
             if (ua_log > 1 && stats_upload.bytes != ua_up_last) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead off; copies uploaded %.1f MiB\n", tag, (stats_upload.bytes - ua_up_last)/1048576.0);
             }
+            if (ua_log > 2) {
+                for (const group & g : groups) {
+                    const int64_t n_mapped = std::count_if(g.lru.key_of.begin(), g.lru.key_of.end(), [](int32_t k) { return k >= 0; });
+                    LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead off: group of %zu layers: %" PRId64 " of %d slots mapped, %d lent, dev_newer %d\n", tag,
+                        g.layers.size(), n_mapped, g.n_slots, g.lru.n_lent, (int) g.dev_newer);
+                }
+            }
             ua_up_last = stats_upload.bytes;
             return;
         }
@@ -3526,6 +3533,13 @@ struct llama_moe_cache::impl {
                 " hits lost, %" PRIu64 " misses left, %.1f MiB ahead, %.1f MiB wasted, %" PRIu64 " fallbacks; copies uploaded %.1f MiB\n", tag, ua_st_ub.layers, ua_st_ub.admitted,
                 ua_st_ub.hit, ua_st_ub.waste, ua_st_ub.lost, ua_st_ub.miss_rest, ua_st_ub.bytes/1048576.0, ua_st_ub.waste_bytes/1048576.0,
                 ua_st_ub.fallback, (stats_upload.bytes - ua_up_last)/1048576.0);
+        }
+        if (ua_log > 2) {
+            for (const group & g : groups) {
+                const int64_t n_mapped = std::count_if(g.lru.key_of.begin(), g.lru.key_of.end(), [](int32_t k) { return k >= 0; });
+                LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead: group of %zu layers: %" PRId64 " of %d slots mapped, %d lent, dev_newer %d\n", tag,
+                    g.layers.size(), n_mapped, g.n_slots, g.lru.n_lent, (int) g.dev_newer);
+            }
         }
         ua_up_last = stats_upload.bytes;
         ua_st.layers += ua_st_ub.layers; ua_st.admitted += ua_st_ub.admitted; ua_st.hit += ua_st_ub.hit; ua_st.waste += ua_st_ub.waste;
