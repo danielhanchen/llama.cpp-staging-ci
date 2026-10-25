@@ -122,6 +122,9 @@ LLAMA_API bool llama_set_state_capture(struct llama_context * ctx, llama_seq_id 
 LLAMA_API bool llama_state_seq_captured(const struct llama_context * ctx, llama_seq_id seq_id, llama_pos * pos_max);
 // layer-major prompt groups can run in this context (a MoE cache with layer-major prompts on)
 LLAMA_API bool llama_layer_major_on(const struct llama_context * ctx);
+// k15-pp: a batch of n_before + n_after prompt tokens of one sequence with a ubatch break (llama_set_ubatch_breaks) after n_before would
+// run the first ubatch after the break in the same layer-major group as the one before it
+LLAMA_API bool llama_layer_major_spans(const struct llama_context * ctx, int32_t n_before, int32_t n_after);
 // k11: wait for the asynchronous state save in flight (LLAMA_STATE_SEQ_FLAGS_ASYNC), before its destination is read or freed
 LLAMA_API void llama_state_seq_async_wait(struct llama_context * ctx);
 
