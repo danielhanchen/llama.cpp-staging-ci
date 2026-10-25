@@ -4776,7 +4776,12 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         // used most (its routing, read before the compute buffers are freed). G4 4 GB, Qwen3.6 Q3_K_M + MTP 2, 3 launches: decode 2k / 8k
         // 136.1 / 150.0 tok/s held before, 138.0 / 146.1 routed (release off 133.6 / 149.3); long-prompt KLD against the all-device run,
         // first token mean 0.00076 held before, 0.00134 routed (the -fa off band 0.00031, k12 0.00118)
-        static const bool lm_release_routed = getenv("LLAMA_MOE_LM_RELEASE_ROUTED") != nullptr && atoi(getenv("LLAMA_MOE_LM_RELEASE_ROUTED")) != 0;
+        // k15-small4: on by default without a draft model (no-draft layer-major prompts, LLAMA_MOE_LAYER_MAJOR_NODRAFT): the slots of a fresh
+        // cache held nothing before the group, so the held-before refill uploaded nothing and decode started from an empty cache (G4 4 GB,
+        // Qwen3.6 Q4_K_XL: 238 experts admitted by the prompts against 1399 ubatch by ubatch, decode -0.7..-2.2%). It changes only which
+        // experts the cache holds. LLAMA_MOE_LM_RELEASE_ROUTED=0 off, =1 on with a draft too
+        static const char * lm_rr_env = getenv("LLAMA_MOE_LM_RELEASE_ROUTED");
+        const bool lm_release_routed = lm_rr_env != nullptr ? atoi(lm_rr_env) != 0 : !cparams.spec_draft;
         if (lm_release_routed && status == GGML_STATUS_SUCCESS) {
             moe_cache->set_refill_routed_once(true);
             moe_cache_ids = lm_record;
