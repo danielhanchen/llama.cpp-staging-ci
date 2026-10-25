@@ -1365,7 +1365,8 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // zero-fill of a fresh multi-MiB buffer (page faults included) otherwise ran on the main thread before the save was queued
 // k15-ttft: buffers of at least 4 MiB are 2 MiB aligned and marked MADV_HUGEPAGE (Linux), so a fresh state / checkpoint buffer faults
 // in 2 MiB pages instead of 4 KiB ones (a 77 MiB prompt-cache save: ~40 faults instead of ~20000). Same memory, same bytes.
-// LLAMA_STATE_THP=0: plain allocations
+// Opt-in (LLAMA_STATE_THP=1): on G4 Flash-Next 32 GB (62 GB host RSS) the madvised allocations stalled in direct compaction
+// (multi-turn steps of 6.8 s and 10.8 s against 2.1 s and 0.95 s, regenerate 64 ms against 44 ms)
 bool   common_state_thp_on();
 void * common_state_thp_alloc(size_t bytes);
 void   common_state_thp_free(void * p);

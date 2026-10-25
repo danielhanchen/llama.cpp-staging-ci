@@ -4050,7 +4050,7 @@ void common_state_buf_recycle(common_state_buf && buf) {
 
 bool common_state_thp_on() {
 #if defined(__linux__)
-    static const bool on = getenv("LLAMA_STATE_THP") == nullptr || atoi(getenv("LLAMA_STATE_THP")) != 0;
+    static const bool on = getenv("LLAMA_STATE_THP") != nullptr && atoi(getenv("LLAMA_STATE_THP")) != 0;
     return on;
 #else
     return false;
