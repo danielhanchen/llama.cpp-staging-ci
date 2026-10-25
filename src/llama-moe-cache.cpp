@@ -5197,13 +5197,12 @@ struct llama_moe_cache::impl {
     // is allocated; the memory kept free for a later model or context (set_mem_reserve) is held against the copies and the graph
     // allocation without the copies of a seeding prompt (`seed` bytes of `graph`): a seed that does not fit is dropped by itself (see
     // llama_context::sched_reserve_seed), lending for it costs the prompts the slots
-    // k15-fn: lending frees the staging arena (`need` bytes) and costs the graph allocation the copies a seeding prompt then holds there
-    // (at most `seed`, the largest split): it lends where that frees at least lend_save_min bytes, whatever the share of the cache. The
-    // fit gives the cache the memory it frees (see llama_context::sched_reserve), so the rule must not depend on the cache size or the
-    // free memory: both change with what the fit gives. G4 Qwen3.8-Flash-Next UD-IQ4_XS + MTP at 32 GB: staging 1275 MiB (6.8% of the
-    // cache, lending was off), split 850 MiB, the lent prompt graph about 480 MiB above the pp graph, so about 790 MiB for the cache;
-    // Qwen3.6 UD-Q4_K_XL at 12 / 16 GB: 354 MiB staging beside a 210 MiB split, below the bar (it lends there anyway because the copies
-    // do not fit, see below; the fit is unchanged)
+    // k15-fn: lending frees the staging arena (`need` bytes), and the fit gives those bytes to the cache (see llama_context::sched_reserve);
+    // a prompt that seeds from its own ids then holds the copies of a split (`seed`) in the graph allocation, if the memory left holds
+    // them. The cache lends where the arena is at least lend_save_min bytes larger than that split, whatever its share of the cache. The
+    // fit and the load must decide the same, so the rule does not depend on the cache size or the free memory. G4 Qwen3.8-Flash-Next
+    // UD-IQ4_XS + MTP at 32 GB: arena 1275 MiB (6.8% of the cache, lending was off), split 850 MiB -> on; Qwen3.6 UD-Q4_K_XL at 12 / 16 GB:
+    // 354 / 210 MiB -> off (it lends there anyway because the copies do not fit, see below, and its fit is unchanged)
     // Discrete GPUs only: on an integrated GPU (gfx1151, unified memory) the rule is not measured, lending stays as it was there
     bool lend_saves(int32_t id, size_t need, size_t seed) const {
         if (!lend_save || need <= seed || need - seed < lend_save_min) {

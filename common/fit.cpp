@@ -148,6 +148,15 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         }
     }
 
+    // k15-fn: the staging arena a lending MoE cache takes over (mb.lend_freed) is memory the measure counted nowhere and the loaded
+    // context does not take: count it off the device (compute first, then context), as the fit counts the arena of a context that
+    // does not lend (not at all). fit_moe_cache_size gives it to the cache. LLAMA_MOE_CACHE_LEND_SAVE=0 off (nothing reported)
+    for (size_t i = 0; i < nd; i++) {
+        const size_t c = std::min(ret[i].mb.compute, ret[i].mb.lend_freed);
+        ret[i].mb.compute -= c;
+        ret[i].mb.context -= std::min(ret[i].mb.context, ret[i].mb.lend_freed - c);
+    }
+
     {
         ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         if (cpu_dev == nullptr) {
@@ -500,7 +509,7 @@ static void common_params_fit_impl(
                 // +338 / +532 MiB of cache at 12 / 16 GB gave +7..+10% decode at 2k-16k (12 GB) and +-2% (16 GB), but a 42-token prompt's
                 // TTFT went 165 -> 178 ms and 125 -> 139 ms; Flash-Next UD-IQ4_XS at 16 / 32 GB and LFM2.5 16 GB had no surplus to fill
                 static const bool fill = getenv("LLAMA_MOE_FIT_FILL") != nullptr && atoi(getenv("LLAMA_MOE_FIT_FILL")) != 0;
-                // k15-fn: where the cache lends because that frees memory (llama_moe_cache lend_saves), the measure counts the compute
+                // k15-fn: where the cache lends because that frees memory (llama_moe_cache lend_saves), the measure counts the device
                 // that much lower (mb.lend_freed). That is a fixed amount, not one that grows with the cache, so the first size, which
                 // takes the whole difference to the measure without the cache as the cache's, misses it: grow by it (at most), as the
                 // fill does by any surplus. LLAMA_MOE_CACHE_LEND_SAVE=0 off (no lending for it, nothing freed)

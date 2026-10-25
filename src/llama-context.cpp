@@ -1370,41 +1370,24 @@ void llama_context::sched_reserve() {
     }
 
     // k15-fn: the fit's measure (no LLAMA_MOE_MEASURE_LENT) leaves the staging arena out (see above: it only uses memory that is left).
-    // Where the cache lends because that frees memory (llama_moe_cache lend_saves, or LLAMA_MOE_CACHE_LEND=1) the loaded context has
-    // no arena, and a prompt that seeds the cache holds the copies of its split in the graph allocation instead: the context then
-    // needs `staging - seed growth` bytes less than one without lending, and the measure gives them to the cache (it counts the compute
-    // that much below the graph alone, so the margin the fit keeps for the arena stays the same). G4 Qwen3.8-Flash-Next UD-IQ4_XS + MTP
-    // at 32 GB: 2274 MiB of compute without lending, 1481 lent (k15l_g4, plans/k15_fn.md section 18). LLAMA_MOE_CACHE_LEND_SAVE=0 off
+    // Where the cache lends because that frees memory (llama_moe_cache lend_saves, or LLAMA_MOE_CACHE_LEND=1) the loaded context has no
+    // arena: the measure reports its bytes (mb.lend_freed, which the fit gives to the cache, see common_get_device_memory_data_impl),
+    // so the memory left after the load is the same as with the arena. The seeding prompt's copies are not counted, as without lending: the seed graph is reserved
+    // only if the memory left holds it (see sched_reserve_seed), like a default context that cannot fit it. G4 Qwen3.8-Flash-Next
+    // UD-IQ4_XS + MTP at 32 GB: k15gl_g4 counted the seed growth (546 MiB) too, the cache got 721 MiB and every prompt seeded the
+    // cache from its own ids: the 2k prompt lost 17% (2448 -> 2044 tok/s), the default does not seed there. LLAMA_MOE_CACHE_LEND_SAVE=0 off
     if (model.hparams.no_alloc) {
         backend_lend_freed.assign(backend_ptrs.size(), 0);
     }
     if (model.hparams.no_alloc && moe_cache && measure_env == nullptr) {
-        std::vector<size_t> save(backend_ptrs.size(), 0);
-        bool any = false;
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-            save[i] = moe_cache->lend_save_need(backend_ptrs[i]);
-            any = any || save[i] > 0;
-        }
-        if (any) {
-            const bool seeds = moe_cache_seed_sync && n_tokens > llama_moe_cache::n_small_max && (int64_t) n_tokens >= prefetch_min_batch;
-            std::vector<size_t> sizes(backend_ptrs.size(), 0);
-            if (seeds) {
-                moe_cache_seed = true;
-                graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), /*split_only =*/ true, sizes.data());
-                moe_cache_seed = false;
+            const size_t save = moe_cache->lend_save_need(backend_ptrs[i]);
+            if (save == 0) {
+                continue;
             }
-            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-                if (save[i] == 0) {
-                    continue;
-                }
-                const size_t grow  = seeds ? sizes[i] - std::min(sizes[i], backend_buf_exp_size[i]) : 0;
-                const size_t freed = save[i] - std::min(save[i], grow);
-                LLAMA_LOG_DEBUG("%s: %s: measure: compute %.2f MiB, the cache lends %.2f MiB of staging, a seeding prompt's graph %.2f MiB larger: "
-                    "%.2f MiB to the cache\n", __func__, ggml_backend_buft_name(backend_buft[i]), backend_buf_exp_size[i]/1024.0/1024.0,
-                    save[i]/1024.0/1024.0, grow/1024.0/1024.0, freed/1024.0/1024.0);
-                backend_lend_freed[i] = std::min(backend_buf_exp_size[i], freed);
-                backend_buf_exp_size[i] -= backend_lend_freed[i];
-            }
+            backend_lend_freed[i] = save;
+            LLAMA_LOG_DEBUG("%s: %s: measure: compute %.2f MiB, the cache lends %.2f MiB of staging to the cache\n", __func__,
+                ggml_backend_buft_name(backend_buft[i]), backend_buf_exp_size[i]/1024.0/1024.0, save/1024.0/1024.0);
         }
     }
 
