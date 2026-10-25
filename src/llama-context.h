@@ -609,6 +609,7 @@ private:
     std::vector<int32_t> ubatch_breaks_next;
     bool lm_auto    = false;  // LLAMA_MOE_LAYER_MAJOR unset: on beside speculative decoding with a model
     int  lm_ub_max  = 16;     // ubatches per layer-major graph [LLAMA_MOE_LAYER_MAJOR_UB_MAX]
+    int64_t lm_n_tail = 0;    // k15-pp2: short last ubatches run as the last member of a group (LLAMA_LM_TAIL)
     bool lm_verbose = false;  // [LLAMA_MOE_LAYER_MAJOR_LOG]
     bool lm_replay_logged = false; // k11: the first replayed device seed is logged (see decode_layer_major)
     // beside the device seed of prompt ubatches (moe_cache_devseed_on): groups run [LLAMA_MOE_LAYER_MAJOR_DEVSEED, default 1] and the

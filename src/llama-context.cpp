@@ -3829,9 +3829,22 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     int64_t n_tokens_group  = 0;
     int64_t t_build_us = 0, t_set_us = 0;
     more = true;
+    // k15-pp2 (LLAMA_LM_TAIL=1): the last ubatch of the batch, too short to be eligible (e.g. the server's last 4 prompt tokens, now in
+    // the same decode as the rest), joins the group as its last member: built as a large ubatch (llama_moe_cache::set_force_large) with
+    // its expert products on the device, it reads the host experts the group already copies for each layer instead of looking them up,
+    // copying the misses and computing some on the host in a pass of its own
+    // opt-in for now (LLAMA_LM_TAIL=1): exact without speculative decoding, but beside an MTP drafter the first verify after the prompt
+    // gives other logits (local B200, Qwen3.6 q4x 12 GB pinned: draft acceptance 33/58 -> 23/80 at 2k), cause not found yet
+    static const bool lm_tail_env = getenv("LLAMA_LM_TAIL") != nullptr && atoi(getenv("LLAMA_LM_TAIL")) != 0;
+    // the device assignments of the tail member, set again after every scheduler reset (a refused allocation, a split of the group)
+    std::vector<std::pair<ggml_tensor *, ggml_backend_t>> lm_tail_pins;
+    // not in a drafter's context (backend samplers: its outputs are the greedy drafts of the last member)
+    const bool lm_tail_ctx = sampling.samplers.empty() && (getenv("LLAMA_LM_TAIL_ANY") != nullptr || cparams.embeddings_nextn || true);
     while ((int) group.size() < lm_ub_max) {
         const auto & ub = mctx->get_ubatch();
-        if (!group.empty() && !eligible(ub)) {
+        const bool tail = lm_tail_env && lm_tail_ctx && !group.empty() && !eligible(ub) && ub.n_seqs_unq == 1 && ub.n_tokens > 0 &&
+            (int64_t) ub.n_tokens < prefetch_min_batch && n_tokens_prev + n_tokens_group + (int64_t) ub.n_tokens == (int64_t) n_tokens_all;
+        if (!group.empty() && !eligible(ub) && !tail) {
             break;
         }
         int32_t n_out = 0;
@@ -3865,7 +3878,54 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         auto * res = lm_res[k].get();
         res->reset();
         const int64_t tb0 = ggml_time_us();
+        if (tail) {
+            moe_cache->set_force_large(true);
+        }
         ggml_cgraph * gf = model.build_graph(graph_params(res, ub, mctx, gtype));
+        if (tail) {
+            moe_cache->set_force_large(false);
+            // its ops on host weights run on the device as the large members' do (the backends would leave a short batch on the CPU)
+            ggml_backend_t be_dev = nullptr;
+            for (const auto & b : backends) {
+                if (b.get() != backend_cpu && ggml_backend_dev_type(ggml_backend_get_device(b.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    be_dev = b.get();
+                    break;
+                }
+            }
+            for (int i = 0; gf != nullptr && be_dev != nullptr && i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                if (node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_NONE) {
+                    continue;
+                }
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    const ggml_tensor * t = node->src[j];
+                    while (t != nullptr && t->view_src != nullptr) {
+                        t = t->view_src;
+                    }
+                    if (t != nullptr && t->buffer != nullptr && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                            ggml_backend_buffer_is_host(t->buffer)) {
+                        ggml_backend_sched_set_tensor_backend(sched.get(), node, be_dev);
+                        lm_tail_pins.emplace_back(node, be_dev);
+                        break;
+                    }
+                }
+            }
+            lm_n_tail++;
+            if (getenv("LLAMA_LM_TAIL_DEBUG") != nullptr) {
+                int n_pin = 0, n_mmid = 0, n_mmid_pin = 0;
+                for (int i = 0; gf != nullptr && i < ggml_graph_n_nodes(gf); ++i) {
+                    ggml_tensor * node = ggml_graph_node(gf, i);
+                    ggml_backend_t be = ggml_backend_sched_get_tensor_backend(sched.get(), node);
+                    n_pin += be == be_dev;
+                    if (node->op == GGML_OP_MUL_MAT_ID) {
+                        n_mmid++;
+                        n_mmid_pin += be == be_dev;
+                    }
+                }
+                LLAMA_LOG_INFO("%s: tail member of %u tokens: %d nodes pinned to %s, MUL_MAT_ID %d of %d\n", __func__, ub.n_tokens, n_pin,
+                    be_dev ? ggml_backend_name(be_dev) : "none", n_mmid_pin, n_mmid);
+            }
+        }
         t_build_us += ggml_time_us() - tb0;
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to build the graph of ubatch %zu\n", __func__, k);
@@ -3994,6 +4054,17 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             }
         }
         n_total += (size_t) ggml_graph_n_nodes(gf) + group[k].n_leafs;
+        if (getenv("LLAMA_LM_TAIL_DEBUG") != nullptr && (k + 1 == group.size() || k == 0) && cuts[k].size() > 4) {
+            for (size_t c = 1; c < 5; ++c) {
+                const int at = cuts[k][c];
+                std::string sline;
+                for (int i = std::max(0, at - 6); i < std::min(ggml_graph_n_nodes(gf), at + 3); ++i) {
+                    const ggml_tensor * nd = ggml_graph_node(gf, i);
+                    sline += (i == at ? " | " : " ") + std::string(ggml_op_desc(nd)) + ":" + nd->name;
+                }
+                LLAMA_LOG_INFO("%s: member %zu cut %zu at %d (%s):%s\n", __func__, k, c, at, cw[k][c] ? cw[k][c]->name : "-", sline.c_str());
+            }
+        }
     }
     // the pieces of all graphs in one order: the cuts of the first graph, a cut of a later graph at the same weight runs with it, a cut
     // the first graph does not have (e.g. the MoE cache lookup of a last layer narrowed to the outputs) right after the graph's previous one
@@ -4507,6 +4578,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     }
 
     auto run = [&](ggml_cgraph * g) {
+        for (const auto & [node, be] : lm_tail_pins) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), node, be);
+        }
         prefetch_n_tokens = n_tokens_max;
         moe_cache->set_graph(g);
         if (!lm_pending.empty()) {
@@ -4515,9 +4589,36 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         lm_staged.clear(); // the expert copies a seed reads are those of this graph
         lm_staged_seq.clear();
         lm_copy_graph = nullptr;
+        static const bool tail_dbg0 = getenv("LLAMA_LM_TAIL_DEBUG") != nullptr;
+        if (tail_dbg0 && !group.empty() && (int64_t) group.back().ub->n_tokens < prefetch_min_batch) {
+            int n_gpu = 0, n_all = 0;
+            for (int i = 0; i < ggml_graph_n_nodes(group.back().gf); ++i) {
+                ggml_tensor * node = ggml_graph_node(group.back().gf, i);
+                if (node->op == GGML_OP_MUL_MAT_ID) {
+                    ggml_backend_t be = ggml_backend_sched_get_tensor_backend(sched.get(), node);
+                    n_all++;
+                    n_gpu += be != nullptr && be != backend_cpu;
+                }
+            }
+            LLAMA_LOG_INFO("%s: before alloc: tail MUL_MAT_ID on a GPU %d of %d, graph %d nodes\n", __func__, n_gpu, n_all, ggml_graph_n_nodes(g));
+        }
         ggml_backend_sched_set_reuse_weight_copies(sched.get(), true);
         const bool ok = ggml_backend_sched_alloc_graph(sched.get(), g);
         ggml_backend_sched_set_reuse_weight_copies(sched.get(), false);
+        static const bool tail_dbg = getenv("LLAMA_LM_TAIL_DEBUG") != nullptr;
+        if (tail_dbg && ok && !group.empty() && (int64_t) group.back().ub->n_tokens < prefetch_min_batch) {
+            std::map<std::string, int> by;
+            for (int i = 0; i < ggml_graph_n_nodes(group.back().gf); ++i) {
+                ggml_tensor * node = ggml_graph_node(group.back().gf, i);
+                if (node->op == GGML_OP_MUL_MAT_ID) {
+                    ggml_backend_t be = ggml_backend_sched_get_tensor_backend(sched.get(), node);
+                    by[std::string(be ? ggml_backend_name(be) : "none") + " src0 " + (node->src[0]->buffer && ggml_backend_buffer_is_host(node->src[0]->buffer) ? "host" : "dev")]++;
+                }
+            }
+            for (const auto & [k, v] : by) {
+                LLAMA_LOG_INFO("%s: tail member MUL_MAT_ID on %s: %d\n", __func__, k.c_str(), v);
+            }
+        }
         if (!ok) {
             if (ggml_backend_sched_get_alloc_over(sched.get()) == 0) {
                 LLAMA_LOG_ERROR("%s: failed to allocate the graph of %zu ubatches\n", __func__, group.size());
@@ -4738,9 +4839,10 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     if (lm_verbose) {
         LLAMA_LOG_INFO("%s: compute buffers %.2f -> %.2f MiB\n", __func__, buf_before/1048576.0, buf_after/1048576.0);
         LLAMA_LOG_INFO("%s: %zu ubatches (%" PRId64 " tokens each at most), %zu pieces, %d nodes, %d splits: build %.2f ms (graphs %.2f, inputs %.2f), "
-            "compute (queued) %.2f ms%s, %d graphs\n",
+            "compute (queued) %.2f ms%s, %d graphs, last member %u tokens (%" PRId64 " tails so far)\n",
             __func__, group.size(), n_tokens_max, cut_w.size(), gm ? ggml_graph_n_nodes(gm) : -1, ggml_backend_sched_get_n_splits(sched.get()),
-            (t1_us - t0_us)/1000.0, t_build_us/1000.0, t_set_us/1000.0, (ggml_time_us() - t1_us)/1000.0, gm ? "" : " (one by one)", n_sub);
+            (t1_us - t0_us)/1000.0, t_build_us/1000.0, t_set_us/1000.0, (ggml_time_us() - t1_us)/1000.0, gm ? "" : " (one by one)", n_sub,
+            group.back().ub->n_tokens, lm_n_tail);
     }
 
     bool seeded = lm_seed_active && !lm_seeded.empty();
@@ -5175,6 +5277,15 @@ void llama_context::output_reorder() {
             }
             std::swap(embd_batch_idxs[i], embd_batch_idxs[j]);
         }
+    }
+    static const bool tail_dbg_h = getenv("LLAMA_LM_TAIL_DEBUG") != nullptr;
+    if (tail_dbg_h && embd_nextn.has_data() && !embd_batch_idxs.empty() && embd_batch_idxs.size() >= 4) {
+        synchronize();
+        const size_t n = embd_batch_idxs.size();
+        uint64_t h = 1469598103934665603ull;
+        const uint8_t * p = (const uint8_t *) (embd_nextn.data + (n - 4)*n_embd_out);
+        for (size_t i = 0; i < 4*n_embd_out*sizeof(float); ++i) { h ^= p[i]; h *= 1099511628211ull; }
+        LLAMA_LOG_INFO("%s: tail debug: %zu rows, h_nextn of the last 4: %016llx\n", __func__, n, (unsigned long long) h);
     }
     embd_batch_idxs.clear();
 }

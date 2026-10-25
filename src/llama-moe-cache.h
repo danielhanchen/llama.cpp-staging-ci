@@ -98,6 +98,10 @@ public:
     // the ubatch of n_tokens is looked up on the device like a small batch: at most n_small_max tokens, or a short prompt whose missing
     // experts the host computes (the large batch path, its copies and its seed do not apply)
     bool small_batch(int64_t n_tokens) const;
+    // k15-pp2: while set, every ubatch is treated as a large one (no device lookup, slot map, host path or CPU misses): its MUL_MAT_ID
+    // read the layer's host experts as the large ubatches do (the last ubatch of a prompt as a member of a layer-major group)
+    void set_force_large(bool on);
+    bool force_large() const;
 
     // true if the graphs of small batches may use the hybrid path
     bool hybrid_active() const;

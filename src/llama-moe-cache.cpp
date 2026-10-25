@@ -435,6 +435,7 @@ static size_t llama_moe_cache_set_bytes(const llama_model & model, llama_moe_cac
 }
 
 struct llama_moe_cache::impl {
+    bool force_large = false; // k15-pp2: see llama_moe_cache::set_force_large
     llama_weight_store * wstore = nullptr;
     // k11: the graph allocation of the graph allocated next may be lent too (a merged layer-major group, see llama_moe_cache::set_graph_lend)
     bool graph_lend_scope = false;
@@ -3584,7 +3585,7 @@ struct llama_moe_cache::impl {
     }
 
     bool use_device(const group & g, int64_t n_tokens) const {
-        return g.dev_lookup && g.n_slots > 0 && n_tokens > 0 && (n_tokens <= max_batch || cm_serves(n_tokens)) &&
+        return !force_large && g.dev_lookup && g.n_slots > 0 && n_tokens > 0 && (n_tokens <= max_batch || cm_serves(n_tokens)) &&
             std::min<int64_t>(n_tokens*n_expert_used, g.ref[0]->ne[2]) <= g.n_slots;
     }
 
@@ -3670,7 +3671,7 @@ struct llama_moe_cache::impl {
     }
 
     bool cm_serves(int64_t n_tokens) const {
-        return cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_max && (n_tokens <= cm_prompt_force || (cm_on[n_tokens] != 0 && cm_prompt_ok()));
+        return !force_large && cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_max && (n_tokens <= cm_prompt_force || (cm_on[n_tokens] != 0 && cm_prompt_ok()));
     }
 
     // the host computes the misses of a batch of n_tokens: the fetch share, 1 = every missing expert is fetched
@@ -3727,7 +3728,7 @@ struct llama_moe_cache::impl {
 
     // the layer can use the hybrid lookup for a ubatch of this size
     bool hybrid_layer(int32_t il, int64_t n_ubatch) const {
-        if (!(hybrid || overlap_batch(n_ubatch)) || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+        if (force_large || !(hybrid || overlap_batch(n_ubatch)) || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return false;
         }
         // CPU misses off for this batch size: the graph of k9 (plain lookup, or the fetch overlap of single tokens)
@@ -5537,7 +5538,7 @@ struct llama_moe_cache::impl {
             return nullptr;
         }
         // with device lookups, ubatches that do not use the device use the host state (see prepare), a ubatch that uses the device keeps the state there
-        if (use_device(groups[layers[il].ig], n_ubatch)) {
+        if (force_large || use_device(groups[layers[il].ig], n_ubatch)) {
             return nullptr;
         }
         const layer & l = layers[il];
@@ -6629,10 +6630,13 @@ bool llama_moe_cache::hybrid_active() const {
 }
 
 bool llama_moe_cache::host_computes(int64_t n_tokens) const {
+    if (pimpl->force_large) {
+        return false;
+    }
     if (pimpl->cm) {
         return pimpl->cm_share_of(n_tokens) < 1.0f;
     }
-    return n_tokens <= n_small_max && pimpl->hybrid_active();
+    return !pimpl->force_large && n_tokens <= n_small_max && pimpl->hybrid_active();
 }
 
 bool llama_moe_cache::cpu_miss_enabled() const {
@@ -6668,7 +6672,15 @@ void llama_moe_cache::cpu_miss_tick(int64_t n_tokens) {
 }
 
 bool llama_moe_cache::small_batch(int64_t n_tokens) const {
-    return n_tokens <= n_small_max || pimpl->cm_serves(n_tokens);
+    return !pimpl->force_large && (n_tokens <= n_small_max || pimpl->cm_serves(n_tokens));
+}
+
+void llama_moe_cache::set_force_large(bool on) {
+    pimpl->force_large = on;
+}
+
+bool llama_moe_cache::force_large() const {
+    return pimpl->force_large;
 }
 
 bool llama_moe_cache::recal_pending() const {
