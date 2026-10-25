@@ -4707,13 +4707,11 @@ private:
             llama_set_ubatch_breaks(ctx_tgt, seg_breaks.data(), (int32_t) seg_breaks.size());
             SRV_DBG("k11 merged prompt batch of %d tokens, %zu ubatch breaks (first at %d)\n", batch.view.size(), seg_breaks.size(), seg_breaks[0]);
         }
-        queue_tasks.yield_to_queue([&]() {
-            ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
-            if (ret == 0 && has_output) {
-                llama_synchronize(ctx_tgt);
-            }
-        });
-        if (lm_cap_req) {
+        // k15-ttft: the captured checkpoint is made before the wait for the batch's outputs, so its bookkeeping and the queued copies
+        // overlap the ubatches still computing (made after the wait, the near checkpoint's merge cost G4 Qwen3.6 32 GB chat 6 ms of TTFT);
+        // LLAMA_CKPT_CAP_EARLY=0: after the wait, as k15-pp did
+        static const bool cap_early = getenv("LLAMA_CKPT_CAP_EARLY") == nullptr || atoi(getenv("LLAMA_CKPT_CAP_EARLY")) != 0;
+        auto cap_checkpoint = [&]() {
             llama_pos cap_pos = -1;
             if (ret == 0 && llama_state_seq_captured(ctx_tgt, lm_cap_slot, &cap_pos)) {
                 for (auto & slot : slots) {
@@ -4723,6 +4721,19 @@ private:
                 }
             }
             lm_cap_slot = -1;
+        };
+        const bool sync_after = lm_cap_req && cap_early;   // the checkpoint (slot state) is made on this thread, outside the yield
+        queue_tasks.yield_to_queue([&]() {
+            ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            if (ret == 0 && has_output && !sync_after) {
+                llama_synchronize(ctx_tgt);
+            }
+        });
+        if (lm_cap_req) {
+            cap_checkpoint();
+        }
+        if (sync_after && ret == 0 && has_output) {
+            llama_synchronize(ctx_tgt);
         }
 
         if (ret != 0) {
