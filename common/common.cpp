@@ -1249,6 +1249,8 @@ static struct llama_model_params common_model_params_to_llama_impl(common_params
 static enum llama_load_mode common_moe_cache_load_mode(const common_params & params, enum llama_load_mode load_mode, int32_t n_gpu_layers);
 static bool common_experts_on_offloaded_host(const common_params & params, const llama_model_tensor_buft_override * overrides, int32_t n_gpu_layers);
 static bool common_moe_hybrid_gate_on(const common_params & params, const llama_model_tensor_buft_override * overrides, int32_t n_gpu_layers);
+static double common_moe_host_expert_bytes(const std::string & path, const llama_model_tensor_buft_override * overrides, int32_t n_gpu_layers);
+static double common_moe_hybrid_max_frac();
 
 // bytes of one expert in the MoE cache: the sum over the expert tensors of the layer (the size of a slot) and the largest single tensor (the
 // size of a slot in its bank), with the number of experts, for the layer with the largest experts; false if the GGUF cannot be read
@@ -2062,9 +2064,18 @@ static bool common_fit_draft_on_cpu(
         const common_params & params, const llama_model_params & mparams, const llama_context_params & cparams,
         const llama_model_params & mparams_dft, llama_context_params cparams_dft, const std::string & path_dft, ggml_log_level log_level) {
     constexpr double MiB = 1024.0*1024.0;
-    double max_frac = 0.25;
+    // k15-pp (default 0.40, was 0.25): G4 Qwen3.8-Flash-Next UD-IQ1_S 16 GB, Q4_K_M MTP drafter on the device at 51% of the
+    // no-draft cache: +32..35% decode, +75% 8k prompt against no draft (the cap of 0.25 put it on the CPU: +13% / +2%)
+    double max_frac = 0.40;
     if (const char * env = getenv("LLAMA_FIT_DRAFT_MAX_CACHE_FRAC")) {
         max_frac = std::max(0.0, atof(env));
+    }
+    // k15-pp: the cache the draft leaves must still hold more than this share of the host experts (LLAMA_FIT_DRAFT_MIN_CACHE_FRAC,
+    // default LLAMA_MOE_CACHE_HYBRID_MAX_FRAC = 0.10; 0 off), so a draft never shrinks the cache into the hybrid gate's range. G4 16 GB:
+    // Flash-Next IQ1_S + Q4_K_M leaves 11.9% (admitted, the win above); + Q8_0 (1 GiB more) would leave about 9%, refused
+    double min_frac = common_moe_hybrid_max_frac();
+    if (const char * env = getenv("LLAMA_FIT_DRAFT_MIN_CACHE_FRAC")) {
+        min_frac = std::max(0.0, atof(env));
     }
 
     llama_model_params   mp = mparams;
@@ -2106,10 +2117,17 @@ static bool common_fit_draft_on_cpu(
         LOG_WRN("%s: failed to measure the draft model, keeping the old placement: %s\n", __func__, e.what());
         return false;
     }
-    const bool gpu = (double) dft <= (double) free_ + max_frac*(double) cache;
-    LOG_INF("%s: draft model needs %.0f MiB of device memory; the MoE cache gets %.0f MiB (%.0f MiB left over) -> draft model on the %s "
-        "(it may take at most %.0f%% of the cache, LLAMA_FIT_DRAFT_MAX_CACHE_FRAC; LLAMA_FIT_DRAFT_LAST=0 for the old order)\n",
-        __func__, dft/MiB, cache/MiB, free_/MiB, gpu ? "GPU" : "CPU", 100.0*max_frac);
+    const bool   cap_ok = (double) dft <= (double) free_ + max_frac*(double) cache;
+    const double take   = std::max(0.0, (double) dft - (double) free_);   // what the draft takes from the cache
+    const double host   = min_frac > 0.0 && take > 0.0 ? common_moe_host_expert_bytes(params.model.path, mp.tensor_buft_overrides, mp.n_gpu_layers) : 0.0;
+    const double left   = std::max(0.0, (double) cache - take);
+    const bool   floor_ok = host <= 0.0 || left > min_frac*host;
+    const bool   gpu    = cap_ok && floor_ok;
+    LOG_INF("%s: draft model needs %.0f MiB of device memory; the MoE cache gets %.0f MiB (%.0f MiB left over), %.0f MiB with the draft "
+        "(%.1f%% of %.0f MiB of host experts) -> draft model on the %s (it may take at most %.0f%% of the cache, LLAMA_FIT_DRAFT_MAX_CACHE_FRAC, "
+        "and must leave more than %.0f%% of the host experts cached, LLAMA_FIT_DRAFT_MIN_CACHE_FRAC; LLAMA_FIT_DRAFT_LAST=0 for the old order)\n",
+        __func__, dft/MiB, cache/MiB, free_/MiB, left/MiB, host > 0.0 ? 100.0*left/host : 0.0, host/MiB, gpu ? "GPU" : "CPU",
+        100.0*max_frac, 100.0*min_frac);
     return !gpu;
 }
 
@@ -2357,7 +2375,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
         // a separate draft model next to a MoE cache goes last: the main model's layers and its cache are placed first, and the draft
         // model gets the GPU only if it fits in the memory the cache does not use, or takes at most LLAMA_FIT_DRAFT_MAX_CACHE_FRAC
-        // (default 0.25) of the memory the cache would get; otherwise it runs on the CPU, or, if the caller can run without it
+        // (default 0.40), leaving more than LLAMA_FIT_DRAFT_MIN_CACHE_FRAC (0.10) of the host experts cached, of the memory the cache would get; otherwise it runs on the CPU, or, if the caller can run without it
         // (fit_can_drop), it is left out and drafting is off unless LLAMA_FIT_DRAFT_CPU=1 (drafting on the CPU is slower than none)
         // the old order (the draft model first, the main model around it) with LLAMA_FIT_DRAFT_LAST=0, or when -ngld or -devd is set
         bool draft_cpu = false;
@@ -3140,15 +3158,26 @@ static bool common_moe_hybrid_gate_on(const common_params & params, const llama_
     if ((env_cm != nullptr && atoi(env_cm) == 2) || ((env_cm == nullptr || atoi(env_cm) != 0) && env_cg != nullptr && atoi(env_cg) == 0)) {
         return false;
     }
+    const double host = common_moe_host_expert_bytes(params.model.path, overrides, n_gpu_layers);
+    return host > 0.0 && (double) params.moe_cache_size <= common_moe_hybrid_max_frac()*host;
+}
+
+// LLAMA_MOE_CACHE_HYBRID_MAX_FRAC (0.10): the share of the host experts at or below which the MoE cache takes its hybrid gate
+static double common_moe_hybrid_max_frac() {
     double max_frac = 0.10;
     if (const char * e = getenv("LLAMA_MOE_CACHE_HYBRID_MAX_FRAC")) {
         max_frac = std::max(0.0, atof(e));
     }
+    return max_frac;
+}
+
+// the bytes of the experts that the overrides (or n_gpu_layers) leave on the host, all expert layers of the same size (0: none, or unknown)
+static double common_moe_host_expert_bytes(const std::string & path, const llama_model_tensor_buft_override * overrides, int32_t n_gpu_layers) {
     common_moe_slot_bytes sbt;
     std::vector<uint8_t> experts;
-    const int64_t n_layer = common_model_n_layer(params.model.path, experts);
-    if (n_layer <= 0 || (int64_t) experts.size() < n_layer || !common_moe_slot_bytes_of(params.model.path, sbt) || sbt.total <= 0) {
-        return false;
+    const int64_t n_layer = common_model_n_layer(path, experts);
+    if (n_layer <= 0 || (int64_t) experts.size() < n_layer || !common_moe_slot_bytes_of(path, sbt) || sbt.total <= 0) {
+        return 0.0;
     }
     const int64_t n_gpu  = n_gpu_layers < 0 ? n_layer + 1 : n_gpu_layers;
     const int64_t il_gpu = std::max<int64_t>(n_layer + 1 - n_gpu, 0); // layers below run on the CPU: their experts are host experts
@@ -3161,10 +3190,9 @@ static bool common_moe_hybrid_gate_on(const common_params & params, const llama_
         n_host += il < il_gpu || common_overrides_put_experts_on_host(overrides, il, il + 1, experts);
     }
     if (n_exp == 0 || n_host == 0) {
-        return false;
+        return 0.0;
     }
-    const double host = (double) sbt.total*(double) n_host/(double) n_exp;
-    return (double) params.moe_cache_size <= max_frac*host;
+    return (double) sbt.total*(double) n_host/(double) n_exp;
 }
 
 // whether the weight stream is forced on (--weight-stream on, LLAMA_WEIGHT_STREAM=N != 0): it uploads the host weights read in place from the mapping, so it needs mmap
