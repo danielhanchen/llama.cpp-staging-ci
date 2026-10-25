@@ -236,6 +236,14 @@ public:
 
     // ggml_backend_sched copy callback, returns false if src is not a slot map
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
+    // k15-lfm2: in-place prompts (LLAMA_MOE_PROMPT_INPLACE=1): the layer whose prompt map t is (-1 if none), its expert tensors, the copy of
+    // its prompt map (uploads the missing experts; counts: seed the layer after its product, nullptr: no seed), the pending seed, and a
+    // context that runs layer-major prompts turns it off
+    int32_t prompt_layer(const ggml_tensor * t) const;
+    std::vector<ggml_tensor *> prompt_experts(int32_t il) const;
+    bool prompt_copy(ggml_backend_t backend, int32_t il, ggml_tensor * dst, const std::vector<int32_t> * counts);
+    void prompt_flush();
+    void prompt_inplace_block(bool blocked);
 
     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
     // returns the number of experts copied, 0 if expert e is not in the cache, -n if a run of n cached experts is too short to copy

@@ -733,6 +733,9 @@ llama_context::llama_context(
             // the cache holds (nearly) every host expert: a prompt uploads (nearly) nothing, nothing to share
             lm_enabled = false;
         }
+        if (moe_cache) {
+            moe_cache->prompt_inplace_block(lm_enabled); // k15-lfm2: layer-major seeds read the staging copies
+        }
         if (lm_enabled && !model.hparams.no_alloc) {
             LLAMA_LOG_INFO("%s: MoE cache: layer-major prompts%s, up to %d ubatches of %u tokens per graph (LLAMA_MOE_LAYER_MAJOR_UB_MAX; "
                 "LLAMA_MOE_LAYER_MAJOR=0 disables)\n", __func__, lm_auto ? " beside speculative decoding" : "", lm_ub_max, cparams.n_ubatch);
@@ -5861,6 +5864,14 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
+    // k15-lfm2: the prompt maps of in-place prompts (LLAMA_MOE_PROMPT_INPLACE=1)
+    if (lctx->moe_cache) {
+        const int32_t pil = lctx->moe_cache->prompt_layer(src);
+        if (pil >= 0) {
+            return lctx->moe_prompt_copy(backend, dst, graph, pil);
+        }
+    }
+
     // the slot maps of the MoE cache
     if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
         return true;
@@ -6122,7 +6133,56 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
     }
 }
 
+bool llama_context::moe_prompt_copy(ggml_backend_t backend, ggml_tensor * dst, ggml_cgraph * graph, int32_t il) {
+    // the routing of the layer: the ids of the get_rows that reads the copy of the prompt map (a view of the selected experts output)
+    const ggml_tensor * sel = nullptr;
+    for (int i = 0; i < ggml_graph_n_nodes(graph) && sel == nullptr; ++i) {
+        const ggml_tensor * node = ggml_graph_node(graph, i);
+        if (node->op == GGML_OP_GET_ROWS && node->src[0] == dst) {
+            sel = node->src[1];
+        }
+    }
+    while (sel != nullptr && sel->view_src != nullptr) {
+        sel = sel->view_src;
+    }
+    const std::vector<ggml_tensor *> experts = moe_cache->prompt_experts(il);
+    const bool sel_ok = sel != nullptr && (sel->flags & GGML_TENSOR_FLAG_OUTPUT) && sel->type == GGML_TYPE_I32 && ggml_is_contiguous(sel);
+    if (moe_cache_record && sel_ok) {
+        for (const ggml_tensor * w : experts) {
+            if (std::none_of(moe_cache_ids.begin(), moe_cache_ids.end(), [&](const auto & r) { return r.first == w; })) {
+                moe_cache_ids.emplace_back(w, sel);
+            }
+        }
+    }
+    // the seed of the last large ubatch: from the routing of an earlier ubatch, or from its own (read now, as the staging copy does)
+    std::vector<int32_t> counts;
+    bool seed = false;
+    if (!experts.empty() && moe_cache_seed_prev) {
+        if (const std::vector<int32_t> * c = moe_cache->get_seed_counts(experts[0])) {
+            counts = *c;
+            seed   = !counts.empty();
+        }
+    } else if (!experts.empty() && moe_cache_seed && sel_ok) {
+        ggml_backend_t backend_ids = ggml_backend_sched_get_tensor_backend(sched.get(), const_cast<ggml_tensor *>(sel));
+        if (backend_ids == nullptr) {
+            backend_ids = backend;
+        }
+        std::vector<int32_t> ids_data(ggml_nelements(sel));
+        ggml_backend_tensor_get_async(backend_ids, sel, ids_data.data(), 0, ggml_nbytes(sel));
+        ggml_backend_synchronize(backend_ids);
+        counts.assign(experts[0]->ne[2], 0);
+        for (const int32_t id : ids_data) {
+            if (id >= 0 && id < (int32_t) counts.size()) {
+                counts[id]++;
+            }
+        }
+        seed = true;
+    }
+    return moe_cache->prompt_copy(backend, il, dst, seed ? &counts : nullptr);
+}
+
 void llama_context::moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_outputs_ub) {
+    moe_cache->prompt_flush();
     if (moe_cache->seed_check() && (moe_cache_seed || moe_cache_seed_prev)) {
         ggml_backend_sched_synchronize(sched.get());
         moe_cache->seed_verify();
