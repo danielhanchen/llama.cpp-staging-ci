@@ -1450,7 +1450,18 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return e != nullptr && atoi(e) != 0;
     }();
     const bool moe_path = moe_one && ids != nullptr && nsamples_x == 1 && nsamples_dst == 1;
-    if (moe_path && ncols_dst > 1) {
+    // k15-fv, GGML_CUDA_VERIFY_REASSOC (default 1; 0 = the bit-exact per-token verify below): a batch invariant verify batch runs the
+    // ordinary multi-column kernels (MUL_MAT_ID: mul_mat_vec_q_moe; dense without fusion: the batched mmvq). Every row then reads the same
+    // q8_1 activations into the same int8 dot products with f32 accumulation as its single token launch, only the order of the f32
+    // sums differs (plans/k11.md equivalence rule); the dispatcher still never routes these nodes to MMQ / cuBLAS
+    static const bool reassoc = [] {
+        const char * e = getenv("GGML_CUDA_VERIFY_REASSOC");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const bool has_fusion_any = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                                fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.shared_up != nullptr;
+    const bool reassoc_path = exact && reassoc && ncols_dst > 1 && (ids != nullptr ? nsamples_x == 1 && nsamples_dst == 1 : !has_fusion_any);
+    if ((moe_path || (reassoc_path && ids != nullptr)) && ncols_dst > 1) {
         const int cc_m  = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const int max_b = get_mmvq_mmid_max_batch(type, cc_m);
         if (ncols_dst > max_b) {
@@ -1470,7 +1481,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
     }
 
     // batch invariant (verify batches, GGML_TENSOR_FLAG_BATCH_INVARIANT): every column gets the bytes of a single column launch
-    if (exact && ncols_dst > 1 && !moe_path) {
+    if (exact && ncols_dst > 1 && !moe_path && !reassoc_path) {
         const auto one_column = [&](const int j) {
             mul_mat_vec_q_switch_ncols_dst<type>(
                 vx, (const char *) vy + (size_t) j*stride_col_y*sizeof(block_q8_1), ids ? ids + (size_t) j*ids_stride : nullptr,

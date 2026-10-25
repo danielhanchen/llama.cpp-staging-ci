@@ -146,7 +146,17 @@ static bool server_spec_exact_frozen() {
 // verified as ordinary batches with the host path, 2 = frozen small batches with drafts verified exactly against them, 3 = as 1 with the
 // small-batch host path of the CPU-miss rule pinned on (llama_moe_pin_small; 1 where the cache has no CPU-miss rule).
 // LLAMA_SPEC_SPILL=0 off, 1 / 2 / 3 force that mode for any model.
-static int server_spec_spill_mode(const std::string & arch, int32_t host_mode) {
+// k15: the CPU-miss rule's spill mode needs host threads: it pins the small-batch host path on (no timing trials), so every drafted
+// verify window computes its missing experts on the host. On a Kaggle T4 half (2 threads; the CPU-miss calibration measured 680-800 us per
+// host expert) LFM2.5 mode 3 decoded 10-35% slower than mode 0 (k14) at 8 / 12 / 16 GB in chat / 8k / 16k (k15r kgB, LLAMA_SPEC_SPILL=0
+// arm = k14), while G4 (24 threads) and L4 (6) gain from it. Below LLAMA_SPEC_SPILL_CM_MIN_THREADS (4) the default is mode 0, the k14
+// behaviour (no spill drafts); 0 turns the guard off. An explicit LLAMA_SPEC_SPILL keeps its meaning.
+static int server_spec_spill_cm_min_threads() {
+    const char * e = getenv("LLAMA_SPEC_SPILL_CM_MIN_THREADS");
+    return e != nullptr ? std::max(0, atoi(e)) : 4;
+}
+
+static int server_spec_spill_mode(const std::string & arch, int32_t host_mode, int32_t n_threads = -1) {
     if (const char * e = getenv("LLAMA_SPEC_SPILL")) {
         return std::max(0, std::min(3, atoi(e)));
     }
@@ -155,6 +165,9 @@ static int server_spec_spill_mode(const std::string & arch, int32_t host_mode) {
     }
     // per (model, host path) after the KLD gate and the G4 timing (plans/k13_lfm.md section 10)
     if (arch == "lfm2moe") {
+        if (host_mode != 1 && n_threads > 0 && n_threads < server_spec_spill_cm_min_threads()) {
+            return 0;
+        }
         return host_mode == 1 ? SPEC_SPILL_LFM_GATE : SPEC_SPILL_LFM_CM;
     }
     if (arch == "gemma4") {

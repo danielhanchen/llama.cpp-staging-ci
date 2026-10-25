@@ -8081,6 +8081,16 @@ void llama_context::set_ubatch_breaks(const int32_t * breaks, int32_t n) {
 }
 
 // k15-pp: llama_set_state_capture
+bool llama_context::state_capture_supported() const {
+    static const bool env = getenv("LLAMA_STATE_CAPTURE") == nullptr || atoi(getenv("LLAMA_STATE_CAPTURE")) != 0;
+    if (!env || memory == nullptr) {
+        return false;
+    }
+    auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    auto * rec = hyb ? hyb->get_mem_recr() : dynamic_cast<llama_memory_recurrent *>(memory.get());
+    return rec != nullptr && !(hyb && model.hparams.swa_type != LLAMA_SWA_TYPE_NONE);
+}
+
 bool llama_context::set_state_capture(llama_seq_id seq_id, int32_t i_batch) {
     static const bool env = getenv("LLAMA_STATE_CAPTURE") == nullptr || atoi(getenv("LLAMA_STATE_CAPTURE")) != 0;
     if (!env || memory == nullptr || i_batch <= 0) {
@@ -8224,12 +8234,33 @@ bool llama_context::layer_major_on() const {
     return lm_enabled && moe_cache != nullptr;
 }
 
+// a batch of n_before + n_after prompt tokens of one sequence, from the start of the batch, with a ubatch break after n_before: the first
+// ubatch after the break runs in the layer-major group of the one before it (decode_layer_major: every member eligible, at most lm_ub_max
+// per group). Otherwise the merge only drops the seed the separate batches made between them: a ubatch before the break that is too short
+// for a group (Qwen3.6 q4x 12 GB, -ub 512: a 640-token prompt runs [124] [512] [4]) or a group that ends at the break
+bool llama_context::layer_major_spans(int64_t n_before, int64_t n_after) const {
+    if (!layer_major_on() || lm_refused_min <= 2 || n_before <= 0 || n_after <= 0) {
+        return false;
+    }
+    const int64_t nu = cparams.n_ubatch;
+    auto eligible = [&](int64_t n) { return n > llama_moe_cache::n_small_max && n >= prefetch_min_batch; };
+    const int64_t r = n_before % nu;
+    if ((r != 0 && !eligible(r)) || !eligible(std::min(nu, n_after))) {
+        return false;
+    }
+    return ((n_before + nu - 1)/nu) % lm_ub_max != 0;
+}
+
 void llama_state_seq_async_wait(llama_context * ctx) {
     ctx->state_async_wait();
 }
 
 void llama_set_ubatch_breaks(llama_context * ctx, const int32_t * breaks, int32_t n) {
     ctx->set_ubatch_breaks(breaks, n);
+}
+
+bool llama_state_capture_supported(const llama_context * ctx) {
+    return ctx->state_capture_supported();
 }
 
 bool llama_set_state_capture(llama_context * ctx, llama_seq_id seq_id, int32_t i_batch) {
@@ -8242,6 +8273,10 @@ bool llama_state_seq_captured(const llama_context * ctx, llama_seq_id seq_id, ll
 
 bool llama_layer_major_on(const llama_context * ctx) {
     return ctx->layer_major_on();
+}
+
+bool llama_layer_major_spans(const llama_context * ctx, int32_t n_before, int32_t n_after) {
+    return ctx->layer_major_spans(n_before, n_after);
 }
 
 bool llama_exact_verify_enabled(void) {
@@ -8319,6 +8354,30 @@ bool llama_verify_exact_placement(const llama_context * ctx) {
             if (cache_ok && name.find("_exps") != std::string::npos) {
                 continue;
             }
+            return false;
+        }
+    }
+    return true;
+}
+
+bool llama_single_pass_equivalent(const llama_context * ctx) {
+    if (ctx == nullptr || llama_moe_host_mode(ctx) != 0 || !llama_verify_exact_placement(ctx)) {
+        return false;
+    }
+    const llama_model & model = ctx->get_model();
+    if (model.devices.empty()) {
+        return false;
+    }
+    for (const auto & d : model.devices) {
+        const char * name = ggml_backend_dev_name(d.dev);
+        if (name == nullptr || strncmp(name, "CUDA", 4) != 0) {   // the kernel paths were checked on CUDA (sm_100, sm_120) only
+            return false;
+        }
+    }
+    static const bool cublas_32f = getenv("GGML_CUDA_FORCE_CUBLAS_COMPUTE_32F") != nullptr;
+    for (const auto & [name, t] : model.tensors_by_name) {
+        if (t != nullptr && !cublas_32f && t->type == GGML_TYPE_F16 && t->ne[1] > 1 && name.rfind("blk.", 0) == 0 &&
+            name.size() > 7 && name.compare(name.size() - 7, 7, ".weight") == 0) {
             return false;
         }
     }

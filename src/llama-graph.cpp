@@ -3433,7 +3433,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             for (int64_t i = 0, n_i = 1; i < n_q; i += n_i) {
                 const int64_t n_kv_i = llm_graph_exact_row_n_kv(ubatch, i, n_kv);
                 n_i = 1;
-                while (group && i + n_i < n_q && llm_graph_exact_row_n_kv(ubatch, i + n_i, n_kv) == n_kv_i) {
+                // a view of several mask rows narrower than the mask is not contiguous (ggml_flash_attn_ext asserts it): queries over
+                // fewer cells than the mask holds stay one node each
+                while (group && n_kv_i == kq_mask->ne[0] && i + n_i < n_q && llm_graph_exact_row_n_kv(ubatch, i + n_i, n_kv) == n_kv_i) {
                     ++n_i;
                 }
 
