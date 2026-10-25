@@ -3149,6 +3149,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
     balloc->ubatch_breaks = std::move(ub_breaks);
+    static const bool tail_dbg_b = getenv("LLAMA_LM_TAIL_DEBUG") != nullptr;
+    if (tail_dbg_b && n_tokens_all <= 8) {
+        std::string t;
+        for (const auto & tk : batch_inp.tokens) {
+            t += " " + std::to_string(tk.id) + "@" + std::to_string(tk.pos[0]) + (tk.output ? "*" : "");
+        }
+        LLAMA_LOG_INFO("%s: tail debug batch (%u tokens, %u outputs, ctx %p):%s\n", __func__, n_tokens_all, n_outputs_all, (void *) this, t.c_str());
+    }
 
     // hybrid MoE cache with a fixed share: a new request (every sequence of the batch is empty) starts from an empty cache
     if (moe_cache && moe_cache->hybrid_fixed()) {
@@ -4919,6 +4927,13 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
     }
 
+    static const bool lm_tail_sync = getenv("LLAMA_LM_TAIL_SYNC") != nullptr && atoi(getenv("LLAMA_LM_TAIL_SYNC")) != 0;
+    if (lm_tail_sync && !group.empty() && (int64_t) group.back().ub->n_tokens < prefetch_min_batch) {
+        synchronize();
+        for (auto & b : backends) {
+            ggml_backend_synchronize(b.get());
+        }
+    }
     if (lm_released) {
         // the slots come back with the experts they held before; LLAMA_MOE_LM_RELEASE_ROUTED=1: with those the last ubatch of the group
         // used most (its routing, read before the compute buffers are freed). G4 4 GB, Qwen3.6 Q3_K_M + MTP 2, 3 launches: decode 2k / 8k
