@@ -4969,7 +4969,7 @@ private:
                 // k15-lfm2: a request under spill mode 3 that cannot draft (no repeat is long enough on a long prompt) gains nothing from
                 // the pinned host path: its decode follows the CPU-miss rule (G4 LFM2.5 12 GB 16k, k15 re-bench: pinned 235.1 tok/s,
                 // LLAMA_SPEC_SPILL=0 286.7). Its prompt ran pinned (all-device), so its first token is unchanged.
-                // LLAMA_SPEC_SPILL_UNPIN_LONG=0: keep the pin
+                // Opt-in, LLAMA_SPEC_SPILL_UNPIN_LONG=1 (mixed on G4, see server_spec_spill_unpin_long)
                 if (spill_pinned && !spill_pin_lifted && server_spec_spill_unpin_long() && params_base.n_parallel == 1) {
                     const auto & ns = params_base.speculative.ngram_suffix;
                     if (ns.long_prompt > 0 && ns.n_min_match_long > 64 && slot.prompt.n_tokens() >= ns.long_prompt) {

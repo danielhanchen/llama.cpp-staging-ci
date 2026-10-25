@@ -83,10 +83,11 @@ static int server_spec_spill_min_match_long(int32_t host_mode, int min_match) {
     return c != nullptr ? std::max(3, atoi(c)) : SPEC_SPILL_MIN_MATCH_LONG_CM;
 }
 
-// k15-lfm2: see server_context::spill_pinned (LLAMA_SPEC_SPILL_UNPIN_LONG=0: keep the pin for requests that cannot draft)
+// k15-lfm2: see server_context::spill_pinned. Opt-in (LLAMA_SPEC_SPILL_UNPIN_LONG=1): G4 LFM2.5, 3 launches (plans/k15_lfm2.md section 10):
+// 12 GB 16k +10% (247.0 vs 223.8 tok/s), but 12 GB 8k -2.1%, 8 GB 8k -5.2%, 8 GB 16k -3.6%
 static bool server_spec_spill_unpin_long() {
     const char * e = getenv("LLAMA_SPEC_SPILL_UNPIN_LONG");
-    return e == nullptr || atoi(e) != 0;
+    return e != nullptr && atoi(e) != 0;
 }
 
 static int server_spec_auto_env() {
