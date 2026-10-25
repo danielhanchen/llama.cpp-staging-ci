@@ -5761,7 +5761,7 @@ ggml_backend_sched_prefetch_mode llama_context::sched_prefetch_mode(const ggml_t
     auto * lctx = static_cast<llama_context *>(user_data);
 
     // the slot maps of the MoE cache change between graph computations, they must go through the copy callback
-    if (lctx->moe_cache && lctx->moe_cache->is_slot_map(src)) {
+    if (lctx->moe_cache && (lctx->moe_cache->is_slot_map(src) || lctx->moe_cache->prompt_layer(src) >= 0)) {
         return GGML_BACKEND_SCHED_PREFETCH_NONE;
     }
 
