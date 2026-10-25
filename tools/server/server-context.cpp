@@ -375,25 +375,13 @@ struct server_slot {
         // the entry (server_prompt_cache::wait_inflight). Larger states than LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB (512) are saved as before.
         static const bool async_on = getenv("LLAMA_PROMPT_SAVE_ASYNC") != nullptr && atoi(getenv("LLAMA_PROMPT_SAVE_ASYNC")) != 0;
         static const size_t async_max = (size_t) (getenv("LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB") ? std::max(0, atoi(getenv("LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB"))) : 512) << 20;
-        // k15-ttft (LLAMA_PCS_BULK=1): the synchronous save reads the device rows through the context's pinned staging buffers (all
-        // rows queued, one wait) and copies them into the entry, instead of one blocking read per row into pageable memory; states
-        // up to LLAMA_PCS_BULK_MAX_MIB (256), the staging buffers stay allocated. Same bytes
-        static const bool bulk_on = getenv("LLAMA_PCS_BULK") != nullptr && atoi(getenv("LLAMA_PCS_BULK")) != 0;
-        static const size_t bulk_max = (size_t) (getenv("LLAMA_PCS_BULK_MAX_MIB") ? std::max(0, atoi(getenv("LLAMA_PCS_BULK_MAX_MIB"))) : 256) << 20;
-        const bool as = async_on && cur_size <= async_max;
-        const bool bulk = !as && bulk_on && cur_size <= bulk_max;
-        const llama_state_seq_flags fl = as || bulk ? LLAMA_STATE_SEQ_FLAGS_ASYNC : LLAMA_STATE_SEQ_FLAGS_NONE;
+        const llama_state_seq_flags fl = async_on && cur_size <= async_max ? LLAMA_STATE_SEQ_FLAGS_ASYNC : LLAMA_STATE_SEQ_FLAGS_NONE;
 
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, fl);
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, fl);
         }
-        if (bulk) {
-            llama_state_seq_async_wait(ctx_tgt);
-            if (ctx_dft) {
-                llama_state_seq_async_wait(ctx_dft);
-            }
-        } else if (fl & LLAMA_STATE_SEQ_FLAGS_ASYNC) {
+        if (fl & LLAMA_STATE_SEQ_FLAGS_ASYNC) {
             prompt_cache.inflight = cur;
         }
 
