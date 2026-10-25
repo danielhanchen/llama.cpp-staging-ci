@@ -776,6 +776,22 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         d1.ne[2]  = 1;
         d1.flags &= ~GGML_TENSOR_FLAG_BATCH_INVARIANT;
         const best_fattn_kernel k1 = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), &d1);
+        // k15-lfm2, GGML_CUDA_FA_VERIFY_MMA=1 (opt-in): where the one query node runs the MMA kernel (Turing / Ampere: f16 KQ tiles,
+        // f16 P, half2 VKQ), the verify node runs that kernel once for all its queries instead of once per query. Same kernel family
+        // and number formats, only the tiling of the KV loop / softmax rescales and the KV split differ (plans/k11.md equivalence
+        // rule: reassociation); taken only when the batched node would pick the MMA kernel too
+        static const bool verify_mma = [] {
+            const char * e = getenv("GGML_CUDA_FA_VERIFY_MMA");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (verify_mma && k1 == BEST_FATTN_KERNEL_MMA_F16) {
+            ggml_tensor dn = *dst;
+            dn.flags &= ~GGML_TENSOR_FLAG_BATCH_INVARIANT;
+            if (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), &dn) == BEST_FATTN_KERNEL_MMA_F16) {
+                ggml_cuda_flash_attn_ext_mma_f16(ctx, &dn);
+                return;
+            }
+        }
         const ggml_tensor * K = dst->src[1];
         const ggml_tensor * V = dst->src[2];
         GGML_ASSERT(K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16); // no staged K / V copy behind the output (llama-graph)

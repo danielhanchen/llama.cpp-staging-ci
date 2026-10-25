@@ -10376,6 +10376,17 @@ static const ggml_type other_types[] = {
 #endif
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+// k15-lfm2: a test case whose output node carries the batch invariant flag (a speculative verify node), vars tagged bi=1
+template <class T> struct test_bi : public T {
+    using T::T;
+    std::string vars() override { return T::vars() + ",bi=1"; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * t = T::build_graph(ctx);
+        t->flags |= GGML_TENSOR_FLAG_BATCH_INVARIANT;
+        return t;
+    }
+};
+
 // k15-lfm2: a batch invariant FA node over nb tokens minus the nb one token nodes (as decode runs them): exact means every output is
 // 0 on the backend under test (err = max |out|, tolerance 0; the CPU reference is not used)
 struct test_fa_bi_exact : public test_case {
@@ -10425,6 +10436,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_fa_bi_exact(64, 8, 4, kv, nb));
         }
         test_cases.emplace_back(new test_fa_bi_exact(128, 2, 8, 1024, nb));
+    }
+    // k15-lfm2: flagged (verify) FA against the CPU reference (GGML_CUDA_FA_VERIFY_MMA takes the batched MMA kernel on Turing / Ampere)
+    for (int64_t nb : { 2, 8 }) {
+        for (int64_t kv : { 512, 4096 }) {
+            test_cases.emplace_back(new test_bi<test_flash_attn_ext>(64, 64, 8, std::array<int64_t, 2>{4, 1}, kv, nb, true, false, 0.0f, 0.0f,
+                GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
     }
     std::default_random_engine rng(0);
 
@@ -13028,17 +13046,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
 // Test cases for performance evaluation: should be representative of real-world use cases
-// k15-lfm2: a test case whose output node carries the batch invariant flag (a speculative verify node), vars tagged bi=1
-template <class T> struct test_bi : public T {
-    using T::T;
-    std::string vars() override { return T::vars() + ",bi=1"; }
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * t = T::build_graph(ctx);
-        t->flags |= GGML_TENSOR_FLAG_BATCH_INVARIANT;
-        return t;
-    }
-};
-
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
