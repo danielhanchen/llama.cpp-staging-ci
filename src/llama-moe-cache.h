@@ -90,6 +90,8 @@ public:
     // k13: CPU misses: small batches (up to 8 tokens) take the host path without trials or miss-rate windows, but still fetch their
     // share and admit (the cache follows the decode; not exact under drafts); true if pinned
     bool pin_small();
+    // k15-lfm2: see llama_moe_cpu_miss_drop_slow
+    bool cpu_miss_drop_slow();
     // k13: who computes the missing experts of small batches: 0 = never the host (every miss fetched), 1 = the hybrid path with a fixed
     // share (the default gate of small caches, or LLAMA_MOE_CACHE_FETCH), 2 = the CPU-miss rule
     int host_mode() const;

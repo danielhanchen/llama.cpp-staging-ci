@@ -8268,6 +8268,18 @@ bool llama_moe_pin_small(llama_context * ctx) {
     return ctx != nullptr && ctx->moe_pin_small();
 }
 
+bool llama_context::moe_cpu_miss_drop_slow() {
+    if (moe_cache == nullptr || !moe_cache->cpu_miss_drop_slow()) {
+        return false;
+    }
+    ggml_backend_sched_set_overlap(sched.get(), moe_cache->hybrid_active());
+    return true;
+}
+
+bool llama_moe_cpu_miss_drop_slow(llama_context * ctx) {
+    return ctx != nullptr && ctx->moe_cpu_miss_drop_slow();
+}
+
 int32_t llama_moe_host_mode(const llama_context * ctx) {
     return ctx != nullptr && ctx->get_moe_cache() != nullptr ? ctx->get_moe_cache()->host_mode() : 0;
 }

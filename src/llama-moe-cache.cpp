@@ -3592,6 +3592,30 @@ struct llama_moe_cache::impl {
             std::min<int64_t>(n_tokens*n_expert_used, g.ref[0]->ne[2]) <= g.n_slots;
     }
 
+    // k15-lfm2: llama_moe_cpu_miss_drop_slow. Once calibrated: where the cache holds at least LLAMA_MOE_CPU_MISS_DROP_FRAC (0.75) of the
+    // host experts' bytes, the host has at most LLAMA_MOE_CPU_MISS_DROP_THREADS (4) small-batch threads and its time per expert is at
+    // least LLAMA_MOE_CPU_MISS_DROP_RATIO (0.5) of an upload, the rule is turned off as a failed calibration does (the misses are
+    // fetched). Kaggle T4x2 LFM2.5 16 GB (2 threads, host 640-660 us per expert, upload 520-940 us, 86% cached): the rule itself
+    // computed nothing on the host there, while the pinned small-batch host path of the default drafts (spill mode 3) cost 2.5 ms
+    // per token (62 vs 72 tok/s). LLAMA_MOE_CPU_MISS_DROP=0: never
+    bool cm_drop_slow() {
+        static const bool   on      = [] { const char * e = getenv("LLAMA_MOE_CPU_MISS_DROP"); return e == nullptr || atoi(e) != 0; }();
+        static const double frac    = [] { const char * e = getenv("LLAMA_MOE_CPU_MISS_DROP_FRAC"); return e != nullptr ? atof(e) : 0.75; }();
+        static const double ratio   = [] { const char * e = getenv("LLAMA_MOE_CPU_MISS_DROP_RATIO"); return e != nullptr ? atof(e) : 0.5; }();
+        static const int    threads = [] { const char * e = getenv("LLAMA_MOE_CPU_MISS_DROP_THREADS"); return e != nullptr ? atoi(e) : 4; }();
+        if (!on || !cm || !cm_cal || cm_force || cm_frozen || cache_frac < frac || single_threads <= 0 || single_threads > threads ||
+                cm_t1 < ratio*cm_tup) {
+            return false;
+        }
+        cm     = false;
+        hybrid = false;
+        cm_gen++;
+        LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses off: %.1f%% of the host experts cached, %d host threads, host %.1f us per expert vs "
+            "upload %.1f us: the missing experts are fetched (LLAMA_MOE_CPU_MISS_DROP=0: keep the rule)\n", tag, 100.0*cache_frac,
+            single_threads, cm_t1, cm_tup);
+        return true;
+    }
+
     // k13: see cm_frozen; only once calibrated (the warm-up decode calibrates), returns false otherwise or without CPU misses
     // keep_fetch (cm_frozen_fetch, llama_moe_pin_small): pin the decisions only
     bool cm_freeze(bool keep_fetch = false) {
@@ -6682,6 +6706,10 @@ bool llama_moe_cache::freeze_small() {
 
 bool llama_moe_cache::pin_small() {
     return pimpl->cm_freeze(true);
+}
+
+bool llama_moe_cache::cpu_miss_drop_slow() {
+    return pimpl->cm_drop_slow();
 }
 
 int llama_moe_cache::host_mode() const {

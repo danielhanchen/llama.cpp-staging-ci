@@ -109,6 +109,7 @@ struct llama_context {
     const llama_moe_cache * get_moe_cache() const { return moe_cache.get(); } // k13
     bool moe_freeze_small(); // k13: see llama_moe_freeze_small
     bool moe_pin_small();    // k13: see llama_moe_pin_small
+    bool moe_cpu_miss_drop_slow(); // k15-lfm2: see llama_moe_cpu_miss_drop_slow
     const llama_cparams & get_cparams() const;
 
     ggml_backend_sched_t get_sched() const;

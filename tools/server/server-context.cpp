@@ -1522,6 +1522,13 @@ private:
             spec_init.reset();
         }
 
+        // k15-lfm2: a weak host (few threads, not faster than an upload) with most experts cached drops the CPU-miss rule, so the
+        // default drafts verify exactly (llama_moe_cpu_miss_drop_slow; LLAMA_MOE_CPU_MISS_DROP=0: off)
+        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO && params_base.speculative.ngram_suffix.auto_mode && server_spec_auto_exact() &&
+                !llama_verify_exact_placement(ctx_tgt) && llama_moe_cpu_miss_drop_slow(ctx_tgt)) {
+            SRV_INF("%s", "MoE cache: CPU misses off on this host (weak host, most experts cached): drafts verified exactly\n");
+        }
+
         // k13: default drafts where the host computes experts (server_spec_spill_mode) draft only from repeats of at least
         // server_spec_spill_min_match tokens (short repeats cost a verify window of host experts for little)
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO && params_base.speculative.ngram_suffix.auto_mode && server_spec_auto_exact() &&
