@@ -1526,7 +1526,7 @@ private:
         // server_spec_spill_min_match tokens (short repeats cost a verify window of host experts for little)
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO && params_base.speculative.ngram_suffix.auto_mode && server_spec_auto_exact() &&
                 !llama_verify_exact_placement(ctx_tgt) &&
-                server_spec_spill_mode(server_spec_auto_arch(params_base.model.path), llama_moe_host_mode(ctx_tgt)) > 0) {
+                server_spec_spill_mode(server_spec_auto_arch(params_base.model.path), llama_moe_host_mode(ctx_tgt), params_base.cpuparams.n_threads) > 0) {
             auto & ns = params_base.speculative.ngram_suffix;
             const int mm = server_spec_spill_min_match(llama_moe_host_mode(ctx_tgt));
             if (mm > ns.n_min_match) {
@@ -1578,7 +1578,7 @@ private:
                 }
                 const int32_t host_mode = llama_moe_host_mode(ctx_tgt);
                 const int     spill     = llama_verify_exact_placement(ctx_tgt) ? -1 :
-                                          server_spec_spill_mode(server_spec_auto_arch(params_base.model.path), host_mode);
+                                          server_spec_spill_mode(server_spec_auto_arch(params_base.model.path), host_mode, params_base.cpuparams.n_threads);
                 if (spill < 0) {
                     llama_set_verify_exact(ctx_tgt, true);
                 } else if (spill == 2 && getenv("LLAMA_MOE_CPU_MISS_FROZEN_FETCH") == nullptr && llama_moe_freeze_small(ctx_tgt)) {
