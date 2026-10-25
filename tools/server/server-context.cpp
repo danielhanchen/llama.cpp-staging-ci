@@ -4490,7 +4490,12 @@ private:
                             // placement (0 = off, the kill switch)
                             static const char * ckpt_single_env = getenv("LLAMA_SERVER_CKPT_SINGLE_MAX");
                             static const bool ckpt_single_eq = ckpt_single_env == nullptr && llama_single_pass_equivalent(ctx_tgt);
-                            static const int ckpt_single_max = ckpt_single_env ? atoi(ckpt_single_env) : (ckpt_single_eq ? 128 : 0);
+                            static const int ckpt_single_max = [&] {
+                                const int v = ckpt_single_env ? atoi(ckpt_single_env) : (ckpt_single_eq ? 128 : 0);
+                                SRV_INF("single-pass short prompts: max %d (%s)\n", v, ckpt_single_env ? "LLAMA_SERVER_CKPT_SINGLE_MAX" :
+                                        ckpt_single_eq ? "default, reassociation-only placement" : "default, off on this placement");
+                                return v;
+                            }();
                             static const bool ckpt_single_any = getenv("LLAMA_SERVER_CKPT_SINGLE_ANY") != nullptr && atoi(getenv("LLAMA_SERVER_CKPT_SINGLE_ANY")) != 0;
                             const int n_batch_start = slot.prompt.n_tokens() - (int) (batch.size() - n_tokens_prev);
                             const int n_rest_batch = slot.task->n_tokens() - n_batch_start;
