@@ -44,6 +44,8 @@ private:
     // callback functions
     std::function<bool(server_task &&, bool)> callback_new_task;
     std::function<void(void)>                 callback_update_slots;
+    std::function<void(void)>                 callback_idle_work;
+    bool                                      idle_work_pending = false;
     std::vector<std::function<void(bool)>>    callback_sleeping_state;
 
 public:
@@ -112,6 +114,17 @@ public:
     //
     // Functions below are not thread-safe, must only be used before start_loop() is called
     //
+
+    // k15-ttft: work for an idle server (the MoE cache's re-calibration, the prompt plan restore) that a request arriving right after
+    // the slots go idle should not wait for: request_idle_work() from update_slots(); start_loop() runs the callback once no task has
+    // arrived for idle_work_delay_ms (LLAMA_SERVER_IDLE_WORK_DELAY_MS, default 200; 0 = at once, as before), and a task that arrives
+    // first is processed first (the work stays pending until the next idle period). Main thread only.
+    void on_idle_work(std::function<void(void)> callback) {
+        callback_idle_work = std::move(callback);
+    }
+    void request_idle_work() {
+        idle_work_pending = true;
+    }
 
     // Register function to process a new task
     // the second argument tells whether the queue is currently yielding (see yield_to_queue)

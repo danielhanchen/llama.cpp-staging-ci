@@ -1806,6 +1806,14 @@ private:
         queue_tasks.on_update_slots([this]() {
             update_slots();
         });
+        queue_tasks.on_idle_work([this]() {
+            if (ctx_tgt) {
+                llama_prepare_prompt_plan(ctx_tgt);
+            }
+            if (ctx_dft && ctx_dft != ctx_tgt) {
+                llama_prepare_prompt_plan(ctx_dft);
+            }
+        });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
@@ -3649,13 +3657,10 @@ private:
                 metrics_flush_idle();
 
                 // k11-decode: the next prompt starts from the worst-case pp plan (a verify window may have re-planned it)
-                if (ctx_tgt) {
-                    llama_prepare_prompt_plan(ctx_tgt);
-                }
                 // k13-fn: the draft context's MoE cache re-calibrates between requests too
-                if (ctx_dft && ctx_dft != ctx_tgt) {
-                    llama_prepare_prompt_plan(ctx_dft);
-                }
+                // k15-ttft: both run once the server has stayed idle (server_queue::on_idle_work), not before a request that is
+                // already arriving (G4-class host, Qwen3.6 MTP with a CPU-miss MoE cache: a 50 ms re-calibration ahead of a chat prompt)
+                queue_tasks.request_idle_work();
 
                 return; // skip further processing
 
