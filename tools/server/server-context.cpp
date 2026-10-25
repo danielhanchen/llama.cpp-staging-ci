@@ -4724,9 +4724,12 @@ private:
         // overlap the ubatches still computing (made after the wait, the near checkpoint's merge cost G4 Qwen3.6 32 GB chat 6 ms of TTFT);
         // LLAMA_CKPT_CAP_EARLY=0: after the wait, as k15-pp did
         static const bool cap_early = getenv("LLAMA_CKPT_CAP_EARLY") == nullptr || atoi(getenv("LLAMA_CKPT_CAP_EARLY")) != 0;
-        auto cap_checkpoint = [&]() {
+        // k15-pp3: the overlap below makes the checkpoints up to a segment's end before it gives that segment to the drafter
+        size_t caps_done = 0;
+        auto cap_checkpoint_upto = [&](int64_t b_rel) {
             // in batch order: a checkpoint list keeps the order the separate calls made them in
-            for (const auto & c : caps_req) {
+            for (; caps_done < caps_req.size() && caps_req[caps_done].batch - off <= b_rel; ++caps_done) {
+                const auto & c = caps_req[caps_done];
                 llama_pos cap_pos = -1;
                 if (ret == 0 && llama_state_seq_captured_at(ctx_tgt, c.slot, c.batch - off, &cap_pos)) {
                     for (auto & slot : slots) {
@@ -4736,12 +4739,18 @@ private:
                     }
                 }
             }
+        };
+        auto cap_checkpoint = [&]() {
+            cap_checkpoint_upto(INT64_MAX);
             lm_caps.erase(std::remove_if(lm_caps.begin(), lm_caps.end(), [&](const lm_cap_req_t & c) {
                 return c.batch > off && c.batch < off + batch.view.size(); }), lm_caps.end());
         };
         // k15-pp3 (LLAMA_MTP_PROMPT_OVERLAP=0 off): see below
         static const bool overlap_env = getenv("LLAMA_MTP_PROMPT_OVERLAP") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_OVERLAP")) != 0;
-        const bool spec_overlap = overlap_env && spec && has_output && !seg_breaks.empty() && common_speculative_rows_early_ok(spec.get());
+        const bool caps_sorted  = std::is_sorted(caps_req.begin(), caps_req.end(), [](const lm_cap_req_t & a, const lm_cap_req_t & b) {
+            return a.batch < b.batch; });
+        const bool spec_overlap = overlap_env && spec && has_output && !seg_breaks.empty() && common_speculative_rows_early_ok(spec.get()) &&
+            (!lm_cap_req || (cap_early && caps_sorted));
         // the checkpoint (slot state) is made on this thread, outside the yield; with the overlap, the drafter's early segments too
         const bool sync_after = (lm_cap_req && cap_early) || spec_overlap;
         queue_tasks.yield_to_queue([&]() {
@@ -4750,7 +4759,7 @@ private:
                 llama_synchronize(ctx_tgt);
             }
         });
-        if (lm_cap_req) {
+        if (lm_cap_req && !(spec_overlap && ret == 0)) {
             cap_checkpoint();
         }
         // k15-pp3 (LLAMA_MTP_PROMPT_OVERLAP=0 off): the drafter's own pass over the segments whose target rows are already on the host
@@ -4763,20 +4772,26 @@ private:
         {
             if (spec_overlap && ret == 0) {
                 const int64_t t_ov0 = common_mtp_handoff_trace() ? ggml_time_us() : 0;
-                queue_tasks.yield_to_queue([&]() {
-                    // a segment [a, b) reads the target rows [a, b) (its first token pairs with the pending row of the one before)
-                    for (; spec_seg_done < (int32_t) seg_breaks.size() && spec_early_ok; ++spec_seg_done) {
-                        const int32_t b = seg_breaks[spec_seg_done];
-                        if (llama_nextn_rows_wait(ctx_tgt, b) < b) {
-                            break;
-                        }
-                        common_batch seg;
-                        seg.n_pos = batch.view.n_pos;
-                        seg.tokens.assign(batch.view.tokens.begin() + spec_seg_a, batch.view.tokens.begin() + b);
-                        spec_early_ok = common_speculative_process_rows_early(spec.get(), seg, spec_seg_a);
-                        spec_seg_a = b;
+                // on this thread, outside the yield, like the checkpoints made in between: each checkpoint's asynchronous read then
+                // runs under the drafter's next segment instead of under the wait of the next checkpoint or of the target
+                // a segment [a, b) reads the target rows [a, b) (its first token pairs with the pending row of the one before)
+                for (; spec_seg_done < (int32_t) seg_breaks.size() && spec_early_ok; ++spec_seg_done) {
+                    const int32_t b = seg_breaks[spec_seg_done];
+                    if (llama_nextn_rows_wait(ctx_tgt, b) < b) {
+                        break;
                     }
-                });
+                    if (lm_cap_req) {
+                        cap_checkpoint_upto(b);
+                    }
+                    common_batch seg;
+                    seg.n_pos = batch.view.n_pos;
+                    seg.tokens.assign(batch.view.tokens.begin() + spec_seg_a, batch.view.tokens.begin() + b);
+                    spec_early_ok = common_speculative_process_rows_early(spec.get(), seg, spec_seg_a);
+                    spec_seg_a = b;
+                }
+                if (lm_cap_req) {
+                    cap_checkpoint();
+                }
                 if (t_ov0) {
                     SRV_INF("mtp_trace prompt overlap: %d of %zu segments (%d rows) before the target's wait, %.2f ms\n", spec_seg_done,
                             seg_breaks.size() + 1, spec_seg_a, (ggml_time_us() - t_ov0)/1e3);
