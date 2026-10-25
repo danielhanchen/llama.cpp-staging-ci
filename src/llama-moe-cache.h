@@ -71,6 +71,8 @@ public:
     // cache or its seed writes slots; the uploads of its misses do not need to wait)
     bool upload_ahead_pending(const ggml_tensor * w) const;
     void upload_ahead_wait(ggml_backend_t backend, const ggml_tensor * w);
+    // after the uploads of the misses of w are queued on the backend: the next upload ahead is ordered after them
+    void upload_ahead_mark(ggml_backend_t backend, const ggml_tensor * w);
 
     // hybrid small batches [LLAMA_MOE_CACHE_HYBRID, LLAMA_MOE_CACHE_FETCH]: the GPU computes the cached experts, the host computes the
     // missing ones it is left; only a share of the missing experts is fetched and admitted

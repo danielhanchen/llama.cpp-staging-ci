@@ -3133,6 +3133,8 @@ struct llama_moe_cache::impl {
         int ev_next = 0;
         ggml_backend_event_t pred_ev = nullptr;
         ggml_backend_event_t drain_ev = nullptr;
+        ggml_backend_event_t mark_ev  = nullptr; // on the compute stream after the uploads of the last copy: the next upload ahead waits for it
+        bool marked = false;
         ggml_backend_buffer_t buf_dev  = nullptr; // router logits [n_expert, ua_max_tokens] f32
         ggml_backend_buffer_t buf_host = nullptr;
         std::vector<float> host_vec;               // if no pinned host buffer
@@ -3247,6 +3249,7 @@ struct llama_moe_cache::impl {
             }
             u.pred_ev  = ggml_backend_event_new(dev);
             u.drain_ev = ggml_backend_event_new(dev);
+            u.mark_ev  = ggml_backend_event_new(dev);
             const size_t sz = (size_t) n_expert_max*ua_max_tokens*sizeof(float);
             u.buf_dev = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(backend), sz);
             ggml_backend_buffer_type_t hb = ggml_backend_dev_host_buffer_type(dev);
@@ -3257,7 +3260,7 @@ struct llama_moe_cache::impl {
                 u.host_vec.resize(sz/sizeof(float));
                 u.host = u.host_vec.data();
             }
-            bool ok = u.buf_dev != nullptr && u.pred_ev != nullptr && u.drain_ev != nullptr;
+            bool ok = u.buf_dev != nullptr && u.pred_ev != nullptr && u.drain_ev != nullptr && u.mark_ev != nullptr;
             for (auto * e : u.ev) {
                 ok &= e != nullptr;
             }
@@ -3293,7 +3296,10 @@ struct llama_moe_cache::impl {
         if (u.drain_ev != nullptr) {
             ggml_backend_event_free(u.drain_ev);
         }
-        u.pred_ev = u.drain_ev = nullptr;
+        if (u.mark_ev != nullptr) {
+            ggml_backend_event_free(u.mark_ev);
+        }
+        u.pred_ev = u.drain_ev = u.mark_ev = nullptr;
         if (u.buf_dev != nullptr) {
             ggml_backend_buffer_free(u.buf_dev);
         }
@@ -3383,6 +3389,11 @@ struct llama_moe_cache::impl {
             ua_regions.push_back({ w, (size_t) L.experts[i]*nb, bank, (size_t) L.slots[i]*nb, n*nb });
             bytes += n*nb;
             i += n;
+        }
+        if (on == nullptr && u.marked) {
+            // after the misses the compute stream uploads for the copy just issued: they go first on the link
+            ggml_backend_event_wait(u.up, u.mark_ev);
+            u.marked = false;
         }
         if (!ggml_backend_tensor_copy_regions_async(on != nullptr ? on : u.up, ua_regions.data(), ua_regions.size())) {
             return false;
@@ -3579,6 +3590,20 @@ struct llama_moe_cache::impl {
         }
         const ua_layer_t & L = ua_l[it->second.il];
         return L.epoch == ua_epoch && std::any_of(L.bank_ev.begin(), L.bank_ev.end(), [](int e) { return e >= 0; });
+    }
+
+    // the uploads of the misses of w are queued on the compute stream: the next upload ahead goes after them
+    void ua_mark(ggml_backend_t backend, const ggml_tensor * w) {
+        const auto it = bindings.find(w);
+        if (ua_mode <= 0 || ua_off || it == bindings.end()) {
+            return;
+        }
+        const group & g = groups[layers[it->second.il].ig];
+        if (!ua_dev_ok(g.id) || ua_devs[g.id].mark_ev == nullptr) {
+            return;
+        }
+        ggml_backend_event_record(ua_devs[g.id].mark_ev, backend);
+        ua_devs[g.id].marked = true;
     }
 
     // the compute stream waits for them: before the copies of w read the cache and before its seed writes slots
@@ -7526,6 +7551,10 @@ void llama_moe_cache::upload_ahead_begin(ggml_backend_t backend, const ggml_tens
 
 bool llama_moe_cache::upload_ahead_pending(const ggml_tensor * w) const {
     return pimpl->ua_pending(w);
+}
+
+void llama_moe_cache::upload_ahead_mark(ggml_backend_t backend, const ggml_tensor * w) {
+    pimpl->ua_mark(backend, w);
 }
 
 void llama_moe_cache::upload_ahead_wait(ggml_backend_t backend, const ggml_tensor * w) {

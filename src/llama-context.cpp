@@ -5917,6 +5917,7 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
         if (ua && lctx->moe_cache->upload_ahead_pending(src)) {
             // k15-pred: the uploads of the misses first, they do not read the slots uploaded ahead; then the cached runs after the wait
             if (n_cached == st.regions.size() || ggml_backend_tensor_copy_regions_async(backend, st.regions.data() + n_cached, st.regions.size() - n_cached)) {
+                lctx->moe_cache->upload_ahead_mark(backend, src);
                 lctx->moe_cache->upload_ahead_wait(backend, src);
                 if (n_cached == 0 || ggml_backend_tensor_copy_regions_async(backend, st.regions.data(), n_cached)) {
                     lctx->moe_cache->count_batch(src, st.regions);
@@ -5926,6 +5927,9 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
         } else if (ggml_backend_tensor_copy_regions_async(backend, st.regions.data(), st.regions.size())) {
             lctx->moe_cache->count_batch(src, st.regions);
             done = true;
+            if (ua) {
+                lctx->moe_cache->upload_ahead_mark(backend, src);
+            }
         }
     }
     if (ua) {
@@ -5938,6 +5942,9 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
             for (const auto & [offset, size] : st.uploads) {
                 ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
             }
+        }
+        if (ua) {
+            lctx->moe_cache->upload_ahead_mark(backend, src);
         }
     }
 
