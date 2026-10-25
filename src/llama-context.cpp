@@ -8303,6 +8303,14 @@ bool llama_moe_pin_small(llama_context * ctx) {
     return ctx != nullptr && ctx->moe_pin_small();
 }
 
+bool llama_context::moe_pin_small_set(bool on) {
+    return moe_cache != nullptr && moe_cache->pin_small_set(on);
+}
+
+bool llama_moe_pin_small_set(llama_context * ctx, bool on) {
+    return ctx != nullptr && ctx->moe_pin_small_set(on);
+}
+
 bool llama_context::moe_cpu_miss_drop_slow() {
     if (moe_cache == nullptr || !moe_cache->cpu_miss_drop_slow()) {
         return false;

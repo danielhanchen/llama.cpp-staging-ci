@@ -1086,6 +1086,10 @@ private:
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    // k15-lfm2: spill mode 3 pinned the small batches (llama_moe_pin_small); a request that cannot draft (a prompt of long_prompt+ tokens
+    // whose shortest repeat is longer than any match) lifts the pin for its decode and the next request restores it before its prompt
+    bool spill_pinned     = false;
+    bool spill_pin_lifted = false;
 
     common_speculative_ptr spec;
 
@@ -1608,6 +1612,7 @@ private:
                     SRV_INF("%s", "n-gram drafting by default under the MoE cache: small batches frozen, drafts verified exactly against them "
                         "(KLD-gated default, LLAMA_SPEC_SPILL=0: off)\n");
                 } else if (spill == 3 && llama_moe_pin_small(ctx_tgt)) {
+                    spill_pinned = true;
                     // k13: small batches always take the host path (no timing trials), fetch share and admissions kept; drafts verified
                     // as ordinary batches: other greedy text, KLD-gated per model
                     SRV_INF("%s", "n-gram drafting by default under the MoE cache: small-batch host path pinned on, drafts verified as ordinary "
@@ -2084,6 +2089,10 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // k15-lfm2: the pin a request without drafts lifted is restored before the next prompt (see spill_pinned)
+        if (spill_pin_lifted) {
+            spill_pin_lifted = !llama_moe_pin_small_set(ctx_tgt, true);
+        }
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -4956,6 +4965,17 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+
+                // k15-lfm2: a request under spill mode 3 that cannot draft (no repeat is long enough on a long prompt) gains nothing from
+                // the pinned host path: its decode follows the CPU-miss rule (G4 LFM2.5 12 GB 16k, k15 re-bench: pinned 235.1 tok/s,
+                // LLAMA_SPEC_SPILL=0 286.7). Its prompt ran pinned (all-device), so its first token is unchanged.
+                // LLAMA_SPEC_SPILL_UNPIN_LONG=0: keep the pin
+                if (spill_pinned && !spill_pin_lifted && server_spec_spill_unpin_long() && params_base.n_parallel == 1) {
+                    const auto & ns = params_base.speculative.ngram_suffix;
+                    if (ns.long_prompt > 0 && ns.n_min_match_long > 64 && slot.prompt.n_tokens() >= ns.long_prompt) {
+                        spill_pin_lifted = !llama_moe_pin_small_set(ctx_tgt, false);
+                    }
+                }
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());

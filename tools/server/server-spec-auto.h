@@ -83,6 +83,12 @@ static int server_spec_spill_min_match_long(int32_t host_mode, int min_match) {
     return c != nullptr ? std::max(3, atoi(c)) : SPEC_SPILL_MIN_MATCH_LONG_CM;
 }
 
+// k15-lfm2: see server_context::spill_pinned (LLAMA_SPEC_SPILL_UNPIN_LONG=0: keep the pin for requests that cannot draft)
+static bool server_spec_spill_unpin_long() {
+    const char * e = getenv("LLAMA_SPEC_SPILL_UNPIN_LONG");
+    return e == nullptr || atoi(e) != 0;
+}
+
 static int server_spec_auto_env() {
     const char * e = getenv("LLAMA_SPEC_AUTO");
     return e != nullptr ? atoi(e) : 1;

@@ -3641,6 +3641,10 @@ struct llama_moe_cache::impl {
         if (!cm || !cm_cal || cm_frozen) {
             return cm_frozen && cm_frozen_fetch == keep_fetch;
         }
+        if (!cm_pinned) {
+            cm_trial_saved = cm_trial;
+        }
+        cm_pinned     = cm_pinned || keep_fetch;
         cm_frozen     = true;
         cm_frozen_fetch = keep_fetch || (getenv("LLAMA_MOE_CPU_MISS_FROZEN_FETCH") != nullptr && atoi(getenv("LLAMA_MOE_CPU_MISS_FROZEN_FETCH")) != 0);
         cm_trial      = false;
@@ -3656,12 +3660,52 @@ struct llama_moe_cache::impl {
             cm_on[n] = n <= std::min<int64_t>({ cm_frozen_max, max_batch }) ? 1 : 0;
         }
         cm_gen++;
+        if (cm_pin_lifted_once) {
+            return true; // a pin restored after cm_pin_set(false): logged once at the first pin
+        }
         LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: small batches of up to %d tokens frozen: %s, "
             "no timing trials (LLAMA_MOE_CPU_MISS_FROZEN=0 off)\n", tag, (int) std::min<int64_t>({ cm_frozen_max, max_batch, cm_max }),
             cm_frozen_fetch ? "host path pinned on, the fetch share and admissions kept (LLAMA_MOE_CPU_MISS_FROZEN_FETCH=1)" :
                               "nothing fetched, the host computes every miss");
         return true;
     }
+
+    // k15-lfm2: lift / restore the pin of llama_moe_pin_small (cm_freeze(true)) between requests. Unpinned, the small batches follow
+    // the rule again (cost model, the timing trials where this cache runs them, after cmt_gap small batches); pinned again, as at the
+    // first pin. Only a cache the pin froze (cm_pinned) takes part. Returns the pinned state
+    bool cm_pinned       = false; // frozen by pin_small (not by freeze_small)
+    bool cm_pin_lifted   = false;
+    bool cm_pin_lifted_once = false;
+    bool cm_trial_saved  = true;
+    bool cm_pin_set(bool on) {
+        if (!cm_pinned) {
+            return cm_frozen;
+        }
+        if (on && cm_pin_lifted) {
+            cm_pin_lifted = false;
+            cm_frozen     = false; // cm_freeze(true) pins again from here
+            cm_freeze(true);
+        } else if (!on && !cm_pin_lifted && cm_frozen) {
+            cm_pin_lifted   = true;
+            cm_pin_lifted_once = true;
+            cm_frozen       = false;
+            cm_frozen_fetch = false;
+            cm_trial        = cm_trial_saved;
+            cm_small_ok     = true;
+            cm_small_live   = true;
+            cmt_done        = -1;
+            cmt_t_prev      = -1;
+            cmt_wait        = cm_trial && !cm_trials_skipped ? cmt_gap : -1;
+            cm_decide();
+            cm_gen++;
+            if (pin_log_n++ < 4) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: small-batch pin lifted for this request (the rule decides%s)\n", tag,
+                    cmt_wait > 0 ? ", a timing trial after the next small batches" : "");
+            }
+        }
+        return cm_frozen;
+    }
+    int pin_log_n = 0;
 
     // a batch of more than max_batch tokens (a short prompt) that the host path serves: it is looked up on the device like a small batch
     // short prompts take the host path only once a trial found it faster for the small batches on this host and model (without a
@@ -6738,6 +6782,10 @@ bool llama_moe_cache::freeze_small() {
 
 bool llama_moe_cache::pin_small() {
     return pimpl->cm_freeze(true);
+}
+
+bool llama_moe_cache::pin_small_set(bool on) {
+    return pimpl->cm_pin_set(on);
 }
 
 bool llama_moe_cache::cpu_miss_drop_slow() {
