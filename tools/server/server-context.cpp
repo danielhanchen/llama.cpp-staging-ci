@@ -388,6 +388,35 @@ struct server_slot {
         return true;
     }
 
+    // k15-ttft: the RAM prompt-cache save of this slot (state + a clone of each checkpoint) writes into fresh host memory when the
+    // buffer pool holds nothing large enough, and faulting those pages in made most of the save (local B200, Qwen3.6-35B-A3B MTP,
+    // 640-token prompt: 77 MiB state + 2 x 62 MiB checkpoints, 80-290 ms against 8-16 ms into resident buffers). Once the prompt is
+    // processed (and again when the slot goes idle) the prefault worker is asked for resident pool buffers of the sizes the next save
+    // needs, so it runs while the slot generates or waits. Same copies into other buffers: the saved bytes are unchanged.
+    // LLAMA_PCS_PREFAULT_NEXT=0: off
+    void prefault_next_save() const {
+        static const bool on = getenv("LLAMA_PCS_PREFAULT_NEXT") == nullptr || atoi(getenv("LLAMA_PCS_PREFAULT_NEXT")) != 0;
+        if (!on || prompt.tokens.size() == 0) {
+            return;
+        }
+        const size_t n_tgt = llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t n_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        common_state_buf_prefault(n_tgt, 1);
+        // checkpoint clones (prompt_checkpoints_clone): one more buffer per checkpoint size than the state request leaves
+        size_t ckpt_max = 0;
+        int    n_ckpt   = 0;
+        for (const auto & c : prompt.checkpoints) {
+            ckpt_max = std::max(ckpt_max, c.data_tgt.size());
+            n_ckpt  += c.data_tgt.size() > 0;
+        }
+        if (n_ckpt > 0) {
+            common_state_buf_prefault(ckpt_max, n_ckpt + (n_tgt >= ckpt_max ? 1 : 0));
+        }
+        if (n_dft > 0) {
+            common_state_buf_prefault(n_dft, 1);
+        }
+    }
+
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
         if (!res) {
@@ -659,6 +688,10 @@ struct server_slot {
             }
 
             callback_on_reset(*this);
+
+            if (task && !task->is_child() && !task->is_stateless()) {
+                prefault_next_save();
+            }
 
             reset();
 
@@ -4928,6 +4961,10 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+                // not while a MoE cache computes experts on the host: the page faults would compete with its decode
+                if (!slot.task->is_child() && !slot.task->is_stateless() && llama_moe_host_mode(ctx_tgt) == 0) {
+                    slot.prefault_next_save();
+                }
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
