@@ -681,7 +681,7 @@ struct llama_moe_cache::impl {
     bool   lend_auto    = true;  // LLAMA_MOE_CACHE_LEND unset: lend only if the staging copies are a large share of the cache, see lend
     bool   seed_own     = false; // prompts seed from their own ids by default (LLAMA_MOE_CACHE_SEED unset or 2), see lend
     double lend_min_frac = 0.08; // LLAMA_MOE_CACHE_LEND_MIN_FRAC: that share
-    bool   lend_save     = true; // k15-fn LLAMA_MOE_CACHE_LEND_SAVE=0 off: also lend where it frees lend_save_min bytes, see lend_saves
+    bool   lend_save     = false; // k15-fn LLAMA_MOE_CACHE_LEND_SAVE=1 (opt-in): also lend where it frees lend_save_min bytes, see lend_saves
     size_t lend_save_min = 256ull*1024*1024; // LLAMA_MOE_CACHE_LEND_SAVE_MIB
     bool   lend_multi   = false; // LLAMA_MOE_CACHE_LEND_MULTI=1: also with the cache on several devices (not validated)
     bool   lend_off_log = false;
@@ -1058,8 +1058,11 @@ struct llama_moe_cache::impl {
             }
             env = getenv("LLAMA_MOE_CACHE_LEND_MULTI");
             lend_multi = env != nullptr && atoi(env) != 0;
+            // opt-in: G4 k15gm_g4, Qwen3.8-Flash-Next UD-IQ4_XS + MTP at 32 GB: cache 18719 -> 19988 MiB with the same device memory, pinned
+            // decode +5.1 / +1.9 / +3.1% (chat / 2k / 8k, same text), but prompts pay the refill of the lent slots: 2k 2441 -> 2313 tok/s
+            // (TTFT 935 -> 986 ms), 8k -2..-3.5%; Qwen3.6 UD-Q4_K_XL 12 / 16 GB, Flash-Next 16 GB and LFM2.5 16 GB unchanged
             env = getenv("LLAMA_MOE_CACHE_LEND_SAVE");
-            lend_save = env == nullptr || atoi(env) != 0;
+            lend_save = env != nullptr && atoi(env) != 0;
             env = getenv("LLAMA_MOE_CACHE_LEND_SAVE_MIB");
             if (env != nullptr) {
                 lend_save_min = (size_t) std::max(0ll, atoll(env))*1024*1024;
@@ -5257,7 +5260,7 @@ struct llama_moe_cache::impl {
         d.lend_auto = on || !fit ? 1 : 0;
         if (saves) {
             LLAMA_LOG_INFO("%s: %s: MoE cache lending on: the staging copies of large batches (%.2f MiB, %.1f%% of the cache) free %.2f MiB beside the "
-                "copies of a seeding prompt (%.2f MiB), at least %.2f MiB (LLAMA_MOE_CACHE_LEND_SAVE_MIB; LLAMA_MOE_CACHE_LEND_SAVE=0 off)\n",
+                "copies of a seeding prompt (%.2f MiB), at least %.2f MiB (LLAMA_MOE_CACHE_LEND_SAVE=1, LLAMA_MOE_CACHE_LEND_SAVE_MIB)\n",
                 __func__, ggml_backend_name(d.backend), need/1024.0/1024.0, 100.0*frac, (need - seed)/1024.0/1024.0, seed/1024.0/1024.0,
                 lend_save_min/1024.0/1024.0);
         } else if (on) {

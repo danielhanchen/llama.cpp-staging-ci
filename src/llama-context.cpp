@@ -1375,7 +1375,7 @@ void llama_context::sched_reserve() {
     // so the memory left after the load is the same as with the arena. The seeding prompt's copies are not counted, as without lending: the seed graph is reserved
     // only if the memory left holds it (see sched_reserve_seed), like a default context that cannot fit it. G4 Qwen3.8-Flash-Next
     // UD-IQ4_XS + MTP at 32 GB: k15gl_g4 counted the seed growth (546 MiB) too, the cache got 721 MiB and every prompt seeded the
-    // cache from its own ids: the 2k prompt lost 17% (2448 -> 2044 tok/s), the default does not seed there. LLAMA_MOE_CACHE_LEND_SAVE=0 off
+    // cache from its own ids: the 2k prompt lost 17% (2448 -> 2044 tok/s), the default does not seed there. Opt-in: LLAMA_MOE_CACHE_LEND_SAVE=1
     if (model.hparams.no_alloc) {
         backend_lend_freed.assign(backend_ptrs.size(), 0);
     }

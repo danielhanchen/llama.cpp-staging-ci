@@ -150,7 +150,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     // k15-fn: the staging arena a lending MoE cache takes over (mb.lend_freed) is memory the measure counted nowhere and the loaded
     // context does not take: count it off the device (compute first, then context), as the fit counts the arena of a context that
-    // does not lend (not at all). fit_moe_cache_size gives it to the cache. LLAMA_MOE_CACHE_LEND_SAVE=0 off (nothing reported)
+    // does not lend (not at all). fit_moe_cache_size gives it to the cache. Only with LLAMA_MOE_CACHE_LEND_SAVE=1 (nothing reported otherwise)
     for (size_t i = 0; i < nd; i++) {
         const size_t c = std::min(ret[i].mb.compute, ret[i].mb.lend_freed);
         ret[i].mb.compute -= c;
@@ -512,7 +512,7 @@ static void common_params_fit_impl(
                 // k15-fn: where the cache lends because that frees memory (llama_moe_cache lend_saves), the measure counts the device
                 // that much lower (mb.lend_freed). That is a fixed amount, not one that grows with the cache, so the first size, which
                 // takes the whole difference to the measure without the cache as the cache's, misses it: grow by it (at most), as the
-                // fill does by any surplus. LLAMA_MOE_CACHE_LEND_SAVE=0 off (no lending for it, nothing freed)
+                // fill does by any surplus. Only with LLAMA_MOE_CACHE_LEND_SAVE=1 (opt-in, see llama_moe_cache lend_save)
                 int64_t lent_left = 0;
                 for (size_t id = 0; id < nd; id++) {
                     lent_left += int64_t(dmds_test[id].mb.lend_freed);
