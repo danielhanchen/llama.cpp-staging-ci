@@ -726,6 +726,15 @@ static __global__ void flash_attn_mask_to_KV_max(
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
+bool ggml_cuda_qsa_maskless_gather_ok(const ggml_cuda_qsa_maskless & qsa);
+// GGML_CUDA_QSA_MASKLESS: 0 builds the dense mask in the graph (kill switch), 1 (default) gathers from the selection,
+// 2 skips the graph's mask nodes but always rebuilds the dense mask (tests the fallback)
+int  ggml_cuda_qsa_maskless_mode();
+void ggml_cuda_qsa_maskless_compact(
+        const ggml_cuda_qsa_maskless & qsa, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max,
+        cudaStream_t stream);
+void ggml_cuda_qsa_maskless_materialize(const ggml_cuda_qsa_maskless & qsa, half * mask, cudaStream_t stream);
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -987,7 +996,10 @@ void launch_fattn(
     // per-head kernel does and its outputs are bit-identical (fattn-vec.cuh, GGML_CUDA_FA_VEC_GQA)
     fattn_kernel_t pb_kernel = nullptr, const int pb_ncols2 = 1,
     // k15: thread groups per block (blockDim.z; fattn-vec.cuh grouped heads), the occupancy then is that of pb_kernel's group size
-    const int block_z = 1
+    const int block_z = 1,
+    // k15-mm2: the vector kernel's KV split may be capped (fattn_vec_kv_split_cap): it is a split-K over the KV cells with an f32
+    // combine, and the vector kernel accumulates VKQ in f32 on NVIDIA, so a cap only reorders f32 sums
+    const bool vec_kv_cap = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1013,6 +1025,28 @@ void launch_fattn(
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
+
+    // k15-mm2 QSA maskless: the graph did not build this node's dense selection mask. A gather takes its lists from the selected
+    // cells and reads the causal mask, which equals the dense one at every listed cell; any other kernel gets the dense mask now
+    const ggml_cuda_qsa_maskless * qsa = nullptr;
+    if (!ctx.qsa_maskless.empty()) {
+        const auto it = ctx.qsa_maskless.find(dst);
+        if (it != ctx.qsa_maskless.end()) {
+            qsa = &it->second;
+        }
+    }
+    const bool qsa_gather = qsa && use_sparse && ggml_cuda_qsa_maskless_gather_ok(*qsa) && ggml_cuda_qsa_maskless_mode() == 1;
+    // the mask node's buffer may hold the selection or the causal mask (the allocator reused it), then a pool copy takes the mask;
+    // allocated before the kernel's pool buffers, freed after them
+    ggml_cuda_pool_alloc<half> qsa_mask(pool);
+    const char * mask_data = mask ? (const char *) mask->data : nullptr;
+    if (qsa_gather) {
+        mask_data = (const char *) qsa->kq->data;
+    } else if (qsa) {
+        half * m = qsa->alias ? qsa_mask.alloc(ggml_nelements(mask)) : (half *) mask->data;
+        ggml_cuda_qsa_maskless_materialize(*qsa, m, main_stream);
+        mask_data = (const char *) m;
+    }
     const int id  = ggml_cuda_get_device();
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
@@ -1114,7 +1148,13 @@ void launch_fattn(
         const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
 
         KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        if (qsa_gather) {
+            ggml_cuda_qsa_maskless_compact(*qsa, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        } else {
+            ggml_tensor mask_m = *mask; // the QSA maskless rebuild may live in a pool copy
+            mask_m.data = (void *) mask_data;
+            ggml_cuda_flash_attn_ext_compact_mask(&mask_m, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        }
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
@@ -1134,7 +1174,7 @@ void launch_fattn(
         KV_max.alloc(ne_KV_max);
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
-            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+            (const half2 *) mask_data, KV_max.ptr, iter_k, s31, s33);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -1227,6 +1267,33 @@ void launch_fattn(
             }
         }
 
+#ifndef GGML_USE_HIP
+        // k15-mm2: fewer, longer KV blocks for the vector kernel, whose blocks otherwise get as little as one KV tile each, so that
+        // their fixed cost (Q load, the final reduction, the combine reads) sets the time. GGML_CUDA_FA_PB_MIN_TILES = KV tiles each
+        // block keeps at least (0 = no minimum), GGML_CUDA_FA_PB_MAX = at most that many parallel blocks (0 = no cap). Not on HIP:
+        // there the vector kernel accumulates VKQ in half2 (V_DOT2_F32_F16_AVAILABLE) and longer blocks would add more half sums.
+        if (vec_kv_cap && parallel_blocks > 1) {
+            static const int pb_max = [] {
+                const char * e = getenv("GGML_CUDA_FA_PB_MAX");
+                return e != nullptr ? atoi(e) : 0;
+            }();
+            static const int min_tiles = [] {
+                const char * e = getenv("GGML_CUDA_FA_PB_MIN_TILES");
+                return e != nullptr ? atoi(e) : 0;
+            }();
+            int cap = parallel_blocks;
+            if (pb_max > 0) {
+                cap = std::min(cap, pb_max);
+            }
+            if (min_tiles > 0) {
+                cap = std::min(cap, std::max(1, ntiles_KV / min_tiles));
+            }
+            parallel_blocks = std::max(1, cap);
+        }
+#else
+        GGML_UNUSED(vec_kv_cap);
+#endif // GGML_USE_HIP
+
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
@@ -1268,7 +1335,7 @@ void launch_fattn(
         (const char *) Q->data,
         K_data,
         V_data,
-        mask ? ((const char *) mask->data) : nullptr,
+        mask_data,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
