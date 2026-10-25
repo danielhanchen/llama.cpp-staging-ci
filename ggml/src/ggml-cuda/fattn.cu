@@ -236,28 +236,31 @@ static __global__ void flash_attn_sel_to_sparse_indices(
     ggml_cuda_pdl_lc();
 }
 
-// the dense mask when the kernel does not gather: one block per token row, -inf, then the causal mask at the selected cells,
-// as fill(-inf) + set_rows(0) + add(kq_mask) computes it
+// the dense mask when the kernel does not gather: -inf, then the causal mask at the selected cells, as fill(-inf) + set_rows(0)
+// + add(kq_mask) computes it. One block per (token row, FATTN_SEL_MASK_CHUNK cells): a block writes only its own cells
+#define FATTN_SEL_MASK_CHUNK 1024
 __launch_bounds__(256, 1)
 static __global__ void flash_attn_sel_to_mask(
         const int32_t * idx_ptr, const half * kq_ptr, half * mask_ptr, const int n_kv, const int n_sel, const int n_queries,
-        const int64_t s_idx, const int64_t s31, const int64_t s33) {
+        const int64_t s_idx, const int64_t s31, const int64_t s33, const int chunk) {
     ggml_cuda_pdl_sync();
 
-    const int q        = blockIdx.x;
-    const int sequence = blockIdx.y;
+    const int q        = blockIdx.y;
+    const int sequence = blockIdx.z;
+    const int c0       = blockIdx.x*chunk;
+    const int c1       = min(c0 + chunk, n_kv);
 
     const int32_t * idx  = idx_ptr  + (int64_t(sequence)*n_queries + q)*s_idx;
     const half    * kq   = kq_ptr   + sequence*s33 + q*s31;
     half          * mask = mask_ptr + sequence*s33 + q*s31;
 
-    for (int c = threadIdx.x; c < n_kv; c += blockDim.x) {
+    for (int c = c0 + threadIdx.x; c < c1; c += blockDim.x) {
         mask[c] = half(-INFINITY);
     }
     __syncthreads();
     for (int s = threadIdx.x; s < n_sel; s += blockDim.x) {
         const int32_t c = idx[s];
-        if (c >= 0 && c < n_kv) {
+        if (c >= c0 && c < c1) {
             mask[c] = __float2half(0.0f + __half2float(kq[c]));
         }
     }
@@ -311,12 +314,15 @@ void ggml_cuda_qsa_maskless_materialize(const ggml_cuda_qsa_maskless & qsa, half
 #else
     const ggml_tensor * idx = qsa.idx;
     const ggml_tensor * kq  = qsa.kq;
-    const dim3 blocks_num(kq->ne[1], kq->ne[3], 1);
+    // GGML_CUDA_QSA_MASK_SPLIT=0: one block per token row (the cell chunk is the whole row)
+    static const bool split = !getenv("GGML_CUDA_QSA_MASK_SPLIT") || atoi(getenv("GGML_CUDA_QSA_MASK_SPLIT")) != 0;
+    const int chunk = split ? FATTN_SEL_MASK_CHUNK : int(kq->ne[0]);
+    const dim3 blocks_num((kq->ne[0] + chunk - 1)/chunk, kq->ne[1], kq->ne[3]);
     const dim3 block_dim(256, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
     ggml_cuda_kernel_launch(flash_attn_sel_to_mask, launch_params,
         (const int32_t *) idx->data, (const half *) kq->data, mask, int(kq->ne[0]), int(idx->ne[0]), int(kq->ne[1]),
-        int64_t(idx->nb[1]/sizeof(int32_t)), int64_t(kq->nb[1]/sizeof(half)), int64_t(kq->nb[3]/sizeof(half)));
+        int64_t(idx->nb[1]/sizeof(int32_t)), int64_t(kq->nb[1]/sizeof(half)), int64_t(kq->nb[3]/sizeof(half)), chunk);
     CUDA_CHECK(cudaGetLastError());
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }

@@ -1412,12 +1412,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_input->nb[1], conv_input->nb[2],
                 ggml_row_size(conv_input->type, s_idx));
 
-        ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
-                state_cols * channels, n_seqs,
-                conv_states_all->nb[1],
-                (slot * mem_size + kv_head) * row_size);
-
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        // k15-mm2: the slot row seen with the tail's shape takes a strided copy of the tail directly (a 2D copy on CUDA), the same
+        // bytes as making the tail contiguous and copying that; LLAMA_QWEN4EXP_CONV_CONT=1 restores the two copies
+        static const bool conv_cont = getenv("LLAMA_QWEN4EXP_CONV_CONT") && atoi(getenv("LLAMA_QWEN4EXP_CONV_CONT")) != 0;
+        if (conv_cont) {
+            ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+                    state_cols * channels, n_seqs,
+                    conv_states_all->nb[1],
+                    (slot * mem_size + kv_head) * row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        } else {
+            ggml_tensor * dst = ggml_view_3d(ctx0, conv_states_all,
+                    state_cols, channels, n_seqs,
+                    ggml_row_size(conv_states_all->type, state_cols), conv_states_all->nb[1],
+                    (slot * mem_size + kv_head) * row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
+        }
     }
 
     return conv_input;
