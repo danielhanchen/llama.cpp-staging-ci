@@ -1086,6 +1086,10 @@ private:
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    // k15-lfm2: spill mode 3 pinned the small batches (llama_moe_pin_small); a request that cannot draft (a prompt of long_prompt+ tokens
+    // whose shortest repeat is longer than any match) lifts the pin for its decode and the next request restores it before its prompt
+    bool spill_pinned     = false;
+    bool spill_pin_lifted = false;
 
     common_speculative_ptr spec;
 
@@ -1574,6 +1578,20 @@ private:
             }
         }
 
+        // k15-lfm2: LFM2.5 with drafts verified exactly (output unchanged by the window): prompts of 4096+ tokens take a short window of
+        // 2 drafts and the full window from a repeat of 6. Opt-in (LLAMA_SPEC_LFM_LONG_WIN=1): G4 32 GB +0.6% / +3.1% at 8k / 16k on the
+        // default build, but -3.7% / -1.6% with GGML_CUDA_MMVQ_MOE_ONE=1 (k15-fn's coming default), plans/k15_lfm2.md
+        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO && params_base.speculative.ngram_suffix.auto_mode && server_spec_auto_exact() &&
+                llama_verify_exact_placement(ctx_tgt) && server_spec_auto_arch(params_base.model.path) == "lfm2moe") {
+            const char * e = getenv("LLAMA_SPEC_LFM_LONG_WIN");
+            if (e != nullptr && atoi(e) != 0) {
+                auto & ns = params_base.speculative.ngram_suffix;
+                ns.win_long_prompt   = 4096;
+                ns.n_max_short_long  = 2;
+                ns.n_long_match_long = 6;
+            }
+        }
+
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
@@ -1618,6 +1636,7 @@ private:
                     SRV_INF("%s", "n-gram drafting by default under the MoE cache: small batches frozen, drafts verified exactly against them "
                         "(KLD-gated default, LLAMA_SPEC_SPILL=0: off)\n");
                 } else if (spill == 3 && llama_moe_pin_small(ctx_tgt)) {
+                    spill_pinned = true;
                     // k13: small batches always take the host path (no timing trials), fetch share and admissions kept; drafts verified
                     // as ordinary batches: other greedy text, KLD-gated per model
                     SRV_INF("%s", "n-gram drafting by default under the MoE cache: small-batch host path pinned on, drafts verified as ordinary "
@@ -2094,6 +2113,17 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // k15-lfm2: the pin a request without drafts lifted is restored before the next prompt (see spill_pinned)
+        if (spill_pin_lifted) {
+            spill_pin_lifted = !llama_moe_pin_small_set(ctx_tgt, true);
+        }
+        // LLAMA_SPEC_SPILL_UNPIN_LONG=2: a request that cannot draft (a long prompt, no repeat long enough) is unpinned before its prompt
+        if (spill_pinned && server_spec_spill_unpin_long() == 2 && params_base.n_parallel == 1) {
+            const auto & ns = params_base.speculative.ngram_suffix;
+            if (ns.long_prompt > 0 && ns.n_min_match_long > 64 && (int64_t) task.tokens.size() >= ns.long_prompt) {
+                spill_pin_lifted = !llama_moe_pin_small_set(ctx_tgt, false);
+            }
+        }
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -5033,6 +5063,17 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+
+                // k15-lfm2: a request under spill mode 3 that cannot draft (no repeat is long enough on a long prompt) gains nothing from
+                // the pinned host path: its decode follows the CPU-miss rule (G4 LFM2.5 12 GB 16k, k15 re-bench: pinned 235.1 tok/s,
+                // LLAMA_SPEC_SPILL=0 286.7). Its prompt ran pinned (all-device), so its first token is unchanged.
+                // Opt-in, LLAMA_SPEC_SPILL_UNPIN_LONG=1 (mixed on G4, see server_spec_spill_unpin_long)
+                if (spill_pinned && !spill_pin_lifted && server_spec_spill_unpin_long() == 1 && params_base.n_parallel == 1) {
+                    const auto & ns = params_base.speculative.ngram_suffix;
+                    if (ns.long_prompt > 0 && ns.n_min_match_long > 64 && slot.prompt.n_tokens() >= ns.long_prompt) {
+                        spill_pin_lifted = !llama_moe_pin_small_set(ctx_tgt, false);
+                    }
+                }
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());

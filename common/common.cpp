@@ -2244,7 +2244,23 @@ static bool common_gguf_has_swa(const std::string & path) {
     }
 }
 
+static std::string common_gguf_arch(const std::string & path) {
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context_ptr ctx(gguf_init_from_file(path.c_str(), gp));
+    if (!ctx) {
+        return "";
+    }
+    const int64_t arch_id = gguf_find_key(ctx.get(), "general.architecture");
+    return arch_id >= 0 && gguf_get_kv_type(ctx.get(), arch_id) == GGUF_TYPE_STRING ? std::string(gguf_get_val_str(ctx.get(), arch_id)) : "";
+}
+
+static bool common_moe_resident_ubatch_try(common_params & params, llama_model_params & mparams, llama_context_params & cparams,
+        const common_fit_extra_model * extra, ggml_log_level log_level, uint32_t u, bool quiet);
+
 // k9-prompt-pass: the prompt ubatch of a MoE model whose experts are all on the device (see the call in common_init_result)
+// k15-lfm2: where 2048 does not keep every expert on the device, 1024 is tried next (LFM2.5 on a 16 GB G4 tier: 512 -> 1024; a ubatch
+// size only regroups the same products, as -ub does: the equivalence rule of plans/k11.md). LLAMA_MOE_RESIDENT_UB_LADDER=0: 2048 only;
+// =2: for every model (default: LFM2 / LFM2-MoE)
 static void common_moe_resident_ubatch(common_params & params, llama_model_params & mparams, llama_context_params & cparams,
         const common_fit_extra_model * extra, ggml_log_level log_level) {
     const char * env = getenv("LLAMA_MOE_RESIDENT_UB");
@@ -2253,16 +2269,38 @@ static void common_moe_resident_ubatch(common_params & params, llama_model_param
     if (want <= (int64_t) ub_def || (params.n_ctx > 0 && want > params.n_ctx) || (params.n_batch_set && (int64_t) cparams.n_batch < want)) {
         return;
     }
-    const uint32_t u = (uint32_t) want;
+    const char * env_l = getenv("LLAMA_MOE_RESIDENT_UB_LADDER");
+    const int ladder = env_l != nullptr ? atoi(env_l) : 1;
+    bool ladder_on = ladder >= 2;
+    if (ladder == 1 && env == nullptr) {
+        const std::string arch = common_gguf_arch(params.model.path);
+        ladder_on = arch == "lfm2" || arch == "lfm2moe";
+    }
+    if (common_moe_resident_ubatch_try(params, mparams, cparams, extra, log_level, (uint32_t) want, ladder_on)) {
+        return;
+    }
+    if (ladder_on && want/2 > (int64_t) ub_def) {
+        if (!common_moe_resident_ubatch_try(params, mparams, cparams, extra, log_level, (uint32_t) (want/2), false)) {
+            return;
+        }
+        COM_INF("MoE experts on the device: n_ubatch %u does not keep every expert on the device, %u does (LLAMA_MOE_RESIDENT_UB_LADDER=0: %u only)\n",
+            (uint32_t) want, (uint32_t) (want/2), (uint32_t) want);
+    }
+}
+
+// one candidate ubatch u: true (and params / cparams set) if the fit at u keeps every expert on the device
+static bool common_moe_resident_ubatch_try(common_params & params, llama_model_params & mparams, llama_context_params & cparams,
+        const common_fit_extra_model * extra, ggml_log_level log_level, uint32_t u, bool quiet) {
+    const uint32_t ub_def = cparams.n_ubatch;
     common_moe_slot_bytes sbt;
     if (!common_moe_slot_bytes_of(params.model.path, sbt) || sbt.n_expert <= 1) {
-        return; // not a MoE model
+        return true; // not a MoE model (nothing to try)
     }
     const char * env_swa = getenv("LLAMA_MOE_RESIDENT_UB_SWA");
     if ((env_swa == nullptr || atoi(env_swa) == 0) && common_gguf_has_swa(params.model.path)) {
         COM_INF("MoE experts on the device: n_ubatch stays %u (sliding-window layers: their KV cache grows with n_ubatch; LLAMA_MOE_RESIDENT_UB_SWA=1 "
             "to grow it anyway)\n", ub_def);
-        return;
+        return true;
     }
     // the fit again at the larger ubatch, on copies: every expert must stay on the device
     llama_model_params   mp = mparams;
@@ -2286,8 +2324,10 @@ static void common_moe_resident_ubatch(common_params & params, llama_model_param
             (tbo.size() != params.tensor_buft_overrides.size()) ||
             !std::equal(tbo.begin(), tbo.end(), params.tensor_buft_overrides.begin(), [](const auto & a, const auto & b) {
                 return a.pattern == b.pattern && a.buft == b.buft; })) {
-        COM_INF("MoE experts on the device: n_ubatch stays %u (at n_ubatch %u the fit does not keep every expert on the device)\n", ub_def, u);
-        return;
+        if (!quiet) {
+            COM_INF("MoE experts on the device: n_ubatch stays %u (at n_ubatch %u the fit does not keep every expert on the device)\n", ub_def, u);
+        }
+        return false;
     }
     // the draft context keeps the ubatch it was fitted with (the MTP context reads the prompt over one layer; a draft model's compute
     // buffer would grow for nothing)
@@ -2302,6 +2342,7 @@ static void common_moe_resident_ubatch(common_params & params, llama_model_param
     }
     COM_INF("MoE experts on the device: n_ubatch = %u (default %u; draft context %d; LLAMA_MOE_RESIDENT_UB=0 keeps the default)\n", u, ub_def,
         extra != nullptr ? params.speculative.draft.n_ubatch : -1);
+    return true;
 }
 
 // the request --moe-cache-mib auto stands for: larger than any device, so that the fit gives the cache what the layers leave

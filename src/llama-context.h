@@ -109,6 +109,7 @@ struct llama_context {
     const llama_moe_cache * get_moe_cache() const { return moe_cache.get(); } // k13
     bool moe_freeze_small(); // k13: see llama_moe_freeze_small
     bool moe_pin_small();    // k13: see llama_moe_pin_small
+    bool moe_pin_small_set(bool on); // k15-lfm2: see llama_moe_pin_small_set
     bool moe_cpu_miss_drop_slow(); // k15-lfm2: see llama_moe_cpu_miss_drop_slow
     const llama_cparams & get_cparams() const;
 
@@ -394,6 +395,8 @@ private:
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
     static bool sched_copy_experts_body(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
+    // k15-lfm2: the prompt map of an in-place prompt layer (llama_moe_cache::prompt_copy): records its routing, seeds as the staging copy does
+    bool moe_prompt_copy(ggml_backend_t backend, ggml_tensor * dst, ggml_cgraph * graph, int32_t il);
     // ggml_backend_sched prefetch callback, selects how the weights in host memory are prefetched
     static ggml_backend_sched_prefetch_mode sched_prefetch_mode(const ggml_tensor * src, const ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
@@ -596,6 +599,8 @@ private:
 
     // value of moe_cache_seed when the current graph was allocated: the scheduler plans the copies of the experts with it
     bool moe_cache_seed_graph = false;
+    bool moe_inplace_ok       = false; // k15-lfm2: this ubatch may read its experts in place (see moe_cache_seed_begin)
+    bool moe_inplace_graph    = false;
     int  moe_cache_hybrid_graph = 0; // llama_moe_cache::hybrid_mode of the previous graph
 
     // routing outputs of the last computed large ubatch (expert tensor, ids), valid until the next graph is built

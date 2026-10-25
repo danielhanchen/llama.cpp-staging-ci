@@ -593,6 +593,7 @@ struct llama_moe_cache::impl {
     struct layer {
         int32_t ig = -1;                    // -1 if the layer is not cached
         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
+        ggml_tensor * prompt_map = nullptr; // k15-lfm2: I32 [1, n_expert] in host memory, the slots a large batch reads in place (see prompt_copy)
         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
         std::vector<const void *> host_dev; // device-accessible pointers to their data, for the device lookup
     };
@@ -675,6 +676,32 @@ struct llama_moe_cache::impl {
 
     // views used by copy_experts
     ggml_context_ptr ctx_views;
+
+    // k15-lfm2: in-place prompts (LLAMA_MOE_PROMPT_INPLACE=1). A large batch reads the experts of its layer in place: the graph looks up
+    // their slots in a prompt map (a host tensor, copied by prompt_copy as the scheduler copies a weight) and the product reads the bank of
+    // the group; the missing experts are uploaded into lent slots of the bank, at lent base + expert, so nothing stages the cached experts
+    // (Kaggle T4 LFM2.5-24B-A2B 16 GB, 8k prompt: 442 ms of copy_regions copying every cached expert into the staging copy per ubatch).
+    // Only where every small batch runs on the device from the slots (no CPU-miss rule, no hybrid gate): the slots then decide nothing
+    // about the text, the prompt reads the same expert bytes with the same product. The group with lent slots is the largest of the device;
+    // a group that holds every expert of its layers admits its misses instead. A seed of a layer is issued after the layer's product, from
+    // its lent slots, when the next layer is copied (prompt_flush)
+    std::unordered_map<const ggml_tensor *, int32_t> prompt_of; // prompt map -> layer
+    bool prompt_inplace_env = [] {
+        const char * e = getenv("LLAMA_MOE_PROMPT_INPLACE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    bool prompt_inplace_blocked = false; // the context runs layer-major prompts (their seeds read the staging copies)
+    bool inplace_graph = false;          // the graph being allocated reads prompt maps (set_graph)
+    struct prompt_seed_t {
+        int32_t il = -1;
+        int32_t base = 0;
+        ggml_backend_t backend = nullptr;
+        std::vector<int32_t> counts;
+    } pseed;
+    ggml_context_ptr ctx_pviews;
+    size_t n_prompt_inplace = 0, n_prompt_fallback = 0, prompt_hits = 0, prompt_misses = 0, prompt_bytes = 0, prompt_seeds = 0, n_prompt_ring_waits = 0, n_prompt_seed_left = 0;
+    bool prompt_log_done = false;
+    mutable bool prompt_why_logged = false;
 
     // lending (see lend): LLAMA_MOE_CACHE_LEND=0 off, 1 on with one cache device, 2 also with several (not validated)
     int    lend_mode    = 1;     // LLAMA_MOE_CACHE_LEND: 0 off, 1 staging copies, 2 also the graph allocator (experimental)
@@ -819,6 +846,25 @@ struct llama_moe_cache::impl {
     int      cm_recal_after = 64;
     int      cm_recal_wait  = -1;
     static constexpr double cm_recal_tol = 0.20;
+    // k15-lfm2 LLAMA_MOE_CPU_MISS_STABLE (opt-in =1; default 0 = k15 until the KLD band ruling, plans/k15_lfm2.md section 13): one decision per launch, not one of two modes drawn from a noisy timing
+    // sample. The fetch share of a small batch sat on the 1/4 - 1/2 level boundary (raw share 0.354, the geometric midpoint) in the
+    // cells whose calibrated raw share is 0.33-0.43 (G4: Qwen3.8-Flash-Next UD-IQ4_XS 32 GB host 22.6-34.5 us per expert against an
+    // upload of 46 us, Qwen3.6 UD-Q3_K_M 8 GB 14.5-18.6 against 29): launches that drew a fast start-up sample fetched 1/4 and computed
+    // twice the host rows (45435 vs 22865 per run, fn4) at 28.6-30.5 us per row in the decode (not the 23 us of the sample), and decoded
+    // 7-9% faster than the launches at 1/2. The balance the share comes from treats a fetch as running beside the device work, while
+    // the fetch reads host memory in the device stream and the host experts run beside it: small batches take 1/4 up to a raw share of
+    // cm_small_half (LLAMA_MOE_CPU_MISS_SMALL_HALF, default 0.47; 0.354 = k15), which holds a host up to 0.89x the upload time per
+    // expert at 1/4. Of 3500 start-up calibrations in this workspace's G4 / L4 / T4 logs, the ones in 0.354-0.472 (Flash-Next, q3m,
+    // a few gemma-4 / q4x launches) are the minority mode of their cell; the other levels are unchanged. Also an agreeing re-calibration
+    // keeps the faster host time and decides again (see cm_calibrate)
+    const bool cm_stable = [] {
+        const char * e = getenv("LLAMA_MOE_CPU_MISS_STABLE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    const double cm_small_half = [this] {
+        const char * e = getenv("LLAMA_MOE_CPU_MISS_SMALL_HALF");
+        return !cm_stable ? 0.354 : e != nullptr ? std::min(0.612, std::max(0.177, atof(e))) : 0.47;
+    }();
     bool     cm_recal_pending = false; // (timed only between requests: 2 x ~40 ms inside a reply cost chat decode 2% on G4)
     int      cm_nb    = 0;     // batches in the window
     int      cm_win   = cm_win1;
@@ -1289,7 +1335,7 @@ struct llama_moe_cache::impl {
             for (int32_t il : g.layers) {
                 n_tensors[g.id] += llama_moe_cache_layer_small(model.layers[il]).size();
             }
-            n_tensors_host  += g.layers.size();
+            n_tensors_host  += 2*g.layers.size(); // slot map and prompt map
         }
         if (n_tensors_host == 0) {
             throw llama_moe_cache_too_small();
@@ -1373,6 +1419,7 @@ struct llama_moe_cache::impl {
         }
         ctx_host  = init_ctx(n_tensors_host);
         ctx_views = init_ctx(2);
+        ctx_pviews = init_ctx(8);
 
         ggml_backend_buffer_type_t buft_host = ggml_backend_cpu_buffer_type();
         const size_t alignment_host = ggml_backend_buft_get_alignment(buft_host);
@@ -1411,6 +1458,10 @@ struct llama_moe_cache::impl {
                 ggml_format_name(l.slot_map, "moe_cache.slot_map-%d", il);
                 layer_of[l.slot_map] = il;
                 buf_host_size += GGML_PAD(ggml_nbytes(l.slot_map), alignment_host);
+                l.prompt_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                ggml_format_name(l.prompt_map, "moe_cache.prompt_map-%d", il);
+                prompt_of[l.prompt_map] = il;
+                buf_host_size += GGML_PAD(ggml_nbytes(l.prompt_map), alignment_host);
             }
             devices[g.id].buf_size += alloc_size(g, g.n_slots);
 
@@ -3623,6 +3674,10 @@ struct llama_moe_cache::impl {
         if (!cm || !cm_cal || cm_frozen) {
             return cm_frozen && cm_frozen_fetch == keep_fetch;
         }
+        if (!cm_pinned) {
+            cm_trial_saved = cm_trial;
+        }
+        cm_pinned     = cm_pinned || keep_fetch;
         cm_frozen     = true;
         cm_frozen_fetch = keep_fetch || (getenv("LLAMA_MOE_CPU_MISS_FROZEN_FETCH") != nullptr && atoi(getenv("LLAMA_MOE_CPU_MISS_FROZEN_FETCH")) != 0);
         cm_trial      = false;
@@ -3638,12 +3693,52 @@ struct llama_moe_cache::impl {
             cm_on[n] = n <= std::min<int64_t>({ cm_frozen_max, max_batch }) ? 1 : 0;
         }
         cm_gen++;
+        if (cm_pin_lifted_once) {
+            return true; // a pin restored after cm_pin_set(false): logged once at the first pin
+        }
         LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: small batches of up to %d tokens frozen: %s, "
             "no timing trials (LLAMA_MOE_CPU_MISS_FROZEN=0 off)\n", tag, (int) std::min<int64_t>({ cm_frozen_max, max_batch, cm_max }),
             cm_frozen_fetch ? "host path pinned on, the fetch share and admissions kept (LLAMA_MOE_CPU_MISS_FROZEN_FETCH=1)" :
                               "nothing fetched, the host computes every miss");
         return true;
     }
+
+    // k15-lfm2: lift / restore the pin of llama_moe_pin_small (cm_freeze(true)) between requests. Unpinned, the small batches follow
+    // the rule again (cost model, the timing trials where this cache runs them, after cmt_gap small batches); pinned again, as at the
+    // first pin. Only a cache the pin froze (cm_pinned) takes part. Returns the pinned state
+    bool cm_pinned       = false; // frozen by pin_small (not by freeze_small)
+    bool cm_pin_lifted   = false;
+    bool cm_pin_lifted_once = false;
+    bool cm_trial_saved  = true;
+    bool cm_pin_set(bool on) {
+        if (!cm_pinned) {
+            return cm_frozen;
+        }
+        if (on && cm_pin_lifted) {
+            cm_pin_lifted = false;
+            cm_frozen     = false; // cm_freeze(true) pins again from here
+            cm_freeze(true);
+        } else if (!on && !cm_pin_lifted && cm_frozen) {
+            cm_pin_lifted   = true;
+            cm_pin_lifted_once = true;
+            cm_frozen       = false;
+            cm_frozen_fetch = false;
+            cm_trial        = cm_trial_saved;
+            cm_small_ok     = true;
+            cm_small_live   = true;
+            cmt_done        = -1;
+            cmt_t_prev      = -1;
+            cmt_wait        = cm_trial && !cm_trials_skipped ? cmt_gap : -1;
+            cm_decide();
+            cm_gen++;
+            if (pin_log_n++ < 4) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: small-batch pin lifted for this request (the rule decides%s)\n", tag,
+                    cmt_wait > 0 ? ", a timing trial after the next small batches" : "");
+            }
+        }
+        return cm_frozen;
+    }
+    int pin_log_n = 0;
 
     // a batch of more than max_batch tokens (a short prompt) that the host path serves: it is looked up on the device like a small batch
     // short prompts take the host path only once a trial found it faster for the small batches on this host and model (without a
@@ -4282,16 +4377,24 @@ struct llama_moe_cache::impl {
             const double t1_new = std::max(slope, 0.05);
             const double dt_new = std::max(0.0, (d_t - d_a)/((double) ka*(T - 1)));
             const double rel    = std::fabs(t1_new - cm_t1)/std::max(cm_t1, 1e-3);
-            if (rel <= cm_recal_tol) {
+            // k15-lfm2 (cm_stable): an agreeing re-calibration also keeps the faster of the two and decides again below (before, it
+            // returned with the start-up decisions, which the next rule window, up to cm_win2 small batches later, then changed)
+            if (rel <= cm_recal_tol && cm_stable) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: re-calibration %.1f us per expert agrees with %.1f (within %.0f%%), host %.1f "
+                    "us per expert kept\n", tag, t1_new, cm_t1, 100.0*cm_recal_tol, std::min(cm_t1, t1_new));
+                cm_dt = t1_new < cm_t1 ? dt_new : cm_dt;
+                cm_t1 = std::min(cm_t1, t1_new);
+            } else if (rel <= cm_recal_tol) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: re-calibration %.1f us per expert agrees with %.1f (within %.0f%%)\n", tag,
                     t1_new, cm_t1, 100.0*cm_recal_tol);
                 return;
+            } else {
+                const double t1_old = cm_t1;
+                cm_t1 = std::min(cm_t1, t1_new);
+                cm_dt = t1_new < t1_old ? dt_new : cm_dt;
+                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: re-calibration %.1f us per expert vs %.1f at start-up (%.0f%% apart): host %.1f us "
+                    "per expert kept\n", tag, t1_new, t1_old, 100.0*rel, cm_t1);
             }
-            const double t1_old = cm_t1;
-            cm_t1 = std::min(cm_t1, t1_new);
-            cm_dt = t1_new < t1_old ? dt_new : cm_dt;
-            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: re-calibration %.1f us per expert vs %.1f at start-up (%.0f%% apart): host %.1f us "
-                "per expert kept\n", tag, t1_new, t1_old, 100.0*rel, cm_t1);
         } else {
             cm_t1    = std::max(slope, 0.05);
             cm_dt    = std::max(0.0, (d_t - d_a)/((double) ka*(T - 1)));
@@ -4308,7 +4411,10 @@ struct llama_moe_cache::impl {
         GGML_UNUSED(attempt);
 
         cm_share.assign(cm_max + 1, 1.0f);
-        cm_on.assign(cm_max + 1, 0);
+        // cm_stable: a re-calibration keeps the decisions it decides again from (the hysteresis of the sizes that are on, the frozen sizes)
+        if (!recal || !cm_stable || cm_on.size() != (size_t) cm_max + 1) {
+            cm_on.assign(cm_max + 1, 0);
+        }
         // k11 LLAMA_MOE_CPU_MISS_FETCH_SCALE=s (opt-in, unset = 1): the fetched share scaled by s before the levels, with a level of 1/16
         // below 1/8. The balance above treats a fetch as running beside the device work, but the fetch kernel reads host memory in the
         // device stream (G4 q4x + MTP 8 GB nsys: 45% of the decode window), so the device side of the balance is slower than cm_tup says;
@@ -4322,8 +4428,10 @@ struct llama_moe_cache::impl {
             const double tbar = std::max(1.0, (double) n*std::min<int64_t>(n_expert_used, n_expert)/D);
             const double tc   = cm_t1 + (tbar - 1.0)*cm_dt;
             const double raw  = tc/(tc + cm_tup)*fetch_scale;
-            // log levels: two calibrations a little apart rarely fall on two sides of a level
-            cm_share[n] = raw <= 0.177 ? 0.125f : raw <= 0.354 ? 0.25f : raw <= 0.612 ? 0.5f : raw <= 0.80 ? 0.75f : 1.0f;
+            // log levels: two calibrations a little apart rarely fall on two sides of a level. k15-lfm2: small batches (at most
+            // max_batch tokens) take 1/4 up to cm_small_half instead of the geometric midpoint 0.354 (see cm_small_half)
+            const double half = n <= max_batch ? cm_small_half : 0.354;
+            cm_share[n] = raw <= 0.177 ? 0.125f : raw <= half ? 0.25f : raw <= 0.612 ? 0.5f : raw <= 0.80 ? 0.75f : 1.0f;
             if (fetch_scale != 1.0 && raw <= 0.088) {
                 cm_share[n] = 0.0625f;
             }
@@ -4971,6 +5079,13 @@ struct llama_moe_cache::impl {
         }
         const int32_t id = (int32_t) (it_dev - devices.begin());
 
+        // k15-lfm2: a graph of in-place prompts lends one layer of slots for its missing experts; its other copies (if any) stay in the
+        // scheduler's arena
+        if (inplace_graph) {
+            prompt_lend(backend, id, dry);
+            return;
+        }
+
         if (n_copies == 0) {
             if (!dry) {
                 for (group & g : groups) {
@@ -5359,6 +5474,7 @@ struct llama_moe_cache::impl {
     }
 
     void unlend(group & g) {
+        prompt_flush();
         ggml_backend_t backend = devices[g.id].backend;
         ggml_backend_synchronize(backend);
         seed_end(g);
@@ -5589,6 +5705,426 @@ struct llama_moe_cache::impl {
         return true;
     }
 
+    // k15-lfm2: in-place prompts, see prompt_of. A group that does not hold every expert of its layers lends prompt_rings*M slots, M the
+    // most experts a layer of the group misses (the slot maps do not change during such a graph: no seed, no admission). The copy of a
+    // prompt map may be prefetched on the copy queue: each staging slot of the scheduler (told apart by where the copy of the map lands)
+    // gets its own ring of M lent slots, so a ring is written again only after the scheduler retired the split that read it
+    static constexpr int32_t prompt_rings = 4;
+    bool prompt_group_full(const group & g) const {
+        return (int64_t) g.n_slots >= (int64_t) g.layers.size()*g.lru.n_expert;
+    }
+    bool prompt_inplace_ok(int32_t il) const {
+        if (!prompt_inplace_env || !prompt_ubatch_ok || prompt_inplace_blocked || cm || hybrid || lend_mode == 0 || host_layer(il)) {
+            return false;
+        }
+        const group & g = groups[layers[il].ig];
+        if (!g.dev_lookup || g.devseed || g.n_slots <= 0) {
+            return false;
+        }
+        if (std::count_if(devices.begin(), devices.end(), [](const device & d) { return d.host_bytes > 0 && d.buf_bank; }) > 1) {
+            return false;
+        }
+        // the rings of a group that misses experts hold a whole layer (a seed may evict any of its experts), in at most half its slots;
+        // a smaller group keeps the staging copies (it could not admit a layer while lending the rings)
+        return prompt_group_full(g) || g.n_slots/2 >= prompt_rings*g.lru.n_expert;
+    }
+    bool prompt_group_inplace(const group & g) const {
+        return std::any_of(g.layers.begin(), g.layers.end(), [&](int32_t il) { return prompt_inplace_ok(il); });
+    }
+    bool prompt_ubatch_ok = false;  // set per ubatch by the context: the ubatch does not seed the cache
+    bool prompt_lent = false;       // slots lent by in-place prompts (given back by set_graph)
+    std::vector<int32_t> prompt_m;  // per group: the ring size of this graph (0: no ring)
+    std::vector<std::pair<const void *, int32_t>> prompt_ring_of; // where a copy of a prompt map lands -> its ring
+    bool prompt_bad = false;        // this graph's rings did not fit (see prompt_rings_set): prompt maps fall back to admitting
+    // a ubatch that seeds from the routing of an earlier one (the context's seed_prev): the seed of every layer is planned before any of its
+    // prompt maps (prompt_seed_plan), so the maps already read the post-seed slots; a seeded expert is read from its ring, then copied
+    // from there into its slot once the split that read it retired (when the ring is written again, or at the end of the graph)
+    std::vector<std::vector<moe_cache_lru::fill>> prompt_seeded; // per layer: expert -> its new slot, data not there yet
+    struct ring_copy { int32_t ig; int32_t from; int32_t to; };
+    std::vector<std::vector<ring_copy>> ring_pending; // per ring: the seed copies to make before it is written again
+    ggml_backend_t ring_backend = nullptr;           // the backend that last wrote the rings
+
+    int32_t prompt_misses_max(const group & g) const {
+        int32_t m = 0;
+        for (int32_t il : g.layers) {
+            const int32_t * sl = g.lru.slot_map[il];
+            int32_t c = 0;
+            for (int32_t e = 0; e < g.lru.n_expert; ++e) {
+                c += sl[e] < 0;
+            }
+            if ((size_t) il < prompt_seeded.size()) {
+                c += (int32_t) prompt_seeded[il].size();
+            }
+            m = std::max(m, c);
+        }
+        return m;
+    }
+
+    // the seed of each layer of the groups that miss experts (as seed() plans it: each layer an equal share of the slots that are not lent,
+    // its most used experts), from the routing the context stored (get_seed_counts); replanned after a change of the lent slots
+    bool prompt_seed_counts = false; // set per ubatch by the context: seed from the stored routing
+    void prompt_seed_plan() {
+        prompt_seeded.assign(layers.size(), {});
+        for (group & g : groups) {
+            if (g.n_slots <= 0 || prompt_group_full(g) || !g.dev_lookup || g.dev_newer) {
+                continue;
+            }
+            for (int32_t il : g.layers) {
+                const layer & l = layers[il];
+                if (!prompt_inplace_ok(il)) {
+                    continue; // staged: seed() seeds it from the staging copy
+                }
+                const std::vector<int32_t> * cp = l.experts.empty() ? nullptr : get_seed_counts(l.experts[0]);
+                if (cp == nullptr || (int32_t) cp->size() != g.lru.n_expert) {
+                    continue;
+                }
+                const std::vector<int32_t> & counts = *cp;
+                const size_t n_avail = (size_t) (g.n_slots - g.lru.n_lent);
+                size_t n_seed = n_avail / g.layers.size();
+                size_t n_full = g.n_slots / g.layers.size();
+                if (n_full == 0) {
+                    const size_t pos = std::find(g.layers.begin(), g.layers.end(), il) - g.layers.begin();
+                    n_full = pos < (size_t) g.n_slots ? 1 : 0;
+                    n_seed = pos < n_avail ? 1 : 0;
+                }
+                if (profile_loaded && profile_seed < 1.0) {
+                    n_full = (size_t) (n_full*profile_seed);
+                    n_seed = std::min(n_seed, n_full);
+                    if (n_full == 0) {
+                        continue;
+                    }
+                }
+                seed_ids.clear();
+                for (int32_t e = 0; e < g.lru.n_expert; ++e) {
+                    if (counts[e] > 0) {
+                        seed_ids.push_back(e);
+                    }
+                }
+                auto by_count = [&](int32_t a, int32_t c) {
+                    return counts[a] != counts[c] ? counts[a] > counts[c] : a < c;
+                };
+                if (n_full < seed_ids.size()) {
+                    std::partial_sort(seed_ids.begin(), seed_ids.begin() + n_full, seed_ids.end(), by_count);
+                    seed_ids.resize(n_full);
+                } else if (n_seed < seed_ids.size()) {
+                    std::sort(seed_ids.begin(), seed_ids.end(), by_count);
+                }
+                if (n_seed < seed_ids.size()) {
+                    refill.resize(layers.size());
+                    refill[il].assign(seed_ids.begin() + n_seed, seed_ids.end());
+                    seed_ids.resize(n_seed);
+                }
+                if (seed_ids.empty()) {
+                    continue;
+                }
+                size_t n_hit = 0;
+                std::vector<moe_cache_lru::fill> fl;
+                const bool ok = g.lru.plan(il, seed_ids.data(), seed_ids.size(), fl, n_hit, nullptr);
+                GGML_ASSERT(ok);
+                prompt_seeded[il] = std::move(fl);
+                prompt_seeds++;
+            }
+        }
+    }
+
+    // LLAMA_MOE_CACHE_SEED_CHECK: the seeded slots are compared with the host experts after the ubatch
+    void prompt_seed_rec(int32_t il, int32_t e, int32_t slot) {
+        if (!seed_check) {
+            return;
+        }
+        const group & g = groups[layers[il].ig];
+        for (const ggml_tensor * w : layers[il].experts) {
+            seed_committed.push_back({ w, g.banks[bindings.at(w).ip], e, slot });
+        }
+    }
+
+    // the seeds whose slot was lent since the plan (their expert is no longer cached)
+    void prompt_seed_filter(const group & g) {
+        for (int32_t il : g.layers) {
+            if ((size_t) il >= prompt_seeded.size()) {
+                continue;
+            }
+            auto & v = prompt_seeded[il];
+            v.erase(std::remove_if(v.begin(), v.end(), [&](const moe_cache_lru::fill & f) {
+                return f.slot >= g.n_slots - g.lru.n_lent || g.lru.slot_map[il][f.expert] != f.slot;
+            }), v.end());
+        }
+    }
+
+    // the seed copies of a ring, from its slots into the slots of the seeded experts (stream order on backend)
+    void prompt_ring_flush(int32_t ring, ggml_backend_t backend) {
+        if (ring < 0 || ring >= (int32_t) ring_pending.size() || ring_pending[ring].empty()) {
+            return;
+        }
+        seed_regions.clear();
+        for (const ring_copy & c : ring_pending[ring]) {
+            for (ggml_tensor * bank : groups[c.ig].banks) {
+                const size_t nb = bank->nb[2];
+                seed_regions.push_back({ bank, (size_t) c.from*nb, bank, (size_t) c.to*nb, nb });
+            }
+        }
+        if (!ggml_backend_tensor_copy_regions_async(backend, seed_regions.data(), seed_regions.size())) {
+            for (const auto & r : seed_regions) {
+                ggml_tensor * bank = r.dst;
+                const size_t nb = bank->nb[2];
+                ggml_reset(ctx_pviews.get());
+                ggml_tensor * src_v = ggml_view_3d(ctx_pviews.get(), bank, bank->ne[0], bank->ne[1], 1, bank->nb[1], nb, r.src_offset);
+                ggml_tensor * dst_v = ggml_view_3d(ctx_pviews.get(), bank, bank->ne[0], bank->ne[1], 1, bank->nb[1], nb, r.dst_offset);
+                ggml_backend_view_init(src_v);
+                ggml_backend_view_init(dst_v);
+                ggml_backend_tensor_copy_async(backend, backend, src_v, dst_v);
+            }
+        }
+        ring_pending[ring].clear();
+    }
+    void prompt_ring_flush_all() {
+        if (ring_backend == nullptr) {
+            return;
+        }
+        // on the compute backend, after everything that read the rings
+        ggml_backend_t b = nullptr;
+        for (const device & d : devices) {
+            if (d.backend != nullptr && d.buf_bank && ggml_backend_get_device(d.backend) == ggml_backend_get_device(ring_backend)) {
+                b = d.backend;
+            }
+        }
+        for (int32_t r = 0; r < (int32_t) ring_pending.size(); ++r) {
+            prompt_ring_flush(r, b != nullptr ? b : ring_backend);
+        }
+        ring_backend = nullptr;
+        prompt_seed_leftovers();
+    }
+    // planned seeds of layers whose prompt map was not built (the slot maps already name them): uploaded from the host weights
+    void prompt_seed_leftovers() {
+        for (int32_t il = 0; il < (int32_t) prompt_seeded.size(); ++il) {
+            if (prompt_seeded[il].empty()) {
+                continue;
+            }
+            group & g = groups[layers[il].ig];
+            stats_seed.bytes += upload_fills(devices[g.id].backend, il, prompt_seeded[il], nullptr);
+            stats_seed.misses += prompt_seeded[il].size();
+            n_prompt_seed_left += prompt_seeded[il].size();
+            for (const auto & f : prompt_seeded[il]) {
+                prompt_seed_rec(il, f.expert, f.slot);
+            }
+            prompt_seeded[il].clear();
+        }
+    }
+
+    // before a graph with in-place layers is allocated: the rings of every group that misses experts (synchronous)
+    void prompt_rings_set() {
+        for (device & d : devices) {
+            if (d.backend != nullptr && d.buf_bank) {
+                ggml_backend_synchronize(d.backend);
+            }
+        }
+        prompt_ring_flush_all();
+        prompt_seed_leftovers();
+        prompt_ring_of.clear();
+        prompt_bad = false;
+        prompt_m.assign(groups.size(), 0);
+        prompt_seeded.assign(layers.size(), {});
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            group & g = groups[ig];
+            if (g.n_slots <= 0 || prompt_group_full(g) || !g.dev_lookup || !prompt_group_inplace(g)) {
+                continue;
+            }
+            // lending evicts experts, which a layer then misses: grow until the rings hold the most misses of a layer
+            int32_t m = prompt_misses_max(g);
+            for (int it = 0; it < 4 && prompt_rings*m > g.lru.n_lent; ++it) {
+                const int32_t n = std::min<int32_t>(g.n_slots/2, prompt_rings*m);
+                if (n <= g.lru.n_lent) {
+                    break;
+                }
+                prompt_lend_now(g, n);
+                m = prompt_misses_max(g);
+            }
+            prompt_m[ig] = m;
+        }
+        if (!prompt_seed_counts) {
+            prompt_rings_check();
+            return;
+        }
+        // the seeds are planned after the lending (they fill the slots that stay); a seeded expert, and one a seed evicts, is read from the
+        // ring: grow the rings again if needed (the seeds of the slots lent then are dropped, unlend uploads those experts)
+        prompt_seed_plan();
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            group & g = groups[ig];
+            if (g.n_slots <= 0 || prompt_group_full(g) || !g.dev_lookup || !prompt_group_inplace(g)) {
+                continue;
+            }
+            int32_t m = prompt_misses_max(g);
+            for (int it = 0; it < 4 && prompt_rings*m > g.lru.n_lent; ++it) {
+                const int32_t n = std::min<int32_t>(g.n_slots/2, prompt_rings*m);
+                if (n <= g.lru.n_lent) {
+                    break;
+                }
+                prompt_lend_now(g, n);
+                prompt_seed_filter(g);
+                m = prompt_misses_max(g);
+            }
+            prompt_m[ig] = m;
+        }
+        prompt_rings_check();
+    }
+
+    void prompt_rings_check() {
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            group & g = groups[ig];
+            if (g.n_slots <= 0 || prompt_group_full(g) || !g.dev_lookup || !prompt_group_inplace(g)) {
+                continue;
+            }
+            const int32_t m = prompt_m[ig];
+            if (prompt_rings*m > g.lru.n_lent) {
+                prompt_bad = true;
+                LLAMA_LOG_WARN("%s: MoE cache: in-place prompt rings of %d x %d slots do not fit in %d lent slots: this graph admits its misses\n",
+                    __func__, prompt_rings, m, g.lru.n_lent);
+            }
+            prompt_m[ig] = std::max<int32_t>(m, 1);
+        }
+    }
+
+    void prompt_lend_now(group & g, int32_t n) {
+        if (g.lru.n_lent >= n) {
+            return;
+        }
+        if (g.dev_lookup && g.dev_newer) {
+            download(g);
+        }
+        seed_end(g);
+        keep_evicted(g, n);
+        g.lru.set_lent(n);
+        prompt_lent = true;
+        if (!prompt_log_done) {
+            prompt_log_done = true;
+            LLAMA_LOG_INFO("%s: %s: MoE cache: large batches read the cached experts in place, %d of %d slots (%.2f MiB) lent for the missing ones "
+                "(LLAMA_MOE_PROMPT_INPLACE=0: staging copies)\n", __func__, ggml_backend_name(devices[g.id].backend), n, g.n_slots,
+                (double) n*g.expert_bytes/1024.0/1024.0);
+        }
+    }
+
+    // (kept for the lend() hook of a graph with in-place layers: its other copies stay in the scheduler's arena)
+    void prompt_lend(ggml_backend_t, int32_t, bool) {}
+    // the seed copies still pending (after the graph that read the rings, before the lent slots are written again)
+    void prompt_flush() {
+        if (ring_backend == nullptr) {
+            prompt_seed_leftovers();
+            return;
+        }
+        for (device & d : devices) {
+            if (d.backend != nullptr && d.buf_bank) {
+                ggml_backend_synchronize(d.backend);
+            }
+        }
+        prompt_ring_flush_all();
+    }
+
+    int32_t prompt_layer(const ggml_tensor * t) const {
+        const auto it = prompt_of.find(t);
+        return it != prompt_of.end() ? it->second : -1;
+    }
+
+    // k15-lfm2: copy of the prompt map of layer il into dst (on the compute backend or the scheduler's copy queue): the slots of its cached
+    // experts, its ring for the others, which are uploaded there
+    bool prompt_copy(ggml_backend_t backend, int32_t il, ggml_tensor * dst, const std::vector<int32_t> *) {
+        layer & l = layers[il];
+        const int32_t ig = l.ig;
+        group & g = groups[ig];
+        GGML_ASSERT(ggml_backend_get_device(backend) == ggml_backend_get_device(devices[g.id].backend));
+        const int32_t ne = g.lru.n_expert;
+        int32_t * m = (int32_t *) l.prompt_map->data;
+        fills.clear();
+        size_t n_hit = 0;
+        const int32_t * slots = g.lru.slot_map[il];
+        const int32_t mg = ig < (int32_t) prompt_m.size() ? prompt_m[ig] : 0;
+        if (!prompt_group_full(g) && mg > 0 && !prompt_bad && g.lru.n_lent >= prompt_rings*mg) {
+            int32_t ring = -1;
+            for (const auto & [ptr, r] : prompt_ring_of) {
+                if (ptr == dst->data) {
+                    ring = r;
+                }
+            }
+            if (ring < 0) {
+                if ((int32_t) prompt_ring_of.size() >= prompt_rings) {
+                    // more staging slots than rings: wait for the device, every ring is free again
+                    ggml_backend_synchronize(devices[g.id].backend);
+                    for (int32_t r = 0; r < (int32_t) ring_pending.size(); ++r) {
+                        prompt_ring_flush(r, backend);
+                    }
+                    prompt_ring_of.clear();
+                    n_prompt_ring_waits++;
+                }
+                ring = (int32_t) prompt_ring_of.size();
+                prompt_ring_of.emplace_back(dst->data, ring);
+            }
+            // the ring is written again: the scheduler retired the split that read it, its seed copies go first
+            if ((int32_t) ring_pending.size() <= ring) {
+                ring_pending.resize(ring + 1);
+            }
+            prompt_ring_flush(ring, backend);
+            ring_backend = backend;
+            const int32_t base = g.n_slots - g.lru.n_lent + ring*mg;
+            std::vector<int32_t> seeded_slot(ne, -1);
+            if ((size_t) il < prompt_seeded.size()) {
+                for (const auto & f : prompt_seeded[il]) {
+                    seeded_slot[f.expert] = f.slot;
+                }
+            }
+            int32_t j = 0;
+            for (int32_t e = 0; e < ne; ++e) {
+                if (slots[e] >= 0 && seeded_slot[e] < 0) {
+                    m[e] = slots[e];
+                    n_hit++;
+                } else {
+                    GGML_ASSERT(j < mg && "MoE cache: an in-place prompt layer misses more experts than its ring holds");
+                    m[e] = base + j;
+                    fills.push_back({ e, base + j });
+                    if (seeded_slot[e] >= 0) {
+                        ring_pending[ring].push_back({ ig, base + j, seeded_slot[e] });
+                        stats_seed.misses++;
+                        stats_seed.bytes += g.expert_bytes;
+                        prompt_seed_rec(il, e, seeded_slot[e]);
+                    }
+                    j++;
+                }
+            }
+            if ((size_t) il < prompt_seeded.size()) {
+                prompt_seeded[il].clear();
+            }
+            n_prompt_inplace++;
+        } else {
+            // a group that holds every expert: the missing experts are admitted into free slots (none is evicted). A group whose rings did
+            // not fit admits them too, on the compute stream only (an admission evicts what a layer still being computed may read)
+            if (!prompt_group_full(g)) {
+                ggml_backend_synchronize(devices[g.id].backend);
+                n_prompt_fallback++;
+            }
+            if ((size_t) il < prompt_seeded.size() && !prompt_seeded[il].empty()) {
+                // planned seeds: the slot maps name them, their data is uploaded first
+                stats_seed.bytes += upload_fills(backend, il, prompt_seeded[il], nullptr);
+                stats_seed.misses += prompt_seeded[il].size();
+                for (const auto & f : prompt_seeded[il]) {
+                    prompt_seed_rec(il, f.expert, f.slot);
+                }
+                prompt_seeded[il].clear();
+            }
+            seed_ids.clear();
+            for (int32_t e = 0; e < ne; ++e) {
+                seed_ids.push_back(e);
+            }
+            if (!g.lru.plan(il, seed_ids.data(), seed_ids.size(), fills, n_hit, nullptr)) {
+                GGML_ABORT("the MoE cache is too small for the experts of layer %d", il);
+            }
+            std::copy(g.lru.slot_map[il], g.lru.slot_map[il] + ne, m);
+        }
+        const size_t bytes = upload_fills(backend, il, fills, nullptr);
+        prompt_hits   += n_hit;
+        prompt_misses += fills.size();
+        prompt_bytes  += bytes;
+        ggml_backend_tensor_set_async(backend, dst, m, 0, (size_t) ne*sizeof(int32_t));
+        return true;
+    }
+
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, int64_t n_ubatch) const {
         if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return nullptr;
@@ -5598,6 +6134,18 @@ struct llama_moe_cache::impl {
             return nullptr;
         }
         const layer & l = layers[il];
+
+        // k15-lfm2: a large batch reads its experts in place (see prompt_of)
+        if (n_tokens > max_batch && prompt_inplace_ok(il)) {
+            return l.prompt_map;
+        }
+        if (n_tokens > max_batch && prompt_inplace_env && prompt_ubatch_ok && !prompt_why_logged) {
+            prompt_why_logged = true;
+            const group & g = groups[l.ig];
+            LLAMA_LOG_INFO("%s: MoE cache: layer %d of this large batch is staged (in-place prompts need: no CPU-miss rule %d, no hybrid gate %d, "
+                "lending %d, no RAM tier %d, device lookups %d, no device seed %d, no layer-major prompts %d, slots %d of %d per layer)\n", __func__, il,
+                !cm, !hybrid, lend_mode != 0, !host_layer(il), g.dev_lookup, !g.devseed, !prompt_inplace_blocked, g.n_slots, (int) g.lru.n_expert);
+        }
 
         // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
         if (n_tokens == 0 || n_tokens > max_batch || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
@@ -5609,6 +6157,24 @@ struct llama_moe_cache::impl {
     // the graph about to be allocated: the groups whose banks it reads through host lookups (the get_rows of a slot map)
     // nullptr: a graph that is only measured or reserved, which never runs and reads nothing
     void set_graph(ggml_cgraph * gf) {
+        prompt_flush();
+        inplace_graph = false;
+        for (int i = 0; gf != nullptr && i < ggml_graph_n_nodes(gf) && !inplace_graph; ++i) {
+            const ggml_tensor * node = ggml_graph_node(gf, i);
+            inplace_graph = node->op == GGML_OP_GET_ROWS && prompt_of.count(node->src[0]) > 0;
+        }
+        if (gf != nullptr && inplace_graph) {
+            prompt_rings_set();
+        }
+        // the slots an in-place prompt lent come back for a graph without in-place layers (e.g. the decode after the prompt)
+        if (gf != nullptr && !inplace_graph && prompt_lent) {
+            prompt_lent = false;
+            for (group & g : groups) {
+                if (g.lru.n_lent > 0) {
+                    unlend(g);
+                }
+            }
+        }
         for (group & g : groups) {
             g.host_read = false;
             g.host_need = 0;
@@ -6554,6 +7120,10 @@ struct llama_moe_cache::impl {
         if (stats_seed.misses > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu experts admitted to the cache, %.2f MiB\n", tag, stats_seed.misses, stats_seed.bytes/1024.0/1024.0);
         }
+        if (n_prompt_inplace + n_prompt_fallback > 0 || prompt_hits + prompt_misses > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: large batches in place: %zu layer copies (%zu admitting), %zu experts read from the slots, %zu uploaded "
+                "(%.2f MiB), %zu ring waits, %zu seeded layers, %zu seeds uploaded late\n", tag, n_prompt_inplace, n_prompt_fallback, prompt_hits, prompt_misses, prompt_bytes/1024.0/1024.0, n_prompt_ring_waits, prompt_seeds, n_prompt_seed_left);
+        }
         if (devseed_disabled > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu device seed plans not run (expert products not on the cache device)\n", tag, devseed_disabled);
         }
@@ -6729,6 +7299,10 @@ bool llama_moe_cache::freeze_small() {
 
 bool llama_moe_cache::pin_small() {
     return pimpl->cm_freeze(true);
+}
+
+bool llama_moe_cache::pin_small_set(bool on) {
+    return pimpl->cm_pin_set(on);
 }
 
 bool llama_moe_cache::cpu_miss_drop_slow() {
@@ -6948,6 +7522,41 @@ void llama_moe_cache::set_weight_store(llama_weight_store * ws) {
         pimpl->host.reset();
         pimpl->host_group.assign(pimpl->groups.size(), false);
     }
+}
+
+int32_t llama_moe_cache::prompt_layer(const ggml_tensor * t) const {
+    return pimpl->prompt_layer(t);
+}
+
+std::vector<ggml_tensor *> llama_moe_cache::prompt_experts(int32_t il) const {
+    return il >= 0 && il < (int32_t) pimpl->layers.size() ? pimpl->layers[il].experts : std::vector<ggml_tensor *>();
+}
+
+bool llama_moe_cache::prompt_copy(ggml_backend_t backend, int32_t il, ggml_tensor * dst, const std::vector<int32_t> * counts) {
+    return pimpl->prompt_copy(backend, il, dst, counts);
+}
+
+void llama_moe_cache::prompt_flush() {
+    pimpl->prompt_flush();
+}
+
+void llama_moe_cache::prompt_inplace_block(bool blocked) {
+    pimpl->prompt_inplace_blocked = blocked;
+}
+
+void llama_moe_cache::prompt_ubatch(bool ok, bool seed_prev) {
+    // LLAMA_MOE_PROMPT_INPLACE_SEED=0: a ubatch that seeds from an earlier routing keeps the staging copies
+    static const bool seed_on = [] { const char * e = getenv("LLAMA_MOE_PROMPT_INPLACE_SEED"); return e == nullptr || atoi(e) != 0; }();
+    pimpl->prompt_ubatch_ok   = ok && (!seed_prev || seed_on);
+    pimpl->prompt_seed_counts = ok && seed_prev && seed_on;
+}
+
+bool llama_moe_cache::prompt_ubatch_on() const {
+    return pimpl->prompt_ubatch_ok;
+}
+
+bool llama_moe_cache::prompt_inplace_on() const {
+    return pimpl->prompt_inplace_env;
 }
 
 bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {

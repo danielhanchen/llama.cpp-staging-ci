@@ -96,6 +96,8 @@ public:
     // k13: CPU misses: small batches (up to 8 tokens) take the host path without trials or miss-rate windows, but still fetch their
     // share and admit (the cache follows the decode; not exact under drafts); true if pinned
     bool pin_small();
+    // k15-lfm2: lift (false) / restore (true) that pin between requests; returns the pinned state (see llama_moe_pin_small_set)
+    bool pin_small_set(bool on);
     // k15-lfm2: see llama_moe_cpu_miss_drop_slow
     bool cpu_miss_drop_slow();
     // k13: who computes the missing experts of small batches: 0 = never the host (every miss fetched), 1 = the hybrid path with a fixed
@@ -244,6 +246,17 @@ public:
 
     // ggml_backend_sched copy callback, returns false if src is not a slot map
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
+    // k15-lfm2: in-place prompts (LLAMA_MOE_PROMPT_INPLACE=1): the layer whose prompt map t is (-1 if none), its expert tensors, the copy of
+    // its prompt map (uploads the missing experts; counts: seed the layer after its product, nullptr: no seed), the pending seed, and a
+    // context that runs layer-major prompts turns it off
+    int32_t prompt_layer(const ggml_tensor * t) const;
+    std::vector<ggml_tensor *> prompt_experts(int32_t il) const;
+    bool prompt_copy(ggml_backend_t backend, int32_t il, ggml_tensor * dst, const std::vector<int32_t> * counts);
+    void prompt_flush();
+    void prompt_inplace_block(bool blocked);
+    void prompt_ubatch(bool ok, bool seed_prev = false); // this ubatch may read its experts in place (seed_prev: it seeds from the stored routing)
+    bool prompt_inplace_on() const; // LLAMA_MOE_PROMPT_INPLACE
+    bool prompt_ubatch_on() const;  // the value prompt_ubatch set (the seed-prev kill switch applied)
 
     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
     // returns the number of experts copied, 0 if expert e is not in the cache, -n if a run of n cached experts is too short to copy
