@@ -493,6 +493,30 @@ static void common_params_fit_impl(
             }
             const int64_t need = shortfall(dmds_test);
             if (need <= 0) {
+                // k15-fn: the first size that fits can leave memory above the targets (the cache does not take exactly the bytes the
+                // linear estimate gave it: G4 Qwen3.8-Flash-Next UD-IQ4_XS + MTP at 32 GB left 856 MiB above the 1024 MiB margin);
+                // grow it by the measured surplus while it still fits (LLAMA_MOE_FIT_FILL=0: keep the first size)
+                static const bool fill = getenv("LLAMA_MOE_FIT_FILL") == nullptr || atoi(getenv("LLAMA_MOE_FIT_FILL")) != 0;
+                for (int g = 0; fill && g < 3 && size < size_requested; g++) {
+                    const int64_t extra = std::min<int64_t>(surplus_of(dmds_test) - 16*MiB, size_requested - size);
+                    if (extra < 64*MiB || !devices_ok(dmds_test)) {
+                        break;
+                    }
+                    cparams->moe_cache_size = size + extra;
+                    dmds_t dmds_grow;
+                    try {
+                        dmds_grow = measure(cparams);
+                    } catch (const std::runtime_error &) {
+                        break;
+                    }
+                    if (shortfall(dmds_grow) > 0) {
+                        break;
+                    }
+                    LOG_TRC("%s: MoE cache grown by %" PRId64 " MiB into the measured surplus\n", __func__, extra/MiB);
+                    size      = size + extra;
+                    dmds_test = dmds_grow;
+                }
+                cparams->moe_cache_size = size;
                 LOG_TRC("%s: MoE cache reduced from %" PRId64 " to %" PRId64 " MiB to keep the layers in device memory\n",
                     __func__, size_requested/MiB, size/MiB);
                 if (margin_gain > 0) {
