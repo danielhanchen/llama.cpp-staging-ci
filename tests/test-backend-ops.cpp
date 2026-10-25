@@ -12797,6 +12797,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // k15-mm2: multi-matrix F32 / BF16 mat-vec (ggml_cuda_mul_mat_vec_f_multi): the same graphs with float weights, 1-4 columns
+    // (K 2048 / 2560: Qwen3.6 / Flash-Next alpha + beta, router + shared expert gate, indexer q + k)
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_BF16 }) {
+        for (int64_t m : { 1, 2, 3, 4 }) {
+            for (int64_t k : { 2048, 2560 }) {
+                for (int pattern : { 0, 3, 4 }) {
+                    test_cases.emplace_back(new test_mul_mat_vec_multi(type, m, k, pattern, m == 3));
+                }
+            }
+        }
+    }
+
     // k15-mm2: split-K F32 mat-vec (few rows, long K; mmvf.cu): Flash-Next hc inject 10240 -> 4, ssm alpha / beta 2560 -> 48, the
     // shared expert gate 2560 -> 1, a K that is not a multiple of the 1024 chunk, the largest row count it takes, 1-8 columns,
     // and a strided src1 (non contiguous columns)
