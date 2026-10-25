@@ -3177,6 +3177,8 @@ struct llama_moe_cache::impl {
     bool ua_verify  = false;
     uint64_t ua_verified = 0, ua_bad = 0;
     size_t   ua_up_last = 0;
+    bool ua_skip = false;        // no predictions in this ubatch (see prepare)
+    int64_t ua_prev_tokens = 0;
     bool ua_off = false; // an upload could not be issued: no more uploads ahead (the admitted ones are dropped by the drain)
     struct ua_stats_t {
         uint64_t layers = 0, admitted = 0, hit = 0, waste = 0, lost = 0, miss_rest = 0, bytes = 0, waste_bytes = 0, fallback = 0;
@@ -3604,7 +3606,7 @@ struct llama_moe_cache::impl {
             }
             ua_st_ub.miss_rest += miss;
             ua_miss_est = miss + (L.epoch == ua_epoch ? (int32_t) L.experts.size() : 0);
-            if (!ua_off) {
+            if (!ua_off && !ua_skip) {
                 ua_predict(backend, g, il, ids);
             }
         }
@@ -5651,6 +5653,10 @@ struct llama_moe_cache::impl {
 
     void prepare(int64_t n_tokens) {
         ua_drain();
+        // a medium ubatch right after a large one is the tail of the same prompt: the large ubatch just seeded the cache with the
+        // experts this text routes, and evicting them for guesses costs more than the overlap gains (G4 q4x 12 GB multi-turn tails +8%)
+        ua_skip = ua_prev_tokens > ua_max_tokens;
+        ua_prev_tokens = n_tokens;
         static const bool st_log = getenv("LLAMA_MOE_CACHE_STATE_LOG") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_STATE_LOG")) != 0;
         if (st_log) {
             if (n_tokens > n_small_max) {
