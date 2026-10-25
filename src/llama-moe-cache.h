@@ -44,6 +44,9 @@ public:
     // k15-pp3: host bytes of the experts a cache of the trunk layers could hold (0: every expert is on a device)
     static size_t host_bytes(const llama_model & model);
 
+    // the share of the host experts below which a mailbox cache skips its timing trials (LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE, 0.50)
+    static double trial_frac_single();
+
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     // size is already the share of the layer set (see budget)
     // ws: the weight store that reads the misses of host lookups from the model files (see set_weight_store), nullptr if none

@@ -3665,10 +3665,7 @@ struct llama_moe_cache::impl {
             const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC");
             return e != nullptr ? std::max(0.0, atof(e)) : -1.0;
         }();
-        static const double trial_frac_single = [] {
-            const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE");
-            return e != nullptr ? std::max(0.0, atof(e)) : 0.50;
-        }();
+        const double trial_frac_single = llama_moe_cache::trial_frac_single();
         if (late && (cm_trials_late_done || !cm || !cm_cal || trial_frac_env >= 0.0 || cmt_n > 0 || cm_trials_skipped)) {
             return false;
         }
@@ -4602,15 +4599,14 @@ struct llama_moe_cache::impl {
                 const double f    = cm_share[n];
                 const double m    = cm_rate*D;
                 const double gain = m*(cm_tup - std::max(f*cm_tup, (1.0 - f)*tc));
-                // k15-np: the mailbox's cheaper split (single_split_frac) only where a batch misses at least LLAMA_MOE_SINGLE_MIN_MISSES (1.5)
-                // distinct experts per layer at the measured miss rate: below, a host batch's fixed cost (mailbox publish, host threads
-                // woken, the merge) is more than the uploads it saves, and the rule weighs the full split as without a mailbox. G4, the
-                // per-launch modes of plans/k15_rebench.md section 5 (MTP verify batches of 3 tokens, 23 distinct experts of 256):
-                // q4x 16 GB at 4-5% misses (1.1 per layer) and q3m 12 GB at 5% (1.2) lost 4-6% chat decode with the host path on, q4x
-                // 12 GB at 15% (3.4) and q3m 8 GB at 30% (7) gained 14-19%. LLAMA_MOE_SINGLE_MIN_MISSES=0: the cheaper split always
+                // k15-np (LLAMA_MOE_SINGLE_MIN_MISSES, default 0 = off): the mailbox's cheaper split (single_split_frac) only where a
+                // batch misses at least this many distinct experts per layer at the measured miss rate. Off by default: G4 k15g4n at 1.5
+                // still turned the host path on at q3m 12 GB and q4x 16 GB + MTP, whose first windows miss 7-12% (m(3) 1.8-2.8) before
+                // settling at 4-6%, against 13.5%+ (3.4) where the host path wins; the cache-share gate on the early note (llama-graph.cpp,
+                // LLAMA_MOE_SINGLE_NOTE_PLAIN_MAX_FRAC) separates those cells instead. Kept as an override
                 static const double mb_min_misses = [] {
                     const char * e = getenv("LLAMA_MOE_SINGLE_MIN_MISSES");
-                    return e != nullptr ? std::max(0.0, atof(e)) : 1.5;
+                    return e != nullptr ? std::max(0.0, atof(e)) : 0.0;
                 }();
                 const bool mb_cheap = n <= max_batch && single_weigh() && single_usable(n) && m >= mb_min_misses;
                 const double need = (n <= max_batch ? cm_margin*cm_split_scale*cm_split*(mb_cheap ? single_split_frac : 1.0) :
@@ -6661,6 +6657,14 @@ size_t llama_moe_cache::budget(const llama_model & model, size_t size, layer_set
         mtp = std::min(size, (size_t) std::max(0, atoi(env))*1024*1024);
     }
     return set == layer_set::nextn ? mtp : size - mtp;
+}
+
+double llama_moe_cache::trial_frac_single() {
+    static const double v = [] {
+        const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE");
+        return e != nullptr ? std::max(0.0, atof(e)) : 0.50;
+    }();
+    return v;
 }
 
 size_t llama_moe_cache::host_bytes(const llama_model & model) {
