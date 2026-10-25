@@ -3167,6 +3167,8 @@ struct llama_moe_cache::impl {
     std::vector<std::pair<float, int32_t>> ua_rank;
     std::vector<ggml_backend_copy_region> ua_regions;
     std::vector<int32_t> ua_want;
+    std::vector<uint8_t> ua_prot;
+    int ua_protect = 4;
     std::vector<uint8_t> ua_busy;
     std::vector<std::pair<int64_t, int32_t>> ua_cand;
     int  ua_victims = 2;
@@ -3195,6 +3197,8 @@ struct llama_moe_cache::impl {
         ua_log = env_l != nullptr ? atoi(env_l) : 0;
         const char * env_v = getenv("LLAMA_MOE_UPLOAD_AHEAD_VICTIMS");
         ua_victims = env_v != nullptr ? atoi(env_v) : 2;
+        const char * env_p = getenv("LLAMA_MOE_UPLOAD_AHEAD_PROTECT");
+        ua_protect = env_p != nullptr ? std::max(0, atoi(env_p)) : 4;
         ua_verify  = getenv("LLAMA_MOE_UPLOAD_AHEAD_VERIFY") != nullptr && atoi(getenv("LLAMA_MOE_UPLOAD_AHEAD_VERIFY")) != 0;
         ua_gating = (int) model.hparams.expert_gating_func;
         ua_router.assign(layers.size(), nullptr);
@@ -3725,6 +3729,7 @@ struct llama_moe_cache::impl {
         const int64_t nt = ua_pred_nt;
         const int64_t k  = std::min<int64_t>(ua_topk, n_expert);
         ua_cnt.assign(n_expert, 0);
+        ua_prot.assign(n_expert, 0);
         ua_w.assign(n_expert, 0.0f);
         ua_sc.resize(n_expert);
         ua_rank.resize(n_expert);
@@ -3754,11 +3759,18 @@ struct llama_moe_cache::impl {
             for (int32_t e = 0; e < n_expert; ++e) {
                 ua_rank[e] = { -(ua_sc[e] + (pbj.empty() ? 0.0f : pbj[e])), e };
             }
-            std::nth_element(ua_rank.begin(), ua_rank.begin() + (k - 1), ua_rank.end());
-            for (int64_t i = 0; i < k; ++i) {
+            const int64_t kp = std::min<int64_t>(k + ua_protect, n_expert);
+            std::nth_element(ua_rank.begin(), ua_rank.begin() + (kp - 1), ua_rank.end());
+            if (kp > k) {
+                std::nth_element(ua_rank.begin(), ua_rank.begin() + (k - 1), ua_rank.begin() + kp);
+            }
+            for (int64_t i = 0; i < kp; ++i) {
                 const int32_t e = ua_rank[i].second;
-                ua_cnt[e]++;
-                ua_w[e] += ua_sc[e];
+                if (i < k) {
+                    ua_cnt[e]++;
+                    ua_w[e] += ua_sc[e];
+                }
+                ua_prot[e] = 1;
             }
         }
         // the predicted experts the cache lacks, most tokens first
@@ -3790,8 +3802,9 @@ struct llama_moe_cache::impl {
                 busy[old[e]] = 1;
             }
         }
-        // classes: 0 free, 1 layer j (not predicted), 2 the other layers but il..j+1 (LLAMA_MOE_UPLOAD_AHEAD_VICTIMS=2, default), by the
-        // policy's order (lowest counter, then least recent)
+        // classes: 0 free, 1 layer j (not predicted within the top k + LLAMA_MOE_UPLOAD_AHEAD_PROTECT of any token), 2 the layers this
+        // ubatch computed already, 3 the layers after j+1 (LLAMA_MOE_UPLOAD_AHEAD_VICTIMS=2, default; 1 = classes 0 and 1 only); in each
+        // class by the policy's order (lowest counter, then least recent)
         auto & cand = ua_cand;
         cand.clear();
         int64_t pos = 0;
@@ -3805,12 +3818,14 @@ struct llama_moe_cache::impl {
             if (key < 0) {
                 cls = 0;
             } else if (key / n_expert == j) {
-                if (ua_cnt[key % n_expert] > 0) {
+                if (ua_prot[key % n_expert]) {
                     continue;
                 }
                 cls = 1;
-            } else if (ua_victims >= 2 && (key / n_expert < il || key / n_expert > j + 1)) {
+            } else if (ua_victims >= 2 && key / n_expert < il) {
                 cls = 2;
+            } else if (ua_victims >= 2 && key / n_expert > j + 1) {
+                cls = 3;
             } else {
                 continue;
             }
