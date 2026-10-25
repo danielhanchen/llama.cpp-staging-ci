@@ -2438,16 +2438,20 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         };
         common_params_fit_status fit_status = run_fit(cparams.n_state_capture);
         {
-            static const bool shrink = getenv("LLAMA_FIT_CAPTURE_SHRINK") == nullptr || atoi(getenv("LLAMA_FIT_CAPTURE_SHRINK")) != 0;
+            // LLAMA_FIT_CAPTURE_SHRINK: 1 (default) one snapshot, else none; 2 none at once; 0 keeps the count
+            static const int shrink = getenv("LLAMA_FIT_CAPTURE_SHRINK") == nullptr ? 1 : atoi(getenv("LLAMA_FIT_CAPTURE_SHRINK"));
             std::vector<uint8_t> exps;
             const int64_t n_layer = common_model_n_layer(params.model.path, exps);
             const auto layers = [&]() { return mparams.n_gpu_layers < 0 ? n_layer + 1 : (int64_t) mparams.n_gpu_layers; };
-            if (shrink && cparams_in.n_state_capture < 0 && cparams_in.spec_draft && !draft_off && n_layer > 0 &&
+            if (shrink > 0 && cparams_in.n_state_capture < 0 && cparams_in.spec_draft && !draft_off && n_layer > 0 &&
                     getenv("LLAMA_STATE_CAPTURE_MAX") == nullptr && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && layers() < n_layer + 1) {
                 const int64_t l_full = layers();
                 int64_t best_l = l_full;
                 int32_t best_n = -1;
                 for (const int32_t n : { 1, 0 }) {
+                    if (n == 1 && shrink == 2) {
+                        continue;
+                    }
                     const auto st = run_fit(n);
                     if (st == COMMON_PARAMS_FIT_STATUS_SUCCESS && layers() > best_l) {
                         best_l = layers();
