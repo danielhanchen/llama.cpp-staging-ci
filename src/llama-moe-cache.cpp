@@ -3168,6 +3168,8 @@ struct llama_moe_cache::impl {
     std::vector<uint8_t> ua_busy;
     std::vector<std::pair<int64_t, int32_t>> ua_cand;
     int  ua_victims = 2;
+    bool ua_verify  = false;
+    uint64_t ua_verified = 0, ua_bad = 0;
     bool ua_off = false; // an upload could not be issued: no more uploads ahead (the admitted ones are dropped by the drain)
     struct ua_stats_t {
         uint64_t layers = 0, admitted = 0, hit = 0, waste = 0, lost = 0, miss_rest = 0, bytes = 0, waste_bytes = 0, fallback = 0;
@@ -3188,6 +3190,7 @@ struct llama_moe_cache::impl {
         ua_log = env_l != nullptr ? atoi(env_l) : 0;
         const char * env_v = getenv("LLAMA_MOE_UPLOAD_AHEAD_VICTIMS");
         ua_victims = env_v != nullptr ? atoi(env_v) : 2;
+        ua_verify  = getenv("LLAMA_MOE_UPLOAD_AHEAD_VERIFY") != nullptr && atoi(getenv("LLAMA_MOE_UPLOAD_AHEAD_VERIFY")) != 0;
         ua_gating = (int) model.hparams.expert_gating_func;
         ua_router.assign(layers.size(), nullptr);
         ua_b.assign(layers.size(), {});
@@ -3447,12 +3450,32 @@ struct llama_moe_cache::impl {
             if (!complete) {
                 ua_st_ub.waste += L.experts.size();
                 ua_drop(g, (int32_t) j);
+            } else if (ua_verify) {
+                // LLAMA_MOE_UPLOAD_AHEAD_VERIFY=1: every bank of the kept admissions holds the host bytes of its expert
+                ggml_backend_synchronize(devices[g.id].backend);
+                std::vector<uint8_t> buf;
+                for (size_t i = 0; i < L.experts.size(); ++i) {
+                    if (g.lru.key_of[L.slots[i]] != (int32_t) j*g.lru.n_expert + L.experts[i]) {
+                        continue;
+                    }
+                    for (size_t ip = 0; ip < layers[j].experts.size(); ++ip) {
+                        const ggml_tensor * w = layers[j].experts[ip];
+                        const size_t nb = w->nb[2];
+                        buf.resize(nb);
+                        ggml_backend_tensor_get(g.banks[ip], buf.data(), (size_t) L.slots[i]*nb, nb);
+                        ua_verified++;
+                        ua_bad += memcmp(buf.data(), (const uint8_t *) w->data + (size_t) L.experts[i]*nb, nb) != 0;
+                    }
+                }
             }
             L.epoch = 0;
             L.resolved = false;
             L.experts.clear();
             L.slots.clear();
             L.victims.clear();
+        }
+        if (ua_verify && ua_verified > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead verified: %" PRIu64 " expert tensors, %" PRIu64 " mismatches\n", tag, ua_verified, ua_bad);
         }
         if (ua_log > 0 && ua_st_ub.layers > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead: %" PRIu64 " layers, %" PRIu64 " admitted, %" PRIu64 " right, %" PRIu64 " wrong, %" PRIu64
@@ -3488,14 +3511,9 @@ struct llama_moe_cache::impl {
             ua_ncall = 0;
             ua_pred_j = -1;
             const int32_t n_expert = g.lru.n_expert;
-            // the routing of il resolves its admissions: the wrong ones are dropped (after their first upload is waited for)
+            // the routing of il resolves its admissions: the wrong ones are dropped (the compute stream waits for their first upload
+            // before it writes or reads any slot, see ua_wait: the copies of this tensor upload their misses first)
             if (L.epoch == ua_epoch && !L.resolved) {
-                for (size_t ip = 0; ip < L.bank_ev.size(); ++ip) {
-                    if (L.bank_ev[ip] >= 0) {
-                        ggml_backend_event_wait(backend, ua_devs[g.id].ev[L.bank_ev[ip]]);
-                        L.bank_ev[ip] = -1;
-                    }
-                }
                 size_t o = 0;
                 size_t n_wrong = 0;
                 for (size_t i = 0; i < L.experts.size(); ++i) {
@@ -3544,18 +3562,52 @@ struct llama_moe_cache::impl {
                 ua_predict(backend, g, il, ids);
             }
         }
-        // the bank of this copy must hold the admitted experts: uploaded ahead (wait for it) or, if not yet, on the compute stream now
-        if (L.epoch == ua_epoch && b.ip < (int) L.bank_ev.size()) {
-            if (L.bank_ev[b.ip] >= 0) {
-                ggml_backend_event_wait(backend, ua_devs[g.id].ev[L.bank_ev[b.ip]]);
-                L.bank_ev[b.ip] = -1;
-            } else if (!L.bank_sent[b.ip]) {
-                ua_st_ub.fallback++;
-                if (!ua_send_bank(g, il, b.ip, backend)) {
-                    ua_drop(g, il); // the copies upload them instead
-                }
+        // the bank of this copy must hold the admitted experts: uploaded ahead (ua_wait) or, if not yet, on the compute stream now
+        if (L.epoch == ua_epoch && L.resolved && b.ip < (int) L.bank_ev.size() && !L.bank_sent[b.ip]) {
+            ua_st_ub.fallback++;
+            if (!ua_send_bank(g, il, b.ip, backend)) {
+                ua_drop(g, il); // the copies upload them instead
             }
         }
+    }
+
+    // the uploads ahead of the layer of w that the compute stream has not waited for
+    bool ua_pending(const ggml_tensor * w) const {
+        const auto it = bindings.find(w);
+        if (ua_mode <= 0 || it == bindings.end()) {
+            return false;
+        }
+        const ua_layer_t & L = ua_l[it->second.il];
+        return L.epoch == ua_epoch && std::any_of(L.bank_ev.begin(), L.bank_ev.end(), [](int e) { return e >= 0; });
+    }
+
+    // the compute stream waits for them: before the copies of w read the cache and before its seed writes slots
+    void ua_wait(ggml_backend_t backend, const ggml_tensor * w) {
+        const auto it = bindings.find(w);
+        if (ua_mode <= 0 || it == bindings.end()) {
+            return;
+        }
+        const int32_t il = it->second.il;
+        ua_layer_t & L = ua_l[il];
+        if (L.epoch != ua_epoch) {
+            return;
+        }
+        const group & g = groups[layers[il].ig];
+        for (size_t ip = 0; ip < L.bank_ev.size(); ++ip) {
+            if (L.bank_ev[ip] >= 0) {
+                ggml_backend_event_wait(backend, ua_devs[g.id].ev[L.bank_ev[ip]]);
+                L.bank_ev[ip] = -1;
+            }
+        }
+    }
+
+    // the slots of layer il, bank ip may be read: no admission ahead of the routing whose bank is not uploaded
+    bool ua_readable(int32_t il, int32_t ip) const {
+        if (ua_mode <= 0 || ua_l.empty()) {
+            return true;
+        }
+        const ua_layer_t & L = ua_l[il];
+        return L.epoch != ua_epoch || L.experts.empty() || (L.resolved && L.bank_sent[ip]);
     }
 
     // the router of layer il+1 on the router input of layer il, on the device; read after the copies of il are issued
@@ -6281,6 +6333,11 @@ struct llama_moe_cache::impl {
             return 0;
         }
 
+        // k15-pred: a layer with experts admitted ahead of its routing whose bank is not uploaded is read from the host
+        if (!ua_readable(b.il, b.ip)) {
+            return 0;
+        }
+
         // large batches only read the cache, so the experts used in generation stay in it
         // while a layer is seeded, its slots are filled after its copies, so the copies read the slots it had before
         const int32_t * slots = b.il == g.sd.il ? g.sd.old_slots.data() : g.lru.slot_map[b.il];
@@ -7465,6 +7522,14 @@ ggml_tensor * llama_moe_cache::lookup(ggml_context * ctx, int32_t il, ggml_tenso
 
 void llama_moe_cache::upload_ahead_begin(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * ids, const std::vector<int32_t> & counts) {
     pimpl->ua_begin(backend, w, ids, counts);
+}
+
+bool llama_moe_cache::upload_ahead_pending(const ggml_tensor * w) const {
+    return pimpl->ua_pending(w);
+}
+
+void llama_moe_cache::upload_ahead_wait(ggml_backend_t backend, const ggml_tensor * w) {
+    pimpl->ua_wait(backend, w);
 }
 
 void llama_moe_cache::upload_ahead_end(ggml_backend_t backend, const ggml_tensor * w) {

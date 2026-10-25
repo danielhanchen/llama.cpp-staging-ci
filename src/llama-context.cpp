@@ -5909,14 +5909,27 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
     bool done = false;
     if (batch) {
         plan(true);
+        const size_t n_cached = st.regions.size();
         for (const auto & [offset, size] : st.uploads) {
             st.regions.push_back({ src, offset, dst, offset, size });
         }
         // fails (nothing copied) e.g. when the host weights are not pinned
-        if (ggml_backend_tensor_copy_regions_async(backend, st.regions.data(), st.regions.size())) {
+        if (ua && lctx->moe_cache->upload_ahead_pending(src)) {
+            // k15-pred: the uploads of the misses first, they do not read the slots uploaded ahead; then the cached runs after the wait
+            if (n_cached == st.regions.size() || ggml_backend_tensor_copy_regions_async(backend, st.regions.data() + n_cached, st.regions.size() - n_cached)) {
+                lctx->moe_cache->upload_ahead_wait(backend, src);
+                if (n_cached == 0 || ggml_backend_tensor_copy_regions_async(backend, st.regions.data(), n_cached)) {
+                    lctx->moe_cache->count_batch(src, st.regions);
+                    done = true;
+                }
+            }
+        } else if (ggml_backend_tensor_copy_regions_async(backend, st.regions.data(), st.regions.size())) {
             lctx->moe_cache->count_batch(src, st.regions);
             done = true;
         }
+    }
+    if (ua) {
+        lctx->moe_cache->upload_ahead_wait(backend, src);
     }
     if (!done) {
         plan(false);
