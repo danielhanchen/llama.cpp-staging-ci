@@ -4835,6 +4835,132 @@ static int ggml_cuda_try_fuse_mmvq_multi(ggml_backend_cuda_context * cuda_ctx, g
     return run;
 }
 
+static bool ggml_cuda_side_mv_run(const ggml_tensor * node);
+
+// k15-mm2: the same for the F32 / BF16 vector kernel (ggml_cuda_mul_mat_vec_f_multi): products of one weight type and K over one
+// activation, e.g. a gated delta net layer's alpha + beta, the router + the shared expert gate, the indexer q + k. Each output gets
+// the bytes of its own launch; the lookahead and the overlap rules are those of ggml_cuda_try_fuse_mmvq_multi. Products the side
+// stream runs (single column, ggml_cuda_side_mv_run) and K >= 4096 (the split-K launch) are left alone.
+// GGML_CUDA_DISABLE_MMVF_MULTI=1 turns it off.
+static bool ggml_cuda_mmvf_multi_disabled() {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_MMVF_MULTI");
+    return disabled;
+}
+
+static bool ggml_cuda_mmvf_multi_candidate(const ggml_tensor * node) {
+    if (node->op != GGML_OP_MUL_MAT || !(node->flags & GGML_TENSOR_FLAG_COMPUTE) || node->view_src != nullptr || node->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+    return (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16) && src0->op == GGML_OP_NONE && src0->view_src == nullptr &&
+        ggml_is_contiguous(src0) && ggml_is_matrix(src0) && src0->ne[0] < 4096 && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) &&
+        src1->ne[2] == 1 && src1->ne[3] == 1 && src1->ne[1] <= 4 && ggml_is_contiguous(node) && !ggml_cuda_side_mv_run(node);
+}
+
+// node goes to ggml_cuda_mul_mat_vec_f in ggml_cuda_mul_mat (same dispatch, see there)
+static bool ggml_cuda_mmvf_multi_runtime_ok(const ggml_backend_cuda_context * ctx, const ggml_tensor * node) {
+    if (!ggml_cuda_mmvf_multi_candidate(node) || ggml_cuda_op_mul_mat_use_fwht(node)) {
+        return false;
+    }
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+    if (src0->buffer == nullptr || !ggml_backend_buft_is_cuda(src0->buffer->buft) ||
+            ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE || src1->data == nullptr || node->data == nullptr) {
+        return false;
+    }
+    const int     cc        = ggml_cuda_info().devices[ctx->device].cc;
+    const int     warp_size = ggml_cuda_info().devices[ctx->device].warp_size;
+    const int64_t ne11      = src1->ne[1];
+    bool ok;
+    if (src0->type == GGML_TYPE_F32 && ggml_get_op_params_i32(node, 3) == GGML_PREC_F32) {
+        ok = ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, 1);
+    } else if ((node->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) && ne11 > 1) {
+        ok = ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, 1);
+    } else {
+        ok = ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11);
+    }
+    return ok && ggml_cuda_mul_mat_vec_f_multi_ok(src0->type, src0->ne[0], ne11, ctx->device);
+}
+
+static int ggml_cuda_try_fuse_mmvf_multi(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    if (ggml_cuda_mmvf_multi_disabled() || ggml_cuda_fusion_disabled() || !cuda_ctx->stream_context().concurrent_events.empty() ||
+            cuda_ctx->curr_stream_no != 0) {
+        return -1;
+    }
+    ggml_tensor * node = cgraph->nodes[i];
+    if (!ggml_cuda_mmvf_multi_candidate(node)) {
+        return -1;
+    }
+    {
+        bool any = false;
+        for (int j = i + 1; j < cgraph->n_nodes && j <= i + GGML_CUDA_MMVQ_MULTI_LOOKAHEAD && !any; ++j) {
+            const ggml_tensor * t = cgraph->nodes[j];
+            any = t->op == GGML_OP_MUL_MAT && t->src[1] == node->src[1];
+        }
+        if (!any) {
+            return -1;
+        }
+    }
+    if (!ggml_cuda_mmvf_multi_runtime_ok(cuda_ctx, node) || ggml_cuda_mmvq_multi_has_partner(cgraph, i)) {
+        return -1;
+    }
+    const ggml_tensor * act = node->src[1];
+    ggml_tensor * dst[GGML_CUDA_MMVQ_MULTI_MAX] = { node };
+    const ggml_tensor * src0[GGML_CUDA_MMVQ_MULTI_MAX] = { node->src[0] };
+    int idx[GGML_CUDA_MMVQ_MULTI_MAX] = { i };
+    int n = 1;
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + GGML_CUDA_MMVQ_MULTI_LOOKAHEAD && n < GGML_CUDA_MMVQ_MULTI_MAX; ++j) {
+        ggml_tensor * t = cgraph->nodes[j];
+        if (cuda_ctx->mmvq_done_early.count(t)) {
+            continue;
+        }
+        const bool member = ggml_cuda_mmvq_multi_pair(node, t) && ggml_get_op_params_i32(node, 3) == ggml_get_op_params_i32(t, 3) &&
+            ggml_cuda_mmvf_multi_runtime_ok(cuda_ctx, t) && !ggml_cuda_mmvq_multi_has_partner(cgraph, j);
+        if (member) {
+            bool ok = true;
+            for (int k = i + 1; k < j && ok; ++k) {
+                const ggml_tensor * u = cgraph->nodes[k];
+                if (ggml_cuda_mmvq_multi_overlap(u, t)) {
+                    ok = false;
+                }
+                for (int s = 0; s < GGML_MAX_SRC && ok; ++s) {
+                    if (u->src[s] != nullptr && ggml_cuda_mmvq_multi_overlap(u->src[s], t)) {
+                        ok = false;
+                    }
+                }
+            }
+            for (int m = 0; m < n && ok; ++m) {
+                ok = !ggml_cuda_mmvq_multi_overlap(dst[m], t);
+            }
+            if (ok) {
+                dst[n] = t;
+                src0[n] = t->src[0];
+                idx[n] = j;
+                n++;
+                continue;
+            }
+        }
+        if (!ggml_cuda_is_view_or_noop(t) && ggml_cuda_mmvq_multi_overlap(t, act)) {
+            break;
+        }
+    }
+    if (n < 2) {
+        return -1;
+    }
+    ggml_cuda_mul_mat_vec_f_multi(*cuda_ctx, n, src0, act, dst);
+    int run = 0;
+    for (int m = 1; m < n; ++m) {
+        if (idx[m] == i + run + 1) {
+            run++;
+        } else {
+            cuda_ctx->mmvq_done_early.insert(dst[m]);
+            cuda_ctx->q8_1_cache.invalidate(dst[m]->data, ggml_nbytes(dst[m]));
+        }
+    }
+    return run;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -6083,7 +6209,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
                 bool fused_multi = false; // k15-mm: a multi-matrix mul_mat_vec_q launch took node i (and maybe nodes after it)
                 if (nodes_to_skip == 0 && node->op == GGML_OP_MUL_MAT && !is_concurrent_event_active) {
-                    const int run = ggml_cuda_try_fuse_mmvq_multi(cuda_ctx, cgraph, i);
+                    int run = ggml_cuda_try_fuse_mmvq_multi(cuda_ctx, cgraph, i);
+                    if (run < 0) {
+                        run = ggml_cuda_try_fuse_mmvf_multi(cuda_ctx, cgraph, i);
+                    }
                     if (run >= 0) {
                         fused_multi   = true;
                         nodes_to_skip = run;
