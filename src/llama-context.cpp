@@ -5971,6 +5971,21 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
     if (ua) {
         lctx->moe_cache->upload_ahead_end(backend, src);
     }
+    // LLAMA_MOE_COPY_CHECK=1 (debug): every routed expert staged in dst holds the host bytes of its expert
+    static const bool copy_check = getenv("LLAMA_MOE_COPY_CHECK") != nullptr && atoi(getenv("LLAMA_MOE_COPY_CHECK")) != 0;
+    if (copy_check && !st.all && src->data != nullptr && ggml_backend_buffer_is_host(src->buffer)) {
+        ggml_backend_synchronize(backend);
+        std::vector<uint8_t> buf(expert_size);
+        for (int64_t e = 0; e < n_expert; ++e) {
+            if (!st.used[e]) {
+                continue;
+            }
+            ggml_backend_tensor_get(dst, buf.data(), e*expert_size, expert_size);
+            if (memcmp(buf.data(), (const uint8_t *) src->data + e*expert_size, expert_size) != 0) {
+                LLAMA_LOG_WARN("%s: copy check: %s expert %lld differs in the staged copy\n", __func__, src->name, (long long) e);
+            }
+        }
+    }
 
     return true;
 }
