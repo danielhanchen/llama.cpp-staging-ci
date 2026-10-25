@@ -3831,9 +3831,9 @@ struct llama_moe_cache::impl {
                     continue;
                 }
                 cls = 1;
-            } else if (ua_victims >= 2 && key / n_expert < il) {
+            } else if (ua_victims >= 2 && ua_victims != 6 && key / n_expert < il) {
                 cls = 1;
-            } else if (ua_victims >= 2 && key / n_expert > j + 1) {
+            } else if (ua_victims >= 2 && ua_victims != 5 && key / n_expert > j + 1) {
                 cls = 2;
             } else {
                 continue;
