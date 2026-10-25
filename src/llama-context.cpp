@@ -390,6 +390,7 @@ llama_context::llama_context(
 
     cparams.weight_stream         = params.weight_stream;
     cparams.spec_draft            = params.spec_draft;
+    cparams.n_state_capture       = params.n_state_capture;
     cparams.weight_stream_io      = params.weight_stream_io;
     cparams.weight_stream_threads = params.weight_stream_threads;
     cparams.weight_stream_ram_mib = params.weight_stream_ram_mib;
@@ -770,7 +771,7 @@ llama_context::llama_context(
         // cache and the first prompt kept its graph allocation out of the lent memory (G4 q4x 12 GB + MTP: lending off, then the graph
         // in its own compute buffer, 188 / 248 MiB free at exit instead of 408 with LLAMA_FIT_CAPTURE=0). cap_prepare takes these buffers
         if (moe_cache && !model.hparams.no_alloc) {
-            static const int n_cap = getenv("LLAMA_STATE_CAPTURE_MAX") ? std::max(1, std::min(cap_max, atoi(getenv("LLAMA_STATE_CAPTURE_MAX")))) : cap_max;
+            const int n_cap = cap_count();
             ggml_backend_buffer_type_t cb = nullptr;
             const size_t cbytes = cap_planned_bytes(&cb);
             if (cbytes > 0 && cb != nullptr) {
@@ -8121,6 +8122,7 @@ llama_context_params llama_context_default_params() {
         /*.mem_reserve                 =*/ nullptr,
         /*.n_mem_reserve               =*/ 0,
         /*.spec_draft                  =*/ false,
+        /*.n_state_capture             =*/ -1,
     };
 
     return result;
@@ -8383,7 +8385,7 @@ void llama_context::set_ubatch_breaks(const int32_t * breaks, int32_t n) {
 // k15-pp: llama_set_state_capture
 bool llama_context::state_capture_supported() const {
     static const bool env = getenv("LLAMA_STATE_CAPTURE") == nullptr || atoi(getenv("LLAMA_STATE_CAPTURE")) != 0;
-    if (!env || memory == nullptr) {
+    if (!env || memory == nullptr || cap_count() == 0) {   // no snapshots (--fit, n_state_capture = 0): the server checkpoints as without capture
         return false;
     }
     auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get());
@@ -8403,7 +8405,7 @@ bool llama_context::set_state_capture(llama_seq_id seq_id, int32_t i_batch) {
         return false;
     }
     // k15-pp2: one slot per (sequence, index) for the next decode, up to cap_max (LLAMA_STATE_CAPTURE_MAX=1: one, as k15-pp)
-    static const int n_max = getenv("LLAMA_STATE_CAPTURE_MAX") ? std::max(1, std::min(cap_max, atoi(getenv("LLAMA_STATE_CAPTURE_MAX")))) : cap_max;
+    const int n_max = cap_count();
     int s = -1;
     for (int c = 0; c < n_max && s < 0; ++c) {
         if (cap[c].pending && cap[c].seq == seq_id && cap[c].idx == i_batch) {
@@ -8500,6 +8502,16 @@ size_t llama_context::cap_reserve_bytes(ggml_backend_buffer_type_t * buft_out) c
     return cap_planned_bytes(buft_out);
 }
 
+// the number of state capture snapshots: LLAMA_STATE_CAPTURE_MAX (1..cap_max) when set, else llama_context_params::n_state_capture
+// when >= 0 (--fit lowers it where the snapshots would cost device layers; 0 = no capture), else cap_max
+int llama_context::cap_count() const {
+    static const int env_n = getenv("LLAMA_STATE_CAPTURE_MAX") ? std::max(1, std::min(cap_max, atoi(getenv("LLAMA_STATE_CAPTURE_MAX")))) : -1;
+    if (env_n > 0) {
+        return env_n;
+    }
+    return cparams.n_state_capture >= 0 ? std::min<int>(cap_max, cparams.n_state_capture) : cap_max;
+}
+
 size_t llama_context::cap_planned_bytes(ggml_backend_buffer_type_t * buft_out) const {
     *buft_out = nullptr;
     // planned: captures happen where prompts run layer-major (a target with a draft whose experts spill to the host, see lm_enabled) on
@@ -8510,7 +8522,7 @@ size_t llama_context::cap_planned_bytes(ggml_backend_buffer_type_t * buft_out) c
     static const bool srv_env = getenv("LLAMA_LM_CKPT_CAPTURE") == nullptr || atoi(getenv("LLAMA_LM_CKPT_CAPTURE")) != 0;
     static const bool lm_env  = getenv("LLAMA_MOE_LAYER_MAJOR") == nullptr || strcmp(getenv("LLAMA_MOE_LAYER_MAJOR"), "auto") == 0 ||
         atoi(getenv("LLAMA_MOE_LAYER_MAJOR")) != 0;
-    static const int  n_cap   = getenv("LLAMA_STATE_CAPTURE_MAX") ? std::max(1, std::min(cap_max, atoi(getenv("LLAMA_STATE_CAPTURE_MAX")))) : cap_max;
+    const int  n_cap   = cap_count();
     if (!fit_env || !srv_env || !lm_env || !cparams.spec_draft || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
             llama_moe_cache::host_bytes(model) == 0 || !state_capture_supported()) {
         return 0;

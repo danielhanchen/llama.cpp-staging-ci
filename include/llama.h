@@ -460,6 +460,10 @@ extern "C" {
         // a draft model or a built-in MTP head runs speculative decoding beside this context: spilled MoE experts then keep the
         // default host weight prefetch depth instead of the deeper start (llama_context::sched_new) [EXPERIMENTAL]
         bool spec_draft;
+
+        // state capture snapshots for layer-major prompts (-1: the default, LLAMA_STATE_CAPTURE_MAX or 2; 0: none, as
+        // LLAMA_LM_CKPT_CAPTURE=0); --fit lowers it where the snapshots would cost device layers [EXPERIMENTAL]
+        int32_t n_state_capture;
     };
 
     struct llama_model_tensor_override {

@@ -684,6 +684,7 @@ private:
         bool                    ev_set = false;
     };
     static constexpr int cap_max = 2;
+    int cap_count() const;
     cap_slot cap[cap_max];
     int      cap_sel = -1;                     // the capture a LLAMA_STATE_SEQ_FLAGS_CAPTURED read takes (llama_state_seq_captured_at)
     bool cap_prepare(int s);                   // the regions of the sequence's cell and their snapshot tensors; false: unsupported

@@ -1251,6 +1251,7 @@ static bool common_experts_on_offloaded_host(const common_params & params, const
 static bool common_moe_hybrid_gate_on(const common_params & params, const llama_model_tensor_buft_override * overrides, int32_t n_gpu_layers);
 static double common_moe_host_expert_bytes(const std::string & path, const llama_model_tensor_buft_override * overrides, int32_t n_gpu_layers);
 static double common_moe_hybrid_max_frac();
+static int64_t common_model_n_layer(const std::string & path, std::vector<uint8_t> & experts);
 
 // bytes of one expert in the MoE cache: the sum over the expert tensors of the layer (the size of a slot) and the largest single tensor (the
 // size of a slot in its bank), with the number of experts, for the layer with the largest experts; false if the GGUF cannot be read
@@ -2406,15 +2407,65 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             }
         }
 
-        common_fit_set_moe_margin_auto(!params.fit_params_target_set);
-        const common_params_fit_status fit_status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
-            params.tensor_split,
-            params.tensor_buft_overrides.data(),
-            params.fit_params_target.data(),
-            params.fit_params_min_ctx,
-            (has_draft || spec_mtp) && !draft_off ? &extra : nullptr,
-            fit_log_level,
-            params.fit_kv_resident);
+        // k15-pp4: the state capture snapshots (layer-major prompts beside a draft, llama_context::cap_planned_bytes) are counted by the
+        // fit; where counting them costs device layers, fewer are taken (2 -> 1 -> 0, llama_context_params::n_state_capture) before any
+        // layer: G4 q3m 4 GB + MTP, ctx 16384: two snapshots (126 MiB) took the small-device placement's whole 114 MiB cache, and 14 of
+        // 42 layers went to the CPU. LLAMA_FIT_CAPTURE_SHRINK=0 keeps the count. Placement only: capture or not, the output is the same
+        const llama_model_params   mparams_in  = mparams;
+        const llama_context_params cparams_in  = cparams;
+        const std::vector<float>   ts_in(params.tensor_split, params.tensor_split + 128);
+        const std::vector<llama_model_tensor_buft_override> tbo_in = params.tensor_buft_overrides;
+        const std::vector<size_t>  margins_in  = params.fit_params_target;
+        auto run_fit = [&](int32_t n_cap) {
+            mparams = mparams_in;
+            cparams = cparams_in;
+            cparams.n_state_capture = n_cap;
+            std::copy(ts_in.begin(), ts_in.end(), params.tensor_split);
+            params.tensor_buft_overrides = tbo_in;
+            params.fit_params_target     = margins_in;
+            if (mparams_in.tensor_buft_overrides != nullptr && !params.tensor_buft_overrides.empty()) {
+                mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
+            }
+            common_fit_set_moe_margin_auto(!params.fit_params_target_set);
+            return common_fit_params(params.model.path.c_str(), &mparams, &cparams,
+                params.tensor_split,
+                params.tensor_buft_overrides.data(),
+                params.fit_params_target.data(),
+                params.fit_params_min_ctx,
+                (has_draft || spec_mtp) && !draft_off ? &extra : nullptr,
+                fit_log_level,
+                params.fit_kv_resident);
+        };
+        common_params_fit_status fit_status = run_fit(cparams.n_state_capture);
+        {
+            static const bool shrink = getenv("LLAMA_FIT_CAPTURE_SHRINK") == nullptr || atoi(getenv("LLAMA_FIT_CAPTURE_SHRINK")) != 0;
+            std::vector<uint8_t> exps;
+            const int64_t n_layer = common_model_n_layer(params.model.path, exps);
+            const auto layers = [&]() { return mparams.n_gpu_layers < 0 ? n_layer + 1 : (int64_t) mparams.n_gpu_layers; };
+            if (shrink && cparams_in.n_state_capture < 0 && cparams_in.spec_draft && !draft_off && n_layer > 0 &&
+                    getenv("LLAMA_STATE_CAPTURE_MAX") == nullptr && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && layers() < n_layer + 1) {
+                const int64_t l_full = layers();
+                int64_t best_l = l_full;
+                int32_t best_n = -1;
+                for (const int32_t n : { 1, 0 }) {
+                    const auto st = run_fit(n);
+                    if (st == COMMON_PARAMS_FIT_STATUS_SUCCESS && layers() > best_l) {
+                        best_l = layers();
+                        best_n = n;
+                        if (best_l >= n_layer + 1) {
+                            break;
+                        }
+                    }
+                }
+                if (best_n != (int32_t) cparams.n_state_capture) {
+                    fit_status = run_fit(best_n);
+                }
+                COM_INF("%s: --fit: the state capture snapshots would move %" PRId64 " layers to the CPU: %s (%" PRId64 " of %" PRId64 " layers "
+                    "in device memory; LLAMA_FIT_CAPTURE_SHRINK=0 keeps them)\n", __func__, n_layer + 1 - l_full,
+                    best_n < 0 ? "kept, fewer snapshots do not keep more layers" : best_n == 0 ? "no capture" : "one snapshot",
+                    layers(), n_layer + 1);
+            }
+        }
         moe_margin_gain = fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS ? common_fit_moe_margin_gain() : 0;
 
         // --moe-cache-mib auto that the fit did not size (a failed or skipped fit, no host experts on a device) is no cache, as with

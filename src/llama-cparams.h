@@ -63,6 +63,7 @@ struct llama_cparams {
 
     int32_t  weight_stream;
     bool     spec_draft; // llama_context_params::spec_draft
+    int32_t  n_state_capture; // llama_context_params::n_state_capture (-1: default)
     int32_t  weight_stream_io;
     int32_t  weight_stream_threads;
     uint32_t weight_stream_ram_mib;
