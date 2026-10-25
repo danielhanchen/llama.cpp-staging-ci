@@ -3452,6 +3452,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 ggml_tensor * v_i = ggml_view_4d(ctx0, v, v->ne[0], n_kv_i, v->ne[2], v->ne[3], v->nb[1], v->nb[2], v->nb[3], 0);
                 ggml_tensor * m_i = ggml_view_4d(ctx0, kq_mask, n_kv_i, n_i, kq_mask->ne[2], kq_mask->ne[3],
                         kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], i*kq_mask->nb[1]);
+                // a group of rows over fewer cells than the mask holds is a strided view, and flash attention takes a contiguous
+                // mask only (the values are copied unchanged): G4 Qwen3.8-Flash-Next UD-IQ4_XS 24 GB, Studio argv (4 slots, unified
+                // KV), LLAMA_MTP_EXACT=1 aborted in GGML_ASSERT(ggml_is_contiguous(mask)) on a verify batch
+                if (!ggml_is_contiguous(m_i)) {
+                    m_i = ggml_cont(ctx0, m_i);
+                }
 
                 ggml_tensor * o_i = ggml_flash_attn_ext(ctx0, q_i, k_i, v_i, m_i, kq_scale, hparams.f_max_alibi_bias,
                                           hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
