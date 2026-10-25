@@ -765,21 +765,20 @@ llama_context::llama_context(
         if (moe_cache && moe_cache_seed_auto) {
             moe_cache->prompts_do_not_seed();
         }
-        // k15-pp3: the capture snapshots fit counted (cap_reserve_bytes) are allocated at the first capture: held free here too, so the
-        // lending decision of the reserve below sees the memory fit left for the cache's neighbours (G4 q4x 12 GB + MTP: with the
-        // 124.5 MiB of snapshots in the free memory, the staging copies stayed outside the cache, lending off, and the process ended
-        // with 188 MiB free instead of 408)
+        // k15-pp3: the capture snapshots fit counted (cap_planned_bytes) are allocated here, before the MoE cache's decisions read the free
+        // memory, instead of at the first capture: with their bytes still free, the first reserve kept the staging copies outside the
+        // cache and the first prompt kept its graph allocation out of the lent memory (G4 q4x 12 GB + MTP: lending off, then the graph
+        // in its own compute buffer, 188 / 248 MiB free at exit instead of 408 with LLAMA_FIT_CAPTURE=0). cap_prepare takes these buffers
         if (moe_cache && !model.hparams.no_alloc) {
+            static const int n_cap = getenv("LLAMA_STATE_CAPTURE_MAX") ? std::max(1, std::min(cap_max, atoi(getenv("LLAMA_STATE_CAPTURE_MAX")))) : cap_max;
             ggml_backend_buffer_type_t cb = nullptr;
             const size_t cbytes = cap_planned_bytes(&cb);
-            ggml_backend_dev_t cdev = cb != nullptr ? ggml_backend_buft_get_device(cb) : nullptr;
-            for (size_t i = 0; cbytes > 0 && cdev != nullptr && i < backend_ptrs.size(); ++i) {
-                if (ggml_backend_get_device(backend_ptrs[i]) == cdev && !ggml_backend_buft_is_host(backend_buft[i])) {
-                    mem_reserve[i] += cbytes;
-                    LLAMA_LOG_INFO("%s: %s: %.2f MiB of device memory kept free for the state capture snapshots (LLAMA_FIT_CAPTURE=0 to "
-                        "disable)\n", __func__, ggml_backend_name(backend_ptrs[i]), cbytes/1024.0/1024.0);
-                    break;
+            if (cbytes > 0 && cb != nullptr) {
+                for (int c = 0; c < n_cap; ++c) {
+                    cap[c].buf.reset(ggml_backend_buft_alloc_buffer(cb, cbytes / n_cap));
                 }
+                LLAMA_LOG_INFO("%s: %.2f MiB of device memory for %d state capture snapshots (%s; LLAMA_FIT_CAPTURE=0: at the first capture, "
+                    "not counted by fit)\n", __func__, cbytes/1024.0/1024.0, n_cap, ggml_backend_buft_name(cb));
             }
         }
         if (moe_cache) {
@@ -8598,15 +8597,14 @@ bool llama_context::cap_prepare(int s) {
     if (rg.empty()) {
         return false;
     }
-    if (!C.buf || ggml_backend_buffer_get_size(C.buf.get()) < total + 4096 || ggml_backend_buffer_get_type(C.buf.get()) != buft ||
-            !C.ctx || ggml_get_mem_size(C.ctx.get()) < (rg.size() + 1)*ggml_tensor_overhead()) {
+    // the buffer may come from the context's creation (k15-pp3: allocated where fit counted it, see cap_planned_bytes)
+    if (!C.buf || ggml_backend_buffer_get_size(C.buf.get()) < total + 4096 || ggml_backend_buffer_get_type(C.buf.get()) != buft) {
         C.buf.reset(ggml_backend_buft_alloc_buffer(buft, total + 4096));
         if (!C.buf) {
             return false;
         }
-        ggml_init_params ip = { (2*rg.size() + 8)*ggml_tensor_overhead(), nullptr, true };
-        C.ctx.reset(ggml_init(ip));
-    } else {
+    }
+    {
         ggml_free(C.ctx.release());
         ggml_init_params ip = { (2*rg.size() + 8)*ggml_tensor_overhead(), nullptr, true };
         C.ctx.reset(ggml_init(ip));
