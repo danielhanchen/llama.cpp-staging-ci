@@ -2408,9 +2408,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         }
 
         // k15-pp4: the state capture snapshots (layer-major prompts beside a draft, llama_context::cap_planned_bytes) are counted by the
-        // fit; where counting them costs device layers, fewer are taken (2 -> 1 -> 0, llama_context_params::n_state_capture) before any
+        // fit; where counting them costs device layers, the capture is dropped (llama_context_params::n_state_capture = 0) before any
         // layer: G4 q3m 4 GB + MTP, ctx 16384: two snapshots (126 MiB) took the small-device placement's whole 114 MiB cache, and 14 of
-        // 42 layers went to the CPU. LLAMA_FIT_CAPTURE_SHRINK=0 keeps the count. Placement only: capture or not, the output is the same
+        // 42 layers went to the CPU. LLAMA_FIT_CAPTURE_SHRINK=0 keeps the count. Placement only: the server then checkpoints as without
+        // capture (LLAMA_LM_CKPT_CAPTURE=0), whose output it equals
         const llama_model_params   mparams_in  = mparams;
         const llama_context_params cparams_in  = cparams;
         const std::vector<float>   ts_in(params.tensor_split, params.tensor_split + 128);
@@ -2438,8 +2439,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         };
         common_params_fit_status fit_status = run_fit(cparams.n_state_capture);
         {
-            // LLAMA_FIT_CAPTURE_SHRINK: 1 (default) one snapshot, else none; 2 none at once; 0 keeps the count
-            static const int shrink = getenv("LLAMA_FIT_CAPTURE_SHRINK") == nullptr ? 1 : atoi(getenv("LLAMA_FIT_CAPTURE_SHRINK"));
+            // LLAMA_FIT_CAPTURE_SHRINK: 2 (default) no capture; 1 one snapshot first, then none; 0 keeps the count. G4 q3m 4 GB + MTP,
+            // ctx 16384 (k15g4s1): one counted snapshot keeps the 42 layers but its 61 MiB leave the first layer-major group 98 MiB free
+            // (split at 2), 2k / 8k prompt 3395 / 3266 tok/s; no capture gives k14's groups and md5, 5264 / 4812 (k14 5229 / 5429)
+            static const int shrink = getenv("LLAMA_FIT_CAPTURE_SHRINK") == nullptr ? 2 : atoi(getenv("LLAMA_FIT_CAPTURE_SHRINK"));
             std::vector<uint8_t> exps;
             const int64_t n_layer = common_model_n_layer(params.model.path, exps);
             const auto layers = [&]() { return mparams.n_gpu_layers < 0 ? n_layer + 1 : (int64_t) mparams.n_gpu_layers; };
