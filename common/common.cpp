@@ -2119,9 +2119,9 @@ static bool common_fit_draft_on_cpu(
     }
     const bool   cap_ok = (double) dft <= (double) free_ + max_frac*(double) cache;
     const double take   = std::max(0.0, (double) dft - (double) free_);   // what the draft takes from the cache
-    const double host   = min_frac > 0.0 && take > 0.0 ? common_moe_host_expert_bytes(params.model.path, mp.tensor_buft_overrides, mp.n_gpu_layers) : 0.0;
+    const double host   = take > 0.0 ? common_moe_host_expert_bytes(params.model.path, mp.tensor_buft_overrides, mp.n_gpu_layers) : 0.0;
     const double left   = std::max(0.0, (double) cache - take);
-    const bool   floor_ok = host <= 0.0 || left > min_frac*host;
+    const bool   floor_ok = min_frac <= 0.0 || host <= 0.0 || left > min_frac*host;
     const bool   gpu    = cap_ok && floor_ok;
     LOG_INF("%s: draft model needs %.0f MiB of device memory; the MoE cache gets %.0f MiB (%.0f MiB left over), %.0f MiB with the draft "
         "(%.1f%% of %.0f MiB of host experts) -> draft model on the %s (it may take at most %.0f%% of the cache, LLAMA_FIT_DRAFT_MAX_CACHE_FRAC, "
