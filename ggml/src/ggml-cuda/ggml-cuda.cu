@@ -2869,6 +2869,30 @@ static void ggml_cuda_copy_peer_end(ggml_backend_cuda_context * ctx, cudaStream_
     CUDA_CHECK(cudaStreamWaitEvent(ctx->stream(), ctx->copy_peer_events[1], 0));
 }
 
+// evicts the cached CUDA graphs last used at or after t_us (ggml_time_us), e.g. the graphs of a computation that will not run again
+// (their keys are node addresses of freed graphs); returns how many. Without it they age out after 10 s of later graph use only
+static size_t ggml_backend_cuda_graph_evict_since(ggml_backend_t backend, int64_t t_us) {
+    size_t n = 0;
+#ifdef USE_CUDA_GRAPH
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return 0;
+    }
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    for (auto it = ctx->cuda_graphs.begin(); it != ctx->cuda_graphs.end(); ) {
+        if (it->second->last_used_time >= t_us) {
+            it = ctx->cuda_graphs.erase(it);
+            n++;
+        } else {
+            ++it;
+        }
+    }
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(t_us);
+#endif
+    return n;
+}
+
 static void ggml_backend_cuda_set_copy_peer(ggml_backend_t copy_backend, ggml_backend_t compute_backend) {
 #if defined(GGML_USE_HIP)
     GGML_UNUSED(copy_backend);
@@ -8396,6 +8420,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_set_copy_peer") == 0) {
         return (void *)ggml_backend_cuda_set_copy_peer;
+    }
+    if (strcmp(name, "ggml_backend_graph_evict_since") == 0) {
+        return (void *)ggml_backend_cuda_graph_evict_since;
     }
     if (strcmp(name, "ggml_backend_timer_new") == 0) {
         return (void *)ggml_backend_cuda_timer_new;

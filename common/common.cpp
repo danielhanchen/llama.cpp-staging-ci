@@ -1410,6 +1410,8 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     }
     const char * env_lm = getenv("LLAMA_MOE_LAYER_MAJOR");
     const int    lm     = env_lm == nullptr || strcmp(env_lm, "auto") == 0 ? -1 : (atoi(env_lm) != 0 ? 1 : 0);
+    // k15-small4: layer-major prompts without a draft (LLAMA_MOE_LAYER_MAJOR_NODRAFT=0 keeps the prompt ubatch by ubatch)
+    static const bool nd_on = getenv("LLAMA_MOE_LAYER_MAJOR_NODRAFT") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_NODRAFT")) != 0;
     if (params.n_ubatch_set) {
         // k9-prompt-pass: an explicit -ub without -b (Unsloth Studio passes --ubatch-size 2048 for a vision projector) kept n_batch at its
         // default 2048, so a batch held one ubatch, layer-major never engaged and a long prompt copied every spilled expert once per
@@ -1418,7 +1420,7 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         // LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB=0 keeps n_batch. Not on unified memory under Windows (params.moe_uma_keep_batch) unless
         // LLAMA_MOE_LAYER_MAJOR=1: groups of large ubatches were slower there than one ubatch per graph (see common_init_result)
         static const bool env_x = getenv("LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB")) != 0;
-        if (!env_x || lm == 0 || params.n_batch_set || (params.moe_uma_keep_batch && lm != 1) || !(lm == 1 || common_spec_draft_model(params)) ||
+        if (!env_x || lm == 0 || params.n_batch_set || (params.moe_uma_keep_batch && lm != 1) || !(lm == 1 || common_spec_draft_model(params) || nd_on) ||
                 !common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
             return;
         }
@@ -1441,6 +1443,11 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             params.n_batch_ckpt = (int32_t) cparams.n_batch;
             params.n_batch  = (int32_t) want;
             cparams.n_batch = (uint32_t) want;
+            // k15-small4: without a draft the context turns layer-major on only with this mark (as the n_ubatch-default branch below sets it;
+            // an explicit -ub, e.g. Studio's --ubatch-size 2048, never reached that branch)
+            if (lm != 1 && !common_spec_draft_model(params)) {
+                common_set_env("LLAMA_MOE_LAYER_MAJOR_AUTO_NODRAFT", "1");
+            }
             // a merged graph of k ubatches keeps what crosses its cuts for every member; at a large ubatch that is more than the fit leaves
             // free (G4, Flash-Next UD-IQ4_XS 32 GB + Q8_0 MTP drafter, -ub 2048: 4 ubatches needed 755 MiB, 744 MiB were free, so the group
             // ran as 2 + 2 and read the experts twice). With LLAMA_MOE_LAYER_MAJOR_RESERVE_FRAC (default 0.025 when the server checkpoint is
@@ -1509,6 +1516,17 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         set_batch();
         COM_INF("MoE cache: layer-major prompts beside speculative decoding: n_ubatch stays %u, n_batch %u (LLAMA_MOE_LAYER_MAJOR=0 disables)\n",
             cparams.n_ubatch, cparams.n_batch);
+    } else if (lm == -1 && spill && !common_spec_draft_model(params) && cparams.n_ubatch == ub0) {
+        // k15-small4: without a draft too, wherever the rules above keep the default n_ubatch with spilled experts (the small-device
+        // placement keeps it for good): every ubatch otherwise uploads the experts the cache misses again. T4 4 GB, Qwen3.6-35B-A3B
+        // UD-Q4_K_XL, no MTP: 2k / 8k prompt 163 / 167 tok/s ubatch by ubatch against 590 / 911 in layer-major groups (the same ubatches,
+        // layer by layer). LLAMA_MOE_LAYER_MAJOR_NODRAFT=0 keeps the prompt ubatch by ubatch
+        if (nd_on) {
+            set_batch();
+            common_set_env("LLAMA_MOE_LAYER_MAJOR_AUTO_NODRAFT", "1");
+            COM_INF("MoE cache: layer-major prompts without a draft: n_ubatch stays %u, n_batch %u (LLAMA_MOE_LAYER_MAJOR_NODRAFT=0 disables)\n",
+                cparams.n_ubatch, cparams.n_batch);
+        }
     }
 }
 
@@ -2060,7 +2078,8 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
 // the draft model's device memory at that context size must fit in what the requested cache leaves, plus at most max_frac of the cache
 static bool common_fit_draft_on_cpu(
         const common_params & params, const llama_model_params & mparams, const llama_context_params & cparams,
-        const llama_model_params & mparams_dft, llama_context_params cparams_dft, const std::string & path_dft, ggml_log_level log_level) {
+        const llama_model_params & mparams_dft, llama_context_params cparams_dft, const std::string & path_dft, ggml_log_level log_level,
+        bool * needs_target = nullptr) {
     constexpr double MiB = 1024.0*1024.0;
     double max_frac = 0.25;
     if (const char * env = getenv("LLAMA_FIT_DRAFT_MAX_CACHE_FRAC")) {
@@ -2103,8 +2122,35 @@ static bool common_fit_draft_on_cpu(
             dft += dmds[i].model + dmds[i].context + dmds[i].compute;
         }
     } catch (const std::exception & e) {
-        LOG_WRN("%s: failed to measure the draft model, keeping the old placement: %s\n", __func__, e.what());
-        return false;
+        // k15-small4: a draft that needs the target's context to be created (a gemma-4 assistant shares the target's KV cache and token
+        // embeddings, "requires ctx_other") cannot be measured on its own. Keeping the old placement put it on the GPU unmeasured:
+        // T4 4 GB, gemma-4-26B-A4B UD-Q3_K_M + its Q8_0 assistant, the fit left 258 MiB free and the draft's 425 MiB of weights failed
+        // to allocate, so the server exited. Its weights are the tensor data of its GGUF, its context the target's (shared); its compute
+        // buffer is LLAMA_FIT_DRAFT_EST_COMPUTE_MIB (default 128; the gemma-4 assistant measured 76.5 MiB at n_ubatch 512 once created).
+        // LLAMA_FIT_DRAFT_ESTIMATE=0: the old placement
+        const char * env_est = getenv("LLAMA_FIT_DRAFT_ESTIMATE");
+        size_t weights = 0;
+        if (env_est == nullptr || atoi(env_est) != 0) {
+            gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+            gguf_context_ptr gctx(gguf_init_from_file(path_dft.c_str(), gp));
+            if (gctx) {
+                for (int64_t i = 0; i < gguf_get_n_tensors(gctx.get()); i++) {
+                    weights += gguf_get_tensor_size(gctx.get(), i);
+                }
+            }
+        }
+        if (weights == 0) {
+            LOG_WRN("%s: failed to measure the draft model, keeping the old placement: %s\n", __func__, e.what());
+            return false;
+        }
+        const char * env_c = getenv("LLAMA_FIT_DRAFT_EST_COMPUTE_MIB");
+        const size_t compute = (size_t) (env_c != nullptr ? std::max(0.0, atof(env_c)) : 128.0) * 1024 * 1024;
+        dft = weights + compute;
+        if (needs_target != nullptr) {
+            *needs_target = true;
+        }
+        LOG_INF("%s: the draft model cannot be measured on its own (%s): estimated as its weights %.0f MiB + %.0f MiB of compute buffer "
+            "(LLAMA_FIT_DRAFT_EST_COMPUTE_MIB; LLAMA_FIT_DRAFT_ESTIMATE=0 keeps the old placement)\n", __func__, e.what(), weights/MiB, compute/MiB);
     }
     const bool gpu = (double) dft <= (double) free_ + max_frac*(double) cache;
     LOG_INF("%s: draft model needs %.0f MiB of device memory; the MoE cache gets %.0f MiB (%.0f MiB left over) -> draft model on the %s "
@@ -2361,17 +2407,25 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         // (fit_can_drop), it is left out and drafting is off unless LLAMA_FIT_DRAFT_CPU=1 (drafting on the CPU is slower than none)
         // the old order (the draft model first, the main model around it) with LLAMA_FIT_DRAFT_LAST=0, or when -ngld or -devd is set
         bool draft_cpu = false;
+        bool draft_needs_target = false;
         {
             const char * env_last = getenv("LLAMA_FIT_DRAFT_LAST");
             const bool   last     = has_draft && params.moe_cache_size > 0 && params.speculative.draft.n_gpu_layers == -1 &&
                 params.speculative.draft.devices.empty() &&
                 (env_last == nullptr || atoi(env_last) != 0);
             if (last) {
-                draft_cpu = common_fit_draft_on_cpu(params, mparams, cparams, mparams_dft, cparams_dft, params_dft.model.path, fit_log_level);
+                draft_cpu = common_fit_draft_on_cpu(params, mparams, cparams, mparams_dft, cparams_dft, params_dft.model.path, fit_log_level,
+                    &draft_needs_target);
             }
         }
         const char * env_dcpu  = getenv("LLAMA_FIT_DRAFT_CPU");
-        const bool   draft_off = draft_cpu && params.speculative.draft.fit_can_drop && (env_dcpu == nullptr || atoi(env_dcpu) == 0);
+        // k15-small4: a draft that runs on the target's context (a gemma-4 assistant reads the target's KV cache) cannot run on the CPU
+        // while that cache is on the device: T4 4 GB with LLAMA_FIT_DRAFT_CPU=1 aborted in its first graph reservation (a CPU context
+        // with a pre-allocated CUDA tensor). It is left out instead
+        if (draft_cpu && draft_needs_target && env_dcpu != nullptr && atoi(env_dcpu) != 0) {
+            COM_WRN("%s: LLAMA_FIT_DRAFT_CPU=1: the draft model runs on the target's KV cache and cannot run on the CPU beside it, it is left out\n", __func__);
+        }
+        const bool   draft_off = draft_cpu && params.speculative.draft.fit_can_drop && (env_dcpu == nullptr || atoi(env_dcpu) == 0 || draft_needs_target);
         if (draft_cpu) {
             // no device at all (-devd none): with only n_gpu_layers = 0 its context still reserves a device compute buffer for the
             // offloaded ops of large batches (2.4 GiB for the MTP drafter at -ub 2048), which pushed the main layers off the GPU
@@ -2388,8 +2442,15 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             }
         }
 
+        // k15-small4: the inputs of the fit, for the MTP drafter trial below
+        const llama_model_params   mparams_in = mparams;
+        const llama_context_params cparams_in = cparams;
+        const std::vector<float>   ts_in(params.tensor_split, params.tensor_split + 128);
+        const std::vector<llama_model_tensor_buft_override> tbo_in = params.tensor_buft_overrides;
+        const std::vector<size_t>  margins_in = params.fit_params_target;
+
         common_fit_set_moe_margin_auto(!params.fit_params_target_set);
-        const common_params_fit_status fit_status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
+        common_params_fit_status fit_status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
@@ -2397,7 +2458,56 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             (has_draft || spec_mtp) && !draft_off ? &extra : nullptr,
             fit_log_level,
             params.fit_kv_resident);
-        moe_margin_gain = fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS ? common_fit_moe_margin_gain() : 0;
+
+        // k15-small4: an MTP drafter (the target's own NextN layers, no -md) that costs whole layers on a small device is dropped, as a
+        // draft model that does not fit is (fit_can_drop). Its context (KV, compute buffer at the draft ubatch), the NextN weights and the
+        // recurrent rollback state (n_rs_seq) are fitted with the target; where they push layers to the CPU, every token runs those layers
+        // (attention, recurrent state) on the CPU: T4 4 GB, Qwen3.6-35B-A3B UD-Q4_K_XL + MTP kept 22 of 42 layers on the device (decode
+        // 4-5 tok/s), without the drafter every layer and a 476 MiB MoE cache. Only when the fit with the drafter moved layers off the
+        // device is the fit run again without it; the drafter goes if that one keeps every layer on the device.
+        // LLAMA_FIT_MTP_DROP=0: keep the drafter and the layer placement
+        const char * env_mtp_drop = getenv("LLAMA_FIT_MTP_DROP");
+        const int64_t moe_gain_first = common_fit_moe_margin_gain();
+        bool moe_gain_mtp_trial = false;
+        if (spec_mtp && !has_draft && !draft_off && params.speculative.draft.fit_can_drop && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS &&
+                mparams.n_gpu_layers != llama_model_default_params().n_gpu_layers && mparams_in.n_gpu_layers == llama_model_default_params().n_gpu_layers &&
+                (env_mtp_drop == nullptr || atoi(env_mtp_drop) != 0)) {
+            llama_model_params   mp = mparams_in;
+            llama_context_params cp = cparams_in;
+            std::vector<float>   ts = ts_in;
+            std::vector<llama_model_tensor_buft_override> tbo = tbo_in;
+            std::vector<size_t>  mg = margins_in;
+            mp.tensor_split = ts.data();
+            if (mparams_in.tensor_buft_overrides == params.tensor_buft_overrides.data()) {
+                mp.tensor_buft_overrides = tbo.data();
+            }
+            mp.load_mtp = params.load_mtp;
+            cp.n_rs_seq = 0;
+            common_fit_set_moe_margin_auto(!params.fit_params_target_set);
+            const common_params_fit_status st2 = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(), tbo.empty() ? nullptr : tbo.data(),
+                mg.data(), params.fit_params_min_ctx, nullptr, fit_log_level, params.fit_kv_resident);
+            if (st2 == COMMON_PARAMS_FIT_STATUS_SUCCESS && mp.n_gpu_layers == llama_model_default_params().n_gpu_layers) {
+                COM_WRN("%s: --fit: the MTP drafter would move layers to the CPU (%d layers on the device with it, all without it): "
+                    "speculative decoding is off (LLAMA_FIT_MTP_DROP=0 keeps it)\n", __func__, mparams.n_gpu_layers);
+                std::copy(ts.begin(), ts.end(), params.tensor_split);
+                std::copy(tbo.begin(), tbo.end(), params.tensor_buft_overrides.begin());
+                params.fit_params_target = mg;
+                const bool tbo_ours = mp.tensor_buft_overrides != nullptr && mp.tensor_buft_overrides == tbo.data();
+                mparams = mp;
+                cparams = cp;
+                mparams.tensor_split = params.tensor_split;
+                if (tbo_ours) {   // the fit points the overrides at the buffer it wrote: the copy now lives in params
+                    mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
+                }
+                fit_status = st2;
+                params.speculative.draft.fit_off = true;
+            } else {
+                COM_INF("%s: --fit: the MTP drafter stays (without it the fit does not keep every layer on the device either)\n", __func__);
+                // the fit with the drafter stands: its outputs were not touched (the trial ran on copies), only its margin gain is the trial's
+                moe_gain_mtp_trial = true;
+            }
+        }
+        moe_margin_gain = fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS ? (moe_gain_mtp_trial ? moe_gain_first : common_fit_moe_margin_gain()) : 0;
 
         // --moe-cache-mib auto that the fit did not size (a failed or skipped fit, no host experts on a device) is no cache, as with
         // the release: the unbounded request must never reach the context

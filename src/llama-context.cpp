@@ -23,6 +23,9 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -414,7 +417,11 @@ llama_context::llama_context(
         // and a batch holds at least two ubatches (checked once the cache exists)
         const char * env = getenv("LLAMA_MOE_LAYER_MAJOR");
         lm_auto    = env == nullptr || strcmp(env, "auto") == 0;
-        lm_enabled = (lm_auto ? cparams.spec_draft && cparams.n_batch >= 2*cparams.n_ubatch : atoi(env) != 0) && cparams.moe_cache_size > 0;
+        // k15-small4: LLAMA_MOE_LAYER_MAJOR_AUTO_NODRAFT=1 (set by common where its rules keep the default n_ubatch with spilled experts,
+        // see common_moe_cache_auto_ubatch): auto also without a draft
+        const char * env_nd = getenv("LLAMA_MOE_LAYER_MAJOR_AUTO_NODRAFT");
+        const bool   lm_nd  = env_nd != nullptr && atoi(env_nd) != 0;
+        lm_enabled = (lm_auto ? (cparams.spec_draft || lm_nd) && cparams.n_batch >= 2*cparams.n_ubatch : atoi(env) != 0) && cparams.moe_cache_size > 0;
         if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX")) {
             lm_ub_max = std::max(1, atoi(e));
         }
@@ -735,7 +742,7 @@ llama_context::llama_context(
         }
         if (lm_enabled && !model.hparams.no_alloc) {
             LLAMA_LOG_INFO("%s: MoE cache: layer-major prompts%s, up to %d ubatches of %u tokens per graph (LLAMA_MOE_LAYER_MAJOR_UB_MAX; "
-                "LLAMA_MOE_LAYER_MAJOR=0 disables)\n", __func__, lm_auto ? " beside speculative decoding" : "", lm_ub_max, cparams.n_ubatch);
+                "LLAMA_MOE_LAYER_MAJOR=0 disables)\n", __func__, lm_auto ? (cparams.spec_draft ? " beside speculative decoding" : " without a draft") : "", lm_ub_max, cparams.n_ubatch);
         }
         if (moe_cache) {
             n_threads_host = host_threads_init();
@@ -3785,6 +3792,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     auto lm_hybrid_ok = [&]() { return lm_hybrid_frac_ok(moe_cache->cache_frac()); };
     const auto & hparams = model.hparams;
     const int64_t n_vocab = model.vocab.n_tokens();
+    const int64_t lm_t_start = ggml_time_us(); // the CUDA graphs used from here on are the group's (evicted with its host memory)
 
     // ubatches that can run layer-major: prompt ubatches whose host experts are prefetched whole (the copy is the same for every ubatch)
     auto eligible = [&](const llama_ubatch & ub) {
@@ -4876,7 +4884,12 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         // used most (its routing, read before the compute buffers are freed). G4 4 GB, Qwen3.6 Q3_K_M + MTP 2, 3 launches: decode 2k / 8k
         // 136.1 / 150.0 tok/s held before, 138.0 / 146.1 routed (release off 133.6 / 149.3); long-prompt KLD against the all-device run,
         // first token mean 0.00076 held before, 0.00134 routed (the -fa off band 0.00031, k12 0.00118)
-        static const bool lm_release_routed = getenv("LLAMA_MOE_LM_RELEASE_ROUTED") != nullptr && atoi(getenv("LLAMA_MOE_LM_RELEASE_ROUTED")) != 0;
+        // k15-small4: on by default without a draft model (no-draft layer-major prompts, LLAMA_MOE_LAYER_MAJOR_NODRAFT): the slots of a fresh
+        // cache held nothing before the group, so the held-before refill uploaded nothing and decode started from an empty cache (G4 4 GB,
+        // Qwen3.6 Q4_K_XL: 238 experts admitted by the prompts against 1399 ubatch by ubatch, decode -0.7..-2.2%). It changes only which
+        // experts the cache holds. LLAMA_MOE_LM_RELEASE_ROUTED=0 off, =1 on with a draft too
+        static const char * lm_rr_env = getenv("LLAMA_MOE_LM_RELEASE_ROUTED");
+        const bool lm_release_routed = lm_rr_env != nullptr ? atoi(lm_rr_env) != 0 : !cparams.spec_draft;
         if (lm_release_routed && status == GGML_STATUS_SUCCESS) {
             moe_cache->set_refill_routed_once(true);
             moe_cache_ids = lm_record;
@@ -4949,6 +4962,40 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
 
     // the next graph is built anew
     gf_res_prev_active = nullptr; gf_res_epoch++;
+
+    // k15-small4: the host memory of the group (its input arena, mostly the KQ masks of every member, and the members' graph results) is
+    // freed after it instead of kept for the next prompt: kept, it stayed in the process after every long prompt (q3m 4 GB, 8k prompt:
+    // RssAnon +235 MiB against ubatch by ubatch, T4 / G4 +160-176 MiB after the bench cells). The routing kept for the seed of the next
+    // ubatch is copied to host memory first (as when the compute buffers shrink). LLAMA_MOE_LM_KEEP_HOST=1 (or LLAMA_MOE_LAYER_MAJOR_EAGER=1)
+    // keeps them
+    static const bool lm_keep_host = (getenv("LLAMA_MOE_LM_KEEP_HOST") != nullptr && atoi(getenv("LLAMA_MOE_LM_KEEP_HOST")) != 0) ||
+                                     (getenv("LLAMA_MOE_LAYER_MAJOR_EAGER") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_EAGER")) != 0);
+    if (!lm_keep_host) {
+        ggml_backend_sched_synchronize(sched.get());
+        lm_ids_host_keep();
+        ggml_backend_sched_reset(sched.get());
+        lm_arena.reset();
+        lm_arena_old.clear();
+        lm_arena_used = 0;
+        lm_inp_buf.clear();
+        lm_res.clear();
+        // the backends' cached CUDA graphs of the group's splits (host-side node records of 16 ubatches, keyed by the freed nodes)
+        for (auto & bk : backend_ptrs) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(bk);
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto fn = reg ? (size_t (*)(ggml_backend_t, int64_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_evict_since") : nullptr;
+            if (fn != nullptr) {
+                fn(bk, lm_t_start);
+            }
+        }
+#if defined(__GLIBC__)
+        // the graph results' metadata are large heap blocks that glibc keeps after free (its mmap threshold grows with the first such free)
+        static const bool lm_trim = getenv("LLAMA_MOE_LM_TRIM") == nullptr || atoi(getenv("LLAMA_MOE_LM_TRIM")) != 0;
+        if (lm_trim) {
+            malloc_trim(0);
+        }
+#endif
+    }
 
     return (int) group.size();
 }
