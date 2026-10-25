@@ -495,8 +495,10 @@ static void common_params_fit_impl(
             if (need <= 0) {
                 // k15-fn: the first size that fits can leave memory above the targets (the cache does not take exactly the bytes the
                 // linear estimate gave it: G4 Qwen3.8-Flash-Next UD-IQ4_XS + MTP at 32 GB left 856 MiB above the 1024 MiB margin);
-                // grow it by the measured surplus while it still fits (LLAMA_MOE_FIT_FILL=0: keep the first size)
-                static const bool fill = getenv("LLAMA_MOE_FIT_FILL") == nullptr || atoi(getenv("LLAMA_MOE_FIT_FILL")) != 0;
+                // grow it by the measured surplus while it still fits. Opt-in (LLAMA_MOE_FIT_FILL=1): G4 k15f_g4, Qwen3.6 UD-Q4_K_XL + MTP,
+                // +338 / +532 MiB of cache at 12 / 16 GB gave +7..+10% decode at 2k-16k (12 GB) and +-2% (16 GB), but a 42-token prompt's
+                // TTFT went 165 -> 178 ms and 125 -> 139 ms; Flash-Next UD-IQ4_XS at 16 / 32 GB and LFM2.5 16 GB had no surplus to fill
+                static const bool fill = getenv("LLAMA_MOE_FIT_FILL") != nullptr && atoi(getenv("LLAMA_MOE_FIT_FILL")) != 0;
                 for (int g = 0; fill && g < 3 && size < size_requested; g++) {
                     const int64_t extra = std::min<int64_t>(surplus_of(dmds_test) - 16*MiB, size_requested - size);
                     if (extra < 64*MiB || !devices_ok(dmds_test)) {
