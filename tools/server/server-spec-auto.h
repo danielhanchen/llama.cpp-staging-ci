@@ -25,12 +25,13 @@
 // G4 timing of plans/k13_lfm.md section 10 (both must pass):
 //   - LFM2.5 with the hybrid gate (small caches, G4 4 GB): mode 1 from repeats of at least 16 tokens (chat = kill switch, 2k +35%,
 //     8k +5%; decode KLD inside the -fa off band, first token unchanged);
-//   - LFM2.5 with the CPU-miss rule (G4 8 GB): off. Mode 3 (chat +28%, 2k +45%, 8k +39%) fails the first-token top-1 (0.875 vs 0.938),
-//     mode 3 from repeats of 12+ its first-token p99 (0.242 vs 0.233): LLAMA_SPEC_SPILL=3 opts in;
+//   - LFM2.5 with the CPU-miss rule (G4 8 GB): mode 3 (k15: its prompts stay off the pinned host path, LLAMA_MOE_PIN_PROMPT_DEV, so
+//     the first token is the all-device one: first-token KLD 0 on 192 + 12 prompts, decode inside the calibrated band; G4 k15d chat
+//     +24%, 2k +62%, 8k +16% against mode 0). k13's mode 3 without that failed the first-token top-1 (0.896 vs band 0.906);
 //   - gemma-4: off (mode 1 loses chat by 1-1.7% on G4 8 GB; LLAMA_SPEC_SPILL=1 opts in).
 #ifndef SPEC_SPILL_LFM_GATE
 #define SPEC_SPILL_LFM_GATE   1
-#define SPEC_SPILL_LFM_CM     0
+#define SPEC_SPILL_LFM_CM     3
 #define SPEC_SPILL_GEMMA4_GATE 0
 #define SPEC_SPILL_GEMMA4_CM  0
 #endif

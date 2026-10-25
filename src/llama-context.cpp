@@ -3229,6 +3229,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -2;
     };
 
+    // k15: a prompt batch (some tokens without an output) keeps its ubatches off the CPU-miss host path of a pinned cache (see
+    // llama_moe_cache::set_prompt_batch); generation and verify batches (an output for every token) keep it
+    struct moe_prompt_mark {
+        llama_moe_cache * mc;
+        moe_prompt_mark(llama_moe_cache * mc, bool prompt) : mc(mc) { if (mc) { mc->set_prompt_batch(prompt); } }
+        ~moe_prompt_mark() { if (mc) { mc->set_prompt_batch(false); } }
+    } moe_prompt_guard(moe_cache.get(), (int64_t) n_outputs_all < (int64_t) n_tokens_all);
+
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
         llama_sampler_backend_begin(entry.second);

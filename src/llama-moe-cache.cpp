@@ -3673,12 +3673,33 @@ struct llama_moe_cache::impl {
         return cmt_host_ok && (!cm_trial || (cmt_n > 0 && cm_small_ok));
     }
 
+    // k15 (port of k11-spill arm P, 43a25ef811): the ubatches of a prompt batch (tokens without outputs, its last partial ubatch
+    // included) stay off the CPU-miss host path, so the first token after a prompt carries no host-computed expert. On by default
+    // only while the small batches are pinned (llama_moe_pin_small, spill mode 3: G4 LFM2.5 8 GB first-token KLD came from the
+    // prompt's small checkpoint tail ubatch taking the pinned host path). LLAMA_MOE_PIN_PROMPT_DEV=0: off there;
+    // LLAMA_MOE_CPU_MISS_PROMPT_DEV=1: also without the pin (test arm)
+    bool cm_prompt_now = false; // set by the context around each decode (set_prompt_batch)
+    bool cm_prompt_off() const {
+        static const bool pin_dev = [] {
+            const char * e = getenv("LLAMA_MOE_PIN_PROMPT_DEV");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        static const bool all_dev = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_PROMPT_DEV");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        return cm_prompt_now && cm && ((cm_frozen && cm_frozen_fetch && pin_dev) || all_dev);
+    }
+
     bool cm_serves(int64_t n_tokens) const {
-        return cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_max && (n_tokens <= cm_prompt_force || (cm_on[n_tokens] != 0 && cm_prompt_ok()));
+        return cm && cm_cal && !cm_prompt_off() && n_tokens > max_batch && n_tokens <= cm_max && (n_tokens <= cm_prompt_force || (cm_on[n_tokens] != 0 && cm_prompt_ok()));
     }
 
     // the host computes the misses of a batch of n_tokens: the fetch share, 1 = every missing expert is fetched
     float cm_share_of(int64_t n_tokens) const {
+        if (cm_prompt_off()) {
+            return 1.0f;
+        }
         if (cm_frozen && !cm_frozen_fetch && cm && cm_cal && n_tokens >= 1 && n_tokens <= std::min<int64_t>({ cm_frozen_max, max_batch, cm_max })) {
             return 0.0f;
         }
@@ -3962,7 +3983,7 @@ struct llama_moe_cache::impl {
     int hybrid_mode() const {
         if (cm) {
             // the decisions of every batch size are in the graph: a new decision rebuilds the graphs
-            return 3 + (ov_live ? 4 : 0) + 8*(int) (cm_gen & 0xfffff);
+            return 3 + (ov_live ? 4 : 0) + 8*(int) (cm_gen & 0xfffff) + (cm_prompt_off() ? (1 << 28) : 0);
         }
         // a single-graph failure (single_off) rebuilds the graphs without their mailboxes: a reused graph would keep merging from a
         // mailbox whose control block says failed (wrong rows in every later ubatch with a pinned fetch share, LLAMA_MOE_CACHE_FETCH)
@@ -6604,6 +6625,10 @@ bool llama_moe_cache::overlap(int64_t n_ubatch) const {
 
 bool llama_moe_cache::hybrid_active() const {
     return pimpl->hybrid_active();
+}
+
+void llama_moe_cache::set_prompt_batch(bool prompt) {
+    pimpl->cm_prompt_now = prompt;
 }
 
 bool llama_moe_cache::host_computes(int64_t n_tokens) const {

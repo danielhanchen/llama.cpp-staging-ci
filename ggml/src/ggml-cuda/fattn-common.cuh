@@ -981,7 +981,13 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE, const bool async_kv_preload = false
+    const int warp_size = WARP_SIZE, const bool async_kv_preload = false,
+    // k15: the number of parallel KV blocks is the one a launch of pb_kernel with pb_ncols2 query heads per block would pick (its
+    // occupancy and output tiles), so a kernel that packs the query heads of a KV head (ncols2 > 1) splits the KV exactly as the
+    // per-head kernel does and its outputs are bit-identical (fattn-vec.cuh, GGML_CUDA_FA_VEC_GQA)
+    fattn_kernel_t pb_kernel = nullptr, const int pb_ncols2 = 1,
+    // k15: thread groups per block (blockDim.z; fattn-vec.cuh grouped heads), the occupancy then is that of pb_kernel's group size
+    const int block_z = 1
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1132,10 +1138,14 @@ void launch_fattn(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    const dim3 block_dim(warp_size, nwarps, 1);
+    const dim3 block_dim(warp_size, nwarps, block_z);
+    GGML_ASSERT(block_z == 1 || pb_kernel != nullptr);
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, pb_kernel ? pb_kernel : fattn_kernel,
+        pb_kernel ? block_dim.x * block_dim.y : block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
     GGML_ASSERT(max_blocks_per_sm > 0);
+    GGML_ASSERT(pb_kernel == nullptr || !stream_k);
+    const int ntiles_dst_pb = pb_kernel ? ntiles_x * ((gqa_ratio + pb_ncols2 - 1) / pb_ncols2) * K->ne[2] * Q->ne[3] : ntiles_dst;
     int parallel_blocks = max_blocks_per_sm;
 
     const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1];
@@ -1198,7 +1208,7 @@ void launch_fattn(
         int nwaves_best = 0;
         int efficiency_percent_best = 0;
         for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
-            const int nblocks_total = ntiles_dst * parallel_blocks_test;
+            const int nblocks_total = ntiles_dst_pb * parallel_blocks_test;
             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
 
@@ -1240,7 +1250,10 @@ void launch_fattn(
     const uint32_t n_head_log2 = 1u << uint32_t(floorf(log2f(float(n_head))));
 
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
-    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+    // m1 is read only for ALiBi (max_bias > 0); without ALiBi a negative m1 tells the vector kernel not to skip KV tiles whose
+    // mask is -inf for every column (GGML_CUDA_FA_VEC_SKIP_MASKED=0, the kill switch of that skip)
+    static const bool vec_skip_masked = !getenv("GGML_CUDA_FA_VEC_SKIP_MASKED") || atoi(getenv("GGML_CUDA_FA_VEC_SKIP_MASKED")) != 0;
+    const float m1 = max_bias <= 0.0f && !vec_skip_masked ? -1.0f : powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
     // TODO other tensor dimensions after removal of WMMA kernel:
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);

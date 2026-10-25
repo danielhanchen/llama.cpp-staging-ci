@@ -4079,6 +4079,15 @@ static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::un
         }
     }
     if (!producer_q8_1_disabled) {
+        // k15: the LFM2 short conv * c product (shortconv-fused.cu writes its q8_1 copy)
+        for (int i = 0; i + 1 < cgraph->n_nodes; ++i) {
+            const ggml_tensor * conv = cgraph->nodes[i];
+            const ggml_tensor * mul  = cgraph->nodes[i + 1];
+            if (conv->op == GGML_OP_SSM_CONV && mul->op == GGML_OP_MUL && (mul->src[0] == conv || mul->src[1] == conv) &&
+                mul->type == GGML_TYPE_F32 && ggml_is_contiguous(mul) && mul->data != nullptr) {
+                norm_outputs.insert(mul);
+            }
+        }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const ggml_tensor * node = cgraph->nodes[i];
             if ((ggml_cuda_ew_chain_op_code(node) >= 0 || node->op == GGML_OP_DSV4_HC_PRE) && node->type == GGML_TYPE_F32 &&
@@ -4420,6 +4429,65 @@ static int ggml_cuda_try_fuse_moe_cache_glu(ggml_backend_cuda_context * cuda_ctx
     return 3;
 }
 
+// k15: ADD -> RMS_NORM -> MUL where a mul_mat_vec_q reads the MUL output (the q8_1 copy of ggml_cuda_q8_1_cache): the residual add
+// is computed by the norm kernel (rms_norm_mul_q8_1_f32 with ra / rb), its output still written for its other users. LFM2.5 decode:
+// two residual adds per layer, 80 launches per token. Bit-identical to the unfused ops (same float add, same reduction order).
+// GGML_CUDA_ADD_RMS_FUSE=0: off
+static int ggml_cuda_try_fuse_add_rms_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_ADD_RMS_FUSE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (!on || i + 2 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * add = cgraph->nodes[i];
+    ggml_tensor * rms = cgraph->nodes[i + 1];
+    ggml_tensor * mul = cgraph->nodes[i + 2];
+    if (add->op != GGML_OP_ADD || rms->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || rms->src[0] != add ||
+            (mul->src[0] != rms && mul->src[1] != rms)) {
+        return 0;
+    }
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(a, add) || !ggml_are_same_shape(b, add) || !ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(add) ||
+            !ggml_is_contiguous(mul) || !ggml_are_same_shape(rms, mul) ||
+            !ggml_cuda_is_aligned(a, 16) || !ggml_cuda_is_aligned(b, 16) || !ggml_cuda_is_aligned(add, 16)) {
+        return 0;
+    }
+    // in place (a or b at add's address) is fine: each element is read and written by the same thread and the norm pass reads after
+    // a barrier; any other overlap is not
+    const auto overlaps = [add](const ggml_tensor * t) {
+        const char * lo = (const char *) t->data;
+        const char * al = (const char *) add->data;
+        return t->data != add->data && lo < al + ggml_nbytes(add) && al < lo + ggml_nbytes(t);
+    };
+    if (overlaps(a) || overlaps(b)) {
+        return 0;
+    }
+    const ggml_tensor * mul_other = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    if (mul_other->type != GGML_TYPE_F32 || !ggml_can_repeat(mul_other, mul)) {
+        return 0;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i, i + 2 })) {
+        return 0;
+    }
+    ggml_cuda_q8_1_cache & cache = cuda_ctx->q8_1_cache;
+    if (!cache.active() || cuda_ctx->curr_stream_no != 0 || !cache.norm_targets.count(mul)) {
+        return 0;
+    }
+    const int64_t ne10_padded = GGML_PAD(mul->ne[0], MATRIX_ROW_PADDING);
+    int64_t key[ggml_cuda_q8_1_cache::n_key];
+    ggml_cuda_q8_1_cache::key_contiguous(mul->ne[0], ggml_nrows(mul), key);
+    void * q8_1_out = cache.reserve(mul->data, ggml_nbytes(mul), key, ggml_nrows(mul)*ne10_padded/QK8_1*sizeof(block_q8_1));
+    if (q8_1_out == nullptr) {
+        return 0;
+    }
+    ggml_cuda_op_rms_norm_fused(*cuda_ctx, rms, mul, q8_1_out, add);
+    return 2;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -4427,6 +4495,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_ADD) {
+        if (const int n = ggml_cuda_try_fuse_add_rms_norm(cuda_ctx, cgraph, i)) {
+            return n;
+        }
+    }
 
     // k11-decode: LFM2 short-conv window (b * x into the conv window) and conv * c, small batches (GGML_CUDA_SHORTCONV_FUSE=0: off)
     if (node->op == GGML_OP_MUL) {

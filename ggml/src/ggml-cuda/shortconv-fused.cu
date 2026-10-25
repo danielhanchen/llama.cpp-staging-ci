@@ -28,12 +28,23 @@ static bool shortconv_f32(const ggml_tensor * t) {
 
 // ---------------------------------------------------------------------------------------------------------- 1. b * x into the window
 // out[t, ch, s] = t < d ? state[t, ch, s] : b[ch, t - d, s] * x[ch, t - d, s]
+// k15: + the conv state snapshots (the CPYs of views of the window into the recurrent cache that follow it, lfm2.cpp): snapshot k
+// writes dst[k] + s*dst_nb1[k] + (ch*d + c)*4 = out[off[k] + c, ch, s], the values this thread just wrote (GGML_CUDA_SHORTCONV_STATE=0: off)
+struct shortconv_snaps {
+    static constexpr int n_max = 8;
+    char *  dst[n_max];
+    int64_t dst_nb1[n_max];
+    int64_t off[n_max];
+    int     n;
+};
+
 static __global__ void shortconv_window_f32(const char * state, const char * b, const char * x, char * out,
                                             const int64_t d, const int64_t n_t, const int64_t nr,
                                             const int64_t st_nb0, const int64_t st_nb1, const int64_t st_nb2,
                                             const int64_t b_nb0, const int64_t b_nb1, const int64_t b_nb2,
                                             const int64_t x_nb0, const int64_t x_nb1, const int64_t x_nb2,
-                                            const int64_t o_nb0, const int64_t o_nb1, const int64_t o_nb2) {
+                                            const int64_t o_nb0, const int64_t o_nb1, const int64_t o_nb2,
+                                            const shortconv_snaps snaps) {
     const int64_t ch = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     const int64_t s  = blockIdx.y;
     if (ch >= nr) {
@@ -46,6 +57,12 @@ static __global__ void shortconv_window_f32(const char * state, const char * b, 
         const float bv = *(const float *) (b + ch*b_nb0 + t*b_nb1 + s*b_nb2);
         const float xv = *(const float *) (x + ch*x_nb0 + t*x_nb1 + s*x_nb2);
         *(float *) (out + (d + t)*o_nb0 + ch*o_nb1 + s*o_nb2) = bv * xv;
+    }
+    for (int k = 0; k < snaps.n; ++k) {
+        for (int64_t c = 0; c < d; ++c) {
+            *(float *) (snaps.dst[k] + s*snaps.dst_nb1[k] + (ch*d + c)*sizeof(float)) =
+                *(const float *) (out + (snaps.off[k] + c)*o_nb0 + ch*o_nb1 + s*o_nb2);
+        }
     }
 }
 
@@ -93,18 +110,67 @@ int ggml_cuda_try_fuse_shortconv_window(ggml_backend_cuda_context & ctx, ggml_cg
             return 0;
         }
     }
+    // k15: the state snapshots right after the window (views and CPYs; any other node ends the scan)
+    static const bool state_on = [] {
+        const char * e = getenv("GGML_CUDA_SHORTCONV_STATE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    shortconv_snaps snaps = {};
+    int n_extra = 0;
+    if (state_on) {
+        for (int j = i + 3; j < cgraph->n_nodes && snaps.n < shortconv_snaps::n_max; ++j) {
+            const ggml_tensor * node = cgraph->nodes[j];
+            if (node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE) {
+                continue;
+            }
+            const ggml_tensor * src = node->src[0];
+            const ggml_tensor * dsn = node->src[1];
+            if (node->op != GGML_OP_CPY || src == nullptr || dsn == nullptr || src->view_src != cat || src->type != GGML_TYPE_F32 ||
+                    dsn->type != GGML_TYPE_F32 || src->ne[0] != d || src->ne[1] != nr || src->ne[2] != n_s || src->ne[3] != 1 ||
+                    src->nb[0] != (size_t) cat->nb[0] || src->nb[1] != cat->nb[1] || src->nb[2] != cat->nb[2] || src->view_offs % cat->nb[0] != 0 ||
+                    (int64_t) (src->view_offs / cat->nb[0]) + d > cat->ne[0] || dsn->ne[0] != d*nr || dsn->ne[1] != n_s || dsn->ne[2] != 1 ||
+                    dsn->ne[3] != 1 || dsn->nb[0] != sizeof(float) || node->data != dsn->data) {
+                break;
+            }
+            // the snapshot must not overlap what the kernel reads or the window it copies from; the one exception is the state cell
+            // it was read from (decode overwrites the cell in place): with the same element addresses, element (c, ch, s) is read
+            // and then written by the same thread (ch, s) only, the reads first
+            const char * d0 = (const char *) dsn->data;
+            const char * d1 = d0 + (n_s - 1)*dsn->nb[1] + d*nr*sizeof(float);
+            const bool same_cell = d0 == (const char *) state->data && state->nb[0] == sizeof(float) &&
+                state->nb[1] == (size_t) d*sizeof(float) && (n_s == 1 || state->nb[2] == dsn->nb[1]);
+            bool clash = false;
+            for (const ggml_tensor * t : { b, x, same_cell ? nullptr : state, (const ggml_tensor *) cat }) {
+                if (t == nullptr) {
+                    continue;
+                }
+                const char * a0 = (const char *) t->data;
+                const char * a1 = a0 + ggml_nbytes(t);
+                clash = clash || (a0 < d1 && d0 < a1);
+            }
+            if (clash) {
+                break;
+            }
+            snaps.dst[snaps.n]     = (char *) dsn->data;
+            snaps.dst_nb1[snaps.n] = dsn->nb[1];
+            snaps.off[snaps.n]     = src->view_offs / cat->nb[0];
+            snaps.n++;
+            n_extra = j - (i + 2);
+        }
+    }
     const int threads = 128;
     const dim3 blocks((unsigned) ((nr + threads - 1)/threads), (unsigned) n_s, 1);
     shortconv_window_f32<<<blocks, threads, 0, ctx.stream()>>>((const char *) state->data, (const char *) b->data, (const char *) x->data,
         (char *) cat->data, d, n_t, nr, state->nb[0], state->nb[1], state->nb[2], b->nb[0], b->nb[1], b->nb[2],
-        x->nb[0], x->nb[1], x->nb[2], cat->nb[0], cat->nb[1], cat->nb[2]);
+        x->nb[0], x->nb[1], x->nb[2], cat->nb[0], cat->nb[1], cat->nb[2], snaps);
     CUDA_CHECK(cudaGetLastError());
     static bool logged = false;
     if (!logged) {
         logged = true;
-        GGML_LOG_INFO("%s: LFM2 short-conv window fused (b * x into the conv window, %lld tokens; GGML_CUDA_SHORTCONV_FUSE=0: off)\n", __func__, (long long) n_t);
+        GGML_LOG_INFO("%s: LFM2 short-conv window fused (b * x into the conv window, %lld tokens, %d state snapshots; GGML_CUDA_SHORTCONV_FUSE=0: off)\n",
+            __func__, (long long) n_t, snaps.n);
     }
-    return 2;
+    return 2 + n_extra;
 }
 
 // ---------------------------------------------------------------------------------------------------------- 2. ssm_conv * c
@@ -114,7 +180,10 @@ static __global__ void shortconv_conv_mul_f32(const float * __restrict__ src0, c
                                               const int src0_nb1, const int src0_nb2, const int src1_nb1,
                                               const int64_t c_nb0, const int64_t c_nb1, const int64_t c_nb2,
                                               float * __restrict__ dst, const int dst_nb0, const int dst_nb1, const int dst_nb2,
-                                              const int64_t n_t) {
+                                              const int64_t n_t, void * __restrict__ vq = nullptr, const int ncols_padded = 0) {
+    // k15: vq (nullable): the q8_1 copy of the output for the out_proj mul_mat_vec_q (ggml_cuda_q8_1_cache), rows = tokens; a warp holds
+    // 32 consecutive channels of a token, lane = element of its q8_1 block, the same 32-lane reductions as quantize_q8_1, so the copy is
+    // bit-identical to quantizing the f32 output
     const int tid  = threadIdx.x;
     const int bidx = blockIdx.x;
     const int bidy = blockIdx.y;
@@ -155,7 +224,23 @@ static __global__ void shortconv_conv_mul_f32(const float * __restrict__ src0, c
         }
         sumf += b;
         const float cv = *(const float *) (c_block + i * c_nb1);
-        y_block[i * stride_y + tid] = cv * sumf;
+        const float yv = cv * sumf;
+        y_block[i * stride_y + tid] = yv;
+        if (vq != nullptr) {
+            float amax = fabsf(yv);
+            float sum  = yv;
+            amax = warp_reduce_max<QK8_1>(amax);
+            sum  = warp_reduce_sum<QK8_1>(sum);
+            const float  d = amax / 127.0f;
+            const int8_t q = amax == 0.0f ? 0 : roundf(yv / d);
+            const int64_t ch  = (int64_t) bidy * split_d_inner + tid;
+            block_q8_1 * yq = (block_q8_1 *) vq + ((int64_t) bidx * n_t + i) * (ncols_padded / QK8_1) + ch / QK8_1;
+            const int iqs = ch % QK8_1;
+            yq->qs[iqs] = q;
+            if (iqs == 0) {
+                yq->ds = make_half2(d, sum);
+            }
+        }
     }
 }
 
@@ -206,10 +291,25 @@ int ggml_cuda_try_fuse_shortconv_conv_mul(ggml_backend_cuda_context & ctx, ggml_
             return 0;
         }
     }
+    // k15: the q8_1 copy of the product for the out_proj reader (GGML_CUDA_SHORTCONV_Q8_1=0: off)
+    static const bool q8_on = [] {
+        const char * e = getenv("GGML_CUDA_SHORTCONV_Q8_1");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    void * q8_1_out = nullptr;
+    const int ncols_padded = (int) GGML_PAD(mul->ne[0], MATRIX_ROW_PADDING);
+    ggml_cuda_q8_1_cache & cache = ctx.q8_1_cache;
+    // (rows without padding only: the padding blocks would need zeros the kernel does not write)
+    if (q8_on && cache.active() && ctx.curr_stream_no == 0 && cache.norm_targets.count(mul) && ggml_is_contiguous(mul) && ncols_padded == mul->ne[0] &&
+            mul->nb[0] == sizeof(float)) {
+        int64_t key[ggml_cuda_q8_1_cache::n_key];
+        ggml_cuda_q8_1_cache::key_contiguous(mul->ne[0], ggml_nrows(mul), key);
+        q8_1_out = cache.reserve(mul->data, ggml_nbytes(mul), key, ggml_nrows(mul)*ncols_padded/QK8_1*sizeof(block_q8_1));
+    }
     const dim3 blocks((unsigned) n_s, (unsigned) ((nr + threads - 1)/threads), 1);
     shortconv_conv_mul_f32<threads, 3><<<blocks, threads, 0, ctx.stream()>>>((const float *) src0->data, (const float *) src1->data,
         (const char *) c->data, (int) src0->nb[1], (int) src0->nb[2], (int) src1->nb[1], c->nb[0], c->nb[1], c->nb[2],
-        (float *) mul->data, (int) mul->nb[0], (int) mul->nb[1], (int) mul->nb[2], n_t);
+        (float *) mul->data, (int) mul->nb[0], (int) mul->nb[1], (int) mul->nb[2], n_t, q8_1_out, ncols_padded);
     CUDA_CHECK(cudaGetLastError());
     static bool logged = false;
     if (!logged) {
