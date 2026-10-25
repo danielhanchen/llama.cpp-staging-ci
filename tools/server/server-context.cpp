@@ -1550,6 +1550,20 @@ private:
             }
         }
 
+        // k15-lfm2: LFM2.5 with drafts verified exactly (output unchanged by the window): prompts of 4096+ tokens take a short window of
+        // 2 drafts and the full window from a repeat of 6 (G4 32 / 16 GB, 8k and 16k: +0.6..+8.5% decode; chat and 2k keep 3 / 8, where
+        // the same rule measured -0.3..-0.5%). LLAMA_SPEC_LFM_LONG_WIN=0: off
+        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO && params_base.speculative.ngram_suffix.auto_mode && server_spec_auto_exact() &&
+                llama_verify_exact_placement(ctx_tgt) && server_spec_auto_arch(params_base.model.path) == "lfm2moe") {
+            const char * e = getenv("LLAMA_SPEC_LFM_LONG_WIN");
+            if (e == nullptr || atoi(e) != 0) {
+                auto & ns = params_base.speculative.ngram_suffix;
+                ns.win_long_prompt   = 4096;
+                ns.n_max_short_long  = 2;
+                ns.n_long_match_long = 6;
+            }
+        }
+
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {

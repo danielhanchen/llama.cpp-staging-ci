@@ -393,6 +393,11 @@ struct common_params_speculative_ngram_suffix {
     // k15-spec: prompts of at least long_prompt tokens draft from repeats of at least n_min_match_long tokens (0: n_min_match)
     int32_t long_prompt      = 0;
     int32_t n_min_match_long = 0;
+    // k15-lfm2: prompts of at least win_long_prompt tokens (0: off) take the short window n_max_short_long (from a match under
+    // n_long_match_long; the full window from there): the server sets them where drafts verify exactly (output unchanged)
+    int32_t win_long_prompt   = 0;
+    int32_t n_max_short_long  = 0;
+    int32_t n_long_match_long = 0;
 };
 
 struct common_params_speculative_ngram_map {

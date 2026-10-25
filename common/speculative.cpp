@@ -2448,6 +2448,8 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         common_spec_round_timer timer;   // k11-decode: round times of this sequence (policy_on)
         int64_t n_probe = 0;
         int min_match = 3;               // k15-spec: this request's shortest repeat (n_min_match, n_min_match_long for a long prompt)
+        int n_short   = 3;               // k15-lfm2: this request's short window and full-window match (n_max_short / n_long_match, or
+        int n_long    = 8;               //           n_max_short_long / n_long_match_long for a long prompt)
     };
 
     std::vector<seq_info> sinfos;
@@ -2481,6 +2483,14 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         }
         for (auto & si : sinfos) {
             si.min_match = params.n_min_match;
+            si.n_short   = params.n_max_short;
+            si.n_long    = params.n_long_match;
+        }
+        if (params.win_long_prompt > 0) {
+            params.n_max_short_long  = std::clamp(params.n_max_short_long > 0 ? params.n_max_short_long : params.n_max_short, 1, params.n_max);
+            params.n_long_match_long = std::max(params.n_min_match, params.n_long_match_long > 0 ? params.n_long_match_long : params.n_long_match);
+            SPC_INF("ngram-suffix: prompts of %d+ tokens: window of %d below a match of %d, else %d\n", params.win_long_prompt,
+                    params.n_max_short_long, params.n_long_match_long, params.n_max);
         }
         {
             const char * e = getenv("LLAMA_SPEC_SUFFIX_POLICY");
@@ -2650,7 +2660,7 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
                     si.n_matches, si.n_drafts, si.n_drafted, si.n_accepted, si.n_yield, rate(si, 0), rate(si, 1), rate(si, 2), rate(si, 3));
         }
         if (policy_on && si.n_lookups > 0) {
-            const int ts = std::min(params.n_max_short + 1, common_spec_cost_policy::MAX_T);
+            const int ts = std::min(si.n_short + 1, common_spec_cost_policy::MAX_T);
             const int tl = std::min(params.n_max + 1, common_spec_cost_policy::MAX_T);
             SPC_INF("ngram-suffix seq %d: round ms by window 1 / %d / %d: %.2f (%.0f) / %.2f (%.0f) / %.2f (%.0f), realized gain %.2f (%.0f) / %.2f (%.0f), %"
                     PRId64 " probes\n", seq_id, ts, tl, policy.cost_ms(1), policy.cost_n[1], policy.cost_ms(ts), policy.cost_n[ts], policy.cost_ms(tl),
@@ -2662,6 +2672,11 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         si.timer.reset();
         si.min_match = (params.long_prompt > 0 && params.n_min_match_long > 0 && (int64_t) prompt.size() >= params.long_prompt) ?
                        params.n_min_match_long : params.n_min_match;
+        {
+            const bool lw = params.win_long_prompt > 0 && (int64_t) prompt.size() >= params.win_long_prompt;
+            si.n_short = lw ? params.n_max_short_long  : params.n_max_short;
+            si.n_long  = lw ? params.n_long_match_long : params.n_long_match;
+        }
         if (policy_on && n_seq == 1) {
             policy.reset_gain();
         }
@@ -2700,7 +2715,7 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
             si.n_matches++;
             const int    b   = bucket(match);
             const double q   = rate(si, b);
-            const int    win = match >= params.n_long_match ? cap : std::min(cap, params.n_max_short);
+            const int    win = match >= si.n_long ? cap : std::min(cap, si.n_short);
             // the draft is the whole window (fewer tokens only where the repeat runs out): every verify length is a graph of its own
             // (a change of length rebuilds the target graph, 10-15 ms on G4, plans/mtp_adapt.md), so the lengths stay few
             int k = 0;
@@ -2710,7 +2725,7 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
             } else if (policy_on) {
                 // k11-decode: the window that commits the most tokens per measured ms, or none (common/spec-cost-policy.h)
                 const int k_full = std::min(offered, win);
-                k = policy.choose(k_full, std::min(k_full, params.n_max_short), q);
+                k = policy.choose(k_full, std::min(k_full, si.n_short), q);
                 if (k > 0 && policy.cost_n[std::min(k + 1, common_spec_cost_policy::MAX_T)] < common_spec_cost_policy::PROBES) {
                     si.n_probe++;
                 }
