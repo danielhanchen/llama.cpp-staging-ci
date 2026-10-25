@@ -5429,6 +5429,15 @@ size_t ggml_backend_sched_get_staging_size(ggml_backend_sched_t sched, ggml_back
     return pf->n_bound > 0 ? pf->staging : 0;
 }
 
+size_t ggml_backend_sched_get_staging_split(ggml_backend_sched_t sched, ggml_backend_t backend) {
+    GGML_ASSERT(sched);
+    int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+
+    const struct ggml_backend_sched_prefetch * pf = &sched->pf[backend_index];
+    return pf->n_bound > 0 ? std::min(pf->need, pf->staging) : 0;
+}
+
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
     GGML_ASSERT(sched);
     int backend_index = ggml_backend_sched_backend_id(sched, backend);

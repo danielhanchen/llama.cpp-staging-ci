@@ -2330,6 +2330,28 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto cparams = common_context_params_to_llama(params);
 
     if (params.fit_params) {
+        // k15-fo: with LLAMA_MOE_CACHE_LEND=1 the cache lends the staging copies of large batches from its own slots, so the fit measures
+        // the compute buffers without them (LLAMA_MOE_MEASURE_LENT=1, as common_moe_cache_auto_ubatch does) and the cache gets that memory;
+        // before, the fit kept it free beside the cache and it stayed unused (G4 Qwen3.8-Flash-Next UD-IQ4_XS 32 GB: 1275 MiB, the cache
+        // 19017 MiB either way). LLAMA_MOE_FIT_LEND=0: the old fit. An explicit LLAMA_MOE_MEASURE_LENT wins
+        struct fit_lend_env {
+            bool set = false;
+            ~fit_lend_env() {
+                if (set) {
+                    common_set_env("LLAMA_MOE_MEASURE_LENT", "");
+                }
+            }
+        } fit_lend;
+        {
+            const char * e_lend = getenv("LLAMA_MOE_CACHE_LEND");
+            const char * e_fit  = getenv("LLAMA_MOE_FIT_LEND");
+            if ((params.moe_cache_size > 0 || params.moe_cache_auto) && e_lend != nullptr && atoi(e_lend) == 1 && (e_fit == nullptr || atoi(e_fit) != 0) &&
+                    getenv("LLAMA_MOE_MEASURE_LENT") == nullptr) {
+                common_set_env("LLAMA_MOE_MEASURE_LENT", "1");
+                fit_lend.set = true;
+                COM_INF("%s: LLAMA_MOE_CACHE_LEND=1: the fit leaves the staging copies of large batches to the lent cache slots (LLAMA_MOE_FIT_LEND=0: counted beside the cache)\n", __func__);
+            }
+        }
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 

@@ -1255,9 +1255,16 @@ void llama_context::sched_reserve() {
         // left after the layers (the reserve drops the prefetch when the compute buffers do not fit with it or leave no headroom), so a fit
         // places the same layers as without the prefetch instead of moving one to the host for the staging copies
         // with the MoE cache the staging may live in lent cache slots and the cache sizing accounts for it: the measurement keeps it
+        // k15-fo: but the copies of one split stay counted. Without the arena (dropped when it does not fit) the weights of a split are
+        // copied into the graph allocation instead, so the context needs at least that much: a draft model with its experts on the host
+        // (--spec-draft-cpu-moe, Qwen3.8-Flash-Next MTP Q8_0 at 32 GB) was measured at 199 MiB of compute, got 982 MiB once loaded and
+        // ran out of memory at its first draft (LLAMA_FIT_STAGING_SPLIT=0: the whole arena left out, as before)
         if (model.hparams.no_alloc && !moe_cache) {
+            static const bool keep_split = getenv("LLAMA_FIT_STAGING_SPLIT") == nullptr || atoi(getenv("LLAMA_FIT_STAGING_SPLIT")) != 0;
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-                backend_buf_exp_size[i] -= std::min(backend_buf_exp_size[i], ggml_backend_sched_get_staging_size(sched.get(), backend_ptrs[i]));
+                const size_t staging = ggml_backend_sched_get_staging_size(sched.get(), backend_ptrs[i]);
+                const size_t split   = keep_split ? ggml_backend_sched_get_staging_split(sched.get(), backend_ptrs[i]) : 0;
+                backend_buf_exp_size[i] -= std::min(backend_buf_exp_size[i], staging - std::min(staging, split));
             }
         }
 
@@ -1348,7 +1355,7 @@ void llama_context::sched_reserve() {
             LLAMA_LOG_DEBUG("%s: measure: staging copies %.2f MiB, the cache lends from %.2f MiB: %s\n", __func__, staging/1024.0/1024.0,
                 min_bytes/1024.0/1024.0, measure_lent ? "lent" : "counted");
         }
-        if (measure_lent != 0) {
+        if (measure_lent != 0 && moe_cache) {
             std::vector<size_t> graph_sz(backend_ptrs.size());
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
                 graph_sz[i] = backend_buf_exp_size[i] - std::min(backend_buf_exp_size[i], staging_pp[i]);
