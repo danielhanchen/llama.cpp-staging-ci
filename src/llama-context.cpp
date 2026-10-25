@@ -3851,6 +3851,10 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     moe_cache_seed_prev = false;
     moe_cache_record    = false;
     moe_cache_devseed   = false;
+    moe_inplace_ok      = false; // k15-lfm2: layer-major prompts keep their staging copies
+    if (moe_cache) {
+        moe_cache->prompt_ubatch(false);
+    }
 
     // the arena is pinned only when it is made at load (LLAMA_MOE_LAYER_MAJOR_EAGER=1): made by a prompt, pinning it cost that prompt
     // 2.6% (2k) / 3.5% (8k) on G4 (Qwen3.6-35B-A3B UD-Q4_K_XL + MTP, 8 GB, fresh process per prompt), while the inputs it holds (mostly
@@ -6141,9 +6145,11 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
             }
         }
     }
-    // k15-lfm2: a ubatch that seeds the cache keeps the staging copies (the seed reads them), the others may read in place
-    moe_inplace_ok = !(moe_cache_seed || moe_cache_seed_prev || moe_cache_devseed);
-    moe_cache->prompt_ubatch(moe_inplace_ok);
+    // k15-lfm2: a ubatch that seeds the cache from its own routing keeps the staging copies (the seed reads them), the others may read in
+    // place; one that seeds from the routing of an earlier ubatch plans its seeds before the graph (see prompt_seed_plan)
+    moe_inplace_ok = !(moe_cache_seed || moe_cache_devseed || (moe_cache_seed_prev && lm_seed_active));
+    moe_cache->prompt_ubatch(moe_inplace_ok, moe_cache_seed_prev);
+    moe_inplace_ok = moe_cache->prompt_ubatch_on();
 }
 
 bool llama_context::moe_prompt_copy(ggml_backend_t backend, ggml_tensor * dst, ggml_cgraph * graph, int32_t il) {
