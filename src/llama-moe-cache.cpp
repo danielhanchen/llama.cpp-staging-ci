@@ -3540,6 +3540,17 @@ struct llama_moe_cache::impl {
         if (ua_log > 2) {
             for (const group & g : groups) {
                 const int64_t n_mapped = std::count_if(g.lru.key_of.begin(), g.lru.key_of.end(), [](int32_t k) { return k >= 0; });
+                {
+                    std::string per;
+                    for (int32_t il : g.layers) {
+                        int c = 0;
+                        for (int32_t e = 0; e < g.lru.n_expert; ++e) {
+                            c += g.lru.slot_map[il][e] >= 0;
+                        }
+                        per += " " + std::to_string(c);
+                    }
+                    LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead: mapped per layer:%s\n", tag, per.c_str());
+                }
                 LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead: group of %zu layers: %" PRId64 " of %d slots mapped, %d lent, dev_newer %d, %" PRIu64 " reads blocked; copied from the cache %.1f MiB, lends %d (max %d); lookups %llu newer %llu nomap %llu miss %llu hit %llu\n", tag,
                     g.layers.size(), n_mapped, g.n_slots, g.lru.n_lent, (int) g.dev_newer, ua_st_ub.blocked, (stats_copy.bytes - ua_copy_last)/1048576.0, (int) n_lends, (int) lend_max,
                     (unsigned long long) ua_dbg[0], (unsigned long long) ua_dbg[1], (unsigned long long) ua_dbg[2], (unsigned long long) ua_dbg[3], (unsigned long long) ua_dbg[4]);
