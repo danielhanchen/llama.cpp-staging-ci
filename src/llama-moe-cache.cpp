@@ -3172,6 +3172,8 @@ struct llama_moe_cache::impl {
     std::vector<uint8_t> ua_prot;  // [expert] within the top k + ua_protect of some token: never a victim of its own layer
     int ua_protect = 4;
     std::vector<uint8_t> ua_busy;
+    std::vector<int32_t> ua_donate;
+    float ua_floor = 0.9f;
     std::vector<std::pair<int64_t, int32_t>> ua_cand;
     int  ua_victims = 3;
     bool ua_verify  = false;
@@ -3203,6 +3205,8 @@ struct llama_moe_cache::impl {
         ua_victims = env_v != nullptr ? atoi(env_v) : 3;
         const char * env_p = getenv("LLAMA_MOE_UPLOAD_AHEAD_PROTECT");
         ua_protect = env_p != nullptr ? std::max(0, atoi(env_p)) : 4;
+        const char * env_f = getenv("LLAMA_MOE_UPLOAD_AHEAD_FLOOR");
+        ua_floor = env_f != nullptr ? (float) atof(env_f) : 0.9f;
         ua_verify  = getenv("LLAMA_MOE_UPLOAD_AHEAD_VERIFY") != nullptr && atoi(getenv("LLAMA_MOE_UPLOAD_AHEAD_VERIFY")) != 0;
         ua_gating = (int) model.hparams.expert_gating_func;
         ua_router.assign(layers.size(), nullptr);
@@ -3913,8 +3917,39 @@ struct llama_moe_cache::impl {
         if (cand.empty()) {
             return;
         }
+        // another layer gives slots only down to LLAMA_MOE_UPLOAD_AHEAD_FLOOR (0.9) of its share: without the floor the later layers of a
+        // ubatch took every slot of the first ones (0 of 99 left in layers 0-4 after a 184-token ubatch), and the large ubatch after it
+        // re-seeded those layers by evicting the experts it was about to copy (uploads 17.1 instead of 11.4 GB)
+        {
+            const int32_t share = std::max<int32_t>(1, g.n_slots / (int32_t) std::max<size_t>(1, g.layers.size()));
+            const int32_t floor_n = (int32_t) std::ceil(ua_floor*(float) share);
+            ua_donate.assign(layers.size(), 0);
+            for (int32_t q : g.layers) {
+                int32_t c = 0;
+                for (int32_t e = 0; e < n_expert; ++e) {
+                    c += g.lru.slot_map[q][e] >= 0;
+                }
+                ua_donate[q] = std::max(0, c - floor_n);
+            }
+            std::sort(cand.begin(), cand.end());
+            size_t o = 0;
+            for (size_t i = 0; i < cand.size() && o < want.size(); ++i) {
+                const int32_t key = g.lru.key_of[cand[i].second];
+                const int32_t q = key >= 0 ? key / n_expert : -1;
+                if (q >= 0 && q != j) {
+                    if (ua_donate[q] <= 0) {
+                        continue;
+                    }
+                    ua_donate[q]--;
+                }
+                cand[o++] = cand[i];
+            }
+            cand.resize(o);
+        }
+        if (cand.empty()) {
+            return;
+        }
         const size_t n = std::min(want.size(), cand.size());
-        std::nth_element(cand.begin(), cand.begin() + (n - 1), cand.end());
         cand.resize(n);
         std::sort(cand.begin(), cand.end(), [](const auto & a, const auto & c) { return a.second < c.second; });
         want.resize(n);
