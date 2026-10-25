@@ -1797,6 +1797,19 @@ float * llama_context::get_embeddings_nextn() {
     return embd_nextn.data;
 }
 
+int64_t llama_context::nextn_rows_wait(int64_t n) {
+    // only rows of a single-sequence order (no output swaps to apply) and only rows the event covers
+    if (n <= 0 || n > rows_ev_n || !rows_ev || !output_swaps.empty() || !embd_nextn.data) {
+        return 0;
+    }
+    ggml_backend_event_synchronize(rows_ev.get());
+    return rows_ev_n;
+}
+
+float * llama_context::nextn_rows_early() {
+    return output_swaps.empty() ? embd_nextn.data : nullptr;
+}
+
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     output_reorder();
 
@@ -3292,6 +3305,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
+    rows_ev_n = 0; // k15-pp3: no early nextn rows from this decode yet
 
     for (bool more = true; more; ) {
         // k15-pp: the state before the ubatch that starts at the capture index (a layer-major group captures inside its graph)
@@ -5023,6 +5037,29 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     }
 
     extract_upto(group.size()); // (none left: each graph extracts its members)
+
+    // k15-pp3: the group's nextn rows are queued for the host; with ubatches still to come in this decode, an event after them lets an
+    // MTP drafter read rows [0, n_tokens_prev) before the decode is done (llama_nextn_rows_wait)
+    {
+        static const bool rows_env = getenv("LLAMA_MTP_PROMPT_OVERLAP") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_OVERLAP")) != 0;
+        auto * t_h = cparams.embeddings_nextn ? group.back().res->get_h_nextn() : nullptr;
+        ggml_backend_t be_h = t_h ? ggml_backend_sched_get_tensor_backend(sched.get(), t_h) : nullptr;
+        if (rows_env && more && be_h && embd_nextn.data && !cparams.embeddings_nextn_masked && !mtp_dev_h_this &&
+                cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(be_h);
+            if (rows_ev && rows_ev_dev != dev) {
+                rows_ev.reset();
+            }
+            if (!rows_ev && dev) {
+                rows_ev.reset(ggml_backend_event_new(dev));
+                rows_ev_dev = dev;
+            }
+            if (rows_ev) {
+                ggml_backend_event_record(rows_ev.get(), be_h);
+                rows_ev_n = n_tokens_prev;
+            }
+        }
+    }
 
     // the next graph is built anew
     gf_res_prev_active = nullptr; gf_res_epoch++;
@@ -8616,6 +8653,14 @@ float * llama_get_embeddings_nextn(llama_context * ctx) {
     ctx->synchronize_outputs();
 
     return ctx->get_embeddings_nextn();
+}
+
+int64_t llama_nextn_rows_wait(llama_context * ctx, int64_t n_rows) {
+    return ctx->nextn_rows_wait(n_rows);
+}
+
+float * llama_get_embeddings_nextn_early(llama_context * ctx) {
+    return ctx->nextn_rows_early();
 }
 
 float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {

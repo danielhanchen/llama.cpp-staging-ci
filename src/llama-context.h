@@ -138,6 +138,9 @@ struct llama_context {
 
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
+    // k15-pp3: the nextn rows [0, n) of the last decode on the host before the decode is done (see rows_ev)
+    int64_t nextn_rows_wait(int64_t n);
+    float * nextn_rows_early();
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
@@ -698,6 +701,11 @@ private:
     ggml_backend_buffer_ptr lm_async_buf;
     size_t lm_async_used = 0;
     int    lm_async_nev  = 0;
+    // k15-pp3 (LLAMA_MTP_PROMPT_OVERLAP=0 off): when more ubatches follow a layer-major group in the same decode, an event after the
+    // copies of the group's nextn rows to the host: an MTP drafter reads rows [0, rows_ev_n) while the rest of the decode computes
+    ggml_backend_event_ptr rows_ev;
+    ggml_backend_dev_t     rows_ev_dev = nullptr;
+    int64_t                rows_ev_n   = 0;
     const ggml_cgraph * lm_copy_graph = nullptr; // the split graph of the last expert copy, lm_copy_seq counts its changes
     int64_t lm_copy_seq = 0;
     std::unordered_map<const ggml_tensor *, int64_t> lm_staged_seq; // expert tensor -> lm_copy_seq of its copy

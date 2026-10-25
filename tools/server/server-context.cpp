@@ -4739,7 +4739,11 @@ private:
             lm_caps.erase(std::remove_if(lm_caps.begin(), lm_caps.end(), [&](const lm_cap_req_t & c) {
                 return c.batch > off && c.batch < off + batch.view.size(); }), lm_caps.end());
         };
-        const bool sync_after = lm_cap_req && cap_early;   // the checkpoint (slot state) is made on this thread, outside the yield
+        // k15-pp3 (LLAMA_MTP_PROMPT_OVERLAP=0 off): see below
+        static const bool overlap_env = getenv("LLAMA_MTP_PROMPT_OVERLAP") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_OVERLAP")) != 0;
+        const bool spec_overlap = overlap_env && spec && has_output && !seg_breaks.empty() && common_speculative_rows_early_ok(spec.get());
+        // the checkpoint (slot state) is made on this thread, outside the yield; with the overlap, the drafter's early segments too
+        const bool sync_after = (lm_cap_req && cap_early) || spec_overlap;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output && !sync_after) {
@@ -4749,8 +4753,42 @@ private:
         if (lm_cap_req) {
             cap_checkpoint();
         }
+        // k15-pp3 (LLAMA_MTP_PROMPT_OVERLAP=0 off): the drafter's own pass over the segments whose target rows are already on the host
+        // (a layer-major group followed by more ubatches in this decode, e.g. [1532] [512] then the [4] before the near checkpoint) runs
+        // while the target still computes the rest, instead of after the target's wait. Same segments, same rows, same order: the
+        // drafter's KV and outputs are those of the separate pass
+        int32_t spec_seg_done = 0; // segments of seg_breaks the drafter has processed
+        int32_t spec_seg_a    = 0; // where the next segment starts
+        bool    spec_early_ok = true;
+        {
+            if (spec_overlap && ret == 0) {
+                const int64_t t_ov0 = common_mtp_handoff_trace() ? ggml_time_us() : 0;
+                queue_tasks.yield_to_queue([&]() {
+                    // a segment [a, b) reads the target rows [a, b) (its first token pairs with the pending row of the one before)
+                    for (; spec_seg_done < (int32_t) seg_breaks.size() && spec_early_ok; ++spec_seg_done) {
+                        const int32_t b = seg_breaks[spec_seg_done];
+                        if (llama_nextn_rows_wait(ctx_tgt, b) < b) {
+                            break;
+                        }
+                        common_batch seg;
+                        seg.n_pos = batch.view.n_pos;
+                        seg.tokens.assign(batch.view.tokens.begin() + spec_seg_a, batch.view.tokens.begin() + b);
+                        spec_early_ok = common_speculative_process_rows_early(spec.get(), seg, spec_seg_a);
+                        spec_seg_a = b;
+                    }
+                });
+                if (t_ov0) {
+                    SRV_INF("mtp_trace prompt overlap: %d of %zu segments (%d rows) before the target's wait, %.2f ms\n", spec_seg_done,
+                            seg_breaks.size() + 1, spec_seg_a, (ggml_time_us() - t_ov0)/1e3);
+                }
+            }
+        }
         if (sync_after && ret == 0 && has_output) {
+            const int64_t t_w0 = common_mtp_handoff_trace() && spec_overlap ? ggml_time_us() : 0;
             llama_synchronize(ctx_tgt);
+            if (t_w0) {
+                SRV_INF("mtp_trace target wait after the overlap %.2f ms\n", (ggml_time_us() - t_w0)/1e3);
+            }
         }
 
         if (ret != 0) {
@@ -4810,14 +4848,18 @@ private:
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
-            bool ok = true;
+            bool ok = spec_early_ok;
             queue_tasks.yield_to_queue([&]() {
+                if (!ok) {
+                    return;
+                }
                 if (seg_breaks.empty()) {
                     ok = common_speculative_process(spec.get(), batch.view);
                 } else {
-                    // the segments one at a time, as the separate batches would have been (the draft keeps its own batches)
-                    int32_t a = 0;
-                    for (size_t k = 0; k <= seg_breaks.size() && ok; ++k) {
+                    // the segments one at a time, as the separate batches would have been (the draft keeps its own batches);
+                    // k15-pp3: from the first one the overlap above did not process
+                    int32_t a = spec_seg_a;
+                    for (size_t k = spec_seg_done; k <= seg_breaks.size() && ok; ++k) {
                         const int32_t b = k < seg_breaks.size() ? seg_breaks[k] : batch.view.size();
                         common_batch seg;
                         seg.n_pos = batch.view.n_pos;
