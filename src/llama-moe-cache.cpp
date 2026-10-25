@@ -535,6 +535,7 @@ struct llama_moe_cache::impl {
         int lend_auto = -1; // automatic lending (LLAMA_MOE_CACHE_LEND unset): -1 not decided yet, 0 off, 1 on
         size_t dry_need = 0; // the largest staging need a measurement (dry lend) asked for, see lend_need_max
         size_t dry_save = 0; // k15-fn: the staging copies a measurement found the device would lend (lend_saves), see lend_save_need
+        bool lend_saving = false; // k15-fn: lending is on for the memory it frees (lend_saves), see unlend
         size_t mem_reserve = 0; // device memory kept free for a later model or context (set_mem_reserve), not free for lend_decide
     };
 
@@ -683,6 +684,7 @@ struct llama_moe_cache::impl {
     double lend_min_frac = 0.08; // LLAMA_MOE_CACHE_LEND_MIN_FRAC: that share
     bool   lend_save     = false; // k15-fn LLAMA_MOE_CACHE_LEND_SAVE=1 (opt-in): also lend where it frees lend_save_min bytes, see lend_saves
     size_t lend_save_min = 256ull*1024*1024; // LLAMA_MOE_CACHE_LEND_SAVE_MIB
+    bool   lend_save_refill = false; // LLAMA_MOE_CACHE_LEND_SAVE_REFILL=1: slots lent for lend_saves are refilled when they come back, see unlend
     bool   lend_multi   = false; // LLAMA_MOE_CACHE_LEND_MULTI=1: also with the cache on several devices (not validated)
     bool   lend_off_log = false;
     size_t n_lends      = 0; // graphs whose staging copies used lent slots
@@ -1063,6 +1065,8 @@ struct llama_moe_cache::impl {
             // (TTFT 935 -> 986 ms), 8k -2..-3.5%; Qwen3.6 UD-Q4_K_XL 12 / 16 GB, Flash-Next 16 GB and LFM2.5 16 GB unchanged
             env = getenv("LLAMA_MOE_CACHE_LEND_SAVE");
             lend_save = env != nullptr && atoi(env) != 0;
+            env = getenv("LLAMA_MOE_CACHE_LEND_SAVE_REFILL");
+            lend_save_refill = env != nullptr && atoi(env) != 0;
             env = getenv("LLAMA_MOE_CACHE_LEND_SAVE_MIB");
             if (env != nullptr) {
                 lend_save_min = (size_t) std::max(0ll, atoll(env))*1024*1024;
@@ -5258,6 +5262,7 @@ struct llama_moe_cache::impl {
             }
         }
         d.lend_auto = on || !fit ? 1 : 0;
+        d.lend_saving = saves;
         if (saves) {
             LLAMA_LOG_INFO("%s: %s: MoE cache lending on: the staging copies of large batches (%.2f MiB, %.1f%% of the cache) free %.2f MiB beside the "
                 "copies of a seeding prompt (%.2f MiB), at least %.2f MiB (LLAMA_MOE_CACHE_LEND_SAVE=1, LLAMA_MOE_CACHE_LEND_SAVE_MIB)\n",
@@ -5429,6 +5434,18 @@ struct llama_moe_cache::impl {
             }
         }
 
+        // k15-fn: slots lent for the memory lending frees (lend_saves) come back empty: decode misses fill them as they are needed. The
+        // refill uploaded every expert they held before the prompt (G4 Qwen3.8-Flash-Next UD-IQ4_XS + MTP at 32 GB: 994 slots, 2208 MiB,
+        // after every 2k prompt, in its last ubatch: 2441 -> 2313 tok/s); the outputs do not depend on what the cache holds.
+        // LLAMA_MOE_CACHE_LEND_SAVE_REFILL=1 refills them
+        if (devices[g.id].lend_saving && !lend_save_refill) {
+            for (int32_t il : g.layers) {
+                if ((size_t) il < refill.size()) {
+                    refill[il].clear();
+                }
+            }
+            return;
+        }
         if (refill.empty() || g.dev_newer) {
             return;
         }
