@@ -8119,6 +8119,23 @@ bool llama_context::layer_major_on() const {
     return lm_enabled && moe_cache != nullptr;
 }
 
+// a batch of n_before + n_after prompt tokens of one sequence, from the start of the batch, with a ubatch break after n_before: the first
+// ubatch after the break runs in the layer-major group of the one before it (decode_layer_major: every member eligible, at most lm_ub_max
+// per group). Otherwise the merge only drops the seed the separate batches made between them: a ubatch before the break that is too short
+// for a group (Qwen3.6 q4x 12 GB, -ub 512: a 640-token prompt runs [124] [512] [4]) or a group that ends at the break
+bool llama_context::layer_major_spans(int64_t n_before, int64_t n_after) const {
+    if (!layer_major_on() || lm_refused_min <= 2 || n_before <= 0 || n_after <= 0) {
+        return false;
+    }
+    const int64_t nu = cparams.n_ubatch;
+    auto eligible = [&](int64_t n) { return n > llama_moe_cache::n_small_max && n >= prefetch_min_batch; };
+    const int64_t r = n_before % nu;
+    if ((r != 0 && !eligible(r)) || !eligible(std::min(nu, n_after))) {
+        return false;
+    }
+    return ((n_before + nu - 1)/nu) % lm_ub_max != 0;
+}
+
 void llama_state_seq_async_wait(llama_context * ctx) {
     ctx->state_async_wait();
 }
@@ -8137,6 +8154,10 @@ bool llama_state_seq_captured(const llama_context * ctx, llama_seq_id seq_id, ll
 
 bool llama_layer_major_on(const llama_context * ctx) {
     return ctx->layer_major_on();
+}
+
+bool llama_layer_major_spans(const llama_context * ctx, int32_t n_before, int32_t n_after) {
+    return ctx->layer_major_spans(n_before, n_after);
 }
 
 bool llama_exact_verify_enabled(void) {
