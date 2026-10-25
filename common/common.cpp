@@ -1410,6 +1410,8 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     }
     const char * env_lm = getenv("LLAMA_MOE_LAYER_MAJOR");
     const int    lm     = env_lm == nullptr || strcmp(env_lm, "auto") == 0 ? -1 : (atoi(env_lm) != 0 ? 1 : 0);
+    // k15-small4: layer-major prompts without a draft (LLAMA_MOE_LAYER_MAJOR_NODRAFT=0 keeps the prompt ubatch by ubatch)
+    static const bool nd_on = getenv("LLAMA_MOE_LAYER_MAJOR_NODRAFT") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_NODRAFT")) != 0;
     if (params.n_ubatch_set) {
         // k9-prompt-pass: an explicit -ub without -b (Unsloth Studio passes --ubatch-size 2048 for a vision projector) kept n_batch at its
         // default 2048, so a batch held one ubatch, layer-major never engaged and a long prompt copied every spilled expert once per
@@ -1418,7 +1420,7 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         // LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB=0 keeps n_batch. Not on unified memory under Windows (params.moe_uma_keep_batch) unless
         // LLAMA_MOE_LAYER_MAJOR=1: groups of large ubatches were slower there than one ubatch per graph (see common_init_result)
         static const bool env_x = getenv("LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB")) != 0;
-        if (!env_x || lm == 0 || params.n_batch_set || (params.moe_uma_keep_batch && lm != 1) || !(lm == 1 || common_spec_draft_model(params)) ||
+        if (!env_x || lm == 0 || params.n_batch_set || (params.moe_uma_keep_batch && lm != 1) || !(lm == 1 || common_spec_draft_model(params) || nd_on) ||
                 !common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
             return;
         }
@@ -1441,6 +1443,11 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             params.n_batch_ckpt = (int32_t) cparams.n_batch;
             params.n_batch  = (int32_t) want;
             cparams.n_batch = (uint32_t) want;
+            // k15-small4: without a draft the context turns layer-major on only with this mark (as the n_ubatch-default branch below sets it;
+            // an explicit -ub, e.g. Studio's --ubatch-size 2048, never reached that branch)
+            if (lm != 1 && !common_spec_draft_model(params)) {
+                common_set_env("LLAMA_MOE_LAYER_MAJOR_AUTO_NODRAFT", "1");
+            }
             // a merged graph of k ubatches keeps what crosses its cuts for every member; at a large ubatch that is more than the fit leaves
             // free (G4, Flash-Next UD-IQ4_XS 32 GB + Q8_0 MTP drafter, -ub 2048: 4 ubatches needed 755 MiB, 744 MiB were free, so the group
             // ran as 2 + 2 and read the experts twice). With LLAMA_MOE_LAYER_MAJOR_RESERVE_FRAC (default 0.025 when the server checkpoint is
@@ -1514,7 +1521,6 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         // placement keeps it for good): every ubatch otherwise uploads the experts the cache misses again. T4 4 GB, Qwen3.6-35B-A3B
         // UD-Q4_K_XL, no MTP: 2k / 8k prompt 163 / 167 tok/s ubatch by ubatch against 590 / 911 in layer-major groups (the same ubatches,
         // layer by layer). LLAMA_MOE_LAYER_MAJOR_NODRAFT=0 keeps the prompt ubatch by ubatch
-        static const bool nd_on = getenv("LLAMA_MOE_LAYER_MAJOR_NODRAFT") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_NODRAFT")) != 0;
         if (nd_on) {
             set_batch();
             common_set_env("LLAMA_MOE_LAYER_MAJOR_AUTO_NODRAFT", "1");
