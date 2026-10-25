@@ -2374,6 +2374,7 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         int64_t n_lookups = 0, n_matches = 0, n_drafts = 0, n_drafted = 0, n_accepted = 0, n_yield = 0;
         common_spec_round_timer timer;   // k11-decode: round times of this sequence (policy_on)
         int64_t n_probe = 0;
+        int min_match = 3;               // k15-spec: this request's shortest repeat (n_min_match, n_min_match_long for a long prompt)
     };
 
     std::vector<seq_info> sinfos;
@@ -2402,6 +2403,12 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         params.n_max_short  = std::min(params.n_max_short, params.n_max);
         this->n_max = params.n_max;
         sinfos.resize(n_seq);
+        if (params.n_min_match_long > 0) {
+            params.n_min_match_long = std::max(3, params.n_min_match_long);
+        }
+        for (auto & si : sinfos) {
+            si.min_match = params.n_min_match;
+        }
         {
             const char * e = getenv("LLAMA_SPEC_SUFFIX_POLICY");
             policy_on = !with_model && (e != nullptr ? atoi(e) != 0 : params.auto_mode);
@@ -2410,6 +2417,9 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         if (policy_on) {
             SPC_INF("ngram-suffix: cost-priced windows of %d / %d drafts (margin %.2f)%s; LLAMA_SPEC_SUFFIX_POLICY=0 for the fixed gate\n",
                     params.n_max_short, params.n_max, policy.margin, params.auto_mode ? ", on by default (LLAMA_SPEC_AUTO=0: off)" : "");
+        }
+        if (params.long_prompt > 0 && params.n_min_match_long > 0 && params.n_min_match_long != params.n_min_match) {
+            SPC_INF("ngram-suffix: prompts of %d+ tokens draft from repeats of at least %d tokens\n", params.long_prompt, params.n_min_match_long);
         }
         SPC_INF("ngram-suffix: min match %d (%d to draft alone), n_max %d (%d below a match of %d), p_cut %.2f, %s %.2f\n", params.n_min_match,
                 params.n_min_draft, params.n_max, params.n_max_short, params.n_long_match, params.p_cut,
@@ -2542,7 +2552,7 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
                         best_end = p;
                     }
                 }
-                if (best_len >= params.n_min_match) {
+                if (best_len >= si.min_match) {
                     match = best_len;
                     // the continuation may run into the current suffix (periodic text): reading up to cur is valid
                     for (size_t q = best_end + 1; q <= cur && k < max_k; ++q) {
@@ -2577,6 +2587,8 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         si.n_probe = 0;
         si.k_last = 0;
         si.timer.reset();
+        si.min_match = (params.long_prompt > 0 && params.n_min_match_long > 0 && (int64_t) prompt.size() >= params.long_prompt) ?
+                       params.n_min_match_long : params.n_min_match;
         if (policy_on && n_seq == 1) {
             policy.reset_gain();
         }

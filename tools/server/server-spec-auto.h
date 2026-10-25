@@ -47,6 +47,42 @@ static int server_spec_spill_min_match(int32_t host_mode) {
     return std::max(3, e != nullptr ? atoi(e) : host_mode == 1 ? SPEC_SPILL_MIN_MATCH_GATE : SPEC_SPILL_MIN_MATCH_CM);
 }
 
+// k15-spec: the shortest repeat the default spill drafts take on a long prompt (LLAMA_SPEC_SPILL_LONG_PROMPT tokens, default 4096). A long
+// prompt (a document, code to edit) is copied in long runs, where a repeat of a few tokens already predicts the next ones; the cost
+// policy still prices each window. host_mode 1 (the hybrid gate, G4 LFM2.5 4 GB) only: the CPU-miss rule's mode 3 (8 GB) already takes
+// every match; chat prompts keep server_spec_spill_min_match (16). Changes text, KLD-gated (plans/k15_models.md, G4 k15spec kld4:
+// short192 + long48 inside the calibrated band, = the 16+ default) and timed (G4 4 GB 8k 122-124 -> 164-166 tok/s, chat unchanged).
+// LLAMA_SPEC_SPILL_MIN_MATCH_LONG=16: off.
+#ifndef SPEC_SPILL_MIN_MATCH_LONG_GATE
+#define SPEC_SPILL_MIN_MATCH_LONG_GATE 4
+#endif
+static int server_spec_spill_long_prompt() {
+    const char * e = getenv("LLAMA_SPEC_SPILL_LONG_PROMPT");
+    return std::max(1, e != nullptr ? atoi(e) : 4096);
+}
+
+// k15-spec: with the CPU-miss rule (mode 3, G4 LFM2.5 8 GB) a long prompt takes no drafts: their verify windows read host-spilled experts
+// (4 rows 13.4 ms, 8 rows 33 ms against a 4.5 ms plain round), and the pinned host path alone is what wins (G4 8 GB 8k: pinned without
+// drafts 221.3 tok/s, with drafts 196.1, mode 0 206.0; chat 170.7 / 170.0). A repeat no longer than the longest match (64) never drafts.
+// The text is that of the pinned path without drafts (KLD-gated, plans/k15_models.md). LLAMA_SPEC_SPILL_LONG_CM=3: drafts from 3+ (as before)
+#ifndef SPEC_SPILL_MIN_MATCH_LONG_CM
+#define SPEC_SPILL_MIN_MATCH_LONG_CM 65
+#endif
+static int server_spec_spill_min_match_long(int32_t host_mode, int min_match) {
+    const char * e = getenv("LLAMA_SPEC_SPILL_MIN_MATCH_LONG");
+    if (e != nullptr) {
+        return std::max(3, atoi(e));
+    }
+    if (getenv("LLAMA_SPEC_SPILL_MIN_MATCH") != nullptr) {
+        return min_match;
+    }
+    if (host_mode == 1) {
+        return SPEC_SPILL_MIN_MATCH_LONG_GATE;
+    }
+    const char * c = getenv("LLAMA_SPEC_SPILL_LONG_CM");
+    return c != nullptr ? std::max(3, atoi(c)) : SPEC_SPILL_MIN_MATCH_LONG_CM;
+}
+
 static int server_spec_auto_env() {
     const char * e = getenv("LLAMA_SPEC_AUTO");
     return e != nullptr ? atoi(e) : 1;
