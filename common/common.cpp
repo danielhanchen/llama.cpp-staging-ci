@@ -2412,8 +2412,15 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             }
         }
 
+        // k15-small4: the inputs of the fit, for the MTP drafter trial below
+        const llama_model_params   mparams_in = mparams;
+        const llama_context_params cparams_in = cparams;
+        const std::vector<float>   ts_in(params.tensor_split, params.tensor_split + 128);
+        const std::vector<llama_model_tensor_buft_override> tbo_in = params.tensor_buft_overrides;
+        const std::vector<size_t>  margins_in = params.fit_params_target;
+
         common_fit_set_moe_margin_auto(!params.fit_params_target_set);
-        const common_params_fit_status fit_status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
+        common_params_fit_status fit_status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
@@ -2421,7 +2428,56 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             (has_draft || spec_mtp) && !draft_off ? &extra : nullptr,
             fit_log_level,
             params.fit_kv_resident);
-        moe_margin_gain = fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS ? common_fit_moe_margin_gain() : 0;
+
+        // k15-small4: an MTP drafter (the target's own NextN layers, no -md) that costs whole layers on a small device is dropped, as a
+        // draft model that does not fit is (fit_can_drop). Its context (KV, compute buffer at the draft ubatch), the NextN weights and the
+        // recurrent rollback state (n_rs_seq) are fitted with the target; where they push layers to the CPU, every token runs those layers
+        // (attention, recurrent state) on the CPU: T4 4 GB, Qwen3.6-35B-A3B UD-Q4_K_XL + MTP kept 22 of 42 layers on the device (decode
+        // 4-5 tok/s), without the drafter every layer and a 476 MiB MoE cache. Only when the fit with the drafter moved layers off the
+        // device is the fit run again without it; the drafter goes if that one keeps every layer on the device.
+        // LLAMA_FIT_MTP_DROP=0: keep the drafter and the layer placement
+        const char * env_mtp_drop = getenv("LLAMA_FIT_MTP_DROP");
+        const int64_t moe_gain_first = common_fit_moe_margin_gain();
+        bool moe_gain_mtp_trial = false;
+        if (spec_mtp && !has_draft && !draft_off && params.speculative.draft.fit_can_drop && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS &&
+                mparams.n_gpu_layers != llama_model_default_params().n_gpu_layers && mparams_in.n_gpu_layers == llama_model_default_params().n_gpu_layers &&
+                (env_mtp_drop == nullptr || atoi(env_mtp_drop) != 0)) {
+            llama_model_params   mp = mparams_in;
+            llama_context_params cp = cparams_in;
+            std::vector<float>   ts = ts_in;
+            std::vector<llama_model_tensor_buft_override> tbo = tbo_in;
+            std::vector<size_t>  mg = margins_in;
+            mp.tensor_split = ts.data();
+            if (mparams_in.tensor_buft_overrides == params.tensor_buft_overrides.data()) {
+                mp.tensor_buft_overrides = tbo.data();
+            }
+            mp.load_mtp = params.load_mtp;
+            cp.n_rs_seq = 0;
+            common_fit_set_moe_margin_auto(!params.fit_params_target_set);
+            const common_params_fit_status st2 = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(), tbo.empty() ? nullptr : tbo.data(),
+                mg.data(), params.fit_params_min_ctx, nullptr, fit_log_level, params.fit_kv_resident);
+            if (st2 == COMMON_PARAMS_FIT_STATUS_SUCCESS && mp.n_gpu_layers == llama_model_default_params().n_gpu_layers) {
+                COM_WRN("%s: --fit: the MTP drafter would move layers to the CPU (%d layers on the device with it, all without it): "
+                    "speculative decoding is off (LLAMA_FIT_MTP_DROP=0 keeps it)\n", __func__, mparams.n_gpu_layers);
+                std::copy(ts.begin(), ts.end(), params.tensor_split);
+                std::copy(tbo.begin(), tbo.end(), params.tensor_buft_overrides.begin());
+                params.fit_params_target = mg;
+                const bool tbo_ours = mp.tensor_buft_overrides != nullptr && mp.tensor_buft_overrides == tbo.data();
+                mparams = mp;
+                cparams = cp;
+                mparams.tensor_split = params.tensor_split;
+                if (tbo_ours) {   // the fit points the overrides at the buffer it wrote: the copy now lives in params
+                    mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
+                }
+                fit_status = st2;
+                params.speculative.draft.fit_off = true;
+            } else {
+                COM_INF("%s: --fit: the MTP drafter stays (without it the fit does not keep every layer on the device either)\n", __func__);
+                // the fit with the drafter stands: its outputs were not touched (the trial ran on copies), only its margin gain is the trial's
+                moe_gain_mtp_trial = true;
+            }
+        }
+        moe_margin_gain = fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS ? (moe_gain_mtp_trial ? moe_gain_first : common_fit_moe_margin_gain()) : 0;
 
         // --moe-cache-mib auto that the fit did not size (a failed or skipped fit, no host experts on a device) is no cache, as with
         // the release: the unbounded request must never reach the context
