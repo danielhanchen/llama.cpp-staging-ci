@@ -4335,14 +4335,38 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         // k10) and 287 instead of 325 tok/s decode, prompt 4815 instead of 5014 (LLAMA_MOE_LM_LEND=0). LLAMA_MOE_LM_LEND_FIRST=1: lend at once (k12)
         static const bool lm_lend_first = getenv("LLAMA_MOE_LM_LEND_FIRST") != nullptr && atoi(getenv("LLAMA_MOE_LM_LEND_FIRST")) != 0;
         const bool lend_ok = lm_lend && moe_cache->lends_on_any();
-        bool lend_g = lend_ok && lm_lend_first;
+        // k13-small round 7: the growth-first rule only up to LLAMA_MOE_LM_LEND_FIRST_GROW_MIB (256) of growth (0 = any growth, the round 1
+        // rule) and for groups starting before position LLAMA_MOE_LM_LEND_FIRST_POS (0 = any position); past either the group borrows at once
+        // (k12). G4 run k13r8: q4x + MTP 8 GB 30k (its groups grow 346 MiB and more) 247.3 tok/s and k12's text with the cap, 225.3 without
+        // (k12 247.7); gemma-4 8 GB 2k (120 MiB) keeps 326.5 (k12 288.2); POS=8192 does not fix 30k (230.2)
+        static const size_t  lf_grow = (size_t) (getenv("LLAMA_MOE_LM_LEND_FIRST_GROW_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LM_LEND_FIRST_GROW_MIB"))) : 256) << 20;
+        static const int64_t lf_pos  = getenv("LLAMA_MOE_LM_LEND_FIRST_POS") ? std::max(0, atoi(getenv("LLAMA_MOE_LM_LEND_FIRST_POS"))) : 0;
+        // a group refused by the cap is followed by groups at least as large and as far in the context: they borrow at once (the growth
+        // only rises with both), saving the refused attempt (G4 q4x 8 GB 30k prompt: 6821 tok/s with the attempt, k12 6927)
+        const int64_t g_pos = group[a].ub->pos[0];
+        const bool lf_known = lf_grow > 0 && g_pos >= lm_lf_refused_pos && (int64_t) (b - a) >= lm_lf_refused_n;
+        bool lend_g = lend_ok && (lm_lend_first || (lf_pos > 0 && g_pos >= lf_pos) || lf_known);
         if (lend_g) {
             moe_cache->set_graph_lend(true);
             ggml_backend_sched_set_alloc_lend_graph(sched.get(), true);
         }
+        const bool lf_capped = lend_ok && !lend_g && lf_grow > 0 && lf_grow < lm_grow_max;
+        if (lf_capped) {
+            ggml_backend_sched_set_alloc_limit(sched.get(), true, lf_grow);
+        }
         ggml_status st = run(g);
         if (lend_g) {
             moe_cache->set_graph_lend(false);
+        }
+        if (st == GGML_STATUS_ALLOC_FAILED && lf_known && !lm_lend_first && !(lf_pos > 0 && g_pos >= lf_pos)) {
+            // the cache did not take it: the growth in free memory, as a group under the cap
+            for (auto & [node, arr] : srcs) {
+                std::copy(arr.begin(), arr.end(), node->src);
+            }
+            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_use_full_hash(sched.get());
+            ggml_backend_sched_set_alloc_limit(sched.get(), true, lm_grow_max);
+            st = run(g);
         }
         if (st == GGML_STATUS_ALLOC_FAILED && lend_ok && !lend_g && ggml_backend_sched_get_alloc_over(sched.get()) > 0) {
             // the growth did not fit in free memory: as the split below would, undo the scheduler's copies, then the same graph with the
@@ -4358,6 +4382,20 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             ggml_backend_sched_set_alloc_lend_graph(sched.get(), true);
             st = run(g);
             moe_cache->set_graph_lend(false);
+            if (st != GGML_STATUS_ALLOC_FAILED && lf_capped) {
+                lm_lf_refused_pos = std::min(lm_lf_refused_pos, g_pos);
+                lm_lf_refused_n   = std::min(lm_lf_refused_n, (int64_t) (b - a));
+            }
+            if (st == GGML_STATUS_ALLOC_FAILED && lf_capped) {
+                // the cache did not take it: the growth in free memory as without the cap
+                for (auto & [node, arr] : srcs) {
+                    std::copy(arr.begin(), arr.end(), node->src);
+                }
+                ggml_backend_sched_reset(sched.get());
+                ggml_backend_sched_use_full_hash(sched.get());
+                ggml_backend_sched_set_alloc_limit(sched.get(), true, lm_grow_max);
+                st = run(g);
+            }
         }
         ggml_backend_sched_set_alloc_limit(sched.get(), false, 0);
         lm_merged_active = false;

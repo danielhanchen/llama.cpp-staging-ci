@@ -617,6 +617,8 @@ private:
     std::vector<uint8_t>                 lm_meta;     // the merged graph
     int64_t lm_n_graphs = 0, lm_n_ubatches = 0, lm_n_fallback = 0, lm_n_seeded = 0, lm_n_split = 0, lm_n_released = 0, lm_n_shrunk = 0;
     // k13-small: host copies of the routing kept for the next seed when the compute buffers are freed after a group (lm_ids_host_keep)
+    // k13-small: the smallest start position and size of a group the lend-first growth cap refused (later groups borrow at once)
+    int64_t lm_lf_refused_pos = INT64_MAX, lm_lf_refused_n = INT64_MAX;
     ggml_context_ptr lm_ids_ctx;
     ggml_backend_buffer_ptr lm_ids_buf;
     void lm_ids_host_keep();
