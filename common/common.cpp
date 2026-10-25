@@ -4063,7 +4063,11 @@ void * common_state_thp_alloc(size_t bytes) {
     if (posix_memalign(&p, 2u << 20, bytes) != 0 || p == nullptr) {
         throw std::bad_alloc();
     }
-    madvise(p, bytes, MADV_HUGEPAGE);
+    // whole huge pages only: the tail stays on 4 KiB pages, so the resident size is the bytes used, not rounded up to 2 MiB
+    const size_t huge = bytes & ~((size_t) (2u << 20) - 1);
+    if (huge > 0) {
+        madvise(p, huge, MADV_HUGEPAGE);
+    }
     return p;
 #else
     return ::operator new(bytes);
