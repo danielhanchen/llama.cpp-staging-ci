@@ -700,6 +700,7 @@ struct llama_moe_cache::impl {
     ggml_context_ptr ctx_pviews;
     size_t n_prompt_inplace = 0, n_prompt_fallback = 0, prompt_hits = 0, prompt_misses = 0, prompt_bytes = 0, prompt_seeds = 0;
     bool prompt_log_done = false;
+    mutable bool prompt_why_logged = false;
 
     // lending (see lend): LLAMA_MOE_CACHE_LEND=0 off, 1 on with one cache device, 2 also with several (not validated)
     int    lend_mode    = 1;     // LLAMA_MOE_CACHE_LEND: 0 off, 1 staging copies, 2 also the graph allocator (experimental)
@@ -5723,17 +5724,10 @@ struct llama_moe_cache::impl {
         if (prompt_group_full(g)) {
             return true;
         }
-        // one group of the device may miss experts: the one that lends (its lent slots hold one layer's experts, at most half its slots)
+        // the group that lends takes the missing experts into its lent slots (one layer's experts, at most half its slots); another group
+        // admits them (the LRU of the group evicts, its slots hold at least one layer's experts)
         const group * gl = prompt_lend_group(g.id);
-        if (gl != &g || g.n_slots/2 < g.lru.n_expert) {
-            return false;
-        }
-        for (const group & o : groups) {
-            if (&o != &g && o.id == g.id && o.n_slots > 0 && !prompt_group_full(o)) {
-                return false;
-            }
-        }
-        return true;
+        return gl == &g ? g.n_slots/2 >= g.lru.n_expert : g.n_slots >= g.lru.n_expert;
     }
 
     // k15-lfm2: the lent slots for in-place prompts: one layer of experts (lend() keeps the copies of the graph, if any, in the scheduler)
@@ -5805,8 +5799,9 @@ struct llama_moe_cache::impl {
         fills.clear();
         size_t n_hit = 0;
         const bool full = prompt_group_full(g);
+        const bool lends = prompt_lend_group(g.id) == &g;
         int32_t base = -1;
-        if (!full && g.lru.n_lent >= ne) {
+        if (!full && lends && g.lru.n_lent >= ne) {
             base = g.n_slots - g.lru.n_lent;
             const int32_t * slots = g.lru.slot_map[il];
             for (int32_t e = 0; e < ne; ++e) {
@@ -5831,6 +5826,9 @@ struct llama_moe_cache::impl {
             std::copy(g.lru.slot_map[il], g.lru.slot_map[il] + ne, m);
             if (!full) {
                 n_prompt_fallback++;
+                if (lends && n_prompt_fallback == 1) {
+                    LLAMA_LOG_WARN("%s: MoE cache: an in-place prompt without lent slots admits its missing experts\n", __func__);
+                }
             }
         }
         const size_t bytes = upload_fills(backend, il, fills, nullptr);
@@ -5860,6 +5858,13 @@ struct llama_moe_cache::impl {
         // k15-lfm2: a large batch reads its experts in place (see prompt_of)
         if (n_tokens > max_batch && prompt_inplace_ok(il)) {
             return l.prompt_map;
+        }
+        if (n_tokens > max_batch && prompt_inplace_env && !prompt_why_logged) {
+            prompt_why_logged = true;
+            const group & g = groups[l.ig];
+            LLAMA_LOG_INFO("%s: MoE cache: layer %d of this large batch is staged (in-place prompts need: no CPU-miss rule %d, no hybrid gate %d, "
+                "lending %d, no RAM tier %d, device lookups %d, no device seed %d, no layer-major prompts %d, slots %d of %d per layer)\n", __func__, il,
+                !cm, !hybrid, lend_mode != 0, !host_layer(il), g.dev_lookup, !g.devseed, !prompt_inplace_blocked, g.n_slots, (int) g.lru.n_expert);
         }
 
         // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
