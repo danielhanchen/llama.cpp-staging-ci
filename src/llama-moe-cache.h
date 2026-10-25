@@ -196,6 +196,8 @@ public:
     void set_refill_routed_once(bool on);
     // the cache lends slots on some device (decided by the first large graph)
     bool lends_on_any() const;
+    // lends_on_any, or a device whose lending is off for the staging copies that still lends to a merged layer-major graph (k15-pp)
+    bool lends_graph_any() const;
     // the cache lends slots on the device of backend (decided by the first large graph, see lend): the staging arena is not allocated there
     bool lends_on(ggml_backend_t backend) const;
     bool lends_graph() const; // the graph allocator may borrow too (LLAMA_MOE_CACHE_LEND=2)

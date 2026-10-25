@@ -1113,6 +1113,10 @@ private:
     // 4 + n_ubatch tokens before the end; the batch goes on, its ubatches still end there (llama_set_ubatch_breaks), so a
     // layer-major prompt reads the host experts once for both (the checkpoint itself is not made)
     std::vector<int32_t> lm_breaks;
+    // k15-pp: the checkpoint at the first merged break, taken inside the decode (llama_set_state_capture): slot, its token count there
+    int     lm_cap_slot     = -1;
+    int64_t lm_cap_n_tokens = -1;
+    int32_t lm_cap_batch    = -1; // absolute batch index of the break
 
     server_metrics metrics;
 
@@ -2752,7 +2756,30 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    // k15-pp: the checkpoint at a merged break (n_tokens_at tokens of the slot, last position pos_at), from the state the decode captured
+    // there; only where the draft and the speculative state hold nothing a checkpoint at that position would need (a draft without
+    // recurrent / SWA rows, no stashed boundary row)
+    void create_checkpoint_captured(server_slot & slot, int64_t n_tokens_at, llama_pos pos_at) {
+        if (ctx_dft) {
+            // the header alone (magic, seq id): a KV cache without SWA writes nothing for a partial state
+            const size_t n_dft = llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (n_dft > 16) {
+                SLT_DBG(slot, "%s", "merged break: the draft holds a partial state, no checkpoint there\n");
+                return;
+            }
+        }
+        std::vector<uint8_t> ds;
+        if (common_speculative_get_state(spec.get(), slot.id, ds) && !ds.empty()) {
+            SLT_DBG(slot, "%s", "merged break: the speculative state is stashed per checkpoint, no checkpoint there\n");
+            return;
+        }
+        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+        const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        const llama_pos pmin = std::max<llama_pos>(0, pos_at - (pos_max - pos_min));
+        create_checkpoint(slot, slot.prompt.n_tokens() - n_tokens_at, pmin, pos_at, true);
+    }
+
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool captured = false) {
         const int id_task = slot.task->id;
 
         // the previous checkpoint's asynchronous copy may still be running (LLAMA_STATE_ASYNC_LAZY): done before any is evicted
@@ -2823,7 +2850,7 @@ private:
         const int64_t t_tr0 = common_mtp_handoff_trace() ? ggml_time_us() : 0;
 
         // the next llama_decode() is queued while the state is still being copied: the copy is complete when it returns
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ASYNC);
+        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ASYNC | (captured ? LLAMA_STATE_SEQ_FLAGS_CAPTURED : 0));
         const int64_t t_tr1 = t_tr0 ? ggml_time_us() : 0;
         // k13-pp: the draft's rows are read on the draft's own stream after its queued prompt pass, so the target's next ubatch is
         // queued while the draft still computes (the synchronous read waited for the draft pass, ~1.5 ms per chat prompt on G4);
@@ -2839,6 +2866,19 @@ private:
                     cur.data_dft.size()/1048576.0, (ggml_time_us() - t_tr1)/1e3);
         }
 
+        // k15-pp debug (LLAMA_CKPT_HASH=1): a hash of the target part, to compare checkpoints taken at one position in different ways
+        static const bool ckpt_hash = getenv("LLAMA_CKPT_HASH") != nullptr && atoi(getenv("LLAMA_CKPT_HASH")) != 0;
+        if (ckpt_hash) {
+            llama_state_seq_async_wait(ctx_tgt);
+            uint64_t h = 1469598103934665603ull;
+            for (size_t i = 0; i < cur.data_tgt.size(); ++i) { h ^= cur.data_tgt.data()[i]; h *= 1099511628211ull; }
+            SLT_INF(slot, "checkpoint hash n_tokens = %" PRId64 " pos = [%d, %d] size %zu captured %d: %016llx\n", cur.n_tokens, cur.pos_min,
+                cur.pos_max, cur.data_tgt.size(), (int) captured, (unsigned long long) h);
+            if (const char * dir = getenv("LLAMA_CKPT_DUMP")) {
+                const std::string fn = std::string(dir) + "/ckpt_" + std::to_string(cur.n_tokens) + "_" + std::to_string((int) captured) + ".bin";
+                if (FILE * f = fopen(fn.c_str(), "wb")) { fwrite(cur.data_tgt.data(), 1, cur.data_tgt.size(), f); fclose(f); }
+            }
+        }
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
@@ -3499,16 +3539,20 @@ private:
     };
 #endif
 
-    // k11 (LLAMA_LM_CKPT_MERGE=1, opt-in): see lm_breaks. Only for a slot alone in the batch, a target with layer-major prompts,
+    // k11 (LLAMA_LM_CKPT_MERGE): see lm_breaks. Only for a slot alone in the batch, a target with layer-major prompts,
     // no mtmd input and speculative impls that read the target rows of a segment (MTP, draft models, n-gram).
-    // Opt-in: the prompt's ubatches and kernels are those of the separate calls, but the MoE cache is seeded once (from the
-    // routing of the ubatch before the last) instead of once per call, so the cache holds other experts after the prompt; where
-    // the host computes misses or the fetch overlap splits a layer by hit / miss, the decode that follows then differs from k10
-    // (G4 Qwen3.6 UD-Q4_K_XL + MTP 8 GB: other text from token 14 / 31 / >64 of the 2k / 4.6k / 8k cells)
+    // The prompt's ubatches and kernels are those of the separate calls, but the MoE cache is seeded once (from the routing of
+    // the ubatch before the last) instead of once per call, and the checkpoint 4 + n_ubatch tokens before the end is not made (the
+    // one 4 tokens before the end is). k11 saw other decode text after the merged prompt where the host computes misses or the
+    // fetch overlap splits a layer by hit / miss (G4 Qwen3.6 UD-Q4_K_XL + MTP 8 GB, from token 14 / 31 / >64 of 2k / 4.6k / 8k).
+    // k15-pp: on by default wherever prompts run layer-major (k13-small: was only on a small device, common_fit_small_device).
+    // Separate, the last ubatch before that checkpoint ran alone and streamed every host expert a second time: G4 Qwen3.6-35B-A3B
+    // Q4 + MTP at 12 GB, 2k prompt [1532] [512] [4] = 27.7 GB of uploads, 16.0 merged, 3188 -> 5226 tok/s. Merged, the output is
+    // md5-equal with the misses pinned on the device (LLAMA_MOE_CPU_MISS=0) and decode speed is unchanged; with the misses on the host
+    // the decode after the prompt may take another text (Qwen3.8-Flash-Next 32 GB 8k), as the cache is seeded once (plans/k15_pp.md
+    // section 6). LLAMA_LM_CKPT_MERGE=0: the separate calls
     bool lm_ckpt_merge_ok(const server_slot & slot, int32_t n_tokens_prev, bool lm_ckpt) const {
-        // k13-small: on by default where the fit kept every layer on a small device (common_fit_small_device): there each extra prompt
-        // call reads all host experts again (G4 4 GB q3m 2k: [1532] [512] [4] = two passes of 13.6 GB); LLAMA_LM_CKPT_MERGE=0 off
-        static const bool on = getenv("LLAMA_LM_CKPT_MERGE") != nullptr ? atoi(getenv("LLAMA_LM_CKPT_MERGE")) != 0 : common_fit_small_device();
+        static const bool on = getenv("LLAMA_LM_CKPT_MERGE") == nullptr || atoi(getenv("LLAMA_LM_CKPT_MERGE")) != 0;
         return on && !lm_ckpt && n_tokens_prev == 0 && !slot.task->tokens.has_mtmd && llama_layer_major_on(ctx_tgt) &&
             common_speculative_rows_ok(spec.get());
     }
@@ -3707,6 +3751,9 @@ private:
         // start populating the batch for this iteration
         batch.clear();
         lm_breaks.clear();
+        lm_cap_slot = -1;
+        lm_cap_n_tokens = -1;
+        lm_cap_batch = -1;
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
@@ -4437,6 +4484,11 @@ private:
                                     // (only when the rest up to the near checkpoint fits this batch: else the batches, so the ubatches, would differ)
                                     if (k == 0 && offset != 4 && batch.size() + (n_last - 4) <= n_batch && lm_ckpt_merge_ok(slot, n_tokens_prev, lm)) {
                                         lm_breaks.push_back(batch.size());
+                                        if (lm_cap_slot < 0 && do_checkpoint) {
+                                            lm_cap_slot     = slot.id;
+                                            lm_cap_n_tokens = slot.prompt.n_tokens();
+                                            lm_cap_batch    = batch.size();
+                                        }
                                         break;
                                     }
                                     should_break = true;
@@ -4620,6 +4672,12 @@ private:
                 seg_breaks.push_back(b - off);
             }
         }
+        // k15-pp (LLAMA_LM_CKPT_CAPTURE=0 off): the checkpoint the merged break skips is taken inside the decode
+        static const bool lm_cap_env = getenv("LLAMA_LM_CKPT_CAPTURE") == nullptr || atoi(getenv("LLAMA_LM_CKPT_CAPTURE")) != 0;
+        bool lm_cap_req = false;
+        if (lm_cap_env && lm_cap_slot >= 0 && lm_cap_batch > off && lm_cap_batch < off + batch.view.size()) {
+            lm_cap_req = llama_set_state_capture(ctx_tgt, lm_cap_slot, lm_cap_batch - off);
+        }
         if (!seg_breaks.empty()) {
             llama_set_ubatch_breaks(ctx_tgt, seg_breaks.data(), (int32_t) seg_breaks.size());
             SRV_DBG("k11 merged prompt batch of %d tokens, %zu ubatch breaks (first at %d)\n", batch.view.size(), seg_breaks.size(), seg_breaks[0]);
@@ -4630,6 +4688,17 @@ private:
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (lm_cap_req) {
+            llama_pos cap_pos = -1;
+            if (ret == 0 && llama_state_seq_captured(ctx_tgt, lm_cap_slot, &cap_pos)) {
+                for (auto & slot : slots) {
+                    if (slot.id == lm_cap_slot && slot.task) {
+                        create_checkpoint_captured(slot, lm_cap_n_tokens, cap_pos);
+                    }
+                }
+            }
+            lm_cap_slot = -1;
+        }
 
         if (ret != 0) {
             {

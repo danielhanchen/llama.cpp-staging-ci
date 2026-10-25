@@ -905,7 +905,7 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
     for (const auto & range : cell_ranges) {
         for (uint32_t i = range.first; i < range.second; ++i) {
             const auto & cell = cells[i];
-            const llama_pos pos      = cell.pos;
+            const llama_pos pos      = cap_map != nullptr && seq_id >= 0 ? cap_pos : cell.pos;
             const uint32_t  n_seq_id = seq_id == -1 ? cell.seq_id.size() : 0;
 
             io.write(&pos,      sizeof(pos));
@@ -921,6 +921,18 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
 }
 
 void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
+    // k15-pp: the captured row of a tensor (a single cell), see cap_map
+    auto cap_tensor = [&](const ggml_tensor * t, size_t range_size) -> ggml_tensor * {
+        if (cap_map == nullptr || range_size != 1) {
+            return nullptr;
+        }
+        for (const auto & [src, snap] : *cap_map) {
+            if (src == t) {
+                return snap;
+            }
+        }
+        return nullptr;
+    };
     const uint32_t s_trans = 0;
     const uint32_t n_layer = hparams.n_layer();
 
@@ -946,6 +958,10 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
         for (const auto & range : cell_ranges) {
             const size_t range_size = range.second - range.first;
             const size_t buf_size = range_size * r_size_row;
+            if (ggml_tensor * c = cap_tensor(r_l[il], range_size)) {
+                io.write_tensor(c, 0, buf_size);
+                continue;
+            }
             io.write_tensor(r_l[il], range.first * r_size_row, buf_size);
         }
 
@@ -956,6 +972,10 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
 
             for (const auto & range : cell_ranges) {
                 const size_t range_size = range.second - range.first;
+                if (ggml_tensor * c = cap_tensor(p_l[il], range_size)) {
+                    io.write_tensor(c, 0, range_size * p_size_row);
+                    continue;
+                }
                 io.write_tensor(p_l[il], range.first * p_size_row, range_size * p_size_row);
             }
         }
@@ -979,6 +999,10 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             for (const auto & range : cell_ranges) {
                 const size_t range_size = range.second - range.first;
                 const size_t buf_size = range_size * s_size_row;
+                if (ggml_tensor * c = cap_tensor(s_l[il], range_size)) {
+                    io.write_tensor(c, 0, buf_size);
+                    continue;
+                }
                 io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
             }
         }

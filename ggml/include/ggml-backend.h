@@ -428,6 +428,9 @@ extern "C" {
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+    // sync = false: the callback (ask = false) is called without synchronizing the backend first, as soon as the nodes up to t are queued.
+    // It may only queue work on the backend that computes t (e.g. an async read of t and an event); set_eval_callback resets it to true
+    GGML_API void                 ggml_backend_sched_set_eval_callback_sync(ggml_backend_sched_t sched, bool sync);
 
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);

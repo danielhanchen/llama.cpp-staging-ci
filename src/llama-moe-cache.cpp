@@ -5009,6 +5009,19 @@ struct llama_moe_cache::impl {
                 return;
             }
         }
+        // k15-pp (LLAMA_MOE_LM_LEND_GRAPH_ONLY=0 off): a merged layer-major graph whose growth does not fit lends from the cache even where
+        // lending is off for the staging copies (lend_decide: they are a small share of the cache): only the graph allocation, for that graph,
+        // and the lent slots are refilled after it, so the decode finds the cache as it was. Split instead, each half streamed every host
+        // expert again: G4 Qwen3.8-Flash-Next UD-IQ4_XS at 32 GB (19 GB cache, lending off at 6.7%), 8k prompt, 4 ubatches of 2048 were
+        // short of 10.5 MiB (755 MiB growth, 744.6 MiB free) and ran as two graphs
+        static const bool graph_only_env = getenv("LLAMA_MOE_LM_LEND_GRAPH_ONLY") == nullptr || atoi(getenv("LLAMA_MOE_LM_LEND_GRAPH_ONLY")) != 0;
+        bool graph_only = false;
+        if (graph_only_env && graph_lend_scope && lend_auto && devices[id].lend_auto == 0 && n_graph > 0) {
+            only.assign(copies, copies + n_graph);
+            copies     = only.data();
+            n_copies   = n_graph;
+            graph_only = true;
+        }
         const size_t graph_need = n_graph > 0 ? graph_all : 0;
         for (int i = 0; i < n_graph; ++i) {
             copies[i].buffer = nullptr;
@@ -5034,7 +5047,7 @@ struct llama_moe_cache::impl {
         // a prompt that seeds from its own ids holds the copies of a split in the graph allocation (see llama_context::sched_reserve_seed)
         const size_t seed  = seed_own ? split : 0;
         const size_t graph = graph_all + seed;
-        if (lend_auto && !lend_decide(id, need, graph, seed, dry)) {
+        if (lend_auto && !graph_only && !lend_decide(id, need, graph, seed, dry)) {
             return;
         }
 
@@ -5055,9 +5068,17 @@ struct llama_moe_cache::impl {
         // LLAMA_MOE_CACHE_LEND_PARTS=N > 1 (experimental): else in up to N bank tails
         static const int max_parts = getenv("LLAMA_MOE_CACHE_LEND_PARTS") ? std::max(1, atoi(getenv("LLAMA_MOE_CACHE_LEND_PARTS"))) : 1;
         const int32_t n0 = n;
-        for (int multi = 0; multi < (n_graph > 1 && max_parts > 1 ? 2 : 1) && n_lend == 0; ++multi) {
+        // k15-pp (LLAMA_MOE_LM_LEND_GRAPH_PARTS=0 off): a graph-only lend tries one part per bank first. In one part the graph had to fit
+        // the tail of a single bank, so the slots lent (and refilled after the group) were ~2.6x the graph: G4 Qwen3.8-Flash-Next 32 GB 8k,
+        // a 1740 MiB graph took 2009 slots (4463 MiB); Qwen3.6 q4x local, 509 MiB took 740 slots (1341 MiB)
+        static const bool graph_parts_env = getenv("LLAMA_MOE_LM_LEND_GRAPH_PARTS") == nullptr || atoi(getenv("LLAMA_MOE_LM_LEND_GRAPH_PARTS")) != 0;
+        const bool parts_first = graph_only && graph_parts_env && n_graph > 1 && g.banks.size() > 1;
+        const int  mp          = parts_first ? std::max<int>(max_parts, (int) g.banks.size()) : max_parts;
+        const int  n_pass      = parts_first || (n_graph > 1 && max_parts > 1) ? 2 : 1;
+        for (int pass = 0; pass < n_pass && n_lend == 0; ++pass) {
+            const int multi = parts_first ? 1 - pass : pass;
             for (n = n0; n <= n_max; n = n < n_max ? std::min(n + step, n_max) : n_max + 1) {
-                if (place(g, n, copies, n_copies, n_graph, multi ? std::min(n_graph, max_parts) : 1, graph_need, depth, guard, offsets, part_sizes)) {
+                if (place(g, n, copies, n_copies, n_graph, multi ? std::min(n_graph, mp) : 1, graph_need, depth, guard, offsets, part_sizes)) {
                     n_lend = n;
                     break;
                 }
@@ -5092,7 +5113,12 @@ struct llama_moe_cache::impl {
                 copies[i].size = part_sizes[i];
             }
         }
-        if (copies != all) {
+        if (copies != all && graph_only) {
+            // the graph entries lead the list; the staging copies stay in the scheduler's arena
+            for (int i = 0; i < n_copies; ++i) {
+                all[i] = copies[i];
+            }
+        } else if (copies != all) {
             for (int i = 0; i < n_copies; ++i) {
                 all[n_all - n_copies + i].buffer = buf;
                 all[n_all - n_copies + i].offset = offsets[i];
@@ -6927,6 +6953,22 @@ bool llama_moe_cache::released() const {
 
 void llama_moe_cache::set_graph_lend(bool on) {
     pimpl->graph_lend_scope = on;
+}
+
+bool llama_moe_cache::lends_graph_any() const {
+    static const bool graph_only_env = getenv("LLAMA_MOE_LM_LEND_GRAPH_ONLY") == nullptr || atoi(getenv("LLAMA_MOE_LM_LEND_GRAPH_ONLY")) != 0;
+    if (lends_on_any()) {
+        return true;
+    }
+    if (!graph_only_env || !pimpl->lend_auto) {
+        return false;
+    }
+    for (const auto & d : pimpl->devices) {
+        if (d.buf_bank && !d.released && pimpl->lend_mode != 0 && d.lend_auto == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool llama_moe_cache::lends_on_any() const {

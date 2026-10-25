@@ -1104,6 +1104,7 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
+    bool callback_eval_nosync; // see ggml_backend_sched_set_eval_callback_sync
 
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
@@ -3825,10 +3826,21 @@ static int ggml_backend_sched_prefetch_ahead(ggml_backend_sched_t sched, const s
     return std::max(std::min(pf->depth, sched->pf_depth) - 1, 1);
 }
 
-static void ggml_backend_sched_prefetch_issue(ggml_backend_sched_t sched) {
+// early = true at the start of a split (k15-pp): also issue the copies the end of the previous prefetched split would issue next, i.e. up
+// to depth - 1 ahead of the splits consumed. Their slots were last read by splits that are already queued (the slot of copy c + depth - 1
+// was last read by split c - 1, whose retire event is recorded), so the copies are the same, only queued before this split's work. A split
+// that stops the host part-way (an eval callback that synchronizes, e.g. the layer-major seed of the MoE cache in the split that holds a
+// layer's router) then no longer holds back the next layer's copies: G4, Qwen3.6-35B-A3B Q4 + MTP at 12 GB, 2k prompt: 42 copy-engine gaps
+// of ~2 ms in a 357 ms layer-major pass. Opt-in (GGML_SCHED_PREFETCH_EARLY=1): on k14 it made G4 q4x 12 GB 2k -8%, 8k -12% (the
+// [512] pass that follows the layer-major group lost most), plans/k15_pp.md
+static void ggml_backend_sched_prefetch_issue_ex(ggml_backend_sched_t sched, bool early) {
+    static const bool early_env = getenv("GGML_SCHED_PREFETCH_EARLY") != nullptr && atoi(getenv("GGML_SCHED_PREFETCH_EARLY")) != 0;
     for (int b = 0; b < sched->n_backends; b++) {
         struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
-        const int ahead = ggml_backend_sched_prefetch_ahead(sched, pf);
+        int ahead = ggml_backend_sched_prefetch_ahead(sched, pf);
+        if (early && early_env && pf->depth >= 2) {
+            ahead = std::min(ahead + 1, pf->depth);
+        }
         while (pf->issued < pf->n_bound && pf->issued < pf->consumed + ahead) {
             struct ggml_backend_sched_split * split = &sched->splits[pf->split_ids[pf->issued]];
             if (split->pf_async) {
@@ -3839,6 +3851,10 @@ static void ggml_backend_sched_prefetch_issue(ggml_backend_sched_t sched) {
             pf->issued++;
         }
     }
+}
+
+static void ggml_backend_sched_prefetch_issue(ggml_backend_sched_t sched) {
+    ggml_backend_sched_prefetch_issue_ex(sched, false);
 }
 
 // cross-graph arm: a split whose copies are plain host weights read by regular ops (not the experts of MUL_MAT_ID, which a copy
@@ -4330,7 +4346,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
         if (sched->pf_active) {
-            ggml_backend_sched_prefetch_issue(sched);
+            ggml_backend_sched_prefetch_issue_ex(sched, true);
         }
 
         // ensure the previous split's async work has completed before we start
@@ -4538,7 +4554,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
 
                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
                 // (a range that ends without a node the user asked for needs no synchronization)
-                if (need) {
+                if (need && !sched->callback_eval_nosync) {
                     ggml_backend_synchronize(split_backend);
                 }
 
@@ -5028,6 +5044,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+    sched->callback_eval_nosync = false;
+}
+
+void ggml_backend_sched_set_eval_callback_sync(ggml_backend_sched_t sched, bool sync) {
+    GGML_ASSERT(sched);
+    sched->callback_eval_nosync = !sync;
 }
 
 // the copies of the allocated graph were selected with the old callbacks: the regular path fills their slots until the next allocation
