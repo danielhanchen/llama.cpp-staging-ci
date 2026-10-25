@@ -3150,6 +3150,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     const uint32_t n_outputs_all = balloc->get_n_outputs();
     balloc->ubatch_breaks = std::move(ub_breaks);
     static const bool tail_dbg_b = getenv("LLAMA_LM_TAIL_DEBUG") != nullptr;
+    if (tail_dbg_b && n_tokens_all > 8) {
+        const auto & v = batch_inp.tokens;
+        std::string t;
+        for (size_t i = 0; i < v.size(); ++i) {
+            if (i < 2 || i + 3 >= v.size()) {
+                t += " " + std::to_string(v[i].id) + "@" + std::to_string(v[i].pos[0]) + (v[i].output ? "*" : "");
+            }
+        }
+        LLAMA_LOG_INFO("%s: tail debug batch (%u tokens, %u outputs, ctx %p):%s\n", __func__, n_tokens_all, n_outputs_all, (void *) this, t.c_str());
+    }
     if (tail_dbg_b && n_tokens_all <= 8) {
         std::string t;
         for (const auto & tk : batch_inp.tokens) {
@@ -4405,7 +4415,11 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             lm_copy_graph = nullptr;
             lm_async_used = 0;
             lm_async_nev  = 0;
-            if (lm_async_env && cparams.cb_eval == nullptr) {
+            // k15-pp2: a group with a tail member (LLAMA_LM_TAIL) seeds synchronously: with the asynchronous read the seed of some layers
+            // copied experts from staging memory already reused (Qwen3.6 q4x + MTP 12 GB: the cache after the prompt held wrong experts, the
+            // first MTP verify gave other logits); not found yet why the extra member breaks the "due" rule of lm_seed_resolve_due
+            const bool lm_has_tail = !group.empty() && (int64_t) group.back().ub->n_tokens < prefetch_min_batch;
+            if (lm_async_env && cparams.cb_eval == nullptr && !lm_has_tail) {
                 size_t need = 0;
                 ggml_backend_dev_t dev = nullptr;
                 bool ok = true;
@@ -6110,6 +6124,11 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
     }
     // layer-major graph: the routing that seeds this layer may come later, the seed then copies from this copy (see lm_eval_cb)
     if (lctx->lm_seed_active && lctx->moe_cache->get_experts(src) != nullptr) {
+        static const bool tail_dbg_s = getenv("LLAMA_LM_TAIL_DEBUG") != nullptr;
+        if (tail_dbg_s && lctx->lm_staged.count(src) > 0) {
+            LLAMA_LOG_INFO("%s: tail debug: a second staged copy of %s (all %d, previous dst %p, this %p)\n", __func__, src->name, (int) st.all,
+                (void *) lctx->lm_staged[src].second, (void *) dst);
+        }
         lctx->lm_staged[src] = { backend, dst };
     }
 
