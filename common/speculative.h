@@ -105,6 +105,11 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
 bool common_speculative_process_rows(common_speculative * spec, const common_batch & batch, int32_t row_offset);
 bool common_speculative_rows_ok(const common_speculative * spec);
 
+// k15-pp3 (LLAMA_MTP_PROMPT_OVERLAP): process_rows on target rows the caller waited for with llama_nextn_rows_wait, while the target's
+// decode may still compute later ubatches; rows_early_ok says whether every impl reads only those rows of the target
+bool common_speculative_rows_early_ok(const common_speculative * spec);
+bool common_speculative_process_rows_early(common_speculative * spec, const common_batch & batch, int32_t row_offset);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 

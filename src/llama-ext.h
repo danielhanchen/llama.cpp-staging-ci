@@ -120,6 +120,11 @@ LLAMA_API void llama_set_ubatch_breaks(struct llama_context * ctx, const int32_t
 #define LLAMA_STATE_SEQ_FLAGS_CAPTURED 8
 LLAMA_API bool llama_set_state_capture(struct llama_context * ctx, llama_seq_id seq_id, int32_t i_batch);
 LLAMA_API bool llama_state_seq_captured(const struct llama_context * ctx, llama_seq_id seq_id, llama_pos * pos_max);
+// k15-pp2: up to two captures per decode (llama_set_state_capture once per index; LLAMA_STATE_CAPTURE_MAX=1: one). The capture at
+// batch index i_batch taken by the last decode; selects it for the next LLAMA_STATE_SEQ_FLAGS_CAPTURED read (default: the lowest index)
+LLAMA_API bool llama_state_seq_captured_at(struct llama_context * ctx, llama_seq_id seq_id, int32_t i_batch, llama_pos * pos_max);
+// k15-ttft: whether llama_set_state_capture can take a capture in this context (a recurrent memory, beside a non-SWA KV cache if hybrid)
+LLAMA_API bool llama_state_capture_supported(const struct llama_context * ctx);
 // layer-major prompt groups can run in this context (a MoE cache with layer-major prompts on)
 LLAMA_API bool llama_layer_major_on(const struct llama_context * ctx);
 // k15-pp: a batch of n_before + n_after prompt tokens of one sequence with a ubatch break (llama_set_ubatch_breaks) after n_before would
@@ -200,6 +205,14 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
+
+// k15-pp3 (LLAMA_MTP_PROMPT_OVERLAP=0 off): the nextn rows [0, n_rows) of the last decode, on the host before that decode is done.
+// When a layer-major group was followed by more ubatches in the same decode, waits for the group's rows only and returns how many rows
+// are on the host (>= n_rows); returns 0 when it cannot (the caller then synchronizes as before). Unmasked nextn, one sequence only.
+LLAMA_API int64_t llama_nextn_rows_wait(struct llama_context * ctx, int64_t n_rows);
+// the nextn rows without a synchronization (unmasked: row i at i*n_embd); nullptr when outputs are to be reordered.
+// Valid for rows [0, llama_nextn_rows_wait(...)) until the next decode
+LLAMA_API float * llama_get_embeddings_nextn_early(struct llama_context * ctx);
 
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
