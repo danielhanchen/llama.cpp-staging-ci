@@ -2725,7 +2725,7 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
             } else if (policy_on) {
                 // k11-decode: the window that commits the most tokens per measured ms, or none (common/spec-cost-policy.h)
                 const int k_full = std::min(offered, win);
-                k = policy.choose(k_full, std::min(k_full, si.n_short), q);
+                k = policy.choose(k_full, std::min(k_full, si.n_short), q, si.n_short != params.n_max_short);
                 if (k > 0 && policy.cost_n[std::min(k + 1, common_spec_cost_policy::MAX_T)] < common_spec_cost_policy::PROBES) {
                     si.n_probe++;
                 }
