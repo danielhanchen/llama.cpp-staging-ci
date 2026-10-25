@@ -3415,15 +3415,8 @@ struct llama_moe_cache::impl {
             ggml_backend_event_wait(u.up, u.mark_ev);
             u.marked = false;
         }
-        static const bool dbg_sync = getenv("LLAMA_MOE_UPLOAD_AHEAD_DEBUG_SYNC") != nullptr;
-        if (dbg_sync) {
-            ggml_backend_synchronize(devices[g.id].backend);
-        }
         if (!ggml_backend_tensor_copy_regions_async(on != nullptr ? on : u.up, ua_regions.data(), ua_regions.size())) {
             return false;
-        }
-        if (dbg_sync) {
-            ggml_backend_synchronize(on != nullptr ? on : u.up);
         }
         L.bank_sent[ip] = 1;
         ua_st_ub.bytes += bytes;
@@ -3876,9 +3869,9 @@ struct llama_moe_cache::impl {
                     continue;
                 }
                 cls = 1;
-            } else if (ua_victims >= 2 && ua_victims != 6 && key / n_expert < il) {
+            } else if (ua_victims >= 2 && key / n_expert < il) {
                 cls = 1;
-            } else if (ua_victims >= 2 && ua_victims != 5 && key / n_expert > j + 1) {
+            } else if (ua_victims >= 2 && key / n_expert > j + 1) {
                 cls = 2;
             } else {
                 continue;
