@@ -797,6 +797,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (mmvf_splitk_part != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(mmvf_splitk_part));
+        CUDA_CHECK(cudaFree(mmvf_splitk_cnt));
+    }
     for (cudaEvent_t ev : copy_peer_events) {
         if (ev != nullptr) {
             CUDA_CHECK(cudaEventDestroy(ev));
