@@ -78,6 +78,10 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // k15-rsr: copies the per-token snapshot `group` of cell `cell` onto its live row (group 0) on the device; false when off or failed
+    bool rollback_copy(uint32_t cell, uint32_t group);
+    uint64_t n_rollback_copy = 0;
+
     // computed before each graph build
     uint32_t n = 0;
 

@@ -216,7 +216,12 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
                 if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
-                    set_rs_idx(seq_id, (uint32_t) rollback);
+                    // k15-rsr: the snapshot is copied onto the live row now, so the next decode reads its state from the same row as
+                    // every other decode: its graph and CUDA graph are reused instead of rebuilt and re-captured twice (once for the
+                    // snapshot row, once back); same bytes, same output. Else (LLAMA_RS_ROLLBACK_COPY=0) the next decode reads the snapshot row
+                    if (!rollback_copy((uint32_t) tail_id, (uint32_t) rollback)) {
+                        set_rs_idx(seq_id, (uint32_t) rollback);
+                    }
                     cell.pos = p0 - 1;
                     return true;
                 }
@@ -421,6 +426,65 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     }
 
     return result;
+}
+
+bool llama_memory_recurrent::rollback_copy(uint32_t cell, uint32_t group) {
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_RS_ROLLBACK_COPY");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (!enabled || group == 0 || group > n_rs_seq || cell >= size) {
+        return false;
+    }
+    // only small states (LFM2.5's short convolutions: 16 KiB per layer): a copy synchronises once per tensor, so for large ones (the
+    // delta-net states of Flash-Next fn4, MiBs per layer) the copies cost more than the graph rebuild they save (G4 fn4 32 GB chat -0.35%)
+    static const size_t max_bytes = [] {
+        const char * e = getenv("LLAMA_RS_ROLLBACK_COPY_MAX_KB");
+        return (size_t) (e != nullptr ? atof(e) : 1024.0)*1024;
+    }();
+    size_t bytes = 0;
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        for (ggml_tensor * t : { r_l[il], s_l[il], il < p_l.size() ? p_l[il] : nullptr }) {
+            if (t != nullptr && t->ne[1] > 0) {
+                bytes += t->nb[1];
+            }
+        }
+    }
+    if (bytes > max_bytes) {
+        return false;
+    }
+    // views of the two rows of every state tensor, in a context of views only (no allocation)
+    const size_t n_views = 2*3*(size_t) r_l.size() + 8;
+    ggml_init_params ip = { n_views*ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (ctx == nullptr) {
+        return false;
+    }
+    bool ok = true;
+    auto copy_row = [&](ggml_tensor * t) {
+        if (!ok || t == nullptr || t->buffer == nullptr || t->ne[0] == 0 || t->ne[1] < (int64_t) ((group + 1)*size)) {
+            return;
+        }
+        ggml_tensor * src = ggml_view_1d(ctx, t, t->ne[0], (size_t) (group*size + cell)*t->nb[1]);
+        ggml_tensor * dst = ggml_view_1d(ctx, t, t->ne[0], (size_t) cell*t->nb[1]);
+        if (ggml_backend_view_init(src) != GGML_STATUS_SUCCESS || ggml_backend_view_init(dst) != GGML_STATUS_SUCCESS) {
+            ok = false;
+            return;
+        }
+        ggml_backend_tensor_copy(src, dst);
+    };
+    for (size_t il = 0; il < r_l.size() && ok; ++il) {
+        copy_row(r_l[il]);
+        copy_row(s_l[il]);
+        if (il < p_l.size()) {
+            copy_row(p_l[il]);
+        }
+    }
+    ggml_free(ctx);
+    if (ok && n_rollback_copy++ == 0) {
+        LLAMA_LOG_INFO("%s: speculative rollbacks copy the state snapshot onto the live row (decode graphs kept; LLAMA_RS_ROLLBACK_COPY=0: off)\n", __func__);
+    }
+    return ok;
 }
 
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
