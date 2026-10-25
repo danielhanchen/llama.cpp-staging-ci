@@ -4578,7 +4578,18 @@ struct llama_moe_cache::impl {
                 const double f    = cm_share[n];
                 const double m    = cm_rate*D;
                 const double gain = m*(cm_tup - std::max(f*cm_tup, (1.0 - f)*tc));
-                const double need = (n <= max_batch ? cm_margin*cm_split_scale*cm_split*(single_weigh() && single_usable(n) ? single_split_frac : 1.0) :
+                // k15-np: the mailbox's cheaper split (single_split_frac) only where a batch misses at least LLAMA_MOE_SINGLE_MIN_MISSES (1.5)
+                // distinct experts per layer at the measured miss rate: below, a host batch's fixed cost (mailbox publish, host threads
+                // woken, the merge) is more than the uploads it saves, and the rule weighs the full split as without a mailbox. G4, the
+                // per-launch modes of plans/k15_rebench.md section 5 (MTP verify batches of 3 tokens, 23 distinct experts of 256):
+                // q4x 16 GB at 4-5% misses (1.1 per layer) and q3m 12 GB at 5% (1.2) lost 4-6% chat decode with the host path on, q4x
+                // 12 GB at 15% (3.4) and q3m 8 GB at 30% (7) gained 14-19%. LLAMA_MOE_SINGLE_MIN_MISSES=0: the cheaper split always
+                static const double mb_min_misses = [] {
+                    const char * e = getenv("LLAMA_MOE_SINGLE_MIN_MISSES");
+                    return e != nullptr ? std::max(0.0, atof(e)) : 1.5;
+                }();
+                const bool mb_cheap = n <= max_batch && single_weigh() && single_usable(n) && m >= mb_min_misses;
+                const double need = (n <= max_batch ? cm_margin*cm_split_scale*cm_split*(mb_cheap ? single_split_frac : 1.0) :
                                      cm_margin_p*(cm_split + n*cm_act))*
                                     (cm_on[n] && cm_measured ? cm_hyst : 1.0);
                 // a batch above max_batch runs the host path in the groups whose slots hold its experts (see use_device), the

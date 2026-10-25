@@ -2690,14 +2690,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             const char * e = getenv("LLAMA_MOE_SINGLE_NOTE_PLAIN");
             return e == nullptr || atoi(e) != 0;
         }();
-        // k15-np (LLAMA_MOE_SINGLE_NOTE_PLAIN_MAX_FRAC, default 0.50 = LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE's default): only a cache that
-        // holds less than this share of the host experts notes it early. Below it the mailbox skips the timing trials (the win: G4 q3m
+        // k15-np (LLAMA_MOE_SINGLE_NOTE_PLAIN_MAX_FRAC, default 2 = every cache; 0.50 was the first fix, superseded by the per-batch miss
+        // count in cm_decide, LLAMA_MOE_SINGLE_MIN_MISSES): only a cache that holds less than this share of the host experts notes it early. Below it the mailbox skips the timing trials (the win: G4 q3m
         // 8 GB, 26.8% cached, +16-19% decode). Above it the trials run anyway, and the early note only lowers the weighed split from window
         // 0 on: G4 q4x 16 GB + MTP (59.5% cached) turned the host path on for 2-4 token verify batches, 2 trials later off again, 493 host
         // experts in a launch and -6..-8% chat decode against NOTE_PLAIN=0
         static const double note_plain_max = [] {
             const char * e = getenv("LLAMA_MOE_SINGLE_NOTE_PLAIN_MAX_FRAC");
-            return e != nullptr ? atof(e) : 0.50;
+            return e != nullptr ? atof(e) : 2.0;
         }();
         const double note_frac = moe_cache ? moe_cache->cache_frac() : -1.0;
         if (note_plain && slots != nullptr && hybrid_ok && note_frac >= 0.0 && note_frac < note_plain_max) {
