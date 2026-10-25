@@ -221,7 +221,12 @@ void ggml_cuda_mul_mat_q(
         const int64_t n_expert_used = ids->ne[0];
 
         // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
-        const int64_t ncols_expert = (ne12*n_expert_used + ne02 - 1) / ne02;
+        // k15-lfm2: op param 2 of a MUL_MAT_ID that reads a MoE cache bank in place (llama-moe-cache in-place prompts) = the number of
+        // experts its ids can name (the layer's experts, not the bank's slots): the average is over those (GGML_CUDA_MMQ_ID_ACTIVE=0: off)
+        static const bool active_hint = [] { const char * e = getenv("GGML_CUDA_MMQ_ID_ACTIVE"); return e == nullptr || atoi(e) != 0; }();
+        const int32_t n_active_hint = active_hint ? ggml_get_op_params_i32(dst, 2) : 0;
+        const int64_t ne02_avg = n_active_hint > 0 && n_active_hint < ne02 ? n_active_hint : ne02;
+        const int64_t ncols_expert = (ne12*n_expert_used + ne02_avg - 1) / ne02_avg;
 
         if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
             // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.

@@ -1806,6 +1806,17 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur, ids) :
         ggml_mul_mat_id(ctx0, slots_host ? w : moe_cache->get_experts(w), cur, slots);
+    // k15-lfm2: a product that reads the bank of the MoE cache in place (an in-place prompt map): its ids name at most the layer's experts,
+    // op param 2 tells the kernels so (mmq picks its tile width for that many experts, not for every slot of the bank)
+    if (slots != nullptr && !slots_host) {
+        const ggml_tensor * s = slots;
+        while (s->view_src != nullptr) {
+            s = s->view_src;
+        }
+        if (s->op == GGML_OP_GET_ROWS && moe_cache->prompt_layer(s->src[0]) >= 0) {
+            ((int32_t *) res->op_params)[2] = (int32_t) w->ne[2];
+        }
+    }
 
     // device seed: the slots planned for the layer are filled from the experts this product reads (the device copy of the host experts),
     // in the split of the product, before that copy is reused

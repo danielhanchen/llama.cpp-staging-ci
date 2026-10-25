@@ -1203,9 +1203,7 @@ void launch_fattn(
         parallel_blocks = std::min(parallel_blocks, ntiles_KV);
 
         // batch invariant one column tiles (k15-fv): the KV split of a launch with one query, so every query is split as it alone is
-        // k15-lfm2: a kernel launched with pb_kernel splits as pb_kernel would (ntiles_dst_pb above, it was shadowed here before), and a
-        // batch invariant one (several tokens per block, fattn-vec.cuh) as pb_kernel would for one query
-        const int ntiles_dst_pb_q = (KQV->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) && (ncols == 1 || pb_kernel) ? ntiles_dst_pb / ntiles_x : ntiles_dst_pb;
+        const int ntiles_dst_pb = (KQV->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) && ncols == 1 ? ntiles_dst / ntiles_x : ntiles_dst;
 
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
@@ -1213,7 +1211,7 @@ void launch_fattn(
         int nwaves_best = 0;
         int efficiency_percent_best = 0;
         for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
-            const int nblocks_total = ntiles_dst_pb_q * parallel_blocks_test;
+            const int nblocks_total = ntiles_dst_pb * parallel_blocks_test;
             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
 
