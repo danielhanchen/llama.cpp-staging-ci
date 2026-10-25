@@ -148,6 +148,10 @@ LLAMA_API bool llama_moe_freeze_small(struct llama_context * ctx);
 // k13: like llama_moe_freeze_small for the decisions only: small batches always take the host path for their misses (no timing trials,
 // no miss-rate windows), but still fetch their share and admit, so the cache follows the decode. Not exact under drafts. True if pinned
 LLAMA_API bool llama_moe_pin_small(struct llama_context * ctx);
+// k15-lfm2: turns the CPU-miss rule off on a host that cannot compute experts faster than it uploads them (few threads, host time per
+// expert not well below the upload time) where the cache holds most host experts: the misses are fetched, every expert runs on the device
+// from a slot (verify rows are single token bytes again). Returns true if it turned the rule off. LLAMA_MOE_CPU_MISS_DROP=0: never
+LLAMA_API bool llama_moe_cpu_miss_drop_slow(struct llama_context * ctx);
 
 // k13: 0 = no MoE cache or its host never computes an expert, 1 = hybrid path with a fixed share (small caches), 2 = CPU-miss rule
 LLAMA_API int32_t llama_moe_host_mode(const struct llama_context * ctx);
