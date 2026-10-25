@@ -8081,6 +8081,16 @@ void llama_context::set_ubatch_breaks(const int32_t * breaks, int32_t n) {
 }
 
 // k15-pp: llama_set_state_capture
+bool llama_context::state_capture_supported() const {
+    static const bool env = getenv("LLAMA_STATE_CAPTURE") == nullptr || atoi(getenv("LLAMA_STATE_CAPTURE")) != 0;
+    if (!env || memory == nullptr) {
+        return false;
+    }
+    auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    auto * rec = hyb ? hyb->get_mem_recr() : dynamic_cast<llama_memory_recurrent *>(memory.get());
+    return rec != nullptr && !(hyb && model.hparams.swa_type != LLAMA_SWA_TYPE_NONE);
+}
+
 bool llama_context::set_state_capture(llama_seq_id seq_id, int32_t i_batch) {
     static const bool env = getenv("LLAMA_STATE_CAPTURE") == nullptr || atoi(getenv("LLAMA_STATE_CAPTURE")) != 0;
     if (!env || memory == nullptr || i_batch <= 0) {
@@ -8249,6 +8259,10 @@ void llama_set_ubatch_breaks(llama_context * ctx, const int32_t * breaks, int32_
     ctx->set_ubatch_breaks(breaks, n);
 }
 
+bool llama_state_capture_supported(const llama_context * ctx) {
+    return ctx->state_capture_supported();
+}
+
 bool llama_set_state_capture(llama_context * ctx, llama_seq_id seq_id, int32_t i_batch) {
     return ctx->set_state_capture(seq_id, i_batch);
 }
@@ -8328,6 +8342,30 @@ bool llama_verify_exact_placement(const llama_context * ctx) {
             if (cache_ok && name.find("_exps") != std::string::npos) {
                 continue;
             }
+            return false;
+        }
+    }
+    return true;
+}
+
+bool llama_single_pass_equivalent(const llama_context * ctx) {
+    if (ctx == nullptr || llama_moe_host_mode(ctx) != 0 || !llama_verify_exact_placement(ctx)) {
+        return false;
+    }
+    const llama_model & model = ctx->get_model();
+    if (model.devices.empty()) {
+        return false;
+    }
+    for (const auto & d : model.devices) {
+        const char * name = ggml_backend_dev_name(d.dev);
+        if (name == nullptr || strncmp(name, "CUDA", 4) != 0) {   // the kernel paths were checked on CUDA (sm_100, sm_120) only
+            return false;
+        }
+    }
+    static const bool cublas_32f = getenv("GGML_CUDA_FORCE_CUBLAS_COMPUTE_32F") != nullptr;
+    for (const auto & [name, t] : model.tensors_by_name) {
+        if (t != nullptr && !cublas_32f && t->type == GGML_TYPE_F16 && t->ne[1] > 1 && name.rfind("blk.", 0) == 0 &&
+            name.size() > 7 && name.compare(name.size() - 7, 7, ".weight") == 0) {
             return false;
         }
     }

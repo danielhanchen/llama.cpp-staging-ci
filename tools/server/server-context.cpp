@@ -3557,6 +3557,30 @@ private:
             common_speculative_rows_ok(spec.get());
     }
 
+    // k15-ttft (LLAMA_CKPT_NEAR_MERGE=1: on, opt-in): the near prompt checkpoint (4 tokens before the end) from a capture inside the prompt's
+    // decode. Only for a slot alone in the batch, no mtmd input, speculative impls that read the target rows of a segment, a memory
+    // whose partial state is the recurrent rows (llama_state_capture_supported), and where create_checkpoint_captured can make the
+    // checkpoint: a draft without a partial state and no speculative state stashed per checkpoint (else the separate call, as before)
+    bool near_ckpt_merge_ok(const server_slot & slot, int32_t n_tokens_prev) const {
+        // opt-in (LLAMA_CKPT_NEAR_MERGE=1): exact and multi-turn reuse unchanged, but slower on G4 (Qwen3.6 MTP 32 GB chat 1413 -> 1269
+        // prompt tok/s, TTFT 54 -> 61 ms; 2k -2.4%; 12 GB chat -2.6%): the merged decode is GPU-bound for longer after its last launch
+        // than the two separate calls (plans/k15_models.md round 11)
+        static const bool on = getenv("LLAMA_CKPT_NEAR_MERGE") != nullptr && atoi(getenv("LLAMA_CKPT_NEAR_MERGE")) != 0;
+        static const bool cap_env = getenv("LLAMA_LM_CKPT_CAPTURE") == nullptr || atoi(getenv("LLAMA_LM_CKPT_CAPTURE")) != 0;
+        if (!on || !cap_env || n_tokens_prev != 0 || slot.task->tokens.has_mtmd || !llama_state_capture_supported(ctx_tgt) ||
+                !common_speculative_rows_ok(spec.get())) {
+            return false;
+        }
+        if (ctx_dft && llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) > 16) {
+            return false;
+        }
+        std::vector<uint8_t> ds;
+        if (common_speculative_get_state(spec.get(), slot.id, ds) && !ds.empty()) {
+            return false;
+        }
+        return true;
+    }
+
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -4466,11 +4490,24 @@ private:
                             // k11 rule (any prompt whose rest is at most N). Still opt-in: the KLD gate (plans/k11.md) failed on G4 for
                             // Qwen3.6-35B-A3B Q4 (first-token p99 0.0058 vs 0.0024 for -fa off), LFM2.5 (first-token mean 0.24 vs 0.065) and
                             // gemma-4 26B (decode top-1 98.9 vs 99.7%), plans/k13_pp.md section 7
-                            static const int ckpt_single_max = getenv("LLAMA_SERVER_CKPT_SINGLE_MAX") ? atoi(getenv("LLAMA_SERVER_CKPT_SINGLE_MAX")) : 0;
+                            // k15-ttft: on by default (N = 128) where the single pass is reassociation-only (plans/k11.md "Equivalence
+                            // rule", llama_single_pass_equivalent: all weights on CUDA, no host-computed expert, no F16 matmul weight) and
+                            // the split pass would run at least 4 tokens before its last 4 (below that MMVF F32 / FlashAttention vec kernels
+                            // take the first pass, other formats). An explicit LLAMA_SERVER_CKPT_SINGLE_MAX keeps the k11 meaning on every
+                            // placement (0 = off, the kill switch)
+                            static const char * ckpt_single_env = getenv("LLAMA_SERVER_CKPT_SINGLE_MAX");
+                            static const bool ckpt_single_eq = ckpt_single_env == nullptr && llama_single_pass_equivalent(ctx_tgt);
+                            static const int ckpt_single_max = [&] {
+                                const int v = ckpt_single_env ? atoi(ckpt_single_env) : (ckpt_single_eq ? 128 : 0);
+                                SRV_INF("single-pass short prompts: max %d (%s)\n", v, ckpt_single_env ? "LLAMA_SERVER_CKPT_SINGLE_MAX" :
+                                        ckpt_single_eq ? "default, reassociation-only placement" : "default, off on this placement");
+                                return v;
+                            }();
                             static const bool ckpt_single_any = getenv("LLAMA_SERVER_CKPT_SINGLE_ANY") != nullptr && atoi(getenv("LLAMA_SERVER_CKPT_SINGLE_ANY")) != 0;
                             const int n_batch_start = slot.prompt.n_tokens() - (int) (batch.size() - n_tokens_prev);
                             const int n_rest_batch = slot.task->n_tokens() - n_batch_start;
                             const bool ckpt_single = ckpt_single_max > 0 && n_rest_batch <= std::min<int>(ckpt_single_max, n_ubatch) &&
+                                (!ckpt_single_eq || n_rest_batch >= 8) &&
                                 (ckpt_single_any || slot.task->n_tokens() <= ckpt_single_max || (last_user_pos > 0 && n_batch_start == last_user_pos));
                             bool should_break = false;
                             for (int k = 0; k < 2; ++k) {
@@ -4493,6 +4530,17 @@ private:
                                             lm_cap_n_tokens = slot.prompt.n_tokens();
                                             lm_cap_batch    = batch.size();
                                         }
+                                        break;
+                                    }
+                                    // k15-ttft: the checkpoint 4 tokens before the end is taken inside this decode (llama_set_state_capture)
+                                    // instead of after a decode of its own: the same ubatches (the last 4 tokens still run as one), one call,
+                                    // no host gap between them, and under layer-major prompts one expert pass (see near_ckpt_merge_ok)
+                                    if (k == 1 && do_checkpoint && lm_cap_slot < 0 && batch.size() + n_last <= n_batch &&
+                                            near_ckpt_merge_ok(slot, n_tokens_prev)) {
+                                        lm_breaks.push_back(batch.size());
+                                        lm_cap_slot     = slot.id;
+                                        lm_cap_n_tokens = slot.prompt.n_tokens();
+                                        lm_cap_batch    = batch.size();
                                         break;
                                     }
                                     should_break = true;
@@ -4686,13 +4734,11 @@ private:
             llama_set_ubatch_breaks(ctx_tgt, seg_breaks.data(), (int32_t) seg_breaks.size());
             SRV_DBG("k11 merged prompt batch of %d tokens, %zu ubatch breaks (first at %d)\n", batch.view.size(), seg_breaks.size(), seg_breaks[0]);
         }
-        queue_tasks.yield_to_queue([&]() {
-            ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
-            if (ret == 0 && has_output) {
-                llama_synchronize(ctx_tgt);
-            }
-        });
-        if (lm_cap_req) {
+        // k15-ttft: the captured checkpoint is made before the wait for the batch's outputs, so its bookkeeping and the queued copies
+        // overlap the ubatches still computing (made after the wait, the near checkpoint's merge cost G4 Qwen3.6 32 GB chat 6 ms of TTFT);
+        // LLAMA_CKPT_CAP_EARLY=0: after the wait, as k15-pp did
+        static const bool cap_early = getenv("LLAMA_CKPT_CAP_EARLY") == nullptr || atoi(getenv("LLAMA_CKPT_CAP_EARLY")) != 0;
+        auto cap_checkpoint = [&]() {
             llama_pos cap_pos = -1;
             if (ret == 0 && llama_state_seq_captured(ctx_tgt, lm_cap_slot, &cap_pos)) {
                 for (auto & slot : slots) {
@@ -4702,6 +4748,19 @@ private:
                 }
             }
             lm_cap_slot = -1;
+        };
+        const bool sync_after = lm_cap_req && cap_early;   // the checkpoint (slot state) is made on this thread, outside the yield
+        queue_tasks.yield_to_queue([&]() {
+            ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            if (ret == 0 && has_output && !sync_after) {
+                llama_synchronize(ctx_tgt);
+            }
+        });
+        if (lm_cap_req) {
+            cap_checkpoint();
+        }
+        if (sync_after && ret == 0 && has_output) {
+            llama_synchronize(ctx_tgt);
         }
 
         if (ret != 0) {

@@ -120,6 +120,8 @@ LLAMA_API void llama_set_ubatch_breaks(struct llama_context * ctx, const int32_t
 #define LLAMA_STATE_SEQ_FLAGS_CAPTURED 8
 LLAMA_API bool llama_set_state_capture(struct llama_context * ctx, llama_seq_id seq_id, int32_t i_batch);
 LLAMA_API bool llama_state_seq_captured(const struct llama_context * ctx, llama_seq_id seq_id, llama_pos * pos_max);
+// k15-ttft: whether llama_set_state_capture can take a capture in this context (a recurrent memory, beside a non-SWA KV cache if hybrid)
+LLAMA_API bool llama_state_capture_supported(const struct llama_context * ctx);
 // layer-major prompt groups can run in this context (a MoE cache with layer-major prompts on)
 LLAMA_API bool llama_layer_major_on(const struct llama_context * ctx);
 // k15-pp: a batch of n_before + n_after prompt tokens of one sequence with a ubatch break (llama_set_ubatch_breaks) after n_before would
@@ -159,6 +161,13 @@ LLAMA_API int32_t llama_arch_rollback_state(const char * arch_name);
 // k11-decode: every layer weight of the context's model is in device memory and no MoE cache runs: the placement where batch
 // invariant verify gives the bytes of single token decodes
 LLAMA_API bool llama_verify_exact_placement(const struct llama_context * ctx);
+
+// k15-ttft: a prompt run as one ubatch instead of [n-4] [4] differs from the split run only by IEEE reassociation (plans/k11.md
+// "Equivalence rule"): every layer weight is computed on a CUDA device with no host-computed expert (llama_verify_exact_placement and
+// llama_moe_host_mode == 0), and no F16 matmul weight (cuBLAS accumulates F16 products in F16 above 16 rows, MMF in F32 below).
+// On such a placement both shapes use the same formats: q8_1 activations into int8 MMVQ / MMQ with F32 accumulation, TF32 for F32
+// weights (MMF and cuBLAS SGEMM under CUBLAS_TF32_TENSOR_OP_MATH), BF16 in / F32 out, FlashAttention MMA F16 (at least 4 rows)
+LLAMA_API bool llama_single_pass_equivalent(const struct llama_context * ctx);
 
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
