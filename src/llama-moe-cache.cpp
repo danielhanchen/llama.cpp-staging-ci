@@ -3173,7 +3173,7 @@ struct llama_moe_cache::impl {
     int ua_protect = 4;
     std::vector<uint8_t> ua_busy;
     std::vector<std::pair<int64_t, int32_t>> ua_cand;
-    int  ua_victims = 2;
+    int  ua_victims = 3;
     bool ua_verify  = false;
     uint64_t ua_verified = 0, ua_bad = 0;
     size_t   ua_up_last = 0;
@@ -3196,7 +3196,7 @@ struct llama_moe_cache::impl {
         const char * env_b = getenv("LLAMA_MOE_UPLOAD_AHEAD_BUDGET");
         ua_budget = env_b != nullptr ? (float) atof(env_b) : 1.5f;
         const char * env_v = getenv("LLAMA_MOE_UPLOAD_AHEAD_VICTIMS");
-        ua_victims = env_v != nullptr ? atoi(env_v) : 2;
+        ua_victims = env_v != nullptr ? atoi(env_v) : 3;
         const char * env_p = getenv("LLAMA_MOE_UPLOAD_AHEAD_PROTECT");
         ua_protect = env_p != nullptr ? std::max(0, atoi(env_p)) : 4;
         ua_verify  = getenv("LLAMA_MOE_UPLOAD_AHEAD_VERIFY") != nullptr && atoi(getenv("LLAMA_MOE_UPLOAD_AHEAD_VERIFY")) != 0;
@@ -3851,7 +3851,7 @@ struct llama_moe_cache::impl {
         }
         // classes: 0 free slots; 1 the slots of layer j whose expert no token predicts within its top k + LLAMA_MOE_UPLOAD_AHEAD_PROTECT
         // (4) and the slots of the layers this ubatch computed already; 2 the layers after j+1. Within a class the policy's order (lowest
-        // counter, then least recent). LLAMA_MOE_UPLOAD_AHEAD_VICTIMS=1: classes 0 and the layer j part of 1 only
+        // counter, then least recent). LLAMA_MOE_UPLOAD_AHEAD_VICTIMS=1: classes 0 and the layer j part of 1 only, 2: classes 0 and 1
         auto & cand = ua_cand;
         cand.clear();
         int64_t pos = 0;
@@ -3871,7 +3871,7 @@ struct llama_moe_cache::impl {
                 cls = 1;
             } else if (ua_victims >= 2 && key / n_expert < il) {
                 cls = 1;
-            } else if (ua_victims >= 2 && key / n_expert > j + 1) {
+            } else if (ua_victims >= 3 && key / n_expert > j + 1) {
                 cls = 2;
             } else {
                 continue;
