@@ -4514,7 +4514,13 @@ private:
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
-                    const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
+                    // k15-small4: a layer-major batch merged across the far checkpoint (lm_cap_*) ends, for this rule, where that checkpoint
+                    // is captured, as the batches without the merge do: else the batch before it counted as near the end and made a checkpoint
+                    // of its own at its start (q3m 4 GB, 8k prompt at n_batch 8192: 3 checkpoints of 62.8 MiB instead of 2, RssAnon +63 MiB
+                    // per long prompt). LLAMA_SERVER_CKPT_MERGED_END=0: the end of the merged batch, as before
+                    static const bool ckpt_merged_end = getenv("LLAMA_SERVER_CKPT_MERGED_END") == nullptr || atoi(getenv("LLAMA_SERVER_CKPT_MERGED_END")) != 0;
+                    const int64_t n_tokens_end = ckpt_merged_end && lm_cap_slot == slot.id && lm_cap_n_tokens > 0 ? lm_cap_n_tokens : slot.prompt.n_tokens();
+                    const bool near_prompt_end = slot.task->n_tokens() < n_tokens_end + n_ubatch;
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;

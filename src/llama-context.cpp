@@ -23,6 +23,9 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -3723,6 +3726,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     auto lm_hybrid_ok = [&]() { return lm_hybrid_frac_ok(moe_cache->cache_frac()); };
     const auto & hparams = model.hparams;
     const int64_t n_vocab = model.vocab.n_tokens();
+    const int64_t lm_t_start = ggml_time_us(); // the CUDA graphs used from here on are the group's (evicted with its host memory)
 
     // ubatches that can run layer-major: prompt ubatches whose host experts are prefetched whole (the copy is the same for every ubatch)
     auto eligible = [&](const llama_ubatch & ub) {
@@ -4854,6 +4858,40 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
 
     // the next graph is built anew
     gf_res_prev_active = nullptr; gf_res_epoch++;
+
+    // k15-small4: the host memory of the group (its input arena, mostly the KQ masks of every member, and the members' graph results) is
+    // freed after it instead of kept for the next prompt: kept, it stayed in the process after every long prompt (q3m 4 GB, 8k prompt:
+    // RssAnon +235 MiB against ubatch by ubatch, T4 / G4 +160-176 MiB after the bench cells). The routing kept for the seed of the next
+    // ubatch is copied to host memory first (as when the compute buffers shrink). LLAMA_MOE_LM_KEEP_HOST=1 (or LLAMA_MOE_LAYER_MAJOR_EAGER=1)
+    // keeps them
+    static const bool lm_keep_host = (getenv("LLAMA_MOE_LM_KEEP_HOST") != nullptr && atoi(getenv("LLAMA_MOE_LM_KEEP_HOST")) != 0) ||
+                                     (getenv("LLAMA_MOE_LAYER_MAJOR_EAGER") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_EAGER")) != 0);
+    if (!lm_keep_host) {
+        ggml_backend_sched_synchronize(sched.get());
+        lm_ids_host_keep();
+        ggml_backend_sched_reset(sched.get());
+        lm_arena.reset();
+        lm_arena_old.clear();
+        lm_arena_used = 0;
+        lm_inp_buf.clear();
+        lm_res.clear();
+        // the backends' cached CUDA graphs of the group's splits (host-side node records of 16 ubatches, keyed by the freed nodes)
+        for (auto & bk : backend_ptrs) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(bk);
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto fn = reg ? (size_t (*)(ggml_backend_t, int64_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_evict_since") : nullptr;
+            if (fn != nullptr) {
+                fn(bk, lm_t_start);
+            }
+        }
+#if defined(__GLIBC__)
+        // the graph results' metadata are large heap blocks that glibc keeps after free (its mmap threshold grows with the first such free)
+        static const bool lm_trim = getenv("LLAMA_MOE_LM_TRIM") == nullptr || atoi(getenv("LLAMA_MOE_LM_TRIM")) != 0;
+        if (lm_trim) {
+            malloc_trim(0);
+        }
+#endif
+    }
 
     return (int) group.size();
 }
