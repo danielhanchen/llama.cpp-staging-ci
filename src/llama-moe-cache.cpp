@@ -3739,6 +3739,44 @@ struct llama_moe_cache::impl {
     }
     int pin_log_n = 0;
 
+    // k15-lfm2 LLAMA_MOE_CPU_MISS_PER_REQUEST (opt-in): the rule's decisions of a request do not depend on the requests before it. At each
+    // request the per-size decisions and the miss rate go back to those of the first request (the calibrated prior), the miss-rate
+    // window starts over (its first window is the short one, so the request decides from its own small batches), and after the first
+    // timing trial no further one runs (one trial verdict per launch: later trials flip on differences of a few percent, G4 LFM2.5
+    // 12 GB 16k 222 vs 291 tok/s from one 3.10 vs 3.01 ms trial). Without CPU misses (pinned, LLAMA_MOE_CPU_MISS=0) nothing changes
+    bool cm_req_snap = false;
+    std::vector<uint8_t> cm_on_snap;
+    double cm_rate_snap = -1.0;
+    bool   cm_measured_snap = false;
+    int    cm_req_n = 0;
+    void cm_request_begin() {
+        static const bool on = [] { const char * e = getenv("LLAMA_MOE_CPU_MISS_PER_REQUEST"); return e != nullptr && atoi(e) != 0; }();
+        if (!on || !cm || !cm_cal || cm_force || cm_frozen) {
+            return;
+        }
+        cm_req_n++;
+        if (!cm_req_snap) {
+            cm_on_snap       = cm_on;
+            cm_rate_snap     = cm_rate;
+            cm_measured_snap = cm_measured;
+            cm_req_snap      = true;
+        } else {
+            cm_on       = cm_on_snap;
+            cm_rate     = cm_rate_snap;
+            cm_measured = cm_measured_snap;
+        }
+        cm_have0 = false;
+        cm_nb    = 0;
+        cm_win   = cm_win1;
+        if (cmt_n > 0 && cmt_done < 0) {
+            cmt_wait = -1;
+        }
+        cm_gen++;
+        if (cm_req_n <= 2) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: request %d starts from the launch's decisions (LLAMA_MOE_CPU_MISS_PER_REQUEST)\n", tag, cm_req_n);
+        }
+    }
+
     // a batch of more than max_batch tokens (a short prompt) that the host path serves: it is looked up on the device like a small batch
     // short prompts take the host path only once a trial found it faster for the small batches on this host and model (without a
     // trial: the model alone). G4 gpt-oss-20b Q2_K 8 GB and T4 Qwen3.6 UD-Q4_K_XL 8 GB without a draft: trials off, the 95-token chat
@@ -7280,6 +7318,10 @@ bool llama_moe_cache::pin_small() {
 
 bool llama_moe_cache::pin_small_set(bool on) {
     return pimpl->cm_pin_set(on);
+}
+
+void llama_moe_cache::request_begin() {
+    pimpl->cm_request_begin();
 }
 
 bool llama_moe_cache::cpu_miss_drop_slow() {

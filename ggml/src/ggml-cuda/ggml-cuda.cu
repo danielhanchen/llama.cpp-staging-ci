@@ -2088,6 +2088,19 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     // batch invariant (speculative verify batches): every column gets the bytes a single column (ne11 == 1) would get
     if ((dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) && ne11 > 1) {
+        // k15-lfm2, GGML_CUDA_VERIFY_MMQ=1 (opt-in): a quantized dense verify product of up to 16 columns runs MMQ (int8 tensor cores,
+        // Turing+) instead of the batched mmvq: the same q8_1 activations into the same int8 products with f32 accumulation, only the
+        // order of the f32 scale products and sums differs (plans/k11.md equivalence rule). T4 at 8 rows the dp4a mmvq is compute-bound
+        // (2x one row, plans/k15_lfm2.md section 11b)
+        static const bool verify_mmq = [] {
+            const char * e = getenv("GGML_CUDA_VERIFY_MMQ");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (verify_mmq && ne11 <= 16 && ne12*ne13 == 1 && ggml_is_quantized(src0->type) && turing_mma_available(cc) &&
+                ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+            ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+            return;
+        }
         // the vector kernels compute each column like their single column launch (mmvq: with the warps of that launch)
         if (ne11 <= MMVF_MAX_BATCH_SIZE && ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, 1)) {
             ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);

@@ -8367,6 +8367,18 @@ bool llama_moe_pin_small_set(llama_context * ctx, bool on) {
     return ctx != nullptr && ctx->moe_pin_small_set(on);
 }
 
+void llama_context::moe_request_begin() {
+    if (moe_cache != nullptr) {
+        moe_cache->request_begin();
+    }
+}
+
+void llama_moe_request_begin(llama_context * ctx) {
+    if (ctx != nullptr) {
+        ctx->moe_request_begin();
+    }
+}
+
 bool llama_context::moe_cpu_miss_drop_slow() {
     if (moe_cache == nullptr || !moe_cache->cpu_miss_drop_slow()) {
         return false;

@@ -110,6 +110,7 @@ struct llama_context {
     bool moe_freeze_small(); // k13: see llama_moe_freeze_small
     bool moe_pin_small();    // k13: see llama_moe_pin_small
     bool moe_pin_small_set(bool on); // k15-lfm2: see llama_moe_pin_small_set
+    void moe_request_begin();        // k15-lfm2: see llama_moe_request_begin
     bool moe_cpu_miss_drop_slow(); // k15-lfm2: see llama_moe_cpu_miss_drop_slow
     const llama_cparams & get_cparams() const;
 
