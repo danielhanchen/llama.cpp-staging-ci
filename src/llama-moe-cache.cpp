@@ -845,7 +845,7 @@ struct llama_moe_cache::impl {
     int      cm_recal_after = 64;
     int      cm_recal_wait  = -1;
     static constexpr double cm_recal_tol = 0.20;
-    // k15-lfm2 LLAMA_MOE_CPU_MISS_STABLE (default 1; 0 = k15): one decision per launch, not one of two modes drawn from a noisy timing
+    // k15-lfm2 LLAMA_MOE_CPU_MISS_STABLE (opt-in =1; default 0 = k15 until the KLD band ruling, plans/k15_lfm2.md section 13): one decision per launch, not one of two modes drawn from a noisy timing
     // sample. The fetch share of a small batch sat on the 1/4 - 1/2 level boundary (raw share 0.354, the geometric midpoint) in the
     // cells whose calibrated raw share is 0.33-0.43 (G4: Qwen3.8-Flash-Next UD-IQ4_XS 32 GB host 22.6-34.5 us per expert against an
     // upload of 46 us, Qwen3.6 UD-Q3_K_M 8 GB 14.5-18.6 against 29): launches that drew a fast start-up sample fetched 1/4 and computed
@@ -858,7 +858,7 @@ struct llama_moe_cache::impl {
     // keeps the faster host time and decides again (see cm_calibrate)
     const bool cm_stable = [] {
         const char * e = getenv("LLAMA_MOE_CPU_MISS_STABLE");
-        return e == nullptr || atoi(e) != 0;
+        return e != nullptr && atoi(e) != 0;
     }();
     const double cm_small_half = [this] {
         const char * e = getenv("LLAMA_MOE_CPU_MISS_SMALL_HALF");
