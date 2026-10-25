@@ -2343,7 +2343,7 @@ struct llama_moe_cache::impl {
         // still allocated then; wstore is not used here
         single_stop_all();
         profile_save();
-        ua_drain();
+        ua_shutdown();
         log_stats();
         ua_free();
         for (const auto & [unmap, buf] : mapped) {
@@ -3321,6 +3321,19 @@ struct llama_moe_cache::impl {
         u.up = nullptr;
     }
 
+    // at the destruction: the context's backends may be gone, only the upload streams are waited for
+    void ua_shutdown() {
+        for (auto & u : ua_devs) {
+            if (u.up != nullptr) {
+                ggml_backend_synchronize(u.up);
+            }
+        }
+        ua_st.layers += ua_st_ub.layers; ua_st.admitted += ua_st_ub.admitted; ua_st.hit += ua_st_ub.hit; ua_st.waste += ua_st_ub.waste;
+        ua_st.lost += ua_st_ub.lost; ua_st.miss_rest += ua_st_ub.miss_rest; ua_st.bytes += ua_st_ub.bytes; ua_st.waste_bytes += ua_st_ub.waste_bytes;
+        ua_st.fallback += ua_st_ub.fallback;
+        ua_st_ub = {};
+    }
+
     void ua_free() {
         for (auto & u : ua_devs) {
             ua_free_dev(u);
@@ -3611,6 +3624,30 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // the slot map of layer il is read by a lookup of the graph (not by a copy, see copy): its admissions ahead keep their slots, the
+    // compute stream waits for the uploads ahead and uploads the banks not sent yet before the lookup reads them
+    void ua_lookup_guard(ggml_backend_t backend, group & g, int32_t il) {
+        if (ua_mode <= 0 || ua_l.empty() || (size_t) g.id >= ua_devs.size() || ua_devs[g.id].up == nullptr) {
+            return;
+        }
+        ua_layer_t & L = ua_l[il];
+        if (L.epoch != ua_epoch || L.experts.empty()) {
+            return;
+        }
+        ua_dev_t & u = ua_devs[g.id];
+        ggml_backend_event_record(u.drain_ev, u.up);
+        ggml_backend_event_wait(backend, u.drain_ev);
+        for (size_t ip = 0; ip < L.bank_sent.size(); ++ip) {
+            L.bank_ev[ip] = -1;
+            if (!L.bank_sent[ip] && !ua_send_bank(g, il, (int) ip, backend)) {
+                ua_drop(g, il);
+                return;
+            }
+        }
+        ua_st_ub.fallback++;
+        L.resolved = true;
+    }
+
     // the uploads ahead of the layer of w that the compute stream has not waited for
     bool ua_pending(const ggml_tensor * w) const {
         const auto it = bindings.find(w);
@@ -3667,8 +3704,9 @@ struct llama_moe_cache::impl {
     // the router of layer il+1 on the router input of layer il, on the device; read after the copies of il are issued
     void ua_predict(ggml_backend_t backend, group & g, int32_t il, const ggml_tensor * ids) {
         const int32_t j = il + 1;
-        if ((size_t) j >= layers.size() || layers[j].ig != layers[il].ig || ua_router[j] == nullptr || ua_router[il] == nullptr || host_layer(j)) {
-            return;
+        if ((size_t) j >= layers.size() || layers[j].ig != layers[il].ig || ua_router[j] == nullptr || ua_router[il] == nullptr || host_layer(j) ||
+                g.host_read) {
+            return; // (a graph that reads the group through lookups uploads its misses at each lookup)
         }
         const ggml_tensor * x = ua_router_input(il, ids);
         const ggml_tensor * wj = ua_router[j];
@@ -6453,6 +6491,9 @@ struct llama_moe_cache::impl {
         group & g = groups[l.ig];
 
         GGML_ASSERT(backend == devices[g.id].backend);
+
+        // k15-pred: a lookup reads the slots through the slot map: the experts admitted ahead get every bank first
+        ua_lookup_guard(backend, g, il);
 
         // the get_rows that looks up the slots of the selected experts
         const int n_nodes = ggml_graph_n_nodes(graph);
