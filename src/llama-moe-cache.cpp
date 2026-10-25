@@ -3984,6 +3984,8 @@ struct llama_moe_cache::impl {
             }
             if (ua_victims == 3 && cls > 0) {
                 cls = 1; // one class: the policy's order over every allowed slot
+            } else if (ua_victims == 4 && cls > 0) {
+                cls = cls == 3 ? 2 : 1; // the layer and the computed layers in the policy's order, then the later layers
             }
             cand.push_back({ (cls << 58) + (v << 24) + pos, s });
         }
