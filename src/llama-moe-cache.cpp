@@ -3181,7 +3181,7 @@ struct llama_moe_cache::impl {
     int64_t ua_prev_tokens = 0;
     bool ua_off = false; // an upload could not be issued: no more uploads ahead (the admitted ones are dropped by the drain)
     struct ua_stats_t {
-        uint64_t layers = 0, admitted = 0, hit = 0, waste = 0, lost = 0, miss_rest = 0, bytes = 0, waste_bytes = 0, fallback = 0;
+        uint64_t layers = 0, admitted = 0, hit = 0, waste = 0, lost = 0, miss_rest = 0, bytes = 0, waste_bytes = 0, fallback = 0, blocked = 0;
     } ua_st, ua_st_ub;
 
     void init_upload_ahead(const llama_model & model) {
@@ -3537,8 +3537,8 @@ struct llama_moe_cache::impl {
         if (ua_log > 2) {
             for (const group & g : groups) {
                 const int64_t n_mapped = std::count_if(g.lru.key_of.begin(), g.lru.key_of.end(), [](int32_t k) { return k >= 0; });
-                LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead: group of %zu layers: %" PRId64 " of %d slots mapped, %d lent, dev_newer %d\n", tag,
-                    g.layers.size(), n_mapped, g.n_slots, g.lru.n_lent, (int) g.dev_newer);
+                LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead: group of %zu layers: %" PRId64 " of %d slots mapped, %d lent, dev_newer %d, %" PRIu64 " reads blocked\n", tag,
+                    g.layers.size(), n_mapped, g.n_slots, g.lru.n_lent, (int) g.dev_newer, ua_st_ub.blocked);
             }
         }
         ua_up_last = stats_upload.bytes;
@@ -6451,6 +6451,7 @@ struct llama_moe_cache::impl {
 
         // k15-pred: a layer with experts admitted ahead of its routing whose bank is not uploaded is read from the host
         if (!ua_readable(b.il, b.ip)) {
+            ua_st_ub.blocked++;
             return 0;
         }
 
