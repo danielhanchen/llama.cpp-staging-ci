@@ -5878,6 +5878,10 @@ struct llama_moe_cache::impl {
         const layer & l = layers[il];
 
         // k15-lfm2: a large batch reads its experts in place (see prompt_of)
+        if (n_tokens > max_batch && il < 2 && getenv("LLAMA_MOE_PROMPT_INPLACE_DEBUG") != nullptr) {
+            LLAMA_LOG_INFO("%s: layer %d tokens %lld ok %d ubatch %d cm %d hybrid %d\n", __func__, il, (long long) n_tokens, (int) prompt_inplace_ok(il),
+                (int) prompt_ubatch_ok, (int) cm, (int) hybrid);
+        }
         if (n_tokens > max_batch && prompt_inplace_ok(il)) {
             return l.prompt_map;
         }
@@ -7265,6 +7269,9 @@ void llama_moe_cache::prompt_inplace_block(bool blocked) {
 
 void llama_moe_cache::prompt_ubatch(bool ok) {
     pimpl->prompt_ubatch_ok = ok;
+    if (getenv("LLAMA_MOE_PROMPT_INPLACE_DEBUG") != nullptr) {
+        LLAMA_LOG_INFO("%s: in-place %d\n", __func__, (int) ok);
+    }
 }
 
 bool llama_moe_cache::prompt_inplace_on() const {
