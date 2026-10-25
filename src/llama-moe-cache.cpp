@@ -5736,7 +5736,12 @@ struct llama_moe_cache::impl {
         if (gc == nullptr || dry || prompt_group_full(*gc)) {
             return;
         }
-        group & g = const_cast<group &>(*gc);
+        prompt_lend_now(const_cast<group &>(*gc), backend);
+    }
+    // (the scheduler calls lend() only for graphs with prefetched copies: an in-place prompt lends here when its first layer is copied, and a
+    // graph without in-place layers gives the slots back, see set_graph)
+    bool prompt_lent = false;
+    void prompt_lend_now(group & g, ggml_backend_t backend) {
         const int32_t n = g.lru.n_expert;
         if (g.lru.n_lent >= n) {
             return;
@@ -5748,6 +5753,7 @@ struct llama_moe_cache::impl {
         seed_end(g);
         keep_evicted(g, n);
         g.lru.set_lent(n);
+        prompt_lent = true;
         if (!prompt_log_done) {
             prompt_log_done = true;
             LLAMA_LOG_INFO("%s: %s: MoE cache: large batches read the cached experts in place, %d of %d slots (%.2f MiB) lent for the missing ones "
@@ -5800,6 +5806,9 @@ struct llama_moe_cache::impl {
         size_t n_hit = 0;
         const bool full = prompt_group_full(g);
         const bool lends = prompt_lend_group(g.id) == &g;
+        if (!full && lends && g.lru.n_lent < ne && g.n_slots/2 >= ne) {
+            prompt_lend_now(g, backend);
+        }
         int32_t base = -1;
         if (!full && lends && g.lru.n_lent >= ne) {
             base = g.n_slots - g.lru.n_lent;
@@ -5882,6 +5891,15 @@ struct llama_moe_cache::impl {
         for (int i = 0; gf != nullptr && i < ggml_graph_n_nodes(gf) && !inplace_graph; ++i) {
             const ggml_tensor * node = ggml_graph_node(gf, i);
             inplace_graph = node->op == GGML_OP_GET_ROWS && prompt_of.count(node->src[0]) > 0;
+        }
+        // the slots an in-place prompt lent come back for a graph without in-place layers (e.g. the decode after the prompt)
+        if (gf != nullptr && !inplace_graph && prompt_lent) {
+            prompt_lent = false;
+            for (group & g : groups) {
+                if (g.lru.n_lent > 0) {
+                    unlend(g);
+                }
+            }
         }
         for (group & g : groups) {
             g.host_read = false;
