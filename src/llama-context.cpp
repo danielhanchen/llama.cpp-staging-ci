@@ -5849,6 +5849,12 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
         st.ids = ids;
     }
 
+    // k15-pred: the experts uploaded ahead of this layer's routing are waited for, the next layer's are predicted (see llama_moe_cache)
+    const bool ua = lctx->moe_cache && !st.all && !st.counts.empty() && lctx->moe_cache->get_experts(src) != nullptr;
+    if (ua) {
+        lctx->moe_cache->upload_ahead_begin(backend, src, ids, st.counts);
+    }
+
     // group consecutive experts and copy them together
     // batched (e.g. CUDA >= 12.8): every cached run is copied from the MoE cache in one call with the uploads
     // otherwise only long cached runs are copied from the cache (many small copies cost more than they save), before the uploads
@@ -5941,6 +5947,9 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
     if (lctx->moe_cache_record && (ids->flags & GGML_TENSOR_FLAG_OUTPUT) && lctx->moe_cache->get_experts(src) != nullptr &&
             std::none_of(lctx->moe_cache_ids.begin(), lctx->moe_cache_ids.end(), [&](const auto & r) { return r.second == ids; })) {
         lctx->moe_cache_ids.emplace_back(src, ids);
+    }
+    if (ua) {
+        lctx->moe_cache->upload_ahead_end(backend, src);
     }
 
     return true;
