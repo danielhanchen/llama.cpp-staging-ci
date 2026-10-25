@@ -3503,6 +3503,13 @@ struct llama_moe_cache::impl {
             L.slots.clear();
             L.vkeys.clear();
         }
+        if (ua_verify) {
+            for (group & g : groups) {
+                if (g.n_slots > 0 && !g.dev_newer && ua_dev_ok(g.id)) {
+                    verify(g, "after uploads ahead");
+                }
+            }
+        }
         if (ua_verify && ua_verified > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead verified: %" PRIu64 " expert tensors, %" PRIu64 " mismatches\n", tag, ua_verified, ua_bad);
         }
