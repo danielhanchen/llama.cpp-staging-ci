@@ -818,6 +818,25 @@ struct llama_moe_cache::impl {
     int      cm_recal_after = 64;
     int      cm_recal_wait  = -1;
     static constexpr double cm_recal_tol = 0.20;
+    // k15-lfm2 LLAMA_MOE_CPU_MISS_STABLE (default 1; 0 = k15): one decision per launch, not one of two modes drawn from a noisy timing
+    // sample. The fetch share of a small batch sat on the 1/4 - 1/2 level boundary (raw share 0.354, the geometric midpoint) in the
+    // cells whose calibrated raw share is 0.33-0.43 (G4: Qwen3.8-Flash-Next UD-IQ4_XS 32 GB host 22.6-34.5 us per expert against an
+    // upload of 46 us, Qwen3.6 UD-Q3_K_M 8 GB 14.5-18.6 against 29): launches that drew a fast start-up sample fetched 1/4 and computed
+    // twice the host rows (45435 vs 22865 per run, fn4) at 28.6-30.5 us per row in the decode (not the 23 us of the sample), and decoded
+    // 7-9% faster than the launches at 1/2. The balance the share comes from treats a fetch as running beside the device work, while
+    // the fetch reads host memory in the device stream and the host experts run beside it: small batches take 1/4 up to a raw share of
+    // cm_small_half (LLAMA_MOE_CPU_MISS_SMALL_HALF, default 0.47; 0.354 = k15), which holds a host up to 0.89x the upload time per
+    // expert at 1/4. Of 3500 start-up calibrations in this workspace's G4 / L4 / T4 logs, the ones in 0.354-0.472 (Flash-Next, q3m,
+    // a few gemma-4 / q4x launches) are the minority mode of their cell; the other levels are unchanged. Also an agreeing re-calibration
+    // keeps the faster host time and decides again (see cm_calibrate)
+    const bool cm_stable = [] {
+        const char * e = getenv("LLAMA_MOE_CPU_MISS_STABLE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const double cm_small_half = [this] {
+        const char * e = getenv("LLAMA_MOE_CPU_MISS_SMALL_HALF");
+        return !cm_stable ? 0.354 : e != nullptr ? std::min(0.612, std::max(0.177, atof(e))) : 0.47;
+    }();
     bool     cm_recal_pending = false; // (timed only between requests: 2 x ~40 ms inside a reply cost chat decode 2% on G4)
     int      cm_nb    = 0;     // batches in the window
     int      cm_win   = cm_win1;
@@ -4284,16 +4303,24 @@ struct llama_moe_cache::impl {
             const double t1_new = std::max(slope, 0.05);
             const double dt_new = std::max(0.0, (d_t - d_a)/((double) ka*(T - 1)));
             const double rel    = std::fabs(t1_new - cm_t1)/std::max(cm_t1, 1e-3);
-            if (rel <= cm_recal_tol) {
+            // k15-lfm2 (cm_stable): an agreeing re-calibration also keeps the faster of the two and decides again below (before, it
+            // returned with the start-up decisions, which the next rule window, up to cm_win2 small batches later, then changed)
+            if (rel <= cm_recal_tol && cm_stable) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: re-calibration %.1f us per expert agrees with %.1f (within %.0f%%), host %.1f "
+                    "us per expert kept\n", tag, t1_new, cm_t1, 100.0*cm_recal_tol, std::min(cm_t1, t1_new));
+                cm_dt = t1_new < cm_t1 ? dt_new : cm_dt;
+                cm_t1 = std::min(cm_t1, t1_new);
+            } else if (rel <= cm_recal_tol) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: re-calibration %.1f us per expert agrees with %.1f (within %.0f%%)\n", tag,
                     t1_new, cm_t1, 100.0*cm_recal_tol);
                 return;
+            } else {
+                const double t1_old = cm_t1;
+                cm_t1 = std::min(cm_t1, t1_new);
+                cm_dt = t1_new < t1_old ? dt_new : cm_dt;
+                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: re-calibration %.1f us per expert vs %.1f at start-up (%.0f%% apart): host %.1f us "
+                    "per expert kept\n", tag, t1_new, t1_old, 100.0*rel, cm_t1);
             }
-            const double t1_old = cm_t1;
-            cm_t1 = std::min(cm_t1, t1_new);
-            cm_dt = t1_new < t1_old ? dt_new : cm_dt;
-            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: re-calibration %.1f us per expert vs %.1f at start-up (%.0f%% apart): host %.1f us "
-                "per expert kept\n", tag, t1_new, t1_old, 100.0*rel, cm_t1);
         } else {
             cm_t1    = std::max(slope, 0.05);
             cm_dt    = std::max(0.0, (d_t - d_a)/((double) ka*(T - 1)));
@@ -4310,7 +4337,10 @@ struct llama_moe_cache::impl {
         GGML_UNUSED(attempt);
 
         cm_share.assign(cm_max + 1, 1.0f);
-        cm_on.assign(cm_max + 1, 0);
+        // cm_stable: a re-calibration keeps the decisions it decides again from (the hysteresis of the sizes that are on, the frozen sizes)
+        if (!recal || !cm_stable || cm_on.size() != (size_t) cm_max + 1) {
+            cm_on.assign(cm_max + 1, 0);
+        }
         // k11 LLAMA_MOE_CPU_MISS_FETCH_SCALE=s (opt-in, unset = 1): the fetched share scaled by s before the levels, with a level of 1/16
         // below 1/8. The balance above treats a fetch as running beside the device work, but the fetch kernel reads host memory in the
         // device stream (G4 q4x + MTP 8 GB nsys: 45% of the decode window), so the device side of the balance is slower than cm_tup says;
@@ -4324,8 +4354,10 @@ struct llama_moe_cache::impl {
             const double tbar = std::max(1.0, (double) n*std::min<int64_t>(n_expert_used, n_expert)/D);
             const double tc   = cm_t1 + (tbar - 1.0)*cm_dt;
             const double raw  = tc/(tc + cm_tup)*fetch_scale;
-            // log levels: two calibrations a little apart rarely fall on two sides of a level
-            cm_share[n] = raw <= 0.177 ? 0.125f : raw <= 0.354 ? 0.25f : raw <= 0.612 ? 0.5f : raw <= 0.80 ? 0.75f : 1.0f;
+            // log levels: two calibrations a little apart rarely fall on two sides of a level. k15-lfm2: small batches (at most
+            // max_batch tokens) take 1/4 up to cm_small_half instead of the geometric midpoint 0.354 (see cm_small_half)
+            const double half = n <= max_batch ? cm_small_half : 0.354;
+            cm_share[n] = raw <= 0.177 ? 0.125f : raw <= half ? 0.25f : raw <= 0.612 ? 0.5f : raw <= 0.80 ? 0.75f : 1.0f;
             if (fetch_scale != 1.0 && raw <= 0.088) {
                 cm_share[n] = 0.0625f;
             }
