@@ -3118,8 +3118,10 @@ struct llama_moe_cache::impl {
     // the wrong guesses are evicted (only their first tensor was sent), and each further expert tensor of the right ones is uploaded
     // on that stream one tensor ahead of its copy. The copies read the slots after waiting for those uploads (an event on the
     // compute stream), so the weights the experts compute with are the same bytes: only the order of the uploads changes.
-    // Victims: free slots, then the slots of layer p+1 itself whose experts are not predicted, so a wrong guess never evicts another
-    // layer's experts; budget LLAMA_MOE_UPLOAD_AHEAD_BUDGET (1.5) x the misses of layer p.
+    // Each upload ahead waits (an event) for the misses the compute stream uploads for the copy issued before it, so the real misses go
+    // first on the link. Victims (see ua_admit): free slots, then by the policy's order the slots of layer p+1 that no token predicts
+    // and the slots of the layers already computed, then the later layers (never p, p+1's predicted ones, p+2, or a slot a pending copy
+    // reads); a wrong guess frees its slot (the head of the list). Budget LLAMA_MOE_UPLOAD_AHEAD_BUDGET (1.5) x the misses of layer p.
     int     ua_mode   = 0;
     int     ua_topk   = 0;
     float   ua_budget = 1.5f;
@@ -3167,20 +3169,8 @@ struct llama_moe_cache::impl {
     std::vector<std::pair<float, int32_t>> ua_rank;
     std::vector<ggml_backend_copy_region> ua_regions;
     std::vector<int32_t> ua_want;
-    struct ua_restore_t {
-        int32_t slot;
-        int32_t key;   // the wrong guess the slot holds
-        int32_t vkey;  // the expert to restore
-        uint8_t banks; // the banks to upload again
-        bool    issued;
-    };
-    std::vector<ua_restore_t> ua_restores; // one group (device) per context in practice: the group of the slot is the group of key's layer
-    bool ua_restore_on = true;
-    std::vector<std::vector<uint8_t>> ua_rslot; // [group][slot] holds a wrong guess waiting for its restore (never a victim then)
-    uint64_t ua_restored = 0;
-    std::vector<uint8_t> ua_prot;
+    std::vector<uint8_t> ua_prot;  // [expert] within the top k + ua_protect of some token: never a victim of its own layer
     int ua_protect = 4;
-    bool ua_share = false;
     std::vector<uint8_t> ua_busy;
     std::vector<std::pair<int64_t, int32_t>> ua_cand;
     int  ua_victims = 2;
@@ -3189,7 +3179,7 @@ struct llama_moe_cache::impl {
     size_t   ua_up_last = 0;
     bool ua_off = false; // an upload could not be issued: no more uploads ahead (the admitted ones are dropped by the drain)
     struct ua_stats_t {
-        uint64_t layers = 0, admitted = 0, hit = 0, waste = 0, lost = 0, miss_rest = 0, bytes = 0, waste_bytes = 0, fallback = 0, restore_bytes = 0;
+        uint64_t layers = 0, admitted = 0, hit = 0, waste = 0, lost = 0, miss_rest = 0, bytes = 0, waste_bytes = 0, fallback = 0;
     } ua_st, ua_st_ub;
 
     void init_upload_ahead(const llama_model & model) {
@@ -3205,15 +3195,10 @@ struct llama_moe_cache::impl {
         ua_topk = env_k != nullptr ? std::max(1, atoi(env_k)) : (int) n_expert_used;
         const char * env_b = getenv("LLAMA_MOE_UPLOAD_AHEAD_BUDGET");
         ua_budget = env_b != nullptr ? (float) atof(env_b) : 1.5f;
-        const char * env_l = getenv("LLAMA_MOE_UPLOAD_AHEAD_LOG");
-        ua_log = env_l != nullptr ? atoi(env_l) : 0;
         const char * env_v = getenv("LLAMA_MOE_UPLOAD_AHEAD_VICTIMS");
         ua_victims = env_v != nullptr ? atoi(env_v) : 2;
         const char * env_p = getenv("LLAMA_MOE_UPLOAD_AHEAD_PROTECT");
         ua_protect = env_p != nullptr ? std::max(0, atoi(env_p)) : 4;
-        const char * env_r = getenv("LLAMA_MOE_UPLOAD_AHEAD_RESTORE");
-        ua_restore_on = env_r != nullptr && atoi(env_r) != 0;
-        ua_share = getenv("LLAMA_MOE_UPLOAD_AHEAD_SHARE") != nullptr && atoi(getenv("LLAMA_MOE_UPLOAD_AHEAD_SHARE")) != 0;
         ua_verify  = getenv("LLAMA_MOE_UPLOAD_AHEAD_VERIFY") != nullptr && atoi(getenv("LLAMA_MOE_UPLOAD_AHEAD_VERIFY")) != 0;
         ua_gating = (int) model.hparams.expert_gating_func;
         ua_router.assign(layers.size(), nullptr);
@@ -3354,10 +3339,6 @@ struct llama_moe_cache::impl {
             return;
         }
         ggml_backend_synchronize(ua_devs[id].up);
-        for (auto & r : ua_restores) {
-            r.banks = 0; // emptied below
-        }
-        ua_restore_end();
         for (size_t j = 0; j < ua_l.size(); ++j) {
             if (ua_l[j].epoch != 0 && groups[layers[j].ig].id == id) {
                 ua_drop(groups[layers[j].ig], (int32_t) j);
@@ -3461,9 +3442,6 @@ struct llama_moe_cache::impl {
 
     // before a graph: the uploads ahead are complete on the compute stream, the admissions not resolved by a routing are dropped
     void ua_drain() {
-        if (ua_mode > 0) {
-            ua_restore_issue(nullptr);
-        }
         if (ua_mode <= 0) {
             if (ua_log > 1 && stats_upload.bytes != ua_up_last) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead off; copies uploaded %.1f MiB\n", tag, (stats_upload.bytes - ua_up_last)/1048576.0);
@@ -3480,7 +3458,6 @@ struct llama_moe_cache::impl {
             ggml_backend_event_wait(devices[id].backend, u.drain_ev);
             u.used = false;
         }
-        ua_restore_end();
         for (size_t j = 0; j < ua_l.size(); ++j) {
             ua_layer_t & L = ua_l[j];
             if (L.epoch == 0) {
@@ -3524,15 +3501,14 @@ struct llama_moe_cache::impl {
         }
         if (ua_log > 0 && (ua_st_ub.layers > 0 || (ua_log > 1 && stats_upload.bytes != ua_up_last))) {
             LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead: %" PRIu64 " layers, %" PRIu64 " admitted, %" PRIu64 " right, %" PRIu64 " wrong, %" PRIu64
-                " hits lost, %" PRIu64 " misses left, %.1f MiB ahead, %.1f MiB wasted, %.1f MiB restored, %" PRIu64 " fallbacks; copies uploaded %.1f MiB\n", tag, ua_st_ub.layers, ua_st_ub.admitted,
+                " hits lost, %" PRIu64 " misses left, %.1f MiB ahead, %.1f MiB wasted, %" PRIu64 " fallbacks; copies uploaded %.1f MiB\n", tag, ua_st_ub.layers, ua_st_ub.admitted,
                 ua_st_ub.hit, ua_st_ub.waste, ua_st_ub.lost, ua_st_ub.miss_rest, ua_st_ub.bytes/1048576.0, ua_st_ub.waste_bytes/1048576.0,
-                ua_st_ub.restore_bytes/1048576.0, ua_st_ub.fallback, (stats_upload.bytes - ua_up_last)/1048576.0);
+                ua_st_ub.fallback, (stats_upload.bytes - ua_up_last)/1048576.0);
         }
         ua_up_last = stats_upload.bytes;
         ua_st.layers += ua_st_ub.layers; ua_st.admitted += ua_st_ub.admitted; ua_st.hit += ua_st_ub.hit; ua_st.waste += ua_st_ub.waste;
         ua_st.lost += ua_st_ub.lost; ua_st.miss_rest += ua_st_ub.miss_rest; ua_st.bytes += ua_st_ub.bytes; ua_st.waste_bytes += ua_st_ub.waste_bytes;
         ua_st.fallback += ua_st_ub.fallback;
-        ua_st.restore_bytes += ua_st_ub.restore_bytes;
         ua_st_ub = {};
         ua_epoch++;
         ua_il = -1;
@@ -3564,10 +3540,6 @@ struct llama_moe_cache::impl {
             if (L.epoch == ua_epoch && !L.resolved) {
                 size_t o = 0;
                 size_t n_wrong = 0;
-                uint8_t sent_mask = 0;
-                for (size_t ip = 0; ip < L.bank_sent.size() && ip < 8; ++ip) {
-                    sent_mask |= L.bank_sent[ip] ? (uint8_t) (1u << ip) : 0;
-                }
                 for (size_t i = 0; i < L.experts.size(); ++i) {
                     const int32_t e = L.experts[i];
                     const int32_t s = L.slots[i];
@@ -3584,12 +3556,6 @@ struct llama_moe_cache::impl {
                         L.vkeys[o] = vk;
                         o++;
                         ua_st_ub.hit++;
-                    } else if (vk >= 0 && ua_restore_on && sent_mask != 0 && L.bank_sent.size() <= 8) {
-                        // a wrong guess: the slot keeps the guess (never routed by this ubatch, so never read) until the banks sent
-                        // ahead are uploaded again for the expert it held, see ua_restore_issue; its other banks still hold that expert
-                        ua_restores.push_back({ s, il*n_expert + e, vk, sent_mask, false });
-                        ua_rslot_mark(layers[il].ig, s, true);
-                        n_wrong++;
                     } else {
                         g.lru.slot_map[il][e] = -1;
                         g.lru.key_of[s] = -1;
@@ -3753,111 +3719,7 @@ struct llama_moe_cache::impl {
         }
         if (ua_ncall == n_banks && ua_pred_j == il + 1) {
             ua_admit(g, il);
-        } else if (ua_ncall == n_banks) {
-            ua_restore_issue(backend); // the last layer predicted from: the restores overlap the rest of the graph
         }
-    }
-
-    // the wrong guesses get the banks sent ahead of the expert their slot held, on the upload stream after the work queued so far on the
-    // compute stream (the seeds of the ubatch write slots there); the slots are mapped to those experts again in ua_restore_end
-    void ua_restore_issue(ggml_backend_t backend) {
-        bool any = false;
-        for (const auto & r : ua_restores) {
-            any |= !r.issued;
-        }
-        if (!any) {
-            return;
-        }
-        for (size_t id = 0; id < ua_devs.size(); ++id) {
-            ua_dev_t & u = ua_devs[id];
-            if (u.up == nullptr) {
-                continue;
-            }
-            ggml_backend_t cb = backend != nullptr && ggml_backend_get_device(backend) == ggml_backend_get_device(devices[id].backend) ? backend : devices[id].backend;
-            ggml_backend_event_record(u.mark_ev, cb);
-            ggml_backend_event_wait(u.up, u.mark_ev);
-            u.marked = false;
-            u.used = true;
-        }
-        for (auto & r : ua_restores) {
-            if (r.issued) {
-                continue;
-            }
-            const int32_t q = r.vkey / layer_n_expert(r.key);
-            group & g = groups[layers[q].ig];
-            const int32_t ne = g.lru.n_expert;
-            r.issued = true;
-            if (g.lru.key_of[r.slot] != r.key || g.lru.slot_map[q][r.vkey % ne] >= 0 || !ua_dev_ok(g.id)) {
-                continue;
-            }
-            ua_regions.clear();
-            for (size_t ip = 0; ip < layers[q].experts.size(); ++ip) {
-                if (r.banks & (1u << ip)) {
-                    const ggml_tensor * w = layers[q].experts[ip];
-                    const size_t nb = w->nb[2];
-                    ua_regions.push_back({ w, (size_t) (r.vkey % ne)*nb, g.banks[ip], (size_t) r.slot*nb, nb });
-                    ua_st_ub.restore_bytes += nb;
-                }
-            }
-            if (!ua_regions.empty() && !ggml_backend_tensor_copy_regions_async(ua_devs[g.id].up, ua_regions.data(), ua_regions.size())) {
-                r.banks = 0; // not restored: the slot is emptied in ua_restore_end
-            }
-        }
-    }
-
-    // after the compute stream waited for the upload stream: the restored slots hold their experts again, the others are emptied
-    void ua_rslot_mark(int32_t ig, int32_t s, bool on) {
-        if (ua_rslot.size() != groups.size()) {
-            ua_rslot.resize(groups.size());
-        }
-        if ((int32_t) ua_rslot[ig].size() != groups[ig].lru.n_slots) {
-            ua_rslot[ig].assign(groups[ig].lru.n_slots, 0);
-        }
-        ua_rslot[ig][s] = on;
-    }
-
-    bool ua_rslot_get(int32_t ig, int32_t s) const {
-        return (size_t) ig < ua_rslot.size() && (size_t) s < ua_rslot[ig].size() && ua_rslot[ig][s];
-    }
-
-    void ua_restore_end() {
-        for (const auto & r : ua_restores) {
-            const int32_t q  = r.vkey / layer_n_expert(r.key);
-            group & g = groups[layers[q].ig];
-            ua_rslot_mark(layers[q].ig, r.slot, false);
-            const int32_t ne = g.lru.n_expert;
-            if (g.lru.key_of[r.slot] != r.key) {
-                continue; // the slot was given to another expert since (a seed or an admission wrote all of its banks or will)
-            }
-            g.lru.slot_map[r.key / ne][r.key % ne] = -1;
-            if (r.issued && r.banks != 0 && g.lru.slot_map[q][r.vkey % ne] < 0) {
-                g.lru.key_of[r.slot] = r.vkey;
-                g.lru.slot_map[q][r.vkey % ne] = r.slot;
-                ua_restored++;
-                if (ua_verify) {
-                    ggml_backend_synchronize(devices[g.id].backend);
-                    std::vector<uint8_t> buf;
-                    for (size_t ip = 0; ip < layers[q].experts.size(); ++ip) {
-                        const ggml_tensor * w = layers[q].experts[ip];
-                        const size_t nb = w->nb[2];
-                        buf.resize(nb);
-                        ggml_backend_tensor_get(g.banks[ip], buf.data(), (size_t) r.slot*nb, nb);
-                        ua_verified++;
-                        ua_bad += memcmp(buf.data(), (const uint8_t *) w->data + (size_t) (r.vkey % ne)*nb, nb) != 0;
-                    }
-                }
-            } else {
-                g.lru.key_of[r.slot] = -1;
-                g.lru.to_head(r.slot);
-            }
-            g.lru.gen++;
-        }
-        ua_restores.clear();
-    }
-
-    int32_t layer_n_expert(int32_t key) const {
-        GGML_UNUSED(key);
-        return groups.empty() ? 1 : groups[0].lru.n_expert;
     }
 
     void ua_admit(group & g, int32_t il) {
@@ -3922,17 +3784,6 @@ struct llama_moe_cache::impl {
                 want.push_back(e);
             }
         }
-        // LLAMA_MOE_UPLOAD_AHEAD_SHARE=1: only within the seed's share of the layer (the most predicted n_full, as the seed admits the
-        // most routed n_full), so the cache ends the ubatch as the seed would leave it
-        if (ua_share && !g.layers.empty()) {
-            const size_t n_full = (size_t) std::max<int32_t>(1, g.n_slots / (int32_t) g.layers.size());
-            std::sort(want.begin(), want.end(), [&](int32_t a, int32_t c) {
-                return ua_cnt[a] != ua_cnt[c] ? ua_cnt[a] > ua_cnt[c] : ua_w[a] != ua_w[c] ? ua_w[a] > ua_w[c] : a < c;
-            });
-            if (want.size() > n_full) {
-                want.resize(n_full);
-            }
-        }
         want.erase(std::remove_if(want.begin(), want.end(), [&](int32_t e) { return slots[e] >= 0; }), want.end());
         std::sort(want.begin(), want.end(), [&](int32_t a, int32_t c) {
             return ua_cnt[a] != ua_cnt[c] ? ua_cnt[a] > ua_cnt[c] : ua_w[a] != ua_w[c] ? ua_w[a] > ua_w[c] : a < c;
@@ -3944,8 +3795,7 @@ struct llama_moe_cache::impl {
         if (want.empty()) {
             return;
         }
-        // victims: free slots first, then the slots of layer j whose expert is not predicted (lowest counter / least recent first);
-        // never a slot the copies of layer il read
+        // never a slot the copies of layer il read (its slots before the seed's plan)
         const int32_t * old = g.sd.il == il ? g.sd.old_slots.data() : g.lru.slot_map[il];
         std::vector<uint8_t> & busy = ua_busy;
         busy.assign(g.lru.n_slots, 0);
@@ -3954,15 +3804,14 @@ struct llama_moe_cache::impl {
                 busy[old[e]] = 1;
             }
         }
-        // classes: 0 free, 1 layer j (not predicted within the top k + LLAMA_MOE_UPLOAD_AHEAD_PROTECT of any token), 2 the layers this
-        // ubatch computed already, 3 the layers after j+1 (LLAMA_MOE_UPLOAD_AHEAD_VICTIMS=2, default; 1 = classes 0 and 1 only); in each
-        // class by the policy's order (lowest counter, then least recent)
+        // classes: 0 free slots; 1 the slots of layer j whose expert no token predicts within its top k + LLAMA_MOE_UPLOAD_AHEAD_PROTECT
+        // (4) and the slots of the layers this ubatch computed already; 2 the layers after j+1. Within a class the policy's order (lowest
+        // counter, then least recent). LLAMA_MOE_UPLOAD_AHEAD_VICTIMS=1: classes 0 and the layer j part of 1 only
         auto & cand = ua_cand;
         cand.clear();
         int64_t pos = 0;
-        const int32_t ig = layers[il].ig;
         for (int32_t s = g.lru.head; s >= 0; s = g.lru.next[s], ++pos) {
-            if (busy[s] || ua_rslot_get(ig, s)) {
+            if (busy[s]) {
                 continue;
             }
             const int32_t key = g.lru.key_of[s];
@@ -3976,16 +3825,11 @@ struct llama_moe_cache::impl {
                 }
                 cls = 1;
             } else if (ua_victims >= 2 && key / n_expert < il) {
-                cls = 2;
+                cls = 1;
             } else if (ua_victims >= 2 && key / n_expert > j + 1) {
-                cls = 3;
+                cls = 2;
             } else {
                 continue;
-            }
-            if (ua_victims == 3 && cls > 0) {
-                cls = 1; // one class: the policy's order over every allowed slot
-            } else if (ua_victims == 4 && cls > 0) {
-                cls = cls == 3 ? 2 : 1; // the layer and the computed layers in the policy's order, then the later layers
             }
             cand.push_back({ (cls << 58) + (v << 24) + pos, s });
         }
