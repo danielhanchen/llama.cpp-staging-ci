@@ -6693,6 +6693,25 @@ bool llama_moe_cache::cpu_miss_tick_sync(int64_t n_tokens) const {
 }
 
 void llama_moe_cache::cpu_miss_tick(int64_t n_tokens) {
+    // k15-fv diagnostic LLAMA_MOE_ROUND_LOG=1 (off by default; it reads the device counters before every ubatch of at most 16 tokens,
+    // i.e. it waits for the previous one): hits / fetched / host experts and uploaded MiB of the previous such ubatch
+    static const bool round_log = getenv("LLAMA_MOE_ROUND_LOG") != nullptr && atoi(getenv("LLAMA_MOE_ROUND_LOG")) != 0;
+    if (round_log && n_tokens <= 16) {
+        static int64_t  prev_n = -1;
+        static uint64_t prev_c[3] = { 0, 0, 0 };
+        uint64_t c[3];
+        pimpl->cm_counters(c);
+        size_t eb = 0;
+        for (const auto & g : pimpl->groups) {
+            eb = std::max(eb, g.expert_bytes);
+        }
+        if (prev_n > 0) {
+            LLAMA_LOG_INFO("moe_round: n %" PRId64 " hits %" PRIu64 " fetched %" PRIu64 " host %" PRIu64 " h2d %.1f MiB\n", prev_n,
+                c[0] - prev_c[0], c[1] - prev_c[1], c[2] - prev_c[2], (double) (c[1] - prev_c[1])*eb/1048576.0);
+        }
+        prev_n = n_tokens;
+        memcpy(prev_c, c, sizeof(c));
+    }
     pimpl->cm_tick(n_tokens);
 }
 
