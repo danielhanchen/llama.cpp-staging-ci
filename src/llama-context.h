@@ -768,6 +768,13 @@ private:
         int32_t flags;
     };
     std::array<std::vector<gf_tensor_state>, GF_SMALL_N> gf_res_small_state;
+    // k15-fn: the scheduler's split and allocation of each kept graph (LLAMA_SCHED_SIZE_CACHE, on by default): a swap-in restores it
+    // instead of splitting and allocating the graph again, so the tensors keep their addresses and the CUDA graph is replayed
+    std::array<ggml_backend_sched_plan_t, GF_SMALL_N> gf_res_small_plan{};
+    uint64_t n_plan_restores = 0;
+    uint64_t n_plan_saves    = 0;
+    uint64_t n_plan_invalid  = 0;
+    void small_plan_free(uint32_t i);
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

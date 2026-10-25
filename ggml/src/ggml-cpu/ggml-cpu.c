@@ -1508,6 +1508,38 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     float tmp[16];
 
+#if defined(__AVX2__)
+    // k15-fn: an expert routed to 2 or more rows of the batch: each weight row is decoded once for up to 8 of them (results
+    // bit-identical to the loop below; GGML_CPU_MMID_MULTI=0: the loop)
+    const ggml_vec_dot_multi_t vdm = ir1_end - ir1_start >= 2 ? ggml_cpu_vec_dot_multi(type) : NULL;
+    if (vdm != NULL) {
+        for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += 8) {
+            const int nc = (int) MIN(8, ir1_end - iir1);
+            const void * cols[8];
+            float      * dsts[8];
+            for (int c = 0; c < nc; ++c) {
+                const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, iir1 + c);
+                const int     id  = row_mapping.i1;
+                const int64_t i11 = id % ne11;
+                const int64_t i12 = row_mapping.i2;
+                cols[c] = (const char *) wdata +
+                    (src1_cont || src1->type != vec_dot_type
+                    ? (i11      + i12*ne11)*row_size
+                    : (i11*nb11 + i12*nb12));
+                dsts[c] = (float *) ((char *) dst->data + ((int64_t) id*nb1 + i12*nb2));
+            }
+            for (int64_t ir0 = ir0_start; ir0 < ir0_end; ++ir0) {
+                float r[8];
+                vdm((int) ne00, r, src0_cur + ir0*nb01, cols, nc);
+                for (int c = 0; c < nc; ++c) {
+                    dsts[c][ir0] = r[c];
+                }
+            }
+        }
+        return;
+    }
+#endif
+
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
@@ -1752,6 +1784,35 @@ static bool ggml_compute_forward_batch_invariant(struct ggml_compute_params * pa
         return false;
     }
     struct ggml_tensor * src1 = tensor->src[1];
+    // k15-fv: an attention node over several queries of one KV length (llama-graph, exact verify): one query at a time, as the
+    // node of that query alone (the tiled kernel takes 8+ queries)
+    if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
+        struct ggml_tensor * q    = tensor->src[0];
+        struct ggml_tensor * mask = tensor->src[3];
+        if (q->ne[1] < 2 || q->ne[3] != 1) {
+            return false;
+        }
+        for (int64_t i = 0; i < q->ne[1]; ++i) {
+            struct ggml_tensor q_i   = *q;
+            struct ggml_tensor m_i;
+            struct ggml_tensor dst_i = *tensor;
+            q_i.ne[1] = 1;
+            q_i.data  = (char *) q->data + i*q->nb[1];
+            if (mask) {
+                m_i = *mask;
+                m_i.ne[1] = 1;
+                m_i.data  = (char *) mask->data + i*mask->nb[1];
+            }
+            dst_i.ne[2]  = 1;
+            dst_i.data   = (char *) tensor->data + i*tensor->nb[2];
+            dst_i.src[0] = &q_i;
+            dst_i.src[3] = mask ? &m_i : NULL;
+            dst_i.flags &= ~GGML_TENSOR_FLAG_BATCH_INVARIANT;
+            ggml_compute_forward(params, &dst_i);
+            ggml_barrier(params->threadpool);
+        }
+        return true;
+    }
     if (tensor->op == GGML_OP_MUL_MAT) {
         if (src1->ne[1] < 2 || src1->ne[1] > 16 || src1->ne[2]*src1->ne[3] != 1 || tensor->ne[2]*tensor->ne[3] != 1) {
             return false;

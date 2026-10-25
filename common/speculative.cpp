@@ -1515,6 +1515,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<uint8_t> pending_dev;     // per seq: its pending row is sink row 0 (pending_h is stale)
     std::vector<uint8_t> verify_dev;      // per seq: the verify rows are sink rows 1 .. verify_h_rows (verify_h is unused)
 
+    // k15-fn: LLAMA_SPEC_COST=1 (opt-in): the cost-aware MTP window (common_spec_mtp_cost, Strata's STRATA_SPEC_COST): the drafts
+    // kept per round are the ones with the best expected tokens per ms, from the drafts' probabilities and measured round times
+    const bool spec_cost = [] {
+        const char * e = getenv("LLAMA_SPEC_COST");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    common_spec_mtp_cost cost_pol;
+    struct cost_seq {
+        int64_t t_us = 0;            // the previous draft() call (0: none since the request began)
+        int     rows = 1;            // the window drafted then
+        std::vector<float> probs;    // its drafts' probabilities
+        common_spec_mtp_cost::chain_state chain;
+    };
+    std::vector<cost_seq> cost_st;
+
     // the pending row of seq back on the host (a blocking copy of one row)
     void pending_to_host(llama_seq_id seq_id) {
         if (dev_h && pending_dev[seq_id]) {
@@ -1602,6 +1617,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         pending_dev.assign(n_seq, 0);
         verify_dev.assign(n_seq, 0);
+        cost_st.assign(n_seq, {});
+        if (spec_cost) {
+            LOG_INF("%s: MTP window by expected tokens per ms (LLAMA_SPEC_COST=1), up to %d drafts\n", __func__, this->params.n_max);
+        }
         if (!is_mem_shared && !chain_heads && common_mtp_handoff_on("DEV_H") && getenv("LLAMA_MTP_DEV_H") && atoi(getenv("LLAMA_MTP_DEV_H")) != 0) {
             dev_h = llama_mtp_dev_h_attach(ctx_dft, ctx_tgt, (int32_t) llama_n_batch(ctx_tgt));
         }
@@ -1631,6 +1650,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
+        if (spec_cost && seq_id >= 0 && seq_id < (llama_seq_id) cost_st.size()) {
+            if (cost_st[seq_id].t_us > 0) {
+                LOG_INF("%s: MTP window cost table: %s\n", __func__, cost_pol.text().c_str());
+            }
+            cost_st[seq_id].t_us = 0;
+            cost_st[seq_id].probs.clear();
+        }
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1877,6 +1903,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 dp.result_q = nullptr;
             }
 
+            if (spec_cost) {
+                // the time since the previous draft() call is one round (verify + sampling + this drafting) of the window drafted then
+                auto & cs = cost_st[seq_id];
+                const int64_t now = ggml_time_us();
+                cost_pol.set_context(dp.pos0);
+                if (cs.t_us > 0) {
+                    cost_pol.observe(cs.rows, (now - cs.t_us)/1000.0);
+                }
+                cs.t_us  = now;
+                cs.rows  = 1;
+                cs.chain = {};
+                cs.probs.clear();
+            }
+
             // result_q is only set when the caller wants rejection, so it also gates the retune
             if (dp.result_q) {
                 spec_retune(smpls, smpls_cfg, llama_get_model(ctx_dft), seq_id, dp);
@@ -1968,6 +2008,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
 
+                if (spec_cost && !dp.result_q) {
+                    auto & cs = cost_st[seq_id];
+                    cs.probs.push_back(cur_p->data[0].p);
+                    const int cap = 1 + (dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max);
+                    if (!cost_pol.keep_draft(cs.chain, (int) result.size() - 1, cur_p->data[0].p, cap)) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+                        continue;
+                    }
+                }
+
                 if (params.n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
@@ -2015,8 +2066,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
+            if (spec_cost && !dp.result_q) {
+                // the window keeps the drafts of the best expected tokens per ms
+                const size_t kept = (size_t) std::max(0, cost_st[seq_id].chain.best_rows - 1);
+                if (dp.result->size() > kept) {
+                    dp.result->resize(kept);
+                }
+            }
+
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+            }
+
+            if (spec_cost) {
+                auto & cs = cost_st[seq_id];
+                cs.rows = 1 + (int) dp.result->size();
+                cs.probs.resize(std::min(cs.probs.size(), dp.result->size()));
             }
         }
     }
@@ -2024,6 +2089,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        if (spec_cost) {
+            auto & cs = cost_st[seq_id];
+            if (!cs.probs.empty()) {
+                cost_pol.observe_probs(cs.probs.data(), (int) cs.probs.size(), n_accepted);
+                cs.probs.clear();
+            }
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];

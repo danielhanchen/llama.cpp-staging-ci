@@ -72,6 +72,9 @@ GGML_API bool ggml_gallocr_reserve_n(
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
+// k15-fn: changes whenever a buffer is replaced or lent memory changes (a saved allocation is valid only at the same generation)
+GGML_API uint64_t ggml_gallocr_get_generation(ggml_gallocr_t galloc);
+GGML_API bool     ggml_gallocr_has_external(ggml_gallocr_t galloc);
 
 // planned buffer sizes of a graph, without reserving it (the buffers and the current allocation are kept)
 GGML_API void ggml_gallocr_measure_n(

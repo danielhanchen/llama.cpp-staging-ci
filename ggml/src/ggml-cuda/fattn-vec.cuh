@@ -583,7 +583,8 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    if (Q->ne[1] == 1) {
+    // batch invariant (k15-fv): one column per block for every query, as a single query launch
+    if (Q->ne[1] == 1 || (KQV->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT)) {
         constexpr int cols_per_block = 1;
         // k15: GQA 4 (LFM2.5: 32 query heads on 8 KV heads, head size 64, f16 KV), one block per KV head. GGML_CUDA_FA_VEC_GQA:
         // 0 (default) = one block per query head, as before; 1 = 4 thread groups per block, each running the per-head kernel for one

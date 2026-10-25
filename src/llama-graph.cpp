@@ -3416,14 +3416,26 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (cparams.batch_invariant && n_q > 1 && n_stream == 1 && kq_mask != nullptr && kq_mask->ne[1] == n_q &&
                 ubatch.pos != nullptr && (int64_t) ubatch.n_tokens == n_q) {
             const int64_t n_kv = k->ne[1];
+            // k15-fv: consecutive queries over the same cells share one attention node (LLAMA_EXACT_FA_GROUP=0: one per query); the
+            // node is batch invariant like every node here, CUDA and CPU compute each of its queries as the single query node would
+            // (f16 K and V only: the CUDA path for other types stages a converted copy behind the node's output)
+            static const bool fa_group = [] {
+                const char * e = getenv("LLAMA_EXACT_FA_GROUP");
+                return e == nullptr || atoi(e) != 0;
+            }();
+            const bool group = fa_group && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
             cur = nullptr;
-            for (int64_t i = 0; i < n_q; ++i) {
+            for (int64_t i = 0, n_i = 1; i < n_q; i += n_i) {
                 const int64_t n_kv_i = llm_graph_exact_row_n_kv(ubatch, i, n_kv);
+                n_i = 1;
+                while (group && i + n_i < n_q && llm_graph_exact_row_n_kv(ubatch, i + n_i, n_kv) == n_kv_i) {
+                    ++n_i;
+                }
 
-                ggml_tensor * q_i = ggml_view_4d(ctx0, q, q->ne[0], 1, q->ne[2], q->ne[3], q->nb[1], q->nb[2], q->nb[3], i*q->nb[1]);
+                ggml_tensor * q_i = ggml_view_4d(ctx0, q, q->ne[0], n_i, q->ne[2], q->ne[3], q->nb[1], q->nb[2], q->nb[3], i*q->nb[1]);
                 ggml_tensor * k_i = ggml_view_4d(ctx0, k, k->ne[0], n_kv_i, k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
                 ggml_tensor * v_i = ggml_view_4d(ctx0, v, v->ne[0], n_kv_i, v->ne[2], v->ne[3], v->nb[1], v->nb[2], v->nb[3], 0);
-                ggml_tensor * m_i = ggml_view_4d(ctx0, kq_mask, n_kv_i, 1, kq_mask->ne[2], kq_mask->ne[3],
+                ggml_tensor * m_i = ggml_view_4d(ctx0, kq_mask, n_kv_i, n_i, kq_mask->ne[2], kq_mask->ne[3],
                         kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], i*kq_mask->nb[1]);
 
                 ggml_tensor * o_i = ggml_flash_attn_ext(ctx0, q_i, k_i, v_i, m_i, kq_scale, hparams.f_max_alibi_bias,
@@ -3435,7 +3447,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 ggml_flash_attn_ext_set_n_kv_max(o_i, static_cast<int32_t>(n_kv_max));
                 ggml_prec_set_acc(o_i, GGML_PREC_F32);
 
-                // [DV, n_head, 1, 1] rows, concatenated along the tokens
+                // [DV, n_head, n_i, 1] rows, concatenated along the tokens
                 cur = cur ? ggml_concat(ctx0, cur, o_i, 2) : o_i;
             }
         } else {

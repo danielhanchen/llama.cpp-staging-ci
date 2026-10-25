@@ -1288,8 +1288,36 @@ static void mul_mat_vec_q_switch_ncols_dst(
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
     GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
 
+    // k15-fv, GGML_CUDA_MMVQ_MOE_ONE=1 (opt-in, changes the single token MUL_MAT_ID sums): one token MUL_MAT_ID runs the multi-token MoE
+    // kernel too. That kernel gives each token one warp of its own over the whole K loop, so a token's sums do not depend on the other
+    // tokens of the launch: a batch invariant verify batch is then that one launch (in chunks of the kernel's batch limit), no longer
+    // one single token launch per token
+    static const bool moe_one = [] {
+        const char * e = getenv("GGML_CUDA_MMVQ_MOE_ONE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    const bool moe_path = moe_one && ids != nullptr && nsamples_x == 1 && nsamples_dst == 1;
+    if (moe_path && ncols_dst > 1) {
+        const int cc_m  = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        const int max_b = get_mmvq_mmid_max_batch(type, cc_m);
+        if (ncols_dst > max_b) {
+            for (int j0 = 0; j0 < ncols_dst; j0 += max_b) {
+                ggml_cuda_mm_fusion_args_device fusion_j = fusion;
+                if (fusion_j.shared_dst != nullptr) {
+                    fusion_j.shared_dst = fusion.shared_dst + (size_t) j0*fusion.shared_stride_col_dst;
+                }
+                mul_mat_vec_q_switch_ncols_dst<type>(
+                    vx, (const char *) vy + (size_t) j0*stride_col_y*sizeof(block_q8_1), ids + (size_t) j0*ids_stride, fusion_j,
+                    dst + (size_t) j0*stride_col_dst, ncols_x, nrows_x, std::min(max_b, ncols_dst - j0), stride_row_x, stride_col_y,
+                    stride_col_dst, nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, false);
+            }
+            return;
+        }
+    }
+
     // batch invariant (verify batches, GGML_TENSOR_FLAG_BATCH_INVARIANT): every column gets the bytes of a single column launch
-    if (exact && ncols_dst > 1) {
+    if (exact && ncols_dst > 1 && !moe_path) {
         const auto one_column = [&](const int j) {
             mul_mat_vec_q_switch_ncols_dst<type>(
                 vx, (const char *) vy + (size_t) j*stride_col_y*sizeof(block_q8_1), ids ? ids + (size_t) j*ids_stride : nullptr,
@@ -1422,8 +1450,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return idle * 8 <= iters_wide * 2;
     };
 
-    if (has_ids && ncols_dst > 1) {
-        // Multi-token MUL_MAT_ID path - dedicated MoE kernel
+    if (has_ids && (ncols_dst > 1 || moe_path)) {
+        // Multi-token MUL_MAT_ID path - dedicated MoE kernel (GGML_CUDA_MMVQ_MOE_ONE=1: one token too)
         mul_mat_vec_q_moe_launch<type>(
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,

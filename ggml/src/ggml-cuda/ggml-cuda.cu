@@ -3020,6 +3020,32 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            // k15-fn: GGML_CUDA_GRAPH_WHY=N logs the first changed node of up to N re-captures (diagnostic)
+            static int why_left = getenv("GGML_CUDA_GRAPH_WHY") ? atoi(getenv("GGML_CUDA_GRAPH_WHY")) : 0;
+            if (!res && why_left > 0) {
+                why_left--;
+                const ggml_cuda_graph::node_properties & o = graph->node_props[i];
+                const char * what = "other tensor field";
+                if (o.node.data != prop.node.data) {
+                    what = "data";
+                } else if (memcmp(o.node.ne, prop.node.ne, sizeof(o.node.ne)) != 0) {
+                    what = "ne";
+                } else if (memcmp(o.node.op_params, prop.node.op_params, sizeof(o.node.op_params)) != 0) {
+                    what = "op_params";
+                } else if (memcmp(o.node_src_data_ptrs, prop.node_src_data_ptrs, sizeof(o.node_src_data_ptrs)) != 0) {
+                    what = "src data";
+                } else if (memcmp(o.node_src_ne, prop.node_src_ne, sizeof(o.node_src_ne)) != 0) {
+                    what = "src ne";
+                } else if (memcmp(o.node.src, prop.node.src, sizeof(o.node.src)) != 0) {
+                    what = "src pointer";
+                } else if (o.node.extra != prop.node.extra) {
+                    what = "extra";
+                } else if (o.node.buffer != prop.node.buffer) {
+                    what = "buffer";
+                }
+                GGML_LOG_INFO("%s: CUDA graph key %p (%d nodes) changed at node %d '%s' (%s): %s\n", __func__, graph_key, cgraph->n_nodes, i,
+                    cgraph->nodes[i]->name, ggml_op_desc(cgraph->nodes[i]), what);
+            }
             graph->node_props[i] = prop;
             res = true;
         }
