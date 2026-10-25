@@ -947,6 +947,80 @@ void ggml_cuda_op_ew_chain(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     ggml_cuda_kernel_launch(ew_chain_f32_kernel, launch_params, (const float *) src->data, (float *) dst->data, k, chain);
 }
 
+// ABS -> POOL_1D(MAX over a whole row) -> elementwise chain -> DIV(x, chain): the per-row power-of-two rescale of
+// build_amax_src1_f16 (Flint MoE down projection) in one kernel. One warp per row. Bit-identical to the unfused ops:
+// the row max is order-independent (fmaxf over |x| from -FLT_MAX, as pool1d_nchw_kernel), the chain uses ew_chain_apply
+// (the single-op expressions) and the quotient is op_div's a / b.
+static __global__ void amax_rescale_f32_kernel(const float * x, float * e_out, float * dst, void * vq, const int ne0, const int ne0q,
+        const int64_t nrows, const ggml_cuda_ew_chain chain) {
+    ggml_cuda_pdl_lc();
+    const int64_t row = int64_t(blockIdx.x)*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    if (row >= nrows) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+    const float * xr = x + row*ne0;
+    float m = -FLT_MAX;
+    for (int i = lane; i < ne0; i += WARP_SIZE) {
+        m = fmaxf(m, fabsf(xr[i]));
+    }
+    m = warp_reduce_max(m);
+    float e = m;
+#pragma unroll 1
+    for (int j = 0; j < chain.n_ops; ++j) {
+        e = ew_chain_apply(chain.op[j], chain.p0[j], chain.p1[j], e);
+    }
+    if (lane == 0) {
+        e_out[row] = e;
+    }
+    float * dr = dst + row*ne0;
+    if (vq == nullptr) {
+        for (int i = lane; i < ne0; i += WARP_SIZE) {
+            dr[i] = xr[i] / e;
+        }
+        return;
+    }
+    // with the q8_1 copy of dst (rows padded to ne0q, padding 0): lane i of block b holds element 32*b + i, as one warp of
+    // quantize_q8_1 does, with its expressions, so the copy is bit-identical to quantizing dst afterwards
+    block_q8_1 * y = (block_q8_1 *) vq + row*(ne0q/QK8_1);
+    for (int i = lane; i < ne0q; i += WARP_SIZE) {
+        float v = 0.0f;
+        if (i < ne0) {
+            v = xr[i] / e;
+            dr[i] = v;
+        }
+        float amax = fabsf(v);
+        float sum  = v;
+        amax = warp_reduce_max<QK8_1>(amax);
+        sum  = warp_reduce_sum<QK8_1>(sum);
+        const float  d = amax / 127.0f;
+        const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+        y[i/QK8_1].qs[lane] = q;
+        if (lane == 0) {
+            y[i/QK8_1].ds = make_half2(d, sum);
+        }
+    }
+}
+
+void ggml_cuda_op_amax_rescale(ggml_backend_cuda_context & ctx, const ggml_tensor * x, ggml_tensor * e, ggml_tensor * dst,
+        const ggml_cuda_ew_chain & chain, void * q8_1_out) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && e->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(e) && ggml_is_contiguous(dst));
+    const int     ne0   = (int) x->ne[0];
+    const int64_t nrows = ggml_nrows(x);
+    GGML_ASSERT(ggml_nelements(e) == nrows && ggml_nelements(dst) == ggml_nelements(x));
+    constexpr int rows_per_block = 4;
+    const int64_t num_blocks = (nrows + rows_per_block - 1) / rows_per_block;
+    const ggml_cuda_kernel_launch_params launch_params =
+        ggml_cuda_kernel_launch_params((dim3) num_blocks, rows_per_block*WARP_SIZE, 0, ctx.stream());
+    static_assert(QK8_1 == WARP_SIZE, "one q8_1 block per warp iteration");
+    GGML_ASSERT(q8_1_out == nullptr || nrows == 1 || ne0 % MATRIX_ROW_PADDING == 0);
+    const int ne0q = q8_1_out ? (int) GGML_PAD(ne0, MATRIX_ROW_PADDING) : ne0;
+    ggml_cuda_kernel_launch(amax_rescale_f32_kernel, launch_params, (const float *) x->data, (float *) e->data, (float *) dst->data,
+        q8_1_out, ne0, ne0q, nrows, chain);
+}
+
 /* elementwise chain -> DSV4_HC_POST (no comb): the chain that turns the injection logits into the post weights (2*sigmoid(x/hc)
    in qwen4exp) is applied once per (stream, token) row, with the expressions of ew_chain_f32_kernel, and the update itself is
    the expression of dsv4_hc_post_f32<false>, so the output is bit-identical to the unfused sequence. One block row (y) per
