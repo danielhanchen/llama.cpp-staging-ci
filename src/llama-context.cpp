@@ -8243,6 +8243,30 @@ bool llama_verify_exact_placement(const llama_context * ctx) {
     return true;
 }
 
+bool llama_single_pass_equivalent(const llama_context * ctx) {
+    if (ctx == nullptr || llama_moe_host_mode(ctx) != 0 || !llama_verify_exact_placement(ctx)) {
+        return false;
+    }
+    const llama_model & model = ctx->get_model();
+    if (model.devices.empty()) {
+        return false;
+    }
+    for (const auto & d : model.devices) {
+        const char * name = ggml_backend_dev_name(d.dev);
+        if (name == nullptr || strncmp(name, "CUDA", 4) != 0) {   // the kernel paths were checked on CUDA (sm_100, sm_120) only
+            return false;
+        }
+    }
+    static const bool cublas_32f = getenv("GGML_CUDA_FORCE_CUBLAS_COMPUTE_32F") != nullptr;
+    for (const auto & [name, t] : model.tensors_by_name) {
+        if (t != nullptr && !cublas_32f && t->type == GGML_TYPE_F16 && t->ne[1] > 1 && name.rfind("blk.", 0) == 0 &&
+            name.size() > 7 && name.compare(name.size() - 7, 7, ".weight") == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 int32_t llama_arch_rollback_state(const char * arch_name) {
     if (arch_name == nullptr) {
         return -1;

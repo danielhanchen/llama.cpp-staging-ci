@@ -4483,11 +4483,19 @@ private:
                             // k11 rule (any prompt whose rest is at most N). Still opt-in: the KLD gate (plans/k11.md) failed on G4 for
                             // Qwen3.6-35B-A3B Q4 (first-token p99 0.0058 vs 0.0024 for -fa off), LFM2.5 (first-token mean 0.24 vs 0.065) and
                             // gemma-4 26B (decode top-1 98.9 vs 99.7%), plans/k13_pp.md section 7
-                            static const int ckpt_single_max = getenv("LLAMA_SERVER_CKPT_SINGLE_MAX") ? atoi(getenv("LLAMA_SERVER_CKPT_SINGLE_MAX")) : 0;
+                            // k15-ttft: on by default (N = 128) where the single pass is reassociation-only (plans/k11.md "Equivalence
+                            // rule", llama_single_pass_equivalent: all weights on CUDA, no host-computed expert, no F16 matmul weight) and
+                            // the split pass would run at least 4 tokens before its last 4 (below that MMVF F32 / FlashAttention vec kernels
+                            // take the first pass, other formats). An explicit LLAMA_SERVER_CKPT_SINGLE_MAX keeps the k11 meaning on every
+                            // placement (0 = off, the kill switch)
+                            static const char * ckpt_single_env = getenv("LLAMA_SERVER_CKPT_SINGLE_MAX");
+                            static const bool ckpt_single_eq = ckpt_single_env == nullptr && llama_single_pass_equivalent(ctx_tgt);
+                            static const int ckpt_single_max = ckpt_single_env ? atoi(ckpt_single_env) : (ckpt_single_eq ? 128 : 0);
                             static const bool ckpt_single_any = getenv("LLAMA_SERVER_CKPT_SINGLE_ANY") != nullptr && atoi(getenv("LLAMA_SERVER_CKPT_SINGLE_ANY")) != 0;
                             const int n_batch_start = slot.prompt.n_tokens() - (int) (batch.size() - n_tokens_prev);
                             const int n_rest_batch = slot.task->n_tokens() - n_batch_start;
                             const bool ckpt_single = ckpt_single_max > 0 && n_rest_batch <= std::min<int>(ckpt_single_max, n_ubatch) &&
+                                (!ckpt_single_eq || n_rest_batch >= 8) &&
                                 (ckpt_single_any || slot.task->n_tokens() <= ckpt_single_max || (last_user_pos > 0 && n_batch_start == last_user_pos));
                             bool should_break = false;
                             for (int k = 0; k < 2; ++k) {
