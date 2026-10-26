@@ -3240,6 +3240,58 @@ uint32_t common_draft_ubatch_max() {
     return v;
 }
 
+// k16-draft: the shape of tensor `name` in a GGUF (split-aware: a target's lm head is usually in a later shard), false if absent
+static bool common_gguf_tensor_ne(const std::string & path, const char * name, int64_t ne[GGML_MAX_DIMS]) {
+    std::string prefix;
+    int n_split = 1;
+    const size_t at = path.rfind("-00001-of-");
+    if (at != std::string::npos && path.size() == at + 20 && path.compare(path.size() - 5, 5, ".gguf") == 0) {
+        prefix  = path.substr(0, at);
+        n_split = atoi(path.substr(at + 10, 5).c_str());
+    }
+    for (int i = 0; i < std::max(1, n_split); ++i) {
+        std::string fname = path;
+        if (n_split > 1) {
+            std::vector<char> sp(prefix.size() + 32);
+            llama_split_path(sp.data(), sp.size(), prefix.c_str(), i, n_split);
+            fname = sp.data();
+        }
+        ggml_context * meta = nullptr;
+        gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &meta };
+        gguf_context_ptr ctx(gguf_init_from_file(fname.c_str(), gp));
+        if (!ctx) {
+            return false;
+        }
+        ggml_context_ptr meta_ptr(meta);
+        if (const ggml_tensor * t = ggml_get_tensor(meta, name)) {
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                ne[d] = t->ne[d];
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+// k16-draft (idea from ikawrakow/ik_llama.cpp PR #2403): a separate MTP draft model (-md with --spec-type draft-mtp) uses the target's
+// token_embd and output when both files hold them with the same shapes (llama_model_loader::borrow_io checks again at load, against
+// the loaded target). Decided here so the fit's measurements of the draft (no target loaded yet) count the lm head as the target's.
+// LLAMA_MTP_BORROW_IO=0: the draft loads its own copies
+static bool common_mtp_borrow_io_ok(const std::string & path_tgt, const std::string & path_dft) {
+    const char * e = getenv("LLAMA_MTP_BORROW_IO");
+    if ((e != nullptr && atoi(e) == 0) || path_tgt.empty() || path_dft.empty() || path_tgt == path_dft) {
+        return false;
+    }
+    for (const char * name : { "token_embd.weight", "output.weight" }) {
+        int64_t a[GGML_MAX_DIMS] = {}, b[GGML_MAX_DIMS] = {};
+        if (!common_gguf_tensor_ne(path_tgt, name, a) || !common_gguf_tensor_ne(path_dft, name, b) ||
+                !std::equal(a, a + GGML_MAX_DIMS, b)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 common_params common_base_params_to_speculative(const common_params & params) {
     const bool has_draft = params.speculative.has_dft();
 
@@ -3283,6 +3335,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
     const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     result.moe_cache_size = spec_mtp && !has_draft ? params.moe_cache_size : 0;
+
+    // k16-draft: borrowed token_embd / output (llama_model_params::mtp_borrow_io)
+    result.mtp_borrow_io = spec_mtp && has_draft && common_mtp_borrow_io_ok(params.model.path, params_spec.mparams.path);
 
     // a separate MTP drafter (-md) is one block: its context reads the prompt in ubatches of at most common_draft_ubatch_max()
     // tokens (it splits the target's larger ubatches itself), so its compute buffer stays small and the MoE cache of the target
@@ -3362,6 +3417,11 @@ common_speculative_init_result::common_speculative_init_result(
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
+
+        // k16-draft: the target lends its token_embd / output to an MTP draft model (llama_model_loader::borrow_io)
+        if (spec_mtp && mparams.mtp_borrow_io) {
+            mparams.model_shared = model_tgt;
+        }
 
         llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
         if (model_dft == NULL) {
