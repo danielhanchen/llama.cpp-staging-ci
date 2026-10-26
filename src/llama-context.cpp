@@ -5819,6 +5819,18 @@ ggml_cgraph * llama_context::graph_reserve(
         return nullptr;
     }
 
+    // k16-draft (debug, LLAMA_RESERVE_TRACE=1): every reserve's device buffer sizes, also in a memory probe (whose log the fit silences)
+    static const bool trace = getenv("LLAMA_RESERVE_TRACE") != nullptr && atoi(getenv("LLAMA_RESERVE_TRACE")) != 0;
+    if (trace) {
+        fprintf(stderr, "reserve-trace: %s tokens %u seqs %u outputs %u split_only %d seed %d:", model.hparams.no_alloc ? "probe" : "real",
+                n_tokens, n_seqs, n_outputs, (int) split_only, (int) moe_cache_seed);
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            const size_t sz = split_only ? (sizes ? sizes[i] : 0) : ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+            fprintf(stderr, " %s %.2f", ggml_backend_name(backend_ptrs[i]), sz/1048576.0);
+        }
+        fprintf(stderr, "\n");
+    }
+
     return gf;
 }
 
