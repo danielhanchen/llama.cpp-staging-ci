@@ -3861,8 +3861,12 @@ bool llama_context::lm_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
 // small batches only, the prompt ubatches a layer-major group runs copy their experts as before. A cache below LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC
 // (0.05) of the host experts runs its prompts layer-major too: G4 at 4 GB, Qwen3.6 Q3_K_M + MTP (0.7% cached) copied every host expert once
 // per 512-token ubatch, 55 GB of copies for a 2k prompt (PolyStrata: 13.6 GB, one per prompt). LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC=0: k12
+// k16-parity: the line was 5%, inside the default gate's band (at most 10% cached, LLAMA_MOE_CACHE_HYBRID_MAX_FRAC): a cache between 5 and
+// 10% ran every prompt ubatch alone (G4 q3m 4 GB ctx 20480 with q8_0 K/V, 5.4% cached: 2k / 8k prompt 2000 / 2059 tok/s, where 4.0% cached
+// gave 5706 / 9436). Now 0.25, past the default band, so every share the default gate fixes runs its prompts layer-major.
+// LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC=0.05: the old line
 static bool lm_hybrid_frac_ok(double frac) {
-    static const double max_frac = getenv("LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC") ? std::max(0.0, atof(getenv("LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC"))) : 0.05;
+    static const double max_frac = getenv("LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC") ? std::max(0.0, atof(getenv("LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC"))) : 0.25;
     return frac >= 0.0 && frac < max_frac;
 }
 

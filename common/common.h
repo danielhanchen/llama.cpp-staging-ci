@@ -665,6 +665,8 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    bool cache_type_k_set  = false; // -ctk / LLAMA_ARG_CACHE_TYPE_K given (no automatic q8_0 K/V then, LLAMA_KV_AUTO_Q8)
+    bool cache_type_v_set  = false; // -ctv / LLAMA_ARG_CACHE_TYPE_V given
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     bool   moe_cache_auto = false; // --moe-cache-mib auto: --fit sizes the MoE cache (see common_moe_cache_auto_resolve)
