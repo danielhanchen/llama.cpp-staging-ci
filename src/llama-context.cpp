@@ -5032,8 +5032,19 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                     free_min = std::min(free_min, fr);
                 }
             }
-            LLAMA_LOG_INFO("decode_layer_major: the graph of ubatches [%zu, %zu) would grow the compute buffers by %.2f MiB (%.2f MiB free): split at %zu\n",
-                a, b, over/1048576.0, free_min == SIZE_MAX ? -1.0 : free_min/1048576.0, mid);
+            // k15-fn: and what the cache could lend a merged graph at most (llama_moe_cache::graph_lend_capacity, the largest over the devices)
+            int32_t lc_max = 0, lc_slots = 0;
+            size_t  lc_bytes = 0;
+            for (auto & bk : backend_ptrs) {
+                int32_t ns = 0;
+                size_t  eb = 0;
+                const int32_t c = moe_cache->graph_lend_capacity(bk, &ns, &eb);
+                if ((size_t) c*eb > (size_t) lc_max*lc_bytes) {
+                    lc_max = c; lc_slots = ns; lc_bytes = eb;
+                }
+            }
+            LLAMA_LOG_INFO("decode_layer_major: the graph of ubatches [%zu, %zu) would grow the compute buffers by %.2f MiB (%.2f MiB free; the cache lends at most %d of %d slots, %.2f MiB): split at %zu\n",
+                a, b, over/1048576.0, free_min == SIZE_MAX ? -1.0 : free_min/1048576.0, lc_max, lc_slots, (double) lc_max*lc_bytes/1048576.0, mid);
         }
         st = run_range(a, mid);
         if (st != GGML_STATUS_SUCCESS) {
