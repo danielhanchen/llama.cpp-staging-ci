@@ -7428,6 +7428,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
 }
 
 size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
+    state_async_wait_reads(); // k15-idlewait: as state_seq_set_data
     llama_io_read_host io(src, size);
     try {
         return state_read_data(io);
@@ -7539,6 +7540,9 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+    // k15-idlewait: the rows are written with synchronous copies off the compute stream: an asynchronous save still queued there must
+    // have read them first (it was joined by the first memory call before; LLAMA_STATE_ASYNC_SPLIT_WAIT=0: the whole save here too)
+    state_async_wait_reads();
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         // create a temporary io to read the magic and the src seq_id
