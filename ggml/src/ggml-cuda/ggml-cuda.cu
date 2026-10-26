@@ -803,6 +803,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         CUDA_CHECK(cudaFree(mmvf_splitk_part));
         CUDA_CHECK(cudaFree(mmvf_splitk_cnt));
     }
+    if (hc_pre_cnt != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(hc_pre_cnt));
+    }
     for (cudaEvent_t ev : copy_peer_events) {
         if (ev != nullptr) {
             CUDA_CHECK(cudaEventDestroy(ev));
@@ -5334,9 +5338,11 @@ static int ggml_cuda_try_fuse_hc_inject_down(ggml_backend_cuda_context * cuda_ct
 }
 
 // k15-mm2: the hyper-connection up projection (Q8_0, gate) and the gated DSV4_HC_PRE reading it (the next compute node): one launch
-// that writes the gate, the mixed stream and its q8_1 copy (ggml_cuda_mul_mat_vec_q_hc_pre, same bytes). GGML_CUDA_HC_UP_PRE=0: off.
+// that writes the gate, the mixed stream and its q8_1 copy (ggml_cuda_mul_mat_vec_q_hc_pre, same bytes). Opt-in, GGML_CUDA_HC_UP_PRE=1:
+// slower on B200 at the Flash-Next verify (10.1 us vs 5.4 + 2.3 us for the two launches; the group arrival and the epilogue after the
+// last block of a group cost more than the launch saves).
 static int ggml_cuda_try_fuse_hc_up_pre(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
-    static const bool off = [] { const char * e = getenv("GGML_CUDA_HC_UP_PRE"); return e != nullptr && atoi(e) == 0; }();
+    static const bool off = [] { const char * e = getenv("GGML_CUDA_HC_UP_PRE"); return e == nullptr || atoi(e) == 0; }();
     ggml_tensor * up = cgraph->nodes[i];
     if (off || cuda_ctx->curr_stream_no != 0 || !cuda_ctx->stream_context().concurrent_events.empty() || up->op != GGML_OP_MUL_MAT ||
             !(up->flags & GGML_TENSOR_FLAG_COMPUTE) || up->view_src != nullptr || up->src[0]->type != GGML_TYPE_Q8_0 ||
@@ -5374,6 +5380,17 @@ static int ggml_cuda_try_fuse_hc_up_pre(ggml_backend_cuda_context * cuda_ctx, gg
             ggml_cuda_tensors_overlap(up, up->src[1])) {
         return 0;
     }
+    // the group counters, allocated outside a capture (the first evaluations run without one)
+    if (cuda_ctx->hc_pre_cnt == nullptr) {
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(cuda_ctx->stream(), &capture));
+        if (capture != cudaStreamCaptureStatusNone) {
+            return 0;
+        }
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        CUDA_CHECK(cudaMalloc((void **) &cuda_ctx->hc_pre_cnt, GGML_CUDA_HC_PRE_MAX_GROUPS*sizeof(unsigned int)));
+        CUDA_CHECK(cudaMemset(cuda_ctx->hc_pre_cnt, 0, GGML_CUDA_HC_PRE_MAX_GROUPS*sizeof(unsigned int)));
+    }
     // src1's q8_1 copy first, as the unfused up projection gets it before the DSV4_HC_PRE reserves its own
     ggml_cuda_pool_alloc<char> q8_1_alloc(cuda_ctx->pool());
     const char * vy = ggml_cuda_mmvq_src1_q8_1(*cuda_ctx, up->src[1], q8_1_alloc);
@@ -5386,7 +5403,7 @@ static int ggml_cuda_try_fuse_hc_up_pre(ggml_backend_cuda_context * cuda_ctx, gg
         q8_1_out = cache.reserve(pre->data, ggml_nbytes(pre), key, nt*n_embd/QK8_1*sizeof(block_q8_1));
     }
     ggml_cuda_mul_mat_vec_q_hc_pre(*cuda_ctx, up->src[0], up->src[1], vy, up, (const float *) x->data, x->nb[1] / sizeof(float),
-        x->nb[2] / sizeof(float), (float *) pre->data, q8_1_out, n_embd, ggml_get_op_params_f32(pre, 0));
+        x->nb[2] / sizeof(float), (float *) pre->data, q8_1_out, cuda_ctx->hc_pre_cnt, n_embd, ggml_get_op_params_f32(pre, 0));
     return j - i;
 }
 

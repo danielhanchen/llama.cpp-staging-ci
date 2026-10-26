@@ -42,7 +42,9 @@ void ggml_cuda_mul_mat_vec_q_inject(ggml_backend_cuda_context & ctx, const ggml_
 bool ggml_cuda_mul_mat_vec_q_hc_pre_ok(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * gate, int64_t n_embd,
     int64_t hc, int cc);
 // vy: the q8_1 copy of src1 (ggml_cuda_mmvq_src1_q8_1)
+// cnt: GGML_CUDA_HC_PRE_MAX_GROUPS zeroed self-resetting counters (ggml_backend_cuda_context::hc_pre_cnt)
 void ggml_cuda_mul_mat_vec_q_hc_pre(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const char * vy,
-    ggml_tensor * gate, const float * x, int64_t sx1, int64_t sx2, float * mixed, void * q8_1_out, int64_t n_embd, float scale);
+    ggml_tensor * gate, const float * x, int64_t sx1, int64_t sx2, float * mixed, void * q8_1_out, unsigned int * cnt, int64_t n_embd,
+    float scale);
 // the q8_1 copy of a contiguous F32 src1 that ggml_cuda_mul_mat_vec_q would read (from the q8_1 cache, else quantized into alloc)
 const char * ggml_cuda_mmvq_src1_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_cuda_pool_alloc<char> & alloc);

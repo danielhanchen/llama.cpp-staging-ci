@@ -1697,6 +1697,8 @@ struct ggml_backend_cuda_context {
     // k15-mm2: split-K few-row F32 mat-vec (mmvf.cu): per stream partial sums and self-resetting per-row arrival counters
     float        * mmvf_splitk_part = nullptr;
     unsigned int * mmvf_splitk_cnt  = nullptr;
+    // k15-mm2: self-resetting group arrival counters of the hyper-connection up + hc_pre launch (mmvq.cu), stream 0 only
+    unsigned int * hc_pre_cnt       = nullptr;
 
     // a graph was computed with this instance (a copy-only instance, e.g. the scheduler copy queue, is not a compute instance)
     bool computes = false;
@@ -1828,6 +1830,7 @@ struct ggml_cuda_mm_fusion_args_host {
 };
 #define GGML_CUDA_MMVQ_MULTI_MAX 3 // matrices sharing one activation in one mul_mat_vec_q launch
 #define GGML_CUDA_MMVQ_EW_MAX    2 // SCALE / SILU ops a mul_mat_vec_q applies to its F32 src1 itself (c_ewq)
+#define GGML_CUDA_HC_PRE_MAX_GROUPS 1024 // n_embd / 32 of the hyper-connection up + hc_pre launch
 #define GGML_CUDA_MMVQ_EW_MAX_K  992 // K of such a product: one K iteration of 4 warps (Q8_0), so 31 q8_1 blocks per column
 
 struct ggml_cuda_mm_fusion_args_device {
