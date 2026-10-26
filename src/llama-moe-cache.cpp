@@ -7033,6 +7033,12 @@ int32_t llama_moe_cache::graph_lend_capacity(ggml_backend_t backend, int32_t * n
     return pimpl->graph_lend_capacity(backend, n_slots, expert_bytes);
 }
 
+size_t llama_moe_cache::lend_capacity_bytes(ggml_backend_t backend) const {
+    size_t eb = 0;
+    const int32_t n = pimpl->graph_lend_capacity(backend, nullptr, &eb);
+    return (size_t) n*eb;
+}
+
 bool llama_moe_cache::release() {
     bool any = false;
     for (size_t id = 0; id < pimpl->devices.size(); ++id) {
