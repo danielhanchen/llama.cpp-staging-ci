@@ -1641,6 +1641,19 @@ extern "C" {
             int32_t               grow_q16,
             bool                  advance);
 
+    // route tail skip for a ggml_moe_cache_lookup or ggml_moe_cache_assign (op) of a decode / verify window: an expert that is not
+    // cached before this lookup and that every token of the window routes only at rank >= rank (ids in routing order, rank = index in
+    // the row of ids, 0 = the largest weight) is neither fetched nor computed: its slot and host id are -1, so its rows are 0 and its
+    // contribution is zero (no renormalisation, the other experts keep their router weights). rank 0: off. dflt: the rank is the
+    // default rather than asked for, the backend may decline it (CUDA: on NVIDIA and on RDNA4, off on other HIP devices).
+    // stat (optional, the I32 use counters of the assign, see ggml_moe_cache_assign): the number of skipped entries is added to the
+    // 64-bit counter at elements [4..5] of its last row
+    GGML_API void ggml_moe_cache_set_tail_skip(
+            struct ggml_tensor  * op,
+            int32_t               rank,
+            bool                  dflt,
+            struct ggml_tensor  * stat);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

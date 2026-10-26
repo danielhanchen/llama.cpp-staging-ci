@@ -2505,7 +2505,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * const gate_up_exps_b_h = gate_up_exps_b;
 
     // the experts of host-resident layers may be read from the MoE cache
-    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il, hybrid_ok ? &hybrid : nullptr, &hybrid_host);
+    // k16 route tail skip (see llama_moe_cache::tail_skip): only a decode / verify window of one sequence (every row an output), the
+    // router's own top k in routing order, and no expert biases (a skipped expert's rows are 0, a bias would still be added)
+    const bool tail_ok = moe_cache != nullptr && selected_experts_in == nullptr && arch != LLM_ARCH_GROVEMOE &&
+        n_outputs == n_tokens && ubatch.n_seqs_unq <= 1 &&
+        !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b;
+    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il, hybrid_ok ? &hybrid : nullptr, &hybrid_host, tail_ok);
     if (slots != nullptr || hybrid != nullptr) {
         // the per-expert scales and biases are read from their device copies, so the layer does not go back to the host
         for (ggml_tensor ** t : { &up_exps_s, &gate_exps_s, &down_exps_s, &up_exps_b, &gate_exps_b, &down_exps_b, &gate_up_exps_b }) {
@@ -2874,7 +2879,8 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
          ggml_tensor * gate_up_exps,
                  int   il,
          ggml_tensor ** assign,
-                bool * host) const {
+                bool * host,
+                bool   tail_ok) const {
     if (moe_cache == nullptr) {
         return nullptr;
     }
@@ -2893,6 +2899,9 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
         }
         bool use_host = false;
         if (ggml_tensor * res = moe_cache->hybrid_assign(ctx0, il, ids, n_tokens, use_host)) {
+            if (tail_ok) {
+                moe_cache->tail_skip(res, il, n_tokens);
+            }
             ggml_backend_sched_set_tensor_backend(sched, res, moe_cache->backend(il));
             cb(res, "ffn_moe_assign", il);
             ggml_build_forward_expand(gf, res);
@@ -2911,6 +2920,9 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
             ids = ggml_cont(ctx0, ids);
         }
         if (ggml_tensor * res = moe_cache->lookup(ctx0, il, ids, n_tokens)) {
+            if (tail_ok) {
+                moe_cache->tail_skip(res, il, n_tokens);
+            }
             ggml_backend_sched_set_tensor_backend(sched, res, moe_cache->backend(il));
             cb(res, "ffn_moe_lookup", il);
 

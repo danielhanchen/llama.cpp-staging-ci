@@ -91,6 +91,10 @@ public:
     // prompts (the assign is frozen, see ggml_moe_cache_assign_freeze), so which expert of a token the host computes depends on the
     // token's own ids and the cache as the prompts left it, the same in a verify window as in a single token decode
     bool host_split_frozen() const;
+    // k16: route tail skip [LLAMA_MOE_ROUTE_TAIL_SKIP] (Strata's STRATA_ROUTE_TAIL_SKIP rule): in a decode or verify window of at most
+    // tail_skip_max_tokens() tokens, a missing expert that every token routes at rank >= the threshold is neither fetched nor computed
+    // (zero contribution, no renormalisation); sets it on the lookup / assign op of layer il when it applies to this cache
+    void tail_skip(ggml_tensor * op, int32_t il, int64_t n_tokens) const;
     // k13: CPU misses: small batches (up to 8 tokens) fetch nothing and the host computes every miss, without trials; true if frozen
     bool freeze_small();
     // k13: CPU misses: small batches (up to 8 tokens) take the host path without trials or miss-rate windows, but still fetch their
