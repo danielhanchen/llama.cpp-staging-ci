@@ -5337,9 +5337,9 @@ static bool ggml_cuda_side_mv_run(const ggml_tensor * node);
 // stream runs (single column, ggml_cuda_side_mv_run) and K >= 4096 (the split-K launch) are left alone.
 // GGML_CUDA_DISABLE_MMVF_MULTI=1 turns it off.
 static bool ggml_cuda_mmvf_multi_disabled() {
-    // opt-in (GGML_CUDA_MMVF_MULTI=1): with PDL on, Qwen3.6-35B-A3B MTP at a spilled tier with the CPU paths pinned gave a different text
-    // in about half the launches (B200, 629cd290caa); with this launch off, or GGML_CUDA_PDL=0, 4 of 4 repeat. The race is not found yet.
-    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_MMVF_MULTI") || !ggml_cuda_env_flag("GGML_CUDA_MMVF_MULTI");
+    // on again: the text that was not repeatable with it at a spilled tier (Qwen3.6-35B-A3B MTP, B200) came from the fused residual
+    // add + RMS norm writing over its inputs, see the allocation dependencies in ggml_backend_cuda_graph_optimize
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_MMVF_MULTI");
     return disabled;
 }
 
