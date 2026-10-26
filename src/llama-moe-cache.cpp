@@ -879,6 +879,24 @@ struct llama_moe_cache::impl {
     // short prompts do not take it either
     static constexpr double cmt_host_bad = 1.25;
     bool     cmt_host_ok = true;
+    // k15-pred r22b, short prompts (LLAMA_MOE_CPU_MISS_PROMPT_AUTO, default on, 0 = off): a prompt ubatch of max_batch + 1 .. cm_max
+    // tokens that the cost model puts on the host path (cm_on, from the calibration and the measured miss rate) takes it without the
+    // small-batch trials, but only while timing says it pays, as Strata's STRATA_PREFILL_CPU_SHARE=auto does: the first such ubatches
+    // alternate with and without it (pt_need of each), timed to their end per token, and the host path is kept only if its median is at
+    // least cmt_margin faster; then one in pt_every runs the other way and the last pt_keep times of each decide again. The host's expert
+    // products are not the device's bit for bit (KLD-gated, like Strata's)
+    static constexpr int pt_need  = 3;
+    static constexpr int pt_keep  = 5;
+    static constexpr int pt_every = 29;
+    bool     pt_auto    = true;
+    bool     pt_any     = false;  // LLAMA_MOE_CPU_MISS_PROMPT_AUTO=2 (diagnostic): every prompt size in range is a candidate, the timing still decides
+    int      pt_state   = -1;     // -1 trial, 0 off, 1 on
+    int      pt_arm     = 1;      // the path of the current / next counted prompt ubatch
+    int      pt_count   = 0;      // counted prompt ubatches since the decision
+    int64_t  pt_t_prev  = -1;
+    int64_t  pt_n_prev  = 0;
+    int      pt_n_dec   = 0;
+    std::vector<double> pt_t[2];  // us per token
     // warm phase: a trial in a cache that is still filling compares the paths at a miss rate that is about to fall, and the host path
     // admits fewer experts, so it fills slower (G4 Qwen3.6 UD-Q4_K_XL 12 GB MTP: trial 1 on at a 41.6% miss rate, then off at 15.2%,
     // chat decode -10%): small batches fetch every miss and windows of cm_win1 batches measure the miss rate until it stops falling (a
@@ -1032,6 +1050,10 @@ struct llama_moe_cache::impl {
                     }
                 }
                 cm_dbg = getenv("LLAMA_MOE_CPU_MISS_LOG") != nullptr && atoi(getenv("LLAMA_MOE_CPU_MISS_LOG")) != 0;
+                if (const char * env_pa = getenv("LLAMA_MOE_CPU_MISS_PROMPT_AUTO")) {
+                    pt_auto = atoi(env_pa) != 0;
+                    pt_any  = atoi(env_pa) == 2;
+                }
                 if (const char * env_s = getenv("LLAMA_MOE_CPU_MISS_SPLIT_SCALE")) {
                     cm_split_scale = std::max(0.0, atof(env_s));
                 }
@@ -4577,8 +4599,15 @@ struct llama_moe_cache::impl {
         return cmt_host_ok && (!cm_trial || (cmt_n > 0 && cm_small_ok));
     }
 
+    // r22b: a prompt ubatch the cost model puts on the host path, outside the forced and the trial-gated rules
+    bool pt_eligible(int64_t n_tokens) const {
+        return pt_auto && cm && cm_cal && !cm_force && n_tokens > max_batch && n_tokens <= cm_max && n_tokens > cm_prompt_force &&
+            (cm_on[n_tokens] != 0 || pt_any) && cmt_host_ok && !cm_prompt_ok();
+    }
+
     bool cm_serves(int64_t n_tokens) const {
-        return cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_max && (n_tokens <= cm_prompt_force || (cm_on[n_tokens] != 0 && cm_prompt_ok()));
+        return cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_max && (n_tokens <= cm_prompt_force || (cm_on[n_tokens] != 0 && cm_prompt_ok()) ||
+            (pt_eligible(n_tokens) && pt_arm != 0));
     }
 
     // the host computes the misses of a batch of n_tokens: the fetch share, 1 = every missing expert is fetched
@@ -4591,6 +4620,11 @@ struct llama_moe_cache::impl {
             // prompt of 122 ms; G4 k11pgW at 1/4: LFM2.5 chat 444 tok/s (339 at the rule's share), Qwen3.6 360 (329); 1/8: LFM2.5 415
             return cm_prompt_share > 0.0f ? cm_prompt_share : std::min(cm_share[n_tokens], 0.25f);
         }
+        if (pt_eligible(n_tokens)) {
+            // the fetch share of k11's prompt path: at most 1/4 (its fetched misses are read by the zero-copy kernel, slower than the DMA
+            // the model prices: G4 LFM2.5 8 GB chat 444 tok/s at 1/4 vs 339 at the rule's share)
+            return pt_arm == 0 ? 1.0f : (cm_prompt_share > 0.0f ? cm_prompt_share : std::min(cm_share[n_tokens], 0.25f));
+        }
         if (!cm || !cm_cal || n_tokens < 1 || n_tokens > cm_max || cm_on[n_tokens] == 0 || (n_tokens <= max_batch ? !cm_small_live : !cm_prompt_ok())) {
             return 1.0f;
         }
@@ -4602,6 +4636,9 @@ struct llama_moe_cache::impl {
             return false;
         }
         for (int64_t n = 1; n <= cm_max; ++n) {
+            if (n > max_batch && pt_eligible(n) && pt_state != 0) {
+                return true;
+            }
             if (cm_on[n] != 0 && (n > max_batch ? cm_prompt_ok() : cm_small_live)) {
                 return true;
             }
@@ -5272,6 +5309,69 @@ struct llama_moe_cache::impl {
             cmt_t[cmt_arm].push_back(ggml_time_us() - cmt_t_prev);
             cmt_t_prev = -1;
         }
+    }
+
+    // r22b prompt timing (see pt_auto): before the graph of a ubatch, and at its end (backends synchronized)
+    bool pt_pending() const {
+        return pt_auto && cm && cm_cal && !cm_force;
+    }
+    void pt_tick(int64_t n_tokens) {
+        pt_t_prev = -1;
+        if (!pt_eligible(n_tokens)) {
+            return;
+        }
+        int arm;
+        if (pt_state < 0) {
+            // alternate, on first, until pt_need of each
+            arm = pt_t[1].size() <= pt_t[0].size() ? 1 : 0;
+        } else {
+            pt_count++;
+            arm = pt_count % pt_every == 0 ? 1 - pt_state : pt_state;
+        }
+        if (arm != pt_arm) {
+            cm_gen++; // graph key
+        }
+        pt_arm    = arm;
+        pt_t_prev = ggml_time_us();
+        pt_n_prev = n_tokens;
+    }
+    bool pt_timed() const {
+        return pt_t_prev >= 0;
+    }
+    void pt_end() {
+        if (pt_t_prev < 0) {
+            return;
+        }
+        auto & v = pt_t[pt_arm];
+        v.push_back((double) (ggml_time_us() - pt_t_prev)/(double) std::max<int64_t>(1, pt_n_prev));
+        if ((int) v.size() > pt_keep) {
+            v.erase(v.begin());
+        }
+        pt_t_prev = -1;
+        const bool trial_done = pt_state < 0 && (int) pt_t[0].size() >= pt_need && (int) pt_t[1].size() >= pt_need;
+        const bool recheck    = pt_state >= 0 && pt_arm != pt_state;
+        if (!trial_done && !recheck) {
+            return;
+        }
+        auto median = [](std::vector<double> x) {
+            std::sort(x.begin(), x.end());
+            return x.empty() ? 0.0 : x[x.size()/2];
+        };
+        const double t_off = median(pt_t[0]);
+        const double t_on  = median(pt_t[1]);
+        const int    st    = t_on < (1.0 - cmt_margin)*t_off ? 1 : 0;
+        pt_n_dec++;
+        if (pt_state < 0 || st != pt_state || cm_dbg) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses, short prompts: %.1f us per token without the host path, %.1f with it (medians of %zu and %zu) "
+                "-> host path %s for prompts of %" PRId64 "-%" PRId64 " tokens where the cost model allows (LLAMA_MOE_CPU_MISS_PROMPT_AUTO=0 off)\n",
+                tag, t_off, t_on, pt_t[0].size(), pt_t[1].size(), st ? "on" : "off", max_batch + 1, cm_max);
+        }
+        if (st != pt_arm) {
+            cm_gen++;
+        }
+        pt_state = st;
+        pt_arm   = st;
+        pt_count = 0;
     }
 
     // before the graph of every ubatch while a trial runs or waits
@@ -7694,7 +7794,7 @@ void llama_moe_cache::overlap_tick(int64_t n_tokens) {
 
 bool llama_moe_cache::hybrid_window_pending() const {
     if (pimpl->cm) {
-        return pimpl->cmt_pending();
+        return pimpl->cmt_pending() || pimpl->pt_pending();
     }
     return pimpl->hybrid && (pimpl->win_done >= 0 || pimpl->win_wait >= 0);
 }
@@ -7704,16 +7804,18 @@ bool llama_moe_cache::hybrid_tick_sync() const {
 }
 
 bool llama_moe_cache::hybrid_tick_timed() const {
-    return pimpl->cm && pimpl->cmt_timed();
+    return pimpl->cm && (pimpl->cmt_timed() || pimpl->pt_timed());
 }
 
 void llama_moe_cache::hybrid_tick_end() {
     pimpl->cmt_end();
+    pimpl->pt_end();
 }
 
 void llama_moe_cache::hybrid_tick(int64_t n_tokens) {
     if (pimpl->cm) {
         pimpl->cmt_tick(n_tokens);
+        pimpl->pt_tick(n_tokens);
         return;
     }
     pimpl->tick(n_tokens);
