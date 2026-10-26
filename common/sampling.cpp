@@ -760,6 +760,23 @@ bool common_sampler_device_greedy(const struct common_sampler * gsmpl) {
     return ok;
 }
 
+bool common_sampler_device_greedy_masked(const struct common_sampler * gsmpl, std::vector<llama_token> & mask) {
+    // k15-fn: the argmax of the logits with some tokens excluded (every bias is -inf, e.g. ignore_eos): the device greedy_masked chain
+    // gives the same token
+    mask.clear();
+    if (gsmpl == nullptr || !gsmpl->greedy_fast || gsmpl->pen_fast || gsmpl->bias_sparse.empty()) {
+        return false;
+    }
+    for (const auto & [tok, bias] : gsmpl->bias_sparse) {
+        if (!(std::isinf(bias) && bias < 0.0f)) {
+            mask.clear();
+            return false;
+        }
+        mask.push_back(tok);
+    }
+    return true;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 

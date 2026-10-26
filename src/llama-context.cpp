@@ -2352,6 +2352,23 @@ void llama_context::set_sampler_raw_logits(llama_seq_id seq_id, bool raw) {
     }
 }
 
+bool llama_context::set_sampler_swap(llama_seq_id seq_id, llama_sampler * sampler) {
+    auto it = sampling.samplers.find(seq_id);
+    if (it == sampling.samplers.end() || sampler == nullptr || !sampler->iface->backend_init || !sampler->iface->backend_apply ||
+            llama_sampler_chain_n(sampler) <= 0) {
+        return false;
+    }
+    if (it->second == sampler) {
+        return true;
+    }
+    if (!llama_sampler_chain_is_init(sampler)) {
+        sampler->iface->backend_init(sampler, ggml_backend_dev_buffer_type(model.dev_output()), cparams.n_outputs_max_per_seq);
+    }
+    // the graph of the next ubatch is built again (llm_graph_result::can_reuse compares the samplers), the reserve stays
+    it->second = sampler;
+    return true;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -2381,7 +2398,10 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (sampler && can_offload) {
         auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
 
-        sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
+        // k15-fn: a chain set before (the server's device greedy chain, back from a backend sampling request) is initialized once
+        if (!llama_sampler_chain_is_init(sampler)) {
+            sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
+        }
 
         sampling.samplers[seq_id] = sampler;
 
@@ -5430,7 +5450,9 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
+    graph_reserving = true;
     const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    graph_reserving = false;
 
     res->reset();
 
@@ -5467,6 +5489,21 @@ ggml_cgraph * llama_context::graph_reserve(
     return gf;
 }
 
+std::map<llama_seq_id, llama_sampler *> llama_context::graph_samplers() const {
+    // k15-fn: a sequence copying its raw logits (llama_set_sampler_raw_logits) has no sampler in the graph: its argmax chains cost ~1%
+    // of a G4 Flash-Next decode step and nothing reads them. The reserve keeps every sampler (the largest graph)
+    if (sampling.raw.empty() || graph_reserving) {
+        return sampling.samplers;
+    }
+    std::map<llama_seq_id, llama_sampler *> res;
+    for (const auto & [seq_id, smpl] : sampling.samplers) {
+        if (sampling.raw.count(seq_id) == 0) {
+            res.emplace(seq_id, smpl);
+        }
+    }
+    return res;
+}
+
 llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -5487,7 +5524,7 @@ llm_graph_params llama_context::graph_params(
         /*.moe_cache   =*/ moe_cache.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
-        /*.samplers    =*/ sampling.samplers,
+        /*.samplers    =*/ graph_samplers(),
         /*.n_outputs   =*/ n_outputs,
         /*.moe_full_last =*/ moe_full_last || getenv("LLAMA_MOE_LEND_FULL_LAST") == nullptr || atoi(getenv("LLAMA_MOE_LEND_FULL_LAST")) >= 2,
         /*.cb          =*/ graph_get_cb(),
@@ -8457,6 +8494,10 @@ void llama_set_sampler_raw_logits(llama_context * ctx, llama_seq_id seq_id, bool
 
 void llama_sched_reserve_now(llama_context * ctx) {
     ctx->sched_reserve();
+}
+
+bool llama_set_sampler_swap(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
+    return ctx->set_sampler_swap(seq_id, smpl);
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {

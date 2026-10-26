@@ -57,6 +57,8 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 
 // k15-fn: the chain picks the argmax of the raw logits (greedy, no logit bias, no active penalties, no probabilities requested)
 bool common_sampler_device_greedy(const struct common_sampler * gsmpl);
+// k15-fn: the request picks the argmax with a token set excluded (every bias -inf, e.g. ignore_eos): true and mask = those tokens, ascending
+bool common_sampler_device_greedy_masked(const struct common_sampler * gsmpl, std::vector<llama_token> & mask);
 // k15-fn: the sampler takes the token a device greedy chain picked for the row (the server sets it for device greedy requests)
 void common_sampler_set_device_token(struct common_sampler * gsmpl, bool on);
 

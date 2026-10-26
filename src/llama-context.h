@@ -372,6 +372,10 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
     void set_sampler_raw_logits(llama_seq_id seq_id, bool raw);
+    bool set_sampler_swap(llama_seq_id seq_id, llama_sampler * sampler);
+    // the samplers the graph of a ubatch applies (graph_params): not those of the sequences copying raw logits, except in a reserve
+    std::map<llama_seq_id, llama_sampler *> graph_samplers() const;
+    bool graph_reserving = false;
 
 private:
     llm_graph_result * get_gf_res_prev();

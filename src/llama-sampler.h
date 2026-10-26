@@ -36,6 +36,8 @@ struct llama_sampler_chain {
 };
 
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
+// k15-fn: a chain whose backend_init was called (false for any other sampler)
+bool llama_sampler_chain_is_init(const llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
 
 struct llama_sampler * llama_sampler_init_dry_testing(
