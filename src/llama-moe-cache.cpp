@@ -6291,6 +6291,19 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("%s: %s: MoE cache lends %d of %d slots (%.2f MiB) to the staging copies of large batches (LLAMA_MOE_CACHE_LEND=0 to disable)\n",
                 __func__, ggml_backend_name(backend), n_lend, g.n_slots, (double) n_lend*g.expert_bytes/1024.0/1024.0);
         }
+        // k15-fn LLAMA_MOE_CACHE_LEND_POISON=1 (debug): the lent slots of a graph lend are filled with 0xff (NaN in f32 / f16 / bf16 and in
+        // the scales of quantized blocks) before the graph, so a read of lent memory before the graph wrote it shows in the output
+        static const bool lend_poison = getenv("LLAMA_MOE_CACHE_LEND_POISON") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_LEND_POISON")) != 0;
+        if (lend_poison && n_graph > 0) {
+            ggml_backend_synchronize(backend);
+            for (ggml_tensor * bank : g.banks) {
+                ggml_backend_tensor_memset(bank, 0xff, (size_t) (g.n_slots - n_lend)*bank->nb[2], (size_t) n_lend*bank->nb[2]);
+            }
+            static int n_poison_log = 0;
+            if (n_poison_log++ < 4) {
+                LLAMA_LOG_WARN("%s: LLAMA_MOE_CACHE_LEND_POISON: %d lent slots filled with 0xff before the graph\n", __func__, n_lend);
+            }
+        }
         n_lends++;
         lend_max = std::max(lend_max, n_lend);
     }
