@@ -1467,6 +1467,8 @@ struct ggml_cuda_q8_1_cache {
     int    pending   = -1; // slot reserved by a producer, see reserve()
     entry  entries[n_slots];
     std::unordered_set<const void *> norm_targets; // producer tensors whose kernel writes the q8_1 copy (see ggml_cuda_q8_1_cache_slot_size)
+    // k15-mm2: the reader's row length of a producer target whose rows differ from the reader's (a multiple of MATRIX_ROW_PADDING)
+    std::unordered_map<const void *, int64_t> norm_target_ne10;
 
     bool active() const {
         return arena != nullptr;
@@ -1483,6 +1485,7 @@ struct ggml_cuda_q8_1_cache {
     void end() {
         begin(nullptr, 0);
         norm_targets.clear();
+        norm_target_ne10.clear();
     }
 
     // returns the slot holding the q8_1 copy of src (quantized == true) or a slot to quantize into
