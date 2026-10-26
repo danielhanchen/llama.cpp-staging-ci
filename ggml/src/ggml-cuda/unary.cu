@@ -887,7 +887,8 @@ static __global__ void ew_chain_f32_kernel(const float * x, float * dst, const i
 
 // ew_chain_f32_kernel plus the q8_1 copy of the output: element i is computed and quantized by thread i, as quantize_q8_1
 // does it (one value per lane, the same 32-lane reductions; CUDA_NEG_BLOCK_SIZE % QK8_1 == 0), padding values are 0
-static __global__ void ew_chain_q8_1_f32_kernel(const float * x, float * dst, void * vq, const int64_t k, const int64_t kq,
+// k15-mm2: rows of ne0 values, their q8_1 copy padded to ne0q per row (ne0q == ne0 or a single row: the layout as before)
+static __global__ void ew_chain_q8_1_f32_kernel(const float * x, float * dst, void * vq, const int64_t ne0, const int64_t ne0q, const int64_t kq,
         const ggml_cuda_ew_chain chain) {
     ggml_cuda_pdl_lc();
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
@@ -897,14 +898,17 @@ static __global__ void ew_chain_q8_1_f32_kernel(const float * x, float * dst, vo
     }
 
     ggml_cuda_pdl_sync();
+    const int64_t row = i / ne0q;
+    const int64_t col = i - row*ne0q;
     float v = 0.0f;
-    if (i < k) {
-        v = x[i];
+    if (col < ne0) {
+        const int64_t ix = row*ne0 + col;
+        v = x[ix];
 #pragma unroll 1
         for (int j = 0; j < chain.n_ops; ++j) {
             v = ew_chain_apply(chain.op[j], chain.p0[j], chain.p1[j], v);
         }
-        dst[i] = v;
+        dst[ix] = v;
     }
 
     float amax = fabsf(v);
@@ -935,11 +939,13 @@ void ggml_cuda_op_ew_chain(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     const int64_t k = ggml_nelements(dst);
     if (q8_1_out != nullptr) {
         static_assert(CUDA_NEG_BLOCK_SIZE % QK8_1 == 0, "a warp must cover whole q8_1 blocks");
-        GGML_ASSERT(ggml_nrows(dst) == 1 || dst->ne[0] % MATRIX_ROW_PADDING == 0);
-        const int64_t kq = ggml_nrows(dst) * GGML_PAD(dst->ne[0], MATRIX_ROW_PADDING);
+        GGML_ASSERT(ggml_nrows(dst) == 1 || dst->ne[0] % QK8_1 == 0);
+        const int64_t ne0  = ggml_nrows(dst) == 1 ? k : dst->ne[0];
+        const int64_t ne0q = GGML_PAD(ne0, MATRIX_ROW_PADDING);
+        const int64_t kq   = ggml_nrows(dst) * ne0q;
         const int64_t num_blocks = (kq + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
-        ggml_cuda_kernel_launch(ew_chain_q8_1_f32_kernel, launch_params, (const float *) src->data, (float *) dst->data, q8_1_out, k, kq, chain);
+        ggml_cuda_kernel_launch(ew_chain_q8_1_f32_kernel, launch_params, (const float *) src->data, (float *) dst->data, q8_1_out, ne0, ne0q, kq, chain);
         return;
     }
     const int64_t num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;

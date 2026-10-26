@@ -680,6 +680,17 @@ static __global__ void mul_mat_vec_q(
 
     // let the next kernel launch while this one runs, its ggml_cuda_pdl_sync() still waits for the completion
     ggml_cuda_pdl_lc();
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (c_ewq) {
+        // the weights do not depend on the previous kernel: start pulling this block's rows (contiguous) into L2 while it finishes,
+        // the chain prologue below then overlaps their latency
+        const char * w0 = (const char *) vx + (size_t) row0*stride_row_x*ggml_cuda_type_traits<type>::bs;
+        const int nbytes = rows_per_cuda_block*stride_row_x*ggml_cuda_type_traits<type>::bs;
+        for (int off = 128*tid; off < nbytes; off += 128*nwarps*warp_size) {
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(w0 + off));
+        }
+    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     ggml_cuda_pdl_sync();
     sample_dst = blockIdx.z;
     // k11-decode: a single column MUL_MAT_ID launch over several tokens (batch invariant verify) takes the tokens as samples:
@@ -788,9 +799,11 @@ static __global__ void mul_mat_vec_q(
             const int j = e / (blocks_per_row_x*QK8_1);
             const int k = e - j*(blocks_per_row_x*QK8_1);
             float v = fusion.ew_src[j*fusion.ew_stride_col + k];
-#pragma unroll 1
-            for (int o = 0; o < fusion.ew_n; ++o) {
-                v = fusion.ew_op[o] == 0 ? fusion.ew_p0[o] * v + fusion.ew_p1[o] : ggml_cuda_op_silu_single(v);
+#pragma unroll
+            for (int o = 0; o < GGML_CUDA_MMVQ_EW_MAX; ++o) {
+                if (o < fusion.ew_n) {
+                    v = fusion.ew_op[o] == 0 ? fusion.ew_p0[o] * v + fusion.ew_p1[o] : ggml_cuda_op_silu_single(v);
+                }
             }
             float amax = fabsf(v);
             float sum  = v;
@@ -2346,12 +2359,16 @@ void ggml_cuda_mul_mat_vec_q_ew(ggml_backend_cuda_context & ctx, const ggml_tens
     const uint3    one            = init_fastdiv_values(1);
     const uint3    zero           = make_uint3(0, 0, 0);
 
-    constexpr int rpb = 4;
+    // 16 rows per block (the rows do not change a row's sum): every block applies the chain to the whole src1, so fewer, longer
+    // blocks (10240 rows: 640 blocks, about two per SM on B200); GGML_CUDA_MMVQ_EW_RPB=4 for 4
+    static const int rpb_env = getenv("GGML_CUDA_MMVQ_EW_RPB") ? atoi(getenv("GGML_CUDA_MMVQ_EW_RPB")) : 16;
+    const int rpb = rpb_env == 4 || nrows_x % 16 != 0 ? 4 : 16;
     const ggml_cuda_kernel_launch_params launch_params =
         ggml_cuda_kernel_launch_params(dim3((nrows_x + rpb - 1) / rpb, 1, 1), dim3(32, 4, 1), 0, ctx.stream());
-#define MMVQ_EW_LAUNCH(NC) ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_Q8_0, NC, false, false, false, 4, 0, rpb, 1, true>, \
+#define MMVQ_EW_LAUNCH_R(NC, RPB) ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_Q8_0, NC, false, false, false, 4, 0, RPB, 1, true>, \
         launch_params, src0->data, nullptr, nullptr, fusion, (float *) dst->data, ncols_x, zero, stride_row_x, stride_col_y, \
         stride_col_dst, one, 0, 0, 0, one, 0, 0, 0, 0)
+#define MMVQ_EW_LAUNCH(NC) if (rpb == 16) { MMVQ_EW_LAUNCH_R(NC, 16); } else { MMVQ_EW_LAUNCH_R(NC, 4); }
     switch (ncols_dst) {
         case 1: MMVQ_EW_LAUNCH(1); break;
         case 2: MMVQ_EW_LAUNCH(2); break;
@@ -2360,6 +2377,7 @@ void ggml_cuda_mul_mat_vec_q_ew(ggml_backend_cuda_context & ctx, const ggml_tens
         default: GGML_ABORT("fatal error");
     }
 #undef MMVQ_EW_LAUNCH
+#undef MMVQ_EW_LAUNCH_R
 }
 
 void ggml_cuda_op_mul_mat_vec_q(

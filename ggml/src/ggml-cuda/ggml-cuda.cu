@@ -4282,8 +4282,11 @@ static int ggml_cuda_try_fuse_ew_chain(ggml_backend_cuda_context * cuda_ctx, ggm
     // a mul_mat_vec_q reads the chain output: write its q8_1 copy in the same kernel
     void * q8_1_out = nullptr;
     ggml_cuda_q8_1_cache & cache = cuda_ctx->q8_1_cache;
+    // k15-mm2: also several rows whose length is a multiple of 32 but not of the q8_1 row padding (the hyper-connection up input at
+    // an MTP verify, 320 x 3), each q8_1 row padded with zeros as quantize_q8_1 pads it (GGML_CUDA_EW_Q8_1_ROWS=0: those rows not)
+    static const bool rows_off = [] { const char * e = getenv("GGML_CUDA_EW_Q8_1_ROWS"); return e != nullptr && atoi(e) == 0; }();
     if (cache.active() && cuda_ctx->curr_stream_no == 0 && cache.norm_targets.count(last) &&
-        (ggml_nrows(last) == 1 || last->ne[0] % MATRIX_ROW_PADDING == 0)) {
+        (ggml_nrows(last) == 1 || last->ne[0] % MATRIX_ROW_PADDING == 0 || (!rows_off && last->ne[0] % QK8_1 == 0))) {
         const int64_t ne10_padded = GGML_PAD(last->ne[0], MATRIX_ROW_PADDING);
         int64_t key[ggml_cuda_q8_1_cache::n_key];
         ggml_cuda_q8_1_cache::key_contiguous(last->ne[0], ggml_nrows(last), key);
@@ -5103,9 +5106,10 @@ static int ggml_cuda_try_fuse_mmvf_multi(ggml_backend_cuda_context * cuda_ctx, g
 // k15-mm2: SCALE / SILU chain (each node read only by the next) -> MUL_MAT whose src1 is the chain end, a short-K dense Q8_0
 // product of 1..4 columns (the hyper-connection up projection behind silu(scale(down))): the product's blocks apply the chain and
 // quantize its output themselves (ggml_cuda_mul_mat_vec_q_ew), one launch in place of the chain kernel, quantize_q8_1 and
-// mul_mat_vec_q, with the same bytes. GGML_CUDA_MMVQ_EW=0 turns it off. Returns the number of extra nodes covered.
+// mul_mat_vec_q, with the same bytes. Opt-in, GGML_CUDA_MMVQ_EW=1. Returns the number of extra nodes covered.
 static int ggml_cuda_try_fuse_ew_mmvq(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
-    static const bool off = [] { const char * e = getenv("GGML_CUDA_MMVQ_EW"); return e != nullptr && atoi(e) == 0; }();
+    // opt-in (GGML_CUDA_MMVQ_EW=1): measured slower on B200 at the Flash-Next verify (+5% per forward), every block repeats the chain
+    static const bool off = [] { const char * e = getenv("GGML_CUDA_MMVQ_EW"); return e == nullptr || atoi(e) == 0; }();
     if (off || cuda_ctx->curr_stream_no != 0) {
         return 0;
     }
