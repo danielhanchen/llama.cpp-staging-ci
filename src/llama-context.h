@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #pragma once
 
 #include "llama.h"
@@ -15,6 +16,7 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <set>
@@ -376,6 +378,8 @@ public:
 
     // reserve the graph of a prefetched ubatch that seeds the MoE cache from its own ids if the devices have room for it (staging_pp:
     // staging memory of the pp graph per backend), returns false if it does not fit
+    static std::atomic<bool> g_fit_seed_priced; // k16-fit: a memory probe priced the seed graph (sched_reserve)
+    static bool fit_seed_price_on();             // LLAMA_FIT_SEED_PRICE (default on)
     bool sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const std::vector<size_t> & staging_pp);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
