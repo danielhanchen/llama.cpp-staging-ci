@@ -5990,7 +5990,15 @@ bool llama_context::restore_pp_plan() {
         return false;
     }
     sched_plan_small = false;
-    synchronize();
+    // k15-idlewait: the reserve needs the device idle and the rows of a save in flight read, not the save's host copy into its
+    // destination (LLAMA_PP_RERESERVE_JOIN=1: synchronize(), which joins the save: G4 q4x chat, 16 ms ahead of a request posted meanwhile)
+    static const bool pp_join = getenv("LLAMA_PP_RERESERVE_JOIN") != nullptr && atoi(getenv("LLAMA_PP_RERESERVE_JOIN")) != 0;
+    if (pp_join) {
+        synchronize();
+    } else {
+        ggml_backend_sched_synchronize(sched.get());
+        state_async_wait_reads();
+    }
     auto mctx_full = memory->init_full();
     if (!mctx_full) {
         return false;
