@@ -2531,6 +2531,7 @@ bool llama_context::set_sampler_swap(llama_seq_id seq_id, llama_sampler * sample
     }
     // the graph of the next ubatch is built again (llm_graph_result::can_reuse compares the samplers), the reserve stays
     it->second = sampler;
+    llm_graph_sampler_unbind(sampler);
     return true;
 }
 
@@ -2569,6 +2570,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         }
 
         sampling.samplers[seq_id] = sampler;
+        llm_graph_sampler_unbind(sampler);
 
         sched_need_reserve = true;
 

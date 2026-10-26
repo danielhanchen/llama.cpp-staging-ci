@@ -1,3 +1,4 @@
+#include <vector>
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
 
@@ -379,6 +380,29 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16));
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
+
+    // k15-fn debug (GGML_CUDA_SET_ROWS_CHECK=1): the row indices read back before the launch, an index outside dst's rows is logged
+    // (an eager graph only: a capture cannot synchronize)
+    static const bool check = getenv("GGML_CUDA_SET_ROWS_CHECK") != nullptr;
+    if (check && src1->ne[2] == 1 && src1->ne[3] == 1 && ggml_is_contiguous(src1)) {
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &cs));
+        if (cs == cudaStreamCaptureStatusNone) {
+            const int64_t n = ggml_nelements(src1);
+            std::vector<int64_t> idx(n);
+            std::vector<char> raw(ggml_nbytes(src1));
+            CUDA_CHECK(cudaMemcpyAsync(raw.data(), src1->data, raw.size(), cudaMemcpyDeviceToHost, ctx.stream()));
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            for (int64_t i = 0; i < n; ++i) {
+                idx[i] = src1->type == GGML_TYPE_I64 ? ((const int64_t *) raw.data())[i] : ((const int32_t *) raw.data())[i];
+                if (idx[i] < 0 || idx[i] >= dst->ne[1]) {
+                    GGML_LOG_ERROR("%s: %s: index %lld of %lld is %lld, dst %s has %lld rows (src1 %s)\n", __func__, dst->name, (long long) i,
+                        (long long) n, (long long) idx[i], dst->name, (long long) dst->ne[1], src1->name);
+                    break;
+                }
+            }
+        }
+    }
 
     if (src0->type == GGML_TYPE_F32) {
         if (src1->type == GGML_TYPE_I64) {
