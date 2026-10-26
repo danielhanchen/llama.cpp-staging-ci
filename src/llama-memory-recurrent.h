@@ -134,6 +134,7 @@ private:
 
     // k16-draft: a no_alloc memory probe holds dummy buffers, sized from the tensors (LLAMA_RS_PROBE_DUMMY=0: real buffers)
     bool probe_sized = false;
+    std::vector<ggml_backend_buffer_ptr> probe_base; // the probe's real allocation of the base rows (LLAMA_RS_PROBE_DUMMY=1)
 
     // true if no layers - can happen if the layer filter removes all layers
     bool is_empty() const;
