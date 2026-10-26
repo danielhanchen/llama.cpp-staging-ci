@@ -5562,10 +5562,25 @@ static __global__ void k_qsa_idx_select(const int32_t * __restrict__ idx, const 
     dst[i] = ggml_cuda_cast<int32_t>(r);
 }
 
+// the same map in one block, results staged in shared memory before any is written: safe when dst overlaps an input at an offset
+static __global__ void k_qsa_idx_select_staged(const int32_t * __restrict__ idx, const float * __restrict__ dump, const float * __restrict__ live,
+        int32_t * __restrict__ dst, const int n) {
+    extern __shared__ int32_t staged[];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float f = ggml_cuda_cast<float>(idx[i]);
+        const float d = dump[i];
+        const float r = __fadd_rn(__fmul_rn(__fsub_rn(f, d), live[i]), d);
+        staged[i] = ggml_cuda_cast<int32_t>(r);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        dst[i] = staged[i];
+    }
+}
+
 static int ggml_cuda_try_fuse_qsa_idx(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
-    // opt-in (GGML_CUDA_QSA_IDX_FUSION=1): on G4 fn4 IQ4_XS 32 GB Studio the 8k / 16k md5 varied from launch to launch with it on and was
-    // stable with it off (k15gd2_g4, 3 launches per arm); the fn1 cells here are exact. Not found yet (interplay with the QSA maskless
-    // attention suspected). GGML_CUDA_DISABLE_QSA_IDX_FUSION=1 still turns it off
+    // opt-in (GGML_CUDA_QSA_IDX_FUSION=1) until G4 confirms the overlap check below: without it the 8k / 16k md5 on G4 fn4 IQ4_XS 32 GB
+    // Studio varied from launch to launch (k15gd2_g4, k15ge_g4, also with GGML_CUDA_QSA_MASKLESS=0). GGML_CUDA_DISABLE_QSA_IDX_FUSION=1 off
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_QSA_IDX_FUSION") || !ggml_cuda_env_flag("GGML_CUDA_QSA_IDX_FUSION");
     if (disabled || i + 4 >= cgraph->n_nodes) {
         return 0;
@@ -5598,10 +5613,27 @@ static int ggml_cuda_try_fuse_qsa_idx(ggml_backend_cuda_context * cuda_ctx, ggml
     if (c2->src[1] != nullptr && c2->src[1]->data != c2->data) {
         return 0;
     }
-    const int64_t n = ggml_nelements(c1);
-    const int block = 256;
-    k_qsa_idx_select<<<(unsigned) ((n + block - 1)/block), block, 0, cuda_ctx->stream()>>>((const int32_t *) c1->src[0]->data,
-        (const float *) sub->src[1]->data, (const float *) mul->src[1]->data, (int32_t *) c2->data, n);
+    // the allocator may place c2 in memory freed inside the chain (live after the mul, dump after the add): the separate kernels finish
+    // reading it first, one grid would race with its other threads unless c2 starts exactly where the input does (element i of both
+    // belongs to thread i). Then one block stages every result before writing any (decode / verify sizes), else no fusion.
+    // G4 fn4 32 GB: 8k md5 changed from launch to launch without this (k15gd2_g4, k15ge_g4); 8 of 12 layers overlap in the fn1 verify graph
+    bool overlap = false;
+    for (const ggml_tensor * in : { c1->src[0], sub->src[1], mul->src[1] }) {
+        overlap = overlap || (in->data != c2->data && ggml_cuda_tensors_overlap(in, c2));
+    }
+    const int64_t n_all = ggml_nelements(c1);
+    if (overlap && n_all > 8192) {
+        return 0;
+    }
+    const int64_t n = n_all;
+    if (overlap) {
+        k_qsa_idx_select_staged<<<1, 1024, n*sizeof(int32_t), cuda_ctx->stream()>>>((const int32_t *) c1->src[0]->data,
+            (const float *) sub->src[1]->data, (const float *) mul->src[1]->data, (int32_t *) c2->data, (int) n);
+    } else {
+        const int block = 256;
+        k_qsa_idx_select<<<(unsigned) ((n + block - 1)/block), block, 0, cuda_ctx->stream()>>>((const int32_t *) c1->src[0]->data,
+            (const float *) sub->src[1]->data, (const float *) mul->src[1]->data, (int32_t *) c2->data, n);
+    }
     CUDA_CHECK(cudaGetLastError());
     return 4;
 }
