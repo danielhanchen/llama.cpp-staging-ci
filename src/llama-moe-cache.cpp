@@ -3190,7 +3190,7 @@ struct llama_moe_cache::impl {
 
     void init_upload_ahead(const llama_model & model) {
         const char * env = getenv("LLAMA_MOE_UPLOAD_AHEAD");
-        ua_mode = env != nullptr ? atoi(env) : 1;
+        ua_mode = env != nullptr ? atoi(env) : 0; // opt-in: LLAMA_MOE_UPLOAD_AHEAD=1 (repeat-prompt decode loses 5-20% when on)
         const char * env_l0 = getenv("LLAMA_MOE_UPLOAD_AHEAD_LOG");
         ua_log = env_l0 != nullptr ? atoi(env_l0) : 0;
         if (ua_mode <= 0 || groups.empty()) {
