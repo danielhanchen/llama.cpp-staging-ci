@@ -1180,7 +1180,12 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
             const double tokens = n_used > 0 ? moe_cache->cached_frac()*(double) model.hparams.n_expert/(double) n_used : 0.0;
             const uint64_t ram_total = llama_sysmem::total();
             const bool ram_ok = ram_total == 0 || moe_cache->host_uncached_bytes() <= ram_frac*(double) ram_total;
-            const char * why = cparams.spec_draft ? "speculative decoding with a draft model or MTP heads" :
+            // k15-ov: a draft model that --fit dropped (common sets LLAMA_FIT_DRAFT_DROPPED=1: it does not fit beside the cache, so
+            // speculative decoding is off) leaves no draft to compete with the depth-3 staging. G4 Flash-Next UD-IQ4_XS 24 GB Studio
+            // argv (Q8_0 drafter dropped), depth 3: 8k prompt -3..-6%, 16k -4% (k15g4u1 S_upd3). LLAMA_MOE_PREFETCH_DEPTH_DROPPED=0: as before
+            static const bool dropped_env = getenv("LLAMA_MOE_PREFETCH_DEPTH_DROPPED") == nullptr || atoi(getenv("LLAMA_MOE_PREFETCH_DEPTH_DROPPED")) != 0;
+            const bool draft_dropped = dropped_env && getenv("LLAMA_FIT_DRAFT_DROPPED") != nullptr && atoi(getenv("LLAMA_FIT_DRAFT_DROPPED")) != 0;
+            const char * why = cparams.spec_draft && !draft_dropped ? "speculative decoding with a draft model or MTP heads" :
                 tokens < min_tokens ? "the cache holds the experts of fewer tokens than LLAMA_MOE_PREFETCH_DEPTH_SPILL_MIN_TOKENS" :
                 !ram_ok ? "the uncached host experts are more than LLAMA_MOE_PREFETCH_DEPTH_SPILL_MAX_RAM_FRAC of the RAM" : nullptr;
             depth_spill = why == nullptr ? 3 : 0;
