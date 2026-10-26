@@ -2393,6 +2393,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         }
         const char * env_dcpu  = getenv("LLAMA_FIT_DRAFT_CPU");
         const bool   draft_off = draft_cpu && params.speculative.draft.fit_can_drop && (env_dcpu == nullptr || atoi(env_dcpu) == 0);
+        // k15-ov: the context's prefetch depth rule treats a target whose draft --fit dropped as running without one (no device draft
+        // competes with the deeper staging); cparams.spec_draft stays set, as it also turns on layer-major prompts (llama_context::sched_new)
+        common_set_env("LLAMA_FIT_DRAFT_DROPPED", draft_off ? "1" : "0");
         if (draft_cpu) {
             // no device at all (-devd none): with only n_gpu_layers = 0 its context still reserves a device compute buffer for the
             // offloaded ops of large batches (2.4 GiB for the MTP drafter at -ub 2048), which pushed the main layers off the GPU
