@@ -2510,7 +2510,8 @@ static std::map<const void *, std::map<std::string, std::pair<int, size_t>>> ggm
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     static const bool exec_stats = getenv("GGML_CUDA_GRAPH_NODE_STATS") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_NODE_STATS")) >= 3;
-    if (exec_stats && (dst->op == GGML_OP_CPY || dst->op == GGML_OP_CONT || dst->op == GGML_OP_DUP || dst->op == GGML_OP_CONCAT ||
+    static const bool exec_all = exec_stats && atoi(getenv("GGML_CUDA_GRAPH_NODE_STATS")) >= 4; // =4: every op run unfused
+    if (exec_stats && (exec_all || dst->op == GGML_OP_CPY || dst->op == GGML_OP_CONT || dst->op == GGML_OP_DUP || dst->op == GGML_OP_CONCAT ||
                        dst->op == GGML_OP_GET_ROWS || dst->op == GGML_OP_REPEAT || dst->op == GGML_OP_SET_ROWS) && ggml_nelements(dst) > 0) {
         std::string nm;
         for (const char * c = dst->name; *c; ++c) {
@@ -2518,8 +2519,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         }
         const ggml_tensor * s0 = dst->src[0];
         char key[256];
-        snprintf(key, sizeof(key), "%s %s [%lld,%lld,%lld] <- %s %s", ggml_op_name(dst->op), nm.c_str(), (long long) dst->ne[0], (long long) dst->ne[1],
-            (long long) dst->ne[2], s0 ? ggml_op_name(s0->op) : "-", s0 ? s0->name : "");
+        snprintf(key, sizeof(key), "%s%s%s %s [%lld,%lld,%lld] <- %s %s", ggml_op_desc(dst), dst->op == GGML_OP_UNARY || dst->op == GGML_OP_GLU ? "" : "",
+            "", nm.c_str(), (long long) dst->ne[0], (long long) dst->ne[1],
+            (long long) dst->ne[2], s0 ? ggml_op_desc(s0) : "-", s0 ? s0->name : "");
         auto & e = ggml_cuda_exec_copy_ops[&ctx][key];
         e.first++;
         e.second += dst->op == GGML_OP_SET_ROWS || dst->op == GGML_OP_CPY ? ggml_nbytes(dst->op == GGML_OP_CPY ? dst->src[0] : dst->src[1]) : ggml_nbytes(dst);
