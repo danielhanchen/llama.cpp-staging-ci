@@ -1876,7 +1876,12 @@ private:
             // worker (async), so a request arriving meanwhile waits only where it reads the cache. A slot saved here is copied, so the
             // checkpoint move (LLAMA_PCS_MOVE_CKPT, which needs the next prompt) applies only to saves still made at a request.
             static const int idle_save = getenv("LLAMA_PCS_IDLE_SAVE") ? atoi(getenv("LLAMA_PCS_IDLE_SAVE")) : 2;
-            if (idle_save > 0 && prompt_cache && !params_base.embedding) {
+            // only where every layer weight is in device memory and no MoE cache runs (llama_verify_exact_placement): at a spilled tier the
+            // save overlapped the next prompt's expert uploads (G4 q4x 12 GB chat back-to-back +11 ms TTFT) and held the entry on top
+            // of the cache's host buffers (+150 MiB VmHWM); there the save stays at the request
+            const bool resident = ctx_tgt && llama_verify_exact_placement(ctx_tgt) && !llama_moe_cache_active(ctx_tgt) &&
+                (!ctx_dft || ctx_dft == ctx_tgt || (llama_verify_exact_placement(ctx_dft) && !llama_moe_cache_active(ctx_dft)));
+            if (idle_save > 0 && resident && prompt_cache && !params_base.embedding) {
                 for (auto & slot : slots) {
                     if (!slot.is_processing() && !slot.prompt_saved_idle && slot.prompt.tokens.size() > 0) {
                         // only where the save evicts nothing (an eviction could not be taken back)

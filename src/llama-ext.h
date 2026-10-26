@@ -161,6 +161,9 @@ LLAMA_API bool llama_moe_cpu_miss_drop_slow(struct llama_context * ctx);
 // k13: 0 = no MoE cache or its host never computes an expert, 1 = hybrid path with a fixed share (small caches), 2 = CPU-miss rule
 LLAMA_API int32_t llama_moe_host_mode(const struct llama_context * ctx);
 
+// k15-ttft: a MoE cache runs (experts stream from host memory into device slots)
+LLAMA_API bool llama_moe_cache_active(const struct llama_context * ctx);
+
 // k11-decode: restore the worst-case prompt plan of the graph allocator if a small graph (a verify window) re-planned it; a server
 // calls it when its slots go idle, so the next prompt does not pay for it (no-op otherwise; LLAMA_PP_RERESERVE=0: off)
 LLAMA_API bool llama_prepare_prompt_plan(struct llama_context * ctx);
