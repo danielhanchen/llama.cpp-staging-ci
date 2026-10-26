@@ -5726,6 +5726,56 @@ static int ggml_cuda_try_fuse_ew_mmvq(ggml_backend_cuda_context * cuda_ctx, ggml
     return n;
 }
 
+// k15-hostcut: consecutive CPY nodes (views between them skipped) with the same shapes and strides that take the generic F32 -> F32
+// element kernel, in one launch (ggml_cuda_cpy_multi): the delta-net conv-state snapshots, n_rs_seq + 1 per layer. No copy may read
+// or overlap what another one writes. Returns the nodes to skip, 0 if not taken
+static int ggml_cuda_try_fuse_cpy_multi(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    if (!ggml_cuda_cpy_multi_enabled() || !cuda_ctx->stream_context().concurrent_events.empty()) {
+        return 0;
+    }
+    ggml_tensor * node = cgraph->nodes[i];
+    if (!ggml_cuda_cpy_multi_ok(node->src[0], node->src[1])) {
+        return 0;
+    }
+    const ggml_tensor * src[GGML_CUDA_CPY_MULTI_MAX] = { node->src[0] };
+    ggml_tensor *       dst[GGML_CUDA_CPY_MULTI_MAX] = { node->src[1] };
+    int n = 1, last = i;
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    for (int j = i + 1; j < cgraph->n_nodes && n < GGML_CUDA_CPY_MULTI_MAX; ++j) {
+        ggml_tensor * t = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(t) || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (t->op != GGML_OP_CPY || !ggml_are_same_shape(t->src[0], src[0]) || !ggml_are_same_stride(t->src[0], src[0]) ||
+                !ggml_are_same_shape(t->src[1], dst[0]) || !ggml_are_same_stride(t->src[1], dst[0]) ||
+                !ggml_cuda_cpy_multi_ok(t->src[0], t->src[1]) ||
+                (!cuda_ctx->qsa_skip.empty() && cuda_ctx->qsa_skip.count(t)) ||
+                (!cuda_ctx->mmvq_done_early.empty() && cuda_ctx->mmvq_done_early.count(t))) {
+            break;
+        }
+        bool ok = true;
+        for (int k = 0; k < n && ok; ++k) {
+            ok = !overlap(t->src[1], dst[k]) && !overlap(t->src[1], src[k]) && !overlap(t->src[0], dst[k]);
+        }
+        if (!ok) {
+            break;
+        }
+        src[n] = t->src[0];
+        dst[n] = t->src[1];
+        ++n;
+        last = j;
+    }
+    if (n < 2) {
+        return 0;
+    }
+    ggml_cuda_cpy_multi(*cuda_ctx, src, dst, n);
+    return last - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -6603,6 +6653,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (const int n_skip = ggml_cuda_try_fuse_ew_chain(cuda_ctx, cgraph, i); n_skip > 0) {
         return n_skip;
+    }
+
+    if (node->op == GGML_OP_CPY) {
+        if (const int n_skip = ggml_cuda_try_fuse_cpy_multi(cuda_ctx, cgraph, i); n_skip > 0) {
+            return n_skip;
+        }
     }
 
     return 0;
