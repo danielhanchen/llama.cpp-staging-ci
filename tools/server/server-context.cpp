@@ -2165,6 +2165,7 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        llama_moe_request_begin(ctx_tgt);
         // k15-lfm2: the pin a request without drafts lifted is restored before the next prompt (see spill_pinned)
         if (spill_pin_lifted) {
             spill_pin_lifted = !llama_moe_pin_small_set(ctx_tgt, true);

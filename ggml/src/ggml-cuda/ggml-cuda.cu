@@ -2054,6 +2054,72 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
     return true;
 }
 
+// k15-lfm2: the kernels of the flagged verify products. One INFO line per load (the first graph with verify products, see
+// ggml_cuda_verify_mmq_summary) counts them by kernel, so the engagement of GGML_CUDA_VERIFY_MMQ shows in any server log;
+// GGML_CUDA_VERIFY_MMQ_LOG=1 also names each product once per kernel and width
+struct ggml_cuda_verify_mmq_state {
+    std::mutex                         mtx;
+    std::map<std::string, std::string> last;  // weight name -> kernel, in the first verify graph
+    std::map<std::string, std::string> seen;  // name + width -> kernel (GGML_CUDA_VERIFY_MMQ_LOG)
+    int                                cc      = 0;
+    int64_t                            cols    = 0;
+    std::atomic<bool>                  printed { false };
+};
+static ggml_cuda_verify_mmq_state & ggml_cuda_verify_mmq_st() {
+    static ggml_cuda_verify_mmq_state st;
+    return st;
+}
+
+static void ggml_cuda_verify_mmq_log(const ggml_tensor * dst, int cc, const char * what) {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_VERIFY_MMQ_LOG");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    auto & st = ggml_cuda_verify_mmq_st();
+    const ggml_tensor * src0 = dst->src[0];
+    std::lock_guard<std::mutex> lock(st.mtx);
+    if (!st.printed) {
+        st.last[src0->name] = what;
+        st.cc   = cc;
+        st.cols = std::max<int64_t>(st.cols, dst->src[1]->ne[1]);
+    }
+    if (!on || st.seen.size() > 1024) {
+        return;
+    }
+    std::string & prev = st.seen[std::string(src0->name) + "/" + std::to_string(dst->src[1]->ne[1])];
+    if (prev == what) {
+        return;
+    }
+    prev = what;
+    GGML_LOG_INFO("ggml_cuda: verify product %s (%s %lld x %lld, %lld columns, cc %d): %s\n", src0->name, ggml_type_name(src0->type),
+        (long long) src0->ne[0], (long long) src0->ne[1], (long long) dst->src[1]->ne[1], cc, what);
+}
+
+// after a graph: the one line per load, once a graph had verify products
+static void ggml_cuda_verify_mmq_summary() {
+    auto & st = ggml_cuda_verify_mmq_st();
+    if (st.printed.load(std::memory_order_relaxed)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(st.mtx);
+    if (st.printed || st.last.empty()) {
+        return;
+    }
+    st.printed = true;
+    std::map<std::string, int> n;
+    for (const auto & [name, what] : st.last) {
+        n[what]++;
+    }
+    std::string list;
+    for (const auto & [what, k] : n) {
+        list += (list.empty() ? "" : ", ") + std::to_string(k) + " " + what;
+    }
+    const char * e = getenv("GGML_CUDA_VERIFY_MMQ");
+    GGML_LOG_INFO("ggml_cuda: verify products of the first verify graph (cc %d, up to %lld columns, GGML_CUDA_VERIFY_MMQ=%s): %s "
+        "(=0 off, GGML_CUDA_VERIFY_MMQ_LOG=1 names them)\n", st.cc, (long long) st.cols, e != nullptr ? e : "default", list.c_str());
+    st.last.clear();
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -2093,6 +2159,25 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     // batch invariant (speculative verify batches): every column gets the bytes a single column (ne11 == 1) would get
     if ((dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) && ne11 > 1) {
+        // k15-lfm2, GGML_CUDA_VERIFY_MMQ: a quantized dense verify product of up to 16 columns runs MMQ (int8 tensor cores) instead
+        // of the batched mmvq: the same q8_1 activations into the same int8 products with f32 accumulation, only the order of the f32
+        // scale products and sums differs (plans/k11.md equivalence rule). T4 at 8 rows the dp4a mmvq is compute-bound (2x one row,
+        // plans/k15_lfm2.md section 15). Default on Turing (cc 7.5) only, where it was timed and passed the KLD gate; =1 on any device with
+        // the Turing MMA (Ampere and newer too), =0 off. Not here: the products of a multi-matrix mmvq launch (ggml_cuda_mmvq_multi_*),
+        // which keep the batched mmvq. GGML_CUDA_VERIFY_MMQ_LOG=1 names each product once with the kernel it takes
+        static const int verify_mmq_env = [] {
+            const char * e = getenv("GGML_CUDA_VERIFY_MMQ");
+            return e != nullptr ? atoi(e) : -1;
+        }();
+        const bool verify_mmq = verify_mmq_env > 0 ||
+            (verify_mmq_env < 0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING && cc < GGML_CUDA_CC_AMPERE);
+        const bool take_mmq = verify_mmq && ne11 <= 16 && ne12*ne13 == 1 && ggml_is_quantized(src0->type) && turing_mma_available(cc) &&
+                ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0);
+        ggml_cuda_verify_mmq_log(dst, cc, take_mmq ? "MMQ" : verify_mmq ? "batched mmvq (not an MMQ product)" : "batched mmvq (VERIFY_MMQ off here)");
+        if (take_mmq) {
+            ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+            return;
+        }
         // the vector kernels compute each column like their single column launch (mmvq: with the warps of that launch)
         if (ne11 <= MMVF_MAX_BATCH_SIZE && ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, 1)) {
             ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
@@ -4762,7 +4847,11 @@ static bool ggml_cuda_mmvq_multi_runtime_ok(const ggml_backend_cuda_context * ct
             ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, false) || !ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         return false;
     }
-    return ggml_cuda_mul_mat_vec_q_multi_ok(src0->type, src0->ne[0], ne11, exact, cc);
+    const bool ok = ggml_cuda_mul_mat_vec_q_multi_ok(src0->type, src0->ne[0], ne11, exact, cc);
+    if (ok && exact && ne11 > 1) {
+        ggml_cuda_verify_mmq_log(node, cc, "multi-matrix batched mmvq (not VERIFY_MMQ)");
+    }
+    return ok;
 }
 
 static bool ggml_cuda_mmvq_multi_overlap(const ggml_tensor * a, const ggml_tensor * b) {
@@ -6583,6 +6672,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    ggml_cuda_verify_mmq_summary();
 
     return GGML_STATUS_SUCCESS;
 }

@@ -862,7 +862,8 @@ struct llama_moe_cache::impl {
     int      cm_recal_after = 64;
     int      cm_recal_wait  = -1;
     static constexpr double cm_recal_tol = 0.20;
-    // k15-lfm2 LLAMA_MOE_CPU_MISS_STABLE (opt-in =1; default 0 = k15 until the KLD band ruling, plans/k15_lfm2.md section 13): one decision per launch, not one of two modes drawn from a noisy timing
+    // k15-lfm2 LLAMA_MOE_CPU_MISS_STABLE (default 1; =0 = the k15 rule; plans/k15_lfm2.md sections 13 and 17: on the v2 prompts all 8
+    // stable launches gave the k15 rule's text, KLD 0 between them): one decision per launch, not one of two modes drawn from a noisy timing
     // sample. The fetch share of a small batch sat on the 1/4 - 1/2 level boundary (raw share 0.354, the geometric midpoint) in the
     // cells whose calibrated raw share is 0.33-0.43 (G4: Qwen3.8-Flash-Next UD-IQ4_XS 32 GB host 22.6-34.5 us per expert against an
     // upload of 46 us, Qwen3.6 UD-Q3_K_M 8 GB 14.5-18.6 against 29): launches that drew a fast start-up sample fetched 1/4 and computed
@@ -875,7 +876,7 @@ struct llama_moe_cache::impl {
     // keeps the faster host time and decides again (see cm_calibrate)
     const bool cm_stable = [] {
         const char * e = getenv("LLAMA_MOE_CPU_MISS_STABLE");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
     const double cm_small_half = [this] {
         const char * e = getenv("LLAMA_MOE_CPU_MISS_SMALL_HALF");
@@ -4634,6 +4635,55 @@ struct llama_moe_cache::impl {
     }
     int pin_log_n = 0;
 
+    // k15-lfm2 LLAMA_MOE_CPU_MISS_PER_REQUEST (opt-in): the rule's decisions of a request do not depend on the requests before it. At each
+    // request the per-size decisions and the miss rate go back to those of the first request (the calibrated prior), the miss-rate
+    // window starts over (its first window is the short one, so the request decides from its own small batches), and after the first
+    // timing trial no further one runs (one trial verdict per launch: later trials flip on differences of a few percent, G4 LFM2.5
+    // 12 GB 16k 222 vs 291 tok/s from one 3.10 vs 3.01 ms trial). Without CPU misses (pinned, LLAMA_MOE_CPU_MISS=0) nothing changes
+    bool cm_req_snap = false;
+    std::vector<uint8_t> cm_on_snap;
+    double cm_rate_snap = -1.0;
+    bool   cm_measured_snap = false;
+    int    cm_req_n = 0;
+    // =1 also empties the cache at each request (hybrid_reset, as the fixed-share hybrid path does): which experts the host computes
+    // depends on what is cached, which the earlier requests left (G4 LFM2.5 8 GB 8k: 189 vs 221 tok/s and another text by the order
+    // of the requests alone, with the same rule decisions); the prompt's seed fills it again. =2: the decisions only
+    bool cm_request_begin() {
+        static const int on = [] { const char * e = getenv("LLAMA_MOE_CPU_MISS_PER_REQUEST"); return e != nullptr ? atoi(e) : 0; }();
+        if (on == 0 || !cm || !cm_cal || cm_frozen) {
+            return false;
+        }
+        if (on == 1) {
+            hybrid_reset(true);
+        }
+        if (cm_force) {
+            return on == 1; // LLAMA_MOE_CPU_MISS=2: no decisions to restart
+        }
+        cm_req_n++;
+        if (!cm_req_snap) {
+            cm_on_snap       = cm_on;
+            cm_rate_snap     = cm_rate;
+            cm_measured_snap = cm_measured;
+            cm_req_snap      = true;
+        } else {
+            cm_on       = cm_on_snap;
+            cm_rate     = cm_rate_snap;
+            cm_measured = cm_measured_snap;
+        }
+        cm_have0 = false;
+        cm_nb    = 0;
+        cm_win   = cm_win1;
+        if (cmt_n > 0 && cmt_done < 0) {
+            cmt_wait = -1;
+        }
+        cm_gen++;
+        if (cm_req_n <= 2) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: request %d starts from the launch's decisions%s (LLAMA_MOE_CPU_MISS_PER_REQUEST)\n", tag,
+                cm_req_n, on == 1 ? " and an empty cache" : "");
+        }
+        return on == 1;
+    }
+
     // a batch of more than max_batch tokens (a short prompt) that the host path serves: it is looked up on the device like a small batch
     // short prompts take the host path only once a trial found it faster for the small batches on this host and model (without a
     // trial: the model alone). G4 gpt-oss-20b Q2_K 8 GB and T4 Qwen3.6 UD-Q4_K_XL 8 GB without a draft: trials off, the 95-token chat
@@ -4660,7 +4710,15 @@ struct llama_moe_cache::impl {
         }
         const bool mailbox = single_weigh() && single_usable(1);
         const double trial_frac = trial_frac_env >= 0.0 ? trial_frac_env : (mailbox ? std::max(0.20, trial_frac_single) : 0.20);
-        const bool skip = cm_trial && !cm_force && cache_frac >= 0.0 && cache_frac < trial_frac;
+        // k15-lfm2: with LLAMA_MOE_CPU_MISS_PER_REQUEST no timing trials (the cost model only), so no verdict depends on which request
+        // ran the first trial (G4 LFM2.5 12 GB: chat / 8k / 16k other texts by request order); LLAMA_MOE_CPU_MISS_PER_REQUEST_TRIALS=1
+        // keeps the first trial
+        static const bool per_req_no_trials = [] {
+            const char * e  = getenv("LLAMA_MOE_CPU_MISS_PER_REQUEST");
+            const char * et = getenv("LLAMA_MOE_CPU_MISS_PER_REQUEST_TRIALS");
+            return e != nullptr && atoi(e) != 0 && !(et != nullptr && atoi(et) != 0);
+        }();
+        const bool skip = cm_trial && !cm_force && ((cache_frac >= 0.0 && cache_frac < trial_frac) || per_req_no_trials);
         if (late) {
             cm_trials_late_done = true;
         }
@@ -4673,9 +4731,10 @@ struct llama_moe_cache::impl {
             cm_small_ok   = true;
             cm_small_live = true;
             cm_gen++;
-            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no timing trials at %.1f%% of the host experts cached (below %.0f%%%s%s): small "
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no timing trials at %.1f%% of the host experts cached (%s%.0f%%%s%s): small "
                 "batches follow the cost model, short prompts stay on the plain cache (LLAMA_MOE_CPU_MISS_TRIAL_FRAC=0 restores the trials)\n",
-                tag, 100.0*cache_frac, 100.0*trial_frac, mailbox ? ", single-graph mailbox" : "", late ? ", from now on" : "");
+                tag, 100.0*cache_frac, per_req_no_trials ? "LLAMA_MOE_CPU_MISS_PER_REQUEST; trial share " : "below ", 100.0*trial_frac,
+                mailbox ? ", single-graph mailbox" : "", late ? ", from now on" : "");
         }
         return skip;
     }
@@ -4827,8 +4886,8 @@ struct llama_moe_cache::impl {
     // the rounding residual of the share, which all carry over from earlier batches; the context calls this before a batch whose
     // sequences are all empty (a new request) and after a state is read, so the output does not depend on earlier requests:
     // the cache starts empty as in a new process (the plain path computes the same with any cache contents, it is not reset)
-    void hybrid_reset() {
-        if (!hybrid || !hybrid_fixed) {
+    void hybrid_reset(bool force = false) {
+        if (!force && (!hybrid || !hybrid_fixed)) {
             return;
         }
         seed_counts.clear();
@@ -8222,6 +8281,10 @@ bool llama_moe_cache::pin_small() {
 
 bool llama_moe_cache::pin_small_set(bool on) {
     return pimpl->cm_pin_set(on);
+}
+
+bool llama_moe_cache::request_begin() {
+    return pimpl->cm_request_begin();
 }
 
 bool llama_moe_cache::cpu_miss_drop_slow() {
