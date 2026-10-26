@@ -8487,7 +8487,7 @@ struct test_hc_mix : public test_case {
     }
 
     double max_nmse_err() override {
-        return 5e-4;
+        return type == GGML_TYPE_Q8_0 ? 5e-4 : 2e-2; // two chained 4-bit products (not fused, the type check) against the CPU
     }
 };
 
