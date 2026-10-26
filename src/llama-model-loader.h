@@ -115,6 +115,14 @@ struct llama_model_loader {
         std::set<std::string>                  tensors;
     } lazy;
 
+    // k16-draft (idea from ikawrakow/ik_llama.cpp PR #2403): an MTP draft model (hparams.n_layer_nextn > 0) loaded with mtp_borrow_io
+    // takes token_embd / output from model_shared, the target it drafts for, instead of its own copies (see borrow_io)
+    const struct llama_model * model_shared = nullptr;
+    bool   mtp_borrow_io        = false;
+    bool   output_borrowed      = false;   // output is the target's tensor (load_tensors_draft_head copies its rows from it)
+    ggml_backend_buffer_type_t output_dry_buft = nullptr; // no_alloc: the device buffer type output would have taken (the draft head's)
+    size_t borrowed_bytes       = 0;
+
     llama_files files;
     std::vector<std::string> file_paths; // path of each file, empty if opened from a FILE pointer
     llama_ftype ftype;
@@ -256,6 +264,9 @@ struct llama_model_loader {
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    // k16-draft: token_embd / output of an MTP draft model taken from model_shared (null: load the own copy). LLAMA_MTP_BORROW_IO=0 off
+    struct ggml_tensor * borrow_io(const llama_hparams & hparams, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
     void done_getting_tensors(bool partial = false) const;
 

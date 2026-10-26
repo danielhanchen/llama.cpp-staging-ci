@@ -1130,6 +1130,65 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     return true;
 }
 
+// declared in llama-model.h, which this file does not include
+const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model);
+
+static bool llama_mtp_borrow_io_env() {
+    const char * e = getenv("LLAMA_MTP_BORROW_IO");
+    return e == nullptr || atoi(e) != 0;
+}
+
+// k16-draft (idea from ikawrakow/ik_llama.cpp PR #2403, shared MTP companions without their own IO): a separate MTP draft model
+// (Qwen3.8-Flash-Next mtp-*.gguf) ships its own token_embd and output, the same weights the target already holds. With mtp_borrow_io
+// and the target as model_shared the draft uses the target's tensors instead: its own copies are neither allocated nor read (the
+// lm head was 644 MiB of device memory at Q8_0, the embeddings 644 MiB of mapped host memory). Only a draft verifies nothing: the
+// target's verify decides every emitted token, so the text is unchanged; the draft proposals may differ where the two files store
+// the head in different types. Shapes must agree exactly, otherwise the draft keeps its own copy. LLAMA_MTP_BORROW_IO=0: own copies
+struct ggml_tensor * llama_model_loader::borrow_io(const llama_hparams & hparams, const LLM_TN_IMPL & tn,
+        const std::initializer_list<int64_t> & ne, int flags) {
+    if (!mtp_borrow_io || model_shared == nullptr || hparams.n_layer_nextn == 0 || (flags & TENSOR_DUPLICATED) ||
+            (tn.tensor != LLM_TENSOR_TOKEN_EMBD && tn.tensor != LLM_TENSOR_OUTPUT) || !llama_mtp_borrow_io_env()) {
+        return nullptr;
+    }
+    const std::string name = tn.str();
+    const llama_tensor_weight * w = get_weight(name.c_str());
+    if (w == nullptr) {
+        return nullptr;
+    }
+    ggml_tensor * src = nullptr;
+    for (const auto & [n, t] : llama_internal_get_tensor_map(model_shared)) {
+        if (n == name) {
+            src = t;
+            break;
+        }
+    }
+    bool same = src != nullptr && src->buffer != nullptr && ggml_n_dims(src) <= 2;
+    size_t dim = 0;
+    for (const int64_t n : ne) {
+        same = same && dim < GGML_MAX_DIMS && src->ne[dim] == n && w->tensor->ne[dim] == n;
+        dim++;
+    }
+    for (; same && dim < GGML_MAX_DIMS; dim++) {
+        same = src->ne[dim] == 1;
+    }
+    if (!same) {
+        LLAMA_LOG_WARN("%s: %s: the target has no tensor of the same shape, the draft keeps its own copy\n", __func__, name.c_str());
+        return nullptr;
+    }
+    // the file's tensor is accounted as used and never read (as an unused tensor)
+    const size_t nbytes = ggml_nbytes(w->tensor);
+    size_data      -= nbytes;
+    borrowed_bytes += nbytes;
+    n_created++;
+    if (tn.tensor == LLM_TENSOR_OUTPUT) {
+        output_borrowed = true;
+    }
+    LLAMA_LOG_INFO("%s: %s taken from the target model (%s on %s; the draft's own %s copy, %.2f MiB, is not loaded; "
+            "LLAMA_MTP_BORROW_IO=0 loads it)\n", __func__, name.c_str(), ggml_type_name(src->type),
+            ggml_backend_buffer_name(src->buffer), ggml_type_name(w->tensor->type), nbytes/1048576.0);
+    return src;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1358,6 +1417,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return ret;
     }
 
+    if (ggml_tensor * shared = borrow_io(hparams, tn, ne, flags)) {
+        return shared;
+    }
+
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
     const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED), flags & TENSOR_ALLOW_RESHAPE);
     if (cur == NULL) {
@@ -1388,6 +1451,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
     if (buft == nullptr) {
         return nullptr;
+    }
+    // k16-draft: the memory measurement of an MTP draft model that will borrow its lm head (no_alloc, the target not loaded yet:
+    // common_fit_draft_on_cpu, the main fit's extra model, common_draft_mem_reserve) counts it on the host; the draft head made from it
+    // keeps the device buffer type (load_tensors_draft_head)
+    if (no_alloc && mtp_borrow_io && model_shared == nullptr && hparams.n_layer_nextn > 0 && tn.tensor == LLM_TENSOR_OUTPUT &&
+            !(flags & TENSOR_DUPLICATED) && llama_mtp_borrow_io_env() && !ggml_backend_buft_is_host(buft)) {
+        output_dry_buft = buft;
+        buft = ggml_backend_cpu_buffer_type();
     }
 
     ggml_context * ctx = ctx_for_buft(buft);
