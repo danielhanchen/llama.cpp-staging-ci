@@ -5547,6 +5547,53 @@ static int ggml_cuda_try_fuse_mmvf_multi(ggml_backend_cuda_context * cuda_ctx, g
     return run;
 }
 
+// k15-fn (GGML_CUDA_DISABLE_SET_ROWS_PAIR=1 off): a SET_ROWS whose next compute node is another SET_ROWS of the same types (the K and
+// V cache stores of an attention layer, the two index-cache stores of a QSA layer) runs with it in one launch. Neither reads or writes
+// the tensor the other writes (different view roots), so the order between them does not matter. Returns the extra nodes covered.
+static const ggml_tensor * ggml_cuda_view_root(const ggml_tensor * t) {
+    while (t != nullptr && t->view_src != nullptr) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+static int ggml_cuda_try_fuse_set_rows_pair(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_SET_ROWS_PAIR") || getenv("GGML_CUDA_SET_ROWS_CHECK") != nullptr;
+    const ggml_tensor * a = cgraph->nodes[i];
+    if (disabled || a->op != GGML_OP_SET_ROWS) {
+        return 0;
+    }
+    int j = i + 1;
+    while (j < cgraph->n_nodes && j <= i + 4 && (ggml_cuda_is_view_or_noop(cgraph->nodes[j]) || (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)) {
+        j++;
+    }
+    if (j >= cgraph->n_nodes || j > i + 4) {
+        return 0;
+    }
+    const ggml_tensor * b = cgraph->nodes[j];
+    if (b->op != GGML_OP_SET_ROWS || (b->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !ggml_cuda_set_rows_pair_supported(a, b)) {
+        return 0;
+    }
+    if (!cuda_ctx->qsa_skip.empty() && (cuda_ctx->qsa_skip.count(a) || cuda_ctx->qsa_skip.count(b))) {
+        return 0;
+    }
+    const ggml_tensor * ra = ggml_cuda_view_root(a);
+    const ggml_tensor * rb = ggml_cuda_view_root(b);
+    if (ra == rb || ggml_cuda_view_root(b->src[0]) == ra || ggml_cuda_view_root(b->src[1]) == ra ||
+            ggml_cuda_view_root(a->src[0]) == rb || ggml_cuda_view_root(a->src[1]) == rb) {
+        return 0;
+    }
+    // the skipped views between them are not read by b as a's output (checked above through the roots)
+    if (!ggml_cuda_set_rows_pair(*cuda_ctx, a, b)) {
+        return 0;
+    }
+    static int64_t n_pairs = 0;
+    if (n_pairs++ == 0) {
+        GGML_LOG_INFO("%s: SET_ROWS pairs in one launch (%s + %s; GGML_CUDA_DISABLE_SET_ROWS_PAIR=1 off)\n", __func__, a->name, b->name);
+    }
+    return j - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -6412,6 +6459,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (const int n_skip = ggml_cuda_try_fuse_ew_chain(cuda_ctx, cgraph, i); n_skip > 0) {
+        return n_skip;
+    }
+
+    if (const int n_skip = ggml_cuda_try_fuse_set_rows_pair(cuda_ctx, cgraph, i); n_skip > 0) {
         return n_skip;
     }
 
