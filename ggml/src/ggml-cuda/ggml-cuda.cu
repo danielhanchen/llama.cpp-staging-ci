@@ -2049,6 +2049,28 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
     return true;
 }
 
+// k15-lfm2 GGML_CUDA_VERIFY_MMQ_LOG=1: the kernel of each flagged verify product, once per weight name
+static void ggml_cuda_verify_mmq_log(const ggml_tensor * dst, int cc, const char * what) {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_VERIFY_MMQ_LOG");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (!on) {
+        return;
+    }
+    static std::mutex mtx;
+    static std::map<std::string, std::string> seen;
+    const ggml_tensor * src0 = dst->src[0];
+    std::lock_guard<std::mutex> lock(mtx);
+    std::string & prev = seen[src0->name];
+    if (prev == what || seen.size() > 512) {
+        return;
+    }
+    prev = what;
+    GGML_LOG_INFO("ggml_cuda: verify product %s (%s %lld x %lld, %lld columns, cc %d): %s\n", src0->name, ggml_type_name(src0->type),
+        (long long) src0->ne[0], (long long) src0->ne[1], (long long) dst->src[1]->ne[1], cc, what);
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -2088,16 +2110,22 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     // batch invariant (speculative verify batches): every column gets the bytes a single column (ne11 == 1) would get
     if ((dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) && ne11 > 1) {
-        // k15-lfm2, GGML_CUDA_VERIFY_MMQ=1 (opt-in): a quantized dense verify product of up to 16 columns runs MMQ (int8 tensor cores,
-        // Turing+) instead of the batched mmvq: the same q8_1 activations into the same int8 products with f32 accumulation, only the
-        // order of the f32 scale products and sums differs (plans/k11.md equivalence rule). T4 at 8 rows the dp4a mmvq is compute-bound
-        // (2x one row, plans/k15_lfm2.md section 11b)
-        static const bool verify_mmq = [] {
+        // k15-lfm2, GGML_CUDA_VERIFY_MMQ: a quantized dense verify product of up to 16 columns runs MMQ (int8 tensor cores) instead
+        // of the batched mmvq: the same q8_1 activations into the same int8 products with f32 accumulation, only the order of the f32
+        // scale products and sums differs (plans/k11.md equivalence rule). T4 at 8 rows the dp4a mmvq is compute-bound (2x one row,
+        // plans/k15_lfm2.md section 15). Default on Turing (cc 7.5) only, where it was timed and passed the KLD gate; =1 on any device with
+        // the Turing MMA (Ampere and newer too), =0 off. Not here: the products of a multi-matrix mmvq launch (ggml_cuda_mmvq_multi_*),
+        // which keep the batched mmvq. GGML_CUDA_VERIFY_MMQ_LOG=1 names each product once with the kernel it takes
+        static const int verify_mmq_env = [] {
             const char * e = getenv("GGML_CUDA_VERIFY_MMQ");
-            return e != nullptr && atoi(e) != 0;
+            return e != nullptr ? atoi(e) : -1;
         }();
-        if (verify_mmq && ne11 <= 16 && ne12*ne13 == 1 && ggml_is_quantized(src0->type) && turing_mma_available(cc) &&
-                ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+        const bool verify_mmq = verify_mmq_env > 0 ||
+            (verify_mmq_env < 0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING && cc < GGML_CUDA_CC_AMPERE);
+        const bool take_mmq = verify_mmq && ne11 <= 16 && ne12*ne13 == 1 && ggml_is_quantized(src0->type) && turing_mma_available(cc) &&
+                ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0);
+        ggml_cuda_verify_mmq_log(dst, cc, take_mmq ? "MMQ" : verify_mmq ? "batched mmvq (not an MMQ product)" : "batched mmvq (VERIFY_MMQ off here)");
+        if (take_mmq) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
             return;
         }
@@ -4746,7 +4774,11 @@ static bool ggml_cuda_mmvq_multi_runtime_ok(const ggml_backend_cuda_context * ct
             ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, false) || !ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         return false;
     }
-    return ggml_cuda_mul_mat_vec_q_multi_ok(src0->type, src0->ne[0], ne11, exact, cc);
+    const bool ok = ggml_cuda_mul_mat_vec_q_multi_ok(src0->type, src0->ne[0], ne11, exact, cc);
+    if (ok && exact && ne11 > 1) {
+        ggml_cuda_verify_mmq_log(node, cc, "multi-matrix batched mmvq (not VERIFY_MMQ)");
+    }
+    return ok;
 }
 
 static bool ggml_cuda_mmvq_multi_overlap(const ggml_tensor * a, const ggml_tensor * b) {
