@@ -2049,26 +2049,70 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
     return true;
 }
 
-// k15-lfm2 GGML_CUDA_VERIFY_MMQ_LOG=1: the kernel of each flagged verify product, once per weight name
+// k15-lfm2: the kernels of the flagged verify products. One INFO line per load (the first graph with verify products, see
+// ggml_cuda_verify_mmq_summary) counts them by kernel, so the engagement of GGML_CUDA_VERIFY_MMQ shows in any server log;
+// GGML_CUDA_VERIFY_MMQ_LOG=1 also names each product once per kernel and width
+struct ggml_cuda_verify_mmq_state {
+    std::mutex                         mtx;
+    std::map<std::string, std::string> last;  // weight name -> kernel, in the first verify graph
+    std::map<std::string, std::string> seen;  // name + width -> kernel (GGML_CUDA_VERIFY_MMQ_LOG)
+    int                                cc      = 0;
+    int64_t                            cols    = 0;
+    std::atomic<bool>                  printed { false };
+};
+static ggml_cuda_verify_mmq_state & ggml_cuda_verify_mmq_st() {
+    static ggml_cuda_verify_mmq_state st;
+    return st;
+}
+
 static void ggml_cuda_verify_mmq_log(const ggml_tensor * dst, int cc, const char * what) {
     static const bool on = [] {
         const char * e = getenv("GGML_CUDA_VERIFY_MMQ_LOG");
         return e != nullptr && atoi(e) != 0;
     }();
-    if (!on) {
+    auto & st = ggml_cuda_verify_mmq_st();
+    const ggml_tensor * src0 = dst->src[0];
+    std::lock_guard<std::mutex> lock(st.mtx);
+    if (!st.printed) {
+        st.last[src0->name] = what;
+        st.cc   = cc;
+        st.cols = std::max<int64_t>(st.cols, dst->src[1]->ne[1]);
+    }
+    if (!on || st.seen.size() > 1024) {
         return;
     }
-    static std::mutex mtx;
-    static std::map<std::string, std::string> seen;
-    const ggml_tensor * src0 = dst->src[0];
-    std::lock_guard<std::mutex> lock(mtx);
-    std::string & prev = seen[src0->name];
-    if (prev == what || seen.size() > 512) {
+    std::string & prev = st.seen[std::string(src0->name) + "/" + std::to_string(dst->src[1]->ne[1])];
+    if (prev == what) {
         return;
     }
     prev = what;
     GGML_LOG_INFO("ggml_cuda: verify product %s (%s %lld x %lld, %lld columns, cc %d): %s\n", src0->name, ggml_type_name(src0->type),
         (long long) src0->ne[0], (long long) src0->ne[1], (long long) dst->src[1]->ne[1], cc, what);
+}
+
+// after a graph: the one line per load, once a graph had verify products
+static void ggml_cuda_verify_mmq_summary() {
+    auto & st = ggml_cuda_verify_mmq_st();
+    if (st.printed.load(std::memory_order_relaxed)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(st.mtx);
+    if (st.printed || st.last.empty()) {
+        return;
+    }
+    st.printed = true;
+    std::map<std::string, int> n;
+    for (const auto & [name, what] : st.last) {
+        n[what]++;
+    }
+    std::string list;
+    for (const auto & [what, k] : n) {
+        list += (list.empty() ? "" : ", ") + std::to_string(k) + " " + what;
+    }
+    const char * e = getenv("GGML_CUDA_VERIFY_MMQ");
+    GGML_LOG_INFO("ggml_cuda: verify products of the first verify graph (cc %d, up to %lld columns, GGML_CUDA_VERIFY_MMQ=%s): %s "
+        "(=0 off, GGML_CUDA_VERIFY_MMQ_LOG=1 names them)\n", st.cc, (long long) st.cols, e != nullptr ? e : "default", list.c_str());
+    st.last.clear();
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -6324,6 +6368,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    ggml_cuda_verify_mmq_summary();
 
     return GGML_STATUS_SUCCESS;
 }
