@@ -25,6 +25,7 @@
 struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
+class llama_memory_recurrent;
 
 class llama_io_read_i;
 class llama_io_write_i;
