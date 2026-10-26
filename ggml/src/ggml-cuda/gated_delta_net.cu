@@ -6,6 +6,15 @@
 
 constexpr int gdn_cols_per_warp = 4;
 
+// k15-fn: the gates the gated_delta_net applies itself (ggml_cuda_try_gdn_gates), the formulas of unary.cu's op_sigmoid / op_softplus and
+// of add_unary_mul_f32_kernel, so the values are those the skipped kernels wrote
+static __device__ __forceinline__ float gdn_gate_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+static __device__ __forceinline__ float gdn_gate_softplus(float x) {
+    return (x > 20.0f) ? x : logf(1.0f + expf(x));
+}
+
 template <int S_v, bool KDA, bool keep_rs_t, int cols_per_warp = gdn_cols_per_warp>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
@@ -34,7 +43,11 @@ gated_delta_net_cuda(const float * q,
                                      int64_t       state_slot_stride,
                                      int           K,
                                      const int32_t * s_ids,
-                                     int64_t       s_row_stride) {
+                                     int64_t       s_row_stride,
+                                     const float * beta_raw,
+                                     const float * ga,
+                                     const float * ga_bias,
+                                     const float * ga_scale) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
 
@@ -89,7 +102,7 @@ gated_delta_net_cuda(const float * q,
         const float * beta_t = beta + gb_offset;
         const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
 
-        const float beta_val = *beta_t;
+        const float beta_val = beta_raw != nullptr ? gdn_gate_sigmoid(beta_raw[gb_offset]) : *beta_t;
 
         // Cache k and q in registers
         float k_reg[rows_per_lane];
@@ -102,7 +115,7 @@ gated_delta_net_cuda(const float * q,
         }
 
         if constexpr (!KDA) {
-            const float g_val = expf(*g_t);
+            const float g_val = expf(ga != nullptr ? gdn_gate_softplus(ga[gb_offset] + ga_bias[h_idx]) * ga_scale[h_idx] : *g_t);
 
             // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
             float kv_shard = 0.0f;
@@ -196,7 +209,8 @@ static void launch_gated_delta_net(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, int64_t state_slot_stride, int K, const int32_t * s_ids, int64_t s_row_stride, cudaStream_t stream) {
+        float scale, int64_t state_slot_stride, int K, const int32_t * s_ids, int64_t s_row_stride,
+        const float * beta_raw, const float * ga, const float * ga_bias, const float * ga_scale, cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     // four columns per warp (see the kernel); shrink the CTA when the wider CTA would leave
@@ -220,26 +234,26 @@ static void launch_gated_delta_net(
             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, beta_raw, ga, ga_bias, ga_scale);
             break;
         case 32:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, beta_raw, ga, ga_bias, ga_scale);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, beta_raw, ga, ga_bias, ga_scale);
             break;
         }
         case 128: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, beta_raw, ga, ga_bias, ga_scale);
             break;
         }
         default:
@@ -382,7 +396,19 @@ static void ggml_cuda_op_gated_delta_net_impl(
         }
     }
 
-    if (s_ids == nullptr) {
+    const float * beta_raw = nullptr, * ga = nullptr, * ga_bias = nullptr, * ga_scale = nullptr;
+    {
+        auto it = ctx.gdn_gates_in.find(dst);
+        if (it != ctx.gdn_gates_in.end()) {
+            beta_raw = it->second.beta_raw;
+            ga       = it->second.a;
+            ga_bias  = it->second.bias;
+            ga_scale = it->second.scale;
+            ctx.gdn_gates_in.erase(it);
+        }
+    }
+
+    if (s_ids == nullptr && beta_raw == nullptr && ga == nullptr) {
         ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
         args.state_out = state_d;
         if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {
@@ -393,21 +419,21 @@ static void ggml_cuda_op_gated_delta_net_impl(
         if (keep_rs) {
             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_ids, s_row_stride, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_ids, s_row_stride, beta_raw, ga, ga_bias, ga_scale, stream);
         } else {
             launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_ids, s_row_stride, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_ids, s_row_stride, beta_raw, ga, ga_bias, ga_scale, stream);
         }
     } else {
         if (keep_rs) {
             launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_ids, s_row_stride, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_ids, s_row_stride, beta_raw, ga, ga_bias, ga_scale, stream);
         } else {
             launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_ids, s_row_stride, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_ids, s_row_stride, beta_raw, ga, ga_bias, ga_scale, stream);
         }
     }
 }

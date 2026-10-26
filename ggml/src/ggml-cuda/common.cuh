@@ -1688,6 +1688,10 @@ struct ggml_backend_cuda_context {
     // gather that copied the row was skipped, see ggml_cuda_try_gdn_state_in_place): node -> cache rows base, row stride (floats), row ids
     struct gdn_state_src { const float * base; int64_t row_stride; const int32_t * ids; };
     std::unordered_map<const ggml_tensor *, gdn_state_src> gdn_state_in_place;
+    // k15-fn: gated_delta_net nodes that apply their own gates (ggml_cuda_try_gdn_gates): beta = sigmoid(beta_raw), and the scalar decay
+    // g = softplus(a + bias[h]) * scale[h]; the skipped nodes' inputs stay unwritten until the gated_delta_net reads them
+    struct gdn_gates { const float * beta_raw; const float * a; const float * bias; const float * scale; };
+    std::unordered_map<const ggml_tensor *, gdn_gates> gdn_gates_in;
     // k15-mm2: QSA maskless (ggml_cuda_qsa_maskless_plan): flash attention node -> its selection, and the dense mask nodes not run
     std::unordered_map<const ggml_tensor *, ggml_cuda_qsa_maskless> qsa_maskless;
     std::unordered_set<const ggml_tensor *> qsa_skip;

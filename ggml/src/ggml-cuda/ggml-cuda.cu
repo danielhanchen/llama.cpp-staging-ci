@@ -5297,6 +5297,130 @@ static bool ggml_cuda_try_gdn_state_in_place(ggml_backend_cuda_context * cuda_ct
     return true;
 }
 
+// k15-fn: the gated_delta_net (non-KDA, one sequence, not the mma kernel) that is the only reader of t (through views of t; its src[k] a
+// contiguous whole view of t), or -1
+static int ggml_cuda_sole_gdn_reader(const ggml_cgraph * cgraph, int i, const ggml_tensor * t, int k_expected) {
+    int gdn = -1;
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * s = n->src[k];
+            if (s == nullptr || (s != t && s->view_src != t)) {
+                continue;
+            }
+            if (ggml_cuda_is_view_or_noop(n) && n->view_src == t) {
+                continue;
+            }
+            if (n->op == GGML_OP_GATED_DELTA_NET && k == k_expected && gdn < 0 && s->view_offs == 0 && ggml_nelements(s) == ggml_nelements(t) &&
+                ggml_is_contiguous(s) && n->src[3]->ne[0] == 1 && n->src[2]->ne[3] == 1 && !ggml_cuda_gated_delta_net_may_use_mma(n)) {
+                gdn = j;
+                continue;
+            }
+            return -1;
+        }
+    }
+    return gdn;
+}
+
+static bool ggml_cuda_gdn_sigmoid_deferred(const ggml_cgraph * cgraph, int i);
+
+// k15-fn: no node between i and j writes over the bytes of t (the allocator may reuse them once their last planned reader ran); a beta
+// sigmoid that its gated_delta_net applies itself (ggml_cuda_gdn_sigmoid_deferred) writes nothing
+static bool ggml_cuda_kept_until(const ggml_cgraph * cgraph, int i, int j, const ggml_tensor * t, bool skip_deferred = false) {
+    for (int m = i + 1; m < j; ++m) {
+        const ggml_tensor * n = cgraph->nodes[m];
+        if (ggml_cuda_is_view_or_noop(n) || n->data == nullptr) {
+            continue;
+        }
+        if (skip_deferred && ggml_cuda_gdn_sigmoid_deferred(cgraph, m)) {
+            continue;
+        }
+        if (ggml_cuda_tensors_overlap(n, t)) {
+            static const bool dbg = getenv("GGML_CUDA_GDN_GATES_DEBUG") != nullptr;
+            if (dbg) {
+                GGML_LOG_INFO("%s: %s overwritten by node %d %s (%s)\n", __func__, t->name, m - i, n->name, ggml_op_desc(n));
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+// k15-fn: the beta sigmoid at node i is applied by the gated_delta_net that reads it (ggml_cuda_try_gdn_gates), so it is not run
+static bool ggml_cuda_gdn_sigmoid_deferred(const ggml_cgraph * cgraph, int i) {
+    static const bool enabled = getenv("GGML_CUDA_GDN_GATES") == nullptr || atoi(getenv("GGML_CUDA_GDN_GATES")) != 0;
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (!enabled || ggml_cuda_fusion_disabled() || node->op != GGML_OP_UNARY || ggml_get_unary_op(node) != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+    const ggml_tensor * raw = node->src[0];
+    if (node->type != GGML_TYPE_F32 || raw->type != GGML_TYPE_F32 || !ggml_is_contiguous(node) || !ggml_is_contiguous(raw) ||
+        (node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const int j = ggml_cuda_sole_gdn_reader(cgraph, i, node, 4);
+    return j >= 0 && ggml_cuda_kept_until(cgraph, i, j, raw);
+}
+
+// k15-fn (GGML_CUDA_GDN_GATES=0 off): the delta-net gates beta = sigmoid(b) and g = softplus(a + dt_bias) * A, each read only by a
+// gated_delta_net, are applied by that kernel to its raw inputs: two launches fewer per layer (Qwen3.8-Flash-Next: 72 per verify), the
+// same float operations, so bitwise. Returns the nodes covered (1 for the sigmoid, 3 for ADD -> SOFTPLUS -> MUL), 0 if not applicable
+static int ggml_cuda_try_gdn_gates(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool enabled = getenv("GGML_CUDA_GDN_GATES") == nullptr || atoi(getenv("GGML_CUDA_GDN_GATES")) != 0;
+    if (!enabled || ggml_cuda_fusion_disabled()) {
+        return 0;
+    }
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID) {
+        if (!ggml_cuda_gdn_sigmoid_deferred(cgraph, i)) {
+            return 0;
+        }
+        const int j = ggml_cuda_sole_gdn_reader(cgraph, i, node, 4);
+        cuda_ctx->gdn_gates_in[cgraph->nodes[j]].beta_raw = (const float *) node->src[0]->data;
+        return 1;
+    }
+    if (node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes) {
+        const ggml_tensor * add   = node;
+        const ggml_tensor * unary = cgraph->nodes[i + 1];
+        const ggml_tensor * mul   = cgraph->nodes[i + 2];
+        if (unary->op != GGML_OP_UNARY || ggml_get_unary_op(unary) != GGML_UNARY_OP_SOFTPLUS || unary->src[0] != add || mul->op != GGML_OP_MUL ||
+            (mul->src[0] == unary) == (mul->src[1] == unary)) {
+            return 0;
+        }
+        const ggml_op ops[3] = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL };
+        if (!ggml_can_fuse(cgraph, i, ops, 3) || (mul->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+        const ggml_tensor * a     = ggml_are_same_shape(add->src[0], add) ? add->src[0] : add->src[1];
+        const ggml_tensor * bias  = a == add->src[0] ? add->src[1] : add->src[0];
+        const ggml_tensor * scale = mul->src[0] == unary ? mul->src[1] : mul->src[0];
+        if (a->type != GGML_TYPE_F32 || bias->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(a, add) || !ggml_are_same_shape(a, mul) || !ggml_is_contiguous(a) || !ggml_is_contiguous(mul) ||
+            bias->ne[0] != a->ne[0] || scale->ne[0] != a->ne[0] || ggml_nrows(bias) != 1 || ggml_nrows(scale) != 1 ||
+            !ggml_is_contiguous(bias) || !ggml_is_contiguous(scale)) {
+            return 0;
+        }
+        const int j = ggml_cuda_sole_gdn_reader(cgraph, i + 2, mul, 3);
+        static const bool dbg = getenv("GGML_CUDA_GDN_GATES_DEBUG") != nullptr;
+        if (dbg) {
+            GGML_LOG_INFO("%s: %s: reader %d, heads %lld / %lld, a kept %d\n", __func__, mul->name, j, j >= 0 ? (long long) cgraph->nodes[j]->src[2]->ne[1] : -1LL,
+                (long long) a->ne[0], j >= 0 ? (int) ggml_cuda_kept_until(cgraph, i + 2, j, a, true) : -1);
+        }
+        // the gate row index of the kernel is its head: a's rows are the heads ([H, T, S], as the kernel's g [1, H, T, S])
+        // the chain's own nodes are not run, so an in-place ADD / SOFTPLUS / MUL over a does not count
+        if (j < 0 || cgraph->nodes[j]->src[2]->ne[1] != a->ne[0] || !ggml_cuda_kept_until(cgraph, i + 2, j, a, true) ||
+            !ggml_cuda_kept_until(cgraph, i + 2, j, bias, true) || !ggml_cuda_kept_until(cgraph, i + 2, j, scale, true)) {
+            return 0;
+        }
+        auto & e = cuda_ctx->gdn_gates_in[cgraph->nodes[j]];
+        e.a     = (const float *) a->data;
+        e.bias  = (const float *) bias->data;
+        e.scale = (const float *) scale->data;
+        return 3;
+    }
+    return 0;
+}
+
 static bool ggml_cuda_side_mv_run(const ggml_tensor * node);
 
 // k15-mm2: the same for the F32 / BF16 vector kernel (ggml_cuda_mul_mat_vec_f_multi): products of one weight type and K over one
@@ -6605,6 +6729,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             cuda_ctx->mmvq_done_early.clear();
             cuda_ctx->gdn_state_in_place.clear();
+            cuda_ctx->gdn_gates_in.clear();
             ggml_cuda_qsa_maskless_plan(cuda_ctx, cgraph);
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -6693,6 +6818,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     // the gated_delta_net that reads this row reads it from the cache instead
                     ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 1);
                     continue;
+                }
+
+                if (node->op == GGML_OP_UNARY || node->op == GGML_OP_ADD) {
+                    const int n_gate = ggml_cuda_try_gdn_gates(cuda_ctx, cgraph, i);
+                    if (n_gate > 0) {
+                        // the gated_delta_net that reads this gate computes it itself
+                        ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, n_gate);
+                        i += n_gate - 1;
+                        continue;
+                    }
                 }
 
                 // the share flag is set only for the unfused node: a fused group may hold pool memory around its products
@@ -6787,6 +6922,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->q8_1_cache.end();
             cuda_ctx->mmvq_done_early.clear();
             cuda_ctx->gdn_state_in_place.clear();
+            cuda_ctx->gdn_gates_in.clear();
         }
 
         // an overlapped MoE cache fetch whose join is not in this graph (another split): the side stream joins the main stream
