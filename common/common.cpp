@@ -1439,9 +1439,11 @@ static int64_t common_lm_batch_default(const common_params & params) {
     if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH")) {
         return atoll(e);
     }
-    // opt-in (LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO=1) until the 16384 group costs no peak host RSS: G4 k15g4y1 Flash-Next 16 GB VmHWM
-    // +170 (fn4) / +188 (fn1) MiB, transient during the group (VmHWM - VmRSS at the end 125-167 vs 0-13 MiB)
-    static const bool auto_env = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO")) != 0;
+    // (was opt-in: G4 k15g4y1 Flash-Next 16 GB VmHWM +170 (fn4) / +188 (fn1) MiB, transient during the group, mostly its host KQ masks)
+    // k15-pp: on by default again (LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO=0: 8192) now that the 16384 group's own host memory is gone:
+    // device-built KQ masks (no host mask per member), no CUDA graph records for the merged graph, next-n rows on the device beside
+    // MTP heads. G4 fn4 16 GB (k15g4n1): VmHWM 75300 vs 75347 MiB for the 8192 default with host masks, 16k TTFT 3.24 vs 4.07 s
+    static const bool auto_env = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO")) != 0;
     if (!auto_env) {
         return 8192;
     }
