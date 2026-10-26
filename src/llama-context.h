@@ -750,6 +750,10 @@ private:
     // (declared after the backends and the scheduler: freed before them)
     std::unique_ptr<llama_weight_store> wstore;
 
+    // k16-disk: host expert ranges registered with the disk prefetch engine (ggml-moe-prefetch.h), see disk_prefetch_init
+    std::vector<const void *> disk_ranges;
+    void disk_prefetch_init();
+
     // training
     ggml_opt_context_t opt_ctx = nullptr;
 
