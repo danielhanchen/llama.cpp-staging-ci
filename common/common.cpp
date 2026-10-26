@@ -4439,7 +4439,11 @@ bool common_state_buf_take(common_state_buf & buf, size_t n) {
             best = it;
         }
     }
-    if (best == g_ckpt_pool.end()) {
+    // a buffer more than twice the request is left in the pool: a small checkpoint that took a state buffer kept all of it resident for as
+    // long as the checkpoint lived (its capacity is not in the prompt cache's size), e.g. 2.8 MiB of checkpoints held 149 MiB on LFM2.5
+    // (LLAMA_STATE_POOL_FIT=0: any buffer that fits)
+    static const bool fit = getenv("LLAMA_STATE_POOL_FIT") == nullptr || atoi(getenv("LLAMA_STATE_POOL_FIT")) != 0;
+    if (best == g_ckpt_pool.end() || (fit && best->capacity() / 2 > n)) {
         return false;
     }
     buf = std::move(*best);
