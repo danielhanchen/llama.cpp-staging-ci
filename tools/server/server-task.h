@@ -700,6 +700,10 @@ struct server_prompt_cache {
     // remove the oldest state, handing it to the SSD tier if there is one
     void evict_front();
 
+    // k15-ttft (LLAMA_PCS_IDLE_SAVE): remove the newest entry holding exactly these tokens (a save made at idle that the next request did
+    // not need: the slot was kept by prompt similarity); true if one was removed
+    bool drop_newest(const server_tokens & tokens);
+
     // in bytes, 0 = no limit
     size_t limit_size = 0;
 

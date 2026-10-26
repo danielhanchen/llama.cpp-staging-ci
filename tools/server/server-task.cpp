@@ -1989,6 +1989,18 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     return true;
 }
 
+bool server_prompt_cache::drop_newest(const server_tokens & tokens) {
+    wait_inflight();
+    for (auto it = states.rbegin(); it != states.rend(); ++it) {
+        if (it->prompt.tokens.size() == tokens.size() && it->prompt.tokens.get_common_prefix(tokens) == tokens.size()) {
+            prompt_state_recycle(*it);
+            states.erase(std::next(it).base());
+            return true;
+        }
+    }
+    return false;
+}
+
 void server_prompt_cache::evict_front() {
     if (states.empty()) {
         return;

@@ -355,6 +355,7 @@ struct server_slot {
     // those are moved into the cache entry instead of copied (LLAMA_PCS_MOVE_CKPT=0: copied as before)
     // k15-ttft: the slot's prompt is in the prompt cache already, saved while the server was idle (LLAMA_PCS_IDLE_SAVE)
     bool prompt_saved_idle = false;
+    bool prompt_saved_idle_new = false; // ... into a new entry (not one the cache held already)
 
     bool prompt_save(server_prompt_cache & prompt_cache, llama_pos ckpt_keep_max = -2, bool force_async = false) {
         if (prompt.tokens.size() == 0) {
@@ -435,7 +436,7 @@ struct server_slot {
     }
 
     void prompt_clear() {
-        prompt_saved_idle = false;
+        prompt_saved_idle = false; prompt_saved_idle_new = false;
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
@@ -1878,7 +1879,19 @@ private:
             if (idle_save > 0 && prompt_cache && !params_base.embedding) {
                 for (auto & slot : slots) {
                     if (!slot.is_processing() && !slot.prompt_saved_idle && slot.prompt.tokens.size() > 0) {
-                        if (slot.prompt_save(*prompt_cache, -2, idle_save == 2)) {
+                        // only where the save evicts nothing (an eviction could not be taken back)
+                        const size_t n_state = llama_state_seq_get_size_ext(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) +
+                            (slot.ctx_dft ? llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0);
+                        size_t n_ckpt = 0;
+                        for (const auto & c : slot.prompt.checkpoints) {
+                            n_ckpt += c.size();
+                        }
+                        if ((prompt_cache->limit_size > 0 && prompt_cache->size() + n_state + n_ckpt > prompt_cache->limit_size) ||
+                            (prompt_cache->limit_tokens > 0 && prompt_cache->n_tokens() + slot.prompt.tokens.size() > prompt_cache->limit_tokens)) {
+                            continue;
+                        }
+                        slot.prompt_saved_idle_new = slot.prompt_save(*prompt_cache, -2, idle_save == 2);
+                        if (slot.prompt_saved_idle_new) {
                             prompt_cache->update();
                         }
                         slot.prompt_saved_idle = true;
@@ -2109,6 +2122,12 @@ private:
         }
 
         if (ret) {
+            // k15-ttft: a save made at idle that the old order would not have made (the slot is kept: similarity, or a stateless task)
+            // is taken back, so the cache holds what it held before (LLAMA_PCS_IDLE_SAVE)
+            if (ret->prompt_saved_idle && ret->prompt_saved_idle_new && prompt_cache && !(update_cache && !task.is_stateless())) {
+                prompt_cache->drop_newest(ret->prompt.tokens);
+            }
+            ret->prompt_saved_idle_new = false;
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for the tasks that reuse them
