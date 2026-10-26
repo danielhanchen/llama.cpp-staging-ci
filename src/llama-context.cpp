@@ -909,8 +909,9 @@ void llama_context::small_plan_free(uint32_t i) {
 // LLAMA_MOE_DISK_PREFETCH: unset = on when those experts exceed 80% of the available RAM (cgroup-aware, the weight store's rule),
 // 0 = off (no threads, no madvise: k15 behaviour), 1 = on. LLAMA_MOE_DISK_PREFETCH_THREADS (8), LLAMA_MOE_DISK_PREFETCH_AHEAD (3
 // MoE splits, 0 = kernel hook only; 0 by default beside a weight store), LLAMA_MOE_DISK_PREFETCH_MIB (lookahead bytes queued or in
-// flight, default min(2 GiB, 10% of the available RAM)), LLAMA_MOE_DISK_PREFETCH_RANDOM (1: MADV_RANDOM on the registered ranges,
-// so a fault the engine did not predict reads its page only, not a read-around window). Linux 5.14+ (MADV_POPULATE_READ) only
+// flight, default min(2 GiB, 10% of the available RAM)), LLAMA_MOE_DISK_PREFETCH_RANDOM (MADV_RANDOM on the registered ranges, so a
+// fault the engine did not predict reads its page only, not a read-around window; default 1 beside a weight store or without a GPU,
+// else 0). Linux 5.14+ (MADV_POPULATE_READ) only
 void llama_context::disk_prefetch_init() {
     const char * env = getenv("LLAMA_MOE_DISK_PREFETCH");
     const int mode = env != nullptr ? atoi(env) : -1;
@@ -961,7 +962,13 @@ void llama_context::disk_prefetch_init() {
     if (main_ctx) {
         ggml_moe_prefetch_set_ahead((int) std::max(0LL, env_i("LLAMA_MOE_DISK_PREFETCH_AHEAD", wstore ? 0 : 3)));
     }
-    const bool rand_read = env_i("LLAMA_MOE_DISK_PREFETCH_RANDOM", 1) != 0;
+    // MADV_RANDOM only where the uploads do not fault the mapping: with a weight store (pread) or without a GPU. Uploads of decode misses
+    // through the mapping (weight store off) are not streamed by the engine, and without read-around each of their faults reads one page
+    const bool has_gpu = std::any_of(backends.begin(), backends.end(), [](const ggml_backend_ptr & b) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(b.get());
+        return dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+    });
+    const bool rand_read = env_i("LLAMA_MOE_DISK_PREFETCH_RANDOM", wstore || !has_gpu ? 1 : 0) != 0;
     for (const auto & r : ranges) {
         ggml_moe_prefetch_register_mapping(r.first, r.second, rand_read);
         disk_ranges.push_back(r.first);
