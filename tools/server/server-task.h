@@ -694,6 +694,8 @@ struct server_prompt_cache {
     // k11: the entry whose state is still being copied by an asynchronous save (server_slot::prompt_save), and how to wait for it
     const server_prompt_cache_state * inflight = nullptr;
     std::function<void()>             wait_reads;
+    // k15-idlewait: the drop of an entry still being saved may be deferred (drop_newest); the server sets it for a single slot only
+    bool                              drop_defer_ok = false;
 
     void wait_inflight() {
         if (inflight != nullptr && wait_reads) {
@@ -720,7 +722,9 @@ struct server_prompt_cache {
     // k15-idlewait (LLAMA_PCS_IDLE_LEND): the checkpoints an idle save moved into the newest entry holding exactly these tokens go back
     // to the slot (dst), all of them when the entry is about to be dropped (keep_entry false), else a copy of those up to pos keep_max
     // (the ones the slot's next prompt keeps); true if the entry was found
-    bool ckpt_return(const server_tokens & tokens, std::list<common_prompt_checkpoint> & dst, bool keep_entry, llama_pos keep_max);
+    // entry_copies: all of them go back and the entry keeps a copy of each (what it held with LLAMA_PCS_IDLE_LEND=0)
+    bool ckpt_return(const server_tokens & tokens, std::list<common_prompt_checkpoint> & dst, bool keep_entry, llama_pos keep_max,
+                     bool entry_copies = false);
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;

@@ -393,6 +393,7 @@ struct server_slot {
             for (const auto & c : lent) {
                 common_state_buf_prefault(c.data_tgt.size(), 2); // as the copy would have asked (prompt_checkpoint_clone)
             }
+            SLT_INF(*this, "idle save: %zu checkpoint(s) lent to the cache entry\n", lent.size());
             cur->prompt.checkpoints.splice(cur->prompt.checkpoints.end(), lent);
             ckpt_lent = true;
         }
@@ -1908,6 +1909,14 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            {
+                // k15-idlewait: the idle checkpoint lend and the deferred drop are for a single slot only
+                static const bool lend_env  = getenv("LLAMA_PCS_IDLE_LEND") == nullptr || atoi(getenv("LLAMA_PCS_IDLE_LEND")) != 0;
+                static const bool defer_env = getenv("LLAMA_PCS_DROP_DEFER") == nullptr || atoi(getenv("LLAMA_PCS_DROP_DEFER")) != 0;
+                prompt_cache->drop_defer_ok = params_base.n_parallel == 1;
+                SRV_INF("prompt cache: idle checkpoint lend %s, deferred drop %s (n_parallel = %d)\n",
+                        lend_env && params_base.n_parallel == 1 ? "on" : "off", defer_env && params_base.n_parallel == 1 ? "on" : "off", params_base.n_parallel);
+            }
             prompt_cache->wait_reads = [this]() {
                 llama_state_seq_async_wait(ctx_tgt);
                 if (ctx_dft) {
@@ -3633,8 +3642,9 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
-                    if (slot->ckpt_lent && prompt_cache) { // k15-idlewait: the lent checkpoints come back (all; the entry stays)
-                        prompt_cache->ckpt_return(slot->prompt.tokens, slot->prompt.checkpoints, false, 0);
+                    if (slot->ckpt_lent && prompt_cache) { // k15-idlewait: the lent checkpoints come back, the entry keeps copies (as with the lend off)
+                        prompt_cache->ckpt_return(slot->prompt.tokens, slot->prompt.checkpoints, false, 0, true);
+                        SLT_INF(*slot, "slot action: %zu lent checkpoint(s) back, the cache entry keeps copies\n", slot->prompt.checkpoints.size());
                         slot->ckpt_lent = false;
                     }
 
@@ -3699,8 +3709,9 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
-                    if (slot->ckpt_lent && prompt_cache) { // k15-idlewait: the lent checkpoints come back (all; the entry stays)
-                        prompt_cache->ckpt_return(slot->prompt.tokens, slot->prompt.checkpoints, false, 0);
+                    if (slot->ckpt_lent && prompt_cache) { // k15-idlewait: the lent checkpoints come back, the entry keeps copies (as with the lend off)
+                        prompt_cache->ckpt_return(slot->prompt.tokens, slot->prompt.checkpoints, false, 0, true);
+                        SLT_INF(*slot, "slot action: %zu lent checkpoint(s) back, the cache entry keeps copies\n", slot->prompt.checkpoints.size());
                         slot->ckpt_lent = false;
                     }
 
@@ -3772,8 +3783,9 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
-                    if (slot->ckpt_lent && prompt_cache) { // k15-idlewait: the lent checkpoints come back (all; the entry stays)
-                        prompt_cache->ckpt_return(slot->prompt.tokens, slot->prompt.checkpoints, false, 0);
+                    if (slot->ckpt_lent && prompt_cache) { // k15-idlewait: the lent checkpoints come back, the entry keeps copies (as with the lend off)
+                        prompt_cache->ckpt_return(slot->prompt.tokens, slot->prompt.checkpoints, false, 0, true);
+                        SLT_INF(*slot, "slot action: %zu lent checkpoint(s) back, the cache entry keeps copies\n", slot->prompt.checkpoints.size());
                         slot->ckpt_lent = false;
                     }
 
