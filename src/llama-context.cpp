@@ -4874,6 +4874,13 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 for (size_t i = 0; i < backend_ptrs.size(); ++i) {
                     lm_merged_peak[i] = std::max(lm_merged_peak[i], ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]));
                 }
+                // k16 (k15-pp): a merged graph of b - a ubatches ran, so a refusal recorded at that size or below is stale (measured from a
+                // smaller buffer, at another position or before the banks were given back): later groups measure again from b - a + 1 up.
+                // LLAMA_MOE_LAYER_MAJOR_REFUSED_RESET=0 keeps the refusal for the process
+                static const bool lm_refused_reset = getenv("LLAMA_MOE_LAYER_MAJOR_REFUSED_RESET") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_REFUSED_RESET")) != 0;
+                if (lm_refused_reset && lm_refused_min <= b - a) {
+                    lm_refused_min = b - a + 1;
+                }
                 n_done = b;
                 extract_upto(n_done);
                 if (cap_in_graph && cap_k >= 0) {
