@@ -1958,7 +1958,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
                 }
                 uint32_t lo = 0, hi = 0;
                 const auto & bits = cells.seq_get_all(j);
-                for (uint32_t q = 0; q < 64 && q < (uint32_t) bits.size(); ++q) {
+                for (uint32_t q = 0; q < 64 && q < n_seq_max && q < (uint32_t) bits.size(); ++q) {
                     if (bits.test(q)) {
                         (q < 32 ? lo : hi) |= 1u << (q & 31);
                     }
