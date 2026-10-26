@@ -135,7 +135,10 @@ struct common_spec_cost_policy {
     }
 
     // the drafts to take (0 = a plain round) of the offered k_full (k_short: the short window, taken instead when it prices better)
-    int choose(int k_full, int k_short, double q) const {
+    // probe_full (k15-lfm2): a full window not measured PROBES times yet is probed (q >= P_PROBE) even where the measured short window
+    // prices better: a cheap short window measured first otherwise keeps the full one at its guessed (SHAPE) cost for good (G4 LFM2.5
+    // 32 GB with GGML_CUDA_MMVQ_MOE_ONE=1 and a 2-draft short window: the 8-row window never ran, 8k 511 -> 470 tok/s)
+    int choose(int k_full, int k_short, double q, bool probe_full = false) const {
         if (k_full <= 0) {
             return 0;
         }
@@ -155,7 +158,7 @@ struct common_spec_cost_policy {
             }
         }
         if (best_k > 0 && best > base*(1.0 + margin)) {
-            if (best_k < k_full && q >= P_PROBE && stale(k_full + 1)) {
+            if (best_k < k_full && q >= P_PROBE && (stale(k_full + 1) || (probe_full && cost_n[k_full + 1] < PROBES))) {
                 return k_full;
             }
             return best_k;

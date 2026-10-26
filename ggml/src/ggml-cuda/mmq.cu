@@ -134,6 +134,11 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
     return GGML_PREC_Q4;
 }
 
+static int ggml_cuda_mmq_skip_empty_mode() {
+    static const int mode = getenv("GGML_CUDA_MMQ_SKIP_EMPTY") ? atoi(getenv("GGML_CUDA_MMQ_SKIP_EMPTY")) : 1;
+    return mode;
+}
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -221,7 +226,12 @@ void ggml_cuda_mul_mat_q(
         const int64_t n_expert_used = ids->ne[0];
 
         // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
-        const int64_t ncols_expert = (ne12*n_expert_used + ne02 - 1) / ne02;
+        // k15-lfm2: op param 2 of a MUL_MAT_ID that reads a MoE cache bank in place (llama-moe-cache in-place prompts) = the number of
+        // experts its ids can name (the layer's experts, not the bank's slots): the average is over those (GGML_CUDA_MMQ_ID_ACTIVE=0: off)
+        static const bool active_hint = [] { const char * e = getenv("GGML_CUDA_MMQ_ID_ACTIVE"); return e == nullptr || atoi(e) != 0; }();
+        const int32_t n_active_hint = active_hint ? ggml_get_op_params_i32(dst, 2) : 0;
+        const int64_t ne02_avg = n_active_hint > 0 && n_active_hint < ne02 ? n_active_hint : ne02;
+        const int64_t ncols_expert = (ne12*n_expert_used + ne02_avg - 1) / ne02_avg;
 
         if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
             // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
@@ -442,7 +452,10 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12, J_best};
+        ne12, J_best,
+        // k15-mm2: a product over a bank of MoE cache slots (op param 2 = the experts its ids can name, set by the graph for in-place
+        // prompt products) gives no tile to the empty slots. GGML_CUDA_MMQ_SKIP_EMPTY=0: off, 2: every compact MoE tiling (tests)
+        ggml_cuda_mmq_skip_empty_mode() == 2 || (ggml_cuda_mmq_skip_empty_mode() == 1 && ggml_get_op_params_i32(dst, 2) > 0)};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }

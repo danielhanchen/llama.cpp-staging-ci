@@ -1659,6 +1659,14 @@ struct ggml_cuda_src1_memo {
     }
 };
 
+// k15-mm2: a QSA flash attention node whose dense selection mask is not built: the selected cells per token (I32 [n_sel, n_tokens],
+// dead slots >= n_kv) and the causal mask the dense one adds them to
+struct ggml_cuda_qsa_maskless {
+    const ggml_tensor * idx;
+    const ggml_tensor * kq;
+    bool alias; // the mask node's buffer overlaps idx or kq
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1680,6 +1688,9 @@ struct ggml_backend_cuda_context {
     // gather that copied the row was skipped, see ggml_cuda_try_gdn_state_in_place): node -> cache rows base, row stride (floats), row ids
     struct gdn_state_src { const float * base; int64_t row_stride; const int32_t * ids; };
     std::unordered_map<const ggml_tensor *, gdn_state_src> gdn_state_in_place;
+    // k15-mm2: QSA maskless (ggml_cuda_qsa_maskless_plan): flash attention node -> its selection, and the dense mask nodes not run
+    std::unordered_map<const ggml_tensor *, ggml_cuda_qsa_maskless> qsa_maskless;
+    std::unordered_set<const ggml_tensor *> qsa_skip;
     ggml_cuda_src1_memo  src1_memo;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
@@ -1688,6 +1699,10 @@ struct ggml_backend_cuda_context {
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {};
 
     int curr_stream_no = 0;
+
+    // k15-mm2: split-K few-row F32 mat-vec (mmvf.cu): per stream partial sums and self-resetting per-row arrival counters
+    float        * mmvf_splitk_part = nullptr;
+    unsigned int * mmvf_splitk_cnt  = nullptr;
 
     // a graph was computed with this instance (a copy-only instance, e.g. the scheduler copy queue, is not a compute instance)
     bool computes = false;

@@ -110,6 +110,9 @@ struct llama_context {
     const llama_moe_cache * get_moe_cache() const { return moe_cache.get(); } // k13
     bool moe_freeze_small(); // k13: see llama_moe_freeze_small
     bool moe_pin_small();    // k13: see llama_moe_pin_small
+    bool moe_pin_small_set(bool on); // k15-lfm2: see llama_moe_pin_small_set
+    void moe_request_begin();        // k15-lfm2: see llama_moe_request_begin
+    bool moe_cpu_miss_drop_slow(); // k15-lfm2: see llama_moe_cpu_miss_drop_slow
     const llama_cparams & get_cparams() const;
 
     ggml_backend_sched_t get_sched() const;
@@ -139,6 +142,9 @@ struct llama_context {
 
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
+    // k15-pp3: the nextn rows [0, n) of the last decode on the host before the decode is done (see rows_ev)
+    int64_t nextn_rows_wait(int64_t n);
+    float * nextn_rows_early();
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
@@ -337,7 +343,9 @@ public:
     // k11 (LLAMA_LM_CKPT_MERGE)
     void set_ubatch_breaks(const int32_t * breaks, int32_t n);
     bool set_state_capture(llama_seq_id seq_id, int32_t i_batch);
+    bool state_capture_supported() const;
     bool state_captured(llama_seq_id seq_id, llama_pos * pos_max) const;
+    bool state_captured_at(llama_seq_id seq_id, int32_t i_batch, llama_pos * pos_max);
     bool layer_major_on() const;
     bool layer_major_spans(int64_t n_before, int64_t n_after) const;
 
@@ -394,6 +402,8 @@ private:
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
     static bool sched_copy_experts_body(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
+    // k15-lfm2: the prompt map of an in-place prompt layer (llama_moe_cache::prompt_copy): records its routing, seeds as the staging copy does
+    bool moe_prompt_copy(ggml_backend_t backend, ggml_tensor * dst, ggml_cgraph * graph, int32_t il);
     // ggml_backend_sched prefetch callback, selects how the weights in host memory are prefetched
     static ggml_backend_sched_prefetch_mode sched_prefetch_mode(const ggml_tensor * src, const ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
@@ -599,6 +609,9 @@ private:
 
     // value of moe_cache_seed when the current graph was allocated: the scheduler plans the copies of the experts with it
     bool moe_cache_seed_graph = false;
+    bool moe_inplace_ok       = false; // k15-lfm2: this ubatch may read its experts in place (see moe_cache_seed_begin)
+    int  moe_seed_early       = 0;     // k15-lfm2: after a per-request reset of the cache, seed before the end of the batch (see moe_request_begin)
+    bool moe_inplace_graph    = false;
     int  moe_cache_hybrid_graph = 0; // llama_moe_cache::hybrid_mode of the previous graph
 
     // routing outputs of the last computed large ubatch (expert tensor, ids), valid until the next graph is built
@@ -616,6 +629,7 @@ private:
     std::vector<int32_t> ubatch_breaks_next;
     bool lm_auto    = false;  // LLAMA_MOE_LAYER_MAJOR unset: on beside speculative decoding with a model
     int  lm_ub_max  = 16;     // ubatches per layer-major graph [LLAMA_MOE_LAYER_MAJOR_UB_MAX]
+    int64_t lm_n_tail = 0;    // k15-pp2: short last ubatches run as the last member of a group (LLAMA_LM_TAIL)
     bool lm_verbose = false;  // [LLAMA_MOE_LAYER_MAJOR_LOG]
     bool lm_replay_logged = false; // k11: the first replayed device seed is logged (see decode_layer_major)
     // beside the device seed of prompt ubatches (moe_cache_devseed_on): groups run [LLAMA_MOE_LAYER_MAJOR_DEVSEED, default 1] and the
@@ -671,17 +685,37 @@ private:
         ggml_tensor * snap;  // its copy before the capture token
         ggml_tensor * view;  // the row as a tensor (view of t)
     };
-    llama_seq_id cap_seq     = -1;
-    int32_t      cap_idx     = -1;    // batch token index of the next / current decode
-    bool         cap_pending = false; // set for the next decode
-    bool         cap_done    = false;
-    llama_pos    cap_pos     = -1;    // position of the last token before cap_idx
-    uint32_t     cap_cell    = 0;
-    std::vector<cap_region> cap_regions;
-    ggml_context_ptr        cap_ctx;
-    ggml_backend_buffer_ptr cap_buf;
-    bool cap_prepare();             // the regions of the sequence's cell and their snapshot tensors; false: unsupported
-    void cap_now(llama_pos pos);    // synchronize, then copy the regions (state before the next ubatch)
+    // k15-pp2: up to LLAMA_STATE_CAPTURE_MAX captures per decode (e.g. the far and the near prompt checkpoint), each with its snapshots
+    struct cap_slot {
+        llama_seq_id seq     = -1;
+        int32_t      idx     = -1;    // batch token index of the next / current decode
+        bool         pending = false; // set for the next decode
+        bool         done    = false;
+        llama_pos    pos     = -1;    // position of the last token before idx
+        uint32_t     cell    = 0;
+        std::vector<cap_region> regions;
+        ggml_context_ptr        ctx;
+        ggml_backend_buffer_ptr buf;
+        ggml_backend_event_t    ev     = nullptr; // the compute stream right after the snapshot copies
+        bool                    ev_set = false;
+    };
+    static constexpr int cap_max = 2;
+    int cap_count() const;
+    cap_slot cap[cap_max];
+    int      cap_sel = -1;                     // the capture a LLAMA_STATE_SEQ_FLAGS_CAPTURED read takes (llama_state_seq_captured_at)
+    bool cap_prepare(int s);                   // the regions of the sequence's cell and their snapshot tensors; false: unsupported
+    size_t cap_reserve_bytes(ggml_backend_buffer_type_t * buft) const; // k15-pp3: the snapshots fit counts (memory_breakdown)
+    size_t cap_planned_bytes(ggml_backend_buffer_type_t * buft) const; // k15-pp3: the snapshots captures will allocate (0: none planned)
+    void cap_now(int s, llama_pos pos);        // copy the regions in stream order (state before the next ubatch)
+    bool cap_any() const { for (const auto & c : cap) { if (c.idx >= 0 && !c.done) { return true; } } return false; }
+    // k15-pp2 (LLAMA_STATE_CAPTURE_SIDE=0 off): the read of a captured state's snapshots runs on a stream of its own, after an event
+    // of the compute stream, so the output wait of the decode does not wait for it; the next capture copy waits for that read
+    ggml_backend_t       cap_side    = nullptr;
+    ggml_backend_event_t cap_side_ev = nullptr;   // the side stream's last read
+    bool                 cap_side_pending = false;
+    int                  cap_save = -1;           // the capture a CAPTURED save is reading (state_get_async)
+    ggml_backend_t cap_backend() const;           // the compute backend of the snapshot device
+    void cap_record(int s, ggml_backend_t be);
     bool lm_seed_async = false;
     ggml_backend_dev_t lm_async_dev = nullptr;
     std::vector<lm_seed_pending> lm_pending;
@@ -689,6 +723,11 @@ private:
     ggml_backend_buffer_ptr lm_async_buf;
     size_t lm_async_used = 0;
     int    lm_async_nev  = 0;
+    // k15-pp3 (LLAMA_MTP_PROMPT_OVERLAP=0 off): when more ubatches follow a layer-major group in the same decode, an event after the
+    // copies of the group's nextn rows to the host: an MTP drafter reads rows [0, rows_ev_n) while the rest of the decode computes
+    ggml_backend_event_ptr rows_ev;
+    ggml_backend_dev_t     rows_ev_dev = nullptr;
+    int64_t                rows_ev_n   = 0;
     const ggml_cgraph * lm_copy_graph = nullptr; // the split graph of the last expert copy, lm_copy_seq counts its changes
     int64_t lm_copy_seq = 0;
     std::unordered_map<const ggml_tensor *, int64_t> lm_staged_seq; // expert tensor -> lm_copy_seq of its copy
@@ -702,7 +741,7 @@ private:
     int decode_layer_major(llama_memory_context_i * mctx, int64_t n_outputs_all, int64_t n_tokens_all, int64_t & n_outputs_prev,
             int64_t & n_tokens_prev, bool & more, int & ret);
 
-    void moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_large, int64_t n_outputs_ub);
+    void moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_large, int64_t n_outputs_ub, bool early = false);
     void moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_outputs_ub);
     // the end of a prompt that did not seed: the lent slots that come back get the experts its last large ubatch used most
     void moe_cache_refill_from_ids();

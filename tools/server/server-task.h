@@ -710,7 +710,10 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    // take_from (k15-ttft, optional): the checkpoint list of the slot being saved; its checkpoints with pos_max > keep_max are moved
+    // into the entry instead of copied (the caller knows the slot drops them), the others are copied as before
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft,
+                                      std::list<common_prompt_checkpoint> * take_from = nullptr, llama_pos keep_max = -1);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 

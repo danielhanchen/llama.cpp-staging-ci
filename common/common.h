@@ -393,6 +393,11 @@ struct common_params_speculative_ngram_suffix {
     // k15-spec: prompts of at least long_prompt tokens draft from repeats of at least n_min_match_long tokens (0: n_min_match)
     int32_t long_prompt      = 0;
     int32_t n_min_match_long = 0;
+    // k15-lfm2: prompts of at least win_long_prompt tokens (0: off) take the short window n_max_short_long (from a match under
+    // n_long_match_long; the full window from there): the server sets them where drafts verify exactly (output unchanged)
+    int32_t win_long_prompt   = 0;
+    int32_t n_max_short_long  = 0;
+    int32_t n_long_match_long = 0;
 };
 
 struct common_params_speculative_ngram_map {
@@ -655,6 +660,7 @@ struct common_params {
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
     bool load_mtp          = false; // load MTP/NextN layers
+    bool mtp_borrow_io     = false; // k16-draft: an MTP draft model takes token_embd / output from the target (set by common_base_params_to_speculative)
 
     bool single_turn       = false; // single turn chat conversation
 
@@ -1366,10 +1372,32 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 
 // a byte buffer whose resize() leaves new bytes uninitialized: a checkpoint is overwritten in full by the state save, and the
 // zero-fill of a fresh multi-MiB buffer (page faults included) otherwise ran on the main thread before the save was queued
+// k15-ttft: buffers of at least 4 MiB are 2 MiB aligned and marked MADV_HUGEPAGE (Linux), so a fresh state / checkpoint buffer faults
+// in 2 MiB pages instead of 4 KiB ones (a 77 MiB prompt-cache save: ~40 faults instead of ~20000). Same memory, same bytes.
+// Opt-in (LLAMA_STATE_THP=1): on G4 Flash-Next 32 GB (62 GB host RSS) the madvised allocations stalled in direct compaction
+// (multi-turn steps of 6.8 s and 10.8 s against 2.1 s and 0.95 s, regenerate 64 ms against 44 ms)
+bool   common_state_thp_on();
+void * common_state_thp_alloc(size_t bytes);
+void   common_state_thp_free(void * p);
+
 template <typename T>
 struct common_default_init_allocator : std::allocator<T> {
     using std::allocator<T>::allocator;
     template <typename U> struct rebind { using other = common_default_init_allocator<U>; };
+    static constexpr size_t thp_min = 4u << 20;
+    T * allocate(size_t n) {
+        if (n * sizeof(T) >= thp_min && common_state_thp_on()) {
+            return (T *) common_state_thp_alloc(n * sizeof(T));
+        }
+        return std::allocator<T>::allocate(n);
+    }
+    void deallocate(T * p, size_t n) noexcept {
+        if (n * sizeof(T) >= thp_min && common_state_thp_on()) {
+            common_state_thp_free(p);
+            return;
+        }
+        std::allocator<T>::deallocate(p, n);
+    }
     template <typename U> void construct(U * p) noexcept(std::is_nothrow_default_constructible<U>::value) { ::new ((void *) p) U; }
     template <typename U, typename... Args> void construct(U * p, Args &&... args) { ::new ((void *) p) U(std::forward<Args>(args)...); }
 };

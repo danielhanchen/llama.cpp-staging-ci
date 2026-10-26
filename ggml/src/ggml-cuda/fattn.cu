@@ -125,6 +125,208 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// k15-mm2 QSA maskless: the lists of flash_attn_mask_to_sparse_indices built from the selected cells themselves. A query row
+// keeps cell c if a slot of its token selects c (idx < n_kv, a dead slot points at a dump row >= n_kv) and its causal mask is
+// finite there, which is the set of finite entries of the dense mask (-inf, 0 at the selected cells, + kq_mask). A bitmap over
+// the cells makes the lists ascending and duplicate free, so they equal the compacted ones element by element
+#define FATTN_SEL_THREADS 1024
+#define FATTN_SEL_UNROLL  4
+template <int ncols1>
+__launch_bounds__(FATTN_SEL_THREADS, 1)
+static __global__ void flash_attn_sel_to_sparse_indices(
+        const int32_t * idx_ptr, const half * kq_ptr, int32_t * indices_ptr, int32_t * counts_ptr, const int n_kv, const int n_sel,
+        const int n_queries, const int n_kv_max, const int64_t s_idx, const int64_t s31, const int64_t s33) {
+    ggml_cuda_pdl_sync();
+
+    extern __shared__ uint32_t bits[];
+    __shared__ int warp_sums[FATTN_SEL_THREADS/WARP_SIZE];
+
+    const int tid      = threadIdx.x;
+    const int sequence = blockIdx.y;
+    const int group    = blockIdx.x;
+    const int nwords   = (n_kv + 31) / 32;
+
+    const int q0 = group*ncols1;
+    const int q1 = min(q0 + ncols1, n_queries);
+
+    for (int w = tid; w < nwords; w += blockDim.x) {
+        bits[w] = 0;
+    }
+    __syncthreads();
+
+    // the loads of a batch of slots are independent: issue them all before the dependent mask reads and the bitmap updates
+    for (int q = q0; q < q1; ++q) {
+        const int32_t * idx = idx_ptr + (int64_t(sequence)*n_queries + q)*s_idx;
+        const half    * kq  = kq_ptr  + sequence*s33 + q*s31;
+        for (int s0 = 0; s0 < n_sel; s0 += FATTN_SEL_UNROLL*FATTN_SEL_THREADS) {
+            int32_t c[FATTN_SEL_UNROLL];
+#pragma unroll
+            for (int u = 0; u < FATTN_SEL_UNROLL; ++u) {
+                const int s = s0 + u*FATTN_SEL_THREADS + tid;
+                c[u] = s < n_sel ? idx[s] : -1;
+                c[u] = c[u] < n_kv ? c[u] : -1;
+            }
+            bool live[FATTN_SEL_UNROLL];
+#pragma unroll
+            for (int u = 0; u < FATTN_SEL_UNROLL; ++u) {
+                live[u] = c[u] >= 0 && isfinite(__half2float(kq[max(c[u], 0)]));
+            }
+#pragma unroll
+            for (int u = 0; u < FATTN_SEL_UNROLL; ++u) {
+                if (live[u]) {
+                    atomicOr(&bits[c[u] / 32], uint32_t(1) << (c[u] % 32));
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    // each thread owns a contiguous run of words, an exclusive scan of the run counts orders the writes
+    const int wpt = (nwords + blockDim.x - 1) / blockDim.x;
+    const int w0  = min(tid*wpt, nwords);
+    const int w1  = min(w0 + wpt, nwords);
+    int count = 0;
+    for (int w = w0; w < w1; ++w) {
+        count += __popc(bits[w]);
+    }
+
+    const int lane = tid % WARP_SIZE;
+    const int warp = tid / WARP_SIZE;
+    int incl = count;
+#pragma unroll
+    for (int off = 1; off < WARP_SIZE; off *= 2) {
+        const int v = __shfl_up_sync(0xFFFFFFFF, incl, off);
+        if (lane >= off) {
+            incl += v;
+        }
+    }
+    if (lane == WARP_SIZE - 1) {
+        warp_sums[warp] = incl;
+    }
+    __syncthreads();
+    int offset = incl - count;
+    int total  = 0;
+#pragma unroll
+    for (int iw = 0; iw < FATTN_SEL_THREADS/WARP_SIZE; ++iw) {
+        const int v = warp_sums[iw];
+        offset += iw < warp ? v : 0;
+        total  += v;
+    }
+
+    int32_t * indices = indices_ptr + (int64_t(sequence)*gridDim.x + group)*n_kv_max;
+    for (int w = w0; w < w1 && offset < n_kv_max; ++w) {
+        uint32_t b = bits[w];
+        while (b != 0 && offset < n_kv_max) {
+            const int bit = __ffs(b) - 1;
+            b &= b - 1;
+            indices[offset++] = w*32 + bit;
+        }
+    }
+
+    const int n = min(total, n_kv_max);
+    for (int i = n + tid; i < n_kv_max; i += blockDim.x) {
+        indices[i] = -1;
+    }
+    if (tid == 0) {
+        counts_ptr[int64_t(sequence)*gridDim.x + group] = n;
+    }
+    __syncthreads();
+
+    ggml_cuda_pdl_lc();
+}
+
+// the dense mask when the kernel does not gather: -inf, then the causal mask at the selected cells, as fill(-inf) + set_rows(0)
+// + add(kq_mask) computes it. One block per (token row, FATTN_SEL_MASK_CHUNK cells): a block writes only its own cells
+#define FATTN_SEL_MASK_CHUNK 1024
+__launch_bounds__(256, 1)
+static __global__ void flash_attn_sel_to_mask(
+        const int32_t * idx_ptr, const half * kq_ptr, half * mask_ptr, const int n_kv, const int n_sel, const int n_queries,
+        const int64_t s_idx, const int64_t s31, const int64_t s33, const int chunk) {
+    ggml_cuda_pdl_sync();
+
+    const int q        = blockIdx.y;
+    const int sequence = blockIdx.z;
+    const int c0       = blockIdx.x*chunk;
+    const int c1       = min(c0 + chunk, n_kv);
+
+    const int32_t * idx  = idx_ptr  + (int64_t(sequence)*n_queries + q)*s_idx;
+    const half    * kq   = kq_ptr   + sequence*s33 + q*s31;
+    half          * mask = mask_ptr + sequence*s33 + q*s31;
+
+    for (int c = c0 + threadIdx.x; c < c1; c += blockDim.x) {
+        mask[c] = half(-INFINITY);
+    }
+    __syncthreads();
+    for (int s = threadIdx.x; s < n_sel; s += blockDim.x) {
+        const int32_t c = idx[s];
+        if (c >= c0 && c < c1) {
+            mask[c] = __float2half(0.0f + __half2float(kq[c]));
+        }
+    }
+    __syncthreads();
+
+    ggml_cuda_pdl_lc();
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+int ggml_cuda_qsa_maskless_mode() {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    return 0;
+#else
+    static const int mode = getenv("GGML_CUDA_QSA_MASKLESS") ? atoi(getenv("GGML_CUDA_QSA_MASKLESS")) : 1;
+    return mode;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
+bool ggml_cuda_qsa_maskless_gather_ok(const ggml_cuda_qsa_maskless & qsa) {
+    return size_t(qsa.kq->ne[0] + 31)/32*sizeof(uint32_t) <= 48*1024;
+}
+
+void ggml_cuda_qsa_maskless_compact(
+        const ggml_cuda_qsa_maskless & qsa, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max,
+        cudaStream_t stream) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(qsa, indices, counts, n_queries, ncols1, n_kv_max, stream);
+    GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA");
+#else
+    const ggml_tensor * idx = qsa.idx;
+    const ggml_tensor * kq  = qsa.kq;
+    GGML_ASSERT(ncols1 == 1 || ncols1 == 8);
+    GGML_ASSERT(n_queries == kq->ne[1]);
+    const int n_kv = kq->ne[0];
+    const dim3 blocks_num((n_queries + ncols1 - 1)/ncols1, kq->ne[3], 1);
+    const dim3 block_dim(FATTN_SEL_THREADS, 1, 1);
+    const size_t nbytes_shared = size_t(n_kv + 31)/32*sizeof(uint32_t);
+    const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, nbytes_shared, stream);
+    const auto kernel = ncols1 == 1 ? flash_attn_sel_to_sparse_indices<1> : flash_attn_sel_to_sparse_indices<8>;
+    ggml_cuda_kernel_launch(kernel, launch_params,
+        (const int32_t *) idx->data, (const half *) kq->data, indices, counts, n_kv, int(idx->ne[0]), n_queries, n_kv_max,
+        int64_t(idx->nb[1]/sizeof(int32_t)), int64_t(kq->nb[1]/sizeof(half)), int64_t(kq->nb[3]/sizeof(half)));
+    CUDA_CHECK(cudaGetLastError());
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
+void ggml_cuda_qsa_maskless_materialize(const ggml_cuda_qsa_maskless & qsa, half * mask, cudaStream_t stream) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(qsa, mask, stream);
+    GGML_ABORT("QSA maskless is only planned on NVIDIA CUDA");
+#else
+    const ggml_tensor * idx = qsa.idx;
+    const ggml_tensor * kq  = qsa.kq;
+    // GGML_CUDA_QSA_MASK_SPLIT=0: one block per token row (the cell chunk is the whole row)
+    static const bool split = !getenv("GGML_CUDA_QSA_MASK_SPLIT") || atoi(getenv("GGML_CUDA_QSA_MASK_SPLIT")) != 0;
+    const int chunk = split ? FATTN_SEL_MASK_CHUNK : int(kq->ne[0]);
+    const dim3 blocks_num((kq->ne[0] + chunk - 1)/chunk, kq->ne[1], kq->ne[3]);
+    const dim3 block_dim(256, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
+    ggml_cuda_kernel_launch(flash_attn_sel_to_mask, launch_params,
+        (const int32_t *) idx->data, (const half *) kq->data, mask, int(kq->ne[0]), int(idx->ne[0]), int(kq->ne[1]),
+        int64_t(idx->nb[1]/sizeof(int32_t)), int64_t(kq->nb[1]/sizeof(half)), int64_t(kq->nb[3]/sizeof(half)), chunk);
+    CUDA_CHECK(cudaGetLastError());
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(cc, dst, ncols1, ncols2);
@@ -776,6 +978,22 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         d1.ne[2]  = 1;
         d1.flags &= ~GGML_TENSOR_FLAG_BATCH_INVARIANT;
         const best_fattn_kernel k1 = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), &d1);
+        // k15-lfm2, GGML_CUDA_FA_VERIFY_MMA=1 (opt-in): where the one query node runs the MMA kernel (Turing / Ampere: f16 KQ tiles,
+        // f16 P, half2 VKQ), the verify node runs that kernel once for all its queries instead of once per query. Same kernel family
+        // and number formats, only the tiling of the KV loop / softmax rescales and the KV split differ (plans/k11.md equivalence
+        // rule: reassociation); taken only when the batched node would pick the MMA kernel too
+        static const bool verify_mma = [] {
+            const char * e = getenv("GGML_CUDA_FA_VERIFY_MMA");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (verify_mma && k1 == BEST_FATTN_KERNEL_MMA_F16) {
+            ggml_tensor dn = *dst;
+            dn.flags &= ~GGML_TENSOR_FLAG_BATCH_INVARIANT;
+            if (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), &dn) == BEST_FATTN_KERNEL_MMA_F16) {
+                ggml_cuda_flash_attn_ext_mma_f16(ctx, &dn);
+                return;
+            }
+        }
         const ggml_tensor * K = dst->src[1];
         const ggml_tensor * V = dst->src[2];
         GGML_ASSERT(K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16); // no staged K / V copy behind the output (llama-graph)

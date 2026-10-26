@@ -234,6 +234,10 @@ struct common_speculative_impl {
     // impls that read target features without honouring it say so
     int32_t nextn_row_offset = 0;
     virtual bool row_offset_ok() const { return true; }
+    // k15-pp3 (LLAMA_MTP_PROMPT_OVERLAP): process() reads the target's rows without a synchronization (llama_get_embeddings_nextn_early),
+    // the caller waited for them (llama_nextn_rows_wait); only impls that read nothing else of the target say yes
+    bool rows_early = false;
+    virtual bool rows_early_ok() const { return false; }
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
@@ -1511,6 +1515,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool dev_h = false;
     // k11: segments of a merged prompt batch (LLAMA_LM_CKPT_MERGE) read host rows at an offset, the device sink holds whole batches
     bool row_offset_ok() const override { return !dev_h; }
+    bool rows_early_ok() const override { return !dev_h && !is_mem_shared; }
     llama_seq_id dev_seq = -1;            // the sequence whose pending row is in sink row 0
     std::vector<uint8_t> pending_dev;     // per seq: its pending row is sink row 0 (pending_h is stale)
     std::vector<uint8_t> verify_dev;      // per seq: the verify rows are sink rows 1 .. verify_h_rows (verify_h is unused)
@@ -1706,6 +1711,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        // k15-pp3: rows the caller already waited for (unmasked: row i at i*n_embd), else the synchronizing lookups
+        const float * h_early = rows_early ? llama_get_embeddings_nextn_early(ctx_tgt) : nullptr;
+        GGML_ASSERT(!rows_early || h_early);
+        auto tgt_row = [&](int32_t i) -> const float * {
+            return h_early ? h_early + (size_t) i * n_embd : llama_get_embeddings_nextn_ith(ctx_tgt, i);
+        };
+
         const int64_t t_tr0 = common_mtp_handoff_trace() && n_tokens >= 64 ? ggml_time_us() : 0;
         int64_t t_tr_sync  = 0;
         int64_t t_tr_build = 0;
@@ -1748,7 +1760,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
             // the device path reads no host rows: no sync on the target here
-            const float * h_tgt = dev ? nullptr : llama_get_embeddings_nextn(ctx_tgt) + (size_t) nextn_row_offset * n_embd;
+            const float * h_tgt = dev ? nullptr : (h_early ? h_early : llama_get_embeddings_nextn(ctx_tgt)) + (size_t) nextn_row_offset * n_embd;
             if (t_tr0) {
                 t_tr_sync = ggml_time_us();
             }
@@ -1843,8 +1855,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             // the rows of one sequence are consecutive in the target's nextn buffer: one copy into a buffer that only grows (a
             // prompt ubatch is n_rows*n_embd floats) instead of a zero-filled resize and a synchronizing lookup per row
-            const float * h_beg = handoff_copy ? llama_get_embeddings_nextn_ith(ctx_tgt, nextn_row_offset + i_batch_beg[seq_id]) : nullptr;
-            const float * h_end = handoff_copy ? llama_get_embeddings_nextn_ith(ctx_tgt, nextn_row_offset + i_batch_end[seq_id]) : nullptr;
+            const float * h_beg = handoff_copy ? tgt_row(nextn_row_offset + i_batch_beg[seq_id]) : nullptr;
+            const float * h_end = handoff_copy ? tgt_row(nextn_row_offset + i_batch_end[seq_id]) : nullptr;
             if (h_beg && h_end == h_beg + (size_t) (n_rows - 1) * n_embd) {
                 // accept() reads row min(n_accepted, n_rows - 1) and n_accepted <= n_max: a prompt ubatch (thousands of rows,
                 // 160 MiB at 4096 x 10240 floats) keeps its first n_keep rows and the last one (in pending_h), not all of them;
@@ -1862,7 +1874,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
                 for (int32_t i = 0; i < n_rows; ++i) {
-                    const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, nextn_row_offset + i_batch_beg[seq_id] + i);
+                    const float * h = tgt_row(nextn_row_offset + i_batch_beg[seq_id] + i);
                     std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
                 }
             }
@@ -2448,6 +2460,8 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         common_spec_round_timer timer;   // k11-decode: round times of this sequence (policy_on)
         int64_t n_probe = 0;
         int min_match = 3;               // k15-spec: this request's shortest repeat (n_min_match, n_min_match_long for a long prompt)
+        int n_short   = 3;               // k15-lfm2: this request's short window and full-window match (n_max_short / n_long_match, or
+        int n_long    = 8;               //           n_max_short_long / n_long_match_long for a long prompt)
     };
 
     std::vector<seq_info> sinfos;
@@ -2481,6 +2495,14 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         }
         for (auto & si : sinfos) {
             si.min_match = params.n_min_match;
+            si.n_short   = params.n_max_short;
+            si.n_long    = params.n_long_match;
+        }
+        if (params.win_long_prompt > 0) {
+            params.n_max_short_long  = std::clamp(params.n_max_short_long > 0 ? params.n_max_short_long : params.n_max_short, 1, params.n_max);
+            params.n_long_match_long = std::max(params.n_min_match, params.n_long_match_long > 0 ? params.n_long_match_long : params.n_long_match);
+            SPC_INF("ngram-suffix: prompts of %d+ tokens: window of %d below a match of %d, else %d\n", params.win_long_prompt,
+                    params.n_max_short_long, params.n_long_match_long, params.n_max);
         }
         {
             const char * e = getenv("LLAMA_SPEC_SUFFIX_POLICY");
@@ -2650,7 +2672,7 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
                     si.n_matches, si.n_drafts, si.n_drafted, si.n_accepted, si.n_yield, rate(si, 0), rate(si, 1), rate(si, 2), rate(si, 3));
         }
         if (policy_on && si.n_lookups > 0) {
-            const int ts = std::min(params.n_max_short + 1, common_spec_cost_policy::MAX_T);
+            const int ts = std::min(si.n_short + 1, common_spec_cost_policy::MAX_T);
             const int tl = std::min(params.n_max + 1, common_spec_cost_policy::MAX_T);
             SPC_INF("ngram-suffix seq %d: round ms by window 1 / %d / %d: %.2f (%.0f) / %.2f (%.0f) / %.2f (%.0f), realized gain %.2f (%.0f) / %.2f (%.0f), %"
                     PRId64 " probes\n", seq_id, ts, tl, policy.cost_ms(1), policy.cost_n[1], policy.cost_ms(ts), policy.cost_n[ts], policy.cost_ms(tl),
@@ -2662,6 +2684,11 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         si.timer.reset();
         si.min_match = (params.long_prompt > 0 && params.n_min_match_long > 0 && (int64_t) prompt.size() >= params.long_prompt) ?
                        params.n_min_match_long : params.n_min_match;
+        {
+            const bool lw = params.win_long_prompt > 0 && (int64_t) prompt.size() >= params.win_long_prompt;
+            si.n_short = lw ? params.n_max_short_long  : params.n_max_short;
+            si.n_long  = lw ? params.n_long_match_long : params.n_long_match;
+        }
         if (policy_on && n_seq == 1) {
             policy.reset_gain();
         }
@@ -2700,7 +2727,7 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
             si.n_matches++;
             const int    b   = bucket(match);
             const double q   = rate(si, b);
-            const int    win = match >= params.n_long_match ? cap : std::min(cap, params.n_max_short);
+            const int    win = match >= si.n_long ? cap : std::min(cap, si.n_short);
             // the draft is the whole window (fewer tokens only where the repeat runs out): every verify length is a graph of its own
             // (a change of length rebuilds the target graph, 10-15 ms on G4, plans/mtp_adapt.md), so the lengths stay few
             int k = 0;
@@ -2710,7 +2737,7 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
             } else if (policy_on) {
                 // k11-decode: the window that commits the most tokens per measured ms, or none (common/spec-cost-policy.h)
                 const int k_full = std::min(offered, win);
-                k = policy.choose(k_full, std::min(k_full, params.n_max_short), q);
+                k = policy.choose(k_full, std::min(k_full, si.n_short), q, si.n_short != params.n_max_short);
                 if (k > 0 && policy.cost_n[std::min(k + 1, common_spec_cost_policy::MAX_T)] < common_spec_cost_policy::PROBES) {
                     si.n_probe++;
                 }
@@ -3213,6 +3240,58 @@ uint32_t common_draft_ubatch_max() {
     return v;
 }
 
+// k16-draft: the shape of tensor `name` in a GGUF (split-aware: a target's lm head is usually in a later shard), false if absent
+static bool common_gguf_tensor_ne(const std::string & path, const char * name, int64_t ne[GGML_MAX_DIMS]) {
+    std::string prefix;
+    int n_split = 1;
+    const size_t at = path.rfind("-00001-of-");
+    if (at != std::string::npos && path.size() == at + 20 && path.compare(path.size() - 5, 5, ".gguf") == 0) {
+        prefix  = path.substr(0, at);
+        n_split = atoi(path.substr(at + 10, 5).c_str());
+    }
+    for (int i = 0; i < std::max(1, n_split); ++i) {
+        std::string fname = path;
+        if (n_split > 1) {
+            std::vector<char> sp(prefix.size() + 32);
+            llama_split_path(sp.data(), sp.size(), prefix.c_str(), i, n_split);
+            fname = sp.data();
+        }
+        ggml_context * meta = nullptr;
+        gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &meta };
+        gguf_context_ptr ctx(gguf_init_from_file(fname.c_str(), gp));
+        if (!ctx) {
+            return false;
+        }
+        ggml_context_ptr meta_ptr(meta);
+        if (const ggml_tensor * t = ggml_get_tensor(meta, name)) {
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                ne[d] = t->ne[d];
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+// k16-draft (idea from ikawrakow/ik_llama.cpp PR #2403): a separate MTP draft model (-md with --spec-type draft-mtp) uses the target's
+// token_embd and output when both files hold them with the same shapes (llama_model_loader::borrow_io checks again at load, against
+// the loaded target). Decided here so the fit's measurements of the draft (no target loaded yet) count the lm head as the target's.
+// LLAMA_MTP_BORROW_IO=0: the draft loads its own copies
+static bool common_mtp_borrow_io_ok(const std::string & path_tgt, const std::string & path_dft) {
+    const char * e = getenv("LLAMA_MTP_BORROW_IO");
+    if ((e != nullptr && atoi(e) == 0) || path_tgt.empty() || path_dft.empty() || path_tgt == path_dft) {
+        return false;
+    }
+    for (const char * name : { "token_embd.weight", "output.weight" }) {
+        int64_t a[GGML_MAX_DIMS] = {}, b[GGML_MAX_DIMS] = {};
+        if (!common_gguf_tensor_ne(path_tgt, name, a) || !common_gguf_tensor_ne(path_dft, name, b) ||
+                !std::equal(a, a + GGML_MAX_DIMS, b)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 common_params common_base_params_to_speculative(const common_params & params) {
     const bool has_draft = params.speculative.has_dft();
 
@@ -3256,6 +3335,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
     const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     result.moe_cache_size = spec_mtp && !has_draft ? params.moe_cache_size : 0;
+
+    // k16-draft: borrowed token_embd / output (llama_model_params::mtp_borrow_io)
+    result.mtp_borrow_io = spec_mtp && has_draft && common_mtp_borrow_io_ok(params.model.path, params_spec.mparams.path);
 
     // a separate MTP drafter (-md) is one block: its context reads the prompt in ubatches of at most common_draft_ubatch_max()
     // tokens (it splits the target's larger ubatches itself), so its compute buffer stays small and the MoE cache of the target
@@ -3335,6 +3417,11 @@ common_speculative_init_result::common_speculative_init_result(
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
+
+        // k16-draft: the target lends its token_embd / output to an MTP draft model (llama_model_loader::borrow_io)
+        if (spec_mtp && mparams.mtp_borrow_io) {
+            mparams.model_shared = model_tgt;
+        }
 
         llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
         if (model_dft == NULL) {
@@ -3603,6 +3690,31 @@ bool common_speculative_process_rows(common_speculative * spec, const common_bat
         impl->nextn_row_offset = 0;
     }
 
+    return result;
+}
+
+bool common_speculative_rows_early_ok(const common_speculative * spec) {
+    if (spec == nullptr || spec->impls.empty()) {
+        return false;
+    }
+    for (const auto & impl : spec->impls) {
+        if (!impl->rows_early_ok()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool common_speculative_process_rows_early(common_speculative * spec, const common_batch & batch, int32_t row_offset) {
+    GGML_ASSERT(common_speculative_rows_early_ok(spec));
+    bool result = true;
+    for (auto & impl : spec->impls) {
+        impl->nextn_row_offset = row_offset;
+        impl->rows_early       = true;
+        result = result && impl->process(batch);
+        impl->rows_early       = false;
+        impl->nextn_row_offset = 0;
+    }
     return result;
 }
 

@@ -1806,6 +1806,17 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur, ids) :
         ggml_mul_mat_id(ctx0, slots_host ? w : moe_cache->get_experts(w), cur, slots);
+    // k15-lfm2: a product that reads the bank of the MoE cache in place (an in-place prompt map): its ids name at most the layer's experts,
+    // op param 2 tells the kernels so (mmq picks its tile width for that many experts, not for every slot of the bank)
+    if (slots != nullptr && !slots_host) {
+        const ggml_tensor * s = slots;
+        while (s->view_src != nullptr) {
+            s = s->view_src;
+        }
+        if (s->op == GGML_OP_GET_ROWS && moe_cache->prompt_layer(s->src[0]) >= 0) {
+            ((int32_t *) res->op_params)[2] = (int32_t) w->ne[2];
+        }
+    }
 
     // device seed: the slots planned for the layer are filled from the experts this product reads (the device copy of the host experts),
     // in the split of the product, before that copy is reused
@@ -2690,7 +2701,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             const char * e = getenv("LLAMA_MOE_SINGLE_NOTE_PLAIN");
             return e == nullptr || atoi(e) != 0;
         }();
-        if (note_plain && slots != nullptr && hybrid_ok) {
+        // k15-np (LLAMA_MOE_SINGLE_NOTE_PLAIN_MAX_FRAC, default = LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE, 0.50; 2 = every cache): only a
+        // cache that skips its timing trials (less than that share of the host experts cached) notes the mailbox form early. There the
+        // prior is all the rule has (the win: G4 q3m 8 GB, 26% cached, +16-19% decode; q4x 12 GB, 39%, +9-19%). Above it the trials run
+        // anyway, and the early note only lowers the weighed split before they do: G4 q4x 16 GB + MTP (61% cached) and q3m 12 GB (55%)
+        // turned the host path on for the first windows' 7-12% misses (k15g4n), -5..-9% chat decode against NOTE_PLAIN=0; the gate
+        // gives NOTE_PLAIN=0's decode there (k15g4g: 316 vs 299, 336 vs 305 tok/s) and k15's where it wins, decisions and md5 included
+        static const double note_plain_max = [] {
+            const char * e = getenv("LLAMA_MOE_SINGLE_NOTE_PLAIN_MAX_FRAC");
+            return e != nullptr ? atof(e) : llama_moe_cache::trial_frac_single();
+        }();
+        const double note_frac = moe_cache ? moe_cache->cache_frac() : -1.0;
+        if (note_plain && slots != nullptr && hybrid_ok && note_frac >= 0.0 && note_frac < note_plain_max) {
             moe_cache->single_note_form(il, type_op == LLM_FFN_SILU && up_exps && gate_exps && !gate_up_exps && !up_exps_s_h && !gate_exps_s_h &&
                 !down_exps_s && !up_exps_b_h && !gate_exps_b_h && !gate_up_exps_b_h && !(il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f));
         }
@@ -3444,6 +3466,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 ggml_tensor * v_i = ggml_view_4d(ctx0, v, v->ne[0], n_kv_i, v->ne[2], v->ne[3], v->nb[1], v->nb[2], v->nb[3], 0);
                 ggml_tensor * m_i = ggml_view_4d(ctx0, kq_mask, n_kv_i, n_i, kq_mask->ne[2], kq_mask->ne[3],
                         kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], i*kq_mask->nb[1]);
+                // a group of rows over fewer cells than the mask holds is a strided view, and flash attention takes a contiguous
+                // mask only (the values are copied unchanged): G4 Qwen3.8-Flash-Next UD-IQ4_XS 24 GB, Studio argv (4 slots, unified
+                // KV), LLAMA_MTP_EXACT=1 aborted in GGML_ASSERT(ggml_is_contiguous(mask)) on a verify batch
+                // (k15-lfm2 hit the same assert on G4 LFM2.5 32 GB, the request after a 16k prompt)
+                if (!ggml_is_contiguous(m_i)) {
+                    m_i = ggml_cont(ctx0, m_i);
+                }
 
                 ggml_tensor * o_i = ggml_flash_attn_ext(ctx0, q_i, k_i, v_i, m_i, kq_scale, hparams.f_max_alibi_bias,
                                           hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);

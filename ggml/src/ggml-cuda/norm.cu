@@ -437,7 +437,7 @@ static void group_norm_f32_cuda(
 // order: float4 loads when do_vec, launched with the block size rms_norm_f32_dispatch picks); the q8_1 rows are produced
 // from the same f32 values exactly as quantize_q8_1 does (one value per lane, the same 32-lane reductions), so both
 // outputs are bit-identical to the unfused rms_norm + mul + quantize_q8_1 sequence.
-template <int block_size, int vpt, bool do_vec>
+template <int block_size, int vpt, bool do_vec, int batch = 1>
 static __global__ void rms_norm_mul_q8_1_f32(const float * x,
                                              float *       dst,
                                              void *        vq,
@@ -526,27 +526,43 @@ static __global__ void rms_norm_mul_q8_1_f32(const float * x,
             // one pass: element i0 is computed, stored and quantized by the same thread, and lane i0 % QK8_1 of its warp is
             // the q8_1 lane quantize_q8_1 uses for it (block_size % QK8_1 == 0), so no read-back is needed
             block_q8_1 * y = (block_q8_1 *) vq + irow*(ncols_padded/QK8_1);
-            for (int i0 = tid; i0 < ncols_padded; i0 += block_size) { // ncols_padded % WARP_SIZE == 0: whole warps
-                float xi = 0.0f;
-                if (i0 < ncols) {
-                    const int mul_col = fastmodulo(i0, mul_ncols_packed);
-                    xi       = scale * xc[i0] * mulc[mul_col];
-                    dstc[i0] = xi;
+            // k15-mm2: a batch of RMS_Q8_1_BATCH elements per thread has its loads issued before its math (GGML_CUDA_RMS_Q8_1_BATCH=0:
+            // one element at a time); every element is computed by the same expressions and lanes, so the outputs do not change
+            for (int i00 = tid; i00 < ncols_padded; i00 += batch*block_size) { // ncols_padded % WARP_SIZE == 0: whole warps
+                float xv[batch];
+                float mv[batch];
+#pragma unroll
+                for (int u = 0; u < batch; ++u) {
+                    const int i0 = i00 + u*block_size;
+                    xv[u] = i0 < ncols ? xc[i0] : 0.0f;
+                    mv[u] = i0 < ncols ? mulc[fastmodulo(i0, mul_ncols_packed)] : 0.0f;
                 }
-                float amax = fabsf(xi);
-                float sum  = xi;
+#pragma unroll
+                for (int u = 0; u < batch; ++u) {
+                    const int i0 = i00 + u*block_size;
+                    if (i0 >= ncols_padded) {
+                        break; // uniform per warp
+                    }
+                    float xi = 0.0f;
+                    if (i0 < ncols) {
+                        xi       = scale * xv[u] * mv[u];
+                        dstc[i0] = xi;
+                    }
+                    float amax = fabsf(xi);
+                    float sum  = xi;
 
-                amax = warp_reduce_max<QK8_1>(amax);
-                sum  = warp_reduce_sum<QK8_1>(sum);
+                    amax = warp_reduce_max<QK8_1>(amax);
+                    sum  = warp_reduce_sum<QK8_1>(sum);
 
-                const float  d = amax / 127.0f;
-                const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+                    const float  d = amax / 127.0f;
+                    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
 
-                const int64_t ib  = i0 / QK8_1;
-                const int     iqs = i0 % QK8_1;
-                y[ib].qs[iqs] = q;
-                if (iqs == 0) {
-                    y[ib].ds = make_half2(d, sum);
+                    const int64_t ib  = i0 / QK8_1;
+                    const int     iqs = i0 % QK8_1;
+                    y[ib].qs[iqs] = q;
+                    if (iqs == 0) {
+                        y[ib].ds = make_half2(d, sum);
+                    }
                 }
             }
 
@@ -1069,11 +1085,13 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
         bool vec = ne00 % 4 == 0 && ne00 > 0 && ((uintptr_t) dst_d & 15) == 0;
         vec = vec && ggml_cuda_is_aligned(rms_norm_src, 16) && mul_ncols == ne00 && ggml_cuda_is_aligned(mul_src, 16);
         const int64_t n4 = ne00 / 4;
+        static const bool rms_q8_1_batch = !getenv("GGML_CUDA_RMS_Q8_1_BATCH") || atoi(getenv("GGML_CUDA_RMS_Q8_1_BATCH")) != 0;
 #define RMS_NORM_Q8_1_LAUNCH(BLOCK_SIZE, VPT, VEC) \
         do { \
             const dim3 block_dims(BLOCK_SIZE, 1, 1); \
             const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32 * sizeof(float), stream}; \
-            ggml_cuda_kernel_launch(rms_norm_mul_q8_1_f32<BLOCK_SIZE, VPT, VEC>, launch_params, src0_d, dst_d, q8_1_out, (int) ne00, ncols_padded, \
+            const auto kernel = rms_q8_1_batch ? rms_norm_mul_q8_1_f32<BLOCK_SIZE, VPT, VEC, 4> : rms_norm_mul_q8_1_f32<BLOCK_SIZE, VPT, VEC, 1>; \
+            ggml_cuda_kernel_launch(kernel, launch_params, src0_d, dst_d, q8_1_out, (int) ne00, ncols_padded, \
                 (int) ne02, (int) ne03, s01, s02, s03, eps, mul_d, mul_s01, mul_s02, mul_s03, \
                 mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, ra_d, rb_d); \
         } while (0)

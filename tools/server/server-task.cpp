@@ -1723,32 +1723,37 @@ static void prompt_state_recycle(server_prompt_cache_state & st) {
 }
 
 // k11: a copy of the checkpoints into pooled buffers (a plain copy faults in every page of a fresh allocation)
+static common_prompt_checkpoint prompt_checkpoint_clone(const common_prompt_checkpoint & c) {
+    common_prompt_checkpoint d;
+    d.n_tokens = c.n_tokens;
+    d.id_task  = c.id_task;
+    d.pos_min  = c.pos_min;
+    d.pos_max  = c.pos_max;
+    common_state_buf_take(d.data_tgt, c.data_tgt.size());
+    d.data_tgt.resize(c.data_tgt.size());
+    if (!c.data_tgt.empty()) {
+        memcpy(d.data_tgt.data(), c.data_tgt.data(), c.data_tgt.size());
+    }
+    common_state_buf_take(d.data_dft, c.data_dft.size());
+    d.data_dft.resize(c.data_dft.size());
+    if (!c.data_dft.empty()) {
+        memcpy(d.data_dft.data(), c.data_dft.data(), c.data_dft.size());
+    }
+    d.data_spec = c.data_spec;
+    common_state_buf_prefault(c.data_tgt.size(), 2);
+    return d;
+}
+
 static std::list<common_prompt_checkpoint> prompt_checkpoints_clone(const std::list<common_prompt_checkpoint> & src) {
     std::list<common_prompt_checkpoint> dst;
     for (const auto & c : src) {
-        common_prompt_checkpoint d;
-        d.n_tokens = c.n_tokens;
-        d.id_task  = c.id_task;
-        d.pos_min  = c.pos_min;
-        d.pos_max  = c.pos_max;
-        common_state_buf_take(d.data_tgt, c.data_tgt.size());
-        d.data_tgt.resize(c.data_tgt.size());
-        if (!c.data_tgt.empty()) {
-            memcpy(d.data_tgt.data(), c.data_tgt.data(), c.data_tgt.size());
-        }
-        common_state_buf_take(d.data_dft, c.data_dft.size());
-        d.data_dft.resize(c.data_dft.size());
-        if (!c.data_dft.empty()) {
-            memcpy(d.data_dft.data(), c.data_dft.data(), c.data_dft.size());
-        }
-        d.data_spec = c.data_spec;
-        common_state_buf_prefault(c.data_tgt.size(), 2);
-        dst.push_back(std::move(d));
+        dst.push_back(prompt_checkpoint_clone(c));
     }
     return dst;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft,
+        std::list<common_prompt_checkpoint> * take_from, llama_pos keep_max) {
     wait_inflight(); // the previous save is complete before entries are compared, erased or evicted
 
     // first check if the current state is contained fully in the cache
@@ -1828,10 +1833,26 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
+    std::list<common_prompt_checkpoint> ckpts;
+    if (take_from != nullptr && take_from == &prompt.checkpoints) {
+        // in order: the ones the slot drops are moved, the rest copied
+        for (auto it = take_from->begin(); it != take_from->end();) {
+            auto next = std::next(it);
+            if (it->pos_max > keep_max) {
+                ckpts.splice(ckpts.end(), *take_from, it);
+            } else {
+                ckpts.push_back(prompt_checkpoint_clone(*it));
+            }
+            it = next;
+        }
+    } else {
+        ckpts = prompt_checkpoints_clone(prompt.checkpoints);
+    }
+
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt_checkpoints_clone(prompt.checkpoints),
+            /*.checkpoints =*/ std::move(ckpts),
             /*.kv_shifted  =*/ prompt.kv_shifted,
         },
         /*.data   =*/ {
