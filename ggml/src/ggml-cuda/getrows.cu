@@ -614,6 +614,87 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
 }
 
+static __global__ void k_rs_zero_get_rows(const float * __restrict__ src0, const int32_t * __restrict__ idx, float * __restrict__ dst,
+        float * states_zero, const int64_t ne00, const int64_t ne10, const int64_t s01, const int64_t s10, const int64_t s1,
+        const int32_t zero_row, const float scale, const float bias) {
+    ggml_cuda_pdl_lc();
+    const int64_t j = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t r = blockIdx.y;
+    if (j >= ne00) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+    if (r == ne10) {
+        // the in-place clear (scale_f32)
+        states_zero[j] = scale * states_zero[j] + bias;
+        return;
+    }
+    const int32_t row = idx[r*s10];
+    const float   x   = src0[row*s01 + j];
+    dst[r*s1 + j] = row == zero_row ? scale * x + bias : x;
+}
+
+bool ggml_cuda_rs_zero_get_rows_ok(const ggml_tensor * scale, const ggml_tensor * gr) {
+    static const bool off = [] {
+        const char * e = getenv("GGML_CUDA_RS_ZERO_FUSE");
+        return e != nullptr && atoi(e) == 0;
+    }();
+    if (off || scale->op != GGML_OP_SCALE || gr->op != GGML_OP_GET_ROWS) {
+        return false;
+    }
+    const ggml_tensor * src0 = gr->src[0];
+    const ggml_tensor * src1 = gr->src[1];
+    float s, b;
+    memcpy(&s, (const float *) scale->op_params + 0, sizeof(float));
+    memcpy(&b, (const float *) scale->op_params + 1, sizeof(float));
+    uint32_t sb, bb;
+    memcpy(&sb, &s, 4);
+    memcpy(&bb, &b, 4);
+    if (sb != 0 || bb != 0) {
+        return false; // only a clear: x*0 + 0 is the same for x and for its result
+    }
+    if (scale->type != GGML_TYPE_F32 || scale->src[0] == nullptr || scale->src[0]->type != GGML_TYPE_F32 || scale->data != scale->src[0]->data ||
+            !ggml_is_contiguous(scale) || src0->type != GGML_TYPE_F32 || gr->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_I32) {
+        return false;
+    }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            src0->nb[0] != sizeof(float) || src1->nb[0] != sizeof(int32_t) || gr->nb[0] != sizeof(float) ||
+            src0->ne[1] > INT32_MAX || src1->ne[0] >= 65535 || src1->ne[0] < 1) {
+        return false;
+    }
+    // the cleared region is exactly one row of the gathered states
+    const char * base = (const char *) src0->data;
+    const char * z    = (const char *) scale->data;
+    if (ggml_nelements(scale) != src0->ne[0] || z < base || z >= base + src0->ne[1]*src0->nb[1] || (z - base) % src0->nb[1] != 0) {
+        return false;
+    }
+    // the gather writes no byte the clear or the gather read
+    const char * d0 = (const char *) gr->data;
+    const char * d1 = d0 + ggml_nbytes(gr);
+    if (d0 < base + ggml_nbytes(src0) && base < d1) {
+        return false;
+    }
+    const char * i0 = (const char *) src1->data;
+    return !(d0 < i0 + ggml_nbytes(src1) && i0 < d1);
+}
+
+void ggml_cuda_op_rs_zero_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * scale, ggml_tensor * gr) {
+    const ggml_tensor * src0 = gr->src[0];
+    const ggml_tensor * src1 = gr->src[1];
+    float s, b;
+    memcpy(&s, (const float *) scale->op_params + 0, sizeof(float));
+    memcpy(&b, (const float *) scale->op_params + 1, sizeof(float));
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne10 = src1->ne[0];
+    const int32_t zero_row = (int32_t) (((const char *) scale->data - (const char *) src0->data) / src0->nb[1]);
+    const dim3 block_nums((unsigned) ((ne00 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE), (unsigned) (ne10 + 1), 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, CUDA_GET_ROWS_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(k_rs_zero_get_rows, launch_params,
+        (const float *) src0->data, (const int32_t *) src1->data, (float *) gr->data, (float *) scale->data,
+        ne00, ne10, (int64_t) (src0->nb[1]/sizeof(float)), (int64_t) (src1->nb[0]/sizeof(int32_t)), (int64_t) (gr->nb[1]/sizeof(float)),
+        zero_row, s, b);
+}
+
 void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0]; // gradients of forward pass output
     const ggml_tensor * src1 = dst->src[1]; // src1 in forward pass

@@ -6674,6 +6674,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // k15-hostcut: the recurrent state clear and the gather after it (build_rs at a new sequence), see getrows.cuh
+    if (node->op == GGML_OP_SCALE && cuda_ctx->stream_context().concurrent_events.empty()) {
+        int j = i + 1;
+        while (j < cgraph->n_nodes && (ggml_cuda_is_view_or_noop(cgraph->nodes[j]) || (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)) {
+            ++j;
+        }
+        if (j < cgraph->n_nodes && ggml_cuda_rs_zero_get_rows_ok(node, cgraph->nodes[j]) &&
+                (cuda_ctx->qsa_skip.empty() || !cuda_ctx->qsa_skip.count(cgraph->nodes[j])) &&
+                (cuda_ctx->mmvq_done_early.empty() || !cuda_ctx->mmvq_done_early.count(cgraph->nodes[j]))) {
+            ggml_cuda_op_rs_zero_get_rows(*cuda_ctx, node, cgraph->nodes[j]);
+            return j - i;
+        }
+    }
+
     return 0;
 }
 
