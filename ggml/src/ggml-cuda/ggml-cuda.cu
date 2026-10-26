@@ -5124,7 +5124,7 @@ static bool ggml_cuda_mmvq_multi_candidate(const ggml_tensor * node) {
     const ggml_tensor * src1 = node->src[1];
     return ggml_is_quantized(src0->type) && src0->op == GGML_OP_NONE && src0->view_src == nullptr && ggml_is_contiguous(src0) &&
         ggml_is_matrix(src0) && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && src1->ne[2] == 1 && src1->ne[3] == 1 &&
-        ggml_is_contiguous(node);
+        src1->ne[1] >= 1 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE && !ggml_is_empty(node) && ggml_is_contiguous(node);
 }
 
 // a and b can share one multi-matrix launch
@@ -6246,7 +6246,8 @@ static bool ggml_cuda_mmvf_multi_candidate(const ggml_tensor * node) {
     const ggml_tensor * src1 = node->src[1];
     return (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16) && src0->op == GGML_OP_NONE && src0->view_src == nullptr &&
         ggml_is_contiguous(src0) && ggml_is_matrix(src0) && src0->ne[0] < 4096 && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) &&
-        src1->ne[2] == 1 && src1->ne[3] == 1 && src1->ne[1] <= 4 && ggml_is_contiguous(node) && !ggml_cuda_side_mv_run(node);
+        src1->ne[2] == 1 && src1->ne[3] == 1 && src1->ne[1] >= 1 && src1->ne[1] <= 4 && !ggml_is_empty(node) && ggml_is_contiguous(node) &&
+        !ggml_cuda_side_mv_run(node);
 }
 
 // node goes to ggml_cuda_mul_mat_vec_f in ggml_cuda_mul_mat (same dispatch, see there)
@@ -7971,11 +7972,18 @@ static bool ggml_cuda_side_mv_candidate(const ggml_tensor * node) {
 // column only, as before), so a verify's hyper-connection inject and shared expert gate run beside the products after them instead
 // of before them. Wider weights (alpha / beta) keep their multi-matrix launch at several columns. Same kernels, same values.
 static bool ggml_cuda_side_mv_run(const ggml_tensor * node) {
-    static const int max_cols = getenv("GGML_CUDA_SIDE_MV_COLS") ? std::max(1, atoi(getenv("GGML_CUDA_SIDE_MV_COLS"))) : 4;
+    static const int max_cols = getenv("GGML_CUDA_SIDE_MV_COLS") ?
+        std::min(MMVF_MAX_BATCH_SIZE, std::max(1, atoi(getenv("GGML_CUDA_SIDE_MV_COLS")))) : 4;
     if (!ggml_cuda_side_mv_candidate(node)) {
         return false;
     }
     const int64_t ncols = node->src[1]->ne[1];
+    // an empty product (0 columns: e.g. the last layer of a prompt ubatch without outputs) is skipped by the evaluation loop, it must not
+    // be moved to the side stream, which computes the node before that check (mmvf has no 0 column kernel: mmvf.cu ncols_dst abort).
+    // The column bound keeps the side stream on the products a single mat-vec launch computes (MMVF / MMVQ_MAX_BATCH_SIZE)
+    if (ncols < 1 || ggml_is_empty(node)) {
+        return false;
+    }
     // at several columns only long-K ones (the hc inject, K = 10240): a short-K tiny product (the shared expert gate, K = 2560) joins
     // the multi-matrix launch of its neighbour instead (the router: one launch fewer), GGML_CUDA_SIDE_MV_COLS_MIN_K (default 4096)
     static const int64_t min_k = getenv("GGML_CUDA_SIDE_MV_COLS_MIN_K") ? atoll(getenv("GGML_CUDA_SIDE_MV_COLS_MIN_K")) : 4096;
@@ -8279,7 +8287,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 if (!side_mv_at.empty()) {
                     const auto it = side_mv_at.find(i);
-                    if (it != side_mv_at.end()) {
+                    if (it != side_mv_at.end() && !ggml_cuda_is_view_or_noop(node) && (node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
                         if (side_mv_n_events == cuda_ctx->side_mv_join.size()) {
                             cudaEvent_t ev;
                             CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
