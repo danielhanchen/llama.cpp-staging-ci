@@ -8447,9 +8447,10 @@ struct test_hc_mix : public test_case {
     const int64_t lr;  // K of the up product
     const int pattern;
     const bool exact;
+    const int64_t d;   // K of the down product, rows of the up product
 
     std::string vars() override {
-        return VARS_TO_STR5(type, m, lr, pattern, exact);
+        return VARS_TO_STR6(type, m, lr, pattern, exact, d);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -8459,11 +8460,10 @@ struct test_hc_mix : public test_case {
 
     bool run_whole_graph() override { return true; }
 
-    test_hc_mix(ggml_type type, int64_t m, int64_t lr, int pattern, bool exact)
-        : type(type), m(m), lr(lr), pattern(pattern), exact(exact) {}
+    test_hc_mix(ggml_type type, int64_t m, int64_t lr, int pattern, bool exact, int64_t d = 1024)
+        : type(type), m(m), lr(lr), pattern(pattern), exact(exact), d(d) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        const int64_t d = 1024;
         ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, m);
         ggml_tensor * wd = ggml_new_tensor_2d(ctx, type, d, lr);
         ggml_tensor * wu = ggml_new_tensor_2d(ctx, type, lr, d);
@@ -13249,6 +13249,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (auto mk : std::vector<std::array<int64_t, 2>>{ { 4, 10240 }, { 48, 2560 }, { 512, 2560 }, { 1, 2560 } }) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
         }
+        // k15-mm2: hc down -> silu(scale) -> up (+ sigmoid) at the Flash-Next shape (GGML_CUDA_MMVQ_EW=0: the unfused launches)
+        test_cases.emplace_back(new test_hc_mix(GGML_TYPE_Q8_0, n, 320, 0, false, 10240));
         // k15-mm2: the router and indexer shapes as BF16 (the F32 router weights are exactly BF16-representable; indexer q / k)
         for (auto mk : std::vector<std::array<int64_t, 2>>{ { 512, 2560 }, { 128, 2560 } }) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
