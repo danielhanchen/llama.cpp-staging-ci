@@ -4422,9 +4422,15 @@ static std::mutex                    g_ckpt_pool_mutex;
 static std::vector<common_state_buf> g_ckpt_pool;
 
 // k11: the pool keeps at most this many bytes (LLAMA_STATE_POOL_MIB, default 1024) and 8 buffers
+// largest buffer asked of the pool so far (the lock is held by the callers that write it)
+static size_t g_ckpt_pool_req_max = 0;
+
+// ... and at most twice the largest request (one state being saved, one ready for the next save): a pool kept at its byte cap held up to
+// 1 GiB idle at the end of a run, 6-7x the state of LFM2.5 (LLAMA_STATE_POOL_REL=0: the byte cap alone)
 static size_t ckpt_pool_limit() {
     static const size_t lim = (size_t) (getenv("LLAMA_STATE_POOL_MIB") ? std::max(0, atoi(getenv("LLAMA_STATE_POOL_MIB"))) : 1024) << 20;
-    return lim;
+    static const bool rel = getenv("LLAMA_STATE_POOL_REL") == nullptr || atoi(getenv("LLAMA_STATE_POOL_REL")) != 0;
+    return rel ? std::min(lim, 2*g_ckpt_pool_req_max + (g_ckpt_pool_req_max/8)) : lim;
 }
 
 // keep the pool within its limits: drop the smallest buffers first (the lock is held by the caller)
@@ -4529,6 +4535,7 @@ struct state_prefault_worker {
         while (true) {
             {
                 std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
+                g_ckpt_pool_req_max = std::max(g_ckpt_pool_req_max, n);
                 int    have  = 0;
                 size_t total = 0;
                 for (const auto & b : g_ckpt_pool) {
@@ -4574,11 +4581,19 @@ void common_state_buf_prefault(size_t n, int count) {
     }
 }
 
+size_t common_state_buf_pool_bytes() {
+    std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
+    size_t t = 0;
+    for (const auto & b : g_ckpt_pool) { t += b.capacity(); }
+    return t;
+}
+
 bool common_state_buf_take(common_state_buf & buf, size_t n) {
     if (!ckpt_pool_on() || buf.capacity() >= n) {
         return false;
     }
     std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
+    g_ckpt_pool_req_max = std::max(g_ckpt_pool_req_max, n);
     // the smallest that fits
     auto best = g_ckpt_pool.end();
     for (auto it = g_ckpt_pool.begin(); it != g_ckpt_pool.end(); ++it) {
@@ -4586,7 +4601,11 @@ bool common_state_buf_take(common_state_buf & buf, size_t n) {
             best = it;
         }
     }
-    if (best == g_ckpt_pool.end()) {
+    // a buffer more than twice the request is left in the pool: a small checkpoint that took a state buffer kept all of it resident for as
+    // long as the checkpoint lived (its capacity is not in the prompt cache's size), e.g. 2.8 MiB of checkpoints held 149 MiB on LFM2.5
+    // (LLAMA_STATE_POOL_FIT=0: any buffer that fits)
+    static const bool fit = getenv("LLAMA_STATE_POOL_FIT") == nullptr || atoi(getenv("LLAMA_STATE_POOL_FIT")) != 0;
+    if (best == g_ckpt_pool.end() || (fit && best->capacity() / 2 > n)) {
         return false;
     }
     buf = std::move(*best);

@@ -1,4 +1,6 @@
 #include "server-task.h"
+
+#include <thread>
 #include "server-prompt-ssd.h"
 
 #include "build-info.h"
@@ -1835,15 +1837,31 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     std::list<common_prompt_checkpoint> ckpts;
     if (take_from != nullptr && take_from == &prompt.checkpoints) {
+        // a moved checkpoint takes no pooled buffer, where its copy would have: the buffer the copy would have taken leaves the pool all
+        // the same (freed off this thread), so the pool, and the host RSS, end where the copies leave them (without it, end-of-run RSS
+        // was +150..+1300 MiB; LLAMA_PCS_MOVE_POOL_DROP=0: kept in the pool)
+        static const bool pool_drop = getenv("LLAMA_PCS_MOVE_POOL_DROP") == nullptr || atoi(getenv("LLAMA_PCS_MOVE_POOL_DROP")) != 0;
+        std::vector<common_state_buf> drop;
         // in order: the ones the slot drops are moved, the rest copied
         for (auto it = take_from->begin(); it != take_from->end();) {
             auto next = std::next(it);
             if (it->pos_max > keep_max) {
+                if (pool_drop) {
+                    for (size_t n : { it->data_tgt.size(), it->data_dft.size() }) {
+                        common_state_buf b;
+                        if (n > 0 && common_state_buf_take(b, n)) {
+                            drop.push_back(std::move(b));
+                        }
+                    }
+                }
                 ckpts.splice(ckpts.end(), *take_from, it);
             } else {
                 ckpts.push_back(prompt_checkpoint_clone(*it));
             }
             it = next;
+        }
+        if (!drop.empty()) {
+            std::thread([drop = std::move(drop)]() mutable { drop.clear(); }).detach();
         }
     } else {
         ckpts = prompt_checkpoints_clone(prompt.checkpoints);
@@ -2028,6 +2046,15 @@ void server_prompt_cache::update() {
         }
     }
 
+    if (getenv("LLAMA_PCS_MEM_LOG") != nullptr) { // debug: bytes held (capacity) against the bytes accounted (size)
+        size_t sz = 0, cap = 0, csz = 0, ccap = 0;
+        for (const auto & st : states) {
+            sz += st.data.main.size() + st.data.drft.size(); cap += st.data.main.capacity() + st.data.drft.capacity();
+            for (const auto & c : st.prompt.checkpoints) { csz += c.data_tgt.size() + c.data_dft.size(); ccap += c.data_tgt.capacity() + c.data_dft.capacity(); }
+        }
+        SRV_INF("pcs mem: %zu entries, state %.1f / %.1f MiB, ckpt %.1f / %.1f MiB (size / capacity), pool %.1f MiB\n", states.size(),
+            sz/1048576.0, cap/1048576.0, csz/1048576.0, ccap/1048576.0, common_state_buf_pool_bytes()/1048576.0);
+    }
     SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
             states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
