@@ -412,6 +412,9 @@ struct server_slot {
     json json_schema;
 
     common_sampler_ptr smpl;
+    // k15-fn: the device greedy chain of this slot (set in the context while greedy requests run, see launch_slot_with_task)
+    llama_sampler_ptr smpl_dev;
+    bool smpl_dev_set = false;
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
@@ -463,7 +466,12 @@ struct server_slot {
 
         n_predict_max = -1;
 
-        llama_set_sampler(ctx_tgt, id, nullptr);
+        // the device greedy chain lives with the slot and stays set for the next greedy request (setting a sampler reserves the graphs)
+        if (!smpl_dev_set) {
+            llama_set_sampler(ctx_tgt, id, nullptr);
+        } else {
+            llama_set_sampler_raw_logits(ctx_tgt, id, true);
+        }
 
         // clear alora start
         alora_invocation_start = -1;
@@ -1009,6 +1017,7 @@ public:
     //  - when not in sleeping state
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
     llama_model * model_tgt = nullptr;
+    bool device_greedy_ok = false; // k15-fn: greedy requests sample on the device (see launch_slot_with_task)
 
     mtmd_context * mctx = nullptr;
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
@@ -1334,6 +1343,18 @@ private:
             return false;
         }
 
+        {
+            const char * e = getenv("LLAMA_SERVER_DEVICE_GREEDY");
+            device_greedy_ok = (e == nullptr || atoi(e) != 0) && llama_model_n_devices(model_tgt) > 0;
+            for (int i = 0; device_greedy_ok && i < llama_model_n_devices(model_tgt); ++i) {
+                ggml_backend_dev_t dev = llama_model_get_device(model_tgt, i);
+                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                const char * rn = reg ? ggml_backend_reg_name(reg) : "";
+                device_greedy_ok = dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                    (strcmp(rn, "CUDA") == 0 || strcmp(rn, "ROCm") == 0);
+            }
+        }
+
         vocab = llama_model_get_vocab(model_tgt);
 
         try {
@@ -1639,6 +1660,28 @@ private:
             };
 
             slot.reset();
+        }
+
+        // k15-fn: every slot gets its device greedy chain once (setting a sampler reserves the graphs again): greedy requests take its
+        // token and copy no logits, the others copy the raw logits as before (llama_set_sampler_raw_logits)
+        if (device_greedy_ok) {
+            bool all = true;
+            for (auto & slot : slots) {
+                slot.smpl_dev.reset(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+                llama_sampler_chain_add(slot.smpl_dev.get(), llama_sampler_init_greedy());
+                slot.smpl_dev_set = llama_set_sampler(ctx_tgt, slot.id, slot.smpl_dev.get());
+                llama_set_sampler_raw_logits(ctx_tgt, slot.id, true);
+                all = all && slot.smpl_dev_set;
+            }
+            if (!all) {
+                for (auto & slot : slots) {
+                    llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                    slot.smpl_dev_set = false;
+                }
+                device_greedy_ok = false;
+            }
+            llama_sched_reserve_now(ctx_tgt);
+            SRV_INF("greedy requests are sampled on the device: %s (LLAMA_SERVER_DEVICE_GREEDY=0 to disable)\n", all ? "on" : "off");
         }
 
         {
@@ -2152,9 +2195,25 @@ private:
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
 
+            // k15-fn: a greedy request (the argmax of the raw logits, common_sampler_device_greedy) takes the token of the slot's device greedy
+            // chain when every device of the model is a CUDA / ROCm GPU (its argmax returns the lowest id on a tie, as the host greedy path),
+            // so the logits of the sampled rows (every verify row of speculative decoding) are not copied to the host: G4 Qwen3.8-Flash-Next
+            // + MTP copied 1.08 MiB per token. Other requests copy the raw logits and sample on the host. LLAMA_SERVER_DEVICE_GREEDY=0 off
+            const bool dev_greedy = !use_backend_sampling && !need_pre_sample_logits && slot.smpl_dev_set &&
+                common_sampler_device_greedy(slot.smpl.get());
+            common_sampler_set_device_token(slot.smpl.get(), dev_greedy);
+
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
+                slot.smpl_dev_set = false;
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+            } else if (slot.smpl_dev_set) {
+                llama_set_sampler_raw_logits(ctx_tgt, slot.id, !dev_greedy);
+            } else if (device_greedy_ok && slot.smpl_dev) {
+                // back from a backend sampling request
+                slot.smpl_dev_set = llama_set_sampler(ctx_tgt, slot.id, slot.smpl_dev.get());
+                llama_set_sampler_raw_logits(ctx_tgt, slot.id, !dev_greedy || !slot.smpl_dev_set);
+                common_sampler_set_device_token(slot.smpl.get(), dev_greedy && slot.smpl_dev_set);
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
             }

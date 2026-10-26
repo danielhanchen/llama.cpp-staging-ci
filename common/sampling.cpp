@@ -135,6 +135,12 @@ struct common_sampler {
     bool pen_fast = false;                                  // k15: the fast path applies the repetition penalties (common_sampler_penalty_fast)
     std::vector<std::pair<llama_token, int>> pen_cnt;       // scratch: the window's tokens and their counts
     std::vector<std::pair<llama_token, float>> sp;          // scratch: biased and penalized tokens with their bias, ascending ids
+    bool dev_token = false;                                 // k15-fn: take the token of a device greedy sampler (common_sampler_set_device_token)
+
+    // the token a backend sampler picked for row idx, if this sampler takes it (backend sampling, or the device greedy chain of the server)
+    llama_token sampled_token(struct llama_context * ctx, int idx) const {
+        return params.backend_sampling || dev_token ? llama_get_sampled_token_ith(ctx, idx) : LLAMA_TOKEN_NULL;
+    }
 
     void reset() {
         prev.clear();
@@ -547,6 +553,7 @@ struct common_sampler * common_sampler_init(
         /* .pen_fast    = */ false,
         /* .pen_cnt     = */ {},
         /* .sp          = */ {},
+        /* .dev_token   = */ false,
     };
 
     result->greedy_fast = common_sampler_greedy_fast(params, grmr, rbudget);
@@ -656,6 +663,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .pen_fast    = */ gsmpl->pen_fast,
         /* .pen_cnt     = */ {},
         /* .sp          = */ {},
+        /* .dev_token   = */ gsmpl->dev_token,
     };
 }
 
@@ -682,6 +690,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->bias_dense  = src->bias_dense;
     dst->bias_sparse = src->bias_sparse;
     dst->pen_fast    = src->pen_fast;
+    dst->dev_token   = src->dev_token;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -738,6 +747,19 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+void common_sampler_set_device_token(struct common_sampler * gsmpl, bool on) {
+    if (gsmpl != nullptr) {
+        gsmpl->dev_token = on;
+    }
+}
+
+bool common_sampler_device_greedy(const struct common_sampler * gsmpl) {
+    // k15-fn: the sampled token is the argmax of the raw logits (no bias, no active penalties): a device argmax that returns the lowest id
+    // on a tie gives the same token without copying the logits
+    const bool ok = gsmpl != nullptr && gsmpl->greedy_fast && !gsmpl->pen_fast && gsmpl->bias_dense.empty() && gsmpl->bias_sparse.empty();
+    return ok;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -751,8 +773,19 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
+    // k15-fn: a device greedy sampler (common_sampler_device_greedy, set by the server) picked the token and no logits were copied
+    if (gsmpl->dev_token && gsmpl->greedy_fast && llama_get_sampled_probs_ith(ctx, idx) == nullptr && llama_get_sampled_logits_ith(ctx, idx) == nullptr) {
+        const llama_token tok = gsmpl->sampled_token(ctx, idx);
+        if (tok != LLAMA_TOKEN_NULL) {
+            gsmpl->cur.resize(1);
+            gsmpl->cur[0] = llama_token_data{tok, 0.0f, 1.0f};
+            cur_p = { gsmpl->cur.data(), 1, 0, false };
+            return tok;
+        }
+    }
+
     // greedy chain on the full logits (no backend sampler output): the argmax of the biased logits, the lowest id on a tie
-    if (gsmpl->greedy_fast && llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL && llama_get_sampled_probs_ith(ctx, idx) == nullptr &&
+    if (gsmpl->greedy_fast && gsmpl->sampled_token(ctx, idx) == LLAMA_TOKEN_NULL && llama_get_sampled_probs_ith(ctx, idx) == nullptr &&
             llama_get_sampled_logits_ith(ctx, idx) == nullptr) {
         const float * logits  = llama_get_logits_ith(ctx, idx);
         GGML_ASSERT(logits != nullptr);
@@ -884,7 +917,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
     {
-        id = llama_get_sampled_token_ith(ctx, idx);
+        id = gsmpl->sampled_token(ctx, idx);
 
         if (id != LLAMA_TOKEN_NULL) {
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);

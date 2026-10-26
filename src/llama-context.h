@@ -17,6 +17,7 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <unordered_set>
 #include <unordered_map>
 #include <thread>
@@ -370,6 +371,7 @@ public:
     bool sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const std::vector<size_t> & staging_pp);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+    void set_sampler_raw_logits(llama_seq_id seq_id, bool raw);
 
 private:
     llm_graph_result * get_gf_res_prev();
@@ -490,6 +492,9 @@ private:
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
+        // k15-fn: sequences whose raw logits are still copied although a sampler is set (llama_set_sampler_raw_logits): the sampler
+        // stays in the graph (no new reserve) while a request that needs the host sampler runs
+        std::set<llama_seq_id> raw;
 
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};

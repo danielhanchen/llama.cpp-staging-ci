@@ -55,6 +55,11 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
 // get the underlying llama_sampler_chain
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 
+// k15-fn: the chain picks the argmax of the raw logits (greedy, no logit bias, no active penalties, no probabilities requested)
+bool common_sampler_device_greedy(const struct common_sampler * gsmpl);
+// k15-fn: the sampler takes the token a device greedy chain picked for the row (the server sets it for device greedy requests)
+void common_sampler_set_device_token(struct common_sampler * gsmpl, bool on);
+
 // extended sampling implementation:
 //
 // - set logits

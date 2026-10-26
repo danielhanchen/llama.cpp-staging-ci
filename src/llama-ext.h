@@ -92,6 +92,12 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
+// k15-fn: with a sampler set for seq_id (llama_set_sampler), raw = true still copies the raw logits of its rows to the host (the host
+// sampler of a request that the device sampler cannot serve), raw = false copies only what the sampler outputs. No new graph reserve
+LLAMA_API void llama_set_sampler_raw_logits(struct llama_context * ctx, llama_seq_id seq_id, bool raw);
+// k15-fn: reserve the graphs now if a change (e.g. llama_set_sampler) asked for it, instead of at the next decode
+LLAMA_API void llama_sched_reserve_now(struct llama_context * ctx);
+
 // the backend buffers that a state write of this memory would touch - empty caches report none
 LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
 

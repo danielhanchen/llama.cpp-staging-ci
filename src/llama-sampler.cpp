@@ -1093,6 +1093,14 @@ static void llama_sampler_greedy_backend_apply(
     }
 
     data->sampled = curl;
+
+    // k15-fn: greedy over the raw logits of the row (nothing before it in the chain made candidates or probabilities): the token is the
+    // whole result, the row's logits are not an output (they were copied to the host for every sampled row, 0.95 MiB each with a
+    // 248320-token vocab). LLAMA_SAMPLER_GREEDY_KEEP_LOGITS=1 keeps them
+    static const bool keep = getenv("LLAMA_SAMPLER_GREEDY_KEEP_LOGITS") != nullptr && atoi(getenv("LLAMA_SAMPLER_GREEDY_KEEP_LOGITS")) != 0;
+    if (!keep && data->candidates == nullptr && data->probs == nullptr) {
+        data->logits = nullptr;
+    }
 }
 
 static struct llama_sampler_i llama_sampler_greedy_i = {
