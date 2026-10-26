@@ -2360,6 +2360,10 @@ bool llama_context::mtp_dev_h_store(ggml_backend_t backend_h, ggml_tensor * t_h_
         if (st) {
             st->usable = false;
             LLAMA_LOG_WARN("%s: MTP handoff back on the host: this graph's h_nextn cannot be written to the device sink\n", __func__);
+            // the host rows were sized for a device-sink decode (none): this decode copies all of its rows to the host from here on
+            if (!cparams.embeddings_nextn_masked && buf_nextn) {
+                GGML_ASSERT(nextn_store_ensure((size_t) nextn_decode_rows));
+            }
             // the rows of this decode already on the device come back to the host buffer
             for (const auto & r : mtp_dev_h_runs) {
                 ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
@@ -2981,6 +2985,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     n_queued_tokens += n_tokens;
 
     // reserve output buffer
+    nextn_need_rows = n_tokens; // k15-pp: encode copies every row (see nextn_store_ensure)
     if (output_reserve(n_tokens) < n_tokens) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %u outputs\n", __func__, n_tokens);
         return -2;
@@ -3489,6 +3494,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
 
     // reserve output buffer
+    // k15-pp: the next-n rows this decode copies to the host (none where they go to the device sink, see mtp_dev_h_decode_begin)
+    nextn_decode_rows = (int64_t) balloc->get_batch().n_tokens;
+    nextn_need_rows   = mtp_dev_h_this ? 0 : nextn_decode_rows;
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
@@ -3732,8 +3740,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 const uint32_t n_embd  = hparams.n_embd_out();
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
-                GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 if (!(mtp_dev_h_this && mtp_dev_h_store(backend_h, t_h_nextn, ubatch, offset))) {
+                    GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                     ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
                 }
                 extract_all_idxs = extract_all_idxs || !masked;
@@ -4753,8 +4761,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                     ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                     GGML_ASSERT(backend_h != nullptr);
                     const uint32_t n_embd  = hparams.n_embd_out();
-                    GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                     if (!(mtp_dev_h_this && mtp_dev_h_store(backend_h, t_h_nextn, ubatch, offset))) {
+                        GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data + offset*n_embd, 0, n_rows*n_embd*sizeof(float));
                     }
                     extract_all_idxs = !masked;
@@ -5392,6 +5400,39 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
 // output
 //
 
+bool llama_context::nextn_store_ensure(size_t rows) {
+    const int64_t n_embd_out = model.hparams.n_embd_out();
+    rows = std::min<size_t>(rows, cparams.n_batch);
+    if (!buf_nextn || nextn_cap_rows < rows) {
+        static const bool log_env = getenv("LLAMA_OUTPUT_RESERVE_LOG") != nullptr && atoi(getenv("LLAMA_OUTPUT_RESERVE_LOG")) != 0;
+        if (log_env) {
+            LLAMA_LOG_INFO("%s: ctx %p: next-n rows %zu -> %zu (%.2f MiB)\n", __func__, (void *) this, nextn_cap_rows, rows,
+                rows*n_embd_out*sizeof(float)/1048576.0);
+        }
+        if (buf_nextn) {
+            synchronize();
+        }
+        buf_nextn = nullptr;
+        auto * buft = ggml_backend_cpu_buffer_type();
+        auto * output_dev = model.dev_output();
+        auto * hb = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
+        if (hb) {
+            buft = hb;
+        }
+        buf_nextn.reset(ggml_backend_buft_alloc_buffer(buft, std::max<size_t>(1, rows)*n_embd_out*sizeof(float)));
+        if (!buf_nextn) {
+            LLAMA_LOG_ERROR("%s: failed to allocate %zu next-n rows\n", __func__, rows);
+            nextn_cap_rows = 0;
+            embd_nextn = buffer_view<float>{nullptr, 0};
+            return false;
+        }
+        ggml_backend_buffer_clear(buf_nextn.get(), 0);
+        nextn_cap_rows = rows;
+    }
+    embd_nextn = buffer_view<float>{(float *) ggml_backend_buffer_get_base(buf_nextn.get()), nextn_cap_rows*n_embd_out};
+    return true;
+}
+
 uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
@@ -5421,10 +5462,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
     embd_nextn.size = has_embd_nextn ? n_embd_out*n_outputs_max  : 0;
 
+    static const bool nextn_lazy = getenv("LLAMA_NEXTN_LAZY") == nullptr || atoi(getenv("LLAMA_NEXTN_LAZY")) != 0;
+    const bool nextn_sep = has_embd_nextn && !cparams.embeddings_nextn_masked && nextn_lazy;
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
         // unmasked: nextn row exists for every token in the batch, not just
         // those flagged via batch.logits[i] -> size by token count instead.
-        embd_nextn.size = (size_t) n_embd_out * n_batch;
+        // (k15-pp: in buf_nextn, see nextn_store_ensure, unless LLAMA_NEXTN_LAZY=0)
+        embd_nextn.size = nextn_sep ? 0 : (size_t) n_embd_out * n_batch;
     }
 
     for (bool enabled : cparams.embeddings_layer_inp) {
@@ -5505,6 +5549,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     embd_nextn = has_embd_nextn ? buffer_view<float>{(float *) (base + offset), embd_nextn.size} : buffer_view<float>{nullptr, 0};
     offset += embd_nextn.size * sizeof(float);
+    if (nextn_sep) {
+        // at least 64 rows (decode, verify), else what this decode copies to the host; never shrinks
+        if (!nextn_store_ensure((size_t) std::max<int64_t>({ nextn_need_rows, n_outputs_max, (int64_t) 64 }))) {
+            return 0;
+        }
+    }
 
     for (uint32_t il = 0; il < embd_layer_inp.size(); ++il) {
         if (cparams.embeddings_layer_inp[il]) {

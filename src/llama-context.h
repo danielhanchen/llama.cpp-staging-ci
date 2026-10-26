@@ -828,6 +828,13 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+    // k15-pp: unmasked next-n rows (MTP) in their own host buffer, sized by the batches that copy them to the host instead of n_batch
+    // (a batch whose rows go to the device sink, LLAMA_MTP_DEV_H, needs none); LLAMA_NEXTN_LAZY=0: in the output buffer at n_batch
+    ggml_backend_buffer_ptr buf_nextn;
+    size_t  nextn_cap_rows  = 0;
+    int64_t nextn_need_rows = 0;   // rows the current decode copies to the host (set before output_reserve)
+    int64_t nextn_decode_rows = 0; // tokens of the current decode (a device-sink batch that falls back to the host needs them all)
+    bool nextn_store_ensure(size_t rows);
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
