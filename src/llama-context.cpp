@@ -1201,7 +1201,11 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
             // pinned + strict exact, depth 4 gave other text than depth 2 and no draft (chat a3c3e816 vs 19b8fd68, twice each), while a
             // dropped -md drafter at depth 4 kept it (not found why yet)
             const bool mtp_heads = getenv("LLAMA_SPEC_MTP_HEADS") != nullptr && atoi(getenv("LLAMA_SPEC_MTP_HEADS")) != 0;
-            const bool spec_deep = spec_env && dropped_depth > 0 && cparams.spec_draft && !draft_dropped && !mtp_heads && tokens >= dropped_min;
+            // not in a memory probe (no_alloc): --fit then sized the cache with the depth-4 arena reserved (G4 k15g4i1, fn4 24 GB +
+            // Q8_0 drafter: cache 12233 -> 8836 MiB, 11.0 -> 8.0 tokens, so the context refused depth 4 after the cache had paid for
+            // it: decode -5..-14%); the probe measures the default depth and the context decides on the cache it really has
+            const bool spec_deep = spec_env && dropped_depth > 0 && cparams.spec_draft && !draft_dropped && !mtp_heads && tokens >= dropped_min &&
+                !model.hparams.no_alloc;
             const char * why = cparams.spec_draft && !draft_dropped && !spec_deep ? "speculative decoding with a draft model or MTP heads" :
                 draft_dropped && tokens < dropped_min ? "a dropped draft model beside a cache of fewer tokens than LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS" :
                 tokens < min_tokens ? "the cache holds the experts of fewer tokens than LLAMA_MOE_PREFETCH_DEPTH_SPILL_MIN_TOKENS" :
