@@ -3380,7 +3380,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
             const bool large      = !moe_cache->small_batch(ubatch.n_tokens);
             const bool last_large = large && n_tokens_all - n_tokens_prev - ubatch.n_tokens <= llama_moe_cache::n_small_max;
-            moe_cache_seed_begin(ubatch, last_large, n_outputs);
+            moe_cache_seed_begin(ubatch, last_large, n_outputs, moe_seed_early != 0 && large && !last_large);
             if (large) {
                 moe_cache->count_large_ubatch();
             }
@@ -6074,7 +6074,7 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
     return true;
 }
 
-void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_large, int64_t n_outputs_ub) {
+void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_large, int64_t n_outputs_ub, bool early) {
     moe_inplace_ok = true; // k15-lfm2: unless this ubatch seeds (below)
     moe_cache->prompt_ubatch(true);
     const bool large = !moe_cache->small_batch(ubatch.n_tokens);
@@ -6093,7 +6093,7 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
 
     // LLAMA_MOE_CACHE_SEED=2 (default): read the routing outputs of the previous large ubatch before this graph replaces them, unless this ubatch
     // records newer ones without seeding
-    if (moe_cache_seed_sync && cont && !moe_cache_ids.empty() && n_outputs_ub == 0 && (!large || (last_large && prefetch))) {
+    if (moe_cache_seed_sync && cont && !moe_cache_ids.empty() && n_outputs_ub == 0 && (!large || ((last_large || early) && prefetch))) {
         ggml_backend_sched_synchronize(sched.get());
         std::vector<int32_t> ids_data;
         std::vector<int32_t> counts;
@@ -6144,6 +6144,20 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
                 moe_cache->count_seed_skipped();
             }
         }
+        moe_seed_early = 0;
+    } else if (early && prefetch && moe_cache_seed_sync && n_outputs_ub == 0 && moe_cache->has_seed_counts()) {
+        // k15-lfm2 (LLAMA_MOE_CPU_MISS_PER_REQUEST=1): the request began with an empty cache, so every ubatch of the batch before its
+        // last uploads all of its experts; a prefetched ubatch without outputs seeds from the routing of the one before it (no larger
+        // graph, no serialized uploads), the ubatches after it copy those experts from the cache. The prompt computes on the device
+        // either way (same bytes), so its logits do not change. =1: the second large ubatch only, =2: every one up to the end of the batch
+        moe_cache_seed_prev = true;
+        if (moe_seed_early != 2) {
+            moe_seed_early = 0;
+        }
+    } else if (early && prefetch && moe_cache_seed_sync && moe_seed_early == 3 && moe_cache_seed_fits) {
+        // =3: the first large ubatch seeds from its own routing (its uploads wait for the router of each layer)
+        moe_cache_seed = true;
+        moe_seed_early = 0;
     }
     // k15-lfm2: a ubatch that seeds the cache from its own routing keeps the staging copies (the seed reads them), the others may read in
     // place; one that seeds from the routing of an earlier ubatch plans its seeds before the graph (see prompt_seed_plan)
@@ -8372,6 +8386,12 @@ void llama_context::moe_request_begin() {
         // the reset takes back the lent slots without a new allocation: a reused graph would keep its copies bound to them
         gf_res_prev_active = nullptr;
         gf_res_epoch++;
+        // the empty cache is seeded early in the first batch (see moe_cache_seed_begin); LLAMA_MOE_CPU_MISS_PER_REQUEST_SEED=0 off
+        static const int seed_early_env = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_PER_REQUEST_SEED");
+            return e != nullptr ? atoi(e) : 1;
+        }();
+        moe_seed_early = seed_early_env;
     }
 }
 

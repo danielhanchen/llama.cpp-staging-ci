@@ -3817,7 +3817,15 @@ struct llama_moe_cache::impl {
         }
         const bool mailbox = single_weigh() && single_usable(1);
         const double trial_frac = trial_frac_env >= 0.0 ? trial_frac_env : (mailbox ? std::max(0.20, trial_frac_single) : 0.20);
-        const bool skip = cm_trial && !cm_force && cache_frac >= 0.0 && cache_frac < trial_frac;
+        // k15-lfm2: with LLAMA_MOE_CPU_MISS_PER_REQUEST no timing trials (the cost model only), so no verdict depends on which request
+        // ran the first trial (G4 LFM2.5 12 GB: chat / 8k / 16k other texts by request order); LLAMA_MOE_CPU_MISS_PER_REQUEST_TRIALS=1
+        // keeps the first trial
+        static const bool per_req_no_trials = [] {
+            const char * e  = getenv("LLAMA_MOE_CPU_MISS_PER_REQUEST");
+            const char * et = getenv("LLAMA_MOE_CPU_MISS_PER_REQUEST_TRIALS");
+            return e != nullptr && atoi(e) != 0 && !(et != nullptr && atoi(et) != 0);
+        }();
+        const bool skip = cm_trial && !cm_force && ((cache_frac >= 0.0 && cache_frac < trial_frac) || per_req_no_trials);
         if (late) {
             cm_trials_late_done = true;
         }
@@ -3830,9 +3838,10 @@ struct llama_moe_cache::impl {
             cm_small_ok   = true;
             cm_small_live = true;
             cm_gen++;
-            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no timing trials at %.1f%% of the host experts cached (below %.0f%%%s%s): small "
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no timing trials at %.1f%% of the host experts cached (%s%.0f%%%s%s): small "
                 "batches follow the cost model, short prompts stay on the plain cache (LLAMA_MOE_CPU_MISS_TRIAL_FRAC=0 restores the trials)\n",
-                tag, 100.0*cache_frac, 100.0*trial_frac, mailbox ? ", single-graph mailbox" : "", late ? ", from now on" : "");
+                tag, 100.0*cache_frac, per_req_no_trials ? "LLAMA_MOE_CPU_MISS_PER_REQUEST; trial share " : "below ", 100.0*trial_frac,
+                mailbox ? ", single-graph mailbox" : "", late ? ", from now on" : "");
         }
         return skip;
     }
