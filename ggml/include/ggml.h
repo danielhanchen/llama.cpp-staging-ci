@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #pragma once
 
 //
@@ -2797,6 +2798,25 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // a verify window of a replay rollback (llama_memory_recurrent replay, k16-draft): before the window, the first wp[0, s] tokens
+    // of the stored previous window of sequence s (wk / wv / wgb at token slots wp[1, s] * n_win + t, n_win = wk->ne[2] / 2) are
+    // applied to state; the result is the output's state (K == 1: the committed state, not the window's final one), and the window's
+    // own k / v / g / beta are written into the other half (token slots (1 - wp[1, s]) * n_win + t) of the stores. Scalar gate only.
+    //   wk  : [S_k, H_k, 2 * n_win, n_seqs] (strided view)   wv : [S_v, H_v, 2 * n_win, n_seqs]   wgb : [2, H_v, 2 * n_win, n_seqs] (g, beta)
+    //   wp  : I32 [2, n_seqs] (kept tokens of the stored window, its half)
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_replay(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * wk,
+            struct ggml_tensor  * wv,
+            struct ggml_tensor  * wgb,
+            struct ggml_tensor  * wp);
 
     // DSA lightning indexer
     //

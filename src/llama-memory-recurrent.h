@@ -94,6 +94,13 @@ public:
     mutable std::vector<int32_t> rk_h;  // per layer: the key heads the graph stored (H_k, or H_v where it repeats them)   // [S_k, H_v, n_win, size], [S_v, H_v, n_win, size], [1, H_v, n_win, size] x 2
     std::vector<uint32_t> pend_n;    // per cell: tokens of the window not committed yet (0: the row is current)
     std::vector<uint32_t> pend_rb;   // per cell: the tokens of that window rolled back (seq_rm)
+    std::vector<uint8_t>  par;       // per cell: the half of the stores that holds its window
+    std::vector<uint32_t> conv_rb;   // per cell: a conv snapshot still to copy onto the live row (its window committed by a fused ubatch)
+    bool replay_fused_ok = false;    // LLAMA_RS_REPLAY_FUSED and a backend with ggml_gated_delta_net_replay
+    bool rp_fused = false;           // the current ubatch commits the windows of its cells itself
+    std::vector<int32_t> rp;         // its (kept tokens, half) per sequence
+    bool replay_fuse(const llama_ubatch & ubatch);
+    uint32_t get_n_win_store() const { return 2*(1 + n_rs_seq); } // token slots per cell in the stores (two halves)
     std::function<void(bool)> commit_cb; // set by llama_context: runs the commit graph (true: waits for it)
     uint64_t n_replay_commit = 0;
     bool has_pending() const;
@@ -221,6 +228,8 @@ public:
     ggml_tensor * get_rg_l(int32_t il) const;
     ggml_tensor * get_rb_l(int32_t il) const;
     void          set_rk_h(int32_t il, int32_t h) const;
+    bool          get_replay_fused() const;              // this ubatch's window commits the stored one (ggml_gated_delta_net_replay)
+    void          set_replay_input(ggml_tensor * t) const; // I32 [2, n_seqs]: kept tokens of the stored window, its half
 
     int32_t s_copy(int i) const;
 

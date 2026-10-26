@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "llama-graph.h"
 
 #include "llama-impl.h"
@@ -410,8 +411,21 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// k16-draft: the replay window input (llama_memory_recurrent replay) of the three recurrent inputs below
+static void rs_replay_set_input(const llm_graph_input_rs * inp, const llama_memory_recurrent_context * mctx) {
+    if (inp->rs_rp != nullptr && inp->rs_rp->buffer != nullptr) {
+        mctx->set_replay_input(inp->rs_rp);
+    }
+}
+
+static bool rs_replay_can_reuse(const llm_graph_input_rs * inp, const llama_memory_recurrent_context * mctx) {
+    return (inp->rs_rp != nullptr) == mctx->get_replay_fused();
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
+
+    rs_replay_set_input(this, mctx);
 
     const int64_t n_rs = mctx->get_n_rs();
 
@@ -448,6 +462,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
     res &= alias == mctx->get_rs_alias(params.ubatch);
+    res &= rs_replay_can_reuse(this, mctx);
 
     return res;
 }
@@ -1199,6 +1214,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
+    rs_replay_set_input(inp_rs.get(), mctx->get_recr());
+
     if (inp_rs->s_copy) {
         // s_copy has no buffer when no node reads it (build_rs reads it also when the states are read in place),
         // but s_copy() still has to run: it clears the rollback index of the sequences
@@ -1237,6 +1254,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
     res &= inp_rs->alias == mctx->get_recr()->get_rs_alias(params.ubatch);
+    res &= rs_replay_can_reuse(inp_rs.get(), mctx->get_recr());
 
     return res;
 }
@@ -1250,6 +1268,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+
+    rs_replay_set_input(inp_rs.get(), mctx->get_recr());
 
     if (inp_rs->s_copy) {
         // s_copy has no buffer when no node reads it (build_rs reads it also when the states are read in place),
@@ -1288,6 +1308,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
     res &= inp_rs->alias == mctx->get_recr()->get_rs_alias(params.ubatch);
+    res &= rs_replay_can_reuse(inp_rs.get(), mctx->get_recr());
 
     return res;
 }
@@ -1332,6 +1353,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+
+    rs_replay_set_input(inp_rs.get(), mctx->get_recr());
 
     if (inp_rs->s_copy) {
         // s_copy has no buffer when no node reads it (build_rs reads it also when the states are read in place),
@@ -1384,6 +1407,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
     res &= inp_rs->alias == mctx->get_recr()->get_rs_alias(params.ubatch);
+    res &= rs_replay_can_reuse(inp_rs.get(), mctx->get_recr());
 
     return res;
 }

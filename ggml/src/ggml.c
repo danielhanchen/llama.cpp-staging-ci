@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
 
@@ -6751,6 +6752,43 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+// ggml_gated_delta_net_replay
+
+struct ggml_tensor * ggml_gated_delta_net_replay(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * wk,
+        struct ggml_tensor  * wv,
+        struct ggml_tensor  * wgb,
+        struct ggml_tensor  * wp) {
+    struct ggml_tensor * result = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+    GGML_ASSERT(g->ne[0] == 1);
+    GGML_ASSERT(wk->type == GGML_TYPE_F32 && wv->type == GGML_TYPE_F32 && wgb->type == GGML_TYPE_F32 && wp->type == GGML_TYPE_I32);
+    GGML_ASSERT(wk->ne[0] == k->ne[0] && wk->ne[1] == k->ne[1] && wk->ne[3] == n_seqs && wk->ne[2] % 2 == 0);
+    GGML_ASSERT(wv->ne[0] == v->ne[0] && wv->ne[1] == v->ne[1] && wv->ne[2] == wk->ne[2] && wv->ne[3] == n_seqs);
+    GGML_ASSERT(wgb->ne[0] == 2 && wgb->ne[1] == v->ne[1] && wgb->ne[2] == wk->ne[2] && wgb->ne[3] == n_seqs);
+    GGML_ASSERT(wk->nb[0] == sizeof(float) && wv->nb[0] == sizeof(float) && wgb->nb[0] == sizeof(float));
+    GGML_ASSERT(n_tokens <= wk->ne[2] / 2);
+    GGML_ASSERT(ggml_is_contiguous(wp) && wp->ne[0] == 2 && ggml_nelements(wp) == 2 * n_seqs);
+
+    ggml_set_op_params_i32(result, 1, 1); // replay window
+
+    result->src[6] = wk;
+    result->src[7] = wv;
+    result->src[8] = wgb;
+    result->src[9] = wp;
 
     return result;
 }

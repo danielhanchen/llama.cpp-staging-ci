@@ -65,6 +65,8 @@ llama_memory_recurrent::llama_memory_recurrent(
         replay = can && want;
         pend_n.assign(mem_size, 0);
         pend_rb.assign(mem_size, 0);
+        par.assign(mem_size, 0);
+        conv_rb.assign(mem_size, 0);
     }
 
     cells.clear();
@@ -108,7 +110,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     rk_l.assign(n_layer, nullptr);
     rv_l.assign(n_layer, nullptr);
     rg_l.assign(n_layer, nullptr);
-    rb_l.assign(n_layer, nullptr);
+    rb_l.assign(n_layer, nullptr); // unused: gate and beta share rg_l
     rk_h.assign(n_layer, 0);
 
     for (int i = 0; i < n_layer; i++) {
@@ -147,14 +149,14 @@ llama_memory_recurrent::llama_memory_recurrent(
             const int64_t H_v   = hparams.ssm_dt_rank;
             const int64_t S_v   = hparams.ssm_d_inner / H_v;
             const int64_t S_k   = hparams.ssm_d_state;
-            rk_l[i] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_k, H_v, n_win, mem_size);
-            rv_l[i] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H_v, n_win, mem_size);
-            rg_l[i] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1,   H_v, n_win, mem_size);
-            rb_l[i] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1,   H_v, n_win, mem_size);
+            // two halves of n_win token slots per cell: a fused window (ggml_gated_delta_net_replay) reads the stored window from one
+            // half and writes its own into the other (par); gate and beta interleaved in one store
+            rk_l[i] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_k, H_v, 2*n_win, mem_size);
+            rv_l[i] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H_v, 2*n_win, mem_size);
+            rg_l[i] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2,   H_v, 2*n_win, mem_size);
             ggml_format_name(rk_l[i], "replay_k_l%d", i);
             ggml_format_name(rv_l[i], "replay_v_l%d", i);
-            ggml_format_name(rg_l[i], "replay_g_l%d", i);
-            ggml_format_name(rb_l[i], "replay_b_l%d", i);
+            ggml_format_name(rg_l[i], "replay_gb_l%d", i);
         }
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
@@ -214,6 +216,24 @@ llama_memory_recurrent::llama_memory_recurrent(
         }
         LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    // k16-draft: the commit folded into the next window (ggml_gated_delta_net_replay), on the backends that implement it (CUDA, CPU);
+    // LLAMA_RS_REPLAY_FUSED=0: every commit through the commit graph (llama_context::rs_replay_commit)
+    if (replay) {
+        const char * e = getenv("LLAMA_RS_REPLAY_FUSED");
+        replay_fused_ok = e == nullptr || atoi(e) != 0;
+        for (const ggml_tensor * t : s_l) {
+            if (t == nullptr || t->buffer == nullptr) {
+                continue;
+            }
+            const char * nm = ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer));
+            if (strncmp(nm, "CUDA", 4) != 0 && strncmp(nm, "ROCm", 4) != 0 && strncmp(nm, "MUSA", 4) != 0 && strncmp(nm, "CPU", 3) != 0) {
+                replay_fused_ok = false;
+            }
+        }
+        LLAMA_LOG_INFO("%s: replay commit %s (LLAMA_RS_REPLAY_FUSED=0: a commit graph before each window)\n", __func__,
+                replay_fused_ok ? "folded into the next window" : "by a commit graph");
     }
 
     if (is_empty()) {
@@ -356,6 +376,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 cells[i].src = -1;
                 pend_n[i]  = 0;
                 pend_rb[i] = 0;
+                conv_rb[i] = 0;
                 if (new_head == size) {
                     new_head = i;
                 }
@@ -536,12 +557,38 @@ bool llama_memory_recurrent::has_pending() const {
     if (!replay) {
         return false;
     }
-    for (uint32_t n : pend_n) {
-        if (n != 0) {
+    for (uint32_t c = 0; c < size; ++c) {
+        if (pend_n[c] != 0 || conv_rb[c] != 0) {
             return true;
         }
     }
     return false;
+}
+
+// k16-draft: after find_slot, whether this ubatch commits the stored windows of its cells itself (ggml_gated_delta_net_replay): a
+// window of every sequence in its own cell. The conv snapshot of a rollback is still copied by the commit graph (conv_rb)
+bool llama_memory_recurrent::replay_fuse(const llama_ubatch & ubatch) {
+    rp_fused = false;
+    if (!replay || !replay_fused_ok || ubatch.n_seqs == 0 || ubatch.n_seq_tokens > 1 + n_rs_seq || head + ubatch.n_seqs > size) {
+        return false;
+    }
+    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+        const uint32_t c = head + s;
+        if (cells[c].src0 != (int32_t) c) {
+            return false;
+        }
+    }
+    rp.assign(2*ubatch.n_seqs, 0);
+    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+        const uint32_t c = head + s;
+        rp[2*s + 0] = (int32_t) (pend_n[c] > pend_rb[c] ? pend_n[c] - pend_rb[c] : 0);
+        rp[2*s + 1] = par[c];
+        conv_rb[c]  = pend_rb[c];
+        pend_n[c]   = 0;
+        pend_rb[c]  = 0;
+    }
+    rp_fused = true;
+    return true;
 }
 
 void llama_memory_recurrent::replay_commit_if_pending(bool sync) const {
@@ -561,6 +608,8 @@ void llama_memory_recurrent::replay_mark(const llama_ubatch & ubatch) {
     for (uint32_t s = 0; s < ubatch.n_seqs && head + s < size; ++s) {
         pend_n[head + s]  = n_tok;
         pend_rb[head + s] = 0;
+        // a fused window wrote its inputs into the other half; the graph of an unfused one into half 0
+        par[head + s] = rp_fused ? (uint8_t) (1 - par[head + s]) : 0;
     }
 }
 
@@ -1555,10 +1604,18 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
-    // k16-draft: the previous window is committed before this ubatch reads (or copies) any state
-    mem->replay_commit_if_pending(/*sync =*/ false); // the graph of this ubatch follows on the same streams
-
-    mem->find_slot(ubatches[i_next]);
+    // k16-draft: the previous window is committed before this ubatch reads (or copies) any state: by this ubatch's own graph when it
+    // is a window of the same cells (replay_fuse), else (and for the conv snapshots and the other cells) by the commit graph, queued
+    // here on the same streams as the graph of this ubatch
+    if (mem->replay && mem->replay_fused_ok) {
+        mem->find_slot(ubatches[i_next]);
+        mem->replay_fuse(ubatches[i_next]);
+        mem->replay_commit_if_pending(/*sync =*/ false);
+    } else {
+        mem->rp_fused = false;
+        mem->replay_commit_if_pending(/*sync =*/ false);
+        mem->find_slot(ubatches[i_next]);
+    }
 
     mem->replay_mark(ubatches[i_next]);
 
@@ -1606,6 +1663,12 @@ ggml_tensor * llama_memory_recurrent_context::get_rv_l(int32_t il) const { retur
 ggml_tensor * llama_memory_recurrent_context::get_rg_l(int32_t il) const { return mem->replay ? mem->rg_l[il] : nullptr; }
 ggml_tensor * llama_memory_recurrent_context::get_rb_l(int32_t il) const { return mem->replay ? mem->rb_l[il] : nullptr; }
 void llama_memory_recurrent_context::set_rk_h(int32_t il, int32_t h) const { mem->rk_h[il] = h; }
+bool llama_memory_recurrent_context::get_replay_fused() const { return mem->replay && mem->rp_fused; }
+void llama_memory_recurrent_context::set_replay_input(ggml_tensor * t) const {
+    GGML_ASSERT(t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer));
+    GGML_ASSERT(mem->rp_fused && (int64_t) mem->rp.size() == ggml_nelements(t));
+    memcpy(t->data, mem->rp.data(), mem->rp.size()*sizeof(int32_t));
+}
 
 ggml_tensor * llama_memory_recurrent_context::get_r_l(int32_t il) const {
     return mem->r_l[il];

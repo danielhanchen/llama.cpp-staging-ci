@@ -939,7 +939,6 @@ void llama_context::rs_replay_commit(bool sync) {
             chk(mem->rk_l[il]);
             chk(mem->rv_l[il]);
             chk(mem->rg_l[il]);
-            chk(mem->rb_l[il]);
         }
         if (one && rs_buft != nullptr) {
             for (auto * be : backend_ptrs) {
@@ -958,8 +957,8 @@ void llama_context::rs_replay_commit(bool sync) {
     // the same cells committing the same token counts (one slot drafting: the usual case) run the graph of the last commit again
     std::vector<uint32_t> key;
     for (uint32_t c = 0; c < mem->size; ++c) {
-        if (mem->pend_n[c] != 0) {
-            key.insert(key.end(), { c, mem->pend_n[c], mem->pend_rb[c] });
+        if (mem->pend_n[c] != 0 || mem->conv_rb[c] != 0) {
+            key.insert(key.end(), { c, mem->pend_n[c], mem->pend_rb[c], mem->conv_rb[c], mem->par[c] });
         }
     }
     static const bool reuse = getenv("LLAMA_RS_REPLAY_REUSE") == nullptr || atoi(getenv("LLAMA_RS_REPLAY_REUSE")) != 0;
@@ -968,6 +967,7 @@ void llama_context::rs_replay_commit(bool sync) {
         for (uint32_t c = 0; c < mem->size; ++c) {
             mem->pend_n[c]  = 0;
             mem->pend_rb[c] = 0;
+            mem->conv_rb[c] = 0;
         }
         rs_graph & e = hit->second;
         if (e.ga) {
@@ -1030,11 +1030,13 @@ void llama_context::rs_replay_commit(bool sync) {
     const int64_t D = model.hparams.n_embd_s();
     for (uint32_t c = 0; c < mem->size; ++c) {
         const uint32_t n = mem->pend_n[c];
-        if (n == 0) {
+        if (n == 0 && mem->conv_rb[c] == 0) {
             continue;
         }
-        const uint32_t rb   = mem->pend_rb[c];
+        // conv_rb: the window was committed by a fused ubatch, only its conv snapshot is left
+        const uint32_t rb   = n != 0 ? mem->pend_rb[c] : mem->conv_rb[c];
         const uint32_t keep = n > rb ? n - rb : 0;
+        const size_t   half = (size_t) mem->par[c] * (size_t) (mem->get_n_win_store() / 2);
         for (size_t il = 0; il < mem->s_l.size(); ++il) {
             ggml_tensor * s  = mem->s_l[il];
             ggml_tensor * rk = mem->rk_l[il];
@@ -1043,18 +1045,19 @@ void llama_context::rs_replay_commit(bool sync) {
             }
             if (keep > 0) {
                 ggml_tensor * rv = mem->rv_l[il];
-                ggml_tensor * rg = mem->rg_l[il];
-                ggml_tensor * rbt = mem->rb_l[il];
+                ggml_tensor * rg = mem->rg_l[il]; // gate and beta interleaved: [2, H_v, 2 * n_win, size]
                 const int64_t H_k = mem->rk_h[il] > 0 ? mem->rk_h[il] : rk->ne[1];
                 const int64_t S_v = rv->ne[0];
                 const int64_t H_v = rv->ne[1];
-                auto win = [&](ggml_tensor * t, int64_t ne0, int64_t ne1) {
-                    return ggml_view_4d(ctx, t, ne0, ne1, keep, 1, t->nb[1], t->nb[2], t->nb[3], (size_t) c * t->nb[3]);
+                auto win = [&](ggml_tensor * t, int64_t ne0, int64_t ne1, size_t off0 = 0) {
+                    return ggml_view_4d(ctx, t, ne0, ne1, keep, 1, t->nb[1], t->nb[2], t->nb[3], (size_t) c * t->nb[3] + half * t->nb[2] + off0);
                 };
+                ggml_tensor * g_c = ggml_cont(ctx, win(rg, 1, H_v, 0));
+                ggml_tensor * b_c = ggml_cont(ctx, win(rg, 1, H_v, sizeof(float)));
                 ggml_tensor * k  = win(rk, rk->ne[0], H_k);
                 ggml_tensor * st = ggml_view_4d(ctx, s, S_v, S_v, H_v, 1, ggml_row_size(s->type, S_v), ggml_row_size(s->type, S_v*S_v),
                         ggml_row_size(s->type, D), (size_t) c * s->nb[1]);
-                ggml_tensor * out = ggml_gated_delta_net(ctx, k, k, win(rv, S_v, H_v), win(rg, 1, H_v), win(rbt, 1, H_v), st, 1);
+                ggml_tensor * out = ggml_gated_delta_net(ctx, k, k, win(rv, S_v, H_v), g_c, b_c, st, 1);
                 ggml_tensor * ns  = ggml_view_1d(ctx, out, D, ggml_row_size(out->type, S_v*H_v*(int64_t) keep));
                 ggml_build_forward_expand(gf, ggml_cpy(ctx, ns, ggml_view_1d(ctx, s, D, (size_t) c * s->nb[1])));
             }
@@ -1071,6 +1074,7 @@ void llama_context::rs_replay_commit(bool sync) {
         }
         mem->pend_n[c]  = 0;
         mem->pend_rb[c] = 0;
+        mem->conv_rb[c] = 0;
     }
     if (ggml_graph_n_nodes(gf) > 0) {
         rs_graph e;

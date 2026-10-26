@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #pragma once
 
 #include "llama-arch.h"
@@ -317,6 +318,9 @@ public:
     uint32_t head;
     int32_t rs_z;
     int32_t alias; // first cache row of the in-place states during decode, -1 when they are gathered
+
+    // k16-draft: I32 [2, n_seqs] of ggml_gated_delta_net_replay (kept tokens of the stored window, its half), when this ubatch commits it
+    ggml_tensor * rs_rp = nullptr;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
