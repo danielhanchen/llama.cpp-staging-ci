@@ -620,6 +620,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     res->t_logits = cur;
 }
 
+static bool proj_adjacent() {
+    static const bool on = !getenv("LLAMA_QWEN4EXP_PROJ_ADJACENT") || atoi(getenv("LLAMA_QWEN4EXP_PROJ_ADJACENT")) != 0;
+    return on;
+}
+
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
                 ggml_tensor * input,
                         int   il) {
@@ -627,10 +632,16 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
+    ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
+    // k15-mm2: both products of the input enter the graph next to each other, so the backend can run them as one multi-matrix
+    // mat-vec (otherwise z is placed where it is first read, after the conv, and the allocator reuses its memory in between);
+    // the same ops, only the node order changes. LLAMA_QWEN4EXP_PROJ_ADJACENT=0: z where it is first read
+    if (proj_adjacent()) {
+        ggml_build_forward_expand(gf, qkv_mixed);
+        ggml_build_forward_expand(gf, z);
+    }
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
-
-    ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
     cb(z, "z", il);
 
     return { qkv_mixed, z };
@@ -763,6 +774,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
 
     // cache rows store raw key | pooled key: pooling precedes norm and rotation, so the raw key gets neither
     ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
+    // k15-mm2: the indexer q product next to k's (one multi-matrix mat-vec), see build_qkvz
+    ggml_tensor * q_raw = build_lora_mm(model.layers[il].index_q_proj, cur);
+    if (proj_adjacent()) {
+        ggml_build_forward_expand(gf, k_raw);
+        ggml_build_forward_expand(gf, q_raw);
+    }
     cb(k_raw, "indexer_k_raw", il);
 
     ggml_tensor * pzero  = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, idx_dim, n_tokens), 0.0f);
@@ -799,7 +816,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);
     cb(pooled, "indexer_k", il);
 
-    ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
+    ggml_tensor * q = q_raw;
     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
     q = build_norm(q, model.layers[il].index_q_norm, nullptr, LLM_NORM_RMS, il);
     q = ggml_rope_multi(ctx0, q, inp_pos, nullptr,
