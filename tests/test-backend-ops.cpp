@@ -8438,6 +8438,59 @@ struct test_mul_mat_vec_multi : public test_case {
     }
 };
 
+// k15-mm2: hyper-connection down -> silu(scale) -> up: the up product applies the elementwise chain to its src1 in its own launch
+// (ggml_cuda_mul_mat_vec_q_ew). pattern 0: scale + silu, 1: silu, 2: scale with bias, 3: scale + silu with the chain input read
+// by a second node too (no fusion)
+struct test_hc_mix : public test_case {
+    const ggml_type type;
+    const int64_t m;   // tokens
+    const int64_t lr;  // K of the up product
+    const int pattern;
+    const bool exact;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, m, lr, pattern, exact);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_MIX";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_hc_mix(ggml_type type, int64_t m, int64_t lr, int pattern, bool exact)
+        : type(type), m(m), lr(lr), pattern(pattern), exact(exact) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t d = 1024;
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, m);
+        ggml_tensor * wd = ggml_new_tensor_2d(ctx, type, d, lr);
+        ggml_tensor * wu = ggml_new_tensor_2d(ctx, type, lr, d);
+        ggml_tensor * lo = ggml_mul_mat(ctx, wd, x);
+        ggml_tensor * c;
+        switch (pattern) {
+            case 1:  c = ggml_silu(ctx, lo); break;
+            case 2:  c = ggml_scale_bias(ctx, lo, 0.25f, 0.5f); break;
+            default: c = ggml_silu(ctx, ggml_scale(ctx, lo, 0.25f)); break;
+        }
+        ggml_tensor * up = ggml_mul_mat(ctx, wu, c);
+        if (exact) {
+            up->flags |= GGML_TENSOR_FLAG_BATCH_INVARIANT;
+        }
+        ggml_tensor * out = ggml_sigmoid(ctx, up);
+        if (pattern == 3) {
+            out = ggml_concat(ctx, out, c, 0);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+};
+
 struct test_mul_mat_vec_shared_src1 : public test_case {
     const ggml_type type_a;
     const ggml_type type_b; // type of the second dense weight (e.g. V of a different quant type)
@@ -12941,6 +12994,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
             for (int64_t rows : { 1024, 1023 }) {
                 test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, rows, m, type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0 ? 320 : 256, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
+    // k15-mm2: hc down -> silu(scale) -> up in the up launch (K 320: Flash-Next; 96 / 992: the K range; 1024 and 5 tokens: not fused)
+    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int64_t m : { 1, 2, 3, 4, 5 }) {
+            for (int64_t lr : { 96, 320, 992, 1024 }) {
+                for (int pattern : { 0, 1, 2, 3 }) {
+                    test_cases.emplace_back(new test_hc_mix(type, m, lr, pattern, m == 3));
+                }
             }
         }
     }

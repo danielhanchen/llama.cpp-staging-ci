@@ -5100,6 +5100,68 @@ static int ggml_cuda_try_fuse_mmvf_multi(ggml_backend_cuda_context * cuda_ctx, g
     return run;
 }
 
+// k15-mm2: SCALE / SILU chain (each node read only by the next) -> MUL_MAT whose src1 is the chain end, a short-K dense Q8_0
+// product of 1..4 columns (the hyper-connection up projection behind silu(scale(down))): the product's blocks apply the chain and
+// quantize its output themselves (ggml_cuda_mul_mat_vec_q_ew), one launch in place of the chain kernel, quantize_q8_1 and
+// mul_mat_vec_q, with the same bytes. GGML_CUDA_MMVQ_EW=0 turns it off. Returns the number of extra nodes covered.
+static int ggml_cuda_try_fuse_ew_mmvq(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool off = [] { const char * e = getenv("GGML_CUDA_MMVQ_EW"); return e != nullptr && atoi(e) == 0; }();
+    if (off || cuda_ctx->curr_stream_no != 0) {
+        return 0;
+    }
+    int   ops[GGML_CUDA_MMVQ_EW_MAX];
+    float p0[GGML_CUDA_MMVQ_EW_MAX];
+    float p1[GGML_CUDA_MMVQ_EW_MAX];
+    int n = 0;
+    const ggml_tensor * ew_src = cgraph->nodes[i]->src[0];
+    while (i + n < cgraph->n_nodes && n < GGML_CUDA_MMVQ_EW_MAX) {
+        const ggml_tensor * t = cgraph->nodes[i + n];
+        const bool is_scale = t->op == GGML_OP_SCALE;
+        const bool is_silu  = t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SILU;
+        if (!(is_scale || is_silu) || t->type != GGML_TYPE_F32 || t->src[0] == nullptr || t->src[0]->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(t) || !ggml_is_contiguous(t->src[0]) || !ggml_are_same_shape(t, t->src[0]) ||
+                !(t->flags & GGML_TENSOR_FLAG_COMPUTE) || (n > 0 && t->src[0] != cgraph->nodes[i + n - 1]) ||
+                !ggml_node_has_n_uses(cgraph, i + n, 1)) {
+            break;
+        }
+        ops[n] = is_scale ? 0 : 1;
+        p0[n]  = 0.0f;
+        p1[n]  = 0.0f;
+        if (is_scale) {
+            memcpy(&p0[n], (const float *) t->op_params + 0, sizeof(float));
+            memcpy(&p1[n], (const float *) t->op_params + 1, sizeof(float));
+        }
+        n++;
+    }
+    if (n == 0 || i + n >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * mm = cgraph->nodes[i + n];
+    const ggml_tensor * last = cgraph->nodes[i + n - 1];
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != last || !(mm->flags & GGML_TENSOR_FLAG_COMPUTE) || mm->view_src != nullptr ||
+            cuda_ctx->mmvq_done_early.count(mm)) {
+        return 0;
+    }
+    const ggml_tensor * src0 = mm->src[0];
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    const int64_t ne11 = mm->ne[1];
+    const int64_t ne11_k = (mm->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) ? 1 : ne11; // batch invariant: as one column
+    // the kernel the unfused product would take (ggml_cuda_mul_mat): mul_mat_vec_q
+    if (src0->buffer == nullptr ||
+            ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE || ggml_cuda_op_mul_mat_use_fwht(mm) ||
+            !ggml_cuda_mul_mat_vec_q_ew_ok(src0, mm, cc) || ew_src->ne[0] != src0->ne[0] || ew_src->ne[1] != ne11 ||
+            !ggml_is_contiguous(ew_src) || ggml_cuda_should_use_mmf(src0->type, cc, 32, src0->ne, src0->nb, ne11_k, false) ||
+            !ggml_cuda_should_use_mmvq(src0->type, cc, ne11_k)) {
+        return 0;
+    }
+    // every block reads the whole chain input while others write their rows: they must not share memory
+    if (ggml_cuda_tensors_overlap(mm, ew_src)) {
+        return 0;
+    }
+    ggml_cuda_mul_mat_vec_q_ew(*cuda_ctx, src0, ew_src, n, ops, p0, p1, mm);
+    return n;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -5107,6 +5169,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_SCALE || node->op == GGML_OP_UNARY) {
+        if (const int n = ggml_cuda_try_fuse_ew_mmvq(cuda_ctx, cgraph, i)) {
+            return n;
+        }
+    }
 
     if (node->op == GGML_OP_ADD) {
         if (const int n = ggml_cuda_try_fuse_add_rms_norm(cuda_ctx, cgraph, i)) {
@@ -5981,8 +6049,16 @@ static bool ggml_cuda_side_mv_candidate(const ggml_tensor * node) {
         src1->ne[2] == 1 && src1->ne[3] == 1 && node->type == GGML_TYPE_F32;
 }
 
+// k15-mm2: products of at most 4 rows also at up to GGML_CUDA_SIDE_MV_COLS columns (default 4: the MTP verify windows; 1 = single
+// column only, as before), so a verify's hyper-connection inject and shared expert gate run beside the products after them instead
+// of before them. Wider weights (alpha / beta) keep their multi-matrix launch at several columns. Same kernels, same values.
 static bool ggml_cuda_side_mv_run(const ggml_tensor * node) {
-    return ggml_cuda_side_mv_candidate(node) && node->src[1]->ne[1] == 1;
+    static const int max_cols = getenv("GGML_CUDA_SIDE_MV_COLS") ? std::max(1, atoi(getenv("GGML_CUDA_SIDE_MV_COLS"))) : 4;
+    if (!ggml_cuda_side_mv_candidate(node)) {
+        return false;
+    }
+    const int64_t ncols = node->src[1]->ne[1];
+    return ncols == 1 || (ncols <= max_cols && node->src[0]->ne[1] <= 4);
 }
 
 // The side stream is only used while a decode-sized graph is captured into a CUDA graph. Used eagerly, it cost more than it saved:
