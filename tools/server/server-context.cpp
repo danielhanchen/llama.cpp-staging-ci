@@ -351,7 +351,9 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    // ckpt_keep_max >= -1 (k15-ttft): the caller knows the next prompt of this slot drops every checkpoint with pos_max above it, so
+    // those are moved into the cache entry instead of copied (LLAMA_PCS_MOVE_CKPT=0: copied as before)
+    bool prompt_save(server_prompt_cache & prompt_cache, llama_pos ckpt_keep_max = -2) {
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -364,7 +366,9 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        static const bool move_ckpt = getenv("LLAMA_PCS_MOVE_CKPT") == nullptr || atoi(getenv("LLAMA_PCS_MOVE_CKPT")) != 0;
+        const bool mv = move_ckpt && ckpt_keep_max >= -1;
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, mv ? &prompt.checkpoints : nullptr, ckpt_keep_max);
         if (cur == nullptr) {
             return false;
         }
@@ -386,6 +390,36 @@ struct server_slot {
         }
 
         return true;
+    }
+
+    // k15-ttft: the RAM prompt-cache save of this slot (state + a clone of each checkpoint) writes into fresh host memory when the
+    // buffer pool holds nothing large enough, and faulting those pages in made most of the save (local B200, Qwen3.6-35B-A3B MTP,
+    // 640-token prompt: 77 MiB state + 2 x 62 MiB checkpoints, 80-290 ms against 8-16 ms into resident buffers). Once the prompt is
+    // processed (and again when the slot goes idle) the prefault worker is asked for resident pool buffers of the sizes the next save
+    // needs, so it runs while the slot generates or waits. Same copies into other buffers: the saved bytes are unchanged.
+    // Opt-in (LLAMA_PCS_PREFAULT_NEXT=1): the prepared buffers stay resident while the slot idles (G4 q4x 32 GB: +113 MiB RSS), and
+    // the 2 MiB pages of common_state_thp_alloc take most of the fault cost without holding memory
+    void prefault_next_save() const {
+        static const bool on = getenv("LLAMA_PCS_PREFAULT_NEXT") != nullptr && atoi(getenv("LLAMA_PCS_PREFAULT_NEXT")) != 0;
+        if (!on || prompt.tokens.size() == 0) {
+            return;
+        }
+        const size_t n_tgt = llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t n_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        common_state_buf_prefault(n_tgt, 1);
+        // checkpoint clones (prompt_checkpoints_clone): one more buffer per checkpoint size than the state request leaves
+        size_t ckpt_max = 0;
+        int    n_ckpt   = 0;
+        for (const auto & c : prompt.checkpoints) {
+            ckpt_max = std::max(ckpt_max, c.data_tgt.size());
+            n_ckpt  += c.data_tgt.size() > 0;
+        }
+        if (n_ckpt > 0) {
+            common_state_buf_prefault(ckpt_max, n_ckpt + (n_tgt >= ckpt_max ? 1 : 0));
+        }
+        if (n_dft > 0) {
+            common_state_buf_prefault(n_dft, 1);
+        }
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
@@ -659,6 +693,10 @@ struct server_slot {
             }
 
             callback_on_reset(*this);
+
+            if (task && !task->is_child() && !task->is_stateless()) {
+                prefault_next_save();
+            }
 
             reset();
 
@@ -1825,6 +1863,14 @@ private:
         queue_tasks.on_update_slots([this]() {
             update_slots();
         });
+        queue_tasks.on_idle_work([this]() {
+            if (ctx_tgt) {
+                llama_prepare_prompt_plan(ctx_tgt);
+            }
+            if (ctx_dft && ctx_dft != ctx_tgt) {
+                llama_prepare_prompt_plan(ctx_dft);
+            }
+        });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
@@ -2052,7 +2098,13 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                // the checkpoints past the common prefix with the new prompt are erased when it starts (pos_next <= n_past <= the
+                // common prefix; not with chunk reuse, which can move n_past past it, nor with multimodal positions)
+                llama_pos keep_max = -2;
+                if (task.params.n_cache_reuse == 0 && !task.tokens.has_mtmd && !ret->prompt.tokens.has_mtmd) {
+                    keep_max = (llama_pos) ret->prompt.tokens.get_common_prefix(task.tokens);
+                }
+                ret->prompt_save(*prompt_cache, keep_max);
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
@@ -3673,13 +3725,10 @@ private:
                 metrics_flush_idle();
 
                 // k11-decode: the next prompt starts from the worst-case pp plan (a verify window may have re-planned it)
-                if (ctx_tgt) {
-                    llama_prepare_prompt_plan(ctx_tgt);
-                }
                 // k13-fn: the draft context's MoE cache re-calibrates between requests too
-                if (ctx_dft && ctx_dft != ctx_tgt) {
-                    llama_prepare_prompt_plan(ctx_dft);
-                }
+                // k15-ttft: both run once the server has stayed idle (server_queue::on_idle_work), not before a request that is
+                // already arriving (G4-class host, Qwen3.6 MTP with a CPU-miss MoE cache: a 50 ms re-calibration ahead of a chat prompt)
+                queue_tasks.request_idle_work();
 
                 return; // skip further processing
 
@@ -5065,6 +5114,10 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+                // not while a MoE cache computes experts on the host: the page faults would compete with its decode
+                if (!slot.task->is_child() && !slot.task->is_stateless() && llama_moe_host_mode(ctx_tgt) == 0) {
+                    slot.prefault_next_save();
+                }
 
                 // k15-lfm2: a request under spill mode 3 that cannot draft (no repeat is long enough on a long prompt) gains nothing from
                 // the pinned host path: its decode follows the CPU-miss rule (G4 LFM2.5 12 GB 16k, k15 re-bench: pinned 235.1 tok/s,
