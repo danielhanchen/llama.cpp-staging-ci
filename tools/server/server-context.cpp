@@ -3446,6 +3446,7 @@ private:
                     if (slot == nullptr) {
                         // if no slot is available, we defer this task for processing later
                         SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
+                        task.t_posted_us = 0; // its prompt time starts when a slot takes it
                         queue_tasks.defer(std::move(task));
                         break;
                     }
@@ -3453,6 +3454,7 @@ private:
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
+                        task.t_posted_us = 0;
                         queue_tasks.defer(std::move(task));
                         break;
                     }
@@ -3463,6 +3465,7 @@ private:
                         std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->id);
                         if (child_slots.size() < n_child_tasks) {
                             SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
+                            task.t_posted_us = 0;
                             queue_tasks.defer(std::move(task));
                             break;
                         }
@@ -4270,7 +4273,10 @@ private:
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
-                        slot.stats.update_prompt_start();
+                        // k15-hostcut: from when the task was posted, so prompt_ms covers what delayed it on the server loop (the client's TTFT
+                        // less the request's parse, tokenize and delivery)
+                        static const bool from_post = getenv("LLAMA_PROMPT_TIME_FROM_POST") == nullptr || atoi(getenv("LLAMA_PROMPT_TIME_FROM_POST")) != 0;
+                        slot.stats.update_prompt_start(from_post ? slot.task->t_posted_us : 0);
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 

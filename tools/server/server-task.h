@@ -212,7 +212,12 @@ struct server_task {
 
     server_task() = default;
 
-    server_task(server_task_type type) : type(type) {}
+    // k15-hostcut: when the HTTP thread made the task (us, ggml_time_us), so the prompt time of its slot starts there and covers what the
+    // server loop did before it took the task (an idle prompt-cache save it waited for, an idle re-reserve of the prompt graph); 0 for a
+    // task that waited for a free slot (its prompt time starts when a slot takes it)
+    int64_t t_posted_us = 0;
+
+    server_task(server_task_type type) : type(type), t_posted_us(ggml_time_us()) {}
 
     int32_t n_tokens() const {
         return tokens.size();
