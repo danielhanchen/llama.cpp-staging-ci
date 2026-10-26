@@ -119,12 +119,28 @@ llama_memory_recurrent::llama_memory_recurrent(
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
+    // k16-draft: a memory probe (no_alloc: the --fit measurements) takes a dummy buffer, as the KV cache does. It allocated the states
+    // for real, so the probe both counted them (context) and saw them gone from the free memory it fits into: the fit gave them twice.
+    // G4 Qwen3.8-Flash-Next 16 GB, Studio argv (-np 4, MTP draft 2: 3 rows per sequence): the main fit saw 14630 instead of 15982 MiB
+    // free (1352 MiB, the states at n_rs_seq 2), 15530 without a draft (n_rs_seq 0, 452 MiB). LLAMA_RS_PROBE_DUMMY=0: allocate as before
+    static const bool probe_dummy = getenv("LLAMA_RS_PROBE_DUMMY") == nullptr || atoi(getenv("LLAMA_RS_PROBE_DUMMY")) != 0;
+    probe_sized = hparams.no_alloc && probe_dummy;
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        ggml_backend_buffer_t buf;
+        if (probe_sized) {
+            buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer, sized by memory_breakdown
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                t->buffer = buf; // so that the backend scheduler does not try to allocate it
+            }
+        } else {
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for rs cache");
         }
-        ggml_backend_buffer_clear(buf, 0);
+        if (!probe_sized) {
+            ggml_backend_buffer_clear(buf, 0);
+        }
         LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
@@ -160,7 +176,7 @@ void llama_memory_recurrent::clear(bool data) {
     head = 0;
     used = 0;
 
-    if (data) {
+    if (data && !probe_sized) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
@@ -503,8 +519,9 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
-    for (const auto & [_, buf] : ctxs_bufs) {
-        ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+    for (const auto & [ctx, buf] : ctxs_bufs) {
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
+        ret[buft] += probe_sized ? ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft) : ggml_backend_buffer_get_size(buf.get());
     }
     return ret;
 }

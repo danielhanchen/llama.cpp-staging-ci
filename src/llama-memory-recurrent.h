@@ -132,6 +132,9 @@ private:
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
+    // k16-draft: a no_alloc memory probe holds dummy buffers, sized from the tensors (LLAMA_RS_PROBE_DUMMY=0: real buffers)
+    bool probe_sized = false;
+
     // true if no layers - can happen if the layer filter removes all layers
     bool is_empty() const;
 
