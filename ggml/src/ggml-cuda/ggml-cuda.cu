@@ -7346,6 +7346,40 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 }
             }
         }
+        // the same for a DSV4_HC_POST computed inside the grouped norm that reads it (ggml_cuda_try_fuse_hc_post_norm): its block
+        // output, residual and post weights (the input of the SCALE / SIGMOID chain the kernel applies) stay alive until the norm
+        // output is allocated, so neither the post output (in place) nor the norm output lands on them. Flash-Next f0 (B200, MTP,
+        // pinned): with the fusion on, the text was not repeatable. GGML_CUDA_HC_POST_NORM_ALIAS=1: as before
+        static const bool hc_alias_ok = ggml_cuda_env_flag("GGML_CUDA_HC_POST_NORM_ALIAS");
+        for (int i = 0; !hc_alias_ok && i + 2 < cgraph->n_nodes; ++i) {
+            ggml_tensor * hc_post = cgraph->nodes[i];
+            if (hc_post->op != GGML_OP_DSV4_HC_POST || hc_post->src[3] != nullptr) {
+                continue;
+            }
+            int irn = i + 1;
+            while (irn < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[irn])) {
+                irn++;
+            }
+            if (irn + 1 >= cgraph->n_nodes) {
+                continue;
+            }
+            ggml_tensor * rn  = cgraph->nodes[irn];
+            ggml_tensor * mul = cgraph->nodes[irn + 1];
+            if (rn->op != GGML_OP_RMS_NORM || rn->src[0] != hc_post || mul->op != GGML_OP_MUL || (mul->src[0] != rn && mul->src[1] != rn)) {
+                continue;
+            }
+            for (int k = 0; k < 2; ++k) {
+                if (hc_post->src[k] != nullptr) {
+                    params->add_alloc_dep(params->user_data, hc_post->src[k], mul);
+                }
+            }
+            ggml_tensor * w = hc_post->src[2];
+            for (int k = 0; w != nullptr && k <= GGML_CUDA_HC_POST_NORM_MAX_OPS; ++k) {
+                params->add_alloc_dep(params->user_data, w, mul);
+                const bool chain = w->op == GGML_OP_SCALE || (w->op == GGML_OP_UNARY && ggml_get_unary_op(w) == GGML_UNARY_OP_SIGMOID);
+                w = chain ? w->src[0] : nullptr;
+            }
+        }
     }
 
     {
