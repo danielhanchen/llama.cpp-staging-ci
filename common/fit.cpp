@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "fit.h"
 
 #include "json.h"
@@ -258,17 +259,48 @@ static void common_params_fit_impl(
     const uint32_t n_streams  = cparams->kv_unified ? 1 : std::max<uint32_t>(1, cparams->n_seq_max);
     const bool     n_ctx_auto = cparams->n_ctx == 0;
 
-    dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
-    uint32_t n_ctx_extra = 0;  // context that memory was measured at
+    dmds_t      dmds_extra;    // memory of the extra model, laid out on the devices of the main model
+    std::string key_extra;     // context (and placement, see below) that memory was measured at
+
+    // k16-fit: an extra model that shares the weights of the main model (an MTP context) runs them in the placement the fit gives the
+    // main model, and takes its share of the main model's MoE cache budget (llama_moe_cache::budget, layer_set::nextn). Measured with
+    // its own parameters (every weight on the device, no cache) it priced the MTP context of Qwen3.6-35B-A3B UD-Q4_K_XL at 323 MiB of
+    // compute; with the experts in system memory it takes 714 MiB of compute (the staging of its host experts) and a 250 MiB cache share,
+    // so the loaded drafter left 474 MiB free against the 1024 MiB target (40 MiB at the end of a run). It is measured in the placement
+    // and at the cache size of the probe it is added to (one extra measure per distinct placement). LLAMA_FIT_EXTRA_FOLLOW=0: its own
+    // parameters, as before
+    static const bool extra_follow = getenv("LLAMA_FIT_EXTRA_FOLLOW") == nullptr || atoi(getenv("LLAMA_FIT_EXTRA_FOLLOW")) != 0;
+    auto placement_key = [&](const llama_model_params * mp, const llama_context_params * cp) {
+        std::string k = " ngl " + std::to_string(mp->n_gpu_layers) + " sm " + std::to_string(int(mp->split_mode)) +
+            " mg " + std::to_string(mp->main_gpu) + " cache " + std::to_string(cp->moe_cache_size) + " ts";
+        if (mp->tensor_split != nullptr) {
+            for (size_t i = 0; i < llama_max_devices(); i++) {
+                k += " " + std::to_string(mp->tensor_split[i]);
+            }
+        }
+        k += " tbo";
+        for (const llama_model_tensor_buft_override * o = mp->tensor_buft_overrides; o != nullptr && o->pattern != nullptr; o++) {
+            k += std::string(" ") + o->pattern + "=" + (o->buft != nullptr ? ggml_backend_buft_name(o->buft) : "-");
+        }
+        return k;
+    };
 
     // the extra model competes for the same memory as the main model, add it to every measurement
-    // its memory is measured again whenever the context it follows changes
-    auto add_extra_memory = [&](dmds_t & dmds) {
+    // its memory is measured again whenever the context it follows changes (and, sharing the model, its placement or cache size)
+    auto add_extra_memory = [&](dmds_t & dmds, const llama_model_params * mp_cur = nullptr, const llama_context_params * cp_cur = nullptr) {
         if (extra == nullptr) {
             return;
         }
+        if (mp_cur == nullptr) {
+            mp_cur = mparams;
+        }
+        if (cp_cur == nullptr) {
+            cp_cur = cparams;
+        }
+        const bool follow = extra->shares_model && extra_follow;
+        const std::string key = std::to_string(cparams->n_ctx) + (follow ? placement_key(mp_cur, cp_cur) : std::string());
 
-        if (dmds_extra.empty() || n_ctx_extra != cparams->n_ctx) {
+        if (dmds_extra.empty() || key_extra != key) {
             std::vector<ggml_backend_dev_t> devs_extra;
             uint32_t ngl_extra = 0;
             uint32_t nct_extra = 0;
@@ -276,18 +308,29 @@ static void common_params_fit_impl(
 
             extra->cparams->n_ctx = cparams->n_ctx;
 
-            LOG_TRC("%s: getting device memory data for the extra model at a context size of %" PRIu32 ":\n",
-                __func__, cparams->n_ctx);
+            llama_model_params   mp_x = *extra->mparams;
+            llama_context_params cp_x = *extra->cparams;
+            if (follow) {
+                mp_x.n_gpu_layers          = mp_cur->n_gpu_layers;
+                mp_x.split_mode            = mp_cur->split_mode;
+                mp_x.main_gpu              = mp_cur->main_gpu;
+                mp_x.tensor_split          = mp_cur->tensor_split;
+                mp_x.tensor_buft_overrides = mp_cur->tensor_buft_overrides;
+                cp_x.moe_cache_size        = cp_cur->moe_cache_size;
+            }
+
+            LOG_TRC("%s: getting device memory data for the extra model at a context size of %" PRIu32 "%s:\n",
+                __func__, cparams->n_ctx, follow ? ", in the placement of the main model" : "");
 
             dmds_t measured;
             try {
                 measured = common_get_device_memory_data_impl(
-                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+                    extra->path_model, &mp_x, &cp_x, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
                 dmds_extra = dmds_t(devs.size() + 1);
-                n_ctx_extra = cparams->n_ctx;
+                key_extra = key;
                 return;
             }
 
@@ -309,7 +352,7 @@ static void common_params_fit_impl(
                 }
             }
 
-            n_ctx_extra = cparams->n_ctx;
+            key_extra = key;
         }
 
         for (size_t id = 0; id < dmds.size(); id++) {
@@ -443,7 +486,7 @@ static void common_params_fit_impl(
         };
         auto measure = [&](const llama_context_params * cp) {
             dmds_t res = common_get_device_memory_data_impl(path_model, mp, cp, devs, hp_ngl, hp_nct, hp_nex, log_level);
-            add_extra_memory(res);
+            add_extra_memory(res, mp, cp);
             return res;
         };
         const int64_t surplus = surplus_of(dmds);
@@ -679,7 +722,7 @@ static void common_params_fit_impl(
             cparams_spill.n_ctx = n_ctx;
             dmds_t dmds_spill = common_get_device_memory_data_impl(
                 path_model, &mparams_spill, &cparams_spill, devs, hp_ngl, hp_nct, hp_nex, log_level);
-            add_extra_memory(dmds_spill);
+            add_extra_memory(dmds_spill, &mparams_spill, &cparams_spill);
             int64_t sum = 0;
             for (size_t id = 0; id < nd; id++) {
                 sum += dmds_spill[id].mb.total();
@@ -962,7 +1005,7 @@ static void common_params_fit_impl(
 
         dmds_t dmd_nl = common_get_device_memory_data_impl(
             path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
-        add_extra_memory(dmd_nl);
+        add_extra_memory(dmd_nl, &mparams_copy, cparams);
         return dmd_nl;
     };
 
@@ -1109,7 +1152,7 @@ static void common_params_fit_impl(
                 LOG_TRC("%s: getting device memory data with all layers in device memory and the experts of one layer:\n", __func__);
                 dmds_t dmds_all = common_get_device_memory_data_impl(
                     path_model, &mparams_all, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
-                add_extra_memory(dmds_all);
+                add_extra_memory(dmds_all, &mparams_all, cparams);
                 int64_t surplus_all = 0;
                 for (size_t id = 0; id < nd; id++) {
                     surplus_all += int64_t(dmds_all[id].free) - int64_t(dmds_all[id].mb.total()) - margins[id];
