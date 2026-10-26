@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
 #include <functional>
 #include <unordered_map>
 #include <unordered_set>
@@ -4289,18 +4290,22 @@ struct ggml_moe_disk_split {
     std::vector<const ggml_tensor *> host_weights;
 };
 
-static int ggml_moe_prefetch_ahead_n = -1;
+static std::atomic<int> ggml_moe_prefetch_ahead_n{-1};
 
 extern "C" void ggml_moe_prefetch_set_ahead(int n) {
-    ggml_moe_prefetch_ahead_n = n;
+    ggml_moe_prefetch_ahead_n.store(n, std::memory_order_relaxed);
 }
 
 static int ggml_moe_prefetch_ahead() {
-    if (ggml_moe_prefetch_ahead_n < 0) {
-        const char * env = getenv("GGML_MOE_PREFETCH_AHEAD");
-        ggml_moe_prefetch_ahead_n = env ? std::max(0, atoi(env)) : 3;
+    const int n = ggml_moe_prefetch_ahead_n.load(std::memory_order_relaxed);
+    if (n >= 0) {
+        return n;
     }
-    return ggml_moe_prefetch_ahead_n;
+    static const int def = [] {
+        const char * env = getenv("GGML_MOE_PREFETCH_AHEAD");
+        return env ? std::max(0, atoi(env)) : 3;
+    }();
+    return def;
 }
 
 static void ggml_moe_disk_splits(ggml_backend_sched_t sched, std::vector<ggml_moe_disk_split> & out) {

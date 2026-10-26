@@ -969,14 +969,21 @@ void llama_context::disk_prefetch_init() {
         return dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
     });
     const bool rand_read = env_i("LLAMA_MOE_DISK_PREFETCH_RANDOM", wstore || !has_gpu ? 1 : 0) != 0;
+    disk_ranges.reserve(disk_ranges.size() + ranges.size());
     for (const auto & r : ranges) {
         ggml_moe_prefetch_register_mapping(r.first, r.second, rand_read);
-        disk_ranges.push_back(r.first);
+        disk_ranges.emplace_back(r.first);
     }
     LLAMA_LOG_INFO("%s: disk prefetch on: %zu host expert tensors, %.1f MiB mapped, %.1f MiB of RAM available%s, %lld threads, lookahead %lld "
         "MoE splits%s, MADV_RANDOM %s (LLAMA_MOE_DISK_PREFETCH=0 off)\n", __func__, ranges.size(), bytes/1048576.0, avail/1048576.0,
         mode == 1 ? " (forced)" : "", env_i("LLAMA_MOE_DISK_PREFETCH_THREADS", 8), main_ctx ? env_i("LLAMA_MOE_DISK_PREFETCH_AHEAD", wstore ? 0 : 3) : -1LL,
         wstore ? " (the weight store reads the uploads)" : "", rand_read ? "on" : "off");
+}
+
+llama_context::disk_range_ref::~disk_range_ref() {
+    if (base != nullptr) {
+        ggml_moe_prefetch_unregister_mapping(base);
+    }
 }
 
 llama_context::~llama_context() {
@@ -986,9 +993,6 @@ llama_context::~llama_context() {
         LLAMA_LOG_INFO("%s: disk prefetch: %" PRIu64 " chunks, %" PRIu64 " resident (skipped), %.1f MiB read ahead, %" PRIu64 " product enqueues, "
             "%" PRIu64 " lookahead tensors (%" PRIu64 " dropped by the budget), %" PRIu64 " chunks MADV_COLD\n", __func__, c.n_jobs, c.n_skipped,
             c.bytes_populated/1048576.0, c.n_node, c.n_tensor, c.n_dropped, c.n_colded);
-        for (const void * p : disk_ranges) {
-            ggml_moe_prefetch_unregister_mapping(p);
-        }
         disk_ranges.clear();
     }
     if (n_plan_saves > 0) {

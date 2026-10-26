@@ -27,6 +27,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -117,7 +118,10 @@ struct prefetch_pool {
         }
     }
 
-    static bool chunk_resident(uintptr_t addr, size_t len) {
+    // k16-disk: all_cold = no page of the chunk was resident (only such chunks are recorded for MADV_COLD: a partly warm chunk
+    // holds working-set pages)
+    static bool chunk_resident(uintptr_t addr, size_t len, bool & all_cold) {
+        all_cold = false;
         const long page = sysconf(_SC_PAGESIZE);
         const uintptr_t astart = addr & ~(uintptr_t)(page - 1);
         const size_t    alen   = (addr + len) - astart;
@@ -129,17 +133,21 @@ struct prefetch_pool {
         if (mincore((void *)astart, alen, vec) != 0) {
             return false;
         }
+        bool all_resident = true;
+        all_cold = true;
         for (size_t i = 0; i < npages; ++i) {
-            if (!(vec[i] & 1)) return false;
+            const bool r = (vec[i] & 1) != 0;
+            all_resident &= r;
+            all_cold     &= !r;
         }
-        return true;
+        return all_resident;
     }
 
     void run();
 };
 
 struct prefetch_state {
-    std::mutex                 reg_mtx;
+    std::shared_mutex          reg_mtx; // k16-disk: workers hold it shared while they touch a range, so an unregister waits for them
     std::vector<mapping_entry> mappings;
 
     std::atomic<uint64_t> epoch{1};
@@ -178,6 +186,8 @@ static prefetch_state & state() {
     return s;
 }
 
+static bool is_mapped_locked(const void * p, size_t len);
+
 void prefetch_pool::run() {
     const long page = sysconf(_SC_PAGESIZE);
     auto & s = state();
@@ -192,9 +202,14 @@ void prefetch_pool::run() {
         }
         s.n_jobs.fetch_add(1, std::memory_order_relaxed);
         bool done_read = false;
-        // skip when every page is already resident; keeps the drain rate
-        // high when the cache is warm
-        if (chunk_resident(j.addr, j.len)) {
+        bool all_cold  = false;
+        // k16-disk: the range must still be registered while the worker touches it (an unregister takes reg_mtx exclusively, so the
+        // address can never belong to a later mapping here)
+        std::shared_lock<std::shared_mutex> reg(s.reg_mtx);
+        if (!is_mapped_locked((const void *) j.addr, j.len)) {
+            // unregistered after the enqueue: skip
+        } else if (chunk_resident(j.addr, j.len, all_cold)) {
+            // skip when every page is already resident; keeps the drain rate high when the cache is warm
             s.n_skipped.fetch_add(1, std::memory_order_relaxed);
         } else {
             const uintptr_t astart = j.addr & ~(uintptr_t)(page - 1);
@@ -207,31 +222,36 @@ void prefetch_pool::run() {
                 done_read = true;
             } // on failure the fault path takes over
         }
+        reg.unlock();
         if (j.lookahead) {
             lookahead_bytes.fetch_sub(std::min<size_t>(j.len, lookahead_bytes.load()), std::memory_order_relaxed);
         }
         if (j.tk) {
-            const int left = j.tk->pending.fetch_sub(1, std::memory_order_acq_rel);
+            // k16-disk: the read is published before the ticket completes, so a waiter / MADV_COLD sees it
             std::lock_guard<std::mutex> lock(mtx);
-            if (done_read && j.tk->track_reads) {
+            if (done_read && all_cold && j.tk->track_reads) {
                 j.tk->read_chunks.emplace_back(j.addr, j.len);
             }
-            if (left == 1) {
+            if (j.tk->pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                 cv_done.notify_all();
             }
         }
     }
 }
 
-// true when [p, p+len) lies inside a registered range
-static bool is_mapped(const void * p, size_t len) {
+// true when [p, p+len) lies inside a registered range (caller holds reg_mtx)
+static bool is_mapped_locked(const void * p, size_t len) {
     auto & s = state();
-    std::lock_guard<std::mutex> lock(s.reg_mtx);
     const uintptr_t a = (uintptr_t)p;
     for (const auto & m : s.mappings) {
         if (a >= m.base && a + len <= m.base + m.size) return true;
     }
     return false;
+}
+
+static bool is_mapped(const void * p, size_t len) {
+    std::shared_lock<std::shared_mutex> lock(state().reg_mtx);
+    return is_mapped_locked(p, len);
 }
 
 // collect [offset, offset+len) ranges of the selected experts of weight tensor w
@@ -300,7 +320,12 @@ static bool enqueue_ranges(const ggml_tensor * w, const std::vector<std::pair<si
     if (pool.shutdown) return false;
 
     if (urgent) {
-        // the routed experts of a running product: no ticket (nobody waits for them), never dropped
+        // the routed experts of a running product: no ticket (nobody waits for them), dropped only beyond the queue cap (a stalled
+        // drive: the demand faults read them anyway)
+        if (pool.queue.size() > GGML_MOE_PREFETCH_MAX_QUEUE) {
+            s.n_dropped.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
         s.n_node.fetch_add(1, std::memory_order_relaxed);
         pool.queue.insert(pool.queue.begin(), std::make_move_iterator(jobs.begin()), std::make_move_iterator(jobs.end()));
         pool.cv_work.notify_all();
@@ -346,10 +371,14 @@ static void advise_range(uintptr_t base, size_t size, int advice) {
 void ggml_moe_prefetch_register_mapping(const void * base, size_t size, bool rand_read) {
     if (!base || size == 0) return;
     auto & s = state();
-    std::lock_guard<std::mutex> lock(s.reg_mtx);
+    std::unique_lock<std::shared_mutex> lock(s.reg_mtx);
     for (auto & m : s.mappings) {
         if (m.base == (uintptr_t)base) { // contexts may re-register the same model
             m.refs++;
+            if (m.rand_read && !rand_read) { // a registrant that needs read-around wins (e.g. an MTP context without a weight store)
+                advise_range(m.base, m.size, MADV_NORMAL);
+                m.rand_read = false;
+            }
             return;
         }
     }
@@ -361,9 +390,8 @@ void ggml_moe_prefetch_register_mapping(const void * base, size_t size, bool ran
 
 void ggml_moe_prefetch_unregister_mapping(const void * base) {
     auto & s = state();
-    std::lock_guard<std::mutex> lock(s.reg_mtx);
-    // a queued job may still point into this range; its madvise then fails
-    // (ENOMEM once unmapped) and the worker skips the chunk
+    // waits for the workers touching a registered range; a job queued for this range is skipped after the erase
+    std::unique_lock<std::shared_mutex> lock(s.reg_mtx);
     for (size_t i = 0; i < s.mappings.size(); ++i) {
         mapping_entry & m = s.mappings[i];
         if (m.base == (uintptr_t)base && --m.refs <= 0) {
@@ -457,10 +485,12 @@ void ggml_moe_prefetch_cold(const struct ggml_tensor * w) {
         if (it == pool->tickets.end() || !it->second->track_reads) return;
         chunks.swap(it->second->read_chunks);
     }
-    const uintptr_t page_mask = (uintptr_t)sysconf(_SC_PAGESIZE) - 1;
+    // k16-disk: whole pages inside each chunk only (a page shared with a neighbouring tensor keeps its state), ranges still registered
+    std::shared_lock<std::shared_mutex> reg(s.reg_mtx);
     for (const auto & c : chunks) {
-        const uintptr_t astart = c.first & ~page_mask;
-        (void) madvise((void *)astart, (size_t)(c.first + c.second - astart), MADV_COLD);
+        if (is_mapped_locked((const void *) c.first, c.second)) {
+            advise_range(c.first, c.second, MADV_COLD);
+        }
     }
     s.n_colded.fetch_add(chunks.size(), std::memory_order_relaxed);
 }
@@ -499,7 +529,7 @@ void ggml_moe_prefetch_stats(struct ggml_moe_prefetch_counters * out) {
     out->n_node          = s.n_node.load();
     out->n_tensor        = s.n_tensor.load();
     out->n_dropped       = s.n_dropped.load();
-    std::lock_guard<std::mutex> lock(s.reg_mtx);
+    std::shared_lock<std::shared_mutex> lock(s.reg_mtx);
     out->n_ranges = s.mappings.size();
     uint64_t b = 0;
     for (const auto & m : s.mappings) {
