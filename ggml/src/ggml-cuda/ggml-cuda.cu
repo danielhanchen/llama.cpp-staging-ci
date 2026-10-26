@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -7312,6 +7313,36 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                             i += ops.size() - 1;
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // The outputs of a residual add + RMS norm + mul that ggml_cuda_try_fuse_add_rms_norm may fuse are kept off the two add inputs.
+    // Both inputs are dead after the add, so the allocator placed the add output (in place) and the norm output over them, and the
+    // fused kernel (rms_norm_mul_q8_1_f32 with ra / rb) overwrote both of its inputs. With PDL that was not repeatable: Qwen3.6-35B-A3B
+    // MTP at a spilled MoE tier (B200, -ot exps=CPU --moe-cache-mib 7480), in the 3- and 4-token graphs of the full-attention layers the
+    // norm output (attn_post_norm, placed over the previous layer's l_out) came out wrong in some launches, and with it the router
+    // and the shared expert, so the greedy text of a request differed. PDL off, the fusion off, or this placement each made every
+    // launch repeat. Costs only the memory of the two inputs until the norm is computed (no extra kernel); the fusion still runs.
+    // GGML_CUDA_ADD_RMS_ALIAS=1: let the allocator place the outputs over the inputs, as before
+    if (!disable_fusion) {
+        static const bool alias_ok = ggml_cuda_env_flag("GGML_CUDA_ADD_RMS_ALIAS");
+        static const bool fuse_on  = [] {
+            const char * e = getenv("GGML_CUDA_ADD_RMS_FUSE");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        for (int i = 0; !alias_ok && fuse_on && i + 2 < cgraph->n_nodes; ++i) {
+            ggml_tensor * add = cgraph->nodes[i];
+            ggml_tensor * rms = cgraph->nodes[i + 1];
+            ggml_tensor * mul = cgraph->nodes[i + 2];
+            if (add->op != GGML_OP_ADD || rms->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || rms->src[0] != add ||
+                    (mul->src[0] != rms && mul->src[1] != rms) || add->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+                continue;
+            }
+            for (int k = 0; k < 2; ++k) {
+                if (add->src[k] != nullptr) {
+                    params->add_alloc_dep(params->user_data, add->src[k], mul);
                 }
             }
         }
