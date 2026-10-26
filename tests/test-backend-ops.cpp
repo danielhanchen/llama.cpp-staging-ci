@@ -13185,6 +13185,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (auto mk : std::vector<std::array<int64_t, 2>>{ { 4, 10240 }, { 48, 2560 }, { 512, 2560 }, { 1, 2560 } }) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
         }
+        // k15-mm2: the router and indexer shapes as BF16 (the F32 router weights are exactly BF16-representable; indexer q / k)
+        for (auto mk : std::vector<std::array<int64_t, 2>>{ { 512, 2560 }, { 128, 2560 } }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
+        }
     }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
