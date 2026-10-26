@@ -7398,8 +7398,10 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 
     // k15-ov: a host save reads its device rows in a few large copies through pinned halves (state_get_bounced) instead of one synchronous
     // copy per row: G4 Flash-Next UD-IQ4_XS, the server's prompt-cache save at a request's start was 118 synchronous 2 MiB copies at
-    // ~3 GB/s (60 ms before an 8k prompt, ~120 ms before a 16k one). The same bytes reach the destination. LLAMA_STATE_BOUNCE=0: as before
-    static const bool bounce_env = getenv("LLAMA_STATE_BOUNCE") == nullptr || atoi(getenv("LLAMA_STATE_BOUNCE")) != 0;
+    // ~3 GB/s (60 ms before an 8k prompt, ~120 ms before a 16k one). The same bytes reach the destination. Opt-in (LLAMA_STATE_BOUNCE=1):
+    // G4 k15g4z1 (3 launches) 16k TTFT -0.7..-1.3% (fn4 16 / 24 GB, q4x 12 GB), 2k / chat within the spread, for 2 x 16 MiB of pinned host
+    // memory per backend; most of the save is the first touch of a fresh cache entry, not the copies
+    static const bool bounce_env = getenv("LLAMA_STATE_BOUNCE") != nullptr && atoi(getenv("LLAMA_STATE_BOUNCE")) != 0;
     if (bounce_env && !(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
         llama_io_write_host_async io(dst, size);
         try {
