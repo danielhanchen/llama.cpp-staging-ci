@@ -2481,6 +2481,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             const char * env_ar = getenv("LLAMA_KV_AUTO_Q8_ARCHS");
             const int     aq_mode = env_aq != nullptr ? atoi(env_aq) : 1;
             const int64_t min_ctx = env_mc != nullptr ? atoll(env_mc) : 8192;
+            // k16-parity G4 (k16p_g4c, q3m 4 GB + MTP): the two trades below win decode but lose the prompt with q8_0 K/V (20k: decode
+            // +12..19% over f16, 2k / 8k prompt -9% / -34%; 32k: +5..15%, -40% / -60%; 16k "a larger MoE cache": decode -4..-9%), so by
+            // default q8_0 is kept only for more context, more layers or every expert on the device. LLAMA_KV_AUTO_Q8_TRADE=1: also for the
+            // MTP drafter that f16 drops and for a MoE cache larger by max(64 MiB, 1/8)
+            const bool aq_trade = getenv("LLAMA_KV_AUTO_Q8_TRADE") != nullptr && atoi(getenv("LLAMA_KV_AUTO_Q8_TRADE")) != 0;
             bool aq_on = aq_mode != 0 && !model_only && !params.cache_type_k_set && !params.cache_type_v_set &&
                 params.cache_type_k == GGML_TYPE_F16 && params.cache_type_v == GGML_TYPE_F16 &&
                 params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && !params.embedding &&
@@ -2568,11 +2573,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                             why = "more context";
                         } else if (b.n_ctx == a.n_ctx && b.layers > a.layers) {
                             why = "more layers on the device";
-                        } else if (b.n_ctx == a.n_ctx && b.layers == a.layers && b.mtp && !a.mtp) {
-                            why = "the MTP drafter stays";
                         } else if (b.n_ctx == a.n_ctx && b.layers == a.layers && b.mtp == a.mtp && a.n_host > 0 && b.n_host == 0) {
                             why = "every expert on the device";
-                        } else if (b.n_ctx == a.n_ctx && b.layers == a.layers && b.mtp == a.mtp && b.n_host > 0 &&
+                        } else if (aq_trade && b.n_ctx == a.n_ctx && b.layers == a.layers && b.mtp && !a.mtp) {
+                            why = "the MTP drafter stays";
+                        } else if (aq_trade && b.n_ctx == a.n_ctx && b.layers == a.layers && b.mtp == a.mtp && b.n_host > 0 &&
                                 b.cache >= a.cache + std::max<int64_t>(64*mib, a.cache/8)) {
                             why = "a larger MoE cache";
                         }
