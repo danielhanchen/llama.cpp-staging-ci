@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -1423,7 +1424,9 @@ private:
 
         {
             const char * e = getenv("LLAMA_SERVER_DEVICE_GREEDY");
-            device_greedy_ok = (e == nullptr || atoi(e) != 0) && llama_model_n_devices(model_tgt) > 0;
+            // integration head: opt-in again (LLAMA_SERVER_DEVICE_GREEDY=1): with it on, a request with n_probs > 0 gets an empty
+            // completion_probabilities top list (Qwen3.6 Q4_K_XL full card, /completion n_probs 5: 0 entries; =0: 5)
+            device_greedy_ok = e != nullptr && atoi(e) != 0 && llama_model_n_devices(model_tgt) > 0;
             for (int i = 0; device_greedy_ok && i < llama_model_n_devices(model_tgt); ++i) {
                 ggml_backend_dev_t dev = llama_model_get_device(model_tgt, i);
                 ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
