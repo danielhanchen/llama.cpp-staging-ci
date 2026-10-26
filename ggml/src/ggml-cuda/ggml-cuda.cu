@@ -3281,7 +3281,8 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
     // sticky: it is cleared and the graph is instantiated again, as for an update failure. A sticky error (an earlier kernel fault)
     // fails the instantiation below with its own message
     static const bool update_retry = getenv("GGML_CUDA_GRAPH_UPDATE_RETRY") == nullptr || atoi(getenv("GGML_CUDA_GRAPH_UPDATE_RETRY")) != 0;
-    if (stat != cudaSuccess && stat != cudaErrorGraphExecUpdateFailure && update_retry) {
+    const bool update_error = stat != cudaSuccess && stat != cudaErrorGraphExecUpdateFailure && update_retry;
+    if (update_error) {
         static int n_logged = 0;
         if (n_logged++ < 4) {
             GGML_LOG_WARN("%s: CUDA graph update failed with %s (%d): instantiating the graph again\n", __func__, cudaGetErrorString(stat), (int) stat);
@@ -3297,7 +3298,18 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         // The pre-existing graph exec cannot be updated due to violated constraints
         // so instead clear error and re-instantiate
         (void)cudaGetLastError();
-        CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+        if (update_error) {
+            // k16-race: after another error than an update failure (seen after a launch stalled for minutes on a crowded GPU: the
+            // update returned invalid argument and so did this destroy, which aborted) the exec is destroyed at most once and a
+            // failed destroy is not fatal: the handle is dropped and a new exec instantiated (GGML_CUDA_GRAPH_UPDATE_RETRY=0: assert)
+            const cudaError_t de = graph->instance != nullptr ? cudaGraphExecDestroy(graph->instance) : cudaSuccess;
+            if (de != cudaSuccess) {
+                GGML_LOG_WARN("%s: destroying the exec after the failed update gave %s: dropped, instantiating a new one\n", __func__, cudaGetErrorString(de));
+                (void)cudaGetLastError();
+            }
+        } else {
+            CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+        }
         graph->instance = nullptr;
         cudaError_t inst = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
         // k11: out of memory may pass once other processes free some; a few tries before the error is fatal
