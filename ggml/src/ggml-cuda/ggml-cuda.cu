@@ -3216,6 +3216,45 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
     return true;
 }
 
+// k15-fn: RMS_NORM -> MUL -> ROPE with a multi-section, non-vision rope (ggml_cuda_op_rms_norm_mul_mrope_fused): f32, the rope
+// reads the mul output, the norm is the full-shape mul operand, the mul output is contiguous (the norm kernel writes it there)
+static bool ggml_cuda_should_fuse_rms_norm_mul_mrope(const ggml_tensor * rms_norm, const ggml_tensor * mul, const ggml_tensor * rope) {
+    if (rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || rope->op != GGML_OP_ROPE) {
+        return false;
+    }
+    if (rms_norm->src[0]->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 || mul->src[0]->type != GGML_TYPE_F32 ||
+        mul->src[1]->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || rope->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (rope->src[0] != mul || (mul->src[0] != rms_norm && mul->src[1] != rms_norm)) {
+        return false;
+    }
+    const ggml_tensor * mul_src = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    if (!ggml_are_same_shape(rms_norm, mul) || !ggml_can_repeat(mul_src, mul) || !ggml_is_contiguous(mul) ||
+        !ggml_is_contiguous_rows(rms_norm->src[0]) || !ggml_is_contiguous_rows(mul_src)) {
+        return false;
+    }
+    const int mode = ((const int32_t *) rope->op_params)[2];
+    if (!(mode & GGML_ROPE_TYPE_MROPE) || mode == GGML_ROPE_TYPE_VISION) {
+        return false;
+    }
+    const int n_dims = ((const int32_t *) rope->op_params)[1];
+    const int n_offs = ((const int32_t *) rope->op_params)[15];
+    const int64_t ne0 = mul->ne[0];
+    if (n_dims <= 0 || n_dims % 2 != 0 || n_offs < 0 || n_offs % 2 != 0 || ne0 % 2 != 0 || n_offs + n_dims > ne0) {
+        return false;
+    }
+    // the norm grid is (rows, channels, samples): the rope row is (head, token, sequence), pos is indexed by the token
+    if (!ggml_are_same_shape(rope, mul) || rope->src[1]->type != GGML_TYPE_I32 || rope->src[1]->ne[0] < 4*mul->ne[2] ||
+        (rope->src[2] != nullptr && rope->src[2]->type != GGML_TYPE_F32)) {
+        return false;
+    }
+    // the rope output rows must not overlap the rows the kernel still reads (only the in-place rope writes back to the mul output)
+    const char * r0 = (const char *) rope->data;
+    const char * m0 = (const char *) mul->data;
+    return r0 == m0 || r0 + ggml_nbytes(rope) <= m0 || m0 + ggml_nbytes(mul) <= r0;
+}
+
 // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
 // (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
 static int ggml_cuda_try_gdn_cache_fusion(
@@ -5644,6 +5683,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    {
+        // k15-fn: the multi-section rope after a q / k norm (qwen4exp attention + indexer q), in the norm kernel
+        // (GGML_CUDA_DISABLE_NORM_MROPE_FUSION=1 turns it off)
+        static const bool mrope_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_NORM_MROPE_FUSION");
+        if (!mrope_disabled && node->op == GGML_OP_RMS_NORM &&
+                ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }) &&
+                ggml_cuda_should_fuse_rms_norm_mul_mrope(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+            int out_nodes[] = { i + 2 };
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 1)) {
+                ggml_cuda_op_rms_norm_mul_mrope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+                return 2;
+            }
+        }
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {

@@ -2849,6 +2849,71 @@ struct test_rms_norm_mul_rope : public test_case {
     }
 };
 
+// k15-fn: RMS_NORM -> MUL -> ROPE with a multi-section rope as qwen4exp builds it (per-head q / k norm over a strided view,
+// partial rotary window, optionally at an offset, in place, with freq factors), fused into the norm kernel by the CUDA backend
+struct test_norm_mrope : public test_case {
+    const std::array<int64_t, 3> ne; // head dim, heads, tokens
+    const int  n_dims;
+    const int  mode;
+    const bool strided;
+    const int  n_offs;
+    const bool inplace;
+    const bool ff;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "NORM_MROPE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR7(ne, n_dims, mode, strided, n_offs, inplace, ff);
+    }
+
+    test_norm_mrope(std::array<int64_t, 3> ne, int n_dims, int mode, bool strided, int n_offs = 0, bool inplace = false, bool ff = false)
+        : ne(ne), n_dims(n_dims), mode(mode), strided(strided), n_offs(n_offs), inplace(inplace), ff(ff) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0] * (strided ? 2 : 1), ne[1], ne[2]);
+        if (strided) {
+            a = ggml_view_3d(ctx, a, ne[0], ne[1], ne[2], a->nb[1], a->nb[2], 0);
+        }
+        ggml_tensor * w   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne[2] * 4);
+        ggml_tensor * fr  = ff ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_dims/2) : nullptr;
+
+        a = ggml_mul(ctx, ggml_rms_norm(ctx, a, 1e-6f), w);
+        int sections[4] = { n_dims/6, n_dims/6, n_dims/2 - 2*(n_dims/6), 0 };
+        if (inplace) {
+            a = ggml_rope_multi_inplace(ctx, a, pos, fr, n_dims, sections, mode, 0, 10000000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        } else {
+            a = ggml_rope_multi(ctx, a, pos, fr, n_dims, sections, mode, 0, 10000000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        }
+        if (n_offs != 0) {
+            a = ggml_rope_set_offset(a, n_offs);
+        }
+        ggml_set_name(a, "out");
+        return a;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int32_t & value : data) {
+                    value = rand() % 4096;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (t->ne[0] == n_dims/2 && ff) {
+                init_tensor_uniform(t, 0.9f, 1.1f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_ARGMAX
 struct test_argmax : public test_case {
     const ggml_type type;
@@ -12866,6 +12931,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_gate_mul_add(op, 2560, m, false));
             test_cases.emplace_back(new test_gate_mul_add(op, 2560, m, true));
             test_cases.emplace_back(new test_gate_mul_add(op, 100, m, true));
+        }
+    }
+
+    // k15-fn: q / k norm + multi-section rope (the qwen4exp attention and indexer shapes: head dim 256 / 128, partial rotary)
+    for (int mode : { GGML_ROPE_TYPE_IMROPE, GGML_ROPE_TYPE_MROPE }) {
+        for (int64_t n_tok : { 1, 3, 17 }) {
+            test_cases.emplace_back(new test_norm_mrope({ 256, 16, n_tok }, 64, mode, true));
+            test_cases.emplace_back(new test_norm_mrope({ 256,  2, n_tok }, 64, mode, false));
+            test_cases.emplace_back(new test_norm_mrope({ 128,  8, n_tok }, 64, mode, false));
+            test_cases.emplace_back(new test_norm_mrope({ 128,  8, n_tok }, 128, mode, false));
+            test_cases.emplace_back(new test_norm_mrope({ 256,  4, n_tok }, 64, mode, false, 32));
+            test_cases.emplace_back(new test_norm_mrope({ 256,  4, n_tok }, 64, mode, false, 0, true));
+            test_cases.emplace_back(new test_norm_mrope({ 256,  4, n_tok }, 64, mode, true, 64, true, true));
+            test_cases.emplace_back(new test_norm_mrope({ 4096, 2, n_tok }, 64, mode, false));
+            test_cases.emplace_back(new test_norm_mrope({ 100,  3, n_tok }, 36, mode, false, 0, false, true));
         }
     }
 
