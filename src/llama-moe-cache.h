@@ -231,6 +231,13 @@ public:
     bool lends_graph_any() const;
     // the cache lends slots on the device of backend (decided by the first large graph, see lend): the staging arena is not allocated there
     bool lends_on(ggml_backend_t backend) const;
+    // k15-fn: the most slots the cache can lend to a merged layer-major graph's allocation on the device of backend (0: none), for capping
+    // a group before it is built; n_slots / expert_bytes (optional) get the size of the group it lends from. An upper bound: the staging
+    // copies share the lent slots and the placement fits whole bank tails, so a graph of capacity*expert_bytes may still be refused
+    int32_t graph_lend_capacity(ggml_backend_t backend, int32_t * n_slots = nullptr, size_t * expert_bytes = nullptr) const;
+    // graph_lend_capacity in bytes. The slots lent now are not subtracted: lend() places each graph's copies afresh in up to that many slots
+    // (it reuses or gives back what an earlier graph held), so the whole capacity is available to the next graph
+    size_t lend_capacity_bytes(ggml_backend_t backend) const;
     bool lends_graph() const; // the graph allocator may borrow too (LLAMA_MOE_CACHE_LEND=2)
     // whether a graph of n_tokens may get its allocation lent (LLAMA_MOE_CACHE_LEND=2 and not a batch the device lookup serves)
     bool lends_graph_to(int64_t n_tokens) const;

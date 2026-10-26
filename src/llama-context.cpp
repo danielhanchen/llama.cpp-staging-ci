@@ -1180,16 +1180,29 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
             const double tokens = n_used > 0 ? moe_cache->cached_frac()*(double) model.hparams.n_expert/(double) n_used : 0.0;
             const uint64_t ram_total = llama_sysmem::total();
             const bool ram_ok = ram_total == 0 || moe_cache->host_uncached_bytes() <= ram_frac*(double) ram_total;
-            const char * why = cparams.spec_draft ? "speculative decoding with a draft model or MTP heads" :
+            // k15-ov: a draft model that --fit dropped (common sets LLAMA_FIT_DRAFT_DROPPED=1: it does not fit beside the cache, so
+            // speculative decoding is off) leaves no draft to compete with a deeper staging: depth LLAMA_MOE_PREFETCH_DEPTH_DROPPED (4;
+            // 0 = as before) where the cache holds the experts of at least LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS (10) tokens.
+            // G4 Flash-Next UD-IQ4_XS Studio argv (Q8_0 drafter dropped), 3 launches, A/A 0.4%, k15g4v1: 24 GB (14.6 tokens) depth 3 /
+            // 4: 8k 1.831 -> 1.780 / 1.716 s, 16k 3.562 -> 3.468 / 3.344 s, decode and pinned md5 unchanged; 16 GB (6.1 tokens) depth 3
+            // reserved the staging in device memory at fit time, the cache fell under the hybrid gate's 10% (6735 -> 5463 MiB, no
+            // layer-major groups): 8k 1.909 -> 4.200 s, hence the minimum
+            static const int dropped_depth = getenv("LLAMA_MOE_PREFETCH_DEPTH_DROPPED") ? std::max(0, atoi(getenv("LLAMA_MOE_PREFETCH_DEPTH_DROPPED"))) : 4;
+            static const double dropped_min = getenv("LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS") ?
+                std::max(0.0, atof(getenv("LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS"))) : 10.0;
+            const bool draft_dropped = dropped_depth > 0 && cparams.spec_draft && getenv("LLAMA_FIT_DRAFT_DROPPED") != nullptr &&
+                atoi(getenv("LLAMA_FIT_DRAFT_DROPPED")) != 0;
+            const char * why = cparams.spec_draft && !draft_dropped ? "speculative decoding with a draft model or MTP heads" :
+                draft_dropped && tokens < dropped_min ? "a dropped draft model beside a cache of fewer tokens than LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS" :
                 tokens < min_tokens ? "the cache holds the experts of fewer tokens than LLAMA_MOE_PREFETCH_DEPTH_SPILL_MIN_TOKENS" :
                 !ram_ok ? "the uncached host experts are more than LLAMA_MOE_PREFETCH_DEPTH_SPILL_MAX_RAM_FRAC of the RAM" : nullptr;
-            depth_spill = why == nullptr ? 3 : 0;
+            depth_spill = why == nullptr ? (draft_dropped ? dropped_depth : 3) : 0;
             static bool logged = false; // once per process, not for a memory probe (no_alloc), whose log the fit silences
             if (!logged && !model.hparams.no_alloc) {
                 logged = true;
                 LLAMA_LOG_INFO("%s: MoE cache: host weight prefetch of the spilled experts starts at depth %s (cache = the experts of %.1f "
                     "tokens%s%s; LLAMA_MOE_PREFETCH_DEPTH_SPILL=N forces N, LLAMA_MOE_PREFETCH_DEPTH_RULE=0 keeps the default)\n", __func__,
-                    why == nullptr ? "3" : "the default", tokens, why ? ": " : "", why ? why : "");
+                    why == nullptr ? (draft_dropped ? std::to_string(dropped_depth).c_str() : "3") : "the default", tokens, why ? ": " : "", why ? why : "");
             }
         }
         if (depth_spill > 0) {
@@ -5015,8 +5028,19 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                     free_min = std::min(free_min, fr);
                 }
             }
-            LLAMA_LOG_INFO("decode_layer_major: the graph of ubatches [%zu, %zu) would grow the compute buffers by %.2f MiB (%.2f MiB free): split at %zu\n",
-                a, b, over/1048576.0, free_min == SIZE_MAX ? -1.0 : free_min/1048576.0, mid);
+            // k15-fn: and what the cache could lend a merged graph at most (llama_moe_cache::graph_lend_capacity, the largest over the devices)
+            int32_t lc_max = 0, lc_slots = 0;
+            size_t  lc_bytes = 0;
+            for (auto & bk : backend_ptrs) {
+                int32_t ns = 0;
+                size_t  eb = 0;
+                const int32_t c = moe_cache->graph_lend_capacity(bk, &ns, &eb);
+                if ((size_t) c*eb > (size_t) lc_max*lc_bytes) {
+                    lc_max = c; lc_slots = ns; lc_bytes = eb;
+                }
+            }
+            LLAMA_LOG_INFO("decode_layer_major: the graph of ubatches [%zu, %zu) would grow the compute buffers by %.2f MiB (%.2f MiB free; the cache lends at most %d of %d slots, %.2f MiB): split at %zu\n",
+                a, b, over/1048576.0, free_min == SIZE_MAX ? -1.0 : free_min/1048576.0, lc_max, lc_slots, (double) lc_max*lc_bytes/1048576.0, mid);
         }
         st = run_range(a, mid);
         if (st != GGML_STATUS_SUCCESS) {
@@ -5372,6 +5396,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
     if (!buf_output || prev_size < new_size) {
+        static const bool log_env = getenv("LLAMA_OUTPUT_RESERVE_LOG") != nullptr && atoi(getenv("LLAMA_OUTPUT_RESERVE_LOG")) != 0;
+        if (log_env) {
+            LLAMA_LOG_INFO("%s: ctx %p type %d: output buffer %.2f -> %.2f MiB (logits %.2f, embd %.2f, embd_nextn %.2f%s, layer_inp %.2f, sampling %.2f MiB; n_outputs %d, n_batch %u)\n",
+                __func__, (void *) this, (int) cparams.ctx_type, prev_size/1048576.0, new_size/1048576.0, logits.size*4/1048576.0, embd.size*4/1048576.0,
+                embd_nextn.size*4/1048576.0, has_embd_nextn && !cparams.embeddings_nextn_masked ? " unmasked" : "", embd_layer_inp_float_count*4/1048576.0,
+                backend_float_count*4/1048576.0, n_outputs, n_batch);
+        }
         if (buf_output) {
 #ifndef NDEBUG
             // This doesn't happen often, but may be annoying in some cases (like the HellaSwag benchmark)
@@ -7369,6 +7400,32 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         synchronize();
     }
 
+    // k15-ov: a host save reads its device rows in a few large copies through pinned halves (state_get_bounced) instead of one synchronous
+    // copy per row: G4 Flash-Next UD-IQ4_XS, the server's prompt-cache save at a request's start was 118 synchronous 2 MiB copies at
+    // ~3 GB/s (60 ms before an 8k prompt, ~120 ms before a 16k one). The same bytes reach the destination. Opt-in (LLAMA_STATE_BOUNCE=1):
+    // G4 k15g4z1 (3 launches) 16k TTFT -0.7..-1.3% (fn4 16 / 24 GB, q4x 12 GB), 2k / chat within the spread, for 2 x 16 MiB of pinned host
+    // memory per backend; most of the save is the first touch of a fresh cache entry, not the copies
+    static const bool bounce_env = getenv("LLAMA_STATE_BOUNCE") != nullptr && atoi(getenv("LLAMA_STATE_BOUNCE")) != 0;
+    if (bounce_env && !(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
+        llama_io_write_host_async io(dst, size);
+        try {
+            io.write(&io_magic, sizeof(io_magic));
+            io.write(&seq_id, sizeof(seq_id));
+
+            const size_t n = state_seq_write_data(io, seq_id, flags);
+
+            if (!state_get_bounced(io.winfos)) {
+                for (const auto & w : io.winfos) {
+                    ggml_backend_tensor_get(w.tensor, w.dst, w.offset, w.size);
+                }
+            }
+            return n;
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+            return 0;
+        }
+    }
+
     std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
@@ -7784,6 +7841,112 @@ size_t llama_context::state_async_reserve(llama_state_seq_flags flags) {
 // backend (reused across saves); a worker thread waits on an event per backend and copies them to dst, so the host is
 // free to prepare the next ubatch meanwhile. Rows in host buffers, or on a device without async copies and events,
 // take the synchronous path instead.
+// k15-ov: the rows of a synchronous host save, read through two pinned halves per device backend: the copies of one half are queued on
+// the backend (in stream order after its queued work, as ggml_backend_tensor_get) while the host copies the previous half to the
+// destination. Returns false (nothing read) when a row is not on an async-capable device backend or the halves cannot be allocated
+bool llama_context::state_get_bounced(const std::vector<llama_state_write_info> & winfos) {
+    if (winfos.empty()) {
+        return true;
+    }
+    state_async_init_backends();
+    if (state_async.empty()) {
+        return false;
+    }
+    static const size_t half = (size_t) std::max(1, getenv("LLAMA_STATE_BOUNCE_MIB") ? atoi(getenv("LLAMA_STATE_BOUNCE_MIB")) : 16) << 20;
+    if (state_bounce.size() != state_async.size()) {
+        state_bounce.resize(state_async.size());
+    }
+    std::vector<int> owner(winfos.size(), -1);
+    for (size_t i = 0; i < winfos.size(); ++i) {
+        const ggml_tensor * t = winfos[i].tensor;
+        ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+        if (buf == nullptr) {
+            return false;
+        }
+        if (ggml_backend_buffer_is_host(buf)) {
+            continue; // read on the host below
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+        for (size_t b = 0; b < state_async.size(); ++b) {
+            if (ggml_backend_buft_get_device(buft) == state_async[b].dev && ggml_backend_supports_buft(state_async[b].backend, buft)) {
+                owner[i] = (int) b;
+                break;
+            }
+        }
+        if (owner[i] < 0) {
+            return false;
+        }
+    }
+    for (size_t b = 0; b < state_bounce.size(); ++b) {
+        auto & sb = state_bounce[b];
+        if (!sb.buf) {
+            sb.buf.reset(ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(state_async[b].dev), 2*half));
+            for (int h = 0; h < 2 && sb.buf; ++h) {
+                sb.ev[h] = ggml_backend_event_new(state_async[b].dev);
+                if (sb.ev[h] == nullptr) {
+                    sb.buf.reset();
+                }
+            }
+            if (!sb.buf) {
+                return false;
+            }
+        }
+    }
+    // host rows first (no copy queue involved)
+    for (size_t i = 0; i < winfos.size(); ++i) {
+        if (owner[i] < 0) {
+            ggml_backend_tensor_get(winfos[i].tensor, winfos[i].dst, winfos[i].offset, winfos[i].size);
+        }
+    }
+    struct piece { uint8_t * dst; size_t off; size_t size; };
+    for (size_t b = 0; b < state_bounce.size(); ++b) {
+        auto & sb = state_bounce[b];
+        ggml_backend_t be = state_async[b].backend;
+        uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(sb.buf.get());
+        std::vector<piece> pend[2];
+        int h = 0;
+        size_t used = 0;
+        auto drain = [&](int k) {
+            if (pend[k].empty()) {
+                return;
+            }
+            ggml_backend_event_synchronize(sb.ev[k]);
+            for (const auto & p : pend[k]) {
+                memcpy(p.dst, base + (size_t) k*half + p.off, p.size);
+            }
+            pend[k].clear();
+        };
+        auto flip = [&]() {
+            ggml_backend_event_record(sb.ev[h], be);
+            h ^= 1;
+            drain(h); // the other half: its copies were queued before this half's
+            used = 0;
+        };
+        for (size_t i = 0; i < winfos.size(); ++i) {
+            if (owner[i] != (int) b) {
+                continue;
+            }
+            size_t done = 0;
+            while (done < winfos[i].size) {
+                if (used >= half) {
+                    flip();
+                }
+                const size_t n = std::min(winfos[i].size - done, half - used);
+                ggml_backend_tensor_get_async(be, winfos[i].tensor, base + (size_t) h*half + used, winfos[i].offset + done, n);
+                pend[h].push_back({ winfos[i].dst + done, used, n });
+                used = GGML_PAD(used + n, 64);
+                done += n;
+            }
+        }
+        if (!pend[h].empty()) {
+            ggml_backend_event_record(sb.ev[h], be);
+        }
+        drain(h ^ 1);
+        drain(h);
+    }
+    return true;
+}
+
 void llama_context::state_get_async(const std::vector<llama_state_write_info> & winfos) {
     // the previous save may still be reading the staging buffers
     state_async_wait();

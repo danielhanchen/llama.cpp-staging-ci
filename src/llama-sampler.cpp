@@ -6,6 +6,8 @@
 #include "llama-grammar.h"
 
 #include "ggml-cpp.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
 
 #include <array>
 #include <algorithm>
@@ -1147,6 +1149,15 @@ struct llama_sampler_greedy_masked : public llama_sampler_backend {
 
     struct ggml_tensor * inp_vals = nullptr;
     struct ggml_tensor * inp_idxs = nullptr;
+
+    // k15-fn (LLAMA_SAMPLER_MASK_PERSIST=0 off): the mask as tensors of the sampler's own buffer, written once at backend_init. As graph
+    // inputs they were bound to the graph built last, so a kept graph reused later (the small-graph cache keeps one per ubatch size, e.g.
+    // a 2-row n-gram verify next to the 1-row decode) set the other graph's inputs and ran its set_rows with uninitialized indices:
+    // gpt-oss-20b ignore_eos greedy, intermittent illegal memory access (5 of 23 launches)
+    ggml_context_ptr        mask_ctx;
+    ggml_backend_buffer_ptr mask_buf;
+    struct ggml_tensor *    mask_vals = nullptr;
+    struct ggml_tensor *    mask_idxs = nullptr;
 };
 
 static const char * llama_sampler_greedy_masked_name(const struct llama_sampler * smpl) {
@@ -1179,7 +1190,34 @@ static bool llama_sampler_greedy_masked_backend_init(
     auto * sctx = (llama_sampler_greedy_masked *) smpl->ctx;
     GGML_UNUSED(n_outputs_max_per_seq);
 
-    const bool res = llama_sampler_backend_support(smpl, buft);
+    bool res = llama_sampler_backend_support(smpl, buft);
+
+    static const bool persist = getenv("LLAMA_SAMPLER_MASK_PERSIST") == nullptr || atoi(getenv("LLAMA_SAMPLER_MASK_PERSIST")) != 0;
+    if (res && persist && !sctx->mask.empty()) {
+        ggml_init_params params = {
+            /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        sctx->mask_ctx.reset(ggml_init(params));
+        if (sctx->mask_ctx) {
+            sctx->mask_vals = ggml_new_tensor_2d(sctx->mask_ctx.get(), GGML_TYPE_F32, 1, (int64_t) sctx->mask.size());
+            sctx->mask_idxs = ggml_new_tensor_1d(sctx->mask_ctx.get(), GGML_TYPE_I32, (int64_t) sctx->mask.size());
+            ggml_set_name(sctx->mask_vals, "greedy_mask_vals_persist");
+            ggml_set_name(sctx->mask_idxs, "greedy_mask_idxs_persist");
+            sctx->mask_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(sctx->mask_ctx.get(), buft));
+        }
+        if (sctx->mask_buf) {
+            const std::vector<float> vals(sctx->mask.size(), -INFINITY);
+            ggml_backend_tensor_set(sctx->mask_vals, vals.data(), 0, ggml_nbytes(sctx->mask_vals));
+            ggml_backend_tensor_set(sctx->mask_idxs, sctx->mask.data(), 0, ggml_nbytes(sctx->mask_idxs));
+        } else {
+            // no buffer: the graph inputs as before
+            sctx->mask_vals = nullptr;
+            sctx->mask_idxs = nullptr;
+            sctx->mask_ctx.reset();
+        }
+    }
 
     sctx->init(res);
 
@@ -1197,7 +1235,12 @@ static void llama_sampler_greedy_masked_backend_apply(
     const int64_t n = ggml_nelements(data->logits);
     struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, n);
 
-    if (!sctx->mask.empty()) {
+    if (!sctx->mask.empty() && sctx->mask_vals != nullptr) {
+        // the persistent mask: the same tensors in every graph, nothing to set per graph
+        struct ggml_tensor * row = ggml_reshape_2d(ctx, logits, 1, n);
+        row    = ggml_set_rows(ctx, row, sctx->mask_vals, sctx->mask_idxs);
+        logits = ggml_reshape_1d(ctx, row, n);
+    } else if (!sctx->mask.empty()) {
         if (sctx->inp_vals == nullptr) {
             sctx->inp_vals = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, (int64_t) sctx->mask.size());
             ggml_set_name(sctx->inp_vals, "greedy_mask_vals");
@@ -1230,7 +1273,7 @@ static void llama_sampler_greedy_masked_backend_apply(
 
 static void llama_sampler_greedy_masked_backend_set_input(struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_greedy_masked *) smpl->ctx;
-    if (sctx->mask.empty()) {
+    if (sctx->mask.empty() || sctx->mask_vals != nullptr) {
         return;
     }
     GGML_ASSERT(sctx->inp_vals != nullptr && sctx->inp_idxs != nullptr);

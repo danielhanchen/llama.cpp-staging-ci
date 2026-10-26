@@ -385,7 +385,9 @@ struct server_slot {
         static const size_t async_max = (size_t) (getenv("LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB") ? std::max(0, atoi(getenv("LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB"))) : 512) << 20;
         const llama_state_seq_flags fl = (async_on || force_async) && cur_size <= async_max ? LLAMA_STATE_SEQ_FLAGS_ASYNC : LLAMA_STATE_SEQ_FLAGS_NONE;
 
+        const int64_t t_get0 = ggml_time_us();
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, fl);
+        SRV_TRC(" - prompt state read in %.2f ms\n", (ggml_time_us() - t_get0) / 1000.0);
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, fl);
         }

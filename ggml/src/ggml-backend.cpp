@@ -1032,6 +1032,7 @@ struct ggml_backend_sched_prefetch {
     enum ggml_backend_buffer_usage lent_usage[GGML_SCHED_MAX_LENT_BUFFERS]; // their own usage while the splits are computed
     int    n_lent_bufs;
     bool   lent_all;  // the graph allocator uses lent memory: the lent buffers behave like compute buffers in every split
+    bool   ensure_refused; // k15-fn: the staging arena of a merged graph did not allocate (the graph is refused, the prefetch kept)
     size_t lent;      // bytes of the copies and of the graph allocator in lent memory
     size_t lent_prev; // logged value
     size_t ext_prev;  // logged size of the graph allocator in lent memory
@@ -2928,6 +2929,12 @@ static bool ggml_backend_sched_prefetch_queue(ggml_backend_sched_t sched, int ba
 // make sure that the arena of a backend can hold pf->staging bytes (none if every copy is in lent memory)
 static size_t ggml_backend_sched_prefetch_staging(ggml_backend_sched_t sched, int backend_id);
 
+// k15-fn: GGML_SCHED_LEND_GUARD=0 restores the allocation failures of merged graphs that turned the host-weight prefetch off
+static bool ggml_backend_sched_lend_guard_on() {
+    static const bool on = getenv("GGML_SCHED_LEND_GUARD") == nullptr || atoi(getenv("GGML_SCHED_LEND_GUARD")) != 0;
+    return on;
+}
+
 static bool ggml_backend_sched_prefetch_ensure(ggml_backend_sched_t sched, int backend_id) {
     struct ggml_backend_sched_prefetch * pf = &sched->pf[backend_id];
     ggml_backend_t backend = sched->backends[backend_id];
@@ -3002,6 +3009,15 @@ static bool ggml_backend_sched_prefetch_ensure(ggml_backend_sched_t sched, int b
             sched->pf_depth = sched->pf_depth0;
             sched->pf_adapt = false;
             ggml_backend_sched_prefetch_release(sched, backend_id);
+            return false;
+        }
+        // k15-fn (GGML_SCHED_LEND_GUARD=0 off): in a merged graph (its caller splits a refused graph) the staging that neither the lender
+        // took nor fits in free memory refuses the graph instead of turning the prefetch off for the rest of the process
+        if (ggml_backend_sched_lend_guard_on() && sched->alloc_limit_on) {
+            GGML_LOG_INFO("%s: %s: %.2f MiB of staging memory do not allocate in a merged graph: the graph is refused, the prefetch kept\n",
+                __func__, ggml_backend_name(backend), pf->staging / 1024.0 / 1024.0);
+            ggml_backend_sched_prefetch_release(sched, backend_id);
+            pf->ensure_refused = true;
             return false;
         }
         GGML_LOG_WARN("%s: %s: failed to allocate %.2f MiB of staging memory, host weight prefetch disabled\n",
@@ -3162,6 +3178,7 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         sched->pf[b].need    = 0;
         sched->pf[b].staging = 0;
         if (!dry) {
+            sched->pf[b].ensure_refused = false;
             sched->pf[b].n_lent_bufs   = 0;
             sched->pf[b].n_lent_copies = 0;
             sched->pf[b].lent          = 0;
@@ -5066,7 +5083,15 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     sched->alloc_over = 0;
     size_t lend_need[GGML_SCHED_MAX_BACKENDS] = { 0 };
-    if (sched->alloc_limit_on) {
+    // k15-fn (GGML_SCHED_LEND_GUARD=0 off): a graph the lender may take is measured like one under the limit, so that a growth neither
+    // lent nor fitting next to the staging arena is refused below (alloc_over, prefetch kept) instead of failing in cudaMalloc, which
+    // disabled the host-weight prefetch for the rest of the process (G4 fn4 16 GB, 8-ubatch group: 2761 MiB cudaMalloc with the
+    // 1275 MiB staging placed in device memory, the 16k prompt 3.84 -> 9.08 s)
+    const bool lend_guard = ggml_backend_sched_lend_guard_on();
+    // a merged graph (decode_layer_major sets the limit or the lend scope around it) can be split by its caller
+    const bool guard_lend = lend_guard && (sched->alloc_limit_on || (sched->alloc_lend_graph && sched->callback_lend != NULL));
+    size_t grow_dev[GGML_SCHED_MAX_BACKENDS] = { 0 };
+    if (sched->alloc_limit_on || guard_lend) {
         // the planned compute buffers of the graph (the current ones and their allocation are kept): refused, nothing allocated and the
         // prefetch kept, if a device buffer would grow by more than the limit or leave less than the prefetch headroom (512 MiB at least)
         // free. Without the check a large graph that allocates drops the prefetch for good (ggml_backend_sched_alloc_splits).
@@ -5101,10 +5126,12 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 continue;
             }
             const size_t grow = sizes[b] - cur;
+            grow_dev[b] = grow;
             size_t free  = 0;
             size_t total = 0;
             ggml_backend_dev_memory(dev, &free, &total);
-            const size_t allow = std::min(sched->alloc_limit, free > headroom ? free - headroom : 0);
+            const size_t limit = sched->alloc_limit_on ? sched->alloc_limit : SIZE_MAX;
+            const size_t allow = std::min(limit, free > headroom ? free - headroom : 0);
             if (grow > allow) {
                 if (sched->alloc_lend_graph && sched->callback_lend != NULL) {
                     lend_need[b] = grow; // decided after the lender placed the graph (below)
@@ -5130,6 +5157,21 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
             if (lend_need[b] > 0 && !sched->pf[b].lent_all) {
                 over = std::max(over, lend_need[b]);
             }
+            if (guard_lend && sched->pf[b].ensure_refused) {
+                over = std::max(over, std::max<size_t>(grow_dev[b], 1));
+            }
+            // k15-fn: the binding may have allocated the staging arena in device memory (the lender took nothing): a growth that no longer
+            // fits next to it is refused too
+            if (guard_lend && over == 0 && grow_dev[b] > 0 && !sched->pf[b].lent_all) {
+                ggml_backend_dev_t dev = sched->backends[b]->device;
+                size_t free  = 0;
+                size_t total = 0;
+                ggml_backend_dev_memory(dev, &free, &total);
+                static const size_t guard_free = (size_t) (getenv("GGML_SCHED_ALLOC_LIMIT_FREE_MIB") ? std::max(0, atoi(getenv("GGML_SCHED_ALLOC_LIMIT_FREE_MIB"))) : 64) << 20;
+                if (grow_dev[b] + guard_free > free) {
+                    over = std::max(over, grow_dev[b]);
+                }
+            }
         }
         if (over > 0) {
             // as a failed allocation below: the caller resets the scheduler, which binds the copies again for the next graph
@@ -5141,6 +5183,13 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
+        if (guard_lend) {
+            // k15-fn: a graph the caller can split (it set the limit or the lend scope) is refused, the prefetch stays on
+            sched->alloc_over = 1;
+            sched->next_copy  = sched->cur_copy;
+            sched->cur_copy   = cur_copy_prev;
+            return false;
+        }
         // retry without the staging memory
         if (!ggml_backend_sched_prefetch_disable(sched) || !ggml_backend_sched_alloc_splits(sched)) {
             return false;

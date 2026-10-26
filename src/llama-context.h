@@ -843,6 +843,15 @@ private:
     std::vector<state_async_backend> state_async;
     bool state_async_init = false;
 
+    // k15-ov: synchronous state saves read the device rows through two small pinned halves per backend (LLAMA_STATE_BOUNCE_MIB each,
+    // 16): the next half's copies run while the previous half is copied to the destination (see state_get_bounced)
+    struct state_bounce_backend {
+        ggml_backend_buffer_ptr buf;
+        ggml_backend_event_t    ev[2] = { nullptr, nullptr };
+    };
+    std::vector<state_bounce_backend> state_bounce;
+    bool state_get_bounced(const std::vector<llama_state_write_info> & winfos);
+
     // waits for the events, then copies staging -> destination; joined by state_async_wait()
     std::thread state_async_worker;
 
