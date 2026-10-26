@@ -4272,10 +4272,10 @@ static std::vector<common_state_buf> g_ckpt_pool;
 static size_t g_ckpt_pool_req_max = 0;
 
 // ... and at most twice the largest request (one state being saved, one ready for the next save): a pool kept at its byte cap held up to
-// 1 GiB idle at the end of a run, 6-7x the state of LFM2.5 (LLAMA_STATE_POOL_REL=0: the byte cap alone)
+// 1 GiB idle at the end of a run, 6-7x the state of LFM2.5 (opt-in LLAMA_STATE_POOL_REL=1; default: the byte cap alone)
 static size_t ckpt_pool_limit() {
     static const size_t lim = (size_t) (getenv("LLAMA_STATE_POOL_MIB") ? std::max(0, atoi(getenv("LLAMA_STATE_POOL_MIB"))) : 1024) << 20;
-    static const bool rel = getenv("LLAMA_STATE_POOL_REL") == nullptr || atoi(getenv("LLAMA_STATE_POOL_REL")) != 0;
+    static const bool rel = getenv("LLAMA_STATE_POOL_REL") != nullptr && atoi(getenv("LLAMA_STATE_POOL_REL")) != 0;
     return rel ? std::min(lim, 2*g_ckpt_pool_req_max + (g_ckpt_pool_req_max/8)) : lim;
 }
 
@@ -4449,8 +4449,8 @@ bool common_state_buf_take(common_state_buf & buf, size_t n) {
     }
     // a buffer more than twice the request is left in the pool: a small checkpoint that took a state buffer kept all of it resident for as
     // long as the checkpoint lived (its capacity is not in the prompt cache's size), e.g. 2.8 MiB of checkpoints held 149 MiB on LFM2.5
-    // (LLAMA_STATE_POOL_FIT=0: any buffer that fits)
-    static const bool fit = getenv("LLAMA_STATE_POOL_FIT") == nullptr || atoi(getenv("LLAMA_STATE_POOL_FIT")) != 0;
+    // (opt-in LLAMA_STATE_POOL_FIT=1: G4 q4x reuse turns +1.4-2.5 ms with it and REL; default: any buffer that fits)
+    static const bool fit = getenv("LLAMA_STATE_POOL_FIT") != nullptr && atoi(getenv("LLAMA_STATE_POOL_FIT")) != 0;
     if (best == g_ckpt_pool.end() || (fit && best->capacity() / 2 > n)) {
         return false;
     }
