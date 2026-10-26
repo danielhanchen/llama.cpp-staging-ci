@@ -9034,6 +9034,10 @@ bool llama_moe_cpu_miss_drop_slow(llama_context * ctx) {
     return ctx != nullptr && ctx->moe_cpu_miss_drop_slow();
 }
 
+bool llama_moe_cache_active(const llama_context * ctx) {
+    return ctx != nullptr && ctx->moe_cache_active();
+}
+
 int32_t llama_moe_host_mode(const llama_context * ctx) {
     return ctx != nullptr && ctx->get_moe_cache() != nullptr ? ctx->get_moe_cache()->host_mode() : 0;
 }
