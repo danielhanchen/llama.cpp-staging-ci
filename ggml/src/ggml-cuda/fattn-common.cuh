@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #pragma once
 
 #include "common.cuh"
@@ -849,7 +850,11 @@ static __global__ void flash_attn_stream_k_fixup_general(
     const bool did_not_have_any_data   = kbc0 == kbc0_stop;
     const bool wrote_beginning_of_tile = fastmodulo(kbc0, fd_iter_k) == 0;
     const bool did_not_write_last      = fastdiv(kbc0, fd_iter_k) == fastdiv(kbc0_stop, fd_iter_k) && fastmodulo(kbc0_stop, fd_iter_k) != 0;
+    // a block with nothing to fix up still waits for the flash attention kernel before it leaves: a grid whose blocks all left
+    // before their griddepcontrol.wait would complete before that kernel, and the PDL wait of the next kernel (only on this grid)
+    // would then not order it after the flash attention output
     if (did_not_have_any_data || wrote_beginning_of_tile || did_not_write_last) {
+        ggml_cuda_pdl_sync();
         return;
     }
 
@@ -867,6 +872,7 @@ static __global__ void flash_attn_stream_k_fixup_general(
     const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
 
     if (jt*ncols1 + j >= ne01 || zt_gqa*ncols2 + c >= gqa_ratio) {
+        ggml_cuda_pdl_sync();
         return;
     }
 
