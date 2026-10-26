@@ -1,4 +1,6 @@
 #include "server-task.h"
+
+#include <thread>
 #include "server-prompt-ssd.h"
 
 #include "build-info.h"
@@ -1835,15 +1837,31 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     std::list<common_prompt_checkpoint> ckpts;
     if (take_from != nullptr && take_from == &prompt.checkpoints) {
+        // a moved checkpoint takes no pooled buffer, where its copy would have: the buffer the copy would have taken leaves the pool all
+        // the same (freed off this thread), so the pool, and the host RSS, end where the copies leave them (without it, end-of-run RSS
+        // was +150..+1300 MiB; LLAMA_PCS_MOVE_POOL_DROP=0: kept in the pool)
+        static const bool pool_drop = getenv("LLAMA_PCS_MOVE_POOL_DROP") == nullptr || atoi(getenv("LLAMA_PCS_MOVE_POOL_DROP")) != 0;
+        std::vector<common_state_buf> drop;
         // in order: the ones the slot drops are moved, the rest copied
         for (auto it = take_from->begin(); it != take_from->end();) {
             auto next = std::next(it);
             if (it->pos_max > keep_max) {
+                if (pool_drop) {
+                    for (size_t n : { it->data_tgt.size(), it->data_dft.size() }) {
+                        common_state_buf b;
+                        if (n > 0 && common_state_buf_take(b, n)) {
+                            drop.push_back(std::move(b));
+                        }
+                    }
+                }
                 ckpts.splice(ckpts.end(), *take_from, it);
             } else {
                 ckpts.push_back(prompt_checkpoint_clone(*it));
             }
             it = next;
+        }
+        if (!drop.empty()) {
+            std::thread([drop = std::move(drop)]() mutable { drop.clear(); }).detach();
         }
     } else {
         ckpts = prompt_checkpoints_clone(prompt.checkpoints);
