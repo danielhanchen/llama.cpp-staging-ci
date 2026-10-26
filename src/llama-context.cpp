@@ -4889,7 +4889,27 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             }
             LLAMA_LOG_INFO("%s: check: %zu index copies at %zu addresses, %d shared by different inputs\n", __func__, lm_sr.size(), at.size(), n_same);
         }
+        // k15-pp: the merged graph runs once (its nodes are freed after the group), so the backends skip their CUDA graph bookkeeping
+        // for it: G4 Flash-Next 16 GB, a 16384-token group recorded ~1 KB per node for a warmup that never completes (+30 MiB host
+        // memory at 55k nodes); same kernels, same order. LLAMA_MOE_LM_GRAPH_RECORDS=1 keeps it
+        static const bool lm_graph_records = getenv("LLAMA_MOE_LM_GRAPH_RECORDS") != nullptr && atoi(getenv("LLAMA_MOE_LM_GRAPH_RECORDS")) != 0;
+        auto lm_graph_skip = [&](bool on) {
+            for (auto & bk : backend_ptrs) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(bk);
+                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                auto fn = reg ? (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_skip_records") : nullptr;
+                if (fn != nullptr) {
+                    fn(bk, on);
+                }
+            }
+        };
+        if (!lm_graph_records) {
+            lm_graph_skip(true);
+        }
         const auto st = graph_compute(g, true);
+        if (!lm_graph_records) {
+            lm_graph_skip(false);
+        }
         if (lm_seed_async && !lm_pending.empty()) {
             // the layers whose copies the graph queued last (their staging slots hold the copies until the next graph)
             if (st == GGML_STATUS_SUCCESS) {

@@ -3055,6 +3055,14 @@ static size_t ggml_backend_cuda_graph_evict_since(ggml_backend_t backend, int64_
     return n;
 }
 
+// k15-pp: on = the next graph computations of this backend run without CUDA graph bookkeeping (computed once, never replayed)
+static void ggml_backend_cuda_graph_skip_records(ggml_backend_t backend, bool on) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return;
+    }
+    ((ggml_backend_cuda_context *) backend->context)->graphs_skip = on;
+}
+
 static void ggml_backend_cuda_set_copy_peer(ggml_backend_t copy_backend, ggml_backend_t compute_backend) {
 #if defined(GGML_USE_HIP)
     GGML_UNUSED(copy_backend);
@@ -7086,6 +7094,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
+    if (!cuda_ctx->graphs_skip) {
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
@@ -7121,6 +7130,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 }
             }
         }
+    }
     }
 #endif // USE_CUDA_GRAPH
 
@@ -9013,6 +9023,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_graph_evict_since") == 0) {
         return (void *)ggml_backend_cuda_graph_evict_since;
+    }
+    if (strcmp(name, "ggml_backend_graph_skip_records") == 0) {
+        return (void *)ggml_backend_cuda_graph_skip_records;
     }
     if (strcmp(name, "ggml_backend_timer_new") == 0) {
         return (void *)ggml_backend_cuda_timer_new;
