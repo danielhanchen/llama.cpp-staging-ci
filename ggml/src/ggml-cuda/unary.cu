@@ -1173,6 +1173,25 @@ static __global__ void unary_mul_gate_f32_kernel(const float * g, const float * 
     dst[i] = op(g[row*sg]) * x[row*sx + i % n];
 }
 
+// k15-fn: the gated product added to a (ADD(a, MUL(x, UNARY(g))), the shared expert added to the routed experts): one kernel for the
+// three ops. a + v equals v + a (float addition commutes), so this is bit-identical to the unfused ops
+template <float (*op)(float)>
+static __global__ void unary_mul_gate_add_f32_kernel(const float * g, const float * x, const float * a, float * dst, const int64_t k,
+                                                     const int64_t n, const int64_t sg, const int64_t sx) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t row = i / n;
+    ggml_cuda_pdl_sync();
+    // no contraction into an fma: the unfused ops round the product before the add
+    const float v = __fmul_rn(op(g[row*sg]), x[row*sx + i % n]);
+    dst[i] = __fadd_rn(a[i], v);
+}
+
 template <float (*op)(float)>
 static void unary_mul_gate_f32_cuda(const float * g, const float * x, float * dst, const int64_t k, const int64_t n,
                                     const int64_t sg, const int64_t sx, cudaStream_t stream) {
@@ -1223,6 +1242,37 @@ void ggml_cuda_op_unary_mul_gate(ggml_backend_cuda_context & ctx, ggml_tensor * 
         case GGML_UNARY_OP_TANH:     unary_mul_gate_f32_cuda<op_tanh>    (g_d, x_d, dst_d, k, n, sg, sx, stream); break;
         case GGML_UNARY_OP_EXP:      unary_mul_gate_f32_cuda<op_exp>     (g_d, x_d, dst_d, k, n, sg, sx, stream); break;
         default: GGML_ABORT("unsupported unary op for the fused gate mul");
+    }
+}
+
+void ggml_cuda_op_unary_mul_gate_add(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node, ggml_tensor * add_node) {
+    const ggml_tensor * g = unary_node->src[0];
+    const ggml_tensor * x = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
+    const ggml_tensor * a = (add_node->src[0] == mul_node) ? add_node->src[1] : add_node->src[0];
+
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && add_node->type == GGML_TYPE_F32 && ggml_are_same_shape(a, add_node) &&
+                ggml_are_same_shape(mul_node, add_node) && ggml_is_contiguous(a) && ggml_is_contiguous(add_node));
+    GGML_ASSERT(g->ne[0] == 1 && ggml_are_same_shape(x, mul_node) && ggml_is_contiguous_1(g) && ggml_is_contiguous_1(x) &&
+                x->nb[0] == sizeof(float));
+
+    const int64_t k  = ggml_nelements(add_node);
+    const int64_t n  = x->ne[0];
+    const int64_t sg = g->nb[1] / sizeof(float);
+    const int64_t sx = x->nb[1] / sizeof(float);
+    const float * g_d = (const float *) g->data;
+    const float * x_d = (const float *) x->data;
+    const float * a_d = (const float *) a->data;
+    float * dst_d     = (float *) add_node->data;
+
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream());
+    switch (ggml_get_unary_op(unary_node)) {
+        case GGML_UNARY_OP_SIGMOID:  ggml_cuda_kernel_launch(unary_mul_gate_add_f32_kernel<op_sigmoid>,  lp, g_d, x_d, a_d, dst_d, k, n, sg, sx); break;
+        case GGML_UNARY_OP_SILU:     ggml_cuda_kernel_launch(unary_mul_gate_add_f32_kernel<op_silu>,     lp, g_d, x_d, a_d, dst_d, k, n, sg, sx); break;
+        case GGML_UNARY_OP_SOFTPLUS: ggml_cuda_kernel_launch(unary_mul_gate_add_f32_kernel<op_softplus>, lp, g_d, x_d, a_d, dst_d, k, n, sg, sx); break;
+        case GGML_UNARY_OP_TANH:     ggml_cuda_kernel_launch(unary_mul_gate_add_f32_kernel<op_tanh>,     lp, g_d, x_d, a_d, dst_d, k, n, sg, sx); break;
+        case GGML_UNARY_OP_EXP:      ggml_cuda_kernel_launch(unary_mul_gate_add_f32_kernel<op_exp>,      lp, g_d, x_d, a_d, dst_d, k, n, sg, sx); break;
+        default: GGML_ABORT("unsupported unary op for the fused gate mul add");
     }
 }
 

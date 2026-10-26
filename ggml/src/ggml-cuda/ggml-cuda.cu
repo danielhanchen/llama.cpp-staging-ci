@@ -4474,7 +4474,9 @@ static int ggml_cuda_try_fuse_hc_post_chain(ggml_backend_cuda_context * cuda_ctx
 }
 
 // UNARY(gate) -> MUL(x, gate) where gate has one element per row of x: shared expert gates
-static bool ggml_cuda_try_fuse_unary_mul_gate(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+// returns the number of extra nodes covered (0 = no fusion): 1, or 2 with a following ADD of the product (k15-fn,
+// GGML_CUDA_DISABLE_GATE_MUL_ADD_FUSION=1 turns that part off)
+static int ggml_cuda_try_fuse_unary_mul_gate(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_GATE_MUL_FUSION");
     if (disabled || i + 1 >= cgraph->n_nodes) {
         return false;
@@ -4500,8 +4502,21 @@ static bool ggml_cuda_try_fuse_unary_mul_gate(ggml_backend_cuda_context * cuda_c
     if (ggml_cuda_tensors_overlap(mul, g) || !ggml_cuda_elementwise_alias_ok(mul, x)) {
         return false;
     }
+    static const bool add_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_GATE_MUL_ADD_FUSION");
+    if (!add_disabled && i + 2 < cgraph->n_nodes) {
+        ggml_tensor * add = cgraph->nodes[i + 2];
+        const ggml_tensor * a = add->op == GGML_OP_ADD ? (add->src[0] == mul ? add->src[1] : add->src[1] == mul ? add->src[0] : nullptr) : nullptr;
+        if (a != nullptr && a != mul && (add->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_node_has_n_uses(cgraph, i + 1, 1) &&
+                a->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 && ggml_are_same_shape(a, add) && ggml_are_same_shape(mul, add) &&
+                ggml_is_contiguous(a) && ggml_is_contiguous(add) && !ggml_cuda_tensors_overlap(add, g) &&
+                ggml_cuda_elementwise_alias_ok(add, x) && ggml_cuda_elementwise_alias_ok(add, a) &&
+                ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD }, { i + 2 })) {
+            ggml_cuda_op_unary_mul_gate_add(*cuda_ctx, unary, mul, add);
+            return 2;
+        }
+    }
     ggml_cuda_op_unary_mul_gate(*cuda_ctx, unary, mul);
-    return true;
+    return 1;
 }
 
 // ADD(a, bias) -> UNARY -> MUL(., scale) with bias and scale one row each: the delta-net alpha gate
@@ -5699,8 +5714,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
-    if (node->op == GGML_OP_UNARY && ggml_cuda_try_fuse_unary_mul_gate(cuda_ctx, cgraph, i)) {
-        return 1;
+    if (node->op == GGML_OP_UNARY) {
+        const int n_gate = ggml_cuda_try_fuse_unary_mul_gate(cuda_ctx, cgraph, i);
+        if (n_gate > 0) {
+            return n_gate;
+        }
     }
 
     if (const int n_skip = ggml_cuda_try_fuse_amax_rescale(cuda_ctx, cgraph, i); n_skip > 0) {

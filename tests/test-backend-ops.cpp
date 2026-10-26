@@ -8247,6 +8247,44 @@ struct test_gated_mmvq : public test_case {
     }
 };
 
+// k15-fn: a shared expert gate: MUL(x, UNARY(g)) with one gate value per row of x, optionally added to the routed experts' output
+// (ADD(a, gated)); the CUDA backend fuses the two or three ops into one kernel
+struct test_gate_mul_add : public test_case {
+    const std::string op;
+    const int64_t n;
+    const int64_t m;
+    const bool    add;
+
+    std::string vars() override {
+        return VARS_TO_STR4(op, n, m, add);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATE_MUL_ADD";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_gate_mul_add(std::string op, int64_t n, int64_t m, bool add) : op(std::move(op)), n(n), m(m), add(add) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * g0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, m);
+        ggml_tensor * x0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, m);
+        ggml_tensor * a0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, m);
+        ggml_tensor * g = ggml_scale(ctx, g0, 1.0f);
+        ggml_tensor * x = ggml_scale(ctx, x0, 1.0f);
+        ggml_tensor * a = ggml_scale(ctx, a0, 1.0f);
+        ggml_tensor * u = op == "silu" ? ggml_silu(ctx, g) : ggml_sigmoid(ctx, g);
+        ggml_tensor * out = ggml_mul(ctx, x, u);
+        if (add) {
+            out = ggml_add(ctx, a, out);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // gate + up + GLU mat-vec products followed by a down product, the activation produced by a (fused) rms_norm + mul: the GLU
 // output can be placed over the activation, which the mat-vec GLU fusion then reads through its q8_1 copy only.
 struct test_glu_src1_alias : public test_case {
@@ -12821,6 +12859,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
+    }
+
+    for (const char * op : { "sigmoid", "silu" }) {
+        for (int64_t m : { 1, 3, 17 }) {
+            test_cases.emplace_back(new test_gate_mul_add(op, 2560, m, false));
+            test_cases.emplace_back(new test_gate_mul_add(op, 2560, m, true));
+            test_cases.emplace_back(new test_gate_mul_add(op, 100, m, true));
+        }
     }
 
     // k15-fn: gated op + quantized mat-vec (the q8_1 copy written by the gated kernel); k = 1024 rows carry no padding, 768 do
