@@ -5579,9 +5579,9 @@ static __global__ void k_qsa_idx_select_staged(const int32_t * __restrict__ idx,
 }
 
 static int ggml_cuda_try_fuse_qsa_idx(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
-    // opt-in (GGML_CUDA_QSA_IDX_FUSION=1) until G4 confirms the overlap check below: without it the 8k / 16k md5 on G4 fn4 IQ4_XS 32 GB
-    // Studio varied from launch to launch (k15gd2_g4, k15ge_g4, also with GGML_CUDA_QSA_MASKLESS=0). GGML_CUDA_DISABLE_QSA_IDX_FUSION=1 off
-    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_QSA_IDX_FUSION") || !ggml_cuda_env_flag("GGML_CUDA_QSA_IDX_FUSION");
+    // (before the overlap rule below the 8k / 16k md5 on G4 fn4 IQ4_XS 32 GB Studio varied from launch to launch: k15gd2_g4, k15ge_g4;
+    // with it stable and equal to the kill switch, k15gv_g4)
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_QSA_IDX_FUSION");
     if (disabled || i + 4 >= cgraph->n_nodes) {
         return 0;
     }
