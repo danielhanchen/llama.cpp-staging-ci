@@ -1269,6 +1269,7 @@ static struct llama_model_params common_model_params_to_llama_impl(common_params
 static enum llama_load_mode common_moe_cache_load_mode(const common_params & params, enum llama_load_mode load_mode, int32_t n_gpu_layers);
 static bool common_experts_on_offloaded_host(const common_params & params, const llama_model_tensor_buft_override * overrides, int32_t n_gpu_layers);
 static bool common_moe_hybrid_gate_on(const common_params & params, const llama_model_tensor_buft_override * overrides, int32_t n_gpu_layers);
+static double common_moe_host_expert_bytes(const std::string & path, const llama_model_tensor_buft_override * overrides, int32_t n_gpu_layers);
 
 // bytes of one expert in the MoE cache: the sum over the expert tensors of the layer (the size of a slot) and the largest single tensor (the
 // size of a slot in its bank), with the number of experts, for the layer with the largest experts; false if the GGUF cannot be read
@@ -3161,6 +3162,30 @@ static bool common_experts_on_offloaded_host(const common_params & params, const
 // k10: whether the MoE cache will take its default hybrid gate (llama_moe_cache: LLAMA_MOE_CACHE_HYBRID unset and the slots hold at most
 // LLAMA_MOE_CACHE_HYBRID_MAX_FRAC (0.10) of the host experts' bytes). Estimated from the fitted cache size and the expert bytes of the layers
 // whose experts the overrides (or n_gpu_layers) leave on the host, all expert layers of the same size
+// the bytes of the experts that the overrides (or n_gpu_layers) leave on the host, all expert layers of the same size (0: none, or unknown)
+static double common_moe_host_expert_bytes(const std::string & path, const llama_model_tensor_buft_override * overrides, int32_t n_gpu_layers) {
+    common_moe_slot_bytes sbt;
+    std::vector<uint8_t> experts;
+    const int64_t n_layer = common_model_n_layer(path, experts);
+    if (n_layer <= 0 || (int64_t) experts.size() < n_layer || !common_moe_slot_bytes_of(path, sbt) || sbt.total <= 0) {
+        return 0.0;
+    }
+    const int64_t n_gpu  = n_gpu_layers < 0 ? n_layer + 1 : n_gpu_layers;
+    const int64_t il_gpu = std::max<int64_t>(n_layer + 1 - n_gpu, 0); // layers below run on the CPU: their experts are host experts
+    int64_t n_exp = 0, n_host = 0;
+    for (int64_t il = 0; il < n_layer; ++il) {
+        if (experts[il] == 0) {
+            continue;
+        }
+        n_exp++;
+        n_host += il < il_gpu || common_overrides_put_experts_on_host(overrides, il, il + 1, experts);
+    }
+    if (n_exp == 0 || n_host == 0) {
+        return 0.0;
+    }
+    return (double) sbt.total*(double) n_host/(double) n_exp;
+}
+
 static bool common_moe_hybrid_gate_on(const common_params & params, const llama_model_tensor_buft_override * overrides, int32_t n_gpu_layers) {
     if (params.moe_cache_size <= 0 || getenv("LLAMA_MOE_CACHE_HYBRID") != nullptr || getenv("LLAMA_MOE_CACHE_FETCH") != nullptr) {
         return false;
