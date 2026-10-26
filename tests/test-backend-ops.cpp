@@ -5234,6 +5234,81 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// k15-fn: GET_ROWS (one recurrent-state row by id) -> GATED_DELTA_NET, with beta = SIGMOID(b) and g = MUL(SOFTPLUS(ADD(a, dt)), A):
+// the CUDA backend reads the state in place and applies both gates inside the kernel (GGML_CUDA_GDN_STATE_IN_PLACE, GGML_CUDA_GDN_GATES)
+struct test_gdn_inplace_gates : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t K;
+    const int64_t n_rows;
+    const int32_t row;
+
+    std::string vars() override {
+        return VARS_TO_STR6(head_count, head_size, n_seq_tokens, K, n_rows, row);
+    }
+
+    test_gdn_inplace_gates(int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 3, int64_t K = 3, int64_t n_rows = 4, int32_t row = 2)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), K(K), n_rows(n_rows), row(row) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S = head_size, H = head_count, T = n_seq_tokens;
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, T, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, T, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, T, 1);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_tensor * b_raw = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, T, 1);
+        ggml_set_name(b_raw, "b_raw");
+        ggml_tensor * beta  = ggml_sigmoid(ctx, b_raw);
+        ggml_tensor * a     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H, T, 1);
+        ggml_tensor * dt    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        ggml_tensor * A     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        ggml_set_name(a, "a");
+        ggml_set_name(dt, "dt");
+        ggml_set_name(A, "A");
+        ggml_tensor * g     = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, a, dt)), A);
+        g = ggml_reshape_4d(ctx, g, 1, H, T, 1);
+        ggml_tensor * rows  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S*S*H, n_rows);
+        ggml_set_name(rows, "rows");
+        ggml_tensor * ids   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * state = ggml_reshape_4d(ctx, ggml_get_rows(ctx, rows, ids), S, S, H, 1);
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+        ggml_tensor * out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+        ggml_set_name(out, "gdn_out");
+        return out;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_INPLACE_GATES";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "ids") == 0) {
+                ggml_backend_tensor_set(t, &row, 0, sizeof(row));
+            } else if (strcmp(t->name, "A") == 0) {
+                init_tensor_uniform(t, -2.0f, -0.05f);
+            } else if (strcmp(t->name, "a") == 0) {
+                init_tensor_uniform(t, -4.0f, 25.0f); // both softplus branches (x > 20 passes through)
+            } else if (strcmp(t->name, "b_raw") == 0) {
+                init_tensor_uniform(t, -6.0f, 6.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -13494,6 +13569,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // gdn + cache cpy fusion (K > 1)
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
+    for (int64_t S : { 32, 64, 128 }) {
+        for (int64_t T : { 1, 2, 3 }) {
+            test_cases.emplace_back(new test_gdn_inplace_gates(4, S, T, 3, 4, 2));
+        }
+    }
+    test_cases.emplace_back(new test_gdn_inplace_gates(48, 128, 3, 3, 3, 0)); // Flash-Next verify shape
+    test_cases.emplace_back(new test_gdn_inplace_gates(8, 64, 1, 1, 2, 1));   // no snapshots
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
