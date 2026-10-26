@@ -2427,6 +2427,9 @@ bool common_moe_cache_auto_resolve(common_params & params, bool fit) {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    // k15-up2: built-in MTP heads (no -md model) for the context's prefetch depth rule (llama_context::sched_new), before any fit probe
+    common_set_env("LLAMA_SPEC_MTP_HEADS", !params.speculative.has_dft() && std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+        [](auto t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP; }) ? "1" : "0");
     // --moe-cache-mib auto: the fit sizes the cache (the fitted size is kept in params, so that a reload from params, e.g. the server
     // waking from sleep, gets the same cache)
     const bool moe_cache_auto = common_moe_cache_auto_resolve(params, params.fit_params);

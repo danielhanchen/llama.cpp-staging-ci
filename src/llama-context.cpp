@@ -1192,17 +1192,26 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
                 std::max(0.0, atof(getenv("LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS"))) : 10.0;
             const bool draft_dropped = dropped_depth > 0 && cparams.spec_draft && getenv("LLAMA_FIT_DRAFT_DROPPED") != nullptr &&
                 atoi(getenv("LLAMA_FIT_DRAFT_DROPPED")) != 0;
-            const char * why = cparams.spec_draft && !draft_dropped ? "speculative decoding with a draft model or MTP heads" :
+            // k15-up2: a draft that runs (a -md drafter on the device or MTP heads) gets the same depth beside a cache of at least
+            // LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS tokens' experts (the old exclusion came from a 64 GB Flash-Next whose depth-3
+            // staging pushed the draft out); LLAMA_MOE_PREFETCH_DEPTH_SPEC=0: depth 2 beside a running draft, as before
+            static const bool spec_env = getenv("LLAMA_MOE_PREFETCH_DEPTH_SPEC") == nullptr || atoi(getenv("LLAMA_MOE_PREFETCH_DEPTH_SPEC")) != 0;
+            // not beside built-in MTP heads (common sets LLAMA_SPEC_MTP_HEADS=1): local B200 Qwen3.6-35B-A3B UD-Q4_K_XL + MTP heads, 12 GB,
+            // pinned + strict exact, depth 4 gave other text than depth 2 and no draft (chat a3c3e816 vs 19b8fd68, twice each), while a
+            // dropped -md drafter at depth 4 kept it (not found why yet)
+            const bool mtp_heads = getenv("LLAMA_SPEC_MTP_HEADS") != nullptr && atoi(getenv("LLAMA_SPEC_MTP_HEADS")) != 0;
+            const bool spec_deep = spec_env && dropped_depth > 0 && cparams.spec_draft && !draft_dropped && !mtp_heads && tokens >= dropped_min;
+            const char * why = cparams.spec_draft && !draft_dropped && !spec_deep ? "speculative decoding with a draft model or MTP heads" :
                 draft_dropped && tokens < dropped_min ? "a dropped draft model beside a cache of fewer tokens than LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS" :
                 tokens < min_tokens ? "the cache holds the experts of fewer tokens than LLAMA_MOE_PREFETCH_DEPTH_SPILL_MIN_TOKENS" :
                 !ram_ok ? "the uncached host experts are more than LLAMA_MOE_PREFETCH_DEPTH_SPILL_MAX_RAM_FRAC of the RAM" : nullptr;
-            depth_spill = why == nullptr ? (draft_dropped ? dropped_depth : 3) : 0;
+            depth_spill = why == nullptr ? (draft_dropped || spec_deep ? dropped_depth : 3) : 0;
             static bool logged = false; // once per process, not for a memory probe (no_alloc), whose log the fit silences
             if (!logged && !model.hparams.no_alloc) {
                 logged = true;
                 LLAMA_LOG_INFO("%s: MoE cache: host weight prefetch of the spilled experts starts at depth %s (cache = the experts of %.1f "
                     "tokens%s%s; LLAMA_MOE_PREFETCH_DEPTH_SPILL=N forces N, LLAMA_MOE_PREFETCH_DEPTH_RULE=0 keeps the default)\n", __func__,
-                    why == nullptr ? (draft_dropped ? std::to_string(dropped_depth).c_str() : "3") : "the default", tokens, why ? ": " : "", why ? why : "");
+                    why == nullptr ? (draft_dropped || spec_deep ? std::to_string(dropped_depth).c_str() : "3") : "the default", tokens, why ? ": " : "", why ? why : "");
             }
         }
         if (depth_spill > 0) {
