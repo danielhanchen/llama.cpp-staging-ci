@@ -583,7 +583,10 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             auto store = [&](ggml_tensor * x, ggml_tensor * dst_all, int64_t ne0, int64_t ne1) {
                 ggml_tensor * dst = ggml_view_4d(ctx0, dst_all, ne0, ne1, n_seq_tokens, n_seqs,
                         dst_all->nb[1], dst_all->nb[2], dst_all->nb[3], (size_t) kv_head * dst_all->nb[3]);
-                ggml_tensor * src = ggml_reshape_4d(ctx0, ggml_cont(ctx0, x), ne0, ne1, n_seq_tokens, n_seqs);
+                // a strided source of the same shape is copied directly (no ggml_cont: one kernel per input instead of two)
+                static const bool direct = getenv("LLAMA_RS_REPLAY_STORE_CONT") == nullptr || atoi(getenv("LLAMA_RS_REPLAY_STORE_CONT")) == 0;
+                ggml_tensor * src = direct && ggml_are_same_shape(x, dst) ? x :
+                        ggml_reshape_4d(ctx0, ggml_cont(ctx0, x), ne0, ne1, n_seq_tokens, n_seqs);
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
             };
             mctx_cur->set_rk_h(il, (int32_t) k->ne[1]);
