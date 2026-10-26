@@ -5819,6 +5819,240 @@ static int ggml_cuda_try_fuse_qsa_idx(ggml_backend_cuda_context * cuda_ctx, ggml
     return 4;
 }
 
+// k15-fn (GGML_CUDA_DISABLE_QSA_SEL_FUSION=1 off): the rest of a QSA layer's selection chain in the launch of its index map. From the
+// top-k pools to the i32 cell index of every slot (llama_model_qwen4exp::graph::build_qsa_sel):
+//   sel_idx = concat(get_rows(pools, top_k), tail)                                   member cells of the top pools, then the tail
+//   live    = concat(repeat(clamp(scale(get_rows(score, top_k)))), clamp(scale(cast(tail))))
+//   dump    = scale(cumsum(fill(live, 1)))                                            n_kv + slot
+//   idx     = cast_i32((cast_f32(sel_idx) - dump) * live + dump)
+// about 14 launches per layer as one block. Every value is what the separate kernels produce: integer cells and dump rows below 2^24
+// are exact in f32, the scale / clamp of the live flags use the nodes' own parameters in the kernels' expressions, the map the explicit
+// _rn intrinsics of k_qsa_idx_select. The chain nodes are skipped (qsa_sel_skip) only when nothing outside the chain reads them and no
+// node that still runs before the index node writes over an input of the chain (the allocator may give memory the skipped readers
+// freed); the block stages its results, so its output may overlap its inputs
+static __global__ void k_qsa_sel_chain(const ggml_backend_cuda_context::qsa_sel_args a, int32_t * __restrict__ dst) {
+    extern __shared__ int32_t staged[];
+    const int n_pool_sel = a.kpool*a.n_top;
+    const int n_sel = n_pool_sel + a.n_tail;
+    const int n = n_sel*a.n_tok;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const int s = i % n_sel;
+        const int t = i / n_sel;
+        int32_t cell;
+        float   live;
+        if (s < n_pool_sel) {
+            const int32_t p = a.top_k[(int64_t) t*a.top_k_s1 + s / a.kpool];
+            cell = a.pools[(int64_t) p*a.pools_s1 + s % a.kpool];
+            const float sc = a.score[(int64_t) t*a.score_s1 + p];
+            live = fminf(fmaxf(a.lp_scale * sc + a.lp_bias, a.lp_min), a.lp_max);
+        } else {
+            cell = a.tail[(int64_t) t*a.tail_s1 + (s - n_pool_sel)];
+            live = fminf(fmaxf(a.lt_scale * ggml_cuda_cast<float>(cell) + a.lt_bias, a.lt_min), a.lt_max);
+        }
+        const float d = a.d_scale * (float) (s + 1) + a.d_bias;
+        const float f = ggml_cuda_cast<float>(cell);
+        const float r = __fadd_rn(__fmul_rn(__fsub_rn(f, d), live), d);
+        staged[i] = ggml_cuda_cast<int32_t>(r);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        dst[i] = staged[i];
+    }
+}
+
+// t through reshapes (each read once): the first non-reshape node, the reshapes collected
+static const ggml_tensor * ggml_cuda_qsa_sel_unreshape(const ggml_tensor * t, std::vector<const ggml_tensor *> & chain) {
+    while (t != nullptr && t->op == GGML_OP_RESHAPE) {
+        chain.push_back(t);
+        t = t->src[0];
+    }
+    return t;
+}
+
+static bool ggml_cuda_qsa_sel_match(const ggml_cgraph * cgraph, const ggml_tensor * c2, ggml_backend_cuda_context::qsa_sel_args & a,
+        std::vector<const ggml_tensor *> & chain, std::vector<const ggml_tensor *> & inputs) {
+    const auto i32c = [](const ggml_tensor * t) { return t != nullptr && t->type == GGML_TYPE_I32 && t->nb[0] == sizeof(int32_t); };
+    const auto f32c = [](const ggml_tensor * t) { return t != nullptr && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t); };
+    if (c2->op != GGML_OP_CPY || c2->type != GGML_TYPE_I32 || !ggml_is_contiguous(c2) || (c2->src[1] != nullptr && c2->src[1]->data != c2->data)) {
+        return false;
+    }
+    const ggml_tensor * add = c2->src[0];
+    if (add == nullptr || add->op != GGML_OP_ADD || !f32c(add)) return false;
+    const ggml_tensor * mul = add->src[0];
+    const ggml_tensor * dump = add->src[1];
+    if (mul == nullptr || mul->op != GGML_OP_MUL || !f32c(mul)) return false;
+    const ggml_tensor * sub = mul->src[0];
+    const ggml_tensor * live = mul->src[1];
+    if (sub == nullptr || sub->op != GGML_OP_SUB || sub->src[1] != dump || !f32c(sub) || !f32c(live) || !f32c(dump)) return false;
+    const ggml_tensor * c1 = sub->src[0];
+    if (c1 == nullptr || c1->op != GGML_OP_CPY || !f32c(c1)) return false;
+    const ggml_tensor * sel_idx = c1->src[0];
+    if (!i32c(sel_idx) || !ggml_is_contiguous(sel_idx) || sel_idx->op != GGML_OP_CONCAT || ggml_get_op_params_i32(sel_idx, 0) != 0) return false;
+    const int64_t n_sel = c2->ne[0];
+    const int64_t n_tok = c2->ne[1];
+    if (c2->ne[2] != 1 || c2->ne[3] != 1 || !ggml_are_same_shape(c1, c2) || !ggml_are_same_shape(sel_idx, c2) || !ggml_are_same_shape(live, c2) ||
+            !ggml_are_same_shape(dump, c2) || !ggml_are_same_shape(add, c2) || !ggml_are_same_shape(mul, c2) || !ggml_are_same_shape(sub, c2) ||
+            n_sel*n_tok > 8192) {
+        return false;
+    }
+    chain.insert(chain.end(), { add, mul, sub, c1, sel_idx, live, dump });
+    // sel_idx = concat(reshape(get_rows(pools, reshape(top_k))), tail)
+    const ggml_tensor * gr = ggml_cuda_qsa_sel_unreshape(sel_idx->src[0], chain);
+    const ggml_tensor * tail = sel_idx->src[1];
+    if (gr == nullptr || gr->op != GGML_OP_GET_ROWS || !i32c(gr) || !ggml_is_contiguous(gr) || !i32c(tail) || tail->ne[1] != n_tok ||
+            tail->ne[2] != 1 || tail->ne[3] != 1) {
+        return false;
+    }
+    chain.push_back(gr);
+    const ggml_tensor * pools = gr->src[0];
+    const ggml_tensor * topk_flat = gr->src[1];
+    if (!i32c(pools) || pools->ne[2] != 1 || pools->ne[3] != 1 || topk_flat == nullptr || topk_flat->type != GGML_TYPE_I32) return false;
+    const ggml_tensor * top_k = topk_flat;
+    while (top_k->op == GGML_OP_RESHAPE && top_k->src[0] != nullptr) {
+        top_k = top_k->src[0];
+    }
+    if (!i32c(top_k) || top_k->ne[1] != n_tok || top_k->ne[2] != 1 || top_k->ne[3] != 1 || !ggml_is_contiguous(topk_flat)) return false;
+    const int64_t kpool = pools->ne[0];
+    const int64_t n_top = top_k->ne[0];
+    if (gr->ne[0] != kpool || gr->ne[1] != n_top*n_tok || kpool*n_top + tail->ne[0] != n_sel) return false;
+    // live = concat(reshape(repeat(clamp(scale(get_rows(reshape(score), top_k))))), clamp(scale(cast(tail))))
+    if (live->op != GGML_OP_CONCAT || ggml_get_op_params_i32(live, 0) != 0) return false;
+    const ggml_tensor * rp = ggml_cuda_qsa_sel_unreshape(live->src[0], chain);
+    if (rp == nullptr || rp->op != GGML_OP_REPEAT || !f32c(rp) || rp->ne[0] != kpool || rp->ne[1] != n_top || rp->ne[2] != n_tok) return false;
+    const ggml_tensor * cl1 = rp->src[0];
+    if (cl1 == nullptr || cl1->op != GGML_OP_CLAMP || !f32c(cl1) || cl1->ne[0] != 1 || cl1->ne[1] != n_top || cl1->ne[2] != n_tok) return false;
+    const ggml_tensor * sc1 = cl1->src[0];
+    if (sc1 == nullptr || sc1->op != GGML_OP_SCALE || !f32c(sc1)) return false;
+    const ggml_tensor * gs = sc1->src[0];
+    if (gs == nullptr || gs->op != GGML_OP_GET_ROWS || !f32c(gs) || gs->src[1] != top_k || gs->ne[0] != 1) return false;
+    const ggml_tensor * score_r = gs->src[0];
+    if (score_r == nullptr || score_r->op != GGML_OP_RESHAPE || score_r->ne[0] != 1 || score_r->ne[2] != n_tok) return false;
+    const ggml_tensor * score = score_r->src[0];
+    if (!f32c(score) || score->ne[1] != n_tok || score->ne[0] != score_r->ne[1]) return false;
+    chain.insert(chain.end(), { rp, cl1, sc1, gs, score_r });
+    const ggml_tensor * cl2 = live->src[1];
+    if (cl2 == nullptr || cl2->op != GGML_OP_CLAMP || !f32c(cl2) || !ggml_are_same_shape(cl2, tail)) return false;
+    const ggml_tensor * sc2 = cl2->src[0];
+    if (sc2 == nullptr || sc2->op != GGML_OP_SCALE || !f32c(sc2)) return false;
+    const ggml_tensor * ct = sc2->src[0];
+    if (ct == nullptr || ct->op != GGML_OP_CPY || !f32c(ct) || ct->src[0] != tail) return false;
+    chain.insert(chain.end(), { cl2, sc2, ct });
+    // dump = scale(cumsum(fill(live, 1)))
+    if (dump->op != GGML_OP_SCALE) return false;
+    const ggml_tensor * cs = dump->src[0];
+    if (cs == nullptr || cs->op != GGML_OP_CUMSUM || !f32c(cs)) return false;
+    const ggml_tensor * fl = cs->src[0];
+    if (fl == nullptr || fl->op != GGML_OP_FILL || !f32c(fl) || fl->src[0] != live || ggml_get_op_params_f32(fl, 0) != 1.0f ||
+            fl->view_src != nullptr) {
+        return false;
+    }
+    chain.insert(chain.end(), { cs, fl });
+    float p[2];
+    memcpy(p, sc1->op_params, sizeof(p)); a.lp_scale = p[0]; a.lp_bias = p[1];
+    memcpy(p, cl1->op_params, sizeof(p)); a.lp_min = p[0]; a.lp_max = p[1];
+    memcpy(p, sc2->op_params, sizeof(p)); a.lt_scale = p[0]; a.lt_bias = p[1];
+    memcpy(p, cl2->op_params, sizeof(p)); a.lt_min = p[0]; a.lt_max = p[1];
+    memcpy(p, dump->op_params, sizeof(p)); a.d_scale = p[0]; a.d_bias = p[1];
+    // the dump rows must be exact integers in f32
+    if (!(std::fabs(a.d_scale*(float) n_sel) + std::fabs(a.d_bias) < 16777216.0f) || a.d_scale != 1.0f) return false;
+    // a scale of +-1 makes scale * x + bias one rounding with or without contraction into an FMA, as in scale_f32
+    if (std::fabs(a.lp_scale) != 1.0f || std::fabs(a.lt_scale) != 1.0f) return false;
+    a.top_k = (const int32_t *) top_k->data; a.top_k_s1 = top_k->nb[1] / sizeof(int32_t);
+    a.pools = (const int32_t *) pools->data; a.pools_s1 = pools->nb[1] / sizeof(int32_t);
+    a.tail  = (const int32_t *) tail->data;  a.tail_s1  = tail->nb[1] / sizeof(int32_t);
+    a.score = (const float *) score->data;   a.score_s1 = score->nb[1] / sizeof(float);
+    a.kpool = (int) kpool; a.n_top = (int) n_top; a.n_tail = (int) tail->ne[0]; a.n_tok = (int) n_tok;
+    if (top_k->nb[1] % sizeof(int32_t) || pools->nb[1] % sizeof(int32_t) || tail->nb[1] % sizeof(int32_t) || score->nb[1] % sizeof(float)) {
+        return false;
+    }
+    inputs.insert(inputs.end(), { top_k, pools, tail, score });
+    GGML_UNUSED(cgraph);
+    return true;
+}
+
+static void ggml_cuda_qsa_sel_plan(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph) {
+    cuda_ctx->qsa_sel.clear();
+    cuda_ctx->qsa_sel_skip.clear();
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_QSA_SEL_FUSION");
+    if (disabled || ggml_cuda_fusion_disabled()) {
+        return;
+    }
+    std::unordered_map<const ggml_tensor *, int> pos;
+    std::vector<const ggml_tensor *> chain, inputs;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * c2 = cgraph->nodes[i];
+        if (c2->op != GGML_OP_CPY || c2->type != GGML_TYPE_I32) {
+            continue;
+        }
+        ggml_backend_cuda_context::qsa_sel_args a = {};
+        chain.clear();
+        inputs.clear();
+        if (!ggml_cuda_qsa_sel_match(cgraph, c2, a, chain, inputs)) {
+            continue;
+        }
+        if (pos.empty()) {
+            for (int j = 0; j < cgraph->n_nodes; ++j) {
+                pos[cgraph->nodes[j]] = j;
+            }
+        }
+        // every chain node: a graph node before c2, not an output, read only by chain nodes (and c2)
+        std::unordered_set<const ggml_tensor *> in_chain(chain.begin(), chain.end());
+        bool ok = true;
+        int i_first = i;
+        for (const ggml_tensor * t : chain) {
+            auto it = pos.find(t);
+            if (it == pos.end() || it->second >= i || (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                ok = false;
+                break;
+            }
+            i_first = std::min(i_first, it->second);
+            int inside = 0;
+            for (const ggml_tensor * u : chain) {
+                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    inside += u->src[k] == t;
+                }
+            }
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                inside += c2->src[k] == t;
+            }
+            if (ggml_cuda_graph_use_count(cgraph, t) != inside) {
+                ok = false;
+                break;
+            }
+        }
+        // the inputs stay as they were until c2: no node that still runs from the first skipped reader on writes over them
+        for (int j = i_first + 1; ok && j < i; ++j) {
+            const ggml_tensor * t = cgraph->nodes[j];
+            if (in_chain.count(t) || ggml_cuda_is_view_or_noop(t) || cuda_ctx->qsa_skip.count(t) || t->data == nullptr) {
+                continue;
+            }
+            for (const ggml_tensor * in : inputs) {
+                if (ggml_cuda_tensors_overlap(t, in)) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if (!ok) {
+            continue;
+        }
+        cuda_ctx->qsa_sel[c2] = a;
+        cuda_ctx->qsa_sel_skip.insert(chain.begin(), chain.end());
+    }
+    static size_t n_logged = SIZE_MAX;
+    if (!cuda_ctx->qsa_sel.empty() && cuda_ctx->qsa_sel.size() != n_logged) {
+        n_logged = cuda_ctx->qsa_sel.size();
+        GGML_LOG_INFO("%s: %zu QSA selection chains in one launch each, %zu nodes not run (GGML_CUDA_DISABLE_QSA_SEL_FUSION=1 off)\n", __func__,
+            cuda_ctx->qsa_sel.size(), cuda_ctx->qsa_sel_skip.size());
+    }
+}
+
+static void ggml_cuda_qsa_sel_launch(ggml_backend_cuda_context * cuda_ctx, const ggml_tensor * c2, const ggml_backend_cuda_context::qsa_sel_args & a) {
+    const int n = (a.kpool*a.n_top + a.n_tail)*a.n_tok;
+    k_qsa_sel_chain<<<1, 256, n*sizeof(int32_t), cuda_ctx->stream()>>>(a, (int32_t *) c2->data);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // k15-fn (GGML_CUDA_DISABLE_SET_ROWS_PAIR=1 off): a SET_ROWS whose next compute node is another SET_ROWS of the same types (the K and
 // V cache stores of an attention layer, the two index-cache stores of a QSA layer) runs with it in one launch. Neither reads or writes
 // the tensor the other writes (different view roots), so the order between them does not matter. Returns the extra nodes covered.
@@ -7314,6 +7548,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->gdn_gates_in.clear();
             cuda_ctx->conv_state_pending.clear();
             ggml_cuda_qsa_maskless_plan(cuda_ctx, cgraph);
+            ggml_cuda_qsa_sel_plan(cuda_ctx, cgraph);
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (!side_mv_pending.empty()) {
@@ -7389,6 +7624,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     // a QSA selection mask node, its flash attention reads the selection instead (ggml_cuda_qsa_maskless_plan)
                     ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 1);
                     continue;
+                }
+
+                if (!cuda_ctx->qsa_sel_skip.empty() && cuda_ctx->qsa_sel_skip.count(node)) {
+                    // a node of a QSA selection chain, computed by the launch of the chain's index node (ggml_cuda_qsa_sel_plan)
+                    ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 1);
+                    continue;
+                }
+                if (!cuda_ctx->qsa_sel.empty()) {
+                    auto it_sel = cuda_ctx->qsa_sel.find(node);
+                    if (it_sel != cuda_ctx->qsa_sel.end()) {
+                        ggml_cuda_qsa_sel_launch(cuda_ctx, node, it_sel->second);
+                        ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 1);
+                        continue;
+                    }
                 }
 
                 if (!cuda_ctx->mmvq_done_early.empty() && cuda_ctx->mmvq_done_early.count(node)) {

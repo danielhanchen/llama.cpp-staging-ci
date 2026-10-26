@@ -1695,6 +1695,19 @@ struct ggml_backend_cuda_context {
     // k15-fn: conv-state copies (the CPY of a conv input's last d_conv - 1 columns into the recurrent cache, qwen4exp build_conv_state_at)
     // deferred into the short convolution that reads the same input (ggml_cuda_try_conv_state_defer): SSM_CONV node -> its CPY nodes
     std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> conv_state_pending;
+    // k15-fn: QSA selection chains (ggml_cuda_qsa_sel_plan): the final i32 index node -> its inputs, and the chain nodes not run
+    struct qsa_sel_args {
+        const int32_t * top_k; int64_t top_k_s1;     // [n_top, n_tok]
+        const int32_t * pools; int64_t pools_s1;     // [kpool, n_pool]: the member cells of each pool
+        const int32_t * tail;  int64_t tail_s1;      // [kpool - 1, n_tok]
+        const float   * score; int64_t score_s1;     // [n_pool, n_tok]
+        int kpool, n_top, n_tail, n_tok;
+        float lp_scale, lp_bias, lp_min, lp_max;     // live of a pool slot: clamp(scale * score + bias)
+        float lt_scale, lt_bias, lt_min, lt_max;     // live of a tail slot: clamp(scale * float(cell) + bias)
+        float d_scale, d_bias;                       // dump of slot s: scale * (s + 1) + bias
+    };
+    std::unordered_map<const ggml_tensor *, qsa_sel_args> qsa_sel;
+    std::unordered_set<const ggml_tensor *> qsa_sel_skip;
     // k15-mm2: QSA maskless (ggml_cuda_qsa_maskless_plan): flash attention node -> its selection, and the dense mask nodes not run
     std::unordered_map<const ggml_tensor *, ggml_cuda_qsa_maskless> qsa_maskless;
     std::unordered_set<const ggml_tensor *> qsa_skip;
