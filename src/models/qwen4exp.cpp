@@ -893,6 +893,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         dump = ggml_scale_bias(ctx0, ggml_cumsum(ctx0, ggml_fill(ctx0, live, 1.0f)), 1.0f, (float) (n_kv - 1));
         qsa_c.dump = dump;
     }
+    // k15-fn: live and dump before the map below, so the cast, sub, mul, add and cast back are consecutive graph nodes (one CUDA
+    // kernel, ggml_cuda_try_fuse_qsa_idx); the order of independent nodes only
+    ggml_build_forward_expand(gf, live);
+    ggml_build_forward_expand(gf, dump);
     ggml_tensor * idx_f = ggml_cast(ctx0, sel_idx, GGML_TYPE_F32);
     idx_f   = ggml_add(ctx0, ggml_mul(ctx0, ggml_sub(ctx0, idx_f, dump), live), dump);
     sel_idx = ggml_cast(ctx0, idx_f, GGML_TYPE_I32);

@@ -5547,6 +5547,62 @@ static int ggml_cuda_try_fuse_mmvf_multi(ggml_backend_cuda_context * cuda_ctx, g
     return run;
 }
 
+// k15-fn (GGML_CUDA_DISABLE_QSA_IDX_FUSION=1 off): the QSA dead-slot index map of each layer, i32 -> f32 cast, (idx - dump) * live + dump,
+// f32 -> i32 cast (5 launches), as one kernel. The same float operations in the same order, rounded as the separate kernels round
+// them (explicit _rn intrinsics, no contraction into an FMA), and the casts as ggml_cuda_cast does them
+static __global__ void k_qsa_idx_select(const int32_t * __restrict__ idx, const float * __restrict__ dump, const float * __restrict__ live,
+        int32_t * __restrict__ dst, const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const float f = ggml_cuda_cast<float>(idx[i]);
+    const float d = dump[i];
+    const float r = __fadd_rn(__fmul_rn(__fsub_rn(f, d), live[i]), d);
+    dst[i] = ggml_cuda_cast<int32_t>(r);
+}
+
+static int ggml_cuda_try_fuse_qsa_idx(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_QSA_IDX_FUSION");
+    if (disabled || i + 4 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * c1  = cgraph->nodes[i];
+    ggml_tensor * sub = cgraph->nodes[i + 1];
+    ggml_tensor * mul = cgraph->nodes[i + 2];
+    ggml_tensor * add = cgraph->nodes[i + 3];
+    ggml_tensor * c2  = cgraph->nodes[i + 4];
+    const auto f32c = [&](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_are_same_shape(t, c1);
+    };
+    if (c1->op != GGML_OP_CPY || c1->src[0]->type != GGML_TYPE_I32 || !ggml_is_contiguous(c1->src[0]) || !f32c(c1) ||
+            !ggml_are_same_shape(c1, c1->src[0]) ||
+            sub->op != GGML_OP_SUB || sub->src[0] != c1 || !f32c(sub) || !f32c(sub->src[1]) ||
+            mul->op != GGML_OP_MUL || mul->src[0] != sub || !f32c(mul) || !f32c(mul->src[1]) ||
+            add->op != GGML_OP_ADD || add->src[0] != mul || add->src[1] != sub->src[1] || !f32c(add) ||
+            c2->op != GGML_OP_CPY || c2->src[0] != add || c2->type != GGML_TYPE_I32 || !ggml_is_contiguous(c2) || !ggml_are_same_shape(c2, c1)) {
+        return 0;
+    }
+    // read only by the next node of the chain (a cast is also its own src[1], see ggml_cast)
+    for (int k = 0; k < 4; ++k) {
+        const ggml_tensor * t = cgraph->nodes[i + k];
+        const int self = t->op == GGML_OP_CPY && t->src[1] == t ? 1 : 0;
+        if (ggml_node_get_use_count(cgraph, i + k) != 1 + self || t->view_src != nullptr || (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+    }
+    // the cast of a CPY node writes its src[1] (dst view): the result tensor is c2 itself here (ggml_cast)
+    if (c2->src[1] != nullptr && c2->src[1]->data != c2->data) {
+        return 0;
+    }
+    const int64_t n = ggml_nelements(c1);
+    const int block = 256;
+    k_qsa_idx_select<<<(unsigned) ((n + block - 1)/block), block, 0, cuda_ctx->stream()>>>((const int32_t *) c1->src[0]->data,
+        (const float *) sub->src[1]->data, (const float *) mul->src[1]->data, (int32_t *) c2->data, n);
+    CUDA_CHECK(cudaGetLastError());
+    return 4;
+}
+
 // k15-fn (GGML_CUDA_DISABLE_SET_ROWS_PAIR=1 off): a SET_ROWS whose next compute node is another SET_ROWS of the same types (the K and
 // V cache stores of an attention layer, the two index-cache stores of a QSA layer) runs with it in one launch. Neither reads or writes
 // the tensor the other writes (different view roots), so the order between them does not matter. Returns the extra nodes covered.
@@ -6463,6 +6519,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (const int n_skip = ggml_cuda_try_fuse_set_rows_pair(cuda_ctx, cgraph, i); n_skip > 0) {
+        return n_skip;
+    }
+
+    if (const int n_skip = ggml_cuda_try_fuse_qsa_idx(cuda_ctx, cgraph, i); n_skip > 0) {
         return n_skip;
     }
 
