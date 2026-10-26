@@ -610,7 +610,7 @@ llama_context::llama_context(
             }
             if (mr != nullptr && mr->replay && !model.hparams.no_alloc) {
                 rs_replay_mem = mr;
-                mr->commit_cb = [this]() { rs_replay_commit(); };
+                mr->commit_cb = [this](bool sync) { rs_replay_commit(sync); };
                 LLAMA_LOG_INFO("%s: recurrent rollback by replay: one delta-net state row per sequence instead of %u "
                         "(LLAMA_RS_REPLAY=0: snapshot rows)\n", __func__, 1 + mr->n_rs_seq);
             }
@@ -910,7 +910,7 @@ void llama_context::small_plan_free(uint32_t i) {
     }
 }
 
-void llama_context::rs_replay_commit() {
+void llama_context::rs_replay_commit(bool sync) {
     llama_memory_recurrent * mem = rs_replay_mem;
     if (mem == nullptr || !mem->has_pending()) {
         return;
@@ -920,9 +920,35 @@ void llama_context::rs_replay_commit() {
     if (!rs_sched) {
         rs_sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, false));
     }
+    // the same cells committing the same token counts (one slot drafting: the usual case) run the graph of the last commit again
+    std::vector<uint32_t> key;
+    for (uint32_t c = 0; c < mem->size; ++c) {
+        if (mem->pend_n[c] != 0) {
+            key.insert(key.end(), { c, mem->pend_n[c], mem->pend_rb[c] });
+        }
+    }
+    static const bool reuse = getenv("LLAMA_RS_REPLAY_REUSE") == nullptr || atoi(getenv("LLAMA_RS_REPLAY_REUSE")) != 0;
+    if (reuse && rs_gf != nullptr && key == rs_key) {
+        for (uint32_t c = 0; c < mem->size; ++c) {
+            mem->pend_n[c]  = 0;
+            mem->pend_rb[c] = 0;
+        }
+        if (ggml_backend_sched_graph_compute_async(rs_sched.get(), rs_gf) != GGML_STATUS_SUCCESS) {
+            GGML_ABORT("%s: the replay commit graph failed", __func__);
+        }
+        if (sync) {
+            ggml_backend_sched_synchronize(rs_sched.get());
+        }
+        rs_reused++;
+        mem->n_replay_commit++;
+        rs_replay_us += ggml_time_us() - t0;
+        return;
+    }
+    rs_gf = nullptr;
+    rs_key = key;
     ggml_init_params ip = { ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false), nullptr, true };
-    ggml_context_ptr ctx_ptr { ggml_init(ip) };
-    ggml_context * ctx = ctx_ptr.get();
+    rs_ctx.reset(ggml_init(ip));
+    ggml_context * ctx = rs_ctx.get();
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, max_nodes, false);
     const int64_t D = model.hparams.n_embd_s();
     for (uint32_t c = 0; c < mem->size; ++c) {
@@ -974,8 +1000,12 @@ void llama_context::rs_replay_commit() {
         if (!ggml_backend_sched_alloc_graph(rs_sched.get(), gf)) {
             GGML_ABORT("%s: cannot allocate the replay commit graph", __func__);
         }
-        if (ggml_backend_sched_graph_compute(rs_sched.get(), gf) != GGML_STATUS_SUCCESS) {
+        if (ggml_backend_sched_graph_compute_async(rs_sched.get(), gf) != GGML_STATUS_SUCCESS) {
             GGML_ABORT("%s: the replay commit graph failed", __func__);
+        }
+        rs_gf = gf;
+        if (sync) {
+            ggml_backend_sched_synchronize(rs_sched.get());
         }
     }
     mem->n_replay_commit++;
@@ -984,8 +1014,11 @@ void llama_context::rs_replay_commit() {
 
 llama_context::~llama_context() {
     if (rs_replay_mem != nullptr && rs_replay_mem->n_replay_commit > 0) {
-        LLAMA_LOG_INFO("%s: recurrent replay commits: %" PRIu64 ", %.2f ms total, %.3f ms each\n", __func__, rs_replay_mem->n_replay_commit,
-                rs_replay_us/1e3, rs_replay_us/1e3/rs_replay_mem->n_replay_commit);
+        LLAMA_LOG_INFO("%s: recurrent replay commits: %" PRIu64 " (%" PRIu64 " reused graphs), %.2f ms total, %.3f ms each (host)\n", __func__,
+                rs_replay_mem->n_replay_commit, rs_reused, rs_replay_us/1e3, rs_replay_us/1e3/rs_replay_mem->n_replay_commit);
+        if (rs_sched) {
+            ggml_backend_sched_synchronize(rs_sched.get());
+        }
         rs_replay_mem->commit_cb = nullptr;
     }
     if (n_plan_saves > 0) {

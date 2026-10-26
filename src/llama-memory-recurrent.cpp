@@ -522,9 +522,9 @@ bool llama_memory_recurrent::has_pending() const {
     return false;
 }
 
-void llama_memory_recurrent::replay_commit_if_pending() const {
+void llama_memory_recurrent::replay_commit_if_pending(bool sync) const {
     if (commit_cb && has_pending()) {
-        commit_cb();
+        commit_cb(sync);
     }
 }
 
@@ -1534,7 +1534,7 @@ bool llama_memory_recurrent_context::apply() {
     }
 
     // k16-draft: the previous window is committed before this ubatch reads (or copies) any state
-    mem->replay_commit_if_pending();
+    mem->replay_commit_if_pending(/*sync =*/ false); // the graph of this ubatch follows on the same streams
 
     mem->find_slot(ubatches[i_next]);
 

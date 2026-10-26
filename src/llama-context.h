@@ -250,10 +250,15 @@ struct llama_context {
 
     // k16-draft (LLAMA_RS_REPLAY): advances the delta-net state rows by the accepted tokens of the last window (see
     // llama_memory_recurrent::replay); called by the recurrent memory before it is read again
-    void rs_replay_commit();
+    void rs_replay_commit(bool sync);
     llama_memory_recurrent * rs_replay_mem = nullptr;
     ggml_backend_sched_ptr   rs_sched;
     int64_t                  rs_replay_us = 0;
+    // the last commit graph, reused while the same cells commit the same tokens (LLAMA_RS_REPLAY_REUSE=0: rebuilt every time)
+    ggml_context_ptr         rs_ctx;
+    ggml_cgraph *            rs_gf = nullptr;
+    std::vector<uint32_t>    rs_key;
+    uint64_t                 rs_reused = 0;
 
     // set when backend work is queued (graph_compute, async state copies), cleared by synchronize()
     bool sync_pending = true;

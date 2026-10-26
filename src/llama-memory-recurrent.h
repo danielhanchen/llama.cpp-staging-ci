@@ -93,10 +93,10 @@ public:
     mutable std::vector<int32_t> rk_h;  // per layer: the key heads the graph stored (H_k, or H_v where it repeats them)   // [S_k, H_v, n_win, size], [S_v, H_v, n_win, size], [1, H_v, n_win, size] x 2
     std::vector<uint32_t> pend_n;    // per cell: tokens of the window not committed yet (0: the row is current)
     std::vector<uint32_t> pend_rb;   // per cell: the tokens of that window rolled back (seq_rm)
-    std::function<void()> commit_cb; // set by llama_context: runs the commit graph
+    std::function<void(bool)> commit_cb; // set by llama_context: runs the commit graph (true: waits for it)
     uint64_t n_replay_commit = 0;
     bool has_pending() const;
-    void replay_commit_if_pending() const; // calls commit_cb (the state reads below call it first)
+    void replay_commit_if_pending(bool sync = true) const; // calls commit_cb (the state reads below call it first)
     void replay_mark(const llama_ubatch & ubatch);
     uint64_t n_rollback_copy = 0;
 
