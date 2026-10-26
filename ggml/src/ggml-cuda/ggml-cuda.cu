@@ -2415,7 +2415,25 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     CUDA_CHECK(cudaGetLastError());
 }
 
+// k15-fn debug (GGML_CUDA_GRAPH_NODE_STATS=3): the copy / gather nodes executed after the fusions, logged per captured graph
+static std::map<const void *, std::map<std::string, std::pair<int, size_t>>> ggml_cuda_exec_copy_ops;
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    static const bool exec_stats = getenv("GGML_CUDA_GRAPH_NODE_STATS") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_NODE_STATS")) >= 3;
+    if (exec_stats && (dst->op == GGML_OP_CPY || dst->op == GGML_OP_CONT || dst->op == GGML_OP_DUP || dst->op == GGML_OP_CONCAT ||
+                       dst->op == GGML_OP_GET_ROWS || dst->op == GGML_OP_REPEAT || dst->op == GGML_OP_SET_ROWS) && ggml_nelements(dst) > 0) {
+        std::string nm;
+        for (const char * c = dst->name; *c; ++c) {
+            if (*c < '0' || *c > '9') { nm += *c; }
+        }
+        const ggml_tensor * s0 = dst->src[0];
+        char key[256];
+        snprintf(key, sizeof(key), "%s %s [%lld,%lld,%lld] <- %s %s", ggml_op_name(dst->op), nm.c_str(), (long long) dst->ne[0], (long long) dst->ne[1],
+            (long long) dst->ne[2], s0 ? ggml_op_name(s0->op) : "-", s0 ? s0->name : "");
+        auto & e = ggml_cuda_exec_copy_ops[&ctx][key];
+        e.first++;
+        e.second += dst->op == GGML_OP_SET_ROWS || dst->op == GGML_OP_CPY ? ggml_nbytes(dst->op == GGML_OP_CPY ? dst->src[0] : dst->src[1]) : ggml_nbytes(dst);
+    }
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -4972,6 +4990,54 @@ static int ggml_cuda_try_fuse_mmvq_multi(ggml_backend_cuda_context * cuda_ctx, g
     return run;
 }
 
+// k15-fn (GGML_CUDA_GDN_STATE_IN_PLACE=0 off): the gather of one recurrent-state row (build_rs, a GET_ROWS of the cache rows by the
+// rollback-group ids) whose only reader is a gated_delta_net of one sequence is skipped, and the kernel reads that row from the cache
+// through the same ids: bitwise the same state, no 3 MiB copy per layer and step (Qwen3.8-Flash-Next: 36 GDN layers, 108 MiB per verify).
+// Not for the mma kernel (it reads a contiguous state), nor when the gathered rows have another reader
+static bool ggml_cuda_try_gdn_state_in_place(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool enabled = getenv("GGML_CUDA_GDN_STATE_IN_PLACE") == nullptr || atoi(getenv("GGML_CUDA_GDN_STATE_IN_PLACE")) != 0;
+    if (!enabled || ggml_cuda_fusion_disabled()) {
+        return false;
+    }
+    const ggml_tensor * gr   = cgraph->nodes[i];
+    const ggml_tensor * rows = gr->src[0];
+    const ggml_tensor * ids  = gr->src[1];
+    if (gr->type != GGML_TYPE_F32 || rows->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        gr->ne[1] != 1 || gr->ne[2] != 1 || gr->ne[3] != 1 || ids->ne[0] != 1 || !ggml_is_contiguous(ids) ||
+        rows->nb[0] != sizeof(float) || rows->ne[2] != 1 || rows->ne[3] != 1 || rows->nb[1] % sizeof(float) != 0 ||
+        rows->data == nullptr || ids->data == nullptr) {
+        return false;
+    }
+    const ggml_tensor * gdn = nullptr;
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * s = n->src[k];
+            if (s == nullptr || (s != gr && s->view_src != gr)) {
+                continue;
+            }
+            if (ggml_cuda_is_view_or_noop(n) && n->view_src == gr) {
+                continue; // a view of the rows: its readers read gr too and are checked themselves
+            }
+            if (n->op == GGML_OP_CPY && ggml_nelements(n->src[0]) == 0) {
+                continue; // the copy of the extra states, empty with one state
+            }
+            if (n->op == GGML_OP_GATED_DELTA_NET && k == 5 && gdn == nullptr && s->view_offs == 0 && ggml_nelements(s) == gr->ne[0] &&
+                ggml_is_contiguous(s) && n->src[2]->ne[3] == 1 && !ggml_cuda_gated_delta_net_may_use_mma(n)) {
+                gdn = n;
+                continue;
+            }
+            return false;
+        }
+    }
+    if (gdn == nullptr) {
+        return false;
+    }
+    // the kernel reads the row the gather would have copied: rows + ids[0] * nb[1]
+    cuda_ctx->gdn_state_in_place[gdn] = { (const float *) rows->data, (int64_t) (rows->nb[1] / sizeof(float)), (const int32_t *) ids->data };
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -6153,6 +6219,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             };
 
             cuda_ctx->mmvq_done_early.clear();
+            cuda_ctx->gdn_state_in_place.clear();
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (!side_mv_pending.empty()) {
@@ -6226,6 +6293,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 if (!cuda_ctx->mmvq_done_early.empty() && cuda_ctx->mmvq_done_early.count(node)) {
                     // computed by an earlier multi-matrix mul_mat_vec_q launch (ggml_cuda_try_fuse_mmvq_multi)
+                    ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 1);
+                    continue;
+                }
+
+                if (node->op == GGML_OP_GET_ROWS && ggml_cuda_try_gdn_state_in_place(cuda_ctx, cgraph, i)) {
+                    // the gated_delta_net that reads this row reads it from the cache instead
                     ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 1);
                     continue;
                 }
@@ -6318,6 +6391,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->src1_memo.share_next = false;
             cuda_ctx->q8_1_cache.end();
             cuda_ctx->mmvq_done_early.clear();
+            cuda_ctx->gdn_state_in_place.clear();
         }
 
         // an overlapped MoE cache fetch whose join is not in this graph (another split): the side stream joins the main stream
@@ -6341,6 +6415,33 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             // launch cost grow with the node count: B200 2000 kernels 5.7 us, with memcpy nodes 102 us)
             static const bool node_stats = getenv("GGML_CUDA_GRAPH_NODE_STATS") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_NODE_STATS")) != 0;
             if (node_stats) {
+                // =2: also the copy / gather ops of the ggml graph by op and tensor name (layer numbers stripped)
+                if (atoi(getenv("GGML_CUDA_GRAPH_NODE_STATS")) >= 2) {
+                    std::map<std::string, int> ops;
+                    for (int i = 0; i < cgraph->n_nodes; ++i) {
+                        const ggml_tensor * t = cgraph->nodes[i];
+                        if (t->op != GGML_OP_CPY && t->op != GGML_OP_CONT && t->op != GGML_OP_DUP && t->op != GGML_OP_CONCAT &&
+                            t->op != GGML_OP_GET_ROWS && t->op != GGML_OP_SET_ROWS && t->op != GGML_OP_REPEAT) {
+                            continue;
+                        }
+                        std::string nm;
+                        for (const char * c = t->name; *c; ++c) {
+                            if (*c < '0' || *c > '9') { nm += *c; }
+                        }
+                        char key[256];
+                        const ggml_tensor * s0 = t->src[0];
+                        snprintf(key, sizeof(key), "%s %s [%lld,%lld,%lld] %s%s <- %s", ggml_op_name(t->op), nm.c_str(), (long long) t->ne[0], (long long) t->ne[1],
+                            (long long) t->ne[2], ggml_type_name(t->type), s0 && !ggml_is_contiguous(s0) ? " (src non-contig)" : "", s0 ? ggml_op_name(s0->op) : "-");
+                        ops[key]++;
+                    }
+                    for (auto & [k, v] : ops) {
+                        GGML_LOG_INFO("%s:   copy/gather op x%d: %s\n", __func__, v, k.c_str());
+                    }
+                }
+                for (auto & [k, v] : ggml_cuda_exec_copy_ops[cuda_ctx]) {
+                    GGML_LOG_INFO("%s:   executed copy/gather x%d (%.2f MiB): %s\n", __func__, v.first, v.second/1048576.0, k.c_str());
+                }
+                ggml_cuda_exec_copy_ops[cuda_ctx].clear();
                 size_t n_nodes = 0;
                 CUDA_CHECK(cudaGraphGetNodes(graph->graph, nullptr, &n_nodes));
                 std::vector<cudaGraphNode_t> nodes(n_nodes);
@@ -6496,6 +6597,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+        ggml_cuda_exec_copy_ops[cuda_ctx].clear(); // k15-fn debug: the copies of this capture only
     }
 
     if (ht_on) {

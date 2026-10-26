@@ -12,3 +12,6 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
 void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                               ggml_cuda_gated_delta_net_fused_cache cache);
+
+// k15-fn: whether the op may take the mma kernel (which reads a contiguous initial state)
+bool ggml_cuda_gated_delta_net_may_use_mma(const ggml_tensor * dst);

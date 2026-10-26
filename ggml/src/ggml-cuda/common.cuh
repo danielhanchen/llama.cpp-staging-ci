@@ -1676,6 +1676,10 @@ struct ggml_backend_cuda_context {
     ggml_cuda_q8_1_cache q8_1_cache;
     // k15-mm: products of this graph evaluation already computed by an earlier multi-matrix mul_mat_vec_q launch (ggml_cuda_try_fuse_mmvq_multi)
     std::unordered_set<const ggml_tensor *> mmvq_done_early;
+    // k15-fn: gated_delta_net nodes of this graph evaluation that read their initial state straight from the recurrent cache rows (the
+    // gather that copied the row was skipped, see ggml_cuda_try_gdn_state_in_place): node -> cache rows base, row stride (floats), row ids
+    struct gdn_state_src { const float * base; int64_t row_stride; const int32_t * ids; };
+    std::unordered_map<const ggml_tensor *, gdn_state_src> gdn_state_in_place;
     ggml_cuda_src1_memo  src1_memo;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
