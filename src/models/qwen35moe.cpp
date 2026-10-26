@@ -256,6 +256,12 @@ static bool qwen35moe_proj_adjacent(int64_t n_tokens) {
     return on && n_tokens > 8;
 }
 
+// k15-idlewait (experiment): the MTP head's graph with the adjacent order too (LLAMA_QWEN35_PROJ_ADJACENT_MTP=0: the old order there)
+static bool qwen35moe_proj_adjacent_mtp(int64_t n_tokens) {
+    static const bool on = !getenv("LLAMA_QWEN35_PROJ_ADJACENT_MTP") || atoi(getenv("LLAMA_QWEN35_PROJ_ADJACENT_MTP")) != 0;
+    return on && qwen35moe_proj_adjacent(n_tokens);
+}
+
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35moe::graph::build_qkvz(
                 ggml_tensor * input,
                         int   il) {
@@ -647,7 +653,7 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
             n_embd_head,     n_head_kv,
             n_embd_head,     n_head_kv,
             il, false);
-    if (qwen35moe_proj_adjacent(n_tokens)) {
+    if (qwen35moe_proj_adjacent_mtp(n_tokens)) {
         ggml_build_forward_expand(gf, Qcur_full);
         ggml_build_forward_expand(gf, Kcur);
         ggml_build_forward_expand(gf, Vcur);
