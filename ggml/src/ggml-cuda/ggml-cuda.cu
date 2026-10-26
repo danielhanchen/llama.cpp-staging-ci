@@ -1806,7 +1806,7 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         compute_type = GGML_TYPE_F32;
     }
 
-    const char * env_c = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
+    static const char * env_c = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE"); // k15-hostcut: read once
     if (env_c != nullptr) {
         std::string env_cpp = env_c;
         for (char & c : env_cpp) {
