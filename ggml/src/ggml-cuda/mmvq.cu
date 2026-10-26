@@ -1730,6 +1730,42 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     stream, unroll);
             };
 
+            // k16-turing (GGML_CUDA_MMVQ_TURING_2ROWS, default on): on sm_75 a single column launch takes 2 rows per block, which shares
+            // the q8_1 loads of the activation between the rows and adds weight loads in flight. A row's sum does not depend on the rows
+            // per block (the K split and the reduction are per row), so the output keeps its bytes. sm_75 binaries only (the TURING table
+            // also covers Volta, where it did not gain), not Q3_K, not the small-K / unrolled / MoE (ids) / shared-expert launches, and
+            // only an even number of rows (a block reads the weights of both its rows). Idea from ikawrakow/ik_llama.cpp PR #2701 (MIT).
+            // =0 off; =2 also on other NVIDIA tables (a check that the bytes do not change, not a tuned setting)
+            static const int turing_2rows_env = [] {
+                const char * e = getenv("GGML_CUDA_MMVQ_TURING_2ROWS");
+                return e != nullptr ? atoi(e) : 1;
+            }();
+            const bool turing_2rows = type != GGML_TYPE_Q3_K && !has_ids && !unroll && fusion.shared_up == nullptr &&
+                nrows_x % 2 == 0 && GGML_CUDA_CC_IS_NVIDIA(cc) && !should_use_small_k(c_ncols_dst) && !should_halve_iters() &&
+                calc_rows_per_block(type, 1, table_id) == 1 &&
+                ((turing_2rows_env == 1 && table_id == MMVQ_PARAMETERS_TURING && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
+                 (turing_2rows_env == 2 && (table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GENERIC)));
+            if constexpr (type != GGML_TYPE_Q3_K) {
+                if (turing_2rows) {
+                    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+                    const dim3 block_nums(nrows_x / 2, nchannels_dst, nsamples_dst);
+                    const dim3 block_dims(warp_size, calc_nwarps(type, c_ncols_dst, table_id), 1);
+                    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+#define MMVQ_2ROWS_LAUNCH(FUS) ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, FUS, false, false, 0, 0, 2, 1>, launch_params, \
+                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst, \
+                        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, \
+                        sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride)
+                    if (has_fusion) {
+                        MMVQ_2ROWS_LAUNCH(true);
+                    } else {
+                        MMVQ_2ROWS_LAUNCH(false);
+                    }
+#undef MMVQ_2ROWS_LAUNCH
+                    break;
+                }
+            }
+
             if (should_use_small_k(c_ncols_dst)) {
                 launch(std::true_type{},  std::false_type{});
             } else if (should_halve_iters()) {
