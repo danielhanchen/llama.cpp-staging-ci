@@ -5237,6 +5237,10 @@ private:
         } else {
             // success, apply batch metrics
             metrics_post_decode(off, batch.view.size(), has_output);
+            // k15-idlewait: a cache entry dropped during its save goes back to the pool (the decode joined the save)
+            if (prompt_cache && !prompt_cache->dropped_inflight.empty()) {
+                prompt_cache->wait_inflight();
+            }
         }
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]

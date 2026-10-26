@@ -2007,8 +2007,15 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     return true;
 }
 
+void server_prompt_cache::recycle_dropped() {
+    for (auto & st : dropped_inflight) {
+        prompt_state_recycle(st);
+    }
+    dropped_inflight.clear();
+}
+
 bool server_prompt_cache::ckpt_return(const server_tokens & tokens, std::list<common_prompt_checkpoint> & dst, bool keep_entry, llama_pos keep_max) {
-    wait_inflight();
+    // no wait for a save in flight: it writes the entry's state buffers only, the checkpoints are not touched by it
     for (auto it = states.rbegin(); it != states.rend(); ++it) {
         if (it->prompt.tokens.size() == tokens.size() && it->prompt.tokens.get_common_prefix(tokens) == tokens.size()) {
             if (!keep_entry) {
@@ -2027,6 +2034,17 @@ bool server_prompt_cache::ckpt_return(const server_tokens & tokens, std::list<co
 }
 
 bool server_prompt_cache::drop_newest(const server_tokens & tokens) {
+    // k15-idlewait: the entry of a save still copying leaves the cache now, its buffers once the copy is done (LLAMA_PCS_DROP_DEFER=0:
+    // wait for the copy here, as before)
+    static const bool defer = getenv("LLAMA_PCS_DROP_DEFER") == nullptr || atoi(getenv("LLAMA_PCS_DROP_DEFER")) != 0;
+    if (defer && inflight != nullptr) {
+        for (auto it = states.rbegin(); it != states.rend(); ++it) {
+            if (&*it == inflight && it->prompt.tokens.size() == tokens.size() && it->prompt.tokens.get_common_prefix(tokens) == tokens.size()) {
+                dropped_inflight.splice(dropped_inflight.end(), states, std::next(it).base());
+                return true;
+            }
+        }
+    }
     wait_inflight();
     for (auto it = states.rbegin(); it != states.rend(); ++it) {
         if (it->prompt.tokens.size() == tokens.size() && it->prompt.tokens.get_common_prefix(tokens) == tokens.size()) {

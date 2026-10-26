@@ -700,7 +700,15 @@ struct server_prompt_cache {
             wait_reads();
         }
         inflight = nullptr;
+        if (!dropped_inflight.empty()) {
+            recycle_dropped();
+        }
     }
+
+    // k15-idlewait: an entry dropped while its asynchronous save was still copying (drop_newest) waits here for the copy, its buffers
+    // go back to the pool at the next wait_inflight (the server calls it after the next decode, which joins the save)
+    std::list<server_prompt_cache_state> dropped_inflight;
+    void recycle_dropped();
 
     // remove the oldest state, handing it to the SSD tier if there is one
     void evict_front();
