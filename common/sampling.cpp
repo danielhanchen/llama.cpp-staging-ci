@@ -579,10 +579,10 @@ struct common_sampler * common_sampler_init(
     result->greedy_fast = common_sampler_greedy_fast(params, grmr, rbudget);
     result->pen_fast    = result->greedy_fast && common_sampler_penalty_active(params);
     // only LLAMA_SAMPLE_GREEDY_FAST=1 reads bias_dense: else the sparse list is built from the biases alone (the same sums, in the same
-    // order), not from a fresh n_vocab array and a scan of it (0.5 ms per request with ignore_eos on a 248k vocab). opt-in: LLAMA_SAMPLE_BIAS_SPARSE=1
+    // order), not from a fresh n_vocab array and a scan of it (0.5 ms per request with ignore_eos on a 248k vocab). LLAMA_SAMPLE_BIAS_SPARSE=0: as before
     static const bool bias_sparse_only = [] {
         const char * e = getenv("LLAMA_SAMPLE_BIAS_SPARSE");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
     if (result->greedy_fast && !merged_bias.empty() && bias_sparse_only && common_sampler_greedy_fast_mode() != 1) {
         const int32_t n_vocab = llama_vocab_n_tokens(vocab);

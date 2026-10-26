@@ -2577,6 +2577,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         moe_cache->hybrid_tick(ubatch.n_tokens);
         ggml_backend_sched_set_overlap(sched.get(), moe_cache->hybrid_active());
     }
+    // k15-pred r22b: short-prompt host path timing (opt-in), no change to the scheduler's overlap flag
+    if (moe_cache && moe_cache->prompt_auto_pending()) {
+        moe_cache->prompt_auto_tick(ubatch.n_tokens);
+    }
 
     const int64_t t_tr0 = llama_mtp_handoff_trace() && ubatch.n_tokens >= 64 ? ggml_time_us() : 0;
     int64_t t_tr_graph = 0;
