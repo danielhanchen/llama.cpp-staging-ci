@@ -551,6 +551,8 @@ struct llama_moe_cache::impl {
 
         int lend_auto = -1; // automatic lending (LLAMA_MOE_CACHE_LEND unset): -1 not decided yet, 0 off, 1 on
         size_t dry_need = 0; // the largest staging need a measurement (dry lend) asked for, see lend_need_max
+        size_t dry_save = 0; // k15-fn: the staging copies a measurement found the device would lend (lend_saves), see lend_save_need
+        bool lend_saving = false; // k15-fn: lending is on for the memory it frees (lend_saves), see unlend
         size_t mem_reserve = 0; // device memory kept free for a later model or context (set_mem_reserve), not free for lend_decide
     };
 
@@ -724,6 +726,9 @@ struct llama_moe_cache::impl {
     bool   lend_auto    = true;  // LLAMA_MOE_CACHE_LEND unset: lend only if the staging copies are a large share of the cache, see lend
     bool   seed_own     = false; // prompts seed from their own ids by default (LLAMA_MOE_CACHE_SEED unset or 2), see lend
     double lend_min_frac = 0.08; // LLAMA_MOE_CACHE_LEND_MIN_FRAC: that share
+    bool   lend_save     = false; // k15-fn LLAMA_MOE_CACHE_LEND_SAVE=1 (opt-in): also lend where it frees lend_save_min bytes, see lend_saves
+    size_t lend_save_min = 256ull*1024*1024; // LLAMA_MOE_CACHE_LEND_SAVE_MIB
+    bool   lend_save_refill = true; // LLAMA_MOE_CACHE_LEND_SAVE_REFILL=0: slots lent for lend_saves come back empty (lazy), see unlend
     bool   lend_multi   = false; // LLAMA_MOE_CACHE_LEND_MULTI=1: also with the cache on several devices (not validated)
     bool   lend_off_log = false;
     size_t n_lends      = 0; // graphs whose staging copies used lent slots
@@ -1119,6 +1124,17 @@ struct llama_moe_cache::impl {
             }
             env = getenv("LLAMA_MOE_CACHE_LEND_MULTI");
             lend_multi = env != nullptr && atoi(env) != 0;
+            // opt-in: G4 k15gm_g4, Qwen3.8-Flash-Next UD-IQ4_XS + MTP at 32 GB: cache 18719 -> 19988 MiB with the same device memory, pinned
+            // decode +5.1 / +1.9 / +3.1% (chat / 2k / 8k, same text), but prompts pay the refill of the lent slots: 2k 2441 -> 2313 tok/s
+            // (TTFT 935 -> 986 ms), 8k -2..-3.5%; Qwen3.6 UD-Q4_K_XL 12 / 16 GB, Flash-Next 16 GB and LFM2.5 16 GB unchanged
+            env = getenv("LLAMA_MOE_CACHE_LEND_SAVE");
+            lend_save = env != nullptr && atoi(env) != 0;
+            env = getenv("LLAMA_MOE_CACHE_LEND_SAVE_REFILL");
+            lend_save_refill = env == nullptr || atoi(env) != 0;
+            env = getenv("LLAMA_MOE_CACHE_LEND_SAVE_MIB");
+            if (env != nullptr) {
+                lend_save_min = (size_t) std::max(0ll, atoll(env))*1024*1024;
+            }
         }
         {
             const char * env = getenv("LLAMA_MOE_CACHE_REFILL");
@@ -6152,6 +6168,8 @@ struct llama_moe_cache::impl {
         // a prompt that seeds from its own ids holds the copies of a split in the graph allocation (see llama_context::sched_reserve_seed)
         const size_t seed  = seed_own ? split : 0;
         const size_t graph = graph_all + seed;
+        // a measurement records the copies the device lends for the memory it frees (set below once the slots hold them)
+        const bool save_rec = dry && !graph_only && lend_save && (!lend_auto || lend_saves(id, need, seed));
         if (lend_auto && !graph_only && !lend_decide(id, need, graph, seed, dry)) {
             return;
         }
@@ -6230,6 +6248,9 @@ struct llama_moe_cache::impl {
             }
         }
         if (dry) {
+            if (save_rec) {
+                devices[id].dry_save = std::max(devices[id].dry_save, need);
+            }
             return;
         }
         // with device lookups the device state may be newer: the slots to evict are only known after it is copied back
@@ -6288,6 +6309,21 @@ struct llama_moe_cache::impl {
     // is allocated; the memory kept free for a later model or context (set_mem_reserve) is held against the copies and the graph
     // allocation without the copies of a seeding prompt (`seed` bytes of `graph`): a seed that does not fit is dropped by itself (see
     // llama_context::sched_reserve_seed), lending for it costs the prompts the slots
+    // k15-fn: lending frees the staging arena (`need` bytes), and the fit gives those bytes to the cache (see llama_context::sched_reserve);
+    // a prompt that seeds from its own ids then holds the copies of a split (`seed`) in the graph allocation, if the memory left holds
+    // them. The cache lends where the arena is at least lend_save_min bytes larger than that split, whatever its share of the cache. The
+    // fit and the load must decide the same, so the rule does not depend on the cache size or the free memory. G4 Qwen3.8-Flash-Next
+    // UD-IQ4_XS + MTP at 32 GB: arena 1275 MiB (6.8% of the cache, lending was off), split 850 MiB -> on; Qwen3.6 UD-Q4_K_XL at 12 / 16 GB:
+    // 354 / 210 MiB -> off (it lends there anyway because the copies do not fit, see below, and its fit is unchanged)
+    // Discrete GPUs only: on an integrated GPU (gfx1151, unified memory) the rule is not measured, lending stays as it was there
+    bool lend_saves(int32_t id, size_t need, size_t seed) const {
+        if (!lend_save || need <= seed || need - seed < lend_save_min) {
+            return false;
+        }
+        ggml_backend_dev_t dev = ggml_backend_get_device(devices[id].backend);
+        return dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU;
+    }
+
     bool lend_decide(int32_t id, size_t need, size_t graph, size_t seed, bool dry) {
         device & d = devices[id];
         if (d.lend_auto >= 0) {
@@ -6300,7 +6336,8 @@ struct llama_moe_cache::impl {
             }
         }
         const double frac = cache > 0 ? (double) need/cache : 1.0;
-        bool on = frac >= lend_min_frac;
+        const bool saves = frac < lend_min_frac && lend_saves(id, need, seed);
+        bool on = frac >= lend_min_frac || saves;
         if (dry) {
             d.dry_need = std::max(d.dry_need, need);
             // a measurement (e.g. for --fit) counts the memory with lending: when the device is short of memory the cache lends anyway
@@ -6330,7 +6367,13 @@ struct llama_moe_cache::impl {
             }
         }
         d.lend_auto = on || !fit ? 1 : 0;
-        if (on) {
+        d.lend_saving = saves;
+        if (saves) {
+            LLAMA_LOG_INFO("%s: %s: MoE cache lending on: the staging copies of large batches (%.2f MiB, %.1f%% of the cache) free %.2f MiB beside the "
+                "copies of a seeding prompt (%.2f MiB), at least %.2f MiB (LLAMA_MOE_CACHE_LEND_SAVE=1, LLAMA_MOE_CACHE_LEND_SAVE_MIB)\n",
+                __func__, ggml_backend_name(d.backend), need/1024.0/1024.0, 100.0*frac, (need - seed)/1024.0/1024.0, seed/1024.0/1024.0,
+                lend_save_min/1024.0/1024.0);
+        } else if (on) {
             LLAMA_LOG_INFO("%s: %s: MoE cache lending on: the staging copies of large batches (%.2f MiB) are %.1f%% of the cache (%.2f MiB), at least %.1f%% (LLAMA_MOE_CACHE_LEND_MIN_FRAC)\n",
                 __func__, ggml_backend_name(d.backend), need/1024.0/1024.0, 100.0*frac, cache/1024.0/1024.0, 100.0*lend_min_frac);
         } else if (!fit) {
@@ -6498,6 +6541,18 @@ struct llama_moe_cache::impl {
             }
         }
 
+        // k15-fn LLAMA_MOE_CACHE_LEND_SAVE_REFILL=0 (opt-in): slots lent for the memory lending frees (lend_saves) come back empty and
+        // misses fill them, instead of uploading every expert they held before the prompt (G4 Qwen3.8-Flash-Next UD-IQ4_XS + MTP at
+        // 32 GB: 994 slots, 2208 MiB after every 2k prompt). k15gn_g4: the 2k prompt loss of lending went from -5.3% to -2.0%, but the
+        // next short prompt reads the experts back: chat TTFT 320 -> 342 ms (refilled: 318). Residency only, the outputs do not change
+        if (devices[g.id].lend_saving && !lend_save_refill) {
+            for (int32_t il : g.layers) {
+                if ((size_t) il < refill.size()) {
+                    refill[il].clear();
+                }
+            }
+            return;
+        }
         if (refill.empty() || g.dev_newer) {
             return;
         }
@@ -8690,6 +8745,15 @@ bool llama_moe_cache::lends_graph_to(int64_t n_tokens) const {
         }
     }
     return false;
+}
+
+size_t llama_moe_cache::lend_save_need(ggml_backend_t backend) const {
+    for (const auto & d : pimpl->devices) {
+        if (d.backend == backend) {
+            return d.dry_save;
+        }
+    }
+    return 0;
 }
 
 size_t llama_moe_cache::lend_need_max() const {

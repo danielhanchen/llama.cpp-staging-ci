@@ -55,6 +55,18 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
 // get the underlying llama_sampler_chain
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 
+// k15-fn: the chain picks the argmax of the raw logits (greedy, no logit bias, no active penalties, no probabilities requested)
+bool common_sampler_device_greedy(const struct common_sampler * gsmpl);
+// k15-fn: the request picks the argmax with a token set excluded (every bias -inf, e.g. ignore_eos): true and mask = those tokens, ascending
+bool common_sampler_device_greedy_masked(const struct common_sampler * gsmpl, std::vector<llama_token> & mask);
+// k15-fn: the chain gives the same token and candidates from the k_dev highest raw logits of a row (a device top-k, see
+// common_sampler_device_topk in sampling.cpp for the conditions): k_dev, or 0 when the request needs the full row
+int32_t common_sampler_device_topk(const struct common_sampler * gsmpl, int32_t k_dev);
+// k15-fn: the rows' logits are device top-k candidates (put in id order before the chain)
+void common_sampler_set_device_topk(struct common_sampler * gsmpl, bool on);
+// k15-fn: the sampler takes the token a device greedy chain picked for the row (the server sets it for device greedy requests)
+void common_sampler_set_device_token(struct common_sampler * gsmpl, bool on);
+
 // extended sampling implementation:
 //
 // - set logits

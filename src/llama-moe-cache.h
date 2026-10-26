@@ -233,6 +233,9 @@ public:
 
     // the largest staging memory (the copies of large batches) a measurement asked the cache to lend, on any device (0 if none)
     size_t lend_need_max() const;
+    // k15-fn: the staging copies a measurement found the cache lends on the device of backend because lending frees memory there
+    // (LLAMA_MOE_CACHE_LEND=1, or unset and lend_saves), 0 if it does not
+    size_t lend_save_need(ggml_backend_t backend) const;
 
     // device memory of backend kept free for a model or context created later (e.g. a draft): the automatic lending decision
     // counts it as used (see lend_decide)

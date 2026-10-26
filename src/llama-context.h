@@ -17,6 +17,7 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <unordered_set>
 #include <unordered_map>
 #include <thread>
@@ -378,6 +379,11 @@ public:
     bool sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const std::vector<size_t> & staging_pp);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+    void set_sampler_raw_logits(llama_seq_id seq_id, bool raw);
+    bool set_sampler_swap(llama_seq_id seq_id, llama_sampler * sampler);
+    // the samplers the graph of a ubatch applies (graph_params): not those of the sequences copying raw logits, except in a reserve
+    std::map<llama_seq_id, llama_sampler *> graph_samplers() const;
+    bool graph_reserving = false;
 
 private:
     llm_graph_result * get_gf_res_prev();
@@ -500,6 +506,9 @@ private:
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
+        // k15-fn: sequences whose raw logits are still copied although a sampler is set (llama_set_sampler_raw_logits): the sampler
+        // stays in the graph (no new reserve) while a request that needs the host sampler runs
+        std::set<llama_seq_id> raw;
 
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};
@@ -776,6 +785,7 @@ private:
     std::vector<ggml_backend_t>             backend_ptrs;
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
+    std::vector<size_t>                     backend_lend_freed;   // k15-fn: of a measurement, the compute lending frees (see sched_reserve)
 
     // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
     std::array<llm_graph_result_ptr, 2> gf_res_prev;

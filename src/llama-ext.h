@@ -69,6 +69,7 @@ struct llama_memory_breakdown_data {
     size_t model   = 0; // memory allocated for the model
     size_t context = 0; // memory allocated for the context
     size_t compute = 0; // memory allocated for temporary compute buffers
+    size_t lend_freed = 0; // k15-fn: of a measurement (no_alloc), the staging arena the MoE cache lends for, not in total() (see sched_reserve)
 
     size_t total() const {
         return model + context + compute;
@@ -90,6 +91,19 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
+
+// k15-fn: with a sampler set for seq_id (llama_set_sampler), raw = true still copies the raw logits of its rows to the host (the host
+// sampler of a request that the device sampler cannot serve), raw = false copies only what the sampler outputs. No new graph reserve
+LLAMA_API void llama_set_sampler_raw_logits(struct llama_context * ctx, llama_seq_id seq_id, bool raw);
+// k15-fn: reserve the graphs now if a change (e.g. llama_set_sampler) asked for it, instead of at the next decode
+LLAMA_API void llama_sched_reserve_now(struct llama_context * ctx);
+// k15-fn: replace the backend sampler of seq_id, which has one, without reserving the graphs again: the caller reserved them with a
+// sampler whose graph is at least as large (e.g. the masked greedy of an ignore_eos request, swapped for the plain one). False: nothing
+// was changed (no sampler set for seq_id, or this one cannot run on the backend)
+LLAMA_API bool llama_set_sampler_swap(struct llama_context * ctx, llama_seq_id seq_id, struct llama_sampler * sampler);
+// k15-fn: greedy with the given tokens excluded (their logit is -inf, as a -inf logit bias), the lowest id on a tie; on the backend
+// it masks the row in the samplers' padded copy of the logits
+LLAMA_API struct llama_sampler * llama_sampler_init_greedy_masked(int32_t n_tokens, const llama_token * tokens);
 
 // the backend buffers that a state write of this memory would touch - empty caches report none
 LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);

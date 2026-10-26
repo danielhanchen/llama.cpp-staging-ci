@@ -1297,9 +1297,16 @@ void llama_context::sched_reserve() {
         // left after the layers (the reserve drops the prefetch when the compute buffers do not fit with it or leave no headroom), so a fit
         // places the same layers as without the prefetch instead of moving one to the host for the staging copies
         // with the MoE cache the staging may live in lent cache slots and the cache sizing accounts for it: the measurement keeps it
+        // k15-fn: a draft model's measure keeps the copies of one split (LLAMA_FIT_STAGING_SPLIT=1, set by common around it, see
+        // common_draft_measure_env): without the arena the weights of a split are copied into the graph allocation instead. The main
+        // model's measure without a MoE cache keeps leaving the whole arena out (the cache it sizes lends or holds the copies)
         if (model.hparams.no_alloc && !moe_cache) {
+            const char * e_split = getenv("LLAMA_FIT_STAGING_SPLIT"); // set by common for draft-model measures only
+            const bool keep_split = e_split != nullptr && atoi(e_split) != 0;
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-                backend_buf_exp_size[i] -= std::min(backend_buf_exp_size[i], ggml_backend_sched_get_staging_size(sched.get(), backend_ptrs[i]));
+                const size_t staging = ggml_backend_sched_get_staging_size(sched.get(), backend_ptrs[i]);
+                const size_t split   = keep_split ? ggml_backend_sched_get_staging_split(sched.get(), backend_ptrs[i]) : 0;
+                backend_buf_exp_size[i] -= std::min(backend_buf_exp_size[i], staging - std::min(staging, split));
             }
         }
 
@@ -1390,7 +1397,7 @@ void llama_context::sched_reserve() {
             LLAMA_LOG_DEBUG("%s: measure: staging copies %.2f MiB, the cache lends from %.2f MiB: %s\n", __func__, staging/1024.0/1024.0,
                 min_bytes/1024.0/1024.0, measure_lent ? "lent" : "counted");
         }
-        if (measure_lent != 0) {
+        if (measure_lent != 0 && moe_cache) {
             std::vector<size_t> graph_sz(backend_ptrs.size());
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
                 graph_sz[i] = backend_buf_exp_size[i] - std::min(backend_buf_exp_size[i], staging_pp[i]);
@@ -1401,6 +1408,28 @@ void llama_context::sched_reserve() {
                     backend_buf_exp_size[i]/1024.0/1024.0, graph_sz[i]/1024.0/1024.0);
                 backend_buf_exp_size[i] = graph_sz[i];
             }
+        }
+    }
+
+    // k15-fn: the fit's measure (no LLAMA_MOE_MEASURE_LENT) leaves the staging arena out (see above: it only uses memory that is left).
+    // Where the cache lends because that frees memory (llama_moe_cache lend_saves, or LLAMA_MOE_CACHE_LEND=1) the loaded context has no
+    // arena: the measure reports its bytes (mb.lend_freed, which the fit gives to the cache, see common_get_device_memory_data_impl),
+    // so the memory left after the load is the same as with the arena. The seeding prompt's copies are not counted, as without lending: the seed graph is reserved
+    // only if the memory left holds it (see sched_reserve_seed), like a default context that cannot fit it. G4 Qwen3.8-Flash-Next
+    // UD-IQ4_XS + MTP at 32 GB: k15gl_g4 counted the seed growth (546 MiB) too, the cache got 721 MiB and every prompt seeded the
+    // cache from its own ids: the 2k prompt lost 17% (2448 -> 2044 tok/s), the default does not seed there. Opt-in: LLAMA_MOE_CACHE_LEND_SAVE=1
+    if (model.hparams.no_alloc) {
+        backend_lend_freed.assign(backend_ptrs.size(), 0);
+    }
+    if (model.hparams.no_alloc && moe_cache && measure_env == nullptr) {
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            const size_t save = moe_cache->lend_save_need(backend_ptrs[i]);
+            if (save == 0) {
+                continue;
+            }
+            backend_lend_freed[i] = save;
+            LLAMA_LOG_DEBUG("%s: %s: measure: compute %.2f MiB, the cache lends %.2f MiB of staging to the cache\n", __func__,
+                ggml_backend_buft_name(backend_buft[i]), backend_buf_exp_size[i]/1024.0/1024.0, save/1024.0/1024.0);
         }
     }
 
@@ -2370,6 +2399,31 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_sampler_raw_logits(llama_seq_id seq_id, bool raw) {
+    if (raw) {
+        sampling.raw.insert(seq_id);
+    } else {
+        sampling.raw.erase(seq_id);
+    }
+}
+
+bool llama_context::set_sampler_swap(llama_seq_id seq_id, llama_sampler * sampler) {
+    auto it = sampling.samplers.find(seq_id);
+    if (it == sampling.samplers.end() || sampler == nullptr || !sampler->iface->backend_init || !sampler->iface->backend_apply ||
+            llama_sampler_chain_n(sampler) <= 0) {
+        return false;
+    }
+    if (it->second == sampler) {
+        return true;
+    }
+    if (!llama_sampler_chain_is_init(sampler)) {
+        sampler->iface->backend_init(sampler, ggml_backend_dev_buffer_type(model.dev_output()), cparams.n_outputs_max_per_seq);
+    }
+    // the graph of the next ubatch is built again (llm_graph_result::can_reuse compares the samplers), the reserve stays
+    it->second = sampler;
+    return true;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -2399,7 +2453,10 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (sampler && can_offload) {
         auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
 
-        sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
+        // k15-fn: a chain set before (the server's device greedy chain, back from a backend sampling request) is initialized once
+        if (!llama_sampler_chain_is_init(sampler)) {
+            sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
+        }
 
         sampling.samplers[seq_id] = sampler;
 
@@ -3048,7 +3105,8 @@ static void copy_tensor_async_rows(
     }
 }
 
-static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers) {
+static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers,
+        const std::set<llama_seq_id> & raw) {
     for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
         if (!ubatch.output[i]) {
             continue;
@@ -3057,7 +3115,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
         // Check if the output token has at least one sequence without a backend sampler.
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             llama_seq_id seq_id = ubatch.seq_id[i][j];
-            if (samplers.find(seq_id) == samplers.end()) {
+            if (samplers.find(seq_id) == samplers.end() || raw.count(seq_id) > 0) {
                 return true;
             }
         }
@@ -3533,7 +3591,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers, sampling.raw)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -4623,7 +4681,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             auto * t_logits  = res->get_logits();
             auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn() : nullptr;
 
-            if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+            if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers, sampling.raw)) {
                 ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
                 GGML_ASSERT(backend_res != nullptr);
                 GGML_ASSERT(n_outputs_prev + n_outputs <= n_outputs_all);
@@ -5693,7 +5751,9 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
+    graph_reserving = true;
     const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    graph_reserving = false;
 
     res->reset();
 
@@ -5730,6 +5790,21 @@ ggml_cgraph * llama_context::graph_reserve(
     return gf;
 }
 
+std::map<llama_seq_id, llama_sampler *> llama_context::graph_samplers() const {
+    // k15-fn: a sequence copying its raw logits (llama_set_sampler_raw_logits) has no sampler in the graph: its argmax chains cost ~1%
+    // of a G4 Flash-Next decode step and nothing reads them. The reserve keeps every sampler (the largest graph)
+    if (sampling.raw.empty() || graph_reserving) {
+        return sampling.samplers;
+    }
+    std::map<llama_seq_id, llama_sampler *> res;
+    for (const auto & [seq_id, smpl] : sampling.samplers) {
+        if (sampling.raw.count(seq_id) == 0) {
+            res.emplace(seq_id, smpl);
+        }
+    }
+    return res;
+}
+
 llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -5750,7 +5825,7 @@ llm_graph_params llama_context::graph_params(
         /*.moe_cache   =*/ moe_cache.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
-        /*.samplers    =*/ sampling.samplers,
+        /*.samplers    =*/ graph_samplers(),
         /*.n_outputs   =*/ n_outputs,
         /*.moe_full_last =*/ moe_full_last || getenv("LLAMA_MOE_LEND_FULL_LAST") == nullptr || atoi(getenv("LLAMA_MOE_LEND_FULL_LAST")) >= 2,
         /*.cb          =*/ graph_get_cb(),
@@ -7969,6 +8044,7 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ggml_backend_t             backend = backends[i].get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
             ret[buft].compute += backend_buf_exp_size[i];
+            ret[buft].lend_freed += i < backend_lend_freed.size() ? backend_lend_freed[i] : 0;
         }
     } else {
         for (const auto & backend_ptr : backends) {
@@ -9107,6 +9183,18 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
     return ctx->set_sampler(seq_id, smpl);
+}
+
+void llama_set_sampler_raw_logits(llama_context * ctx, llama_seq_id seq_id, bool raw) {
+    ctx->set_sampler_raw_logits(seq_id, raw);
+}
+
+void llama_sched_reserve_now(llama_context * ctx) {
+    ctx->sched_reserve();
+}
+
+bool llama_set_sampler_swap(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
+    return ctx->set_sampler_swap(seq_id, smpl);
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {

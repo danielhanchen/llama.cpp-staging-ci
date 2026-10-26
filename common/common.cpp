@@ -972,6 +972,26 @@ void common_set_env(const std::string & name, const std::string & value) {
 #endif
 }
 
+// k15-fn: a draft model (no MoE cache of its own) is measured with the weight copies of one prefetch split counted
+// (LLAMA_FIT_STAGING_SPLIT, see sched_reserve): with its experts on the host (--spec-draft-cpu-moe) the arena does not fit beside a
+// full MoE cache, the copies then land in its graph allocation (Qwen3.8-Flash-Next MTP Q8_0 at 32 GB: measured 199 MiB of compute,
+// 982 MiB once loaded, out of memory at the first draft). LLAMA_FIT_STAGING_SPLIT=0: the old measure
+struct common_draft_measure_env {
+    bool set = false;
+    explicit common_draft_measure_env(bool on = true) {
+        if (on && getenv("LLAMA_FIT_STAGING_SPLIT") == nullptr) {
+            common_set_env("LLAMA_FIT_STAGING_SPLIT", "1");
+            set = true;
+        }
+    }
+    ~common_draft_measure_env() {
+        if (set) {
+            common_set_env("LLAMA_FIT_STAGING_SPLIT", "");
+        }
+    }
+};
+
+
 std::filesystem::path common_get_path_from_env(const std::string & name) {
 #if defined(_WIN32)
     const std::wstring wname = utf8_to_wstring(name);
@@ -1640,6 +1660,7 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
         std::vector<ggml_backend_dev_t> devs;
         uint32_t hp_ngl = 0, hp_nct = 0, hp_nex = 0;
         try {
+            common_draft_measure_env split_env(has_draft); // an MTP context on the main model's weights: unchanged
             const common_device_memory_data_vec dmd = common_get_device_memory_data(has_draft ? params_dft.model.path.c_str() : params.model.path.c_str(),
                 &mparams_dft, &cp, devs, hp_ngl, hp_nct, hp_nex, params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
             for (size_t i = 0; i + 1 < dmd.size(); ++i) {
@@ -2132,6 +2153,7 @@ static bool common_fit_draft_on_cpu(
     uint32_t ngl = 0, nct = 0, nex = 0;
     size_t dft = 0;
     try {
+        common_draft_measure_env split_env;
         const auto dmds = common_get_device_memory_data(path_dft.c_str(), &mparams_dft, &cparams_dft, devs, ngl, nct, nex, log_level);
         for (size_t i = 0; i < devs.size() && i < dmds.size(); i++) {
             dft += dmds[i].model + dmds[i].context + dmds[i].compute;
@@ -2211,6 +2233,7 @@ static void common_draft_mem_reserve(const common_params & params, const llama_m
     cparams_dft.n_ctx    = cparams.n_ctx;
     uint32_t hp_ngl = 0, hp_nct = 0, hp_nex = 0;
     try {
+        common_draft_measure_env split_env(has_draft);
         const common_device_memory_data_vec dmd = common_get_device_memory_data(has_draft ? params_dft.model.path.c_str() : params.model.path.c_str(),
             &mparams_dft, &cparams_dft, devs, hp_ngl, hp_nct, hp_nex, params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
         // the weights of a draft model are loaded after the main context too, an MTP context runs on the weights of the main model

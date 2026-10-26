@@ -1036,6 +1036,9 @@ struct ggml_backend_sched_prefetch {
     size_t lent_prev; // logged value
     size_t ext_prev;  // logged size of the graph allocator in lent memory
     ggml_backend_buffer_t ext_buf; // lent memory of the graph allocator, its tensors are not prefetched copies
+    ggml_backend_buffer_t own_buf; // k15-fn: the graph allocator's own buffer as the first region of a lent graph allocation (see prefetch_bind)
+    size_t own_size;
+    size_t own_rest;               // the lent part it needs after the own buffer
     size_t ext_offset;
     size_t ext_size;
     bool   lending;   // the user lent memory for the last graph, it is told when the memory is no longer used
@@ -3367,6 +3370,11 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
     // memory lent by the user (e.g. free slots of a cache): the copies it places do not use the arena
     // and a graph that does not fit in the buffer of the graph allocator (e.g. the activations of a large batch) may be allocated there
     size_t gsize[GGML_SCHED_MAX_BACKENDS] = { 0 };
+    for (int b = 0; b < sched->n_backends; b++) {
+        sched->pf[b].own_buf  = NULL;
+        sched->pf[b].own_size = 0;
+        sched->pf[b].own_rest = 0;
+    }
     if (sched->callback_lend != NULL && !dry) {
         // the prefetched copies are not allocated by the graph allocator
         static char measure_placeholder;
@@ -3393,6 +3401,36 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
             if (ggml_backend_sched_prefetch_backend_ok(sched, b) && sizes[b] > ggml_gallocr_get_buffer_size(sched->galloc, b)) {
                 gsize[b] = GGML_PAD(sizes[b], ggml_backend_buft_get_alignment(sched->bufts[b]));
             }
+        }
+        // k15-fn (GGML_SCHED_LEND_OWN=0 off): the own buffer as the first region of a lent graph allocation, the user lends the rest; the
+        // rest is measured with the plan the allocator then makes (the own buffer limits the first chunk, the lent region is not a limit)
+        static const bool lend_own_env = getenv("GGML_SCHED_LEND_OWN") == nullptr || atoi(getenv("GGML_SCHED_LEND_OWN")) != 0;
+        for (int b = 0; b < sched->n_backends && lend_own_env; b++) {
+            struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+            pf->own_buf  = NULL;
+            pf->own_size = 0;
+            pf->own_rest = 0;
+            ggml_backend_buffer_t ob = NULL;
+            size_t os = 0;
+            const size_t align = ggml_backend_buft_get_alignment(sched->bufts[b]);
+            if (gsize[b] == 0 || !ggml_gallocr_get_own_region(sched->galloc, b, &ob, &os) || os < align || ggml_backend_buffer_get_type(ob) != sched->bufts[b]) {
+                continue;
+            }
+            size_t s0 = 0;
+            size_t rest = 0;
+            for (ggml_tensor * t : bound) {
+                t->data = &measure_placeholder;
+            }
+            ggml_gallocr_measure_limited(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, b, os, &s0, &rest);
+            for (ggml_tensor * t : bound) {
+                t->data = NULL;
+            }
+            if (rest == SIZE_MAX || rest == 0 || s0 > os || GGML_PAD(rest, align) >= gsize[b]) {
+                continue;
+            }
+            pf->own_buf  = ob;
+            pf->own_size = os;
+            pf->own_rest = GGML_PAD(rest, align);
         }
     }
 
@@ -3422,9 +3460,18 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         // the graph allocator: live during the whole graph, as GGML_SCHED_MAX_GRAPH_PARTS entries first with src = NULL, ordinal -1 and
         // size = the bytes of the whole allocation; the user may place it in several parts, at most one per entry, and sets size to the
         // size of the part (the graph allocator plans the parts in order, a tensor never spans two parts), unused entries keep buffer NULL
-        const int n_graph = gsize[b] > 0 ? GGML_SCHED_MAX_GRAPH_PARTS : 0;
+        // k15-fn: with the own buffer as the first region (measured above) the user lends one part of the rest; if it cannot, the whole
+        // allocation as before (lend_full). G4 Qwen3.8-Flash-Next IQ1_S 16 GB + device MTP drafter, 16k prompt: a 3316 MiB graph needed 2227
+        // slots, over the cache's cap (2003), so the group ran as two graphs streaming the experts twice; its own buffer held 2244 MiB
+        bool lend_full = pf->own_buf == NULL || dry;
+        lend_again:
+        ggml_backend_buffer_t own_buf  = lend_full ? NULL : pf->own_buf;
+        const size_t          own_size = lend_full ? 0 : pf->own_size;
+        const size_t          gask     = lend_full ? gsize[b] : pf->own_rest;
+        const int             n_graph  = gsize[b] > 0 ? (lend_full ? GGML_SCHED_MAX_GRAPH_PARTS : 1) : 0;
+        n_copies = 0;
         for (int k = 0; k < n_graph; k++) {
-            push({ NULL, gsize[b], -1, NULL, 0 });
+            push({ NULL, gask, -1, NULL, 0 });
         }
         for (int k = 0; k < pf->n_bound; k++) {
             const int i = pf->split_ids[k];
@@ -3441,6 +3488,11 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         // for every split) the copies of different splits may share bytes, depth 1 for the lender
         const int lend_depth = sync_lend[b] ? 1 : pf->depth;
         sched->callback_lend(sched->backends[b], pf->lend_copies, n_copies, lend_depth, dry, sched->callback_lend_user_data);
+        if (!lend_full && n_graph > 0 && (pf->lend_copies[0].buffer == NULL || pf->lend_copies[0].size < gask)) {
+            // the user could not lend the rest in one part: the whole allocation, as without the own region
+            lend_full = true;
+            goto lend_again;
+        }
 
         // a dry run only measures, the user may not have allocated its memory (e.g. no_alloc)
         auto valid = [&](const struct ggml_backend_sched_lend_copy & lc) {
@@ -3462,11 +3514,19 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         bool any = false;
         if (n_graph > 0) {
             ggml_backend_buffer_t gbuf = NULL;
-            size_t offs [GGML_SCHED_MAX_GRAPH_PARTS];
-            size_t sizes[GGML_SCHED_MAX_GRAPH_PARTS];
+            size_t offs [GGML_SCHED_MAX_GRAPH_PARTS + 1];
+            size_t sizes[GGML_SCHED_MAX_GRAPH_PARTS + 1];
+            ggml_backend_buffer_t gbufs[GGML_SCHED_MAX_GRAPH_PARTS + 1];
             int n_parts = 0;
             size_t total = 0;
             bool ok = true;
+            if (own_buf != NULL) {
+                gbufs[0] = own_buf;
+                offs [0] = 0;
+                sizes[0] = own_size;
+                n_parts  = 1;
+            }
+            const int part0 = n_parts;
             for (int k = 0; k < n_graph; k++) {
                 const struct ggml_backend_sched_lend_copy & lc = pf->lend_copies[c++];
                 if (lc.buffer == NULL || lc.size == 0) {
@@ -3477,24 +3537,26 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
                     continue;
                 }
                 gbuf = lc.buffer;
+                gbufs[n_parts] = lc.buffer;
                 offs [n_parts] = lc.offset;
                 sizes[n_parts] = lc.size;
                 total += lc.size;
                 n_parts++;
             }
-            if (!dry && ok && n_parts > 0) {
-                ggml_gallocr_set_external_n(sched->galloc, b, gbuf, offs, sizes, n_parts);
-                // the first part (with more parts the list of the prefetched copies tells them apart, see ggml_backend_sched_prefetch_is_bound)
+            if (!dry && ok && n_parts > part0) {
+                ggml_gallocr_set_external_bufs(sched->galloc, b, gbufs, offs, sizes, n_parts);
+                ggml_gallocr_set_external_last_free(sched->galloc, b, part0 > 0);
+                // the first lent part (with more parts the list of the prefetched copies tells them apart, see ggml_backend_sched_prefetch_is_bound)
                 pf->ext_buf    = gbuf;
-                pf->ext_offset = offs[0];
-                pf->ext_size   = sizes[0];
+                pf->ext_offset = offs[part0];
+                pf->ext_size   = sizes[part0];
                 pf->lent_all   = true;
                 ext[b] = true;
                 any    = true;
                 if (total != pf->ext_prev) {
-                    GGML_LOG_INFO("%s: %s: graph allocation of %.2f MiB in lent memory, %d part%s of %.2f MiB (own compute buffer %.2f MiB)\n", __func__,
-                        ggml_backend_name(sched->backends[b]), gsize[b] / 1024.0 / 1024.0, n_parts, n_parts > 1 ? "s" : "", total / 1024.0 / 1024.0,
-                        ggml_gallocr_get_buffer_size(sched->galloc, b) / 1024.0 / 1024.0);
+                    GGML_LOG_INFO("%s: %s: graph allocation of %.2f MiB in lent memory, %d part%s of %.2f MiB (own compute buffer %.2f MiB%s)\n", __func__,
+                        ggml_backend_name(sched->backends[b]), gsize[b] / 1024.0 / 1024.0, n_parts - part0, n_parts - part0 > 1 ? "s" : "",
+                        total / 1024.0 / 1024.0, ggml_gallocr_get_buffer_size(sched->galloc, b) / 1024.0 / 1024.0, part0 > 0 ? ", the first region" : "");
                     pf->ext_prev = total;
                 }
             }
@@ -5427,6 +5489,15 @@ size_t ggml_backend_sched_get_staging_size(ggml_backend_sched_t sched, ggml_back
 
     const struct ggml_backend_sched_prefetch * pf = &sched->pf[backend_index];
     return pf->n_bound > 0 ? pf->staging : 0;
+}
+
+size_t ggml_backend_sched_get_staging_split(ggml_backend_sched_t sched, ggml_backend_t backend) {
+    GGML_ASSERT(sched);
+    int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+
+    const struct ggml_backend_sched_prefetch * pf = &sched->pf[backend_index];
+    return pf->n_bound > 0 ? std::min(pf->need, pf->staging) : 0;
 }
 
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
