@@ -7211,6 +7211,96 @@ static void ggml_cuda_side_mv_plan(ggml_backend_cuda_context * cuda_ctx, ggml_cg
     }
 }
 
+// k16-race: see ggml_backend_cuda_graph_optimize. Returns the last node the fused kernel writes (nullptr: no match) and the inputs it reads
+static const ggml_tensor * ggml_cuda_fused_match(const ggml_cgraph * cgraph, int i, std::vector<ggml_tensor *> & inputs) {
+    static const bool all_alias = ggml_cuda_env_flag("GGML_CUDA_FUSED_ALIAS");
+    if (all_alias) {
+        return nullptr;
+    }
+    ggml_tensor * n0 = cgraph->nodes[i];
+    inputs.clear();
+
+    // residual add + RMS norm + mul (+ q8_1), ggml_cuda_try_fuse_add_rms_norm (rms_norm_mul_q8_1_f32 with ra / rb): both add inputs.
+    // Qwen3.6-35B-A3B MTP spilled (B200): the norm output landed on the previous layer's l_out, the text was not repeatable.
+    // GGML_CUDA_ADD_RMS_ALIAS=1
+    static const bool add_rms_alias = ggml_cuda_env_flag("GGML_CUDA_ADD_RMS_ALIAS");
+    if (!add_rms_alias && n0->op == GGML_OP_ADD && n0->type == GGML_TYPE_F32 && i + 2 < cgraph->n_nodes) {
+        ggml_tensor * rms = cgraph->nodes[i + 1];
+        ggml_tensor * mul = cgraph->nodes[i + 2];
+        if (rms->op == GGML_OP_RMS_NORM && rms->src[0] == n0 && mul->op == GGML_OP_MUL && (mul->src[0] == rms || mul->src[1] == rms) &&
+                mul->type == GGML_TYPE_F32) {
+            for (int k = 0; k < 2; ++k) {
+                if (n0->src[k] != nullptr) {
+                    inputs.push_back(n0->src[k]);
+                }
+            }
+            return mul;
+        }
+    }
+
+    // DSV4_HC_POST computed inside the grouped norm that reads it (+ mul, q8_1), ggml_cuda_try_fuse_hc_post_norm: block output, residual
+    // and the post weights (the input of the SCALE / SIGMOID chain the kernel applies). Flash-Next f0: not repeatable.
+    // GGML_CUDA_HC_POST_NORM_ALIAS=1
+    static const bool hc_alias = ggml_cuda_env_flag("GGML_CUDA_HC_POST_NORM_ALIAS");
+    if (!hc_alias && n0->op == GGML_OP_DSV4_HC_POST && n0->src[3] == nullptr) {
+        int irn = i + 1;
+        while (irn < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[irn])) {
+            irn++;
+        }
+        if (irn + 1 < cgraph->n_nodes) {
+            ggml_tensor * rn  = cgraph->nodes[irn];
+            ggml_tensor * mul = cgraph->nodes[irn + 1];
+            if (rn->op == GGML_OP_RMS_NORM && rn->src[0] == n0 && mul->op == GGML_OP_MUL && (mul->src[0] == rn || mul->src[1] == rn)) {
+                for (int k = 0; k < 2; ++k) {
+                    if (n0->src[k] != nullptr) {
+                        inputs.push_back(n0->src[k]);
+                    }
+                }
+                ggml_tensor * w = n0->src[2];
+                for (int k = 0; w != nullptr && k <= GGML_CUDA_HC_POST_NORM_MAX_OPS; ++k) {
+                    inputs.push_back(w);
+                    const bool chain = w->op == GGML_OP_SCALE || (w->op == GGML_OP_UNARY && ggml_get_unary_op(w) == GGML_UNARY_OP_SIGMOID);
+                    w = chain ? w->src[0] : nullptr;
+                }
+                return mul;
+            }
+        }
+    }
+
+    // QSA dead-slot index map CPY(i32 -> f32) -> SUB -> MUL -> ADD -> CPY(f32 -> i32) in one kernel (ggml_cuda_try_fuse_qsa_idx, k15-fn):
+    // the index input, dump and live. G4 fn4 32 GB: the map's output landed in memory freed inside the chain at an offset, the 8k md5
+    // varied (k15-fn stages the overlapping case in one block; with the inputs kept alive it does not occur). GGML_CUDA_QSA_IDX_ALIAS=1
+    static const bool qsa_alias = ggml_cuda_env_flag("GGML_CUDA_QSA_IDX_ALIAS");
+    if (!qsa_alias && n0->op == GGML_OP_CPY && n0->type == GGML_TYPE_F32 && n0->src[0] != nullptr && n0->src[0]->type == GGML_TYPE_I32 &&
+            i + 4 < cgraph->n_nodes) {
+        ggml_tensor * sub = cgraph->nodes[i + 1];
+        ggml_tensor * mul = cgraph->nodes[i + 2];
+        ggml_tensor * add = cgraph->nodes[i + 3];
+        ggml_tensor * c2  = cgraph->nodes[i + 4];
+        if (sub->op == GGML_OP_SUB && sub->src[0] == n0 && mul->op == GGML_OP_MUL && mul->src[0] == sub && add->op == GGML_OP_ADD &&
+                add->src[0] == mul && add->src[1] == sub->src[1] && c2->op == GGML_OP_CPY && c2->src[0] == add && c2->type == GGML_TYPE_I32) {
+            inputs = { n0->src[0], sub->src[1], mul->src[1] };
+            return c2;
+        }
+    }
+    return nullptr;
+}
+
+static void ggml_cuda_fused_keep_inputs(ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+    std::vector<ggml_tensor *> inputs;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * last = ggml_cuda_fused_match(cgraph, i, inputs);
+        if (last == nullptr) {
+            continue;
+        }
+        for (ggml_tensor * in : inputs) {
+            if (in != nullptr) {
+                params->add_alloc_dep(params->user_data, in, const_cast<ggml_tensor *>(last));
+            }
+        }
+    }
+}
+
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -7330,68 +7420,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         }
     }
 
-    // The outputs of a residual add + RMS norm + mul that ggml_cuda_try_fuse_add_rms_norm may fuse are kept off the two add inputs.
-    // Both inputs are dead after the add, so the allocator placed the add output (in place) and the norm output over them, and the
-    // fused kernel (rms_norm_mul_q8_1_f32 with ra / rb) overwrote both of its inputs. With PDL that was not repeatable: Qwen3.6-35B-A3B
-    // MTP at a spilled MoE tier (B200, -ot exps=CPU --moe-cache-mib 7480), in the 3- and 4-token graphs of the full-attention layers the
-    // norm output (attn_post_norm, placed over the previous layer's l_out) came out wrong in some launches, and with it the router
-    // and the shared expert, so the greedy text of a request differed. PDL off, the fusion off, or this placement each made every
-    // launch repeat. Costs only the memory of the two inputs until the norm is computed (no extra kernel); the fusion still runs.
-    // GGML_CUDA_ADD_RMS_ALIAS=1: let the allocator place the outputs over the inputs, as before
+    // k16-race: fused kernels whose outputs must not land on the inputs they read. Each matcher below follows the op pattern its
+    // fusion takes (ggml_cuda_try_fuse_*) and names the tensors the fused kernel reads and the last node it writes; graph_optimize keeps
+    // those inputs alive until that node is allocated, so the allocator places no output (also none in place) over them. The separate
+    // kernels each finish reading before the next writes; a fused kernel writes while it (or the kernels around it, with PDL) still
+    // reads. Same kernels and values, only the compute buffer holds the inputs a few nodes longer.
+    // Kill switches: GGML_CUDA_FUSED_ALIAS=1 (all), or per fusion as listed with each matcher
     if (!disable_fusion) {
-        static const bool alias_ok = ggml_cuda_env_flag("GGML_CUDA_ADD_RMS_ALIAS");
-        static const bool fuse_on  = [] {
-            const char * e = getenv("GGML_CUDA_ADD_RMS_FUSE");
-            return e == nullptr || atoi(e) != 0;
-        }();
-        for (int i = 0; !alias_ok && fuse_on && i + 2 < cgraph->n_nodes; ++i) {
-            ggml_tensor * add = cgraph->nodes[i];
-            ggml_tensor * rms = cgraph->nodes[i + 1];
-            ggml_tensor * mul = cgraph->nodes[i + 2];
-            if (add->op != GGML_OP_ADD || rms->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || rms->src[0] != add ||
-                    (mul->src[0] != rms && mul->src[1] != rms) || add->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
-                continue;
-            }
-            for (int k = 0; k < 2; ++k) {
-                if (add->src[k] != nullptr) {
-                    params->add_alloc_dep(params->user_data, add->src[k], mul);
-                }
-            }
-        }
-        // the same for a DSV4_HC_POST computed inside the grouped norm that reads it (ggml_cuda_try_fuse_hc_post_norm): its block
-        // output, residual and post weights (the input of the SCALE / SIGMOID chain the kernel applies) stay alive until the norm
-        // output is allocated, so neither the post output (in place) nor the norm output lands on them. Flash-Next f0 (B200, MTP,
-        // pinned): with the fusion on, the text was not repeatable. GGML_CUDA_HC_POST_NORM_ALIAS=1: as before
-        static const bool hc_alias_ok = ggml_cuda_env_flag("GGML_CUDA_HC_POST_NORM_ALIAS");
-        for (int i = 0; !hc_alias_ok && i + 2 < cgraph->n_nodes; ++i) {
-            ggml_tensor * hc_post = cgraph->nodes[i];
-            if (hc_post->op != GGML_OP_DSV4_HC_POST || hc_post->src[3] != nullptr) {
-                continue;
-            }
-            int irn = i + 1;
-            while (irn < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[irn])) {
-                irn++;
-            }
-            if (irn + 1 >= cgraph->n_nodes) {
-                continue;
-            }
-            ggml_tensor * rn  = cgraph->nodes[irn];
-            ggml_tensor * mul = cgraph->nodes[irn + 1];
-            if (rn->op != GGML_OP_RMS_NORM || rn->src[0] != hc_post || mul->op != GGML_OP_MUL || (mul->src[0] != rn && mul->src[1] != rn)) {
-                continue;
-            }
-            for (int k = 0; k < 2; ++k) {
-                if (hc_post->src[k] != nullptr) {
-                    params->add_alloc_dep(params->user_data, hc_post->src[k], mul);
-                }
-            }
-            ggml_tensor * w = hc_post->src[2];
-            for (int k = 0; w != nullptr && k <= GGML_CUDA_HC_POST_NORM_MAX_OPS; ++k) {
-                params->add_alloc_dep(params->user_data, w, mul);
-                const bool chain = w->op == GGML_OP_SCALE || (w->op == GGML_OP_UNARY && ggml_get_unary_op(w) == GGML_UNARY_OP_SIGMOID);
-                w = chain ? w->src[0] : nullptr;
-            }
-        }
+        ggml_cuda_fused_keep_inputs(cgraph, params);
     }
 
     {
