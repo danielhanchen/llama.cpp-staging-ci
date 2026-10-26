@@ -238,10 +238,6 @@ struct common_speculative_impl {
     // the caller waited for them (llama_nextn_rows_wait); only impls that read nothing else of the target say yes
     bool rows_early = false;
     virtual bool rows_early_ok() const { return false; }
-    // k15-pp6 (LLAMA_MTP_PROMPT_DEFER): process() reads the target's rows from this copy (row i at i*rows_n_embd()) instead of the
-    // target's buffer; set by the caller around process(), only for impls with rows_early_ok()
-    const float * rows_ext = nullptr;
-    virtual int32_t rows_n_embd() const { return 0; }
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
@@ -1520,7 +1516,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // k11: segments of a merged prompt batch (LLAMA_LM_CKPT_MERGE) read host rows at an offset, the device sink holds whole batches
     bool row_offset_ok() const override { return !dev_h; }
     bool rows_early_ok() const override { return !dev_h && !is_mem_shared; }
-    int32_t rows_n_embd() const override { return n_embd; }
     llama_seq_id dev_seq = -1;            // the sequence whose pending row is in sink row 0
     std::vector<uint8_t> pending_dev;     // per seq: its pending row is sink row 0 (pending_h is stale)
     std::vector<uint8_t> verify_dev;      // per seq: the verify rows are sink rows 1 .. verify_h_rows (verify_h is unused)
@@ -1717,7 +1712,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         // k15-pp3: rows the caller already waited for (unmasked: row i at i*n_embd), else the synchronizing lookups
-        const float * h_early = rows_ext ? rows_ext : rows_early ? llama_get_embeddings_nextn_early(ctx_tgt) : nullptr;
+        const float * h_early = rows_early ? llama_get_embeddings_nextn_early(ctx_tgt) : nullptr;
         GGML_ASSERT(!rows_early || h_early);
         auto tgt_row = [&](int32_t i) -> const float * {
             return h_early ? h_early + (size_t) i * n_embd : llama_get_embeddings_nextn_ith(ctx_tgt, i);
@@ -3643,30 +3638,6 @@ bool common_speculative_process_rows_early(common_speculative * spec, const comm
         impl->rows_early       = true;
         result = result && impl->process(batch);
         impl->rows_early       = false;
-        impl->nextn_row_offset = 0;
-    }
-    return result;
-}
-
-int32_t common_speculative_rows_n_embd(const common_speculative * spec) {
-    if (!common_speculative_rows_early_ok(spec)) {
-        return 0;
-    }
-    int32_t n = 0;
-    for (const auto & impl : spec->impls) {
-        n = std::max(n, impl->rows_n_embd());
-    }
-    return n;
-}
-
-bool common_speculative_process_rows_ext(common_speculative * spec, const common_batch & batch, int32_t row_offset, const float * rows) {
-    GGML_ASSERT(common_speculative_rows_early_ok(spec) && rows != nullptr);
-    bool result = true;
-    for (auto & impl : spec->impls) {
-        impl->nextn_row_offset = row_offset;
-        impl->rows_ext         = rows;
-        result = result && impl->process(batch);
-        impl->rows_ext         = nullptr;
         impl->nextn_row_offset = 0;
     }
     return result;
