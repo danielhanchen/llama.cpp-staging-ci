@@ -1047,6 +1047,7 @@ public:
         const int64_t t0 = ggml_time_us();
         for (auto & slot : slots) {
             if (slot.prompt.tokens.size() > 0) {
+                spec_defer_drain(-1); // k15-pp6: the drafter state is saved with the prompt
                 slot.prompt_save(*prompt_cache);
             }
         }
@@ -1088,6 +1089,21 @@ private:
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
+
+    // k15-pp6 (LLAMA_MTP_PROMPT_DEFER=0 off): the drafter's pass over a prompt runs after the prompt's first token is sent, before the
+    // first draft, instead of after each prompt batch of the target. The jobs keep a copy of the target's rows of their batch and run in
+    // order (later decodes of the same sequence queue behind them); the drafter sees the same rows in the same segments, only later
+    struct spec_defer_job {
+        common_batch         seg;      // the batch's tokens
+        std::vector<int32_t> breaks;   // segment breaks inside it (LLAMA_LM_CKPT_MERGE), the drafter's batches end there
+        std::vector<float>   rows;     // the target's nextn rows of the batch, row i at i*n_embd
+        int32_t              done = 0; // tokens processed
+    };
+    std::deque<spec_defer_job> spec_defer;
+    llama_seq_id               spec_defer_seq   = -1;
+    bool                       spec_defer_rows  = false; // the last job waits for its rows (copied after post_decode)
+    int                        spec_defer_begin = -1;    // slot whose common_speculative_begin waits for the drain
+    llama_tokens               spec_defer_begin_prompt;
 
     bool add_bos_token = true;
 
@@ -2018,6 +2034,7 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
+                spec_defer_drain(-1); // k15-pp6: the drafter state is saved with the prompt
                 ret->prompt_save(*prompt_cache);
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
@@ -2748,6 +2765,7 @@ private:
         GGML_ASSERT(child_slots.size() == parent_task.child_tasks.size());
         for (auto * slot : child_slots) {
             // keep the state that the child task is about to overwrite
+            spec_defer_drain(-1); // k15-pp6: the drafter state is saved with the prompt
             if (prompt_cache && slot->prompt_save(*prompt_cache)) {
                 prompt_cache->update();
             }
@@ -3187,6 +3205,7 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
+                                spec_defer_drain(-1); // k15-pp6: the drafter state is saved with the prompt
                                 if (slot.prompt_save(*prompt_cache)) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
@@ -3709,6 +3728,7 @@ private:
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
                 post_decode(n_tokens, off);
+                spec_defer_take_rows(); // before the next decode of the target overwrites them
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
@@ -3796,6 +3816,13 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // k15-pp6: the drafter's deferred passes run before it drafts (LLAMA_MTP_PROMPT_DEFER_TOKENS=N: at most N tokens of them per
+        // step, the steps draft nothing until they are done; default all at once, before the second token)
+        if (!spec_defer.empty()) {
+            static const int64_t defer_tokens = getenv("LLAMA_MTP_PROMPT_DEFER_TOKENS") ? atoll(getenv("LLAMA_MTP_PROMPT_DEFER_TOKENS")) : -1;
+            spec_defer_drain(defer_tokens > 0 ? defer_tokens : -1);
+        }
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -3820,6 +3847,9 @@ private:
                 int n_draft_max = slot.get_n_draft_max();
 
                 slot.gov_step = 0;
+                if (n_draft_max > 0 && slot.spec_draft.empty() && !spec_defer.empty() && spec_defer_seq == slot.id) {
+                    n_draft_max = 0; // k15-pp6: the drafter has not caught up with the prompt yet
+                }
                 // a partial draft to replay is verified whatever the governor says (it restores a state)
                 if (n_draft_max > 0 && slot.spec_draft.empty() && !slot.gov.allows()) {
                     n_draft_max   = 0;
@@ -4675,6 +4705,78 @@ private:
 
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
+    // copy the target's rows of the batch the last job holds (after post_decode: no target decode since)
+    void spec_defer_take_rows() {
+        if (!spec_defer_rows || spec_defer.empty()) {
+            spec_defer_rows = false;
+            return;
+        }
+        auto & job = spec_defer.back();
+        const int32_t n_embd = common_speculative_rows_n_embd(spec.get());
+        const float * h = llama_get_embeddings_nextn(ctx_tgt);
+        GGML_ASSERT(h != nullptr && n_embd > 0);
+        job.rows.assign(h, h + (size_t) job.seg.tokens.size()*n_embd);
+        spec_defer_rows = false;
+    }
+
+    // run the queued drafter passes, at most n_max tokens of them (< 0: all); the segments end at their breaks and the drafter's own
+    // ubatches start at each segment's start, as in the pass right after the target's batch
+    void spec_defer_drain(int64_t n_max) {
+        if (spec_defer.empty()) {
+            return;
+        }
+        spec_defer_take_rows();
+        const int32_t nu = (int32_t) llama_n_ubatch(ctx_dft);
+        int64_t left = n_max < 0 ? INT64_MAX : n_max;
+        while (!spec_defer.empty() && left > 0) {
+            auto & job = spec_defer.front();
+            const int32_t n = (int32_t) job.seg.tokens.size();
+            while (job.done < n && left > 0) {
+                int32_t b = n;
+                for (const int32_t br : job.breaks) {
+                    if (br > job.done) {
+                        b = std::min(b, br);
+                        break;
+                    }
+                }
+                // the segment's start: the last break at or before done
+                int32_t sa = 0;
+                for (const int32_t br : job.breaks) {
+                    if (br <= job.done) {
+                        sa = br;
+                    }
+                }
+                if (n_max >= 0) {
+                    const int64_t k = std::max<int64_t>(1, std::min<int64_t>(left, b - job.done) / nu);
+                    b = (int32_t) std::min<int64_t>(b, sa + ((job.done - sa) / nu + k)*(int64_t) nu);
+                }
+                common_batch seg;
+                seg.n_pos = job.seg.n_pos;
+                seg.tokens.assign(job.seg.tokens.begin() + job.done, job.seg.tokens.begin() + b);
+                bool ok = true;
+                queue_tasks.yield_to_queue([&]() {
+                    ok = common_speculative_process_rows_ext(spec.get(), seg, job.done, job.rows.data());
+                });
+                if (!ok) {
+                    throw std::runtime_error("failed to process the deferred speculative batch");
+                }
+                left    -= b - job.done;
+                job.done = b;
+            }
+            if (job.done >= n) {
+                spec_defer.pop_front();
+            }
+        }
+        if (spec_defer.empty()) {
+            spec_defer_seq = -1;
+            if (spec_defer_begin >= 0) {
+                common_speculative_begin(spec.get(), spec_defer_begin, spec_defer_begin_prompt);
+                spec_defer_begin = -1;
+                spec_defer_begin_prompt.clear();
+            }
+        }
+    }
+
     bool decode(int32_t & n_batch, int32_t off) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
@@ -4706,6 +4808,23 @@ private:
         for (int i = off; i < off + batch.view.size(); ++i) {
             has_output |= batch.tokens[i].output;
             has_prompt |= batch.tokens[i].is_prompt;
+        }
+
+        // k15-pp6: the drafter's pass over this batch waits until the prompt's first token is sent (spec_defer): a prompt batch of one
+        // sequence without draft rows, or any batch of that sequence while its earlier passes are queued
+        static const bool defer_env = getenv("LLAMA_MTP_PROMPT_DEFER") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_DEFER")) != 0;
+        bool defer_now = false;
+        if (spec && defer_env && !batch.has_draft && !batch.view.has_embd() && batch.view.size() > 0 &&
+                common_speculative_rows_n_embd(spec.get()) > 0) {
+            const llama_seq_id s0 = batch.tokens[off].id_slot;
+            bool one_seq = true;
+            for (int i = off; i < off + batch.view.size() && one_seq; ++i) {
+                one_seq = batch.tokens[i].id_slot == s0;
+            }
+            defer_now = one_seq && (spec_defer.empty() ? has_prompt && batch.view.size() > 1 : spec_defer_seq == s0);
+        }
+        if (!defer_now && !spec_defer.empty()) {
+            spec_defer_drain(-1); // in order: the queued passes before this batch's
         }
 
         // a batch of sampled and draft tokens only is a speculative verify batch: with LLAMA_MTP_EXACT=1 its rows are
@@ -4765,7 +4884,7 @@ private:
         static const bool overlap_env = getenv("LLAMA_MTP_PROMPT_OVERLAP") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_OVERLAP")) != 0;
         const bool caps_sorted  = std::is_sorted(caps_req.begin(), caps_req.end(), [](const lm_cap_req_t & a, const lm_cap_req_t & b) {
             return a.batch < b.batch; });
-        const bool spec_overlap = overlap_env && spec && has_output && !seg_breaks.empty() && common_speculative_rows_early_ok(spec.get()) &&
+        const bool spec_overlap = overlap_env && !defer_now && spec && has_output && !seg_breaks.empty() && common_speculative_rows_early_ok(spec.get()) &&
             (!lm_cap_req || (cap_early && caps_sorted));
         // the checkpoint (slot state) is made on this thread, outside the yield; with the overlap, the drafter's early segments too
         const bool sync_after = (lm_cap_req && cap_early) || spec_overlap;
@@ -4878,7 +4997,15 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (spec) {
+        if (spec && defer_now) {
+            spec_defer_job job;
+            job.seg.n_pos = batch.view.n_pos;
+            job.seg.tokens.assign(batch.view.tokens.begin(), batch.view.tokens.end());
+            job.breaks = seg_breaks;
+            spec_defer.push_back(std::move(job));
+            spec_defer_seq  = batch.tokens[off].id_slot;
+            spec_defer_rows = true;
+        } else if (spec) {
             bool ok = spec_early_ok;
             queue_tasks.yield_to_queue([&]() {
                 if (!ok) {
@@ -4999,7 +5126,13 @@ private:
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
 
-                if (slot.can_speculate()) {
+                if (slot.can_speculate() && !spec_defer.empty() && spec_defer_seq == slot.id) {
+                    // k15-pp6: after the drafter's deferred pass over the prompt (spec_defer_drain)
+                    spec_defer_begin        = slot.id;
+                    spec_defer_begin_prompt = slot.prompt.tokens.get_text_tokens();
+                    slot.gov.new_sequence();
+                    slot.gov_t_last = 0;
+                } else if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                     slot.gov.new_sequence();
                     slot.gov_t_last = 0;

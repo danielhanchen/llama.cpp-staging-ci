@@ -110,6 +110,11 @@ bool common_speculative_rows_ok(const common_speculative * spec);
 bool common_speculative_rows_early_ok(const common_speculative * spec);
 bool common_speculative_process_rows_early(common_speculative * spec, const common_batch & batch, int32_t row_offset);
 
+// k15-pp6 (LLAMA_MTP_PROMPT_DEFER): process_rows on a copy of the target's rows (row i at i*rows_n_embd), for a drafter pass that runs
+// after the target's later decodes; rows_n_embd is 0 when an impl reads more of the target than its rows (no deferral then)
+int32_t common_speculative_rows_n_embd(const common_speculative * spec);
+bool common_speculative_process_rows_ext(common_speculative * spec, const common_batch & batch, int32_t row_offset, const float * rows);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
