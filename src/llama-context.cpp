@@ -1180,16 +1180,29 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
             const double tokens = n_used > 0 ? moe_cache->cached_frac()*(double) model.hparams.n_expert/(double) n_used : 0.0;
             const uint64_t ram_total = llama_sysmem::total();
             const bool ram_ok = ram_total == 0 || moe_cache->host_uncached_bytes() <= ram_frac*(double) ram_total;
-            const char * why = cparams.spec_draft ? "speculative decoding with a draft model or MTP heads" :
+            // k15-ov: a draft model that --fit dropped (common sets LLAMA_FIT_DRAFT_DROPPED=1: it does not fit beside the cache, so
+            // speculative decoding is off) leaves no draft to compete with a deeper staging: depth LLAMA_MOE_PREFETCH_DEPTH_DROPPED (4;
+            // 0 = as before) where the cache holds the experts of at least LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS (10) tokens.
+            // G4 Flash-Next UD-IQ4_XS Studio argv (Q8_0 drafter dropped), 3 launches, A/A 0.4%, k15g4v1: 24 GB (14.6 tokens) depth 3 /
+            // 4: 8k 1.831 -> 1.780 / 1.716 s, 16k 3.562 -> 3.468 / 3.344 s, decode and pinned md5 unchanged; 16 GB (6.1 tokens) depth 3
+            // reserved the staging in device memory at fit time, the cache fell under the hybrid gate's 10% (6735 -> 5463 MiB, no
+            // layer-major groups): 8k 1.909 -> 4.200 s, hence the minimum
+            static const int dropped_depth = getenv("LLAMA_MOE_PREFETCH_DEPTH_DROPPED") ? std::max(0, atoi(getenv("LLAMA_MOE_PREFETCH_DEPTH_DROPPED"))) : 4;
+            static const double dropped_min = getenv("LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS") ?
+                std::max(0.0, atof(getenv("LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS"))) : 10.0;
+            const bool draft_dropped = dropped_depth > 0 && cparams.spec_draft && getenv("LLAMA_FIT_DRAFT_DROPPED") != nullptr &&
+                atoi(getenv("LLAMA_FIT_DRAFT_DROPPED")) != 0;
+            const char * why = cparams.spec_draft && !draft_dropped ? "speculative decoding with a draft model or MTP heads" :
+                draft_dropped && tokens < dropped_min ? "a dropped draft model beside a cache of fewer tokens than LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS" :
                 tokens < min_tokens ? "the cache holds the experts of fewer tokens than LLAMA_MOE_PREFETCH_DEPTH_SPILL_MIN_TOKENS" :
                 !ram_ok ? "the uncached host experts are more than LLAMA_MOE_PREFETCH_DEPTH_SPILL_MAX_RAM_FRAC of the RAM" : nullptr;
-            depth_spill = why == nullptr ? 3 : 0;
+            depth_spill = why == nullptr ? (draft_dropped ? dropped_depth : 3) : 0;
             static bool logged = false; // once per process, not for a memory probe (no_alloc), whose log the fit silences
             if (!logged && !model.hparams.no_alloc) {
                 logged = true;
                 LLAMA_LOG_INFO("%s: MoE cache: host weight prefetch of the spilled experts starts at depth %s (cache = the experts of %.1f "
                     "tokens%s%s; LLAMA_MOE_PREFETCH_DEPTH_SPILL=N forces N, LLAMA_MOE_PREFETCH_DEPTH_RULE=0 keeps the default)\n", __func__,
-                    why == nullptr ? "3" : "the default", tokens, why ? ": " : "", why ? why : "");
+                    why == nullptr ? (draft_dropped ? std::to_string(dropped_depth).c_str() : "3") : "the default", tokens, why ? ": " : "", why ? why : "");
             }
         }
         if (depth_spill > 0) {
