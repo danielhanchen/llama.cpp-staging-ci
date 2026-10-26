@@ -353,7 +353,10 @@ struct server_slot {
 
     // ckpt_keep_max >= -1 (k15-ttft): the caller knows the next prompt of this slot drops every checkpoint with pos_max above it, so
     // those are moved into the cache entry instead of copied (LLAMA_PCS_MOVE_CKPT=0: copied as before)
-    bool prompt_save(server_prompt_cache & prompt_cache, llama_pos ckpt_keep_max = -2) {
+    // k15-ttft: the slot's prompt is in the prompt cache already, saved while the server was idle (LLAMA_PCS_IDLE_SAVE)
+    bool prompt_saved_idle = false;
+
+    bool prompt_save(server_prompt_cache & prompt_cache, llama_pos ckpt_keep_max = -2, bool force_async = false) {
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -379,7 +382,7 @@ struct server_slot {
         // the entry (server_prompt_cache::wait_inflight). Larger states than LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB (512) are saved as before.
         static const bool async_on = getenv("LLAMA_PROMPT_SAVE_ASYNC") != nullptr && atoi(getenv("LLAMA_PROMPT_SAVE_ASYNC")) != 0;
         static const size_t async_max = (size_t) (getenv("LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB") ? std::max(0, atoi(getenv("LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB"))) : 512) << 20;
-        const llama_state_seq_flags fl = async_on && cur_size <= async_max ? LLAMA_STATE_SEQ_FLAGS_ASYNC : LLAMA_STATE_SEQ_FLAGS_NONE;
+        const llama_state_seq_flags fl = (async_on || force_async) && cur_size <= async_max ? LLAMA_STATE_SEQ_FLAGS_ASYNC : LLAMA_STATE_SEQ_FLAGS_NONE;
 
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, fl);
         if (ctx_dft) {
@@ -432,6 +435,7 @@ struct server_slot {
     }
 
     void prompt_clear() {
+        prompt_saved_idle = false;
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
@@ -1864,6 +1868,23 @@ private:
             update_slots();
         });
         queue_tasks.on_idle_work([this]() {
+            // k15-ttft: the prompt-cache save that the next request's slot selection makes (get_available_slot: the slot's prompt with its
+            // checkpoints, 65 MiB for a short Qwen3.6 chat, 8-19 ms on a B200 ahead of the prompt) is made here instead, as the slot went
+            // idle: the same entry, saved in the same order before the next request's load. LLAMA_PCS_IDLE_SAVE=0: at the request, as
+            // before; 1: on this thread (a request sent right after the response waits for it); default 2: the host copy on the state
+            // worker (async), so a request arriving meanwhile waits only where it reads the cache. A slot saved here is copied, so the
+            // checkpoint move (LLAMA_PCS_MOVE_CKPT, which needs the next prompt) applies only to saves still made at a request.
+            static const int idle_save = getenv("LLAMA_PCS_IDLE_SAVE") ? atoi(getenv("LLAMA_PCS_IDLE_SAVE")) : 2;
+            if (idle_save > 0 && prompt_cache && !params_base.embedding) {
+                for (auto & slot : slots) {
+                    if (!slot.is_processing() && !slot.prompt_saved_idle && slot.prompt.tokens.size() > 0) {
+                        if (slot.prompt_save(*prompt_cache, -2, idle_save == 2)) {
+                            prompt_cache->update();
+                        }
+                        slot.prompt_saved_idle = true;
+                    }
+                }
+            }
             if (ctx_tgt) {
                 llama_prepare_prompt_plan(ctx_tgt);
             }
@@ -2104,7 +2125,9 @@ private:
                 if (task.params.n_cache_reuse == 0 && !task.tokens.has_mtmd && !ret->prompt.tokens.has_mtmd) {
                     keep_max = (llama_pos) ret->prompt.tokens.get_common_prefix(task.tokens);
                 }
-                ret->prompt_save(*prompt_cache, keep_max);
+                if (!ret->prompt_saved_idle) {
+                    ret->prompt_save(*prompt_cache, keep_max);
+                }
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
@@ -2165,6 +2188,7 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        slot.prompt_saved_idle = false;
         llama_moe_request_begin(ctx_tgt);
         // k15-lfm2: the pin a request without drafts lifted is restored before the next prompt (see spill_pinned)
         if (spill_pin_lifted) {
@@ -2185,6 +2209,7 @@ private:
                 if (lora_should_clear_cache(slot.lora, task_loras)) {
                     SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task.params.lora.size());
                     slot.prompt.clear();
+                    slot.prompt_saved_idle = false;
                 } else {
                     SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
                 }
@@ -3873,6 +3898,7 @@ private:
                     new_tokens.resize(slot.prompt.tokens.size() - n_discard);
 
                     slot.prompt.clear();
+                    slot.prompt_saved_idle = false;
                     slot.prompt.tokens.insert(new_tokens);
                 }
 
