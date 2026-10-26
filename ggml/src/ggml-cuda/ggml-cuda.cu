@@ -218,6 +218,18 @@ static void ggml_cuda_device_free(void * ptr) {
 static cudaError_t ggml_cuda_device_malloc_impl(void ** ptr, size_t size, int device);
 
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
+    // debug: GGML_CUDA_FAKE_FREE_STRICT=1 with GGML_CUDA_FAKE_FREE_MIB fails an allocation past the fake budget, as cudaMalloc does on a
+    // card of that size (the fake free memory alone lets it succeed on a larger card)
+    static const bool fake_strict = getenv("GGML_CUDA_FAKE_FREE_STRICT") != nullptr && atoi(getenv("GGML_CUDA_FAKE_FREE_STRICT")) != 0 &&
+                                    getenv("GGML_CUDA_FAKE_FREE_MIB") != nullptr && atoll(getenv("GGML_CUDA_FAKE_FREE_MIB")) > 0;
+    if (fake_strict) {
+        const int64_t cap = (int64_t) atoll(getenv("GGML_CUDA_FAKE_FREE_MIB")) << 20;
+        std::lock_guard<std::mutex> lock(ggml_cuda_own_mutex);
+        if (ggml_cuda_own_bytes[device] + (int64_t) size > cap) {
+            *ptr = nullptr;
+            return cudaErrorMemoryAllocation;
+        }
+    }
     const cudaError_t err = ggml_cuda_device_malloc_impl(ptr, size, device);
     if (err == cudaSuccess && *ptr != nullptr) {
         std::lock_guard<std::mutex> lock(ggml_cuda_own_mutex);
@@ -6325,6 +6337,37 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph_evaluated_or_captured = true; // CUDA graph has been captured
+            // k15-fn debug (GGML_CUDA_GRAPH_NODE_STATS=1): the node types of each captured graph (a host<->device memcpy node makes the
+            // launch cost grow with the node count: B200 2000 kernels 5.7 us, with memcpy nodes 102 us)
+            static const bool node_stats = getenv("GGML_CUDA_GRAPH_NODE_STATS") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_NODE_STATS")) != 0;
+            if (node_stats) {
+                size_t n_nodes = 0;
+                CUDA_CHECK(cudaGraphGetNodes(graph->graph, nullptr, &n_nodes));
+                std::vector<cudaGraphNode_t> nodes(n_nodes);
+                CUDA_CHECK(cudaGraphGetNodes(graph->graph, nodes.data(), &n_nodes));
+                int cnt[16] = { 0 };
+                int n_h2d = 0, n_d2h = 0, n_d2d = 0;
+                for (cudaGraphNode_t nd : nodes) {
+                    cudaGraphNodeType t;
+                    CUDA_CHECK(cudaGraphNodeGetType(nd, &t));
+                    cnt[std::min((int) t, 15)]++;
+                    if (t == cudaGraphNodeTypeMemcpy) {
+                        cudaMemcpy3DParms p = {};
+                        CUDA_CHECK(cudaGraphMemcpyNodeGetParams(nd, &p));
+                        cudaPointerAttributes as = {}, ad = {};
+                        cudaPointerGetAttributes(&as, p.srcPtr.ptr);
+                        cudaPointerGetAttributes(&ad, p.dstPtr.ptr);
+                        (void) cudaGetLastError();
+                        const bool sd = as.type == cudaMemoryTypeDevice, dd = ad.type == cudaMemoryTypeDevice;
+                        n_h2d += !sd && dd; n_d2h += sd && !dd; n_d2d += sd && dd;
+                    }
+                }
+                GGML_LOG_INFO("%s: captured graph of %d ggml nodes: %zu CUDA nodes, %d kernels, %d memcpy (%d H2D, %d D2H, %d D2D), %d memset, %d host, %d event record, %d event wait, %d empty, %d other\n",
+                    __func__, cgraph->n_nodes, n_nodes, cnt[cudaGraphNodeTypeKernel], cnt[cudaGraphNodeTypeMemcpy], n_h2d, n_d2h, n_d2d,
+                    cnt[cudaGraphNodeTypeMemset], cnt[cudaGraphNodeTypeHost], cnt[cudaGraphNodeTypeEventRecord], cnt[cudaGraphNodeTypeWaitEvent],
+                    cnt[cudaGraphNodeTypeEmpty], (int) n_nodes - cnt[cudaGraphNodeTypeKernel] - cnt[cudaGraphNodeTypeMemcpy] - cnt[cudaGraphNodeTypeMemset] -
+                    cnt[cudaGraphNodeTypeHost] - cnt[cudaGraphNodeTypeEventRecord] - cnt[cudaGraphNodeTypeWaitEvent] - cnt[cudaGraphNodeTypeEmpty]);
+            }
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
@@ -6344,7 +6387,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph
-        CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        {
+            // k15-fn debug (GGML_CUDA_HOST_TIMING=N): the host time of the launch call alone, graphs of over 1000 ggml nodes apart
+            static const int lt_every = getenv("GGML_CUDA_HOST_TIMING") ? atoi(getenv("GGML_CUDA_HOST_TIMING")) : 0;
+            static int64_t lt_n[2] = { 0, 0 }, lt_t[2] = { 0, 0 }, lt_nodes[2] = { 0, 0 };
+            const int64_t lt0 = lt_every > 0 ? ggml_time_us() : 0;
+            CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+            if (lt_every > 0) {
+                const int bk = cgraph->n_nodes > 1000;
+                lt_n[bk]++; lt_t[bk] += ggml_time_us() - lt0; lt_nodes[bk] += cgraph->n_nodes;
+                if (lt_n[bk] % lt_every == 0) {
+                    GGML_LOG_INFO("%s: cudaGraphLaunch over the last %lld launches of %s graphs: %.1f us per launch, %.0f ggml nodes\n", __func__,
+                        (long long) lt_n[bk], bk ? "large" : "small", (double) lt_t[bk] / lt_n[bk], (double) lt_nodes[bk] / lt_n[bk]);
+                    lt_n[bk] = lt_t[bk] = lt_nodes[bk] = 0;
+                }
+            }
+        }
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
