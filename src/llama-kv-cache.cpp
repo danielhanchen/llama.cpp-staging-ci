@@ -1920,6 +1920,105 @@ static double kq_mask_thread_cpu_ms() {
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
+    if (dst->op == GGML_OP_KQ_MASK) {
+        // k15-pp: the device builds the mask (ggml_kq_mask, see build_attn_inp_kq_mask): the cells and the tokens it reads
+        // the host inputs (build_attn_inp_kq_mask keeps them in the op params: the scheduler points src[] at the device copies)
+        ggml_tensor * srcs[2];
+        memcpy(srcs, dst->op_params, sizeof(srcs));
+        ggml_tensor * tc = srcs[0];
+        ggml_tensor * tt = srcs[1];
+        GGML_ASSERT(tc->buffer != nullptr && tt->buffer != nullptr);
+        GGML_ASSERT(!hparams.use_alibi);
+        const bool is_2d = ubatch->is_pos_2d();
+        const int64_t n_kv     = dst->ne[0];
+        const int64_t n_stream = dst->ne[3];
+        const int64_t n_tps    = n_tokens/n_stream;
+        GGML_ASSERT(dst->ne[1] == n_tps && tc->ne[1] == n_kv && tt->ne[1] == n_tps);
+        if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+            causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
+        }
+        GGML_ASSERT(causal_attn || hparams.non_causal_type != LLAMA_NON_CAUSAL_TYPE_SWA_FULL || swa_type == LLAMA_SWA_TYPE_NONE);
+        static std::atomic<int64_t> n_dev { 0 };
+        if (n_dev++ == 0) {
+            LLAMA_LOG_INFO("%s: KQ masks built on the device from the cells and tokens (LLAMA_KQ_MASK_DEVICE=0: on the host)\n", __func__);
+        }
+        // written in place where the inputs are host memory, else staged and uploaded
+        const bool c_host = ggml_backend_buffer_is_host(tc->buffer);
+        const bool t_host = ggml_backend_buffer_is_host(tt->buffer);
+        std::vector<int32_t> c_stage(c_host ? 0 : ggml_nelements(tc)), t_stage(t_host ? 0 : ggml_nelements(tt));
+        int32_t * c = c_host ? (int32_t *) tc->data : c_stage.data();
+        int32_t * t = t_host ? (int32_t *) tt->data : t_stage.data();
+        for (int64_t s = 0; s < n_stream; ++s) {
+            const auto & cells = v_cells.at(seq_to_stream[ubatch->seq_id[s*n_tps][0]]);
+            for (int64_t j = 0; j < n_kv; ++j) {
+                int32_t * cj = c + 5*(s*n_kv + j);
+                if (cells.is_empty(j)) {
+                    cj[0] = INT32_MIN; cj[1] = 0; cj[2] = 0; cj[3] = 0; cj[4] = 0;
+                    continue;
+                }
+                uint32_t lo = 0, hi = 0;
+                const auto & bits = cells.seq_get_all(j);
+                for (uint32_t q = 0; q < 64 && q < (uint32_t) bits.size(); ++q) {
+                    if (bits.test(q)) {
+                        (q < 32 ? lo : hi) |= 1u << (q & 31);
+                    }
+                }
+                cj[0] = cells.pos_get(j); cj[1] = (int32_t) lo; cj[2] = (int32_t) hi;
+                if (is_2d) {
+                    const auto & ext = cells.ext_get(j);
+                    cj[3] = ext.x; cj[4] = ext.y;
+                } else {
+                    cj[3] = 0; cj[4] = 0;
+                }
+            }
+            for (int64_t ii = 0; ii < n_tps; ++ii) {
+                const int64_t i = s*n_tps + ii;
+                const llama_seq_id seq_id = ubatch->seq_id[i][0];
+                GGML_ASSERT(seq_id >= 0 && seq_id < 64);
+                GGML_ASSERT(seq_to_stream[seq_id] == seq_to_stream[ubatch->seq_id[s*n_tps][0]]);
+                int32_t * ti = t + 8*i;
+                ti[0] = ubatch->pos[i]; ti[1] = seq_id; ti[2] = causal_attn ? 1 : 0; ti[3] = (int32_t) swa_type; ti[4] = (int32_t) n_swa;
+                ti[5] = is_2d ? 1 : 0;
+                ti[6] = is_2d ? ubatch->pos[i + ubatch->n_tokens*2] : 0;
+                ti[7] = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : 0;
+            }
+        }
+        // LLAMA_KQ_MASK_DEVICE_CHECK=1 (debug): the mask the cells and tokens give (the CPU op's rule) against the host mask
+        static const bool dev_check = getenv("LLAMA_KQ_MASK_DEVICE_CHECK") != nullptr && atoi(getenv("LLAMA_KQ_MASK_DEVICE_CHECK")) != 0;
+        if (dev_check) {
+            const args_set_input_kq_mask args = { hparams, ubatch, v_cells, seq_to_stream, n_swa, swa_type, n_kv, n_stream, n_tps };
+            std::vector<float> ref((size_t) n_kv*n_tokens);
+            set_input_kq_mask_impl<float>(args, ref.data(), causal_attn);
+            int64_t n_bad = 0;
+            for (int64_t s = 0; s < n_stream; ++s) {
+                for (int64_t ii = 0; ii < n_tps; ++ii) {
+                    const int32_t * ti = t + 8*(s*n_tps + ii);
+                    for (int64_t j = 0; j < n_kv; ++j) {
+                        const int32_t * cj = c + 5*(s*n_kv + j);
+                        bool keep = cj[0] != INT32_MIN && (((uint32_t) cj[ti[1] < 32 ? 1 : 2]) & (1u << (ti[1] & 31))) != 0;
+                        if (keep && ti[2] && cj[0] > ti[0]) keep = false;
+                        if (keep && ti[2] && ti[5] && cj[0] == ti[0] && (cj[4] > ti[7] || (cj[4] == ti[7] && cj[3] > ti[6]))) keep = false;
+                        if (keep && ti[3] != 0 && llama_hparams::is_masked_swa((uint32_t) ti[4], (llama_swa_type) ti[3], cj[0], ti[0])) keep = false;
+                        const float v = keep ? 0.0f : -INFINITY;
+                        const float r = ref[(s*n_tps + ii)*n_kv + j];
+                        if (memcmp(&v, &r, sizeof(float)) != 0 && n_bad++ < 4) {
+                            LLAMA_LOG_WARN("%s: KQ mask check: stream %d row %d cell %d: device rule %f, host %f (cell pos %d bits %08x %08x, token pos %d seq %d causal %d swa %d/%d)\n",
+                                __func__, (int) s, (int) ii, (int) j, v, r, cj[0], (unsigned) cj[1], (unsigned) cj[2], ti[0], ti[1], ti[2], ti[3], ti[4]);
+                        }
+                    }
+                }
+            }
+            LLAMA_LOG_INFO("%s: KQ mask check: %d x %d x %d, %lld differ\n", __func__, (int) n_kv, (int) n_tps, (int) n_stream, (long long) n_bad);
+        }
+        if (!c_host) {
+            ggml_backend_tensor_set(tc, c, 0, ggml_nbytes(tc));
+        }
+        if (!t_host) {
+            ggml_backend_tensor_set(tt, t, 0, ggml_nbytes(tt));
+        }
+        return;
+    }
+
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const int64_t n_kv     = dst->ne[0];

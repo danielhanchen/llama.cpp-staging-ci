@@ -1862,6 +1862,55 @@ static bool ggml_compute_forward_batch_invariant(struct ggml_compute_params * pa
     return false;
 }
 
+// k15-pp: GGML_OP_KQ_MASK (see ggml_kq_mask), the rows split over the threads
+static bool ggml_kq_mask_swa_masked(int32_t swa_type, int32_t n_swa, int32_t p0, int32_t p1) {
+    switch (swa_type) {
+        case 1: return p1 - p0 >= n_swa;                                    // LLAMA_SWA_TYPE_STANDARD
+        case 2: return p0 < (p1 / n_swa) * n_swa;                           // LLAMA_SWA_TYPE_CHUNKED
+        case 3: { const int32_t h = n_swa / 2; const int32_t d = p1 - p0;  // LLAMA_SWA_TYPE_SYMMETRIC
+                  return d < -h || d > h; }
+        default: return false;
+    }
+}
+
+static void ggml_compute_forward_kq_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * cells = dst->src[0];
+    const struct ggml_tensor * toks  = dst->src[1];
+    const int64_t n_kv = dst->ne[0], n_tps = dst->ne[1], n_stream = dst->ne[3];
+    const int64_t n_rows = n_tps*n_stream;
+    const int64_t dr = (n_rows + params->nth - 1)/params->nth;
+    const int64_t r0 = dr*params->ith, r1 = MIN(r0 + dr, n_rows);
+    const ggml_fp16_t keep16 = GGML_CPU_FP32_TO_FP16(0.0f), drop16 = GGML_CPU_FP32_TO_FP16(-INFINITY);
+    for (int64_t r = r0; r < r1; ++r) {
+        const int64_t s = r / n_tps, i = r % n_tps;
+        const int32_t * t = (const int32_t *) ((const char *) toks->data + s*toks->nb[2] + i*toks->nb[1]);
+        const int32_t p1 = t[0], seq = t[1], causal = t[2], swa_type = t[3], n_swa = t[4], is_2d = t[5], x1 = t[6], y1 = t[7];
+        const int32_t * c = (const int32_t *) ((const char *) cells->data + s*cells->nb[2]);
+        const uint32_t bit = 1u << (seq & 31);
+        const int word = seq < 32 ? 1 : 2;
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const int32_t * cj = c + 5*j;
+            const int32_t p0 = cj[0];
+            bool keep = p0 != INT32_MIN && (((uint32_t) cj[word]) & bit) != 0;
+            if (keep && causal && p0 > p1) {
+                keep = false;
+            }
+            // M-RoPE: a cell at the token's position whose 2D position is after the token's (llama_kv_cell_ext::is_2d_gt)
+            if (keep && causal && is_2d && p0 == p1 && (cj[4] > y1 || (cj[4] == y1 && cj[3] > x1))) {
+                keep = false;
+            }
+            if (keep && swa_type != 0 && ggml_kq_mask_swa_masked(swa_type, n_swa, p0, p1)) {
+                keep = false;
+            }
+            if (dst->type == GGML_TYPE_F16) {
+                ((ggml_fp16_t *) ((char *) dst->data + s*dst->nb[3] + i*dst->nb[1]))[j] = keep ? keep16 : drop16;
+            } else {
+                ((float *) ((char *) dst->data + s*dst->nb[3] + i*dst->nb[1]))[j] = keep ? 0.0f : -INFINITY;
+            }
+        }
+    }
+}
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -2298,6 +2347,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 GGML_ABORT("%s: not supported by the CPU backend", ggml_op_name(tensor->op));
             }
+        case GGML_OP_KQ_MASK:
+            {
+                ggml_compute_forward_kq_mask(params, tensor);
+            } break;
         case GGML_OP_COUNT:
             {
                 GGML_ABORT("fatal error");
@@ -2476,6 +2529,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                     GGML_ABORT("fatal error");
             }
             break;
+        case GGML_OP_KQ_MASK:
+            {
+                n_tasks = n_threads;
+            } break;
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(node)) {
                 case GGML_GLU_OP_REGLU:

@@ -2875,6 +2875,27 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     compute_n_tokens = ubatch.n_tokens;
     const int64_t t_ub2 = ub_timing ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    // k15-pp (debug): LLAMA_KQ_MASK_DUMP=1 counts the kept cells of each device-built KQ mask (marked as an output by the builder)
+    static const bool kq_mask_dump = getenv("LLAMA_KQ_MASK_DUMP") != nullptr;
+    if (kq_mask_dump) {
+        ggml_backend_sched_synchronize(sched.get());
+        ggml_cgraph * g = res->get_gf();
+        for (int i = 0; i < ggml_graph_n_nodes(g); ++i) {
+            ggml_tensor * t = ggml_graph_node(g, i);
+            if (t->op != GGML_OP_KQ_MASK) {
+                continue;
+            }
+            std::vector<uint8_t> buf(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+            int64_t n_keep = 0, n_drop = 0, n_other = 0;
+            for (int64_t k = 0; k < ggml_nelements(t); ++k) {
+                const float v = t->type == GGML_TYPE_F16 ? ggml_fp16_to_fp32(((ggml_fp16_t *) buf.data())[k]) : ((float *) buf.data())[k];
+                if (v == 0.0f) n_keep++; else if (std::isinf(v) && v < 0) n_drop++; else n_other++;
+            }
+            LLAMA_LOG_INFO("%s: KQ mask dump %s [%d x %d]: %lld kept, %lld masked, %lld other (backend %s)\n", __func__, t->name, (int) t->ne[0],
+                (int) t->ne[1], (long long) n_keep, (long long) n_drop, (long long) n_other, t->buffer ? ggml_backend_buffer_name(t->buffer) : "-");
+        }
+    }
     compute_n_tokens = 0;
     if (t_tr0) {
         const int64_t t_tr_end = ggml_time_us();
