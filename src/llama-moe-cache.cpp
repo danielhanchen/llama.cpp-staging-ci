@@ -879,7 +879,7 @@ struct llama_moe_cache::impl {
     // short prompts do not take it either
     static constexpr double cmt_host_bad = 1.25;
     bool     cmt_host_ok = true;
-    // k15-pred r22b, short prompts (LLAMA_MOE_CPU_MISS_PROMPT_AUTO, default on, 0 = off): a prompt ubatch of max_batch + 1 .. cm_max
+    // k15-pred r22b, short prompts (LLAMA_MOE_CPU_MISS_PROMPT_AUTO=1, opt-in; 2 = every size a candidate, diagnostic): a prompt ubatch of max_batch + 1 .. cm_max
     // tokens that the cost model puts on the host path (cm_on, from the calibration and the measured miss rate) takes it without the
     // small-batch trials, but only while timing says it pays, as Strata's STRATA_PREFILL_CPU_SHARE=auto does: the first such ubatches
     // alternate with and without it (pt_need of each), timed to their end per token, and the host path is kept only if its median is at
@@ -888,7 +888,7 @@ struct llama_moe_cache::impl {
     static constexpr int pt_need  = 3;
     static constexpr int pt_keep  = 5;
     static constexpr int pt_every = 29;
-    bool     pt_auto    = true;
+    bool     pt_auto    = false;  // r22b G4 t17p: opt-in (decided off on 6 of 7 cells, RSS +20..81 MiB, see plans/k15_models.md round 22b)
     bool     pt_any     = false;  // LLAMA_MOE_CPU_MISS_PROMPT_AUTO=2 (diagnostic): every prompt size in range is a candidate, the timing still decides
     int      pt_state   = -1;     // -1 trial, 0 off, 1 on
     int      pt_arm     = 1;      // the path of the current / next counted prompt ubatch
@@ -7794,13 +7794,21 @@ void llama_moe_cache::overlap_tick(int64_t n_tokens) {
 
 bool llama_moe_cache::hybrid_window_pending() const {
     if (pimpl->cm) {
-        return pimpl->cmt_pending() || pimpl->pt_pending();
+        return pimpl->cmt_pending();
     }
     return pimpl->hybrid && (pimpl->win_done >= 0 || pimpl->win_wait >= 0);
 }
 
 bool llama_moe_cache::hybrid_tick_sync() const {
     return !pimpl->cm; // CPU misses: each timed ubatch is synchronized at its end (see hybrid_tick_end)
+}
+
+bool llama_moe_cache::prompt_auto_pending() const {
+    return pimpl->pt_pending();
+}
+
+void llama_moe_cache::prompt_auto_tick(int64_t n_tokens) {
+    pimpl->pt_tick(n_tokens);
 }
 
 bool llama_moe_cache::hybrid_tick_timed() const {
@@ -7815,7 +7823,6 @@ void llama_moe_cache::hybrid_tick_end() {
 void llama_moe_cache::hybrid_tick(int64_t n_tokens) {
     if (pimpl->cm) {
         pimpl->cmt_tick(n_tokens);
-        pimpl->pt_tick(n_tokens);
         return;
     }
     pimpl->tick(n_tokens);

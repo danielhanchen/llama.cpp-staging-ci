@@ -154,6 +154,9 @@ public:
     bool hybrid_tick_sync() const;
     // CPU misses trial: the ubatch after the tick is timed; synchronize after its graph is computed, then hybrid_tick_end
     bool hybrid_tick_timed() const;
+    // k15-pred r22b (LLAMA_MOE_CPU_MISS_PROMPT_AUTO=1): short-prompt host path timing, before the graph of a ubatch (timed with hybrid_tick_timed / hybrid_tick_end)
+    bool prompt_auto_pending() const;
+    void prompt_auto_tick(int64_t n_tokens);
     void hybrid_tick_end();
 
     // fetch overlap rule (default) or auto (LLAMA_MOE_CACHE_FETCH_OVERLAP=3): true while a window or trial runs or waits; the tick goes before the graph of
