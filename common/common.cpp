@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "gguf.h"
@@ -2821,6 +2822,17 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         // decide on the params the model is loaded with, whatever the fit status: a failed or skipped fit leaves the user placement, which then decides like the path without --fit
         // the fitted overrides live in params.tensor_buft_overrides, which mparams points to
         mparams.load_mode = common_moe_cache_load_mode(params, mparams.load_mode, mparams.n_gpu_layers);
+
+        // k16-fit: the memory the fit leaves free (its target) is also the headroom of the context's optional load-time allocations (the
+        // MoE cache seed graph, an unlent staging arena): they only take memory beyond it (llama_context::sched_reserve_seed,
+        // llama_moe_cache lend_decide). LLAMA_FIT_TARGET_HEADROOM=0: their fixed 512 MiB as before
+        if (fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && (getenv("LLAMA_FIT_TARGET_HEADROOM") == nullptr || atoi(getenv("LLAMA_FIT_TARGET_HEADROOM")) != 0)) {
+            size_t target = 0;
+            for (size_t t : params.fit_params_target) {
+                target = std::max(target, t);
+            }
+            common_set_env("LLAMA_FIT_TARGET_MIB", std::to_string(target/(1024*1024)));
+        }
     }
 
     if (!model_only) {

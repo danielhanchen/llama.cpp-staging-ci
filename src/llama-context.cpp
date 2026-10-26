@@ -1603,8 +1603,9 @@ bool llama_context::fit_seed_price_on() {
 }
 
 bool llama_context::sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const std::vector<size_t> & staging_pp) {
-    // headroom for the memory the backends allocate while computing (e.g. the CUDA pool), which a larger compute buffer would take
-    constexpr size_t margin = 512ull*1024*1024;
+    // headroom for the memory the backends allocate while computing (e.g. the CUDA pool), which a larger compute buffer would take;
+    // k16-fit: at least the memory --fit left free (LLAMA_FIT_TARGET_MIB, set by common), which this optional graph must not take
+    const size_t margin = std::max<size_t>(512ull*1024*1024, getenv("LLAMA_FIT_TARGET_MIB") ? (size_t) atoll(getenv("LLAMA_FIT_TARGET_MIB"))*1024*1024 : 0);
 
     // the measure may release a graph allocator buffer that is too small for this graph, the free memory then includes it
     std::vector<size_t> cur(backend_ptrs.size(), 0);
