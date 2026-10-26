@@ -1193,9 +1193,10 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
             const bool draft_dropped = dropped_depth > 0 && cparams.spec_draft && getenv("LLAMA_FIT_DRAFT_DROPPED") != nullptr &&
                 atoi(getenv("LLAMA_FIT_DRAFT_DROPPED")) != 0;
             // k15-up2: a draft that runs (a -md drafter on the device or MTP heads) gets the same depth beside a cache of at least
-            // LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS tokens' experts (the old exclusion came from a 64 GB Flash-Next whose depth-3
-            // staging pushed the draft out); LLAMA_MOE_PREFETCH_DEPTH_SPEC=0: depth 2 beside a running draft, as before
-            static const bool spec_env = getenv("LLAMA_MOE_PREFETCH_DEPTH_SPEC") == nullptr || atoi(getenv("LLAMA_MOE_PREFETCH_DEPTH_SPEC")) != 0;
+            // LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS tokens' experts. Opt-in (LLAMA_MOE_PREFETCH_DEPTH_SPEC=1): G4 k15g4i1, Flash-Next
+            // UD-IQ4_XS Studio argv + the admitted Q8_0 drafter, 3 launches: 24 GB TTFT 2k / 8k / 16k +3.1 / +1.2 / +2.2% and decode
+            // -5..-14% (1.5 GB less device memory in use at the end), 32 GB 8k / 16k -6.1 / -4.7% with decode mixed (2k -3.6%, 8k +16%)
+            static const bool spec_env = getenv("LLAMA_MOE_PREFETCH_DEPTH_SPEC") != nullptr && atoi(getenv("LLAMA_MOE_PREFETCH_DEPTH_SPEC")) != 0;
             // not beside built-in MTP heads (common sets LLAMA_SPEC_MTP_HEADS=1): local B200 Qwen3.6-35B-A3B UD-Q4_K_XL + MTP heads, 12 GB,
             // pinned + strict exact, depth 4 gave other text than depth 2 and no draft (chat a3c3e816 vs 19b8fd68, twice each), while a
             // dropped -md drafter at depth 4 kept it (not found why yet)
