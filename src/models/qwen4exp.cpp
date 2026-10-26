@@ -782,7 +782,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     }
     cb(k_raw, "indexer_k_raw", il);
 
-    static const bool qsa_hoist = getenv("LLAMA_QSA_HOIST") == nullptr || atoi(getenv("LLAMA_QSA_HOIST")) != 0;
+    // opt-in (LLAMA_QSA_HOIST=1): on G4 fn4 IQ4_XS 32 GB Studio (single-graph host misses) the first chat diverged and a verify graph hit
+    // an illegal memory access with it on (k15gb_g4); not found yet, the fn1 cells here are exact
+    static const bool qsa_hoist = getenv("LLAMA_QSA_HOIST") != nullptr && atoi(getenv("LLAMA_QSA_HOIST")) != 0;
     ggml_tensor * pzero  = qsa_hoist ? qsa_c.pzero : nullptr;
     if (pzero == nullptr) {
         pzero = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, idx_dim, n_tokens), 0.0f);
