@@ -1404,8 +1404,11 @@ private:
         }
 
         {
+            // k15 integration: opt-in (LLAMA_SERVER_DEVICE_GREEDY=1) until the intermittent abort is fixed. gpt-oss-20b full card,
+            // greedy chat after a 1-token n-gram draft: "CUDA error: an illegal memory access" at the first decode in 5 of 23 launches
+            // of 25d7da107dd, 0 of 11 with LLAMA_SERVER_DEVICE_GREEDY=0, 0 of 15 before k15-fn (plans/k15_rebench.md section 3)
             const char * e = getenv("LLAMA_SERVER_DEVICE_GREEDY");
-            device_greedy_ok = (e == nullptr || atoi(e) != 0) && llama_model_n_devices(model_tgt) > 0;
+            device_greedy_ok = e != nullptr && atoi(e) != 0 && llama_model_n_devices(model_tgt) > 0;
             for (int i = 0; device_greedy_ok && i < llama_model_n_devices(model_tgt); ++i) {
                 ggml_backend_dev_t dev = llama_model_get_device(model_tgt, i);
                 ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
