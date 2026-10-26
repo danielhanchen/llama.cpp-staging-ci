@@ -7276,7 +7276,7 @@ struct test_concat : public test_case {
     const std::array<int64_t, 4> ne_a;
     const int64_t ne_b_d;
     const int dim;
-    const int v; // view (1 << 0: non-cont a (first 3 dim), 1 << 1: non-cont b (first 3 dim), 1 << 2: non-cont a (last 2 dim), 1 << 3: non-cont b (last 2 dim))
+    const int v; // view (1 << 0: non-cont a (first 3 dim), 1 << 1: non-cont b (first 3 dim), 1 << 2: non-cont a (last 2 dim), 1 << 3: non-cont b (last 2 dim), 1 << 4: b transposed)
 
     std::string vars() override {
         return VARS_TO_STR5(type, ne_a, ne_b_d, dim, v);
@@ -7325,6 +7325,14 @@ struct test_concat : public test_case {
 
             b = ggml_view_4d(ctx, b, ne_b[0], ne_b[1], ne_b[2], ne_b[3], b->nb[1], b->nb[2], b->nb[3], 0);
             ggml_set_name(b, "view_of_b");
+        } else if (v & 16) {
+            // b = the transpose of a contiguous tensor (the conv state concat of GDN / Mamba prefill: concat(state, transpose(x), 0))
+            auto ne = ne_b; std::swap(ne[0], ne[1]);
+            b = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_name(b, "b");
+
+            b = ggml_transpose(ctx, b);
+            ggml_set_name(b, "transpose_of_b");
         } else {
             b = ggml_new_tensor(ctx, type, 4, ne_b.data());
             ggml_set_name(b, "b");
@@ -12116,6 +12124,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 1, false, 512, 1, 256));
     }
 
+    // MoE ubatches beyond the shared memory of the single-warp ids helper (n_tokens*4 bytes: 16384 tokens on 64 KB LDS,
+    // e.g. gfx1151, 58112 on 227 KB): the ids are sorted by the counting sort, or on the host where neither fits
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_F16}) {
+        for (int n : {16384, 16385, 20000, 60000}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 2, false, 32, n, 256));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 32, 20000, 256));
+    }
+
     for (ggml_type type_a : other_types) {
         for (ggml_type type_b : {GGML_TYPE_F32}) {
             if (ggml_blck_size(type_a) != 256) {
@@ -12665,6 +12682,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {98304, 8, 1, 1}, dim == 0 ? 288 : 2, dim, 0));
         test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {20000, 3, 2, 1}, dim == 0 ? 333 : 1, dim, 1));
         test_cases.emplace_back(new test_concat(GGML_TYPE_Q8_0, {8192, 2, 1, 1}, dim == 0 ? 4096 : 1, dim, 0));
+    }
+
+    // dim 0 concat with a transposed src1, ne3 == 1 (GDN / Mamba conv state + transpose(x)): tokens below, at and above the
+    // 32-token tile, channels not a multiple of 32, several sequences, 2- and 4-byte types
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        for (int64_t n_tok : { 7, 31, 32, 77, 512 }) {
+            test_cases.emplace_back(new test_concat(type, {3, 8192, 1, 1}, n_tok, 0, 16));
+            test_cases.emplace_back(new test_concat(type, {3, 1000, 2, 1}, n_tok, 0, 16));
+        }
+        test_cases.emplace_back(new test_concat(type, {3, 33, 3, 1}, 2047, 0, 16));
+        test_cases.emplace_back(new test_concat(type, {3, 4096, 1, 2}, 64, 0, 16)); // ne3 == 2: generic path
     }
 
     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
@@ -13437,6 +13465,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Keep the WebGPU dispatch below 65535 workgroups (32 per token for this shape).
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2047, 2, 3));
 
+    // token-tiled kernel window (16+ tokens the chunked kernel does not take): H = 16 / 32 / 48 value heads, head size 128,
+    // q / k heads 16 (the models' layout, MMA-eligible from 64 tokens on NVIDIA) and != 16 (never MMA), 1 and 2 sequences
+    for (int64_t nt : {16, 64, 512, 2047}) {
+        for (int64_t ns : {1, 2}) {
+            for (int vr : {1, 2, 3}) {
+                test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, ns, vr));
+            }
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8, 128, nt, ns, 2));
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, nt, ns, 1));
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 24, 128, nt, ns, 2));
+        }
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 24, 128, nt, 2, 2, false, false, /*K=*/4));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 2, 3, true));
+    }
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 64, 512, 2, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 64, 100, 1, 2, false, false, /*K=*/4));
+
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
     // exact-match cases (K == n_seq_tokens):
@@ -13551,6 +13596,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         // k15-mm2: the router and indexer shapes as BF16 (the F32 router weights are exactly BF16-representable; indexer q / k)
         for (auto mk : std::vector<std::array<int64_t, 2>>{ { 512, 2560 }, { 128, 2560 } }) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
+        }
+    }
+
+    // FLASH_ATTN_EXT head size 256 prefill at Qwen3.5 / Qwen3.6 / Flash-Next shapes (2 KV heads, GQA 8 / 4), F16 KV
+    for (int64_t nb : { 512, 2048 }) {
+        for (int64_t kv : { 2048, 8192 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+
+    // GATED_DELTA_NET prefill at Qwen3.5 dense (16 / 16 heads), Qwen3.6-35B (16 q/k, 32 v) and Flash-Next (16 q/k, 48 v) shapes,
+    // head size 128: ubatches of 512, the 1756 / 2000 / 2047-token tails of a 2048 ubatch split, and 2048
+    for (int v_repeat : { 1, 2, 3 }) {
+        for (int64_t n_tok : { 64, 512, 1756, 2047, 2048 }) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tok, 1, v_repeat));
+        }
+    }
+
+    // CONCAT of the GDN conv state with transpose(x) at Qwen3.5 / Qwen3.6 prefill shapes (channels 6144 / 8192 / 12288)
+    for (int64_t ch : { 6144, 8192, 12288 }) {
+        for (int64_t n_tok : { 512, 2048 }) {
+            test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, ch, 1, 1}, n_tok, 0, 16));
         }
     }
 

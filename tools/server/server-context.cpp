@@ -1297,12 +1297,25 @@ private:
         server_spec_auto_apply(params);
 
         params_base = params;
+        // A zero draft length means no speculation, for a draft model and for MTP (no draft model) alike. Without this the context
+        // is sized from common_speculative_n_max() == 0 (one output per sequence) while the draft path is still initialized, and
+        // the first verify batch trips GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max).
+        if (common_speculative_n_max(&params_base.speculative) <= 0 &&
+                (params_base.speculative.has_dft() ||
+                 std::any_of(params_base.speculative.types.begin(), params_base.speculative.types.end(), [](common_speculative_type t) {
+                     return t != COMMON_SPECULATIVE_TYPE_NONE;
+                 }))) {
+            SRV_WRN("%s", "draft length is 0 - disabling speculative decoding\n");
+            params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+            params_base.speculative.draft.mparams = {};
+        }
+
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
         const bool has_mmproj = !params.mmproj.path.empty();
-        const bool has_draft = params.speculative.has_dft();
+        const bool has_draft = params_base.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
