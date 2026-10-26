@@ -590,6 +590,9 @@ struct llama_moe_cache::impl {
         int32_t n_slots = 0;
         moe_cache_lru lru;
         seed_state sd;
+        // k15-pred r19: the key each slot held when the device lookups of the last small ubatches had used it (-1: not used); the
+        // uploads ahead take none of these slots while they still hold that key (LLAMA_MOE_UPLOAD_AHEAD_KEEP_DECODE)
+        std::vector<int32_t> ua_dec_key;
 
         // device lookup: slot maps of all layers [n_expert, n_layer] and eviction state, see ggml_moe_cache_lookup
         ggml_tensor * map   = nullptr;
@@ -3174,6 +3177,8 @@ struct llama_moe_cache::impl {
     std::vector<uint8_t> ua_busy;
     std::vector<int32_t> ua_donate;
     float ua_floor = 0.9f;
+    bool  ua_keep_dec = false;
+    bool  ua_dec_ref  = false;
     std::vector<std::pair<int64_t, int32_t>> ua_cand;
     int  ua_victims = 3;
     bool ua_verify  = false;
@@ -3207,6 +3212,10 @@ struct llama_moe_cache::impl {
         ua_protect = env_p != nullptr ? std::max(0, atoi(env_p)) : 4;
         const char * env_f = getenv("LLAMA_MOE_UPLOAD_AHEAD_FLOOR");
         ua_floor = env_f != nullptr ? (float) atof(env_f) : 0.9f;
+        const char * env_kd = getenv("LLAMA_MOE_UPLOAD_AHEAD_KEEP_DECODE");
+        ua_keep_dec = env_kd != nullptr && atoi(env_kd) != 0;
+        const char * env_dr = getenv("LLAMA_MOE_UPLOAD_AHEAD_DEC_REF");
+        ua_dec_ref = env_dr != nullptr && atoi(env_dr) != 0;
         ua_verify  = getenv("LLAMA_MOE_UPLOAD_AHEAD_VERIFY") != nullptr && atoi(getenv("LLAMA_MOE_UPLOAD_AHEAD_VERIFY")) != 0;
         ua_gating = (int) model.hparams.expert_gating_func;
         ua_router.assign(layers.size(), nullptr);
@@ -3896,6 +3905,9 @@ struct llama_moe_cache::impl {
                 continue;
             }
             const int32_t key = g.lru.key_of[s];
+            if (ua_keep_dec && key >= 0 && !g.ua_dec_key.empty() && g.ua_dec_key[s] == key) {
+                continue; // the last decode used it: the next one likely does too
+            }
             const int64_t v = key >= 0 && g.lru.grow_q16 > 0 ? (int64_t) g.lru.scores[key] : 0;
             int64_t cls;
             if (key < 0) {
@@ -3905,9 +3917,11 @@ struct llama_moe_cache::impl {
                     continue;
                 }
                 cls = 1;
-            } else if (ua_victims >= 2 && key / n_expert < il) {
+            } else if (ua_victims >= 4 && key / n_expert != il) {
+                cls = 1; // r19 LLAMA_MOE_UPLOAD_AHEAD_VICTIMS=4: every other layer in one class, the policy's order alone (as a real miss)
+            } else if (ua_victims >= 2 && ua_victims <= 3 && key / n_expert < il) {
                 cls = 1;
-            } else if (ua_victims >= 3 && key / n_expert > j + 1) {
+            } else if (ua_victims == 3 && key / n_expert > j + 1) {
                 cls = 2;
             } else {
                 continue;
@@ -5631,6 +5645,16 @@ struct llama_moe_cache::impl {
         }
         std::vector<int32_t> buf(3*(size_t) g.n_slots, 0);
         std::copy(g.lru.key_of.begin(), g.lru.key_of.end(), buf.begin());
+        // k15-pred r20 (LLAMA_MOE_UPLOAD_AHEAD_DEC_REF=1): the slots the last decode used, if they still hold that expert, start with the
+        // reference bit set, so the decode after a prompt does not evict its own working set first (the hand starts at slot 0 with every bit
+        // clear; after a prompt with uploads ahead the decode missed 1400 times per 32 tokens vs 850 off, 90 and fewer with this and KEEP_DECODE)
+        if (ua_dec_ref && ua_mode > 0 && !g.ua_dec_key.empty()) {
+            for (int32_t s = 0; s < g.n_slots; ++s) {
+                if (g.lru.key_of[s] >= 0 && g.ua_dec_key[s] == g.lru.key_of[s]) {
+                    buf[g.n_slots + s] = 1;
+                }
+            }
+        }
         ggml_backend_tensor_set(g.state, buf.data(), n_hdr*sizeof(int32_t), buf.size()*sizeof(int32_t));
         if (g.scores != nullptr) {
             ggml_backend_tensor_set(g.scores, g.lru.scores.data(), 0, g.lru.scores.size()*sizeof(int32_t));
@@ -5690,6 +5714,14 @@ struct llama_moe_cache::impl {
             ggml_backend_tensor_get(g.state, &w, 7*sizeof(int32_t), sizeof(int32_t));
         }
         g.lru.load(g.layers, buf.data(), buf.data() + g.n_slots, g.scores != nullptr ? sc.data() : nullptr, w);
+        if (ua_mode > 0 && (ua_keep_dec || ua_dec_ref)) {
+            g.ua_dec_key.assign(g.n_slots, -1);
+            for (int32_t s = 0; s < g.n_slots; ++s) {
+                if (buf[s] >= 0 && buf[g.n_slots + s] != 0) {
+                    g.ua_dec_key[s] = buf[s];
+                }
+            }
+        }
 
         g.dev_gen   = g.lru.gen;
         g.dev_newer = false;
