@@ -8609,6 +8609,9 @@ size_t llama_context::cap_reserve_bytes(ggml_backend_buffer_type_t * buft_out) c
 // when >= 0 (--fit lowers it where the snapshots would cost device layers; 0 = no capture), else cap_max
 int llama_context::cap_count() const {
     static const int env_n = getenv("LLAMA_STATE_CAPTURE_MAX") ? std::max(1, std::min(cap_max, atoi(getenv("LLAMA_STATE_CAPTURE_MAX")))) : -1;
+    if (cparams.n_state_capture == 0) {
+        return 0;   // --fit dropped the capture (no room for its snapshots): also under LLAMA_STATE_CAPTURE_MAX
+    }
     if (env_n > 0) {
         return env_n;
     }

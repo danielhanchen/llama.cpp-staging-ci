@@ -2541,7 +2541,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             std::vector<uint8_t> exps;
             const int64_t n_layer = common_model_n_layer(params.model.path, exps);
             const auto layers = [&]() { return mparams.n_gpu_layers < 0 ? n_layer + 1 : (int64_t) mparams.n_gpu_layers; };
-            if (shrink > 0 && cparams_in.n_state_capture < 0 && cparams_in.spec_draft && !draft_off && n_layer > 0 &&
+            const bool counted = getenv("LLAMA_FIT_CAPTURE") != nullptr && atoi(getenv("LLAMA_FIT_CAPTURE")) != 0;   // llama_context::cap_planned_bytes
+            if (counted && shrink > 0 && cparams_in.n_state_capture < 0 && cparams_in.spec_draft && !draft_off && n_layer > 0 &&
                     getenv("LLAMA_STATE_CAPTURE_MAX") == nullptr && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && layers() < n_layer + 1) {
                 const int64_t l_full = layers();
                 int64_t best_l = l_full;
@@ -2566,6 +2567,19 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                     "in device memory; LLAMA_FIT_CAPTURE_SHRINK=0 keeps them)\n", __func__, n_layer + 1 - l_full,
                     best_n < 0 ? "kept, fewer snapshots do not keep more layers" : best_n == 0 ? "no capture" : "one snapshot",
                     layers(), n_layer + 1);
+            }
+            // k15-pp5: with the snapshots not counted (LLAMA_FIT_CAPTURE unset, the default) they are allocated at the first capture from
+            // what the fit left free. On a small-margin placement (common_fit_small_device: the margin dropped below the default beside a
+            // cache of at most 256 MiB) or one that did not keep every layer in device memory there is no room for them: G4 q3m 4 GB + MTP,
+            // ctx 16384 ran out of device memory at the first prompt save in 2 of 2 launches (k15g4c8), with LLAMA_STATE_CAPTURE_MAX=1 too.
+            // The capture is dropped there as above (the server checkpoints as with LLAMA_LM_CKPT_CAPTURE=0; md5 = k14); the placement
+            // is the fit's, unchanged. LLAMA_FIT_CAPTURE_GUARD=0 keeps the capture
+            static const bool guard      = getenv("LLAMA_FIT_CAPTURE_GUARD") == nullptr || atoi(getenv("LLAMA_FIT_CAPTURE_GUARD")) != 0;
+            if (!counted && guard && cparams_in.n_state_capture < 0 && cparams.n_state_capture < 0 && cparams_in.spec_draft && !draft_off &&
+                    n_layer > 0 && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && (common_fit_small_device() || layers() < n_layer + 1)) {
+                cparams.n_state_capture = 0;
+                COM_INF("%s: --fit: %s: no state capture (its snapshots are not counted and would not fit; LLAMA_FIT_CAPTURE_GUARD=0 keeps it)\n",
+                    __func__, common_fit_small_device() ? "small device" : "layers in system memory");
             }
         }
         // k15-small4 (after the k15-c capture shrink, from the same inputs): an MTP drafter (the target's own NextN layers, no -md) that costs whole layers on a small device is dropped, as a

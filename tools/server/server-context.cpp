@@ -4580,7 +4580,9 @@ private:
                                     // (only when the rest up to the near checkpoint fits this batch: else the batches, so the ubatches, would differ)
                                     // k15-pp (LLAMA_LM_CKPT_MERGE_SPAN=0 off): only where the group spans the break; elsewhere the separate
                                     // calls seed the cache between them and the merge only lost that (q4x 12 GB 640-token prompt: +14% uploads)
-                                    static const bool lm_span_env = getenv("LLAMA_LM_CKPT_MERGE_SPAN") == nullptr || atoi(getenv("LLAMA_LM_CKPT_MERGE_SPAN")) != 0;
+                                    // off by default (LLAMA_LM_CKPT_MERGE_SPAN=1 on): G4 gemma-4 26B-A4B UD-Q3_K_M 8 GB chat TTFT 0.151 -> 0.185 s with
+                                    // it, for +3% / -2% q4x 12 GB chat / 2k decode and no q4x TTFT gain (plans/k15_rebench.md section 5d)
+                                    static const bool lm_span_env = getenv("LLAMA_LM_CKPT_MERGE_SPAN") != nullptr && atoi(getenv("LLAMA_LM_CKPT_MERGE_SPAN")) != 0;
                                     if (k == 0 && offset != 4 && batch.size() + (n_last - 4) <= n_batch && lm_ckpt_merge_ok(slot, n_tokens_prev, lm) &&
                                             (!lm_span_env || llama_layer_major_spans(ctx_tgt, (int32_t) batch.size(), n_last - 4))) {
                                         lm_breaks.push_back(batch.size());
