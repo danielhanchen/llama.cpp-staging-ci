@@ -1110,6 +1110,12 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
         case GGML_TYPE_BF16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                // k15-mm2: GGML_CUDA_MMVF_BF16_MAX_N=N (opt-in, 0 = off): small BF16 weights at up to N columns take the vector kernel
+                // (f32 activations and sums) instead of MMF (BF16 activations): more precise, not bit-identical (KLD-gated)
+                static const int bf16_max_n = getenv("GGML_CUDA_MMVF_BF16_MAX_N") ? atoi(getenv("GGML_CUDA_MMVF_BF16_MAX_N")) : 0;
+                if (src0_small && ne11 <= std::min(bf16_max_n, MMVF_MAX_BATCH_SIZE)) {
+                    return true;
+                }
                 // MMF needs full row tiles, for other row counts MMVF still beats cuBLAS at small batch size
                 if (src0_small && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
                     return ne11 <= MMVF_MAX_BATCH_SIZE;

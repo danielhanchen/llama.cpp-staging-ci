@@ -13216,6 +13216,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // k15-mm2: MUL_MAT_ID over a sparse bank (the MoE cache read in place: 64 of 2091 / 512 slots routed), with the op param 2 hint that
+    // makes mmq give the empty slots no tile (GGML_CUDA_MMQ_SKIP_EMPTY), and without; 64 to 1024 tokens (the tiling and stream-k paths)
+    for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) {
+        for (int n_mats : { 2091, 512 }) {
+            for (int64_t n : { 64, 333, 1024 }) {
+                for (bool hint : { false, true }) {
+                    test_cases.emplace_back(new test_mul_mat_id_sparse(t, n_mats, 64, 4, 256, n, 512, hint));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat_id_sparse(t, 2091, 7, 2, 96, 40, 256, true));
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -13266,6 +13279,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
         for (auto mk : std::vector<std::array<int64_t, 2>>{ { 4, 10240 }, { 48, 2560 }, { 512, 2560 }, { 1, 2560 } }) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
+        }
+        // k15-mm2: the router and indexer shapes as BF16 (the F32 router weights are exactly BF16-representable; indexer q / k)
+        for (auto mk : std::vector<std::array<int64_t, 2>>{ { 512, 2560 }, { 128, 2560 } }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
         }
     }
 
