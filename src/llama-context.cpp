@@ -4898,7 +4898,11 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             return GGML_STATUS_ALLOC_FAILED; // out of memory: the members not computed yet one by one, unseeded (below)
         }
         lm_n_split++;
-        lm_refused_min = std::min(lm_refused_min, b - a);
+        // k16: a refusal measured while the cache banks were released (lm_released: the compute buffers were freed back first) does not
+        // turn layer-major off for the process: it keeps lm_refused_min at LLAMA_MOE_LAYER_MAJOR_RELEASED_MIN (4) ubatches or more, so a
+        // later prompt still tries groups of 3 (k15-pp: one growth measured from a shrunk buffer must not cost every later prompt)
+        static const size_t lm_rel_min = getenv("LLAMA_MOE_LAYER_MAJOR_RELEASED_MIN") ? (size_t) std::max(0, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_RELEASED_MIN"))) : 4;
+        lm_refused_min = std::min(lm_refused_min, (lm_regrow && lm_released) ? std::max(lm_rel_min, b - a) : b - a);
         if (lm_verbose) {
             size_t free_min = SIZE_MAX;
             for (auto & bk : backend_ptrs) {
