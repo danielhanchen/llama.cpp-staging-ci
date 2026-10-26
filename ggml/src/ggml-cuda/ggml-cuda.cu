@@ -4661,10 +4661,7 @@ static int ggml_cuda_try_fuse_hc_post_norm(ggml_backend_cuda_context * cuda_ctx,
         return 0;
     }
     {
-        // integration head: opt-in (GGML_CUDA_HC_POST_NORM=1). With PDL on, Flash-Next (qwen4exp) f0 pinned gave a different 2k / rep text
-        // in about 1 of 5 launches (local B200, k15-mm2 tip 724ab3d5369); with this fusion off (14 / 14) or GGML_CUDA_PDL=0 (9 / 9) every
-        // launch repeats. The race is not found yet
-        static const bool off = [] { const char * e = getenv("GGML_CUDA_HC_POST_NORM"); return e == nullptr || atoi(e) == 0; }();
+        static const bool off = [] { const char * e = getenv("GGML_CUDA_HC_POST_NORM"); return e != nullptr && atoi(e) == 0; }();
         int irn = ip + 1;
         while (irn < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[irn])) {
             irn++;
