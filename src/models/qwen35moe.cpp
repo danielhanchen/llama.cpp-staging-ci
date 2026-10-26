@@ -256,9 +256,12 @@ static bool qwen35moe_proj_adjacent(int64_t n_tokens) {
     return on && n_tokens > 8;
 }
 
-// k15-idlewait (experiment): the MTP head's graph with the adjacent order too (LLAMA_QWEN35_PROJ_ADJACENT_MTP=0: the old order there)
+// k15-idlewait: not in the MTP head's graph. There the adjacent order made the head's prompt graph and its decode-size graphs plan
+// the allocator differently, so every reply re-planned it and the idle work re-reserved the prompt graph before the next request
+// (local q4x: re-plans 2 per launch with it, 1 without, as with LLAMA_QWEN35_PROJ_ADJACENT=0); the head is one layer, it saves one
+// q8_1 copy there. LLAMA_QWEN35_PROJ_ADJACENT_MTP=1: the adjacent order there too
 static bool qwen35moe_proj_adjacent_mtp(int64_t n_tokens) {
-    static const bool on = !getenv("LLAMA_QWEN35_PROJ_ADJACENT_MTP") || atoi(getenv("LLAMA_QWEN35_PROJ_ADJACENT_MTP")) != 0;
+    static const bool on = getenv("LLAMA_QWEN35_PROJ_ADJACENT_MTP") != nullptr && atoi(getenv("LLAMA_QWEN35_PROJ_ADJACENT_MTP")) != 0;
     return on && qwen35moe_proj_adjacent(n_tokens);
 }
 
