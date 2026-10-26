@@ -5874,10 +5874,10 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
 static void ggml_cuda_side_mv_plan(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     // the last node a candidate reads is found by a scan back from it (the first node that is one of its sources: a node appears once
     // in the graph), not from a map of every node kept up to date over the moves (0.4 ms at 4k nodes, rebuilt every graph).
-    // opt-in: GGML_CUDA_SIDE_MV_SCAN=1 (default: the map, as before)
+    // GGML_CUDA_SIDE_MV_SCAN=0: the map, as before
     static const bool scan = [] {
         const char * e = getenv("GGML_CUDA_SIDE_MV_SCAN");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
     std::unordered_map<const ggml_tensor *, int> idx;
     if (!scan) {
