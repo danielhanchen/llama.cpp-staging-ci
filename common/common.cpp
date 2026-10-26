@@ -1452,7 +1452,10 @@ static int64_t common_lm_batch_default(const common_params & params) {
     }
     const bool mtp_heads = !params.speculative.has_dft() && std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
         [](auto t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP; });
-    if (mtp_heads) {
+    // beside built-in MTP heads 16384 is opt-in (LLAMA_MOE_LAYER_MAJOR_BATCH_MTP=1): G4 k15g4q1 q4x 12 GB with it (and the device MTP
+    // handoff) 16k TTFT -13% but decode 8k / 16k -11 / -10%, chat TTFT +20%, RssAnon +95 MiB, device memory +232 MiB
+    static const bool mtp_env = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_MTP") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_MTP")) != 0;
+    if (mtp_heads && mtp_env) {
         static const double rss_mib = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_RSS_MIB") ? atof(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_RSS_MIB")) : 100.0;
         const int64_t n_embd = common_gguf_u32(params.model.path, "embedding_length");
         if (n_embd > 0 && (double) n_embd*4.0*8192.0/1048576.0 <= rss_mib) {
