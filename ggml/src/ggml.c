@@ -3751,6 +3751,29 @@ void ggml_moe_cache_set_scores(
     ggml_set_op_params_i32(op, 14, advance ? 1 : 0);
 }
 
+void ggml_moe_cache_set_tail_skip(
+        struct ggml_tensor  * op,
+        int32_t               rank,
+        bool                  dflt,
+        struct ggml_tensor  * stat) {
+    GGML_ASSERT(op->op == GGML_OP_MOE_CACHE_LOOKUP);
+    const int mode = ggml_get_op_params_i32(op, 10);
+    GGML_ASSERT(mode == 0 || mode == 1);
+    GGML_ASSERT(rank >= 0 && rank < 256);
+    // op param 12 (unused by the lookup and the assign): rank, bit 8 = default
+    ggml_set_op_params_i32(op, 12, rank | (dflt ? 1 << 8 : 0));
+    if (stat != NULL && mode == 0) {
+        // the lookup has no use counters: they go after the banks and the scores
+        GGML_ASSERT(stat->type == GGML_TYPE_I32 && ggml_is_contiguous(stat) && stat->ne[0] >= 6);
+        GGML_ASSERT(stat->ne[0] == op->src[1]->ne[0] && stat->ne[1] == op->src[1]->ne[1] + 1);
+        const int i = 4 + ggml_get_op_params_i32(op, 1);
+        GGML_ASSERT(i < GGML_MAX_SRC && op->src[i] == NULL);
+        op->src[i] = stat;
+    } else if (stat != NULL) {
+        GGML_ASSERT(op->src[3] == stat);
+    }
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {

@@ -1300,7 +1300,8 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps,
                      int   il,
              ggml_tensor ** assign = nullptr,
-                    bool * host   = nullptr) const;
+                    bool * host   = nullptr,
+                    bool   tail_ok = false) const;
 
     //
     // inputs

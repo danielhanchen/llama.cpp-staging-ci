@@ -834,6 +834,11 @@ struct llama_moe_cache::impl {
     bool    cm      = false;
     bool    cm_dbg  = false;  // LLAMA_MOE_CPU_MISS_LOG=1: every rule window
     bool    cm_force = false; // LLAMA_MOE_CPU_MISS=2: on for every batch size, no rule
+    // k16 route tail skip (LLAMA_MOE_ROUTE_TAIL_SKIP, see tail_skip): the rank threshold (0 = off), whether it is the default (the
+    // backend may decline a default, see ggml_moe_cache_set_tail_skip), and the largest window it applies to
+    int32_t tail_rank       = 0;
+    bool    tail_dflt       = false;
+    int64_t tail_max_tokens = 8;
     // k11 LLAMA_MOE_CPU_MISS_PROMPT=N (opt-in, default 0 = off): prompt ubatches of max_batch + 1 .. N tokens always take the host path
     // once calibrated, at the rule's fetch share but at most 1/4 (the host computes at least three quarters of the misses, the experts
     // with the fewest uses), without waiting for a trial on the small batches. G4, LFM2.5-24B-A2B 8 GB, a 38-token prompt: 6.1 GB of uploads
@@ -1389,6 +1394,7 @@ struct llama_moe_cache::impl {
             cache_frac    = host > 0.0 ? std::min(1.0, cached/host) : 1.0;
             host_uncached = std::max(0.0, host - cached);
         }
+        tail_skip_init(model, set);
         // k13-small: the default single-graph host misses need a cache that holds a real share of the experts. With almost every expert
         // on the host (G4 at 4 GB, Qwen3.6 Q3_K_M + MTP, 0.7% cached) the split decodes faster: 155 / 131 tok/s chat / 2k against 129 /
         // 120 with single-graph, same text (LLAMA_MOE_SINGLE=0 vs default at -fitt 256). The 8 GB tiers it was built for cache 17-38%.
@@ -4876,6 +4882,105 @@ struct llama_moe_cache::impl {
         return op;
     }
 
+    // k16: route tail skip, Strata's STRATA_ROUTE_TAIL_SKIP (src/program/generate.cpp, src/core/expert_source.cpp at 4b9e05a2): a missing
+    // expert that every token of a decode / verify window routes at rank >= 7 (of the router's top k, in routing order) is neither copied
+    // nor computed; its contribution is zero and the other experts keep their router weights. On by default (7) where Strata has it on by
+    // default: CUDA (and HIP RDNA4, decided by the backend), unless every expert is on the device (no cache, nothing to skip), 90% or
+    // more of the experts are on the device (resident layers + cache slots, LLAMA_MOE_ROUTE_TAIL_SKIP_MAX_CACHED=<percent>), or the
+    // experts are NVFP4. The graph also leaves it off for windows of several sequences (Strata: off with --batch slots), prompt ubatches
+    // (not every row an output), more than 8 tokens (LLAMA_MOE_ROUTE_TAIL_SKIP_MAX_TOKENS; Strata's verify window) and experts with
+    // biases (the bias would still be added). LLAMA_MOE_ROUTE_TAIL_SKIP=0: off (the exact path); =N: rank N, also where the default is off.
+    // Changes the output (Strata: KL 0.003-0.006, top-1 ~98%, docs/DETAILS.md)
+    void tail_skip_init(const llama_model & model, layer_set set) {
+        const char * env = getenv("LLAMA_MOE_ROUTE_TAIL_SKIP");
+        if (const char * e = getenv("LLAMA_MOE_ROUTE_TAIL_SKIP_MAX_TOKENS")) {
+            tail_max_tokens = std::max<int64_t>(1, std::min<int64_t>(n_small_max, atoll(e)));
+        }
+        tail_rank = 0;
+        tail_dflt = false;
+        if (!device_lookup || groups.empty()) {
+            return;
+        }
+        if (env != nullptr) {
+            tail_rank = std::max(0, std::min(255, atoi(env)));
+            tail_rank = tail_rank < (int32_t) n_expert_used ? tail_rank : 0;
+            if (tail_rank > 0 && !model.hparams.no_alloc) {
+                LLAMA_LOG_INFO("%s: route tail skip: rank %d (LLAMA_MOE_ROUTE_TAIL_SKIP): a missing expert that every token of a decode / "
+                    "verify window of at most %" PRId64 " tokens routes at rank %d or lower is neither fetched nor computed (changes the output)\n",
+                    __func__, tail_rank, tail_max_tokens, tail_rank);
+            }
+            return;
+        }
+        // Strata's share: experts on the device (resident layers and cache slots) over all experts of the cached set
+        double n_all = 0.0;
+        double n_dev = 0.0;
+        for (size_t il = 0; il < model.layers.size(); ++il) {
+            if (!llama_moe_cache_in_set(model, set, il)) {
+                continue;
+            }
+            const auto experts = llama_moe_cache_layer_experts(model.layers[il]);
+            if (experts.empty()) {
+                continue;
+            }
+            n_all += (double) experts[0]->ne[2];
+            if (!std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
+                n_dev += (double) experts[0]->ne[2];
+            }
+        }
+        bool nvfp4 = false;
+        for (const group & g : groups) {
+            n_dev += (double) g.n_slots;
+            for (const ggml_tensor * t : g.ref) {
+                nvfp4 = nvfp4 || t->type == GGML_TYPE_NVFP4;
+            }
+        }
+        const double frac = n_all > 0.0 ? std::min(1.0, n_dev/n_all) : 1.0;
+        const char * e_max = getenv("LLAMA_MOE_ROUTE_TAIL_SKIP_MAX_CACHED");
+        const double max_frac = e_max != nullptr ? atof(e_max)/100.0 : 0.90;
+        const int32_t rank = 7;
+        if (model.hparams.no_alloc) {
+            return;
+        }
+        if (rank >= (int32_t) n_expert_used) {
+            LLAMA_LOG_INFO("%s: route tail skip off: %u routed experts per token (rank %d)\n", __func__, n_expert_used, rank);
+        } else if (nvfp4) {
+            LLAMA_LOG_INFO("%s: route tail skip off by default with NVFP4 experts (LLAMA_MOE_ROUTE_TAIL_SKIP=%d turns it on)\n", __func__, rank);
+        } else if (frac >= max_frac) {
+            LLAMA_LOG_INFO("%s: route tail skip off by default: %.1f%% of the experts are on the device (at least %.0f%%, "
+                "LLAMA_MOE_ROUTE_TAIL_SKIP_MAX_CACHED; LLAMA_MOE_ROUTE_TAIL_SKIP=%d turns it on)\n", __func__, 100.0*frac, 100.0*max_frac, rank);
+        } else {
+            tail_rank = rank;
+            tail_dflt = true;
+            LLAMA_LOG_INFO("%s: route tail skip: rank %d by default (%.1f%% of the experts on the device): a missing expert that every token "
+                "of a decode / verify window of at most %" PRId64 " tokens routes at rank %d or lower is neither fetched nor computed "
+                "(changes the output; LLAMA_MOE_ROUTE_TAIL_SKIP=0 off)\n", __func__, rank, 100.0*frac, tail_max_tokens, rank);
+        }
+    }
+
+    void tail_skip(ggml_tensor * op, int32_t il, int64_t n_tokens) const {
+        if (tail_rank <= 0 || op == nullptr || n_tokens > tail_max_tokens || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+            return;
+        }
+        const group & g = groups[layers[il].ig];
+        // the skips are counted in the use counters' statistics row (the assign reads them anyway, the lookup gets them as a source)
+        // (an assign reads g.counts as src[3], a lookup gets it as an extra source)
+        ggml_tensor * stat = g.counts != nullptr && g.counts->ne[0] >= 6 ? g.counts : nullptr;
+        ggml_moe_cache_set_tail_skip(op, tail_rank, tail_dflt, stat);
+    }
+
+    uint64_t tail_skipped() const {
+        uint64_t n = 0;
+        for (const group & g : groups) {
+            if (g.counts == nullptr || g.counts->data == nullptr || !g.dev_lookup || g.counts->ne[0] < 6) {
+                continue;
+            }
+            uint64_t cnt = 0;
+            ggml_backend_tensor_get(g.counts, &cnt, ((size_t) g.counts->ne[0]*(g.counts->ne[1] - 1) + 4)*sizeof(int32_t), sizeof(cnt));
+            n += cnt;
+        }
+        return n;
+    }
+
     // k13: frozen small batches of the CPU-miss rule (cm_freeze): the host computes every missing expert of a small batch, nothing is
     // fetched and the assign admits nothing, not even to free slots (LLAMA_MOE_CACHE_FETCH=0 keeps its k12 behaviour: it fills free
     // slots, so it is not frozen)
@@ -4932,7 +5037,11 @@ struct llama_moe_cache::impl {
             // the use counters and the residual; the count of experts computed on the host (statistics, stat[0..1]) is kept
             const size_t n_cnt = (size_t) g.counts->ne[0]*(g.counts->ne[1] - 1);
             ggml_backend_tensor_memset(g.counts, 0, 0, n_cnt*sizeof(int32_t));
-            ggml_backend_tensor_memset(g.counts, 0, (n_cnt + 2)*sizeof(int32_t), ((size_t) g.counts->ne[0] - 2)*sizeof(int32_t));
+            // (k16: the count of route tail skips, stat[4..5], is kept too)
+            ggml_backend_tensor_memset(g.counts, 0, (n_cnt + 2)*sizeof(int32_t), 2*sizeof(int32_t));
+            if (g.counts->ne[0] > 6) {
+                ggml_backend_tensor_memset(g.counts, 0, (n_cnt + 6)*sizeof(int32_t), ((size_t) g.counts->ne[0] - 6)*sizeof(int32_t));
+            }
             // the device state is replaced by the empty host state before the next device lookup (see prepare)
             g.dev_newer = false;
             g.dev_gen   = UINT64_MAX;
@@ -8113,6 +8222,10 @@ struct llama_moe_cache::impl {
                 st.bytes  += cnt[1]*g.expert_bytes;
             }
             log("device lookups (ubatch <= 32)", st);
+            if (tail_rank > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: route tail skip (rank %d%s): %llu missing experts skipped in windows of at most %" PRId64 " tokens\n",
+                    tag, tail_rank, tail_dflt ? ", default" : "", (unsigned long long) tail_skipped(), tail_max_tokens);
+            }
             if (cm && cm_cal) {
                 uint64_t c[3];
                 cm_counters(c);
@@ -8324,6 +8437,10 @@ bool llama_moe_cache::host_never() const {
 
 bool llama_moe_cache::host_split_frozen() const {
     return pimpl->split_frozen();
+}
+
+void llama_moe_cache::tail_skip(ggml_tensor * op, int32_t il, int64_t n_tokens) const {
+    pimpl->tail_skip(op, il, n_tokens);
 }
 
 bool llama_moe_cache::freeze_small() {

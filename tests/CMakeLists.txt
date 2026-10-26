@@ -316,6 +316,7 @@ llama_build_and_test(test-spec-type-gguf.cpp)
 if (NOT WIN32 AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-weight-store.cpp)
     llama_build_and_test(test-moe-host-cache.cpp)
+    llama_build_and_test(test-moe-cache-tail-skip.cpp)
 endif()
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately
