@@ -4730,6 +4730,27 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     // leave the prefetch headroom free: a larger graph is split in two (and again), else its allocation would drop the prefetch for good
     // (gpt-oss-20b MXFP4, G4 8 GB tier: 16 ubatches of 512 grew the compute buffer 455 -> 1164 MiB)
     static const size_t lm_grow_max = (size_t) (getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB"))) : 1024) << 20;
+    // k16: after a group whose cache banks were released (lm_released) the compute buffers are freed back to what the next graph needs
+    // (ggml_backend_sched_free_device_buffers), so the next group's growth is measured from that small buffer, not from the one the
+    // previous group ran with: G4, Qwen3.8-Flash-Next UD-IQ4_XS 12 GB, Studio argv (-ub 2048, cache 4.65% of the host experts), the 8k
+    // prompt grew 2520 -> 3285 MiB (765 MiB, ran as one group), the 16k prompt after it the same graph from 1544 MiB (1673 MiB > the cap,
+    // with 4633 MiB free): split down to single ubatches with the banks released, then lm_refused_min = 2 turned layer-major off for every
+    // later prompt (16k 1818 tok/s against 1935 without groups, 4313 at 8k). With the banks released the cap also allows the growth back
+    // up to the largest buffer a merged graph ran with (still within the free memory less the prefetch headroom, checked by the
+    // scheduler). LLAMA_MOE_LAYER_MAJOR_REGROW=0 off
+    static const bool lm_regrow = getenv("LLAMA_MOE_LAYER_MAJOR_REGROW") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_REGROW")) != 0;
+    auto grow_limit = [&]() -> size_t {
+        size_t back = 0;
+        if (lm_regrow && lm_released) {
+            for (size_t i = 0; i < backend_ptrs.size() && i < lm_merged_peak.size(); ++i) {
+                const size_t cur = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+                if (lm_merged_peak[i] > cur) {
+                    back = std::max(back, lm_merged_peak[i] - cur);
+                }
+            }
+        }
+        return lm_grow_max + back;
+    };
     int n_sub = 0;
     size_t n_done = 0; // the members computed (in order): a fallback must not compute them again (recurrent states would advance twice)
     bool first_run = true;
@@ -4770,7 +4791,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             srcs.emplace_back(node, arr);
         }
         lm_merged_active = true;
-        ggml_backend_sched_set_alloc_limit(sched.get(), true, lm_grow_max);
+        ggml_backend_sched_set_alloc_limit(sched.get(), true, grow_limit());
         // k11 (LLAMA_MOE_LM_LEND=0 off): a merged graph whose compute buffers would grow past the free memory borrows its allocation from the
         // MoE cache (slots lent for the group and refilled after it, as its staging copies are) instead of being split; the merged graph
         // runs the same ubatches, only where its tensors live changes
@@ -4811,7 +4832,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             }
             ggml_backend_sched_reset(sched.get());
             ggml_backend_sched_use_full_hash(sched.get());
-            ggml_backend_sched_set_alloc_limit(sched.get(), true, lm_grow_max);
+            ggml_backend_sched_set_alloc_limit(sched.get(), true, grow_limit());
             st = run(g);
         }
         if (st == GGML_STATUS_ALLOC_FAILED && lend_ok && !lend_g && ggml_backend_sched_get_alloc_over(sched.get()) > 0) {
@@ -4822,7 +4843,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             }
             ggml_backend_sched_reset(sched.get());
             ggml_backend_sched_use_full_hash(sched.get());
-            ggml_backend_sched_set_alloc_limit(sched.get(), true, lm_grow_max);
+            ggml_backend_sched_set_alloc_limit(sched.get(), true, grow_limit());
             lend_g = true;
             moe_cache->set_graph_lend(true);
             ggml_backend_sched_set_alloc_lend_graph(sched.get(), true);
@@ -4839,7 +4860,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 }
                 ggml_backend_sched_reset(sched.get());
                 ggml_backend_sched_use_full_hash(sched.get());
-                ggml_backend_sched_set_alloc_limit(sched.get(), true, lm_grow_max);
+                ggml_backend_sched_set_alloc_limit(sched.get(), true, grow_limit());
                 st = run(g);
             }
         }
@@ -4848,6 +4869,10 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         if (st != GGML_STATUS_ALLOC_FAILED) {
             n_sub++;
             if (st == GGML_STATUS_SUCCESS) {
+                lm_merged_peak.resize(backend_ptrs.size(), 0);
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    lm_merged_peak[i] = std::max(lm_merged_peak[i], ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]));
+                }
                 n_done = b;
                 extract_upto(n_done);
                 if (cap_in_graph && cap_k >= 0) {
