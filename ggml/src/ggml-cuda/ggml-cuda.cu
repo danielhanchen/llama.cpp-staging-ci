@@ -2796,6 +2796,47 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
+// k15-fn: the host -> device uploads of n tensors (offset 0, whole size given) as one cudaMemcpyBatchAsync on the backend's stream, in
+// stream order like n cudaMemcpyAsync (the scheduler's graph inputs of a split: 21 per Flash-Next verify graph, issued back to back with
+// the GPU idle between them). Returns false (nothing queued) where the batch API is missing or refuses them: the caller copies one by one
+static bool ggml_backend_cuda_set_tensors_batch_async(ggml_backend_t backend, ggml_tensor * const * tensors, const void * const * data,
+        const size_t * sizes, int n) {
+#if CUDART_VERSION >= 12080 && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (n <= 0) {
+        return true;
+    }
+    std::vector<void *> dsts(n);
+    std::vector<const void *> srcs(n);
+    std::vector<size_t> sz(n);
+    for (int i = 0; i < n; ++i) {
+        ggml_backend_buffer_t buf = tensors[i]->view_src ? tensors[i]->view_src->buffer : tensors[i]->buffer;
+        if (buf == nullptr || buf->buft != ggml_backend_cuda_buffer_type(cuda_ctx->device)) {
+            return false;
+        }
+        dsts[i] = tensors[i]->data;
+        srcs[i] = data[i];
+        sz[i]   = sizes[i];
+    }
+    cudaMemcpyAttributes attr = {};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    attr.srcLocHint.type = cudaMemLocationTypeHost;
+    attr.dstLocHint.type = cudaMemLocationTypeDevice;
+    attr.dstLocHint.id   = cuda_ctx->device;
+    attr.flags = cudaMemcpyFlagPreferOverlapWithCompute;
+    size_t attr_idx = 0;
+    const cudaError_t err = cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sz.data(), (size_t) n, &attr, &attr_idx, 1, cuda_ctx->stream());
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
+#else
+    GGML_UNUSED(backend); GGML_UNUSED(tensors); GGML_UNUSED(data); GGML_UNUSED(sizes); GGML_UNUSED(n);
+    return false;
+#endif
+}
+
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
@@ -6328,8 +6369,20 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+// k15-fn debug (GGML_CUDA_HOST_TIMING=N): host time of the graph_compute phases, a summary every N calls with at least 64 nodes
+struct ggml_cuda_host_timing {
+    int every = 0;
+    int64_t n = 0, t_check = 0, t_eval = 0, n_graph = 0, n_nodes = 0;
+    ggml_cuda_host_timing() { const char * e = getenv("GGML_CUDA_HOST_TIMING"); every = e ? atoi(e) : 0; }
+};
+static ggml_cuda_host_timing & ggml_cuda_host_timing_get() { static ggml_cuda_host_timing t; return t; }
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_host_timing & ht = ggml_cuda_host_timing_get();
+    const bool ht_on = ht.every > 0 && cgraph->n_nodes >= 64;
+    const int64_t ht0 = ht_on ? ggml_time_us() : 0;
+    int64_t ht1 = ht0;
 
     ggml_cuda_set_device(cuda_ctx->device);
     cuda_ctx->computes = true;
@@ -6387,7 +6440,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    if (ht_on) {
+        ht1 = ggml_time_us();
+    }
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    if (ht_on) {
+        const int64_t ht2 = ggml_time_us();
+        ht.n++; ht.t_check += ht1 - ht0; ht.t_eval += ht2 - ht1; ht.n_graph += use_cuda_graph; ht.n_nodes += cgraph->n_nodes;
+        if (ht.n % ht.every == 0) {
+            GGML_LOG_INFO("%s: host timing over the last %lld calls: check %.1f us, evaluate/launch %.1f us per call, %.0f%% CUDA graphs, %.0f nodes\n",
+                __func__, (long long) ht.n, (double) ht.t_check / ht.n, (double) ht.t_eval / ht.n, 100.0 * ht.n_graph / ht.n, (double) ht.n_nodes / ht.n);
+            ht.n = ht.t_check = ht.t_eval = ht.n_graph = ht.n_nodes = 0;
+        }
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -8259,6 +8324,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_host_map_range") == 0) {
         return (void *)ggml_backend_cuda_host_map_range;
+    }
+    if (strcmp(name, "ggml_backend_set_tensors_batch_async") == 0) {
+        return (void *)ggml_backend_cuda_set_tensors_batch_async;
     }
     if (strcmp(name, "ggml_backend_host_mapped_bytes") == 0) {
         return (void *)ggml_backend_cuda_host_mapped_bytes;

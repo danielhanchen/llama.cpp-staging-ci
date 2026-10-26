@@ -1061,6 +1061,16 @@ struct ggml_backend_sched_overlap {
     bool upload_pending;         // `upload` has not been waited on yet
 };
 
+// k15-fn: a backend's batched host -> device upload (ggml_backend_set_tensors_batch_async proc of its registry), see ggml_backend_sched_upload_flush
+typedef bool (*ggml_backend_set_tensors_batch_async_t)(ggml_backend_t backend, ggml_tensor * const * tensors, const void * const * data, const size_t * sizes, int n);
+
+struct ggml_backend_sched_upload_batch {
+    ggml_backend_t backend = NULL;
+    std::vector<ggml_tensor *> tensors;
+    std::vector<const void *>  data;
+    std::vector<size_t>        sizes;
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -1126,6 +1136,7 @@ struct ggml_backend_sched {
     bool   alloc_limit_on;
     size_t alloc_limit;
     bool   alloc_lend_graph; // k11: growth past the free memory may be lent (ggml_backend_sched_set_alloc_lend_graph)
+    ggml_backend_sched_upload_batch * upload_batch; // k15-fn: the graph-input uploads of the split being prepared (GGML_SCHED_UPLOAD_BATCH)
     size_t alloc_over; // growth the last refused allocation needed, 0 if it was not refused
     int  pre_split; // split whose first pre_nodes nodes were launched before the CPU split preceding it, -1 if none
     int  pre_nodes;
@@ -4156,6 +4167,59 @@ static void ggml_backend_sched_hsm_wait(ggml_backend_sched_t sched) {
 // the caller synchronizes the split backend once after all of them, so the host data can be overwritten when compute_splits moves on
 // with the CPU/GPU overlap, an upload from host compute memory (written only by later host splits) neither waits for the backend
 // nor is waited for here: `relaxed` is set and the caller records an event that host work waits for before it overwrites the memory
+// k15-fn (GGML_SCHED_UPLOAD_BATCH=0 off): the async graph-input uploads of a split are queued and issued together by
+// ggml_backend_sched_upload_flush (one cudaMemcpyBatchAsync): issued one by one, the device idled between the small copies
+// (Flash-Next verify: 21 uploads, 0.63 ms of idle per step on a B200)
+static ggml_backend_set_tensors_batch_async_t ggml_backend_sched_batch_fn(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : NULL;
+    static thread_local ggml_backend_reg_t last_reg = NULL;
+    static thread_local ggml_backend_set_tensors_batch_async_t last_fn = NULL;
+    if (reg != last_reg) {
+        last_reg = reg;
+        last_fn  = reg ? (ggml_backend_set_tensors_batch_async_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_tensors_batch_async") : NULL;
+    }
+    return last_fn;
+}
+
+static bool ggml_backend_sched_upload_queue(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_tensor * dst, const void * data, size_t size) {
+    static const bool enabled = getenv("GGML_SCHED_UPLOAD_BATCH") == NULL || atoi(getenv("GGML_SCHED_UPLOAD_BATCH")) != 0;
+    if (!enabled || size == 0 || ggml_backend_sched_batch_fn(backend) == NULL) {
+        return false;
+    }
+    if (sched->upload_batch == NULL) {
+        sched->upload_batch = new ggml_backend_sched_upload_batch();
+    }
+    ggml_backend_sched_upload_batch * ub = sched->upload_batch;
+    if (ub->backend != NULL && ub->backend != backend) {
+        return false; // one backend per batch (a split has one)
+    }
+    ub->backend = backend;
+    ub->tensors.push_back(dst);
+    ub->data.push_back(data);
+    ub->sizes.push_back(size);
+    return true;
+}
+
+// issues the queued uploads (in queue order) before anything that must follow them on the stream
+static void ggml_backend_sched_upload_flush(ggml_backend_sched_t sched) {
+    ggml_backend_sched_upload_batch * ub = sched->upload_batch;
+    if (ub == NULL || ub->tensors.empty()) {
+        return;
+    }
+    const int n = (int) ub->tensors.size();
+    ggml_backend_set_tensors_batch_async_t fn = ggml_backend_sched_batch_fn(ub->backend);
+    if (n == 1 || fn == NULL || !fn(ub->backend, ub->tensors.data(), ub->data.data(), ub->sizes.data(), n)) {
+        for (int i = 0; i < n; ++i) {
+            ggml_backend_tensor_set_async(ub->backend, ub->tensors[i], ub->data[i], 0, ub->sizes[i]);
+        }
+    }
+    ub->backend = NULL;
+    ub->tensors.clear();
+    ub->data.clear();
+    ub->sizes.clear();
+}
+
 static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, bool & synced, bool & relaxed) {
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
@@ -4229,7 +4293,9 @@ static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, st
         // produced by an earlier split
         ggml_backend_synchronize(ggml_backend_sched_get_tensor_backend(sched, input));
     }
-    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+    if (!ggml_backend_sched_upload_queue(sched, split_backend, input_cpy, input->data, ggml_nbytes(input))) {
+        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+    }
     relaxed = ov;
     return true;
 }
@@ -4488,9 +4554,11 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                     upload_pending |= !relaxed;
                     continue;
                 }
+                ggml_backend_sched_upload_flush(sched); // a copy below may synchronize the stream: the queued uploads go first
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
         }
+        ggml_backend_sched_upload_flush(sched);
         if (upload_pending && sched->hsm_active && ggml_backend_sched_hsm_backend_ok(split_backend)) {
             // k15 hsm: the host data the upload reads is next written by a later host split, which syncs this backend first, or by the
             // caller after this graph, which waits for the event below
@@ -4782,6 +4850,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+    if (sched != NULL) {
+        delete sched->upload_batch;
+        sched->upload_batch = NULL;
+    }
     if (sched == NULL) {
         return;
     }
