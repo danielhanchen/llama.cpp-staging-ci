@@ -602,7 +602,7 @@ llama_context::llama_context(
 
         memory.reset(model.create_memory(params_mem, cparams));
         if (memory) {
-            memory->wait_state_reads = [this]() { state_async_wait(); };
+            memory->wait_state_reads = [this]() { state_async_wait_reads(); };
         }
     }
 
@@ -7763,6 +7763,25 @@ void llama_context::state_async_wait() {
     }
 }
 
+// k15-idlewait: what a sequence change (llama_memory_seq_rm / seq_cp / clear) has to wait for is the read of the device rows, so the
+// change cannot reach them first; the host copy from the pinned staging into the save's destination (the prompt-cache entry: 77 MiB
+// for a 640-token Qwen3.6 chat, about 15 ms of the next request's G4 TTFT when it was waited for here) goes on on the worker. The
+// destination is still waited for in full where it is read or freed (state_async_wait: the next save, llama_state_seq_async_wait,
+// synchronize, the end of decode)
+void llama_context::state_async_wait_reads() {
+    static const bool split = getenv("LLAMA_STATE_ASYNC_SPLIT_WAIT") == nullptr || atoi(getenv("LLAMA_STATE_ASYNC_SPLIT_WAIT")) != 0;
+    if (!split) {
+        state_async_wait();
+        return;
+    }
+    if (!state_async_worker.joinable() || state_async_reads_done.load(std::memory_order_acquire)) {
+        return;
+    }
+    for (auto * ev : state_async_evs) {
+        ggml_backend_event_synchronize(ev);
+    }
+}
+
 static bool state_async_disabled() {
     static const bool disabled = [] {
         const char * e = getenv("LLAMA_STATE_ASYNC");
@@ -8059,10 +8078,13 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
 
     sync_pending = true;
 
-    state_async_worker = std::thread([jobs = std::move(jobs), events = std::move(events), retired = std::move(retired)]() mutable {
+    state_async_evs = events;
+    state_async_reads_done.store(false, std::memory_order_release);
+    state_async_worker = std::thread([jobs = std::move(jobs), events = std::move(events), retired = std::move(retired), done = &state_async_reads_done]() mutable {
         for (auto * ev : events) {
             ggml_backend_event_synchronize(ev);
         }
+        done->store(true, std::memory_order_release);
         for (const auto & j : jobs) {
             memcpy(j.dst, j.src, j.size);
         }

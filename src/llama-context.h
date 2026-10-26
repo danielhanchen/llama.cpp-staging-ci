@@ -21,6 +21,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <thread>
+#include <atomic>
 #include <vector>
 
 struct llama_model;
@@ -248,6 +249,9 @@ struct llama_context {
 
     // wait until the last asynchronous state save has reached its destination
     void state_async_wait();
+    // k15-idlewait: wait only until the device rows of the asynchronous save in flight are read (its D2H copies into the pinned
+    // staging done), not for the worker's host copy into the destination (LLAMA_STATE_ASYNC_SPLIT_WAIT=0: the whole save)
+    void state_async_wait_reads();
 
     // set when backend work is queued (graph_compute, async state copies), cleared by synchronize()
     bool sync_pending = true;
@@ -859,6 +863,8 @@ private:
 
     // waits for the events, then copies staging -> destination; joined by state_async_wait()
     std::thread state_async_worker;
+    std::vector<ggml_backend_event_t> state_async_evs;        // k15-idlewait: the read events of the save in flight
+    std::atomic<bool>                 state_async_reads_done { true };
 
     bool has_evaluated_once = false;
 
