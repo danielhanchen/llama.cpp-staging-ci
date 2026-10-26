@@ -5750,6 +5750,48 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// k15-lfm2: MUL_MAT_ID over a bank of n_mats slots of which only n_active are routed (in-place prompts read the MoE cache bank:
+// ne02 = the slots of the cache, the ids the slots of the layer's experts)
+struct test_mul_mat_id_sparse : public test_mul_mat_id {
+    const int n_active;
+    const bool hint; // op param 2 = n_active (as the graph sets it for an in-place prompt product)
+    test_mul_mat_id_sparse(ggml_type type_a, int n_mats, int n_active, int n_used, int64_t m, int64_t n, int64_t k, bool hint = false)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, false, m, n, k), n_active(n_active), hint(hint) {}
+    std::string vars() override { return test_mul_mat_id::vars() + ",active=" + std::to_string(n_active) + ",hint=" + std::to_string(hint); }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
+        if (hint) {
+            ((int32_t *) out->op_params)[2] = n_active;
+        }
+        return out;
+    }
+    void fill_ids(ggml_context * ctx) {
+        std::default_random_engine rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+                continue;
+            }
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<int32_t> act(n_active);
+                for (int i = 0; i < n_active; i++) {
+                    act[i] = (int32_t) ((int64_t) i * n_mats / n_active);
+                }
+                std::shuffle(act.begin(), act.end(), rng);
+                std::vector<int32_t> data(t->ne[0], 0);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    data[i] = act[i % n_active];
+                }
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+        }
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat_id::initialize_tensors(ctx);
+        fill_ids(ctx);
+    }
+    void reinit_perf_iter(ggml_context * ctx) override { fill_ids(ctx); }
+};
+
 // MUL_MAT_ID with expert ids repeated within a token's row
 struct test_mul_mat_id_dup : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
@@ -13101,6 +13143,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // k15-mm2: MUL_MAT_ID over a sparse bank (the MoE cache read in place: 64 of 2091 / 512 slots routed), with the op param 2 hint that
+    // makes mmq give the empty slots no tile (GGML_CUDA_MMQ_SKIP_EMPTY), and without; 64 to 1024 tokens (the tiling and stream-k paths)
+    for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) {
+        for (int n_mats : { 2091, 512 }) {
+            for (int64_t n : { 64, 333, 1024 }) {
+                for (bool hint : { false, true }) {
+                    test_cases.emplace_back(new test_mul_mat_id_sparse(t, n_mats, 64, 4, 256, n, 512, hint));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat_id_sparse(t, 2091, 7, 2, 96, 40, 256, true));
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -13110,6 +13165,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // k15-lfm2: LFM2.5 prompt expert products (2048 tokens, 4 of 64 experts) over the experts alone and over a 2091-slot cache bank
+    for (auto tmk : std::vector<std::tuple<ggml_type, int64_t, int64_t>>{ { GGML_TYPE_Q4_K, 1536, 2048 }, { GGML_TYPE_Q5_K, 2048, 1536 } }) {
+        const auto [t, m, k] = tmk;
+        test_cases.emplace_back(new test_mul_mat_id_sparse(t, 64, 64, 4, m, 2048, k));
+        test_cases.emplace_back(new test_mul_mat_id_sparse(t, 2091, 64, 4, m, 2048, k));
+        test_cases.emplace_back(new test_mul_mat_id_sparse(t, 2091, 64, 4, m, 2048, k, true));
+        test_cases.emplace_back(new test_mul_mat_id_sparse(t, 512, 64, 4, m, 2048, k));
+    }
 
     // k15-mm: Flash-Next (qwen4exp) decode projections at 1 and 3 columns (an MTP verify window): hyper-connection down / up / inject,
     // gated delta net qkv / gate / out, attention q, shared expert, router and the linear-attention alpha / beta
