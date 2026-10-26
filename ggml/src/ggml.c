@@ -3462,7 +3462,8 @@ struct ggml_tensor * ggml_moe_cache_lookup(
         int                   n_banks,
         int                   il) {
     GGML_ASSERT(ids->type == GGML_TYPE_I32 && map->type == GGML_TYPE_I32 && state->type == GGML_TYPE_I32);
-    GGML_ASSERT(ggml_is_contiguous(ids) && ids->ne[2] == 1 && ids->ne[3] == 1);
+    // k15-fn: the rows of ids may be strided (a view of the argsort, e.g. ggml_argsort_top_k), the elements of a row contiguous
+    GGML_ASSERT(ids->nb[0] == sizeof(int32_t) && ids->nb[1] >= ids->ne[0]*sizeof(int32_t) && ids->ne[2] == 1 && ids->ne[3] == 1);
     GGML_ASSERT(ggml_is_contiguous(map) && ggml_is_contiguous(state));
     GGML_ASSERT(il >= 0 && il < map->ne[1]);
     GGML_ASSERT(n_banks > 0 && n_banks <= 4 && 3 + n_banks <= GGML_MAX_SRC);
@@ -3508,7 +3509,8 @@ struct ggml_tensor * ggml_moe_cache_assign(
         float                 fetch,
         int                   il) {
     GGML_ASSERT(ids->type == GGML_TYPE_I32 && map->type == GGML_TYPE_I32 && state->type == GGML_TYPE_I32 && counts->type == GGML_TYPE_I32);
-    GGML_ASSERT(ggml_is_contiguous(ids) && ids->ne[2] == 1 && ids->ne[3] == 1);
+    // k15-fn: the rows of ids may be strided (a view of the argsort, e.g. ggml_argsort_top_k), the elements of a row contiguous
+    GGML_ASSERT(ids->nb[0] == sizeof(int32_t) && ids->nb[1] >= ids->ne[0]*sizeof(int32_t) && ids->ne[2] == 1 && ids->ne[3] == 1);
     GGML_ASSERT(ggml_is_contiguous(map) && ggml_is_contiguous(state) && ggml_is_contiguous(counts));
     GGML_ASSERT(il >= 0 && il < map->ne[1]);
     GGML_ASSERT(counts->ne[0] == map->ne[0] && counts->ne[1] == map->ne[1] + 1 && counts->ne[0] >= 4);

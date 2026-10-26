@@ -2951,7 +2951,11 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     // small batches: the slots are looked up on the device, which also copies the missing experts from host memory
     {
         ggml_tensor * ids = selected_experts;
-        if (!ggml_is_contiguous(ids)) {
+        // k15-fn (LLAMA_MOE_LOOKUP_IDS_VIEW=0 off): the lookup reads the router's top-k view (rows strided in the argsort) directly,
+        // one CONT launch less per MoE layer in every decode and verify graph (fn: 47 of ~2400-2700 kernels per graph)
+        static const bool ids_view = getenv("LLAMA_MOE_LOOKUP_IDS_VIEW") == nullptr || atoi(getenv("LLAMA_MOE_LOOKUP_IDS_VIEW")) != 0;
+        const bool rows_ok = ids->nb[0] == ggml_type_size(ids->type) && ids->ne[2] == 1 && ids->ne[3] == 1;
+        if (!ggml_is_contiguous(ids) && !(ids_view && rows_ok)) {
             ids = ggml_cont(ctx0, ids);
         }
         if (ggml_tensor * res = moe_cache->lookup(ctx0, il, ids, n_tokens)) {
