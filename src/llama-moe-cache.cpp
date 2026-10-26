@@ -4911,6 +4911,22 @@ struct llama_moe_cache::impl {
             }
             return;
         }
+        // k15-pp: off by default in the exact modes, where the text must not depend on what the cache holds: batch-invariant verify
+        // (LLAMA_MTP_EXACT=1) or the miss path pinned to uploads (LLAMA_MOE_CPU_MISS=0). G4 fn4 24 GB and local fn1, pinned + strict
+        // exact: with the default rank-7 skip the text followed the cache size, the drafter and the prefetch depth (a verify window
+        // skips only where every token routes the expert at rank >= 7, a decode decides per token); with it off, drafter = no draft
+        // and one md5 at every cache size. LLAMA_MOE_ROUTE_TAIL_SKIP=N still sets it
+        {
+            const char * e_exact = getenv("LLAMA_MTP_EXACT");
+            const char * e_miss  = getenv("LLAMA_MOE_CPU_MISS");
+            const bool exact = (e_exact != nullptr && atoi(e_exact) != 0) || (e_miss != nullptr && atoi(e_miss) == 0);
+            if (exact) {
+                if (!model.hparams.no_alloc) {
+                    LLAMA_LOG_INFO("%s: route tail skip off: exact mode (LLAMA_MTP_EXACT=1 or LLAMA_MOE_CPU_MISS=0; LLAMA_MOE_ROUTE_TAIL_SKIP=N sets it)\n", __func__);
+                }
+                return;
+            }
+        }
         // Strata's share: experts on the device (resident layers and cache slots) over all experts of the cached set
         double n_all = 0.0;
         double n_dev = 0.0;
