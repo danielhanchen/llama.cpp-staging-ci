@@ -471,6 +471,9 @@ extern "C" {
     // returns the growth the graph needed (0 after an allocation that was not refused)
     GGML_API void                 ggml_backend_sched_set_alloc_limit(ggml_backend_sched_t sched, bool enable, size_t max_grow);
     GGML_API size_t               ggml_backend_sched_get_alloc_over(ggml_backend_sched_t sched);
+    // k15-fn: t is a prefetched weight copy of the bound graph in staging memory (the arena or memory the user lent for the copies), which
+    // stays as written until the copy queue reuses its slot; false for a copy the graph allocator placed (its memory is reused by the graph)
+    GGML_API bool                 ggml_backend_sched_tensor_is_staged(ggml_backend_sched_t sched, const struct ggml_tensor * t);
     // k11: with the allocation limit on, a device compute buffer that would grow past the free memory may instead be placed in memory the
     // lender lends (the graph allocation entries of ggml_backend_sched_lend_copy); the graph is refused (as by the limit) only if the
     // lender does not take it

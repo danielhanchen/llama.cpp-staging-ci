@@ -3003,6 +3003,16 @@ static bool ggml_backend_sched_prefetch_ensure(ggml_backend_sched_t sched, int b
     }
 
     pf->arena = ggml_backend_buft_alloc_buffer(sched->bufts[backend_id], pf->staging);
+    // k15-fn GGML_SCHED_PREFETCH_FAIL_AT=N (debug): the Nth staging allocation fails, as cudaMalloc does when the device is full
+    {
+        static const int fail_at = getenv("GGML_SCHED_PREFETCH_FAIL_AT") ? atoi(getenv("GGML_SCHED_PREFETCH_FAIL_AT")) : 0;
+        static int n_ensure = 0;
+        if (fail_at > 0 && ++n_ensure == fail_at && pf->arena != NULL) {
+            GGML_LOG_WARN("%s: GGML_SCHED_PREFETCH_FAIL_AT=%d: staging allocation %d made to fail\n", __func__, fail_at, n_ensure);
+            ggml_backend_buffer_free(pf->arena);
+            pf->arena = NULL;
+        }
+    }
     if (pf->arena == NULL) {
         if (pf->depth > sched->pf_depth0) {
             // a step of the adaptive depth: the next binding uses the starting depth again
@@ -5616,6 +5626,20 @@ void ggml_backend_sched_free_device_buffers(ggml_backend_sched_t sched) {
 size_t ggml_backend_sched_get_alloc_over(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->alloc_over;
+}
+
+bool ggml_backend_sched_tensor_is_staged(ggml_backend_sched_t sched, const struct ggml_tensor * t) {
+    GGML_ASSERT(sched);
+    if (t == NULL || t->buffer == NULL || !sched->pf_active) {
+        return false;
+    }
+    for (int b = 0; b < sched->n_backends; b++) {
+        const struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+        if ((pf->arena != NULL && t->buffer == pf->arena) || ggml_backend_sched_is_lent(pf, t)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void ggml_backend_sched_set_lend_callback(ggml_backend_sched_t sched, ggml_backend_sched_lend_callback callback, void * user_data) {

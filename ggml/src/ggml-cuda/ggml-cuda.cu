@@ -3301,7 +3301,8 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
     // sticky: it is cleared and the graph is instantiated again, as for an update failure. A sticky error (an earlier kernel fault)
     // fails the instantiation below with its own message
     static const bool update_retry = getenv("GGML_CUDA_GRAPH_UPDATE_RETRY") == nullptr || atoi(getenv("GGML_CUDA_GRAPH_UPDATE_RETRY")) != 0;
-    if (stat != cudaSuccess && stat != cudaErrorGraphExecUpdateFailure && update_retry) {
+    const bool update_error = stat != cudaSuccess && stat != cudaErrorGraphExecUpdateFailure && update_retry;
+    if (update_error) {
         static int n_logged = 0;
         if (n_logged++ < 4) {
             GGML_LOG_WARN("%s: CUDA graph update failed with %s (%d): instantiating the graph again\n", __func__, cudaGetErrorString(stat), (int) stat);
@@ -3317,7 +3318,18 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         // The pre-existing graph exec cannot be updated due to violated constraints
         // so instead clear error and re-instantiate
         (void)cudaGetLastError();
-        CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+        if (update_error) {
+            // k16-race: after another error than an update failure (seen after a launch stalled for minutes on a crowded GPU: the
+            // update returned invalid argument and so did this destroy, which aborted) the exec is destroyed at most once and a
+            // failed destroy is not fatal: the handle is dropped and a new exec instantiated (GGML_CUDA_GRAPH_UPDATE_RETRY=0: assert)
+            const cudaError_t de = graph->instance != nullptr ? cudaGraphExecDestroy(graph->instance) : cudaSuccess;
+            if (de != cudaSuccess) {
+                GGML_LOG_WARN("%s: destroying the exec after the failed update gave %s: dropped, instantiating a new one\n", __func__, cudaGetErrorString(de));
+                (void)cudaGetLastError();
+            }
+        } else {
+            CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+        }
         graph->instance = nullptr;
         cudaError_t inst = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
         // k11: out of memory may pass once other processes free some; a few tries before the error is fatal
@@ -5529,6 +5541,8 @@ static bool ggml_cuda_side_mv_run(const ggml_tensor * node);
 // stream runs (single column, ggml_cuda_side_mv_run) and K >= 4096 (the split-K launch) are left alone.
 // GGML_CUDA_DISABLE_MMVF_MULTI=1 turns it off.
 static bool ggml_cuda_mmvf_multi_disabled() {
+    // on again: the text that was not repeatable with it at a spilled tier (Qwen3.6-35B-A3B MTP, B200) came from the fused residual
+    // add + RMS norm writing over its inputs, see the allocation dependencies in ggml_backend_cuda_graph_optimize
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_MMVF_MULTI");
     return disabled;
 }
@@ -7437,6 +7451,96 @@ static void ggml_cuda_side_mv_plan(ggml_backend_cuda_context * cuda_ctx, ggml_cg
     }
 }
 
+// k16-race: see ggml_backend_cuda_graph_optimize. Returns the last node the fused kernel writes (nullptr: no match) and the inputs it reads
+static const ggml_tensor * ggml_cuda_fused_match(const ggml_cgraph * cgraph, int i, std::vector<ggml_tensor *> & inputs) {
+    static const bool all_alias = ggml_cuda_env_flag("GGML_CUDA_FUSED_ALIAS");
+    if (all_alias) {
+        return nullptr;
+    }
+    ggml_tensor * n0 = cgraph->nodes[i];
+    inputs.clear();
+
+    // residual add + RMS norm + mul (+ q8_1), ggml_cuda_try_fuse_add_rms_norm (rms_norm_mul_q8_1_f32 with ra / rb): both add inputs.
+    // Qwen3.6-35B-A3B MTP spilled (B200): the norm output landed on the previous layer's l_out, the text was not repeatable.
+    // GGML_CUDA_ADD_RMS_ALIAS=1
+    static const bool add_rms_alias = ggml_cuda_env_flag("GGML_CUDA_ADD_RMS_ALIAS");
+    if (!add_rms_alias && n0->op == GGML_OP_ADD && n0->type == GGML_TYPE_F32 && i + 2 < cgraph->n_nodes) {
+        ggml_tensor * rms = cgraph->nodes[i + 1];
+        ggml_tensor * mul = cgraph->nodes[i + 2];
+        if (rms->op == GGML_OP_RMS_NORM && rms->src[0] == n0 && mul->op == GGML_OP_MUL && (mul->src[0] == rms || mul->src[1] == rms) &&
+                mul->type == GGML_TYPE_F32) {
+            for (int k = 0; k < 2; ++k) {
+                if (n0->src[k] != nullptr) {
+                    inputs.push_back(n0->src[k]);
+                }
+            }
+            return mul;
+        }
+    }
+
+    // DSV4_HC_POST computed inside the grouped norm that reads it (+ mul, q8_1), ggml_cuda_try_fuse_hc_post_norm: block output, residual
+    // and the post weights (the input of the SCALE / SIGMOID chain the kernel applies). Flash-Next f0: not repeatable.
+    // GGML_CUDA_HC_POST_NORM_ALIAS=1
+    static const bool hc_alias = ggml_cuda_env_flag("GGML_CUDA_HC_POST_NORM_ALIAS");
+    if (!hc_alias && n0->op == GGML_OP_DSV4_HC_POST && n0->src[3] == nullptr) {
+        int irn = i + 1;
+        while (irn < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[irn])) {
+            irn++;
+        }
+        if (irn + 1 < cgraph->n_nodes) {
+            ggml_tensor * rn  = cgraph->nodes[irn];
+            ggml_tensor * mul = cgraph->nodes[irn + 1];
+            if (rn->op == GGML_OP_RMS_NORM && rn->src[0] == n0 && mul->op == GGML_OP_MUL && (mul->src[0] == rn || mul->src[1] == rn)) {
+                for (int k = 0; k < 2; ++k) {
+                    if (n0->src[k] != nullptr) {
+                        inputs.push_back(n0->src[k]);
+                    }
+                }
+                ggml_tensor * w = n0->src[2];
+                for (int k = 0; w != nullptr && k <= GGML_CUDA_HC_POST_NORM_MAX_OPS; ++k) {
+                    inputs.push_back(w);
+                    const bool chain = w->op == GGML_OP_SCALE || (w->op == GGML_OP_UNARY && ggml_get_unary_op(w) == GGML_UNARY_OP_SIGMOID);
+                    w = chain ? w->src[0] : nullptr;
+                }
+                return mul;
+            }
+        }
+    }
+
+    // QSA dead-slot index map CPY(i32 -> f32) -> SUB -> MUL -> ADD -> CPY(f32 -> i32) in one kernel (ggml_cuda_try_fuse_qsa_idx, k15-fn):
+    // the index input, dump and live. G4 fn4 32 GB: the map's output landed in memory freed inside the chain at an offset, the 8k md5
+    // varied (k15-fn stages the overlapping case in one block; with the inputs kept alive it does not occur). GGML_CUDA_QSA_IDX_ALIAS=1
+    static const bool qsa_alias = ggml_cuda_env_flag("GGML_CUDA_QSA_IDX_ALIAS");
+    if (!qsa_alias && n0->op == GGML_OP_CPY && n0->type == GGML_TYPE_F32 && n0->src[0] != nullptr && n0->src[0]->type == GGML_TYPE_I32 &&
+            i + 4 < cgraph->n_nodes) {
+        ggml_tensor * sub = cgraph->nodes[i + 1];
+        ggml_tensor * mul = cgraph->nodes[i + 2];
+        ggml_tensor * add = cgraph->nodes[i + 3];
+        ggml_tensor * c2  = cgraph->nodes[i + 4];
+        if (sub->op == GGML_OP_SUB && sub->src[0] == n0 && mul->op == GGML_OP_MUL && mul->src[0] == sub && add->op == GGML_OP_ADD &&
+                add->src[0] == mul && add->src[1] == sub->src[1] && c2->op == GGML_OP_CPY && c2->src[0] == add && c2->type == GGML_TYPE_I32) {
+            inputs = { n0->src[0], sub->src[1], mul->src[1] };
+            return c2;
+        }
+    }
+    return nullptr;
+}
+
+static void ggml_cuda_fused_keep_inputs(ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+    std::vector<ggml_tensor *> inputs;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * last = ggml_cuda_fused_match(cgraph, i, inputs);
+        if (last == nullptr) {
+            continue;
+        }
+        for (ggml_tensor * in : inputs) {
+            if (in != nullptr) {
+                params->add_alloc_dep(params->user_data, in, const_cast<ggml_tensor *>(last));
+            }
+        }
+    }
+}
+
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -7554,6 +7658,16 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 }
             }
         }
+    }
+
+    // k16-race: fused kernels whose outputs must not land on the inputs they read. Each matcher below follows the op pattern its
+    // fusion takes (ggml_cuda_try_fuse_*) and names the tensors the fused kernel reads and the last node it writes; graph_optimize keeps
+    // those inputs alive until that node is allocated, so the allocator places no output (also none in place) over them. The separate
+    // kernels each finish reading before the next writes; a fused kernel writes while it (or the kernels around it, with PDL) still
+    // reads. Same kernels and values, only the compute buffer holds the inputs a few nodes longer.
+    // Kill switches: GGML_CUDA_FUSED_ALIAS=1 (all), or per fusion as listed with each matcher
+    if (!disable_fusion) {
+        ggml_cuda_fused_keep_inputs(cgraph, params);
     }
 
     {
