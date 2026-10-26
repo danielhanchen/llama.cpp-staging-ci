@@ -20,3 +20,9 @@ bool ggml_cuda_mul_mat_vec_f_multi_ok(ggml_type type, int64_t ncols, int64_t nco
 // its own ggml_cuda_mul_mat_vec_f launch
 void ggml_cuda_mul_mat_vec_f_multi(ggml_backend_cuda_context & ctx, int n, const ggml_tensor * const * src0, const ggml_tensor * src1,
     ggml_tensor * const * dst);
+
+// k15-mm2: the split-K launch (mmvf-splitk.cuh) ggml_cuda_mul_mat_vec_f would make for a dense F32 product without fusion, without
+// allocating its buffers; false if it would not take it
+struct ggml_cuda_mmvf_splitk_args;
+bool ggml_cuda_mul_mat_vec_f_splitk_plan(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+    ggml_tensor * dst, ggml_cuda_mmvf_splitk_args & a);

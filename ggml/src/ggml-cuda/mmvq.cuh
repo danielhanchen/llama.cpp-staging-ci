@@ -24,3 +24,27 @@ bool ggml_cuda_mul_mat_vec_q_multi_ok(ggml_type type, int64_t ncols_x, int64_t n
 // n (2..GGML_CUDA_MMVQ_MULTI_MAX) dense quantized matrices of one type and K over the same contiguous src1, one launch
 void ggml_cuda_mul_mat_vec_q_multi(ggml_backend_cuda_context & ctx, int n, const ggml_tensor * const * src0, const ggml_tensor * src1,
     ggml_tensor * const * dst);
+
+// k15-mm2: whether ggml_cuda_mul_mat_vec_q_ew gives dst the bytes of the unfused chain + ggml_cuda_mul_mat_vec_q
+bool ggml_cuda_mul_mat_vec_q_ew_ok(const ggml_tensor * src0, const ggml_tensor * dst, int cc);
+
+// dst = src0 * chain(ew_src), chain = n_ops SCALE (ops[o] == 0: p0 * x + p1) / SILU (ops[o] == 1) ops, quantized to q8_1 in the kernel
+void ggml_cuda_mul_mat_vec_q_ew(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * ew_src, int n_ops,
+    const int * ops, const float * p0, const float * p1, ggml_tensor * dst);
+
+// k15-mm2: hyper-connection mat-vecs with their neighbour in one launch (same bytes as the separate launches), see mmvq.cu.
+// down (Q8_0) + inject (F32 split-K, args from ggml_cuda_mul_mat_vec_f_splitk_plan) over the same activation
+struct ggml_cuda_mmvf_splitk_args;
+bool ggml_cuda_mul_mat_vec_q_inject_ok(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc);
+void ggml_cuda_mul_mat_vec_q_inject(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+    const ggml_cuda_mmvf_splitk_args & inj);
+// up (Q8_0, gate = src0 * src1) + gated DSV4_HC_PRE (mixed, and its q8_1 copy if q8_1_out != nullptr) over x [n_embd, 4, ncols]
+bool ggml_cuda_mul_mat_vec_q_hc_pre_ok(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * gate, int64_t n_embd,
+    int64_t hc, int cc);
+// vy: the q8_1 copy of src1 (ggml_cuda_mmvq_src1_q8_1)
+// cnt: GGML_CUDA_HC_PRE_MAX_GROUPS zeroed self-resetting counters (ggml_backend_cuda_context::hc_pre_cnt)
+void ggml_cuda_mul_mat_vec_q_hc_pre(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const char * vy,
+    ggml_tensor * gate, const float * x, int64_t sx1, int64_t sx2, float * mixed, void * q8_1_out, unsigned int * cnt, int64_t n_embd,
+    float scale);
+// the q8_1 copy of a contiguous F32 src1 that ggml_cuda_mul_mat_vec_q would read (from the q8_1 cache, else quantized into alloc)
+const char * ggml_cuda_mmvq_src1_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_cuda_pool_alloc<char> & alloc);

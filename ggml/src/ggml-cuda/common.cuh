@@ -1707,6 +1707,8 @@ struct ggml_backend_cuda_context {
     // k15-mm2: split-K few-row F32 mat-vec (mmvf.cu): per stream partial sums and self-resetting per-row arrival counters
     float        * mmvf_splitk_part = nullptr;
     unsigned int * mmvf_splitk_cnt  = nullptr;
+    // k15-mm2: self-resetting group arrival counters of the hyper-connection up + hc_pre launch (mmvq.cu), stream 0 only
+    unsigned int * hc_pre_cnt       = nullptr;
 
     // a graph was computed with this instance (a copy-only instance, e.g. the scheduler copy queue, is not a compute instance)
     bool computes = false;
@@ -1857,6 +1859,9 @@ struct ggml_cuda_mm_fusion_args_host {
     ggml_tensor * shared_dst = nullptr;
 };
 #define GGML_CUDA_MMVQ_MULTI_MAX 3 // matrices sharing one activation in one mul_mat_vec_q launch
+#define GGML_CUDA_MMVQ_EW_MAX    2 // SCALE / SILU ops a mul_mat_vec_q applies to its F32 src1 itself (c_ewq)
+#define GGML_CUDA_HC_PRE_MAX_GROUPS 1024 // n_embd / 32 of the hyper-connection up + hc_pre launch
+#define GGML_CUDA_MMVQ_EW_MAX_K  992 // K of such a product: one K iteration of 4 warps (Q8_0), so 31 q8_1 blocks per column
 
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1876,6 +1881,14 @@ struct ggml_cuda_mm_fusion_args_device {
     float * multi_dst[GGML_CUDA_MMVQ_MULTI_MAX] = {};
     uint32_t multi_nrows[GGML_CUDA_MMVQ_MULTI_MAX] = {};
     uint32_t multi_block0[GGML_CUDA_MMVQ_MULTI_MAX] = {};
+    // k15-mm2 (mul_mat_vec_q c_ewq): src1 is not given as q8_1 but as the F32 input ew_src of a SCALE / SILU chain (ew_n ops),
+    // which each block applies and quantizes into shared memory itself (see ggml_cuda_mul_mat_vec_q_ew)
+    const float * ew_src = nullptr;
+    uint32_t ew_stride_col = 0;
+    int   ew_n = 0;
+    int   ew_op[GGML_CUDA_MMVQ_EW_MAX] = {};
+    float ew_p0[GGML_CUDA_MMVQ_EW_MAX] = {};
+    float ew_p1[GGML_CUDA_MMVQ_EW_MAX] = {};
 };
 
 struct ggml_cuda_kernel_launch_params {
