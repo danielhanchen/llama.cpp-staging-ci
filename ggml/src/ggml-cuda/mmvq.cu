@@ -2,6 +2,7 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "mmvf-splitk.cuh"
 
 #include <cstdint>
 #include <type_traits>
@@ -2409,4 +2410,303 @@ void ggml_cuda_op_mul_mat_vec_q(
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, stream);
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
+}
+
+// k15-mm2: the hyper-connection mat-vecs of qwen4exp (Flash-Next) next to their neighbours, in one launch each. A Q8_0 row's sum
+// depends only on the warps of its block (4 here, as the unfused launch has on the generic and Turing tables at 1..4 columns, also
+// batch invariant, where a column is computed with the warps of a single column launch), not on the rows per block: the kernels
+// below compute every Q8_0 row with the 4-warp K split and reduction of mul_mat_vec_q, so each output keeps its bytes.
+static bool mmvq_q8_0_four_warps(const int cc, const int ncols_dst) {
+    const mmvq_parameter_table_id table_id = get_device_table_id(cc);
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size == 32 &&
+        (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_TURING) && ncols_dst >= 1 && ncols_dst <= 4 &&
+        calc_nwarps(GGML_TYPE_Q8_0, ncols_dst, table_id) == 4 && calc_nwarps(GGML_TYPE_Q8_0, 1, table_id, true) == 4 &&
+        calc_nwarps(GGML_TYPE_Q8_0, 1, table_id, false) == 4;
+}
+
+// the q8_1 copy of a contiguous src1, as ggml_cuda_mul_mat_vec_q makes it (the q8_1 cache entry it would use)
+const char * ggml_cuda_mmvq_src1_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_cuda_pool_alloc<char> & alloc) {
+    const int64_t ne10        = src1->ne[0];
+    const int64_t ne11        = src1->ne[1];
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const size_t  q8_1_size   = ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    char * q = nullptr;
+    bool quantized = false;
+    if (ctx.curr_stream_no == 0) {
+        int64_t key[ggml_cuda_q8_1_cache::n_key];
+        ggml_cuda_q8_1_cache::key_contiguous(ne10, ne11, key);
+        q = ctx.q8_1_cache.get(src1->data, ggml_nbytes(src1), key, q8_1_size, quantized);
+    }
+    if (q == nullptr) {
+        q = alloc.alloc(q8_1_size);
+    }
+    if (!quantized) {
+        const int64_t s11 = src1->nb[1] / sizeof(float);
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, q, GGML_TYPE_Q8_0, ne10, s11, s11*ne11, s11*ne11, ne10_padded, ne11, 1, 1,
+            ctx.stream());
+    }
+    return q;
+}
+
+// one Q8_0 row r of rpb rows of a 4-warp block, as mul_mat_vec_q computes it (tid = 32*warp + lane)
+#define MMVQ_HC_NWARPS 4
+
+// lever 1, GGML_CUDA_HC_INJECT_DOWN: the hc down projection (Q8_0, K = hc*n_embd -> a few hundred rows) and the inject product (F32,
+// the same activation -> hc rows, split-K) in one grid: blocks [0, nblocks_q) are the down rows, the others the split-K blocks of the
+// inject (mmvf-splitk.cuh, the code of its own launch)
+template <int ncols_dst, int rpb>
+__launch_bounds__(MMVQ_HC_NWARPS*32, 1)
+static __global__ void mul_mat_vec_q8_0_inject(
+        const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst, const int ncols_x, const int stride_row_x,
+        const int stride_col_y, const int stride_col_dst, const int nblocks_q, const ggml_cuda_mmvf_splitk_args inj) {
+    static_assert(MMVF_SPLITK_BLOCK == MMVQ_HC_NWARPS*32, "the inject blocks have the block size of their own launch");
+    if (blockIdx.x >= (unsigned int) nblocks_q) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        const int b = blockIdx.x - nblocks_q;
+        mul_mat_vec_f_splitk_block<ncols_dst>(inj.x, inj.y, inj.dst, inj.part, inj.cnt, inj.ncols2, inj.chunk2, inj.stride_row,
+            inj.stride_col_y2, inj.stride_col_dst, b % inj.nrows, b / inj.nrows, inj.nsplit, 32*threadIdx.y + threadIdx.x);
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        return;
+    }
+    constexpr ggml_type type = GGML_TYPE_Q8_0;
+    constexpr int qk        = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi        = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr       = get_vdr_mmvq(type);
+    constexpr int nwarps    = MMVQ_HC_NWARPS;
+    constexpr int warp_size = 32;
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const     int tid              = warp_size*threadIdx.y + threadIdx.x;
+    const     int row0             = rpb*blockIdx.x;
+    const     int blocks_per_row_x = ncols_x / qk;
+    constexpr int blocks_per_iter  = vdr * nwarps*warp_size / qi;
+
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+
+    float tmp[ncols_dst][rpb] = {{0.0f}};
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    const int kbx_offset = row0*stride_row_x;
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (tid % (qi/vdr));
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < rpb; ++i) {
+                tmp[j][i] += vec_dot_q_cuda(vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            }
+        }
+    }
+
+    __shared__ float tmp_shared[nwarps-1][ncols_dst][rpb][warp_size];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < rpb; ++i) {
+                tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+    dst += row0;
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+        for (int i = 0; i < rpb; ++i) {
+#pragma unroll
+            for (int l = 0; l < nwarps-1; ++l) {
+                tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
+            }
+            tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+            if (threadIdx.x == i) {
+                dst[j*stride_col_dst + i] = tmp[j][i];
+            }
+        }
+    }
+}
+
+bool ggml_cuda_mul_mat_vec_q_inject_ok(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, const int cc) {
+    return src0->type == GGML_TYPE_Q8_0 && ggml_is_contiguous(src0) && ggml_is_matrix(src0) && src1->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(src1) && ggml_is_matrix(src1) && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) &&
+        dst->ne[2] == 1 && dst->ne[3] == 1 && dst->ne[0] == src0->ne[1] && dst->ne[1] == src1->ne[1] && src0->ne[0] == src1->ne[0] &&
+        src0->ne[0] % MATRIX_ROW_PADDING == 0 && src0->ne[1] % 2 == 0 && src0->ne[1] <= INT_MAX/2 && mmvq_q8_0_four_warps(cc, (int) dst->ne[1]);
+}
+
+void ggml_cuda_mul_mat_vec_q_inject(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const ggml_cuda_mmvf_splitk_args & inj) {
+    GGML_ASSERT(ggml_cuda_mul_mat_vec_q_inject_ok(src0, src1, dst, ggml_cuda_info().devices[ctx.device].cc));
+    GGML_ASSERT(inj.ncols_dst == (int) dst->ne[1] && inj.nrows > 0 && inj.nsplit > 0);
+    ggml_cuda_pool_alloc<char> q8_1_alloc(ctx.pool());
+    const char * vy = ggml_cuda_mmvq_src1_q8_1(ctx, src1, q8_1_alloc);
+    const int ncols_x        = (int) src0->ne[0];
+    const int nrows_x        = (int) src0->ne[1];
+    const int ncols_dst      = (int) dst->ne[1];
+    const int stride_row_x   = (int) (src0->nb[1] / ggml_type_size(src0->type));
+    const int stride_col_y   = (int) (GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING) / QK8_1);
+    const int stride_col_dst = (int) (dst->nb[1] / sizeof(float));
+    // 2 rows per block (the rows do not change a row's sum)
+    constexpr int rpb = 2;
+    const int nblocks_q = nrows_x / rpb;
+    const ggml_cuda_kernel_launch_params launch_params =
+        ggml_cuda_kernel_launch_params(dim3(nblocks_q + inj.nrows*inj.nsplit, 1, 1), dim3(32, MMVQ_HC_NWARPS, 1), 0, ctx.stream());
+#define MMVQ_INJ_LAUNCH(NC) ggml_cuda_kernel_launch(mul_mat_vec_q8_0_inject<NC, rpb>, launch_params, src0->data, (const void *) vy, \
+        (float *) dst->data, ncols_x, stride_row_x, stride_col_y, stride_col_dst, nblocks_q, inj)
+    switch (ncols_dst) {
+        case 1: MMVQ_INJ_LAUNCH(1); break;
+        case 2: MMVQ_INJ_LAUNCH(2); break;
+        case 3: MMVQ_INJ_LAUNCH(3); break;
+        case 4: MMVQ_INJ_LAUNCH(4); break;
+        default: GGML_ABORT("fatal error");
+    }
+#undef MMVQ_INJ_LAUNCH
+}
+
+// lever 2, GGML_CUDA_HC_UP_PRE: the hc up projection (Q8_0, short K -> hc*n_embd rows, gate) and the gated DSV4_HC_PRE that reads it
+// (mixed[i] = scale * sum_h x[i, h] * sigmoid(gate[i, h])) plus its q8_1 copy, in one launch. A block computes the gate rows of 32
+// channels for all hc = 4 streams: each warp computes whole rows, with every lane doing the work of the lanes l, l + 32, l + 64,
+// l + 96 of the 4-warp mul_mat_vec_q block and adding their partial sums in that block's order (warp 0, 1, 2, 3, then the warp
+// reduction), so the gate keeps its bytes; the 32 mixed values of a column are then computed, stored and quantized by one warp as
+// dsv4_hc_pre_q8_1_f32 does it (one q8_1 block).
+#define MMVQ_HC_PRE_HC     4
+#define MMVQ_HC_PRE_CH     32
+#define MMVQ_HC_PRE_NWARPS 8
+
+template <int ncols_dst>
+__launch_bounds__(MMVQ_HC_PRE_NWARPS*32, 1)
+static __global__ void mul_mat_vec_q8_0_hc_pre(
+        const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ gate, const float * __restrict__ x,
+        float * __restrict__ mixed, void * __restrict__ vq, const int ncols_x, const int stride_row_x, const int stride_col_y,
+        const int stride_col_gate, const int n_embd, const int64_t sx1, const int64_t sx2, const float scale) {
+    constexpr ggml_type type = GGML_TYPE_Q8_0;
+    constexpr int qk        = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi        = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr       = get_vdr_mmvq(type);
+    constexpr int nwarps_v  = MMVQ_HC_NWARPS; // the warps of the block whose sums are reproduced
+    constexpr int warp_size = 32;
+    constexpr int rows      = MMVQ_HC_PRE_CH*MMVQ_HC_PRE_HC;
+    constexpr int rpw       = rows/MMVQ_HC_PRE_NWARPS; // rows per warp
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    constexpr int blocks_per_iter = vdr * nwarps_v*warp_size / qi;
+
+    const int lane = threadIdx.x;
+    const int w    = threadIdx.y;
+    const int c0   = MMVQ_HC_PRE_CH*blockIdx.x;
+    const int blocks_per_row_x = ncols_x / qk;
+
+    __shared__ float gs[ncols_dst][MMVQ_HC_PRE_HC][MMVQ_HC_PRE_CH];
+
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    float v[rpw][ncols_dst];
+#pragma unroll
+    for (int k = 0; k < rpw; ++k) {
+        const int r   = w + MMVQ_HC_PRE_NWARPS*k;
+        const int row = c0 + r % MMVQ_HC_PRE_CH + (r / MMVQ_HC_PRE_CH)*n_embd;
+#pragma unroll
+        for (int vw = 0; vw < nwarps_v; ++vw) {
+            const int t = warp_size*vw + lane;
+            float p[ncols_dst] = {0.0f};
+            for (int kbx = t / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+                const int kby = kbx * (qk/QK8_1);
+                const int kqs = vdr * (t % (qi/vdr));
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    p[j] += vec_dot_q_cuda(vx, &y[j*stride_col_y + kby], row*stride_row_x + kbx, kqs);
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                if (vw == 0) {
+                    v[k][j] = p[j];
+                } else {
+                    v[k][j] += p[j];
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < rpw; ++k) {
+        const int r   = w + MMVQ_HC_PRE_NWARPS*k;
+        const int row = c0 + r % MMVQ_HC_PRE_CH + (r / MMVQ_HC_PRE_CH)*n_embd;
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const float g = warp_reduce_sum<warp_size>(v[k][j]);
+            if (lane == 0) {
+                gs[j][r / MMVQ_HC_PRE_CH][r % MMVQ_HC_PRE_CH] = g;
+                gate[j*stride_col_gate + row] = g;
+            }
+        }
+    }
+    __syncthreads();
+    if (w >= ncols_dst) {
+        return;
+    }
+    // dsv4_hc_pre_q8_1_f32 (gated) for token it = w, channel i0 = c0 + lane
+    const int     i0 = c0 + lane;
+    const int64_t it = w;
+    float sum = 0.0f;
+    for (int64_t ih = 0; ih < MMVQ_HC_PRE_HC; ++ih) {
+        const float xv = x[i0 + ih*sx1 + it*sx2];
+        const float wv = 1.0f / (1.0f + expf(-gs[w][ih][lane]));
+        sum += xv * wv;
+    }
+    const float xi = scale * sum;
+    mixed[it*n_embd + i0] = xi;
+    if (vq == nullptr) {
+        return;
+    }
+    float amax = fabsf(xi);
+    float qsum = xi;
+    amax = warp_reduce_max<QK8_1>(amax);
+    qsum = warp_reduce_sum<QK8_1>(qsum);
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    block_q8_1 * yq = (block_q8_1 *) vq;
+    const int64_t ir  = it*n_embd + i0;
+    const int64_t ib  = ir / QK8_1;
+    const int     iqs = ir % QK8_1;
+    yq[ib].qs[iqs] = q;
+    if (iqs == 0) {
+        yq[ib].ds = make_half2(d, qsum);
+    }
+}
+
+bool ggml_cuda_mul_mat_vec_q_hc_pre_ok(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * gate, const int64_t n_embd,
+        const int64_t hc, const int cc) {
+    return src0->type == GGML_TYPE_Q8_0 && ggml_is_contiguous(src0) && ggml_is_matrix(src0) && src1->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(src1) && ggml_is_matrix(src1) && gate->type == GGML_TYPE_F32 && ggml_is_contiguous(gate) && ggml_is_matrix(gate) &&
+        gate->ne[0] == src0->ne[1] && gate->ne[1] == src1->ne[1] && src0->ne[0] == src1->ne[0] && src0->ne[0] % QK8_0 == 0 &&
+        hc == MMVQ_HC_PRE_HC && src0->ne[1] == hc*n_embd && n_embd % MATRIX_ROW_PADDING == 0 && src0->ne[1] <= INT_MAX/2 &&
+        mmvq_q8_0_four_warps(cc, (int) gate->ne[1]);
+}
+
+void ggml_cuda_mul_mat_vec_q_hc_pre(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const char * vy,
+        ggml_tensor * gate, const float * x, const int64_t sx1, const int64_t sx2, float * mixed, void * q8_1_out, const int64_t n_embd,
+        const float scale) {
+    GGML_ASSERT(ggml_cuda_mul_mat_vec_q_hc_pre_ok(src0, src1, gate, n_embd, MMVQ_HC_PRE_HC, ggml_cuda_info().devices[ctx.device].cc));
+    const int ncols_x         = (int) src0->ne[0];
+    const int ncols_dst       = (int) gate->ne[1];
+    const int stride_row_x    = (int) (src0->nb[1] / ggml_type_size(src0->type));
+    const int stride_col_y    = (int) (GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING) / QK8_1);
+    const int stride_col_gate = (int) (gate->nb[1] / sizeof(float));
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
+        dim3((unsigned int) (n_embd / MMVQ_HC_PRE_CH), 1, 1), dim3(32, MMVQ_HC_PRE_NWARPS, 1), 0, ctx.stream());
+#define MMVQ_HC_PRE_LAUNCH(NC) ggml_cuda_kernel_launch(mul_mat_vec_q8_0_hc_pre<NC>, launch_params, src0->data, (const void *) vy, \
+        (float *) gate->data, x, mixed, q8_1_out, ncols_x, stride_row_x, stride_col_y, stride_col_gate, (int) n_embd, sx1, sx2, scale)
+    switch (ncols_dst) {
+        case 1: MMVQ_HC_PRE_LAUNCH(1); break;
+        case 2: MMVQ_HC_PRE_LAUNCH(2); break;
+        case 3: MMVQ_HC_PRE_LAUNCH(3); break;
+        case 4: MMVQ_HC_PRE_LAUNCH(4); break;
+        default: GGML_ABORT("fatal error");
+    }
+#undef MMVQ_HC_PRE_LAUNCH
 }

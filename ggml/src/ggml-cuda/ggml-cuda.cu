@@ -33,6 +33,7 @@
 #include "ggml-cuda/mmid.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
+#include "ggml-cuda/mmvf-splitk.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -5244,6 +5245,151 @@ static int ggml_cuda_try_fuse_ew_mmvq(ggml_backend_cuda_context * cuda_ctx, ggml
     return n;
 }
 
+// node goes to ggml_cuda_mul_mat_vec_f in ggml_cuda_mul_mat (same dispatch, see there), whatever its K
+static bool ggml_cuda_mmvf_dispatch_ok(const ggml_backend_cuda_context * ctx, const ggml_tensor * node) {
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+    if (node->op != GGML_OP_MUL_MAT || ggml_cuda_op_mul_mat_use_fwht(node) || src0->buffer == nullptr ||
+            !ggml_backend_buft_is_cuda(src0->buffer->buft) || ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
+            src0->view_src != nullptr || src1->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32 || src1->ne[1] > MMVF_MAX_BATCH_SIZE) {
+        return false;
+    }
+    const int     cc        = ggml_cuda_info().devices[ctx->device].cc;
+    const int     warp_size = ggml_cuda_info().devices[ctx->device].warp_size;
+    const int64_t ne11      = src1->ne[1];
+    if ((src0->type == GGML_TYPE_F32 && ggml_get_op_params_i32(node, 3) == GGML_PREC_F32) ||
+            ((node->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) && ne11 > 1)) {
+        return ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, 1);
+    }
+    return ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11);
+}
+
+// k15-mm2: the hyper-connection down projection (Q8_0) and inject product (F32, K = hc*n_embd -> hc rows, split-K) of one mix read the
+// same activation and are adjacent once the side-stream planner moved the inject behind its activation: one launch for both
+// (ggml_cuda_mul_mat_vec_q_inject, same bytes). Node i and the next compute node j; the inject then does not use the side stream.
+// GGML_CUDA_HC_INJECT_DOWN=0 turns it off.
+static bool ggml_cuda_hc_inject_down_match(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i, int & j_out,
+        ggml_tensor ** q_out, ggml_tensor ** f_out, ggml_cuda_mmvf_splitk_args * inj) {
+    static const bool off = [] { const char * e = getenv("GGML_CUDA_HC_INJECT_DOWN"); return e != nullptr && atoi(e) == 0; }();
+    ggml_tensor * a = cgraph->nodes[i];
+    if (off || ggml_cuda_fusion_disabled() || a->op != GGML_OP_MUL_MAT || !(a->flags & GGML_TENSOR_FLAG_COMPUTE) || a->view_src != nullptr) {
+        return false;
+    }
+    int j = i + 1;
+    while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        j++;
+    }
+    if (j >= cgraph->n_nodes) {
+        return false;
+    }
+    ggml_tensor * b = cgraph->nodes[j];
+    if (b->op != GGML_OP_MUL_MAT || !(b->flags & GGML_TENSOR_FLAG_COMPUTE) || b->view_src != nullptr || b->src[1] != a->src[1] ||
+            (a->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) != (b->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT)) {
+        return false;
+    }
+    ggml_tensor * q = a->src[0]->type == GGML_TYPE_Q8_0 ? a : b;
+    ggml_tensor * f = q == a ? b : a;
+    const int iq = q == a ? i : j;
+    const int iff = q == a ? j : i;
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    if (q->src[0]->type != GGML_TYPE_Q8_0 || f->src[0]->type != GGML_TYPE_F32 || f->src[0]->op != GGML_OP_NONE ||
+            !ggml_cuda_mul_mat_vec_q_inject_ok(q->src[0], q->src[1], q, cc) || !ggml_cuda_mmvq_multi_runtime_ok(cuda_ctx, q) ||
+            !ggml_cuda_mmvf_dispatch_ok(cuda_ctx, f) || ggml_cuda_mmvq_multi_has_partner(cgraph, iq) ||
+            ggml_cuda_mmvq_multi_has_partner(cgraph, iff) || !ggml_is_contiguous(f) || !ggml_is_contiguous(f->src[0])) {
+        return false;
+    }
+    if (ggml_cuda_tensors_overlap(q, f) || ggml_cuda_tensors_overlap(q, q->src[1]) || ggml_cuda_tensors_overlap(f, q->src[1])) {
+        return false;
+    }
+    ggml_cuda_mmvf_splitk_args args;
+    if (!ggml_cuda_mul_mat_vec_f_splitk_plan(*cuda_ctx, f->src[0], f->src[1], f, args)) {
+        return false;
+    }
+    j_out = j;
+    if (q_out) {
+        *q_out = q;
+    }
+    if (f_out) {
+        *f_out = f;
+    }
+    if (inj) {
+        *inj = args;
+    }
+    return true;
+}
+
+static int ggml_cuda_try_fuse_hc_inject_down(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    if (cuda_ctx->curr_stream_no != 0 || !cuda_ctx->stream_context().concurrent_events.empty() || cuda_ctx->mmvq_done_early.count(cgraph->nodes[i])) {
+        return 0;
+    }
+    int j = -1;
+    ggml_tensor * q = nullptr;
+    ggml_tensor * f = nullptr;
+    ggml_cuda_mmvf_splitk_args inj;
+    if (!ggml_cuda_hc_inject_down_match(cuda_ctx, cgraph, i, j, &q, &f, &inj) || cuda_ctx->mmvq_done_early.count(cgraph->nodes[j])) {
+        return 0;
+    }
+    ggml_cuda_mul_mat_vec_q_inject(*cuda_ctx, q->src[0], q->src[1], q, inj);
+    return j - i;
+}
+
+// k15-mm2: the hyper-connection up projection (Q8_0, gate) and the gated DSV4_HC_PRE reading it (the next compute node): one launch
+// that writes the gate, the mixed stream and its q8_1 copy (ggml_cuda_mul_mat_vec_q_hc_pre, same bytes). GGML_CUDA_HC_UP_PRE=0: off.
+static int ggml_cuda_try_fuse_hc_up_pre(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool off = [] { const char * e = getenv("GGML_CUDA_HC_UP_PRE"); return e != nullptr && atoi(e) == 0; }();
+    ggml_tensor * up = cgraph->nodes[i];
+    if (off || cuda_ctx->curr_stream_no != 0 || !cuda_ctx->stream_context().concurrent_events.empty() || up->op != GGML_OP_MUL_MAT ||
+            !(up->flags & GGML_TENSOR_FLAG_COMPUTE) || up->view_src != nullptr || up->src[0]->type != GGML_TYPE_Q8_0 ||
+            cuda_ctx->mmvq_done_early.count(up)) {
+        return 0;
+    }
+    int j = i + 1;
+    while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        j++;
+    }
+    if (j >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * pre = cgraph->nodes[j];
+    if (pre->op != GGML_OP_DSV4_HC_PRE || !(pre->flags & GGML_TENSOR_FLAG_COMPUTE) || ggml_get_op_params_i32(pre, 1) == 0 ||
+            cuda_ctx->mmvq_done_early.count(pre)) {
+        return 0;
+    }
+    const ggml_tensor * x = pre->src[0];
+    const ggml_tensor * w = pre->src[1];
+    const int64_t n_embd = x->ne[0];
+    const int64_t hc     = x->ne[1];
+    const int64_t nt     = x->ne[2];
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || pre->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || x->ne[3] != 1 ||
+            w->data != up->data || !ggml_is_contiguous(w) || ggml_nelements(w) != ggml_nelements(up) || w->ne[0] != n_embd || w->ne[1] != hc ||
+            w->ne[2] != nt || !ggml_is_contiguous(pre) || pre->ne[0] != n_embd || pre->ne[1] != nt || up->ne[1] != nt ||
+            !ggml_cuda_mul_mat_vec_q_hc_pre_ok(up->src[0], up->src[1], up, n_embd, hc, cc) || !ggml_cuda_mmvq_multi_runtime_ok(cuda_ctx, up) ||
+            ggml_cuda_mmvq_multi_has_partner(cgraph, i)) {
+        return 0;
+    }
+    // the kernel reads the q8_1 copy of src1, made before it starts (the mixed stream may take the memory of src1, which the up
+    // projection read last)
+    if (ggml_cuda_tensors_overlap(up, x) || ggml_cuda_tensors_overlap(up, pre) || ggml_cuda_tensors_overlap(pre, x) ||
+            ggml_cuda_tensors_overlap(up, up->src[1])) {
+        return 0;
+    }
+    // src1's q8_1 copy first, as the unfused up projection gets it before the DSV4_HC_PRE reserves its own
+    ggml_cuda_pool_alloc<char> q8_1_alloc(cuda_ctx->pool());
+    const char * vy = ggml_cuda_mmvq_src1_q8_1(*cuda_ctx, up->src[1], q8_1_alloc);
+    // the q8_1 copy of the mixed stream, as ggml_cuda_op_dsv4_hc_pre reserves it
+    void * q8_1_out = nullptr;
+    ggml_cuda_q8_1_cache & cache = cuda_ctx->q8_1_cache;
+    if (cache.active() && cache.norm_targets.count(pre)) {
+        int64_t key[ggml_cuda_q8_1_cache::n_key];
+        ggml_cuda_q8_1_cache::key_contiguous(n_embd, nt, key);
+        q8_1_out = cache.reserve(pre->data, ggml_nbytes(pre), key, nt*n_embd/QK8_1*sizeof(block_q8_1));
+    }
+    ggml_cuda_mul_mat_vec_q_hc_pre(*cuda_ctx, up->src[0], up->src[1], vy, up, (const float *) x->data, x->nb[1] / sizeof(float),
+        x->nb[2] / sizeof(float), (float *) pre->data, q8_1_out, n_embd, ggml_get_op_params_f32(pre, 0));
+    return j - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -5251,6 +5397,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_MUL_MAT) {
+        if (const int n = ggml_cuda_try_fuse_hc_inject_down(cuda_ctx, cgraph, i)) {
+            return n;
+        }
+        if (const int n = ggml_cuda_try_fuse_hc_up_pre(cuda_ctx, cgraph, i)) {
+            return n;
+        }
+    }
 
     if (node->op == GGML_OP_SCALE || node->op == GGML_OP_UNARY) {
         if (const int n = ggml_cuda_try_fuse_ew_mmvq(cuda_ctx, cgraph, i)) {
@@ -6405,8 +6560,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 for (const auto & [mv, reader] : cuda_ctx->side_mv) {
                     const auto a = idx.find(mv);
                     const auto b = idx.find(reader);
+                    int j_inj = -1;
                     if (a != idx.end() && b != idx.end() && b->second - a->second >= GGML_CUDA_SIDE_MV_MIN_GAP &&
-                        ggml_cuda_side_mv_run(mv)) {
+                        ggml_cuda_side_mv_run(mv) &&
+                        // a hyper-connection inject that runs in its down projection's launch (ggml_cuda_try_fuse_hc_inject_down)
+                        !ggml_cuda_hc_inject_down_match(cuda_ctx, cgraph, a->second, j_inj, nullptr, nullptr, nullptr)) {
                         side_mv_at[a->second] = b->second;
                     }
                 }
