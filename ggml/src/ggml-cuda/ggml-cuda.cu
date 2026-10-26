@@ -3165,6 +3165,15 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     return cgraph->nodes[0];
 }
 
+// GGML_CUDA_GRAPH_UID=0: the compatibility check walks every node on every evaluation, as before
+static bool ggml_cuda_graph_uid_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_GRAPH_UID");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     bool res = false;
 
@@ -6968,7 +6977,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        // a graph with the uid of the last walked one is that same graph, unchanged (the uid is renewed whenever the scheduler splits a
+        // graph, and the property compare below already returns early on it): its compatibility is the cached answer.
+        // Idea from ikawrakow/ik_llama.cpp PR #2316 (MIT)
+        bool graph_compatible;
+        if (ggml_cuda_graph_uid_enabled() && cgraph->uid != 0 && cgraph->uid == graph->compat_uid) {
+            graph_compatible = graph->compat_ok;
+        } else {
+            graph_compatible  = ggml_cuda_graph_check_compability(cgraph);
+            graph->compat_uid = cgraph->uid;
+            graph->compat_ok  = graph_compatible;
+        }
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
