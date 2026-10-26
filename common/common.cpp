@@ -1424,6 +1424,20 @@ static int64_t common_gguf_u32(const std::string & path, const char * key) {
     }
 }
 
+// k15-up: the layer-major batch (tokens per merged group). Default 8192; 16384 (one group for a 16k prompt, one pass over the host
+// experts instead of two) where the draft model was left out by --fit (fit_off): no drafter or MTP heads keep n_batch-sized rows
+// beside it (an MTP drafter on the device grew the peak RSS by 570 MiB at 16384, a dropped one by 50-96 MiB). A group whose lent
+// allocation does not fit is refused and split (ggml sched lend guard), so a cache that cannot lend for 8 members runs 4 + 4 as at
+// 8192. G4 Flash-Next UD-IQ4_XS Studio argv, 16k: 24 GB 3.661 -> 3.216 s, 16 GB (own-buffer lend) 3.820 -> 3.184 s, md5 unchanged.
+// LLAMA_MOE_LAYER_MAJOR_BATCH=N sets N; LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO=0 keeps 8192
+static int64_t common_lm_batch_default(const common_params & params) {
+    if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH")) {
+        return atoll(e);
+    }
+    static const bool auto_env = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO")) != 0;
+    return auto_env && params.speculative.draft.fit_off ? 16384 : 8192;
+}
+
 // layer-major prompts (llama_context::decode_layer_major): the ubatches of one batch upload each host expert once, so n_ubatch stays the
 // default (no compute buffer growth taken from the cache) and the batch holds up to LLAMA_MOE_LAYER_MAJOR_BATCH (8192) tokens, at most the
 // context and lm_ub_max ubatches. LLAMA_MOE_LAYER_MAJOR=1 forces it for spilled experts, =0 turns it off; unset (auto): on for spilled
@@ -1458,7 +1472,7 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
                 "no layer-major groups)\n", cparams.n_batch, cparams.n_ubatch);
             return;
         }
-        int64_t want = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH") != nullptr ? atoll(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH")) : 8192;
+        int64_t want = common_lm_batch_default(params);
         const int64_t ub_max = getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX") != nullptr ? std::max(1, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX"))) : 16;
         want = std::min<int64_t>(want, ub_max*(int64_t) cparams.n_ubatch);
         if (params.n_ctx > 0) {
@@ -1519,7 +1533,7 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     const bool   spill  = lm != 0 && common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers);
     const auto   set_batch = [&]() {
         if (!params.n_batch_set) {
-            int64_t want = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH") != nullptr ? atoll(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH")) : 8192;
+            int64_t want = common_lm_batch_default(params);
             const int64_t ub_max = getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX") != nullptr ? std::max(1, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX"))) : 16;
             want = std::min<int64_t>(want, ub_max*(int64_t) cparams.n_ubatch);
             if (params.n_ctx > 0) {
