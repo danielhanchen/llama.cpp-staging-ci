@@ -198,15 +198,16 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
 // Once per model, only for buffers of layer weights ("blk." tensors other than routed experts, which a MoE cache maps itself), only with
 // op offload, and only while the pinned total stays within min(LLAMA_DENSE_HOST_PIN_MAX_FRAC (0.5) x MemTotal - memory pinned already,
 // MemAvailable - max(2 GiB, 1/16)): registering a mapped file faults in and locks its pages. The same bytes are copied, so the outputs
-// are bit-identical. LLAMA_DENSE_HOST_PIN=0 disables.
+// are bit-identical. Off by default (see below): LLAMA_DENSE_HOST_PIN=1 enables.
 static void llama_dense_host_pin(const llama_model & model) {
     using host_pin_range_t    = void * (*)(void *, size_t);
     using host_unpin_t        = void (*)(void *);
     using host_mapped_bytes_t = size_t (*)(void);
-    if (const char * e = getenv("LLAMA_DENSE_HOST_PIN")) {
-        if (atoi(e) == 0) {
-            return;
-        }
+    // opt-in (LLAMA_DENSE_HOST_PIN=1): the driver keeps GPU page tables for registered host memory, ~2 MiB of VRAM per GiB page-locked
+    // whatever the flags (Default / Portable / Portable | Mapped, 4 KiB or 2 MiB host pages: exclusive B200, 8 GiB -> +16 MiB, 2 GiB ->
+    // +4 MiB, nothing charged to the process; G4 / L4 / T4 dense Qwen3.6-27B 12 GB: +18 MiB for 8.7 GiB), outside any buffer of ours
+    if (const char * e = getenv("LLAMA_DENSE_HOST_PIN"); e == nullptr || atoi(e) == 0) {
+        return;
     }
     std::lock_guard<std::mutex> lock(model.host_pin_mutex);
     if (model.host_pin_done) {
@@ -280,7 +281,7 @@ static void llama_dense_host_pin(const llama_model & model) {
         }
     }
     LLAMA_LOG_INFO("%s: dense host pin: %.0f of %.0f MiB of memory-mapped layer weights in system memory (%zu tensors, %zu buffers) "
-        "page-locked for the copies of offloaded prompt ops in %.1f ms (LLAMA_DENSE_HOST_PIN=0 disables)\n", __func__, done/1048576.0,
+        "page-locked for the copies of offloaded prompt ops in %.1f ms (LLAMA_DENSE_HOST_PIN=1)\n", __func__, done/1048576.0,
         need/1048576.0, n_tensors, bufs.size(), (ggml_time_us() - t0)/1000.0);
 }
 
