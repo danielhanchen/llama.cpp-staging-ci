@@ -8187,6 +8187,66 @@ struct test_moe_amax_rescale : public test_case {
     }
 };
 
+// k15-fn: a gated op (swiglu GLU, or SIGMOID / SILU -> MUL as the CUDA backend fuses it) read by a quantized mat-vec product
+// (MUL_MAT, or MUL_MAT_ID over n_used rows as the MoE down projection): the CUDA gated kernel writes the q8_1 copy of its output
+// for the product (unary_gated_q8_1_kernel), as Strata fuses swiglu + quantize
+struct test_gated_mmvq : public test_case {
+    const ggml_type type;
+    const std::string gate; // "swiglu", "sigmoid", "silu"
+    const int64_t k;        // gated width (mat-vec input)
+    const int64_t m;        // tokens
+    const bool    moe;      // MUL_MAT_ID over n_used experts per token
+    const int64_t split;    // > 1: the gated op works on rows of k / split values (heads), the product reads their reshape to k
+
+    static constexpr int n_mats = 8;
+    static constexpr int n_used = 4;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, gate, k, m, moe, split);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_MMVQ";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_gated_mmvq(ggml_type type, std::string gate, int64_t k, int64_t m, bool moe, int64_t split = 1)
+        : type(type), gate(std::move(gate)), k(k), m(m), moe(moe), split(split) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t rows = moe ? n_used : split;
+        const int64_t w0   = moe ? k : k / split;
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w0, rows, m);
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w0, rows, m);
+        ggml_tensor * x = ggml_scale(ctx, a, 1.0f); // non-leaf activations, as in a model
+        ggml_tensor * y = ggml_scale(ctx, b, 1.0f);
+        ggml_tensor * cur = gate == "swiglu" ? ggml_swiglu_split(ctx, x, y) :
+                            gate == "silu"   ? ggml_mul(ctx, ggml_silu(ctx, x), y) :
+                                               ggml_mul(ctx, y, ggml_sigmoid(ctx, x));
+        ggml_tensor * out;
+        if (moe) {
+            ggml_tensor * w   = ggml_new_tensor_3d(ctx, type, k, 64, n_mats);
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, m);
+            out = ggml_mul_mat_id(ctx, w, cur, ids);
+        } else {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, type, k, 64);
+            out = ggml_mul_mat(ctx, w, ggml_reshape_2d(ctx, cur, k, m));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+};
+
 // gate + up + GLU mat-vec products followed by a down product, the activation produced by a (fused) rms_norm + mul: the GLU
 // output can be placed over the activation, which the mat-vec GLU fusion then reads through its q8_1 copy only.
 struct test_glu_src1_alias : public test_case {
@@ -12761,6 +12821,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
+    }
+
+    // k15-fn: gated op + quantized mat-vec (the q8_1 copy written by the gated kernel); k = 1024 rows carry no padding, 768 do
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS }) {
+        for (const char * gate : { "swiglu", "sigmoid", "silu" }) {
+            for (int64_t k : { 768, 1024 }) {
+                for (int64_t m : { 1, 3 }) {
+                    test_cases.emplace_back(new test_gated_mmvq(type, gate, k, m, false));
+                    test_cases.emplace_back(new test_gated_mmvq(type, gate, k, m, true));
+                    test_cases.emplace_back(new test_gated_mmvq(type, gate, k, m, false, 8)); // heads of k / 8 read as one row
+                }
+            }
+        }
     }
 
     for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ2_XXS }) {
