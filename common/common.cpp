@@ -1430,12 +1430,32 @@ static int64_t common_gguf_u32(const std::string & path, const char * key) {
 // allocation does not fit is refused and split (ggml sched lend guard), so a cache that cannot lend for 8 members runs 4 + 4 as at
 // 8192. G4 Flash-Next UD-IQ4_XS Studio argv, 16k: 24 GB 3.661 -> 3.216 s, 16 GB (own-buffer lend) 3.820 -> 3.184 s, md5 unchanged.
 // LLAMA_MOE_LAYER_MAJOR_BATCH=N sets N; LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO=0 keeps 8192
+// k15-up (2): built-in MTP heads (no -md model) keep one next-n row per batch token (llama_context::output_reserve, embd_nextn unmasked:
+// n_embd floats x n_batch), which is all the drafter's prompt pass needs after the batch. 16384 adds n_embd x 4 B x 8192 to the host
+// output buffer; it is taken where that is at most LLAMA_MOE_LAYER_MAJOR_BATCH_RSS_MIB (100): Qwen3.6-35B-A3B (n_embd 2048) +64 MiB.
+// The rest of the measured peak RSS growth (~170 MiB, G4 q4x 12 GB +237) is the 8-member graph's own host buffers, the same without a
+// draft (Flash-Next 16 GB, draft dropped: +170)
 static int64_t common_lm_batch_default(const common_params & params) {
     if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH")) {
         return atoll(e);
     }
     static const bool auto_env = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO")) != 0;
-    return auto_env && params.speculative.draft.fit_off ? 16384 : 8192;
+    if (!auto_env) {
+        return 8192;
+    }
+    if (params.speculative.draft.fit_off) {
+        return 16384;
+    }
+    const bool mtp_heads = !params.speculative.has_dft() && std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+        [](auto t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP; });
+    if (mtp_heads) {
+        static const double rss_mib = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_RSS_MIB") ? atof(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_RSS_MIB")) : 100.0;
+        const int64_t n_embd = common_gguf_u32(params.model.path, "embedding_length");
+        if (n_embd > 0 && (double) n_embd*4.0*8192.0/1048576.0 <= rss_mib) {
+            return 16384;
+        }
+    }
+    return 8192;
 }
 
 // layer-major prompts (llama_context::decode_layer_major): the ubatches of one batch upload each host expert once, so n_ubatch stays the
