@@ -185,6 +185,22 @@ struct moe_cache_lru {
         tail = s;
     }
 
+    // move slot s to the head (the next to be evicted), k15-pred
+    void to_head(int32_t s) {
+        if (s == head) {
+            return;
+        }
+        unlink(s);
+        prev[s] = -1;
+        next[s] = head;
+        if (head >= 0) {
+            prev[head] = s;
+        } else {
+            tail = s;
+        }
+        head = s;
+    }
+
     struct fill {
         int32_t expert;
         int32_t slot;
@@ -1568,6 +1584,7 @@ struct llama_moe_cache::impl {
         if (!model.hparams.no_alloc) {
             init_host_cache(host_mib);
             init_ahead(model);
+            init_upload_ahead(model);
         }
 
         if (device_lookup && !model.hparams.no_alloc) {
@@ -2382,7 +2399,9 @@ struct llama_moe_cache::impl {
         // still allocated then; wstore is not used here
         single_stop_all();
         profile_save();
+        ua_shutdown();
         log_stats();
+        ua_free();
         for (const auto & [unmap, buf] : mapped) {
             unmap(buf);
         }
@@ -3144,6 +3163,881 @@ struct llama_moe_cache::impl {
                 ast.issued++;
                 ast.bytes += nb_all;
             }
+        }
+    }
+
+    // k15-pred: upload ahead (LLAMA_MOE_UPLOAD_AHEAD, 0 = off). A prompt ubatch of n_small_max < n <= ua_max_tokens tokens copies the
+    // experts each layer routes after reading its ids, so the uploads of layer p wait for its router and the link idles while the
+    // device computes. Here the router of layer p+1 is applied (on the device) to the router input of layer p as soon as the ids of p
+    // are read; after the last expert tensor of p is copied, the predicted experts of p+1 that the cache lacks are admitted to slots of
+    // layer p+1 and the first expert tensor of each is uploaded into its slot on a second stream. When the real ids of p+1 are read,
+    // the wrong guesses are evicted (only their first tensor was sent), and each further expert tensor of the right ones is uploaded
+    // on that stream one tensor ahead of its copy. The copies read the slots after waiting for those uploads (an event on the
+    // compute stream), so the weights the experts compute with are the same bytes: only the order of the uploads changes.
+    // Each upload ahead waits (an event) for the misses the compute stream uploads for the copy issued before it, so the real misses go
+    // first on the link. Victims (see ua_admit): free slots, then by the policy's order the slots of layer p+1 that no token predicts
+    // and the slots of the layers already computed, then the later layers (never p, p+1's predicted ones, p+2, or a slot a pending copy
+    // reads); a wrong guess frees its slot (the head of the list). Budget LLAMA_MOE_UPLOAD_AHEAD_BUDGET (1.5) x the misses of layer p.
+    int     ua_mode   = 0;
+    int     ua_topk   = 0;
+    float   ua_budget = 1.5f;
+    int     ua_log    = 0;
+    int     ua_gating = 0;
+    static constexpr int64_t ua_max_tokens = 255; // larger ubatches prefetch every expert (prefetch_min_batch = 256)
+    static constexpr int     ua_n_events   = 16;
+    struct ua_dev_t {
+        ggml_backend_t up = nullptr; // second backend instance of the device: its stream uploads ahead
+        std::vector<ggml_backend_event_t> ev;
+        int ev_next = 0;
+        ggml_backend_event_t pred_ev = nullptr;
+        ggml_backend_event_t drain_ev = nullptr;
+        ggml_backend_event_t mark_ev  = nullptr; // on the compute stream after the uploads of the last copy: the next upload ahead waits for it
+        bool marked = false;
+        ggml_backend_buffer_t buf_dev  = nullptr; // router logits [n_expert, ua_max_tokens] f32
+        ggml_backend_buffer_t buf_host = nullptr;
+        std::vector<float> host_vec;               // if no pinned host buffer
+        float * host = nullptr;
+        bool used = false;                         // uploads issued since the last drain
+    };
+    std::vector<ua_dev_t> ua_devs; // [device]
+    struct ua_layer_t {
+        uint64_t epoch = 0;
+        std::vector<int32_t> experts, slots;  // admitted ahead of the routing (kept: the right ones after the routing is read)
+        std::vector<int32_t> vkeys;           // [admitted] key of the expert its slot held (-1 = free)
+        std::vector<int>     bank_ev;         // [bank] event of its upload, -1 = waited or none
+        std::vector<uint8_t> bank_sent;       // [bank] uploaded for the admitted experts
+        bool    resolved = false;             // the routing was read
+    };
+    std::vector<ua_layer_t> ua_l;
+    std::vector<const ggml_tensor *> ua_router; // [n_layer] ffn_gate_inp on a device
+    std::vector<std::vector<float>>  ua_b, ua_pb;
+    ggml_context_ptr ua_ctx;
+    uint64_t ua_epoch = 1;
+    int32_t  ua_il    = -1; // layer of the current copies
+    uint64_t ua_il_epoch = 0;
+    int      ua_ncall = 0;  // expert tensors of ua_il copied so far
+    int32_t  ua_pred_j = -1;
+    int32_t  ua_pred_dev = -1;
+    int64_t  ua_pred_nt = 0;
+    int32_t  ua_miss_est = 0; // routed experts of ua_il the cache lacked before the uploads ahead
+    std::vector<int32_t> ua_cnt;
+    std::vector<float>   ua_w, ua_sc;
+    std::vector<std::pair<float, int32_t>> ua_rank;
+    std::vector<ggml_backend_copy_region> ua_regions;
+    std::vector<int32_t> ua_want;
+    std::vector<uint8_t> ua_prot;  // [expert] within the top k + ua_protect of some token: never a victim of its own layer
+    int ua_protect = 4;
+    std::vector<uint8_t> ua_busy;
+    std::vector<int32_t> ua_donate;
+    float ua_floor = 0.9f;
+    std::vector<std::pair<int64_t, int32_t>> ua_cand;
+    int  ua_victims = 3;
+    bool ua_verify  = false;
+    uint64_t ua_verified = 0, ua_bad = 0;
+    size_t   ua_up_last = 0;
+    size_t   ua_copy_last = 0;
+    uint64_t ua_dbg[5] = { 0, 0, 0, 0, 0 }; // copy_experts calls: all, dev_newer, no map, miss, hit (LLAMA_MOE_UPLOAD_AHEAD_LOG=3)
+    bool ua_skip = false;        // no predictions in this ubatch (see prepare)
+    int64_t ua_prev_tokens = 0;
+    bool ua_off = false; // an upload could not be issued: no more uploads ahead (the admitted ones are dropped by the drain)
+    struct ua_stats_t {
+        uint64_t layers = 0, admitted = 0, hit = 0, waste = 0, lost = 0, miss_rest = 0, bytes = 0, waste_bytes = 0, fallback = 0, blocked = 0;
+    } ua_st, ua_st_ub;
+
+    void init_upload_ahead(const llama_model & model) {
+        const char * env = getenv("LLAMA_MOE_UPLOAD_AHEAD");
+        ua_mode = env != nullptr ? atoi(env) : 0; // opt-in: LLAMA_MOE_UPLOAD_AHEAD=1 (repeat-prompt decode loses 5-20% when on)
+        const char * env_l0 = getenv("LLAMA_MOE_UPLOAD_AHEAD_LOG");
+        ua_log = env_l0 != nullptr ? atoi(env_l0) : 0;
+        if (ua_mode <= 0 || groups.empty()) {
+            ua_mode = 0;
+            return;
+        }
+        const char * env_k = getenv("LLAMA_MOE_UPLOAD_AHEAD_TOPK");
+        ua_topk = env_k != nullptr ? std::max(1, atoi(env_k)) : (int) n_expert_used;
+        const char * env_b = getenv("LLAMA_MOE_UPLOAD_AHEAD_BUDGET");
+        ua_budget = env_b != nullptr ? (float) atof(env_b) : 1.5f;
+        const char * env_v = getenv("LLAMA_MOE_UPLOAD_AHEAD_VICTIMS");
+        ua_victims = env_v != nullptr ? atoi(env_v) : 3;
+        const char * env_p = getenv("LLAMA_MOE_UPLOAD_AHEAD_PROTECT");
+        ua_protect = env_p != nullptr ? std::max(0, atoi(env_p)) : 4;
+        const char * env_f = getenv("LLAMA_MOE_UPLOAD_AHEAD_FLOOR");
+        ua_floor = env_f != nullptr ? (float) atof(env_f) : 0.9f;
+        ua_verify  = getenv("LLAMA_MOE_UPLOAD_AHEAD_VERIFY") != nullptr && atoi(getenv("LLAMA_MOE_UPLOAD_AHEAD_VERIFY")) != 0;
+        ua_gating = (int) model.hparams.expert_gating_func;
+        ua_router.assign(layers.size(), nullptr);
+        ua_b.assign(layers.size(), {});
+        ua_pb.assign(layers.size(), {});
+        ua_l.assign(layers.size(), {});
+        int64_t n_expert_max = 0;
+        size_t n_layers = 0;
+        for (size_t il = 0; il < layers.size() && il < model.layers.size(); ++il) {
+            if (layers[il].ig < 0 || host_layer((int32_t) il)) {
+                continue;
+            }
+            const ggml_tensor * w = model.layers[il].ffn_gate_inp;
+            const int64_t n_expert = layers[il].experts[0]->ne[2];
+            if (w == nullptr || w->buffer == nullptr || ggml_backend_buffer_is_host(w->buffer) || ggml_n_dims(w) != 2 || w->ne[1] != n_expert) {
+                continue;
+            }
+            auto get_bias = [&](const ggml_tensor * b, std::vector<float> & out) {
+                if (b != nullptr && b->buffer != nullptr && b->type == GGML_TYPE_F32 && ggml_nelements(b) == n_expert && ggml_is_contiguous(b)) {
+                    out.resize(n_expert);
+                    ggml_backend_tensor_get(b, out.data(), 0, n_expert*sizeof(float));
+                }
+            };
+            get_bias(model.layers[il].ffn_gate_inp_b, ua_b[il]);
+            get_bias(model.layers[il].ffn_exp_probs_b, ua_pb[il]);
+            ua_router[il] = w;
+            ua_l[il].bank_ev.assign(layers[il].experts.size(), -1);
+            ua_l[il].bank_sent.assign(layers[il].experts.size(), 0);
+            n_expert_max = std::max(n_expert_max, n_expert);
+            n_layers++;
+        }
+        if (n_layers < 2) {
+            ua_mode = 0;
+            return;
+        }
+        ua_devs.resize(devices.size());
+        size_t n_dev = 0;
+        for (size_t id = 0; id < devices.size(); ++id) {
+            bool any = false;
+            for (const group & g : groups) {
+                any |= g.id == (int32_t) id && g.n_slots > 0;
+            }
+            ggml_backend_t backend = devices[id].backend;
+            if (!any || !ggml_backend_tensor_copy_regions_async(backend, nullptr, 0)) {
+                continue;
+            }
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            ua_dev_t & u = ua_devs[id];
+            u.up = ggml_backend_dev_init(dev, nullptr);
+            if (u.up == nullptr) {
+                continue;
+            }
+            for (int i = 0; i < ua_n_events; ++i) {
+                u.ev.push_back(ggml_backend_event_new(dev));
+            }
+            u.pred_ev  = ggml_backend_event_new(dev);
+            u.drain_ev = ggml_backend_event_new(dev);
+            u.mark_ev  = ggml_backend_event_new(dev);
+            const size_t sz = (size_t) n_expert_max*ua_max_tokens*sizeof(float);
+            u.buf_dev = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(backend), sz);
+            ggml_backend_buffer_type_t hb = ggml_backend_dev_host_buffer_type(dev);
+            u.buf_host = hb != nullptr ? ggml_backend_buft_alloc_buffer(hb, sz) : nullptr;
+            if (u.buf_host != nullptr) {
+                u.host = (float *) ggml_backend_buffer_get_base(u.buf_host);
+            } else {
+                u.host_vec.resize(sz/sizeof(float));
+                u.host = u.host_vec.data();
+            }
+            bool ok = u.buf_dev != nullptr && u.pred_ev != nullptr && u.drain_ev != nullptr && u.mark_ev != nullptr;
+            for (auto * e : u.ev) {
+                ok &= e != nullptr;
+            }
+            if (!ok) {
+                ua_free_dev(u);
+                continue;
+            }
+            n_dev++;
+        }
+        if (n_dev == 0) {
+            ua_mode = 0;
+            return;
+        }
+        ggml_init_params ip = { ggml_tensor_overhead()*8 + ggml_graph_overhead_custom(8, false), nullptr, true };
+        ua_ctx.reset(ggml_init(ip));
+        LLAMA_LOG_INFO("%s: MoE cache: uploads ahead of the routing for prompts of %" PRId64 "..%" PRId64 " tokens (next layer's router, top %d per token, "
+                "budget %.1fx; LLAMA_MOE_UPLOAD_AHEAD=0 off), %zu layers\n", __func__, n_small_max + 1, ua_max_tokens, ua_topk, ua_budget, n_layers);
+    }
+
+    void ua_free_dev(ua_dev_t & u) {
+        if (u.up != nullptr) {
+            ggml_backend_synchronize(u.up);
+        }
+        for (auto * e : u.ev) {
+            if (e != nullptr) {
+                ggml_backend_event_free(e);
+            }
+        }
+        u.ev.clear();
+        if (u.pred_ev != nullptr) {
+            ggml_backend_event_free(u.pred_ev);
+        }
+        if (u.drain_ev != nullptr) {
+            ggml_backend_event_free(u.drain_ev);
+        }
+        if (u.mark_ev != nullptr) {
+            ggml_backend_event_free(u.mark_ev);
+        }
+        u.pred_ev = u.drain_ev = u.mark_ev = nullptr;
+        if (u.buf_dev != nullptr) {
+            ggml_backend_buffer_free(u.buf_dev);
+        }
+        if (u.buf_host != nullptr) {
+            ggml_backend_buffer_free(u.buf_host);
+        }
+        u.buf_dev = u.buf_host = nullptr;
+        u.host = nullptr;
+        if (u.up != nullptr) {
+            ggml_backend_free(u.up);
+        }
+        u.up = nullptr;
+    }
+
+    // at the destruction: the context's backends may be gone, only the upload streams are waited for
+    void ua_shutdown() {
+        for (auto & u : ua_devs) {
+            if (u.up != nullptr) {
+                ggml_backend_synchronize(u.up);
+            }
+        }
+        ua_st.layers += ua_st_ub.layers; ua_st.admitted += ua_st_ub.admitted; ua_st.hit += ua_st_ub.hit; ua_st.waste += ua_st_ub.waste;
+        ua_st.lost += ua_st_ub.lost; ua_st.miss_rest += ua_st_ub.miss_rest; ua_st.bytes += ua_st_ub.bytes; ua_st.waste_bytes += ua_st_ub.waste_bytes;
+        ua_st.fallback += ua_st_ub.fallback;
+        ua_st_ub = {};
+    }
+
+    void ua_free() {
+        for (auto & u : ua_devs) {
+            ua_free_dev(u);
+        }
+        ua_devs.clear();
+        ua_mode = 0;
+    }
+
+    bool ua_dev_ok(int32_t id) const {
+        return ua_mode > 0 && id >= 0 && (size_t) id < ua_devs.size() && ua_devs[id].up != nullptr && !devices[id].released;
+    }
+
+    // the banks of device id are freed (release): the uploads ahead complete first, the admissions are dropped
+    void ua_release(int32_t id) {
+        if (!ua_dev_ok(id)) {
+            return;
+        }
+        ggml_backend_synchronize(ua_devs[id].up);
+        for (size_t j = 0; j < ua_l.size(); ++j) {
+            if (ua_l[j].epoch != 0 && groups[layers[j].ig].id == id) {
+                ua_drop(groups[layers[j].ig], (int32_t) j);
+                ua_l[j].resolved = false;
+                std::fill(ua_l[j].bank_ev.begin(), ua_l[j].bank_ev.end(), -1);
+            }
+        }
+        ua_il = -1;
+        ua_pred_j = -1;
+    }
+
+    // the router input of layer il: src[1] of the matmul with its router that the ids derive from
+    const ggml_tensor * ua_router_input(int32_t il, const ggml_tensor * ids) const {
+        const ggml_tensor * stack[64];
+        int n = 0;
+        int visited = 0;
+        stack[n++] = ids;
+        while (n > 0 && visited < 64) {
+            const ggml_tensor * t = stack[--n];
+            visited++;
+            if (t->op == GGML_OP_MUL_MAT && t->src[0] == ua_router[il]) {
+                return t->src[1];
+            }
+            for (int i = 0; i < GGML_MAX_SRC && n < 63; ++i) {
+                if (t->src[i] != nullptr) {
+                    stack[n++] = t->src[i];
+                }
+            }
+            if (t->view_src != nullptr && n < 63) {
+                stack[n++] = t->view_src;
+            }
+        }
+        return nullptr;
+    }
+
+    // uploads bank ip of the experts admitted ahead to layer j on the upload stream (or on `on` when given)
+    bool ua_send_bank(group & g, int32_t j, int ip, ggml_backend_t on) {
+        ua_layer_t & L = ua_l[j];
+        ua_dev_t & u = ua_devs[g.id];
+        if (L.bank_sent[ip] || L.experts.empty()) {
+            L.bank_sent[ip] = 1;
+            return true;
+        }
+        const ggml_tensor * w = layers[j].experts[ip];
+        ggml_tensor * bank = g.banks[ip];
+        GGML_ASSERT(bank->nb[2] == w->nb[2]);
+        const size_t nb = w->nb[2];
+        ua_regions.clear();
+        size_t bytes = 0;
+        for (size_t i = 0; i < L.experts.size();) {
+            size_t n = 1;
+            while (i + n < L.experts.size() && L.experts[i + n] == L.experts[i] + (int32_t) n && L.slots[i + n] == L.slots[i] + (int32_t) n) {
+                n++;
+            }
+            ua_regions.push_back({ w, (size_t) L.experts[i]*nb, bank, (size_t) L.slots[i]*nb, n*nb });
+            bytes += n*nb;
+            i += n;
+        }
+        if (on == nullptr && u.marked) {
+            // after the misses the compute stream uploads for the copy just issued: they go first on the link
+            ggml_backend_event_wait(u.up, u.mark_ev);
+            u.marked = false;
+        }
+        if (!ggml_backend_tensor_copy_regions_async(on != nullptr ? on : u.up, ua_regions.data(), ua_regions.size())) {
+            return false;
+        }
+        L.bank_sent[ip] = 1;
+        ua_st_ub.bytes += bytes;
+        if (on == nullptr) {
+            const int e = u.ev_next++ % ua_n_events;
+            ggml_backend_event_record(u.ev[e], u.up);
+            L.bank_ev[ip] = e;
+            u.used = true;
+        } else {
+            L.bank_ev[ip] = -1;
+        }
+        return true;
+    }
+
+    // drops the admissions of layer j (their slots are emptied and go to the head); the compute stream has waited for their uploads
+    void ua_drop(group & g, int32_t j) {
+        ua_layer_t & L = ua_l[j];
+        const int32_t n_expert = g.lru.n_expert;
+        for (size_t i = 0; i < L.experts.size(); ++i) {
+            const int32_t s = L.slots[i];
+            if (g.sd.il == j && !g.sd.old_slots.empty() && g.sd.old_slots[L.experts[i]] == s) {
+                g.sd.old_slots[L.experts[i]] = -1; // the copies of the layer's other tensors must not read it
+            }
+            if (g.lru.key_of[s] == j*n_expert + L.experts[i]) {
+                g.lru.slot_map[j][L.experts[i]] = -1;
+                g.lru.key_of[s] = -1;
+                g.lru.to_head(s);
+            }
+        }
+        g.lru.gen++;
+        L.experts.clear();
+        L.slots.clear();
+        L.vkeys.clear();
+        L.epoch = 0;
+    }
+
+    // before a graph: the uploads ahead are complete on the compute stream, the admissions not resolved by a routing are dropped
+    void ua_drain() {
+        if (ua_mode <= 0) {
+            if (ua_log > 1 && stats_upload.bytes != ua_up_last) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead off; copies uploaded %.1f MiB\n", tag, (stats_upload.bytes - ua_up_last)/1048576.0);
+            }
+            if (ua_log > 2) {
+                for (const group & g : groups) {
+                    const int64_t n_mapped = std::count_if(g.lru.key_of.begin(), g.lru.key_of.end(), [](int32_t k) { return k >= 0; });
+                    LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead off: group of %zu layers: %" PRId64 " of %d slots mapped, %d lent, dev_newer %d; copied from the cache %.1f MiB, lends %d (max %d)\n", tag,
+                        g.layers.size(), n_mapped, g.n_slots, g.lru.n_lent, (int) g.dev_newer, (stats_copy.bytes - ua_copy_last)/1048576.0, (int) n_lends, (int) lend_max);
+                }
+            }
+            ua_up_last = stats_upload.bytes;
+            ua_copy_last = stats_copy.bytes;
+            return;
+        }
+        for (size_t id = 0; id < ua_devs.size(); ++id) {
+            ua_dev_t & u = ua_devs[id];
+            if (u.up == nullptr || !u.used) {
+                continue;
+            }
+            ggml_backend_event_record(u.drain_ev, u.up);
+            ggml_backend_event_wait(devices[id].backend, u.drain_ev);
+            u.used = false;
+        }
+        for (size_t j = 0; j < ua_l.size(); ++j) {
+            ua_layer_t & L = ua_l[j];
+            if (L.epoch == 0) {
+                continue;
+            }
+            group & g = groups[layers[j].ig];
+            bool complete = L.resolved;
+            for (size_t ip = 0; ip < L.bank_sent.size(); ++ip) {
+                complete &= L.bank_sent[ip] != 0;
+                L.bank_ev[ip] = -1;
+            }
+            if (!complete) {
+                ua_st_ub.waste += L.experts.size();
+                ua_drop(g, (int32_t) j);
+            } else if (ua_verify) {
+                // LLAMA_MOE_UPLOAD_AHEAD_VERIFY=1: every bank of the kept admissions holds the host bytes of its expert
+                ggml_backend_synchronize(devices[g.id].backend);
+                std::vector<uint8_t> buf;
+                for (size_t i = 0; i < L.experts.size(); ++i) {
+                    if (g.lru.key_of[L.slots[i]] != (int32_t) j*g.lru.n_expert + L.experts[i]) {
+                        continue;
+                    }
+                    for (size_t ip = 0; ip < layers[j].experts.size(); ++ip) {
+                        const ggml_tensor * w = layers[j].experts[ip];
+                        const size_t nb = w->nb[2];
+                        buf.resize(nb);
+                        ggml_backend_tensor_get(g.banks[ip], buf.data(), (size_t) L.slots[i]*nb, nb);
+                        ua_verified++;
+                        ua_bad += memcmp(buf.data(), (const uint8_t *) w->data + (size_t) L.experts[i]*nb, nb) != 0;
+                    }
+                }
+            }
+            L.epoch = 0;
+            L.resolved = false;
+            L.experts.clear();
+            L.slots.clear();
+            L.vkeys.clear();
+        }
+        if (ua_verify) {
+            for (group & g : groups) {
+                if (g.n_slots > 0 && !g.dev_newer && ua_dev_ok(g.id)) {
+                    verify(g, "after uploads ahead");
+                }
+            }
+        }
+        if (ua_verify && ua_verified > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead verified: %" PRIu64 " expert tensors, %" PRIu64 " mismatches\n", tag, ua_verified, ua_bad);
+        }
+        if (ua_log > 0 && (ua_st_ub.layers > 0 || (ua_log > 1 && stats_upload.bytes != ua_up_last))) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead: %" PRIu64 " layers, %" PRIu64 " admitted, %" PRIu64 " right, %" PRIu64 " wrong, %" PRIu64
+                " hits lost, %" PRIu64 " misses left, %.1f MiB ahead, %.1f MiB wasted, %" PRIu64 " fallbacks; copies uploaded %.1f MiB\n", tag, ua_st_ub.layers, ua_st_ub.admitted,
+                ua_st_ub.hit, ua_st_ub.waste, ua_st_ub.lost, ua_st_ub.miss_rest, ua_st_ub.bytes/1048576.0, ua_st_ub.waste_bytes/1048576.0,
+                ua_st_ub.fallback, (stats_upload.bytes - ua_up_last)/1048576.0);
+        }
+        if (ua_log > 2) {
+            for (const group & g : groups) {
+                const int64_t n_mapped = std::count_if(g.lru.key_of.begin(), g.lru.key_of.end(), [](int32_t k) { return k >= 0; });
+                {
+                    std::string per;
+                    for (int32_t il : g.layers) {
+                        int c = 0;
+                        for (int32_t e = 0; e < g.lru.n_expert; ++e) {
+                            c += g.lru.slot_map[il][e] >= 0;
+                        }
+                        per += " " + std::to_string(c);
+                    }
+                    LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead: mapped per layer:%s\n", tag, per.c_str());
+                }
+                LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead: group of %zu layers: %" PRId64 " of %d slots mapped, %d lent, dev_newer %d, %" PRIu64 " reads blocked; copied from the cache %.1f MiB, lends %d (max %d); lookups %llu newer %llu nomap %llu miss %llu hit %llu\n", tag,
+                    g.layers.size(), n_mapped, g.n_slots, g.lru.n_lent, (int) g.dev_newer, ua_st_ub.blocked, (stats_copy.bytes - ua_copy_last)/1048576.0, (int) n_lends, (int) lend_max,
+                    (unsigned long long) ua_dbg[0], (unsigned long long) ua_dbg[1], (unsigned long long) ua_dbg[2], (unsigned long long) ua_dbg[3], (unsigned long long) ua_dbg[4]);
+            }
+        }
+        ua_up_last = stats_upload.bytes;
+        ua_copy_last = stats_copy.bytes;
+        ua_st.layers += ua_st_ub.layers; ua_st.admitted += ua_st_ub.admitted; ua_st.hit += ua_st_ub.hit; ua_st.waste += ua_st_ub.waste;
+        ua_st.lost += ua_st_ub.lost; ua_st.miss_rest += ua_st_ub.miss_rest; ua_st.bytes += ua_st_ub.bytes; ua_st.waste_bytes += ua_st_ub.waste_bytes;
+        ua_st.fallback += ua_st_ub.fallback;
+        ua_st_ub = {};
+        ua_epoch++;
+        ua_il = -1;
+        ua_pred_j = -1;
+    }
+
+    // the copy of expert tensor w of a prompt ubatch, after its ids were read (counts: tokens per expert), before its copies
+    void ua_begin(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * ids, const std::vector<int32_t> & counts) {
+        const auto it = bindings.find(w);
+        if (it == bindings.end()) {
+            return;
+        }
+        const binding & b = it->second;
+        const int32_t il = b.il;
+        group & g = groups[layers[il].ig];
+        if (!ua_dev_ok(g.id) || ggml_backend_get_device(backend) != ggml_backend_get_device(devices[g.id].backend) || g.dev_newer ||
+                (int64_t) counts.size() != g.lru.n_expert) {
+            return;
+        }
+        ua_layer_t & L = ua_l[il];
+        if (il != ua_il || ua_il_epoch != ua_epoch) {
+            ua_il = il;
+            ua_il_epoch = ua_epoch;
+            ua_ncall = 0;
+            ua_pred_j = -1;
+            const int32_t n_expert = g.lru.n_expert;
+            // the routing of il resolves its admissions: the wrong ones are dropped (the compute stream waits for their first upload
+            // before it writes or reads any slot, see ua_wait: the copies of this tensor upload their misses first)
+            if (L.epoch == ua_epoch && !L.resolved) {
+                size_t o = 0;
+                size_t n_wrong = 0;
+                for (size_t i = 0; i < L.experts.size(); ++i) {
+                    const int32_t e = L.experts[i];
+                    const int32_t s = L.slots[i];
+                    if (g.lru.key_of[s] != il*n_expert + e) {
+                        continue; // reassigned since (not by a prompt copy: they never plan another layer)
+                    }
+                    const int32_t vk = L.vkeys[i];
+                    if (vk >= 0 && vk / n_expert == il && counts[vk % n_expert] > 0) {
+                        ua_st_ub.lost++;
+                    }
+                    if (counts[e] > 0) {
+                        L.experts[o] = e;
+                        L.slots[o] = s;
+                        L.vkeys[o] = vk;
+                        o++;
+                        ua_st_ub.hit++;
+                    } else {
+                        g.lru.slot_map[il][e] = -1;
+                        g.lru.key_of[s] = -1;
+                        g.lru.to_head(s);
+                        n_wrong++;
+                    }
+                }
+                if (n_wrong > 0) {
+                    g.lru.gen++;
+                    size_t sent = 0;
+                    for (size_t ip = 0; ip < L.bank_sent.size(); ++ip) {
+                        sent += L.bank_sent[ip] ? layers[il].experts[ip]->nb[2] : 0;
+                    }
+                    ua_st_ub.waste += n_wrong;
+                    ua_st_ub.waste_bytes += n_wrong*sent;
+                }
+                L.experts.resize(o);
+                L.slots.resize(o);
+                L.vkeys.resize(o);
+                L.resolved = true;
+            }
+            const int32_t * slots = g.lru.slot_map[il];
+            int32_t miss = 0;
+            for (int32_t e = 0; e < n_expert; ++e) {
+                miss += counts[e] > 0 && slots[e] < 0;
+            }
+            ua_st_ub.miss_rest += miss;
+            ua_miss_est = miss + (L.epoch == ua_epoch ? (int32_t) L.experts.size() : 0);
+            if (!ua_off && !ua_skip) {
+                ua_predict(backend, g, il, ids);
+            }
+        }
+        // the bank of this copy must hold the admitted experts: uploaded ahead (ua_wait) or, if not yet, on the compute stream now
+        if (L.epoch == ua_epoch && L.resolved && b.ip < (int) L.bank_ev.size() && !L.bank_sent[b.ip]) {
+            ua_st_ub.fallback++;
+            if (!ua_send_bank(g, il, b.ip, backend)) {
+                ua_drop(g, il); // the copies upload them instead
+            }
+        }
+    }
+
+    // the slot map of layer il is read by a lookup of the graph (not by a copy, see copy): its admissions ahead keep their slots, the
+    // compute stream waits for the uploads ahead and uploads the banks not sent yet before the lookup reads them
+    void ua_lookup_guard(ggml_backend_t backend, group & g, int32_t il) {
+        if (ua_mode <= 0 || ua_l.empty() || (size_t) g.id >= ua_devs.size() || ua_devs[g.id].up == nullptr) {
+            return;
+        }
+        ua_layer_t & L = ua_l[il];
+        if (L.epoch != ua_epoch || L.experts.empty()) {
+            return;
+        }
+        ua_dev_t & u = ua_devs[g.id];
+        ggml_backend_event_record(u.drain_ev, u.up);
+        ggml_backend_event_wait(backend, u.drain_ev);
+        for (size_t ip = 0; ip < L.bank_sent.size(); ++ip) {
+            L.bank_ev[ip] = -1;
+            if (!L.bank_sent[ip] && !ua_send_bank(g, il, (int) ip, backend)) {
+                ua_drop(g, il);
+                return;
+            }
+        }
+        ua_st_ub.fallback++;
+        L.resolved = true;
+    }
+
+    // the uploads ahead of the layer of w that the compute stream has not waited for
+    bool ua_pending(const ggml_tensor * w) const {
+        const auto it = bindings.find(w);
+        if (ua_mode <= 0 || it == bindings.end()) {
+            return false;
+        }
+        const ua_layer_t & L = ua_l[it->second.il];
+        return L.epoch == ua_epoch && std::any_of(L.bank_ev.begin(), L.bank_ev.end(), [](int e) { return e >= 0; });
+    }
+
+    // the uploads of the misses of w are queued on the compute stream: the next upload ahead goes after them
+    void ua_mark(ggml_backend_t backend, const ggml_tensor * w) {
+        const auto it = bindings.find(w);
+        if (ua_mode <= 0 || ua_off || it == bindings.end()) {
+            return;
+        }
+        const group & g = groups[layers[it->second.il].ig];
+        if (!ua_dev_ok(g.id) || ua_devs[g.id].mark_ev == nullptr) {
+            return;
+        }
+        ggml_backend_event_record(ua_devs[g.id].mark_ev, backend);
+        ua_devs[g.id].marked = true;
+    }
+
+    // the compute stream waits for them: before the copies of w read the cache and before its seed writes slots
+    void ua_wait(ggml_backend_t backend, const ggml_tensor * w) {
+        const auto it = bindings.find(w);
+        if (ua_mode <= 0 || it == bindings.end()) {
+            return;
+        }
+        const int32_t il = it->second.il;
+        ua_layer_t & L = ua_l[il];
+        if (L.epoch != ua_epoch) {
+            return;
+        }
+        const group & g = groups[layers[il].ig];
+        for (size_t ip = 0; ip < L.bank_ev.size(); ++ip) {
+            if (L.bank_ev[ip] >= 0) {
+                ggml_backend_event_wait(backend, ua_devs[g.id].ev[L.bank_ev[ip]]);
+                L.bank_ev[ip] = -1;
+            }
+        }
+    }
+
+    // the slots of layer il, bank ip may be read: no admission ahead of the routing whose bank is not uploaded
+    bool ua_readable(int32_t il, int32_t ip) const {
+        if (ua_mode <= 0 || ua_l.empty()) {
+            return true;
+        }
+        const ua_layer_t & L = ua_l[il];
+        return L.epoch != ua_epoch || L.experts.empty() || (L.resolved && L.bank_sent[ip]);
+    }
+
+    // the router of layer il+1 on the router input of layer il, on the device; read after the copies of il are issued
+    void ua_predict(ggml_backend_t backend, group & g, int32_t il, const ggml_tensor * ids) {
+        const int32_t j = il + 1;
+        if ((size_t) j >= layers.size() || layers[j].ig != layers[il].ig || ua_router[j] == nullptr || ua_router[il] == nullptr || host_layer(j) ||
+                g.host_read) {
+            return; // (a graph that reads the group through lookups uploads its misses at each lookup)
+        }
+        const ggml_tensor * x = ua_router_input(il, ids);
+        const ggml_tensor * wj = ua_router[j];
+        if (x == nullptr || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[0] != wj->ne[0] || ggml_nrows(x) != x->ne[1] ||
+                x->ne[1] < 1 || x->ne[1] > ua_max_tokens || x->buffer == nullptr || x->data == nullptr || ggml_backend_buffer_is_host(x->buffer) ||
+                !ggml_backend_supports_buft(backend, ggml_backend_buffer_get_type(x->buffer)) ||
+                !ggml_backend_supports_buft(backend, ggml_backend_buffer_get_type(wj->buffer))) {
+            return;
+        }
+        ua_dev_t & u = ua_devs[g.id];
+        ggml_context * ctx = ua_ctx.get();
+        ggml_reset(ctx);
+        ggml_tensor * xv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1]);
+        xv->buffer = x->buffer;
+        xv->data   = x->data;
+        ggml_tensor * l = ggml_mul_mat(ctx, const_cast<ggml_tensor *>(wj), xv);
+        if (ggml_backend_tensor_alloc(u.buf_dev, l, ggml_backend_buffer_get_base(u.buf_dev)) != GGML_STATUS_SUCCESS) {
+            return;
+        }
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8, false);
+        ggml_build_forward_expand(gf, l);
+        if (ggml_backend_graph_compute_async(backend, gf) != GGML_STATUS_SUCCESS) {
+            return;
+        }
+        ggml_backend_tensor_get_async(backend, l, u.host, 0, ggml_nbytes(l));
+        ggml_backend_event_record(u.pred_ev, backend);
+        ua_pred_j   = j;
+        ua_pred_dev = g.id;
+        ua_pred_nt  = x->ne[1];
+    }
+
+    // after the copies (and the seed) of expert tensor w: the next bank of its layer's admissions, and after the last tensor of the
+    // layer the admissions of the next layer from the prediction with their first bank
+    void ua_end(ggml_backend_t backend, const ggml_tensor * w) {
+        GGML_UNUSED(backend);
+        const auto it = bindings.find(w);
+        if (it == bindings.end()) {
+            return;
+        }
+        const binding & b = it->second;
+        const int32_t il = b.il;
+        if (il != ua_il || ua_il_epoch != ua_epoch) {
+            return;
+        }
+        group & g = groups[layers[il].ig];
+        if (!ua_dev_ok(g.id) || ua_off) {
+            return; // (a bank not sent is uploaded on the compute stream before its copy, see ua_begin)
+        }
+        const int n_banks = (int) layers[il].experts.size();
+        ua_ncall++;
+        ua_layer_t & L = ua_l[il];
+        if (L.epoch == ua_epoch && L.resolved) {
+            // one bank ahead of its copy (the lowest one not sent)
+            for (int ip = 0; ip < n_banks; ++ip) {
+                if (!L.bank_sent[ip] && ip != b.ip) {
+                    if (!ua_send_bank(g, il, ip, nullptr)) {
+                        ua_drop(g, il);
+                    }
+                    break;
+                }
+            }
+        }
+        if (ua_ncall == n_banks && ua_pred_j == il + 1) {
+            ua_admit(g, il);
+        }
+    }
+
+    void ua_admit(group & g, int32_t il) {
+        const int32_t j = ua_pred_j;
+        ua_pred_j = -1;
+        ua_dev_t & u = ua_devs[ua_pred_dev];
+        ggml_backend_event_synchronize(u.pred_ev);
+        const int32_t n_expert = g.lru.n_expert;
+        const int64_t nt = ua_pred_nt;
+        const int64_t k  = std::min<int64_t>(ua_topk, n_expert);
+        ua_cnt.assign(n_expert, 0);
+        ua_prot.assign(n_expert, 0);
+        ua_w.assign(n_expert, 0.0f);
+        ua_sc.resize(n_expert);
+        ua_rank.resize(n_expert);
+        const auto & bj  = ua_b[j];
+        const auto & pbj = ua_pb[j];
+        for (int64_t t = 0; t < nt; ++t) {
+            const float * lg = u.host + t*n_expert;
+            float mx = -INFINITY;
+            for (int32_t e = 0; e < n_expert; ++e) {
+                ua_sc[e] = lg[e] + (bj.empty() ? 0.0f : bj[e]);
+                mx = std::max(mx, ua_sc[e]);
+            }
+            if (ua_gating == LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID) {
+                for (int32_t e = 0; e < n_expert; ++e) {
+                    ua_sc[e] = 1.0f/(1.0f + expf(-ua_sc[e]));
+                }
+            } else {
+                float sum = 0.0f;
+                for (int32_t e = 0; e < n_expert; ++e) {
+                    ua_sc[e] = expf(ua_sc[e] - mx);
+                    sum += ua_sc[e];
+                }
+                for (int32_t e = 0; e < n_expert; ++e) {
+                    ua_sc[e] /= sum;
+                }
+            }
+            for (int32_t e = 0; e < n_expert; ++e) {
+                ua_rank[e] = { -(ua_sc[e] + (pbj.empty() ? 0.0f : pbj[e])), e };
+            }
+            const int64_t kp = std::min<int64_t>(k + ua_protect, n_expert);
+            std::nth_element(ua_rank.begin(), ua_rank.begin() + (kp - 1), ua_rank.end());
+            if (kp > k) {
+                std::nth_element(ua_rank.begin(), ua_rank.begin() + (k - 1), ua_rank.begin() + kp);
+            }
+            for (int64_t i = 0; i < kp; ++i) {
+                const int32_t e = ua_rank[i].second;
+                if (i < k) {
+                    ua_cnt[e]++;
+                    ua_w[e] += ua_sc[e];
+                }
+                ua_prot[e] = 1;
+            }
+        }
+        // the predicted experts the cache lacks, most tokens first
+        int32_t * slots = g.lru.slot_map[j];
+        std::vector<int32_t> & want = ua_want;
+        want.clear();
+        for (int32_t e = 0; e < n_expert; ++e) {
+            if (ua_cnt[e] > 0) {
+                want.push_back(e);
+            }
+        }
+        want.erase(std::remove_if(want.begin(), want.end(), [&](int32_t e) { return slots[e] >= 0; }), want.end());
+        std::sort(want.begin(), want.end(), [&](int32_t a, int32_t c) {
+            return ua_cnt[a] != ua_cnt[c] ? ua_cnt[a] > ua_cnt[c] : ua_w[a] != ua_w[c] ? ua_w[a] > ua_w[c] : a < c;
+        });
+        const size_t budget = (size_t) std::max(0.0f, std::ceil(ua_budget*(float) ua_miss_est));
+        if (want.size() > budget) {
+            want.resize(budget);
+        }
+        if (want.empty()) {
+            return;
+        }
+        // never a slot the copies of layer il read (its slots before the seed's plan)
+        const int32_t * old = g.sd.il == il ? g.sd.old_slots.data() : g.lru.slot_map[il];
+        std::vector<uint8_t> & busy = ua_busy;
+        busy.assign(g.lru.n_slots, 0);
+        for (int32_t e = 0; e < n_expert; ++e) {
+            if (old != nullptr && old[e] >= 0) {
+                busy[old[e]] = 1;
+            }
+        }
+        // classes: 0 free slots; 1 the slots of layer j whose expert no token predicts within its top k + LLAMA_MOE_UPLOAD_AHEAD_PROTECT
+        // (4) and the slots of the layers this ubatch computed already; 2 the layers after j+1. Within a class the policy's order (lowest
+        // counter, then least recent). LLAMA_MOE_UPLOAD_AHEAD_VICTIMS=1: classes 0 and the layer j part of 1 only, 2: classes 0 and 1
+        auto & cand = ua_cand;
+        cand.clear();
+        int64_t pos = 0;
+        for (int32_t s = g.lru.head; s >= 0; s = g.lru.next[s], ++pos) {
+            if (busy[s]) {
+                continue;
+            }
+            const int32_t key = g.lru.key_of[s];
+            const int64_t v = key >= 0 && g.lru.grow_q16 > 0 ? (int64_t) g.lru.scores[key] : 0;
+            int64_t cls;
+            if (key < 0) {
+                cls = 0;
+            } else if (key / n_expert == j) {
+                if (ua_prot[key % n_expert]) {
+                    continue;
+                }
+                cls = 1;
+            } else if (ua_victims >= 2 && key / n_expert < il) {
+                cls = 1;
+            } else if (ua_victims >= 3 && key / n_expert > j + 1) {
+                cls = 2;
+            } else {
+                continue;
+            }
+            cand.push_back({ (cls << 58) + (v << 24) + pos, s });
+        }
+        if (cand.empty()) {
+            return;
+        }
+        // another layer gives slots only down to LLAMA_MOE_UPLOAD_AHEAD_FLOOR (0.9) of its share: without the floor the later layers of a
+        // ubatch took every slot of the first ones (0 of 99 left in layers 0-4 after a 184-token ubatch), and the large ubatch after it
+        // re-seeded those layers by evicting the experts it was about to copy (uploads 17.1 instead of 11.4 GB)
+        {
+            const int32_t share = std::max<int32_t>(1, g.n_slots / (int32_t) std::max<size_t>(1, g.layers.size()));
+            const int32_t floor_n = (int32_t) std::ceil(ua_floor*(float) share);
+            ua_donate.assign(layers.size(), 0);
+            for (int32_t q : g.layers) {
+                int32_t c = 0;
+                for (int32_t e = 0; e < n_expert; ++e) {
+                    c += g.lru.slot_map[q][e] >= 0;
+                }
+                ua_donate[q] = std::max(0, c - floor_n);
+            }
+            std::sort(cand.begin(), cand.end());
+            size_t o = 0;
+            for (size_t i = 0; i < cand.size() && o < want.size(); ++i) {
+                const int32_t key = g.lru.key_of[cand[i].second];
+                const int32_t q = key >= 0 ? key / n_expert : -1;
+                if (q >= 0 && q != j) {
+                    if (ua_donate[q] <= 0) {
+                        continue;
+                    }
+                    ua_donate[q]--;
+                }
+                cand[o++] = cand[i];
+            }
+            cand.resize(o);
+        }
+        if (cand.empty()) {
+            return;
+        }
+        const size_t n = std::min(want.size(), cand.size());
+        cand.resize(n);
+        std::sort(cand.begin(), cand.end(), [](const auto & a, const auto & c) { return a.second < c.second; });
+        want.resize(n);
+        std::sort(want.begin(), want.end());
+        ua_layer_t & L = ua_l[j];
+        L.experts.clear();
+        L.slots.clear();
+        L.vkeys.clear();
+        for (size_t i = 0; i < n; ++i) {
+            const int32_t s = cand[i].second;
+            const int32_t key = g.lru.key_of[s];
+            if (key >= 0) {
+                g.lru.slot_map[key / n_expert][key % n_expert] = -1;
+            }
+            g.lru.key_of[s] = j*n_expert + want[i];
+            slots[want[i]] = s;
+            g.lru.touch(s);
+            L.experts.push_back(want[i]);
+            L.slots.push_back(s);
+            L.vkeys.push_back(key);
+        }
+        g.lru.gen++;
+        L.epoch = ua_epoch;
+        L.resolved = false;
+        std::fill(L.bank_sent.begin(), L.bank_sent.end(), 0);
+        std::fill(L.bank_ev.begin(), L.bank_ev.end(), -1);
+        ua_st_ub.layers++;
+        ua_st_ub.admitted += n;
+        if (!ua_send_bank(g, j, 0, nullptr)) {
+            ua_drop(g, j);
+            ua_off = true;
+            LLAMA_LOG_WARN("llama_moe_cache%s: uploads ahead off: the experts cannot be copied asynchronously\n", tag);
         }
     }
 
@@ -4988,6 +5882,11 @@ struct llama_moe_cache::impl {
     }
 
     void prepare(int64_t n_tokens) {
+        ua_drain();
+        // a medium ubatch right after a large one is the tail of the same prompt: the large ubatch just seeded the cache with the
+        // experts this text routes, and evicting them for guesses costs more than the overlap gains (G4 q4x 12 GB multi-turn tails +8%)
+        ua_skip = ua_prev_tokens > ua_max_tokens;
+        ua_prev_tokens = n_tokens;
         static const bool st_log = getenv("LLAMA_MOE_CACHE_STATE_LOG") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_STATE_LOG")) != 0;
         if (st_log) {
             if (n_tokens > n_small_max) {
@@ -5399,6 +6298,7 @@ struct llama_moe_cache::impl {
             return false;
         }
         ggml_backend_t backend = d.backend;
+        ua_release(id);
         ggml_backend_synchronize(backend);
         size_t n_held = 0;
         for (group & g : groups) {
@@ -6218,8 +7118,16 @@ struct llama_moe_cache::impl {
             return 0;
         }
 
+        ua_dbg[0]++;
         // the device state is newer (e.g. after a warmup that selected every expert on the host): the host slots are stale, upload everything
         if (g.dev_newer) {
+            ua_dbg[1]++;
+            return 0;
+        }
+
+        // k15-pred: a layer with experts admitted ahead of its routing whose bank is not uploaded is read from the host
+        if (!ua_readable(b.il, b.ip)) {
+            ua_st_ub.blocked++;
             return 0;
         }
 
@@ -6227,8 +7135,10 @@ struct llama_moe_cache::impl {
         // while a layer is seeded, its slots are filled after its copies, so the copies read the slots it had before
         const int32_t * slots = b.il == g.sd.il ? g.sd.old_slots.data() : g.lru.slot_map[b.il];
         if (slots == nullptr || slots[e] < 0) {
+            ua_dbg[slots == nullptr ? 2 : 3]++;
             return 0;
         }
+        ua_dbg[4]++;
         int64_t n = 1;
         while (e + n <= last && slots[e + n] == slots[e] + n) {
             n++;
@@ -6273,6 +7183,9 @@ struct llama_moe_cache::impl {
         group & g = groups[l.ig];
 
         GGML_ASSERT(backend == devices[g.id].backend);
+
+        // k15-pred: a lookup reads the slots through the slot map: the experts admitted ahead get every bank first
+        ua_lookup_guard(backend, g, il);
 
         // the get_rows that looks up the slots of the selected experts
         const int n_nodes = ggml_graph_n_nodes(graph);
@@ -7067,6 +7980,12 @@ struct llama_moe_cache::impl {
         };
         log("ubatch <= 8", stats_small);
         log("ubatch  > 8", stats_large);
+        if (ua_st.layers > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: uploads ahead: %" PRIu64 " layers, %" PRIu64 " admitted, %" PRIu64 " right (%.1f%%), %" PRIu64 " wrong, %" PRIu64
+                " hits lost, %" PRIu64 " misses left, %.1f MiB ahead, %.1f MiB wasted, %" PRIu64 " fallbacks\n", tag, ua_st.layers, ua_st.admitted, ua_st.hit,
+                ua_st.admitted > 0 ? 100.0*ua_st.hit/ua_st.admitted : 0.0, ua_st.waste, ua_st.lost, ua_st.miss_rest, ua_st.bytes/1048576.0,
+                ua_st.waste_bytes/1048576.0, ua_st.fallback);
+        }
         if (device_lookup) {
             stats st;
             for (const group & g : groups) {
@@ -7455,6 +8374,26 @@ ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_
 
 ggml_tensor * llama_moe_cache::lookup(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch) const {
     return pimpl->lookup(ctx, il, ids, n_ubatch);
+}
+
+void llama_moe_cache::upload_ahead_begin(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * ids, const std::vector<int32_t> & counts) {
+    pimpl->ua_begin(backend, w, ids, counts);
+}
+
+bool llama_moe_cache::upload_ahead_pending(const ggml_tensor * w) const {
+    return pimpl->ua_pending(w);
+}
+
+void llama_moe_cache::upload_ahead_mark(ggml_backend_t backend, const ggml_tensor * w) {
+    pimpl->ua_mark(backend, w);
+}
+
+void llama_moe_cache::upload_ahead_wait(ggml_backend_t backend, const ggml_tensor * w) {
+    pimpl->ua_wait(backend, w);
+}
+
+void llama_moe_cache::upload_ahead_end(ggml_backend_t backend, const ggml_tensor * w) {
+    pimpl->ua_end(backend, w);
 }
 
 void llama_moe_cache::prepare(int64_t n_tokens) {

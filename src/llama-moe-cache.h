@@ -69,6 +69,17 @@ public:
     // before computing a ubatch: moves the state of the cache between the host and the devices if the other side uses it
     void prepare(int64_t n_tokens);
 
+    // k15-pred: uploads ahead of the routing (LLAMA_MOE_UPLOAD_AHEAD): the copy callback of a prompt ubatch calls begin after it read
+    // the ids of expert tensor w (counts: tokens per expert) and before its copies, and end after its copies and seed
+    void upload_ahead_begin(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * ids, const std::vector<int32_t> & counts);
+    void upload_ahead_end(ggml_backend_t backend, const ggml_tensor * w);
+    // the uploads ahead of the layer of w not yet waited for; wait: the backend's stream waits for them (before the copies of w read the
+    // cache or its seed writes slots; the uploads of its misses do not need to wait)
+    bool upload_ahead_pending(const ggml_tensor * w) const;
+    void upload_ahead_wait(ggml_backend_t backend, const ggml_tensor * w);
+    // after the uploads of the misses of w are queued on the backend: the next upload ahead is ordered after them
+    void upload_ahead_mark(ggml_backend_t backend, const ggml_tensor * w);
+
     // hybrid small batches [LLAMA_MOE_CACHE_HYBRID, LLAMA_MOE_CACHE_FETCH]: the GPU computes the cached experts, the host computes the
     // missing ones it is left; only a share of the missing experts is fetched and admitted
     // the hybrid lookup of layer il (see ggml_moe_cache_assign), nullptr if the layer does not use it, and the copies of the experts it

@@ -6613,9 +6613,18 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
 }
 
 static void ggml_cuda_side_mv_plan(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+    // the last node a candidate reads is found by a scan back from it (the first node that is one of its sources: a node appears once
+    // in the graph), not from a map of every node kept up to date over the moves (0.4 ms at 4k nodes, rebuilt every graph).
+    // opt-in: GGML_CUDA_SIDE_MV_SCAN=1 (default: the map, as before)
+    static const bool scan = [] {
+        const char * e = getenv("GGML_CUDA_SIDE_MV_SCAN");
+        return e != nullptr && atoi(e) != 0;
+    }();
     std::unordered_map<const ggml_tensor *, int> idx;
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        idx[cgraph->nodes[i]] = i;
+    if (!scan) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            idx[cgraph->nodes[i]] = i;
+        }
     }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -6623,10 +6632,21 @@ static void ggml_cuda_side_mv_plan(ggml_backend_cuda_context * cuda_ctx, ggml_cg
             continue;
         }
         int p = -1; // the last node it reads
-        for (int k = 0; k < GGML_MAX_SRC; ++k) {
-            const auto it = node->src[k] ? idx.find(node->src[k]) : idx.end();
-            if (it != idx.end()) {
-                p = std::max(p, it->second);
+        if (scan) {
+            for (int j = i - 1; j >= 0 && p < 0; --j) {
+                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    if (node->src[k] != nullptr && cgraph->nodes[j] == node->src[k]) {
+                        p = j;
+                        break;
+                    }
+                }
+            }
+        } else {
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                const auto it = node->src[k] ? idx.find(node->src[k]) : idx.end();
+                if (it != idx.end()) {
+                    p = std::max(p, it->second);
+                }
             }
         }
         int c = -1; // its first reader
@@ -6643,8 +6663,10 @@ static void ggml_cuda_side_mv_plan(ggml_backend_cuda_context * cuda_ctx, ggml_cg
         }
         if (i > p + 1) {
             std::rotate(cgraph->nodes + p + 1, cgraph->nodes + i, cgraph->nodes + i + 1);
-            for (int j = p + 1; j <= i; ++j) {
-                idx[cgraph->nodes[j]] = j;
+            if (!scan) {
+                for (int j = p + 1; j <= i; ++j) {
+                    idx[cgraph->nodes[j]] = j;
+                }
             }
         }
         // the main stream may reuse the memory of the sources once their last reader in the node order is done

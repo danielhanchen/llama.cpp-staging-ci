@@ -6268,6 +6268,12 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
         st.ids = ids;
     }
 
+    // k15-pred: the experts uploaded ahead of this layer's routing are waited for, the next layer's are predicted (see llama_moe_cache)
+    const bool ua = lctx->moe_cache && !st.all && !st.counts.empty() && lctx->moe_cache->get_experts(src) != nullptr;
+    if (ua) {
+        lctx->moe_cache->upload_ahead_begin(backend, src, ids, st.counts);
+    }
+
     // group consecutive experts and copy them together
     // batched (e.g. CUDA >= 12.8): every cached run is copied from the MoE cache in one call with the uploads
     // otherwise only long cached runs are copied from the cache (many small copies cost more than they save), before the uploads
@@ -6322,14 +6328,31 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
     bool done = false;
     if (batch) {
         plan(true);
+        const size_t n_cached = st.regions.size();
         for (const auto & [offset, size] : st.uploads) {
             st.regions.push_back({ src, offset, dst, offset, size });
         }
         // fails (nothing copied) e.g. when the host weights are not pinned
-        if (ggml_backend_tensor_copy_regions_async(backend, st.regions.data(), st.regions.size())) {
+        if (ua && lctx->moe_cache->upload_ahead_pending(src)) {
+            // k15-pred: the uploads of the misses first, they do not read the slots uploaded ahead; then the cached runs after the wait
+            if (n_cached == st.regions.size() || ggml_backend_tensor_copy_regions_async(backend, st.regions.data() + n_cached, st.regions.size() - n_cached)) {
+                lctx->moe_cache->upload_ahead_mark(backend, src);
+                lctx->moe_cache->upload_ahead_wait(backend, src);
+                if (n_cached == 0 || ggml_backend_tensor_copy_regions_async(backend, st.regions.data(), n_cached)) {
+                    lctx->moe_cache->count_batch(src, st.regions);
+                    done = true;
+                }
+            }
+        } else if (ggml_backend_tensor_copy_regions_async(backend, st.regions.data(), st.regions.size())) {
             lctx->moe_cache->count_batch(src, st.regions);
             done = true;
+            if (ua) {
+                lctx->moe_cache->upload_ahead_mark(backend, src);
+            }
         }
+    }
+    if (ua) {
+        lctx->moe_cache->upload_ahead_wait(backend, src);
     }
     if (!done) {
         plan(false);
@@ -6338,6 +6361,9 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
             for (const auto & [offset, size] : st.uploads) {
                 ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
             }
+        }
+        if (ua) {
+            lctx->moe_cache->upload_ahead_mark(backend, src);
         }
     }
 
@@ -6365,6 +6391,24 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
     if (lctx->moe_cache_record && (ids->flags & GGML_TENSOR_FLAG_OUTPUT) && lctx->moe_cache->get_experts(src) != nullptr &&
             std::none_of(lctx->moe_cache_ids.begin(), lctx->moe_cache_ids.end(), [&](const auto & r) { return r.second == ids; })) {
         lctx->moe_cache_ids.emplace_back(src, ids);
+    }
+    if (ua) {
+        lctx->moe_cache->upload_ahead_end(backend, src);
+    }
+    // LLAMA_MOE_COPY_CHECK=1 (debug): every routed expert staged in dst holds the host bytes of its expert
+    static const bool copy_check = getenv("LLAMA_MOE_COPY_CHECK") != nullptr && atoi(getenv("LLAMA_MOE_COPY_CHECK")) != 0;
+    if (copy_check && !st.all && src->data != nullptr && ggml_backend_buffer_is_host(src->buffer)) {
+        ggml_backend_synchronize(backend);
+        std::vector<uint8_t> buf(expert_size);
+        for (int64_t e = 0; e < n_expert; ++e) {
+            if (!st.used[e]) {
+                continue;
+            }
+            ggml_backend_tensor_get(dst, buf.data(), e*expert_size, expert_size);
+            if (memcmp(buf.data(), (const uint8_t *) src->data + e*expert_size, expert_size) != 0) {
+                LLAMA_LOG_WARN("%s: copy check: %s expert %lld differs in the staged copy\n", __func__, src->name, (long long) e);
+            }
+        }
     }
 
     return true;
