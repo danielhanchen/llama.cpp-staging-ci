@@ -2108,9 +2108,11 @@ static bool common_fit_draft_on_cpu(
         const llama_model_params & mparams_dft, llama_context_params cparams_dft, const std::string & path_dft, ggml_log_level log_level,
         bool * needs_target = nullptr) {
     constexpr double MiB = 1024.0*1024.0;
-    // k15-pp (default 0.60, was 0.25; a sanity bound, the floor below decides): G4 Qwen3.8-Flash-Next UD-IQ1_S 16 GB, Q4_K_M MTP
-    // drafter on the device: +32..35% decode, +75% 8k prompt against no draft; it takes 37% (ctx 16384) / 41% (ctx 32768) of the cache
-    double max_frac = 0.60;
+    // default 0.25 (k15-pp: 0.60 admits more drafts, +13..55% decode, but the drafter's own prompt pass, about 29 us per prompt token
+    // plus about 50 ms per request, then sits on every prompt: G4 TTFT +8..18%, +42% at Flash-Next UD-IQ1_S 16 GB 16k, where the smaller
+    // cache also lends too few slots for a full layer-major group (k15g4d2, plans/k15_pp.md section 20). LLAMA_FIT_DRAFT_MAX_CACHE_FRAC=0.60
+    // opts in until the drafter's prompt pass is off the time to first token
+    double max_frac = 0.25;
     if (const char * env = getenv("LLAMA_FIT_DRAFT_MAX_CACHE_FRAC")) {
         max_frac = std::max(0.0, atof(env));
     }
@@ -2489,7 +2491,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
         // a separate draft model next to a MoE cache goes last: the main model's layers and its cache are placed first, and the draft
         // model gets the GPU only if it fits in the memory the cache does not use, or takes at most LLAMA_FIT_DRAFT_MAX_CACHE_FRAC
-        // (default 0.60), leaving more than LLAMA_FIT_DRAFT_MIN_CACHE_FRAC (0.10) of the host experts cached, of the memory the cache would get; otherwise it runs on the CPU, or, if the caller can run without it
+        // (default 0.25), leaving more than LLAMA_FIT_DRAFT_MIN_CACHE_FRAC (0.10) of the host experts cached, of the memory the cache would get; otherwise it runs on the CPU, or, if the caller can run without it
         // (fit_can_drop), it is left out and drafting is off unless LLAMA_FIT_DRAFT_CPU=1 (drafting on the CPU is slower than none)
         // the old order (the draft model first, the main model around it) with LLAMA_FIT_DRAFT_LAST=0, or when -ngld or -devd is set
         bool draft_cpu = false;
