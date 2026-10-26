@@ -5383,6 +5383,101 @@ static bool ggml_cuda_try_gdn_state_in_place(ggml_backend_cuda_context * cuda_ct
     return true;
 }
 
+// k15-fn (GGML_CUDA_DISABLE_CONV_STATE_FUSION=1 off): the conv-state copy of a recurrent layer (qwen4exp build_conv_state_at: a CPY of
+// the last d_conv - 1 columns of the conv input into the recurrent cache) is deferred to the short convolution that reads the same input
+// a few nodes later, whose short-token kernel writes the same floats (ssm_conv_f32, see ssm_conv_state_copies): one launch per layer
+// fewer. Only when nothing between them touches the copy's destination or writes over the input, and the convolution's outputs do not
+// overlap its input (an allocator could put the SILU output over the freed input: then the copy could read overwritten floats)
+static bool ggml_cuda_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    if (a == nullptr || b == nullptr || a->data == nullptr || b->data == nullptr || ggml_nbytes(a) == 0 || ggml_nbytes(b) == 0) {
+        return false;
+    }
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
+// a deferred conv-state copy whose convolution did not take it (not expected: the defer checks the convolution's path) runs at the end
+// of the graph evaluation as the copy it was
+static void ggml_cuda_conv_state_flush(ggml_backend_cuda_context * cuda_ctx) {
+    if (cuda_ctx->conv_state_pending.empty()) {
+        return;
+    }
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        GGML_LOG_WARN("%s: deferred conv-state copies ran at the end of the graph (GGML_CUDA_DISABLE_CONV_STATE_FUSION=1 off)\n", __func__);
+    }
+    for (auto & [conv, cpys] : cuda_ctx->conv_state_pending) {
+        for (ggml_tensor * c : cpys) {
+            ggml_cuda_cpy(*cuda_ctx, c->src[0], c->src[1]);
+        }
+    }
+    cuda_ctx->conv_state_pending.clear();
+}
+
+static bool ggml_cuda_try_conv_state_defer(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_CONV_STATE_FUSION");
+    if (disabled || ggml_cuda_fusion_disabled() || cuda_ctx->curr_stream_no != 0) {
+        return false;
+    }
+    ggml_tensor * cpy = cgraph->nodes[i];
+    const ggml_tensor * tail = cpy->src[0];
+    const ggml_tensor * dst  = cpy->src[1];
+    if (cpy->op != GGML_OP_CPY || tail == nullptr || dst == nullptr || tail->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        (cpy->flags & GGML_TENSOR_FLAG_OUTPUT) || tail->view_src == nullptr || tail->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
+        tail->ne[3] != 1 || dst->ne[3] != 1 || !ggml_are_same_shape(tail, dst) || dst->nb[1] % sizeof(float) != 0 ||
+        dst->nb[2] % sizeof(float) != 0 || tail->data == nullptr || dst->data == nullptr) {
+        return false;
+    }
+    const ggml_tensor * input = tail->view_src;
+    // the tail is a column range of every row of the input: the same row and sequence strides, the offset inside the first row
+    const size_t offs = (const char *) tail->data - (const char *) input->data;
+    if (input->type != GGML_TYPE_F32 || input->nb[0] != sizeof(float) || tail->nb[1] != input->nb[1] || tail->nb[2] != input->nb[2] ||
+        tail->ne[1] != input->ne[1] || tail->ne[2] != input->ne[2] || offs % sizeof(float) != 0 ||
+        offs / sizeof(float) + tail->ne[0] > (size_t) input->ne[0]) {
+        return false;
+    }
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 24; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_SSM_CONV && n->src[0] == input) {
+            const ggml_tensor * w = n->src[1];
+            const int64_t n_t = n->ne[1];
+            if (w == nullptr || w->ne[0] != tail->ne[0] + 1 || n->ne[0] != input->ne[1] || n->ne[2] != input->ne[2] || n_t > 32 ||
+                input->nb[1] != input->ne[0] * (int64_t) sizeof(float) || input->ne[1] % 128 != 0) {
+                return false;
+            }
+            // the LFM2 short conv * c fusion does not take the copies; the outputs the kernel may write must not overlap the input
+            if (j + 1 < cgraph->n_nodes && cgraph->nodes[j + 1]->op == GGML_OP_MUL) {
+                return false;
+            }
+            for (int k = j; k < cgraph->n_nodes && k <= j + 2; ++k) {
+                if (ggml_cuda_ranges_overlap(cgraph->nodes[k], input) || ggml_cuda_ranges_overlap(cgraph->nodes[k], dst)) {
+                    return false;
+                }
+            }
+            auto & v = cuda_ctx->conv_state_pending[n];
+            if (v.size() >= 4) {
+                return false;
+            }
+            v.push_back(cpy);
+            return true;
+        }
+        // a node between them: it must not read or write the copy's destination, nor write over the input
+        if (ggml_cuda_ranges_overlap(n, dst) || ggml_cuda_ranges_overlap(n, input)) {
+            if (!(n->op == GGML_OP_CPY && n->src[0] != nullptr && n->src[0]->view_src == input && !ggml_cuda_ranges_overlap(n, dst))) {
+                return false;
+            }
+        }
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            if (ggml_cuda_ranges_overlap(n->src[k], dst)) {
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
 // k15-fn: the gated_delta_net (non-KDA, one sequence, not the mma kernel) that is the only reader of t (through views of t; its src[k] a
 // contiguous whole view of t), or -1
 static int ggml_cuda_sole_gdn_reader(const ggml_cgraph * cgraph, int i, const ggml_tensor * t, int k_expected) {
@@ -7217,6 +7312,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->mmvq_done_early.clear();
             cuda_ctx->gdn_state_in_place.clear();
             cuda_ctx->gdn_gates_in.clear();
+            cuda_ctx->conv_state_pending.clear();
             ggml_cuda_qsa_maskless_plan(cuda_ctx, cgraph);
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -7297,6 +7393,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 if (!cuda_ctx->mmvq_done_early.empty() && cuda_ctx->mmvq_done_early.count(node)) {
                     // computed by an earlier multi-matrix mul_mat_vec_q launch (ggml_cuda_try_fuse_mmvq_multi)
+                    ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 1);
+                    continue;
+                }
+
+                if (node->op == GGML_OP_CPY && ggml_cuda_try_conv_state_defer(cuda_ctx, cgraph, i)) {
+                    // the short convolution that reads the same input writes this copy (ssm_conv_state_copies)
                     ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 1);
                     continue;
                 }
@@ -7410,6 +7512,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->mmvq_done_early.clear();
             cuda_ctx->gdn_state_in_place.clear();
             cuda_ctx->gdn_gates_in.clear();
+            ggml_cuda_conv_state_flush(cuda_ctx);
         }
 
         // an overlapped MoE cache fetch whose join is not in this graph (another split): the side stream joins the main stream

@@ -1692,6 +1692,9 @@ struct ggml_backend_cuda_context {
     // g = softplus(a + bias[h]) * scale[h]; the skipped nodes' inputs stay unwritten until the gated_delta_net reads them
     struct gdn_gates { const float * beta_raw; const float * a; const float * bias; const float * scale; };
     std::unordered_map<const ggml_tensor *, gdn_gates> gdn_gates_in;
+    // k15-fn: conv-state copies (the CPY of a conv input's last d_conv - 1 columns into the recurrent cache, qwen4exp build_conv_state_at)
+    // deferred into the short convolution that reads the same input (ggml_cuda_try_conv_state_defer): SSM_CONV node -> its CPY nodes
+    std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> conv_state_pending;
     // k15-mm2: QSA maskless (ggml_cuda_qsa_maskless_plan): flash attention node -> its selection, and the dense mask nodes not run
     std::unordered_map<const ggml_tensor *, ggml_cuda_qsa_maskless> qsa_maskless;
     std::unordered_set<const ggml_tensor *> qsa_skip;
