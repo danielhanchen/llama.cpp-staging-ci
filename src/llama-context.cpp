@@ -8368,8 +8368,10 @@ bool llama_moe_pin_small_set(llama_context * ctx, bool on) {
 }
 
 void llama_context::moe_request_begin() {
-    if (moe_cache != nullptr) {
-        moe_cache->request_begin();
+    if (moe_cache != nullptr && moe_cache->request_begin()) {
+        // the reset takes back the lent slots without a new allocation: a reused graph would keep its copies bound to them
+        gf_res_prev_active = nullptr;
+        gf_res_epoch++;
     }
 }
 

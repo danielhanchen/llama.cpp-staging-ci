@@ -3749,10 +3749,19 @@ struct llama_moe_cache::impl {
     double cm_rate_snap = -1.0;
     bool   cm_measured_snap = false;
     int    cm_req_n = 0;
-    void cm_request_begin() {
-        static const bool on = [] { const char * e = getenv("LLAMA_MOE_CPU_MISS_PER_REQUEST"); return e != nullptr && atoi(e) != 0; }();
-        if (!on || !cm || !cm_cal || cm_force || cm_frozen) {
-            return;
+    // =1 also empties the cache at each request (hybrid_reset, as the fixed-share hybrid path does): which experts the host computes
+    // depends on what is cached, which the earlier requests left (G4 LFM2.5 8 GB 8k: 189 vs 221 tok/s and another text by the order
+    // of the requests alone, with the same rule decisions); the prompt's seed fills it again. =2: the decisions only
+    bool cm_request_begin() {
+        static const int on = [] { const char * e = getenv("LLAMA_MOE_CPU_MISS_PER_REQUEST"); return e != nullptr ? atoi(e) : 0; }();
+        if (on == 0 || !cm || !cm_cal || cm_frozen) {
+            return false;
+        }
+        if (on == 1) {
+            hybrid_reset(true);
+        }
+        if (cm_force) {
+            return on == 1; // LLAMA_MOE_CPU_MISS=2: no decisions to restart
         }
         cm_req_n++;
         if (!cm_req_snap) {
@@ -3773,8 +3782,10 @@ struct llama_moe_cache::impl {
         }
         cm_gen++;
         if (cm_req_n <= 2) {
-            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: request %d starts from the launch's decisions (LLAMA_MOE_CPU_MISS_PER_REQUEST)\n", tag, cm_req_n);
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: request %d starts from the launch's decisions%s (LLAMA_MOE_CPU_MISS_PER_REQUEST)\n", tag,
+                cm_req_n, on == 1 ? " and an empty cache" : "");
         }
+        return on == 1;
     }
 
     // a batch of more than max_batch tokens (a short prompt) that the host path serves: it is looked up on the device like a small batch
@@ -3973,8 +3984,8 @@ struct llama_moe_cache::impl {
     // the rounding residual of the share, which all carry over from earlier batches; the context calls this before a batch whose
     // sequences are all empty (a new request) and after a state is read, so the output does not depend on earlier requests:
     // the cache starts empty as in a new process (the plain path computes the same with any cache contents, it is not reset)
-    void hybrid_reset() {
-        if (!hybrid || !hybrid_fixed) {
+    void hybrid_reset(bool force = false) {
+        if (!force && (!hybrid || !hybrid_fixed)) {
             return;
         }
         seed_counts.clear();
@@ -7320,8 +7331,8 @@ bool llama_moe_cache::pin_small_set(bool on) {
     return pimpl->cm_pin_set(on);
 }
 
-void llama_moe_cache::request_begin() {
-    pimpl->cm_request_begin();
+bool llama_moe_cache::request_begin() {
+    return pimpl->cm_request_begin();
 }
 
 bool llama_moe_cache::cpu_miss_drop_slow() {

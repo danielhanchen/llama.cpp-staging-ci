@@ -93,7 +93,7 @@ public:
     // k15-lfm2: lift (false) / restore (true) that pin between requests; returns the pinned state (see llama_moe_pin_small_set)
     bool pin_small_set(bool on);
     // k15-lfm2: a new request starts (LLAMA_MOE_CPU_MISS_PER_REQUEST=1): the CPU-miss rule's decisions restart from the launch's (see cm_request_begin)
-    void request_begin();
+    bool request_begin(); // true if the cache was emptied
     // k15-lfm2: see llama_moe_cpu_miss_drop_slow
     bool cpu_miss_drop_slow();
     // k13: who computes the missing experts of small batches: 0 = never the host (every miss fetched), 1 = the hybrid path with a fixed
