@@ -5153,6 +5153,13 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         LLAMA_LOG_INFO("%s: async seed: %" PRId64 " routings read without a sync, %.2f ms waited for them in total\n", __func__, lm_n_async,
             lm_n_async_wait_us/1000.0);
     }
+    if (lm_n_seed_unstaged > 0) {
+        static int n_unstaged_log = 0;
+        if (n_unstaged_log++ < 4) {
+            LLAMA_LOG_WARN("%s: %" PRId64 " expert copies outside staging memory did not seed the cache so far (LLAMA_MOE_LM_SEED_STAGED_ONLY=0 seeds "
+                "from them)\n", __func__, lm_n_seed_unstaged);
+        }
+    }
     lm_pending.clear();
     lm_staged_seq.clear();
     lm_seed_async       = false;
@@ -6485,7 +6492,16 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
         }
     }
     // layer-major graph: the routing that seeds this layer may come later, the seed then copies from this copy (see lm_eval_cb)
-    if (lctx->lm_seed_active && lctx->moe_cache->get_experts(src) != nullptr) {
+    // k15-fn (LLAMA_MOE_LM_SEED_STAGED_ONLY=0 off): only from a prefetched copy in staging memory. A copy the graph allocator placed (the
+    // host-weight prefetch turned off within the group, e.g. its staging arena failed to allocate after a lent graph) is overwritten by
+    // the later nodes of the graph before the routing resolves, and the seed filled cache slots with those bytes (G4 fn1 IQ1_S + MTP 16 GB
+    // 16k with GGML_SCHED_LEND_OWN=0: 118 + 21 slots wrong, the text and drafts off the no-draft run; locally GGML_SCHED_PREFETCH_FAIL_AT=1)
+    static const bool lm_seed_staged_only = getenv("LLAMA_MOE_LM_SEED_STAGED_ONLY") == nullptr || atoi(getenv("LLAMA_MOE_LM_SEED_STAGED_ONLY")) != 0;
+    if (lctx->lm_seed_active && lm_seed_staged_only && lctx->moe_cache->get_experts(src) != nullptr &&
+            !ggml_backend_sched_tensor_is_staged(lctx->sched.get(), dst)) {
+        lctx->lm_staged.erase(src);
+        lctx->lm_n_seed_unstaged++;
+    } else if (lctx->lm_seed_active && lctx->moe_cache->get_experts(src) != nullptr) {
         static const bool tail_dbg_s = getenv("LLAMA_LM_TAIL_DEBUG") != nullptr;
         if (tail_dbg_s && lctx->lm_staged.count(src) > 0) {
             LLAMA_LOG_INFO("%s: tail debug: a second staged copy of %s (all %d, previous dst %p, this %p)\n", __func__, src->name, (int) st.all,
