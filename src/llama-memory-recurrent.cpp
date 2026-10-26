@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "llama-memory-recurrent.h"
 
 #include "ggml-backend.h"
@@ -35,12 +36,33 @@ llama_memory_recurrent::llama_memory_recurrent(
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
 
-    // k16-draft: commit by replay for the delta-net models (see llama_memory_recurrent::replay); LLAMA_RS_REPLAY=0: snapshot rows
+    // k16-draft: commit by replay for the delta-net models (see llama_memory_recurrent::replay). LLAMA_RS_REPLAY unset / auto: only
+    // when layer weights spill to host memory while others are on a device (a MoE cache / host experts: the memory the snapshot rows
+    // would take goes to the cache there); with everything resident (or nothing offloaded) the snapshot rows stay, since the commit's
+    // second delta-net pass costs decode (B200, full card: fn1 -1.5%, Qwen3.6-35B-A3B -2.8%). =1 forces replay, =0 the snapshot rows.
+    // The placement is read from the weights' buffers, which a no_alloc (fit probe) model also sets, so a probe sizes the same rows.
     {
         const char * e = getenv("LLAMA_RS_REPLAY");
+        const int mode = e == nullptr || strcmp(e, "auto") == 0 ? -1 : (atoi(e) != 0 ? 1 : 0);
         const bool arch_ok = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN4EXP;
-        replay = n_rs_seq > 0 && arch_ok && (e == nullptr || atoi(e) != 0) && hparams.n_embd_head_kda == 0 &&
+        const bool can = n_rs_seq > 0 && arch_ok && hparams.n_embd_head_kda == 0 &&
                  hparams.ssm_dt_rank > 0 && hparams.ssm_d_state > 0 && hparams.ssm_d_inner % hparams.ssm_dt_rank == 0;
+        bool want = mode == 1;
+        if (can && mode < 0) {
+            bool on_host = false, on_dev = false;
+            for (const auto & it : model.tensors_by_name) {
+                const ggml_tensor * t = it.second;
+                if (t == nullptr || t->buffer == nullptr || it.first.compare(0, 4, "blk.") != 0) {
+                    continue;
+                }
+                (ggml_backend_buffer_is_host(t->buffer) ? on_host : on_dev) = true;
+            }
+            want = on_host && on_dev;
+            LLAMA_LOG_INFO("%s: delta-net rollback: %s (LLAMA_RS_REPLAY auto: layer weights %s; =1 / =0 forces replay / snapshot rows)\n",
+                    __func__, want ? "replay" : "snapshot rows", on_host && on_dev ? "spill to host memory" :
+                    on_dev ? "all on a device" : "all in host memory");
+        }
+        replay = can && want;
         pend_n.assign(mem_size, 0);
         pend_rb.assign(mem_size, 0);
     }
