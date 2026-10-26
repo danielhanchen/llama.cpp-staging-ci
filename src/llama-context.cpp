@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <set>
 #include <cinttypes>
 #if defined(__GLIBC__)
 #include <malloc.h>
@@ -936,6 +937,23 @@ void llama_context::rs_replay_commit(bool sync) {
         }
         ggml_cgraph * gfh = hit->second.second;
         if (key != rs_key) {
+            // the allocator keeps any tensor whose data is set, so the intermediates (and views of them) of a graph allocated before
+            // another key's graph would keep addresses in a compute buffer that may since have been reallocated: clear them first
+            ggml_context * hctx = hit->second.first.get();
+            std::set<const ggml_tensor *> own;
+            for (ggml_tensor * t = ggml_get_first_tensor(hctx); t != nullptr; t = ggml_get_next_tensor(hctx, t)) {
+                own.insert(t);
+            }
+            for (ggml_tensor * t = ggml_get_first_tensor(hctx); t != nullptr; t = ggml_get_next_tensor(hctx, t)) {
+                const ggml_tensor * root = t;
+                while (root->view_src != nullptr) {
+                    root = root->view_src;
+                }
+                if (own.count(root) != 0) {
+                    t->data   = nullptr;
+                    t->buffer = nullptr;
+                }
+            }
             ggml_backend_sched_reset(rs_sched.get());
             if (!ggml_backend_sched_alloc_graph(rs_sched.get(), gfh)) {
                 GGML_ABORT("%s: cannot allocate the replay commit graph", __func__);
