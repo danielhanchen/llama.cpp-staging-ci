@@ -477,6 +477,33 @@ static __global__ void mm_ids_zero_dst(
     }
 }
 
+bool ggml_cuda_mm_ids_may_skip(const ggml_tensor * ids) {
+    static const bool off = [] {
+        const char * e = getenv("GGML_CUDA_MMID_ZERO_SKIP");
+        return e != nullptr && atoi(e) == 0;
+    }();
+    if (off || ids == nullptr) {
+        return true;
+    }
+    const ggml_tensor * t = ids;
+    for (int depth = 0; depth < 16 && t != nullptr; ++depth) {
+        switch (t->op) {
+            case GGML_OP_VIEW:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+                t = t->src[0];
+                break;
+            case GGML_OP_ARGSORT:
+            case GGML_OP_TOP_K:
+                return t->type != GGML_TYPE_I32;
+            default:
+                return true;
+        }
+    }
+    return true;
+}
+
 void ggml_cuda_launch_mm_ids_zero_dst(
         const int32_t * ids, float * dst,
         const int n_tokens, const int n_expert_used, const int ne0, const int si1,

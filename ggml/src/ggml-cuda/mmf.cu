@@ -70,7 +70,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     }
 
     // the matmul below only writes the rows an expert owns, the rest are skipped slots
-    if (ids) {
+    if (ids && ggml_cuda_mm_ids_may_skip(ids)) {
         ggml_cuda_launch_mm_ids_zero_dst(ids_d, dst_d,
             static_cast<int>(ne12), static_cast<int>(ids->ne[0]), static_cast<int>(ne0),
             static_cast<int>(ids_s1), s1, s2, ctx.stream());

@@ -394,9 +394,11 @@ void ggml_cuda_mul_mat_q(
         }
 
         // the matmul below only writes the rows an expert owns, the rest are skipped slots
-        ggml_cuda_launch_mm_ids_zero_dst((const int32_t *) ids->data, dst_d,
-            ne12, n_expert_used, ne0, si1, s1, s2, stream);
-        CUDA_CHECK(cudaGetLastError());
+        if (ggml_cuda_mm_ids_may_skip(ids)) {
+            ggml_cuda_launch_mm_ids_zero_dst((const int32_t *) ids->data, dst_d,
+                ne12, n_expert_used, ne0, si1, s1, s2, stream);
+            CUDA_CHECK(cudaGetLastError());
+        }
     }
 
     ggml_cuda_pool_alloc<char> src1_q8_1_a(ctx.pool());

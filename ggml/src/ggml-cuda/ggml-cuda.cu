@@ -2510,9 +2510,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 
     // the get_rows above copies a placeholder row into the skipped slots, overwrite them with zeros
-    ggml_cuda_launch_mm_ids_zero_dst((const int32_t *) ids->data, (float *) dst->data,
-        ne2, n_expert_used, ne0, ids->nb[1]/sizeof(int32_t), nb1/sizeof(float), nb2/sizeof(float), stream);
-    CUDA_CHECK(cudaGetLastError());
+    if (ggml_cuda_mm_ids_may_skip(ids)) {
+        ggml_cuda_launch_mm_ids_zero_dst((const int32_t *) ids->data, (float *) dst->data,
+            ne2, n_expert_used, ne0, ids->nb[1]/sizeof(int32_t), nb1/sizeof(float), nb2/sizeof(float), stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
 
 // k15-fn debug (GGML_CUDA_GRAPH_NODE_STATS=3): the copy / gather nodes executed after the fusions, logged per captured graph
