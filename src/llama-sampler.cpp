@@ -576,6 +576,11 @@ private:
     bool support;
 };
 
+// k15-fn: whether a sampler (or a member of a chain) keeps graph-input tensors of the graph built last (dist: its uniforms, penalties: the
+// token counts, logit_bias: the biases): a kept graph built before must not be reused (llm_graph_input_sampling::can_reuse), else it
+// runs with the other graph's inputs set and its own uninitialized. greedy_masked keeps its mask in its own buffer instead
+static bool llama_sampler_graph_bound_one(const struct llama_sampler * smpl);
+
 // .copy_state for samplers deriving from llama_sampler_backend
 template<typename T>
 static void llama_sampler_backend_copy_state(const struct llama_sampler * src, struct llama_sampler * dst) {
@@ -4610,4 +4615,26 @@ void llama_perf_sampler_reset(struct llama_sampler * chain) {
 
     ctx->t_sample_us = 0;
     ctx->n_sample    = 0;
+}
+
+// k15-fn: see llama_sampler_graph_bound_one
+static bool llama_sampler_graph_bound_one(const struct llama_sampler * smpl) {
+    return smpl != nullptr && (smpl->iface == &llama_sampler_dist_i || smpl->iface == &llama_sampler_penalties_i ||
+                              smpl->iface == &llama_sampler_logit_bias_i);
+}
+
+bool llama_sampler_graph_bound(const struct llama_sampler * smpl) {
+    if (smpl == nullptr) {
+        return false;
+    }
+    if (smpl->iface == &llama_sampler_chain_i) {
+        const auto * chain = (const struct llama_sampler_chain *) smpl->ctx;
+        for (const auto & e : chain->samplers) {
+            if (e.is_backend && llama_sampler_graph_bound_one(e.ptr)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return llama_sampler_graph_bound_one(smpl);
 }
