@@ -4052,6 +4052,13 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     const size_t num_unary = std::count(ops.begin(), ops.end(), GGML_OP_UNARY);
     GGML_ASSERT(unary_ops.size() == num_unary);
 #endif
+    // k15-hostcut: every pattern below matches only through ggml_can_fuse / ggml_can_fuse_subgraph, which need node_idx to have the
+    // first op: test that first, before the pattern comparisons (about 30 calls per node in ggml_cuda_try_fuse).
+    // GGML_CUDA_FUSE_PREFILTER=0: off
+    static const bool prefilter = !getenv("GGML_CUDA_FUSE_PREFILTER") || atoi(getenv("GGML_CUDA_FUSE_PREFILTER")) != 0;
+    if (prefilter && (node_idx < 0 || node_idx >= cgraph->n_nodes || ops.size() == 0 || cgraph->nodes[node_idx]->op != *ops.begin())) {
+        return false;
+    }
 
     const auto is_equal = [](const std::initializer_list<enum ggml_op> & list1,
                              const std::initializer_list<enum ggml_op> & list2) {
@@ -4364,6 +4371,12 @@ static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::un
         if (is_candidate(cgraph->nodes[i])) {
             n_readers[cgraph->nodes[i]->src[1]->data]++;
         }
+    }
+    // k15-hostcut: no mat-vec-size product (a prompt batch): no slot, and the producer scans below would find no target
+    // (the same result without five passes over the graph). GGML_CUDA_Q8_1_PLAN_SCAN=1: scan anyway
+    static const bool always_scan = ggml_cuda_env_flag("GGML_CUDA_Q8_1_PLAN_SCAN");
+    if (n_readers.empty() && !always_scan) {
+        return 0;
     }
 
     // RMS_NORM + MUL outputs that a candidate reads as a whole contiguous activation: the fused norm kernel writes their
