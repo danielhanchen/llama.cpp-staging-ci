@@ -5190,6 +5190,37 @@ struct llama_moe_cache::impl {
         lend_max = std::max(lend_max, n_lend);
     }
 
+    // k15-fn: the most slots the cache could lend to the graph allocation of a merged layer-major graph on the device of backend (the n_max of
+    // lend for a graph without host lookups: every slot but those of one layer), its slot count and bytes; 0 where it lends nothing to a graph
+    // (lending off, the banks released, host lookups in its largest group, several devices without LLAMA_MOE_CACHE_LEND_MULTI)
+    int32_t graph_lend_capacity(ggml_backend_t backend, int32_t * n_slots_out, size_t * expert_bytes_out) const {
+        if (n_slots_out) { *n_slots_out = 0; }
+        if (expert_bytes_out) { *expert_bytes_out = 0; }
+        const auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return d.backend == backend; });
+        if (it_dev == devices.end() || !it_dev->buf_bank || it_dev->released || lend_mode == 0) {
+            return 0;
+        }
+        if (!lend_multi && std::count_if(devices.begin(), devices.end(), [](const device & d) { return d.host_bytes > 0 && d.buf_bank; }) > 1) {
+            return 0;
+        }
+        const int id = (int) (it_dev - devices.begin());
+        const group * gl = nullptr;
+        bool host_read = false;
+        for (const group & g : groups) {
+            if (g.id == id && g.n_slots > 0 && (gl == nullptr || (size_t) g.n_slots*g.expert_bytes > (size_t) gl->n_slots*gl->expert_bytes)) {
+                gl = &g;
+            }
+            host_read = host_read || (g.id == id && g.host_read);
+        }
+        if (gl == nullptr || host_read) {
+            return 0;
+        }
+        if (n_slots_out) { *n_slots_out = gl->n_slots; }
+        if (expert_bytes_out) { *expert_bytes_out = gl->expert_bytes; }
+        const int32_t n_keep = std::min<int32_t>(gl->n_slots / 2, gl->lru.n_expert + 1);
+        return std::max<int32_t>(gl->n_slots / 2, gl->n_slots - n_keep);
+    }
+
     bool lends_on(ggml_backend_t backend) const {
         const auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return d.backend == backend; });
         if (it_dev == devices.end() || !it_dev->buf || lend_mode == 0) {
@@ -6996,6 +7027,10 @@ bool llama_moe_cache::lends() const {
 
 bool llama_moe_cache::lends_on(ggml_backend_t backend) const {
     return pimpl->lends_on(backend);
+}
+
+int32_t llama_moe_cache::graph_lend_capacity(ggml_backend_t backend, int32_t * n_slots, size_t * expert_bytes) const {
+    return pimpl->graph_lend_capacity(backend, n_slots, expert_bytes);
 }
 
 bool llama_moe_cache::release() {
