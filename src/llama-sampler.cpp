@@ -134,8 +134,10 @@ struct ring_buffer {
 
 // writes result in res, does not mutate cur
 static void llama_token_data_array_partial_sort(const llama_token_data_array & cur, int npartial, std::vector<llama_token_data> & res) {
+    // k15-fn: equal logits in id order (a total order), so a row and any subset of it holding its top npartial give the same sorted
+    // top npartial (the device top-k candidates of common_sampler_device_topk)
     static const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
-        return a.logit > b.logit;
+        return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
     };
 
     constexpr int   nbuckets     = 128;
@@ -192,8 +194,10 @@ static void llama_token_data_array_partial_sort(const llama_token_data_array & c
 
 // reduces the size of cur_p to npartial, keeping only the top npartial elements
 static void llama_token_data_array_partial_sort_inplace(llama_token_data_array * cur_p, int npartial) {
+    // k15-fn: equal logits in id order (a total order), so a row and any subset of it holding its top npartial give the same sorted
+    // top npartial (the device top-k candidates of common_sampler_device_topk)
     static const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
-        return a.logit > b.logit;
+        return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
     };
 
     if (npartial <= 128) {

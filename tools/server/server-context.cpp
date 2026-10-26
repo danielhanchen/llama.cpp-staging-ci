@@ -415,7 +415,13 @@ struct server_slot {
     // k15-fn: the device greedy chain of this slot (set in the context while greedy requests run, see launch_slot_with_task)
     llama_sampler_ptr smpl_dev;
     llama_sampler_ptr smpl_dev_m; // the same with the EOG tokens excluded (ignore_eos requests), swapped in for them
+    llama_sampler_ptr smpl_dev_k; // a device top-k (dev_topk_k candidates) for sampled requests the host chain can finish from them
     bool smpl_dev_set = false;
+
+    // the device chain with the largest graph, set when the graphs are reserved (the others are swapped in without a reserve)
+    llama_sampler * dev_reserve_chain() const {
+        return smpl_dev_k ? smpl_dev_k.get() : smpl_dev_m ? smpl_dev_m.get() : smpl_dev.get();
+    }
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
@@ -1020,6 +1026,7 @@ public:
     llama_model * model_tgt = nullptr;
     bool device_greedy_ok = false; // k15-fn: greedy requests sample on the device (see launch_slot_with_task)
     std::vector<llama_token> dev_greedy_mask; // the EOG tokens (ignore_eos), ascending: the mask of the slots' masked device chain
+    int32_t dev_topk_k = 0; // k15-fn: the candidates of the device top-k chain (0: off, LLAMA_SERVER_DEVICE_TOPK=0)
 
     mtmd_context * mctx = nullptr;
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
@@ -1676,6 +1683,13 @@ private:
             std::sort(dev_greedy_mask.begin(), dev_greedy_mask.end());
             dev_greedy_mask.erase(std::unique(dev_greedy_mask.begin(), dev_greedy_mask.end()), dev_greedy_mask.end());
 
+            // sampled requests: a device top-k of dev_topk_k candidates, from which the host chain gives the token of the full row
+            // (common_sampler_device_topk); this chain has the largest outputs, so it is the one set for the reserve
+            {
+                const char * ek = getenv("LLAMA_SERVER_DEVICE_TOPK");
+                dev_topk_k = ek == nullptr ? 256 : atoi(ek);
+                dev_topk_k = std::max(0, std::min(dev_topk_k, 4096));
+            }
             bool all = true;
             for (auto & slot : slots) {
                 slot.smpl_dev.reset(llama_sampler_chain_init(llama_sampler_chain_default_params()));
@@ -1686,7 +1700,12 @@ private:
                     llama_sampler_chain_add(slot.smpl_dev_m.get(),
                         llama_sampler_init_greedy_masked((int32_t) dev_greedy_mask.size(), dev_greedy_mask.data()));
                 }
-                slot.smpl_dev_set = llama_set_sampler(ctx_tgt, slot.id, slot.smpl_dev_m ? slot.smpl_dev_m.get() : slot.smpl_dev.get());
+                slot.smpl_dev_k.reset();
+                if (dev_topk_k > 0) {
+                    slot.smpl_dev_k.reset(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+                    llama_sampler_chain_add(slot.smpl_dev_k.get(), llama_sampler_init_top_k(dev_topk_k));
+                }
+                slot.smpl_dev_set = llama_set_sampler(ctx_tgt, slot.id, slot.dev_reserve_chain());
                 llama_set_sampler_raw_logits(ctx_tgt, slot.id, true);
                 all = all && slot.smpl_dev_set;
             }
@@ -1699,8 +1718,9 @@ private:
             }
             llama_sched_reserve_now(ctx_tgt);
             for (auto & slot : slots) {
-                if (slot.smpl_dev_set && slot.smpl_dev_m && !llama_set_sampler_swap(ctx_tgt, slot.id, slot.smpl_dev.get())) {
-                    slot.smpl_dev_m.reset(); // stays on the masked chain: never taken for a request without that mask
+                if (slot.smpl_dev_set && slot.dev_reserve_chain() != slot.smpl_dev.get() && !llama_set_sampler_swap(ctx_tgt, slot.id, slot.smpl_dev.get())) {
+                    slot.smpl_dev_m.reset();
+                    slot.smpl_dev_k.reset();
                     slot.smpl_dev.reset();
                     llama_set_sampler(ctx_tgt, slot.id, nullptr);
                     slot.smpl_dev_set = false;
@@ -2225,7 +2245,10 @@ private:
             // so the logits of the sampled rows (every verify row of speculative decoding) are not copied to the host: G4 Qwen3.8-Flash-Next
             // + MTP copied 1.08 MiB per token. Other requests copy the raw logits and sample on the host. LLAMA_SERVER_DEVICE_GREEDY=0 off
             // an ignore_eos request (every bias is the -inf of an EOG token) takes the masked chain of the slot
-            const bool dev_ok = !use_backend_sampling && !need_pre_sample_logits && slot.smpl_dev && (slot.smpl_dev_set || device_greedy_ok);
+            // a sampled request whose chain can finish from the device top-k (common_sampler_device_topk) takes the slot's top-k chain:
+            // the rows copy dev_topk_k candidates instead of the full logits. A decision task reads the raw logits
+            const bool dev_ok = !use_backend_sampling && !need_pre_sample_logits && slot.smpl_dev && (slot.smpl_dev_set || device_greedy_ok) &&
+                task.decision.labels.empty();
             bool dev_masked = false;
             bool dev_greedy = dev_ok && common_sampler_device_greedy(slot.smpl.get());
             if (dev_ok && !dev_greedy && slot.smpl_dev_m) {
@@ -2233,6 +2256,7 @@ private:
                 dev_masked = common_sampler_device_greedy_masked(slot.smpl.get(), mask) && mask == dev_greedy_mask;
                 dev_greedy = dev_masked;
             }
+            bool dev_topk = dev_ok && !dev_greedy && slot.smpl_dev_k && common_sampler_device_topk(slot.smpl.get(), dev_topk_k) > 0;
 
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
@@ -2240,18 +2264,23 @@ private:
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
             } else if (slot.smpl_dev) {
                 if (!slot.smpl_dev_set) {
-                    // back from a backend sampling request: the larger (masked) chain is set for the reserve
-                    slot.smpl_dev_set = llama_set_sampler(ctx_tgt, slot.id, slot.smpl_dev_m ? slot.smpl_dev_m.get() : slot.smpl_dev.get());
+                    // back from a backend sampling request: the largest chain is set for the reserve
+                    slot.smpl_dev_set = llama_set_sampler(ctx_tgt, slot.id, slot.dev_reserve_chain());
                 }
-                if (slot.smpl_dev_set && dev_greedy) {
-                    llama_sampler * want = dev_masked ? slot.smpl_dev_m.get() : slot.smpl_dev.get();
-                    dev_greedy = llama_set_sampler_swap(ctx_tgt, slot.id, want);
+                if (slot.smpl_dev_set && (dev_greedy || dev_topk)) {
+                    llama_sampler * want = dev_topk ? slot.smpl_dev_k.get() : dev_masked ? slot.smpl_dev_m.get() : slot.smpl_dev.get();
+                    const bool ok = llama_set_sampler_swap(ctx_tgt, slot.id, want);
+                    dev_greedy = dev_greedy && ok;
+                    dev_topk   = dev_topk && ok;
                 }
                 dev_greedy = dev_greedy && slot.smpl_dev_set;
-                llama_set_sampler_raw_logits(ctx_tgt, slot.id, !dev_greedy);
+                dev_topk   = dev_topk && slot.smpl_dev_set;
+                llama_set_sampler_raw_logits(ctx_tgt, slot.id, !dev_greedy && !dev_topk);
                 common_sampler_set_device_token(slot.smpl.get(), dev_greedy);
+                common_sampler_set_device_topk(slot.smpl.get(), dev_topk);
             } else {
                 common_sampler_set_device_token(slot.smpl.get(), false);
+                common_sampler_set_device_topk(slot.smpl.get(), false);
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
             }
 
