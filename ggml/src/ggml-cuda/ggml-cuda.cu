@@ -5563,7 +5563,10 @@ static __global__ void k_qsa_idx_select(const int32_t * __restrict__ idx, const 
 }
 
 static int ggml_cuda_try_fuse_qsa_idx(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
-    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_QSA_IDX_FUSION");
+    // opt-in (GGML_CUDA_QSA_IDX_FUSION=1): on G4 fn4 IQ4_XS 32 GB Studio the 8k / 16k md5 varied from launch to launch with it on and was
+    // stable with it off (k15gd2_g4, 3 launches per arm); the fn1 cells here are exact. Not found yet (interplay with the QSA maskless
+    // attention suspected). GGML_CUDA_DISABLE_QSA_IDX_FUSION=1 still turns it off
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_QSA_IDX_FUSION") || !ggml_cuda_env_flag("GGML_CUDA_QSA_IDX_FUSION");
     if (disabled || i + 4 >= cgraph->n_nodes) {
         return 0;
     }
