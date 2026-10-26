@@ -1296,8 +1296,6 @@ static __global__ void mul_mat_q_stream_k_fixup(
         float * tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
         const int stride_col_dst, const uint3 nchannels_y, const int stride_channel_dst, const uint3 nsamples_y,
         const int stride_sample_dst, const uint3 ntx_host, const int nexperts_compact, const int32_t * __restrict__ tile_prefix) {
-    // k15-mm2: tile_prefix: the column tile count is known on the device only (mmq_moe_tile_prefix), the stream-k split is over it
-    const uint3 ntx = tile_prefix ? mmq_fastdiv_values_dev(tile_prefix[nexperts_compact]) : ntx_host;
     constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps          = (ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / 2) / warp_size;
     constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback, prec_src1);
@@ -1308,6 +1306,9 @@ static __global__ void mul_mat_q_stream_k_fixup(
     // k13-pp: launched with PDL (programmatic dependent launch) behind the stream-k kernel, so its launch overlaps that kernel's tail:
     // wait here for the stream-k kernel's partial sums (a no-op without PDL)
     ggml_cuda_pdl_sync();
+    // k15-mm2: tile_prefix: the column tile count is known on the device only (mmq_moe_tile_prefix), the stream-k split is over it;
+    // read after the PDL wait like every other input
+    const uint3 ntx = tile_prefix ? mmq_fastdiv_values_dev(tile_prefix[nexperts_compact]) : ntx_host;
 
     float sum[J / nwarps] = {0.0f};
     const int i = blockIdx.y*warp_size + threadIdx.x;

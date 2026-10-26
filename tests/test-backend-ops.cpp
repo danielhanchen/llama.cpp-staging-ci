@@ -8601,6 +8601,59 @@ struct test_mul_mat_vec_multi : public test_case {
     }
 };
 
+// k15-mm2: hyper-connection down -> silu(scale) -> up: the up product applies the elementwise chain to its src1 in its own launch
+// (ggml_cuda_mul_mat_vec_q_ew). pattern 0: scale + silu, 1: silu, 2: scale with bias, 3: scale + silu with the chain input read
+// by a second node too (no fusion)
+struct test_hc_mix : public test_case {
+    const ggml_type type;
+    const int64_t m;   // tokens
+    const int64_t lr;  // K of the up product
+    const int pattern;
+    const bool exact;
+    const int64_t d;   // K of the down product, rows of the up product
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, m, lr, pattern, exact, d);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_MIX";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_hc_mix(ggml_type type, int64_t m, int64_t lr, int pattern, bool exact, int64_t d = 1024)
+        : type(type), m(m), lr(lr), pattern(pattern), exact(exact), d(d) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, m);
+        ggml_tensor * wd = ggml_new_tensor_2d(ctx, type, d, lr);
+        ggml_tensor * wu = ggml_new_tensor_2d(ctx, type, lr, d);
+        ggml_tensor * lo = ggml_mul_mat(ctx, wd, x);
+        ggml_tensor * c;
+        switch (pattern) {
+            case 1:  c = ggml_silu(ctx, lo); break;
+            case 2:  c = ggml_scale_bias(ctx, lo, 0.25f, 0.5f); break;
+            default: c = ggml_silu(ctx, ggml_scale(ctx, lo, 0.25f)); break;
+        }
+        ggml_tensor * up = ggml_mul_mat(ctx, wu, c);
+        if (exact) {
+            up->flags |= GGML_TENSOR_FLAG_BATCH_INVARIANT;
+        }
+        ggml_tensor * out = ggml_sigmoid(ctx, up);
+        if (pattern == 3) {
+            out = ggml_concat(ctx, out, c, 0);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    double max_nmse_err() override {
+        return type == GGML_TYPE_Q8_0 ? 5e-4 : 2e-2; // two chained 4-bit products (not fused, the type check) against the CPU
+    }
+};
+
 struct test_mul_mat_vec_shared_src1 : public test_case {
     const ggml_type type_a;
     const ggml_type type_b; // type of the second dense weight (e.g. V of a different quant type)
@@ -10869,6 +10922,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool mm : {false, true}) {
             test_cases.emplace_back(new test_hc_post_norm(2560, 4, 1, gated, mm));
             test_cases.emplace_back(new test_hc_post_norm(512, 4, 2, gated, mm));
+            // k15-mm2: the 3 / 4 token MTP verify (the post computed in the q8_1 norm kernel)
+            test_cases.emplace_back(new test_hc_post_norm(2560, 4, 3, gated, mm));
+            test_cases.emplace_back(new test_hc_post_norm(mm ? 40 : 30, 4, 4, gated, mm)); // 40*4 is a Q8_0 row; 40 straddles q8_1 blocks
         }
         test_cases.emplace_back(new test_hc_post_norm(31, 4, 17, gated, false));
         test_cases.emplace_back(new test_hc_post_norm(1024, 3, 5, gated, false));
@@ -13217,6 +13273,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // k15-mm2: hc down -> silu(scale) -> up in the up launch (K 320: Flash-Next; 96 / 992: the K range; 1024 and 5 tokens: not fused)
+    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int64_t m : { 1, 2, 3, 4, 5 }) {
+            for (int64_t lr : { 96, 320, 992, 1024 }) {
+                for (int pattern : { 0, 1, 2, 3 }) {
+                    test_cases.emplace_back(new test_hc_mix(type, m, lr, pattern, m == 3));
+                }
+            }
+        }
+    }
+
     // k15-mm2: multi-matrix F32 / BF16 mat-vec (ggml_cuda_mul_mat_vec_f_multi): the same graphs with float weights, 1-4 columns
     // (K 2048 / 2560: Qwen3.6 / Flash-Next alpha + beta, router + shared expert gate, indexer q + k)
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_BF16 }) {
@@ -13479,6 +13546,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (auto mk : std::vector<std::array<int64_t, 2>>{ { 4, 10240 }, { 48, 2560 }, { 512, 2560 }, { 1, 2560 } }) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
         }
+        // k15-mm2: hc down -> silu(scale) -> up (+ sigmoid) at the Flash-Next shape (GGML_CUDA_MMVQ_EW=0: the unfused launches)
+        test_cases.emplace_back(new test_hc_mix(GGML_TYPE_Q8_0, n, 320, 0, false, 10240));
         // k15-mm2: the router and indexer shapes as BF16 (the F32 router weights are exactly BF16-representable; indexer q / k)
         for (auto mk : std::vector<std::array<int64_t, 2>>{ { 512, 2560 }, { 128, 2560 } }) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));

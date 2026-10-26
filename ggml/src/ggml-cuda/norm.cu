@@ -437,7 +437,7 @@ static void group_norm_f32_cuda(
 // order: float4 loads when do_vec, launched with the block size rms_norm_f32_dispatch picks); the q8_1 rows are produced
 // from the same f32 values exactly as quantize_q8_1 does (one value per lane, the same 32-lane reductions), so both
 // outputs are bit-identical to the unfused rms_norm + mul + quantize_q8_1 sequence.
-template <int block_size, int vpt, bool do_vec, int batch = 1>
+template <int block_size, int vpt, bool do_vec, int batch = 1, bool c_hcpost = false>
 static __global__ void rms_norm_mul_q8_1_f32(const float * x,
                                              float *       dst,
                                              void *        vq,
@@ -458,7 +458,8 @@ static __global__ void rms_norm_mul_q8_1_f32(const float * x,
                                              const uint3   mul_nchannels_packed,
                                              const uint3   mul_nsamples_packed,
                                              const float * ra = nullptr,
-                                             const float * rb = nullptr) {
+                                             const float * rb = nullptr,
+                                             const ggml_cuda_hc_post_args hcp = {}) {
     // k15: ra / rb (both or neither): x = ra + rb is computed here (the ADD before the norm, a residual add) and stored to x, with the
     // same float add as k_bin_bcast's op_add; the norm reads the same values, so every output is bit-identical to ADD + RMS_NORM + MUL
     static_assert(block_size % QK8_1 == 0, "a warp must cover whole q8_1 blocks");
@@ -484,6 +485,29 @@ static __global__ void rms_norm_mul_q8_1_f32(const float * x,
 
             float tmp = 0.0f;
             const int64_t xoff = sample*stride_sample + channel*stride_channel + row*stride_row;
+            // c_hcpost: the row is stream `row` of token `channel` of the DSV4_HC_POST output; its weight once per block
+            [[maybe_unused]] float hc_w = 0.0f;
+            [[maybe_unused]] const float * hc_bo = nullptr;
+            [[maybe_unused]] const float * hc_r  = nullptr;
+            if constexpr (c_hcpost) {
+                __shared__ float hc_w_s;
+                __syncthreads();
+                if (tid == 0) {
+                    float w = hcp.post[row + (int64_t) hcp.hc*channel];
+#pragma unroll
+                    for (int j = 0; j < GGML_CUDA_HC_POST_NORM_MAX_OPS; ++j) {
+                        if (j < hcp.n_ops) {
+                            // the expressions of ew_chain_apply (SCALE) and op_sigmoid
+                            w = hcp.op[j] == 0 ? hcp.p0[j] * w + hcp.p1[j] : 1.0f / (1.0f + expf(-w));
+                        }
+                    }
+                    hc_w_s = w;
+                }
+                __syncthreads();
+                hc_w  = hc_w_s;
+                hc_bo = hcp.bo + channel*hcp.sbo1;
+                hc_r  = hcp.residual + row*hcp.sr1 + channel*hcp.sr2;
+            }
             if constexpr (do_vec) {
                 const int      ncols4 = ncols / 4;
                 const float4 * x4     = (const float4 *) xc;
@@ -492,7 +516,16 @@ static __global__ void rms_norm_mul_q8_1_f32(const float * x,
                     const int i = tid + k*block_size;
                     if (i < ncols4) {
                         float4 xs;
-                        if (ra != nullptr) {
+                        if constexpr (c_hcpost) {
+                            // hc_post_chain_f32: sum = x*w; sum += residual
+                            const float4 b = ((const float4 *) hc_bo)[i];
+                            const float4 r = ((const float4 *) hc_r)[i];
+                            xs.x = b.x * hc_w; xs.x += r.x;
+                            xs.y = b.y * hc_w; xs.y += r.y;
+                            xs.z = b.z * hc_w; xs.z += r.z;
+                            xs.w = b.w * hc_w; xs.w += r.w;
+                            ((float4 *) const_cast<float *>(xc))[i] = xs;
+                        } else if (ra != nullptr) {
                             const float4 a = ((const float4 *) (ra + xoff))[i];
                             const float4 b = ((const float4 *) (rb + xoff))[i];
                             xs = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
@@ -506,7 +539,11 @@ static __global__ void rms_norm_mul_q8_1_f32(const float * x,
             } else {
                 for (int col = tid; col < ncols; col += block_size) {
                     float xi;
-                    if (ra != nullptr) {
+                    if constexpr (c_hcpost) {
+                        xi = hc_bo[col] * hc_w;
+                        xi += hc_r[col];
+                        const_cast<float *>(xc)[col] = xi;
+                    } else if (ra != nullptr) {
                         xi = ra[xoff + col] + rb[xoff + col];
                         const_cast<float *>(xc)[col] = xi;
                     } else {
@@ -516,7 +553,7 @@ static __global__ void rms_norm_mul_q8_1_f32(const float * x,
                 }
             }
             tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
-            if (ra != nullptr) {
+            if (c_hcpost || ra != nullptr) {
                 __syncthreads(); // the second pass reads elements other threads stored
             }
 
@@ -1009,7 +1046,8 @@ static bool rms_norm_mul_conv_launch(ggml_backend_cuda_context & ctx, const ggml
 }
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor, void * q8_1_out,
-                                 const ggml_tensor * add_tensor) {
+                                 const ggml_tensor * add_tensor, const ggml_cuda_hc_post_args * hcp) {
+    GGML_ASSERT(hcp == nullptr || (q8_1_out != nullptr && add_tensor == nullptr));
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     // k15: add_tensor (the ADD producing rms_norm_src, fused before it): only with the q8_1 output (see ggml_cuda_try_fuse_add_rms_norm)
     GGML_ASSERT(add_tensor == nullptr || (add_tensor == rms_norm_src && q8_1_out != nullptr));
@@ -1084,16 +1122,21 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
         const float * rb_d = add_tensor ? (const float *) add_tensor->src[1]->data : nullptr;
         bool vec = ne00 % 4 == 0 && ne00 > 0 && ((uintptr_t) dst_d & 15) == 0;
         vec = vec && ggml_cuda_is_aligned(rms_norm_src, 16) && mul_ncols == ne00 && ggml_cuda_is_aligned(mul_src, 16);
+        const ggml_cuda_hc_post_args hc_args = hcp ? *hcp : ggml_cuda_hc_post_args{};
+        // the vector loads of the hc post inputs: 16-byte aligned rows (the fusion checks the tensors, these the row strides)
+        GGML_ASSERT(!hcp || !vec || (((uintptr_t) hc_args.bo & 15) == 0 && ((uintptr_t) hc_args.residual & 15) == 0 &&
+            hc_args.sbo1 % 4 == 0 && hc_args.sr1 % 4 == 0 && hc_args.sr2 % 4 == 0));
         const int64_t n4 = ne00 / 4;
         static const bool rms_q8_1_batch = !getenv("GGML_CUDA_RMS_Q8_1_BATCH") || atoi(getenv("GGML_CUDA_RMS_Q8_1_BATCH")) != 0;
 #define RMS_NORM_Q8_1_LAUNCH(BLOCK_SIZE, VPT, VEC) \
         do { \
             const dim3 block_dims(BLOCK_SIZE, 1, 1); \
             const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32 * sizeof(float), stream}; \
-            const auto kernel = rms_q8_1_batch ? rms_norm_mul_q8_1_f32<BLOCK_SIZE, VPT, VEC, 4> : rms_norm_mul_q8_1_f32<BLOCK_SIZE, VPT, VEC, 1>; \
+            const auto kernel = hcp ? (rms_q8_1_batch ? rms_norm_mul_q8_1_f32<BLOCK_SIZE, VPT, VEC, 4, true> : rms_norm_mul_q8_1_f32<BLOCK_SIZE, VPT, VEC, 1, true>) : \
+                                      (rms_q8_1_batch ? rms_norm_mul_q8_1_f32<BLOCK_SIZE, VPT, VEC, 4> : rms_norm_mul_q8_1_f32<BLOCK_SIZE, VPT, VEC, 1>); \
             ggml_cuda_kernel_launch(kernel, launch_params, src0_d, dst_d, q8_1_out, (int) ne00, ncols_padded, \
                 (int) ne02, (int) ne03, s01, s02, s03, eps, mul_d, mul_s01, mul_s02, mul_s03, \
-                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, ra_d, rb_d); \
+                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, ra_d, rb_d, hc_args); \
         } while (0)
         if (vec) {
             if (n4 <= 32) {

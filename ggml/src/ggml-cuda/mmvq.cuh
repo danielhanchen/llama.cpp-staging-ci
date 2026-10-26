@@ -24,3 +24,10 @@ bool ggml_cuda_mul_mat_vec_q_multi_ok(ggml_type type, int64_t ncols_x, int64_t n
 // n (2..GGML_CUDA_MMVQ_MULTI_MAX) dense quantized matrices of one type and K over the same contiguous src1, one launch
 void ggml_cuda_mul_mat_vec_q_multi(ggml_backend_cuda_context & ctx, int n, const ggml_tensor * const * src0, const ggml_tensor * src1,
     ggml_tensor * const * dst);
+
+// k15-mm2: whether ggml_cuda_mul_mat_vec_q_ew gives dst the bytes of the unfused chain + ggml_cuda_mul_mat_vec_q
+bool ggml_cuda_mul_mat_vec_q_ew_ok(const ggml_tensor * src0, const ggml_tensor * dst, int cc);
+
+// dst = src0 * chain(ew_src), chain = n_ops SCALE (ops[o] == 0: p0 * x + p1) / SILU (ops[o] == 1) ops, quantized to q8_1 in the kernel
+void ggml_cuda_mul_mat_vec_q_ew(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * ew_src, int n_ops,
+    const int * ops, const float * p0, const float * p1, ggml_tensor * dst);
