@@ -709,6 +709,11 @@ struct server_prompt_cache {
     // not need: the slot was kept by prompt similarity); true if one was removed
     bool drop_newest(const server_tokens & tokens);
 
+    // k15-idlewait (LLAMA_PCS_IDLE_LEND): the checkpoints an idle save moved into the newest entry holding exactly these tokens go back
+    // to the slot (dst), all of them when the entry is about to be dropped (keep_entry false), else a copy of those up to pos keep_max
+    // (the ones the slot's next prompt keeps); true if the entry was found
+    bool ckpt_return(const server_tokens & tokens, std::list<common_prompt_checkpoint> & dst, bool keep_entry, llama_pos keep_max);
+
     // in bytes, 0 = no limit
     size_t limit_size = 0;
 

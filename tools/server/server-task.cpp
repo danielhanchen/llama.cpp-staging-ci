@@ -2007,6 +2007,25 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     return true;
 }
 
+bool server_prompt_cache::ckpt_return(const server_tokens & tokens, std::list<common_prompt_checkpoint> & dst, bool keep_entry, llama_pos keep_max) {
+    wait_inflight();
+    for (auto it = states.rbegin(); it != states.rend(); ++it) {
+        if (it->prompt.tokens.size() == tokens.size() && it->prompt.tokens.get_common_prefix(tokens) == tokens.size()) {
+            if (!keep_entry) {
+                dst.splice(dst.end(), it->prompt.checkpoints);
+            } else {
+                for (const auto & c : it->prompt.checkpoints) {
+                    if (c.pos_max <= keep_max) {
+                        dst.push_back(prompt_checkpoint_clone(c));
+                    }
+                }
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 bool server_prompt_cache::drop_newest(const server_tokens & tokens) {
     wait_inflight();
     for (auto it = states.rbegin(); it != states.rend(); ++it) {

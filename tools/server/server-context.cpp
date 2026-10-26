@@ -357,11 +357,23 @@ struct server_slot {
     // k15-ttft: the slot's prompt is in the prompt cache already, saved while the server was idle (LLAMA_PCS_IDLE_SAVE)
     bool prompt_saved_idle = false;
     bool prompt_saved_idle_new = false; // ... into a new entry (not one the cache held already)
+    // k15-idlewait: that save moved the slot's checkpoints into the entry instead of copying them (they come back at the next request)
+    bool ckpt_lent = false;
 
-    bool prompt_save(server_prompt_cache & prompt_cache, llama_pos ckpt_keep_max = -2, bool force_async = false) {
+    bool prompt_save(server_prompt_cache & prompt_cache, llama_pos ckpt_keep_max = -2, bool force_async = false, bool lend_ckpt = false) {
         if (prompt.tokens.size() == 0) {
             return false;
         }
+        // k15-idlewait: an idle save of the only slot moves the checkpoints into the entry (no copy on the server loop: G4 q4x, 63 MiB for
+        // the 640-token warm prompt); ckpt_return gives them back at the next request (server_context_impl::get_available_slot)
+        std::list<common_prompt_checkpoint> lent;
+        if (lend_ckpt) {
+            lent.splice(lent.end(), prompt.checkpoints);
+        }
+        struct lent_back {
+            std::list<common_prompt_checkpoint> & from; std::list<common_prompt_checkpoint> & to;
+            ~lent_back() { if (!from.empty()) { to.splice(to.begin(), from); } }
+        } lent_guard { lent, prompt.checkpoints };
 
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
@@ -376,6 +388,13 @@ struct server_slot {
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, mv ? &prompt.checkpoints : nullptr, ckpt_keep_max);
         if (cur == nullptr) {
             return false;
+        }
+        if (!lent.empty()) {
+            for (const auto & c : lent) {
+                common_state_buf_prefault(c.data_tgt.size(), 2); // as the copy would have asked (prompt_checkpoint_clone)
+            }
+            cur->prompt.checkpoints.splice(cur->prompt.checkpoints.end(), lent);
+            ckpt_lent = true;
         }
 
         // k11 (LLAMA_PROMPT_SAVE_ASYNC=1, opt-in: on G4 it took 5 ms off the chat TTFT but the copies then delay the prompt's first
@@ -437,7 +456,7 @@ struct server_slot {
     }
 
     void prompt_clear() {
-        prompt_saved_idle = false; prompt_saved_idle_new = false;
+        prompt_saved_idle = false; prompt_saved_idle_new = false; ckpt_lent = false;
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
@@ -1999,7 +2018,8 @@ private:
                             (prompt_cache->limit_tokens > 0 && prompt_cache->n_tokens() + slot.prompt.tokens.size() > prompt_cache->limit_tokens)) {
                             continue;
                         }
-                        slot.prompt_saved_idle_new = slot.prompt_save(*prompt_cache, -2, idle_save == 2);
+                        static const bool lend_env = getenv("LLAMA_PCS_IDLE_LEND") == nullptr || atoi(getenv("LLAMA_PCS_IDLE_LEND")) != 0;
+                        slot.prompt_saved_idle_new = slot.prompt_save(*prompt_cache, -2, idle_save == 2, lend_env && params_base.n_parallel == 1);
                         if (slot.prompt_saved_idle_new) {
                             prompt_cache->update();
                         }
@@ -2233,6 +2253,17 @@ private:
         if (ret) {
             // k15-ttft: a save made at idle that the old order would not have made (the slot is kept: similarity, or a stateless task)
             // is taken back, so the cache holds what it held before (LLAMA_PCS_IDLE_SAVE)
+            // k15-idlewait: the checkpoints the idle save lent to its entry come back first: all of them when the entry is dropped below,
+            // else a copy of the ones the next prompt keeps (past the common prefix the slot would erase them when the prompt starts)
+            if (ret->ckpt_lent && prompt_cache) {
+                const bool keep_entry = update_cache && !task.is_stateless();
+                llama_pos kmax = std::numeric_limits<llama_pos>::max();
+                if (keep_entry && task.params.n_cache_reuse == 0 && !task.tokens.has_mtmd && !ret->prompt.tokens.has_mtmd) {
+                    kmax = (llama_pos) ret->prompt.tokens.get_common_prefix(task.tokens);
+                }
+                prompt_cache->ckpt_return(ret->prompt.tokens, ret->prompt.checkpoints, keep_entry, kmax);
+            }
+            ret->ckpt_lent = false;
             if (ret->prompt_saved_idle && ret->prompt_saved_idle_new && prompt_cache && !(update_cache && !task.is_stateless())) {
                 prompt_cache->drop_newest(ret->prompt.tokens);
             }
@@ -2343,6 +2374,7 @@ private:
                     SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task.params.lora.size());
                     slot.prompt.clear();
                     slot.prompt_saved_idle = false;
+                    slot.ckpt_lent = false;
                 } else {
                     SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
                 }
@@ -3601,6 +3633,10 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+                    if (slot->ckpt_lent && prompt_cache) { // k15-idlewait: the lent checkpoints come back (all; the entry stays)
+                        prompt_cache->ckpt_return(slot->prompt.tokens, slot->prompt.checkpoints, false, 0);
+                        slot->ckpt_lent = false;
+                    }
 
                     const int64_t t_start = ggml_time_us();
 
@@ -3662,6 +3698,10 @@ private:
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
                         break;
+                    }
+                    if (slot->ckpt_lent && prompt_cache) { // k15-idlewait: the lent checkpoints come back (all; the entry stays)
+                        prompt_cache->ckpt_return(slot->prompt.tokens, slot->prompt.checkpoints, false, 0);
+                        slot->ckpt_lent = false;
                     }
 
                     const int64_t t_start = ggml_time_us();
@@ -3731,6 +3771,10 @@ private:
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
                         break;
+                    }
+                    if (slot->ckpt_lent && prompt_cache) { // k15-idlewait: the lent checkpoints come back (all; the entry stays)
+                        prompt_cache->ckpt_return(slot->prompt.tokens, slot->prompt.checkpoints, false, 0);
+                        slot->ckpt_lent = false;
                     }
 
                     // Erase token cache
@@ -4072,6 +4116,7 @@ private:
 
                     slot.prompt.clear();
                     slot.prompt_saved_idle = false;
+                    slot.ckpt_lent = false;
                     slot.prompt.tokens.insert(new_tokens);
                 }
 
