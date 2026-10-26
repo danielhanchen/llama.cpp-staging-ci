@@ -255,9 +255,8 @@ struct llama_context {
     ggml_backend_sched_ptr   rs_sched;
     int64_t                  rs_replay_us = 0;
     // the last commit graph, reused while the same cells commit the same tokens (LLAMA_RS_REPLAY_REUSE=0: rebuilt every time)
-    ggml_context_ptr         rs_ctx;
-    ggml_cgraph *            rs_gf = nullptr;
-    std::vector<uint32_t>    rs_key;
+    std::map<std::vector<uint32_t>, std::pair<ggml_context_ptr, ggml_cgraph *>> rs_graphs; // per (cell, tokens, rolled back) set
+    std::vector<uint32_t>    rs_key; // the graph the sched holds the allocation of
     uint64_t                 rs_reused = 0;
 
     // set when backend work is queued (graph_compute, async state copies), cleared by synchronize()
