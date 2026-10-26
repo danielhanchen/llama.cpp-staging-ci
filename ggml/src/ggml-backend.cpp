@@ -13,6 +13,7 @@
 #include "ggml-alloc.h"
 #include "ggml-alloc-ext.h"
 #include "ggml-impl.h"
+#include "ggml-moe-prefetch.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -21,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
 #include <functional>
 #include <unordered_map>
 #include <unordered_set>
@@ -4423,6 +4425,73 @@ static void ggml_backend_sched_prefetch_plan(ggml_backend_sched_t sched) {
     sched->callback_plan(srcs.data(), (int) srcs.size(), sched->callback_plan_user_data);
 }
 
+// k16-disk: disk prefetch lookahead of host experts (ported from ik_llama.cpp PR #2101, see ggml-moe-prefetch.cpp). The host expert
+// tensors (host buffer, WEIGHTS usage, ne[2] > 1) that the engine has registered (expert ranges of file mappings, by llama) of the
+// next GGML_MOE_PREFETCH_AHEAD (default 3, ggml_moe_prefetch_set_ahead) MoE splits of a batch of >= 32 tokens are streamed into the
+// page cache while the current split runs, and the pages the streamer read for a split are MADV_COLD after it, so prompt streaming
+// does not evict the decode working set. Page cache only: the copies and kernels read the same mapped bytes.
+struct ggml_moe_disk_split {
+    int split;
+    std::vector<const ggml_tensor *> host_weights;
+};
+
+static std::atomic<int> ggml_moe_prefetch_ahead_n{-1};
+
+extern "C" void ggml_moe_prefetch_set_ahead(int n) {
+    ggml_moe_prefetch_ahead_n.store(n, std::memory_order_relaxed);
+}
+
+static int ggml_moe_prefetch_ahead() {
+    const int n = ggml_moe_prefetch_ahead_n.load(std::memory_order_relaxed);
+    if (n >= 0) {
+        return n;
+    }
+    static const int def = [] {
+        const char * env = getenv("GGML_MOE_PREFETCH_AHEAD");
+        return env ? std::max(0, atoi(env)) : 3;
+    }();
+    return def;
+}
+
+static void ggml_moe_disk_splits(ggml_backend_sched_t sched, std::vector<ggml_moe_disk_split> & out) {
+    out.clear();
+    for (int i = 0; i < sched->n_splits; i++) {
+        const struct ggml_backend_sched_split & sp = sched->splits[i];
+        ggml_moe_disk_split info;
+        info.split = i;
+        int64_t n_tokens = 0;
+        bool multi_layer = false;
+        const ggml_tensor * host_ids = nullptr;
+        for (int n = 0; n < sp.graph.n_nodes; ++n) {
+            const ggml_tensor * node = sp.graph.nodes[n];
+            if (node->op != GGML_OP_MUL_MAT_ID) {
+                continue;
+            }
+            const ggml_tensor * node_ids = node->src[2];
+            n_tokens = std::max<int64_t>(n_tokens, node_ids ? node_ids->ne[1] : 0);
+            const ggml_tensor * w = node->src[0];
+            if (w && ggml_backend_sched_is_host_weight(w) && w->ne[2] > 1 && ggml_moe_prefetch_is_registered(w)) {
+                info.host_weights.push_back(w);
+                // up/gate and down of a layer share one ids tensor
+                multi_layer |= host_ids != nullptr && host_ids != node_ids;
+                host_ids = node_ids;
+            }
+        }
+        // in the offloaded case the node's weight srcs were rewritten to device copies; the host originals arrive as split inputs
+        for (int j = 0; j < sp.n_inputs; ++j) {
+            const ggml_tensor * input = sp.inputs[j];
+            if (input->ne[2] > 1 && ggml_backend_sched_is_host_weight(input) && ggml_moe_prefetch_is_registered(input)) {
+                info.host_weights.push_back(input);
+            }
+        }
+        // batch graphs touch most experts; multi-layer splits (e.g. a CPU-only graph) would fetch everything at once: the kernel hook
+        // streams those
+        if (!info.host_weights.empty() && n_tokens >= 32 && !multi_layer) {
+            out.push_back(std::move(info));
+        }
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sched_t sched) {
     struct ggml_backend_sched_split * splits = sched->splits;
 
@@ -4485,10 +4554,41 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         }
     }
 
+    // k16-disk: disk prefetch lookahead (see ggml_moe_disk_splits)
+    std::vector<ggml_moe_disk_split> moe_disk;
+    size_t moe_next = 0; // first entry with split >= current split
+    size_t moe_enq  = 0; // entries already enqueued
+    size_t moe_cold = 0; // entries already given MADV_COLD
+    const size_t moe_ahead = ggml_moe_prefetch_enabled() ? (size_t) ggml_moe_prefetch_ahead() : 0;
+    if (moe_ahead > 0) {
+        ggml_moe_prefetch_new_epoch();
+        ggml_moe_disk_splits(sched, moe_disk);
+    }
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        if (!moe_disk.empty()) {
+            // the pages streamed for the splits that ran are one-shot prompt traffic
+            for (; moe_cold < moe_disk.size() && moe_disk[moe_cold].split < split_id; ++moe_cold) {
+                for (const ggml_tensor * w : moe_disk[moe_cold].host_weights) {
+                    ggml_moe_prefetch_cold(w);
+                }
+            }
+            while (moe_next < moe_disk.size() && moe_disk[moe_next].split < split_id) {
+                moe_next++;
+            }
+            // keep the next moe_ahead MoE splits streaming in
+            const size_t want_end = std::min(moe_next + moe_ahead, moe_disk.size());
+            for (size_t k = std::max(moe_enq, moe_next); k < want_end; ++k) {
+                for (const ggml_tensor * w : moe_disk[k].host_weights) {
+                    ggml_moe_prefetch_tensor(w);
+                }
+                moe_enq = k + 1;
+            }
+        }
 
         if (sched->pf_active) {
             ggml_backend_sched_prefetch_issue_ex(sched, true);
@@ -4743,6 +4843,12 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
 
     if (sched->pf_active && (sched->pf_cross == 2 || (sched->pf_cross == 1 && sched->pf_runs < sched->pf_prev_runs))) {
         ggml_backend_sched_prefetch_arm(sched);
+    }
+
+    for (; moe_cold < moe_disk.size(); ++moe_cold) {
+        for (const ggml_tensor * w : moe_disk[moe_cold].host_weights) {
+            ggml_moe_prefetch_cold(w);
+        }
     }
 
     return GGML_STATUS_SUCCESS;

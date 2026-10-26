@@ -16,6 +16,8 @@
 #include "llama-model.h"
 #include "llama-moe-cache.h"
 #include "llama-sysmem.h"
+#include "llama-weight-store.h"
+#include "ggml-moe-prefetch.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -757,6 +759,9 @@ llama_context::llama_context(
             // the default hybrid path takes its fetch share from the decode threads, so it does not depend on timing
             moe_cache->hybrid_set_threads(n_threads_host > 0 ? n_threads_host : (int32_t) cparams.n_threads, model.hparams.no_alloc);
         }
+        if (!model.hparams.no_alloc) {
+            disk_prefetch_init();
+        }
         // LLAMA_MOE_CACHE_DEVSEED=1 (opt-in, default 0): with the default seeding (=2) a prefetched ubatch seeds the cache on the device from
         // its own routing (see llama_moe_cache::devseed_plan): its expert uploads never wait for the host to read the routing, and it needs
         // no stored routing of an earlier ubatch nor a larger seed graph; groups without device lookups are not seeded by prefetched ubatches
@@ -897,7 +902,99 @@ void llama_context::small_plan_free(uint32_t i) {
     }
 }
 
+// k16-disk: runtime disk prefetch of host experts read through the file mappings (ggml/src/ggml-moe-prefetch.cpp, ported from
+// ik_llama.cpp PR #2101). The host expert tensors of file mappings are registered with the engine; the CPU MUL_MAT_ID streams the
+// routed experts of each product with its worker threads, the scheduler streams the next MoE splits of a prompt whose uploads read
+// the mapping (not when the weight store reads them). Page cache only: the kernels read the same mapped bytes (exact).
+// LLAMA_MOE_DISK_PREFETCH: unset = on when those experts exceed 80% of the available RAM (cgroup-aware, the weight store's rule),
+// 0 = off (no threads, no madvise: k15 behaviour), 1 = on. LLAMA_MOE_DISK_PREFETCH_THREADS (8), LLAMA_MOE_DISK_PREFETCH_AHEAD (3
+// MoE splits, 0 = kernel hook only; 0 by default beside a weight store), LLAMA_MOE_DISK_PREFETCH_MIB (lookahead bytes queued or in
+// flight, default min(2 GiB, 10% of the available RAM)), LLAMA_MOE_DISK_PREFETCH_RANDOM (MADV_RANDOM on the registered ranges, so a
+// fault the engine did not predict reads its page only, not a read-around window; default 1 beside a weight store or without a GPU,
+// else 0). Linux 5.14+ (MADV_POPULATE_READ) only
+void llama_context::disk_prefetch_init() {
+    const char * env = getenv("LLAMA_MOE_DISK_PREFETCH");
+    const int mode = env != nullptr ? atoi(env) : -1;
+    if (mode == 0) {
+        return;
+    }
+    std::vector<std::pair<const void *, size_t>> ranges;
+    uint64_t bytes = 0;
+    for (const auto & layer : model.layers) {
+        for (ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
+            if (t == nullptr || t->buffer == nullptr || t->data == nullptr || !ggml_backend_buffer_is_host(t->buffer) ||
+                    strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer)), "CPU_Mapped") != 0) {
+                continue;
+            }
+            ranges.emplace_back(t->data, ggml_nbytes(t));
+            bytes += ggml_nbytes(t);
+        }
+    }
+    if (ranges.empty()) {
+        return;
+    }
+    const uint64_t avail = llama_weight_store::ram_available();
+    const bool on = mode == 1 || (avail > 0 && (double) bytes > 0.8*(double) avail);
+    if (!on) {
+        if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+            LLAMA_LOG_INFO("%s: disk prefetch off: %.1f MiB of mapped host experts fit in %.1f MiB of available RAM (LLAMA_MOE_DISK_PREFETCH=1 forces it)\n",
+                __func__, bytes/1048576.0, avail/1048576.0);
+        }
+        return;
+    }
+    auto env_i = [](const char * name, long long def) {
+        const char * e = getenv(name);
+        return e != nullptr ? atoll(e) : def;
+    };
+    const bool main_ctx = cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP;
+    if (main_ctx || !ggml_moe_prefetch_enabled()) {
+        const int n_threads = (int) std::max(1LL, env_i("LLAMA_MOE_DISK_PREFETCH_THREADS", 8));
+        ggml_moe_prefetch_set_n_threads(n_threads);
+        if (!ggml_moe_prefetch_enabled()) {
+            LLAMA_LOG_WARN("%s: disk prefetch unavailable (no MADV_POPULATE_READ, Linux 5.14+)\n", __func__);
+            return;
+        }
+        const long long def_mib = (long long) std::min<uint64_t>(2048, avail/10/1048576);
+        ggml_moe_prefetch_set_budget((size_t) std::max(0LL, env_i("LLAMA_MOE_DISK_PREFETCH_MIB", std::max(64LL, def_mib))) << 20);
+    }
+    // the weight store reads the uploads of the host weights itself (ahead of the copies, with pread): the scheduler lookahead would
+    // read them a second time through the page cache
+    if (main_ctx) {
+        ggml_moe_prefetch_set_ahead((int) std::max(0LL, env_i("LLAMA_MOE_DISK_PREFETCH_AHEAD", wstore ? 0 : 3)));
+    }
+    // MADV_RANDOM only where the uploads do not fault the mapping: with a weight store (pread) or without a GPU. Uploads of decode misses
+    // through the mapping (weight store off) are not streamed by the engine, and without read-around each of their faults reads one page
+    const bool has_gpu = std::any_of(backends.begin(), backends.end(), [](const ggml_backend_ptr & b) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(b.get());
+        return dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+    });
+    const bool rand_read = env_i("LLAMA_MOE_DISK_PREFETCH_RANDOM", wstore || !has_gpu ? 1 : 0) != 0;
+    disk_ranges.reserve(disk_ranges.size() + ranges.size());
+    for (const auto & r : ranges) {
+        ggml_moe_prefetch_register_mapping(r.first, r.second, rand_read);
+        disk_ranges.emplace_back(r.first);
+    }
+    LLAMA_LOG_INFO("%s: disk prefetch on: %zu host expert tensors, %.1f MiB mapped, %.1f MiB of RAM available%s, %lld threads, lookahead %lld "
+        "MoE splits%s, MADV_RANDOM %s (LLAMA_MOE_DISK_PREFETCH=0 off)\n", __func__, ranges.size(), bytes/1048576.0, avail/1048576.0,
+        mode == 1 ? " (forced)" : "", env_i("LLAMA_MOE_DISK_PREFETCH_THREADS", 8), main_ctx ? env_i("LLAMA_MOE_DISK_PREFETCH_AHEAD", wstore ? 0 : 3) : -1LL,
+        wstore ? " (the weight store reads the uploads)" : "", rand_read ? "on" : "off");
+}
+
+llama_context::disk_range_ref::~disk_range_ref() {
+    if (base != nullptr) {
+        ggml_moe_prefetch_unregister_mapping(base);
+    }
+}
+
 llama_context::~llama_context() {
+    if (!disk_ranges.empty()) {
+        ggml_moe_prefetch_counters c = {};
+        ggml_moe_prefetch_stats(&c);
+        LLAMA_LOG_INFO("%s: disk prefetch: %" PRIu64 " chunks, %" PRIu64 " resident (skipped), %.1f MiB read ahead, %" PRIu64 " product enqueues, "
+            "%" PRIu64 " lookahead tensors (%" PRIu64 " dropped by the budget), %" PRIu64 " chunks MADV_COLD\n", __func__, c.n_jobs, c.n_skipped,
+            c.bytes_populated/1048576.0, c.n_node, c.n_tensor, c.n_dropped, c.n_colded);
+        disk_ranges.clear();
+    }
     if (n_plan_saves > 0) {
         size_t bytes = 0;
         int    n     = 0;

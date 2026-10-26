@@ -13,6 +13,7 @@
 #include "vec.h"
 #include "ops.h"
 #include "ggml.h"
+#include "ggml-moe-prefetch.h"
 #include "common.h"
 #include "tiled/tiled.h"
 
@@ -1595,6 +1596,10 @@ static void ggml_compute_forward_mul_mat_id(
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+    // k16-disk: the routed experts of a host expert tensor in a file mapping are read by the disk prefetch workers while the threads
+    // below start on them (page cache only, same bytes; a no-op unless the engine is on, see ggml-moe-prefetch.h)
+    ggml_moe_prefetch_kernel_hook(dst, ith);
 
     const enum ggml_type type = src0->type;
 
