@@ -4643,80 +4643,6 @@ static int ggml_cuda_try_fuse_amax_rescale(ggml_backend_cuda_context * cuda_ctx,
     return id - i;
 }
 
-// k15-mm2: the next hyper-connection mix's grouped norm (RMS_NORM -> MUL, a q8_1 producer) reads the DSV4_HC_POST output of the
-// chain nodes [i, i + n_chain) + nodes[ip]: computed in one norm kernel (see below). Returns the number of extra nodes covered.
-    // k15-mm2: the next hyper-connection mix's grouped norm (RMS_NORM -> MUL, a q8_1 producer) reads this DSV4_HC_POST output: the
-    // norm kernel computes the post itself (stored to the post output as before) and writes the norm, its q8_1 copy, one launch
-    // (GGML_CUDA_HC_POST_NORM=0: separate launches). Same expressions in the same order, so every output keeps its bytes.
-static int ggml_cuda_try_fuse_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, int n_chain, int ip) {
-    ggml_tensor * hc_post = cgraph->nodes[ip];
-    const ggml_tensor * x        = hc_post->src[0];
-    const ggml_tensor * residual = hc_post->src[1];
-    const ggml_tensor * post_src = cgraph->nodes[i]->src[0];
-    const int64_t hc       = residual->ne[1];
-    const int64_t n_tokens = x->ne[1];
-    if (hc_post->src[3] != nullptr || post_src == nullptr || post_src->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 ||
-            residual->type != GGML_TYPE_F32 || hc_post->type != GGML_TYPE_F32 || ggml_nelements(post_src) != hc*n_tokens ||
-            ggml_cuda_tensors_overlap(hc_post, post_src)) {
-        return 0;
-    }
-    {
-        static const bool off = [] { const char * e = getenv("GGML_CUDA_HC_POST_NORM"); return e != nullptr && atoi(e) == 0; }();
-        int irn = ip + 1;
-        while (irn < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[irn])) {
-            irn++;
-        }
-        bool ok = !off && irn + 1 < cgraph->n_nodes && n_chain <= GGML_CUDA_HC_POST_NORM_MAX_OPS && cuda_ctx->curr_stream_no == 0 &&
-            cuda_ctx->q8_1_cache.active();
-        ggml_tensor * rn  = ok ? cgraph->nodes[irn]     : nullptr;
-        ggml_tensor * mul = ok ? cgraph->nodes[irn + 1] : nullptr;
-        ok = ok && rn->op == GGML_OP_RMS_NORM && rn->src[0] == hc_post && (rn->flags & GGML_TENSOR_FLAG_COMPUTE) &&
-            mul->op == GGML_OP_MUL && (mul->src[0] == rn || mul->src[1] == rn) && (mul->flags & GGML_TENSOR_FLAG_COMPUTE) &&
-            ggml_node_has_n_uses(cgraph, irn, 1) && !(rn->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_is_contiguous(hc_post) &&
-            ggml_is_contiguous(mul) && rn->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && cuda_ctx->q8_1_cache.norm_targets.count(mul) &&
-            hc_post->ne[0] == x->ne[0] && hc_post->ne[1] == hc && hc_post->ne[2] == n_tokens && hc_post->ne[3] == 1 &&
-            x->nb[0] == sizeof(float) && residual->nb[0] == sizeof(float) && ggml_is_contiguous(post_src);
-        for (int j = 0; ok && j < n_chain; ++j) {
-            const ggml_tensor * t = cgraph->nodes[i + j];
-            ok = t->op == GGML_OP_SCALE || (t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID);
-        }
-        // every block reads the whole block output row of its token (x) while others write the post output: no overlap; the residual
-        // only element by element (in place is fine when it is the same layout)
-        ok = ok && !ggml_cuda_tensors_overlap(hc_post, x) &&
-            (!ggml_cuda_tensors_overlap(hc_post, residual) || (hc_post->data == residual->data && ggml_are_same_stride(hc_post, residual)));
-        if (ok) {
-            const int64_t ne10_padded = GGML_PAD(mul->ne[0], MATRIX_ROW_PADDING);
-            int64_t key[ggml_cuda_q8_1_cache::n_key];
-            ggml_cuda_q8_1_cache::key_contiguous(mul->ne[0], ggml_nrows(mul), key);
-            void * q8_1_out = cuda_ctx->q8_1_cache.reserve(mul->data, ggml_nbytes(mul), key, ggml_nrows(mul)*ne10_padded/QK8_1*sizeof(block_q8_1));
-            if (q8_1_out != nullptr) {
-                ggml_cuda_hc_post_args hcp;
-                hcp.bo       = (const float *) x->data;
-                hcp.residual = (const float *) residual->data;
-                hcp.post     = (const float *) post_src->data;
-                hcp.sbo1     = x->nb[1] / sizeof(float);
-                hcp.sr1      = residual->nb[1] / sizeof(float);
-                hcp.sr2      = residual->nb[2] / sizeof(float);
-                hcp.hc       = (int) hc;
-                hcp.n_ops    = n_chain;
-                for (int j = 0; j < n_chain; ++j) {
-                    hcp.op[j] = cgraph->nodes[i + j]->op == GGML_OP_SCALE ? 0 : 1;
-                    const ggml_tensor * t = cgraph->nodes[i + j];
-                    hcp.p0[j] = 0.0f;
-                    hcp.p1[j] = 0.0f;
-                    if (t->op == GGML_OP_SCALE) {
-                        memcpy(&hcp.p0[j], (const float *) t->op_params + 0, sizeof(float));
-                        memcpy(&hcp.p1[j], (const float *) t->op_params + 1, sizeof(float));
-                    }
-                }
-                ggml_cuda_op_rms_norm_fused(*cuda_ctx, rn, mul, q8_1_out, nullptr, &hcp);
-                return irn + 1 - i;
-            }
-        }
-    }
-    return 0;
-}
-
 // elementwise chain -> DSV4_HC_POST (no comb) where the chain computes the post weights: one kernel, the chain applied to the
 // weight each thread reads. Returns the number of extra nodes covered (0 = no fusion).
 // GGML_CUDA_DISABLE_HC_POST_CHAIN_FUSION=1 turns it off.
@@ -4788,10 +4714,6 @@ static int ggml_cuda_try_fuse_hc_post_chain(ggml_backend_cuda_context * cuda_ctx
             memcpy(&chain.p0[j], (const float *) t->op_params + 0, sizeof(float));
             memcpy(&chain.p1[j], (const float *) t->op_params + 1, sizeof(float));
         }
-    }
-
-    if (const int n = ggml_cuda_try_fuse_hc_post_norm(cuda_ctx, cgraph, i, n_chain, ip)) {
-        return n;
     }
 
     ggml_cuda_op_hc_post_chain(*cuda_ctx, chain, post_src, hc_post);
@@ -6557,11 +6479,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST }, { GGML_UNARY_OP_SIGMOID })) {
-        if (cgraph->nodes[i + 3]->src[2] == cgraph->nodes[i + 2]) {
-            if (const int n = ggml_cuda_try_fuse_hc_post_norm(cuda_ctx, cgraph, i, 3, i + 3)) {
-                return n;
-            }
-        }
         ggml_cuda_op_dsv4_hc_post(*cuda_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2]);
         return 3;
     }
@@ -6630,10 +6547,7 @@ static bool ggml_cuda_side_mv_run(const ggml_tensor * node) {
         return false;
     }
     const int64_t ncols = node->src[1]->ne[1];
-    // at several columns only long-K ones (the hc inject, K = 10240): a short-K tiny product (the shared expert gate, K = 2560) joins
-    // the multi-matrix launch of its neighbour instead (the router: one launch fewer), GGML_CUDA_SIDE_MV_COLS_MIN_K (default 4096)
-    static const int64_t min_k = getenv("GGML_CUDA_SIDE_MV_COLS_MIN_K") ? atoll(getenv("GGML_CUDA_SIDE_MV_COLS_MIN_K")) : 4096;
-    return ncols == 1 || (ncols <= max_cols && node->src[0]->ne[1] <= 4 && node->src[0]->ne[0] >= min_k);
+    return ncols == 1 || (ncols <= max_cols && node->src[0]->ne[1] <= 4);
 }
 
 // The side stream is only used while a decode-sized graph is captured into a CUDA graph. Used eagerly, it cost more than it saved:

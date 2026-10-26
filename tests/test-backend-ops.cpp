@@ -11005,9 +11005,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool mm : {false, true}) {
             test_cases.emplace_back(new test_hc_post_norm(2560, 4, 1, gated, mm));
             test_cases.emplace_back(new test_hc_post_norm(512, 4, 2, gated, mm));
-            // k15-mm2: the 3 / 4 token MTP verify (the post computed in the q8_1 norm kernel)
-            test_cases.emplace_back(new test_hc_post_norm(2560, 4, 3, gated, mm));
-            test_cases.emplace_back(new test_hc_post_norm(mm ? 40 : 30, 4, 4, gated, mm)); // 40*4 is a Q8_0 row; 40 straddles q8_1 blocks
         }
         test_cases.emplace_back(new test_hc_post_norm(31, 4, 17, gated, false));
         test_cases.emplace_back(new test_hc_post_norm(1024, 3, 5, gated, false));
