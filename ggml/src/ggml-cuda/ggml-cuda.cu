@@ -3302,7 +3302,9 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
             // k16-race: after another error than an update failure (seen after a launch stalled for minutes on a crowded GPU: the
             // update returned invalid argument and so did this destroy, which aborted) the exec is destroyed at most once and a
             // failed destroy is not fatal: the handle is dropped and a new exec instantiated (GGML_CUDA_GRAPH_UPDATE_RETRY=0: assert)
-            const cudaError_t de = graph->instance != nullptr ? cudaGraphExecDestroy(graph->instance) : cudaSuccess;
+            // GGML_CUDA_GRAPH_DESTROY_FAULT=1 (debug, with GGML_CUDA_GRAPH_UPDATE_FAULT): this destroy fails as seen live (the exec is leaked)
+            static const bool destroy_fault = ggml_cuda_env_flag("GGML_CUDA_GRAPH_DESTROY_FAULT");
+            const cudaError_t de = graph->instance == nullptr ? cudaSuccess : destroy_fault ? cudaErrorInvalidValue : cudaGraphExecDestroy(graph->instance);
             if (de != cudaSuccess) {
                 GGML_LOG_WARN("%s: destroying the exec after the failed update gave %s: dropped, instantiating a new one\n", __func__, cudaGetErrorString(de));
                 (void)cudaGetLastError();
