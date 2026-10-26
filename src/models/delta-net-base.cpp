@@ -560,6 +560,46 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
+    // k16-draft (LLAMA_RS_REPLAY, llama_memory_recurrent::replay): a window of at most K tokens per sequence leaves the state row as
+    // it was and stores its inputs for the commit, which advances the row by the accepted tokens with this same op; a larger ubatch
+    // writes its final state. One state row per cell instead of K
+    if (mctx_cur->get_replay() && mctx_cur->get_rk_l(il) != nullptr && g->ne[0] == 1) {
+        ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, 1);
+        if (n_seq_tokens > 1) {
+            res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+        } else {
+            res->add_fused_node({LLM_FUSED_OP_GDN_AR, gdn_out, il});
+        }
+        const int64_t attn_elems = S_v * H_v * n_seq_tokens * n_seqs;
+        ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
+            S_v, H_v, n_seq_tokens, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, S_v * H_v),
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+            0);
+        cb(output, "attn_output", il);
+        const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+        if (n_seq_tokens <= K) {
+            auto store = [&](ggml_tensor * x, ggml_tensor * dst_all, int64_t ne0, int64_t ne1) {
+                ggml_tensor * dst = ggml_view_4d(ctx0, dst_all, ne0, ne1, n_seq_tokens, n_seqs,
+                        dst_all->nb[1], dst_all->nb[2], dst_all->nb[3], (size_t) kv_head * dst_all->nb[3]);
+                ggml_tensor * src = ggml_reshape_4d(ctx0, ggml_cont(ctx0, x), ne0, ne1, n_seq_tokens, n_seqs);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+            };
+            mctx_cur->set_rk_h(il, (int32_t) k->ne[1]);
+            store(k, mctx_cur->get_rk_l(il), k->ne[0], k->ne[1]);
+            store(v, mctx_cur->get_rv_l(il), S_v, H_v);
+            store(g, mctx_cur->get_rg_l(il), 1, H_v);
+            store(b, mctx_cur->get_rb_l(il), 1, H_v);
+        } else {
+            ggml_tensor * st = ggml_view_2d(ctx0, gdn_out, D, n_seqs, ggml_row_size(gdn_out->type, D),
+                    ggml_row_size(gdn_out->type, attn_elems));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, st,
+                    ggml_view_2d(ctx0, ssm_states_all, D, n_seqs, ssm_states_all->nb[1], (size_t) kv_head * row_size)));
+        }
+        return output;
+    }
+
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
     if (n_seq_tokens > 1) {

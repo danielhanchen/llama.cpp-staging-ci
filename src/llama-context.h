@@ -247,6 +247,13 @@ struct llama_context {
     // wait until the last asynchronous state save has reached its destination
     void state_async_wait();
 
+    // k16-draft (LLAMA_RS_REPLAY): advances the delta-net state rows by the accepted tokens of the last window (see
+    // llama_memory_recurrent::replay); called by the recurrent memory before it is read again
+    void rs_replay_commit();
+    llama_memory_recurrent * rs_replay_mem = nullptr;
+    ggml_backend_sched_ptr   rs_sched;
+    int64_t                  rs_replay_us = 0;
+
     // set when backend work is queued (graph_compute, async state copies), cleared by synchronize()
     bool sync_pending = true;
 

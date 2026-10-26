@@ -601,6 +601,19 @@ llama_context::llama_context(
         memory.reset(model.create_memory(params_mem, cparams));
         if (memory) {
             memory->wait_state_reads = [this]() { state_async_wait(); };
+            // k16-draft: the replay commit of the delta-net states runs on this context's backends
+            llama_memory_recurrent * mr = dynamic_cast<llama_memory_recurrent *>(memory.get());
+            if (auto * mh = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+                mr = mh->get_mem_recr();
+            } else if (auto * mhi = dynamic_cast<llama_memory_hybrid_iswa *>(memory.get())) {
+                mr = mhi->get_mem_recr();
+            }
+            if (mr != nullptr && mr->replay && !model.hparams.no_alloc) {
+                rs_replay_mem = mr;
+                mr->commit_cb = [this]() { rs_replay_commit(); };
+                LLAMA_LOG_INFO("%s: recurrent rollback by replay: one delta-net state row per sequence instead of %u "
+                        "(LLAMA_RS_REPLAY=0: snapshot rows)\n", __func__, 1 + mr->n_rs_seq);
+            }
         }
     }
 
@@ -897,7 +910,84 @@ void llama_context::small_plan_free(uint32_t i) {
     }
 }
 
+void llama_context::rs_replay_commit() {
+    llama_memory_recurrent * mem = rs_replay_mem;
+    if (mem == nullptr || !mem->has_pending()) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    const size_t max_nodes = 16384;
+    if (!rs_sched) {
+        rs_sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, false));
+    }
+    ggml_init_params ip = { ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false), nullptr, true };
+    ggml_context_ptr ctx_ptr { ggml_init(ip) };
+    ggml_context * ctx = ctx_ptr.get();
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, max_nodes, false);
+    const int64_t D = model.hparams.n_embd_s();
+    for (uint32_t c = 0; c < mem->size; ++c) {
+        const uint32_t n = mem->pend_n[c];
+        if (n == 0) {
+            continue;
+        }
+        const uint32_t rb   = mem->pend_rb[c];
+        const uint32_t keep = n > rb ? n - rb : 0;
+        for (size_t il = 0; il < mem->s_l.size(); ++il) {
+            ggml_tensor * s  = mem->s_l[il];
+            ggml_tensor * rk = mem->rk_l[il];
+            if (s == nullptr || rk == nullptr) {
+                continue;
+            }
+            if (keep > 0) {
+                ggml_tensor * rv = mem->rv_l[il];
+                ggml_tensor * rg = mem->rg_l[il];
+                ggml_tensor * rbt = mem->rb_l[il];
+                const int64_t H_k = mem->rk_h[il] > 0 ? mem->rk_h[il] : rk->ne[1];
+                const int64_t S_v = rv->ne[0];
+                const int64_t H_v = rv->ne[1];
+                auto win = [&](ggml_tensor * t, int64_t ne0, int64_t ne1) {
+                    return ggml_view_4d(ctx, t, ne0, ne1, keep, 1, t->nb[1], t->nb[2], t->nb[3], (size_t) c * t->nb[3]);
+                };
+                ggml_tensor * k  = win(rk, rk->ne[0], H_k);
+                ggml_tensor * st = ggml_view_4d(ctx, s, S_v, S_v, H_v, 1, ggml_row_size(s->type, S_v), ggml_row_size(s->type, S_v*S_v),
+                        ggml_row_size(s->type, D), (size_t) c * s->nb[1]);
+                ggml_tensor * out = ggml_gated_delta_net(ctx, k, k, win(rv, S_v, H_v), win(rg, 1, H_v), win(rbt, 1, H_v), st, 1);
+                ggml_tensor * ns  = ggml_view_1d(ctx, out, D, ggml_row_size(out->type, S_v*H_v*(int64_t) keep));
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, ns, ggml_view_1d(ctx, s, D, (size_t) c * s->nb[1])));
+            }
+            if (rb > 0) {
+                // the conv histories keep their snapshot rows: group rb of this cell onto its live row
+                for (ggml_tensor * t : { mem->r_l[il], il < mem->p_l.size() ? mem->p_l[il] : nullptr }) {
+                    if (t == nullptr) {
+                        continue;
+                    }
+                    ggml_tensor * src = ggml_view_1d(ctx, t, t->ne[0], ((size_t) rb * mem->size + c) * t->nb[1]);
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx, src, ggml_view_1d(ctx, t, t->ne[0], (size_t) c * t->nb[1])));
+                }
+            }
+        }
+        mem->pend_n[c]  = 0;
+        mem->pend_rb[c] = 0;
+    }
+    if (ggml_graph_n_nodes(gf) > 0) {
+        ggml_backend_sched_reset(rs_sched.get());
+        if (!ggml_backend_sched_alloc_graph(rs_sched.get(), gf)) {
+            GGML_ABORT("%s: cannot allocate the replay commit graph", __func__);
+        }
+        if (ggml_backend_sched_graph_compute(rs_sched.get(), gf) != GGML_STATUS_SUCCESS) {
+            GGML_ABORT("%s: the replay commit graph failed", __func__);
+        }
+    }
+    mem->n_replay_commit++;
+    rs_replay_us += ggml_time_us() - t0;
+}
+
 llama_context::~llama_context() {
+    if (rs_replay_mem != nullptr && rs_replay_mem->n_replay_commit > 0) {
+        LLAMA_LOG_INFO("%s: recurrent replay commits: %" PRIu64 ", %.2f ms total, %.3f ms each\n", __func__, rs_replay_mem->n_replay_commit,
+                rs_replay_us/1e3, rs_replay_us/1e3/rs_replay_mem->n_replay_commit);
+        rs_replay_mem->commit_cb = nullptr;
+    }
     if (n_plan_saves > 0) {
         size_t bytes = 0;
         int    n     = 0;
