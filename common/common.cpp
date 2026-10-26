@@ -1439,7 +1439,9 @@ static int64_t common_lm_batch_default(const common_params & params) {
     if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH")) {
         return atoll(e);
     }
-    static const bool auto_env = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO")) != 0;
+    // opt-in (LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO=1) until the 16384 group costs no peak host RSS: G4 k15g4y1 Flash-Next 16 GB VmHWM
+    // +170 (fn4) / +188 (fn1) MiB, transient during the group (VmHWM - VmRSS at the end 125-167 vs 0-13 MiB)
+    static const bool auto_env = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO")) != 0;
     if (!auto_env) {
         return 8192;
     }
