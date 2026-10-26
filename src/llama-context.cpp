@@ -5392,6 +5392,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
     if (!buf_output || prev_size < new_size) {
+        static const bool log_env = getenv("LLAMA_OUTPUT_RESERVE_LOG") != nullptr && atoi(getenv("LLAMA_OUTPUT_RESERVE_LOG")) != 0;
+        if (log_env) {
+            LLAMA_LOG_INFO("%s: ctx %p type %d: output buffer %.2f -> %.2f MiB (logits %.2f, embd %.2f, embd_nextn %.2f%s, layer_inp %.2f, sampling %.2f MiB; n_outputs %d, n_batch %u)\n",
+                __func__, (void *) this, (int) cparams.ctx_type, prev_size/1048576.0, new_size/1048576.0, logits.size*4/1048576.0, embd.size*4/1048576.0,
+                embd_nextn.size*4/1048576.0, has_embd_nextn && !cparams.embeddings_nextn_masked ? " unmasked" : "", embd_layer_inp_float_count*4/1048576.0,
+                backend_float_count*4/1048576.0, n_outputs, n_batch);
+        }
         if (buf_output) {
 #ifndef NDEBUG
             // This doesn't happen often, but may be annoying in some cases (like the HellaSwag benchmark)
@@ -7389,6 +7396,30 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         synchronize();
     }
 
+    // k15-ov: a host save reads its device rows in a few large copies through pinned halves (state_get_bounced) instead of one synchronous
+    // copy per row: G4 Flash-Next UD-IQ4_XS, the server's prompt-cache save at a request's start was 118 synchronous 2 MiB copies at
+    // ~3 GB/s (60 ms before an 8k prompt, ~120 ms before a 16k one). The same bytes reach the destination. LLAMA_STATE_BOUNCE=0: as before
+    static const bool bounce_env = getenv("LLAMA_STATE_BOUNCE") == nullptr || atoi(getenv("LLAMA_STATE_BOUNCE")) != 0;
+    if (bounce_env && !(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
+        llama_io_write_host_async io(dst, size);
+        try {
+            io.write(&io_magic, sizeof(io_magic));
+            io.write(&seq_id, sizeof(seq_id));
+
+            const size_t n = state_seq_write_data(io, seq_id, flags);
+
+            if (!state_get_bounced(io.winfos)) {
+                for (const auto & w : io.winfos) {
+                    ggml_backend_tensor_get(w.tensor, w.dst, w.offset, w.size);
+                }
+            }
+            return n;
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+            return 0;
+        }
+    }
+
     std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
@@ -7804,6 +7835,112 @@ size_t llama_context::state_async_reserve(llama_state_seq_flags flags) {
 // backend (reused across saves); a worker thread waits on an event per backend and copies them to dst, so the host is
 // free to prepare the next ubatch meanwhile. Rows in host buffers, or on a device without async copies and events,
 // take the synchronous path instead.
+// k15-ov: the rows of a synchronous host save, read through two pinned halves per device backend: the copies of one half are queued on
+// the backend (in stream order after its queued work, as ggml_backend_tensor_get) while the host copies the previous half to the
+// destination. Returns false (nothing read) when a row is not on an async-capable device backend or the halves cannot be allocated
+bool llama_context::state_get_bounced(const std::vector<llama_state_write_info> & winfos) {
+    if (winfos.empty()) {
+        return true;
+    }
+    state_async_init_backends();
+    if (state_async.empty()) {
+        return false;
+    }
+    static const size_t half = (size_t) std::max(1, getenv("LLAMA_STATE_BOUNCE_MIB") ? atoi(getenv("LLAMA_STATE_BOUNCE_MIB")) : 16) << 20;
+    if (state_bounce.size() != state_async.size()) {
+        state_bounce.resize(state_async.size());
+    }
+    std::vector<int> owner(winfos.size(), -1);
+    for (size_t i = 0; i < winfos.size(); ++i) {
+        const ggml_tensor * t = winfos[i].tensor;
+        ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+        if (buf == nullptr) {
+            return false;
+        }
+        if (ggml_backend_buffer_is_host(buf)) {
+            continue; // read on the host below
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+        for (size_t b = 0; b < state_async.size(); ++b) {
+            if (ggml_backend_buft_get_device(buft) == state_async[b].dev && ggml_backend_supports_buft(state_async[b].backend, buft)) {
+                owner[i] = (int) b;
+                break;
+            }
+        }
+        if (owner[i] < 0) {
+            return false;
+        }
+    }
+    for (size_t b = 0; b < state_bounce.size(); ++b) {
+        auto & sb = state_bounce[b];
+        if (!sb.buf) {
+            sb.buf.reset(ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(state_async[b].dev), 2*half));
+            for (int h = 0; h < 2 && sb.buf; ++h) {
+                sb.ev[h] = ggml_backend_event_new(state_async[b].dev);
+                if (sb.ev[h] == nullptr) {
+                    sb.buf.reset();
+                }
+            }
+            if (!sb.buf) {
+                return false;
+            }
+        }
+    }
+    // host rows first (no copy queue involved)
+    for (size_t i = 0; i < winfos.size(); ++i) {
+        if (owner[i] < 0) {
+            ggml_backend_tensor_get(winfos[i].tensor, winfos[i].dst, winfos[i].offset, winfos[i].size);
+        }
+    }
+    struct piece { uint8_t * dst; size_t off; size_t size; };
+    for (size_t b = 0; b < state_bounce.size(); ++b) {
+        auto & sb = state_bounce[b];
+        ggml_backend_t be = state_async[b].backend;
+        uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(sb.buf.get());
+        std::vector<piece> pend[2];
+        int h = 0;
+        size_t used = 0;
+        auto drain = [&](int k) {
+            if (pend[k].empty()) {
+                return;
+            }
+            ggml_backend_event_synchronize(sb.ev[k]);
+            for (const auto & p : pend[k]) {
+                memcpy(p.dst, base + (size_t) k*half + p.off, p.size);
+            }
+            pend[k].clear();
+        };
+        auto flip = [&]() {
+            ggml_backend_event_record(sb.ev[h], be);
+            h ^= 1;
+            drain(h); // the other half: its copies were queued before this half's
+            used = 0;
+        };
+        for (size_t i = 0; i < winfos.size(); ++i) {
+            if (owner[i] != (int) b) {
+                continue;
+            }
+            size_t done = 0;
+            while (done < winfos[i].size) {
+                if (used >= half) {
+                    flip();
+                }
+                const size_t n = std::min(winfos[i].size - done, half - used);
+                ggml_backend_tensor_get_async(be, winfos[i].tensor, base + (size_t) h*half + used, winfos[i].offset + done, n);
+                pend[h].push_back({ winfos[i].dst + done, used, n });
+                used = GGML_PAD(used + n, 64);
+                done += n;
+            }
+        }
+        if (!pend[h].empty()) {
+            ggml_backend_event_record(sb.ev[h], be);
+        }
+        drain(h ^ 1);
+        drain(h);
+    }
+    return true;
+}
+
 void llama_context::state_get_async(const std::vector<llama_state_write_info> & winfos) {
     // the previous save may still be reading the staging buffers
     state_async_wait();
