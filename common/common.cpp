@@ -4420,6 +4420,13 @@ void common_state_buf_prefault(size_t n, int count) {
     }
 }
 
+size_t common_state_buf_pool_bytes() {
+    std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
+    size_t t = 0;
+    for (const auto & b : g_ckpt_pool) { t += b.capacity(); }
+    return t;
+}
+
 bool common_state_buf_take(common_state_buf & buf, size_t n) {
     if (!ckpt_pool_on() || buf.capacity() >= n) {
         return false;

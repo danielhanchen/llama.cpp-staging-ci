@@ -2109,6 +2109,11 @@ private:
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
+                if (getenv("LLAMA_PCS_MEM_LOG") != nullptr) {
+                    size_t sz = 0, cap = 0;
+                    for (const auto & c : ret->prompt.checkpoints) { sz += c.data_tgt.size() + c.data_dft.size(); cap += c.data_tgt.capacity() + c.data_dft.capacity(); }
+                    SRV_INF("pcs mem: slot %d after load: %zu ckpts, %.1f / %.1f MiB (size / capacity)\n", ret->id, ret->prompt.checkpoints.size(), sz/1048576.0, cap/1048576.0);
+                }
 
                 prompt_cache->update();
 

@@ -1409,6 +1409,7 @@ using common_state_buf = std::vector<uint8_t, common_default_init_allocator<uint
 void common_state_buf_recycle(common_state_buf && buf);
 // a buffer of at least n bytes from the pool into buf, if buf is smaller (returns true when one was taken)
 bool common_state_buf_take(common_state_buf & buf, size_t n);
+size_t common_state_buf_pool_bytes(); // debug: capacity held by the pool
 // k11 (LLAMA_STATE_PREFAULT=0 turns it off): ask a background thread to keep count pooled buffers of at least n bytes with resident pages
 void common_state_buf_prefault(size_t n, int count);
 

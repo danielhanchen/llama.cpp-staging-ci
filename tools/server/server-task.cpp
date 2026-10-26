@@ -2046,6 +2046,15 @@ void server_prompt_cache::update() {
         }
     }
 
+    if (getenv("LLAMA_PCS_MEM_LOG") != nullptr) { // debug: bytes held (capacity) against the bytes accounted (size)
+        size_t sz = 0, cap = 0, csz = 0, ccap = 0;
+        for (const auto & st : states) {
+            sz += st.data.main.size() + st.data.drft.size(); cap += st.data.main.capacity() + st.data.drft.capacity();
+            for (const auto & c : st.prompt.checkpoints) { csz += c.data_tgt.size() + c.data_dft.size(); ccap += c.data_tgt.capacity() + c.data_dft.capacity(); }
+        }
+        SRV_INF("pcs mem: %zu entries, state %.1f / %.1f MiB, ckpt %.1f / %.1f MiB (size / capacity), pool %.1f MiB\n", states.size(),
+            sz/1048576.0, cap/1048576.0, csz/1048576.0, ccap/1048576.0, common_state_buf_pool_bytes()/1048576.0);
+    }
     SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
             states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
