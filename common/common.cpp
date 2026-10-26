@@ -4279,8 +4279,10 @@ static size_t ckpt_pool_limit() {
     return rel ? std::min(lim, 2*g_ckpt_pool_req_max + (g_ckpt_pool_req_max/8)) : lim;
 }
 
-static bool ckpt_pool_fit() {
-    static const bool fit = getenv("LLAMA_STATE_POOL_FIT") != nullptr && atoi(getenv("LLAMA_STATE_POOL_FIT")) != 0;
+// LLAMA_STATE_POOL_FIT=N (opt-in): a buffer is handed out for n only up to max(2, N) times n
+static size_t ckpt_pool_fit() {
+    static const size_t fit = getenv("LLAMA_STATE_POOL_FIT") != nullptr && atoi(getenv("LLAMA_STATE_POOL_FIT")) > 0 ?
+        (size_t) std::max(2, atoi(getenv("LLAMA_STATE_POOL_FIT"))) : 0;
     return fit;
 }
 
@@ -4392,7 +4394,7 @@ struct state_prefault_worker {
                 for (const auto & b : g_ckpt_pool) {
                     // with the fit, a buffer over twice the size is not handed out for n: it does not count as ready (else the fill
                     // stopped and the next checkpoint of this size faulted in fresh pages on the request path)
-                    have  += b.capacity() >= n && (!ckpt_pool_fit() || b.capacity() / 2 <= n);
+                    have  += b.capacity() >= n && (!ckpt_pool_fit() || b.capacity() / ckpt_pool_fit() <= n);
                     total += b.capacity();
                 }
                 if (have >= count || g_ckpt_pool.size() >= 8 || total + n_alloc > ckpt_pool_limit()) {
@@ -4457,7 +4459,7 @@ bool common_state_buf_take(common_state_buf & buf, size_t n) {
     // a buffer more than twice the request is left in the pool: a small checkpoint that took a state buffer kept all of it resident for as
     // long as the checkpoint lived (its capacity is not in the prompt cache's size), e.g. 2.8 MiB of checkpoints held 149 MiB on LFM2.5
     // (opt-in LLAMA_STATE_POOL_FIT=1: G4 q4x reuse turns +1.4-2.5 ms with it and REL; default: any buffer that fits)
-    if (best == g_ckpt_pool.end() || (ckpt_pool_fit() && best->capacity() / 2 > n)) {
+    if (best == g_ckpt_pool.end() || (ckpt_pool_fit() && best->capacity() / ckpt_pool_fit() > n)) {
         return false;
     }
     buf = std::move(*best);
