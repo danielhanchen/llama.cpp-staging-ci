@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -188,6 +189,100 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.name             =*/ "fused DeepSeek V4 HC post",
     /*.n_tokens_per_seq =*/ 1,
 };
+
+// k16 dense host pin: the weights of the layers that --fit / -ngl leave in system memory sit in a memory-mapped (pageable) buffer, so the
+// scheduler's copies of them for the prompt ops it offloads to the GPU go through the driver's staging buffer and block the host
+// (cudaMemcpyAsync from pageable memory): L4, dense Qwen3.6-27B UD-Q4_K_XL at 12 GB (32 of 65 layers on the GPU), 8.7 GB of CPU layers
+// per 512-token ubatch at ~3.5 GB/s, 207 prompt tok/s at 2k-16k (16k TTFT 80 s). Page-locking those buffers (read-only, not mapped into the
+// device address space, so no VRAM is spent on page tables) lets the copies run as DMA at the link's speed and overlap the compute (prefetch depth 2).
+// Once per model, only for buffers of layer weights ("blk." tensors other than routed experts, which a MoE cache maps itself), only with
+// op offload, and only while the pinned total stays within min(LLAMA_DENSE_HOST_PIN_MAX_FRAC (0.5) x MemTotal - memory pinned already,
+// MemAvailable - max(2 GiB, 1/16)): registering a mapped file faults in and locks its pages. The same bytes are copied, so the outputs
+// are bit-identical. LLAMA_DENSE_HOST_PIN=0 disables.
+static void llama_dense_host_pin(const llama_model & model) {
+    using host_pin_range_t    = void * (*)(void *, size_t);
+    using host_unpin_t        = void (*)(void *);
+    using host_mapped_bytes_t = size_t (*)(void);
+    if (const char * e = getenv("LLAMA_DENSE_HOST_PIN")) {
+        if (atoi(e) == 0) {
+            return;
+        }
+    }
+    std::lock_guard<std::mutex> lock(model.host_pin_mutex);
+    if (model.host_pin_done) {
+        return;
+    }
+    model.host_pin_done = true;
+    ggml_backend_reg_t reg = nullptr;
+    for (const auto & d : model.devices) {
+        if (d.is_meta || d.dev == nullptr || ggml_backend_dev_type(d.dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        ggml_backend_reg_t r = ggml_backend_dev_backend_reg(d.dev);
+        if (r != nullptr && ggml_backend_reg_get_proc_address(r, "ggml_backend_host_pin_range") != nullptr) {
+            reg = r;
+            break;
+        }
+    }
+    if (reg == nullptr) {
+        LLAMA_LOG_DEBUG("%s: dense host pin: no device that page-locks host memory\n", __func__);
+        return;
+    }
+    auto pin_range = (host_pin_range_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_pin_range");
+    auto unpin     = (host_unpin_t)        ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_unpin");
+    auto mapped_b  = (host_mapped_bytes_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_mapped_bytes");
+    if (unpin == nullptr) {
+        return;
+    }
+    std::vector<ggml_backend_buffer_t> bufs;
+    size_t n_tensors = 0;
+    for (const auto & [name, t] : model.tensors_by_name) {
+        if (t == nullptr || t->buffer == nullptr || name.rfind("blk.", 0) != 0 || name.find("_exps") != std::string::npos) {
+            continue;
+        }
+        if (strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer)), "CPU_Mapped") != 0) {
+            continue;
+        }
+        n_tensors++;
+        if (std::find(bufs.begin(), bufs.end(), t->buffer) == bufs.end()) {
+            bufs.push_back(t->buffer);
+        }
+    }
+    if (bufs.empty()) {
+        LLAMA_LOG_DEBUG("%s: dense host pin: no layer weights in memory-mapped system memory\n", __func__);
+        return;
+    }
+    double frac = 0.5;
+    if (const char * e = getenv("LLAMA_DENSE_HOST_PIN_MAX_FRAC")) {
+        frac = std::max(0.0, std::min(0.95, atof(e)));
+    }
+    const uint64_t total  = llama_sysmem::total();
+    const uint64_t avail  = llama_sysmem::available();
+    const uint64_t pinned = mapped_b != nullptr ? mapped_b() : 0;
+    size_t need = 0;
+    for (ggml_backend_buffer_t b : bufs) {
+        need += ggml_backend_buffer_get_size(b);
+    }
+    const uint64_t margin = std::max<uint64_t>(UINT64_C(2) << 30, need/16);
+    if ((total > 0 && (double) (need + pinned) > frac*(double) total) || (avail > 0 && need + margin > avail)) {
+        LLAMA_LOG_INFO("%s: dense host pin: %.0f MiB of memory-mapped layer weights in system memory, more than the budget (%.0f MiB total, "
+            "%.0f MiB available, %.0f MiB pinned already): left pageable (LLAMA_DENSE_HOST_PIN_MAX_FRAC)\n", __func__, need/1048576.0,
+            total/1048576.0, avail/1048576.0, pinned/1048576.0);
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    size_t done = 0;
+    for (ggml_backend_buffer_t b : bufs) {
+        void * key = pin_range(ggml_backend_buffer_get_base(b), ggml_backend_buffer_get_size(b));
+        if (key != nullptr) {
+            model.host_pins.emplace_back(unpin, key);
+            done += ggml_backend_buffer_get_size(b);
+        }
+    }
+    LLAMA_LOG_INFO("%s: dense host pin: %.0f of %.0f MiB of memory-mapped layer weights in system memory (%zu tensors, %zu buffers) "
+        "page-locked for the copies of offloaded prompt ops in %.1f ms (LLAMA_DENSE_HOST_PIN=0 disables)\n", __func__, done/1048576.0,
+        need/1048576.0, n_tensors, bufs.size(), (ggml_time_us() - t0)/1000.0);
+}
 
 llama_context::llama_context(
         const llama_model & model,
@@ -724,6 +819,9 @@ llama_context::llama_context(
             }
         } else if (moe_cache_budget > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, moe_cache_budget, moe_cache_set, wstore.get(), cparams.moe_host_cache_mib);
+        }
+        if (!moe_cache && !wstore && cparams.op_offload && !model.hparams.no_alloc) {
+            llama_dense_host_pin(model);
         }
         if (lm_enabled && !moe_cache) {
             // nothing on the host is cached: no layer-major prompts, and the scheduler keeps its usual size
