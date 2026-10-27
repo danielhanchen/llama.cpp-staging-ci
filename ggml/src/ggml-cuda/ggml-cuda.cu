@@ -5548,7 +5548,8 @@ static bool ggml_cuda_try_conv_cat_elide(ggml_backend_cuda_context * cuda_ctx, c
     if (jc < 0) {
         return false;
     }
-    // every reader of the concat: the convolution, or a copy of a view of it
+    // every reader of the concat: the convolution, or a copy of a view of it that comes before the convolution (a later one would
+    // read the concat after the convolution consumed it, unwritten)
     for (int k = i + 1; k < cgraph->n_nodes; ++k) {
         const ggml_tensor * n = cgraph->nodes[k];
         if (k == jc || ggml_cuda_is_view_or_noop(n)) {
@@ -5556,7 +5557,7 @@ static bool ggml_cuda_try_conv_cat_elide(ggml_backend_cuda_context * cuda_ctx, c
         }
         for (int s = 0; s < GGML_MAX_SRC; ++s) {
             const ggml_tensor * t = n->src[s];
-            if (t != nullptr && (t == cat || t->view_src == cat) && !(n->op == GGML_OP_CPY && s == 0 && t->view_src == cat)) {
+            if (t != nullptr && (t == cat || t->view_src == cat) && !(n->op == GGML_OP_CPY && s == 0 && t->view_src == cat && k < jc)) {
                 return false;
             }
         }
