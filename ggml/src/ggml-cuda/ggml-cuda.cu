@@ -8172,6 +8172,42 @@ static const ggml_tensor * ggml_cuda_fused_match(const ggml_cgraph * cgraph, int
             return c2;
         }
     }
+
+    // QSA selection chain in one staged block at its index node (ggml_cuda_qsa_sel_plan, k15-fn): the chain's inputs (top_k, pool
+    // members, tail cells, scores) stay allocated until the index node is, so no node that still runs between the chain's first skipped
+    // reader and the index node is placed over them (the plan then never has to refuse a chain for it). GGML_CUDA_QSA_SEL_ALIAS=1
+    static const bool qsa_sel_alias = ggml_cuda_env_flag("GGML_CUDA_QSA_SEL_ALIAS");
+    if (!qsa_sel_alias && n0->op == GGML_OP_CPY && n0->type == GGML_TYPE_I32) {
+        ggml_backend_cuda_context::qsa_sel_args a = {};
+        std::vector<const ggml_tensor *> chain, ins;
+        if (ggml_cuda_qsa_sel_match(cgraph, n0, a, chain, ins)) {
+            for (const ggml_tensor * t : ins) {
+                inputs.push_back(const_cast<ggml_tensor *>(t));
+            }
+            return n0;
+        }
+    }
+
+    // short convolution (+ bias ADD) + SILU in one launch, which also writes the deferred conv-state copies (ggml_cuda_op_ssm_conv,
+    // ggml_cuda_try_conv_state_defer, k15-fn): the conv input and the weights stay off the SILU output (the allocator could place it in
+    // the input freed after the convolution: the fused kernel reads the input while it writes). GGML_CUDA_CONV_STATE_ALIAS=1
+    static const bool conv_alias = ggml_cuda_env_flag("GGML_CUDA_CONV_STATE_ALIAS");
+    if (!conv_alias && n0->op == GGML_OP_SSM_CONV && i + 1 < cgraph->n_nodes) {
+        ggml_tensor * nx = cgraph->nodes[i + 1];
+        ggml_tensor * bias = nullptr;
+        if (nx->op == GGML_OP_ADD && (nx->src[0] == n0 || nx->src[1] == n0) && i + 2 < cgraph->n_nodes) {
+            bias = nx->src[0] == n0 ? nx->src[1] : nx->src[0];
+            nx = cgraph->nodes[i + 2];
+        }
+        if (nx->op == GGML_OP_UNARY && ggml_get_unary_op(nx) == GGML_UNARY_OP_SILU && nx->src[0] != nullptr &&
+                (nx->src[0] == n0 || nx->src[0] == cgraph->nodes[i + 1])) {
+            inputs = { n0->src[0], n0->src[1] };
+            if (bias != nullptr) {
+                inputs.push_back(bias);
+            }
+            return nx;
+        }
+    }
     return nullptr;
 }
 
