@@ -3260,6 +3260,11 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+    // GGML_CUDA_GRAPH_UPDATE_DEBUG=1 (debug): the error pending before the update and whether the exec handle is still valid, logged
+    // when the update fails with another error than an update failure (a sticky / earlier error vs a bad handle)
+    static const bool update_debug = ggml_cuda_env_flag("GGML_CUDA_GRAPH_UPDATE_DEBUG");
+    const cudaError_t pending = update_debug ? cudaPeekAtLastError() : cudaSuccess;
+
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
     cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &result_info);
@@ -3282,6 +3287,19 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
     // fails the instantiation below with its own message
     static const bool update_retry = getenv("GGML_CUDA_GRAPH_UPDATE_RETRY") == nullptr || atoi(getenv("GGML_CUDA_GRAPH_UPDATE_RETRY")) != 0;
     const bool update_error = stat != cudaSuccess && stat != cudaErrorGraphExecUpdateFailure && update_retry;
+    if (update_debug && stat != cudaSuccess && stat != cudaErrorGraphExecUpdateFailure) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        const cudaError_t probe = cudaSuccess;
+#else
+        unsigned long long flags = 0;
+        const cudaError_t probe = cudaGraphExecGetFlags(graph->instance, &flags);
+#endif
+        size_t n_nodes = 0;
+        const cudaError_t gprobe = cudaGraphGetNodes(graph->graph, nullptr, &n_nodes);
+        GGML_LOG_WARN("%s: update gave %s; pending before it %s; exec %p probe %s; graph %p probe %s (%zu nodes); last error now %s\n", __func__,
+            cudaGetErrorString(stat), cudaGetErrorString(pending), (void *) graph->instance, cudaGetErrorString(probe), (void *) graph->graph,
+            cudaGetErrorString(gprobe), n_nodes, cudaGetErrorString(cudaPeekAtLastError()));
+    }
     if (update_error) {
         static int n_logged = 0;
         if (n_logged++ < 4) {
@@ -3303,11 +3321,17 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
             // update returned invalid argument and so did this destroy, which aborted) the exec is destroyed at most once and a
             // failed destroy is not fatal: the handle is dropped and a new exec instantiated (GGML_CUDA_GRAPH_UPDATE_RETRY=0: assert)
             // GGML_CUDA_GRAPH_DESTROY_FAULT=1 (debug, with GGML_CUDA_GRAPH_UPDATE_FAULT): this destroy fails as seen live (the exec is leaked)
+            // A leaked exec keeps its device memory, which matters under the memory pressure that made the update fail: the error is
+            // cleared and the destroy tried once more; the handle is dropped (leaked) only when that fails too
             static const bool destroy_fault = ggml_cuda_env_flag("GGML_CUDA_GRAPH_DESTROY_FAULT");
-            const cudaError_t de = graph->instance == nullptr ? cudaSuccess : destroy_fault ? cudaErrorInvalidValue : cudaGraphExecDestroy(graph->instance);
+            cudaError_t de = graph->instance == nullptr ? cudaSuccess : destroy_fault ? cudaErrorInvalidValue : cudaGraphExecDestroy(graph->instance);
             if (de != cudaSuccess) {
-                GGML_LOG_WARN("%s: destroying the exec after the failed update gave %s: dropped, instantiating a new one\n", __func__, cudaGetErrorString(de));
                 (void)cudaGetLastError();
+                const cudaError_t de2 = destroy_fault ? de : cudaGraphExecDestroy(graph->instance);
+                (void)cudaGetLastError();
+                GGML_LOG_WARN("%s: destroying the exec after the failed update gave %s, again %s: %s, instantiating a new one\n", __func__,
+                    cudaGetErrorString(de), cudaGetErrorString(de2), de2 == cudaSuccess ? "destroyed" : "dropped");
+                de = de2;
             }
         } else {
             CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
