@@ -4841,8 +4841,29 @@ struct llama_moe_cache::impl {
     // single-graph mailbox): where they run, their verdict already gates prompts (cm_prompt_ok). G4 k17g4a q4x 16 GB (61% cached, trials
     // run): the rule without this gate took chat_s onto the host path at 358 vs 550 tok/s and the 2k decode after it fell 342 -> 306 tok/s;
     // at 8 / 12 GB (trials skipped) chat +18% / +30%
+    // and only where the host is clearly faster than the uploads at the batch's tokens per expert: host us per missing expert
+    // t_cpu(n) = cm_t1 + (tbar(n) - 1)*cm_dt at most cm_short_ratio (LLAMA_MOE_CPU_MISS_SHORT_RATIO, 0.67) of an upload, so the host's 3/4
+    // of the misses take at most half the time their uploads would. The cost model alone (cm_on) put these G4 cells on the host path:
+    // Qwen3.6 UD-Q4_K_XL 8 / 12 GB (t_cpu / t_up 0.60: TTFT -15% / -23%) but also Flash-Next UD-IQ1_S 24 GB (0.75: TTFT +11%, 2k decode
+    // -8%; its re-calibration measured the host 46% slower than at start-up) and gemma-4 Q3_K_M 8 GB (1.3: TTFT +29%, 2k decode -20%)
+    const double cm_short_ratio = [] {
+        const char * e = getenv("LLAMA_MOE_CPU_MISS_SHORT_RATIO");
+        return e != nullptr ? std::max(0.0, atof(e)) : 0.67;
+    }();
+    bool short_fast(int64_t n_tokens) const {
+        for (const group & g : groups) {
+            if (g.dev_lookup && g.n_slots > 0 && g.counts != nullptr && cm_tup > 0.0) {
+                const int64_t n_expert = g.ref[0]->ne[2];
+                const double  D        = cm_distinct(n_tokens, n_expert);
+                const double  tbar     = std::max(1.0, (double) n_tokens*std::min<int64_t>(n_expert_used, n_expert)/std::max(1.0, D));
+                return cm_t1 + (tbar - 1.0)*cm_dt <= cm_short_ratio*cm_tup;
+            }
+        }
+        return false;
+    }
     bool short_eligible(int64_t n_tokens) const {
         return short_live() && cm_trials_skipped && cm && cm_cal && !cm_force && n_tokens > max_batch && n_tokens <= std::min(cm_max, cm_short_max) &&
+            short_fast(n_tokens) &&
             n_tokens > cm_prompt_force && cm_on[n_tokens] != 0 && cmt_host_ok && !cm_prompt_off();
     }
     bool cm_prompt_off() const {
