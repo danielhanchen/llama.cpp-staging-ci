@@ -609,8 +609,8 @@ static void common_params_fit_impl(
     if (fit_moe_cache && !tbo_user.empty()) {
         fit_moe_cache_size(dmds_full, mparams, mparams->n_gpu_layers == default_mparams.n_gpu_layers);
         // k16-fit: --moe-cache-mib auto (an unbounded request) beside user host experts (--cpu-moe, -ot) where the whole cache fits:
-        // every host expert gets a slot, so the request becomes the bytes the cache measures (and a pad for the split over groups, the
-        // slots stop at all experts anyway). Without this the request stayed unbounded, the fit returned "no changes needed" and
+        // every host expert gets a slot, so the request becomes the bytes the cache measures plus the surplus (the slots stop at all
+        // experts anyway). Without this the request stayed unbounded, the fit returned "no changes needed" and
         // common_init_result dropped the cache (T4 gpt-oss-20b --cpu-moe auto on a free card: CPU experts at 14 tok/s against 41 with a
         // 4000 MiB cache). Only the user placement: the fit's own all-experts-on-the-host probe keeps the unbounded request to tell
         // "the cache fits whole" (then experts move to the device). LLAMA_FIT_MOE_CACHE_ALLFIT=0 keeps the old behaviour
@@ -623,13 +623,18 @@ static void common_params_fit_impl(
             dmds_t dmds_nc = common_get_device_memory_data_impl(path_model, mparams, &cparams_nc, devs, hp_ngl, hp_nct, hp_nex, log_level);
             add_extra_memory(dmds_nc, mparams, &cparams_nc);
             int64_t cache_bytes = 0;
+            int64_t surplus     = 0;
             for (size_t id = 0; id < nd; id++) {
                 cache_bytes += int64_t(dmds_full[id].mb.total()) - int64_t(dmds_nc[id].mb.total());
+                surplus     += int64_t(dmds_full[id].free) - int64_t(dmds_full[id].mb.total()) - int64_t(margins[id]);
             }
+            // the request also carries the surplus beyond the targets: common_moe_cache_auto_ubatch funds a larger n_ubatch from the
+            // request, and with the bare cache bytes it took them from the slots (T4 gpt-oss-20b k16fit_t4a: 9783 -> 9421 MiB, 9417 of
+            // 9720 MiB cached). The cache stops at every expert, so the device use stays the projection's plus what n_ubatch takes
             if (cache_bytes > 0) {
-                cparams->moe_cache_size = size_t(cache_bytes + 64*MiB);
-                LOG_INF("%s: --moe-cache-mib auto: every host expert fits in device memory, MoE cache of %" PRId64 " MiB\n",
-                    __func__, cache_bytes/MiB);
+                cparams->moe_cache_size = size_t(cache_bytes + std::max<int64_t>(surplus, 16*MiB));
+                LOG_INF("%s: --moe-cache-mib auto: every host expert fits in device memory, MoE cache of %" PRId64 " MiB, "
+                    "request %zu MiB with the surplus beyond the target\n", __func__, cache_bytes/MiB, cparams->moe_cache_size/MiB);
             }
         }
     }
