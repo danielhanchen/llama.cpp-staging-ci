@@ -422,9 +422,30 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
             }
         }
 
+        // k15-fn (LLAMA_KPOOL_INCREMENTAL=0: rebuild): an edit at p0 > pos_min (a rejected draft's seq_rm, every verify round) leaves
+        // the cells before p0 and every pool that ends before p0 as they were (mem_idx_stale_set), so the layout keeps that prefix
+        // and rescans from the end of its last kept pool: the greedy scan's decisions there depend only on those cells. The rebuild
+        // walked the whole position set (8k context: 8k set nodes per ubatch). LLAMA_KPOOL_INCREMENTAL=2 checks it against a rebuild
+        static const int incr = getenv("LLAMA_KPOOL_INCREMENTAL") ? atoi(getenv("LLAMA_KPOOL_INCREMENTAL")) : 1;
+        bool incr_done = false;
+        if (incr > 0 && mem_idx_stale[s] != POS_CLEAN && !sq.cells.empty() && !sp.empty() && sq.pos_min == sp.begin()->first &&
+                mem_idx_stale[s] > sq.pos_min) {
+            const llama_pos p0 = mem_idx_stale[s];
+            const size_t nk = std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(p0, 0u)) - sq.cells.begin();
+            sq.cells.resize(nk);
+            while (!sq.pools.empty() && sq.pools.back() + kpool > nk) {
+                sq.pools.pop_back();
+            }
+            sq.j_next = sq.pools.empty() ? 0 : sq.pools.back() + kpool;
+            for (auto it = sp.lower_bound(std::make_pair(p0, 0u)); it != sp.end(); ++it) {
+                sq.cells.push_back(*it);
+            }
+            incr_done = sq.cells.size() == sp.size();
+        }
+
         // the appended tail accounts for every cell only if nothing before it was dropped, but an edit can
         // regroup a sequence without changing its cell count, so a stale sequence must rebuild regardless
-        if (sq.cells.size() != sp.size() || mem_idx_stale[s] != POS_CLEAN) {
+        if (!incr_done && (sq.cells.size() != sp.size() || mem_idx_stale[s] != POS_CLEAN)) {
             sq.cells.assign(sp.begin(), sp.end());
             sq.pools.clear();
             sq.j_next  = 0;
@@ -461,6 +482,43 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
             }
         }
         sq.j_next = j;
+
+        if (incr_done && incr >= 2) {
+            // the check: a rebuild of this sequence gives the same cells, pools and scan state
+            kpool_layout::seq ref = sq;
+            ref.cells.assign(sp.begin(), sp.end());
+            ref.pools.clear();
+            ref.j_next  = 0;
+            ref.pos_min = sp.begin()->first;
+            size_t jr = 0;
+            if (hparams_idx.indexer_kpool_by_order) {
+                for (; jr + kpool <= ref.cells.size(); jr += kpool) {
+                    ref.pools.push_back((uint32_t) jr);
+                }
+            } else {
+                while (jr + kpool <= ref.cells.size()) {
+                    const llama_pos q0 = ref.cells[jr].first;
+                    if ((q0 - ref.pos_min) % (llama_pos) kpool != 0) {
+                        ++jr;
+                        continue;
+                    }
+                    bool ok = true;
+                    for (uint32_t k = 1; k < kpool; ++k) {
+                        if (ref.cells[jr + k].first != q0 + (llama_pos) k) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (ok) {
+                        ref.pools.push_back((uint32_t) jr);
+                        jr += kpool;
+                    } else {
+                        ++jr;
+                    }
+                }
+            }
+            GGML_ASSERT(ref.cells == sq.cells && ref.pools == sq.pools && jr == sq.j_next && "LLAMA_KPOOL_INCREMENTAL=2: layout differs from a rebuild");
+        }
 
         lay.n_pool_real += (uint32_t) sq.pools.size();
     }
@@ -883,12 +941,33 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     // Padded entries re-pool cells whose pooled slot is never read: only the reps of complete pools are read.
     // Each entry takes its own cell, entries sharing one would write it from several threads in the scatter.
     if (n_new_g > n_new) {
-        std::vector<int64_t> reps(pcell, pcell + pool_end.size());
-        std::sort(reps.begin(), reps.end());
+        // k15-fn (LLAMA_KPOOL_PAD_BITSET=0: sort): the reps as a bitset over the cells, the same smallest free cells as the sorted
+        // search, without sorting every rep of the context per ubatch
+        static const bool pad_bits = getenv("LLAMA_KPOOL_PAD_BITSET") == nullptr || atoi(getenv("LLAMA_KPOOL_PAD_BITSET")) != 0;
+        const int64_t n_cells_all = (int64_t) kv_size*n_stream_kv;
+        std::vector<int64_t>  reps;
+        std::vector<uint64_t> rep_bits;
+        if (pad_bits) {
+            rep_bits.assign((size_t) (n_cells_all + 63)/64, 0);
+            for (size_t ip = 0; ip < pool_end.size(); ++ip) {
+                const int64_t c = pcell[ip];
+                GGML_ASSERT(c >= 0 && c < n_cells_all);
+                rep_bits[(size_t) c/64] |= uint64_t(1) << (c % 64);
+            }
+        } else {
+            reps.assign(pcell, pcell + pool_end.size());
+            std::sort(reps.begin(), reps.end());
+        }
+        const auto is_rep = [&](int64_t c) {
+            if (pad_bits) {
+                return c < n_cells_all && ((rep_bits[(size_t) c/64] >> (c % 64)) & 1) != 0;
+            }
+            return std::binary_search(reps.begin(), reps.end(), c);
+        };
 
         int64_t pad_cell = 0;
         for (uint32_t i = n_new; i < n_new_g; ++i, ++pad_cell) {
-            while (std::binary_search(reps.begin(), reps.end(), pad_cell)) {
+            while (is_rep(pad_cell)) {
                 ++pad_cell;
             }
             GGML_ASSERT(pad_cell < (int64_t) kv_size*n_stream_kv);

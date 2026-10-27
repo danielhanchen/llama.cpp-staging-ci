@@ -3159,6 +3159,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 way = (int) w;
             }
         }
+        // k15-fn (LLAMA_GRAPH_SMALL_WARM_WAY=0: least recently used): no kept graph of this size can be reused (a new request or a grown
+        // KV view changed the parameters) and the most recently used one ran at least 8 times since it was built (a stable graph, so
+        // not one of two alternating parameter sets): it is rebuilt in place. Its meta buffer gives the rebuilt graph the same first
+        // node, so the backend's CUDA graph for it is captured again at once instead of an eager warm-up pass plus a capture under a
+        // new key (G4 Flash-Next: ~14 ms at each request's first verify)
+        static const bool warm_way = getenv("LLAMA_GRAPH_SMALL_WARM_WAY") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_WARM_WAY")) != 0;
+        if (way < 0 && warm_way) {
+            int mru = -1;
+            for (uint32_t w = 0; w < GF_SMALL_WAYS; ++w) {
+                const uint32_t i = n_small*GF_SMALL_WAYS + w;
+                if (gf_res_small[i] && gf_res_small_built[i] && (mru < 0 || gf_res_small_used[i] > gf_res_small_used[n_small*GF_SMALL_WAYS + mru])) {
+                    mru = (int) w;
+                }
+            }
+            if (mru >= 0 && gf_res_small_nuse[n_small*GF_SMALL_WAYS + mru] >= 8) {
+                way = mru;
+            }
+        }
         if (way < 0) {
             way = 0;
             for (uint32_t w = 1; w < GF_SMALL_WAYS; ++w) {
@@ -3174,6 +3192,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             gf_res_small_built[i_small] = false;
         }
         gf_res_small_used[i_small] = ++n_small_uses;
+        gf_res_small_nuse[i_small]++;
         res = r.get();
     } else {
         res = get_gf_res_prev();
@@ -3340,6 +3359,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active     = res;
         if (n_small > 0) {
             gf_res_small_built[i_small] = true;
+            gf_res_small_nuse[i_small]  = 0;
             gf_res_small_epoch[i_small] = gf_res_epoch;
             if (size_cache) {
                 gf_res_small_plan[i_small] = ggml_backend_sched_plan_save(sched.get());
