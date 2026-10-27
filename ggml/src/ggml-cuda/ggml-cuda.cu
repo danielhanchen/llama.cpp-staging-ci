@@ -4662,7 +4662,9 @@ static int ggml_cuda_try_fuse_hc_post_norm(ggml_backend_cuda_context * cuda_ctx,
         return 0;
     }
     {
-        static const bool off = [] { const char * e = getenv("GGML_CUDA_HC_POST_NORM"); return e != nullptr && atoi(e) == 0; }();
+        // integration head (coordinator 10-26): opt-in (GGML_CUDA_HC_POST_NORM=1) as a free interim until the CUDA-graphs timing race fix
+        // lands (Flash-Next pinned f0 diverged in about 1 of 5 launches with it on, 0 of 14 off; G4 decode cost of off: inside 1% A/A)
+        static const bool off = [] { const char * e = getenv("GGML_CUDA_HC_POST_NORM"); return e == nullptr || atoi(e) == 0; }();
         int irn = ip + 1;
         while (irn < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[irn])) {
             irn++;
