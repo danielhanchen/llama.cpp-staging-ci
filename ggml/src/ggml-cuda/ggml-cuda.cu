@@ -2188,8 +2188,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             const char * e = getenv("GGML_CUDA_VERIFY_MMQ");
             return e != nullptr ? atoi(e) : -1;
         }();
+        // k15-pp: the Turing default is a reassociation, so the bit-exact verify (GGML_CUDA_VERIFY_REASSOC=0) leaves it off there: T4,
+        // Qwen3.6-35B-A3B UD-Q4_K_XL + MTP heads, LLAMA_MTP_EXACT=1 + VERIFY_REASSOC=0, the drafted text left the no-draft text at
+        // token 126 / 89 of 128 (chat / 8k), a near tie; GGML_CUDA_VERIFY_MMQ=1 still turns it on
+        static const bool reassoc_ok = [] {
+            const char * e = getenv("GGML_CUDA_VERIFY_REASSOC");
+            return e == nullptr || atoi(e) != 0;
+        }();
         const bool verify_mmq = verify_mmq_env > 0 ||
-            (verify_mmq_env < 0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING && cc < GGML_CUDA_CC_AMPERE);
+            (verify_mmq_env < 0 && reassoc_ok && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING && cc < GGML_CUDA_CC_AMPERE);
         const bool take_mmq = verify_mmq && ne11 <= 16 && ne12*ne13 == 1 && ggml_is_quantized(src0->type) && turing_mma_available(cc) &&
                 ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0);
         ggml_cuda_verify_mmq_log(dst, cc, take_mmq ? "MMQ" : verify_mmq ? "batched mmvq (not an MMQ product)" : "batched mmvq (VERIFY_MMQ off here)");
