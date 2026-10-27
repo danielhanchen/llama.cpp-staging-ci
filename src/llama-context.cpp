@@ -3995,9 +3995,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // llama_moe_cache::set_prompt_batch); generation and verify batches (an output for every token) keep it
     struct moe_prompt_mark {
         llama_moe_cache * mc;
-        moe_prompt_mark(llama_moe_cache * mc, bool prompt) : mc(mc) { if (mc) { mc->set_prompt_batch(prompt); } }
+        moe_prompt_mark(llama_moe_cache * mc, bool prompt, int64_t n_all) : mc(mc) { if (mc) { mc->set_prompt_batch(prompt, n_all); } }
         ~moe_prompt_mark() { if (mc) { mc->set_prompt_batch(false); } }
-    } moe_prompt_guard(moe_cache.get(), (int64_t) n_outputs_all < (int64_t) n_tokens_all);
+    } moe_prompt_guard(moe_cache.get(), (int64_t) n_outputs_all < (int64_t) n_tokens_all, (int64_t) n_tokens_all);
 
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {

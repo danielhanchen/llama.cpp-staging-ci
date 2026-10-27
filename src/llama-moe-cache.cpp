@@ -4818,6 +4818,29 @@ struct llama_moe_cache::impl {
     // prompt's small checkpoint tail ubatch taking the pinned host path). LLAMA_MOE_PIN_PROMPT_DEV=0: off there;
     // LLAMA_MOE_CPU_MISS_PROMPT_DEV=1: also without the pin (test arm)
     bool cm_prompt_now = false; // set by the context around each decode (set_prompt_batch)
+    int64_t cm_prompt_all = 0;  // k17-ttft: tokens of that prompt batch (0 outside prompt batches)
+
+    // k17-ttft short prompts (LLAMA_MOE_CPU_MISS_SHORT, default 128; 0 = off, the k15 default): a prompt batch of max_batch + 1 ..
+    // cm_short_max tokens in all (a chat turn, not the tail of a long prompt: G4 r22b gemma-4 2k decode -18% after its last partial
+    // ubatch took the host path and admitted less) takes the host path in each ubatch the cost model turns on (cm_on: calibrated host
+    // us per expert and per further token, upload us, the split and the activations at cm_margin_p, the measured miss rate), at the
+    // rule's fetch share but at most 1/4 as k11's prompt path; no timing trials, so no trial ubatch changes what the cache admits.
+    // As Strata's own default (q36: --hybrid-rows 128, every miss of a batch of up to 128 rows on the CPU pool, q36_engine.cu
+    // moe_hybrid_cpu; Flash-Next: STRATA_PREFILL_CPU_SHARE=auto below 1024 tokens): the host's expert products are ggml-cpu's
+    // (Q8_K activations), not the device's bit for bit, so the text changes (KLD-gated). Before it, the small-batch trials (which
+    // never ran on these placements: "0 trials") kept every prompt above 32 tokens on the uploads (G4 q4x 12 GB: 4.8 GB for a
+    // 42-token chat prompt, 90 ms of H2D at the link ceiling)
+    const int64_t cm_short_max = [] {
+        const char * e = getenv("LLAMA_MOE_CPU_MISS_SHORT");
+        return e != nullptr ? std::max<int64_t>(0, std::min<int64_t>(cm_max_limit, atoll(e))) : (int64_t) 128;
+    }();
+    bool short_live() const {
+        return cm_short_max > 0 && cm_prompt_now && cm_prompt_all > max_batch && cm_prompt_all <= cm_short_max;
+    }
+    bool short_eligible(int64_t n_tokens) const {
+        return short_live() && cm && cm_cal && !cm_force && n_tokens > max_batch && n_tokens <= std::min(cm_max, cm_short_max) &&
+            n_tokens > cm_prompt_force && cm_on[n_tokens] != 0 && cmt_host_ok && !cm_prompt_off();
+    }
     bool cm_prompt_off() const {
         static const bool pin_dev = [] {
             const char * e = getenv("LLAMA_MOE_PIN_PROMPT_DEV");
@@ -4838,7 +4861,7 @@ struct llama_moe_cache::impl {
 
     bool cm_serves(int64_t n_tokens) const {
         return !force_large && cm && cm_cal && !cm_prompt_off() && n_tokens > max_batch && n_tokens <= cm_max && (n_tokens <= cm_prompt_force || (cm_on[n_tokens] != 0 && cm_prompt_ok()) ||
-            (pt_eligible(n_tokens) && pt_arm != 0));
+            (pt_eligible(n_tokens) && pt_arm != 0) || short_eligible(n_tokens));
     }
 
     // the host computes the misses of a batch of n_tokens: the fetch share, 1 = every missing expert is fetched
@@ -4852,6 +4875,9 @@ struct llama_moe_cache::impl {
         if (cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_prompt_force) {
             // default: at most 1/4 fetched. The rule's share (capped at 3/4) left 71 ms of zero-copy fetch kernels in a 38-token LFM2.5 8 GB
             // prompt of 122 ms; G4 k11pgW at 1/4: LFM2.5 chat 444 tok/s (339 at the rule's share), Qwen3.6 360 (329); 1/8: LFM2.5 415
+            return cm_prompt_share > 0.0f ? cm_prompt_share : std::min(cm_share[n_tokens], 0.25f);
+        }
+        if (short_eligible(n_tokens) && !cm_prompt_ok()) {
             return cm_prompt_share > 0.0f ? cm_prompt_share : std::min(cm_share[n_tokens], 0.25f);
         }
         if (pt_eligible(n_tokens)) {
@@ -5259,7 +5285,7 @@ struct llama_moe_cache::impl {
     int hybrid_mode() const {
         if (cm) {
             // the decisions of every batch size are in the graph: a new decision rebuilds the graphs
-            return 3 + (ov_live ? 4 : 0) + 8*(int) (cm_gen & 0xfffff) + (cm_prompt_off() ? (1 << 28) : 0);
+            return 3 + (ov_live ? 4 : 0) + 8*(int) (cm_gen & 0xfffff) + (cm_prompt_off() ? (1 << 28) : 0) + (short_live() ? (1 << 29) : 0);
         }
         // a single-graph failure (single_off) rebuilds the graphs without their mailboxes: a reused graph would keep merging from a
         // mailbox whose control block says failed (wrong rows in every later ubatch with a pinned fetch share, LLAMA_MOE_CACHE_FETCH)
@@ -8658,8 +8684,9 @@ bool llama_moe_cache::hybrid_active() const {
     return pimpl->hybrid_active();
 }
 
-void llama_moe_cache::set_prompt_batch(bool prompt) {
+void llama_moe_cache::set_prompt_batch(bool prompt, int64_t n_tokens_all) {
     pimpl->cm_prompt_now = prompt;
+    pimpl->cm_prompt_all = prompt ? n_tokens_all : 0;
 }
 
 bool llama_moe_cache::host_computes(int64_t n_tokens) const {

@@ -145,7 +145,7 @@ public:
     void single_note_form(int32_t il, bool ok) const;
     // k15: the context marks each decode: a prompt batch (tokens without outputs) keeps its ubatches off the CPU-miss host path while
     // the small batches are pinned (see cm_prompt_off)
-    void set_prompt_batch(bool prompt);
+    void set_prompt_batch(bool prompt, int64_t n_tokens_all = 0);
     // before the graph of every ubatch of n_tokens: wakes the host thread (batches that may publish), turns the path off after a failure
     void single_kick(int64_t n_tokens);
 
