@@ -170,6 +170,9 @@ LLAMA_API bool llama_moe_pin_small(struct llama_context * ctx);
 LLAMA_API bool llama_moe_pin_small_set(struct llama_context * ctx, bool on);
 // k15-lfm2: a new request starts (the CPU-miss rule restarts from the launch's decisions with LLAMA_MOE_CPU_MISS_PER_REQUEST=1)
 LLAMA_API void llama_moe_request_begin(struct llama_context * ctx);
+// k15-idlewait: the idle work of llama_prepare_prompt_plan (the MoE cache's pending re-calibration of the CPU-miss host timings) polls
+// fn(data) and stops, staying pending, when it returns true (a request arrived); NULL: it runs to the end
+LLAMA_API void llama_set_idle_abort(struct llama_context * ctx, bool (*fn)(void *), void * data);
 // k15-lfm2: turns the CPU-miss rule off on a host that cannot compute experts faster than it uploads them (few threads, host time per
 // expert not well below the upload time) where the cache holds most host experts: the misses are fetched, every expert runs on the device
 // from a slot (verify rows are single token bytes again). Returns true if it turned the rule off. LLAMA_MOE_CPU_MISS_DROP=0: never

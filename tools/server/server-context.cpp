@@ -2046,10 +2046,14 @@ private:
                     }
                 }
             }
+            // k15-idlewait: the MoE cache re-calibration in this idle work stops (stays pending) once a task is queued
+            auto idle_abort = [](void * q) { return static_cast<server_queue *>(q)->has_tasks(); };
             if (ctx_tgt) {
+                llama_set_idle_abort(ctx_tgt, idle_abort, &queue_tasks);
                 llama_prepare_prompt_plan(ctx_tgt);
             }
             if (ctx_dft && ctx_dft != ctx_tgt) {
+                llama_set_idle_abort(ctx_dft, idle_abort, &queue_tasks);
                 llama_prepare_prompt_plan(ctx_dft);
             }
         });

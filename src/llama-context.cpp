@@ -5978,14 +5978,26 @@ llm_graph_params llama_context::graph_params(
 // next prompt would each re-plan it again as the KV view grows, every time with a synchronization of all backends (G4: prompts 2-7%
 // slower with n-gram drafting on). This restores the worst-case pp plan of sched_reserve once. The allocator only plans addresses:
 // outputs cannot change. LLAMA_PP_RERESERVE=0: off.
-bool llama_context::restore_pp_plan() {
+bool llama_context::restore_pp_plan(bool idle) {
     // k13-fn: the slots are idle: the MoE cache's pending re-calibration of the CPU-miss host timings runs now, not inside a reply
+    // k15-idlewait (LLAMA_MOE_RECAL_YIELD=0: runs to the end, as before): a request that arrives meanwhile (llama_set_idle_abort) stops it
+    // before the next timing repetition and it stays pending for the next idle time; it changes nothing until it completes. G4 q4x 12 GB:
+    // the re-calibration of the target and the MTP head (~50 ms) ran after the chat reply, and the next request waited for all of it
     if (moe_cache && backend_cpu != nullptr && moe_cache->recal_pending()) {
-        synchronize();
-        compute_n_tokens = -1;
-        set_compute_threads(false);
-        compute_n_tokens = 0;
-        moe_cache->recal(backend_cpu);
+        static const bool yield = getenv("LLAMA_MOE_RECAL_YIELD") == nullptr || atoi(getenv("LLAMA_MOE_RECAL_YIELD")) != 0;
+        bool (*abort)(void *) = yield && idle ? idle_abort_fn : nullptr;
+        if (abort == nullptr || !abort(idle_abort_data)) {
+            synchronize();
+            compute_n_tokens = -1;
+            set_compute_threads(false);
+            compute_n_tokens = 0;
+            if (!moe_cache->recal(backend_cpu, abort, idle_abort_data)) {
+                static int n_log = 0;
+                if (n_log++ < 8) {
+                    LLAMA_LOG_INFO("%s: MoE cache re-calibration stopped by a request, it stays pending\n", __func__);
+                }
+            }
+        }
     }
     static const bool pp_rereserve = getenv("LLAMA_PP_RERESERVE") == nullptr || atoi(getenv("LLAMA_PP_RERESERVE")) != 0;
     if (!pp_rereserve || !sched_plan_small || !memory || moe_cache || model.hparams.no_alloc || sched_need_reserve) {
@@ -9175,7 +9187,7 @@ bool llama_exact_verify_enabled(void) {
 }
 
 bool llama_prepare_prompt_plan(llama_context * ctx) {
-    return ctx->restore_pp_plan();
+    return ctx->restore_pp_plan(true);
 }
 
 bool llama_context::moe_freeze_small() {
@@ -9213,6 +9225,13 @@ void llama_context::moe_request_begin() {
             return e != nullptr ? atoi(e) : 1;
         }();
         moe_seed_early = seed_early_env;
+    }
+}
+
+void llama_set_idle_abort(llama_context * ctx, bool (*fn)(void *), void * data) {
+    if (ctx != nullptr) {
+        ctx->idle_abort_fn   = fn;
+        ctx->idle_abort_data = data;
     }
 }
 

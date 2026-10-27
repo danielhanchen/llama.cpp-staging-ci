@@ -51,6 +51,12 @@ private:
 public:
     ~server_queue() { worker_stop(); }
 
+    // k15-idlewait: a task waits in the queue (the idle work's abort check, see llama_set_idle_abort)
+    bool has_tasks() {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        return !queue_tasks.empty();
+    }
+
     // Add a new task to the end of the queue
     int post(server_task && task, bool front = false);
 

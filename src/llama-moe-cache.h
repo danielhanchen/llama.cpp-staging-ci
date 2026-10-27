@@ -157,7 +157,9 @@ public:
     void hybrid_probe(ggml_backend_t backend_cpu);
     // k13-fn: one re-calibration of the CPU-miss host timings after warm-up, run between requests (see cm_recal_wait)
     bool recal_pending() const;
-    void recal(ggml_backend_t backend_cpu);
+    // k15-idlewait: abort(abort_data) is polled between the timing repetitions; when it returns true the re-calibration stops, changes
+    // nothing and stays pending (returns false)
+    bool recal(ggml_backend_t backend_cpu, bool (*abort)(void *) = nullptr, void * abort_data = nullptr);
 
     // default and forced hybrid path (LLAMA_MOE_CACHE_HYBRID unset or 2): the fetch share follows from the decode threads, call once after
     // the constructor; the same inputs then give the same output in every run (see hybrid_fixed)

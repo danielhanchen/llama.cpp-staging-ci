@@ -113,6 +113,9 @@ struct llama_context {
     bool moe_pin_small();    // k13: see llama_moe_pin_small
     bool moe_pin_small_set(bool on); // k15-lfm2: see llama_moe_pin_small_set
     void moe_request_begin();        // k15-lfm2: see llama_moe_request_begin
+    // k15-idlewait: see llama_set_idle_abort
+    bool (*idle_abort_fn)(void *) = nullptr;
+    void * idle_abort_data        = nullptr;
     bool moe_cpu_miss_drop_slow(); // k15-lfm2: see llama_moe_cpu_miss_drop_slow
     const llama_cparams & get_cparams() const;
 
@@ -177,7 +180,7 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_verify(bool value);
     void set_verify_exact(bool value);
-    bool restore_pp_plan(); // k11-decode (see the definition)
+    bool restore_pp_plan(bool idle = false); // k11-decode (see the definition); idle: from llama_prepare_prompt_plan
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
 
