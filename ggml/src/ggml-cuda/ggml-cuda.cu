@@ -4468,8 +4468,8 @@ static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::un
             }
         }
     }
-    // k15-mm2: gated outputs (GLU, and the MUL of a fused SILU / SIGMOID / SOFTPLUS + MUL pair), unary.cu writes their q8_1 copy, also
-    // for a reader whose rows are a multiple of MATRIX_ROW_PADDING other than theirs (GGML_CUDA_GATED_Q8_1=0 turns this off)
+    // k15-mm2: gated outputs (GLU, and the MUL of a fused SILU / SIGMOID / SOFTPLUS + MUL pair), unary.cu writes their q8_1 copy in the
+    // rows of their reader, of any width (GGML_CUDA_GATED_Q8_1=0 turns this off)
     // (GGML_CUDA_DISABLE_GLU_Q8_1=1, the switch of k15-fn 414e7c2d4a5 that this replaces, is an alias)
     static const bool gated_q8_1_disabled = [] {
         const char * e = getenv("GGML_CUDA_GATED_Q8_1");
@@ -4509,13 +4509,17 @@ static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::un
         while (prod->view_src != nullptr && prod->view_offs == 0 && ggml_nbytes(prod) == ggml_nbytes(prod->view_src)) {
             prod = prod->view_src;
         }
-        const bool same_rows = ggml_cuda_q8_1_cache::same_copy_rows(src1->ne[0], prod->ne[0]);
-        const bool flat_rows = !same_rows && flat_outputs.count(prod) && src1->ne[0] % MATRIX_ROW_PADDING == 0 &&
-            !ggml_cuda_q8_1_cache::reshape_disabled();
-        const bool norm_target = norm_outputs.count(prod) && ggml_is_contiguous(src1) && ggml_is_contiguous(prod) && (same_rows || flat_rows);
+        // a gated output writes its copy in the rows of its reader, of any width (unary_gated_q8_1_kernel): the first reader whose rows
+        // are not the producer's own sets them; a later reader with other rows than the planned copy quantizes for itself
+        const auto planned = norm_target_ne10.find(prod);
+        const int64_t copy_ne10 = planned != norm_target_ne10.end() ? planned->second : prod->ne[0];
+        const bool same_rows = ggml_cuda_q8_1_cache::same_copy_rows(src1->ne[0], copy_ne10);
+        const bool reader_rows = !same_rows && flat_outputs.count(prod) && !norm_targets.count(prod) && src1->ne[0] > 0 &&
+            ggml_nelements(prod) % src1->ne[0] == 0;
+        const bool norm_target = norm_outputs.count(prod) && ggml_is_contiguous(src1) && ggml_is_contiguous(prod) && (same_rows || reader_rows);
         if (norm_target) {
             norm_targets.insert(prod);
-            if (flat_rows) {
+            if (reader_rows) {
                 norm_target_ne10[prod] = src1->ne[0];
             }
         } else if (n_readers[src1->data] < 2) {
