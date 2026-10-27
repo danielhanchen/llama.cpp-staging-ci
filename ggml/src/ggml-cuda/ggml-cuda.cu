@@ -6166,10 +6166,88 @@ static int ggml_cuda_try_fuse_qsa_pool(ggml_backend_cuda_context * cuda_ctx, con
     return j - i + 1;
 }
 
+// k15-fn: the readers of every tensor of one evaluation pass, built once per pass on first use: entries (node j, src k) with
+// src[k] == t or src[k]->view_src == t, ascending (j, k) per t. The scan to the graph end per question cost ~6 scans of ~8000
+// nodes x GGML_MAX_SRC per delta-net layer per pass (host time of every eager / capture pass; G4 k15gi2 CPU samples)
+static uint64_t ggml_cuda_eval_gen = 1;   // bumped at the start of every evaluation pass
+
+struct ggml_cuda_reader_index {
+    const ggml_cgraph *   g     = nullptr;
+    ggml_tensor * const * nodes = nullptr;
+    int                   n     = -1;
+    uint64_t              gen   = 0;
+    std::unordered_map<const ggml_tensor *, int> head;
+    std::vector<int> e_j, e_k, e_next;
+
+    void build(const ggml_cgraph * cgraph) {
+        g = cgraph; nodes = cgraph->nodes; n = cgraph->n_nodes; gen = ggml_cuda_eval_gen;
+        head.clear(); head.reserve(2 * (size_t) n + 16);
+        e_j.clear(); e_k.clear(); e_next.clear();
+        const auto push = [&](const ggml_tensor * key, int j, int k) {
+            auto it = head.find(key);
+            e_j.push_back(j); e_k.push_back(k); e_next.push_back(it == head.end() ? -1 : it->second);
+            head[key] = (int) e_j.size() - 1;
+        };
+        // descending (j, k), each entry prepended: every list ascends
+        for (int j = n - 1; j >= 0; --j) {
+            const ggml_tensor * nd = cgraph->nodes[j];
+            for (int k = GGML_MAX_SRC - 1; k >= 0; --k) {
+                const ggml_tensor * s = nd->src[k];
+                if (s == nullptr) {
+                    continue;
+                }
+                push(s, j, k);
+                if (s->view_src != nullptr && s->view_src != s) {
+                    push(s->view_src, j, k);
+                }
+            }
+        }
+    }
+    bool valid(const ggml_cgraph * cgraph) const {
+        return g == cgraph && nodes == cgraph->nodes && n == cgraph->n_nodes && gen == ggml_cuda_eval_gen;
+    }
+};
+
+// k15-fn: one reader (node j, src k) of t for ggml_cuda_sole_gdn_reader: 1 = skipped (a view of t), 0 = t's gated_delta_net, -1 = other
+static int ggml_cuda_gdn_reader_kind(const ggml_cgraph * cgraph, int j, int k, const ggml_tensor * t, int k_expected, int gdn) {
+    const ggml_tensor * n = cgraph->nodes[j];
+    const ggml_tensor * s = n->src[k];
+    if (ggml_cuda_is_view_or_noop(n) && n->view_src == t) {
+        return 1;
+    }
+    if (n->op == GGML_OP_GATED_DELTA_NET && k == k_expected && gdn < 0 && s->view_offs == 0 && ggml_nelements(s) == ggml_nelements(t) &&
+        ggml_is_contiguous(s) && n->src[3]->ne[0] == 1 && n->src[2]->ne[3] == 1 && !ggml_cuda_gated_delta_net_may_use_mma(n)) {
+        return 0;
+    }
+    return -1;
+}
+
 // k15-fn: the gated_delta_net (non-KDA, one sequence, not the mma kernel) that is the only reader of t (through views of t; its src[k] a
-// contiguous whole view of t), or -1
+// contiguous whole view of t), or -1. GGML_CUDA_GDN_READER_INDEX=0: a scan of every node after i per call (the same answer)
 static int ggml_cuda_sole_gdn_reader(const ggml_cgraph * cgraph, int i, const ggml_tensor * t, int k_expected) {
+    static const bool use_index = getenv("GGML_CUDA_GDN_READER_INDEX") == nullptr || atoi(getenv("GGML_CUDA_GDN_READER_INDEX")) != 0;
     int gdn = -1;
+    if (use_index) {
+        static thread_local ggml_cuda_reader_index idx;
+        if (!idx.valid(cgraph)) {
+            idx.build(cgraph);
+        }
+        const auto it = idx.head.find(t);
+        for (int e = it == idx.head.end() ? -1 : it->second; e >= 0; e = idx.e_next[e]) {
+            const int j = idx.e_j[e];
+            if (j <= i) {
+                continue;
+            }
+            const int r = ggml_cuda_gdn_reader_kind(cgraph, j, idx.e_k[e], t, k_expected, gdn);
+            if (r < 0) {
+                return -1;
+            }
+            if (r == 0) {
+                gdn = j;
+            }
+        }
+        return gdn;
+    }
     for (int j = i + 1; j < cgraph->n_nodes; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
         for (int k = 0; k < GGML_MAX_SRC; ++k) {
@@ -6177,15 +6255,13 @@ static int ggml_cuda_sole_gdn_reader(const ggml_cgraph * cgraph, int i, const gg
             if (s == nullptr || (s != t && s->view_src != t)) {
                 continue;
             }
-            if (ggml_cuda_is_view_or_noop(n) && n->view_src == t) {
-                continue;
+            const int r = ggml_cuda_gdn_reader_kind(cgraph, j, k, t, k_expected, gdn);
+            if (r < 0) {
+                return -1;
             }
-            if (n->op == GGML_OP_GATED_DELTA_NET && k == k_expected && gdn < 0 && s->view_offs == 0 && ggml_nelements(s) == ggml_nelements(t) &&
-                ggml_is_contiguous(s) && n->src[3]->ne[0] == 1 && n->src[2]->ne[3] == 1 && !ggml_cuda_gated_delta_net_may_use_mma(n)) {
+            if (r == 0) {
                 gdn = j;
-                continue;
             }
-            return -1;
         }
     }
     return gdn;
@@ -8355,6 +8431,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->conv_state_pending.clear();
             cuda_ctx->conv_cat_elided.clear();
             cuda_ctx->unary_cont_elided.clear();
+            ++ggml_cuda_eval_gen;   // k15-fn: per-pass caches (ggml_cuda_reader_index) are rebuilt on first use
             ggml_cuda_qsa_maskless_plan(cuda_ctx, cgraph);
             ggml_cuda_qsa_sel_plan(cuda_ctx, cgraph);
             for (int i = 0; i < cgraph->n_nodes; i++) {
