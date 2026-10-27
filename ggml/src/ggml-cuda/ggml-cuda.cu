@@ -3265,6 +3265,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
                 prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j]->data;
                 memcpy(prop.node_src_ne[j], cgraph->nodes[i]->src[j]->ne, sizeof(prop.node_src_ne[j]));
                 memcpy(prop.node_src_nb[j], cgraph->nodes[i]->src[j]->nb, sizeof(prop.node_src_nb[j]));
+                prop.node_src_type[j] = (int32_t) cgraph->nodes[i]->src[j]->type;
             }
         }
 
@@ -3285,6 +3286,8 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
                     what = "src data";
                 } else if (memcmp(o.node_src_ne, prop.node_src_ne, sizeof(o.node_src_ne)) != 0) {
                     what = "src ne";
+                } else if (memcmp(o.node_src_type, prop.node_src_type, sizeof(o.node_src_type)) != 0) {
+                    what = "src type";
                 } else if (memcmp(o.node.src, prop.node.src, sizeof(o.node.src)) != 0) {
                     what = "src pointer";
                 } else if (o.node.extra != prop.node.extra) {
