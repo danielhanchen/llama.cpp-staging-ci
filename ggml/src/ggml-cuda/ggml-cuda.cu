@@ -5425,6 +5425,8 @@ static int ggml_cuda_try_fuse_mmvq_multi(ggml_backend_cuda_context * cuda_ctx, g
 // rollback-group ids) whose only reader is a gated_delta_net of one sequence is skipped, and the kernel reads that row from the cache
 // through the same ids: bitwise the same state, no 3 MiB copy per layer and step (Qwen3.8-Flash-Next: 36 GDN layers, 108 MiB per verify).
 // Not for the mma kernel (it reads a contiguous state), nor when the gathered rows have another reader
+static bool ggml_cuda_kept_until(const ggml_cgraph * cgraph, int i, int j, const ggml_tensor * t, bool skip_deferred);
+
 static bool ggml_cuda_try_gdn_state_in_place(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
     static const bool enabled = getenv("GGML_CUDA_GDN_STATE_IN_PLACE") == nullptr || atoi(getenv("GGML_CUDA_GDN_STATE_IN_PLACE")) != 0;
     if (!enabled || ggml_cuda_fusion_disabled()) {
@@ -5439,7 +5441,8 @@ static bool ggml_cuda_try_gdn_state_in_place(ggml_backend_cuda_context * cuda_ct
         rows->data == nullptr || ids->data == nullptr) {
         return false;
     }
-    const ggml_tensor * gdn = nullptr;
+    const ggml_tensor * gdn     = nullptr;
+    int                 gdn_idx = -1;
     for (int j = i + 1; j < cgraph->n_nodes; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
         for (int k = 0; k < GGML_MAX_SRC; ++k) {
@@ -5455,13 +5458,25 @@ static bool ggml_cuda_try_gdn_state_in_place(ggml_backend_cuda_context * cuda_ct
             }
             if (n->op == GGML_OP_GATED_DELTA_NET && k == 5 && gdn == nullptr && s->view_offs == 0 && ggml_nelements(s) == gr->ne[0] &&
                 ggml_is_contiguous(s) && n->src[2]->ne[3] == 1 && !ggml_cuda_gated_delta_net_may_use_mma(n)) {
-                gdn = n;
+                gdn     = n;
+                gdn_idx = j;
                 continue;
             }
             return false;
         }
     }
     if (gdn == nullptr) {
+        return false;
+    }
+    // the kernel reads ids and the cache row at the gated_delta_net, not at the gather: the gather was the last planned reader of ids (the
+    // rollback-group ids, one input shared by every recurrent layer, so the last layer's gather frees it), so the allocator may hand its
+    // bytes to a node in between, and the kernel then read a stale id (an out-of-bounds state read, and text that depended on the
+    // allocation plan). Only skip the gather when nothing in between writes over ids or the rows
+    if (!ggml_cuda_kept_until(cgraph, i, gdn_idx, ids, false) || !ggml_cuda_kept_until(cgraph, i, gdn_idx, rows, false)) {
+        static const bool dbg = getenv("GGML_CUDA_GDN_STATE_IN_PLACE_DEBUG") != nullptr;
+        if (dbg) {
+            GGML_LOG_INFO("%s: %s: ids or rows overwritten before %s, gather kept\n", __func__, gr->name, gdn->name);
+        }
         return false;
     }
     // the kernel reads the row the gather would have copied: rows + ids[0] * nb[1]
