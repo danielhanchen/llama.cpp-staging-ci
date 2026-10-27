@@ -608,6 +608,30 @@ static void common_params_fit_impl(
     // if the user also fixed the layers the fit aborts below, so only the free memory itself is the target there
     if (fit_moe_cache && !tbo_user.empty()) {
         fit_moe_cache_size(dmds_full, mparams, mparams->n_gpu_layers == default_mparams.n_gpu_layers);
+        // k16-fit: --moe-cache-mib auto (an unbounded request) beside user host experts (--cpu-moe, -ot) where the whole cache fits:
+        // every host expert gets a slot, so the request becomes the bytes the cache measures (and a pad for the split over groups, the
+        // slots stop at all experts anyway). Without this the request stayed unbounded, the fit returned "no changes needed" and
+        // common_init_result dropped the cache (T4 gpt-oss-20b --cpu-moe auto on a free card: CPU experts at 14 tok/s against 41 with a
+        // 4000 MiB cache). Only the user placement: the fit's own all-experts-on-the-host probe keeps the unbounded request to tell
+        // "the cache fits whole" (then experts move to the device). LLAMA_FIT_MOE_CACHE_ALLFIT=0 keeps the old behaviour
+        const char * e_allfit = getenv("LLAMA_FIT_MOE_CACHE_ALLFIT");
+        const bool   allfit   = e_allfit == nullptr || atoi(e_allfit) != 0;
+        if (allfit && cparams->moe_cache_size >= (size_t(1) << 40)) { // COMMON_MOE_CACHE_AUTO_BYTES: not shrunk, so the whole cache fits
+            llama_context_params cparams_nc = *cparams;
+            cparams_nc.moe_cache_size = 0;
+            LOG_TRC("%s: getting device memory data without the MoE cache (the whole cache fits):\n", __func__);
+            dmds_t dmds_nc = common_get_device_memory_data_impl(path_model, mparams, &cparams_nc, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            add_extra_memory(dmds_nc, mparams, &cparams_nc);
+            int64_t cache_bytes = 0;
+            for (size_t id = 0; id < nd; id++) {
+                cache_bytes += int64_t(dmds_full[id].mb.total()) - int64_t(dmds_nc[id].mb.total());
+            }
+            if (cache_bytes > 0) {
+                cparams->moe_cache_size = size_t(cache_bytes + 64*MiB);
+                LOG_INF("%s: --moe-cache-mib auto: every host expert fits in device memory, MoE cache of %" PRId64 " MiB\n",
+                    __func__, cache_bytes/MiB);
+            }
+        }
     }
 
     int64_t sum_free            = 0;
