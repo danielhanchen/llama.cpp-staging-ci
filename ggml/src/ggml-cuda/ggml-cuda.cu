@@ -5565,23 +5565,105 @@ static bool ggml_cuda_try_conv_cat_elide(ggml_backend_cuda_context * cuda_ctx, c
     return true;
 }
 
-// an elided conv-input concat that a node about to run reads (other than its convolution): the concat runs now
+// an elided conv-input concat that a node about to run reads (other than its convolution), or an elided CONT (other than by the fused
+// UNARY + MUL that took it): it runs now
 static void ggml_cuda_conv_cat_materialize(ggml_backend_cuda_context * cuda_ctx, const ggml_tensor * node) {
-    if (node->op == GGML_OP_SSM_CONV) {
-        return;
-    }
-    for (int s = 0; s < GGML_MAX_SRC && !cuda_ctx->conv_cat_elided.empty(); ++s) {
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
         const ggml_tensor * t = node->src[s];
         if (t == nullptr) {
             continue;
         }
         const ggml_tensor * root = t->view_src != nullptr ? t->view_src : t;
-        auto it = cuda_ctx->conv_cat_elided.find(root);
-        if (it != cuda_ctx->conv_cat_elided.end()) {
-            cuda_ctx->conv_cat_elided.erase(it);
-            ggml_cuda_op_concat(*cuda_ctx, const_cast<ggml_tensor *>(root));
+        if (node->op != GGML_OP_SSM_CONV) {
+            auto it = cuda_ctx->conv_cat_elided.find(root);
+            if (it != cuda_ctx->conv_cat_elided.end()) {
+                cuda_ctx->conv_cat_elided.erase(it);
+                ggml_cuda_op_concat(*cuda_ctx, const_cast<ggml_tensor *>(root));
+            }
+        }
+        auto ic = cuda_ctx->unary_cont_elided.find(root);
+        if (ic != cuda_ctx->unary_cont_elided.end()) {
+            cuda_ctx->unary_cont_elided.erase(ic);
+            ggml_cuda_dup(*cuda_ctx, const_cast<ggml_tensor *>(root));
         }
     }
+}
+
+// k15-fn (GGML_CUDA_DISABLE_UNARY_SRC_CONT_FUSION=1 off): the CONT of a strided 3D f32 view (the attention output gate of qwen35 /
+// qwen35moe / qwen3next / qwen4exp: a view of every head's second half of Qcur_full, made contiguous) whose only reader is a UNARY
+// fused with the MUL after it (ggml_cuda_op_unary_mul): the fused kernel reads the view, the CONT does not run. Decode / verify rows
+// only (at most 8); nothing that runs up to the MUL may write over the view. Returns the UNARY index, -1: no match
+static int ggml_cuda_unary_src_cont_match(const ggml_cgraph * cgraph, int i, bool runtime) {
+    const ggml_tensor * c = cgraph->nodes[i];
+    const ggml_tensor * s = c->src[0];
+    if (c->op != GGML_OP_CONT || c->type != GGML_TYPE_F32 || s == nullptr || s->type != GGML_TYPE_F32 || s->nb[0] != sizeof(float) ||
+        s->ne[3] != 1 || s->ne[2] > 8 || c->ne[0] != s->ne[0]*s->ne[1] || ggml_nrows(c) != s->ne[2] || !ggml_is_contiguous(c) ||
+        s->nb[1] % sizeof(float) != 0 || s->nb[2] % sizeof(float) != 0 || (c->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return -1;
+    }
+    int u = -1;
+    for (int k = i + 1; k < cgraph->n_nodes; ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        bool reads = false;
+        for (int q = 0; q < GGML_MAX_SRC; ++q) {
+            const ggml_tensor * t = n->src[q];
+            if (t != nullptr && (t == c || t->view_src == c)) {
+                reads = true;
+            }
+        }
+        if (!reads) {
+            continue;
+        }
+        if (u >= 0 || n->op != GGML_OP_UNARY || n->src[0] != c) {
+            return -1;
+        }
+        u = k;
+        if (!runtime) {
+            break;
+        }
+    }
+    if (u < 0 || u + 1 >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor * un  = cgraph->nodes[u];
+    const ggml_tensor * mul = cgraph->nodes[u + 1];
+    const ggml_unary_op op = ggml_get_unary_op(un);
+    if ((op != GGML_UNARY_OP_SILU && op != GGML_UNARY_OP_SIGMOID && op != GGML_UNARY_OP_SOFTPLUS) || mul->op != GGML_OP_MUL ||
+        (mul->src[0] != un && mul->src[1] != un) || !ggml_cuda_can_fuse(cgraph, u, { GGML_OP_UNARY, GGML_OP_MUL }, { op })) {
+        return -1;
+    }
+    const ggml_tensor * x = mul->src[0] == un ? mul->src[1] : mul->src[0];
+    if (x->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous_1(x) || x->nb[0] != sizeof(float) ||
+        !ggml_are_same_shape(c, x) || c->ne[0] == 1) {
+        return -1;
+    }
+    if (runtime) {
+        if (s->data == nullptr) {
+            return -1;
+        }
+        for (int k = i + 1; k <= u + 1; ++k) {
+            const ggml_tensor * n = cgraph->nodes[k];
+            if (!ggml_cuda_is_view_or_noop(n) && n != un && ggml_cuda_ranges_overlap(n, s)) {
+                return -1;
+            }
+        }
+    }
+    return u;
+}
+
+static bool ggml_cuda_try_unary_src_cont_elide(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_UNARY_SRC_CONT_FUSION");
+    if (disabled || ggml_cuda_fusion_disabled() || cuda_ctx->curr_stream_no != 0) {
+        return false;
+    }
+    if (ggml_cuda_unary_src_cont_match(cgraph, i, /*runtime=*/true) < 0) {
+        return false;
+    }
+    cuda_ctx->unary_cont_elided.insert(cgraph->nodes[i]);
+    return true;
 }
 
 // k15-fn (GGML_CUDA_DISABLE_QSA_POOL_FUSION=1 off): a QSA layer's new pooled keys (qwen4exp build_qsa_sel): GET_ROWS of the kpool
@@ -7998,6 +8080,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->gdn_gates_in.clear();
             cuda_ctx->conv_state_pending.clear();
             cuda_ctx->conv_cat_elided.clear();
+            cuda_ctx->unary_cont_elided.clear();
             ggml_cuda_qsa_maskless_plan(cuda_ctx, cgraph);
             ggml_cuda_qsa_sel_plan(cuda_ctx, cgraph);
             for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -8109,7 +8192,26 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                if (!cuda_ctx->conv_cat_elided.empty()) {
+                if (node->op == GGML_OP_CONT && ggml_cuda_try_unary_src_cont_elide(cuda_ctx, cgraph, i)) {
+                    // the fused UNARY + MUL that reads this CONT reads its source view (unary_gated_op_kernel, x_split)
+                    ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 1);
+                    continue;
+                }
+
+                if (node->op == GGML_OP_UNARY && !cuda_ctx->unary_cont_elided.empty() && cuda_ctx->unary_cont_elided.count(node->src[0])) {
+                    const ggml_tensor * c = node->src[0];
+                    cuda_ctx->unary_cont_elided.erase(c);
+                    const ggml_unary_op op = ggml_get_unary_op(node);
+                    if (i + 1 < cgraph->n_nodes && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { op })) {
+                        ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1], c->src[0]);
+                        ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 2);
+                        i += 1;
+                        continue;
+                    }
+                    ggml_cuda_dup(*cuda_ctx, const_cast<ggml_tensor *>(c));
+                }
+
+                if (!cuda_ctx->conv_cat_elided.empty() || !cuda_ctx->unary_cont_elided.empty()) {
                     ggml_cuda_conv_cat_materialize(cuda_ctx, node);
                 }
 
@@ -8244,6 +8346,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->gdn_gates_in.clear();
             ggml_cuda_conv_state_flush(cuda_ctx);
             cuda_ctx->conv_cat_elided.clear();
+            cuda_ctx->unary_cont_elided.clear();
         }
 
         // an overlapped MoE cache fetch whose join is not in this graph (another split): the side stream joins the main stream
@@ -8695,6 +8798,17 @@ static const ggml_tensor * ggml_cuda_fused_match(const ggml_cgraph * cgraph, int
         if (ggml_cuda_qsa_key_pack_match(cgraph, i, m, /*runtime=*/false) >= 0) {
             inputs = { m.concat->src[0], m.set_rows->src[1] };
             return m.set_rows;
+        }
+    }
+
+    // CONT of a strided view read by its fused UNARY + MUL instead (ggml_cuda_try_unary_src_cont_elide, k15-fn): the view (and so the
+    // tensor it views) stays allocated until the MUL is. GGML_CUDA_UNARY_SRC_CONT_ALIAS=1
+    static const bool cont_alias = ggml_cuda_env_flag("GGML_CUDA_UNARY_SRC_CONT_ALIAS");
+    if (!cont_alias && n0->op == GGML_OP_CONT) {
+        const int u = ggml_cuda_unary_src_cont_match(cgraph, i, /*runtime=*/false);
+        if (u >= 0) {
+            inputs = { n0->src[0] };
+            return cgraph->nodes[u + 1];
         }
     }
 
