@@ -488,7 +488,14 @@ llama_context::llama_context(
 
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
-    cparams.moe_cache_size = params.moe_cache_size;
+    // k17-models: a model without experts takes no MoE cache (it used to throw "MoE cache requires a MoE model" from the cache): with
+    // --fit on --moe-cache-mib auto (Studio's argv) that error aborted the fit's probe context, so a dense model was loaded with every layer
+    // on the device and failed to allocate wherever it does not fit (Kaggle T4: Llama-3.1-8B at 4 GB, Mistral-Small-3.2-24B at 8 / 16 GB,
+    // plans/k17_models.md). Same path and text as without the flag; MoE models are unchanged
+    cparams.moe_cache_size = model.hparams.n_expert > 0 ? params.moe_cache_size : 0;
+    if (params.moe_cache_size > 0 && model.hparams.n_expert == 0) {
+        LLAMA_LOG_INFO("%s: the model has no experts: no MoE cache (--moe-cache-mib ignored)\n", __func__);
+    }
 
     cparams.weight_stream         = params.weight_stream;
     cparams.spec_draft            = params.spec_draft;
