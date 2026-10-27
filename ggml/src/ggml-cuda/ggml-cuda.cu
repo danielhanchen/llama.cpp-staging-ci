@@ -5493,6 +5493,97 @@ static bool ggml_cuda_try_conv_state_defer(ggml_backend_cuda_context * cuda_ctx,
     return false;
 }
 
+// k15-fn (GGML_CUDA_DISABLE_CONV_CAT_FUSION=1 off): the CONCAT (dim 0) of a short convolution's state columns and its transposed new
+// tokens (qwen4exp build_conv_state_at) is not run in a decode / verify graph: the convolution reads both parts (ssm_conv_cat_f32), and
+// the conv-state copies deferred to it read the same registers. Only when every reader of the concat is that convolution or a copy of a
+// view of it (a copy that is not deferred makes the concat run first, ggml_cuda_conv_cat_materialize), nothing that runs before the
+// convolution writes over either part, and the convolution's outputs do not overlap them
+static bool ggml_cuda_try_conv_cat_elide(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_CONV_CAT_FUSION");
+    if (disabled || ggml_cuda_fusion_disabled() || cuda_ctx->curr_stream_no != 0) {
+        return false;
+    }
+    const ggml_tensor * cat = cgraph->nodes[i];
+    const ggml_tensor * a = cat->src[0];
+    const ggml_tensor * b = cat->src[1];
+    if (cat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat, 0) != 0 || cat->type != GGML_TYPE_F32 || a == nullptr || b == nullptr ||
+        a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || (cat->flags & GGML_TENSOR_FLAG_OUTPUT) || cat->ne[3] != 1 ||
+        a->ne[3] != 1 || b->ne[3] != 1 || cat->data == nullptr || a->data == nullptr || b->data == nullptr || a->nb[0] != sizeof(float) ||
+        a->nb[1] % sizeof(float) != 0 || a->nb[2] % sizeof(float) != 0 || b->nb[0] % sizeof(float) != 0 || b->nb[1] % sizeof(float) != 0 ||
+        b->nb[2] % sizeof(float) != 0 || b->ne[0] > 8 || a->ne[1] != b->ne[1] || a->ne[2] != b->ne[2] || cat->ne[1] % 128 != 0 ||
+        cat->nb[1] != cat->ne[0] * (int64_t) sizeof(float)) {
+        return false;
+    }
+    int jc = -1;
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 24; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_SSM_CONV && n->src[0] == cat) {
+            const ggml_tensor * w = n->src[1];
+            if (w == nullptr || w->ne[0] != a->ne[0] + 1 || n->ne[1] != b->ne[0] || n->ne[2] != a->ne[2]) {
+                return false;
+            }
+            // the LFM2 short conv * c product reads the input in its own kernel
+            if (j + 1 < cgraph->n_nodes && cgraph->nodes[j + 1]->op == GGML_OP_MUL) {
+                return false;
+            }
+            for (int k = j; k < cgraph->n_nodes && k <= j + 2; ++k) {
+                if (ggml_cuda_ranges_overlap(cgraph->nodes[k], a) || ggml_cuda_ranges_overlap(cgraph->nodes[k], b)) {
+                    return false;
+                }
+            }
+            jc = j;
+            break;
+        }
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        // a copy of a view of the concat is deferred to the convolution, or makes the concat run before it: it writes only after that
+        if (n->op == GGML_OP_CPY && n->src[0] != nullptr && n->src[0]->view_src == cat) {
+            continue;
+        }
+        if (ggml_cuda_ranges_overlap(n, a) || ggml_cuda_ranges_overlap(n, b)) {
+            return false;
+        }
+    }
+    if (jc < 0) {
+        return false;
+    }
+    // every reader of the concat: the convolution, or a copy of a view of it
+    for (int k = i + 1; k < cgraph->n_nodes; ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (k == jc || ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * t = n->src[s];
+            if (t != nullptr && (t == cat || t->view_src == cat) && !(n->op == GGML_OP_CPY && s == 0 && t->view_src == cat)) {
+                return false;
+            }
+        }
+    }
+    cuda_ctx->conv_cat_elided.insert(cat);
+    return true;
+}
+
+// an elided conv-input concat that a node about to run reads (other than its convolution): the concat runs now
+static void ggml_cuda_conv_cat_materialize(ggml_backend_cuda_context * cuda_ctx, const ggml_tensor * node) {
+    if (node->op == GGML_OP_SSM_CONV) {
+        return;
+    }
+    for (int s = 0; s < GGML_MAX_SRC && !cuda_ctx->conv_cat_elided.empty(); ++s) {
+        const ggml_tensor * t = node->src[s];
+        if (t == nullptr) {
+            continue;
+        }
+        const ggml_tensor * root = t->view_src != nullptr ? t->view_src : t;
+        auto it = cuda_ctx->conv_cat_elided.find(root);
+        if (it != cuda_ctx->conv_cat_elided.end()) {
+            cuda_ctx->conv_cat_elided.erase(it);
+            ggml_cuda_op_concat(*cuda_ctx, const_cast<ggml_tensor *>(root));
+        }
+    }
+}
+
 // k15-fn: the gated_delta_net (non-KDA, one sequence, not the mma kernel) that is the only reader of t (through views of t; its src[k] a
 // contiguous whole view of t), or -1
 static int ggml_cuda_sole_gdn_reader(const ggml_cgraph * cgraph, int i, const ggml_tensor * t, int k_expected) {
@@ -7566,6 +7657,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->gdn_state_in_place.clear();
             cuda_ctx->gdn_gates_in.clear();
             cuda_ctx->conv_state_pending.clear();
+            cuda_ctx->conv_cat_elided.clear();
             ggml_cuda_qsa_maskless_plan(cuda_ctx, cgraph);
             ggml_cuda_qsa_sel_plan(cuda_ctx, cgraph);
             for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -7665,10 +7757,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                if (node->op == GGML_OP_CONCAT && ggml_cuda_try_conv_cat_elide(cuda_ctx, cgraph, i)) {
+                    // the short convolution that reads this concat reads its two parts (ssm_conv_cat_f32)
+                    ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 1);
+                    continue;
+                }
+
                 if (node->op == GGML_OP_CPY && ggml_cuda_try_conv_state_defer(cuda_ctx, cgraph, i)) {
                     // the short convolution that reads the same input writes this copy (ssm_conv_state_copies)
                     ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 1);
                     continue;
+                }
+
+                if (!cuda_ctx->conv_cat_elided.empty()) {
+                    ggml_cuda_conv_cat_materialize(cuda_ctx, node);
                 }
 
                 if (node->op == GGML_OP_GET_ROWS && ggml_cuda_try_gdn_state_in_place(cuda_ctx, cgraph, i)) {
@@ -7781,6 +7883,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->gdn_state_in_place.clear();
             cuda_ctx->gdn_gates_in.clear();
             ggml_cuda_conv_state_flush(cuda_ctx);
+            cuda_ctx->conv_cat_elided.clear();
         }
 
         // an overlapped MoE cache fetch whose join is not in this graph (another split): the side stream joins the main stream
@@ -8206,6 +8309,31 @@ static const ggml_tensor * ggml_cuda_fused_match(const ggml_cgraph * cgraph, int
                 inputs.push_back(bias);
             }
             return nx;
+        }
+    }
+
+    // conv-input CONCAT read by its short convolution instead of run (ggml_cuda_try_conv_cat_elide, k15-fn): the state columns and the
+    // new tokens stay allocated until the convolution's last output is, so no node between them, nor the convolution's output, is
+    // placed over them (the runtime check then never has to refuse it). GGML_CUDA_CONV_CAT_ALIAS=1
+    static const bool cat_alias = ggml_cuda_env_flag("GGML_CUDA_CONV_CAT_ALIAS");
+    if (!cat_alias && n0->op == GGML_OP_CONCAT && ggml_get_op_params_i32(n0, 0) == 0 && n0->type == GGML_TYPE_F32 && n0->src[1] != nullptr &&
+            n0->src[1]->ne[0] <= 8) {
+        for (int j = i + 1; j < cgraph->n_nodes && j <= i + 24; ++j) {
+            ggml_tensor * conv = cgraph->nodes[j];
+            if (conv->op != GGML_OP_SSM_CONV || conv->src[0] != n0) {
+                continue;
+            }
+            ggml_tensor * last = conv;
+            int k = j + 1;
+            if (k < cgraph->n_nodes && cgraph->nodes[k]->op == GGML_OP_ADD && (cgraph->nodes[k]->src[0] == conv || cgraph->nodes[k]->src[1] == conv)) {
+                last = cgraph->nodes[k++];
+            }
+            if (k < cgraph->n_nodes && cgraph->nodes[k]->op == GGML_OP_UNARY && ggml_get_unary_op(cgraph->nodes[k]) == GGML_UNARY_OP_SILU &&
+                    cgraph->nodes[k]->src[0] == last) {
+                last = cgraph->nodes[k];
+            }
+            inputs = { n0->src[0], n0->src[1] };
+            return last;
         }
     }
     return nullptr;

@@ -1707,6 +1707,9 @@ struct ggml_backend_cuda_context {
     // k15-fn: conv-state copies (the CPY of a conv input's last d_conv - 1 columns into the recurrent cache, qwen4exp build_conv_state_at)
     // deferred into the short convolution that reads the same input (ggml_cuda_try_conv_state_defer): SSM_CONV node -> its CPY nodes
     std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> conv_state_pending;
+    // k15-fn: conv-input concats (state columns ++ the transposed new tokens) not run: the short convolution that reads them reads both
+    // parts itself (ggml_cuda_try_conv_cat_elide); any other node that reads one first makes it run then (ggml_cuda_conv_cat_materialize)
+    std::unordered_set<const ggml_tensor *> conv_cat_elided;
     // k15-fn: QSA selection chains (ggml_cuda_qsa_sel_plan): the final i32 index node -> its inputs, and the chain nodes not run
     struct qsa_sel_args {
         const int32_t * top_k; int64_t top_k_s1;     // [n_top, n_tok]
