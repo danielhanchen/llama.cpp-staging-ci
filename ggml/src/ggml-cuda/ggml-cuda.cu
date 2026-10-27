@@ -5498,12 +5498,22 @@ static bool ggml_cuda_try_conv_state_defer(ggml_backend_cuda_context * cuda_ctx,
 // the conv-state copies deferred to it read the same registers. Only when every reader of the concat is that convolution or a copy of a
 // view of it (a copy that is not deferred makes the concat run first, ggml_cuda_conv_cat_materialize), nothing that runs before the
 // convolution writes over either part, and the convolution's outputs do not overlap them
+// GGML_CUDA_FUSION_TRACE=1: why a conv-input concat was not elided (refusal point, concat name)
+static bool ggml_cuda_conv_cat_refuse(const char * name, int where) {
+    static const bool trace = ggml_cuda_env_flag("GGML_CUDA_FUSION_TRACE");
+    if (trace) {
+        GGML_LOG_INFO("conv cat elide: %s refused at %d\n", name, where);
+    }
+    return false;
+}
+
 static bool ggml_cuda_try_conv_cat_elide(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_CONV_CAT_FUSION");
     if (disabled || ggml_cuda_fusion_disabled() || cuda_ctx->curr_stream_no != 0) {
         return false;
     }
     const ggml_tensor * cat = cgraph->nodes[i];
+    const char * cat_dbg_name = cat->name;
     const ggml_tensor * a = cat->src[0];
     const ggml_tensor * b = cat->src[1];
     if (cat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat, 0) != 0 || cat->type != GGML_TYPE_F32 || a == nullptr || b == nullptr ||
@@ -5512,7 +5522,7 @@ static bool ggml_cuda_try_conv_cat_elide(ggml_backend_cuda_context * cuda_ctx, c
         a->nb[1] % sizeof(float) != 0 || a->nb[2] % sizeof(float) != 0 || b->nb[0] % sizeof(float) != 0 || b->nb[1] % sizeof(float) != 0 ||
         b->nb[2] % sizeof(float) != 0 || b->ne[0] > 8 || a->ne[1] != b->ne[1] || a->ne[2] != b->ne[2] || cat->ne[1] % 128 != 0 ||
         cat->nb[1] != (size_t) cat->ne[0] * sizeof(float)) {
-        return false;
+        return ggml_cuda_conv_cat_refuse(cat_dbg_name, 2);
     }
     int jc = -1;
     for (int j = i + 1; j < cgraph->n_nodes && j <= i + 24; ++j) {
@@ -5520,15 +5530,15 @@ static bool ggml_cuda_try_conv_cat_elide(ggml_backend_cuda_context * cuda_ctx, c
         if (n->op == GGML_OP_SSM_CONV && n->src[0] == cat) {
             const ggml_tensor * w = n->src[1];
             if (w == nullptr || w->ne[0] != a->ne[0] + 1 || n->ne[1] != b->ne[0] || n->ne[2] != a->ne[2]) {
-                return false;
+                return ggml_cuda_conv_cat_refuse(cat_dbg_name, 3);
             }
             // the LFM2 short conv * c product reads the input in its own kernel
             if (j + 1 < cgraph->n_nodes && cgraph->nodes[j + 1]->op == GGML_OP_MUL) {
-                return false;
+                return ggml_cuda_conv_cat_refuse(cat_dbg_name, 4);
             }
             for (int k = j; k < cgraph->n_nodes && k <= j + 2; ++k) {
                 if (ggml_cuda_ranges_overlap(cgraph->nodes[k], a) || ggml_cuda_ranges_overlap(cgraph->nodes[k], b)) {
-                    return false;
+                    return ggml_cuda_conv_cat_refuse(cat_dbg_name, 5);
                 }
             }
             jc = j;
@@ -5542,11 +5552,11 @@ static bool ggml_cuda_try_conv_cat_elide(ggml_backend_cuda_context * cuda_ctx, c
             continue;
         }
         if (ggml_cuda_ranges_overlap(n, a) || ggml_cuda_ranges_overlap(n, b)) {
-            return false;
+            return ggml_cuda_conv_cat_refuse(cat_dbg_name, 6);
         }
     }
     if (jc < 0) {
-        return false;
+        return ggml_cuda_conv_cat_refuse(cat_dbg_name, 7);
     }
     // every reader of the concat: the convolution, or a copy of a view of it that comes before the convolution (a later one would
     // read the concat after the convolution consumed it, unwritten)
@@ -5558,7 +5568,7 @@ static bool ggml_cuda_try_conv_cat_elide(ggml_backend_cuda_context * cuda_ctx, c
         for (int s = 0; s < GGML_MAX_SRC; ++s) {
             const ggml_tensor * t = n->src[s];
             if (t != nullptr && (t == cat || t->view_src == cat) && !(n->op == GGML_OP_CPY && s == 0 && t->view_src == cat && k < jc)) {
-                return false;
+                return ggml_cuda_conv_cat_refuse(cat_dbg_name, 8);
             }
         }
     }

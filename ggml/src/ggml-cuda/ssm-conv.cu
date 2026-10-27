@@ -342,6 +342,10 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
             cat.b_nb1 = b->nb[1] / sizeof(float);
             cat.b_nb2 = b->nb[2] / sizeof(float);
         } else {
+            static const bool trace = getenv("GGML_CUDA_FUSION_TRACE") != nullptr && atoi(getenv("GGML_CUDA_FUSION_TRACE")) != 0;
+            if (trace) {
+                GGML_LOG_INFO("conv cat elide: %s runs at its convolution (n_t %d, %d copies)\n", src0->name, (int) n_t, (int) cpys.size());
+            }
             ggml_cuda_op_concat(ctx, const_cast<ggml_tensor *>(src0));
         }
     }
