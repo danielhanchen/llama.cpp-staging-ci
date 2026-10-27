@@ -5487,6 +5487,10 @@ static bool ggml_cuda_try_conv_state_defer(ggml_backend_cuda_context * cuda_ctx,
             v.push_back(cpy);
             return true;
         }
+        // views do not run
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
         // a node between them: it must not read or write the copy's destination, nor write over the input
         if (ggml_cuda_ranges_overlap(n, dst) || ggml_cuda_ranges_overlap(n, input)) {
             if (!(n->op == GGML_OP_CPY && n->src[0] != nullptr && n->src[0]->view_src == input && !ggml_cuda_ranges_overlap(n, dst))) {
