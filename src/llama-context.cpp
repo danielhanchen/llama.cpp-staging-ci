@@ -5986,7 +5986,10 @@ bool llama_context::restore_pp_plan(bool idle) {
     if (moe_cache && backend_cpu != nullptr && moe_cache->recal_pending()) {
         static const bool yield = getenv("LLAMA_MOE_RECAL_YIELD") == nullptr || atoi(getenv("LLAMA_MOE_RECAL_YIELD")) != 0;
         bool (*abort)(void *) = yield && idle ? idle_abort_fn : nullptr;
-        if (abort == nullptr || !abort(idle_abort_data)) {
+        // a server (it set llama_set_idle_abort) serves it in its idle work only: the fallback call inside a long prompt's decode would
+        // put a re-calibration a request deferred into that request (G4 q4x 12 GB 2k back-to-back: +55 ms TTFT)
+        const bool skip = yield && !idle && idle_abort_fn != nullptr;
+        if (!skip && (abort == nullptr || !abort(idle_abort_data))) {
             synchronize();
             compute_n_tokens = -1;
             set_compute_threads(false);
