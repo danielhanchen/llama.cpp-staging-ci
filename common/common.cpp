@@ -4507,6 +4507,8 @@ static bool ckpt_pool_on() {
 
 static std::mutex                    g_ckpt_pool_mutex;
 static std::vector<common_state_buf> g_ckpt_pool;
+// k17: capacities of the buffers a background copy returns to the pool once it is done (common_state_buf_pending_add)
+static std::vector<size_t>           g_ckpt_pool_pending;
 
 // k11: the pool keeps at most this many bytes (LLAMA_STATE_POOL_MIB, default 1024) and 8 buffers
 // largest buffer asked of the pool so far (the lock is held by the callers that write it)
@@ -4542,6 +4544,44 @@ void common_state_buf_recycle(common_state_buf && buf) {
         return; // small buffers are not worth keeping (buf is freed by its owner)
     }
     std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
+    g_ckpt_pool.push_back(std::move(buf));
+    ckpt_pool_trim();
+}
+
+// k17 (LLAMA_STATE_POOL_PENDING=0: off): a buffer on its way back to the pool (the originals of the checkpoint copies a request save runs
+// on a thread, LLAMA_PCS_CKPT_COPY_ASYNC) counts as pooled for the prefault worker. Without it the worker saw a pool short of the
+// buffers the copy still held, faulted in fresh ones, and the originals then landed on top: the pool ended fuller than with the copies
+// made in place, where the slot's erase returns the originals before the worker runs (T4 LFM2.5 multi-turn end RSS +577 MiB)
+static bool ckpt_pool_pending_on() {
+    static const bool on = getenv("LLAMA_STATE_POOL_PENDING") == nullptr || atoi(getenv("LLAMA_STATE_POOL_PENDING")) != 0;
+    return on;
+}
+
+void common_state_buf_pending_add(size_t capacity) {
+    if (!ckpt_pool_on() || !ckpt_pool_pending_on() || capacity < (1u << 20)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
+    g_ckpt_pool_pending.push_back(capacity);
+}
+
+void common_state_buf_pending_drop(size_t capacity) {
+    std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
+    auto it = std::find(g_ckpt_pool_pending.begin(), g_ckpt_pool_pending.end(), capacity);
+    if (it != g_ckpt_pool_pending.end()) {
+        g_ckpt_pool_pending.erase(it);
+    }
+}
+
+void common_state_buf_recycle_pending(common_state_buf && buf) {
+    std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
+    auto it = std::find(g_ckpt_pool_pending.begin(), g_ckpt_pool_pending.end(), buf.capacity());
+    if (it != g_ckpt_pool_pending.end()) {
+        g_ckpt_pool_pending.erase(it);
+    }
+    if (!ckpt_pool_on() || buf.capacity() < (1u << 20)) {
+        return;
+    }
     g_ckpt_pool.push_back(std::move(buf));
     ckpt_pool_trim();
 }
@@ -4638,7 +4678,11 @@ struct state_prefault_worker {
                     have  += b.capacity() >= n && (!ckpt_pool_fit() || b.capacity() / ckpt_pool_fit() <= n);
                     total += b.capacity();
                 }
-                if (have >= count || g_ckpt_pool.size() >= 8 || total + n_alloc > ckpt_pool_limit()) {
+                for (const size_t cap : g_ckpt_pool_pending) { // k17: the buffers a background copy returns shortly
+                    have  += cap >= n && (!ckpt_pool_fit() || cap / ckpt_pool_fit() <= n);
+                    total += cap;
+                }
+                if (have >= count || g_ckpt_pool.size() + g_ckpt_pool_pending.size() >= 8 || total + n_alloc > ckpt_pool_limit()) {
                     return;
                 }
             }
@@ -4675,6 +4719,21 @@ void common_state_buf_prefault(size_t n, int count) {
     if (state_prefault_on() && n >= (1u << 20) && count > 0) {
         g_state_prefault.request(n, count);
     }
+}
+
+std::string common_state_buf_pool_desc() {
+    std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
+    std::string r;
+    for (const auto & b : g_ckpt_pool) {
+        r += string_format("%s%.1f", r.empty() ? "" : ",", b.capacity() / 1048576.0);
+    }
+    if (!g_ckpt_pool_pending.empty()) {
+        r += " pending";
+        for (const size_t cap : g_ckpt_pool_pending) {
+            r += string_format(" %.1f", cap / 1048576.0);
+        }
+    }
+    return r;
 }
 
 size_t common_state_buf_pool_bytes() {

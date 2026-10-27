@@ -773,6 +773,12 @@ struct server_slot {
             if (task && !task->is_child() && !task->is_stateless()) {
                 prefault_next_save();
             }
+            if (getenv("LLAMA_PCS_MEM_LOG") != nullptr) { // debug: what the slot and the buffer pool hold as the slot goes idle
+                size_t csz = 0, ccap = 0;
+                for (const auto & c : prompt.checkpoints) { csz += c.data_tgt.size() + c.data_dft.size(); ccap += c.data_tgt.capacity() + c.data_dft.capacity(); }
+                SLT_INF(*this, "pcs mem: at release %zu ckpts, %.1f / %.1f MiB (size / capacity), pool %.1f MiB [%s]\n", prompt.checkpoints.size(),
+                    csz/1048576.0, ccap/1048576.0, common_state_buf_pool_bytes()/1048576.0, common_state_buf_pool_desc().c_str());
+            }
 
             reset();
 

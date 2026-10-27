@@ -1414,6 +1414,11 @@ void common_state_buf_recycle(common_state_buf && buf);
 // a buffer of at least n bytes from the pool into buf, if buf is smaller (returns true when one was taken)
 bool common_state_buf_take(common_state_buf & buf, size_t n);
 size_t common_state_buf_pool_bytes(); // debug: capacity held by the pool
+std::string common_state_buf_pool_desc(); // debug: the capacities (MiB) of the pooled buffers, and those pending
+// k17: a buffer of this capacity will be recycled shortly (common_state_buf_recycle_pending): the prefault worker counts it as pooled
+void common_state_buf_pending_add(size_t capacity);
+void common_state_buf_recycle_pending(common_state_buf && buf);
+void common_state_buf_pending_drop(size_t capacity); // ... that will not come back after all
 // k11 (LLAMA_STATE_PREFAULT=0 turns it off): ask a background thread to keep count pooled buffers of at least n bytes with resident pages
 void common_state_buf_prefault(size_t n, int count);
 
