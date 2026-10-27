@@ -1812,7 +1812,7 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         compute_type = GGML_TYPE_F32;
     }
 
-    const char * env_c = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
+    static const char * env_c = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE"); // k15-hostcut: read once
     if (env_c != nullptr) {
         std::string env_cpp = env_c;
         for (char & c : env_cpp) {
@@ -2516,9 +2516,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 
     // the get_rows above copies a placeholder row into the skipped slots, overwrite them with zeros
-    ggml_cuda_launch_mm_ids_zero_dst((const int32_t *) ids->data, (float *) dst->data,
-        ne2, n_expert_used, ne0, ids->nb[1]/sizeof(int32_t), nb1/sizeof(float), nb2/sizeof(float), stream);
-    CUDA_CHECK(cudaGetLastError());
+    if (ggml_cuda_mm_ids_may_skip(ids)) {
+        ggml_cuda_launch_mm_ids_zero_dst((const int32_t *) ids->data, (float *) dst->data,
+            ne2, n_expert_used, ne0, ids->nb[1]/sizeof(int32_t), nb1/sizeof(float), nb2/sizeof(float), stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
 
 // k15-fn debug (GGML_CUDA_GRAPH_NODE_STATS=3): the copy / gather nodes executed after the fusions, logged per captured graph
@@ -4093,6 +4095,13 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     const size_t num_unary = std::count(ops.begin(), ops.end(), GGML_OP_UNARY);
     GGML_ASSERT(unary_ops.size() == num_unary);
 #endif
+    // k15-hostcut: every pattern below matches only through ggml_can_fuse / ggml_can_fuse_subgraph, which need node_idx to have the
+    // first op: test that first, before the pattern comparisons (about 30 calls per node in ggml_cuda_try_fuse).
+    // GGML_CUDA_FUSE_PREFILTER=0: off
+    static const bool prefilter = !getenv("GGML_CUDA_FUSE_PREFILTER") || atoi(getenv("GGML_CUDA_FUSE_PREFILTER")) != 0;
+    if (prefilter && (node_idx < 0 || node_idx >= cgraph->n_nodes || ops.size() == 0 || cgraph->nodes[node_idx]->op != *ops.begin())) {
+        return false;
+    }
 
     const auto is_equal = [](const std::initializer_list<enum ggml_op> & list1,
                              const std::initializer_list<enum ggml_op> & list2) {
@@ -4405,6 +4414,12 @@ static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::un
         if (is_candidate(cgraph->nodes[i])) {
             n_readers[cgraph->nodes[i]->src[1]->data]++;
         }
+    }
+    // k15-hostcut: no mat-vec-size product (a prompt batch): no slot, and the producer scans below would find no target
+    // (the same result without five passes over the graph). GGML_CUDA_Q8_1_PLAN_SCAN=1: scan anyway
+    static const bool always_scan = ggml_cuda_env_flag("GGML_CUDA_Q8_1_PLAN_SCAN");
+    if (n_readers.empty() && !always_scan) {
+        return 0;
     }
 
     // RMS_NORM + MUL outputs that a candidate reads as a whole contiguous activation: the fused norm kernel writes their
@@ -6951,6 +6966,56 @@ static int ggml_cuda_try_fuse_hc_up_pre(ggml_backend_cuda_context * cuda_ctx, gg
     return j - i;
 }
 
+// k15-hostcut: consecutive CPY nodes (views between them skipped) with the same shapes and strides that take the generic F32 -> F32
+// element kernel, in one launch (ggml_cuda_cpy_multi): the delta-net conv-state snapshots, n_rs_seq + 1 per layer. No copy may read
+// or overlap what another one writes. Returns the nodes to skip, 0 if not taken
+static int ggml_cuda_try_fuse_cpy_multi(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    if (!ggml_cuda_cpy_multi_enabled() || !cuda_ctx->stream_context().concurrent_events.empty()) {
+        return 0;
+    }
+    ggml_tensor * node = cgraph->nodes[i];
+    if (!ggml_cuda_cpy_multi_ok(node->src[0], node->src[1])) {
+        return 0;
+    }
+    const ggml_tensor * src[GGML_CUDA_CPY_MULTI_MAX] = { node->src[0] };
+    ggml_tensor *       dst[GGML_CUDA_CPY_MULTI_MAX] = { node->src[1] };
+    int n = 1, last = i;
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    for (int j = i + 1; j < cgraph->n_nodes && n < GGML_CUDA_CPY_MULTI_MAX; ++j) {
+        ggml_tensor * t = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(t) || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (t->op != GGML_OP_CPY || !ggml_are_same_shape(t->src[0], src[0]) || !ggml_are_same_stride(t->src[0], src[0]) ||
+                !ggml_are_same_shape(t->src[1], dst[0]) || !ggml_are_same_stride(t->src[1], dst[0]) ||
+                !ggml_cuda_cpy_multi_ok(t->src[0], t->src[1]) ||
+                (!cuda_ctx->qsa_skip.empty() && cuda_ctx->qsa_skip.count(t)) ||
+                (!cuda_ctx->mmvq_done_early.empty() && cuda_ctx->mmvq_done_early.count(t))) {
+            break;
+        }
+        bool ok = true;
+        for (int k = 0; k < n && ok; ++k) {
+            ok = !overlap(t->src[1], dst[k]) && !overlap(t->src[1], src[k]) && !overlap(t->src[0], dst[k]);
+        }
+        if (!ok) {
+            break;
+        }
+        src[n] = t->src[0];
+        dst[n] = t->src[1];
+        ++n;
+        last = j;
+    }
+    if (n < 2) {
+        return 0;
+    }
+    ggml_cuda_cpy_multi(*cuda_ctx, src, dst, n);
+    return last - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -7845,6 +7910,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (const int n_skip = ggml_cuda_try_fuse_qsa_idx(cuda_ctx, cgraph, i); n_skip > 0) {
         return n_skip;
+    }
+
+    if (node->op == GGML_OP_CPY) {
+        if (const int n_skip = ggml_cuda_try_fuse_cpy_multi(cuda_ctx, cgraph, i); n_skip > 0) {
+            return n_skip;
+        }
+    }
+
+    // k15-hostcut: the recurrent state clear and the gather after it (build_rs at a new sequence), see getrows.cuh
+    if (node->op == GGML_OP_SCALE && cuda_ctx->stream_context().concurrent_events.empty()) {
+        int j = i + 1;
+        while (j < cgraph->n_nodes && (ggml_cuda_is_view_or_noop(cgraph->nodes[j]) || (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)) {
+            ++j;
+        }
+        if (j < cgraph->n_nodes && ggml_cuda_rs_zero_get_rows_ok(node, cgraph->nodes[j]) &&
+                (cuda_ctx->qsa_skip.empty() || !cuda_ctx->qsa_skip.count(cgraph->nodes[j])) &&
+                (cuda_ctx->mmvq_done_early.empty() || !cuda_ctx->mmvq_done_early.count(cgraph->nodes[j]))) {
+            ggml_cuda_op_rs_zero_get_rows(*cuda_ctx, node, cgraph->nodes[j]);
+            return j - i;
+        }
     }
 
     return 0;

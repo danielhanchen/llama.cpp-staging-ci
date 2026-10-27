@@ -353,15 +353,28 @@ struct server_slot {
     server_prompt prompt;
 
     // ckpt_keep_max >= -1 (k15-ttft): the caller knows the next prompt of this slot drops every checkpoint with pos_max above it, so
-    // those are moved into the cache entry instead of copied (opt-in, LLAMA_PCS_MOVE_CKPT=1: end-of-run host RSS +150..+1300 MiB when on; default: copied as before)
+    // those are moved into the cache entry instead of copied (opt-in, LLAMA_PCS_MOVE_CKPT=1), or copied on a thread (at_request, default)
     // k15-ttft: the slot's prompt is in the prompt cache already, saved while the server was idle (LLAMA_PCS_IDLE_SAVE)
     bool prompt_saved_idle = false;
     bool prompt_saved_idle_new = false; // ... into a new entry (not one the cache held already)
+    // k15-idlewait: that save moved the slot's checkpoints into the entry instead of copying them (they come back at the next request)
+    bool ckpt_lent = false;
 
-    bool prompt_save(server_prompt_cache & prompt_cache, llama_pos ckpt_keep_max = -2, bool force_async = false) {
+    bool prompt_save(server_prompt_cache & prompt_cache, llama_pos ckpt_keep_max = -2, bool force_async = false, bool lend_ckpt = false,
+                     bool at_request = false) {
         if (prompt.tokens.size() == 0) {
             return false;
         }
+        // k15-idlewait: an idle save of the only slot moves the checkpoints into the entry (no copy on the server loop: G4 q4x, 63 MiB for
+        // the 640-token warm prompt); ckpt_return gives them back at the next request (server_context_impl::get_available_slot)
+        std::list<common_prompt_checkpoint> lent;
+        if (lend_ckpt) {
+            lent.splice(lent.end(), prompt.checkpoints);
+        }
+        struct lent_back {
+            std::list<common_prompt_checkpoint> & from; std::list<common_prompt_checkpoint> & to;
+            ~lent_back() { if (!from.empty()) { to.splice(to.begin(), from); } }
+        } lent_guard { lent, prompt.checkpoints };
 
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
@@ -371,11 +384,27 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
+        // opt-in (LLAMA_PCS_MOVE_CKPT=1): local q4x spilled multi-turn (mt_local, k15r36) ended +900 MiB RssAnon with the move on
         static const bool move_ckpt = getenv("LLAMA_PCS_MOVE_CKPT") != nullptr && atoi(getenv("LLAMA_PCS_MOVE_CKPT")) != 0;
         const bool mv = move_ckpt && ckpt_keep_max >= -1;
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, mv ? &prompt.checkpoints : nullptr, ckpt_keep_max);
+        // k15-idlewait (LLAMA_PCS_CKPT_COPY_ASYNC=0: copied here, as before): at a request save the checkpoints the next prompt erases
+        // are copied on a thread of the prompt cache into pooled buffers (the same buffers and copies as before, the originals go back
+        // to the pool once copied, as the prompt's erase would have put them); the entry waits for it like a state save in flight.
+        // G4 q4x 12 GB chat: the copies of 2 checkpoints (125.6 MiB) were ~20 ms of the request
+        static const bool copy_async = getenv("LLAMA_PCS_CKPT_COPY_ASYNC") == nullptr || atoi(getenv("LLAMA_PCS_CKPT_COPY_ASYNC")) != 0;
+        const bool ca = !mv && copy_async && at_request && ckpt_keep_max >= -1;
+        prompt_cache.clone_async_next = ca;
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, (mv || ca) ? &prompt.checkpoints : nullptr, ckpt_keep_max);
         if (cur == nullptr) {
             return false;
+        }
+        if (!lent.empty()) {
+            for (const auto & c : lent) {
+                common_state_buf_prefault(c.data_tgt.size(), 2); // as the copy would have asked (prompt_checkpoint_clone)
+            }
+            SLT_INF(*this, "idle save: %zu checkpoint(s) lent to the cache entry\n", lent.size());
+            cur->prompt.checkpoints.splice(cur->prompt.checkpoints.end(), lent);
+            ckpt_lent = true;
         }
 
         // k11 (LLAMA_PROMPT_SAVE_ASYNC=1, opt-in: on G4 it took 5 ms off the chat TTFT but the copies then delay the prompt's first
@@ -384,7 +413,16 @@ struct server_slot {
         // the entry (server_prompt_cache::wait_inflight). Larger states than LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB (512) are saved as before.
         static const bool async_on = getenv("LLAMA_PROMPT_SAVE_ASYNC") != nullptr && atoi(getenv("LLAMA_PROMPT_SAVE_ASYNC")) != 0;
         static const size_t async_max = (size_t) (getenv("LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB") ? std::max(0, atoi(getenv("LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB"))) : 512) << 20;
-        const llama_state_seq_flags fl = (async_on || force_async) && cur_size <= async_max ? LLAMA_STATE_SEQ_FLAGS_ASYNC : LLAMA_STATE_SEQ_FLAGS_NONE;
+        llama_state_seq_flags fl = (async_on || force_async) && cur_size <= async_max ? LLAMA_STATE_SEQ_FLAGS_ASYNC : LLAMA_STATE_SEQ_FLAGS_NONE;
+        // k15-idlewait (LLAMA_PCS_REQ_SAVE_ASYNC=0: synchronous, as before): a save made at the request (where no idle save ran: a spilled
+        // tier, a MoE cache) reads the state rows into the pinned staging buffers the context already holds (the checkpoint saves reserve
+        // them) and the state worker copies them into the entry while the prompt runs; the next memory op waits for the reads only. G4
+        // q4x 12 GB chat: the synchronous reads into the fresh entry (77 MiB, 82 calls with a sync each) were most of the 40 ms the request
+        // waited before its prompt. Only where the staging holds the save already (LLAMA_STATE_SEQ_FLAGS_ASYNC_NO_GROW): no new pinned memory
+        static const bool req_async = getenv("LLAMA_PCS_REQ_SAVE_ASYNC") == nullptr || atoi(getenv("LLAMA_PCS_REQ_SAVE_ASYNC")) != 0;
+        if (fl == LLAMA_STATE_SEQ_FLAGS_NONE && req_async && at_request && cur_size <= async_max) {
+            fl = LLAMA_STATE_SEQ_FLAGS_ASYNC | LLAMA_STATE_SEQ_FLAGS_ASYNC_NO_GROW;
+        }
 
         const int64_t t_get0 = ggml_time_us();
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, fl);
@@ -439,7 +477,7 @@ struct server_slot {
     }
 
     void prompt_clear() {
-        prompt_saved_idle = false; prompt_saved_idle_new = false;
+        prompt_saved_idle = false; prompt_saved_idle_new = false; ckpt_lent = false;
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
@@ -1891,6 +1929,14 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            {
+                // k15-idlewait: the idle checkpoint lend and the deferred drop are for a single slot only
+                static const bool lend_env  = getenv("LLAMA_PCS_IDLE_LEND") == nullptr || atoi(getenv("LLAMA_PCS_IDLE_LEND")) != 0;
+                static const bool defer_env = getenv("LLAMA_PCS_DROP_DEFER") == nullptr || atoi(getenv("LLAMA_PCS_DROP_DEFER")) != 0;
+                prompt_cache->drop_defer_ok = params_base.n_parallel == 1;
+                SRV_INF("prompt cache: idle checkpoint lend %s, deferred drop %s (n_parallel = %d)\n",
+                        lend_env && params_base.n_parallel == 1 ? "on" : "off", defer_env && params_base.n_parallel == 1 ? "on" : "off", params_base.n_parallel);
+            }
             prompt_cache->wait_reads = [this]() {
                 llama_state_seq_async_wait(ctx_tgt);
                 if (ctx_dft) {
@@ -2001,7 +2047,8 @@ private:
                             (prompt_cache->limit_tokens > 0 && prompt_cache->n_tokens() + slot.prompt.tokens.size() > prompt_cache->limit_tokens)) {
                             continue;
                         }
-                        slot.prompt_saved_idle_new = slot.prompt_save(*prompt_cache, -2, idle_save == 2);
+                        static const bool lend_env = getenv("LLAMA_PCS_IDLE_LEND") == nullptr || atoi(getenv("LLAMA_PCS_IDLE_LEND")) != 0;
+                        slot.prompt_saved_idle_new = slot.prompt_save(*prompt_cache, -2, idle_save == 2, lend_env && params_base.n_parallel == 1);
                         if (slot.prompt_saved_idle_new) {
                             prompt_cache->update();
                         }
@@ -2009,10 +2056,14 @@ private:
                     }
                 }
             }
+            // k15-idlewait: the MoE cache re-calibration in this idle work stops (stays pending) once a task is queued
+            auto idle_abort = [](void * q) { return static_cast<server_queue *>(q)->has_tasks(); };
             if (ctx_tgt) {
+                llama_set_idle_abort(ctx_tgt, idle_abort, &queue_tasks);
                 llama_prepare_prompt_plan(ctx_tgt);
             }
             if (ctx_dft && ctx_dft != ctx_tgt) {
+                llama_set_idle_abort(ctx_dft, idle_abort, &queue_tasks);
                 llama_prepare_prompt_plan(ctx_dft);
             }
         });
@@ -2235,6 +2286,17 @@ private:
         if (ret) {
             // k15-ttft: a save made at idle that the old order would not have made (the slot is kept: similarity, or a stateless task)
             // is taken back, so the cache holds what it held before (LLAMA_PCS_IDLE_SAVE)
+            // k15-idlewait: the checkpoints the idle save lent to its entry come back first: all of them when the entry is dropped below,
+            // else a copy of the ones the next prompt keeps (past the common prefix the slot would erase them when the prompt starts)
+            if (ret->ckpt_lent && prompt_cache) {
+                const bool keep_entry = update_cache && !task.is_stateless();
+                llama_pos kmax = std::numeric_limits<llama_pos>::max();
+                if (keep_entry && task.params.n_cache_reuse == 0 && !task.tokens.has_mtmd && !ret->prompt.tokens.has_mtmd) {
+                    kmax = (llama_pos) ret->prompt.tokens.get_common_prefix(task.tokens);
+                }
+                prompt_cache->ckpt_return(ret->prompt.tokens, ret->prompt.checkpoints, keep_entry, kmax);
+            }
+            ret->ckpt_lent = false;
             if (ret->prompt_saved_idle && ret->prompt_saved_idle_new && prompt_cache && !(update_cache && !task.is_stateless())) {
                 prompt_cache->drop_newest(ret->prompt.tokens);
             }
@@ -2256,7 +2318,7 @@ private:
                     keep_max = (llama_pos) ret->prompt.tokens.get_common_prefix(task.tokens);
                 }
                 if (!ret->prompt_saved_idle) {
-                    ret->prompt_save(*prompt_cache, keep_max);
+                    ret->prompt_save(*prompt_cache, keep_max, false, false, true);
                 }
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
@@ -2345,6 +2407,7 @@ private:
                     SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task.params.lora.size());
                     slot.prompt.clear();
                     slot.prompt_saved_idle = false;
+                    slot.ckpt_lent = false;
                 } else {
                     SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
                 }
@@ -3448,6 +3511,7 @@ private:
                     if (slot == nullptr) {
                         // if no slot is available, we defer this task for processing later
                         SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
+                        task.t_posted_us = 0; // its prompt time starts when a slot takes it
                         queue_tasks.defer(std::move(task));
                         break;
                     }
@@ -3455,6 +3519,7 @@ private:
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
+                        task.t_posted_us = 0;
                         queue_tasks.defer(std::move(task));
                         break;
                     }
@@ -3465,6 +3530,7 @@ private:
                         std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->id);
                         if (child_slots.size() < n_child_tasks) {
                             SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
+                            task.t_posted_us = 0;
                             queue_tasks.defer(std::move(task));
                             break;
                         }
@@ -3482,7 +3548,17 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (slot.prompt_save(*prompt_cache)) {
+                                // k15-idlewait (LLAMA_PCS_IDLE_SLOTS_ASYNC=0: synchronous, copied, as before): the save of an idle slot
+                                // at a new task takes the request-save path: the state rows read into the pinned staging the context
+                                // holds (no new pinned memory, else synchronous), and with a unified KV cache, where the slot is cleared
+                                // right after, its checkpoints move into the entry instead of being copied. G4 fn4 16 GB -np 4 chat:
+                                // 52.7 ms of synchronous reads (131.8 MiB) before the new task's prompt
+                                static const bool idle_slots_async = getenv("LLAMA_PCS_IDLE_SLOTS_ASYNC") == nullptr ||
+                                    atoi(getenv("LLAMA_PCS_IDLE_SLOTS_ASYNC")) != 0;
+                                const bool saved = idle_slots_async ?
+                                    slot.prompt_save(*prompt_cache, params_base.kv_unified ? -1 : -2, false, false, true) :
+                                    slot.prompt_save(*prompt_cache);
+                                if (saved) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
                                 }
@@ -3600,6 +3676,11 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+                    if (slot->ckpt_lent && prompt_cache) { // k15-idlewait: the lent checkpoints come back, the entry keeps copies (as with the lend off)
+                        prompt_cache->ckpt_return(slot->prompt.tokens, slot->prompt.checkpoints, false, 0, true);
+                        SLT_INF(*slot, "slot action: %zu lent checkpoint(s) back, the cache entry keeps copies\n", slot->prompt.checkpoints.size());
+                        slot->ckpt_lent = false;
+                    }
 
                     const int64_t t_start = ggml_time_us();
 
@@ -3661,6 +3742,11 @@ private:
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
                         break;
+                    }
+                    if (slot->ckpt_lent && prompt_cache) { // k15-idlewait: the lent checkpoints come back, the entry keeps copies (as with the lend off)
+                        prompt_cache->ckpt_return(slot->prompt.tokens, slot->prompt.checkpoints, false, 0, true);
+                        SLT_INF(*slot, "slot action: %zu lent checkpoint(s) back, the cache entry keeps copies\n", slot->prompt.checkpoints.size());
+                        slot->ckpt_lent = false;
                     }
 
                     const int64_t t_start = ggml_time_us();
@@ -3730,6 +3816,11 @@ private:
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
                         break;
+                    }
+                    if (slot->ckpt_lent && prompt_cache) { // k15-idlewait: the lent checkpoints come back, the entry keeps copies (as with the lend off)
+                        prompt_cache->ckpt_return(slot->prompt.tokens, slot->prompt.checkpoints, false, 0, true);
+                        SLT_INF(*slot, "slot action: %zu lent checkpoint(s) back, the cache entry keeps copies\n", slot->prompt.checkpoints.size());
+                        slot->ckpt_lent = false;
                     }
 
                     // Erase token cache
@@ -4071,6 +4162,7 @@ private:
 
                     slot.prompt.clear();
                     slot.prompt_saved_idle = false;
+                    slot.ckpt_lent = false;
                     slot.prompt.tokens.insert(new_tokens);
                 }
 
@@ -4272,7 +4364,10 @@ private:
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
-                        slot.stats.update_prompt_start();
+                        // k15-hostcut: from when the task was posted, so prompt_ms covers what delayed it on the server loop (the client's TTFT
+                        // less the request's parse, tokenize and delivery)
+                        static const bool from_post = getenv("LLAMA_PROMPT_TIME_FROM_POST") == nullptr || atoi(getenv("LLAMA_PROMPT_TIME_FROM_POST")) != 0;
+                        slot.stats.update_prompt_start(from_post ? slot.task->t_posted_us : 0);
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
@@ -5188,6 +5283,10 @@ private:
         } else {
             // success, apply batch metrics
             metrics_post_decode(off, batch.view.size(), has_output);
+            // k15-idlewait: a cache entry dropped during its save goes back to the pool (the decode joined the save)
+            if (prompt_cache && !prompt_cache->dropped_inflight.empty()) {
+                prompt_cache->wait_inflight();
+            }
         }
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]

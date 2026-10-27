@@ -410,9 +410,11 @@ struct server_slot_stats {
     int64_t t_gen_last    = 0;
 
     // can only move one direction: start -> prompt -> gen
-    void update_prompt_start() {
+    // t_from_us > 0: the prompt time starts there (not after now), e.g. when the request's task was posted (k15-hostcut)
+    void update_prompt_start(int64_t t_from_us = 0) {
         GGML_ASSERT(t_start == 0);
-        t_start = ggml_time_us();
+        const int64_t t_now = ggml_time_us();
+        t_start = t_from_us > 0 ? std::min(t_from_us, t_now) : t_now;
     }
     void set_prompt_last(int64_t t_us) {
         GGML_ASSERT(t_start > 0);

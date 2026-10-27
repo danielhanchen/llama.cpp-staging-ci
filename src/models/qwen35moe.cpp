@@ -246,6 +246,25 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     res->t_logits = cur;
 }
 
+// k15-hostcut: the products of one input enter the graph next to each other in prompt batches (GDN qkv and z; attention q, k and v),
+// so the q8_1 copy of the input that the norm writes (or the first product makes) is shared by all of them: otherwise z is placed
+// where it is first read (after the delta net) and k / v after the q norm and rope, and each quantizes the input again. The same ops,
+// only the node order changes; decode-size batches (8 tokens or fewer, mat-vec kernels) keep the old order.
+// LLAMA_QWEN35_PROJ_ADJACENT=0: the old order everywhere
+static bool qwen35moe_proj_adjacent(int64_t n_tokens) {
+    static const bool on = !getenv("LLAMA_QWEN35_PROJ_ADJACENT") || atoi(getenv("LLAMA_QWEN35_PROJ_ADJACENT")) != 0;
+    return on && n_tokens > 8;
+}
+
+// k15-idlewait: not in the MTP head's graph. There the adjacent order made the head's prompt graph and its decode-size graphs plan
+// the allocator differently, so every reply re-planned it and the idle work re-reserved the prompt graph before the next request
+// (local q4x: re-plans 2 per launch with it, 1 without, as with LLAMA_QWEN35_PROJ_ADJACENT=0); the head is one layer, it saves one
+// q8_1 copy there. LLAMA_QWEN35_PROJ_ADJACENT_MTP=1: the adjacent order there too
+static bool qwen35moe_proj_adjacent_mtp(int64_t n_tokens) {
+    static const bool on = getenv("LLAMA_QWEN35_PROJ_ADJACENT_MTP") != nullptr && atoi(getenv("LLAMA_QWEN35_PROJ_ADJACENT_MTP")) != 0;
+    return on && qwen35moe_proj_adjacent(n_tokens);
+}
+
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35moe::graph::build_qkvz(
                 ggml_tensor * input,
                         int   il) {
@@ -253,10 +272,16 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35moe::graph::build_qkvz
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
+    if (qwen35moe_proj_adjacent(n_tokens)) {
+        ggml_build_forward_expand(gf, qkv_mixed);
+    }
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
+    if (qwen35moe_proj_adjacent(n_tokens)) {
+        ggml_build_forward_expand(gf, z);
+    }
     cb(z, "z", il);
 
     return { qkv_mixed, z };
@@ -290,6 +315,11 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
             n_embd_head,     n_head_kv,
             n_embd_head,     n_head_kv,
             il, false);
+    if (qwen35moe_proj_adjacent(n_tokens)) {
+        ggml_build_forward_expand(gf, Qcur_full);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, Vcur);
+    }
     cb(Qcur_full, "Qcur_full", il);
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
@@ -626,6 +656,11 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
             n_embd_head,     n_head_kv,
             n_embd_head,     n_head_kv,
             il, false);
+    if (qwen35moe_proj_adjacent_mtp(n_tokens)) {
+        ggml_build_forward_expand(gf, Qcur_full);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, Vcur);
+    }
     cb(Qcur_full, "mtp_Qcur_full", il);
 
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full,

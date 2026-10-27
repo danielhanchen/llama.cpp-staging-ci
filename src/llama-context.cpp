@@ -39,6 +39,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <functional>
+#include <chrono>
+#include <thread>
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/resource.h>
@@ -699,7 +701,7 @@ llama_context::llama_context(
 
         memory.reset(model.create_memory(params_mem, cparams));
         if (memory) {
-            memory->wait_state_reads = [this]() { state_async_wait(); };
+            memory->wait_state_reads = [this]() { state_async_wait_reads(); };
         }
     }
 
@@ -6284,21 +6286,44 @@ llm_graph_params llama_context::graph_params(
 // next prompt would each re-plan it again as the KV view grows, every time with a synchronization of all backends (G4: prompts 2-7%
 // slower with n-gram drafting on). This restores the worst-case pp plan of sched_reserve once. The allocator only plans addresses:
 // outputs cannot change. LLAMA_PP_RERESERVE=0: off.
-bool llama_context::restore_pp_plan() {
+bool llama_context::restore_pp_plan(bool idle) {
     // k13-fn: the slots are idle: the MoE cache's pending re-calibration of the CPU-miss host timings runs now, not inside a reply
+    // k15-idlewait (LLAMA_MOE_RECAL_YIELD=0: runs to the end, as before): a request that arrives meanwhile (llama_set_idle_abort) stops it
+    // before the next timing repetition and it stays pending for the next idle time; it changes nothing until it completes. G4 q4x 12 GB:
+    // the re-calibration of the target and the MTP head (~50 ms) ran after the chat reply, and the next request waited for all of it
     if (moe_cache && backend_cpu != nullptr && moe_cache->recal_pending()) {
-        synchronize();
-        compute_n_tokens = -1;
-        set_compute_threads(false);
-        compute_n_tokens = 0;
-        moe_cache->recal(backend_cpu);
+        static const bool yield = getenv("LLAMA_MOE_RECAL_YIELD") == nullptr || atoi(getenv("LLAMA_MOE_RECAL_YIELD")) != 0;
+        bool (*abort)(void *) = yield && idle ? idle_abort_fn : nullptr;
+        // a server (it set llama_set_idle_abort) serves it in its idle work only: the fallback call inside a long prompt's decode would
+        // put a re-calibration a request deferred into that request (G4 q4x 12 GB 2k back-to-back: +55 ms TTFT)
+        const bool skip = yield && !idle && idle_abort_fn != nullptr;
+        if (!skip && (abort == nullptr || !abort(idle_abort_data))) {
+            synchronize();
+            compute_n_tokens = -1;
+            set_compute_threads(false);
+            compute_n_tokens = 0;
+            if (!moe_cache->recal(backend_cpu, abort, idle_abort_data)) {
+                static int n_log = 0;
+                if (n_log++ < 8) {
+                    LLAMA_LOG_INFO("%s: MoE cache re-calibration stopped by a request, it stays pending\n", __func__);
+                }
+            }
+        }
     }
     static const bool pp_rereserve = getenv("LLAMA_PP_RERESERVE") == nullptr || atoi(getenv("LLAMA_PP_RERESERVE")) != 0;
     if (!pp_rereserve || !sched_plan_small || !memory || moe_cache || model.hparams.no_alloc || sched_need_reserve) {
         return false;
     }
     sched_plan_small = false;
-    synchronize();
+    // k15-idlewait: the reserve needs the device idle and the rows of a save in flight read, not the save's host copy into its
+    // destination (LLAMA_PP_RERESERVE_JOIN=1: synchronize(), which joins the save: G4 q4x chat, 16 ms ahead of a request posted meanwhile)
+    static const bool pp_join = getenv("LLAMA_PP_RERESERVE_JOIN") != nullptr && atoi(getenv("LLAMA_PP_RERESERVE_JOIN")) != 0;
+    if (pp_join) {
+        synchronize();
+    } else {
+        ggml_backend_sched_synchronize(sched.get());
+        state_async_wait_reads();
+    }
     auto mctx_full = memory->init_full();
     if (!mctx_full) {
         return false;
@@ -7728,6 +7753,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
 }
 
 size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
+    state_async_wait_reads(); // k15-idlewait: as state_seq_set_data
     llama_io_read_host io(src, size);
     try {
         return state_read_data(io);
@@ -7793,6 +7819,8 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         cap_save = -1;
         return n;
     }
+    const bool no_grow = (flags & LLAMA_STATE_SEQ_FLAGS_ASYNC_NO_GROW) != 0;
+    flags &= ~LLAMA_STATE_SEQ_FLAGS_ASYNC_NO_GROW;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ASYNC) {
         flags &= ~LLAMA_STATE_SEQ_FLAGS_ASYNC;
 
@@ -7807,7 +7835,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 
                 const size_t n = state_seq_write_data(io, seq_id, flags);
 
-                state_get_async(io.winfos);
+                state_get_async(io.winfos, no_grow);
 
                 return n;
             } catch (const std::exception & err) {
@@ -7865,6 +7893,9 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+    // k15-idlewait: the rows are written with synchronous copies off the compute stream: an asynchronous save still queued there must
+    // have read them first (it was joined by the first memory call before; LLAMA_STATE_ASYNC_SPLIT_WAIT=0: the whole save here too)
+    state_async_wait_reads();
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         // create a temporary io to read the magic and the src seq_id
@@ -8094,6 +8125,25 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
 void llama_context::state_async_wait() {
     if (state_async_worker.joinable()) {
         state_async_worker.join();
+    }
+}
+
+// k15-idlewait: what a sequence change (llama_memory_seq_rm / seq_cp / clear) has to wait for is the read of the device rows, so the
+// change cannot reach them first; the host copy from the pinned staging into the save's destination (the prompt-cache entry: 77 MiB
+// for a 640-token Qwen3.6 chat, about 15 ms of the next request's G4 TTFT when it was waited for here) goes on on the worker. The
+// destination is still waited for in full where it is read or freed (state_async_wait: the next save, llama_state_seq_async_wait,
+// synchronize, the end of decode)
+void llama_context::state_async_wait_reads() {
+    static const bool split = getenv("LLAMA_STATE_ASYNC_SPLIT_WAIT") == nullptr || atoi(getenv("LLAMA_STATE_ASYNC_SPLIT_WAIT")) != 0;
+    if (!split) {
+        state_async_wait();
+        return;
+    }
+    if (!state_async_worker.joinable() || state_async_reads_done.load(std::memory_order_acquire)) {
+        return;
+    }
+    for (auto * ev : state_async_evs) {
+        ggml_backend_event_synchronize(ev);
     }
 }
 
@@ -8367,7 +8417,7 @@ bool llama_context::state_get_bounced(const std::vector<llama_state_write_info> 
     return true;
 }
 
-void llama_context::state_get_async(const std::vector<llama_state_write_info> & winfos) {
+void llama_context::state_get_async(const std::vector<llama_state_write_info> & winfos, bool no_grow) {
     // the previous save may still be reading the staging buffers
     state_async_wait();
 
@@ -8409,10 +8459,25 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
     // allocation, drained the queued ubatch and left the GPU idle for the whole cudaMallocHost of the new one.
     std::vector<ggml_backend_buffer_ptr> retired;
 
+    // k15-idlewait (LLAMA_STATE_ASYNC_PARTIAL=0: all synchronous then): with ASYNC_NO_GROW, a save larger than the staging the context
+    // holds reads the rows that fit there asynchronously and the rest synchronously into dst (G4 fn4 16 GB: the checkpoint staging
+    // holds the 112.6 MiB of recurrent rows, the save is 131.8 MiB with the KV rows)
+    static const bool partial_env = getenv("LLAMA_STATE_ASYNC_PARTIAL") == nullptr || atoi(getenv("LLAMA_STATE_ASYNC_PARTIAL")) != 0;
+    std::vector<uint8_t> partial(state_async.size(), 0);
+    std::vector<uint8_t> sync_row(winfos.size(), 0);
+
     for (size_t b = 0; ok && b < state_async.size(); ++b) {
         auto & sa = state_async[b];
         if (need[b] == 0 || (sa.staging && ggml_backend_buffer_get_size(sa.staging.get()) >= need[b])) {
             continue;
+        }
+        if (no_grow && partial_env && sa.staging) {
+            partial[b] = 1;
+            continue;
+        }
+        if (no_grow) {   // LLAMA_STATE_SEQ_FLAGS_ASYNC_NO_GROW: no new pinned memory for this save, it is synchronous
+            ok = false;
+            break;
         }
 
         ggml_backend_buffer_ptr grown(ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(sa.dev), need[b]));
@@ -8434,6 +8499,30 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
             ggml_backend_tensor_get(w.tensor, w.dst, w.offset, w.size);
         }
         return;
+    }
+
+    // partial: the rows in order while they fit in the staging, the rest synchronous
+    size_t n_sync = 0;
+    for (size_t b = 0; b < state_async.size(); ++b) {
+        if (!partial[b]) {
+            continue;
+        }
+        const size_t cap_b = ggml_backend_buffer_get_size(state_async[b].staging.get());
+        size_t run = 0;
+        for (size_t i = 0; i < winfos.size(); ++i) {
+            if (owner[i] != (int) b) {
+                continue;
+            }
+            const size_t pad = GGML_PAD(winfos[i].size, 64);
+            if (run + pad <= cap_b) {
+                offs[i] = run;
+                run    += pad;
+            } else {
+                sync_row[i] = 1;
+                n_sync++;
+            }
+        }
+        need[b] = run;
     }
 
     struct copy_job {
@@ -8471,6 +8560,9 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
     }
 
     for (size_t i = 0; i < winfos.size(); ++i) {
+        if (sync_row[i]) {
+            continue;
+        }
         auto & sa = state_async[owner[i]];
         uint8_t * stage = (uint8_t *) ggml_backend_buffer_get_base(sa.staging.get()) + offs[i];
 
@@ -8493,18 +8585,55 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
         }
     }
 
+    // partial: the rows past the staging, synchronously (their backend's stream first: the reads use another stream)
+    if (n_sync > 0) {
+        for (size_t b = 0; b < state_async.size(); ++b) {
+            if (partial[b]) {
+                ggml_backend_synchronize(state_async[b].backend);
+            }
+        }
+        for (size_t i = 0; i < winfos.size(); ++i) {
+            if (sync_row[i]) {
+                ggml_backend_tensor_get(winfos[i].tensor, winfos[i].dst, winfos[i].offset, winfos[i].size);
+            }
+        }
+        static int n_log = 0;
+        if (n_log++ < 4) {
+            LLAMA_LOG_INFO("%s: state save larger than the staging: %zu of %zu rows read synchronously (LLAMA_STATE_ASYNC_PARTIAL)\n",
+                __func__, n_sync, winfos.size());
+        }
+    }
+
     if (events.empty()) {
         return;
     }
 
     sync_pending = true;
 
-    state_async_worker = std::thread([jobs = std::move(jobs), events = std::move(events), retired = std::move(retired)]() mutable {
+    state_async_evs = events;
+    state_async_reads_done.store(false, std::memory_order_release);
+    // debug (tests of a save in flight, default 0 = off): LLAMA_STATE_ASYNC_DEBUG_DELAY_MS=N sleeps N/2 ms before the host copy and N/2 ms
+    // halfway through it, so the copy of the idle save is still running (half done) when the next task arrives
+    static const int dbg_delay_ms = getenv("LLAMA_STATE_ASYNC_DEBUG_DELAY_MS") ? std::max(0, atoi(getenv("LLAMA_STATE_ASYNC_DEBUG_DELAY_MS"))) : 0;
+    state_async_worker = std::thread([jobs = std::move(jobs), events = std::move(events), retired = std::move(retired), done = &state_async_reads_done]() mutable {
         for (auto * ev : events) {
             ggml_backend_event_synchronize(ev);
         }
-        for (const auto & j : jobs) {
-            memcpy(j.dst, j.src, j.size);
+        done->store(true, std::memory_order_release);
+        if (dbg_delay_ms > 0) {
+            LLAMA_LOG_INFO("%s: debug delay: host copy of %zu jobs in flight from epoch_us %lld\n", "state_async", jobs.size(),
+                (long long) std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+            std::this_thread::sleep_for(std::chrono::milliseconds(dbg_delay_ms / 2));
+        }
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            if (dbg_delay_ms > 0 && i == jobs.size() / 2) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(dbg_delay_ms - dbg_delay_ms / 2));
+            }
+            memcpy(jobs[i].dst, jobs[i].src, jobs[i].size);
+        }
+        if (dbg_delay_ms > 0) {
+            LLAMA_LOG_INFO("%s: debug delay: host copy done at epoch_us %lld\n", "state_async",
+                (long long) std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
         }
         retired.clear();
     });
@@ -9558,7 +9687,7 @@ bool llama_exact_verify_enabled(void) {
 }
 
 bool llama_prepare_prompt_plan(llama_context * ctx) {
-    return ctx->restore_pp_plan();
+    return ctx->restore_pp_plan(true);
 }
 
 bool llama_context::moe_freeze_small() {
@@ -9596,6 +9725,13 @@ void llama_context::moe_request_begin() {
             return e != nullptr ? atoi(e) : 1;
         }();
         moe_seed_early = seed_early_env;
+    }
+}
+
+void llama_set_idle_abort(llama_context * ctx, bool (*fn)(void *), void * data) {
+    if (ctx != nullptr) {
+        ctx->idle_abort_fn   = fn;
+        ctx->idle_abort_data = data;
     }
 }
 

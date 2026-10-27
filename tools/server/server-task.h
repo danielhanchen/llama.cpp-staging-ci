@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_set>
 #include <list>
+#include <thread>
 #include <functional>
 #include <map>
 
@@ -212,7 +213,12 @@ struct server_task {
 
     server_task() = default;
 
-    server_task(server_task_type type) : type(type) {}
+    // k15-hostcut: when the HTTP thread made the task (us, ggml_time_us), so the prompt time of its slot starts there and covers what the
+    // server loop did before it took the task (an idle prompt-cache save it waited for, an idle re-reserve of the prompt graph); 0 for a
+    // task that waited for a free slot (its prompt time starts when a slot takes it)
+    int64_t t_posted_us = 0;
+
+    server_task(server_task_type type) : type(type), t_posted_us(ggml_time_us()) {}
 
     int32_t n_tokens() const {
         return tokens.size();
@@ -689,13 +695,35 @@ struct server_prompt_cache {
     // k11: the entry whose state is still being copied by an asynchronous save (server_slot::prompt_save), and how to wait for it
     const server_prompt_cache_state * inflight = nullptr;
     std::function<void()>             wait_reads;
+    // k15-idlewait: the drop of an entry still being saved may be deferred (drop_newest); the server sets it for a single slot only
+    bool                              drop_defer_ok = false;
+
+    // k15-idlewait (LLAMA_PCS_CKPT_COPY_ASYNC): the next alloc() copies the checkpoints the slot drops on clone_thread (set by
+    // server_slot::prompt_save at a request); wait_inflight / wait_clone join it
+    bool        clone_async_next = false;
+    std::thread clone_thread;
+    void wait_clone() {
+        if (clone_thread.joinable()) {
+            clone_thread.join();
+        }
+    }
+    ~server_prompt_cache() { wait_clone(); }
 
     void wait_inflight() {
+        wait_clone();
         if (inflight != nullptr && wait_reads) {
             wait_reads();
         }
         inflight = nullptr;
+        if (!dropped_inflight.empty()) {
+            recycle_dropped();
+        }
     }
+
+    // k15-idlewait: an entry dropped while its asynchronous save was still copying (drop_newest) waits here for the copy, its buffers
+    // go back to the pool at the next wait_inflight (the server calls it after the next decode, which joins the save)
+    std::list<server_prompt_cache_state> dropped_inflight;
+    void recycle_dropped();
 
     // remove the oldest state, handing it to the SSD tier if there is one
     void evict_front();
@@ -703,6 +731,13 @@ struct server_prompt_cache {
     // k15-ttft (LLAMA_PCS_IDLE_SAVE): remove the newest entry holding exactly these tokens (a save made at idle that the next request did
     // not need: the slot was kept by prompt similarity); true if one was removed
     bool drop_newest(const server_tokens & tokens);
+
+    // k15-idlewait (LLAMA_PCS_IDLE_LEND): the checkpoints an idle save moved into the newest entry holding exactly these tokens go back
+    // to the slot (dst), all of them when the entry is about to be dropped (keep_entry false), else a copy of those up to pos keep_max
+    // (the ones the slot's next prompt keeps); true if the entry was found
+    // entry_copies: all of them go back and the entry keeps a copy of each (what it held with LLAMA_PCS_IDLE_LEND=0)
+    bool ckpt_return(const server_tokens & tokens, std::list<common_prompt_checkpoint> & dst, bool keep_entry, llama_pos keep_max,
+                     bool entry_copies = false);
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;

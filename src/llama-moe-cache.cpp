@@ -5367,7 +5367,21 @@ struct llama_moe_cache::impl {
     // calibration, once before the first small batch, with the threads of small batches: the host times one layer's expert tensors for 1
     // expert x 1 token, k experts x 1 token and k experts x T tokens (other experts every repetition, as they are read in generation),
     // the device times uploads of k experts from the host experts and a small synchronous read (the round trip of a host split)
+    // k15-idlewait: set by cm_calibrate when cm_cal_abort stopped a re-calibration (nothing changed, it stays pending)
+    bool (*cm_cal_abort)(void *) = nullptr;
+    void * cm_cal_abort_data     = nullptr;
+    bool   cm_cal_aborted        = false;
     void cm_calibrate(ggml_backend_t backend_cpu) {
+        cm_cal_aborted = false;
+        const bool hybrid_probe_was = hybrid_probe;
+        auto aborted = [&]() {
+            if (cm_cal && cm_cal_abort != nullptr && cm_cal_abort(cm_cal_abort_data)) {
+                cm_cal_aborted = true;
+                hybrid_probe   = hybrid_probe_was;
+                return true;
+            }
+            return false;
+        };
         hybrid_probe = false;
         const int64_t t_start = ggml_time_us();
         // k13-fn: the second call is the re-calibration after warm-up (see cm_recal_wait): host timings only, see below
@@ -5459,6 +5473,9 @@ struct llama_moe_cache::impl {
         for (; attempt < 3 && !ok; ++attempt) {
             std::vector<int64_t> ta, tb, tt;
             for (int r = 0; r <= n_rep; ++r) {
+                if (aborted()) {
+                    return;
+                }
                 set_ids(ids_a, ka, 1);
                 const int64_t da = timed(gf_a);
                 set_ids(ids_b, kb, 1);
@@ -5490,6 +5507,9 @@ struct llama_moe_cache::impl {
             return;
         }
 
+        if (aborted()) {
+            return;
+        }
         // uploads into the spare slot at the end of the banks (never looked up), then a small synchronous read
         std::vector<int64_t> tu, trt;
         ggml_backend_t backend = devices[g.id].backend;
@@ -8726,9 +8746,19 @@ bool llama_moe_cache::recal_pending() const {
     return pimpl->cm && pimpl->cm_cal && pimpl->cm_recal_pending;
 }
 
-void llama_moe_cache::recal(ggml_backend_t backend_cpu) {
-    pimpl->cm_recal_pending = false;
+bool llama_moe_cache::recal(ggml_backend_t backend_cpu, bool (*abort)(void *), void * abort_data) {
+    pimpl->cm_recal_pending  = false;
+    pimpl->cm_cal_abort      = abort;
+    pimpl->cm_cal_abort_data = abort_data;
     pimpl->cm_calibrate(backend_cpu);
+    pimpl->cm_cal_abort      = nullptr;
+    pimpl->cm_cal_abort_data = nullptr;
+    if (pimpl->cm_cal_aborted) {
+        pimpl->cm_cal_aborted   = false;
+        pimpl->cm_recal_pending = true;
+        return false;
+    }
+    return true;
 }
 
 bool llama_moe_cache::hybrid_probe_pending() const {

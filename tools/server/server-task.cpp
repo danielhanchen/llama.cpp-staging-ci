@@ -1756,6 +1756,8 @@ static std::list<common_prompt_checkpoint> prompt_checkpoints_clone(const std::l
 
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft,
         std::list<common_prompt_checkpoint> * take_from, llama_pos keep_max) {
+    const bool clone_async = clone_async_next; // for this call only (k15-idlewait, server_slot::prompt_save)
+    clone_async_next = false;
     wait_inflight(); // the previous save is complete before entries are compared, erased or evicted
 
     // first check if the current state is contained fully in the cache
@@ -1836,7 +1838,52 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     }
 
     std::list<common_prompt_checkpoint> ckpts;
-    if (take_from != nullptr && take_from == &prompt.checkpoints) {
+    if (clone_async && take_from != nullptr && take_from == &prompt.checkpoints) {
+        // k15-idlewait: the ones the slot drops get pooled buffers here (as prompt_checkpoint_clone), their bytes are copied on
+        // clone_thread, which then puts the originals back to the pool (as the erase at the prompt start would have); the rest as before
+        struct copy_job { uint8_t * dst; const uint8_t * src; size_t n; };
+        std::vector<copy_job> jobs;
+        std::list<common_prompt_checkpoint> srcs;
+        for (auto it = take_from->begin(); it != take_from->end();) {
+            auto next = std::next(it);
+            if (it->pos_max > keep_max) {
+                common_prompt_checkpoint d;
+                d.n_tokens = it->n_tokens;
+                d.id_task  = it->id_task;
+                d.pos_min  = it->pos_min;
+                d.pos_max  = it->pos_max;
+                common_state_buf_take(d.data_tgt, it->data_tgt.size());
+                d.data_tgt.resize(it->data_tgt.size());
+                common_state_buf_take(d.data_dft, it->data_dft.size());
+                d.data_dft.resize(it->data_dft.size());
+                d.data_spec = it->data_spec;
+                common_state_buf_prefault(it->data_tgt.size(), 2);
+                if (!it->data_tgt.empty()) {
+                    jobs.push_back({ d.data_tgt.data(), it->data_tgt.data(), it->data_tgt.size() });
+                }
+                if (!it->data_dft.empty()) {
+                    jobs.push_back({ d.data_dft.data(), it->data_dft.data(), it->data_dft.size() });
+                }
+                ckpts.push_back(std::move(d));
+                srcs.splice(srcs.end(), *take_from, it);
+            } else {
+                ckpts.push_back(prompt_checkpoint_clone(*it));
+            }
+            it = next;
+        }
+        if (!srcs.empty()) {
+            clone_thread = std::thread([jobs = std::move(jobs), srcs = std::move(srcs)]() mutable {
+                for (const auto & j : jobs) {
+                    memcpy(j.dst, j.src, j.n);
+                }
+                for (auto & c : srcs) {
+                    common_state_buf_recycle(std::move(c.data_tgt));
+                    common_state_buf_recycle(std::move(c.data_dft));
+                }
+                srcs.clear();
+            });
+        }
+    } else if (take_from != nullptr && take_from == &prompt.checkpoints) {
         // a moved checkpoint takes no pooled buffer, where its copy would have: the buffer the copy would have taken leaves the pool all
         // the same (freed off this thread), so the pool, and the host RSS, end where the copies leave them (without it, end-of-run RSS
         // was +150..+1300 MiB; LLAMA_PCS_MOVE_POOL_DROP=0: kept in the pool)
@@ -1879,6 +1926,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         },
     });
 
+    if (clone_thread.joinable()) {
+        inflight = &states.back(); // its checkpoints are being copied: readers of the entry wait (wait_inflight)
+    }
     return &states.back();
 }
 
@@ -2007,7 +2057,53 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     return true;
 }
 
+void server_prompt_cache::recycle_dropped() {
+    for (auto & st : dropped_inflight) {
+        prompt_state_recycle(st);
+    }
+    dropped_inflight.clear();
+}
+
+bool server_prompt_cache::ckpt_return(const server_tokens & tokens, std::list<common_prompt_checkpoint> & dst, bool keep_entry, llama_pos keep_max,
+        bool entry_copies) {
+    // no wait for a state save in flight: it writes the entry's state buffers only; the checkpoint copies of a request save do touch
+    // them (LLAMA_PCS_CKPT_COPY_ASYNC): wait_clone
+    for (auto it = states.rbegin(); it != states.rend(); ++it) {
+        if (it->prompt.tokens.size() == tokens.size() && it->prompt.tokens.get_common_prefix(tokens) == tokens.size()) {
+            if (&*it == inflight) {
+                wait_clone();
+            }
+            if (entry_copies) {
+                std::list<common_prompt_checkpoint> copies = prompt_checkpoints_clone(it->prompt.checkpoints);
+                dst.splice(dst.end(), it->prompt.checkpoints);
+                it->prompt.checkpoints = std::move(copies);
+            } else if (!keep_entry) {
+                dst.splice(dst.end(), it->prompt.checkpoints);
+            } else {
+                for (const auto & c : it->prompt.checkpoints) {
+                    if (c.pos_max <= keep_max) {
+                        dst.push_back(prompt_checkpoint_clone(c));
+                    }
+                }
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 bool server_prompt_cache::drop_newest(const server_tokens & tokens) {
+    // k15-idlewait: the entry of a save still copying leaves the cache now, its buffers once the copy is done (LLAMA_PCS_DROP_DEFER=0:
+    // wait for the copy here, as before)
+    static const bool defer = getenv("LLAMA_PCS_DROP_DEFER") == nullptr || atoi(getenv("LLAMA_PCS_DROP_DEFER")) != 0;
+    if (defer && drop_defer_ok && inflight != nullptr) {
+        for (auto it = states.rbegin(); it != states.rend(); ++it) {
+            if (&*it == inflight && it->prompt.tokens.size() == tokens.size() && it->prompt.tokens.get_common_prefix(tokens) == tokens.size()) {
+                dropped_inflight.splice(dropped_inflight.end(), states, std::next(it).base());
+                return true;
+            }
+        }
+    }
     wait_inflight();
     for (auto it = states.rbegin(); it != states.rend(); ++it) {
         if (it->prompt.tokens.size() == tokens.size() && it->prompt.tokens.get_common_prefix(tokens) == tokens.size()) {

@@ -23,6 +23,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <thread>
+#include <atomic>
 #include <vector>
 
 struct llama_model;
@@ -114,6 +115,9 @@ struct llama_context {
     bool moe_pin_small();    // k13: see llama_moe_pin_small
     bool moe_pin_small_set(bool on); // k15-lfm2: see llama_moe_pin_small_set
     void moe_request_begin();        // k15-lfm2: see llama_moe_request_begin
+    // k15-idlewait: see llama_set_idle_abort
+    bool (*idle_abort_fn)(void *) = nullptr;
+    void * idle_abort_data        = nullptr;
     bool moe_cpu_miss_drop_slow(); // k15-lfm2: see llama_moe_cpu_miss_drop_slow
     const llama_cparams & get_cparams() const;
 
@@ -178,7 +182,7 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_verify(bool value);
     void set_verify_exact(bool value);
-    bool restore_pp_plan(); // k11-decode (see the definition)
+    bool restore_pp_plan(bool idle = false); // k11-decode (see the definition); idle: from llama_prepare_prompt_plan
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
 
@@ -246,10 +250,13 @@ struct llama_context {
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
     // LLAMA_STATE_SEQ_FLAGS_ASYNC: queue the tensor reads of a state save without synchronizing (see state_get_async)
-    void state_get_async(const std::vector<llama_state_write_info> & winfos);
+    void state_get_async(const std::vector<llama_state_write_info> & winfos, bool no_grow = false);
 
     // wait until the last asynchronous state save has reached its destination
     void state_async_wait();
+    // k15-idlewait: wait only until the device rows of the asynchronous save in flight are read (its D2H copies into the pinned
+    // staging done), not for the worker's host copy into the destination (LLAMA_STATE_ASYNC_SPLIT_WAIT=0: the whole save)
+    void state_async_wait_reads();
 
     // set when backend work is queued (graph_compute, async state copies), cleared by synchronize()
     bool sync_pending = true;
@@ -881,6 +888,8 @@ private:
 
     // waits for the events, then copies staging -> destination; joined by state_async_wait()
     std::thread state_async_worker;
+    std::vector<ggml_backend_event_t> state_async_evs;        // k15-idlewait: the read events of the save in flight
+    std::atomic<bool>                 state_async_reads_done { true };
 
     bool has_evaluated_once = false;
 
