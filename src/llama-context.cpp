@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <array>
+#include <set>
 #include <cinttypes>
 #if defined(__GLIBC__)
 #include <malloc.h>
@@ -702,6 +703,19 @@ llama_context::llama_context(
         memory.reset(model.create_memory(params_mem, cparams));
         if (memory) {
             memory->wait_state_reads = [this]() { state_async_wait_reads(); };
+            // k16-draft: the replay commit of the delta-net states runs on this context's backends
+            llama_memory_recurrent * mr = dynamic_cast<llama_memory_recurrent *>(memory.get());
+            if (auto * mh = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+                mr = mh->get_mem_recr();
+            } else if (auto * mhi = dynamic_cast<llama_memory_hybrid_iswa *>(memory.get())) {
+                mr = mhi->get_mem_recr();
+            }
+            if (mr != nullptr && mr->replay && !model.hparams.no_alloc) {
+                rs_replay_mem = mr;
+                mr->commit_cb = [this](bool sync) { rs_replay_commit(sync); };
+                LLAMA_LOG_INFO("%s: recurrent rollback by replay: one delta-net state row per sequence instead of %u "
+                        "(LLAMA_RS_REPLAY=0: snapshot rows)\n", __func__, 1 + mr->n_rs_seq);
+            }
         }
     }
 
@@ -1004,6 +1018,207 @@ void llama_context::small_plan_free(uint32_t i) {
     }
 }
 
+void llama_context::rs_replay_commit(bool sync) {
+    llama_memory_recurrent * mem = rs_replay_mem;
+    if (mem == nullptr || !mem->has_pending()) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    const size_t max_nodes = 16384;
+    if (rs_mode == 0) {
+        const bool sched_only = getenv("LLAMA_RS_REPLAY_SCHED") != nullptr && atoi(getenv("LLAMA_RS_REPLAY_SCHED")) != 0;
+        bool one = !sched_only;
+        auto chk = [&](const ggml_tensor * t) {
+            if (t == nullptr) {
+                return;
+            }
+            ggml_backend_buffer_type_t bt = t->buffer != nullptr ? ggml_backend_buffer_get_type(t->buffer) : nullptr;
+            if (bt == nullptr || (rs_buft != nullptr && bt != rs_buft)) {
+                one = false;
+            }
+            rs_buft = bt;
+        };
+        for (size_t il = 0; il < mem->s_l.size(); ++il) {
+            chk(mem->s_l[il]);
+            chk(mem->r_l[il]);
+            chk(il < mem->p_l.size() ? mem->p_l[il] : nullptr);
+            chk(mem->rk_l[il]);
+            chk(mem->rv_l[il]);
+            chk(mem->rg_l[il]);
+        }
+        if (one && rs_buft != nullptr) {
+            for (auto * be : backend_ptrs) {
+                if (ggml_backend_supports_buft(be, rs_buft)) {
+                    rs_backend = be;
+                    break;
+                }
+            }
+        }
+        rs_mode = rs_backend != nullptr ? 1 : -1;
+        LLAMA_LOG_INFO("%s: replay commit graphs run %s\n", __func__, rs_mode == 1 ? ggml_backend_name(rs_backend) : "through a scheduler");
+    }
+    if (rs_mode < 0 && !rs_sched) {
+        rs_sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, false));
+    }
+    // the same cells committing the same token counts (one slot drafting: the usual case) run the graph of the last commit again
+    std::vector<uint32_t> key;
+    for (uint32_t c = 0; c < mem->size; ++c) {
+        if (mem->pend_n[c] != 0 || mem->conv_rb[c] != 0) {
+            key.insert(key.end(), { c, mem->pend_n[c], mem->pend_rb[c], mem->conv_rb[c], mem->par[c] });
+        }
+    }
+    static const bool reuse = getenv("LLAMA_RS_REPLAY_REUSE") == nullptr || atoi(getenv("LLAMA_RS_REPLAY_REUSE")) != 0;
+    auto hit = reuse ? rs_graphs.find(key) : rs_graphs.end();
+    if (hit != rs_graphs.end()) {
+        for (uint32_t c = 0; c < mem->size; ++c) {
+            mem->pend_n[c]  = 0;
+            mem->pend_rb[c] = 0;
+            mem->conv_rb[c] = 0;
+        }
+        rs_graph & e = hit->second;
+        if (e.ga) {
+            if (ggml_backend_graph_compute_async(rs_backend, e.gf) != GGML_STATUS_SUCCESS) {
+                GGML_ABORT("%s: the replay commit graph failed", __func__);
+            }
+            if (sync) {
+                ggml_backend_synchronize(rs_backend);
+            }
+        } else {
+            if (key != rs_key) {
+                // the allocator keeps any tensor whose data is set, so the intermediates (and views of them) of a graph allocated before
+                // another key's graph would keep addresses in a compute buffer that may since have been reallocated: clear them first
+                ggml_context * hctx = e.ctx.get();
+                std::set<const ggml_tensor *> own;
+                for (ggml_tensor * t = ggml_get_first_tensor(hctx); t != nullptr; t = ggml_get_next_tensor(hctx, t)) {
+                    own.insert(t);
+                }
+                for (ggml_tensor * t = ggml_get_first_tensor(hctx); t != nullptr; t = ggml_get_next_tensor(hctx, t)) {
+                    const ggml_tensor * root = t;
+                    while (root->view_src != nullptr) {
+                        root = root->view_src;
+                    }
+                    if (own.count(root) != 0) {
+                        t->data   = nullptr;
+                        t->buffer = nullptr;
+                    }
+                }
+                ggml_backend_sched_reset(rs_sched.get());
+                if (!ggml_backend_sched_alloc_graph(rs_sched.get(), e.gf)) {
+                    GGML_ABORT("%s: cannot allocate the replay commit graph", __func__);
+                }
+                rs_key = key;
+            }
+            if (ggml_backend_sched_graph_compute_async(rs_sched.get(), e.gf) != GGML_STATUS_SUCCESS) {
+                GGML_ABORT("%s: the replay commit graph failed", __func__);
+            }
+            if (sync) {
+                ggml_backend_sched_synchronize(rs_sched.get());
+            }
+        }
+        rs_reused++;
+        mem->n_replay_commit++;
+        rs_replay_us += ggml_time_us() - t0;
+        return;
+    }
+    static const size_t max_graphs = getenv("LLAMA_RS_REPLAY_GRAPHS") ? (size_t) std::max(1, atoi(getenv("LLAMA_RS_REPLAY_GRAPHS"))) : 8;
+    if (rs_graphs.size() >= max_graphs || !reuse) {
+        // a graph still in flight may use an allocation about to be freed
+        if (rs_backend != nullptr) {
+            ggml_backend_synchronize(rs_backend);
+        }
+        rs_graphs.clear();
+        rs_ga_bytes = 0;
+    }
+    ggml_init_params ip = { ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false), nullptr, true };
+    ggml_context_ptr ctx_own { ggml_init(ip) };
+    ggml_context * ctx = ctx_own.get();
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, max_nodes, false);
+    const int64_t D = model.hparams.n_embd_s();
+    for (uint32_t c = 0; c < mem->size; ++c) {
+        const uint32_t n = mem->pend_n[c];
+        if (n == 0 && mem->conv_rb[c] == 0) {
+            continue;
+        }
+        // conv_rb: the window was committed by a fused ubatch, only its conv snapshot is left
+        const uint32_t rb   = n != 0 ? mem->pend_rb[c] : mem->conv_rb[c];
+        const uint32_t keep = n > rb ? n - rb : 0;
+        const size_t   half = (size_t) mem->par[c] * (size_t) (mem->get_n_win_store() / 2);
+        for (size_t il = 0; il < mem->s_l.size(); ++il) {
+            ggml_tensor * s  = mem->s_l[il];
+            ggml_tensor * rk = mem->rk_l[il];
+            if (s == nullptr || rk == nullptr) {
+                continue;
+            }
+            if (keep > 0) {
+                ggml_tensor * rv = mem->rv_l[il];
+                ggml_tensor * rg = mem->rg_l[il]; // gate and beta interleaved: [2, H_v, 2 * n_win, size]
+                const int64_t H_k = mem->rk_h[il] > 0 ? mem->rk_h[il] : rk->ne[1];
+                const int64_t S_v = rv->ne[0];
+                const int64_t H_v = rv->ne[1];
+                auto win = [&](ggml_tensor * t, int64_t ne0, int64_t ne1, size_t off0 = 0) {
+                    return ggml_view_4d(ctx, t, ne0, ne1, keep, 1, t->nb[1], t->nb[2], t->nb[3], (size_t) c * t->nb[3] + half * t->nb[2] + off0);
+                };
+                ggml_tensor * g_c = ggml_cont(ctx, win(rg, 1, H_v, 0));
+                ggml_tensor * b_c = ggml_cont(ctx, win(rg, 1, H_v, sizeof(float)));
+                ggml_tensor * k  = win(rk, rk->ne[0], H_k);
+                ggml_tensor * st = ggml_view_4d(ctx, s, S_v, S_v, H_v, 1, ggml_row_size(s->type, S_v), ggml_row_size(s->type, S_v*S_v),
+                        ggml_row_size(s->type, D), (size_t) c * s->nb[1]);
+                ggml_tensor * out = ggml_gated_delta_net(ctx, k, k, win(rv, S_v, H_v), g_c, b_c, st, 1);
+                ggml_tensor * ns  = ggml_view_1d(ctx, out, D, ggml_row_size(out->type, S_v*H_v*(int64_t) keep));
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, ns, ggml_view_1d(ctx, s, D, (size_t) c * s->nb[1])));
+            }
+            if (rb > 0) {
+                // the conv histories keep their snapshot rows: group rb of this cell onto its live row
+                for (ggml_tensor * t : { mem->r_l[il], il < mem->p_l.size() ? mem->p_l[il] : nullptr }) {
+                    if (t == nullptr) {
+                        continue;
+                    }
+                    ggml_tensor * src = ggml_view_1d(ctx, t, t->ne[0], ((size_t) rb * mem->size + c) * t->nb[1]);
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx, src, ggml_view_1d(ctx, t, t->ne[0], (size_t) c * t->nb[1])));
+                }
+            }
+        }
+        mem->pend_n[c]  = 0;
+        mem->pend_rb[c] = 0;
+        mem->conv_rb[c] = 0;
+    }
+    if (ggml_graph_n_nodes(gf) > 0) {
+        rs_graph e;
+        e.gf = gf;
+        if (rs_mode == 1) {
+            e.ga.reset(ggml_gallocr_new(rs_buft));
+            if (!ggml_gallocr_alloc_graph(e.ga.get(), gf)) {
+                GGML_ABORT("%s: cannot allocate the replay commit graph", __func__);
+            }
+            rs_ga_bytes += ggml_gallocr_get_buffer_size(e.ga.get(), 0);
+            rs_ga_bytes_max = std::max(rs_ga_bytes_max, rs_ga_bytes);
+            if (ggml_backend_graph_compute_async(rs_backend, gf) != GGML_STATUS_SUCCESS) {
+                GGML_ABORT("%s: the replay commit graph failed", __func__);
+            }
+            if (sync) {
+                ggml_backend_synchronize(rs_backend);
+            }
+        } else {
+            ggml_backend_sched_reset(rs_sched.get());
+            if (!ggml_backend_sched_alloc_graph(rs_sched.get(), gf)) {
+                GGML_ABORT("%s: cannot allocate the replay commit graph", __func__);
+            }
+            if (ggml_backend_sched_graph_compute_async(rs_sched.get(), gf) != GGML_STATUS_SUCCESS) {
+                GGML_ABORT("%s: the replay commit graph failed", __func__);
+            }
+            rs_key = key;
+            if (sync) {
+                ggml_backend_sched_synchronize(rs_sched.get());
+            }
+        }
+        e.ctx = std::move(ctx_own);
+        // without reuse the graph is still kept until the next commit (it may be in flight)
+        rs_graphs[reuse ? key : std::vector<uint32_t>{ UINT32_MAX }] = std::move(e);
+    }
+    mem->n_replay_commit++;
+    rs_replay_us += ggml_time_us() - t0;
+}
+
 // k16-disk: runtime disk prefetch of host experts read through the file mappings (ggml/src/ggml-moe-prefetch.cpp, ported from
 // ik_llama.cpp PR #2101). The host expert tensors of file mappings are registered with the engine; the CPU MUL_MAT_ID streams the
 // routed experts of each product with its worker threads, the scheduler streams the next MoE splits of a prompt whose uploads read
@@ -1096,6 +1311,18 @@ llama_context::~llama_context() {
             "%" PRIu64 " lookahead tensors (%" PRIu64 " dropped by the budget), %" PRIu64 " chunks MADV_COLD\n", __func__, c.n_jobs, c.n_skipped,
             c.bytes_populated/1048576.0, c.n_node, c.n_tensor, c.n_dropped, c.n_colded);
         disk_ranges.clear();
+    }
+    if (rs_replay_mem != nullptr && rs_replay_mem->n_replay_commit > 0) {
+        LLAMA_LOG_INFO("%s: recurrent replay commits: %" PRIu64 " (%" PRIu64 " reused graphs), %.2f ms total, %.3f ms each (host)\n", __func__,
+                rs_replay_mem->n_replay_commit, rs_reused, rs_replay_us/1e3, rs_replay_us/1e3/rs_replay_mem->n_replay_commit);
+        LLAMA_LOG_INFO("%s: replay commit graph allocations: %.2f MiB at most\n", __func__, rs_ga_bytes_max/1024.0/1024.0);
+        if (rs_sched) {
+            ggml_backend_sched_synchronize(rs_sched.get());
+        }
+        if (rs_backend != nullptr) {
+            ggml_backend_synchronize(rs_backend);
+        }
+        rs_replay_mem->commit_cb = nullptr;
     }
     if (n_plan_saves > 0) {
         size_t bytes = 0;

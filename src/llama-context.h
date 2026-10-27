@@ -29,6 +29,7 @@
 struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
+class llama_memory_recurrent;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -257,6 +258,28 @@ struct llama_context {
     // k15-idlewait: wait only until the device rows of the asynchronous save in flight are read (its D2H copies into the pinned
     // staging done), not for the worker's host copy into the destination (LLAMA_STATE_ASYNC_SPLIT_WAIT=0: the whole save)
     void state_async_wait_reads();
+
+    // k16-draft (LLAMA_RS_REPLAY): advances the delta-net state rows by the accepted tokens of the last window (see
+    // llama_memory_recurrent::replay); called by the recurrent memory before it is read again
+    void rs_replay_commit(bool sync);
+    llama_memory_recurrent * rs_replay_mem = nullptr;
+    ggml_backend_sched_ptr   rs_sched;
+    int64_t                  rs_replay_us = 0;
+    // the last commit graph, reused while the same cells commit the same tokens (LLAMA_RS_REPLAY_REUSE=0: rebuilt every time)
+    struct rs_graph {
+        ggml_context_ptr ctx;
+        ggml_cgraph *    gf = nullptr;
+        ggml_gallocr_ptr ga; // its own allocation on rs_backend (null: allocated by rs_sched)
+    };
+    std::map<std::vector<uint32_t>, rs_graph> rs_graphs; // per (cell, tokens, rolled back) set
+    std::vector<uint32_t>    rs_key; // the graph the sched holds the allocation of
+    uint64_t                 rs_reused = 0;
+    // every state and window tensor on one backend: the commit graphs run on it directly, each with its own small allocation, so a
+    // switch between cached graphs neither re-allocates nor synchronizes (LLAMA_RS_REPLAY_SCHED=1: through rs_sched instead)
+    int                        rs_mode = 0; // 0 not decided, 1 one backend, -1 sched
+    ggml_backend_t             rs_backend = nullptr;
+    ggml_backend_buffer_type_t rs_buft = nullptr;
+    size_t                     rs_ga_bytes = 0, rs_ga_bytes_max = 0;
 
     // set when backend work is queued (graph_compute, async state copies), cleared by synchronize()
     bool sync_pending = true;

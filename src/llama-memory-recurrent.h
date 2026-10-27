@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #pragma once
 
 #include "llama-batch.h"
@@ -6,6 +7,7 @@
 
 #include <map>
 #include <set>
+#include <functional>
 #include <vector>
 
 //
@@ -80,6 +82,30 @@ public:
 
     // k15-rsr: copies the per-token snapshot `group` of cell `cell` onto its live row (group 0) on the device; false when off or failed
     bool rollback_copy(uint32_t cell, uint32_t group);
+
+    // k16-draft (LLAMA_RS_REPLAY, the commit-by-replay of Strata's verify window, include/strata/core/verify.hpp:13-18): the delta-net
+    // states (s_l) keep one row per cell instead of 1 + n_rs_seq. A window of at most 1 + n_rs_seq tokens per sequence reads the row and
+    // leaves it as it was, and stores its delta-net inputs (k, v, gate, beta; rk_l ...) per layer and cell; its conv histories (r_l, p_l)
+    // keep their snapshot rows. The commit (llama_context::rs_replay_commit, run before the memory is read again: the next ubatch, a
+    // state save, a sequence copy) advances each row by the window's accepted tokens with the same op and copies the conv snapshot of a
+    // rollback onto the live row. Larger ubatches (prompts) write the final state as without drafting and cannot be rolled back.
+    bool replay = false;
+    std::vector<ggml_tensor *> rk_l, rv_l, rg_l, rb_l;
+    mutable std::vector<int32_t> rk_h;  // per layer: the key heads the graph stored (H_k, or H_v where it repeats them)   // [S_k, H_v, n_win, size], [S_v, H_v, n_win, size], [1, H_v, n_win, size] x 2
+    std::vector<uint32_t> pend_n;    // per cell: tokens of the window not committed yet (0: the row is current)
+    std::vector<uint32_t> pend_rb;   // per cell: the tokens of that window rolled back (seq_rm)
+    std::vector<uint8_t>  par;       // per cell: the half of the stores that holds its window
+    std::vector<uint32_t> conv_rb;   // per cell: a conv snapshot still to copy onto the live row (its window committed by a fused ubatch)
+    bool replay_fused_ok = false;    // LLAMA_RS_REPLAY_FUSED and a backend with ggml_gated_delta_net_replay
+    bool rp_fused = false;           // the current ubatch commits the windows of its cells itself
+    std::vector<int32_t> rp;         // its (kept tokens, half) per sequence
+    bool replay_fuse(const llama_ubatch & ubatch);
+    uint32_t get_n_win_store() const { return 2*(1 + n_rs_seq); } // token slots per cell in the stores (two halves)
+    std::function<void(bool)> commit_cb; // set by llama_context: runs the commit graph (true: waits for it)
+    uint64_t n_replay_commit = 0;
+    bool has_pending() const;
+    void replay_commit_if_pending(bool sync = true) const; // calls commit_cb (the state reads below call it first)
+    void replay_mark(const llama_ubatch & ubatch);
     uint64_t n_rollback_copy = 0;
 
     // computed before each graph build
@@ -193,6 +219,17 @@ public:
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_p_l(int32_t il) const;
+
+    // k16-draft: the replay window's input stores (null when LLAMA_RS_REPLAY is off for this memory)
+    bool          get_replay() const;
+    uint32_t      get_n_win()  const;
+    ggml_tensor * get_rk_l(int32_t il) const;
+    ggml_tensor * get_rv_l(int32_t il) const;
+    ggml_tensor * get_rg_l(int32_t il) const;
+    ggml_tensor * get_rb_l(int32_t il) const;
+    void          set_rk_h(int32_t il, int32_t h) const;
+    bool          get_replay_fused() const;              // this ubatch's window commits the stored one (ggml_gated_delta_net_replay)
+    void          set_replay_input(ggml_tensor * t) const; // I32 [2, n_seqs]: kept tokens of the stored window, its half
 
     int32_t s_copy(int i) const;
 

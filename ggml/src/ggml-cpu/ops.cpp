@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "ops.h"
 
 #include "ggml-cpu.h"
@@ -11265,11 +11266,20 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // per-seq stride in floats (seq s starts at state + s * seq_stride)
     const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
 
-    const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
+    // ggml_gated_delta_net_replay: the stored window first (its result is the output state), then this window on a copy
+    const bool win = ggml_get_op_params_i32(dst, 1) == 1;
+    const ggml_tensor * src_wk  = win ? dst->src[6] : nullptr;
+    const ggml_tensor * src_wv  = win ? dst->src[7] : nullptr;
+    const ggml_tensor * src_wgb = win ? dst->src[8] : nullptr;
+    const ggml_tensor * src_wp  = win ? dst->src[9] : nullptr;
+    const int64_t n_win = win ? src_wk->ne[2] / 2 : 0;
+    GGML_ASSERT(!win || (K == 1 && !kda));
+
+    const int64_t per_thread = S_v + (K > 1 || win ? S_v * S_v : 0);
     const int ith = params->ith;
 
     float * delta       = (float *)params->wdata + ith * per_thread + CACHE_LINE_SIZE_F32;
-    float * state_work  = K > 1 ? (delta + S_v) : nullptr;
+    float * state_work  = K > 1 || win ? (delta + S_v) : nullptr;
 
     // output layout: [attn_scores | new_states]
     // attn_scores: S_v * H * n_tokens * n_seqs    floats
@@ -11311,6 +11321,34 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
         const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
         memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+
+        int64_t w_par = 0;
+        if (win) {
+            const int32_t * wp = (const int32_t *) ((const char *) src_wp->data + iv3 * src_wp->nb[1]);
+            const int64_t keep = wp[0];
+            w_par = wp[1];
+            GGML_ASSERT(keep >= 0 && keep <= n_win && (w_par == 0 || w_par == 1));
+            // the same token step as below, without the attention scores (the commit of the stored window)
+            for (int64_t t = 0; t < keep; t++) {
+                const int64_t ts = w_par * n_win + t;
+                const float * k_d = (const float *)((const char *)src_wk->data + iv3 * src_wk->nb[3] + ts * src_wk->nb[2] + ik1 * src_wk->nb[1]);
+                const float * v_d = (const float *)((const char *)src_wv->data + iv3 * src_wv->nb[3] + ts * src_wv->nb[2] + iv1 * src_wv->nb[1]);
+                const float * gb  = (const float *)((const char *)src_wgb->data + iv3 * src_wgb->nb[3] + ts * src_wgb->nb[2] + iv1 * src_wgb->nb[1]);
+                const float beta_val = gb[1];
+                ggml_vec_scale_f32(S_v * S_v, s_out, expf(gb[0]));
+                for (int64_t j = 0; j < S_v; ++j) {
+                    float sum = 0.0f;
+                    ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, k_d, 0, 1);
+                    delta[j] = (v_d[j] - sum) * beta_val;
+                }
+                for (int64_t j = 0; j < S_v; ++j) {
+                    ggml_vec_mad_f32(S_v, &s_out[j * S_v], k_d, delta[j]);
+                }
+            }
+            // s_out keeps the committed state (the output); the window runs on a copy
+            memcpy(state_work, s_out, S_v * S_v * sizeof(float));
+            s_out = state_work;
+        }
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
@@ -11359,6 +11397,18 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             }
 
             attn_data += S_v * H; // advance to next token
+
+            if (win) {
+                // this window's inputs, into the other half of the stores (k once per key head)
+                const int64_t ts = (1 - w_par) * n_win + t;
+                if (iv1 == ik1) {
+                    memcpy((char *) src_wk->data + iv3 * src_wk->nb[3] + ts * src_wk->nb[2] + ik1 * src_wk->nb[1], k_d, nek0 * sizeof(float));
+                }
+                memcpy((char *) src_wv->data + iv3 * src_wv->nb[3] + ts * src_wv->nb[2] + iv1 * src_wv->nb[1], v_d, S_v * sizeof(float));
+                float * gb = (float *) ((char *) src_wgb->data + iv3 * src_wgb->nb[3] + ts * src_wgb->nb[2] + iv1 * src_wgb->nb[1]);
+                gb[0] = g_d[0];
+                gb[1] = beta_val;
+            }
 
             if (K > 1) {
                 const int64_t target_slot = n_tokens - 1 - t;

@@ -1,3 +1,4 @@
+# Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 llama_add_compile_flags()
 
 # Optional args:
@@ -335,6 +336,7 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
 endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
+llama_build(test-gdn-replay.cpp LINK ggml) # k16-draft: ggml_gated_delta_net_replay vs the unfused replay path, bitwise
 
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")

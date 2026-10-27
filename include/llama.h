@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #ifndef LLAMA_H
 #define LLAMA_H
 
