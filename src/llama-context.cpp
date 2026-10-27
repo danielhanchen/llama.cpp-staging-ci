@@ -19,6 +19,12 @@
 #include "llama-sysmem.h"
 #include "llama-weight-store.h"
 #include "ggml-moe-prefetch.h"
+#include <cerrno>
+#include <mutex>
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -1005,6 +1011,61 @@ llama_context::llama_context(
         }
 
         ple.enabled = t && (ple_prefetcher || ple.verify);
+    }
+
+    // k15-fn (LLAMA_PLE_RESIDENT: unset = auto, 0 = off, 1 = always): the lazy per-layer embedding table (Qwen3.8-Flash-Next: 28.8 GB,
+    // read a few rows per token through the mapping) is faulted in whole and locked when the host has room for it beside every other
+    // host weight plus 8 GiB (Strata v0.2.7's PLE auto-RAM rule): the rows of a prompt then cost no page faults, and the page cache
+    // cannot evict them. The same bytes through the same mapping, so exact. Once per model; Linux only (mlock may be refused by
+    // RLIMIT_MEMLOCK, the populate still holds until memory pressure)
+    {
+        const ggml_tensor * t = model.per_layer_tok_embd;
+        static const int res_env = getenv("LLAMA_PLE_RESIDENT") ? atoi(getenv("LLAMA_PLE_RESIDENT")) : -1;
+        static std::mutex res_mtx;
+        static std::unordered_set<const ggml_tensor *> res_done;
+        if (res_env != 0 && t && model.can_prefetch.count(t) && t->data && t->buffer && ggml_backend_buffer_is_host(t->buffer) &&
+                cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+            std::lock_guard<std::mutex> lock(res_mtx);
+            if (res_done.insert(t).second) {
+                const size_t table = ggml_nbytes(t);
+                size_t host = 0;
+                for (const auto & [name, w] : model.tensors_by_name) {
+                    if (w != t && w->buffer != nullptr && ggml_backend_buffer_is_host(w->buffer)) {
+                        host += ggml_nbytes(w);
+                    }
+                }
+                const uint64_t avail = llama_sysmem::available();
+                const uint64_t need  = (uint64_t) table + host + (8ull << 30);
+#if defined(__linux__)
+                const bool admit = res_env == 1 || (avail > 0 && avail >= need);
+#else
+                const bool admit = false; // the populate and the lock are Linux only
+#endif
+                LLAMA_LOG_INFO("%s: PLE table '%s' (%.1f GiB) %s in RAM: %.1f GiB available, %.1f GiB needed (table + %.1f GiB other host weights + "
+                    "8 GiB; LLAMA_PLE_RESIDENT=0 off, =1 always)\n", __func__, t->name, table/1073741824.0, admit ? "made resident" : "left lazy",
+                    avail/1073741824.0, need/1073741824.0, host/1073741824.0);
+#if defined(__linux__)
+                if (admit) {
+                    const int64_t t0 = ggml_time_us();
+                    const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
+                    uint8_t * a0 = (uint8_t *) ((uintptr_t) t->data & ~(uintptr_t) (pg - 1));
+                    const size_t len = (size_t) ((uint8_t *) t->data + table - a0);
+                    int pr = madvise(a0, len, 22 /* MADV_POPULATE_READ, Linux 5.14 */);
+                    if (pr != 0) {
+                        // older kernels: touch one byte per page
+                        volatile uint8_t sink = 0;
+                        for (size_t o = 0; o < len; o += pg) {
+                            sink ^= a0[o];
+                        }
+                        (void) sink;
+                    }
+                    const int lr = mlock(a0, len);
+                    LLAMA_LOG_INFO("%s: PLE table resident in %.1f s (populate %s, mlock %s)\n", __func__, (ggml_time_us() - t0)/1e6,
+                        pr == 0 ? "ok" : "by touch", lr == 0 ? "ok" : strerror(errno));
+                }
+#endif
+            }
+        }
     }
 
     // Initialize the full vocabulary token ids for backend samplers.
