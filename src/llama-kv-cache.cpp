@@ -325,10 +325,16 @@ llama_kv_cache::llama_kv_cache(
                 if (alloc_fn != nullptr && commit_fn != nullptr && sz > 0) {
                     buf = alloc_fn(buft, sz);
                     if (buf != nullptr) {
+                        // as ggml_backend_alloc_ctx_tensors: the tensors first, then the views of them (the per-stream K / V views)
                         ggml_tallocr ta = ggml_tallocr_new(buf);
                         for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
-                            if (ggml_tallocr_alloc(&ta, t) != GGML_STATUS_SUCCESS) {
+                            if (t->data == nullptr && t->view_src == nullptr && ggml_tallocr_alloc(&ta, t) != GGML_STATUS_SUCCESS) {
                                 throw std::runtime_error("failed to place a tensor of the lazy kv cache buffer");
+                            }
+                        }
+                        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                            if (t->data == nullptr && t->view_src != nullptr && ggml_backend_view_init(t) != GGML_STATUS_SUCCESS) {
+                                throw std::runtime_error("failed to set a view of the lazy kv cache buffer");
                             }
                         }
                         lazy_bufs.push_back(buf);
