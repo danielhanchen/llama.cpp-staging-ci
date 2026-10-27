@@ -4941,8 +4941,17 @@ struct llama_moe_cache::impl {
         if (model.hparams.no_alloc) {
             return;
         }
+        // LLAMA_MTP_EXACT=1 promises greedy text byte equal to decoding without a draft: a skip depends on which experts are missing
+        // (the cache size, the staging depth, a draft model's share of the memory) and on the window (a verify window skips only what
+        // all of its tokens rank low), so the default is off there (LLAMA_MOE_ROUTE_TAIL_SKIP_EXACT=1 or LLAMA_MOE_ROUTE_TAIL_SKIP=N
+        // keep it on)
+        const char * e_exact = getenv("LLAMA_MOE_ROUTE_TAIL_SKIP_EXACT");
+        const bool exact_off = llama_exact_verify_enabled() && !(e_exact != nullptr && atoi(e_exact) != 0);
         if (rank >= (int32_t) n_expert_used) {
             LLAMA_LOG_INFO("%s: route tail skip off: %u routed experts per token (rank %d)\n", __func__, n_expert_used, rank);
+        } else if (exact_off) {
+            LLAMA_LOG_INFO("%s: route tail skip off by default with LLAMA_MTP_EXACT=1 (the skips depend on the cache contents and the "
+                "window; LLAMA_MOE_ROUTE_TAIL_SKIP_EXACT=1 or LLAMA_MOE_ROUTE_TAIL_SKIP=%d turns it on)\n", __func__, rank);
         } else if (nvfp4) {
             LLAMA_LOG_INFO("%s: route tail skip off by default with NVFP4 experts (LLAMA_MOE_ROUTE_TAIL_SKIP=%d turns it on)\n", __func__, rank);
         } else if (frac >= max_frac) {
