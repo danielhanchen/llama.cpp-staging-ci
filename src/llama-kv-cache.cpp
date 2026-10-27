@@ -6,6 +6,8 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include "ggml-alloc.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
@@ -311,7 +313,32 @@ llama_kv_cache::llama_kv_cache(
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
         } else {
-            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+            buf = nullptr;
+            // k17-small: LLAMA_KV_LAZY=1 reserves a device buffer's address range and backs only the cells in use (see lazy_ensure)
+            static const bool kv_lazy = getenv("LLAMA_KV_LAZY") != nullptr && atoi(getenv("LLAMA_KV_LAZY")) != 0;
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (kv_lazy && n_stream == 1 && !v_trans && dev != nullptr && !ggml_backend_buft_is_host(buft)) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                auto alloc_fn  = reg ? (ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_alloc_lazy") : nullptr;
+                auto commit_fn = reg ? (bool (*)(ggml_backend_buffer_t, size_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_commit") : nullptr;
+                const size_t sz = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+                if (alloc_fn != nullptr && commit_fn != nullptr && sz > 0) {
+                    buf = alloc_fn(buft, sz);
+                    if (buf != nullptr) {
+                        ggml_tallocr ta = ggml_tallocr_new(buf);
+                        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                            if (ggml_tallocr_alloc(&ta, t) != GGML_STATUS_SUCCESS) {
+                                throw std::runtime_error("failed to place a tensor of the lazy kv cache buffer");
+                            }
+                        }
+                        lazy_bufs.push_back(buf);
+                        lazy_commit_fn = commit_fn;
+                    }
+                }
+            }
+            if (buf == nullptr) {
+                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+            }
         }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");
@@ -321,6 +348,14 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+    if (!lazy_bufs.empty()) {
+        const char * e_init = getenv("LLAMA_KV_LAZY_INIT");
+        const uint32_t n0 = std::min<uint32_t>(kv_size, e_init != nullptr ? (uint32_t) std::max(256, atoi(e_init)) : 4096);
+        if (!lazy_ensure(n0)) {
+            throw std::runtime_error("failed to back the first cells of the lazy kv cache");
+        }
+        LLAMA_LOG_INFO("%s: lazy KV: %u of %u cells backed (LLAMA_KV_LAZY=0 backs them all at load)\n", __func__, lazy_cells, kv_size);
     }
 
     {
@@ -1162,10 +1197,46 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
+bool llama_kv_cache::lazy_ensure(uint32_t n_cells) {
+    if (lazy_bufs.empty() || n_cells <= lazy_cells) {
+        return true;
+    }
+    static const uint32_t step = getenv("LLAMA_KV_LAZY_STEP") != nullptr ? (uint32_t) std::max(256, atoi(getenv("LLAMA_KV_LAZY_STEP"))) : 1024;
+    const uint32_t kv_size = v_cells.empty() ? 0 : v_cells[0].size();
+    const uint32_t n = std::min(kv_size, ((n_cells + step - 1)/step)*step);
+    for (const auto & layer : layers) {
+        for (ggml_tensor * t : { layer.k, layer.v }) {
+            if (t == nullptr || std::find(lazy_bufs.begin(), lazy_bufs.end(), t->buffer) == lazy_bufs.end()) {
+                continue;
+            }
+            const size_t off = (const char *) t->data - (const char *) ggml_backend_buffer_get_base(t->buffer);
+            if (!lazy_commit_fn(t->buffer, off, (size_t) n*t->nb[1])) {
+                LLAMA_LOG_ERROR("%s: no device memory to back KV cells [%u, %u)\n", __func__, lazy_cells, n);
+                return false;
+            }
+        }
+    }
+    lazy_cells = n;
+    return true;
+}
+
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, std::vector<purge_backup> * purged) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
+    }
+    if (!lazy_bufs.empty()) {
+        // the cells this ubatch writes, and every cell up to the padded n_kv the graph reads, must be backed
+        uint32_t mx = 0;
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+                mx = std::max<uint32_t>(mx, sinfo.idxs[s][ii] + 1);
+            }
+        }
+        mx = std::max<uint32_t>(mx, v_cells[0].used_max_p1());
+        if (!lazy_ensure(GGML_PAD(mx, 256))) {
+            GGML_ABORT("lazy KV: no device memory for the cells of this ubatch (LLAMA_KV_LAZY=0 backs them all at load)");
+        }
     }
 
     // keep track of the max sequence position that we would overwrite with this ubatch
@@ -3213,6 +3284,17 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             }
             runs.push_back({idxs[i0], idxs[i1 - 1] + 1});
             i0 = i1;
+        }
+    }
+
+    if (!lazy_bufs.empty() && !runs.empty()) {
+        uint32_t mx = 0;
+        for (const auto & r : runs) {
+            mx = std::max(mx, r.to);
+        }
+        if (!lazy_ensure(GGML_PAD(mx, 256))) {
+            LLAMA_LOG_ERROR("%s: lazy KV: no device memory for the %u cells of the state\n", __func__, mx);
+            return false;
         }
     }
 

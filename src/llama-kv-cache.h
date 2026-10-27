@@ -354,6 +354,18 @@ private:
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
+    // k17-small (LLAMA_KV_LAZY=1, opt-in): device KV buffers whose address range is reserved whole and backed with memory as the cells
+    // in use grow (ggml_backend_buffer_commit of the CUDA backend), so a long context costs only the rows it has reached. One stream,
+    // non-transposed V (flash attention) only: each layer's K and V rows of cells [0, n) are then one prefix of the tensor
+    std::vector<ggml_backend_buffer_t> lazy_bufs;
+    bool (*lazy_commit_fn)(ggml_backend_buffer_t, size_t, size_t) = nullptr;
+    uint32_t lazy_cells = 0;   // cells [0, lazy_cells) of every layer are backed
+public:
+    // back the rows of cells [0, n_cells) (rounded up to the step); false if the device has no memory for them
+    bool lazy_ensure(uint32_t n_cells);
+    bool lazy_on() const { return !lazy_bufs.empty(); }
+private:
+
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
