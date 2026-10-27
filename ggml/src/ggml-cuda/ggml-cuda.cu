@@ -5776,6 +5776,134 @@ static int ggml_cuda_qsa_pool_match(const ggml_cgraph * cgraph, int i, ggml_cuda
     return j;
 }
 
+// k15-fn (GGML_CUDA_DISABLE_QSA_KEY_PACK_FUSION=1 off): a QSA layer's packed indexer key row (qwen4exp build_qsa_sel: FILL of the
+// pooled half -> CONCAT (dim 0) of the raw key and it -> views -> SET_ROWS into the cache) as one kernel at the FILL that writes the
+// raw key and the fill value with set_rows' conversion (the concat only copies floats). Returns the SET_ROWS index, -1: no match
+struct ggml_cuda_qsa_key_pack {
+    const ggml_tensor * fill     = nullptr;
+    const ggml_tensor * concat   = nullptr;
+    const ggml_tensor * set_rows = nullptr;
+};
+
+static int ggml_cuda_qsa_key_pack_match(const ggml_cgraph * cgraph, int i, ggml_cuda_qsa_key_pack & m, bool runtime) {
+    m = {};
+    const ggml_tensor * f = cgraph->nodes[i];
+    if (f->op != GGML_OP_FILL || f->type != GGML_TYPE_F32 || !ggml_is_contiguous(f) || f->ne[2] != 1 || f->ne[3] != 1) {
+        return -1;
+    }
+    auto next = [&](int j) {
+        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            j++;
+        }
+        return j;
+    };
+    int j = next(i + 1);
+    if (j >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor * cat = cgraph->nodes[j];
+    const ggml_tensor * kr  = cat->src[0];
+    const int64_t nt = f->ne[1];
+    if (cat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat, 0) != 0 || cat->type != GGML_TYPE_F32 || cat->src[1] != f || kr == nullptr ||
+        kr->type != GGML_TYPE_F32 || kr->nb[0] != sizeof(float) || kr->ne[1] != nt || kr->ne[2] != 1 || kr->ne[3] != 1 ||
+        kr->nb[1] % sizeof(float) != 0 || cat->ne[0] != kr->ne[0] + f->ne[0] || cat->ne[1] != nt) {
+        return -1;
+    }
+    j = next(j + 1);
+    if (j >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor * sr = cgraph->nodes[j];
+    const ggml_tensor * sv = sr->src[0];
+    const ggml_tensor * ix = sr->src[1];
+    if (sr->op != GGML_OP_SET_ROWS || (sr->type != GGML_TYPE_F16 && sr->type != GGML_TYPE_F32) || sr->nb[0] != ggml_type_size(sr->type) ||
+        sv == nullptr || sv->view_src != cat || sv->view_offs != 0 || !ggml_is_contiguous(sv) || sv->ne[0] != cat->ne[0] || sv->ne[1] != nt ||
+        sv->ne[2] != 1 || sv->ne[3] != 1 || ix == nullptr || (ix->type != GGML_TYPE_I64 && ix->type != GGML_TYPE_I32) ||
+        ggml_nelements(ix) != nt || ix->ne[0] != nt || sr->ne[0] != cat->ne[0] || sr->ne[2] != 1 || sr->ne[3] != 1) {
+        return -1;
+    }
+    if (runtime) {
+        if ((f->flags & GGML_TENSOR_FLAG_OUTPUT) || (cat->flags & GGML_TENSOR_FLAG_OUTPUT) || kr->data == nullptr || sr->data == nullptr ||
+            ix->data == nullptr || ggml_cuda_ranges_overlap(kr, sr)) {
+            return -1;
+        }
+        for (int k = i + 1; k < cgraph->n_nodes; ++k) {
+            const ggml_tensor * n = cgraph->nodes[k];
+            if (n == cat || n == sr || ggml_cuda_is_view_or_noop(n)) {
+                continue;
+            }
+            for (int q = 0; q < GGML_MAX_SRC; ++q) {
+                const ggml_tensor * t = n->src[q];
+                if (t == nullptr) {
+                    continue;
+                }
+                const ggml_tensor * root = t->view_src != nullptr ? t->view_src : t;
+                if (root == f || root == cat) {
+                    return -1;
+                }
+            }
+        }
+    }
+    m.fill     = f;
+    m.concat   = cat;
+    m.set_rows = sr;
+    return j;
+}
+
+template <typename dst_t, typename idx_t>
+static __global__ void k_qsa_key_pack(const float * kr, const int64_t kr_s1, const int n0, const int n, const float c, const idx_t * idx,
+                                      const int64_t idx_s0, char * dst, const int64_t dst_nb1) {
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    const int t = blockIdx.x;
+    const int64_t row = (int64_t) idx[(int64_t) t*idx_s0];
+    dst_t * d = (dst_t *) (dst + row*dst_nb1);
+    const float * k = kr + (int64_t) t*kr_s1;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        d[j] = ggml_cuda_cast<dst_t>(j < n0 ? k[j] : c);
+    }
+}
+
+static int ggml_cuda_try_fuse_qsa_key_pack(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_QSA_KEY_PACK_FUSION");
+    if (disabled || ggml_cuda_fusion_disabled() || cuda_ctx->curr_stream_no != 0) {
+        return 0;
+    }
+    ggml_cuda_qsa_key_pack m;
+    const int j = ggml_cuda_qsa_key_pack_match(cgraph, i, m, /*runtime=*/true);
+    if (j < 0) {
+        return 0;
+    }
+    const ggml_tensor * kr = m.concat->src[0];
+    const ggml_tensor * ix = m.set_rows->src[1];
+    float c;
+    memcpy(&c, m.fill->op_params, sizeof(float));
+    const int nt = (int) m.fill->ne[1];
+    const int n0 = (int) kr->ne[0];
+    const int n  = (int) m.concat->ne[0];
+    const int64_t kr_s1  = kr->nb[1] / sizeof(float);
+    const int64_t idx_s0 = ix->nb[0] / ggml_type_size(ix->type);
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(std::min(256, GGML_PAD(n, 32)), 1, 1), 0,
+                                                                             cuda_ctx->stream());
+    char * dst = (char *) m.set_rows->data;
+    const size_t nb1 = m.set_rows->nb[1];
+    const float * krd = (const float *) kr->data;
+    if (m.set_rows->type == GGML_TYPE_F16) {
+        if (ix->type == GGML_TYPE_I64) {
+            ggml_cuda_kernel_launch(k_qsa_key_pack<half, int64_t>, lp, krd, kr_s1, n0, n, c, (const int64_t *) ix->data, idx_s0, dst, (int64_t) nb1);
+        } else {
+            ggml_cuda_kernel_launch(k_qsa_key_pack<half, int32_t>, lp, krd, kr_s1, n0, n, c, (const int32_t *) ix->data, idx_s0, dst, (int64_t) nb1);
+        }
+    } else {
+        if (ix->type == GGML_TYPE_I64) {
+            ggml_cuda_kernel_launch(k_qsa_key_pack<float, int64_t>, lp, krd, kr_s1, n0, n, c, (const int64_t *) ix->data, idx_s0, dst, (int64_t) nb1);
+        } else {
+            ggml_cuda_kernel_launch(k_qsa_key_pack<float, int32_t>, lp, krd, kr_s1, n0, n, c, (const int32_t *) ix->data, idx_s0, dst, (int64_t) nb1);
+        }
+    }
+    return j - i + 1;
+}
+
 static int ggml_cuda_try_fuse_qsa_pool(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_QSA_POOL_FUSION");
     if (disabled || ggml_cuda_fusion_disabled() || cuda_ctx->curr_stream_no != 0) {
@@ -7985,6 +8113,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     ggml_cuda_conv_cat_materialize(cuda_ctx, node);
                 }
 
+                if (node->op == GGML_OP_FILL) {
+                    const int n_pack = ggml_cuda_try_fuse_qsa_key_pack(cuda_ctx, cgraph, i);
+                    if (n_pack > 0) {
+                        // a QSA layer's packed indexer key row, written into the cache (k_qsa_key_pack)
+                        ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, n_pack);
+                        i += n_pack - 1;
+                        continue;
+                    }
+                }
+
                 if (node->op == GGML_OP_GET_ROWS) {
                     const int n_pool = ggml_cuda_try_fuse_qsa_pool(cuda_ctx, cgraph, i);
                     if (n_pool > 0) {
@@ -8545,6 +8683,17 @@ static const ggml_tensor * ggml_cuda_fused_match(const ggml_cgraph * cgraph, int
             if (m.rope->src[2] != nullptr) {
                 inputs.push_back(m.rope->src[2]);
             }
+            return m.set_rows;
+        }
+    }
+
+    // QSA packed indexer key row in one kernel at its FILL (ggml_cuda_try_fuse_qsa_key_pack, k15-fn): the raw key and the rows stay
+    // allocated until the scatter is. GGML_CUDA_QSA_KEY_PACK_ALIAS=1
+    static const bool pack_alias = ggml_cuda_env_flag("GGML_CUDA_QSA_KEY_PACK_ALIAS");
+    if (!pack_alias && n0->op == GGML_OP_FILL) {
+        ggml_cuda_qsa_key_pack m;
+        if (ggml_cuda_qsa_key_pack_match(cgraph, i, m, /*runtime=*/false) >= 0) {
+            inputs = { m.concat->src[0], m.set_rows->src[1] };
             return m.set_rows;
         }
     }
