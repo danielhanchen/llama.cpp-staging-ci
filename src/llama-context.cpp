@@ -5382,7 +5382,50 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     // every host expert per 512 tokens). The group does not seed the cache. LLAMA_MOE_LM_RELEASE=0 off
     static const bool lm_release_env = getenv("LLAMA_MOE_LM_RELEASE") == nullptr || atoi(getenv("LLAMA_MOE_LM_RELEASE")) != 0;
     bool lm_released = false;
-    if (lm_release_env && group.size() >= 2 && lm_tiny_cache(moe_cache->cache_frac())) {
+    // k17-small: the release also where the cache is above LLAMA_MOE_LM_RELEASE_FRAC but the group's merged graph does not allocate in
+    // the free memory (it would be split): q3m 4 GB without MTP holds 5.1% of the host experts at ctx 16384 (699 MiB) and 4.5% at 20480;
+    // at 5.1% the 16-ubatch group of an 8k prompt was split in halves down to single ubatches (T4 8k prompt 440 vs 830 tok/s, G4 2063 vs
+    // 8076). One trial allocation of the merged graph against the growth limit, without lending, before the seed is set up; if it does not
+    // fit, the banks are released as for a tiny cache (no seed, refilled after the group). Only below LLAMA_MOE_LM_RELEASE_SPLIT_FRAC (0.10)
+    // of the host experts cached (the hybrid gate's small-device range). LLAMA_MOE_LM_RELEASE_SPLIT=0: only the fixed share, as before
+    static const bool   lm_rel_split      = getenv("LLAMA_MOE_LM_RELEASE_SPLIT") == nullptr || atoi(getenv("LLAMA_MOE_LM_RELEASE_SPLIT")) != 0;
+    static const double lm_rel_split_frac = getenv("LLAMA_MOE_LM_RELEASE_SPLIT_FRAC") ? std::max(0.0, atof(getenv("LLAMA_MOE_LM_RELEASE_SPLIT_FRAC"))) : 0.10;
+    static const size_t lm_rel_grow_max   = (size_t) (getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB"))) : 1024) << 20;
+    const double lm_cf   = moe_cache->cache_frac();
+    bool         lm_tiny = lm_tiny_cache(lm_cf);
+    if (lm_release_env && lm_rel_split && !lm_tiny && gm != nullptr && group.size() >= 2 && lm_cf >= 0.0 && lm_cf < lm_rel_split_frac) {
+        std::vector<std::pair<ggml_tensor *, std::array<ggml_tensor *, GGML_MAX_SRC>>> srcs0;
+        srcs0.reserve(ggml_graph_n_nodes(gm));
+        for (int i = 0; i < ggml_graph_n_nodes(gm); ++i) {
+            ggml_tensor * node = ggml_graph_node(gm, i);
+            std::array<ggml_tensor *, GGML_MAX_SRC> arr;
+            std::copy(node->src, node->src + GGML_MAX_SRC, arr.begin());
+            srcs0.emplace_back(node, arr);
+        }
+        ggml_backend_sched_reset(sched.get());
+        ggml_backend_sched_use_full_hash(sched.get());
+        ggml_backend_sched_set_alloc_limit(sched.get(), true, lm_rel_grow_max);
+        moe_cache->set_graph(gm);
+        const bool   ok   = ggml_backend_sched_alloc_graph(sched.get(), gm);
+        const size_t over = ggml_backend_sched_get_alloc_over(sched.get());
+        ggml_backend_sched_set_alloc_limit(sched.get(), false, 0);
+        for (auto & [node, arr] : srcs0) {
+            std::copy(arr.begin(), arr.end(), node->src);
+        }
+        ggml_backend_sched_reset(sched.get());
+        ggml_backend_sched_use_full_hash(sched.get());
+        moe_cache->set_graph(nullptr);
+        if (!ok && over > 0) {
+            static int n_log = 0;
+            if (n_log++ < 4) {
+                LLAMA_LOG_INFO("%s: the merged graph of %zu ubatches would grow the compute buffers by %.2f MiB more than the free memory allows, "
+                    "%.1f%% of the host experts cached: the cache banks are released for it (LLAMA_MOE_LM_RELEASE_SPLIT=0 splits instead)\n",
+                    __func__, group.size(), over/1048576.0, 100.0*lm_cf);
+            }
+            lm_tiny = true;
+        }
+    }
+    if (lm_release_env && group.size() >= 2 && lm_tiny) {
         ggml_backend_sched_synchronize(sched.get());
         lm_released = moe_cache->release();
     }
