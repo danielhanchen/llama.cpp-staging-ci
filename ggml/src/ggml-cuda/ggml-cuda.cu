@@ -3307,6 +3307,10 @@ static bool ggml_cuda_graph_drop_failed_instance(ggml_cuda_graph * graph, cudaEr
         CUDA_CHECK(inst);
     }
     (void)cudaGetLastError();
+    // a sticky error (an earlier kernel fault) would fail everything after it: the device must still synchronize cleanly, else abort
+    // as before (only a non-sticky error, e.g. a bad captured graph after a stall, is recovered from)
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaGetLastError());
     if (graph->instance != nullptr) {
         (void)cudaGraphExecDestroy(graph->instance);
         (void)cudaGetLastError();
