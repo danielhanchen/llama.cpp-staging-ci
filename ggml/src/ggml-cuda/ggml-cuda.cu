@@ -5584,6 +5584,10 @@ static void ggml_cuda_conv_cat_materialize(ggml_backend_cuda_context * cuda_ctx,
         auto ic = cuda_ctx->unary_cont_elided.find(root);
         if (ic != cuda_ctx->unary_cont_elided.end()) {
             cuda_ctx->unary_cont_elided.erase(ic);
+            static int n_warn = 0;
+            if (n_warn++ < 4) {
+                GGML_LOG_WARN("%s: elided CONT %s read by %s (%s): it runs (not expected)\n", __func__, root->name, node->name, ggml_op_desc(node));
+            }
             ggml_cuda_dup(*cuda_ctx, const_cast<ggml_tensor *>(root));
         }
     }
@@ -8207,6 +8211,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 2);
                         i += 1;
                         continue;
+                    }
+                    static int n_warn = 0;
+                    if (n_warn++ < 4) {
+                        GGML_LOG_WARN("%s: elided CONT %s: %s is not fused with the next node (%s): the CONT runs (not expected)\n", __func__, c->name,
+                            node->name, i + 1 < cgraph->n_nodes ? ggml_op_desc(cgraph->nodes[i + 1]) : "none");
                     }
                     ggml_cuda_dup(*cuda_ctx, const_cast<ggml_tensor *>(c));
                 }
