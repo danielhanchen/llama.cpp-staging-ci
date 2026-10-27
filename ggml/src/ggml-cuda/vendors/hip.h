@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #pragma once
 
 #define HIP_DISABLE_WARP_SYNC_BUILTINS 1
@@ -58,6 +59,7 @@
 #define cudaDeviceSynchronize hipDeviceSynchronize
 #define cudaError_t hipError_t
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory
+#define cudaErrorInvalidValue hipErrorInvalidValue
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
 #define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled
 #define cudaEventCreate hipEventCreate
