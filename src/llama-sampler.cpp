@@ -1,10 +1,13 @@
 #include "llama-sampler.h"
+#include "llama-ext.h"
 
 #include "llama-impl.h"
 #include "llama-vocab.h"
 #include "llama-grammar.h"
 
 #include "ggml-cpp.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
 
 #include <array>
 #include <algorithm>
@@ -133,8 +136,10 @@ struct ring_buffer {
 
 // writes result in res, does not mutate cur
 static void llama_token_data_array_partial_sort(const llama_token_data_array & cur, int npartial, std::vector<llama_token_data> & res) {
+    // k15-fn: equal logits in id order (a total order), so a row and any subset of it holding its top npartial give the same sorted
+    // top npartial (the device top-k candidates of common_sampler_device_topk)
     static const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
-        return a.logit > b.logit;
+        return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
     };
 
     constexpr int   nbuckets     = 128;
@@ -191,8 +196,10 @@ static void llama_token_data_array_partial_sort(const llama_token_data_array & c
 
 // reduces the size of cur_p to npartial, keeping only the top npartial elements
 static void llama_token_data_array_partial_sort_inplace(llama_token_data_array * cur_p, int npartial) {
+    // k15-fn: equal logits in id order (a total order), so a row and any subset of it holding its top npartial give the same sorted
+    // top npartial (the device top-k candidates of common_sampler_device_topk)
     static const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
-        return a.logit > b.logit;
+        return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
     };
 
     if (npartial <= 128) {
@@ -568,6 +575,11 @@ private:
     bool is_init;
     bool support;
 };
+
+// k15-fn: whether a sampler (or a member of a chain) keeps graph-input tensors of the graph built last (dist: its uniforms, penalties: the
+// token counts, logit_bias: the biases): a kept graph built before must not be reused (llm_graph_input_sampling::can_reuse), else it
+// runs with the other graph's inputs set and its own uninitialized. greedy_masked keeps its mask in its own buffer instead
+static bool llama_sampler_graph_bound_one(const struct llama_sampler * smpl);
 
 // .copy_state for samplers deriving from llama_sampler_backend
 template<typename T>
@@ -1006,6 +1018,10 @@ struct llama_sampler * llama_sampler_chain_remove(struct llama_sampler * chain, 
     return result;
 }
 
+bool llama_sampler_chain_is_init(const llama_sampler * sampler) {
+    return sampler != nullptr && sampler->iface == &llama_sampler_chain_i && ((const llama_sampler_chain *) sampler->ctx)->is_init;
+}
+
 int32_t llama_sampler_chain_n(const struct llama_sampler * chain) {
     const auto * p = (const llama_sampler_chain *) chain->ctx;
 
@@ -1093,6 +1109,14 @@ static void llama_sampler_greedy_backend_apply(
     }
 
     data->sampled = curl;
+
+    // k15-fn: greedy over the raw logits of the row (nothing before it in the chain made candidates or probabilities): the token is the
+    // whole result, the row's logits are not an output (they were copied to the host for every sampled row, 0.95 MiB each with a
+    // 248320-token vocab). LLAMA_SAMPLER_GREEDY_KEEP_LOGITS=1 keeps them
+    static const bool keep = getenv("LLAMA_SAMPLER_GREEDY_KEEP_LOGITS") != nullptr && atoi(getenv("LLAMA_SAMPLER_GREEDY_KEEP_LOGITS")) != 0;
+    if (!keep && data->candidates == nullptr && data->probs == nullptr) {
+        data->logits = nullptr;
+    }
 }
 
 static struct llama_sampler_i llama_sampler_greedy_i = {
@@ -1116,6 +1140,182 @@ struct llama_sampler * llama_sampler_init_greedy() {
         /* .ctx   = */ new llama_sampler_greedy {
             ("greedy"),
         }
+    );
+}
+
+// k15-fn: greedy_masked - greedy with a fixed token set excluded (the -inf logit bias of an ignore_eos request), so a device greedy chain
+// serves those requests too: on the backend the masked tokens of the row are set to -inf and the argmax (lowest id on a tie)
+// is the token, the same token as the host greedy over the biased logits
+
+struct llama_sampler_greedy_masked : public llama_sampler_backend {
+    llama_sampler_greedy_masked(std::vector<llama_token> mask) : llama_sampler_backend("greedy_masked"), mask(std::move(mask)) {}
+
+    const std::vector<llama_token> mask;
+
+    struct ggml_tensor * inp_vals = nullptr;
+    struct ggml_tensor * inp_idxs = nullptr;
+
+    // k15-fn (LLAMA_SAMPLER_MASK_PERSIST=0 off): the mask as tensors of the sampler's own buffer, written once at backend_init. As graph
+    // inputs they were bound to the graph built last, so a kept graph reused later (the small-graph cache keeps one per ubatch size, e.g.
+    // a 2-row n-gram verify next to the 1-row decode) set the other graph's inputs and ran its set_rows with uninitialized indices:
+    // gpt-oss-20b ignore_eos greedy, intermittent illegal memory access (5 of 23 launches)
+    ggml_context_ptr        mask_ctx;
+    ggml_backend_buffer_ptr mask_buf;
+    struct ggml_tensor *    mask_vals = nullptr;
+    struct ggml_tensor *    mask_idxs = nullptr;
+};
+
+static const char * llama_sampler_greedy_masked_name(const struct llama_sampler * smpl) {
+    return ((llama_sampler_greedy_masked *) smpl->ctx)->get_name();
+}
+
+static void llama_sampler_greedy_masked_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    const auto * sctx = (const llama_sampler_greedy_masked *) smpl->ctx;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        if (std::binary_search(sctx->mask.begin(), sctx->mask.end(), cur_p->data[i].id)) {
+            cur_p->data[i].logit = -INFINITY;
+        }
+    }
+    llama_sampler_greedy_apply(smpl, cur_p);
+}
+
+static struct llama_sampler * llama_sampler_greedy_masked_clone(const struct llama_sampler * smpl) {
+    const auto * sctx = (const llama_sampler_greedy_masked *) smpl->ctx;
+    return llama_sampler_init_greedy_masked((int32_t) sctx->mask.size(), sctx->mask.data());
+}
+
+static void llama_sampler_greedy_masked_free(struct llama_sampler * smpl) {
+    delete (llama_sampler_greedy_masked *) smpl->ctx;
+}
+
+static bool llama_sampler_greedy_masked_backend_init(
+        struct llama_sampler       * smpl,
+        ggml_backend_buffer_type_t   buft,
+        uint32_t                     n_outputs_max_per_seq) {
+    auto * sctx = (llama_sampler_greedy_masked *) smpl->ctx;
+    GGML_UNUSED(n_outputs_max_per_seq);
+
+    bool res = llama_sampler_backend_support(smpl, buft);
+
+    static const bool persist = getenv("LLAMA_SAMPLER_MASK_PERSIST") == nullptr || atoi(getenv("LLAMA_SAMPLER_MASK_PERSIST")) != 0;
+    if (res && persist && !sctx->mask.empty()) {
+        ggml_init_params params = {
+            /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        sctx->mask_ctx.reset(ggml_init(params));
+        if (sctx->mask_ctx) {
+            sctx->mask_vals = ggml_new_tensor_2d(sctx->mask_ctx.get(), GGML_TYPE_F32, 1, (int64_t) sctx->mask.size());
+            sctx->mask_idxs = ggml_new_tensor_1d(sctx->mask_ctx.get(), GGML_TYPE_I32, (int64_t) sctx->mask.size());
+            ggml_set_name(sctx->mask_vals, "greedy_mask_vals_persist");
+            ggml_set_name(sctx->mask_idxs, "greedy_mask_idxs_persist");
+            sctx->mask_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(sctx->mask_ctx.get(), buft));
+        }
+        if (sctx->mask_buf) {
+            const std::vector<float> vals(sctx->mask.size(), -INFINITY);
+            ggml_backend_tensor_set(sctx->mask_vals, vals.data(), 0, ggml_nbytes(sctx->mask_vals));
+            ggml_backend_tensor_set(sctx->mask_idxs, sctx->mask.data(), 0, ggml_nbytes(sctx->mask_idxs));
+        } else {
+            // no buffer: the graph inputs as before
+            sctx->mask_vals = nullptr;
+            sctx->mask_idxs = nullptr;
+            sctx->mask_ctx.reset();
+        }
+    }
+
+    sctx->init(res);
+
+    return res;
+}
+
+static void llama_sampler_greedy_masked_backend_apply(
+        struct llama_sampler      * smpl,
+        struct ggml_context       * ctx,
+        struct ggml_cgraph        * gf,
+        struct llama_sampler_data * data) {
+    GGML_UNUSED(gf);
+    auto * sctx = (llama_sampler_greedy_masked *) smpl->ctx;
+
+    const int64_t n = ggml_nelements(data->logits);
+    struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, n);
+
+    if (!sctx->mask.empty() && sctx->mask_vals != nullptr) {
+        // the persistent mask: the same tensors in every graph, nothing to set per graph
+        struct ggml_tensor * row = ggml_reshape_2d(ctx, logits, 1, n);
+        row    = ggml_set_rows(ctx, row, sctx->mask_vals, sctx->mask_idxs);
+        logits = ggml_reshape_1d(ctx, row, n);
+    } else if (!sctx->mask.empty()) {
+        if (sctx->inp_vals == nullptr) {
+            sctx->inp_vals = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, (int64_t) sctx->mask.size());
+            ggml_set_name(sctx->inp_vals, "greedy_mask_vals");
+            ggml_set_input(sctx->inp_vals);
+
+            sctx->inp_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) sctx->mask.size());
+            ggml_set_name(sctx->inp_idxs, "greedy_mask_idxs");
+            ggml_set_input(sctx->inp_idxs);
+        }
+        // in place: the row is the padded copy of the logits that build_sampling makes for the samplers (the raw logits are not
+        // touched), and only the chain of its own output row reads it (the chains without a row are not computed)
+        struct ggml_tensor * row = ggml_reshape_2d(ctx, logits, 1, n);
+        row    = ggml_set_rows(ctx, row, sctx->inp_vals, sctx->inp_idxs);
+        logits = ggml_reshape_1d(ctx, row, n);
+    }
+
+    struct ggml_tensor * curl = ggml_argmax(ctx, logits);
+    ggml_set_name(curl, "greedy_masked_argmax");
+
+    if (data->candidates != nullptr) {
+        struct ggml_tensor * candidates = ggml_reshape_2d(ctx, data->candidates, 1, ggml_nelements(data->candidates));
+        curl = ggml_get_rows(ctx, candidates, curl);
+    }
+
+    data->sampled = curl;
+    if (data->candidates == nullptr && data->probs == nullptr) {
+        data->logits = nullptr;
+    }
+}
+
+static void llama_sampler_greedy_masked_backend_set_input(struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_greedy_masked *) smpl->ctx;
+    if (sctx->mask.empty() || sctx->mask_vals != nullptr) {
+        return;
+    }
+    GGML_ASSERT(sctx->inp_vals != nullptr && sctx->inp_idxs != nullptr);
+
+    const std::vector<float> vals(sctx->mask.size(), -INFINITY);
+    ggml_backend_tensor_set(sctx->inp_vals, vals.data(), 0, ggml_nbytes(sctx->inp_vals));
+    ggml_backend_tensor_set(sctx->inp_idxs, sctx->mask.data(), 0, ggml_nbytes(sctx->inp_idxs));
+}
+
+static void llama_sampler_greedy_masked_backend_reset(struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_greedy_masked *) smpl->ctx;
+    sctx->inp_vals = nullptr;
+    sctx->inp_idxs = nullptr;
+}
+
+static struct llama_sampler_i llama_sampler_greedy_masked_i = {
+    /* .name              = */ llama_sampler_greedy_masked_name,
+    /* .accept            = */ nullptr,
+    /* .apply             = */ llama_sampler_greedy_masked_apply,
+    /* .reset             = */ nullptr,
+    /* .clone             = */ llama_sampler_greedy_masked_clone,
+    /* .free              = */ llama_sampler_greedy_masked_free,
+    /* .backend_init      = */ llama_sampler_greedy_masked_backend_init,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ llama_sampler_greedy_masked_backend_apply,
+    /* .backend_set_input = */ llama_sampler_greedy_masked_backend_set_input,
+    /* .backend_reset     = */ llama_sampler_greedy_masked_backend_reset,
+    /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_greedy_masked>,
+};
+
+struct llama_sampler * llama_sampler_init_greedy_masked(int32_t n_tokens, const llama_token * tokens) {
+    std::vector<llama_token> mask(tokens, tokens + std::max(0, n_tokens));
+    std::sort(mask.begin(), mask.end());
+    mask.erase(std::unique(mask.begin(), mask.end()), mask.end());
+    return llama_sampler_init(
+        /* .iface = */ &llama_sampler_greedy_masked_i,
+        /* .ctx   = */ new llama_sampler_greedy_masked(std::move(mask))
     );
 }
 
@@ -4415,4 +4615,26 @@ void llama_perf_sampler_reset(struct llama_sampler * chain) {
 
     ctx->t_sample_us = 0;
     ctx->n_sample    = 0;
+}
+
+// k15-fn: see llama_sampler_graph_bound_one
+static bool llama_sampler_graph_bound_one(const struct llama_sampler * smpl) {
+    return smpl != nullptr && (smpl->iface == &llama_sampler_dist_i || smpl->iface == &llama_sampler_penalties_i ||
+                              smpl->iface == &llama_sampler_logit_bias_i);
+}
+
+bool llama_sampler_graph_bound(const struct llama_sampler * smpl) {
+    if (smpl == nullptr) {
+        return false;
+    }
+    if (smpl->iface == &llama_sampler_chain_i) {
+        const auto * chain = (const struct llama_sampler_chain *) smpl->ctx;
+        for (const auto & e : chain->samplers) {
+            if (e.is_backend && llama_sampler_graph_bound_one(e.ptr)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return llama_sampler_graph_bound_one(smpl);
 }

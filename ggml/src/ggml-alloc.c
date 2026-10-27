@@ -510,10 +510,12 @@ struct ggml_gallocr {
     // memory lent by the user for a buffer (see ggml_gallocr_set_external)
     struct gallocr_external {
         ggml_backend_buffer_t buffer;
+        ggml_backend_buffer_t bufs[GGML_GALLOCR_MAX_EXTERNAL]; // k15-fn: the buffer of each region (ggml_gallocr_set_external_bufs)
         size_t offset[GGML_GALLOCR_MAX_EXTERNAL]; // regions of buffer, chunk c of the plan goes to region c
         size_t size  [GGML_GALLOCR_MAX_EXTERNAL];
         int    n;
         bool   used; // the current allocation is in it, the own buffer is not grown for it
+        bool   last_free; // k15-fn: the last region does not limit the plan (only checked against it), see ggml_gallocr_set_external_last_free
     } * ext; // [n_buffers]
     bool ext_changed; // the next allocation must be planned again
 };
@@ -898,6 +900,34 @@ static void ggml_gallocr_plan(ggml_gallocr_t galloc, struct ggml_cgraph * graph,
 }
 
 // the buffer type of buffer i is not shared with another buffer id (its allocator plans only its tensors)
+// k15-fn: an own buffer about to be freed may be a region of the external memory (ggml_gallocr_get_own_region): the external memory is dropped
+static void ggml_gallocr_ext_drop_vbuffer(ggml_gallocr_t galloc, const struct vbuffer * vb) {
+    if (vb == NULL || galloc->ext == NULL) {
+        return;
+    }
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        struct gallocr_external * e = &galloc->ext[i];
+        bool hit = false;
+        for (int c = 0; c < e->n && !hit; c++) {
+            for (int k = 0; k < GGML_VBUFFER_MAX_CHUNKS && vb->chunks[k] != NULL; k++) {
+                hit = hit || e->bufs[c] == vb->chunks[k];
+            }
+        }
+        if (hit) {
+            e->buffer = NULL;
+            e->n      = 0;
+            e->used   = false;
+            e->last_free = false;
+            for (int c = 0; c < GGML_GALLOCR_MAX_EXTERNAL; c++) {
+                e->bufs[c]   = NULL;
+                e->offset[c] = 0;
+                e->size[c]   = 0;
+            }
+            galloc->ext_changed = true;
+        }
+    }
+}
+
 static bool ggml_gallocr_ext_own_talloc(ggml_gallocr_t galloc, int i) {
     for (int j = 0; j < galloc->n_buffers; j++) {
         if (j != i && galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
@@ -929,7 +959,7 @@ static void ggml_gallocr_plan_ext(ggml_gallocr_t galloc, struct ggml_cgraph * gr
         struct gallocr_external * e = &galloc->ext[i];
         const bool lim = use_ext && e->buffer != NULL && e->n > 1 && ggml_gallocr_ext_own_talloc(galloc, i);
         galloc->buf_tallocs[i]->chunk_limits   = lim ? e->size : NULL;
-        galloc->buf_tallocs[i]->n_chunk_limits = lim ? e->n : 0;
+        galloc->buf_tallocs[i]->n_chunk_limits = lim ? (e->last_free ? e->n - 1 : e->n) : 0;
         limited |= lim;
     }
     ggml_gallocr_plan(galloc, graph, node_buffer_ids, leaf_buffer_ids);
@@ -1044,6 +1074,7 @@ static bool ggml_gallocr_reserve_n_impl(
                 }
             }
 #endif
+            ggml_gallocr_ext_drop_vbuffer(galloc, galloc->buffers[i]);
             ggml_vbuffer_free(galloc->buffers[i]);
             galloc->gen++;
             if (no_alloc) {
@@ -1076,6 +1107,35 @@ void ggml_gallocr_measure_n(
     }
 }
 
+void ggml_gallocr_measure_limited(
+        ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, int buffer_id, size_t limit0,
+        size_t * size0, size_t * rest) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    struct ggml_dyn_tallocr * t = galloc->buf_tallocs[buffer_id];
+    t->chunk_limits   = &limit0;
+    t->n_chunk_limits = 1;
+    ggml_gallocr_plan(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+    t->chunk_limits   = NULL;
+    t->n_chunk_limits = 0;
+    *size0 = t->n_chunks > 0 ? t->chunks[0]->max_size : 0;
+    *rest  = 0;
+    for (int c = 1; c < t->n_chunks; c++) {
+        *rest += t->chunks[c]->max_size;
+    }
+    if (t->n_chunks > 2) {
+        *rest = SIZE_MAX; // not two regions
+    }
+}
+
+void ggml_gallocr_set_external_last_free(ggml_gallocr_t galloc, int buffer_id, bool on) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    if (galloc->ext[buffer_id].last_free != on) {
+        galloc->ext[buffer_id].last_free = on;
+        galloc->ext_changed = true;
+        galloc->gen++;
+    }
+}
+
 void ggml_gallocr_free_buffer(ggml_gallocr_t galloc, int buffer_id) {
     GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
     struct vbuffer * buf = galloc->buffers[buffer_id];
@@ -1087,6 +1147,7 @@ void ggml_gallocr_free_buffer(ggml_gallocr_t galloc, int buffer_id) {
             galloc->buffers[i] = NULL;
         }
     }
+    ggml_gallocr_ext_drop_vbuffer(galloc, buf);
     ggml_vbuffer_free(buf);
     galloc->gen++;
     // the assignments point into the freed buffer: the next allocation plans again
@@ -1094,17 +1155,19 @@ void ggml_gallocr_free_buffer(ggml_gallocr_t galloc, int buffer_id) {
     galloc->n_leafs = 0;
 }
 
-void ggml_gallocr_set_external_n(ggml_gallocr_t galloc, int buffer_id, ggml_backend_buffer_t buffer, const size_t * offsets, const size_t * sizes, int n) {
+void ggml_gallocr_set_external_bufs(ggml_gallocr_t galloc, int buffer_id, const ggml_backend_buffer_t * bufs, const size_t * offsets, const size_t * sizes, int n) {
     GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
     GGML_ASSERT(n >= 0 && n <= GGML_GALLOCR_MAX_EXTERNAL);
     struct gallocr_external * e = &galloc->ext[buffer_id];
-    if (buffer == NULL || n == 0) {
-        buffer = NULL;
-        n      = 0;
+    for (int c = 0; c < n; c++) {
+        if (bufs == NULL || bufs[c] == NULL) {
+            n = 0;
+        }
     }
+    ggml_backend_buffer_t buffer = n > 0 ? bufs[0] : NULL;
     bool changed = e->buffer != buffer || e->n != n;
     for (int c = 0; c < n && !changed; c++) {
-        changed = e->offset[c] != offsets[c] || e->size[c] != sizes[c];
+        changed = e->bufs[c] != bufs[c] || e->offset[c] != offsets[c] || e->size[c] != sizes[c];
     }
     if (changed) {
         galloc->ext_changed = true;
@@ -1113,9 +1176,39 @@ void ggml_gallocr_set_external_n(ggml_gallocr_t galloc, int buffer_id, ggml_back
     e->buffer = buffer;
     e->n      = n;
     for (int c = 0; c < GGML_GALLOCR_MAX_EXTERNAL; c++) {
+        e->bufs  [c] = c < n ? bufs[c]    : NULL;
         e->offset[c] = c < n ? offsets[c] : 0;
         e->size  [c] = c < n ? sizes[c]   : 0;
     }
+}
+
+void ggml_gallocr_set_external_n(ggml_gallocr_t galloc, int buffer_id, ggml_backend_buffer_t buffer, const size_t * offsets, const size_t * sizes, int n) {
+    GGML_ASSERT(n >= 0 && n <= GGML_GALLOCR_MAX_EXTERNAL);
+    ggml_backend_buffer_t bufs[GGML_GALLOCR_MAX_EXTERNAL];
+    for (int c = 0; c < GGML_GALLOCR_MAX_EXTERNAL; c++) {
+        bufs[c] = buffer;
+    }
+    ggml_gallocr_set_external_bufs(galloc, buffer_id, bufs, offsets, sizes, buffer != NULL ? n : 0);
+    galloc->ext[buffer_id].last_free = false;
+}
+
+bool ggml_gallocr_get_own_region(ggml_gallocr_t galloc, int buffer_id, ggml_backend_buffer_t * buffer, size_t * size) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    *buffer = NULL;
+    *size   = 0;
+    struct vbuffer * vb = galloc->buffers[buffer_id];
+    if (vb == NULL || vb->chunks[0] == NULL || (GGML_VBUFFER_MAX_CHUNKS > 1 && vb->chunks[1] != NULL) ||
+            !ggml_gallocr_ext_own_talloc(galloc, buffer_id)) {
+        return false;
+    }
+    for (int j = 0; j < galloc->n_buffers; j++) {
+        if (j != buffer_id && galloc->buffers[j] == vb) {
+            return false;
+        }
+    }
+    *buffer = vb->chunks[0];
+    *size   = ggml_backend_buffer_get_size(vb->chunks[0]);
+    return true;
 }
 
 void ggml_gallocr_set_external(ggml_gallocr_t galloc, int buffer_id, ggml_backend_buffer_t buffer, size_t offset, size_t size) {
@@ -1162,10 +1255,11 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
                 // initialized as a compute tensor, like in the own buffer
                 const struct gallocr_external * e = &galloc->ext[buffer_id];
                 GGML_ASSERT(tensor_alloc->addr.chunk >= 0 && tensor_alloc->addr.chunk < e->n);
-                const enum ggml_backend_buffer_usage usage = ggml_backend_buffer_get_usage(e->buffer);
-                ggml_backend_buffer_set_usage(e->buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
-                ggml_backend_tensor_alloc(e->buffer, tensor, (char *) ggml_backend_buffer_get_base(e->buffer) + e->offset[tensor_alloc->addr.chunk] + tensor_alloc->addr.offset);
-                ggml_backend_buffer_set_usage(e->buffer, usage);
+                ggml_backend_buffer_t eb = e->bufs[tensor_alloc->addr.chunk];
+                const enum ggml_backend_buffer_usage usage = ggml_backend_buffer_get_usage(eb);
+                ggml_backend_buffer_set_usage(eb, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                ggml_backend_tensor_alloc(eb, tensor, (char *) ggml_backend_buffer_get_base(eb) + e->offset[tensor_alloc->addr.chunk] + tensor_alloc->addr.offset);
+                ggml_backend_buffer_set_usage(eb, usage);
             } else {
                 ggml_vbuffer_tensor_alloc(galloc->buffers[buffer_id], tensor, tensor_alloc->addr);
             }

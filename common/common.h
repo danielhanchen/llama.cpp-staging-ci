@@ -667,6 +667,8 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    bool cache_type_k_set  = false; // -ctk / LLAMA_ARG_CACHE_TYPE_K given (no automatic q8_0 K/V then, LLAMA_KV_AUTO_Q8)
+    bool cache_type_v_set  = false; // -ctv / LLAMA_ARG_CACHE_TYPE_V given
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     bool   moe_cache_auto = false; // --moe-cache-mib auto: --fit sizes the MoE cache (see common_moe_cache_auto_resolve)
@@ -1373,10 +1375,32 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 
 // a byte buffer whose resize() leaves new bytes uninitialized: a checkpoint is overwritten in full by the state save, and the
 // zero-fill of a fresh multi-MiB buffer (page faults included) otherwise ran on the main thread before the save was queued
+// k15-ttft: buffers of at least 4 MiB are 2 MiB aligned and marked MADV_HUGEPAGE (Linux), so a fresh state / checkpoint buffer faults
+// in 2 MiB pages instead of 4 KiB ones (a 77 MiB prompt-cache save: ~40 faults instead of ~20000). Same memory, same bytes.
+// Opt-in (LLAMA_STATE_THP=1): on G4 Flash-Next 32 GB (62 GB host RSS) the madvised allocations stalled in direct compaction
+// (multi-turn steps of 6.8 s and 10.8 s against 2.1 s and 0.95 s, regenerate 64 ms against 44 ms)
+bool   common_state_thp_on();
+void * common_state_thp_alloc(size_t bytes);
+void   common_state_thp_free(void * p);
+
 template <typename T>
 struct common_default_init_allocator : std::allocator<T> {
     using std::allocator<T>::allocator;
     template <typename U> struct rebind { using other = common_default_init_allocator<U>; };
+    static constexpr size_t thp_min = 4u << 20;
+    T * allocate(size_t n) {
+        if (n * sizeof(T) >= thp_min && common_state_thp_on()) {
+            return (T *) common_state_thp_alloc(n * sizeof(T));
+        }
+        return std::allocator<T>::allocate(n);
+    }
+    void deallocate(T * p, size_t n) noexcept {
+        if (n * sizeof(T) >= thp_min && common_state_thp_on()) {
+            common_state_thp_free(p);
+            return;
+        }
+        std::allocator<T>::deallocate(p, n);
+    }
     template <typename U> void construct(U * p) noexcept(std::is_nothrow_default_constructible<U>::value) { ::new ((void *) p) U; }
     template <typename U, typename... Args> void construct(U * p, Args &&... args) { ::new ((void *) p) U(std::forward<Args>(args)...); }
 };
@@ -1389,6 +1413,7 @@ using common_state_buf = std::vector<uint8_t, common_default_init_allocator<uint
 void common_state_buf_recycle(common_state_buf && buf);
 // a buffer of at least n bytes from the pool into buf, if buf is smaller (returns true when one was taken)
 bool common_state_buf_take(common_state_buf & buf, size_t n);
+size_t common_state_buf_pool_bytes(); // debug: capacity held by the pool
 // k11 (LLAMA_STATE_PREFAULT=0 turns it off): ask a background thread to keep count pooled buffers of at least n bytes with resident pages
 void common_state_buf_prefault(size_t n, int count);
 

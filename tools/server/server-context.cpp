@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -351,7 +352,13 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    // ckpt_keep_max >= -1 (k15-ttft): the caller knows the next prompt of this slot drops every checkpoint with pos_max above it, so
+    // those are moved into the cache entry instead of copied (opt-in, LLAMA_PCS_MOVE_CKPT=1: end-of-run host RSS +150..+1300 MiB when on; default: copied as before)
+    // k15-ttft: the slot's prompt is in the prompt cache already, saved while the server was idle (LLAMA_PCS_IDLE_SAVE)
+    bool prompt_saved_idle = false;
+    bool prompt_saved_idle_new = false; // ... into a new entry (not one the cache held already)
+
+    bool prompt_save(server_prompt_cache & prompt_cache, llama_pos ckpt_keep_max = -2, bool force_async = false) {
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -364,7 +371,9 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        static const bool move_ckpt = getenv("LLAMA_PCS_MOVE_CKPT") != nullptr && atoi(getenv("LLAMA_PCS_MOVE_CKPT")) != 0;
+        const bool mv = move_ckpt && ckpt_keep_max >= -1;
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, mv ? &prompt.checkpoints : nullptr, ckpt_keep_max);
         if (cur == nullptr) {
             return false;
         }
@@ -375,9 +384,11 @@ struct server_slot {
         // the entry (server_prompt_cache::wait_inflight). Larger states than LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB (512) are saved as before.
         static const bool async_on = getenv("LLAMA_PROMPT_SAVE_ASYNC") != nullptr && atoi(getenv("LLAMA_PROMPT_SAVE_ASYNC")) != 0;
         static const size_t async_max = (size_t) (getenv("LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB") ? std::max(0, atoi(getenv("LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB"))) : 512) << 20;
-        const llama_state_seq_flags fl = async_on && cur_size <= async_max ? LLAMA_STATE_SEQ_FLAGS_ASYNC : LLAMA_STATE_SEQ_FLAGS_NONE;
+        const llama_state_seq_flags fl = (async_on || force_async) && cur_size <= async_max ? LLAMA_STATE_SEQ_FLAGS_ASYNC : LLAMA_STATE_SEQ_FLAGS_NONE;
 
+        const int64_t t_get0 = ggml_time_us();
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, fl);
+        SRV_TRC(" - prompt state read in %.2f ms\n", (ggml_time_us() - t_get0) / 1000.0);
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, fl);
         }
@@ -386,6 +397,36 @@ struct server_slot {
         }
 
         return true;
+    }
+
+    // k15-ttft: the RAM prompt-cache save of this slot (state + a clone of each checkpoint) writes into fresh host memory when the
+    // buffer pool holds nothing large enough, and faulting those pages in made most of the save (local B200, Qwen3.6-35B-A3B MTP,
+    // 640-token prompt: 77 MiB state + 2 x 62 MiB checkpoints, 80-290 ms against 8-16 ms into resident buffers). Once the prompt is
+    // processed (and again when the slot goes idle) the prefault worker is asked for resident pool buffers of the sizes the next save
+    // needs, so it runs while the slot generates or waits. Same copies into other buffers: the saved bytes are unchanged.
+    // Opt-in (LLAMA_PCS_PREFAULT_NEXT=1): the prepared buffers stay resident while the slot idles (G4 q4x 32 GB: +113 MiB RSS), and
+    // the 2 MiB pages of common_state_thp_alloc take most of the fault cost without holding memory
+    void prefault_next_save() const {
+        static const bool on = getenv("LLAMA_PCS_PREFAULT_NEXT") != nullptr && atoi(getenv("LLAMA_PCS_PREFAULT_NEXT")) != 0;
+        if (!on || prompt.tokens.size() == 0) {
+            return;
+        }
+        const size_t n_tgt = llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t n_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        common_state_buf_prefault(n_tgt, 1);
+        // checkpoint clones (prompt_checkpoints_clone): one more buffer per checkpoint size than the state request leaves
+        size_t ckpt_max = 0;
+        int    n_ckpt   = 0;
+        for (const auto & c : prompt.checkpoints) {
+            ckpt_max = std::max(ckpt_max, c.data_tgt.size());
+            n_ckpt  += c.data_tgt.size() > 0;
+        }
+        if (n_ckpt > 0) {
+            common_state_buf_prefault(ckpt_max, n_ckpt + (n_tgt >= ckpt_max ? 1 : 0));
+        }
+        if (n_dft > 0) {
+            common_state_buf_prefault(n_dft, 1);
+        }
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
@@ -398,6 +439,7 @@ struct server_slot {
     }
 
     void prompt_clear() {
+        prompt_saved_idle = false; prompt_saved_idle_new = false;
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
@@ -412,6 +454,16 @@ struct server_slot {
     json json_schema;
 
     common_sampler_ptr smpl;
+    // k15-fn: the device greedy chain of this slot (set in the context while greedy requests run, see launch_slot_with_task)
+    llama_sampler_ptr smpl_dev;
+    llama_sampler_ptr smpl_dev_m; // the same with the EOG tokens excluded (ignore_eos requests), swapped in for them
+    llama_sampler_ptr smpl_dev_k; // a device top-k (dev_topk_k candidates) for sampled requests the host chain can finish from them
+    bool smpl_dev_set = false;
+
+    // the device chain with the largest graph, set when the graphs are reserved (the others are swapped in without a reserve)
+    llama_sampler * dev_reserve_chain() const {
+        return smpl_dev_k ? smpl_dev_k.get() : smpl_dev_m ? smpl_dev_m.get() : smpl_dev.get();
+    }
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
@@ -463,7 +515,12 @@ struct server_slot {
 
         n_predict_max = -1;
 
-        llama_set_sampler(ctx_tgt, id, nullptr);
+        // the device greedy chain lives with the slot and stays set for the next greedy request (setting a sampler reserves the graphs)
+        if (!smpl_dev_set) {
+            llama_set_sampler(ctx_tgt, id, nullptr);
+        } else {
+            llama_set_sampler_raw_logits(ctx_tgt, id, true);
+        }
 
         // clear alora start
         alora_invocation_start = -1;
@@ -659,6 +716,10 @@ struct server_slot {
             }
 
             callback_on_reset(*this);
+
+            if (task && !task->is_child() && !task->is_stateless()) {
+                prefault_next_save();
+            }
 
             reset();
 
@@ -1009,6 +1070,9 @@ public:
     //  - when not in sleeping state
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
     llama_model * model_tgt = nullptr;
+    bool device_greedy_ok = false; // k15-fn: greedy requests sample on the device (see launch_slot_with_task)
+    std::vector<llama_token> dev_greedy_mask; // the EOG tokens (ignore_eos), ascending: the mask of the slots' masked device chain
+    int32_t dev_topk_k = 0; // k15-fn: the candidates of the device top-k chain (0: off, LLAMA_SERVER_DEVICE_TOPK=0)
 
     mtmd_context * mctx = nullptr;
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
@@ -1236,12 +1300,25 @@ private:
         server_spec_auto_apply(params);
 
         params_base = params;
+        // A zero draft length means no speculation, for a draft model and for MTP (no draft model) alike. Without this the context
+        // is sized from common_speculative_n_max() == 0 (one output per sequence) while the draft path is still initialized, and
+        // the first verify batch trips GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max).
+        if (common_speculative_n_max(&params_base.speculative) <= 0 &&
+                (params_base.speculative.has_dft() ||
+                 std::any_of(params_base.speculative.types.begin(), params_base.speculative.types.end(), [](common_speculative_type t) {
+                     return t != COMMON_SPECULATIVE_TYPE_NONE;
+                 }))) {
+            SRV_WRN("%s", "draft length is 0 - disabling speculative decoding\n");
+            params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+            params_base.speculative.draft.mparams = {};
+        }
+
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
         const bool has_mmproj = !params.mmproj.path.empty();
-        const bool has_draft = params.speculative.has_dft();
+        const bool has_draft = params_base.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
@@ -1345,6 +1422,20 @@ private:
         if (ctx_tgt == nullptr) {
             SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
             return false;
+        }
+
+        {
+            const char * e = getenv("LLAMA_SERVER_DEVICE_GREEDY");
+            // on by default again with 928828cc004 (pre-sampling n_probs read the raw logits): the n_probs / logprobs check passes 4 / 4
+            // (completion + chat, streaming + not) with it on. LLAMA_SERVER_DEVICE_GREEDY=0 off
+            device_greedy_ok = (e == nullptr || atoi(e) != 0) && llama_model_n_devices(model_tgt) > 0;
+            for (int i = 0; device_greedy_ok && i < llama_model_n_devices(model_tgt); ++i) {
+                ggml_backend_dev_t dev = llama_model_get_device(model_tgt, i);
+                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                const char * rn = reg ? ggml_backend_reg_name(reg) : "";
+                device_greedy_ok = dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                    (strcmp(rn, "CUDA") == 0 || strcmp(rn, "ROCm") == 0);
+            }
         }
 
         vocab = llama_model_get_vocab(model_tgt);
@@ -1691,6 +1782,64 @@ private:
             slot.reset();
         }
 
+        // k15-fn: every slot gets its device greedy chain once (setting a sampler reserves the graphs again): greedy requests take its
+        // token and copy no logits, the others copy the raw logits as before (llama_set_sampler_raw_logits)
+        if (device_greedy_ok) {
+            // the EOG tokens an ignore_eos request excludes (their -inf bias): the masked chain, the larger graph, is set for the reserve and
+            // the plain one is swapped in after it (llama_set_sampler_swap keeps the reserve)
+            dev_greedy_mask.clear();
+            for (const auto & lb : params_base.sampling.logit_bias_eog) {
+                dev_greedy_mask.push_back(lb.token);
+            }
+            std::sort(dev_greedy_mask.begin(), dev_greedy_mask.end());
+            dev_greedy_mask.erase(std::unique(dev_greedy_mask.begin(), dev_greedy_mask.end()), dev_greedy_mask.end());
+
+            // sampled requests: a device top-k of dev_topk_k candidates, from which the host chain gives the token of the full row
+            // (common_sampler_device_topk); this chain has the largest outputs, so it is the one set for the reserve
+            {
+                const char * ek = getenv("LLAMA_SERVER_DEVICE_TOPK");
+                dev_topk_k = ek == nullptr ? 256 : atoi(ek);
+                dev_topk_k = std::max(0, std::min(dev_topk_k, 4096));
+            }
+            bool all = true;
+            for (auto & slot : slots) {
+                slot.smpl_dev.reset(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+                llama_sampler_chain_add(slot.smpl_dev.get(), llama_sampler_init_greedy());
+                slot.smpl_dev_m.reset();
+                if (!dev_greedy_mask.empty()) {
+                    slot.smpl_dev_m.reset(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+                    llama_sampler_chain_add(slot.smpl_dev_m.get(),
+                        llama_sampler_init_greedy_masked((int32_t) dev_greedy_mask.size(), dev_greedy_mask.data()));
+                }
+                slot.smpl_dev_k.reset();
+                if (dev_topk_k > 0) {
+                    slot.smpl_dev_k.reset(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+                    llama_sampler_chain_add(slot.smpl_dev_k.get(), llama_sampler_init_top_k(dev_topk_k));
+                }
+                slot.smpl_dev_set = llama_set_sampler(ctx_tgt, slot.id, slot.dev_reserve_chain());
+                llama_set_sampler_raw_logits(ctx_tgt, slot.id, true);
+                all = all && slot.smpl_dev_set;
+            }
+            if (!all) {
+                for (auto & slot : slots) {
+                    llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                    slot.smpl_dev_set = false;
+                }
+                device_greedy_ok = false;
+            }
+            llama_sched_reserve_now(ctx_tgt);
+            for (auto & slot : slots) {
+                if (slot.smpl_dev_set && slot.dev_reserve_chain() != slot.smpl_dev.get() && !llama_set_sampler_swap(ctx_tgt, slot.id, slot.smpl_dev.get())) {
+                    slot.smpl_dev_m.reset();
+                    slot.smpl_dev_k.reset();
+                    slot.smpl_dev.reset();
+                    llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                    slot.smpl_dev_set = false;
+                }
+            }
+            SRV_INF("greedy requests are sampled on the device: %s (LLAMA_SERVER_DEVICE_GREEDY=0 to disable)\n", all ? "on" : "off");
+        }
+
         {
             const char * LLAMA_TRACE = getenv("LLAMA_TRACE");
             trace = LLAMA_TRACE ? atoi(LLAMA_TRACE) : 0;
@@ -1824,6 +1973,48 @@ private:
         });
         queue_tasks.on_update_slots([this]() {
             update_slots();
+        });
+        queue_tasks.on_idle_work([this]() {
+            // k15-ttft: the prompt-cache save that the next request's slot selection makes (get_available_slot: the slot's prompt with its
+            // checkpoints, 65 MiB for a short Qwen3.6 chat, 8-19 ms on a B200 ahead of the prompt) is made here instead, as the slot went
+            // idle: the same entry, saved in the same order before the next request's load. LLAMA_PCS_IDLE_SAVE=0: at the request, as
+            // before; 1: on this thread (a request sent right after the response waits for it); default 2: the host copy on the state
+            // worker (async), so a request arriving meanwhile waits only where it reads the cache. A slot saved here is copied, so the
+            // checkpoint move (LLAMA_PCS_MOVE_CKPT, which needs the next prompt) applies only to saves still made at a request.
+            static const int idle_save = getenv("LLAMA_PCS_IDLE_SAVE") ? atoi(getenv("LLAMA_PCS_IDLE_SAVE")) : 2;
+            // only where every layer weight is in device memory and no MoE cache runs (llama_verify_exact_placement): at a spilled tier the
+            // save overlapped the next prompt's expert uploads (G4 q4x 12 GB chat back-to-back +11 ms TTFT) and held the entry on top
+            // of the cache's host buffers (+150 MiB VmHWM); there the save stays at the request
+            const bool resident = ctx_tgt && llama_verify_exact_placement(ctx_tgt) && !llama_moe_cache_active(ctx_tgt) &&
+                (!ctx_dft || ctx_dft == ctx_tgt || (llama_verify_exact_placement(ctx_dft) && !llama_moe_cache_active(ctx_dft)));
+            if (idle_save > 0 && resident && prompt_cache && !params_base.embedding) {
+                for (auto & slot : slots) {
+                    if (!slot.is_processing() && !slot.prompt_saved_idle && slot.prompt.tokens.size() > 0) {
+                        // only where the save evicts nothing (an eviction could not be taken back)
+                        const size_t n_state = llama_state_seq_get_size_ext(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) +
+                            (slot.ctx_dft ? llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0);
+                        size_t n_ckpt = 0;
+                        for (const auto & c : slot.prompt.checkpoints) {
+                            n_ckpt += c.size();
+                        }
+                        if ((prompt_cache->limit_size > 0 && prompt_cache->size() + n_state + n_ckpt > prompt_cache->limit_size) ||
+                            (prompt_cache->limit_tokens > 0 && prompt_cache->n_tokens() + slot.prompt.tokens.size() > prompt_cache->limit_tokens)) {
+                            continue;
+                        }
+                        slot.prompt_saved_idle_new = slot.prompt_save(*prompt_cache, -2, idle_save == 2);
+                        if (slot.prompt_saved_idle_new) {
+                            prompt_cache->update();
+                        }
+                        slot.prompt_saved_idle = true;
+                    }
+                }
+            }
+            if (ctx_tgt) {
+                llama_prepare_prompt_plan(ctx_tgt);
+            }
+            if (ctx_dft && ctx_dft != ctx_tgt) {
+                llama_prepare_prompt_plan(ctx_dft);
+            }
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
@@ -2042,6 +2233,12 @@ private:
         }
 
         if (ret) {
+            // k15-ttft: a save made at idle that the old order would not have made (the slot is kept: similarity, or a stateless task)
+            // is taken back, so the cache holds what it held before (LLAMA_PCS_IDLE_SAVE)
+            if (ret->prompt_saved_idle && ret->prompt_saved_idle_new && prompt_cache && !(update_cache && !task.is_stateless())) {
+                prompt_cache->drop_newest(ret->prompt.tokens);
+            }
+            ret->prompt_saved_idle_new = false;
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for the tasks that reuse them
@@ -2052,10 +2249,23 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                // the checkpoints past the common prefix with the new prompt are erased when it starts (pos_next <= n_past <= the
+                // common prefix; not with chunk reuse, which can move n_past past it, nor with multimodal positions)
+                llama_pos keep_max = -2;
+                if (task.params.n_cache_reuse == 0 && !task.tokens.has_mtmd && !ret->prompt.tokens.has_mtmd) {
+                    keep_max = (llama_pos) ret->prompt.tokens.get_common_prefix(task.tokens);
+                }
+                if (!ret->prompt_saved_idle) {
+                    ret->prompt_save(*prompt_cache, keep_max);
+                }
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
+                }
+                if (getenv("LLAMA_PCS_MEM_LOG") != nullptr) {
+                    size_t sz = 0, cap = 0;
+                    for (const auto & c : ret->prompt.checkpoints) { sz += c.data_tgt.size() + c.data_dft.size(); cap += c.data_tgt.capacity() + c.data_dft.capacity(); }
+                    SRV_INF("pcs mem: slot %d after load: %zu ckpts, %.1f / %.1f MiB (size / capacity)\n", ret->id, ret->prompt.checkpoints.size(), sz/1048576.0, cap/1048576.0);
                 }
 
                 prompt_cache->update();
@@ -2113,6 +2323,8 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        slot.prompt_saved_idle = false;
+        llama_moe_request_begin(ctx_tgt);
         // k15-lfm2: the pin a request without drafts lifted is restored before the next prompt (see spill_pinned)
         if (spill_pin_lifted) {
             spill_pin_lifted = !llama_moe_pin_small_set(ctx_tgt, true);
@@ -2132,6 +2344,7 @@ private:
                 if (lora_should_clear_cache(slot.lora, task_loras)) {
                     SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task.params.lora.size());
                     slot.prompt.clear();
+                    slot.prompt_saved_idle = false;
                 } else {
                     SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
                 }
@@ -2213,10 +2426,47 @@ private:
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
 
+            // k15-fn: a greedy request (the argmax of the raw logits, common_sampler_device_greedy) takes the token of the slot's device greedy
+            // chain when every device of the model is a CUDA / ROCm GPU (its argmax returns the lowest id on a tie, as the host greedy path),
+            // so the logits of the sampled rows (every verify row of speculative decoding) are not copied to the host: G4 Qwen3.8-Flash-Next
+            // + MTP copied 1.08 MiB per token. Other requests copy the raw logits and sample on the host. LLAMA_SERVER_DEVICE_GREEDY=0 off
+            // an ignore_eos request (every bias is the -inf of an EOG token) takes the masked chain of the slot
+            // a sampled request whose chain can finish from the device top-k (common_sampler_device_topk) takes the slot's top-k chain:
+            // the rows copy dev_topk_k candidates instead of the full logits. A decision task reads the raw logits
+            const bool dev_ok = !use_backend_sampling && !need_pre_sample_logits && slot.smpl_dev && (slot.smpl_dev_set || device_greedy_ok) &&
+                task.decision.labels.empty();
+            bool dev_masked = false;
+            bool dev_greedy = dev_ok && common_sampler_device_greedy(slot.smpl.get());
+            if (dev_ok && !dev_greedy && slot.smpl_dev_m) {
+                std::vector<llama_token> mask;
+                dev_masked = common_sampler_device_greedy_masked(slot.smpl.get(), mask) && mask == dev_greedy_mask;
+                dev_greedy = dev_masked;
+            }
+            bool dev_topk = dev_ok && !dev_greedy && slot.smpl_dev_k && common_sampler_device_topk(slot.smpl.get(), dev_topk_k) > 0;
+
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
+                slot.smpl_dev_set = false;
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+            } else if (slot.smpl_dev) {
+                if (!slot.smpl_dev_set) {
+                    // back from a backend sampling request: the largest chain is set for the reserve
+                    slot.smpl_dev_set = llama_set_sampler(ctx_tgt, slot.id, slot.dev_reserve_chain());
+                }
+                if (slot.smpl_dev_set && (dev_greedy || dev_topk)) {
+                    llama_sampler * want = dev_topk ? slot.smpl_dev_k.get() : dev_masked ? slot.smpl_dev_m.get() : slot.smpl_dev.get();
+                    const bool ok = llama_set_sampler_swap(ctx_tgt, slot.id, want);
+                    dev_greedy = dev_greedy && ok;
+                    dev_topk   = dev_topk && ok;
+                }
+                dev_greedy = dev_greedy && slot.smpl_dev_set;
+                dev_topk   = dev_topk && slot.smpl_dev_set;
+                llama_set_sampler_raw_logits(ctx_tgt, slot.id, !dev_greedy && !dev_topk);
+                common_sampler_set_device_token(slot.smpl.get(), dev_greedy);
+                common_sampler_set_device_topk(slot.smpl.get(), dev_topk);
             } else {
+                common_sampler_set_device_token(slot.smpl.get(), false);
+                common_sampler_set_device_topk(slot.smpl.get(), false);
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
             }
 
@@ -3673,13 +3923,10 @@ private:
                 metrics_flush_idle();
 
                 // k11-decode: the next prompt starts from the worst-case pp plan (a verify window may have re-planned it)
-                if (ctx_tgt) {
-                    llama_prepare_prompt_plan(ctx_tgt);
-                }
                 // k13-fn: the draft context's MoE cache re-calibrates between requests too
-                if (ctx_dft && ctx_dft != ctx_tgt) {
-                    llama_prepare_prompt_plan(ctx_dft);
-                }
+                // k15-ttft: both run once the server has stayed idle (server_queue::on_idle_work), not before a request that is
+                // already arriving (G4-class host, Qwen3.6 MTP with a CPU-miss MoE cache: a 50 ms re-calibration ahead of a chat prompt)
+                queue_tasks.request_idle_work();
 
                 return; // skip further processing
 
@@ -3823,6 +4070,7 @@ private:
                     new_tokens.resize(slot.prompt.tokens.size() - n_discard);
 
                     slot.prompt.clear();
+                    slot.prompt_saved_idle = false;
                     slot.prompt.tokens.insert(new_tokens);
                 }
 
@@ -5065,6 +5313,10 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+                // not while a MoE cache computes experts on the host: the page faults would compete with its decode
+                if (!slot.task->is_child() && !slot.task->is_stateless() && llama_moe_host_mode(ctx_tgt) == 0) {
+                    slot.prefault_next_save();
+                }
 
                 // k15-lfm2: a request under spill mode 3 that cannot draft (no repeat is long enough on a long prompt) gains nothing from
                 // the pinned host path: its decode follows the CPU-miss rule (G4 LFM2.5 12 GB 16k, k15 re-bench: pinned 235.1 tok/s,

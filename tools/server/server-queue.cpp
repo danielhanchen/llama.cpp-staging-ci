@@ -287,6 +287,9 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
     worker.thread = std::thread([this]() { worker_loop(); });
 
     constexpr auto max_wait_time = std::chrono::seconds(1);
+    // opt-in (default 0 = the idle work runs at once, as before): on G4 q4x 12 GB the 2k prompt was 10% slower with 200 (4684 vs 5222
+    // tok/s, 3 launches; not explained yet) and the bench cells showed no TTFT gain
+    static const int64_t idle_work_delay_ms = getenv("LLAMA_SERVER_IDLE_WORK_DELAY_MS") ? std::max(0, atoi(getenv("LLAMA_SERVER_IDLE_WORK_DELAY_MS"))) : 0;
     auto should_sleep = [&]() -> bool {
         // caller must hold mutex_tasks
         if (idle_sleep_ms < 0) {
@@ -321,6 +324,20 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
             std::unique_lock<std::mutex> lock(mutex_tasks);
             if (!running || !queue_tasks.empty()) {
                 break; // go back to process new tasks or terminate
+            }
+
+            // k15-ttft: idle work once the queue has stayed empty for idle_work_delay_ms
+            if (idle_work_pending && callback_idle_work) {
+                const bool arrived = idle_work_delay_ms > 0 && condition_tasks.wait_for(lock, std::chrono::milliseconds(idle_work_delay_ms), [&]{
+                    return (!queue_tasks.empty() || !running);
+                });
+                if (arrived) {
+                    break; // the task first, the work stays pending
+                }
+                idle_work_pending = false;
+                lock.unlock();
+                callback_idle_work();
+                continue;
             }
 
             // no tasks, check for sleeping state

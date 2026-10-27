@@ -1,4 +1,6 @@
 #include "server-task.h"
+
+#include <thread>
 #include "server-prompt-ssd.h"
 
 #include "build-info.h"
@@ -1723,32 +1725,37 @@ static void prompt_state_recycle(server_prompt_cache_state & st) {
 }
 
 // k11: a copy of the checkpoints into pooled buffers (a plain copy faults in every page of a fresh allocation)
+static common_prompt_checkpoint prompt_checkpoint_clone(const common_prompt_checkpoint & c) {
+    common_prompt_checkpoint d;
+    d.n_tokens = c.n_tokens;
+    d.id_task  = c.id_task;
+    d.pos_min  = c.pos_min;
+    d.pos_max  = c.pos_max;
+    common_state_buf_take(d.data_tgt, c.data_tgt.size());
+    d.data_tgt.resize(c.data_tgt.size());
+    if (!c.data_tgt.empty()) {
+        memcpy(d.data_tgt.data(), c.data_tgt.data(), c.data_tgt.size());
+    }
+    common_state_buf_take(d.data_dft, c.data_dft.size());
+    d.data_dft.resize(c.data_dft.size());
+    if (!c.data_dft.empty()) {
+        memcpy(d.data_dft.data(), c.data_dft.data(), c.data_dft.size());
+    }
+    d.data_spec = c.data_spec;
+    common_state_buf_prefault(c.data_tgt.size(), 2);
+    return d;
+}
+
 static std::list<common_prompt_checkpoint> prompt_checkpoints_clone(const std::list<common_prompt_checkpoint> & src) {
     std::list<common_prompt_checkpoint> dst;
     for (const auto & c : src) {
-        common_prompt_checkpoint d;
-        d.n_tokens = c.n_tokens;
-        d.id_task  = c.id_task;
-        d.pos_min  = c.pos_min;
-        d.pos_max  = c.pos_max;
-        common_state_buf_take(d.data_tgt, c.data_tgt.size());
-        d.data_tgt.resize(c.data_tgt.size());
-        if (!c.data_tgt.empty()) {
-            memcpy(d.data_tgt.data(), c.data_tgt.data(), c.data_tgt.size());
-        }
-        common_state_buf_take(d.data_dft, c.data_dft.size());
-        d.data_dft.resize(c.data_dft.size());
-        if (!c.data_dft.empty()) {
-            memcpy(d.data_dft.data(), c.data_dft.data(), c.data_dft.size());
-        }
-        d.data_spec = c.data_spec;
-        common_state_buf_prefault(c.data_tgt.size(), 2);
-        dst.push_back(std::move(d));
+        dst.push_back(prompt_checkpoint_clone(c));
     }
     return dst;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft,
+        std::list<common_prompt_checkpoint> * take_from, llama_pos keep_max) {
     wait_inflight(); // the previous save is complete before entries are compared, erased or evicted
 
     // first check if the current state is contained fully in the cache
@@ -1828,10 +1835,42 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
+    std::list<common_prompt_checkpoint> ckpts;
+    if (take_from != nullptr && take_from == &prompt.checkpoints) {
+        // a moved checkpoint takes no pooled buffer, where its copy would have: the buffer the copy would have taken leaves the pool all
+        // the same (freed off this thread), so the pool, and the host RSS, end where the copies leave them (without it, end-of-run RSS
+        // was +150..+1300 MiB; LLAMA_PCS_MOVE_POOL_DROP=0: kept in the pool)
+        static const bool pool_drop = getenv("LLAMA_PCS_MOVE_POOL_DROP") == nullptr || atoi(getenv("LLAMA_PCS_MOVE_POOL_DROP")) != 0;
+        std::vector<common_state_buf> drop;
+        // in order: the ones the slot drops are moved, the rest copied
+        for (auto it = take_from->begin(); it != take_from->end();) {
+            auto next = std::next(it);
+            if (it->pos_max > keep_max) {
+                if (pool_drop) {
+                    for (size_t n : { it->data_tgt.size(), it->data_dft.size() }) {
+                        common_state_buf b;
+                        if (n > 0 && common_state_buf_take(b, n)) {
+                            drop.push_back(std::move(b));
+                        }
+                    }
+                }
+                ckpts.splice(ckpts.end(), *take_from, it);
+            } else {
+                ckpts.push_back(prompt_checkpoint_clone(*it));
+            }
+            it = next;
+        }
+        if (!drop.empty()) {
+            std::thread([drop = std::move(drop)]() mutable { drop.clear(); }).detach();
+        }
+    } else {
+        ckpts = prompt_checkpoints_clone(prompt.checkpoints);
+    }
+
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt_checkpoints_clone(prompt.checkpoints),
+            /*.checkpoints =*/ std::move(ckpts),
             /*.kv_shifted  =*/ prompt.kv_shifted,
         },
         /*.data   =*/ {
@@ -1968,6 +2007,18 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     return true;
 }
 
+bool server_prompt_cache::drop_newest(const server_tokens & tokens) {
+    wait_inflight();
+    for (auto it = states.rbegin(); it != states.rend(); ++it) {
+        if (it->prompt.tokens.size() == tokens.size() && it->prompt.tokens.get_common_prefix(tokens) == tokens.size()) {
+            prompt_state_recycle(*it);
+            states.erase(std::next(it).base());
+            return true;
+        }
+    }
+    return false;
+}
+
 void server_prompt_cache::evict_front() {
     if (states.empty()) {
         return;
@@ -2007,6 +2058,15 @@ void server_prompt_cache::update() {
         }
     }
 
+    if (getenv("LLAMA_PCS_MEM_LOG") != nullptr) { // debug: bytes held (capacity) against the bytes accounted (size)
+        size_t sz = 0, cap = 0, csz = 0, ccap = 0;
+        for (const auto & st : states) {
+            sz += st.data.main.size() + st.data.drft.size(); cap += st.data.main.capacity() + st.data.drft.capacity();
+            for (const auto & c : st.prompt.checkpoints) { csz += c.data_tgt.size() + c.data_dft.size(); ccap += c.data_tgt.capacity() + c.data_dft.capacity(); }
+        }
+        SRV_INF("pcs mem: %zu entries, state %.1f / %.1f MiB, ckpt %.1f / %.1f MiB (size / capacity), pool %.1f MiB\n", states.size(),
+            sz/1048576.0, cap/1048576.0, csz/1048576.0, ccap/1048576.0, common_state_buf_pool_bytes()/1048576.0);
+    }
     SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
             states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 

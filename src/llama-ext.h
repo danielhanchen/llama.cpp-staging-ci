@@ -69,6 +69,7 @@ struct llama_memory_breakdown_data {
     size_t model   = 0; // memory allocated for the model
     size_t context = 0; // memory allocated for the context
     size_t compute = 0; // memory allocated for temporary compute buffers
+    size_t lend_freed = 0; // k15-fn: of a measurement (no_alloc), the staging arena the MoE cache lends for, not in total() (see sched_reserve)
 
     size_t total() const {
         return model + context + compute;
@@ -90,6 +91,19 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
+
+// k15-fn: with a sampler set for seq_id (llama_set_sampler), raw = true still copies the raw logits of its rows to the host (the host
+// sampler of a request that the device sampler cannot serve), raw = false copies only what the sampler outputs. No new graph reserve
+LLAMA_API void llama_set_sampler_raw_logits(struct llama_context * ctx, llama_seq_id seq_id, bool raw);
+// k15-fn: reserve the graphs now if a change (e.g. llama_set_sampler) asked for it, instead of at the next decode
+LLAMA_API void llama_sched_reserve_now(struct llama_context * ctx);
+// k15-fn: replace the backend sampler of seq_id, which has one, without reserving the graphs again: the caller reserved them with a
+// sampler whose graph is at least as large (e.g. the masked greedy of an ignore_eos request, swapped for the plain one). False: nothing
+// was changed (no sampler set for seq_id, or this one cannot run on the backend)
+LLAMA_API bool llama_set_sampler_swap(struct llama_context * ctx, llama_seq_id seq_id, struct llama_sampler * sampler);
+// k15-fn: greedy with the given tokens excluded (their logit is -inf, as a -inf logit bias), the lowest id on a tie; on the backend
+// it masks the row in the samplers' padded copy of the logits
+LLAMA_API struct llama_sampler * llama_sampler_init_greedy_masked(int32_t n_tokens, const llama_token * tokens);
 
 // the backend buffers that a state write of this memory would touch - empty caches report none
 LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
@@ -151,6 +165,8 @@ LLAMA_API bool llama_moe_pin_small(struct llama_context * ctx);
 // k15-lfm2: lifts (on = false) or restores (on = true) the pin of llama_moe_pin_small, e.g. for a request that cannot draft; a cache
 // the pin did not freeze is left as it is. Returns the pinned state
 LLAMA_API bool llama_moe_pin_small_set(struct llama_context * ctx, bool on);
+// k15-lfm2: a new request starts (the CPU-miss rule restarts from the launch's decisions with LLAMA_MOE_CPU_MISS_PER_REQUEST=1)
+LLAMA_API void llama_moe_request_begin(struct llama_context * ctx);
 // k15-lfm2: turns the CPU-miss rule off on a host that cannot compute experts faster than it uploads them (few threads, host time per
 // expert not well below the upload time) where the cache holds most host experts: the misses are fetched, every expert runs on the device
 // from a slot (verify rows are single token bytes again). Returns true if it turned the rule off. LLAMA_MOE_CPU_MISS_DROP=0: never
@@ -158,6 +174,9 @@ LLAMA_API bool llama_moe_cpu_miss_drop_slow(struct llama_context * ctx);
 
 // k13: 0 = no MoE cache or its host never computes an expert, 1 = hybrid path with a fixed share (small caches), 2 = CPU-miss rule
 LLAMA_API int32_t llama_moe_host_mode(const struct llama_context * ctx);
+
+// k15-ttft: a MoE cache runs (experts stream from host memory into device slots)
+LLAMA_API bool llama_moe_cache_active(const struct llama_context * ctx);
 
 // k11-decode: restore the worst-case prompt plan of the graph allocator if a small graph (a verify window) re-planned it; a server
 // calls it when its slots go idle, so the next prompt does not pay for it (no-op otherwise; LLAMA_PP_RERESERVE=0: off)

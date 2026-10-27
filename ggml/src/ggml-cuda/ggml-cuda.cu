@@ -1,7 +1,9 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include "ggml-cuda/kq-mask.cuh"
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -218,6 +220,18 @@ static void ggml_cuda_device_free(void * ptr) {
 static cudaError_t ggml_cuda_device_malloc_impl(void ** ptr, size_t size, int device);
 
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
+    // debug: GGML_CUDA_FAKE_FREE_STRICT=1 with GGML_CUDA_FAKE_FREE_MIB fails an allocation past the fake budget, as cudaMalloc does on a
+    // card of that size (the fake free memory alone lets it succeed on a larger card)
+    static const bool fake_strict = getenv("GGML_CUDA_FAKE_FREE_STRICT") != nullptr && atoi(getenv("GGML_CUDA_FAKE_FREE_STRICT")) != 0 &&
+                                    getenv("GGML_CUDA_FAKE_FREE_MIB") != nullptr && atoll(getenv("GGML_CUDA_FAKE_FREE_MIB")) > 0;
+    if (fake_strict) {
+        const int64_t cap = (int64_t) atoll(getenv("GGML_CUDA_FAKE_FREE_MIB")) << 20;
+        std::lock_guard<std::mutex> lock(ggml_cuda_own_mutex);
+        if (ggml_cuda_own_bytes[device] + (int64_t) size > cap) {
+            *ptr = nullptr;
+            return cudaErrorMemoryAllocation;
+        }
+    }
     const cudaError_t err = ggml_cuda_device_malloc_impl(ptr, size, device);
     if (err == cudaSuccess && *ptr != nullptr) {
         std::lock_guard<std::mutex> lock(ggml_cuda_own_mutex);
@@ -2054,6 +2068,72 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
     return true;
 }
 
+// k15-lfm2: the kernels of the flagged verify products. One INFO line per load (the first graph with verify products, see
+// ggml_cuda_verify_mmq_summary) counts them by kernel, so the engagement of GGML_CUDA_VERIFY_MMQ shows in any server log;
+// GGML_CUDA_VERIFY_MMQ_LOG=1 also names each product once per kernel and width
+struct ggml_cuda_verify_mmq_state {
+    std::mutex                         mtx;
+    std::map<std::string, std::string> last;  // weight name -> kernel, in the first verify graph
+    std::map<std::string, std::string> seen;  // name + width -> kernel (GGML_CUDA_VERIFY_MMQ_LOG)
+    int                                cc      = 0;
+    int64_t                            cols    = 0;
+    std::atomic<bool>                  printed { false };
+};
+static ggml_cuda_verify_mmq_state & ggml_cuda_verify_mmq_st() {
+    static ggml_cuda_verify_mmq_state st;
+    return st;
+}
+
+static void ggml_cuda_verify_mmq_log(const ggml_tensor * dst, int cc, const char * what) {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_VERIFY_MMQ_LOG");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    auto & st = ggml_cuda_verify_mmq_st();
+    const ggml_tensor * src0 = dst->src[0];
+    std::lock_guard<std::mutex> lock(st.mtx);
+    if (!st.printed) {
+        st.last[src0->name] = what;
+        st.cc   = cc;
+        st.cols = std::max<int64_t>(st.cols, dst->src[1]->ne[1]);
+    }
+    if (!on || st.seen.size() > 1024) {
+        return;
+    }
+    std::string & prev = st.seen[std::string(src0->name) + "/" + std::to_string(dst->src[1]->ne[1])];
+    if (prev == what) {
+        return;
+    }
+    prev = what;
+    GGML_LOG_INFO("ggml_cuda: verify product %s (%s %lld x %lld, %lld columns, cc %d): %s\n", src0->name, ggml_type_name(src0->type),
+        (long long) src0->ne[0], (long long) src0->ne[1], (long long) dst->src[1]->ne[1], cc, what);
+}
+
+// after a graph: the one line per load, once a graph had verify products
+static void ggml_cuda_verify_mmq_summary() {
+    auto & st = ggml_cuda_verify_mmq_st();
+    if (st.printed.load(std::memory_order_relaxed)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(st.mtx);
+    if (st.printed || st.last.empty()) {
+        return;
+    }
+    st.printed = true;
+    std::map<std::string, int> n;
+    for (const auto & [name, what] : st.last) {
+        n[what]++;
+    }
+    std::string list;
+    for (const auto & [what, k] : n) {
+        list += (list.empty() ? "" : ", ") + std::to_string(k) + " " + what;
+    }
+    const char * e = getenv("GGML_CUDA_VERIFY_MMQ");
+    GGML_LOG_INFO("ggml_cuda: verify products of the first verify graph (cc %d, up to %lld columns, GGML_CUDA_VERIFY_MMQ=%s): %s "
+        "(=0 off, GGML_CUDA_VERIFY_MMQ_LOG=1 names them)\n", st.cc, (long long) st.cols, e != nullptr ? e : "default", list.c_str());
+    st.last.clear();
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -2093,6 +2173,25 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     // batch invariant (speculative verify batches): every column gets the bytes a single column (ne11 == 1) would get
     if ((dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) && ne11 > 1) {
+        // k15-lfm2, GGML_CUDA_VERIFY_MMQ: a quantized dense verify product of up to 16 columns runs MMQ (int8 tensor cores) instead
+        // of the batched mmvq: the same q8_1 activations into the same int8 products with f32 accumulation, only the order of the f32
+        // scale products and sums differs (plans/k11.md equivalence rule). T4 at 8 rows the dp4a mmvq is compute-bound (2x one row,
+        // plans/k15_lfm2.md section 15). Default on Turing (cc 7.5) only, where it was timed and passed the KLD gate; =1 on any device with
+        // the Turing MMA (Ampere and newer too), =0 off. Not here: the products of a multi-matrix mmvq launch (ggml_cuda_mmvq_multi_*),
+        // which keep the batched mmvq. GGML_CUDA_VERIFY_MMQ_LOG=1 names each product once with the kernel it takes
+        static const int verify_mmq_env = [] {
+            const char * e = getenv("GGML_CUDA_VERIFY_MMQ");
+            return e != nullptr ? atoi(e) : -1;
+        }();
+        const bool verify_mmq = verify_mmq_env > 0 ||
+            (verify_mmq_env < 0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING && cc < GGML_CUDA_CC_AMPERE);
+        const bool take_mmq = verify_mmq && ne11 <= 16 && ne12*ne13 == 1 && ggml_is_quantized(src0->type) && turing_mma_available(cc) &&
+                ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0);
+        ggml_cuda_verify_mmq_log(dst, cc, take_mmq ? "MMQ" : verify_mmq ? "batched mmvq (not an MMQ product)" : "batched mmvq (VERIFY_MMQ off here)");
+        if (take_mmq) {
+            ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+            return;
+        }
         // the vector kernels compute each column like their single column launch (mmvq: with the warps of that launch)
         if (ne11 <= MMVF_MAX_BATCH_SIZE && ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, 1)) {
             ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
@@ -2181,6 +2280,11 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         }
     }
 
+    // MMQ / MMF sort the ids on the device: only where the helper fits the shared memory of the device (see ggml_cuda_mul_mat_id)
+    if (!ggml_cuda_mm_ids_helper_supported(src0->ne[2], src1->ne[2], dst->src[2]->ne[0])) {
+        return true;
+    }
+
     if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
         return false;
     }
@@ -2223,12 +2327,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        // MMQ / MMF sort the ids with ggml_cuda_launch_mm_ids_helper, which needs either n_experts or n_tokens ids in shared
+        // memory: a device that holds neither (huge expert count AND a ubatch beyond smpbo/4 tokens) takes the host sort below
+        const bool ids_on_device = ggml_cuda_mm_ids_helper_supported(ne02, ne12, ids->ne[0]);
+
+        if (ids_on_device && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
-        if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+        if (ids_on_device && ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
@@ -2408,7 +2516,27 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     CUDA_CHECK(cudaGetLastError());
 }
 
+// k15-fn debug (GGML_CUDA_GRAPH_NODE_STATS=3): the copy / gather nodes executed after the fusions, logged per captured graph
+static std::map<const void *, std::map<std::string, std::pair<int, size_t>>> ggml_cuda_exec_copy_ops;
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    static const bool exec_stats = getenv("GGML_CUDA_GRAPH_NODE_STATS") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_NODE_STATS")) >= 3;
+    static const bool exec_all = exec_stats && atoi(getenv("GGML_CUDA_GRAPH_NODE_STATS")) >= 4; // =4: every op run unfused
+    if (exec_stats && (exec_all || dst->op == GGML_OP_CPY || dst->op == GGML_OP_CONT || dst->op == GGML_OP_DUP || dst->op == GGML_OP_CONCAT ||
+                       dst->op == GGML_OP_GET_ROWS || dst->op == GGML_OP_REPEAT || dst->op == GGML_OP_SET_ROWS) && ggml_nelements(dst) > 0) {
+        std::string nm;
+        for (const char * c = dst->name; *c; ++c) {
+            if (*c < '0' || *c > '9') { nm += *c; }
+        }
+        const ggml_tensor * s0 = dst->src[0];
+        char key[256];
+        snprintf(key, sizeof(key), "%s%s%s %s [%lld,%lld,%lld] <- %s %s", ggml_op_desc(dst), dst->op == GGML_OP_UNARY || dst->op == GGML_OP_GLU ? "" : "",
+            "", nm.c_str(), (long long) dst->ne[0], (long long) dst->ne[1],
+            (long long) dst->ne[2], s0 ? ggml_op_desc(s0) : "-", s0 ? s0->name : "");
+        auto & e = ggml_cuda_exec_copy_ops[&ctx][key];
+        e.first++;
+        e.second += dst->op == GGML_OP_SET_ROWS || dst->op == GGML_OP_CPY ? ggml_nbytes(dst->op == GGML_OP_CPY ? dst->src[0] : dst->src[1]) : ggml_nbytes(dst);
+    }
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -2741,6 +2869,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MOE_CACHE_LOOKUP:
             ggml_cuda_op_moe_cache_lookup(ctx, dst);
             break;
+        case GGML_OP_KQ_MASK:
+            ggml_cuda_op_kq_mask(ctx, dst);
+            break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
             break;
@@ -2799,6 +2930,47 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+}
+
+// k15-fn: the host -> device uploads of n tensors (offset 0, whole size given) as one cudaMemcpyBatchAsync on the backend's stream, in
+// stream order like n cudaMemcpyAsync (the scheduler's graph inputs of a split: 21 per Flash-Next verify graph, issued back to back with
+// the GPU idle between them). Returns false (nothing queued) where the batch API is missing or refuses them: the caller copies one by one
+static bool ggml_backend_cuda_set_tensors_batch_async(ggml_backend_t backend, ggml_tensor * const * tensors, const void * const * data,
+        const size_t * sizes, int n) {
+#if CUDART_VERSION >= 12080 && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (n <= 0) {
+        return true;
+    }
+    std::vector<void *> dsts(n);
+    std::vector<const void *> srcs(n);
+    std::vector<size_t> sz(n);
+    for (int i = 0; i < n; ++i) {
+        ggml_backend_buffer_t buf = tensors[i]->view_src ? tensors[i]->view_src->buffer : tensors[i]->buffer;
+        if (buf == nullptr || buf->buft != ggml_backend_cuda_buffer_type(cuda_ctx->device)) {
+            return false;
+        }
+        dsts[i] = tensors[i]->data;
+        srcs[i] = data[i];
+        sz[i]   = sizes[i];
+    }
+    cudaMemcpyAttributes attr = {};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    attr.srcLocHint.type = cudaMemLocationTypeHost;
+    attr.dstLocHint.type = cudaMemLocationTypeDevice;
+    attr.dstLocHint.id   = cuda_ctx->device;
+    attr.flags = cudaMemcpyFlagPreferOverlapWithCompute;
+    size_t attr_idx = 0;
+    const cudaError_t err = cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sz.data(), (size_t) n, &attr, &attr_idx, 1, cuda_ctx->stream());
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
+#else
+    GGML_UNUSED(backend); GGML_UNUSED(tensors); GGML_UNUSED(data); GGML_UNUSED(sizes); GGML_UNUSED(n);
+    return false;
+#endif
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -2891,6 +3063,14 @@ static size_t ggml_backend_cuda_graph_evict_since(ggml_backend_t backend, int64_
     GGML_UNUSED(t_us);
 #endif
     return n;
+}
+
+// k15-pp: on = the next graph computations of this backend run without CUDA graph bookkeeping (computed once, never replayed)
+static void ggml_backend_cuda_graph_skip_records(ggml_backend_t backend, bool on) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return;
+    }
+    ((ggml_backend_cuda_context *) backend->context)->graphs_skip = on;
 }
 
 static void ggml_backend_cuda_set_copy_peer(ggml_backend_t copy_backend, ggml_backend_t compute_backend) {
@@ -3028,6 +3208,15 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     return cgraph->nodes[0];
+}
+
+// GGML_CUDA_GRAPH_UID=0: the compatibility check walks every node on every evaluation, as before
+static bool ggml_cuda_graph_uid_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_GRAPH_UID");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
@@ -3243,6 +3432,45 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
     }
 
     return true;
+}
+
+// k15-fn: RMS_NORM -> MUL -> ROPE with a multi-section, non-vision rope (ggml_cuda_op_rms_norm_mul_mrope_fused): f32, the rope
+// reads the mul output, the norm is the full-shape mul operand, the mul output is contiguous (the norm kernel writes it there)
+static bool ggml_cuda_should_fuse_rms_norm_mul_mrope(const ggml_tensor * rms_norm, const ggml_tensor * mul, const ggml_tensor * rope) {
+    if (rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || rope->op != GGML_OP_ROPE) {
+        return false;
+    }
+    if (rms_norm->src[0]->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 || mul->src[0]->type != GGML_TYPE_F32 ||
+        mul->src[1]->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || rope->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (rope->src[0] != mul || (mul->src[0] != rms_norm && mul->src[1] != rms_norm)) {
+        return false;
+    }
+    const ggml_tensor * mul_src = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    if (!ggml_are_same_shape(rms_norm, mul) || !ggml_can_repeat(mul_src, mul) || !ggml_is_contiguous(mul) ||
+        !ggml_is_contiguous_rows(rms_norm->src[0]) || !ggml_is_contiguous_rows(mul_src)) {
+        return false;
+    }
+    const int mode = ((const int32_t *) rope->op_params)[2];
+    if (!(mode & GGML_ROPE_TYPE_MROPE) || mode == GGML_ROPE_TYPE_VISION) {
+        return false;
+    }
+    const int n_dims = ((const int32_t *) rope->op_params)[1];
+    const int n_offs = ((const int32_t *) rope->op_params)[15];
+    const int64_t ne0 = mul->ne[0];
+    if (n_dims <= 0 || n_dims % 2 != 0 || n_offs < 0 || n_offs % 2 != 0 || ne0 % 2 != 0 || n_offs + n_dims > ne0) {
+        return false;
+    }
+    // the norm grid is (rows, channels, samples): the rope row is (head, token, sequence), pos is indexed by the token
+    if (!ggml_are_same_shape(rope, mul) || rope->src[1]->type != GGML_TYPE_I32 || rope->src[1]->ne[0] < 4*mul->ne[2] ||
+        (rope->src[2] != nullptr && rope->src[2]->type != GGML_TYPE_F32)) {
+        return false;
+    }
+    // the rope output rows must not overlap the rows the kernel still reads (only the in-place rope writes back to the mul output)
+    const char * r0 = (const char *) rope->data;
+    const char * m0 = (const char *) mul->data;
+    return r0 == m0 || r0 + ggml_nbytes(rope) <= m0 || m0 + ggml_nbytes(mul) <= r0;
 }
 
 // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
@@ -4105,8 +4333,10 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 // norm_targets: the producer tensors (RMS_NORM + MUL outputs, elementwise chain ends, DSV4_HC_PRE) whose q8_1 copy their
 // kernel writes. They are matched to their readers by tensor identity, through reshapes, not by address: the allocator
 // reuses the memory of dead tensors, so one address holds different tensors over a graph.
-static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::unordered_set<const void *> & norm_targets) {
+static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::unordered_set<const void *> & norm_targets,
+        std::unordered_map<const void *, int64_t> & target_ne10) {
     norm_targets.clear();
+    target_ne10.clear();
     // GGML_CUDA_DISABLE_FUSION=1 also turns it off, so that it restores the unfused path as a whole
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_Q8_1_CACHE") || ggml_cuda_env_flag("GGML_CUDA_DISABLE_FUSION");
     if (disabled) {
@@ -4140,6 +4370,7 @@ static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::un
     // the same for the outputs of elementwise chains and of DSV4_HC_PRE (GGML_CUDA_DISABLE_PRODUCER_Q8_1=1 turns this off)
     static const bool producer_q8_1_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_PRODUCER_Q8_1");
     std::unordered_set<const ggml_tensor *> norm_outputs;
+    std::unordered_set<const ggml_tensor *> gated_outputs; // k15-fn: their kernel writes the copy in the rows of any reader
     if (!norm_q8_1_disabled) {
         for (int i = 0; i + 1 < cgraph->n_nodes; ++i) {
             const ggml_tensor * norm = cgraph->nodes[i];
@@ -4179,6 +4410,31 @@ static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::un
                 norm_outputs.insert(node);
             }
         }
+        // k15-fn: the gated ops (GLU, and UNARY -> MUL as ggml_cuda_op_unary_mul fuses it), whose f32 kernel writes the q8_1 copy
+        // (unary_gated_q8_1_kernel). GGML_CUDA_DISABLE_GLU_Q8_1=1 turns this off
+        static const bool glu_q8_1_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_GLU_Q8_1");
+        if (!glu_q8_1_disabled) {
+            auto f32c = [](const ggml_tensor * t) {
+                return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->data != nullptr && (t->flags & GGML_TENSOR_FLAG_COMPUTE);
+            };
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const ggml_tensor * node = cgraph->nodes[i];
+                if (node->op == GGML_OP_GLU && f32c(node) && node->src[0]->type == GGML_TYPE_F32) {
+                    const ggml_glu_op gop = ggml_get_glu_op(node);
+                    if (gop == GGML_GLU_OP_SWIGLU || gop == GGML_GLU_OP_GEGLU || gop == GGML_GLU_OP_REGLU || gop == GGML_GLU_OP_GEGLU_ERF ||
+                        gop == GGML_GLU_OP_GEGLU_QUICK) {
+                        gated_outputs.insert(node);
+                    }
+                }
+                if (node->op == GGML_OP_UNARY && i + 1 < cgraph->n_nodes && f32c(cgraph->nodes[i + 1]) && cgraph->nodes[i + 1]->op == GGML_OP_MUL &&
+                    (cgraph->nodes[i + 1]->src[0] == node || cgraph->nodes[i + 1]->src[1] == node)) {
+                    const ggml_unary_op uop = ggml_get_unary_op(node);
+                    if (uop == GGML_UNARY_OP_SILU || uop == GGML_UNARY_OP_SIGMOID || uop == GGML_UNARY_OP_SOFTPLUS) {
+                        gated_outputs.insert(cgraph->nodes[i + 1]);
+                    }
+                }
+            }
+        }
     }
 
     size_t slot_size = 0;
@@ -4195,7 +4451,14 @@ static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::un
         }
         const bool norm_target = norm_outputs.count(prod) && ggml_is_contiguous(src1) && ggml_is_contiguous(prod) &&
             ggml_cuda_q8_1_cache::same_copy_rows(src1->ne[0], prod->ne[0]);
-        if (norm_target) {
+        // a gated producer read by one candidate: the copy is written in the rows of that reader (a second reader with other rows
+        // quantizes for itself)
+        const bool gated_target = !norm_target && gated_outputs.count(prod) && ggml_is_contiguous(src1) && ggml_is_contiguous(prod) &&
+            !norm_targets.count(prod);
+        if (gated_target) {
+            norm_targets.insert(prod);
+            target_ne10[prod] = src1->ne[0];
+        } else if (norm_target) {
             norm_targets.insert(prod);
         } else if (n_readers[src1->data] < 2) {
             continue;
@@ -4306,8 +4569,11 @@ static int ggml_cuda_try_fuse_ew_chain(ggml_backend_cuda_context * cuda_ctx, ggm
     // a mul_mat_vec_q reads the chain output: write its q8_1 copy in the same kernel
     void * q8_1_out = nullptr;
     ggml_cuda_q8_1_cache & cache = cuda_ctx->q8_1_cache;
+    // k15-mm2: also several rows whose length is a multiple of 32 but not of the q8_1 row padding (the hyper-connection up input at
+    // an MTP verify, 320 x 3), each q8_1 row padded with zeros as quantize_q8_1 pads it (GGML_CUDA_EW_Q8_1_ROWS=0: those rows not)
+    static const bool rows_off = [] { const char * e = getenv("GGML_CUDA_EW_Q8_1_ROWS"); return e != nullptr && atoi(e) == 0; }();
     if (cache.active() && cuda_ctx->curr_stream_no == 0 && cache.norm_targets.count(last) &&
-        (ggml_nrows(last) == 1 || last->ne[0] % MATRIX_ROW_PADDING == 0)) {
+        (ggml_nrows(last) == 1 || last->ne[0] % MATRIX_ROW_PADDING == 0 || (!rows_off && last->ne[0] % QK8_1 == 0))) {
         const int64_t ne10_padded = GGML_PAD(last->ne[0], MATRIX_ROW_PADDING);
         int64_t key[ggml_cuda_q8_1_cache::n_key];
         ggml_cuda_q8_1_cache::key_contiguous(last->ne[0], ggml_nrows(last), key);
@@ -4390,6 +4656,82 @@ static int ggml_cuda_try_fuse_amax_rescale(ggml_backend_cuda_context * cuda_ctx,
     return id - i;
 }
 
+// k15-mm2: the next hyper-connection mix's grouped norm (RMS_NORM -> MUL, a q8_1 producer) reads the DSV4_HC_POST output of the
+// chain nodes [i, i + n_chain) + nodes[ip]: computed in one norm kernel (see below). Returns the number of extra nodes covered.
+    // k15-mm2: the next hyper-connection mix's grouped norm (RMS_NORM -> MUL, a q8_1 producer) reads this DSV4_HC_POST output: the
+    // norm kernel computes the post itself (stored to the post output as before) and writes the norm, its q8_1 copy, one launch
+    // (GGML_CUDA_HC_POST_NORM=0: separate launches). Same expressions in the same order, so every output keeps its bytes.
+static int ggml_cuda_try_fuse_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, int n_chain, int ip) {
+    ggml_tensor * hc_post = cgraph->nodes[ip];
+    const ggml_tensor * x        = hc_post->src[0];
+    const ggml_tensor * residual = hc_post->src[1];
+    const ggml_tensor * post_src = cgraph->nodes[i]->src[0];
+    const int64_t hc       = residual->ne[1];
+    const int64_t n_tokens = x->ne[1];
+    if (hc_post->src[3] != nullptr || post_src == nullptr || post_src->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 ||
+            residual->type != GGML_TYPE_F32 || hc_post->type != GGML_TYPE_F32 || ggml_nelements(post_src) != hc*n_tokens ||
+            ggml_cuda_tensors_overlap(hc_post, post_src)) {
+        return 0;
+    }
+    {
+        // integration head (coordinator 10-26): opt-in (GGML_CUDA_HC_POST_NORM=1) as a free interim until the CUDA-graphs timing race fix
+        // lands (Flash-Next pinned f0 diverged in about 1 of 5 launches with it on, 0 of 14 off; G4 decode cost of off: inside 1% A/A)
+        static const bool off = [] { const char * e = getenv("GGML_CUDA_HC_POST_NORM"); return e == nullptr || atoi(e) == 0; }();
+        int irn = ip + 1;
+        while (irn < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[irn])) {
+            irn++;
+        }
+        bool ok = !off && irn + 1 < cgraph->n_nodes && n_chain <= GGML_CUDA_HC_POST_NORM_MAX_OPS && cuda_ctx->curr_stream_no == 0 &&
+            cuda_ctx->q8_1_cache.active();
+        ggml_tensor * rn  = ok ? cgraph->nodes[irn]     : nullptr;
+        ggml_tensor * mul = ok ? cgraph->nodes[irn + 1] : nullptr;
+        ok = ok && rn->op == GGML_OP_RMS_NORM && rn->src[0] == hc_post && (rn->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            mul->op == GGML_OP_MUL && (mul->src[0] == rn || mul->src[1] == rn) && (mul->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            ggml_node_has_n_uses(cgraph, irn, 1) && !(rn->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_is_contiguous(hc_post) &&
+            ggml_is_contiguous(mul) && rn->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && cuda_ctx->q8_1_cache.norm_targets.count(mul) &&
+            hc_post->ne[0] == x->ne[0] && hc_post->ne[1] == hc && hc_post->ne[2] == n_tokens && hc_post->ne[3] == 1 &&
+            x->nb[0] == sizeof(float) && residual->nb[0] == sizeof(float) && ggml_is_contiguous(post_src);
+        for (int j = 0; ok && j < n_chain; ++j) {
+            const ggml_tensor * t = cgraph->nodes[i + j];
+            ok = t->op == GGML_OP_SCALE || (t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID);
+        }
+        // every block reads the whole block output row of its token (x) while others write the post output: no overlap; the residual
+        // only element by element (in place is fine when it is the same layout)
+        ok = ok && !ggml_cuda_tensors_overlap(hc_post, x) &&
+            (!ggml_cuda_tensors_overlap(hc_post, residual) || (hc_post->data == residual->data && ggml_are_same_stride(hc_post, residual)));
+        if (ok) {
+            const int64_t ne10_padded = GGML_PAD(mul->ne[0], MATRIX_ROW_PADDING);
+            int64_t key[ggml_cuda_q8_1_cache::n_key];
+            ggml_cuda_q8_1_cache::key_contiguous(mul->ne[0], ggml_nrows(mul), key);
+            void * q8_1_out = cuda_ctx->q8_1_cache.reserve(mul->data, ggml_nbytes(mul), key, ggml_nrows(mul)*ne10_padded/QK8_1*sizeof(block_q8_1));
+            if (q8_1_out != nullptr) {
+                ggml_cuda_hc_post_args hcp;
+                hcp.bo       = (const float *) x->data;
+                hcp.residual = (const float *) residual->data;
+                hcp.post     = (const float *) post_src->data;
+                hcp.sbo1     = x->nb[1] / sizeof(float);
+                hcp.sr1      = residual->nb[1] / sizeof(float);
+                hcp.sr2      = residual->nb[2] / sizeof(float);
+                hcp.hc       = (int) hc;
+                hcp.n_ops    = n_chain;
+                for (int j = 0; j < n_chain; ++j) {
+                    hcp.op[j] = cgraph->nodes[i + j]->op == GGML_OP_SCALE ? 0 : 1;
+                    const ggml_tensor * t = cgraph->nodes[i + j];
+                    hcp.p0[j] = 0.0f;
+                    hcp.p1[j] = 0.0f;
+                    if (t->op == GGML_OP_SCALE) {
+                        memcpy(&hcp.p0[j], (const float *) t->op_params + 0, sizeof(float));
+                        memcpy(&hcp.p1[j], (const float *) t->op_params + 1, sizeof(float));
+                    }
+                }
+                ggml_cuda_op_rms_norm_fused(*cuda_ctx, rn, mul, q8_1_out, nullptr, &hcp);
+                return irn + 1 - i;
+            }
+        }
+    }
+    return 0;
+}
+
 // elementwise chain -> DSV4_HC_POST (no comb) where the chain computes the post weights: one kernel, the chain applied to the
 // weight each thread reads. Returns the number of extra nodes covered (0 = no fusion).
 // GGML_CUDA_DISABLE_HC_POST_CHAIN_FUSION=1 turns it off.
@@ -4463,12 +4805,18 @@ static int ggml_cuda_try_fuse_hc_post_chain(ggml_backend_cuda_context * cuda_ctx
         }
     }
 
+    if (const int n = ggml_cuda_try_fuse_hc_post_norm(cuda_ctx, cgraph, i, n_chain, ip)) {
+        return n;
+    }
+
     ggml_cuda_op_hc_post_chain(*cuda_ctx, chain, post_src, hc_post);
     return n_chain;
 }
 
 // UNARY(gate) -> MUL(x, gate) where gate has one element per row of x: shared expert gates
-static bool ggml_cuda_try_fuse_unary_mul_gate(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+// returns the number of extra nodes covered (0 = no fusion): 1, or 2 with a following ADD of the product (k15-fn,
+// GGML_CUDA_DISABLE_GATE_MUL_ADD_FUSION=1 turns that part off)
+static int ggml_cuda_try_fuse_unary_mul_gate(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_GATE_MUL_FUSION");
     if (disabled || i + 1 >= cgraph->n_nodes) {
         return false;
@@ -4494,8 +4842,21 @@ static bool ggml_cuda_try_fuse_unary_mul_gate(ggml_backend_cuda_context * cuda_c
     if (ggml_cuda_tensors_overlap(mul, g) || !ggml_cuda_elementwise_alias_ok(mul, x)) {
         return false;
     }
+    static const bool add_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_GATE_MUL_ADD_FUSION");
+    if (!add_disabled && i + 2 < cgraph->n_nodes) {
+        ggml_tensor * add = cgraph->nodes[i + 2];
+        const ggml_tensor * a = add->op == GGML_OP_ADD ? (add->src[0] == mul ? add->src[1] : add->src[1] == mul ? add->src[0] : nullptr) : nullptr;
+        if (a != nullptr && a != mul && (add->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_node_has_n_uses(cgraph, i + 1, 1) &&
+                a->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 && ggml_are_same_shape(a, add) && ggml_are_same_shape(mul, add) &&
+                ggml_is_contiguous(a) && ggml_is_contiguous(add) && !ggml_cuda_tensors_overlap(add, g) &&
+                ggml_cuda_elementwise_alias_ok(add, x) && ggml_cuda_elementwise_alias_ok(add, a) &&
+                ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD }, { i + 2 })) {
+            ggml_cuda_op_unary_mul_gate_add(*cuda_ctx, unary, mul, add);
+            return 2;
+        }
+    }
     ggml_cuda_op_unary_mul_gate(*cuda_ctx, unary, mul);
-    return true;
+    return 1;
 }
 
 // ADD(a, bias) -> UNARY -> MUL(., scale) with bias and scale one row each: the delta-net alpha gate
@@ -4762,7 +5123,11 @@ static bool ggml_cuda_mmvq_multi_runtime_ok(const ggml_backend_cuda_context * ct
             ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, false) || !ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         return false;
     }
-    return ggml_cuda_mul_mat_vec_q_multi_ok(src0->type, src0->ne[0], ne11, exact, cc);
+    const bool ok = ggml_cuda_mul_mat_vec_q_multi_ok(src0->type, src0->ne[0], ne11, exact, cc);
+    if (ok && exact && ne11 > 1) {
+        ggml_cuda_verify_mmq_log(node, cc, "multi-matrix batched mmvq (not VERIFY_MMQ)");
+    }
+    return ok;
 }
 
 static bool ggml_cuda_mmvq_multi_overlap(const ggml_tensor * a, const ggml_tensor * b) {
@@ -4998,6 +5363,178 @@ static int ggml_cuda_try_fuse_mmvq_multi(ggml_backend_cuda_context * cuda_ctx, g
     return run;
 }
 
+// k15-fn (GGML_CUDA_GDN_STATE_IN_PLACE=0 off): the gather of one recurrent-state row (build_rs, a GET_ROWS of the cache rows by the
+// rollback-group ids) whose only reader is a gated_delta_net of one sequence is skipped, and the kernel reads that row from the cache
+// through the same ids: bitwise the same state, no 3 MiB copy per layer and step (Qwen3.8-Flash-Next: 36 GDN layers, 108 MiB per verify).
+// Not for the mma kernel (it reads a contiguous state), nor when the gathered rows have another reader
+static bool ggml_cuda_try_gdn_state_in_place(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool enabled = getenv("GGML_CUDA_GDN_STATE_IN_PLACE") == nullptr || atoi(getenv("GGML_CUDA_GDN_STATE_IN_PLACE")) != 0;
+    if (!enabled || ggml_cuda_fusion_disabled()) {
+        return false;
+    }
+    const ggml_tensor * gr   = cgraph->nodes[i];
+    const ggml_tensor * rows = gr->src[0];
+    const ggml_tensor * ids  = gr->src[1];
+    if (gr->type != GGML_TYPE_F32 || rows->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        gr->ne[1] != 1 || gr->ne[2] != 1 || gr->ne[3] != 1 || ids->ne[0] != 1 || !ggml_is_contiguous(ids) ||
+        rows->nb[0] != sizeof(float) || rows->ne[2] != 1 || rows->ne[3] != 1 || rows->nb[1] % sizeof(float) != 0 ||
+        rows->data == nullptr || ids->data == nullptr) {
+        return false;
+    }
+    const ggml_tensor * gdn = nullptr;
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * s = n->src[k];
+            if (s == nullptr || (s != gr && s->view_src != gr)) {
+                continue;
+            }
+            if (ggml_cuda_is_view_or_noop(n) && n->view_src == gr) {
+                continue; // a view of the rows: its readers read gr too and are checked themselves
+            }
+            if (n->op == GGML_OP_CPY && ggml_nelements(n->src[0]) == 0) {
+                continue; // the copy of the extra states, empty with one state
+            }
+            if (n->op == GGML_OP_GATED_DELTA_NET && k == 5 && gdn == nullptr && s->view_offs == 0 && ggml_nelements(s) == gr->ne[0] &&
+                ggml_is_contiguous(s) && n->src[2]->ne[3] == 1 && !ggml_cuda_gated_delta_net_may_use_mma(n)) {
+                gdn = n;
+                continue;
+            }
+            return false;
+        }
+    }
+    if (gdn == nullptr) {
+        return false;
+    }
+    // the kernel reads the row the gather would have copied: rows + ids[0] * nb[1]
+    cuda_ctx->gdn_state_in_place[gdn] = { (const float *) rows->data, (int64_t) (rows->nb[1] / sizeof(float)), (const int32_t *) ids->data };
+    return true;
+}
+
+// k15-fn: the gated_delta_net (non-KDA, one sequence, not the mma kernel) that is the only reader of t (through views of t; its src[k] a
+// contiguous whole view of t), or -1
+static int ggml_cuda_sole_gdn_reader(const ggml_cgraph * cgraph, int i, const ggml_tensor * t, int k_expected) {
+    int gdn = -1;
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * s = n->src[k];
+            if (s == nullptr || (s != t && s->view_src != t)) {
+                continue;
+            }
+            if (ggml_cuda_is_view_or_noop(n) && n->view_src == t) {
+                continue;
+            }
+            if (n->op == GGML_OP_GATED_DELTA_NET && k == k_expected && gdn < 0 && s->view_offs == 0 && ggml_nelements(s) == ggml_nelements(t) &&
+                ggml_is_contiguous(s) && n->src[3]->ne[0] == 1 && n->src[2]->ne[3] == 1 && !ggml_cuda_gated_delta_net_may_use_mma(n)) {
+                gdn = j;
+                continue;
+            }
+            return -1;
+        }
+    }
+    return gdn;
+}
+
+static bool ggml_cuda_gdn_sigmoid_deferred(const ggml_cgraph * cgraph, int i);
+
+// k15-fn: no node between i and j writes over the bytes of t (the allocator may reuse them once their last planned reader ran); a beta
+// sigmoid that its gated_delta_net applies itself (ggml_cuda_gdn_sigmoid_deferred) writes nothing
+static bool ggml_cuda_kept_until(const ggml_cgraph * cgraph, int i, int j, const ggml_tensor * t, bool skip_deferred = false) {
+    for (int m = i + 1; m < j; ++m) {
+        const ggml_tensor * n = cgraph->nodes[m];
+        if (ggml_cuda_is_view_or_noop(n) || n->data == nullptr) {
+            continue;
+        }
+        if (skip_deferred && ggml_cuda_gdn_sigmoid_deferred(cgraph, m)) {
+            continue;
+        }
+        if (ggml_cuda_tensors_overlap(n, t)) {
+            static const bool dbg = getenv("GGML_CUDA_GDN_GATES_DEBUG") != nullptr;
+            if (dbg) {
+                GGML_LOG_INFO("%s: %s overwritten by node %d %s (%s)\n", __func__, t->name, m - i, n->name, ggml_op_desc(n));
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+// k15-fn: the beta sigmoid at node i is applied by the gated_delta_net that reads it (ggml_cuda_try_gdn_gates), so it is not run
+static bool ggml_cuda_gdn_sigmoid_deferred(const ggml_cgraph * cgraph, int i) {
+    static const bool enabled = getenv("GGML_CUDA_GDN_GATES") == nullptr || atoi(getenv("GGML_CUDA_GDN_GATES")) != 0;
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (!enabled || ggml_cuda_fusion_disabled() || node->op != GGML_OP_UNARY || ggml_get_unary_op(node) != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+    const ggml_tensor * raw = node->src[0];
+    if (node->type != GGML_TYPE_F32 || raw->type != GGML_TYPE_F32 || !ggml_is_contiguous(node) || !ggml_is_contiguous(raw) ||
+        (node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const int j = ggml_cuda_sole_gdn_reader(cgraph, i, node, 4);
+    return j >= 0 && ggml_cuda_kept_until(cgraph, i, j, raw);
+}
+
+// k15-fn (GGML_CUDA_GDN_GATES=0 off): the delta-net gates beta = sigmoid(b) and g = softplus(a + dt_bias) * A, each read only by a
+// gated_delta_net, are applied by that kernel to its raw inputs: two launches fewer per layer (Qwen3.8-Flash-Next: 72 per verify), the
+// same float operations, so bitwise. Returns the nodes covered (1 for the sigmoid, 3 for ADD -> SOFTPLUS -> MUL), 0 if not applicable
+static int ggml_cuda_try_gdn_gates(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool enabled = getenv("GGML_CUDA_GDN_GATES") == nullptr || atoi(getenv("GGML_CUDA_GDN_GATES")) != 0;
+    if (!enabled || ggml_cuda_fusion_disabled()) {
+        return 0;
+    }
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID) {
+        if (!ggml_cuda_gdn_sigmoid_deferred(cgraph, i)) {
+            return 0;
+        }
+        const int j = ggml_cuda_sole_gdn_reader(cgraph, i, node, 4);
+        cuda_ctx->gdn_gates_in[cgraph->nodes[j]].beta_raw = (const float *) node->src[0]->data;
+        return 1;
+    }
+    if (node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes) {
+        const ggml_tensor * add   = node;
+        const ggml_tensor * unary = cgraph->nodes[i + 1];
+        const ggml_tensor * mul   = cgraph->nodes[i + 2];
+        if (unary->op != GGML_OP_UNARY || ggml_get_unary_op(unary) != GGML_UNARY_OP_SOFTPLUS || unary->src[0] != add || mul->op != GGML_OP_MUL ||
+            (mul->src[0] == unary) == (mul->src[1] == unary)) {
+            return 0;
+        }
+        const ggml_op ops[3] = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL };
+        if (!ggml_can_fuse(cgraph, i, ops, 3) || (mul->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+        const ggml_tensor * a     = ggml_are_same_shape(add->src[0], add) ? add->src[0] : add->src[1];
+        const ggml_tensor * bias  = a == add->src[0] ? add->src[1] : add->src[0];
+        const ggml_tensor * scale = mul->src[0] == unary ? mul->src[1] : mul->src[0];
+        if (a->type != GGML_TYPE_F32 || bias->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(a, add) || !ggml_are_same_shape(a, mul) || !ggml_is_contiguous(a) || !ggml_is_contiguous(mul) ||
+            bias->ne[0] != a->ne[0] || scale->ne[0] != a->ne[0] || ggml_nrows(bias) != 1 || ggml_nrows(scale) != 1 ||
+            !ggml_is_contiguous(bias) || !ggml_is_contiguous(scale)) {
+            return 0;
+        }
+        const int j = ggml_cuda_sole_gdn_reader(cgraph, i + 2, mul, 3);
+        static const bool dbg = getenv("GGML_CUDA_GDN_GATES_DEBUG") != nullptr;
+        if (dbg) {
+            GGML_LOG_INFO("%s: %s: reader %d, heads %lld / %lld, a kept %d\n", __func__, mul->name, j, j >= 0 ? (long long) cgraph->nodes[j]->src[2]->ne[1] : -1LL,
+                (long long) a->ne[0], j >= 0 ? (int) ggml_cuda_kept_until(cgraph, i + 2, j, a, true) : -1);
+        }
+        // the gate row index of the kernel is its head: a's rows are the heads ([H, T, S], as the kernel's g [1, H, T, S])
+        // the chain's own nodes are not run, so an in-place ADD / SOFTPLUS / MUL over a does not count
+        if (j < 0 || cgraph->nodes[j]->src[2]->ne[1] != a->ne[0] || !ggml_cuda_kept_until(cgraph, i + 2, j, a, true) ||
+            !ggml_cuda_kept_until(cgraph, i + 2, j, bias, true) || !ggml_cuda_kept_until(cgraph, i + 2, j, scale, true)) {
+            return 0;
+        }
+        auto & e = cuda_ctx->gdn_gates_in[cgraph->nodes[j]];
+        e.a     = (const float *) a->data;
+        e.bias  = (const float *) bias->data;
+        e.scale = (const float *) scale->data;
+        return 3;
+    }
+    return 0;
+}
+
 static bool ggml_cuda_side_mv_run(const ggml_tensor * node);
 
 // k15-mm2: the same for the F32 / BF16 vector kernel (ggml_cuda_mul_mat_vec_f_multi): products of one weight type and K over one
@@ -5124,6 +5661,207 @@ static int ggml_cuda_try_fuse_mmvf_multi(ggml_backend_cuda_context * cuda_ctx, g
     return run;
 }
 
+// k15-mm2: SCALE / SILU chain (each node read only by the next) -> MUL_MAT whose src1 is the chain end, a short-K dense Q8_0
+// product of 1..4 columns (the hyper-connection up projection behind silu(scale(down))): the product's blocks apply the chain and
+// quantize its output themselves (ggml_cuda_mul_mat_vec_q_ew), one launch in place of the chain kernel, quantize_q8_1 and
+// mul_mat_vec_q, with the same bytes. Opt-in, GGML_CUDA_MMVQ_EW=1. Returns the number of extra nodes covered.
+static int ggml_cuda_try_fuse_ew_mmvq(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    // opt-in (GGML_CUDA_MMVQ_EW=1): measured slower on B200 at the Flash-Next verify (+5% per forward), every block repeats the chain
+    static const bool off = [] { const char * e = getenv("GGML_CUDA_MMVQ_EW"); return e == nullptr || atoi(e) == 0; }();
+    if (off || cuda_ctx->curr_stream_no != 0) {
+        return 0;
+    }
+    int   ops[GGML_CUDA_MMVQ_EW_MAX];
+    float p0[GGML_CUDA_MMVQ_EW_MAX];
+    float p1[GGML_CUDA_MMVQ_EW_MAX];
+    int n = 0;
+    const ggml_tensor * ew_src = cgraph->nodes[i]->src[0];
+    while (i + n < cgraph->n_nodes && n < GGML_CUDA_MMVQ_EW_MAX) {
+        const ggml_tensor * t = cgraph->nodes[i + n];
+        const bool is_scale = t->op == GGML_OP_SCALE;
+        const bool is_silu  = t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SILU;
+        if (!(is_scale || is_silu) || t->type != GGML_TYPE_F32 || t->src[0] == nullptr || t->src[0]->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(t) || !ggml_is_contiguous(t->src[0]) || !ggml_are_same_shape(t, t->src[0]) ||
+                !(t->flags & GGML_TENSOR_FLAG_COMPUTE) || (n > 0 && t->src[0] != cgraph->nodes[i + n - 1]) ||
+                !ggml_node_has_n_uses(cgraph, i + n, 1)) {
+            break;
+        }
+        ops[n] = is_scale ? 0 : 1;
+        p0[n]  = 0.0f;
+        p1[n]  = 0.0f;
+        if (is_scale) {
+            memcpy(&p0[n], (const float *) t->op_params + 0, sizeof(float));
+            memcpy(&p1[n], (const float *) t->op_params + 1, sizeof(float));
+        }
+        n++;
+    }
+    if (n == 0 || i + n >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * mm = cgraph->nodes[i + n];
+    const ggml_tensor * last = cgraph->nodes[i + n - 1];
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != last || !(mm->flags & GGML_TENSOR_FLAG_COMPUTE) || mm->view_src != nullptr ||
+            cuda_ctx->mmvq_done_early.count(mm)) {
+        return 0;
+    }
+    const ggml_tensor * src0 = mm->src[0];
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    const int64_t ne11 = mm->ne[1];
+    const int64_t ne11_k = (mm->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) ? 1 : ne11; // batch invariant: as one column
+    // the kernel the unfused product would take (ggml_cuda_mul_mat): mul_mat_vec_q
+    if (src0->buffer == nullptr ||
+            ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE || ggml_cuda_op_mul_mat_use_fwht(mm) ||
+            !ggml_cuda_mul_mat_vec_q_ew_ok(src0, mm, cc) || ew_src->ne[0] != src0->ne[0] || ew_src->ne[1] != ne11 ||
+            !ggml_is_contiguous(ew_src) || ggml_cuda_should_use_mmf(src0->type, cc, 32, src0->ne, src0->nb, ne11_k, false) ||
+            !ggml_cuda_should_use_mmvq(src0->type, cc, ne11_k)) {
+        return 0;
+    }
+    // every block reads the whole chain input while others write their rows: they must not share memory
+    if (ggml_cuda_tensors_overlap(mm, ew_src)) {
+        return 0;
+    }
+    ggml_cuda_mul_mat_vec_q_ew(*cuda_ctx, src0, ew_src, n, ops, p0, p1, mm);
+    return n;
+}
+
+// k15-fn (GGML_CUDA_DISABLE_QSA_IDX_FUSION=1 off): the QSA dead-slot index map of each layer, i32 -> f32 cast, (idx - dump) * live + dump,
+// f32 -> i32 cast (5 launches), as one kernel. The same float operations in the same order, rounded as the separate kernels round
+// them (explicit _rn intrinsics, no contraction into an FMA), and the casts as ggml_cuda_cast does them
+static __global__ void k_qsa_idx_select(const int32_t * __restrict__ idx, const float * __restrict__ dump, const float * __restrict__ live,
+        int32_t * __restrict__ dst, const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const float f = ggml_cuda_cast<float>(idx[i]);
+    const float d = dump[i];
+    const float r = __fadd_rn(__fmul_rn(__fsub_rn(f, d), live[i]), d);
+    dst[i] = ggml_cuda_cast<int32_t>(r);
+}
+
+// the same map in one block, results staged in shared memory before any is written: safe when dst overlaps an input at an offset
+static __global__ void k_qsa_idx_select_staged(const int32_t * __restrict__ idx, const float * __restrict__ dump, const float * __restrict__ live,
+        int32_t * __restrict__ dst, const int n) {
+    extern __shared__ int32_t staged[];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float f = ggml_cuda_cast<float>(idx[i]);
+        const float d = dump[i];
+        const float r = __fadd_rn(__fmul_rn(__fsub_rn(f, d), live[i]), d);
+        staged[i] = ggml_cuda_cast<int32_t>(r);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        dst[i] = staged[i];
+    }
+}
+
+static int ggml_cuda_try_fuse_qsa_idx(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    // (before the overlap rule below the 8k / 16k md5 on G4 fn4 IQ4_XS 32 GB Studio varied from launch to launch: k15gd2_g4, k15ge_g4;
+    // with it stable and equal to the kill switch, k15gv_g4)
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_QSA_IDX_FUSION");
+    if (disabled || i + 4 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * c1  = cgraph->nodes[i];
+    ggml_tensor * sub = cgraph->nodes[i + 1];
+    ggml_tensor * mul = cgraph->nodes[i + 2];
+    ggml_tensor * add = cgraph->nodes[i + 3];
+    ggml_tensor * c2  = cgraph->nodes[i + 4];
+    const auto f32c = [&](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_are_same_shape(t, c1);
+    };
+    if (c1->op != GGML_OP_CPY || c1->src[0]->type != GGML_TYPE_I32 || !ggml_is_contiguous(c1->src[0]) || !f32c(c1) ||
+            !ggml_are_same_shape(c1, c1->src[0]) ||
+            sub->op != GGML_OP_SUB || sub->src[0] != c1 || !f32c(sub) || !f32c(sub->src[1]) ||
+            mul->op != GGML_OP_MUL || mul->src[0] != sub || !f32c(mul) || !f32c(mul->src[1]) ||
+            add->op != GGML_OP_ADD || add->src[0] != mul || add->src[1] != sub->src[1] || !f32c(add) ||
+            c2->op != GGML_OP_CPY || c2->src[0] != add || c2->type != GGML_TYPE_I32 || !ggml_is_contiguous(c2) || !ggml_are_same_shape(c2, c1)) {
+        return 0;
+    }
+    // read only by the next node of the chain (a cast is also its own src[1], see ggml_cast)
+    for (int k = 0; k < 4; ++k) {
+        const ggml_tensor * t = cgraph->nodes[i + k];
+        const int self = t->op == GGML_OP_CPY && t->src[1] == t ? 1 : 0;
+        if (ggml_node_get_use_count(cgraph, i + k) != 1 + self || t->view_src != nullptr || (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+    }
+    // the cast of a CPY node writes its src[1] (dst view): the result tensor is c2 itself here (ggml_cast)
+    if (c2->src[1] != nullptr && c2->src[1]->data != c2->data) {
+        return 0;
+    }
+    // the allocator may place c2 in memory freed inside the chain (live after the mul, dump after the add): the separate kernels finish
+    // reading it first, one grid would race with its other threads unless c2 starts exactly where the input does (element i of both
+    // belongs to thread i). Then one block stages every result before writing any (decode / verify sizes), else no fusion.
+    // G4 fn4 32 GB: 8k md5 changed from launch to launch without this (k15gd2_g4, k15ge_g4); 8 of 12 layers overlap in the fn1 verify graph
+    bool overlap = false;
+    for (const ggml_tensor * in : { c1->src[0], sub->src[1], mul->src[1] }) {
+        overlap = overlap || (in->data != c2->data && ggml_cuda_tensors_overlap(in, c2));
+    }
+    const int64_t n_all = ggml_nelements(c1);
+    if (overlap && n_all > 8192) {
+        return 0;
+    }
+    const int64_t n = n_all;
+    if (overlap) {
+        k_qsa_idx_select_staged<<<1, 1024, n*sizeof(int32_t), cuda_ctx->stream()>>>((const int32_t *) c1->src[0]->data,
+            (const float *) sub->src[1]->data, (const float *) mul->src[1]->data, (int32_t *) c2->data, (int) n);
+    } else {
+        const int block = 256;
+        k_qsa_idx_select<<<(unsigned) ((n + block - 1)/block), block, 0, cuda_ctx->stream()>>>((const int32_t *) c1->src[0]->data,
+            (const float *) sub->src[1]->data, (const float *) mul->src[1]->data, (int32_t *) c2->data, n);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return 4;
+}
+
+// k15-fn (GGML_CUDA_DISABLE_SET_ROWS_PAIR=1 off): a SET_ROWS whose next compute node is another SET_ROWS of the same types (the K and
+// V cache stores of an attention layer, the two index-cache stores of a QSA layer) runs with it in one launch. Neither reads or writes
+// the tensor the other writes (different view roots), so the order between them does not matter. Returns the extra nodes covered.
+static const ggml_tensor * ggml_cuda_view_root(const ggml_tensor * t) {
+    while (t != nullptr && t->view_src != nullptr) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+static int ggml_cuda_try_fuse_set_rows_pair(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_SET_ROWS_PAIR") || getenv("GGML_CUDA_SET_ROWS_CHECK") != nullptr;
+    const ggml_tensor * a = cgraph->nodes[i];
+    if (disabled || a->op != GGML_OP_SET_ROWS) {
+        return 0;
+    }
+    int j = i + 1;
+    while (j < cgraph->n_nodes && j <= i + 4 && (ggml_cuda_is_view_or_noop(cgraph->nodes[j]) || (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)) {
+        j++;
+    }
+    if (j >= cgraph->n_nodes || j > i + 4) {
+        return 0;
+    }
+    const ggml_tensor * b = cgraph->nodes[j];
+    if (b->op != GGML_OP_SET_ROWS || (b->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !ggml_cuda_set_rows_pair_supported(a, b)) {
+        return 0;
+    }
+    if (!cuda_ctx->qsa_skip.empty() && (cuda_ctx->qsa_skip.count(a) || cuda_ctx->qsa_skip.count(b))) {
+        return 0;
+    }
+    const ggml_tensor * ra = ggml_cuda_view_root(a);
+    const ggml_tensor * rb = ggml_cuda_view_root(b);
+    if (ra == rb || ggml_cuda_view_root(b->src[0]) == ra || ggml_cuda_view_root(b->src[1]) == ra ||
+            ggml_cuda_view_root(a->src[0]) == rb || ggml_cuda_view_root(a->src[1]) == rb) {
+        return 0;
+    }
+    // the skipped views between them are not read by b as a's output (checked above through the roots)
+    if (!ggml_cuda_set_rows_pair(*cuda_ctx, a, b)) {
+        return 0;
+    }
+    static int64_t n_pairs = 0;
+    if (n_pairs++ == 0) {
+        GGML_LOG_INFO("%s: SET_ROWS pairs in one launch (%s + %s; GGML_CUDA_DISABLE_SET_ROWS_PAIR=1 off)\n", __func__, a->name, b->name);
+    }
+    return j - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -5131,6 +5869,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_SCALE || node->op == GGML_OP_UNARY) {
+        if (const int n = ggml_cuda_try_fuse_ew_mmvq(cuda_ctx, cgraph, i)) {
+            return n;
+        }
+    }
 
     if (node->op == GGML_OP_ADD) {
         if (const int n = ggml_cuda_try_fuse_add_rms_norm(cuda_ctx, cgraph, i)) {
@@ -5890,6 +6634,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    {
+        // k15-fn: the multi-section rope after a q / k norm (qwen4exp attention + indexer q), in the norm kernel
+        // (GGML_CUDA_DISABLE_NORM_MROPE_FUSION=1 turns it off)
+        static const bool mrope_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_NORM_MROPE_FUSION");
+        if (!mrope_disabled && node->op == GGML_OP_RMS_NORM &&
+                ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }) &&
+                ggml_cuda_should_fuse_rms_norm_mul_mrope(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+            int out_nodes[] = { i + 2 };
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 1)) {
+                ggml_cuda_op_rms_norm_mul_mrope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+                return 2;
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;
@@ -5949,6 +6708,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST }, { GGML_UNARY_OP_SIGMOID })) {
+        if (cgraph->nodes[i + 3]->src[2] == cgraph->nodes[i + 2]) {
+            if (const int n = ggml_cuda_try_fuse_hc_post_norm(cuda_ctx, cgraph, i, 3, i + 3)) {
+                return n;
+            }
+        }
         ggml_cuda_op_dsv4_hc_post(*cuda_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2]);
         return 3;
     }
@@ -5958,8 +6722,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
-    if (node->op == GGML_OP_UNARY && ggml_cuda_try_fuse_unary_mul_gate(cuda_ctx, cgraph, i)) {
-        return 1;
+    if (node->op == GGML_OP_UNARY) {
+        const int n_gate = ggml_cuda_try_fuse_unary_mul_gate(cuda_ctx, cgraph, i);
+        if (n_gate > 0) {
+            return n_gate;
+        }
     }
 
     if (const int n_skip = ggml_cuda_try_fuse_amax_rescale(cuda_ctx, cgraph, i); n_skip > 0) {
@@ -5971,6 +6738,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (const int n_skip = ggml_cuda_try_fuse_ew_chain(cuda_ctx, cgraph, i); n_skip > 0) {
+        return n_skip;
+    }
+
+    if (const int n_skip = ggml_cuda_try_fuse_set_rows_pair(cuda_ctx, cgraph, i); n_skip > 0) {
+        return n_skip;
+    }
+
+    if (const int n_skip = ggml_cuda_try_fuse_qsa_idx(cuda_ctx, cgraph, i); n_skip > 0) {
         return n_skip;
     }
 
@@ -6005,8 +6780,19 @@ static bool ggml_cuda_side_mv_candidate(const ggml_tensor * node) {
         src1->ne[2] == 1 && src1->ne[3] == 1 && node->type == GGML_TYPE_F32;
 }
 
+// k15-mm2: products of at most 4 rows also at up to GGML_CUDA_SIDE_MV_COLS columns (default 4: the MTP verify windows; 1 = single
+// column only, as before), so a verify's hyper-connection inject and shared expert gate run beside the products after them instead
+// of before them. Wider weights (alpha / beta) keep their multi-matrix launch at several columns. Same kernels, same values.
 static bool ggml_cuda_side_mv_run(const ggml_tensor * node) {
-    return ggml_cuda_side_mv_candidate(node) && node->src[1]->ne[1] == 1;
+    static const int max_cols = getenv("GGML_CUDA_SIDE_MV_COLS") ? std::max(1, atoi(getenv("GGML_CUDA_SIDE_MV_COLS"))) : 4;
+    if (!ggml_cuda_side_mv_candidate(node)) {
+        return false;
+    }
+    const int64_t ncols = node->src[1]->ne[1];
+    // at several columns only long-K ones (the hc inject, K = 10240): a short-K tiny product (the shared expert gate, K = 2560) joins
+    // the multi-matrix launch of its neighbour instead (the router: one launch fewer), GGML_CUDA_SIDE_MV_COLS_MIN_K (default 4096)
+    static const int64_t min_k = getenv("GGML_CUDA_SIDE_MV_COLS_MIN_K") ? atoll(getenv("GGML_CUDA_SIDE_MV_COLS_MIN_K")) : 4096;
+    return ncols == 1 || (ncols <= max_cols && node->src[0]->ne[1] <= 4 && node->src[0]->ne[0] >= min_k);
 }
 
 // The side stream is only used while a decode-sized graph is captured into a CUDA graph. Used eagerly, it cost more than it saved:
@@ -6245,10 +7031,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_pool_alloc<char> q8_1_cache_arena(cuda_ctx->pool());
             {
                 std::unordered_set<const void *> norm_targets;
-                const size_t slot_size = stream_ctx.concurrent_events.empty() ? ggml_cuda_q8_1_cache_slot_size(cgraph, norm_targets) : 0;
+                std::unordered_map<const void *, int64_t> target_ne10;
+                const size_t slot_size = stream_ctx.concurrent_events.empty() ? ggml_cuda_q8_1_cache_slot_size(cgraph, norm_targets, target_ne10) : 0;
                 if (slot_size > 0) {
                     cuda_ctx->q8_1_cache.begin(q8_1_cache_arena.alloc(ggml_cuda_q8_1_cache::n_slots*slot_size), slot_size);
                     cuda_ctx->q8_1_cache.norm_targets = std::move(norm_targets);
+                    cuda_ctx->q8_1_cache.target_ne10  = std::move(target_ne10);
                 }
             }
 
@@ -6285,6 +7073,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             };
 
             cuda_ctx->mmvq_done_early.clear();
+            cuda_ctx->gdn_state_in_place.clear();
+            cuda_ctx->gdn_gates_in.clear();
             ggml_cuda_qsa_maskless_plan(cuda_ctx, cgraph);
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -6367,6 +7157,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     // computed by an earlier multi-matrix mul_mat_vec_q launch (ggml_cuda_try_fuse_mmvq_multi)
                     ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 1);
                     continue;
+                }
+
+                if (node->op == GGML_OP_GET_ROWS && ggml_cuda_try_gdn_state_in_place(cuda_ctx, cgraph, i)) {
+                    // the gated_delta_net that reads this row reads it from the cache instead
+                    ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 1);
+                    continue;
+                }
+
+                if (node->op == GGML_OP_UNARY || node->op == GGML_OP_ADD) {
+                    const int n_gate = ggml_cuda_try_gdn_gates(cuda_ctx, cgraph, i);
+                    if (n_gate > 0) {
+                        // the gated_delta_net that reads this gate computes it itself
+                        ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, n_gate);
+                        i += n_gate - 1;
+                        continue;
+                    }
                 }
 
                 // the share flag is set only for the unfused node: a fused group may hold pool memory around its products
@@ -6460,6 +7266,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->src1_memo.share_next = false;
             cuda_ctx->q8_1_cache.end();
             cuda_ctx->mmvq_done_early.clear();
+            cuda_ctx->gdn_state_in_place.clear();
+            cuda_ctx->gdn_gates_in.clear();
         }
 
         // an overlapped MoE cache fetch whose join is not in this graph (another split): the side stream joins the main stream
@@ -6479,6 +7287,64 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph_evaluated_or_captured = true; // CUDA graph has been captured
+            // k15-fn debug (GGML_CUDA_GRAPH_NODE_STATS=1): the node types of each captured graph (a host<->device memcpy node makes the
+            // launch cost grow with the node count: B200 2000 kernels 5.7 us, with memcpy nodes 102 us)
+            static const bool node_stats = getenv("GGML_CUDA_GRAPH_NODE_STATS") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_NODE_STATS")) != 0;
+            if (node_stats) {
+                // =2: also the copy / gather ops of the ggml graph by op and tensor name (layer numbers stripped)
+                if (atoi(getenv("GGML_CUDA_GRAPH_NODE_STATS")) >= 2) {
+                    std::map<std::string, int> ops;
+                    for (int i = 0; i < cgraph->n_nodes; ++i) {
+                        const ggml_tensor * t = cgraph->nodes[i];
+                        if (t->op != GGML_OP_CPY && t->op != GGML_OP_CONT && t->op != GGML_OP_DUP && t->op != GGML_OP_CONCAT &&
+                            t->op != GGML_OP_GET_ROWS && t->op != GGML_OP_SET_ROWS && t->op != GGML_OP_REPEAT) {
+                            continue;
+                        }
+                        std::string nm;
+                        for (const char * c = t->name; *c; ++c) {
+                            if (*c < '0' || *c > '9') { nm += *c; }
+                        }
+                        char key[256];
+                        const ggml_tensor * s0 = t->src[0];
+                        snprintf(key, sizeof(key), "%s %s [%lld,%lld,%lld] %s%s <- %s", ggml_op_name(t->op), nm.c_str(), (long long) t->ne[0], (long long) t->ne[1],
+                            (long long) t->ne[2], ggml_type_name(t->type), s0 && !ggml_is_contiguous(s0) ? " (src non-contig)" : "", s0 ? ggml_op_name(s0->op) : "-");
+                        ops[key]++;
+                    }
+                    for (auto & [k, v] : ops) {
+                        GGML_LOG_INFO("%s:   copy/gather op x%d: %s\n", __func__, v, k.c_str());
+                    }
+                }
+                for (auto & [k, v] : ggml_cuda_exec_copy_ops[cuda_ctx]) {
+                    GGML_LOG_INFO("%s:   executed copy/gather x%d (%.2f MiB): %s\n", __func__, v.first, v.second/1048576.0, k.c_str());
+                }
+                ggml_cuda_exec_copy_ops[cuda_ctx].clear();
+                size_t n_nodes = 0;
+                CUDA_CHECK(cudaGraphGetNodes(graph->graph, nullptr, &n_nodes));
+                std::vector<cudaGraphNode_t> nodes(n_nodes);
+                CUDA_CHECK(cudaGraphGetNodes(graph->graph, nodes.data(), &n_nodes));
+                int cnt[16] = { 0 };
+                int n_h2d = 0, n_d2h = 0, n_d2d = 0;
+                for (cudaGraphNode_t nd : nodes) {
+                    cudaGraphNodeType t;
+                    CUDA_CHECK(cudaGraphNodeGetType(nd, &t));
+                    cnt[std::min((int) t, 15)]++;
+                    if (t == cudaGraphNodeTypeMemcpy) {
+                        cudaMemcpy3DParms p = {};
+                        CUDA_CHECK(cudaGraphMemcpyNodeGetParams(nd, &p));
+                        cudaPointerAttributes as = {}, ad = {};
+                        cudaPointerGetAttributes(&as, p.srcPtr.ptr);
+                        cudaPointerGetAttributes(&ad, p.dstPtr.ptr);
+                        (void) cudaGetLastError();
+                        const bool sd = as.type == cudaMemoryTypeDevice, dd = ad.type == cudaMemoryTypeDevice;
+                        n_h2d += !sd && dd; n_d2h += sd && !dd; n_d2d += sd && dd;
+                    }
+                }
+                GGML_LOG_INFO("%s: captured graph of %d ggml nodes: %zu CUDA nodes, %d kernels, %d memcpy (%d H2D, %d D2H, %d D2D), %d memset, %d host, %d event record, %d event wait, %d empty, %d other\n",
+                    __func__, cgraph->n_nodes, n_nodes, cnt[cudaGraphNodeTypeKernel], cnt[cudaGraphNodeTypeMemcpy], n_h2d, n_d2h, n_d2d,
+                    cnt[cudaGraphNodeTypeMemset], cnt[cudaGraphNodeTypeHost], cnt[cudaGraphNodeTypeEventRecord], cnt[cudaGraphNodeTypeWaitEvent],
+                    cnt[cudaGraphNodeTypeEmpty], (int) n_nodes - cnt[cudaGraphNodeTypeKernel] - cnt[cudaGraphNodeTypeMemcpy] - cnt[cudaGraphNodeTypeMemset] -
+                    cnt[cudaGraphNodeTypeHost] - cnt[cudaGraphNodeTypeEventRecord] - cnt[cudaGraphNodeTypeWaitEvent] - cnt[cudaGraphNodeTypeEmpty]);
+            }
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
@@ -6498,7 +7364,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph
-        CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        {
+            // k15-fn debug (GGML_CUDA_HOST_TIMING=N): the host time of the launch call alone, graphs of over 1000 ggml nodes apart
+            static const int lt_every = getenv("GGML_CUDA_HOST_TIMING") ? atoi(getenv("GGML_CUDA_HOST_TIMING")) : 0;
+            static int64_t lt_n[2] = { 0, 0 }, lt_t[2] = { 0, 0 }, lt_nodes[2] = { 0, 0 };
+            const int64_t lt0 = lt_every > 0 ? ggml_time_us() : 0;
+            CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+            if (lt_every > 0) {
+                const int bk = cgraph->n_nodes > 1000;
+                lt_n[bk]++; lt_t[bk] += ggml_time_us() - lt0; lt_nodes[bk] += cgraph->n_nodes;
+                if (lt_n[bk] % lt_every == 0) {
+                    GGML_LOG_INFO("%s: cudaGraphLaunch over the last %lld launches of %s graphs: %.1f us per launch, %.0f ggml nodes\n", __func__,
+                        (long long) lt_n[bk], bk ? "large" : "small", (double) lt_t[bk] / lt_n[bk], (double) lt_nodes[bk] / lt_n[bk]);
+                    lt_n[bk] = lt_t[bk] = lt_nodes[bk] = 0;
+                }
+            }
+        }
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -6523,8 +7404,20 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+// k15-fn debug (GGML_CUDA_HOST_TIMING=N): host time of the graph_compute phases, a summary every N calls with at least 64 nodes
+struct ggml_cuda_host_timing {
+    int every = 0;
+    int64_t n = 0, t_check = 0, t_eval = 0, n_graph = 0, n_nodes = 0;
+    ggml_cuda_host_timing() { const char * e = getenv("GGML_CUDA_HOST_TIMING"); every = e ? atoi(e) : 0; }
+};
+static ggml_cuda_host_timing & ggml_cuda_host_timing_get() { static ggml_cuda_host_timing t; return t; }
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_host_timing & ht = ggml_cuda_host_timing_get();
+    const bool ht_on = ht.every > 0 && cgraph->n_nodes >= 64;
+    const int64_t ht0 = ht_on ? ggml_time_us() : 0;
+    int64_t ht1 = ht0;
 
     ggml_cuda_set_device(cuda_ctx->device);
     cuda_ctx->computes = true;
@@ -6534,13 +7427,24 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
+    if (!cuda_ctx->graphs_skip) {
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        // a graph with the uid of the last walked one is that same graph, unchanged (the uid is renewed whenever the scheduler splits a
+        // graph, and the property compare below already returns early on it): its compatibility is the cached answer.
+        // Idea from ikawrakow/ik_llama.cpp PR #2316 (MIT)
+        bool graph_compatible;
+        if (ggml_cuda_graph_uid_enabled() && cgraph->uid != 0 && cgraph->uid == graph->compat_uid) {
+            graph_compatible = graph->compat_ok;
+        } else {
+            graph_compatible  = ggml_cuda_graph_check_compability(cgraph);
+            graph->compat_uid = cgraph->uid;
+            graph->compat_ok  = graph_compatible;
+        }
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
@@ -6570,6 +7474,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
         }
     }
+    }
 #endif // USE_CUDA_GRAPH
 
     if (use_cuda_graph && cuda_graph_update_required) {
@@ -6580,9 +7485,23 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+        ggml_cuda_exec_copy_ops[cuda_ctx].clear(); // k15-fn debug: the copies of this capture only
     }
 
+    if (ht_on) {
+        ht1 = ggml_time_us();
+    }
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    ggml_cuda_verify_mmq_summary();
+    if (ht_on) {
+        const int64_t ht2 = ggml_time_us();
+        ht.n++; ht.t_check += ht1 - ht0; ht.t_eval += ht2 - ht1; ht.n_graph += use_cuda_graph; ht.n_nodes += cgraph->n_nodes;
+        if (ht.n % ht.every == 0) {
+            GGML_LOG_INFO("%s: host timing over the last %lld calls: check %.1f us, evaluate/launch %.1f us per call, %.0f%% CUDA graphs, %.0f nodes\n",
+                __func__, (long long) ht.n, (double) ht.t_check / ht.n, (double) ht.t_eval / ht.n, 100.0 * ht.n_graph / ht.n, (double) ht.n_nodes / ht.n);
+            ht.n = ht.t_check = ht.t_eval = ht.n_graph = ht.n_nodes = 0;
+        }
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -6613,9 +7532,18 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
 }
 
 static void ggml_cuda_side_mv_plan(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+    // the last node a candidate reads is found by a scan back from it (the first node that is one of its sources: a node appears once
+    // in the graph), not from a map of every node kept up to date over the moves (0.4 ms at 4k nodes, rebuilt every graph).
+    // GGML_CUDA_SIDE_MV_SCAN=0: the map, as before
+    static const bool scan = [] {
+        const char * e = getenv("GGML_CUDA_SIDE_MV_SCAN");
+        return e == nullptr || atoi(e) != 0;
+    }();
     std::unordered_map<const ggml_tensor *, int> idx;
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        idx[cgraph->nodes[i]] = i;
+    if (!scan) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            idx[cgraph->nodes[i]] = i;
+        }
     }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -6623,10 +7551,21 @@ static void ggml_cuda_side_mv_plan(ggml_backend_cuda_context * cuda_ctx, ggml_cg
             continue;
         }
         int p = -1; // the last node it reads
-        for (int k = 0; k < GGML_MAX_SRC; ++k) {
-            const auto it = node->src[k] ? idx.find(node->src[k]) : idx.end();
-            if (it != idx.end()) {
-                p = std::max(p, it->second);
+        if (scan) {
+            for (int j = i - 1; j >= 0 && p < 0; --j) {
+                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    if (node->src[k] != nullptr && cgraph->nodes[j] == node->src[k]) {
+                        p = j;
+                        break;
+                    }
+                }
+            }
+        } else {
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                const auto it = node->src[k] ? idx.find(node->src[k]) : idx.end();
+                if (it != idx.end()) {
+                    p = std::max(p, it->second);
+                }
             }
         }
         int c = -1; // its first reader
@@ -6643,8 +7582,10 @@ static void ggml_cuda_side_mv_plan(ggml_backend_cuda_context * cuda_ctx, ggml_cg
         }
         if (i > p + 1) {
             std::rotate(cgraph->nodes + p + 1, cgraph->nodes + i, cgraph->nodes + i + 1);
-            for (int j = p + 1; j <= i; ++j) {
-                idx[cgraph->nodes[j]] = j;
+            if (!scan) {
+                for (int j = p + 1; j <= i; ++j) {
+                    idx[cgraph->nodes[j]] = j;
+                }
             }
         }
         // the main stream may reuse the memory of the sources once their last reader in the node order is done
@@ -7289,6 +8230,35 @@ static void * ggml_cuda_host_map_range(int device, void * ptr, size_t size, void
     *base       = pb;
     *registered = true;
     return ptr;
+}
+
+// k16: page-locks [ptr, ptr + size) (page-aligned outward) for DMA copies only: read-only and NOT mapped into the device address space, so
+// the device keeps no page tables for it (the mapped registration of ggml_cuda_host_map_range cost 10-18 MiB of VRAM for 7-9 GiB).
+// Returns the key to release with ggml_backend_cuda_host_unpin, nullptr if the host or the driver refuses (e.g. no read-only registration)
+static void * ggml_backend_cuda_host_pin_range(void * ptr, size_t size) {
+    if (ptr == nullptr || size == 0) {
+        return nullptr;
+    }
+#if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
+    const uintptr_t page = 4096;
+    const uintptr_t b = (uintptr_t) ptr & ~(page - 1);
+    const uintptr_t e = ((uintptr_t) ptr + size + page - 1) & ~(page - 1);
+    if (cudaHostRegister((void *) b, e - b, cudaHostRegisterPortable | cudaHostRegisterReadOnly) != cudaSuccess) {
+        (void)cudaGetLastError();
+        GGML_LOG_WARN("%s: could not page-lock %.2f MiB of host memory read-only: copies from it stay pageable\n", __func__, (e - b)/1024.0/1024.0);
+        return nullptr;
+    }
+    return (void *) b;
+#else
+    GGML_UNUSED(size);
+    return nullptr;
+#endif
+}
+
+static void ggml_backend_cuda_host_unpin(void * key) {
+    if (key != nullptr && cudaHostUnregister(key) != cudaSuccess) {
+        (void)cudaGetLastError();
+    }
 }
 
 // bytes of host memory registered by ggml_backend_cuda_host_map and ggml_backend_cuda_host_map_range (all devices)
@@ -8030,6 +9000,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->type == GGML_TYPE_F32;
         case GGML_OP_MOE_CACHE_LOOKUP:
             return ggml_cuda_moe_cache_lookup_supported(op);
+        case GGML_OP_KQ_MASK:
+            return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
         case GGML_OP_DSV4_HC_POST:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
@@ -8424,6 +9396,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_graph_evict_since") == 0) {
         return (void *)ggml_backend_cuda_graph_evict_since;
     }
+    if (strcmp(name, "ggml_backend_graph_skip_records") == 0) {
+        return (void *)ggml_backend_cuda_graph_skip_records;
+    }
     if (strcmp(name, "ggml_backend_timer_new") == 0) {
         return (void *)ggml_backend_cuda_timer_new;
     }
@@ -8457,6 +9432,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_host_map_range") == 0) {
         return (void *)ggml_backend_cuda_host_map_range;
+    }
+    if (strcmp(name, "ggml_backend_set_tensors_batch_async") == 0) {
+        return (void *)ggml_backend_cuda_set_tensors_batch_async;
+    }
+    if (strcmp(name, "ggml_backend_host_pin_range") == 0) {
+        return (void *)ggml_backend_cuda_host_pin_range;
+    }
+    if (strcmp(name, "ggml_backend_host_unpin") == 0) {
+        return (void *)ggml_backend_cuda_host_unpin;
     }
     if (strcmp(name, "ggml_backend_host_mapped_bytes") == 0) {
         return (void *)ggml_backend_cuda_host_mapped_bytes;

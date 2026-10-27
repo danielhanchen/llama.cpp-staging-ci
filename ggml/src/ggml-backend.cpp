@@ -13,6 +13,7 @@
 #include "ggml-alloc.h"
 #include "ggml-alloc-ext.h"
 #include "ggml-impl.h"
+#include "ggml-moe-prefetch.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -21,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
 #include <functional>
 #include <unordered_map>
 #include <unordered_set>
@@ -1032,10 +1034,14 @@ struct ggml_backend_sched_prefetch {
     enum ggml_backend_buffer_usage lent_usage[GGML_SCHED_MAX_LENT_BUFFERS]; // their own usage while the splits are computed
     int    n_lent_bufs;
     bool   lent_all;  // the graph allocator uses lent memory: the lent buffers behave like compute buffers in every split
+    bool   ensure_refused; // k15-fn: the staging arena of a merged graph did not allocate (the graph is refused, the prefetch kept)
     size_t lent;      // bytes of the copies and of the graph allocator in lent memory
     size_t lent_prev; // logged value
     size_t ext_prev;  // logged size of the graph allocator in lent memory
     ggml_backend_buffer_t ext_buf; // lent memory of the graph allocator, its tensors are not prefetched copies
+    ggml_backend_buffer_t own_buf; // k15-fn: the graph allocator's own buffer as the first region of a lent graph allocation (see prefetch_bind)
+    size_t own_size;
+    size_t own_rest;               // the lent part it needs after the own buffer
     size_t ext_offset;
     size_t ext_size;
     bool   lending;   // the user lent memory for the last graph, it is told when the memory is no longer used
@@ -1056,6 +1062,16 @@ struct ggml_backend_sched_overlap {
     bool ready_pending;          // copies were queued and their host split has not waited for them yet
     ggml_backend_event_t upload; // recorded after uploads that read host compute memory without a synchronization
     bool upload_pending;         // `upload` has not been waited on yet
+};
+
+// k15-fn: a backend's batched host -> device upload (ggml_backend_set_tensors_batch_async proc of its registry), see ggml_backend_sched_upload_flush
+typedef bool (*ggml_backend_set_tensors_batch_async_t)(ggml_backend_t backend, ggml_tensor * const * tensors, const void * const * data, const size_t * sizes, int n);
+
+struct ggml_backend_sched_upload_batch {
+    ggml_backend_t backend = NULL;
+    std::vector<ggml_tensor *> tensors;
+    std::vector<const void *>  data;
+    std::vector<size_t>        sizes;
 };
 
 struct ggml_backend_sched {
@@ -1123,6 +1139,7 @@ struct ggml_backend_sched {
     bool   alloc_limit_on;
     size_t alloc_limit;
     bool   alloc_lend_graph; // k11: growth past the free memory may be lent (ggml_backend_sched_set_alloc_lend_graph)
+    ggml_backend_sched_upload_batch * upload_batch; // k15-fn: the graph-input uploads of the split being prepared (GGML_SCHED_UPLOAD_BATCH)
     size_t alloc_over; // growth the last refused allocation needed, 0 if it was not refused
     int  pre_split; // split whose first pre_nodes nodes were launched before the CPU split preceding it, -1 if none
     int  pre_nodes;
@@ -2914,6 +2931,12 @@ static bool ggml_backend_sched_prefetch_queue(ggml_backend_sched_t sched, int ba
 // make sure that the arena of a backend can hold pf->staging bytes (none if every copy is in lent memory)
 static size_t ggml_backend_sched_prefetch_staging(ggml_backend_sched_t sched, int backend_id);
 
+// k15-fn: GGML_SCHED_LEND_GUARD=0 restores the allocation failures of merged graphs that turned the host-weight prefetch off
+static bool ggml_backend_sched_lend_guard_on() {
+    static const bool on = getenv("GGML_SCHED_LEND_GUARD") == nullptr || atoi(getenv("GGML_SCHED_LEND_GUARD")) != 0;
+    return on;
+}
+
 static bool ggml_backend_sched_prefetch_ensure(ggml_backend_sched_t sched, int backend_id) {
     struct ggml_backend_sched_prefetch * pf = &sched->pf[backend_id];
     ggml_backend_t backend = sched->backends[backend_id];
@@ -2980,6 +3003,16 @@ static bool ggml_backend_sched_prefetch_ensure(ggml_backend_sched_t sched, int b
     }
 
     pf->arena = ggml_backend_buft_alloc_buffer(sched->bufts[backend_id], pf->staging);
+    // k15-fn GGML_SCHED_PREFETCH_FAIL_AT=N (debug): the Nth staging allocation fails, as cudaMalloc does when the device is full
+    {
+        static const int fail_at = getenv("GGML_SCHED_PREFETCH_FAIL_AT") ? atoi(getenv("GGML_SCHED_PREFETCH_FAIL_AT")) : 0;
+        static int n_ensure = 0;
+        if (fail_at > 0 && ++n_ensure == fail_at && pf->arena != NULL) {
+            GGML_LOG_WARN("%s: GGML_SCHED_PREFETCH_FAIL_AT=%d: staging allocation %d made to fail\n", __func__, fail_at, n_ensure);
+            ggml_backend_buffer_free(pf->arena);
+            pf->arena = NULL;
+        }
+    }
     if (pf->arena == NULL) {
         if (pf->depth > sched->pf_depth0) {
             // a step of the adaptive depth: the next binding uses the starting depth again
@@ -2988,6 +3021,15 @@ static bool ggml_backend_sched_prefetch_ensure(ggml_backend_sched_t sched, int b
             sched->pf_depth = sched->pf_depth0;
             sched->pf_adapt = false;
             ggml_backend_sched_prefetch_release(sched, backend_id);
+            return false;
+        }
+        // k15-fn (GGML_SCHED_LEND_GUARD=0 off): in a merged graph (its caller splits a refused graph) the staging that neither the lender
+        // took nor fits in free memory refuses the graph instead of turning the prefetch off for the rest of the process
+        if (ggml_backend_sched_lend_guard_on() && sched->alloc_limit_on) {
+            GGML_LOG_INFO("%s: %s: %.2f MiB of staging memory do not allocate in a merged graph: the graph is refused, the prefetch kept\n",
+                __func__, ggml_backend_name(backend), pf->staging / 1024.0 / 1024.0);
+            ggml_backend_sched_prefetch_release(sched, backend_id);
+            pf->ensure_refused = true;
             return false;
         }
         GGML_LOG_WARN("%s: %s: failed to allocate %.2f MiB of staging memory, host weight prefetch disabled\n",
@@ -3148,6 +3190,7 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         sched->pf[b].need    = 0;
         sched->pf[b].staging = 0;
         if (!dry) {
+            sched->pf[b].ensure_refused = false;
             sched->pf[b].n_lent_bufs   = 0;
             sched->pf[b].n_lent_copies = 0;
             sched->pf[b].lent          = 0;
@@ -3367,6 +3410,11 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
     // memory lent by the user (e.g. free slots of a cache): the copies it places do not use the arena
     // and a graph that does not fit in the buffer of the graph allocator (e.g. the activations of a large batch) may be allocated there
     size_t gsize[GGML_SCHED_MAX_BACKENDS] = { 0 };
+    for (int b = 0; b < sched->n_backends; b++) {
+        sched->pf[b].own_buf  = NULL;
+        sched->pf[b].own_size = 0;
+        sched->pf[b].own_rest = 0;
+    }
     if (sched->callback_lend != NULL && !dry) {
         // the prefetched copies are not allocated by the graph allocator
         static char measure_placeholder;
@@ -3393,6 +3441,36 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
             if (ggml_backend_sched_prefetch_backend_ok(sched, b) && sizes[b] > ggml_gallocr_get_buffer_size(sched->galloc, b)) {
                 gsize[b] = GGML_PAD(sizes[b], ggml_backend_buft_get_alignment(sched->bufts[b]));
             }
+        }
+        // k15-fn (GGML_SCHED_LEND_OWN=0 off): the own buffer as the first region of a lent graph allocation, the user lends the rest; the
+        // rest is measured with the plan the allocator then makes (the own buffer limits the first chunk, the lent region is not a limit)
+        static const bool lend_own_env = getenv("GGML_SCHED_LEND_OWN") == nullptr || atoi(getenv("GGML_SCHED_LEND_OWN")) != 0;
+        for (int b = 0; b < sched->n_backends && lend_own_env; b++) {
+            struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+            pf->own_buf  = NULL;
+            pf->own_size = 0;
+            pf->own_rest = 0;
+            ggml_backend_buffer_t ob = NULL;
+            size_t os = 0;
+            const size_t align = ggml_backend_buft_get_alignment(sched->bufts[b]);
+            if (gsize[b] == 0 || !ggml_gallocr_get_own_region(sched->galloc, b, &ob, &os) || os < align || ggml_backend_buffer_get_type(ob) != sched->bufts[b]) {
+                continue;
+            }
+            size_t s0 = 0;
+            size_t rest = 0;
+            for (ggml_tensor * t : bound) {
+                t->data = &measure_placeholder;
+            }
+            ggml_gallocr_measure_limited(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, b, os, &s0, &rest);
+            for (ggml_tensor * t : bound) {
+                t->data = NULL;
+            }
+            if (rest == SIZE_MAX || rest == 0 || s0 > os || GGML_PAD(rest, align) >= gsize[b]) {
+                continue;
+            }
+            pf->own_buf  = ob;
+            pf->own_size = os;
+            pf->own_rest = GGML_PAD(rest, align);
         }
     }
 
@@ -3422,9 +3500,18 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         // the graph allocator: live during the whole graph, as GGML_SCHED_MAX_GRAPH_PARTS entries first with src = NULL, ordinal -1 and
         // size = the bytes of the whole allocation; the user may place it in several parts, at most one per entry, and sets size to the
         // size of the part (the graph allocator plans the parts in order, a tensor never spans two parts), unused entries keep buffer NULL
-        const int n_graph = gsize[b] > 0 ? GGML_SCHED_MAX_GRAPH_PARTS : 0;
+        // k15-fn: with the own buffer as the first region (measured above) the user lends one part of the rest; if it cannot, the whole
+        // allocation as before (lend_full). G4 Qwen3.8-Flash-Next IQ1_S 16 GB + device MTP drafter, 16k prompt: a 3316 MiB graph needed 2227
+        // slots, over the cache's cap (2003), so the group ran as two graphs streaming the experts twice; its own buffer held 2244 MiB
+        bool lend_full = pf->own_buf == NULL || dry;
+        lend_again:
+        ggml_backend_buffer_t own_buf  = lend_full ? NULL : pf->own_buf;
+        const size_t          own_size = lend_full ? 0 : pf->own_size;
+        const size_t          gask     = lend_full ? gsize[b] : pf->own_rest;
+        const int             n_graph  = gsize[b] > 0 ? (lend_full ? GGML_SCHED_MAX_GRAPH_PARTS : 1) : 0;
+        n_copies = 0;
         for (int k = 0; k < n_graph; k++) {
-            push({ NULL, gsize[b], -1, NULL, 0 });
+            push({ NULL, gask, -1, NULL, 0 });
         }
         for (int k = 0; k < pf->n_bound; k++) {
             const int i = pf->split_ids[k];
@@ -3441,6 +3528,11 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         // for every split) the copies of different splits may share bytes, depth 1 for the lender
         const int lend_depth = sync_lend[b] ? 1 : pf->depth;
         sched->callback_lend(sched->backends[b], pf->lend_copies, n_copies, lend_depth, dry, sched->callback_lend_user_data);
+        if (!lend_full && n_graph > 0 && (pf->lend_copies[0].buffer == NULL || pf->lend_copies[0].size < gask)) {
+            // the user could not lend the rest in one part: the whole allocation, as without the own region
+            lend_full = true;
+            goto lend_again;
+        }
 
         // a dry run only measures, the user may not have allocated its memory (e.g. no_alloc)
         auto valid = [&](const struct ggml_backend_sched_lend_copy & lc) {
@@ -3462,11 +3554,19 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         bool any = false;
         if (n_graph > 0) {
             ggml_backend_buffer_t gbuf = NULL;
-            size_t offs [GGML_SCHED_MAX_GRAPH_PARTS];
-            size_t sizes[GGML_SCHED_MAX_GRAPH_PARTS];
+            size_t offs [GGML_SCHED_MAX_GRAPH_PARTS + 1];
+            size_t sizes[GGML_SCHED_MAX_GRAPH_PARTS + 1];
+            ggml_backend_buffer_t gbufs[GGML_SCHED_MAX_GRAPH_PARTS + 1];
             int n_parts = 0;
             size_t total = 0;
             bool ok = true;
+            if (own_buf != NULL) {
+                gbufs[0] = own_buf;
+                offs [0] = 0;
+                sizes[0] = own_size;
+                n_parts  = 1;
+            }
+            const int part0 = n_parts;
             for (int k = 0; k < n_graph; k++) {
                 const struct ggml_backend_sched_lend_copy & lc = pf->lend_copies[c++];
                 if (lc.buffer == NULL || lc.size == 0) {
@@ -3477,24 +3577,26 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
                     continue;
                 }
                 gbuf = lc.buffer;
+                gbufs[n_parts] = lc.buffer;
                 offs [n_parts] = lc.offset;
                 sizes[n_parts] = lc.size;
                 total += lc.size;
                 n_parts++;
             }
-            if (!dry && ok && n_parts > 0) {
-                ggml_gallocr_set_external_n(sched->galloc, b, gbuf, offs, sizes, n_parts);
-                // the first part (with more parts the list of the prefetched copies tells them apart, see ggml_backend_sched_prefetch_is_bound)
+            if (!dry && ok && n_parts > part0) {
+                ggml_gallocr_set_external_bufs(sched->galloc, b, gbufs, offs, sizes, n_parts);
+                ggml_gallocr_set_external_last_free(sched->galloc, b, part0 > 0);
+                // the first lent part (with more parts the list of the prefetched copies tells them apart, see ggml_backend_sched_prefetch_is_bound)
                 pf->ext_buf    = gbuf;
-                pf->ext_offset = offs[0];
-                pf->ext_size   = sizes[0];
+                pf->ext_offset = offs[part0];
+                pf->ext_size   = sizes[part0];
                 pf->lent_all   = true;
                 ext[b] = true;
                 any    = true;
                 if (total != pf->ext_prev) {
-                    GGML_LOG_INFO("%s: %s: graph allocation of %.2f MiB in lent memory, %d part%s of %.2f MiB (own compute buffer %.2f MiB)\n", __func__,
-                        ggml_backend_name(sched->backends[b]), gsize[b] / 1024.0 / 1024.0, n_parts, n_parts > 1 ? "s" : "", total / 1024.0 / 1024.0,
-                        ggml_gallocr_get_buffer_size(sched->galloc, b) / 1024.0 / 1024.0);
+                    GGML_LOG_INFO("%s: %s: graph allocation of %.2f MiB in lent memory, %d part%s of %.2f MiB (own compute buffer %.2f MiB%s)\n", __func__,
+                        ggml_backend_name(sched->backends[b]), gsize[b] / 1024.0 / 1024.0, n_parts - part0, n_parts - part0 > 1 ? "s" : "",
+                        total / 1024.0 / 1024.0, ggml_gallocr_get_buffer_size(sched->galloc, b) / 1024.0 / 1024.0, part0 > 0 ? ", the first region" : "");
                     pf->ext_prev = total;
                 }
             }
@@ -4094,6 +4196,59 @@ static void ggml_backend_sched_hsm_wait(ggml_backend_sched_t sched) {
 // the caller synchronizes the split backend once after all of them, so the host data can be overwritten when compute_splits moves on
 // with the CPU/GPU overlap, an upload from host compute memory (written only by later host splits) neither waits for the backend
 // nor is waited for here: `relaxed` is set and the caller records an event that host work waits for before it overwrites the memory
+// k15-fn (GGML_SCHED_UPLOAD_BATCH=0 off): the async graph-input uploads of a split are queued and issued together by
+// ggml_backend_sched_upload_flush (one cudaMemcpyBatchAsync): issued one by one, the device idled between the small copies
+// (Flash-Next verify: 21 uploads, 0.63 ms of idle per step on a B200)
+static ggml_backend_set_tensors_batch_async_t ggml_backend_sched_batch_fn(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : NULL;
+    static thread_local ggml_backend_reg_t last_reg = NULL;
+    static thread_local ggml_backend_set_tensors_batch_async_t last_fn = NULL;
+    if (reg != last_reg) {
+        last_reg = reg;
+        last_fn  = reg ? (ggml_backend_set_tensors_batch_async_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_tensors_batch_async") : NULL;
+    }
+    return last_fn;
+}
+
+static bool ggml_backend_sched_upload_queue(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_tensor * dst, const void * data, size_t size) {
+    static const bool enabled = getenv("GGML_SCHED_UPLOAD_BATCH") == NULL || atoi(getenv("GGML_SCHED_UPLOAD_BATCH")) != 0;
+    if (!enabled || size == 0 || ggml_backend_sched_batch_fn(backend) == NULL) {
+        return false;
+    }
+    if (sched->upload_batch == NULL) {
+        sched->upload_batch = new ggml_backend_sched_upload_batch();
+    }
+    ggml_backend_sched_upload_batch * ub = sched->upload_batch;
+    if (ub->backend != NULL && ub->backend != backend) {
+        return false; // one backend per batch (a split has one)
+    }
+    ub->backend = backend;
+    ub->tensors.push_back(dst);
+    ub->data.push_back(data);
+    ub->sizes.push_back(size);
+    return true;
+}
+
+// issues the queued uploads (in queue order) before anything that must follow them on the stream
+static void ggml_backend_sched_upload_flush(ggml_backend_sched_t sched) {
+    ggml_backend_sched_upload_batch * ub = sched->upload_batch;
+    if (ub == NULL || ub->tensors.empty()) {
+        return;
+    }
+    const int n = (int) ub->tensors.size();
+    ggml_backend_set_tensors_batch_async_t fn = ggml_backend_sched_batch_fn(ub->backend);
+    if (n == 1 || fn == NULL || !fn(ub->backend, ub->tensors.data(), ub->data.data(), ub->sizes.data(), n)) {
+        for (int i = 0; i < n; ++i) {
+            ggml_backend_tensor_set_async(ub->backend, ub->tensors[i], ub->data[i], 0, ub->sizes[i]);
+        }
+    }
+    ub->backend = NULL;
+    ub->tensors.clear();
+    ub->data.clear();
+    ub->sizes.clear();
+}
+
 static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, bool & synced, bool & relaxed) {
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
@@ -4167,7 +4322,9 @@ static bool ggml_backend_sched_upload_input_async(ggml_backend_sched_t sched, st
         // produced by an earlier split
         ggml_backend_synchronize(ggml_backend_sched_get_tensor_backend(sched, input));
     }
-    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+    if (!ggml_backend_sched_upload_queue(sched, split_backend, input_cpy, input->data, ggml_nbytes(input))) {
+        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+    }
     relaxed = ov;
     return true;
 }
@@ -4278,6 +4435,73 @@ static void ggml_backend_sched_prefetch_plan(ggml_backend_sched_t sched) {
     sched->callback_plan(srcs.data(), (int) srcs.size(), sched->callback_plan_user_data);
 }
 
+// k16-disk: disk prefetch lookahead of host experts (ported from ik_llama.cpp PR #2101, see ggml-moe-prefetch.cpp). The host expert
+// tensors (host buffer, WEIGHTS usage, ne[2] > 1) that the engine has registered (expert ranges of file mappings, by llama) of the
+// next GGML_MOE_PREFETCH_AHEAD (default 3, ggml_moe_prefetch_set_ahead) MoE splits of a batch of >= 32 tokens are streamed into the
+// page cache while the current split runs, and the pages the streamer read for a split are MADV_COLD after it, so prompt streaming
+// does not evict the decode working set. Page cache only: the copies and kernels read the same mapped bytes.
+struct ggml_moe_disk_split {
+    int split;
+    std::vector<const ggml_tensor *> host_weights;
+};
+
+static std::atomic<int> ggml_moe_prefetch_ahead_n{-1};
+
+extern "C" void ggml_moe_prefetch_set_ahead(int n) {
+    ggml_moe_prefetch_ahead_n.store(n, std::memory_order_relaxed);
+}
+
+static int ggml_moe_prefetch_ahead() {
+    const int n = ggml_moe_prefetch_ahead_n.load(std::memory_order_relaxed);
+    if (n >= 0) {
+        return n;
+    }
+    static const int def = [] {
+        const char * env = getenv("GGML_MOE_PREFETCH_AHEAD");
+        return env ? std::max(0, atoi(env)) : 3;
+    }();
+    return def;
+}
+
+static void ggml_moe_disk_splits(ggml_backend_sched_t sched, std::vector<ggml_moe_disk_split> & out) {
+    out.clear();
+    for (int i = 0; i < sched->n_splits; i++) {
+        const struct ggml_backend_sched_split & sp = sched->splits[i];
+        ggml_moe_disk_split info;
+        info.split = i;
+        int64_t n_tokens = 0;
+        bool multi_layer = false;
+        const ggml_tensor * host_ids = nullptr;
+        for (int n = 0; n < sp.graph.n_nodes; ++n) {
+            const ggml_tensor * node = sp.graph.nodes[n];
+            if (node->op != GGML_OP_MUL_MAT_ID) {
+                continue;
+            }
+            const ggml_tensor * node_ids = node->src[2];
+            n_tokens = std::max<int64_t>(n_tokens, node_ids ? node_ids->ne[1] : 0);
+            const ggml_tensor * w = node->src[0];
+            if (w && ggml_backend_sched_is_host_weight(w) && w->ne[2] > 1 && ggml_moe_prefetch_is_registered(w)) {
+                info.host_weights.push_back(w);
+                // up/gate and down of a layer share one ids tensor
+                multi_layer |= host_ids != nullptr && host_ids != node_ids;
+                host_ids = node_ids;
+            }
+        }
+        // in the offloaded case the node's weight srcs were rewritten to device copies; the host originals arrive as split inputs
+        for (int j = 0; j < sp.n_inputs; ++j) {
+            const ggml_tensor * input = sp.inputs[j];
+            if (input->ne[2] > 1 && ggml_backend_sched_is_host_weight(input) && ggml_moe_prefetch_is_registered(input)) {
+                info.host_weights.push_back(input);
+            }
+        }
+        // batch graphs touch most experts; multi-layer splits (e.g. a CPU-only graph) would fetch everything at once: the kernel hook
+        // streams those
+        if (!info.host_weights.empty() && n_tokens >= 32 && !multi_layer) {
+            out.push_back(std::move(info));
+        }
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sched_t sched) {
     struct ggml_backend_sched_split * splits = sched->splits;
 
@@ -4340,10 +4564,41 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         }
     }
 
+    // k16-disk: disk prefetch lookahead (see ggml_moe_disk_splits)
+    std::vector<ggml_moe_disk_split> moe_disk;
+    size_t moe_next = 0; // first entry with split >= current split
+    size_t moe_enq  = 0; // entries already enqueued
+    size_t moe_cold = 0; // entries already given MADV_COLD
+    const size_t moe_ahead = ggml_moe_prefetch_enabled() ? (size_t) ggml_moe_prefetch_ahead() : 0;
+    if (moe_ahead > 0) {
+        ggml_moe_prefetch_new_epoch();
+        ggml_moe_disk_splits(sched, moe_disk);
+    }
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        if (!moe_disk.empty()) {
+            // the pages streamed for the splits that ran are one-shot prompt traffic
+            for (; moe_cold < moe_disk.size() && moe_disk[moe_cold].split < split_id; ++moe_cold) {
+                for (const ggml_tensor * w : moe_disk[moe_cold].host_weights) {
+                    ggml_moe_prefetch_cold(w);
+                }
+            }
+            while (moe_next < moe_disk.size() && moe_disk[moe_next].split < split_id) {
+                moe_next++;
+            }
+            // keep the next moe_ahead MoE splits streaming in
+            const size_t want_end = std::min(moe_next + moe_ahead, moe_disk.size());
+            for (size_t k = std::max(moe_enq, moe_next); k < want_end; ++k) {
+                for (const ggml_tensor * w : moe_disk[k].host_weights) {
+                    ggml_moe_prefetch_tensor(w);
+                }
+                moe_enq = k + 1;
+            }
+        }
 
         if (sched->pf_active) {
             ggml_backend_sched_prefetch_issue_ex(sched, true);
@@ -4426,9 +4681,11 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                     upload_pending |= !relaxed;
                     continue;
                 }
+                ggml_backend_sched_upload_flush(sched); // a copy below may synchronize the stream: the queued uploads go first
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
         }
+        ggml_backend_sched_upload_flush(sched);
         if (upload_pending && sched->hsm_active && ggml_backend_sched_hsm_backend_ok(split_backend)) {
             // k15 hsm: the host data the upload reads is next written by a later host split, which syncs this backend first, or by the
             // caller after this graph, which waits for the event below
@@ -4598,6 +4855,12 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         ggml_backend_sched_prefetch_arm(sched);
     }
 
+    for (; moe_cold < moe_disk.size(); ++moe_cold) {
+        for (const ggml_tensor * w : moe_disk[moe_cold].host_weights) {
+            ggml_moe_prefetch_cold(w);
+        }
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -4720,6 +4983,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+    if (sched != NULL) {
+        delete sched->upload_batch;
+        sched->upload_batch = NULL;
+    }
     if (sched == NULL) {
         return;
     }
@@ -4932,7 +5199,15 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     sched->alloc_over = 0;
     size_t lend_need[GGML_SCHED_MAX_BACKENDS] = { 0 };
-    if (sched->alloc_limit_on) {
+    // k15-fn (GGML_SCHED_LEND_GUARD=0 off): a graph the lender may take is measured like one under the limit, so that a growth neither
+    // lent nor fitting next to the staging arena is refused below (alloc_over, prefetch kept) instead of failing in cudaMalloc, which
+    // disabled the host-weight prefetch for the rest of the process (G4 fn4 16 GB, 8-ubatch group: 2761 MiB cudaMalloc with the
+    // 1275 MiB staging placed in device memory, the 16k prompt 3.84 -> 9.08 s)
+    const bool lend_guard = ggml_backend_sched_lend_guard_on();
+    // a merged graph (decode_layer_major sets the limit or the lend scope around it) can be split by its caller
+    const bool guard_lend = lend_guard && (sched->alloc_limit_on || (sched->alloc_lend_graph && sched->callback_lend != NULL));
+    size_t grow_dev[GGML_SCHED_MAX_BACKENDS] = { 0 };
+    if (sched->alloc_limit_on || guard_lend) {
         // the planned compute buffers of the graph (the current ones and their allocation are kept): refused, nothing allocated and the
         // prefetch kept, if a device buffer would grow by more than the limit or leave less than the prefetch headroom (512 MiB at least)
         // free. Without the check a large graph that allocates drops the prefetch for good (ggml_backend_sched_alloc_splits).
@@ -4967,10 +5242,12 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 continue;
             }
             const size_t grow = sizes[b] - cur;
+            grow_dev[b] = grow;
             size_t free  = 0;
             size_t total = 0;
             ggml_backend_dev_memory(dev, &free, &total);
-            const size_t allow = std::min(sched->alloc_limit, free > headroom ? free - headroom : 0);
+            const size_t limit = sched->alloc_limit_on ? sched->alloc_limit : SIZE_MAX;
+            const size_t allow = std::min(limit, free > headroom ? free - headroom : 0);
             if (grow > allow) {
                 if (sched->alloc_lend_graph && sched->callback_lend != NULL) {
                     lend_need[b] = grow; // decided after the lender placed the graph (below)
@@ -4996,6 +5273,21 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
             if (lend_need[b] > 0 && !sched->pf[b].lent_all) {
                 over = std::max(over, lend_need[b]);
             }
+            if (guard_lend && sched->pf[b].ensure_refused) {
+                over = std::max(over, std::max<size_t>(grow_dev[b], 1));
+            }
+            // k15-fn: the binding may have allocated the staging arena in device memory (the lender took nothing): a growth that no longer
+            // fits next to it is refused too
+            if (guard_lend && over == 0 && grow_dev[b] > 0 && !sched->pf[b].lent_all) {
+                ggml_backend_dev_t dev = sched->backends[b]->device;
+                size_t free  = 0;
+                size_t total = 0;
+                ggml_backend_dev_memory(dev, &free, &total);
+                static const size_t guard_free = (size_t) (getenv("GGML_SCHED_ALLOC_LIMIT_FREE_MIB") ? std::max(0, atoi(getenv("GGML_SCHED_ALLOC_LIMIT_FREE_MIB"))) : 64) << 20;
+                if (grow_dev[b] + guard_free > free) {
+                    over = std::max(over, grow_dev[b]);
+                }
+            }
         }
         if (over > 0) {
             // as a failed allocation below: the caller resets the scheduler, which binds the copies again for the next graph
@@ -5007,6 +5299,13 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
+        if (guard_lend) {
+            // k15-fn: a graph the caller can split (it set the limit or the lend scope) is refused, the prefetch stays on
+            sched->alloc_over = 1;
+            sched->next_copy  = sched->cur_copy;
+            sched->cur_copy   = cur_copy_prev;
+            return false;
+        }
         // retry without the staging memory
         if (!ggml_backend_sched_prefetch_disable(sched) || !ggml_backend_sched_alloc_splits(sched)) {
             return false;
@@ -5329,6 +5628,20 @@ size_t ggml_backend_sched_get_alloc_over(ggml_backend_sched_t sched) {
     return sched->alloc_over;
 }
 
+bool ggml_backend_sched_tensor_is_staged(ggml_backend_sched_t sched, const struct ggml_tensor * t) {
+    GGML_ASSERT(sched);
+    if (t == NULL || t->buffer == NULL || !sched->pf_active) {
+        return false;
+    }
+    for (int b = 0; b < sched->n_backends; b++) {
+        const struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+        if ((pf->arena != NULL && t->buffer == pf->arena) || ggml_backend_sched_is_lent(pf, t)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void ggml_backend_sched_set_lend_callback(ggml_backend_sched_t sched, ggml_backend_sched_lend_callback callback, void * user_data) {
     GGML_ASSERT(sched);
     if (sched->callback_lend != callback || sched->callback_lend_user_data != user_data) {
@@ -5427,6 +5740,15 @@ size_t ggml_backend_sched_get_staging_size(ggml_backend_sched_t sched, ggml_back
 
     const struct ggml_backend_sched_prefetch * pf = &sched->pf[backend_index];
     return pf->n_bound > 0 ? pf->staging : 0;
+}
+
+size_t ggml_backend_sched_get_staging_split(ggml_backend_sched_t sched, ggml_backend_t backend) {
+    GGML_ASSERT(sched);
+    int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+
+    const struct ggml_backend_sched_prefetch * pf = &sched->pf[backend_index];
+    return pf->n_bound > 0 ? std::min(pf->need, pf->staging) : 0;
 }
 
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {

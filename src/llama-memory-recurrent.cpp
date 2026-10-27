@@ -180,8 +180,10 @@ llama_memory_recurrent::llama_memory_recurrent(
     // rollback snapshots has (mem_size): that copy is the slack every fit had so far, which covers the fit's compute estimate being short
     // of the real buffer (local B200 fn1 16 GB: fit 1091 MiB, sched_reserve 1459 MiB; without the slack the server ended at 515-600 MiB
     // free under the 1024 MiB target). Only the rollback rows (n_rs_seq) are no longer counted twice.
-    // LLAMA_RS_PROBE_DUMMY=0: allocate as before; =2: no real memory at all (also the base rows; leaves the compute shortfall uncovered)
-    static const int probe_dummy = getenv("LLAMA_RS_PROBE_DUMMY") == nullptr ? 1 : atoi(getenv("LLAMA_RS_PROBE_DUMMY"));
+    // k16-fit: the compute shortfall is the seed graph, which the probe now prices (llama_context::sched_reserve, LLAMA_FIT_SEED_PRICE),
+    // so by default (=2) the probe holds no real memory at all and every state is counted once.
+    // LLAMA_RS_PROBE_DUMMY=0: allocate as before (all rows twice); =1: real memory for the base rows only (their slack kept)
+    static const int probe_dummy = getenv("LLAMA_RS_PROBE_DUMMY") == nullptr ? 2 : atoi(getenv("LLAMA_RS_PROBE_DUMMY"));
     probe_sized = hparams.no_alloc && probe_dummy != 0;
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf;
@@ -929,8 +931,15 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
             // What should happen when the pos backtracks or skips a value?
             // Clearing the state mid-batch would require special-casing which isn't done.
-            LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
-                __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
+            // A hybrid model whose filter drops every recurrent layer (e.g. the MTP context of a hybrid model) leaves this cache
+            // without tensors: its positions are bookkeeping only, so a rejected speculative draft is no inconsistency to warn about.
+            const bool has_state =
+                std::any_of(r_l.begin(), r_l.end(), [](const ggml_tensor * t) { return t != nullptr; }) ||
+                std::any_of(s_l.begin(), s_l.end(), [](const ggml_tensor * t) { return t != nullptr; });
+            if (has_state) {
+                LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
+                    __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
+            }
         }
         cell.pos = last_pos;
         cell.seq_id.clear();

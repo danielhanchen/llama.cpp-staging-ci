@@ -24,6 +24,9 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstring>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -970,6 +973,26 @@ void common_set_env(const std::string & name, const std::string & value) {
 #endif
 }
 
+// k15-fn: a draft model (no MoE cache of its own) is measured with the weight copies of one prefetch split counted
+// (LLAMA_FIT_STAGING_SPLIT, see sched_reserve): with its experts on the host (--spec-draft-cpu-moe) the arena does not fit beside a
+// full MoE cache, the copies then land in its graph allocation (Qwen3.8-Flash-Next MTP Q8_0 at 32 GB: measured 199 MiB of compute,
+// 982 MiB once loaded, out of memory at the first draft). LLAMA_FIT_STAGING_SPLIT=0: the old measure
+struct common_draft_measure_env {
+    bool set = false;
+    explicit common_draft_measure_env(bool on = true) {
+        if (on && getenv("LLAMA_FIT_STAGING_SPLIT") == nullptr) {
+            common_set_env("LLAMA_FIT_STAGING_SPLIT", "1");
+            set = true;
+        }
+    }
+    ~common_draft_measure_env() {
+        if (set) {
+            common_set_env("LLAMA_FIT_STAGING_SPLIT", "");
+        }
+    }
+};
+
+
 std::filesystem::path common_get_path_from_env(const std::string & name) {
 #if defined(_WIN32)
     const std::wstring wname = utf8_to_wstring(name);
@@ -1402,6 +1425,47 @@ static int64_t common_gguf_u32(const std::string & path, const char * key) {
     }
 }
 
+// k15-up: the layer-major batch (tokens per merged group). Default 8192; 16384 (one group for a 16k prompt, one pass over the host
+// experts instead of two) where the draft model was left out by --fit (fit_off): no drafter or MTP heads keep n_batch-sized rows
+// beside it (an MTP drafter on the device grew the peak RSS by 570 MiB at 16384, a dropped one by 50-96 MiB). A group whose lent
+// allocation does not fit is refused and split (ggml sched lend guard), so a cache that cannot lend for 8 members runs 4 + 4 as at
+// 8192. G4 Flash-Next UD-IQ4_XS Studio argv, 16k: 24 GB 3.661 -> 3.216 s, 16 GB (own-buffer lend) 3.820 -> 3.184 s, md5 unchanged.
+// LLAMA_MOE_LAYER_MAJOR_BATCH=N sets N; LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO=0 keeps 8192
+// k15-up (2): built-in MTP heads (no -md model) keep one next-n row per batch token (llama_context::output_reserve, embd_nextn unmasked:
+// n_embd floats x n_batch), which is all the drafter's prompt pass needs after the batch. 16384 adds n_embd x 4 B x 8192 to the host
+// output buffer; it is taken where that is at most LLAMA_MOE_LAYER_MAJOR_BATCH_RSS_MIB (100): Qwen3.6-35B-A3B (n_embd 2048) +64 MiB.
+// The rest of the measured peak RSS growth (~170 MiB, G4 q4x 12 GB +237) is the 8-member graph's own host buffers, the same without a
+// draft (Flash-Next 16 GB, draft dropped: +170)
+static int64_t common_lm_batch_default(const common_params & params) {
+    if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH")) {
+        return atoll(e);
+    }
+    // (was opt-in: G4 k15g4y1 Flash-Next 16 GB VmHWM +170 (fn4) / +188 (fn1) MiB, transient during the group, mostly its host KQ masks)
+    // k15-pp: on by default again (LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO=0: 8192) now that the 16384 group's own host memory is gone:
+    // device-built KQ masks (no host mask per member), no CUDA graph records for the merged graph, next-n rows on the device beside
+    // MTP heads. G4 fn4 16 GB (k15g4n1): VmHWM 75300 vs 75347 MiB for the 8192 default with host masks, 16k TTFT 3.24 vs 4.07 s
+    static const bool auto_env = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_AUTO")) != 0;
+    if (!auto_env) {
+        return 8192;
+    }
+    if (params.speculative.draft.fit_off) {
+        return 16384;
+    }
+    const bool mtp_heads = !params.speculative.has_dft() && std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+        [](auto t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP; });
+    // beside built-in MTP heads 16384 is opt-in (LLAMA_MOE_LAYER_MAJOR_BATCH_MTP=1): G4 k15g4q1 q4x 12 GB with it (and the device MTP
+    // handoff) 16k TTFT -13% but decode 8k / 16k -11 / -10%, chat TTFT +20%, RssAnon +95 MiB, device memory +232 MiB
+    static const bool mtp_env = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_MTP") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_MTP")) != 0;
+    if (mtp_heads && mtp_env) {
+        static const double rss_mib = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_RSS_MIB") ? atof(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_RSS_MIB")) : 100.0;
+        const int64_t n_embd = common_gguf_u32(params.model.path, "embedding_length");
+        if (n_embd > 0 && (double) n_embd*4.0*8192.0/1048576.0 <= rss_mib) {
+            return 16384;
+        }
+    }
+    return 8192;
+}
+
 // layer-major prompts (llama_context::decode_layer_major): the ubatches of one batch upload each host expert once, so n_ubatch stays the
 // default (no compute buffer growth taken from the cache) and the batch holds up to LLAMA_MOE_LAYER_MAJOR_BATCH (8192) tokens, at most the
 // context and lm_ub_max ubatches. LLAMA_MOE_LAYER_MAJOR=1 forces it for spilled experts, =0 turns it off; unset (auto): on for spilled
@@ -1431,12 +1495,20 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         // k10: not where the MoE cache's default hybrid gate will run (it holds at most LLAMA_MOE_CACHE_HYBRID_MAX_FRAC of the host experts):
         // that path refuses every layer-major group, so the raise only changed the batches (local B200, Qwen3.6 UD-Q4_K_XL + MTP, 1500 MiB
         // cache, -ub 2048: 8k text differs from k9 with no group run)
-        if (lm != 1 && common_moe_hybrid_gate_on(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
+        // k16: except below LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC (0.05) of the host experts, where llama_context runs the groups beside the
+        // gate (k13-small, lm_hybrid_frac_ok) but this early return kept n_batch at one ubatch, so no group formed: G4, Qwen3.8-Flash-Next
+        // UD-IQ4_XS 12 GB with Studio's -ub 2048 (cache 2642 of 56762 MiB, 4.7%), 8k / 16k / 30k prompt 1917 / 1934 / 1896 tok/s against
+        // 4396 / 4460 at 16 GB (groups) and Strata 3345 / 4261 / 4129. LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB_HYBRID=0 restores the early return
+        static const bool xh_on = getenv("LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB_HYBRID") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB_HYBRID")) != 0;
+        static const double lm_hyb_frac = getenv("LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC") ? std::max(0.0, atof(getenv("LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC"))) : 0.05;
+        const double host_x = xh_on ? common_moe_host_expert_bytes(params.model.path, mparams.tensor_buft_overrides, mparams.n_gpu_layers) : 0.0;
+        const bool lm_beside_gate = xh_on && host_x > 0.0 && (double) params.moe_cache_size < lm_hyb_frac*host_x;
+        if (lm != 1 && !lm_beside_gate && common_moe_hybrid_gate_on(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
             COM_INF("MoE cache: n_batch stays %u at the given n_ubatch %u (the cache holds a small share of the host experts: the hybrid gate, "
                 "no layer-major groups)\n", cparams.n_batch, cparams.n_ubatch);
             return;
         }
-        int64_t want = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH") != nullptr ? atoll(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH")) : 8192;
+        int64_t want = common_lm_batch_default(params);
         const int64_t ub_max = getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX") != nullptr ? std::max(1, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX"))) : 16;
         want = std::min<int64_t>(want, ub_max*(int64_t) cparams.n_ubatch);
         if (params.n_ctx > 0) {
@@ -1497,7 +1569,7 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     const bool   spill  = lm != 0 && common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers);
     const auto   set_batch = [&]() {
         if (!params.n_batch_set) {
-            int64_t want = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH") != nullptr ? atoll(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH")) : 8192;
+            int64_t want = common_lm_batch_default(params);
             const int64_t ub_max = getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX") != nullptr ? std::max(1, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX"))) : 16;
             want = std::min<int64_t>(want, ub_max*(int64_t) cparams.n_ubatch);
             if (params.n_ctx > 0) {
@@ -1638,6 +1710,7 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
         std::vector<ggml_backend_dev_t> devs;
         uint32_t hp_ngl = 0, hp_nct = 0, hp_nex = 0;
         try {
+            common_draft_measure_env split_env(has_draft); // an MTP context on the main model's weights: unchanged
             const common_device_memory_data_vec dmd = common_get_device_memory_data(has_draft ? params_dft.model.path.c_str() : params.model.path.c_str(),
                 &mparams_dft, &cp, devs, hp_ngl, hp_nct, hp_nex, params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
             for (size_t i = 0; i + 1 < dmd.size(); ++i) {
@@ -2085,9 +2158,11 @@ static bool common_fit_draft_on_cpu(
         const llama_model_params & mparams_dft, llama_context_params cparams_dft, const std::string & path_dft, ggml_log_level log_level,
         bool * needs_target = nullptr) {
     constexpr double MiB = 1024.0*1024.0;
-    // k15-pp (default 0.60, was 0.25; a sanity bound, the floor below decides): G4 Qwen3.8-Flash-Next UD-IQ1_S 16 GB, Q4_K_M MTP
-    // drafter on the device: +32..35% decode, +75% 8k prompt against no draft; it takes 37% (ctx 16384) / 41% (ctx 32768) of the cache
-    double max_frac = 0.60;
+    // default 0.25 (k15-pp: 0.60 admits more drafts, +13..55% decode, but the drafter's own prompt pass, about 29 us per prompt token
+    // plus about 50 ms per request, then sits on every prompt: G4 TTFT +8..18%, +42% at Flash-Next UD-IQ1_S 16 GB 16k, where the smaller
+    // cache also lends too few slots for a full layer-major group (k15g4d2, plans/k15_pp.md section 20). LLAMA_FIT_DRAFT_MAX_CACHE_FRAC=0.60
+    // opts in until the drafter's prompt pass is off the time to first token
+    double max_frac = 0.25;
     if (const char * env = getenv("LLAMA_FIT_DRAFT_MAX_CACHE_FRAC")) {
         max_frac = std::max(0.0, atof(env));
     }
@@ -2130,6 +2205,7 @@ static bool common_fit_draft_on_cpu(
     uint32_t ngl = 0, nct = 0, nex = 0;
     size_t dft = 0;
     try {
+        common_draft_measure_env split_env;
         const auto dmds = common_get_device_memory_data(path_dft.c_str(), &mparams_dft, &cparams_dft, devs, ngl, nct, nex, log_level);
         for (size_t i = 0; i < devs.size() && i < dmds.size(); i++) {
             dft += dmds[i].model + dmds[i].context + dmds[i].compute;
@@ -2209,6 +2285,7 @@ static void common_draft_mem_reserve(const common_params & params, const llama_m
     cparams_dft.n_ctx    = cparams.n_ctx;
     uint32_t hp_ngl = 0, hp_nct = 0, hp_nex = 0;
     try {
+        common_draft_measure_env split_env(has_draft);
         const common_device_memory_data_vec dmd = common_get_device_memory_data(has_draft ? params_dft.model.path.c_str() : params.model.path.c_str(),
             &mparams_dft, &cparams_dft, devs, hp_ngl, hp_nct, hp_nex, params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
         // the weights of a draft model are loaded after the main context too, an MTP context runs on the weights of the main model
@@ -2366,6 +2443,9 @@ bool common_moe_cache_auto_resolve(common_params & params, bool fit) {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    // k15-up2: built-in MTP heads (no -md model) for the context's prefetch depth rule (llama_context::sched_new), before any fit probe
+    common_set_env("LLAMA_SPEC_MTP_HEADS", !params.speculative.has_dft() && std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+        [](auto t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP; }) ? "1" : "0");
     // --moe-cache-mib auto: the fit sizes the cache (the fitted size is kept in params, so that a reload from params, e.g. the server
     // waking from sleep, gets the same cache)
     const bool moe_cache_auto = common_moe_cache_auto_resolve(params, params.fit_params);
@@ -2464,9 +2544,139 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
         // a separate draft model next to a MoE cache goes last: the main model's layers and its cache are placed first, and the draft
         // model gets the GPU only if it fits in the memory the cache does not use, or takes at most LLAMA_FIT_DRAFT_MAX_CACHE_FRAC
-        // (default 0.60), leaving more than LLAMA_FIT_DRAFT_MIN_CACHE_FRAC (0.10) of the host experts cached, of the memory the cache would get; otherwise it runs on the CPU, or, if the caller can run without it
+        // (default 0.25), leaving more than LLAMA_FIT_DRAFT_MIN_CACHE_FRAC (0.10) of the host experts cached, of the memory the cache would get; otherwise it runs on the CPU, or, if the caller can run without it
         // (fit_can_drop), it is left out and drafting is off unless LLAMA_FIT_DRAFT_CPU=1 (drafting on the CPU is slower than none)
         // the old order (the draft model first, the main model around it) with LLAMA_FIT_DRAFT_LAST=0, or when -ngld or -devd is set
+
+        // k16-parity: q8_0 K/V above 8K context where it buys device residency (Strata's setup: fp16 K/V up to 8K context, int8 above,
+        // 8-bit codes + an fp16 scale per 64 values; ours: q8_0, 8-bit codes + an fp16 scale per 32). Only without -ctk / -ctv (or their
+        // LLAMA_ARG_ variables), with flash attention not off, and only when the f16 placement spills (layers on the CPU, the MTP drafter
+        // dropped, or experts in system memory). Both K/V types are fitted on copies, each with the MTP drop rule below applied, and
+        // q8_0 is kept when it gives more context, more layers on the device, the MTP drafter that f16 drops, the experts on the device,
+        // or a MoE cache larger by max(64 MiB, 1/8); otherwise the fit runs as before with f16. The rest of the fit then runs on the chosen
+        // type as usual. Lossy (KV quantisation). LLAMA_KV_AUTO_Q8=0: off (f16 as before); LLAMA_KV_AUTO_Q8_MIN_CTX (8192): the context
+        // above which it applies
+        {
+            const char * env_aq = getenv("LLAMA_KV_AUTO_Q8");
+            const char * env_mc = getenv("LLAMA_KV_AUTO_Q8_MIN_CTX");
+            const char * env_ar = getenv("LLAMA_KV_AUTO_Q8_ARCHS");
+            const int     aq_mode = env_aq != nullptr ? atoi(env_aq) : 1;
+            const int64_t min_ctx = env_mc != nullptr ? atoll(env_mc) : 8192;
+            // k16-parity G4 (k16p_g4c, q3m 4 GB + MTP): the two trades below win decode but lose the prompt with q8_0 K/V (20k: decode
+            // +12..19% over f16, 2k / 8k prompt -9% / -34%; 32k: +5..15%, -40% / -60%; 16k "a larger MoE cache": decode -4..-9%), so by
+            // default q8_0 is kept only for more context, more layers or every expert on the device. LLAMA_KV_AUTO_Q8_TRADE=1: also for the
+            // MTP drafter that f16 drops and for a MoE cache larger by max(64 MiB, 1/8)
+            const bool aq_trade = getenv("LLAMA_KV_AUTO_Q8_TRADE") != nullptr && atoi(getenv("LLAMA_KV_AUTO_Q8_TRADE")) != 0;
+            bool aq_on = aq_mode != 0 && !model_only && !params.cache_type_k_set && !params.cache_type_v_set &&
+                params.cache_type_k == GGML_TYPE_F16 && params.cache_type_v == GGML_TYPE_F16 &&
+                params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && !params.embedding &&
+                (params.n_ctx <= 0 || (int64_t) params.n_ctx > min_ctx);
+            // only the architectures whose q8_0 K/V was measured inside the reassociation band (LLAMA_KV_AUTO_Q8=2: every architecture;
+            // LLAMA_KV_AUTO_Q8_ARCHS=a,b,...: this list). qwen35moe (Qwen3.6-35B-A3B) and qwen4exp (Qwen3.8-Flash-Next): teacher-forced KLD
+            // of q8_0 vs f16 K/V at positions 8K-16K inside the -ub 256 / -fa off band. Not lfm2moe (LFM2.5-24B-A2B): on short prompts the
+            // first token's KLD is 6x the -ub 64 band (0.27 vs 0.044, top-1 0.80 vs 0.97)
+            if (aq_on && aq_mode != 2) {
+                const std::string arch = common_gguf_arch(params.model.path);
+                const std::string list = std::string(",") + (env_ar != nullptr ? env_ar : "qwen35moe,qwen4exp") + ",";
+                aq_on = !arch.empty() && list.find("," + arch + ",") != std::string::npos;
+            }
+            if (aq_on) {
+                struct kv_probe {
+                    bool     ok      = false;
+                    uint32_t n_ctx   = 0;
+                    int64_t  layers  = 0;
+                    bool     mtp     = false;
+                    int64_t  n_host  = 0; // tensor buffer overrides the fit added (experts in system memory)
+                    int64_t  cache   = 0;
+                };
+                std::vector<uint8_t> exps;
+                const int64_t n_layer = common_model_n_layer(params.model.path, exps);
+                const auto probe = [&](ggml_type t) {
+                    kv_probe r;
+                    const auto one = [&](bool with_extra, kv_probe & o) {
+                        llama_model_params   mp = mparams;
+                        llama_context_params cp = cparams;
+                        std::vector<float>   ts(params.tensor_split, params.tensor_split + 128);
+                        std::vector<llama_model_tensor_buft_override> tbo = params.tensor_buft_overrides;
+                        std::vector<size_t>  mg = params.fit_params_target;
+                        mp.tensor_split = ts.data();
+                        if (mparams.tensor_buft_overrides != nullptr && mparams.tensor_buft_overrides == params.tensor_buft_overrides.data()) {
+                            mp.tensor_buft_overrides = tbo.data();
+                        }
+                        cp.type_k = t;
+                        cp.type_v = t;
+                        if (!with_extra) {
+                            mp.load_mtp = params.load_mtp;
+                            cp.n_rs_seq = 0;
+                        }
+                        int64_t n0 = 0;
+                        for (const auto & o2 : tbo) {
+                            n0 += o2.pattern != nullptr;
+                        }
+                        llama_model_params   mp_dft = mparams_dft; // the fit may write the draft's params: copies
+                        llama_context_params cp_dft = cparams_dft;
+                        const common_fit_extra_model ex = { extra.path_model, &mp_dft, &cp_dft, extra.shares_model };
+                        common_fit_set_moe_margin_auto(!params.fit_params_target_set);
+                        const auto st = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(), tbo.empty() ? nullptr : tbo.data(),
+                            mg.data(), params.fit_params_min_ctx, with_extra ? &ex : nullptr, fit_log_level, params.fit_kv_resident);
+                        o.ok     = st == COMMON_PARAMS_FIT_STATUS_SUCCESS;
+                        o.n_ctx  = cp.n_ctx;
+                        o.layers = mp.n_gpu_layers == llama_model_default_params().n_gpu_layers || mp.n_gpu_layers < 0 ? n_layer + 1 : mp.n_gpu_layers;
+                        o.mtp    = with_extra && spec_mtp && !has_draft;
+                        int64_t n1 = 0;
+                        for (const auto & o2 : tbo) {
+                            n1 += o2.pattern != nullptr;
+                        }
+                        o.n_host = n1 - n0;
+                        o.cache  = cp.moe_cache_size >= COMMON_MOE_CACHE_AUTO_BYTES ? 0 : (int64_t) cp.moe_cache_size + common_fit_moe_margin_gain();
+                    };
+                    // a separate draft model is placed after the main model and its cache (see common_fit_draft_on_cpu): only the main model here
+                    one(spec_mtp && !has_draft, r);
+                    const char * env_md = getenv("LLAMA_FIT_MTP_DROP");
+                    if (r.ok && spec_mtp && !has_draft && params.speculative.draft.fit_can_drop && r.layers < n_layer + 1 &&
+                            mparams.n_gpu_layers == llama_model_default_params().n_gpu_layers && (env_md == nullptr || atoi(env_md) != 0)) {
+                        kv_probe r2;
+                        one(false, r2);
+                        if (r2.ok && r2.layers >= n_layer + 1) {
+                            r = r2; // the MTP drop rule below would drop the drafter
+                        }
+                    }
+                    return r;
+                };
+                const kv_probe a = probe(GGML_TYPE_F16);
+                const bool spilled = a.ok && (a.layers < n_layer + 1 || (spec_mtp && !has_draft && !a.mtp) || a.n_host > 0);
+                if (a.ok && spilled && (int64_t) a.n_ctx > min_ctx && n_layer > 0) {
+                    const kv_probe b = probe(GGML_TYPE_Q8_0);
+                    const int64_t mib = 1024*1024;
+                    const char * why = nullptr;
+                    if (b.ok) {
+                        if (b.n_ctx > a.n_ctx) {
+                            why = "more context";
+                        } else if (b.n_ctx == a.n_ctx && b.layers > a.layers) {
+                            why = "more layers on the device";
+                        } else if (b.n_ctx == a.n_ctx && b.layers == a.layers && b.mtp == a.mtp && a.n_host > 0 && b.n_host == 0) {
+                            why = "every expert on the device";
+                        } else if (aq_trade && b.n_ctx == a.n_ctx && b.layers == a.layers && b.mtp && !a.mtp) {
+                            why = "the MTP drafter stays";
+                        } else if (aq_trade && b.n_ctx == a.n_ctx && b.layers == a.layers && b.mtp == a.mtp && b.n_host > 0 &&
+                                b.cache >= a.cache + std::max<int64_t>(64*mib, a.cache/8)) {
+                            why = "a larger MoE cache";
+                        }
+                    }
+                    if (why != nullptr) {
+                        params.cache_type_k = GGML_TYPE_Q8_0;
+                        params.cache_type_v = GGML_TYPE_Q8_0;
+                        cparams.type_k      = GGML_TYPE_Q8_0;
+                        cparams.type_v      = GGML_TYPE_Q8_0;
+                    }
+                    COM_INF("%s: --fit: K/V cache %s at ctx %u: %s (f16: %" PRId64 " / %" PRId64 " layers, MTP %d, MoE cache %" PRId64 " MiB; "
+                        "q8_0: %" PRId64 " layers, MTP %d, MoE cache %" PRId64 " MiB%s; LLAMA_KV_AUTO_Q8=0 keeps f16)\n", __func__,
+                        why != nullptr ? "q8_0" : "f16", a.n_ctx, why != nullptr ? why : "q8_0 buys no device residency", a.layers, n_layer + 1,
+                        (int) a.mtp, a.cache/mib, b.layers, (int) b.mtp, b.cache/mib, b.ok ? "" : ", fit failed");
+                }
+            }
+        }
+
         bool draft_cpu = false;
         bool draft_needs_target = false;
         {
@@ -2487,6 +2697,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             COM_WRN("%s: LLAMA_FIT_DRAFT_CPU=1: the draft model runs on the target's KV cache and cannot run on the CPU beside it, it is left out\n", __func__);
         }
         const bool   draft_off = draft_cpu && params.speculative.draft.fit_can_drop && (env_dcpu == nullptr || atoi(env_dcpu) == 0 || draft_needs_target);
+        // k15-ov: the context's prefetch depth rule treats a target whose draft --fit dropped as running without one (no device draft
+        // competes with the deeper staging); cparams.spec_draft stays set, as it also turns on layer-major prompts (llama_context::sched_new)
+        common_set_env("LLAMA_FIT_DRAFT_DROPPED", draft_off ? "1" : "0");
         if (draft_cpu) {
             // no device at all (-devd none): with only n_gpu_layers = 0 its context still reserves a device compute buffer for the
             // offloaded ops of large batches (2.4 GiB for the MTP drafter at -ub 2048), which pushed the main layers off the GPU
@@ -2661,6 +2874,17 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         // decide on the params the model is loaded with, whatever the fit status: a failed or skipped fit leaves the user placement, which then decides like the path without --fit
         // the fitted overrides live in params.tensor_buft_overrides, which mparams points to
         mparams.load_mode = common_moe_cache_load_mode(params, mparams.load_mode, mparams.n_gpu_layers);
+
+        // k16-fit: the memory the fit leaves free (its target) is also the headroom of the context's optional load-time allocations (the
+        // MoE cache seed graph, an unlent staging arena): they only take memory beyond it (llama_context::sched_reserve_seed,
+        // llama_moe_cache lend_decide). LLAMA_FIT_TARGET_HEADROOM=0: their fixed 512 MiB as before
+        if (fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && (getenv("LLAMA_FIT_TARGET_HEADROOM") == nullptr || atoi(getenv("LLAMA_FIT_TARGET_HEADROOM")) != 0)) {
+            size_t target = 0;
+            for (size_t t : params.fit_params_target) {
+                target = std::max(target, t);
+            }
+            common_set_env("LLAMA_FIT_TARGET_MIB", std::to_string(target/(1024*1024)));
+        }
     }
 
     if (!model_only) {
@@ -4267,9 +4491,22 @@ static std::mutex                    g_ckpt_pool_mutex;
 static std::vector<common_state_buf> g_ckpt_pool;
 
 // k11: the pool keeps at most this many bytes (LLAMA_STATE_POOL_MIB, default 1024) and 8 buffers
+// largest buffer asked of the pool so far (the lock is held by the callers that write it)
+static size_t g_ckpt_pool_req_max = 0;
+
+// ... and at most twice the largest request (one state being saved, one ready for the next save): a pool kept at its byte cap held up to
+// 1 GiB idle at the end of a run, 6-7x the state of LFM2.5 (opt-in LLAMA_STATE_POOL_REL=1; default: the byte cap alone)
 static size_t ckpt_pool_limit() {
     static const size_t lim = (size_t) (getenv("LLAMA_STATE_POOL_MIB") ? std::max(0, atoi(getenv("LLAMA_STATE_POOL_MIB"))) : 1024) << 20;
-    return lim;
+    static const bool rel = getenv("LLAMA_STATE_POOL_REL") != nullptr && atoi(getenv("LLAMA_STATE_POOL_REL")) != 0;
+    return rel ? std::min(lim, 2*g_ckpt_pool_req_max + (g_ckpt_pool_req_max/8)) : lim;
+}
+
+// LLAMA_STATE_POOL_FIT=N (opt-in): a buffer is handed out for n only up to max(2, N) times n
+static size_t ckpt_pool_fit() {
+    static const size_t fit = getenv("LLAMA_STATE_POOL_FIT") != nullptr && atoi(getenv("LLAMA_STATE_POOL_FIT")) > 0 ?
+        (size_t) std::max(2, atoi(getenv("LLAMA_STATE_POOL_FIT"))) : 0;
+    return fit;
 }
 
 // keep the pool within its limits: drop the smallest buffers first (the lock is held by the caller)
@@ -4289,6 +4526,40 @@ void common_state_buf_recycle(common_state_buf && buf) {
     std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
     g_ckpt_pool.push_back(std::move(buf));
     ckpt_pool_trim();
+}
+
+bool common_state_thp_on() {
+#if defined(__linux__)
+    static const bool on = getenv("LLAMA_STATE_THP") != nullptr && atoi(getenv("LLAMA_STATE_THP")) != 0;
+    return on;
+#else
+    return false;
+#endif
+}
+
+void * common_state_thp_alloc(size_t bytes) {
+#if defined(__linux__)
+    void * p = nullptr;
+    if (posix_memalign(&p, 2u << 20, bytes) != 0 || p == nullptr) {
+        throw std::bad_alloc();
+    }
+    // whole huge pages only: the tail stays on 4 KiB pages, so the resident size is the bytes used, not rounded up to 2 MiB
+    const size_t huge = bytes & ~((size_t) (2u << 20) - 1);
+    if (huge > 0) {
+        madvise(p, huge, MADV_HUGEPAGE);
+    }
+    return p;
+#else
+    return ::operator new(bytes);
+#endif
+}
+
+void common_state_thp_free(void * p) {
+#if defined(__linux__)
+    free(p);
+#else
+    ::operator delete(p);
+#endif
 }
 
 // k11 (LLAMA_STATE_PREFAULT, default on with the pool, =0 off): a background thread keeps buffers whose pages are already resident
@@ -4340,10 +4611,13 @@ struct state_prefault_worker {
         while (true) {
             {
                 std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
+                g_ckpt_pool_req_max = std::max(g_ckpt_pool_req_max, n);
                 int    have  = 0;
                 size_t total = 0;
                 for (const auto & b : g_ckpt_pool) {
-                    have  += b.capacity() >= n;
+                    // with the fit, a buffer over twice the size is not handed out for n: it does not count as ready (else the fill
+                    // stopped and the next checkpoint of this size faulted in fresh pages on the request path)
+                    have  += b.capacity() >= n && (!ckpt_pool_fit() || b.capacity() / ckpt_pool_fit() <= n);
                     total += b.capacity();
                 }
                 if (have >= count || g_ckpt_pool.size() >= 8 || total + n_alloc > ckpt_pool_limit()) {
@@ -4385,11 +4659,19 @@ void common_state_buf_prefault(size_t n, int count) {
     }
 }
 
+size_t common_state_buf_pool_bytes() {
+    std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
+    size_t t = 0;
+    for (const auto & b : g_ckpt_pool) { t += b.capacity(); }
+    return t;
+}
+
 bool common_state_buf_take(common_state_buf & buf, size_t n) {
     if (!ckpt_pool_on() || buf.capacity() >= n) {
         return false;
     }
     std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
+    g_ckpt_pool_req_max = std::max(g_ckpt_pool_req_max, n);
     // the smallest that fits
     auto best = g_ckpt_pool.end();
     for (auto it = g_ckpt_pool.begin(); it != g_ckpt_pool.end(); ++it) {
@@ -4397,7 +4679,10 @@ bool common_state_buf_take(common_state_buf & buf, size_t n) {
             best = it;
         }
     }
-    if (best == g_ckpt_pool.end()) {
+    // a buffer more than twice the request is left in the pool: a small checkpoint that took a state buffer kept all of it resident for as
+    // long as the checkpoint lived (its capacity is not in the prompt cache's size), e.g. 2.8 MiB of checkpoints held 149 MiB on LFM2.5
+    // (opt-in LLAMA_STATE_POOL_FIT=1: G4 q4x reuse turns +1.4-2.5 ms with it and REL; default: any buffer that fits)
+    if (best == g_ckpt_pool.end() || (ckpt_pool_fit() && best->capacity() / ckpt_pool_fit() > n)) {
         return false;
     }
     buf = std::move(*best);

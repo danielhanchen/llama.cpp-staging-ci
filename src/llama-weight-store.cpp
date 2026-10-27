@@ -1,6 +1,7 @@
 #include "llama-weight-store.h"
 
 #include "llama-impl.h"
+#include "llama-sysmem.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1329,6 +1330,18 @@ size_t llama_weight_store::ram_available() {
         const size_t used = cur > file ? cur - file : 0;
         const size_t cg   = lim > used ? lim - used : 0;
         avail = avail == 0 ? cg : std::min(avail, cg);
+    }
+    // k16-disk: the limits of this process's own cgroup and of its parents (/proc/self/cgroup), not only of the namespace root read
+    // above: under a systemd scope / service (MemoryMax=), Slurm or any cgroup that is not the root of a cgroup namespace, the root
+    // has no limit, so the weight stream and its RAM tier stayed off and the experts were read by page faults (Qwen3.6-35B-A3B
+    // UD-Q4_K_XL in a 10 GiB scope: decode 0.37 tok/s and 3.7 GB read per token, against 9.56 tok/s and 90 MB with the stream on;
+    // same output). LLAMA_SYSMEM_CGROUP_WALK=0: the root only, as before
+    static const bool walk = [] { const char * e = getenv("LLAMA_SYSMEM_CGROUP_WALK"); return e == nullptr || atoi(e) != 0; }();
+    if (walk) {
+        const uint64_t s = llama_sysmem::available();
+        if (s > 0) {
+            avail = avail == 0 ? (size_t) s : std::min(avail, (size_t) s);
+        }
     }
     return avail;
 #endif

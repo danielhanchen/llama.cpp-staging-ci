@@ -1355,6 +1355,10 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    for (const auto & [unmap, buf] : host_pins) {
+        unmap(buf);
+    }
+    host_pins.clear();
     for (auto * lora : loras) {
         delete lora;
     }

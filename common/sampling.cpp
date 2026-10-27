@@ -135,6 +135,15 @@ struct common_sampler {
     bool pen_fast = false;                                  // k15: the fast path applies the repetition penalties (common_sampler_penalty_fast)
     std::vector<std::pair<llama_token, int>> pen_cnt;       // scratch: the window's tokens and their counts
     std::vector<std::pair<llama_token, float>> sp;          // scratch: biased and penalized tokens with their bias, ascending ids
+    bool dev_token = false;                                 // k15-fn: take the token of a device greedy sampler (common_sampler_set_device_token)
+    bool dev_topk = false;                                  // k15-fn: the row's logits are the device top-k candidates (common_sampler_set_device_topk)
+    int32_t dev_n_bias = 0;                                 // k15-fn: tokens with a bias (logit_bias + suppress tokens), for common_sampler_device_topk
+    bool dev_bias_pos  = false;                             //         one of those biases can raise a logit
+
+    // the token a backend sampler picked for row idx, if this sampler takes it (backend sampling, or the device greedy chain of the server)
+    llama_token sampled_token(struct llama_context * ctx, int idx) const {
+        return params.backend_sampling || dev_token ? llama_get_sampled_token_ith(ctx, idx) : LLAMA_TOKEN_NULL;
+    }
 
     void reset() {
         prev.clear();
@@ -163,6 +172,10 @@ struct common_sampler {
             cur.resize(sampled_logits_count);
             for (uint32_t i = 0; i < sampled_logits_count; i++) {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
+            }
+            if (dev_topk) {
+                // k15-fn: in id order, as the full row, for the samplers that depend on the order (greedy, dist before any sort)
+                std::sort(cur.begin(), cur.end(), [](const llama_token_data & a, const llama_token_data & b) { return a.id < b.id; });
             }
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
@@ -547,11 +560,52 @@ struct common_sampler * common_sampler_init(
         /* .pen_fast    = */ false,
         /* .pen_cnt     = */ {},
         /* .sp          = */ {},
+        /* .dev_token   = */ false,
+        /* .dev_topk    = */ false,
+        /* .dev_n_bias  = */ 0,
+        /* .dev_bias_pos = */ false,
     };
+
+    {
+        std::vector<llama_token> bt;
+        for (const auto & lb : merged_bias) {
+            bt.push_back(lb.token);
+            result->dev_bias_pos = result->dev_bias_pos || !(lb.bias <= 0.0f);
+        }
+        std::sort(bt.begin(), bt.end());
+        result->dev_n_bias = (int32_t) (std::unique(bt.begin(), bt.end()) - bt.begin());
+    }
 
     result->greedy_fast = common_sampler_greedy_fast(params, grmr, rbudget);
     result->pen_fast    = result->greedy_fast && common_sampler_penalty_active(params);
-    if (result->greedy_fast && !merged_bias.empty()) {
+    // only LLAMA_SAMPLE_GREEDY_FAST=1 reads bias_dense: else the sparse list is built from the biases alone (the same sums, in the same
+    // order), not from a fresh n_vocab array and a scan of it (0.5 ms per request with ignore_eos on a 248k vocab). LLAMA_SAMPLE_BIAS_SPARSE=0: as before
+    static const bool bias_sparse_only = [] {
+        const char * e = getenv("LLAMA_SAMPLE_BIAS_SPARSE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (result->greedy_fast && !merged_bias.empty() && bias_sparse_only && common_sampler_greedy_fast_mode() != 1) {
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+        std::vector<std::pair<llama_token, float>> lbs;
+        lbs.reserve(merged_bias.size());
+        for (const auto & lb : merged_bias) {
+            if (lb.token >= 0 && lb.token < n_vocab) {
+                lbs.emplace_back(lb.token, lb.bias);
+            }
+        }
+        std::stable_sort(lbs.begin(), lbs.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+        for (size_t k = 0; k < lbs.size();) {
+            float sum = 0.0f;
+            size_t e = k;
+            for (; e < lbs.size() && lbs[e].first == lbs[k].first; ++e) {
+                sum += lbs[e].second;
+            }
+            if (sum != 0.0f) {
+                result->bias_sparse.emplace_back(lbs[k].first, sum);
+            }
+            k = e;
+        }
+    } else if (result->greedy_fast && !merged_bias.empty()) {
         const int32_t n_vocab = llama_vocab_n_tokens(vocab);
         result->bias_dense.assign(n_vocab, 0.0f);
         for (const auto & lb : merged_bias) {
@@ -656,6 +710,10 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .pen_fast    = */ gsmpl->pen_fast,
         /* .pen_cnt     = */ {},
         /* .sp          = */ {},
+        /* .dev_token   = */ gsmpl->dev_token,
+        /* .dev_topk    = */ gsmpl->dev_topk,
+        /* .dev_n_bias  = */ gsmpl->dev_n_bias,
+        /* .dev_bias_pos = */ gsmpl->dev_bias_pos,
     };
 }
 
@@ -682,6 +740,10 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->bias_dense  = src->bias_dense;
     dst->bias_sparse = src->bias_sparse;
     dst->pen_fast    = src->pen_fast;
+    dst->dev_token   = src->dev_token;
+    dst->dev_topk    = src->dev_topk;
+    dst->dev_n_bias  = src->dev_n_bias;
+    dst->dev_bias_pos = src->dev_bias_pos;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -738,6 +800,103 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+void common_sampler_set_device_topk(struct common_sampler * gsmpl, bool on) {
+    if (gsmpl != nullptr) {
+        gsmpl->dev_topk = on;
+    }
+}
+
+void common_sampler_set_device_token(struct common_sampler * gsmpl, bool on) {
+    if (gsmpl != nullptr) {
+        gsmpl->dev_token = on;
+    }
+}
+
+bool common_sampler_device_greedy(const struct common_sampler * gsmpl) {
+    // k15-fn: the sampled token is the argmax of the raw logits (no bias, no active penalties): a device argmax that returns the lowest id
+    // on a tie gives the same token without copying the logits
+    const bool ok = gsmpl != nullptr && gsmpl->greedy_fast && !gsmpl->pen_fast && gsmpl->bias_dense.empty() && gsmpl->bias_sparse.empty();
+    return ok;
+}
+
+bool common_sampler_device_greedy_masked(const struct common_sampler * gsmpl, std::vector<llama_token> & mask) {
+    // k15-fn: the argmax of the logits with some tokens excluded (every bias is -inf, e.g. ignore_eos): the device greedy_masked chain
+    // gives the same token
+    mask.clear();
+    if (gsmpl == nullptr || !gsmpl->greedy_fast || gsmpl->pen_fast || gsmpl->bias_sparse.empty()) {
+        return false;
+    }
+    for (const auto & [tok, bias] : gsmpl->bias_sparse) {
+        if (!(std::isinf(bias) && bias < 0.0f)) {
+            mask.clear();
+            return false;
+        }
+        mask.push_back(tok);
+    }
+    return true;
+}
+
+int32_t common_sampler_device_topk(const struct common_sampler * gsmpl, int32_t k_dev) {
+    // k15-fn: the chain runs on the k_dev highest raw logits of the row (a device top-k) and still gives the token, the
+    // candidates and the probabilities of the full row, when
+    //   - everything before the chain's top_k (or before its final greedy) only lowers logits or does nothing: penalties with
+    //     repeat >= 1, frequency >= 0, presence >= 0; biases <= 0 (logit_bias, suppress tokens, ignore_eos); inactive dry,
+    //     top_n_sigma, typical, top_p, min_p, xtc;
+    //   - k + m <= k_dev, k the top_k (1 for greedy), m the tokens whose logit can change before it (the penalty window + the
+    //     biased tokens): the k highest lowered logits are then among the k + m highest raw ones;
+    //   - no grammar, reasoning budget, mirostat, adaptive-p, infill, dynamic temperature or probabilities output.
+    // The host top_k breaks ties by the lower id, so the full row and its device top-k give the same sorted candidates.
+    // Returns k_dev when the request qualifies, 0 otherwise (the raw logits are copied as before)
+    if (gsmpl == nullptr || gsmpl->grmr != nullptr || gsmpl->rbudget != nullptr || gsmpl->dev_bias_pos) {
+        return 0;
+    }
+    const auto & p = gsmpl->params;
+    if (p.mirostat != 0 || p.n_probs != 0 || p.samplers.empty() || k_dev <= 0) {
+        return 0;
+    }
+    const bool pen_active = p.penalty_last_n != 0 && (p.penalty_repeat != 1.0f || p.penalty_freq != 0.0f || p.penalty_present != 0.0f);
+    if (pen_active && (p.penalty_last_n < 0 || !(p.penalty_repeat >= 1.0f) || !(p.penalty_freq >= 0.0f) || !(p.penalty_present >= 0.0f))) {
+        return 0;
+    }
+    int32_t k = 0;
+    for (size_t i = 0; i < p.samplers.size(); ++i) {
+        const auto t = p.samplers[i];
+        if (t == COMMON_SAMPLER_TYPE_TOP_K && p.top_k > 0) {
+            k = p.top_k;
+            break;
+        }
+        switch (t) {
+            case COMMON_SAMPLER_TYPE_PENALTIES:   break;
+            case COMMON_SAMPLER_TYPE_TOP_K:       break; // top_k <= 0: does nothing
+            case COMMON_SAMPLER_TYPE_DRY:         if (p.dry_multiplier != 0.0f && p.dry_penalty_last_n != 0) { return 0; } break;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA: if (p.top_n_sigma > 0.0f) { return 0; } break;
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:   if (p.typ_p < 1.0f) { return 0; } break;
+            case COMMON_SAMPLER_TYPE_TOP_P:       if (p.top_p < 1.0f) { return 0; } break;
+            case COMMON_SAMPLER_TYPE_MIN_P:       if (p.min_p > 0.0f) { return 0; } break;
+            case COMMON_SAMPLER_TYPE_XTC:         if (p.xtc_probability > 0.0f) { return 0; } break;
+            case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                // a greedy chain ends with temperature 0 (common_sampler_init picks greedy for it)
+                if (i + 1 == p.samplers.size() && p.temp == 0.0f && p.dynatemp_range == 0.0f) { k = 1; break; }
+                return 0;
+            default: return 0;
+        }
+        if (k > 0) {
+            break;
+        }
+    }
+    if (k <= 0) {
+        return 0;
+    }
+    for (const auto t : p.samplers) {
+        if (t == COMMON_SAMPLER_TYPE_ADAPTIVE_P || t == COMMON_SAMPLER_TYPE_INFILL ||
+                (t == COMMON_SAMPLER_TYPE_TEMPERATURE && p.dynatemp_range != 0.0f)) {
+            return 0;
+        }
+    }
+    const int64_t m = (pen_active ? (int64_t) p.penalty_last_n : 0) + gsmpl->dev_n_bias;
+    return (int64_t) k + m <= (int64_t) k_dev ? k_dev : 0;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -751,8 +910,19 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
+    // k15-fn: a device greedy sampler (common_sampler_device_greedy, set by the server) picked the token and no logits were copied
+    if (gsmpl->dev_token && gsmpl->greedy_fast && llama_get_sampled_probs_ith(ctx, idx) == nullptr && llama_get_sampled_logits_ith(ctx, idx) == nullptr) {
+        const llama_token tok = gsmpl->sampled_token(ctx, idx);
+        if (tok != LLAMA_TOKEN_NULL) {
+            gsmpl->cur.resize(1);
+            gsmpl->cur[0] = llama_token_data{tok, 0.0f, 1.0f};
+            cur_p = { gsmpl->cur.data(), 1, 0, false };
+            return tok;
+        }
+    }
+
     // greedy chain on the full logits (no backend sampler output): the argmax of the biased logits, the lowest id on a tie
-    if (gsmpl->greedy_fast && llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL && llama_get_sampled_probs_ith(ctx, idx) == nullptr &&
+    if (gsmpl->greedy_fast && gsmpl->sampled_token(ctx, idx) == LLAMA_TOKEN_NULL && llama_get_sampled_probs_ith(ctx, idx) == nullptr &&
             llama_get_sampled_logits_ith(ctx, idx) == nullptr) {
         const float * logits  = llama_get_logits_ith(ctx, idx);
         GGML_ASSERT(logits != nullptr);
@@ -884,7 +1054,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
     {
-        id = llama_get_sampled_token_ith(ctx, idx);
+        id = gsmpl->sampled_token(ctx, idx);
 
         if (id != LLAMA_TOKEN_NULL) {
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);

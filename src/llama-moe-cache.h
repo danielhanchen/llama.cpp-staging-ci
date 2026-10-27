@@ -69,6 +69,17 @@ public:
     // before computing a ubatch: moves the state of the cache between the host and the devices if the other side uses it
     void prepare(int64_t n_tokens);
 
+    // k15-pred: uploads ahead of the routing (LLAMA_MOE_UPLOAD_AHEAD): the copy callback of a prompt ubatch calls begin after it read
+    // the ids of expert tensor w (counts: tokens per expert) and before its copies, and end after its copies and seed
+    void upload_ahead_begin(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * ids, const std::vector<int32_t> & counts);
+    void upload_ahead_end(ggml_backend_t backend, const ggml_tensor * w);
+    // the uploads ahead of the layer of w not yet waited for; wait: the backend's stream waits for them (before the copies of w read the
+    // cache or its seed writes slots; the uploads of its misses do not need to wait)
+    bool upload_ahead_pending(const ggml_tensor * w) const;
+    void upload_ahead_wait(ggml_backend_t backend, const ggml_tensor * w);
+    // after the uploads of the misses of w are queued on the backend: the next upload ahead is ordered after them
+    void upload_ahead_mark(ggml_backend_t backend, const ggml_tensor * w);
+
     // hybrid small batches [LLAMA_MOE_CACHE_HYBRID, LLAMA_MOE_CACHE_FETCH]: the GPU computes the cached experts, the host computes the
     // missing ones it is left; only a share of the missing experts is fetched and admitted
     // the hybrid lookup of layer il (see ggml_moe_cache_assign), nullptr if the layer does not use it, and the copies of the experts it
@@ -91,6 +102,10 @@ public:
     // prompts (the assign is frozen, see ggml_moe_cache_assign_freeze), so which expert of a token the host computes depends on the
     // token's own ids and the cache as the prompts left it, the same in a verify window as in a single token decode
     bool host_split_frozen() const;
+    // k16: route tail skip [LLAMA_MOE_ROUTE_TAIL_SKIP] (Strata's STRATA_ROUTE_TAIL_SKIP rule): in a decode or verify window of at most
+    // tail_skip_max_tokens() tokens, a missing expert that every token routes at rank >= the threshold is neither fetched nor computed
+    // (zero contribution, no renormalisation); sets it on the lookup / assign op of layer il when it applies to this cache
+    void tail_skip(ggml_tensor * op, int32_t il, int64_t n_tokens) const;
     // k13: CPU misses: small batches (up to 8 tokens) fetch nothing and the host computes every miss, without trials; true if frozen
     bool freeze_small();
     // k13: CPU misses: small batches (up to 8 tokens) take the host path without trials or miss-rate windows, but still fetch their
@@ -98,6 +113,8 @@ public:
     bool pin_small();
     // k15-lfm2: lift (false) / restore (true) that pin between requests; returns the pinned state (see llama_moe_pin_small_set)
     bool pin_small_set(bool on);
+    // k15-lfm2: a new request starts (LLAMA_MOE_CPU_MISS_PER_REQUEST=1): the CPU-miss rule's decisions restart from the launch's (see cm_request_begin)
+    bool request_begin(); // true if the cache was emptied
     // k15-lfm2: see llama_moe_cpu_miss_drop_slow
     bool cpu_miss_drop_slow();
     // k13: who computes the missing experts of small batches: 0 = never the host (every miss fetched), 1 = the hybrid path with a fixed
@@ -160,6 +177,9 @@ public:
     bool hybrid_tick_sync() const;
     // CPU misses trial: the ubatch after the tick is timed; synchronize after its graph is computed, then hybrid_tick_end
     bool hybrid_tick_timed() const;
+    // k15-pred r22b (LLAMA_MOE_CPU_MISS_PROMPT_AUTO=1): short-prompt host path timing, before the graph of a ubatch (timed with hybrid_tick_timed / hybrid_tick_end)
+    bool prompt_auto_pending() const;
+    void prompt_auto_tick(int64_t n_tokens);
     void hybrid_tick_end();
 
     // fetch overlap rule (default) or auto (LLAMA_MOE_CACHE_FETCH_OVERLAP=3): true while a window or trial runs or waits; the tick goes before the graph of
@@ -214,12 +234,22 @@ public:
     bool lends_graph_any() const;
     // the cache lends slots on the device of backend (decided by the first large graph, see lend): the staging arena is not allocated there
     bool lends_on(ggml_backend_t backend) const;
+    // k15-fn: the most slots the cache can lend to a merged layer-major graph's allocation on the device of backend (0: none), for capping
+    // a group before it is built; n_slots / expert_bytes (optional) get the size of the group it lends from. An upper bound: the staging
+    // copies share the lent slots and the placement fits whole bank tails, so a graph of capacity*expert_bytes may still be refused
+    int32_t graph_lend_capacity(ggml_backend_t backend, int32_t * n_slots = nullptr, size_t * expert_bytes = nullptr) const;
+    // graph_lend_capacity in bytes. The slots lent now are not subtracted: lend() places each graph's copies afresh in up to that many slots
+    // (it reuses or gives back what an earlier graph held), so the whole capacity is available to the next graph
+    size_t lend_capacity_bytes(ggml_backend_t backend) const;
     bool lends_graph() const; // the graph allocator may borrow too (LLAMA_MOE_CACHE_LEND=2)
     // whether a graph of n_tokens may get its allocation lent (LLAMA_MOE_CACHE_LEND=2 and not a batch the device lookup serves)
     bool lends_graph_to(int64_t n_tokens) const;
 
     // the largest staging memory (the copies of large batches) a measurement asked the cache to lend, on any device (0 if none)
     size_t lend_need_max() const;
+    // k15-fn: the staging copies a measurement found the cache lends on the device of backend because lending frees memory there
+    // (LLAMA_MOE_CACHE_LEND=1, or unset and lend_saves), 0 if it does not
+    size_t lend_save_need(ggml_backend_t backend) const;
 
     // device memory of backend kept free for a model or context created later (e.g. a draft): the automatic lending decision
     // counts it as used (see lend_decide)

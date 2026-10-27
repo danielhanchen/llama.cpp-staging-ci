@@ -605,6 +605,8 @@ extern "C" {
 
         GGML_OP_MOE_CACHE_LOOKUP,
 
+        GGML_OP_KQ_MASK,
+
         GGML_OP_COUNT,
     };
 
@@ -1525,6 +1527,17 @@ extern "C" {
     // host:  device-accessible pointers to the experts of layer il in host memory, with the layout of the banks
     // the missing experts get a slot (the least recently used one, approximated with a CLOCK) and are copied from host memory
     // result: I32 [n_expert_used, n_tokens] slots of the selected experts, then the copied experts; ggml_view_2d(ctx, res, n_expert_used, n_tokens, res->nb[1], 0) gives the ids for ggml_mul_mat_id with a bank
+    // k15-pp: the KQ mask of a KV-cached attention built by the backend from the cells and the tokens (the values of
+    // llama_kv_cache::set_input_kq_mask: 0 = attend, -INFINITY = masked)
+    // cells: I32 [5, n_kv, n_stream]: position (INT32_MIN = empty cell), sequence bits 0-31, sequence bits 32-63, 2D x, 2D y
+    // toks:  I32 [8, n_tps, n_stream]: position, sequence id (< 64), causal, SWA type (enum llama_swa_type), n_swa, 2D (M-RoPE), x, y
+    // result: type (F16 or F32) [n_kv, n_tps, 1, n_stream]
+    GGML_API struct ggml_tensor * ggml_kq_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cells,
+            struct ggml_tensor  * toks,
+            enum ggml_type        type);
+
     GGML_API struct ggml_tensor * ggml_moe_cache_lookup(
             struct ggml_context * ctx,
             struct ggml_tensor  * ids,
@@ -1641,6 +1654,19 @@ extern "C" {
             struct ggml_tensor  * scores,
             int32_t               grow_q16,
             bool                  advance);
+
+    // route tail skip for a ggml_moe_cache_lookup or ggml_moe_cache_assign (op) of a decode / verify window: an expert that is not
+    // cached before this lookup and that every token of the window routes only at rank >= rank (ids in routing order, rank = index in
+    // the row of ids, 0 = the largest weight) is neither fetched nor computed: its slot and host id are -1, so its rows are 0 and its
+    // contribution is zero (no renormalisation, the other experts keep their router weights). rank 0: off. dflt: the rank is the
+    // default rather than asked for, the backend may decline it (CUDA: on NVIDIA and on RDNA4, off on other HIP devices).
+    // stat (optional, the I32 use counters of the assign, see ggml_moe_cache_assign): the number of skipped entries is added to the
+    // 64-bit counter at elements [4..5] of its last row
+    GGML_API void ggml_moe_cache_set_tail_skip(
+            struct ggml_tensor  * op,
+            int32_t               rank,
+            bool                  dflt,
+            struct ggml_tensor  * stat);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

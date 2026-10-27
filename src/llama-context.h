@@ -16,8 +16,10 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <unordered_set>
 #include <unordered_map>
 #include <thread>
@@ -112,6 +114,7 @@ struct llama_context {
     bool moe_freeze_small(); // k13: see llama_moe_freeze_small
     bool moe_pin_small();    // k13: see llama_moe_pin_small
     bool moe_pin_small_set(bool on); // k15-lfm2: see llama_moe_pin_small_set
+    void moe_request_begin();        // k15-lfm2: see llama_moe_request_begin
     bool moe_cpu_miss_drop_slow(); // k15-lfm2: see llama_moe_cpu_miss_drop_slow
     const llama_cparams & get_cparams() const;
 
@@ -398,9 +401,16 @@ public:
 
     // reserve the graph of a prefetched ubatch that seeds the MoE cache from its own ids if the devices have room for it (staging_pp:
     // staging memory of the pp graph per backend), returns false if it does not fit
+    static std::atomic<bool> g_fit_seed_priced; // k16-fit: a memory probe priced the seed graph (sched_reserve)
+    static bool fit_seed_price_on();             // LLAMA_FIT_SEED_PRICE (default on)
     bool sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const std::vector<size_t> & staging_pp);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+    void set_sampler_raw_logits(llama_seq_id seq_id, bool raw);
+    bool set_sampler_swap(llama_seq_id seq_id, llama_sampler * sampler);
+    // the samplers the graph of a ubatch applies (graph_params): not those of the sequences copying raw logits, except in a reserve
+    std::map<llama_seq_id, llama_sampler *> graph_samplers() const;
+    bool graph_reserving = false;
 
 private:
     llm_graph_result * get_gf_res_prev();
@@ -523,6 +533,9 @@ private:
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
+        // k15-fn: sequences whose raw logits are still copied although a sampler is set (llama_set_sampler_raw_logits): the sampler
+        // stays in the graph (no new reserve) while a request that needs the host sampler runs
+        std::set<llama_seq_id> raw;
 
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};
@@ -624,6 +637,7 @@ private:
     // value of moe_cache_seed when the current graph was allocated: the scheduler plans the copies of the experts with it
     bool moe_cache_seed_graph = false;
     bool moe_inplace_ok       = false; // k15-lfm2: this ubatch may read its experts in place (see moe_cache_seed_begin)
+    int  moe_seed_early       = 0;     // k15-lfm2: after a per-request reset of the cache, seed before the end of the batch (see moe_request_begin)
     bool moe_inplace_graph    = false;
     int  moe_cache_hybrid_graph = 0; // llama_moe_cache::hybrid_mode of the previous graph
 
@@ -667,6 +681,8 @@ private:
     bool lm_merged_active = false;
     // the fewest ubatches of a merged graph refused for its compute buffer growth (decode_layer_major)
     size_t lm_refused_min = SIZE_MAX;
+    // per scheduler backend: the largest compute buffer a merged graph of decode_layer_major ran with (k16 regrow rule)
+    std::vector<size_t> lm_merged_peak;
     // the seed of the MoE cache at the end of a prompt, as the ubatch-by-ubatch order does it (moe_cache_seed_begin): the last large ubatch
     // seeds from the routing of the ubatch before it. In the merged graph that routing exists only once the graph reaches it, so the seed
     // of a layer is issued from the eval callback after that routing (or, for expert copies issued later, from the copy callback), on the
@@ -745,6 +761,7 @@ private:
     int64_t lm_copy_seq = 0;
     std::unordered_map<const ggml_tensor *, int64_t> lm_staged_seq; // expert tensor -> lm_copy_seq of its copy
     int64_t lm_n_async_wait_us = 0;
+    int64_t lm_n_seed_unstaged = 0; // k15-fn: expert copies outside staging memory a layer-major seed skipped (LLAMA_MOE_LM_SEED_STAGED_ONLY)
     int64_t lm_n_async = 0;
     void lm_seed_resolve(lm_seed_pending & p);
     // pre = true: before the copies of a split (only the layers whose staged copies the split may overwrite); false: after them
@@ -754,7 +771,7 @@ private:
     int decode_layer_major(llama_memory_context_i * mctx, int64_t n_outputs_all, int64_t n_tokens_all, int64_t & n_outputs_prev,
             int64_t & n_tokens_prev, bool & more, int & ret);
 
-    void moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_large, int64_t n_outputs_ub);
+    void moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_large, int64_t n_outputs_ub, bool early = false);
     void moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_outputs_ub);
     // the end of a prompt that did not seed: the lent slots that come back get the experts its last large ubatch used most
     void moe_cache_refill_from_ids();
@@ -773,6 +790,19 @@ private:
     // uploads of the mapped host weights from the model files through pinned memory [--weight-stream], nullptr if off
     // (declared after the backends and the scheduler: freed before them)
     std::unique_ptr<llama_weight_store> wstore;
+
+    // k16-disk: host expert ranges registered with the disk prefetch engine (ggml-moe-prefetch.h), see disk_prefetch_init; each entry
+    // unregisters its range when it goes (also when the constructor throws after the registration)
+    struct disk_range_ref {
+        const void * base = nullptr;
+        explicit disk_range_ref(const void * p) : base(p) {}
+        disk_range_ref(const disk_range_ref &) = delete;
+        disk_range_ref & operator=(const disk_range_ref &) = delete;
+        disk_range_ref(disk_range_ref && o) noexcept : base(o.base) { o.base = nullptr; }
+        ~disk_range_ref();
+    };
+    std::vector<disk_range_ref> disk_ranges;
+    void disk_prefetch_init();
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
@@ -798,6 +828,7 @@ private:
     std::vector<ggml_backend_t>             backend_ptrs;
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
+    std::vector<size_t>                     backend_lend_freed;   // k15-fn: of a measurement, the compute lending frees (see sched_reserve)
 
     // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
     std::array<llm_graph_result_ptr, 2> gf_res_prev;
@@ -840,6 +871,13 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+    // k15-pp: unmasked next-n rows (MTP) in their own host buffer, sized by the batches that copy them to the host instead of n_batch
+    // (a batch whose rows go to the device sink, LLAMA_MTP_DEV_H, needs none); LLAMA_NEXTN_LAZY=0: in the output buffer at n_batch
+    ggml_backend_buffer_ptr buf_nextn;
+    size_t  nextn_cap_rows  = 0;
+    int64_t nextn_need_rows = 0;   // rows the current decode copies to the host (set before output_reserve)
+    int64_t nextn_decode_rows = 0; // tokens of the current decode (a device-sink batch that falls back to the host needs them all)
+    bool nextn_store_ensure(size_t rows);
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
@@ -854,6 +892,15 @@ private:
     };
     std::vector<state_async_backend> state_async;
     bool state_async_init = false;
+
+    // k15-ov: synchronous state saves read the device rows through two small pinned halves per backend (LLAMA_STATE_BOUNCE_MIB each,
+    // 16): the next half's copies run while the previous half is copied to the destination (see state_get_bounced)
+    struct state_bounce_backend {
+        ggml_backend_buffer_ptr buf;
+        ggml_backend_event_t    ev[2] = { nullptr, nullptr };
+    };
+    std::vector<state_bounce_backend> state_bounce;
+    bool state_get_bounced(const std::vector<llama_state_write_info> & winfos);
 
     // waits for the events, then copies staging -> destination; joined by state_async_wait()
     std::thread state_async_worker;

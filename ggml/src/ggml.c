@@ -1121,9 +1121,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "MOE_CACHE_LOOKUP",
+
+    "KQ_MASK",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1238,9 +1240,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "moe_cache_lookup(ids, map, state, banks)",
+
+    "kq_mask(cells, toks)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3453,6 +3457,25 @@ struct ggml_tensor * ggml_mul_mat_id(
 
 // ggml_moe_cache_lookup
 
+struct ggml_tensor * ggml_kq_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cells,
+        struct ggml_tensor  * toks,
+        enum ggml_type        type) {
+    GGML_ASSERT(cells->type == GGML_TYPE_I32 && toks->type == GGML_TYPE_I32);
+    GGML_ASSERT(cells->ne[0] == 5 && toks->ne[0] == 8 && cells->ne[2] == toks->ne[2] && cells->ne[3] == 1 && toks->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(cells) && ggml_is_contiguous(toks));
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, cells->ne[1], toks->ne[1], 1, cells->ne[2]);
+
+    result->op     = GGML_OP_KQ_MASK;
+    result->src[0] = cells;
+    result->src[1] = toks;
+
+    return result;
+}
+
 struct ggml_tensor * ggml_moe_cache_lookup(
         struct ggml_context * ctx,
         struct ggml_tensor  * ids,
@@ -3463,7 +3486,8 @@ struct ggml_tensor * ggml_moe_cache_lookup(
         int                   n_banks,
         int                   il) {
     GGML_ASSERT(ids->type == GGML_TYPE_I32 && map->type == GGML_TYPE_I32 && state->type == GGML_TYPE_I32);
-    GGML_ASSERT(ggml_is_contiguous(ids) && ids->ne[2] == 1 && ids->ne[3] == 1);
+    // k15-fn: the rows of ids may be strided (a view of the argsort, e.g. ggml_argsort_top_k), the elements of a row contiguous
+    GGML_ASSERT(ids->nb[0] == sizeof(int32_t) && ids->nb[1] >= ids->ne[0]*sizeof(int32_t) && ids->ne[2] == 1 && ids->ne[3] == 1);
     GGML_ASSERT(ggml_is_contiguous(map) && ggml_is_contiguous(state));
     GGML_ASSERT(il >= 0 && il < map->ne[1]);
     GGML_ASSERT(n_banks > 0 && n_banks <= 4 && 3 + n_banks <= GGML_MAX_SRC);
@@ -3509,7 +3533,8 @@ struct ggml_tensor * ggml_moe_cache_assign(
         float                 fetch,
         int                   il) {
     GGML_ASSERT(ids->type == GGML_TYPE_I32 && map->type == GGML_TYPE_I32 && state->type == GGML_TYPE_I32 && counts->type == GGML_TYPE_I32);
-    GGML_ASSERT(ggml_is_contiguous(ids) && ids->ne[2] == 1 && ids->ne[3] == 1);
+    // k15-fn: the rows of ids may be strided (a view of the argsort, e.g. ggml_argsort_top_k), the elements of a row contiguous
+    GGML_ASSERT(ids->nb[0] == sizeof(int32_t) && ids->nb[1] >= ids->ne[0]*sizeof(int32_t) && ids->ne[2] == 1 && ids->ne[3] == 1);
     GGML_ASSERT(ggml_is_contiguous(map) && ggml_is_contiguous(state) && ggml_is_contiguous(counts));
     GGML_ASSERT(il >= 0 && il < map->ne[1]);
     GGML_ASSERT(counts->ne[0] == map->ne[0] && counts->ne[1] == map->ne[1] + 1 && counts->ne[0] >= 4);
@@ -3750,6 +3775,29 @@ void ggml_moe_cache_set_scores(
     op->src[i] = scores;
     ggml_set_op_params_i32(op, 13, grow_q16);
     ggml_set_op_params_i32(op, 14, advance ? 1 : 0);
+}
+
+void ggml_moe_cache_set_tail_skip(
+        struct ggml_tensor  * op,
+        int32_t               rank,
+        bool                  dflt,
+        struct ggml_tensor  * stat) {
+    GGML_ASSERT(op->op == GGML_OP_MOE_CACHE_LOOKUP);
+    const int mode = ggml_get_op_params_i32(op, 10);
+    GGML_ASSERT(mode == 0 || mode == 1);
+    GGML_ASSERT(rank >= 0 && rank < 256);
+    // op param 12 (unused by the lookup and the assign): rank, bit 8 = default
+    ggml_set_op_params_i32(op, 12, rank | (dflt ? 1 << 8 : 0));
+    if (stat != NULL && mode == 0) {
+        // the lookup has no use counters: they go after the banks and the scores
+        GGML_ASSERT(stat->type == GGML_TYPE_I32 && ggml_is_contiguous(stat) && stat->ne[0] >= 6);
+        GGML_ASSERT(stat->ne[0] == op->src[1]->ne[0] && stat->ne[1] == op->src[1]->ne[1] + 1);
+        const int i = 4 + ggml_get_op_params_i32(op, 1);
+        GGML_ASSERT(i < GGML_MAX_SRC && op->src[i] == NULL);
+        op->src[i] = stat;
+    } else if (stat != NULL) {
+        GGML_ASSERT(op->src[3] == stat);
+    }
 }
 
 // ggml_out_prod

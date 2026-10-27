@@ -17,6 +17,8 @@
 #include "llama-model.h"
 #include "llama-moe-cache.h"
 #include "llama-sysmem.h"
+#include "llama-weight-store.h"
+#include "ggml-moe-prefetch.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -32,6 +34,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -193,6 +196,101 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.name             =*/ "fused DeepSeek V4 HC post",
     /*.n_tokens_per_seq =*/ 1,
 };
+
+// k16 dense host pin: the weights of the layers that --fit / -ngl leave in system memory sit in a memory-mapped (pageable) buffer, so the
+// scheduler's copies of them for the prompt ops it offloads to the GPU go through the driver's staging buffer and block the host
+// (cudaMemcpyAsync from pageable memory): L4, dense Qwen3.6-27B UD-Q4_K_XL at 12 GB (32 of 65 layers on the GPU), 8.7 GB of CPU layers
+// per 512-token ubatch at ~3.5 GB/s, 207 prompt tok/s at 2k-16k (16k TTFT 80 s). Page-locking those buffers (read-only, not mapped into the
+// device address space, so no VRAM is spent on page tables) lets the copies run as DMA at the link's speed and overlap the compute (prefetch depth 2).
+// Once per model, only for buffers of layer weights ("blk." tensors other than routed experts, which a MoE cache maps itself), only with
+// op offload, and only while the pinned total stays within min(LLAMA_DENSE_HOST_PIN_MAX_FRAC (0.5) x MemTotal - memory pinned already,
+// MemAvailable - max(2 GiB, 1/16)): registering a mapped file faults in and locks its pages. The same bytes are copied, so the outputs
+// are bit-identical. Off by default (see below): LLAMA_DENSE_HOST_PIN=1 enables.
+static void llama_dense_host_pin(const llama_model & model) {
+    using host_pin_range_t    = void * (*)(void *, size_t);
+    using host_unpin_t        = void (*)(void *);
+    using host_mapped_bytes_t = size_t (*)(void);
+    // opt-in (LLAMA_DENSE_HOST_PIN=1): the driver keeps GPU page tables for registered host memory, ~2 MiB of VRAM per GiB page-locked
+    // whatever the flags (Default / Portable / Portable | Mapped, 4 KiB or 2 MiB host pages: exclusive B200, 8 GiB -> +16 MiB, 2 GiB ->
+    // +4 MiB, nothing charged to the process; G4 / L4 / T4 dense Qwen3.6-27B 12 GB: +18 MiB for 8.7 GiB), outside any buffer of ours
+    if (const char * e = getenv("LLAMA_DENSE_HOST_PIN"); e == nullptr || atoi(e) == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(model.host_pin_mutex);
+    if (model.host_pin_done) {
+        return;
+    }
+    model.host_pin_done = true;
+    ggml_backend_reg_t reg = nullptr;
+    for (const auto & d : model.devices) {
+        if (d.is_meta || d.dev == nullptr || ggml_backend_dev_type(d.dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        ggml_backend_reg_t r = ggml_backend_dev_backend_reg(d.dev);
+        if (r != nullptr && ggml_backend_reg_get_proc_address(r, "ggml_backend_host_pin_range") != nullptr) {
+            reg = r;
+            break;
+        }
+    }
+    if (reg == nullptr) {
+        LLAMA_LOG_DEBUG("%s: dense host pin: no device that page-locks host memory\n", __func__);
+        return;
+    }
+    auto pin_range = (host_pin_range_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_pin_range");
+    auto unpin     = (host_unpin_t)        ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_unpin");
+    auto mapped_b  = (host_mapped_bytes_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_mapped_bytes");
+    if (unpin == nullptr) {
+        return;
+    }
+    std::vector<ggml_backend_buffer_t> bufs;
+    size_t n_tensors = 0;
+    for (const auto & [name, t] : model.tensors_by_name) {
+        if (t == nullptr || t->buffer == nullptr || name.rfind("blk.", 0) != 0 || name.find("_exps") != std::string::npos) {
+            continue;
+        }
+        if (strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer)), "CPU_Mapped") != 0) {
+            continue;
+        }
+        n_tensors++;
+        if (std::find(bufs.begin(), bufs.end(), t->buffer) == bufs.end()) {
+            bufs.push_back(t->buffer);
+        }
+    }
+    if (bufs.empty()) {
+        LLAMA_LOG_DEBUG("%s: dense host pin: no layer weights in memory-mapped system memory\n", __func__);
+        return;
+    }
+    double frac = 0.5;
+    if (const char * e = getenv("LLAMA_DENSE_HOST_PIN_MAX_FRAC")) {
+        frac = std::max(0.0, std::min(0.95, atof(e)));
+    }
+    const uint64_t total  = llama_sysmem::total();
+    const uint64_t avail  = llama_sysmem::available();
+    const uint64_t pinned = mapped_b != nullptr ? mapped_b() : 0;
+    size_t need = 0;
+    for (ggml_backend_buffer_t b : bufs) {
+        need += ggml_backend_buffer_get_size(b);
+    }
+    const uint64_t margin = std::max<uint64_t>(UINT64_C(2) << 30, need/16);
+    if ((total > 0 && (double) (need + pinned) > frac*(double) total) || (avail > 0 && need + margin > avail)) {
+        LLAMA_LOG_INFO("%s: dense host pin: %.0f MiB of memory-mapped layer weights in system memory, more than the budget (%.0f MiB total, "
+            "%.0f MiB available, %.0f MiB pinned already): left pageable (LLAMA_DENSE_HOST_PIN_MAX_FRAC)\n", __func__, need/1048576.0,
+            total/1048576.0, avail/1048576.0, pinned/1048576.0);
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    size_t done = 0;
+    for (ggml_backend_buffer_t b : bufs) {
+        void * key = pin_range(ggml_backend_buffer_get_base(b), ggml_backend_buffer_get_size(b));
+        if (key != nullptr) {
+            model.host_pins.emplace_back(unpin, key);
+            done += ggml_backend_buffer_get_size(b);
+        }
+    }
+    LLAMA_LOG_INFO("%s: dense host pin: %.0f of %.0f MiB of memory-mapped layer weights in system memory (%zu tensors, %zu buffers) "
+        "page-locked for the copies of offloaded prompt ops in %.1f ms (LLAMA_DENSE_HOST_PIN=1)\n", __func__, done/1048576.0,
+        need/1048576.0, n_tensors, bufs.size(), (ggml_time_us() - t0)/1000.0);
+}
 
 llama_context::llama_context(
         const llama_model & model,
@@ -748,6 +846,9 @@ llama_context::llama_context(
         } else if (moe_cache_budget > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, moe_cache_budget, moe_cache_set, wstore.get(), cparams.moe_host_cache_mib);
         }
+        if (!moe_cache && !wstore && cparams.op_offload && !model.hparams.no_alloc) {
+            llama_dense_host_pin(model);
+        }
         if (lm_enabled && !moe_cache) {
             // nothing on the host is cached: no layer-major prompts, and the scheduler keeps its usual size
             lm_enabled = false;
@@ -771,6 +872,9 @@ llama_context::llama_context(
             }
             // the default hybrid path takes its fetch share from the decode threads, so it does not depend on timing
             moe_cache->hybrid_set_threads(n_threads_host > 0 ? n_threads_host : (int32_t) cparams.n_threads, model.hparams.no_alloc);
+        }
+        if (!model.hparams.no_alloc) {
+            disk_prefetch_init();
         }
         // LLAMA_MOE_CACHE_DEVSEED=1 (opt-in, default 0): with the default seeding (=2) a prefetched ubatch seeds the cache on the device from
         // its own routing (see llama_moe_cache::devseed_plan): its expert uploads never wait for the host to read the routing, and it needs
@@ -1113,7 +1217,99 @@ void llama_context::rs_replay_commit(bool sync) {
     rs_replay_us += ggml_time_us() - t0;
 }
 
+// k16-disk: runtime disk prefetch of host experts read through the file mappings (ggml/src/ggml-moe-prefetch.cpp, ported from
+// ik_llama.cpp PR #2101). The host expert tensors of file mappings are registered with the engine; the CPU MUL_MAT_ID streams the
+// routed experts of each product with its worker threads, the scheduler streams the next MoE splits of a prompt whose uploads read
+// the mapping (not when the weight store reads them). Page cache only: the kernels read the same mapped bytes (exact).
+// LLAMA_MOE_DISK_PREFETCH: unset = on when those experts exceed 80% of the available RAM (cgroup-aware, the weight store's rule),
+// 0 = off (no threads, no madvise: k15 behaviour), 1 = on. LLAMA_MOE_DISK_PREFETCH_THREADS (8), LLAMA_MOE_DISK_PREFETCH_AHEAD (3
+// MoE splits, 0 = kernel hook only; 0 by default beside a weight store), LLAMA_MOE_DISK_PREFETCH_MIB (lookahead bytes queued or in
+// flight, default min(2 GiB, 10% of the available RAM)), LLAMA_MOE_DISK_PREFETCH_RANDOM (MADV_RANDOM on the registered ranges, so a
+// fault the engine did not predict reads its page only, not a read-around window; default 1 beside a weight store or without a GPU,
+// else 0). Linux 5.14+ (MADV_POPULATE_READ) only
+void llama_context::disk_prefetch_init() {
+    const char * env = getenv("LLAMA_MOE_DISK_PREFETCH");
+    const int mode = env != nullptr ? atoi(env) : -1;
+    if (mode == 0) {
+        return;
+    }
+    std::vector<std::pair<const void *, size_t>> ranges;
+    uint64_t bytes = 0;
+    for (const auto & layer : model.layers) {
+        for (ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
+            if (t == nullptr || t->buffer == nullptr || t->data == nullptr || !ggml_backend_buffer_is_host(t->buffer) ||
+                    strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer)), "CPU_Mapped") != 0) {
+                continue;
+            }
+            ranges.emplace_back(t->data, ggml_nbytes(t));
+            bytes += ggml_nbytes(t);
+        }
+    }
+    if (ranges.empty()) {
+        return;
+    }
+    const uint64_t avail = llama_weight_store::ram_available();
+    const bool on = mode == 1 || (avail > 0 && (double) bytes > 0.8*(double) avail);
+    if (!on) {
+        if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+            LLAMA_LOG_INFO("%s: disk prefetch off: %.1f MiB of mapped host experts fit in %.1f MiB of available RAM (LLAMA_MOE_DISK_PREFETCH=1 forces it)\n",
+                __func__, bytes/1048576.0, avail/1048576.0);
+        }
+        return;
+    }
+    auto env_i = [](const char * name, long long def) {
+        const char * e = getenv(name);
+        return e != nullptr ? atoll(e) : def;
+    };
+    const bool main_ctx = cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP;
+    if (main_ctx || !ggml_moe_prefetch_enabled()) {
+        const int n_threads = (int) std::max(1LL, env_i("LLAMA_MOE_DISK_PREFETCH_THREADS", 8));
+        ggml_moe_prefetch_set_n_threads(n_threads);
+        if (!ggml_moe_prefetch_enabled()) {
+            LLAMA_LOG_WARN("%s: disk prefetch unavailable (no MADV_POPULATE_READ, Linux 5.14+)\n", __func__);
+            return;
+        }
+        const long long def_mib = (long long) std::min<uint64_t>(2048, avail/10/1048576);
+        ggml_moe_prefetch_set_budget((size_t) std::max(0LL, env_i("LLAMA_MOE_DISK_PREFETCH_MIB", std::max(64LL, def_mib))) << 20);
+    }
+    // the weight store reads the uploads of the host weights itself (ahead of the copies, with pread): the scheduler lookahead would
+    // read them a second time through the page cache
+    if (main_ctx) {
+        ggml_moe_prefetch_set_ahead((int) std::max(0LL, env_i("LLAMA_MOE_DISK_PREFETCH_AHEAD", wstore ? 0 : 3)));
+    }
+    // MADV_RANDOM only where the uploads do not fault the mapping: with a weight store (pread) or without a GPU. Uploads of decode misses
+    // through the mapping (weight store off) are not streamed by the engine, and without read-around each of their faults reads one page
+    const bool has_gpu = std::any_of(backends.begin(), backends.end(), [](const ggml_backend_ptr & b) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(b.get());
+        return dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+    });
+    const bool rand_read = env_i("LLAMA_MOE_DISK_PREFETCH_RANDOM", wstore || !has_gpu ? 1 : 0) != 0;
+    disk_ranges.reserve(disk_ranges.size() + ranges.size());
+    for (const auto & r : ranges) {
+        ggml_moe_prefetch_register_mapping(r.first, r.second, rand_read);
+        disk_ranges.emplace_back(r.first);
+    }
+    LLAMA_LOG_INFO("%s: disk prefetch on: %zu host expert tensors, %.1f MiB mapped, %.1f MiB of RAM available%s, %lld threads, lookahead %lld "
+        "MoE splits%s, MADV_RANDOM %s (LLAMA_MOE_DISK_PREFETCH=0 off)\n", __func__, ranges.size(), bytes/1048576.0, avail/1048576.0,
+        mode == 1 ? " (forced)" : "", env_i("LLAMA_MOE_DISK_PREFETCH_THREADS", 8), main_ctx ? env_i("LLAMA_MOE_DISK_PREFETCH_AHEAD", wstore ? 0 : 3) : -1LL,
+        wstore ? " (the weight store reads the uploads)" : "", rand_read ? "on" : "off");
+}
+
+llama_context::disk_range_ref::~disk_range_ref() {
+    if (base != nullptr) {
+        ggml_moe_prefetch_unregister_mapping(base);
+    }
+}
+
 llama_context::~llama_context() {
+    if (!disk_ranges.empty()) {
+        ggml_moe_prefetch_counters c = {};
+        ggml_moe_prefetch_stats(&c);
+        LLAMA_LOG_INFO("%s: disk prefetch: %" PRIu64 " chunks, %" PRIu64 " resident (skipped), %.1f MiB read ahead, %" PRIu64 " product enqueues, "
+            "%" PRIu64 " lookahead tensors (%" PRIu64 " dropped by the budget), %" PRIu64 " chunks MADV_COLD\n", __func__, c.n_jobs, c.n_skipped,
+            c.bytes_populated/1048576.0, c.n_node, c.n_tensor, c.n_dropped, c.n_colded);
+        disk_ranges.clear();
+    }
     if (rs_replay_mem != nullptr && rs_replay_mem->n_replay_commit > 0) {
         LLAMA_LOG_INFO("%s: recurrent replay commits: %" PRIu64 " (%" PRIu64 " reused graphs), %.2f ms total, %.3f ms each (host)\n", __func__,
                 rs_replay_mem->n_replay_commit, rs_reused, rs_replay_us/1e3, rs_replay_us/1e3/rs_replay_mem->n_replay_commit);
@@ -1408,16 +1604,45 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
             const double tokens = n_used > 0 ? moe_cache->cached_frac()*(double) model.hparams.n_expert/(double) n_used : 0.0;
             const uint64_t ram_total = llama_sysmem::total();
             const bool ram_ok = ram_total == 0 || moe_cache->host_uncached_bytes() <= ram_frac*(double) ram_total;
-            const char * why = cparams.spec_draft ? "speculative decoding with a draft model or MTP heads" :
+            // k15-ov: a draft model that --fit dropped (common sets LLAMA_FIT_DRAFT_DROPPED=1: it does not fit beside the cache, so
+            // speculative decoding is off) leaves no draft to compete with a deeper staging: depth LLAMA_MOE_PREFETCH_DEPTH_DROPPED (4;
+            // 0 = as before) where the cache holds the experts of at least LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS (10) tokens.
+            // G4 Flash-Next UD-IQ4_XS Studio argv (Q8_0 drafter dropped), 3 launches, A/A 0.4%, k15g4v1: 24 GB (14.6 tokens) depth 3 /
+            // 4: 8k 1.831 -> 1.780 / 1.716 s, 16k 3.562 -> 3.468 / 3.344 s, decode and pinned md5 unchanged; 16 GB (6.1 tokens) depth 3
+            // reserved the staging in device memory at fit time, the cache fell under the hybrid gate's 10% (6735 -> 5463 MiB, no
+            // layer-major groups): 8k 1.909 -> 4.200 s, hence the minimum
+            static const int dropped_depth = getenv("LLAMA_MOE_PREFETCH_DEPTH_DROPPED") ? std::max(0, atoi(getenv("LLAMA_MOE_PREFETCH_DEPTH_DROPPED"))) : 4;
+            static const double dropped_min = getenv("LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS") ?
+                std::max(0.0, atof(getenv("LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS"))) : 10.0;
+            const bool draft_dropped = dropped_depth > 0 && cparams.spec_draft && getenv("LLAMA_FIT_DRAFT_DROPPED") != nullptr &&
+                atoi(getenv("LLAMA_FIT_DRAFT_DROPPED")) != 0;
+            // k15-up2: a draft that runs (a -md drafter on the device or MTP heads) gets the same depth beside a cache of at least
+            // LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS tokens' experts (LLAMA_MOE_PREFETCH_DEPTH_SPEC=0: depth 2 beside a running draft).
+            // G4 k15g4j1, Flash-Next UD-IQ4_XS Studio argv + the admitted Q8_0 drafter, 3 launches, A/A <= 0.7%: 24 GB (11.0 tokens) TTFT
+            // 8k / 16k 2.002 -> 1.864 / 3.927 -> 3.675 s, 32 GB (18.4 tokens) 1.933 -> 1.817 / 3.726 -> 3.559 s; decode equal where the text
+            // is (24 GB chat 142.7 / 142.3 tok/s), elsewhere it follows the accepted drafts of another text; same device memory in use
+            // at the end. (k15g4i1 lost decode only because the fit probe paid for the depth-4 arena, see below.)
+            static const bool spec_env = getenv("LLAMA_MOE_PREFETCH_DEPTH_SPEC") == nullptr || atoi(getenv("LLAMA_MOE_PREFETCH_DEPTH_SPEC")) != 0;
+            // not beside built-in MTP heads (common sets LLAMA_SPEC_MTP_HEADS=1): local B200 Qwen3.6-35B-A3B UD-Q4_K_XL + MTP heads, 12 GB,
+            // pinned + strict exact, depth 4 gave other text than depth 2 and no draft (chat a3c3e816 vs 19b8fd68, twice each), while a
+            // dropped -md drafter at depth 4 kept it (not found why yet)
+            const bool mtp_heads = getenv("LLAMA_SPEC_MTP_HEADS") != nullptr && atoi(getenv("LLAMA_SPEC_MTP_HEADS")) != 0;
+            // not in a memory probe (no_alloc): --fit then sized the cache with the depth-4 arena reserved (G4 k15g4i1, fn4 24 GB +
+            // Q8_0 drafter: cache 12233 -> 8836 MiB, 11.0 -> 8.0 tokens, so the context refused depth 4 after the cache had paid for
+            // it: decode -5..-14%); the probe measures the default depth and the context decides on the cache it really has
+            const bool spec_deep = spec_env && dropped_depth > 0 && cparams.spec_draft && !draft_dropped && !mtp_heads && tokens >= dropped_min &&
+                !model.hparams.no_alloc;
+            const char * why = cparams.spec_draft && !draft_dropped && !spec_deep ? "speculative decoding with a draft model or MTP heads" :
+                draft_dropped && tokens < dropped_min ? "a dropped draft model beside a cache of fewer tokens than LLAMA_MOE_PREFETCH_DEPTH_DROPPED_MIN_TOKENS" :
                 tokens < min_tokens ? "the cache holds the experts of fewer tokens than LLAMA_MOE_PREFETCH_DEPTH_SPILL_MIN_TOKENS" :
                 !ram_ok ? "the uncached host experts are more than LLAMA_MOE_PREFETCH_DEPTH_SPILL_MAX_RAM_FRAC of the RAM" : nullptr;
-            depth_spill = why == nullptr ? 3 : 0;
+            depth_spill = why == nullptr ? (draft_dropped || spec_deep ? dropped_depth : 3) : 0;
             static bool logged = false; // once per process, not for a memory probe (no_alloc), whose log the fit silences
             if (!logged && !model.hparams.no_alloc) {
                 logged = true;
                 LLAMA_LOG_INFO("%s: MoE cache: host weight prefetch of the spilled experts starts at depth %s (cache = the experts of %.1f "
                     "tokens%s%s; LLAMA_MOE_PREFETCH_DEPTH_SPILL=N forces N, LLAMA_MOE_PREFETCH_DEPTH_RULE=0 keeps the default)\n", __func__,
-                    why == nullptr ? "3" : "the default", tokens, why ? ": " : "", why ? why : "");
+                    why == nullptr ? (draft_dropped || spec_deep ? std::to_string(dropped_depth).c_str() : "3") : "the default", tokens, why ? ": " : "", why ? why : "");
             }
         }
         if (depth_spill > 0) {
@@ -1525,9 +1750,16 @@ void llama_context::sched_reserve() {
         // left after the layers (the reserve drops the prefetch when the compute buffers do not fit with it or leave no headroom), so a fit
         // places the same layers as without the prefetch instead of moving one to the host for the staging copies
         // with the MoE cache the staging may live in lent cache slots and the cache sizing accounts for it: the measurement keeps it
+        // k15-fn: a draft model's measure keeps the copies of one split (LLAMA_FIT_STAGING_SPLIT=1, set by common around it, see
+        // common_draft_measure_env): without the arena the weights of a split are copied into the graph allocation instead. The main
+        // model's measure without a MoE cache keeps leaving the whole arena out (the cache it sizes lends or holds the copies)
         if (model.hparams.no_alloc && !moe_cache) {
+            const char * e_split = getenv("LLAMA_FIT_STAGING_SPLIT"); // set by common for draft-model measures only
+            const bool keep_split = e_split != nullptr && atoi(e_split) != 0;
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-                backend_buf_exp_size[i] -= std::min(backend_buf_exp_size[i], ggml_backend_sched_get_staging_size(sched.get(), backend_ptrs[i]));
+                const size_t staging = ggml_backend_sched_get_staging_size(sched.get(), backend_ptrs[i]);
+                const size_t split   = keep_split ? ggml_backend_sched_get_staging_split(sched.get(), backend_ptrs[i]) : 0;
+                backend_buf_exp_size[i] -= std::min(backend_buf_exp_size[i], staging - std::min(staging, split));
             }
         }
 
@@ -1584,6 +1816,24 @@ void llama_context::sched_reserve() {
         }
     }
 
+    // k16-fit: a memory probe (no_alloc: the --fit measurements) prices the graph that seeds the MoE cache (sched_reserve_seed), which
+    // the loaded context reserves after the pp graph and which so far took its growth from the fit's free-memory target (Qwen3.8-Flash-Next
+    // UD-IQ1_S, 16 GB, Studio argv: 1092 -> 1459 MiB); the loaded context then reserves it without its own free-memory check (the fit made
+    // the room), see sched_reserve_seed. LLAMA_FIT_SEED_PRICE=0: not priced, the context reserves it only where it fits beside 512 MiB
+    if (fit_seed_price_on() && model.hparams.no_alloc && moe_cache && moe_cache_seed_sync && n_tokens > llama_moe_cache::n_small_max &&
+            (int64_t) n_tokens >= prefetch_min_batch) {
+        std::vector<size_t> sizes(backend_ptrs.size(), 0);
+        moe_cache_seed = true;
+        graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), /*split_only =*/ true, sizes.data());
+        moe_cache_seed = false;
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            if (!ggml_backend_buft_is_host(backend_buft[i])) {
+                backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], sizes[i]);
+            }
+        }
+        g_fit_seed_priced.store(true);
+    }
+
     // the measure of the MoE cache auto n_ubatch (LLAMA_MOE_MEASURE_LENT=1, set by common_moe_cache_auto_ubatch) counts the compute buffer
     // the loaded context ends up with: the staging copies lent by the MoE cache (none of the arena), and the seed graph when it is larger
     // than the pp graph (a prompt ubatch that seeds the cache holds the expert copies of its cached layers in the graph allocation), which
@@ -1618,7 +1868,7 @@ void llama_context::sched_reserve() {
             LLAMA_LOG_DEBUG("%s: measure: staging copies %.2f MiB, the cache lends from %.2f MiB: %s\n", __func__, staging/1024.0/1024.0,
                 min_bytes/1024.0/1024.0, measure_lent ? "lent" : "counted");
         }
-        if (measure_lent != 0) {
+        if (measure_lent != 0 && moe_cache) {
             std::vector<size_t> graph_sz(backend_ptrs.size());
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
                 graph_sz[i] = backend_buf_exp_size[i] - std::min(backend_buf_exp_size[i], staging_pp[i]);
@@ -1629,6 +1879,28 @@ void llama_context::sched_reserve() {
                     backend_buf_exp_size[i]/1024.0/1024.0, graph_sz[i]/1024.0/1024.0);
                 backend_buf_exp_size[i] = graph_sz[i];
             }
+        }
+    }
+
+    // k15-fn: the fit's measure (no LLAMA_MOE_MEASURE_LENT) leaves the staging arena out (see above: it only uses memory that is left).
+    // Where the cache lends because that frees memory (llama_moe_cache lend_saves, or LLAMA_MOE_CACHE_LEND=1) the loaded context has no
+    // arena: the measure reports its bytes (mb.lend_freed, which the fit gives to the cache, see common_get_device_memory_data_impl),
+    // so the memory left after the load is the same as with the arena. The seeding prompt's copies are not counted, as without lending: the seed graph is reserved
+    // only if the memory left holds it (see sched_reserve_seed), like a default context that cannot fit it. G4 Qwen3.8-Flash-Next
+    // UD-IQ4_XS + MTP at 32 GB: k15gl_g4 counted the seed growth (546 MiB) too, the cache got 721 MiB and every prompt seeded the
+    // cache from its own ids: the 2k prompt lost 17% (2448 -> 2044 tok/s), the default does not seed there. Opt-in: LLAMA_MOE_CACHE_LEND_SAVE=1
+    if (model.hparams.no_alloc) {
+        backend_lend_freed.assign(backend_ptrs.size(), 0);
+    }
+    if (model.hparams.no_alloc && moe_cache && measure_env == nullptr) {
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            const size_t save = moe_cache->lend_save_need(backend_ptrs[i]);
+            if (save == 0) {
+                continue;
+            }
+            backend_lend_freed[i] = save;
+            LLAMA_LOG_DEBUG("%s: %s: measure: compute %.2f MiB, the cache lends %.2f MiB of staging to the cache\n", __func__,
+                ggml_backend_buft_name(backend_buft[i]), backend_buf_exp_size[i]/1024.0/1024.0, save/1024.0/1024.0);
         }
     }
 
@@ -1682,6 +1954,20 @@ void llama_context::sched_reserve() {
                 val(n_splits_pp, n_splits_tg).c_str(),
                 val(n_inputs_pp, n_inputs_tg).c_str(),
                 val(n_input_tensors_pp, n_input_tensors_tg).c_str());
+    }
+
+    {
+        static const bool trace = getenv("LLAMA_RESERVE_TRACE") != nullptr && atoi(getenv("LLAMA_RESERVE_TRACE")) != 0;
+        if (trace && !model.hparams.no_alloc) {
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+                if (dev != nullptr && !ggml_backend_buft_is_host(backend_buft[i])) {
+                    size_t free = 0, total = 0;
+                    ggml_backend_dev_memory(dev, &free, &total);
+                    fprintf(stderr, "reserve-trace: free after reserve %s %.2f MiB\n", ggml_backend_name(backend_ptrs[i]), free/1048576.0);
+                }
+            }
+        }
     }
 
     const int64_t t_end_us = ggml_time_us();
@@ -1747,9 +2033,18 @@ void llama_context::moe_cache_devseed_fallback() {
     }
 }
 
+// k16-fit: set once a memory probe of this process priced a seed graph (sched_reserve): the fit then made room for it
+std::atomic<bool> llama_context::g_fit_seed_priced{false};
+
+bool llama_context::fit_seed_price_on() {
+    static const bool on = getenv("LLAMA_FIT_SEED_PRICE") == nullptr || atoi(getenv("LLAMA_FIT_SEED_PRICE")) != 0;
+    return on;
+}
+
 bool llama_context::sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const std::vector<size_t> & staging_pp) {
-    // headroom for the memory the backends allocate while computing (e.g. the CUDA pool), which a larger compute buffer would take
-    constexpr size_t margin = 512ull*1024*1024;
+    // headroom for the memory the backends allocate while computing (e.g. the CUDA pool), which a larger compute buffer would take;
+    // k16-fit: at least the memory --fit left free (LLAMA_FIT_TARGET_MIB, set by common), which this optional graph must not take
+    const size_t margin = std::max<size_t>(512ull*1024*1024, getenv("LLAMA_FIT_TARGET_MIB") ? (size_t) atoll(getenv("LLAMA_FIT_TARGET_MIB"))*1024*1024 : 0);
 
     // the measure may release a graph allocator buffer that is too small for this graph, the free memory then includes it
     std::vector<size_t> cur(backend_ptrs.size(), 0);
@@ -1789,6 +2084,11 @@ bool llama_context::sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint3
                 ggml_backend_buft_name(backend_buft[i]), (graph - cur_gph)/1024.0/1024.0, free/1024.0/1024.0, margin/1024.0/1024.0);
             fits = false;
         }
+    }
+    if (!fits && fit_seed_price_on() && g_fit_seed_priced.load()) {
+        // the fit priced this graph: reserve it (a failed allocation still falls back below)
+        LLAMA_LOG_INFO("%s: the fit priced the seed graph: reserved without the headroom check (LLAMA_FIT_SEED_PRICE=0: checked)\n", __func__);
+        fits = true;
     }
     if (!fits) {
         return false;
@@ -2530,6 +2830,10 @@ bool llama_context::mtp_dev_h_store(ggml_backend_t backend_h, ggml_tensor * t_h_
         if (st) {
             st->usable = false;
             LLAMA_LOG_WARN("%s: MTP handoff back on the host: this graph's h_nextn cannot be written to the device sink\n", __func__);
+            // the host rows were sized for a device-sink decode (none): this decode copies all of its rows to the host from here on
+            if (!cparams.embeddings_nextn_masked && buf_nextn) {
+                GGML_ASSERT(nextn_store_ensure((size_t) nextn_decode_rows));
+            }
             // the rows of this decode already on the device come back to the host buffer
             for (const auto & r : mtp_dev_h_runs) {
                 ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
@@ -2598,6 +2902,32 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_sampler_raw_logits(llama_seq_id seq_id, bool raw) {
+    if (raw) {
+        sampling.raw.insert(seq_id);
+    } else {
+        sampling.raw.erase(seq_id);
+    }
+}
+
+bool llama_context::set_sampler_swap(llama_seq_id seq_id, llama_sampler * sampler) {
+    auto it = sampling.samplers.find(seq_id);
+    if (it == sampling.samplers.end() || sampler == nullptr || !sampler->iface->backend_init || !sampler->iface->backend_apply ||
+            llama_sampler_chain_n(sampler) <= 0) {
+        return false;
+    }
+    if (it->second == sampler) {
+        return true;
+    }
+    if (!llama_sampler_chain_is_init(sampler)) {
+        sampler->iface->backend_init(sampler, ggml_backend_dev_buffer_type(model.dev_output()), cparams.n_outputs_max_per_seq);
+    }
+    // the graph of the next ubatch is built again (llm_graph_result::can_reuse compares the samplers), the reserve stays
+    it->second = sampler;
+    llm_graph_sampler_unbind(sampler);
+    return true;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -2627,9 +2957,13 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (sampler && can_offload) {
         auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
 
-        sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
+        // k15-fn: a chain set before (the server's device greedy chain, back from a backend sampling request) is initialized once
+        if (!llama_sampler_chain_is_init(sampler)) {
+            sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
+        }
 
         sampling.samplers[seq_id] = sampler;
+        llm_graph_sampler_unbind(sampler);
 
         sched_need_reserve = true;
 
@@ -2747,6 +3081,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
         moe_cache->hybrid_tick(ubatch.n_tokens);
         ggml_backend_sched_set_overlap(sched.get(), moe_cache->hybrid_active());
+    }
+    // k15-pred r22b: short-prompt host path timing (opt-in), no change to the scheduler's overlap flag
+    if (moe_cache && moe_cache->prompt_auto_pending()) {
+        moe_cache->prompt_auto_tick(ubatch.n_tokens);
     }
 
     const int64_t t_tr0 = llama_mtp_handoff_trace() && ubatch.n_tokens >= 64 ? ggml_time_us() : 0;
@@ -3017,6 +3355,27 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     compute_n_tokens = ubatch.n_tokens;
     const int64_t t_ub2 = ub_timing ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    // k15-pp (debug): LLAMA_KQ_MASK_DUMP=1 counts the kept cells of each device-built KQ mask (marked as an output by the builder)
+    static const bool kq_mask_dump = getenv("LLAMA_KQ_MASK_DUMP") != nullptr;
+    if (kq_mask_dump) {
+        ggml_backend_sched_synchronize(sched.get());
+        ggml_cgraph * g = res->get_gf();
+        for (int i = 0; i < ggml_graph_n_nodes(g); ++i) {
+            ggml_tensor * t = ggml_graph_node(g, i);
+            if (t->op != GGML_OP_KQ_MASK) {
+                continue;
+            }
+            std::vector<uint8_t> buf(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+            int64_t n_keep = 0, n_drop = 0, n_other = 0;
+            for (int64_t k = 0; k < ggml_nelements(t); ++k) {
+                const float v = t->type == GGML_TYPE_F16 ? ggml_fp16_to_fp32(((ggml_fp16_t *) buf.data())[k]) : ((float *) buf.data())[k];
+                if (v == 0.0f) n_keep++; else if (std::isinf(v) && v < 0) n_drop++; else n_other++;
+            }
+            LLAMA_LOG_INFO("%s: KQ mask dump %s [%d x %d]: %lld kept, %lld masked, %lld other (backend %s)\n", __func__, t->name, (int) t->ne[0],
+                (int) t->ne[1], (long long) n_keep, (long long) n_drop, (long long) n_other, t->buffer ? ggml_backend_buffer_name(t->buffer) : "-");
+        }
+    }
     compute_n_tokens = 0;
     if (t_tr0) {
         const int64_t t_tr_end = ggml_time_us();
@@ -3102,6 +3461,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     n_queued_tokens += n_tokens;
 
     // reserve output buffer
+    nextn_need_rows = n_tokens; // k15-pp: encode copies every row (see nextn_store_ensure)
     if (output_reserve(n_tokens) < n_tokens) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %u outputs\n", __func__, n_tokens);
         return -2;
@@ -3276,7 +3636,8 @@ static void copy_tensor_async_rows(
     }
 }
 
-static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers) {
+static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers,
+        const std::set<llama_seq_id> & raw) {
     for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
         if (!ubatch.output[i]) {
             continue;
@@ -3285,7 +3646,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
         // Check if the output token has at least one sequence without a backend sampler.
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             llama_seq_id seq_id = ubatch.seq_id[i][j];
-            if (samplers.find(seq_id) == samplers.end()) {
+            if (samplers.find(seq_id) == samplers.end() || raw.count(seq_id) > 0) {
                 return true;
             }
         }
@@ -3609,6 +3970,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
 
     // reserve output buffer
+    // k15-pp: the next-n rows this decode copies to the host (none where they go to the device sink, see mtp_dev_h_decode_begin)
+    nextn_decode_rows = (int64_t) balloc->get_batch().n_tokens;
+    nextn_need_rows   = mtp_dev_h_this ? 0 : nextn_decode_rows;
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
@@ -3694,7 +4058,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
             const bool large      = !moe_cache->small_batch(ubatch.n_tokens);
             const bool last_large = large && n_tokens_all - n_tokens_prev - ubatch.n_tokens <= llama_moe_cache::n_small_max;
-            moe_cache_seed_begin(ubatch, last_large, n_outputs);
+            moe_cache_seed_begin(ubatch, last_large, n_outputs, moe_seed_early != 0 && large && !last_large);
             if (large) {
                 moe_cache->count_large_ubatch();
             }
@@ -3761,7 +4125,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers, sampling.raw)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -3852,8 +4216,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 const uint32_t n_embd  = hparams.n_embd_out();
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
-                GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 if (!(mtp_dev_h_this && mtp_dev_h_store(backend_h, t_h_nextn, ubatch, offset))) {
+                    GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                     ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
                 }
                 extract_all_idxs = extract_all_idxs || !masked;
@@ -4089,8 +4453,12 @@ bool llama_context::lm_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
 // small batches only, the prompt ubatches a layer-major group runs copy their experts as before. A cache below LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC
 // (0.05) of the host experts runs its prompts layer-major too: G4 at 4 GB, Qwen3.6 Q3_K_M + MTP (0.7% cached) copied every host expert once
 // per 512-token ubatch, 55 GB of copies for a 2k prompt (PolyStrata: 13.6 GB, one per prompt). LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC=0: k12
+// k16-parity: the line was 5%, inside the default gate's band (at most 10% cached, LLAMA_MOE_CACHE_HYBRID_MAX_FRAC): a cache between 5 and
+// 10% ran every prompt ubatch alone (G4 q3m 4 GB ctx 20480 with q8_0 K/V, 5.4% cached: 2k / 8k prompt 2000 / 2059 tok/s, where 4.0% cached
+// gave 5706 / 9436). Now 0.25, past the default band, so every share the default gate fixes runs its prompts layer-major.
+// LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC=0.05: the old line
 static bool lm_hybrid_frac_ok(double frac) {
-    static const double max_frac = getenv("LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC") ? std::max(0.0, atof(getenv("LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC"))) : 0.05;
+    static const double max_frac = getenv("LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC") ? std::max(0.0, atof(getenv("LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC"))) : 0.25;
     return frac >= 0.0 && frac < max_frac;
 }
 
@@ -4851,7 +5219,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             auto * t_logits  = res->get_logits();
             auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn() : nullptr;
 
-            if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+            if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers, sampling.raw)) {
                 ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
                 GGML_ASSERT(backend_res != nullptr);
                 GGML_ASSERT(n_outputs_prev + n_outputs <= n_outputs_all);
@@ -4869,8 +5237,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                     ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                     GGML_ASSERT(backend_h != nullptr);
                     const uint32_t n_embd  = hparams.n_embd_out();
-                    GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                     if (!(mtp_dev_h_this && mtp_dev_h_store(backend_h, t_h_nextn, ubatch, offset))) {
+                        GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data + offset*n_embd, 0, n_rows*n_embd*sizeof(float));
                     }
                     extract_all_idxs = !masked;
@@ -5005,7 +5373,27 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             }
             LLAMA_LOG_INFO("%s: check: %zu index copies at %zu addresses, %d shared by different inputs\n", __func__, lm_sr.size(), at.size(), n_same);
         }
+        // k15-pp: the merged graph runs once (its nodes are freed after the group), so the backends skip their CUDA graph bookkeeping
+        // for it: G4 Flash-Next 16 GB, a 16384-token group recorded ~1 KB per node for a warmup that never completes (+30 MiB host
+        // memory at 55k nodes); same kernels, same order. LLAMA_MOE_LM_GRAPH_RECORDS=1 keeps it
+        static const bool lm_graph_records = getenv("LLAMA_MOE_LM_GRAPH_RECORDS") != nullptr && atoi(getenv("LLAMA_MOE_LM_GRAPH_RECORDS")) != 0;
+        auto lm_graph_skip = [&](bool on) {
+            for (auto & bk : backend_ptrs) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(bk);
+                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                auto fn = reg ? (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_skip_records") : nullptr;
+                if (fn != nullptr) {
+                    fn(bk, on);
+                }
+            }
+        };
+        if (!lm_graph_records) {
+            lm_graph_skip(true);
+        }
         const auto st = graph_compute(g, true);
+        if (!lm_graph_records) {
+            lm_graph_skip(false);
+        }
         if (lm_seed_async && !lm_pending.empty()) {
             // the layers whose copies the graph queued last (their staging slots hold the copies until the next graph)
             if (st == GGML_STATUS_SUCCESS) {
@@ -5027,6 +5415,27 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     // leave the prefetch headroom free: a larger graph is split in two (and again), else its allocation would drop the prefetch for good
     // (gpt-oss-20b MXFP4, G4 8 GB tier: 16 ubatches of 512 grew the compute buffer 455 -> 1164 MiB)
     static const size_t lm_grow_max = (size_t) (getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB"))) : 1024) << 20;
+    // k16: after a group whose cache banks were released (lm_released) the compute buffers are freed back to what the next graph needs
+    // (ggml_backend_sched_free_device_buffers), so the next group's growth is measured from that small buffer, not from the one the
+    // previous group ran with: G4, Qwen3.8-Flash-Next UD-IQ4_XS 12 GB, Studio argv (-ub 2048, cache 4.65% of the host experts), the 8k
+    // prompt grew 2520 -> 3285 MiB (765 MiB, ran as one group), the 16k prompt after it the same graph from 1544 MiB (1673 MiB > the cap,
+    // with 4633 MiB free): split down to single ubatches with the banks released, then lm_refused_min = 2 turned layer-major off for every
+    // later prompt (16k 1818 tok/s against 1935 without groups, 4313 at 8k). With the banks released the cap also allows the growth back
+    // up to the largest buffer a merged graph ran with (still within the free memory less the prefetch headroom, checked by the
+    // scheduler). LLAMA_MOE_LAYER_MAJOR_REGROW=0 off
+    static const bool lm_regrow = getenv("LLAMA_MOE_LAYER_MAJOR_REGROW") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_REGROW")) != 0;
+    auto grow_limit = [&]() -> size_t {
+        size_t back = 0;
+        if (lm_regrow && lm_released) {
+            for (size_t i = 0; i < backend_ptrs.size() && i < lm_merged_peak.size(); ++i) {
+                const size_t cur = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+                if (lm_merged_peak[i] > cur) {
+                    back = std::max(back, lm_merged_peak[i] - cur);
+                }
+            }
+        }
+        return lm_grow_max + back;
+    };
     int n_sub = 0;
     size_t n_done = 0; // the members computed (in order): a fallback must not compute them again (recurrent states would advance twice)
     bool first_run = true;
@@ -5065,7 +5474,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             srcs.emplace_back(node, arr);
         }
         lm_merged_active = true;
-        ggml_backend_sched_set_alloc_limit(sched.get(), true, lm_grow_max);
+        ggml_backend_sched_set_alloc_limit(sched.get(), true, grow_limit());
         // k11 (LLAMA_MOE_LM_LEND=0 off): a merged graph whose compute buffers would grow past the free memory borrows its allocation from the
         // MoE cache (slots lent for the group and refilled after it, as its staging copies are) instead of being split; the merged graph
         // runs the same ubatches, only where its tensors live changes
@@ -5106,7 +5515,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             }
             ggml_backend_sched_reset(sched.get());
             ggml_backend_sched_use_full_hash(sched.get());
-            ggml_backend_sched_set_alloc_limit(sched.get(), true, lm_grow_max);
+            ggml_backend_sched_set_alloc_limit(sched.get(), true, grow_limit());
             st = run(g);
         }
         if (st == GGML_STATUS_ALLOC_FAILED && lend_ok && !lend_g && ggml_backend_sched_get_alloc_over(sched.get()) > 0) {
@@ -5117,7 +5526,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             }
             ggml_backend_sched_reset(sched.get());
             ggml_backend_sched_use_full_hash(sched.get());
-            ggml_backend_sched_set_alloc_limit(sched.get(), true, lm_grow_max);
+            ggml_backend_sched_set_alloc_limit(sched.get(), true, grow_limit());
             lend_g = true;
             moe_cache->set_graph_lend(true);
             ggml_backend_sched_set_alloc_lend_graph(sched.get(), true);
@@ -5134,7 +5543,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 }
                 ggml_backend_sched_reset(sched.get());
                 ggml_backend_sched_use_full_hash(sched.get());
-                ggml_backend_sched_set_alloc_limit(sched.get(), true, lm_grow_max);
+                ggml_backend_sched_set_alloc_limit(sched.get(), true, grow_limit());
                 st = run(g);
             }
         }
@@ -5143,6 +5552,17 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         if (st != GGML_STATUS_ALLOC_FAILED) {
             n_sub++;
             if (st == GGML_STATUS_SUCCESS) {
+                lm_merged_peak.resize(backend_ptrs.size(), 0);
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    lm_merged_peak[i] = std::max(lm_merged_peak[i], ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]));
+                }
+                // k16 (k15-pp): a merged graph of b - a ubatches ran, so a refusal recorded at that size or below is stale (measured from a
+                // smaller buffer, at another position or before the banks were given back): later groups measure again from b - a + 1 up.
+                // LLAMA_MOE_LAYER_MAJOR_REFUSED_RESET=0 keeps the refusal for the process
+                static const bool lm_refused_reset = getenv("LLAMA_MOE_LAYER_MAJOR_REFUSED_RESET") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_REFUSED_RESET")) != 0;
+                if (lm_refused_reset && lm_refused_min <= b - a) {
+                    lm_refused_min = b - a + 1;
+                }
                 n_done = b;
                 extract_upto(n_done);
                 for (int c = 0; cap_in_graph && c < cap_max; ++c) {
@@ -5170,7 +5590,11 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             return GGML_STATUS_ALLOC_FAILED; // out of memory: the members not computed yet one by one, unseeded (below)
         }
         lm_n_split++;
-        lm_refused_min = std::min(lm_refused_min, b - a);
+        // k16: a refusal measured while the cache banks were released (lm_released: the compute buffers were freed back first) does not
+        // turn layer-major off for the process: it keeps lm_refused_min at LLAMA_MOE_LAYER_MAJOR_RELEASED_MIN (4) ubatches or more, so a
+        // later prompt still tries groups of 3 (k15-pp: one growth measured from a shrunk buffer must not cost every later prompt)
+        static const size_t lm_rel_min = getenv("LLAMA_MOE_LAYER_MAJOR_RELEASED_MIN") ? (size_t) std::max(0, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_RELEASED_MIN"))) : 4;
+        lm_refused_min = std::min(lm_refused_min, (lm_regrow && lm_released) ? std::max(lm_rel_min, b - a) : b - a);
         if (lm_verbose) {
             size_t free_min = SIZE_MAX;
             for (auto & bk : backend_ptrs) {
@@ -5181,8 +5605,19 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                     free_min = std::min(free_min, fr);
                 }
             }
-            LLAMA_LOG_INFO("decode_layer_major: the graph of ubatches [%zu, %zu) would grow the compute buffers by %.2f MiB (%.2f MiB free): split at %zu\n",
-                a, b, over/1048576.0, free_min == SIZE_MAX ? -1.0 : free_min/1048576.0, mid);
+            // k15-fn: and what the cache could lend a merged graph at most (llama_moe_cache::graph_lend_capacity, the largest over the devices)
+            int32_t lc_max = 0, lc_slots = 0;
+            size_t  lc_bytes = 0;
+            for (auto & bk : backend_ptrs) {
+                int32_t ns = 0;
+                size_t  eb = 0;
+                const int32_t c = moe_cache->graph_lend_capacity(bk, &ns, &eb);
+                if ((size_t) c*eb > (size_t) lc_max*lc_bytes) {
+                    lc_max = c; lc_slots = ns; lc_bytes = eb;
+                }
+            }
+            LLAMA_LOG_INFO("decode_layer_major: the graph of ubatches [%zu, %zu) would grow the compute buffers by %.2f MiB (%.2f MiB free; the cache lends at most %d of %d slots, %.2f MiB): split at %zu\n",
+                a, b, over/1048576.0, free_min == SIZE_MAX ? -1.0 : free_min/1048576.0, lc_max, lc_slots, (double) lc_max*lc_bytes/1048576.0, mid);
         }
         st = run_range(a, mid);
         if (st != GGML_STATUS_SUCCESS) {
@@ -5290,6 +5725,13 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     if (lm_verbose && lm_seed_async) {
         LLAMA_LOG_INFO("%s: async seed: %" PRId64 " routings read without a sync, %.2f ms waited for them in total\n", __func__, lm_n_async,
             lm_n_async_wait_us/1000.0);
+    }
+    if (lm_n_seed_unstaged > 0) {
+        static int n_unstaged_log = 0;
+        if (n_unstaged_log++ < 4) {
+            LLAMA_LOG_WARN("%s: %" PRId64 " expert copies outside staging memory did not seed the cache so far (LLAMA_MOE_LM_SEED_STAGED_ONLY=0 seeds "
+                "from them)\n", __func__, lm_n_seed_unstaged);
+        }
     }
     lm_pending.clear();
     lm_staged_seq.clear();
@@ -5477,6 +5919,39 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
 // output
 //
 
+bool llama_context::nextn_store_ensure(size_t rows) {
+    const int64_t n_embd_out = model.hparams.n_embd_out();
+    rows = std::min<size_t>(rows, cparams.n_batch);
+    if (!buf_nextn || nextn_cap_rows < rows) {
+        static const bool log_env = getenv("LLAMA_OUTPUT_RESERVE_LOG") != nullptr && atoi(getenv("LLAMA_OUTPUT_RESERVE_LOG")) != 0;
+        if (log_env) {
+            LLAMA_LOG_INFO("%s: ctx %p: next-n rows %zu -> %zu (%.2f MiB)\n", __func__, (void *) this, nextn_cap_rows, rows,
+                rows*n_embd_out*sizeof(float)/1048576.0);
+        }
+        if (buf_nextn) {
+            synchronize();
+        }
+        buf_nextn = nullptr;
+        auto * buft = ggml_backend_cpu_buffer_type();
+        auto * output_dev = model.dev_output();
+        auto * hb = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
+        if (hb) {
+            buft = hb;
+        }
+        buf_nextn.reset(ggml_backend_buft_alloc_buffer(buft, std::max<size_t>(1, rows)*n_embd_out*sizeof(float)));
+        if (!buf_nextn) {
+            LLAMA_LOG_ERROR("%s: failed to allocate %zu next-n rows\n", __func__, rows);
+            nextn_cap_rows = 0;
+            embd_nextn = buffer_view<float>{nullptr, 0};
+            return false;
+        }
+        ggml_backend_buffer_clear(buf_nextn.get(), 0);
+        nextn_cap_rows = rows;
+    }
+    embd_nextn = buffer_view<float>{(float *) ggml_backend_buffer_get_base(buf_nextn.get()), nextn_cap_rows*n_embd_out};
+    return true;
+}
+
 uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
@@ -5506,10 +5981,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
     embd_nextn.size = has_embd_nextn ? n_embd_out*n_outputs_max  : 0;
 
+    static const bool nextn_lazy = getenv("LLAMA_NEXTN_LAZY") == nullptr || atoi(getenv("LLAMA_NEXTN_LAZY")) != 0;
+    const bool nextn_sep = has_embd_nextn && !cparams.embeddings_nextn_masked && nextn_lazy;
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
         // unmasked: nextn row exists for every token in the batch, not just
         // those flagged via batch.logits[i] -> size by token count instead.
-        embd_nextn.size = (size_t) n_embd_out * n_batch;
+        // (k15-pp: in buf_nextn, see nextn_store_ensure, unless LLAMA_NEXTN_LAZY=0)
+        embd_nextn.size = nextn_sep ? 0 : (size_t) n_embd_out * n_batch;
     }
 
     for (bool enabled : cparams.embeddings_layer_inp) {
@@ -5538,6 +6016,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
     if (!buf_output || prev_size < new_size) {
+        static const bool log_env = getenv("LLAMA_OUTPUT_RESERVE_LOG") != nullptr && atoi(getenv("LLAMA_OUTPUT_RESERVE_LOG")) != 0;
+        if (log_env) {
+            LLAMA_LOG_INFO("%s: ctx %p type %d: output buffer %.2f -> %.2f MiB (logits %.2f, embd %.2f, embd_nextn %.2f%s, layer_inp %.2f, sampling %.2f MiB; n_outputs %d, n_batch %u)\n",
+                __func__, (void *) this, (int) cparams.ctx_type, prev_size/1048576.0, new_size/1048576.0, logits.size*4/1048576.0, embd.size*4/1048576.0,
+                embd_nextn.size*4/1048576.0, has_embd_nextn && !cparams.embeddings_nextn_masked ? " unmasked" : "", embd_layer_inp_float_count*4/1048576.0,
+                backend_float_count*4/1048576.0, n_outputs, n_batch);
+        }
         if (buf_output) {
 #ifndef NDEBUG
             // This doesn't happen often, but may be annoying in some cases (like the HellaSwag benchmark)
@@ -5583,6 +6068,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     embd_nextn = has_embd_nextn ? buffer_view<float>{(float *) (base + offset), embd_nextn.size} : buffer_view<float>{nullptr, 0};
     offset += embd_nextn.size * sizeof(float);
+    if (nextn_sep) {
+        // at least 64 rows (decode, verify), else what this decode copies to the host; never shrinks
+        if (!nextn_store_ensure((size_t) std::max<int64_t>({ nextn_need_rows, n_outputs_max, (int64_t) 64 }))) {
+            return 0;
+        }
+    }
 
     for (uint32_t il = 0; il < embd_layer_inp.size(); ++il) {
         if (cparams.embeddings_layer_inp[il]) {
@@ -5921,7 +6412,9 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
+    graph_reserving = true;
     const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    graph_reserving = false;
 
     res->reset();
 
@@ -5955,7 +6448,34 @@ ggml_cgraph * llama_context::graph_reserve(
         return nullptr;
     }
 
+    // k16-draft (debug, LLAMA_RESERVE_TRACE=1): every reserve's device buffer sizes, also in a memory probe (whose log the fit silences)
+    static const bool trace = getenv("LLAMA_RESERVE_TRACE") != nullptr && atoi(getenv("LLAMA_RESERVE_TRACE")) != 0;
+    if (trace) {
+        fprintf(stderr, "reserve-trace: %s tokens %u seqs %u outputs %u split_only %d seed %d:", model.hparams.no_alloc ? "probe" : "real",
+                n_tokens, n_seqs, n_outputs, (int) split_only, (int) moe_cache_seed);
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            const size_t sz = split_only ? (sizes ? sizes[i] : 0) : ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+            fprintf(stderr, " %s %.2f", ggml_backend_name(backend_ptrs[i]), sz/1048576.0);
+        }
+        fprintf(stderr, "\n");
+    }
+
     return gf;
+}
+
+std::map<llama_seq_id, llama_sampler *> llama_context::graph_samplers() const {
+    // k15-fn: a sequence copying its raw logits (llama_set_sampler_raw_logits) has no sampler in the graph: its argmax chains cost ~1%
+    // of a G4 Flash-Next decode step and nothing reads them. The reserve keeps every sampler (the largest graph)
+    if (sampling.raw.empty() || graph_reserving) {
+        return sampling.samplers;
+    }
+    std::map<llama_seq_id, llama_sampler *> res;
+    for (const auto & [seq_id, smpl] : sampling.samplers) {
+        if (sampling.raw.count(seq_id) == 0) {
+            res.emplace(seq_id, smpl);
+        }
+    }
+    return res;
 }
 
 llm_graph_params llama_context::graph_params(
@@ -5978,7 +6498,7 @@ llm_graph_params llama_context::graph_params(
         /*.moe_cache   =*/ moe_cache.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
-        /*.samplers    =*/ sampling.samplers,
+        /*.samplers    =*/ graph_samplers(),
         /*.n_outputs   =*/ n_outputs,
         /*.moe_full_last =*/ moe_full_last || getenv("LLAMA_MOE_LEND_FULL_LAST") == nullptr || atoi(getenv("LLAMA_MOE_LEND_FULL_LAST")) >= 2,
         /*.cb          =*/ graph_get_cb(),
@@ -6496,6 +7016,12 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
         st.ids = ids;
     }
 
+    // k15-pred: the experts uploaded ahead of this layer's routing are waited for, the next layer's are predicted (see llama_moe_cache)
+    const bool ua = lctx->moe_cache && !st.all && !st.counts.empty() && lctx->moe_cache->get_experts(src) != nullptr;
+    if (ua) {
+        lctx->moe_cache->upload_ahead_begin(backend, src, ids, st.counts);
+    }
+
     // group consecutive experts and copy them together
     // batched (e.g. CUDA >= 12.8): every cached run is copied from the MoE cache in one call with the uploads
     // otherwise only long cached runs are copied from the cache (many small copies cost more than they save), before the uploads
@@ -6550,14 +7076,31 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
     bool done = false;
     if (batch) {
         plan(true);
+        const size_t n_cached = st.regions.size();
         for (const auto & [offset, size] : st.uploads) {
             st.regions.push_back({ src, offset, dst, offset, size });
         }
         // fails (nothing copied) e.g. when the host weights are not pinned
-        if (ggml_backend_tensor_copy_regions_async(backend, st.regions.data(), st.regions.size())) {
+        if (ua && lctx->moe_cache->upload_ahead_pending(src)) {
+            // k15-pred: the uploads of the misses first, they do not read the slots uploaded ahead; then the cached runs after the wait
+            if (n_cached == st.regions.size() || ggml_backend_tensor_copy_regions_async(backend, st.regions.data() + n_cached, st.regions.size() - n_cached)) {
+                lctx->moe_cache->upload_ahead_mark(backend, src);
+                lctx->moe_cache->upload_ahead_wait(backend, src);
+                if (n_cached == 0 || ggml_backend_tensor_copy_regions_async(backend, st.regions.data(), n_cached)) {
+                    lctx->moe_cache->count_batch(src, st.regions);
+                    done = true;
+                }
+            }
+        } else if (ggml_backend_tensor_copy_regions_async(backend, st.regions.data(), st.regions.size())) {
             lctx->moe_cache->count_batch(src, st.regions);
             done = true;
+            if (ua) {
+                lctx->moe_cache->upload_ahead_mark(backend, src);
+            }
         }
+    }
+    if (ua) {
+        lctx->moe_cache->upload_ahead_wait(backend, src);
     }
     if (!done) {
         plan(false);
@@ -6566,6 +7109,9 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
             for (const auto & [offset, size] : st.uploads) {
                 ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
             }
+        }
+        if (ua) {
+            lctx->moe_cache->upload_ahead_mark(backend, src);
         }
     }
 
@@ -6580,7 +7126,16 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
         }
     }
     // layer-major graph: the routing that seeds this layer may come later, the seed then copies from this copy (see lm_eval_cb)
-    if (lctx->lm_seed_active && lctx->moe_cache->get_experts(src) != nullptr) {
+    // k15-fn (LLAMA_MOE_LM_SEED_STAGED_ONLY=0 off): only from a prefetched copy in staging memory. A copy the graph allocator placed (the
+    // host-weight prefetch turned off within the group, e.g. its staging arena failed to allocate after a lent graph) is overwritten by
+    // the later nodes of the graph before the routing resolves, and the seed filled cache slots with those bytes (G4 fn1 IQ1_S + MTP 16 GB
+    // 16k with GGML_SCHED_LEND_OWN=0: 118 + 21 slots wrong, the text and drafts off the no-draft run; locally GGML_SCHED_PREFETCH_FAIL_AT=1)
+    static const bool lm_seed_staged_only = getenv("LLAMA_MOE_LM_SEED_STAGED_ONLY") == nullptr || atoi(getenv("LLAMA_MOE_LM_SEED_STAGED_ONLY")) != 0;
+    if (lctx->lm_seed_active && lm_seed_staged_only && lctx->moe_cache->get_experts(src) != nullptr &&
+            !ggml_backend_sched_tensor_is_staged(lctx->sched.get(), dst)) {
+        lctx->lm_staged.erase(src);
+        lctx->lm_n_seed_unstaged++;
+    } else if (lctx->lm_seed_active && lctx->moe_cache->get_experts(src) != nullptr) {
         static const bool tail_dbg_s = getenv("LLAMA_LM_TAIL_DEBUG") != nullptr;
         if (tail_dbg_s && lctx->lm_staged.count(src) > 0) {
             LLAMA_LOG_INFO("%s: tail debug: a second staged copy of %s (all %d, previous dst %p, this %p)\n", __func__, src->name, (int) st.all,
@@ -6594,11 +7149,29 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
             std::none_of(lctx->moe_cache_ids.begin(), lctx->moe_cache_ids.end(), [&](const auto & r) { return r.second == ids; })) {
         lctx->moe_cache_ids.emplace_back(src, ids);
     }
+    if (ua) {
+        lctx->moe_cache->upload_ahead_end(backend, src);
+    }
+    // LLAMA_MOE_COPY_CHECK=1 (debug): every routed expert staged in dst holds the host bytes of its expert
+    static const bool copy_check = getenv("LLAMA_MOE_COPY_CHECK") != nullptr && atoi(getenv("LLAMA_MOE_COPY_CHECK")) != 0;
+    if (copy_check && !st.all && src->data != nullptr && ggml_backend_buffer_is_host(src->buffer)) {
+        ggml_backend_synchronize(backend);
+        std::vector<uint8_t> buf(expert_size);
+        for (int64_t e = 0; e < n_expert; ++e) {
+            if (!st.used[e]) {
+                continue;
+            }
+            ggml_backend_tensor_get(dst, buf.data(), e*expert_size, expert_size);
+            if (memcmp(buf.data(), (const uint8_t *) src->data + e*expert_size, expert_size) != 0) {
+                LLAMA_LOG_WARN("%s: copy check: %s expert %lld differs in the staged copy\n", __func__, src->name, (long long) e);
+            }
+        }
+    }
 
     return true;
 }
 
-void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_large, int64_t n_outputs_ub) {
+void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_large, int64_t n_outputs_ub, bool early) {
     moe_inplace_ok = true; // k15-lfm2: unless this ubatch seeds (below)
     moe_cache->prompt_ubatch(true);
     const bool large = !moe_cache->small_batch(ubatch.n_tokens);
@@ -6617,7 +7190,7 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
 
     // LLAMA_MOE_CACHE_SEED=2 (default): read the routing outputs of the previous large ubatch before this graph replaces them, unless this ubatch
     // records newer ones without seeding
-    if (moe_cache_seed_sync && cont && !moe_cache_ids.empty() && n_outputs_ub == 0 && (!large || (last_large && prefetch))) {
+    if (moe_cache_seed_sync && cont && !moe_cache_ids.empty() && n_outputs_ub == 0 && (!large || ((last_large || early) && prefetch))) {
         ggml_backend_sched_synchronize(sched.get());
         std::vector<int32_t> ids_data;
         std::vector<int32_t> counts;
@@ -6668,6 +7241,20 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
                 moe_cache->count_seed_skipped();
             }
         }
+        moe_seed_early = 0;
+    } else if (early && prefetch && moe_cache_seed_sync && n_outputs_ub == 0 && moe_cache->has_seed_counts()) {
+        // k15-lfm2 (LLAMA_MOE_CPU_MISS_PER_REQUEST=1): the request began with an empty cache, so every ubatch of the batch before its
+        // last uploads all of its experts; a prefetched ubatch without outputs seeds from the routing of the one before it (no larger
+        // graph, no serialized uploads), the ubatches after it copy those experts from the cache. The prompt computes on the device
+        // either way (same bytes), so its logits do not change. =1: the second large ubatch only, =2: every one up to the end of the batch
+        moe_cache_seed_prev = true;
+        if (moe_seed_early != 2) {
+            moe_seed_early = 0;
+        }
+    } else if (early && prefetch && moe_cache_seed_sync && moe_seed_early == 3 && moe_cache_seed_fits) {
+        // =3: the first large ubatch seeds from its own routing (its uploads wait for the router of each layer)
+        moe_cache_seed = true;
+        moe_seed_early = 0;
     }
     // k15-lfm2: a ubatch that seeds the cache from its own routing keeps the staging copies (the seed reads them), the others may read in
     // place; one that seeds from the routing of an earlier ubatch plans its seeds before the graph (see prompt_seed_plan)
@@ -7460,6 +8047,32 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         synchronize();
     }
 
+    // k15-ov: a host save reads its device rows in a few large copies through pinned halves (state_get_bounced) instead of one synchronous
+    // copy per row: G4 Flash-Next UD-IQ4_XS, the server's prompt-cache save at a request's start was 118 synchronous 2 MiB copies at
+    // ~3 GB/s (60 ms before an 8k prompt, ~120 ms before a 16k one). The same bytes reach the destination. Opt-in (LLAMA_STATE_BOUNCE=1):
+    // G4 k15g4z1 (3 launches) 16k TTFT -0.7..-1.3% (fn4 16 / 24 GB, q4x 12 GB), 2k / chat within the spread, for 2 x 16 MiB of pinned host
+    // memory per backend; most of the save is the first touch of a fresh cache entry, not the copies
+    static const bool bounce_env = getenv("LLAMA_STATE_BOUNCE") != nullptr && atoi(getenv("LLAMA_STATE_BOUNCE")) != 0;
+    if (bounce_env && !(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
+        llama_io_write_host_async io(dst, size);
+        try {
+            io.write(&io_magic, sizeof(io_magic));
+            io.write(&seq_id, sizeof(seq_id));
+
+            const size_t n = state_seq_write_data(io, seq_id, flags);
+
+            if (!state_get_bounced(io.winfos)) {
+                for (const auto & w : io.winfos) {
+                    ggml_backend_tensor_get(w.tensor, w.dst, w.offset, w.size);
+                }
+            }
+            return n;
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+            return 0;
+        }
+    }
+
     std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
@@ -7875,6 +8488,112 @@ size_t llama_context::state_async_reserve(llama_state_seq_flags flags) {
 // backend (reused across saves); a worker thread waits on an event per backend and copies them to dst, so the host is
 // free to prepare the next ubatch meanwhile. Rows in host buffers, or on a device without async copies and events,
 // take the synchronous path instead.
+// k15-ov: the rows of a synchronous host save, read through two pinned halves per device backend: the copies of one half are queued on
+// the backend (in stream order after its queued work, as ggml_backend_tensor_get) while the host copies the previous half to the
+// destination. Returns false (nothing read) when a row is not on an async-capable device backend or the halves cannot be allocated
+bool llama_context::state_get_bounced(const std::vector<llama_state_write_info> & winfos) {
+    if (winfos.empty()) {
+        return true;
+    }
+    state_async_init_backends();
+    if (state_async.empty()) {
+        return false;
+    }
+    static const size_t half = (size_t) std::max(1, getenv("LLAMA_STATE_BOUNCE_MIB") ? atoi(getenv("LLAMA_STATE_BOUNCE_MIB")) : 16) << 20;
+    if (state_bounce.size() != state_async.size()) {
+        state_bounce.resize(state_async.size());
+    }
+    std::vector<int> owner(winfos.size(), -1);
+    for (size_t i = 0; i < winfos.size(); ++i) {
+        const ggml_tensor * t = winfos[i].tensor;
+        ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+        if (buf == nullptr) {
+            return false;
+        }
+        if (ggml_backend_buffer_is_host(buf)) {
+            continue; // read on the host below
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+        for (size_t b = 0; b < state_async.size(); ++b) {
+            if (ggml_backend_buft_get_device(buft) == state_async[b].dev && ggml_backend_supports_buft(state_async[b].backend, buft)) {
+                owner[i] = (int) b;
+                break;
+            }
+        }
+        if (owner[i] < 0) {
+            return false;
+        }
+    }
+    for (size_t b = 0; b < state_bounce.size(); ++b) {
+        auto & sb = state_bounce[b];
+        if (!sb.buf) {
+            sb.buf.reset(ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(state_async[b].dev), 2*half));
+            for (int h = 0; h < 2 && sb.buf; ++h) {
+                sb.ev[h] = ggml_backend_event_new(state_async[b].dev);
+                if (sb.ev[h] == nullptr) {
+                    sb.buf.reset();
+                }
+            }
+            if (!sb.buf) {
+                return false;
+            }
+        }
+    }
+    // host rows first (no copy queue involved)
+    for (size_t i = 0; i < winfos.size(); ++i) {
+        if (owner[i] < 0) {
+            ggml_backend_tensor_get(winfos[i].tensor, winfos[i].dst, winfos[i].offset, winfos[i].size);
+        }
+    }
+    struct piece { uint8_t * dst; size_t off; size_t size; };
+    for (size_t b = 0; b < state_bounce.size(); ++b) {
+        auto & sb = state_bounce[b];
+        ggml_backend_t be = state_async[b].backend;
+        uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(sb.buf.get());
+        std::vector<piece> pend[2];
+        int h = 0;
+        size_t used = 0;
+        auto drain = [&](int k) {
+            if (pend[k].empty()) {
+                return;
+            }
+            ggml_backend_event_synchronize(sb.ev[k]);
+            for (const auto & p : pend[k]) {
+                memcpy(p.dst, base + (size_t) k*half + p.off, p.size);
+            }
+            pend[k].clear();
+        };
+        auto flip = [&]() {
+            ggml_backend_event_record(sb.ev[h], be);
+            h ^= 1;
+            drain(h); // the other half: its copies were queued before this half's
+            used = 0;
+        };
+        for (size_t i = 0; i < winfos.size(); ++i) {
+            if (owner[i] != (int) b) {
+                continue;
+            }
+            size_t done = 0;
+            while (done < winfos[i].size) {
+                if (used >= half) {
+                    flip();
+                }
+                const size_t n = std::min(winfos[i].size - done, half - used);
+                ggml_backend_tensor_get_async(be, winfos[i].tensor, base + (size_t) h*half + used, winfos[i].offset + done, n);
+                pend[h].push_back({ winfos[i].dst + done, used, n });
+                used = GGML_PAD(used + n, 64);
+                done += n;
+            }
+        }
+        if (!pend[h].empty()) {
+            ggml_backend_event_record(sb.ev[h], be);
+        }
+        drain(h ^ 1);
+        drain(h);
+    }
+    return true;
+}
+
 void llama_context::state_get_async(const std::vector<llama_state_write_info> & winfos) {
     // the previous save may still be reading the staging buffers
     state_async_wait();
@@ -8139,6 +8858,7 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ggml_backend_t             backend = backends[i].get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
             ret[buft].compute += backend_buf_exp_size[i];
+            ret[buft].lend_freed += i < backend_lend_freed.size() ? backend_lend_freed[i] : 0;
         }
     } else {
         for (const auto & backend_ptr : backends) {
@@ -9092,6 +9812,26 @@ bool llama_moe_pin_small_set(llama_context * ctx, bool on) {
     return ctx != nullptr && ctx->moe_pin_small_set(on);
 }
 
+void llama_context::moe_request_begin() {
+    if (moe_cache != nullptr && moe_cache->request_begin()) {
+        // the reset takes back the lent slots without a new allocation: a reused graph would keep its copies bound to them
+        gf_res_prev_active = nullptr;
+        gf_res_epoch++;
+        // the empty cache is seeded early in the first batch (see moe_cache_seed_begin); LLAMA_MOE_CPU_MISS_PER_REQUEST_SEED=0 off
+        static const int seed_early_env = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_PER_REQUEST_SEED");
+            return e != nullptr ? atoi(e) : 1;
+        }();
+        moe_seed_early = seed_early_env;
+    }
+}
+
+void llama_moe_request_begin(llama_context * ctx) {
+    if (ctx != nullptr) {
+        ctx->moe_request_begin();
+    }
+}
+
 bool llama_context::moe_cpu_miss_drop_slow() {
     if (moe_cache == nullptr || !moe_cache->cpu_miss_drop_slow()) {
         return false;
@@ -9102,6 +9842,10 @@ bool llama_context::moe_cpu_miss_drop_slow() {
 
 bool llama_moe_cpu_miss_drop_slow(llama_context * ctx) {
     return ctx != nullptr && ctx->moe_cpu_miss_drop_slow();
+}
+
+bool llama_moe_cache_active(const llama_context * ctx) {
+    return ctx != nullptr && ctx->moe_cache_active();
 }
 
 int32_t llama_moe_host_mode(const llama_context * ctx) {
@@ -9257,6 +10001,18 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
     return ctx->set_sampler(seq_id, smpl);
+}
+
+void llama_set_sampler_raw_logits(llama_context * ctx, llama_seq_id seq_id, bool raw) {
+    ctx->set_sampler_raw_logits(seq_id, raw);
+}
+
+void llama_sched_reserve_now(llama_context * ctx) {
+    ctx->sched_reserve();
+}
+
+bool llama_set_sampler_swap(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
+    return ctx->set_sampler_swap(seq_id, smpl);
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {

@@ -620,6 +620,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     res->t_logits = cur;
 }
 
+static bool proj_adjacent() {
+    static const bool on = !getenv("LLAMA_QWEN4EXP_PROJ_ADJACENT") || atoi(getenv("LLAMA_QWEN4EXP_PROJ_ADJACENT")) != 0;
+    return on;
+}
+
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
                 ggml_tensor * input,
                         int   il) {
@@ -627,10 +632,16 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
+    ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
+    // k15-mm2: both products of the input enter the graph next to each other, so the backend can run them as one multi-matrix
+    // mat-vec (otherwise z is placed where it is first read, after the conv, and the allocator reuses its memory in between);
+    // the same ops, only the node order changes. LLAMA_QWEN4EXP_PROJ_ADJACENT=0: z where it is first read
+    if (proj_adjacent()) {
+        ggml_build_forward_expand(gf, qkv_mixed);
+        ggml_build_forward_expand(gf, z);
+    }
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
-
-    ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
     cb(z, "z", il);
 
     return { qkv_mixed, z };
@@ -763,9 +774,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
 
     // cache rows store raw key | pooled key: pooling precedes norm and rotation, so the raw key gets neither
     ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
+    // k15-mm2: the indexer q product next to k's (one multi-matrix mat-vec), see build_qkvz
+    ggml_tensor * q_raw = build_lora_mm(model.layers[il].index_q_proj, cur);
+    if (proj_adjacent()) {
+        ggml_build_forward_expand(gf, k_raw);
+        ggml_build_forward_expand(gf, q_raw);
+    }
     cb(k_raw, "indexer_k_raw", il);
 
-    ggml_tensor * pzero  = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, idx_dim, n_tokens), 0.0f);
+    // opt-in (LLAMA_QSA_HOIST=1): on G4 fn4 IQ4_XS 32 GB Studio (single-graph host misses) the first chat diverged and a verify graph hit
+    // an illegal memory access with it on (k15gb_g4); not found yet, the fn1 cells here are exact
+    static const bool qsa_hoist = getenv("LLAMA_QSA_HOIST") != nullptr && atoi(getenv("LLAMA_QSA_HOIST")) != 0;
+    ggml_tensor * pzero  = qsa_hoist ? qsa_c.pzero : nullptr;
+    if (pzero == nullptr) {
+        pzero = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, idx_dim, n_tokens), 0.0f);
+        qsa_c.pzero = pzero;
+    }
     ggml_tensor * packed = ggml_reshape_3d(ctx0, ggml_concat(ctx0, k_raw, pzero, 0), 2*idx_dim, 1, n_tokens);
     ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, packed, inp_kpool->k_idxs, il));
 
@@ -799,7 +823,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);
     cb(pooled, "indexer_k", il);
 
-    ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
+    ggml_tensor * q = q_raw;
     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
     q = build_norm(q, model.layers[il].index_q_norm, nullptr, LLM_NORM_RMS, il);
     q = ggml_rope_multi(ctx0, q, inp_pos, nullptr,
@@ -809,7 +833,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
 
     // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim),
     // which is the lightning indexer with every head weight set to that scale
-    ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
+    ggml_tensor * weights = qsa_hoist ? qsa_c.weights : nullptr;
+    if (weights == nullptr) {
+        weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
+        qsa_c.weights = weights;
+    }
     ggml_tensor * score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
     cb(score, "indexer_score", il);
@@ -839,6 +867,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     mask_all = ggml_repeat_4d(ctx0, mask_all, n_kv + n_sel, n_tokens, 1, 1);
     mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_kv + n_sel, n_tokens);
 
+    // (per layer: the CUDA maskless attention matches this fill chain as private to the layer, see ggml_cuda_qsa_maskless_plan)
     ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, kq_mask->type, n_sel, 1, 1, 1);
     zeros = ggml_fill(ctx0, zeros, 0.0f);
     zeros = ggml_repeat_4d(ctx0, zeros, n_sel, n_tokens, 1, 1);
@@ -852,12 +881,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     ggml_tensor * live_pool = ggml_clamp(ctx0, ggml_scale_bias(ctx0, top_score, 1.0f, 1.0f), 0.0f, 1.0f);
     live_pool = ggml_reshape_2d(ctx0, ggml_repeat_4d(ctx0, live_pool, kpool, n_top_pool, n_tokens, 1), kpool*n_top_pool, n_tokens);
     // a tail cell is live unless it is the n_kv sentinel
-    ggml_tensor * live_tail = ggml_cast(ctx0, inp_kpool->tail_idxs, GGML_TYPE_F32);
-    live_tail = ggml_clamp(ctx0, ggml_scale_bias(ctx0, live_tail, -1.0f, (float) n_kv), 0.0f, 1.0f);
+    ggml_tensor * live_tail = qsa_hoist ? qsa_c.live_tail : nullptr;
+    if (live_tail == nullptr) {
+        live_tail = ggml_cast(ctx0, inp_kpool->tail_idxs, GGML_TYPE_F32);
+        live_tail = ggml_clamp(ctx0, ggml_scale_bias(ctx0, live_tail, -1.0f, (float) n_kv), 0.0f, 1.0f);
+        qsa_c.live_tail = live_tail;
+    }
     ggml_tensor * live = ggml_concat(ctx0, live_pool, live_tail, 0); // [n_sel, n_tokens]
 
     // dump rows n_kv + slot as a cumulative sum: the meta backend cannot split an arange, which has no source
-    ggml_tensor * dump  = ggml_scale_bias(ctx0, ggml_cumsum(ctx0, ggml_fill(ctx0, live, 1.0f)), 1.0f, (float) (n_kv - 1));
+    ggml_tensor * dump  = qsa_hoist ? qsa_c.dump : nullptr;
+    if (dump == nullptr) {
+        dump = ggml_scale_bias(ctx0, ggml_cumsum(ctx0, ggml_fill(ctx0, live, 1.0f)), 1.0f, (float) (n_kv - 1));
+        qsa_c.dump = dump;
+    }
+    // k15-fn: live and dump before the map below, so the cast, sub, mul, add and cast back are consecutive graph nodes (one CUDA
+    // kernel, ggml_cuda_try_fuse_qsa_idx); the order of independent nodes only
+    ggml_build_forward_expand(gf, live);
+    ggml_build_forward_expand(gf, dump);
     ggml_tensor * idx_f = ggml_cast(ctx0, sel_idx, GGML_TYPE_F32);
     idx_f   = ggml_add(ctx0, ggml_mul(ctx0, ggml_sub(ctx0, idx_f, dump), live), dump);
     sel_idx = ggml_cast(ctx0, idx_f, GGML_TYPE_I32);
@@ -1412,12 +1453,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_input->nb[1], conv_input->nb[2],
                 ggml_row_size(conv_input->type, s_idx));
 
-        ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
-                state_cols * channels, n_seqs,
-                conv_states_all->nb[1],
-                (slot * mem_size + kv_head) * row_size);
-
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        // k15-mm2: the slot row seen with the tail's shape takes a strided copy of the tail directly (a 2D copy on CUDA), the same
+        // bytes as making the tail contiguous and copying that; LLAMA_QWEN4EXP_CONV_CONT=1 restores the two copies
+        static const bool conv_cont = getenv("LLAMA_QWEN4EXP_CONV_CONT") && atoi(getenv("LLAMA_QWEN4EXP_CONV_CONT")) != 0;
+        if (conv_cont) {
+            ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+                    state_cols * channels, n_seqs,
+                    conv_states_all->nb[1],
+                    (slot * mem_size + kv_head) * row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        } else {
+            ggml_tensor * dst = ggml_view_3d(ctx0, conv_states_all,
+                    state_cols, channels, n_seqs,
+                    ggml_row_size(conv_states_all->type, state_cols), conv_states_all->nb[1],
+                    (slot * mem_size + kv_head) * row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
+        }
     }
 
     return conv_input;

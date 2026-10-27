@@ -13,6 +13,10 @@
 #include <cstring>
 #include <vector>
 #include <sstream>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 
 struct llama_logger_state {
     ggml_log_callback log_callback = llama_log_callback_default;
@@ -38,7 +42,44 @@ void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_
         mr.push_back({ base + (size_t) rows[i] * tensor->nb[1], row_bytes });
     }
 
-    llama_prefetch(std::move(mr));
+    // k15-ov: the advice (madvise WILLNEED per page run) is issued by a worker thread, off the caller's path. Setting the inputs of a
+    // ubatch waited for it: Flash-Next PLE, 2048 tokens, one syscall per run of rows, ~12 ms per ubatch on G4 (49 ms of host inputs
+    // before a layer-major group of 4 started) and 21-110 ms on a loaded host. It is a hint only (the rows are gathered by the graph
+    // either way), so the order and the outputs do not change. A queue of more than 4 requests drops the oldest.
+    // LLAMA_PREFETCH_ROWS_ASYNC=0: in the caller, as before
+    static const bool async_env = getenv("LLAMA_PREFETCH_ROWS_ASYNC") == nullptr || atoi(getenv("LLAMA_PREFETCH_ROWS_ASYNC")) != 0;
+    if (!async_env) {
+        llama_prefetch(std::move(mr));
+        return;
+    }
+    struct worker {
+        std::mutex mtx;
+        std::condition_variable cv;
+        std::deque<std::vector<llama_memory_range>> q;
+        worker() {
+            std::thread([this]() {
+                for (;;) {
+                    std::vector<llama_memory_range> job;
+                    {
+                        std::unique_lock<std::mutex> lock(mtx);
+                        cv.wait(lock, [this]() { return !q.empty(); });
+                        job = std::move(q.front());
+                        q.pop_front();
+                    }
+                    llama_prefetch(std::move(job));
+                }
+            }).detach();
+        }
+    };
+    static worker * w = new worker(); // never freed: the detached thread uses it until the process ends
+    {
+        std::lock_guard<std::mutex> lock(w->mtx);
+        if (w->q.size() >= 4) {
+            w->q.pop_front();
+        }
+        w->q.push_back(std::move(mr));
+    }
+    w->cv.notify_one();
 }
 
 time_meas::time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}

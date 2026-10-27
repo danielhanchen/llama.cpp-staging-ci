@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "fit.h"
 
 #include "json.h"
@@ -142,9 +143,19 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
                 ret[i].mb.model   += mb.model;
                 ret[i].mb.context += mb.context;
                 ret[i].mb.compute += mb.compute;
+                ret[i].mb.lend_freed += mb.lend_freed;
                 break;
             }
         }
+    }
+
+    // k15-fn: the staging arena a lending MoE cache takes over (mb.lend_freed) is memory the measure counted nowhere and the loaded
+    // context does not take: count it off the device (compute first, then context), as the fit counts the arena of a context that
+    // does not lend (not at all). fit_moe_cache_size gives it to the cache. Only with LLAMA_MOE_CACHE_LEND_SAVE=1 (nothing reported otherwise)
+    for (size_t i = 0; i < nd; i++) {
+        const size_t c = std::min(ret[i].mb.compute, ret[i].mb.lend_freed);
+        ret[i].mb.compute -= c;
+        ret[i].mb.context -= std::min(ret[i].mb.context, ret[i].mb.lend_freed - c);
     }
 
     {
@@ -248,17 +259,48 @@ static void common_params_fit_impl(
     const uint32_t n_streams  = cparams->kv_unified ? 1 : std::max<uint32_t>(1, cparams->n_seq_max);
     const bool     n_ctx_auto = cparams->n_ctx == 0;
 
-    dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
-    uint32_t n_ctx_extra = 0;  // context that memory was measured at
+    dmds_t      dmds_extra;    // memory of the extra model, laid out on the devices of the main model
+    std::string key_extra;     // context (and placement, see below) that memory was measured at
+
+    // k16-fit: an extra model that shares the weights of the main model (an MTP context) runs them in the placement the fit gives the
+    // main model, and takes its share of the main model's MoE cache budget (llama_moe_cache::budget, layer_set::nextn). Measured with
+    // its own parameters (every weight on the device, no cache) it priced the MTP context of Qwen3.6-35B-A3B UD-Q4_K_XL at 323 MiB of
+    // compute; with the experts in system memory it takes 714 MiB of compute (the staging of its host experts) and a 250 MiB cache share,
+    // so the loaded drafter left 474 MiB free against the 1024 MiB target (40 MiB at the end of a run). It is measured in the placement
+    // and at the cache size of the probe it is added to (one extra measure per distinct placement). LLAMA_FIT_EXTRA_FOLLOW=0: its own
+    // parameters, as before
+    static const bool extra_follow = getenv("LLAMA_FIT_EXTRA_FOLLOW") == nullptr || atoi(getenv("LLAMA_FIT_EXTRA_FOLLOW")) != 0;
+    auto placement_key = [&](const llama_model_params * mp, const llama_context_params * cp) {
+        std::string k = " ngl " + std::to_string(mp->n_gpu_layers) + " sm " + std::to_string(int(mp->split_mode)) +
+            " mg " + std::to_string(mp->main_gpu) + " cache " + std::to_string(cp->moe_cache_size) + " ts";
+        if (mp->tensor_split != nullptr) {
+            for (size_t i = 0; i < llama_max_devices(); i++) {
+                k += " " + std::to_string(mp->tensor_split[i]);
+            }
+        }
+        k += " tbo";
+        for (const llama_model_tensor_buft_override * o = mp->tensor_buft_overrides; o != nullptr && o->pattern != nullptr; o++) {
+            k += std::string(" ") + o->pattern + "=" + (o->buft != nullptr ? ggml_backend_buft_name(o->buft) : "-");
+        }
+        return k;
+    };
 
     // the extra model competes for the same memory as the main model, add it to every measurement
-    // its memory is measured again whenever the context it follows changes
-    auto add_extra_memory = [&](dmds_t & dmds) {
+    // its memory is measured again whenever the context it follows changes (and, sharing the model, its placement or cache size)
+    auto add_extra_memory = [&](dmds_t & dmds, const llama_model_params * mp_cur = nullptr, const llama_context_params * cp_cur = nullptr) {
         if (extra == nullptr) {
             return;
         }
+        if (mp_cur == nullptr) {
+            mp_cur = mparams;
+        }
+        if (cp_cur == nullptr) {
+            cp_cur = cparams;
+        }
+        const bool follow = extra->shares_model && extra_follow;
+        const std::string key = std::to_string(cparams->n_ctx) + (follow ? placement_key(mp_cur, cp_cur) : std::string());
 
-        if (dmds_extra.empty() || n_ctx_extra != cparams->n_ctx) {
+        if (dmds_extra.empty() || key_extra != key) {
             std::vector<ggml_backend_dev_t> devs_extra;
             uint32_t ngl_extra = 0;
             uint32_t nct_extra = 0;
@@ -266,18 +308,29 @@ static void common_params_fit_impl(
 
             extra->cparams->n_ctx = cparams->n_ctx;
 
-            LOG_TRC("%s: getting device memory data for the extra model at a context size of %" PRIu32 ":\n",
-                __func__, cparams->n_ctx);
+            llama_model_params   mp_x = *extra->mparams;
+            llama_context_params cp_x = *extra->cparams;
+            if (follow) {
+                mp_x.n_gpu_layers          = mp_cur->n_gpu_layers;
+                mp_x.split_mode            = mp_cur->split_mode;
+                mp_x.main_gpu              = mp_cur->main_gpu;
+                mp_x.tensor_split          = mp_cur->tensor_split;
+                mp_x.tensor_buft_overrides = mp_cur->tensor_buft_overrides;
+                cp_x.moe_cache_size        = cp_cur->moe_cache_size;
+            }
+
+            LOG_TRC("%s: getting device memory data for the extra model at a context size of %" PRIu32 "%s:\n",
+                __func__, cparams->n_ctx, follow ? ", in the placement of the main model" : "");
 
             dmds_t measured;
             try {
                 measured = common_get_device_memory_data_impl(
-                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+                    extra->path_model, &mp_x, &cp_x, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
                 dmds_extra = dmds_t(devs.size() + 1);
-                n_ctx_extra = cparams->n_ctx;
+                key_extra = key;
                 return;
             }
 
@@ -299,7 +352,7 @@ static void common_params_fit_impl(
                 }
             }
 
-            n_ctx_extra = cparams->n_ctx;
+            key_extra = key;
         }
 
         for (size_t id = 0; id < dmds.size(); id++) {
@@ -433,7 +486,7 @@ static void common_params_fit_impl(
         };
         auto measure = [&](const llama_context_params * cp) {
             dmds_t res = common_get_device_memory_data_impl(path_model, mp, cp, devs, hp_ngl, hp_nct, hp_nex, log_level);
-            add_extra_memory(res);
+            add_extra_memory(res, mp, cp);
             return res;
         };
         const int64_t surplus = surplus_of(dmds);
@@ -493,6 +546,45 @@ static void common_params_fit_impl(
             }
             const int64_t need = shortfall(dmds_test);
             if (need <= 0) {
+                // k15-fn: the first size that fits can leave memory above the targets (the cache does not take exactly the bytes the
+                // linear estimate gave it: G4 Qwen3.8-Flash-Next UD-IQ4_XS + MTP at 32 GB left 856 MiB above the 1024 MiB margin);
+                // grow it by the measured surplus while it still fits. Opt-in (LLAMA_MOE_FIT_FILL=1): G4 k15f_g4, Qwen3.6 UD-Q4_K_XL + MTP,
+                // +338 / +532 MiB of cache at 12 / 16 GB gave +7..+10% decode at 2k-16k (12 GB) and +-2% (16 GB), but a 42-token prompt's
+                // TTFT went 165 -> 178 ms and 125 -> 139 ms; Flash-Next UD-IQ4_XS at 16 / 32 GB and LFM2.5 16 GB had no surplus to fill
+                static const bool fill = getenv("LLAMA_MOE_FIT_FILL") != nullptr && atoi(getenv("LLAMA_MOE_FIT_FILL")) != 0;
+                // k15-fn: where the cache lends because that frees memory (llama_moe_cache lend_saves), the measure counts the device
+                // that much lower (mb.lend_freed). That is a fixed amount, not one that grows with the cache, so the first size, which
+                // takes the whole difference to the measure without the cache as the cache's, misses it: grow by it (at most), as the
+                // fill does by any surplus. Only with LLAMA_MOE_CACHE_LEND_SAVE=1 (opt-in, see llama_moe_cache lend_save)
+                int64_t lent_left = 0;
+                for (size_t id = 0; id < nd; id++) {
+                    lent_left += int64_t(dmds_test[id].mb.lend_freed);
+                }
+                for (int g = 0; (fill || lent_left >= 64*MiB) && g < 3 && size < size_requested; g++) {
+                    int64_t extra = std::min<int64_t>(surplus_of(dmds_test) - 16*MiB, size_requested - size);
+                    if (!fill) {
+                        extra = std::min(extra, lent_left);
+                    }
+                    if (extra < 64*MiB || !devices_ok(dmds_test)) {
+                        break;
+                    }
+                    cparams->moe_cache_size = size + extra;
+                    dmds_t dmds_grow;
+                    try {
+                        dmds_grow = measure(cparams);
+                    } catch (const std::runtime_error &) {
+                        break;
+                    }
+                    if (shortfall(dmds_grow) > 0) {
+                        break;
+                    }
+                    LOG_TRC("%s: MoE cache grown by %" PRId64 " MiB into the measured surplus%s\n", __func__, extra/MiB,
+                        fill ? "" : " the lent staging copies leave");
+                    size      = size + extra;
+                    dmds_test = dmds_grow;
+                    lent_left -= extra;
+                }
+                cparams->moe_cache_size = size;
                 LOG_TRC("%s: MoE cache reduced from %" PRId64 " to %" PRId64 " MiB to keep the layers in device memory\n",
                     __func__, size_requested/MiB, size/MiB);
                 if (margin_gain > 0) {
@@ -630,7 +722,7 @@ static void common_params_fit_impl(
             cparams_spill.n_ctx = n_ctx;
             dmds_t dmds_spill = common_get_device_memory_data_impl(
                 path_model, &mparams_spill, &cparams_spill, devs, hp_ngl, hp_nct, hp_nex, log_level);
-            add_extra_memory(dmds_spill);
+            add_extra_memory(dmds_spill, &mparams_spill, &cparams_spill);
             int64_t sum = 0;
             for (size_t id = 0; id < nd; id++) {
                 sum += dmds_spill[id].mb.total();
@@ -913,7 +1005,7 @@ static void common_params_fit_impl(
 
         dmds_t dmd_nl = common_get_device_memory_data_impl(
             path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
-        add_extra_memory(dmd_nl);
+        add_extra_memory(dmd_nl, &mparams_copy, cparams);
         return dmd_nl;
     };
 
@@ -1060,7 +1152,7 @@ static void common_params_fit_impl(
                 LOG_TRC("%s: getting device memory data with all layers in device memory and the experts of one layer:\n", __func__);
                 dmds_t dmds_all = common_get_device_memory_data_impl(
                     path_model, &mparams_all, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
-                add_extra_memory(dmds_all);
+                add_extra_memory(dmds_all, &mparams_all, cparams);
                 int64_t surplus_all = 0;
                 for (size_t id = 0; id < nd; id++) {
                     surplus_all += int64_t(dmds_all[id].free) - int64_t(dmds_all[id].mb.total()) - margins[id];
@@ -1364,7 +1456,18 @@ static void common_params_fit_impl(
         }
 
         // try to fit at least part of one more layer
-        if (ngl_per_device[id_dense_start].n_layer > (id < nd - 1 ? 0 : 1)) {
+        // LLAMA_MTP_EXACT=1: no such layer (LLAMA_FIT_PARTIAL_LAYER=1 keeps it, =0 drops it everywhere). Its host part is no MoE cache
+        // expert set (UP / GATE split the experts, ATTN also moves the router and the shared expert), so the scheduler computes it on
+        // the CPU for small batches: the greedy text then followed which layer the fit split, i.e. the cache size and a draft model's share
+        static const bool partial_layer = [] {
+            const char * e = getenv("LLAMA_FIT_PARTIAL_LAYER");
+            if (e != nullptr) {
+                return atoi(e) != 0;
+            }
+            const char * x = getenv("LLAMA_MTP_EXACT");
+            return !(x != nullptr && atoi(x) != 0);
+        }();
+        if (partial_layer && ngl_per_device[id_dense_start].n_layer > (id < nd - 1 ? 0 : 1)) {
             std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
             size_t id_dense_start_test = id_dense_start;
             ngl_per_device_test[id_dense_start_test].n_layer--;
