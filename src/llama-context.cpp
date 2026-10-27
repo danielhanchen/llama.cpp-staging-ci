@@ -37,6 +37,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <functional>
+#include <chrono>
+#include <thread>
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/resource.h>
@@ -8092,13 +8094,28 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
 
     state_async_evs = events;
     state_async_reads_done.store(false, std::memory_order_release);
+    // debug (tests of a save in flight, default 0 = off): LLAMA_STATE_ASYNC_DEBUG_DELAY_MS=N sleeps N/2 ms before the host copy and N/2 ms
+    // halfway through it, so the copy of the idle save is still running (half done) when the next task arrives
+    static const int dbg_delay_ms = getenv("LLAMA_STATE_ASYNC_DEBUG_DELAY_MS") ? std::max(0, atoi(getenv("LLAMA_STATE_ASYNC_DEBUG_DELAY_MS"))) : 0;
     state_async_worker = std::thread([jobs = std::move(jobs), events = std::move(events), retired = std::move(retired), done = &state_async_reads_done]() mutable {
         for (auto * ev : events) {
             ggml_backend_event_synchronize(ev);
         }
         done->store(true, std::memory_order_release);
-        for (const auto & j : jobs) {
-            memcpy(j.dst, j.src, j.size);
+        if (dbg_delay_ms > 0) {
+            LLAMA_LOG_INFO("%s: debug delay: host copy of %zu jobs in flight from epoch_us %lld\n", "state_async", jobs.size(),
+                (long long) std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+            std::this_thread::sleep_for(std::chrono::milliseconds(dbg_delay_ms / 2));
+        }
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            if (dbg_delay_ms > 0 && i == jobs.size() / 2) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(dbg_delay_ms - dbg_delay_ms / 2));
+            }
+            memcpy(jobs[i].dst, jobs[i].src, jobs[i].size);
+        }
+        if (dbg_delay_ms > 0) {
+            LLAMA_LOG_INFO("%s: debug delay: host copy done at epoch_us %lld\n", "state_async",
+                (long long) std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
         }
         retired.clear();
     });
