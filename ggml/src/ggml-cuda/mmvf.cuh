@@ -12,3 +12,11 @@ void ggml_cuda_op_mul_mat_vec_f(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11);
+
+// k15-mm2: whether ggml_cuda_mul_mat_vec_f_multi has a kernel for this type, K and number of columns (the single launch's block size)
+bool ggml_cuda_mul_mat_vec_f_multi_ok(ggml_type type, int64_t ncols, int64_t ncols_dst, int device);
+
+// k15-mm2: n (2..GGML_CUDA_MMVQ_MULTI_MAX) F32 / BF16 products of one type and K over src1 in one launch, each output with the bytes of
+// its own ggml_cuda_mul_mat_vec_f launch
+void ggml_cuda_mul_mat_vec_f_multi(ggml_backend_cuda_context & ctx, int n, const ggml_tensor * const * src0, const ggml_tensor * src1,
+    ggml_tensor * const * dst);

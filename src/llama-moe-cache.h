@@ -41,6 +41,12 @@ public:
     // (LLAMA_MOE_CACHE_MTP_MIB=N sets the MTP share); the same for both contexts, so --fit measures the same caches the contexts create
     static size_t budget(const llama_model & model, size_t size, layer_set set);
 
+    // k15-pp3: host bytes of the experts a cache of the trunk layers could hold (0: every expert is on a device)
+    static size_t host_bytes(const llama_model & model);
+
+    // the share of the host experts below which a mailbox cache skips its timing trials (LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE, 0.50)
+    static double trial_frac_single();
+
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     // size is already the share of the layer set (see budget)
     // ws: the weight store that reads the misses of host lookups from the model files (see set_weight_store), nullptr if none
@@ -62,6 +68,17 @@ public:
 
     // before computing a ubatch: moves the state of the cache between the host and the devices if the other side uses it
     void prepare(int64_t n_tokens);
+
+    // k15-pred: uploads ahead of the routing (LLAMA_MOE_UPLOAD_AHEAD): the copy callback of a prompt ubatch calls begin after it read
+    // the ids of expert tensor w (counts: tokens per expert) and before its copies, and end after its copies and seed
+    void upload_ahead_begin(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * ids, const std::vector<int32_t> & counts);
+    void upload_ahead_end(ggml_backend_t backend, const ggml_tensor * w);
+    // the uploads ahead of the layer of w not yet waited for; wait: the backend's stream waits for them (before the copies of w read the
+    // cache or its seed writes slots; the uploads of its misses do not need to wait)
+    bool upload_ahead_pending(const ggml_tensor * w) const;
+    void upload_ahead_wait(ggml_backend_t backend, const ggml_tensor * w);
+    // after the uploads of the misses of w are queued on the backend: the next upload ahead is ordered after them
+    void upload_ahead_mark(ggml_backend_t backend, const ggml_tensor * w);
 
     // hybrid small batches [LLAMA_MOE_CACHE_HYBRID, LLAMA_MOE_CACHE_FETCH]: the GPU computes the cached experts, the host computes the
     // missing ones it is left; only a share of the missing experts is fetched and admitted
@@ -85,11 +102,21 @@ public:
     // prompts (the assign is frozen, see ggml_moe_cache_assign_freeze), so which expert of a token the host computes depends on the
     // token's own ids and the cache as the prompts left it, the same in a verify window as in a single token decode
     bool host_split_frozen() const;
+    // k16: route tail skip [LLAMA_MOE_ROUTE_TAIL_SKIP] (Strata's STRATA_ROUTE_TAIL_SKIP rule): in a decode or verify window of at most
+    // tail_skip_max_tokens() tokens, a missing expert that every token routes at rank >= the threshold is neither fetched nor computed
+    // (zero contribution, no renormalisation); sets it on the lookup / assign op of layer il when it applies to this cache
+    void tail_skip(ggml_tensor * op, int32_t il, int64_t n_tokens) const;
     // k13: CPU misses: small batches (up to 8 tokens) fetch nothing and the host computes every miss, without trials; true if frozen
     bool freeze_small();
     // k13: CPU misses: small batches (up to 8 tokens) take the host path without trials or miss-rate windows, but still fetch their
     // share and admit (the cache follows the decode; not exact under drafts); true if pinned
     bool pin_small();
+    // k15-lfm2: lift (false) / restore (true) that pin between requests; returns the pinned state (see llama_moe_pin_small_set)
+    bool pin_small_set(bool on);
+    // k15-lfm2: a new request starts (LLAMA_MOE_CPU_MISS_PER_REQUEST=1): the CPU-miss rule's decisions restart from the launch's (see cm_request_begin)
+    bool request_begin(); // true if the cache was emptied
+    // k15-lfm2: see llama_moe_cpu_miss_drop_slow
+    bool cpu_miss_drop_slow();
     // k13: who computes the missing experts of small batches: 0 = never the host (every miss fetched), 1 = the hybrid path with a fixed
     // share (the default gate of small caches, or LLAMA_MOE_CACHE_FETCH), 2 = the CPU-miss rule
     int host_mode() const;
@@ -98,6 +125,10 @@ public:
     // the ubatch of n_tokens is looked up on the device like a small batch: at most n_small_max tokens, or a short prompt whose missing
     // experts the host computes (the large batch path, its copies and its seed do not apply)
     bool small_batch(int64_t n_tokens) const;
+    // k15-pp2: while set, every ubatch is treated as a large one (no device lookup, slot map, host path or CPU misses): its MUL_MAT_ID
+    // read the layer's host experts as the large ubatches do (the last ubatch of a prompt as a member of a layer-major group)
+    void set_force_large(bool on);
+    bool force_large() const;
 
     // true if the graphs of small batches may use the hybrid path
     bool hybrid_active() const;
@@ -146,6 +177,9 @@ public:
     bool hybrid_tick_sync() const;
     // CPU misses trial: the ubatch after the tick is timed; synchronize after its graph is computed, then hybrid_tick_end
     bool hybrid_tick_timed() const;
+    // k15-pred r22b (LLAMA_MOE_CPU_MISS_PROMPT_AUTO=1): short-prompt host path timing, before the graph of a ubatch (timed with hybrid_tick_timed / hybrid_tick_end)
+    bool prompt_auto_pending() const;
+    void prompt_auto_tick(int64_t n_tokens);
     void hybrid_tick_end();
 
     // fetch overlap rule (default) or auto (LLAMA_MOE_CACHE_FETCH_OVERLAP=3): true while a window or trial runs or waits; the tick goes before the graph of
@@ -242,6 +276,17 @@ public:
 
     // ggml_backend_sched copy callback, returns false if src is not a slot map
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
+    // k15-lfm2: in-place prompts (LLAMA_MOE_PROMPT_INPLACE=1): the layer whose prompt map t is (-1 if none), its expert tensors, the copy of
+    // its prompt map (uploads the missing experts; counts: seed the layer after its product, nullptr: no seed), the pending seed, and a
+    // context that runs layer-major prompts turns it off
+    int32_t prompt_layer(const ggml_tensor * t) const;
+    std::vector<ggml_tensor *> prompt_experts(int32_t il) const;
+    bool prompt_copy(ggml_backend_t backend, int32_t il, ggml_tensor * dst, const std::vector<int32_t> * counts);
+    void prompt_flush();
+    void prompt_inplace_block(bool blocked);
+    void prompt_ubatch(bool ok, bool seed_prev = false); // this ubatch may read its experts in place (seed_prev: it seeds from the stored routing)
+    bool prompt_inplace_on() const; // LLAMA_MOE_PROMPT_INPLACE
+    bool prompt_ubatch_on() const;  // the value prompt_ubatch set (the seed-prev kill switch applied)
 
     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
     // returns the number of experts copied, 0 if expert e is not in the cache, -n if a run of n cached experts is too short to copy

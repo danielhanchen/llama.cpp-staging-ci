@@ -360,6 +360,10 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // k16-draft: an already loaded target model whose token embeddings and lm head an MTP draft model may use instead of its own
+        // copies (with mtp_borrow_io; shapes must match exactly). Must outlive the model being loaded
+        const struct llama_model * model_shared;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
@@ -367,6 +371,7 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        bool mtp_borrow_io;   // k16-draft: an MTP draft model takes token_embd / output from model_shared (no_alloc: counts them on the host)
     };
 
     struct llama_sampler_seq_config {
@@ -460,6 +465,10 @@ extern "C" {
         // a draft model or a built-in MTP head runs speculative decoding beside this context: spilled MoE experts then keep the
         // default host weight prefetch depth instead of the deeper start (llama_context::sched_new) [EXPERIMENTAL]
         bool spec_draft;
+
+        // state capture snapshots for layer-major prompts (-1: the default, LLAMA_STATE_CAPTURE_MAX or 2; 0: none, as
+        // LLAMA_LM_CKPT_CAPTURE=0); --fit lowers it where the snapshots would cost device layers [EXPERIMENTAL]
+        int32_t n_state_capture;
     };
 
     struct llama_model_tensor_override {

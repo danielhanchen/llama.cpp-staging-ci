@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "gated-delta-net-mma.cuh"
 #include "mma.cuh"
 
@@ -400,8 +401,20 @@ static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a
     return gdn_path::ar;
 #else
     // Enable only architectures benchmarked for this schedule. MMA support alone does not imply a speedup.
-    if (!ampere_mma_available(info.cc) ||
-        (info.cc != GGML_CUDA_CC_AMPERE_GA10X && info.cc != GGML_CUDA_CC_ADA_LOVELACE &&
+    // k15-mm2: B200 (cc 1000) added: prefill 512 / 2048 tokens with 16 key heads (Qwen3.6-35B-A3B, Flash-Next / Qwen3.6-27B) 1.6-3.3x
+    // faster than the per-token kernel (test-backend-ops perf), Qwen3.6-35B-A3B pp2048 kernel time 149 -> 119 ms.
+    // GGML_CUDA_GDN_MMA_B200=0 is the kill switch of that addition (the list as before it). GGML_CUDA_GDN_MMA=0 never takes the
+    // chunked kernel, =1 takes it on every NVIDIA GPU with Ampere MMA (measurements only).
+    static const int force = [] {
+        const char * e = getenv("GGML_CUDA_GDN_MMA");
+        return e != nullptr ? atoi(e) : -1;
+    }();
+    static const bool b200 = [] {
+        const char * e = getenv("GGML_CUDA_GDN_MMA_B200");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (force == 0 || !ampere_mma_available(info.cc) ||
+        (force != 1 && info.cc != GGML_CUDA_CC_AMPERE_GA10X && info.cc != GGML_CUDA_CC_ADA_LOVELACE && (info.cc != 1000 || !b200) &&
          info.cc != GGML_CUDA_CC_BLACKWELL && info.cc != GGML_CUDA_CC_DGX_SPARK)) {
         return gdn_path::ar;
     }

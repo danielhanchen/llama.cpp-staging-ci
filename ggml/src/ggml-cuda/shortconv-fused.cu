@@ -22,6 +22,16 @@ static bool shortconv_fuse_enabled() {
     return on;
 }
 
+// k15-lfm2: windows of 2..32 tokens (speculative verify) spread the tokens over the grid instead of a loop per thread (the same
+// float operations per element, so bit-identical; decode keeps the one-token kernels). GGML_CUDA_SHORTCONV_TOKENS=0: off
+static bool shortconv_tokens_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_SHORTCONV_TOKENS");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 static bool shortconv_f32(const ggml_tensor * t) {
     return t != nullptr && t->type == GGML_TYPE_F32;
 }
@@ -62,6 +72,52 @@ static __global__ void shortconv_window_f32(const char * state, const char * b, 
         for (int64_t c = 0; c < d; ++c) {
             *(float *) (snaps.dst[k] + s*snaps.dst_nb1[k] + (ch*d + c)*sizeof(float)) =
                 *(const float *) (out + (snaps.off[k] + c)*o_nb0 + ch*o_nb1 + s*o_nb2);
+        }
+    }
+}
+
+// k15-lfm2: one thread per window element (t, ch, s), grid z = window column t. A snapshot element is written by the thread of the
+// window column it copies (the same value: a copy of state or the same b * x product); a snapshot into the state cell it was read
+// from (same_cell) is written by the thread that reads that state element, after its read, so no thread reads an overwritten value.
+static __global__ void shortconv_window_tok_f32(const char * state, const char * b, const char * x, char * out,
+                                                const int64_t d, const int64_t nr,
+                                                const int64_t st_nb0, const int64_t st_nb1, const int64_t st_nb2,
+                                                const int64_t b_nb0, const int64_t b_nb1, const int64_t b_nb2,
+                                                const int64_t x_nb0, const int64_t x_nb1, const int64_t x_nb2,
+                                                const int64_t o_nb0, const int64_t o_nb1, const int64_t o_nb2,
+                                                const shortconv_snaps snaps, const int same_cell_mask) {
+    const int64_t ch = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t s  = blockIdx.y;
+    const int64_t j  = blockIdx.z;   // window column
+    if (ch >= nr) {
+        return;
+    }
+    float v;
+    if (j < d) {
+        v = *(const float *) (state + j*st_nb0 + ch*st_nb1 + s*st_nb2);
+    } else {
+        const float bv = *(const float *) (b + ch*b_nb0 + (j - d)*b_nb1 + s*b_nb2);
+        const float xv = *(const float *) (x + ch*x_nb0 + (j - d)*x_nb1 + s*x_nb2);
+        v = bv * xv;
+    }
+    *(float *) (out + j*o_nb0 + ch*o_nb1 + s*o_nb2) = v;
+    for (int k = 0; k < snaps.n; ++k) {
+        if (same_cell_mask & (1 << k)) {
+            // element c = j of the state cell (j < d): this thread read it above; the snapshot value is window column off + j
+            if (j < d) {
+                const int64_t src = snaps.off[k] + j;
+                float sv;
+                if (src < d) {
+                    sv = *(const float *) (state + src*st_nb0 + ch*st_nb1 + s*st_nb2);
+                } else {
+                    const float bv = *(const float *) (b + ch*b_nb0 + (src - d)*b_nb1 + s*b_nb2);
+                    const float xv = *(const float *) (x + ch*x_nb0 + (src - d)*x_nb1 + s*x_nb2);
+                    sv = bv * xv;
+                }
+                *(float *) (snaps.dst[k] + s*snaps.dst_nb1[k] + (ch*d + j)*sizeof(float)) = sv;
+            }
+        } else if (j >= snaps.off[k] && j < snaps.off[k] + d) {
+            *(float *) (snaps.dst[k] + s*snaps.dst_nb1[k] + (ch*d + (j - snaps.off[k]))*sizeof(float)) = v;
         }
     }
 }
@@ -117,6 +173,7 @@ int ggml_cuda_try_fuse_shortconv_window(ggml_backend_cuda_context & ctx, ggml_cg
     }();
     shortconv_snaps snaps = {};
     int n_extra = 0;
+    int same_cell_mask = 0;   // k15-lfm2: snapshots written into the state cell they were read from
     if (state_on) {
         for (int j = i + 3; j < cgraph->n_nodes && snaps.n < shortconv_snaps::n_max; ++j) {
             const ggml_tensor * node = cgraph->nodes[j];
@@ -151,6 +208,9 @@ int ggml_cuda_try_fuse_shortconv_window(ggml_backend_cuda_context & ctx, ggml_cg
             if (clash) {
                 break;
             }
+            if (same_cell) {
+                same_cell_mask |= 1 << snaps.n;
+            }
             snaps.dst[snaps.n]     = (char *) dsn->data;
             snaps.dst_nb1[snaps.n] = dsn->nb[1];
             snaps.off[snaps.n]     = src->view_offs / cat->nb[0];
@@ -159,6 +219,34 @@ int ggml_cuda_try_fuse_shortconv_window(ggml_backend_cuda_context & ctx, ggml_cg
         }
     }
     const int threads = 128;
+    // k15-lfm2: the token-parallel kernel for 2+ tokens, unless two snapshots share destination bytes (their order would matter) or a
+    // same-cell snapshot would copy a column another same-cell snapshot overwrites first
+    bool tok = shortconv_tokens_enabled() && n_t > 1;
+    for (int a = 0; tok && a < snaps.n; ++a) {
+        const char * a0 = snaps.dst[a];
+        const char * a1 = a0 + (n_s - 1)*snaps.dst_nb1[a] + d*nr*sizeof(float);
+        for (int c = a + 1; c < snaps.n; ++c) {
+            const char * c0 = snaps.dst[c];
+            const char * c1 = c0 + (n_s - 1)*snaps.dst_nb1[c] + d*nr*sizeof(float);
+            tok = tok && !(a0 < c1 && c0 < a1);
+        }
+        // a same-cell snapshot reads window columns < d (state) only if off + c < d: those reads come from the state cell it overwrites
+        tok = tok && !((same_cell_mask & (1 << a)) && snaps.off[a] < d);
+    }
+    if (tok) {
+        const dim3 blocks_t((unsigned) ((nr + threads - 1)/threads), (unsigned) n_s, (unsigned) (d + n_t));
+        shortconv_window_tok_f32<<<blocks_t, threads, 0, ctx.stream()>>>((const char *) state->data, (const char *) b->data, (const char *) x->data,
+            (char *) cat->data, d, nr, state->nb[0], state->nb[1], state->nb[2], b->nb[0], b->nb[1], b->nb[2],
+            x->nb[0], x->nb[1], x->nb[2], cat->nb[0], cat->nb[1], cat->nb[2], snaps, same_cell_mask);
+        CUDA_CHECK(cudaGetLastError());
+        static bool logged_t = false;
+        if (!logged_t) {
+            logged_t = true;
+            GGML_LOG_INFO("%s: LFM2 short-conv window of %lld tokens on the token-parallel kernel (%d snapshots; GGML_CUDA_SHORTCONV_TOKENS=0: off)\n",
+                __func__, (long long) n_t, snaps.n);
+        }
+        return 2 + n_extra;
+    }
     const dim3 blocks((unsigned) ((nr + threads - 1)/threads), (unsigned) n_s, 1);
     shortconv_window_f32<<<blocks, threads, 0, ctx.stream()>>>((const char *) state->data, (const char *) b->data, (const char *) x->data,
         (char *) cat->data, d, n_t, nr, state->nb[0], state->nb[1], state->nb[2], b->nb[0], b->nb[1], b->nb[2],
@@ -244,6 +332,62 @@ static __global__ void shortconv_conv_mul_f32(const float * __restrict__ src0, c
     }
 }
 
+// k15-lfm2: shortconv_conv_mul_f32 with one token per block (grid z): token i sums window columns i .. i + d_conv - 1 times w in the
+// same order (j = 0, 1, 2, starting from 0.0f, then + b), so every output and its q8_1 copy are bit-identical to the loop kernel's
+template <size_t split_d_inner, size_t d_conv>
+static __global__ void shortconv_conv_mul_tok_f32(const float * __restrict__ src0, const float * __restrict__ src1, const char * cmul,
+                                                  const int src0_nb1, const int src0_nb2, const int src1_nb1,
+                                                  const int64_t c_nb0, const int64_t c_nb1, const int64_t c_nb2,
+                                                  float * __restrict__ dst, const int dst_nb0, const int dst_nb1, const int dst_nb2,
+                                                  const int64_t n_t, void * __restrict__ vq = nullptr, const int ncols_padded = 0) {
+    const int tid  = threadIdx.x;
+    const int bidx = blockIdx.x;
+    const int bidy = blockIdx.y;
+    const int64_t i = blockIdx.z;
+
+    const float * x_block = (const float *) ((const char *) src0 + bidx * src0_nb2 + bidy * split_d_inner * src0_nb1);
+    const float * w_block = (const float *) ((const char *) src1 + bidy * split_d_inner * src1_nb1);
+    float *       y_block = (float *) ((char *) dst + bidx * dst_nb2 + bidy * split_d_inner * dst_nb0);
+    const char *  c_block = cmul + bidx * c_nb2 + (bidy * split_d_inner + tid) * c_nb0;
+
+    const int stride_x = src0_nb1 / sizeof(float);
+    const int stride_w = src1_nb1 / sizeof(float);
+    const int stride_y = dst_nb1 / sizeof(float);
+
+    float x[d_conv];
+    float w[d_conv];
+#pragma unroll
+    for (size_t j = 0; j < d_conv; j++) {
+        w[j] = w_block[tid * stride_w + j];
+        x[j] = x_block[tid * stride_x + i + j];
+    }
+    const float b = 0.0f;
+    float sumf = 0.0f;
+#pragma unroll
+    for (size_t j = 0; j < d_conv; j++) {
+        sumf += x[j] * w[j];
+    }
+    sumf += b;
+    const float cv = *(const float *) (c_block + i * c_nb1);
+    const float yv = cv * sumf;
+    y_block[i * stride_y + tid] = yv;
+    if (vq != nullptr) {
+        float amax = fabsf(yv);
+        float sum  = yv;
+        amax = warp_reduce_max<QK8_1>(amax);
+        sum  = warp_reduce_sum<QK8_1>(sum);
+        const float  d = amax / 127.0f;
+        const int8_t q = amax == 0.0f ? 0 : roundf(yv / d);
+        const int64_t ch  = (int64_t) bidy * split_d_inner + tid;
+        block_q8_1 * yq = (block_q8_1 *) vq + ((int64_t) bidx * n_t + i) * (ncols_padded / QK8_1) + ch / QK8_1;
+        const int iqs = ch % QK8_1;
+        yq->qs[iqs] = q;
+        if (iqs == 0) {
+            yq->ds = make_half2(d, sum);
+        }
+    }
+}
+
 int ggml_cuda_try_fuse_shortconv_conv_mul(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
     if (!shortconv_fuse_enabled() || i + 1 >= cgraph->n_nodes) {
         return 0;
@@ -306,10 +450,19 @@ int ggml_cuda_try_fuse_shortconv_conv_mul(ggml_backend_cuda_context & ctx, ggml_
         ggml_cuda_q8_1_cache::key_contiguous(mul->ne[0], ggml_nrows(mul), key);
         q8_1_out = cache.reserve(mul->data, ggml_nbytes(mul), key, ggml_nrows(mul)*ncols_padded/QK8_1*sizeof(block_q8_1));
     }
+    // k15-lfm2: the token-parallel kernel for 2+ tokens; the output may be in place on c only element for element (checked above),
+    // and each element's c is read by the thread that writes it, so the order across tokens does not matter
+    if (shortconv_tokens_enabled() && n_t > 1) {
+        const dim3 blocks_t((unsigned) n_s, (unsigned) ((nr + threads - 1)/threads), (unsigned) n_t);
+        shortconv_conv_mul_tok_f32<threads, 3><<<blocks_t, threads, 0, ctx.stream()>>>((const float *) src0->data, (const float *) src1->data,
+            (const char *) c->data, (int) src0->nb[1], (int) src0->nb[2], (int) src1->nb[1], c->nb[0], c->nb[1], c->nb[2],
+            (float *) mul->data, (int) mul->nb[0], (int) mul->nb[1], (int) mul->nb[2], n_t, q8_1_out, ncols_padded);
+    } else {
     const dim3 blocks((unsigned) n_s, (unsigned) ((nr + threads - 1)/threads), 1);
     shortconv_conv_mul_f32<threads, 3><<<blocks, threads, 0, ctx.stream()>>>((const float *) src0->data, (const float *) src1->data,
         (const char *) c->data, (int) src0->nb[1], (int) src0->nb[2], (int) src1->nb[1], c->nb[0], c->nb[1], c->nb[2],
         (float *) mul->data, (int) mul->nb[0], (int) mul->nb[1], (int) mul->nb[2], n_t, q8_1_out, ncols_padded);
+    }
     CUDA_CHECK(cudaGetLastError());
     static bool logged = false;
     if (!logged) {

@@ -179,6 +179,18 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
 }
 
+// RDNA3 (incl. RDNA3.5): compile-time opt-in GGML_HIP_FA_RDNA3_D256_FLOAT_VKQ gives head size 256 float VKQ accumulators
+// (mma_tile_sizes<256, ncols> below) and tile sizes for that register budget. Off by default: on gfx1151 it was 5-25% slower
+// in head-256 prefill and ~8% slower in MTP decode after a 2k prompt, with no prefill gain. RDNA4 is unaffected.
+static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_rdna3(const int DKQ, const int DV, const int ncols) {
+#ifdef GGML_HIP_FA_RDNA3_D256_FLOAT_VKQ
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  64, 128, 128,  64, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 1,  32, 128,  64,  64, 1, false);
+#endif // GGML_HIP_FA_RDNA3_D256_FLOAT_VKQ
+
+    return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols);
+}
+
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_cdna(const int DKQ, const int DV, const int ncols) {
     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64,  8, 128, 1,  64,  32,  32,  32, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 16, 256, 2,  64,  32,  32,  32, 1, true);
@@ -242,7 +254,8 @@ static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, c
         return ggml_cuda_fattn_mma_get_config_cdna(DKQ, DV, ncols);
     }
     if (amd_wmma_available(cc)) {
-        return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols);
+        return GGML_CUDA_CC_IS_RDNA3(cc) ? ggml_cuda_fattn_mma_get_config_rdna3(DKQ, DV, ncols) :
+                                           ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols);
     }
     GGML_ASSERT(volta_mma_available(cc));
     return ggml_cuda_fattn_mma_get_config_volta(DKQ, DV, ncols);
@@ -257,6 +270,8 @@ static constexpr __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config(cons
     return ggml_cuda_fattn_mma_get_config_cdna(DKQ, DV, ncols);
 #elif defined(VOLTA_MMA_AVAILABLE)
     return ggml_cuda_fattn_mma_get_config_volta(DKQ, DV, ncols);
+#elif defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+    return ggml_cuda_fattn_mma_get_config_rdna3(DKQ, DV, ncols);
 #elif defined(AMD_WMMA_AVAILABLE)
     return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols);
 #else
@@ -1140,6 +1155,17 @@ template<int ncols> struct mma_tile_sizes<112, ncols> {
     using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
     using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
 };
+#ifdef GGML_HIP_FA_RDNA3_D256_FLOAT_VKQ
+// head size 256: float VKQ accumulators (more precise than half2 over long rows), see ggml_cuda_fattn_mma_get_config_rdna3
+template<int ncols> struct mma_tile_sizes<256, ncols> {
+    using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
+    using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
+    using T_C_KQ  = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
+    using T_A_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
+    using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
+    using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
+};
+#endif // GGML_HIP_FA_RDNA3_D256_FLOAT_VKQ
 #else
 template<int DKQ, int ncols> struct mma_tile_sizes {
     using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR>;           // row-major
@@ -1256,7 +1282,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 #if defined(TURING_MMA_AVAILABLE)
     T_C_VKQ VKQ_C[cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J)];
 #elif defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
-    T_C_VKQ VKQ_C[DV % 32 != 0       ? DV/T_C_VKQ::J : DV/(2*T_C_VKQ::J)];
+    T_C_VKQ VKQ_C[std::is_same_v<decltype(T_C_VKQ::x), float[T_C_VKQ::ne]> ? DV/T_C_VKQ::J : DV/(2*T_C_VKQ::J)];
 #elif defined(AMD_MFMA_AVAILABLE)
     T_C_VKQ VKQ_C[                                     DV/T_C_VKQ::J];
 #elif defined(AMD_WMMA_AVAILABLE)

@@ -779,14 +779,19 @@ public:
     const llama_memory_hybrid_iswa_context * mctx;
 };
 
+// k15-fn: a sampler set again (llama_set_sampler / swap) has no graph build until its next one: a kept graph is not reused for it
+void llm_graph_sampler_unbind(const llama_sampler * smpl);
+
 class llm_graph_input_sampling : public llm_graph_input_i {
 public:
-    llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) :
-        samplers(std::move(samplers)) { }
+    llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers);
     virtual ~llm_graph_input_sampling() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
     bool can_reuse(const llm_graph_params & params) override;
+
+    // k15-fn: this graph's build; a sampler that writes per-step inputs (llama_sampler_graph_bound) binds them to its latest build
+    uint64_t build_id = 0;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 };
@@ -1300,7 +1305,8 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps,
                      int   il,
              ggml_tensor ** assign = nullptr,
-                    bool * host   = nullptr) const;
+                    bool * host   = nullptr,
+                    bool   tail_ok = false) const;
 
     //
     // inputs

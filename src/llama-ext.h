@@ -134,6 +134,11 @@ LLAMA_API void llama_set_ubatch_breaks(struct llama_context * ctx, const int32_t
 #define LLAMA_STATE_SEQ_FLAGS_CAPTURED 8
 LLAMA_API bool llama_set_state_capture(struct llama_context * ctx, llama_seq_id seq_id, int32_t i_batch);
 LLAMA_API bool llama_state_seq_captured(const struct llama_context * ctx, llama_seq_id seq_id, llama_pos * pos_max);
+// k15-pp2: up to two captures per decode (llama_set_state_capture once per index; LLAMA_STATE_CAPTURE_MAX=1: one). The capture at
+// batch index i_batch taken by the last decode; selects it for the next LLAMA_STATE_SEQ_FLAGS_CAPTURED read (default: the lowest index)
+LLAMA_API bool llama_state_seq_captured_at(struct llama_context * ctx, llama_seq_id seq_id, int32_t i_batch, llama_pos * pos_max);
+// k15-ttft: whether llama_set_state_capture can take a capture in this context (a recurrent memory, beside a non-SWA KV cache if hybrid)
+LLAMA_API bool llama_state_capture_supported(const struct llama_context * ctx);
 // layer-major prompt groups can run in this context (a MoE cache with layer-major prompts on)
 LLAMA_API bool llama_layer_major_on(const struct llama_context * ctx);
 // k15-pp: a batch of n_before + n_after prompt tokens of one sequence with a ubatch break (llama_set_ubatch_breaks) after n_before would
@@ -157,9 +162,21 @@ LLAMA_API bool llama_moe_freeze_small(struct llama_context * ctx);
 // k13: like llama_moe_freeze_small for the decisions only: small batches always take the host path for their misses (no timing trials,
 // no miss-rate windows), but still fetch their share and admit, so the cache follows the decode. Not exact under drafts. True if pinned
 LLAMA_API bool llama_moe_pin_small(struct llama_context * ctx);
+// k15-lfm2: lifts (on = false) or restores (on = true) the pin of llama_moe_pin_small, e.g. for a request that cannot draft; a cache
+// the pin did not freeze is left as it is. Returns the pinned state
+LLAMA_API bool llama_moe_pin_small_set(struct llama_context * ctx, bool on);
+// k15-lfm2: a new request starts (the CPU-miss rule restarts from the launch's decisions with LLAMA_MOE_CPU_MISS_PER_REQUEST=1)
+LLAMA_API void llama_moe_request_begin(struct llama_context * ctx);
+// k15-lfm2: turns the CPU-miss rule off on a host that cannot compute experts faster than it uploads them (few threads, host time per
+// expert not well below the upload time) where the cache holds most host experts: the misses are fetched, every expert runs on the device
+// from a slot (verify rows are single token bytes again). Returns true if it turned the rule off. LLAMA_MOE_CPU_MISS_DROP=0: never
+LLAMA_API bool llama_moe_cpu_miss_drop_slow(struct llama_context * ctx);
 
 // k13: 0 = no MoE cache or its host never computes an expert, 1 = hybrid path with a fixed share (small caches), 2 = CPU-miss rule
 LLAMA_API int32_t llama_moe_host_mode(const struct llama_context * ctx);
+
+// k15-ttft: a MoE cache runs (experts stream from host memory into device slots)
+LLAMA_API bool llama_moe_cache_active(const struct llama_context * ctx);
 
 // k11-decode: restore the worst-case prompt plan of the graph allocator if a small graph (a verify window) re-planned it; a server
 // calls it when its slots go idle, so the next prompt does not pay for it (no-op otherwise; LLAMA_PP_RERESERVE=0: off)
@@ -173,6 +190,13 @@ LLAMA_API int32_t llama_arch_rollback_state(const char * arch_name);
 // k11-decode: every layer weight of the context's model is in device memory and no MoE cache runs: the placement where batch
 // invariant verify gives the bytes of single token decodes
 LLAMA_API bool llama_verify_exact_placement(const struct llama_context * ctx);
+
+// k15-ttft: a prompt run as one ubatch instead of [n-4] [4] differs from the split run only by IEEE reassociation (plans/k11.md
+// "Equivalence rule"): every layer weight is computed on a CUDA device with no host-computed expert (llama_verify_exact_placement and
+// llama_moe_host_mode == 0), and no F16 matmul weight (cuBLAS accumulates F16 products in F16 above 16 rows, MMF in F32 below).
+// On such a placement both shapes use the same formats: q8_1 activations into int8 MMVQ / MMQ with F32 accumulation, TF32 for F32
+// weights (MMF and cuBLAS SGEMM under CUBLAS_TF32_TENSOR_OP_MATH), BF16 in / F32 out, FlashAttention MMA F16 (at least 4 rows)
+LLAMA_API bool llama_single_pass_equivalent(const struct llama_context * ctx);
 
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
@@ -214,6 +238,14 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
+
+// k15-pp3 (LLAMA_MTP_PROMPT_OVERLAP=0 off): the nextn rows [0, n_rows) of the last decode, on the host before that decode is done.
+// When a layer-major group was followed by more ubatches in the same decode, waits for the group's rows only and returns how many rows
+// are on the host (>= n_rows); returns 0 when it cannot (the caller then synchronizes as before). Unmasked nextn, one sequence only.
+LLAMA_API int64_t llama_nextn_rows_wait(struct llama_context * ctx, int64_t n_rows);
+// the nextn rows without a synchronization (unmasked: row i at i*n_embd); nullptr when outputs are to be reordered.
+// Valid for rows [0, llama_nextn_rows_wait(...)) until the next decode
+LLAMA_API float * llama_get_embeddings_nextn_early(struct llama_context * ctx);
 
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);

@@ -578,7 +578,34 @@ struct common_sampler * common_sampler_init(
 
     result->greedy_fast = common_sampler_greedy_fast(params, grmr, rbudget);
     result->pen_fast    = result->greedy_fast && common_sampler_penalty_active(params);
-    if (result->greedy_fast && !merged_bias.empty()) {
+    // only LLAMA_SAMPLE_GREEDY_FAST=1 reads bias_dense: else the sparse list is built from the biases alone (the same sums, in the same
+    // order), not from a fresh n_vocab array and a scan of it (0.5 ms per request with ignore_eos on a 248k vocab). LLAMA_SAMPLE_BIAS_SPARSE=0: as before
+    static const bool bias_sparse_only = [] {
+        const char * e = getenv("LLAMA_SAMPLE_BIAS_SPARSE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (result->greedy_fast && !merged_bias.empty() && bias_sparse_only && common_sampler_greedy_fast_mode() != 1) {
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+        std::vector<std::pair<llama_token, float>> lbs;
+        lbs.reserve(merged_bias.size());
+        for (const auto & lb : merged_bias) {
+            if (lb.token >= 0 && lb.token < n_vocab) {
+                lbs.emplace_back(lb.token, lb.bias);
+            }
+        }
+        std::stable_sort(lbs.begin(), lbs.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+        for (size_t k = 0; k < lbs.size();) {
+            float sum = 0.0f;
+            size_t e = k;
+            for (; e < lbs.size() && lbs[e].first == lbs[k].first; ++e) {
+                sum += lbs[e].second;
+            }
+            if (sum != 0.0f) {
+                result->bias_sparse.emplace_back(lbs[k].first, sum);
+            }
+            k = e;
+        }
+    } else if (result->greedy_fast && !merged_bias.empty()) {
         const int32_t n_vocab = llama_vocab_n_tokens(vocab);
         result->bias_dense.assign(n_vocab, 0.0f);
         for (const auto & lb : merged_bias) {

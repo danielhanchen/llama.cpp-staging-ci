@@ -1279,6 +1279,8 @@ struct ggml_cuda_graph {
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
     uint64_t uid = 0;
+    uint64_t compat_uid = 0;   // uid of the graph whose compatibility walk gave compat_ok (GGML_CUDA_GRAPH_UID)
+    bool     compat_ok  = false;
     int64_t last_used_time = 0;
     struct node_properties {
         ggml_tensor node;
@@ -1659,6 +1661,14 @@ struct ggml_cuda_src1_memo {
     }
 };
 
+// k15-mm2: a QSA flash attention node whose dense selection mask is not built: the selected cells per token (I32 [n_sel, n_tokens],
+// dead slots >= n_kv) and the causal mask the dense one adds them to
+struct ggml_cuda_qsa_maskless {
+    const ggml_tensor * idx;
+    const ggml_tensor * kq;
+    bool alias; // the mask node's buffer overlaps idx or kq
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1676,6 +1686,17 @@ struct ggml_backend_cuda_context {
     ggml_cuda_q8_1_cache q8_1_cache;
     // k15-mm: products of this graph evaluation already computed by an earlier multi-matrix mul_mat_vec_q launch (ggml_cuda_try_fuse_mmvq_multi)
     std::unordered_set<const ggml_tensor *> mmvq_done_early;
+    // k15-fn: gated_delta_net nodes of this graph evaluation that read their initial state straight from the recurrent cache rows (the
+    // gather that copied the row was skipped, see ggml_cuda_try_gdn_state_in_place): node -> cache rows base, row stride (floats), row ids
+    struct gdn_state_src { const float * base; int64_t row_stride; const int32_t * ids; };
+    std::unordered_map<const ggml_tensor *, gdn_state_src> gdn_state_in_place;
+    // k15-fn: gated_delta_net nodes that apply their own gates (ggml_cuda_try_gdn_gates): beta = sigmoid(beta_raw), and the scalar decay
+    // g = softplus(a + bias[h]) * scale[h]; the skipped nodes' inputs stay unwritten until the gated_delta_net reads them
+    struct gdn_gates { const float * beta_raw; const float * a; const float * bias; const float * scale; };
+    std::unordered_map<const ggml_tensor *, gdn_gates> gdn_gates_in;
+    // k15-mm2: QSA maskless (ggml_cuda_qsa_maskless_plan): flash attention node -> its selection, and the dense mask nodes not run
+    std::unordered_map<const ggml_tensor *, ggml_cuda_qsa_maskless> qsa_maskless;
+    std::unordered_set<const ggml_tensor *> qsa_skip;
     ggml_cuda_src1_memo  src1_memo;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
@@ -1684,6 +1705,10 @@ struct ggml_backend_cuda_context {
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {};
 
     int curr_stream_no = 0;
+
+    // k15-mm2: split-K few-row F32 mat-vec (mmvf.cu): per stream partial sums and self-resetting per-row arrival counters
+    float        * mmvf_splitk_part = nullptr;
+    unsigned int * mmvf_splitk_cnt  = nullptr;
 
     // a graph was computed with this instance (a copy-only instance, e.g. the scheduler copy queue, is not a compute instance)
     bool computes = false;
@@ -1834,6 +1859,8 @@ struct ggml_cuda_mm_fusion_args_host {
     ggml_tensor * shared_dst = nullptr;
 };
 #define GGML_CUDA_MMVQ_MULTI_MAX 3 // matrices sharing one activation in one mul_mat_vec_q launch
+#define GGML_CUDA_MMVQ_EW_MAX    2 // SCALE / SILU ops a mul_mat_vec_q applies to its F32 src1 itself (c_ewq)
+#define GGML_CUDA_MMVQ_EW_MAX_K  992 // K of such a product: one K iteration of 4 warps (Q8_0), so 31 q8_1 blocks per column
 
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1853,6 +1880,14 @@ struct ggml_cuda_mm_fusion_args_device {
     float * multi_dst[GGML_CUDA_MMVQ_MULTI_MAX] = {};
     uint32_t multi_nrows[GGML_CUDA_MMVQ_MULTI_MAX] = {};
     uint32_t multi_block0[GGML_CUDA_MMVQ_MULTI_MAX] = {};
+    // k15-mm2 (mul_mat_vec_q c_ewq): src1 is not given as q8_1 but as the F32 input ew_src of a SCALE / SILU chain (ew_n ops),
+    // which each block applies and quantizes into shared memory itself (see ggml_cuda_mul_mat_vec_q_ew)
+    const float * ew_src = nullptr;
+    uint32_t ew_stride_col = 0;
+    int   ew_n = 0;
+    int   ew_op[GGML_CUDA_MMVQ_EW_MAX] = {};
+    float ew_p0[GGML_CUDA_MMVQ_EW_MAX] = {};
+    float ew_p1[GGML_CUDA_MMVQ_EW_MAX] = {};
 };
 
 struct ggml_cuda_kernel_launch_params {

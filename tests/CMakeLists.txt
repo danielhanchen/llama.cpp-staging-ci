@@ -310,12 +310,15 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+# token-tiled gated delta-net vs the AR kernel, byte for byte on the GPU backend (SKIP without one)
+llama_build_and_test(test-gdn-tiled-exact.cpp LINK ggml)
 llama_build_and_test(test-spec-type-gguf.cpp)
 
 # the weight store is internal to libllama (exported symbols on non-Windows builds), the test uses the CPU backend directly
 if (NOT WIN32 AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-weight-store.cpp)
     llama_build_and_test(test-moe-host-cache.cpp)
+    llama_build_and_test(test-moe-cache-tail-skip.cpp)
 endif()
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately

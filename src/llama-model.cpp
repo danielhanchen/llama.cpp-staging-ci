@@ -2174,8 +2174,19 @@ void llama_model_base::load_tensors_draft_head(llama_model_loader & ml, bool dry
     if (params.split_mode == LLAMA_SPLIT_MODE_ROW) {
         return;
     }
+    // k16-draft: a borrowed lm head (llama_model_loader::borrow_io) is the target's tensor, not in this file: its rows are read from it
+    const bool src_borrowed = src == output && ml.output_borrowed;
+    if (src_borrowed) {
+        ggml_backend_buffer_type_t bt = ggml_backend_buffer_get_type(src->buffer);
+        const bool plain = !ggml_backend_buft_is_host(bt) || bt == ggml_backend_cpu_buffer_type() || strstr(ggml_backend_buft_name(bt), "_Host") != nullptr;
+        if (!plain || !ggml_is_contiguous(src)) {
+            LLAMA_LOG_WARN("%s: the borrowed MTP head %s is not readable in its plain layout (%s), keeping the full-vocabulary draft head\n",
+                    __func__, ggml_get_name(src), ggml_backend_buft_name(bt));
+            return;
+        }
+    }
     const llama_model_loader::llama_tensor_weight * w = ml.get_weight(ggml_get_name(src));
-    if (!dry && (w == nullptr || w->tensor->type != src->type || w->idx >= ml.files.size() ||
+    if (!dry && !src_borrowed && (w == nullptr || w->tensor->type != src->type || w->idx >= ml.files.size() ||
                  ggml_row_size(src->type, src->ne[0]) != src->nb[1])) {
         LLAMA_LOG_WARN("%s: the MTP head %s is not stored as loaded, keeping the full-vocabulary draft head\n", __func__, ggml_get_name(src));
         return;
@@ -2228,6 +2239,9 @@ void llama_model_base::load_tensors_draft_head(llama_model_loader & ml, bool dry
     // rows for the tokens of the requests that the list lacks (identifiers of pasted code, names of a document): their rows are
     // read back from the head, which needs its plain layout (not a CPU repack buffer)
     ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(src->buffer);
+    if (dry && src == output && ml.output_dry_buft != nullptr) {
+        buft = ml.output_dry_buft; // the borrowed head stays with the target; the draft head made from it is the draft's (device) memory
+    }
     const bool can_read = !ggml_backend_buft_is_host(buft) || buft == ggml_backend_cpu_buffer_type() ||
             strstr(ggml_backend_buft_name(buft), "_Host") != nullptr;
     const char * env_ctx = getenv("LLAMA_MTP_DRAFT_VOCAB_CTX");
@@ -2268,10 +2282,19 @@ void llama_model_base::load_tensors_draft_head(llama_model_loader & ml, bool dry
         ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         const size_t rs = src->nb[1];
         std::vector<uint8_t> rows((size_t) n_sub * rs);
-        llama_file * file = ml.files[w->idx].get();
-        for (int32_t i = 0; i < n_sub; ++i) {
-            file->seek(w->offs + (size_t) ids[i] * rs, SEEK_SET);
-            file->read_raw(rows.data() + (size_t) i * rs, rs);
+        if (src_borrowed) {
+            // one read of the whole head (a per-row read is a device sync each)
+            std::vector<uint8_t> all(ggml_nbytes(src));
+            ggml_backend_tensor_get(src, all.data(), 0, all.size());
+            for (int32_t i = 0; i < n_sub; ++i) {
+                memcpy(rows.data() + (size_t) i * rs, all.data() + (size_t) ids[i] * rs, rs);
+            }
+        } else {
+            llama_file * file = ml.files[w->idx].get();
+            for (int32_t i = 0; i < n_sub; ++i) {
+                file->seek(w->offs + (size_t) ids[i] * rs, SEEK_SET);
+                file->read_raw(rows.data() + (size_t) i * rs, rs);
+            }
         }
         ggml_backend_tensor_set(sub, rows.data(), 0, rows.size());
         std::vector<int64_t> map(ids.begin(), ids.end());
@@ -3613,12 +3636,14 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.model_shared                =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.mtp_borrow_io               =*/ false,
     };
 
     return result;
