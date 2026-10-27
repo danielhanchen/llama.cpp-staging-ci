@@ -2117,8 +2117,18 @@ struct llama_moe_cache::impl {
         return e == nullptr || atoi(e) != 0;
     }();
 
+    // k17-models LLAMA_MOE_SINGLE_MAX_TOKENS (1..GGML_MOE_MAILBOX_MAX_TOKENS, default 4 = k15; 8 = opt-in): the largest batch that
+    // publishes to the mailbox. Above it a batch takes the graph split per MoE layer (device sync, host threads, the CUDA graph cut). The
+    // host plans are the split's ops on the same rows, so 5-8 row batches on the mailbox are exact (cloud gate, plans/k17_models.md 4a:
+    // md5 equal, 4.7x the host batches). Opt-in because it does not pay: Colab L4 (6 host threads) LFM2.5 8 GB with the same drafts in
+    // both arms, 2k 84.9 vs 90.2 tok/s, 8k (LONG_CM=3) 74.5 vs 78.1; G4 Flint long48 within 1% (plans/k17_models.md 4c / 4d)
+    const int single_max_tok = [] {
+        const char * e = getenv("LLAMA_MOE_SINGLE_MAX_TOKENS");
+        return std::max(1, std::min<int>(GGML_MOE_MAILBOX_MAX_TOKENS, e != nullptr ? atoi(e) : 4));
+    }();
+
     bool single_usable(int64_t n_tokens) const {
-        return single_req && !single_off && !single_no_alloc && n_tokens >= 1 && n_tokens <= GGML_MOE_MAILBOX_MAX_TOKENS;
+        return single_req && !single_off && !single_no_alloc && n_tokens >= 1 && n_tokens <= single_max_tok;
     }
 
     bool single_register() {
@@ -2149,7 +2159,7 @@ struct llama_moe_cache::impl {
             h.thr = std::thread(single_service);
         }
         LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses on (LLAMA_MOE_SINGLE): batches of up to %d tokens, %d host threads "
-            "(one host thread for every cache of the process), slow-batch warning above %d ms (merges never time out)\n", tag, GGML_MOE_MAILBOX_MAX_TOKENS, h.threads,
+            "(one host thread for every cache of the process), slow-batch warning above %d ms (merges never time out)\n", tag, single_max_tok, h.threads,
             single_timeout_ms);
         return true;
     }
@@ -2196,7 +2206,7 @@ struct llama_moe_cache::impl {
         mb->w_down = down;
         mb->buf.reset(ggml_backend_cpu_buffer_from_ptr(mb->host, size));
         // the plans of every batch size now, not in the first batch the device waits for
-        for (int n = 1; n <= GGML_MOE_MAILBOX_MAX_TOKENS; ++n) {
+        for (int n = 1; n <= single_max_tok; ++n) {
             single_plan * p = nullptr;
             if (!single_plan_get(*mb, n, p)) {
                 LLAMA_LOG_WARN("llama_moe_cache%s: LLAMA_MOE_SINGLE: no host plan for layer %d, the split path stays\n", tag, il);
@@ -2384,7 +2394,7 @@ struct llama_moe_cache::impl {
             cm_gen++;
             return;
         }
-        if (n_tokens < 1 || n_tokens > GGML_MOE_MAILBOX_MAX_TOKENS) {
+        if (n_tokens < 1 || n_tokens > single_max_tok) {
             return;
         }
         // no publish while the CPU-miss rule has the host path off for this batch size: the host thread sleeps instead of polling
