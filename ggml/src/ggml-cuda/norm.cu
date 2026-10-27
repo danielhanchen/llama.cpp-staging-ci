@@ -1235,6 +1235,161 @@ void ggml_cuda_op_rms_norm_mul_mrope_fused(ggml_backend_cuda_context & ctx, ggml
         nullptr, 0, 0, 0, zero_packed, zero_packed, zero_packed, zero_packed, ctx.stream(), 1.0f, a);
 }
 
+// k15-fn: a QSA layer's new pooled keys in one warp per pool (qwen4exp build_qsa_sel: GET_ROWS of the kpool member keys -> CONT + ADDs
+// (their sum) -> SCALE (the mean) -> RMS_NORM -> MUL -> ROPE (multi-section) -> SET_ROWS into the pooled half of the rep row). Every
+// step is the unfused kernel's float arithmetic in its order: the member keys converted as get_rows does, summed member 0 first, the
+// scale kernel's scale * x + bias, the norm of rms_norm_f32<32, 1, true, true> (the launch rms_norm_f32_dispatch picks for these rows,
+// checked by the caller), rope_multi_rotate, and set_rows' conversion. See ggml_cuda_qsa_pool_match
+template <bool keys_f16, bool dst_f16, bool has_ff>
+static __global__ void k_qsa_pool(const ggml_cuda_qsa_pool_args a, const ggml_cuda_rms_rope_args rope) {
+    constexpr int block_size = 32;
+    ggml_cuda_pdl_lc();
+    const int p   = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int ncols  = a.ncols;
+    const int ncols4 = ncols / 4;
+
+    __shared__ float s_sum[32];
+    __shared__ float s_row[GGML_CUDA_QSA_POOL_MAX_COLS];
+    __shared__ float s_out[GGML_CUDA_QSA_POOL_MAX_COLS];
+
+    ggml_cuda_pdl_sync();
+
+    float4 xs[1];
+    float  tmp = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 1; k++) {
+        const int i = tid + k*block_size;
+        if (i < ncols4) {
+            float v[4];
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const int d = 4*i + c;
+                float acc = 0.0f;
+                for (int m = 0; m < a.kpool; ++m) {
+                    const int32_t row = a.ids[(int64_t) (p*a.kpool + m)*a.ids_s0];
+                    const char * kr = (const char *) a.keys + (int64_t) row*a.keys_nb1;
+                    float r;
+                    if constexpr (keys_f16) {
+                        r = ggml_cuda_cast<float>(((const half *) kr)[d]);
+                    } else {
+                        r = ((const float *) kr)[d];
+                    }
+                    acc = m == 0 ? r : acc + r;
+                }
+                v[c] = a.scale * acc + a.bias;
+            }
+            xs[k] = make_float4(v[0], v[1], v[2], v[3]);
+            tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
+        }
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / ncols + a.eps);
+
+#pragma unroll
+    for (int k = 0; k < 1; k++) {
+        const int i = tid + k*block_size;
+        if (i < ncols4) {
+            float4 r = make_float4(scale*xs[k].x, scale*xs[k].y, scale*xs[k].z, scale*xs[k].w);
+            const float4 m = ((const float4 *) a.w)[i];
+            r.x *= m.x;
+            r.y *= m.y;
+            r.z *= m.z;
+            r.w *= m.w;
+            s_row[4*i + 0] = r.x;
+            s_row[4*i + 1] = r.y;
+            s_row[4*i + 2] = r.z;
+            s_row[4*i + 3] = r.w;
+        }
+    }
+    __syncthreads();
+
+    for (int i0 = 2*tid; i0 < ncols; i0 += 2*block_size) {
+        if (i0 < rope.n_offs || i0 >= rope.n_offs + rope.n_dims) {
+            s_out[i0 + 0] = s_row[i0 + 0];
+            s_out[i0 + 1] = s_row[i0 + 1];
+            continue;
+        }
+        rope_multi_rotate<true, has_ff>((const float *) s_row, s_out, i0, (uint32_t) p, a.n_new, rope.n_dims, rope.n_offs, rope.pos,
+            rope.freq_scale, rope.ext_factor, rope.attn_factor, rope.corr_dims, rope.theta_scale, rope.freq_factors, rope.sections,
+            rope.is_imrope);
+    }
+    __syncthreads();
+
+    const int64_t dst_row = a.rep_i64 ? ((const int64_t *) a.rep)[(int64_t) p*a.rep_s0] : (int64_t) ((const int32_t *) a.rep)[(int64_t) p*a.rep_s0];
+    char * dr = (char *) a.dst + dst_row*a.dst_nb1;
+    for (int d = tid; d < ncols; d += block_size) {
+        if constexpr (dst_f16) {
+            ((half *) dr)[d] = ggml_cuda_cast<half>(s_out[d]);
+        } else {
+            ((float *) dr)[d] = s_out[d];
+        }
+    }
+}
+
+void ggml_cuda_op_qsa_pool_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * get_rows, const ggml_tensor * scale_node,
+                                 const ggml_tensor * rms_norm, const ggml_tensor * mul, const ggml_tensor * rope, const ggml_tensor * set_rows,
+                                 const int kpool) {
+    const ggml_tensor * keys = get_rows->src[0];
+    const ggml_tensor * w    = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+
+    ggml_cuda_qsa_pool_args a;
+    a.keys     = keys->data;
+    a.keys_nb1 = keys->nb[1];
+    a.ids      = (const int32_t *) get_rows->src[1]->data;
+    a.ids_s0   = get_rows->src[1]->nb[0] / sizeof(int32_t);
+    a.kpool    = kpool;
+    a.ncols    = (int) get_rows->ne[0];
+    a.n_new    = (int) (get_rows->ne[1] / kpool);
+    memcpy(&a.scale, (const float *) scale_node->op_params + 0, sizeof(float));
+    memcpy(&a.bias,  (const float *) scale_node->op_params + 1, sizeof(float));
+    memcpy(&a.eps, rms_norm->op_params, sizeof(float));
+    a.w        = (const float *) w->data;
+    a.dst      = set_rows->data;
+    a.dst_nb1  = set_rows->nb[1];
+    a.rep      = set_rows->src[1]->data;
+    a.rep_i64  = set_rows->src[1]->type == GGML_TYPE_I64;
+    a.rep_s0   = set_rows->src[1]->nb[0] / ggml_type_size(set_rows->src[1]->type);
+
+    // the rope parameters as ggml_cuda_op_rope reads them
+    ggml_cuda_rms_rope_args r;
+    const int n_ctx_orig = ((const int32_t *) rope->op_params)[4];
+    r.n_dims = ((const int32_t *) rope->op_params)[1];
+    r.n_offs = ((const int32_t *) rope->op_params)[15];
+    const int mode = ((const int32_t *) rope->op_params)[2];
+    float freq_base;
+    float beta_fast;
+    float beta_slow;
+    memcpy(&freq_base,     (const int32_t *) rope->op_params +  5, sizeof(float));
+    memcpy(&r.freq_scale,  (const int32_t *) rope->op_params +  6, sizeof(float));
+    memcpy(&r.ext_factor,  (const int32_t *) rope->op_params +  7, sizeof(float));
+    memcpy(&r.attn_factor, (const int32_t *) rope->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,     (const int32_t *) rope->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,     (const int32_t *) rope->op_params + 10, sizeof(float));
+    memcpy(&r.sections.v,  (const int32_t *) rope->op_params + 11, sizeof(int)*4);
+    ggml_rope_yarn_corr_dims(r.n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, r.corr_dims.v);
+    r.theta_scale  = powf(freq_base, -2.0f / r.n_dims);
+    r.pos          = (const int32_t *) rope->src[1]->data;
+    r.freq_factors = rope->src[2] != nullptr ? (const float *) rope->src[2]->data : nullptr;
+    r.is_imrope    = mode == GGML_ROPE_TYPE_IMROPE;
+
+    GGML_ASSERT(a.ncols % 4 == 0 && a.ncols / 4 <= 32 && a.ncols <= GGML_CUDA_QSA_POOL_MAX_COLS);
+    const bool keys_f16 = keys->type == GGML_TYPE_F16;
+    const bool dst_f16  = set_rows->type == GGML_TYPE_F16;
+    const bool has_ff   = r.freq_factors != nullptr;
+
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(dim3(a.n_new, 1, 1), dim3(32, 1, 1), 0, ctx.stream());
+#define QSA_POOL_LAUNCH(KF, DF, FF) ggml_cuda_kernel_launch(k_qsa_pool<KF, DF, FF>, lp, a, r)
+    if (keys_f16) {
+        if (dst_f16) { if (has_ff) { QSA_POOL_LAUNCH(true, true, true); } else { QSA_POOL_LAUNCH(true, true, false); } }
+        else         { if (has_ff) { QSA_POOL_LAUNCH(true, false, true); } else { QSA_POOL_LAUNCH(true, false, false); } }
+    } else {
+        if (dst_f16) { if (has_ff) { QSA_POOL_LAUNCH(false, true, true); } else { QSA_POOL_LAUNCH(false, true, false); } }
+        else         { if (has_ff) { QSA_POOL_LAUNCH(false, false, true); } else { QSA_POOL_LAUNCH(false, false, false); } }
+    }
+#undef QSA_POOL_LAUNCH
+}
+
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                                      ggml_tensor *               dst,
                                      ggml_tensor *               mul_tensor,
