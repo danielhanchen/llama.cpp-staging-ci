@@ -2150,7 +2150,17 @@ void llama_context::moe_cache_devseed_fallback() {
     if (env != nullptr && atoi(env) == 0) {
         return;
     }
-    double max_frac = 0.5;
+    // k16-seed: where the fit did not price the host seed (the token gate, or LLAMA_FIT_SEED_PRICE=0), a cache of up to
+    // LLAMA_MOE_CACHE_DEVSEED_UNPRICED_MAX_FRAC (0.75) of the host experts takes the device seed: above 0.5 it was only prefilled
+    // and its prompts did not seed it (G4 k16d_g4seed, Qwen3.6 UD-Q4_K_XL + MTP 16 GB, 51% of the host experts: decode hit rate 94.0%,
+    // priced 97.0%; k16d_g4seed2: that placement with the device seed beat the priced seed in all 6 prompts, mean request -2.6%)
+    const bool unpriced = !(fit_seed_price_on() && seed_price_wanted());
+    double max_frac = unpriced ? 0.75 : 0.5;
+    if (unpriced) {
+        if (const char * e = getenv("LLAMA_MOE_CACHE_DEVSEED_UNPRICED_MAX_FRAC")) {
+            max_frac = atof(e);
+        }
+    }
     if (const char * e = getenv("LLAMA_MOE_CACHE_DEVSEED_FALLBACK_MAX_FRAC")) {
         max_frac = atof(e);
     }
