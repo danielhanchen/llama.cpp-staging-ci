@@ -4308,9 +4308,9 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 // kernel writes. They are matched to their readers by tensor identity, through reshapes, not by address: the allocator
 // reuses the memory of dead tensors, so one address holds different tensors over a graph.
 static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::unordered_set<const void *> & norm_targets,
-        std::unordered_map<const void *, int64_t> & target_ne10) {
+        std::unordered_map<const void *, int64_t> & norm_target_ne10) {
     norm_targets.clear();
-    target_ne10.clear();
+    norm_target_ne10.clear();
     // GGML_CUDA_DISABLE_FUSION=1 also turns it off, so that it restores the unfused path as a whole
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_Q8_1_CACHE") || ggml_cuda_env_flag("GGML_CUDA_DISABLE_FUSION");
     if (disabled) {
@@ -4344,7 +4344,6 @@ static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::un
     // the same for the outputs of elementwise chains and of DSV4_HC_PRE (GGML_CUDA_DISABLE_PRODUCER_Q8_1=1 turns this off)
     static const bool producer_q8_1_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_PRODUCER_Q8_1");
     std::unordered_set<const ggml_tensor *> norm_outputs;
-    std::unordered_set<const ggml_tensor *> gated_outputs; // k15-fn: their kernel writes the copy in the rows of any reader
     if (!norm_q8_1_disabled) {
         for (int i = 0; i + 1 < cgraph->n_nodes; ++i) {
             const ggml_tensor * norm = cgraph->nodes[i];
@@ -4384,29 +4383,32 @@ static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::un
                 norm_outputs.insert(node);
             }
         }
-        // k15-fn: the gated ops (GLU, and UNARY -> MUL as ggml_cuda_op_unary_mul fuses it), whose f32 kernel writes the q8_1 copy
-        // (unary_gated_q8_1_kernel). GGML_CUDA_DISABLE_GLU_Q8_1=1 turns this off
-        static const bool glu_q8_1_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_GLU_Q8_1");
-        if (!glu_q8_1_disabled) {
-            auto f32c = [](const ggml_tensor * t) {
-                return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->data != nullptr && (t->flags & GGML_TENSOR_FLAG_COMPUTE);
-            };
-            for (int i = 0; i < cgraph->n_nodes; ++i) {
-                const ggml_tensor * node = cgraph->nodes[i];
-                if (node->op == GGML_OP_GLU && f32c(node) && node->src[0]->type == GGML_TYPE_F32) {
-                    const ggml_glu_op gop = ggml_get_glu_op(node);
-                    if (gop == GGML_GLU_OP_SWIGLU || gop == GGML_GLU_OP_GEGLU || gop == GGML_GLU_OP_REGLU || gop == GGML_GLU_OP_GEGLU_ERF ||
-                        gop == GGML_GLU_OP_GEGLU_QUICK) {
-                        gated_outputs.insert(node);
-                    }
-                }
-                if (node->op == GGML_OP_UNARY && i + 1 < cgraph->n_nodes && f32c(cgraph->nodes[i + 1]) && cgraph->nodes[i + 1]->op == GGML_OP_MUL &&
-                    (cgraph->nodes[i + 1]->src[0] == node || cgraph->nodes[i + 1]->src[1] == node)) {
-                    const ggml_unary_op uop = ggml_get_unary_op(node);
-                    if (uop == GGML_UNARY_OP_SILU || uop == GGML_UNARY_OP_SIGMOID || uop == GGML_UNARY_OP_SOFTPLUS) {
-                        gated_outputs.insert(cgraph->nodes[i + 1]);
-                    }
-                }
+    }
+    // k15-mm2: gated outputs (GLU, and the MUL of a fused SILU / SIGMOID / SOFTPLUS + MUL pair), unary.cu writes their q8_1 copy, also
+    // for a reader whose rows are a multiple of MATRIX_ROW_PADDING other than theirs (GGML_CUDA_GATED_Q8_1=0 turns this off)
+    // (GGML_CUDA_DISABLE_GLU_Q8_1=1, the switch of k15-fn 414e7c2d4a5 that this replaces, is an alias)
+    static const bool gated_q8_1_disabled = [] {
+        const char * e = getenv("GGML_CUDA_GATED_Q8_1");
+        const char * d = getenv("GGML_CUDA_DISABLE_GLU_Q8_1");
+        return (e != nullptr && atoi(e) == 0) || (d != nullptr && atoi(d) != 0);
+    }();
+    std::unordered_set<const ggml_tensor *> flat_outputs;
+    if (!producer_q8_1_disabled && !gated_q8_1_disabled) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node) || node->data == nullptr || !(node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                continue;
+            }
+            bool gated = node->op == GGML_OP_GLU;
+            if (node->op == GGML_OP_MUL && i > 0) {
+                const ggml_tensor * u = cgraph->nodes[i - 1];
+                gated = u->op == GGML_OP_UNARY && (node->src[0] == u || node->src[1] == u) &&
+                    (ggml_get_unary_op(u) == GGML_UNARY_OP_SILU || ggml_get_unary_op(u) == GGML_UNARY_OP_SIGMOID ||
+                     ggml_get_unary_op(u) == GGML_UNARY_OP_SOFTPLUS);
+            }
+            if (gated) {
+                norm_outputs.insert(node);
+                flat_outputs.insert(node);
             }
         }
     }
@@ -4423,17 +4425,15 @@ static size_t ggml_cuda_q8_1_cache_slot_size(const ggml_cgraph * cgraph, std::un
         while (prod->view_src != nullptr && prod->view_offs == 0 && ggml_nbytes(prod) == ggml_nbytes(prod->view_src)) {
             prod = prod->view_src;
         }
-        const bool norm_target = norm_outputs.count(prod) && ggml_is_contiguous(src1) && ggml_is_contiguous(prod) &&
-            ggml_cuda_q8_1_cache::same_copy_rows(src1->ne[0], prod->ne[0]);
-        // a gated producer read by one candidate: the copy is written in the rows of that reader (a second reader with other rows
-        // quantizes for itself)
-        const bool gated_target = !norm_target && gated_outputs.count(prod) && ggml_is_contiguous(src1) && ggml_is_contiguous(prod) &&
-            !norm_targets.count(prod);
-        if (gated_target) {
+        const bool same_rows = ggml_cuda_q8_1_cache::same_copy_rows(src1->ne[0], prod->ne[0]);
+        const bool flat_rows = !same_rows && flat_outputs.count(prod) && src1->ne[0] % MATRIX_ROW_PADDING == 0 &&
+            !ggml_cuda_q8_1_cache::reshape_disabled();
+        const bool norm_target = norm_outputs.count(prod) && ggml_is_contiguous(src1) && ggml_is_contiguous(prod) && (same_rows || flat_rows);
+        if (norm_target) {
             norm_targets.insert(prod);
-            target_ne10[prod] = src1->ne[0];
-        } else if (norm_target) {
-            norm_targets.insert(prod);
+            if (flat_rows) {
+                norm_target_ne10[prod] = src1->ne[0];
+            }
         } else if (n_readers[src1->data] < 2) {
             continue;
         }
@@ -4648,7 +4648,9 @@ static int ggml_cuda_try_fuse_hc_post_norm(ggml_backend_cuda_context * cuda_ctx,
         return 0;
     }
     {
-        static const bool off = [] { const char * e = getenv("GGML_CUDA_HC_POST_NORM"); return e != nullptr && atoi(e) == 0; }();
+        // opt-in (GGML_CUDA_HC_POST_NORM=1), as on k15 1923a00666c: it raised the rate of the pinned Flash-Next graphs race
+        // (integration gate, 6/35 vs 0/14) until that is fixed; decode cost of leaving it off +0.4 to 0.5% (inside the noise)
+        static const bool off = [] { const char * e = getenv("GGML_CUDA_HC_POST_NORM"); return e == nullptr || atoi(e) == 0; }();
         int irn = ip + 1;
         while (irn < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[irn])) {
             irn++;
@@ -6185,10 +6187,11 @@ static bool ggml_cuda_mmvf_dispatch_ok(const ggml_backend_cuda_context * ctx, co
 // k15-mm2: the hyper-connection down projection (Q8_0) and inject product (F32, K = hc*n_embd -> hc rows, split-K) of one mix read the
 // same activation and are adjacent once the side-stream planner moved the inject behind its activation: one launch for both
 // (ggml_cuda_mul_mat_vec_q_inject, same bytes). Node i and the next compute node j; the inject then does not use the side stream.
-// GGML_CUDA_HC_INJECT_DOWN=0 turns it off.
+// Opt-in, GGML_CUDA_HC_INJECT_DOWN=1: break-even on G4 (k15mm2g4k fn4 32 GB: 128.9 / 115.6 tok/s chat / 8k vs 129.1 / 115.4 off) and
+// B200 (-0.4% / -0.1% per decode), inside the noise; it gives up the inject's side-stream overlap for one launch fewer per mix.
 static bool ggml_cuda_hc_inject_down_match(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i, int & j_out,
         ggml_tensor ** q_out, ggml_tensor ** f_out, ggml_cuda_mmvf_splitk_args * inj) {
-    static const bool off = [] { const char * e = getenv("GGML_CUDA_HC_INJECT_DOWN"); return e != nullptr && atoi(e) == 0; }();
+    static const bool off = [] { const char * e = getenv("GGML_CUDA_HC_INJECT_DOWN"); return e == nullptr || atoi(e) == 0; }();
     ggml_tensor * a = cgraph->nodes[i];
     if (off || ggml_cuda_fusion_disabled() || a->op != GGML_OP_MUL_MAT || !(a->flags & GGML_TENSOR_FLAG_COMPUTE) || a->view_src != nullptr) {
         return false;
@@ -7499,12 +7502,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_pool_alloc<char> q8_1_cache_arena(cuda_ctx->pool());
             {
                 std::unordered_set<const void *> norm_targets;
-                std::unordered_map<const void *, int64_t> target_ne10;
-                const size_t slot_size = stream_ctx.concurrent_events.empty() ? ggml_cuda_q8_1_cache_slot_size(cgraph, norm_targets, target_ne10) : 0;
+                std::unordered_map<const void *, int64_t> norm_target_ne10;
+                const size_t slot_size = stream_ctx.concurrent_events.empty() ?
+                    ggml_cuda_q8_1_cache_slot_size(cgraph, norm_targets, norm_target_ne10) : 0;
                 if (slot_size > 0) {
                     cuda_ctx->q8_1_cache.begin(q8_1_cache_arena.alloc(ggml_cuda_q8_1_cache::n_slots*slot_size), slot_size);
                     cuda_ctx->q8_1_cache.norm_targets = std::move(norm_targets);
-                    cuda_ctx->q8_1_cache.target_ne10  = std::move(target_ne10);
+                    cuda_ctx->q8_1_cache.norm_target_ne10 = std::move(norm_target_ne10);
                 }
             }
 

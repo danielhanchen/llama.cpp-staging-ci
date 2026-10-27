@@ -1467,7 +1467,8 @@ struct ggml_cuda_q8_1_cache {
     int    pending   = -1; // slot reserved by a producer, see reserve()
     entry  entries[n_slots];
     std::unordered_set<const void *> norm_targets; // producer tensors whose kernel writes the q8_1 copy (see ggml_cuda_q8_1_cache_slot_size)
-    std::unordered_map<const void *, int64_t> target_ne10; // k15-fn: row width the reader of a gated producer uses (its q8_1 rows)
+    // k15-mm2: the reader's row length of a producer target whose rows differ from the reader's (a multiple of MATRIX_ROW_PADDING)
+    std::unordered_map<const void *, int64_t> norm_target_ne10;
 
     bool active() const {
         return arena != nullptr;
@@ -1484,7 +1485,7 @@ struct ggml_cuda_q8_1_cache {
     void end() {
         begin(nullptr, 0);
         norm_targets.clear();
-        target_ne10.clear();
+        norm_target_ne10.clear();
     }
 
     // returns the slot holding the q8_1 copy of src (quantized == true) or a slot to quantize into
@@ -1841,26 +1842,6 @@ struct ggml_backend_cuda_context {
         return pool(device);
     }
 };
-
-// k15-fn: the q8_1 copy a producer kernel writes beside its f32 output t, when a mul_mat_vec_q reads t (a norm target of the
-// q8_1 cache, see ggml_cuda_q8_1_cache_slot_size), nullptr otherwise; layout of the copy as ggml_cuda_op_ew_chain writes it
-// ne10: the row width of the copy (the reader's src1 rows, t may be a reshape of them), nrows = nelements / ne10
-static inline void * ggml_cuda_q8_1_producer_out(ggml_backend_cuda_context & ctx, const ggml_tensor * t, int64_t & ne10, int64_t & nrows) {
-    ggml_cuda_q8_1_cache & cache = ctx.q8_1_cache;
-    if (!cache.active() || ctx.curr_stream_no != 0 || !cache.norm_targets.count(t) || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
-        return nullptr;
-    }
-    const auto it = cache.target_ne10.find(t);
-    ne10 = it != cache.target_ne10.end() ? it->second : t->ne[0];
-    if (ne10 <= 0 || ggml_nelements(t) % ne10 != 0) {
-        return nullptr;
-    }
-    nrows = ggml_nelements(t) / ne10;
-    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    int64_t key[ggml_cuda_q8_1_cache::n_key];
-    ggml_cuda_q8_1_cache::key_contiguous(ne10, nrows, key);
-    return cache.reserve(t->data, ggml_nbytes(t), key, nrows*ne10_padded/QK8_1*sizeof(block_q8_1));
-}
 
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
