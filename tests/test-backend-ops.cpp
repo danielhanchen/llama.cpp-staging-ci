@@ -8521,6 +8521,252 @@ struct test_glu_src1_alias : public test_case {
 // pattern 0: q, k, v adjacent; 1: the attention order (q, a view of it, rms_norm * w, then k, v: moved next to q before allocation);
 // 2: v of another type (only q + k share a launch); 3: k and v followed by bias adds (gpt-oss: those keep their own fusion);
 // 4: two products (gated delta net qkv + gate) with a reshape between them. Rows of q / k / v are not multiples of the rows per block.
+// k15-fn: the conv input of a qwen4exp / qwen35 short convolution (build_conv_state_at): CONCAT of the state columns (read in place from
+// the recurrent cache row) and the transposed new tokens, the per-rollback-slot tail copies into the cache (slot 0 over the row the
+// state was read from), then SSM_CONV + SILU. The CUDA backend does not run the concat in decode / verify (ssm_conv_cat_f32, kill
+// GGML_CUDA_DISABLE_CONV_CAT_FUSION=1) and writes the copies in the convolution (GGML_CUDA_DISABLE_CONV_STATE_FUSION=1).
+// cpy_after: the copies come after the convolution, where the concat must run (the fusion refuses)
+struct test_conv_cat_state : public test_case {
+    const int64_t channels;
+    const int64_t d_conv;
+    const int64_t n_t;
+    const int64_t n_slots;
+    const bool    cpy_after;
+    std::vector<ggml_tensor *> checked;
+
+    std::string vars() override {
+        return VARS_TO_STR5(channels, d_conv, n_t, n_slots, cpy_after);
+    }
+
+    test_conv_cat_state(int64_t channels = 10240, int64_t d_conv = 4, int64_t n_t = 1, int64_t n_slots = 3, bool cpy_after = false)
+        : channels(channels), d_conv(d_conv), n_t(n_t), n_slots(n_slots), cpy_after(cpy_after) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t sc = d_conv - 1, C = channels, mem_size = 2, head = 1;
+        checked.clear();
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sc*C, n_slots*mem_size);
+        ggml_set_name(cache, "conv_cache");
+        ggml_tensor * state = ggml_reshape_3d(ctx, ggml_view_2d(ctx, cache, sc*C, 1, cache->nb[1], head*cache->nb[1]), sc, C, 1);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, n_t, 1);
+        ggml_set_name(x, "x");
+        ggml_tensor * conv_input = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
+        ggml_set_name(conv_input, "conv_input");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, C);
+        ggml_set_name(w, "conv_w");
+        std::vector<ggml_tensor *> cpys;
+        for (int64_t slot = 0; slot < n_slots; ++slot) {
+            const int64_t s_idx = std::max<int64_t>(0, conv_input->ne[0] - sc - slot);
+            ggml_tensor * tail = ggml_view_3d(ctx, conv_input, sc, C, 1, conv_input->nb[1], conv_input->nb[2], s_idx*sizeof(float));
+            ggml_tensor * dst  = ggml_view_3d(ctx, cache, sc, C, 1, sc*sizeof(float), cache->nb[1], (slot*mem_size + head)*cache->nb[1]);
+            cpys.push_back(ggml_cpy(ctx, tail, dst));
+        }
+        if (!cpy_after && mode == MODE_TEST) {
+            for (ggml_tensor * c : cpys) {
+                ggml_build_forward_expand(gf, c);
+            }
+        }
+        ggml_tensor * out = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, w));
+        ggml_set_name(out, "conv_out");
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, out);
+            if (cpy_after) {
+                for (ggml_tensor * c : cpys) {
+                    ggml_build_forward_expand(gf, c);
+                }
+            }
+        }
+        checked = cpys;
+        checked.push_back(out);
+        return out;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONV_CAT_STATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return checked; }
+};
+
+// k15-fn: a qwen4exp QSA layer's new pooled keys (build_qsa_sel): GET_ROWS of the kpool member keys from the f16 indexer cache -> CONT
+// + ADDs -> SCALE -> RMS_NORM -> MUL -> RESHAPE -> multi-section ROPE -> RESHAPE -> SET_ROWS into the pooled half of the rep rows. The
+// CUDA backend runs it as one warp per pool (k_qsa_pool, kill GGML_CUDA_DISABLE_QSA_POOL_FUSION=1)
+struct test_qsa_pool_keys : public test_case {
+    const int64_t idx_dim;
+    const int64_t kpool;
+    const int64_t n_new;
+    const int64_t n_cells;
+    ggml_tensor * sr = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR4(idx_dim, kpool, n_new, n_cells);
+    }
+
+    test_qsa_pool_keys(int64_t idx_dim = 128, int64_t kpool = 4, int64_t n_new = 1, int64_t n_cells = 64)
+        : idx_dim(idx_dim), kpool(kpool), n_new(n_new), n_cells(n_cells) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t D = idx_dim;
+        ggml_tensor * k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 2*D, n_cells);
+        ggml_set_name(k, "kcache");
+        ggml_tensor * key_gate = ggml_view_2d(ctx, k, D, n_cells, k->nb[1], 0);
+        ggml_tensor * pooled_v = ggml_view_2d(ctx, k, D, n_cells, k->nb[1], ggml_row_size(k->type, D));
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kpool*n_new);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * rows = ggml_reshape_3d(ctx, ggml_get_rows(ctx, key_gate, ids), D, kpool, n_new);
+        ggml_tensor * pooled = nullptr;
+        for (int64_t i = 0; i < kpool; ++i) {
+            ggml_tensor * slice = ggml_view_2d(ctx, rows, D, n_new, rows->nb[2], i*rows->nb[1]);
+            pooled = pooled ? ggml_add(ctx, pooled, slice) : ggml_cont(ctx, slice);
+        }
+        pooled = ggml_scale(ctx, pooled, 1.0f/(float) kpool);
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
+        ggml_set_name(w, "norm_w");
+        pooled = ggml_mul(ctx, ggml_rms_norm(ctx, pooled, 1e-6f), w);
+        pooled = ggml_reshape_3d(ctx, pooled, D, 1, n_new);
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4*n_new);
+        ggml_set_name(pos, "pos");
+        int sections[4] = { 11, 11, 10, 0 };
+        pooled = ggml_rope_multi(ctx, pooled, pos, nullptr, 64, sections, GGML_ROPE_TYPE_IMROPE, 262144, 10000000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        pooled = ggml_reshape_2d(ctx, pooled, D, n_new);
+        ggml_tensor * rep = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_new);
+        ggml_set_name(rep, "rep");
+        sr = ggml_set_rows(ctx, pooled_v, pooled, rep);
+        ggml_set_name(sr, "pooled_set");
+        return sr;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QSA_POOL_KEYS";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(7);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "ids") == 0) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (auto & e : v) { e = (int32_t) (rng() % n_cells); }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "rep") == 0) {
+                std::vector<int64_t> v(ggml_nelements(t));
+                for (size_t i = 0; i < v.size(); ++i) { v[i] = (int64_t) ((7 + 13*i) % n_cells); }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "pos") == 0) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (auto & e : v) { e = (int32_t) (rng() % 16384); }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// k15-fn: a qwen4exp QSA layer's packed indexer key row (build_qsa_sel): FILL (the pooled half, zero) -> CONCAT with the raw key ->
+// views -> SET_ROWS into the f16 indexer cache. The CUDA backend writes it in one kernel (k_qsa_key_pack, kill
+// GGML_CUDA_DISABLE_QSA_KEY_PACK_FUSION=1)
+struct test_qsa_key_pack : public test_case {
+    const int64_t idx_dim;
+    const int64_t n_tokens;
+    const int64_t n_cells;
+
+    std::string vars() override {
+        return VARS_TO_STR3(idx_dim, n_tokens, n_cells);
+    }
+
+    test_qsa_key_pack(int64_t idx_dim = 128, int64_t n_tokens = 1, int64_t n_cells = 64)
+        : idx_dim(idx_dim), n_tokens(n_tokens), n_cells(n_cells) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t D = idx_dim;
+        ggml_tensor * k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 2*D, n_cells);
+        ggml_set_name(k, "kcache");
+        ggml_tensor * kr = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_tokens);
+        ggml_set_name(kr, "k_raw");
+        ggml_tensor * pz = ggml_fill(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_tokens), 0.0f);
+        ggml_tensor * packed = ggml_reshape_3d(ctx, ggml_concat(ctx, kr, pz, 0), 2*D, 1, n_tokens);
+        packed = ggml_view_2d(ctx, packed, 2*D, n_tokens, packed->nb[2], 0);
+        ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+        ggml_set_name(idx, "idx");
+        ggml_tensor * out = ggml_set_rows(ctx, k, packed, idx);
+        ggml_set_name(out, "packed_set");
+        return out;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QSA_KEY_PACK";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "idx") == 0) {
+                std::vector<int64_t> v(ggml_nelements(t));
+                for (size_t i = 0; i < v.size(); ++i) { v[i] = (int64_t) ((5 + 11*i) % n_cells); }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// k15-fn: the attention output gate of qwen35 / qwen35moe / qwen3next / qwen4exp: CONT of the strided view of every head's second half
+// of Qcur_full, SIGMOID, MUL with the attention output (+ the wo mat-vec, whose q8_1 input the fused kernel writes). The CUDA backend
+// does not run the CONT, the fused sigmoid * mul reads the view (kill GGML_CUDA_DISABLE_UNARY_SRC_CONT_FUSION=1)
+struct test_gate_cont : public test_case {
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_tokens;
+    const bool    with_mm;
+    ggml_tensor * gated = nullptr;
+    ggml_tensor * out   = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR4(head_dim, n_head, n_tokens, with_mm);
+    }
+
+    test_gate_cont(int64_t head_dim = 128, int64_t n_head = 48, int64_t n_tokens = 1, bool with_mm = true)
+        : head_dim(head_dim), n_head(n_head), n_tokens(n_tokens), with_mm(with_mm) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hd = head_dim, nh = n_head, nt = n_tokens;
+        ggml_tensor * qf = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*hd*nh, nt);
+        ggml_set_name(qf, "Qcur_full");
+        ggml_tensor * gate = ggml_view_3d(ctx, qf, hd, nh, nt, ggml_element_size(qf)*2*hd, ggml_element_size(qf)*2*hd*nh,
+                                          ggml_element_size(qf)*hd);
+        gate = ggml_cont_2d(ctx, gate, hd*nh, nt);
+        ggml_tensor * attn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd*nh, nt);
+        ggml_set_name(attn, "attn");
+        gated = ggml_mul(ctx, attn, ggml_sigmoid(ctx, gate));
+        ggml_set_name(gated, "attn_gated");
+        out = gated;
+        if (with_mm) {
+            ggml_tensor * wo = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hd*nh, 256);
+            ggml_set_name(wo, "wo");
+            out = ggml_mul_mat(ctx, wo, gated);
+            ggml_set_name(out, "attn_out");
+        }
+        return out;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATE_CONT";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return with_mm ? std::vector<ggml_tensor *>{ gated, out } : std::vector<ggml_tensor *>{ gated }; }
+};
+
 // k15-mm2: the QSA selection mask of qwen4exp (llama_model_qwen4exp::graph::build_qsa_sel) feeding sparse flash attention:
 // sel = add(view(set_rows(repeat(fill(-inf)), repeat(fill(0)), idx)), kq_mask), dead slots pointing at dump rows >= n_kv.
 // The CUDA backend gathers from idx and kq_mask without building sel (GGML_CUDA_QSA_MASKLESS)
@@ -13782,6 +14028,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_gdn_inplace_gates(48, 128, 3, 3, 3, 0)); // Flash-Next verify shape
     test_cases.emplace_back(new test_gdn_inplace_gates(8, 64, 1, 1, 2, 1));   // no snapshots
+    // k15-fn decode fusions at the Qwen3.8-Flash-Next / Qwen3.6 shapes (decode n_t 1, MTP verify 3), plus the refused orders
+    for (int64_t nt : { 1, 3 }) {
+        test_cases.emplace_back(new test_conv_cat_state(10240, 4, nt, 3, false));
+        test_cases.emplace_back(new test_conv_cat_state(8192, 4, nt, 3, false));   // Qwen3.6 conv channels
+        test_cases.emplace_back(new test_conv_cat_state(10240, 4, nt, 3, true));
+        test_cases.emplace_back(new test_qsa_key_pack(128, nt, 20480));
+        test_cases.emplace_back(new test_gate_cont(128, 48, nt, true));
+        test_cases.emplace_back(new test_gate_cont(256, 16, nt, true));             // Qwen3.6 attention
+        test_cases.emplace_back(new test_gate_cont(128, 48, nt, false));
+    }
+    test_cases.emplace_back(new test_conv_cat_state(10240, 4, 1, 1, false));        // one rollback slot (no drafting)
+    for (int64_t n_new : { 1, 2, 3 }) {
+        test_cases.emplace_back(new test_qsa_pool_keys(128, 4, n_new, 20480));
+    }
+
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
