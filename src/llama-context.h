@@ -629,6 +629,7 @@ private:
     bool moe_cache_seed_enabled = true; // LLAMA_MOE_CACHE_SEED != 0
     bool moe_cache_seed_sync    = true;  // LLAMA_MOE_CACHE_SEED=2 (default): a prefetched ubatch seeds (earlier routing, else its own ids read first)
     bool moe_cache_seed_auto    = false; // LLAMA_MOE_CACHE_SEED unset, n_ubatch >= LLAMA_MOE_CACHE_SEED_AUTO: as LLAMA_MOE_CACHE_SEED=1
+    std::unordered_set<const llm_graph_result *> devseed_zeroed; // k15-fn: graphs whose seed plans a disabled prepare zeroed since their build
     bool moe_cache_devseed_on   = false; // LLAMA_MOE_CACHE_DEVSEED: prefetched ubatches seed the cache on the device (see llama_moe_cache::devseed_plan)
     bool moe_cache_devseed      = false; // the ubatch being computed seeds on the device
     bool moe_cache_devseed_graph = false; // the graph last built had its seed plans enabled
@@ -856,6 +857,8 @@ private:
     std::array<bool, GF_SMALL_N>                 gf_res_small_built{};
     std::array<uint64_t, GF_SMALL_N>             gf_res_small_used{};
     uint64_t gf_res_epoch = 1;
+    // k15-fn debug (LLAMA_GRAPH_SMALL_WHY=N): every invalidation of the kept graphs is logged with its source line
+    void gf_res_epoch_bump(int line);
     uint64_t n_small_swaps = 0;
     uint64_t n_small_uses  = 0;
     // the scheduler rewrites a graph it allocates (split input copies in its own context, tensor addresses): each kept graph's

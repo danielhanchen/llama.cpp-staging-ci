@@ -1292,6 +1292,9 @@ struct ggml_cuda_graph {
     uint64_t uid = 0;
     uint64_t compat_uid = 0;   // uid of the graph whose compatibility walk gave compat_ok (GGML_CUDA_GRAPH_UID)
     bool     compat_ok  = false;
+    // k15-fn: launches of the current exec since its capture (a warm key whose properties change captures again at once, no eager
+    // warm-up pass)
+    int64_t  n_launch_since_capture = 0;
     int64_t last_used_time = 0;
     struct node_properties {
         ggml_tensor node;

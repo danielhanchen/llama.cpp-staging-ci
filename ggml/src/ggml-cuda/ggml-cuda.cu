@@ -3220,8 +3220,25 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
+// k15-fn (GGML_CUDA_GRAPH_KEY_SHAPE=0: the first node alone): the key adds the node count and the shapes of the first and last nodes, so
+// graphs built in the same meta buffer (llama rebuilds every graph in one: the prompt tail, the verify, a 1-token decode) keep their own
+// entries, and a request's first verify finds the previous request's captured verify graph instead of warming up and capturing again.
+// Correctness does not depend on the key: an entry is reused only when every node property matches (ggml_cuda_graph_update_required)
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    static const bool shape = getenv("GGML_CUDA_GRAPH_KEY_SHAPE") == nullptr || atoi(getenv("GGML_CUDA_GRAPH_KEY_SHAPE")) != 0;
+    if (!shape || cgraph->n_nodes == 0) {
+        return cgraph->nodes[0];
+    }
+    uint64_t h = (uint64_t) (uintptr_t) cgraph->nodes[0];
+    const auto mix = [&h](uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); };
+    mix((uint64_t) cgraph->n_nodes);
+    const ggml_tensor * a = cgraph->nodes[0];
+    const ggml_tensor * b = cgraph->nodes[cgraph->n_nodes - 1];
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        mix((uint64_t) a->ne[d]);
+        mix((uint64_t) b->ne[d]);
+    }
+    return (const void *) (uintptr_t) h;
 }
 
 // GGML_CUDA_GRAPH_UID=0: the compatibility check walks every node on every evaluation, as before
@@ -8723,6 +8740,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph_evaluated_or_captured = true; // CUDA graph has been captured
+            // k15-fn debug (GGML_CUDA_GRAPH_CAPTURE_LOG=1): every capture, with the launches of the key's previous exec
+            static const bool cap_log = getenv("GGML_CUDA_GRAPH_CAPTURE_LOG") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_CAPTURE_LOG")) != 0;
+            static int64_t n_captures = 0;
+            ++n_captures;
+            if (cap_log) {
+                GGML_LOG_INFO("%s: CUDA graph capture %lld: key %p, %d nodes, previous exec launched %lld times\n", __func__, (long long) n_captures,
+                    graph_key, cgraph->n_nodes, (long long) graph->n_launch_since_capture);
+            }
+            graph->n_launch_since_capture = 0;
             // k15-fn debug (GGML_CUDA_GRAPH_NODE_STATS=1): the node types of each captured graph (a host<->device memcpy node makes the
             // launch cost grow with the node count: B200 2000 kernels 5.7 us, with memcpy nodes 102 us)
             static const bool node_stats = getenv("GGML_CUDA_GRAPH_NODE_STATS") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_NODE_STATS")) != 0;
@@ -8815,6 +8841,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             static int64_t lt_n[2] = { 0, 0 }, lt_t[2] = { 0, 0 }, lt_nodes[2] = { 0, 0 };
             const int64_t lt0 = lt_every > 0 ? ggml_time_us() : 0;
             CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+            graph->n_launch_since_capture++;
             if (lt_every > 0) {
                 const int bk = cgraph->n_nodes > 1000;
                 lt_n[bk]++; lt_t[bk] += ggml_time_us() - lt0; lt_nodes[bk] += cgraph->n_nodes;
@@ -8906,7 +8933,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
                 // Post-warmup: normal CUDA graph operation
-                if (properties_changed) {
+                // k15-fn (GGML_CUDA_GRAPH_DIRECT_RECAPTURE=0: always warm up again): a key whose exec ran at least twice since its capture
+                // (a stable graph) and whose properties changed (a rebuilt graph: new request, other KV size) is captured again at once,
+                // without the eager warm-up pass; a graph that changes every call never gets there and warms up as before
+                static const bool direct = getenv("GGML_CUDA_GRAPH_DIRECT_RECAPTURE") == nullptr || atoi(getenv("GGML_CUDA_GRAPH_DIRECT_RECAPTURE")) != 0;
+                if (properties_changed && direct && graph->instance != nullptr && graph->n_launch_since_capture >= 2) {
+                    use_cuda_graph = true;
+                    cuda_graph_update_required = true;
+                } else if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
                     if (ggml_cuda_graph_debug_enabled()) {

@@ -1310,6 +1310,16 @@ llama_context::disk_range_ref::~disk_range_ref() {
     }
 }
 
+void llama_context::gf_res_epoch_bump(int line) {
+    gf_res_epoch++;
+    static const bool why = getenv("LLAMA_GRAPH_SMALL_WHY") != nullptr && atoi(getenv("LLAMA_GRAPH_SMALL_WHY")) > 0;
+    static int n_logged = 0;
+    if (why && n_logged < 64) {
+        n_logged++;
+        LLAMA_LOG_INFO("%s: kept graphs invalidated (epoch %llu) at llama-context.cpp:%d\n", __func__, (unsigned long long) gf_res_epoch, line);
+    }
+}
+
 llama_context::~llama_context() {
     if (!disk_ranges.empty()) {
         ggml_moe_prefetch_counters c = {};
@@ -1697,7 +1707,7 @@ void llama_context::sched_reserve() {
         res.reset();
     }
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
-    gf_res_prev_active = nullptr; gf_res_epoch++;
+    gf_res_prev_active = nullptr; gf_res_epoch_bump(__LINE__);
 
     // a layer-major graph holds the graphs of up to lm_ub_max ubatches (LLAMA_MOE_LAYER_MAJOR_SCHED_PAD=1, debug: that size without them)
     static const bool lm_sched_pad = getenv("LLAMA_MOE_LAYER_MAJOR_SCHED_PAD") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_SCHED_PAD")) != 0;
@@ -2249,7 +2259,7 @@ bool llama_context::memory_update(bool optimize) {
         static const bool keep_update = getenv("LLAMA_GRAPH_SMALL_KEEP_UPDATE") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_KEEP_UPDATE")) != 0;
         gf_res_prev_active = nullptr;
         if (!keep_update) {
-            gf_res_epoch++;
+            gf_res_epoch_bump(__LINE__);
         }
 
         if (!mctx->apply()) {
@@ -3187,6 +3197,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 moe_cache_seed_graph != moe_cache_seed || moe_cache_hybrid_graph != moe_cache_hybrid || moe_cache_devseed_graph != moe_cache_devseed ||
                 moe_inplace_graph != moe_inplace_ok ||
                 !res->can_reuse(gparams)) {
+            // k15-fn debug (LLAMA_GRAPH_SMALL_WHY=N): the first condition that refused the kept graph, for up to N refusals
+            static int why_left = getenv("LLAMA_GRAPH_SMALL_WHY") ? atoi(getenv("LLAMA_GRAPH_SMALL_WHY")) : 0;
+            if (n_small > 0 && gf != nullptr && why_left > 0) {
+                why_left--;
+                const char * why = !gf_res_small_built[i_small] ? "not built" : gf_res_small_epoch[i_small] != gf_res_epoch ? "epoch" :
+                    moe_cache_seed_graph != moe_cache_seed ? "seed mode" : moe_cache_hybrid_graph != moe_cache_hybrid ? "hybrid mode" :
+                    moe_cache_devseed_graph != moe_cache_devseed ? "devseed mode" : moe_inplace_graph != moe_inplace_ok ? "inplace" : "can_reuse";
+                LLAMA_LOG_INFO("%s: kept graph for %u tokens (way %u) not reused: %s (epoch %llu / %llu)\n", __func__, n_small, i_small % GF_SMALL_WAYS,
+                    why, (unsigned long long) gf_res_small_epoch[i_small], (unsigned long long) gf_res_epoch);
+            }
             return false;
         }
         gf_res_prev_active = nullptr; // (k11: not an invalidation of the kept small graphs)
@@ -3361,7 +3381,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (moe_cache) {
         moe_cache->prepare(ubatch.n_tokens);
         if (moe_cache_devseed_on) {
-            moe_cache->devseed_prepare(res->get_gf(), moe_cache_devseed);
+            // k15-fn (LLAMA_MOE_DEVSEED_SKIP=0: every ubatch): a disabled prepare only zeroes the seed plans of the graph (two walks of every
+            // node); a reused graph whose plans a disabled prepare already zeroed since it was built keeps them zeroed (only prepare and
+            // devseed_end write them, and devseed_end runs after an enabled prepare only)
+            static const bool skip_env = getenv("LLAMA_MOE_DEVSEED_SKIP") == nullptr || atoi(getenv("LLAMA_MOE_DEVSEED_SKIP")) != 0;
+            const bool zeroed = ub_reused && devseed_zeroed.count(res) > 0;
+            if (!(skip_env && !moe_cache_devseed && zeroed)) {
+                moe_cache->devseed_prepare(res->get_gf(), moe_cache_devseed);
+            }
+            if (moe_cache_devseed) {
+                devseed_zeroed.erase(res);
+            } else {
+                devseed_zeroed.insert(res);
+            }
         }
     }
 
@@ -3885,7 +3917,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         if (fresh) {
             moe_cache->hybrid_reset();
         // the reset takes back the lent slots without a new allocation: a reused graph would keep its copies bound to them
-        gf_res_prev_active = nullptr; gf_res_epoch++;
+        gf_res_prev_active = nullptr; gf_res_epoch_bump(__LINE__);
         }
     }
 
@@ -4536,7 +4568,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     };
     std::vector<lm_ub> group;
 
-    gf_res_prev_active = nullptr; gf_res_epoch++;
+    gf_res_prev_active = nullptr; gf_res_epoch_bump(__LINE__);
     moe_cache_ids.clear();
     ggml_backend_sched_reset(sched.get());
     ggml_backend_sched_use_full_hash(sched.get());
@@ -5889,7 +5921,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     }
 
     // the next graph is built anew
-    gf_res_prev_active = nullptr; gf_res_epoch++;
+    gf_res_prev_active = nullptr; gf_res_epoch_bump(__LINE__);
 
     // k15-small4: the host memory of the group (its input arena, mostly the KQ masks of every member, and the members' graph results) is
     // freed after it instead of kept for the next prompt: kept, it stayed in the process after every long prompt (q3m 4 GB, 8k prompt:
@@ -6410,7 +6442,7 @@ ggml_cgraph * llama_context::graph_reserve(
             res->reset();
         }
     }
-    gf_res_prev_active = nullptr; gf_res_epoch++;
+    gf_res_prev_active = nullptr; gf_res_epoch_bump(__LINE__);
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -8334,7 +8366,7 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
     if (moe_cache) {
         moe_cache->hybrid_reset();
         // the reset takes back the lent slots without a new allocation: a reused graph would keep its copies bound to them
-        gf_res_prev_active = nullptr; gf_res_epoch++;
+        gf_res_prev_active = nullptr; gf_res_epoch_bump(__LINE__);
     }
 
     // read model info
@@ -8930,7 +8962,7 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
     if (moe_cache) {
         moe_cache->hybrid_reset();
         // the reset takes back the lent slots without a new allocation: a reused graph would keep its copies bound to them
-        gf_res_prev_active = nullptr; gf_res_epoch++;
+        gf_res_prev_active = nullptr; gf_res_epoch_bump(__LINE__);
     }
     if (memory) {
         memory->state_read(io, seq_id, flags);
@@ -9160,7 +9192,7 @@ void llama_context::opt_epoch_iter(
             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
 
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
-            gf_res_prev_active = nullptr; gf_res_epoch++;
+            gf_res_prev_active = nullptr; gf_res_epoch_bump(__LINE__);
             res->reset();
 
             moe_cache_ids.clear();
@@ -9973,7 +10005,7 @@ void llama_context::moe_request_begin() {
     if (moe_cache != nullptr && moe_cache->request_begin()) {
         // the reset takes back the lent slots without a new allocation: a reused graph would keep its copies bound to them
         gf_res_prev_active = nullptr;
-        gf_res_epoch++;
+        gf_res_epoch_bump(__LINE__);
         // the empty cache is seeded early in the first batch (see moe_cache_seed_begin); LLAMA_MOE_CPU_MISS_PER_REQUEST_SEED=0 off
         static const int seed_early_env = [] {
             const char * e = getenv("LLAMA_MOE_CPU_MISS_PER_REQUEST_SEED");
