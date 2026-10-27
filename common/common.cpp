@@ -2886,7 +2886,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         // device is the fit run again without it; the drafter goes if that one keeps every layer on the device.
         // LLAMA_FIT_MTP_DROP=0: keep the drafter and the layer placement
         const char * env_mtp_drop = getenv("LLAMA_FIT_MTP_DROP");
-        const int64_t moe_gain_first = common_fit_moe_margin_gain();
+        int64_t moe_gain_first = common_fit_moe_margin_gain();
         bool moe_gain_mtp_trial = false;
         if (spec_mtp && !has_draft && !draft_off && params.speculative.draft.fit_can_drop && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS &&
                 mparams.n_gpu_layers != llama_model_default_params().n_gpu_layers && mparams_in.n_gpu_layers == llama_model_default_params().n_gpu_layers &&
@@ -2925,6 +2925,76 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 COM_INF("%s: --fit: the MTP drafter stays (without it the fit does not keep every layer on the device either)\n", __func__);
                 // the fit with the drafter stands: its outputs were not touched (the trial ran on copies), only its margin gain is the trial's
                 moe_gain_mtp_trial = true;
+            }
+        }
+        // k17-small: on a small device with few host threads an MTP drafter that keeps every layer on the device can still take most of
+        // the MoE cache (Qwen3.6-35B-A3B 4 GB, ctx 16384: UD-Q3_K_M cache 31 MiB with it, 699 MiB without; UD-Q4_K_XL 99 vs 535). There
+        // the host computes nearly every expert of every drafted verify window on its few threads (Kaggle T4 half, 2 threads, ctx 32768:
+        // no drafter + 297 MiB cache decoded 16.0-20.8 tok/s, the drafter beside a 33 MiB cache 14.6-16.6, plans/k15_kaggle.md k15smPC),
+        // while hosts with many threads gain from the drafts (G4 48 threads, 16k: the drafter kept is k14's 153 tok/s). So below
+        // LLAMA_FIT_MTP_CACHE_MIN_THREADS (4, the spill guard's threshold) host threads, on a small-device placement with the drafter, the
+        // fit runs again without it; the drafter goes if that keeps every layer on the device and gives the cache at least
+        // LLAMA_FIT_MTP_CACHE_GAIN_MIB (256) and twice its size. The drafter's own text equals the target's where the verify is exact.
+        // LLAMA_FIT_MTP_CACHE_DROP=0 keeps the drafter (the previous placement)
+        {
+            const char * e_cd = getenv("LLAMA_FIT_MTP_CACHE_DROP");
+            const char * e_ct = getenv("LLAMA_FIT_MTP_CACHE_MIN_THREADS");
+            const char * e_cg = getenv("LLAMA_FIT_MTP_CACHE_GAIN_MIB");
+            const int     min_threads = e_ct != nullptr ? std::max(0, atoi(e_ct)) : 4;
+            const int64_t gain_mib    = e_cg != nullptr ? std::max<int64_t>(0, atoll(e_cg)) : 256;
+            const int32_t n_threads   = params.cpuparams.n_threads;
+            const bool    cache_auto  = moe_cache_auto && cparams.moe_cache_size < COMMON_MOE_CACHE_AUTO_BYTES;
+            if ((e_cd == nullptr || atoi(e_cd) != 0) && spec_mtp && !has_draft && !draft_off && !params.speculative.draft.fit_off &&
+                    params.speculative.draft.fit_can_drop && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && cache_auto &&
+                    mparams.n_gpu_layers == llama_model_default_params().n_gpu_layers &&
+                    mparams_in.n_gpu_layers == llama_model_default_params().n_gpu_layers &&
+                    n_threads > 0 && n_threads < min_threads && common_fit_small_device()) {
+                const int64_t mib       = 1024*1024;
+                const int64_t gain_with = moe_gain_mtp_trial ? moe_gain_first : common_fit_moe_margin_gain();
+                const int64_t c_with    = (int64_t) cparams.moe_cache_size + gain_with;
+                llama_model_params   mp = mparams_in;
+                llama_context_params cp = cparams_in;
+                std::vector<float>   ts = ts_in;
+                std::vector<llama_model_tensor_buft_override> tbo = tbo_in;
+                std::vector<size_t>  mg = margins_in;
+                mp.tensor_split = ts.data();
+                if (mparams_in.tensor_buft_overrides == params.tensor_buft_overrides.data()) {
+                    mp.tensor_buft_overrides = tbo.data();
+                }
+                mp.load_mtp = params.load_mtp;
+                cp.n_rs_seq = 0;
+                cp.n_state_capture = cparams.n_state_capture;
+                common_fit_set_moe_margin_auto(!params.fit_params_target_set);
+                const common_params_fit_status st3 = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(), tbo.empty() ? nullptr : tbo.data(),
+                    mg.data(), params.fit_params_min_ctx, nullptr, fit_log_level, params.fit_kv_resident);
+                const int64_t gain_wo = common_fit_moe_margin_gain();
+                const int64_t c_wo    = st3 == COMMON_PARAMS_FIT_STATUS_SUCCESS && cp.moe_cache_size < COMMON_MOE_CACHE_AUTO_BYTES ?
+                    (int64_t) cp.moe_cache_size + gain_wo : -1;
+                const bool drop = st3 == COMMON_PARAMS_FIT_STATUS_SUCCESS && mp.n_gpu_layers == llama_model_default_params().n_gpu_layers &&
+                    c_wo >= c_with + gain_mib*mib && c_wo >= 2*c_with;
+                if (drop) {
+                    COM_WRN("%s: --fit: small device, %d host threads: the MTP drafter would take %" PRId64 " of %" PRId64 " MiB of the MoE cache "
+                        "(every layer on the device either way): speculative decoding is off (LLAMA_FIT_MTP_CACHE_DROP=0 keeps it)\n", __func__,
+                        n_threads, (c_wo - c_with)/mib, c_wo/mib);
+                    std::copy(ts.begin(), ts.end(), params.tensor_split);
+                    std::copy(tbo.begin(), tbo.end(), params.tensor_buft_overrides.begin());
+                    params.fit_params_target = mg;
+                    const bool tbo_ours = mp.tensor_buft_overrides != nullptr && mp.tensor_buft_overrides == tbo.data();
+                    mparams = mp;
+                    cparams = cp;
+                    mparams.tensor_split = params.tensor_split;
+                    if (tbo_ours) {
+                        mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
+                    }
+                    fit_status = st3;
+                    params.speculative.draft.fit_off = true;
+                    moe_gain_mtp_trial = false;   // the margin gain is the trial's (the last fit)
+                } else {
+                    COM_INF("%s: --fit: small device, %d host threads: the MTP drafter stays (MoE cache %" PRId64 " MiB with it, %" PRId64 " without)\n",
+                        __func__, n_threads, c_with/mib, c_wo/mib);
+                    moe_gain_first     = gain_with;
+                    moe_gain_mtp_trial = true;    // the fit with the drafter stands, its margin gain was recorded before the trial
+                }
             }
         }
         moe_margin_gain = fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS ? (moe_gain_mtp_trial ? moe_gain_first : common_fit_moe_margin_gain()) : 0;
