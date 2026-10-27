@@ -336,6 +336,7 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
 endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
+llama_build(test-graph-src-type.cpp LINK ggml) # k15-mmid: a CUDA graph is not replayed for a source of another type
 llama_build(test-gdn-replay.cpp LINK ggml) # k16-draft: ggml_gated_delta_net_replay vs the unfused replay path, bitwise
 
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
