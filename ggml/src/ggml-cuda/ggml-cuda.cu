@@ -5431,6 +5431,15 @@ static void ggml_cuda_conv_state_flush(ggml_backend_cuda_context * cuda_ctx) {
     cuda_ctx->conv_state_pending.clear();
 }
 
+// GGML_CUDA_FUSION_TRACE=1: why a conv-input concat was not elided (refusal point, concat name)
+static bool ggml_cuda_conv_cat_refuse(const char * name, int where) {
+    static const bool trace = ggml_cuda_env_flag("GGML_CUDA_FUSION_TRACE");
+    if (trace) {
+        GGML_LOG_INFO("conv cat elide: %s refused at %d\n", name, where);
+    }
+    return false;
+}
+
 static bool ggml_cuda_try_conv_state_defer(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_CONV_STATE_FUSION");
     if (disabled || ggml_cuda_fusion_disabled() || cuda_ctx->curr_stream_no != 0) {
@@ -5443,7 +5452,7 @@ static bool ggml_cuda_try_conv_state_defer(ggml_backend_cuda_context * cuda_ctx,
         (cpy->flags & GGML_TENSOR_FLAG_OUTPUT) || tail->view_src == nullptr || tail->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
         tail->ne[3] != 1 || dst->ne[3] != 1 || !ggml_are_same_shape(tail, dst) || dst->nb[1] % sizeof(float) != 0 ||
         dst->nb[2] % sizeof(float) != 0 || tail->data == nullptr || dst->data == nullptr) {
-        return false;
+        return ggml_cuda_conv_cat_refuse(cpy->name, 100 + 1);
     }
     const ggml_tensor * input = tail->view_src;
     // the tail is a column range of every row of the input: the same row and sequence strides, the offset inside the first row
@@ -5451,7 +5460,7 @@ static bool ggml_cuda_try_conv_state_defer(ggml_backend_cuda_context * cuda_ctx,
     if (input->type != GGML_TYPE_F32 || input->nb[0] != sizeof(float) || tail->nb[1] != input->nb[1] || tail->nb[2] != input->nb[2] ||
         tail->ne[1] != input->ne[1] || tail->ne[2] != input->ne[2] || offs % sizeof(float) != 0 ||
         offs / sizeof(float) + tail->ne[0] > (size_t) input->ne[0]) {
-        return false;
+        return ggml_cuda_conv_cat_refuse(cpy->name, 100 + 2);
     }
     for (int j = i + 1; j < cgraph->n_nodes && j <= i + 24; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
@@ -5460,20 +5469,20 @@ static bool ggml_cuda_try_conv_state_defer(ggml_backend_cuda_context * cuda_ctx,
             const int64_t n_t = n->ne[1];
             if (w == nullptr || w->ne[0] != tail->ne[0] + 1 || n->ne[0] != input->ne[1] || n->ne[2] != input->ne[2] || n_t > 32 ||
                 input->nb[1] != input->ne[0] * (int64_t) sizeof(float) || input->ne[1] % 128 != 0) {
-                return false;
+                return ggml_cuda_conv_cat_refuse(cpy->name, 100 + 3);
             }
             // the LFM2 short conv * c fusion does not take the copies; the outputs the kernel may write must not overlap the input
             if (j + 1 < cgraph->n_nodes && cgraph->nodes[j + 1]->op == GGML_OP_MUL) {
-                return false;
+                return ggml_cuda_conv_cat_refuse(cpy->name, 100 + 4);
             }
             for (int k = j; k < cgraph->n_nodes && k <= j + 2; ++k) {
                 if (ggml_cuda_ranges_overlap(cgraph->nodes[k], input) || ggml_cuda_ranges_overlap(cgraph->nodes[k], dst)) {
-                    return false;
+                    return ggml_cuda_conv_cat_refuse(cpy->name, 100 + 5);
                 }
             }
             auto & v = cuda_ctx->conv_state_pending[n];
             if (v.size() >= 4) {
-                return false;
+                return ggml_cuda_conv_cat_refuse(cpy->name, 100 + 6);
             }
             v.push_back(cpy);
             return true;
@@ -5481,16 +5490,16 @@ static bool ggml_cuda_try_conv_state_defer(ggml_backend_cuda_context * cuda_ctx,
         // a node between them: it must not read or write the copy's destination, nor write over the input
         if (ggml_cuda_ranges_overlap(n, dst) || ggml_cuda_ranges_overlap(n, input)) {
             if (!(n->op == GGML_OP_CPY && n->src[0] != nullptr && n->src[0]->view_src == input && !ggml_cuda_ranges_overlap(n, dst))) {
-                return false;
+                return ggml_cuda_conv_cat_refuse(cpy->name, 100 + 7);
             }
         }
         for (int k = 0; k < GGML_MAX_SRC; ++k) {
             if (ggml_cuda_ranges_overlap(n->src[k], dst)) {
-                return false;
+                return ggml_cuda_conv_cat_refuse(cpy->name, 100 + 8);
             }
         }
     }
-    return false;
+    return ggml_cuda_conv_cat_refuse(cpy->name, 100 + 9);
 }
 
 // k15-fn (GGML_CUDA_DISABLE_CONV_CAT_FUSION=1 off): the CONCAT (dim 0) of a short convolution's state columns and its transposed new
@@ -5498,15 +5507,6 @@ static bool ggml_cuda_try_conv_state_defer(ggml_backend_cuda_context * cuda_ctx,
 // the conv-state copies deferred to it read the same registers. Only when every reader of the concat is that convolution or a copy of a
 // view of it (a copy that is not deferred makes the concat run first, ggml_cuda_conv_cat_materialize), nothing that runs before the
 // convolution writes over either part, and the convolution's outputs do not overlap them
-// GGML_CUDA_FUSION_TRACE=1: why a conv-input concat was not elided (refusal point, concat name)
-static bool ggml_cuda_conv_cat_refuse(const char * name, int where) {
-    static const bool trace = ggml_cuda_env_flag("GGML_CUDA_FUSION_TRACE");
-    if (trace) {
-        GGML_LOG_INFO("conv cat elide: %s refused at %d\n", name, where);
-    }
-    return false;
-}
-
 static bool ggml_cuda_try_conv_cat_elide(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_CONV_CAT_FUSION");
     if (disabled || ggml_cuda_fusion_disabled() || cuda_ctx->curr_stream_no != 0) {
