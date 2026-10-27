@@ -1603,6 +1603,24 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
     if (force == 0) {
         return;
     }
+    // k15-pp: LLAMA_MTP_EXACT=1 promises the drafted text byte equal to the text without a draft, but these rules raise n_ubatch
+    // without a model drafter and keep the default beside one, and the prompt's numerics follow n_ubatch (Qwen3.6-35B-A3B UD-Q4_K_XL +
+    // MTP heads, --cpu-moe --moe-cache-mib 4000, strict: no draft at n_ubatch 4096 differed from the drafter at 512 from the second
+    // token on; the no-draft arm at 512 matched it and the all-device runs). In the exact mode n_ubatch stays the default with and
+    // without a draft (the layer-major groups below then read the prompt, as beside a draft). LLAMA_MOE_PREFILL_UB=N still forces N,
+    // LLAMA_MOE_PREFILL_UB_EXACT=1 keeps the rules
+    if (force < 0) {
+        static const bool exact_keep = [] {
+            const char * x = getenv("LLAMA_MTP_EXACT");
+            const char * k = getenv("LLAMA_MOE_PREFILL_UB_EXACT");
+            return !(x != nullptr && atoi(x) != 0) || (k != nullptr && atoi(k) != 0);
+        }();
+        if (!exact_keep) {
+            COM_INF("MoE cache: n_ubatch stays %u with LLAMA_MTP_EXACT=1, with or without a draft (LLAMA_MOE_PREFILL_UB_EXACT=1 keeps "
+                "the rules, LLAMA_MOE_PREFILL_UB=N forces N)\n", cparams.n_ubatch);
+            return;
+        }
+    }
     // k13-small: no larger n_ubatch beside the small-device placement (common_fit_small_device): its 256 MiB margin has no room for the
     // run-time buffers of a larger ubatch. G4 4 GB q3m without a draft: "every expert cached" took n_ubatch 2048 (compute 804 MiB) and the
     // first 2k prompt ran out of device memory (CUDA error). LLAMA_MOE_PREFILL_UB=N still forces N
