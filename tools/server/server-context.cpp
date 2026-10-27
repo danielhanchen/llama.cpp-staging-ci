@@ -391,9 +391,10 @@ struct server_slot {
         // are copied on a thread of the prompt cache into pooled buffers (the same buffers and copies as before, the originals go back
         // to the pool once copied, as the prompt's erase would have put them); the entry waits for it like a state save in flight.
         // G4 q4x 12 GB chat: the copies of 2 checkpoints (125.6 MiB) were ~20 ms of the request.
-        // integration head (coordinator 10-27, RSS-adding defaults are opt-in): opt-in (LLAMA_PCS_CKPT_COPY_ASYNC=1). On by default the
-        // T4 LFM2.5-24B-A2B multi-turn run (mt_local, k15r_cg13 per-switch split) ended +577 MiB RssAnon (3315 vs 2738 MiB), same text
-        static const bool copy_async = getenv("LLAMA_PCS_CKPT_COPY_ASYNC") != nullptr && atoi(getenv("LLAMA_PCS_CKPT_COPY_ASYNC")) != 0;
+        // k17: default on again (LLAMA_PCS_CKPT_COPY_ASYNC=0: off). Its +577 MiB end-of-run RssAnon (T4 LFM2.5 multi-turn) was the state
+        // pool: oversized pooled buffers held by small checkpoints and refills racing the originals (common_state_buf_pending_add,
+        // LLAMA_STATE_POOL_SMALL_FRESH, LLAMA_STATE_POOL_REL); with those the run ends below the copies in place
+        static const bool copy_async = getenv("LLAMA_PCS_CKPT_COPY_ASYNC") == nullptr || atoi(getenv("LLAMA_PCS_CKPT_COPY_ASYNC")) != 0;
         const bool ca = !mv && copy_async && at_request && ckpt_keep_max >= -1;
         prompt_cache.clone_async_next = ca;
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, (mv || ca) ? &prompt.checkpoints : nullptr, ckpt_keep_max);
@@ -1992,7 +1993,7 @@ private:
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
             {
                 // k15-idlewait: the idle checkpoint lend and the deferred drop are for a single slot only
-                static const bool lend_env  = getenv("LLAMA_PCS_IDLE_LEND") != nullptr && atoi(getenv("LLAMA_PCS_IDLE_LEND")) != 0;
+                static const bool lend_env  = getenv("LLAMA_PCS_IDLE_LEND") == nullptr || atoi(getenv("LLAMA_PCS_IDLE_LEND")) != 0;
                 static const bool defer_env = getenv("LLAMA_PCS_DROP_DEFER") == nullptr || atoi(getenv("LLAMA_PCS_DROP_DEFER")) != 0;
                 prompt_cache->drop_defer_ok = params_base.n_parallel == 1;
                 SRV_INF("prompt cache: idle checkpoint lend %s, deferred drop %s (n_parallel = %d)\n",
@@ -2108,9 +2109,10 @@ private:
                             (prompt_cache->limit_tokens > 0 && prompt_cache->n_tokens() + slot.prompt.tokens.size() > prompt_cache->limit_tokens)) {
                             continue;
                         }
-                        // integration head (coordinator 10-27): opt-in (LLAMA_PCS_IDLE_LEND=1). On by default it ended the local multi-turn run
-                        // (mt_local) with about +270 MiB host RSS on Qwen3.6 MTP and +370 to +560 MiB on LFM2.5 against the pre-idlewait head
-                        static const bool lend_env = getenv("LLAMA_PCS_IDLE_LEND") != nullptr && atoi(getenv("LLAMA_PCS_IDLE_LEND")) != 0;
+                        // k17: default on again (LLAMA_PCS_IDLE_LEND=0: off). With the state pool fixes (LLAMA_STATE_POOL_SMALL_FRESH / _REL /
+                        // _PENDING) the resident G4 multi-turn run ends below the merged opt-in defaults: Qwen3.6 MTP 3991 vs 4959 MiB, LFM2.5
+                        // 1903 vs 2707 MiB, same text and VmHWM (the lend itself: +206 MiB on Qwen3.6, 3991 vs 3785; G4 q4x 32 GB chat -2 ms)
+                        static const bool lend_env = getenv("LLAMA_PCS_IDLE_LEND") == nullptr || atoi(getenv("LLAMA_PCS_IDLE_LEND")) != 0;
                         slot.prompt_saved_idle_new = slot.prompt_save(*prompt_cache, -2, idle_save == 2, lend_env && params_base.n_parallel == 1);
                         if (slot.prompt_saved_idle_new) {
                             prompt_cache->update();
