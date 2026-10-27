@@ -3303,7 +3303,41 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+// integration head: an instantiation that fails (after a failed update, or of a newly captured graph) is not fatal. The graph and its
+// exec are dropped, this evaluation runs its nodes without a CUDA graph (eager, ggml_cuda_graph_evaluate_and_capture) and the next
+// evaluation captures it again. Seen once on a crowded B200: a 20 s stall, the update gave invalid argument, the exec destroy then
+// worked but cudaGraphInstantiate of the same graph also gave invalid argument and aborted. GGML_CUDA_GRAPH_EAGER_FALLBACK=0: abort as
+// before. GGML_CUDA_GRAPH_INSTANTIATE_FAULT=1 (debug): every instantiation after a failed update fails (with GGML_CUDA_GRAPH_UPDATE_FAULT)
+static bool ggml_cuda_graph_drop_failed_instance(ggml_cuda_graph * graph, cudaError_t inst, const char * where) {
+    static const bool eager_fallback = getenv("GGML_CUDA_GRAPH_EAGER_FALLBACK") == nullptr || atoi(getenv("GGML_CUDA_GRAPH_EAGER_FALLBACK")) != 0;
+    if (!eager_fallback) {
+        CUDA_CHECK(inst);
+    }
+    (void)cudaGetLastError();
+    // a sticky error (an earlier kernel fault) would fail everything after it: the device must still synchronize cleanly, else abort
+    // as before (only a non-sticky error, e.g. a bad captured graph after a stall, is recovered from)
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaGetLastError());
+    if (graph->instance != nullptr) {
+        (void)cudaGraphExecDestroy(graph->instance);
+        (void)cudaGetLastError();
+        graph->instance = nullptr;
+    }
+    if (graph->graph != nullptr) {
+        (void)cudaGraphDestroy(graph->graph);
+        (void)cudaGetLastError();
+        graph->graph = nullptr;
+    }
+    static int n_logged = 0;
+    if (n_logged++ < 4) {
+        GGML_LOG_WARN("%s: instantiating the CUDA graph %s gave %s: this evaluation runs without the graph, it is captured again at the next one "
+            "(GGML_CUDA_GRAPH_EAGER_FALLBACK=0: abort)\n", __func__, where, cudaGetErrorString(inst));
+    }
+    return false;
+}
+
+// returns false when the exec could not be instantiated again (see ggml_cuda_graph_drop_failed_instance): the caller runs eagerly
+static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     // GGML_CUDA_GRAPH_UPDATE_DEBUG=1 (debug): the error pending before the update and whether the exec handle is still valid, logged
@@ -3390,13 +3424,20 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             inst = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
         }
-        CUDA_CHECK(inst);
+        static const bool inst_fault = ggml_cuda_env_flag("GGML_CUDA_GRAPH_INSTANTIATE_FAULT");
+        if (inst_fault && inst == cudaSuccess) {
+            inst = cudaErrorInvalidValue;
+        }
+        if (inst != cudaSuccess) {
+            return ggml_cuda_graph_drop_failed_instance(graph, inst, "after a failed update");
+        }
     } else {
         if (stat != cudaSuccess) {
             GGML_LOG_ERROR("%s: CUDA graph update failed with %s (%d)\n", __func__, cudaGetErrorString(stat), (int) stat);
         }
         GGML_ASSERT(stat == cudaSuccess);
     }
+    return true;
 }
 #endif // USE_CUDA_GRAPH
 
@@ -8648,11 +8689,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        bool graph_ok = true;
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            const cudaError_t inst = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+            if (inst != cudaSuccess) {
+                graph_ok = ggml_cuda_graph_drop_failed_instance(graph, inst, "after its capture");
+            }
         }
-        if (cuda_graph_update_required) { // Update graph executable
-            ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+        if (graph_ok && cuda_graph_update_required) { // Update graph executable
+            graph_ok = ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+        }
+        if (!graph_ok) {
+            // nothing of this evaluation ran (its nodes were only captured): run them now without the graph
+            ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, graph_key);
+            return;
         }
         // Launch graph
         {

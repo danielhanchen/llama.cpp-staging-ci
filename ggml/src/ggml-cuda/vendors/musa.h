@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #pragma once
 
 #include <musa_runtime.h>
@@ -52,6 +53,7 @@
 #define cudaDeviceGetAttribute musaDeviceGetAttribute
 #define cudaError_t musaError_t
 #define cudaErrorMemoryAllocation musaErrorMemoryAllocation
+#define cudaErrorInvalidValue musaErrorInvalidValue
 #define cudaErrorPeerAccessAlreadyEnabled musaErrorPeerAccessAlreadyEnabled
 #define cudaErrorPeerAccessNotEnabled musaErrorPeerAccessNotEnabled
 #define cudaEventCreate musaEventCreate
