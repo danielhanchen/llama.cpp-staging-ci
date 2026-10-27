@@ -78,6 +78,18 @@ static int64_t common_fit_moe_margin(int64_t m) {
     return m - m_default + std::min(keep, m_default);
 }
 
+// k17-small (LLAMA_FIT_MTP_PRICE, default 1): the fit prices an MTP drafter as it runs. Once the draft attaches, the target's graphs
+// also return the hidden state before the output norm (llama_set_embeddings_nextn), and the drafter's graphs return it for their
+// output rows. Both re-reserve larger compute buffers that the measures did not have: Kaggle T4 4 GB, Qwen3.6-35B-A3B UD-Q4_K_XL + MTP
+// at ctx 16384, the main context grew 474 -> 506 MiB and q3m 428 -> 466 MiB. g_fit_nextn = 1 while a fit for an MTP target measures
+// the main model; an MTP context's own measure always has it (see below). The drafter without a MoE cache of its own (its share too
+// small) also keeps one prefetch split in its compute, see sched_reserve. =0: the measures before k17-small
+static bool common_fit_mtp_price_on() {
+    const char * e = getenv("LLAMA_FIT_MTP_PRICE");
+    return e == nullptr || *e == '\0' || atoi(e) != 0;
+}
+static thread_local int g_fit_nextn = 0;
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
@@ -119,6 +131,16 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         llama_model_free(model);
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to create llama_context from model");
+    }
+
+    // k17-small: measure the graphs the context runs once an MTP draft is attached (unmasked for the target, masked for the drafter,
+    // as common_speculative sets them)
+    if (common_fit_mtp_price_on()) {
+        const bool is_mtp = cparams->ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+        if (is_mtp || g_fit_nextn == 1) {
+            llama_set_embeddings_nextn(ctx, true, /*masked =*/ is_mtp);
+            llama_sched_reserve_now(ctx);
+        }
     }
 
     const size_t nd = llama_model_n_devices(model);
@@ -259,6 +281,13 @@ static void common_params_fit_impl(
     const uint32_t n_streams  = cparams->kv_unified ? 1 : std::max<uint32_t>(1, cparams->n_seq_max);
     const bool     n_ctx_auto = cparams->n_ctx == 0;
 
+    // k17-small: the main model of a fit with an MTP context on its weights is measured as an MTP target (see g_fit_nextn)
+    struct nextn_scope {
+        int prev;
+        explicit nextn_scope(bool on) : prev(g_fit_nextn) { if (on) { g_fit_nextn = 1; } }
+        ~nextn_scope() { g_fit_nextn = prev; }
+    } nextn_guard(extra != nullptr && extra->shares_model && common_fit_mtp_price_on());
+
     dmds_t      dmds_extra;    // memory of the extra model, laid out on the devices of the main model
     std::string key_extra;     // context (and placement, see below) that memory was measured at
 
@@ -323,10 +352,14 @@ static void common_params_fit_impl(
                 __func__, cparams->n_ctx, follow ? ", in the placement of the main model" : "");
 
             dmds_t measured;
+            const int nextn_main = g_fit_nextn;
+            g_fit_nextn = 0; // the extra model is not the target
             try {
                 measured = common_get_device_memory_data_impl(
                     extra->path_model, &mp_x, &cp_x, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+                g_fit_nextn = nextn_main;
             } catch (const std::runtime_error & e) {
+                g_fit_nextn = nextn_main;
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
                 dmds_extra = dmds_t(devs.size() + 1);
