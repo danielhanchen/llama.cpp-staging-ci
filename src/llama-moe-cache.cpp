@@ -2117,13 +2117,14 @@ struct llama_moe_cache::impl {
         return e == nullptr || atoi(e) != 0;
     }();
 
-    // k17-models LLAMA_MOE_SINGLE_MAX_TOKENS (1..GGML_MOE_MAILBOX_MAX_TOKENS, default 8; 4 = k15): the largest batch that publishes to the
-    // mailbox. Above it a batch takes the graph split per MoE layer (device sync, host threads, the CUDA graph cut), which made an 8-row
-    // verify window of the default n-gram drafts cost 6.2x a plain round against 2.5x for 4 rows (G4 LFM2.5 8 GB, plans/k15_models.md
-    // round 9). The host plans are the split's ops on the same rows, so the rows are the split's (exact)
+    // k17-models LLAMA_MOE_SINGLE_MAX_TOKENS (1..GGML_MOE_MAILBOX_MAX_TOKENS, default 4 = k15; 8 = opt-in): the largest batch that
+    // publishes to the mailbox. Above it a batch takes the graph split per MoE layer (device sync, host threads, the CUDA graph cut). The
+    // host plans are the split's ops on the same rows, so 5-8 row batches on the mailbox are exact (cloud gate, plans/k17_models.md 4a:
+    // md5 equal, 4.7x the host batches). Opt-in because it does not pay: Colab L4 (6 host threads) LFM2.5 8 GB with the same drafts in
+    // both arms, 2k 84.9 vs 90.2 tok/s, 8k (LONG_CM=3) 74.5 vs 78.1; G4 Flint long48 within 1% (plans/k17_models.md 4c / 4d)
     const int single_max_tok = [] {
         const char * e = getenv("LLAMA_MOE_SINGLE_MAX_TOKENS");
-        return std::max(1, std::min<int>(GGML_MOE_MAILBOX_MAX_TOKENS, e != nullptr ? atoi(e) : GGML_MOE_MAILBOX_MAX_TOKENS));
+        return std::max(1, std::min<int>(GGML_MOE_MAILBOX_MAX_TOKENS, e != nullptr ? atoi(e) : 4));
     }();
 
     bool single_usable(int64_t n_tokens) const {

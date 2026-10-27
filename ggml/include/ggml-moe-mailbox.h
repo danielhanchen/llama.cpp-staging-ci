@@ -8,7 +8,7 @@
 #include <stdint.h>
 
 // k17-models: capacity 8 (was 4), so an 8-row verify window (7 n-gram drafts) takes the mailbox instead of a graph split per layer;
-// llama_moe_cache limits the batches it publishes at run time (LLAMA_MOE_SINGLE_MAX_TOKENS, default 8; 4 = the previous behaviour)
+// llama_moe_cache limits the batches it publishes at run time (LLAMA_MOE_SINGLE_MAX_TOKENS, default 4 = the previous behaviour; 8 opt-in)
 #define GGML_MOE_MAILBOX_MAX_TOKENS 8
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
