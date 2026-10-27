@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -194,6 +195,101 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.name             =*/ "fused DeepSeek V4 HC post",
     /*.n_tokens_per_seq =*/ 1,
 };
+
+// k16 dense host pin: the weights of the layers that --fit / -ngl leave in system memory sit in a memory-mapped (pageable) buffer, so the
+// scheduler's copies of them for the prompt ops it offloads to the GPU go through the driver's staging buffer and block the host
+// (cudaMemcpyAsync from pageable memory): L4, dense Qwen3.6-27B UD-Q4_K_XL at 12 GB (32 of 65 layers on the GPU), 8.7 GB of CPU layers
+// per 512-token ubatch at ~3.5 GB/s, 207 prompt tok/s at 2k-16k (16k TTFT 80 s). Page-locking those buffers (read-only, not mapped into the
+// device address space, so no VRAM is spent on page tables) lets the copies run as DMA at the link's speed and overlap the compute (prefetch depth 2).
+// Once per model, only for buffers of layer weights ("blk." tensors other than routed experts, which a MoE cache maps itself), only with
+// op offload, and only while the pinned total stays within min(LLAMA_DENSE_HOST_PIN_MAX_FRAC (0.5) x MemTotal - memory pinned already,
+// MemAvailable - max(2 GiB, 1/16)): registering a mapped file faults in and locks its pages. The same bytes are copied, so the outputs
+// are bit-identical. Off by default (see below): LLAMA_DENSE_HOST_PIN=1 enables.
+static void llama_dense_host_pin(const llama_model & model) {
+    using host_pin_range_t    = void * (*)(void *, size_t);
+    using host_unpin_t        = void (*)(void *);
+    using host_mapped_bytes_t = size_t (*)(void);
+    // opt-in (LLAMA_DENSE_HOST_PIN=1): the driver keeps GPU page tables for registered host memory, ~2 MiB of VRAM per GiB page-locked
+    // whatever the flags (Default / Portable / Portable | Mapped, 4 KiB or 2 MiB host pages: exclusive B200, 8 GiB -> +16 MiB, 2 GiB ->
+    // +4 MiB, nothing charged to the process; G4 / L4 / T4 dense Qwen3.6-27B 12 GB: +18 MiB for 8.7 GiB), outside any buffer of ours
+    if (const char * e = getenv("LLAMA_DENSE_HOST_PIN"); e == nullptr || atoi(e) == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(model.host_pin_mutex);
+    if (model.host_pin_done) {
+        return;
+    }
+    model.host_pin_done = true;
+    ggml_backend_reg_t reg = nullptr;
+    for (const auto & d : model.devices) {
+        if (d.is_meta || d.dev == nullptr || ggml_backend_dev_type(d.dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        ggml_backend_reg_t r = ggml_backend_dev_backend_reg(d.dev);
+        if (r != nullptr && ggml_backend_reg_get_proc_address(r, "ggml_backend_host_pin_range") != nullptr) {
+            reg = r;
+            break;
+        }
+    }
+    if (reg == nullptr) {
+        LLAMA_LOG_DEBUG("%s: dense host pin: no device that page-locks host memory\n", __func__);
+        return;
+    }
+    auto pin_range = (host_pin_range_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_pin_range");
+    auto unpin     = (host_unpin_t)        ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_unpin");
+    auto mapped_b  = (host_mapped_bytes_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_mapped_bytes");
+    if (unpin == nullptr) {
+        return;
+    }
+    std::vector<ggml_backend_buffer_t> bufs;
+    size_t n_tensors = 0;
+    for (const auto & [name, t] : model.tensors_by_name) {
+        if (t == nullptr || t->buffer == nullptr || name.rfind("blk.", 0) != 0 || name.find("_exps") != std::string::npos) {
+            continue;
+        }
+        if (strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer)), "CPU_Mapped") != 0) {
+            continue;
+        }
+        n_tensors++;
+        if (std::find(bufs.begin(), bufs.end(), t->buffer) == bufs.end()) {
+            bufs.push_back(t->buffer);
+        }
+    }
+    if (bufs.empty()) {
+        LLAMA_LOG_DEBUG("%s: dense host pin: no layer weights in memory-mapped system memory\n", __func__);
+        return;
+    }
+    double frac = 0.5;
+    if (const char * e = getenv("LLAMA_DENSE_HOST_PIN_MAX_FRAC")) {
+        frac = std::max(0.0, std::min(0.95, atof(e)));
+    }
+    const uint64_t total  = llama_sysmem::total();
+    const uint64_t avail  = llama_sysmem::available();
+    const uint64_t pinned = mapped_b != nullptr ? mapped_b() : 0;
+    size_t need = 0;
+    for (ggml_backend_buffer_t b : bufs) {
+        need += ggml_backend_buffer_get_size(b);
+    }
+    const uint64_t margin = std::max<uint64_t>(UINT64_C(2) << 30, need/16);
+    if ((total > 0 && (double) (need + pinned) > frac*(double) total) || (avail > 0 && need + margin > avail)) {
+        LLAMA_LOG_INFO("%s: dense host pin: %.0f MiB of memory-mapped layer weights in system memory, more than the budget (%.0f MiB total, "
+            "%.0f MiB available, %.0f MiB pinned already): left pageable (LLAMA_DENSE_HOST_PIN_MAX_FRAC)\n", __func__, need/1048576.0,
+            total/1048576.0, avail/1048576.0, pinned/1048576.0);
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    size_t done = 0;
+    for (ggml_backend_buffer_t b : bufs) {
+        void * key = pin_range(ggml_backend_buffer_get_base(b), ggml_backend_buffer_get_size(b));
+        if (key != nullptr) {
+            model.host_pins.emplace_back(unpin, key);
+            done += ggml_backend_buffer_get_size(b);
+        }
+    }
+    LLAMA_LOG_INFO("%s: dense host pin: %.0f of %.0f MiB of memory-mapped layer weights in system memory (%zu tensors, %zu buffers) "
+        "page-locked for the copies of offloaded prompt ops in %.1f ms (LLAMA_DENSE_HOST_PIN=1)\n", __func__, done/1048576.0,
+        need/1048576.0, n_tensors, bufs.size(), (ggml_time_us() - t0)/1000.0);
+}
 
 llama_context::llama_context(
         const llama_model & model,
@@ -735,6 +831,9 @@ llama_context::llama_context(
             }
         } else if (moe_cache_budget > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, moe_cache_budget, moe_cache_set, wstore.get(), cparams.moe_host_cache_mib);
+        }
+        if (!moe_cache && !wstore && cparams.op_offload && !model.hparams.no_alloc) {
+            llama_dense_host_pin(model);
         }
         if (lm_enabled && !moe_cache) {
             // nothing on the host is cached: no layer-major prompts, and the scheduler keeps its usual size
@@ -5024,6 +5123,27 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     // leave the prefetch headroom free: a larger graph is split in two (and again), else its allocation would drop the prefetch for good
     // (gpt-oss-20b MXFP4, G4 8 GB tier: 16 ubatches of 512 grew the compute buffer 455 -> 1164 MiB)
     static const size_t lm_grow_max = (size_t) (getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB"))) : 1024) << 20;
+    // k16: after a group whose cache banks were released (lm_released) the compute buffers are freed back to what the next graph needs
+    // (ggml_backend_sched_free_device_buffers), so the next group's growth is measured from that small buffer, not from the one the
+    // previous group ran with: G4, Qwen3.8-Flash-Next UD-IQ4_XS 12 GB, Studio argv (-ub 2048, cache 4.65% of the host experts), the 8k
+    // prompt grew 2520 -> 3285 MiB (765 MiB, ran as one group), the 16k prompt after it the same graph from 1544 MiB (1673 MiB > the cap,
+    // with 4633 MiB free): split down to single ubatches with the banks released, then lm_refused_min = 2 turned layer-major off for every
+    // later prompt (16k 1818 tok/s against 1935 without groups, 4313 at 8k). With the banks released the cap also allows the growth back
+    // up to the largest buffer a merged graph ran with (still within the free memory less the prefetch headroom, checked by the
+    // scheduler). LLAMA_MOE_LAYER_MAJOR_REGROW=0 off
+    static const bool lm_regrow = getenv("LLAMA_MOE_LAYER_MAJOR_REGROW") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_REGROW")) != 0;
+    auto grow_limit = [&]() -> size_t {
+        size_t back = 0;
+        if (lm_regrow && lm_released) {
+            for (size_t i = 0; i < backend_ptrs.size() && i < lm_merged_peak.size(); ++i) {
+                const size_t cur = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+                if (lm_merged_peak[i] > cur) {
+                    back = std::max(back, lm_merged_peak[i] - cur);
+                }
+            }
+        }
+        return lm_grow_max + back;
+    };
     int n_sub = 0;
     size_t n_done = 0; // the members computed (in order): a fallback must not compute them again (recurrent states would advance twice)
     bool first_run = true;
@@ -5062,7 +5182,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             srcs.emplace_back(node, arr);
         }
         lm_merged_active = true;
-        ggml_backend_sched_set_alloc_limit(sched.get(), true, lm_grow_max);
+        ggml_backend_sched_set_alloc_limit(sched.get(), true, grow_limit());
         // k11 (LLAMA_MOE_LM_LEND=0 off): a merged graph whose compute buffers would grow past the free memory borrows its allocation from the
         // MoE cache (slots lent for the group and refilled after it, as its staging copies are) instead of being split; the merged graph
         // runs the same ubatches, only where its tensors live changes
@@ -5103,7 +5223,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             }
             ggml_backend_sched_reset(sched.get());
             ggml_backend_sched_use_full_hash(sched.get());
-            ggml_backend_sched_set_alloc_limit(sched.get(), true, lm_grow_max);
+            ggml_backend_sched_set_alloc_limit(sched.get(), true, grow_limit());
             st = run(g);
         }
         if (st == GGML_STATUS_ALLOC_FAILED && lend_ok && !lend_g && ggml_backend_sched_get_alloc_over(sched.get()) > 0) {
@@ -5114,7 +5234,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             }
             ggml_backend_sched_reset(sched.get());
             ggml_backend_sched_use_full_hash(sched.get());
-            ggml_backend_sched_set_alloc_limit(sched.get(), true, lm_grow_max);
+            ggml_backend_sched_set_alloc_limit(sched.get(), true, grow_limit());
             lend_g = true;
             moe_cache->set_graph_lend(true);
             ggml_backend_sched_set_alloc_lend_graph(sched.get(), true);
@@ -5131,7 +5251,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 }
                 ggml_backend_sched_reset(sched.get());
                 ggml_backend_sched_use_full_hash(sched.get());
-                ggml_backend_sched_set_alloc_limit(sched.get(), true, lm_grow_max);
+                ggml_backend_sched_set_alloc_limit(sched.get(), true, grow_limit());
                 st = run(g);
             }
         }
@@ -5140,6 +5260,17 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         if (st != GGML_STATUS_ALLOC_FAILED) {
             n_sub++;
             if (st == GGML_STATUS_SUCCESS) {
+                lm_merged_peak.resize(backend_ptrs.size(), 0);
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    lm_merged_peak[i] = std::max(lm_merged_peak[i], ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]));
+                }
+                // k16 (k15-pp): a merged graph of b - a ubatches ran, so a refusal recorded at that size or below is stale (measured from a
+                // smaller buffer, at another position or before the banks were given back): later groups measure again from b - a + 1 up.
+                // LLAMA_MOE_LAYER_MAJOR_REFUSED_RESET=0 keeps the refusal for the process
+                static const bool lm_refused_reset = getenv("LLAMA_MOE_LAYER_MAJOR_REFUSED_RESET") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_REFUSED_RESET")) != 0;
+                if (lm_refused_reset && lm_refused_min <= b - a) {
+                    lm_refused_min = b - a + 1;
+                }
                 n_done = b;
                 extract_upto(n_done);
                 for (int c = 0; cap_in_graph && c < cap_max; ++c) {
@@ -5167,7 +5298,11 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             return GGML_STATUS_ALLOC_FAILED; // out of memory: the members not computed yet one by one, unseeded (below)
         }
         lm_n_split++;
-        lm_refused_min = std::min(lm_refused_min, b - a);
+        // k16: a refusal measured while the cache banks were released (lm_released: the compute buffers were freed back first) does not
+        // turn layer-major off for the process: it keeps lm_refused_min at LLAMA_MOE_LAYER_MAJOR_RELEASED_MIN (4) ubatches or more, so a
+        // later prompt still tries groups of 3 (k15-pp: one growth measured from a shrunk buffer must not cost every later prompt)
+        static const size_t lm_rel_min = getenv("LLAMA_MOE_LAYER_MAJOR_RELEASED_MIN") ? (size_t) std::max(0, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_RELEASED_MIN"))) : 4;
+        lm_refused_min = std::min(lm_refused_min, (lm_regrow && lm_released) ? std::max(lm_rel_min, b - a) : b - a);
         if (lm_verbose) {
             size_t free_min = SIZE_MAX;
             for (auto & bk : backend_ptrs) {

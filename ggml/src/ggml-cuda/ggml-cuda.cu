@@ -8072,6 +8072,35 @@ static void * ggml_cuda_host_map_range(int device, void * ptr, size_t size, void
     return ptr;
 }
 
+// k16: page-locks [ptr, ptr + size) (page-aligned outward) for DMA copies only: read-only and NOT mapped into the device address space, so
+// the device keeps no page tables for it (the mapped registration of ggml_cuda_host_map_range cost 10-18 MiB of VRAM for 7-9 GiB).
+// Returns the key to release with ggml_backend_cuda_host_unpin, nullptr if the host or the driver refuses (e.g. no read-only registration)
+static void * ggml_backend_cuda_host_pin_range(void * ptr, size_t size) {
+    if (ptr == nullptr || size == 0) {
+        return nullptr;
+    }
+#if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
+    const uintptr_t page = 4096;
+    const uintptr_t b = (uintptr_t) ptr & ~(page - 1);
+    const uintptr_t e = ((uintptr_t) ptr + size + page - 1) & ~(page - 1);
+    if (cudaHostRegister((void *) b, e - b, cudaHostRegisterPortable | cudaHostRegisterReadOnly) != cudaSuccess) {
+        (void)cudaGetLastError();
+        GGML_LOG_WARN("%s: could not page-lock %.2f MiB of host memory read-only: copies from it stay pageable\n", __func__, (e - b)/1024.0/1024.0);
+        return nullptr;
+    }
+    return (void *) b;
+#else
+    GGML_UNUSED(size);
+    return nullptr;
+#endif
+}
+
+static void ggml_backend_cuda_host_unpin(void * key) {
+    if (key != nullptr && cudaHostUnregister(key) != cudaSuccess) {
+        (void)cudaGetLastError();
+    }
+}
+
 // bytes of host memory registered by ggml_backend_cuda_host_map and ggml_backend_cuda_host_map_range (all devices)
 static size_t ggml_backend_cuda_host_mapped_bytes(void) {
     std::lock_guard<std::mutex> lock(ggml_cuda_host_mappings_mutex());
@@ -9241,6 +9270,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_set_tensors_batch_async") == 0) {
         return (void *)ggml_backend_cuda_set_tensors_batch_async;
+    }
+    if (strcmp(name, "ggml_backend_host_pin_range") == 0) {
+        return (void *)ggml_backend_cuda_host_pin_range;
+    }
+    if (strcmp(name, "ggml_backend_host_unpin") == 0) {
+        return (void *)ggml_backend_cuda_host_unpin;
     }
     if (strcmp(name, "ggml_backend_host_mapped_bytes") == 0) {
         return (void *)ggml_backend_cuda_host_mapped_bytes;

@@ -9,6 +9,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -880,6 +881,12 @@ struct llama_model {
         size_t offs = 0;
     };
     std::unordered_map<const ggml_tensor *, lazy_file> lazy_files;
+
+    // k16 dense host pin (llama_context::dense_host_pin): mappings of the memory-mapped buffers that hold the weights of layers left in
+    // system memory, registered once per model for the copies of offloaded prompt ops; released in ~llama_model, before the buffers
+    mutable std::mutex host_pin_mutex;
+    mutable bool       host_pin_done = false;
+    mutable std::vector<std::pair<void (*)(void *), void *>> host_pins;
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;

@@ -1454,7 +1454,15 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         // k10: not where the MoE cache's default hybrid gate will run (it holds at most LLAMA_MOE_CACHE_HYBRID_MAX_FRAC of the host experts):
         // that path refuses every layer-major group, so the raise only changed the batches (local B200, Qwen3.6 UD-Q4_K_XL + MTP, 1500 MiB
         // cache, -ub 2048: 8k text differs from k9 with no group run)
-        if (lm != 1 && common_moe_hybrid_gate_on(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
+        // k16: except below LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC (0.05) of the host experts, where llama_context runs the groups beside the
+        // gate (k13-small, lm_hybrid_frac_ok) but this early return kept n_batch at one ubatch, so no group formed: G4, Qwen3.8-Flash-Next
+        // UD-IQ4_XS 12 GB with Studio's -ub 2048 (cache 2642 of 56762 MiB, 4.7%), 8k / 16k / 30k prompt 1917 / 1934 / 1896 tok/s against
+        // 4396 / 4460 at 16 GB (groups) and Strata 3345 / 4261 / 4129. LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB_HYBRID=0 restores the early return
+        static const bool xh_on = getenv("LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB_HYBRID") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB_HYBRID")) != 0;
+        static const double lm_hyb_frac = getenv("LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC") ? std::max(0.0, atof(getenv("LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC"))) : 0.05;
+        const double host_x = xh_on ? common_moe_host_expert_bytes(params.model.path, mparams.tensor_buft_overrides, mparams.n_gpu_layers) : 0.0;
+        const bool lm_beside_gate = xh_on && host_x > 0.0 && (double) params.moe_cache_size < lm_hyb_frac*host_x;
+        if (lm != 1 && !lm_beside_gate && common_moe_hybrid_gate_on(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
             COM_INF("MoE cache: n_batch stays %u at the given n_ubatch %u (the cache holds a small share of the host experts: the hybrid gate, "
                 "no layer-major groups)\n", cparams.n_batch, cparams.n_ubatch);
             return;
