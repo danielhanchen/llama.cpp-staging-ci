@@ -8209,6 +8209,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (i + 1 < cgraph->n_nodes && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { op })) {
                         ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1], c->src[0]);
                         ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 2);
+                        cuda_ctx->q8_1_cache.commit(); // the q8_1 copy of the MUL output the fused kernel wrote, if any
                         i += 1;
                         continue;
                     }
