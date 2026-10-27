@@ -4743,8 +4743,20 @@ size_t common_state_buf_pool_bytes() {
     return t;
 }
 
+// k17 (LLAMA_STATE_POOL_SMALL_FRESH=0: off, any request takes the smallest pooled buffer that fits): a request below the pool's minimum
+// (1 MiB, the size it keeps) gets fresh memory, not a pooled buffer. Every pooled buffer is a state or a large checkpoint, so a small
+// checkpoint took one whole and kept it resident for as long as it lived: T4 LFM2.5 multi-turn, 6 checkpoints of 2.8 MiB held 308 MiB
+// in the slot and 1.4 MiB held 389 MiB in the cache entry. Faulting in a fresh buffer this small costs microseconds
+static bool ckpt_pool_small_fresh() {
+    static const bool on = getenv("LLAMA_STATE_POOL_SMALL_FRESH") == nullptr || atoi(getenv("LLAMA_STATE_POOL_SMALL_FRESH")) != 0;
+    return on;
+}
+
 bool common_state_buf_take(common_state_buf & buf, size_t n) {
     if (!ckpt_pool_on() || buf.capacity() >= n) {
+        return false;
+    }
+    if (n < (1u << 20) && ckpt_pool_small_fresh()) {
         return false;
     }
     std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
