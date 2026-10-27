@@ -360,7 +360,8 @@ struct server_slot {
     // k15-idlewait: that save moved the slot's checkpoints into the entry instead of copying them (they come back at the next request)
     bool ckpt_lent = false;
 
-    bool prompt_save(server_prompt_cache & prompt_cache, llama_pos ckpt_keep_max = -2, bool force_async = false, bool lend_ckpt = false) {
+    bool prompt_save(server_prompt_cache & prompt_cache, llama_pos ckpt_keep_max = -2, bool force_async = false, bool lend_ckpt = false,
+                     bool at_request = false) {
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -404,7 +405,16 @@ struct server_slot {
         // the entry (server_prompt_cache::wait_inflight). Larger states than LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB (512) are saved as before.
         static const bool async_on = getenv("LLAMA_PROMPT_SAVE_ASYNC") != nullptr && atoi(getenv("LLAMA_PROMPT_SAVE_ASYNC")) != 0;
         static const size_t async_max = (size_t) (getenv("LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB") ? std::max(0, atoi(getenv("LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB"))) : 512) << 20;
-        const llama_state_seq_flags fl = (async_on || force_async) && cur_size <= async_max ? LLAMA_STATE_SEQ_FLAGS_ASYNC : LLAMA_STATE_SEQ_FLAGS_NONE;
+        llama_state_seq_flags fl = (async_on || force_async) && cur_size <= async_max ? LLAMA_STATE_SEQ_FLAGS_ASYNC : LLAMA_STATE_SEQ_FLAGS_NONE;
+        // k15-idlewait (LLAMA_PCS_REQ_SAVE_ASYNC=0: synchronous, as before): a save made at the request (where no idle save ran: a spilled
+        // tier, a MoE cache) reads the state rows into the pinned staging buffers the context already holds (the checkpoint saves reserve
+        // them) and the state worker copies them into the entry while the prompt runs; the next memory op waits for the reads only. G4
+        // q4x 12 GB chat: the synchronous reads into the fresh entry (77 MiB, 82 calls with a sync each) were most of the 40 ms the request
+        // waited before its prompt. Only where the staging holds the save already (LLAMA_STATE_SEQ_FLAGS_ASYNC_NO_GROW): no new pinned memory
+        static const bool req_async = getenv("LLAMA_PCS_REQ_SAVE_ASYNC") == nullptr || atoi(getenv("LLAMA_PCS_REQ_SAVE_ASYNC")) != 0;
+        if (fl == LLAMA_STATE_SEQ_FLAGS_NONE && req_async && at_request && cur_size <= async_max) {
+            fl = LLAMA_STATE_SEQ_FLAGS_ASYNC | LLAMA_STATE_SEQ_FLAGS_ASYNC_NO_GROW;
+        }
 
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, fl);
         if (ctx_dft) {
@@ -2294,7 +2304,7 @@ private:
                     keep_max = (llama_pos) ret->prompt.tokens.get_common_prefix(task.tokens);
                 }
                 if (!ret->prompt_saved_idle) {
-                    ret->prompt_save(*prompt_cache, keep_max);
+                    ret->prompt_save(*prompt_cache, keep_max, false, false, true);
                 }
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {

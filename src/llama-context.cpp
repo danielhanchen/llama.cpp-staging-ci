@@ -7496,6 +7496,8 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         cap_save = -1;
         return n;
     }
+    const bool no_grow = (flags & LLAMA_STATE_SEQ_FLAGS_ASYNC_NO_GROW) != 0;
+    flags &= ~LLAMA_STATE_SEQ_FLAGS_ASYNC_NO_GROW;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ASYNC) {
         flags &= ~LLAMA_STATE_SEQ_FLAGS_ASYNC;
 
@@ -7510,7 +7512,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 
                 const size_t n = state_seq_write_data(io, seq_id, flags);
 
-                state_get_async(io.winfos);
+                state_get_async(io.winfos, no_grow);
 
                 return n;
             } catch (const std::exception & err) {
@@ -7960,7 +7962,7 @@ size_t llama_context::state_async_reserve(llama_state_seq_flags flags) {
 // backend (reused across saves); a worker thread waits on an event per backend and copies them to dst, so the host is
 // free to prepare the next ubatch meanwhile. Rows in host buffers, or on a device without async copies and events,
 // take the synchronous path instead.
-void llama_context::state_get_async(const std::vector<llama_state_write_info> & winfos) {
+void llama_context::state_get_async(const std::vector<llama_state_write_info> & winfos, bool no_grow) {
     // the previous save may still be reading the staging buffers
     state_async_wait();
 
@@ -8006,6 +8008,10 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
         auto & sa = state_async[b];
         if (need[b] == 0 || (sa.staging && ggml_backend_buffer_get_size(sa.staging.get()) >= need[b])) {
             continue;
+        }
+        if (no_grow) {   // LLAMA_STATE_SEQ_FLAGS_ASYNC_NO_GROW: no new pinned memory for this save, it is synchronous
+            ok = false;
+            break;
         }
 
         ggml_backend_buffer_ptr grown(ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(sa.dev), need[b]));

@@ -245,7 +245,7 @@ struct llama_context {
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
     // LLAMA_STATE_SEQ_FLAGS_ASYNC: queue the tensor reads of a state save without synchronizing (see state_get_async)
-    void state_get_async(const std::vector<llama_state_write_info> & winfos);
+    void state_get_async(const std::vector<llama_state_write_info> & winfos, bool no_grow = false);
 
     // wait until the last asynchronous state save has reached its destination
     void state_async_wait();

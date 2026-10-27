@@ -144,6 +144,9 @@ LLAMA_API bool llama_layer_major_on(const struct llama_context * ctx);
 // k15-pp: a batch of n_before + n_after prompt tokens of one sequence with a ubatch break (llama_set_ubatch_breaks) after n_before would
 // run the first ubatch after the break in the same layer-major group as the one before it
 LLAMA_API bool llama_layer_major_spans(const struct llama_context * ctx, int32_t n_before, int32_t n_after);
+// k15-idlewait: with LLAMA_STATE_SEQ_FLAGS_ASYNC, take the asynchronous path only where the pinned staging buffers already hold the
+// save (no new pinned memory); otherwise the save is synchronous
+#define LLAMA_STATE_SEQ_FLAGS_ASYNC_NO_GROW 16
 // k11: wait for the asynchronous state save in flight (LLAMA_STATE_SEQ_FLAGS_ASYNC), before its destination is read or freed
 LLAMA_API void llama_state_seq_async_wait(struct llama_context * ctx);
 
