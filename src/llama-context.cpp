@@ -2630,6 +2630,10 @@ void llama_context::set_verify_exact(bool value) {
     cparams.verify_exact = value;
 }
 
+bool llama_context::get_verify_exact() const {
+    return cparams.verify_exact;
+}
+
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
 
@@ -9911,6 +9915,23 @@ bool llama_layer_major_spans(const llama_context * ctx, int32_t n_before, int32_
 
 bool llama_exact_verify_enabled(void) {
     return llama_exact_verify_env();
+}
+
+// k17-strict: a verify ubatch of n tokens reads the MoE cache slots only while n * n_expert_used fits the slots of every cached group
+// (llama_moe_cache::n_tokens_cached, the condition of the device lookup and of the host slot map); a larger one takes neither and its
+// MUL_MAT_ID runs on the layer's host expert tensors on the CPU (batch invariant per row there, but CPU kernels, while the single
+// token decode it must equal runs on the device). T4 Colab, gpt-oss-20b MXFP4, --cpu-moe, strict env (LLAMA_MTP_EXACT=1,
+// LLAMA_MOE_CPU_MISS=0, LLAMA_MOE_CACHE_HYBRID=0): --moe-cache-mib 256 holds 17 slots = 4 tokens, the n-gram windows of 5-8 tokens ran
+// on the CPU and the greedy text followed the cache size. The server caps its draft windows at this many tokens (LLAMA_SPEC_EXACT_DEVICE_CAP=0: off)
+int32_t llama_verify_device_max_tokens(const llama_context * ctx) {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_SPEC_EXACT_DEVICE_CAP");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (!on || ctx == nullptr || ctx->get_moe_cache() == nullptr || !(llama_exact_verify_env() || ctx->get_verify_exact())) {
+        return -1;
+    }
+    return (int32_t) std::max<int64_t>(1, ctx->get_moe_cache()->n_tokens_cached());
 }
 
 bool llama_prepare_prompt_plan(llama_context * ctx) {

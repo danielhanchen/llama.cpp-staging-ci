@@ -197,6 +197,12 @@ LLAMA_API int32_t llama_arch_rollback_state(const char * arch_name);
 // invariant verify gives the bytes of single token decodes
 LLAMA_API bool llama_verify_exact_placement(const struct llama_context * ctx);
 
+// k17-strict: the most tokens a batch invariant verify ubatch may hold so that every MoE cache layer still reads its experts from the
+// device slots (n_tokens * n_expert_used <= slots, as a single token decode does); -1 when no cap applies (no MoE cache, verify
+// batches not computed batch invariant, or LLAMA_SPEC_EXACT_DEVICE_CAP=0). A larger window falls back to the layer's host expert
+// tensors and runs on the CPU, whose kernels are not those of the single token decode on the device (a numeric format change)
+LLAMA_API int32_t llama_verify_device_max_tokens(const struct llama_context * ctx);
+
 // k15-ttft: a prompt run as one ubatch instead of [n-4] [4] differs from the split run only by IEEE reassociation (plans/k11.md
 // "Equivalence rule"): every layer weight is computed on a CUDA device with no host-computed expert (llama_verify_exact_placement and
 // llama_moe_host_mode == 0), and no F16 matmul weight (cuBLAS accumulates F16 products in F16 above 16 rows, MMF in F32 below).

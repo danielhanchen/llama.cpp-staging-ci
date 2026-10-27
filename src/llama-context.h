@@ -183,6 +183,7 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_verify(bool value);
     void set_verify_exact(bool value);
+    bool get_verify_exact() const; // k17-strict
     bool restore_pp_plan(bool idle = false); // k11-decode (see the definition); idle: from llama_prepare_prompt_plan
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);

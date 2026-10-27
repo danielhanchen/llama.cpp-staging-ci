@@ -688,6 +688,19 @@ struct server_slot {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
         }
 
+        // k17-strict: batch invariant verify under a MoE cache: the window (the sampled token + the drafts) stays within the tokens
+        // whose experts the cache serves on the device, as the single token decodes it must equal (llama_verify_device_max_tokens);
+        // a larger window would run its experts on the CPU from host weights. LLAMA_SPEC_EXACT_DEVICE_CAP=0: off
+        if (const int32_t cap = llama_verify_device_max_tokens(ctx_tgt); cap > 0 && n_draft_max > cap - 1) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                SLT_INF(*this, "exact verify: draft windows capped at %d tokens, the most whose experts the MoE cache serves on the device "
+                    "(a larger window runs them on the CPU from host weights; LLAMA_SPEC_EXACT_DEVICE_CAP=0: off)\n", cap);
+            }
+            n_draft_max = cap - 1;
+        }
+
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
         return n_draft_max;
