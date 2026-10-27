@@ -5698,6 +5698,24 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // LLAMA_MOE_CACHE_STATS_REQ=1 (diagnostic, read-only): the cumulative lookup counters at each request begin, so the hit rate of one
+    // request's decode is the difference to the next line (or to the exit summary); the read waits for the device, between requests
+    void stats_request_snapshot() {
+        static const bool on = [] { const char * e = getenv("LLAMA_MOE_CACHE_STATS_REQ"); return e != nullptr && atoi(e) != 0; }();
+        if (!on) {
+            return;
+        }
+        static int n_req = 0;
+        uint64_t c[3] = { 0, 0, 0 };
+        if (device_lookup) {
+            cm_counters(c);
+        }
+        LLAMA_LOG_INFO("llama_moe_cache%s: stats at request %d: device hits = %llu, device misses = %llu, host computed = %llu, "
+            "small hits = %zu, small misses = %zu, large hits = %zu, large misses = %zu, tail skipped = %llu\n", tag, n_req++,
+            (unsigned long long) c[0], (unsigned long long) c[1], (unsigned long long) c[2], stats_small.hits, stats_small.misses,
+            stats_large.hits, stats_large.misses, (unsigned long long) (tail_rank > 0 ? tail_skipped() : 0));
+    }
+
     // the batch runs device lookups (and moves the counters)
     bool cm_counted(int64_t n_tokens) const {
         return n_tokens >= 1 && (n_tokens <= max_batch || cm_serves(n_tokens));
@@ -8496,6 +8514,7 @@ bool llama_moe_cache::pin_small_set(bool on) {
 }
 
 bool llama_moe_cache::request_begin() {
+    pimpl->stats_request_snapshot();
     return pimpl->cm_request_begin();
 }
 
