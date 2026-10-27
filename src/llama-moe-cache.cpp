@@ -4837,8 +4837,12 @@ struct llama_moe_cache::impl {
     bool short_live() const {
         return cm_short_max > 0 && cm_prompt_now && cm_prompt_all > max_batch && cm_prompt_all <= cm_short_max;
     }
+    // only where the small-batch timing trials were skipped (below LLAMA_MOE_CPU_MISS_TRIAL_FRAC of the host experts cached, 50% with the
+    // single-graph mailbox): where they run, their verdict already gates prompts (cm_prompt_ok). G4 k17g4a q4x 16 GB (61% cached, trials
+    // run): the rule without this gate took chat_s onto the host path at 358 vs 550 tok/s and the 2k decode after it fell 342 -> 306 tok/s;
+    // at 8 / 12 GB (trials skipped) chat +18% / +30%
     bool short_eligible(int64_t n_tokens) const {
-        return short_live() && cm && cm_cal && !cm_force && n_tokens > max_batch && n_tokens <= std::min(cm_max, cm_short_max) &&
+        return short_live() && cm_trials_skipped && cm && cm_cal && !cm_force && n_tokens > max_batch && n_tokens <= std::min(cm_max, cm_short_max) &&
             n_tokens > cm_prompt_force && cm_on[n_tokens] != 0 && cmt_host_ok && !cm_prompt_off();
     }
     bool cm_prompt_off() const {
