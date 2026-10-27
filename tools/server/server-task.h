@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_set>
 #include <list>
+#include <thread>
 #include <functional>
 #include <map>
 
@@ -697,7 +698,19 @@ struct server_prompt_cache {
     // k15-idlewait: the drop of an entry still being saved may be deferred (drop_newest); the server sets it for a single slot only
     bool                              drop_defer_ok = false;
 
+    // k15-idlewait (LLAMA_PCS_CKPT_COPY_ASYNC): the next alloc() copies the checkpoints the slot drops on clone_thread (set by
+    // server_slot::prompt_save at a request); wait_inflight / wait_clone join it
+    bool        clone_async_next = false;
+    std::thread clone_thread;
+    void wait_clone() {
+        if (clone_thread.joinable()) {
+            clone_thread.join();
+        }
+    }
+    ~server_prompt_cache() { wait_clone(); }
+
     void wait_inflight() {
+        wait_clone();
         if (inflight != nullptr && wait_reads) {
             wait_reads();
         }

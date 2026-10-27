@@ -353,7 +353,7 @@ struct server_slot {
     server_prompt prompt;
 
     // ckpt_keep_max >= -1 (k15-ttft): the caller knows the next prompt of this slot drops every checkpoint with pos_max above it, so
-    // those are moved into the cache entry instead of copied (default; LLAMA_PCS_MOVE_CKPT=0: copied as before)
+    // those are moved into the cache entry instead of copied (opt-in, LLAMA_PCS_MOVE_CKPT=1), or copied on a thread (at_request, default)
     // k15-ttft: the slot's prompt is in the prompt cache already, saved while the server was idle (LLAMA_PCS_IDLE_SAVE)
     bool prompt_saved_idle = false;
     bool prompt_saved_idle_new = false; // ... into a new entry (not one the cache held already)
@@ -384,12 +384,17 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        // k15-idlewait: on by default (LLAMA_PCS_MOVE_CKPT=0: copied). The +150..+1300 MiB end-of-run RSS of the first version came from
-        // the pool keeping the buffers the copies would have taken; the move now drops them from the pool (LLAMA_PCS_MOVE_POOL_DROP), so
-        // the pool ends where the copies leave it. G4 q4x 12 GB chat: the copies of 2 checkpoints (125.6 MiB) were ~20 ms of the request
-        static const bool move_ckpt = getenv("LLAMA_PCS_MOVE_CKPT") == nullptr || atoi(getenv("LLAMA_PCS_MOVE_CKPT")) != 0;
+        // opt-in (LLAMA_PCS_MOVE_CKPT=1): local q4x spilled multi-turn (mt_local, k15r36) ended +900 MiB RssAnon with the move on
+        static const bool move_ckpt = getenv("LLAMA_PCS_MOVE_CKPT") != nullptr && atoi(getenv("LLAMA_PCS_MOVE_CKPT")) != 0;
         const bool mv = move_ckpt && ckpt_keep_max >= -1;
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, mv ? &prompt.checkpoints : nullptr, ckpt_keep_max);
+        // k15-idlewait (LLAMA_PCS_CKPT_COPY_ASYNC=0: copied here, as before): at a request save the checkpoints the next prompt erases
+        // are copied on a thread of the prompt cache into pooled buffers (the same buffers and copies as before, the originals go back
+        // to the pool once copied, as the prompt's erase would have put them); the entry waits for it like a state save in flight.
+        // G4 q4x 12 GB chat: the copies of 2 checkpoints (125.6 MiB) were ~20 ms of the request
+        static const bool copy_async = getenv("LLAMA_PCS_CKPT_COPY_ASYNC") == nullptr || atoi(getenv("LLAMA_PCS_CKPT_COPY_ASYNC")) != 0;
+        const bool ca = !mv && copy_async && at_request && ckpt_keep_max >= -1;
+        prompt_cache.clone_async_next = ca;
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, (mv || ca) ? &prompt.checkpoints : nullptr, ckpt_keep_max);
         if (cur == nullptr) {
             return false;
         }

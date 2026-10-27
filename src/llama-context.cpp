@@ -8019,9 +8019,20 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
     // allocation, drained the queued ubatch and left the GPU idle for the whole cudaMallocHost of the new one.
     std::vector<ggml_backend_buffer_ptr> retired;
 
+    // k15-idlewait (LLAMA_STATE_ASYNC_PARTIAL=0: all synchronous then): with ASYNC_NO_GROW, a save larger than the staging the context
+    // holds reads the rows that fit there asynchronously and the rest synchronously into dst (G4 fn4 16 GB: the checkpoint staging
+    // holds the 112.6 MiB of recurrent rows, the save is 131.8 MiB with the KV rows)
+    static const bool partial_env = getenv("LLAMA_STATE_ASYNC_PARTIAL") == nullptr || atoi(getenv("LLAMA_STATE_ASYNC_PARTIAL")) != 0;
+    std::vector<uint8_t> partial(state_async.size(), 0);
+    std::vector<uint8_t> sync_row(winfos.size(), 0);
+
     for (size_t b = 0; ok && b < state_async.size(); ++b) {
         auto & sa = state_async[b];
         if (need[b] == 0 || (sa.staging && ggml_backend_buffer_get_size(sa.staging.get()) >= need[b])) {
+            continue;
+        }
+        if (no_grow && partial_env && sa.staging) {
+            partial[b] = 1;
             continue;
         }
         if (no_grow) {   // LLAMA_STATE_SEQ_FLAGS_ASYNC_NO_GROW: no new pinned memory for this save, it is synchronous
@@ -8048,6 +8059,30 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
             ggml_backend_tensor_get(w.tensor, w.dst, w.offset, w.size);
         }
         return;
+    }
+
+    // partial: the rows in order while they fit in the staging, the rest synchronous
+    size_t n_sync = 0;
+    for (size_t b = 0; b < state_async.size(); ++b) {
+        if (!partial[b]) {
+            continue;
+        }
+        const size_t cap_b = ggml_backend_buffer_get_size(state_async[b].staging.get());
+        size_t run = 0;
+        for (size_t i = 0; i < winfos.size(); ++i) {
+            if (owner[i] != (int) b) {
+                continue;
+            }
+            const size_t pad = GGML_PAD(winfos[i].size, 64);
+            if (run + pad <= cap_b) {
+                offs[i] = run;
+                run    += pad;
+            } else {
+                sync_row[i] = 1;
+                n_sync++;
+            }
+        }
+        need[b] = run;
     }
 
     struct copy_job {
@@ -8085,6 +8120,9 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
     }
 
     for (size_t i = 0; i < winfos.size(); ++i) {
+        if (sync_row[i]) {
+            continue;
+        }
         auto & sa = state_async[owner[i]];
         uint8_t * stage = (uint8_t *) ggml_backend_buffer_get_base(sa.staging.get()) + offs[i];
 
@@ -8104,6 +8142,25 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
                 ggml_backend_event_record(state_async[b].event, state_async[b].backend);
                 events.push_back(state_async[b].event);
             }
+        }
+    }
+
+    // partial: the rows past the staging, synchronously (their backend's stream first: the reads use another stream)
+    if (n_sync > 0) {
+        for (size_t b = 0; b < state_async.size(); ++b) {
+            if (partial[b]) {
+                ggml_backend_synchronize(state_async[b].backend);
+            }
+        }
+        for (size_t i = 0; i < winfos.size(); ++i) {
+            if (sync_row[i]) {
+                ggml_backend_tensor_get(winfos[i].tensor, winfos[i].dst, winfos[i].offset, winfos[i].size);
+            }
+        }
+        static int n_log = 0;
+        if (n_log++ < 4) {
+            LLAMA_LOG_INFO("%s: state save larger than the staging: %zu of %zu rows read synchronously (LLAMA_STATE_ASYNC_PARTIAL)\n",
+                __func__, n_sync, winfos.size());
         }
     }
 
