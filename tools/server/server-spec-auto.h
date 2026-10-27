@@ -68,7 +68,13 @@ static int server_spec_spill_long_prompt() {
 #ifndef SPEC_SPILL_MIN_MATCH_LONG_CM
 #define SPEC_SPILL_MIN_MATCH_LONG_CM 65
 #endif
-static int server_spec_spill_min_match_long(int32_t host_mode, int min_match) {
+// k17-models: Flint under the MoE cache (see server_spec_spill_flint): long prompts draft from repeats of SPEC_SPILL_FLINT_LONG_CM with the
+// CPU-miss rule (Flint's verify windows are not the LFM2.5 windows the 65 above was timed on). LLAMA_SPEC_SPILL_LONG_CM still overrides
+#ifndef SPEC_SPILL_FLINT_LONG_CM
+#define SPEC_SPILL_FLINT_LONG_CM 3
+#endif
+static bool server_spec_spill_flint_on();
+static int server_spec_spill_min_match_long(int32_t host_mode, int min_match, const std::string & arch = "") {
     const char * e = getenv("LLAMA_SPEC_SPILL_MIN_MATCH_LONG");
     if (e != nullptr) {
         return std::max(3, atoi(e));
@@ -80,6 +86,9 @@ static int server_spec_spill_min_match_long(int32_t host_mode, int min_match) {
         return SPEC_SPILL_MIN_MATCH_LONG_GATE;
     }
     const char * c = getenv("LLAMA_SPEC_SPILL_LONG_CM");
+    if (c == nullptr && arch == "flint" && server_spec_spill_flint_on()) {
+        return SPEC_SPILL_FLINT_LONG_CM;
+    }
     return c != nullptr ? std::max(3, atoi(c)) : SPEC_SPILL_MIN_MATCH_LONG_CM;
 }
 
@@ -164,12 +173,32 @@ static int server_spec_spill_cm_min_threads() {
     return e != nullptr ? std::max(0, atoi(e)) : 4;
 }
 
+// k17-models: Flint (arch flint) drafted nothing at any spilled tier (4-16 GB): mode 0 for every arch but LFM2.5 / gemma-4, while
+// PolyStrata drafts 60-140 of 256 tokens there and per forward pass we were as fast or faster (plans/k17_models.md section 1). Spill
+// mode SPEC_SPILL_FLINT_GATE with the hybrid gate, SPEC_SPILL_FLINT_CM with the CPU-miss rule, mode 0 below
+// LLAMA_SPEC_SPILL_CM_MIN_THREADS host threads (as LFM2.5). Changes text where it drafts (verify windows run as ordinary batches with the
+// host path), KLD-gated. LLAMA_SPEC_SPILL_FLINT=0: off (mode 0, the previous default)
+#ifndef SPEC_SPILL_FLINT_GATE
+#define SPEC_SPILL_FLINT_GATE 1
+#define SPEC_SPILL_FLINT_CM   1
+#endif
+static bool server_spec_spill_flint_on() {
+    const char * e = getenv("LLAMA_SPEC_SPILL_FLINT");
+    return e == nullptr || atoi(e) != 0;
+}
+
 static int server_spec_spill_mode(const std::string & arch, int32_t host_mode, int32_t n_threads = -1) {
     if (const char * e = getenv("LLAMA_SPEC_SPILL")) {
         return std::max(0, std::min(3, atoi(e)));
     }
     if (host_mode == 0) {
         return 0;
+    }
+    if (arch == "flint") {
+        if (!server_spec_spill_flint_on() || (host_mode != 1 && n_threads > 0 && n_threads < server_spec_spill_cm_min_threads())) {
+            return 0;
+        }
+        return host_mode == 1 ? SPEC_SPILL_FLINT_GATE : SPEC_SPILL_FLINT_CM;
     }
     // per (model, host path) after the KLD gate and the G4 timing (plans/k13_lfm.md section 10)
     if (arch == "lfm2moe") {

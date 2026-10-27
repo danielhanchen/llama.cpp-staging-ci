@@ -1662,7 +1662,8 @@ private:
             }
             // k15-spec: long prompts draft from shorter repeats (server_spec_spill_min_match_long)
             ns.long_prompt      = server_spec_spill_long_prompt();
-            ns.n_min_match_long = server_spec_spill_min_match_long(llama_moe_host_mode(ctx_tgt), ns.n_min_match);
+            ns.n_min_match_long = server_spec_spill_min_match_long(llama_moe_host_mode(ctx_tgt), ns.n_min_match,
+                server_spec_auto_arch(params_base.model.path));
             if (ns.n_min_match_long != ns.n_min_match) {
                 SRV_INF("n-gram drafting under the MoE cache: prompts of %d+ tokens draft from repeats of at least %d tokens "
                         "(KLD-gated default; LLAMA_SPEC_SPILL_MIN_MATCH_LONG=16 at 4 GB, LLAMA_SPEC_SPILL_LONG_CM=3 at 8 GB: off)\n", ns.long_prompt, ns.n_min_match_long);
