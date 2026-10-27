@@ -7995,11 +7995,20 @@ static bool ggml_cuda_side_mv_run(const ggml_tensor * node) {
 // 0.25 us more per kernel boundary in an nsys trace): Qwen3.6-35B-A3B 8k prompt -1.8% / -1.9% vs GGML_CUDA_DISABLE_SIDE_MATVEC=1,
 // and with CUDA graphs off decode -7%. The same branches inside a captured graph cost nothing. A prompt graph (a planned product
 // over more than GGML_CUDA_SIDE_MV_MAX_COLS columns) runs all of them on the main stream, as there is nothing to overlap.
-static bool ggml_cuda_side_mv_use(const std::unordered_map<const ggml_tensor *, const ggml_tensor *> & side_mv, const bool capturing) {
-    if (side_mv.empty() || !capturing) {
-        return false;
-    }
+// The plan is read only for the graph it was made for (or a view of it, which shares its node array), and a planned tensor is only
+// dereferenced once it is found among this graph's nodes: the plan outlives its graph (a scheduler that planned it and was freed, then
+// a ggml_backend_graph_compute without graph_optimize on another graph: test-backend-ops), so its pointers may be dangling.
+static bool ggml_cuda_side_mv_planned_for(const ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph) {
+    return !ctx->side_mv.empty() && ctx->side_mv_nodes != nullptr && cgraph->n_nodes > 0 &&
+           cgraph->nodes >= ctx->side_mv_nodes && cgraph->nodes + cgraph->n_nodes <= ctx->side_mv_nodes + ctx->side_mv_n_nodes;
+}
+
+static bool ggml_cuda_side_mv_use(const std::unordered_map<const ggml_tensor *, const ggml_tensor *> & side_mv,
+                                  const std::unordered_map<const ggml_tensor *, int> & idx) {
     for (const auto & [mv, reader] : side_mv) {
+        if (idx.count(mv) == 0) {
+            continue;   // not in this graph (a view of the planned one): not dereferenced
+        }
         if (mv->src[1]->ne[1] > GGML_CUDA_SIDE_MV_MAX_COLS) {
             return false;
         }
@@ -8239,11 +8248,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             // side-stream matrix-vector products of this graph (see ggml_cuda_side_mv_plan): node index -> join index
             std::unordered_map<int, int> side_mv_at;
             std::vector<std::pair<int, cudaEvent_t>> side_mv_pending; // join index, event
-            if (stream_ctx.concurrent_events.empty() && ggml_cuda_side_mv_use(cuda_ctx->side_mv, use_cuda_graph && cuda_graph_update_required)) {
-                std::unordered_map<const ggml_tensor *, int> idx;
+            std::unordered_map<const ggml_tensor *, int> idx;
+            if (stream_ctx.concurrent_events.empty() && use_cuda_graph && cuda_graph_update_required &&
+                    ggml_cuda_side_mv_planned_for(cuda_ctx, cgraph)) {
                 for (int i = 0; i < cgraph->n_nodes; ++i) {
                     idx[cgraph->nodes[i]] = i;
                 }
+            }
+            if (!idx.empty() && ggml_cuda_side_mv_use(cuda_ctx->side_mv, idx)) {
                 for (const auto & [mv, reader] : cuda_ctx->side_mv) {
                     const auto a = idx.find(mv);
                     const auto b = idx.find(reader);
@@ -9114,6 +9126,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     // the side-stream matrix-vector products of the previous graph do not apply to this one
     cuda_ctx->side_mv.clear();
+    cuda_ctx->side_mv_nodes   = cgraph->nodes;
+    cuda_ctx->side_mv_n_nodes = cgraph->n_nodes;
 
     if (!disable_fusion) {
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
