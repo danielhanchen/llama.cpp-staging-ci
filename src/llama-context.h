@@ -732,6 +732,7 @@ private:
     int64_t lm_copy_seq = 0;
     std::unordered_map<const ggml_tensor *, int64_t> lm_staged_seq; // expert tensor -> lm_copy_seq of its copy
     int64_t lm_n_async_wait_us = 0;
+    int64_t lm_n_seed_unstaged = 0; // k15-fn: expert copies outside staging memory a layer-major seed skipped (LLAMA_MOE_LM_SEED_STAGED_ONLY)
     int64_t lm_n_async = 0;
     void lm_seed_resolve(lm_seed_pending & p);
     // pre = true: before the copies of a split (only the layers whose staged copies the split may overwrite); false: after them

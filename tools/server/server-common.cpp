@@ -1588,10 +1588,15 @@ json format_response_rerank(
 std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n_top) {
     std::vector<llama_token_data> cur;
 
-    const auto * logits = llama_get_logits_ith(ctx, idx);
-    const llama_token * sampled_ids = llama_get_sampled_candidates_ith(ctx, idx);
+    // k15-fn: a row with backend sampled logits reads them with their candidate ids; any other row reads its raw logits over the
+    // whole vocabulary. The count used to come from the sampled buffer alone, which exists as soon as any sequence has a device
+    // chain (the server's device greedy chain on every slot), so a raw row of an n_probs request counted 0 logits: empty top_logprobs
+    const float * sampled_logits = llama_get_sampled_logits_ith(ctx, idx);
+    const auto * logits = sampled_logits != nullptr ? sampled_logits : llama_get_logits_ith(ctx, idx);
+    const llama_token * sampled_ids = sampled_logits != nullptr ? llama_get_sampled_candidates_ith(ctx, idx) : nullptr;
 
-    const int n_logits = llama_get_sampled_logits_count_ith(ctx, idx);
+    const int n_logits = sampled_logits != nullptr ? (int) llama_get_sampled_logits_count_ith(ctx, idx) :
+        logits != nullptr ? llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx))) : 0;
 
     cur.resize(n_logits);
     if (sampled_ids) {
