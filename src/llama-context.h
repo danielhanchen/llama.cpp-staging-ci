@@ -486,6 +486,18 @@ private:
     // the rows are predicted on the main thread before the ubatch before them is processed, the workers warm the
     // page cache meanwhile; set_input still computes the authoritative rows, so nothing here changes the results
     std::unique_ptr<llama_row_prefetcher> ple_prefetcher;
+    // k15-fn: the PLE table read-in after the load (LLAMA_PLE_RESIDENT), stopped and joined when the context goes (also from a
+    // constructor that throws later)
+    struct ple_res_runner {
+        std::thread       th;
+        std::atomic<bool> stop{false};
+        ~ple_res_runner() {
+            stop.store(true);
+            if (th.joinable()) {
+                th.join();
+            }
+        }
+    } ple_res;
 
 public:
     struct ple_state {

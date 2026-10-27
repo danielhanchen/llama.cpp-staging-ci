@@ -21,8 +21,12 @@
 #include "ggml-moe-prefetch.h"
 #include <cerrno>
 #include <mutex>
+#include <atomic>
 #if defined(__linux__)
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/resource.h>
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 #include "llama-ext.h"
@@ -1013,11 +1017,14 @@ llama_context::llama_context(
         ple.enabled = t && (ple_prefetcher || ple.verify);
     }
 
-    // k15-fn (LLAMA_PLE_RESIDENT: unset = auto, 0 = off, 1 = always): the lazy per-layer embedding table (Qwen3.8-Flash-Next: 28.8 GB,
-    // read a few rows per token through the mapping) is faulted in whole and locked when the host has room for it beside every other
-    // host weight plus 8 GiB (Strata v0.2.7's PLE auto-RAM rule): the rows of a prompt then cost no page faults, and the page cache
-    // cannot evict them. The same bytes through the same mapping, so exact. Once per model; Linux only (mlock may be refused by
-    // RLIMIT_MEMLOCK, the populate still holds until memory pressure)
+    // k15-fn (LLAMA_PLE_RESIDENT: unset = auto, 0 = off, 1 = always): the lazy per-layer embedding table (Qwen3.8-Flash-Next: 26.8 GiB,
+    // read a few rows per token through the mapping) is read in whole and locked when the host has room for it beside every other host
+    // weight plus 8 GiB (Strata v0.2.7's PLE auto-RAM rule): the rows of a prompt then cost no page faults (a cold disk: G4 fn4 8k TTFT
+    // 25.2 -> 2.0 s), and the page cache cannot evict them. The same bytes through the same mapping, so exact. Once per model, Linux only.
+    // The read runs in a background thread after the load (the server is ready at once; a row a prompt touches first is read by its own
+    // fault, the thread then finds it resident), with idle I/O priority and the readahead the lazy mapping's MADV_RANDOM switches off
+    // (POSIX_FADV_WILLNEED per chunk on the file, then MADV_POPULATE_READ). LLAMA_PLE_RESIDENT_SYNC=1: the read inside the load instead.
+    // Then RLIMIT_MEMLOCK is raised to its hard limit and the table locked; a refused lock keeps the populated pages (logged once)
     {
         const ggml_tensor * t = model.per_layer_tok_embd;
         static const int res_env = getenv("LLAMA_PLE_RESIDENT") ? atoi(getenv("LLAMA_PLE_RESIDENT")) : -1;
@@ -1039,29 +1046,75 @@ llama_context::llama_context(
 #if defined(__linux__)
                 const bool admit = res_env == 1 || (avail > 0 && avail >= need);
 #else
-                const bool admit = false; // the populate and the lock are Linux only
+                const bool admit = false; // the read-in and the lock are Linux only
 #endif
+                static const bool res_sync = getenv("LLAMA_PLE_RESIDENT_SYNC") != nullptr && atoi(getenv("LLAMA_PLE_RESIDENT_SYNC")) != 0;
                 LLAMA_LOG_INFO("%s: PLE table '%s' (%.1f GiB) %s in RAM: %.1f GiB available, %.1f GiB needed (table + %.1f GiB other host weights + "
-                    "8 GiB; LLAMA_PLE_RESIDENT=0 off, =1 always)\n", __func__, t->name, table/1073741824.0, admit ? "made resident" : "left lazy",
-                    avail/1073741824.0, need/1073741824.0, host/1073741824.0);
+                    "8 GiB; LLAMA_PLE_RESIDENT=0 off, =1 always)%s\n", __func__, t->name, table/1073741824.0, admit ? "made resident" : "left lazy",
+                    avail/1073741824.0, need/1073741824.0, host/1073741824.0, admit ? (res_sync ? ", read during the load" : ", read in the background") : "");
 #if defined(__linux__)
                 if (admit) {
-                    const int64_t t0 = ggml_time_us();
-                    const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
-                    uint8_t * a0 = (uint8_t *) ((uintptr_t) t->data & ~(uintptr_t) (pg - 1));
-                    const size_t len = (size_t) ((uint8_t *) t->data + table - a0);
-                    int pr = madvise(a0, len, 22 /* MADV_POPULATE_READ, Linux 5.14 */);
-                    if (pr != 0) {
-                        // older kernels: touch one byte per page
-                        volatile uint8_t sink = 0;
-                        for (size_t o = 0; o < len; o += pg) {
-                            sink ^= a0[o];
-                        }
-                        (void) sink;
+                    int    fd   = -1;
+                    size_t offs = 0;
+                    if (const auto it = model.lazy_files.find(t); it != model.lazy_files.end()) {
+                        fd   = it->second.fd;
+                        offs = it->second.offs;
                     }
-                    const int lr = mlock(a0, len);
-                    LLAMA_LOG_INFO("%s: PLE table resident in %.1f s (populate %s, mlock %s)\n", __func__, (ggml_time_us() - t0)/1e6,
-                        pr == 0 ? "ok" : "by touch", lr == 0 ? "ok" : strerror(errno));
+                    const std::string tname = t->name;
+                    std::atomic<bool> * stop = &ple_res.stop;
+                    auto work = [t, table, fd, offs, tname, stop](bool background) {
+                        const int64_t t0 = ggml_time_us();
+                        if (background) {
+                            // idle I/O class (a request's own reads go first) and the lowest CPU priority, this thread only
+                            (void) syscall(SYS_ioprio_set, 1 /* IOPRIO_WHO_PROCESS */, 0, (3 << 13) /* IOPRIO_CLASS_IDLE */);
+                            (void) setpriority(PRIO_PROCESS, (id_t) syscall(SYS_gettid), 19);
+                        }
+                        const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
+                        uint8_t * a0 = (uint8_t *) ((uintptr_t) t->data & ~(uintptr_t) (pg - 1));
+                        const size_t len = (size_t) ((uint8_t *) t->data + table - a0);
+                        const size_t lead = (size_t) ((uint8_t *) t->data - a0);
+                        const size_t chunk = 64ull << 20;
+                        bool pop_ok = true;
+                        size_t done = 0;
+                        for (size_t o = 0; o < len && !stop->load(std::memory_order_relaxed); o += chunk) {
+                            const size_t n = std::min(chunk, len - o);
+                            if (fd >= 0 && o + n > lead) {
+                                const size_t fo = offs + (o > lead ? o - lead : 0);
+                                (void) posix_fadvise(fd, (off_t) fo, (off_t) (n - (o < lead ? lead - o : 0)), POSIX_FADV_WILLNEED);
+                            }
+                            if (pop_ok && madvise(a0 + o, n, 22 /* MADV_POPULATE_READ, Linux 5.14 */) != 0) {
+                                pop_ok = false;
+                            }
+                            if (!pop_ok) {
+                                volatile uint8_t sink = 0;
+                                for (size_t q = 0; q < n; q += pg) {
+                                    sink ^= a0[o + q];
+                                }
+                                (void) sink;
+                            }
+                            done += n;
+                        }
+                        if (stop->load(std::memory_order_relaxed)) {
+                            LLAMA_LOG_INFO("%s: PLE table read-in stopped at %.1f of %.1f GiB (context freed)\n", __func__, done/1073741824.0, len/1073741824.0);
+                            return;
+                        }
+                        const double t_read = (ggml_time_us() - t0)/1e6;
+                        struct rlimit rl;
+                        if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < rl.rlim_max) {
+                            rl.rlim_cur = rl.rlim_max;
+                            (void) setrlimit(RLIMIT_MEMLOCK, &rl);
+                        }
+                        const int lr = mlock(a0, len);
+                        const int le = errno;
+                        LLAMA_LOG_INFO("%s: PLE table '%s' resident: %.1f GiB read in %.1f s%s (populate %s), %s%s\n", __func__, tname.c_str(),
+                            len/1073741824.0, t_read, background ? " in the background" : "", pop_ok ? "ok" : "by touch",
+                            lr == 0 ? "locked" : "not locked: ", lr == 0 ? "" : strerror(le));
+                    };
+                    if (res_sync) {
+                        work(false);
+                    } else {
+                        ple_res.th = std::thread(work, true);
+                    }
                 }
 #endif
             }
