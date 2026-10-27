@@ -1722,6 +1722,7 @@ struct ggml_backend_cuda_context {
         float lp_scale, lp_bias, lp_min, lp_max;     // live of a pool slot: clamp(scale * score + bias)
         float lt_scale, lt_bias, lt_min, lt_max;     // live of a tail slot: clamp(scale * float(cell) + bias)
         float d_scale, d_bias;                       // dump of slot s: scale * (s + 1) + bias
+        bool  no_alias;                              // the index output overlaps none of the inputs: a grid of blocks, no staging
     };
     std::unordered_map<const ggml_tensor *, qsa_sel_args> qsa_sel;
     std::unordered_set<const ggml_tensor *> qsa_sel_skip;

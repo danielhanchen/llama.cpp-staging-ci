@@ -6379,33 +6379,46 @@ static int ggml_cuda_try_fuse_qsa_idx(ggml_backend_cuda_context * cuda_ctx, ggml
 // _rn intrinsics of k_qsa_idx_select. The chain nodes are skipped (qsa_sel_skip) only when nothing outside the chain reads them and no
 // node that still runs before the index node writes over an input of the chain (the allocator may give memory the skipped readers
 // freed); the block stages its results, so its output may overlap its inputs
-static __global__ void k_qsa_sel_chain(const ggml_backend_cuda_context::qsa_sel_args a, int32_t * __restrict__ dst) {
-    extern __shared__ int32_t staged[];
+static __device__ __forceinline__ int32_t qsa_sel_elem(const ggml_backend_cuda_context::qsa_sel_args & a, const int i) {
     const int n_pool_sel = a.kpool*a.n_top;
     const int n_sel = n_pool_sel + a.n_tail;
-    const int n = n_sel*a.n_tok;
+    const int s = i % n_sel;
+    const int t = i / n_sel;
+    int32_t cell;
+    float   live;
+    if (s < n_pool_sel) {
+        const int32_t p = a.top_k[(int64_t) t*a.top_k_s1 + s / a.kpool];
+        cell = a.pools[(int64_t) p*a.pools_s1 + s % a.kpool];
+        const float sc = a.score[(int64_t) t*a.score_s1 + p];
+        live = fminf(fmaxf(a.lp_scale * sc + a.lp_bias, a.lp_min), a.lp_max);
+    } else {
+        cell = a.tail[(int64_t) t*a.tail_s1 + (s - n_pool_sel)];
+        live = fminf(fmaxf(a.lt_scale * ggml_cuda_cast<float>(cell) + a.lt_bias, a.lt_min), a.lt_max);
+    }
+    const float d = a.d_scale * (float) (s + 1) + a.d_bias;
+    const float f = ggml_cuda_cast<float>(cell);
+    const float r = __fadd_rn(__fmul_rn(__fsub_rn(f, d), live), d);
+    return ggml_cuda_cast<int32_t>(r);
+}
+
+static __global__ void k_qsa_sel_chain(const ggml_backend_cuda_context::qsa_sel_args a, int32_t * __restrict__ dst) {
+    extern __shared__ int32_t staged[];
+    const int n = (a.kpool*a.n_top + a.n_tail)*a.n_tok;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        const int s = i % n_sel;
-        const int t = i / n_sel;
-        int32_t cell;
-        float   live;
-        if (s < n_pool_sel) {
-            const int32_t p = a.top_k[(int64_t) t*a.top_k_s1 + s / a.kpool];
-            cell = a.pools[(int64_t) p*a.pools_s1 + s % a.kpool];
-            const float sc = a.score[(int64_t) t*a.score_s1 + p];
-            live = fminf(fmaxf(a.lp_scale * sc + a.lp_bias, a.lp_min), a.lp_max);
-        } else {
-            cell = a.tail[(int64_t) t*a.tail_s1 + (s - n_pool_sel)];
-            live = fminf(fmaxf(a.lt_scale * ggml_cuda_cast<float>(cell) + a.lt_bias, a.lt_min), a.lt_max);
-        }
-        const float d = a.d_scale * (float) (s + 1) + a.d_bias;
-        const float f = ggml_cuda_cast<float>(cell);
-        const float r = __fadd_rn(__fmul_rn(__fsub_rn(f, d), live), d);
-        staged[i] = ggml_cuda_cast<int32_t>(r);
+        staged[i] = qsa_sel_elem(a, i);
     }
     __syncthreads();
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         dst[i] = staged[i];
+    }
+}
+
+// k15-fn (GGML_CUDA_QSA_SEL_GRID=0: the staged single block always): the output overlaps no input (the keep-alive table keeps them
+// apart), so each thread writes its own element: one thread per element over a grid instead of one block looping over all of them
+static __global__ void k_qsa_sel_chain_grid(const ggml_backend_cuda_context::qsa_sel_args a, int32_t * __restrict__ dst, const int n) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = qsa_sel_elem(a, i);
     }
 }
 
@@ -6585,6 +6598,12 @@ static void ggml_cuda_qsa_sel_plan(ggml_backend_cuda_context * cuda_ctx, const g
         if (!ok) {
             continue;
         }
+        a.no_alias = c2->data != nullptr;
+        for (const ggml_tensor * in : inputs) {
+            if (in->data == nullptr || ggml_cuda_tensors_overlap(c2, in)) {
+                a.no_alias = false;
+            }
+        }
         cuda_ctx->qsa_sel[c2] = a;
         cuda_ctx->qsa_sel_skip.insert(chain.begin(), chain.end());
     }
@@ -6598,7 +6617,12 @@ static void ggml_cuda_qsa_sel_plan(ggml_backend_cuda_context * cuda_ctx, const g
 
 static void ggml_cuda_qsa_sel_launch(ggml_backend_cuda_context * cuda_ctx, const ggml_tensor * c2, const ggml_backend_cuda_context::qsa_sel_args & a) {
     const int n = (a.kpool*a.n_top + a.n_tail)*a.n_tok;
-    k_qsa_sel_chain<<<1, 256, n*sizeof(int32_t), cuda_ctx->stream()>>>(a, (int32_t *) c2->data);
+    static const bool grid = getenv("GGML_CUDA_QSA_SEL_GRID") == nullptr || atoi(getenv("GGML_CUDA_QSA_SEL_GRID")) != 0;
+    if (grid && a.no_alias) {
+        k_qsa_sel_chain_grid<<<(n + 127)/128, 128, 0, cuda_ctx->stream()>>>(a, (int32_t *) c2->data, n);
+    } else {
+        k_qsa_sel_chain<<<1, 256, n*sizeof(int32_t), cuda_ctx->stream()>>>(a, (int32_t *) c2->data);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
