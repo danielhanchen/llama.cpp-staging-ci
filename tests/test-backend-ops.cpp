@@ -8738,6 +8738,126 @@ struct test_hc_mix : public test_case {
     }
 };
 
+// k15-mm2: gated outputs read by a quantized mat-vec (their q8_1 copy written by the gated kernel): SWIGLU (split) -> Q product
+// over the same rows (padded q8_1 rows), and sigmoid(z) * x over [hd, heads, T] read as [hd*heads, T] (the Qwen3-Next style output gate)
+struct test_gated_q8_1 : public test_case {
+    const int mode;     // 0: swiglu split, 1: sigmoid * x reshaped, 2: silu * x
+    const int64_t n;    // row length of the gated op
+    const int64_t heads;
+    const int64_t n_tokens;
+    const ggml_type type;
+
+    ggml_tensor * gated = nullptr;
+    ggml_tensor * out   = nullptr;
+
+    std::string vars() override { return VARS_TO_STR5(mode, n, heads, n_tokens, type); }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "GATED_Q8_1"; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { gated, out }; }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_gated_q8_1(int mode, int64_t n, int64_t heads, int64_t n_tokens, ggml_type type = GGML_TYPE_Q8_0)
+        : mode(mode), n(n), heads(heads), n_tokens(n_tokens), type(type) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, heads, n_tokens);
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, heads, n_tokens);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        // non-leaf inputs, as in a model
+        a = ggml_scale(ctx, a, 0.5f);
+        b = ggml_scale(ctx, b, 2.0f);
+        if (mode == 0) {
+            gated = ggml_swiglu_split(ctx, a, b);
+        } else if (mode == 1) {
+            gated = ggml_mul(ctx, b, ggml_sigmoid(ctx, a));
+        } else {
+            gated = ggml_mul(ctx, ggml_silu(ctx, a), b);
+        }
+        ggml_set_name(gated, "gated");
+        ggml_tensor * flat = ggml_reshape_2d(ctx, gated, n*heads, n_tokens);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type, n*heads, 96);
+        out = ggml_mul_mat(ctx, w, flat);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// k15-mm2: one qwen4exp hyper-connection mix (build_hc_mix): grouped norm -> down (Q8_0) -> silu(scale) -> up (Q8_0) -> gated
+// DSV4_HC_PRE, and the F32 inject product over the normed streams (before or after the down projection), with a Q8_0 product
+// reading the mixed stream (its q8_1 copy). CUDA: the down + inject launch and the up + hc_pre launch.
+struct test_hc_block : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t lr;
+    const int64_t n_tokens;
+    const bool inject_first;
+    const bool exact;
+
+    ggml_tensor * mixed  = nullptr;
+    ggml_tensor * inject = nullptr;
+    ggml_tensor * mm_out = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_embd, hc, lr, n_tokens, inject_first, exact);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_BLOCK";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { mixed, inject, mm_out, both }; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * both = nullptr;
+
+    test_hc_block(int64_t n_embd, int64_t hc, int64_t lr, int64_t n_tokens, bool inject_first, bool exact)
+        : n_embd(n_embd), hc(hc), lr(lr), n_tokens(n_tokens), inject_first(inject_first), exact(exact) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hc_dim = n_embd*hc;
+        ggml_tensor * x      = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_tensor * w_norm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hc_dim, lr);
+        ggml_tensor * w_up   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, lr, hc_dim);
+        ggml_tensor * w_inj  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, hc);
+        ggml_tensor * w_out  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, 64);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * xn = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w_norm);
+        xn = ggml_reshape_2d(ctx, xn, hc_dim, n_tokens);
+        if (inject_first) {
+            inject = ggml_mul_mat(ctx, w_inj, xn);
+        }
+        ggml_tensor * down = ggml_mul_mat(ctx, w_down, xn);
+        if (!inject_first) {
+            inject = ggml_mul_mat(ctx, w_inj, xn);
+        }
+        // read together first, so the graph orders them next to each other (the model's side-stream planner does that)
+        both = inject_first ? ggml_concat(ctx, inject, down, 0) : ggml_concat(ctx, down, inject, 0);
+        ggml_tensor * lo = ggml_silu(ctx, ggml_scale(ctx, down, 1.0f / (float) hc));
+        ggml_tensor * gate = ggml_mul_mat(ctx, w_up, lo);
+        if (exact) {
+            for (ggml_tensor * t : { inject, down, gate }) {
+                t->flags |= GGML_TENSOR_FLAG_BATCH_INVARIANT;
+            }
+        }
+        mixed = ggml_dsv4_hc_pre_gated(ctx, ggml_reshape_3d(ctx, xn, n_embd, hc, n_tokens), ggml_reshape_3d(ctx, gate, n_embd, hc, n_tokens),
+            1.0f / (float) hc);
+        ggml_set_name(mixed, "mixed");
+        ggml_set_name(inject, "inject");
+        mm_out = ggml_mul_mat(ctx, w_out, mixed);
+        ggml_set_name(mm_out, "mm_out");
+        ggml_tensor * out = ggml_add(ctx, ggml_sum(ctx, both), ggml_sum(ctx, mm_out));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat_vec_shared_src1 : public test_case {
     const ggml_type type_a;
     const ggml_type type_b; // type of the second dense weight (e.g. V of a different quant type)
@@ -11067,6 +11187,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_hc_post_norm(mm ? 40 : 30, 4, 4, gated, mm)); // 40*4 is a Q8_0 row; 40 straddles q8_1 blocks
         }
         test_cases.emplace_back(new test_hc_post_norm(31, 4, 17, gated, false));
+        // k15-mm2: gated outputs with their q8_1 copy (the gated kernel writes it)
+        if (!gated) {
+            for (int64_t nt : {1, 3, 4}) {
+                test_cases.emplace_back(new test_gated_q8_1(0, 640, 1, nt));
+                test_cases.emplace_back(new test_gated_q8_1(0, 512, 1, nt));
+                test_cases.emplace_back(new test_gated_q8_1(1, 128, 48, nt, GGML_TYPE_Q6_K));
+                test_cases.emplace_back(new test_gated_q8_1(1, 128, 4, nt));
+                test_cases.emplace_back(new test_gated_q8_1(2, 96, 3, nt));
+            }
+        }
+        // k15-mm2: hc down + inject, hc up + hc_pre (the first of them also allocates the split-K buffers)
+        if (!gated) {
+            for (bool inj_first : {true, false}) {
+                for (int64_t nt : {1, 2, 3, 4}) {
+                    test_cases.emplace_back(new test_hc_block(1024, 4, 320, nt, inj_first, false));
+                    test_cases.emplace_back(new test_hc_block(2560, 4, 320, nt, inj_first, nt > 1));
+                }
+            }
+            test_cases.emplace_back(new test_hc_block(1024, 4, 320, 5, true, false));
+            test_cases.emplace_back(new test_hc_block(1024, 4, 256, 3, true, false));
+        }
         test_cases.emplace_back(new test_hc_post_norm(1024, 3, 5, gated, false));
         test_cases.emplace_back(new test_hc_post_norm(4096, 4, 7, gated, false));
     }

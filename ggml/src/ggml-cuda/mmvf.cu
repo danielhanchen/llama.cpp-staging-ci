@@ -2,6 +2,7 @@
 #include "common.cuh"
 #include "unary.cuh"
 #include "mmvf.cuh"
+#include "mmvf-splitk.cuh"
 #include "mmf.cuh"
 #include "convert.cuh"
 
@@ -738,86 +739,20 @@ void ggml_cuda_mul_mat_vec_f_multi(ggml_backend_cuda_context & ctx, const int n,
 
 // CUDA only: HIP / MUSA keep the one-block-per-row kernel (the arrival count uses __ldcg and the stream capture query)
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-#define MMVF_SPLITK_MAX_ROWS  256
-#define MMVF_SPLITK_MAX_SPLIT 64
-#define MMVF_SPLITK_BLOCK     128
-
 template <int ncols_dst>
 static __global__ void __launch_bounds__(MMVF_SPLITK_BLOCK) mul_mat_vec_f_splitk(
         const float * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst, float * __restrict__ part,
         unsigned int * __restrict__ cnt, const int ncols2, const int chunk2, const int stride_row, const int stride_col_y2,
         const int stride_col_dst) {
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    constexpr int nwarps    = MMVF_SPLITK_BLOCK/warp_size;
-    const int row    = blockIdx.x;
-    const int split  = blockIdx.y;
-    const int nsplit = gridDim.y;
-    const int tid    = threadIdx.x;
-
-    __shared__ float buf[nwarps][ncols_dst];
-    __shared__ bool  last;
-
-    ggml_cuda_pdl_sync();
-
-    const float2 * x2 = (const float2 *) (x + int64_t(row)*stride_row);
-    const float2 * y2 = (const float2 *) y;
-    const int c0 = split*chunk2;
-    const int c1 = min(ncols2, c0 + chunk2);
-
-    float sumf[ncols_dst] = {0.0f};
-    for (int col2 = c0 + tid; col2 < c1; col2 += MMVF_SPLITK_BLOCK) {
-        const float2 tmpx = x2[col2];
-#pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
-            const float2 tmpy = y2[j*stride_col_y2 + col2];
-            ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
-            ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
-        }
-    }
-    ggml_cuda_pdl_lc();
-
-#pragma unroll
-    for (int j = 0; j < ncols_dst; ++j) {
-        sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
-        if (tid % warp_size == 0) {
-            buf[tid/warp_size][j] = sumf[j];
-        }
-    }
-    __syncthreads();
-
-    float * p = part + (int64_t(row)*MMVF_SPLITK_MAX_SPLIT)*ncols_dst;
-    if (tid < ncols_dst) {
-        float v = 0.0f;
-#pragma unroll
-        for (int w = 0; w < nwarps; ++w) {
-            v += buf[w][tid];
-        }
-        p[split*ncols_dst + tid] = v;
-        __threadfence();
-    }
-    __syncthreads();
-    if (tid == 0) {
-        last = atomicAdd(cnt + row, 1u) == (unsigned int) (nsplit - 1);
-        if (last) {
-            cnt[row] = 0;
-        }
-    }
-    __syncthreads();
-    if (!last || tid >= ncols_dst) {
-        return;
-    }
-    __threadfence();
-    float v = 0.0f;
-    for (int sp = 0; sp < nsplit; ++sp) {
-        v += __ldcg(p + sp*ncols_dst + tid);
-    }
-    dst[tid*stride_col_dst + row] = v;
+    mul_mat_vec_f_splitk_block<ncols_dst>(x, y, dst, part, cnt, ncols2, chunk2, stride_row, stride_col_y2, stride_col_dst,
+        blockIdx.x, blockIdx.y, gridDim.y, threadIdx.x);
 }
 
-// returns false when the split-K launch does not apply (the caller then runs the one-block-per-row kernel)
-static bool mul_mat_vec_f_splitk_try(ggml_backend_cuda_context & ctx, const float * x, const float * y, float * dst,
+// the split-K launch of this product, if it applies (false: the caller runs the one-block-per-row kernel). alloc = false: never
+// allocates the partial sum buffers (a planner asking whether the launch would be taken; they are allocated outside a capture)
+static bool mul_mat_vec_f_splitk_plan(ggml_backend_cuda_context & ctx, const float * x, const float * y, float * dst,
         const int64_t ncols, const int64_t nrows, const int64_t ncols_dst, const int64_t stride_row, const int64_t stride_col_y,
-        const int64_t stride_col_dst) {
+        const int64_t stride_col_dst, const bool alloc, ggml_cuda_mmvf_splitk_args & a) {
     static const int chunk = [] {
         const char * e = getenv("GGML_CUDA_MMVF_SPLITK");
         return e != nullptr ? atoi(e) : 512;
@@ -833,8 +768,11 @@ static bool mul_mat_vec_f_splitk_try(ggml_backend_cuda_context & ctx, const floa
         return false;
     }
     const size_t part_per_stream = (size_t) MMVF_SPLITK_MAX_ROWS*MMVF_SPLITK_MAX_SPLIT*MMVF_MAX_BATCH_SIZE;
-    cudaStream_t stream = ctx.stream();
     if (ctx.mmvf_splitk_part == nullptr) {
+        if (!alloc) {
+            return false;
+        }
+        cudaStream_t stream = ctx.stream();
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
         if (capture != cudaStreamCaptureStatusNone) {
@@ -846,14 +784,34 @@ static bool mul_mat_vec_f_splitk_try(ggml_backend_cuda_context & ctx, const floa
         CUDA_CHECK(cudaMemset(ctx.mmvf_splitk_cnt, 0, GGML_CUDA_MAX_STREAMS*MMVF_SPLITK_MAX_ROWS*sizeof(unsigned int)));
     }
     // one region per stream: products on the side / concurrent streams may run at the same time as those on stream 0
-    float        * part = ctx.mmvf_splitk_part + ctx.curr_stream_no*part_per_stream;
-    unsigned int * cnt  = ctx.mmvf_splitk_cnt  + ctx.curr_stream_no*MMVF_SPLITK_MAX_ROWS;
+    a.x              = x;
+    a.y              = y;
+    a.dst            = dst;
+    a.part           = ctx.mmvf_splitk_part + ctx.curr_stream_no*part_per_stream;
+    a.cnt            = ctx.mmvf_splitk_cnt  + ctx.curr_stream_no*MMVF_SPLITK_MAX_ROWS;
+    a.nrows          = (int) nrows;
+    a.nsplit         = (int) nsplit;
+    a.ncols2         = (int) (ncols/2);
+    a.chunk2         = chunk/2;
+    a.stride_row     = (int) stride_row;
+    a.stride_col_y2  = (int) (stride_col_y/2);
+    a.stride_col_dst = (int) stride_col_dst;
+    a.ncols_dst      = (int) ncols_dst;
+    return true;
+}
 
-    const dim3 block_nums(nrows, nsplit, 1);
+static bool mul_mat_vec_f_splitk_try(ggml_backend_cuda_context & ctx, const float * x, const float * y, float * dst,
+        const int64_t ncols, const int64_t nrows, const int64_t ncols_dst, const int64_t stride_row, const int64_t stride_col_y,
+        const int64_t stride_col_dst) {
+    ggml_cuda_mmvf_splitk_args a;
+    if (!mul_mat_vec_f_splitk_plan(ctx, x, y, dst, ncols, nrows, ncols_dst, stride_row, stride_col_y, stride_col_dst, true, a)) {
+        return false;
+    }
+    const dim3 block_nums(a.nrows, a.nsplit, 1);
     const dim3 block_dims(MMVF_SPLITK_BLOCK, 1, 1);
-    const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
-#define MMVF_SPLITK_LAUNCH(NC) case NC: ggml_cuda_kernel_launch(mul_mat_vec_f_splitk<NC>, launch_params, x, y, dst, part, cnt, \
-        (int) (ncols/2), chunk/2, (int) stride_row, (int) (stride_col_y/2), (int) stride_col_dst); break;
+    const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, ctx.stream()};
+#define MMVF_SPLITK_LAUNCH(NC) case NC: ggml_cuda_kernel_launch(mul_mat_vec_f_splitk<NC>, launch_params, a.x, a.y, a.dst, a.part, a.cnt, \
+        a.ncols2, a.chunk2, a.stride_row, a.stride_col_y2, a.stride_col_dst); break;
     switch (ncols_dst) {
         MMVF_SPLITK_LAUNCH(1)
         MMVF_SPLITK_LAUNCH(2)
@@ -869,6 +827,13 @@ static bool mul_mat_vec_f_splitk_try(ggml_backend_cuda_context & ctx, const floa
     return true;
 }
 #else
+static bool mul_mat_vec_f_splitk_plan(ggml_backend_cuda_context & ctx, const float * x, const float * y, float * dst,
+        const int64_t ncols, const int64_t nrows, const int64_t ncols_dst, const int64_t stride_row, const int64_t stride_col_y,
+        const int64_t stride_col_dst, const bool alloc, ggml_cuda_mmvf_splitk_args & a) {
+    GGML_UNUSED_VARS(ctx, x, y, dst, ncols, nrows, ncols_dst, stride_row, stride_col_y, stride_col_dst, alloc, a);
+    return false;
+}
+
 static bool mul_mat_vec_f_splitk_try(ggml_backend_cuda_context & ctx, const float * x, const float * y, float * dst,
         const int64_t ncols, const int64_t nrows, const int64_t ncols_dst, const int64_t stride_row, const int64_t stride_col_y,
         const int64_t stride_col_dst) {
@@ -876,6 +841,19 @@ static bool mul_mat_vec_f_splitk_try(ggml_backend_cuda_context & ctx, const floa
     return false;
 }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+// k15-mm2: the split-K launch ggml_cuda_mul_mat would make for this dense F32 product (ggml_cuda_mul_mat_vec_f, no fusion), without
+// allocating; false if it would not take that launch (see the hyper-connection down + inject launch in mmvq.cu)
+bool ggml_cuda_mul_mat_vec_f_splitk_plan(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        ggml_tensor * dst, ggml_cuda_mmvf_splitk_args & a) {
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || src0->nb[0] != sizeof(float) ||
+            src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) || src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 ||
+            src1->ne[3] != 1 || src0->data == nullptr || src1->data == nullptr || dst->data == nullptr) {
+        return false;
+    }
+    return mul_mat_vec_f_splitk_plan(ctx, (const float *) src0->data, (const float *) src1->data, (float *) dst->data, src0->ne[0],
+        src0->ne[1], src1->ne[1], src0->nb[1] / sizeof(float), src1->nb[1] / sizeof(float), dst->nb[1] / sizeof(float), false, a);
+}
 
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion) {

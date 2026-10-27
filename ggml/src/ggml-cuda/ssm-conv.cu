@@ -1,13 +1,26 @@
 #include "common.cuh"
 #include "ssm-conv.cuh"
 #include "unary.cuh"
+#include "cpy.cuh"
+
+// k15-fn: conv-state copies the short-token kernel also writes (see ggml_cuda_try_conv_state_defer): copy c writes, for every channel
+// and sequence, the cols floats of the channel's input row starting at column s_idx[c] to dst[c] + seq * seq_stride[c] + ch * ch_stride[c]
+struct ssm_conv_state_copies {
+    static constexpr int max_copies = 4;
+    float * dst[max_copies];
+    int64_t ch_stride[max_copies];
+    int64_t seq_stride[max_copies];
+    int     s_idx[max_copies];
+    int     n;
+    int     cols;
+};
 
 template <bool apply_silu, size_t split_d_inner, size_t d_conv>
 static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_ptr,
                                     const float * bias_ptr,
                                     const int src0_nb0, const int src0_nb1, const int src0_nb2, const int src1_nb1,
                                     float * dst_ptr, const int dst_nb0, const int dst_nb1, const int dst_nb2,
-                                    const int64_t n_t) {
+                                    const int64_t n_t, const ssm_conv_state_copies cs) {
     ggml_cuda_pdl_lc();
     const float * GGML_CUDA_RESTRICT src0 = src0_ptr;
     const float * GGML_CUDA_RESTRICT src1 = src1_ptr;
@@ -30,6 +43,14 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
     float w[d_conv] = { 0.0f };
 
     ggml_cuda_pdl_sync();
+    // the deferred conv-state copies: the same floats a CPY of the input's tail writes (they read the input, which this kernel only reads)
+    for (int c = 0; c < cs.n; ++c) {
+        const float * s = x_block + tid * stride_x + cs.s_idx[c];
+        float * d = cs.dst[c] + bidx * cs.seq_stride[c] + (int64_t) (bidy * split_d_inner + tid) * cs.ch_stride[c];
+        for (int k = 0; k < cs.cols; ++k) {
+            d[k] = s[k];
+        }
+    }
 #pragma unroll
     for (size_t j = 0; j < d_conv; j++) {
         w[j] = w_block[tid * stride_w + j];
@@ -127,7 +148,7 @@ template <bool apply_silu>
 static void ssm_conv_f32_cuda(const float * src0, const float * src1, const float * bias, const int src0_nb0, const int src0_nb1,
                               const int src0_nb2, const int src1_nb1, float * dst, const int dst_nb0, const int dst_nb1,
                               const int dst_nb2, const int64_t nc, const int64_t nr, const int64_t n_t,
-                              const int64_t n_s, cudaStream_t stream) {
+                              const int64_t n_s, cudaStream_t stream, const ssm_conv_state_copies & cs) {
     const int threads = 128;
     GGML_ASSERT(nr % threads == 0);
 
@@ -137,8 +158,9 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
             const dim3 blocks(n_s, (nr + threads - 1) / threads, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
             ggml_cuda_kernel_launch(ssm_conv_f32<apply_silu, threads, kNC>, launch_params, src0, src1, bias, src0_nb0, src0_nb1,
-                                                                        src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t);
+                                                                        src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t, cs);
         } else {
+            GGML_ASSERT(cs.n == 0);
             const int64_t split_n_t = 32;
             dim3          blocks(n_s, (nr + threads - 1) / threads, (n_t + split_n_t - 1) / split_n_t);
             const size_t  smem_size = threads * (kNC - 1 + split_n_t) * sizeof(float);
@@ -196,11 +218,34 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         GGML_ASSERT(ggml_nelements(bias) == nr);
     }
 
+    // k15-fn: the conv-state copies deferred to this convolution (ggml_cuda_try_conv_state_defer); a long input runs them as copies first
+    ssm_conv_state_copies cs = {};
+    auto pend = ctx.conv_state_pending.find(dst);
+    if (pend != ctx.conv_state_pending.end()) {
+        std::vector<ggml_tensor *> cpys = std::move(pend->second);
+        ctx.conv_state_pending.erase(pend);
+        if (n_t > 32 || (int) cpys.size() > ssm_conv_state_copies::max_copies) {
+            for (ggml_tensor * c : cpys) {
+                ggml_cuda_cpy(ctx, c->src[0], c->src[1]);
+            }
+        } else {
+            for (ggml_tensor * c : cpys) {
+                const ggml_tensor * t = c->src[0];
+                cs.dst[cs.n]        = (float *) c->src[1]->data;
+                cs.ch_stride[cs.n]  = c->src[1]->nb[1] / sizeof(float);
+                cs.seq_stride[cs.n] = c->src[1]->nb[2] / sizeof(float);
+                cs.s_idx[cs.n]      = (int) (((const char *) t->data - (const char *) src0->data) / sizeof(float));
+                cs.cols             = (int) t->ne[0];
+                cs.n++;
+            }
+        }
+    }
+
     if (fuse_silu) {
         ssm_conv_f32_cuda<true>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
-                          out->nb[2], nc, nr, n_t, n_s, stream);
+                          out->nb[2], nc, nr, n_t, n_s, stream, cs);
     } else {
         ssm_conv_f32_cuda<false>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
-                          out->nb[2], nc, nr, n_t, n_s, stream);
+                          out->nb[2], nc, nr, n_t, n_s, stream, cs);
     }
 }

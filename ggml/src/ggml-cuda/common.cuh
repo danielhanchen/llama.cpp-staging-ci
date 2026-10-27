@@ -1480,7 +1480,8 @@ struct ggml_cuda_q8_1_cache {
     int    pending   = -1; // slot reserved by a producer, see reserve()
     entry  entries[n_slots];
     std::unordered_set<const void *> norm_targets; // producer tensors whose kernel writes the q8_1 copy (see ggml_cuda_q8_1_cache_slot_size)
-    std::unordered_map<const void *, int64_t> target_ne10; // k15-fn: row width the reader of a gated producer uses (its q8_1 rows)
+    // k15-mm2: the reader's row length of a producer target whose rows differ from the reader's (a multiple of MATRIX_ROW_PADDING)
+    std::unordered_map<const void *, int64_t> norm_target_ne10;
 
     bool active() const {
         return arena != nullptr;
@@ -1497,7 +1498,7 @@ struct ggml_cuda_q8_1_cache {
     void end() {
         begin(nullptr, 0);
         norm_targets.clear();
-        target_ne10.clear();
+        norm_target_ne10.clear();
     }
 
     // returns the slot holding the q8_1 copy of src (quantized == true) or a slot to quantize into
@@ -1705,6 +1706,22 @@ struct ggml_backend_cuda_context {
     // g = softplus(a + bias[h]) * scale[h]; the skipped nodes' inputs stay unwritten until the gated_delta_net reads them
     struct gdn_gates { const float * beta_raw; const float * a; const float * bias; const float * scale; };
     std::unordered_map<const ggml_tensor *, gdn_gates> gdn_gates_in;
+    // k15-fn: conv-state copies (the CPY of a conv input's last d_conv - 1 columns into the recurrent cache, qwen4exp build_conv_state_at)
+    // deferred into the short convolution that reads the same input (ggml_cuda_try_conv_state_defer): SSM_CONV node -> its CPY nodes
+    std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> conv_state_pending;
+    // k15-fn: QSA selection chains (ggml_cuda_qsa_sel_plan): the final i32 index node -> its inputs, and the chain nodes not run
+    struct qsa_sel_args {
+        const int32_t * top_k; int64_t top_k_s1;     // [n_top, n_tok]
+        const int32_t * pools; int64_t pools_s1;     // [kpool, n_pool]: the member cells of each pool
+        const int32_t * tail;  int64_t tail_s1;      // [kpool - 1, n_tok]
+        const float   * score; int64_t score_s1;     // [n_pool, n_tok]
+        int kpool, n_top, n_tail, n_tok;
+        float lp_scale, lp_bias, lp_min, lp_max;     // live of a pool slot: clamp(scale * score + bias)
+        float lt_scale, lt_bias, lt_min, lt_max;     // live of a tail slot: clamp(scale * float(cell) + bias)
+        float d_scale, d_bias;                       // dump of slot s: scale * (s + 1) + bias
+    };
+    std::unordered_map<const ggml_tensor *, qsa_sel_args> qsa_sel;
+    std::unordered_set<const ggml_tensor *> qsa_sel_skip;
     // k15-mm2: QSA maskless (ggml_cuda_qsa_maskless_plan): flash attention node -> its selection, and the dense mask nodes not run
     std::unordered_map<const ggml_tensor *, ggml_cuda_qsa_maskless> qsa_maskless;
     std::unordered_set<const ggml_tensor *> qsa_skip;
@@ -1720,6 +1737,8 @@ struct ggml_backend_cuda_context {
     // k15-mm2: split-K few-row F32 mat-vec (mmvf.cu): per stream partial sums and self-resetting per-row arrival counters
     float        * mmvf_splitk_part = nullptr;
     unsigned int * mmvf_splitk_cnt  = nullptr;
+    // k15-mm2: self-resetting group arrival counters of the hyper-connection up + hc_pre launch (mmvq.cu), stream 0 only
+    unsigned int * hc_pre_cnt       = nullptr;
 
     // a graph was computed with this instance (a copy-only instance, e.g. the scheduler copy queue, is not a compute instance)
     bool computes = false;
@@ -1840,26 +1859,6 @@ struct ggml_backend_cuda_context {
     }
 };
 
-// k15-fn: the q8_1 copy a producer kernel writes beside its f32 output t, when a mul_mat_vec_q reads t (a norm target of the
-// q8_1 cache, see ggml_cuda_q8_1_cache_slot_size), nullptr otherwise; layout of the copy as ggml_cuda_op_ew_chain writes it
-// ne10: the row width of the copy (the reader's src1 rows, t may be a reshape of them), nrows = nelements / ne10
-static inline void * ggml_cuda_q8_1_producer_out(ggml_backend_cuda_context & ctx, const ggml_tensor * t, int64_t & ne10, int64_t & nrows) {
-    ggml_cuda_q8_1_cache & cache = ctx.q8_1_cache;
-    if (!cache.active() || ctx.curr_stream_no != 0 || !cache.norm_targets.count(t) || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
-        return nullptr;
-    }
-    const auto it = cache.target_ne10.find(t);
-    ne10 = it != cache.target_ne10.end() ? it->second : t->ne[0];
-    if (ne10 <= 0 || ggml_nelements(t) % ne10 != 0) {
-        return nullptr;
-    }
-    nrows = ggml_nelements(t) / ne10;
-    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    int64_t key[ggml_cuda_q8_1_cache::n_key];
-    ggml_cuda_q8_1_cache::key_contiguous(ne10, nrows, key);
-    return cache.reserve(t->data, ggml_nbytes(t), key, nrows*ne10_padded/QK8_1*sizeof(block_q8_1));
-}
-
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;
@@ -1874,6 +1873,7 @@ struct ggml_cuda_mm_fusion_args_host {
 };
 #define GGML_CUDA_MMVQ_MULTI_MAX 3 // matrices sharing one activation in one mul_mat_vec_q launch
 #define GGML_CUDA_MMVQ_EW_MAX    2 // SCALE / SILU ops a mul_mat_vec_q applies to its F32 src1 itself (c_ewq)
+#define GGML_CUDA_HC_PRE_MAX_GROUPS 1024 // n_embd / 32 of the hyper-connection up + hc_pre launch
 #define GGML_CUDA_MMVQ_EW_MAX_K  992 // K of such a product: one K iteration of 4 warps (Q8_0), so 31 q8_1 blocks per column
 
 struct ggml_cuda_mm_fusion_args_device {
