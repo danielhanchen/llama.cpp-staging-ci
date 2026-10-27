@@ -1291,6 +1291,9 @@ struct test_case {
     }
 
     virtual bool run_whole_graph() { return false; }
+    // > 0: the graph runs through a backend scheduler (so the backend's graph_optimize plans it, as in llama.cpp) this many times on
+    // backend1 (a CUDA backend captures it on the 2nd run and replays it on the 3rd), and the last output is checked against backend2
+    virtual int eval_sched_runs() { return 0; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
 
@@ -1474,6 +1477,49 @@ struct test_case {
         initialize_tensors(ctx.get());
         if (ctx_weights) {
             initialize_tensors(ctx_weights.get());
+        }
+
+        if (eval_sched_runs() > 0 && ggml_backend_dev_type(ggml_backend_get_device(backend1)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            ggml_backend_t backs[2] = { backend1, backend2 };
+            ggml_backend_sched_t sched = ggml_backend_sched_new(backs, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
+            bool ok = sched != nullptr;
+            for (int r = 0; r < eval_sched_runs() && ok; ++r) {
+                ok = ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS;
+            }
+            if (sched != nullptr) {
+                ggml_backend_sched_synchronize(sched);
+            }
+            int io = -1;
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                if (ggml_graph_node(gf, i) == out) {
+                    io = i;
+                }
+            }
+            double err = 0.0;
+            if (ok && io >= 0) {
+                struct ggml_backend_graph_copy cp = ggml_backend_graph_copy(backend2, gf);
+                ok = cp.buffer != nullptr && ggml_backend_graph_compute(backend2, cp.graph) == GGML_STATUS_SUCCESS;
+                if (ok) {
+                    const std::vector<float> f1 = tensor_to_float(out);
+                    const std::vector<float> f2 = tensor_to_float(ggml_graph_node(cp.graph, io));
+                    err = nmse(f1.data(), f2.data(), f1.size());
+                    ok = f1.size() == f2.size() && err <= max_nmse_err();
+                    if (!ok) {
+                        printf("[%s] NMSE = %.9f > %.9f ", current_op_name.c_str(), err, max_nmse_err());
+                    }
+                }
+                if (cp.buffer != nullptr) {
+                    ggml_backend_graph_copy_free(cp);
+                }
+            } else {
+                ok = false;
+            }
+            if (sched != nullptr) {
+                ggml_backend_sched_free(sched);
+            }
+            test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, ok, ok ? "" : "test failed");
+            print_test_result_locked(output_printer, result);
+            return ok ? test_status_t::OK : test_status_t::FAIL;
         }
 
         // compare
@@ -8931,6 +8977,64 @@ struct test_mul_mat_vec_multi : public test_case {
     }
 };
 
+// k15-mmvffix: the mat-vec fusions of a Flash-Next layer at m columns, through a scheduler (graph_optimize plans the side stream) and
+// captured into a CUDA graph (eval_sched_runs): a long-K 4-row F32 product read 24+ nodes later (the hc inject: side stream at up to 4
+// columns), the same product over 0 columns (the last layer of a prompt ubatch without outputs: skipped, never sent to the side
+// stream), an F32 router + shared expert gate over one activation (F32 multi mat-vec), Q8_0 products over one activation (mmvq multi)
+// and a GLU feeding a Q8_0 product (gated q8_1 copy). m 9..16: above every mat-vec kernel's column limit, the fallbacks
+struct test_mmv_fused_cols : public test_case {
+    const int64_t m;  // columns
+    const bool empty; // add the 0 column product
+
+    std::string vars() override {
+        return VARS_TO_STR2(m, empty);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MMV_FUSED_COLS";
+    }
+
+    bool run_whole_graph() override { return true; }
+    int eval_sched_runs() override { return 3; }
+
+    test_mmv_fused_cols(int64_t m, bool empty) : m(m), empty(empty) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t k1 = 4096, k2 = 2560;
+        ggml_tensor * x1  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k1, m);
+        ggml_tensor * x2  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k2, m);
+        ggml_tensor * a   = ggml_mul(ctx, ggml_rms_norm(ctx, x1, 1e-6f), ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k1));
+        ggml_tensor * a2  = ggml_mul(ctx, ggml_rms_norm(ctx, x2, 1e-6f), ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k2));
+        ggml_tensor * r   = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  k2, 16), a2); // router
+        ggml_tensor * sg  = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  k2, 1),  a2); // shared expert gate
+        ggml_tensor * q1  = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k2, 64), a2);
+        ggml_tensor * q3  = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k2, 64), a2);
+        ggml_tensor * q2  = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k2, 32), a2);
+        ggml_tensor * g   = ggml_swiglu_split(ctx, q1, q3);
+        ggml_tensor * dn  = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 64, 32), g);
+        ggml_tensor * sh  = ggml_mul(ctx, dn, ggml_sigmoid(ctx, sg));
+        ggml_tensor * qa  = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k1, 32), a);
+        ggml_tensor * t   = ggml_add(ctx, sh, qa);
+        for (int i = 0; i < 14; ++i) { // the nodes between the long-K product's input and its reader
+            t = ggml_scale(ctx, ggml_add(ctx, t, q2), 0.5f);
+        }
+        ggml_tensor * winj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k1, 4);
+        ggml_tensor * injr = ggml_sigmoid(ctx, ggml_mul_mat(ctx, winj, a));
+        if (empty) {
+            ggml_tensor * e0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k1, 0);
+            injr = ggml_concat(ctx, injr, ggml_sigmoid(ctx, ggml_mul_mat(ctx, winj, e0)), 1);
+        }
+        ggml_tensor * out = ggml_concat(ctx, ggml_concat(ctx, t, r, 0), injr, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+};
+
 // k15-mm2: hyper-connection down -> silu(scale) -> up: the up product applies the elementwise chain to its src1 in its own launch
 // (ggml_cuda_mul_mat_vec_q_ew). pattern 0: scale + silu, 1: silu, 2: scale with bias, 3: scale + silu with the chain input read
 // by a second node too (no fusion)
@@ -13825,6 +13929,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (int64_t rows : { 1024, 1023 }) {
                 test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, rows, m, type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0 ? 320 : 256, {1, 1}, {1, 1}));
             }
+        }
+    }
+
+    // k15-mmvffix: the mat-vec fusions at 1..16 columns, with and without a 0 column product, captured into a CUDA graph
+    for (int64_t m : { 1, 2, 3, 4, 8, 9, 10, 12, 15, 16 }) {
+        for (bool empty : { false, true }) {
+            test_cases.emplace_back(new test_mmv_fused_cols(m, empty));
         }
     }
 

@@ -5172,7 +5172,7 @@ static bool ggml_cuda_mmvq_multi_candidate(const ggml_tensor * node) {
     const ggml_tensor * src1 = node->src[1];
     return ggml_is_quantized(src0->type) && src0->op == GGML_OP_NONE && src0->view_src == nullptr && ggml_is_contiguous(src0) &&
         ggml_is_matrix(src0) && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && src1->ne[2] == 1 && src1->ne[3] == 1 &&
-        ggml_is_contiguous(node);
+        src1->ne[1] >= 1 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE && !ggml_is_empty(node) && ggml_is_contiguous(node);
 }
 
 // a and b can share one multi-matrix launch
@@ -6309,7 +6309,8 @@ static bool ggml_cuda_mmvf_multi_candidate(const ggml_tensor * node) {
     const ggml_tensor * src1 = node->src[1];
     return (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16) && src0->op == GGML_OP_NONE && src0->view_src == nullptr &&
         ggml_is_contiguous(src0) && ggml_is_matrix(src0) && src0->ne[0] < 4096 && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) &&
-        src1->ne[2] == 1 && src1->ne[3] == 1 && src1->ne[1] <= 4 && ggml_is_contiguous(node) && !ggml_cuda_side_mv_run(node);
+        src1->ne[2] == 1 && src1->ne[3] == 1 && src1->ne[1] >= 1 && src1->ne[1] <= 4 && !ggml_is_empty(node) && ggml_is_contiguous(node) &&
+        !ggml_cuda_side_mv_run(node);
 }
 
 // node goes to ggml_cuda_mul_mat_vec_f in ggml_cuda_mul_mat (same dispatch, see there)
@@ -8034,11 +8035,18 @@ static bool ggml_cuda_side_mv_candidate(const ggml_tensor * node) {
 // column only, as before), so a verify's hyper-connection inject and shared expert gate run beside the products after them instead
 // of before them. Wider weights (alpha / beta) keep their multi-matrix launch at several columns. Same kernels, same values.
 static bool ggml_cuda_side_mv_run(const ggml_tensor * node) {
-    static const int max_cols = getenv("GGML_CUDA_SIDE_MV_COLS") ? std::max(1, atoi(getenv("GGML_CUDA_SIDE_MV_COLS"))) : 4;
+    static const int max_cols = getenv("GGML_CUDA_SIDE_MV_COLS") ?
+        std::min(MMVF_MAX_BATCH_SIZE, std::max(1, atoi(getenv("GGML_CUDA_SIDE_MV_COLS")))) : 4;
     if (!ggml_cuda_side_mv_candidate(node)) {
         return false;
     }
     const int64_t ncols = node->src[1]->ne[1];
+    // an empty product (0 columns: e.g. the last layer of a prompt ubatch without outputs) is skipped by the evaluation loop, it must not
+    // be moved to the side stream, which computes the node before that check (mmvf has no 0 column kernel: mmvf.cu ncols_dst abort).
+    // The column bound keeps the side stream on the products a single mat-vec launch computes (MMVF / MMVQ_MAX_BATCH_SIZE)
+    if (ncols < 1 || ggml_is_empty(node)) {
+        return false;
+    }
     // at several columns only long-K ones (the hc inject, K = 10240): a short-K tiny product (the shared expert gate, K = 2560) joins
     // the multi-matrix launch of its neighbour instead (the router: one launch fewer), GGML_CUDA_SIDE_MV_COLS_MIN_K (default 4096)
     static const int64_t min_k = getenv("GGML_CUDA_SIDE_MV_COLS_MIN_K") ? atoll(getenv("GGML_CUDA_SIDE_MV_COLS_MIN_K")) : 4096;
@@ -8050,11 +8058,20 @@ static bool ggml_cuda_side_mv_run(const ggml_tensor * node) {
 // 0.25 us more per kernel boundary in an nsys trace): Qwen3.6-35B-A3B 8k prompt -1.8% / -1.9% vs GGML_CUDA_DISABLE_SIDE_MATVEC=1,
 // and with CUDA graphs off decode -7%. The same branches inside a captured graph cost nothing. A prompt graph (a planned product
 // over more than GGML_CUDA_SIDE_MV_MAX_COLS columns) runs all of them on the main stream, as there is nothing to overlap.
-static bool ggml_cuda_side_mv_use(const std::unordered_map<const ggml_tensor *, const ggml_tensor *> & side_mv, const bool capturing) {
-    if (side_mv.empty() || !capturing) {
-        return false;
-    }
+// The plan is read only for the graph it was made for (or a view of it, which shares its node array), and a planned tensor is only
+// dereferenced once it is found among this graph's nodes: the plan outlives its graph (a scheduler that planned it and was freed, then
+// a ggml_backend_graph_compute without graph_optimize on another graph: test-backend-ops), so its pointers may be dangling.
+static bool ggml_cuda_side_mv_planned_for(const ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph) {
+    return !ctx->side_mv.empty() && ctx->side_mv_nodes != nullptr && cgraph->n_nodes > 0 &&
+           cgraph->nodes >= ctx->side_mv_nodes && cgraph->nodes + cgraph->n_nodes <= ctx->side_mv_nodes + ctx->side_mv_n_nodes;
+}
+
+static bool ggml_cuda_side_mv_use(const std::unordered_map<const ggml_tensor *, const ggml_tensor *> & side_mv,
+                                  const std::unordered_map<const ggml_tensor *, int> & idx) {
     for (const auto & [mv, reader] : side_mv) {
+        if (idx.count(mv) == 0) {
+            continue;   // not in this graph (a view of the planned one): not dereferenced
+        }
         if (mv->src[1]->ne[1] > GGML_CUDA_SIDE_MV_MAX_COLS) {
             return false;
         }
@@ -8294,11 +8311,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             // side-stream matrix-vector products of this graph (see ggml_cuda_side_mv_plan): node index -> join index
             std::unordered_map<int, int> side_mv_at;
             std::vector<std::pair<int, cudaEvent_t>> side_mv_pending; // join index, event
-            if (stream_ctx.concurrent_events.empty() && ggml_cuda_side_mv_use(cuda_ctx->side_mv, use_cuda_graph && cuda_graph_update_required)) {
-                std::unordered_map<const ggml_tensor *, int> idx;
+            std::unordered_map<const ggml_tensor *, int> idx;
+            if (stream_ctx.concurrent_events.empty() && use_cuda_graph && cuda_graph_update_required &&
+                    ggml_cuda_side_mv_planned_for(cuda_ctx, cgraph)) {
                 for (int i = 0; i < cgraph->n_nodes; ++i) {
                     idx[cgraph->nodes[i]] = i;
                 }
+            }
+            if (!idx.empty() && ggml_cuda_side_mv_use(cuda_ctx->side_mv, idx)) {
                 for (const auto & [mv, reader] : cuda_ctx->side_mv) {
                     const auto a = idx.find(mv);
                     const auto b = idx.find(reader);
@@ -8342,7 +8362,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 if (!side_mv_at.empty()) {
                     const auto it = side_mv_at.find(i);
-                    if (it != side_mv_at.end()) {
+                    if (it != side_mv_at.end() && !ggml_cuda_is_view_or_noop(node) && (node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
                         if (side_mv_n_events == cuda_ctx->side_mv_join.size()) {
                             cudaEvent_t ev;
                             CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
@@ -9178,6 +9198,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     // the side-stream matrix-vector products of the previous graph do not apply to this one
     cuda_ctx->side_mv.clear();
+    cuda_ctx->side_mv_nodes   = cgraph->nodes;
+    cuda_ctx->side_mv_n_nodes = cgraph->n_nodes;
 
     if (!disable_fusion) {
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.

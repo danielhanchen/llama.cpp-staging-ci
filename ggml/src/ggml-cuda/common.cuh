@@ -1693,6 +1693,10 @@ struct ggml_backend_cuda_context {
     // small matrix-vector products that graph_optimize moved next to their inputs, run on a side stream until their first
     // reader (see ggml_cuda_side_mv_plan): node -> first reader
     std::unordered_map<const ggml_tensor *, const ggml_tensor *> side_mv;
+    // the node array of the graph that plan is for (a scheduler split; its views share the array) and its node count: another graph
+    // never reads the plan, whose tensors may be freed by then (a scheduler freed before a direct ggml_backend_graph_compute)
+    ggml_tensor * const *    side_mv_nodes   = nullptr;
+    int                      side_mv_n_nodes = 0;
     cudaEvent_t              side_mv_fork = nullptr;
     std::vector<cudaEvent_t> side_mv_join;
 
