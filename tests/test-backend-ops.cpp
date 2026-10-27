@@ -9509,6 +9509,62 @@ struct test_arange : public test_case {
     }
 };
 
+// GGML_OP_KQ_MASK (k15-pp)
+struct test_kq_mask : public test_case {
+    const ggml_type type;
+    const int64_t n_kv, n_tps, n_stream;
+    const int swa_type, n_swa, is_2d;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type, n_kv, n_tps, n_stream, swa_type, n_swa, is_2d);
+    }
+
+    test_kq_mask(ggml_type type = GGML_TYPE_F16, int64_t n_kv = 1024, int64_t n_tps = 64, int64_t n_stream = 1, int swa_type = 0, int n_swa = 0, int is_2d = 0)
+        : type(type), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), swa_type(swa_type), n_swa(n_swa), is_2d(is_2d) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cells = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 5, n_kv, n_stream);
+        ggml_set_name(cells, "cells");
+        ggml_tensor * toks = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 8, n_tps, n_stream);
+        ggml_set_name(toks, "toks");
+        ggml_tensor * out = ggml_kq_mask(ctx, cells, toks, type);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "cells") == 0) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (int64_t j = 0; j < n_kv*n_stream; ++j) {
+                    const bool empty = rng() % 10 == 0;
+                    v[5*j + 0] = empty ? INT32_MIN : (int32_t) (j % n_kv);
+                    v[5*j + 1] = empty ? 0 : (int32_t) (rng() & 0x8000000fu);
+                    v[5*j + 2] = empty ? 0 : (int32_t) (rng() & 0x80000003u);
+                    v[5*j + 3] = (int32_t) (rng() % 4);
+                    v[5*j + 4] = (int32_t) (rng() % 4);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "toks") == 0) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (int64_t i = 0; i < n_tps*n_stream; ++i) {
+                    const int32_t seqs[] = { 0, 1, 2, 3, 31, 32, 33, 63 };
+                    v[8*i + 0] = (int32_t) (n_kv - n_tps + (i % n_tps));
+                    v[8*i + 1] = seqs[rng() % 8];
+                    v[8*i + 2] = (int32_t) (rng() % 4 != 0);
+                    v[8*i + 3] = swa_type;
+                    v[8*i + 4] = n_swa;
+                    v[8*i + 5] = is_2d;
+                    v[8*i + 6] = (int32_t) (rng() % 4);
+                    v[8*i + 7] = (int32_t) (rng() % 4);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            }
+        }
+    }
+};
+
 // GGML_OP_TIMESTEP_EMBEDDING
 struct test_timestep_embedding : public test_case {
     const ggml_type type;
@@ -12952,6 +13008,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_roll());
     test_cases.emplace_back(new test_roll(3, -2, 1, -1, true));
     test_cases.emplace_back(new test_arange());
+    for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        test_cases.emplace_back(new test_kq_mask(t, 1024, 64, 1, 0, 0, 0));
+        test_cases.emplace_back(new test_kq_mask(t, 4096, 2048, 1, 0, 0, 0));
+        test_cases.emplace_back(new test_kq_mask(t, 1024, 32, 2, 0, 0, 1));
+        test_cases.emplace_back(new test_kq_mask(t, 1024, 64, 1, 1, 128, 0));
+        test_cases.emplace_back(new test_kq_mask(t, 1024, 64, 1, 2, 256, 0));
+        test_cases.emplace_back(new test_kq_mask(t, 1024, 64, 1, 3, 100, 0));
+    }
     test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, 1048576.0f, 1.0f));
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_leaky_relu());

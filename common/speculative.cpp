@@ -1626,7 +1626,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (spec_cost) {
             LOG_INF("%s: MTP window by expected tokens per ms (LLAMA_SPEC_COST=1), up to %d drafts\n", __func__, this->params.n_max);
         }
-        if (!is_mem_shared && !chain_heads && common_mtp_handoff_on("DEV_H") && getenv("LLAMA_MTP_DEV_H") && atoi(getenv("LLAMA_MTP_DEV_H")) != 0) {
+        // k15-pp: on by default beside built-in MTP heads (common sets LLAMA_SPEC_MTP_HEADS=1): the target's next-n rows of a prompt
+        // batch then go to the device sink and the host keeps none of them (llama_context::nextn_store_ensure), so the host rows no
+        // longer grow with n_batch (q4x 16384-token groups: 128 MiB pinned). A -md draft model keeps the host path (G4 Flash-Next 8k
+        // prompt +8% with it, plans/impl_mtp.md). LLAMA_MTP_DEV_H=0 / =1 forces it off / on
+        const char * dev_h_env = getenv("LLAMA_MTP_DEV_H");
+        // (G4 k15g4q1 measured it together with 16384 groups beside the heads, which cost decode and stay opt-in; at 8192 the device
+        // path saves the 64 MiB of host rows for a 64 MiB sink)
+        const bool dev_h_on = dev_h_env != nullptr ? atoi(dev_h_env) != 0 :
+            getenv("LLAMA_SPEC_MTP_HEADS") != nullptr && atoi(getenv("LLAMA_SPEC_MTP_HEADS")) != 0;
+        if (!is_mem_shared && !chain_heads && common_mtp_handoff_on("DEV_H") && dev_h_on) {
             dev_h = llama_mtp_dev_h_attach(ctx_dft, ctx_tgt, (int32_t) llama_n_batch(ctx_tgt));
         }
     }

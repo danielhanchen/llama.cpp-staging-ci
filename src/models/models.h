@@ -2735,6 +2735,15 @@ struct llama_model_qwen4exp : public llama_model_base {
         // the QSA layers share one set of k-pool inputs, see llama_memory_hybrid_idx
         llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
 
+        // k15-fn (LLAMA_QSA_HOIST=0 off): the QSA constants every layer builds alike (the zero half of the packed key, the head
+        // weights, the tail liveness and the dump rows), built once per graph by the first QSA layer
+        struct qsa_shared {
+            ggml_tensor * pzero     = nullptr;
+            ggml_tensor * weights   = nullptr;
+            ggml_tensor * live_tail = nullptr;
+            ggml_tensor * dump      = nullptr;
+        } qsa_c;
+
         // QSA: the additive mask [n_kv, n_tokens] of the top blocks and the tail, kq_mask included
         ggml_tensor * build_qsa_sel(
   const llama_memory_hybrid_idx_context * mctx_hyb,

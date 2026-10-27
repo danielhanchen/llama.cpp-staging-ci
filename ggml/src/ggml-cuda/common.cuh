@@ -1721,6 +1721,9 @@ struct ggml_backend_cuda_context {
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    // k15-pp: graphs computed once (a merged layer-major group: its node addresses are freed after it) skip the CUDA graph
+    // bookkeeping (the per-node properties a warmup compares, ~1 KB per node), see ggml_backend_graph_skip_records
+    bool graphs_skip = false;
 
     int64_t last_graph_eviction_sweep = 0;
 

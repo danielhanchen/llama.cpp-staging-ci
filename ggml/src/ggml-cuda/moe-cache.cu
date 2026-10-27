@@ -52,17 +52,23 @@ static __device__ __forceinline__ int32_t moe_cache_id(const int32_t * ids, cons
     return (uint32_t) e < (uint32_t) n_expert ? e : 0;
 }
 
+// k15-fn: ids with strided rows (s1 elements apart, s1 = ne0 when contiguous), e.g. the view of the router's argsort
+static __device__ __forceinline__ int32_t moe_cache_id(const int32_t * ids, const int i, const int n_expert, const int ne0, const int s1) {
+    const int32_t e = ids[s1 == ne0 ? i : (i / ne0)*s1 + i % ne0];
+    return (uint32_t) e < (uint32_t) n_expert ? e : 0;
+}
+
 // route tail skip (ggml_moe_cache_set_tail_skip): entry i is skipped if its expert is not cached before this lookup (s < 0, read
 // before the lookup writes the map) and every entry of that expert in the window has a rank (i % ne0, ids in routing order) of at least
 // tail_rank; such an expert is neither admitted, fetched nor left to the host (slot and host id -1), so its rows are 0
 static __device__ __forceinline__ bool moe_cache_tail_skip(const int32_t * ids, const int i, const int32_t s, const int n_ids, const int ne0,
-        const int n_expert, const int tail_rank) {
+        const int n_expert, const int tail_rank, const int s1) {
     if (tail_rank <= 0 || s >= 0 || i % ne0 < tail_rank) {
         return false;
     }
-    const int32_t e = moe_cache_id(ids, i, n_expert);
+    const int32_t e = moe_cache_id(ids, i, n_expert, ne0, s1);
     for (int j = 0; j < n_ids; ++j) {
-        if (j % ne0 < tail_rank && moe_cache_id(ids, j, n_expert) == e) {
+        if (j % ne0 < tail_rank && moe_cache_id(ids, j, n_expert, ne0, s1) == e) {
             return false;
         }
     }
@@ -84,7 +90,10 @@ static __global__ void moe_cache_assign(
         const int n_ids, const int ne0, const int n_expert, const int il, const int n_slots,
         int32_t * __restrict__ counts, const int n_layer, const int fetch_q,
         int32_t * __restrict__ scores, const int grow, const int advance, const int n_scores, const int frozen = 0,
-        const int tail_rank = 0, int32_t * __restrict__ skip_stat = nullptr) {
+        const int tail_rank = 0, int32_t * __restrict__ skip_stat = nullptr, int ids_s1 = 0) {
+    if (ids_s1 <= 0) {
+        ids_s1 = ne0;
+    }
     extern __shared__ int32_t smem[];
     int32_t * miss_e = smem;         // [n_ids] missing experts, in the order of their first use
     int32_t * victim = smem + n_ids; // [n_ids] slots given to them
@@ -112,9 +121,9 @@ static __global__ void moe_cache_assign(
         int n_mis = 0;
         int n_skp = 0;
         for (int i = lane; i < n_ids; i += MOE_CACHE_LANES) {
-            const int32_t e = moe_cache_id(ids, i, n_expert);
+            const int32_t e = moe_cache_id(ids, i, n_expert, ne0, ids_s1);
             const int32_t s = row[e];
-            const bool skip = moe_cache_tail_skip(ids, i, s, n_ids, ne0, n_expert, tail_rank);
+            const bool skip = moe_cache_tail_skip(ids, i, s, n_ids, ne0, n_expert, tail_rank, ids_s1);
             slots[i]             = s;
             fill_s[2*n_ids + i]  = s;
             fill_s[n_ids + i]    = s < 0 && !skip ? e : -1;
@@ -174,8 +183,8 @@ static __global__ void moe_cache_assign(
     int n_hit = 0;
     int n_skp = 0;
     for (int i = lane; i < n_ids; i += MOE_CACHE_LANES) {
-        const int32_t s = row[moe_cache_id(ids, i, n_expert)];
-        const bool skip = moe_cache_tail_skip(ids, i, s, n_ids, ne0, n_expert, tail_rank);
+        const int32_t s = row[moe_cache_id(ids, i, n_expert, ne0, ids_s1)];
+        const bool skip = moe_cache_tail_skip(ids, i, s, n_ids, ne0, n_expert, tail_rank, ids_s1);
         n_skp += skip;
         slots[i] = skip ? MOE_CACHE_SKIPPED : s;
         if (counts != nullptr) {
@@ -185,7 +194,7 @@ static __global__ void moe_cache_assign(
             ref[s] = 1;
             if ((uint32_t) atomicExch(&pin[s], (int32_t) epoch) != epoch) {
                 n_hit++;
-                const int32_t e = moe_cache_id(ids, i, n_expert);
+                const int32_t e = moe_cache_id(ids, i, n_expert, ne0, ids_s1);
                 if (cnt != nullptr) {
                     cnt[e] += cnt[e] < 0x7fffffff;
                 }
@@ -201,7 +210,7 @@ static __global__ void moe_cache_assign(
     int n_miss = 0;
     for (int i0 = 0; i0 < n_ids; i0 += MOE_CACHE_LANES) {
         const int i = i0 + lane;
-        const int32_t e = i < n_ids && slots[i] < 0 ? moe_cache_id(ids, i, n_expert) : -1;
+        const int32_t e = i < n_ids && slots[i] < 0 ? moe_cache_id(ids, i, n_expert, ne0, ids_s1) : -1;
         bool first = e >= 0;
         for (int k = 0; k < MOE_CACHE_LANES; ++k) {
             const int32_t ek = __shfl_sync(full, e, k, MOE_CACHE_LANES);
@@ -434,13 +443,13 @@ static __global__ void moe_cache_assign(
             // every entry of a skipped expert is skipped, so no other entry reads its map entry here
             skip     = true;
             slots[i] = -1;
-            row[moe_cache_id(ids, i, n_expert)] = -1;
+            row[moe_cache_id(ids, i, n_expert, ne0, ids_s1)] = -1;
         } else if (slots[i] < 0) {
-            slots[i] = row[moe_cache_id(ids, i, n_expert)];
+            slots[i] = row[moe_cache_id(ids, i, n_expert, ne0, ids_s1)];
         }
         if (counts != nullptr) {
             // after the copy list: the experts left to the host
-            fill_s[n_ids + i] = slots[i] < 0 && !skip ? moe_cache_id(ids, i, n_expert) : -1;
+            fill_s[n_ids + i] = slots[i] < 0 && !skip ? moe_cache_id(ids, i, n_expert, ne0, ids_s1) : -1;
         }
     }
 
@@ -1082,7 +1091,8 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
     const int n_scores = scores != nullptr ? (int) ggml_nelements(scores) : 0;
     GGML_ASSERT(scores == nullptr || (ggml_is_contiguous(scores) && ggml_nelements(scores) == ggml_nelements(map) && grow > 65536 && grow <= 2*65536));
 
-    GGML_ASSERT(ggml_is_contiguous(ids) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ids->nb[0] == sizeof(int32_t) && ggml_is_contiguous(dst));
+    const int ids_s1 = (int) (ids->nb[1]/sizeof(int32_t)); // k15-fn: rows of ids may be strided
 
     if (n_ids == 0) {
         return; // for example the last layer of a ubatch without outputs
@@ -1112,7 +1122,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
             (const int32_t *) ids->data, (int32_t *) map->data, (int32_t *) state->data, (int32_t *) dst->data,
             n_ids, ne0, n_expert, il, n_slots, (int32_t *) counts->data, (int) map->ne[1], fetch_q,
             scores != nullptr ? (int32_t *) scores->data : nullptr, grow, advance, n_scores, ggml_get_op_params_i32(dst, 15),
-            tail_rank, tail_rank > 0 ? (int32_t *) counts->data + (int64_t) map->ne[1]*n_expert + 4 : nullptr);
+            tail_rank, tail_rank > 0 ? (int32_t *) counts->data + (int64_t) map->ne[1]*n_expert + 4 : nullptr, ids_s1);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -1124,7 +1134,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
         (const int32_t *) ids->data, (int32_t *) map->data, (int32_t *) state->data, (int32_t *) dst->data,
         n_ids, ne0, n_expert, il, n_slots, nullptr, 0, 0,
         scores != nullptr ? (int32_t *) scores->data : nullptr, grow, advance, n_scores, 0,
-        tail_rank, tail_rank > 0 && skip_counts != nullptr ? (int32_t *) skip_counts->data + (int64_t) map->ne[1]*n_expert + 4 : nullptr);
+        tail_rank, tail_rank > 0 && skip_counts != nullptr ? (int32_t *) skip_counts->data + (int64_t) map->ne[1]*n_expert + 4 : nullptr, ids_s1);
     CUDA_CHECK(cudaGetLastError());
 
     moe_cache_fetch_launch(stream, dst, dst->src + 3, n_banks, (const int32_t *) dst->data, n_ids, ne0);

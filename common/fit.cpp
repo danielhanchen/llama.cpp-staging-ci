@@ -1456,7 +1456,18 @@ static void common_params_fit_impl(
         }
 
         // try to fit at least part of one more layer
-        if (ngl_per_device[id_dense_start].n_layer > (id < nd - 1 ? 0 : 1)) {
+        // LLAMA_MTP_EXACT=1: no such layer (LLAMA_FIT_PARTIAL_LAYER=1 keeps it, =0 drops it everywhere). Its host part is no MoE cache
+        // expert set (UP / GATE split the experts, ATTN also moves the router and the shared expert), so the scheduler computes it on
+        // the CPU for small batches: the greedy text then followed which layer the fit split, i.e. the cache size and a draft model's share
+        static const bool partial_layer = [] {
+            const char * e = getenv("LLAMA_FIT_PARTIAL_LAYER");
+            if (e != nullptr) {
+                return atoi(e) != 0;
+            }
+            const char * x = getenv("LLAMA_MTP_EXACT");
+            return !(x != nullptr && atoi(x) != 0);
+        }();
+        if (partial_layer && ngl_per_device[id_dense_start].n_layer > (id < nd - 1 ? 0 : 1)) {
             std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
             size_t id_dense_start_test = id_dense_start;
             ngl_per_device_test[id_dense_start_test].n_layer--;

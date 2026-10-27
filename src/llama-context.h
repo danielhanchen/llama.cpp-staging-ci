@@ -848,6 +848,13 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+    // k15-pp: unmasked next-n rows (MTP) in their own host buffer, sized by the batches that copy them to the host instead of n_batch
+    // (a batch whose rows go to the device sink, LLAMA_MTP_DEV_H, needs none); LLAMA_NEXTN_LAZY=0: in the output buffer at n_batch
+    ggml_backend_buffer_ptr buf_nextn;
+    size_t  nextn_cap_rows  = 0;
+    int64_t nextn_need_rows = 0;   // rows the current decode copies to the host (set before output_reserve)
+    int64_t nextn_decode_rows = 0; // tokens of the current decode (a device-sink batch that falls back to the host needs them all)
+    bool nextn_store_ensure(size_t rows);
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
@@ -862,6 +869,15 @@ private:
     };
     std::vector<state_async_backend> state_async;
     bool state_async_init = false;
+
+    // k15-ov: synchronous state saves read the device rows through two small pinned halves per backend (LLAMA_STATE_BOUNCE_MIB each,
+    // 16): the next half's copies run while the previous half is copied to the destination (see state_get_bounced)
+    struct state_bounce_backend {
+        ggml_backend_buffer_ptr buf;
+        ggml_backend_event_t    ev[2] = { nullptr, nullptr };
+    };
+    std::vector<state_bounce_backend> state_bounce;
+    bool state_get_bounced(const std::vector<llama_state_write_info> & winfos);
 
     // waits for the events, then copies staging -> destination; joined by state_async_wait()
     std::thread state_async_worker;

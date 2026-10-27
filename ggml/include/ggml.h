@@ -604,6 +604,8 @@ extern "C" {
 
         GGML_OP_MOE_CACHE_LOOKUP,
 
+        GGML_OP_KQ_MASK,
+
         GGML_OP_COUNT,
     };
 
@@ -1524,6 +1526,17 @@ extern "C" {
     // host:  device-accessible pointers to the experts of layer il in host memory, with the layout of the banks
     // the missing experts get a slot (the least recently used one, approximated with a CLOCK) and are copied from host memory
     // result: I32 [n_expert_used, n_tokens] slots of the selected experts, then the copied experts; ggml_view_2d(ctx, res, n_expert_used, n_tokens, res->nb[1], 0) gives the ids for ggml_mul_mat_id with a bank
+    // k15-pp: the KQ mask of a KV-cached attention built by the backend from the cells and the tokens (the values of
+    // llama_kv_cache::set_input_kq_mask: 0 = attend, -INFINITY = masked)
+    // cells: I32 [5, n_kv, n_stream]: position (INT32_MIN = empty cell), sequence bits 0-31, sequence bits 32-63, 2D x, 2D y
+    // toks:  I32 [8, n_tps, n_stream]: position, sequence id (< 64), causal, SWA type (enum llama_swa_type), n_swa, 2D (M-RoPE), x, y
+    // result: type (F16 or F32) [n_kv, n_tps, 1, n_stream]
+    GGML_API struct ggml_tensor * ggml_kq_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cells,
+            struct ggml_tensor  * toks,
+            enum ggml_type        type);
+
     GGML_API struct ggml_tensor * ggml_moe_cache_lookup(
             struct ggml_context * ctx,
             struct ggml_tensor  * ids,
