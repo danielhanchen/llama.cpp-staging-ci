@@ -390,8 +390,10 @@ struct server_slot {
         // k15-idlewait (LLAMA_PCS_CKPT_COPY_ASYNC=0: copied here, as before): at a request save the checkpoints the next prompt erases
         // are copied on a thread of the prompt cache into pooled buffers (the same buffers and copies as before, the originals go back
         // to the pool once copied, as the prompt's erase would have put them); the entry waits for it like a state save in flight.
-        // G4 q4x 12 GB chat: the copies of 2 checkpoints (125.6 MiB) were ~20 ms of the request
-        static const bool copy_async = getenv("LLAMA_PCS_CKPT_COPY_ASYNC") == nullptr || atoi(getenv("LLAMA_PCS_CKPT_COPY_ASYNC")) != 0;
+        // G4 q4x 12 GB chat: the copies of 2 checkpoints (125.6 MiB) were ~20 ms of the request.
+        // integration head (coordinator 10-27, RSS-adding defaults are opt-in): opt-in (LLAMA_PCS_CKPT_COPY_ASYNC=1). On by default the
+        // T4 LFM2.5-24B-A2B multi-turn run (mt_local, k15r_cg13 per-switch split) ended +577 MiB RssAnon (3315 vs 2738 MiB), same text
+        static const bool copy_async = getenv("LLAMA_PCS_CKPT_COPY_ASYNC") != nullptr && atoi(getenv("LLAMA_PCS_CKPT_COPY_ASYNC")) != 0;
         const bool ca = !mv && copy_async && at_request && ckpt_keep_max >= -1;
         prompt_cache.clone_async_next = ca;
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, (mv || ca) ? &prompt.checkpoints : nullptr, ckpt_keep_max);
