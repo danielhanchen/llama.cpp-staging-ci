@@ -21,6 +21,8 @@
 #include "ggml-moe-prefetch.h"
 #include <cerrno>
 #include <mutex>
+#include <vector>
+#include <chrono>
 #include <atomic>
 #if defined(__linux__)
 #include <sys/mman.h>
@@ -303,6 +305,9 @@ static void llama_dense_host_pin(const llama_model & model) {
         "page-locked for the copies of offloaded prompt ops in %.1f ms (LLAMA_DENSE_HOST_PIN=1)\n", __func__, done/1048576.0,
         need/1048576.0, n_tensors, bufs.size(), (ggml_time_us() - t0)/1000.0);
 }
+
+// k15-fn: the time of the last ubatch of any context of the process (the PLE table read-in runs in the gaps, see below)
+static std::atomic<int64_t> llama_ple_busy_us{0};
 
 llama_context::llama_context(
         const llama_model & model,
@@ -1073,14 +1078,31 @@ llama_context::llama_context(
                         uint8_t * a0 = (uint8_t *) ((uintptr_t) t->data & ~(uintptr_t) (pg - 1));
                         const size_t len = (size_t) ((uint8_t *) t->data + table - a0);
                         const size_t lead = (size_t) ((uint8_t *) t->data - a0);
-                        const size_t chunk = 64ull << 20;
+                        // 8 MiB per step: a step waits while any context ran a ubatch in the last 300 ms (a request's own reads and faults
+                        // go first: with the mq-deadline / none schedulers of NVMe the idle class is not enforced), then reads the chunk
+                        // into the page cache with pread (no mmap lock held while the disk works: a populate that waited on the disk held
+                        // it and stalled the request's own mapping calls, G4 k15gk: 8k TTFT 17-48 s), then maps the cached pages
+                        const size_t chunk = 8ull << 20;
+                        static const int64_t gap_us = getenv("LLAMA_PLE_RESIDENT_GAP_MS") ? 1000ll*atoll(getenv("LLAMA_PLE_RESIDENT_GAP_MS")) : 300000;
+                        std::vector<uint8_t> rbuf(fd >= 0 ? chunk : 0);
                         bool pop_ok = true;
                         size_t done = 0;
                         for (size_t o = 0; o < len && !stop->load(std::memory_order_relaxed); o += chunk) {
+                            while (background && !stop->load(std::memory_order_relaxed) &&
+                                    ggml_time_us() - llama_ple_busy_us.load(std::memory_order_relaxed) < gap_us) {
+                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                            }
                             const size_t n = std::min(chunk, len - o);
                             if (fd >= 0 && o + n > lead) {
-                                const size_t fo = offs + (o > lead ? o - lead : 0);
-                                (void) posix_fadvise(fd, (off_t) fo, (off_t) (n - (o < lead ? lead - o : 0)), POSIX_FADV_WILLNEED);
+                                const size_t skip = o < lead ? lead - o : 0;
+                                size_t fo = offs + (o + skip - lead), left = n - skip;
+                                while (left > 0) {
+                                    const ssize_t r = pread(fd, rbuf.data(), left, (off_t) fo);
+                                    if (r <= 0) {
+                                        break;
+                                    }
+                                    fo += (size_t) r; left -= (size_t) r;
+                                }
                             }
                             if (pop_ok && madvise(a0 + o, n, 22 /* MADV_POPULATE_READ, Linux 5.14 */) != 0) {
                                 pop_ok = false;
@@ -3186,6 +3208,7 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    llama_ple_busy_us.store(ggml_time_us(), std::memory_order_relaxed); // k15-fn: the PLE read-in waits while ubatches run
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
