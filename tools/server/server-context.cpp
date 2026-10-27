@@ -1536,7 +1536,29 @@ private:
                 // LLAMA_DRAFT_FAIL_HARD=1: exit, as before
                 const char * env_hard = getenv("LLAMA_DRAFT_FAIL_HARD");
                 const bool   hard     = env_hard != nullptr && atoi(env_hard) != 0;
-                const bool   failed   = (has_draft && model_dft == nullptr) || ctx_dft == nullptr;
+                bool         failed   = (has_draft && model_dft == nullptr) || ctx_dft == nullptr;
+                // k17-small: the draft is up, but device memory the fit did not price can leave the GPU too little for the CUDA pools of the
+                // first prompt (Kaggle T4 4 GB, Qwen3.6-35B-A3B UD-Q4_K_XL + MTP, ctx 16384: the fit left 258 MiB, the MTP context's compute
+                // buffer took 233 MiB against the 104 the fit measured and the main one grew 482 -> 514, 74.8 MiB were free after load and the
+                // first prompt aborted with "CUDA error: out of memory" in every launch). A device with less than LLAMA_DRAFT_MIN_FREE_MIB (192)
+                // free after the draft is created drops the draft as above; the main context stays as fitted. LLAMA_DRAFT_MIN_FREE_MIB=0: off
+                if (!failed) {
+                    const char * e_mf = getenv("LLAMA_DRAFT_MIN_FREE_MIB");
+                    const size_t min_free = (size_t) std::max(0, e_mf != nullptr ? atoi(e_mf) : 192) * 1024 * 1024;
+                    for (size_t i = 0; min_free > 0 && i < ggml_backend_dev_count(); ++i) {
+                        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                            continue;
+                        }
+                        size_t dfree = 0, dtotal = 0;
+                        ggml_backend_dev_memory(dev, &dfree, &dtotal);
+                        if (dtotal > 0 && dfree < min_free) {
+                            SRV_WRN("%s: %.1f MiB free after the draft was created, less than %zu MiB (LLAMA_DRAFT_MIN_FREE_MIB)\n",
+                                ggml_backend_dev_name(dev), dfree/1048576.0, min_free/1048576);
+                            failed = true;
+                        }
+                    }
+                }
                 if (has_draft && model_dft == nullptr) {
                     SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
                 } else if (ctx_dft == nullptr) {
