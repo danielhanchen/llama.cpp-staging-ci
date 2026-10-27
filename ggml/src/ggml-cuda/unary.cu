@@ -326,28 +326,34 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
 }
 
 // k15-mm2: unary_gated_op_kernel (F32) plus the q8_1 copy of dst for the mul_mat_vec_q that reads it (see ggml_cuda_q8_1_cache).
-// Thread i holds q8_1 element i of rows of n values padded to nq (nq == n: no padding, the rows are one flat run), computes it with
-// the expression of unary_gated_op_kernel (0 in the padding) and quantizes it as quantize_q8_1 does (one value per lane, the same
-// 32-lane reductions), so dst and the copy have the bytes of the unfused unary_gated_op_kernel + quantize_q8_1 pair.
+// The copy is in the reader's rows: rows of ne10 values (the reader's src1 row width, any width; dst may be a reshape of them) padded
+// to ne10q = ne10 rounded up to MATRIX_ROW_PADDING, as quantize_q8_1 lays the reader's src1 out (k15-fn 414e7c2d4a5's layout, which
+// covers the gated rows themselves and the flat run of rows of a multiple of MATRIX_ROW_PADDING). Thread i holds q8_1 element i, computes
+// dst element e = row*ne10 + col (gated row e / n, column e % n) with the expression of unary_gated_op_kernel (0 in the padding) and
+// quantizes it as quantize_q8_1 does (one value per lane, the same 32-lane reductions), so dst and the copy have the bytes of the unfused
+// unary_gated_op_kernel + quantize_q8_1 pair. x_split: the strided x of k15-fn 6e134f1f896 (column c at (c / xn0)*xs1 + c % xn0)
 template <float (*op)(float), bool x_split = false>
 static __global__ void unary_gated_q8_1_kernel(const float * x, const float * g, float * dst, void * vq, const int64_t kq, const int64_t n,
-        const int64_t nq, const int64_t o0, const int64_t o1, const int64_t xn0 = 0, const int64_t xs1 = 0) {
+        const int64_t ne10, const int64_t ne10q, const int64_t o0, const int64_t o1, const int64_t xn0 = 0, const int64_t xs1 = 0) {
     ggml_cuda_pdl_lc();
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
 
     if (i >= kq) {
         return;
     }
-    const int64_t r = i / nq;
-    const int64_t c = i % nq;
+    const int64_t row = i / ne10q;
+    const int64_t col = i % ne10q;
 
     ggml_cuda_pdl_sync();
     float v = 0.0f;
-    if (c < n) {
+    if (col < ne10) {
+        const int64_t e = row*ne10 + col;
+        const int64_t r = e / n;
+        const int64_t c = e % n;
         const int64_t j0 = x_split ? r * o0 + (c / xn0) * xs1 + c % xn0 : r * o0 + c;
         const int64_t j1 = (o0 == o1 && !x_split) ? j0 : r * o1 + c;
         v = op(x[j0]) * g[j1];
-        dst[r*n + c] = v;
+        dst[e] = v;
     }
 
     float amax = fabsf(v);
@@ -378,47 +384,40 @@ static bool ggml_cuda_gated_q8_1_disabled() {
     return off;
 }
 
-// the q8_1 copy for a contiguous F32 dst of nrows rows of n values that a mul_mat_vec_q reads (a q8_1 cache producer target), or nullptr.
-// The reader's rows are either these rows (nq = n padded to MATRIX_ROW_PADDING) or rows of a multiple of MATRIX_ROW_PADDING (nq = n:
-// the copy is the flat run of all values, see ggml_cuda_q8_1_cache::key_contiguous)
-static void * unary_gated_q8_1_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const int64_t n, int64_t & nq) {
+// the q8_1 copy for a contiguous F32 dst that a mul_mat_vec_q reads (a q8_1 cache producer target), or nullptr; ne10 / ne10q: the
+// reader's row width (ggml_cuda_q8_1_cache::norm_target_ne10, else the gated row width n) and its padded width
+static void * unary_gated_q8_1_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const int64_t n, int64_t & ne10, int64_t & ne10q) {
     ggml_cuda_q8_1_cache & cache = ctx.q8_1_cache;
     if (ggml_cuda_gated_q8_1_disabled() || !cache.active() || ctx.curr_stream_no != 0 || dst->type != GGML_TYPE_F32 ||
             !ggml_is_contiguous(dst) || !cache.norm_targets.count(dst)) {
         return nullptr;
     }
     const auto it = cache.norm_target_ne10.find(dst);
-    const int64_t ne10 = it != cache.norm_target_ne10.end() ? it->second : n;
+    ne10 = it != cache.norm_target_ne10.end() ? it->second : n;
     const int64_t nelem = ggml_nelements(dst);
-    int64_t key[ggml_cuda_q8_1_cache::n_key];
-    if (ne10 == n) {
-        nq = GGML_PAD(n, MATRIX_ROW_PADDING);
-        ggml_cuda_q8_1_cache::key_contiguous(n, nelem / n, key);
-    } else {
-        // the reader's rows carry no padding: one flat run
-        if (ne10 % MATRIX_ROW_PADDING != 0 || nelem % ne10 != 0 || ggml_cuda_q8_1_cache::reshape_disabled()) {
-            return nullptr;
-        }
-        nq = n;
-        ggml_cuda_q8_1_cache::key_contiguous(ne10, nelem / ne10, key);
+    if (ne10 <= 0 || nelem % ne10 != 0) {
+        return nullptr;
     }
-    const int64_t kq = (nelem / n) * nq;
-    return cache.reserve(dst->data, ggml_nbytes(dst), key, kq/QK8_1*sizeof(block_q8_1));
+    ne10q = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const int64_t nrows = nelem / ne10;
+    int64_t key[ggml_cuda_q8_1_cache::n_key];
+    ggml_cuda_q8_1_cache::key_contiguous(ne10, nrows, key);
+    return cache.reserve(dst->data, ggml_nbytes(dst), key, nrows*ne10q/QK8_1*sizeof(block_q8_1));
 }
 
 template <float (*op)(float), typename T>
 static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream,
-        void * q8_1_out = nullptr, const int64_t nq = 0, const int64_t xn0 = 0, const int64_t xs1 = 0) {
+        void * q8_1_out = nullptr, const int64_t ne10 = 0, const int64_t ne10q = 0, const int64_t xn0 = 0, const int64_t xs1 = 0) {
     if constexpr (std::is_same_v<T, float>) {
         if (q8_1_out != nullptr) {
             static_assert(CUDA_GLU_BLOCK_SIZE % QK8_1 == 0, "a warp must cover whole q8_1 blocks");
-            const int64_t kq = (k / n) * nq;
+            const int64_t kq = (k / ne10) * ne10q;
             const int64_t num_blocks = (kq + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
             if (xn0 > 0) {
-                ggml_cuda_kernel_launch(unary_gated_q8_1_kernel<op, true>, launch_params, x, g, dst, q8_1_out, kq, n, nq, o0, o1, xn0, xs1);
+                ggml_cuda_kernel_launch(unary_gated_q8_1_kernel<op, true>, launch_params, x, g, dst, q8_1_out, kq, n, ne10, ne10q, o0, o1, xn0, xs1);
             } else {
-                ggml_cuda_kernel_launch(unary_gated_q8_1_kernel<op>, launch_params, x, g, dst, q8_1_out, kq, n, nq, o0, o1, (int64_t) 0, (int64_t) 0);
+                ggml_cuda_kernel_launch(unary_gated_q8_1_kernel<op>, launch_params, x, g, dst, q8_1_out, kq, n, ne10, ne10q, o0, o1, (int64_t) 0, (int64_t) 0);
             }
             return;
         }
@@ -493,10 +492,10 @@ void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
 
         // k15-mm2: a mul_mat_vec_q reads dst: its q8_1 copy from this kernel
-        int64_t nq = 0;
-        void * q8_1_out = unary_gated_q8_1_reserve(ctx, dst, nc, nq);
+        int64_t ne10 = 0, ne10q = 0;
+        void * q8_1_out = unary_gated_q8_1_reserve(ctx, dst, nc, ne10, ne10q);
         unary_gated_cuda<op>(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), stream,
-            q8_1_out, nq);
+            q8_1_out, ne10, ne10q);
     }
     GGML_UNUSED(dst_d);
     GGML_UNUSED(stream);
@@ -834,10 +833,10 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
         GGML_ASSERT(unary_src->ne[0] == split_src->ne[0] * split_src->ne[1] && ggml_nrows(unary_src) == split_src->ne[2]);
         const int64_t k  = ggml_nelements(mul_node);
         const int64_t nc = unary_src->ne[0];
-        int64_t nq = 0;
-        void * q8_1_out = unary_gated_q8_1_reserve(ctx, mul_node, nc, nq);
+        int64_t ne10 = 0, ne10q = 0;
+        void * q8_1_out = unary_gated_q8_1_reserve(ctx, mul_node, nc, ne10, ne10q);
         unary_gated_cuda<op>((const float *) split_src->data, (const float *) other_src->data, (float *) mul_node->data, k, nc,
-                             split_src->nb[2] / sizeof(float), other_src->nb[1] / sizeof(float), ctx.stream(), q8_1_out, nq,
+                             split_src->nb[2] / sizeof(float), other_src->nb[1] / sizeof(float), ctx.stream(), q8_1_out, ne10, ne10q,
                              split_src->ne[0], split_src->nb[1] / sizeof(float));
         return;
     }
@@ -869,11 +868,11 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
                              unary_stride / sizeof(nv_bfloat16), other_stride / sizeof(nv_bfloat16), stream);
     } else {
         // k15-mm2: a mul_mat_vec_q reads the product: its q8_1 copy from this kernel
-        int64_t nq = 0;
-        void * q8_1_out = unary_gated_q8_1_reserve(ctx, mul_node, nc, nq);
+        int64_t ne10 = 0, ne10q = 0;
+        void * q8_1_out = unary_gated_q8_1_reserve(ctx, mul_node, nc, ne10, ne10q);
         unary_gated_cuda<op>((const float *) unary_src->data, (const float *) other_src->data,
                              (float *) mul_node->data, k, nc,
-                             unary_stride / sizeof(float), other_stride / sizeof(float), stream, q8_1_out, nq);
+                             unary_stride / sizeof(float), other_stride / sizeof(float), stream, q8_1_out, ne10, ne10q);
     }
 }
 
