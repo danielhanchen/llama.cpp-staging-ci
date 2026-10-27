@@ -7285,6 +7285,32 @@ static const ggml_tensor * ggml_cuda_fused_match(const ggml_cgraph * cgraph, int
             return c2;
         }
     }
+
+    // SILU / SIGMOID / SOFTPLUS + MUL in one kernel (ggml_cuda_op_unary_mul, also the gated q8_1 producer of k15-mm2): thread i writes
+    // product element r*n + c and reads input element r*o + c. The allocator does put the product on the unary input (Qwen3.6 /
+    // Flash-Next attn_gated), safe for contiguous rows (each thread reads what it writes), not for a strided input whose elements
+    // other threads still read: such inputs only (none in the current models, so their placement is unchanged). Same rule as k15-mm2
+    // 35b80a4d1dc. GGML_CUDA_UNARY_MUL_ALIAS=1
+    static const bool um_alias = ggml_cuda_env_flag("GGML_CUDA_UNARY_MUL_ALIAS");
+    if (!um_alias && n0->op == GGML_OP_UNARY && i + 1 < cgraph->n_nodes) {
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+        const ggml_unary_op uop = ggml_get_unary_op(n0);
+        if (mul->op == GGML_OP_MUL && (mul->src[0] == n0 || mul->src[1] == n0) &&
+                (uop == GGML_UNARY_OP_SILU || uop == GGML_UNARY_OP_SIGMOID || uop == GGML_UNARY_OP_SOFTPLUS)) {
+            const auto strided = [](const ggml_tensor * t) {
+                return t != nullptr && ggml_nrows(t) > 1 && t->nb[1] != (size_t) t->ne[0]*ggml_element_size(t);
+            };
+            ggml_tensor * other = mul->src[0] == n0 ? mul->src[1] : mul->src[0];
+            for (ggml_tensor * t : { n0->src[0], other }) {
+                if (strided(t)) {
+                    inputs.push_back(t);
+                }
+            }
+            if (!inputs.empty()) {
+                return mul;
+            }
+        }
+    }
     return nullptr;
 }
 
