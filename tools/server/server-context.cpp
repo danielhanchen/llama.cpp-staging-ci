@@ -1931,7 +1931,7 @@ private:
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
             {
                 // k15-idlewait: the idle checkpoint lend and the deferred drop are for a single slot only
-                static const bool lend_env  = getenv("LLAMA_PCS_IDLE_LEND") == nullptr || atoi(getenv("LLAMA_PCS_IDLE_LEND")) != 0;
+                static const bool lend_env  = getenv("LLAMA_PCS_IDLE_LEND") != nullptr && atoi(getenv("LLAMA_PCS_IDLE_LEND")) != 0;
                 static const bool defer_env = getenv("LLAMA_PCS_DROP_DEFER") == nullptr || atoi(getenv("LLAMA_PCS_DROP_DEFER")) != 0;
                 prompt_cache->drop_defer_ok = params_base.n_parallel == 1;
                 SRV_INF("prompt cache: idle checkpoint lend %s, deferred drop %s (n_parallel = %d)\n",
@@ -2047,7 +2047,9 @@ private:
                             (prompt_cache->limit_tokens > 0 && prompt_cache->n_tokens() + slot.prompt.tokens.size() > prompt_cache->limit_tokens)) {
                             continue;
                         }
-                        static const bool lend_env = getenv("LLAMA_PCS_IDLE_LEND") == nullptr || atoi(getenv("LLAMA_PCS_IDLE_LEND")) != 0;
+                        // integration head (coordinator 10-27): opt-in (LLAMA_PCS_IDLE_LEND=1). On by default it ended the local multi-turn run
+                        // (mt_local) with about +270 MiB host RSS on Qwen3.6 MTP and +370 to +560 MiB on LFM2.5 against the pre-idlewait head
+                        static const bool lend_env = getenv("LLAMA_PCS_IDLE_LEND") != nullptr && atoi(getenv("LLAMA_PCS_IDLE_LEND")) != 0;
                         slot.prompt_saved_idle_new = slot.prompt_save(*prompt_cache, -2, idle_save == 2, lend_env && params_base.n_parallel == 1);
                         if (slot.prompt_saved_idle_new) {
                             prompt_cache->update();
