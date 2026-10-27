@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "llama-moe-cache.h"
 #include "llama-sysmem.h"
 
@@ -6628,8 +6629,9 @@ struct llama_moe_cache::impl {
             // a measurement (e.g. for --fit) counts the memory with lending: when the device is short of memory the cache lends anyway
             return true;
         }
-        // headroom for the memory the backends allocate while computing (e.g. the CUDA pool)
-        constexpr size_t margin = 512ull*1024*1024;
+        // headroom for the memory the backends allocate while computing (e.g. the CUDA pool); k16-fit: at least the memory --fit left
+        // free (LLAMA_FIT_TARGET_MIB, set by common), which an unlent staging arena must not take
+        const size_t margin = std::max<size_t>(512ull*1024*1024, getenv("LLAMA_FIT_TARGET_MIB") ? (size_t) atoll(getenv("LLAMA_FIT_TARGET_MIB"))*1024*1024 : 0);
         size_t free  = 0;
         size_t total = 0;
         ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);

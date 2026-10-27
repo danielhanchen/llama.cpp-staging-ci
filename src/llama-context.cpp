@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "llama-context.h"
 
 #include "ggml.h"
@@ -1473,6 +1474,24 @@ void llama_context::sched_reserve() {
         }
     }
 
+    // k16-fit: a memory probe (no_alloc: the --fit measurements) prices the graph that seeds the MoE cache (sched_reserve_seed), which
+    // the loaded context reserves after the pp graph and which so far took its growth from the fit's free-memory target (Qwen3.8-Flash-Next
+    // UD-IQ1_S, 16 GB, Studio argv: 1092 -> 1459 MiB); the loaded context then reserves it without its own free-memory check (the fit made
+    // the room), see sched_reserve_seed. LLAMA_FIT_SEED_PRICE=0: not priced, the context reserves it only where it fits beside 512 MiB
+    if (fit_seed_price_on() && model.hparams.no_alloc && moe_cache && moe_cache_seed_sync && n_tokens > llama_moe_cache::n_small_max &&
+            (int64_t) n_tokens >= prefetch_min_batch) {
+        std::vector<size_t> sizes(backend_ptrs.size(), 0);
+        moe_cache_seed = true;
+        graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), /*split_only =*/ true, sizes.data());
+        moe_cache_seed = false;
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            if (!ggml_backend_buft_is_host(backend_buft[i])) {
+                backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], sizes[i]);
+            }
+        }
+        g_fit_seed_priced.store(true);
+    }
+
     // the measure of the MoE cache auto n_ubatch (LLAMA_MOE_MEASURE_LENT=1, set by common_moe_cache_auto_ubatch) counts the compute buffer
     // the loaded context ends up with: the staging copies lent by the MoE cache (none of the arena), and the seed graph when it is larger
     // than the pp graph (a prompt ubatch that seeds the cache holds the expert copies of its cached layers in the graph allocation), which
@@ -1595,6 +1614,20 @@ void llama_context::sched_reserve() {
                 val(n_input_tensors_pp, n_input_tensors_tg).c_str());
     }
 
+    {
+        static const bool trace = getenv("LLAMA_RESERVE_TRACE") != nullptr && atoi(getenv("LLAMA_RESERVE_TRACE")) != 0;
+        if (trace && !model.hparams.no_alloc) {
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+                if (dev != nullptr && !ggml_backend_buft_is_host(backend_buft[i])) {
+                    size_t free = 0, total = 0;
+                    ggml_backend_dev_memory(dev, &free, &total);
+                    fprintf(stderr, "reserve-trace: free after reserve %s %.2f MiB\n", ggml_backend_name(backend_ptrs[i]), free/1048576.0);
+                }
+            }
+        }
+    }
+
     const int64_t t_end_us = ggml_time_us();
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
@@ -1658,9 +1691,18 @@ void llama_context::moe_cache_devseed_fallback() {
     }
 }
 
+// k16-fit: set once a memory probe of this process priced a seed graph (sched_reserve): the fit then made room for it
+std::atomic<bool> llama_context::g_fit_seed_priced{false};
+
+bool llama_context::fit_seed_price_on() {
+    static const bool on = getenv("LLAMA_FIT_SEED_PRICE") == nullptr || atoi(getenv("LLAMA_FIT_SEED_PRICE")) != 0;
+    return on;
+}
+
 bool llama_context::sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const std::vector<size_t> & staging_pp) {
-    // headroom for the memory the backends allocate while computing (e.g. the CUDA pool), which a larger compute buffer would take
-    constexpr size_t margin = 512ull*1024*1024;
+    // headroom for the memory the backends allocate while computing (e.g. the CUDA pool), which a larger compute buffer would take;
+    // k16-fit: at least the memory --fit left free (LLAMA_FIT_TARGET_MIB, set by common), which this optional graph must not take
+    const size_t margin = std::max<size_t>(512ull*1024*1024, getenv("LLAMA_FIT_TARGET_MIB") ? (size_t) atoll(getenv("LLAMA_FIT_TARGET_MIB"))*1024*1024 : 0);
 
     // the measure may release a graph allocator buffer that is too small for this graph, the free memory then includes it
     std::vector<size_t> cur(backend_ptrs.size(), 0);
@@ -1700,6 +1742,11 @@ bool llama_context::sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint3
                 ggml_backend_buft_name(backend_buft[i]), (graph - cur_gph)/1024.0/1024.0, free/1024.0/1024.0, margin/1024.0/1024.0);
             fits = false;
         }
+    }
+    if (!fits && fit_seed_price_on() && g_fit_seed_priced.load()) {
+        // the fit priced this graph: reserve it (a failed allocation still falls back below)
+        LLAMA_LOG_INFO("%s: the fit priced the seed graph: reserved without the headroom check (LLAMA_FIT_SEED_PRICE=0: checked)\n", __func__);
+        fits = true;
     }
     if (!fits) {
         return false;
@@ -5923,6 +5970,18 @@ ggml_cgraph * llama_context::graph_reserve(
         GGML_ASSERT(!sizes);
         LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
         return nullptr;
+    }
+
+    // k16-draft (debug, LLAMA_RESERVE_TRACE=1): every reserve's device buffer sizes, also in a memory probe (whose log the fit silences)
+    static const bool trace = getenv("LLAMA_RESERVE_TRACE") != nullptr && atoi(getenv("LLAMA_RESERVE_TRACE")) != 0;
+    if (trace) {
+        fprintf(stderr, "reserve-trace: %s tokens %u seqs %u outputs %u split_only %d seed %d:", model.hparams.no_alloc ? "probe" : "real",
+                n_tokens, n_seqs, n_outputs, (int) split_only, (int) moe_cache_seed);
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            const size_t sz = split_only ? (sizes ? sizes[i] : 0) : ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+            fprintf(stderr, " %s %.2f", ggml_backend_name(backend_ptrs[i]), sz/1048576.0);
+        }
+        fprintf(stderr, "\n");
     }
 
     return gf;

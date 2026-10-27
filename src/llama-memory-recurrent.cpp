@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "llama-memory-recurrent.h"
 
 #include "ggml-backend.h"
@@ -127,8 +128,10 @@ llama_memory_recurrent::llama_memory_recurrent(
     // rollback snapshots has (mem_size): that copy is the slack every fit had so far, which covers the fit's compute estimate being short
     // of the real buffer (local B200 fn1 16 GB: fit 1091 MiB, sched_reserve 1459 MiB; without the slack the server ended at 515-600 MiB
     // free under the 1024 MiB target). Only the rollback rows (n_rs_seq) are no longer counted twice.
-    // LLAMA_RS_PROBE_DUMMY=0: allocate as before; =2: no real memory at all (also the base rows; leaves the compute shortfall uncovered)
-    static const int probe_dummy = getenv("LLAMA_RS_PROBE_DUMMY") == nullptr ? 1 : atoi(getenv("LLAMA_RS_PROBE_DUMMY"));
+    // k16-fit: the compute shortfall is the seed graph, which the probe now prices (llama_context::sched_reserve, LLAMA_FIT_SEED_PRICE),
+    // so by default (=2) the probe holds no real memory at all and every state is counted once.
+    // LLAMA_RS_PROBE_DUMMY=0: allocate as before (all rows twice); =1: real memory for the base rows only (their slack kept)
+    static const int probe_dummy = getenv("LLAMA_RS_PROBE_DUMMY") == nullptr ? 2 : atoi(getenv("LLAMA_RS_PROBE_DUMMY"));
     probe_sized = hparams.no_alloc && probe_dummy != 0;
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf;
