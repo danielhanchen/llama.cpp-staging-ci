@@ -10970,10 +10970,23 @@ static size_t ggml_backend_cuda_moe_fetch_overlap_min_bytes(ggml_backend_dev_t d
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
+// k17-small: the compute capability of a CUDA device as major*100 + minor*10 (e.g. 750 for a T4), -1 if dev is not a CUDA device
+static int ggml_backend_cuda_dev_compute_capability(ggml_backend_dev_t dev) {
+    if (dev == nullptr || ggml_backend_dev_backend_reg(dev) != ggml_backend_cuda_reg()) {
+        return -1;
+    }
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    const int cc     = ggml_cuda_info().devices[device].cc;
+    return cc >= GGML_CUDA_CC_OFFSET_MTHREADS ? -1 : cc;   // NVIDIA only (AMD / Moore Threads carry an offset)
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_moe_fetch_overlap_min_bytes") == 0) {
         return (void *)ggml_backend_cuda_moe_fetch_overlap_min_bytes;
+    }
+    if (strcmp(name, "ggml_backend_dev_compute_capability") == 0) {
+        return (void *)ggml_backend_cuda_dev_compute_capability;
     }
     if (strcmp(name, "ggml_backend_moe_fetch_overlap_default") == 0) {
         return (void *)ggml_backend_cuda_moe_fetch_overlap_default;

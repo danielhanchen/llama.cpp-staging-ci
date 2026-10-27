@@ -1542,12 +1542,27 @@ private:
                 // buffer took 233 MiB against the 104 the fit measured and the main one grew 482 -> 514, 74.8 MiB were free after load and the
                 // first prompt aborted with "CUDA error: out of memory" in every launch). A device with less than LLAMA_DRAFT_MIN_FREE_MIB (192)
                 // free after the draft is created drops the draft as above; the main context stays as fitted. LLAMA_DRAFT_MIN_FREE_MIB=0: off
+                // The floor is per device: 192 MiB below compute capability 8.0, 32 MiB from 8.0 on. G4 (RTX PRO 6000, cc 12.0) runs the
+                // same q4x 4 GB 16k + MTP with 58.6 MiB free (decode 169 tok/s; dropping the draft there costs 30%), while q3m 4 GB 32k + MTP
+                // with 18.6 MiB free aborts in rs_replay_commit. LLAMA_DRAFT_MIN_FREE_MIB=N sets one floor for every device
                 if (!failed) {
                     const char * e_mf = getenv("LLAMA_DRAFT_MIN_FREE_MIB");
-                    const size_t min_free = (size_t) std::max(0, e_mf != nullptr ? atoi(e_mf) : 192) * 1024 * 1024;
-                    for (size_t i = 0; min_free > 0 && i < ggml_backend_dev_count(); ++i) {
+                    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
                         if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                            continue;
+                        }
+                        int mib = 192;
+                        if (e_mf != nullptr) {
+                            mib = atoi(e_mf);
+                        } else {
+                            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                            auto cc_fn = reg ? (int (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_compute_capability") : nullptr;
+                            const int cc = cc_fn != nullptr ? cc_fn(dev) : -1;
+                            mib = cc >= 800 ? 32 : 192;   // also non-CUDA GPUs (no capability): 192
+                        }
+                        const size_t min_free = (size_t) std::max(0, mib) * 1024 * 1024;
+                        if (min_free == 0) {
                             continue;
                         }
                         size_t dfree = 0, dtotal = 0;
