@@ -4515,10 +4515,13 @@ static std::vector<size_t>           g_ckpt_pool_pending;
 static size_t g_ckpt_pool_req_max = 0;
 
 // ... and at most twice the largest request (one state being saved, one ready for the next save): a pool kept at its byte cap held up to
-// 1 GiB idle at the end of a run, 6-7x the state of LFM2.5 (opt-in LLAMA_STATE_POOL_REL=1; default: the byte cap alone)
+// 1 GiB idle at the end of a run, 6-7x the state of LFM2.5. k17: default on (LLAMA_STATE_POOL_REL=0: the byte cap alone), with the
+// request save's checkpoint copies on a thread (LLAMA_PCS_CKPT_COPY_ASYNC) the T4 multi-turn run ends below the copies made in place:
+// LFM2.5 2553 vs 2740 MiB, Qwen3.6 MTP 23379 vs 23975 MiB (with LLAMA_STATE_POOL_PENDING and _SMALL_FRESH), same text, same VmHWM,
+// G4 q4x 12 GB chat TTFT 101 vs 125 ms
 static size_t ckpt_pool_limit() {
     static const size_t lim = (size_t) (getenv("LLAMA_STATE_POOL_MIB") ? std::max(0, atoi(getenv("LLAMA_STATE_POOL_MIB"))) : 1024) << 20;
-    static const bool rel = getenv("LLAMA_STATE_POOL_REL") != nullptr && atoi(getenv("LLAMA_STATE_POOL_REL")) != 0;
+    static const bool rel = getenv("LLAMA_STATE_POOL_REL") == nullptr || atoi(getenv("LLAMA_STATE_POOL_REL")) != 0;
     return rel ? std::min(lim, 2*g_ckpt_pool_req_max + (g_ckpt_pool_req_max/8)) : lim;
 }
 
