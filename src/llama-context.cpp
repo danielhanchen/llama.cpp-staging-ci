@@ -1976,7 +1976,7 @@ void llama_context::sched_reserve() {
     // UD-IQ1_S, 16 GB, Studio argv: 1092 -> 1459 MiB); the loaded context then reserves it without its own free-memory check (the fit made
     // the room), see sched_reserve_seed. LLAMA_FIT_SEED_PRICE=0: not priced, the context reserves it only where it fits beside 512 MiB
     if (fit_seed_price_on() && model.hparams.no_alloc && moe_cache && moe_cache_seed_sync && n_tokens > llama_moe_cache::n_small_max &&
-            (int64_t) n_tokens >= prefetch_min_batch) {
+            (int64_t) n_tokens >= prefetch_min_batch && seed_price_wanted()) {
         std::vector<size_t> sizes(backend_ptrs.size(), 0);
         moe_cache_seed = true;
         graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), /*split_only =*/ true, sizes.data());
@@ -2196,6 +2196,35 @@ bool llama_context::fit_seed_price_on() {
     return on;
 }
 
+// k16-seed: whether the fit prices the host seed of a prompt (sched_reserve_seed) for this context's MoE cache. The host seed reads the
+// routing of the prompt's last ubatch before its uploads (they no longer run ahead of the compute of each layer) and admits the experts
+// that ubatch uses. Where the cache holds the experts of many tokens, that ubatch admits nearly the whole cache again while its uploads
+// wait, and the prompt pays for it: G4 k16d_g4cut, Qwen3.6-35B-A3B UD-Q4_K_XL + MTP (the experts of 9.6 / 16 tokens cached at 12 / 16 GB),
+// 2k prompt 5528 -> 6547 / 6070 -> 7866 tok/s unpriced, decode within the A/A spread; where it holds few, the seed pays (Qwen3.8-Flash-Next
+// UD-IQ4_XS, 2.4 / 6.1 tokens: prompts +2.6%, 16 GB 8k decode +4.8% priced). Unpriced, the context seeds as before the price: the host seed
+// where it fits beside the headroom, else the device seed (moe_cache_devseed_fallback) or none. LLAMA_FIT_SEED_PRICE_MAX_TOKENS (8): the
+// experts of at most that many tokens cached; LLAMA_FIT_SEED_PRICE=1 prices it always, =0 never
+bool llama_context::seed_price_wanted() const {
+    if (!fit_seed_price_on() || !moe_cache) {
+        return false;
+    }
+    const char * env = getenv("LLAMA_FIT_SEED_PRICE");
+    if (env != nullptr && atoi(env) == 1) {
+        return true;
+    }
+    static const double max_tokens = getenv("LLAMA_FIT_SEED_PRICE_MAX_TOKENS") ? atof(getenv("LLAMA_FIT_SEED_PRICE_MAX_TOKENS")) : 8.0;
+    const double frac = moe_cache->cache_frac() >= 0.0 ? moe_cache->cache_frac() :
+        (double) cparams.moe_cache_size/std::max<double>(1.0, (double) llama_moe_cache::host_bytes(model));
+    const uint32_t n_used = model.hparams.n_expert_used_max();
+    const double tokens = n_used > 0 ? frac*(double) model.hparams.n_expert/(double) n_used : 0.0;
+    static const bool trace = getenv("LLAMA_RESERVE_TRACE") != nullptr && atoi(getenv("LLAMA_RESERVE_TRACE")) != 0;
+    if (trace) {
+        fprintf(stderr, "reserve-trace: %s seed price: cache share %.4f, the experts of %.2f tokens (priced up to %.2f): %s\n",
+            model.hparams.no_alloc ? "probe" : "real", frac, tokens, max_tokens, tokens <= max_tokens ? "priced" : "not priced");
+    }
+    return tokens <= max_tokens;
+}
+
 bool llama_context::sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const std::vector<size_t> & staging_pp) {
     // headroom for the memory the backends allocate while computing (e.g. the CUDA pool), which a larger compute buffer would take;
     // k16-fit: at least the memory --fit left free (LLAMA_FIT_TARGET_MIB, set by common), which this optional graph must not take
@@ -2240,7 +2269,7 @@ bool llama_context::sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint3
             fits = false;
         }
     }
-    if (!fits && fit_seed_price_on() && g_fit_seed_priced.load()) {
+    if (!fits && fit_seed_price_on() && g_fit_seed_priced.load() && seed_price_wanted()) {
         // the fit priced this graph: reserve it (a failed allocation still falls back below)
         LLAMA_LOG_INFO("%s: the fit priced the seed graph: reserved without the headroom check (LLAMA_FIT_SEED_PRICE=0: checked)\n", __func__);
         fits = true;
