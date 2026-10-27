@@ -1,6 +1,7 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "llama-graph.h"
 
+#include <atomic>
 #include <mutex>
 #include <typeinfo>
 #include <unordered_map>
@@ -3081,6 +3082,17 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
 
     ggml_tensor * slot_map = moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0], n_tokens);
     if (slot_map == nullptr) {
+        // k17-strict: a small batch that neither the device lookup nor the slot map serves (n_tokens * n_expert_used above the slots)
+        // reads the layer's host expert tensors: its MUL_MAT_ID runs on the CPU. Logged once per (size, batch invariant) for the gates
+        if (n_tokens <= llama_moe_cache::n_small_max && !moe_cache->force_large()) {
+            static std::atomic<uint64_t> seen{0};
+            const uint64_t bit = 1ull << ((n_tokens & 31) + (cparams.batch_invariant ? 32 : 0));
+            if ((seen.fetch_or(bit) & bit) == 0) {
+                LLAMA_LOG_INFO("%s: MoE cache: a %sbatch of %d tokens reads the host experts of layer %d (the cache serves %d tokens on the "
+                    "device): its expert products run on the CPU\n", __func__, cparams.batch_invariant ? "batch invariant verify " : "",
+                    (int) n_tokens, il, (int) moe_cache->n_tokens_cached());
+            }
+        }
         return nullptr;
     }
 
