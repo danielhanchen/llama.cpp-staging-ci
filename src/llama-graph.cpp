@@ -1,6 +1,8 @@
 #include "llama-graph.h"
 
+#include <mutex>
 #include <typeinfo>
+#include <unordered_map>
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1461,6 +1463,26 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// k15-fn (LLAMA_SAMPLER_REBIND_REUSE=0 off): the latest build of each sampler with per-step graph inputs (dist, penalties keep their input
+// tensors from the graph built last): a kept graph (the small-graph cache keeps one per ubatch size) built before is built again
+// instead of reused, so its own inputs are the ones set (else the other graph's were, and its own stayed uninitialized)
+static std::mutex                                       llm_sampler_bind_mutex;
+static std::unordered_map<const llama_sampler *, uint64_t> llm_sampler_bind_build;
+static uint64_t                                         llm_sampler_bind_next = 0;
+
+void llm_graph_sampler_unbind(const llama_sampler * smpl) {
+    std::lock_guard<std::mutex> lock(llm_sampler_bind_mutex);
+    llm_sampler_bind_build.erase(smpl);
+}
+
+llm_graph_input_sampling::llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) : samplers(std::move(samplers)) {
+    std::lock_guard<std::mutex> lock(llm_sampler_bind_mutex);
+    build_id = ++llm_sampler_bind_next;
+    for (const auto & [seq_id, smpl] : this->samplers) {
+        llm_sampler_bind_build[smpl] = build_id;
+    }
+}
+
 bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
     if (samplers.size() != params.samplers.size()) {
         return false;
@@ -1469,6 +1491,27 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
     for (const auto & [seq_id, sampler] : params.samplers) {
         if (samplers[seq_id] != sampler) {
             return false;
+        }
+    }
+
+    static const bool rebind = getenv("LLAMA_SAMPLER_REBIND_REUSE") == nullptr || atoi(getenv("LLAMA_SAMPLER_REBIND_REUSE")) != 0;
+    {
+        std::lock_guard<std::mutex> lock(llm_sampler_bind_mutex);
+        for (const auto & [seq_id, sampler] : samplers) {
+            const auto it = llm_sampler_bind_build.find(sampler);
+            // a sampler set again (llama_set_sampler: possibly a new chain at a freed one's address) has no build until its next one
+            if ((it == llm_sampler_bind_build.end() || it->second != build_id) && llama_sampler_graph_bound(sampler)) {
+                if (rebind) {
+                    return false;
+                }
+                // the kill switch: the graph is reused with its sampler inputs bound to another graph (counted for the regression check)
+                static int64_t n_stale = 0;
+                if (++n_stale == 1 || n_stale % 100 == 0) {
+                    LLAMA_LOG_WARN("%s: a graph reused with its sampler inputs bound to another graph (%lld times, LLAMA_SAMPLER_REBIND_REUSE=0)\n",
+                        __func__, (long long) n_stale);
+                }
+                break;
+            }
         }
     }
 
@@ -2973,7 +3016,11 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     // small batches: the slots are looked up on the device, which also copies the missing experts from host memory
     {
         ggml_tensor * ids = selected_experts;
-        if (!ggml_is_contiguous(ids)) {
+        // k15-fn (LLAMA_MOE_LOOKUP_IDS_VIEW=0 off): the lookup reads the router's top-k view (rows strided in the argsort) directly,
+        // one CONT launch less per MoE layer in every decode and verify graph (fn: 47 of ~2400-2700 kernels per graph)
+        static const bool ids_view = getenv("LLAMA_MOE_LOOKUP_IDS_VIEW") == nullptr || atoi(getenv("LLAMA_MOE_LOOKUP_IDS_VIEW")) != 0;
+        const bool rows_ok = ids->nb[0] == ggml_type_size(ids->type) && ids->ne[2] == 1 && ids->ne[3] == 1;
+        if (!ggml_is_contiguous(ids) && !(ids_view && rows_ok)) {
             ids = ggml_cont(ctx0, ids);
         }
         if (ggml_tensor * res = moe_cache->lookup(ctx0, il, ids, n_tokens)) {
