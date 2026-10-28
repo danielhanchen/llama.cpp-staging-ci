@@ -1272,7 +1272,36 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 }
 
 bool llama_kv_cache::lazy_ensure(uint32_t n_cells, bool shrink_ok) {
-    if (lazy_bufs.empty() || n_cells <= lazy_cells) {
+    if (lazy_bufs.empty()) {
+        return true;
+    }
+    // k17-small (lazy KV step 2): at the first batch, the device keeps at least LLAMA_KV_LAZY_MIN_FREE_MIB (128) free for the
+    // allocations of its first graphs (the CUDA pool), the MoE cache giving the rest back. The cache holds the KV bytes not backed
+    // yet, and a context created after this one can leave the device without room for them: k17lkv_g4e, G4 q4x 4 GB 16k + MTP, the
+    // cache lent the drafter's staging copies and 14 MiB were left, the first request ran out of memory in mul_mat_q (LLAMA_KV_LAZY=0:
+    // 190 MiB free, the staging not allocated)
+    if (shrink_ok && lazy_shrink_fn != nullptr && !lazy_min_free_done) {
+        lazy_min_free_done = true;
+        static const int64_t min_free = (getenv("LLAMA_KV_LAZY_MIN_FREE_MIB") != nullptr ? std::max<int64_t>(0, atoll(getenv("LLAMA_KV_LAZY_MIN_FREE_MIB"))) : 128) << 20;
+        std::set<ggml_backend_dev_t> devs;
+        for (ggml_backend_buffer_t buf : lazy_bufs) {
+            devs.insert(ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf)));
+        }
+        for (ggml_backend_dev_t dev : devs) {
+            size_t free = 0;
+            size_t total = 0;
+            if (dev == nullptr) {
+                continue;
+            }
+            ggml_backend_dev_memory(dev, &free, &total);
+            if ((int64_t) free < min_free) {
+                const size_t got = lazy_shrink_fn(dev, (size_t) (min_free - (int64_t) free));
+                LLAMA_LOG_INFO("%s: lazy KV: %.2f MiB free on %s at the first batch, the MoE cache gave back %.2f MiB (LLAMA_KV_LAZY_MIN_FREE_MIB = %" PRId64 ")\n",
+                    __func__, free/1048576.0, ggml_backend_dev_name(dev), got/1048576.0, min_free >> 20);
+            }
+        }
+    }
+    if (n_cells <= lazy_cells) {
         return true;
     }
     static const uint32_t step = getenv("LLAMA_KV_LAZY_STEP") != nullptr ? (uint32_t) std::max(256, atoi(getenv("LLAMA_KV_LAZY_STEP"))) : 1024;
