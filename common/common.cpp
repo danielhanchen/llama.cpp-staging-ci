@@ -2405,6 +2405,62 @@ static bool common_fit_draft_on_cpu(
             gpu      = tok_ok;
         }
     }
+    // k18 (LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT, default 1; LLAMA_DRAFT_REQUANT=off disables, an explicit type forces it in every fit):
+    // a draft refused at its file's types is measured again with its FFN / expert matrices at q3_k and its output matrix at q4_k
+    // (requantized at load, see llama_model_loader general.requant_type) and gets the GPU when the cache it then leaves holds the experts
+    // of at least that many tokens per layer; the load then uses those types (LLAMA_DRAFT_REQUANT / _OUTPUT are set for it). Drafts are
+    // verified: the output is the target's, only the acceptance moves. G4, Qwen3.8-Flash-Next UD-IQ4_XS 12 GB + its Q8_0 MTP drafter:
+    // refused (0.4 tokens) -> q3_k / q4_k admitted (1.x tokens), request time chat / 2k / 8k 3.30 / 4.03 / 4.82 -> 2.39 / 4.01 / 4.46 s
+    const char * env_rq = getenv("LLAMA_DRAFT_REQUANT");
+    const bool rq_off = env_rq != nullptr && (strcmp(env_rq, "off") == 0 || strcmp(env_rq, "0") == 0 || strcmp(env_rq, "none") == 0);
+    const bool rq_set = env_rq != nullptr && !rq_off && env_rq[0] != 0;
+    int64_t rq_min_tok = 1;
+    if (const char * e = getenv("LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT")) {
+        rq_min_tok = std::max(0, atoi(e));
+    }
+    double rq_tok = -1.0, rq_dft = 0.0;
+    if (!gpu && !rq_off && !rq_set && rq_min_tok > 0 && host > 0.0 && (needs_target == nullptr || !*needs_target)) {
+        std::vector<llama_model_kv_override> kvo;
+        if (mparams_dft.kv_overrides != nullptr) {
+            for (const llama_model_kv_override * p = mparams_dft.kv_overrides; p->key[0] != 0; ++p) {
+                kvo.push_back(*p);
+            }
+        }
+        for (const auto & kv : { std::make_pair("general.requant_type", "q3_k"), std::make_pair("general.requant_output_type", "q4_k") }) {
+            llama_model_kv_override o = {};
+            snprintf(o.key, sizeof(o.key), "%s", kv.first);
+            o.tag = LLAMA_KV_OVERRIDE_TYPE_STR;
+            snprintf(o.val_str, sizeof(o.val_str), "%s", kv.second);
+            kvo.push_back(o);
+        }
+        kvo.emplace_back();
+        kvo.back().key[0] = 0;
+        llama_model_params mp_rq = mparams_dft;
+        mp_rq.kv_overrides = kvo.data();
+        try {
+            common_draft_measure_env split_env;
+            std::vector<ggml_backend_dev_t> devs_rq;
+            uint32_t ngl2 = 0, nct2 = 0, nex2 = 0;
+            const auto dmds = common_get_device_memory_data(path_dft.c_str(), &mp_rq, &cparams_dft, devs_rq, ngl2, nct2, nex2, log_level);
+            for (size_t i = 0; i < devs_rq.size() && i < dmds.size(); i++) {
+                rq_dft += dmds[i].model + dmds[i].context + dmds[i].compute;
+            }
+        } catch (const std::exception & e) {
+            rq_dft = 0.0;
+        }
+        common_moe_slot_bytes sbt;
+        if (rq_dft > 0.0 && rq_dft < (double) dft && common_moe_slot_bytes_of(params.model.path, sbt) && sbt.sum > 0 && sbt.n_used > 0 && sbt.n_layer > 0) {
+            const double left_rq = std::max(0.0, (double) cache - std::max(0.0, rq_dft - (double) free_));
+            const bool   lm_rq   = left_rq < common_lm_hybrid_frac()*host || left_rq > common_moe_hybrid_max_frac()*host;
+            const double host_layers = std::min<double>((double) sbt.n_layer, host/((double) sbt.sum*(double) std::max<int64_t>(sbt.n_expert, 1)) + 0.5);
+            rq_tok = left_rq/((double) sbt.sum*(double) sbt.n_used*std::max(host_layers, 1.0));
+            if (lm_rq && rq_tok >= (double) rq_min_tok) {
+                gpu = true;
+                common_set_env("LLAMA_DRAFT_REQUANT", "q3_k");
+                common_set_env("LLAMA_DRAFT_REQUANT_OUTPUT", "q4_k");
+            }
+        }
+    }
     LOG_INF("%s: draft model needs %.0f MiB of device memory; the MoE cache gets %.0f MiB (%.0f MiB left over), %.0f MiB with the draft "
         "(%.1f%% of %.0f MiB of host experts) -> draft model on the %s (it may take at most %.0f%% of the cache, LLAMA_FIT_DRAFT_MAX_CACHE_FRAC, "
         "and must leave more than %.0f%% of the host experts cached, LLAMA_FIT_DRAFT_MIN_CACHE_FRAC; LLAMA_FIT_DRAFT_LAST=0 for the old order)\n",
@@ -2413,6 +2469,13 @@ static bool common_fit_draft_on_cpu(
     if (tok_left >= 0.0) {
         LOG_INF("%s: the cache the draft leaves holds the experts of %.1f tokens per layer -> %s (at least %d, LLAMA_FIT_DRAFT_MIN_TOKENS; 0: "
             "the cap and the floor alone)\n", __func__, tok_left, tok_ok ? "draft model on the GPU" : "refused", (int) min_tok);
+    }
+    if (rq_tok >= 0.0) {
+        LOG_INF("%s: draft requantized at load (q3_k FFN / experts, q4_k output): %.0f MiB of device memory, the cache it leaves holds the experts "
+            "of %.1f tokens per layer -> %s (at least %d, LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT; LLAMA_DRAFT_REQUANT=off disables)\n", __func__,
+            rq_dft/MiB, rq_tok, gpu ? "draft model on the GPU, requantized" : "refused", (int) rq_min_tok);
+    } else if (!gpu && rq_off) {
+        LOG_INF("%s: draft refused at its file's types; requantization off (LLAMA_DRAFT_REQUANT=off)\n", __func__);
     }
     return !gpu;
 }

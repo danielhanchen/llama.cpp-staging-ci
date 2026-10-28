@@ -3343,7 +3343,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
         // output does not change, only the acceptance
         for (const char * rq_env : { "LLAMA_DRAFT_REQUANT", "LLAMA_DRAFT_REQUANT_OUTPUT" }) {
             const char * rq = getenv(rq_env);
-            if (rq != nullptr && rq[0] != 0) {
+            if (rq != nullptr && rq[0] != 0 && strcmp(rq, "off") != 0 && strcmp(rq, "0") != 0 && strcmp(rq, "none") != 0) {
                 if (!result.kv_overrides.empty() && result.kv_overrides.back().key[0] == 0) {
                     result.kv_overrides.pop_back();
                 }
