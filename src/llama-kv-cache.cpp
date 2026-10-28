@@ -20,6 +20,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -321,24 +322,44 @@ llama_kv_cache::llama_kv_cache(
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
             // k17-small (lazy KV step 2): a measurement reports the device KV bytes a lazy buffer would leave unbacked at load, where the
-            // MoE cache can give them back as the cells grow (the fit gives them to the cache, see common_fit). Whether the backend has
-            // lazy buffers is tried with one (an address range, no memory); each tensor may back one more 2 MiB chunk than its rows
+            // MoE cache can give them back as the cells grow (the fit gives them to the cache, see common_fit). A probe buffer (an address
+            // range and one chunk, freed at once) tells whether the backend has lazy buffers and their chunk size; the tensors are then
+            // placed as the lazy buffer places them, and the chunks the first cells back are counted exactly (k17lkv_g4d: an estimate one
+            // chunk per tensor low left the cache 40 MiB short and the MTP drafter's staging took it, the first request ran out of memory)
             static const bool shrink_on = getenv("LLAMA_MOE_CACHE_SHRINK") == nullptr || atoi(getenv("LLAMA_MOE_CACHE_SHRINK")) != 0;
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
             if (kv_lazy && shrink_on && n_stream == 1 && !v_trans && dev != nullptr && !ggml_backend_buft_is_host(buft)) {
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-                auto alloc_fn = reg ? (ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_alloc_lazy") : nullptr;
-                ggml_backend_buffer_t probe = alloc_fn != nullptr ? alloc_fn(buft, 1) : nullptr;
+                auto alloc_fn     = reg ? (ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_alloc_lazy") : nullptr;
+                auto commit_fn    = reg ? (bool (*)(ggml_backend_buffer_t, size_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_commit") : nullptr;
+                auto committed_fn = reg ? (size_t (*)(ggml_backend_buffer_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_committed") : nullptr;
+                ggml_backend_buffer_t probe = alloc_fn != nullptr && commit_fn != nullptr && committed_fn != nullptr ? alloc_fn(buft, 1) : nullptr;
+                size_t gran = 0;
                 if (probe != nullptr) {
+                    gran = commit_fn(probe, 0, 1) ? committed_fn(probe) : 0;
                     ggml_backend_buffer_free(probe);
-                    size_t unbacked = 0;
+                }
+                if (gran > 0) {
+                    // the cells lazy_ensure backs at load (lazy_n0 rounded up to its step)
+                    static const uint32_t step = getenv("LLAMA_KV_LAZY_STEP") != nullptr ? (uint32_t) std::max(256, atoi(getenv("LLAMA_KV_LAZY_STEP"))) : 1024;
+                    const uint32_t n_init = std::min(kv_size, ((lazy_n0 + step - 1)/step)*step);
+                    const size_t align = ggml_backend_buft_get_alignment(buft);
+                    std::set<size_t> chunks;
+                    size_t off = 0;
                     for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
-                        if (t->view_src == nullptr) {
-                            const size_t backed = std::min(ggml_nbytes(t), (size_t) lazy_n0*t->nb[1] + (size_t(2) << 20));
-                            unbacked += ggml_nbytes(t) - backed;
+                        if (t->view_src != nullptr) {
+                            continue;
                         }
+                        const size_t sz     = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
+                        const size_t prefix = std::min(ggml_nbytes(t), (size_t) n_init*t->nb[1]);
+                        for (size_t c = off/gran; prefix > 0 && c <= (off + prefix - 1)/gran; ++c) {
+                            chunks.insert(c);
+                        }
+                        off += sz;
                     }
-                    lazy_unbacked_est[buft] += unbacked;
+                    const size_t total  = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+                    const size_t backed = chunks.size()*gran;
+                    lazy_unbacked_est[buft] += total - std::min(total, backed);
                 }
             }
         } else {
