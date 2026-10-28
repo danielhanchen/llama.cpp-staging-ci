@@ -6038,8 +6038,9 @@ struct llama_moe_cache::impl {
             }
             g.lru.clear();
             // the banks as allocated (cleared), kernels may read a little past the end of an expert
+            // (k17-small: the slots left and the spare slot; the rows shrink retired are not backed)
             for (ggml_tensor * bank : g.banks) {
-                ggml_backend_tensor_memset(bank, 0, 0, ggml_nbytes(bank));
+                ggml_backend_tensor_memset(bank, 0, 0, (size_t) (g.n_slots + 1)*bank->nb[2]);
             }
             // the use counters and the residual; the count of experts computed on the host (statistics, stat[0..1]) is kept
             const size_t n_cnt = (size_t) g.counts->ne[0]*(g.counts->ne[1] - 1);
@@ -9688,7 +9689,7 @@ struct llama_moe_cache::impl {
         }
         g.lru.clear();
         for (ggml_tensor * bank : g.banks) {
-            ggml_backend_tensor_memset(bank, 0, 0, ggml_nbytes(bank));
+            ggml_backend_tensor_memset(bank, 0, 0, (size_t) (g.n_slots + 1)*bank->nb[2]); // (k17-small: not the retired rows)
         }
         g.dev_newer = false;
         g.dev_gen   = UINT64_MAX;
