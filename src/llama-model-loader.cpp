@@ -577,7 +577,9 @@ llama_model_loader::llama_model_loader(
             std::transform(v.begin(), v.end(), v.begin(), ::tolower);
             for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
                 const char * n = ggml_type_name((ggml_type) t);
-                if (n != nullptr && v == n && ggml_get_type_traits((ggml_type) t)->from_float_ref != nullptr &&
+                std::string nl = n != nullptr ? n : "";
+                std::transform(nl.begin(), nl.end(), nl.begin(), ::tolower); // ggml names the K quants q4_K, q3_K, ...
+                if (n != nullptr && v == nl && ggml_get_type_traits((ggml_type) t)->from_float_ref != nullptr &&
                         !ggml_quantize_requires_imatrix((ggml_type) t)) {
                     requant_type = (ggml_type) t;
                 }
@@ -1471,11 +1473,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     GGML_ASSERT(ggml_nbytes(&t_meta) == ggml_nbytes(cur));
 
-    // k18 load-time requantization: an FFN / expert matrix (name with "ffn_", 2-3 dims, rows of whole blocks of the target type) that a
+    // k18 load-time requantization: an FFN / expert matrix (name with "ffn_"; not a router (gate_inp), norm or hyper-connection (hc_)
+    // matrix; 2-3 dims, rows of whole blocks of the target type) that a
     // device holds is stored as requant_type; it is converted while it is loaded (load_all_data). Host tensors keep the file's type
     // (they may be mapped from the file)
     const bool rq_cand = requant_type != GGML_TYPE_COUNT && !is_lazy && !(flags & TENSOR_DUPLICATED) && t_meta.type != requant_type &&
-        strstr(tn.str().c_str(), "ffn_") != nullptr && ggml_n_dims(&t_meta) >= 2 && ggml_get_type_traits(t_meta.type)->to_float != nullptr &&
+        strstr(tn.str().c_str(), "ffn_") != nullptr && strstr(tn.str().c_str(), "hc_") == nullptr &&
+        strstr(tn.str().c_str(), "gate_inp") == nullptr && strstr(tn.str().c_str(), "norm") == nullptr && ggml_n_dims(&t_meta) >= 2 && ggml_get_type_traits(t_meta.type)->to_float != nullptr &&
         t_meta.ne[0] % ggml_blck_size(requant_type) == 0 && ggml_type_size(requant_type)*t_meta.ne[0]/ggml_blck_size(requant_type) <
         ggml_row_size(t_meta.type, t_meta.ne[0]);
     const ggml_type rq_orig = t_meta.type;
