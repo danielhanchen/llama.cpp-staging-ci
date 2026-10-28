@@ -2040,12 +2040,12 @@ void llama_context::sched_reserve() {
         // model's measure without a MoE cache keeps leaving the whole arena out (the cache it sizes lends or holds the copies)
         // k17-small: an MTP context without a MoE cache of its own (its share of the budget too small for one token) also keeps one
         // split: on a small device its arena does not fit (Kaggle T4 4 GB, Qwen3.6-35B-A3B UD-Q4_K_XL + MTP at ctx 16384: measured 104
-        // MiB of compute, the 320 MiB arena failed at load and the compute took 233 MiB with the copies of a split). LLAMA_FIT_MTP_PRICE=0
-        // or LLAMA_FIT_STAGING_SPLIT=0: as before
+        // MiB of compute, the 320 MiB arena failed at load and the compute took 233 MiB with the copies of a split). Only with
+        // LLAMA_FIT_MTP_PRICE=1 (common exports its default, see common_fit_mtp_price_on); LLAMA_FIT_STAGING_SPLIT=0: as before
         if (model.hparams.no_alloc && !moe_cache) {
             const char * e_split = getenv("LLAMA_FIT_STAGING_SPLIT"); // set by common for draft-model measures only
             const char * e_price = getenv("LLAMA_FIT_MTP_PRICE");
-            const bool mtp_split = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && (e_price == nullptr || *e_price == '\0' || atoi(e_price) != 0);
+            const bool mtp_split = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && e_price != nullptr && atoi(e_price) != 0;
             const bool keep_split = e_split != nullptr && *e_split != '\0' ? atoi(e_split) != 0 : mtp_split;
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
                 const size_t staging = ggml_backend_sched_get_staging_size(sched.get(), backend_ptrs[i]);

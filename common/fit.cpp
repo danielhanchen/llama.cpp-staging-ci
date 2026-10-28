@@ -1,6 +1,7 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "fit.h"
 
+#include "common.h"
 #include "json.h"
 #include "log.h"
 
@@ -83,10 +84,35 @@ static int64_t common_fit_moe_margin(int64_t m) {
 // output rows. Both re-reserve larger compute buffers that the measures did not have: Kaggle T4 4 GB, Qwen3.6-35B-A3B UD-Q4_K_XL + MTP
 // at ctx 16384, the main context grew 474 -> 506 MiB and q3m 428 -> 466 MiB. g_fit_nextn = 1 while a fit for an MTP target measures
 // the main model; an MTP context's own measure always has it (see below). The drafter without a MoE cache of its own (its share too
-// small) also keeps one prefetch split in its compute, see sched_reserve. =0: the measures before k17-small
+// small) also keeps one prefetch split in its compute, see sched_reserve. =0: the measures before k17-small, =1: on every device.
+// Default: on where the server's post-draft floor is (an NVIDIA GPU below compute capability 8.0, see LLAMA_DRAFT_MIN_FREE_MIB), so
+// that the fit rather than that floor decides the drafter there; off elsewhere. G4 (cc 12.0) runs q4x 4 GB 16k + MTP with 18.6 MiB
+// free after the draft (decode 170 tok/s); the exact price would drop the drafter there for the 256 MiB margin (116 tok/s without it).
+// The default is decided once and exported as LLAMA_FIT_MTP_PRICE, which the measure in sched_reserve reads
 static bool common_fit_mtp_price_on() {
-    const char * e = getenv("LLAMA_FIT_MTP_PRICE");
-    return e == nullptr || *e == '\0' || atoi(e) != 0;
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_FIT_MTP_PRICE");
+        if (e != nullptr && *e != '\0') {
+            return atoi(e) != 0;
+        }
+        bool pre_ampere = false;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            auto cc_fn = reg ? (int (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_compute_capability") : nullptr;
+            const int cc = cc_fn != nullptr ? cc_fn(dev) : -1;
+            pre_ampere = pre_ampere || (cc >= 0 && cc < 800);
+        }
+        common_set_env("LLAMA_FIT_MTP_PRICE", pre_ampere ? "1" : "0");
+        if (pre_ampere) {
+            LOG_INF("%s: an MTP drafter is priced as it runs (a GPU below compute capability 8.0; LLAMA_FIT_MTP_PRICE=0 off)\n", __func__);
+        }
+        return pre_ampere;
+    }();
+    return on;
 }
 static thread_local int g_fit_nextn = 0;
 
@@ -116,6 +142,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
     }, &ud);
 
+    const bool mtp_price = common_fit_mtp_price_on(); // decided (and exported for sched_reserve) before the context is created
+
     llama_model_params mparams_copy = *mparams;
     mparams_copy.no_alloc  = true;
     mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
@@ -135,7 +163,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     // k17-small: measure the graphs the context runs once an MTP draft is attached (unmasked for the target, masked for the drafter,
     // as common_speculative sets them)
-    if (common_fit_mtp_price_on()) {
+    if (mtp_price) {
         const bool is_mtp = cparams->ctx_type == LLAMA_CONTEXT_TYPE_MTP;
         if (is_mtp || g_fit_nextn == 1) {
             llama_set_embeddings_nextn(ctx, true, /*masked =*/ is_mtp);
