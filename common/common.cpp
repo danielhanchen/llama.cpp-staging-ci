@@ -1555,12 +1555,18 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
                 // free while a 4-member group at -ub 2048 grows the compute buffers ~850 MiB, and the cache cannot lend the whole merged
                 // allocation, so every 8k prompt ran as 2 + 2 and read the host experts twice (G4 Flash-Next UD-IQ4_XS: 12 GB no draft
                 // and 16 GB beside the Q8_0 MTP drafter, "split at 2", 8k TTFT 2.62 / 2.88 s against 1.83 at 16 GB with one graph)
+                // Only the shortfall: (k - 1) member estimates (+10%) less LLAMA_MOE_LM_GATE_RESERVE_FREE_MIB (default 512, the free memory
+                // found beside the gate at group time: 545 / 576 MiB on G4), at most that share of the cache; a group that fits takes nothing
+                double gate_frac = 0.0;
                 if (lm_beside_gate && lm != 1 && common_moe_hybrid_gate_on(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
-                    double gf = 0.10;
+                    gate_frac = 0.10;
                     if (const char * eg = getenv("LLAMA_MOE_LM_GATE_RESERVE_FRAC")) {
-                        gf = std::max(0.0, atof(eg));
+                        gate_frac = std::max(0.0, atof(eg));
                     }
-                    frac = std::max(frac, gf);
+                }
+                int64_t gate_free = 512ll << 20;
+                if (const char * eg = getenv("LLAMA_MOE_LM_GATE_RESERVE_FREE_MIB")) {
+                    gate_free = std::max<int64_t>(0, atoll(eg)) << 20;
                 }
                 if (const char * ef = getenv("LLAMA_MOE_LAYER_MAJOR_RESERVE_FRAC")) {
                     frac = std::max(0.0, atof(ef));
@@ -1572,6 +1578,10 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
                 if (n_embd > 0 && n_ff > 0 && n_used > 0 && k > 1) {
                     const int64_t est = (int64_t) cparams.n_ubatch*4*(4*n_embd + 4*n_used*n_ff);
                     reserve = std::min<int64_t>((int64_t) (frac*(double) params.moe_cache_size), (k - 1)*est);
+                    if (gate_frac > 0.0) {
+                        const int64_t need = std::max<int64_t>(0, (int64_t) (1.1*(double) ((k - 1)*est)) - gate_free);
+                        reserve = std::max<int64_t>(reserve, std::min<int64_t>((int64_t) (gate_frac*(double) params.moe_cache_size), need));
+                    }
                 }
             }
             if (reserve > 0 && (int64_t) params.moe_cache_size > 2*reserve) {
