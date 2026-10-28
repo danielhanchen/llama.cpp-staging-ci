@@ -1551,6 +1551,17 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
             } else {
                 const bool ckpt_batch = getenv("LLAMA_MOE_LAYER_MAJOR_CKPT") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_CKPT")) != 0;
                 double frac = ckpt_batch ? 0.025 : 0.0;
+                // k18 (LLAMA_MOE_LM_GATE_RESERVE_FRAC, default 0.10; 0 = as before): beside the hybrid gate the fit leaves ~550 MiB
+                // free while a 4-member group at -ub 2048 grows the compute buffers ~850 MiB, and the cache cannot lend the whole merged
+                // allocation, so every 8k prompt ran as 2 + 2 and read the host experts twice (G4 Flash-Next UD-IQ4_XS: 12 GB no draft
+                // and 16 GB beside the Q8_0 MTP drafter, "split at 2", 8k TTFT 2.62 / 2.88 s against 1.83 at 16 GB with one graph)
+                if (lm_beside_gate && lm != 1 && common_moe_hybrid_gate_on(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
+                    double gf = 0.10;
+                    if (const char * eg = getenv("LLAMA_MOE_LM_GATE_RESERVE_FRAC")) {
+                        gf = std::max(0.0, atof(eg));
+                    }
+                    frac = std::max(frac, gf);
+                }
                 if (const char * ef = getenv("LLAMA_MOE_LAYER_MAJOR_RESERVE_FRAC")) {
                     frac = std::max(0.0, atof(ef));
                 }
