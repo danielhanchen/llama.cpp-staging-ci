@@ -11128,6 +11128,13 @@ static size_t ggml_backend_cuda_pool_mark_trim(ggml_backend_t backend, bool trim
     if (trim) {
         CUDA_CHECK(cudaDeviceSynchronize());
     }
+    if (!trim) {
+        // the streams a later call may need are created now, while the device has memory for them: G4 4 GB q3m 16k release-split,
+        // a prompt checkpoint (state_get_async) inside the released window failed in cudaStreamCreateWithFlags
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+            (void) ctx->stream(ctx->device, s);
+        }
+    }
     size_t freed = 0;
     for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
         if (ctx->pools[ctx->device][s] == nullptr) {
