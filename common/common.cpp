@@ -1473,6 +1473,19 @@ static int64_t common_lm_batch_default(const common_params & params) {
 // experts with speculative decoding by a model (the built-in MTP heads, a -md draft), where the rules below keep the default n_ubatch
 // (no lending beside a draft: G4, Qwen3.6-35B-A3B UD-Q3_K_M + MTP at 8 GB, 2k / 8k prompt 2288 -> 3709 / 2430 -> 6609 tok/s, same text);
 // where they grow n_ubatch (a lent graph) the prompt stays ubatch by ubatch
+// the share of the host experts below which a prompt's layer-major groups run beside the hybrid gate (llama_context lm_hybrid_frac_ok,
+// LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC, default 0.25). k18 (LLAMA_MOE_LM_GATE_BATCH, default on; =0 the k16 line, 0.05): the batch of an
+// explicit -ub grows to hold groups wherever the context runs them; with 0.05 a cache of 5-10% kept one ubatch per batch under the gate,
+// so no group formed (G4, Qwen3.8-Flash-Next UD-IQ4_XS 12 GB, 6.3% cached, Studio -ub 2048: 8k prompt 1945 tok/s against 4463 at
+// 16 GB with groups; 16 GB beside a Q8_0 MTP drafter, 8.0%: 1845 tok/s, TTFT 1.84 -> 4.44 s)
+static double common_lm_hybrid_frac() {
+    if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC")) {
+        return std::max(0.0, atof(e));
+    }
+    const char * g = getenv("LLAMA_MOE_LM_GATE_BATCH");
+    return g != nullptr && atoi(g) == 0 ? 0.05 : 0.25;
+}
+
 static void common_moe_cache_auto_ubatch(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
     if (params.moe_cache_size == 0 || params.embedding || cparams.embeddings) {
         return;
@@ -1501,7 +1514,7 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
         // UD-IQ4_XS 12 GB with Studio's -ub 2048 (cache 2642 of 56762 MiB, 4.7%), 8k / 16k / 30k prompt 1917 / 1934 / 1896 tok/s against
         // 4396 / 4460 at 16 GB (groups) and Strata 3345 / 4261 / 4129. LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB_HYBRID=0 restores the early return
         static const bool xh_on = getenv("LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB_HYBRID") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_EXPLICIT_UB_HYBRID")) != 0;
-        static const double lm_hyb_frac = getenv("LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC") ? std::max(0.0, atof(getenv("LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC"))) : 0.05;
+        static const double lm_hyb_frac = common_lm_hybrid_frac();
         const double host_x = xh_on ? common_moe_host_expert_bytes(params.model.path, mparams.tensor_buft_overrides, mparams.n_gpu_layers) : 0.0;
         const bool lm_beside_gate = xh_on && host_x > 0.0 && (double) params.moe_cache_size < lm_hyb_frac*host_x;
         if (lm != 1 && !lm_beside_gate && common_moe_hybrid_gate_on(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers)) {
@@ -2265,12 +2278,41 @@ static bool common_fit_draft_on_cpu(
     const double host   = take > 0.0 ? common_moe_host_expert_bytes(params.model.path, mp.tensor_buft_overrides, mp.n_gpu_layers) : 0.0;
     const double left   = std::max(0.0, (double) cache - take);
     const bool   floor_ok = min_frac <= 0.0 || host <= 0.0 || left > min_frac*host;
-    const bool   gpu    = cap_ok && floor_ok;
+    bool         gpu    = cap_ok && floor_ok;
+    // k18 (LLAMA_FIT_DRAFT_MIN_TOKENS, default 4; 0 = the cap and floor alone, as before): a draft the cap or the floor refuses still gets
+    // the GPU when the cache it leaves holds the experts of at least that many tokens per layer (n_expert_used slots per token: a verify
+    // window of the draft plus the tail the cache serves on the device). The floor existed because prompts lost their layer-major groups
+    // under the hybrid gate; those now run beside the gate (common_moe_cache_auto_ubatch, k18), and the decode gain of drafting comes from
+    // reading the resident weights once per verified window. G4, Qwen3.8-Flash-Next UD-IQ4_XS + its Q8_0 MTP head forced on: 16 GB
+    // (cache 8271 -> 4576 MiB, 4.1 tokens per layer) decode chat / 2k / 8k 89.9 / 89.3 / 85.6 -> 139.1 / 103.8 / 118.5 tok/s; 12 GB
+    // (3549 -> 479 MiB, 0.4 tokens) +29 / -9 / +6%: refused here
+    int64_t min_tok = 4;
+    if (const char * env = getenv("LLAMA_FIT_DRAFT_MIN_TOKENS")) {
+        min_tok = std::max(0, atoi(env));
+    }
+    double tok_left = -1.0;
+    bool   tok_ok   = false;
+    // only where prompts keep their layer-major groups: below the share they run beside the gate, or above the gate
+    const bool lm_ok = host > 0.0 && (left < common_lm_hybrid_frac()*host || left > common_moe_hybrid_max_frac()*host);
+    if (!gpu && min_tok > 0 && lm_ok) {
+        common_moe_slot_bytes sbt;
+        if (common_moe_slot_bytes_of(params.model.path, sbt) && sbt.sum > 0 && sbt.n_used > 0 && sbt.n_layer > 0) {
+            // the expert layers on the host, all of the largest slot (the fit's own estimate of a slot)
+            const double host_layers = std::min<double>((double) sbt.n_layer, host/((double) sbt.sum*(double) std::max<int64_t>(sbt.n_expert, 1)) + 0.5);
+            tok_left = left/((double) sbt.sum*(double) sbt.n_used*std::max(host_layers, 1.0));
+            tok_ok   = tok_left >= (double) min_tok;
+            gpu      = tok_ok;
+        }
+    }
     LOG_INF("%s: draft model needs %.0f MiB of device memory; the MoE cache gets %.0f MiB (%.0f MiB left over), %.0f MiB with the draft "
         "(%.1f%% of %.0f MiB of host experts) -> draft model on the %s (it may take at most %.0f%% of the cache, LLAMA_FIT_DRAFT_MAX_CACHE_FRAC, "
         "and must leave more than %.0f%% of the host experts cached, LLAMA_FIT_DRAFT_MIN_CACHE_FRAC; LLAMA_FIT_DRAFT_LAST=0 for the old order)\n",
         __func__, dft/MiB, cache/MiB, free_/MiB, left/MiB, host > 0.0 ? 100.0*left/host : 0.0, host/MiB, gpu ? "GPU" : "CPU",
         100.0*max_frac, 100.0*min_frac);
+    if (tok_left >= 0.0) {
+        LOG_INF("%s: the cache the draft leaves holds the experts of %.1f tokens per layer -> %s (at least %d, LLAMA_FIT_DRAFT_MIN_TOKENS; 0: "
+            "the cap and the floor alone)\n", __func__, tok_left, tok_ok ? "draft model on the GPU" : "refused", (int) min_tok);
+    }
     return !gpu;
 }
 
