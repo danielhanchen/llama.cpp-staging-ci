@@ -369,7 +369,7 @@ private:
     // measurement (no_alloc) the device KV bytes the lazy buffers would leave unbacked at load (see lazy_unbacked)
     std::function<size_t(ggml_backend_dev_t, size_t)> lazy_shrink_fn;
     std::map<ggml_backend_dev_t, int64_t> lazy_margin;
-    bool lazy_min_free_done = false; // the first batch checked the free memory (LLAMA_KV_LAZY_MIN_FREE_MIB, see lazy_ensure)
+    int64_t lazy_min_free_t = -1; // time of the last check of the free memory (LLAMA_KV_LAZY_MIN_FREE_MIB, see lazy_ensure)
     std::map<ggml_backend_buffer_type_t, size_t> lazy_unbacked_est;
 public:
     // back the rows of cells [0, n_cells) (rounded up to the step); false if the device has no memory for them. shrink_ok: between

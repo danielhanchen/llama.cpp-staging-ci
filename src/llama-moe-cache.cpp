@@ -8533,6 +8533,10 @@ struct llama_moe_cache::impl {
         if (!shrink_on || bytes == 0 || !d.buf_bank || !d.bank_lazy || d.released || d.shrink_floor == SIZE_MAX) {
             return 0;
         }
+        // at the floor: nothing to give, and nothing is stopped
+        if (std::none_of(groups.begin(), groups.end(), [&](const group & g) { return g.id == id && g.n_slots > g.n_slots_min; })) {
+            return 0;
+        }
         ggml_backend_t backend = d.backend;
         ua_release(id);
         ggml_backend_synchronize(backend);

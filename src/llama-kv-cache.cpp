@@ -1275,13 +1275,13 @@ bool llama_kv_cache::lazy_ensure(uint32_t n_cells, bool shrink_ok) {
     if (lazy_bufs.empty()) {
         return true;
     }
-    // k17-small (lazy KV step 2): at the first batch, the device keeps at least LLAMA_KV_LAZY_MIN_FREE_MIB (128) free for the
-    // allocations of its first graphs (the CUDA pool), the MoE cache giving the rest back. The cache holds the KV bytes not backed
-    // yet, and a context created after this one can leave the device without room for them: k17lkv_g4e, G4 q4x 4 GB 16k + MTP, the
-    // cache lent the drafter's staging copies and 14 MiB were left, the first request ran out of memory in mul_mat_q (LLAMA_KV_LAZY=0:
-    // 190 MiB free, the staging not allocated)
-    if (shrink_ok && lazy_shrink_fn != nullptr && !lazy_min_free_done) {
-        lazy_min_free_done = true;
+    // k17-small (lazy KV step 2): before a batch (at most every 100 ms) the device keeps at least LLAMA_KV_LAZY_MIN_FREE_MIB (128) free
+    // for the allocations of its graphs (the CUDA pool, cuBLAS), the MoE cache giving the rest back down to its floor. The cache holds
+    // the KV bytes not backed yet, and a context created after this one (the drafter, after the warmup batch) can leave the device
+    // without room for them: k17lkv_g4e, G4 q4x 4 GB 16k + MTP, the cache lent the drafter's staging copies and 14 MiB were left, the
+    // first request ran out of memory in mul_mat_q (LLAMA_KV_LAZY=0: 190 MiB free, the staging not allocated)
+    if (shrink_ok && lazy_shrink_fn != nullptr && (lazy_min_free_t < 0 || ggml_time_us() - lazy_min_free_t >= 100000)) {
+        lazy_min_free_t = ggml_time_us();
         static const int64_t min_free = (getenv("LLAMA_KV_LAZY_MIN_FREE_MIB") != nullptr ? std::max<int64_t>(0, atoll(getenv("LLAMA_KV_LAZY_MIN_FREE_MIB"))) : 128) << 20;
         std::set<ggml_backend_dev_t> devs;
         for (ggml_backend_buffer_t buf : lazy_bufs) {
@@ -1296,8 +1296,10 @@ bool llama_kv_cache::lazy_ensure(uint32_t n_cells, bool shrink_ok) {
             ggml_backend_dev_memory(dev, &free, &total);
             if ((int64_t) free < min_free) {
                 const size_t got = lazy_shrink_fn(dev, (size_t) (min_free - (int64_t) free));
-                LLAMA_LOG_INFO("%s: lazy KV: %.2f MiB free on %s at the first batch, the MoE cache gave back %.2f MiB (LLAMA_KV_LAZY_MIN_FREE_MIB = %" PRId64 ")\n",
-                    __func__, free/1048576.0, ggml_backend_dev_name(dev), got/1048576.0, min_free >> 20);
+                if (got > 0) {
+                    LLAMA_LOG_INFO("%s: lazy KV: %.2f MiB free on %s before a batch, the MoE cache gave back %.2f MiB (LLAMA_KV_LAZY_MIN_FREE_MIB = %" PRId64 ")\n",
+                        __func__, free/1048576.0, ggml_backend_dev_name(dev), got/1048576.0, min_free >> 20);
+                }
             }
         }
     }
