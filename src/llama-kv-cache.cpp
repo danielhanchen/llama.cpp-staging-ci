@@ -365,7 +365,11 @@ llama_kv_cache::llama_kv_cache(
         } else {
             buf = nullptr;
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-            if (kv_lazy && n_stream == 1 && !v_trans && dev != nullptr && !ggml_backend_buft_is_host(buft)) {
+            // LLAMA_KV_LAZY_SUSPEND=1 (set by common where --fit keeps a drafter): the whole KV cache is backed at load, as without
+            // LLAMA_KV_LAZY (read at every allocation: the fit's measurements run before the decision)
+            const char * e_susp = getenv("LLAMA_KV_LAZY_SUSPEND");
+            const bool   susp   = e_susp != nullptr && atoi(e_susp) != 0;
+            if (kv_lazy && !susp && n_stream == 1 && !v_trans && dev != nullptr && !ggml_backend_buft_is_host(buft)) {
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
                 auto alloc_fn  = reg ? (ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_alloc_lazy") : nullptr;
                 auto commit_fn = reg ? (bool (*)(ggml_backend_buffer_t, size_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_commit") : nullptr;

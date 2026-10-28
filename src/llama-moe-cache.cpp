@@ -1791,7 +1791,8 @@ struct llama_moe_cache::impl {
             {
                 const char * e_kv = getenv("LLAMA_KV_LAZY");
                 const char * e_sh = getenv("LLAMA_MOE_CACHE_SHRINK");
-                shrink_on = e_kv != nullptr && atoi(e_kv) != 0 && (e_sh == nullptr || atoi(e_sh) != 0);
+                const char * e_su = getenv("LLAMA_KV_LAZY_SUSPEND");   // a drafter kept by --fit: plain banks, as without LLAMA_KV_LAZY
+                shrink_on = e_kv != nullptr && atoi(e_kv) != 0 && (e_sh == nullptr || atoi(e_sh) != 0) && (e_su == nullptr || atoi(e_su) == 0);
             }
             for (device & d : devices) {
                 if (!d.ctx) {

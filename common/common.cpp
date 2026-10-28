@@ -3917,6 +3917,28 @@ uma_restart:
         } else if (moe_cache_auto) {
             COM_INF("%s: --moe-cache-mib auto: MoE cache %zu MiB\n", __func__, cparams.moe_cache_size/(1024*1024));
         }
+        // k17-small (lazy KV): where the fit keeps a drafter (a draft model or the MTP heads) the KV cache is backed whole at load and the
+        // MoE cache keeps its floor (common_fit does not give it the unbacked KV beside a drafter): G4 q4x 4 GB 16k + MTP ran out of memory
+        // at the first request 3/3 with the bigger cache, q3m 16k + MTP was 5-17% slower. Without a drafter (none asked, or dropped by the
+        // fit) lazy KV stays on. LLAMA_KV_LAZY_FIT_DRAFT=1 keeps it on beside a drafter
+        {
+            const char * e_kv = getenv("LLAMA_KV_LAZY");
+            const char * e_fd = getenv("LLAMA_KV_LAZY_FIT_DRAFT");
+            const bool lazy_on  = e_kv != nullptr && atoi(e_kv) != 0;
+            const bool draft_on = !params.speculative.draft.fit_off && !params.speculative.draft.fit_on_cpu && (params.speculative.has_dft() ||
+                std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end());
+            const bool suspend  = lazy_on && draft_on && !(e_fd != nullptr && atoi(e_fd) != 0);
+            common_set_env("LLAMA_KV_LAZY_SUSPEND", suspend ? "1" : "0");
+            if (suspend) {
+                // the whole KV is backed now: a cache the fit raised by the unbacked KV (a fit that ran without the drafter) gives it back
+                const size_t grant = common_fit_kv_lazy_grant(cparams.moe_cache_size);
+                if (grant > 0 && cparams.moe_cache_size > grant) {
+                    cparams.moe_cache_size -= grant;
+                }
+                COM_INF("%s: lazy KV: a drafter is kept, the KV cache is backed whole at load, MoE cache %zu MiB (%zu MiB of unbacked KV "
+                    "given back; LLAMA_KV_LAZY_FIT_DRAFT=1 keeps lazy KV)\n", __func__, cparams.moe_cache_size/(1024*1024), grant/(1024*1024));
+            }
+        }
 
         // the fit may have reduced the MoE cache (it gets the memory left after the layers), the load mode below follows the fitted size
         params.moe_cache_size = cparams.moe_cache_size;

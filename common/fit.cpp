@@ -164,6 +164,18 @@ int64_t common_fit_small_reserve_plan(int64_t cache_mib, int64_t reserve_mib, in
     return std::min(reserve_mib, cache_mib - floor_mib);
 }
 
+// k17-small (lazy KV): the MoE cache sizes a fit raised by the unbacked KV, and by how much (every fit of the process)
+static std::vector<std::pair<size_t, size_t>> g_kv_lazy_grants;
+
+size_t common_fit_kv_lazy_grant(size_t moe_cache_size) {
+    for (const auto & [after, grant] : g_kv_lazy_grants) {
+        if (after == moe_cache_size) {
+            return grant;
+        }
+    }
+    return 0;
+}
+
 // the margin of a device beside a MoE cache for the default margin m (see common_fit_set_moe_margin_auto)
 static int64_t common_fit_moe_margin(int64_t m, int64_t free_dev, int64_t cache_want, bool has_drafter) {
     constexpr int64_t MiB_ = 1024*1024;
@@ -1673,9 +1685,19 @@ static void common_params_fit_impl(
                 // LLAMA_MOE_CACHE_SHRINK=0: the cache keeps the floor (step 1)
                 // (LLAMA_KV_LAZY_FIT=0: the cache keeps the floor while still shrinking for the KV cache, a debug knob)
                 static const bool kv_lazy_fit = getenv("LLAMA_KV_LAZY_FIT") == nullptr || atoi(getenv("LLAMA_KV_LAZY_FIT")) != 0;
-                if (kv_lazy_fit && nd == 1 && dmds_cpu_moe[0].mb.kv_lazy > 0 && cparams->moe_cache_size > 0 && cparams->moe_cache_size < size_before) {
+                // beside a fitted drafter the cache keeps the floor (LLAMA_KV_LAZY_FIT_DRAFT=1 gives it the unbacked KV there too): the bigger
+                // cache lent the drafter's staging, its compute took 506 MiB and left 14 MiB (G4 q4x 4 GB 16k + MTP: out of memory at the
+                // first request 3/3; q3m 16k + MTP 5-17% slower end to end)
+                static const bool kv_lazy_fit_draft = getenv("LLAMA_KV_LAZY_FIT_DRAFT") != nullptr && atoi(getenv("LLAMA_KV_LAZY_FIT_DRAFT")) != 0;
+                const bool kv_lazy_draft_ok = extra == nullptr || kv_lazy_fit_draft;
+                if (kv_lazy_fit && !kv_lazy_draft_ok && nd == 1 && dmds_cpu_moe[0].mb.kv_lazy > 0) {
+                    LOG_INF("%s: lazy KV: a drafter is fitted, the MoE cache keeps %zu MiB, not the %zu MiB of KV cells not backed at load on top "
+                        "(LLAMA_KV_LAZY_FIT_DRAFT=1 to give them)\n", __func__, cparams->moe_cache_size/MiB, dmds_cpu_moe[0].mb.kv_lazy/MiB);
+                }
+                if (kv_lazy_fit && kv_lazy_draft_ok && nd == 1 && dmds_cpu_moe[0].mb.kv_lazy > 0 && cparams->moe_cache_size > 0 && cparams->moe_cache_size < size_before) {
                     const size_t floor = cparams->moe_cache_size;
                     cparams->moe_cache_size += std::min(dmds_cpu_moe[0].mb.kv_lazy, size_before - floor);
+                    g_kv_lazy_grants.emplace_back(cparams->moe_cache_size, cparams->moe_cache_size - floor);
                     LOG_INF("%s: lazy KV: the MoE cache takes the %zu MiB of KV cells not backed at load: %zu -> %zu MiB, it gives them back as the "
                         "context grows (LLAMA_MOE_CACHE_SHRINK=0 to disable)\n", __func__, dmds_cpu_moe[0].mb.kv_lazy/MiB, floor/MiB,
                         cparams->moe_cache_size/MiB);
