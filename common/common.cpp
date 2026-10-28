@@ -1471,9 +1471,11 @@ static int64_t common_lm_batch_default(const common_params & params) {
     }
     const bool mtp_heads = !params.speculative.has_dft() && std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
         [](auto t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP; });
-    // beside built-in MTP heads 16384 is opt-in (LLAMA_MOE_LAYER_MAJOR_BATCH_MTP=1): G4 k15g4q1 q4x 12 GB with it (and the device MTP
-    // handoff) 16k TTFT -13% but decode 8k / 16k -11 / -10%, chat TTFT +20%, RssAnon +95 MiB, device memory +232 MiB
-    static const bool mtp_env = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_MTP") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_MTP")) != 0;
+    // beside built-in MTP heads 16384 (LLAMA_MOE_LAYER_MAJOR_BATCH_MTP=0: 8192). It was opt-in: G4 k15g4q1 q4x 12 GB 16k TTFT -13% but
+    // decode 8k / 16k -11 / -10%, RssAnon +95 MiB. k17 (on the scheduler trim, the input arena fit and the MTP state release): G4 k17lmm3 q4x
+    // + MTP 12 GB, 3 launches: 16k / 30k TTFT 1.46 -> 1.34 / 2.74 -> 2.36 s, decode equal, md5 sets equal, end RssAnon 2446-2459 against
+    // 2497-2509 MiB for the previous 8192 default; KLD inside the model's own band. Only beside built-in heads: a -md draft keeps 8192
+    static const bool mtp_env = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_MTP") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_MTP")) != 0;
     if (mtp_heads && mtp_env) {
         static const double rss_mib = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_RSS_MIB") ? atof(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_RSS_MIB")) : 100.0;
         const int64_t n_embd = common_gguf_u32(params.model.path, "embedding_length");
