@@ -465,6 +465,21 @@ static void common_params_fit_impl(
     if (g_place8) {
         common_fit_place8_env(0);
     }
+    // k17-small (lazy KV): a fit beside a drafter measures the KV cache as backed whole, as without LLAMA_KV_LAZY (the KV cache is then
+    // allocated so, see common_init_result): measured lazily, G4 q3m 4 GB 16k + MTP got a 151 MiB cache against 152 without lazy KV;
+    // a fit without one (none asked, or the trial that drops it) measures it lazily. LLAMA_KV_LAZY_FIT_DRAFT=1: lazily beside a drafter too
+    {
+        const char * e_kv = getenv("LLAMA_KV_LAZY");
+        const char * e_fd = getenv("LLAMA_KV_LAZY_FIT_DRAFT");
+        if (e_kv != nullptr && atoi(e_kv) != 0) {
+            const char * v = extra != nullptr && !(e_fd != nullptr && atoi(e_fd) != 0) ? "1" : "0";
+#if defined(_WIN32)
+            _putenv_s("LLAMA_KV_LAZY_SUSPEND", v);
+#else
+            setenv("LLAMA_KV_LAZY_SUSPEND", v, 1);
+#endif
+        }
+    }
     constexpr int64_t MiB = 1024*1024;
     typedef std::vector<llama_device_memory_data> dmds_t;
     const llama_model_params default_mparams = llama_model_default_params();

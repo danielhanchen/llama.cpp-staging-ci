@@ -328,7 +328,8 @@ llama_kv_cache::llama_kv_cache(
             // chunk per tensor low left the cache 40 MiB short and the MTP drafter's staging took it, the first request ran out of memory)
             static const bool shrink_on = getenv("LLAMA_MOE_CACHE_SHRINK") == nullptr || atoi(getenv("LLAMA_MOE_CACHE_SHRINK")) != 0;
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-            if (kv_lazy && shrink_on && n_stream == 1 && !v_trans && dev != nullptr && !ggml_backend_buft_is_host(buft)) {
+            const char * e_susp = getenv("LLAMA_KV_LAZY_SUSPEND");   // a fit beside a drafter: measured as backed whole (see common_fit)
+            if (kv_lazy && shrink_on && !(e_susp != nullptr && atoi(e_susp) != 0) && n_stream == 1 && !v_trans && dev != nullptr && !ggml_backend_buft_is_host(buft)) {
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
                 auto alloc_fn     = reg ? (ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_alloc_lazy") : nullptr;
                 auto commit_fn    = reg ? (bool (*)(ggml_backend_buffer_t, size_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_commit") : nullptr;
