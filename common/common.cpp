@@ -1437,6 +1437,23 @@ static int64_t common_gguf_u32(const std::string & path, const char * key) {
 // output buffer; it is taken where that is at most LLAMA_MOE_LAYER_MAJOR_BATCH_RSS_MIB (100): Qwen3.6-35B-A3B (n_embd 2048) +64 MiB.
 // The rest of the measured peak RSS growth (~170 MiB, G4 q4x 12 GB +237) is the 8-member graph's own host buffers, the same without a
 // draft (Flash-Next 16 GB, draft dropped: +170)
+// k17-small: what a launch without the drafter passes where the fit dropped an MTP drafter (LLAMA_FIT_MTP_DROP, the 2-thread MTP-cache
+// rule): no draft types (no next-n rows, one output per sequence, no rollback states), no draft context flag (the layer-major refill
+// and the state capture of a drafting server), the default capture count. Before this the server ran in the "draft left out" mode:
+// a 16384-token layer-major batch, the capture and refill of a drafting context, and its prompts and checkpoints differed from a
+// plain launch (2k / 8k text not equal to it). The trial fit runs with these context parameters, so the placement is that launch's
+static void common_fit_plain_launch(common_params & params, llama_context_params & cp) {
+    params.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+    const common_speculative_output_limits lim = common_speculative_get_output_limits(params.n_batch, params.n_parallel, 0);
+    params.n_outputs_max         = lim.total;
+    params.n_outputs_max_per_seq = lim.per_seq;
+    cp.n_rs_seq              = params.speculative.need_n_rs_seq();
+    cp.n_outputs_max         = std::max(params.n_outputs_max, 0);
+    cp.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
+    cp.spec_draft            = false;
+    cp.n_state_capture       = llama_context_default_params().n_state_capture;
+}
+
 static int64_t common_lm_batch_default(const common_params & params) {
     if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH")) {
         return atoll(e);
@@ -1449,7 +1466,7 @@ static int64_t common_lm_batch_default(const common_params & params) {
     if (!auto_env) {
         return 8192;
     }
-    if (params.speculative.draft.fit_off) {
+    if (params.speculative.draft.fit_off && params.speculative.has_dft()) {   // a dropped MTP drafter: as a plain launch (k17-small)
         return 16384;
     }
     const bool mtp_heads = !params.speculative.has_dft() && std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
@@ -2901,8 +2918,17 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 mp.tensor_buft_overrides = tbo.data();
             }
             mp.load_mtp = params.load_mtp;
-            cp.n_rs_seq = 0;
-            cp.n_state_capture = cparams.n_state_capture;   // k15-c: the capture count the shrink above chose
+            // k17-small: the trial is the fit of a launch without the drafter (common_fit_plain_launch); LLAMA_FIT_DROP_PLAIN=0: the
+            // drafting context's parameters minus its rollback states, as before
+            static const bool drop_plain = getenv("LLAMA_FIT_DROP_PLAIN") == nullptr || atoi(getenv("LLAMA_FIT_DROP_PLAIN")) != 0;
+            common_params params_plain = params;
+            if (drop_plain) {
+                common_fit_plain_launch(params_plain, cp);
+                common_set_env("LLAMA_SPEC_MTP_HEADS", "0");
+            } else {
+                cp.n_rs_seq = 0;
+                cp.n_state_capture = cparams.n_state_capture;   // k15-c: the capture count the shrink above chose
+            }
             common_fit_set_moe_margin_auto(!params.fit_params_target_set);
             const common_params_fit_status st2 = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(), tbo.empty() ? nullptr : tbo.data(),
                 mg.data(), params.fit_params_min_ctx, nullptr, fit_log_level, params.fit_kv_resident);
@@ -2921,7 +2947,14 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 }
                 fit_status = st2;
                 params.speculative.draft.fit_off = true;
+                if (drop_plain) {
+                    llama_context_params cp_plain = cparams;
+                    common_fit_plain_launch(params, cp_plain);
+                }
             } else {
+                if (drop_plain) {
+                    common_set_env("LLAMA_SPEC_MTP_HEADS", "1");
+                }
                 COM_INF("%s: --fit: the MTP drafter stays (without it the fit does not keep every layer on the device either)\n", __func__);
                 // the fit with the drafter stands: its outputs were not touched (the trial ran on copies), only its margin gain is the trial's
                 moe_gain_mtp_trial = true;
@@ -2966,8 +2999,15 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                     mp.tensor_buft_overrides = tbo.data();
                 }
                 mp.load_mtp = params.load_mtp;
-                cp.n_rs_seq = 0;
-                cp.n_state_capture = cparams.n_state_capture;
+                static const bool drop_plain2 = getenv("LLAMA_FIT_DROP_PLAIN") == nullptr || atoi(getenv("LLAMA_FIT_DROP_PLAIN")) != 0;
+                common_params params_plain2 = params;
+                if (drop_plain2) {
+                    common_fit_plain_launch(params_plain2, cp);
+                    common_set_env("LLAMA_SPEC_MTP_HEADS", "0");
+                } else {
+                    cp.n_rs_seq = 0;
+                    cp.n_state_capture = cparams.n_state_capture;
+                }
                 common_fit_set_moe_margin_auto(!params.fit_params_target_set);
                 const common_params_fit_status st3 = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(), tbo.empty() ? nullptr : tbo.data(),
                     mg.data(), params.fit_params_min_ctx, nullptr, fit_log_level, params.fit_kv_resident);
@@ -2993,7 +3033,14 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                     fit_status = st3;
                     params.speculative.draft.fit_off = true;
                     moe_gain_mtp_trial = false;   // the margin gain is the trial's (the last fit)
+                    if (drop_plain2) {
+                        llama_context_params cp_plain = cparams;
+                        common_fit_plain_launch(params, cp_plain);
+                    }
                 } else {
+                    if (drop_plain2) {
+                        common_set_env("LLAMA_SPEC_MTP_HEADS", "1");
+                    }
                     COM_INF("%s: --fit: small device, %d host threads: the MTP drafter stays (MoE cache %" PRId64 " MiB with it, %" PRId64 " without)\n",
                         __func__, n_threads, c_with/mib, c_wo/mib);
                     moe_gain_first     = gain_with;
