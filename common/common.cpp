@@ -2414,7 +2414,13 @@ static bool common_fit_draft_on_cpu(
     const char * env_rq = getenv("LLAMA_DRAFT_REQUANT");
     const bool rq_off = env_rq != nullptr && (strcmp(env_rq, "off") == 0 || strcmp(env_rq, "0") == 0 || strcmp(env_rq, "none") == 0);
     const bool rq_set = env_rq != nullptr && !rq_off && env_rq[0] != 0;
-    int64_t rq_min_tok = 1;
+    // the 1-token line is measured for a built-in-head drafter (draft-mtp) with short verify windows (at most 3 drafted tokens): its
+    // verify step cost 1.9x a single token at 1.4 tokens per layer (G4 fn4 12 GB). A separate draft model with longer windows did not pay
+    // there: G4 Qwen3.6-35B-A3B UD-Q4_K_XL 7 GB + Qwen3.5-0.8B Q8_0 (draft-simple, 4 tokens) at 2.8 tokens requantized: 38.8 ms per verify
+    // step against 5.7 ms per token without it, chat 60.5 vs 175 tok/s. Other drafters keep LLAMA_FIT_DRAFT_MIN_TOKENS at the smaller size
+    const bool rq_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) !=
+        params.speculative.types.end() && common_speculative_n_max(&params.speculative) <= 3;
+    int64_t rq_min_tok = rq_mtp ? 1 : min_tok;
     if (const char * e = getenv("LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT")) {
         rq_min_tok = std::max(0, atoi(e));
     }
