@@ -1568,7 +1568,12 @@ private:
                             ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
                             auto cc_fn = reg ? (int (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_compute_capability") : nullptr;
                             const int cc = cc_fn != nullptr ? cc_fn(dev) : -1;
-                            mib = (cc >= 0 && cc < 800) ? 192 : 0;
+                            // k17-small: off where the fit priced the drafter as it runs (LLAMA_FIT_MTP_PRICE=1, exported by common):
+                            // the floor stood in for that price and dropped drafts that fit (Colab T4 4 GB q4x 16k: 126.9 MiB free,
+                            // chat 38.9 -> 27.1 tok/s)
+                            const char * e_pr = getenv("LLAMA_FIT_MTP_PRICE");
+                            const bool priced = e_pr != nullptr && atoi(e_pr) != 0 && params_base.fit_params;
+                            mib = (cc >= 0 && cc < 800 && !priced) ? 192 : 0;
                         }
                         const size_t min_free = (size_t) std::max(0, mib) * 1024 * 1024;
                         if (min_free == 0) {
