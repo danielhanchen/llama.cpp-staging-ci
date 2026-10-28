@@ -1412,6 +1412,10 @@ void llama_batch_ext_clear(llama_batch_ext * batch) {
     batch->clear();
 }
 
+void llama_batch_ext_release_state(llama_batch_ext * batch) {
+    std::vector<float>().swap(batch->state);
+}
+
 void llama_batch_ext_reserve(llama_batch_ext * batch, int32_t n_tokens, int32_t n_state_tokens) {
     batch->reserve(n_tokens, n_state_tokens);
 }

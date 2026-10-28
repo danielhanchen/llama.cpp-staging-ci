@@ -1639,6 +1639,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (!is_mem_shared && !chain_heads && common_mtp_handoff_on("DEV_H") && dev_h_on) {
             dev_h = llama_mtp_dev_h_attach(ctx_dft, ctx_tgt, (int32_t) llama_n_batch(ctx_tgt));
         }
+        // k17: the device handoff reads no host state rows, so the batch's prefaulted ones (n_batch x n_embd floats: 64 MiB at 8192,
+        // 128 MiB at 16384 for Qwen3.6 + MTP heads) are given back; a host-path batch grows them again (LLAMA_MTP_DEV_H_KEEP_STATE=1 keeps them)
+        if (dev_h && getenv("LLAMA_MTP_DEV_H_KEEP_STATE") == nullptr) {
+            llama_batch_ext_release_state(batch.batch.get());
+        }
     }
 
     ~common_speculative_impl_draft_mtp() override {

@@ -241,6 +241,8 @@ enum llama_decision_order {
 // The embeddings output has one value per entry: row i is the score of option i
 // k11: room for n_tokens entries, n_state_tokens of them with a state row, before they are added
 LLAMA_API void llama_batch_ext_reserve(struct llama_batch_ext * batch, int32_t n_tokens, int32_t n_state_tokens);
+// k17: frees the state rows a batch prefaulted at its creation (LLAMA_BATCH_STATE_PREFAULT); later state rows grow it again
+LLAMA_API void llama_batch_ext_release_state(struct llama_batch_ext * batch);
 
 LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch, int32_t idx, enum llama_decision_order order);
 
