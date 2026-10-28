@@ -263,6 +263,12 @@ struct llama_context {
     // k16-draft (LLAMA_RS_REPLAY): advances the delta-net state rows by the accepted tokens of the last window (see
     // llama_memory_recurrent::replay); called by the recurrent memory before it is read again
     void rs_replay_commit(bool sync);
+    // k16-replay-oom: decides rs_mode and reserves the fallback allocation of the largest commit graph at load (see rs_replay_commit)
+    void rs_replay_setup();
+    // the commit graph of the pending cells (worst: every cell with a full window, the pending state untouched, for the reserve)
+    void rs_commit_build(ggml_context * ctx, ggml_cgraph * gf, bool worst);
+    ggml_gallocr_ptr         rs_ga_fb; // one backend: the reserved fallback allocation (null: not reserved)
+    uint64_t                 rs_fb_used = 0;
     llama_memory_recurrent * rs_replay_mem = nullptr;
     ggml_backend_sched_ptr   rs_sched;
     int64_t                  rs_replay_us = 0;
@@ -270,7 +276,8 @@ struct llama_context {
     struct rs_graph {
         ggml_context_ptr ctx;
         ggml_cgraph *    gf = nullptr;
-        ggml_gallocr_ptr ga; // its own allocation on rs_backend (null: allocated by rs_sched)
+        ggml_gallocr_ptr ga; // its own allocation on rs_backend (null: allocated by rs_sched or in rs_ga_fb)
+        bool             shared = false; // k16-replay-oom: allocated in the buffer reserved at load (rs_ga_fb), re-allocated on a key switch
     };
     std::map<std::vector<uint32_t>, rs_graph> rs_graphs; // per (cell, tokens, rolled back) set
     std::vector<uint32_t>    rs_key; // the graph the sched holds the allocation of
