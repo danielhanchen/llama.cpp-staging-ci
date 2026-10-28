@@ -1419,6 +1419,9 @@ std::string common_state_buf_pool_desc(); // debug: the capacities (MiB) of the 
 void common_state_buf_pending_add(size_t capacity);
 void common_state_buf_recycle_pending(common_state_buf && buf);
 void common_state_buf_pending_drop(size_t capacity); // ... that will not come back after all
+// k17: as common_state_buf_take / _prefault, but only a pooled buffer of at most fit times n counts (fit <= 0: the pool's rule)
+bool common_state_buf_take_fit(common_state_buf & buf, size_t n, int fit);
+void common_state_buf_prefault_fit(size_t n, int count, int fit);
 // k11 (LLAMA_STATE_PREFAULT=0 turns it off): ask a background thread to keep count pooled buffers of at least n bytes with resident pages
 void common_state_buf_prefault(size_t n, int count);
 

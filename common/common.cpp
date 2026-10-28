@@ -4634,16 +4634,17 @@ namespace {
 struct state_prefault_worker {
     std::mutex              m;
     std::condition_variable cv;
-    std::vector<std::pair<size_t, int>> want; // (bytes, count)
+    struct want_t { size_t n; int count; int fit; };
+    std::vector<want_t> want; // (bytes, count, fit: a ready buffer is at most fit times n, 0 = the pool's rule)
     bool        stop = false;
     std::thread th;
 
-    void request(size_t n, int count) {
+    void request(size_t n, int count, int fit = 0) {
         std::lock_guard<std::mutex> lock(m);
         if (stop) {
             return;
         }
-        want.push_back({ n, count });
+        want.push_back({ n, count, fit });
         if (!th.joinable()) {
             th = std::thread([this] { run(); });
         }
@@ -4660,14 +4661,14 @@ struct state_prefault_worker {
             auto w = std::move(want);
             want.clear();
             lock.unlock();
-            for (const auto & [n, count] : w) {
-                fill(n, count);
+            for (const auto & r : w) {
+                fill(r.n, r.count, r.fit);
             }
             lock.lock();
         }
     }
 
-    void fill(size_t n, int count) {
+    void fill(size_t n, int count, int fit = 0) {
         const size_t n_alloc = n + n/16; // room for a slightly longer prompt
         while (true) {
             {
@@ -4678,11 +4679,11 @@ struct state_prefault_worker {
                 for (const auto & b : g_ckpt_pool) {
                     // with the fit, a buffer over twice the size is not handed out for n: it does not count as ready (else the fill
                     // stopped and the next checkpoint of this size faulted in fresh pages on the request path)
-                    have  += b.capacity() >= n && (!ckpt_pool_fit() || b.capacity() / ckpt_pool_fit() <= n);
+                    have  += b.capacity() >= n && (fit > 0 ? b.capacity() / fit <= n : (!ckpt_pool_fit() || b.capacity() / ckpt_pool_fit() <= n));
                     total += b.capacity();
                 }
                 for (const size_t cap : g_ckpt_pool_pending) { // k17: the buffers a background copy returns shortly
-                    have  += cap >= n && (!ckpt_pool_fit() || cap / ckpt_pool_fit() <= n);
+                    have  += cap >= n && (fit > 0 ? cap / fit <= n : (!ckpt_pool_fit() || cap / ckpt_pool_fit() <= n));
                     total += cap;
                 }
                 if (have >= count || g_ckpt_pool.size() + g_ckpt_pool_pending.size() >= 8 || total + n_alloc > ckpt_pool_limit()) {
@@ -4739,6 +4740,12 @@ std::string common_state_buf_pool_desc() {
     return r;
 }
 
+void common_state_buf_prefault_fit(size_t n, int count, int fit) {
+    if (state_prefault_on() && n >= (1u << 20) && count > 0) {
+        g_state_prefault.request(n, count, fit);
+    }
+}
+
 size_t common_state_buf_pool_bytes() {
     std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
     size_t t = 0;
@@ -4782,6 +4789,29 @@ bool common_state_buf_take(common_state_buf & buf, size_t n) {
     return true;
 }
 
+bool common_state_buf_take_fit(common_state_buf & buf, size_t n, int fit) {
+    if (!ckpt_pool_on() || buf.capacity() >= n || fit <= 0) {
+        return fit <= 0 ? common_state_buf_take(buf, n) : false;
+    }
+    if (n < (1u << 20) && ckpt_pool_small_fresh()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_ckpt_pool_mutex);
+    g_ckpt_pool_req_max = std::max(g_ckpt_pool_req_max, n);
+    auto best = g_ckpt_pool.end();
+    for (auto it = g_ckpt_pool.begin(); it != g_ckpt_pool.end(); ++it) {
+        if (it->capacity() >= n && it->capacity() / fit <= n && (best == g_ckpt_pool.end() || it->capacity() < best->capacity())) {
+            best = it;
+        }
+    }
+    if (best == g_ckpt_pool.end()) {
+        return false;
+    }
+    buf = std::move(*best);
+    g_ckpt_pool.erase(best);
+    return true;
+}
+
 static bool ckpt_no_zero_fill() {
     static const bool on = common_mtp_handoff_on("CKPT");
     return on;
@@ -4797,8 +4827,19 @@ void common_prompt_checkpoint::update_tgt(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    common_state_buf_take(data_tgt, ckpt_size);
-    common_state_buf_prefault(ckpt_size, 2);
+    // k17 (LLAMA_STATE_CKPT_FIT=0: any pooled buffer that fits): a new checkpoint takes a pooled buffer of at most twice its size, and the
+    // prefault worker keeps two of those ready. Every pooled buffer is a state or a checkpoint, and a checkpoint that took a state buffer kept
+    // it whole for its life, in the slot and in the cache entry it was lent or moved to: G4 resident Qwen3.6 MTP multi-turn, 8 checkpoints
+    // of 502 MiB held 860-980 MiB, the entry's 691 MiB held 1387 MiB with the idle lend (1173 MiB without). Copies (clones) keep the
+    // pool's rule: they come several at once on a reuse turn, where a fitted pool faulted fresh pages on the request path (round 26)
+    static const bool ckpt_fit = getenv("LLAMA_STATE_CKPT_FIT") == nullptr || atoi(getenv("LLAMA_STATE_CKPT_FIT")) != 0;
+    if (ckpt_fit) {
+        common_state_buf_take_fit(data_tgt, ckpt_size, 2);
+        common_state_buf_prefault_fit(ckpt_size, 2, 2);
+    } else {
+        common_state_buf_take(data_tgt, ckpt_size);
+        common_state_buf_prefault(ckpt_size, 2);
+    }
     data_tgt.resize(ckpt_size);
     if (!ckpt_no_zero_fill()) {
         std::fill(data_tgt.begin(), data_tgt.end(), 0); // LLAMA_MTP_HANDOFF_CKPT=0: zero-filled as before
@@ -4820,7 +4861,12 @@ void common_prompt_checkpoint::update_dft(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    common_state_buf_take(data_dft, ckpt_size);
+    static const bool ckpt_fit = getenv("LLAMA_STATE_CKPT_FIT") == nullptr || atoi(getenv("LLAMA_STATE_CKPT_FIT")) != 0;
+    if (ckpt_fit) {
+        common_state_buf_take_fit(data_dft, ckpt_size, 2); // as update_tgt
+    } else {
+        common_state_buf_take(data_dft, ckpt_size);
+    }
     data_dft.resize(ckpt_size);
     if (!ckpt_no_zero_fill()) {
         std::fill(data_dft.begin(), data_dft.end(), 0); // LLAMA_MTP_HANDOFF_CKPT=0: zero-filled as before
