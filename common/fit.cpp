@@ -1182,8 +1182,18 @@ static void common_params_fit_impl(
                 const int64_t cap_below_mib = e_cb != nullptr ? std::max<int64_t>(0, atoll(e_cb)) : 256;
                 // opt-in second, smaller margin when the first one leaves no cache (LLAMA_FIT_SMALL_MARGIN_MIN_MIB=N): G4 4 GB Qwen3.6
                 // UD-Q4_K_XL + MTP placed every layer at 128 MiB but ran out of device memory in its first request (CUDA error, run k13r2)
+                // k17-small: with the MTP drafter priced as it runs (common_fit_mtp_price_on) the second margin is 160 MiB by default
+                // (LLAMA_FIT_MTP_SMALL_MARGIN_MIB). The 256 MiB margin was tuned with a drafter priced 129 + 32 MiB short, so at the exact price
+                // it leaves no cache beside the drafter and the fit drops it where it runs: Colab T4 4 GB, Qwen3.6-35B-A3B UD-Q4_K_XL + MTP at
+                // ctx 16384 drafted with 126.9 MiB free after load at the old price (95 MiB once the target grew for the drafter), while a
+                // Kaggle T4 at 74.8 MiB (about 43 at the first prompt; its driver keeps ~53 MiB more) ran out of memory. 160 MiB priced
+                // exactly leaves ~160 on the Colab host and ~107 on the Kaggle one at the first prompt, the cache taking the rest
+                const bool mtp_priced = extra != nullptr && extra->shares_model && common_fit_mtp_price_on();
+                const char * e_sm3 = getenv("LLAMA_FIT_MTP_SMALL_MARGIN_MIB");
+                const int64_t mtp_min_mib = e_sm3 != nullptr ? std::max<int64_t>(0, atoll(e_sm3)) : 160;
                 const char * e_sm2 = getenv("LLAMA_FIT_SMALL_MARGIN_MIN_MIB");
-                const int64_t small_min_mib = std::min<int64_t>(small_mib, e_sm2 != nullptr ? std::max<int64_t>(0, atoll(e_sm2)) : small_mib);
+                const int64_t small_min_mib = std::min<int64_t>(small_mib, e_sm2 != nullptr ? std::max<int64_t>(0, atoll(e_sm2)) :
+                    (mtp_priced && mtp_min_mib > 0 ? mtp_min_mib : small_mib));
                 if (g_moe_margin_auto && small_mib > 0 && small_mib*MiB < m_default && margins[0] >= m_default) {
                     const int64_t margin_saved = margins[0];
                     const dmds_t  dmds_nc_saved = dmds_cpu_moe;
