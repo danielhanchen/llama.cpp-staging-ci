@@ -1360,6 +1360,46 @@ static bool ggml_backend_cuda_buffer_commit(ggml_backend_buffer_t buffer, size_t
 #endif
 }
 
+// k17-small (lazy KV step 2): give back the device memory of the chunks that lie wholly inside [offset, offset + size) of a lazy buffer
+// (the address range stays reserved, a later commit backs them again, cleared). Returns the bytes freed (0 for a buffer that is not lazy).
+// The caller makes sure nothing reads or writes that range any more (the device is synchronized here first)
+static size_t ggml_backend_cuda_buffer_decommit(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
+        return 0;
+    }
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (!ctx->lazy || size == 0) {
+        return 0;
+    }
+#if defined(GGML_USE_VMM)
+    const size_t c0 = (offset + ctx->lazy_gran - 1) / ctx->lazy_gran;
+    const size_t c1 = std::min(ctx->chunks.size(), (offset + size) / ctx->lazy_gran);
+    if (c0 >= c1) {
+        return 0;
+    }
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    size_t freed = 0;
+    for (size_t i = c0; i < c1; ++i) {
+        if (ctx->chunks[i] == 0) {
+            continue;
+        }
+        const CUdeviceptr at = (CUdeviceptr) ctx->dev_ptr + i*ctx->lazy_gran;
+        CU_CHECK(cuMemUnmap(at, ctx->lazy_gran));
+        CU_CHECK(cuMemRelease(ctx->chunks[i]));
+        ctx->chunks[i] = 0;
+        freed += ctx->lazy_gran;
+    }
+    if (freed > 0) {
+        ggml_cuda_own_add(ctx->device, -(int64_t) freed);
+    }
+    return freed;
+#else
+    GGML_UNUSED(offset);
+    return 0;
+#endif
+}
+
 // the backed bytes of a lazy buffer (its size if it is not lazy)
 static size_t ggml_backend_cuda_buffer_committed(ggml_backend_buffer_t buffer) {
     if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
@@ -12490,6 +12530,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_buffer_committed") == 0) {
         return (void *)ggml_backend_cuda_buffer_committed;
+    }
+    if (strcmp(name, "ggml_backend_buffer_decommit") == 0) {
+        return (void *)ggml_backend_cuda_buffer_decommit;
     }
     if (strcmp(name, "ggml_backend_moe_fetch_overlap_default") == 0) {
         return (void *)ggml_backend_cuda_moe_fetch_overlap_default;
