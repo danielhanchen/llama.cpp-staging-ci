@@ -89,13 +89,10 @@ static int64_t common_fit_moe_margin(int64_t m) {
 // that the fit rather than that floor decides the drafter there; off elsewhere. G4 (cc 12.0) runs q4x 4 GB 16k + MTP with 18.6 MiB
 // free after the draft (decode 170 tok/s); the exact price would drop the drafter there for the 256 MiB margin (116 tok/s without it).
 // The default is decided once and exported as LLAMA_FIT_MTP_PRICE, which the measure in sched_reserve reads
-static bool common_fit_mtp_price_on() {
-    static const bool on = [] {
-        const char * e = getenv("LLAMA_FIT_MTP_PRICE");
-        if (e != nullptr && *e != '\0') {
-            return atoi(e) != 0;
-        }
-        bool pre_ampere = false;
+// an NVIDIA GPU below compute capability 8.0 among the devices
+static bool common_fit_pre_ampere() {
+    static const bool pre = [] {
+        bool any = false;
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
@@ -104,8 +101,20 @@ static bool common_fit_mtp_price_on() {
             ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
             auto cc_fn = reg ? (int (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_compute_capability") : nullptr;
             const int cc = cc_fn != nullptr ? cc_fn(dev) : -1;
-            pre_ampere = pre_ampere || (cc >= 0 && cc < 800);
+            any = any || (cc >= 0 && cc < 800);
         }
+        return any;
+    }();
+    return pre;
+}
+
+static bool common_fit_mtp_price_on() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_FIT_MTP_PRICE");
+        if (e != nullptr && *e != '\0') {
+            return atoi(e) != 0;
+        }
+        const bool pre_ampere = common_fit_pre_ampere();
         // k17-small round 9: on every GPU by default. G4 4 GB, Qwen3.6-35B-A3B UD-Q3_K_M + MTP at ctx 32768 aborted in its first prompt
         // with the old price (2 of 2 launches, as base) and runs with the exact one (the fit drops the drafter: 143 tok/s); where the old
         // price kept the drafter and it ran (q4x 16k / 20k), the main context had lost its host weight prefetch to a failed allocation
@@ -1190,7 +1199,10 @@ static void common_params_fit_impl(
                 // exactly leaves ~160 on the Colab host and ~107 on the Kaggle one at the first prompt, the cache taking the rest
                 const bool mtp_priced = extra != nullptr && extra->shares_model && common_fit_mtp_price_on();
                 const char * e_sm3 = getenv("LLAMA_FIT_MTP_SMALL_MARGIN_MIB");
-                const int64_t mtp_min_mib = e_sm3 != nullptr ? std::max<int64_t>(0, atoll(e_sm3)) : 160;
+                // only below compute capability 8.0 (the T4 hosts it was measured on): G4 (cc 12.0) 4 GB q4x 16k at 160 MiB kept the
+                // drafter with 130.6 MiB free after it, the target grew 474 -> 506 MiB, and the first prompt ran out of memory creating a
+                // cuBLAS handle (rs_replay_commit, 2 of 2 launches); at 256 the fit drops the drafter there and every cell runs (k17s_g4i)
+                const int64_t mtp_min_mib = e_sm3 != nullptr ? std::max<int64_t>(0, atoll(e_sm3)) : (common_fit_pre_ampere() ? 160 : 0);
                 const char * e_sm2 = getenv("LLAMA_FIT_SMALL_MARGIN_MIN_MIB");
                 const int64_t small_min_mib = std::min<int64_t>(small_mib, e_sm2 != nullptr ? std::max<int64_t>(0, atoll(e_sm2)) :
                     (mtp_priced && mtp_min_mib > 0 ? mtp_min_mib : small_mib));
