@@ -106,11 +106,18 @@ static bool common_fit_mtp_price_on() {
             const int cc = cc_fn != nullptr ? cc_fn(dev) : -1;
             pre_ampere = pre_ampere || (cc >= 0 && cc < 800);
         }
-        common_set_env("LLAMA_FIT_MTP_PRICE", pre_ampere ? "1" : "0");
-        if (pre_ampere) {
-            LOG_INF("%s: an MTP drafter is priced as it runs (a GPU below compute capability 8.0; LLAMA_FIT_MTP_PRICE=0 off)\n", __func__);
+        // k17-small round 9: on every GPU by default. G4 4 GB, Qwen3.6-35B-A3B UD-Q3_K_M + MTP at ctx 32768 aborted in its first prompt
+        // with the old price (2 of 2 launches, as base) and runs with the exact one (the fit drops the drafter: 143 tok/s); where the old
+        // price kept the drafter and it ran (q4x 16k / 20k), the main context had lost its host weight prefetch to a failed allocation
+        // after the draft attached (8k prompt 1662-1888 tok/s against 9200-9502 without the drafter, decode 11-19% higher with it).
+        // LLAMA_FIT_MTP_PRICE_PRE_AMPERE_ONLY=1: only below compute capability 8.0 (054ee0034e5)
+        const char * e_pa = getenv("LLAMA_FIT_MTP_PRICE_PRE_AMPERE_ONLY");
+        const bool on = (e_pa != nullptr && atoi(e_pa) != 0) ? pre_ampere : true;
+        common_set_env("LLAMA_FIT_MTP_PRICE", on ? "1" : "0");
+        if (on) {
+            LOG_INF("%s: an MTP drafter is priced as it runs (LLAMA_FIT_MTP_PRICE=0 off)\n", __func__);
         }
-        return pre_ampere;
+        return on;
     }();
     return on;
 }
