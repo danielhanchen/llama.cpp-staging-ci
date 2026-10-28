@@ -1422,6 +1422,9 @@ void common_state_buf_pending_drop(size_t capacity); // ... that will not come b
 // k17: as common_state_buf_take / _prefault, but only a pooled buffer of at most fit times n counts (fit <= 0: the pool's rule)
 bool common_state_buf_take_fit(common_state_buf & buf, size_t n, int fit);
 void common_state_buf_prefault_fit(size_t n, int count, int fit);
+// k17: new checkpoints take fitted pooled buffers (see common_prompt_checkpoint::update_tgt); auto mode turns it on at the first idle lend
+bool common_state_ckpt_fit();
+void common_state_ckpt_fit_enable();
 // k11 (LLAMA_STATE_PREFAULT=0 turns it off): ask a background thread to keep count pooled buffers of at least n bytes with resident pages
 void common_state_buf_prefault(size_t n, int count);
 

@@ -2113,6 +2113,9 @@ private:
                         // _PENDING) the resident G4 multi-turn run ends below the merged opt-in defaults: Qwen3.6 MTP 3991 vs 4959 MiB, LFM2.5
                         // 1903 vs 2707 MiB, same text and VmHWM (the lend itself: +206 MiB on Qwen3.6, 3991 vs 3785; G4 q4x 32 GB chat -2 ms)
                         static const bool lend_env = getenv("LLAMA_PCS_IDLE_LEND") == nullptr || atoi(getenv("LLAMA_PCS_IDLE_LEND")) != 0;
+                        if (lend_env && params_base.n_parallel == 1) {
+                            common_state_ckpt_fit_enable(); // k17: lent checkpoints keep their buffers in the cache entry: fit them from now on
+                        }
                         slot.prompt_saved_idle_new = slot.prompt_save(*prompt_cache, -2, idle_save == 2, lend_env && params_base.n_parallel == 1);
                         if (slot.prompt_saved_idle_new) {
                             prompt_cache->update();

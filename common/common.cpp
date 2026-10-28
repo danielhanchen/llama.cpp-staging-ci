@@ -18,6 +18,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -4740,6 +4741,16 @@ std::string common_state_buf_pool_desc() {
     return r;
 }
 
+// LLAMA_STATE_CKPT_FIT: unset = auto (off until common_state_ckpt_fit_enable), 1 = always, 0 = never
+static std::atomic<bool> g_ckpt_fit_auto_on { false };
+bool common_state_ckpt_fit() {
+    static const int mode = getenv("LLAMA_STATE_CKPT_FIT") != nullptr ? (atoi(getenv("LLAMA_STATE_CKPT_FIT")) != 0 ? 1 : 0) : -1;
+    return mode == 1 || (mode < 0 && g_ckpt_fit_auto_on.load(std::memory_order_relaxed));
+}
+void common_state_ckpt_fit_enable() {
+    g_ckpt_fit_auto_on.store(true, std::memory_order_relaxed);
+}
+
 void common_state_buf_prefault_fit(size_t n, int count, int fit) {
     if (state_prefault_on() && n >= (1u << 20) && count > 0) {
         g_state_prefault.request(n, count, fit);
@@ -4832,8 +4843,10 @@ void common_prompt_checkpoint::update_tgt(
     // it whole for its life, in the slot and in the cache entry it was lent or moved to: G4 resident Qwen3.6 MTP multi-turn, 8 checkpoints
     // of 502 MiB held 860-980 MiB, the entry's 691 MiB held 1387 MiB with the idle lend (1173 MiB without). Copies (clones) keep the
     // pool's rule: they come several at once on a reuse turn, where a fitted pool faulted fresh pages on the request path (round 26)
-    static const bool ckpt_fit = getenv("LLAMA_STATE_CKPT_FIT") == nullptr || atoi(getenv("LLAMA_STATE_CKPT_FIT")) != 0;
-    if (ckpt_fit) {
+    // default auto: only once the server lends checkpoints at idle (common_state_ckpt_fit_enable, resident placements): T4 Qwen3.6 MTP
+    // (spilled, no lend) ended +152 MiB with the fit always on (fresh fitted buffers beside the pooled state buffers) and reuse turns
+    // 2-5% slower; G4 resident -339 MiB with it (3649 vs 3988), where the lent checkpoints otherwise kept the state buffers whole
+    if (common_state_ckpt_fit()) {
         common_state_buf_take_fit(data_tgt, ckpt_size, 2);
         common_state_buf_prefault_fit(ckpt_size, 2, 2);
     } else {
@@ -4861,8 +4874,7 @@ void common_prompt_checkpoint::update_dft(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    static const bool ckpt_fit = getenv("LLAMA_STATE_CKPT_FIT") == nullptr || atoi(getenv("LLAMA_STATE_CKPT_FIT")) != 0;
-    if (ckpt_fit) {
+    if (common_state_ckpt_fit()) {
         common_state_buf_take_fit(data_dft, ckpt_size, 2); // as update_tgt
     } else {
         common_state_buf_take(data_dft, ckpt_size);
