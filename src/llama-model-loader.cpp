@@ -18,6 +18,7 @@
 #include <cstring>
 #include <future>
 #include <regex>
+#include <thread>
 #include <unordered_set>
 
 #if defined(__linux__)
@@ -566,6 +567,27 @@ llama_model_loader::llama_model_loader(
     if (param_overrides_p != nullptr) {
         for (const struct llama_model_kv_override * p = param_overrides_p; p->key[0] != 0; p++) {
             kv_overrides.insert({std::string(p->key), *p});
+        }
+    }
+
+    {
+        auto it = kv_overrides.find("general.requant_type");
+        if (it != kv_overrides.end() && it->second.tag == LLAMA_KV_OVERRIDE_TYPE_STR) {
+            std::string v = it->second.val_str;
+            std::transform(v.begin(), v.end(), v.begin(), ::tolower);
+            for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+                const char * n = ggml_type_name((ggml_type) t);
+                if (n != nullptr && v == n && ggml_get_type_traits((ggml_type) t)->from_float_ref != nullptr &&
+                        !ggml_quantize_requires_imatrix((ggml_type) t)) {
+                    requant_type = (ggml_type) t;
+                }
+            }
+            if (requant_type == GGML_TYPE_COUNT) {
+                LLAMA_LOG_WARN("%s: general.requant_type = %s is not a type that quantizes without an imatrix: ignored\n", __func__, v.c_str());
+            } else {
+                LLAMA_LOG_INFO("%s: the FFN / expert weights on devices are requantized to %s at load (LLAMA_DRAFT_REQUANT)\n", __func__,
+                    ggml_type_name(requant_type));
+            }
         }
     }
 
@@ -1449,7 +1471,32 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     GGML_ASSERT(ggml_nbytes(&t_meta) == ggml_nbytes(cur));
 
+    // k18 load-time requantization: an FFN / expert matrix (name with "ffn_", 2-3 dims, rows of whole blocks of the target type) that a
+    // device holds is stored as requant_type; it is converted while it is loaded (load_all_data). Host tensors keep the file's type
+    // (they may be mapped from the file)
+    const bool rq_cand = requant_type != GGML_TYPE_COUNT && !is_lazy && !(flags & TENSOR_DUPLICATED) && t_meta.type != requant_type &&
+        strstr(tn.str().c_str(), "ffn_") != nullptr && ggml_n_dims(&t_meta) >= 2 && ggml_get_type_traits(t_meta.type)->to_float != nullptr &&
+        t_meta.ne[0] % ggml_blck_size(requant_type) == 0 && ggml_type_size(requant_type)*t_meta.ne[0]/ggml_blck_size(requant_type) <
+        ggml_row_size(t_meta.type, t_meta.ne[0]);
+    const ggml_type rq_orig = t_meta.type;
+    if (rq_cand) {
+        t_meta.type  = requant_type;
+        t_meta.nb[0] = ggml_type_size(requant_type);
+        t_meta.nb[1] = ggml_row_size(requant_type, t_meta.ne[0]);
+        for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+            t_meta.nb[d] = t_meta.nb[d-1]*t_meta.ne[d-1];
+        }
+    }
+
     ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+    if (rq_cand && buft != nullptr && ggml_backend_buft_is_host(buft)) {
+        // on the host: as in the file
+        t_meta = *cur;
+        buft = buft_for_tensor(&t_meta);
+    } else if (rq_cand && buft != nullptr) {
+        requant_src[tn.str()] = { rq_orig, ggml_nbytes(cur) };
+        size_data -= ggml_nbytes(cur) - ggml_nbytes(&t_meta);
+    }
     if (buft == nullptr) {
         return nullptr;
     }
@@ -1803,6 +1850,55 @@ bool llama_model_loader::load_all_data(
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
+        // k18: a requantized tensor (see create_tensor): read as in the file, converted on the host threads, then uploaded
+        if (auto rq = requant_src.find(ggml_get_name(cur)); rq != requant_src.end()) {
+            const ggml_type t_src  = rq->second.first;
+            const size_t    n_src  = rq->second.second;
+            std::vector<no_init<uint8_t>> src_buf;
+            const uint8_t * src = nullptr;
+            if (from_mapping) {
+                src = (const uint8_t *) mappings.at(weight->idx)->addr() + weight->offs;
+            } else {
+                const auto & file = files.at(weight->idx);
+                src_buf.resize(n_src);
+                file->seek(weight->offs, SEEK_SET);
+                file->read_raw(src_buf.data(), n_src);
+                src = (const uint8_t *) src_buf.data();
+            }
+            const int64_t ne0   = cur->ne[0];
+            const int64_t nrows = ggml_nelements(cur)/ne0;
+            const size_t  rs_src = ggml_row_size(t_src, ne0);
+            const size_t  rs_dst = ggml_row_size(cur->type, ne0);
+            std::vector<no_init<uint8_t>> dst(n_size);
+            const auto * tr = ggml_get_type_traits(t_src);
+            ggml_quantize_init(cur->type);
+            const int nth = (int) std::max(1u, std::min(32u, std::thread::hardware_concurrency()));
+            const int64_t t0 = ggml_time_us();
+            std::vector<std::thread> workers;
+            for (int it = 0; it < nth; ++it) {
+                workers.emplace_back([&, it]() {
+                    const int64_t r0 = nrows*it/nth, r1 = nrows*(it + 1)/nth;
+                    std::vector<float> f((size_t) ne0*64);
+                    for (int64_t r = r0; r < r1; r += 64) {
+                        const int64_t nr = std::min<int64_t>(64, r1 - r);
+                        for (int64_t k = 0; k < nr; ++k) {
+                            tr->to_float(src + (size_t) (r + k)*rs_src, f.data() + (size_t) k*ne0, ne0);
+                        }
+                        ggml_quantize_chunk(cur->type, f.data(), (uint8_t *) dst.data() + (size_t) r*rs_dst, 0, nr, ne0, nullptr);
+                    }
+                });
+            }
+            for (auto & w : workers) {
+                w.join();
+            }
+            requant_us += ggml_time_us() - t0;
+            requant_bytes_src += n_src;
+            requant_bytes_dst += n_size;
+            ggml_backend_tensor_set(cur, dst.data(), 0, n_size);
+            size_done += n_size;
+            continue;
+        }
+
         if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
@@ -1925,6 +2021,11 @@ bool llama_model_loader::load_all_data(
         }
 
         size_done += n_size;
+    }
+
+    if (!requant_src.empty()) {
+        LLAMA_LOG_INFO("%s: requantized %zu tensors to %s: %.2f -> %.2f MiB in %.1f ms (LLAMA_DRAFT_REQUANT)\n", __func__, requant_src.size(),
+            ggml_type_name(requant_type), requant_bytes_src/1048576.0, requant_bytes_dst/1048576.0, requant_us/1000.0);
     }
 
     // free temporary resources used for async uploads
