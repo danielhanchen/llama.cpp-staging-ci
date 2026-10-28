@@ -60,11 +60,33 @@ bool common_fit_small_device() {
 }
 
 // the margin of a device beside a MoE cache for the default margin m (see common_fit_set_moe_margin_auto)
-static int64_t common_fit_moe_margin(int64_t m) {
+static int64_t common_fit_moe_margin(int64_t m, int64_t free_dev, int64_t cache_want) {
     constexpr int64_t MiB_ = 1024*1024;
     constexpr int64_t m_default = 1024*MiB_;
     if (!g_moe_margin_auto || m < m_default) {
         return m;
+    }
+    // k17-models: on by default (256 MiB stay free beside the cache) where the device budget is at least LLAMA_MOE_FIT_MARGIN_MIN_GIB (10)
+    // and the host experts the cache would hold are at most LLAMA_MOE_FIT_MARGIN_MAX_RATIO (1.8) times that budget: a cache that holds a
+    // small share of a large expert set stages many misses per prompt ubatch at run time and needs the margin.
+    // Gate (k17m_l4mm / g4mm / g4mg / g4mh, chat to 30k prompts, log grep for allocation failures and fallbacks), experts / budget:
+    //   pass with 256: LFM2.5 Q4_K_XL 12 GB (1.12), q4x + MTP 12 / 16 GB (1.58 / 1.17), Flint Q4_K_XL 16 GB (1.37),
+    //     Flash-Next IQ1_S + MTP 16 / 24 GB (2.38 / 1.58), IQ4_XS + MTP 24 GB (2.37), q4x 8 GB (2.40)
+    //   fail with 256: Flint 12 GB (1.85: no allocation failure, but its pinned text follows the cache size and short192 KLD is x1.03 over
+    //     a one-point G4 band), Flint 8 GB (2.82, prefetch staging allocation failed), Flash-Next IQ4_XS 12 GB (4.78, CUDA out of memory abort)
+    //     and 16 GB (3.55, 1275 MiB staging allocation failed)
+    // Gain: LFM2.5 12 GB cache 9236 -> 10000 MiB, long48 +6..+9% (L4 76.4 -> 83.6, G4 257.4 -> 273.1), chat +6..+10%; q4x 12 GB 0..+12%.
+    // LLAMA_MOE_FIT_MARGIN=0: the full margin everywhere; LLAMA_MOE_FIT_MARGIN_MIB keeps its meaning (below)
+    if (getenv("LLAMA_MOE_FIT_MARGIN_MIB") == nullptr) {
+        const char * en  = getenv("LLAMA_MOE_FIT_MARGIN");
+        const char * eg  = getenv("LLAMA_MOE_FIT_MARGIN_MIN_GIB");
+        const char * er  = getenv("LLAMA_MOE_FIT_MARGIN_MAX_RATIO");
+        const int64_t mn = (eg != nullptr ? std::max<int64_t>(0, atoll(eg)) : 10)*1024*MiB_;
+        const double  mr = er != nullptr ? std::max(0.0, atof(er)) : 1.8;
+        if ((en != nullptr && atoi(en) == 0) || free_dev < mn || (double) cache_want > mr*(double) free_dev) {
+            return m;
+        }
+        return m - m_default + 256*MiB_;
     }
     // opt-in (k11 G4 timing): the 8 GB tiers use the default margin at run time (layer-major groups, prefetch depth, the MTP context's
     // staging, the CUDA pools: 70 MiB free at the low point of Qwen3.6 UD-Q4_K_XL + MTP); 384 MiB ran out of device memory there and on
@@ -585,7 +607,8 @@ static void common_params_fit_impl(
         int64_t margin_gain = 0;
         for (size_t id = 0; id < nd; id++) {
             if (use_margins && int64_t(dmds[id].mb.total()) > int64_t(dmds_nc[id].mb.total())) {
-                margin_gain += int64_t(margins[id]) - common_fit_moe_margin(int64_t(margins[id]));
+                margin_gain += int64_t(margins[id]) - common_fit_moe_margin(int64_t(margins[id]), int64_t(dmds[id].free),
+                    int64_t(dmds[id].mb.total()) - int64_t(dmds_nc[id].mb.total()));
             }
         }
 

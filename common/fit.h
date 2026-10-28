@@ -49,7 +49,7 @@ common_params_fit_status common_fit_params(
                      ggml_log_level   log_level,             // minimum log level to print during fitting, lower levels go to debug log
              common_fit_kv_resident   kv_resident = COMMON_FIT_KV_RESIDENT_AUTO); // placement for dense models that do not fit
 
-// k11 (LLAMA_MOE_FIT_MARGIN_MIB=N, opt-in): the margin the fit keeps free beside a MoE cache. The fit sizes the cache with the full
+// k11 (LLAMA_MOE_FIT_MARGIN_MIB=N; k17-models: 256 by default on devices with 10+ GiB, see common_fit_moe_margin): the margin the fit keeps free beside a MoE cache. The fit sizes the cache with the full
 // margin (--fit-target, default 1024 MiB), so every decision that follows the cache size (n_ubatch, lending, the resident rule) is the same
 // as before; then the cache gets the part of the default margin beyond N MiB. Off by default: the 8 GB tiers use that margin at run time
 // (G4: 70 MiB free at the low point of Qwen3.6 UD-Q4_K_XL + MTP; N = 384 ran out of memory there). An explicit --fit-target is kept as
