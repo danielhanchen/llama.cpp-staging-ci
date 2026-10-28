@@ -2935,10 +2935,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         // LLAMA_FIT_MTP_CACHE_MIN_THREADS (4, the spill guard's threshold) host threads, on a small-device placement with the drafter, the
         // fit runs again without it; the drafter goes if that keeps every layer on the device and gives the cache at least
         // LLAMA_FIT_MTP_CACHE_GAIN_MIB (256) and twice its size. The drafter's own text equals the target's where the verify is exact.
-        // Opt-in (LLAMA_FIT_MTP_CACHE_DROP=1): the G4 KLD of the no-MTP 4 GB placement against a full-card reference is outside the
-        // placement band of full card vs -cmoe (decode mean 0.0061 / 0.0047 short / long vs 0.0015 / 0.0011; today's MTP 4 GB default
-        // 0.0034 / 0.0038, k17s_g4c), so it is not a default (coordinator rule); the route tail skip at 4 GB, which skips more experts in
-        // single-token than in verify windows, is a suspected part of that excess and is measured apart next
+        // On by default (LLAMA_FIT_MTP_CACHE_DROP=0 keeps the drafter). G4 KLD against a full-card reference, judged against today's MTP
+        // 4 GB default under the same route tail skip setting (k17s_g4d, tail skip off): decode mean / p99 0.00149 / 0.0287 short and
+        // 0.00187 / 0.0299 long for this placement, 0.00136 / 0.0244 and 0.00208 / 0.0322 for today's default; with the default tail
+        // skip both are further out (0.0061 / 0.0034 short), the skip being the accepted default (Strata's). Kaggle T4 2 threads: decode
+        // +29..+49% (q3m 16k), +25% (q4x 16k)
         {
             const char * e_cd = getenv("LLAMA_FIT_MTP_CACHE_DROP");
             const char * e_ct = getenv("LLAMA_FIT_MTP_CACHE_MIN_THREADS");
@@ -2947,7 +2948,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             const int64_t gain_mib    = e_cg != nullptr ? std::max<int64_t>(0, atoll(e_cg)) : 256;
             const int32_t n_threads   = params.cpuparams.n_threads;
             const bool    cache_auto  = moe_cache_auto && cparams.moe_cache_size < COMMON_MOE_CACHE_AUTO_BYTES;
-            if (e_cd != nullptr && atoi(e_cd) != 0 && spec_mtp && !has_draft && !draft_off && !params.speculative.draft.fit_off &&
+            if ((e_cd == nullptr || atoi(e_cd) != 0) && spec_mtp && !has_draft && !draft_off && !params.speculative.draft.fit_off &&
                     params.speculative.draft.fit_can_drop && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && cache_auto &&
                     mparams.n_gpu_layers == llama_model_default_params().n_gpu_layers &&
                     mparams_in.n_gpu_layers == llama_model_default_params().n_gpu_layers &&
