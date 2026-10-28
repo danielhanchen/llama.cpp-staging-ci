@@ -1581,7 +1581,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 // The graph it replaces is mul_mat_id(up, x, ids), mul_mat_id(gate, x, ids), swiglu_split(gate, up), mul_mat_id(down, act, ids): four
 // nodes, seven barriers and a plan per batch, for 1-4 tokens and a few experts (Flash-Next UD-IQ4_XS at 12 / 16 GB on G4: 2.2-2.9
 // experts per batch, 76-95 us per batch, of which 20-35 us does not depend on the number of experts). Here every thread quantizes the
-// activations itself (no barrier), computes its share of the up and gate rows, waits at the one barrier, then forms the SwiGLU rows
+// activations itself (no barrier), computes its share of the up and gate rows (shares of equal weight: a row counts once per pair it serves), waits at the one barrier, then forms the SwiGLU rows
 // (and their quantization) of the pairs its down rows need and computes those down rows. Each output is the same vec_dot (or, for an
 // expert routed to 2+ rows, the same multi-column kernel, bit-identical to vec_dot per column) of the same quantized rows as in the graph,
 // so the result is the graph's bit for bit. Rows of id -1 are 0, as the graph writes them.
@@ -1603,6 +1603,20 @@ static int64_t ggml_moe_host_per_thread(const struct ggml_tensor * up, const str
            ggml_moe_host_pad((int64_t) n_tokens*(int64_t) ggml_row_size(type_traits_cpu[gate->type].vec_dot_type, n_embd)) +
            ggml_moe_host_pad(n_ff*(int64_t) sizeof(float)) +
            GGML_MOE_HOST_COLS*ggml_moe_host_pad((int64_t) ggml_row_size(type_traits_cpu[down->type].vec_dot_type, n_ff));
+}
+
+// k18: item index at weight B, items laid out group by group (rows items per group), an item of group g weighing its columns (pairs):
+// the threads take equal weight, not equal items (a group of an expert routed to 4 rows costs 4 single rows)
+static int64_t ggml_moe_host_item_at(const int32_t * gstart, int n_grp, int64_t rows, int64_t b) {
+    int64_t cum = 0;
+    for (int g = 0; g < n_grp; ++g) {
+        const int64_t nc = gstart[g + 1] - gstart[g];
+        if (b < cum + nc*rows) {
+            return (int64_t) g*rows + (b - cum)/nc;
+        }
+        cum += nc*rows;
+    }
+    return (int64_t) n_grp*rows;
 }
 
 size_t ggml_cpu_moe_host_ffn_wsize(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
@@ -1746,9 +1760,9 @@ bool ggml_cpu_moe_host_ffn(const struct ggml_tensor * up, const struct ggml_tens
 
         // 2. up and gate rows: items (group, matrix, row) in contiguous ranges per thread
         {
-            const int64_t n_item = (int64_t) n_grp*2*n_ff;
-            const int64_t i0 = n_item*ith/nth;
-            const int64_t i1 = n_item*(ith + 1)/nth;
+            const int64_t w_all = (int64_t) n_pair*2*n_ff;
+            const int64_t i0 = ggml_moe_host_item_at(gstart, n_grp, 2*n_ff, w_all*ith/nth);
+            const int64_t i1 = ggml_moe_host_item_at(gstart, n_grp, 2*n_ff, w_all*(ith + 1)/nth);
             for (int64_t it = i0; it < i1; ++it) {
                 const int     g = (int) (it/(2*n_ff));
                 const int     m = (int) ((it/n_ff) % 2);
@@ -1792,9 +1806,9 @@ bool ggml_cpu_moe_host_ffn(const struct ggml_tensor * up, const struct ggml_tens
         // 3. down rows: items (group, row) in contiguous ranges per thread. The SwiGLU rows of a group's pairs and their quantization are
         //    formed by every thread whose range touches the group (the graph's swiglu_split row and its down quantization, same bytes)
         {
-            const int64_t n_item = (int64_t) n_grp*n_embd;
-            const int64_t i0 = n_item*ith/nth;
-            const int64_t i1 = n_item*(ith + 1)/nth;
+            const int64_t w_all = (int64_t) n_pair*n_embd;
+            const int64_t i0 = ggml_moe_host_item_at(gstart, n_grp, n_embd, w_all*ith/nth);
+            const int64_t i1 = ggml_moe_host_item_at(gstart, n_grp, n_embd, w_all*(ith + 1)/nth);
             int64_t it = i0;
             while (it < i1) {
                 const int     g    = (int) (it/n_embd);
