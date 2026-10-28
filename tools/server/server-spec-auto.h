@@ -65,8 +65,12 @@ static int server_spec_spill_long_prompt() {
 // (4 rows 13.4 ms, 8 rows 33 ms against a 4.5 ms plain round), and the pinned host path alone is what wins (G4 8 GB 8k: pinned without
 // drafts 221.3 tok/s, with drafts 196.1, mode 0 206.0; chat 170.7 / 170.0). A repeat no longer than the longest match (64) never drafts.
 // The text is that of the pinned path without drafts (KLD-gated, plans/k15_models.md). LLAMA_SPEC_SPILL_LONG_CM=3: drafts from 3+ (as before)
+// k17-models: repeats of 8+ (LLAMA_SPEC_SPILL_LONG_CM=65: the k15-spec value above, no long-prompt drafts). LFM2.5 Q4_K_XL 12 GB on this
+// head (k17m_l4lf / k17m_g4lf, f976a60d684, 2 launches): L4 8k 75.8-76.2 -> 91.4-91.6 tok/s, 16k 71.9-72.1 -> 79.1-79.5, long48 76.6 ->
+// 78.5; G4 8k 258.7 -> 312.6-313.8, 16k 278.1-279.1 -> 290.6-292.8, long48 248.4 -> 251.0; chat / 2k unchanged (short prompts). 3 lost G4
+// 16k (-11%), 16 lost G4 16k (-10%); 8 lost no cell. The cost policy still prices every window (common/spec-cost-policy.h)
 #ifndef SPEC_SPILL_MIN_MATCH_LONG_CM
-#define SPEC_SPILL_MIN_MATCH_LONG_CM 65
+#define SPEC_SPILL_MIN_MATCH_LONG_CM 8
 #endif
 // k17-models: Flint under the MoE cache (see server_spec_spill_flint): long prompts draft from repeats of SPEC_SPILL_FLINT_LONG_CM with the
 // CPU-miss rule (Flint's verify windows are not the LFM2.5 windows the 65 above was timed on). LLAMA_SPEC_SPILL_LONG_CM still overrides
