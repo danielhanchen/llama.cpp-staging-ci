@@ -1922,12 +1922,24 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
                 tokens < min_tokens ? "the cache holds the experts of fewer tokens than LLAMA_MOE_PREFETCH_DEPTH_SPILL_MIN_TOKENS" :
                 !ram_ok ? "the uncached host experts are more than LLAMA_MOE_PREFETCH_DEPTH_SPILL_MAX_RAM_FRAC of the RAM" : nullptr;
             depth_spill = why == nullptr ? (draft_dropped || spec_deep ? dropped_depth : 3) : 0;
+            // k17-fndepth: a cache of at least LLAMA_MOE_PREFETCH_DEPTH_DEEP_MIN_TOKENS (10) tokens' experts lends enough slots for
+            // LLAMA_MOE_PREFETCH_DEPTH_DEEP (5; 0 = the depths above) splits in flight. Not in a memory probe (no_alloc: the fit would size
+            // the cache with the deeper arena reserved), not beside built-in MTP heads. G4 k17dp, Flash-Next UD-IQ4_XS, 24 GB, 2 launches:
+            // no draft (13.6 tokens) depth 3 -> 5 TTFT 8k / 16k / 30k 1.712 -> 1.534 / 3.360 -> 3.021 / 6.416 -> 5.760 s (6: 3.145 at 16k,
+            // 8: 3.187); the Q8_0 drafter forced to 5 by LLAMA_MOE_PREFETCH_DEPTH_SPILL (which the probe also sees: cache 11881 -> 8705 MiB)
+            // 16k 3.646 -> 3.420 s
+            static const int deep_depth = getenv("LLAMA_MOE_PREFETCH_DEPTH_DEEP") ? std::max(0, atoi(getenv("LLAMA_MOE_PREFETCH_DEPTH_DEEP"))) : 5;
+            static const double deep_min = getenv("LLAMA_MOE_PREFETCH_DEPTH_DEEP_MIN_TOKENS") ?
+                std::max(0.0, atof(getenv("LLAMA_MOE_PREFETCH_DEPTH_DEEP_MIN_TOKENS"))) : 10.0;
+            if (depth_spill > 0 && deep_depth > depth_spill && tokens >= deep_min && !mtp_heads && !model.hparams.no_alloc) {
+                depth_spill = deep_depth;
+            }
             static bool logged = false; // once per process, not for a memory probe (no_alloc), whose log the fit silences
             if (!logged && !model.hparams.no_alloc) {
                 logged = true;
                 LLAMA_LOG_INFO("%s: MoE cache: host weight prefetch of the spilled experts starts at depth %s (cache = the experts of %.1f "
                     "tokens%s%s; LLAMA_MOE_PREFETCH_DEPTH_SPILL=N forces N, LLAMA_MOE_PREFETCH_DEPTH_RULE=0 keeps the default)\n", __func__,
-                    why == nullptr ? (draft_dropped || spec_deep ? std::to_string(dropped_depth).c_str() : "3") : "the default", tokens, why ? ": " : "", why ? why : "");
+                    why == nullptr ? std::to_string(depth_spill).c_str() : "the default", tokens, why ? ": " : "", why ? why : "");
             }
         }
         if (depth_spill > 0) {
