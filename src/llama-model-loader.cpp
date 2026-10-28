@@ -1493,7 +1493,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
-    if (rq_cand && buft != nullptr && ggml_backend_buft_is_host(buft)) {
+    // LLAMA_REQUANT_HOST=1 (test only, without mmap): host tensors too
+    static const bool rq_host = getenv("LLAMA_REQUANT_HOST") != nullptr && atoi(getenv("LLAMA_REQUANT_HOST")) != 0;
+    if (rq_cand && buft != nullptr && ggml_backend_buft_is_host(buft) && !(rq_host && !use_mmap)) {
         // on the host: as in the file
         t_meta = *cur;
         buft = buft_for_tensor(&t_meta);
