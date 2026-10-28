@@ -891,8 +891,11 @@ static __global__ void moe_mailbox_publish(const int32_t * hid, const int n_ids,
 }
 
 // one block per row [n_embd] of dev: rows on the host wait for the host and add its result
+// k18 (GGML_MOE_MAILBOX_FAST, default on; =0 restores the loop below): with no timeout (what llama_moe_cache passes) only completed is
+// polled, error every 16th poll and no sleep, so a wait costs one mapped read per poll instead of four plus 100 ns; the host rows are
+// read 16 bytes at a time (a quarter of the mapped reads). The same sums of the same values, in the same order per element.
 static __global__ void moe_mailbox_merge(const float * d, const int32_t * hid, const int n_embd, const char * mbox, const int n_used,
-        ggml_moe_mailbox_ctl * ctl, float * dst, const uint64_t timeout_ns) {
+        ggml_moe_mailbox_ctl * ctl, float * dst, const uint64_t timeout_ns, const int fast) {
     const int row = blockIdx.x;
     __shared__ int st;
     if (threadIdx.x == 0) {
@@ -905,7 +908,15 @@ static __global__ void moe_mailbox_merge(const float * d, const int32_t * hid, c
                 // nonzero timeout runs only while the host thread neither computes this batch (started) nor another one (busy)
                 uint64_t t0 = moe_mailbox_ns();
                 s = 1;
-                while (moe_mailbox_load_acquire(&hdr->completed) != seq) {
+                if (fast && timeout_ns == 0) {
+                    for (uint32_t it = 1; moe_mailbox_load_acquire(&hdr->completed) != seq; ++it) {
+                        if ((it & 15) == 0 && moe_mailbox_load_acquire(&hdr->error) != 0) {
+                            s = 2;
+                            break;
+                        }
+                    }
+                }
+                while (s == 1 && moe_mailbox_load_acquire(&hdr->completed) != seq) {
                     if (moe_mailbox_load_acquire(&hdr->error) != 0) {
                         s = 2;
                         break;
@@ -931,6 +942,17 @@ static __global__ void moe_mailbox_merge(const float * d, const int32_t * hid, c
     const float * h = (const float *) (mbox + ggml_moe_mailbox_off_out(n_used, n_embd)) + (int64_t) row*n_embd;
     const float * dr = d + (int64_t) row*n_embd;
     float * o = dst + (int64_t) row*n_embd;
+    if (fast && st == 1 && n_embd % 4 == 0 && ((((uintptr_t) h) | ((uintptr_t) dr) | ((uintptr_t) o)) & 15) == 0) {
+        const float4 * h4 = (const float4 *) h;
+        const float4 * d4 = (const float4 *) dr;
+        float4       * o4 = (float4 *) o;
+        for (int i = threadIdx.x; i < n_embd/4; i += blockDim.x) {
+            const float4 hv = __ldcv(h4 + i);
+            const float4 dv = d4[i];
+            o4[i] = make_float4(dv.x + hv.x, dv.y + hv.y, dv.z + hv.z, dv.w + hv.w);
+        }
+        return;
+    }
     for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
         // a merge that gave up keeps the device rows only: finite values, since the ubatch is taken back or failed anyway (see
         // single_check) and NaN rows would stay in the KV cells it wrote, which masked attention of later requests still reads
@@ -964,8 +986,12 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
             const int n_rows = (int) (ggml_nelements(d)/n_embd);
             GGML_ASSERT(ggml_is_contiguous(d) && ggml_is_contiguous(dst) && n_rows == (int) ggml_nelements(hid));
             const uint64_t timeout_ns = (uint64_t) std::max(0, ggml_get_op_params_i32(dst, 6))*1000000ull; // 0: no timeout
+            static const int fast = [] {
+                const char * e = getenv("GGML_MOE_MAILBOX_FAST");
+                return e == nullptr || atoi(e) != 0 ? 1 : 0;
+            }();
             moe_mailbox_merge<<<n_rows, 256, 0, ctx.stream()>>>((const float *) d->data, (const int32_t *) hid->data, n_embd,
-                (const char *) mbox, (int) d->ne[1], (ggml_moe_mailbox_ctl *) ctl, (float *) dst->data, timeout_ns);
+                (const char *) mbox, (int) d->ne[1], (ggml_moe_mailbox_ctl *) ctl, (float *) dst->data, timeout_ns, fast);
         }
         CUDA_CHECK(cudaGetLastError());
         return;

@@ -2323,6 +2323,15 @@ struct llama_moe_cache::impl {
     // nonzero busy in every mailbox of the process while the host thread computes one batch: merges waiting on another mailbox
     // (an MTP context) do not time out behind it. Called by the host thread with reg_mtx held
     static void single_hub_busy(bool on) {
+        // k18 (GGML_MOE_MAILBOX_FAST, default on): the merges of this process never time out (single_merge passes 0), and only a merge
+        // with a timeout reads busy, so the stores (two per mailbox of every cache per host batch, on lines the device polls) are skipped
+        static const bool fast = [] {
+            const char * e = getenv("GGML_MOE_MAILBOX_FAST");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        if (fast) {
+            return;
+        }
         single_hub_t & h = single_hub();
         for (impl * o : h.owners) {
             for (size_t i = 0; i < o->mbox_n; ++i) {
