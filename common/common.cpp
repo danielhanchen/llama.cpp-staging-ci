@@ -2910,8 +2910,16 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 params.speculative.draft.devices.empty() &&
                 (env_last == nullptr || atoi(env_last) != 0);
             if (last) {
+                const bool rq_before = getenv("LLAMA_DRAFT_REQUANT") != nullptr;
                 draft_cpu = common_fit_draft_on_cpu(params, mparams, cparams, mparams_dft, cparams_dft, params_dft.model.path, fit_log_level,
                     &draft_needs_target);
+                if (!draft_cpu && !rq_before && getenv("LLAMA_DRAFT_REQUANT") != nullptr) {
+                    // k18: the draft was admitted requantized: the rest of the fit (the extra model) measures it at those types, as it loads
+                    params_dft  = common_base_params_to_speculative(params);
+                    const auto cp_keep = cparams_dft;
+                    mparams_dft = common_model_params_to_llama(params_dft);
+                    cparams_dft = cp_keep;
+                }
             }
         }
         const char * env_dcpu  = getenv("LLAMA_FIT_DRAFT_CPU");
