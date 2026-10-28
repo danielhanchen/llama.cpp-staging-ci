@@ -640,9 +640,8 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     size_t pool_used = 0;
     size_t pool_size = 0;
     size_t granularity;
-#if defined(GGML_USE_HIP)
-    std::vector<std::pair<CUdeviceptr, size_t>> mappings;
-#endif
+    std::vector<std::pair<CUdeviceptr, size_t>> mappings; // k17-small: also on CUDA, for trim()
+    size_t mark_size = SIZE_MAX;                           // k17-small: pool_size at mark(), SIZE_MAX: never marked (trim keeps all)
 
     explicit ggml_cuda_pool_vmm(int device) :
         device(device),
@@ -658,7 +657,9 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
                 CU_CHECK(cuMemUnmap(mapping.first, mapping.second));
             }
 #else
-            CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+            if (pool_size > 0) {
+                CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+            }
 #endif
             CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
             ggml_cuda_own_add(device, -(int64_t) pool_size);
@@ -696,9 +697,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             // map at the end of the pool
             CUdeviceptr start_ptr = (CUdeviceptr)((char *)(pool_addr) + pool_size);
             CU_CHECK(cuMemMap(start_ptr, reserve_size, 0, handle, 0));
-#if defined(GGML_USE_HIP)
             mappings.push_back({start_ptr, reserve_size});
-#endif
 
             // the memory allocation handle is no longer needed after mapping
             CU_CHECK(cuMemRelease(handle));
@@ -767,6 +766,30 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #endif
 
         return ptr;
+    }
+
+    // k17-small: unmap the trailing mappings that lie wholly above what is allocated (whole mappings: a range is unmapped as it was mapped)
+    void mark() override {
+        mark_size = pool_size;
+    }
+
+    size_t trim() override {
+        size_t freed = 0;
+        const size_t keep = std::max(mark_size == SIZE_MAX ? pool_size : mark_size, pool_used);
+        while (!mappings.empty()) {
+            const std::pair<CUdeviceptr, size_t> m = mappings.back();
+            if ((size_t) (m.first - pool_addr) < keep) {
+                break;
+            }
+            CU_CHECK(cuMemUnmap(m.first, m.second));
+            mappings.pop_back();
+            pool_size -= m.second;
+            freed     += m.second;
+        }
+        if (freed > 0) {
+            ggml_cuda_own_add(device, -(int64_t) freed);
+        }
+        return freed;
     }
 
     void free(void * ptr, size_t size) override {
@@ -11094,6 +11117,31 @@ static int ggml_backend_cuda_dev_compute_capability(ggml_backend_dev_t dev) {
     return cc >= GGML_CUDA_CC_OFFSET_MTHREADS ? -1 : cc;   // NVIDIA only (AMD / Moore Threads carry an offset)
 }
 
+// k17-small (release-split): mark / trim every memory pool of a CUDA backend (see ggml_cuda_pool::mark / trim); trim synchronizes the
+// device first and returns the bytes given back. Other backends: nothing (0)
+static size_t ggml_backend_cuda_pool_mark_trim(ggml_backend_t backend, bool trim) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return 0;
+    }
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    if (trim) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    size_t freed = 0;
+    for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+        if (ctx->pools[ctx->device][s] == nullptr) {
+            continue;
+        }
+        if (trim) {
+            freed += ctx->pools[ctx->device][s]->trim();
+        } else {
+            ctx->pools[ctx->device][s]->mark();
+        }
+    }
+    return freed;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_moe_fetch_overlap_min_bytes") == 0) {
@@ -11101,6 +11149,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_dev_compute_capability") == 0) {
         return (void *)ggml_backend_cuda_dev_compute_capability;
+    }
+    if (strcmp(name, "ggml_backend_pool_mark_trim") == 0) {
+        return (void *)ggml_backend_cuda_pool_mark_trim;
     }
     if (strcmp(name, "ggml_backend_moe_fetch_overlap_default") == 0) {
         return (void *)ggml_backend_cuda_moe_fetch_overlap_default;

@@ -1214,6 +1214,10 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+    // k17-small: mark() records the memory the pool holds now; trim() gives what it took beyond the mark (and beyond what is allocated)
+    // back to the device, so graphs captured before the mark keep their memory. The caller synchronized the device. Returns the bytes
+    virtual void   mark() {}
+    virtual size_t trim() { return 0; }
 };
 
 template<typename T>

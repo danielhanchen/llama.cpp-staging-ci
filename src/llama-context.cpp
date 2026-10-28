@@ -5425,8 +5425,28 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             lm_tiny = true;
         }
     }
+    // k17-small: the CUDA memory pools grow into the memory the released banks free (the merged graph's temporaries) and keep it, so
+    // after restore() the device can be full (G4 4 GB q3m 16k, release-split: the prompt checkpoint after a released 707 MiB group
+    // failed to create a CUDA stream). Each pool's size is marked before the release and what it grew past the mark is given back
+    // before the banks return (graphs captured before keep their memory). LLAMA_MOE_LM_RELEASE_TRIM=0: off
+    static const bool lm_rel_trim = getenv("LLAMA_MOE_LM_RELEASE_TRIM") == nullptr || atoi(getenv("LLAMA_MOE_LM_RELEASE_TRIM")) != 0;
+    auto pool_mark_trim = [&](bool trim) -> size_t {
+        size_t freed = 0;
+        for (auto & bk : backend_ptrs) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(bk);
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto fn = reg ? (size_t (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_pool_mark_trim") : nullptr;
+            if (fn != nullptr) {
+                freed += fn(bk, trim);
+            }
+        }
+        return freed;
+    };
     if (lm_release_env && group.size() >= 2 && lm_tiny) {
         ggml_backend_sched_synchronize(sched.get());
+        if (lm_rel_trim) {
+            pool_mark_trim(false);
+        }
         lm_released = moe_cache->release();
     }
     lm_ask.clear();
@@ -6208,7 +6228,30 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         moe_cache->clear_seed_counts();
         // the compute buffers shrink back to what the next graph needs before the banks take their memory again
         ggml_backend_sched_free_device_buffers(sched.get());
+        if (lm_rel_trim) {
+            const size_t trimmed = pool_mark_trim(true);
+            static int n_trim_log = 0;
+            if (trimmed > 0 && n_trim_log++ < 4) {
+                LLAMA_LOG_INFO("%s: %.2f MiB of CUDA pool memory the released group took given back before the banks return "
+                    "(LLAMA_MOE_LM_RELEASE_TRIM=0 keeps it)\n", __func__, trimmed/1048576.0);
+            }
+        }
         moe_cache->restore();
+        {
+            static int n_free_log = 0;
+            if (n_free_log < 4) {
+                for (auto & bk : backend_ptrs) {
+                    ggml_backend_dev_t dev = ggml_backend_get_device(bk);
+                    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        continue;
+                    }
+                    size_t fr = 0, tot = 0;
+                    ggml_backend_dev_memory(dev, &fr, &tot);
+                    LLAMA_LOG_INFO("%s: %s: %.1f MiB free after the released banks returned\n", __func__, ggml_backend_dev_name(dev), fr/1048576.0);
+                    n_free_log++;
+                }
+            }
+        }
         lm_n_released++;
     } else if (buf_after > buf_before) {
         // k13-small: a group that grew the compute buffers leaves them at its size, and the decode after it computes in what is left: G4 at
