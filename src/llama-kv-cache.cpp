@@ -892,6 +892,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
     bool success = true;
 
+    lazy_sim = true;
     for (const auto & ubatch : ubatches) {
         // only find a suitable slot for the ubatch. don't modify the cells yet
         const auto sinfo_new = find_slot(ubatch, false);
@@ -919,6 +920,8 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         // now emplace the ubatch
         apply_ubatch(sinfo_new, ubatch, restore_purge ? &states.back().purged : nullptr);
     }
+
+    lazy_sim = false;
 
     GGML_ASSERT(!states.empty() || !success);
 
@@ -1338,8 +1341,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     if (other) {
         return;
     }
-    if (!lazy_bufs.empty()) {
+    if (!lazy_bufs.empty() && !lazy_sim) {
         // the cells this ubatch writes, and every cell up to the padded n_kv the graph reads, must be backed
+        // (k17-small step 2: prepare backed them already, with the MoE cache giving memory back; this only checks)
         uint32_t mx = 0;
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
             for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {

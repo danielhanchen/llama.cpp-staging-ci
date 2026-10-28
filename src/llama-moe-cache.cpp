@@ -8412,6 +8412,17 @@ struct llama_moe_cache::impl {
         return n;
     }
 
+    // k17-small: the bytes of the slots the groups of device id held at load
+    size_t slot_bytes_load(int32_t id) const {
+        size_t n = 0;
+        for (const group & g : groups) {
+            if (g.id == id) {
+                n += (size_t) g.n_slots_load*g.expert_bytes;
+            }
+        }
+        return n;
+    }
+
     // k17-small: shrink keeps at least floor bytes of slots on device id, every group in proportion to its slots at load (at least the
     // experts of one token)
     void set_shrink_floor(int32_t id, size_t floor) {
@@ -10773,6 +10784,23 @@ bool llama_moe_cache::hybrid_fixed() const {
 
 double llama_moe_cache::cache_frac() const {
     return pimpl->cache_frac;
+}
+
+double llama_moe_cache::release_frac() const {
+    size_t load  = 0;
+    size_t floor = 0;
+    bool   any   = false;
+    for (size_t id = 0; id < pimpl->devices.size(); ++id) {
+        const size_t l = pimpl->slot_bytes_load((int32_t) id);
+        const size_t f = pimpl->devices[id].shrink_floor;
+        load  += l;
+        floor += f == SIZE_MAX ? l : std::min(f, l);
+        any    = any || f != SIZE_MAX;
+    }
+    if (!any || load == 0 || pimpl->cache_frac < 0.0) {
+        return pimpl->cache_frac;
+    }
+    return pimpl->cache_frac*(double) floor/(double) load;
 }
 
 void llama_moe_cache::hybrid_reset() {

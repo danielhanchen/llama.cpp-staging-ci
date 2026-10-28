@@ -187,6 +187,9 @@ public:
     bool hybrid_fixed() const;
     // k13-small: the cached share of the host experts' bytes (-1 before the slots are sized)
     double cache_frac() const;
+    // k17-small (lazy KV step 2): cache_frac of the slots the cache keeps for itself, its shrink floor (the rest is the KV cache's,
+    // see shrink): what the bank release of a layer-major prompt group is decided on (cache_frac where no floor is set)
+    double release_frac() const;
     void hybrid_reset();
 
     // auto mode: before the graph of each ubatch while the trial runs, after the previous ubatch finished (backends synchronized);

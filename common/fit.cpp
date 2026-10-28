@@ -1671,7 +1671,9 @@ static void common_params_fit_impl(
                 // beside the full-context KV, so that size is its floor; it gets the unbacked KV bytes on top (up to the size requested)
                 // and gives them back as the cells grow (llama_moe_cache::shrink), so every cell of the context still fits.
                 // LLAMA_MOE_CACHE_SHRINK=0: the cache keeps the floor (step 1)
-                if (nd == 1 && dmds_cpu_moe[0].mb.kv_lazy > 0 && cparams->moe_cache_size > 0 && cparams->moe_cache_size < size_before) {
+                // (LLAMA_KV_LAZY_FIT=0: the cache keeps the floor while still shrinking for the KV cache, a debug knob)
+                static const bool kv_lazy_fit = getenv("LLAMA_KV_LAZY_FIT") == nullptr || atoi(getenv("LLAMA_KV_LAZY_FIT")) != 0;
+                if (kv_lazy_fit && nd == 1 && dmds_cpu_moe[0].mb.kv_lazy > 0 && cparams->moe_cache_size > 0 && cparams->moe_cache_size < size_before) {
                     const size_t floor = cparams->moe_cache_size;
                     cparams->moe_cache_size += std::min(dmds_cpu_moe[0].mb.kv_lazy, size_before - floor);
                     LOG_INF("%s: lazy KV: the MoE cache takes the %zu MiB of KV cells not backed at load: %zu -> %zu MiB, it gives them back as the "

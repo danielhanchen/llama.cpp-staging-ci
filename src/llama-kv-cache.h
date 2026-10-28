@@ -363,6 +363,7 @@ private:
     bool (*lazy_commit_fn)(ggml_backend_buffer_t, size_t, size_t) = nullptr;
     size_t (*lazy_committed_fn)(ggml_backend_buffer_t) = nullptr;
     uint32_t lazy_cells = 0;   // cells [0, lazy_cells) of every layer are backed
+    bool     lazy_sim   = false; // prepare places the ubatches (apply_ubatch only simulates them): the cells are backed after it
     // k17-small (lazy KV step 2): the MoE cache that gives device memory back as the cells grow (lazy_set_shrink), the free memory a
     // growth leaves on the device (LLAMA_KV_LAZY_MARGIN_MIB, at most what is free at the first growth; -1: not measured yet), and of a
     // measurement (no_alloc) the device KV bytes the lazy buffers would leave unbacked at load (see lazy_unbacked)

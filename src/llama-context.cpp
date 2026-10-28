@@ -6813,8 +6813,10 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     static const bool   lm_rel_split      = getenv("LLAMA_MOE_LM_RELEASE_SPLIT") == nullptr || atoi(getenv("LLAMA_MOE_LM_RELEASE_SPLIT")) != 0;
     static const double lm_rel_split_frac = getenv("LLAMA_MOE_LM_RELEASE_SPLIT_FRAC") ? std::max(0.0, atof(getenv("LLAMA_MOE_LM_RELEASE_SPLIT_FRAC"))) : 0.10;
     static const size_t lm_rel_grow_max   = (size_t) (getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB"))) : 1024) << 20;
-    const double lm_cf   = moe_cache->cache_frac();
     // k19-placemid: the graphs are reserved at the decode size (LLAMA_MOE_PLACE8_MID), a merged group never fits beside the banks
+    // (k17-small, lazy KV step 2: the share of the cache's own slots, its shrink floor; the slots above it are the KV cache's and the
+    // placement of the prompt is that of the cache the fit sized beside the full-context KV)
+    const double lm_cf   = moe_cache->release_frac();
     bool         lm_tiny = lm_tiny_cache(lm_cf) || place8_rel;
     if (lm_release_env && lm_rel_split && !lm_tiny && gm != nullptr && group.size() >= 2 && lm_cf >= 0.0 && lm_cf < lm_rel_split_frac) {
         // k19 (LLAMA_MOE_LM_MEASURE_RESTORE=0 off): the measure allocates the merged graph when it fits, which sets the data of its
