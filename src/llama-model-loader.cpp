@@ -570,8 +570,9 @@ llama_model_loader::llama_model_loader(
         }
     }
 
-    {
-        auto it = kv_overrides.find("general.requant_type");
+    for (const char * rq_key : { "general.requant_type", "general.requant_output_type" }) {
+        ggml_type & requant_type = strcmp(rq_key, "general.requant_type") == 0 ? this->requant_type : this->requant_output_type;
+        auto it = kv_overrides.find(rq_key);
         if (it != kv_overrides.end() && it->second.tag == LLAMA_KV_OVERRIDE_TYPE_STR) {
             std::string v = it->second.val_str;
             std::transform(v.begin(), v.end(), v.begin(), ::tolower);
@@ -587,8 +588,9 @@ llama_model_loader::llama_model_loader(
             if (requant_type == GGML_TYPE_COUNT) {
                 LLAMA_LOG_WARN("%s: general.requant_type = %s is not a type that quantizes without an imatrix: ignored\n", __func__, v.c_str());
             } else {
-                LLAMA_LOG_INFO("%s: the FFN / expert weights on devices are requantized to %s at load (LLAMA_DRAFT_REQUANT)\n", __func__,
-                    ggml_type_name(requant_type));
+                LLAMA_LOG_INFO("%s: the %s on devices are requantized to %s at load (LLAMA_DRAFT_REQUANT%s)\n", __func__,
+                    &requant_type == &this->requant_type ? "FFN / expert weights" : "output weights", ggml_type_name(requant_type),
+                    &requant_type == &this->requant_type ? "" : "_OUTPUT");
             }
         }
     }
@@ -1477,16 +1479,18 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // matrix; 2-3 dims, rows of whole blocks of the target type) that a
     // device holds is stored as requant_type; it is converted while it is loaded (load_all_data). Host tensors keep the file's type
     // (they may be mapped from the file)
-    const bool rq_cand = requant_type != GGML_TYPE_COUNT && !is_lazy && !(flags & TENSOR_DUPLICATED) && t_meta.type != requant_type &&
-        strstr(tn.str().c_str(), "ffn_") != nullptr && strstr(tn.str().c_str(), "hc_") == nullptr &&
-        strstr(tn.str().c_str(), "gate_inp") == nullptr && strstr(tn.str().c_str(), "norm") == nullptr && ggml_n_dims(&t_meta) >= 2 && ggml_get_type_traits(t_meta.type)->to_float != nullptr &&
-        t_meta.ne[0] % ggml_blck_size(requant_type) == 0 && ggml_type_size(requant_type)*t_meta.ne[0]/ggml_blck_size(requant_type) <
+    const bool rq_out  = tn.tensor == LLM_TENSOR_OUTPUT && requant_output_type != GGML_TYPE_COUNT;
+    const ggml_type rq_t = rq_out ? requant_output_type : requant_type;
+    const bool rq_cand = rq_t != GGML_TYPE_COUNT && !is_lazy && !(flags & TENSOR_DUPLICATED) && t_meta.type != rq_t &&
+        (rq_out || (strstr(tn.str().c_str(), "ffn_") != nullptr && strstr(tn.str().c_str(), "hc_") == nullptr &&
+        strstr(tn.str().c_str(), "gate_inp") == nullptr && strstr(tn.str().c_str(), "norm") == nullptr)) && ggml_n_dims(&t_meta) >= 2 && ggml_get_type_traits(t_meta.type)->to_float != nullptr &&
+        t_meta.ne[0] % ggml_blck_size(rq_t) == 0 && ggml_type_size(rq_t)*t_meta.ne[0]/ggml_blck_size(rq_t) <
         ggml_row_size(t_meta.type, t_meta.ne[0]);
     const ggml_type rq_orig = t_meta.type;
     if (rq_cand) {
-        t_meta.type  = requant_type;
-        t_meta.nb[0] = ggml_type_size(requant_type);
-        t_meta.nb[1] = ggml_row_size(requant_type, t_meta.ne[0]);
+        t_meta.type  = rq_t;
+        t_meta.nb[0] = ggml_type_size(rq_t);
+        t_meta.nb[1] = ggml_row_size(rq_t, t_meta.ne[0]);
         for (int d = 2; d < GGML_MAX_DIMS; ++d) {
             t_meta.nb[d] = t_meta.nb[d-1]*t_meta.ne[d-1];
         }
@@ -2030,8 +2034,8 @@ bool llama_model_loader::load_all_data(
     }
 
     if (!requant_src.empty()) {
-        LLAMA_LOG_INFO("%s: requantized %zu tensors to %s: %.2f -> %.2f MiB in %.1f ms (LLAMA_DRAFT_REQUANT)\n", __func__, requant_src.size(),
-            ggml_type_name(requant_type), requant_bytes_src/1048576.0, requant_bytes_dst/1048576.0, requant_us/1000.0);
+        LLAMA_LOG_INFO("%s: requantized %zu tensors: %.2f -> %.2f MiB in %.1f ms (LLAMA_DRAFT_REQUANT)\n", __func__, requant_src.size(),
+            requant_bytes_src/1048576.0, requant_bytes_dst/1048576.0, requant_us/1000.0);
     }
 
     // free temporary resources used for async uploads

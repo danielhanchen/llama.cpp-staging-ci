@@ -3341,13 +3341,14 @@ common_params common_base_params_to_speculative(const common_params & params) {
         // k18 (LLAMA_DRAFT_REQUANT=q4_k|q3_k|..., opt-in): the draft model's FFN / expert weights are requantized to that type at load
         // (llama_model_loader, KV override general.requant_type), so the fit prices the smaller drafter; drafts are verified, so the
         // output does not change, only the acceptance
-        if (const char * rq = getenv("LLAMA_DRAFT_REQUANT")) {
-            if (rq[0] != 0) {
+        for (const char * rq_env : { "LLAMA_DRAFT_REQUANT", "LLAMA_DRAFT_REQUANT_OUTPUT" }) {
+            const char * rq = getenv(rq_env);
+            if (rq != nullptr && rq[0] != 0) {
                 if (!result.kv_overrides.empty() && result.kv_overrides.back().key[0] == 0) {
                     result.kv_overrides.pop_back();
                 }
                 llama_model_kv_override o = {};
-                snprintf(o.key, sizeof(o.key), "%s", "general.requant_type");
+                snprintf(o.key, sizeof(o.key), "%s", strcmp(rq_env, "LLAMA_DRAFT_REQUANT") == 0 ? "general.requant_type" : "general.requant_output_type");
                 o.tag = LLAMA_KV_OVERRIDE_TYPE_STR;
                 snprintf(o.val_str, sizeof(o.val_str), "%s", rq);
                 result.kv_overrides.push_back(o);

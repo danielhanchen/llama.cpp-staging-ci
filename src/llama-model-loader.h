@@ -136,6 +136,7 @@ struct llama_model_loader {
     // k18: load-time requantization of the FFN / expert weights (KV override general.requant_type, set by common for a draft model):
     // the target type and, per requantized tensor, its type and size in the file
     ggml_type requant_type = GGML_TYPE_COUNT;
+    ggml_type requant_output_type = GGML_TYPE_COUNT; // general.requant_output_type: the output (lm head) matrix
     std::unordered_map<std::string, std::pair<ggml_type, size_t>> requant_src;
     int64_t requant_us = 0;
     size_t  requant_bytes_src = 0, requant_bytes_dst = 0;
