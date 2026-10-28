@@ -304,6 +304,14 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // k17-small: LLAMA_KV_LAZY=1 reserves a device buffer's address range and backs only the cells in use (see lazy_ensure)
+    static const bool kv_lazy = getenv("LLAMA_KV_LAZY") != nullptr && atoi(getenv("LLAMA_KV_LAZY")) != 0;
+    // the cells backed at load
+    const uint32_t lazy_n0 = [&]() {
+        const char * e_init = getenv("LLAMA_KV_LAZY_INIT");
+        return std::min<uint32_t>(kv_size, e_init != nullptr ? (uint32_t) std::max(256, atoi(e_init)) : 4096);
+    }();
+
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf;
@@ -312,15 +320,35 @@ llama_kv_cache::llama_kv_cache(
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
+            // k17-small (lazy KV step 2): a measurement reports the device KV bytes a lazy buffer would leave unbacked at load, where the
+            // MoE cache can give them back as the cells grow (the fit gives them to the cache, see common_fit). Whether the backend has
+            // lazy buffers is tried with one (an address range, no memory); each tensor may back one more 2 MiB chunk than its rows
+            static const bool shrink_on = getenv("LLAMA_MOE_CACHE_SHRINK") == nullptr || atoi(getenv("LLAMA_MOE_CACHE_SHRINK")) != 0;
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (kv_lazy && shrink_on && n_stream == 1 && !v_trans && dev != nullptr && !ggml_backend_buft_is_host(buft)) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                auto alloc_fn = reg ? (ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_alloc_lazy") : nullptr;
+                ggml_backend_buffer_t probe = alloc_fn != nullptr ? alloc_fn(buft, 1) : nullptr;
+                if (probe != nullptr) {
+                    ggml_backend_buffer_free(probe);
+                    size_t unbacked = 0;
+                    for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                        if (t->view_src == nullptr) {
+                            const size_t backed = std::min(ggml_nbytes(t), (size_t) lazy_n0*t->nb[1] + (size_t(2) << 20));
+                            unbacked += ggml_nbytes(t) - backed;
+                        }
+                    }
+                    lazy_unbacked_est[buft] += unbacked;
+                }
+            }
         } else {
             buf = nullptr;
-            // k17-small: LLAMA_KV_LAZY=1 reserves a device buffer's address range and backs only the cells in use (see lazy_ensure)
-            static const bool kv_lazy = getenv("LLAMA_KV_LAZY") != nullptr && atoi(getenv("LLAMA_KV_LAZY")) != 0;
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
             if (kv_lazy && n_stream == 1 && !v_trans && dev != nullptr && !ggml_backend_buft_is_host(buft)) {
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
                 auto alloc_fn  = reg ? (ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_alloc_lazy") : nullptr;
                 auto commit_fn = reg ? (bool (*)(ggml_backend_buffer_t, size_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_commit") : nullptr;
+                lazy_committed_fn = reg ? (size_t (*)(ggml_backend_buffer_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_committed") : nullptr;
                 const size_t sz = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
                 if (alloc_fn != nullptr && commit_fn != nullptr && sz > 0) {
                     buf = alloc_fn(buft, sz);
@@ -356,8 +384,7 @@ llama_kv_cache::llama_kv_cache(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
     if (!lazy_bufs.empty()) {
-        const char * e_init = getenv("LLAMA_KV_LAZY_INIT");
-        const uint32_t n0 = std::min<uint32_t>(kv_size, e_init != nullptr ? (uint32_t) std::max(256, atoi(e_init)) : 4096);
+        const uint32_t n0 = lazy_n0;
         if (!lazy_ensure(n0)) {
             throw std::runtime_error("failed to back the first cells of the lazy kv cache");
         }
@@ -917,6 +944,23 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         return {};
     }
 
+    // k17-small (lazy KV step 2): the cells of every ubatch of the batch are backed now, before any of its graphs is built, so the MoE
+    // cache may give memory back for them (lazy_ensure); apply_ubatch then finds them backed
+    if (!lazy_bufs.empty() && !other) {
+        uint32_t mx = v_cells.empty() ? 0 : v_cells[0].used_max_p1();
+        for (const auto & sinfo : res) {
+            for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+                for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+                    mx = std::max<uint32_t>(mx, sinfo.idxs[s][ii] + 1);
+                }
+            }
+        }
+        if (!lazy_ensure(GGML_PAD(mx, 256), true)) {
+            LLAMA_LOG_ERROR("%s: lazy KV: no device memory for the cells of this batch\n", __func__);
+            return {};
+        }
+    }
+
     return res;
 }
 
@@ -1203,20 +1247,70 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
-bool llama_kv_cache::lazy_ensure(uint32_t n_cells) {
+bool llama_kv_cache::lazy_ensure(uint32_t n_cells, bool shrink_ok) {
     if (lazy_bufs.empty() || n_cells <= lazy_cells) {
         return true;
     }
     static const uint32_t step = getenv("LLAMA_KV_LAZY_STEP") != nullptr ? (uint32_t) std::max(256, atoi(getenv("LLAMA_KV_LAZY_STEP"))) : 1024;
     const uint32_t kv_size = v_cells.empty() ? 0 : v_cells[0].size();
     const uint32_t n = std::min(kv_size, ((n_cells + step - 1)/step)*step);
+    // k17-small (lazy KV step 2): the growth is paid by the MoE cache (lazy_set_shrink). Before backing the rows, each device keeps the
+    // free memory it had when the cells first grew (at most LLAMA_KV_LAZY_MARGIN_MIB, 256: the margin the fit leaves a small device): if
+    // the new rows would take it below that, the cache gives back the difference first; if backing still fails, it gives back the rest
+    // and the rows are backed again. The fit keeps every layer beside the full-context KV with the cache at its floor, so the cache can
+    // always give the rows back
+    auto bytes_of = [&](ggml_backend_buffer_t buf) {
+        size_t b = 0;
+        for (const auto & layer : layers) {
+            for (ggml_tensor * t : { layer.k, layer.v }) {
+                if (t != nullptr && t->buffer == buf) {
+                    b += (size_t) (n - lazy_cells)*t->nb[1];
+                }
+            }
+        }
+        return b;
+    };
+    auto dev_of = [](ggml_backend_buffer_t buf) { return ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf)); };
+    const bool shrink = shrink_ok && lazy_shrink_fn != nullptr;
+    if (shrink) {
+        // an explicit LLAMA_KV_LAZY_MARGIN_MIB is kept as it is (also above what is free: the cache then shrinks at the first growth)
+        static const char *  e_margin   = getenv("LLAMA_KV_LAZY_MARGIN_MIB");
+        static const int64_t margin_max = (e_margin != nullptr ? std::max<int64_t>(0, atoll(e_margin)) : 256) << 20;
+        for (ggml_backend_buffer_t buf : lazy_bufs) {
+            ggml_backend_dev_t dev = dev_of(buf);
+            if (dev == nullptr) {
+                continue;
+            }
+            size_t free = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            auto it = lazy_margin.find(dev);
+            if (it == lazy_margin.end()) {
+                it = lazy_margin.emplace(dev, e_margin != nullptr ? margin_max : std::min<int64_t>(margin_max, (int64_t) free)).first;
+                LLAMA_LOG_INFO("%s: lazy KV: %.2f MiB free on %s as the cells first grow, the MoE cache gives memory back to keep %.2f MiB free\n",
+                    __func__, free/1048576.0, ggml_backend_dev_name(dev), it->second/1048576.0);
+            }
+            const int64_t need = (int64_t) bytes_of(buf) + it->second - (int64_t) free;
+            if (need > 0) {
+                lazy_shrink_fn(dev, (size_t) need);
+            }
+        }
+    }
     for (const auto & layer : layers) {
         for (ggml_tensor * t : { layer.k, layer.v }) {
             if (t == nullptr || std::find(lazy_bufs.begin(), lazy_bufs.end(), t->buffer) == lazy_bufs.end()) {
                 continue;
             }
             const size_t off = (const char *) t->data - (const char *) ggml_backend_buffer_get_base(t->buffer);
-            if (!lazy_commit_fn(t->buffer, off, (size_t) n*t->nb[1])) {
+            bool ok = lazy_commit_fn(t->buffer, off, (size_t) n*t->nb[1]);
+            // the device is short of memory (another process, the rounding of the chunks): the cache gives back what this growth backs
+            for (int it = 0; !ok && shrink && it < 4; ++it) {
+                if (lazy_shrink_fn(dev_of(t->buffer), bytes_of(t->buffer) + (size_t(4) << 20)) == 0) {
+                    break;
+                }
+                ok = lazy_commit_fn(t->buffer, off, (size_t) n*t->nb[1]);
+            }
+            if (!ok) {
                 LLAMA_LOG_ERROR("%s: no device memory to back KV cells [%u, %u)\n", __func__, lazy_cells, n);
                 return false;
             }
@@ -1224,6 +1318,19 @@ bool llama_kv_cache::lazy_ensure(uint32_t n_cells) {
     }
     lazy_cells = n;
     return true;
+}
+
+std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::lazy_unbacked() const {
+    if (hparams.no_alloc) {
+        return lazy_unbacked_est;
+    }
+    std::map<ggml_backend_buffer_type_t, size_t> ret;
+    for (ggml_backend_buffer_t buf : lazy_bufs) {
+        const size_t sz = ggml_backend_buffer_get_size(buf);
+        const size_t c  = lazy_committed_fn != nullptr ? lazy_committed_fn(buf) : sz;
+        ret[ggml_backend_buffer_get_type(buf)] += sz - std::min(sz, c);
+    }
+    return ret;
 }
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, std::vector<purge_backup> * purged) {
@@ -3298,7 +3405,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         for (const auto & r : runs) {
             mx = std::max(mx, r.to);
         }
-        if (!lazy_ensure(GGML_PAD(mx, 256))) {
+        if (!lazy_ensure(GGML_PAD(mx, 256), true)) {
             LLAMA_LOG_ERROR("%s: lazy KV: no device memory for the %u cells of the state\n", __func__, mx);
             return false;
         }

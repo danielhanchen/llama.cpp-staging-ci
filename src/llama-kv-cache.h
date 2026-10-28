@@ -6,6 +6,8 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <functional>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -359,11 +361,23 @@ private:
     // non-transposed V (flash attention) only: each layer's K and V rows of cells [0, n) are then one prefix of the tensor
     std::vector<ggml_backend_buffer_t> lazy_bufs;
     bool (*lazy_commit_fn)(ggml_backend_buffer_t, size_t, size_t) = nullptr;
+    size_t (*lazy_committed_fn)(ggml_backend_buffer_t) = nullptr;
     uint32_t lazy_cells = 0;   // cells [0, lazy_cells) of every layer are backed
+    // k17-small (lazy KV step 2): the MoE cache that gives device memory back as the cells grow (lazy_set_shrink), the free memory a
+    // growth leaves on the device (LLAMA_KV_LAZY_MARGIN_MIB, at most what is free at the first growth; -1: not measured yet), and of a
+    // measurement (no_alloc) the device KV bytes the lazy buffers would leave unbacked at load (see lazy_unbacked)
+    std::function<size_t(ggml_backend_dev_t, size_t)> lazy_shrink_fn;
+    std::map<ggml_backend_dev_t, int64_t> lazy_margin;
+    std::map<ggml_backend_buffer_type_t, size_t> lazy_unbacked_est;
 public:
-    // back the rows of cells [0, n_cells) (rounded up to the step); false if the device has no memory for them
-    bool lazy_ensure(uint32_t n_cells);
+    // back the rows of cells [0, n_cells) (rounded up to the step); false if the device has no memory for them. shrink_ok: between
+    // batches (no graph pending), so the MoE cache may give memory back first (lazy_set_shrink)
+    bool lazy_ensure(uint32_t n_cells, bool shrink_ok = false);
     bool lazy_on() const { return !lazy_bufs.empty(); }
+    void lazy_set_shrink(std::function<size_t(ggml_backend_dev_t, size_t)> fn) { lazy_shrink_fn = std::move(fn); }
+    // the device KV bytes that are not backed now, per buffer type (a measurement: the bytes the lazy buffers would leave unbacked at
+    // load, reported only where the MoE cache shrinks, LLAMA_MOE_CACHE_SHRINK)
+    std::map<ggml_backend_buffer_type_t, size_t> lazy_unbacked() const;
 private:
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())

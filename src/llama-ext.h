@@ -71,6 +71,7 @@ struct llama_memory_breakdown_data {
     size_t context = 0; // memory allocated for the context
     size_t compute = 0; // memory allocated for temporary compute buffers
     size_t lend_freed = 0; // k15-fn: of a measurement (no_alloc), the staging arena the MoE cache lends for, not in total() (see sched_reserve)
+    size_t kv_lazy    = 0; // k17-small: the bytes of context a lazy KV cache leaves unbacked (a measurement: at load), in total()
 
     size_t total() const {
         return model + context + compute;

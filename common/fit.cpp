@@ -346,6 +346,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
                 ret[i].mb.context += mb.context;
                 ret[i].mb.compute += mb.compute;
                 ret[i].mb.lend_freed += mb.lend_freed;
+                ret[i].mb.kv_lazy    += mb.kv_lazy;
                 break;
             }
         }
@@ -1664,6 +1665,18 @@ static void common_params_fit_impl(
                             "MiB, at least %.0f%% of it and 256 MiB wanted, LLAMA_FIT_PLACEMID_MIN_FRAC)\n", __func__, grow/MiB, size_ok/MiB,
                             100.0*placemid_min_frac);
                     }
+                }
+                // k17-small (lazy KV step 2, PolyStrata's rule): LLAMA_KV_LAZY=1 backs only the first LLAMA_KV_LAZY_INIT (4096) cells of
+                // the KV cache at load (mb.kv_lazy: the rest, reported only where the MoE cache can shrink). The cache was fitted above
+                // beside the full-context KV, so that size is its floor; it gets the unbacked KV bytes on top (up to the size requested)
+                // and gives them back as the cells grow (llama_moe_cache::shrink), so every cell of the context still fits.
+                // LLAMA_MOE_CACHE_SHRINK=0: the cache keeps the floor (step 1)
+                if (nd == 1 && dmds_cpu_moe[0].mb.kv_lazy > 0 && cparams->moe_cache_size > 0 && cparams->moe_cache_size < size_before) {
+                    const size_t floor = cparams->moe_cache_size;
+                    cparams->moe_cache_size += std::min(dmds_cpu_moe[0].mb.kv_lazy, size_before - floor);
+                    LOG_INF("%s: lazy KV: the MoE cache takes the %zu MiB of KV cells not backed at load: %zu -> %zu MiB, it gives them back as the "
+                        "context grows (LLAMA_MOE_CACHE_SHRINK=0 to disable)\n", __func__, dmds_cpu_moe[0].mb.kv_lazy/MiB, floor/MiB,
+                        cparams->moe_cache_size/MiB);
                 }
                 // every layer in device memory with all experts in system memory and the cache: the placement of --cpu-moe
                 LOG_TRC("%s: all layers in device memory, MoE tensors in system memory, MoE cache of %zu MiB\n",
