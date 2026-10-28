@@ -1780,10 +1780,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 t_tr_sync = ggml_time_us();
             }
 
+            // k18 (LLAMA_MTP_PROMPT_WINDOW=W, opt-in; 0 = every row): a batch of more than W rows of one sequence gives the drafter only
+            // its last W rows; the draft's cells of that sequence are dropped first (it then attends to the last W prompt positions,
+            // RoPE positions as in the target). Drafts are verified: only the acceptance moves. Host rows only (not the device sink,
+            // shared KV or chained heads)
+            static const int32_t pw_env = getenv("LLAMA_MTP_PROMPT_WINDOW") ? std::max(0, atoi(getenv("LLAMA_MTP_PROMPT_WINDOW"))) : 0;
+            const int32_t pw = (!dev && !is_mem_shared && !chain_heads) ? pw_env : 0;
+            std::vector<int32_t> k_first(n_seq, 0);
+            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                if (i_batch_beg[s] < 0) {
+                    continue;
+                }
+                const int32_t n_rows_s = i_batch_end[s] - i_batch_beg[s] + 1;
+                k_first[s] = pw > 0 && n_rows_s > pw ? i_batch_end[s] - pw + 1 : i_batch_beg[s];
+            }
+
             for (int k = 0; k < n_tokens; ++k) {
                 const auto & t = batch_in.tokens[k];
 
                 const llama_seq_id seq_id = t.seq_id;
+                if (k < k_first[seq_id]) {
+                    continue; // outside the window
+                }
 
                 // vision tokens carry an embedding instead of an id
                 const int32_t idx = t.id != LLAMA_TOKEN_NULL
@@ -1802,6 +1820,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
+            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                if (i_batch_beg[s] >= 0 && k_first[s] > i_batch_beg[s]) {
+                    llama_memory_seq_rm(mem_dft, s, -1, -1);
+                }
+            }
 
             if (t_tr0) {
                 t_tr_build = ggml_time_us();
