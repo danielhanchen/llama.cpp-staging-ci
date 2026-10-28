@@ -1931,7 +1931,19 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
             static const int deep_depth = getenv("LLAMA_MOE_PREFETCH_DEPTH_DEEP") ? std::max(0, atoi(getenv("LLAMA_MOE_PREFETCH_DEPTH_DEEP"))) : 5;
             static const double deep_min = getenv("LLAMA_MOE_PREFETCH_DEPTH_DEEP_MIN_TOKENS") ?
                 std::max(0.0, atof(getenv("LLAMA_MOE_PREFETCH_DEPTH_DEEP_MIN_TOKENS"))) : 10.0;
-            if (depth_spill > 0 && deep_depth > depth_spill && tokens >= deep_min && !mtp_heads && !model.hparams.no_alloc) {
+            // only for large expert banks (LLAMA_MOE_PREFETCH_DEPTH_DEEP_MIN_BANK_MIB, 384: the largest expert tensor of a layer), whose
+            // per-split copies (10+ ms) the default depth cannot hide; smaller banks lose at depth 5 (k17fdepb: Flint UD-Q4_K_XL, 256 x
+            // ~170 MiB banks, 8k TTFT +3.6% / +6.5% at 12 / 16 GB), Flash-Next's 512-expert banks are ~620 MiB
+            static const double deep_bank_mib = getenv("LLAMA_MOE_PREFETCH_DEPTH_DEEP_MIN_BANK_MIB") ?
+                std::max(0.0, atof(getenv("LLAMA_MOE_PREFETCH_DEPTH_DEEP_MIN_BANK_MIB"))) : 384.0;
+            size_t bank_max = 0;
+            for (const auto & layer : model.layers) {
+                for (const ggml_tensor * t : { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps, layer.ffn_gate_up_exps }) {
+                    bank_max = t != nullptr ? std::max(bank_max, ggml_nbytes(t)) : bank_max;
+                }
+            }
+            if (depth_spill > 0 && deep_depth > depth_spill && tokens >= deep_min && !mtp_heads && !model.hparams.no_alloc &&
+                    bank_max >= deep_bank_mib*1048576.0) {
                 depth_spill = deep_depth;
             }
             static bool logged = false; // once per process, not for a memory probe (no_alloc), whose log the fit silences
