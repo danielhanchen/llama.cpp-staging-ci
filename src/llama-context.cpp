@@ -5097,7 +5097,14 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         auto & ib = lm_inp_buf[k];
         ib.reset();
         if (!lm_arena || lm_arena_used + inp_size > ggml_backend_buffer_get_size(lm_arena.get())) {
-            const size_t want = std::max<size_t>(inp_size*(size_t) (lm_ub_max - k), lm_arena ? ggml_backend_buffer_get_size(lm_arena.get())*3/2 : 0);
+            // k17 (LLAMA_MOE_LM_ARENA_FIT=0: the old sizing): the members this batch still has (at most lm_ub_max), each with an eighth more
+            // for the inputs that grow with the cells it attends to; a regrow takes what the remaining members need instead of 1.5x the
+            // whole arena (q4x + MTP 12 GB, 16384 group: arenas of 129.6, 132.1 and 194.3 MiB held at once)
+            static const bool arena_fit = getenv("LLAMA_MOE_LM_ARENA_FIT") == nullptr || atoi(getenv("LLAMA_MOE_LM_ARENA_FIT")) != 0;
+            const int64_t left_tok = std::max<int64_t>(1, (int64_t) n_tokens_all - n_tokens_prev - n_tokens_group);
+            const int64_t left_ub  = std::max<int64_t>(1, std::min<int64_t>(lm_ub_max - k, (left_tok + cparams.n_ubatch - 1)/cparams.n_ubatch));
+            const size_t want = arena_fit ? inp_size*(size_t) left_ub + inp_size*(size_t) left_ub/8 :
+                std::max<size_t>(inp_size*(size_t) (lm_ub_max - k), lm_arena ? ggml_backend_buffer_get_size(lm_arena.get())*3/2 : 0);
             if (lm_arena) {
                 lm_arena_old.push_back(std::move(lm_arena));
             }
@@ -6376,6 +6383,12 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         ggml_backend_sched_synchronize(sched.get());
         lm_ids_host_keep();
         ggml_backend_sched_reset(sched.get());
+        // k17: the scheduler's per-tensor table, sized for the merged graph, gives the pages the group touched back (the usual graphs
+        // use its small part); LLAMA_MOE_LM_SCHED_TRIM=0 keeps them
+        static const bool lm_sched_trim = getenv("LLAMA_MOE_LM_SCHED_TRIM") == nullptr || atoi(getenv("LLAMA_MOE_LM_SCHED_TRIM")) != 0;
+        if (lm_sched_trim) {
+            ggml_backend_sched_trim(sched.get());
+        }
         lm_arena.reset();
         lm_arena_old.clear();
         lm_arena_used = 0;

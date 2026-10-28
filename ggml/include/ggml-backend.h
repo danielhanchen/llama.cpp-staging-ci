@@ -465,6 +465,8 @@ extern "C" {
     // small table; ggml_backend_sched_use_full_hash, right after a reset, gives the next graph the full table
     GGML_API void                 ggml_backend_sched_set_hash_size_small(ggml_backend_sched_t sched, size_t graph_size);
     GGML_API void                 ggml_backend_sched_use_full_hash(ggml_backend_sched_t sched);
+    // gives the pages of a large table above its small size back to the OS (a clean table, right after a reset; Linux only, else a no-op)
+    GGML_API void                 ggml_backend_sched_trim(ggml_backend_sched_t sched);
 
     // While enabled, ggml_backend_sched_alloc_graph returns false without allocating (prefetch kept) if the compute buffer of a device
     // would grow by more than max_grow bytes or leave less than the prefetch headroom free (64 MiB with a lender); ggml_backend_sched_get_alloc_over then

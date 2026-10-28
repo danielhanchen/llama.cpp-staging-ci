@@ -4955,10 +4955,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->hash_size_full  = sched->hash_set.size;
     sched->hash_size_small = 0;
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
-    sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+    // calloc: a large table (sized for graphs of several ubatches) is not touched beyond what the graphs use (a zeroing memset of it was
+    // resident in every such process: q4x + MTP 12 GB, n_batch 16384, RssAnon +100 MiB at load for the trunk and MTP contexts)
+    sched->hv_tensor_copies      = (ggml_tensor **) calloc(sched->hash_set.size * sched->n_backends * sched->n_copies, sizeof(struct ggml_tensor *));
     // the sparse reset of a large table keeps the entries that are not in use at -1 / NULL (see ggml_backend_sched_reset)
     memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
-    memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
     const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
@@ -5143,6 +5144,34 @@ void ggml_backend_sched_set_hash_size_small(ggml_backend_sched_t sched, size_t g
     const size_t s = graph_size > 0 ? ggml_hash_size(graph_size) : 0;
     sched->hash_size_small = s > 0 && s < sched->hash_size_full ? s : 0;
     sched->hash_set.size   = sched->hash_size_small > 0 ? sched->hash_size_small : sched->hash_size_full;
+}
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+static void ggml_sched_pages_free(void * base, size_t from, size_t to) {
+    const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
+    uintptr_t b = (uintptr_t) base + from;
+    uintptr_t e = (uintptr_t) base + to;
+    b = (b + page - 1) & ~(page - 1);
+    e = e & ~(page - 1);
+    if (e > b) {
+        madvise((void *) b, e - b, MADV_DONTNEED);
+    }
+}
+#endif
+
+void ggml_backend_sched_trim(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+#if defined(__linux__)
+    // on a clean table only: the entries above the small size are NULL (copies) or unread (keys), so zero pages are the same
+    if (!sched->is_reset || sched->hash_size_small == 0 || sched->hash_size_small >= sched->hash_size_full) {
+        return;
+    }
+    const size_t per = (size_t) sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *);
+    ggml_sched_pages_free(sched->hv_tensor_copies, sched->hash_size_small*per, sched->hash_size_full*per);
+    ggml_sched_pages_free(sched->hash_set.keys, sched->hash_size_small*sizeof(struct ggml_tensor *), sched->hash_size_full*sizeof(struct ggml_tensor *));
+#endif
 }
 
 void ggml_backend_sched_use_full_hash(ggml_backend_sched_t sched) {
