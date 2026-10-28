@@ -3504,6 +3504,37 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         // allocation as before (lend_full). G4 Qwen3.8-Flash-Next IQ1_S 16 GB + device MTP drafter, 16k prompt: a 3316 MiB graph needed 2227
         // slots, over the cache's cap (2003), so the group ran as two graphs streaming the experts twice; its own buffer held 2244 MiB
         bool lend_full = pf->own_buf == NULL || dry;
+        // k17-lendoom (GGML_SCHED_LEND_FREE_CHECK=0 off): with less device memory free than GGML_SCHED_PREFETCH_HEADROOM_MIB (default 512,
+        // what the backends allocate while computing, e.g. the CUDA pool of mul_mat_q) the user is asked for the whole graph allocation in
+        // one part first, and the own buffer is freed for it; if it cannot, the own region and the rest as before. G4 Qwen3.8-Flash-Next
+        // 24 GB, 16k context: a chat prompt grew the own buffer by its SYNC copies (847 MiB of 976 MiB free, the cache does not lend to
+        // small batches), the 8k prompt after it used that 861 MiB buffer as the first region and the CUDA pool ran out of memory
+        // (only an own buffer of 64 MiB or more: a small one, e.g. of the decode graphs, frees little and is allocated again every prompt)
+        static const bool lend_free_check = getenv("GGML_SCHED_LEND_FREE_CHECK") == nullptr || atoi(getenv("GGML_SCHED_LEND_FREE_CHECK")) != 0;
+        static const size_t lend_headroom = [] {
+            const char * env = getenv("GGML_SCHED_PREFETCH_HEADROOM_MIB");
+            return (size_t) (env != NULL ? std::max(0, atoi(env)) : 512) * 1024 * 1024;
+        }();
+        bool   full_first = false;
+        bool   free_own   = false;
+        size_t full_free  = 0;
+        size_t full_own   = 0;
+        if (lend_free_check && !dry && gsize[b] > 0) {
+            ggml_backend_buffer_t ob = NULL;
+            size_t os = 0;
+            ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
+            if (dev != NULL && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+                    ggml_gallocr_get_own_region(sched->galloc, b, &ob, &os) && os >= 64ull*1024*1024) {
+                size_t free = 0, total = 0;
+                ggml_backend_dev_memory(dev, &free, &total);
+                if (total > 0 && free < lend_headroom) {
+                    full_first = true;
+                    full_free  = free;
+                    full_own   = os;
+                    lend_full  = true;
+                }
+            }
+        }
         lend_again:
         ggml_backend_buffer_t own_buf  = lend_full ? NULL : pf->own_buf;
         const size_t          own_size = lend_full ? 0 : pf->own_size;
@@ -3528,6 +3559,20 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         // for every split) the copies of different splits may share bytes, depth 1 for the lender
         const int lend_depth = sync_lend[b] ? 1 : pf->depth;
         sched->callback_lend(sched->backends[b], pf->lend_copies, n_copies, lend_depth, dry, sched->callback_lend_user_data);
+        if (full_first && n_graph > 0) {
+            full_first = false;
+            bool one = pf->lend_copies[0].buffer != NULL && pf->lend_copies[0].size >= gsize[b];
+            for (int k = 1; k < n_graph; k++) {
+                one = one && (pf->lend_copies[k].buffer == NULL || pf->lend_copies[k].size == 0);
+            }
+            if (one) {
+                free_own = true;
+            } else if (pf->own_buf != NULL) {
+                // not in one part: the own region and the rest, as without the check
+                lend_full = false;
+                goto lend_again;
+            }
+        }
         if (!lend_full && n_graph > 0 && (pf->lend_copies[0].buffer == NULL || pf->lend_copies[0].size < gask)) {
             // the user could not lend the rest in one part: the whole allocation, as without the own region
             lend_full = true;
@@ -3584,6 +3629,19 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
                 n_parts++;
             }
             if (!dry && ok && n_parts > part0) {
+                if (free_own && n_parts == 1 && sizes[0] >= gsize[b]) {
+                    // the whole graph is in lent memory: the own buffer is not needed by it, the graphs after it allocate it again
+                    // (the graph before it may still read it)
+                    ggml_backend_synchronize(sched->backends[b]);
+                    ggml_gallocr_free_buffer(sched->galloc, b);
+                    pf->own_buf  = NULL;
+                    pf->own_size = 0;
+                    pf->own_rest = 0;
+                    GGML_LOG_INFO("%s: %s: %.2f MiB of device memory free, below the headroom of %.0f MiB: the graph allocation of %.2f MiB "
+                        "is lent in one part and the own compute buffer of %.2f MiB is freed (GGML_SCHED_LEND_FREE_CHECK=0 to disable)\n", __func__,
+                        ggml_backend_name(sched->backends[b]), full_free/1024.0/1024.0, lend_headroom/1024.0/1024.0, gsize[b]/1024.0/1024.0,
+                        full_own/1024.0/1024.0);
+                }
                 ggml_gallocr_set_external_bufs(sched->galloc, b, gbufs, offs, sizes, n_parts);
                 ggml_gallocr_set_external_last_free(sched->galloc, b, part0 > 0);
                 // the first lent part (with more parts the list of the prefetched copies tells them apart, see ggml_backend_sched_prefetch_is_bound)
