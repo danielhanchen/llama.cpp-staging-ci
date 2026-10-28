@@ -2072,6 +2072,14 @@ struct llama_moe_cache::impl {
         std::atomic<bool>    stop{false};
         ggml_backend_ptr     cpu;
         int                  threads = 1;
+        // k18 (LLAMA_MOE_SINGLE_FUSED, default on; =0 the graph of each batch as before): the CPU backend's one-region form of the batch's
+        // host experts (ggml_cpu_moe_host_ffn: one barrier instead of the graph's seven, no plan; bit-identical to the graph), with
+        // its scratch; null when the CPU backend has none (the graph then)
+        bool (*fused)(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const float *, const int32_t *, float *, int, int, int,
+                void *, size_t) = nullptr;
+        size_t (*fused_wsize)(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, int, int, int) = nullptr;
+        std::vector<uint8_t> fused_buf;
+        uint64_t             fused_batches = 0;
         std::atomic<int64_t> kick_us{0};
         std::mutex              mtx;
         std::condition_variable cv;
@@ -2151,6 +2159,15 @@ struct llama_moe_cache::impl {
             if (set_n != nullptr) {
                 set_n(h.cpu.get(), h.threads);
             }
+            const char * ef = getenv("LLAMA_MOE_SINGLE_FUSED");
+            if (ef == nullptr || atoi(ef) != 0) {
+                h.fused       = (decltype(h.fused))       ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_host_ffn");
+                h.fused_wsize = (decltype(h.fused_wsize)) ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_host_ffn_wsize");
+                if (h.fused == nullptr || h.fused_wsize == nullptr) {
+                    h.fused = nullptr;
+                    h.fused_wsize = nullptr;
+                }
+            }
         }
         h.owners.push_back(this);
         single_reg = true;
@@ -2159,8 +2176,8 @@ struct llama_moe_cache::impl {
             h.thr = std::thread(single_service);
         }
         LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses on (LLAMA_MOE_SINGLE): batches of up to %d tokens, %d host threads "
-            "(one host thread for every cache of the process), slow-batch warning above %d ms (merges never time out)\n", tag, single_max_tok, h.threads,
-            single_timeout_ms);
+            "(one host thread for every cache of the process), slow-batch warning above %d ms (merges never time out), %s\n", tag, single_max_tok, h.threads,
+            single_timeout_ms, h.fused != nullptr ? "one-region host experts (LLAMA_MOE_SINGLE_FUSED=0: the graph)" : "host experts by graph");
         return true;
     }
 
@@ -2289,7 +2306,21 @@ struct llama_moe_cache::impl {
                 const int64_t t0 = single_now_us();
                 single_hub_busy(true);
                 single_debug_delay(true);
-                ok = ggml_backend_graph_compute(cpu, p->gf) == GGML_STATUS_SUCCESS;
+                single_hub_t & hub = single_hub();
+                if (hub.fused != nullptr) {
+                    const size_t ws = hub.fused_wsize(mb.w_up, mb.w_gate, mb.w_down, mb.n_used, n_tokens, hub.threads);
+                    if (ws > 0 && hub.fused_buf.size() < ws) {
+                        hub.fused_buf.resize(ws);
+                    }
+                    char * hb = (char *) mb.host;
+                    ok = ws > 0 && hub.fused(mb.w_up, mb.w_gate, mb.w_down, (const float *) (hb + ggml_moe_mailbox_off_x(mb.n_used)),
+                        (const int32_t *) (hb + ggml_moe_mailbox_off_ids()), (float *) (hb + ggml_moe_mailbox_off_out(mb.n_used, mb.n_embd)),
+                        mb.n_used, n_tokens, hub.threads, hub.fused_buf.data(), hub.fused_buf.size());
+                    hub.fused_batches += ok;
+                }
+                if (!ok) {
+                    ok = ggml_backend_graph_compute(cpu, p->gf) == GGML_STATUS_SUCCESS;
+                }
                 if (!ok) {
                     // the device waits for this batch: computed again, a second failure is fatal (never a wrong row)
                     ok = ggml_backend_graph_compute(cpu, p->gf) == GGML_STATUS_SUCCESS;
@@ -2440,6 +2471,8 @@ struct llama_moe_cache::impl {
                 LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses: %" PRIu64 " host batches, %" PRIu64 " expert rows, %.1f us per batch "
                     "(%.2f us per row), %" PRIu64 " above 1 ms, at most %.1f ms\n", tag, single_batches, single_rows, (double) single_us/single_batches,
                     single_rows > 0 ? (double) single_us/single_rows : 0.0, single_slow, single_max_us/1e3);
+                LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses: %" PRIu64 " of the process's host batches in one region "
+                    "(LLAMA_MOE_SINGLE_FUSED)\n", tag, single_hub().fused_batches);
             }
         }
         for (auto & mb : mboxes) {

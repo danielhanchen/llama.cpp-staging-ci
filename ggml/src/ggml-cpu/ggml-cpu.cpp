@@ -692,6 +692,14 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
         return (void *)ggml_backend_cpu_set_use_ref;
     }
 
+    // k18: the single-graph MoE mailbox host experts (llama_moe_cache)
+    if (strcmp(name, "ggml_cpu_moe_host_ffn") == 0) {
+        return (void *)ggml_cpu_moe_host_ffn;
+    }
+    if (strcmp(name, "ggml_cpu_moe_host_ffn_wsize") == 0) {
+        return (void *)ggml_cpu_moe_host_ffn_wsize;
+    }
+
     // threadpool - TODO:  move to ggml-base
     if (strcmp(name, "ggml_threadpool_new") == 0) {
         return (void *)ggml_threadpool_new;
