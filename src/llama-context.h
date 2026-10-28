@@ -900,6 +900,7 @@ private:
     uint64_t n_plan_saves    = 0;
     uint64_t n_plan_invalid  = 0;
     void small_plan_free(uint32_t i);
+    size_t release_device_compute(); // k17-small: frees the device compute buffers (an MTP drafter beside its target's prompt group)
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

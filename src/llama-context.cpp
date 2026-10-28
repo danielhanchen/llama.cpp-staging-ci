@@ -309,6 +309,11 @@ static void llama_dense_host_pin(const llama_model & model) {
 // k15-fn: the time of the last ubatch of any context of the process (the PLE table read-in runs in the gaps, see below)
 static std::atomic<int64_t> llama_ple_busy_us{0};
 
+// k17-small: the MTP draft contexts of the process (a target's layer-major prompt group frees their device compute buffers, see
+// decode_layer_major)
+static std::mutex                   llama_mtp_ctx_mutex;
+static std::vector<llama_context *> llama_mtp_ctxs;
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -856,6 +861,10 @@ llama_context::llama_context(
         // the main context caches the layers of its graph, an MTP context the NextN layers with its share of the same budget
         // (LLAMA_MOE_CACHE_MTP=0: the main context caches all layers, an MTP context none)
         const bool ctx_mtp = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+        if (ctx_mtp) {
+            std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
+            llama_mtp_ctxs.push_back(this);
+        }
         const auto moe_cache_set = llama_moe_cache::select_layers(model, ctx_mtp);
         const size_t moe_cache_budget = cparams.moe_cache_size == 0 || (ctx_mtp && moe_cache_set != llama_moe_cache::layer_set::nextn) ? 0 :
             llama_moe_cache::budget(model, cparams.moe_cache_size, moe_cache_set);
@@ -1575,6 +1584,30 @@ llama_context::disk_range_ref::~disk_range_ref() {
     }
 }
 
+// k17-small: frees the device compute buffers of this context (an MTP drafter, for a layer-major prompt group of its target); the next
+// graph is built and allocated anew. Returns the bytes freed
+size_t llama_context::release_device_compute() {
+    size_t bytes = 0;
+    for (auto & bk : backend_ptrs) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(bk);
+        if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            bytes += ggml_backend_sched_get_buffer_size(sched.get(), bk);
+        }
+    }
+    if (bytes == 0) {
+        return 0;
+    }
+    synchronize();
+    for (auto & res : gf_res_prev) {
+        if (res) {
+            res->reset();
+        }
+    }
+    gf_res_prev_active = nullptr; gf_res_epoch_bump(__LINE__);
+    ggml_backend_sched_free_device_buffers(sched.get());
+    return bytes;
+}
+
 void llama_context::gf_res_epoch_bump(int line) {
     gf_res_epoch++;
     static const bool why = getenv("LLAMA_GRAPH_SMALL_WHY") != nullptr && atoi(getenv("LLAMA_GRAPH_SMALL_WHY")) > 0;
@@ -1586,6 +1619,10 @@ void llama_context::gf_res_epoch_bump(int line) {
 }
 
 llama_context::~llama_context() {
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
+        llama_mtp_ctxs.erase(std::remove(llama_mtp_ctxs.begin(), llama_mtp_ctxs.end(), this), llama_mtp_ctxs.end());
+    }
     if (!disk_ranges.empty()) {
         ggml_moe_prefetch_counters c = {};
         ggml_moe_prefetch_stats(&c);
@@ -5417,6 +5454,47 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     // the slots of so small a cache are too few to lend the growth (G4 at 4 GB, Qwen3.6 Q3_K_M + MTP: 111 MiB in three bank tails of at most
     // 33 MiB, a 4-ubatch group grows by 68 MiB with 77 MiB free and 64 MiB of headroom, it was split in single ubatches: one pass over
     // every host expert per 512 tokens). The group does not seed the cache. LLAMA_MOE_LM_RELEASE=0 off
+    // k17-small (LLAMA_MOE_LM_DRAFT_RELEASE=0 off): beside a kept MTP drafter on a small device the drafter's device compute buffers are
+    // freed for the group (its next graph allocates them again; the target's compute buffers are freed after the group, so they have
+    // their memory back), so the merged graph grows in that memory too. T4 4 GB, Qwen3.6-35B-A3B UD-Q4_K_XL + MTP, ctx 16384: with the
+    // drafter's 233 MiB compute held, 157.8 MiB were free and the 16-ubatch group of an 8k prompt ran as 8 graphs of 2 (each streaming
+    // every host expert, 477 tok/s) against one graph without a drafter (970 tok/s). Only with less than LLAMA_MOE_LM_DRAFT_RELEASE_FREE_MIB
+    // (512) free
+    static const bool   lm_dft_rel_env  = getenv("LLAMA_MOE_LM_DRAFT_RELEASE") == nullptr || atoi(getenv("LLAMA_MOE_LM_DRAFT_RELEASE")) != 0;
+    static const size_t lm_dft_rel_free = (size_t) (getenv("LLAMA_MOE_LM_DRAFT_RELEASE_FREE_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LM_DRAFT_RELEASE_FREE_MIB"))) : 512) << 20;
+    bool lm_dft_released = false;
+    if (lm_dft_rel_env && gm != nullptr && cparams.spec_draft && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+        size_t free_min = SIZE_MAX;
+        for (auto & bk : backend_ptrs) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(bk);
+            if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                size_t fr = 0, tot = 0;
+                ggml_backend_dev_memory(dev, &fr, &tot);
+                free_min = std::min(free_min, fr);
+            }
+        }
+        if (free_min < lm_dft_rel_free) {
+            std::vector<llama_context *> dfts;
+            {
+                std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
+                for (llama_context * c : llama_mtp_ctxs) {
+                    if (c != this && &c->model == &model) {
+                        dfts.push_back(c);
+                    }
+                }
+            }
+            size_t freed = 0;
+            for (llama_context * c : dfts) {
+                freed += c->release_device_compute();
+            }
+            lm_dft_released = freed > 0;
+            static int n_dft_log = 0;
+            if (lm_dft_released && n_dft_log++ < 4) {
+                LLAMA_LOG_INFO("%s: %.2f MiB free: the MTP drafter's device compute buffers (%.2f MiB) are freed for the group "
+                    "(LLAMA_MOE_LM_DRAFT_RELEASE=0 keeps them)\n", __func__, free_min/1048576.0, freed/1048576.0);
+            }
+        }
+    }
     static const bool lm_release_env = getenv("LLAMA_MOE_LM_RELEASE") == nullptr || atoi(getenv("LLAMA_MOE_LM_RELEASE")) != 0;
     bool lm_released = false;
     // k17-small: the release also where the cache is above LLAMA_MOE_LM_RELEASE_FRAC but the group's merged graph does not allocate in
@@ -6290,7 +6368,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             }
         }
         lm_n_released++;
-    } else if (buf_after > buf_before) {
+    } else if (buf_after > buf_before || lm_dft_released) {
+        // (k17-small: after a group that freed the drafter's compute buffers the target's are freed too, so the drafter has its memory back)
         // k13-small: a group that grew the compute buffers leaves them at its size, and the decode after it computes in what is left: G4 at
         // 4 GB, Qwen3.6 Q3_K_M + MTP with LLAMA_MOE_LM_RELEASE=0, a fresh server's first request (2100 tokens): the group grew 502 -> 534 MiB
         // inside the 64 MiB headroom with 118 MiB left after it, the staging copies of the next graphs took the rest and the decode ran out
@@ -6308,7 +6387,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 free_min = std::min(free_min, fr);
             }
         }
-        if (free_min < lm_shrink_free) {
+        if (free_min < lm_shrink_free || lm_dft_released) {
             ggml_backend_sched_synchronize(sched.get());
             lm_ids_host_keep();
             ggml_backend_sched_free_device_buffers(sched.get());
