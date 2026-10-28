@@ -2915,10 +2915,25 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                     &draft_needs_target);
                 if (!draft_cpu && !rq_before && getenv("LLAMA_DRAFT_REQUANT") != nullptr) {
                     // k18: the draft was admitted requantized: the rest of the fit (the extra model) measures it at those types, as it loads
-                    params_dft  = common_base_params_to_speculative(params);
-                    const auto cp_keep = cparams_dft;
-                    mparams_dft = common_model_params_to_llama(params_dft);
-                    cparams_dft = cp_keep;
+                    // (the overrides are added in place: the extra model holds params_dft's path and &mparams_dft)
+                    if (!params_dft.kv_overrides.empty() && params_dft.kv_overrides.back().key[0] == 0) {
+                        params_dft.kv_overrides.pop_back();
+                    }
+                    for (const auto & kv : { std::make_pair("general.requant_type", "LLAMA_DRAFT_REQUANT"),
+                                             std::make_pair("general.requant_output_type", "LLAMA_DRAFT_REQUANT_OUTPUT") }) {
+                        const char * v = getenv(kv.second);
+                        if (v == nullptr || v[0] == 0) {
+                            continue;
+                        }
+                        llama_model_kv_override o = {};
+                        snprintf(o.key, sizeof(o.key), "%s", kv.first);
+                        o.tag = LLAMA_KV_OVERRIDE_TYPE_STR;
+                        snprintf(o.val_str, sizeof(o.val_str), "%s", v);
+                        params_dft.kv_overrides.push_back(o);
+                    }
+                    params_dft.kv_overrides.emplace_back();
+                    params_dft.kv_overrides.back().key[0] = 0;
+                    mparams_dft.kv_overrides = params_dft.kv_overrides.data();
                 }
             }
         }
