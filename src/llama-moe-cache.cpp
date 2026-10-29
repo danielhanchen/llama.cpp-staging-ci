@@ -8895,7 +8895,14 @@ void llama_moe_cache::single_note_form(int32_t il, bool ok) const {
 }
 
 ggml_tensor * llama_moe_cache::single_merge(ggml_context * ctx, ggml_tensor * dev, ggml_tensor * pub) const {
-    return ggml_moe_mailbox_merge(ctx, dev, pub, 0); // no timeout: the merge waits for the host (see single_timeout_ms)
+    // no timeout: the merge waits for the host (see single_timeout_ms). LLAMA_MOE_SINGLE_MERGE_TIMEOUT_MS=N (diagnostic): a merge whose
+    // batch the host thread neither computes nor picked up within N ms gives up (that ubatch keeps its device rows only, so its output is
+    // not exact) and the next graph turns the path off (single_kick): a hang turns into a logged failure
+    static const int merge_timeout_ms = [] {
+        const char * e = getenv("LLAMA_MOE_SINGLE_MERGE_TIMEOUT_MS");
+        return e != nullptr ? std::max(0, atoi(e)) : 0;
+    }();
+    return ggml_moe_mailbox_merge(ctx, dev, pub, merge_timeout_ms);
 }
 
 void llama_moe_cache::single_kick(int64_t n_tokens) {
