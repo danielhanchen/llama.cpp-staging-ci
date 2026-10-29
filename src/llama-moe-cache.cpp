@@ -9146,6 +9146,14 @@ void llama_moe_cache::seed_unavailable() {
     }
 }
 
+bool llama_moe_cache::resident_union() const {
+    return pimpl->host && pimpl->host->exclusive() && pimpl->host_spare && pimpl->resident_mode;
+}
+
+void llama_moe_cache::seeds_off() {
+    pimpl->seed_own = false;
+}
+
 void llama_moe_cache::prompts_do_not_seed() {
     pimpl->seed_own = false;
     seed_unavailable();

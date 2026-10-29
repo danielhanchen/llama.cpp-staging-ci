@@ -944,6 +944,20 @@ llama_context::llama_context(
         if (moe_cache && moe_cache_seed_auto) {
             moe_cache->prompts_do_not_seed();
         }
+        // k18-lowram: where the exclusive RAM tier and the device slots hold every streamed expert (resident mode: RAM + VRAM hold the
+        // model, the RAM alone cannot pin it), prompts do not seed the device cache. A seed admits the prompt's experts into device slots
+        // and evicts device experts RAM does not hold; their copies back into a RAM tier the prompt pins found no slot or evicted another
+        // expert RAM alone held, so every prompt dropped experts from both tiers and the next prompt and the decode after it read them
+        // from the files (G4, Qwen3.8-Flash-Next UD-IQ4_XS 32 GB at 48 GiB RAM, Studio argv: 18.0 / 34.9 GB read in the 8k / 16k cells,
+        // 10162 copies back without a slot, decode 9.1 / 9.5 tok/s; without seeds 3.5 / 5.4 GB, RAM hit rate 87.6 -> 98.5%, 8k / 16k TTFT
+        // 115.7 -> 64.6 / 251.1 -> 134.8 s, decode 34.8 / 39.4 tok/s, same text). LLAMA_MOE_HOST_SEED=1 seeds as before
+        if (moe_cache && moe_cache_seed_enabled && getenv("LLAMA_MOE_CACHE_SEED") == nullptr && moe_cache->resident_union() &&
+                (getenv("LLAMA_MOE_HOST_SEED") == nullptr || atoi(getenv("LLAMA_MOE_HOST_SEED")) == 0)) {
+            moe_cache_seed_enabled = false;
+            moe_cache->seeds_off();
+            LLAMA_LOG_INFO("%s: MoE cache: RAM and the device slots hold every streamed expert: prompts do not seed the device cache "
+                "(LLAMA_MOE_HOST_SEED=1 seeds)\n", __func__);
+        }
         // k15-pp3: the capture snapshots fit counted (cap_planned_bytes) are allocated here, before the MoE cache's decisions read the free
         // memory, instead of at the first capture: with their bytes still free, the first reserve kept the staging copies outside the
         // cache and the first prompt kept its graph allocation out of the lent memory (G4 q4x 12 GB + MTP: lending off, then the graph

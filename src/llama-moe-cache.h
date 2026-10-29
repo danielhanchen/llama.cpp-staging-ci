@@ -322,6 +322,11 @@ public:
     // default seeding skipped it, and do not count a seed split in the lent memory
     void prompts_do_not_seed();
 
+    // the exclusive RAM tier and the device slots hold every streamed expert (resident mode, see init_host_cache)
+    bool resident_union() const;
+    // prompts never seed (llama_context, k18-lowram): no seed split in the lent memory either
+    void seeds_off();
+
     // LLAMA_MOE_CACHE_SEED_CHECK=1 (debug): after the seeding ubatch is synchronized, compare the seeded slots with the host experts
     bool seed_check() const;
     void seed_verify();
