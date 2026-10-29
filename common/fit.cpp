@@ -67,7 +67,8 @@ static int64_t common_fit_moe_margin(int64_t m, int64_t free_dev, int64_t cache_
         return m;
     }
     // k17-models: on by default (256 MiB stay free beside the cache) where the device budget is at least LLAMA_MOE_FIT_MARGIN_MIN_GIB (10)
-    // and the host experts the cache would hold are at most LLAMA_MOE_FIT_MARGIN_MAX_RATIO (1.8) times that budget: a cache that holds a
+    // and the host experts the cache would hold are at most LLAMA_MOE_FIT_MARGIN_MAX_RATIO (1.3; k18: 1.8 cost Flint 16 GB (1.37) +71 / +181 ms
+    // G4 / L4 chat TTFT) times that budget: a cache that holds a
     // small share of a large expert set stages many misses per prompt ubatch at run time and needs the margin.
     // Gate (k17m_l4mm / g4mm / g4mg / g4mh, chat to 30k prompts, log grep for allocation failures and fallbacks), experts / budget:
     //   pass with 256: LFM2.5 Q4_K_XL 12 GB (1.12), q4x + MTP 12 / 16 GB (1.58 / 1.17), Flint Q4_K_XL 16 GB (1.37),
@@ -82,7 +83,7 @@ static int64_t common_fit_moe_margin(int64_t m, int64_t free_dev, int64_t cache_
         const char * eg  = getenv("LLAMA_MOE_FIT_MARGIN_MIN_GIB");
         const char * er  = getenv("LLAMA_MOE_FIT_MARGIN_MAX_RATIO");
         const int64_t mn = (eg != nullptr ? std::max<int64_t>(0, atoll(eg)) : 10)*1024*MiB_;
-        const double  mr = er != nullptr ? std::max(0.0, atof(er)) : 1.8;
+        const double  mr = er != nullptr ? std::max(0.0, atof(er)) : 1.3;
         // k18-margin: never beside a draft model or MTP heads (LLAMA_MOE_FIT_MARGIN_DRAFT=1 allows it). The drafter's runtime pools
         // (mul_mat_q, CUDA graphs) live in that slack once the MTP draft is priced exactly: k15 head b741bad76b7 + the rule aborted with
         // CUDA out of memory in every G4 q4x + MTP 12 / 16 GB launch (about 130 MiB free after the cache took +768 MiB), fn1 + MTP 24 GB
