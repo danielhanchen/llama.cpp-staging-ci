@@ -2414,13 +2414,27 @@ static bool common_fit_draft_on_cpu(
     const char * env_rq = getenv("LLAMA_DRAFT_REQUANT");
     const bool rq_off = env_rq != nullptr && (strcmp(env_rq, "off") == 0 || strcmp(env_rq, "0") == 0 || strcmp(env_rq, "none") == 0);
     const bool rq_set = env_rq != nullptr && !rq_off && env_rq[0] != 0;
-    // the 1-token line is measured for a built-in-head drafter (draft-mtp) with short verify windows (at most 3 drafted tokens): its
-    // verify step cost 1.9x a single token at 1.4 tokens per layer (G4 fn4 12 GB). A separate draft model with longer windows did not pay
-    // there: G4 Qwen3.6-35B-A3B UD-Q4_K_XL 7 GB + Qwen3.5-0.8B Q8_0 (draft-simple, 4 tokens) at 2.8 tokens requantized: 38.8 ms per verify
-    // step against 5.7 ms per token without it, chat 60.5 vs 175 tok/s. Other drafters keep LLAMA_FIT_DRAFT_MIN_TOKENS at the smaller size
-    const bool rq_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) !=
-        params.speculative.types.end() && common_speculative_n_max(&params.speculative) <= 3;
-    int64_t rq_min_tok = rq_mtp ? 1 : min_tok;
+    // the 1-token line holds where a verify step costs little more than a single token. The fit runs before any model is loaded, so a
+    // probe cannot measure that: a cost model gives it instead, the expected distinct experts a verify window of n_max + 1 tokens reads
+    // per layer over those of one token, with independent routing (n_expert / n_used * (1 - (1 - n_used / n_expert)^(n_max + 1))). At most
+    // LLAMA_FIT_DRAFT_REQUANT_MAX_VERIFY_RATIO (3.5) keeps the 1-token line, above it LLAMA_FIT_DRAFT_MIN_TOKENS applies at the smaller
+    // size too. Calibrated on two G4 cells (the model ranks them, its scale is a heuristic: real routing is correlated):
+    //  - Qwen3.8-Flash-Next UD-IQ4_XS 12 GB (512 experts, 10 used) + its Q8_0 MTP drafter, n_max 2: model 2.94, measured verify step
+    //    1.9x a single token at 1.4 tokens per layer, request time chat 3.32 -> 2.44 s: admitted at 1 token
+    //  - Qwen3.6-35B-A3B UD-Q4_K_XL 7 GB (256 experts, 8 used) + Qwen3.5-0.8B Q8_0, draft-simple n_max 4: model 4.70, measured 38.8 ms per
+    //    verify step against 5.7 ms per token without the drafter, chat 175 -> 60.5 tok/s at 2.8 tokens: refused
+    common_moe_slot_bytes sbt_v;
+    double v_ratio = -1.0;
+    if (common_moe_slot_bytes_of(params.model.path, sbt_v) && sbt_v.n_used > 0 && sbt_v.n_expert > sbt_v.n_used) {
+        const double q = 1.0 - (double) sbt_v.n_used/(double) sbt_v.n_expert;
+        const int    n = std::max(1, common_speculative_n_max(&params.speculative)) + 1;
+        v_ratio = (double) sbt_v.n_expert/(double) sbt_v.n_used*(1.0 - std::pow(q, n));
+    }
+    double v_max = 3.5;
+    if (const char * e = getenv("LLAMA_FIT_DRAFT_REQUANT_MAX_VERIFY_RATIO")) {
+        v_max = std::max(0.0, atof(e));
+    }
+    int64_t rq_min_tok = v_ratio >= 0.0 && v_ratio <= v_max ? 1 : min_tok;
     if (const char * e = getenv("LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT")) {
         rq_min_tok = std::max(0, atoi(e));
     }
@@ -2478,8 +2492,10 @@ static bool common_fit_draft_on_cpu(
     }
     if (rq_tok >= 0.0) {
         LOG_INF("%s: draft requantized at load (q3_k FFN / experts, q4_k output): %.0f MiB of device memory, the cache it leaves holds the experts "
-            "of %.1f tokens per layer -> %s (at least %d, LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT; LLAMA_DRAFT_REQUANT=off disables)\n", __func__,
-            rq_dft/MiB, rq_tok, gpu ? "draft model on the GPU, requantized" : "refused", (int) rq_min_tok);
+            "of %.1f tokens per layer -> %s (at least %d, LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT: verify window cost %.2fx a token, %s %.2f "
+            "LLAMA_FIT_DRAFT_REQUANT_MAX_VERIFY_RATIO; LLAMA_DRAFT_REQUANT=off disables)\n", __func__,
+            rq_dft/MiB, rq_tok, gpu ? "draft model on the GPU, requantized" : "refused", (int) rq_min_tok, v_ratio,
+            v_ratio >= 0.0 && v_ratio <= v_max ? "at most" : "over", v_max);
     } else if (!gpu && rq_off) {
         LOG_INF("%s: draft refused at its file's types; requantization off (LLAMA_DRAFT_REQUANT=off)\n", __func__);
     }
