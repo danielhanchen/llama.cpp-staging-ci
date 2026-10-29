@@ -1816,6 +1816,7 @@ private:
             SRV_INF("%s", "MoE cache: small batches frozen (LLAMA_MOE_CPU_MISS_FROZEN=1)\n");
         }
 
+        bool auto_verify_exact = false; // k19: the default n-gram drafts verify batch invariant (logged below)
         if (spec) {
             SRV_TRC("%s", "speculative decoding context initialized\n");
             // k11-decode: the default drafts are verified batch invariant, so greedy output stays that of plain decoding; where the
@@ -1831,9 +1832,11 @@ private:
                                           server_spec_spill_mode(server_spec_auto_arch(params_base.model.path), host_mode, params_base.cpuparams.n_threads);
                 if (spill < 0) {
                     llama_set_verify_exact(ctx_tgt, true);
+                    auto_verify_exact = true;
                 } else if (spill == 2 && getenv("LLAMA_MOE_CPU_MISS_FROZEN_FETCH") == nullptr && llama_moe_freeze_small(ctx_tgt)) {
                     // k13: frozen small batches, drafts verified batch invariant (exact against this frozen cache)
                     llama_set_verify_exact(ctx_tgt, true);
+                    auto_verify_exact = true;
                     SRV_INF("%s", "n-gram drafting by default under the MoE cache: small batches frozen, drafts verified exactly against them "
                         "(KLD-gated default, LLAMA_SPEC_SPILL=0: off)\n");
                 } else if (spill == 3 && llama_moe_pin_small(ctx_tgt)) {
@@ -1856,6 +1859,17 @@ private:
             spec_init.reset();
             ctx_dft   = nullptr;
             model_dft = nullptr;
+        }
+
+        // k19: with the reassociated verify (GGML_CUDA_VERIFY_REASSOC, default on: verify rows differ from single token decodes by f32
+        // summation order, plans/k11.md equivalence rule) and windows priced from measured round times, which tokens come from a verify
+        // row depends on timing, so greedy output can differ between launches at near ties (plans/k19_phi4_nondet.md)
+        if (spec && auto_verify_exact) {
+            const char * e = getenv("GGML_CUDA_VERIFY_REASSOC");
+            if (e == nullptr || atoi(e) != 0) {
+                SRV_INF("%s", "n-gram drafting by default with the reassociated verify: greedy output can vary between launches near ties; "
+                    "GGML_CUDA_VERIFY_REASSOC=0 (exact verify) or LLAMA_SPEC_AUTO=0 for byte-stable output\n");
+            }
         }
 
         if (!spec && params_base.speculative.has_synth()) {
