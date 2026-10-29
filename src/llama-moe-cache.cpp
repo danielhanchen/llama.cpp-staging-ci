@@ -5438,13 +5438,25 @@ struct llama_moe_cache::impl {
     // deterministic share (LLAMA_MOE_CACHE_HYBRID unset or 2): share = k/(k + n_threads), k = 6, rounded to 1/8, at least 1/8; the
     // host path is off above 3/4; the timed probe (LLAMA_MOE_CACHE_HYBRID=3) found 0.25 with 24 threads (G4: 58-91 GB/s on the host,
     // 31 GB/s upload) and 0.5 / 0.625 with 6 threads (L4: 13 / 10 GB/s), and the rounded share flipped between launches, which changed
-    // the greedy output; this one depends only on the thread count
+    // the greedy output; this one depends only on the thread count.
+    // k18-lfm: at most LLAMA_MOE_CACHE_HYBRID_SHARE_CAP (0.25) with LLAMA_MOE_CACHE_HYBRID_SHARE_CAP_THREADS (6) or more decode threads.
+    // L4 (6 threads, 12 GB/s upload, ~470 us per uploaded expert): LFM2.5 UD-Q4_K_XL 4 GB (4.8% cached) at the old 0.5 vs 0.25 decoded
+    // chat / 2k / 8k 28.4 / 36.0 / 32.0 vs 37.1 / 52.2 / 51.0 tok/s (every miss on the host: 28.5 / 39.0 / 34.8); 24 threads give 0.25
+    // either way. LLAMA_MOE_CACHE_HYBRID_SHARE_CAP=1 restores k/(k + n)
     void set_threads(int n_threads, bool quiet) {
         if (!hybrid || !hybrid_det) {
             return;
         }
+        static const double share_cap = [] {
+            const char * e = getenv("LLAMA_MOE_CACHE_HYBRID_SHARE_CAP");
+            return e != nullptr ? std::min(1.0, std::max(0.125, atof(e))) : 0.25;
+        }();
+        static const int share_cap_threads = [] {
+            const char * e = getenv("LLAMA_MOE_CACHE_HYBRID_SHARE_CAP_THREADS");
+            return e != nullptr ? std::max(1, atoi(e)) : 6;
+        }();
         const int    n     = std::max(1, n_threads);
-        const double share = hybrid_k/(hybrid_k + n);
+        const double share = n >= share_cap_threads ? std::min(share_cap, hybrid_k/(hybrid_k + n)) : hybrid_k/(hybrid_k + n);
         const float  q     = std::max(0.125f, (float) std::round(share*8.0)/8.0f);
         if (q > 0.75f) {
             hybrid       = false;
