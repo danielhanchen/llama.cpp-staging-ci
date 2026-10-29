@@ -5542,13 +5542,22 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     const double lm_cf   = moe_cache->cache_frac();
     bool         lm_tiny = lm_tiny_cache(lm_cf);
     if (lm_release_env && lm_rel_split && !lm_tiny && gm != nullptr && group.size() >= 2 && lm_cf >= 0.0 && lm_cf < lm_rel_split_frac) {
+        // k19 (LLAMA_MOE_LM_MEASURE_RESTORE=0 off): the measure allocates the merged graph when it fits, which sets the data of its
+        // nodes; the graph allocator takes a node with data as preallocated, so the allocation that runs the graph planned only the
+        // scheduler's new input copies, over the memory of the nodes the measure placed (Colab T4, Qwen3.6-35B-A3B + MTP at 6 GB with
+        // LLAMA_MOE_PREFILL_UB_TINY=0, 2k prompt: the attention, state and KV index copies were overwritten, get_rows read state row
+        // 1056161495, the fused set_rows pair wrote out of bounds). The nodes get their state from before the measure back.
+        static const bool lm_measure_restore = getenv("LLAMA_MOE_LM_MEASURE_RESTORE") == nullptr || atoi(getenv("LLAMA_MOE_LM_MEASURE_RESTORE")) != 0;
         std::vector<std::pair<ggml_tensor *, std::array<ggml_tensor *, GGML_MAX_SRC>>> srcs0;
+        std::vector<std::pair<void *, ggml_backend_buffer_t>> alloc0;
         srcs0.reserve(ggml_graph_n_nodes(gm));
+        alloc0.reserve(ggml_graph_n_nodes(gm));
         for (int i = 0; i < ggml_graph_n_nodes(gm); ++i) {
             ggml_tensor * node = ggml_graph_node(gm, i);
             std::array<ggml_tensor *, GGML_MAX_SRC> arr;
             std::copy(node->src, node->src + GGML_MAX_SRC, arr.begin());
             srcs0.emplace_back(node, arr);
+            alloc0.emplace_back(node->data, node->buffer);
         }
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_use_full_hash(sched.get());
@@ -5559,6 +5568,21 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         ggml_backend_sched_set_alloc_limit(sched.get(), false, 0);
         for (auto & [node, arr] : srcs0) {
             std::copy(arr.begin(), arr.end(), node->src);
+        }
+        if (lm_measure_restore) {
+            for (size_t i = 0; i < srcs0.size(); ++i) {
+                srcs0[i].first->data   = alloc0[i].first;
+                srcs0[i].first->buffer = alloc0[i].second;
+            }
+        }
+        {
+            static int64_t n_measure = 0, n_measure_alloc = 0;
+            n_measure++;
+            n_measure_alloc += ok ? 1 : 0;
+            if (n_measure <= 4 || (n_measure & (n_measure - 1)) == 0) {
+                LLAMA_LOG_INFO("%s: release-split measure %" PRId64 " (%zu ubatches): %s, %" PRId64 " of %" PRId64 " allocated, node allocations %s\n", __func__,
+                    n_measure, group.size(), ok ? "fits" : "refused", n_measure_alloc, n_measure, lm_measure_restore ? "restored" : "kept (LLAMA_MOE_LM_MEASURE_RESTORE=0)");
+            }
         }
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_use_full_hash(sched.get());
