@@ -2730,7 +2730,22 @@ struct llama_moe_cache::impl {
             reserve = (size_t) std::max<long long>(0, atoll(e)) << 20;
         }
         const size_t avail_plan = avail > reserve ? avail - reserve : 0;
-        const llama_moe_host_plan plan = llama_moe_host_decide(e_bytes, v_bytes, mapped, avail_plan, token_bytes, host_mib, policy_env, force);
+        llama_moe_host_plan plan = llama_moe_host_decide(e_bytes, v_bytes, mapped, avail_plan, token_bytes, host_mib, policy_env, force);
+        // where the whole reserve would cost the union of RAM and the device slots (the experts the device does not hold no longer fit),
+        // but the budget without it holds them: the budget is that complement + 1 GiB, so resident mode stays and the reserve gets the
+        // rest. G4 Flash-Next 32 GB at 48 GiB: the full 6 GiB reserve left 35.4 GB for 35.4 GB of complement, resident mode was lost and
+        // the 8k / 16k cells read 12.0 / 18.3 GB from disk (TTFT 85 / 147 s, decode 25 / 34 tok/s against 63 / 96 s, 55 / 59 tok/s)
+        if (reserve > 0 && host_mib < 0 && e_bytes > v_bytes) {
+            const size_t need = e_bytes - v_bytes + ((size_t) 1 << 30);
+            const llama_moe_host_plan full = llama_moe_host_decide(e_bytes, v_bytes, mapped, avail, token_bytes, host_mib, policy_env, force);
+            if (full.on && full.budget >= need && (!plan.on || plan.budget < need)) {
+                plan = full;
+                plan.budget = need;
+                plan.spare = need + v_bytes >= e_bytes;
+                LLAMA_LOG_INFO("%s: MoE host cache: the %.1f MiB host reserve would leave the experts the device slots do not hold outside RAM: "
+                        "the budget is that complement + 1 GiB (%.1f MiB), the reserve gets the rest\n", __func__, reserve/1048576.0, need/1048576.0);
+            }
+        }
         if (reserve > 0 && host_mib < 0) {
             LLAMA_LOG_INFO("%s: MoE host cache: %.1f MiB available, %.1f MiB kept as the host reserve (LLAMA_MOE_HOST_RESERVE_MIB)\n", __func__,
                     avail/1048576.0, reserve/1048576.0);
