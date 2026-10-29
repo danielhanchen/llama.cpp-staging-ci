@@ -1454,7 +1454,7 @@ static void common_fit_plain_launch(common_params & params, llama_context_params
     cp.n_state_capture       = llama_context_default_params().n_state_capture;
 }
 
-static int64_t common_lm_batch_default(const common_params & params) {
+static int64_t common_lm_batch_default(const common_params & params, bool * nodraft = nullptr) {
     if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH")) {
         return atoll(e);
     }
@@ -1476,6 +1476,9 @@ static int64_t common_lm_batch_default(const common_params & params) {
     // draft 16k / 30k TTFT 3.34 / 6.41 -> 3.03 / 5.81 s at the previous depth. LLAMA_MOE_LAYER_MAJOR_BATCH_NODRAFT=0 keeps 8192
     static const bool nodraft_env = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_NODRAFT") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_NODRAFT")) != 0;
     if (nodraft_env && !params.speculative.has_dft() && !mtp_heads) {
+        if (nodraft) {
+            *nodraft = true;   // the caller keeps 8192 where the cache has no room for the 16384 graphs (common_lm_nodraft_room)
+        }
         return 16384;
     }
     // beside built-in MTP heads 16384 (LLAMA_MOE_LAYER_MAJOR_BATCH_MTP=0: 8192). It was opt-in: G4 k15g4q1 q4x 12 GB 16k TTFT -13% but
@@ -1504,6 +1507,27 @@ static int64_t common_lm_batch_default(const common_params & params) {
 // explicit -ub grows to hold groups wherever the context runs them; with 0.05 a cache of 5-10% kept one ubatch per batch under the gate,
 // so no group formed (G4, Qwen3.8-Flash-Next UD-IQ4_XS 12 GB, 6.3% cached, Studio -ub 2048: 8k prompt 1945 tok/s against 4463 at
 // 16 GB with groups; 16 GB beside a Q8_0 MTP drafter, 8.0%: 1845 tok/s, TTFT 1.84 -> 4.44 s)
+// k17-fnbatch: the 16384 batch without a draft (common_lm_batch_default) only where the cache has room for its merged graphs: the member
+// estimate n_ubatch x 4 B x (4 n_embd + 4 n_expert_used n_ff_exp), (k - 1) of them, at most 1/LLAMA_MOE_LAYER_MAJOR_BATCH_NODRAFT_ROOM (2)
+// of the cache; else 8192. G4 / T4 k17nbg / k17nbo: Flash-Next UD-IQ4_XS 12 GB (2321 MiB cache) 16k / 30k text changed beside the
+// hybrid gate for -0.7 / -1.1% TTFT; gpt-oss-20b 8 GB on T4 (3026 MiB cache) still split 4 + 4, its input arena 91 -> 182 MiB and 16k
+// TTFT +1.0%; 24 GB (15068 MiB) one group, 30k TTFT -2.3%, text unchanged
+static bool common_lm_nodraft_room(const common_params & params, int64_t n_ubatch, int64_t want, int64_t * est_out = nullptr) {
+    static const double room = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_NODRAFT_ROOM") ? std::max(0.0, atof(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_NODRAFT_ROOM"))) : 2.0;   // 0: always 16384 (the callers skip the check)
+    const int64_t n_embd = common_gguf_u32(params.model.path, "embedding_length");
+    const int64_t n_ff   = common_gguf_u32(params.model.path, "expert_feed_forward_length");
+    const int64_t n_used = common_gguf_u32(params.model.path, "expert_used_count");
+    const int64_t k      = n_ubatch > 0 ? want/n_ubatch : 0;
+    if (n_embd <= 0 || n_ff <= 0 || n_used <= 0 || k < 2) {
+        return false;
+    }
+    const int64_t est = n_ubatch*4*(4*n_embd + 4*n_used*n_ff);
+    if (est_out) {
+        *est_out = est;
+    }
+    return (double) params.moe_cache_size >= room*(double) ((k - 1)*est);
+}
+
 static double common_lm_hybrid_frac() {
     if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_HYBRID_FRAC")) {
         return std::max(0.0, atof(e));
@@ -1548,29 +1572,15 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
                 "no layer-major groups)\n", cparams.n_batch, cparams.n_ubatch);
             return;
         }
-        int64_t want = common_lm_batch_default(params);
+        bool nd16 = false;
+        int64_t want = common_lm_batch_default(params, &nd16);
         const int64_t ub_max = getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX") != nullptr ? std::max(1, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX"))) : 16;
         want = std::min<int64_t>(want, ub_max*(int64_t) cparams.n_ubatch);
         if (params.n_ctx > 0) {
             want = std::min<int64_t>(want, params.n_ctx);
         }
-        if (want >= 2*(int64_t) cparams.n_ubatch && want > (int64_t) cparams.n_batch) {
-            // the server clamps its checkpoint offsets to the old n_batch: the same batches and ubatches as without the raise
-            params.n_batch_ckpt = (int32_t) cparams.n_batch;
-            params.n_batch  = (int32_t) want;
-            cparams.n_batch = (uint32_t) want;
-            // k15-small4: without a draft the context turns layer-major on only with this mark (as the n_ubatch-default branch below sets it;
-            // an explicit -ub, e.g. Studio's --ubatch-size 2048, never reached that branch)
-            if (lm != 1 && !common_spec_draft_model(params)) {
-                common_set_env("LLAMA_MOE_LAYER_MAJOR_AUTO_NODRAFT", "1");
-            }
-            // a merged graph of k ubatches keeps what crosses its cuts for every member; at a large ubatch that is more than the fit leaves
-            // free (G4, Flash-Next UD-IQ4_XS 32 GB + Q8_0 MTP drafter, -ub 2048: 4 ubatches needed 755 MiB, 744 MiB were free, so the group
-            // ran as 2 + 2 and read the experts twice). With LLAMA_MOE_LAYER_MAJOR_RESERVE_FRAC (default 0.025 when the server checkpoint is
-            // one batch back, LLAMA_MOE_LAYER_MAJOR_CKPT=1, else 0) the cache gives up min(frac of itself, (k - 1) x the estimate of one
-            // member: n_ubatch x 4 B x (4 n_embd + 4 n_expert_used n_ff_exp)); LLAMA_MOE_LAYER_MAJOR_RESERVE_MIB=N takes N MiB.
-            // Not by default: with the checkpoint one ubatch back an 8k prompt is a group of 3 (fits) + the checkpoint ubatch, and the 481 MiB
-            // the cache gave up there cost the decode after it 1.9% (hit rate 86.84 -> 86.62%) for no prompt gain (same G4 VM, 8k cell)
+        // the cache given up for the merged graphs of k ubatches (k17-fnbatch: a function of k, to compare the 16384 and 8192 batches)
+        auto reserve_for = [&](const int64_t k) -> int64_t {
             int64_t reserve = -1;
             if (const char * e = getenv("LLAMA_MOE_LAYER_MAJOR_RESERVE_MIB")) {
                 reserve = std::max<int64_t>(0, atoll(e)) << 20;
@@ -1600,7 +1610,6 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
                 const int64_t n_embd = common_gguf_u32(params.model.path, "embedding_length");
                 const int64_t n_ff   = common_gguf_u32(params.model.path, "expert_feed_forward_length");
                 const int64_t n_used = common_gguf_u32(params.model.path, "expert_used_count");
-                const int64_t k      = (int64_t) cparams.n_batch/(int64_t) cparams.n_ubatch;
                 if (n_embd > 0 && n_ff > 0 && n_used > 0 && k > 1) {
                     const int64_t est = (int64_t) cparams.n_ubatch*4*(4*n_embd + 4*n_used*n_ff);
                     reserve = std::min<int64_t>((int64_t) (frac*(double) params.moe_cache_size), (k - 1)*est);
@@ -1610,6 +1619,45 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
                     }
                 }
             }
+            return reserve;
+        };
+        // k17-fnbatch: the 16384 batch without a draft only where it gives up no more of the cache than 8192 and the cache has room
+        // for its graphs (common_lm_nodraft_room); else 8192. G4 k17nbg Flash-Next UD-IQ4_XS 16 GB beside the hybrid gate: 540.51 instead
+        // of 412.00 MiB kept free (cache 4859 vs 4992 MiB), 8k / 30k TTFT +2.0 / +1.0%. LLAMA_MOE_LAYER_MAJOR_BATCH_NODRAFT_ROOM=0: always
+        const int64_t ub_n = (int64_t) cparams.n_ubatch;
+        static const bool nd_room_on = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_NODRAFT_ROOM") == nullptr || atof(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_NODRAFT_ROOM")) > 0.0;
+        if (nd16 && nd_room_on && want > 8192) {
+            const int64_t want_lo = 8192;
+            int64_t est = 0;
+            const bool room = common_lm_nodraft_room(params, ub_n, want, &est);
+            const int64_t r_hi = want    >= 2*ub_n ? reserve_for(want/ub_n)    : 0;
+            const int64_t r_lo = want_lo >= 2*ub_n ? reserve_for(want_lo/ub_n) : 0;
+            if (!room || r_hi > r_lo) {
+                COM_INF("MoE cache: layer-major batch without a draft stays %lld: %s (cache %.2f MiB, %lld graph members of %.2f MiB; "
+                    "kept free %.2f vs %.2f MiB; LLAMA_MOE_LAYER_MAJOR_BATCH_NODRAFT_ROOM=0 for 16384)\n", (long long) want_lo,
+                    !room ? "no room in the cache for the 16384 graphs" : "16384 would take more of the cache", params.moe_cache_size/1048576.0,
+                    (long long) (want/ub_n - 1), est/1048576.0, r_hi/1048576.0, r_lo/1048576.0);
+                want = want_lo;
+            }
+        }
+        if (want >= 2*(int64_t) cparams.n_ubatch && want > (int64_t) cparams.n_batch) {
+            // the server clamps its checkpoint offsets to the old n_batch: the same batches and ubatches as without the raise
+            params.n_batch_ckpt = (int32_t) cparams.n_batch;
+            params.n_batch  = (int32_t) want;
+            cparams.n_batch = (uint32_t) want;
+            // k15-small4: without a draft the context turns layer-major on only with this mark (as the n_ubatch-default branch below sets it;
+            // an explicit -ub, e.g. Studio's --ubatch-size 2048, never reached that branch)
+            if (lm != 1 && !common_spec_draft_model(params)) {
+                common_set_env("LLAMA_MOE_LAYER_MAJOR_AUTO_NODRAFT", "1");
+            }
+            // a merged graph of k ubatches keeps what crosses its cuts for every member; at a large ubatch that is more than the fit leaves
+            // free (G4, Flash-Next UD-IQ4_XS 32 GB + Q8_0 MTP drafter, -ub 2048: 4 ubatches needed 755 MiB, 744 MiB were free, so the group
+            // ran as 2 + 2 and read the experts twice). With LLAMA_MOE_LAYER_MAJOR_RESERVE_FRAC (default 0.025 when the server checkpoint is
+            // one batch back, LLAMA_MOE_LAYER_MAJOR_CKPT=1, else 0) the cache gives up min(frac of itself, (k - 1) x the estimate of one
+            // member: n_ubatch x 4 B x (4 n_embd + 4 n_expert_used n_ff_exp)); LLAMA_MOE_LAYER_MAJOR_RESERVE_MIB=N takes N MiB.
+            // Not by default: with the checkpoint one ubatch back an 8k prompt is a group of 3 (fits) + the checkpoint ubatch, and the 481 MiB
+            // the cache gave up there cost the decode after it 1.9% (hit rate 86.84 -> 86.62%) for no prompt gain (same G4 VM, 8k cell)
+            int64_t reserve = reserve_for((int64_t) cparams.n_batch/(int64_t) cparams.n_ubatch);
             if (reserve > 0 && (int64_t) params.moe_cache_size > 2*reserve) {
                 params.moe_cache_size  -= (size_t) reserve;
                 cparams.moe_cache_size  = params.moe_cache_size;
@@ -1630,11 +1678,17 @@ static void common_moe_cache_auto_ubatch(common_params & params, llama_model_par
     const bool   spill  = lm != 0 && common_experts_on_offloaded_host(params, mparams.tensor_buft_overrides, mparams.n_gpu_layers);
     const auto   set_batch = [&]() {
         if (!params.n_batch_set) {
-            int64_t want = common_lm_batch_default(params);
+            bool nd16 = false;
+            int64_t want = common_lm_batch_default(params, &nd16);
             const int64_t ub_max = getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX") != nullptr ? std::max(1, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX"))) : 16;
             want = std::min<int64_t>(want, ub_max*(int64_t) cparams.n_ubatch);
             if (params.n_ctx > 0) {
                 want = std::min<int64_t>(want, params.n_ctx);
+            }
+            // k17-fnbatch: as for an explicit -ub, 16384 without a draft only where the cache has room for its graphs
+            static const bool nd_room_on = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_NODRAFT_ROOM") == nullptr || atof(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_NODRAFT_ROOM")) > 0.0;
+            if (nd16 && nd_room_on && want > 8192 && !common_lm_nodraft_room(params, (int64_t) cparams.n_ubatch, want)) {
+                want = 8192;
             }
             if (want > (int64_t) cparams.n_batch) {
                 params.n_batch  = (int32_t) want;
