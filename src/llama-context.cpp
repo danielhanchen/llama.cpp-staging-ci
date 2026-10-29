@@ -2198,6 +2198,8 @@ void llama_context::sched_reserve() {
         if (!moe_cache_seed_fits) {
             moe_cache_devseed_fallback();
             moe_cache->seed_unavailable();
+        } else {
+            moe_cache_devseed_fallback(/*host_seed_fits =*/ true);
         }
     }
 
@@ -2371,7 +2373,16 @@ void llama_context::sched_reserve() {
 // decode but costs the prompt 11-14% (its uploads wait for the routing of each layer, the lent slots are refilled after the prompt).
 // A cache of most experts (Flash-Next 64 GB, 92%) keeps the prefill alone: there the decode reads 98.8% from it already.
 // LLAMA_MOE_CACHE_DEVSEED_FALLBACK=0 keeps the prefill without seeding; an explicit LLAMA_MOE_CACHE_DEVSEED or LLAMA_MOE_CACHE_SEED wins
-void llama_context::moe_cache_devseed_fallback() {
+//
+// k19-devseed (host_seed_fits, LLAMA_MOE_CACHE_DEVSEED_PREFER, default 1): where the host seed fits but the fit did not price it (the cache
+// holds the experts of more than LLAMA_FIT_SEED_PRICE_MAX_TOKENS tokens, see seed_price_wanted), the same rule (share, tokens, min_ub)
+// turns the device seed on for the prompt ubatches of min_ub+ tokens only; smaller prompt ubatches keep the host seed (it fits), and nothing
+// is prefilled. Before, the choice followed whether the seed graph fit beside the fit's headroom, i.e. incidental free memory: L4 Flint
+// UD-Q4_K_XL 16 GB ctx 32768 pinned, the host seed fit at the default margin (2k prompt 1006 tok/s, 8k 1408) and did not with 768 MiB
+// more cache (LLAMA_MOE_FIT_MARGIN_MIB=256: device seed, 1670 / 1878). The single-ubatch own-ids host seed makes the uploads of every
+// layer wait for its routing and admits nearly the whole cache again (see seed_price_wanted); the device seed needs no larger graph and
+// no memory beyond the seed plans. =0: the host seed wherever it fits, as before
+void llama_context::moe_cache_devseed_fallback(bool host_seed_fits) {
     if (!moe_cache || moe_cache_devseed_on || model.hparams.no_alloc || prefetch_min_batch == INT64_MAX ||
         getenv("LLAMA_MOE_CACHE_DEVSEED") != nullptr || getenv("LLAMA_MOE_CACHE_SEED") != nullptr) {
         return;
@@ -2379,6 +2390,12 @@ void llama_context::moe_cache_devseed_fallback() {
     const char * env = getenv("LLAMA_MOE_CACHE_DEVSEED_FALLBACK");
     if (env != nullptr && atoi(env) == 0) {
         return;
+    }
+    if (host_seed_fits) {
+        const char * ep = getenv("LLAMA_MOE_CACHE_DEVSEED_PREFER");
+        if ((ep != nullptr && atoi(ep) == 0) || !moe_cache_seed_sync || moe_cache_seed_auto || seed_price_wanted()) {
+            return;
+        }
     }
     // k16-seed: where the fit did not price the host seed (the token gate, or LLAMA_FIT_SEED_PRICE=0), a cache of up to
     // LLAMA_MOE_CACHE_DEVSEED_UNPRICED_MAX_FRAC (0.75) of the host experts takes the device seed: above 0.5 it was only prefilled
@@ -2410,6 +2427,17 @@ void llama_context::moe_cache_devseed_fallback() {
     }
     min_ub = std::max(min_ub, prefetch_min_batch);
     const bool on = frac >= 0.0 && frac <= max_frac && tokens >= min_tokens && (int64_t) cparams.n_ubatch >= min_ub;
+    if (host_seed_fits) {
+        // the host seed stays for the smaller prompt ubatches: no message unless the device seed is on
+        if (on && moe_cache->devseed_init(min_ub)) {
+            moe_cache_devseed_on  = true;
+            moe_cache_devseed_min = min_ub;
+            LLAMA_LOG_INFO("%s: MoE cache: the host seed fits but is not priced (cache = %.1f%% of the host experts, the experts of %.1f tokens): "
+                "prompt ubatches of %" PRId64 "+ tokens seed the cache on the device, smaller ones on the host (LLAMA_MOE_CACHE_DEVSEED_PREFER=0 "
+                "keeps the host seed)\n", __func__, 100.0*frac, tokens, min_ub);
+        }
+        return;
+    }
     if (on && moe_cache->devseed_init(min_ub)) {
         moe_cache_devseed_on = true;
         moe_cache_seed_sync  = false;
@@ -7860,7 +7888,9 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
 
     // LLAMA_MOE_CACHE_SEED=2 (default): read the routing outputs of the previous large ubatch before this graph replaces them, unless this ubatch
     // records newer ones without seeding
-    if (moe_cache_seed_sync && cont && !moe_cache_ids.empty() && n_outputs_ub == 0 && (!large || ((last_large || early) && prefetch))) {
+    // k19-devseed: not for a ubatch that seeds on the device (moe_cache_devseed_min), which does not read them
+    const bool devseed_ub = moe_cache_devseed_on && moe_cache_seed_sync && last_large && prefetch && (int64_t) ubatch.n_tokens >= moe_cache_devseed_min;
+    if (moe_cache_seed_sync && cont && !moe_cache_ids.empty() && n_outputs_ub == 0 && (!large || ((last_large || early) && prefetch)) && !devseed_ub) {
         ggml_backend_sched_synchronize(sched.get());
         std::vector<int32_t> ids_data;
         std::vector<int32_t> counts;
@@ -7899,7 +7929,8 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
     if (last_large) {
         if (!prefetch) {
             moe_cache_seed = true;
-        } else if (moe_cache_devseed_on) {
+        } else if (moe_cache_devseed_on && (!moe_cache_seed_sync || (int64_t) ubatch.n_tokens >= moe_cache_devseed_min)) {
+            // k19-devseed: beside the host seed only the ubatches the device seed plans (see moe_cache_devseed_fallback)
             moe_cache_devseed = true;
         } else if (moe_cache_seed_sync) {
             if (n_outputs_ub == 0 && moe_cache->has_seed_counts()) {

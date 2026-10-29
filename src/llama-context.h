@@ -411,8 +411,9 @@ public:
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
-    // the host seed of a prompt does not fit: large prompt ubatches seed the MoE cache on the device instead (see the definition)
-    void moe_cache_devseed_fallback();
+    // the host seed of a prompt does not fit: large prompt ubatches seed the MoE cache on the device instead (see the definition);
+    // k19-devseed: host_seed_fits = the host seed fits, large prompt ubatches may still seed on the device where its price is not wanted
+    void moe_cache_devseed_fallback(bool host_seed_fits = false);
 
     // reserve the graph of a prefetched ubatch that seeds the MoE cache from its own ids if the devices have room for it (staging_pp:
     // staging memory of the pp graph per backend), returns false if it does not fit
@@ -651,6 +652,7 @@ private:
     bool moe_cache_seed_auto    = false; // LLAMA_MOE_CACHE_SEED unset, n_ubatch >= LLAMA_MOE_CACHE_SEED_AUTO: as LLAMA_MOE_CACHE_SEED=1
     std::unordered_set<const llm_graph_result *> devseed_zeroed; // k15-fn: graphs whose seed plans a disabled prepare zeroed since their build
     bool moe_cache_devseed_on   = false; // LLAMA_MOE_CACHE_DEVSEED: prefetched ubatches seed the cache on the device (see llama_moe_cache::devseed_plan)
+    int64_t moe_cache_devseed_min = INT64_MAX; // k19-devseed: beside the host seed (moe_cache_seed_sync), ubatches of this many tokens seed on the device
     bool moe_cache_devseed      = false; // the ubatch being computed seeds on the device
     bool moe_cache_devseed_graph = false; // the graph last built had its seed plans enabled
     // set once a lent prompt graph with outputs failed to allocate: such graphs keep their last layer at full width from then on (see
