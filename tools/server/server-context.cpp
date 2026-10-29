@@ -60,6 +60,11 @@ static common_speculative_output_limits server_output_limits(const common_params
     return result;
 }
 
+static bool spec_replay_reverify() {
+    static const bool v = getenv("LLAMA_SPEC_REPLAY_REVERIFY") != nullptr && atoi(getenv("LLAMA_SPEC_REPLAY_REVERIFY")) != 0;
+    return v;
+}
+
 // a checkpoint restore dropped tokens the target had accepted - re-accept them rather than verify again
 static std::vector<llama_token> server_accept_replay(
         common_sampler * smpl,
@@ -5602,7 +5607,13 @@ private:
                     accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
-                } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
+                } else if (slot.spec_is_replay && (slot.use_spec_rejection() || !spec_replay_reverify())) {
+                    // k18: greedy replays too re-accept the tokens the first verify accepted. Verifying them again assumes the
+                    // replay batch computes the same argmax as the verify batch; where batch shape and routing change the rows'
+                    // numerics (MoE cache host / device split, CPU misses) a near tie flips between the two batches, each replay
+                    // rolls back again and the request never ends (G4 Qwen3.6-35B-A3B UD-Q4_K_XL 7 GB + Qwen3.5-0.8B draft-simple 4,
+                    // FFN requantized: 12 tokens of the 2k cell, then restore / replay forever, 4 of 4 launches).
+                    // LLAMA_SPEC_REPLAY_REVERIFY=1: verify greedy replays again (the old behaviour)
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 } else if (use_rejection) {
                     accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
