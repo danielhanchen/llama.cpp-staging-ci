@@ -3959,6 +3959,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // node, so the backend's CUDA graph for it is captured again at once instead of an eager warm-up pass plus a capture under a
         // new key (G4 Flash-Next: ~14 ms at each request's first verify)
         static const bool warm_way = getenv("LLAMA_GRAPH_SMALL_WARM_WAY") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_WARM_WAY")) != 0;
+        // fndec (LLAMA_GRAPH_SMALL_WARM_VERIFY=0: 8 uses for verify windows too): a verify window rebuilds its most recently used kept
+        // graph in place once that ran twice. With a variable window (p_min / n-gram drafts) each size runs only a few times between
+        // two KV view growths, so the 8-use rule sent it to another way: a new first node, so a new CUDA graph key, an eager pass and a
+        // fresh instantiation (~6 ms for the 2000-kernel verify graph) instead of a capture the exec update accepts. Two uses still
+        // keep two alternating parameter sets in two ways
+        static const bool warm_verify = getenv("LLAMA_GRAPH_SMALL_WARM_VERIFY") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_WARM_VERIFY")) != 0;
+        const uint64_t warm_min = warm_verify && cparams.verify ? 2 : 8;
         if (way < 0 && warm_way) {
             int mru = -1;
             for (uint32_t w = 0; w < GF_SMALL_WAYS; ++w) {
@@ -3967,7 +3974,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     mru = (int) w;
                 }
             }
-            if (mru >= 0 && gf_res_small_nuse[n_small*GF_SMALL_WAYS + mru] >= 8) {
+            if (mru >= 0 && gf_res_small_nuse[n_small*GF_SMALL_WAYS + mru] >= warm_min) {
                 way = mru;
             }
         }
