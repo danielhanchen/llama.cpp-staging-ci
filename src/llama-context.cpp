@@ -877,7 +877,23 @@ llama_context::llama_context(
                 moe_cache.reset();
             }
         } else if (moe_cache_budget > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, moe_cache_budget, moe_cache_set, wstore.get(), cparams.moe_host_cache_mib);
+            // k18cov: an explicit --moe-cache-mib below the experts of one token runs without the cache (a warning) instead of failing the
+            // context (Granite 4.0-H tiny Q4_K_M, --moe-cache-mib 4); a memory probe of the fit (no_alloc) still gets the exception, its
+            // search handles it. LLAMA_MOE_CACHE_TOO_SMALL_FAIL=1: the context fails as before
+            static const bool too_small_fail = [] {
+                const char * e = getenv("LLAMA_MOE_CACHE_TOO_SMALL_FAIL");
+                return e != nullptr && atoi(e) != 0;
+            }();
+            try {
+                moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, moe_cache_budget, moe_cache_set, wstore.get(), cparams.moe_host_cache_mib);
+            } catch (const llama_moe_cache_too_small & e) {
+                if (model.hparams.no_alloc || too_small_fail) {
+                    throw;
+                }
+                LLAMA_LOG_WARN("%s: %s (%.2f MiB asked): the host experts run without a MoE cache (LLAMA_MOE_CACHE_TOO_SMALL_FAIL=1 to fail instead)\n",
+                        __func__, e.what(), moe_cache_budget/1024.0/1024.0);
+                moe_cache.reset();
+            }
         }
         if (!moe_cache && !wstore && cparams.op_offload && !model.hparams.no_alloc) {
             llama_dense_host_pin(model);
