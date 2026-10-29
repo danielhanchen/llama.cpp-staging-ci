@@ -5182,6 +5182,66 @@ void ggml_backend_sched_use_full_hash(ggml_backend_sched_t sched) {
     sched->hash_set.size = sched->hash_size_full;
 }
 
+// a reserve without a lender (the MoE cache) measures the compute buffers with the prefetched copies bound before the staging arena is
+// allocated: a device whose free memory (plus the buffers it holds) takes less than the arena, the graph and the prefetch headroom runs
+// without the prefetch, as the reserve would after a failed allocation or headroom check, without trying the allocation. The memory fit
+// leaves the arena out of its budget (llama_context::sched_reserve): Qwen3.8-Flash-Next UD-Q4_K_XL at 32 GB (-c 8192 / 32768) and the MTP
+// context of Qwen3.6-35B-A3B UD-Q4_K_XL on a 4 GB T4 logged cudaMalloc out of memory for the compute buffer at every load
+// (GGML_SCHED_PREFETCH_RESERVE_CHECK=0: allocate and fall back as before)
+static void ggml_backend_sched_prefetch_reserve_check(ggml_backend_sched_t sched) {
+    static const bool on = getenv("GGML_SCHED_PREFETCH_RESERVE_CHECK") == nullptr || atoi(getenv("GGML_SCHED_PREFETCH_RESERVE_CHECK")) != 0;
+    if (!on || sched->callback_lend != NULL || sched->pf_headroom == 0 || sched->pf_mode == 0) {
+        return;
+    }
+    bool any = false;
+    for (int b = 0; b < sched->n_backends; b++) {
+        any = any || ggml_backend_sched_prefetch_backend_ok(sched, b);
+    }
+    if (!any) {
+        return;
+    }
+    ggml_backend_sched_prefetch_bind(sched, /*dry =*/ true);
+    size_t sizes[GGML_SCHED_MAX_BACKENDS] = { 0 };
+    ggml_gallocr_measure_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+    for (int i = 0; i < sched->n_splits; i++) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        for (int j = 0; j < split->n_inputs; j++) {
+            struct ggml_tensor * input_cpy = tensor_copy(split->inputs[j], split->backend_id, sched->cur_copy);
+            if (input_cpy != NULL && input_cpy->data == &ggml_backend_sched_dry_placeholder) {
+                input_cpy->data   = NULL;
+                input_cpy->buffer = NULL;
+            }
+        }
+    }
+    for (int b = 0; b < sched->n_backends; b++) {
+        struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+        ggml_backend_dev_t dev = sched->backends[b]->device;
+        if (pf->n_bound == 0 || pf->staging == 0 || dev == NULL || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        size_t free  = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        if (total == 0) {
+            continue;
+        }
+        const size_t held = ggml_gallocr_get_buffer_size(sched->galloc, b) + (pf->arena != NULL ? pf->arena_size : 0);
+        const size_t need = sizes[b] + pf->staging + sched->pf_headroom;
+        if (free + held >= need) {
+            continue;
+        }
+        GGML_LOG_INFO("%s: %s: %.2f MiB of staging memory and %.2f MiB of compute buffers with %.0f MiB of headroom do not fit in %.2f MiB "
+            "free: host weight prefetch not used (GGML_SCHED_PREFETCH_RESERVE_CHECK=0 tries the allocation)\n", __func__,
+            ggml_backend_name(sched->backends[b]), pf->staging/1024.0/1024.0, sizes[b]/1024.0/1024.0, sched->pf_headroom/1024.0/1024.0,
+            (free + held)/1024.0/1024.0);
+        if (pf->arena != NULL || pf->copy_backend != NULL) {
+            ggml_backend_sched_prefetch_sync(sched);
+            ggml_backend_sched_prefetch_release(sched, b);
+        }
+        pf->failed = true;
+    }
+}
+
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
@@ -5215,6 +5275,8 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     ggml_backend_sched_synchronize(sched);
 
     ggml_backend_sched_split_graph(sched, measure_graph);
+
+    ggml_backend_sched_prefetch_reserve_check(sched);
 
     ggml_backend_sched_prefetch_bind(sched, /*dry =*/ false);
 

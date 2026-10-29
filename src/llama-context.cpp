@@ -2103,7 +2103,10 @@ void llama_context::sched_reserve() {
         // split: on a small device its arena does not fit (Kaggle T4 4 GB, Qwen3.6-35B-A3B UD-Q4_K_XL + MTP at ctx 16384: measured 104
         // MiB of compute, the 320 MiB arena failed at load and the compute took 233 MiB with the copies of a split). Only with
         // LLAMA_FIT_MTP_PRICE=1 (common exports its default, see common_fit_mtp_price_on); LLAMA_FIT_STAGING_SPLIT=0: as before
-        if (model.hparams.no_alloc && !moe_cache) {
+        // LLAMA_FIT_STAGING_PRICE=1 (opt-in): the measure keeps the whole arena, so that the fit leaves room for it and the prefetch runs
+        // (the reserve checks the arena next to the compute buffers before allocating either, ggml_backend_sched_prefetch_reserve_check)
+        static const bool staging_price = getenv("LLAMA_FIT_STAGING_PRICE") != nullptr && atoi(getenv("LLAMA_FIT_STAGING_PRICE")) != 0;
+        if (model.hparams.no_alloc && !moe_cache && !staging_price) {
             const char * e_split = getenv("LLAMA_FIT_STAGING_SPLIT"); // set by common for draft-model measures only
             const char * e_price = getenv("LLAMA_FIT_MTP_PRICE");
             const bool mtp_split = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && e_price != nullptr && atoi(e_price) != 0;
