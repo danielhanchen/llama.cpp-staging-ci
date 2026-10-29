@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "llama-vocab.h"
 
 #include "ggml.h"

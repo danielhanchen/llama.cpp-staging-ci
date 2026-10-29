@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "allreduce.cuh"
 
 #if !defined(GGML_USE_MUSA)

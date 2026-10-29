@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #define GGML_COMMON_IMPL_CPP
 #define GGML_COMMON_DECL_CPP
 

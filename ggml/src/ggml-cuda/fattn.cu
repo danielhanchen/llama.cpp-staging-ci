@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"

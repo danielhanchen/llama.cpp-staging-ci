@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "common.cuh"
 
 #define MMVF_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVF kernels.

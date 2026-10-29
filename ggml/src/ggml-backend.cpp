@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 // Note: porting this file to C++ is a work in progress
 
 #ifdef _WIN32

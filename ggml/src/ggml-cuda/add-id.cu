@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "add-id.cuh"
 
 static __global__ void add_id_kernel(

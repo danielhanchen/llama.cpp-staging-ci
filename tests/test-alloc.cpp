@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "ggml-alloc.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "ggml-cpp.h"

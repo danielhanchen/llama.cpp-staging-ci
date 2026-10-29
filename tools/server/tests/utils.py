@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 # -*- coding: utf-8 -*-
 
 # type: ignore[reportUnusedImport]

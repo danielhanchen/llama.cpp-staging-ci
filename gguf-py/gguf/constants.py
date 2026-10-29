@@ -1,3 +1,4 @@
+# Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 from __future__ import annotations
 
 from enum import Enum, IntEnum, auto

@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 //  Tests chat handling, including grammar genration and parsing for tool calling, for various templates.
 //
 //  Also acts as a CLI to generate a Markdown summary of the formats of Jinja templates,

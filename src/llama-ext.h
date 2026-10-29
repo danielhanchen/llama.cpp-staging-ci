@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #pragma once
 
 // this is a staging header for new llama.cpp API

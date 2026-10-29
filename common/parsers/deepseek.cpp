@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "parsers.h"
 
 // The DeepSeek V4 reference implementation renders consecutive tool results into a single

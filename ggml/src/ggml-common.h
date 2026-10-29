@@ -1,3 +1,4 @@
+// Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #ifndef GGML_COMMON_DECL
 
 #if defined(GGML_COMMON_DECL_C)
