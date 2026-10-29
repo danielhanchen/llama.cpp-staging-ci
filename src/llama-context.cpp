@@ -6881,6 +6881,17 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         res += 16u * cparams.n_rs_seq * model.hparams.n_layer();
     }
 
+    // k18cov: LLAMA_EXACT_FA_GROUP=0 (kill switch of the k15-fv grouping) builds one attention per query of a batch invariant verify
+    // batch: 4 views, the mask copy, the attention and the concat per query and layer. The 8 x n_tensors budget of a small dense model
+    // ran out there (T4 Phi-4-mini Q4_K_M, the k15 kill-switch set, n-gram verify window: GGML_ASSERT(obj_new) in ggml_flash_attn_ext)
+    static const bool fa_group_off = [] {
+        const char * e = getenv("LLAMA_EXACT_FA_GROUP");
+        return e != nullptr && atoi(e) == 0;
+    }();
+    if (fa_group_off) {
+        res += 8u * model.hparams.n_layer() * std::min<uint32_t>(n_tokens, 64u);
+    }
+
     if (cparams.training) {
         res *= 4;
     }
