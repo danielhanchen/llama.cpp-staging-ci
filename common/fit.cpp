@@ -60,7 +60,7 @@ bool common_fit_small_device() {
 }
 
 // the margin of a device beside a MoE cache for the default margin m (see common_fit_set_moe_margin_auto)
-static int64_t common_fit_moe_margin(int64_t m, int64_t free_dev, int64_t cache_want) {
+static int64_t common_fit_moe_margin(int64_t m, int64_t free_dev, int64_t cache_want, bool has_drafter) {
     constexpr int64_t MiB_ = 1024*1024;
     constexpr int64_t m_default = 1024*MiB_;
     if (!g_moe_margin_auto || m < m_default) {
@@ -83,7 +83,13 @@ static int64_t common_fit_moe_margin(int64_t m, int64_t free_dev, int64_t cache_
         const char * er  = getenv("LLAMA_MOE_FIT_MARGIN_MAX_RATIO");
         const int64_t mn = (eg != nullptr ? std::max<int64_t>(0, atoll(eg)) : 10)*1024*MiB_;
         const double  mr = er != nullptr ? std::max(0.0, atof(er)) : 1.8;
-        if ((en != nullptr && atoi(en) == 0) || free_dev < mn || (double) cache_want > mr*(double) free_dev) {
+        // k18-margin: never beside a draft model or MTP heads (LLAMA_MOE_FIT_MARGIN_DRAFT=1 allows it). The drafter's runtime pools
+        // (mul_mat_q, CUDA graphs) live in that slack once the MTP draft is priced exactly: k15 head b741bad76b7 + the rule aborted with
+        // CUDA out of memory in every G4 q4x + MTP 12 / 16 GB launch (about 130 MiB free after the cache took +768 MiB), fn1 + MTP 24 GB
+        // at 8k / 16k and 1 of 2 L4 q4x + MTP 12 GB launches; the kill switch and base had 0 aborts
+        const char * ed = getenv("LLAMA_MOE_FIT_MARGIN_DRAFT");
+        const bool draft_ok = ed != nullptr && atoi(ed) != 0;
+        if ((en != nullptr && atoi(en) == 0) || free_dev < mn || (double) cache_want > mr*(double) free_dev || (has_drafter && !draft_ok)) {
             return m;
         }
         return m - m_default + 256*MiB_;
@@ -353,6 +359,7 @@ static void common_params_fit_impl(
         explicit nextn_scope(bool on) : prev(g_fit_nextn) { if (on) { g_fit_nextn = 1; } }
         ~nextn_scope() { g_fit_nextn = prev; }
     } nextn_guard(extra != nullptr && extra->shares_model && common_fit_mtp_price_on());
+    const bool has_drafter = extra != nullptr || mparams->load_mtp; // a draft model or MTP heads beside the target (k18-margin)
 
     dmds_t      dmds_extra;    // memory of the extra model, laid out on the devices of the main model
     std::string key_extra;     // context (and placement, see below) that memory was measured at
@@ -608,7 +615,7 @@ static void common_params_fit_impl(
         for (size_t id = 0; id < nd; id++) {
             if (use_margins && int64_t(dmds[id].mb.total()) > int64_t(dmds_nc[id].mb.total())) {
                 margin_gain += int64_t(margins[id]) - common_fit_moe_margin(int64_t(margins[id]), int64_t(dmds[id].free),
-                    int64_t(dmds[id].mb.total()) - int64_t(dmds_nc[id].mb.total()));
+                    int64_t(dmds[id].mb.total()) - int64_t(dmds_nc[id].mb.total()), has_drafter);
             }
         }
 
