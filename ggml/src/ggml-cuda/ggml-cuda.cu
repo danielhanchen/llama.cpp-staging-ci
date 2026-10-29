@@ -9080,6 +9080,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             const int64_t lt0 = lt_every > 0 ? ggml_time_us() : 0;
             CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
             graph->n_launch_since_capture++;
+            graph->n_launch_total++;
             if (lt_every > 0) {
                 const int bk = cgraph->n_nodes > 1000;
                 lt_n[bk]++; lt_t[bk] += ggml_time_us() - lt0; lt_nodes[bk] += cgraph->n_nodes;
@@ -9176,9 +9177,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 // (a stable graph) and whose properties changed (a rebuilt graph: new request, other KV size) is captured again at once,
                 // without the eager warm-up pass; a graph that changes every call never gets there and warms up as before
                 static const bool direct = getenv("GGML_CUDA_GRAPH_DIRECT_RECAPTURE") == nullptr || atoi(getenv("GGML_CUDA_GRAPH_DIRECT_RECAPTURE")) != 0;
-                if (properties_changed && direct && graph->instance != nullptr && graph->n_launch_since_capture >= 2) {
+                // fndec (GGML_CUDA_GRAPH_DIRECT_ONE=0: two launches as before): a key replayed at least 8 times in all also re-captures
+                // directly after one launch since its capture (a verify window size that changed again before its second use: its KV
+                // view grew), while its direct re-captures keep being followed by an unchanged replay (n_direct_streak < 2)
+                static const bool direct_one = getenv("GGML_CUDA_GRAPH_DIRECT_ONE") == nullptr || atoi(getenv("GGML_CUDA_GRAPH_DIRECT_ONE")) != 0;
+                const int64_t need = direct_one && graph->n_launch_total >= 8 && graph->n_direct_streak < 2 ? 1 : 2;
+                if (properties_changed && direct && graph->instance != nullptr && graph->n_launch_since_capture >= need) {
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
+                    graph->n_direct_streak++;
                 } else if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
@@ -9188,6 +9195,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
+                    graph->n_direct_streak = 0;
                 }
             }
         }

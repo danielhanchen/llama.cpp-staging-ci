@@ -1299,6 +1299,10 @@ struct ggml_cuda_graph {
     // k15-fn: launches of the current exec since its capture (a warm key whose properties change captures again at once, no eager
     // warm-up pass)
     int64_t  n_launch_since_capture = 0;
+    // fndec: launches of this key in all (a decode / verify graph replayed this often is kept past the 10 s age rule, see cuda_graph)
+    // and direct re-captures since the last unchanged replay (a key whose graph changes at every call stops re-capturing directly)
+    int64_t  n_launch_total = 0;
+    int      n_direct_streak = 0;
     int64_t last_used_time = 0;
     struct node_properties {
         ggml_tensor node;
@@ -1782,10 +1786,38 @@ struct ggml_backend_cuda_context {
         const int64_t time_now = ggml_time_us();
 
         // sweep every 5s, evicting cuda graphs unused for >=10s
-        if (time_now - last_graph_eviction_sweep >= 5'000'000) {
+        // fndec (GGML_CUDA_GRAPH_KEEP=0: every key ages out as before): a key launched at least 8 times (a decode or verify window
+        // size) is kept through idle time, so the next request replays it instead of an eager pass, a capture and a ~6 ms
+        // instantiation per window size; at most GGML_CUDA_GRAPH_KEEP_MAX (64) of them, the least recently used beyond that age out.
+        // GGML_CUDA_GRAPH_EVICT_MS sets the age (default 10000; a test of the idle path)
+        static const bool    keep     = getenv("GGML_CUDA_GRAPH_KEEP") == nullptr || atoi(getenv("GGML_CUDA_GRAPH_KEEP")) != 0;
+        static const size_t  keep_max = getenv("GGML_CUDA_GRAPH_KEEP_MAX") ? (size_t) std::max(0, atoi(getenv("GGML_CUDA_GRAPH_KEEP_MAX"))) : 64;
+        static const int64_t evict_us = getenv("GGML_CUDA_GRAPH_EVICT_MS") ? 1000LL * std::max(1, atoi(getenv("GGML_CUDA_GRAPH_EVICT_MS"))) : 10'000'000;
+        if (time_now - last_graph_eviction_sweep >= std::min<int64_t>(5'000'000, evict_us / 2)) {
             last_graph_eviction_sweep = time_now;
-            for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-                if (time_now - it->second->last_used_time >= 10'000'000) {
+            size_t n_kept = 0;
+            if (keep) {
+                std::vector<int64_t> kept_times;
+                for (const auto & [key, graph] : cuda_graphs) {
+                    if (graph->n_launch_total >= 8 && time_now - graph->last_used_time >= evict_us) {
+                        kept_times.push_back(graph->last_used_time);
+                    }
+                }
+                n_kept = kept_times.size();
+                // the oldest of the kept ones beyond keep_max age out
+                int64_t t_cut = INT64_MIN;
+                if (n_kept > keep_max) {
+                    std::nth_element(kept_times.begin(), kept_times.begin() + (n_kept - keep_max - 1), kept_times.end());
+                    t_cut = kept_times[n_kept - keep_max - 1];
+                }
+                for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
+                    const bool old = time_now - it->second->last_used_time >= evict_us;
+                    const bool kept = it->second->n_launch_total >= 8 && it->second->last_used_time > t_cut;
+                    it = old && !kept ? cuda_graphs.erase(it) : std::next(it);
+                }
+            }
+            for (auto it = cuda_graphs.begin(); it != cuda_graphs.end() && !keep; ) {
+                if (time_now - it->second->last_used_time >= evict_us) {
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;
