@@ -2721,7 +2721,20 @@ struct llama_moe_cache::impl {
             policy_env = strcmp(env_p, "inclusive") == 0 ? LLAMA_MOE_HOST_INCLUSIVE : LLAMA_MOE_HOST_EXCLUSIVE;
         }
         const bool force = env != nullptr && atoi(env) > 0;
-        const llama_moe_host_plan plan = llama_moe_host_decide(e_bytes, v_bytes, mapped, avail, token_bytes, host_mib, policy_env, force);
+        // k18-lowram: the tier never plans into a host reserve kept for the rest of the machine (a Studio user's desktop, browser and the
+        // backend live there): LLAMA_MOE_HOST_RESERVE_MIB (default 6144, 0 = the auto budget as before). Only this path reaches it: the tier
+        // exists where the weight store streams the experts, so every host that pins them loads as before. G4 Flash-Next UD-IQ4_XS 32 GB
+        // at 48 GiB RAM without it: 39.7 GB of slots and MemAvailable down to 2.5 GiB during the run
+        size_t reserve = (size_t) 6144 << 20;
+        if (const char * e = getenv("LLAMA_MOE_HOST_RESERVE_MIB")) {
+            reserve = (size_t) std::max<long long>(0, atoll(e)) << 20;
+        }
+        const size_t avail_plan = avail > reserve ? avail - reserve : 0;
+        const llama_moe_host_plan plan = llama_moe_host_decide(e_bytes, v_bytes, mapped, avail_plan, token_bytes, host_mib, policy_env, force);
+        if (reserve > 0 && host_mib < 0) {
+            LLAMA_LOG_INFO("%s: MoE host cache: %.1f MiB available, %.1f MiB kept as the host reserve (LLAMA_MOE_HOST_RESERVE_MIB)\n", __func__,
+                    avail/1048576.0, reserve/1048576.0);
+        }
         if (!plan.on) {
             LLAMA_LOG_INFO("%s: MoE host cache off: %s (%.1f MiB of streamed experts, %.1f MiB in device slots = the experts of %.1f tokens, "
                     "minimum %d, budget %.1f MiB, MemAvailable %.1f MiB; LLAMA_MOE_HOST_CACHE=1 forces it)\n", __func__, plan.why,
