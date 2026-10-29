@@ -472,7 +472,32 @@ static void common_params_fit_impl(
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
-    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    dmds_t dmds_full;
+    try {
+        dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    } catch (const std::runtime_error &) {
+        // k18-fit-small: an explicit MoE cache too small for the experts of one token fails the probe context; the real context runs
+        // without the cache (llama_context, LLAMA_MOE_CACHE_TOO_SMALL_FAIL=1 fails it), so fit what it runs: one warning instead of an
+        // error line (T4 Granite 4.0-H tiny Q4_K_M --moe-cache-mib 4). Only when the same measure without the cache succeeds
+        const char * e_fail = getenv("LLAMA_MOE_CACHE_TOO_SMALL_FAIL");
+        if (cparams->moe_cache_size == 0 || (e_fail != nullptr && atoi(e_fail) != 0)) {
+            throw;
+        }
+        const size_t size_asked = cparams->moe_cache_size;
+        cparams->moe_cache_size = 0;
+        try {
+            dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+        } catch (const std::runtime_error &) {
+            cparams->moe_cache_size = size_asked;
+            throw;
+        }
+        static bool warned = false; // the trial fits of common.cpp measure the same parameters
+        if (!warned) {
+            warned = true;
+            LOG_WRN("%s: a MoE cache of %.2f MiB cannot hold the experts of one token: the host experts run without a MoE cache "
+                "(LLAMA_MOE_CACHE_TOO_SMALL_FAIL=1 to fail instead)\n", __func__, size_asked/(1024.0*1024.0));
+        }
+    }
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
