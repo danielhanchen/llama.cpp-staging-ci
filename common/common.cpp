@@ -4026,6 +4026,28 @@ static bool common_weight_stream_forced(const common_params & params) {
 // are uploaded from pinned staging buffers (Gemma-4 26B-A4B on an L4: 6.0 s vs 7.0-8.2 s with mmap): load without mmap in both cases, as before the host expert check
 // mmap stays only where a feature that is on reads the mapping: the weight stream forced on (and the RAM tier behind it) or a device without the device lookup
 static enum llama_load_mode common_moe_cache_load_mode(const common_params & params, enum llama_load_mode load_mode, int32_t n_gpu_layers) {
+    // k15-fn (LLAMA_MOE_LOWRAM_MAP=0 off): an explicit --load-mode none copies every host expert into pinned memory, which is not
+    // reclaimable; where the host experts and 8 GiB do not fit in the available memory that load is killed for memory (G4 fndl at
+    // 48 GiB: Flash-Next UD-IQ4_XS, 57.4 GB of host experts, rc -9). Load with mmap there instead: the weight store streams the experts
+    // and the MoE cache RAM tier serves them. Never where they fit, so every such host loads as before
+    if (params.moe_cache_size != 0 && load_mode == LLAMA_LOAD_MODE_NONE && (n_gpu_layers < 0 || n_gpu_layers > 1) &&
+            (getenv("LLAMA_MOE_LOWRAM_MAP") == nullptr || atoi(getenv("LLAMA_MOE_LOWRAM_MAP")) != 0) &&
+            common_experts_on_offloaded_host(params, params.tensor_buft_overrides.empty() ? nullptr : params.tensor_buft_overrides.data(), n_gpu_layers)) {
+        common_moe_slot_bytes sb;
+        const uint64_t expert_bytes = common_moe_slot_bytes_of(params.model.path, sb) && sb.total > 0 ? (uint64_t) sb.total : 0;
+        uint64_t avail = common_available_memory();
+        if (ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+            size_t mem_free = 0, mem_total = 0;
+            ggml_backend_dev_memory(cpu, &mem_free, &mem_total);
+            const uint64_t m = std::min(mem_free, mem_total);
+            avail = avail > 0 ? std::min<uint64_t>(avail, m) : m;
+        }
+        if (expert_bytes > 0 && avail > 0 && expert_bytes + (UINT64_C(8) << 30) > avail) {
+            COM_INF("MoE cache: --load-mode none would pin %.0f MiB of host experts with %.0f MiB of memory available: loading with mmap, "
+                "the experts are streamed through the RAM tier (LLAMA_MOE_LOWRAM_MAP=0 keeps --load-mode none)\n", expert_bytes/1048576.0, avail/1048576.0);
+            return LLAMA_LOAD_MODE_AUTO;
+        }
+    }
     if (params.moe_cache_size <= 0 || load_mode != LLAMA_LOAD_MODE_AUTO || !(n_gpu_layers < 0 || n_gpu_layers > 1) || common_weight_stream_forced(params)) {
         return load_mode;
     }
