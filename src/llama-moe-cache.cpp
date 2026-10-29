@@ -2735,7 +2735,10 @@ struct llama_moe_cache::impl {
         // but the budget without it holds them: the budget is that complement + 1 GiB, so resident mode stays and the reserve gets the
         // rest. G4 Flash-Next 32 GB at 48 GiB: the full 6 GiB reserve left 35.4 GB for 35.4 GB of complement, resident mode was lost and
         // the 8k / 16k cells read 12.0 / 18.3 GB from disk (TTFT 85 / 147 s, decode 25 / 34 tok/s against 63 / 96 s, 55 / 59 tok/s)
-        if (reserve > 0 && host_mib < 0 && e_bytes > v_bytes) {
+        // LLAMA_MOE_HOST_RESERVE_STRICT=1: the whole reserve even where it costs resident mode (the misses then come from the files:
+        // with --weight-stream-io buffered from the page cache, which the host can reclaim)
+        const bool reserve_strict = getenv("LLAMA_MOE_HOST_RESERVE_STRICT") != nullptr && atoi(getenv("LLAMA_MOE_HOST_RESERVE_STRICT")) != 0;
+        if (reserve > 0 && host_mib < 0 && e_bytes > v_bytes && !reserve_strict) {
             const size_t need = e_bytes - v_bytes + ((size_t) 1 << 30);
             const llama_moe_host_plan full = llama_moe_host_decide(e_bytes, v_bytes, mapped, avail, token_bytes, host_mib, policy_env, force);
             if (full.on && full.budget >= need && (!plan.on || plan.budget < need)) {
@@ -9175,7 +9178,10 @@ void llama_moe_cache::seed_unavailable() {
 }
 
 bool llama_moe_cache::resident_union() const {
-    return pimpl->host && pimpl->host->exclusive() && pimpl->host_spare && pimpl->resident_mode;
+    // resident mode alone (>= LLAMA_MOE_RESIDENT_MIN_FRAC of the experts in RAM + device slots): with the host reserve the tier can
+    // hold the complement without spare room (G4 fndl 48 GiB, full 6 GiB reserve: 15045 + 9253 slots for 24576 experts), and prompt
+    // seeds there demoted 151 GB and read 12 GB from disk per 8k prompt
+    return pimpl->host && pimpl->host->exclusive() && pimpl->resident_mode;
 }
 
 void llama_moe_cache::seeds_off() {
