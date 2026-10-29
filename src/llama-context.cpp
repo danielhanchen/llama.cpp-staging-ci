@@ -7997,11 +7997,25 @@ void llama_context::moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_ou
     }
 
     moe_cache_seeded    = moe_cache_seed || moe_cache_seed_prev || moe_cache_devseed;
+    const bool devseeded = moe_cache_devseed;
     moe_cache_devseed   = false;
     const bool recorded = moe_cache_record;
     moe_cache_seed      = false;
     moe_cache_seed_prev = false;
     moe_cache_record    = false;
+
+    // k19-devseed (LLAMA_MOE_CACHE_DEVSEED_REFILL_ROUTED, default 1): a ubatch that seeded on the device beside the host seed (see
+    // moe_cache_devseed_fallback) leaves the lent slots to the experts they held before the prompt, where the host seed refills them with
+    // the next most used experts of the ubatch: they get the experts its routing used most instead (the same number of uploads when the
+    // slots come back, see llama_moe_cache unlend). G4 Flint UD-Q4_K_XL 16 GB, defaults (CPU misses on): decode hit rate 89.8% held before
+    // vs 90.9% with the host seed. =0: the experts held before
+    if (devseeded && moe_cache_seed_sync && recorded && !moe_cache_ids.empty()) {
+        static const bool refill_env = getenv("LLAMA_MOE_CACHE_DEVSEED_REFILL_ROUTED") == nullptr || atoi(getenv("LLAMA_MOE_CACHE_DEVSEED_REFILL_ROUTED")) != 0;
+        if (refill_env) {
+            moe_cache->set_refill_routed_once(true);
+            moe_cache_refill_from_ids();
+        }
+    }
 
     // the prompt ends at a ubatch with outputs (or a failed one), the next one may belong to another prompt
     if (n_outputs_ub != 0 || ubatch.n_seqs_unq != 1) {
