@@ -58,9 +58,20 @@ llama_memory_recurrent::llama_memory_recurrent(
                 (ggml_backend_buffer_is_host(t->buffer) ? on_host : on_dev) = true;
             }
             want = on_host && on_dev;
-            LLAMA_LOG_INFO("%s: delta-net rollback: %s (LLAMA_RS_REPLAY auto: layer weights %s; =1 / =0 forces replay / snapshot rows)\n",
-                    __func__, want ? "replay" : "snapshot rows", on_host && on_dev ? "spill to host memory" :
-                    on_dev ? "all on a device" : "all in host memory");
+            // k19-npmtp: several sequences (llama-server --parallel N) keep the snapshot rows. With replay a window waits uncommitted
+            // until the next ubatch of its cell, and find_slot moves cells to gather a multi-sequence ubatch: G4 Qwen3.8-Flash-Next +
+            // MTP -np 4 --kv-unified, four overlapping requests, a later ubatch of the same decode moved the cell of a verify window
+            // before its rollback (seq_rm refused, server abort), and the 8k reply differed from its single-slot text.
+            // LLAMA_RS_REPLAY_MULTI=1: replay with several sequences too (the k16 behaviour)
+            const char * em = getenv("LLAMA_RS_REPLAY_MULTI");
+            const bool multi_ok = em != nullptr && atoi(em) != 0;
+            const bool multi    = n_seq_max > 1 && !multi_ok;
+            const bool spill    = on_host && on_dev;
+            want = spill && !multi;
+            LLAMA_LOG_INFO("%s: delta-net rollback: %s (LLAMA_RS_REPLAY auto: layer weights %s%s; =1 / =0 forces replay / snapshot rows)\n",
+                    __func__, want ? "replay" : "snapshot rows", spill ? "spill to host memory" :
+                    on_dev ? "all on a device" : "all in host memory",
+                    spill && multi ? ", but several sequences (LLAMA_RS_REPLAY_MULTI=1: replay)" : "");
         }
         replay = can && want;
         const char * es = getenv("LLAMA_RS_REPLAY_SCOPED");
