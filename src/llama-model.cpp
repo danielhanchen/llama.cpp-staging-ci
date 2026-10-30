@@ -2134,6 +2134,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 // and the verifier's residual max(0, p - q) covers the target tokens outside it.
 //   LLAMA_MTP_DRAFT_VOCAB=n (default 65536, 0: off; 32768 lost 2-3% on Qwen3.6 8 GB chat), LLAMA_MTP_DRAFT_VOCAB_FILE=path
 //   (int32 token ids, as open-jet's draft_vocab_32k.bin), else the GGUF array tokenizer.ggml.draft_vocab, else llama_vocab::draft_vocab (merge rank / score)
+// k19-amxmtp: whether the rows of a weight in this buffer type read back in their plain layout (ggml_backend_tensor_get). A device
+// buffer and the plain CPU / pinned host buffers do; a CPU extra buffer type (AMX, CPU_REPACK, KleidiAI: not host memory, on the CPU
+// device) holds a repacked layout and AMX has no get_tensor at all (a null call: the MTP drafter segfaulted at load on AMX CPUs)
+static bool llama_buft_rows_readable(ggml_backend_buffer_type_t bt) {
+    if (bt == ggml_backend_cpu_buffer_type() || strstr(ggml_backend_buft_name(bt), "_Host") != nullptr) {
+        return true;
+    }
+    if (ggml_backend_buft_is_host(bt)) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(bt);
+    return dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+}
+
 void llama_model_base::load_tensors_draft_head(llama_model_loader & ml, bool dry) {
     draft_head = {};
     if (hparams.n_layer_nextn == 0) {
@@ -2179,7 +2193,7 @@ void llama_model_base::load_tensors_draft_head(llama_model_loader & ml, bool dry
     const bool src_borrowed = src == output && ml.output_borrowed;
     if (src_borrowed) {
         ggml_backend_buffer_type_t bt = ggml_backend_buffer_get_type(src->buffer);
-        const bool plain = !ggml_backend_buft_is_host(bt) || bt == ggml_backend_cpu_buffer_type() || strstr(ggml_backend_buft_name(bt), "_Host") != nullptr;
+        const bool plain = llama_buft_rows_readable(bt);
         if (!plain || !ggml_is_contiguous(src)) {
             LLAMA_LOG_WARN("%s: the borrowed MTP head %s is not readable in its plain layout (%s), keeping the full-vocabulary draft head\n",
                     __func__, ggml_get_name(src), ggml_backend_buft_name(bt));
@@ -2243,8 +2257,7 @@ void llama_model_base::load_tensors_draft_head(llama_model_loader & ml, bool dry
     if (dry && src == output && ml.output_dry_buft != nullptr) {
         buft = ml.output_dry_buft; // the borrowed head stays with the target; the draft head made from it is the draft's (device) memory
     }
-    const bool can_read = !ggml_backend_buft_is_host(buft) || buft == ggml_backend_cpu_buffer_type() ||
-            strstr(ggml_backend_buft_name(buft), "_Host") != nullptr;
+    const bool can_read = llama_buft_rows_readable(buft);
     const char * env_ctx = getenv("LLAMA_MTP_DRAFT_VOCAB_CTX");
     const int32_t n_ctx_rows = can_read ? std::max(0, env_ctx ? atoi(env_ctx) : 4096) : 0;
     n_sub = n_base + n_ctx_rows;
