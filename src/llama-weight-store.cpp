@@ -1330,6 +1330,19 @@ size_t llama_weight_store::ram_available() {
             avail = avail == 0 ? (size_t) s : std::min(avail, (size_t) s);
         }
     }
+    // LLAMA_SYSMEM_LOG=1 (diagnostic, once): the readings that make up the value, with the pre-k19 root credit beside the current one
+    static const bool sysmem_log = [] { const char * e = getenv("LLAMA_SYSMEM_LOG"); return e != nullptr && atoi(e) != 0; }();
+    static bool sysmem_logged = false;
+    if (sysmem_log && !sysmem_logged) {
+        sysmem_logged = true;
+        const uint64_t root_new = llama_sysmem::cgroup_v2_dir_available("/sys/fs/cgroup", false);
+        const uint64_t root_old = llama_sysmem::cgroup_v2_dir_available("/sys/fs/cgroup", true);
+        const uint64_t wk       = llama_sysmem::available();
+        auto mib = [](uint64_t v) { return v == UINT64_MAX ? -1.0 : v/1048576.0; };
+        LLAMA_LOG_INFO("%s: ram_available %.1f MiB: cgroup v2 root read %.1f MiB (memory.stat file credited: %.1f MiB; -1 = no limit), "
+            "cgroup walk %.1f MiB (%s), credit_file %d (LLAMA_SYSMEM_LOG)\n", __func__, avail/1048576.0, mib(root_new), mib(root_old), mib(wk),
+            walk ? "used" : "off: LLAMA_SYSMEM_CGROUP_WALK=0", (int) (getenv("LLAMA_SYSMEM_CREDIT_FILE") && atoi(getenv("LLAMA_SYSMEM_CREDIT_FILE"))));
+    }
     return avail;
 #endif
 }
