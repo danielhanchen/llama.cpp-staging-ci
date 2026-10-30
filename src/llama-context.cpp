@@ -1017,7 +1017,7 @@ llama_context::llama_context(
         } else if (tiny_force > 0 && moe_cache && !model.hparams.no_alloc && (int64_t) cparams.n_ubatch > tiny_force) {
             tiny_rel_ub     = tiny_force;
             tiny_rel_res_ub = tiny_force;
-            tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") == nullptr || atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0;
+            tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") != nullptr && atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0;
             lm_enabled      = false;
             LLAMA_LOG_INFO("%s: MoE cache: ubatches of more than %d tokens run with the cache banks released (LLAMA_MOE_TINY_RELEASE_FORCE)\n", __func__, tiny_force);
         } else if (const char * e = getenv("LLAMA_MOE_TINY_RELEASE"); e != nullptr && *e != '\0' && moe_cache && !model.hparams.no_alloc &&
@@ -1027,7 +1027,7 @@ llama_context::llama_context(
                     cparams.moe_cache_size == (size_t) cache_b) {
                 tiny_rel_ub     = (int64_t) ub_d;
                 tiny_rel_res_ub = (int64_t) ub_d;
-                tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") == nullptr || atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0;
+                tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") != nullptr && atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0;
                 if (lm_enabled) {
                     lm_enabled = false;
                 }

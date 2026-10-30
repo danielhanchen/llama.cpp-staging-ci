@@ -1982,13 +1982,46 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
                     // k19-tiny-ub (LLAMA_MOE_PREFILL_UB_TINY_RELEASE=0: the growth is taken from the cache for good, as before): the larger
                     // n_ubatch is for prompts only, so the cache keeps its size (less any KV growth, none by the rule above) and frees its
                     // banks while ubatches of more than the default n_ubatch run; the next ubatch of at most that many tokens frees the
-                    // compute buffers (also an MTP drafter's) and allocates and refills the banks again (llama_context::tiny_rel_enter /
-                    // tiny_rel_leave). Decode then reads the cache of the default n_ubatch with the prompt of the larger one. T4 6 GB,
-                    // Qwen3.6-35B-A3B + MTP: the rule took 590 / 974 MiB of 1141 / 1398 MiB (q4x / q3m) and kept them through decode (chat
-                    // decode 33 vs 39 tok/s at the default n_ubatch). Single device, no separate draft model (its compute buffers are not freed)
+                    // compute buffers (also an MTP drafter's) and allocates and refills the banks again with the experts they held
+                    // (llama_context::tiny_rel_enter / tiny_rel_leave). Decode then reads the cache of the default n_ubatch with the prompt
+                    // of the larger one. T4 6 GB, Qwen3.6-35B-A3B + MTP: the rule took 576 / 974 MiB of 1141 / 1398 MiB (q4x / q3m) and kept
+                    // them through decode (chat decode 33.5 / 38.6 tok/s, released: 38.6 / 50.2). Single device, no separate draft model
+                    // (its compute buffers are not freed)
+                    // Only where the whole cache holds the experts of at least LLAMA_MOE_PREFILL_UB_TINY_RELEASE_MIN_TOKENS (1.5) tokens: below
+                    // that the decode misses most experts of a token with or without the growth, so it gains little, while every prompt
+                    // refills the whole cache after it and stages from the host the experts the smaller cache would have copied on the
+                    // device (L4 LFM2.5-24B-A2B 4 GB, 1.2 tokens: e2e chat / 2k / 8k 1.04 / 1.03 / 0.96 of the rule before; T4 Qwen3.6-35B-A3B
+                    // + MTP 6 GB, 1.6 / 2.3 tokens (q4x / q3m): 1.14 / 1.15 / 1.08 and 1.27 / 1.20 / 1.11)
                     static const bool tiny_rel_env = getenv("LLAMA_MOE_PREFILL_UB_TINY_RELEASE") == nullptr || atoi(getenv("LLAMA_MOE_PREFILL_UB_TINY_RELEASE")) != 0;
+                    double tiny_rel_min_tokens = 1.5;
+                    if (const char * e = getenv("LLAMA_MOE_PREFILL_UB_TINY_RELEASE_MIN_TOKENS")) {
+                        tiny_rel_min_tokens = std::max(0.0, atof(e));
+                    }
+                    // and only while the host keeps the experts the refill reads (as the spill lending: the host experts at most
+                    // LLAMA_MOE_SPILL_LEND_MAX_RAM_FRAC (0.5) of the RAM, Linux; not with --load-mode none, which streams them from the files)
+                    bool tiny_rel_ram = params.load_mode != LLAMA_LOAD_MODE_NONE;
+#ifdef __linux__
+                    if (tiny_rel_ram) {
+                        double ram_frac = 0.5;
+                        if (const char * e = getenv("LLAMA_MOE_SPILL_LEND_MAX_RAM_FRAC")) {
+                            ram_frac = std::max(0.0, atof(e));
+                        }
+                        if (FILE * fm = fopen("/proc/meminfo", "r")) {
+                            char line[256];
+                            long long total_kb = 0;
+                            while (fgets(line, sizeof(line), fm)) {
+                                if (sscanf(line, "MemTotal: %lld kB", &total_kb) == 1) {
+                                    break;
+                                }
+                            }
+                            fclose(fm);
+                            tiny_rel_ram = total_kb <= 0 || std::max(0.0, (double) sbt.total - (double) cache) <= ram_frac*(double) total_kb*1024.0;
+                        }
+                    }
+#endif
                     const int64_t kv_grow  = std::max<int64_t>(0, kv_t(m_t) - kv_t(m_def));
-                    const bool    tiny_rel = tiny_rel_env && m_t.n_dev == 1 && m_def.n_dev == 1 && !has_draft;
+                    const bool    tiny_rel = tiny_rel_env && m_t.n_dev == 1 && m_def.n_dev == 1 && !has_draft && tokens >= tiny_rel_min_tokens &&
+                        tiny_rel_ram;
                     const int64_t cache_t  = cache - (tiny_rel ? kv_grow : taken_t);
                     if (tiny_rel) {
                         COM_INF("MoE cache: n_ubatch = %u (default %u, rule: tiny cache, the experts of %.1f tokens < %.1f, experts spill): +%.2f MiB of compute "
