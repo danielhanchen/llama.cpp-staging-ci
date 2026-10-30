@@ -1691,22 +1691,13 @@ static std::vector<llama_context *> llama_mtp_ctxs_of(const llama_context * self
 }
 
 // k19-tiny-ub: the banks are released for the graphs of ubatches larger than the cache was sized for. The CUDA pools of this context
-// and of its MTP drafters are marked first, so what the larger graphs make them grow is given back before the banks return
+// are marked first, so what the larger graphs make them grow is given back before the banks return (as for a released layer-major group)
 void llama_context::tiny_rel_enter(const char * why) {
     if (tiny_rel_held || !moe_cache || moe_cache->released()) {
         return;
     }
-    // (the first reserve runs before the scheduler exists)
-    if (sched) {
-        ggml_backend_sched_synchronize(sched.get());
-    }
+    ggml_backend_sched_synchronize(sched.get());
     pool_mark_trim_dev(false);
-    for (llama_context * c : llama_mtp_ctxs_of(this, model)) {
-        if (c->sched) {
-            c->synchronize();
-        }
-        c->pool_mark_trim_dev(false);
-    }
     tiny_rel_held = moe_cache->release();
     tiny_rel_n_enter += tiny_rel_held ? 1 : 0;
     if (!tiny_rel_held) {
@@ -1717,7 +1708,7 @@ void llama_context::tiny_rel_enter(const char * why) {
 }
 
 // before a ubatch the cache was sized for: this context's and its MTP drafters' device compute buffers are freed (their next graphs
-// allocate what they need), the pools give back what they grew past the mark, then the banks are allocated again and refilled
+// allocate what they need), this context's pools give back what they grew past the mark, then the banks are allocated again and refilled
 void llama_context::tiny_rel_leave() {
     if (!tiny_rel_held) {
         return;
@@ -1728,15 +1719,23 @@ void llama_context::tiny_rel_leave() {
     moe_cache_seq      = -1;
     moe_cache_pos_next = -1;
     moe_cache->clear_seed_counts();
-    size_t freed = release_device_compute();
+    // this context's compute buffers are freed as at the end of a released layer-major group (its graph results stay: this runs inside
+    // decode), the drafters' as for a layer-major group beside a kept drafter (release_device_compute, k17-small)
+    size_t freed = 0;
+    for (auto & bk : backend_ptrs) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(bk);
+        if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            freed += ggml_backend_sched_get_buffer_size(sched.get(), bk);
+        }
+    }
+    ggml_backend_sched_free_device_buffers(sched.get());
     size_t freed_dft = 0;
-    size_t trimmed   = pool_mark_trim_dev(true);
     for (llama_context * c : llama_mtp_ctxs_of(this, model)) {
         if (c->sched) {
             freed_dft += c->release_device_compute();
         }
-        trimmed += c->pool_mark_trim_dev(true);
     }
+    const size_t trimmed = pool_mark_trim_dev(true);
     moe_cache->restore();
     tiny_rel_held = false;
     tiny_rel_n_leave++;
