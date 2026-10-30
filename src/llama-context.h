@@ -905,6 +905,20 @@ private:
     void small_plan_free(uint32_t i);
     size_t release_device_compute(); // k17-small: frees the device compute buffers (an MTP drafter beside its target's prompt group)
 
+    // k19-tiny-ub (common's tiny-cache n_ubatch rule, LLAMA_MOE_TINY_RELEASE set by common; LLAMA_MOE_PREFILL_UB_TINY_RELEASE=0 off): the
+    // MoE cache banks are released while ubatches of more than tiny_rel_ub tokens run (their compute buffers grow in that memory) and
+    // allocated and refilled before the next ubatch of at most tiny_rel_ub tokens, after this context's and its MTP drafters' device
+    // compute buffers are freed
+    int64_t tiny_rel_ub      = 0;     // > 0: on (the default n_ubatch the cache was sized for)
+    bool    tiny_rel_held    = false; // the banks are released by tiny_rel_enter
+    bool    tiny_rel_routed  = true;  // LLAMA_MOE_TINY_RELEASE_ROUTED=0: the slots come back with the experts they held before
+    int64_t tiny_rel_n_enter = 0;
+    int64_t tiny_rel_n_leave = 0;
+    double  tiny_rel_ms      = 0.0;   // host time of the restores (frees, trims, bank allocation, refill)
+    size_t  pool_mark_trim_dev(bool trim); // mark / trim the CUDA pools of this context's backends (ggml_backend_pool_mark_trim)
+    void    tiny_rel_enter(const char * why);
+    void    tiny_rel_leave();
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
     // k15-pp: unmasked next-n rows (MTP) in their own host buffer, sized by the batches that copy them to the host instead of n_batch

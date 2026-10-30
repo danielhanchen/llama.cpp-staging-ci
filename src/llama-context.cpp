@@ -979,6 +979,24 @@ llama_context::llama_context(
                 moe_cache->set_mem_reserve(backend_ptrs[i], mem_reserve[i]);
             }
         }
+        // k19-tiny-ub: the context common's tiny-cache rule sized ("<default n_ubatch>:<n_ubatch>:<cache bytes>"): its cache keeps the size
+        // of the default n_ubatch and is released while larger ubatches run, starting with the reserve below (see tiny_rel_enter)
+        if (const char * e = getenv("LLAMA_MOE_TINY_RELEASE"); e != nullptr && *e != '\0' && moe_cache && !model.hparams.no_alloc &&
+                cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+            unsigned long long ub_d = 0, ub_t = 0, cache_b = 0;
+            if (sscanf(e, "%llu:%llu:%llu", &ub_d, &ub_t, &cache_b) == 3 && ub_d > 0 && ub_t > ub_d && cparams.n_ubatch == ub_t &&
+                    cparams.moe_cache_size == (size_t) cache_b) {
+                tiny_rel_ub     = (int64_t) ub_d;
+                tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") == nullptr || atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0;
+                if (lm_enabled) {
+                    lm_enabled = false;
+                }
+                LLAMA_LOG_INFO("%s: MoE cache: ubatches of more than %lld tokens (up to n_ubatch %u) run with the cache banks released, the next "
+                    "smaller ubatch frees the compute buffers and refills the banks (%s; LLAMA_MOE_PREFILL_UB_TINY_RELEASE=0 off)\n", __func__,
+                    (long long) tiny_rel_ub, cparams.n_ubatch, tiny_rel_routed ? "with the experts the last large ubatch routed most" :
+                    "with the experts they held before");
+            }
+        }
 
         sched_reserve();
 
@@ -1638,6 +1656,91 @@ size_t llama_context::release_device_compute() {
     return bytes;
 }
 
+size_t llama_context::pool_mark_trim_dev(bool trim) {
+    size_t freed = 0;
+    for (auto & bk : backend_ptrs) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(bk);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto fn = reg ? (size_t (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_pool_mark_trim") : nullptr;
+        if (fn != nullptr) {
+            freed += fn(bk, trim);
+        }
+    }
+    return freed;
+}
+
+// the MTP drafters on this context's model (their compute buffers grow with the prompt too)
+static std::vector<llama_context *> llama_mtp_ctxs_of(const llama_context * self, const llama_model & model) {
+    std::vector<llama_context *> out;
+    std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
+    for (llama_context * c : llama_mtp_ctxs) {
+        if (c != self && &c->get_model() == &model) {
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
+// k19-tiny-ub: the banks are released for the graphs of ubatches larger than the cache was sized for. The CUDA pools of this context
+// and of its MTP drafters are marked first, so what the larger graphs make them grow is given back before the banks return
+void llama_context::tiny_rel_enter(const char * why) {
+    if (tiny_rel_held || !moe_cache || moe_cache->released()) {
+        return;
+    }
+    ggml_backend_sched_synchronize(sched.get());
+    pool_mark_trim_dev(false);
+    for (llama_context * c : llama_mtp_ctxs_of(this, model)) {
+        c->synchronize();
+        c->pool_mark_trim_dev(false);
+    }
+    tiny_rel_held = moe_cache->release();
+    tiny_rel_n_enter += tiny_rel_held ? 1 : 0;
+    if (!tiny_rel_held) {
+        LLAMA_LOG_WARN("%s: MoE cache: the banks could not be released (%s): ubatches of up to %u tokens run beside the full cache\n", __func__, why, cparams.n_ubatch);
+    } else if (tiny_rel_n_enter <= 3) {
+        LLAMA_LOG_INFO("%s: MoE cache banks released (%s, %lld)\n", __func__, why, (long long) tiny_rel_n_enter);
+    }
+}
+
+// before a ubatch the cache was sized for: this context's and its MTP drafters' device compute buffers are freed (their next graphs
+// allocate what they need), the pools give back what they grew past the mark, then the banks are allocated again and refilled
+void llama_context::tiny_rel_leave() {
+    if (!tiny_rel_held) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    // the routing kept for a seed lives in the compute buffers freed here
+    moe_cache_ids.clear();
+    moe_cache_seq      = -1;
+    moe_cache_pos_next = -1;
+    moe_cache->clear_seed_counts();
+    size_t freed = release_device_compute();
+    size_t freed_dft = 0;
+    size_t trimmed   = pool_mark_trim_dev(true);
+    for (llama_context * c : llama_mtp_ctxs_of(this, model)) {
+        freed_dft += c->release_device_compute();
+        trimmed   += c->pool_mark_trim_dev(true);
+    }
+    moe_cache->restore();
+    tiny_rel_held = false;
+    tiny_rel_n_leave++;
+    const double ms = (ggml_time_us() - t0)/1e3;
+    tiny_rel_ms += ms;
+    if (tiny_rel_n_leave <= 3) {
+        size_t fr = 0, tot = 0;
+        for (auto & bk : backend_ptrs) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(bk);
+            if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                ggml_backend_dev_memory(dev, &fr, &tot);
+                break;
+            }
+        }
+        LLAMA_LOG_INFO("%s: MoE cache banks back (%lld): %.2f MiB of compute buffers freed (MTP drafters %.2f MiB), %.2f MiB of CUDA pools "
+            "given back, %.1f MiB free after the refill, %.1f ms\n", __func__, (long long) tiny_rel_n_leave, freed/1048576.0, freed_dft/1048576.0,
+            trimmed/1048576.0, fr/1048576.0, ms);
+    }
+}
+
 void llama_context::gf_res_epoch_bump(int line) {
     gf_res_epoch++;
     static const bool why = getenv("LLAMA_GRAPH_SMALL_WHY") != nullptr && atoi(getenv("LLAMA_GRAPH_SMALL_WHY")) > 0;
@@ -1650,6 +1753,11 @@ void llama_context::gf_res_epoch_bump(int line) {
 
 llama_context::~llama_context() {
     nextn_join();
+    if (tiny_rel_ub > 0) {
+        LLAMA_LOG_INFO("%s: MoE cache tiny-cache release (LLAMA_MOE_PREFILL_UB_TINY_RELEASE): %lld releases, %lld restores, %.1f ms restoring "
+            "(%.1f ms each)\n", __func__, (long long) tiny_rel_n_enter, (long long) tiny_rel_n_leave, tiny_rel_ms,
+            tiny_rel_n_leave > 0 ? tiny_rel_ms/tiny_rel_n_leave : 0.0);
+    }
     if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
         std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
         llama_mtp_ctxs.erase(std::remove(llama_mtp_ctxs.begin(), llama_mtp_ctxs.end(), this), llama_mtp_ctxs.end());
@@ -2051,6 +2159,11 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
+
+    // k19-tiny-ub: the worst-case graph is of n_ubatch tokens, larger than the cache was sized for: it is reserved with the banks released
+    if (tiny_rel_ub > 0 && moe_cache && !moe_cache->released()) {
+        tiny_rel_enter("reserve");
+    }
 
     const int64_t t_start_us = ggml_time_us();
 
@@ -4620,6 +4733,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             wstore->set_wrap(!(n_outputs > 0 && n_outputs < ubatch.n_tokens));
         }
 
+        // k19-tiny-ub: a ubatch of more than the default n_ubatch runs with the cache banks released, the next smaller one gets them back
+        if (tiny_rel_ub > 0 && moe_cache) {
+            if ((int64_t) ubatch.n_tokens > tiny_rel_ub) {
+                if (!moe_cache->released()) {
+                    tiny_rel_enter("prompt");
+                }
+            } else if (tiny_rel_held) {
+                tiny_rel_leave();
+            }
+        }
+        const bool tiny_rel_now = tiny_rel_held && moe_cache && moe_cache->released();
+        bool tiny_rel_record = false;
+
         // the MoE cache only serves batches of up to 32 tokens, the end of a prompt seeds it for the generation that follows
         if (moe_cache) {
             // CPU misses: the rule decides per batch size from the miss rate of the device lookups (see llama_moe_cache::cpu_miss_tick),
@@ -4634,7 +4760,21 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
             const bool large      = !moe_cache->small_batch(ubatch.n_tokens);
             const bool last_large = large && n_tokens_all - n_tokens_prev - ubatch.n_tokens <= llama_moe_cache::n_small_max;
-            moe_cache_seed_begin(ubatch, last_large, n_outputs, moe_seed_early != 0 && large && !last_large);
+            if (tiny_rel_now) {
+                // k19-tiny-ub: released banks take no seed (no slots to admit into); the last large ubatch records its routing for the
+                // refill instead (see tiny_rel_leave)
+                const bool seed_on = moe_cache_seed_enabled;
+                moe_cache_seed_enabled = false;
+                moe_cache_seed_begin(ubatch, last_large, n_outputs, false);
+                moe_cache_seed_enabled = seed_on;
+                if (tiny_rel_routed && last_large && prefetch_min_batch != INT64_MAX) {
+                    moe_cache_ids.clear();
+                    moe_cache_record = true;
+                    tiny_rel_record  = true;
+                }
+            } else {
+                moe_cache_seed_begin(ubatch, last_large, n_outputs, moe_seed_early != 0 && large && !last_large);
+            }
             if (large) {
                 moe_cache->count_large_ubatch();
             }
@@ -4648,6 +4788,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         cparams.batch_invariant = false;
         cparams.exact_split     = 0;
 
+        if (tiny_rel_record) {
+            // k19-tiny-ub: the slots that come back get the experts this ubatch routed most (read before its compute buffers are freed)
+            if (res && !moe_cache_ids.empty()) {
+                moe_cache->set_refill_routed_once(true);
+                moe_cache_refill_from_ids();
+            }
+            moe_cache_ids.clear();
+            moe_cache_record = false;
+        }
         if (moe_cache) {
             moe_cache_seed_end(ubatch, res ? n_outputs : -1);
         }

@@ -1940,6 +1940,7 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
     // on the device. Here n_ubatch grows (1024 ... LLAMA_MOE_PREFILL_UB_MAX) while the cache keeps at least
     // LLAMA_MOE_PREFILL_UB_TINY_KEEP (0.25) of itself and the KV cache does not grow. LLAMA_MOE_PREFILL_UB_TINY=0 off, =N forces N here
     {
+        common_set_env("LLAMA_MOE_TINY_RELEASE", ""); // set below for the context this rule sizes (k19-tiny-ub)
         common_moe_slot_bytes sbt;
         const char * env_t   = getenv("LLAMA_MOE_PREFILL_UB_TINY");
         const int    force_t = env_t != nullptr ? atoi(env_t) : -1;
@@ -1967,9 +1968,9 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
                 ct.erase(std::remove_if(ct.begin(), ct.end(), [&](uint32_t u) { return u <= ub_def || u > ub_lim || (force_t <= 0 && u > ub_max); }), ct.end());
                 uint32_t pick_t = ub_def;
                 mem      m_t    = m_def;
+                const auto kv_t = [](const mem & x) { return x.total - x.compute - x.dft; };
                 for (uint32_t u : ct) {
                     const mem m = u == cands[0] ? m_ref : measure(u);
-                    const auto kv_t = [](const mem & x) { return x.total - x.compute - x.dft; };
                     if (m.total < 0 || kv_t(m) > kv_t(m_def) + (1 << 20) || (double) (cache - (m.total - m_def.total)) < keep*(double) cache) {
                         break;
                     }
@@ -1978,17 +1979,36 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
                 }
                 if (pick_t != ub_def) {
                     const int64_t taken_t = std::max<int64_t>(0, m_t.total - m_def.total);
-                    COM_INF("MoE cache: n_ubatch = %u (default %u, rule: tiny cache, the experts of %.1f tokens < %.1f, experts spill): +%.2f MiB of compute "
-                        "and KV memory taken from the cache, %.2f -> %.2f MiB (the experts of %.1f tokens; LLAMA_MOE_PREFILL_UB_TINY=0 to disable)\n",
-                        pick_t, ub_def, tokens, tiny_tokens, taken_t/1048576.0, cache/1048576.0, (cache - taken_t)/1048576.0, (cache - taken_t)/token_bytes);
+                    // k19-tiny-ub (LLAMA_MOE_PREFILL_UB_TINY_RELEASE=0: the growth is taken from the cache for good, as before): the larger
+                    // n_ubatch is for prompts only, so the cache keeps its size (less any KV growth, none by the rule above) and frees its
+                    // banks while ubatches of more than the default n_ubatch run; the next ubatch of at most that many tokens frees the
+                    // compute buffers (also an MTP drafter's) and allocates and refills the banks again (llama_context::tiny_rel_enter /
+                    // tiny_rel_leave). Decode then reads the cache of the default n_ubatch with the prompt of the larger one. T4 6 GB,
+                    // Qwen3.6-35B-A3B + MTP: the rule took 590 / 974 MiB of 1141 / 1398 MiB (q4x / q3m) and kept them through decode (chat
+                    // decode 33 vs 39 tok/s at the default n_ubatch). Single device, no separate draft model (its compute buffers are not freed)
+                    static const bool tiny_rel_env = getenv("LLAMA_MOE_PREFILL_UB_TINY_RELEASE") == nullptr || atoi(getenv("LLAMA_MOE_PREFILL_UB_TINY_RELEASE")) != 0;
+                    const int64_t kv_grow  = std::max<int64_t>(0, kv_t(m_t) - kv_t(m_def));
+                    const bool    tiny_rel = tiny_rel_env && m_t.n_dev == 1 && m_def.n_dev == 1 && !has_draft;
+                    const int64_t cache_t  = cache - (tiny_rel ? kv_grow : taken_t);
+                    if (tiny_rel) {
+                        COM_INF("MoE cache: n_ubatch = %u (default %u, rule: tiny cache, the experts of %.1f tokens < %.1f, experts spill): +%.2f MiB of compute "
+                            "and KV memory while a ubatch of more than %u tokens runs, the cache banks are released for it and refilled after it, the cache keeps "
+                            "%.2f of %.2f MiB (LLAMA_MOE_PREFILL_UB_TINY_RELEASE=0: taken from the cache for good; LLAMA_MOE_PREFILL_UB_TINY=0 to disable)\n",
+                            pick_t, ub_def, tokens, tiny_tokens, taken_t/1048576.0, ub_def, cache_t/1048576.0, cache/1048576.0);
+                        common_set_env("LLAMA_MOE_TINY_RELEASE", std::to_string(ub_def) + ":" + std::to_string(pick_t) + ":" + std::to_string((uint64_t) cache_t));
+                    } else {
+                        COM_INF("MoE cache: n_ubatch = %u (default %u, rule: tiny cache, the experts of %.1f tokens < %.1f, experts spill): +%.2f MiB of compute "
+                            "and KV memory taken from the cache, %.2f -> %.2f MiB (the experts of %.1f tokens; LLAMA_MOE_PREFILL_UB_TINY=0 to disable)\n",
+                            pick_t, ub_def, tokens, tiny_tokens, taken_t/1048576.0, cache/1048576.0, (cache - taken_t)/1048576.0, (cache - taken_t)/token_bytes);
+                    }
                     params.n_ubatch  = (int32_t) pick_t;
                     cparams.n_ubatch = pick_t;
                     if (!params.n_batch_set) {
                         params.n_batch  = std::max<int32_t>(params.n_batch, (int32_t) pick_t);
                         cparams.n_batch = std::max<uint32_t>(cparams.n_batch, pick_t);
                     }
-                    params.moe_cache_size  = (size_t) (cache - taken_t);
-                    cparams.moe_cache_size = (size_t) (cache - taken_t);
+                    params.moe_cache_size  = (size_t) cache_t;
+                    cparams.moe_cache_size = (size_t) cache_t;
                     return;
                 }
                 COM_INF("MoE cache: tiny cache (the experts of %.1f tokens < %.1f) but no larger n_ubatch keeps %.0f%% of it, n_ubatch stays %u\n",
