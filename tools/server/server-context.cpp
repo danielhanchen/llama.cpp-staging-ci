@@ -548,6 +548,9 @@ struct server_slot {
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
+        // kdp: a request with drafting off (the drafter's remap failed) ends here; the next one remaps again
+        spec_off_req   = false;
+        spec_lent_req  = false;
         spec_is_replay = false;
 
         last_nl_pos    = 0;
@@ -675,8 +678,13 @@ struct server_slot {
         return state != SLOT_STATE_IDLE;
     }
 
+    // kdp (LLAMA_MTP_DRAFT_LEND): spec_off_req = the drafter's weights or compute buffers could not be mapped back after a lend, so
+    // this request decodes without drafts (the output is the same); spec_lent_req = this request remapped them
+    bool spec_off_req  = false;
+    bool spec_lent_req = false;
+
     bool can_speculate() const {
-        return !!spec;
+        return !!spec && !spec_off_req;
     }
 
     // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
@@ -1263,12 +1271,45 @@ private:
 
     // joins the worker (a no-op without one); false: its pass failed (the caller reports it, as the in-line pass's failure)
     bool spec_bg_join() {
-        const bool ok = spec_bg_join_impl();
+        bool ok = spec_bg_join_impl();
         if (spec_bg.fail) {
             spec_bg.fail = false;
+            ok = false;
+        }
+        // kdp: a drafter pass that failed after a lend (its compute buffers did not fit again) turns drafting off for the request
+        if (!ok) {
+            return spec_fail_soft("the drafter's pass on a worker failed");
+        }
+        for (const auto & sl : slots) {
+            if (sl.is_processing() && sl.spec_lent_req && !sl.spec_off_req) {
+                llama_mtp_draft_lend_note(ctx_dft, true); // the remapped drafter computed its pass
+                break;
+            }
+        }
+        return true;
+    }
+
+    // kdp: a failed drafter step in a request whose drafter weights were lent and remapped (or the failed remap itself): the processing
+    // slots decode without drafts for the rest of the request instead of failing it (true); not after a lend: false (the caller fails)
+    bool spec_fail_soft(const char * what, bool remap = false) {
+        bool lent = remap;
+        for (const auto & sl : slots) {
+            lent |= sl.is_processing() && sl.spec_lent_req;
+        }
+        if (!lent) {
             return false;
         }
-        return ok;
+        for (auto & sl : slots) {
+            if (sl.is_processing()) {
+                sl.spec_off_req = true;
+                sl.spec_draft.clear();
+                sl.spec_i_batch.clear();
+            }
+        }
+        llama_mtp_draft_lend_note(ctx_dft, false);
+        SRV_WRN("%s after the MTP drafter weight lend: drafting is off for this request, the remap is retried on the next one "
+                "(LLAMA_MTP_DRAFT_LEND=0 off)\n", what);
+        return true;
     }
 
     // k19-host (LLAMA_MTP_PROMPT_BG_GROUP): the target context's next-n hold (llama_set_nextn_hold), on the server thread inside the target's
@@ -5607,10 +5648,15 @@ private:
             // 4.714 / 6.346 / 10.360 -> 4.473 / 6.145 / 9.103 s (no drafter: 4.524 / 6.417 / 9.392)
             static const bool    lend_env = getenv("LLAMA_MTP_DRAFT_LEND") == nullptr || atoi(getenv("LLAMA_MTP_DRAFT_LEND")) != 0;
             static const int32_t tail_env = getenv("LLAMA_MTP_PROMPT_TAIL") ? std::max(0, atoi(getenv("LLAMA_MTP_PROMPT_TAIL"))) : 2048;
+            // kdp: drafting off for this request (a failed remap): the drafter computes nothing until the next request
+            bool dft_off = false;
+            for (const auto & sl : slots) {
+                dft_off |= sl.is_processing() && sl.spec_off_req;
+            }
             bool skip = false;
             // only where the target's groups lend (llama_mtp_draft_lend_active): elsewhere the skip would cost acceptance for nothing
             // (G4 fn4 16 GB, depth 4 without the lend: 30k e2e +0.9%)
-            if (lend_env && tail_env > 0 && ok && ret == 0 && slots.size() == 1 && has_prompt && ctx_dft && seg_breaks.empty() &&
+            if (!dft_off && lend_env && tail_env > 0 && ok && ret == 0 && slots.size() == 1 && has_prompt && ctx_dft && seg_breaks.empty() &&
                     spec_seg_a == 0 && off + batch.view.size() == batch.size() && llama_mtp_draft_lend_active(ctx_tgt)) {
                 const server_slot & sl = slots[0];
                 const int32_t n_rest_s = sl.task ? sl.task->n_tokens() - sl.prompt.n_tokens() : 0;
@@ -5627,8 +5673,16 @@ private:
                             "LLAMA_MTP_DRAFT_LEND=0 off)\n", batch.view.size(), n_rest_s, n_skip, tail_env);
                 }
             }
-            if (!skip && ok && ctx_dft && !llama_mtp_draft_weights_restore(ctx_dft)) {
-                ok = false;
+            bool restored = false;
+            if (!dft_off && !skip && ok && ctx_dft && llama_mtp_draft_weights_evicted(ctx_dft)) {
+                if (llama_mtp_draft_weights_restore(ctx_dft)) {
+                    restored = true;
+                    for (auto & sl : slots) {
+                        sl.spec_lent_req |= sl.is_processing();
+                    }
+                } else {
+                    dft_off = spec_fail_soft("the drafter's weights could not be mapped back", /*remap =*/ true);
+                }
             }
             int32_t n_rest = 0;
             // k19-host (LLAMA_MTP_PROMPT_BG_MIN=N tokens, default min(n_ubatch, 1024)): only a prompt batch of at least N tokens runs its
@@ -5640,7 +5694,7 @@ private:
                 SRV_INF("mtp prompt pass on a worker for prompt batches of at least %d tokens (LLAMA_MTP_PROMPT_BG_MIN)\n", v);
                 return v;
             }();
-            bool bg = !skip && bg_env && ok && ret == 0 && slots.size() == 1 && has_prompt && batch.view.size() > spec_bg_tail_max &&
+            bool bg = !dft_off && !skip && bg_env && ok && ret == 0 && slots.size() == 1 && has_prompt && batch.view.size() > spec_bg_tail_max &&
                 batch.view.size() >= bg_min && off + batch.view.size() == batch.size() && common_speculative_rows_ext_floats(spec.get()) > 0;
             if (bg) {
                 const server_slot & sl = slots[0];
@@ -5727,7 +5781,7 @@ private:
                 srv_ph("drafter launched");
             }
             queue_tasks.yield_to_queue([&]() {
-                if (!ok || bg || skip) {
+                if (!ok || bg || skip || dft_off) {
                     return;
                 }
                 if (seg_breaks.empty()) {
@@ -5748,6 +5802,11 @@ private:
             });
 
             srv_ph("drafter processed");
+            if (!ok && spec_fail_soft("the drafter's pass failed")) {
+                ok = true;
+            } else if (ok && restored && !bg && !skip && !dft_off) {
+                llama_mtp_draft_lend_note(ctx_dft, true); // the remapped drafter computed this batch
+            }
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
 

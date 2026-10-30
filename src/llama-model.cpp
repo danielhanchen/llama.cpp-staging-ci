@@ -1282,6 +1282,8 @@ struct llama_model::impl {
     std::vector<ggml_backend_buffer_t> evict_bufs;
     mutable std::mutex                 evict_m;
     bool                               evicted = false;
+    bool                               lend_disabled = false; // no more evictions (host RAM, or LLAMA_MTP_DRAFT_LEND_MAX_FAILS remaps failed)
+    int                                lend_fails    = 0;     // consecutive requests whose remap or drafter pass after a lend failed
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -3057,7 +3059,7 @@ bool llama_mtp_draft_lend_on() {
 
 size_t llama_model::weights_evict() {
     std::lock_guard<std::mutex> lock(pimpl->evict_m);
-    if (pimpl->evicted || pimpl->evict_bufs.empty()) {
+    if (pimpl->evicted || pimpl->evict_bufs.empty() || pimpl->lend_disabled) {
         return 0;
     }
     size_t freed = 0;
@@ -3077,6 +3079,13 @@ bool llama_model::weights_restore() {
     std::lock_guard<std::mutex> lock(pimpl->evict_m);
     if (!pimpl->evicted) {
         return true;
+    }
+    // debug (LLAMA_MTP_DRAFT_LEND_FAIL_TEST=N): the first N remaps fail as if the device had no memory (the weights stay evicted)
+    static int fail_test = getenv("LLAMA_MTP_DRAFT_LEND_FAIL_TEST") ? std::max(0, atoi(getenv("LLAMA_MTP_DRAFT_LEND_FAIL_TEST"))) : 0;
+    if (fail_test > 0) {
+        fail_test--;
+        LLAMA_LOG_WARN("%s: LLAMA_MTP_DRAFT_LEND_FAIL_TEST: remap failure injected (%d left)\n", __func__, fail_test);
+        return false;
     }
     bool ok = true;
     for (ggml_backend_buffer_t buf : pimpl->evict_bufs) {
@@ -3114,8 +3123,40 @@ bool llama_model::weights_evicted() const {
     return pimpl->evicted;
 }
 
+size_t llama_model::weights_evictable_bytes() const {
+    std::lock_guard<std::mutex> lock(pimpl->evict_m);
+    size_t bytes = 0;
+    for (ggml_backend_buffer_t buf : pimpl->evict_bufs) {
+        bytes += ggml_backend_buffer_get_size(buf);
+    }
+    return bytes;
+}
+
+void llama_model::weights_lend_disable() {
+    std::lock_guard<std::mutex> lock(pimpl->evict_m);
+    pimpl->lend_disabled = true;
+}
+
+bool llama_model::weights_lend_note(bool ok) {
+    static const int max_fails = getenv("LLAMA_MTP_DRAFT_LEND_MAX_FAILS") ? std::max(1, atoi(getenv("LLAMA_MTP_DRAFT_LEND_MAX_FAILS"))) : 3;
+    std::lock_guard<std::mutex> lock(pimpl->evict_m);
+    if (ok) {
+        pimpl->lend_fails = 0;
+        return false;
+    }
+    pimpl->lend_fails++;
+    if (pimpl->lend_fails >= max_fails && !pimpl->lend_disabled) {
+        pimpl->lend_disabled = true;
+        return true;
+    }
+    return false;
+}
+
 bool llama_model::weights_evictable() const {
     std::lock_guard<std::mutex> lock(pimpl->evict_m);
+    if (pimpl->lend_disabled) {
+        return false;
+    }
     return !pimpl->evict_bufs.empty();
 }
 

@@ -889,6 +889,23 @@ llama_context::llama_context(
             llama_mtp_ctxs.push_back(this);
         }
         // kdp: an MTP drafter with evictable weights (a separate -md model, LLAMA_MTP_DRAFT_LEND) copies them to pinned host memory once
+        // the host copy honours the host-RAM reserve of the pinned experts (llama_model_loader::pin_auto_budget: max(4 GiB, 10% of
+        // MemTotal) left of the available RAM, cgroup limits included): no room, or the available RAM unknown, and the lend is off
+        if (ctx_mtp && const_cast<llama_model &>(model).weights_evictable()) {
+            const uint64_t need    = const_cast<llama_model &>(model).weights_evictable_bytes();
+            const uint64_t avail   = llama_weight_store::ram_available();
+            const uint64_t total   = llama_sysmem::total();
+            const uint64_t reserve = std::max<uint64_t>((uint64_t) 4 << 30, total/10);
+            if (avail == 0 || avail < reserve || need > avail - reserve) {
+                const_cast<llama_model &>(model).weights_lend_disable();
+                static bool logged = false;
+                if (!logged) {
+                    logged = true;
+                    LLAMA_LOG_WARN("%s: MTP drafter weight lend off: its %.2f MiB host copy does not fit the host RAM (available %.0f MiB, "
+                        "reserve %.0f MiB)\n", __func__, need/1048576.0, avail/1048576.0, reserve/1048576.0);
+                }
+            }
+        }
         if (ctx_mtp && const_cast<llama_model &>(model).weights_evictable()) {
             const int64_t t0 = ggml_time_us();
             const size_t  b  = const_cast<llama_model &>(model).weights_evict_prepare();
@@ -1732,7 +1749,8 @@ bool llama_context::mtp_weights_restore() {
     static int64_t n_restore = 0;
     n_restore++;
     if (!ok) {
-        LLAMA_LOG_ERROR("%s: the MTP drafter's weights could not be mapped back (no device memory)\n", __func__);
+        LLAMA_LOG_WARN("%s: the MTP drafter's weights could not be mapped back (no device memory): drafting is off for this request, "
+            "the remap is retried on the next one\n", __func__);
     } else {
         LLAMA_LOG_INFO("%s: MTP drafter weights restored in %.2f ms (%" PRId64 " restores)\n", __func__, (ggml_time_us() - t0)/1000.0, n_restore);
     }
@@ -6067,18 +6085,18 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                     free_min = std::min(free_min, fr);
                 }
             }
-            // the server skips the drafter's pass over the early batches only where a group lends (llama_mtp_draft_lend_active)
-            mtp_lend_active = free_min < lend_free;
+            std::vector<llama_context *> dfts;
             if (free_min < lend_free) {
-                std::vector<llama_context *> dfts;
-                {
-                    std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
-                    for (llama_context * c : llama_mtp_ctxs) {
-                        if (c != this && &c->model != &model && const_cast<llama_model &>(c->model).weights_evictable()) {
-                            dfts.push_back(c);
-                        }
+                std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
+                for (llama_context * c : llama_mtp_ctxs) {
+                    if (c != this && &c->model != &model && const_cast<llama_model &>(c->model).weights_evictable()) {
+                        dfts.push_back(c);
                     }
                 }
+            }
+            // the server skips the drafter's pass over the early batches only where a group lends (llama_mtp_draft_lend_active)
+            mtp_lend_active = !dfts.empty();
+            if (!dfts.empty()) {
                 const int64_t t0 = ggml_time_us();
                 size_t freed_w = 0, freed_c = 0;
                 for (llama_context * c : dfts) {
@@ -11426,6 +11444,21 @@ void llama_set_nextn_hold(llama_context * ctx, void (*fn)(void *), void * user_d
 
 bool llama_mtp_draft_lend_active(const llama_context * ctx) {
     return ctx != nullptr && ctx->mtp_lend_active;
+}
+
+bool llama_mtp_draft_weights_evicted(const llama_context * ctx) {
+    return ctx != nullptr && llama_get_model(ctx)->weights_evicted();
+}
+
+void llama_mtp_draft_lend_note(llama_context * ctx, bool ok) {
+    if (ctx == nullptr) {
+        return;
+    }
+    if (const_cast<llama_model *>(llama_get_model(ctx))->weights_lend_note(ok)) {
+        LLAMA_LOG_WARN("%s: MTP drafter weight lend off for this process: the remap or the drafter's pass after a lend failed in %s "
+            "consecutive requests (LLAMA_MTP_DRAFT_LEND_MAX_FAILS)\n", __func__,
+            getenv("LLAMA_MTP_DRAFT_LEND_MAX_FAILS") ? getenv("LLAMA_MTP_DRAFT_LEND_MAX_FAILS") : "3");
+    }
 }
 
 bool llama_mtp_draft_weights_restore(llama_context * ctx) {

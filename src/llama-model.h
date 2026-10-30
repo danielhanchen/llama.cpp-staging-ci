@@ -936,7 +936,10 @@ struct llama_model {
     size_t weights_evict();
     bool   weights_restore();
     bool   weights_evicted() const;
-    bool   weights_evictable() const;
+    bool   weights_evictable() const;       // false once the lend is disabled (the buffers can still be restored)
+    size_t weights_evictable_bytes() const; // the host copy the lend needs
+    void   weights_lend_disable();
+    bool   weights_lend_note(bool ok);      // a lent request's outcome; true: this failure disabled the lend (LLAMA_MTP_DRAFT_LEND_MAX_FAILS, 3)
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
