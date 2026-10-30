@@ -14,6 +14,8 @@
 #include <cstdio>
 #include <cstring>
 #include <array>
+#include <algorithm>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -670,6 +672,140 @@ struct case_k19_move : ctx_test {
     }
 };
 
+// k19 fuzz: random llama-server-like schedules (prompt chunks, 1-token steps, 2-3 token verify windows, rollbacks of 0..n-1 tokens of a
+// window) of several sequences decoded together, against a context that decodes one sequence per ubatch; every state after every step.
+// Covers several moved cells per ubatch, chains of swaps, a window whose cell is the destination of another, and rollbacks consumed by
+// a ubatch of other sequences
+struct case_k19_fuzz : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+    const char * name() const override { return "k19_fuzz"; }
+    const char * description() const override { return "random multi-sequence verify/rollback schedules against one sequence per ubatch"; }
+    std::string skip_reason(model_run & mr) const override {
+        if (arch_reserves_single_seq(mr.model)) {
+            return "multi-seq graphs";
+        }
+        return ctx_test::skip_reason(mr);
+    }
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+        const char * es = getenv("K19_FUZZ_STEPS");
+        const int n_steps = es ? atoi(es) : 30;
+        for (uint32_t n_seqs : { 4u, 6u }) {
+            for (uint32_t seed : { 1u, 2u, 3u, 4u }) {
+                ctx_opts opts;
+                opts.n_ctx = 4096; opts.n_batch = 64; opts.n_ubatch = 32; opts.n_seq_max = n_seqs; opts.n_rs_seq = 2; opts.kv_unified = 1;
+                llama_context_ptr ctx_m = mr.ctx(opts);
+                llama_context_ptr ctx_s = mr.ctx(opts);
+                if (!ctx_m || !ctx_s) {
+                    return case_result::fail();
+                }
+                if (llama_n_rs_seq(ctx_m.get()) < 2) {
+                    return case_result::skip("n_rs_seq is too small");
+                }
+                std::mt19937 rng(seed * 7919u + n_seqs);
+                std::vector<llama_pos> pos(n_seqs, 0);
+                std::vector<int> win(n_seqs, 0); // tokens of the last decode of the seq (a window when 2..3)
+                for (int step = 0; step < n_steps; ++step) {
+                    // a slot that takes a new request: the whole sequence removed (post-release prompt_clear / memory_seq_rm [0, end))
+                    for (uint32_t s = 0; s < n_seqs; ++s) {
+                        if (pos[s] > 0 && rng() % 25 == 0) {
+                            CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx_m.get()), (llama_seq_id) s, 0, -1), "clear failed");
+                            CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx_s.get()), (llama_seq_id) s, 0, -1), "clear failed");
+                            pos[s] = 0;
+                        }
+                    }
+                    // the spans of this decode
+                    std::vector<std::array<llama_pos, 3>> spans;
+                    int total = 0;
+                    for (uint32_t s = 0; s < n_seqs; ++s) {
+                        if (pos[s] > 0 && rng() % 3 == 0) {
+                            continue;
+                        }
+                        static const int lens[] = { 1, 2, 3, 3, 3, 4, 6, 9 };
+                        int n = pos[s] == 0 ? 4 + (int) (rng() % 9) : lens[rng() % 8];
+                        if (total + n > 60) {
+                            continue;
+                        }
+                        spans.push_back({ (llama_pos) s, pos[s], pos[s] + n });
+                        total += n;
+                    }
+                    if (spans.empty()) {
+                        continue;
+                    }
+                    // shuffle the order of the sequences in the batch (the server adds slots in id order, the tail of a prompt last)
+                    std::shuffle(spans.begin(), spans.end(), rng);
+                    common_batch batch(ctx_m.get());
+                    for (const auto & sp : spans) {
+                        for (llama_pos p = sp[1]; p < sp[2]; ++p) {
+                            batch.add(gen_token(n_vocab, (llama_seq_id) sp[0], p), p, (llama_seq_id) sp[0], true);
+                        }
+                    }
+                    CTX_REQUIRE(llama_process(ctx_m.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "multi decode failed");
+                    for (const auto & sp : spans) {
+                        common_batch b1(ctx_s.get());
+                        for (llama_pos p = sp[1]; p < sp[2]; ++p) {
+                            b1.add(gen_token(n_vocab, (llama_seq_id) sp[0], p), p, (llama_seq_id) sp[0], true);
+                        }
+                        CTX_REQUIRE(llama_process(ctx_s.get(), LLAMA_PROCESS_TYPE_DECODE, b1.get()) == 0, "serial decode failed");
+                        pos[sp[0]] = sp[2];
+                        win[sp[0]] = (int) (sp[2] - sp[1]);
+                    }
+                    // rollbacks of windows (2..3 tokens: a verify of 1..2 drafts), 0..n-1 tokens, like post_decode's seq_rm
+                    for (const auto & sp : spans) {
+                        const int n = (int) (sp[2] - sp[1]);
+                        if (n < 2 || n > 3) {
+                            continue;
+                        }
+                        const int r = (int) (rng() % n);
+                        if (r == 0) {
+                            continue;
+                        }
+                        const llama_pos p0 = sp[2] - r;
+                        const bool rm_m = llama_memory_seq_rm(llama_get_memory(ctx_m.get()), (llama_seq_id) sp[0], p0, -1);
+                        const bool rm_s = llama_memory_seq_rm(llama_get_memory(ctx_s.get()), (llama_seq_id) sp[0], p0, -1);
+                        CTX_REQUIRE(rm_s, "the serial context refused a rollback");
+                        CTX_REQUIRE(rm_m, "seed " + std::to_string(seed) + " seqs " + std::to_string(n_seqs) + " step " + std::to_string(step) +
+                                ": the rollback of seq " + std::to_string(sp[0]) + " was refused (llama-server would abort)");
+                        pos[sp[0]] = p0;
+                    }
+                    // the states of every seq (a state read commits a pending replay window: K19_FUZZ_CMP_EVERY=N compares every N steps and
+                    // at the end only, so that windows stay pending across decodes)
+                    const char * ec = getenv("K19_FUZZ_CMP_EVERY");
+                    const int cmp_every = ec ? std::max(1, atoi(ec)) : 1;
+                    if ((step + 1) % cmp_every != 0 && step + 1 != n_steps) {
+                        continue;
+                    }
+                    for (uint32_t s = 0; s < n_seqs; ++s) {
+                        std::vector<uint8_t> st[2];
+                        llama_context * cs[2] = { ctx_m.get(), ctx_s.get() };
+                        for (int c = 0; c < 2; ++c) {
+                            const size_t n = llama_state_seq_get_size_ext(cs[c], (llama_seq_id) s, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            st[c].resize(n);
+                            llama_state_seq_get_data_ext(cs[c], st[c].data(), n, (llama_seq_id) s, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        }
+                        CTX_REQUIRE(st[0].size() == st[1].size(), "state sizes differ");
+                        float d_max = 0.0f, a_max = 0.0f;
+                        for (size_t i = 0; i + 4 <= st[0].size(); i += 4) {
+                            float a, b;
+                            memcpy(&a, st[0].data() + i, 4);
+                            memcpy(&b, st[1].data() + i, 4);
+                            if (std::isfinite(a) && std::isfinite(b)) {
+                                d_max = std::max(d_max, std::fabs(a - b));
+                                a_max = std::max(a_max, std::fabs(b));
+                            }
+                        }
+                        CTX_REQUIRE(d_max <= 1e-3f*a_max + 1e-6f, "seed " + std::to_string(seed) + " seqs " + std::to_string(n_seqs) + " step " +
+                                std::to_string(step) + ": the state of seq " + std::to_string(s) + " differs from one sequence per ubatch (max diff " +
+                                std::to_string(d_max) + " of " + std::to_string(a_max) + ")");
+                    }
+                }
+                TLOG_INF("%s: seqs %u seed %u: %d steps match\n", __func__, n_seqs, seed, n_steps);
+            }
+        }
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
@@ -678,6 +814,7 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
     cases.push_back(std::make_unique<case_replay_overlap>());
     cases.push_back(std::make_unique<case_k19_move>());
+    cases.push_back(std::make_unique<case_k19_fuzz>());
 
     return cases;
 }
