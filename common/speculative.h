@@ -111,6 +111,13 @@ bool common_speculative_rows_ok(const common_speculative * spec);
 bool common_speculative_rows_early_ok(const common_speculative * spec);
 bool common_speculative_process_rows_early(common_speculative * spec, const common_batch & batch, int32_t row_offset);
 
+// k19-host (LLAMA_MTP_PROMPT_BG): process_rows() reads the target's rows through h (row i at h + i * floats), rows [0, n_lo) from a copy made
+// here, and calls nothing of the target context, so it can run on a worker beside the target's next decode (which may overwrite rows
+// [0, n_lo)). rows_ext_floats: floats per row where every impl supports it, else 0. Set and clear on the thread that owns the target
+int64_t common_speculative_rows_ext_floats(const common_speculative * spec);
+bool common_speculative_rows_ext_set(common_speculative * spec, const float * h, int32_t n_rows, int32_t n_lo);
+void common_speculative_rows_ext_clear(common_speculative * spec);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 

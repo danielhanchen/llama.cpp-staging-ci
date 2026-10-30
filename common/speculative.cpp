@@ -239,6 +239,11 @@ struct common_speculative_impl {
     // the caller waited for them (llama_nextn_rows_wait); only impls that read nothing else of the target say yes
     bool rows_early = false;
     virtual bool rows_early_ok() const { return false; }
+    // k19-host (LLAMA_MTP_PROMPT_BG): process() reads the target's rows through a pointer the caller resolved (no target call: it may run
+    // on a worker beside the target's next decode), rows [0, n_lo) from a copy the caller made first; floats per row (0 = not supported)
+    virtual int64_t rows_ext_floats() const { return 0; }
+    virtual bool rows_ext_set(const float * /*h*/, int32_t /*n_rows*/, int32_t /*n_lo*/) { return false; }
+    virtual void rows_ext_clear() {}
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
@@ -1517,6 +1522,31 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // k11: segments of a merged prompt batch (LLAMA_LM_CKPT_MERGE) read host rows at an offset, the device sink holds whole batches
     bool row_offset_ok() const override { return !dev_h; }
     bool rows_early_ok() const override { return !dev_h && !is_mem_shared; }
+
+    // k19-host (LLAMA_MTP_PROMPT_BG): see common_speculative_rows_ext_set
+    const float *      h_ext = nullptr; // the target's next-n rows, row i at h_ext + i*n_embd
+    int32_t            h_ext_lo = 0;    // rows [0, h_ext_lo) are read from h_ext_stash instead (the next decode may overwrite them)
+    std::vector<float> h_ext_stash;     // kept between prompts (at most 256 rows)
+    int64_t rows_ext_floats() const override { return rows_early_ok() && !chain_heads ? n_embd : 0; }
+    bool rows_ext_set(const float * h, int32_t n_rows, int32_t n_lo) override {
+        if (!rows_ext_floats() || h == nullptr || n_rows <= 0) {
+            return false;
+        }
+        n_lo = std::max<int32_t>(0, std::min(n_lo, n_rows));
+        if (h_ext_stash.size() < (size_t) n_lo * n_embd) {
+            h_ext_stash.resize((size_t) n_lo * n_embd);
+        }
+        if (n_lo > 0) {
+            std::memcpy(h_ext_stash.data(), h, (size_t) n_lo * n_embd * sizeof(float));
+        }
+        h_ext    = h;
+        h_ext_lo = n_lo;
+        return true;
+    }
+    void rows_ext_clear() override {
+        h_ext    = nullptr;
+        h_ext_lo = 0;
+    }
     llama_seq_id dev_seq = -1;            // the sequence whose pending row is in sink row 0
     std::vector<uint8_t> pending_dev;     // per seq: its pending row is sink row 0 (pending_h is stale)
     std::vector<uint8_t> verify_dev;      // per seq: the verify rows are sink rows 1 .. verify_h_rows (verify_h is unused)
@@ -1727,9 +1757,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         // k15-pp3: rows the caller already waited for (unmasked: row i at i*n_embd), else the synchronizing lookups
-        const float * h_early = rows_early ? llama_get_embeddings_nextn_early(ctx_tgt) : nullptr;
-        GGML_ASSERT(!rows_early || h_early);
+        // k19-host: with h_ext (LLAMA_MTP_PROMPT_BG) the rows come from the caller's pointer and stash, no target call at all
+        const bool ext = h_ext != nullptr;
+        const float * h_early = !ext && rows_early ? llama_get_embeddings_nextn_early(ctx_tgt) : nullptr;
+        GGML_ASSERT(ext || !rows_early || h_early);
         auto tgt_row = [&](int32_t i) -> const float * {
+            if (ext) {
+                return i < h_ext_lo ? h_ext_stash.data() + (size_t) i * n_embd : h_ext + (size_t) i * n_embd;
+            }
             return h_early ? h_early + (size_t) i * n_embd : llama_get_embeddings_nextn_ith(ctx_tgt, i);
         };
 
@@ -1775,7 +1810,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
             // the device path reads no host rows: no sync on the target here
-            const float * h_tgt = dev ? nullptr : (h_early ? h_early : llama_get_embeddings_nextn(ctx_tgt)) + (size_t) nextn_row_offset * n_embd;
+            const float * h_tgt = dev || ext ? nullptr : (h_early ? h_early : llama_get_embeddings_nextn(ctx_tgt)) + (size_t) nextn_row_offset * n_embd;
             if (t_tr0) {
                 t_tr_sync = ggml_time_us();
             }
@@ -1814,7 +1849,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 const float * h_row = k == i_batch_beg[seq_id]
                     ? pending_h[seq_id].data()
-                    : h_tgt + (size_t) (k - 1) * n_embd;
+                    : ext ? tgt_row(nextn_row_offset + k - 1) : h_tgt + (size_t) (k - 1) * n_embd;
 
                 batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
             }
@@ -1895,6 +1930,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // prompt ubatch is n_rows*n_embd floats) instead of a zero-filled resize and a synchronizing lookup per row
             const float * h_beg = handoff_copy ? tgt_row(nextn_row_offset + i_batch_beg[seq_id]) : nullptr;
             const float * h_end = handoff_copy ? tgt_row(nextn_row_offset + i_batch_end[seq_id]) : nullptr;
+            if (ext && handoff_copy) {
+                // k19-host: the copy below row by row (the stash breaks the rows' contiguity): the same n_keep rows and pending row
+                const int32_t n_keep = verify_h_trim ? std::min<int32_t>(n_rows, std::max<int32_t>(256, n_max + 2)) : n_rows;
+                verify_h_kept[seq_id] = n_keep;
+                if (verify_h[seq_id].size() < (size_t) n_keep * n_embd) {
+                    verify_h[seq_id].resize((size_t) n_keep * n_embd);
+                }
+                for (int32_t i = 0; i < n_keep; ++i) {
+                    std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, tgt_row(nextn_row_offset + i_batch_beg[seq_id] + i), row_bytes);
+                }
+                std::memcpy(pending_h[seq_id].data(), h_end, row_bytes);
+                continue;
+            }
             if (h_beg && h_end == h_beg + (size_t) (n_rows - 1) * n_embd) {
                 // accept() reads row min(n_accepted, n_rows - 1) and n_accepted <= n_max: a prompt ubatch (thousands of rows,
                 // 160 MiB at 4096 x 10240 floats) keeps its first n_keep rows and the last one (in pending_h), not all of them;
@@ -3773,6 +3821,43 @@ bool common_speculative_process_rows_early(common_speculative * spec, const comm
         impl->nextn_row_offset = 0;
     }
     return result;
+}
+
+int64_t common_speculative_rows_ext_floats(const common_speculative * spec) {
+    if (spec == nullptr || spec->impls.empty()) {
+        return 0;
+    }
+    int64_t n = 0;
+    for (const auto & impl : spec->impls) {
+        const int64_t f = impl->rows_ext_floats();
+        if (f <= 0 || (n != 0 && f != n)) {
+            return 0;
+        }
+        n = f;
+    }
+    return n;
+}
+
+bool common_speculative_rows_ext_set(common_speculative * spec, const float * h, int32_t n_rows, int32_t n_lo) {
+    if (common_speculative_rows_ext_floats(spec) <= 0) {
+        return false;
+    }
+    for (auto & impl : spec->impls) {
+        if (!impl->rows_ext_set(h, n_rows, n_lo)) {
+            common_speculative_rows_ext_clear(spec);
+            return false;
+        }
+    }
+    return true;
+}
+
+void common_speculative_rows_ext_clear(common_speculative * spec) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->rows_ext_clear();
+    }
 }
 
 bool common_speculative_process(common_speculative * spec, const common_batch & batch) {

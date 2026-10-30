@@ -4263,9 +4263,9 @@ static bool llama_phase_log_on() {
     static const bool on = getenv("LLAMA_DECODE_PHASE_LOG") != nullptr && atoi(getenv("LLAMA_DECODE_PHASE_LOG")) != 0;
     return on;
 }
-static int64_t      llama_phase_t0  = 0;
-static int64_t      llama_phase_tl  = 0;
-static const char * llama_phase_who = "";
+static thread_local int64_t      llama_phase_t0  = 0; // thread_local: a drafter decode may run on a server worker (LLAMA_MTP_PROMPT_BG)
+static thread_local int64_t      llama_phase_tl  = 0;
+static thread_local const char * llama_phase_who = "";
 static void llama_phase(const char * what) {
     if (llama_phase_log_on() && llama_phase_t0 > 0) {
         const int64_t t = ggml_time_us();

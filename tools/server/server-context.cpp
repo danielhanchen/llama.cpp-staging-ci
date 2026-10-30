@@ -34,6 +34,10 @@
 #include <fstream>
 #include <list>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <functional>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -293,6 +297,14 @@ struct server_slot {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
+    // k19-host (LLAMA_MTP_PROMPT_BG): joins the drafter's prompt pass running on a worker before the slot touches the draft context
+    std::function<void()> spec_bg_join;
+    void spec_bg_wait() const {
+        if (spec_bg_join) {
+            spec_bg_join();
+        }
+    }
+
     common_memory mem;
 
     // multimodal
@@ -367,6 +379,7 @@ struct server_slot {
 
     bool prompt_save(server_prompt_cache & prompt_cache, llama_pos ckpt_keep_max = -2, bool force_async = false, bool lend_ckpt = false,
                      bool at_request = false) {
+        spec_bg_wait();
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -476,6 +489,7 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+        spec_bg_wait();
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
@@ -485,6 +499,7 @@ struct server_slot {
     }
 
     void prompt_clear() {
+        spec_bg_wait();
         prompt_saved_idle = false; prompt_saved_idle_new = false; ckpt_lent = false;
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
@@ -759,6 +774,7 @@ struct server_slot {
     }
 
     void release() {
+        spec_bg_wait();
         if (is_processing()) {
             GGML_ASSERT(task);
 
@@ -957,6 +973,7 @@ struct server_slot {
 
     // the other slot continues from the tokens processed so far
     void copy_prompt_to(server_slot & other) const {
+        spec_bg_wait();
         mem.seq_rm(other.id,     -1, -1);
         mem.seq_cp(id, other.id, -1, -1);
 
@@ -966,6 +983,7 @@ struct server_slot {
     void copy_state_to(server_slot & other) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
+        spec_bg_wait();
         mem.seq_rm(other.id,     -1, -1);
         mem.seq_cp(id, other.id, -1, -1);
 
@@ -1222,6 +1240,71 @@ private:
 
     common_speculative_ptr spec;
 
+    // k19-host (LLAMA_MTP_PROMPT_BG=0 off): the MTP drafter's pass over a prompt batch runs on a worker beside the target's next decode when
+    // that decode is the slot's last few prompt tokens (the [n-4] [4] split of a long prompt: the [4] waits for its experts over PCIe while
+    // the drafter computes). The worker runs the same process_rows calls on the same rows in the same order, then the draft-context steps
+    // the main thread queued for it (the checkpoint's draft part, the draft's seq_rm), so the draft's KV, drafts and text are those of
+    // the in-line pass. The main thread joins it before any other use of the draft context or the speculative state
+    struct spec_bg_state_t {
+        std::thread                        thr;
+        std::mutex                         m;
+        std::condition_variable            cv;
+        std::deque<std::function<void()>>  q;       // draft-context steps queued by the main thread, run after the segments
+        bool                               closing = false;
+        bool                               live    = false; // main thread: a worker is running
+        bool                               hold    = false; // main thread: the next update_slots continues the slot's prompt beside it
+        std::atomic<bool>                  ok      { true };
+        int64_t                            t_launch = 0;
+    } spec_bg;
+
+    static constexpr int32_t spec_bg_tail_max = 64; // the next target decode it may run beside: at most this many tokens
+
+    // joins the worker (a no-op without one); false: its pass failed (the caller reports it, as the in-line pass's failure)
+    bool spec_bg_join() {
+        if (!spec_bg.live) {
+            return true;
+        }
+        const int64_t t0 = ggml_time_us();
+        {
+            std::lock_guard<std::mutex> lock(spec_bg.m);
+            spec_bg.closing = true;
+        }
+        spec_bg.cv.notify_all();
+        spec_bg.thr.join();
+        spec_bg.live = false;
+        spec_bg.hold = false;
+        common_speculative_rows_ext_clear(spec.get());
+        static const bool srv_phase = getenv("LLAMA_DECODE_PHASE_LOG") != nullptr && atoi(getenv("LLAMA_DECODE_PHASE_LOG")) != 0;
+        if (srv_phase) {
+            SRV_INF("srv phase: drafter joined, waited %.2f ms, %.2f ms after its launch\n", (ggml_time_us() - t0)/1e3, (ggml_time_us() - spec_bg.t_launch)/1e3);
+        }
+        return spec_bg.ok.load();
+    }
+
+    // for callers that cannot throw: a failed pass ends every slot, as decode()'s throw does
+    void spec_bg_join_or_abort() {
+        if (!spec_bg.live) {
+            return;
+        }
+        if (!spec_bg_join()) {
+            SRV_ERR("%s", "failed to process speculative batch\n");
+            abort_all_slots("failed to process speculative batch");
+        }
+    }
+
+    // a draft-context step of the main thread while the worker runs: queued behind its segments, else run here
+    void spec_bg_push(std::function<void()> && fn) {
+        if (!spec_bg.live) {
+            fn();
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(spec_bg.m);
+            spec_bg.q.push_back(std::move(fn));
+        }
+        spec_bg.cv.notify_all();
+    }
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -1282,6 +1365,9 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        if (spec_bg.live) {
+            spec_bg_join();
+        }
         if (prompt_cache) {
             prompt_cache->wait_inflight(); // an asynchronous prompt save is complete before the contexts go
         }
@@ -1884,6 +1970,7 @@ private:
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft;
             slot.mem.init(ctx_tgt, ctx_dft);
+            slot.spec_bg_join = [this]() { spec_bg_join_or_abort(); };
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
 
@@ -2107,6 +2194,7 @@ private:
             update_slots();
         });
         queue_tasks.on_idle_work([this]() {
+            spec_bg_join_or_abort();
             // k15-ttft: the prompt-cache save that the next request's slot selection makes (get_available_slot: the slot's prompt with its
             // checkpoints, 65 MiB for a short Qwen3.6 chat, 8-19 ms on a B200 ahead of the prompt) is made here instead, as the slot went
             // idle: the same entry, saved in the same order before the next request's load. LLAMA_PCS_IDLE_SAVE=0: at the request, as
@@ -3226,6 +3314,7 @@ private:
     // there; only where the draft and the speculative state hold nothing a checkpoint at that position would need (a draft without
     // recurrent / SWA rows, no stashed boundary row)
     void create_checkpoint_captured(server_slot & slot, int64_t n_tokens_at, llama_pos pos_at) {
+        spec_bg_join_or_abort();
         if (ctx_dft) {
             // the header alone (magic, seq id): a KV cache without SWA writes nothing for a partial state
             const size_t n_dft = llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -3247,10 +3336,13 @@ private:
 
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool captured = false) {
         const int id_task = slot.task->id;
+        // k19-host: with the drafter's pass on the worker (LLAMA_MTP_PROMPT_BG) the draft part is queued behind it; the launch completed
+        // every earlier asynchronous draft save, so none is in flight for the evictions below
+        const bool dft_bg = spec_bg.live && ctx_dft != nullptr;
 
         // the previous checkpoint's asynchronous copy may still be running (LLAMA_STATE_ASYNC_LAZY): done before any is evicted
         llama_state_seq_async_wait(ctx_tgt);
-        if (ctx_dft) {
+        if (ctx_dft && !dft_bg) {
             llama_state_seq_async_wait(ctx_dft); // k13-pp: the draft part is saved asynchronously too (ckpt_dft_async)
         }
 
@@ -3323,6 +3415,29 @@ private:
         // the save is complete when the draft's next decode() returns, or at any state call / synchronize of the draft context.
         // LLAMA_CKPT_DFT_ASYNC=0: the synchronous read as before.
         static const bool ckpt_dft_async = getenv("LLAMA_CKPT_DFT_ASYNC") == nullptr || atoi(getenv("LLAMA_CKPT_DFT_ASYNC")) != 0;
+        if (dft_bg) {
+            // the list node is stable, and nothing evicts or reads it before the join (decode()'s spec block, or any other user of the
+            // slot's checkpoints: a later create_checkpoint, prompt save / clear, slot release, a task)
+            common_prompt_checkpoint * cp = &cur;
+            const int  slot_id   = slot.id;
+            const int  n_ckpt    = (int) slot.prompt.checkpoints.size();
+            const int  n_ckpt_mx = params_base.n_ctx_checkpoints;
+            const double t_tgt_ms = t_tr0 ? (t_tr1 - t_tr0)/1e3 : 0.0;
+            spec_bg_push([this, cp, slot_id, id_task, n_ckpt, n_ckpt_mx, t_tgt_ms]() {
+                const int64_t t_d0 = common_mtp_handoff_trace() ? ggml_time_us() : 0;
+                llama_state_seq_async_wait(ctx_dft);
+                cp->update_dft(ctx_dft, slot_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | (ckpt_dft_async ? LLAMA_STATE_SEQ_FLAGS_ASYNC : 0));
+                common_speculative_get_state(spec.get(), slot_id, cp->data_spec);
+                if (t_d0) {
+                    LOG_INF("slot %12.*s: id %2d | task %d | mtp_trace ckpt tgt=%.1f MiB %.2f ms, dft=%.1f MiB + spec %.2f ms (draft part on the worker)\n",
+                            12, "create_check", slot_id, id_task, cp->data_tgt.size()/1048576.0, t_tgt_ms, cp->data_dft.size()/1048576.0,
+                            (ggml_time_us() - t_d0)/1e3);
+                }
+                LOG_TRC("slot %12.*s: id %2d | task %d | created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                        12, "create_check", slot_id, id_task, n_ckpt, n_ckpt_mx, cp->pos_min, cp->pos_max, cp->n_tokens, (float) cp->size() / 1024 / 1024);
+            });
+            return;
+        }
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | (ckpt_dft_async ? LLAMA_STATE_SEQ_FLAGS_ASYNC : 0));
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
@@ -3575,6 +3690,11 @@ private:
         if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
+        }
+        // k19-host: any task but the loop's own next-response tick and the read-only ones ends the drafter's background pass first
+        if (!is_yielding && task.type != SERVER_TASK_TYPE_NEXT_RESPONSE && task.type != SERVER_TASK_TYPE_METRICS &&
+                task.type != SERVER_TASK_TYPE_SLOT_GET) {
+            spec_bg_join_or_abort();
         }
 
         switch (task.type) {
@@ -4065,6 +4185,7 @@ private:
                 !common_speculative_rows_ok(spec.get())) {
             return false;
         }
+        const_cast<server_context_impl *>(this)->spec_bg_join_or_abort(); // k19-host: the draft context is read below
         if (ctx_dft && llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) > 16) {
             return false;
         }
@@ -4076,6 +4197,12 @@ private:
     }
 
     void update_slots() {
+        // k19-host: the first pass after a background drafter launch continues the slot's prompt beside it (its [4] tail); any later one joins
+        if (spec_bg.live && spec_bg.hold) {
+            spec_bg.hold = false;
+        } else {
+            spec_bg_join_or_abort();
+        }
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -4196,6 +4323,16 @@ private:
     }
 
     void pre_decode() {
+        // k19-host: beside the drafter's background pass only the batch of the slot's last prompt tokens is built (its seq_rm and checkpoint
+        // queue their draft parts behind the pass); anything else joins it first
+        if (spec_bg.live) {
+            const bool tail = slots.size() == 1 && slots[0].state == SLOT_STATE_PROCESSING_PROMPT && slots[0].task &&
+                !slots[0].task->tokens.has_mtmd && slots[0].task->n_tokens() > slots[0].prompt.n_tokens() &&
+                slots[0].task->n_tokens() - slots[0].prompt.n_tokens() <= spec_bg_tail_max;
+            if (!tail) {
+                spec_bg_join_or_abort();
+            }
+        }
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -4801,7 +4938,21 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    if (spec_bg.live && slot.ctx_dft) {
+                        // k19-host: the draft's part behind the drafter's pass on the worker, in the order of the in-line pass
+                        if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0, -1)) {
+                            GGML_ABORT("failed to remove sequence %d with p0=%d, p1=-1\n", slot.id, p0);
+                        }
+                        llama_context * cd = slot.ctx_dft;
+                        const llama_seq_id sid = slot.id;
+                        spec_bg_push([cd, sid, p0]() {
+                            if (!llama_memory_seq_rm(llama_get_memory(cd), sid, p0, -1)) {
+                                GGML_ABORT("failed to remove sequence %d with p0=%d, p1=-1\n", sid, p0);
+                            }
+                        });
+                    } else {
+                        slot.mem.seq_rm(slot.id, p0, -1);
+                    }
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;
@@ -5210,6 +5361,16 @@ private:
             has_prompt |= batch.tokens[i].is_prompt;
         }
 
+        // k19-host: the target decode beside the drafter's background pass is at most spec_bg_tail_max tokens of the one slot: such a decode
+        // is not layer-major (which may free the drafter's compute buffers) and writes at most that many next-n rows (the stash holds them),
+        // it never grows the next-n store (64 rows at least, the pass's batch had more). Anything else joins first
+        if (spec_bg.live && (batch.view.size() > spec_bg_tail_max || slots.size() != 1)) {
+            if (!spec_bg_join()) {
+                SRV_ERR("%s", "failed to process speculative batch\n");
+                throw std::runtime_error("failed to process speculative batch");
+            }
+        }
+
         // a batch of sampled and draft tokens only is a speculative verify batch: with LLAMA_MTP_EXACT=1 its rows are
         // computed as single token decodes would compute them, so greedy speculative output equals plain decoding
         llama_set_verify(ctx_tgt, batch.has_draft && !has_prompt);
@@ -5395,9 +5556,95 @@ private:
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
-            bool ok = spec_early_ok;
+            // k19-host: the drafter's background pass of the previous prompt batch is complete before this batch's pass
+            bool ok = spec_bg_join() && spec_early_ok;
+            // k19-host (LLAMA_MTP_PROMPT_BG=0 off): this batch's pass on a worker, beside the slot's next (last, <= spec_bg_tail_max token)
+            // prompt decode; same segments, rows and order (see spec_bg_state_t)
+            static const bool bg_env = getenv("LLAMA_MTP_PROMPT_BG") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_BG")) != 0;
+            int32_t n_rest = 0;
+            bool bg = bg_env && ok && ret == 0 && slots.size() == 1 && has_prompt && batch.view.size() > spec_bg_tail_max &&
+                off + batch.view.size() == batch.size() && common_speculative_rows_ext_floats(spec.get()) > 0;
+            if (bg) {
+                const server_slot & sl = slots[0];
+                n_rest = sl.task ? sl.task->n_tokens() - sl.prompt.n_tokens() : 0;
+                bg = sl.state == SLOT_STATE_PROCESSING_PROMPT && sl.task && !sl.task->tokens.has_mtmd && sl.spec_i_batch.empty() &&
+                    !(sl.i_batch >= off && sl.i_batch < off + batch.view.size()) && n_rest > 0 && n_rest <= spec_bg_tail_max;
+                for (int i = 0; bg && i < batch.view.size(); ++i) {
+                    bg = batch.view.tokens[i].seq_id == sl.id && batch.view.tokens[i].seq_ids_extra.empty() && !batch.view.tokens[i].output;
+                }
+            }
+            const float * h_bg = nullptr;
+            if (bg) {
+                // the target's rows, resolved here (the worker calls nothing of the target); unmasked: row i at h + i * floats
+                const int64_t nf = common_speculative_rows_ext_floats(spec.get());
+                const int32_t n_rows = batch.view.size();
+                h_bg = llama_get_embeddings_nextn(ctx_tgt);
+                bg = h_bg != nullptr && llama_get_embeddings_nextn_ith(ctx_tgt, n_rows - 1) == h_bg + (size_t) (n_rows - 1) * nf;
+                if (bg) {
+                    // an earlier asynchronous draft save (a checkpoint's draft part) completes here, not at the worker's first decode,
+                    // so the main thread's checkpoint evictions beside the pass never free a buffer still being written
+                    if (ctx_dft) {
+                        llama_state_seq_async_wait(ctx_dft);
+                    }
+                    bg = common_speculative_rows_ext_set(spec.get(), h_bg, n_rows, std::min<int32_t>(n_rows, 256));
+                }
+            }
+            if (bg) {
+                std::vector<common_batch> segs;
+                std::vector<int32_t>      segs_a;
+                if (seg_breaks.empty()) {
+                    segs.emplace_back();
+                    segs.back().n_pos = batch.view.n_pos;
+                    segs.back().tokens = batch.view.tokens;
+                    segs_a.push_back(0);
+                } else {
+                    int32_t a = spec_seg_a;
+                    for (size_t k = spec_seg_done; k <= seg_breaks.size(); ++k) {
+                        const int32_t b = k < seg_breaks.size() ? seg_breaks[k] : batch.view.size();
+                        segs.emplace_back();
+                        segs.back().n_pos = batch.view.n_pos;
+                        segs.back().tokens.assign(batch.view.tokens.begin() + a, batch.view.tokens.begin() + b);
+                        segs_a.push_back(a);
+                        a = b;
+                    }
+                }
+                const bool whole = seg_breaks.empty();
+                spec_bg.closing  = false;
+                spec_bg.q.clear();
+                spec_bg.ok       = true;
+                spec_bg.t_launch = ggml_time_us();
+                common_speculative * sp = spec.get();
+                spec_bg.thr = std::thread([this, sp, whole, segs = std::move(segs), segs_a = std::move(segs_a)]() {
+                    bool ok_w = true;
+                    for (size_t k = 0; k < segs.size() && ok_w; ++k) {
+                        // as the in-line pass: one process() of the whole view without breaks, else one per segment at its row offset
+                        ok_w = whole ? common_speculative_process(sp, segs[k]) : common_speculative_process_rows(sp, segs[k], segs_a[k]);
+                    }
+                    spec_bg.ok = ok_w;
+                    while (true) {
+                        std::function<void()> fn;
+                        {
+                            std::unique_lock<std::mutex> lock(spec_bg.m);
+                            spec_bg.cv.wait(lock, [&]() { return spec_bg.closing || !spec_bg.q.empty(); });
+                            if (spec_bg.q.empty()) {
+                                return; // closing, nothing left
+                            }
+                            fn = std::move(spec_bg.q.front());
+                            spec_bg.q.pop_front();
+                        }
+                        if (ok_w) {
+                            fn(); // the draft-context steps the main thread queued, in its order (skipped after a failed pass)
+                        }
+                    }
+                });
+                spec_bg.live = true;
+                spec_bg.hold = true;
+                SRV_INF("mtp prompt pass on a worker: %d rows, %zu segments beside the next %d-token target decode (LLAMA_MTP_PROMPT_BG=0 off)\n",
+                        batch.view.size(), seg_breaks.empty() ? (size_t) 1 : seg_breaks.size() + 1 - spec_seg_done, n_rest);
+                srv_ph("drafter launched");
+            }
             queue_tasks.yield_to_queue([&]() {
-                if (!ok) {
+                if (!ok || bg) {
                     return;
                 }
                 if (seg_breaks.empty()) {
@@ -5459,6 +5706,18 @@ private:
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
         };
+
+        // k19-host: a slot that samples in this view uses the speculative state (begin, draft, accept): the background pass ends first
+        if (spec_bg.live) {
+            bool samples = false;
+            for (const auto & slot : slots) {
+                samples |= !slot.spec_i_batch.empty() || is_inside_view(slot.i_batch);
+            }
+            if (samples && !spec_bg_join()) {
+                SRV_ERR("%s", "failed to process speculative batch\n");
+                throw std::runtime_error("failed to process speculative batch");
+            }
+        }
 
         // TODO @ngxson : it's tricky to make sub-batch compatible with common_sampler_sample_and_accept_n,
         // so for now we will throw an error in this case: https://github.com/ggml-org/llama.cpp/issues/24840
