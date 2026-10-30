@@ -2393,7 +2393,8 @@ void llama_context::moe_cache_devseed_fallback(bool host_seed_fits) {
     }
     if (host_seed_fits) {
         const char * ep = getenv("LLAMA_MOE_CACHE_DEVSEED_PREFER");
-        if ((ep != nullptr && atoi(ep) == 0) || !moe_cache_seed_sync || moe_cache_seed_auto || seed_price_wanted()) {
+        // prompts that do not seed at all (moe_cache_seed_enabled off, e.g. a resident RAM tier) get no device seed either
+        if ((ep != nullptr && atoi(ep) == 0) || !moe_cache_seed_enabled || !moe_cache_seed_sync || moe_cache_seed_auto || seed_price_wanted()) {
             return;
         }
     }
