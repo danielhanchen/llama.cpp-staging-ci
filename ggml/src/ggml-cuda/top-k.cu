@@ -505,6 +505,151 @@ static void top_k_radix_cuda(
     }
 }
 
+// k19 (idea from ikawrakow/ik_llama.cpp PR #2767, Joel Farthing, MIT): the radix select above in one launch per call, one block per
+// row. The same four 8-bit histogram passes over the same keys pick the same threshold key and the same count of kept ties, and the
+// gather writes the same order: the keys above the threshold in column order, then the first kept ties in column order. So the output
+// is bitwise that of top_k_radix_cuda (init + 4 x (histogram + select) + gather = 10 launches per call). GGML_CUDA_TOPK_ONEBLOCK=0: off.
+#ifndef GGML_CUDA_TOP_K_ONE_BLOCK_MAX_NCOLS
+#    define GGML_CUDA_TOP_K_ONE_BLOCK_MAX_NCOLS 65536
+#endif // GGML_CUDA_TOP_K_ONE_BLOCK_MAX_NCOLS
+
+// adds 1 to hist[bin] for every lane with match; every lane of the warp must call it
+static __device__ __forceinline__ void top_k_histogram_add(int * hist, const int bin, const bool match) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    // the top byte of most scores is the same: one atomic per distinct bin of the warp instead of up to 32 on one address
+    const unsigned active = __ballot_sync(0xffffffff, match);
+    if (match) {
+        const unsigned peers = __match_any_sync(active, bin);
+        if ((int) (threadIdx.x % WARP_SIZE) == __ffs(peers) - 1) {
+            atomicAdd(&hist[bin], __popc(peers));
+        }
+    }
+#else
+    if (match) {
+        atomicAdd(&hist[bin], 1);
+    }
+#endif
+}
+
+template<int BLOCK_SIZE>
+static __global__ void __launch_bounds__(BLOCK_SIZE, 1) top_k_radix_one_block(
+        const float * __restrict__ src, int * __restrict__ dst, const int ncols, const int k) {
+    constexpr int RADIX_BITS = 8;
+    constexpr int NBINS      = 1 << RADIX_BITS;
+    constexpr int NWARPS     = BLOCK_SIZE / WARP_SIZE;
+    static_assert(BLOCK_SIZE >= NBINS && BLOCK_SIZE % WARP_SIZE == 0, "one thread per bin");
+    static_assert(BLOCK_SIZE < (1 << 15), "two 16 bit counters per int");
+
+    const int tid  = threadIdx.x;
+    const int warp = tid / WARP_SIZE;
+    const int lane = tid % WARP_SIZE;
+    const float * row_src = src + (size_t) blockIdx.x * ncols;
+    int *         row_dst = dst + (size_t) blockIdx.x * k;
+
+    __shared__ int      histogram[NBINS];
+    __shared__ int      warp_counts[NWARPS];
+    __shared__ uint32_t s_prefix;
+    __shared__ int      s_rank;
+
+    uint32_t prefix      = 0;
+    uint32_t prefix_mask = 0;
+    int      rank        = k;
+    for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
+        if (tid < NBINS) {
+            histogram[tid] = 0;
+        }
+        __syncthreads();
+        for (int col0 = 0; col0 < ncols; col0 += BLOCK_SIZE) {
+            const int      col   = col0 + tid;
+            const uint32_t key   = col < ncols ? top_k_float_to_ordered(row_src[col]) : 0;
+            const bool     match = col < ncols && (key & prefix_mask) == prefix;
+            top_k_histogram_add(histogram, (key >> shift) & (NBINS - 1), match);
+        }
+        __syncthreads();
+
+        // top_k_radix_select's walk from the highest bin down, as a scan: with S(b) the count of keys in bins >= b, the selected bin is
+        // the highest b with S(b) >= rank (bin 0 when there is none), and rank - S(bin + 1) of its keys are kept
+        const int bin = NBINS - 1 - tid;
+        const int h   = tid < NBINS ? histogram[bin] : 0;
+        int incl = warp_prefix_inclusive_sum<int>(h);
+        if (lane == WARP_SIZE - 1) {
+            warp_counts[warp] = incl;
+        }
+        __syncthreads();
+        if (tid < NBINS) {
+            for (int w = 0; w < warp; ++w) {
+                incl += warp_counts[w];
+            }
+            const int excl = incl - h; // S(bin + 1)
+            if (excl < rank && (incl >= rank || bin == 0)) {
+                s_prefix = prefix | ((uint32_t) bin << shift);
+                s_rank   = rank - excl;
+            }
+        }
+        __syncthreads();
+        prefix       = s_prefix;
+        rank         = s_rank;
+        prefix_mask |= (uint32_t) (NBINS - 1) << shift;
+    }
+
+    // top_k_radix_gather's order: the keys above the threshold in column order, then the first n_equal ties in column order
+    const int n_equal   = rank;
+    const int n_greater = k - n_equal;
+    int pos_greater = 0;
+    int pos_equal   = 0;
+    for (int col0 = 0; col0 < ncols; col0 += BLOCK_SIZE) {
+        if (pos_greater >= n_greater && pos_equal >= n_equal) {
+            break; // uniform: every thread holds the same counters
+        }
+        const int      col     = col0 + tid;
+        const uint32_t key     = col < ncols ? top_k_float_to_ordered(row_src[col]) : 0;
+        const bool     greater = col < ncols && key >  prefix;
+        const bool     equal   = col < ncols && key == prefix;
+
+        const int flags     = (int) greater | ((int) equal << 16);
+        const int inclusive = warp_prefix_inclusive_sum<int>(flags);
+        if (lane == WARP_SIZE - 1) {
+            warp_counts[warp] = inclusive;
+        }
+        __syncthreads();
+
+        int before = 0;
+        int total  = 0;
+#pragma unroll
+        for (int w = 0; w < NWARPS; ++w) {
+            const int c = warp_counts[w];
+            before += w < warp ? c : 0;
+            total  += c;
+        }
+        const int exclusive = before + inclusive - flags;
+
+        if (greater) {
+            row_dst[pos_greater + (exclusive & 0xFFFF)] = col;
+        } else if (equal) {
+            const int pos = pos_equal + (exclusive >> 16);
+            if (pos < n_equal) {
+                row_dst[n_greater + pos] = col;
+            }
+        }
+        pos_greater += total & 0xFFFF;
+        pos_equal   += total >> 16;
+        __syncthreads();
+    }
+}
+
+static bool ggml_cuda_top_k_one_block_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_TOPK_ONEBLOCK");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static void top_k_radix_one_block_cuda(const float * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
+    constexpr int BLOCK_SIZE = 1024;
+    top_k_radix_one_block<BLOCK_SIZE><<<(unsigned int) nrows, BLOCK_SIZE, 0, stream>>>(src, dst, ncols, k);
+}
+
 static void top_k_argsort_cuda(
         ggml_cuda_pool & pool,
         const float * src, int * dst, int ncols, int64_t nrows, int k, bool use_cub, cudaStream_t stream,
@@ -571,6 +716,13 @@ static void ggml_cuda_op_top_k_deterministic(ggml_cuda_pool & pool, const float 
         return;
     }
 #endif // GGML_CUDA_USE_CUB
+
+    // k19: few rows (one wave of blocks): the same selection and order in one launch, see top_k_radix_one_block
+    if (ggml_cuda_top_k_one_block_enabled() && nrows <= ggml_cuda_info().devices[device].nsm &&
+            ncols <= GGML_CUDA_TOP_K_ONE_BLOCK_MAX_NCOLS) {
+        top_k_radix_one_block_cuda(src0_d, dst_d, ncols, nrows, k, stream);
+        return;
+    }
 
     top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
 }
