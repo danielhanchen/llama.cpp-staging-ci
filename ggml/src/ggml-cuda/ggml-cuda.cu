@@ -11388,8 +11388,14 @@ static bool ggml_backend_cuda_buffer_evict_prepare(ggml_backend_buffer_t buffer)
             ctx->host_copy = nullptr;
             return false;
         }
-        CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(cudaMemcpy(ctx->host_copy, ctx->dev_ptr, ctx->vmm_size, cudaMemcpyDeviceToHost));
+        // fail safe (kdp): a copy that fails leaves the buffer resident and never evicted
+        if (cudaDeviceSynchronize() != cudaSuccess ||
+                cudaMemcpy(ctx->host_copy, ctx->dev_ptr, ctx->vmm_size, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            (void) cudaGetLastError();
+            (void) cudaFreeHost(ctx->host_copy);
+            ctx->host_copy = nullptr;
+            return false;
+        }
     }
     return true;
 #else
@@ -11409,13 +11415,20 @@ static size_t ggml_backend_cuda_buffer_evict(ggml_backend_buffer_t buffer) {
         return 0;
     }
     ggml_cuda_set_device(ctx->device);
-    // every reader of the weights (any stream of the device) is done before the memory goes
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // every reader of the weights (any stream of the device) is done before the memory goes (fail safe: else nothing is lent)
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0;
+    }
     if (!ggml_backend_cuda_buffer_evict_prepare(buffer)) {
         return 0;
     }
-    CU_CHECK(cuMemUnmap((CUdeviceptr) ctx->dev_ptr, ctx->vmm_size));
-    CU_CHECK(cuMemRelease(ctx->vmm_handle));
+    // fail safe (kdp): an unmap that fails keeps the weights resident (nothing lent)
+    if (cuMemUnmap((CUdeviceptr) ctx->dev_ptr, ctx->vmm_size) != CUDA_SUCCESS) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    (void) cuMemRelease(ctx->vmm_handle);
     ctx->vmm_handle = 0;
     ctx->evicted    = true;
     ggml_cuda_own_add(ctx->device, -(int64_t) ctx->vmm_size);
@@ -11440,7 +11453,15 @@ static bool ggml_backend_cuda_buffer_restore(ggml_backend_buffer_t buffer) {
     if (!ggml_cuda_vmm_buffer_map(ctx)) {
         return false;
     }
-    CUDA_CHECK(cudaMemcpy(ctx->dev_ptr, ctx->host_copy, ctx->vmm_size, cudaMemcpyHostToDevice));
+    if (cudaMemcpy(ctx->dev_ptr, ctx->host_copy, ctx->vmm_size, cudaMemcpyHostToDevice) != cudaSuccess) {
+        // fail safe (kdp): unmapped again, still evicted; the caller turns drafting off and retries later
+        (void) cudaGetLastError();
+        (void) cuMemUnmap((CUdeviceptr) ctx->dev_ptr, ctx->vmm_size);
+        (void) cuMemRelease(ctx->vmm_handle);
+        ctx->vmm_handle = 0;
+        ggml_cuda_own_add(ctx->device, -(int64_t) ctx->vmm_size);
+        return false;
+    }
     ctx->evicted = false;
     return true;
 #else
