@@ -104,6 +104,26 @@ inline uint64_t cgroup_available(const std::string & proc_cgroup, const std::str
     return res;
 }
 
+// memory left under memory.max of one cgroup v2 directory (the weight store reads the cgroup namespace root, /sys/fs/cgroup, with it),
+// UINT64_MAX if there is no limit. Used = memory.current less the reclaimable file pages, the same set cgroup_available credits
+// (active_file + inactive_file + slab_reclaimable). k19: the weight store used to credit memory.stat "file", which also holds shmem
+// (tmpfs, /dev/shm, memfd: swap-backed, never reclaimed without swap) and mlocked file pages (unevictable, e.g. --mlock on the model's
+// own mapping): an 8 GiB scope with 1 GiB anon and a 4 GiB mlocked mapping read 7165 MiB available against 3069 MiB that fit, and
+// allocating it was OOM-killed (same for 3 GiB of memfd: 7158 vs 4093 MiB). credit_file = true: that formula, as before
+inline uint64_t cgroup_v2_dir_available(const std::string & dir, bool credit_file) {
+    uint64_t lim = 0;
+    if (!read_u64(dir + "/memory.max", lim)) {
+        return UINT64_MAX; // "max" or missing
+    }
+    uint64_t cur = 0;
+    read_u64(dir + "/memory.current", cur);
+    static const char * const keys_file[] = { "file", nullptr };
+    static const char * const keys_v2[]   = { "active_file", "inactive_file", "slab_reclaimable", nullptr };
+    const uint64_t reclaimable = stat_sum(dir + "/memory.stat", credit_file ? keys_file : keys_v2, nullptr);
+    const uint64_t used = cur - std::min(cur, reclaimable);
+    return lim > used ? lim - used : 0;
+}
+
 // MemAvailable of a /proc/meminfo file in bytes, 0 if it is missing
 inline uint64_t meminfo_available(const std::string & meminfo) {
     std::ifstream f(meminfo);

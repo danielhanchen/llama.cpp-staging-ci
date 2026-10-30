@@ -93,6 +93,32 @@ int main() {
     check("no /proc/self/cgroup: no limit", llama_sysmem::cgroup_available((root / "none").string(), sys), UINT64_MAX);
     check("no meminfo: unknown", llama_sysmem::available((root / "none").string(), cg, sys), 0);
 
+    // k19: one cgroup v2 directory (the weight store's namespace-root read); the numbers of the 8 GiB scope probes
+    // (tests/k19_ram_avail/probe.cpp, MiB): mlock 4 GiB of the model's mapping + 1 GiB anon, memfd (shmem) 3 GiB + 1 GiB anon, mmap 4 GiB clean
+    {
+        const fs::path d = root / "ns";
+        put(d / "memory.max", std::to_string(8192*MiB) + "\n");
+        put(d / "memory.current", std::to_string(5123*MiB) + "\n");
+        put(d / "memory.stat", "anon " + std::to_string(1024*MiB) + "\nfile " + std::to_string(4096*MiB) +
+            "\nactive_file 0\ninactive_file 0\nfile_mapped " + std::to_string(4096*MiB) + "\nunevictable " + std::to_string(4096*MiB) +
+            "\nslab_reclaimable 0\nshmem 0\n");
+        check("v2 dir, mlocked file pages are used", llama_sysmem::cgroup_v2_dir_available(d.string(), false), (8192 - 5123)*MiB);
+        check("v2 dir, LLAMA_SYSMEM_CREDIT_FILE=1 (old)", llama_sysmem::cgroup_v2_dir_available(d.string(), true), (8192 - 1027)*MiB);
+        put(d / "memory.current", std::to_string(4106*MiB) + "\n");
+        put(d / "memory.stat", "anon " + std::to_string(1024*MiB) + "\nfile " + std::to_string(3072*MiB) +
+            "\nactive_file 0\ninactive_file 0\nshmem " + std::to_string(3072*MiB) + "\nslab_reclaimable " + std::to_string(7*MiB) + "\n");
+        check("v2 dir, shmem (memfd / tmpfs) is used", llama_sysmem::cgroup_v2_dir_available(d.string(), false), (8192 - 4106 + 7)*MiB);
+        // clean page cache, mapped (active) or not: reclaimable, credited exactly as before (unchanged reading)
+        put(d / "memory.current", std::to_string(5123*MiB) + "\n");
+        put(d / "memory.stat", "anon " + std::to_string(1024*MiB) + "\nfile " + std::to_string(4096*MiB) + "\nactive_file " +
+            std::to_string(4096*MiB) + "\ninactive_file 0\nfile_mapped " + std::to_string(4096*MiB) + "\nslab_reclaimable 0\nshmem 0\n");
+        check("v2 dir, clean mapped page cache is reclaimable", llama_sysmem::cgroup_v2_dir_available(d.string(), false), (8192 - 1027)*MiB);
+        check("v2 dir, same as the old reading there", llama_sysmem::cgroup_v2_dir_available(d.string(), true), (8192 - 1027)*MiB);
+        put(d / "memory.max", "max\n");
+        check("v2 dir, memory.max \"max\": no limit", llama_sysmem::cgroup_v2_dir_available(d.string(), false), UINT64_MAX);
+        check("v2 dir, missing: no limit", llama_sysmem::cgroup_v2_dir_available((root / "nodir").string(), false), UINT64_MAX);
+    }
+
     // the live system gives a value
     printf("live: %llu MiB\n", (unsigned long long) (llama_sysmem::available() >> 20));
 

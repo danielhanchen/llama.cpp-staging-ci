@@ -1309,27 +1309,14 @@ size_t llama_weight_store::ram_available() {
             }
         }
     }
-    // cgroup v2: the limit minus what is used, the page cache of the group counts as available
-    std::ifstream fmax("/sys/fs/cgroup/memory.max");
-    std::string smax;
-    if (fmax >> smax && smax != "max") {
-        const size_t lim = (size_t) strtoull(smax.c_str(), nullptr, 10);
-        size_t cur = 0;
-        std::ifstream fcur("/sys/fs/cgroup/memory.current");
-        fcur >> cur;
-        size_t file = 0;
-        std::ifstream fst("/sys/fs/cgroup/memory.stat");
-        std::string k;
-        size_t v = 0;
-        while (fst >> k >> v) {
-            if (k == "file") {
-                file = v;
-                break;
-            }
+    // cgroup v2: the limit minus what is used; the reclaimable file pages of the group count as available, shmem and mlocked file
+    // pages do not (llama_sysmem::cgroup_v2_dir_available). LLAMA_SYSMEM_CREDIT_FILE=1: every page of memory.stat "file", as before k19
+    {
+        static const bool credit_file = [] { const char * e = getenv("LLAMA_SYSMEM_CREDIT_FILE"); return e != nullptr && atoi(e) != 0; }();
+        const uint64_t cg = llama_sysmem::cgroup_v2_dir_available("/sys/fs/cgroup", credit_file);
+        if (cg != UINT64_MAX) {
+            avail = avail == 0 ? (size_t) cg : std::min(avail, (size_t) cg);
         }
-        const size_t used = cur > file ? cur - file : 0;
-        const size_t cg   = lim > used ? lim - used : 0;
-        avail = avail == 0 ? cg : std::min(avail, cg);
     }
     // k16-disk: the limits of this process's own cgroup and of its parents (/proc/self/cgroup), not only of the namespace root read
     // above: under a systemd scope / service (MemoryMax=), Slurm or any cgroup that is not the root of a cgroup namespace, the root
