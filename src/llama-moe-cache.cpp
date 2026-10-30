@@ -6661,6 +6661,7 @@ struct llama_moe_cache::impl {
         // a graph that needs fewer slots than are lent keeps them (LLAMA_MOE_CACHE_LEND_SHRINK=1 gives them back): giving them back clears
         // and refills them, and the next larger graph of the prompt (the ubatches grow with the KV cache) evicts them again
         static const bool lend_shrink = getenv("LLAMA_MOE_CACHE_LEND_SHRINK") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_LEND_SHRINK")) != 0;
+        static const bool lend_keep_nested = getenv("LLAMA_MOE_CACHE_LEND_KEEP_NESTED") == nullptr || atoi(getenv("LLAMA_MOE_CACHE_LEND_KEEP_NESTED")) != 0;
         if (!dry && !lend_shrink && g.lru.n_lent > n_lend && g.lru.n_lent <= n_max) {
             std::vector<size_t> offsets_k(n_copies);
             std::vector<size_t> part_sizes_k(n_graph);
@@ -6668,6 +6669,15 @@ struct llama_moe_cache::impl {
                 n_lend     = g.lru.n_lent;
                 offsets    = std::move(offsets_k);
                 part_sizes = std::move(part_sizes_k);
+            } else if (lend_keep_nested) {
+                // k19-fn32: place() is a best fit (the graph part goes to the smallest bank tail that holds it), so it can fail at more slots
+                // where it fit at fewer: G4 Qwen3.8-Flash-Next 32 GB 30k, the last group (3 ubatches) fit in 2104 slots but not in the 2283
+                // lent, and the cache gave all 2283 back, refilled 5.4 GB (111 ms with no kernel) and lent 2104 of them again. The placement
+                // in n_lend slots lies in the last n_lend slots of every bank, inside the n_lent lent ones: keep them all with it
+                // (LLAMA_MOE_CACHE_LEND_KEEP_NESTED=0: give them back as before)
+                LLAMA_LOG_INFO("%s: %s: MoE cache keeps %d lent slots for a graph that fits in %d (nested placement)\n", __func__,
+                    ggml_backend_name(backend), g.lru.n_lent, n_lend);
+                n_lend = g.lru.n_lent;
             }
         }
         ggml_backend_buffer_t buf = devices[id].buf_bank.get();
