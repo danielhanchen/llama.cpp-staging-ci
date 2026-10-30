@@ -479,6 +479,12 @@ extern "C" {
     // returns the growth the graph needed (0 after an allocation that was not refused)
     GGML_API void                 ggml_backend_sched_set_alloc_limit(ggml_backend_sched_t sched, bool enable, size_t max_grow);
     GGML_API size_t               ggml_backend_sched_get_alloc_over(ggml_backend_sched_t sched);
+    // k19-synclend: the operations on host weights that a device would run (the weights copied to it) stay on the host while op_offload is
+    // false (the value ggml_backend_sched_new was given is the default); the fallback of a graph refused by its SYNC copies, see
+    // ggml_backend_sched_alloc_graph (GGML_SCHED_HOST_OPS_FALLBACK=0: neither the refusal nor the fallback, ggml_backend_sched_host_fallback_on)
+    GGML_API bool                 ggml_backend_sched_get_op_offload(ggml_backend_sched_t sched);
+    GGML_API void                 ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, bool op_offload);
+    GGML_API bool                 ggml_backend_sched_host_fallback_on(void);
     // k15-fn: t is a prefetched weight copy of the bound graph in staging memory (the arena or memory the user lent for the copies), which
     // stays as written until the copy queue reuses its slot; false for a copy the graph allocator placed (its memory is reused by the graph)
     GGML_API bool                 ggml_backend_sched_tensor_is_staged(ggml_backend_sched_t sched, const struct ggml_tensor * t);

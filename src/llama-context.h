@@ -900,6 +900,7 @@ private:
     std::array<ggml_backend_sched_plan_t, GF_SMALL_N> gf_res_small_plan{};
     uint64_t n_plan_restores = 0;
     uint64_t n_plan_saves    = 0;
+    uint64_t n_host_fallbacks = 0; // k19-synclend: graphs built again with the operations on host weights on the host
     uint64_t n_plan_invalid  = 0;
     void small_plan_free(uint32_t i);
     size_t release_device_compute(); // k17-small: frees the device compute buffers (an MTP drafter beside its target's prompt group)

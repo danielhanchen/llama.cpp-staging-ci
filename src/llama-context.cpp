@@ -3745,7 +3745,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         prefetch_n_tokens = ubatch.n_tokens;
-        if (n_small > 0) {
+        auto small_snapshot = [&]() {
+            if (n_small == 0) {
+                return;
+            }
             auto & sv = gf_res_small_state[i_small];
             sv.clear();
             for (ggml_tensor * t = ggml_get_first_tensor(res->get_ctx()); t != nullptr; t = ggml_get_next_tensor(res->get_ctx(), t)) {
@@ -3758,7 +3761,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 st.flags  = t->flags;
                 sv.push_back(st);
             }
-        }
+        };
+        small_snapshot();
         if (moe_cache) {
             moe_cache->set_graph(gf);
         }
@@ -3784,6 +3788,38 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 moe_cache->set_graph(gf);
             }
             alloc_ok = gf != nullptr && ggml_backend_sched_alloc_graph(sched.get(), gf);
+        }
+        // k19-synclend (GGML_SCHED_HOST_OPS_FALLBACK=0 off): a graph that did not allocate (e.g. refused because the MoE cache did not lend
+        // the SYNC copies of its host weights and the device cannot hold them, see ggml_backend_sched_alloc_graph) is built again with the
+        // operations on host weights kept on the host, as for batches below the backend's offload size: no copies of those weights, the
+        // prefetch stays on for the graphs after it. G4 Qwen3.6 UD-Q4_K_XL 12 GB, LLAMA_MOE_FIT_MARGIN_MAX_RATIO=1.8: the 42-token chat
+        // prompt failed and with it every later prompt of the process
+        if (!alloc_ok && gf != nullptr && ggml_backend_sched_host_fallback_on() && ggml_backend_sched_get_op_offload(sched.get())) {
+            const size_t over = ggml_backend_sched_get_alloc_over(sched.get());
+            res->reset();
+            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+            gf = model.build_graph(graph_params(res, ubatch, mctx, gtype));
+            if (gf && cparams.batch_invariant) {
+                for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                    ggml_graph_node(gf, i)->flags |= GGML_TENSOR_FLAG_BATCH_INVARIANT;
+                }
+            }
+            if (gf) {
+                small_snapshot();
+                if (moe_cache) {
+                    moe_cache->set_graph(gf);
+                }
+                ggml_backend_sched_set_op_offload(sched.get(), false);
+                alloc_ok = ggml_backend_sched_alloc_graph(sched.get(), gf);
+                ggml_backend_sched_set_op_offload(sched.get(), true);
+            }
+            n_host_fallbacks++;
+            if (n_host_fallbacks <= 2 || !alloc_ok) {
+                LLAMA_LOG_WARN("%s: a graph of %u tokens failed to allocate (%.2f MiB more needed): built again with the operations on host weights "
+                    "on the host, %s (%llu so far; GGML_SCHED_HOST_OPS_FALLBACK=0 to disable)\n", __func__, ubatch.n_tokens, over/1024.0/1024.0,
+                    alloc_ok ? "allocated" : "failed again", (unsigned long long) n_host_fallbacks);
+            }
         }
         if (!alloc_ok) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);

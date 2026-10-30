@@ -1053,6 +1053,8 @@ struct ggml_backend_sched_prefetch {
     size_t ext_size;
     bool   lending;   // the user lent memory for the last graph, it is told when the memory is no longer used
     bool   sync_lend_log; // logged that SYNC copies are placed in lent memory (the graph allocator could not grow by them)
+    size_t sync_short;    // k19-synclend: the growth by the SYNC copies of the last binding that the lender did not place (0: none) and
+    size_t sync_free;     // the free device memory it was measured against (see ggml_backend_sched_alloc_graph)
     // the prefetched copies placed in lent memory (sorted): with the graph allocator in lent memory too, the buffer alone does not tell
     // a prefetched copy from a graph tensor (e.g. the copy of an input from another backend, which must not go through the copy queue)
     const struct ggml_tensor ** lent_copies;
@@ -1148,11 +1150,13 @@ struct ggml_backend_sched {
     bool   alloc_lend_graph; // k11: growth past the free memory may be lent (ggml_backend_sched_set_alloc_lend_graph)
     ggml_backend_sched_upload_batch * upload_batch; // k15-fn: the graph-input uploads of the split being prepared (GGML_SCHED_UPLOAD_BATCH)
     size_t alloc_over; // growth the last refused allocation needed, 0 if it was not refused
+    int    n_sync_refused; // k19-synclend: graphs refused by their unplaced SYNC copies (the first two are logged)
     int  pre_split; // split whose first pre_nodes nodes were launched before the CPU split preceding it, -1 if none
     int  pre_nodes;
 
     ggml_backend_sched_lend_callback callback_lend;
     int  lend_sync; // bindings with only SYNC copies and no arena are offered to the lender: 0 never, 1 (default) if the graph allocator cannot grow, 2 always (GGML_SCHED_LEND_SYNC)
+    bool host_fallback; // k19-synclend: a graph whose SYNC copies neither fit nor are lent is refused, the prefetch kept (GGML_SCHED_HOST_OPS_FALLBACK=0 off)
     void * callback_lend_user_data;
 
     // reads of the prefetched host weights ahead [ggml_backend_sched_set_prefetch_plan_callback]
@@ -3366,7 +3370,13 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
     // GGML_SCHED_PREFETCH_HEADROOM_MIB, default 512, for what the backends allocate while computing), so a binding the graph allocator
     // already holds (e.g. the reserved seeding ubatch of the MoE cache) or can hold keeps the old path; 2: always; 0: never
     bool sync_lend[GGML_SCHED_MAX_BACKENDS] = { false };
+    size_t sync_grow[GGML_SCHED_MAX_BACKENDS] = { 0 };
+    size_t sync_free[GGML_SCHED_MAX_BACKENDS] = { 0 };
     bool any_sync_lend = false;
+    for (int b = 0; b < sched->n_backends && !dry; b++) {
+        sched->pf[b].sync_short = 0;
+        sched->pf[b].sync_free  = 0;
+    }
     for (int b = 0; b < sched->n_backends; b++) {
         const struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
         sync_lend[b] = pf->n_bound > 0 && pf->n_async == 0 && !dry && pf->arena == NULL && sched->callback_lend != NULL && sched->lend_sync != 0;
@@ -3410,6 +3420,8 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
                 ggml_backend_dev_memory(dev, &free, &total);
             }
             const bool fits = grow == 0 || dev == NULL || total == 0 || free >= grow + headroom;
+            sync_grow[b] = grow;
+            sync_free[b] = free;
             if (fits) {
                 sync_lend[b] = false;
             } else if (!sched->pf[b].sync_lend_log) {
@@ -3737,6 +3749,10 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
                 all_placed = all_placed && sched->splits[pf->split_ids[k]].pf_size == 0;
             }
             if (!all_placed) {
+                if (!dry) {
+                    pf->sync_short = sync_grow[b];
+                    pf->sync_free  = sync_free[b];
+                }
                 for (int k = 0; k < pf->n_bound; k++) {
                     struct ggml_backend_sched_split * split = &sched->splits[pf->split_ids[k]];
                     for (int j = 0; j < split->n_inputs; j++) {
@@ -5047,6 +5063,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
         // when no arena exists, see ggml_backend_sched_prefetch_bind); 1 (default) only if the graph allocator cannot grow by them; 2 always
         const char * GGML_SCHED_LEND_SYNC = getenv("GGML_SCHED_LEND_SYNC");
         sched->lend_sync    = GGML_SCHED_LEND_SYNC ? atoi(GGML_SCHED_LEND_SYNC) : 1;
+        const char * GGML_SCHED_HOST_OPS_FALLBACK = getenv("GGML_SCHED_HOST_OPS_FALLBACK");
+        sched->host_fallback = GGML_SCHED_HOST_OPS_FALLBACK == nullptr || atoi(GGML_SCHED_HOST_OPS_FALLBACK) != 0;
         const char * GGML_SCHED_PREFETCH_WINDOW = getenv("GGML_SCHED_PREFETCH_WINDOW");
         const char * GGML_SCHED_PREFETCH_CROSS  = getenv("GGML_SCHED_PREFETCH_CROSS");
         const char * GGML_SCHED_PREFETCH_ADAPT  = getenv("GGML_SCHED_PREFETCH_ADAPT");
@@ -5553,6 +5571,23 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     over = std::max(over, grow_dev[b]);
                 }
             }
+            // k19-synclend (GGML_SCHED_HOST_OPS_FALLBACK=0 off): the SYNC copies the lender did not place (e.g. a small prompt ubatch whose
+            // experts are looked up in the MoE cache while its other layers copy theirs) and the graph allocator cannot grow by them: refused
+            // before the allocation fails, the prefetch kept; the caller can build the graph again with the operations on host weights kept
+            // on the host (ggml_backend_sched_set_op_offload). G4 Qwen3.6 UD-Q4_K_XL 12 GB, LLAMA_MOE_FIT_MARGIN_MAX_RATIO=1.8: a 42-token chat
+            // prompt needed 207.81 MiB with 192.56 MiB free, cudaMalloc failed, the prefetch was disabled and every later prompt failed too
+            if (!guard_lend && sched->host_fallback && sched->op_offload && sched->pf[b].sync_short > 0) {
+                static const size_t sync_guard = (size_t) (getenv("GGML_SCHED_ALLOC_LIMIT_FREE_MIB") ? std::max(0, atoi(getenv("GGML_SCHED_ALLOC_LIMIT_FREE_MIB"))) : 64) << 20;
+                if (sched->pf[b].sync_short + sync_guard > sched->pf[b].sync_free) {
+                    over = std::max(over, sched->pf[b].sync_short);
+                    if (++sched->n_sync_refused <= 2) {
+                        GGML_LOG_INFO("%s: %s: the SYNC copies the lender did not place need %.2f MiB more graph allocation, %.2f MiB free: refused "
+                            "before the allocation, the host weight prefetch kept (%d so far; GGML_SCHED_HOST_OPS_FALLBACK=0 to disable)\n", __func__,
+                            ggml_backend_name(sched->backends[b]), sched->pf[b].sync_short/1024.0/1024.0, sched->pf[b].sync_free/1024.0/1024.0,
+                            sched->n_sync_refused);
+                    }
+                }
+            }
         }
         if (over > 0) {
             // as a failed allocation below: the caller resets the scheduler, which binds the copies again for the next graph
@@ -5893,6 +5928,21 @@ void ggml_backend_sched_free_device_buffers(ggml_backend_sched_t sched) {
 size_t ggml_backend_sched_get_alloc_over(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->alloc_over;
+}
+
+bool ggml_backend_sched_get_op_offload(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->op_offload;
+}
+
+void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, bool op_offload) {
+    GGML_ASSERT(sched);
+    sched->op_offload = op_offload;
+}
+
+bool ggml_backend_sched_host_fallback_on(void) {
+    static const bool on = getenv("GGML_SCHED_HOST_OPS_FALLBACK") == nullptr || atoi(getenv("GGML_SCHED_HOST_OPS_FALLBACK")) != 0;
+    return on;
 }
 
 bool ggml_backend_sched_tensor_is_staged(ggml_backend_sched_t sched, const struct ggml_tensor * t) {
