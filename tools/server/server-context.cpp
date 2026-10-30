@@ -5271,10 +5271,20 @@ private:
             (!lm_cap_req || (cap_early && caps_sorted));
         // the checkpoint (slot state) is made on this thread, outside the yield; with the overlap, the drafter's early segments too
         const bool sync_after = (lm_cap_req && cap_early) || spec_overlap;
+        // k19-host (diagnostic, LLAMA_DECODE_PHASE_LOG=1): host time of the server's steps of a decode of more than 64 tokens
+        static const bool srv_phase = getenv("LLAMA_DECODE_PHASE_LOG") != nullptr && atoi(getenv("LLAMA_DECODE_PHASE_LOG")) != 0;
+        const int64_t t_ph0 = srv_phase && batch.view.size() > 64 ? ggml_time_us() : 0;
+        auto srv_ph = [&](const char * what) {
+            if (t_ph0) {
+                SRV_INF("srv phase n=%d: %-22s %8.2f ms\n", batch.view.size(), what, (ggml_time_us() - t_ph0)/1e3);
+            }
+        };
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            srv_ph("target returned");
             if (ret == 0 && has_output && !sync_after) {
                 llama_synchronize(ctx_tgt);
+                srv_ph("target synced");
             }
         });
         if (lm_cap_req && !(spec_overlap && ret == 0)) {
@@ -5407,6 +5417,7 @@ private:
                 }
             });
 
+            srv_ph("drafter processed");
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
 

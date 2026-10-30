@@ -4250,7 +4250,31 @@ static bool state_async_lazy() {
     return on;
 }
 
+// k19-host (diagnostic, LLAMA_DECODE_PHASE_LOG=1): host time of the phases of a decode of more than 64 tokens, ms since it started
+static bool llama_phase_log_on() {
+    static const bool on = getenv("LLAMA_DECODE_PHASE_LOG") != nullptr && atoi(getenv("LLAMA_DECODE_PHASE_LOG")) != 0;
+    return on;
+}
+static int64_t      llama_phase_t0  = 0;
+static int64_t      llama_phase_tl  = 0;
+static const char * llama_phase_who = "";
+static void llama_phase(const char * what) {
+    if (llama_phase_log_on() && llama_phase_t0 > 0) {
+        const int64_t t = ggml_time_us();
+        LLAMA_LOG_INFO("decode phase %s: %-26s %8.2f ms (+%.2f)\n", llama_phase_who, what, (t - llama_phase_t0)/1000.0, (t - llama_phase_tl)/1000.0);
+        llama_phase_tl = t;
+    }
+}
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    if (llama_phase_log_on()) {
+        llama_phase_t0  = batch_inp.tokens.size() > 64 ? ggml_time_us() : 0;
+        llama_phase_tl  = llama_phase_t0;
+        llama_phase_who = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "mtp" : "tgt";
+    }
+    struct phase_end {
+        ~phase_end() { llama_phase("return"); }
+    } phase_end_guard;
     // an asynchronous state save queued before this call has reached its destination when this call returns (LLAMA_STATE_ASYNC_LAZY=0)
     struct state_async_join {
         llama_context * ctx;
@@ -4504,6 +4528,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (handoff_tr.t0) {
         handoff_tr.t_split = ggml_time_us();
     }
+    llama_phase("split");
 
     // reserve output buffer
     // k15-pp: the next-n rows this decode copies to the host (none where they go to the device sink, see mtp_dev_h_decode_begin)
@@ -4513,6 +4538,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
+    llama_phase("output_reserve");
 
     // k15: a prompt batch (some tokens without an output) keeps its ubatches off the CPU-miss host path of a pinned cache (see
     // llama_moe_cache::set_prompt_batch); generation and verify batches (an output for every token) keep it
@@ -5047,6 +5073,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
 
     const int64_t t0_us = ggml_time_us();
     const auto gtype = ctx_type_to_graph_type(cparams.ctx_type);
+    llama_phase("layer-major start");
 
     // the ubatches of the group: graphs built, inputs set in host memory of their own
     struct lm_ub {
@@ -5542,7 +5569,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
         return g;
     };
+    llama_phase("members built");
     ggml_cgraph * gm = aligned && group.size() > 1 ? build_merged(0, group.size()) : nullptr;
+    llama_phase("merged built");
 
     // the seed of the MoE cache, as moe_cache_seed_begin plans it for the ubatch-by-ubatch order: the last large ubatch of the batch seeds,
     // from the routing of the ubatch before it if it has no outputs, else from its own (if its seed graph fits); every member of the group
@@ -5697,6 +5726,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             ggml_backend_sched_set_prefetch_depth_scope(sched.get(), lm_rel_depth);
         }
     }
+    llama_phase("release decided");
     lm_ask.clear();
     lm_staged.clear();
     lm_seeded.clear();
@@ -6017,9 +6047,11 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             }
             LLAMA_LOG_INFO("%s: before alloc: tail MUL_MAT_ID on a GPU %d of %d, graph %d nodes\n", __func__, n_gpu, n_all, ggml_graph_n_nodes(g));
         }
+        llama_phase("graph alloc begin");
         ggml_backend_sched_set_reuse_weight_copies(sched.get(), true);
         const bool ok = ggml_backend_sched_alloc_graph(sched.get(), g);
         ggml_backend_sched_set_reuse_weight_copies(sched.get(), false);
+        llama_phase("graph alloc end");
         static const bool tail_dbg = getenv("LLAMA_LM_TAIL_DEBUG") != nullptr;
         if (tail_dbg && ok && !group.empty() && (int64_t) group.back().ub->n_tokens < prefetch_min_batch) {
             std::map<std::string, int> by;
@@ -6072,7 +6104,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         if (!lm_graph_records) {
             lm_graph_skip(true);
         }
+        llama_phase("compute begin");
         const auto st = graph_compute(g, true);
+        llama_phase("compute queued");
         if (!lm_graph_records) {
             lm_graph_skip(false);
         }
@@ -6453,6 +6487,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             ggml_backend_synchronize(b.get());
         }
     }
+    llama_phase("group computed");
     if (lm_released) {
         // the slots come back with the experts they held before; LLAMA_MOE_LM_RELEASE_ROUTED=1: with those the last ubatch of the group
         // used most (its routing, read before the compute buffers are freed). G4 4 GB, Qwen3.6 Q3_K_M + MTP 2, 3 launches: decode 2k / 8k
@@ -6486,7 +6521,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                     "(LLAMA_MOE_LM_RELEASE_TRIM=0 keeps it)\n", __func__, trimmed/1048576.0);
             }
         }
+        llama_phase("buffers freed");
         moe_cache->restore();
+        llama_phase("banks restored");
         {
             static int n_free_log = 0;
             if (n_free_log < 4) {
@@ -6645,7 +6682,9 @@ bool llama_context::nextn_store_ensure(size_t rows) {
         if (buf_nextn) {
             synchronize();
         }
+        llama_phase("next-n store sync");
         buf_nextn = nullptr;
+        llama_phase("next-n store old freed");
         auto * buft = ggml_backend_cpu_buffer_type();
         auto * output_dev = model.dev_output();
         auto * hb = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
@@ -6659,8 +6698,10 @@ bool llama_context::nextn_store_ensure(size_t rows) {
             embd_nextn = buffer_view<float>{nullptr, 0};
             return false;
         }
+        llama_phase("next-n store alloc");
         ggml_backend_buffer_clear(buf_nextn.get(), 0);
         nextn_cap_rows = rows;
+        llama_phase("next-n store clear");
     }
     embd_nextn = buffer_view<float>{(float *) ggml_backend_buffer_get_base(buf_nextn.get()), nextn_cap_rows*n_embd_out};
     return true;
@@ -6743,6 +6784,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             LLAMA_LOG_DEBUG("%s: reallocating output buffer from size %.02f MiB to %.02f MiB\n", __func__, prev_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
 #endif
             synchronize();
+            llama_phase("output sync");
 
             // TODO: not needed?
             buf_output = nullptr;
@@ -6761,12 +6803,14 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         if (output_dev_host_buft) {
             buft = output_dev_host_buft;
         }
+        llama_phase("output old freed");
         buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));
         if (buf_output == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to allocate output buffer of size %.2f MiB\n", __func__, new_size / (1024.0 * 1024.0));
             return 0;
         }
         ggml_backend_buffer_clear(buf_output.get(), 0);
+        llama_phase("output alloc+clear");
     }
 
     float * output_base = (float *) ggml_backend_buffer_get_base(buf_output.get());
