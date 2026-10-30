@@ -5598,6 +5598,34 @@ private:
             // allocation, ~65 ms with the GPU idle on G4 Flash-Next 16 GB) runs while the drafter computes. The target context waits for
             // the pass (llama_set_nextn_hold) before it writes the next-n rows the pass reads or frees the drafter's compute buffers
             static const bool bg_group_env = getenv("LLAMA_MTP_PROMPT_BG_GROUP") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_BG_GROUP")) != 0;
+            // kdp (LLAMA_MTP_DRAFT_LEND=0 off; LLAMA_MTP_PROMPT_TAIL=N rows, default 2048, 0 off): a prompt batch with at least N of the
+            // prompt's tokens still after it is not run through the drafter (common_speculative_process_skip: its cells are dropped, the
+            // next batch pairs with this batch's last row), so the drafter computes only the batches that hold the prompt's last N rows
+            // (at least N rows) and no drafter pass is in flight beside the earlier layer-major groups: those can borrow the drafter's device
+            // weights for a deeper staging arena (llama_context::decode_layer_major). Drafts are verified: only the acceptance moves
+            static const bool    lend_env = getenv("LLAMA_MTP_DRAFT_LEND") == nullptr || atoi(getenv("LLAMA_MTP_DRAFT_LEND")) != 0;
+            static const int32_t tail_env = getenv("LLAMA_MTP_PROMPT_TAIL") ? std::max(0, atoi(getenv("LLAMA_MTP_PROMPT_TAIL"))) : 2048;
+            bool skip = false;
+            if (lend_env && tail_env > 0 && ok && ret == 0 && slots.size() == 1 && has_prompt && ctx_dft && seg_breaks.empty() &&
+                    spec_seg_a == 0 && off + batch.view.size() == batch.size()) {
+                const server_slot & sl = slots[0];
+                const int32_t n_rest_s = sl.task ? sl.task->n_tokens() - sl.prompt.n_tokens() : 0;
+                skip = sl.state == SLOT_STATE_PROCESSING_PROMPT && sl.task && !sl.task->tokens.has_mtmd && sl.spec_i_batch.empty() &&
+                    !(sl.i_batch >= off && sl.i_batch < off + batch.view.size()) && n_rest_s >= tail_env;
+                for (int i = 0; skip && i < batch.view.size(); ++i) {
+                    skip = batch.view.tokens[i].seq_id == sl.id && batch.view.tokens[i].seq_ids_extra.empty() && !batch.view.tokens[i].output;
+                }
+                if (skip) {
+                    ok = common_speculative_process_skip(spec.get(), batch.view);
+                    static int64_t n_skip = 0;
+                    n_skip++;
+                    SRV_INF("mtp prompt pass skipped: %d rows, %d prompt tokens after them (%" PRId64 " batches; LLAMA_MTP_PROMPT_TAIL=%d, "
+                            "LLAMA_MTP_DRAFT_LEND=0 off)\n", batch.view.size(), n_rest_s, n_skip, tail_env);
+                }
+            }
+            if (!skip && ok && ctx_dft && !llama_mtp_draft_weights_restore(ctx_dft)) {
+                ok = false;
+            }
             int32_t n_rest = 0;
             // k19-host (LLAMA_MTP_PROMPT_BG_MIN=N tokens, default min(n_ubatch, 1024)): only a prompt batch of at least N tokens runs its
             // drafter pass on the worker, a shorter one in line as before: G4 Flash-Next + Q8_0 MTP 16 GB, batch 17, chat TTFT +4 ms
@@ -5608,7 +5636,7 @@ private:
                 SRV_INF("mtp prompt pass on a worker for prompt batches of at least %d tokens (LLAMA_MTP_PROMPT_BG_MIN)\n", v);
                 return v;
             }();
-            bool bg = bg_env && ok && ret == 0 && slots.size() == 1 && has_prompt && batch.view.size() > spec_bg_tail_max &&
+            bool bg = !skip && bg_env && ok && ret == 0 && slots.size() == 1 && has_prompt && batch.view.size() > spec_bg_tail_max &&
                 batch.view.size() >= bg_min && off + batch.view.size() == batch.size() && common_speculative_rows_ext_floats(spec.get()) > 0;
             if (bg) {
                 const server_slot & sl = slots[0];
@@ -5695,7 +5723,7 @@ private:
                 srv_ph("drafter launched");
             }
             queue_tasks.yield_to_queue([&]() {
-                if (!ok || bg) {
+                if (!ok || bg || skip) {
                     return;
                 }
                 if (seg_breaks.empty()) {

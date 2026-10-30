@@ -877,10 +877,23 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 // cuda buffer
 
+// kdp (ggml_backend_cuda_set_alloc_evictable, used for an MTP drafter's weights, LLAMA_MTP_DRAFT_LEND): a buffer allocated while the
+// flag is set is backed by virtual memory (one reserved address range, its physical memory mapped in), so its physical memory can be
+// given back (ggml_backend_cuda_buffer_evict: the contents are copied once to pinned host memory, the range is unmapped) and mapped again
+// at the same address (ggml_backend_cuda_buffer_restore). Every tensor, graph and captured CUDA graph keeps its pointers
+static thread_local bool ggml_cuda_alloc_evictable = false;
+
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+    // kdp: the virtual memory backing (vmm_size > 0) and its eviction state
+    size_t vmm_size  = 0;
+    bool   evicted   = false;
+    void * host_copy = nullptr;
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    CUmemGenericAllocationHandle vmm_handle = 0;
+#endif
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -888,9 +901,79 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        if (vmm_size > 0) {
+            ggml_cuda_set_device(device);
+            if (!evicted) {
+                CU_CHECK(cuMemUnmap((CUdeviceptr) dev_ptr, vmm_size));
+                CU_CHECK(cuMemRelease(vmm_handle));
+                ggml_cuda_own_add(device, -(int64_t) vmm_size);
+            }
+            CU_CHECK(cuMemAddressFree((CUdeviceptr) dev_ptr, vmm_size));
+            if (host_copy != nullptr) {
+                CUDA_CHECK(cudaFreeHost(host_copy));
+            }
+            return;
+        }
+#endif
         ggml_cuda_device_free(dev_ptr);
     }
 };
+
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// map vmm_size bytes of new physical memory at ctx->dev_ptr (false: out of memory, nothing mapped)
+static bool ggml_cuda_vmm_buffer_map(ggml_backend_cuda_buffer_context * ctx) {
+    const int physical_device = ggml_cuda_get_physical_device(ctx->device);
+    CUmemAllocationProp prop = {};
+    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id   = physical_device;
+    CUmemGenericAllocationHandle h;
+    if (cuMemCreate(&h, ctx->vmm_size, &prop, 0) != CUDA_SUCCESS) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (cuMemMap((CUdeviceptr) ctx->dev_ptr, ctx->vmm_size, 0, h, 0) != CUDA_SUCCESS) {
+        CU_CHECK(cuMemRelease(h));
+        return false;
+    }
+    CUmemAccessDesc access = {};
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access.location.id   = physical_device;
+    access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    if (cuMemSetAccess((CUdeviceptr) ctx->dev_ptr, ctx->vmm_size, &access, 1) != CUDA_SUCCESS) {
+        CU_CHECK(cuMemUnmap((CUdeviceptr) ctx->dev_ptr, ctx->vmm_size));
+        CU_CHECK(cuMemRelease(h));
+        return false;
+    }
+    ctx->vmm_handle = h;
+    ggml_cuda_own_add(ctx->device, (int64_t) ctx->vmm_size);
+    return true;
+}
+
+static ggml_backend_cuda_buffer_context * ggml_cuda_vmm_buffer_alloc(int device, size_t size) {
+    const size_t gran = ggml_cuda_info().devices[device].vmm_granularity;
+    if (!ggml_cuda_info().devices[device].vmm || gran == 0 || size == 0) {
+        return nullptr;
+    }
+    ggml_cuda_set_device(device);
+    const size_t vsize = gran * ((size + gran - 1) / gran);
+    CUdeviceptr va = 0;
+    if (cuMemAddressReserve(&va, vsize, 0, 0, 0) != CUDA_SUCCESS) {
+        return nullptr;
+    }
+    auto * ctx = new ggml_backend_cuda_buffer_context(device, (void *) va);
+    ctx->vmm_size = vsize;
+    if (!ggml_cuda_vmm_buffer_map(ctx)) {
+        CU_CHECK(cuMemAddressFree(va, vsize));
+        ctx->vmm_size = 0;
+        ctx->dev_ptr  = nullptr;
+        delete ctx;
+        return nullptr;
+    }
+    return ctx;
+}
+#endif
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
@@ -1039,6 +1122,16 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
 
     ggml_cuda_set_device(buft_ctx->device);
+
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (ggml_cuda_alloc_evictable && !ggml_cuda_unified_memory_enabled()) {
+        ggml_backend_cuda_buffer_context * vctx = ggml_cuda_vmm_buffer_alloc(buft_ctx->device, size);
+        if (vctx != nullptr) {
+            return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, vctx, size);
+        }
+        // no virtual memory: an ordinary buffer, never evicted
+    }
+#endif
 
     void * dev_ptr;
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
@@ -11273,6 +11366,89 @@ static size_t ggml_backend_cuda_pool_mark_trim(ggml_backend_t backend, bool trim
     return freed;
 }
 
+// kdp: see ggml_cuda_alloc_evictable
+static void ggml_backend_cuda_set_alloc_evictable(bool on) {
+    ggml_cuda_alloc_evictable = on;
+}
+
+// the pinned host copy of an evictable buffer, made once (the weights do not change after the load) and kept for every restore
+static bool ggml_backend_cuda_buffer_evict_prepare(ggml_backend_buffer_t buffer) {
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (ctx->vmm_size == 0 || ctx->evicted) {
+        return ctx->vmm_size > 0 && ctx->host_copy != nullptr;
+    }
+    if (ctx->host_copy == nullptr) {
+        ggml_cuda_set_device(ctx->device);
+        if (cudaMallocHost(&ctx->host_copy, ctx->vmm_size) != cudaSuccess) {
+            (void) cudaGetLastError();
+            ctx->host_copy = nullptr;
+            return false;
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(ctx->host_copy, ctx->dev_ptr, ctx->vmm_size, cudaMemcpyDeviceToHost));
+    }
+    return true;
+#else
+    GGML_UNUSED(buffer);
+    return false;
+#endif
+}
+
+// the bytes of physical memory a buffer gave back (0: not evictable, already evicted, or no host memory for its copy)
+static size_t ggml_backend_cuda_buffer_evict(ggml_backend_buffer_t buffer) {
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
+        return 0;
+    }
+    auto * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (ctx->vmm_size == 0 || ctx->evicted) {
+        return 0;
+    }
+    ggml_cuda_set_device(ctx->device);
+    // every reader of the weights (any stream of the device) is done before the memory goes
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (!ggml_backend_cuda_buffer_evict_prepare(buffer)) {
+        return 0;
+    }
+    CU_CHECK(cuMemUnmap((CUdeviceptr) ctx->dev_ptr, ctx->vmm_size));
+    CU_CHECK(cuMemRelease(ctx->vmm_handle));
+    ctx->vmm_handle = 0;
+    ctx->evicted    = true;
+    ggml_cuda_own_add(ctx->device, -(int64_t) ctx->vmm_size);
+    return ctx->vmm_size;
+#else
+    GGML_UNUSED(buffer);
+    return 0;
+#endif
+}
+
+// true: the buffer holds its weights at its address (it was never evicted, or it was mapped and copied back)
+static bool ggml_backend_cuda_buffer_restore(ggml_backend_buffer_t buffer) {
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
+        return true;
+    }
+    auto * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (ctx->vmm_size == 0 || !ctx->evicted) {
+        return true;
+    }
+    ggml_cuda_set_device(ctx->device);
+    if (!ggml_cuda_vmm_buffer_map(ctx)) {
+        return false;
+    }
+    CUDA_CHECK(cudaMemcpy(ctx->dev_ptr, ctx->host_copy, ctx->vmm_size, cudaMemcpyHostToDevice));
+    ctx->evicted = false;
+    return true;
+#else
+    GGML_UNUSED(buffer);
+    return true;
+#endif
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_moe_fetch_overlap_min_bytes") == 0) {
@@ -11283,6 +11459,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_pool_mark_trim") == 0) {
         return (void *)ggml_backend_cuda_pool_mark_trim;
+    }
+    if (strcmp(name, "ggml_backend_set_alloc_evictable") == 0) {
+        return (void *)ggml_backend_cuda_set_alloc_evictable;
+    }
+    if (strcmp(name, "ggml_backend_buffer_evict_prepare") == 0) {
+        return (void *)ggml_backend_cuda_buffer_evict_prepare;
+    }
+    if (strcmp(name, "ggml_backend_buffer_evict") == 0) {
+        return (void *)ggml_backend_cuda_buffer_evict;
+    }
+    if (strcmp(name, "ggml_backend_buffer_restore") == 0) {
+        return (void *)ggml_backend_cuda_buffer_restore;
     }
     if (strcmp(name, "ggml_backend_moe_fetch_overlap_default") == 0) {
         return (void *)ggml_backend_cuda_moe_fetch_overlap_default;

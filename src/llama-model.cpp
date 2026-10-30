@@ -33,6 +33,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <mutex>
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
@@ -1277,6 +1278,11 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
+    // kdp: the evictable device weight buffers (llama_model::weights_evict)
+    std::vector<ggml_backend_buffer_t> evict_bufs;
+    mutable std::mutex                 evict_m;
+    bool                               evicted = false;
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -1991,7 +1997,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
+                // kdp: a separate MTP drafter's device weights in evictable buffers (llama_model::weights_evict)
+                using set_evictable_t = void (*)(bool);
+                set_evictable_t set_ev = nullptr;
+                if (params.mtp_borrow_io && llama_mtp_draft_lend_on() && !ggml_backend_buft_is_host(buft) &&
+                        ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU && ggml_backend_dev_backend_reg(dev) != nullptr) {
+                    set_ev = (set_evictable_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_set_alloc_evictable");
+                }
+                if (set_ev) {
+                    set_ev(true);
+                }
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                if (set_ev) {
+                    set_ev(false);
+                    if (buf != nullptr) {
+                        pimpl->evict_bufs.push_back(buf);
+                    }
+                }
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
@@ -3023,6 +3045,78 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
 
 bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
+}
+
+// kdp (LLAMA_MTP_DRAFT_LEND, default on; 0 off): an MTP drafter loaded beside its target (mtp_borrow_io) keeps its device weights in
+// evictable buffers, a long prompt's layer-major group of the target can borrow their memory (llama_context::decode_layer_major) and the
+// server skips the drafter's pass over the prompt batches before the last LLAMA_MTP_PROMPT_TAIL rows (see server-context.cpp)
+bool llama_mtp_draft_lend_on() {
+    static const bool on = getenv("LLAMA_MTP_DRAFT_LEND") == nullptr || atoi(getenv("LLAMA_MTP_DRAFT_LEND")) != 0;
+    return on;
+}
+
+size_t llama_model::weights_evict() {
+    std::lock_guard<std::mutex> lock(pimpl->evict_m);
+    if (pimpl->evicted || pimpl->evict_bufs.empty()) {
+        return 0;
+    }
+    size_t freed = 0;
+    for (ggml_backend_buffer_t buf : pimpl->evict_bufs) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto fn = reg ? (size_t (*)(ggml_backend_buffer_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_evict") : nullptr;
+        if (fn != nullptr) {
+            freed += fn(buf);
+        }
+    }
+    pimpl->evicted = freed > 0;
+    return freed;
+}
+
+bool llama_model::weights_restore() {
+    std::lock_guard<std::mutex> lock(pimpl->evict_m);
+    if (!pimpl->evicted) {
+        return true;
+    }
+    bool ok = true;
+    for (ggml_backend_buffer_t buf : pimpl->evict_bufs) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto fn = reg ? (bool (*)(ggml_backend_buffer_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_restore") : nullptr;
+        if (fn != nullptr && !fn(buf)) {
+            ok = false;
+        }
+    }
+    pimpl->evicted = !ok;
+    return ok;
+}
+
+size_t llama_model::weights_evict_prepare() {
+    std::lock_guard<std::mutex> lock(pimpl->evict_m);
+    size_t bytes = 0;
+    std::vector<ggml_backend_buffer_t> keep;
+    for (ggml_backend_buffer_t buf : pimpl->evict_bufs) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto fn = reg ? (bool (*)(ggml_backend_buffer_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_evict_prepare") : nullptr;
+        if (fn != nullptr && fn(buf)) {
+            keep.push_back(buf);
+            bytes += ggml_backend_buffer_get_size(buf);
+        }
+    }
+    // a buffer without virtual memory or a host copy is never evicted
+    pimpl->evict_bufs = std::move(keep);
+    return bytes;
+}
+
+bool llama_model::weights_evicted() const {
+    std::lock_guard<std::mutex> lock(pimpl->evict_m);
+    return pimpl->evicted;
+}
+
+bool llama_model::weights_evictable() const {
+    std::lock_guard<std::mutex> lock(pimpl->evict_m);
+    return !pimpl->evict_bufs.empty();
 }
 
 const ggml_tensor * llama_model::get_tensor(const char * name) const {

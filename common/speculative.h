@@ -101,6 +101,9 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
+// kdp (LLAMA_MTP_DRAFT_LEND): a prompt batch before the prompt's last rows, which the MTP drafter does not compute (see skip_prompt)
+bool common_speculative_process_skip(common_speculative * spec, const common_batch & batch);
+
 // k11 (LLAMA_LM_CKPT_MERGE): process() of a segment of the target batch whose first entry is target batch row row_offset (the target's nextn
 // rows are read from there); rows_ok: every impl of spec supports it (eagle3 / dflash do not)
 bool common_speculative_process_rows(common_speculative * spec, const common_batch & batch, int32_t row_offset);

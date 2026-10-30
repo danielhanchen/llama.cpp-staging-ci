@@ -109,6 +109,7 @@ std::string format(const char * fmt, ...);
 // LLAMA_MTP_HANDOFF=0 all of them; LLAMA_MTP_HANDOFF_TRACE=1 logs the host time of the prompt handoff steps
 bool llama_mtp_handoff_on(const char * lever);
 bool llama_mtp_handoff_trace();
+bool llama_mtp_draft_lend_on(); // kdp: LLAMA_MTP_DRAFT_LEND (llama-model.cpp)
 
 std::string llama_format_tensor_shape(const std::vector<int64_t> & ne);
 std::string llama_format_tensor_shape(const struct ggml_tensor * t);

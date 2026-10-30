@@ -929,6 +929,15 @@ struct llama_model {
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
+    // kdp (LLAMA_MTP_DRAFT_LEND, see llama_mtp_draft_lend_on): a separate MTP drafter (mtp_borrow_io) keeps its device weights in
+    // evictable buffers: weights_evict gives their device memory back (the bytes freed), weights_restore maps it again at the same
+    // addresses and copies the weights back (false: no device memory); thread safe
+    size_t weights_evict_prepare(); // the host copies (once, at the drafter context's creation); the bytes that can be evicted
+    size_t weights_evict();
+    bool   weights_restore();
+    bool   weights_evicted() const;
+    bool   weights_evictable() const;
+
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
 

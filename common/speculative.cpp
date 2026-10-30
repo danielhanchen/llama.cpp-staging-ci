@@ -231,6 +231,10 @@ struct common_speculative_impl {
 
     virtual bool process(const common_batch & batch) = 0;
 
+    // kdp (LLAMA_MTP_DRAFT_LEND): a prompt batch whose rows lie before the prompt's last LLAMA_MTP_PROMPT_TAIL rows is not run
+    // through the drafter; an impl that keeps its own state per position processes it as usual
+    virtual bool skip_prompt(const common_batch & batch) { return process(batch); }
+
     // k11 (LLAMA_LM_CKPT_MERGE): process() reads the target's rows from this batch index on (a segment of a merged prompt batch);
     // impls that read target features without honouring it say so
     int32_t nextn_row_offset = 0;
@@ -1724,6 +1728,44 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     (int) pos_max, N - 1);
         }
     }
+
+    // kdp: the drafter keeps no cells of a skipped batch's sequences (the k18 window's drop: it attends to the rows it gets later,
+    // RoPE positions as in the target) and pairs the next batch's first row with the target's row of this batch's last token. Drafts
+    // are verified: only the acceptance moves. Host rows only, as the window
+    bool skip_prompt(const common_batch & batch_in) override {
+        if (dev_h || is_mem_shared || chain_heads || h_ext != nullptr || batch_in.size() <= 0 || (!batch_in.has_token() && !batch_in.has_embd())) {
+            return process(batch_in);
+        }
+        const int32_t n_tokens = batch_in.size();
+        std::vector<int32_t> i_end(n_seq, -1);
+        for (int k = 0; k < n_tokens; ++k) {
+            const llama_seq_id s = batch_in.tokens[k].seq_id;
+            if (s < 0 || s >= (llama_seq_id) n_seq || !batch_in.tokens[k].seq_ids_extra.empty()) {
+                return process(batch_in);
+            }
+            i_end[s] = k;
+        }
+        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * mem_dft = llama_get_memory(this->params.ctx_dft);
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+            if (i_end[s] < 0) {
+                continue;
+            }
+            const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, nextn_row_offset + i_end[s]);
+            if (h == nullptr) {
+                return process(batch_in);
+            }
+            llama_memory_seq_rm(mem_dft, s, -1, -1);
+            std::memcpy(pending_h[s].data(), h, row_bytes);
+            if (s < (llama_seq_id) pending_dev.size()) {
+                pending_dev[s] = 0;
+            }
+        }
+        n_skipped_rows += n_tokens;
+        return true;
+    }
+    int64_t n_skipped_rows = 0;
 
     bool process(const common_batch & batch_in) override {
         if (batch_in.size() <= 0) {
@@ -3858,6 +3900,20 @@ void common_speculative_rows_ext_clear(common_speculative * spec) {
     for (auto & impl : spec->impls) {
         impl->rows_ext_clear();
     }
+}
+
+bool common_speculative_process_skip(common_speculative * spec, const common_batch & batch) {
+    bool result = true;
+
+    if (spec == nullptr) {
+        return result;
+    }
+
+    for (auto & impl : spec->impls) {
+        result = result && impl->skip_prompt(batch);
+    }
+
+    return result;
 }
 
 bool common_speculative_process(common_speculative * spec, const common_batch & batch) {

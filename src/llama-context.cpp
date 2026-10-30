@@ -888,6 +888,13 @@ llama_context::llama_context(
             std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
             llama_mtp_ctxs.push_back(this);
         }
+        // kdp: an MTP drafter with evictable weights (a separate -md model, LLAMA_MTP_DRAFT_LEND) copies them to pinned host memory once
+        if (ctx_mtp && const_cast<llama_model &>(model).weights_evictable()) {
+            const int64_t t0 = ggml_time_us();
+            const size_t  b  = const_cast<llama_model &>(model).weights_evict_prepare();
+            LLAMA_LOG_INFO("%s: MTP drafter weights can be lent to the target's prompt groups: %.2f MiB, host copy in %.1f ms "
+                "(LLAMA_MTP_DRAFT_LEND=0 off)\n", __func__, b/1048576.0, (ggml_time_us() - t0)/1000.0);
+        }
         const auto moe_cache_set = llama_moe_cache::select_layers(model, ctx_mtp);
         const size_t moe_cache_budget = cparams.moe_cache_size == 0 || (ctx_mtp && moe_cache_set != llama_moe_cache::layer_set::nextn) ? 0 :
             llama_moe_cache::budget(model, cparams.moe_cache_size, moe_cache_set);
@@ -1715,6 +1722,23 @@ llama_context::disk_range_ref::~disk_range_ref() {
 
 // k17-small: frees the device compute buffers of this context (an MTP drafter, for a layer-major prompt group of its target); the next
 // graph is built and allocated anew. Returns the bytes freed
+bool llama_context::mtp_weights_restore() {
+    llama_model & m = const_cast<llama_model &>(model);
+    if (!m.weights_evicted()) {
+        return true;
+    }
+    const int64_t t0 = ggml_time_us();
+    const bool ok = m.weights_restore();
+    static int64_t n_restore = 0;
+    n_restore++;
+    if (!ok) {
+        LLAMA_LOG_ERROR("%s: the MTP drafter's weights could not be mapped back (no device memory)\n", __func__);
+    } else {
+        LLAMA_LOG_INFO("%s: MTP drafter weights restored in %.2f ms (%" PRId64 " restores)\n", __func__, (ggml_time_us() - t0)/1000.0, n_restore);
+    }
+    return ok;
+}
+
 size_t llama_context::release_device_compute() {
     size_t bytes = 0;
     for (auto & bk : backend_ptrs) {
@@ -4501,6 +4525,10 @@ static void llama_phase(const char * what) {
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    // kdp: a drafter whose weights a target group borrowed maps them back before it computes (the server does it first on its thread)
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !mtp_weights_restore()) {
+        return -3;
+    }
     if (llama_phase_log_on()) {
         llama_phase_t0  = batch_inp.tokens.size() > 64 ? ggml_time_us() : 0;
         llama_phase_tl  = llama_phase_t0;
@@ -6019,6 +6047,53 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         static const int lm_rel_depth = getenv("LLAMA_MOE_LM_RELEASE_DEPTH") ? std::max(0, atoi(getenv("LLAMA_MOE_LM_RELEASE_DEPTH"))) : 4;
         if (lm_released && lm_rel_depth > 0) {
             ggml_backend_sched_set_prefetch_depth_scope(sched.get(), lm_rel_depth);
+        }
+        // kdp (LLAMA_MTP_DRAFT_LEND=0 off): beside a separate MTP drafter (-md) the deeper staging arena does not fit (G4 Flash-Next
+        // UD-IQ4_XS 12 GB + the requantized Q8_0 drafter, ctx 32768: 2930 MiB free, depth 2, the splits waited 23% of each 8192-token
+        // group for their copies, 30k TTFT 7.65 s against 6.36 s without the drafter, whose cache freed 2759 MiB and ran at depth 4).
+        // While no drafter pass is in flight (the server skips its pass over the batches before the prompt's last rows), the drafter's
+        // device weights (evictable buffers, llama_model::weights_evict) and compute buffers give their memory to the group; the server
+        // maps the weights back at the same addresses before the drafter's next pass (llama_mtp_draft_weights_restore). Below
+        // LLAMA_MTP_DRAFT_LEND_FREE_MIB (6144) free only: where the deep arena fits anyway the restore would cost the request ~25 ms
+        if (lm_released && lm_rel_depth > 0 && llama_mtp_draft_lend_on() && cparams.spec_draft && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP &&
+                nextn_hold_fn == nullptr) {
+            static const size_t lend_free = (size_t) (getenv("LLAMA_MTP_DRAFT_LEND_FREE_MIB") ? std::max(0, atoi(getenv("LLAMA_MTP_DRAFT_LEND_FREE_MIB"))) : 6144) << 20;
+            size_t free_min = SIZE_MAX;
+            for (auto & bk : backend_ptrs) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(bk);
+                if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    size_t fr = 0, tot = 0;
+                    ggml_backend_dev_memory(dev, &fr, &tot);
+                    free_min = std::min(free_min, fr);
+                }
+            }
+            if (free_min < lend_free) {
+                std::vector<llama_context *> dfts;
+                {
+                    std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
+                    for (llama_context * c : llama_mtp_ctxs) {
+                        if (c != this && &c->model != &model && const_cast<llama_model &>(c->model).weights_evictable()) {
+                            dfts.push_back(c);
+                        }
+                    }
+                }
+                const int64_t t0 = ggml_time_us();
+                size_t freed_w = 0, freed_c = 0;
+                for (llama_context * c : dfts) {
+                    c->synchronize();
+                    freed_w += const_cast<llama_model &>(c->model).weights_evict();
+                    if (!lm_dft_released) {
+                        freed_c += c->release_device_compute();
+                    }
+                }
+                static int64_t n_lend = 0;
+                if (freed_w > 0) {
+                    n_lend++;
+                    LLAMA_LOG_INFO("%s: MTP drafter weights lent to the group: %.2f MiB + %.2f MiB of its compute buffers, %.2f MiB were free, "
+                        "%.2f ms (%" PRId64 " groups; LLAMA_MTP_DRAFT_LEND=0 off)\n", __func__, freed_w/1048576.0, freed_c/1048576.0,
+                        free_min/1048576.0, (ggml_time_us() - t0)/1000.0, n_lend);
+                }
+            }
         }
     }
     llama_phase("release decided");
@@ -11345,6 +11420,10 @@ int64_t llama_nextn_rows_wait(llama_context * ctx, int64_t n_rows) {
 
 void llama_set_nextn_hold(llama_context * ctx, void (*fn)(void *), void * user_data) {
     ctx->set_nextn_hold(fn, user_data);
+}
+
+bool llama_mtp_draft_weights_restore(llama_context * ctx) {
+    return ctx == nullptr || ctx->mtp_weights_restore();
 }
 
 float * llama_get_embeddings_nextn_early(llama_context * ctx) {

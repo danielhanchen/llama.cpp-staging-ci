@@ -151,6 +151,7 @@ struct llama_context {
     float * get_embeddings_nextn_ith(int32_t i);
     // k15-pp3: the nextn rows [0, n) of the last decode on the host before the decode is done (see rows_ev)
     int64_t nextn_rows_wait(int64_t n);
+    bool    mtp_weights_restore(); // kdp: see llama_mtp_draft_weights_restore
     float * nextn_rows_early();
 
     float * get_embeddings_layer_inp(uint32_t lid);
