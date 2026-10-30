@@ -1397,112 +1397,30 @@ void llama_context::rs_commit_build(ggml_context * ctx, ggml_cgraph * gf, bool w
 
 // k19-npmtp: find_slot gathers the cells of a multi-sequence ubatch next to each other by swapping cells; the state and conv rows of a
 // moved cell are copied by the ubatch graph (s_copy), but a window still pending there (its stored inputs, the conv snapshot rows of
-// its rollback) stays in the old cell. It is moved here, in swap order (a permutation of the cells), before the commit or ubatch graphs
-// that read it: every source read into a copy first, then written, on the backend of the stores (synchronized: moves are rare)
+// its rollback) stays in the old cell. It is moved here, in swap order, before the commit or ubatch graphs that read it.
+// k19-b33mv: row to row copies through scratch units allocated with the cache (llama_memory_recurrent::rs_move_rows), after the graphs
+// in flight (ubatch, replay commits, async state reads) have finished: no graph and no compute buffer (9c2e built a dup graph whose
+// buffer the fit did not price, and aborted when it could not be allocated)
 void llama_context::rs_replay_move(llama_memory_recurrent * mem, const std::vector<std::pair<uint32_t, uint32_t>> & swaps) {
     if (mem == nullptr || swaps.empty()) {
         return;
     }
-    const bool on_rs = mem == rs_replay_mem;
-    if (on_rs && rs_mode == 0) {
-        rs_replay_setup();
+    if (sched) {
+        ggml_backend_sched_synchronize(sched.get());
     }
-    // after the swaps cell c holds what was in cell perm[c]
-    std::vector<uint32_t> perm(mem->size);
-    for (uint32_t c = 0; c < mem->size; ++c) {
-        perm[c] = c;
+    if (rs_sched) {
+        ggml_backend_sched_synchronize(rs_sched.get());
     }
-    for (const auto & sw : swaps) {
-        std::swap(perm[sw.first], perm[sw.second]);
+    if (rs_backend != nullptr) {
+        ggml_backend_synchronize(rs_backend);
     }
-    std::vector<uint32_t> cs;
-    for (uint32_t c = 0; c < mem->size; ++c) {
-        if (perm[c] != c) {
-            cs.push_back(c);
-        }
-    }
-    if (cs.empty()) {
-        return;
-    }
-    const uint32_t n_rs = mem->n_rs_seq;
-    const size_t max_nodes = 16 * cs.size() * mem->s_l.size() * (3 + 3 * (size_t) n_rs) + 64;
-    ggml_init_params ip = { ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false), nullptr, true };
-    ggml_context_ptr ctx_own { ggml_init(ip) };
-    ggml_context * ctx = ctx_own.get();
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, max_nodes, false);
-    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> writes; // (copy of the source, destination)
-    auto cell_of = [&](ggml_tensor * t, uint32_t c) { // [.., .., .., size]: the slice of one cell
-        return ggml_view_1d(ctx, t, t->nb[3] / ggml_element_size(t), (size_t) c * t->nb[3]);
-    };
-    auto row_of = [&](ggml_tensor * t, size_t r) {
-        return ggml_view_1d(ctx, t, t->ne[0], r * t->nb[1]);
-    };
-    for (size_t il = 0; il < mem->r_l.size(); ++il) {
-        // the snapshot groups 1..n_rs_seq of the state rows (replay keeps one row per cell: none)
-        ggml_tensor * st = il < mem->s_l.size() ? mem->s_l[il] : nullptr;
-        if (st != nullptr && st->ne[1] > (int64_t) mem->size) {
-            for (uint32_t g = 1; g <= n_rs; ++g) {
-                for (uint32_t c : cs) {
-                    ggml_tensor * tmp = ggml_dup(ctx, row_of(st, (size_t) g * mem->size + perm[c]));
-                    ggml_build_forward_expand(gf, tmp);
-                    writes.emplace_back(tmp, row_of(st, (size_t) g * mem->size + c));
-                }
-            }
-        }
-        // replay: the stored window inputs of the cells
-        for (ggml_tensor * t : { il < mem->rk_l.size() ? mem->rk_l[il] : nullptr, il < mem->rv_l.size() ? mem->rv_l[il] : nullptr,
-                                 il < mem->rg_l.size() ? mem->rg_l[il] : nullptr }) {
-            if (t == nullptr || !mem->replay) {
-                continue;
-            }
-            for (uint32_t c : cs) {
-                ggml_tensor * tmp = ggml_dup(ctx, cell_of(t, perm[c]));
-                ggml_build_forward_expand(gf, tmp);
-                writes.emplace_back(tmp, cell_of(t, c));
-            }
-        }
-        for (ggml_tensor * t : { mem->r_l[il], il < mem->p_l.size() ? mem->p_l[il] : nullptr }) {
-            if (t == nullptr || t->ne[1] <= (int64_t) mem->size) {
-                continue;
-            }
-            for (uint32_t g = 1; g <= n_rs; ++g) {
-                for (uint32_t c : cs) {
-                    ggml_tensor * tmp = ggml_dup(ctx, row_of(t, (size_t) g * mem->size + perm[c]));
-                    ggml_build_forward_expand(gf, tmp);
-                    writes.emplace_back(tmp, row_of(t, (size_t) g * mem->size + c));
-                }
-            }
-        }
-    }
-    for (const auto & w : writes) {
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, w.first, w.second));
-    }
-    if (ggml_graph_n_nodes(gf) == 0) {
-        return;
-    }
-    if (on_rs && rs_mode == 1) {
-        ggml_gallocr_ptr ga { ggml_gallocr_new(rs_buft) };
-        if (!ggml_gallocr_alloc_graph(ga.get(), gf)) {
-            GGML_ABORT("%s: cannot allocate the replay window move graph", __func__);
-        }
-        if (ggml_backend_graph_compute(rs_backend, gf) != GGML_STATUS_SUCCESS) {
-            GGML_ABORT("%s: the replay window move graph failed", __func__);
-        }
+    state_async_wait_reads();
+    mem->rs_move_rows(swaps);
+    if (mem->replay) {
+        mem->n_replay_move++;
     } else {
-        if (!rs_sched) {
-            rs_sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 16384, false, false));
-        }
-        ggml_backend_sched_reset(rs_sched.get());
-        if (!ggml_backend_sched_alloc_graph(rs_sched.get(), gf)) {
-            GGML_ABORT("%s: cannot allocate the replay window move graph", __func__);
-        }
-        if (ggml_backend_sched_graph_compute(rs_sched.get(), gf) != GGML_STATUS_SUCCESS) {
-            GGML_ABORT("%s: the replay window move graph failed", __func__);
-        }
-        rs_key.clear(); // the sched no longer holds the allocation of the last commit graph
-        ggml_backend_sched_reset(rs_sched.get());
+        mem->n_snap_move++;
     }
-    mem->n_replay_move++;
 }
 
 void llama_context::rs_replay_commit(bool sync) {
@@ -1964,6 +1882,10 @@ llama_context::~llama_context() {
         rs_replay_mem->commit_cb = nullptr;
     }
     if (rs_move_mem != nullptr) {
+        if (rs_move_mem->n_snap_move > 0 || rs_move_mem->n_replay_move > 0) {
+            LLAMA_LOG_INFO("%s: recurrent rollback rows moved with their cells: %" PRIu64 " snapshot-group moves, %" PRIu64 " replay-window moves\n",
+                    __func__, rs_move_mem->n_snap_move, rs_move_mem->n_replay_move);
+        }
         rs_move_mem->move_cb = nullptr;
     }
     if (n_plan_saves > 0) {

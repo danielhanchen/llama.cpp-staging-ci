@@ -99,7 +99,8 @@ llama_memory_recurrent::llama_memory_recurrent(
         if (it == ctx_map.end()) {
             ggml_init_params params = {
                 // r and s per layer, plus the separate PLE conv row where the model has one
-                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead() + 4u*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead() + 4u*n_layer*ggml_tensor_overhead() +
+                                         6u*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -125,6 +126,26 @@ llama_memory_recurrent::llama_memory_recurrent(
     rg_l.assign(n_layer, nullptr);
     rb_l.assign(n_layer, nullptr); // unused: gate and beta share rg_l
     rk_h.assign(n_layer, 0);
+
+    // k19-b33mv: the scratch units of rs_move_rows, one per buffer type and shape (several sequences only: a single one never moves)
+    const bool want_mv_tmp = n_rs_seq > 0 && n_seq_max > 1;
+    for (auto * v : { &mv_tmp_r_l, &mv_tmp_s_l, &mv_tmp_p_l, &mv_tmp_k_l, &mv_tmp_v_l, &mv_tmp_g_l }) {
+        v->assign(n_layer, nullptr);
+    }
+    std::map<std::pair<ggml_backend_buffer_type_t, std::pair<int, int64_t>>, ggml_tensor *> mv_tmp_map;
+    auto mv_tmp = [&](ggml_context * ctx, ggml_backend_buffer_type_t buft, ggml_tensor * like, int64_t n) -> ggml_tensor * {
+        if (!want_mv_tmp || like == nullptr) {
+            return nullptr;
+        }
+        const auto key = std::make_pair(buft, std::make_pair((int) like->type, n));
+        auto it = mv_tmp_map.find(key);
+        if (it == mv_tmp_map.end()) {
+            ggml_tensor * t = ggml_new_tensor_1d(ctx, like->type, n);
+            ggml_format_name(t, "rs_move_tmp_%d", (int) mv_tmp_map.size());
+            it = mv_tmp_map.emplace(key, t).first;
+        }
+        return it->second;
+    };
 
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
@@ -182,6 +203,14 @@ llama_memory_recurrent::llama_memory_recurrent(
             ggml_format_name(p, "cache_ple_r_l%d", i);
             p_l[i] = p;
         }
+
+        mv_tmp_r_l[i] = mv_tmp(ctx, buft, r, r->ne[0]);
+        mv_tmp_s_l[i] = replay ? nullptr : mv_tmp(ctx, buft, s, s->ne[0]);
+        mv_tmp_p_l[i] = mv_tmp(ctx, buft, p_l[i], p_l[i] ? p_l[i]->ne[0] : 0);
+        for (auto [t, tmp] : { std::make_pair(rk_l[i], &mv_tmp_k_l[i]), std::make_pair(rv_l[i], &mv_tmp_v_l[i]),
+                               std::make_pair(rg_l[i], &mv_tmp_g_l[i]) }) {
+            *tmp = mv_tmp(ctx, buft, t, t ? ggml_nelements(t) / t->ne[3] : 0);
+        }
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
@@ -206,7 +235,7 @@ llama_memory_recurrent::llama_memory_recurrent(
             size_t rows_bytes = 0;
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
                 const bool is_s = strncmp(t->name, "cache_s_l", 9) == 0;
-                if (strncmp(t->name, "replay_", 7) == 0) {
+                if (strncmp(t->name, "replay_", 7) == 0 || strncmp(t->name, "rs_move_tmp", 11) == 0) {
                     continue;
                 }
                 rows_bytes += (is_s && replay) ? ggml_nbytes(t) : ggml_nbytes(t) / (1 + n_rs_seq);
@@ -1161,6 +1190,62 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 
     // sanity check
     return n >= n_seqs;
+}
+
+// k19-b33mv: replays the swaps of find_slot, in order, on the rollback rows of the swapped cells: the snapshot groups 1..n_rs_seq of the
+// state (snapshot rows) and conv rows, and with replay the stored window slices of the cells. Each swap of two units is three copies
+// through the scratch unit of the same buffer type and shape (ggml_backend_tensor_copy on views): no graph and no allocation. The
+// caller (llama_context::rs_replay_move) waits for the graphs in flight first
+void llama_memory_recurrent::rs_move_rows(const std::vector<std::pair<uint32_t, uint32_t>> & swaps) {
+    if (swaps.empty()) {
+        return;
+    }
+    const size_t n_views = 2 * swaps.size() * r_l.size() * (6 + 3 * (size_t) n_rs_seq) + 8;
+    ggml_init_params ip = { ggml_tensor_overhead() * n_views, nullptr, true };
+    ggml_context_ptr ctx_own { ggml_init(ip) };
+    ggml_context * ctx = ctx_own.get();
+    // unit u of t: n elements at byte offset u * stride
+    auto unit = [&](ggml_tensor * t, int64_t n, size_t stride, size_t u) {
+        ggml_tensor * v = ggml_view_1d(ctx, t, n, u * stride);
+        GGML_ASSERT(ggml_backend_view_init(v) == GGML_STATUS_SUCCESS);
+        return v;
+    };
+    auto swap_units = [&](ggml_tensor * t, ggml_tensor * tmp, size_t stride, size_t ua, size_t ub) {
+        ggml_tensor * a = unit(t, tmp->ne[0], stride, ua);
+        ggml_tensor * b = unit(t, tmp->ne[0], stride, ub);
+        ggml_backend_tensor_copy(a, tmp);
+        ggml_backend_tensor_copy(b, a);
+        ggml_backend_tensor_copy(tmp, b);
+    };
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        // snapshot groups 1..n_rs_seq of the rows (replay keeps one state row per cell: no groups in s)
+        for (auto [t, tmp] : { std::make_pair(r_l[il], mv_tmp_r_l[il]), std::make_pair(s_l[il], mv_tmp_s_l[il]),
+                               std::make_pair(il < p_l.size() ? p_l[il] : nullptr, mv_tmp_p_l[il]) }) {
+            if (t == nullptr || tmp == nullptr || t->ne[1] <= (int64_t) size) {
+                continue;
+            }
+            GGML_ASSERT(tmp->ne[0] == t->ne[0] && tmp->type == t->type);
+            for (uint32_t g = 1; g <= n_rs_seq; ++g) {
+                for (const auto & sw : swaps) {
+                    swap_units(t, tmp, t->nb[1], (size_t) g * size + sw.first, (size_t) g * size + sw.second);
+                }
+            }
+        }
+        // replay: the stored window inputs of the cells ([.., .., .., size]: one slice per cell)
+        if (replay) {
+            for (auto [t, tmp] : { std::make_pair(il < rk_l.size() ? rk_l[il] : nullptr, mv_tmp_k_l[il]),
+                                   std::make_pair(il < rv_l.size() ? rv_l[il] : nullptr, mv_tmp_v_l[il]),
+                                   std::make_pair(il < rg_l.size() ? rg_l[il] : nullptr, mv_tmp_g_l[il]) }) {
+                if (t == nullptr || tmp == nullptr) {
+                    continue;
+                }
+                GGML_ASSERT(tmp->ne[0] * t->ne[3] == ggml_nelements(t) && tmp->type == t->type);
+                for (const auto & sw : swaps) {
+                    swap_units(t, tmp, t->nb[3], sw.first, sw.second);
+                }
+            }
+        }
+    }
 }
 
 bool llama_memory_recurrent::get_can_shift() const {

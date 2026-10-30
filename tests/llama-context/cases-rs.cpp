@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <array>
 #include <string>
 #include <vector>
 
@@ -584,6 +585,91 @@ struct case_replay_overlap : ctx_test {
     }
 };
 
+// llama-server --parallel 4 with a draft verify window (multi-sequence verify shape). A window of seq 1 in its own ubatch, then a
+// ubatch of seqs 0, 2, 3 whose cells find_slot gathers (moving the cell of seq 1), then the rollback of seq 1 and a step of all four;
+// the recurrent states against a context that decodes one sequence per ubatch (no cell ever moves)
+struct case_k19_move : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+    const char * name() const override { return "k19_move"; }
+    const char * description() const override { return "rollback of a verify window whose cell a later ubatch moved, against one sequence per ubatch"; }
+    std::string skip_reason(model_run & mr) const override {
+        if (arch_reserves_single_seq(mr.model)) {
+            return "multi-seq graphs";
+        }
+        return ctx_test::skip_reason(mr);
+    }
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+        constexpr uint32_t n_seqs = 4;
+        constexpr llama_pos n_pre = 8;
+        ctx_opts opts;
+        opts.n_ctx = 256; opts.n_batch = 64; opts.n_ubatch = 32; opts.n_seq_max = n_seqs; opts.n_rs_seq = 2; opts.kv_unified = 1;
+        llama_context_ptr ctx_m = mr.ctx(opts);
+        llama_context_ptr ctx_s = mr.ctx(opts);
+        if (!ctx_m || !ctx_s) {
+            return case_result::fail();
+        }
+        if (llama_n_rs_seq(ctx_m.get()) < 2) {
+            return case_result::skip("n_rs_seq is too small");
+        }
+        const auto run = [&](const std::vector<std::array<llama_pos, 3>> & spans) {
+            common_batch batch(ctx_m.get());
+            for (const auto & sp : spans) {
+                for (llama_pos p = sp[1]; p < sp[2]; ++p) {
+                    batch.add(gen_token(n_vocab, (llama_seq_id) sp[0], p), p, (llama_seq_id) sp[0], true);
+                }
+            }
+            if (llama_process(ctx_m.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                return false;
+            }
+            for (const auto & sp : spans) {
+                common_batch b1(ctx_s.get());
+                for (llama_pos p = sp[1]; p < sp[2]; ++p) {
+                    b1.add(gen_token(n_vocab, (llama_seq_id) sp[0], p), p, (llama_seq_id) sp[0], true);
+                }
+                if (llama_process(ctx_s.get(), LLAMA_PROCESS_TYPE_DECODE, b1.get()) != 0) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            CTX_REQUIRE(run({ { (llama_pos) s, 0, n_pre } }), "prefill failed");
+        }
+        CTX_REQUIRE(run({ { 1, n_pre, n_pre + 3 }, { 0, n_pre, n_pre + 4 }, { 2, n_pre, n_pre + 4 }, { 3, n_pre, n_pre + 4 } }), "overlap decode failed");
+        const bool rm_m = llama_memory_seq_rm(llama_get_memory(ctx_m.get()), 1, n_pre + 1, -1);
+        const bool rm_s = llama_memory_seq_rm(llama_get_memory(ctx_s.get()), 1, n_pre + 1, -1);
+        TLOG_INF("%s: rollback of seq 1 after the move: %s (one sequence per ubatch: %s)\n", __func__, rm_m ? "accepted" : "REFUSED", rm_s ? "accepted" : "refused");
+        CTX_REQUIRE(rm_s, "the oracle refused the rollback");
+        CTX_REQUIRE(rm_m, "the rollback of seq 1 was refused after a later ubatch moved its cell (llama-server would abort)");
+        CTX_REQUIRE(run({ { 0, n_pre + 4, n_pre + 5 }, { 1, n_pre + 1, n_pre + 2 }, { 2, n_pre + 4, n_pre + 5 }, { 3, n_pre + 4, n_pre + 5 } }), "step failed");
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            std::vector<uint8_t> st[2];
+            llama_context * cs[2] = { ctx_m.get(), ctx_s.get() };
+            for (int c = 0; c < 2; ++c) {
+                const size_t n = llama_state_seq_get_size_ext(cs[c], (llama_seq_id) s, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                st[c].resize(n);
+                llama_state_seq_get_data_ext(cs[c], st[c].data(), n, (llama_seq_id) s, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+            CTX_REQUIRE(st[0].size() == st[1].size(), "state sizes differ");
+            float d_max = 0.0f, a_max = 0.0f;
+            for (size_t i = 0; i + 4 <= st[0].size(); i += 4) {
+                float a, b;
+                memcpy(&a, st[0].data() + i, 4);
+                memcpy(&b, st[1].data() + i, 4);
+                if (std::isfinite(a) && std::isfinite(b)) {
+                    d_max = std::max(d_max, std::fabs(a - b));
+                    a_max = std::max(a_max, std::fabs(b));
+                }
+            }
+            TLOG_INF("%s: seq %u state max diff %g (max %g)\n", __func__, s, (double) d_max, (double) a_max);
+            CTX_REQUIRE(d_max <= 1e-3f*a_max + 1e-7f, "the state of seq " + std::to_string(s) + " differs from one sequence per ubatch (max diff " +
+                    std::to_string(d_max) + " of " + std::to_string(a_max) + ")");
+        }
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
@@ -591,6 +677,7 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
     cases.push_back(std::make_unique<case_replay_overlap>());
+    cases.push_back(std::make_unique<case_k19_move>());
 
     return cases;
 }

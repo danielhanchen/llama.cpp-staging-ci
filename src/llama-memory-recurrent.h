@@ -123,6 +123,12 @@ public:
     std::function<void(const std::vector<std::pair<uint32_t, uint32_t>> &)> move_cb; // set by llama_context (rs_replay_move)
     std::vector<std::pair<uint32_t, uint32_t>> rp_swaps;
     uint64_t n_replay_move = 0;
+    uint64_t n_snap_move   = 0;
+    // k19-b33mv: the move copies row to row (rs_move_rows) through one scratch unit per buffer type and shape (r, s, PLE conv rows;
+    // with replay the k, v, gate/beta window slices of a cell), allocated with the cache (so the fit prices them) and only with several
+    // sequences: no graph and no allocation at move time (the dup graph of 9c2e needed an unpriced compute buffer, ~900 MiB on G4 fn4)
+    std::vector<ggml_tensor *> mv_tmp_r_l, mv_tmp_s_l, mv_tmp_p_l, mv_tmp_k_l, mv_tmp_v_l, mv_tmp_g_l;
+    void rs_move_rows(const std::vector<std::pair<uint32_t, uint32_t>> & swaps);
     void replay_swap(int32_t a, int32_t b, const std::vector<uint8_t> & in_ubatch);
     void replay_mark(const llama_ubatch & ubatch);
     uint64_t n_rollback_copy = 0;
