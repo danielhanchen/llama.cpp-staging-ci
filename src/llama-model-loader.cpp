@@ -2285,6 +2285,54 @@ void llama_model_loader::settle_pinned_cache() {
             __func__, experts_pin_avail/1024.0/1024.0, pinned_ranges.size(), n_dropped/1024.0/1024.0, mapped_ranges.size(), n_read/1024.0/1024.0,
             (ggml_time_us() - t0)/1000.0);
     }
+    // k19-flintl4: the rule above prices the steady state only. The load itself can still evict mapped tensors while it pins: L4
+    // (53 GB RAM), Flint UD-Q4_K_XL 16 GB (14.4 GB pinned beside a 23.9 GB file, 51.3 GB available) and Qwen3.6-35B-A3B UD-Q4_K_XL
+    // 12 GB: in about half the launches the whole token embedding (311.6 / 515.3 MiB, the first tensor of the file, so the oldest
+    // page-cache pages) is gone after the load. Every prompt then reads its rows from disk (40 / 90 MB at 2k / 8k), and those launches
+    // run 2k / 8k TTFT 1.54 / 4.85 s instead of 1.27 / 4.33 s (q4x 12 GB: 2.78 / 5.1 vs 2.58 / 4.73 s).
+    // When the drop above did not run, mincore() checks the tensors that stay mapped and reads back only those that lost pages
+    // (MADV_POPULATE_READ, else a read per page). LLAMA_MOE_PIN_RESIDENT=0: off (as before)
+    const char * env_res = getenv("LLAMA_MOE_PIN_RESIDENT");
+    if (!tight && !in_tmpfs && (env_res == nullptr || atoi(env_res) != 0)) {
+        const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+        std::vector<unsigned char> vec;
+        size_t n_checked = 0, n_evicted = 0, b_checked = 0, b_missing = 0, b_read = 0;
+        const int64_t t0 = ggml_time_us();
+        for (const auto & r : mapped_ranges) {
+            if (r.idx >= mappings.size() || r.size == 0) {
+                continue;
+            }
+            uint8_t * base = (uint8_t *) mappings.at(r.idx)->addr();
+            const size_t beg = r.offs & ~(page - 1);
+            const size_t end = r.offs + r.size;
+            vec.resize((end - beg + page - 1) / page);
+            if (mincore(base + beg, end - beg, vec.data()) != 0) {
+                continue;
+            }
+            n_checked++;
+            b_checked += r.size;
+            size_t miss = 0;
+            for (unsigned char c : vec) {
+                miss += (c & 1) == 0;
+            }
+            if (miss == 0) {
+                continue;
+            }
+            n_evicted++;
+            b_missing += miss * page;
+            if (madvise(base + beg, end - beg, MADV_POPULATE_READ) != 0) {
+                volatile uint8_t sink = 0;
+                for (size_t o = r.offs; o < end; o += page) {
+                    sink ^= base[o];
+                }
+                (void) sink;
+            }
+            b_read += r.size;
+        }
+        LLAMA_LOG_INFO("%s: k19 resident check: %zu of %zu mapped tensors (%.2f MiB) lost %.2f MiB of page cache during the load, read "
+            "%.2f MiB back in %.0f ms (LLAMA_MOE_PIN_RESIDENT=0 off)\n", __func__, n_evicted, n_checked, b_checked/1024.0/1024.0,
+            b_missing/1024.0/1024.0, b_read/1024.0/1024.0, (ggml_time_us() - t0)/1000.0);
+    }
 #endif
     pinned_ranges.clear();
     mapped_ranges.clear();
