@@ -115,6 +115,15 @@ public:
     void replay_commit_cells(const std::vector<uint8_t> & which, bool sync);
     void replay_commit_cell(int32_t c);
     void replay_commit_ubatch(const llama_ubatch & ubatch, bool placed);
+    // k19-npmtp: find_slot moves the rollback rows of the cells it swaps with them: the snapshot groups 1..n_rs_seq (state and conv rows)
+    // and, with replay, a pending window (instead of committing it). The ubatch graph copies only the live rows (s_copy), so a verify
+    // window whose cell a later ubatch of the same decode moved rolled back from another cell's rows (snapshot rows: wrong state) or
+    // could not roll back (replay). grp_moved: the cells whose rows moved in the last find_slot (s_copy reads their snapshot there)
+    std::vector<uint8_t> grp_moved;
+    std::function<void(const std::vector<std::pair<uint32_t, uint32_t>> &)> move_cb; // set by llama_context (rs_replay_move)
+    std::vector<std::pair<uint32_t, uint32_t>> rp_swaps;
+    uint64_t n_replay_move = 0;
+    void replay_swap(int32_t a, int32_t b, const std::vector<uint8_t> & in_ubatch);
     void replay_mark(const llama_ubatch & ubatch);
     uint64_t n_rollback_copy = 0;
 

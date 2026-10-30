@@ -662,6 +662,46 @@ void llama_memory_recurrent::replay_commit_cell(int32_t c) {
     replay_commit_cells(which, /*sync =*/ false);
 }
 
+// k19-npmtp: find_slot swaps cells a and b. A cell of a sequence of this ubatch commits its window first (it was rolled back before this
+// decode); a pending window of another sequence moves with its cell (rp_swaps, run by move_cb at the end of find_slot), so it can still
+// be rolled back after this decode (G4 -np 4: a ubatch of three sequences moved the cell of the fourth one's verify window)
+void llama_memory_recurrent::replay_swap(int32_t a, int32_t b, const std::vector<uint8_t> & in_ubatch) {
+    if (in_prepare) {
+        return;
+    }
+    if (!replay) {
+        // snapshot rows: the groups of both cells move with them (their rollback may come after this decode)
+        if (n_rs_seq > 0 && move_cb != nullptr && replay_scoped) {
+            rp_swaps.emplace_back((uint32_t) a, (uint32_t) b);
+            grp_moved[a] = grp_moved[b] = 1;
+        }
+        return;
+    }
+    auto ours = [&](int32_t c) {
+        for (llama_seq_id s : cells[c].seq_id) {
+            if (s >= 0 && (size_t) s < in_ubatch.size() && in_ubatch[s]) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const bool can_move = replay_scoped && move_cb != nullptr;
+    for (int32_t c : { a, b }) {
+        if (!can_move || ours(c)) {
+            replay_commit_cell(c);
+        }
+    }
+    auto pending = [&](int32_t c) { return pend_n[c] != 0 || conv_rb[c] != 0; };
+    if (pending(a) || pending(b)) {
+        std::swap(pend_n[a],  pend_n[b]);
+        std::swap(pend_rb[a], pend_rb[b]);
+        std::swap(conv_rb[a], conv_rb[b]);
+        std::swap(par[a],     par[b]);
+        rp_swaps.emplace_back((uint32_t) a, (uint32_t) b);
+        grp_moved[a] = grp_moved[b] = 1;
+    }
+}
+
 // k19-npmtp: before a ubatch, the windows of the cells it reads or copies: placed (after find_slot) the cells [head, head + n) and
 // their copy sources, else the tails of its sequences and every cell a copy is staged from or to (find_slot commits what it moves)
 void llama_memory_recurrent::replay_commit_ubatch(const llama_ubatch & ubatch, bool placed) {
@@ -675,13 +715,10 @@ void llama_memory_recurrent::replay_commit_ubatch(const llama_ubatch & ubatch, b
         }
     };
     if (placed) {
-        // its own cells, and the other cells of [head, head + n) whose rows the graph copies from another cell (an identity copy
-        // leaves a row as it is, so the window of such a cell stays pending)
-        for (uint32_t c = head; c < head + n && c < size; ++c) {
-            if (c < head + ubatch.n_seqs || (cells[c].src0 >= 0 && cells[c].src0 != (int32_t) c)) {
-                mark((int32_t) c);
-                mark(cells[c].src0);
-            }
+        // its own cells. A cell of another sequence that find_slot moved keeps its window (moved with it, replay_swap): its state row
+        // is copied by this ubatch's graph, so it is committed by a later ubatch of its own
+        for (uint32_t c = head; c < head + ubatch.n_seqs && c < size; ++c) {
+            mark((int32_t) c);
         }
     } else {
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
@@ -896,6 +933,24 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     // can only process batches with an equal number of new tokens in each sequence
     GGML_ASSERT(ubatch.equal_seqs());
 
+    // k19-npmtp: the sequences of this ubatch (replay_swap)
+    std::vector<uint8_t> in_ubatch;
+    if (!in_prepare) {
+        grp_moved.assign(size, 0);
+    }
+    if (!in_prepare && (replay || n_rs_seq > 0)) {
+        in_ubatch.assign(size, 0);
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                const llama_seq_id sid = ubatch.seq_id[i][j];
+                if (sid >= 0 && (uint32_t) sid < size) {
+                    in_ubatch[sid] = 1;
+                }
+            }
+        }
+        rp_swaps.clear();
+    }
+
     int32_t min = size - 1;
     int32_t max = 0;
 
@@ -1009,8 +1064,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         const int32_t dst_id = s + min;
         const int32_t src_id = cells[ubatch.seq_id[i][0]].tail;
         if (dst_id != src_id) {
-            replay_commit_cell(dst_id);
-            replay_commit_cell(src_id);
+            replay_swap(dst_id, src_id, in_ubatch);
             auto & dst_cell = cells[dst_id];
             auto & src_cell = cells[src_id];
 
@@ -1089,6 +1143,14 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             }
             cells[i].src = i; // avoid moving or clearing twice
         }
+    }
+
+    // k19-npmtp: the windows that moved with their cells (replay_swap)
+    if (!rp_swaps.empty()) {
+        if (move_cb) {
+            move_cb(rp_swaps);
+        }
+        rp_swaps.clear();
     }
 
     // allow getting the range of used cells, from head to head + n
@@ -1873,5 +1935,7 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
             mem->rs_idx[seq] = 0;
         }
     }
-    return (int32_t)(idx * mem->size) + src0;
+    // k19-npmtp: a cell that find_slot moved has its snapshot groups at its new place (rs_move), only the live row is read at src0
+    const bool moved = idx > 0 && cell_idx < mem->grp_moved.size() && mem->grp_moved[cell_idx];
+    return (int32_t)(idx * mem->size) + (moved ? (int32_t) cell_idx : src0);
 }

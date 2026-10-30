@@ -265,11 +265,14 @@ struct llama_context {
     void rs_replay_commit(bool sync);
     // k16-replay-oom: decides rs_mode and reserves the fallback allocation of the largest commit graph at load (see rs_replay_commit)
     void rs_replay_setup();
+    // k19-npmtp: moves the pending windows (stores and conv snapshot rows) of cells that find_slot swapped, in swap order
+    void rs_replay_move(llama_memory_recurrent * mem, const std::vector<std::pair<uint32_t, uint32_t>> & swaps);
     // the commit graph of the pending cells (worst: every cell with a full window, the pending state untouched, for the reserve)
     void rs_commit_build(ggml_context * ctx, ggml_cgraph * gf, bool worst);
     ggml_gallocr_ptr         rs_ga_fb; // one backend: the reserved fallback allocation (null: not reserved)
     uint64_t                 rs_fb_used = 0;
     llama_memory_recurrent * rs_replay_mem = nullptr;
+    llama_memory_recurrent * rs_move_mem   = nullptr; // k19-npmtp: any recurrent memory with rollback rows (rs_replay_move)
     ggml_backend_sched_ptr   rs_sched;
     int64_t                  rs_replay_us = 0;
     // the last commit graph, reused while the same cells commit the same tokens (LLAMA_RS_REPLAY_REUSE=0: rebuilt every time)
