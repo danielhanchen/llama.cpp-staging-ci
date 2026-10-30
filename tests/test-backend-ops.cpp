@@ -10030,6 +10030,9 @@ struct test_kq_mask : public test_case {
                     v[8*i + 7] = (int32_t) (rng() % 4);
                 }
                 ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else {
+                // the sentinels: left unset they hold whatever the buffer held before (NaN now and then), which the NaN check reports
+                init_tensor_uniform(t);
             }
         }
     }
