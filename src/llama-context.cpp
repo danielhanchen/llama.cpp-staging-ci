@@ -5649,6 +5649,17 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             pool_mark_trim(false);
         }
         lm_released = moe_cache->release();
+        // k19-fn16 (LLAMA_MOE_LM_RELEASE_DEPTH, default 4; 0 = the usual depth): while the banks are released the group copies every host
+        // expert of every layer, and the memory they freed holds a deeper staging arena next to the merged graph's buffers. The scheduler
+        // takes the deepest depth up to this that fits (ggml_backend_sched_set_prefetch_depth_scope), the arena returns to its size before
+        // the banks come back. The decode depth, the cache and the fit are unchanged. G4, Qwen3.8-Flash-Next UD-IQ4_XS + Q8_0 MTP drafter,
+        // 16 GB, 8k prompt (k19fn_p1_g4): at depth 2 the splits waited 384 of 1647 ms for their copies (H2D 57.5 GB at 56 GB/s, 452 ms
+        // of it outside the kernels); depth 4 everywhere (LLAMA_MOE_PREFETCH_DEPTH_SPILL=4, whose fit paid with 2 GB of cache) waited 0.7 ms
+        // and the group took 1329 instead of 1710 ms
+        static const int lm_rel_depth = getenv("LLAMA_MOE_LM_RELEASE_DEPTH") ? std::max(0, atoi(getenv("LLAMA_MOE_LM_RELEASE_DEPTH"))) : 4;
+        if (lm_released && lm_rel_depth > 0) {
+            ggml_backend_sched_set_prefetch_depth_scope(sched.get(), lm_rel_depth);
+        }
     }
     lm_ask.clear();
     lm_staged.clear();
@@ -6429,6 +6440,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         moe_cache->clear_seed_counts();
         // the compute buffers shrink back to what the next graph needs before the banks take their memory again
         ggml_backend_sched_free_device_buffers(sched.get());
+        // k19-fn16: and the staging arena to its size before the group (a no-op without LLAMA_MOE_LM_RELEASE_DEPTH)
+        ggml_backend_sched_set_prefetch_depth_scope(sched.get(), 0);
         if (lm_rel_trim) {
             const size_t trimmed = pool_mark_trim(true);
             static int n_trim_log = 0;

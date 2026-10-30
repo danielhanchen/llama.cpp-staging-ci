@@ -410,6 +410,11 @@ extern "C" {
     // starting depth of the host weight prefetch (copies of that many splits in flight), unless GGML_SCHED_PREFETCH_DEPTH is set; the
     // adaptive depth continues from it and a staging arena that does not fit goes back to the default depth
     GGML_API void                       ggml_backend_sched_set_prefetch_depth_init(ggml_backend_sched_t sched, int depth);
+    // k19-fn16: graphs allocated under an allocation limit (ggml_backend_sched_set_alloc_limit) until the scope ends get the deepest
+    // prefetch depth up to `depth` whose staging arena fits next to their measured compute buffer growth (else the usual depth); the arena
+    // returns to its earlier size when the scope ends (depth 0; call it after the scheduler was reset or its buffers freed). Not with
+    // GGML_SCHED_PREFETCH_DEPTH set. The adaptive depth does not count the scoped graphs
+    GGML_API void                       ggml_backend_sched_set_prefetch_depth_scope(ggml_backend_sched_t sched, int depth);
     GGML_API size_t                     ggml_backend_sched_get_prefetch_headroom(ggml_backend_sched_t sched);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);

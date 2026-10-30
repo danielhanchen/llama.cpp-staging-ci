@@ -1013,6 +1013,7 @@ struct ggml_backend_sched_prefetch {
     int  n_timers_cap;
     int  n_timed;   // prefetched splits timed in the last computed graph (2 events each, plus the first and last)
     bool timed;     // the last computed graph recorded timers that were not read yet
+    bool timed_scoped; // k19-fn16: ... and that graph was bound at the scoped depth (logged with the stats, not used by the adaptive depth)
     bool shrink;    // the adaptive depth went back to a smaller depth: reallocate a larger arena at the next binding
 
     // prefetched splits of the current graph
@@ -1036,6 +1037,11 @@ struct ggml_backend_sched_prefetch {
     int    n_lent_bufs;
     bool   lent_all;  // the graph allocator uses lent memory: the lent buffers behave like compute buffers in every split
     bool   ensure_refused; // k15-fn: the staging arena of a merged graph did not allocate (the graph is refused, the prefetch kept)
+    // k19-fn16: the current binding uses the scoped depth (ggml_backend_sched_set_prefetch_depth_scope); scope_grown: the arena was
+    // reallocated for it, scope_prev = its size before (given back when the scope ends, and reported by ggml_backend_sched_get_buffer_size)
+    bool   scoped;
+    bool   scope_grown;
+    size_t scope_prev;
     size_t lent;      // bytes of the copies and of the graph allocator in lent memory
     size_t lent_prev; // logged value
     size_t ext_prev;  // logged size of the graph allocator in lent memory
@@ -1184,6 +1190,11 @@ struct ggml_backend_sched {
     ggml_backend_event_t (*pf_timer_new)(ggml_backend_dev_t);
     bool (*pf_timer_elapsed)(ggml_backend_event_t, ggml_backend_event_t, float *);
     bool pf_check;     // a staging arena was allocated since the headroom was last checked
+    // k19-fn16: depth asked for the graphs allocated until the scope ends (0 = none), the depth the current graph got (0 = the usual
+    // one), and the free memory a scoped arena must leave next to the graph's compute buffer growth [GGML_SCHED_PREFETCH_SCOPE_HEADROOM_MIB]
+    int    pf_depth_scope;
+    int    pf_depth_scope_eff;
+    size_t pf_scope_headroom;
     size_t pf_headroom; // free device memory a reserve / graph allocation must leave with a staging arena, else the prefetch is dropped
     struct ggml_backend_sched_prefetch pf[GGML_SCHED_MAX_BACKENDS];
 
@@ -2967,7 +2978,7 @@ static bool ggml_backend_sched_prefetch_ensure(ggml_backend_sched_t sched, int b
     // itself is exact, the headroom only covers the backends: Qwen3.6 MTP on a 12 GB T4 with 498 MiB free stepped both contexts with 0
     // and ran 16k prompts with 104 MiB left (without the check a 320 MiB arena failed), 512 blocked the step of Flash-Next IQ1_S on 8 GB
     // (694 MiB of growth, 890 MiB free)
-    if (pf->depth > sched->pf_depth0 && pf->staging > pf->arena_size) {
+    if (pf->depth > sched->pf_depth0 && pf->staging > pf->arena_size && !pf->scoped) {
         static const size_t headroom = (size_t) std::max(0, getenv("GGML_SCHED_PREFETCH_ADAPT_HEADROOM_MIB") ?
             atoi(getenv("GGML_SCHED_PREFETCH_ADAPT_HEADROOM_MIB")) : 128) * 1024 * 1024;
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -2997,6 +3008,10 @@ static bool ggml_backend_sched_prefetch_ensure(ggml_backend_sched_t sched, int b
     // the old arena (if any) may still be read or written
     ggml_backend_sched_prefetch_sync(sched);
 
+    if (pf->scoped && !pf->scope_grown) {
+        pf->scope_prev  = pf->arena != NULL ? pf->arena_size : 0;
+        pf->scope_grown = true;
+    }
     if (pf->arena != NULL) {
         ggml_backend_buffer_free(pf->arena);
         pf->arena      = NULL;
@@ -3004,6 +3019,15 @@ static bool ggml_backend_sched_prefetch_ensure(ggml_backend_sched_t sched, int b
     }
 
     pf->arena = ggml_backend_buft_alloc_buffer(sched->bufts[backend_id], pf->staging);
+    if (pf->arena == NULL && pf->scoped) {
+        // k19-fn16: the scoped depth did not allocate after all: this binding uses the usual depth
+        GGML_LOG_INFO("%s: %s: %.2f MiB of staging memory for the scoped depth %d do not allocate: depth %d\n", __func__,
+            ggml_backend_name(backend), pf->staging / 1024.0 / 1024.0, pf->depth, sched->pf_depth);
+        pf->scoped  = false;
+        pf->depth   = sched->pf_depth;
+        pf->staging = ggml_backend_sched_prefetch_staging(sched, backend_id);
+        pf->arena   = ggml_backend_buft_alloc_buffer(sched->bufts[backend_id], pf->staging);
+    }
     // k15-fn GGML_SCHED_PREFETCH_FAIL_AT=N (debug): the Nth staging allocation fails, as cudaMalloc does when the device is full
     {
         static const int fail_at = getenv("GGML_SCHED_PREFETCH_FAIL_AT") ? atoi(getenv("GGML_SCHED_PREFETCH_FAIL_AT")) : 0;
@@ -3183,7 +3207,9 @@ static void ggml_backend_sched_prefetch_bind(ggml_backend_sched_t sched, bool dr
         sched->pf_runs      = 0;
     }
     for (int b = 0; b < sched->n_backends; b++) {
-        sched->pf[b].depth   = sched->pf_depth;
+        // k19-fn16: a binding (not a measure) at the depth the allocation chose for the scope
+        sched->pf[b].scoped  = !dry && sched->pf_depth_scope_eff > 0;
+        sched->pf[b].depth   = sched->pf[b].scoped ? sched->pf_depth_scope_eff : sched->pf_depth;
         sched->pf[b].ring    = false;
         sched->pf[b].armed   = 0;
         sched->pf[b].n_bound = 0;
@@ -3984,6 +4010,9 @@ static void ggml_backend_sched_prefetch_copy(ggml_backend_sched_t sched, int b, 
 // splits issued ahead of the computed ones: the depth of the binding (its staging slots), or a smaller depth the adaptive depth went
 // back to since the binding (a step that did not pay ends at once, not at the next binding: llama reuses the graph of a prompt's ubatches)
 static int ggml_backend_sched_prefetch_ahead(ggml_backend_sched_t sched, const struct ggml_backend_sched_prefetch * pf) {
+    if (pf->scoped) {
+        return std::max(pf->depth - 1, 1);
+    }
     return std::max(std::min(pf->depth, sched->pf_depth) - 1, 1);
 }
 
@@ -4049,7 +4078,7 @@ static void ggml_backend_sched_prefetch_arm(ggml_backend_sched_t sched) {
     for (int b = 0; b < sched->n_backends; b++) {
         struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
         pf->armed = 0;
-        if (pf->n_bound == 0 || pf->copy_backend == NULL || pf->consumed != pf->n_bound) {
+        if (pf->n_bound == 0 || pf->copy_backend == NULL || pf->consumed != pf->n_bound || pf->scoped) {
             continue;
         }
         const int ahead = std::min(ggml_backend_sched_prefetch_ahead(sched, pf), pf->n_bound);
@@ -4106,7 +4135,7 @@ static void ggml_backend_sched_prefetch_adapt(ggml_backend_sched_t sched) {
             GGML_LOG_INFO("%s: prefetch stats: depth %d, %d timed splits waited %.2f of %.2f ms (%.1f%%) for their copies\n",
                 __func__, pf->depth, pf->n_timed, stall, busy, 100.0*stall/busy);
         }
-        if (!sched->pf_adapt) {
+        if (!sched->pf_adapt || pf->timed_scoped) {
             continue;
         }
         sched->pf_acc_stall += stall;
@@ -4464,7 +4493,7 @@ static void ggml_backend_sched_prefetch_plan(ggml_backend_sched_t sched) {
     std::vector<const struct ggml_tensor *> & srcs = *sched->plan_srcs;
     srcs.clear();
     if (sched->pf_active) {
-        const int ahead = std::max(sched->pf_depth - 1, 1);
+        const int ahead = std::max((sched->pf_depth_scope_eff > 0 ? sched->pf_depth_scope_eff : sched->pf_depth) - 1, 1);
         int issued[GGML_SCHED_MAX_BACKENDS]   = { 0 };
         int consumed[GGML_SCHED_MAX_BACKENDS] = { 0 };
         auto issue = [&]() {
@@ -4895,6 +4924,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             if (timing[split_backend_id] && pf->consumed == pf->n_bound && pf->n_timed > 0) {
                 ggml_backend_event_record(pf->timers[2*pf->n_timed], split_backend);
                 pf->timed = true;
+                pf->timed_scoped = pf->scoped;
             }
             ggml_backend_sched_prefetch_issue(sched);
         }
@@ -5009,6 +5039,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->pf_depth0    = sched->pf_depth;
         const char * GGML_SCHED_PREFETCH_HEADROOM_MIB = getenv("GGML_SCHED_PREFETCH_HEADROOM_MIB");
         sched->pf_headroom  = (size_t) (GGML_SCHED_PREFETCH_HEADROOM_MIB ? std::max(0, atoi(GGML_SCHED_PREFETCH_HEADROOM_MIB)) : 512)*1024*1024;
+        const char * GGML_SCHED_PREFETCH_SCOPE_HEADROOM_MIB = getenv("GGML_SCHED_PREFETCH_SCOPE_HEADROOM_MIB");
+        sched->pf_scope_headroom = (size_t) (GGML_SCHED_PREFETCH_SCOPE_HEADROOM_MIB ? std::max(0, atoi(GGML_SCHED_PREFETCH_SCOPE_HEADROOM_MIB)) : 512)*1024*1024;
+        sched->pf_depth_scope     = 0;
+        sched->pf_depth_scope_eff = 0;
         // GGML_SCHED_LEND_SYNC=0: bindings with only SYNC copies are not offered to the lender (their copies go to the graph allocator
         // when no arena exists, see ggml_backend_sched_prefetch_bind); 1 (default) only if the graph allocator cannot grow by them; 2 always
         const char * GGML_SCHED_LEND_SYNC = getenv("GGML_SCHED_LEND_SYNC");
@@ -5268,6 +5302,58 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     ggml_backend_sched_reset(sched);
 }
 
+// k19-fn16: an arena grown for the scoped depth goes back to the size it had before the scope (nothing may be queued that reads it:
+// the queues are synchronized first; the bound copies of the current graph point into it, so the scheduler is reset before its next use)
+static void ggml_backend_sched_prefetch_scope_shrink(ggml_backend_sched_t sched) {
+    bool any = false;
+    for (int b = 0; b < sched->n_backends; b++) {
+        any = any || sched->pf[b].scope_grown;
+    }
+    if (!any) {
+        return;
+    }
+    ggml_backend_sched_prefetch_sync(sched);
+    for (int b = 0; b < sched->n_backends; b++) {
+        struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+        if (!pf->scope_grown) {
+            continue;
+        }
+        if (pf->arena != NULL) {
+            ggml_backend_buffer_free(pf->arena);
+            pf->arena      = NULL;
+            pf->arena_size = 0;
+        }
+        if (pf->scope_prev > 0) {
+            pf->arena = ggml_backend_buft_alloc_buffer(sched->bufts[b], pf->scope_prev);
+            if (pf->arena != NULL) {
+                ggml_backend_buffer_set_usage(pf->arena, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                pf->arena_size = pf->scope_prev;
+            }
+        }
+        pf->scope_grown = false;
+        pf->scope_prev  = 0;
+        pf->scoped      = false;
+        pf->armed       = 0;
+    }
+}
+
+void ggml_backend_sched_set_prefetch_depth_scope(ggml_backend_sched_t sched, int depth) {
+    GGML_ASSERT(sched);
+    if (depth > 0) {
+        if (sched->pf_mode == 0 || getenv("GGML_SCHED_PREFETCH_DEPTH") != NULL) {
+            return;
+        }
+        sched->pf_depth_scope = std::min(depth, GGML_SCHED_MAX_PREFETCH_DEPTH);
+        return;
+    }
+    sched->pf_depth_scope     = 0;
+    sched->pf_depth_scope_eff = 0;
+    ggml_backend_sched_prefetch_scope_shrink(sched);
+    for (int b = 0; b < sched->n_backends; b++) {
+        sched->pf[b].scoped = false;
+    }
+}
+
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
@@ -5348,6 +5434,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     } at_l = { at_on, at0, at1, graph->n_nodes, sched->n_splits };
 
     sched->alloc_over = 0;
+    sched->pf_depth_scope_eff = 0;
     size_t lend_need[GGML_SCHED_MAX_BACKENDS] = { 0 };
     // k15-fn (GGML_SCHED_LEND_GUARD=0 off): a graph the lender may take is measured like one under the limit, so that a growth neither
     // lent nor fitting next to the staging arena is refused below (alloc_over, prefetch kept) instead of failing in cudaMalloc, which
@@ -5412,6 +5499,34 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
             sched->cur_copy   = cur_copy_prev;
             return false;
         }
+        // k19-fn16: a scoped depth (ggml_backend_sched_set_prefetch_depth_scope) for a graph measured under the limit: the deepest depth
+        // up to the scope whose staging arena fits in the free memory next to the measured growth of the compute buffers, with
+        // GGML_SCHED_PREFETCH_SCOPE_HEADROOM_MIB (512) left; none fits: the usual depth. Only the copies' placement and how far ahead they
+        // are issued change, not what the graph computes
+        if (sched->alloc_limit_on && sched->pf_depth_scope > sched->pf_depth) {
+            for (int d = sched->pf_depth_scope; d > sched->pf_depth && sched->pf_depth_scope_eff == 0; d--) {
+                bool any = false;
+                bool fits = true;
+                for (int b = 0; b < sched->n_backends && fits; b++) {
+                    struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+                    ggml_backend_dev_t dev = sched->backends[b]->device;
+                    if (pf->n_bound == 0 || pf->n_async == 0 || dev == NULL || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        continue;
+                    }
+                    any = true;
+                    const size_t st    = ggml_backend_sched_prefetch_layout(sched, b, d, NULL, false);
+                    const size_t have  = pf->arena != NULL ? pf->arena_size : 0;
+                    const size_t extra = st > have ? st - have : 0;
+                    size_t free  = 0;
+                    size_t total = 0;
+                    ggml_backend_dev_memory(dev, &free, &total);
+                    fits = total > 0 && extra + grow_dev[b] + sched->pf_scope_headroom <= free;
+                }
+                if (any && fits) {
+                    sched->pf_depth_scope_eff = d;
+                }
+            }
+        }
     }
 
     ggml_backend_sched_prefetch_bind(sched, /*dry =*/ false);
@@ -5441,6 +5556,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         if (over > 0) {
             // as a failed allocation below: the caller resets the scheduler, which binds the copies again for the next graph
+            ggml_backend_sched_prefetch_scope_shrink(sched);
             sched->alloc_over = over;
             sched->next_copy  = sched->cur_copy;
             sched->cur_copy   = cur_copy_prev;
@@ -5451,6 +5567,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     if (!ggml_backend_sched_alloc_splits(sched)) {
         if (guard_lend) {
             // k15-fn: a graph the caller can split (it set the limit or the lend scope) is refused, the prefetch stays on
+            ggml_backend_sched_prefetch_scope_shrink(sched);
             sched->alloc_over = 1;
             sched->next_copy  = sched->cur_copy;
             sched->cur_copy   = cur_copy_prev;
@@ -5861,7 +5978,8 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
 
     size_t size = ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
     if (sched->pf[backend_index].arena != NULL) {
-        size += ggml_backend_buffer_get_size(sched->pf[backend_index].arena);
+        // k19-fn16: a scoped arena counts with the size it had before the scope (it gets it back when the scope ends)
+        size += sched->pf[backend_index].scope_grown ? sched->pf[backend_index].scope_prev : ggml_backend_buffer_get_size(sched->pf[backend_index].arena);
     }
     return size;
 }
