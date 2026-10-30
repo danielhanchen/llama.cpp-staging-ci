@@ -1753,6 +1753,7 @@ void llama_context::tiny_rel_leave() {
     if (!tiny_rel_held) {
         return;
     }
+    nextn_hold_wait(); // a drafter pass in flight beside this decode ends before its buffers go
     const int64_t t0 = ggml_time_us();
     // the routing kept for a seed lives in the compute buffers freed here
     moe_cache_ids.clear();
