@@ -1007,6 +1007,19 @@ llama_context::llama_context(
             if (sscanf(e, "%llu:%llu:%llu", &ub_d, &ub_t, &cache_b) == 3 && ub_d > 0 && cparams.moe_cache_size == (size_t) cache_b) {
                 tiny_rel_res_ub = (int64_t) ub_d;
             }
+        }
+        // test knob (LLAMA_MOE_TINY_RELEASE_FORCE=N): the release of the tiny-cache rule for any context with a MoE cache and n_ubatch above
+        // N (and N as the reserve size of its MTP drafter), e.g. -ub 4096 with an explicit --moe-cache-mib, to compare it byte for byte
+        // against the same placement without the release
+        const int tiny_force = getenv("LLAMA_MOE_TINY_RELEASE_FORCE") != nullptr ? atoi(getenv("LLAMA_MOE_TINY_RELEASE_FORCE")) : 0;
+        if (tiny_force > 0 && !model.hparams.no_alloc && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            tiny_rel_res_ub = tiny_force;
+        } else if (tiny_force > 0 && moe_cache && !model.hparams.no_alloc && (int64_t) cparams.n_ubatch > tiny_force) {
+            tiny_rel_ub     = tiny_force;
+            tiny_rel_res_ub = tiny_force;
+            tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") == nullptr || atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0;
+            lm_enabled      = false;
+            LLAMA_LOG_INFO("%s: MoE cache: ubatches of more than %d tokens run with the cache banks released (LLAMA_MOE_TINY_RELEASE_FORCE)\n", __func__, tiny_force);
         } else if (const char * e = getenv("LLAMA_MOE_TINY_RELEASE"); e != nullptr && *e != '\0' && moe_cache && !model.hparams.no_alloc &&
                 cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
             unsigned long long ub_d = 0, ub_t = 0, cache_b = 0;
