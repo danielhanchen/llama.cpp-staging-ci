@@ -1263,6 +1263,7 @@ private:
         bool                               hold    = false; // main thread: the next update_slots continues the slot's prompt beside it
         bool                               group   = false; // main thread: beside the next prompt batch of any size (the target holds)
         bool                               fail    = false; // main thread: a pass the target's hold joined failed (reported at the next join)
+        int                                slot_id = -1;    // main thread: the slot whose prompt batch the pass computes (k19-studio-np4)
         std::atomic<bool>                  ok      { true };
         int64_t                            t_launch = 0;
     } spec_bg;
@@ -1344,6 +1345,31 @@ private:
             SRV_INF("srv phase: drafter joined, waited %.2f ms, %.2f ms after its launch\n", (ggml_time_us() - t0)/1e3, (ggml_time_us() - spec_bg.t_launch)/1e3);
         }
         return spec_bg.ok.load();
+    }
+
+    // k19-studio-np4 (LLAMA_MTP_PROMPT_BG_MULTI=0 off): the slot whose prompt the drafter's background pass may accompany: the only
+    // slot (-np 1), or with several slots the only one that is processing (the others idle: Studio's -np 4 with one user). Before, the
+    // pass ran on a worker only at -np 1; at -np 4 each 8192-token group of a long prompt waited for its drafter pass in line (G4 Flash-Next
+    // + Q8_0 MTP 16 GB, 30k: 93-117 ms per group, TTFT 6.356 vs 6.162 s at -np 1). Every other slot that starts work joins the worker
+    // first (pre_decode, and the slot's prompt_load / prompt_save / prompt_clear / release), as the draft context is shared
+    server_slot * spec_bg_slot() {
+        if (slots.size() == 1) {
+            return &slots[0];
+        }
+        static const bool multi_env = getenv("LLAMA_MTP_PROMPT_BG_MULTI") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_BG_MULTI")) != 0;
+        if (!multi_env) {
+            return nullptr;
+        }
+        server_slot * one = nullptr;
+        for (auto & sl : slots) {
+            if (sl.is_processing()) {
+                if (one != nullptr) {
+                    return nullptr;
+                }
+                one = &sl;
+            }
+        }
+        return one;
     }
 
     // for callers that cannot throw: a failed pass ends every slot, as decode()'s throw does
@@ -4391,9 +4417,11 @@ private:
         // k19-host: beside the drafter's background pass only the batch of the slot's last prompt tokens is built (its seq_rm and checkpoint
         // queue their draft parts behind the pass); anything else joins it first
         if (spec_bg.live) {
-            const bool tail = slots.size() == 1 && slots[0].state == SLOT_STATE_PROCESSING_PROMPT && slots[0].task &&
-                !slots[0].task->tokens.has_mtmd && slots[0].task->n_tokens() > slots[0].prompt.n_tokens() &&
-                (spec_bg.group || slots[0].task->n_tokens() - slots[0].prompt.n_tokens() <= spec_bg_tail_max);
+            // k19-studio-np4: with several slots, only while the slot of the pass is the only one processing (spec_bg_slot)
+            const server_slot * bs = spec_bg_slot();
+            const bool tail = bs != nullptr && bs->id == spec_bg.slot_id && bs->state == SLOT_STATE_PROCESSING_PROMPT && bs->task &&
+                !bs->task->tokens.has_mtmd && bs->task->n_tokens() > bs->prompt.n_tokens() &&
+                (spec_bg.group || bs->task->n_tokens() - bs->prompt.n_tokens() <= spec_bg_tail_max);
             if (!tail) {
                 spec_bg_join_or_abort();
             }
@@ -5694,10 +5722,12 @@ private:
                 SRV_INF("mtp prompt pass on a worker for prompt batches of at least %d tokens (LLAMA_MTP_PROMPT_BG_MIN)\n", v);
                 return v;
             }();
-            bool bg = !dft_off && !skip && bg_env && ok && ret == 0 && slots.size() == 1 && has_prompt && batch.view.size() > spec_bg_tail_max &&
+            // k19-studio-np4: the only slot, or the only processing one of several (spec_bg_slot, LLAMA_MTP_PROMPT_BG_MULTI=0 off)
+            const server_slot * bg_sl = spec_bg_slot();
+            bool bg = !dft_off && !skip && bg_env && ok && ret == 0 && bg_sl != nullptr && has_prompt && batch.view.size() > spec_bg_tail_max &&
                 batch.view.size() >= bg_min && off + batch.view.size() == batch.size() && common_speculative_rows_ext_floats(spec.get()) > 0;
             if (bg) {
-                const server_slot & sl = slots[0];
+                const server_slot & sl = *bg_sl;
                 n_rest = sl.task ? sl.task->n_tokens() - sl.prompt.n_tokens() : 0;
                 bg = sl.state == SLOT_STATE_PROCESSING_PROMPT && sl.task && !sl.task->tokens.has_mtmd && sl.spec_i_batch.empty() &&
                     !(sl.i_batch >= off && sl.i_batch < off + batch.view.size()) && n_rest > 0 && (n_rest <= spec_bg_tail_max || bg_group_env);
@@ -5769,9 +5799,10 @@ private:
                         }
                     }
                 });
-                spec_bg.live  = true;
-                spec_bg.hold  = true;
-                spec_bg.group = n_rest > spec_bg_tail_max;
+                spec_bg.live    = true;
+                spec_bg.hold    = true;
+                spec_bg.group   = n_rest > spec_bg_tail_max;
+                spec_bg.slot_id = bg_sl->id;
                 if (spec_bg.group) {
                     llama_set_nextn_hold(ctx_tgt, &server_context_impl::spec_bg_hold_cb, this);
                 }

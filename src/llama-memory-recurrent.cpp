@@ -62,16 +62,23 @@ llama_memory_recurrent::llama_memory_recurrent(
             // until the next ubatch of its cell, and find_slot moves cells to gather a multi-sequence ubatch: G4 Qwen3.8-Flash-Next +
             // MTP -np 4 --kv-unified, four overlapping requests, a later ubatch of the same decode moved the cell of a verify window
             // before its rollback (seq_rm refused, server abort), and the 8k reply differed from its single-slot text.
-            // LLAMA_RS_REPLAY_MULTI=1: replay with several sequences too (the k16 behaviour)
+            // k19-studio-np4 (LLAMA_RS_REPLAY_MULTI, default 1 now): the pending window of a cell moves with it (replay_scoped, see
+            // find_slot / the rollback row move), so several sequences replay too and get the memory of the snapshot rows back:
+            // 2 more state rows per sequence, 823 MiB on G4 Qwen3.8-Flash-Next UD-IQ4_XS + MTP at Studio's -np 4 --kv-unified (16 GB:
+            // MoE cache 3752 -> 4578 MiB). Same math as the snapshot rows (G4 fixed placement, np 4 replay = np 1 replay = np 1 snapshot
+            // md5). =0: the snapshot rows with several sequences (as before); LLAMA_RS_REPLAY_SCOPED=0 (the windows do not move) keeps them
             const char * em = getenv("LLAMA_RS_REPLAY_MULTI");
-            const bool multi_ok = em != nullptr && atoi(em) != 0;
+            const char * es = getenv("LLAMA_RS_REPLAY_SCOPED");
+            const bool scoped   = es == nullptr || atoi(es) != 0;
+            const bool multi_ok = em != nullptr ? atoi(em) != 0 : scoped;
             const bool multi    = n_seq_max > 1 && !multi_ok;
             const bool spill    = on_host && on_dev;
             want = spill && !multi;
             LLAMA_LOG_INFO("%s: delta-net rollback: %s (LLAMA_RS_REPLAY auto: layer weights %s%s; =1 / =0 forces replay / snapshot rows)\n",
                     __func__, want ? "replay" : "snapshot rows", spill ? "spill to host memory" :
                     on_dev ? "all on a device" : "all in host memory",
-                    spill && multi ? ", but several sequences (LLAMA_RS_REPLAY_MULTI=1: replay)" : "");
+                    spill && multi ? ", but several sequences (LLAMA_RS_REPLAY_MULTI=1: replay)" :
+                    spill && n_seq_max > 1 ? ", several sequences replay too (LLAMA_RS_REPLAY_MULTI=0: snapshot rows)" : "");
         }
         replay = can && want;
         const char * es = getenv("LLAMA_RS_REPLAY_SCOPED");
