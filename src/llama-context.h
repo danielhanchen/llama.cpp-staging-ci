@@ -910,6 +910,7 @@ private:
     // allocated and refilled before the next ubatch of at most tiny_rel_ub tokens, after this context's and its MTP drafters' device
     // compute buffers are freed
     int64_t tiny_rel_ub      = 0;     // > 0: on (the default n_ubatch the cache was sized for)
+    int64_t tiny_rel_res_ub  = 0;     // > 0: sched_reserve reserves the graphs of at most this many tokens (also an MTP drafter of such a context)
     bool    tiny_rel_held    = false; // the banks are released by tiny_rel_enter
     bool    tiny_rel_routed  = true;  // LLAMA_MOE_TINY_RELEASE_ROUTED=0: the slots come back with the experts they held before
     int64_t tiny_rel_n_enter = 0;

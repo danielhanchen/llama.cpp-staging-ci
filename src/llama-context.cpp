@@ -981,12 +981,21 @@ llama_context::llama_context(
         }
         // k19-tiny-ub: the context common's tiny-cache rule sized ("<default n_ubatch>:<n_ubatch>:<cache bytes>"): its cache keeps the size
         // of the default n_ubatch and is released while larger ubatches run, starting with the reserve below (see tiny_rel_enter)
-        if (const char * e = getenv("LLAMA_MOE_TINY_RELEASE"); e != nullptr && *e != '\0' && moe_cache && !model.hparams.no_alloc &&
+        if (const char * e = getenv("LLAMA_MOE_TINY_RELEASE"); e != nullptr && *e != '\0' && !model.hparams.no_alloc &&
+                cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            // the MTP drafter of such a context reserves at the default n_ubatch too: its prompt passes run while the target's banks
+            // are released (right after the target's ubatches), and the target frees its compute buffers before the banks return
+            unsigned long long ub_d = 0, ub_t = 0, cache_b = 0;
+            if (sscanf(e, "%llu:%llu:%llu", &ub_d, &ub_t, &cache_b) == 3 && ub_d > 0 && cparams.moe_cache_size == (size_t) cache_b) {
+                tiny_rel_res_ub = (int64_t) ub_d;
+            }
+        } else if (const char * e = getenv("LLAMA_MOE_TINY_RELEASE"); e != nullptr && *e != '\0' && moe_cache && !model.hparams.no_alloc &&
                 cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
             unsigned long long ub_d = 0, ub_t = 0, cache_b = 0;
             if (sscanf(e, "%llu:%llu:%llu", &ub_d, &ub_t, &cache_b) == 3 && ub_d > 0 && ub_t > ub_d && cparams.n_ubatch == ub_t &&
                     cparams.moe_cache_size == (size_t) cache_b) {
                 tiny_rel_ub     = (int64_t) ub_d;
+                tiny_rel_res_ub = (int64_t) ub_d;
                 tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") == nullptr || atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0;
                 if (lm_enabled) {
                     lm_enabled = false;
@@ -1687,10 +1696,15 @@ void llama_context::tiny_rel_enter(const char * why) {
     if (tiny_rel_held || !moe_cache || moe_cache->released()) {
         return;
     }
-    ggml_backend_sched_synchronize(sched.get());
+    // (the first reserve runs before the scheduler exists)
+    if (sched) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
     pool_mark_trim_dev(false);
     for (llama_context * c : llama_mtp_ctxs_of(this, model)) {
-        c->synchronize();
+        if (c->sched) {
+            c->synchronize();
+        }
         c->pool_mark_trim_dev(false);
     }
     tiny_rel_held = moe_cache->release();
@@ -1718,8 +1732,10 @@ void llama_context::tiny_rel_leave() {
     size_t freed_dft = 0;
     size_t trimmed   = pool_mark_trim_dev(true);
     for (llama_context * c : llama_mtp_ctxs_of(this, model)) {
-        freed_dft += c->release_device_compute();
-        trimmed   += c->pool_mark_trim_dev(true);
+        if (c->sched) {
+            freed_dft += c->release_device_compute();
+        }
+        trimmed += c->pool_mark_trim_dev(true);
     }
     moe_cache->restore();
     tiny_rel_held = false;
@@ -2160,17 +2176,23 @@ void llama_context::sched_reserve() {
 
     synchronize();
 
-    // k19-tiny-ub: the worst-case graph is of n_ubatch tokens, larger than the cache was sized for: it is reserved with the banks released
-    if (tiny_rel_ub > 0 && moe_cache && !moe_cache->released()) {
-        tiny_rel_enter("reserve");
+    // k19-tiny-ub: the graphs are reserved beside the whole cache (a reserved small batch reads its banks), at most at the n_ubatch the
+    // cache was sized for (tiny_rel_res_ub); a larger ubatch grows the compute buffers while it runs with the banks released
+    if (tiny_rel_held) {
+        tiny_rel_leave();
     }
 
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    if (tiny_rel_res_ub > 0 && (int64_t) n_tokens > tiny_rel_res_ub) {
+        LLAMA_LOG_INFO("%s: the graphs are reserved at %lld tokens, not n_ubatch %u (MoE cache tiny-cache release: larger ubatches grow the "
+            "compute buffers while the cache banks are released)\n", __func__, (long long) tiny_rel_res_ub, n_tokens);
+        n_tokens = (uint32_t) tiny_rel_res_ub;
+    }
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
@@ -4783,7 +4805,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         cparams.batch_invariant = exact_verify && ubatch.n_tokens > 1;
         cparams.exact_split     = cparams.batch_invariant ? llm_graph_exact_split(ubatch) : 0;
 
+        // k19-tiny-ub: with the banks released every layer is built as a large batch (an output-only last layer would read the banks
+        // through a host lookup)
+        if (tiny_rel_now) {
+            moe_cache->set_force_large(true);
+        }
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        if (tiny_rel_now) {
+            moe_cache->set_force_large(false);
+        }
 
         cparams.batch_invariant = false;
         cparams.exact_split     = 0;
