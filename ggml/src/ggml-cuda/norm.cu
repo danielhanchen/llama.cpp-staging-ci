@@ -1521,3 +1521,354 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
+
+// k19: the gated delta net output norm (qwen4exp build_norm_gated): RMS_NORM -> MUL (weight) -> MUL by UNARY SIGMOID (z), in one kernel
+// instead of rms_norm_f32<do_multiply> + unary_gated_q8_1_kernel. The sum of squares is rms_norm_f32's (the same loads and expressions
+// for the block size, vpt and float4 choice rms_norm_f32_dispatch makes), each output is op_sigmoid(z) * (scale * x * w) as the two
+// kernels compute it, and the q8_1 copy (vq != nullptr) is in the reader's rows (ne10 values padded to ne10q, the layout of
+// unary_gated_q8_1_kernel) with one value per lane and the same 32-lane reductions as quantize_q8_1. So dst and the copy are bitwise
+// those of the unfused kernels. Needs ncols % QK8_1 == 0 and ne10 % QK8_1 == 0 (checked by the caller); the weight row is not broadcast
+// along the columns (mul_ncols == ncols).
+template <int block_size, int vpt, bool do_vec>
+static __global__ void rms_norm_mul_sigmoid_gate_f32(const float * x,
+                                                     float *       dst,
+                                                     void *        vq,
+                                                     const int     ncols,
+                                                     const int     nchannels,
+                                                     const int     nsamples,
+                                                     const int64_t stride_row,
+                                                     const int64_t stride_channel,
+                                                     const int64_t stride_sample,
+                                                     const float   eps,
+                                                     const float * mul,
+                                                     const int64_t mul_stride_row,
+                                                     const int64_t mul_stride_channel,
+                                                     const int64_t mul_stride_sample,
+                                                     const uint3   mul_nrows_packed,
+                                                     const uint3   mul_nchannels_packed,
+                                                     const uint3   mul_nsamples_packed,
+                                                     const float * gate,
+                                                     const int64_t gate_stride_row,
+                                                     const int64_t ne10,
+                                                     const int64_t ne10q) {
+    static_assert(block_size % QK8_1 == 0, "a warp must cover whole q8_1 blocks");
+    ggml_cuda_pdl_lc();
+    const int nrows = gridDim.x;
+    const int row   = blockIdx.x;
+    const int tid   = threadIdx.x;
+
+    extern __shared__ float s_sum[];
+
+    ggml_cuda_pdl_sync();
+
+    for (int sample = blockIdx.z; sample < nsamples; sample += gridDim.z) {
+        for (int channel = blockIdx.y; channel < nchannels; channel += gridDim.y) {
+            const int64_t irow = ((int64_t) sample*nchannels + channel)*nrows + row;
+            const float * xc   = x   + sample*stride_sample + channel*stride_channel + row*stride_row;
+            float       * dstc = dst + irow*ncols;
+            const float * gc   = gate + irow*gate_stride_row;
+
+            const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+            const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+            const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
+            const float * mulc = mul + mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+
+            float tmp = 0.0f;
+            if constexpr (do_vec) {
+                const int      ncols4 = ncols / 4;
+                const float4 * x4     = (const float4 *) xc;
+#pragma unroll
+                for (int k = 0; k < vpt; k++) {
+                    const int i = tid + k*block_size;
+                    if (i < ncols4) {
+                        const float4 xs = x4[i];
+                        tmp += xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
+                    }
+                }
+            } else {
+                for (int col = tid; col < ncols; col += block_size) {
+                    const float xi = xc[col];
+                    tmp += xi * xi;
+                }
+            }
+            tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+            const float mean  = tmp / ncols;
+            const float scale = rsqrtf(mean + eps);
+
+            block_q8_1 * y = (block_q8_1 *) vq;
+            for (int i0 = tid; i0 < ncols; i0 += block_size) { // ncols % QK8_1 == 0: whole warps
+                const float nv = scale * xc[i0] * mulc[i0];
+                const float v  = 1.0f / (1.0f + expf(-gc[i0])) * nv; // op_sigmoid(z) * g, as unary_gated_q8_1_kernel
+                dstc[i0] = v;
+                if (vq == nullptr) {
+                    continue; // uniform
+                }
+                float amax = fabsf(v);
+                float sum  = v;
+                amax = warp_reduce_max<QK8_1>(amax);
+                sum  = warp_reduce_sum<QK8_1>(sum);
+
+                const float  d = amax / 127.0f;
+                const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+
+                const int64_t e   = irow*ncols + i0;
+                const int64_t iq  = (e / ne10)*ne10q + e % ne10;
+                const int64_t ib  = iq / QK8_1;
+                const int     iqs = iq % QK8_1;
+                y[ib].qs[iqs] = q;
+                if (iqs == 0) {
+                    y[ib].ds = make_half2(d, sum);
+                }
+            }
+            // the zero padding of a reader row that ends in this norm row, as quantize_q8_1 writes it
+            if (vq != nullptr && ne10q > ne10 && ((irow + 1)*ncols) % ne10 == 0) {
+                const int64_t r = ((irow + 1)*ncols) / ne10 - 1;
+                for (int64_t p = tid; p < ne10q - ne10; p += block_size) {
+                    const int64_t iq  = r*ne10q + ne10 + p;
+                    const int     iqs = iq % QK8_1;
+                    y[iq / QK8_1].qs[iqs] = 0;
+                    if (iqs == 0) {
+                        y[iq / QK8_1].ds = make_half2(0.0f, 0.0f);
+                    }
+                }
+            }
+
+            if constexpr (block_size > WARP_SIZE) {
+                __syncthreads();
+            }
+        }
+    }
+}
+
+bool ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * mul_w,
+                                            const ggml_tensor * unary, ggml_tensor * mul_gate, void * q8_1_out, const int64_t ne10,
+                                            const int64_t ne10q, const bool check_only) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mul_w->src[0] == rms_norm ? mul_w->src[1] : mul_w->src[0];
+    const ggml_tensor * z = unary->src[0];
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+
+    const int64_t ne00 = x->ne[0];
+    const int64_t ne01 = x->ne[1];
+    const int64_t ne02 = x->ne[2];
+    const int64_t ne03 = x->ne[3];
+    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || z->type != GGML_TYPE_F32 || mul_gate->type != GGML_TYPE_F32 || eps < 0.0f ||
+            x->nb[0] != sizeof(float) || w->nb[0] != sizeof(float) || w->ne[0] != ne00 || !ggml_is_contiguous(mul_gate) ||
+            !ggml_are_same_shape(x, mul_gate) || !ggml_is_contiguous_1(z) || z->nb[0] != sizeof(float) || !ggml_are_same_shape(z, mul_gate) ||
+            ne00 % QK8_1 != 0 || ne00 > INT_MAX || (q8_1_out != nullptr && (ne10 <= 0 || ne10 % QK8_1 != 0 || ne10q % QK8_1 != 0 ||
+            ggml_nelements(mul_gate) % ne10 != 0))) {
+        return false;
+    }
+    // z's rows: one stride over the flattened rows (unary_gated_q8_1_kernel's o0)
+    const int64_t gate_s1 = z->nb[1] / sizeof(float);
+    if (ggml_nrows(z) > 1 && (z->nb[2] != z->ne[1]*z->nb[1] || z->nb[3] != z->ne[2]*z->nb[2])) {
+        return false;
+    }
+    if (check_only) {
+        return true;
+    }
+
+    const int64_t s01 = x->nb[1] / sizeof(float);
+    const int64_t s02 = x->nb[2] / sizeof(float);
+    const int64_t s03 = x->nb[3] / sizeof(float);
+    const int64_t mul_s01 = w->nb[1] / sizeof(float);
+    const int64_t mul_s02 = w->nb[2] / sizeof(float);
+    const int64_t mul_s03 = w->nb[3] / sizeof(float);
+    const uint3 mul_nrows_packed     = init_fastdiv_values((uint32_t) w->ne[1]);
+    const uint3 mul_nchannels_packed = init_fastdiv_values((uint32_t) w->ne[2]);
+    const uint3 mul_nsamples_packed  = init_fastdiv_values((uint32_t) w->ne[3]);
+
+    const float * x_d = (const float *) x->data;
+    const float * w_d = (const float *) w->data;
+    const float * z_d = (const float *) z->data;
+    float * dst_d = (float *) mul_gate->data;
+    cudaStream_t stream = ctx.stream();
+
+    // rms_norm_f32_dispatch<do_multiply = true>'s choice for the unfused norm, whose dst is the weight MUL's output (allocated, not
+    // written here); its mul_ncols_packed.z == ncols test is w->ne[0] == ne00 above
+    bool vec = ne00 % 4 == 0 && ne00 > 0 && ((uintptr_t) mul_w->data & 15) == 0;
+    vec = vec && ggml_cuda_is_aligned(x, 16) && ggml_cuda_is_aligned(w, 16);
+    const int n4 = (int) ne00 / 4;
+    const dim3 blocks_num(ne01, MIN(ne02, UINT16_MAX), MIN(ne03, UINT16_MAX));
+#define K19_GATED_NORM_LAUNCH(BLOCK_SIZE, VPT, VEC) \
+    do { \
+        const dim3 block_dims(BLOCK_SIZE, 1, 1); \
+        const ggml_cuda_kernel_launch_params launch_params{ blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, stream }; \
+        ggml_cuda_kernel_launch(rms_norm_mul_sigmoid_gate_f32<BLOCK_SIZE, VPT, VEC>, launch_params, x_d, dst_d, q8_1_out, (int) ne00, \
+            (int) ne02, (int) ne03, s01, s02, s03, eps, w_d, mul_s01, mul_s02, mul_s03, mul_nrows_packed, mul_nchannels_packed, \
+            mul_nsamples_packed, z_d, gate_s1, ne10, ne10q); \
+    } while (0)
+    if (vec) {
+        if (n4 <= 32) {
+            K19_GATED_NORM_LAUNCH(32,   1, true);
+        } else if (n4 <= 128) {
+            K19_GATED_NORM_LAUNCH(128,  1, true);
+        } else if (n4 <= 256) {
+            K19_GATED_NORM_LAUNCH(256,  1, true);
+        } else if (n4 <= 512) {
+            K19_GATED_NORM_LAUNCH(512,  1, true);
+        } else if (n4 <= 1024) {
+            K19_GATED_NORM_LAUNCH(1024, 1, true);
+        } else if (n4 <= 4096) {
+            K19_GATED_NORM_LAUNCH(1024, 4, true);
+        } else {
+            K19_GATED_NORM_LAUNCH(1024, 1, false);
+        }
+    } else if (ne00 < 1024) {
+        K19_GATED_NORM_LAUNCH(256,  1, false);
+    } else {
+        K19_GATED_NORM_LAUNCH(1024, 1, false);
+    }
+#undef K19_GATED_NORM_LAUNCH
+    return true;
+}
+
+// k19: two RMS_NORM -> SCALE pairs over sources of one shape and stride (the gated delta net's q and k L2 norm, build_gdn_l2_norm) in
+// one launch: blockIdx.z picks the pair. Each block runs rms_norm_f32<do_scale>'s expressions for the block size, vpt and float4 choice
+// rms_norm_f32_dispatch makes, so both outputs are bitwise those of the two separate launches.
+template <int block_size, int vpt, bool do_vec>
+static __global__ void rms_norm_scale_pair_f32(const float * x0, const float * x1, float * dst0, float * dst1, const int ncols,
+                                               const int nchannels, const int nsamples, const int64_t stride_row,
+                                               const int64_t stride_channel, const int64_t stride_sample, const float eps,
+                                               const float scale_out) {
+    ggml_cuda_pdl_lc();
+    const int nrows = gridDim.x;
+    const int row   = blockIdx.x;
+    const int tid   = threadIdx.x;
+    const int which = blockIdx.z & 1;
+    const float * x   = which ? x1 : x0;
+    float *       dst = which ? dst1 : dst0;
+
+    extern __shared__ float s_sum[];
+
+    ggml_cuda_pdl_sync();
+
+    for (int sample = blockIdx.z >> 1; sample < nsamples; sample += gridDim.z >> 1) {
+        for (int channel = blockIdx.y; channel < nchannels; channel += gridDim.y) {
+            const float * xc   = x   + sample*stride_sample + channel*stride_channel + row*stride_row;
+            float       * dstc = dst + ((sample*nchannels + channel)*nrows + row)*ncols;
+
+            if constexpr (do_vec) {
+                const int      ncols4 = ncols / 4;
+                const float4 * x4     = (const float4 *) xc;
+                float4 *       dst4   = (float4 *) dstc;
+
+                float4 xs[vpt];
+                float  tmp = 0.0f;
+
+#pragma unroll
+                for (int k = 0; k < vpt; k++) {
+                    const int i = tid + k*block_size;
+                    if (i < ncols4) {
+                        xs[k] = x4[i];
+                        tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
+                    }
+                }
+                tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+                const float scale = rsqrtf(tmp / ncols + eps);
+
+#pragma unroll
+                for (int k = 0; k < vpt; k++) {
+                    const int i = tid + k*block_size;
+                    if (i < ncols4) {
+                        float4 r = make_float4(scale*xs[k].x, scale*xs[k].y, scale*xs[k].z, scale*xs[k].w);
+                        r.x *= scale_out;
+                        r.y *= scale_out;
+                        r.z *= scale_out;
+                        r.w *= scale_out;
+                        dst4[i] = r;
+                    }
+                }
+            } else {
+                float tmp = 0.0f;
+                for (int col = tid; col < ncols; col += block_size) {
+                    const float xi = xc[col];
+                    tmp += xi * xi;
+                }
+                tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+                const float mean  = tmp / ncols;
+                const float scale = rsqrtf(mean + eps);
+
+                for (int col = tid; col < ncols; col += block_size) {
+                    dstc[col] = scale_out * (scale * xc[col]);
+                }
+            }
+            if constexpr (block_size > WARP_SIZE) {
+                __syncthreads();
+            }
+        }
+    }
+}
+
+bool ggml_cuda_op_rms_norm_scale_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * rms0, const ggml_tensor * scale0,
+                                      const ggml_tensor * rms1, const ggml_tensor * scale1) {
+    const ggml_tensor * a = rms0->src[0];
+    const ggml_tensor * b = rms1->src[0];
+    float eps0, eps1, s0, s1, bias0, bias1;
+    memcpy(&eps0, rms0->op_params, sizeof(float));
+    memcpy(&eps1, rms1->op_params, sizeof(float));
+    memcpy(&s0, (const float *) scale0->op_params + 0, sizeof(float));
+    memcpy(&s1, (const float *) scale1->op_params + 0, sizeof(float));
+    memcpy(&bias0, (const float *) scale0->op_params + 1, sizeof(float));
+    memcpy(&bias1, (const float *) scale1->op_params + 1, sizeof(float));
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || scale0->type != GGML_TYPE_F32 || scale1->type != GGML_TYPE_F32 ||
+            eps0 != eps1 || eps0 < 0.0f || s0 != s1 || bias0 != 0.0f || bias1 != 0.0f || !ggml_are_same_shape(a, b) ||
+            !ggml_are_same_shape(a, scale0) || !ggml_are_same_shape(a, scale1) || !ggml_is_contiguous(scale0) || !ggml_is_contiguous(scale1) ||
+            a->nb[0] != sizeof(float) || a->nb[1] != b->nb[1] || a->nb[2] != b->nb[2] || a->nb[3] != b->nb[3] || a->ne[0] > INT_MAX ||
+            a->ne[3] > UINT16_MAX/2) {
+        return false;
+    }
+    // rms_norm_f32_dispatch's float4 test, for both launches (each must pick the same kernel as it would alone)
+    auto vec_ok = [](const ggml_tensor * x, const ggml_tensor * d) {
+        return x->ne[0] % 4 == 0 && x->ne[0] > 0 && ((uintptr_t) d->data & 15) == 0 && ggml_cuda_is_aligned(x, 16);
+    };
+    const bool vec = vec_ok(a, scale0);
+    if (vec != vec_ok(b, scale1)) {
+        return false;
+    }
+    const int64_t ne00 = a->ne[0];
+    const int64_t s01 = a->nb[1] / sizeof(float);
+    const int64_t s02 = a->nb[2] / sizeof(float);
+    const int64_t s03 = a->nb[3] / sizeof(float);
+    const float * a_d = (const float *) a->data;
+    const float * b_d = (const float *) b->data;
+    float * d0 = (float *) scale0->data;
+    float * d1 = (float *) scale1->data;
+    cudaStream_t stream = ctx.stream();
+    const int n4 = (int) ne00 / 4;
+    const dim3 blocks_num(a->ne[1], MIN(a->ne[2], UINT16_MAX), 2*a->ne[3]);
+#define K19_PAIR_LAUNCH(BLOCK_SIZE, VPT, VEC) \
+    do { \
+        const dim3 block_dims(BLOCK_SIZE, 1, 1); \
+        const ggml_cuda_kernel_launch_params launch_params{ blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, stream }; \
+        ggml_cuda_kernel_launch(rms_norm_scale_pair_f32<BLOCK_SIZE, VPT, VEC>, launch_params, a_d, b_d, d0, d1, (int) ne00, \
+            (int) a->ne[2], (int) a->ne[3], s01, s02, s03, eps0, s0); \
+    } while (0)
+    if (vec) {
+        if (n4 <= 32) {
+            K19_PAIR_LAUNCH(32,   1, true);
+        } else if (n4 <= 128) {
+            K19_PAIR_LAUNCH(128,  1, true);
+        } else if (n4 <= 256) {
+            K19_PAIR_LAUNCH(256,  1, true);
+        } else if (n4 <= 512) {
+            K19_PAIR_LAUNCH(512,  1, true);
+        } else if (n4 <= 1024) {
+            K19_PAIR_LAUNCH(1024, 1, true);
+        } else if (n4 <= 4096) {
+            K19_PAIR_LAUNCH(1024, 4, true);
+        } else {
+            K19_PAIR_LAUNCH(1024, 1, false);
+        }
+    } else if (ne00 < 1024) {
+        K19_PAIR_LAUNCH(256,  1, false);
+    } else {
+        K19_PAIR_LAUNCH(1024, 1, false);
+    }
+#undef K19_PAIR_LAUNCH
+    return true;
+}

@@ -7203,6 +7203,43 @@ static int ggml_cuda_try_fuse_cpy_multi(ggml_backend_cuda_context * cuda_ctx, gg
     return last - i;
 }
 
+// k19: the next node after j that is not a view / no-op (at most 4 of them skipped), or n_nodes
+static int ggml_cuda_k19_next_compute(const ggml_cgraph * cgraph, int j) {
+    for (int k = 0; k < 5; ++k) {
+        if (++j >= cgraph->n_nodes) {
+            return cgraph->n_nodes;
+        }
+        if (!ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            return j;
+        }
+    }
+    return cgraph->n_nodes;
+}
+
+// k19: the nodes in (first, last) that are not in idxs are views / no-ops of none of the idxs nodes
+static bool ggml_cuda_k19_views_between_ok(const ggml_cgraph * cgraph, int first, int last, const int * idxs, int n_idx) {
+    for (int j = first + 1; j < last; ++j) {
+        bool member = false;
+        for (int m = 0; m < n_idx; ++m) {
+            member = member || idxs[m] == j;
+        }
+        if (member) {
+            continue;
+        }
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (!ggml_cuda_is_view_or_noop(t)) {
+            return false;
+        }
+        for (int m = 0; m < n_idx; ++m) {
+            const ggml_tensor * f = cgraph->nodes[idxs[m]];
+            if (t->view_src == f || t->src[0] == f) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -8012,6 +8049,88 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
+    }
+
+    // k19 (GGML_CUDA_DISABLE_GATED_NORM_Q8=1 off): the gated delta net output norm, RMS_NORM -> MUL (weight) -> UNARY SIGMOID (z) ->
+    // MUL, in one kernel that also writes the q8_1 copy the out projection reads (ggml_cuda_op_rms_norm_mul_sigmoid_gate); before, the
+    // norm * weight kernel and the sigmoid * product kernel (with the q8_1 copy). Bitwise the two kernels. View nodes may sit between
+    // the four (z's reshape comes right before the sigmoid), as long as they view none of the fused nodes
+    static const bool k19_gated_norm_off = ggml_cuda_env_flag("GGML_CUDA_DISABLE_GATED_NORM_Q8");
+    if (node->op == GGML_OP_RMS_NORM && !k19_gated_norm_off) {
+        const int ia = ggml_cuda_k19_next_compute(cgraph, i);
+        const int ib = ggml_cuda_k19_next_compute(cgraph, ia);
+        const int ic = ggml_cuda_k19_next_compute(cgraph, ib);
+        if (ic < cgraph->n_nodes) {
+            ggml_tensor * mul_w = cgraph->nodes[ia];
+            ggml_tensor * unary = cgraph->nodes[ib];
+            ggml_tensor * mul_g = cgraph->nodes[ic];
+            const int idxs[] = { i, ia, ib, ic };
+            const ggml_op ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
+            const int out_nodes[] = { ic };
+            if (mul_w->op == GGML_OP_MUL && (mul_w->src[0] == node || mul_w->src[1] == node) && unary->op == GGML_OP_UNARY &&
+                    ggml_get_unary_op(unary) == GGML_UNARY_OP_SIGMOID && mul_g->op == GGML_OP_MUL &&
+                    ((mul_g->src[0] == mul_w && mul_g->src[1] == unary) || (mul_g->src[0] == unary && mul_g->src[1] == mul_w)) &&
+                    ggml_are_same_shape(mul_w, node) && ggml_are_same_shape(mul_g, mul_w) && ggml_are_same_shape(unary, mul_w) &&
+                    ggml_cuda_k19_views_between_ok(cgraph, i, ic, idxs, 4) &&
+                    ggml_can_fuse_subgraph_ext(cgraph, idxs, 4, ops, out_nodes, 1) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, ic - i + 1, out_nodes, 1) &&
+                    ggml_cuda_op_rms_norm_mul_sigmoid_gate(*cuda_ctx, node, mul_w, unary, mul_g, nullptr, 0, 0, /*check_only=*/true)) {
+                // the q8_1 copy as unary_gated_q8_1_reserve plans it: in the rows of the reader (ggml_cuda_q8_1_cache::norm_target_ne10)
+                void * q8_1_out = nullptr;
+                int64_t ne10 = 0, ne10q = 0;
+                ggml_cuda_q8_1_cache & cache = cuda_ctx->q8_1_cache;
+                const bool target = cache.active() && cuda_ctx->curr_stream_no == 0 && ggml_is_contiguous(mul_g) && cache.norm_targets.count(mul_g);
+                if (target) {
+                    const auto it = cache.norm_target_ne10.find(mul_g);
+                    ne10 = it != cache.norm_target_ne10.end() ? it->second : mul_g->ne[0];
+                    const int64_t nelem = ggml_nelements(mul_g);
+                    if (ne10 > 0 && nelem % ne10 == 0 && ne10 % QK8_1 == 0) {
+                        ne10q = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+                        const int64_t nrows = nelem / ne10;
+                        int64_t key[ggml_cuda_q8_1_cache::n_key];
+                        ggml_cuda_q8_1_cache::key_contiguous(ne10, nrows, key);
+                        q8_1_out = cache.reserve(mul_g->data, ggml_nbytes(mul_g), key, nrows*ne10q/QK8_1*sizeof(block_q8_1));
+                    }
+                }
+                if (q8_1_out != nullptr || !target) {
+                    const bool ok = ggml_cuda_op_rms_norm_mul_sigmoid_gate(*cuda_ctx, node, mul_w, unary, mul_g, q8_1_out, ne10, ne10q);
+                    GGML_ASSERT(ok);
+                    static bool logged = false;
+                    if (!logged) {
+                        logged = true;
+                        GGML_LOG_INFO("%s: k19 gated norm: rms_norm * w * sigmoid(z)%s in one kernel (GGML_CUDA_DISABLE_GATED_NORM_Q8=1: off)\n",
+                                      __func__, q8_1_out ? " + q8_1" : "");
+                    }
+                    return ic - i;
+                }
+            }
+        }
+    }
+
+    // k19 (GGML_CUDA_DISABLE_L2_NORM_PAIR=1 off): two RMS_NORM -> SCALE pairs of one shape and stride (the gated delta net's q and k L2
+    // norm, build_gdn_l2_norm; the k view node between them) in one launch, bitwise the two launches; neither pair may read or write what
+    // the other writes
+    static const bool k19_l2_pair_off = ggml_cuda_env_flag("GGML_CUDA_DISABLE_L2_NORM_PAIR");
+    if (node->op == GGML_OP_RMS_NORM && !k19_l2_pair_off && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
+        const int ir = ggml_cuda_k19_next_compute(cgraph, i + 1);
+        if (ir + 1 < cgraph->n_nodes && cgraph->nodes[ir]->op == GGML_OP_RMS_NORM &&
+                ggml_cuda_can_fuse(cgraph, ir, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
+            const ggml_tensor * s0 = cgraph->nodes[i + 1];
+            const ggml_tensor * r1 = cgraph->nodes[ir];
+            const ggml_tensor * s1 = cgraph->nodes[ir + 1];
+            const int idxs[] = { i, i + 1, ir, ir + 1 };
+            if (ggml_cuda_k19_views_between_ok(cgraph, i, ir + 1, idxs, 4) &&
+                    !ggml_cuda_tensors_overlap(s0, r1->src[0]) && !ggml_cuda_tensors_overlap(s1, node->src[0]) && !ggml_cuda_tensors_overlap(s0, s1) &&
+                    !ggml_cuda_tensors_overlap(s0, node->src[0]) && !ggml_cuda_tensors_overlap(s1, r1->src[0]) &&
+                    ggml_cuda_op_rms_norm_scale_pair(*cuda_ctx, node, s0, r1, s1)) {
+                static bool logged = false;
+                if (!logged) {
+                    logged = true;
+                    GGML_LOG_INFO("%s: k19 L2 norm pair: two rms_norm * scale in one launch (GGML_CUDA_DISABLE_L2_NORM_PAIR=1: off)\n", __func__);
+                }
+                return ir + 1 - i;
+            }
+        }
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
