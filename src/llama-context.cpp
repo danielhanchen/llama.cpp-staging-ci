@@ -315,6 +315,23 @@ static std::atomic<int64_t> llama_ple_busy_us{0};
 static std::mutex                   llama_mtp_ctx_mutex;
 static std::vector<llama_context *> llama_mtp_ctxs;
 
+// k19-tiny-ub debug (LLAMA_MOE_TINY_RELEASE_TRACE=1): step lines around the release / restore and a backtrace on a fatal signal
+static bool tiny_rel_trace() {
+    static const bool on = getenv("LLAMA_MOE_TINY_RELEASE_TRACE") != nullptr && atoi(getenv("LLAMA_MOE_TINY_RELEASE_TRACE")) != 0;
+    return on;
+}
+#if defined(__linux__)
+#include <execinfo.h>
+static void tiny_rel_sig(int sig) {
+    fprintf(stderr, "tiny_rel_trace: fatal signal %d\n", sig);
+    void * frames[64];
+    const int n = backtrace(frames, 64);
+    backtrace_symbols_fd(frames, n, 2);
+    _exit(128 + sig);
+}
+#endif
+#define TINY_TRACE(...) do { if (tiny_rel_trace()) { LLAMA_LOG_INFO(__VA_ARGS__); } } while (0)
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -1687,22 +1704,6 @@ size_t llama_context::pool_mark_trim_dev(bool trim) {
     return freed;
 }
 
-// k19-tiny-ub debug (LLAMA_MOE_TINY_RELEASE_TRACE=1): step lines around the release / restore and a backtrace on a fatal signal
-static bool tiny_rel_trace() {
-    static const bool on = getenv("LLAMA_MOE_TINY_RELEASE_TRACE") != nullptr && atoi(getenv("LLAMA_MOE_TINY_RELEASE_TRACE")) != 0;
-    return on;
-}
-#if defined(__linux__)
-#include <execinfo.h>
-static void tiny_rel_sig(int sig) {
-    fprintf(stderr, "tiny_rel_trace: fatal signal %d\n", sig);
-    void * frames[64];
-    const int n = backtrace(frames, 64);
-    backtrace_symbols_fd(frames, n, 2);
-    _exit(128 + sig);
-}
-#endif
-#define TINY_TRACE(...) do { if (tiny_rel_trace()) { LLAMA_LOG_INFO(__VA_ARGS__); } } while (0)
 
 // the MTP drafters on this context's model (their compute buffers grow with the prompt too)
 static std::vector<llama_context *> llama_mtp_ctxs_of(const llama_context * self, const llama_model & model) {
