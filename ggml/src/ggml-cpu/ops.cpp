@@ -5057,6 +5057,46 @@ static void ggml_compute_forward_scale_bf16(
     }
 }
 
+// k19-ewchain-cpu: the CPU device claims SCALE for every type (supports_op default), so F16 needs a kernel too (test-backend-ops
+// EW_CHAIN F16 scale+silu aborted the CPU run here); computed in f32 per element, as the BF16 path
+static void ggml_compute_forward_scale_f16(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+
+    float s; // scale factor
+    float b; // bias
+
+    memcpy(&s, (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&b, (float *) dst->op_params + 1, sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc = src0->ne[0];
+    const int nr = ggml_nrows(src0);
+
+    // rows per thread
+    const int dr = (nr + nth - 1)/nth;
+
+    // row range for this thread
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int i1 = ir0; i1 < ir1; i1++) {
+        const ggml_fp16_t * x = (const ggml_fp16_t *) ((const char *) src0->data + i1*src0->nb[1]);
+        ggml_fp16_t       * y = (ggml_fp16_t *)       ((char *)       dst->data  + i1*dst->nb[1]);
+        for (int k = 0; k < nc; k++) {
+            y[k] = GGML_CPU_FP32_TO_FP16(s*GGML_CPU_FP16_TO_FP32(x[k]) + b);
+        }
+    }
+}
+
 void ggml_compute_forward_scale(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -5067,6 +5107,10 @@ void ggml_compute_forward_scale(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_scale_f32(params, dst);
+            } break;
+        case GGML_TYPE_F16:
+            {
+                ggml_compute_forward_scale_f16(params, dst);
             } break;
         case GGML_TYPE_BF16:
             {
