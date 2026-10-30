@@ -9106,7 +9106,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
-        ggml_cuda_exec_copy_ops[cuda_ctx].clear(); // k15-fn debug: the copies of this capture only
+        // k15-fn debug: the copies of this capture only (k19-host: only with the stats on, GGML_CUDA_GRAPH_NODE_STATS >= 3, the only writer
+        // of the map: an unlocked global map lookup on every capture raced with a capture of another context on another thread)
+        static const bool exec_stats_cap = getenv("GGML_CUDA_GRAPH_NODE_STATS") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_NODE_STATS")) >= 3;
+        if (exec_stats_cap) {
+            ggml_cuda_exec_copy_ops[cuda_ctx].clear();
+        }
     }
 
     if (ht_on) {
