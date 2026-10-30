@@ -1649,6 +1649,7 @@ void llama_context::gf_res_epoch_bump(int line) {
 }
 
 llama_context::~llama_context() {
+    nextn_join();
     if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
         std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
         llama_mtp_ctxs.erase(std::remove(llama_mtp_ctxs.begin(), llama_mtp_ctxs.end(), this), llama_mtp_ctxs.end());
@@ -2822,12 +2823,14 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
 }
 
 float * llama_context::get_embeddings_nextn() {
+    nextn_join();
     output_reorder();
 
     return embd_nextn.data;
 }
 
 int64_t llama_context::nextn_rows_wait(int64_t n) {
+    nextn_join();
     // only rows of a single-sequence order (no output swaps to apply) and only rows the event covers
     if (n <= 0 || n > rows_ev_n || !rows_ev || !output_swaps.empty() || !embd_nextn.data) {
         return 0;
@@ -2837,10 +2840,12 @@ int64_t llama_context::nextn_rows_wait(int64_t n) {
 }
 
 float * llama_context::nextn_rows_early() {
+    nextn_join();
     return output_swaps.empty() ? embd_nextn.data : nullptr;
 }
 
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
+    nextn_join();
     output_reorder();
 
     try {
@@ -3255,6 +3260,7 @@ void llama_context::mtp_dev_h_decode_begin(const llama_batch_ext & batch_inp) {
         return;
     }
     st->last_rows = 0;
+    nextn_join();
     const int64_t n = (int64_t) batch_inp.tokens.size();
     if (!st->usable || !cparams.embeddings_nextn || cparams.embeddings_nextn_masked || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE ||
             n < st->min_rows || n > st->n_rows || !embd_nextn.data) {
@@ -3277,6 +3283,7 @@ void llama_context::mtp_dev_h_decode_begin(const llama_batch_ext & batch_inp) {
 }
 
 bool llama_context::mtp_dev_h_store(ggml_backend_t backend_h, ggml_tensor * t_h_nextn, const llama_ubatch & ubatch, int64_t offset) {
+    nextn_join();
     auto * st = mtp_dev_h_sink;
     const int64_t n_embd = model.hparams.n_embd_out();
     bool ok = st && backend_h && t_h_nextn && t_h_nextn->buffer && ubatch.data && ubatch.data->batch_idxs.size() == ubatch.n_tokens &&
@@ -4099,6 +4106,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     }
 
     // extract nextn embeddings (hidden state before the final output norm)
+    nextn_join();
     if (embd_nextn.data && t_h_nextn && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
         ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
         GGML_ASSERT(backend_h != nullptr);
@@ -4534,11 +4542,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // k15-pp: the next-n rows this decode copies to the host (none where they go to the device sink, see mtp_dev_h_decode_begin)
     nextn_decode_rows = (int64_t) balloc->get_batch().n_tokens;
     nextn_need_rows   = mtp_dev_h_this ? 0 : nextn_decode_rows;
-    if (output_reserve(n_outputs_all) < n_outputs_all) {
+    // k19-fn16: a prompt batch longer than one ubatch may grow the next-n store on a thread (nextn_store_ensure)
+    nextn_async_ok = n_outputs_all < n_tokens_all && nextn_decode_rows > (int64_t) cparams.n_ubatch;
+    const uint32_t n_res = output_reserve(n_outputs_all);
+    nextn_async_ok = false;
+    llama_phase("output_reserve");
+    if (n_res < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
-    llama_phase("output_reserve");
 
     // k15: a prompt batch (some tokens without an output) keeps its ubatches off the CPU-miss host path of a pinned cache (see
     // llama_moe_cache::set_prompt_batch); generation and verify batches (an output for every token) keep it
@@ -4771,6 +4783,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
+            nextn_join();
             if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
@@ -5945,6 +5958,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
                 const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
+                nextn_join();
                 if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                     ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                     GGML_ASSERT(backend_h != nullptr);
@@ -6052,6 +6066,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         const bool ok = ggml_backend_sched_alloc_graph(sched.get(), g);
         ggml_backend_sched_set_reuse_weight_copies(sched.get(), false);
         llama_phase("graph alloc end");
+        if (ok) {
+            nextn_launch();
+        }
         static const bool tail_dbg = getenv("LLAMA_LM_TAIL_DEBUG") != nullptr;
         if (tail_dbg && ok && !group.empty() && (int64_t) group.back().ub->n_tokens < prefetch_min_batch) {
             std::map<std::string, int> by;
@@ -6603,6 +6620,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         static const bool rows_env = getenv("LLAMA_MTP_PROMPT_OVERLAP") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_OVERLAP")) != 0;
         auto * t_h = cparams.embeddings_nextn ? group.back().res->get_h_nextn() : nullptr;
         ggml_backend_t be_h = t_h ? ggml_backend_sched_get_tensor_backend(sched.get(), t_h) : nullptr;
+        if (rows_env && more && be_h) {
+            nextn_join();
+        }
         if (rows_env && more && be_h && embd_nextn.data && !cparams.embeddings_nextn_masked && !mtp_dev_h_this &&
                 cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
             ggml_backend_dev_t dev = ggml_backend_get_device(be_h);
@@ -6670,17 +6690,112 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
 // output
 //
 
+// k19-host (LLAMA_NEXTN_CLEAR=1: cleared as before): a new next-n store is not cleared. Every row a reader takes is a row of the last
+// decode, written by that decode's copy to the host before the reader's wait (the drafter's process() rows [0, n_tokens) of the batch and
+// its verify copy of the first rows, get_embeddings_nextn_ith, output_reorder's swaps inside the outputs, the device-sink fallback), and a
+// growth throws the old rows away (no copy), so no reader can see what the clear wrote. G4 Flash-Next + Q8_0 MTP drafter 16 GB: 320 MiB memset
+static bool llama_nextn_clear() {
+    static const bool on = getenv("LLAMA_NEXTN_CLEAR") != nullptr && atoi(getenv("LLAMA_NEXTN_CLEAR")) != 0;
+    return on;
+}
+
+// k19-host: start the allocation of a growth nextn_store_ensure left pending (a prompt batch, LLAMA_NEXTN_ASYNC) on a thread. Called once the
+// layer-major group's merged graph is allocated, so the pinning runs while the group computes instead of beside the member build, where
+// fa48ea65bc7's thread made the build ~40 ms slower (address-space lock contention); nextn_join() installs it before the first row is written
+void llama_context::nextn_launch() {
+    if (!nextn_pending || nextn_started) {
+        return;
+    }
+    nextn_started = true;
+    nextn_t_launch = ggml_time_us();
+    auto * buft = nextn_buft;
+    const size_t bytes = nextn_bytes;
+    const bool clear = llama_nextn_clear();
+    nextn_thr = std::thread([this, buft, bytes, clear]() {
+        ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(buft, bytes);
+        if (b != nullptr && clear) {
+            ggml_backend_buffer_clear(b, 0);
+        }
+        nextn_new = b;
+        nextn_t_done = ggml_time_us();
+    });
+}
+
+void llama_context::nextn_join() {
+    if (!nextn_pending) {
+        return;
+    }
+    const int64_t n_embd_out = model.hparams.n_embd_out();
+    const bool started = nextn_started;
+    const int64_t t_join = ggml_time_us();
+    if (started) {
+        nextn_thr.join();
+    }
+    nextn_pending = false;
+    nextn_started = false;
+    if (nextn_new == nullptr) {
+        // not started (no layer-major group in this decode) or the thread's allocation failed: here, as before the thread, else no next-n rows
+        nextn_new = ggml_backend_buft_alloc_buffer(nextn_buft, std::max<size_t>(1, nextn_new_rows)*n_embd_out*sizeof(float));
+        if (nextn_new == nullptr) {
+            LLAMA_LOG_ERROR("%s: failed to allocate %zu next-n rows\n", __func__, nextn_new_rows);
+            return;
+        }
+        if (llama_nextn_clear()) {
+            ggml_backend_buffer_clear(nextn_new, 0);
+        }
+    } else {
+        static int n_log = 0;
+        if (n_log++ < 8) {
+            LLAMA_LOG_INFO("%s: next-n store of %zu rows (%.2f MiB) allocated beside the group in %.2f ms, joined %.2f ms after the start, "
+                "waited %.2f ms (LLAMA_NEXTN_ASYNC=0: on the request's path)\n", __func__, nextn_new_rows,
+                nextn_new_rows*n_embd_out*sizeof(float)/1048576.0, (nextn_t_done - nextn_t_launch)/1000.0, (t_join - nextn_t_launch)/1000.0,
+                (ggml_time_us() - t_join)/1000.0);
+        }
+    }
+    buf_nextn.reset(nextn_new);
+    nextn_new      = nullptr;
+    nextn_cap_rows = nextn_new_rows;
+    embd_nextn     = buffer_view<float>{(float *) ggml_backend_buffer_get_base(buf_nextn.get()), nextn_cap_rows*n_embd_out};
+}
+
 bool llama_context::nextn_store_ensure(size_t rows) {
     const int64_t n_embd_out = model.hparams.n_embd_out();
     rows = std::min<size_t>(rows, cparams.n_batch);
+    // k19-fn16 (LLAMA_NEXTN_GROW_FULL=1, opt-in: up to n_batch - n_ubatch rows more host memory than the prompts need): a batch of more
+    // than n_ubatch rows (a long prompt) grows the store to n_batch at once, so a longer prompt does not reallocate it again (G4 Flash-Next
+    // + Q8_0 MTP drafter, 16 GB: the 8k prompt grew it to 8188 rows, the 16k prompt after it to 8192, 320 MiB of pinned memory each time)
+    static const bool grow_full = getenv("LLAMA_NEXTN_GROW_FULL") != nullptr && atoi(getenv("LLAMA_NEXTN_GROW_FULL")) != 0;
+    if (grow_full && rows > cparams.n_ubatch) {
+        rows = cparams.n_batch;
+    }
+    nextn_join();
     if (!buf_nextn || nextn_cap_rows < rows) {
+        // k19-host (LLAMA_NEXTN_ROUND_ROWS=N rows, default 256; 0 or 1 = the rows asked): a growth is rounded up to a multiple of N rows (at
+        // most n_batch), so a prompt a few rows longer than the last one does not reallocate the store: G4 Flash-Next + Q8_0 MTP drafter,
+        // 16 GB, the 8k prompt grew it to 8188 rows (its [8188] [4] split), the 16k prompt after it to 8192, 320 MiB of pinned memory freed
+        // and pinned again on the 16k request's path. At most N - 1 rows (10 MiB at 40 KiB a row) more than asked
+        static const size_t round_rows = getenv("LLAMA_NEXTN_ROUND_ROWS") ? (size_t) std::max(0, atoi(getenv("LLAMA_NEXTN_ROUND_ROWS"))) : 256;
+        const size_t rows_asked = rows;
+        if (round_rows > 1) {
+            rows = std::min<size_t>(cparams.n_batch, (rows + round_rows - 1) / round_rows * round_rows);
+            rows = std::max(rows, rows_asked);
+        }
         static const bool log_env = getenv("LLAMA_OUTPUT_RESERVE_LOG") != nullptr && atoi(getenv("LLAMA_OUTPUT_RESERVE_LOG")) != 0;
         if (log_env) {
-            LLAMA_LOG_INFO("%s: ctx %p: next-n rows %zu -> %zu (%.2f MiB)\n", __func__, (void *) this, nextn_cap_rows, rows,
+            LLAMA_LOG_INFO("%s: ctx %p: next-n rows %zu -> %zu (%zu asked, %.2f MiB)\n", __func__, (void *) this, nextn_cap_rows, rows, rows_asked,
                 rows*n_embd_out*sizeof(float)/1048576.0);
         }
         if (buf_nextn) {
-            synchronize();
+            // k19-host (LLAMA_NEXTN_SYNC_FULL=1: synchronize() as before): the old store is written only by this context's copies to the
+            // host, so the scheduler's sync is what its free needs, plus the device reads of an asynchronous state save in flight; the save's
+            // host copy into its prompt-cache entry (the previous request's, still running at the next long prompt) reads neither store
+            static const bool sync_full = getenv("LLAMA_NEXTN_SYNC_FULL") != nullptr && atoi(getenv("LLAMA_NEXTN_SYNC_FULL")) != 0;
+            if (sync_full || !sched) {
+                synchronize();
+            } else {
+                ggml_backend_sched_synchronize(sched.get());
+                state_async_wait_reads();
+            }
         }
         llama_phase("next-n store sync");
         buf_nextn = nullptr;
@@ -6691,6 +6806,21 @@ bool llama_context::nextn_store_ensure(size_t rows) {
         if (hb) {
             buft = hb;
         }
+        // k19-fn16 / k19-host (LLAMA_NEXTN_ASYNC, default 1; 0 = here): for a prompt batch the pinned allocation is made on a thread
+        // started once a layer-major group's merged graph is allocated (nextn_launch), else at the first use (nextn_join); the rows are
+        // first written after the group computed. Same buffer type and size, only allocated off the request's path
+        static const bool nextn_async = getenv("LLAMA_NEXTN_ASYNC") == nullptr || atoi(getenv("LLAMA_NEXTN_ASYNC")) != 0;
+        if (nextn_async && nextn_async_ok) {
+            nextn_new      = nullptr;
+            nextn_new_rows = rows;
+            nextn_buft     = buft;
+            nextn_bytes    = std::max<size_t>(1, rows)*n_embd_out*sizeof(float);
+            nextn_cap_rows = 0;
+            embd_nextn     = buffer_view<float>{nullptr, 0};
+            nextn_pending  = true;
+            nextn_started  = false;
+            return true;
+        }
         buf_nextn.reset(ggml_backend_buft_alloc_buffer(buft, std::max<size_t>(1, rows)*n_embd_out*sizeof(float)));
         if (!buf_nextn) {
             LLAMA_LOG_ERROR("%s: failed to allocate %zu next-n rows\n", __func__, rows);
@@ -6699,7 +6829,9 @@ bool llama_context::nextn_store_ensure(size_t rows) {
             return false;
         }
         llama_phase("next-n store alloc");
-        ggml_backend_buffer_clear(buf_nextn.get(), 0);
+        if (llama_nextn_clear()) {
+            ggml_backend_buffer_clear(buf_nextn.get(), 0);
+        }
         nextn_cap_rows = rows;
         llama_phase("next-n store clear");
     }
@@ -6922,6 +7054,7 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 }
 
 void llama_context::output_reorder() {
+    nextn_join();
     const uint64_t n_vocab     = model.vocab.n_tokens();
     const uint64_t n_embd      = model.hparams.n_embd;
     const uint64_t n_embd_out  = model.hparams.n_embd_out();

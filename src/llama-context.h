@@ -914,6 +914,21 @@ private:
     int64_t nextn_need_rows = 0;   // rows the current decode copies to the host (set before output_reserve)
     int64_t nextn_decode_rows = 0; // tokens of the current decode (a device-sink batch that falls back to the host needs them all)
     bool nextn_store_ensure(size_t rows);
+    // k19-fn16: a growth of the next-n store for a prompt batch is allocated on a thread while the prompt's graphs start
+    // (LLAMA_NEXTN_ASYNC); nextn_join() installs it before the rows are first written or read
+    std::thread             nextn_thr;
+    ggml_backend_buffer_t   nextn_new      = nullptr;
+    size_t                  nextn_new_rows = 0;
+    bool                    nextn_pending  = false;
+    bool                    nextn_async_ok = false; // set by decode() for the output_reserve of a prompt batch
+    // k19-host: the pending growth is started by nextn_launch() once a layer-major group is allocated, else made in nextn_join()
+    bool                    nextn_started  = false;
+    ggml_backend_buffer_type_t nextn_buft  = nullptr;
+    size_t                  nextn_bytes    = 0;
+    int64_t                 nextn_t_launch = 0;
+    std::atomic<int64_t>    nextn_t_done   { 0 };
+    void nextn_launch();
+    void nextn_join();
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
