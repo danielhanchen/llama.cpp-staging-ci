@@ -3284,6 +3284,7 @@ void llama_context::mtp_dev_h_decode_begin(const llama_batch_ext & batch_inp) {
 
 bool llama_context::mtp_dev_h_store(ggml_backend_t backend_h, ggml_tensor * t_h_nextn, const llama_ubatch & ubatch, int64_t offset) {
     nextn_join();
+    nextn_hold_wait();
     auto * st = mtp_dev_h_sink;
     const int64_t n_embd = model.hparams.n_embd_out();
     bool ok = st && backend_h && t_h_nextn && t_h_nextn->buffer && ubatch.data && ubatch.data->batch_idxs.size() == ubatch.n_tokens &&
@@ -4107,6 +4108,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
 
     // extract nextn embeddings (hidden state before the final output norm)
     nextn_join();
+    nextn_hold_wait();
     if (embd_nextn.data && t_h_nextn && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
         ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
         GGML_ASSERT(backend_h != nullptr);
@@ -4784,6 +4786,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
             nextn_join();
+            if (embd_nextn.data && t_h_nextn && n_rows > 0) {
+                nextn_hold_wait();
+            }
             if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
@@ -5624,6 +5629,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 }
             }
             size_t freed = 0;
+            if (!dfts.empty()) {
+                nextn_hold_wait(); // a drafter pass in flight beside this decode ends before its buffers go
+            }
             for (llama_context * c : dfts) {
                 freed += c->release_device_compute();
             }
@@ -5959,6 +5967,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
                 nextn_join();
+                if (embd_nextn.data && t_h_nextn && n_rows > 0) {
+                    nextn_hold_wait();
+                }
                 if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                     ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                     GGML_ASSERT(backend_h != nullptr);
@@ -6785,6 +6796,7 @@ bool llama_context::nextn_store_ensure(size_t rows) {
             LLAMA_LOG_INFO("%s: ctx %p: next-n rows %zu -> %zu (%zu asked, %.2f MiB)\n", __func__, (void *) this, nextn_cap_rows, rows, rows_asked,
                 rows*n_embd_out*sizeof(float)/1048576.0);
         }
+        nextn_hold_wait(); // the rows are freed below
         if (buf_nextn) {
             // k19-host (LLAMA_NEXTN_SYNC_FULL=1: synchronize() as before): the old store is written only by this context's copies to the
             // host, so the scheduler's sync is what its free needs, plus the device reads of an asynchronous state save in flight; the save's
@@ -6915,6 +6927,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             // This doesn't happen often, but may be annoying in some cases (like the HellaSwag benchmark)
             LLAMA_LOG_DEBUG("%s: reallocating output buffer from size %.02f MiB to %.02f MiB\n", __func__, prev_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
 #endif
+            nextn_hold_wait(); // the buffer (with the next-n rows where LLAMA_NEXTN_LAZY=0) is freed below
             synchronize();
             llama_phase("output sync");
 
@@ -7055,6 +7068,9 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 
 void llama_context::output_reorder() {
     nextn_join();
+    if (!output_swaps.empty()) {
+        nextn_hold_wait();
+    }
     const uint64_t n_vocab     = model.vocab.n_tokens();
     const uint64_t n_embd      = model.hparams.n_embd;
     const uint64_t n_embd_out  = model.hparams.n_embd_out();
@@ -11051,6 +11067,10 @@ float * llama_get_embeddings_nextn(llama_context * ctx) {
 
 int64_t llama_nextn_rows_wait(llama_context * ctx, int64_t n_rows) {
     return ctx->nextn_rows_wait(n_rows);
+}
+
+void llama_set_nextn_hold(llama_context * ctx, void (*fn)(void *), void * user_data) {
+    ctx->set_nextn_hold(fn, user_data);
 }
 
 float * llama_get_embeddings_nextn_early(llama_context * ctx) {

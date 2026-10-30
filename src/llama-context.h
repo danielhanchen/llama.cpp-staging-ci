@@ -929,6 +929,20 @@ private:
     std::atomic<int64_t>    nextn_t_done   { 0 };
     void nextn_launch();
     void nextn_join();
+    // k19-host (llama_set_nextn_hold): a reader of the next-n rows outside this context (an MTP drafter's prompt pass on a server worker)
+    // is waited for, once, before this context next writes, reorders or frees those rows or frees the drafter's compute buffers
+    void (*nextn_hold_fn)(void *) = nullptr;
+    void * nextn_hold_ud = nullptr;
+    void nextn_hold_wait() {
+        if (nextn_hold_fn != nullptr) {
+            auto * fn = nextn_hold_fn;
+            nextn_hold_fn = nullptr;
+            fn(nextn_hold_ud);
+        }
+    }
+public:
+    void set_nextn_hold(void (*fn)(void *), void * ud) { nextn_hold_fn = fn; nextn_hold_ud = ud; }
+private:
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;

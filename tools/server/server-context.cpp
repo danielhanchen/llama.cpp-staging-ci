@@ -1253,6 +1253,8 @@ private:
         bool                               closing = false;
         bool                               live    = false; // main thread: a worker is running
         bool                               hold    = false; // main thread: the next update_slots continues the slot's prompt beside it
+        bool                               group   = false; // main thread: beside the next prompt batch of any size (the target holds)
+        bool                               fail    = false; // main thread: a pass the target's hold joined failed (reported at the next join)
         std::atomic<bool>                  ok      { true };
         int64_t                            t_launch = 0;
     } spec_bg;
@@ -1261,8 +1263,29 @@ private:
 
     // joins the worker (a no-op without one); false: its pass failed (the caller reports it, as the in-line pass's failure)
     bool spec_bg_join() {
+        const bool ok = spec_bg_join_impl();
+        if (spec_bg.fail) {
+            spec_bg.fail = false;
+            return false;
+        }
+        return ok;
+    }
+
+    // k19-host (LLAMA_MTP_PROMPT_BG_GROUP): the target context's next-n hold (llama_set_nextn_hold), on the server thread inside the target's
+    // decode, before it writes / frees the rows the pass reads or frees the drafter's compute buffers
+    static void spec_bg_hold_cb(void * ud) {
+        auto * self = (server_context_impl *) ud;
+        if (!self->spec_bg_join_impl()) {
+            self->spec_bg.fail = true;
+        }
+    }
+
+    bool spec_bg_join_impl() {
         if (!spec_bg.live) {
             return true;
+        }
+        if (spec_bg.group) {
+            llama_set_nextn_hold(ctx_tgt, nullptr, nullptr);
         }
         const int64_t t0 = ggml_time_us();
         {
@@ -1271,8 +1294,9 @@ private:
         }
         spec_bg.cv.notify_all();
         spec_bg.thr.join();
-        spec_bg.live = false;
-        spec_bg.hold = false;
+        spec_bg.live  = false;
+        spec_bg.hold  = false;
+        spec_bg.group = false;
         common_speculative_rows_ext_clear(spec.get());
         static const bool srv_phase = getenv("LLAMA_DECODE_PHASE_LOG") != nullptr && atoi(getenv("LLAMA_DECODE_PHASE_LOG")) != 0;
         if (srv_phase) {
@@ -4328,7 +4352,7 @@ private:
         if (spec_bg.live) {
             const bool tail = slots.size() == 1 && slots[0].state == SLOT_STATE_PROCESSING_PROMPT && slots[0].task &&
                 !slots[0].task->tokens.has_mtmd && slots[0].task->n_tokens() > slots[0].prompt.n_tokens() &&
-                slots[0].task->n_tokens() - slots[0].prompt.n_tokens() <= spec_bg_tail_max;
+                (spec_bg.group || slots[0].task->n_tokens() - slots[0].prompt.n_tokens() <= spec_bg_tail_max);
             if (!tail) {
                 spec_bg_join_or_abort();
             }
@@ -5364,7 +5388,9 @@ private:
         // k19-host: the target decode beside the drafter's background pass is at most spec_bg_tail_max tokens of the one slot: such a decode
         // is not layer-major (which may free the drafter's compute buffers) and writes at most that many next-n rows (the stash holds them),
         // it never grows the next-n store (64 rows at least, the pass's batch had more). Anything else joins first
-        if (spec_bg.live && (batch.view.size() > spec_bg_tail_max || slots.size() != 1)) {
+        // k19-host (LLAMA_MTP_PROMPT_BG_GROUP): beside a pass launched in group mode the slot's next prompt batch of any size runs, the
+        // target waits for the pass (its next-n hold) before it writes the rows or frees the drafter's compute buffers
+        if (spec_bg.live && (slots.size() != 1 || (batch.view.size() > spec_bg_tail_max && !spec_bg.group))) {
             if (!spec_bg_join()) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
                 throw std::runtime_error("failed to process speculative batch");
@@ -5448,6 +5474,12 @@ private:
                 srv_ph("target synced");
             }
         });
+        // k19-host: a drafter pass beside this decode is complete before anything below reads the rows or the speculative state
+        // (the target's next-n hold normally joined it already, when it wrote the rows)
+        if (spec_bg.live && !spec_bg_join()) {
+            SRV_ERR("%s", "failed to process speculative batch\n");
+            throw std::runtime_error("failed to process speculative batch");
+        }
         if (lm_cap_req && !(spec_overlap && ret == 0)) {
             cap_checkpoint();
         }
@@ -5561,6 +5593,11 @@ private:
             // k19-host (LLAMA_MTP_PROMPT_BG=0 off): this batch's pass on a worker, beside the slot's next (last, <= spec_bg_tail_max token)
             // prompt decode; same segments, rows and order (see spec_bg_state_t)
             static const bool bg_env = getenv("LLAMA_MTP_PROMPT_BG") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_BG")) != 0;
+            // k19-host (LLAMA_MTP_PROMPT_BG_GROUP=0: only beside the last <= 64 prompt tokens): also beside the slot's next prompt batch of
+            // any size (the batches of a long prompt, each a released layer-major group at 16 GB): its pre-group host work (members, measure,
+            // allocation, ~65 ms with the GPU idle on G4 Flash-Next 16 GB) runs while the drafter computes. The target context waits for
+            // the pass (llama_set_nextn_hold) before it writes the next-n rows the pass reads or frees the drafter's compute buffers
+            static const bool bg_group_env = getenv("LLAMA_MTP_PROMPT_BG_GROUP") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_BG_GROUP")) != 0;
             int32_t n_rest = 0;
             bool bg = bg_env && ok && ret == 0 && slots.size() == 1 && has_prompt && batch.view.size() > spec_bg_tail_max &&
                 off + batch.view.size() == batch.size() && common_speculative_rows_ext_floats(spec.get()) > 0;
@@ -5568,7 +5605,7 @@ private:
                 const server_slot & sl = slots[0];
                 n_rest = sl.task ? sl.task->n_tokens() - sl.prompt.n_tokens() : 0;
                 bg = sl.state == SLOT_STATE_PROCESSING_PROMPT && sl.task && !sl.task->tokens.has_mtmd && sl.spec_i_batch.empty() &&
-                    !(sl.i_batch >= off && sl.i_batch < off + batch.view.size()) && n_rest > 0 && n_rest <= spec_bg_tail_max;
+                    !(sl.i_batch >= off && sl.i_batch < off + batch.view.size()) && n_rest > 0 && (n_rest <= spec_bg_tail_max || bg_group_env);
                 for (int i = 0; bg && i < batch.view.size(); ++i) {
                     bg = batch.view.tokens[i].seq_id == sl.id && batch.view.tokens[i].seq_ids_extra.empty() && !batch.view.tokens[i].output;
                 }
@@ -5637,10 +5674,15 @@ private:
                         }
                     }
                 });
-                spec_bg.live = true;
-                spec_bg.hold = true;
-                SRV_INF("mtp prompt pass on a worker: %d rows, %zu segments beside the next %d-token target decode (LLAMA_MTP_PROMPT_BG=0 off)\n",
-                        batch.view.size(), seg_breaks.empty() ? (size_t) 1 : seg_breaks.size() + 1 - spec_seg_done, n_rest);
+                spec_bg.live  = true;
+                spec_bg.hold  = true;
+                spec_bg.group = n_rest > spec_bg_tail_max;
+                if (spec_bg.group) {
+                    llama_set_nextn_hold(ctx_tgt, &server_context_impl::spec_bg_hold_cb, this);
+                }
+                SRV_INF("mtp prompt pass on a worker: %d rows, %zu segments beside the next %d-token target decode%s (LLAMA_MTP_PROMPT_BG=0 off)\n",
+                        batch.view.size(), seg_breaks.empty() ? (size_t) 1 : seg_breaks.size() + 1 - spec_seg_done, std::min<int32_t>(n_rest, n_batch),
+                        spec_bg.group ? " (group mode, LLAMA_MTP_PROMPT_BG_GROUP=0 off)" : "");
                 srv_ph("drafter launched");
             }
             queue_tasks.yield_to_queue([&]() {

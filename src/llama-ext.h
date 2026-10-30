@@ -261,6 +261,10 @@ LLAMA_API int64_t llama_nextn_rows_wait(struct llama_context * ctx, int64_t n_ro
 // the nextn rows without a synchronization (unmasked: row i at i*n_embd); nullptr when outputs are to be reordered.
 // Valid for rows [0, llama_nextn_rows_wait(...)) until the next decode
 LLAMA_API float * llama_get_embeddings_nextn_early(struct llama_context * ctx);
+// k19-host: fn(user_data) is called once, on the calling thread of a later decode / encode / output read, before the context writes,
+// reorders or frees its next-n rows, or frees an MTP drafter's compute buffers (a reader of the rows outside the context, e.g. a drafter's
+// prompt pass on another thread, is waited for there). nullptr clears it. Not thread-safe: set it from the thread that decodes
+LLAMA_API void llama_set_nextn_hold(struct llama_context * ctx, void (*fn)(void *), void * user_data);
 
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
