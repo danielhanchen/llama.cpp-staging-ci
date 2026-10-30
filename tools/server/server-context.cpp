@@ -5599,12 +5599,12 @@ private:
             // the pass (llama_set_nextn_hold) before it writes the next-n rows the pass reads or frees the drafter's compute buffers
             static const bool bg_group_env = getenv("LLAMA_MTP_PROMPT_BG_GROUP") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_BG_GROUP")) != 0;
             int32_t n_rest = 0;
-            // k19-host (LLAMA_MTP_PROMPT_BG_MIN=N tokens, default min(n_ubatch, 512)): only a prompt batch of at least N tokens runs its
+            // k19-host (LLAMA_MTP_PROMPT_BG_MIN=N tokens, default min(n_ubatch, 1024)): only a prompt batch of at least N tokens runs its
             // drafter pass on the worker, a shorter one in line as before: G4 Flash-Next + Q8_0 MTP 16 GB, batch 17, chat TTFT +4 ms
             // (0.357 vs 0.352-0.353) with the worker on short prompts, where its pass is too short to hide anything
             static const int32_t bg_min = [&]() {
                 const char * e = getenv("LLAMA_MTP_PROMPT_BG_MIN");
-                const int32_t v = e ? std::max(0, atoi(e)) : std::min<int32_t>((int32_t) llama_n_ubatch(ctx_tgt), 512);
+                const int32_t v = e ? std::max(0, atoi(e)) : std::min<int32_t>((int32_t) llama_n_ubatch(ctx_tgt), 1024);
                 SRV_INF("mtp prompt pass on a worker for prompt batches of at least %d tokens (LLAMA_MTP_PROMPT_BG_MIN)\n", v);
                 return v;
             }();
