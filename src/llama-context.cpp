@@ -6067,6 +6067,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                     free_min = std::min(free_min, fr);
                 }
             }
+            // the server skips the drafter's pass over the early batches only where a group lends (llama_mtp_draft_lend_active)
+            mtp_lend_active = free_min < lend_free;
             if (free_min < lend_free) {
                 std::vector<llama_context *> dfts;
                 {
@@ -11420,6 +11422,10 @@ int64_t llama_nextn_rows_wait(llama_context * ctx, int64_t n_rows) {
 
 void llama_set_nextn_hold(llama_context * ctx, void (*fn)(void *), void * user_data) {
     ctx->set_nextn_hold(fn, user_data);
+}
+
+bool llama_mtp_draft_lend_active(const llama_context * ctx) {
+    return ctx != nullptr && ctx->mtp_lend_active;
 }
 
 bool llama_mtp_draft_weights_restore(llama_context * ctx) {

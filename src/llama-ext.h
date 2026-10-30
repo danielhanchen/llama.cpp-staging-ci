@@ -269,6 +269,9 @@ LLAMA_API void llama_set_nextn_hold(struct llama_context * ctx, void (*fn)(void 
 // kdp (LLAMA_MTP_DRAFT_LEND): maps the device weights of a drafter context's model back if a layer-major group of its target borrowed
 // their memory (same addresses, copied back from pinned host memory); a no-op otherwise. false: no device memory for them
 LLAMA_API bool llama_mtp_draft_weights_restore(struct llama_context * ctx_dft);
+// kdp: true where the target's last released layer-major group was below LLAMA_MTP_DRAFT_LEND_FREE_MIB free (it lends, or would but
+// for a drafter pass in flight): the server skips the drafter's pass over the early prompt batches only then
+LLAMA_API bool llama_mtp_draft_lend_active(const struct llama_context * ctx_tgt);
 
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);

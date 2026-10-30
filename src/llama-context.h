@@ -152,6 +152,7 @@ struct llama_context {
     // k15-pp3: the nextn rows [0, n) of the last decode on the host before the decode is done (see rows_ev)
     int64_t nextn_rows_wait(int64_t n);
     bool    mtp_weights_restore(); // kdp: see llama_mtp_draft_weights_restore
+    bool    mtp_lend_active = false; // kdp: the last released layer-major group found too little free memory (llama_mtp_draft_lend_active)
     float * nextn_rows_early();
 
     float * get_embeddings_layer_inp(uint32_t lid);

@@ -5602,12 +5602,16 @@ private:
             // prompt's tokens still after it is not run through the drafter (common_speculative_process_skip: its cells are dropped, the
             // next batch pairs with this batch's last row), so the drafter computes only the batches that hold the prompt's last N rows
             // (at least N rows) and no drafter pass is in flight beside the earlier layer-major groups: those can borrow the drafter's device
-            // weights for a deeper staging arena (llama_context::decode_layer_major). Drafts are verified: only the acceptance moves
+            // weights for a deeper staging arena (llama_context::decode_layer_major). Drafts are verified: only the acceptance moves.
+            // G4 fn4 UD-IQ4_XS 12 GB + the requantized Q8_0 drafter, ctx 32768 (kdp_g1, 3 launches): depth 2 -> 3, 8k / 16k / 30k e2e
+            // 4.714 / 6.346 / 10.360 -> 4.473 / 6.145 / 9.103 s (no drafter: 4.524 / 6.417 / 9.392)
             static const bool    lend_env = getenv("LLAMA_MTP_DRAFT_LEND") == nullptr || atoi(getenv("LLAMA_MTP_DRAFT_LEND")) != 0;
             static const int32_t tail_env = getenv("LLAMA_MTP_PROMPT_TAIL") ? std::max(0, atoi(getenv("LLAMA_MTP_PROMPT_TAIL"))) : 2048;
             bool skip = false;
+            // only where the target's groups lend (llama_mtp_draft_lend_active): elsewhere the skip would cost acceptance for nothing
+            // (G4 fn4 16 GB, depth 4 without the lend: 30k e2e +0.9%)
             if (lend_env && tail_env > 0 && ok && ret == 0 && slots.size() == 1 && has_prompt && ctx_dft && seg_breaks.empty() &&
-                    spec_seg_a == 0 && off + batch.view.size() == batch.size()) {
+                    spec_seg_a == 0 && off + batch.view.size() == batch.size() && llama_mtp_draft_lend_active(ctx_tgt)) {
                 const server_slot & sl = slots[0];
                 const int32_t n_rest_s = sl.task ? sl.task->n_tokens() - sl.prompt.n_tokens() : 0;
                 skip = sl.state == SLOT_STATE_PROCESSING_PROMPT && sl.task && !sl.task->tokens.has_mtmd && sl.spec_i_batch.empty() &&
