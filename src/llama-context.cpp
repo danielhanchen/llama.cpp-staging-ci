@@ -1761,6 +1761,9 @@ void llama_context::tiny_rel_leave() {
     for (llama_context * c : llama_mtp_ctxs_of(this, model)) {
         if (c->sched) {
             TINY_TRACE("%s: trace: free drafter compute\n", __func__);
+            // the routing a drafter keeps for the seed of its next ubatch lives in the compute buffers freed here: it is copied to
+            // host memory first (as before a layer-major group shrinks them), so the drafter seeds as without the release
+            c->lm_ids_host_keep();
             freed_dft += c->release_device_compute();
         }
     }
