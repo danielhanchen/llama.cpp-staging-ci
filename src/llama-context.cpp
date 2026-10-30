@@ -39,6 +39,7 @@
 #include <array>
 #include <set>
 #include <cinttypes>
+#include <csignal>
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
@@ -1000,6 +1001,14 @@ llama_context::llama_context(
                 if (lm_enabled) {
                     lm_enabled = false;
                 }
+#if defined(__linux__)
+                if (tiny_rel_trace()) {
+                    signal(SIGSEGV, tiny_rel_sig);
+                    signal(SIGBUS, tiny_rel_sig);
+                    signal(SIGFPE, tiny_rel_sig);
+                    signal(SIGILL, tiny_rel_sig);
+                }
+#endif
                 LLAMA_LOG_INFO("%s: MoE cache: ubatches of more than %lld tokens (up to n_ubatch %u) run with the cache banks released, the next "
                     "smaller ubatch frees the compute buffers and refills the banks (%s; LLAMA_MOE_PREFILL_UB_TINY_RELEASE=0 off)\n", __func__,
                     (long long) tiny_rel_ub, cparams.n_ubatch, tiny_rel_routed ? "with the experts the last large ubatch routed most" :
@@ -1678,6 +1687,23 @@ size_t llama_context::pool_mark_trim_dev(bool trim) {
     return freed;
 }
 
+// k19-tiny-ub debug (LLAMA_MOE_TINY_RELEASE_TRACE=1): step lines around the release / restore and a backtrace on a fatal signal
+static bool tiny_rel_trace() {
+    static const bool on = getenv("LLAMA_MOE_TINY_RELEASE_TRACE") != nullptr && atoi(getenv("LLAMA_MOE_TINY_RELEASE_TRACE")) != 0;
+    return on;
+}
+#if defined(__linux__)
+#include <execinfo.h>
+static void tiny_rel_sig(int sig) {
+    fprintf(stderr, "tiny_rel_trace: fatal signal %d\n", sig);
+    void * frames[64];
+    const int n = backtrace(frames, 64);
+    backtrace_symbols_fd(frames, n, 2);
+    _exit(128 + sig);
+}
+#endif
+#define TINY_TRACE(...) do { if (tiny_rel_trace()) { LLAMA_LOG_INFO(__VA_ARGS__); } } while (0)
+
 // the MTP drafters on this context's model (their compute buffers grow with the prompt too)
 static std::vector<llama_context *> llama_mtp_ctxs_of(const llama_context * self, const llama_model & model) {
     std::vector<llama_context *> out;
@@ -1728,15 +1754,20 @@ void llama_context::tiny_rel_leave() {
             freed += ggml_backend_sched_get_buffer_size(sched.get(), bk);
         }
     }
+    TINY_TRACE("%s: trace: free own compute (%.2f MiB)\n", __func__, freed/1048576.0);
     ggml_backend_sched_free_device_buffers(sched.get());
     size_t freed_dft = 0;
     for (llama_context * c : llama_mtp_ctxs_of(this, model)) {
         if (c->sched) {
+            TINY_TRACE("%s: trace: free drafter compute\n", __func__);
             freed_dft += c->release_device_compute();
         }
     }
+    TINY_TRACE("%s: trace: trim\n", __func__);
     const size_t trimmed = pool_mark_trim_dev(true);
+    TINY_TRACE("%s: trace: restore\n", __func__);
     moe_cache->restore();
+    TINY_TRACE("%s: trace: restored\n", __func__);
     tiny_rel_held = false;
     tiny_rel_n_leave++;
     const double ms = (ggml_time_us() - t0)/1e3;
@@ -4766,6 +4797,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
         const bool tiny_rel_now = tiny_rel_held && moe_cache && moe_cache->released();
         bool tiny_rel_record = false;
+        if (tiny_rel_ub > 0) {
+            TINY_TRACE("%s: trace: ubatch of %u tokens (%u outputs), released %d\n", __func__, ubatch.n_tokens, (unsigned) n_outputs, (int) tiny_rel_now);
+        }
 
         // the MoE cache only serves batches of up to 32 tokens, the end of a prompt seeds it for the generation that follows
         if (moe_cache) {
@@ -4812,6 +4846,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
         if (tiny_rel_now) {
             moe_cache->set_force_large(false);
+        }
+        if (tiny_rel_ub > 0) {
+            TINY_TRACE("%s: trace: ubatch done (%d)\n", __func__, res != nullptr);
         }
 
         cparams.batch_invariant = false;
