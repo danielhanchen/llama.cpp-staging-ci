@@ -1480,7 +1480,31 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // device holds is stored as requant_type; it is converted while it is loaded (load_all_data). Host tensors keep the file's type
     // (they may be mapped from the file)
     const bool rq_out  = tn.tensor == LLM_TENSOR_OUTPUT && requant_output_type != GGML_TYPE_COUNT;
-    const ggml_type rq_t = rq_out ? requant_output_type : requant_type;
+    ggml_type rq_t = rq_out ? requant_output_type : requant_type;
+    // k19: an FFN / expert matrix whose rows the requant type's blocks do not divide (Qwen3.8-Flash-Next's MTP head: ffn_down_exps
+    // rows of 640 against the 256 of q3_K) kept the file's type, 850 of the head's 1632 MiB at Q8_0. It is stored as
+    // LLAMA_DRAFT_REQUANT_FALLBACK (default q4_0, 32-blocks; "off" keeps the file's type) instead, when that is smaller. A draft's
+    // weights move only its acceptance: drafts are verified by the target
+    if (!rq_out && rq_t != GGML_TYPE_COUNT && t_meta.ne[0] % ggml_blck_size(rq_t) != 0) {
+        static const ggml_type rq_fb = []() {
+            const char * e = getenv("LLAMA_DRAFT_REQUANT_FALLBACK");
+            std::string v = e != nullptr ? e : "q4_0";
+            std::transform(v.begin(), v.end(), v.begin(), ::tolower);
+            for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+                const char * n = ggml_type_name((ggml_type) t);
+                std::string nl = n != nullptr ? n : "";
+                std::transform(nl.begin(), nl.end(), nl.begin(), ::tolower);
+                if (n != nullptr && v == nl && ggml_get_type_traits((ggml_type) t)->from_float_ref != nullptr &&
+                        !ggml_quantize_requires_imatrix((ggml_type) t)) {
+                    return (ggml_type) t;
+                }
+            }
+            return GGML_TYPE_COUNT;
+        }();
+        if (rq_fb != GGML_TYPE_COUNT) {
+            rq_t = rq_fb;
+        }
+    }
     const bool rq_cand = rq_t != GGML_TYPE_COUNT && !is_lazy && !(flags & TENSOR_DUPLICATED) && t_meta.type != rq_t &&
         (rq_out || (strstr(tn.str().c_str(), "ffn_") != nullptr && strstr(tn.str().c_str(), "hc_") == nullptr &&
         strstr(tn.str().c_str(), "gate_inp") == nullptr && strstr(tn.str().c_str(), "norm") == nullptr)) && ggml_n_dims(&t_meta) >= 2 && ggml_get_type_traits(t_meta.type)->to_float != nullptr &&

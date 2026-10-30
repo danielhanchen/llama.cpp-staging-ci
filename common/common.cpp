@@ -2413,6 +2413,8 @@ static bool common_fit_draft_on_cpu(
     // of at least that many tokens per layer; the load then uses those types (LLAMA_DRAFT_REQUANT / _OUTPUT are set for it). Drafts are
     // verified: the output is the target's, only the acceptance moves. G4, Qwen3.8-Flash-Next UD-IQ4_XS 12 GB + its Q8_0 MTP drafter:
     // refused (0.4 tokens) -> q3_k / q4_k admitted (1.x tokens), request time chat / 2k / 8k 3.30 / 4.03 / 4.82 -> 2.39 / 4.01 / 4.46 s
+    // k19: matrices whose rows q3_k's blocks do not divide go to LLAMA_DRAFT_REQUANT_FALLBACK (q4_0, llama_model_loader::create_tensor),
+    // so the measure here sees them too. Same head at ctx 32768: 2009 MiB (0.9 tokens, refused) with its ffn_down_exps kept at Q8_0
     const char * env_rq = getenv("LLAMA_DRAFT_REQUANT");
     const bool rq_off = env_rq != nullptr && (strcmp(env_rq, "off") == 0 || strcmp(env_rq, "0") == 0 || strcmp(env_rq, "none") == 0);
     const bool rq_set = env_rq != nullptr && !rq_off && env_rq[0] != 0;
@@ -2493,7 +2495,7 @@ static bool common_fit_draft_on_cpu(
             "the cap and the floor alone)\n", __func__, tok_left, tok_ok ? "draft model on the GPU" : "refused", (int) min_tok);
     }
     if (rq_tok >= 0.0) {
-        LOG_INF("%s: draft requantized at load (q3_k FFN / experts, q4_k output): %.0f MiB of device memory, the cache it leaves holds the experts "
+        LOG_INF("%s: draft requantized at load (q3_k FFN / experts, LLAMA_DRAFT_REQUANT_FALLBACK where q3_k blocks do not divide the rows, q4_k output): %.0f MiB of device memory, the cache it leaves holds the experts "
             "of %.1f tokens per layer -> %s (at least %d, LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT: verify window cost %.2fx a token, %s %.2f "
             "LLAMA_FIT_DRAFT_REQUANT_MAX_VERIFY_RATIO; LLAMA_DRAFT_REQUANT=off disables)\n", __func__,
             rq_dft/MiB, rq_tok, gpu ? "draft model on the GPU, requantized" : "refused", (int) rq_min_tok, v_ratio,
