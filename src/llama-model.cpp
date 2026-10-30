@@ -1282,6 +1282,7 @@ struct llama_model::impl {
     std::vector<ggml_backend_buffer_t> evict_bufs;
     mutable std::mutex                 evict_m;
     bool                               evicted = false;
+    bool                               prepared      = false; // the host copies exist (weights_evict_prepare)
     bool                               lend_disabled = false; // no more evictions (host RAM, or LLAMA_MTP_DRAFT_LEND_MAX_FAILS remaps failed)
     int                                lend_fails    = 0;     // consecutive requests whose remap or drafter pass after a lend failed
 
@@ -3115,12 +3116,18 @@ size_t llama_model::weights_evict_prepare() {
     }
     // a buffer without virtual memory or a host copy is never evicted
     pimpl->evict_bufs = std::move(keep);
+    pimpl->prepared   = true;
     return bytes;
 }
 
 bool llama_model::weights_evicted() const {
     std::lock_guard<std::mutex> lock(pimpl->evict_m);
     return pimpl->evicted;
+}
+
+bool llama_model::weights_prepared() const {
+    std::lock_guard<std::mutex> lock(pimpl->evict_m);
+    return pimpl->prepared;
 }
 
 size_t llama_model::weights_evictable_bytes() const {
