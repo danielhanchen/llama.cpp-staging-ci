@@ -1131,6 +1131,13 @@ extern "C" {
                                                int32_t   idx,
                                      struct llama_embd   embd);
 
+    // As llama_batch_ext_set_embd_state, but the batch keeps a pointer to embd.data instead of a copy: the data must stay valid and
+    // unchanged until the llama_decode() / llama_process() call that takes this batch has returned
+    LLAMA_API bool llama_batch_ext_set_embd_state_ref(
+                                struct llama_batch_ext * batch,
+                                               int32_t   idx,
+                                     struct llama_embd   embd);
+
     // Set if output embeddings should be available for the token at index idx in the batch
     // Note: for now, this is equivalent to setting the output logits
     LLAMA_API bool llama_batch_ext_set_output_embd(

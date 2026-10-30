@@ -134,7 +134,19 @@ bool llama_batch_allocr::init(
         embd_vec = batch_inp.embd;
     }
 
-    if (has_state) {
+    bool state_by_ref = false;
+    for (int32_t i = 0; has_state && i < n_tok && !state_by_ref; ++i) {
+        state_by_ref = batch_inp.tokens[i].state_ref != nullptr;
+    }
+    if (has_state && state_by_ref) {
+        // k19-host: rows the caller holds (llama_batch_ext_set_embd_state_ref), read in place; a ubatch over rows contiguous in memory
+        // points at them, else its rows are copied (ubatch_add)
+        state_ptrs.resize(n_tok);
+        for (int32_t i = 0; i < n_tok; ++i) {
+            const auto & t = batch_inp.tokens[i];
+            state_ptrs[i] = t.state_ref ? t.state_ref : batch_inp.state.data() + t.state_off;
+        }
+    } else if (has_state) {
         // the input batch outlives every ubatch split from it (they are consumed inside the same decode call), so its state rows
         // are read in place; LLAMA_MTP_HANDOFF_COPY=0: copied first, as before
         static const bool no_copy = llama_mtp_handoff_on("COPY");
@@ -876,6 +888,7 @@ void llama_batch_allocr::clear() {
     is_embd_vec .clear();
     state_vec   .clear();
     state_src = nullptr;
+    state_ptrs  .clear();
     seq_id_data .clear();
     pos         .clear();
     n_seq_id    .clear();
@@ -918,14 +931,20 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     const bool mixed     = mixed_batch && n_embd_rows > 0 && n_embd_rows < n_tokens;
     const bool use_token = batch.token && !(mixed_batch && n_embd_rows == n_tokens);
     const bool use_embd  = batch.embd  && !(mixed_batch && n_embd_rows == 0);
-    const bool has_state = state_src != nullptr;
+    const bool state_by_ref = !state_ptrs.empty();
+    const bool has_state = state_src != nullptr || state_by_ref;
+    // the state row of batch entry j
+    auto state_row = [&](int32_t j) -> const float * {
+        return state_by_ref ? state_ptrs[j] : state_src + (int64_t) j*n_embd_state;
+    };
 
     // the state rows of consecutive batch entries are already laid out as the ubatch needs them: the ubatch points at them
     // instead of a zero-filled copy (a prompt ubatch of the MTP draft carries n_tokens*n_embd floats of target hidden state)
+    // (k19-host: rows held by reference must also be consecutive in memory)
     static const bool state_in_place = llama_mtp_handoff_on("COPY");
-    bool state_view = has_state && state_in_place;
+    bool state_view = has_state && (state_in_place || state_by_ref);
     for (size_t i = 1; state_view && i < idxs.size(); ++i) {
-        state_view = idxs[i] == idxs[0] + (int32_t) i;
+        state_view = idxs[i] == idxs[0] + (int32_t) i && (!state_by_ref || state_ptrs[idxs[i]] == state_ptrs[idxs[0]] + i*n_embd_state);
     }
 
     const int64_t n_embd_all  = use_embd  ? (int64_t) n_tokens*n_embd       : 0;
@@ -963,7 +982,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         }
 
         if (has_state && !state_view) {
-            memcpy(udata->embd_state.data() + i*n_embd_state, state_src + (int64_t) idxs[i]*n_embd_state, n_embd_state*sizeof(float));
+            memcpy(udata->embd_state.data() + i*n_embd_state, state_row(idxs[i]), n_embd_state*sizeof(float));
         }
 
         for (size_t j = 0; j < (size_t)n_pos_per_embd; ++j) {
@@ -1012,7 +1031,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
         /*.token        =*/ use_token ? udata->token.data() : nullptr,
         /*.embd         =*/ use_embd  ? udata->embd.data()  : nullptr,
-        /*.embd_state   =*/ !has_state ? nullptr : state_view ? const_cast<float *>(state_src + (int64_t) idxs[0]*n_embd_state) : udata->embd_state.data(),
+        /*.embd_state   =*/ !has_state ? nullptr : state_view ? const_cast<float *>(state_row(idxs[0])) : udata->embd_state.data(),
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
         /*.seq_id       =*/ udata->seq_id.data(),
@@ -1333,7 +1352,7 @@ bool llama_batch_ext::set_token_embd(int32_t idx, llama_embd embd_in) {
     return true;
 }
 
-bool llama_batch_ext::set_token_state(int32_t idx, llama_embd state_in) {
+bool llama_batch_ext::set_token_state(int32_t idx, llama_embd state_in, bool by_ref) {
     if (idx < 0 || idx >= (int32_t) tokens.size()) {
         return false;
     }
@@ -1359,6 +1378,10 @@ bool llama_batch_ext::set_token_state(int32_t idx, llama_embd state_in) {
     }
 
     t.has_state = true;
+    if (by_ref) {
+        t.state_ref = state_in.data;
+        return true;
+    }
     t.state_off = state.size();
     state.insert(state.end(), state_in.data, state_in.data + n_total);
 
@@ -1461,6 +1484,10 @@ bool llama_batch_ext_set_embd_token(llama_batch_ext * batch, int32_t idx, llama_
 
 bool llama_batch_ext_set_embd_state(llama_batch_ext * batch, int32_t idx, llama_embd embd) {
     return batch->set_token_state(idx, embd);
+}
+
+bool llama_batch_ext_set_embd_state_ref(llama_batch_ext * batch, int32_t idx, llama_embd embd) {
+    return batch->set_token_state(idx, embd, true);
 }
 
 bool llama_batch_ext_set_output_embd(llama_batch_ext * batch, int32_t idx, bool value) {

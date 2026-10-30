@@ -4762,12 +4762,18 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
 
     llama_batch_ext * res = batch.get();
     llama_batch_ext_clear(res);
+    // k19-host (LLAMA_BATCH_STATE_REF=0: copied as before): a batch of 64 entries or more (an MTP drafter's prompt pass) hands its state
+    // rows to the context by reference: the views given to set_embd_state() stay valid until the decode that takes this batch returns
+    // (the caller decodes it at once), so the rows are read in place instead of copied into the batch first (G4 Flash-Next + Q8_0 MTP
+    // drafter: 240 MiB, ~13 ms on the server thread for the 6144-row segment of an 8k prompt)
+    static const bool state_ref_env = getenv("LLAMA_BATCH_STATE_REF") == nullptr || atoi(getenv("LLAMA_BATCH_STATE_REF")) != 0;
+    const bool state_ref = state_ref_env && n >= 64;
     {
         int32_t n_state = 0;
         for (int32_t i = off; i < off + n; ++i) {
             n_state += tokens[i].state.data != nullptr;
         }
-        llama_batch_ext_reserve(res, n, n_state);
+        llama_batch_ext_reserve(res, n, state_ref ? 0 : n_state);
     }
 
     for (int32_t i = off; i < off + n; ++i) {
@@ -4801,7 +4807,11 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
             llama_batch_ext_set_output_logits(res, idx, true);
         }
         if (t.state.data) {
-            llama_batch_ext_set_embd_state(res, idx, t.state); // contexts without a state input ignore it
+            if (state_ref) {
+                llama_batch_ext_set_embd_state_ref(res, idx, t.state); // contexts without a state input ignore it
+            } else {
+                llama_batch_ext_set_embd_state(res, idx, t.state); // contexts without a state input ignore it
+            }
         }
         if (t.decision_order != 0) {
             llama_batch_ext_set_decision_order(res, idx, (llama_decision_order) t.decision_order);
