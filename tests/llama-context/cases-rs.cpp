@@ -8,8 +8,11 @@
 #include "common.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -393,12 +396,171 @@ struct case_shared_seq_reserve : ctx_test {
     }
 };
 
+// k19-npmtp: two parallel requests with draft verify windows (llama-server --parallel N with an MTP / draft model). A batch holds the
+// verify window of one sequence and a prompt chunk of another, so the window is not in the last ubatch of the decode; the window is
+// then rolled back after the decode. A later batch places two windows so that the cells move. Run with the delta-net rollback by replay
+// (LLAMA_RS_REPLAY=1) against the snapshot rows (LLAMA_RS_REPLAY=0), every logit compared. Before the fix the replay context committed
+// every window before each ubatch (the rollback was refused: llama-server aborted in seq_rm), and a moved window read the old row
+struct case_replay_overlap : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "replay_overlap"; }
+
+    const char * description() const override {
+        return "parallel verify windows beside a prompt chunk roll back, delta-net replay against snapshot rows";
+    }
+
+    std::string skip_reason(model_run & mr) const override {
+        if (arch_reserves_single_seq(mr.model)) {
+            return "the overlap batches are multi-seq graphs";
+        }
+
+        return ctx_test::skip_reason(mr);
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr uint32_t n_seqs   = 3;
+        constexpr llama_pos n_pre   = 8;
+        constexpr llama_pos n_chunk = 20;
+
+        // the mode is read when the memory is made: set for each context, then the caller's value back
+        const char * env_prev = getenv("LLAMA_RS_REPLAY");
+        const std::string prev = env_prev ? env_prev : "";
+        const auto make = [&](const char * replay) {
+            setenv("LLAMA_RS_REPLAY", replay, 1);
+            ctx_opts opts;
+            opts.n_ctx      = 256;
+            opts.n_batch    = 64;
+            opts.n_ubatch   = 32;
+            opts.n_seq_max  = n_seqs;
+            opts.n_rs_seq   = 2;
+            opts.kv_unified = 1;
+            auto ctx = mr.ctx(opts);
+            if (env_prev) {
+                setenv("LLAMA_RS_REPLAY", prev.c_str(), 1);
+            } else {
+                unsetenv("LLAMA_RS_REPLAY");
+            }
+            return ctx;
+        };
+
+        llama_context_ptr ctx_rp   = make("1");
+        llama_context_ptr ctx_snap = make("0");
+        if (!ctx_rp || !ctx_snap) {
+            return case_result::fail();
+        }
+        if (llama_n_rs_seq(ctx_rp.get()) < 2) {
+            return case_result::skip("n_rs_seq is too small");
+        }
+
+        llama_context * ctxs[2] = { ctx_rp.get(), ctx_snap.get() };
+
+        // the same batch on both contexts, every output row compared
+        logits_diff diff;
+        const auto both = [&](const std::vector<std::array<llama_pos, 3>> & spans) {
+            int32_t n_out = 0;
+            for (llama_context * ctx : ctxs) {
+                common_batch batch(ctx);
+                n_out = 0;
+                for (const auto & sp : spans) {
+                    for (llama_pos p = sp[1]; p < sp[2]; ++p) {
+                        batch.add(gen_token(n_vocab, (llama_seq_id) sp[0], p), p, (llama_seq_id) sp[0], true);
+                        n_out++;
+                    }
+                }
+                if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                    return false;
+                }
+            }
+            for (int32_t i = 0; i < n_out; ++i) {
+                const float * a = llama_get_logits_ith(ctx_rp.get(), i);
+                const float * b = llama_get_logits_ith(ctx_snap.get(), i);
+                if (a == nullptr || b == nullptr) {
+                    return false;
+                }
+                diff.add(a, b, n_vocab);
+            }
+            return true;
+        };
+        const auto rollback = [&](llama_seq_id seq, llama_pos p0) {
+            bool ok = true;
+            for (llama_context * ctx : ctxs) {
+                ok = ok && llama_memory_seq_rm(llama_get_memory(ctx), seq, p0, -1);
+            }
+            return ok;
+        };
+
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            CTX_REQUIRE(both({ { (llama_pos) s, 0, n_pre } }), "prefill failed");
+        }
+
+        // seq 0: a verify window (3 tokens) beside the prompt chunk of seq 1, which takes a later ubatch of the same decode
+        CTX_REQUIRE(both({ { 0, n_pre, n_pre + 3 }, { 1, n_pre, n_pre + n_chunk } }), "overlap decode failed");
+        CTX_REQUIRE(rollback(0, n_pre + 2), "the window of seq 0 cannot be rolled back after a later ubatch of seq 1");
+
+        // windows of seqs 0 and 2 in one ubatch: their cells are gathered next to each other, the cell of seq 1 moves
+        CTX_REQUIRE(both({ { 0, n_pre + 2, n_pre + 5 }, { 2, n_pre, n_pre + 3 } }), "two-window decode failed");
+        CTX_REQUIRE(rollback(0, n_pre + 3) && rollback(2, n_pre + 1), "the windows of seqs 0 and 2 cannot be rolled back");
+
+        // then all three, one token each, and a few more steps
+        llama_pos pos[3] = { n_pre + 3, n_pre + n_chunk, n_pre + 1 };
+        for (int step = 0; step < 4; ++step) {
+            CTX_REQUIRE(both({ { 1, pos[1], pos[1] + 1 }, { 0, pos[0], pos[0] + 1 }, { 2, pos[2], pos[2] + 1 } }),
+                    "decode failed at step " + std::to_string(step));
+            for (llama_pos & p : pos) {
+                p++;
+            }
+        }
+
+        // the recurrent states themselves: the logits of a random dummy model hardly depend on them (a moved window that read the
+        // state of another sequence changed the logits by 1e-8), so the states are compared too
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            std::vector<uint8_t> st[2];
+            for (int c = 0; c < 2; ++c) {
+                const size_t n = llama_state_seq_get_size_ext(ctxs[c], (llama_seq_id) s, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                st[c].resize(n);
+                CTX_REQUIRE(n > 0 && llama_state_seq_get_data_ext(ctxs[c], st[c].data(), n, (llama_seq_id) s,
+                            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == n, "state save failed");
+            }
+            CTX_REQUIRE(st[0].size() == st[1].size(), "the replay and snapshot states of seq " + std::to_string(s) + " differ in size");
+            float d_max = 0.0f;
+            float a_max = 0.0f;
+            for (size_t i = 0; i + sizeof(float) <= st[0].size(); i += sizeof(float)) {
+                float a, b;
+                memcpy(&a, st[0].data() + i, sizeof(float));
+                memcpy(&b, st[1].data() + i, sizeof(float));
+                if (std::isfinite(a) && std::isfinite(b)) {
+                    d_max = std::max(d_max, std::fabs(a - b));
+                    a_max = std::max(a_max, std::fabs(b));
+                }
+            }
+            TLOG_INF("%s: seq %u state: %zu bytes, max diff %g (max %g)\n", __func__, s, st[0].size(), (double) d_max, (double) a_max);
+            // the states of a dummy model are small (about 4e-3 here); a moved window that read another row differed by 2% of that
+            CTX_REQUIRE(d_max <= 1e-3f*a_max + 1e-7f, "the replay state of seq " + std::to_string(s) +
+                    " differs from the snapshot rows (max diff " + std::to_string(d_max) + " of " + std::to_string(a_max) + ")");
+        }
+
+        // random dummy models drift a little between the two rollback paths; see case_multi_seq_split_replay
+        constexpr float nmse_eps = 1e-4f;
+        CTX_REQUIRE(diff.nmse() <= nmse_eps,
+                "replay logits differ from the snapshot rows (max diff " + std::to_string(diff.diff_max) +
+                ", nmse " + std::to_string(diff.nmse()) + ", first difference at index " + std::to_string(diff.i_first) + ")");
+
+        TLOG_INF("%s: replay matched the snapshot rows (max diff %g, nmse %g)\n", __func__, (double) diff.diff_max, diff.nmse());
+
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
     cases.push_back(std::make_unique<case_rollback>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
+    cases.push_back(std::make_unique<case_replay_overlap>());
 
     return cases;
 }

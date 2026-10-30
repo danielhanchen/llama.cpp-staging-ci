@@ -98,6 +98,7 @@ public:
     std::vector<uint32_t> conv_rb;   // per cell: a conv snapshot still to copy onto the live row (its window committed by a fused ubatch)
     bool replay_fused_ok = false;    // LLAMA_RS_REPLAY_FUSED and a backend with ggml_gated_delta_net_replay
     bool rp_fused = false;           // the current ubatch commits the windows of its cells itself
+    bool rp_moved = false;           // k19-npmtp: a cell of the current ubatch reads its state from another row (src0 != the cell)
     std::vector<int32_t> rp;         // its (kept tokens, half) per sequence
     bool replay_fuse(const llama_ubatch & ubatch);
     uint32_t get_n_win_store() const { return 2*(1 + n_rs_seq); } // token slots per cell in the stores (two halves)
@@ -105,6 +106,15 @@ public:
     uint64_t n_replay_commit = 0;
     bool has_pending() const;
     void replay_commit_if_pending(bool sync = true) const; // calls commit_cb (the state reads below call it first)
+    // k19-npmtp: the windows of the cells a ubatch reads, copies or moves are committed before it, the others stay pending: a window is
+    // rolled back (seq_rm) after the whole llama_decode, so a later ubatch of another sequence in the same decode (--parallel, a prompt
+    // chunk beside a verify window) that committed every cell left nothing to roll back (seq_rm false, server abort).
+    // LLAMA_RS_REPLAY_SCOPED=0: every pending window is committed before each ubatch (the old behaviour)
+    bool replay_scoped = true;
+    bool in_prepare    = false; // prepare() simulates find_slot on a copy of the cells: no commit from there
+    void replay_commit_cells(const std::vector<uint8_t> & which, bool sync);
+    void replay_commit_cell(int32_t c);
+    void replay_commit_ubatch(const llama_ubatch & ubatch, bool placed);
     void replay_mark(const llama_ubatch & ubatch);
     uint64_t n_rollback_copy = 0;
 
@@ -229,6 +239,7 @@ public:
     ggml_tensor * get_rb_l(int32_t il) const;
     void          set_rk_h(int32_t il, int32_t h) const;
     bool          get_replay_fused() const;              // this ubatch's window commits the stored one (ggml_gated_delta_net_replay)
+    bool          get_replay_moved() const;              // k19-npmtp: a sequence of this ubatch reads its state from another row
     void          set_replay_input(ggml_tensor * t) const; // I32 [2, n_seqs]: kept tokens of the stored window, its half
 
     int32_t s_copy(int i) const;

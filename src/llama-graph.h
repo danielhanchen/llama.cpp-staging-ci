@@ -321,6 +321,8 @@ public:
 
     // k16-draft: I32 [2, n_seqs] of ggml_gated_delta_net_replay (kept tokens of the stored window, its half), when this ubatch commits it
     ggml_tensor * rs_rp = nullptr;
+    // k19-npmtp: a sequence of this ubatch reads its state from another row (find_slot moved its cell), see build_recurrent_attn
+    bool rs_moved = false;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {

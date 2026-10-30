@@ -612,6 +612,13 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
             };
             mctx_cur->set_rk_h(il, (int32_t) k->ne[1]);
+            if (inp->rs_moved) {
+                // k19-npmtp: a sequence that find_slot moved to another cell (or a new one) read its state from the old row (or the
+                // zeroed one); the window leaves its own row as it is, and the commit advances that row: it gets the state read
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, s,
+                        ggml_view_4d(ctx0, ssm_states_all, S_v, S_v, H_v, n_seqs, ggml_row_size(ssm_states_all->type, S_v),
+                            ggml_row_size(ssm_states_all->type, S_v*S_v), ssm_states_all->nb[1], (size_t) kv_head * row_size)));
+            }
             store(k, mctx_cur->get_rk_l(il), k->ne[0], k->ne[1]);
             store(v, mctx_cur->get_rv_l(il), S_v, H_v);
             store(g, mctx_cur->get_rg_l(il), 1, H_v, 0);

@@ -63,6 +63,8 @@ llama_memory_recurrent::llama_memory_recurrent(
                     on_dev ? "all on a device" : "all in host memory");
         }
         replay = can && want;
+        const char * es = getenv("LLAMA_RS_REPLAY_SCOPED");
+        replay_scoped = es == nullptr || atoi(es) != 0;
         pend_n.assign(mem_size, 0);
         pend_rb.assign(mem_size, 0);
         par.assign(mem_size, 0);
@@ -266,6 +268,10 @@ void llama_memory_recurrent::clear(bool data) {
         cells[i].src = -1;
         cells[i].tail = -1;
     }
+    // k19-npmtp: no window outlives its sequence (a commit no longer runs over every cell before the next ubatch)
+    std::fill(pend_n.begin(),  pend_n.end(),  0);
+    std::fill(pend_rb.begin(), pend_rb.end(), 0);
+    std::fill(conv_rb.begin(), conv_rb.end(), 0);
 
     head = 0;
     used = 0;
@@ -599,6 +605,92 @@ void llama_memory_recurrent::replay_commit_if_pending(bool sync) const {
     }
 }
 
+// k19-npmtp: commit the pending windows of the cells in `which` only. The others are held out of the commit graph (its builder and its
+// graph key read pend_n / pend_rb / conv_rb) and put back after it, so they can still be rolled back
+void llama_memory_recurrent::replay_commit_cells(const std::vector<uint8_t> & which, bool sync) {
+    if (!commit_cb || !has_pending()) {
+        return;
+    }
+    if (!replay_scoped) {
+        commit_cb(sync);
+        return;
+    }
+    struct held { uint32_t c, n, rb, crb; };
+    std::vector<held> hold;
+    bool any = false;
+    for (uint32_t c = 0; c < size; ++c) {
+        if (pend_n[c] == 0 && conv_rb[c] == 0) {
+            continue;
+        }
+        if (c < which.size() && which[c]) {
+            any = true;
+            continue;
+        }
+        hold.push_back({ c, pend_n[c], pend_rb[c], conv_rb[c] });
+        pend_n[c]  = 0;
+        pend_rb[c] = 0;
+        conv_rb[c] = 0;
+    }
+    if (any) {
+        commit_cb(sync);
+    }
+    for (const held & h : hold) {
+        pend_n[h.c]  = h.n;
+        pend_rb[h.c] = h.rb;
+        conv_rb[h.c] = h.crb;
+    }
+}
+
+// k19-npmtp: find_slot is about to move or share the rows of cell c (a cell swap, a shared tail copied): its window first
+void llama_memory_recurrent::replay_commit_cell(int32_t c) {
+    if (!replay || in_prepare || c < 0 || (uint32_t) c >= size || (pend_n[c] == 0 && conv_rb[c] == 0)) {
+        return;
+    }
+    std::vector<uint8_t> which(size, 0);
+    which[c] = 1;
+    replay_commit_cells(which, /*sync =*/ false);
+}
+
+// k19-npmtp: before a ubatch, the windows of the cells it reads or copies: placed (after find_slot) the cells [head, head + n) and
+// their copy sources, else the tails of its sequences and every cell a copy is staged from or to (find_slot commits what it moves)
+void llama_memory_recurrent::replay_commit_ubatch(const llama_ubatch & ubatch, bool placed) {
+    if (!commit_cb || !has_pending()) {
+        return;
+    }
+    std::vector<uint8_t> which(size, 0);
+    auto mark = [&](int32_t c) {
+        if (c >= 0 && (uint32_t) c < size) {
+            which[c] = 1;
+        }
+    };
+    if (placed) {
+        // its own cells, and the other cells of [head, head + n) whose rows the graph copies from another cell (an identity copy
+        // leaves a row as it is, so the window of such a cell stays pending)
+        for (uint32_t c = head; c < head + n && c < size; ++c) {
+            if (c < head + ubatch.n_seqs || (cells[c].src0 >= 0 && cells[c].src0 != (int32_t) c)) {
+                mark((int32_t) c);
+                mark(cells[c].src0);
+            }
+        }
+    } else {
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                const llama_seq_id sid = ubatch.seq_id[i][j];
+                if (sid >= 0 && (uint32_t) sid < size) {
+                    mark(cells[sid].tail);
+                }
+            }
+        }
+    }
+    for (uint32_t c = 0; c < size; ++c) {
+        if (cells[c].src >= 0 && cells[c].src != (int32_t) c) {
+            mark((int32_t) c);
+            mark(cells[c].src);
+        }
+    }
+    replay_commit_cells(which, /*sync =*/ false);
+}
+
 // k16-draft: after find_slot placed the ubatch's sequences in cells [head, head + n_seqs): a window (at most 1 + n_rs_seq tokens per
 // sequence) is left uncommitted by the graph (build_recurrent_attn), a larger ubatch writes its final state
 void llama_memory_recurrent::replay_mark(const llama_ubatch & ubatch) {
@@ -759,12 +851,14 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
 
     bool success = true;
 
+    in_prepare = true;
     for (const auto & ubatch : ubatches) {
         if (!find_slot(ubatch)) {
             success = false;
             break;
         }
     }
+    in_prepare = false;
 
     // restore the original state
     cells = std::move(org_cells);
@@ -811,6 +905,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             if (j > 0) {
                 auto & seq = cells[seq_id];
                 if (seq.tail >= 0) {
+                    replay_commit_cell(seq.tail);
                     auto & cell = cells[seq.tail];
                     // clear cells from seq_ids that become shared
                     // (should not normally happen, but let's handle it anyway)
@@ -874,6 +969,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             GGML_ASSERT(empty_cell.is_empty());
             // copy old tail into the empty cell
             if (seq_meta.tail >= 0) {
+                replay_commit_cell(seq_meta.tail);
                 auto & orig_cell = cells[seq_meta.tail];
                 empty_cell.pos = orig_cell.pos;
                 empty_cell.src = orig_cell.src;
@@ -902,6 +998,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         const int32_t dst_id = s + min;
         const int32_t src_id = cells[ubatch.seq_id[i][0]].tail;
         if (dst_id != src_id) {
+            replay_commit_cell(dst_id);
+            replay_commit_cell(src_id);
             auto & dst_cell = cells[dst_id];
             auto & src_cell = cells[src_id];
 
@@ -1616,14 +1714,24 @@ bool llama_memory_recurrent_context::apply() {
     // k16-draft: the previous window is committed before this ubatch reads (or copies) any state: by this ubatch's own graph when it
     // is a window of the same cells (replay_fuse), else (and for the conv snapshots and the other cells) by the commit graph, queued
     // here on the same streams as the graph of this ubatch
+    // k19-npmtp: only the windows of the cells this ubatch reads, copies or moves (replay_commit_ubatch, find_slot); the other sequences'
+    // windows stay pending, so a draft verified earlier in the same llama_decode can still be rolled back
     if (mem->replay && mem->replay_fused_ok) {
         mem->find_slot(ubatches[i_next]);
         mem->replay_fuse(ubatches[i_next]);
-        mem->replay_commit_if_pending(/*sync =*/ false);
+        mem->replay_commit_ubatch(ubatches[i_next], /*placed =*/ true);
     } else {
         mem->rp_fused = false;
-        mem->replay_commit_if_pending(/*sync =*/ false);
+        mem->replay_commit_ubatch(ubatches[i_next], /*placed =*/ false);
         mem->find_slot(ubatches[i_next]);
+    }
+    // k19-npmtp: whether a sequence of this ubatch reads its state from another row (LLAMA_RS_REPLAY_SCOPED=0: not written, as before)
+    mem->rp_moved = false;
+    if (mem->replay && mem->replay_scoped) {
+        const llama_ubatch & ub = ubatches[i_next];
+        for (uint32_t s = 0; s < ub.n_seqs && mem->head + s < mem->size; ++s) {
+            mem->rp_moved |= mem->cells[mem->head + s].src0 != (int32_t) (mem->head + s);
+        }
     }
 
     mem->replay_mark(ubatches[i_next]);
@@ -1673,6 +1781,7 @@ ggml_tensor * llama_memory_recurrent_context::get_rg_l(int32_t il) const { retur
 ggml_tensor * llama_memory_recurrent_context::get_rb_l(int32_t il) const { return mem->replay ? mem->rb_l[il] : nullptr; }
 void llama_memory_recurrent_context::set_rk_h(int32_t il, int32_t h) const { mem->rk_h[il] = h; }
 bool llama_memory_recurrent_context::get_replay_fused() const { return mem->replay && mem->rp_fused; }
+bool llama_memory_recurrent_context::get_replay_moved() const { return mem->replay && mem->rp_moved; }
 void llama_memory_recurrent_context::set_replay_input(ggml_tensor * t) const {
     GGML_ASSERT(t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer));
     GGML_ASSERT(mem->rp_fused && (int64_t) mem->rp.size() == ggml_nelements(t));

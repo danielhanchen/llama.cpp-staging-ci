@@ -472,7 +472,7 @@ static void rs_replay_set_input(const llm_graph_input_rs * inp, const llama_memo
 }
 
 static bool rs_replay_can_reuse(const llm_graph_input_rs * inp, const llama_memory_recurrent_context * mctx) {
-    return (inp->rs_rp != nullptr) == mctx->get_replay_fused();
+    return (inp->rs_rp != nullptr) == mctx->get_replay_fused() && inp->rs_moved == mctx->get_replay_moved();
 }
 
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
@@ -4605,6 +4605,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+    inp->rs_moved = mctx_cur->get_replay_moved();
     inp->alias = mctx_cur->get_rs_alias(ubatch);
     if (inp->alias >= 0) {
         LLAMA_LOG_DEBUG("%s: recurrent states of %d sequences read in place from row %d\n", __func__, (int) n_seqs, inp->alias);
