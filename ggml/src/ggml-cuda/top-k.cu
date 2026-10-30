@@ -648,6 +648,11 @@ static bool ggml_cuda_top_k_one_block_enabled() {
 static void top_k_radix_one_block_cuda(const float * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
     constexpr int BLOCK_SIZE = 1024;
     top_k_radix_one_block<BLOCK_SIZE><<<(unsigned int) nrows, BLOCK_SIZE, 0, stream>>>(src, dst, ncols, k);
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        GGML_LOG_INFO("%s: k19 top-k radix select in one launch (%lld rows of %d; GGML_CUDA_TOPK_ONEBLOCK=0: off)\n", __func__, (long long) nrows, ncols);
+    }
 }
 
 static void top_k_argsort_cuda(
