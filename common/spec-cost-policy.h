@@ -464,6 +464,11 @@ struct common_spec_tpp_cost {
     marg_stat mg[CTX];
     double marg_prior  = 4.0;
     double marg_cap    = 1.25;
+    // LLAMA_SPEC_TPP_MAX_POS (default 24576, 0: no limit): from this position on the window stays at the floor. G4 fn4 full card
+    // (ktp_g4d): with the held / predicted pricing 30k was still 0.979 of base (0.961 without it) while 16k gained 4.1%; the
+    // floor-only window there is the base's own (the kill switch arm: 0.999)
+    int64_t max_pos    = 24576;
+    int64_t pos_cur    = 0;
     // LLAMA_SPEC_TPP_SWITCH_SKIP=1 (opt-in): the first round after a window-size switch stays out of the size's median. Off by
     // default: a size not run for a while re-captures its verify graph when the KV view has grown since (3-5 ms host, plans/fndec.md
     // section 7), a real cost of switching to it, so skipping those rounds underprices the rarely used 4-row window. The switched
@@ -478,6 +483,9 @@ struct common_spec_tpp_cost {
         }
         if (const char * e = getenv("LLAMA_SPEC_TPP_SWITCH_SKIP")) {
             switch_skip = atoi(e) != 0;
+        }
+        if (const char * e = getenv("LLAMA_SPEC_TPP_MAX_POS")) {
+            max_pos = atoll(e);
         }
         if (const char * e = getenv("LLAMA_SPEC_TPP_MARG_CAP")) {
             marg_cap = atof(e);
@@ -498,7 +506,8 @@ struct common_spec_tpp_cost {
     }
 
     void set_context(int64_t pos) {
-        bk = bucket(pos);
+        bk      = bucket(pos);
+        pos_cur = pos;
     }
 
     // one round of the window kind k (0 = floor, 1 = floor + 1)
@@ -562,6 +571,9 @@ struct common_spec_tpp_cost {
 
     // window floor + 1 (expected tokens e_w, chance q_w that every draft holds) against the floor window (e_f)
     bool wide_pays(double e_f, double e_w, double q_w) const {
+        if (max_pos > 0 && pos_cur >= max_pos) {
+            return false;
+        }
         const double r = marg_ratio();
         e_w = e_f + (e_w - e_f)*r;
         q_w *= r;
