@@ -63,8 +63,8 @@ static int g_big_nodes = 1000;
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
     const char * p = strstr(text, "CUDA graph capture ");
     if (p) {
+        // "CUDA graph capture N: key K, NODES nodes, previous exec launched M times"
         const char * k = strstr(p, ", ");
-        k = k ? strstr(k + 2, ", ") : nullptr;
         if (k && atoi(k + 2) >= g_big_nodes) {
             g_big_captures++;
         }
