@@ -35,6 +35,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
+    rs_copied.assign(n_seq_max, 0);
 
     // k16-draft: commit by replay for the delta-net models (see llama_memory_recurrent::replay). LLAMA_RS_REPLAY unset / auto: only
     // when layer weights spill to host memory while others are on a device (a MoE cache / host experts: the memory the snapshot rows
@@ -330,6 +331,7 @@ void llama_memory_recurrent::clear(bool data) {
     }
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+    std::fill(rs_copied.begin(), rs_copied.end(), 0);
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -376,8 +378,8 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                     return true;
                 }
                 const llama_pos rollback = cell.pos - (p0 - 1);
-                // pending rollback is single-use
-                const bool pending = rs_idx[seq_id] != 0;
+                // pending rollback is single-use (k19-rsbis: also one that rollback_copy put on the live row)
+                const bool pending = rs_idx[seq_id] != 0 || rs_copied[seq_id] != 0;
                 if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq && replay) {
                     // k16-draft: the window is still uncommitted; the commit replays only its kept tokens
                     const uint32_t c = (uint32_t) tail_id;
@@ -392,7 +394,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                     // k15-rsr: the snapshot is copied onto the live row now, so the next decode reads its state from the same row as
                     // every other decode: its graph and CUDA graph are reused instead of rebuilt and re-captured twice (once for the
                     // snapshot row, once back); same bytes, same output. Else (LLAMA_RS_ROLLBACK_COPY=0) the next decode reads the snapshot row
-                    if (!rollback_copy((uint32_t) tail_id, (uint32_t) rollback)) {
+                    if (rollback_copy((uint32_t) tail_id, (uint32_t) rollback)) {
+                        rs_copied[seq_id] = 1;
+                    } else {
                         set_rs_idx(seq_id, (uint32_t) rollback);
                     }
                     cell.pos = p0 - 1;
@@ -853,6 +857,7 @@ bool llama_memory_recurrent::rollback_copy(uint32_t cell, uint32_t group) {
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     if (seq_id < 0) {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);
+        std::fill(rs_copied.begin(), rs_copied.end(), 0);
         return;
     }
 
@@ -862,6 +867,7 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     GGML_ASSERT(idx <= n_rs_seq);
 
     rs_idx[seq_id] = idx;
+    rs_copied[seq_id] = 0;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
@@ -2025,6 +2031,7 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
             idx = mem->rs_idx[seq];
             // reset rollback idx
             mem->rs_idx[seq] = 0;
+            mem->rs_copied[seq] = 0;
         }
     }
     // k19-npmtp: a cell that find_slot moved has its snapshot groups at its new place (rs_move), only the live row is read at src0

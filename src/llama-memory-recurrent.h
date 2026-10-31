@@ -78,6 +78,10 @@ public:
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
+    // k19-rsbis: per seq, a rollback that rollback_copy already put on the live row (rs_idx stays 0); the snapshot groups still count
+    // from the end of the last decode, so a second partial seq_rm before the next ubatch reads the seq is refused as with rs_idx != 0
+    std::vector<uint8_t> rs_copied;
+
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
     // k15-rsr: copies the per-token snapshot `group` of cell `cell` onto its live row (group 0) on the device; false when off or failed
