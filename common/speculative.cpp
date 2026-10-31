@@ -1678,8 +1678,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             LOG_INF("%s: MTP window by expected tokens per ms (LLAMA_SPEC_COST=1), up to %d drafts\n", __func__, this->params.n_max);
         }
         if (tpp_floor > 0) {
-            LOG_INF("%s: k19-tpp: MTP windows of %d drafts, %d where the measured tokens per ms pay for the wider window (LLAMA_SPEC_TPP=0: off)\n",
-                __func__, tpp_floor, tpp_floor + 1);
+            const bool cached = this->params.ctx_tgt != nullptr && llama_moe_cache_active(this->params.ctx_tgt);
+            tpp_cost.set_cached(cached);
+            LOG_INF("%s: k19-tpp: MTP windows of %d drafts, %d where the expected tokens per ms pay for the wider window (LLAMA_SPEC_TPP=0: "
+                "off); round times %s (cost ratio %.2f at 16k, MoE cache %s; LLAMA_SPEC_TPP_LIVE=1: live medians)\n", __func__, tpp_floor,
+                tpp_floor + 1, tpp_cost.live ? "live" : "from the fixed table", tpp_cost.cost_ratio[3], cached ? "on" : "off");
         }
         // k15-pp: on by default beside built-in MTP heads (common sets LLAMA_SPEC_MTP_HEADS=1): the target's next-n rows of a prompt
         // batch then go to the device sink and the host keeps none of them (llama_context::nextn_store_ensure), so the host rows no

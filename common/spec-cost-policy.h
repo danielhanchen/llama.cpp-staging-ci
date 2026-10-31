@@ -469,6 +469,15 @@ struct common_spec_tpp_cost {
     // floor-only window there is the base's own (the kill switch arm: 0.999)
     int64_t max_pos    = 24576;
     int64_t pos_cur    = 0;
+    // the round times are priced from a fixed table by default, not from live timings: live medians move with timing noise, so the
+    // window sequence (and with an MoE cache, which experts are resident and how a CPU miss sums) differed launch to launch (G4 fn4
+    // 16 GB, ktp_g4d: 2-3 md5 per cell, base stable). The table is c(4 rows) / c(3 rows) per context bucket, measured on G4 fn4:
+    // all experts on the device 1.14 below 12288 (chat / 8k: 11.96 / 10.52, 12.50 / 10.99 ms) and 1.18 above (16k: 12.88 / 10.93);
+    // with an MoE cache streaming experts 1.22 (16 / 32 GB: +5.6 / +3.1 ms per 4-row pass on ~26 / ~17 ms). The drafts' probabilities
+    // and the held counts are functions of the text, so the windows are too. LLAMA_SPEC_TPP_LIVE=1: the live medians (as before);
+    // LLAMA_SPEC_TPP_RATIO=x: one ratio for every bucket
+    bool   live            = false;
+    double cost_ratio[CTX] = { 1.14, 1.14, 1.14, 1.18, 1.18 };
     // LLAMA_SPEC_TPP_SWITCH_SKIP=1 (opt-in): the first round after a window-size switch stays out of the size's median. Off by
     // default: a size not run for a while re-captures its verify graph when the KV view has grown since (3-5 ms host, plans/fndec.md
     // section 7), a real cost of switching to it, so skipping those rounds underprices the rarely used 4-row window. The switched
@@ -483,6 +492,12 @@ struct common_spec_tpp_cost {
         }
         if (const char * e = getenv("LLAMA_SPEC_TPP_SWITCH_SKIP")) {
             switch_skip = atoi(e) != 0;
+        }
+        if (const char * e = getenv("LLAMA_SPEC_TPP_LIVE")) {
+            live = atoi(e) != 0;
+        }
+        if (const char * e = getenv("LLAMA_SPEC_TPP_RATIO")) {
+            std::fill(cost_ratio, cost_ratio + CTX, atof(e));
         }
         if (const char * e = getenv("LLAMA_SPEC_TPP_MAX_POS")) {
             max_pos = atoll(e);
@@ -549,7 +564,17 @@ struct common_spec_tpp_cost {
     }
 
     // the floor window must run now (too few samples in this bucket, or its last one is STALE rounds old)
+    // an MoE cache streams experts: a wider window reads more of them (LLAMA_SPEC_TPP_RATIO still overrides)
+    void set_cached(bool cached) {
+        if (cached && getenv("LLAMA_SPEC_TPP_RATIO") == nullptr) {
+            std::fill(cost_ratio, cost_ratio + CTX, 1.22);
+        }
+    }
+
     bool need_floor() const {
+        if (!live) {
+            return false;
+        }
         const size_stat & s = st[bk][0];
         return s.n < PROBES || rounds - s.last > stale;
     }
@@ -577,6 +602,9 @@ struct common_spec_tpp_cost {
         const double r = marg_ratio();
         e_w = e_f + (e_w - e_f)*r;
         q_w *= r;
+        if (!live) {
+            return e_w > e_f*cost_ratio[bk]*(1.0 + margin);
+        }
         const size_stat & s = st[bk][1];
         if (s.n < PROBES || rounds - s.last > stale) {
             return q_w >= probe_q;   // measure it when the chain is likely to reach it
@@ -586,14 +614,14 @@ struct common_spec_tpp_cost {
     }
 
     std::string text() const {
-        std::string out;
+        std::string out = live ? "live " : "fixed ";
         char b[192];
         for (int k = 0; k < CTX; ++k) {
             if (st[k][0].n == 0 && st[k][1].n == 0) {
                 continue;
             }
             snprintf(b, sizeof(b), "%sctx%d: floor %.2f(n=%d) wide %.2f(n=%d) held %.1f/%.1f switched %.2f(n=%d) %.2f(n=%d)",
-                out.empty() ? "" : " | ", k, median_of(st[k][0]), st[k][0].n, median_of(st[k][1]), st[k][1].n, mg[k].held, mg[k].pred,
+                out.size() <= 6 ? "" : " | ", k, median_of(st[k][0]), st[k][0].n, median_of(st[k][1]), st[k][1].n, mg[k].held, mg[k].pred,
                 median_of(sw[k][0]), sw[k][0].n, median_of(sw[k][1]), sw[k][1].n);
             out += b;
         }
