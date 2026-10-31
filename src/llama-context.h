@@ -302,9 +302,8 @@ struct llama_context {
     // allocate the staging buffers of asynchronous saves with these flags up front (see llama_state_seq_reserve_async)
     size_t state_async_reserve(llama_state_seq_flags flags);
 
-    // k19-host30k: pinned staging for a whole-state save of `need` bytes, pinned on a thread (see llama_state_seq_async_ext_reserve)
+    // k19-host30k: pinned staging for a whole-state save of `need` bytes (0: the bound of one sequence), see llama_state_seq_async_ext_reserve
     void state_async_ext_request(size_t need);
-    void state_async_ext_take();
 
     void state_async_init_backends();
 
@@ -968,7 +967,6 @@ private:
     }
 public:
     void set_nextn_hold(void (*fn)(void *), void * ud) { nextn_hold_fn = fn; nextn_hold_ud = ud; }
-    void set_refill_pace(bool on);
 private:
 
     // keep copies of the per-sequence memory on the device
@@ -986,11 +984,6 @@ private:
     };
     std::vector<state_async_backend> state_async;
     bool state_async_init = false;
-
-    // k19-host30k: the thread pinning the next staging extension, its buffer and whether it is done
-    std::thread                       state_ext_worker;
-    ggml_backend_buffer_ptr           state_ext_new;
-    std::atomic<bool>                 state_ext_done { false };
 
     // k15-ov: synchronous state saves read the device rows through two small pinned halves per backend (LLAMA_STATE_BOUNCE_MIB each,
     // 16): the next half's copies run while the previous half is copied to the destination (see state_get_bounced)

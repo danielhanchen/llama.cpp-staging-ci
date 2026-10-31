@@ -150,8 +150,9 @@ LLAMA_API bool llama_layer_major_spans(const struct llama_context * ctx, int32_t
 #define LLAMA_STATE_SEQ_FLAGS_ASYNC_NO_GROW 16
 // k11: wait for the asynchronous state save in flight (LLAMA_STATE_SEQ_FLAGS_ASYNC), before its destination is read or freed
 LLAMA_API void llama_state_seq_async_wait(struct llama_context * ctx);
-// k19-host30k: pin, on a thread, enough staging that a later asynchronous save of `bytes` reads every row asynchronously (also with
-// LLAMA_STATE_SEQ_FLAGS_ASYNC_NO_GROW); returns at once. Added to the staging, kept with the context (LLAMA_STATE_ASYNC_EXT=0: no-op)
+// k19-host30k: pin now enough staging that a later asynchronous save of `bytes` (0: the largest save of one sequence) reads every row
+// asynchronously, also with LLAMA_STATE_SEQ_FLAGS_ASYNC_NO_GROW. Added to the staging, kept with the context (LLAMA_STATE_ASYNC_EXT=0: no-op).
+// Call it while the context is idle (e.g. after loading)
 LLAMA_API void llama_state_seq_async_ext_reserve(struct llama_context * ctx, size_t bytes);
 
 // LLAMA_MTP_EXACT=1 is set (read once)
@@ -268,9 +269,6 @@ LLAMA_API float * llama_get_embeddings_nextn_early(struct llama_context * ctx);
 // reorders or frees its next-n rows, or frees an MTP drafter's compute buffers (a reader of the rows outside the context, e.g. a drafter's
 // prompt pass on another thread, is waited for there). nullptr clears it. Not thread-safe: set it from the thread that decodes
 LLAMA_API void llama_set_nextn_hold(struct llama_context * ctx, void (*fn)(void *), void * user_data);
-// k19-host30k: an MTP drafter's prompt pass runs on another thread beside this context's next decodes (on): the MoE cache paces the refill
-// of its lent slots so the drafter's input uploads are not queued behind all of it (LLAMA_MOE_CACHE_REFILL_PACE=0: never). Not thread-safe
-LLAMA_API void llama_set_refill_pace(struct llama_context * ctx, bool on);
 
 // kdp (LLAMA_MTP_DRAFT_LEND): maps the device weights of a drafter context's model back if a layer-major group of its target borrowed
 // their memory (same addresses, copied back from pinned host memory); a no-op otherwise. false: no device memory for them

@@ -71,9 +71,10 @@ static bool spec_replay_reverify() {
 
 // k19-host30k (LLAMA_STATE_ASYNC_EXT=0: off): the prompt-cache save of a long prompt (larger than LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB, or than
 // the staging at a request) was synchronous on the server thread: G4 Qwen3.8-Flash-Next UD-IQ4_XS, the 642 MiB save of a 16k prompt
-// took 175 ms of the next (30k) request's TTFT at 24 / 32 GB (a MoE cache: saved at the request) and ~140 ms at full card (saved at idle,
-// which the request sent right after the response waits for). The contexts pin the staging the save needs on a thread once the prompt's
-// first token is out (llama_state_seq_async_ext_reserve), and the save then reads its rows asynchronously: the same bytes into the entry
+// took 175-360 ms of the next (30k) request's TTFT at 24 / 32 GB (a MoE cache: saved at the request) and ~140 ms at full card (saved at
+// idle, which the request sent right after the response waits for). The contexts pin at load the staging a whole-sequence save needs at
+// most (llama_state_seq_async_ext_reserve), and the save then reads its rows asynchronously: the same bytes into the entry. Pinned on a
+// thread while the slot generated instead (k19hx_g4), the pinning cost the decode 5-17% (cudaMallocHost beside the decode)
 static bool server_state_async_ext() {
     static const bool v = getenv("LLAMA_STATE_ASYNC_EXT") == nullptr || atoi(getenv("LLAMA_STATE_ASYNC_EXT")) != 0;
     return v;
@@ -1351,9 +1352,6 @@ private:
         }
         spec_bg.cv.notify_all();
         spec_bg.thr.join();
-        if (!spec_bg.group) {
-            llama_set_refill_pace(ctx_tgt, false);
-        }
         spec_bg.live  = false;
         spec_bg.hold  = false;
         spec_bg.group = false;
@@ -2263,6 +2261,14 @@ private:
             }
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
+        }
+
+        // k19-host30k: the staging a whole-sequence prompt-cache save needs at most, pinned now (server_state_async_ext)
+        if (prompt_cache && server_state_async_ext()) {
+            llama_state_seq_async_ext_reserve(ctx_tgt, 0);
+            if (ctx_dft && ctx_dft != ctx_tgt) {
+                llama_state_seq_async_ext_reserve(ctx_dft, 0);
+            }
         }
 
         if (!params_base.model_alias.empty()) {
@@ -5839,10 +5845,6 @@ private:
                 spec_bg.slot_id = bg_sl->id;
                 if (spec_bg.group) {
                     llama_set_nextn_hold(ctx_tgt, &server_context_impl::spec_bg_hold_cb, this);
-                } else {
-                    // k19-host30k: the target's next decode (the prompt's last <= 64 tokens) refills the MoE cache's lent slots; paced, the
-                    // copies leave the drafter's input uploads room in the copy queue (llama_set_refill_pace)
-                    llama_set_refill_pace(ctx_tgt, true);
                 }
                 SRV_INF("mtp prompt pass on a worker: %d rows, %zu segments beside the next %d-token target decode%s (LLAMA_MTP_PROMPT_BG=0 off)\n",
                         batch.view.size(), seg_breaks.empty() ? (size_t) 1 : seg_breaks.size() + 1 - spec_seg_done, std::min<int32_t>(n_rest, n_batch),
@@ -6059,15 +6061,6 @@ private:
                 slot.release();
 
                 return;
-            }
-
-            // k19-host30k: once the first token is out, the contexts pin on a thread the staging the prompt-cache save of this prompt
-            // needs at the next request (server_state_async_ext)
-            if (slot.stats.n_gen == 1 && server_state_async_ext() && prompt_cache && !slot.task->is_child() && !slot.task->is_stateless()) {
-                llama_state_seq_async_ext_reserve(slot.ctx_tgt, llama_state_seq_get_size_ext(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
-                if (slot.ctx_dft && slot.ctx_dft != slot.ctx_tgt) {
-                    llama_state_seq_async_ext_reserve(slot.ctx_dft, llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
-                }
             }
 
             slot.print_timings_tg();

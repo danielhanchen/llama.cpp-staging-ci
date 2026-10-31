@@ -231,9 +231,6 @@ public:
     bool released() const;
     // the next restore refills the slots with the experts the recorded routing used most (set_refill_counts), as LLAMA_MOE_CACHE_REFILL_ROUTED=1
     void set_refill_routed_once(bool on);
-    // k19-host30k: another context (an MTP drafter's prompt pass on a worker) uploads to the device meanwhile: the refill of the lent slots
-    // is queued a layer or two ahead of the copy engine instead of at once (LLAMA_MOE_CACHE_REFILL_PACE=0: never)
-    void set_refill_pace(bool on);
     // the cache lends slots on some device (decided by the first large graph)
     bool lends_on_any() const;
     // lends_on_any, or a device whose lending is off for the staging copies that still lends to a merged layer-major graph (k15-pp)

@@ -1946,9 +1946,6 @@ void llama_context::gf_res_epoch_bump(int line) {
 
 llama_context::~llama_context() {
     nextn_join();
-    if (state_ext_worker.joinable()) {
-        state_ext_worker.join();
-    }
     if (tiny_rel_ub > 0) {
         LLAMA_LOG_INFO("%s: MoE cache tiny-cache release (LLAMA_MOE_PREFILL_UB_TINY_RELEASE): %lld releases, %lld restores, %.1f ms restoring "
             "(%.1f ms each)\n", __func__, (long long) tiny_rel_n_enter, (long long) tiny_rel_n_leave, tiny_rel_ms,
@@ -9913,12 +9910,12 @@ size_t llama_context::state_async_reserve(llama_state_seq_flags flags) {
 
 // k19-host30k (LLAMA_STATE_ASYNC_EXT=0: off): a whole-state save larger than the staging (the server's prompt-cache save of the previous
 // prompt at a request, or at idle) read the rows past the staging synchronously into fresh host memory: G4 Qwen3.8-Flash-Next UD-IQ4_XS
-// 24 / 32 GB, the 642 MiB save of the 16k prompt held the next (30k) request 175 ms before its first ubatch (and the 381 MiB save of
-// the 8k prompt held the 16k one 74 ms). Once a prompt is processed the server asks for staging that holds the state then, plus a
-// quarter and 64 MiB for the generation, and the pinning runs on a thread while the slot generates; the next save that fits reads every
-// row asynchronously (the same rows into the same destination). Nothing is freed while the context lives (cudaFreeHost would
-// synchronize the device under a running prompt): an extension is added after the staging. At most LLAMA_STATE_ASYNC_EXT_MAX_MIB
-// (2048) of staging in all, only while MemAvailable keeps max(4 GiB, 10% of MemTotal) after it, and one async backend only (one GPU)
+// 24 / 32 GB, the 600 MiB save of the 16k prompt held the next (30k) request 175-360 ms before its first ubatch (and the 381 MiB save
+// of the 8k prompt held the 16k one 74-133 ms). The server asks at load for staging that holds a whole-sequence save at most (the
+// device bytes of the memory's buffers); it is pinned then and added after the staging, and every save that fits reads its rows
+// asynchronously (the same rows into the same destination). Pinned on a thread while a slot generated instead, cudaMallocHost cost that
+// decode 5-17% (k19hx_g4). At most LLAMA_STATE_ASYNC_EXT_MAX_MIB (2048) of staging in all, only while MemAvailable keeps
+// max(4 GiB, 10% of MemTotal) after it, one async backend only (one GPU); kept with the context
 static bool state_async_ext_on() {
     static const bool on = [] {
         const char * e = getenv("LLAMA_STATE_ASYNC_EXT");
@@ -9927,70 +9924,51 @@ static bool state_async_ext_on() {
     return on;
 }
 
-void llama_context::state_async_ext_take() {
-    if (!state_ext_worker.joinable() || !state_ext_done.load(std::memory_order_acquire)) {
-        return;
-    }
-    state_ext_worker.join();
-    if (state_ext_new && state_async.size() == 1) {
-        state_async[0].ext.push_back(std::move(state_ext_new));
-    } else {
-        LLAMA_LOG_WARN("%s: could not pin the staging extension for asynchronous state saves\n", __func__);
-    }
-    state_ext_new.reset();
-}
-
 void llama_context::state_async_ext_request(size_t need) {
     static const size_t cap = (size_t) std::max(0, getenv("LLAMA_STATE_ASYNC_EXT_MAX_MIB") ? atoi(getenv("LLAMA_STATE_ASYNC_EXT_MAX_MIB")) : 2048) << 20;
-    if (!state_async_ext_on() || state_async_disabled() || need == 0 || cap == 0) {
+    if (!state_async_ext_on() || state_async_disabled() || cap == 0 || !memory) {
         return;
     }
-    if (state_ext_worker.joinable()) {
-        if (!state_ext_done.load(std::memory_order_acquire)) {
-            return; // still pinning the last one
-        }
-        state_async_ext_take();
-    }
+    state_async_wait();
     state_async_init_backends();
     if (state_async.size() != 1) {
         return;
     }
     auto & sa = state_async[0];
+    if (need == 0) {
+        // the device bytes of the memory's buffers bound the save of one sequence (its KV rows and recurrent rows)
+        for (const auto & [buft, size] : memory->memory_breakdown()) {
+            if (!ggml_backend_buft_is_host(buft) && ggml_backend_buft_get_device(buft) == sa.dev) {
+                need += size;
+            }
+        }
+    }
     size_t have = sa.staging ? ggml_backend_buffer_get_size(sa.staging.get()) : 0;
     for (const auto & b : sa.ext) {
         have += ggml_backend_buffer_get_size(b.get());
     }
-    // what the state needs, its row alignment and room for first-fit gaps (see state_get_async)
-    if (have >= need + need/16 + (4u << 20) || have >= cap) {
-        return;
-    }
-    const size_t want = std::min(cap, GGML_PAD(need + need/4 + (64u << 20), 2u << 20));
-    if (want <= have + (16u << 20)) {
+    // room for the 64-byte alignment of each row and for first-fit gaps (see state_get_async)
+    const size_t want = std::min(cap, GGML_PAD(need + need/32 + (8u << 20), 2u << 20));
+    if (need == 0 || want <= have + (16u << 20)) {
         return;
     }
     const size_t add = want - have;
     const uint64_t avail = llama_sysmem::available();
-    const uint64_t total = llama_sysmem::total();
-    const uint64_t keep  = std::max<uint64_t>(4ull << 30, total / 10);
+    const uint64_t keep  = std::max<uint64_t>(4ull << 30, llama_sysmem::total() / 10);
     if (avail == 0 || avail < add + keep) {
-        static int n_log = 0;
-        if (n_log++ < 2) {
-            LLAMA_LOG_INFO("%s: no staging extension of %.2f MiB for asynchronous state saves: MemAvailable %.1f MiB, %.1f MiB kept free\n",
-                __func__, add/1048576.0, avail/1048576.0, keep/1048576.0);
-        }
+        LLAMA_LOG_INFO("%s: no staging extension of %.2f MiB for asynchronous state saves: MemAvailable %.1f MiB, %.1f MiB kept free\n",
+            __func__, add/1048576.0, avail/1048576.0, keep/1048576.0);
         return;
     }
     ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(sa.dev);
-    if (buft == nullptr) {
+    ggml_backend_buffer_ptr buf(buft ? ggml_backend_buft_alloc_buffer(buft, add) : nullptr);
+    if (!buf) {
+        LLAMA_LOG_WARN("%s: could not pin a %.2f MiB staging extension for asynchronous state saves\n", __func__, add/1048576.0);
         return;
     }
-    LLAMA_LOG_INFO("%s: %s: pinning %.2f MiB more staging for asynchronous state saves on a thread (%.2f MiB in all) "
-        "(LLAMA_STATE_ASYNC_EXT=0 off)\n", __func__, ggml_backend_dev_name(sa.dev), add/1048576.0, want/1048576.0);
-    state_ext_done.store(false, std::memory_order_release);
-    state_ext_worker = std::thread([this, buft, add]() {
-        state_ext_new.reset(ggml_backend_buft_alloc_buffer(buft, add));
-        state_ext_done.store(true, std::memory_order_release);
-    });
+    sa.ext.push_back(std::move(buf));
+    LLAMA_LOG_INFO("%s: %s: %.2f MiB more pinned staging for asynchronous state saves (%.2f MiB in all) (LLAMA_STATE_ASYNC_EXT=0 off)\n",
+        __func__, ggml_backend_dev_name(sa.dev), add/1048576.0, want/1048576.0);
 }
 
 // Read the state rows of an asynchronous save into dst without synchronizing the context.
@@ -10108,7 +10086,6 @@ bool llama_context::state_get_bounced(const std::vector<llama_state_write_info> 
 void llama_context::state_get_async(const std::vector<llama_state_write_info> & winfos, bool no_grow) {
     // the previous save may still be reading the staging buffers
     state_async_wait();
-    state_async_ext_take(); // k19-host30k: a staging extension pinned meanwhile
 
     const bool disabled = state_async_disabled();
 
@@ -11668,16 +11645,6 @@ bool llama_mtp_draft_lend_warm(llama_context * ctx) {
         return false;
     }
     return ctx->mtp_lend_warm();
-}
-
-void llama_context::set_refill_pace(bool on) {
-    if (moe_cache) {
-        moe_cache->set_refill_pace(on);
-    }
-}
-
-void llama_set_refill_pace(llama_context * ctx, bool on) {
-    ctx->set_refill_pace(on);
 }
 
 bool llama_mtp_draft_lend_active(const llama_context * ctx) {
