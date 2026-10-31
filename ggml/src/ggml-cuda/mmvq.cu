@@ -1654,6 +1654,16 @@ static const mmvq_moe_group_cfg & mmvq_moe_group_config() {
     return cfg;
 }
 
+// one INFO line per process at the first grouped launch: the engagement check for runs and kill-switch arms (absent with
+// GGML_CUDA_MMVQ_MOE_GROUP=0, on HIP / MUSA, or when no product qualifies)
+static void mmvq_moe_group_log(const ggml_type type, const bool fused, const int ncols_dst, const int nchannels_dst) {
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        GGML_LOG_INFO("mmvq_moe_group: grouped MoE mat-vec engaged (first: %s%s, %d tokens x %d slots)\n", ggml_type_name(type),
+            fused ? " with fused gate" : "", ncols_dst, nchannels_dst);
+    });
+}
+
 template <ggml_type type, int c_rpw, int c_nwarps, int c_group, bool c_dec>
 static void mul_mat_vec_q_moe_group_launch_cfg(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1714,6 +1724,7 @@ static bool mul_mat_vec_q_moe_group_launch(
             mul_mat_vec_q_moe_group_launch_cfg<type, R, W, G, D>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, \
                 stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride, \
                 nchannels_dst, stream); \
+            mmvq_moe_group_log(type, fused, ncols_dst, nchannels_dst); \
             return true; \
         }
         MMVQ_MOE_GROUP_CFG(1, 4, 2, true)
