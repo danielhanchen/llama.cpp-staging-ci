@@ -74,14 +74,15 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
     // k19-vgraph (LLAMA_KV_BUCKET=0: off, the 256 cell padding of every ubatch): a decode or verify ubatch of qwen4exp, whose every
-    // attention layer is QSA, pads n_kv to a quarter of its octave instead of 256 cells, and the k-pool count with it, so its graph
+    // attention layer is QSA, pads n_kv to an eighth of its octave instead of 256 cells, and the k-pool count with it, so its graph
     // and CUDA graph are not rebuilt and captured again each time the context grows past 256 cells (G4 Flash-Next: 8-10 verify
     // re-captures per 256 tokens, one per window size and boundary, 3-5 ms host each). Only where the bucket cannot change a result:
     // the attention gathers the selected cells (CUDA sparse flash attention: n_kv >= max(4096, 2*n_tokens*n_sel), a single
     // query tile up to 4 tokens), so its work list and split follow n_sel and not n_kv, the extra cells are masked and the extra
     // pools score -inf (top_k keeps the lowest of tied columns, which the padding at the end never is). =2 (opt-in, not exact:
     // the dense attention's KV split moves, a reassociation): any ubatch up to LLAMA_KV_BUCKET_MAX_TOKENS (8) tokens from 1024 cells.
-    // LLAMA_KV_BUCKET_DIV (4): buckets per octave
+    // LLAMA_KV_BUCKET_DIV (8): buckets per octave (G4 fn4 d2 16k, 256-token requests that never cross a boundary: 4 per octave,
+    // n_kv 20480 for 16640, cost 0.5% decode in the extra mask / indexer / top_k cells)
     static const int mode = getenv("LLAMA_KV_BUCKET") ? atoi(getenv("LLAMA_KV_BUCKET")) : 1;
     const auto & hp = model.hparams;
     bool all_qsa = mode != 0 && mem_idx != nullptr && hp.indexer_kpool > 0 && hp.indexer_kpool_by_order && hp.indexer_top_k > 0;
@@ -104,7 +105,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             bp.n_kv_min           = 4096;
             bp.n_kv_min_per_token = 2*n_sel;
         }
-        bp.div = getenv("LLAMA_KV_BUCKET_DIV") ? (uint32_t) std::max(1, atoi(getenv("LLAMA_KV_BUCKET_DIV"))) : 4;
+        bp.div = getenv("LLAMA_KV_BUCKET_DIV") ? (uint32_t) std::max(1, atoi(getenv("LLAMA_KV_BUCKET_DIV"))) : 8;
         get_mem_attn()->set_n_kv_bucket(bp);
         mem_idx->set_n_kv_bucket(bp);
         LLAMA_LOG_INFO("%s: n_kv buckets for ubatches of up to %u tokens from %u cells (%u per token), %u per octave (LLAMA_KV_BUCKET=%d)\n",

@@ -194,14 +194,14 @@ public:
     uint32_t get_n_kv(const slot_info & sinfo, bool * bucketed = nullptr) const;
 
     // k19-vgraph: coarser n_kv for small ubatches (decode, speculative verify), so their graphs keep their shapes, and their CUDA graphs
-    // stay captured, while the context grows by up to a quarter instead of 256 cells (see llama_memory_hybrid_idx, the only user).
+    // stay captured, while the context grows by up to an eighth instead of 256 cells (see llama_memory_hybrid_idx, the only user).
     // A ubatch of at most n_tokens_max tokens whose 256-padded n_kv is at least max(n_kv_min, n_tokens*n_kv_min_per_token) gets
     // n_kv padded to max(256, pow2floor(n_kv)/div) cells. Off when n_tokens_max == 0
     struct n_kv_bucket_params {
         uint32_t n_tokens_max       = 0;
         uint32_t n_kv_min           = 0;
         uint32_t n_kv_min_per_token = 0;
-        uint32_t div                = 4;
+        uint32_t div                = 8;
     };
     void set_n_kv_bucket(const n_kv_bucket_params & p) { n_kv_bucket = p; }
     // a context whose verify rows must equal single token decodes (llm_graph_exact_row_n_kv) keeps the 256 cell padding
