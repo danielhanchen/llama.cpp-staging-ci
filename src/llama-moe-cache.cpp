@@ -5534,7 +5534,30 @@ struct llama_moe_cache::impl {
         }();
         return mode;
     }
-    bool cm_from_file = false; // this launch decides from a persisted (or just written) calibration
+    bool cm_from_file = false; // this launch decides from a persisted calibration
+    // k19-determinism (option a): no file yet. This launch runs the live rule, and the re-calibration after warm-up (the host as it is during
+    // decode) writes the file; later launches decide from it from the first token
+    bool cm_persist_pending = false;
+    std::string cm_pend_dir, cm_pend_key, cm_pend_path;
+
+    // noise of sample sets: the spread of the per-set host times ((max - min) / median) or the interquartile spread within a set
+    static bool cm_cal_noisy(std::vector<double> t1s, double iqr, double limit, double & spread) {
+        if (t1s.empty()) {
+            spread = 1e9;
+            return true;
+        }
+        std::sort(t1s.begin(), t1s.end());
+        const double m = t1s[t1s.size()/2];
+        spread = std::max(iqr, m > 0.0 ? (t1s.back() - t1s.front())/m : 1e9);
+        return spread > limit;
+    }
+    static double cm_cal_max_spread() {
+        static const double v = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_CAL_MAX_SPREAD");
+            return e != nullptr ? std::max(0.0, atof(e)) : 0.25;
+        }();
+        return v;
+    }
 
     static std::string cm_cal_dir() {
         auto env = [](const char * n) { const char * e = getenv(n); return std::string(e != nullptr ? e : ""); };
@@ -5720,6 +5743,18 @@ struct llama_moe_cache::impl {
         if (recal && cm_from_file) {
             return;
         }
+        // LLAMA_MOE_CPU_MISS_CAL_VALUES="t1 dt tup split" (us; tests): decide from these numbers, no timing, no file, no re-calibration
+        if (!recal) {
+            const char * fv = getenv("LLAMA_MOE_CPU_MISS_CAL_VALUES");
+            double v[4];
+            if (fv != nullptr && sscanf(fv, "%lf %lf %lf %lf", &v[0], &v[1], &v[2], &v[3]) == 4 && v[0] > 0.0 && v[2] > 0.0) {
+                cm_t1 = v[0]; cm_dt = v[1]; cm_tup = v[2]; cm_split = v[3];
+                cm_from_file = true;
+                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: calibration from LLAMA_MOE_CPU_MISS_CAL_VALUES (%s)\n", tag, fv);
+                cm_calibrate_finish(false, g, t_start);
+                return;
+            }
+        }
         std::string cal_dir, cal_key, cal_path;
         if (!recal && persist != 0) {
             cal_dir = cm_cal_dir();
@@ -5882,6 +5917,54 @@ struct llama_moe_cache::impl {
             }
         }
 
+        if (recal && cm_persist_pending) {
+            // option (a): the host as it is during decode, the median of LLAMA_MOE_CPU_MISS_CAL_SETS (3) sample sets (this one and more)
+            static const int n_sets = [] {
+                const char * e = getenv("LLAMA_MOE_CPU_MISS_CAL_SETS");
+                return e != nullptr ? std::max(1, atoi(e)) : 3;
+            }();
+            std::vector<double> t1s = { std::max(slope, 0.05) }, dts = { std::max(0.0, (d_t - d_a)/((double) ka*(T - 1))) }, das = { d_a };
+            double iqr = cal_spread;
+            for (int k = 1; k < n_sets; ++k) {
+                std::vector<int64_t> ta, tb, tt;
+                for (int r = 0; r <= n_rep; ++r) {
+                    if (aborted()) {
+                        return;
+                    }
+                    set_ids(ids_a, ka, 1);
+                    const int64_t da = timed(gf_a);
+                    set_ids(ids_b, kb, 1);
+                    const int64_t db = timed(gf_b);
+                    set_ids(ids_t, ka, T);
+                    const int64_t dt = timed(gf_t);
+                    if (r > 0) {
+                        ta.push_back(da);
+                        tb.push_back(db);
+                        tt.push_back(dt);
+                    }
+                }
+                const double a = median(ta), b = median(tb), t = median(tt);
+                t1s.push_back(std::max(kb > ka ? (b - a)/(kb - ka) : a/ka, 0.05));
+                dts.push_back(std::max(0.0, (t - a)/((double) ka*(T - 1))));
+                das.push_back(a);
+                iqr = std::max(iqr, std::max(rel_iqr(ta), rel_iqr(tb)));
+            }
+            auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size()/2]; };
+            double spread = 0.0;
+            const bool noisy = cm_cal_noisy(t1s, iqr, cm_cal_max_spread(), spread);
+            const double t1w = med(t1s), dtw = med(dts), daw = med(das);
+            double v[4] = { t1w, dtw, std::max(median(tu)/ka, 0.05), std::max(0.0, daw - ka*t1w) + 2.0*median(trt) };
+            cm_persist_pending = false;
+            if (noisy) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: calibration not kept, the host timings spread %.0f%% (above %.0f%%, "
+                    "LLAMA_MOE_CPU_MISS_CAL_MAX_SPREAD): the next launch times the host again\n", tag, 100.0*spread, 100.0*cm_cal_max_spread());
+            } else {
+                const bool w = cm_cal_write(cm_pend_dir, cm_pend_path, cm_pend_key, v, persist == 2);
+                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: calibration %s %s: host %.1f us per expert (%.2f us per further token), upload %.1f us, "
+                    "host split %.1f us (re-calibration, %zu sets, spread %.0f%%)\n", tag, w ? "written to" : "could not be written to",
+                    cm_pend_path.c_str(), v[0], v[1], v[2], v[3], t1s.size(), 100.0*spread);
+            }
+        }
         if (recal) {
             // k13-fn: one start-up sample set (11 repetitions of one layer, before any request) can be slow as a whole: on the file
             // tier (G4 Flash-Next UD-IQ4_XS 16 GB / 64 GiB RAM) 2 of 3 launches measured 33.3 instead of 23.1 us per expert, the fetch
@@ -5914,25 +5997,14 @@ struct llama_moe_cache::impl {
             cm_tup   = std::max(median(tu)/ka, 0.05);
             cm_split = std::max(0.0, d_a - ka*cm_t1) + 2.0*median(trt);
             if (!cal_path.empty()) {
-                // a noisy sample set (spread of the host timings above LLAMA_MOE_CPU_MISS_CAL_MAX_SPREAD, default 0.25: a busy host, e.g. a
-                // build beside it) decides this launch only and is not kept: the next launch times the host again
-                static const double max_spread = [] {
-                    const char * e = getenv("LLAMA_MOE_CPU_MISS_CAL_MAX_SPREAD");
-                    return e != nullptr ? std::max(0.0, atof(e)) : 0.25;
-                }();
-                if (cal_spread > max_spread) {
-                    LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: calibration not kept, the host timings spread %.0f%% (above %.0f%%, "
-                        "LLAMA_MOE_CPU_MISS_CAL_MAX_SPREAD): this launch only, the next one times the host again\n", tag, 100.0*cal_spread, 100.0*max_spread);
-                } else {
-                    double v[4] = { cm_t1, cm_dt, cm_tup, cm_split };
-                    // decided from the numbers in place (these, or those another launch put there first), in this launch too
-                    cm_from_file = cm_cal_write(cal_dir, cal_path, cal_key, v, persist == 2);
-                    if (cm_from_file) {
-                        cm_t1 = v[0]; cm_dt = v[1]; cm_tup = v[2]; cm_split = v[3];
-                    }
-                    LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: calibration %s %s (spread %.0f%%; LLAMA_MOE_CPU_MISS_CAL_PERSIST=0: timed in every launch)\n", tag,
-                        cm_from_file ? "written to" : "could not be written to", cal_path.c_str(), 100.0*cal_spread);
-                }
+                // option (a): the start-up sample decides this launch only (it is often faster than the host during decode: G4 Flash-Next
+                // 23.3-23.9 us per expert at start-up in most launches, 34.6-35.5 re-timed after warm-up in all); the re-calibration writes
+                cm_persist_pending = true;
+                cm_pend_dir  = cal_dir;
+                cm_pend_key  = cal_key;
+                cm_pend_path = cal_path;
+                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: calibrating; later launches will use %s (written by the re-calibration after "
+                    "warm-up; LLAMA_MOE_CPU_MISS_CAL_PERSIST=0: timed in every launch)\n", tag, cal_path.c_str());
             }
         }
         GGML_UNUSED(attempt);
