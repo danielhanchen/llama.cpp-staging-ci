@@ -78,7 +78,7 @@ static uint64_t tpp_gguf_bytes(const std::string & path) {
             sscanf(path.c_str() + at - 5, "%5d-of-%5d.gguf", &k, &n) == 2 && n > 1) {
         const std::string prefix = path.substr(0, at - 6);
         uint64_t sum = 0;
-        for (int i = 1; i <= n; ++i) {
+        for (int i = 0; i < n; ++i) {   // llama_split_path numbers from 0 (split_no 0 = NAME-00001-of-0000n.gguf)
             char sp[4096];
             llama_split_path(sp, sizeof(sp), prefix.c_str(), i, n);
             const auto b = std::filesystem::file_size(sp, ec);
