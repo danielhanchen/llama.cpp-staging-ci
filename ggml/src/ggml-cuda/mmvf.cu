@@ -1019,6 +1019,21 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
+static thread_local bool ggml_cuda_verify_graph_tls = false;
+
+ggml_cuda_verify_graph_scope::ggml_cuda_verify_graph_scope(const struct ggml_cgraph * cgraph) : prev(ggml_cuda_verify_graph_tls) {
+    const int n = cgraph != nullptr ? cgraph->n_nodes : 0;
+    ggml_cuda_verify_graph_tls = n > 0 && ((cgraph->nodes[0]->flags | cgraph->nodes[n - 1]->flags) & GGML_TENSOR_FLAG_VERIFY) != 0;
+}
+
+ggml_cuda_verify_graph_scope::~ggml_cuda_verify_graph_scope() {
+    ggml_cuda_verify_graph_tls = prev;
+}
+
+bool ggml_cuda_verify_graph_active() {
+    return ggml_cuda_verify_graph_tls;
+}
+
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
     if (src0_ne[0] % 2 != 0) {
         return false;
@@ -1040,6 +1055,15 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
         case GGML_TYPE_F32:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 if (ampere_mma_available(cc)) {
+                    if (ggml_cuda_verify_graph_tls && ne11 == 4) { // k19-tpp: a 4-row verify window as a 3-row one
+                        static bool logged = false;
+                        if (!logged) {
+                            logged = true;
+                            GGML_LOG_INFO("%s: k19-tpp: a 4-row verify window keeps its F32 products on mmvf, as a 3-row one "
+                                "(LLAMA_SPEC_TPP_VERIFY=0: off)\n", __func__);
+                        }
+                        return true;
+                    }
                     return ne11 <= 3;
                 }
                 if (cc >= GGML_CUDA_CC_TURING) {

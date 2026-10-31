@@ -156,6 +156,17 @@ static bool llama_exact_verify_env() {
     return value;
 }
 
+// k19-tpp: LLAMA_SPEC_TPP_VERIFY (default on, =0 off): the nodes of a verify batch that is not computed batch invariant carry
+// GGML_TENSOR_FLAG_VERIFY, so the backend keeps the kernels of a 3-row verify for a 4-row one (ggml-cuda: F32 weights stay on mmvf at 4
+// columns instead of MMF): a row's sums do not depend on whether the window drafted 2 or 3. Prompt tails are never tagged
+static bool llama_verify_tag_env() {
+    static const bool value = [] {
+        const char * env = getenv("LLAMA_SPEC_TPP_VERIFY");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return value;
+}
+
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
@@ -374,6 +385,7 @@ llama_context::llama_context(
     cparams.verify                  = false;
     cparams.verify_exact            = false;
     cparams.batch_invariant         = false;
+    cparams.verify_tag              = false;
     cparams.exact_split             = 0;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
@@ -4071,6 +4083,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 ggml_graph_node(gf, i)->flags |= GGML_TENSOR_FLAG_BATCH_INVARIANT;
             }
         }
+        if (cparams.verify_tag) {
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_graph_node(gf, i)->flags |= GGML_TENSOR_FLAG_VERIFY;
+            }
+        }
 
         prefetch_n_tokens = ubatch.n_tokens;
         auto small_snapshot = [&]() {
@@ -4112,6 +4129,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     ggml_graph_node(gf, i)->flags |= GGML_TENSOR_FLAG_BATCH_INVARIANT;
                 }
             }
+            if (gf && cparams.verify_tag) {
+                for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                    ggml_graph_node(gf, i)->flags |= GGML_TENSOR_FLAG_VERIFY;
+                }
+            }
             if (gf && moe_cache) {
                 moe_cache->set_graph(gf);
             }
@@ -4131,6 +4153,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             if (gf && cparams.batch_invariant) {
                 for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
                     ggml_graph_node(gf, i)->flags |= GGML_TENSOR_FLAG_BATCH_INVARIANT;
+                }
+            }
+            if (gf && cparams.verify_tag) {
+                for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                    ggml_graph_node(gf, i)->flags |= GGML_TENSOR_FLAG_VERIFY;
                 }
             }
             if (gf) {
@@ -4996,6 +5023,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         cparams.batch_invariant = exact_verify && ubatch.n_tokens > 1;
         cparams.exact_split     = cparams.batch_invariant ? llm_graph_exact_split(ubatch) : 0;
+        cparams.verify_tag      = llama_verify_tag_env() && cparams.verify && !cparams.batch_invariant && ubatch.n_tokens > 1 && !output_all;
 
         // k19-tiny-ub: with the banks released every layer is built as a large batch (an output-only last layer would read the banks
         // through a host lookup)
@@ -5012,6 +5040,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         cparams.batch_invariant = false;
         cparams.exact_split     = 0;
+        cparams.verify_tag      = false;
 
         if (tiny_rel_record) {
             // k19-tiny-ub: the slots that come back get the experts this ubatch routed most (read before its compute buffers are freed)

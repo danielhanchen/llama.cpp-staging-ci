@@ -674,6 +674,9 @@ extern "C" {
         // ...must compute every token column (row of the batch) exactly as a batch of one token would (same kernels,
         // same reduction order), e.g. for the verify batches of speculative decoding; backends may ignore it
         GGML_TENSOR_FLAG_BATCH_INVARIANT = 32,
+        // ...belongs to a speculative verify batch (not batch invariant): a backend may keep the kernels of a narrower verify
+        // window for it, so that a row's sums do not depend on the window's width; backends may ignore it
+        GGML_TENSOR_FLAG_VERIFY = 64,
     };
 
     enum ggml_tri_type {

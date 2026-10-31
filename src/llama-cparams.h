@@ -39,6 +39,7 @@ struct llama_cparams {
     bool verify;                  // the caller marks the next batches as speculative verify batches (llama_set_verify)
     bool verify_exact;            // k11-decode: verify batches are computed batch invariant without LLAMA_MTP_EXACT (llama_set_verify_exact)
     bool batch_invariant;         // the current ubatch is a verify batch computed batch invariant (LLAMA_MTP_EXACT=1)
+    bool verify_tag;              // k19-tpp: the current ubatch is a verify batch of 2+ tokens, not batch invariant: its nodes carry GGML_TENSOR_FLAG_VERIFY
     uint32_t exact_split;         // batch invariant ubatch: rows whose attention sees fewer KV cells (llm_graph_exact_split)
     bool causal_attn;
     bool offload_kqv;

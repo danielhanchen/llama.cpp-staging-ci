@@ -3354,6 +3354,9 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
         mix((uint64_t) a->ne[d]);
         mix((uint64_t) b->ne[d]);
     }
+    if ((a->flags | b->flags) & GGML_TENSOR_FLAG_VERIFY) {
+        mix(0x7470705f76657269ULL); // k19-tpp: a verify-tagged graph never shares a key with an untagged one
+    }
     return (const void *) (uintptr_t) h;
 }
 
@@ -9121,6 +9124,7 @@ static ggml_cuda_host_timing & ggml_cuda_host_timing_get() { static ggml_cuda_ho
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    const ggml_cuda_verify_graph_scope verify_scope(cgraph); // k19-tpp
     ggml_cuda_host_timing & ht = ggml_cuda_host_timing_get();
     const bool ht_on = ht.every > 0 && cgraph->n_nodes >= 64;
     const int64_t ht0 = ht_on ? ggml_time_us() : 0;
@@ -9533,6 +9537,7 @@ static void ggml_cuda_fused_keep_inputs(ggml_cgraph * cgraph, ggml_backend_graph
 }
 
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+    const ggml_cuda_verify_graph_scope verify_scope(cgraph); // k19-tpp
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     const bool disable_fusion = ggml_cuda_fusion_disabled();

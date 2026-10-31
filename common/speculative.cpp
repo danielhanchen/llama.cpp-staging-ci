@@ -1561,10 +1561,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const char * e = getenv("LLAMA_SPEC_COST");
         return e != nullptr && atoi(e) != 0;
     }();
+    // k19-tpp: LLAMA_SPEC_TPP (the server sets params.n_floor): the window keeps n_floor drafts and one more only where the expected
+    // tokens per ms of the wider window (calibrated draft acceptance, common_spec_mtp_cost::chain_e) beat the floor window's at the
+    // measured round times (common_spec_tpp_cost), so the verify sizes are n_floor + 1 and n_floor + 2 only
+    int32_t tpp_floor = 0;
+    bool    cost_on   = false; // spec_cost || tpp_floor > 0: the round times and draft probabilities are recorded
     common_spec_mtp_cost cost_pol;
+    common_spec_tpp_cost tpp_cost;
     struct cost_seq {
         int64_t t_us = 0;            // the previous draft() call (0: none since the request began)
         int     rows = 1;            // the window drafted then
+        int     drafted = 0;         // k19-tpp: the drafts made then (more than rows - 1: a wider window was drafted and not kept)
         std::vector<float> probs;    // its drafts' probabilities
         common_spec_mtp_cost::chain_state chain;
     };
@@ -1643,6 +1650,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 c.reserve((size_t) (this->params.n_max + 1) * n_embd);
             }
         }
+        // k19-tpp: one trained head without shared memory only (chained heads and gemma4's shared KV keep the floor as their length)
+        if (this->params.n_floor > 0) {
+            if (!chain_heads && !is_mem_shared && !spec_cost && this->params.n_max == this->params.n_floor + 1) {
+                tpp_floor = this->params.n_floor;
+            } else {
+                this->params.n_max = std::min(this->params.n_max, this->params.n_floor);
+            }
+        }
+        cost_on = spec_cost || tpp_floor > 0;
         this->n_max = this->params.n_max;
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
@@ -1660,6 +1676,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         cost_st.assign(n_seq, {});
         if (spec_cost) {
             LOG_INF("%s: MTP window by expected tokens per ms (LLAMA_SPEC_COST=1), up to %d drafts\n", __func__, this->params.n_max);
+        }
+        if (tpp_floor > 0) {
+            LOG_INF("%s: k19-tpp: MTP windows of %d drafts, %d where the measured tokens per ms pay for the wider window (LLAMA_SPEC_TPP=0: off)\n",
+                __func__, tpp_floor, tpp_floor + 1);
         }
         // k15-pp: on by default beside built-in MTP heads (common sets LLAMA_SPEC_MTP_HEADS=1): the target's next-n rows of a prompt
         // batch then go to the device sink and the host keeps none of them (llama_context::nextn_store_ensure), so the host rows no
@@ -1704,9 +1724,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
-        if (spec_cost && seq_id >= 0 && seq_id < (llama_seq_id) cost_st.size()) {
+        if (cost_on && seq_id >= 0 && seq_id < (llama_seq_id) cost_st.size()) {
             if (cost_st[seq_id].t_us > 0) {
-                LOG_INF("%s: MTP window cost table: %s\n", __func__, cost_pol.text().c_str());
+                if (tpp_floor > 0) {
+                    LOG_INF("%s: MTP window cost table (k19-tpp): %s | windows: %d drafts %.0f, %d drafts %.0f\n", __func__, tpp_cost.text().c_str(),
+                        tpp_floor, cost_pol.n_rounds[tpp_floor + 1], tpp_floor + 1, cost_pol.n_rounds[tpp_floor + 2]);
+                } else {
+                    LOG_INF("%s: MTP window cost table: %s\n", __func__, cost_pol.text().c_str());
+                }
             }
             cost_st[seq_id].t_us = 0;
             cost_st[seq_id].probs.clear();
@@ -2043,13 +2068,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 dp.result_q = nullptr;
             }
 
-            if (spec_cost) {
+            if (cost_on) {
                 // the time since the previous draft() call is one round (verify + sampling + this drafting) of the window drafted then
                 auto & cs = cost_st[seq_id];
                 const int64_t now = ggml_time_us();
-                cost_pol.set_context(dp.pos0);
-                if (cs.t_us > 0) {
-                    cost_pol.observe(cs.rows, (now - cs.t_us)/1000.0);
+                if (tpp_floor > 0) {
+                    tpp_cost.set_context(dp.pos0);
+                    if (cs.t_us > 0) {
+                        cost_pol.n_rounds[std::clamp(cs.rows, 1, common_spec_mtp_cost::MAX_T)] += 1.0;
+                        // a round that drafted a wider window and kept the floor carries a draft step the floor window does not have
+                        if (cs.rows - 1 >= tpp_floor && cs.rows - 1 <= tpp_floor + 1 && cs.drafted == cs.rows - 1) {
+                            tpp_cost.observe(cs.rows - 1 - tpp_floor, (now - cs.t_us)/1000.0);
+                        }
+                    }
+                } else {
+                    cost_pol.set_context(dp.pos0);
+                    if (cs.t_us > 0) {
+                        cost_pol.observe(cs.rows, (now - cs.t_us)/1000.0);
+                    }
                 }
                 cs.t_us  = now;
                 cs.rows  = 1;
@@ -2148,7 +2184,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
 
-                if (spec_cost && !dp.result_q) {
+                if (tpp_floor > 0 && !dp.result_q) {
+                    auto & cs = cost_st[seq_id];
+                    cs.probs.push_back(cur_p->data[0].p);
+                    // after the floor's drafts: one more where the wider window, its next draft as likely to hold as the last, pays
+                    if ((int) result.size() == tpp_floor) {
+                        bool more = !tpp_cost.need_floor() && (dp.n_max <= 0 || dp.n_max > tpp_floor);
+                        if (more) {
+                            double q = 1.0;
+                            const double e_f = cost_pol.chain_e(cs.probs.data(), tpp_floor, q);
+                            const double a   = cost_pol.draft_rate(cs.probs.back());
+                            more = tpp_cost.wide_pays(e_f, e_f + q*a, q*a);
+                        }
+                        if (!more) {
+                            drafting[seq_id] = false;
+                            n_drafting--;
+                            continue;
+                        }
+                    }
+                } else if (spec_cost && !dp.result_q) {
                     auto & cs = cost_st[seq_id];
                     cs.probs.push_back(cur_p->data[0].p);
                     const int cap = 1 + (dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max);
@@ -2206,7 +2260,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            if (spec_cost && !dp.result_q) {
+            if (tpp_floor > 0 && !dp.result_q) {
+                // k19-tpp: the floor's drafts, and the one beyond it where the wider window pays with the drafted token's probability
+                auto & cs = cost_st[seq_id];
+                cs.drafted = (int) dp.result->size();
+                if ((int) dp.result->size() > tpp_floor && (int) cs.probs.size() > tpp_floor) {
+                    double q_f = 1.0, q_w = 1.0;
+                    const double e_f = cost_pol.chain_e(cs.probs.data(), tpp_floor, q_f);
+                    const double e_w = cost_pol.chain_e(cs.probs.data(), tpp_floor + 1, q_w);
+                    if (!tpp_cost.wide_pays(e_f, e_w, q_w)) {
+                        dp.result->resize(tpp_floor);
+                    }
+                }
+            } else if (spec_cost && !dp.result_q) {
                 // the window keeps the drafts of the best expected tokens per ms
                 const size_t kept = (size_t) std::max(0, cost_st[seq_id].chain.best_rows - 1);
                 if (dp.result->size() > kept) {
@@ -2218,7 +2284,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 dp.result->clear();
             }
 
-            if (spec_cost) {
+            if (cost_on) {
                 auto & cs = cost_st[seq_id];
                 cs.rows = 1 + (int) dp.result->size();
                 cs.probs.resize(std::min(cs.probs.size(), dp.result->size()));
@@ -2231,7 +2297,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
-        if (spec_cost) {
+        if (cost_on) {
             auto & cs = cost_st[seq_id];
             if (!cs.probs.empty()) {
                 cost_pol.observe_probs(cs.probs.data(), (int) cs.probs.size(), n_accepted);

@@ -941,6 +941,7 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.batch_invariant         == other.cparams.batch_invariant         &&
+            cparams.verify_tag              == other.cparams.verify_tag              &&
             // a verify ubatch crossing a padding block of the KV cells splits its attention by rows: rebuilt every time
             cparams.exact_split == 0 && other.cparams.exact_split == 0 &&
             cparams.causal_attn             == other.cparams.causal_attn             &&

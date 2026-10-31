@@ -24,6 +24,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <climits>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -1556,6 +1557,46 @@ private:
 
         // k11-decode: n-gram drafting on by default where nothing else drafts (server-spec-auto.h, LLAMA_SPEC_AUTO=0: off)
         server_spec_auto_apply(params);
+
+        // k19-tpp (LLAMA_SPEC_TPP=0: off): an MTP drafter at 2 drafts (Studio's --spec-draft-n-max 2, greedy, no p-min) keeps those 2 and
+        // adds a 3rd where the measured tokens per ms of a 4-row verify beat the 3-row one (common_spec_mtp_cost::tpp_more / tpp_keep).
+        // Verify rows of 3 and 4 tokens run the same kernels (LLAMA_SPEC_TPP_VERIFY), so the greedy text stays that of 2 drafts
+        {
+            const char * e = getenv("LLAMA_SPEC_TPP");
+            auto & sp = params.speculative;
+            // (types starts as { NONE } and --spec-type appends: the only drafting type must be draft-mtp)
+            const bool mtp_only = std::count_if(sp.types.begin(), sp.types.end(), [](common_speculative_type t) {
+                return t != COMMON_SPECULATIVE_TYPE_NONE;
+            }) == 1 && std::find(sp.types.begin(), sp.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != sp.types.end();
+            // by default only where every GPU is NVIDIA Ampere or newer (compute capability >= 8.0): there a 4-row verify row runs the
+            // kernels of a 3-row one (mmvq keeps its 4 warps up to 4 columns, F32 weights stay on mmvf under the verify tag). Turing's
+            // mmvq table halves the q6_K warps at 4 columns, so a T4 window's head rows sum in another order (Kaggle T4 q4x + MTP heads:
+            // +3% decode, but chat text varied launch to launch); AMD and other GPUs report no capability. LLAMA_SPEC_TPP=1 forces it on
+            const bool mtp_shape = mtp_only && sp.draft.n_max == 2 && sp.draft.n_min == 0 && sp.draft.p_min <= 0.0f && !sp.draft.probabilistic &&
+                params.n_parallel == 1;
+            int n_gpu = 0, cc_min = INT_MAX;
+            for (size_t i = 0; mtp_shape && i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    continue;
+                }
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                auto cc_fn = reg ? (int (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_compute_capability") : nullptr;
+                const int cc = cc_fn != nullptr ? cc_fn(dev) : -1;
+                n_gpu++;
+                cc_min = std::min(cc_min, cc);
+            }
+            const bool dev_ok = n_gpu > 0 && cc_min >= 800;
+            const bool on = e != nullptr ? atoi(e) != 0 : dev_ok;
+            if (mtp_shape && on) {
+                sp.draft.n_floor = 2;
+                sp.draft.n_max   = 3;
+                SRV_INF("%s", "k19-tpp: MTP drafts 2, a 3rd where it pays (LLAMA_SPEC_TPP=0: off)\n");
+            } else if (mtp_shape && e == nullptr) {
+                SRV_INF("k19-tpp: MTP stays at 2 drafts here (%d GPUs, lowest compute capability %d: not every GPU is NVIDIA Ampere or newer; "
+                    "LLAMA_SPEC_TPP=1 forces the wider window)\n", n_gpu, n_gpu > 0 ? cc_min : -1);
+            }
+        }
 
         params_base = params;
         // A zero draft length means no speculation, for a draft model and for MTP (no draft model) alike. Without this the context

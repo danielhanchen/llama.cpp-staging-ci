@@ -12,6 +12,16 @@ void ggml_cuda_op_mul_mat_vec_f(
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
+// k19-tpp: set while ggml-cuda plans or evaluates a graph whose nodes carry GGML_TENSOR_FLAG_VERIFY (a verify window, not batch
+// invariant): F32 weights then keep mmvf at 4 columns on NVIDIA Ampere and newer, as at 3, so a 4-row window's rows get the sums of a
+// 3-row window's (mmvf's per-column sums do not depend on the column count: the block size follows K only)
+struct ggml_cuda_verify_graph_scope {
+    explicit ggml_cuda_verify_graph_scope(const struct ggml_cgraph * cgraph);
+    ~ggml_cuda_verify_graph_scope();
+    bool prev;
+};
+bool ggml_cuda_verify_graph_active();
+
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11);
 
 // k15-mm2: whether ggml_cuda_mul_mat_vec_f_multi has a kernel for this type, K and number of columns (the single launch's block size)

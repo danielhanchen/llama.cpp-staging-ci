@@ -378,6 +378,17 @@ struct common_spec_mtp_cost {
         return std::max(v1, v2) > st.best_v*(1.0 + margin/3.0) || (cost_n[bk][rows + 1] < PROBES && st.q*a >= 0.15);
     }
 
+    // expected committed tokens of a window holding the first n drafts (probabilities p), and the chance all n hold
+    double chain_e(const float * p, int n, double & q) const {
+        double e = 1.0;
+        q = 1.0;
+        for (int j = 0; j < n; ++j) {
+            q *= draft_rate(p[j]);
+            e += q;
+        }
+        return e;
+    }
+
     std::string text() const {
         std::string out;
         char b[96];
@@ -411,6 +422,108 @@ struct common_spec_mtp_cost {
                 snprintf(b, sizeof(b), " %.2f:%.2f(%.0f)", (i + 0.5)/PB, pa_ok[i]/pa_n[i], pa_n[i]);
                 out += b;
             }
+        }
+        return out;
+    }
+};
+
+// k19-tpp (LLAMA_SPEC_TPP): the round time of the floor window (n_floor drafts) and of the floor + 1 window, per context bucket, as the
+// median of the last NS rounds of each (robust to the graph captures and host stalls a mean takes in). The floor window keeps being
+// measured: it runs while it has fewer than PROBES samples in the bucket and once every STALE rounds after its last sample, so one slow
+// early round cannot price it out (the first G4 gate: T3 sampled once at 19.4 ms in a warm-up round, real 11 ms, then never again)
+struct common_spec_tpp_cost {
+    static constexpr int CTX    = 5;    // context buckets: < 1536, < 6144, < 12288, < 24576, longer
+    static constexpr int NS     = 15;
+    static constexpr int SKIP   = 2;    // the first rounds of a size in a bucket build / capture its graphs
+    static constexpr int PROBES = 3;
+    static constexpr int STALE  = 48;
+
+    struct size_stat {
+        float   ring[NS] = {};
+        int     n    = 0;
+        int     seen = 0;
+        int64_t last = -1000000;
+    };
+    size_stat st[CTX][2];
+    int     bk     = 0;
+    int64_t rounds = 0;
+    double  margin  = 0.05;
+    double  probe_q = 0.5;
+    int     stale   = STALE;
+
+    common_spec_tpp_cost() {
+        if (const char * e = getenv("LLAMA_SPEC_TPP_MARGIN")) {
+            margin = atof(e);
+        }
+        if (const char * e = getenv("LLAMA_SPEC_TPP_PROBE_Q")) {
+            probe_q = atof(e);
+        }
+        if (const char * e = getenv("LLAMA_SPEC_TPP_STALE")) {
+            stale = std::max(1, atoi(e));
+        }
+    }
+
+    static int bucket(int64_t pos) {
+        return pos < 1536 ? 0 : pos < 6144 ? 1 : pos < 12288 ? 2 : pos < 24576 ? 3 : 4;
+    }
+
+    void set_context(int64_t pos) {
+        bk = bucket(pos);
+    }
+
+    // one round of the window kind k (0 = floor, 1 = floor + 1)
+    void observe(int k, double ms) {
+        ++rounds;
+        size_stat & s = st[bk][k];
+        if (!(ms > 0.0) || s.seen++ < SKIP) {
+            return;
+        }
+        s.ring[s.n % NS] = (float) ms;
+        s.n++;
+        s.last = rounds;
+    }
+
+    static double median_of(const size_stat & s) {
+        const int m = std::min(s.n, NS);
+        if (m == 0) {
+            return 0.0;
+        }
+        float v[NS];
+        std::copy(s.ring, s.ring + m, v);
+        std::nth_element(v, v + m/2, v + m);
+        return v[m/2];
+    }
+
+    double median(int k) const {
+        return median_of(st[bk][k]);
+    }
+
+    // the floor window must run now (too few samples in this bucket, or its last one is STALE rounds old)
+    bool need_floor() const {
+        const size_stat & s = st[bk][0];
+        return s.n < PROBES || rounds - s.last > stale;
+    }
+
+    // window floor + 1 (expected tokens e_w, chance q_w that every draft holds) against the floor window (e_f)
+    bool wide_pays(double e_f, double e_w, double q_w) const {
+        const size_stat & s = st[bk][1];
+        if (s.n < PROBES || rounds - s.last > stale) {
+            return q_w >= probe_q;   // measure it when the chain is likely to reach it
+        }
+        const double c_f = median(0), c_w = median(1);
+        return c_f > 0.0 && c_w > 0.0 && e_w/c_w > e_f/c_f*(1.0 + margin);
+    }
+
+    std::string text() const {
+        std::string out;
+        char b[96];
+        for (int k = 0; k < CTX; ++k) {
+            if (st[k][0].n == 0 && st[k][1].n == 0) {
+                continue;
+            }
+            snprintf(b, sizeof(b), "%sctx%d: floor %.2f(n=%d) wide %.2f(n=%d)", out.empty() ? "" : " | ", k, median_of(st[k][0]), st[k][0].n,
+                median_of(st[k][1]), st[k][1].n);
+            out += b;
         }
         return out;
     }
