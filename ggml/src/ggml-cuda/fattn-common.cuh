@@ -992,6 +992,18 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// k19-tpp: a verify window (GGML_TENSOR_FLAG_VERIFY, not batch invariant) of more rows than GGML_CUDA_VERIFY_REF_ROWS (default 3: the
+// window of 2 drafts that every MTP verify forms) takes the launch choices of that reference window where they follow the row count:
+// the sparse / dense attention pick (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse) and the stream-k blocks per output tile of the
+// one-query sparse kernel. Its rows then sum in the order of a 3-row window's (0 = off)
+static int ggml_cuda_fattn_verify_ref_rows(const ggml_tensor * KQV) {
+    if (!(KQV->flags & GGML_TENSOR_FLAG_VERIFY) || (KQV->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT)) {
+        return 0;
+    }
+    static const int ref = getenv("GGML_CUDA_VERIFY_REF_ROWS") ? atoi(getenv("GGML_CUDA_VERIFY_REF_ROWS")) : 3;
+    return ref > 0 && KQV->src[0]->ne[1] > ref ? ref : 0;
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1239,6 +1251,20 @@ void launch_fattn(
                 : nblocks_stream_k_raw;
 
             blocks_num.x = nblocks_stream_k;
+
+            // k19-tpp: one-query tiles of a verify window wider than the reference: the blocks per output tile of the reference window,
+            // so every query's KV range is split at the same cells as there (each tile's split depends only on its block count when the
+            // count divides evenly). Only when the reference launch itself rounds to whole tiles; otherwise as before
+            const int ref_rows = ncols1 == 1 ? ggml_cuda_fattn_verify_ref_rows(KQV) : 0;
+            if (ref_rows > 0) {
+                const int ntiles_dst_ref = ntiles_dst / ntiles_x * ref_rows;
+                const int raw_ref        = std::min(max_blocks, ntiles_KV*ntiles_dst_ref);
+                const int rounded_ref    = (raw_ref / ntiles_dst_ref) * ntiles_dst_ref;
+                const int loss_ref       = rounded_ref > 0 ? 100 * (raw_ref - rounded_ref) / raw_ref : 100;
+                if (loss_ref <= max_efficiency_loss_percent) {
+                    blocks_num.x = (rounded_ref / ntiles_dst_ref) * ntiles_dst;
+                }
+            }
         }
 
         if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
