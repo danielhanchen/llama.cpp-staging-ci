@@ -5559,7 +5559,8 @@ struct llama_moe_cache::impl {
 
     // what the timings depend on: the device, the host threads and CPU count, the cache (main / MTP) and the expert form
     std::string cm_cal_key(const group & g, const layer & l) const {
-        std::string k = "moe-cpu-miss-cal v1";
+        // the format version and the build: an upgraded binary times the host again instead of reusing older numbers
+        std::string k = "moe-cpu-miss-cal v2|build=" + std::string(ggml_commit());
         ggml_backend_dev_t dev = devices[g.id].backend != nullptr ? ggml_backend_get_device(devices[g.id].backend) : nullptr;
         k += std::string("|dev=") + (dev != nullptr ? ggml_backend_dev_description(dev) : "?");
         k += "|threads=" + std::to_string(single_threads) + "|ncpu=" + std::to_string(std::thread::hardware_concurrency());
@@ -5611,7 +5612,10 @@ struct llama_moe_cache::impl {
         return ok;
     }
 
-    static bool cm_cal_write(const std::string & dir, const std::string & path, const std::string & key, const double v[4]) {
+    // written to a temporary file and then put in place in one step, so a reader never sees half a file. Two servers that time the host
+    // at once: the first file in place wins (a hard link fails if the file exists) and the other launch reads it and decides from it too,
+    // so both decide alike; replace (=2) renames over the old file. Returns false if nothing usable is in place (v keeps the own numbers)
+    static bool cm_cal_write(const std::string & dir, const std::string & path, const std::string & key, double v[4], bool replace) {
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
         const std::string tmp = path + ".tmp" + std::to_string((long long) ggml_time_us());
@@ -5624,12 +5628,54 @@ struct llama_moe_cache::impl {
             std::remove(tmp.c_str());
             return false;
         }
-        std::filesystem::rename(tmp, path, ec);
-        if (ec) {
-            std::remove(tmp.c_str());
-            return false;
+        bool placed = false;
+        if (replace) {
+            std::filesystem::rename(tmp, path, ec);
+            placed = !ec;
+        } else {
+#if defined(__linux__) || defined(__APPLE__)
+            placed = link(tmp.c_str(), path.c_str()) == 0;
+#else
+            if (!std::filesystem::exists(path, ec)) {
+                std::filesystem::rename(tmp, path, ec);
+                placed = !ec;
+            }
+#endif
         }
-        return true;
+        std::remove(tmp.c_str());
+        if (placed) {
+            return true;
+        }
+        // another launch put its numbers in place first: decide from those
+        double w[4];
+        if (cm_cal_read(path, key, w)) {
+            std::copy(w, w + 4, v);
+            return true;
+        }
+        return false;
+    }
+
+    // k19-determinism: one line at load naming the calibration file this cache will use (read, or written by its first small batch)
+    void cm_cal_log_file(bool quiet) const {
+        if (quiet || !cm || cm_persist_mode() == 0) {
+            return;
+        }
+        for (const group & g : groups) {
+            if (g.dev_lookup && g.n_slots > 0 && g.counts != nullptr && !g.layers.empty()) {
+                const std::string dir = cm_cal_dir();
+                if (dir.empty()) {
+                    LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no calibration directory (LLAMA_MOE_CPU_MISS_CAL_DIR / LLAMA_CACHE / HOME unset): timed in every launch\n", tag);
+                    return;
+                }
+                const std::string key  = cm_cal_key(g, layers[g.layers[0]]);
+                const std::string path = cm_cal_path(dir, key);
+                double v[4];
+                const bool have = cm_persist_mode() == 1 && cm_cal_read(path, key, v);
+                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: calibration file %s (%s; LLAMA_MOE_CPU_MISS_CAL_PERSIST=0: timed in every launch)\n", tag,
+                    path.c_str(), have ? "found, read at the first small batch" : "not found: the first small batch times the host and writes it");
+                return;
+            }
+        }
     }
 
     void cm_calibrate(ggml_backend_t backend_cpu) {
@@ -5747,6 +5793,16 @@ struct llama_moe_cache::impl {
             std::sort(v.begin(), v.end());
             return (double) v[v.size()/2];
         };
+        // k19-determinism: interquartile range over the median of a sample set (the noise of a start-up calibration)
+        auto rel_iqr = [](std::vector<int64_t> v) {
+            if (v.size() < 4) {
+                return 0.0;
+            }
+            std::sort(v.begin(), v.end());
+            const double q1 = (double) v[v.size()/4], q3 = (double) v[(3*v.size())/4], m = (double) v[v.size()/2];
+            return m > 0.0 ? (q3 - q1)/m : 0.0;
+        };
+        double cal_spread = 0.0;
         auto timed = [&](ggml_cgraph * gf) {
             const int64_t t0 = ggml_time_us();
             ggml_backend_graph_compute(backend_cpu, gf);
@@ -5778,6 +5834,7 @@ struct llama_moe_cache::impl {
             d_a = median(ta);
             d_b = median(tb);
             d_t = median(tt);
+            cal_spread = std::max(rel_iqr(ta), rel_iqr(tb));
             slope = kb > ka ? (d_b - d_a)/(kb - ka) : d_a/ka;
             const double gbs = slope > 0.0 ? g.expert_bytes/slope/1e3 : 0.0;
             ok = slope > 0.0 && gbs >= 0.2 && gbs <= 400.0 && d_t >= 0.9*d_a;
@@ -5857,11 +5914,25 @@ struct llama_moe_cache::impl {
             cm_tup   = std::max(median(tu)/ka, 0.05);
             cm_split = std::max(0.0, d_a - ka*cm_t1) + 2.0*median(trt);
             if (!cal_path.empty()) {
-                const double v[4] = { cm_t1, cm_dt, cm_tup, cm_split };
-                // decided from these numbers in this launch too, so it matches every later one
-                cm_from_file = cm_cal_write(cal_dir, cal_path, cal_key, v);
-                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: calibration %s %s (LLAMA_MOE_CPU_MISS_CAL_PERSIST=0: timed in every launch)\n", tag,
-                    cm_from_file ? "written to" : "could not be written to", cal_path.c_str());
+                // a noisy sample set (spread of the host timings above LLAMA_MOE_CPU_MISS_CAL_MAX_SPREAD, default 0.25: a busy host, e.g. a
+                // build beside it) decides this launch only and is not kept: the next launch times the host again
+                static const double max_spread = [] {
+                    const char * e = getenv("LLAMA_MOE_CPU_MISS_CAL_MAX_SPREAD");
+                    return e != nullptr ? std::max(0.0, atof(e)) : 0.25;
+                }();
+                if (cal_spread > max_spread) {
+                    LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: calibration not kept, the host timings spread %.0f%% (above %.0f%%, "
+                        "LLAMA_MOE_CPU_MISS_CAL_MAX_SPREAD): this launch only, the next one times the host again\n", tag, 100.0*cal_spread, 100.0*max_spread);
+                } else {
+                    double v[4] = { cm_t1, cm_dt, cm_tup, cm_split };
+                    // decided from the numbers in place (these, or those another launch put there first), in this launch too
+                    cm_from_file = cm_cal_write(cal_dir, cal_path, cal_key, v, persist == 2);
+                    if (cm_from_file) {
+                        cm_t1 = v[0]; cm_dt = v[1]; cm_tup = v[2]; cm_split = v[3];
+                    }
+                    LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: calibration %s %s (spread %.0f%%; LLAMA_MOE_CPU_MISS_CAL_PERSIST=0: timed in every launch)\n", tag,
+                        cm_from_file ? "written to" : "could not be written to", cal_path.c_str(), 100.0*cal_spread);
+                }
             }
         }
         GGML_UNUSED(attempt);
@@ -9083,6 +9154,7 @@ void llama_moe_cache::hybrid_probe(ggml_backend_t backend_cpu) {
 void llama_moe_cache::hybrid_set_threads(int32_t n_threads, bool quiet) {
     pimpl->single_threads = n_threads;
     pimpl->set_threads(n_threads, quiet);
+    pimpl->cm_cal_log_file(quiet);
 }
 
 ggml_tensor * llama_moe_cache::single_publish(ggml_context * ctx, int32_t il, ggml_tensor * host_ids, ggml_tensor * x,
