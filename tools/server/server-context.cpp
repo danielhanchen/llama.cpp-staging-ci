@@ -5459,7 +5459,13 @@ private:
         // it never grows the next-n store (64 rows at least, the pass's batch had more). Anything else joins first
         // k19-host (LLAMA_MTP_PROMPT_BG_GROUP): beside a pass launched in group mode the slot's next prompt batch of any size runs, the
         // target waits for the pass (its next-n hold) before it writes the rows or frees the drafter's compute buffers
-        if (spec_bg.live && (slots.size() != 1 || (batch.view.size() > spec_bg_tail_max && !spec_bg.group))) {
+        // k19-npkdp (LLAMA_MTP_PROMPT_BG_MULTI_JOIN=1: join at -np > 1 as before): with several slots, the batch of the pass's slot while it
+        // is the only one processing (spec_bg_slot) runs beside the pass too; at -np 4 the join here put the drafter's pass back in line
+        // before every 8192-token group of a long prompt (G4 Flash-Next 16 GB 30k: 99-144 ms between the batch build and the group)
+        static const bool bg_multi_join = getenv("LLAMA_MTP_PROMPT_BG_MULTI_JOIN") != nullptr && atoi(getenv("LLAMA_MTP_PROMPT_BG_MULTI_JOIN")) != 0;
+        const server_slot * bg_only = spec_bg.live && slots.size() > 1 && !bg_multi_join ? spec_bg_slot() : nullptr;
+        const bool bg_other = slots.size() != 1 && (bg_only == nullptr || bg_only->id != spec_bg.slot_id);
+        if (spec_bg.live && (bg_other || (batch.view.size() > spec_bg_tail_max && !spec_bg.group))) {
             if (!spec_bg_join()) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
                 throw std::runtime_error("failed to process speculative batch");
