@@ -230,8 +230,16 @@ public:
     // return empty slot_info on failure
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
+    // the cells of one stream that the SWA purge of apply_ubatch() changed, as they were before it
+    struct purge_backup {
+        uint32_t              strm;
+        std::vector<uint32_t> idxs;
+        llama_kv_cells        cells;
+    };
+
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
-    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+    // k19-rsbis: with `purged`, the cells the SWA purge changes outside the slot are saved there first (prepare() restores them)
+    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, std::vector<purge_backup> * purged = nullptr);
 
     //
     // input API

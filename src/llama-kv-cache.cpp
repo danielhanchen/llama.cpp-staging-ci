@@ -812,7 +812,18 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         std::vector<uint32_t> v_heads_old; // old positions of the heads, before placing the ubatch
 
         std::vector<llama_kv_cells> v_cells; // copy of the old cells, before placing the ubatch
+
+        std::vector<purge_backup> purged; // the cells outside the slot that the SWA purge of the ubatch changed
     };
+
+    // k19-rsbis: the SWA purge of a ubatch (apply_ubatch: the positions of a sequence below a masked cell it overwrites) removes cells
+    // outside its slot, which the restore below did not put back, so the earlier ubatches of the same decode ran without them: a cell
+    // masked only for the later ubatch (another sequence's tokens took it) was still in the window of the earlier ubatch's tokens
+    // (e.g. llama-server -np N --kv-unified on SWA models; test-llama-context swa_prepare). LLAMA_KV_PREPARE_PURGE_RESTORE=0: as before
+    static const bool restore_purge = [] {
+        const char * e = getenv("LLAMA_KV_PREPARE_PURGE_RESTORE");
+        return e == nullptr || atoi(e) != 0;
+    }();
 
     // remember the old state of the cells so we can restore it in the end
     std::vector<state_t> states;
@@ -832,7 +843,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
         // store the old state of the cells in the recovery stack
         {
-            state_t state = { sinfo_new, v_heads, {} };
+            state_t state = { sinfo_new, v_heads, {}, {} };
 
             for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
                 auto & cells = v_cells[sinfo_new.strm[s]];
@@ -844,7 +855,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         }
 
         // now emplace the ubatch
-        apply_ubatch(sinfo_new, ubatch);
+        apply_ubatch(sinfo_new, ubatch, restore_purge ? &states.back().purged : nullptr);
     }
 
     GGML_ASSERT(!states.empty() || !success);
@@ -852,6 +863,11 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     // iterate backwards and restore the cells to their original state
     for (auto it = states.rbegin(); it != states.rend(); ++it) {
         const auto & sinfo = it->sinfo;
+
+        // the purge ran after the ubatch was placed, so it is undone first
+        for (auto pt = it->purged.rbegin(); pt != it->purged.rend(); ++pt) {
+            v_cells[pt->strm].set(pt->idxs, pt->cells);
+        }
 
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
             auto & cells = v_cells[sinfo.strm[s]];
@@ -1152,7 +1168,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
-void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, std::vector<purge_backup> * purged) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -1233,6 +1249,17 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         if (cells.seq_pos_min(s) <= seq_pos_max_rm[s]) {
             LLAMA_LOG_DEBUG("%s: purging positions [%d, %d] of sequence %d from KV cache\n",
                     __func__, cells.seq_pos_min(s), seq_pos_max_rm[s], s);
+
+            if (purged != nullptr) {
+                purge_backup pb = { seq_to_stream[s], {}, {} };
+                for (uint32_t i = 0; i < cells.size(); ++i) {
+                    if (cells.pos_in(i, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1) && cells.seq_has(i, s)) {
+                        pb.idxs.push_back(i);
+                    }
+                }
+                pb.cells = cells.cp(pb.idxs);
+                purged->push_back(std::move(pb));
+            }
 
             seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
         }
