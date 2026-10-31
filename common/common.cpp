@@ -1404,6 +1404,9 @@ static bool common_spec_draft_model(const common_params & params) {
 }
 
 static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_model_params & mparams, llama_context_params & cparams);
+static uint64_t common_model_file_bytes(const std::string & path);
+static bool     common_model_file_in_ram(const std::string & path);
+static uint64_t common_available_memory();
 
 // <arch>.<key> of a GGUF as an integer (u32 / i32 / u64), -1 if absent or unreadable
 static int64_t common_gguf_u32(const std::string & path, const char * key) {
@@ -2029,6 +2032,31 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
                             }
                             fclose(fm);
                             tiny_rel_ram = total_kb <= 0 || std::max(0.0, (double) sbt.total - (double) cache) <= ram_frac*(double) total_kb*1024.0;
+                            // k19-smallm (LLAMA_MOE_TINY_RELEASE_RAM_FIT=0: the RAM share alone, as before): also where the whole model
+                            // file fits in the available memory with LLAMA_MOE_TINY_RELEASE_RAM_RESERVE (0.10) of the RAM to spare. The
+                            // refill reads only the cache's experts, from a page cache that then keeps the whole file. Kaggle T4 (4 vCPU,
+                            // 31.3 GB RAM, 29.8 GB available), Qwen3.6-35B-A3B UD-Q4_K_XL + MTP at 6 GB: 19.2 GB of host experts are 61%
+                            // of the RAM, so the share kept the old rule (cache 1139 -> 549 MiB, decode hit rate 25.7%) though the 21.8 GB
+                            // file stayed resident (0 MB read from the disk during the requests)
+                            static const bool ram_fit_env = getenv("LLAMA_MOE_TINY_RELEASE_RAM_FIT") == nullptr ||
+                                atoi(getenv("LLAMA_MOE_TINY_RELEASE_RAM_FIT")) != 0;
+                            if (!tiny_rel_ram && ram_fit_env && total_kb > 0) {
+                                double reserve = 0.10;
+                                if (const char * e = getenv("LLAMA_MOE_TINY_RELEASE_RAM_RESERVE")) {
+                                    reserve = std::max(0.0, atof(e));
+                                }
+                                const uint64_t file  = common_model_file_bytes(params.model.path);
+                                const uint64_t avail = common_available_memory();
+                                const bool tiny_rel_fit = file > 0 && avail > 0 && !common_model_file_in_ram(params.model.path) &&
+                                    (double) file + reserve*(double) total_kb*1024.0 <= (double) avail;
+                                tiny_rel_ram = tiny_rel_fit;
+                                if (tiny_rel_fit) {
+                                    COM_INF("MoE cache: tiny-cache release: the host experts (%.0f MiB) are more than %.0f%% of the RAM, but the model "
+                                        "file (%.0f MiB) fits in the available memory (%.0f MiB) with %.0f%% of the RAM to spare "
+                                        "(LLAMA_MOE_TINY_RELEASE_RAM_FIT=0: the RAM share only)\n", std::max(0.0, (double) sbt.total - (double) cache)/1048576.0,
+                                        100.0*ram_frac, file/1048576.0, avail/1048576.0, 100.0*reserve);
+                                }
+                            }
                         }
                     }
 #endif
