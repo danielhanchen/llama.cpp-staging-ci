@@ -1483,12 +1483,12 @@ static int64_t common_lm_batch_default(const common_params & params, bool * nodr
         }
         return 16384;
     }
-    // k19-np12c (LLAMA_MOE_LAYER_MAJOR_BATCH_LEND=0: 8192): beside a separate MTP drafter (-md, draft-mtp) whose device weights the target's
-    // prompt groups borrow (kdp, LLAMA_MTP_DRAFT_LEND) 16384 too: the server skips the drafter's pass over every batch before the prompt's
-    // last LLAMA_MTP_PROMPT_TAIL rows, so those groups hold neither its rows nor its pass, and a group whose lent allocation does not fit
-    // is still split (ggml sched lend guard). G4 Flash-Next UD-IQ4_XS 12 GB, Studio's -np 4 with the q3_k drafter: 30k ran as 4 groups of
-    // 4 ubatches (every host expert read 4 times), 9.573 s against 9.236 s with no drafter and groups of 8
-    static const bool lend_batch_env = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_LEND") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_LEND")) != 0;
+    // k19-np12c, opt-in (LLAMA_MOE_LAYER_MAJOR_BATCH_LEND=1): beside a separate MTP drafter (-md, draft-mtp) whose device weights the
+    // target's prompt groups borrow (kdp, LLAMA_MTP_DRAFT_LEND) 16384. Off by default: the server's drafter pass covers the whole last
+    // batch, so a 30k prompt passed 14332 drafter rows instead of 6140 (G4 Flash-Next UD-IQ4_XS 12 GB, Studio's -np 4 with the q3_k drafter:
+    // TTFT 6.89 vs 6.66 s, e2e 9.837 vs 9.572 s), and the choice is made before --fit knows whether anything is lent (16 GB, nothing lent:
+    // MoE cache 4488 vs 4576 MiB, 30k e2e 8.616 vs 8.486 s)
+    static const bool lend_batch_env = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_LEND") != nullptr && atoi(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_LEND")) != 0;
     const char * e_lend = getenv("LLAMA_MTP_DRAFT_LEND");
     const bool   lend_on = e_lend == nullptr || atoi(e_lend) != 0;
     const bool   dft_mtp = params.speculative.has_dft() && std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
