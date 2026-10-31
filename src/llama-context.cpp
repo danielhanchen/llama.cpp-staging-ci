@@ -9977,7 +9977,7 @@ size_t llama_context::state_async_reserve(llama_state_seq_flags flags) {
 // device bytes of the memory's buffers); it is pinned then and added after the staging, and every save that fits reads its rows
 // asynchronously (the same rows into the same destination). Pinned on a thread while a slot generated instead, cudaMallocHost cost that
 // decode 5-17% (k19hx_g4). At most LLAMA_STATE_ASYNC_EXT_MAX_MIB (2048) of staging in all, only while free memory (MemFree, so no
-// page cache is evicted for it) keeps max(4 GiB, 10% of MemTotal) after it, one async backend only (one GPU); kept with the context
+// page cache is evicted for it) keeps max(4 GiB, 5% of MemTotal) after it, one async backend only (one GPU); kept with the context
 static bool state_async_ext_on() {
     static const bool on = [] {
         const char * e = getenv("LLAMA_STATE_ASYNC_EXT");
@@ -10033,7 +10033,12 @@ void llama_context::state_async_ext_request(size_t need) {
         avail = std::min<uint64_t>(avail, mem_free);
     }
 #endif
-    const uint64_t keep  = std::max<uint64_t>(4ull << 30, llama_sysmem::total() / 10);
+    // k19-host30k: the share of MemTotal kept free is LLAMA_STATE_ASYNC_EXT_KEEP_PCT (5) percent, at least 4 GiB. At 10% the G4 at 24 /
+    // 32 GB (12.3 GiB free after load of 176 GiB) never pinned (k19hx2_g4). LLAMA_STATE_ASYNC_EXT_TOTAL_MIB (test only) stands in for
+    // MemTotal, to see the decision of a smaller host
+    static const uint64_t keep_pct = (uint64_t) std::max(0, getenv("LLAMA_STATE_ASYNC_EXT_KEEP_PCT") ? atoi(getenv("LLAMA_STATE_ASYNC_EXT_KEEP_PCT")) : 5);
+    static const uint64_t total_mem = getenv("LLAMA_STATE_ASYNC_EXT_TOTAL_MIB") ? (uint64_t) std::max(0, atoi(getenv("LLAMA_STATE_ASYNC_EXT_TOTAL_MIB"))) << 20 : llama_sysmem::total();
+    const uint64_t keep  = std::max<uint64_t>(4ull << 30, total_mem * keep_pct / 100);
     if (avail == 0 || avail < add + keep) {
         LLAMA_LOG_INFO("%s: no staging extension of %.2f MiB for asynchronous state saves: %.1f MiB free (MemFree, MemAvailable, cgroup), "
             "%.1f MiB kept free\n", __func__, add/1048576.0, avail/1048576.0, keep/1048576.0);
@@ -10046,8 +10051,9 @@ void llama_context::state_async_ext_request(size_t need) {
         return;
     }
     sa.ext.push_back(std::move(buf));
-    LLAMA_LOG_INFO("%s: %s: %.2f MiB more pinned staging for asynchronous state saves (%.2f MiB in all) (LLAMA_STATE_ASYNC_EXT=0 off)\n",
-        __func__, ggml_backend_dev_name(sa.dev), add/1048576.0, want/1048576.0);
+    LLAMA_LOG_INFO("%s: %s: %.2f MiB more pinned staging for asynchronous state saves (%.2f MiB in all; %.1f MiB free before, %.1f MiB kept "
+        "free) (LLAMA_STATE_ASYNC_EXT=0 off)\n", __func__, ggml_backend_dev_name(sa.dev), add/1048576.0, want/1048576.0, avail/1048576.0,
+        keep/1048576.0);
 }
 
 // Read the state rows of an asynchronous save into dst without synchronizing the context.
