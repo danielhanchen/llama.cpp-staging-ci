@@ -160,6 +160,16 @@
 #define cudaGraph_t musaGraph_t
 #define cudaKernelNodeParams musaKernelNodeParams
 #define cudaStreamCaptureModeRelaxed musaStreamCaptureModeRelaxed
+#define cudaPeekAtLastError musaPeekAtLastError
+#define cudaMemoryTypeDevice musaMemoryTypeDevice
+#define cudaMemcpy3DParms musaMemcpy3DParms
+#define cudaGraphMemcpyNodeGetParams musaGraphMemcpyNodeGetParams
+#define cudaGraphNodeTypeMemcpy musaGraphNodeTypeMemcpy
+#define cudaGraphNodeTypeMemset musaGraphNodeTypeMemset
+#define cudaGraphNodeTypeHost musaGraphNodeTypeHost
+#define cudaGraphNodeTypeEventRecord musaGraphNodeTypeEventRecord
+#define cudaGraphNodeTypeWaitEvent musaGraphNodeTypeWaitEvent
+#define cudaGraphNodeTypeEmpty musaGraphNodeTypeEmpty
 #define cudaStreamBeginCapture musaStreamBeginCapture
 #define cudaStreamEndCapture musaStreamEndCapture
 #define cudaStreamCaptureStatus musaStreamCaptureStatus

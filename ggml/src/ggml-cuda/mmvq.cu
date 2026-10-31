@@ -2721,7 +2721,13 @@ static __global__ void mul_mat_vec_q8_0_hc_pre(
     float sum = 0.0f;
     for (int64_t ih = 0; ih < MMVQ_HC_PRE_HC; ++ih) {
         const float xv = x[i0 + ih*sx1 + it*sx2];
-        const float wv = 1.0f / (1.0f + expf(-__ldcg(gate + it*stride_col_gate + ih*n_embd + i0)));
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        const float gv = __ldcg(gate + it*stride_col_gate + ih*n_embd + i0);
+#else
+        // no __ldcg on HIP / MUSA: a volatile load also skips the non-coherent L1 for the other blocks' gate values
+        const float gv = *(const volatile float *) (gate + it*stride_col_gate + ih*n_embd + i0);
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        const float wv = 1.0f / (1.0f + expf(-gv));
         sum += xv * wv;
     }
     const float xi = scale * sum;
