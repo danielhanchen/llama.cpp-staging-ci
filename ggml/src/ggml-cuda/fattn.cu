@@ -197,7 +197,7 @@ static __global__ void flash_attn_sel_to_sparse_indices(
     int incl = count;
 #pragma unroll
     for (int off = 1; off < WARP_SIZE; off *= 2) {
-        const int v = __shfl_up_sync(0xFFFFFFFF, incl, off);
+        const int v = __shfl_up_sync(0xFFFFFFFF, incl, off, WARP_SIZE);
         if (lane >= off) {
             incl += v;
         }

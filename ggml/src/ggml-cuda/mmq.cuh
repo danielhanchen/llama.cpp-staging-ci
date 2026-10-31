@@ -1704,7 +1704,7 @@ static __global__ void mmq_moe_tile_prefix(const int32_t * __restrict__ expert_b
         int incl = f;
 #pragma unroll
         for (int off = 1; off < WARP_SIZE; off *= 2) {
-            const int v = __shfl_up_sync(0xFFFFFFFF, incl, off);
+            const int v = __shfl_up_sync(0xFFFFFFFF, incl, off, WARP_SIZE);
             incl += lane >= off ? v : 0;
         }
         if (lane == WARP_SIZE - 1) {
