@@ -158,6 +158,9 @@ int main() {
     ggml_backend_load_all();
     ggml_backend_t be = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
     if (be == nullptr) {
+        be = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr); // Strix Halo, unified memory
+    }
+    if (be == nullptr) {
         printf("test-moe-cache-tail-skip: no GPU backend, skipped\n");
         return 0;
     }

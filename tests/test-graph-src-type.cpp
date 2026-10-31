@@ -77,7 +77,7 @@ int main() {
     ggml_backend_t gpu = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t d = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_IGPU) { // IGPU: Strix Halo, unified memory
             gpu = ggml_backend_dev_init(d, nullptr);
             break;
         }
