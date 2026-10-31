@@ -167,6 +167,24 @@ static bool llama_verify_tag_env() {
     return value;
 }
 
+// k19-tpp: no verify tag while an MoE cache runs (LLAMA_SPEC_TPP_CACHED=1: tagged there too; LLAMA_SPEC_TPP_FORCE_CACHED=1, a test
+// hook: as if a cache ran), so a cached tier verifies as LLAMA_SPEC_TPP=0 does there
+static bool llama_tpp_cached_env() {
+    static const bool value = [] {
+        const char * env = getenv("LLAMA_SPEC_TPP_CACHED");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return value;
+}
+
+static bool llama_tpp_force_cached_env() {
+    static const bool value = [] {
+        const char * env = getenv("LLAMA_SPEC_TPP_FORCE_CACHED");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return value;
+}
+
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
@@ -5023,7 +5041,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         cparams.batch_invariant = exact_verify && ubatch.n_tokens > 1;
         cparams.exact_split     = cparams.batch_invariant ? llm_graph_exact_split(ubatch) : 0;
-        cparams.verify_tag      = llama_verify_tag_env() && cparams.verify && !cparams.batch_invariant && ubatch.n_tokens > 1 && !output_all;
+        cparams.verify_tag      = llama_verify_tag_env() && cparams.verify && !cparams.batch_invariant && ubatch.n_tokens > 1 && !output_all &&
+            (!(moe_cache_active() || llama_tpp_force_cached_env()) || llama_tpp_cached_env());
 
         // k19-tiny-ub: with the banks released every layer is built as a large batch (an output-only last layer would read the banks
         // through a host lookup)

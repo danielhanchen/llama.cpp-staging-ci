@@ -65,6 +65,33 @@ static common_speculative_output_limits server_output_limits(const common_params
     return result;
 }
 
+// k19-tpp: bytes of a GGUF file and its splits (NAME-0000k-of-0000n.gguf), 0 if unknown
+static uint64_t tpp_gguf_bytes(const std::string & path) {
+    std::error_code ec;
+    if (path.empty()) {
+        return 0;
+    }
+    int k = 0, n = 0;
+    const size_t at = path.rfind("-of-");
+    if (at != std::string::npos && at >= 6 && path.size() >= at + 4 + 5 + 5 &&
+            sscanf(path.c_str() + at - 5, "%5d-of-%5d.gguf", &k, &n) == 2 && n > 1) {
+        const std::string prefix = path.substr(0, at - 6);
+        uint64_t sum = 0;
+        for (int i = 1; i <= n; ++i) {
+            char sp[4096];
+            llama_split_path(sp, sizeof(sp), prefix.c_str(), i, n);
+            const auto b = std::filesystem::file_size(sp, ec);
+            if (ec) {
+                return 0;
+            }
+            sum += b;
+        }
+        return sum;
+    }
+    const auto b = std::filesystem::file_size(path, ec);
+    return ec ? 0 : (uint64_t) b;
+}
+
 static bool spec_replay_reverify() {
     static const bool v = getenv("LLAMA_SPEC_REPLAY_REVERIFY") != nullptr && atoi(getenv("LLAMA_SPEC_REPLAY_REVERIFY")) != 0;
     return v;
@@ -1587,11 +1614,38 @@ private:
                 cc_min = std::min(cc_min, cc);
             }
             const bool dev_ok = n_gpu > 0 && cc_min >= 800;
-            const bool on = e != nullptr ? atoi(e) != 0 : dev_ok;
+            // no wider window where the experts will not all fit on the devices: there the fit runs an MoE cache, whose residency a
+            // wider window moves, and sizing the outputs for 4 rows instead of 3 already takes from the cache (G4 fn4 16 GB, ktp_g4e: MoE
+            // cache 5528 vs 5538 MiB, text != base, 0.94-0.96 of base at 16k / 30k). Decided before the fit, from the GGUF bytes (target
+            // and drafter + 1.5 GiB) against the devices' free memory; the speculative side also turns the window off if a cache runs
+            // anyway. LLAMA_SPEC_TPP_CACHED=1: on there too
+            size_t dev_free = 0;
+            for (size_t i = 0; mtp_shape && i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    size_t f = 0, t = 0;
+                    ggml_backend_dev_memory(dev, &f, &t);
+                    dev_free += f;
+                }
+            }
+            const uint64_t need = mtp_shape ? tpp_gguf_bytes(params.model.path) + tpp_gguf_bytes(sp.draft.mparams.path) + (1536ull << 20) : 0;
+            // (no GPU: no MoE cache. LLAMA_SPEC_TPP_FORCE_CACHED=1, a test hook: as if the experts did not fit)
+            const char * ce = getenv("LLAMA_SPEC_TPP_CACHED");
+            const char * fe = getenv("LLAMA_SPEC_TPP_FORCE_CACHED");
+            // (experts placed on the host by hand, --cpu-moe / --n-cpu-moe / -ot, or a fixed --moe-cache-mib: a cache tier too)
+            const bool host_experts = !params.tensor_buft_overrides.empty() || (params.moe_cache_size > 0 && !params.moe_cache_auto);
+            const bool cache_expected = (fe != nullptr && atoi(fe) != 0) || (n_gpu > 0 && (host_experts || !(need > (1536ull << 20) && need <= dev_free)));
+            const bool fits_all = (ce != nullptr && atoi(ce) != 0) || !cache_expected;
+            // LLAMA_SPEC_TPP=1 forces past the device rule, not the MoE cache rule
+            const bool on = (e != nullptr ? atoi(e) != 0 : dev_ok) && fits_all;
             if (mtp_shape && on) {
                 sp.draft.n_floor = 2;
                 sp.draft.n_max   = 3;
                 SRV_INF("%s", "k19-tpp: MTP drafts 2, a 3rd where it pays (LLAMA_SPEC_TPP=0: off)\n");
+            } else if (mtp_shape && (e != nullptr ? atoi(e) != 0 : dev_ok)) {
+                SRV_INF("k19-tpp: off: 3-draft windows are off because the MoE cache is on (model + drafter %.0f MiB, %.0f MiB free on the GPUs%s%s); "
+                    "MTP windows of 2 drafts, as LLAMA_SPEC_TPP=0 (LLAMA_SPEC_TPP_CACHED=1: on)\n", need/1048576.0, dev_free/1048576.0,
+                    host_experts ? ", experts placed on the host" : "", fe != nullptr && atoi(fe) != 0 ? ", LLAMA_SPEC_TPP_FORCE_CACHED" : "");
             } else if (mtp_shape && e == nullptr) {
                 SRV_INF("k19-tpp: MTP stays at 2 drafts here (%d GPUs, lowest compute capability %d: not every GPU is NVIDIA Ampere or newer; "
                     "LLAMA_SPEC_TPP=1 forces the wider window)\n", n_gpu, n_gpu > 0 ? cc_min : -1);

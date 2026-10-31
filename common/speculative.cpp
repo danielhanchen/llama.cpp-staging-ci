@@ -1678,6 +1678,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             LOG_INF("%s: MTP window by expected tokens per ms (LLAMA_SPEC_COST=1), up to %d drafts\n", __func__, this->params.n_max);
         }
         if (tpp_floor > 0) {
+            // (LLAMA_SPEC_TPP_FORCE_CACHED=1, a test hook: as if an MoE cache ran)
+            const char * fe = getenv("LLAMA_SPEC_TPP_FORCE_CACHED");
+            const bool cached = (this->params.ctx_tgt != nullptr && llama_moe_cache_active(this->params.ctx_tgt)) || (fe != nullptr && atoi(fe) != 0);
+            const char * ce = getenv("LLAMA_SPEC_TPP_CACHED");
+            if (cached && !(ce != nullptr && atoi(ce) != 0)) {
+                // an MoE cache: the policy is off and the window is the floor's, as with LLAMA_SPEC_TPP=0 (a wider window reads more
+                // streamed experts and moves which ones stay resident; G4 fn4 16 GB, ktp_g4e: 0.94-0.96 of base at 16k / 30k)
+                tpp_floor = 0;
+                this->params.n_max = this->params.n_floor;
+                this->n_max = this->params.n_max;
+                cost_on = spec_cost;
+                LOG_INF("%s: k19-tpp: off: 3-draft windows are off because the MoE cache is on; MTP windows of %d drafts, as LLAMA_SPEC_TPP=0 "
+                    "(LLAMA_SPEC_TPP_CACHED=1: on)\n", __func__, this->params.n_max);
+            }
+        }
+        if (tpp_floor > 0) {
             const bool cached = this->params.ctx_tgt != nullptr && llama_moe_cache_active(this->params.ctx_tgt);
             tpp_cost.set_cached(cached);
             LOG_INF("%s: k19-tpp: MTP windows of %d drafts, %d where the expected tokens per ms pay for the wider window (LLAMA_SPEC_TPP=0: "
