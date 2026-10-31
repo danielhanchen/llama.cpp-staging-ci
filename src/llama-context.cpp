@@ -1723,6 +1723,47 @@ llama_context::disk_range_ref::~disk_range_ref() {
 // kdp: the drafter's pinned host copy, made at its first lend (not at load: G4 fn4 24 GB never lends and its unrequantized drafter's
 // copy was +2647 MiB RSS). It honours the host-RAM reserve of the pinned experts (llama_model_loader::pin_auto_budget: max(4 GiB,
 // 10% of MemTotal) left of the available RAM, cgroup limits included); no room, or the available RAM unknown: the lend is off (one WARN)
+bool llama_context::mtp_lend_warm() {
+    if (!llama_mtp_draft_lend_on() || !cparams.spec_draft || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || !moe_cache || !lm_enabled) {
+        return false;
+    }
+    static const size_t lend_free = (size_t) (getenv("LLAMA_MTP_DRAFT_LEND_FREE_MIB") ? std::max(0, atoi(getenv("LLAMA_MTP_DRAFT_LEND_FREE_MIB"))) : 6144) << 20;
+    static const bool lend_arena_env = getenv("LLAMA_MTP_DRAFT_LEND_ARENA") == nullptr || atoi(getenv("LLAMA_MTP_DRAFT_LEND_ARENA")) != 0;
+    const double frac  = moe_cache->cache_frac();
+    const size_t cache = frac > 0.0 ? (size_t) (frac*(double) llama_moe_cache::host_bytes(model)) : 0;
+    size_t free_min = SIZE_MAX;
+    for (auto & bk : backend_ptrs) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(bk);
+        if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            size_t fr = 0, tot = 0;
+            ggml_backend_dev_memory(dev, &fr, &tot);
+            const size_t held = lend_arena_env ? ggml_backend_sched_get_arena_size(sched.get(), bk) : 0;
+            free_min = std::min(free_min, fr + held + cache);
+        }
+    }
+    if (free_min == SIZE_MAX || free_min >= lend_free) {
+        return false;
+    }
+    std::vector<llama_context *> dfts;
+    {
+        std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
+        for (llama_context * c : llama_mtp_ctxs) {
+            if (c != this && &c->model != &model) {
+                dfts.push_back(c);
+            }
+        }
+    }
+    bool any = false;
+    for (llama_context * c : dfts) {
+        any |= c->mtp_lend_prepare();
+    }
+    if (any) {
+        LLAMA_LOG_INFO("%s: MTP drafter host copy made at load: %.2f MiB expected free in a prompt group (cache released, staging arena "
+            "held), below %.2f MiB (LLAMA_MTP_DRAFT_LEND_EAGER=0: at the first lend)\n", __func__, free_min/1048576.0, lend_free/1048576.0);
+    }
+    return any;
+}
+
 bool llama_context::mtp_lend_prepare() {
     llama_model & m = const_cast<llama_model &>(model);
     if (!m.weights_evictable()) {
@@ -11473,6 +11514,19 @@ int64_t llama_nextn_rows_wait(llama_context * ctx, int64_t n_rows) {
 
 void llama_set_nextn_hold(llama_context * ctx, void (*fn)(void *), void * user_data) {
     ctx->set_nextn_hold(fn, user_data);
+}
+
+// k19-np12c (LLAMA_MTP_DRAFT_LEND_EAGER=0 off): the pinned host copy a drafter needs before its first lend (llama_context::mtp_lend_prepare)
+// is made at load where the target's prompt groups are expected to borrow its weights (the lend gate in decode_layer_major: free memory
+// once the cache banks are released, with the held staging arena, below LLAMA_MTP_DRAFT_LEND_FREE_MIB), instead of on the first long
+// prompt. G4 Flash-Next UD-IQ4_XS 12 GB, Studio's -np 4 with the q3_k drafter: 186 ms of that prompt's TTFT (8k 1.882 vs 1.545 s without
+// a drafter). Where the gate is not expected to lend, nothing is copied (the RSS stays as before)
+bool llama_mtp_draft_lend_warm(llama_context * ctx) {
+    static const bool eager_env = getenv("LLAMA_MTP_DRAFT_LEND_EAGER") == nullptr || atoi(getenv("LLAMA_MTP_DRAFT_LEND_EAGER")) != 0;
+    if (ctx == nullptr || !eager_env) {
+        return false;
+    }
+    return ctx->mtp_lend_warm();
 }
 
 bool llama_mtp_draft_lend_active(const llama_context * ctx) {

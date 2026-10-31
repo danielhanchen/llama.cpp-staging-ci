@@ -2054,6 +2054,11 @@ private:
             return false;
         }
 
+        // k19-np12c: the drafter's host copy at load where the prompt groups are expected to borrow its weights (LLAMA_MTP_DRAFT_LEND_EAGER=0 off)
+        if (ctx_dft != nullptr) {
+            llama_mtp_draft_lend_warm(ctx_tgt);
+        }
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 

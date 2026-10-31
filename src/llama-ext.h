@@ -272,6 +272,8 @@ LLAMA_API bool llama_mtp_draft_weights_restore(struct llama_context * ctx_dft);
 // kdp: true where the target's last released layer-major group was below LLAMA_MTP_DRAFT_LEND_FREE_MIB free (it lends, or would but
 // for a drafter pass in flight): the server skips the drafter's pass over the early prompt batches only then
 LLAMA_API bool llama_mtp_draft_lend_active(const struct llama_context * ctx_tgt);
+// k19-np12c: makes the MTP drafter's pinned host copy now where the target's prompt groups are expected to borrow its weights (LLAMA_MTP_DRAFT_LEND_EAGER=0 off)
+LLAMA_API bool llama_mtp_draft_lend_warm(struct llama_context * ctx_tgt);
 // kdp: the drafter's weights are lent out now (a remap is due before its next pass)
 LLAMA_API bool llama_mtp_draft_weights_evicted(const struct llama_context * ctx_dft);
 // kdp: the outcome of a request whose drafter weights were remapped: ok resets the failure count, a failure (remap, or the drafter's pass

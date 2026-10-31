@@ -153,6 +153,7 @@ struct llama_context {
     int64_t nextn_rows_wait(int64_t n);
     bool    mtp_weights_restore(); // kdp: see llama_mtp_draft_weights_restore
     bool    mtp_lend_prepare();    // kdp: the host copy at the first lend (host-RAM checked); false: not lendable
+    bool    mtp_lend_warm();       // k19-np12c: that copy at load where a prompt group is expected to borrow the drafter's weights
     bool    mtp_lend_active = false; // kdp: the last released layer-major group found too little free memory (llama_mtp_draft_lend_active)
     float * nextn_rows_early();
 

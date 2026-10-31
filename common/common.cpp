@@ -1483,6 +1483,19 @@ static int64_t common_lm_batch_default(const common_params & params, bool * nodr
         }
         return 16384;
     }
+    // k19-np12c (LLAMA_MOE_LAYER_MAJOR_BATCH_LEND=0: 8192): beside a separate MTP drafter (-md, draft-mtp) whose device weights the target's
+    // prompt groups borrow (kdp, LLAMA_MTP_DRAFT_LEND) 16384 too: the server skips the drafter's pass over every batch before the prompt's
+    // last LLAMA_MTP_PROMPT_TAIL rows, so those groups hold neither its rows nor its pass, and a group whose lent allocation does not fit
+    // is still split (ggml sched lend guard). G4 Flash-Next UD-IQ4_XS 12 GB, Studio's -np 4 with the q3_k drafter: 30k ran as 4 groups of
+    // 4 ubatches (every host expert read 4 times), 9.573 s against 9.236 s with no drafter and groups of 8
+    static const bool lend_batch_env = getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_LEND") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_BATCH_LEND")) != 0;
+    const char * e_lend = getenv("LLAMA_MTP_DRAFT_LEND");
+    const bool   lend_on = e_lend == nullptr || atoi(e_lend) != 0;
+    const bool   dft_mtp = params.speculative.has_dft() && std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+        [](auto t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP; });
+    if (lend_batch_env && lend_on && dft_mtp) {
+        return 16384;
+    }
     // beside built-in MTP heads 16384 (LLAMA_MOE_LAYER_MAJOR_BATCH_MTP=0: 8192). It was opt-in: G4 k15g4q1 q4x 12 GB 16k TTFT -13% but
     // decode 8k / 16k -11 / -10%, RssAnon +95 MiB. k17 (on the scheduler trim, the input arena fit and the MTP state release): G4 k17lmm3 q4x
     // + MTP 12 GB, 3 launches: 16k / 30k TTFT 1.46 -> 1.34 / 2.74 -> 2.36 s, decode equal, md5 sets equal, end RssAnon 2446-2459 against
