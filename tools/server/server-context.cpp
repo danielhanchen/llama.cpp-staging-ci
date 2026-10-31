@@ -3236,6 +3236,17 @@ private:
 
         res->index = slot.task->index;
 
+        // k19-pf debug (LLAMA_MTP_KV_HASH=1): a hash of the drafter's whole sequence state (its K / V and indexer cells) at the end of
+        // the request, to compare the drafter's caches of two runs (LLAMA_MTP_PROMPT_KV_ONLY=0 / 1)
+        static const bool mtp_kv_hash = getenv("LLAMA_MTP_KV_HASH") != nullptr && atoi(getenv("LLAMA_MTP_KV_HASH")) != 0;
+        if (mtp_kv_hash && ctx_dft && spec_bg_join()) {
+            std::vector<uint8_t> st(llama_state_seq_get_size(ctx_dft, slot.id));
+            const size_t n_st = llama_state_seq_get_data(ctx_dft, st.data(), st.size(), slot.id);
+            uint64_t h = 1469598103934665603ull;
+            for (size_t i = 0; i < n_st; ++i) { h ^= st[i]; h *= 1099511628211ull; }
+            SLT_INF(slot, "mtp kv hash: %zu bytes %016llx\n", n_st, (unsigned long long) h);
+        }
+
         // keep copy of last generated text for debugging purposes
         if (slots_debug) {
             slot.debug_generated_text = slot.generated.text;

@@ -5,6 +5,7 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
@@ -572,6 +573,25 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // the draft memory has no recurrent layer, but its input still has to be allocated
     ggml_build_forward_expand(gf, inp_hyb->get_recr()->s_copy);
 
+    // k19-pf (LLAMA_MTP_PROMPT_KV_ONLY=0 off): a batch with no output row (the server's prompt passes and the catch-up after a verify,
+    // every row output=false) is only read later through the caches it writes: the block's K / V and, for a QSA block, the indexer
+    // keys and pooled keys. So the graph ends after those writes: no query, attention, output projection, FFN (512 Q8_0 experts) or
+    // head. The written rows come from the same ops on the same rows, so the cache bytes, drafts and output are those of the full
+    // block. Strata's MTP prompt pass (draft_kv) also stops at the K / V append
+    static const bool kv_only_env = getenv("LLAMA_MTP_PROMPT_KV_ONLY") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_KV_ONLY")) != 0;
+    // only on prompt-sized batches (LLAMA_MTP_PROMPT_KV_ONLY_MIN rows, default 64): there every product is its own MMQ / cuBLAS
+    // launch whose result depends on that product's shape alone, while the small catch-up batches use mat-vec kernels that fuse
+    // adjacent products of one input (k15-mm2)
+    static const int64_t kv_only_min = getenv("LLAMA_MTP_PROMPT_KV_ONLY_MIN") ? std::max(1, atoi(getenv("LLAMA_MTP_PROMPT_KV_ONLY_MIN"))) : 64;
+    kv_only = kv_only_env && n_outputs == 0 && n_tokens >= kv_only_min;
+    if (kv_only) {
+        static std::atomic<int> n_log { 0 };
+        if (n_log++ == 0) {
+            LLAMA_LOG_INFO("%s: MTP drafter batches of at least %lld rows with no output row compute the block's cache writes only (K / V, "
+                "indexer keys; LLAMA_MTP_PROMPT_KV_ONLY=0 off)\n", __func__, (long long) kv_only_min);
+        }
+    }
+
     // only a QSA MTP block reads the k-pool inputs: with compress ratio 0 (e.g. the MTP/ drafter of unsloth/Qwen3.8-Flash-Next-GGUF
     // before 766911a6) the block attends densely, and k-pool inputs that no op reads stay unallocated and abort in set_input
     llm_graph_input_kpool * inp_kpool = nullptr;
@@ -582,7 +602,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     }
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // (no output rows to select in a kv_only graph: its out_ids input would stay unallocated)
+    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
 
     ggml_tensor * h_norm = build_norm(ggml_reshape_3d(ctx0, h, n_embd, hc, n_tokens), layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
     cb(h_norm, "mtp_hnorm", il);
@@ -596,6 +617,12 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     ggml_tensor * inject = nullptr;
     ggml_tensor * cur = build_hc_mix(res_hc, layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, &inject, il);
+
+    if (kv_only) {
+        build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
+        return;
+    }
+
     cur    = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
     res_hc = build_hc_combine(res_hc, cur, inject, il);
 
@@ -668,7 +695,9 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, nullptr, new_pool_idxs, new_pool_rep,
+        // k19-pf: a kv_only graph (writes_only) has none of the four selection inputs
+        mctx->set_input_kpool(writes_only ? nullptr : pool_cells, writes_only ? nullptr : pool_idxs, writes_only ? nullptr : pool_mask,
+                              writes_only ? nullptr : tail_idxs, nullptr, new_pool_idxs, new_pool_rep,
                               ubatch, new_pool_pos);
     }
 
@@ -705,6 +734,7 @@ public:
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t kpool;
+    bool writes_only = false; // k19-pf: kv_only graph, only the new pools are filled (see graph_mtp)
     uint32_t n_new = 0; // padded to a stable bound, never below 1
     uint32_t n_sel = 0;
     uint32_t n_kv  = 0;
@@ -729,11 +759,16 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     ggml_set_input(inp->pool_mask);
     ggml_set_input(inp->tail_idxs);
 
-    // set_input fills them all, so keep them allocated even when no op reads them
-    ggml_build_forward_expand(gf, inp->pool_cells);
-    ggml_build_forward_expand(gf, inp->pool_idxs);
-    ggml_build_forward_expand(gf, inp->pool_mask);
-    ggml_build_forward_expand(gf, inp->tail_idxs);
+    // set_input fills them all, so keep them allocated even when no op reads them. k19-pf: a kv_only graph (only the scoring reads
+    // them) leaves them out and set_input does not fill them: kept in the graph with no reader, their memory was not theirs (the CPU
+    // backend handed it to the token ids; CPU test with a fake drafter)
+    inp->writes_only = kv_only;
+    if (!kv_only) {
+        ggml_build_forward_expand(gf, inp->pool_cells);
+        ggml_build_forward_expand(gf, inp->pool_idxs);
+        ggml_build_forward_expand(gf, inp->pool_mask);
+        ggml_build_forward_expand(gf, inp->tail_idxs);
+    }
 
     inp->n_kv  = mctx_idx->get_n_kv();
     inp->n_new = mctx_hyb->get_n_kpool_new();
@@ -776,8 +811,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // cache rows store raw key | pooled key: pooling precedes norm and rotation, so the raw key gets neither
     ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
     // k15-mm2: the indexer q product next to k's (one multi-matrix mat-vec), see build_qkvz
+    // (k19-pf: kv_only reads no query; q_raw then stays out of the graph, no op uses it)
     ggml_tensor * q_raw = build_lora_mm(model.layers[il].index_q_proj, cur);
-    if (proj_adjacent()) {
+    if (proj_adjacent() && !kv_only) {
         ggml_build_forward_expand(gf, k_raw);
         ggml_build_forward_expand(gf, q_raw);
     }
@@ -820,6 +856,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // scatter the fresh pooled keys into their rep rows, then gather all n_pool of them by cell:
     // the older pools come from the rows earlier ubatches wrote
     ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
+    if (kv_only) {
+        return nullptr; // k19-pf: the cache writes only (graph_mtp)
+    }
     ggml_tensor * pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);
     cb(pooled, "indexer_k", il);
@@ -975,6 +1014,52 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     return cur;
 }
 
+// k19-pf: the K / V half of build_layer_attn for a kv_only graph: the same ops on the same rows (k / v projections, k norm,
+// IMRoPE on k), then the cache writes of build_attn_qsa (QSA block) or build_attn (dense block)
+void llama_model_qwen4exp::graph::build_attn_kv_store(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor *             cur,
+        ggml_tensor *             inp_pos,
+        int *                     sections,
+        int                       il) {
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+
+    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+    cb(Kcur, "Kcur", il);
+
+    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    cb(Vcur, "Vcur", il);
+
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+    Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+    cb(Kcur, "Kcur_normed", il);
+
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+
+    Kcur = ggml_rope_multi(
+            ctx0, Kcur, inp_pos, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow
+            );
+    cb(Kcur, "Kcur", il);
+    cb(Vcur, "Vcur", il);
+
+    if (inp->self_k_rot) {
+        Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp->self_k_rot);
+    }
+    if (inp->self_v_rot) {
+        Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp->self_v_rot);
+    }
+
+    // as build_attn / build_attn_qsa: v, then k (rope fusion writes k into the cache)
+    ggml_build_forward_expand(gf, Vcur);
+    ggml_build_forward_expand(gf, Kcur);
+
+    const auto * mctx_cur = inp->mctx;
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, Kcur, inp->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, Vcur, inp->get_v_idxs(), il));
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         llm_graph_input_attn_kv * inp,
         const llama_memory_hybrid_idx_context * mctx_hyb,
@@ -990,6 +1075,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     const bool qsa = inp_kpool != nullptr && hparams.dsv4_compress_ratios[il] > 0;
 
     ggml_tensor * sel = qsa ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
+
+    // k19-pf: only the K / V rows (kv_only, see graph_mtp)
+    if (kv_only) {
+        build_attn_kv_store(inp, cur, inp_pos, sections, il);
+        return nullptr;
+    }
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]

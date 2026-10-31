@@ -2722,6 +2722,14 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int * sections,
                             int   il);
 
+        // k19-pf: the K / V projections and cache writes of build_layer_attn only (kv_only)
+        void build_attn_kv_store(
+        llm_graph_input_attn_kv * inp,
+                    ggml_tensor * cur,
+                    ggml_tensor * inp_pos,
+                            int * sections,
+                            int   il);
+
         // dense self-attention over the cells the QSA mask keeps
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
@@ -2744,6 +2752,10 @@ struct llama_model_qwen4exp : public llama_model_base {
             ggml_tensor * live_tail = nullptr;
             ggml_tensor * dump      = nullptr;
         } qsa_c;
+
+        // k19-pf: an MTP drafter batch with no output row only writes its caches (graph_mtp): build_layer_attn stores K / V and
+        // returns nullptr, build_qsa_sel writes the indexer keys and pooled keys and returns nullptr
+        bool kv_only = false;
 
         // QSA: the additive mask [n_kv, n_tokens] of the top blocks and the tail, kq_mask included
         ggml_tensor * build_qsa_sel(
