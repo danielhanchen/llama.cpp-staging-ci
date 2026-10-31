@@ -1038,7 +1038,7 @@ bool ggml_cuda_verify_graph_active() {
     return ggml_cuda_verify_graph_tls;
 }
 
-// k19-vrow2: GGML_CUDA_VERIFY_WIDE (a mask, default 3; 0 = off): what a verify window of 5..GGML_CUDA_VERIFY_WIDE_MAX (default 6) rows
+// k19-vrow2: GGML_CUDA_VERIFY_WIDE (a mask, default 0 = off; 3 = both): what a verify window of 5..GGML_CUDA_VERIFY_WIDE_MAX (default 6) rows
 // keeps from a 3-row one. 1: F32 weights stay on mmvf (and two F32 products over one activation stay one mmvf multi launch) instead of
 // MMF / cuBLAS; 2: dense mmvq products without fusion keep the 4 warps of 1..4 columns (the generic table halves them from 5). Not
 // bit-identical to a 5-row window without it (f32 summation order, KLD-gated); a row's sums then no longer depend on whether the window
@@ -1050,7 +1050,7 @@ int ggml_cuda_verify_wide_cols(const int cc, const int bit) {
 #else
     static const int mask = [] {
         const char * e = getenv("GGML_CUDA_VERIFY_WIDE");
-        return e != nullptr ? atoi(e) : 3;
+        return e != nullptr ? atoi(e) : 0; // off by default: reassociation-class, KLD-gated, not md5-exact
     }();
     static const int max_cols = [] {
         const char * e = getenv("GGML_CUDA_VERIFY_WIDE_MAX");
