@@ -681,7 +681,12 @@ struct case_k19_move : ctx_test {
 // k19 fuzz: random llama-server-like schedules (prompt chunks, 1-token steps, 2-3 token verify windows, rollbacks of 0..n-1 tokens of a
 // window) of several sequences decoded together, against a context that decodes one sequence per ubatch; every state after every step.
 // Covers several moved cells per ubatch, chains of swaps, a window whose cell is the destination of another, and rollbacks consumed by
-// a ubatch of other sequences
+// a ubatch of other sequences.
+// k19-rsbis: the attention runs without flash attention on F32 K / V, and the logits of every token are compared too. The CPU flash
+// attention accumulates an F16 V in F16 (ggml-cpu ops.cpp, VKQ16), so its result depends on the order of the cells, which differs
+// between the two contexts: kimi-k3 / glm5-next differed by up to 1.1e-3 of the state (bf16 or q8_0 V, or no flash attention: 4e-7),
+// with the same recurrent rows. The state bytes are compared only without SWA layers: a PARTIAL_ONLY save also holds the SWA cells,
+// in cell order, and the masked cells the cache did not reuse yet (lfm2: one more cell, out of the window of every next token)
 struct case_k19_fuzz : ctx_test {
     test_group group() const override { return TEST_GROUP_RS; }
     const char * name() const override { return "k19_fuzz"; }
@@ -700,6 +705,7 @@ struct case_k19_fuzz : ctx_test {
             for (uint32_t seed : { 1u, 2u, 3u, 4u }) {
                 ctx_opts opts;
                 opts.n_ctx = 4096; opts.n_batch = 64; opts.n_ubatch = 32; opts.n_seq_max = n_seqs; opts.n_rs_seq = 2; opts.kv_unified = 1;
+                opts.fa = LLAMA_FLASH_ATTN_TYPE_DISABLED; opts.type_k = GGML_TYPE_F32; opts.type_v = GGML_TYPE_F32;
                 llama_context_ptr ctx_m = mr.ctx(opts);
                 llama_context_ptr ctx_s = mr.ctx(opts);
                 if (!ctx_m || !ctx_s) {
@@ -747,12 +753,27 @@ struct case_k19_fuzz : ctx_test {
                         }
                     }
                     CTX_REQUIRE(llama_process(ctx_m.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "multi decode failed");
+                    int i_m = 0; // the first token of the span in the multi-sequence batch
                     for (const auto & sp : spans) {
                         common_batch b1(ctx_s.get());
                         for (llama_pos p = sp[1]; p < sp[2]; ++p) {
                             b1.add(gen_token(n_vocab, (llama_seq_id) sp[0], p), p, (llama_seq_id) sp[0], true);
                         }
                         CTX_REQUIRE(llama_process(ctx_s.get(), LLAMA_PROCESS_TYPE_DECODE, b1.get()) == 0, "serial decode failed");
+                        float l_max = 0.0f, la_max = 0.0f;
+                        for (int t = 0; t < (int) (sp[2] - sp[1]); ++t) {
+                            const float * l_m = llama_get_logits_ith(ctx_m.get(), i_m + t);
+                            const float * l_s = llama_get_logits_ith(ctx_s.get(), t);
+                            CTX_REQUIRE(l_m != nullptr && l_s != nullptr, "missing logits");
+                            for (int v = 0; v < n_vocab; ++v) {
+                                l_max  = std::max(l_max,  std::fabs(l_m[v] - l_s[v]));
+                                la_max = std::max(la_max, std::fabs(l_s[v]));
+                            }
+                        }
+                        CTX_REQUIRE(l_max <= 1e-3f*la_max + 1e-6f, "seed " + std::to_string(seed) + " seqs " + std::to_string(n_seqs) + " step " +
+                                std::to_string(step) + ": the logits of seq " + std::to_string(sp[0]) + " differ from one sequence per ubatch (max diff " +
+                                std::to_string(l_max) + " of " + std::to_string(la_max) + ")");
+                        i_m += (int) (sp[2] - sp[1]);
                         pos[sp[0]] = sp[2];
                         win[sp[0]] = (int) (sp[2] - sp[1]);
                     }
@@ -778,7 +799,7 @@ struct case_k19_fuzz : ctx_test {
                     // at the end only, so that windows stay pending across decodes)
                     const char * ec = getenv("K19_FUZZ_CMP_EVERY");
                     const int cmp_every = ec ? std::max(1, atoi(ec)) : 1;
-                    if ((step + 1) % cmp_every != 0 && step + 1 != n_steps) {
+                    if (((step + 1) % cmp_every != 0 && step + 1 != n_steps) || llama_model_n_swa(mr.model) > 0) {
                         continue;
                     }
                     for (uint32_t s = 0; s < n_seqs; ++s) {
