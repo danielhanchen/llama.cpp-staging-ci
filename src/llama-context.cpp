@@ -1946,6 +1946,9 @@ void llama_context::gf_res_epoch_bump(int line) {
 
 llama_context::~llama_context() {
     nextn_join();
+    if (state_ext_worker.joinable()) {
+        state_ext_worker.join();
+    }
     if (tiny_rel_ub > 0) {
         LLAMA_LOG_INFO("%s: MoE cache tiny-cache release (LLAMA_MOE_PREFILL_UB_TINY_RELEASE): %lld releases, %lld restores, %.1f ms restoring "
             "(%.1f ms each)\n", __func__, (long long) tiny_rel_n_enter, (long long) tiny_rel_n_leave, tiny_rel_ms,
@@ -9792,7 +9795,7 @@ void llama_context::state_async_init_backends() {
                 continue;
             }
 
-            state_async.push_back({ b, dev, event, nullptr });
+            state_async.push_back({ b, dev, event, nullptr, {} });
         }
     }
 }
@@ -9906,6 +9909,88 @@ size_t llama_context::state_async_reserve(llama_state_seq_flags flags) {
     }
 
     return total;
+}
+
+// k19-host30k (LLAMA_STATE_ASYNC_EXT=0: off): a whole-state save larger than the staging (the server's prompt-cache save of the previous
+// prompt at a request, or at idle) read the rows past the staging synchronously into fresh host memory: G4 Qwen3.8-Flash-Next UD-IQ4_XS
+// 24 / 32 GB, the 642 MiB save of the 16k prompt held the next (30k) request 175 ms before its first ubatch (and the 381 MiB save of
+// the 8k prompt held the 16k one 74 ms). Once a prompt is processed the server asks for staging that holds the state then, plus a
+// quarter and 64 MiB for the generation, and the pinning runs on a thread while the slot generates; the next save that fits reads every
+// row asynchronously (the same rows into the same destination). Nothing is freed while the context lives (cudaFreeHost would
+// synchronize the device under a running prompt): an extension is added after the staging. At most LLAMA_STATE_ASYNC_EXT_MAX_MIB
+// (2048) of staging in all, only while MemAvailable keeps max(4 GiB, 10% of MemTotal) after it, and one async backend only (one GPU)
+static bool state_async_ext_on() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_STATE_ASYNC_EXT");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+void llama_context::state_async_ext_take() {
+    if (!state_ext_worker.joinable() || !state_ext_done.load(std::memory_order_acquire)) {
+        return;
+    }
+    state_ext_worker.join();
+    if (state_ext_new && state_async.size() == 1) {
+        state_async[0].ext.push_back(std::move(state_ext_new));
+    } else {
+        LLAMA_LOG_WARN("%s: could not pin the staging extension for asynchronous state saves\n", __func__);
+    }
+    state_ext_new.reset();
+}
+
+void llama_context::state_async_ext_request(size_t need) {
+    static const size_t cap = (size_t) std::max(0, getenv("LLAMA_STATE_ASYNC_EXT_MAX_MIB") ? atoi(getenv("LLAMA_STATE_ASYNC_EXT_MAX_MIB")) : 2048) << 20;
+    if (!state_async_ext_on() || state_async_disabled() || need == 0 || cap == 0) {
+        return;
+    }
+    if (state_ext_worker.joinable()) {
+        if (!state_ext_done.load(std::memory_order_acquire)) {
+            return; // still pinning the last one
+        }
+        state_async_ext_take();
+    }
+    state_async_init_backends();
+    if (state_async.size() != 1) {
+        return;
+    }
+    auto & sa = state_async[0];
+    size_t have = sa.staging ? ggml_backend_buffer_get_size(sa.staging.get()) : 0;
+    for (const auto & b : sa.ext) {
+        have += ggml_backend_buffer_get_size(b.get());
+    }
+    // what the state needs, its row alignment and room for first-fit gaps (see state_get_async)
+    if (have >= need + need/16 + (4u << 20) || have >= cap) {
+        return;
+    }
+    const size_t want = std::min(cap, GGML_PAD(need + need/4 + (64u << 20), 2u << 20));
+    if (want <= have + (16u << 20)) {
+        return;
+    }
+    const size_t add = want - have;
+    const uint64_t avail = llama_sysmem::available();
+    const uint64_t total = llama_sysmem::total();
+    const uint64_t keep  = std::max<uint64_t>(4ull << 30, total / 10);
+    if (avail == 0 || avail < add + keep) {
+        static int n_log = 0;
+        if (n_log++ < 2) {
+            LLAMA_LOG_INFO("%s: no staging extension of %.2f MiB for asynchronous state saves: MemAvailable %.1f MiB, %.1f MiB kept free\n",
+                __func__, add/1048576.0, avail/1048576.0, keep/1048576.0);
+        }
+        return;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(sa.dev);
+    if (buft == nullptr) {
+        return;
+    }
+    LLAMA_LOG_INFO("%s: %s: pinning %.2f MiB more staging for asynchronous state saves on a thread (%.2f MiB in all) "
+        "(LLAMA_STATE_ASYNC_EXT=0 off)\n", __func__, ggml_backend_dev_name(sa.dev), add/1048576.0, want/1048576.0);
+    state_ext_done.store(false, std::memory_order_release);
+    state_ext_worker = std::thread([this, buft, add]() {
+        state_ext_new.reset(ggml_backend_buft_alloc_buffer(buft, add));
+        state_ext_done.store(true, std::memory_order_release);
+    });
 }
 
 // Read the state rows of an asynchronous save into dst without synchronizing the context.
@@ -10023,6 +10108,7 @@ bool llama_context::state_get_bounced(const std::vector<llama_state_write_info> 
 void llama_context::state_get_async(const std::vector<llama_state_write_info> & winfos, bool no_grow) {
     // the previous save may still be reading the staging buffers
     state_async_wait();
+    state_async_ext_take(); // k19-host30k: a staging extension pinned meanwhile
 
     const bool disabled = state_async_disabled();
 
@@ -10069,9 +10155,64 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
     std::vector<uint8_t> partial(state_async.size(), 0);
     std::vector<uint8_t> sync_row(winfos.size(), 0);
 
+    // k19-host30k: a save larger than the staging, with a staging extension (state_async_ext_request): the rows go first fit into the
+    // staging and the extension's buffers; rows that fit nowhere are read synchronously where the save may not grow, as the partial path
+    std::vector<uint8_t>   ext_b(state_async.size(), 0);
+    std::vector<uint8_t *> ext_at(winfos.size(), nullptr);
+    size_t n_ext_sync = 0;
     for (size_t b = 0; ok && b < state_async.size(); ++b) {
         auto & sa = state_async[b];
-        if (need[b] == 0 || (sa.staging && ggml_backend_buffer_get_size(sa.staging.get()) >= need[b])) {
+        if (need[b] == 0 || sa.ext.empty() || (sa.staging && ggml_backend_buffer_get_size(sa.staging.get()) >= need[b])) {
+            continue;
+        }
+        std::vector<std::pair<uint8_t *, size_t>> room; // free space per region: base of the free part, bytes left
+        if (sa.staging) {
+            room.push_back({ (uint8_t *) ggml_backend_buffer_get_base(sa.staging.get()), ggml_backend_buffer_get_size(sa.staging.get()) });
+        }
+        for (const auto & e : sa.ext) {
+            room.push_back({ (uint8_t *) ggml_backend_buffer_get_base(e.get()), ggml_backend_buffer_get_size(e.get()) });
+        }
+        size_t n_miss = 0;
+        for (size_t i = 0; i < winfos.size(); ++i) {
+            if (owner[i] != (int) b) {
+                continue;
+            }
+            const size_t pad = GGML_PAD(winfos[i].size, 64);
+            for (auto & r : room) {
+                if (r.second >= pad) {
+                    ext_at[i]  = r.first;
+                    r.first   += pad;
+                    r.second  -= pad;
+                    break;
+                }
+            }
+            n_miss += ext_at[i] == nullptr;
+        }
+        if (n_miss > 0 && !(no_grow && partial_env)) {
+            for (size_t i = 0; i < winfos.size(); ++i) {
+                if (owner[i] == (int) b) {
+                    ext_at[i] = nullptr; // grown below as before
+                }
+            }
+            continue;
+        }
+        for (size_t i = 0; i < winfos.size(); ++i) {
+            if (owner[i] == (int) b && ext_at[i] == nullptr) {
+                sync_row[i] = 1;
+            }
+        }
+        ext_b[b] = 1;
+        n_ext_sync += n_miss;
+        static int n_log = 0;
+        if (n_log++ < 16) {
+            LLAMA_LOG_INFO("%s: state save of %.2f MiB read asynchronously through the staging and %zu extension(s), %zu rows synchronously "
+                "(LLAMA_STATE_ASYNC_EXT)\n", __func__, need[b]/1048576.0, sa.ext.size(), n_miss);
+        }
+    }
+
+    for (size_t b = 0; ok && b < state_async.size(); ++b) {
+        auto & sa = state_async[b];
+        if (need[b] == 0 || ext_b[b] || (sa.staging && ggml_backend_buffer_get_size(sa.staging.get()) >= need[b])) {
             continue;
         }
         if (no_grow && partial_env && sa.staging) {
@@ -10105,7 +10246,7 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
     }
 
     // partial: the rows in order while they fit in the staging, the rest synchronous
-    size_t n_sync = 0;
+    size_t n_sync = n_ext_sync;
     for (size_t b = 0; b < state_async.size(); ++b) {
         if (!partial[b]) {
             continue;
@@ -10167,7 +10308,7 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
             continue;
         }
         auto & sa = state_async[owner[i]];
-        uint8_t * stage = (uint8_t *) ggml_backend_buffer_get_base(sa.staging.get()) + offs[i];
+        uint8_t * stage = ext_b[owner[i]] ? ext_at[i] : (uint8_t *) ggml_backend_buffer_get_base(sa.staging.get()) + offs[i];
 
         ggml_backend_tensor_get_async(side ? side : sa.backend, winfos[i].tensor, stage, winfos[i].offset, winfos[i].size);
 
@@ -10191,7 +10332,7 @@ void llama_context::state_get_async(const std::vector<llama_state_write_info> & 
     // partial: the rows past the staging, synchronously (their backend's stream first: the reads use another stream)
     if (n_sync > 0) {
         for (size_t b = 0; b < state_async.size(); ++b) {
-            if (partial[b]) {
+            if (partial[b] || ext_b[b]) {
                 ggml_backend_synchronize(state_async[b].backend);
             }
         }
@@ -11529,6 +11670,16 @@ bool llama_mtp_draft_lend_warm(llama_context * ctx) {
     return ctx->mtp_lend_warm();
 }
 
+void llama_context::set_refill_pace(bool on) {
+    if (moe_cache) {
+        moe_cache->set_refill_pace(on);
+    }
+}
+
+void llama_set_refill_pace(llama_context * ctx, bool on) {
+    ctx->set_refill_pace(on);
+}
+
 bool llama_mtp_draft_lend_active(const llama_context * ctx) {
     return ctx != nullptr && ctx->mtp_lend_active;
 }
@@ -11867,6 +12018,10 @@ size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, ll
 
 size_t llama_state_seq_reserve_async(llama_context * ctx, llama_state_seq_flags flags) {
     return ctx->state_async_reserve(flags);
+}
+
+void llama_state_seq_async_ext_reserve(llama_context * ctx, size_t bytes) {
+    ctx->state_async_ext_request(bytes);
 }
 
 size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {

@@ -652,6 +652,10 @@ struct llama_moe_cache::impl {
     std::vector<int32_t> seed_ids;
     std::vector<std::vector<int32_t>> refill; // [n_layer] experts of the last seed waiting for the lent slots to come back
     bool  refill_enabled = true;
+    // k19-host30k: pace the refill's uploads (set_refill_pace): at most two layers of them queued at a time, events per device
+    bool  refill_pace = false;
+    std::vector<std::array<ggml_backend_event_t, 2>> pace_ev;
+    uint64_t n_refill_paced = 0;
     // the routing of the end of a prompt that did not seed (see set_refill_counts): the slots that come back after it get its most used experts
     std::vector<std::vector<int32_t>> refill_counts; // [n_layer]
     bool   refill_routed   = false; // LLAMA_MOE_CACHE_REFILL_ROUTED=1 (opt-in): else the slots get back the experts they held before they were lent
@@ -2499,6 +2503,17 @@ struct llama_moe_cache::impl {
         // the weight store is destroyed first (llama_context): its destructor completes the reads ahead into the RAM slots, which are
         // still allocated then; wstore is not used here
         single_stop_all();
+        for (auto & evs : pace_ev) {
+            for (auto * ev : evs) {
+                if (ev != nullptr) {
+                    ggml_backend_event_free(ev);
+                }
+            }
+        }
+        if (n_refill_paced > 0) {
+            LLAMA_LOG_INFO("%s: MoE cache: %" PRIu64 " refills of lent slots paced beside an MTP drafter pass (LLAMA_MOE_CACHE_REFILL_PACE)\n",
+                __func__, n_refill_paced);
+        }
         profile_save();
         ua_shutdown();
         log_stats();
@@ -7057,6 +7072,29 @@ struct llama_moe_cache::impl {
             return;
         }
         n_refill_routed += routed ? 1 : 0;
+        // k19-host30k (LLAMA_MOE_CACHE_REFILL_PACE=0: off): beside an MTP drafter's prompt pass on a worker (set_refill_pace) the refill's
+        // uploads are queued at most two layers ahead of the copy engine, the host waiting for the layer before the last. Queued at once,
+        // the whole refill (G4 Qwen3.8-Flash-Next UD-IQ4_XS 32 GB, 5.1 GB after a 30k prompt) sat in the copy engine's queue ahead of the
+        // drafter's input uploads, which it serves in submission order: the drafter's pass waited ~100 ms with no kernel running, and the
+        // first token waits for that pass. The same copies in the same order on the same stream; only when the host queues them changes
+        ggml_backend_event_t * pev = nullptr;
+        if (refill_pace && refill_enabled) {
+            if (pace_ev.size() < devices.size()) {
+                pace_ev.resize(devices.size(), { nullptr, nullptr });
+            }
+            auto & evs = pace_ev[g.id];
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            for (auto & ev : evs) {
+                if (ev == nullptr && dev != nullptr) {
+                    ev = ggml_backend_event_new(dev);
+                }
+            }
+            if (evs[0] != nullptr && evs[1] != nullptr) {
+                pev = evs.data();
+                n_refill_paced++;
+            }
+        }
+        int32_t n_paced = 0;
         // at most the n slots that came back are filled, so the refill never evicts an expert that stayed cached
         size_t budget = (size_t) n;
         for (int32_t il : g.layers) {
@@ -7078,6 +7116,13 @@ struct llama_moe_cache::impl {
                 }
                 stats_refill.bytes += upload_fills(backend, il, fills, nullptr);
                 stats_refill.misses += fills.size();
+                if (pev != nullptr) {
+                    ggml_backend_event_record(pev[n_paced & 1], backend);
+                    if (n_paced > 0) {
+                        ggml_backend_event_synchronize(pev[(n_paced - 1) & 1]);
+                    }
+                    n_paced++;
+                }
             }
             ids_il.clear();
         }
@@ -9241,6 +9286,11 @@ void llama_moe_cache::restore() {
 
 void llama_moe_cache::set_refill_routed_once(bool on) {
     pimpl->refill_routed_once = on;
+}
+
+void llama_moe_cache::set_refill_pace(bool on) {
+    static const bool env_on = getenv("LLAMA_MOE_CACHE_REFILL_PACE") == nullptr || atoi(getenv("LLAMA_MOE_CACHE_REFILL_PACE")) != 0;
+    pimpl->refill_pace = on && env_on;
 }
 
 bool llama_moe_cache::released() const {
