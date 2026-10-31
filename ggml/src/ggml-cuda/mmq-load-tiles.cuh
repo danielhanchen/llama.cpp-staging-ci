@@ -1376,8 +1376,17 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
-template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq3_s(
+// k19-mmq-pipe: the IQ3_S grid can be read from a copy in shared memory (mmq_iq3s_grid_shared, filled by the pipe kernel)
+static __shared__ uint32_t mmq_iq3s_grid_shared[512];
+
+template <ggml_type type, int J, bool fallback, bool grid_smem = false> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq3_s(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    const uint32_t * grid;
+    if constexpr (grid_smem) {
+        grid = mmq_iq3s_grid_shared;
+    } else {
+        grid = iq3s_grid;
+    }
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / warp_size;
     constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8);
@@ -1417,8 +1426,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #pragma unroll
         for (int l = 0; l < QR3_S; ++l) {
             const int2 grid_pos = make_int2(
-                iq3s_grid[qs[2*l+0] | ((qh << (8 - 2*l)) & 0x100)],
-                iq3s_grid[qs[2*l+1] | ((qh << (7 - 2*l)) & 0x100)]);
+                grid[qs[2*l+0] | ((qh << (8 - 2*l)) & 0x100)],
+                grid[qs[2*l+1] | ((qh << (7 - 2*l)) & 0x100)]);
 
             const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
             const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
