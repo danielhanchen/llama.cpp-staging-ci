@@ -684,7 +684,9 @@ static int64_t mul_mat_vec_f_block_size(const int64_t ncols, const int device) {
 }
 
 bool ggml_cuda_mul_mat_vec_f_multi_ok(const ggml_type type, const int64_t ncols, const int64_t ncols_dst, const int device) {
-    return (type == GGML_TYPE_F32 || type == GGML_TYPE_BF16) && ncols % 2 == 0 && ncols_dst >= 1 && ncols_dst <= 4 &&
+    // k19-vrow2: F32 at 5..6 columns in a verify window (GGML_CUDA_VERIFY_WIDE bit 1), where mmvf takes them (one launch for both)
+    const int max_cols = ncols_dst <= 4 ? 4 : type == GGML_TYPE_F32 ? ggml_cuda_verify_wide_cols(ggml_cuda_info().devices[device].cc, 1) : 0;
+    return (type == GGML_TYPE_F32 || type == GGML_TYPE_BF16) && ncols % 2 == 0 && ncols_dst >= 1 && ncols_dst <= std::min(max_cols, 6) &&
         ggml_cuda_info().devices[device].warp_size == 32 && mul_mat_vec_f_block_size(ncols, device) == 256;
 }
 
@@ -703,6 +705,8 @@ static void mul_mat_vec_f_multi_launch(const ggml_cuda_mm_fusion_args_device & f
         MMVF_MULTI_LAUNCH(2)
         MMVF_MULTI_LAUNCH(3)
         MMVF_MULTI_LAUNCH(4)
+        MMVF_MULTI_LAUNCH(5)
+        MMVF_MULTI_LAUNCH(6)
         default: GGML_ABORT("fatal error");
     }
 #undef MMVF_MULTI_LAUNCH
@@ -1034,6 +1038,37 @@ bool ggml_cuda_verify_graph_active() {
     return ggml_cuda_verify_graph_tls;
 }
 
+// k19-vrow2: GGML_CUDA_VERIFY_WIDE (a mask, default 3; 0 = off): what a verify window of 5..GGML_CUDA_VERIFY_WIDE_MAX (default 6) rows
+// keeps from a 3-row one. 1: F32 weights stay on mmvf (and two F32 products over one activation stay one mmvf multi launch) instead of
+// MMF / cuBLAS; 2: dense mmvq products without fusion keep the 4 warps of 1..4 columns (the generic table halves them from 5). Not
+// bit-identical to a 5-row window without it (f32 summation order, KLD-gated); a row's sums then no longer depend on whether the window
+// had 3 or 6 rows for these products. NVIDIA Ampere and newer only, CUDA builds only: HIP / MUSA and older GPUs keep their kernels
+int ggml_cuda_verify_wide_cols(const int cc, const int bit) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(cc, bit);
+    return 0;
+#else
+    static const int mask = [] {
+        const char * e = getenv("GGML_CUDA_VERIFY_WIDE");
+        return e != nullptr ? atoi(e) : 3;
+    }();
+    static const int max_cols = [] {
+        const char * e = getenv("GGML_CUDA_VERIFY_WIDE_MAX");
+        return std::max(4, std::min(e != nullptr ? atoi(e) : 6, MMVF_MAX_BATCH_SIZE));
+    }();
+    if (!ggml_cuda_verify_graph_tls || (mask & bit) == 0 || !GGML_CUDA_CC_IS_NVIDIA(cc) || !ampere_mma_available(cc)) {
+        return 0;
+    }
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        GGML_LOG_INFO("%s: k19-vrow2: verify windows of 5..%d rows keep the kernels of a 3-row one (GGML_CUDA_VERIFY_WIDE=%d: 1 F32 mmvf, "
+            "2 mmvq warps; 0 off)\n", __func__, max_cols, mask);
+    }
+    return max_cols;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
     if (src0_ne[0] % 2 != 0) {
         return false;
@@ -1064,7 +1099,8 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                         }
                         return true;
                     }
-                    return ne11 <= 3;
+                    // k19-vrow2: 5..6 rows too (GGML_CUDA_VERIFY_WIDE bit 1)
+                    return ne11 <= 3 || ne11 <= ggml_cuda_verify_wide_cols(cc, 1);
                 }
                 if (cc >= GGML_CUDA_CC_TURING) {
                     return ne11 <= 4;

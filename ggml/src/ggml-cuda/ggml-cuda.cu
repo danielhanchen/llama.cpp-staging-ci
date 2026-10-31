@@ -6524,8 +6524,8 @@ static bool ggml_cuda_mmvf_multi_candidate(const ggml_tensor * node) {
     const ggml_tensor * src1 = node->src[1];
     return (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16) && src0->op == GGML_OP_NONE && src0->view_src == nullptr &&
         ggml_is_contiguous(src0) && ggml_is_matrix(src0) && src0->ne[0] < 4096 && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) &&
-        src1->ne[2] == 1 && src1->ne[3] == 1 && src1->ne[1] >= 1 && src1->ne[1] <= 4 && !ggml_is_empty(node) && ggml_is_contiguous(node) &&
-        !ggml_cuda_side_mv_run(node);
+        src1->ne[2] == 1 && src1->ne[3] == 1 && src1->ne[1] >= 1 && src1->ne[1] <= 6 && !ggml_is_empty(node) && ggml_is_contiguous(node) &&
+        !ggml_cuda_side_mv_run(node); // k19-vrow2: 5..6 columns only where ggml_cuda_mul_mat_vec_f_multi_ok takes them (GGML_CUDA_VERIFY_WIDE)
 }
 
 // node goes to ggml_cuda_mul_mat_vec_f in ggml_cuda_mul_mat (same dispatch, see there)
