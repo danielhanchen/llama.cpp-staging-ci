@@ -26,6 +26,8 @@
 #include <set>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <string>
 #include <stdexcept>
 #include <tuple>
 #include <unordered_map>
@@ -5517,6 +5519,119 @@ struct llama_moe_cache::impl {
     bool (*cm_cal_abort)(void *) = nullptr;
     void * cm_cal_abort_data     = nullptr;
     bool   cm_cal_aborted        = false;
+
+    // k19-determinism (LLAMA_MOE_CPU_MISS_CAL_PERSIST, default 1): the start-up calibration is kept in a small file per device, host
+    // threads and expert form (LLAMA_MOE_CPU_MISS_CAL_DIR, else $LLAMA_CACHE, else $XDG_CACHE_HOME/llama.cpp, else ~/.cache/llama.cpp), and
+    // every later launch reads it at the same point instead of timing the host again; the re-calibration after warm-up then changes nothing.
+    // A per-launch sample decided some batch sizes on a noisy timing: G4 Qwen3.6-35B-A3B UD-Q4_K_XL + MTP 12 GB, host split 30.7 vs 34.7 us
+    // put single token batches on the host path in one launch and not in the other (7931 vs 7388 host batches, other text at temperature 0
+    // in 1 of 3 launches). The first launch decides from the numbers it writes, so all launches on a machine decide alike. =0: timed in
+    // every launch (the live rule, with the re-calibration); =2: timed again and the file rewritten (after a hardware or load change)
+    static int cm_persist_mode() {
+        static const int mode = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_CAL_PERSIST");
+            return e != nullptr ? atoi(e) : 1;
+        }();
+        return mode;
+    }
+    bool cm_from_file = false; // this launch decides from a persisted (or just written) calibration
+
+    static std::string cm_cal_dir() {
+        auto env = [](const char * n) { const char * e = getenv(n); return std::string(e != nullptr ? e : ""); };
+        std::string d = env("LLAMA_MOE_CPU_MISS_CAL_DIR");
+        if (d.empty()) {
+            d = env("LLAMA_CACHE");
+        }
+#if defined(_WIN32)
+        if (d.empty() && !env("LOCALAPPDATA").empty()) {
+            d = env("LOCALAPPDATA") + "\\llama.cpp";
+        }
+#else
+        if (d.empty() && !env("XDG_CACHE_HOME").empty()) {
+            d = env("XDG_CACHE_HOME") + "/llama.cpp";
+        }
+        if (d.empty() && !env("HOME").empty()) {
+            d = env("HOME") + "/.cache/llama.cpp";
+        }
+#endif
+        return d;
+    }
+
+    // what the timings depend on: the device, the host threads and CPU count, the cache (main / MTP) and the expert form
+    std::string cm_cal_key(const group & g, const layer & l) const {
+        std::string k = "moe-cpu-miss-cal v1";
+        ggml_backend_dev_t dev = devices[g.id].backend != nullptr ? ggml_backend_get_device(devices[g.id].backend) : nullptr;
+        k += std::string("|dev=") + (dev != nullptr ? ggml_backend_dev_description(dev) : "?");
+        k += "|threads=" + std::to_string(single_threads) + "|ncpu=" + std::to_string(std::thread::hardware_concurrency());
+        k += std::string("|cache=") + (tag[0] != '\0' ? "mtp" : "main");
+        k += "|n_expert=" + std::to_string(g.ref[0]->ne[2]) + "|n_used=" + std::to_string(n_expert_used);
+        k += "|bytes=" + std::to_string(g.expert_bytes);
+        for (const ggml_tensor * w : l.experts) {
+            k += std::string("|") + ggml_type_name(w->type) + ":" + std::to_string(w->ne[0]) + "x" + std::to_string(w->ne[1]);
+        }
+        for (char & c : k) {
+            c = c == '\n' || c == '\r' ? ' ' : c;
+        }
+        return k;
+    }
+
+    static std::string cm_cal_path(const std::string & dir, const std::string & key) {
+        uint64_t h = 1469598103934665603ull;
+        for (unsigned char c : key) {
+            h ^= c;
+            h *= 1099511628211ull;
+        }
+        char name[64];
+        snprintf(name, sizeof(name), "moe_cpu_miss_cal_%016llx.txt", (unsigned long long) h);
+#if defined(_WIN32)
+        return dir + "\\" + name;
+#else
+        return dir + "/" + name;
+#endif
+    }
+
+    // the file: the key on the first line, then t1 dt tup split (us)
+    static bool cm_cal_read(const std::string & path, const std::string & key, double v[4]) {
+        FILE * f = fopen(path.c_str(), "r");
+        if (f == nullptr) {
+            return false;
+        }
+        std::string line;
+        char buf[4096];
+        bool ok = fgets(buf, sizeof(buf), f) != nullptr;
+        if (ok) {
+            line = buf;
+            while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+                line.pop_back();
+            }
+            ok = line == key && fscanf(f, "%lf %lf %lf %lf", &v[0], &v[1], &v[2], &v[3]) == 4 &&
+                 v[0] > 0.0 && v[1] >= 0.0 && v[2] > 0.0 && v[3] >= 0.0;
+        }
+        fclose(f);
+        return ok;
+    }
+
+    static bool cm_cal_write(const std::string & dir, const std::string & path, const std::string & key, const double v[4]) {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        const std::string tmp = path + ".tmp" + std::to_string((long long) ggml_time_us());
+        FILE * f = fopen(tmp.c_str(), "w");
+        if (f == nullptr) {
+            return false;
+        }
+        const bool ok = fprintf(f, "%s\n%.17g %.17g %.17g %.17g\n", key.c_str(), v[0], v[1], v[2], v[3]) > 0;
+        if (fclose(f) != 0 || !ok) {
+            std::remove(tmp.c_str());
+            return false;
+        }
+        std::filesystem::rename(tmp, path, ec);
+        if (ec) {
+            std::remove(tmp.c_str());
+            return false;
+        }
+        return true;
+    }
+
     void cm_calibrate(ggml_backend_t backend_cpu) {
         cm_cal_aborted = false;
         const bool hybrid_probe_was = hybrid_probe;
@@ -5553,6 +5668,32 @@ struct llama_moe_cache::impl {
         const int     kb       = (int) std::min<int64_t>(4*ka, n_expert);
         const int     T        = 8;
         const int     n_rep    = 11;
+
+        // k19-determinism: a persisted calibration replaces the timing (start-up), and the re-calibration changes nothing
+        const int persist = cm_persist_mode();
+        if (recal && cm_from_file) {
+            return;
+        }
+        std::string cal_dir, cal_key, cal_path;
+        if (!recal && persist != 0) {
+            cal_dir = cm_cal_dir();
+            if (!cal_dir.empty()) {
+                cal_key  = cm_cal_key(g, l);
+                cal_path = cm_cal_path(cal_dir, cal_key);
+                double v[4];
+                if (persist == 1 && cm_cal_read(cal_path, cal_key, v)) {
+                    cm_t1    = v[0];
+                    cm_dt    = v[1];
+                    cm_tup   = v[2];
+                    cm_split = v[3];
+                    cm_from_file = true;
+                    LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: calibration read from %s (LLAMA_MOE_CPU_MISS_CAL_PERSIST=0: timed in every launch)\n",
+                        tag, cal_path.c_str());
+                    cm_calibrate_finish(false, g, t_start);
+                    return;
+                }
+            }
+        }
 
         ggml_init_params params = {
             /*.mem_size   =*/ (8 + 6*l.experts.size())*ggml_tensor_overhead() + 3*ggml_graph_overhead_custom(16, false),
@@ -5715,7 +5856,21 @@ struct llama_moe_cache::impl {
             cm_dt    = std::max(0.0, (d_t - d_a)/((double) ka*(T - 1)));
             cm_tup   = std::max(median(tu)/ka, 0.05);
             cm_split = std::max(0.0, d_a - ka*cm_t1) + 2.0*median(trt);
+            if (!cal_path.empty()) {
+                const double v[4] = { cm_t1, cm_dt, cm_tup, cm_split };
+                // decided from these numbers in this launch too, so it matches every later one
+                cm_from_file = cm_cal_write(cal_dir, cal_path, cal_key, v);
+                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: calibration %s %s (LLAMA_MOE_CPU_MISS_CAL_PERSIST=0: timed in every launch)\n", tag,
+                    cm_from_file ? "written to" : "could not be written to", cal_path.c_str());
+            }
         }
+        GGML_UNUSED(attempt);
+        cm_calibrate_finish(recal, g, t_start);
+    }
+
+    // the decisions from the host / upload timings (cm_t1, cm_dt, cm_tup, cm_split), measured or read from the calibration file
+    void cm_calibrate_finish(bool recal, const group & g, int64_t t_start) {
+        const int64_t n_expert = g.ref[0]->ne[2];
         {
             int64_t n_embd = 0;
             for (const ggml_tensor * t : g.ref) {
@@ -5723,7 +5878,6 @@ struct llama_moe_cache::impl {
             }
             cm_act = 2.0*n_embd*sizeof(float)/std::max(1e-3, g.expert_bytes/cm_tup);
         }
-        GGML_UNUSED(attempt);
 
         cm_share.assign(cm_max + 1, 1.0f);
         // cm_stable: a re-calibration keeps the decisions it decides again from (the hysteresis of the sizes that are on, the frozen sizes)
@@ -5765,7 +5919,7 @@ struct llama_moe_cache::impl {
             return;
         }
         cm_cal = true;
-        cm_recal_wait = cm_recal_after;
+        cm_recal_wait = cm_from_file ? -1 : cm_recal_after; // k19-determinism: no re-calibration from a persisted one
         // the first prompt and tokens run before any measured miss rate: a prior from the cached share c of the experts, (1 - c)^4
         // (decode miss rates measured on a G4: Qwen3.6-35B-A3B UD-Q4_K_XL c = 0.17 -> 0.29-0.47, c = 0.39 -> 0.16; gpt-oss-20b Q2_K
         // c = 0.54 -> 0.007), the first measured window corrects it without the hysteresis
