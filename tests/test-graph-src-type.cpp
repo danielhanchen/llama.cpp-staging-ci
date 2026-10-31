@@ -9,7 +9,6 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
 
 #include <cmath>
 #include <cstdio>
@@ -87,7 +86,13 @@ int main() {
         printf("no GPU backend: skipped\n");
         return 0;
     }
-    ggml_backend_t cpu = ggml_backend_cpu_init();
+    // through the registry, so the test links with GGML_BACKEND_DL (the release recipe) too
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (cpu == nullptr) {
+        printf("no CPU backend: skipped\n");
+        ggml_backend_free(gpu);
+        return 0;
+    }
 
     const ggml_type pairs[2][2] = { { GGML_TYPE_F16, GGML_TYPE_BF16 }, { GGML_TYPE_BF16, GGML_TYPE_F16 } };
     std::mt19937 rng(1234);

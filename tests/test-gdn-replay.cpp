@@ -9,7 +9,6 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
 
 #include <cmath>
 #include <cstdio>
@@ -225,8 +224,14 @@ int main() {
     };
     int fails = 0;
     for (ggml_backend_t be : bes) {
-        if (ggml_backend_is_cpu(be)) {
-            ggml_backend_cpu_set_n_threads(be, 8);
+        // through the registry, so the test links with GGML_BACKEND_DL (the release recipe) too
+        ggml_backend_dev_t dev = ggml_backend_get_device(be);
+        if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            auto set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
+                    "ggml_backend_set_n_threads");
+            if (set_n_threads != nullptr) {
+                set_n_threads(be, 8);
+            }
         }
         for (size_t i = 0; i < cfgs.size(); ++i) {
             fails += test_one(be, cfgs[i], 1234 + (uint32_t) i);

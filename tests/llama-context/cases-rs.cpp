@@ -19,6 +19,12 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+// POSIX environment helpers for the MSVC CRT (getenv sees _putenv_s; an empty value removes the variable), as test-sched-lend.cpp
+static int setenv(const char * name, const char * value, int /*overwrite*/) { return _putenv_s(name, value); }
+static int unsetenv(const char * name) { return _putenv_s(name, ""); }
+#endif
+
 // roll back multiple sequences, then replay them in a single batch whose per-seq token count
 // exceeds n_ubatch: each seq's replay spans several ubatches while its rollback restore is
 // still pending. Compared against a reference context that never advanced past the rollback
