@@ -20,6 +20,7 @@
 #include "speculative.h"
 #include "spec-governor.h"
 #include "server-spec-auto.h"
+#include "server-tpp.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -1601,11 +1602,24 @@ private:
             // +3% decode, but chat text varied launch to launch); AMD and other GPUs report no capability. LLAMA_SPEC_TPP=1 forces it on
             const bool mtp_shape = mtp_only && sp.draft.n_max == 2 && sp.draft.n_min == 0 && sp.draft.p_min <= 0.0f && !sp.draft.probabilistic &&
                 params.n_parallel == 1;
+            // the GPUs the fit will use (server-tpp.h: --device's list, else every GPU; with --split-mode none the main GPU only)
+            std::vector<ggml_backend_dev_t> all_devs;
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                all_devs.push_back(ggml_backend_dev_get(i));
+            }
+            std::vector<ggml_backend_dev_t> req_devs;
+            for (ggml_backend_dev_t dev : params.devices) {
+                if (dev != nullptr) {
+                    req_devs.push_back(dev);
+                }
+            }
+            const std::vector<ggml_backend_dev_t> gpus = tpp_fit_gpus(req_devs, all_devs,
+                [](ggml_backend_dev_t d) { return ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU; },
+                params.split_mode == LLAMA_SPLIT_MODE_NONE, params.main_gpu);
             int n_gpu = 0, cc_min = INT_MAX;
-            for (size_t i = 0; mtp_shape && i < ggml_backend_dev_count(); ++i) {
-                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-                if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
-                    continue;
+            for (ggml_backend_dev_t dev : gpus) {
+                if (!mtp_shape) {
+                    break;
                 }
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
                 auto cc_fn = reg ? (int (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_compute_capability") : nullptr;
@@ -1620,20 +1634,20 @@ private:
             // and drafter + 1.5 GiB) against the devices' free memory; the speculative side also turns the window off if a cache runs
             // anyway. LLAMA_SPEC_TPP_CACHED=1: on there too
             size_t dev_free = 0;
-            for (size_t i = 0; mtp_shape && i < ggml_backend_dev_count(); ++i) {
-                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                    size_t f = 0, t = 0;
-                    ggml_backend_dev_memory(dev, &f, &t);
-                    dev_free += f;
+            for (ggml_backend_dev_t dev : gpus) {
+                if (!mtp_shape) {
+                    break;
                 }
+                size_t f = 0, t = 0;
+                ggml_backend_dev_memory(dev, &f, &t);
+                dev_free += f;
             }
             const uint64_t need = mtp_shape ? tpp_gguf_bytes(params.model.path) + tpp_gguf_bytes(sp.draft.mparams.path) + (1536ull << 20) : 0;
             // (no GPU: no MoE cache. LLAMA_SPEC_TPP_FORCE_CACHED=1, a test hook: as if the experts did not fit)
             const char * ce = getenv("LLAMA_SPEC_TPP_CACHED");
             const char * fe = getenv("LLAMA_SPEC_TPP_FORCE_CACHED");
             // (experts placed on the host by hand, --cpu-moe / --n-cpu-moe / -ot, or a fixed --moe-cache-mib: a cache tier too)
-            const bool host_experts = !params.tensor_buft_overrides.empty() || (params.moe_cache_size > 0 && !params.moe_cache_auto);
+            const bool host_experts = tpp_host_experts(params.tensor_buft_overrides, params.moe_cache_size, params.moe_cache_auto);
             const bool cache_expected = (fe != nullptr && atoi(fe) != 0) || (n_gpu > 0 && (host_experts || !(need > (1536ull << 20) && need <= dev_free)));
             const bool fits_all = (ce != nullptr && atoi(ce) != 0) || !cache_expected;
             // LLAMA_SPEC_TPP=1 forces past the device rule, not the MoE cache rule
@@ -1641,9 +1655,12 @@ private:
             if (mtp_shape && on) {
                 sp.draft.n_floor = 2;
                 sp.draft.n_max   = 3;
-                SRV_INF("%s", "k19-tpp: MTP drafts 2, a 3rd where it pays (LLAMA_SPEC_TPP=0: off)\n");
+                SRV_INF("k19-tpp: MTP drafts 2, a 3rd where it pays (need %.0f MiB for model + drafter, %.0f MiB free on %d GPUs%s; "
+                    "LLAMA_SPEC_TPP=0: off)\n", need/1048576.0, dev_free/1048576.0, n_gpu, n_gpu == 0 ? ", no GPU: forced" : "");
+            } else if (mtp_shape && n_gpu == 0 && e == nullptr) {
+                SRV_INF("%s", "k19-tpp: off: no GPU (LLAMA_SPEC_TPP=1: on)\n");
             } else if (mtp_shape && (e != nullptr ? atoi(e) != 0 : dev_ok)) {
-                SRV_INF("k19-tpp: off: 3-draft windows are off because the MoE cache is on (model + drafter %.0f MiB, %.0f MiB free on the GPUs%s%s); "
+                SRV_INF("k19-tpp: off: 3-draft windows are off because the MoE cache is on (need %.0f MiB for model + drafter, %.0f MiB free on the GPUs%s%s); "
                     "MTP windows of 2 drafts, as LLAMA_SPEC_TPP=0 (LLAMA_SPEC_TPP_CACHED=1: on)\n", need/1048576.0, dev_free/1048576.0,
                     host_experts ? ", experts placed on the host" : "", fe != nullptr && atoi(fe) != 0 ? ", LLAMA_SPEC_TPP_FORCE_CACHED" : "");
             } else if (mtp_shape && e == nullptr) {
