@@ -5690,9 +5690,14 @@ private:
             bool skip = false;
             // only where the target's groups lend (llama_mtp_draft_lend_active): elsewhere the skip would cost acceptance for nothing
             // (G4 fn4 16 GB, depth 4 without the lend: 30k e2e +0.9%)
-            if (!dft_off && lend_env && tail_env > 0 && ok && ret == 0 && slots.size() == 1 && has_prompt && ctx_dft && seg_breaks.empty() &&
+            // k19-np12b (LLAMA_MTP_PROMPT_TAIL_MULTI=0: -np 1 only, as before): with several slots, the skip for the slot that is the only one
+            // processing (spec_bg_slot). At -np 4 the target's groups lent the drafter's weights but its pass still ran over every early batch,
+            // with a weight remap before each: G4 Qwen3.8-Flash-Next 12 GB -np 4 with the q3_k drafter admitted, 30k TTFT 7.35 vs 6.27 s
+            static const bool skip_multi_env = getenv("LLAMA_MTP_PROMPT_TAIL_MULTI") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_TAIL_MULTI")) != 0;
+            const server_slot * skip_sl = slots.size() == 1 ? &slots[0] : (skip_multi_env ? spec_bg_slot() : nullptr);
+            if (!dft_off && lend_env && tail_env > 0 && ok && ret == 0 && skip_sl != nullptr && has_prompt && ctx_dft && seg_breaks.empty() &&
                     spec_seg_a == 0 && off + batch.view.size() == batch.size() && llama_mtp_draft_lend_active(ctx_tgt)) {
-                const server_slot & sl = slots[0];
+                const server_slot & sl = *skip_sl;
                 const int32_t n_rest_s = sl.task ? sl.task->n_tokens() - sl.prompt.n_tokens() : 0;
                 skip = sl.state == SLOT_STATE_PROCESSING_PROMPT && sl.task && !sl.task->tokens.has_mtmd && sl.spec_i_batch.empty() &&
                     !(sl.i_batch >= off && sl.i_batch < off + batch.view.size()) && n_rest_s >= tail_env;

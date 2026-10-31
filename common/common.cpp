@@ -2491,12 +2491,20 @@ static bool common_fit_draft_on_cpu(
     if (const char * e = getenv("LLAMA_FIT_DRAFT_REQUANT_MAX_VERIFY_RATIO")) {
         v_max = std::max(0.0, atof(e));
     }
-    int64_t rq_min_tok = v_ratio >= 0.0 && v_ratio <= v_max ? 1 : min_tok;
+    // k19-np12b (LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT_MULTI, default 0.75; 1 = as before): with several slots (llama-server -np > 1, Studio's
+    // -np 4 --kv-unified) the floor is lower. Their replay rows and compute take 545 MiB of the 12 GB fit of Qwen3.8-Flash-Next UD-IQ4_XS:
+    // its q3_k MTP drafter leaves the experts of 0.8 tokens per layer there (1.3 at -np 1) and was refused, chat 3.375 s vs 2.700 s
+    // admitted (G4 k19sr). LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT (fractional) sets the floor for every slot count
+    double rq_min_tok = v_ratio >= 0.0 && v_ratio <= v_max ? 1.0 : (double) min_tok;
+    if (rq_min_tok == 1.0 && params.n_parallel > 1) {
+        const char * em = getenv("LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT_MULTI");
+        rq_min_tok = em != nullptr ? std::max(0.0, atof(em)) : 0.75;
+    }
     if (const char * e = getenv("LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT")) {
-        rq_min_tok = std::max(0, atoi(e));
+        rq_min_tok = std::max(0.0, atof(e));
     }
     double rq_tok = -1.0, rq_dft = 0.0;
-    if (!gpu && !rq_off && !rq_set && rq_min_tok > 0 && host > 0.0 && (needs_target == nullptr || !*needs_target)) {
+    if (!gpu && !rq_off && !rq_set && rq_min_tok > 0.0 && host > 0.0 && (needs_target == nullptr || !*needs_target)) {
         std::vector<llama_model_kv_override> kvo;
         if (mparams_dft.kv_overrides != nullptr) {
             for (const llama_model_kv_override * p = mparams_dft.kv_overrides; p->key[0] != 0; ++p) {
@@ -2531,7 +2539,7 @@ static bool common_fit_draft_on_cpu(
             const bool   lm_rq   = left_rq < common_lm_hybrid_frac()*host || left_rq > common_moe_hybrid_max_frac()*host;
             const double host_layers = std::min<double>((double) sbt.n_layer, host/((double) sbt.sum*(double) std::max<int64_t>(sbt.n_expert, 1)) + 0.5);
             rq_tok = left_rq/((double) sbt.sum*(double) sbt.n_used*std::max(host_layers, 1.0));
-            if (lm_rq && rq_tok >= (double) rq_min_tok) {
+            if (lm_rq && rq_tok >= rq_min_tok) {
                 gpu = true;
                 common_set_env("LLAMA_DRAFT_REQUANT", "q3_k");
                 common_set_env("LLAMA_DRAFT_REQUANT_OUTPUT", "q4_k");
@@ -2549,9 +2557,9 @@ static bool common_fit_draft_on_cpu(
     }
     if (rq_tok >= 0.0) {
         LOG_INF("%s: draft requantized at load (q3_k FFN / experts, LLAMA_DRAFT_REQUANT_FALLBACK where q3_k blocks do not divide the rows, q4_k output): %.0f MiB of device memory, the cache it leaves holds the experts "
-            "of %.1f tokens per layer -> %s (at least %d, LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT: verify window cost %.2fx a token, %s %.2f "
+            "of %.1f tokens per layer -> %s (at least %.2f, LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT(_MULTI): verify window cost %.2fx a token, %s %.2f "
             "LLAMA_FIT_DRAFT_REQUANT_MAX_VERIFY_RATIO; LLAMA_DRAFT_REQUANT=off disables)\n", __func__,
-            rq_dft/MiB, rq_tok, gpu ? "draft model on the GPU, requantized" : "refused", (int) rq_min_tok, v_ratio,
+            rq_dft/MiB, rq_tok, gpu ? "draft model on the GPU, requantized" : "refused", rq_min_tok, v_ratio,
             v_ratio >= 0.0 && v_ratio <= v_max ? "at most" : "over", v_max);
     } else if (!gpu && rq_off) {
         LOG_INF("%s: draft refused at its file's types; requantization off (LLAMA_DRAFT_REQUANT=off)\n", __func__);
