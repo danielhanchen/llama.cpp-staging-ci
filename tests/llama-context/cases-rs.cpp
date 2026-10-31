@@ -686,7 +686,11 @@ struct case_k19_move : ctx_test {
 // attention accumulates an F16 V in F16 (ggml-cpu ops.cpp, VKQ16), so its result depends on the order of the cells, which differs
 // between the two contexts: kimi-k3 / glm5-next differed by up to 1.1e-3 of the state (bf16 or q8_0 V, or no flash attention: 4e-7),
 // with the same recurrent rows. The state bytes are compared only without SWA layers: a PARTIAL_ONLY save also holds the SWA cells,
-// in cell order, and the masked cells the cache did not reuse yet (lfm2: one more cell, out of the window of every next token)
+// in cell order, and the masked cells the cache did not reuse yet (lfm2: one more cell, out of the window of every next token).
+// k19-rsbis: with SWA layers each sequence has its own KV stream here (kv_unified = 0). In a unified SWA cache a later ubatch of
+// another sequence can take a cell that only the tokens of a verify window masked, and the rollback of that window cannot bring it
+// back, so the logits after the rollback depend on the placement (a limitation of the unified SWA cache with partial rollbacks;
+// case_swa_prepare covers the purge inside one decode, which was a bug)
 struct case_k19_fuzz : ctx_test {
     test_group group() const override { return TEST_GROUP_RS; }
     const char * name() const override { return "k19_fuzz"; }
@@ -706,6 +710,9 @@ struct case_k19_fuzz : ctx_test {
                 ctx_opts opts;
                 opts.n_ctx = 4096; opts.n_batch = 64; opts.n_ubatch = 32; opts.n_seq_max = n_seqs; opts.n_rs_seq = 2; opts.kv_unified = 1;
                 opts.fa = LLAMA_FLASH_ATTN_TYPE_DISABLED; opts.type_k = GGML_TYPE_F32; opts.type_v = GGML_TYPE_F32;
+                if (llama_model_n_swa(mr.model) > 0) {
+                    opts.kv_unified = 0;
+                }
                 llama_context_ptr ctx_m = mr.ctx(opts);
                 llama_context_ptr ctx_s = mr.ctx(opts);
                 if (!ctx_m || !ctx_s) {
@@ -833,6 +840,105 @@ struct case_k19_fuzz : ctx_test {
     }
 };
 
+// k19-rsbis: the SWA purge inside one decode. llama_kv_cache::prepare() places every ubatch of a decode ahead and puts the cells
+// back; the purge of a ubatch (the positions of a sequence below a masked cell it reuses) also removed cells outside its slot, and
+// those stayed removed, so an earlier ubatch of the same decode ran without cells still in its window. A k19_fuzz schedule (seed 4,
+// 4 sequences, steps 0..8 of lfm2): at the last decode seq 0 was cleared and restarts beside seq 2, its second ubatch reuses the cell
+// of seq 2 at pos 7 and purged pos 0..6, and seq 2's tokens 36 / 37 of the first ubatch lost pos 5 / 6 (logits off by 3e-4 .. 3e-3;
+// LLAMA_KV_PREPARE_PURGE_RESTORE=0). Against one sequence per ubatch, SWA models only, the SWA cache at its default size
+struct case_swa_prepare : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+    const char * name() const override { return "swa_prepare"; }
+    const char * description() const override { return "an SWA purge of a later ubatch does not remove cells an earlier ubatch of the decode reads"; }
+    std::string skip_reason(model_run & mr) const override {
+        if (llama_model_n_swa(mr.model) == 0) {
+            return "no SWA layers";
+        }
+        if (arch_reserves_single_seq(mr.model)) {
+            return "multi-seq graphs";
+        }
+        return ctx_test::skip_reason(mr);
+    }
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+        // decodes ("seq:p0-p1,..."), partial removals ("rmS:p") and clears ("clrS"), in order
+        static const char * sched[] = {
+            "3:0-6,1:0-7,2:0-10,0:0-10", "2:10-16,1:7-13,0:10-12", "0:12-16,1:13-16,3:6-9", "rm3:8",
+            "0:16-20,2:16-19,3:8-17,1:16-19", "rm2:17", "rm1:17", "1:17-19,3:17-21,2:17-23", "rm1:18",
+            "3:21-24,0:20-21,1:18-21", "rm3:23", "3:23-24,0:21-30,2:23-27", "1:21-24,2:27-36", "rm1:22", "clr0",
+            "2:36-39,0:0-8",
+        };
+        ctx_opts opts;
+        opts.n_ctx = 4096; opts.n_batch = 64; opts.n_ubatch = 32; opts.n_seq_max = 4; opts.n_rs_seq = 2; opts.kv_unified = 1;
+        opts.fa = LLAMA_FLASH_ATTN_TYPE_DISABLED; opts.type_k = GGML_TYPE_F32; opts.type_v = GGML_TYPE_F32;
+        llama_context_ptr ctx_m = mr.ctx(opts);
+        llama_context_ptr ctx_s = mr.ctx(opts);
+        if (!ctx_m || !ctx_s) {
+            return case_result::fail();
+        }
+        float l_max = 0.0f, la_max = 0.0f;
+        for (const char * st : sched) {
+            int sq = 0, p = 0;
+            if (sscanf(st, "rm%d:%d", &sq, &p) == 2) {
+                CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx_m.get()), sq, p, -1) &&
+                            llama_memory_seq_rm(llama_get_memory(ctx_s.get()), sq, p, -1), std::string("rollback refused: ") + st);
+                continue;
+            }
+            if (sscanf(st, "clr%d", &sq) == 1) {
+                CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx_m.get()), sq, 0, -1) &&
+                            llama_memory_seq_rm(llama_get_memory(ctx_s.get()), sq, 0, -1), "clear failed");
+                continue;
+            }
+            std::vector<std::array<int, 3>> spans;
+            for (const char * c = st; *c; ) {
+                int a, b, e, n = 0;
+                if (sscanf(c, "%d:%d-%d%n", &a, &b, &e, &n) != 3) {
+                    return case_result::fail();
+                }
+                spans.push_back({ a, b, e });
+                c += n;
+                if (*c == ',') {
+                    ++c;
+                }
+            }
+            common_batch batch(ctx_m.get());
+            for (const auto & sp : spans) {
+                for (int q = sp[1]; q < sp[2]; ++q) {
+                    batch.add(gen_token(n_vocab, sp[0], q), q, sp[0], true);
+                }
+            }
+            CTX_REQUIRE(llama_process(ctx_m.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "multi decode failed");
+            int i_m = 0;
+            for (const auto & sp : spans) {
+                common_batch b1(ctx_s.get());
+                for (int q = sp[1]; q < sp[2]; ++q) {
+                    b1.add(gen_token(n_vocab, sp[0], q), q, sp[0], true);
+                }
+                CTX_REQUIRE(llama_process(ctx_s.get(), LLAMA_PROCESS_TYPE_DECODE, b1.get()) == 0, "serial decode failed");
+                for (int t = 0; t < sp[2] - sp[1]; ++t) {
+                    const float * l_m = llama_get_logits_ith(ctx_m.get(), i_m + t);
+                    const float * l_s = llama_get_logits_ith(ctx_s.get(), t);
+                    CTX_REQUIRE(l_m != nullptr && l_s != nullptr, "missing logits");
+                    float d = 0.0f;
+                    for (int v = 0; v < n_vocab; ++v) {
+                        d      = std::max(d,      std::fabs(l_m[v] - l_s[v]));
+                        la_max = std::max(la_max, std::fabs(l_s[v]));
+                    }
+                    l_max = std::max(l_max, d);
+                    // F32 K / V without flash attention: the two contexts differ by ~1e-7 (the order of the cells)
+                    CTX_REQUIRE(d <= 1e-5f*la_max + 1e-6f, std::string(st) + ": the logits of seq " + std::to_string(sp[0]) + " at pos " +
+                            std::to_string(sp[1] + t) + " differ from one sequence per ubatch (max diff " + std::to_string(d) + " of " +
+                            std::to_string(la_max) + ")");
+                }
+                i_m += sp[2] - sp[1];
+            }
+        }
+        TLOG_INF("%s: logits match one sequence per ubatch (max diff %g of %g)\n", __func__, (double) l_max, (double) la_max);
+        return case_result::pass();
+    }
+};
+
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
@@ -842,6 +948,7 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     cases.push_back(std::make_unique<case_replay_overlap>());
     cases.push_back(std::make_unique<case_k19_move>());
     cases.push_back(std::make_unique<case_k19_fuzz>());
+    cases.push_back(std::make_unique<case_swa_prepare>());
 
     return cases;
 }
