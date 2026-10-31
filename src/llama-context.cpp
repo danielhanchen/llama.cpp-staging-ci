@@ -9914,8 +9914,8 @@ size_t llama_context::state_async_reserve(llama_state_seq_flags flags) {
 // of the 8k prompt held the 16k one 74-133 ms). The server asks at load for staging that holds a whole-sequence save at most (the
 // device bytes of the memory's buffers); it is pinned then and added after the staging, and every save that fits reads its rows
 // asynchronously (the same rows into the same destination). Pinned on a thread while a slot generated instead, cudaMallocHost cost that
-// decode 5-17% (k19hx_g4). At most LLAMA_STATE_ASYNC_EXT_MAX_MIB (2048) of staging in all, only while MemAvailable keeps
-// max(4 GiB, 10% of MemTotal) after it, one async backend only (one GPU); kept with the context
+// decode 5-17% (k19hx_g4). At most LLAMA_STATE_ASYNC_EXT_MAX_MIB (2048) of staging in all, only while free memory (MemFree, so no
+// page cache is evicted for it) keeps max(4 GiB, 10% of MemTotal) after it, one async backend only (one GPU); kept with the context
 static bool state_async_ext_on() {
     static const bool on = [] {
         const char * e = getenv("LLAMA_STATE_ASYNC_EXT");
@@ -9953,11 +9953,28 @@ void llama_context::state_async_ext_request(size_t need) {
         return;
     }
     const size_t add = want - have;
-    const uint64_t avail = llama_sysmem::available();
+    // free memory, not MemAvailable: MemAvailable counts the page cache, and pinning into it would evict cached model pages (a 31-32 GB
+    // host reading its weights through the page cache); the cgroup limit caps it as for the other pinned buffers
+    uint64_t avail = llama_sysmem::available();
+#if defined(__linux__)
+    {
+        std::ifstream f("/proc/meminfo");
+        std::string key, unit;
+        uint64_t kb = 0, mem_free = 0;
+        while (f >> key >> kb) {
+            std::getline(f, unit);
+            if (key == "MemFree:") {
+                mem_free = kb*1024;
+                break;
+            }
+        }
+        avail = std::min<uint64_t>(avail, mem_free);
+    }
+#endif
     const uint64_t keep  = std::max<uint64_t>(4ull << 30, llama_sysmem::total() / 10);
     if (avail == 0 || avail < add + keep) {
-        LLAMA_LOG_INFO("%s: no staging extension of %.2f MiB for asynchronous state saves: MemAvailable %.1f MiB, %.1f MiB kept free\n",
-            __func__, add/1048576.0, avail/1048576.0, keep/1048576.0);
+        LLAMA_LOG_INFO("%s: no staging extension of %.2f MiB for asynchronous state saves: %.1f MiB free (MemFree, MemAvailable, cgroup), "
+            "%.1f MiB kept free\n", __func__, add/1048576.0, avail/1048576.0, keep/1048576.0);
         return;
     }
     ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(sa.dev);
