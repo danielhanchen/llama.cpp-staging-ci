@@ -1284,8 +1284,9 @@ struct mmvq_moe_wdec<GGML_TYPE_IQ4_NL, true> {
 // Every (token, slot, row) value is bitwise mul_mat_vec_q_moe's: the same lane runs the same vec_dot_q_cuda sums over the same
 // K blocks in the same order (mmvq_moe_wdec), the same warp_reduce_sum and the same epilogue; only which warp computes a row changes.
 // Grid: (ceil(nrows_x / (c_rpw*c_nwarps)), nchannels_dst (slots), ncols_dst (tokens)); block (warp_size, c_nwarps), warp y owns c_rpw
-// rows. NVIDIA only (ballots on a 32 lane warp); no shared expert (mul_mat_vec_q_moe_group_launch falls back)
-template <ggml_type type, int c_rpw, int c_nwarps, bool c_dec, bool has_fusion>
+// rows and takes c_group entries of its expert per pass over K (more: further passes over K, the weights then come from L1 / L2).
+// NVIDIA only (ballots on a 32 lane warp); no shared expert
+template <ggml_type type, int c_rpw, int c_nwarps, int c_group, bool c_dec, bool has_fusion>
 __launch_bounds__(c_nwarps*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe_group(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
@@ -1308,7 +1309,6 @@ static __global__ void mul_mat_vec_q_moe_group(
     constexpr int qi        = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr       = get_vdr_mmvq(type);
     constexpr int warp_size = 32;
-    constexpr int c_group   = MMVQ_MAX_BATCH_SIZE;  // entries of one expert per pass over K (more: further passes)
 
     bool use_gate = false;
     const void  * vgate      = nullptr;
@@ -1627,29 +1627,34 @@ static void mul_mat_vec_q_moe_launch(
     }
 }
 
-// k19-vrow: GGML_CUDA_MMVQ_MOE_GROUP (default 1; 0 = mul_mat_vec_q_moe): the multi-token MUL_MAT_ID of the types below runs
-// mul_mat_vec_q_moe_group, bitwise the same values with each expert's rows read and decoded once per launch.
-// GGML_CUDA_MMVQ_MOE_GROUP_CFG=rpw,nwarps,dec (microbench only) picks another of the instantiated shapes
+// k19-vrow: GGML_CUDA_MMVQ_MOE_GROUP (default 1; 0 = mul_mat_vec_q_moe everywhere): a bit mask of the multi-token IQ3_S / IQ4_NL
+// MUL_MAT_IDs that run mul_mat_vec_q_moe_group instead, bitwise the same values: 1 = with a fused gate (gate / up + GLU), 2 = the
+// others (down). Flash-Next shapes on G4, random weights, real-like routing (1.85x top-k distinct experts at 3 tokens), us per layer
+// of gate / up + down (scripts/k19vr, plans/k19_vrow.md): 3 tokens 49.6 -> 47.0, 5 tokens 69.9 -> 66.2, 6 tokens 82.9 -> 76.5 with
+// bit 1 and the shape below; the grouped down is slower at every shape (its base kernel is 40 registers, all lanes busy on L2 hits),
+// and without shared experts across tokens the grouped gate / up is 2-4% slower.
+// GGML_CUDA_MMVQ_MOE_GROUP_CFG=rpw,nwarps,dec,group (microbench builds, GGML_CUDA_MMVQ_MOE_GROUP_BENCH) picks another shape
 struct mmvq_moe_group_cfg {
-    int  rpw    = 2;
-    int  nwarps = 4;
+    int  rpw    = 1;   // rows per warp
+    int  nwarps = 4;   // warps per block
     bool dec    = true;
+    int  group  = 2;   // entries per pass over K (registers: 2 keeps the gate / up kernel near mul_mat_vec_q_moe's); 0 = the token count
 };
 
 static const mmvq_moe_group_cfg & mmvq_moe_group_config() {
     static const mmvq_moe_group_cfg cfg = [] {
         mmvq_moe_group_cfg c;
         const char * e = getenv("GGML_CUDA_MMVQ_MOE_GROUP_CFG");
-        int rpw = 0, nw = 0, dec = 1;
-        if (e != nullptr && sscanf(e, "%d,%d,%d", &rpw, &nw, &dec) >= 2) {
-            c.rpw = rpw; c.nwarps = nw; c.dec = dec != 0;
+        int rpw = 0, nw = 0, dec = 1, group = 0;
+        if (e != nullptr && sscanf(e, "%d,%d,%d,%d", &rpw, &nw, &dec, &group) >= 2) {
+            c.rpw = rpw; c.nwarps = nw; c.dec = dec != 0; c.group = group;
         }
         return c;
     }();
     return cfg;
 }
 
-template <ggml_type type, int c_rpw, int c_nwarps, bool c_dec>
+template <ggml_type type, int c_rpw, int c_nwarps, int c_group, bool c_dec>
 static void mul_mat_vec_q_moe_group_launch_cfg(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
@@ -1664,11 +1669,11 @@ static void mul_mat_vec_q_moe_group_launch_cfg(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
     if (has_fusion) {
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe_group<type, c_rpw, c_nwarps, c_dec, true>, launch_params,
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe_group<type, c_rpw, c_nwarps, c_group, c_dec, true>, launch_params,
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride);
     } else {
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe_group<type, c_rpw, c_nwarps, c_dec, false>, launch_params,
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe_group<type, c_rpw, c_nwarps, c_group, c_dec, false>, launch_params,
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride);
     }
@@ -1687,9 +1692,10 @@ static bool mul_mat_vec_q_moe_group_launch(
         stride_channel_x, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
     return false;
 #else
-    static const bool on = [] {
+    // bit 1: products with a fused gate (gate / up + GLU), bit 2: the others (down)
+    static const int on = [] {
         const char * e = getenv("GGML_CUDA_MMVQ_MOE_GROUP");
-        return e == nullptr || atoi(e) != 0;
+        return e == nullptr ? 1 : atoi(e);
     }();
     if constexpr (!(type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL)) {
         GGML_UNUSED_VARS(vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
@@ -1697,31 +1703,39 @@ static bool mul_mat_vec_q_moe_group_launch(
         return false;
     } else {
         const mmvq_moe_group_cfg & cfg = mmvq_moe_group_config();
-        if (!on || warp_size != 32 || fusion.shared_up != nullptr || (int64_t) nchannels_dst*ncols_dst > 64 || nrows_x % cfg.rpw != 0) {
+        const bool fused = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                           fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+        if (!(on & (fused ? 1 : 2)) || warp_size != 32 || fusion.shared_up != nullptr || (int64_t) nchannels_dst*ncols_dst > 64 || nrows_x % cfg.rpw != 0) {
             return false;
         }
-#define MMVQ_MOE_GROUP_CFG(R, W, D) \
-        if (cfg.rpw == (R) && cfg.nwarps == (W) && cfg.dec == (D)) { \
-            mul_mat_vec_q_moe_group_launch_cfg<type, R, W, D>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, \
+        const int group = cfg.group > 0 ? cfg.group : (int) ncols_dst;
+#define MMVQ_MOE_GROUP_CFG(R, W, G, D) \
+        if (cfg.rpw == (R) && cfg.nwarps == (W) && group == (G) && cfg.dec == (D)) { \
+            mul_mat_vec_q_moe_group_launch_cfg<type, R, W, G, D>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, \
                 stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride, \
                 nchannels_dst, stream); \
             return true; \
         }
-        MMVQ_MOE_GROUP_CFG(2, 4, true)
+        MMVQ_MOE_GROUP_CFG(1, 4, 2, true)
 #ifdef GGML_CUDA_MMVQ_MOE_GROUP_BENCH
-        MMVQ_MOE_GROUP_CFG(2, 4, false)
-        MMVQ_MOE_GROUP_CFG(1, 4, true)
-        MMVQ_MOE_GROUP_CFG(1, 8, true)
-        MMVQ_MOE_GROUP_CFG(2, 1, true)
-        MMVQ_MOE_GROUP_CFG(2, 2, true)
-        MMVQ_MOE_GROUP_CFG(2, 8, true)
-        MMVQ_MOE_GROUP_CFG(4, 1, true)
-        MMVQ_MOE_GROUP_CFG(4, 2, true)
-        MMVQ_MOE_GROUP_CFG(4, 4, true)
-        MMVQ_MOE_GROUP_CFG(1, 2, true)
+        MMVQ_MOE_GROUP_CFG(2, 4, 2, true)
+        MMVQ_MOE_GROUP_CFG(2, 4, 3, true)
+        MMVQ_MOE_GROUP_CFG(2, 4, 4, true)
+        MMVQ_MOE_GROUP_CFG(2, 4, 5, true)
+        MMVQ_MOE_GROUP_CFG(2, 4, 6, true)
+        MMVQ_MOE_GROUP_CFG(1, 4, 3, true)
+        MMVQ_MOE_GROUP_CFG(1, 4, 4, true)
+        MMVQ_MOE_GROUP_CFG(1, 4, 5, true)
+        MMVQ_MOE_GROUP_CFG(1, 4, 6, true)
+        MMVQ_MOE_GROUP_CFG(1, 2, 2, true)
+        MMVQ_MOE_GROUP_CFG(1, 2, 3, true)
+        MMVQ_MOE_GROUP_CFG(1, 2, 4, true)
+        MMVQ_MOE_GROUP_CFG(1, 2, 5, true)
+        MMVQ_MOE_GROUP_CFG(1, 2, 6, true)
+        MMVQ_MOE_GROUP_CFG(2, 4, 3, false)
 #endif // GGML_CUDA_MMVQ_MOE_GROUP_BENCH
 #undef MMVQ_MOE_GROUP_CFG
-        GGML_ABORT("GGML_CUDA_MMVQ_MOE_GROUP_CFG: shape %d,%d,%d not instantiated", cfg.rpw, cfg.nwarps, (int) cfg.dec);
+        return false;   // a token count / shape without an instance: mul_mat_vec_q_moe
     }
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
