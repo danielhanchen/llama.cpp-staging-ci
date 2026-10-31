@@ -6060,6 +6060,16 @@ size_t ggml_backend_sched_get_staging_size(ggml_backend_sched_t sched, ggml_back
     return pf->n_bound > 0 ? pf->staging : 0;
 }
 
+size_t ggml_backend_sched_get_arena_size(ggml_backend_sched_t sched, ggml_backend_t backend) {
+    GGML_ASSERT(sched);
+    int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    if (backend_index < 0 || backend_index >= sched->n_backends) {
+        return 0;
+    }
+    const struct ggml_backend_sched_prefetch * pf = &sched->pf[backend_index];
+    return pf->arena != NULL ? pf->arena_size : 0;
+}
+
 size_t ggml_backend_sched_get_staging_split(ggml_backend_sched_t sched, ggml_backend_t backend) {
     GGML_ASSERT(sched);
     int backend_index = ggml_backend_sched_backend_id(sched, backend);

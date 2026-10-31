@@ -6089,13 +6089,33 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         if (lm_released && lm_rel_depth > 0 && llama_mtp_draft_lend_on() && cparams.spec_draft && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP &&
                 nextn_hold_fn == nullptr) {
             static const size_t lend_free = (size_t) (getenv("LLAMA_MTP_DRAFT_LEND_FREE_MIB") ? std::max(0, atoi(getenv("LLAMA_MTP_DRAFT_LEND_FREE_MIB"))) : 6144) << 20;
+            // k19-npkdp (LLAMA_MTP_DRAFT_LEND_ARENA=0 off): the staging arena the scheduler already holds on the device counts as free here,
+            // since the deep arena of the group grows from it (ggml_backend_sched_prefetch: extra = staging - arena_size). Where the MoE cache
+            // lends the staging (G4 Flash-Next fn4 16 GB -np 1) it holds none and nothing changes; where the cache is too small to lend it
+            // (-np 4 --kv-unified: 1275 MiB arena of its own) the gate lent the drafter's weights though the depth-4 arena fit without them:
+            // 5490 MiB free + 1275 held, the lazy pinned host copy (185 ms) on the first long prompt and a 23 ms remap per group, 8k TTFT
+            // 1.886 vs 1.640 s at -np 1. Free memory counted as the deep arena sees it, -np 4 with one user lends where -np 1 does
+            static const bool lend_arena_env = getenv("LLAMA_MTP_DRAFT_LEND_ARENA") == nullptr || atoi(getenv("LLAMA_MTP_DRAFT_LEND_ARENA")) != 0;
             size_t free_min = SIZE_MAX;
+            size_t arena_cr = 0;
             for (auto & bk : backend_ptrs) {
                 ggml_backend_dev_t dev = ggml_backend_get_device(bk);
                 if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
                     size_t fr = 0, tot = 0;
                     ggml_backend_dev_memory(dev, &fr, &tot);
-                    free_min = std::min(free_min, fr);
+                    const size_t held = lend_arena_env ? ggml_backend_sched_get_arena_size(sched.get(), bk) : 0;
+                    if (fr + held < free_min) {
+                        free_min = fr + held;
+                        arena_cr = held;
+                    }
+                }
+            }
+            if (arena_cr > 0 && free_min >= lend_free) {
+                static int64_t n_arena_log = 0;
+                if (n_arena_log++ < 4) {
+                    LLAMA_LOG_INFO("%s: MTP drafter weights not lent: %.2f MiB free with the %.2f MiB staging arena the group grows from, at least "
+                        "%.2f MiB (LLAMA_MTP_DRAFT_LEND_ARENA=0: without the arena)\n", __func__, free_min/1048576.0, arena_cr/1048576.0,
+                        lend_free/1048576.0);
                 }
             }
             std::vector<llama_context *> dfts;

@@ -402,6 +402,8 @@ extern "C" {
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
     // staging memory of the host weight prefetch needed by the last graph reserved, allocated or measured on backend (part of the buffer size once allocated)
     GGML_API size_t                     ggml_backend_sched_get_staging_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+    // bytes of the staging arena the scheduler holds on the backend (0 when none, or when the copies live in lent memory)
+    GGML_API size_t                     ggml_backend_sched_get_arena_size(ggml_backend_sched_t sched, ggml_backend_t backend);
     // the largest split of that staging (the weight copies one split needs): without the arena these copies land in the graph allocation
     GGML_API size_t                     ggml_backend_sched_get_staging_split(ggml_backend_sched_t sched, ggml_backend_t backend);
     // a reserve or graph allocation that leaves less than `headroom` bytes free on a device with a staging arena drops the host weight
