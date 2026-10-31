@@ -10,6 +10,7 @@
 #include "llama-memory.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa-iswa.h"
@@ -4860,6 +4861,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // speculative verify batches with LLAMA_MTP_EXACT=1 are computed batch invariant (see llama_set_verify)
     const bool exact_verify = cparams.verify && (llama_exact_verify_env() || cparams.verify_exact) && n_tokens_all > 1 && cparams.causal_attn && !output_all;
+
+    // k19-vgraph: with exact verify on, every ubatch (its single token decodes too) keeps the 256 cell n_kv that
+    // llm_graph_exact_row_n_kv splits the verify rows by
+    if (auto * mem_idx = dynamic_cast<llama_memory_hybrid_idx *>(memory.get())) {
+        mem_idx->set_n_kv_bucket_allowed(!(llama_exact_verify_env() || cparams.verify_exact));
+    }
 
     while (true) {
         mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);

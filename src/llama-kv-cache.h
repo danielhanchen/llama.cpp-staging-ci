@@ -191,7 +191,21 @@ public:
     // graph_build API
     //
 
-    uint32_t get_n_kv(const slot_info & sinfo) const;
+    uint32_t get_n_kv(const slot_info & sinfo, bool * bucketed = nullptr) const;
+
+    // k19-vgraph: coarser n_kv for small ubatches (decode, speculative verify), so their graphs keep their shapes, and their CUDA graphs
+    // stay captured, while the context grows by up to a quarter instead of 256 cells (see llama_memory_hybrid_idx, the only user).
+    // A ubatch of at most n_tokens_max tokens whose 256-padded n_kv is at least max(n_kv_min, n_tokens*n_kv_min_per_token) gets
+    // n_kv padded to max(256, pow2floor(n_kv)/div) cells. Off when n_tokens_max == 0
+    struct n_kv_bucket_params {
+        uint32_t n_tokens_max       = 0;
+        uint32_t n_kv_min           = 0;
+        uint32_t n_kv_min_per_token = 0;
+        uint32_t div                = 4;
+    };
+    void set_n_kv_bucket(const n_kv_bucket_params & p) { n_kv_bucket = p; }
+    // a context whose verify rows must equal single token decodes (llm_graph_exact_row_n_kv) keeps the 256 cell padding
+    void set_n_kv_bucket_allowed(bool value) { n_kv_bucket_allowed = value; }
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -284,6 +298,10 @@ private:
 
     // required padding
     const uint32_t n_pad = 1;
+
+    // k19-vgraph: see set_n_kv_bucket
+    n_kv_bucket_params n_kv_bucket;
+    bool n_kv_bucket_allowed = true;
 
     // SWA
     const uint32_t n_swa = 0;
@@ -412,6 +430,9 @@ public:
 
     uint32_t get_n_kv() const;
 
+    // k19-vgraph: whether this ubatch's n_kv was padded past 256 cells (llama_kv_cache::set_n_kv_bucket)
+    bool get_n_kv_bucketed() const { return n_kv_bucketed; }
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -486,4 +507,5 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+    bool    n_kv_bucketed = false;
 };

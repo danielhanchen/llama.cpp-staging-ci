@@ -1310,8 +1310,9 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
     return seq_to_stream[seq_id];
 }
 
-uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, bool * bucketed) const {
     uint32_t result = 0;
+    uint32_t n_cells = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
@@ -1321,6 +1322,30 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
         const auto & cells = v_cells[sinfo.strm[s]];
 
         result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
+        n_cells = std::max(n_cells, cells.size());
+    }
+
+    if (bucketed) {
+        *bucketed = false;
+    }
+
+    // k19-vgraph: see set_n_kv_bucket. The step is a power of two, so the buckets of one octave end where the next one starts and
+    // n_kv only grows with the cells
+    const uint32_t n_tokens = (uint32_t) sinfo.size();
+    if (n_kv_bucket.n_tokens_max > 0 && n_kv_bucket_allowed && n_tokens <= n_kv_bucket.n_tokens_max &&
+            result >= std::max(n_kv_bucket.n_kv_min, n_tokens*n_kv_bucket.n_kv_min_per_token)) {
+        uint32_t step = 1;
+        while (step <= result/2) {
+            step *= 2;
+        }
+        step = std::max<uint32_t>(n_pad_cur, step/std::max<uint32_t>(1, n_kv_bucket.div));
+        if (step % n_pad_cur == 0) {
+            const uint32_t b = std::min(n_cells, GGML_PAD(result, step));
+            if (bucketed) {
+                *bucketed = b != result;
+            }
+            result = std::max(result, b);
+        }
     }
 
     return result;
@@ -3213,7 +3238,7 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
-    n_kv = kv->get_n_kv(sinfos[i_cur]);
+    n_kv = kv->get_n_kv(sinfos[i_cur], &n_kv_bucketed);
 
     return true;
 }

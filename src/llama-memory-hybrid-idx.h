@@ -78,8 +78,14 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
+    // k19-vgraph: see llama_kv_cache::set_n_kv_bucket_allowed (both caches)
+    void set_n_kv_bucket_allowed(bool value);
+
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
+
+    // k19-vgraph: the pools the indexer selection keeps at most (top_k / kpool)
+    uint32_t get_kpool_top() const { return hparams_idx.indexer_kpool > 0 ? hparams_idx.indexer_top_k / hparams_idx.indexer_kpool : 0; }
 
     // Whether pools are kpool consecutive cells in sequence order (qwen4exp) instead of kpool consecutive positions.
     bool get_kpool_by_order() const { return hparams_idx.indexer_kpool_by_order; }

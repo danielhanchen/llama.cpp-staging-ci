@@ -72,7 +72,52 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()) {
+    // k19-vgraph (LLAMA_KV_BUCKET=0: off, the 256 cell padding of every ubatch): a decode or verify ubatch of qwen4exp, whose every
+    // attention layer is QSA, pads n_kv to a quarter of its octave instead of 256 cells, and the k-pool count with it, so its graph
+    // and CUDA graph are not rebuilt and captured again each time the context grows past 256 cells (G4 Flash-Next: 8-10 verify
+    // re-captures per 256 tokens, one per window size and boundary, 3-5 ms host each). Only where the bucket cannot change a result:
+    // the attention gathers the selected cells (CUDA sparse flash attention: n_kv >= max(4096, 2*n_tokens*n_sel), a single
+    // query tile up to 4 tokens), so its work list and split follow n_sel and not n_kv, the extra cells are masked and the extra
+    // pools score -inf (top_k keeps the lowest of tied columns, which the padding at the end never is). =2 (opt-in, not exact:
+    // the dense attention's KV split moves, a reassociation): any ubatch up to LLAMA_KV_BUCKET_MAX_TOKENS (8) tokens from 1024 cells.
+    // LLAMA_KV_BUCKET_DIV (4): buckets per octave
+    static const int mode = getenv("LLAMA_KV_BUCKET") ? atoi(getenv("LLAMA_KV_BUCKET")) : 1;
+    const auto & hp = model.hparams;
+    bool all_qsa = mode != 0 && mem_idx != nullptr && hp.indexer_kpool > 0 && hp.indexer_kpool_by_order && hp.indexer_top_k > 0;
+    bool any_attn = false;
+    for (uint32_t il = 0; all_qsa && il < hp.n_layer_all && il < LLAMA_MAX_LAYERS; ++il) {
+        if (filter_attn == nullptr || filter_attn(il)) {
+            any_attn = true;
+            all_qsa  = hp.dsv4_compress_ratios[il] > 0;
+        }
+    }
+    if (all_qsa && any_attn) {
+        const uint32_t kpool = hp.indexer_kpool;
+        const uint32_t n_sel = kpool*(hp.indexer_top_k/kpool) + kpool - 1; // build_qsa_sel at n_pool >= top_k/kpool
+        llama_kv_cache::n_kv_bucket_params bp;
+        if (mode == 2) {
+            bp.n_tokens_max = getenv("LLAMA_KV_BUCKET_MAX_TOKENS") ? (uint32_t) std::max(1, atoi(getenv("LLAMA_KV_BUCKET_MAX_TOKENS"))) : 8;
+            bp.n_kv_min     = 1024;
+        } else {
+            bp.n_tokens_max       = 4;
+            bp.n_kv_min           = 4096;
+            bp.n_kv_min_per_token = 2*n_sel;
+        }
+        bp.div = getenv("LLAMA_KV_BUCKET_DIV") ? (uint32_t) std::max(1, atoi(getenv("LLAMA_KV_BUCKET_DIV"))) : 4;
+        get_mem_attn()->set_n_kv_bucket(bp);
+        mem_idx->set_n_kv_bucket(bp);
+        LLAMA_LOG_INFO("%s: n_kv buckets for ubatches of up to %u tokens from %u cells (%u per token), %u per octave (LLAMA_KV_BUCKET=%d)\n",
+            __func__, bp.n_tokens_max, bp.n_kv_min, bp.n_kv_min_per_token, bp.div, mode);
+    }
+}
+
+void llama_memory_hybrid_idx::set_n_kv_bucket_allowed(bool value) {
+    get_mem_attn()->set_n_kv_bucket_allowed(value);
+    if (mem_idx) {
+        mem_idx->set_n_kv_bucket_allowed(value);
+    }
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -359,6 +404,7 @@ struct llama_memory_hybrid_idx_context::kpool_state {
     uint32_t n_pool_real = 0;
     uint32_t n_new       = 0;
     uint32_t n_new_g     = 1; // graph size of the new pool list, stable across decode steps
+    uint32_t n_pool_g    = 0; // k19-vgraph: graph pool count when n_kv is bucketed (0: kpool_pad(n_pool_real))
 };
 
 namespace {
@@ -772,6 +818,15 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     const uint32_t n_pool_max = kv_size / kpool * idx->get_n_seq_max();
     const uint32_t bound = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
     st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_pool_real) - 1, n_pool_max})});
+
+    // k19-vgraph: a bucketed n_kv brings the pools with it (they change with the cells, every 256 of them), so the indexer, its
+    // top_k and the pool inputs keep their shapes too; the extra pools are padding (sentinel members, -inf scores)
+    // (only once the selection holds its full top_k/kpool pools without them: else n_sel would follow the padding)
+    st.n_pool_g = 0;
+    if (get_idx()->get_n_kv_bucketed() && kpool_pad(st.n_pool_real) >= mem->get_kpool_top()) {
+        const uint32_t n_kv = get_idx()->get_n_kv();
+        st.n_pool_g = std::max(kpool_pad(st.n_pool_real), kpool_pad(n_kv/kpool));
+    }
 }
 
 const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_context::kpool_cur() const {
@@ -781,7 +836,8 @@ const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_con
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool() const {
-    return kpool_pad(kpool_cur().n_pool_real);
+    const auto & st = kpool_cur();
+    return st.n_pool_g > 0 ? st.n_pool_g : kpool_pad(st.n_pool_real);
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
@@ -811,7 +867,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
     const bool by_order = mem->get_kpool_by_order();
 
-    GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real));
+    GGML_ASSERT(n_pool == (st.n_pool_g > 0 ? st.n_pool_g : kpool_pad(st.n_pool_real)));
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
     GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
