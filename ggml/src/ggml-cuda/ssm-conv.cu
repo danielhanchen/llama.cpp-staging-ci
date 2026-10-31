@@ -156,12 +156,16 @@ static __global__ void ssm_conv_cat_f32(const ssm_conv_cat cat, const float * sr
     }
 }
 
-template <bool apply_silu, size_t split_d_inner, size_t d_conv, int64_t split_n_t>
+// from_cat (k19-fuse F5, ggml_cuda_try_conv_cat_elide_prompt): src0 is a CONCAT (dim 0) that did not run, the d_conv - 1 state columns
+// cat.a and the transposed new tokens cat.b: a thread loads its own channel's columns from the two parts (channels adjacent in b),
+// the convolution is the same code
+template <bool apply_silu, size_t split_d_inner, size_t d_conv, int64_t split_n_t, bool from_cat = false>
 static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, const float * __restrict__ src1,
                                                const float * __restrict__ bias,
                                                const int src0_nb0, const int src0_nb1, const int src0_nb2,
                                                const int src1_nb1, float * __restrict__ dst, const int dst_nb0,
-                                               const int dst_nb1, const int dst_nb2, const int64_t n_t) {
+                                               const int dst_nb1, const int dst_nb2, const int64_t n_t,
+                                               const ssm_conv_cat cat = {}) {
     const int tid  = threadIdx.x;
     const int bidx = blockIdx.x;
     const int bidy = blockIdx.y;
@@ -184,6 +188,19 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
 
     constexpr int load_cols   = d_conv - 1 + split_n_t;
     constexpr int total_elems = split_d_inner * load_cols;
+    if constexpr (from_cat) {
+        const int64_t ch = (int64_t) bidy * split_d_inner + tid;
+        const float * ap = cat.a + bidx * cat.a_nb2 + ch * cat.a_nb1;
+        const float * bp = cat.b + bidx * cat.b_nb2 + ch * cat.b_nb1;
+        const int64_t g0 = bidz * split_n_t;  // the concat column of smem column 0
+        const int64_t ng = d_conv - 1 + n_t;  // the concat's columns
+#pragma unroll
+        for (int c = 0; c < load_cols; ++c) {
+            const int64_t g = g0 + c;
+            smem[tid * n_cols + c] = g < (int64_t) d_conv - 1 ? ap[g] : g < ng ? bp[(g - (int64_t) (d_conv - 1)) * cat.b_nb0] : 0.0f;
+        }
+        GGML_UNUSED(total_elems);
+    } else {
     int row = tid / load_cols;
     int col = tid % load_cols;
 #pragma unroll
@@ -198,6 +215,7 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
         if (idx >= total_elems - tid - split_d_inner) {
             break;
         }
+    }
     }
     __syncthreads();
 
@@ -233,13 +251,20 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
 
     auto launch_kernel = [&](auto NC) {
         constexpr int kNC = decltype(NC)::value;
-        if (cat != nullptr) {
+        if (cat != nullptr && n_t > ssm_conv_long_token_min_t) {
+            GGML_ASSERT(cs.n == 0);
+            const int64_t split_n_t = 32;
+            dim3          blocks(n_s, nr / threads, (n_t + split_n_t - 1) / split_n_t);
+            const size_t  smem_size = threads * (kNC - 1 + split_n_t) * sizeof(float);
+            ssm_conv_long_token_f32<apply_silu, threads, kNC, split_n_t, true><<<blocks, threads, smem_size, stream>>>(
+                src0, src1, bias, src0_nb0, src0_nb1, src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t, *cat);
+        } else if (cat != nullptr) {
             GGML_ASSERT(n_t <= ssm_conv_cat_max_t);
             const dim3 blocks(n_s, nr / threads, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
             ggml_cuda_kernel_launch(ssm_conv_cat_f32<apply_silu, threads, kNC>, launch_params, *cat, src1, bias, src1_nb1, dst, dst_nb0,
                                     dst_nb1, dst_nb2, n_t, cs);
-        } else if (n_t <= 32) {
+        } else if (n_t <= ssm_conv_long_token_min_t) {
             const dim3 blocks(n_s, (nr + threads - 1) / threads, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
             ggml_cuda_kernel_launch(ssm_conv_f32<apply_silu, threads, kNC>, launch_params, src0, src1, bias, src0_nb0, src0_nb1,
@@ -316,6 +341,8 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     // launch cannot (too many tokens or copies, a copy or the output over a part other than the thread-private state row)
     ssm_conv_cat cat = {};
     bool use_cat = false;
+    bool prompt  = false;                  // k19-fuse F5: a prompt concat, its conv-state copies moved behind this launch
+    std::vector<ggml_tensor *> prompt_cpys;
     if (!ctx.conv_cat_elided.empty() && ctx.conv_cat_elided.count(src0)) {
         ctx.conv_cat_elided.erase(src0);
         const ggml_tensor * a = src0->src[0];
@@ -325,8 +352,15 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
             const char * y0 = (const char *) y->data;
             return x0 < y0 + ggml_nbytes(y) && y0 < x0 + ggml_nbytes(x);
         };
-        use_cat = n_t <= ssm_conv_cat_max_t && (int) cpys.size() <= ssm_conv_state_copies::max_copies && a->ne[0] == nc - 1 &&
-                  b->ne[0] == n_t && !overlap(out, a) && !overlap(out, b);
+        const auto pit = ctx.conv_cat_prompt.find(src0);
+        if (pit != ctx.conv_cat_prompt.end()) {
+            prompt_cpys = std::move(pit->second);
+            ctx.conv_cat_prompt.erase(pit);
+            prompt = true;
+        }
+        use_cat = (prompt ? n_t > ssm_conv_long_token_min_t && cpys.empty() && b->nb[1] == sizeof(float)
+                          : n_t <= ssm_conv_cat_max_t && (int) cpys.size() <= ssm_conv_state_copies::max_copies) &&
+                  a->ne[0] == nc - 1 && b->ne[0] == n_t && !overlap(out, a) && !overlap(out, b);
         for (const ggml_tensor * c : cpys) {
             const ggml_tensor * d = c->src[1];
             if (overlap(d, b) || (overlap(d, a) && !(d->data == a->data && d->nb[1] == a->nb[1] && d->nb[2] == a->nb[2] &&
@@ -348,6 +382,11 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
                 GGML_LOG_INFO("conv cat elide: %s runs at its convolution (n_t %d, %d copies)\n", src0->name, (int) n_t, (int) cpys.size());
             }
             ggml_cuda_op_concat(ctx, const_cast<ggml_tensor *>(src0));
+            // the copies run where they were, after the concat and before the convolution
+            for (ggml_tensor * c : prompt_cpys) {
+                ggml_cuda_cpy(ctx, c->src[0], c->src[1]);
+            }
+            prompt_cpys.clear();
         }
     }
 
@@ -369,11 +408,35 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         }
     }
 
+    if (prompt && use_cat) {
+        static const bool log = getenv("GGML_CUDA_CONV_CAT_PROMPT_LOG") != nullptr && atoi(getenv("GGML_CUDA_CONV_CAT_PROMPT_LOG")) != 0;
+        if (log) {
+            GGML_LOG_INFO("conv cat prompt: %s read in place by %s (%d tokens)\n", src0->name, dst->name, (int) n_t);
+        }
+    }
     if (fuse_silu) {
         ssm_conv_f32_cuda<true>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
                           out->nb[2], nc, nr, n_t, n_s, stream, cs, use_cat ? &cat : nullptr);
     } else {
         ssm_conv_f32_cuda<false>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
                           out->nb[2], nc, nr, n_t, n_s, stream, cs, use_cat ? &cat : nullptr);
+    }
+
+    // k19-fuse F5: the conv-state copies of the elided prompt concat, from its new-token part: copy c's column range starts at
+    // concat column s >= d_conv - 1, which is column s - (d_conv - 1) of b
+    if (!prompt_cpys.empty()) {
+        const ggml_tensor * b = src0->src[1];
+        for (ggml_tensor * c : prompt_cpys) {
+            const ggml_tensor * t = c->src[0];
+            const int64_t s = ((const char *) t->data - (const char *) src0->data) / (int64_t) sizeof(float);
+            ggml_tensor bv = *t;
+            bv.op       = GGML_OP_VIEW;
+            bv.view_src = const_cast<ggml_tensor *>(b);
+            bv.data     = (char *) b->data + (s - (nc - 1)) * b->nb[0];
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                bv.nb[d] = b->nb[d];
+            }
+            ggml_cuda_cpy(ctx, &bv, c->src[1]);
+        }
     }
 }

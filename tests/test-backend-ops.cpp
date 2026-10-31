@@ -13903,13 +13903,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // k15-mm2: QSA selection mask + sparse flash attention (Flash-Next: 256, 2 KV heads x 8 / 12, 2051 cells); at 16k 8 tokens
-    // take the dense kernel (the CUDA backend rebuilds the dense mask), 40 tokens build it in the graph, the rest gather
+    // take the dense kernel (the CUDA backend rebuilds the dense mask), the rest gather; 40 tokens and the prompt ubatches (k19-fuse
+    // F6, kill GGML_CUDA_DISABLE_QSA_PROMPT_MASK=1) get the dense mask rebuilt in one launch
     for (int64_t nr : { 8, 12 }) {
         for (int64_t nb : { 1, 3, 8, 40 }) {
             test_cases.emplace_back(new test_qsa_sel_fa(256, 2, nr, 16384, nb, 2051));
         }
         test_cases.emplace_back(new test_qsa_sel_fa(256, 2, nr, 4608, 1, 2051));
         test_cases.emplace_back(new test_qsa_sel_fa(256, 2, nr, 65536, 2, 2051));
+    }
+    for (int64_t nb : { 512, 2048 }) {
+        test_cases.emplace_back(new test_qsa_sel_fa(256, 2, 12, 8192, nb, 2051));
     }
 
     for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q4_0 }) {
@@ -14153,6 +14157,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gate_cont(128, 48, nt, false));
     }
     test_cases.emplace_back(new test_conv_cat_state(10240, 4, 1, 1, false));        // one rollback slot (no drafting)
+    // k19-fuse F5 prompt ubatches (kill GGML_CUDA_DISABLE_CONV_CAT_PROMPT=1): past the 32-token boundary, a partial tile, 512 / 2048
+    for (int64_t nt : { 33, 100, 512, 2048 }) {
+        test_cases.emplace_back(new test_conv_cat_state(10240, 4, nt, 3, false));
+        test_cases.emplace_back(new test_conv_cat_state(10240, 4, nt, 1, false));
+    }
+    test_cases.emplace_back(new test_conv_cat_state(10240, 4, 512, 3, true));
     for (int64_t n_new : { 1, 2, 3 }) {
         test_cases.emplace_back(new test_qsa_pool_keys(128, 4, n_new, 20480));
     }

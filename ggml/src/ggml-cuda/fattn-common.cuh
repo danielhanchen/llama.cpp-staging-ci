@@ -1053,7 +1053,7 @@ void launch_fattn(
             qsa = &it->second;
         }
     }
-    const bool qsa_gather = qsa && use_sparse && ggml_cuda_qsa_maskless_gather_ok(*qsa) && ggml_cuda_qsa_maskless_mode() == 1;
+    const bool qsa_gather = qsa && !qsa->prompt && use_sparse && ggml_cuda_qsa_maskless_gather_ok(*qsa) && ggml_cuda_qsa_maskless_mode() == 1;
     // the mask node's buffer may hold the selection or the causal mask (the allocator reused it), then a pool copy takes the mask;
     // allocated before the kernel's pool buffers, freed after them
     ggml_cuda_pool_alloc<half> qsa_mask(pool);

@@ -1693,7 +1693,8 @@ struct ggml_cuda_src1_memo {
 struct ggml_cuda_qsa_maskless {
     const ggml_tensor * idx;
     const ggml_tensor * kq;
-    bool alias; // the mask node's buffer overlaps idx or kq
+    bool alias;  // the mask node's buffer overlaps idx or kq
+    bool prompt; // k19-fuse F6: a prompt batch (more than GGML_CUDA_QSA_MASKLESS_MAX_TOKENS tokens), rebuilt in place, never gathered
 };
 
 struct ggml_backend_cuda_context {
@@ -1731,6 +1732,10 @@ struct ggml_backend_cuda_context {
     // k15-fn: conv-input concats (state columns ++ the transposed new tokens) not run: the short convolution that reads them reads both
     // parts itself (ggml_cuda_try_conv_cat_elide); any other node that reads one first makes it run then (ggml_cuda_conv_cat_materialize)
     std::unordered_set<const ggml_tensor *> conv_cat_elided;
+    // k19-fuse F5: elided conv-input concats of a prompt batch (ggml_cuda_try_conv_cat_elide): concat -> the conv-state CPYs of views of
+    // it, which all lie in the new-token part; they do not run where they are, the convolution writes them from that part after it ran
+    std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> conv_cat_prompt;
+    std::unordered_set<const ggml_tensor *> conv_cat_prompt_cpys;
     // k15-fn: CONTs of a strided view whose only reader is a fused UNARY + MUL that reads the view itself (ggml_cuda_try_unary_src_cont_elide)
     std::unordered_set<const ggml_tensor *> unary_cont_elided;
     // k15-fn: QSA selection chains (ggml_cuda_qsa_sel_plan): the final i32 index node -> its inputs, and the chain nodes not run

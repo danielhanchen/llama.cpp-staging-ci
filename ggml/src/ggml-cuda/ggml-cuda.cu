@@ -5470,8 +5470,12 @@ static void ggml_cuda_qsa_maskless_plan(ggml_backend_cuda_context * cuda_ctx, co
         // set_rows dst [1, n_kv + n_sel, n_tokens]: the plane of token t = q + ne1*seq is mask row (q, seq)
         const int64_t n_kv   = kq->ne[0];
         const int64_t n_tok  = kq->ne[1]*kq->ne[3];
-        // decode and verify windows: a dense kernel's pool copy of the mask stays small, and no mask scan (one stream)
-        if (n_tok > GGML_CUDA_QSA_MASKLESS_MAX_TOKENS || kq->ne[3] != 1) {
+        // decode and verify windows: a dense kernel's pool copy of the mask stays small, and no mask scan (one stream).
+        // k19-fuse F6: a prompt batch never gathers, it gets the dense mask rebuilt in place by one launch instead of the fill /
+        // repeat / set_rows / add chain (the same f16 values); GGML_CUDA_DISABLE_QSA_PROMPT_MASK=1 builds it in the graph
+        static const bool prompt_off = ggml_cuda_env_flag("GGML_CUDA_DISABLE_QSA_PROMPT_MASK");
+        const bool prompt = n_tok > GGML_CUDA_QSA_MASKLESS_MAX_TOKENS;
+        if ((prompt && (prompt_off || kq->ne[1] > 65535)) || kq->ne[3] != 1) { // grid y of flash_attn_sel_to_mask
             continue;
         }
         const ggml_tensor * idx = sr->src[1]; // set_rows: src[0] rows, src[1] indices, src[2] dst
@@ -5524,7 +5528,17 @@ static void ggml_cuda_qsa_maskless_plan(ggml_backend_cuda_context * cuda_ctx, co
         if (clobbered) {
             continue;
         }
-        cuda_ctx->qsa_maskless[fa] = { idx, kq, overlaps(add, idx) || overlaps(add, kq) };
+        const bool alias = overlaps(add, idx) || overlaps(add, kq);
+        if (prompt && alias) {
+            continue; // no pool copy of a prompt-sized mask
+        }
+        if (prompt) {
+            static const bool log = ggml_cuda_env_flag("GGML_CUDA_QSA_PROMPT_LOG");
+            if (log) {
+                GGML_LOG_INFO("qsa prompt mask: %s built in one launch (%d tokens, %d cells)\n", fa->name, (int) n_tok, (int) n_kv);
+            }
+        }
+        cuda_ctx->qsa_maskless[fa] = { idx, kq, alias, prompt };
         cuda_ctx->qsa_skip.insert(nodes.begin(), nodes.end());
     }
 }
@@ -5692,6 +5706,17 @@ static bool ggml_cuda_ranges_overlap(const ggml_tensor * a, const ggml_tensor * 
 // a deferred conv-state copy whose convolution did not take it (not expected: the defer checks the convolution's path) runs at the end
 // of the graph evaluation as the copy it was
 static void ggml_cuda_conv_state_flush(ggml_backend_cuda_context * cuda_ctx) {
+    if (!cuda_ctx->conv_cat_prompt.empty()) {
+        GGML_LOG_WARN("%s: %d prompt conv-input concats whose convolution did not run: they and their copies run now (not expected)\n",
+            __func__, (int) cuda_ctx->conv_cat_prompt.size());
+        for (auto & [cat, cpys] : cuda_ctx->conv_cat_prompt) {
+            ggml_cuda_op_concat(*cuda_ctx, const_cast<ggml_tensor *>(cat));
+            for (ggml_tensor * c : cpys) {
+                ggml_cuda_cpy(*cuda_ctx, c->src[0], c->src[1]);
+            }
+        }
+        cuda_ctx->conv_cat_prompt.clear();
+    }
     if (cuda_ctx->conv_state_pending.empty()) {
         return;
     }
@@ -5788,6 +5813,8 @@ static bool ggml_cuda_try_conv_state_defer(ggml_backend_cuda_context * cuda_ctx,
 // the conv-state copies deferred to it read the same registers. Only when every reader of the concat is that convolution or a copy of a
 // view of it (a copy that is not deferred makes the concat run first, ggml_cuda_conv_cat_materialize), nothing that runs before the
 // convolution writes over either part, and the convolution's outputs do not overlap them
+static bool ggml_cuda_try_conv_cat_elide_prompt(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i);
+
 static bool ggml_cuda_try_conv_cat_elide(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_CONV_CAT_FUSION");
     if (disabled || ggml_cuda_fusion_disabled() || cuda_ctx->curr_stream_no != 0) {
@@ -5797,6 +5824,9 @@ static bool ggml_cuda_try_conv_cat_elide(ggml_backend_cuda_context * cuda_ctx, c
     const char * cat_dbg_name = cat->name;
     const ggml_tensor * a = cat->src[0];
     const ggml_tensor * b = cat->src[1];
+    if (b != nullptr && b->ne[0] > ssm_conv_long_token_min_t) {
+        return ggml_cuda_try_conv_cat_elide_prompt(cuda_ctx, cgraph, i);
+    }
     if (cat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat, 0) != 0 || cat->type != GGML_TYPE_F32 || a == nullptr || b == nullptr ||
         a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || (cat->flags & GGML_TENSOR_FLAG_OUTPUT) || cat->ne[3] != 1 ||
         a->ne[3] != 1 || b->ne[3] != 1 || cat->data == nullptr || a->data == nullptr || b->data == nullptr || a->nb[0] != sizeof(float) ||
@@ -5855,6 +5885,125 @@ static bool ggml_cuda_try_conv_cat_elide(ggml_backend_cuda_context * cuda_ctx, c
     }
     cuda_ctx->conv_cat_elided.insert(cat);
     return true;
+}
+
+// k19-fuse F5 (GGML_CUDA_DISABLE_CONV_CAT_PROMPT=1 off): the same concat in a prompt batch (more new tokens than the short kernels
+// take): the long-token convolution reads the state columns and the transposed new tokens itself (ssm_conv_long_token_f32 from_cat),
+// and the conv-state copies of the concat's tail, all inside the new-token part, run after it from that part (the same floats). The
+// copies move behind the convolution: one may write the very state row the convolution reads, nothing else between them may read or
+// write their destinations, and no other node reads the concat
+static bool ggml_cuda_try_conv_cat_elide_prompt(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(cuda_ctx, cgraph, i);
+    return false; // verified on NVIDIA only
+#else
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_CONV_CAT_PROMPT");
+    if (disabled) {
+        return false;
+    }
+    const ggml_tensor * cat = cgraph->nodes[i];
+    const char * cat_dbg_name = cat->name;
+    const ggml_tensor * a = cat->src[0];
+    const ggml_tensor * b = cat->src[1];
+    // a: [d_conv - 1, channels, n_seqs] rows; b: the transposed new tokens, channels adjacent (coalesced loads)
+    if (cat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat, 0) != 0 || cat->type != GGML_TYPE_F32 || a == nullptr || b == nullptr ||
+        a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || (cat->flags & GGML_TENSOR_FLAG_OUTPUT) || cat->ne[3] != 1 ||
+        a->ne[3] != 1 || b->ne[3] != 1 || cat->data == nullptr || a->data == nullptr || b->data == nullptr || a->nb[0] != sizeof(float) ||
+        a->nb[1] % sizeof(float) != 0 || a->nb[2] % sizeof(float) != 0 || b->nb[1] != sizeof(float) || b->nb[0] % sizeof(float) != 0 ||
+        b->nb[2] % sizeof(float) != 0 || a->ne[1] != b->ne[1] || a->ne[2] != b->ne[2] || cat->ne[1] % 128 != 0 ||
+        cat->nb[1] != (size_t) cat->ne[0] * sizeof(float) || cat->nb[2] != cat->nb[1] * cat->ne[1]) {
+        return ggml_cuda_conv_cat_refuse(cat_dbg_name, 202);
+    }
+    const int64_t sc = a->ne[0];
+    std::vector<ggml_tensor *> cpys;
+    int jc = -1;
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 24; ++j) {
+        ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_SSM_CONV && n->src[0] == cat) {
+            const ggml_tensor * w = n->src[1];
+            if (w == nullptr || w->ne[0] != sc + 1 || n->ne[1] != b->ne[0] || n->ne[2] != a->ne[2]) {
+                return ggml_cuda_conv_cat_refuse(cat_dbg_name, 203);
+            }
+            if (j + 1 < cgraph->n_nodes && cgraph->nodes[j + 1]->op == GGML_OP_MUL) {
+                return ggml_cuda_conv_cat_refuse(cat_dbg_name, 204);
+            }
+            for (int k = j; k < cgraph->n_nodes && k <= j + 2; ++k) {
+                if (ggml_cuda_ranges_overlap(cgraph->nodes[k], a) || ggml_cuda_ranges_overlap(cgraph->nodes[k], b)) {
+                    return ggml_cuda_conv_cat_refuse(cat_dbg_name, 205);
+                }
+                for (const ggml_tensor * c : cpys) {
+                    if (ggml_cuda_ranges_overlap(cgraph->nodes[k], c->src[1])) {
+                        return ggml_cuda_conv_cat_refuse(cat_dbg_name, 206);
+                    }
+                }
+            }
+            jc = j;
+            break;
+        }
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (n->op == GGML_OP_CPY && n->src[0] != nullptr && n->src[0]->view_src == cat) {
+            // a column range of every row of the concat, inside the new-token part, f32 into an f32 destination
+            const ggml_tensor * t = n->src[0];
+            const ggml_tensor * d = n->src[1];
+            const size_t offs = (const char *) t->data - (const char *) cat->data;
+            if (d == nullptr || d->type != GGML_TYPE_F32 || t->type != GGML_TYPE_F32 || (n->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                t->nb[0] != sizeof(float) || t->nb[1] != cat->nb[1] || t->nb[2] != cat->nb[2] || t->ne[1] != cat->ne[1] ||
+                t->ne[2] != cat->ne[2] || t->ne[3] != 1 || offs % sizeof(float) != 0 || offs >= cat->nb[1] ||
+                (int64_t) (offs / sizeof(float)) < sc || (int64_t) (offs / sizeof(float)) + t->ne[0] > cat->ne[0] || d->data == nullptr ||
+                ggml_cuda_ranges_overlap(d, b) || ggml_cuda_ranges_overlap(d, cat) || cpys.size() >= 8) {
+                return ggml_cuda_conv_cat_refuse(cat_dbg_name, 207);
+            }
+            for (const ggml_tensor * c : cpys) {
+                if (ggml_cuda_ranges_overlap(c->src[1], d)) {
+                    return ggml_cuda_conv_cat_refuse(cat_dbg_name, 208);
+                }
+            }
+            cpys.push_back(n);
+            continue;
+        }
+        if (ggml_cuda_ranges_overlap(n, a) || ggml_cuda_ranges_overlap(n, b)) {
+            return ggml_cuda_conv_cat_refuse(cat_dbg_name, 209);
+        }
+        // a node between a moved copy and the convolution must not read or write its destination
+        for (const ggml_tensor * c : cpys) {
+            if (ggml_cuda_ranges_overlap(n, c->src[1])) {
+                return ggml_cuda_conv_cat_refuse(cat_dbg_name, 210);
+            }
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                if (n->src[k] != nullptr && ggml_cuda_ranges_overlap(n->src[k], c->src[1])) {
+                    return ggml_cuda_conv_cat_refuse(cat_dbg_name, 211);
+                }
+            }
+        }
+    }
+    if (jc < 0) {
+        return ggml_cuda_conv_cat_refuse(cat_dbg_name, 212);
+    }
+    for (int k = i + 1; k < cgraph->n_nodes; ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (k == jc || ggml_cuda_is_view_or_noop(n) || std::find(cpys.begin(), cpys.end(), n) != cpys.end()) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * t = n->src[s];
+            if (t != nullptr && (t == cat || t->view_src == cat)) {
+                return ggml_cuda_conv_cat_refuse(cat_dbg_name, 213);
+            }
+        }
+    }
+    static const bool log = ggml_cuda_env_flag("GGML_CUDA_CONV_CAT_PROMPT_LOG");
+    if (log) {
+        GGML_LOG_INFO("conv cat prompt: %s elided (%d tokens, %d copies)\n", cat_dbg_name, (int) b->ne[0], (int) cpys.size());
+    }
+    for (ggml_tensor * c : cpys) {
+        cuda_ctx->conv_cat_prompt_cpys.insert(c);
+    }
+    cuda_ctx->conv_cat_prompt[cat] = std::move(cpys);
+    cuda_ctx->conv_cat_elided.insert(cat);
+    return true;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
 // an elided conv-input concat that a node about to run reads (other than its convolution), or an elided CONT (other than by the fused
@@ -8685,6 +8834,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->gdn_gates_in.clear();
             cuda_ctx->conv_state_pending.clear();
             cuda_ctx->conv_cat_elided.clear();
+            cuda_ctx->conv_cat_prompt.clear();
+            cuda_ctx->conv_cat_prompt_cpys.clear();
             cuda_ctx->unary_cont_elided.clear();
             ++ggml_cuda_eval_gen;   // k15-fn: per-pass caches (ggml_cuda_reader_index) are rebuilt on first use
             ggml_cuda_qsa_maskless_plan(cuda_ctx, cgraph);
@@ -8782,6 +8933,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 if (!cuda_ctx->mmvq_done_early.empty() && cuda_ctx->mmvq_done_early.count(node)) {
                     // computed by an earlier multi-matrix mul_mat_vec_q launch (ggml_cuda_try_fuse_mmvq_multi)
+                    ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 1);
+                    continue;
+                }
+
+                if (node->op == GGML_OP_CPY && !cuda_ctx->conv_cat_prompt_cpys.empty() && cuda_ctx->conv_cat_prompt_cpys.count(node)) {
+                    // a conv-state copy of a prompt concat: its convolution writes it (ggml_cuda_try_conv_cat_elide_prompt)
                     ggml_cuda_q8_1_cache_node_done(cuda_ctx->q8_1_cache, cgraph, i, 1);
                     continue;
                 }
@@ -8958,6 +9115,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->gdn_gates_in.clear();
             ggml_cuda_conv_state_flush(cuda_ctx);
             cuda_ctx->conv_cat_elided.clear();
+            cuda_ctx->conv_cat_prompt_cpys.clear();
             cuda_ctx->unary_cont_elided.clear();
         }
 
