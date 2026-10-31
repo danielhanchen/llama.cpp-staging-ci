@@ -58,6 +58,7 @@ static std::vector<std::pair<int, int>> env_pairs(const char * name, const char 
 
 static std::atomic<int> g_big_captures{0};
 static std::atomic<int> g_rebuilds{0}; // kept graphs not reused (LLAMA_GRAPH_SMALL_WHY=N)
+static std::atomic<int> g_invalid{0};  // kept graphs invalidated (LLAMA_GRAPH_SMALL_WHY=N)
 static int g_big_nodes = 1000;
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
@@ -72,8 +73,11 @@ static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
     if (strstr(text, "not reused")) {
         g_rebuilds++;
     }
+    if (strstr(text, "kept graphs invalidated")) {
+        g_invalid++;
+    }
     if (level >= GGML_LOG_LEVEL_WARN || p || strstr(text, "changed at node") || strstr(text, "n_kv buckets") ||
-            strstr(text, "not reused")) {
+            strstr(text, "not reused") || strstr(text, "invalidated")) {
         fputs(text, stderr);
     }
 }
@@ -188,7 +192,35 @@ int main(int argc, char ** argv) {
         uint64_t h_len = 1469598103934665603ULL;
         llama_pos P = L;
         int n_tok = 0;
+        // VG_REQS=R: R requests per length, each after the first starts with a new turn of VG_TURN prompt tokens (as a chat's next
+        // message); per request the large-graph captures, kept graph rebuilds and invalidations of its verify passes
+        const int n_req  = std::max(1, env_int("VG_REQS", 1));
+        const int n_turn = env_int("VG_TURN", 200);
+        int rcap0 = g_big_captures.load(), rreb0 = g_rebuilds.load(), rinv0 = g_invalid.load(), req = 0;
+        double t_turn = 0.0, t_req = 0.0;
+        auto req_report = [&]() {
+            printf("VGR L=%d req=%d turn_ms=%.1f passes_ms=%.1f big_captures=%d rebuilds=%d invalidations=%d\n", L, req, t_turn, t_req,
+                g_big_captures.load() - rcap0, g_rebuilds.load() - rreb0, g_invalid.load() - rinv0);
+        };
         for (int it = 0; it < n_pass; ++it) {
+            if (n_req > 1 && it > 0 && it % (n_pass/n_req) == 0 && req + 1 < n_req) {
+                req_report();
+                req++;
+                batch.n_tokens = 0;
+                for (int i = 0; i < n_turn; ++i) {
+                    batch_add(batch, (llama_token) (1000 + rng_next(rs) % 50000), P + i, i == n_turn - 1);
+                }
+                const int64_t tt0 = ggml_time_us();
+                if (llama_decode(ctx, batch) != 0) {
+                    fprintf(stderr, "turn decode failed\n");
+                    return 2;
+                }
+                cur = argmax(llama_get_logits_ith(ctx, -1), n_vocab);
+                t_turn = (ggml_time_us() - tt0)/1e3;
+                P += n_turn;
+                t_req = 0.0;
+                rcap0 = g_big_captures.load(); rreb0 = g_rebuilds.load(); rinv0 = g_invalid.load();
+            }
             int w = fixed;
             if (w <= 0) {
                 int r = (int) (rng_next(rs) % (uint64_t) w_total);
@@ -231,6 +263,10 @@ int main(int argc, char ** argv) {
                 t_by_w[w].push_back(ms);
             }
             passes.push_back({ w, ms });
+            t_req += ms;
+        }
+        if (n_req > 1) {
+            req_report();
         }
         const int caps = g_big_captures.load() - cap0;
         const int rebs = g_rebuilds.load() - reb0;
