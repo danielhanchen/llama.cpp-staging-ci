@@ -2299,6 +2299,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (cost_on) {
             auto & cs = cost_st[seq_id];
+            // k19-tpp: a kept draft past the floor, reached (the floor's drafts held): did it hold, against its predicted rate
+            if (tpp_floor > 0 && (int) cs.probs.size() == tpp_floor + 1 && n_accepted >= tpp_floor) {
+                tpp_cost.observe_marginal(cost_pol.draft_rate(cs.probs[tpp_floor]), n_accepted > tpp_floor);
+            }
             if (!cs.probs.empty()) {
                 cost_pol.observe_probs(cs.probs.data(), (int) cs.probs.size(), n_accepted);
                 cs.probs.clear();

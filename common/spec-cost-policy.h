@@ -451,7 +451,37 @@ struct common_spec_tpp_cost {
     double  probe_q = 0.5;
     int     stale   = STALE;
 
+    // the draft past the floor: how often it held against its predicted rate (draft_rate), per context bucket, decayed. The rate
+    // is calibrated over every context, and a long context can hold far less than it says (G4 fn4 30k: the wider windows added
+    // ~0.05 tokens per pass), so the wider window's extra tokens are scaled by this ratio. LLAMA_SPEC_TPP_MARG_PRIOR: the prior's
+    // weight in drafts (0: off, the rate as calibrated); LLAMA_SPEC_TPP_MARG_CAP: the largest ratio (a kept draft is one whose rate
+    // looked high, so held / predicted runs below 1 even where the rate is right; the cap above 1 lets that noise even out)
+    static constexpr double MDECAY = 0.97;
+    struct marg_stat {
+        double pred = 0.0;
+        double held = 0.0;
+    };
+    marg_stat mg[CTX];
+    double marg_prior  = 4.0;
+    double marg_cap    = 1.25;
+    // LLAMA_SPEC_TPP_SWITCH_SKIP=1 (opt-in): the first round after a window-size switch stays out of the size's median. Off by
+    // default: a size not run for a while re-captures its verify graph when the KV view has grown since (3-5 ms host, plans/fndec.md
+    // section 7), a real cost of switching to it, so skipping those rounds underprices the rarely used 4-row window. The switched
+    // rounds' times also go to sw[], a median per kind printed in the cost table, so a run shows what a switch costs
+    bool      switch_skip = false;
+    int       last_k      = -1;
+    size_stat sw[CTX][2];
+
     common_spec_tpp_cost() {
+        if (const char * e = getenv("LLAMA_SPEC_TPP_MARG_PRIOR")) {
+            marg_prior = atof(e);
+        }
+        if (const char * e = getenv("LLAMA_SPEC_TPP_SWITCH_SKIP")) {
+            switch_skip = atoi(e) != 0;
+        }
+        if (const char * e = getenv("LLAMA_SPEC_TPP_MARG_CAP")) {
+            marg_cap = atof(e);
+        }
         if (const char * e = getenv("LLAMA_SPEC_TPP_MARGIN")) {
             margin = atof(e);
         }
@@ -475,8 +505,19 @@ struct common_spec_tpp_cost {
     void observe(int k, double ms) {
         ++rounds;
         size_stat & s = st[bk][k];
+        const bool switched = last_k >= 0 && k != last_k;
+        last_k = k;
         if (!(ms > 0.0) || s.seen++ < SKIP) {
             return;
+        }
+        if (switched) {
+            size_stat & w = sw[bk][k];
+            w.ring[w.n % NS] = (float) ms;
+            w.n++;
+            if (switch_skip && s.n >= PROBES) {
+                s.last = rounds;   // the size ran now: its median stays current
+                return;
+            }
         }
         s.ring[s.n % NS] = (float) ms;
         s.n++;
@@ -504,8 +545,26 @@ struct common_spec_tpp_cost {
         return s.n < PROBES || rounds - s.last > stale;
     }
 
+    double marg_ratio() const {
+        if (!(marg_prior > 0.0)) {
+            return 1.0;
+        }
+        const marg_stat & m = mg[bk];
+        return std::min(marg_cap, (m.held + marg_prior)/(m.pred + marg_prior));
+    }
+
+    // a window that kept the draft past the floor, its predicted hold rate a, and whether it held (the floor's drafts all held)
+    void observe_marginal(double a, bool held) {
+        marg_stat & m = mg[bk];
+        m.pred = MDECAY*m.pred + a;
+        m.held = MDECAY*m.held + (held ? 1.0 : 0.0);
+    }
+
     // window floor + 1 (expected tokens e_w, chance q_w that every draft holds) against the floor window (e_f)
     bool wide_pays(double e_f, double e_w, double q_w) const {
+        const double r = marg_ratio();
+        e_w = e_f + (e_w - e_f)*r;
+        q_w *= r;
         const size_stat & s = st[bk][1];
         if (s.n < PROBES || rounds - s.last > stale) {
             return q_w >= probe_q;   // measure it when the chain is likely to reach it
@@ -516,13 +575,14 @@ struct common_spec_tpp_cost {
 
     std::string text() const {
         std::string out;
-        char b[96];
+        char b[192];
         for (int k = 0; k < CTX; ++k) {
             if (st[k][0].n == 0 && st[k][1].n == 0) {
                 continue;
             }
-            snprintf(b, sizeof(b), "%sctx%d: floor %.2f(n=%d) wide %.2f(n=%d)", out.empty() ? "" : " | ", k, median_of(st[k][0]), st[k][0].n,
-                median_of(st[k][1]), st[k][1].n);
+            snprintf(b, sizeof(b), "%sctx%d: floor %.2f(n=%d) wide %.2f(n=%d) held %.1f/%.1f switched %.2f(n=%d) %.2f(n=%d)",
+                out.empty() ? "" : " | ", k, median_of(st[k][0]), st[k][0].n, median_of(st[k][1]), st[k][1].n, mg[k].held, mg[k].pred,
+                median_of(sw[k][0]), sw[k][0].n, median_of(sw[k][1]), sw[k][1].n);
             out += b;
         }
         return out;
