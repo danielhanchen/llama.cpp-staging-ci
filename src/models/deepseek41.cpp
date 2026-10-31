@@ -587,7 +587,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         }
         GGML_ASSERT(top_k && "DeepSeek-V4.1: top-k source layer produced no top-k");
 
-        GGML_ASSERT(!inp_attn->self_k_rot && "DeepSeek-V4.1: rotated (quantized) KV cache is not supported yet");
+        GGML_ASSERT(!inp_attn->self_k_rot && "DeepSeek-V4.1: the KV cache never rotates K for this model (llama_kv_cache)");
         ggml_build_forward_expand(gf, q);
         ggml_build_forward_expand(gf, kv);
         ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
