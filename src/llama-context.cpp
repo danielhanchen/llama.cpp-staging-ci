@@ -5237,9 +5237,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT(backend_h != nullptr);
 
                 const uint32_t n_embd  = hparams.n_embd_out();
-                float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 if (!(mtp_dev_h_this && mtp_dev_h_store(backend_h, t_h_nextn, ubatch, offset))) {
+                    // the destination is taken after mtp_dev_h_store: a refused device handoff grows the host store
+                    // (nextn_store_ensure), which can reallocate embd_nextn
+                    float * embd_nextn_out = embd_nextn.data + offset*n_embd;
                     GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                     ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
                 }
