@@ -1496,7 +1496,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const struct mmid_row_mapping * matrix_rows,
     const size_t row_size,
     const bool src1_cont,
-    const void * wdata) {
+    const void * wdata,
+    const bool use_ref) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1510,10 +1511,12 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     float tmp[16];
 
+    GGML_UNUSED(use_ref); // no multi-column kernels without AVX2
+
 #if defined(__AVX2__)
     // k15-fn: an expert routed to 2 or more rows of the batch: each weight row is decoded once for up to 8 of them (results
-    // bit-identical to the loop below; GGML_CPU_MMID_MULTI=0: the loop)
-    const ggml_vec_dot_multi_t vdm = ir1_end - ir1_start >= 2 ? ggml_cpu_vec_dot_multi(type) : NULL;
+    // bit-identical to the loop below; GGML_CPU_MMID_MULTI=0: the loop). The reference backend (use_ref) takes the loop.
+    const ggml_vec_dot_multi_t vdm = !use_ref && ir1_end - ir1_start >= 2 ? ggml_cpu_vec_dot_multi(type) : NULL;
     if (vdm != NULL) {
         for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += 8) {
             const int nc = (int) MIN(8, ir1_end - iir1);
@@ -2043,7 +2046,7 @@ static void ggml_compute_forward_mul_mat_id(
             ggml_compute_forward_mul_mat_id_one_chunk(
                 dst, src0, src1, ids, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata
+                src0_cur, matrix_rows, row_size, src1_cont, wdata, params->use_ref
             );
 
             if (nth >= nchunk0 * nchunk1) {
