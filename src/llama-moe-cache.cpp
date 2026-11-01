@@ -459,18 +459,29 @@ static bool llama_moe_cache_in_set(const llama_model & model, llama_moe_cache::l
     }
 }
 
-// the experts of layer il that a cache can hold: all of them in host memory, the layer assigned to a GPU
+// a device whose MUL_MAT_ID and ADD_ID implement the -1 id of the cache (a slot that is not cached or not computed: the row is
+// zeroed / nothing is added, see ggml_mul_mat_id and ggml_add_id): ggml-cuda (CUDA, ROCm, MUSA). Metal and Vulkan read out of
+// bounds or leave stale rows for it, and an RPC device's remote backend is unknown, so their layers are not cached
+static bool llama_moe_cache_device_ok(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return false;
+    }
+    const auto type = ggml_backend_dev_type(dev);
+    if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    const char * name = reg != nullptr ? ggml_backend_reg_name(reg) : nullptr;
+    return name != nullptr && (strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0 || strcmp(name, "MUSA") == 0);
+}
+
+// the experts of layer il that a cache can hold: all of them in host memory, the layer assigned to a GPU whose ops take -1 ids
 static bool llama_moe_cache_layer_cacheable(const llama_model & model, size_t il, std::vector<ggml_tensor *> & experts) {
     experts = llama_moe_cache_layer_experts(model.layers[il]);
     if (experts.empty() || !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
         return false;
     }
-    ggml_backend_dev_t dev = model.dev_layer((int) il);
-    if (dev == nullptr) {
-        return false;
-    }
-    const auto type = ggml_backend_dev_type(dev);
-    return type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+    return llama_moe_cache_device_ok(model.dev_layer((int) il));
 }
 
 // host bytes of the experts that the cache of a layer set can hold
@@ -1055,15 +1066,14 @@ struct llama_moe_cache::impl {
             }
         }
         for (size_t i = 0; i < backends.size(); ++i) {
-            const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
-            if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            if (llama_moe_cache_device_ok(ggml_backend_get_device(backends[i]))) {
                 auto & d = devices.emplace_back();
                 d.backend = backends[i];
                 d.buft    = bufts[i];
             }
         }
         if (devices.empty()) {
-            throw std::runtime_error("MoE cache requires a GPU backend");
+            throw std::runtime_error("MoE cache requires a CUDA / ROCm / MUSA GPU backend");
         }
         if (single_auto && devices.size() != 1) {
             single_req = false; // the default single-graph host misses: one GPU only (multi-GPU is untested)
