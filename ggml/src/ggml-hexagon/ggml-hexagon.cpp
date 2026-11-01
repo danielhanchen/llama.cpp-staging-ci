@@ -3688,6 +3688,11 @@ static bool ggml_hexagon_supported_gated_delta_net(const struct ggml_hexagon_ses
         return false;
     }
 
+    // ggml_gated_delta_net_replay (op_params[1] != 0) is implemented on CPU / CUDA only
+    if (((const int32_t *) op->op_params)[1] != 0) {
+        return false;
+    }
+
     const struct ggml_tensor * q     = op->src[0];
     const struct ggml_tensor * k     = op->src[1];
     const struct ggml_tensor * v     = op->src[2];

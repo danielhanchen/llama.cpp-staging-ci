@@ -9282,6 +9282,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             }
         case GGML_OP_GATED_DELTA_NET:
             {
+                // ggml_gated_delta_net_replay (op_params[1] != 0) is implemented on CPU / CUDA only
+                if (((const int32_t *) op->op_params)[1] != 0) {
+                    return false;
+                }
                 // Match the Vulkan backend: only F32 -> F32, S_v in {16, 32, 64, 128}.
                 if (op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
                     return false;

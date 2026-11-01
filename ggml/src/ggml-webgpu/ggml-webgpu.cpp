@@ -4737,11 +4737,13 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             break;
         case GGML_OP_GATED_DELTA_NET:
             {
+                // ggml_gated_delta_net_replay (op_params[1] != 0) is implemented on CPU / CUDA only
                 const uint32_t s_v = (uint32_t) src2->ne[0];
                 supports_op = op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
                               src2->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                               op->src[4]->type == GGML_TYPE_F32 && op->src[5]->type == GGML_TYPE_F32 &&
-                              s_v <= ctx->webgpu_global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;
+                              s_v <= ctx->webgpu_global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup &&
+                              ((const int32_t *) op->op_params)[1] == 0;
             }
             break;
         case GGML_OP_CLAMP:

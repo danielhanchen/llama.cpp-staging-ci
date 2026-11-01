@@ -7282,12 +7282,14 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 return false;
             }
             return true;
+        case GGML_OP_GATED_DELTA_NET:
+            // ggml_gated_delta_net_replay (op_params[1] != 0) is implemented on CPU / CUDA only
+            return ((const int32_t *) op->op_params)[1] == 0;
         case GGML_OP_LEAKY_RELU:
         case GGML_OP_TIMESTEP_EMBEDDING:
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
         case GGML_OP_GATED_LINEAR_ATTN:
-        case GGML_OP_GATED_DELTA_NET:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
             return true;

@@ -1842,7 +1842,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
+            // ggml_gated_delta_net_replay (op_params[1] != 0) is implemented on CPU / CUDA only
+            return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0 && ((const int32_t *) op->op_params)[1] == 0;
         case GGML_OP_SOLVE_TRI:
             return has_simdgroup_reduction && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_MUL_MAT:

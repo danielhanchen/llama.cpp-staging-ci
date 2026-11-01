@@ -1655,6 +1655,9 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
         if (op->src[3]->ne[0] != 1) {
             return {false, "GATED_DELTA_NET with kda (per-key-dimension gating) is not supported"};
         }
+        if (((const int32_t *) op->op_params)[1] != 0) {
+            return {false, "GATED_DELTA_NET replay window (ggml_gated_delta_net_replay) is not supported"};
+        }
         // K > 1 (multiple state snapshots) not supported by fused op
         if (((const int32_t *) op->op_params)[0] > 1) {
             return {false, "GATED_DELTA_NET with K > 1 (multiple state snapshots) is not supported"};
