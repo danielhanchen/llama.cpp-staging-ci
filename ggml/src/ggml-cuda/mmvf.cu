@@ -1043,6 +1043,9 @@ bool ggml_cuda_verify_graph_active() {
 // MMF / cuBLAS; 2: dense mmvq products without fusion keep the 4 warps of 1..4 columns (the generic table halves them from 5). Not
 // bit-identical to a 5-row window without it (f32 summation order, KLD-gated); a row's sums then no longer depend on whether the window
 // had 3 or 6 rows for these products. NVIDIA Ampere and newer only, CUDA builds only: HIP / MUSA and older GPUs keep their kernels
+// KNOWN ISSUE (kvr2_tfc1, 10-31): with GGML_CUDA_VERIFY_WIDE=3 and 4-draft windows, Qwen3.8-Flash-Next (fn4, G4 full card) gave a
+// speculative distribution far from the model's own (teacher-forced) one at a confident position (long48 prompt 10 pos 64: KLD 0.54, the
+// wrong top token; the base without it 0.003): not only reassociation. Under investigation (k19-v5bug); do not enable it.
 int ggml_cuda_verify_wide_cols(const int cc, const int bit) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(cc, bit);
@@ -1050,7 +1053,12 @@ int ggml_cuda_verify_wide_cols(const int cc, const int bit) {
 #else
     static const int mask = [] {
         const char * e = getenv("GGML_CUDA_VERIFY_WIDE");
-        return e != nullptr ? atoi(e) : 0; // off by default: reassociation-class, KLD-gated, not md5-exact
+        const int m = e != nullptr ? atoi(e) : 0; // off by default: reassociation-class, KLD-gated, not md5-exact
+        if (m != 0) {
+            GGML_LOG_WARN("%s: GGML_CUDA_VERIFY_WIDE=%d is on: known deviation from the model at some 5-row verify positions (kvr2_tfc1: "
+                "KLD 0.54 vs teacher forcing at a confident position, the wrong top token); under investigation (k19-v5bug), do not enable it\n", __func__, m);
+        }
+        return m;
     }();
     static const int max_cols = [] {
         const char * e = getenv("GGML_CUDA_VERIFY_WIDE_MAX");
