@@ -364,14 +364,6 @@ llama_kv_cache::llama_kv_cache(
             attn_rot_k = true;
         }
 
-        // DeepSeek-V4.1 (deepseek41) builds its window attention without the Hadamard rotation of a quantized K cache yet: the K cache
-        // is kept unrotated (lower quantization accuracy, as before attention rotation) instead of a graph that cannot be built
-        if (model.arch == LLM_ARCH_DEEPSEEK41 && attn_rot_k) {
-            attn_rot_k = false;
-            LLAMA_LOG_WARN("%s: DeepSeek-V4.1: the quantized K cache (%s) is not rotated (its attention does not apply the rotation yet)\n",
-                    __func__, ggml_type_name(type_k));
-        }
-
         const bool attn_rot_v =
             !attn_rot_disable &&
             n_embd_head_v_all > 0 &&
