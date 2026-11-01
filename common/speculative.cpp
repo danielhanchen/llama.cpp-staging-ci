@@ -1696,6 +1696,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (tpp_floor > 0) {
             const bool cached = this->params.ctx_tgt != nullptr && llama_moe_cache_active(this->params.ctx_tgt);
             tpp_cost.set_cached(cached);
+            if (tpp_cost.ctx_on) {
+                LOG_INF("%s: k19-tppctx: windows fixed per context bucket: drafts past %d per bucket <1536 / <6144 / <12288 / <24576 / longer "
+                    "%d / %d / %d / %d / %d (-1 priced; LLAMA_SPEC_TPP_CTX=0: off)\n", __func__, tpp_floor, tpp_cost.ctx_extra[0],
+                    tpp_cost.ctx_extra[1], tpp_cost.ctx_extra[2], tpp_cost.ctx_extra[3], tpp_cost.ctx_extra[4]);
+            }
             LOG_INF("%s: k19-tpp: MTP windows of %d drafts, %d where the expected tokens per ms pay for the wider window (LLAMA_SPEC_TPP=0: "
                 "off); round times %s (cost ratio %.2f at 16k, MoE cache %s; LLAMA_SPEC_TPP_LIVE=1: live medians)\n", __func__, tpp_floor,
                 tpp_floor + 1, tpp_cost.live ? "live" : "from the fixed table", tpp_cost.cost_ratio[3], cached ? "on" : "off");

@@ -485,6 +485,14 @@ struct common_spec_tpp_cost {
     bool      switch_skip = false;
     int       last_k      = -1;
     size_stat sw[CTX][2];
+    // k19-tppctx, LLAMA_SPEC_TPP_CTX (default 1, =0 off): the window of some context buckets is fixed instead of priced:
+    // LLAMA_SPEC_TPP_CTX_EXTRA="e0,e1,e2,e3,e4" drafts past the floor per bucket (0 or 1; -1 = priced as before), default "1,-1,-1,-1,-1":
+    // the chat bucket (below 1536 tokens) takes the 3rd draft in every window. G4 Qwen3.8-Flash-Next fn4 full card (kvr2_c1, x3): chat
+    // 258.8 -> 278.6 tok/s (3.24 -> 3.46 tokens per pass at 12.52 / 12.42 ms per pass, the same text), 8k / 16k / 30k unchanged (0.995 /
+    // 1.004 / 1.007, same text); a 4-row window runs a 3-row one's kernels (LLAMA_SPEC_TPP_VERIFY), so the text does not change.
+    // Deterministic: no timing
+    int  ctx_extra[CTX] = { -1, -1, -1, -1, -1 };
+    bool ctx_on         = true;
 
     common_spec_tpp_cost() {
         if (const char * e = getenv("LLAMA_SPEC_TPP_MARG_PRIOR")) {
@@ -513,6 +521,22 @@ struct common_spec_tpp_cost {
         }
         if (const char * e = getenv("LLAMA_SPEC_TPP_STALE")) {
             stale = std::max(1, atoi(e));
+        }
+        if (const char * e = getenv("LLAMA_SPEC_TPP_CTX")) {
+            ctx_on = atoi(e) != 0;
+        }
+        if (ctx_on) {
+            const char * e = getenv("LLAMA_SPEC_TPP_CTX_EXTRA");
+            const std::string str = e != nullptr ? e : "1,-1,-1,-1,-1";
+            size_t p = 0;
+            for (int k = 0; k < CTX && p <= str.size(); ++k) {
+                size_t q = str.find(',', p);
+                if (q == std::string::npos) {
+                    q = str.size();
+                }
+                ctx_extra[k] = std::clamp(atoi(str.substr(p, q - p).c_str()), -1, 1);
+                p = q + 1;
+            }
         }
     }
 
@@ -594,8 +618,16 @@ struct common_spec_tpp_cost {
         m.held = MDECAY*m.held + (held ? 1.0 : 0.0);
     }
 
+    // k19-tppctx: the fixed drafts past the floor of the current bucket, -1 = priced
+    int forced_extra() const {
+        return ctx_on ? ctx_extra[bk] : -1;
+    }
+
     // window floor + 1 (expected tokens e_w, chance q_w that every draft holds) against the floor window (e_f)
     bool wide_pays(double e_f, double e_w, double q_w) const {
+        if (forced_extra() >= 0) {
+            return forced_extra() >= 1;
+        }
         if (max_pos > 0 && pos_cur >= max_pos) {
             return false;
         }
