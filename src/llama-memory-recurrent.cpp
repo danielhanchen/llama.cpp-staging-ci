@@ -1216,10 +1216,15 @@ void llama_memory_recurrent::rs_move_rows(const std::vector<std::pair<uint32_t, 
     if (swaps.empty()) {
         return;
     }
-    const size_t n_views = 2 * swaps.size() * r_l.size() * (6 + 3 * (size_t) n_rs_seq) + 8;
-    ggml_init_params ip = { ggml_tensor_overhead() * n_views, nullptr, true };
-    ggml_context_ptr ctx_own { ggml_init(ip) };
+    // k19-fixD: no views under -sm tensor (move_by_host): two units bounce through host memory on the parent tensor
+    const size_t n_views = move_by_host ? 0 : 2 * swaps.size() * r_l.size() * (6 + 3 * (size_t) n_rs_seq) + 8;
+    ggml_context_ptr ctx_own;
+    if (!move_by_host) {
+        ggml_init_params ip = { ggml_tensor_overhead() * n_views, nullptr, true };
+        ctx_own.reset(ggml_init(ip));
+    }
     ggml_context * ctx = ctx_own.get();
+    std::vector<uint8_t> host_a, host_b;
     // unit u of t: n elements at byte offset u * stride
     auto unit = [&](ggml_tensor * t, int64_t n, size_t stride, size_t u) {
         ggml_tensor * v = ggml_view_1d(ctx, t, n, u * stride);
@@ -1227,6 +1232,16 @@ void llama_memory_recurrent::rs_move_rows(const std::vector<std::pair<uint32_t, 
         return v;
     };
     auto swap_units = [&](ggml_tensor * t, ggml_tensor * tmp, size_t stride, size_t ua, size_t ub) {
+        if (move_by_host) {
+            const size_t nbytes = ggml_row_size(t->type, tmp->ne[0]);
+            host_a.resize(nbytes);
+            host_b.resize(nbytes);
+            ggml_backend_tensor_get(t, host_a.data(), ua * stride, nbytes);
+            ggml_backend_tensor_get(t, host_b.data(), ub * stride, nbytes);
+            ggml_backend_tensor_set(t, host_b.data(), ua * stride, nbytes);
+            ggml_backend_tensor_set(t, host_a.data(), ub * stride, nbytes);
+            return;
+        }
         ggml_tensor * a = unit(t, tmp->ne[0], stride, ua);
         ggml_tensor * b = unit(t, tmp->ne[0], stride, ub);
         ggml_backend_tensor_copy(a, tmp);

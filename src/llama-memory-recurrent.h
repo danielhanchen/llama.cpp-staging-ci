@@ -136,6 +136,10 @@ public:
     // with replay the k, v, gate/beta window slices of a cell), allocated with the cache (so the fit prices them) and only with several
     // sequences: no graph and no allocation at move time (the dup graph of 9c2e needed an unpriced compute buffer, ~900 MiB on G4 fn4)
     std::vector<ggml_tensor *> mv_tmp_r_l, mv_tmp_s_l, mv_tmp_p_l, mv_tmp_k_l, mv_tmp_v_l, mv_tmp_g_l;
+    // k19-fixD: set by llama_context under -sm tensor: the move reads and writes the units of the parent tensors through host memory
+    // instead of copying views (each view is kept in the meta backend's compute view arena, 16 per tensor of the buffer, until the
+    // second graph rebuild after it: one find_slot of two swaps with 7 snapshot groups made 56 views on a buffer of 4 tensors)
+    bool move_by_host = false;
     void rs_move_rows(const std::vector<std::pair<uint32_t, uint32_t>> & swaps);
     void replay_swap(int32_t a, int32_t b, const std::vector<uint8_t> & in_ubatch);
     void replay_mark(const llama_ubatch & ubatch);

@@ -795,6 +795,8 @@ llama_context::llama_context(
                 mr->move_cb = [this, mr](const std::vector<std::pair<uint32_t, uint32_t>> & swaps) { rs_replay_move(mr, swaps); };
                 // k19-fixB: rollback_copy waits for the decodes first; not under -sm tensor (meta buffers, see sync_cb)
                 const bool any_meta = std::any_of(model.devices.begin(), model.devices.end(), [](const auto & d) { return d.is_meta; });
+                // k19-fixD: under -sm tensor the move makes no views (move_by_host)
+                mr->move_by_host = any_meta;
                 if (!any_meta) {
                     mr->sync_cb = [this]() {
                         if (sched) {
