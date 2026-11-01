@@ -11594,6 +11594,11 @@ bool llama_moe_pin_small_set(llama_context * ctx, bool on) {
 }
 
 void llama_context::moe_request_begin() {
+    // k19-fixD: the banks the tiny-ubatch rule released come back before the per-request reset (LLAMA_MOE_CPU_MISS_PER_REQUEST=1)
+    // clears them: hybrid_reset skips a released device, so the request started from the previous request's cache
+    if (moe_cache != nullptr && moe_cache->request_resets()) {
+        tiny_rel_leave();
+    }
     if (moe_cache != nullptr && moe_cache->request_begin()) {
         // the reset takes back the lent slots without a new allocation: a reused graph would keep its copies bound to them
         gf_res_prev_active = nullptr;

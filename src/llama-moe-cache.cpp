@@ -4840,8 +4840,15 @@ struct llama_moe_cache::impl {
     // =1 also empties the cache at each request (hybrid_reset, as the fixed-share hybrid path does): which experts the host computes
     // depends on what is cached, which the earlier requests left (G4 LFM2.5 8 GB 8k: 189 vs 221 tok/s and another text by the order
     // of the requests alone, with the same rule decisions); the prompt's seed fills it again. =2: the decisions only
-    bool cm_request_begin() {
+    static int cm_per_request() {
         static const int on = [] { const char * e = getenv("LLAMA_MOE_CPU_MISS_PER_REQUEST"); return e != nullptr ? atoi(e) : 0; }();
+        return on;
+    }
+    bool cm_request_resets() const {
+        return cm_per_request() == 1 && cm && cm_cal && !cm_frozen;
+    }
+    bool cm_request_begin() {
+        const int on = cm_per_request();
         if (on == 0 || !cm || !cm_cal || cm_frozen) {
             return false;
         }
@@ -9243,6 +9250,10 @@ bool llama_moe_cache::pin_small_set(bool on) {
 bool llama_moe_cache::request_begin() {
     pimpl->stats_request_snapshot();
     return pimpl->cm_request_begin();
+}
+
+bool llama_moe_cache::request_resets() const {
+    return pimpl->cm_request_resets();
 }
 
 bool llama_moe_cache::cpu_miss_drop_slow() {
