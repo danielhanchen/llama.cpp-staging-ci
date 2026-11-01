@@ -497,8 +497,10 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
 
         ggml_tensor * top_k = topk_of[hparams.dsv41_topk_src[il]];
         if (hparams.dsv41_topk_src[il] == il) {
-            ggml_tensor * ik = ggml_cont(ctx0, ggml_view_4d(ctx0, comp_all, n_idx_embd, 1, n_comp, n_stream,
-                    comp_all->nb[1], comp_all->nb[2], comp_all->nb[3], ggml_row_size(comp_all->type, n_embd_head)));
+            ggml_tensor * ik = ggml_view_4d(ctx0, comp_all, n_idx_embd, 1, n_comp, n_stream,
+                    comp_all->nb[1], comp_all->nb[2], comp_all->nb[3], ggml_row_size(comp_all->type, n_embd_head));
+            // the indexer needs the strided view contiguous; CUDA has no same-type copy of quantized views, so dequantize them
+            ik = ggml_is_quantized(ik->type) ? ggml_cast(ctx0, ik, GGML_TYPE_F32) : ggml_cont(ctx0, ik);
 
             ggml_tensor * iq = ggml_reshape_3d(ctx0, build_lora_mm(layer.indexer_attn_q_b, qr), n_idx_embd, n_idx_head, nt);
             iq = rope(iq, inp_pos, n_idx_embd - n_embd_head_rope);
