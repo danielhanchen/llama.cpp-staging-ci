@@ -793,6 +793,22 @@ llama_context::llama_context(
             if (mr != nullptr && mr->n_rs_seq > 0 && !model.hparams.no_alloc) {
                 rs_move_mem = mr;
                 mr->move_cb = [this, mr](const std::vector<std::pair<uint32_t, uint32_t>> & swaps) { rs_replay_move(mr, swaps); };
+                // k19-fixB: rollback_copy waits for the decodes first; not under -sm tensor (meta buffers, see sync_cb)
+                const bool any_meta = std::any_of(model.devices.begin(), model.devices.end(), [](const auto & d) { return d.is_meta; });
+                if (!any_meta) {
+                    mr->sync_cb = [this]() {
+                        if (sched) {
+                            ggml_backend_sched_synchronize(sched.get());
+                        }
+                        if (rs_sched) {
+                            ggml_backend_sched_synchronize(rs_sched.get());
+                        }
+                        if (rs_backend != nullptr) {
+                            ggml_backend_synchronize(rs_backend);
+                        }
+                        state_async_wait_reads();
+                    };
+                }
             }
             if (mr != nullptr && mr->replay && !model.hparams.no_alloc) {
                 rs_replay_mem = mr;
@@ -2021,6 +2037,7 @@ llama_context::~llama_context() {
                     __func__, rs_move_mem->n_snap_move, rs_move_mem->n_replay_move);
         }
         rs_move_mem->move_cb = nullptr;
+        rs_move_mem->sync_cb = nullptr;
     }
     if (n_plan_saves > 0) {
         size_t bytes = 0;

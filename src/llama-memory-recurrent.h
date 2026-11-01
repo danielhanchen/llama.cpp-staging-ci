@@ -125,6 +125,10 @@ public:
     // could not roll back (replay). grp_moved: the cells whose rows moved in the last find_slot (s_copy reads their snapshot there)
     std::vector<uint8_t> grp_moved;
     std::function<void(const std::vector<std::pair<uint32_t, uint32_t>> &)> move_cb; // set by llama_context (rs_replay_move)
+    // k19-fixB: set by llama_context: waits for the work queued on the state rows (decodes, replay commits, async state reads). Without
+    // it rollback_copy is off (the indexed rollback): llama_context leaves it unset under -sm tensor, where each rollback would add views
+    // to the meta backend's compute view arena of a reused graph
+    std::function<void()> sync_cb;
     std::vector<std::pair<uint32_t, uint32_t>> rp_swaps;
     uint64_t n_replay_move = 0;
     uint64_t n_snap_move   = 0;

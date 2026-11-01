@@ -800,7 +800,7 @@ bool llama_memory_recurrent::rollback_copy(uint32_t cell, uint32_t group) {
         const char * e = getenv("LLAMA_RS_ROLLBACK_COPY");
         return e == nullptr || atoi(e) != 0;
     }();
-    if (!enabled || group == 0 || group > n_rs_seq || cell >= size) {
+    if (!enabled || !sync_cb || group == 0 || group > n_rs_seq || cell >= size) {
         return false;
     }
     // only small states (LFM2.5's short convolutions: 16 KiB per layer): a copy synchronises once per tensor, so for large ones (the
@@ -820,6 +820,9 @@ bool llama_memory_recurrent::rollback_copy(uint32_t cell, uint32_t group) {
     if (bytes > max_bytes) {
         return false;
     }
+    // k19-fixB: the copy (a device copy on its own stream, or a memcpy) is not ordered after the decode that wrote the snapshot and the
+    // live row: seq_rm right after llama_decode, without a read of the outputs, is a legal order
+    sync_cb();
     // views of the two rows of every state tensor, in a context of views only (no allocation)
     const size_t n_views = 2*3*(size_t) r_l.size() + 8;
     ggml_init_params ip = { n_views*ggml_tensor_overhead(), nullptr, true };
