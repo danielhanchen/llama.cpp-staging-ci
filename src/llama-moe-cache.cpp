@@ -39,6 +39,40 @@
 #include <unistd.h>
 #endif
 
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#endif
+
+// acquire load / release store / spin pause on the host mailbox words, which the device reads and writes through mapped pinned memory:
+// the GCC / Clang builtins, on MSVC (no __atomic_* / __builtin_ia32_pause) the interlocked intrinsics (full barriers) and _mm_pause
+static inline uint32_t llama_mb_load_acq(const uint32_t * p) {
+#if defined(_MSC_VER) && !defined(__clang__)
+    return (uint32_t) _InterlockedCompareExchange((volatile long *) p, 0, 0);
+#else
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+#endif
+}
+
+static inline void llama_mb_store_rel(uint32_t * p, uint32_t v) {
+#if defined(_MSC_VER) && !defined(__clang__)
+    _InterlockedExchange((volatile long *) p, (long) v);
+#else
+    __atomic_store_n(p, v, __ATOMIC_RELEASE);
+#endif
+}
+
+static inline void llama_mb_spin_pause() {
+#if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_pause();
+#elif defined(_MSC_VER) && !defined(__clang__) && defined(_M_ARM64)
+    __yield();
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#else
+    std::this_thread::yield();
+#endif
+}
+
 bool llama_moe_cache_device_lookup_supported(ggml_backend_dev_t dev) {
     if (dev == nullptr) {
         return false;
@@ -2292,7 +2326,7 @@ struct llama_moe_cache::impl {
             }
             mailbox & mb = *mbp;
             auto * hdr = (ggml_moe_mailbox_hdr *) mb.host;
-            const uint32_t req = __atomic_load_n(&hdr->request, __ATOMIC_ACQUIRE);
+            const uint32_t req = llama_mb_load_acq(&hdr->request);
             if (req == mb.done || (stall_after >= 0 && (int64_t) single_batches >= stall_after)) {
                 continue;
             }
@@ -2303,7 +2337,7 @@ struct llama_moe_cache::impl {
             const int n_tokens = hdr->n_tokens;
             single_plan * p = nullptr;
             // picked up: the merge on the device waits for this batch without a timeout from now on (see moe_mailbox_merge)
-            __atomic_store_n(&hdr->started, req, __ATOMIC_RELEASE);
+            llama_mb_store_rel(&hdr->started, req);
             if (!single_failed.load(std::memory_order_relaxed) && n_tokens >= 1 && n_tokens <= GGML_MOE_MAILBOX_MAX_TOKENS &&
                     single_plan_get(mb, n_tokens, p)) {
                 const int64_t t0 = single_now_us();
@@ -2345,11 +2379,11 @@ struct llama_moe_cache::impl {
             }
             if (!ok) {
                 single_failed.store(true, std::memory_order_relaxed);
-                __atomic_store_n(&hdr->error, 2u, __ATOMIC_RELEASE);
+                llama_mb_store_rel(&hdr->error, 2u);
             }
             single_batches++;
             mb.done = req;
-            __atomic_store_n(&hdr->completed, req, __ATOMIC_RELEASE);
+            llama_mb_store_rel(&hdr->completed, req);
         }
         return work;
     }
@@ -2371,7 +2405,7 @@ struct llama_moe_cache::impl {
             for (size_t i = 0; i < o->mbox_n; ++i) {
                 mailbox * mbp = o->mbox_live[i].load(std::memory_order_acquire);
                 if (mbp != nullptr) {
-                    __atomic_store_n(&((ggml_moe_mailbox_hdr *) mbp->host)->busy, on ? 1u : 0u, __ATOMIC_RELEASE);
+                    llama_mb_store_rel(&((ggml_moe_mailbox_hdr *) mbp->host)->busy, on ? 1u : 0u);
                 }
             }
         }
@@ -2411,11 +2445,7 @@ struct llama_moe_cache::impl {
                 std::unique_lock<std::mutex> lock(h.mtx);
                 h.cv.wait_for(lock, std::chrono::milliseconds(1));
             } else {
-#if defined(__x86_64__) || defined(_M_X64)
-                __builtin_ia32_pause();
-#else
-                std::this_thread::yield();
-#endif
+                llama_mb_spin_pause();
             }
         }
     }
@@ -2428,7 +2458,7 @@ struct llama_moe_cache::impl {
         }
         bool failed = single_failed.load(std::memory_order_relaxed);
         for (auto & mb : mboxes) {
-            failed = failed || (mb && __atomic_load_n(&((ggml_moe_mailbox_hdr *) mb->host)->error, __ATOMIC_ACQUIRE) != 0);
+            failed = failed || (mb && llama_mb_load_acq(&((ggml_moe_mailbox_hdr *) mb->host)->error) != 0);
         }
         if (failed) {
             LLAMA_LOG_ERROR("llama_moe_cache%s: single-graph host misses failed (a merge waited %d ms or the host thread failed): "
