@@ -4179,7 +4179,14 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 #if defined(__AVX2__)
 #define GGML_VDM_MAX 8
 
-static inline __attribute__((always_inline)) void ggml_vec_dot_iq3_s_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+// always inlined into the multi-row MUL_MAT_ID dispatch; MSVC (which defines __AVX2__ under /arch:AVX2) has no __attribute__
+#if defined(_MSC_VER) && !defined(__clang__)
+#define GGML_VDM_INLINE static __forceinline
+#else
+#define GGML_VDM_INLINE static inline __attribute__((always_inline))
+#endif
+
+GGML_VDM_INLINE void ggml_vec_dot_iq3_s_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
     static const uint8_t k_mask1[32] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
                                         0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03
     };
@@ -4263,7 +4270,7 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_iq3_s_q8_K_multi_
     }
 }
 
-static inline __attribute__((always_inline)) void ggml_vec_dot_iq4_nl_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+GGML_VDM_INLINE void ggml_vec_dot_iq4_nl_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
     const block_iq4_nl * GGML_RESTRICT x = vx;
     const int nb = n / QK4_NL;
 
@@ -4343,7 +4350,7 @@ static void ggml_vec_dot_iq4_nl_q8_0_multi(int n, float * GGML_RESTRICT s, const
     }
 }
 
-static inline __attribute__((always_inline)) void ggml_vec_dot_iq1_s_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+GGML_VDM_INLINE void ggml_vec_dot_iq1_s_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
     const block_iq1_s * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
     __m256 accum[GGML_VDM_MAX];
@@ -4406,7 +4413,7 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_iq1_s_q8_K_multi_
     }
 }
 
-static inline __attribute__((always_inline)) void ggml_vec_dot_iq2_xxs_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+GGML_VDM_INLINE void ggml_vec_dot_iq2_xxs_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
     const block_iq2_xxs * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
     const uint64_t * signs64 = (const uint64_t *)keven_signs_q2xs;
@@ -4485,7 +4492,7 @@ static void ggml_vec_dot_iq2_xxs_q8_K_multi(int n, float * GGML_RESTRICT s, cons
     }
 }
 
-static inline __attribute__((always_inline)) void ggml_vec_dot_iq4_xs_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+GGML_VDM_INLINE void ggml_vec_dot_iq4_xs_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
     const block_iq4_xs * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
     const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_iq4nl);
@@ -4554,7 +4561,7 @@ static void ggml_vec_dot_iq4_xs_q8_K_multi(int n, float * GGML_RESTRICT s, const
 // the single-column AVX2 kernel's instruction sequence on its own accumulators, so every result is bit-identical to ggml_vec_dot_X.
 // Before these, a short prompt's host expert paid almost a whole expert per further token (G4 Qwen3.6 UD-Q4_K_XL calibration:
 // 21.7 us per expert, 12.5 us per further token), the host path for prompt ubatches lost to the uploads.
-static inline __attribute__((always_inline)) void ggml_vec_dot_q4_K_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+GGML_VDM_INLINE void ggml_vec_dot_q4_K_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
     const block_q4_K * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
     static const uint32_t kmask1 = 0x3f3f3f3f;
@@ -4623,7 +4630,7 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_q4_K_q8_K_multi_n
     }
 }
 
-static inline __attribute__((always_inline)) void ggml_vec_dot_q5_K_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+GGML_VDM_INLINE void ggml_vec_dot_q5_K_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
     const block_q5_K * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
     static const uint32_t kmask1 = 0x3f3f3f3f;
@@ -4700,7 +4707,7 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_q5_K_q8_K_multi_n
     }
 }
 
-static inline __attribute__((always_inline)) void ggml_vec_dot_q6_K_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+GGML_VDM_INLINE void ggml_vec_dot_q6_K_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
     const block_q6_K * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
     const __m256i m3 = _mm256_set1_epi8(3);
@@ -4769,7 +4776,7 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_q6_K_q8_K_multi_n
     }
 }
 
-static inline __attribute__((always_inline)) void ggml_vec_dot_iq3_xxs_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+GGML_VDM_INLINE void ggml_vec_dot_iq3_xxs_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
     const block_iq3_xxs * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
     const uint64_t * signs64 = (const uint64_t *)keven_signs_q2xs;
@@ -4826,7 +4833,7 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_iq3_xxs_q8_K_mult
     }
 }
 
-static inline __attribute__((always_inline)) void ggml_vec_dot_mxfp4_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+GGML_VDM_INLINE void ggml_vec_dot_mxfp4_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
     const block_mxfp4 * GGML_RESTRICT x = vx;
     const int nb = n / QK_MXFP4;
     const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_fp4);
