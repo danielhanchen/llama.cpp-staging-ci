@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 
 // ---------------------------------------------------------------------------
 // AllReduce for tensor-parallel inference across two GPUs (CUDA or
@@ -478,7 +479,7 @@ struct ggml_cuda_ar_pipeline {
     // i's memory and are written by the peer; dev_tmp[i] is filled by the
     // peer's cudaMemcpyPeerAsync on the copy-engine path.
     bool                     p2p;
-    bool                     p2p_enabled_here[GGML_CUDA_MAX_DEVICES]; // we enabled peer access (undo on free)
+    bool                     p2p_enabled_here[GGML_CUDA_MAX_DEVICES]; // holds a reference of ggml_cuda_ar_peer_refs (dropped on free)
     char *                   p2p_inbox[GGML_CUDA_MAX_DEVICES];        // POOL_SIZE * buf_bytes
     int *                    p2p_flags[GGML_CUDA_MAX_DEVICES];        // POOL_SIZE * KERNEL_BLOCKS * ARRIVAL_STRIDE bytes
     cudaEvent_t              p2p_pushed[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_POOL_SIZE]; // my data is in the peer's dev_tmp
@@ -549,6 +550,41 @@ static void ggml_cuda_ar_wait_for_compute(
 // P2P setup + integrity probe
 // ---------------------------------------------------------------------------
 
+// Peer access is a property of the CUDA context, shared by every pipeline of the process: the pipelines that found it disabled
+// enable it and count references per (device, peer), and the last of them to be freed disables it again. Disabling it on the
+// free of one pipeline revoked it under another live pipeline on the same pair (two -sm tensor contexts on the same 2 GPUs, the
+// first freed while the second decodes: illegal address). Access enabled by someone else (ggml_cuda_init with peer copies,
+// NCCL) is never counted and never disabled here.
+static std::mutex ggml_cuda_ar_peer_mutex;
+static int        ggml_cuda_ar_peer_refs[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {};
+
+// on the current device (dev): true and a reference taken when peer access to peer is on, else false with the error in rc
+static bool ggml_cuda_ar_peer_acquire(int dev, int peer, cudaError_t & rc) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_ar_peer_mutex);
+    if (ggml_cuda_ar_peer_refs[dev][peer] > 0) {
+        ++ggml_cuda_ar_peer_refs[dev][peer];
+        rc = cudaSuccess;
+        return true;
+    }
+    rc = cudaDeviceEnablePeerAccess(peer, 0);
+    if (rc == cudaSuccess) {
+        ggml_cuda_ar_peer_refs[dev][peer] = 1;
+        return true;
+    }
+    (void) cudaGetLastError();
+    return false;
+}
+
+// on the current device (dev): drops a reference taken by ggml_cuda_ar_peer_acquire, the last one disables peer access
+static void ggml_cuda_ar_peer_release(int dev, int peer) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_ar_peer_mutex);
+    GGML_ASSERT(ggml_cuda_ar_peer_refs[dev][peer] > 0);
+    if (--ggml_cuda_ar_peer_refs[dev][peer] == 0) {
+        (void) cudaDeviceDisablePeerAccess(peer);
+        (void) cudaGetLastError();
+    }
+}
+
 static void ggml_cuda_ar_p2p_release(ggml_cuda_ar_pipeline * p) {
     for (int i = 0; i < p->n_devices; ++i) {
         ggml_cuda_set_device(p->devices[i]);
@@ -558,8 +594,7 @@ static void ggml_cuda_ar_p2p_release(ggml_cuda_ar_pipeline * p) {
             if (p->p2p_pushed[i][s]) { CUDA_CHECK(cudaEventDestroy(p->p2p_pushed[i][s])); p->p2p_pushed[i][s] = nullptr; }
         }
         if (p->p2p_enabled_here[i]) {
-            (void) cudaDeviceDisablePeerAccess(p->devices[1 - i]);
-            (void) cudaGetLastError();
+            ggml_cuda_ar_peer_release(p->devices[i], p->devices[1 - i]);
             p->p2p_enabled_here[i] = false;
         }
     }
@@ -789,13 +824,12 @@ static bool ggml_cuda_ar_p2p_setup(ggml_cuda_ar_pipeline * p, char * why, size_t
     }
     for (int i = 0; i < 2; ++i) {
         ggml_cuda_set_device(p->devices[i]);
-        const cudaError_t rc = cudaDeviceEnablePeerAccess(p->devices[1 - i], 0);
-        if (rc == cudaSuccess) {
+        cudaError_t rc = cudaSuccess;
+        if (ggml_cuda_ar_peer_acquire(p->devices[i], p->devices[1 - i], rc)) {
             p->p2p_enabled_here[i] = true;
         } else if (rc == cudaErrorPeerAccessAlreadyEnabled) {
-            (void) cudaGetLastError();
+            // enabled outside the pipelines: not ours to disable
         } else {
-            (void) cudaGetLastError();
             snprintf(why, why_n, "cudaDeviceEnablePeerAccess(%d -> %d): %s", p->devices[i], p->devices[1 - i], cudaGetErrorString(rc));
             ggml_cuda_ar_p2p_release(p);
             return false;
