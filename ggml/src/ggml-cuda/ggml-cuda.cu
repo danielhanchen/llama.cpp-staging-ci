@@ -10619,6 +10619,8 @@ struct ggml_backend_cuda_device_context {
 
 // maps host memory into the address space of the device dev (see ggml_cuda_host_map)
 // single-graph MoE mailbox (k11, see ggml-moe-mailbox.h): mapped host memory the device writes and reads, and its device control block
+// (CUDA only, as its proc address: MUSA has no cudaHostAlloc / cudaHostAllocMapped, HIP has no mailbox kernels)
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 static void * ggml_backend_cuda_moe_mailbox_alloc(void * dev, size_t size, void ** mbox_dev, void ** ctl_dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)((ggml_backend_dev_t) dev)->context;
     ggml_cuda_set_device(ctx->device);
@@ -10644,6 +10646,7 @@ static void * ggml_backend_cuda_moe_mailbox_alloc(void * dev, size_t size, void 
     }
     return host;
 }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 static void ggml_backend_cuda_moe_mailbox_free(void * dev, void * host, void * ctl_dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)((ggml_backend_dev_t) dev)->context;
