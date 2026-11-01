@@ -5524,8 +5524,12 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     const int64_t lm_t_start = ggml_time_us(); // the CUDA graphs used from here on are the group's (evicted with its host memory)
 
     // ubatches that can run layer-major: prompt ubatches whose host experts are prefetched whole (the copy is the same for every ubatch)
+    // k19-fixD: with replay rollback, not a ubatch short enough to leave a replay window (n_seq_tokens <= 1 + n_rs_seq, replay_mark):
+    // the next member's graph applies it, after the in-graph state capture of build_merged copied the rows (cap_now commits the
+    // window first, the merged capture cannot); only with GGML_SCHED_PREFETCH_MIN_BATCH lowered or --draft-max >= 255
     auto eligible = [&](const llama_ubatch & ub) {
-        return ub.n_tokens > llama_moe_cache::n_small_max && (int64_t) ub.n_tokens >= prefetch_min_batch && ub.n_seqs_unq == 1;
+        return ub.n_tokens > llama_moe_cache::n_small_max && (int64_t) ub.n_tokens >= prefetch_min_batch && ub.n_seqs_unq == 1 &&
+            (rs_replay_mem == nullptr || ub.n_seq_tokens > 1 + rs_replay_mem->n_rs_seq);
     };
     // a merged graph of two ubatches was refused for its compute buffer growth: every graph would run alone, as usual
     if (lm_refused_min <= 2) {
