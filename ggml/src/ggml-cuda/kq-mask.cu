@@ -25,17 +25,19 @@ template <typename T>
 static __global__ void kq_mask_kernel(const int32_t * __restrict__ cells, const int32_t * __restrict__ toks, T * __restrict__ dst,
         const int64_t n_kv, const int64_t n_tps, const size_t nb1, const size_t nb3) {
     const int64_t j = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
-    const int64_t i = blockIdx.y;
     const int64_t s = blockIdx.z;
     if (j >= n_kv) {
         return;
     }
-    const bool keep = kq_mask_keep(cells + 5*(s*n_kv + j), toks + 8*(s*n_tps + i));
-    T * row = (T *) ((char *) dst + s*nb3 + i*nb1);
-    if constexpr (std::is_same_v<T, half>) {
-        row[j] = keep ? __float2half(0.0f) : __float2half(-INFINITY);
-    } else {
-        row[j] = keep ? 0.0f : -INFINITY;
+    // grid.y is at most 65535: a stream of more tokens takes several rows per block
+    for (int64_t i = blockIdx.y; i < n_tps; i += gridDim.y) {
+        const bool keep = kq_mask_keep(cells + 5*(s*n_kv + j), toks + 8*(s*n_tps + i));
+        T * row = (T *) ((char *) dst + s*nb3 + i*nb1);
+        if constexpr (std::is_same_v<T, half>) {
+            row[j] = keep ? __float2half(0.0f) : __float2half(-INFINITY);
+        } else {
+            row[j] = keep ? 0.0f : -INFINITY;
+        }
     }
 }
 
@@ -48,7 +50,8 @@ void ggml_cuda_op_kq_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         return;
     }
     const dim3 block(256, 1, 1);
-    const dim3 grid((unsigned) ((n_kv + 255)/256), (unsigned) n_tps, (unsigned) n_stream);
+    GGML_ASSERT(n_stream <= 65535);
+    const dim3 grid((unsigned) ((n_kv + 255)/256), (unsigned) std::min<int64_t>(n_tps, 65535), (unsigned) n_stream);
     cudaStream_t stream = ctx.stream();
     if (dst->type == GGML_TYPE_F16) {
         kq_mask_kernel<half><<<grid, block, 0, stream>>>((const int32_t *) cells->data, (const int32_t *) toks->data, (half *) dst->data,

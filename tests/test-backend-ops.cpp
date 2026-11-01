@@ -13615,6 +13615,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_kq_mask(t, 1024, 64, 1, 1, 128, 0));
         test_cases.emplace_back(new test_kq_mask(t, 1024, 64, 1, 2, 256, 0));
         test_cases.emplace_back(new test_kq_mask(t, 1024, 64, 1, 3, 100, 0));
+        // more than 65535 tokens per stream (the CUDA grid.y limit), two streams
+        test_cases.emplace_back(new test_kq_mask(t, 64, 65600, 2, 0, 0, 0));
     }
     test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, 1048576.0f, 1.0f));
     test_cases.emplace_back(new test_timestep_embedding());
