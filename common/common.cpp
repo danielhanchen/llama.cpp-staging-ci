@@ -3545,7 +3545,8 @@ common_sampler * common_init_result::sampler(llama_seq_id seq_id) {
 
 void common_init_result::reset_samplers() {
     for (int i = 0; i < (int) pimpl->samplers.size(); ++i) {
-        llama_sampler_reset(common_sampler_get(pimpl->samplers[i].get()));
+        // the history too: the greedy fast path rebuilds its penalty window from it (common_sampler_sample), as the chain from its state
+        common_sampler_reset(pimpl->samplers[i].get());
     }
 }
 
