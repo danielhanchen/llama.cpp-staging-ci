@@ -1685,8 +1685,10 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         }
     }
 
-    // their op params hold process-local pointers, which a client must never supply (KQ_MASK: also no shape check of its sources here)
-    if (tensor->op == GGML_OP_MOE_CACHE_LOOKUP || tensor->op == GGML_OP_KQ_MASK) {
+    // their op params hold process-local pointers, which a client must never supply (KQ_MASK: also no shape check of its sources here);
+    // the GATED_DELTA_NET replay window (op_params[1] != 0) reads and writes src[6..8], whose shapes are not checked here either
+    if (tensor->op == GGML_OP_MOE_CACHE_LOOKUP || tensor->op == GGML_OP_KQ_MASK ||
+            (tensor->op == GGML_OP_GATED_DELTA_NET && tensor->op_params[1] != 0)) {
         LOG_ERROR("[%s] op %s is not supported over RPC\n", __func__, ggml_op_name((ggml_op) tensor->op));
         return nullptr;
     }
@@ -2895,8 +2897,10 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
     GGML_UNUSED(dev);
     //TODO: call the remote backend and cache the results
     // KQ_MASK (llama, batches of 64+ tokens) is computed by the client's CPU and its mask uploaded, as the host mask was: the remote
-    // backend may lack it (Metal, Vulkan), and an older server does not know the op
-    return op->op != GGML_OP_MOE_CACHE_LOOKUP && op->op != GGML_OP_KQ_MASK;
+    // backend may lack it (Metal, Vulkan), and an older server does not know the op; the same for the GATED_DELTA_NET replay window
+    // (op_params[1] != 0, llama builds it only on CUDA / ROCm / MUSA / CPU state buffers), which the server refuses too
+    return op->op != GGML_OP_MOE_CACHE_LOOKUP && op->op != GGML_OP_KQ_MASK &&
+        !(op->op == GGML_OP_GATED_DELTA_NET && ggml_get_op_params_i32(op, 1) != 0);
 }
 
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {

@@ -209,8 +209,10 @@ int main() {
             } else {
                 ggml_backend_dev_t rdev = ggml_backend_reg_dev_get(reg, 0);
                 const bool r_kq = refuses(rdev, GGML_OP_KQ_MASK, 0), r_mc = refuses(rdev, GGML_OP_MOE_CACHE_LOOKUP, 0);
-                printf("RPC supports_op refuses: KQ_MASK %d, MOE_CACHE_LOOKUP %d\n", r_kq, r_mc);
-                fails += !r_kq + !r_mc;
+                const bool r_gdn_replay = refuses(rdev, GGML_OP_GATED_DELTA_NET, 1), r_gdn = refuses(rdev, GGML_OP_GATED_DELTA_NET, 0);
+                printf("RPC supports_op refuses: KQ_MASK %d, MOE_CACHE_LOOKUP %d, GATED_DELTA_NET replay %d (plain %d)\n", r_kq, r_mc,
+                        r_gdn_replay, r_gdn);
+                fails += !r_kq + !r_mc + !r_gdn_replay + r_gdn;
                 ggml_backend_ptr be(ggml_backend_dev_init(rdev, nullptr));
                 fails += run_graph("RPC", be.get(), cpu.get());
             }
