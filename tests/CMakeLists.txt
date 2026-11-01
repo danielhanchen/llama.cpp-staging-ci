@@ -263,6 +263,29 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS --rs-decode-parity -s 1
     )
 
+    # the greedy fast path of common_sampler_sample samples what the sampler chain samples, in every mode of its env knobs
+    llama_build(test-sampling-greedy-fast.cpp)
+    foreach(GF_ENV "" "LLAMA_SAMPLE_GREEDY_FAST=0" "LLAMA_SAMPLE_GREEDY_FAST=1" "LLAMA_SAMPLE_GREEDY_FAST=3"
+                   "LLAMA_SAMPLE_BIAS_SPARSE=0" "LLAMA_SAMPLE_GREEDY_PENALTY=0")
+        if (GF_ENV STREQUAL "")
+            set(GF_NAME test-sampling-greedy-fast)
+        else()
+            string(REGEX REPLACE "^LLAMA_SAMPLE_([A-Z_]+)=([0-9])$" "\\1_\\2" GF_SUFFIX "${GF_ENV}")
+            string(TOLOWER "${GF_SUFFIX}" GF_SUFFIX)
+            set(GF_NAME test-sampling-greedy-fast-${GF_SUFFIX})
+        endif()
+        llama_test(
+            test-sampling-greedy-fast
+            NAME ${GF_NAME}
+            LABEL main
+            ARGS "${MODEL_DIR}/llama-dense.gguf"
+        )
+        set_tests_properties(${GF_NAME} PROPERTIES FIXTURES_REQUIRED generate-models)
+        if (NOT GF_ENV STREQUAL "")
+            set_tests_properties(${GF_NAME} PROPERTIES ENVIRONMENT "${GF_ENV}")
+        endif()
+    endforeach()
+
     # the advisory PLE prefetch predicts the rows set_input gathers, on the generated qwen4exp model
     llama_build(test-ple-prefetch.cpp)
     llama_test(

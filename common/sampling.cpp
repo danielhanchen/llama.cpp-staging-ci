@@ -240,11 +240,20 @@ static bool common_sampler_penalty_fast(const common_params_sampling & params) {
     if (!on || common_sampler_greedy_fast_mode() < 2 || params.penalty_last_n <= 0 || params.penalty_last_n > std::max(32, params.n_prev)) {
         return false;
     }
+    // exactly one penalties stage (a second one penalizes again), and only samplers that leave the logits unchanged before it: a
+    // temperature other than 1 scales the logits the frequency / presence penalties are subtracted from (temperature 0 keeps only
+    // the max), and the fast path penalizes the raw logits
+    if (std::count(params.samplers.begin(), params.samplers.end(), COMMON_SAMPLER_TYPE_PENALTIES) != 1) {
+        return false;
+    }
     for (const auto & t : params.samplers) {
         if (t == COMMON_SAMPLER_TYPE_PENALTIES) {
             return true;
         }
         if (t == COMMON_SAMPLER_TYPE_TOP_K || t == COMMON_SAMPLER_TYPE_TOP_P || t == COMMON_SAMPLER_TYPE_MIN_P || t == COMMON_SAMPLER_TYPE_TOP_N_SIGMA) {
+            return false;
+        }
+        if (t == COMMON_SAMPLER_TYPE_TEMPERATURE && (params.temp != 1.0f || params.dynatemp_range != 0.0f)) {
             return false;
         }
     }
@@ -578,7 +587,9 @@ struct common_sampler * common_sampler_init(
     }
 
     result->greedy_fast = common_sampler_greedy_fast(params, grmr, rbudget);
-    result->pen_fast    = result->greedy_fast && common_sampler_penalty_active(params);
+    // the fast path applies the penalties only when the chain has a penalties stage (common_sampler_penalty_fast): a chain without one
+    // never penalizes, whatever the penalty parameters
+    result->pen_fast    = result->greedy_fast && common_sampler_penalty_active(params) && common_sampler_penalty_fast(params);
     // only LLAMA_SAMPLE_GREEDY_FAST=1 reads bias_dense: else the sparse list is built from the biases alone (the same sums, in the same
     // order), not from a fresh n_vocab array and a scan of it (0.5 ms per request with ignore_eos on a 248k vocab). LLAMA_SAMPLE_BIAS_SPARSE=0: as before
     static const bool bias_sparse_only = [] {
@@ -970,10 +981,18 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
                         pc.emplace_back(t, 1);
                     }
                 }
+                // the window tokens without a bias join the biased ones: membership is looked up in bias_sparse (ascending ids, filled in
+                // every mode), not in bias_dense, which the default sparse mode leaves empty: a biased token added twice was saved after
+                // its first -inf write, so the row kept -inf and the bias could be lost (a -inf biased token sampled)
                 auto & sp = gsmpl->sp;
-                sp = gsmpl->bias_sparse;
+                const auto & bsl = gsmpl->bias_sparse;
+                sp = bsl;
                 for (const auto & e : pc) {
-                    if (e.first >= 0 && e.first < n_vocab && (gsmpl->bias_dense.empty() || gsmpl->bias_dense[e.first] == 0.0f)) {
+                    if (e.first < 0 || e.first >= n_vocab) {
+                        continue;
+                    }
+                    const auto it = std::lower_bound(bsl.begin(), bsl.end(), e.first, [](const auto & b, llama_token t) { return b.first < t; });
+                    if (it == bsl.end() || it->first != e.first) {
                         sp.emplace_back(e.first, 0.0f);
                     }
                 }
