@@ -5631,9 +5631,11 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         if (tail) {
             moe_cache->set_force_large(false);
             // its ops on host weights run on the device as the large members' do (the backends would leave a short batch on the CPU)
+            // k19-igpu: an integrated GPU too (ggml-cuda's prop.integrated: Strix Halo gfx1151), whose layer-major groups have the tail as well
             ggml_backend_t be_dev = nullptr;
             for (const auto & b : backends) {
-                if (b.get() != backend_cpu && ggml_backend_dev_type(ggml_backend_get_device(b.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                const enum ggml_backend_dev_type t = b.get() != backend_cpu ? ggml_backend_dev_type(ggml_backend_get_device(b.get())) : GGML_BACKEND_DEVICE_TYPE_CPU;
+                if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) {
                     be_dev = b.get();
                     break;
                 }
@@ -6044,11 +6046,14 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     static const bool   lm_dft_rel_env  = getenv("LLAMA_MOE_LM_DRAFT_RELEASE") == nullptr || atoi(getenv("LLAMA_MOE_LM_DRAFT_RELEASE")) != 0;
     static const size_t lm_dft_rel_free = (size_t) (getenv("LLAMA_MOE_LM_DRAFT_RELEASE_FREE_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LM_DRAFT_RELEASE_FREE_MIB"))) : 512) << 20;
     bool lm_dft_released = false;
+    // k19-igpu: an integrated GPU too: its free memory is the host's available memory (ggml-cuda's UMA path), and freeing the drafter's
+    // compute buffers gives memory back to that one pool without a host copy, so the rule reads the same there
     if (lm_dft_rel_env && gm != nullptr && cparams.spec_draft && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
         size_t free_min = SIZE_MAX;
         for (auto & bk : backend_ptrs) {
             ggml_backend_dev_t dev = ggml_backend_get_device(bk);
-            if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            const enum ggml_backend_dev_type dev_type = dev != nullptr ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+            if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
                 size_t fr = 0, tot = 0;
                 ggml_backend_dev_memory(dev, &fr, &tot);
                 free_min = std::min(free_min, fr);
@@ -6375,10 +6380,13 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 for (const auto & a : lm_ask) {
                     need += GGML_PAD(ggml_nbytes(a.second.ids), 64);
                 }
-                // the device of the first GPU backend (the routing of an offloaded MoE layer is computed there)
+                // the device of the first GPU backend (the routing of an offloaded MoE layer is computed there). k19-igpu: an integrated
+                // GPU too (Strix Halo gfx1151 ran every group with the synchronous read of k14); the pinned host buffer holds only the routing
+                // ids of the group (4 bytes x experts used x tokens per MoE layer, a few MiB), not sized from free memory
                 for (const auto & b : backends) {
                     ggml_backend_dev_t d = ggml_backend_get_device(b.get());
-                    if (d != nullptr && ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    const enum ggml_backend_dev_type d_type = d != nullptr ? ggml_backend_dev_type(d) : GGML_BACKEND_DEVICE_TYPE_CPU;
+                    if (d_type == GGML_BACKEND_DEVICE_TYPE_GPU || d_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
                         dev = d;
                         break;
                     }
