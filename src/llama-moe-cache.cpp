@@ -5254,6 +5254,12 @@ struct llama_moe_cache::impl {
             if (g.n_slots == 0 || !g.dev_lookup || g.counts == nullptr || g.counts->data == nullptr) {
                 continue;
             }
+            // k19-fixB: released banks (llama_moe_cache::release, the tiny-ubatch rule) have no memory to clear; the caller restores
+            // them first (llama_context::tiny_rel_leave), this only keeps a missed caller from a memset on a tensor without a buffer
+            if (devices[g.id].released) {
+                LLAMA_LOG_WARN("%s: MoE cache banks of device %d are released: not reset\n", __func__, g.id);
+                continue;
+            }
             for (int32_t il : g.layers) {
                 if ((size_t) il < refill.size()) {
                     refill[il].clear();
@@ -9187,6 +9193,14 @@ bool llama_moe_cache::host_split_frozen() const {
 
 void llama_moe_cache::tail_skip(ggml_tensor * op, int32_t il, int64_t n_tokens) const {
     pimpl->tail_skip(op, il, n_tokens);
+}
+
+bool llama_moe_cache::tail_skip_off_exact() const {
+    static const bool keep = [] {
+        const char * e = getenv("LLAMA_MOE_ROUTE_TAIL_SKIP_EXACT");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return pimpl->tail_dflt && !keep;
 }
 
 bool llama_moe_cache::freeze_small() {

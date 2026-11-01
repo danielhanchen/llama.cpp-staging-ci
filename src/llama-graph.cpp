@@ -2635,7 +2635,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // the experts of host-resident layers may be read from the MoE cache
     // k16 route tail skip (see llama_moe_cache::tail_skip): only a decode / verify window of one sequence (every row an output), the
     // router's own top k in routing order, and no expert biases (a skipped expert's rows are 0, a bias would still be added)
+    // k19-fixB: exact verify through llama_set_verify_exact (the server's n-gram default) drops the default rule in every graph of the
+    // context, decodes included, as LLAMA_MTP_EXACT=1 does at init: a verify window skips an expert only where every row routes it at
+    // rank >= 7, a single token decode decides per token, so the drafted text was not the bytes of plain decoding
     const bool tail_ok = moe_cache != nullptr && selected_experts_in == nullptr && arch != LLM_ARCH_GROVEMOE &&
+        !(cparams.verify_exact && moe_cache->tail_skip_off_exact()) &&
         n_outputs == n_tokens && ubatch.n_seqs_unq <= 1 &&
         !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b;
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il, hybrid_ok ? &hybrid : nullptr, &hybrid_host, tail_ok);

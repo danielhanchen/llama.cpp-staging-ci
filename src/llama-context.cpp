@@ -3441,6 +3441,10 @@ void llama_context::set_verify(bool value) {
 }
 
 void llama_context::set_verify_exact(bool value) {
+    if (cparams.verify_exact != value && moe_cache) {
+        // k19-fixB: the flag shapes the MoE graphs (the route tail skip, see build_moe_ffn), which a kept graph would not follow
+        gf_res_prev_active = nullptr; gf_res_epoch_bump(__LINE__);
+    }
     cparams.verify_exact = value;
 }
 
@@ -4824,6 +4828,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
         if (fresh) {
+            // k19-fixB: the banks the tiny-ubatch rule released after the last prompt come back first (the reset clears them)
+            tiny_rel_leave();
             moe_cache->hybrid_reset();
         // the reset takes back the lent slots without a new allocation: a reused graph would keep its copies bound to them
         gf_res_prev_active = nullptr; gf_res_epoch_bump(__LINE__);
@@ -9781,6 +9787,7 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
 
     // the next batches continue the state read, not the batches before: see llama_moe_cache::hybrid_reset
     if (moe_cache) {
+        tiny_rel_leave(); // k19-fixB: released banks come back before the reset clears them
         moe_cache->hybrid_reset();
         // the reset takes back the lent slots without a new allocation: a reused graph would keep its copies bound to them
         gf_res_prev_active = nullptr; gf_res_epoch_bump(__LINE__);
@@ -10518,6 +10525,7 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (moe_cache) {
+        tiny_rel_leave(); // k19-fixB: released banks come back before the reset clears them
         moe_cache->hybrid_reset();
         // the reset takes back the lent slots without a new allocation: a reused graph would keep its copies bound to them
         gf_res_prev_active = nullptr; gf_res_epoch_bump(__LINE__);
@@ -11429,6 +11437,15 @@ void llama_context::cap_now(int s, llama_pos pos) {
         return;
     }
     auto & C = cap[s];
+    // k19-fixB: the replay window of the ubatch before (up to 1 + n_rs_seq tokens, replay_mark) is only applied to the state rows by
+    // the next ubatch's apply(), which runs after this capture: commit that cell's window first, or the checkpoint misses those tokens
+    {
+        auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get());
+        auto * rec = hyb ? hyb->get_mem_recr() : dynamic_cast<llama_memory_recurrent *>(memory.get());
+        if (rec != nullptr) {
+            rec->replay_commit_cell((int32_t) C.cell);
+        }
+    }
     // device copies in stream order on the backend that holds the rows (after the ubatches queued so far, before the next one),
     // else through host memory after a sync
     ggml_backend_t be = nullptr;
