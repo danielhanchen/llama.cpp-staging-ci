@@ -4981,6 +4981,82 @@ static int ggml_cuda_try_fuse_hc_post_norm(ggml_backend_cuda_context * cuda_ctx,
     return 0;
 }
 
+static void ggml_cuda_src1_memo_plan_norm(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int i);
+
+// k19-fu2 F1: nodes i .. i + 3 = SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST (hc_combine of block i, prompt batch), then the grouped
+// RMS_NORM -> MUL of block i + 1's mix whose copy its products convert (rms_norm_mul_conv_f32, ggml_cuda_src1_memo): the post is computed
+// inside that norm kernel (ggml_cuda_op_hc_post_rms_norm_conv), one launch instead of dsv4_hc_post_f32 + rms_norm_mul_conv_f32. Same
+// expressions in the same order, so every output keeps its bytes. Returns the extra nodes covered (0 = not taken).
+// GGML_CUDA_DISABLE_FUSE_HC_POST_CONV=1 turns it off; GGML_CUDA_HC_POST_CONV_LOG=1 logs each fused launch (tests).
+static int ggml_cuda_try_fuse_hc_post_norm_conv(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_FUSE_HC_POST_CONV");
+    static const bool log      = ggml_cuda_env_flag("GGML_CUDA_HC_POST_CONV_LOG");
+    if (disabled || cuda_ctx->curr_stream_no != 0 || !cuda_ctx->stream_context().concurrent_events.empty()) {
+        return 0;
+    }
+    ggml_tensor * hc_post = cgraph->nodes[i + 3];
+    if (hc_post->op != GGML_OP_DSV4_HC_POST || hc_post->src[2] != cgraph->nodes[i + 2] || hc_post->src[3] != nullptr) {
+        return 0;
+    }
+    int irn = i + 4;
+    while (irn < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[irn])) {
+        irn++;
+    }
+    if (irn + 1 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * rn  = cgraph->nodes[irn];
+    ggml_tensor * mul = cgraph->nodes[irn + 1];
+    if (rn->op != GGML_OP_RMS_NORM || rn->src[0] != hc_post || !(rn->flags & GGML_TENSOR_FLAG_COMPUTE) || (rn->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            !ggml_node_has_n_uses(cgraph, irn, 1) || mul->op != GGML_OP_MUL || (mul->src[0] != rn && mul->src[1] != rn) ||
+            !(mul->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        return 0;
+    }
+    const ggml_tensor * scale_in  = cgraph->nodes[i];
+    const ggml_tensor * scale_out = cgraph->nodes[i + 2];
+    // the bias of either scale: dsv4_hc_post_f32 does not apply one, so neither does this
+    if (ggml_get_op_params_f32(scale_in, 1) != 0.0f || ggml_get_op_params_f32(scale_out, 1) != 0.0f) {
+        return 0;
+    }
+    // the post output: off the block output, the post weights and the norm output (every block reads a whole block output row while
+    // others write); on the residual only in place (each element read, then written, by one thread). The norm output off every input.
+    {
+        const ggml_tensor * bo  = hc_post->src[0];
+        const ggml_tensor * res = hc_post->src[1];
+        const ggml_tensor * ps  = scale_in->src[0];
+        const ggml_tensor * mw  = mul->src[0] == rn ? mul->src[1] : mul->src[0];
+        if (bo == nullptr || res == nullptr || ps == nullptr || mw == nullptr ||
+                ggml_cuda_tensors_overlap(hc_post, bo) || ggml_cuda_tensors_overlap(hc_post, ps) || ggml_cuda_tensors_overlap(hc_post, mul) ||
+                (ggml_cuda_tensors_overlap(hc_post, res) && !(hc_post->data == res->data && ggml_are_same_stride(hc_post, res))) ||
+                ggml_cuda_tensors_overlap(mul, bo) || ggml_cuda_tensors_overlap(mul, res) || ggml_cuda_tensors_overlap(mul, ps) ||
+                ggml_cuda_tensors_overlap(mul, mw)) {
+            return 0;
+        }
+    }
+    ggml_cuda_src1_memo_plan_norm(cuda_ctx, cgraph, irn);
+    ggml_cuda_src1_memo & memo = cuda_ctx->src1_memo;
+    if (memo.producer == mul &&
+            ggml_cuda_op_hc_post_rms_norm_conv(*cuda_ctx, hc_post, scale_in->src[0], ggml_get_op_params_f32(scale_in, 0),
+                ggml_get_op_params_f32(scale_out, 0), rn, mul)) {
+        static bool logged = false;
+        if (log) {
+            GGML_LOG_INFO("hc post conv: %s + %s in one launch (%lld tokens, mode %d)\n", hc_post->name, mul->name,
+                (long long) hc_post->ne[2], memo.producer_mode);
+        } else if (!logged) {
+            GGML_LOG_INFO("%s: k19-fu2 F1: hc combine + next mix norm (+ q8_1 MMQ copy) in one kernel (GGML_CUDA_DISABLE_FUSE_HC_POST_CONV=1: off)\n", __func__);
+        }
+        logged = true;
+        return irn + 1 - i;
+    }
+    // not taken: the norm plans its own copy when it runs
+    if (memo.producer != nullptr) {
+        memo.release();
+    }
+    memo.producer = nullptr;
+    memo.produced = false;
+    return 0;
+}
+
 // elementwise chain -> DSV4_HC_POST (no comb) where the chain computes the post weights: one kernel, the chain applied to the
 // weight each thread reads. Returns the number of extra nodes covered (0 = no fusion).
 // GGML_CUDA_DISABLE_HC_POST_CHAIN_FUSION=1 turns it off.
@@ -7485,6 +7561,96 @@ static bool ggml_cuda_k19_views_between_ok(const ggml_cgraph * cgraph, int first
     return true;
 }
 
+static void ggml_cuda_src1_memo_plan_products(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int j0, const ggml_tensor * mul);
+
+// k19-fu2 F2: the fused gated delta net output norm (RMS_NORM -> MUL -> SIGMOID(z) -> MUL, node ic = the gated product) of a prompt
+// batch whose out projection converts it to q8_1 MMQ rows with D4 scales: the norm kernel writes that copy too
+// (ggml_cuda_op_rms_norm_mul_sigmoid_gate_mmq, ggml_cuda_src1_memo), so the product does not quantize it. Same bytes.
+// GGML_CUDA_DISABLE_FUSE_GATED_NORM_MMQ=1 turns it off; GGML_CUDA_GATED_NORM_MMQ_LOG=1 logs each fused launch (tests).
+static bool ggml_cuda_try_gated_norm_mmq(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const ggml_tensor * rn,
+        const ggml_tensor * mul_w, const ggml_tensor * unary, ggml_tensor * mul_g, int ic) {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_FUSE_GATED_NORM_MMQ") ||
+        (getenv("GGML_CUDA_SRC1_MEMO") != nullptr && atoi(getenv("GGML_CUDA_SRC1_MEMO")) == 0) ||
+        (getenv("GGML_CUDA_NORM_CONV") != nullptr && atoi(getenv("GGML_CUDA_NORM_CONV")) == 0) ||
+        getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE") != nullptr;
+    static const bool log = ggml_cuda_env_flag("GGML_CUDA_GATED_NORM_MMQ_LOG");
+    ggml_cuda_src1_memo & memo = cuda_ctx->src1_memo;
+    if (disabled || cuda_ctx->curr_stream_no != 0 || !cuda_ctx->stream_context().concurrent_events.empty() || memo.producer != nullptr ||
+            mul_g->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul_g) || mul_g->data == nullptr) {
+        return false;
+    }
+    ggml_cuda_src1_memo_plan_products(cuda_ctx, cgraph, ic + 1, mul_g);
+    if (memo.producer == mul_g && ggml_cuda_op_rms_norm_mul_sigmoid_gate_mmq(*cuda_ctx, rn, mul_w, unary, mul_g)) {
+        static bool logged = false;
+        if (log) {
+            GGML_LOG_INFO("gated norm mmq: %s with its q8_1 MMQ copy in one launch (%lld x %lld)\n", mul_g->name,
+                (long long) memo.K_out, (long long) memo.N_out);
+        } else if (!logged) {
+            GGML_LOG_INFO("%s: k19-fu2 F2: gated delta net norm writes its out projection's q8_1 MMQ copy (GGML_CUDA_DISABLE_FUSE_GATED_NORM_MMQ=1: off)\n", __func__);
+        }
+        logged = true;
+        return true;
+    }
+    if (memo.producer != nullptr) {
+        memo.release();
+    }
+    memo.producer = nullptr;
+    memo.produced = false;
+    return false;
+}
+
+// k19-fu2 F3: SWIGLU (split gate / up, the routed experts' activation) -> MUL_MAT_ID (the down product) on the MMQ path, prompt batches:
+// the product's gathered quantize computes the SWIGLU itself (swiglu_quantize_mmq_q8_1: the same values and the same q8_1 bytes, the
+// rows placed by the inverse expert map, which sorts the rows as the forward map does), so the SWIGLU kernel, its f32 output and its
+// re-read do not run. Returns the extra nodes covered (0 = not taken). GGML_CUDA_DISABLE_FUSE_SWIGLU_MMID=1 turns it off;
+// GGML_CUDA_SWIGLU_MMID_LOG=1 logs each fused launch (tests).
+static int ggml_cuda_try_fuse_swiglu_mmid(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_FUSE_SWIGLU_MMID");
+    static const bool log      = ggml_cuda_env_flag("GGML_CUDA_SWIGLU_MMID_LOG");
+    ggml_tensor * glu = cgraph->nodes[i];
+    if (disabled || glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr ||
+            (glu->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_node_has_n_uses(cgraph, i, 1)) {
+        return 0;
+    }
+    int j = i + 1;
+    while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        j++;
+    }
+    if (j >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * mm = cgraph->nodes[j];
+    if (mm->op != GGML_OP_MUL_MAT_ID || mm->src[1] != glu || !(mm->flags & GGML_TENSOR_FLAG_COMPUTE) || mm->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * ids  = mm->src[2];
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    // the MMQ path of ggml_cuda_mul_mat_id (a prompt batch: no mul_mat_vec_q)
+    if (!ggml_is_quantized(src0->type) || mm->ne[2] <= MMVQ_MAX_BATCH_SIZE ||
+            !ggml_cuda_mm_ids_helper_supported(src0->ne[2], glu->ne[2], ids->ne[0]) ||
+            !ggml_cuda_should_use_mmq(src0->type, cc, glu->ne[2], /*n_experts=*/src0->ne[2]) ||
+            !ggml_cuda_mmq_id_swiglu_ok(src0, glu, ids, mm, cc)) {
+        return 0;
+    }
+    // the product's output (zeroed for skipped slots before the quantize runs) must not cover the gate / up rows the quantize reads
+    if (ggml_cuda_tensors_overlap(mm, glu->src[0]) || ggml_cuda_tensors_overlap(mm, glu->src[1])) {
+        return 0;
+    }
+    cuda_ctx->mmq_swiglu_src1 = glu;
+    ggml_cuda_mul_mat_id(*cuda_ctx, mm);
+    cuda_ctx->mmq_swiglu_src1 = nullptr;
+    static bool logged = false;
+    if (log) {
+        GGML_LOG_INFO("swiglu mmid: %s computed in the quantize of %s (%lld tokens x %lld slots)\n", glu->name, mm->name,
+            (long long) glu->ne[2], (long long) glu->ne[1]);
+    } else if (!logged) {
+        GGML_LOG_INFO("%s: k19-fu2 F3: routed SWIGLU computed in the down product's gathered quantize (GGML_CUDA_DISABLE_FUSE_SWIGLU_MMID=1: off)\n", __func__);
+    }
+    logged = true;
+    return j - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -7492,6 +7658,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_GLU) {
+        if (const int n = ggml_cuda_try_fuse_swiglu_mmid(cuda_ctx, cgraph, i)) {
+            return n;
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT) {
         if (const int n = ggml_cuda_try_fuse_hc_inject_down(cuda_ctx, cgraph, i)) {
@@ -8337,6 +8509,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         q8_1_out = cache.reserve(mul_g->data, ggml_nbytes(mul_g), key, nrows*ne10q/QK8_1*sizeof(block_q8_1));
                     }
                 }
+                if (!target && ggml_cuda_try_gated_norm_mmq(cuda_ctx, cgraph, node, mul_w, unary, mul_g, ic)) {
+                    return ic - i;
+                }
                 if (q8_1_out != nullptr || !target) {
                     const bool ok = ggml_cuda_op_rms_norm_mul_sigmoid_gate(*cuda_ctx, node, mul_w, unary, mul_g, q8_1_out, ne10, ne10q);
                     GGML_ASSERT(ok);
@@ -8424,6 +8599,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST }, { GGML_UNARY_OP_SIGMOID })) {
         if (cgraph->nodes[i + 3]->src[2] == cgraph->nodes[i + 2]) {
             if (const int n = ggml_cuda_try_fuse_hc_post_norm(cuda_ctx, cgraph, i, 3, i + 3)) {
+                return n;
+            }
+            if (const int n = ggml_cuda_try_fuse_hc_post_norm_conv(cuda_ctx, cgraph, i)) {
                 return n;
             }
         }
@@ -8606,6 +8784,8 @@ static const ggml_tensor * ggml_cuda_src1_memo_base(const ggml_tensor * t) {
     return t;
 }
 
+static void ggml_cuda_src1_memo_plan_products(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int j0, const ggml_tensor * mul);
+
 static void ggml_cuda_src1_memo_plan_norm(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int i) {
     static const bool disabled = (getenv("GGML_CUDA_SRC1_MEMO") != nullptr && atoi(getenv("GGML_CUDA_SRC1_MEMO")) == 0) ||
         (getenv("GGML_CUDA_NORM_CONV") != nullptr && atoi(getenv("GGML_CUDA_NORM_CONV")) == 0) ||
@@ -8622,6 +8802,13 @@ static void ggml_cuda_src1_memo_plan_norm(ggml_backend_cuda_context * ctx, const
             mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul) || mul->data == nullptr) {
         return;
     }
+    ggml_cuda_src1_memo_plan_products(ctx, cgraph, i + 2, mul);
+}
+
+// the products of nodes j0 .. j0 + 10 that convert producer (see ggml_cuda_src1_memo_plan_norm): reserve the copy and note the producer
+static void ggml_cuda_src1_memo_plan_products(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int j0, const ggml_tensor * mul) {
+    ggml_cuda_src1_memo & memo = ctx->src1_memo;
+    const int i = j0 - 2;
     const int cc = ggml_cuda_info().devices[ctx->device].cc;
     for (int j = i + 2; j < cgraph->n_nodes && j <= i + 12; ++j) {
         const ggml_tensor * node = cgraph->nodes[j];

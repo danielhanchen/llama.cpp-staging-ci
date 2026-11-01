@@ -2132,3 +2132,6 @@ void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
+
+// k19-fu2 F3: see mmq.cu
+bool ggml_cuda_mmq_id_swiglu_ok(const ggml_tensor * src0, const ggml_tensor * glu, const ggml_tensor * ids, const ggml_tensor * dst, int cc);

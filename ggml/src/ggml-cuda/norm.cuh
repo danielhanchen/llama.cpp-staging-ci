@@ -26,6 +26,12 @@ struct ggml_cuda_hc_post_args {
 };
 
 // q8_1_out != nullptr: also write the q8_1 rows of the (contiguous) output for mul_mat_vec_q, see ggml_cuda_q8_1_cache
+// k19-fu2 F1: a prompt batch's gated DSV4_HC_POST (no comb; post weights = scale_out*sigmoid(scale_in*post_src)) computed inside the
+// grouped RMS_NORM -> MUL that reads it, which also writes the copy its products convert it to (ctx.src1_memo planned for mul_tensor);
+// false (nothing launched) when a precondition fails
+bool ggml_cuda_op_hc_post_rms_norm_conv(ggml_backend_cuda_context & ctx, const ggml_tensor * hc_post, const ggml_tensor * post_src,
+        float gate_scale_in, float gate_scale_out, ggml_tensor * rms_norm, ggml_tensor * mul_tensor);
+
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor, void * q8_1_out = nullptr,
                                  const ggml_tensor * add_tensor = nullptr, const ggml_cuda_hc_post_args * hcp = nullptr);
 
@@ -74,6 +80,11 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 bool ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * mul_w,
                                             const ggml_tensor * unary, ggml_tensor * mul_gate, void * q8_1_out, int64_t ne10, int64_t ne10q,
                                             bool check_only = false);
+
+// k19-fu2 F2: the same fused gated norm for a prompt batch whose out projection reads the output through MMQ: the kernel also writes the
+// q8_1 MMQ (D4) copy ctx.src1_memo planned for mul_gate; false (nothing launched) if the plan or the shapes do not fit
+bool ggml_cuda_op_rms_norm_mul_sigmoid_gate_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * mul_w,
+                                                const ggml_tensor * unary, ggml_tensor * mul_gate);
 
 // k19: two RMS_NORM -> SCALE pairs of one shape and stride in one launch, bitwise the two launches; false if they do not fit
 bool ggml_cuda_op_rms_norm_scale_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * rms0, const ggml_tensor * scale0,

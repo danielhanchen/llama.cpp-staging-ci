@@ -4820,6 +4820,96 @@ struct test_hc_post_norm : public test_case {
     }
 };
 
+static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, bool skip, float amax);
+
+// k19-fu2 F2: the gated delta net output norm of a prompt batch (RMS_NORM -> MUL -> SIGMOID(z) -> MUL over [hd, heads, T], read as
+// [hd*heads, T]) feeding a quantized product on the MMQ path; CUDA writes the q8_1 MMQ copy in the norm kernel for D4 types
+// (GGML_CUDA_DISABLE_FUSE_GATED_NORM_MMQ=1: off), other layouts quantize in the product
+struct test_gated_norm_mmq : public test_case {
+    const int64_t hd;
+    const int64_t heads;
+    const int64_t n_tokens;
+    const ggml_type type;
+
+    ggml_tensor * gated = nullptr;
+    ggml_tensor * out   = nullptr;
+
+    std::string vars() override { return VARS_TO_STR4(hd, heads, n_tokens, type); }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "GATED_NORM_MMQ"; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { gated, out }; }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_gated_norm_mmq(int64_t hd, int64_t heads, int64_t n_tokens, ggml_type type = GGML_TYPE_Q8_0)
+        : hd(hd), heads(heads), n_tokens(n_tokens), type(type) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, heads, n_tokens);
+        ggml_tensor * z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, heads, n_tokens);
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+        ggml_set_name(x, "x");
+        ggml_set_name(z, "z");
+        ggml_set_name(w, "w");
+        x = ggml_scale(ctx, x, 0.5f); // non-leaf inputs, as in a model
+        z = ggml_scale(ctx, z, 2.0f);
+        ggml_tensor * nw = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        gated = ggml_mul(ctx, nw, ggml_sigmoid(ctx, z));
+        ggml_set_name(gated, "gated");
+        ggml_tensor * flat = ggml_reshape_2d(ctx, gated, hd*heads, n_tokens);
+        ggml_tensor * wo = ggml_new_tensor_2d(ctx, type, hd*heads, 96);
+        ggml_set_name(wo, "wo");
+        out = ggml_mul_mat(ctx, wo, flat);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// k19-fu2 F3: the routed experts' SWIGLU (split gate / up, [n_ff, n_used, T]) feeding the down MUL_MAT_ID of a prompt batch; CUDA
+// computes the SWIGLU in the product's gathered quantize (GGML_CUDA_DISABLE_FUSE_SWIGLU_MMID=1: off). skip: some slots are -1
+struct test_swiglu_mmid : public test_case {
+    const ggml_type type;
+    const int n_mats;
+    const int n_used;
+    const int64_t n_ff;
+    const int64_t n_out;
+    const int64_t n_tokens;
+    const bool skip;
+
+    ggml_tensor * glu = nullptr;
+    ggml_tensor * out = nullptr;
+
+    std::string vars() override { return VARS_TO_STR7(type, n_mats, n_used, n_ff, n_out, n_tokens, skip); }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "SWIGLU_MMID"; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_swiglu_mmid(ggml_type type, int n_mats, int n_used, int64_t n_ff, int64_t n_out, int64_t n_tokens, bool skip = false)
+        : type(type), n_mats(n_mats), n_used(n_used), n_ff(n_ff), n_out(n_out), n_tokens(n_tokens), skip(skip) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * g = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ff, n_used, n_tokens);
+        ggml_tensor * u = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ff, n_used, n_tokens);
+        ggml_set_name(g, "g");
+        ggml_set_name(u, "u");
+        g = ggml_scale(ctx, g, 2.0f); // non-leaf inputs, as in a model
+        u = ggml_scale(ctx, u, 0.5f);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * down = ggml_new_tensor_3d(ctx, type, n_ff, n_out, n_mats);
+        ggml_set_name(down, "down");
+        glu = ggml_swiglu_split(ctx, g, u);
+        ggml_set_name(glu, "glu");
+        out = ggml_mul_mat_id(ctx, down, glu, ids);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats, skip, 1.0f);
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -14163,6 +14253,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_conv_cat_state(10240, 4, nt, 1, false));
     }
     test_cases.emplace_back(new test_conv_cat_state(10240, 4, 512, 3, true));
+    // k19-fu2 prompt fusions at the Qwen3.8-Flash-Next shapes: F1 the hc combine in the next mix's norm (+ its Q8_0 MMQ copy), F2 the
+    // gated delta net output norm with its MMQ copy (Q8_0 / Q6_K: D4; Q4_K: DS4, not taken), F3 the routed SWIGLU in the down quantize
+    for (int64_t nt : { 33, 512, 2048 }) {
+        test_cases.emplace_back(new test_hc_post_norm(2560, 4, nt, true, true));
+        test_cases.emplace_back(new test_gated_norm_mmq(128, 48, nt));
+        test_cases.emplace_back(new test_swiglu_mmid(GGML_TYPE_IQ4_NL, 64, 8, 640, 512, nt));
+        test_cases.emplace_back(new test_swiglu_mmid(GGML_TYPE_IQ4_NL, 64, 8, 640, 512, nt, true));
+    }
+    test_cases.emplace_back(new test_hc_post_norm(2560, 4, 512, false, true)); // ungated post: not taken
+    test_cases.emplace_back(new test_gated_norm_mmq(128, 48, 512, GGML_TYPE_Q6_K));
+    test_cases.emplace_back(new test_gated_norm_mmq(128, 48, 512, GGML_TYPE_Q4_K));
+    test_cases.emplace_back(new test_swiglu_mmid(GGML_TYPE_Q4_K, 32, 8, 768, 256, 512));  // DS4
+    test_cases.emplace_back(new test_swiglu_mmid(GGML_TYPE_Q2_K, 32, 8, 768, 256, 512));  // D2S6
+    test_cases.emplace_back(new test_swiglu_mmid(GGML_TYPE_Q8_0, 16, 4, 640, 256, 100)); // fewer used experts, a partial tile
     for (int64_t n_new : { 1, 2, 3 }) {
         test_cases.emplace_back(new test_qsa_pool_keys(128, 4, n_new, 20480));
     }

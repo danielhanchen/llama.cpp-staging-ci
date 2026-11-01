@@ -5,10 +5,15 @@
 //   F5: the CUDA prompt conv-input concat elide (GGML_CUDA_DISABLE_CONV_CAT_PROMPT): state ++ transposed tokens -> SSM_CONV + SILU and
 //       the per-rollback-slot tail copies into the cache (slot 0 over the state row the convolution reads);
 //   F6: the CUDA QSA prompt mask built in one launch (GGML_CUDA_DISABLE_QSA_PROMPT_MASK): the dense selection mask of build_qsa_sel
-//       feeding flash attention.
+//       feeding flash attention;
+//   k19-fu2 F1: the gated hc combine (SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST) computed in the next mix's grouped norm, which writes
+//       the q8_1 MMQ copy of its Q8_0 product (GGML_CUDA_DISABLE_FUSE_HC_POST_CONV);
+//   k19-fu2 F2: the gated delta net output norm writing the q8_1 MMQ copy of its out projection (GGML_CUDA_DISABLE_FUSE_GATED_NORM_MMQ);
+//   k19-fu2 F3: the routed SWIGLU computed in the gathered quantize of the down MUL_MAT_ID (GGML_CUDA_DISABLE_FUSE_SWIGLU_MMID); the SWIGLU
+//       output itself is not written when fused, so only the product is compared.
 // The CUDA kill switches are read once per process, so each mode runs in a child process (this binary with --child MODE FILE) that
 // dumps every case's outputs; the parent compares the dumps byte for byte. GGML_CUDA_CONV_CAT_PROMPT_LOG=1 / GGML_CUDA_QSA_PROMPT_LOG=1
-// make the backend log every fused launch: the fused child must log exactly the expected launches, the other none, so a silent
+// (and GGML_CUDA_HC_POST_CONV_LOG / GGML_CUDA_GATED_NORM_MMQ_LOG / GGML_CUDA_SWIGLU_MMID_LOG) make the backend log every fused launch: the fused child must log exactly the expected launches, the other none, so a silent
 // fallback fails the test. No GPU backend: the F4 CPU check runs, then SKIP for the rest, exit 0.
 
 #include "ggml.h"
@@ -25,16 +30,29 @@
 #include <string>
 #include <vector>
 
-static int n_conv_logs = 0;
-static int n_qsa_logs  = 0;
+// fused launches logged per kind: F5, F6, F1, F2, F3
+enum { L_CONV, L_QSA, L_HCN, L_GN, L_SWM, L_COUNT };
+static int n_logs[L_COUNT] = {};
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
     if (strstr(text, "conv cat prompt:") != nullptr && strstr(text, "read in place") != nullptr) {
-        n_conv_logs++;
+        n_logs[L_CONV]++;
         return;
     }
     if (strstr(text, "qsa prompt mask:") != nullptr) {
-        n_qsa_logs++;
+        n_logs[L_QSA]++;
+        return;
+    }
+    if (strstr(text, "hc post conv:") != nullptr) {
+        n_logs[L_HCN]++;
+        return;
+    }
+    if (strstr(text, "gated norm mmq:") != nullptr) {
+        n_logs[L_GN]++;
+        return;
+    }
+    if (strstr(text, "swiglu mmid:") != nullptr) {
+        n_logs[L_SWM]++;
         return;
     }
     if (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN) {
@@ -42,13 +60,25 @@ static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
     }
 }
 
-enum case_kind { K_PLE, K_CONV, K_QSA };
+enum case_kind { K_PLE, K_CONV, K_QSA, K_HCN, K_GN, K_SWM };
 
 struct fuse_case {
     case_kind kind;
-    int64_t   a, b, c, d; // PLE: hc_dim, n_t, n_slots, w_bf16; CONV: channels, n_t, n_slots, cpy_after; QSA: kv, n_t, nr, n_sel
+    // PLE: hc_dim, n_t, n_slots, w_bf16; CONV: channels, n_t, n_slots, cpy_after; QSA: kv, n_t, nr, n_sel; HCN: n_embd, n_t, gated, -;
+    // GN: head dim, n_t, heads, out type (0 Q8_0 = D4, 1 Q4_K = DS4: not fused); SWM: n_ff, n_t, n_used, skipped slots
+    int64_t   a, b, c, d;
     bool      cf = false; // PLE: channels-first graph
-    bool      fused() const { return kind == K_CONV ? d == 0 : kind == K_QSA; } // the fused child must log one launch
+    bool      fused() const { // the fused child must log one launch
+        switch (kind) {
+            case K_CONV: return d == 0;
+            case K_QSA:  return true;
+            case K_HCN:  return c != 0;
+            case K_GN:   return d == 0;
+            case K_SWM:  return true;
+            default:     return false;
+        }
+    }
+    int       log_kind() const { return kind == K_CONV ? L_CONV : kind == K_QSA ? L_QSA : kind == K_HCN ? L_HCN : kind == K_GN ? L_GN : L_SWM; }
     std::string str() const {
         char buf[160];
         if (kind == K_PLE) {
@@ -57,9 +87,18 @@ struct fuse_case {
         } else if (kind == K_CONV) {
             snprintf(buf, sizeof(buf), "F5 conv cat  channels=%lld n_t=%lld slots=%lld%s", (long long) a, (long long) b, (long long) c,
                      d ? " cpy_after (refused)" : "");
-        } else {
+        } else if (kind == K_QSA) {
             snprintf(buf, sizeof(buf), "F6 QSA mask  kv=%lld n_t=%lld nr=%lld n_sel=%lld", (long long) a, (long long) b, (long long) c,
                      (long long) d);
+        } else if (kind == K_HCN) {
+            snprintf(buf, sizeof(buf), "F1 hc post + norm  n_embd=%lld n_t=%lld %s", (long long) a, (long long) b,
+                     c ? "gated" : "ungated (refused)");
+        } else if (kind == K_GN) {
+            snprintf(buf, sizeof(buf), "F2 gated norm mmq  hd=%lld n_t=%lld heads=%lld %s", (long long) a, (long long) b, (long long) c,
+                     d ? "Q4_K (DS4, refused)" : "Q8_0");
+        } else {
+            snprintf(buf, sizeof(buf), "F3 swiglu mmid  n_ff=%lld n_t=%lld n_used=%lld%s", (long long) a, (long long) b, (long long) c,
+                     d ? " skipped slots" : "");
         }
         return buf;
     }
@@ -83,6 +122,16 @@ static std::vector<fuse_case> gpu_cases() {
         }
     }
     s.push_back({K_QSA, 4096, 40, 8, 2051});
+    // k19-fu2: the Flash-Next prompt shapes (hc 4 x 2560 into the Q8_0 hc down 10240 -> 320; GDN 48 heads x 128 into the Q8_0 out
+    // projection 6144 -> 2560; 8 of 64 experts, n_ff 640, IQ4_NL down 640 -> 2560), a partial tile and the ubatch sizes
+    for (int64_t nt : {33, 512, 2048}) {
+        s.push_back({K_HCN, 2560, nt, 1, 0});
+        s.push_back({K_GN, 128, nt, 48, 0});
+        s.push_back({K_SWM, 640, nt, 8, 0});
+        s.push_back({K_SWM, 640, nt, 8, 1});
+    }
+    s.push_back({K_HCN, 2560, 512, 0, 0}); // ungated post: not taken
+    s.push_back({K_GN, 128, 512, 48, 1});  // DS4 product: not taken
     return s;
 }
 
@@ -183,6 +232,61 @@ static built build_case(const fuse_case & t) {
             }
         }
         r.outs = { out, cache };
+    } else if (t.kind == K_HCN) {
+        // qwen4exp build_hc_combine (gated) of block i, then build_hc_mix's grouped norm of block i + 1 and its hc down / inject products
+        const int64_t n_embd = t.a, hc = 4, n_t = t.b;
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_t);
+        ggml_set_name(x, "x");
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_t);
+        ggml_set_name(residual, "residual");
+        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_t);
+        ggml_set_name(post, "post");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(w, "w");
+        ggml_tensor * wd = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd*hc, 320);
+        ggml_set_name(wd, "wd");
+        ggml_tensor * wi = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, hc);
+        ggml_set_name(wi, "wi");
+        if (t.c) {
+            post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) hc)), 2.0f);
+        }
+        ggml_tensor * hc_out = ggml_dsv4_hc_post(ctx, x, residual, post, nullptr);
+        ggml_tensor * normed = ggml_mul(ctx, ggml_rms_norm(ctx, hc_out, 1e-6f), w);
+        ggml_tensor * flat = ggml_reshape_2d(ctx, normed, n_embd*hc, n_t);
+        ggml_tensor * mm_i = ggml_mul_mat(ctx, wi, flat);
+        ggml_tensor * mm_d = ggml_mul_mat(ctx, wd, flat);
+        ggml_build_forward_expand(r.gf, mm_i);
+        ggml_build_forward_expand(r.gf, mm_d);
+        r.outs = { hc_out, normed, mm_d, mm_i };
+    } else if (t.kind == K_GN) {
+        // qwen4exp build_norm_gated (gated delta net output) into ssm_out
+        const int64_t hd = t.a, n_t = t.b, heads = t.c;
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, heads, n_t);
+        ggml_set_name(x, "x");
+        ggml_tensor * z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, heads, n_t);
+        ggml_set_name(z, "z");
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+        ggml_set_name(w, "w");
+        ggml_tensor * wo = ggml_new_tensor_2d(ctx, t.d ? GGML_TYPE_Q4_K : GGML_TYPE_Q8_0, hd*heads, 2560);
+        ggml_set_name(wo, "wo");
+        ggml_tensor * gated = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w), ggml_sigmoid(ctx, z));
+        ggml_tensor * out = ggml_mul_mat(ctx, wo, ggml_reshape_2d(ctx, gated, hd*heads, n_t));
+        ggml_build_forward_expand(r.gf, out);
+        r.outs = { gated, out };
+    } else if (t.kind == K_SWM) {
+        // build_moe_ffn: SWIGLU of the gate / up products, the down MUL_MAT_ID (gate / up are inputs here)
+        const int64_t n_ff = t.a, n_t = t.b, n_used = t.c, n_exp = 64;
+        ggml_tensor * g = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ff, n_used, n_t);
+        ggml_set_name(g, "g");
+        ggml_tensor * u = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ff, n_used, n_t);
+        ggml_set_name(u, "u");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_t);
+        ggml_set_name(ids, t.d ? "ids_skip" : "ids");
+        ggml_tensor * down = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ4_NL, n_ff, 2560, n_exp);
+        ggml_set_name(down, "down");
+        ggml_tensor * out = ggml_mul_mat_id(ctx, down, ggml_swiglu_split(ctx, g, u), ids);
+        ggml_build_forward_expand(r.gf, out);
+        r.outs = { out };
     } else {
         const int64_t hs = 256, nh = 2, kv = t.a, nb = t.b, nr = t.c, n_sel = t.d;
         ggml_tensor * q  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh * nr, 1);
@@ -249,6 +353,31 @@ static void init_inputs(const fuse_case & t, ggml_context * ctx, int seed) {
                 ids[j * n_sel + 2] = (int32_t) (kv - 1);
             }
             ggml_backend_tensor_set(x, ids.data(), 0, ggml_nbytes(x));
+        } else if (strncmp(x->name, "ids", 3) == 0) {
+            // n_used distinct experts of 64 per token; ids_skip: every 5th token's last two slots are -1 (skipped)
+            const int64_t n_used = x->ne[0], n_t = x->ne[1];
+            std::vector<int32_t> ids(n_used * n_t);
+            std::vector<int32_t> order(64);
+            for (int e = 0; e < 64; ++e) {
+                order[e] = e;
+            }
+            for (int64_t j = 0; j < n_t; ++j) {
+                std::shuffle(order.begin(), order.end(), rng);
+                for (int64_t s = 0; s < n_used; ++s) {
+                    ids[j * n_used + s] = (x->name[3] == '_' && j % 5 == 2 && s >= n_used - 2) ? -1 : order[s];
+                }
+            }
+            ggml_backend_tensor_set(x, ids.data(), 0, ggml_nbytes(x));
+        } else if (ggml_is_quantized(x->type)) {
+            const int64_t n_per_row = x->ne[0];
+            const int64_t nrows = n / n_per_row;
+            std::vector<float> f(n);
+            for (auto & v : f) {
+                v = u(rng);
+            }
+            std::vector<uint8_t> q(ggml_nbytes(x));
+            ggml_quantize_chunk(x->type, f.data(), q.data(), 0, nrows, n_per_row, nullptr);
+            ggml_backend_tensor_set(x, q.data(), 0, q.size());
         } else if (x->type == GGML_TYPE_F32) {
             std::vector<float> d(n);
             for (auto & v : d) {
@@ -352,8 +481,7 @@ static int run_child(const char * path) {
         fwrite(&n, sizeof(n), 1, f);
         fwrite(o.data(), 1, o.size(), f);
     }
-    fwrite(&n_conv_logs, sizeof(n_conv_logs), 1, f);
-    fwrite(&n_qsa_logs, sizeof(n_qsa_logs), 1, f);
+    fwrite(n_logs, sizeof(n_logs), 1, f);
     fclose(f);
     const int n_fail = check_ple(backend, ggml_backend_name(backend));
     ggml_backend_free(backend);
@@ -385,7 +513,7 @@ static bool read_dump(const std::string & path, std::vector<std::vector<uint8_t>
             return false;
         }
     }
-    const bool ok = fread(&logs[0], sizeof(int), 1, f) == 1 && fread(&logs[1], sizeof(int), 1, f) == 1;
+    const bool ok = fread(logs, sizeof(int), L_COUNT, f) == L_COUNT;
     fclose(f);
     return ok;
 }
@@ -417,13 +545,24 @@ int main(int argc, char ** argv) {
 
     const std::vector<fuse_case> sh = gpu_cases();
     std::vector<std::vector<uint8_t>> outs[2];
-    int logs[2][2] = {{-1, -1}, {-1, -1}};
+    int logs[2][L_COUNT];
+    for (int m = 0; m < 2; ++m) {
+        for (int k = 0; k < L_COUNT; ++k) {
+            logs[m][k] = -1;
+        }
+    }
     for (int mode = 0; mode < 2; ++mode) {
         const std::string path = std::string(argc > 1 ? argv[1] : ".") + "/k19_fuse_exact_" + std::to_string(mode) + ".bin";
         set_env("GGML_CUDA_DISABLE_CONV_CAT_PROMPT", mode ? "0" : "1");
         set_env("GGML_CUDA_DISABLE_QSA_PROMPT_MASK", mode ? "0" : "1");
+        set_env("GGML_CUDA_DISABLE_FUSE_HC_POST_CONV", mode ? "0" : "1");
+        set_env("GGML_CUDA_DISABLE_FUSE_GATED_NORM_MMQ", mode ? "0" : "1");
+        set_env("GGML_CUDA_DISABLE_FUSE_SWIGLU_MMID", mode ? "0" : "1");
         set_env("GGML_CUDA_CONV_CAT_PROMPT_LOG", "1");
         set_env("GGML_CUDA_QSA_PROMPT_LOG", "1");
+        set_env("GGML_CUDA_HC_POST_CONV_LOG", "1");
+        set_env("GGML_CUDA_GATED_NORM_MMQ_LOG", "1");
+        set_env("GGML_CUDA_SWIGLU_MMID_LOG", "1");
         std::string cmd = "\"" + std::string(argv[0]) + "\" --child " + std::to_string(mode) + " \"" + path + "\"";
 #ifdef _WIN32
         cmd = "\"" + cmd + "\""; // cmd.exe /c strips the outer pair of quotes of a line with more than two
@@ -437,15 +576,14 @@ int main(int argc, char ** argv) {
     }
 
     int n_fail = 0;
-    int exp_conv = 0;
-    int exp_qsa  = 0;
+    int exp_logs[L_COUNT] = {};
     for (size_t i = 0; i < sh.size(); ++i) {
         const auto & a = outs[0][i];
         const auto & b = outs[1][i];
         size_t first = 0;
         const bool ok = same_bytes(a, b, first);
         if (sh[i].fused()) {
-            (sh[i].kind == K_CONV ? exp_conv : exp_qsa)++;
+            exp_logs[sh[i].log_kind()]++;
         }
         printf("  fused vs graph: %-60s bytes=%zu: %s", sh[i].str().c_str(), a.size(), ok ? "memcmp == 0\n" : "DIFFER");
         if (!ok) {
@@ -453,9 +591,14 @@ int main(int argc, char ** argv) {
             n_fail++;
         }
     }
-    printf("fused launches logged: conv cat graph child %d, fused child %d (expected 0 / %d); QSA mask graph child %d, fused child %d "
-           "(expected 0 / %d)\n", logs[0][0], logs[1][0], exp_conv, logs[0][1], logs[1][1], exp_qsa);
-    if (logs[0][0] != 0 || logs[1][0] != exp_conv || logs[0][1] != 0 || logs[1][1] != exp_qsa) {
+    static const char * log_names[L_COUNT] = { "F5 conv cat", "F6 QSA mask", "F1 hc post conv", "F2 gated norm mmq", "F3 swiglu mmid" };
+    bool logs_ok = true;
+    for (int k = 0; k < L_COUNT; ++k) {
+        printf("fused launches logged: %-18s graph child %d, fused child %d (expected 0 / %d)\n", log_names[k], logs[0][k], logs[1][k],
+               exp_logs[k]);
+        logs_ok = logs_ok && logs[0][k] == 0 && logs[1][k] == exp_logs[k];
+    }
+    if (!logs_ok) {
         printf("FAIL: a fusion did not run exactly once per case in the fused child (or ran in the graph child)\n");
         return 1;
     }

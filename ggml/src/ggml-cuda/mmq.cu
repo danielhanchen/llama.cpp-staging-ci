@@ -344,6 +344,9 @@ void ggml_cuda_mul_mat_q(
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+    // k19-fu2 F3: src1 is a SWIGLU this product computes in its quantize (ggml_cuda_mmq_id_swiglu_ok), scattered by the inverse map
+    const bool swiglu_src1 = ctx.mmq_swiglu_src1 != nullptr && ctx.mmq_swiglu_src1 == src1;
+    GGML_ASSERT(!swiglu_src1 || (!use_native_fp4 && ne11 == n_expert_used));
 
     GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
     const int si1  = ids->nb[1] / ggml_element_size(ids);
@@ -357,7 +360,7 @@ void ggml_cuda_mul_mat_q(
     const int64_t memo_key[ggml_cuda_src1_memo::n_key] = {
         (int64_t) mmq_get_q8_1_ds_layout(src0->type), ne10, ne11, ne12, ne02, n_expert_used, si1, sis1,
         (int64_t) (intptr_t) ids, ne10_padded };
-    const bool memo_top  = !use_native_fp4 && memo.top(dst);
+    const bool memo_top  = !use_native_fp4 && !swiglu_src1 && memo.top(dst);
     const bool memo_hit  = memo_top && memo.match(3, src1, memo_key);
     const bool memo_hold = memo_top && !memo_hit && memo.share_next;
     if (memo_hold) {
@@ -390,7 +393,7 @@ void ggml_cuda_mul_mat_q(
     {
         if (!memo_hit) {
             ggml_cuda_launch_mm_ids_helper(ctx.pool(), (const int32_t *) ids->data, ids_src1_p, ids_dst_p, expert_bounds_p,
-                ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+                ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast || swiglu_src1, stream);
             CUDA_CHECK(cudaGetLastError());
         }
 
@@ -433,6 +436,12 @@ void ggml_cuda_mul_mat_q(
                 quantize_mmq_fp4_cuda(src1_d, ids_src1_p, src1_q8_1_p, src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
                                         ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
             }
+        } else if (swiglu_src1) {
+            const ggml_tensor * g = src1->src[0];
+            const ggml_tensor * u = src1->src[1];
+            swiglu_quantize_mmq_q8_1_cuda((const float *) g->data, (const float *) u->data, ids_src1_p, src1_q8_1_p, src0->type, ne10,
+                g->nb[1] / sizeof(float), g->nb[2] / sizeof(float), u->nb[1] / sizeof(float), u->nb[2] / sizeof(float),
+                ne10_padded, ne12*n_expert_used, ne11_flat, n_expert_used, stream);
         } else if (dedup_bcast) {
             quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1_p, src1_q8_1_p, src0->type, ne10,
                                     /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
@@ -461,6 +470,42 @@ void ggml_cuda_mul_mat_q(
         ggml_cuda_mmq_skip_empty_mode() == 2 || (ggml_cuda_mmq_skip_empty_mode() == 1 && ggml_get_op_params_i32(dst, 2) > 0)};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+}
+
+// k19-fu2 F3: whether the MMQ id path of dst (a MUL_MAT_ID with src0, src1 = glu, ids) can compute glu (SWIGLU of two F32 tensors) in
+// its gathered quantize (swiglu_quantize_mmq_q8_1): q8_1 activations (not the native FP4 path), one row of glu per (token, slot), float4
+// loads of the gate / up rows. The caller checks that the product takes the MMQ path.
+bool ggml_cuda_mmq_id_swiglu_ok(const ggml_tensor * src0, const ggml_tensor * glu, const ggml_tensor * ids, const ggml_tensor * dst, int cc) {
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr || ids == nullptr) {
+        return false;
+    }
+    const ggml_tensor * g = glu->src[0];
+    const ggml_tensor * u = glu->src[1];
+    for (const ggml_tensor * t : { g, u, glu, dst }) {
+        if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float) || t->data == nullptr) {
+            return false;
+        }
+    }
+    const int64_t ne10 = glu->ne[0], n_expert_used = ids->ne[0], n_tokens = glu->ne[2];
+    if (ggml_cuda_mmq_get_prec_src1(src0, dst, cc) == GGML_PREC_Q4 || src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_MXFP4) {
+        return false;
+    }
+    const mmq_q8_1_ds_layout layout = mmq_get_q8_1_ds_layout(src0->type);
+    if (layout != MMQ_Q8_1_DS_LAYOUT_D4 && layout != MMQ_Q8_1_DS_LAYOUT_DS4 && layout != MMQ_Q8_1_DS_LAYOUT_D2S6) {
+        return false;
+    }
+    if (!ggml_is_contiguous(glu) || glu->ne[1] != n_expert_used || glu->ne[3] != 1 || ne10 % 4 != 0 || ne10 != src0->ne[0] ||
+            ids->ne[1] != n_tokens || dst->ne[1] != n_expert_used || dst->ne[2] != n_tokens) {
+        return false;
+    }
+    for (const ggml_tensor * t : { g, u }) {
+        if (t->ne[0] != ne10 || t->ne[1] != n_expert_used || t->ne[2] != n_tokens || t->ne[3] != 1 || !ggml_cuda_is_aligned(t, 16) ||
+                (t->nb[1] / sizeof(float)) % 4 != 0 || (t->nb[2] / sizeof(float)) % 4 != 0 || t->nb[1] % sizeof(float) != 0 ||
+                t->nb[2] % sizeof(float) != 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {

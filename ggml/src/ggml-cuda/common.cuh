@@ -1756,6 +1756,8 @@ struct ggml_backend_cuda_context {
     std::unordered_map<const ggml_tensor *, ggml_cuda_qsa_maskless> qsa_maskless;
     std::unordered_set<const ggml_tensor *> qsa_skip;
     ggml_cuda_src1_memo  src1_memo;
+    // k19-fu2 F3: the SWIGLU node whose MUL_MAT_ID reader computes it in its gathered quantize (set around that product only)
+    const ggml_tensor *  mmq_swiglu_src1 = nullptr;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
