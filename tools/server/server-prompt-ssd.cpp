@@ -183,7 +183,9 @@ static bool read_header(ssd_reader & r, uint64_t ns_hash, llama_tokens & tokens)
     if (!r.get_val(magic) || magic != SSD_MAGIC ||
         !r.get_val(version) || version != SSD_VERSION ||
         !r.get_val(ns) || ns != ns_hash ||
-        !r.get_val(n_tokens) || n_tokens == 0 || n_tokens*sizeof(llama_token) > r.n_left) {
+        // the token count is untrusted: compared by division, n_tokens*sizeof(llama_token) wraps (n_tokens = 2^62 + 16 passed and
+        // the resize below threw std::length_error out of the startup scan, at every start)
+        !r.get_val(n_tokens) || n_tokens == 0 || n_tokens > r.n_left / sizeof(llama_token)) {
         return false;
     }
     tokens.resize(n_tokens);
@@ -284,12 +286,19 @@ void server_prompt_ssd::scan() {
         e.size = (size_t) fs::file_size(p, ec);
         e.last_used = file_mtime_ms(p);
 
+        // an unreadable or corrupt file is skipped and deleted below, it must not stop the server from starting
         bool ok = false;
-        if (FILE * f = open_file(p, "rb")) {
-            ssd_reader r;
-            r.f = f;
-            r.n_left = e.size;
-            ok = read_header(r, ns_hash, e.tokens);
+        FILE * f = ec ? nullptr : open_file(p, "rb");
+        if (f) {
+            try {
+                ssd_reader r;
+                r.f = f;
+                r.n_left = e.size;
+                ok = read_header(r, ns_hash, e.tokens);
+            } catch (const std::exception & err) {
+                SRV_WRN("prompt cache: cannot read '%s': %s\n", e.path.c_str(), err.what());
+                ok = false;
+            }
             fclose(f);
         }
         if (ok) {
@@ -326,6 +335,19 @@ size_t server_prompt_ssd::count() const {
 static bool is_prefix(const llama_tokens & a, const llama_tokens & b) {
     // a is a prefix of b
     return a.size() <= b.size() && std::equal(a.begin(), a.end(), b.begin());
+}
+
+// a is a prefix of the token ids of b
+static bool is_prefix_of(const llama_tokens & a, const server_tokens & b) {
+    if (a.size() > b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // the token ids of a prompt (get_tokens() is not allowed on a multimodal context, media positions are LLAMA_TOKEN_NULL)
@@ -365,6 +387,13 @@ void server_prompt_ssd::put(server_prompt_cache_state && state) {
         for (const auto & e : index) {
             if (is_prefix(tokens, e.tokens)) {
                 SRV_TRC("%s", "prompt cache: prompt is already in the SSD tier\n");
+                return;
+            }
+        }
+        // the same prompt (or a longer one) evicted again before the writer got to it
+        for (const auto & q : queue) {
+            if (is_prefix_of(tokens, q.prompt.tokens)) {
+                SRV_TRC("%s", "prompt cache: prompt is already queued for the SSD tier\n");
                 return;
             }
         }
@@ -423,6 +452,17 @@ void server_prompt_ssd::run() {
 bool server_prompt_ssd::write(const server_prompt_cache_state & state) {
     const llama_tokens tokens = token_ids(state.prompt.tokens);
     const uint64_t key = token_key(ns_hash, tokens);
+
+    {
+        // written since it was queued (an entry with this prompt or a longer one): writing it again would only replace a file
+        std::lock_guard<std::mutex> lock(mtx);
+        for (const auto & e : index) {
+            if (is_prefix(tokens, e.tokens)) {
+                SRV_TRC("%s", "prompt cache: prompt is already in the SSD tier, not written again\n");
+                return false;
+            }
+        }
+    }
 
     char name[32];
     snprintf(name, sizeof(name), "%016" PRIx64 ".lpc", key);
@@ -490,7 +530,8 @@ bool server_prompt_ssd::write(const server_prompt_cache_state & state) {
     }
     for (size_t i = 0; i < index.size(); ++i) {
         if (index[i].path == path_utf8) {
-            remove_locked(i); // replaced by the file just renamed over it
+            // replaced by the file just renamed over it: only the index entry goes (remove_locked would delete the new file)
+            index.erase(index.begin() + i);
             break;
         }
     }
@@ -500,6 +541,11 @@ bool server_prompt_ssd::write(const server_prompt_cache_state & state) {
     e.tokens    = tokens;
     e.key       = key;
     e.size      = (size_t) fs::file_size(path, ec);
+    if (ec) {
+        SRV_WRN("prompt cache: cannot stat '%s': %s\n", e.path.c_str(), ec.message().c_str());
+        fs::remove(path, ec);
+        return false;
+    }
     e.last_used = file_mtime_ms(path);
     index.push_back(std::move(e));
 
