@@ -5,7 +5,8 @@
 // compares the dumps byte for byte. GGML_CUDA_GDN_TILED_LOG=1 makes the backend log every tiled launch: the tiled child
 // must log exactly one launch per shape and the AR child none, so a silent fallback fails the test.
 // Shapes keep the q / k head count != 16, so the chunked MMA kernel declines them on every arch.
-// No GPU backend: prints SKIP and exits 0.
+// The kernel is ggml-cuda's and wave32 only (gdn_use_tiled): without a CUDA / ROCm device, or on a wave64 ROCm device (gfx90a,
+// gfx942, ...), it prints SKIP and exits 0. Metal / Vulkan / SYCL / OpenCL devices are not used.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -50,8 +51,10 @@ static std::vector<gdn_shape> shapes() {
 }
 
 static int n_tiled_logs = 0;
+static std::string init_log; // the backend's device listing (ggml-cuda logs each device's wave size on ROCm)
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
+    init_log += text;
     if (strstr(text, "token-tiled gated delta-net kernel") != nullptr) {
         n_tiled_logs++;
         return;
@@ -68,15 +71,38 @@ static void fill(std::vector<float> & v, std::mt19937 & rng, float lo, float hi)
     }
 }
 
+static bool is_rocm(ggml_backend_dev_t d) {
+    return strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(d)), "ROCm") == 0;
+}
+
+// the first CUDA / ROCm GPU: the token-tiled kernel exists in ggml-cuda only
 static ggml_backend_dev_t gpu_dev() {
     ggml_backend_load_all();
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t d = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_IGPU) { // IGPU: Strix Halo, unified memory
+        if (ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU && ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_IGPU) { // IGPU: Strix Halo, unified memory
+            continue;
+        }
+        const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(d));
+        if (strcmp(reg, "CUDA") == 0 || strcmp(reg, "ROCm") == 0) {
             return d;
         }
     }
     return nullptr;
+}
+
+// the wave size ggml-cuda logged for a ROCm device ("  Device N: ..., Wave Size: W, ..."), 0 when not found
+static int rocm_wave_size(ggml_backend_dev_t d) {
+    const char * name = ggml_backend_dev_name(d); // "ROCm<N>"
+    const std::string key = std::string("Device ") + (name + 4) + ":";
+    for (size_t pos = init_log.find(key); pos != std::string::npos; pos = init_log.find(key, pos + 1)) {
+        const size_t eol = init_log.find('\n', pos);
+        const size_t ws  = init_log.find("Wave Size: ", pos);
+        if (ws != std::string::npos && (eol == std::string::npos || ws < eol)) {
+            return atoi(init_log.c_str() + ws + strlen("Wave Size: "));
+        }
+    }
+    return 0;
 }
 
 static int run_child(const char * path) {
@@ -191,9 +217,18 @@ int main(int argc, char ** argv) {
     }
 
     // the parent never initialises a GPU: only decide whether there is one (the registry enumerates without a context)
-    if (gpu_dev() == nullptr) {
-        printf("SKIP: no GPU backend\n");
+    ggml_log_set(log_cb, nullptr);
+    ggml_backend_dev_t dev = gpu_dev();
+    if (dev == nullptr) {
+        printf("SKIP: no CUDA / ROCm device (the token-tiled gated delta-net kernel is ggml-cuda only)\n");
         return 0;
+    }
+    if (is_rocm(dev)) {
+        const int ws = rocm_wave_size(dev);
+        if (ws != 32) {
+            printf("SKIP: %s has wave size %d (the token-tiled kernel runs on wave32 devices only)\n", ggml_backend_dev_name(dev), ws);
+            return 0;
+        }
     }
 
     const std::vector<gdn_shape> sh = shapes();

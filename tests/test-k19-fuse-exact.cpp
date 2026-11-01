@@ -14,7 +14,7 @@
 // The CUDA kill switches are read once per process, so each mode runs in a child process (this binary with --child MODE FILE) that
 // dumps every case's outputs; the parent compares the dumps byte for byte. GGML_CUDA_CONV_CAT_PROMPT_LOG=1 / GGML_CUDA_QSA_PROMPT_LOG=1
 // (and GGML_CUDA_HC_POST_CONV_LOG / GGML_CUDA_GATED_NORM_MMQ_LOG / GGML_CUDA_SWIGLU_MMID_LOG) make the backend log every fused launch: the fused child must log exactly the expected launches, the other none, so a silent
-// fallback fails the test. No GPU backend: the F4 CPU check runs, then SKIP for the rest, exit 0.
+// fallback fails the test. No CUDA / ROCm device: the F4 CPU check runs, then SKIP for the rest, exit 0.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -420,11 +420,16 @@ static std::vector<uint8_t> run_case(ggml_backend_t backend, const fuse_case & t
     return res;
 }
 
+// the first CUDA / ROCm GPU: the fused launches and their logs are ggml-cuda's (a Metal / Vulkan / SYCL / OpenCL device is not used)
 static ggml_backend_dev_t gpu_dev() {
     ggml_backend_load_all();
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t d = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+        if (ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU && ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(d));
+        if (strcmp(reg, "CUDA") == 0 || strcmp(reg, "ROCm") == 0) {
             return d;
         }
     }
@@ -539,7 +544,7 @@ int main(int argc, char ** argv) {
 
     // the parent never initialises a GPU: only decide whether there is one (the registry enumerates without a context)
     if (gpu_dev() == nullptr) {
-        printf("OK: F4 bit-identical on the CPU backend; SKIP: no GPU backend for F4 / F5 / F6 on the GPU\n");
+        printf("OK: F4 bit-identical on the CPU backend; SKIP: no CUDA / ROCm device for F4 / F5 / F6 on the GPU\n");
         return 0;
     }
 
