@@ -1954,7 +1954,8 @@ void llama_context::tiny_rel_leave() {
         size_t fr = 0, tot = 0;
         for (auto & bk : backend_ptrs) {
             ggml_backend_dev_t dev = ggml_backend_get_device(bk);
-            if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            const enum ggml_backend_dev_type dev_type = dev != nullptr ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+            if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) { // k19-igpu: logged there too
                 ggml_backend_dev_memory(dev, &fr, &tot);
                 break;
             }
@@ -7070,7 +7071,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             if (n_free_log < 4) {
                 for (auto & bk : backend_ptrs) {
                     ggml_backend_dev_t dev = ggml_backend_get_device(bk);
-                    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    const enum ggml_backend_dev_type dev_type = dev != nullptr ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+                    if (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU && dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU) { // k19-igpu: logged there too
                         continue;
                     }
                     size_t fr = 0, tot = 0;
@@ -8103,7 +8105,9 @@ void llama_context::vram_watch_sample(bool force) {
     }
     for (size_t i = 0; i < model.devices.size(); ++i) {
         ggml_backend_dev_t dev = model.devices[i].dev;
-        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        // k19-igpu: an integrated GPU too (its free memory is the host's available memory, ggml-cuda's UMA path)
+        const enum ggml_backend_dev_type dev_type = dev != nullptr ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU && dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
             continue;
         }
         size_t free = 0, total = 0;
