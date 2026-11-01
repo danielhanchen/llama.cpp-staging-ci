@@ -783,6 +783,31 @@ std::string server_prompt_ssd_namespace(
             params.rope_freq_scale, params.yarn_ext_factor, params.yarn_attn_factor, params.yarn_beta_fast,
             params.yarn_beta_slow, params.yarn_orig_ctx));
 
+    // k19-fixE: the lines below are added only off their defaults, so that a default configuration keeps its namespace (directory)
+    if (params.attention_type != LLAMA_ATTENTION_TYPE_UNSPECIFIED) {
+        add("attention_type", std::to_string((int) params.attention_type));
+    }
+
+    // the model metadata overrides (--override-kv: rope base / scaling, expert count, attention scale, context length, ...)
+    // change the logits of the same tokens and do not show in model_desc: a restart with another override restored the old state
+    for (const auto & o : params.kv_overrides) {
+        if (o.key[0] == '\0') {
+            break;
+        }
+        std::string v;
+        switch (o.tag) {
+            case LLAMA_KV_OVERRIDE_TYPE_INT:   v = std::to_string(o.val_i64);           break;
+            case LLAMA_KV_OVERRIDE_TYPE_FLOAT: v = string_format("%a", o.val_f64);      break;
+            case LLAMA_KV_OVERRIDE_TYPE_BOOL:  v = o.val_bool ? "true" : "false";       break;
+            case LLAMA_KV_OVERRIDE_TYPE_STR:   v = std::string(o.val_str, strnlen(o.val_str, sizeof(o.val_str))); break;
+        }
+        add("kv_override", std::string(o.key, strnlen(o.key, sizeof(o.key))) + ":" + std::to_string((int) o.tag) + ":" + v);
+    }
+
+    // --lora-init-without-apply loads the adapters without applying them (until POST /lora-adapters)
+    if (params.lora_init_without_apply && !params.lora_adapters.empty()) {
+        add("lora_init_without_apply", "1");
+    }
     for (const auto & la : params.lora_adapters) {
         add("lora", la.path + ":" + file_identity(la.path) + string_format(":%a", la.scale));
     }

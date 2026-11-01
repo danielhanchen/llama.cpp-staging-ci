@@ -284,6 +284,17 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-moe-cache-device PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # the SSD prompt-cache namespace covers the --override-kv metadata overrides (a restart with another override restored stale state)
+    llama_build(test-server-prompt-ssd-ns.cpp)
+    target_include_directories(test-server-prompt-ssd-ns PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-prompt-ssd-ns PRIVATE server-context)
+    llama_test(
+        test-server-prompt-ssd-ns
+        LABEL main
+        ARGS "${MODEL_DIR}/llama-dense.gguf"
+    )
+    set_tests_properties(test-server-prompt-ssd-ns PROPERTIES FIXTURES_REQUIRED generate-models)
+
     # the greedy fast path of common_sampler_sample samples what the sampler chain samples, in every mode of its env knobs
     llama_build(test-sampling-greedy-fast.cpp)
     foreach(GF_ENV "" "LLAMA_SAMPLE_GREEDY_FAST=0" "LLAMA_SAMPLE_GREEDY_FAST=1" "LLAMA_SAMPLE_GREEDY_FAST=3"
