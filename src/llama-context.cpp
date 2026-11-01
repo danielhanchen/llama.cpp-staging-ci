@@ -352,7 +352,8 @@ static bool tiny_rel_trace() {
     static const bool on = getenv("LLAMA_MOE_TINY_RELEASE_TRACE") != nullptr && atoi(getenv("LLAMA_MOE_TINY_RELEASE_TRACE")) != 0;
     return on;
 }
-#if defined(__linux__)
+// glibc only, as in ggml.c: musl has no <execinfo.h>, Android bionic has it from API 33
+#if defined(__linux__) && defined(__GLIBC__)
 #include <execinfo.h>
 static void tiny_rel_sig(int sig) {
     fprintf(stderr, "tiny_rel_trace: fatal signal %d\n", sig);
@@ -1067,7 +1068,7 @@ llama_context::llama_context(
                 if (lm_enabled) {
                     lm_enabled = false;
                 }
-#if defined(__linux__)
+#if defined(__linux__) && defined(__GLIBC__)
                 if (tiny_rel_trace()) {
                     signal(SIGSEGV, tiny_rel_sig);
                     signal(SIGBUS, tiny_rel_sig);
