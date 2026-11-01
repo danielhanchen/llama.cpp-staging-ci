@@ -316,6 +316,11 @@ llama_build_and_test(test-gdn-tiled-exact.cpp LINK ggml)
 # k19-fuse prompt fusions of qwen4exp (PLE conv taps, conv-input concat, QSA mask) vs the plain graphs, byte for byte (F4 also on the CPU)
 llama_build_and_test(test-k19-fuse-exact.cpp LINK ggml)
 llama_build_and_test(test-spec-type-gguf.cpp)
+# the build identity of the MoE CPU-miss calibration key: unknown-commit builds differ by content, a relaunch keeps its identity
+llama_build_and_test(test-cal-build-id.cpp LINK ggml)
+if (NOT WIN32)
+    target_link_libraries(test-cal-build-id PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 # the weight store is internal to libllama (exported symbols on non-Windows builds), the test uses the CPU backend directly
 if (NOT WIN32 AND NOT GGML_BACKEND_DL)

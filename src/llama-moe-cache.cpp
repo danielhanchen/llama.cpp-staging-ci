@@ -7,6 +7,7 @@
 #include "llama-model.h"
 #include "llama-weight-store.h"
 #include "llama-moe-host-cache.h"
+#include "llama-build-id.h"
 
 #include "ggml-cpp.h"
 #include "ggml-alloc.h"
@@ -5559,6 +5560,29 @@ struct llama_moe_cache::impl {
         return v;
     }
 
+    // the build identity for the calibration key: computed lazily, once per process, on the first calibration file read or write (a load
+    // without a MoE cache with CPU misses never gets here); the module files are hashed only for an unknown / dirty commit, timed, logged once
+    static const std::string & cm_build_id() {
+        static const std::string id = [] {
+            std::string mods[2];
+            mods[0] = llama_build_id_module_path((const void *) &llama_backend_init);
+            ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            ggml_backend_reg_t reg = cpu != nullptr ? ggml_backend_dev_backend_reg(cpu) : nullptr;
+            mods[1] = llama_build_id_module_path(reg != nullptr ? ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads") : nullptr);
+            const int64_t t0 = ggml_time_us();
+            std::string r = llama_build_id(ggml_commit(), mods, 2);
+            if (r != ggml_commit()) {
+                std::error_code ec;
+                const double mb0 = mods[0].empty() ? 0.0 : (double) std::filesystem::file_size(mods[0], ec) / 1048576.0;
+                const double mb1 = mods[1].empty() ? 0.0 : (double) std::filesystem::file_size(mods[1], ec) / 1048576.0;
+                LLAMA_LOG_INFO("llama_moe_cache: CPU-miss calibration key: commit \"%s\", so the build is named by its modules: %s (%.1f MiB) + %s (%.1f MiB) hashed in %.1f ms\n",
+                    ggml_commit(), mods[0].empty() ? "?" : mods[0].c_str(), mb0, mods[1].empty() ? "?" : mods[1].c_str(), mb1, (ggml_time_us() - t0) / 1000.0);
+            }
+            return r;
+        }();
+        return id;
+    }
+
     static std::string cm_cal_dir() {
         auto env = [](const char * n) { const char * e = getenv(n); return std::string(e != nullptr ? e : ""); };
         std::string d = env("LLAMA_MOE_CPU_MISS_CAL_DIR");
@@ -5582,8 +5606,9 @@ struct llama_moe_cache::impl {
 
     // what the timings depend on: the device, the host threads and CPU count, the cache (main / MTP) and the expert form
     std::string cm_cal_key(const group & g, const layer & l) const {
-        // the format version and the build: an upgraded binary times the host again instead of reusing older numbers
-        std::string k = "moe-cpu-miss-cal v2|build=" + std::string(ggml_commit());
+        // the format version and the build: an upgraded binary times the host again instead of reusing older numbers (a build without
+        // git metadata reports commit "unknown": then the content of libllama and the CPU backend module stands in, llama-build-id.h)
+        std::string k = "moe-cpu-miss-cal v2|build=" + cm_build_id();
         ggml_backend_dev_t dev = devices[g.id].backend != nullptr ? ggml_backend_get_device(devices[g.id].backend) : nullptr;
         k += std::string("|dev=") + (dev != nullptr ? ggml_backend_dev_description(dev) : "?");
         k += "|threads=" + std::to_string(single_threads) + "|ncpu=" + std::to_string(std::thread::hardware_concurrency());
