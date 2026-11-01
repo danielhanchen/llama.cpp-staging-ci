@@ -124,7 +124,9 @@ static bool common_fit_pre_ampere() {
         bool any = false;
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            // an integrated GPU counts as the server's floor counts it (a pre-Ampere Jetson pairs the price with the floor as a T4 does)
+            const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+            if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
                 continue;
             }
             ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);

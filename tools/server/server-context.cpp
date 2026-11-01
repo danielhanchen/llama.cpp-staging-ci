@@ -1863,12 +1863,15 @@ private:
                 // memory after the draft does not predict the abort. q4x 4 GB 16k + MTP runs with 18.6 MiB free (decode 169 tok/s, dropping
                 // the draft there costs 30%), while q3m 4 GB 32k + MTP aborts in its first prompt with 58.6 MiB free, the same as with the
                 // draft kept, so a floor there only loses speed. AMD, Moore Threads and other GPUs report no capability: off, as before.
-                // LLAMA_DRAFT_MIN_FREE_MIB=N sets one floor for every GPU
+                // LLAMA_DRAFT_MIN_FREE_MIB=N sets one floor for every GPU, integrated ones included (ggml-cuda reports a device with
+                // prop.integrated as IGPU: Strix Halo gfx1151, Jetson, DGX Spark; the check skipped them, so the floor never applied there,
+                // AMD CI 41265043892: LLAMA_DRAFT_MIN_FREE_MIB=1000000 logged no floor line on the 8060S)
                 if (!failed) {
                     const char * e_mf = getenv("LLAMA_DRAFT_MIN_FREE_MIB");
                     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-                        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        const enum ggml_backend_dev_type dev_type = ggml_backend_dev_type(dev);
+                        if (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU && dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
                             continue;
                         }
                         int mib = 192;
