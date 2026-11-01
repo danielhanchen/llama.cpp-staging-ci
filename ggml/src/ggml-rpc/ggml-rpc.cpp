@@ -1685,9 +1685,9 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         }
     }
 
-    // its op params hold process-local pointers, which a client must never supply
-    if (tensor->op == GGML_OP_MOE_CACHE_LOOKUP) {
-        LOG_ERROR("[%s] op %s is not supported over RPC\n", __func__, ggml_op_name(GGML_OP_MOE_CACHE_LOOKUP));
+    // their op params hold process-local pointers, which a client must never supply (KQ_MASK: also no shape check of its sources here)
+    if (tensor->op == GGML_OP_MOE_CACHE_LOOKUP || tensor->op == GGML_OP_KQ_MASK) {
+        LOG_ERROR("[%s] op %s is not supported over RPC\n", __func__, ggml_op_name((ggml_op) tensor->op));
         return nullptr;
     }
     result->op = (ggml_op) tensor->op;
@@ -2894,7 +2894,9 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
     //TODO: call the remote backend and cache the results
-    return op->op != GGML_OP_MOE_CACHE_LOOKUP;
+    // KQ_MASK (llama, batches of 64+ tokens) is computed by the client's CPU and its mask uploaded, as the host mask was: the remote
+    // backend may lack it (Metal, Vulkan), and an older server does not know the op
+    return op->op != GGML_OP_MOE_CACHE_LOOKUP && op->op != GGML_OP_KQ_MASK;
 }
 
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {

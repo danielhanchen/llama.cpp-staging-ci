@@ -158,6 +158,12 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
     if (op->op == GGML_OP_MOE_CACHE_LOOKUP) {
         return false;
     }
+    // KQ_MASK has no split state either (llama builds it for batches of 64+ tokens): the scheduler puts it on the CPU and copies the
+    // mask, as with the host mask; the GATED_DELTA_NET replay window (op_params[1] != 0) reads and writes src[6..8], which the split
+    // of handle_gated_delta_net does not cover
+    if (op->op == GGML_OP_KQ_MASK || (op->op == GGML_OP_GATED_DELTA_NET && ggml_get_op_params_i32(op, 1) != 0)) {
+        return false;
+    }
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
     return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
         [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });

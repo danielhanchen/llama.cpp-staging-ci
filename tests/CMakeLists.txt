@@ -358,6 +358,8 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 llama_build_and_test(test-arg-parser.cpp)
 # token-tiled gated delta-net vs the AR kernel, byte for byte on the GPU backend (SKIP without one)
 llama_build_and_test(test-gdn-tiled-exact.cpp LINK ggml)
+# the ops added here (KQ_MASK, MOE_CACHE_LOOKUP, the GDN replay window) are refused by the meta backend (-sm tensor) and RPC and run on the CPU
+llama_build_and_test(test-meta-k15-ops.cpp LINK ggml)
 # k19-fuse prompt fusions of qwen4exp (PLE conv taps, conv-input concat, QSA mask) vs the plain graphs, byte for byte (F4 also on the CPU)
 llama_build_and_test(test-k19-fuse-exact.cpp LINK ggml)
 llama_build_and_test(test-spec-type-gguf.cpp)
