@@ -3091,7 +3091,13 @@ static bool ggml_backend_cuda_set_tensors_batch_async(ggml_backend_t backend, gg
     attr.dstLocHint.id   = cuda_ctx->device;
     attr.flags = cudaMemcpyFlagPreferOverlapWithCompute;
     size_t attr_idx = 0;
+#if CUDART_VERSION >= 13000
     const cudaError_t err = cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sz.data(), (size_t) n, &attr, &attr_idx, 1, cuda_ctx->stream());
+#else
+    // CUDA 12.8 / 12.9 declare non-const sources and a failIdx before the stream
+    size_t fail_idx = 0;
+    const cudaError_t err = cudaMemcpyBatchAsync(dsts.data(), const_cast<void **>(srcs.data()), sz.data(), (size_t) n, &attr, &attr_idx, 1, &fail_idx, cuda_ctx->stream());
+#endif
     if (err != cudaSuccess) {
         (void) cudaGetLastError();
         return false;
@@ -3507,8 +3513,8 @@ static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
     static const bool update_retry = getenv("GGML_CUDA_GRAPH_UPDATE_RETRY") == nullptr || atoi(getenv("GGML_CUDA_GRAPH_UPDATE_RETRY")) != 0;
     const bool update_error = stat != cudaSuccess && stat != cudaErrorGraphExecUpdateFailure && update_retry;
     if (update_debug && stat != cudaSuccess && stat != cudaErrorGraphExecUpdateFailure) {
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-        const cudaError_t probe = cudaSuccess;
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || CUDART_VERSION < 12000
+        const cudaError_t probe = cudaSuccess; // cudaGraphExecGetFlags is CUDA 12.0+
 #else
         unsigned long long flags = 0;
         const cudaError_t probe = cudaGraphExecGetFlags(graph->instance, &flags);
