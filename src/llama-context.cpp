@@ -3904,8 +3904,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // hybrid MoE cache: the fetch share is measured with the threads of the small batches, before their first graph is built
     // (CPU misses: at the first ubatch of any size, with the decode threads, so that the first prompt can use the host path)
+    // k19-fixE: not while the tiny-ubatch rule has the banks released (a first prompt ubatch above it with no warmup decode before): the
+    // probe uploads experts into the banks; it stays pending for the first ubatch with the banks back, and such ubatches use no bank
     if (moe_cache && moe_cache->hybrid_probe_pending() && (ubatch.n_tokens <= llama_moe_cache::n_small_max || moe_cache->cpu_miss_enabled()) &&
-            backend_cpu != nullptr) {
+            backend_cpu != nullptr && !moe_cache->released()) {
         ggml_backend_sched_synchronize(sched.get());
         // the calibration times the host with the threads that compute the missing experts (k11 host threads when on)
         compute_n_tokens = -1;
@@ -7988,7 +7990,8 @@ bool llama_context::restore_pp_plan(bool idle) {
     // k15-idlewait (LLAMA_MOE_RECAL_YIELD=0: runs to the end, as before): a request that arrives meanwhile (llama_set_idle_abort) stops it
     // before the next timing repetition and it stays pending for the next idle time; it changes nothing until it completes. G4 q4x 12 GB:
     // the re-calibration of the target and the MTP head (~50 ms) ran after the chat reply, and the next request waited for all of it
-    if (moe_cache && backend_cpu != nullptr && moe_cache->recal_pending()) {
+    // k19-fixE: the re-calibration uploads into the banks too: it waits while they are released
+    if (moe_cache && backend_cpu != nullptr && moe_cache->recal_pending() && !moe_cache->released()) {
         static const bool yield = getenv("LLAMA_MOE_RECAL_YIELD") == nullptr || atoi(getenv("LLAMA_MOE_RECAL_YIELD")) != 0;
         bool (*abort)(void *) = yield && idle ? idle_abort_fn : nullptr;
         // a server (it set llama_set_idle_abort) serves it in its idle work only: the fallback call inside a long prompt's decode would
