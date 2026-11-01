@@ -1274,8 +1274,12 @@ void launch_fattn(
         // parallel_blocks must not be larger than what the tensor size allows:
         parallel_blocks = std::min(parallel_blocks, ntiles_KV);
 
-        // batch invariant one column tiles (k15-fv): the KV split of a launch with one query, so every query is split as it alone is
-        const int ntiles_dst_pb = (KQV->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) && ncols == 1 ? ntiles_dst / ntiles_x : ntiles_dst;
+        // batch invariant one column tiles (k15-fv): the KV split of a launch with one query, so every query is split as it alone is.
+        // From the count above, which for a GQA-packed launch (GGML_CUDA_FA_VEC_GQA, pb_kernel, ncols2 > 1) is the per-head kernel's:
+        // a count of its own here (ntiles_dst) dropped that, so the packed kernel no longer split as the per-head one, and verify
+        // (ncols == 4 there, so not divided) split by the batch size
+        const bool bi_one_query = (KQV->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) && ncols1 == 1 && (ncols2 == 1 || pb_kernel != nullptr);
+        const int ntiles_dst_split = bi_one_query ? ntiles_dst_pb / ntiles_x : ntiles_dst_pb;
 
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
@@ -1283,7 +1287,7 @@ void launch_fattn(
         int nwaves_best = 0;
         int efficiency_percent_best = 0;
         for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
-            const int nblocks_total = ntiles_dst_pb * parallel_blocks_test;
+            const int nblocks_total = ntiles_dst_split * parallel_blocks_test;
             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
 
