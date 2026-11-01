@@ -1000,26 +1000,50 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
         const ggml_tensor * K = dst->src[1];
         const ggml_tensor * V = dst->src[2];
-        GGML_ASSERT(K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16); // no staged K / V copy behind the output (llama-graph)
-        if (k1 == BEST_FATTN_KERNEL_VEC && Q->ne[3] == 1) {
-            ggml_cuda_flash_attn_ext_vec(ctx, dst);
+        // k19-fixC: the per query launches need f16 K and V (another type stages a converted copy behind the output, which a
+        // launch writing one row of it would place over the rows after it). llama-graph splits the queries of one stream itself and
+        // groups f16 K / V only, but a node of several streams (non-unified KV, -np N, a verify batch over 2+ sequences) with a
+        // quantized cache reaches here whole: it takes the ordinary kernels below (correct, not bit-equal to a decode) instead of
+        // the assert it hit before
+        if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
+            if (k1 == BEST_FATTN_KERNEL_VEC && Q->ne[3] == 1) {
+                ggml_cuda_flash_attn_ext_vec(ctx, dst);
+                return;
+            }
+            // one launch per (stream, query): the kernels index the output from its shape (contiguous), so each launch gets its
+            // stream's K / V / mask and output rows with ne[3] = 1 (with ne[3] kept, stream s of the one row output landed at
+            // s*H*D instead of s*n_q*H*D and the streams overwrote each other)
+            GGML_ASSERT(Q->ne[3] % K->ne[3] == 0 && Q->ne[3] % V->ne[3] == 0);
+            GGML_ASSERT(mask == nullptr || Q->ne[3] % mask->ne[3] == 0);
+            for (int64_t s = 0; s < Q->ne[3]; ++s) {
+                ggml_tensor k_s = *K;
+                k_s.ne[3] = 1;
+                k_s.data  = (char *) K->data + (s / (Q->ne[3] / K->ne[3]))*K->nb[3];
+                ggml_tensor v_s = *V;
+                v_s.ne[3] = 1;
+                v_s.data  = (char *) V->data + (s / (Q->ne[3] / V->ne[3]))*V->nb[3];
+                for (int64_t i = 0; i < Q->ne[1]; ++i) {
+                    ggml_tensor q_i = q1;
+                    q_i.ne[3] = 1;
+                    q_i.data  = (char *) Q->data + i*Q->nb[1] + s*Q->nb[3];
+                    ggml_tensor m_i;
+                    if (mask) {
+                        m_i = m1;
+                        m_i.ne[3] = 1;
+                        m_i.data  = (char *) mask->data + i*mask->nb[1] + (s % mask->ne[3])*mask->nb[3];
+                    }
+                    ggml_tensor d_i = d1;
+                    d_i.src[0] = &q_i;
+                    d_i.src[1] = &k_s;
+                    d_i.src[2] = &v_s;
+                    d_i.src[3] = mask ? &m_i : nullptr;
+                    d_i.ne[3]  = 1;
+                    d_i.data   = (char *) dst->data + i*dst->nb[2] + s*dst->nb[3];
+                    ggml_cuda_flash_attn_ext(ctx, &d_i);
+                }
+            }
             return;
         }
-        for (int64_t i = 0; i < Q->ne[1]; ++i) {
-            ggml_tensor q_i = q1;
-            q_i.data = (char *) Q->data + i*Q->nb[1];
-            ggml_tensor m_i;
-            if (mask) {
-                m_i = m1;
-                m_i.data = (char *) mask->data + i*mask->nb[1];
-            }
-            ggml_tensor d_i = d1;
-            d_i.src[0] = &q_i;
-            d_i.src[3] = mask ? &m_i : nullptr;
-            d_i.data   = (char *) dst->data + i*dst->nb[2];
-            ggml_cuda_flash_attn_ext(ctx, &d_i);
-        }
-        return;
     }
 
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
