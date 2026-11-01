@@ -295,6 +295,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-server-prompt-ssd-ns PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # -sm tensor (Meta(CPU, CPU)) with LLAMA_RS_REPLAY=1: the delta-net rollback keeps the snapshot rows and matches the CPU decode
+    llama_build(test-rs-replay-meta.cpp)
+    llama_test(
+        test-rs-replay-meta
+        LABEL main
+        ARGS "${MODEL_DIR}/qwen35-dense.gguf"
+    )
+    set_tests_properties(test-rs-replay-meta PROPERTIES FIXTURES_REQUIRED generate-models)
+
     # the greedy fast path of common_sampler_sample samples what the sampler chain samples, in every mode of its env knobs
     llama_build(test-sampling-greedy-fast.cpp)
     foreach(GF_ENV "" "LLAMA_SAMPLE_GREEDY_FAST=0" "LLAMA_SAMPLE_GREEDY_FAST=1" "LLAMA_SAMPLE_GREEDY_FAST=3"

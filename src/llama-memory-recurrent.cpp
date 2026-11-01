@@ -46,8 +46,15 @@ llama_memory_recurrent::llama_memory_recurrent(
         const char * e = getenv("LLAMA_RS_REPLAY");
         const int mode = e == nullptr || strcmp(e, "auto") == 0 ? -1 : (atoi(e) != 0 ? 1 : 0);
         const bool arch_ok = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN4EXP;
-        const bool can = n_rs_seq > 0 && arch_ok && hparams.n_embd_head_kda == 0 &&
+        // k19-fixE: not under -sm tensor (a meta device): the commit graph's replay inputs are mirrored while the states are split,
+        // and its views abort the meta graph allocation (ggml-backend-meta.cpp split_dim_view_src assert, Meta(CPU,CPU) with
+        // LLAMA_RS_REPLAY=1); the snapshot rows move through host memory there (move_by_host)
+        const bool any_meta = std::any_of(model.devices.begin(), model.devices.end(), [](const auto & d) { return d.is_meta; });
+        const bool can = n_rs_seq > 0 && arch_ok && !any_meta && hparams.n_embd_head_kda == 0 &&
                  hparams.ssm_dt_rank > 0 && hparams.ssm_d_state > 0 && hparams.ssm_d_inner % hparams.ssm_dt_rank == 0;
+        if (any_meta && mode == 1 && n_rs_seq > 0 && arch_ok) {
+            LLAMA_LOG_WARN("%s: LLAMA_RS_REPLAY=1 ignored under -sm tensor: delta-net rollback by snapshot rows\n", __func__);
+        }
         bool want = mode == 1;
         if (can && mode < 0) {
             bool on_host = false, on_dev = false;
