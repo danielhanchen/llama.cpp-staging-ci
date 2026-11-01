@@ -597,11 +597,23 @@ int main(int argc, char ** argv) {
         }
     }
     static const char * log_names[L_COUNT] = { "F5 conv cat", "F6 QSA mask", "F1 hc post conv", "F2 gated norm mmq", "F3 swiglu mmid" };
+    // F1 / F2 / F3 are fused into MMQ, which ggml_cuda_should_use_mmq picks for every case only on NVIDIA Turing and newer (MMA): an
+    // AMD CDNA1 / CDNA2 device (MI100, MI210) takes BLAS for the Q8_0 products of 512 / 2048 tokens, an older NVIDIA GPU above its DP4A
+    // batch limit. Elsewhere the fused child must log at least one of their launches (the 33-token cases take MMQ there too) and at
+    // most the expected count; the outputs are compared byte for byte either way
+    typedef int (*cc_fn_t)(ggml_backend_dev_t);
+    ggml_backend_dev_t gdev = gpu_dev();
+    auto cc_fn = (cc_fn_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(gdev), "ggml_backend_dev_compute_capability");
+    const int cc = cc_fn != nullptr ? cc_fn(gdev) : -1; // NVIDIA only, -1 for ROCm
+    const bool mmq_all = cc >= 750;
     bool logs_ok = true;
     for (int k = 0; k < L_COUNT; ++k) {
-        printf("fused launches logged: %-18s graph child %d, fused child %d (expected 0 / %d)\n", log_names[k], logs[0][k], logs[1][k],
-               exp_logs[k]);
-        logs_ok = logs_ok && logs[0][k] == 0 && logs[1][k] == exp_logs[k];
+        const bool mmq_kind = k == L_HCN || k == L_GN || k == L_SWM;
+        const bool exact    = !mmq_kind || mmq_all;
+        printf("fused launches logged: %-18s graph child %d, fused child %d (expected 0 / %s%d)\n", log_names[k], logs[0][k], logs[1][k],
+               exact ? "" : "1..", exp_logs[k]);
+        logs_ok = logs_ok && logs[0][k] == 0 &&
+            (exact ? logs[1][k] == exp_logs[k] : logs[1][k] >= std::min(1, exp_logs[k]) && logs[1][k] <= exp_logs[k]);
     }
     if (!logs_ok) {
         printf("FAIL: a fusion did not run exactly once per case in the fused child (or ran in the graph child)\n");
