@@ -2113,6 +2113,10 @@ struct llama_moe_cache::impl {
     // one host thread and one CPU backend for every cache of the process (the target and its MTP draft context alternate, two threads
     // with a CPU team each would compete for the same cores): the thread serves the mailboxes of the registered caches
     struct single_hub_t {
+        // the lifecycle (registration, and the last owner's stop / join / CPU backend reset) of caches created and freed on several
+        // threads: without it a cache registering while the last owner stopped saw the thread still joinable and started none, then
+        // the stop joined it and reset the CPU backend, and the new cache's host-miss merges waited forever. Not taken by the thread
+        std::mutex           life_mtx;
         std::mutex           reg_mtx; // the owners; held by the thread while it serves them
         std::vector<impl *>  owners;
         std::thread          thr;
@@ -2191,6 +2195,7 @@ struct llama_moe_cache::impl {
             return true;
         }
         single_hub_t & h = single_hub();
+        std::lock_guard<std::mutex> life(h.life_mtx);
         std::lock_guard<std::mutex> lock(h.reg_mtx);
         if (!h.cpu) {
             h.cpu.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
@@ -2497,6 +2502,8 @@ struct llama_moe_cache::impl {
         // the context synchronized its backends before it frees the cache (they may be gone here)
         if (single_reg) {
             single_hub_t & h = single_hub();
+            // held across the erase and the stop / join of the last owner (reg_mtx is released for the join: the thread takes it)
+            std::lock_guard<std::mutex> life(h.life_mtx);
             bool last = false;
             {
                 std::lock_guard<std::mutex> lock(h.reg_mtx);
