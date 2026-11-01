@@ -9111,6 +9111,14 @@ llama_moe_cache::layer_set llama_moe_cache::select_layers(const llama_model & mo
 
 size_t llama_moe_cache::budget(const llama_model & model, size_t size, layer_set set) {
     if (set == layer_set::all) {
+        // no layer the cache can hold (host experts on a CUDA / ROCm / MUSA device, llama_moe_cache_layer_cacheable): Metal, Vulkan,
+        // CPU only, or every expert on the devices. No cache, as for the trunk / NextN sets below, instead of a constructor that throws
+        // and fails the context ("requires a CUDA / ROCm / MUSA GPU backend")
+        if (size > 0 && llama_moe_cache_set_bytes(model, layer_set::all) == 0) {
+            LLAMA_LOG_WARN("%s: a MoE cache of %.2f MiB has no layer to hold (it caches host experts of layers on CUDA / ROCm / MUSA "
+                "devices only): running without it\n", __func__, size/1048576.0);
+            return 0;
+        }
         return size;
     }
     const size_t bytes_trunk = llama_moe_cache_set_bytes(model, layer_set::trunk);

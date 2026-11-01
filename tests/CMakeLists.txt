@@ -275,6 +275,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-exact-verify-cells PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # --moe-cache-mib with the layers on a GPU outside ggml-cuda (a mock device): the context runs without the MoE cache
+    llama_build(test-moe-cache-device.cpp)
+    llama_test(
+        test-moe-cache-device
+        LABEL main
+        ARGS "${MODEL_DIR}/llama-moe.gguf"
+    )
+    set_tests_properties(test-moe-cache-device PROPERTIES FIXTURES_REQUIRED generate-models)
+
     # the greedy fast path of common_sampler_sample samples what the sampler chain samples, in every mode of its env knobs
     llama_build(test-sampling-greedy-fast.cpp)
     foreach(GF_ENV "" "LLAMA_SAMPLE_GREEDY_FAST=0" "LLAMA_SAMPLE_GREEDY_FAST=1" "LLAMA_SAMPLE_GREEDY_FAST=3"
