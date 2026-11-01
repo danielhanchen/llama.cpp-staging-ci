@@ -3,6 +3,7 @@
 //   - a corrupt entry (an untrusted token count of 2^62 + 16) is skipped and deleted at startup instead of aborting the server
 
 #include "../tools/server/server-prompt-ssd.h"
+#include "common.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -45,7 +46,8 @@ int main() {
     fs::remove_all(root, ec);
 
     server_prompt_ssd_params params;
-    params.dir = root.string();
+    // UTF-8, as the server passes it (a narrow .string() is the ANSI code page on Windows: a non-ASCII %TEMP% would not round trip)
+    params.dir = fs_path_to_utf8(root);
 
     // the same prompt put three times in a row: the writer is still writing (or has not started) the first copy
     for (int iter = 0; iter < 4; ++iter) {
@@ -90,9 +92,13 @@ int main() {
             memcpy(p, &version, sizeof(version));   p += sizeof(version);
             memcpy(p, &ns, sizeof(ns));             p += sizeof(ns);
             memcpy(p, &n_tokens, sizeof(n_tokens));
+#ifdef _WIN32
+            FILE * f = _wfopen(bad.wstring().c_str(), L"wb");
+#else
             FILE * f = fopen(bad.string().c_str(), "wb");
+#endif
             if (f == nullptr) {
-                fprintf(stderr, "cannot create %s\n", bad.string().c_str());
+                fprintf(stderr, "cannot create %s\n", fs_path_to_utf8(bad).c_str());
                 return 1;
             }
             fwrite(buf.data(), 1, buf.size(), f);
