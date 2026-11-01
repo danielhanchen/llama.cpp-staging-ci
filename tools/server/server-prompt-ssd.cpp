@@ -219,7 +219,7 @@ server_prompt_ssd::server_prompt_ssd(const server_prompt_ssd_params & params, co
 
     char name[32];
     snprintf(name, sizeof(name), "%016" PRIx64, ns_hash);
-    dir = (fs::u8path(params.dir) / name).string();
+    dir = fs_path_to_utf8(fs::u8path(params.dir) / name);
 
     std::error_code ec;
     if (!params.readonly) {
@@ -268,7 +268,7 @@ void server_prompt_ssd::scan() {
     }
     for (const auto & de : it) {
         const fs::path p = de.path();
-        const std::string fname = p.filename().string();
+        const std::string fname = fs_path_to_utf8(p.filename());
         if (fname.rfind(".tmp", 0) == 0) {
             // left over by a writer that did not finish
             if (!params.readonly) {
@@ -280,7 +280,7 @@ void server_prompt_ssd::scan() {
             continue;
         }
         entry e;
-        e.path = p.string();
+        e.path = fs_path_to_utf8(p);
         e.size = (size_t) fs::file_size(p, ec);
         e.last_used = file_mtime_ms(p);
 
@@ -427,6 +427,7 @@ bool server_prompt_ssd::write(const server_prompt_cache_state & state) {
     char name[32];
     snprintf(name, sizeof(name), "%016" PRIx64 ".lpc", key);
     const fs::path path = fs::u8path(dir) / name;
+    const std::string path_utf8 = fs_path_to_utf8(path); // the index keeps UTF-8 paths (a narrow .string() throws on Windows)
 
     char tmp_name[64];
     snprintf(tmp_name, sizeof(tmp_name), ".tmp.%016" PRIx64 ".%" PRIu64, key, n_tmp++);
@@ -434,7 +435,7 @@ bool server_prompt_ssd::write(const server_prompt_cache_state & state) {
 
     FILE * f = open_file(tmp, "wb");
     if (!f) {
-        SRV_WRN("prompt cache: cannot create '%s'\n", tmp.string().c_str());
+        SRV_WRN("prompt cache: cannot create '%s'\n", fs_path_to_utf8(tmp).c_str());
         return false;
     }
 
@@ -466,13 +467,13 @@ bool server_prompt_ssd::write(const server_prompt_cache_state & state) {
 
     std::error_code ec;
     if (!synced) {
-        SRV_WRN("prompt cache: failed to write '%s' (disk full?)\n", tmp.string().c_str());
+        SRV_WRN("prompt cache: failed to write '%s' (disk full?)\n", fs_path_to_utf8(tmp).c_str());
         fs::remove(tmp, ec);
         return false;
     }
     fs::rename(tmp, path, ec);
     if (ec) {
-        SRV_WRN("prompt cache: failed to rename '%s': %s\n", tmp.string().c_str(), ec.message().c_str());
+        SRV_WRN("prompt cache: failed to rename '%s': %s\n", fs_path_to_utf8(tmp).c_str(), ec.message().c_str());
         fs::remove(tmp, ec);
         return false;
     }
@@ -481,21 +482,21 @@ bool server_prompt_ssd::write(const server_prompt_cache_state & state) {
 
     // an entry that is a prefix of the new one is obsolete: the new one restores everything it did and more
     for (size_t i = 0; i < index.size();) {
-        if (index[i].path != path.string() && is_prefix(index[i].tokens, tokens)) {
+        if (index[i].path != path_utf8 && is_prefix(index[i].tokens, tokens)) {
             remove_locked(i);
         } else {
             ++i;
         }
     }
     for (size_t i = 0; i < index.size(); ++i) {
-        if (index[i].path == path.string()) {
+        if (index[i].path == path_utf8) {
             remove_locked(i); // replaced by the file just renamed over it
             break;
         }
     }
 
     entry e;
-    e.path      = path.string();
+    e.path      = path_utf8;
     e.tokens    = tokens;
     e.key       = key;
     e.size      = (size_t) fs::file_size(path, ec);
@@ -718,7 +719,7 @@ std::string server_prompt_ssd_namespace(
 
     add("model", model_desc(model_tgt));
     for (const auto & f : model_files(params.model.path)) {
-        add("model_file", fs::u8path(f).filename().string() + ":" + file_identity(f));
+        add("model_file", fs_path_to_utf8(fs::u8path(f).filename()) + ":" + file_identity(f));
     }
     add("n_swa", std::to_string(llama_model_n_swa(model_tgt)));
 
