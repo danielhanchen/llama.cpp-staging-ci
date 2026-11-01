@@ -255,6 +255,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
     )
 
+    # recurrent single-token decodes (states read in place) equal one prompt of the same tokens on the CPU
+    llama_test(
+        test-llama-archs
+        NAME test-rs-decode-parity
+        LABEL main
+        ARGS --rs-decode-parity -s 1
+    )
+
     # the advisory PLE prefetch predicts the rows set_input gathers, on the generated qwen4exp model
     llama_build(test-ple-prefetch.cpp)
     llama_test(

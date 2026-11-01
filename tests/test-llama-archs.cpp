@@ -13,6 +13,7 @@
 #include "../src/llama-ext.h"
 #include "../src/llama-model-saver.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstddef>
@@ -129,6 +130,7 @@ static void usage(char ** argv) {
     LOG("  -o, --out <dir>          Save generated test models to <dir> instead of running backend tests\n");
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
+    LOG("  --rs-decode-parity       Only check CPU single-token decodes against one prompt for RWKV6 / RWKV7 / Mamba\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -602,6 +604,12 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_SHEXP, std::vector<float>({0.0f, 5.0f}));
     }
     ms.add_kv(LLM_KV_WKV_HEAD_SIZE,               n_embd/n_head);
+    if (arch == LLM_ARCH_RWKV7 || arch == LLM_ARCH_ARWKV7) {
+        ms.add_kv(LLM_KV_ATTENTION_DECAY_LORA_RANK,              uint32_t(16));
+        ms.add_kv(LLM_KV_ATTENTION_ICLR_LORA_RANK,               uint32_t(16));
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_RESIDUAL_MIX_LORA_RANK, uint32_t(16));
+        ms.add_kv(LLM_KV_ATTENTION_GATE_LORA_RANK,               uint32_t(16));
+    }
     ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,           uint32_t(3));
     ms.add_kv(LLM_KV_RESIDUAL_SCALE,              3.5565588200778455f);
     ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(12));
@@ -1099,6 +1107,51 @@ static int check_qwen4exp_mtp_ctx(const size_t seed, const float stdev) {
     return ret;
 }
 
+// recurrent models on the CPU: a prompt followed by single-token decodes must give the logits of the same tokens
+// decoded as one prompt. Single-token decodes read the recurrent states in place (LLAMA_RS_ALIAS), so this catches a
+// state read ordered after the store of the same ubatch (RWKV token shift). RWKV is skipped by test_backends.
+static int check_rs_decode_parity(const std::string & arch_filter, const size_t seed, const float stdev) {
+    int ret = 0;
+    for (const llm_arch arch : { LLM_ARCH_RWKV6, LLM_ARCH_RWKV7, LLM_ARCH_MAMBA }) {
+        if (!arch_matches(arch_filter, arch)) {
+            continue;
+        }
+        const std::vector<ggml_backend_dev_t> devs = { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) };
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, false);
+        auto ref = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, devs);
+        auto dec = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, devs);
+
+        const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(ref.first.get()));
+        const uint32_t n_prompt = 4;
+        const std::vector<llama_token> tokens = get_tokens(12, n_vocab, seed);
+        const std::vector<float> logits_ref = get_logits(ref.first.get(), ref.second.get(), tokens);
+
+        double nmse_max = 0.0;
+        bool   ok       = true;
+        for (uint32_t i = n_prompt - 1; i < tokens.size() && ok; i++) {
+            common_batch batch(dec.second.get());
+            for (uint32_t pos = i == n_prompt - 1 ? 0 : i; pos <= i; pos++) {
+                batch.add(tokens[pos], pos, 0, pos == i);
+            }
+            if (llama_process(dec.second.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+                ok = false;
+                break;
+            }
+            const float * row = llama_get_logits_ith(dec.second.get(), -1);
+            const std::vector<float> a(logits_ref.begin() + (size_t) i*n_vocab, logits_ref.begin() + (size_t) (i + 1)*n_vocab);
+            const std::vector<float> b(row, row + n_vocab);
+            nmse_max = std::max(nmse_max, nmse(a, b));
+        }
+        ok = ok && nmse_max <= 1e-6;
+        printf("|%15s|%30s|%6s|%15.3e|%9s|\n", llm_arch_name(arch), "CPU decode vs prompt", "-", nmse_max,
+            ok ? "\033[1;32mOK\033[0m" : "\033[1;31mFAIL\033[0m");
+        if (!ok) {
+            ret = 1;
+        }
+    }
+    return ret;
+}
+
 static int test_backends(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const char * target_backend) {
     struct user_data_t {
         struct {
@@ -1411,6 +1464,7 @@ int main(int argc, char ** argv) {
     float stdev = 0.1f;
     std::string out;
     const char * target_backend = nullptr;
+    bool rs_decode_parity = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1465,6 +1519,8 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--rs-decode-parity") == 0) {
+            rs_decode_parity = true;
         } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--backend") == 0) {
             if (i + 1 < argc) {
                 const char * backend_name = argv[++i];
@@ -1493,6 +1549,9 @@ int main(int argc, char ** argv) {
     try {
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
+        }
+        if (rs_decode_parity) {
+            return check_rs_decode_parity(arch_filter, seed, stdev);
         }
         int ret = 0;
         if (arch_matches(arch_filter, LLM_ARCH_QWEN4EXP) && target_backend == nullptr) {

@@ -4662,9 +4662,14 @@ ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
 
     ggml_tensor * token_shift_all = mctx_cur->get_r_l(il);
 
+    // the token shift is never read in place (rs_alias -1, every state gathered by the full s_copy): RWKV6 / RWKV7 read
+    // the FFN shift in the channel mix, after build_rwkv_token_shift_store has written the new shift into the same rows,
+    // and no data edge orders that read before the store. The copy is n_embd*token_shift_count floats per sequence
     ggml_tensor * token_shift = build_rs(
-            inp, token_shift_all,
-            hparams.n_embd_r(), n_seqs);
+            token_shift_all, inp->s_copy, inp->s_copy_main,
+            hparams.n_embd_r(), n_seqs,
+            mctx_cur->get_n_rs(), mctx_cur->get_head(), mctx_cur->get_size(), mctx_cur->get_rs_z(),
+            -1, nullptr);
 
     token_shift = ggml_reshape_3d(ctx0, token_shift, hparams.n_embd, token_shift_count, n_seqs);
 
