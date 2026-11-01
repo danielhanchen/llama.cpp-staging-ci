@@ -267,6 +267,8 @@ static void llama_dense_host_pin(const llama_model & model) {
     }
     model.host_pin_done = true;
     ggml_backend_reg_t reg = nullptr;
+    // discrete GPUs only (k19-igpu): on an integrated GPU (IGPU, unified memory: Strix Halo gfx1151, Jetson, DGX Spark) the device memory
+    // is the host's, so page-locking host weights takes from the pool the device allocates from and speeds a copy from RAM to RAM
     for (const auto & d : model.devices) {
         if (d.is_meta || d.dev == nullptr || ggml_backend_dev_type(d.dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
             continue;
@@ -1763,6 +1765,9 @@ bool llama_context::mtp_lend_warm() {
     const double frac  = moe_cache->cache_frac();
     const size_t cache = frac > 0.0 ? (size_t) (frac*(double) llama_moe_cache::host_bytes(model)) : 0;
     size_t free_min = SIZE_MAX;
+    // discrete GPUs only (k19-igpu): lending copies the drafter's device weights to pinned host memory before it frees them, and on an
+    // integrated GPU (IGPU, unified memory) both are the same pool: the copy takes what the eviction gives back, so a lend frees nothing
+    // (the device's free memory, the host's available memory there, would also be counted with the host copy's RAM reserve)
     for (auto & bk : backend_ptrs) {
         ggml_backend_dev_t dev = ggml_backend_get_device(bk);
         if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
@@ -6207,6 +6212,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             static const bool lend_arena_env = getenv("LLAMA_MTP_DRAFT_LEND_ARENA") == nullptr || atoi(getenv("LLAMA_MTP_DRAFT_LEND_ARENA")) != 0;
             size_t free_min = SIZE_MAX;
             size_t arena_cr = 0;
+            // discrete GPUs only (k19-igpu): on an integrated GPU the lend's pinned host copy and the evicted weights are one pool, see
+            // llama_context::mtp_lend_warm; no device found leaves free_min at SIZE_MAX, so nothing is lent there
             for (auto & bk : backend_ptrs) {
                 ggml_backend_dev_t dev = ggml_backend_get_device(bk);
                 if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {

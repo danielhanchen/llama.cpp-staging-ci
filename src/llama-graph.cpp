@@ -3491,6 +3491,8 @@ static ggml_backend_t kv_host_gpu_backend(ggml_backend_sched_t sched) {
     }
     ggml_backend_t backend = ggml_backend_sched_get_backend(sched, 0);
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    // discrete GPUs only (k19-igpu): the staged / streamed host KV paths pair with the pinned host KV (llama_kv_cache), which an integrated
+    // GPU does not get; there the host KV attention stays as upstream runs it (both modes are opt-in: LLAMA_KV_STAGE, LLAMA_KV_DECODE)
     return dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ? backend : nullptr;
 }
 

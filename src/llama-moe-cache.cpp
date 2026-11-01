@@ -7137,6 +7137,8 @@ struct llama_moe_cache::impl {
     // UD-IQ4_XS + MTP at 32 GB: arena 1275 MiB (6.8% of the cache, lending was off), split 850 MiB -> on; Qwen3.6 UD-Q4_K_XL at 12 / 16 GB:
     // 354 / 210 MiB -> off (it lends there anyway because the copies do not fit, see below, and its fit is unchanged)
     // Discrete GPUs only: on an integrated GPU (gfx1151, unified memory) the rule is not measured, lending stays as it was there
+    // (k19-igpu: kept so; the fit gives the lent arena's bytes to the cache from the device's free memory, which there is the host's
+    // available memory that the RAM tier is sized from too)
     bool lend_saves(int32_t id, size_t need, size_t seed) const {
         if (!lend_save || need <= seed || need - seed < lend_save_min) {
             return false;

@@ -2003,6 +2003,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 // kdp: a separate MTP drafter's device weights in evictable buffers (llama_model::weights_evict)
                 using set_evictable_t = void (*)(bool);
                 set_evictable_t set_ev = nullptr;
+                // discrete GPUs only (k19-igpu): on an integrated GPU the lend frees nothing (llama_context::mtp_lend_warm), so its weights
+                // stay in plain buffers
                 if (params.mtp_borrow_io && llama_mtp_draft_lend_on() && !ggml_backend_buft_is_host(buft) &&
                         ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU && ggml_backend_dev_backend_reg(dev) != nullptr) {
                     set_ev = (set_evictable_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_set_alloc_evictable");

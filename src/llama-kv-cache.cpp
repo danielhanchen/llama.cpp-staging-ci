@@ -239,6 +239,8 @@ llama_kv_cache::llama_kv_cache(
         if (ggml_backend_buft_is_host(buft) && kv_host_pinned()) {
             for (const auto & d : model.devices) {
                 ggml_backend_buffer_type_t host_buft = d.is_meta ? nullptr : ggml_backend_dev_host_buffer_type(d.dev);
+                // discrete GPUs only (k19-igpu): with an integrated GPU (unified memory) the host KV stays pageable, as upstream keeps
+                // it: pinning it takes from the pool the device allocates from, and the DMA it enables copies from RAM to RAM
                 if (host_buft != nullptr && ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
                     buft     = host_buft;
                     dev_name = ggml_backend_buft_name(host_buft);
