@@ -170,6 +170,10 @@ public:
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
+    // k19-fixB: whether token i of the ubatch sees a cell in [c0, c1) of its stream: a used cell (or a cell of the ubatch) of one of
+    // its sequences at a position <= its own. A ubatch over several streams counts as seeing them
+    bool exact_row_sees(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t i, uint32_t c0, uint32_t c1) const;
+
     // The stream holding seq_id's cells.
     uint32_t get_stream(llama_seq_id seq_id) const;
 
@@ -475,6 +479,9 @@ public:
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
+
+    // see llama_kv_cache::exact_row_sees(), for the current ubatch
+    bool exact_row_sees(const llama_ubatch & ubatch, uint32_t i, uint32_t c0, uint32_t c1) const;
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;

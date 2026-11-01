@@ -3558,7 +3558,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+        const llama_kv_cache_context * mctx_kv) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -3608,13 +3609,23 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 return e == nullptr || atoi(e) != 0;
             }();
             const bool group = fa_group && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
+            // k19-fixB: the cells a row's position implies (llm_graph_exact_row_n_kv) are kept only when the row sees none of the
+            // cells past them: positions do not follow cells with several sequences in one unified cache (A in cells 0..127, B in
+            // 128..382: B's row at position 255 kept 256 cells and lost B's positions 128..254), or after a seq_rm left holes
+            const auto row_n_kv = [&](int64_t r) {
+                const int64_t n_r = llm_graph_exact_row_n_kv(ubatch, r, n_kv);
+                if (n_r < n_kv && (mctx_kv == nullptr || mctx_kv->exact_row_sees(ubatch, (uint32_t) r, (uint32_t) n_r, (uint32_t) n_kv))) {
+                    return n_kv;
+                }
+                return n_r;
+            };
             cur = nullptr;
             for (int64_t i = 0, n_i = 1; i < n_q; i += n_i) {
-                const int64_t n_kv_i = llm_graph_exact_row_n_kv(ubatch, i, n_kv);
+                const int64_t n_kv_i = row_n_kv(i);
                 n_i = 1;
                 // a view of several mask rows narrower than the mask is not contiguous (ggml_flash_attn_ext asserts it): queries over
                 // fewer cells than the mask holds stay one node each
-                while (group && n_kv_i == kq_mask->ne[0] && i + n_i < n_q && llm_graph_exact_row_n_kv(ubatch, i + n_i, n_kv) == n_kv_i) {
+                while (group && n_kv_i == kq_mask->ne[0] && i + n_i < n_q && row_n_kv(i + n_i) == n_kv_i) {
                     ++n_i;
                 }
 
@@ -3929,7 +3940,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il, mctx_cur);
     cb(cur, "kqv_out", il);
 
     if (host_mode == KV_HOST_STAGE) {
@@ -4036,7 +4047,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il, mctx_cur);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -4121,7 +4132,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, top_k->ne[0], kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, top_k->ne[0], kq_scale, il, mctx_cur);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -4208,7 +4219,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il, use_kv_cur ? nullptr : mctx_cur);
     cb(cur, "kqv_out", il);
 
     if (v_rot) {
@@ -4279,7 +4290,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il, mctx_cur);
     cb(cur, "kqv_out", il);
 
     if (k_rot) {

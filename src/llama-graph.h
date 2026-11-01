@@ -1355,7 +1355,10 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            // the cache k / v are views of: an exact verify row reads fewer cells only when it sees none of the cells it drops
+            // (nullptr: every row reads all n_kv cells)
+            const llama_kv_cache_context * mctx_kv = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

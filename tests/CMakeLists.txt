@@ -263,6 +263,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS --rs-decode-parity -s 1
     )
 
+    # an exact verify row keeps every cell of its sequence when the cells do not follow the positions (two sequences in a unified KV)
+    llama_build(test-exact-verify-cells.cpp)
+    llama_test(
+        test-exact-verify-cells
+        LABEL main
+        ARGS "${MODEL_DIR}/llama-dense.gguf"
+    )
+    set_tests_properties(test-exact-verify-cells PROPERTIES FIXTURES_REQUIRED generate-models)
+
     # the greedy fast path of common_sampler_sample samples what the sampler chain samples, in every mode of its env knobs
     llama_build(test-sampling-greedy-fast.cpp)
     foreach(GF_ENV "" "LLAMA_SAMPLE_GREEDY_FAST=0" "LLAMA_SAMPLE_GREEDY_FAST=1" "LLAMA_SAMPLE_GREEDY_FAST=3"

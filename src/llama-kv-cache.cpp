@@ -1333,6 +1333,43 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
+bool llama_kv_cache::exact_row_sees(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t i, uint32_t c0, uint32_t c1) const {
+    if (sinfo.n_stream() != 1 || ubatch.pos == nullptr || i >= ubatch.n_tokens) {
+        return true;
+    }
+    const auto & cells = v_cells[sinfo.strm[0]];
+    const llama_pos p_i = ubatch.pos[i];
+    const auto same_seq = [&](uint32_t j) {
+        for (int32_t a = 0; a < ubatch.n_seq_id[j]; ++a) {
+            for (int32_t b = 0; b < ubatch.n_seq_id[i]; ++b) {
+                if (ubatch.seq_id[j][a] == ubatch.seq_id[i][b]) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    c1 = std::min(c1, cells.size());
+    for (uint32_t c = c0; c < c1; ++c) {
+        if (cells.is_empty(c) || cells.pos_get(c) > p_i) {
+            continue;
+        }
+        for (int32_t b = 0; b < ubatch.n_seq_id[i]; ++b) {
+            if (cells.seq_has(c, ubatch.seq_id[i][b])) {
+                return true;
+            }
+        }
+    }
+    // the cells of the ubatch itself, whether or not they are applied yet
+    const auto & idxs = sinfo.idxs[0];
+    for (uint32_t j = 0; j < ubatch.n_tokens && j < idxs.size(); ++j) {
+        if (idxs[j] >= c0 && ubatch.pos[j] <= p_i && same_seq(j)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
@@ -3292,6 +3329,10 @@ const llama_ubatch * llama_kv_cache_context::peek_ubatch(uint32_t k) const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+bool llama_kv_cache_context::exact_row_sees(const llama_ubatch & ubatch, uint32_t i, uint32_t c0, uint32_t c1) const {
+    return kv->exact_row_sees(sinfos[i_cur], ubatch, i, c0, c1);
 }
 
 ggml_type llama_kv_cache_context::type_k() const {
