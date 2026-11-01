@@ -1614,7 +1614,11 @@ private:
                 }
             }
             const std::vector<ggml_backend_dev_t> gpus = tpp_fit_gpus(req_devs, all_devs,
-                [](ggml_backend_dev_t d) { return ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU; },
+                [](ggml_backend_dev_t d) {
+                    const enum ggml_backend_dev_type t = ggml_backend_dev_type(d);
+                    return t == GGML_BACKEND_DEVICE_TYPE_GPU ? TPP_GPU : t == GGML_BACKEND_DEVICE_TYPE_IGPU ? TPP_IGPU : TPP_NOT_GPU;
+                },
+                [](ggml_backend_dev_t a, ggml_backend_dev_t b) { return ggml_backend_dev_backend_reg(a) == ggml_backend_dev_backend_reg(b); },
                 params.split_mode == LLAMA_SPLIT_MODE_NONE, params.main_gpu);
             int n_gpu = 0, cc_min = INT_MAX;
             for (ggml_backend_dev_t dev : gpus) {
@@ -1633,15 +1637,22 @@ private:
             // cache 5528 vs 5538 MiB, text != base, 0.94-0.96 of base at 16k / 30k). Decided before the fit, from the GGUF bytes (target
             // and drafter + 1.5 GiB) against the devices' free memory; the speculative side also turns the window off if a cache runs
             // anyway. LLAMA_SPEC_TPP_CACHED=1: on there too
+            // (an integrated GPU's free memory is the host's available memory, ggml-cuda's UMA path: several of them count it once)
             size_t dev_free = 0;
+            size_t igpu_free = 0;
             for (ggml_backend_dev_t dev : gpus) {
                 if (!mtp_shape) {
                     break;
                 }
                 size_t f = 0, t = 0;
                 ggml_backend_dev_memory(dev, &f, &t);
-                dev_free += f;
+                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    igpu_free = std::max(igpu_free, f);
+                } else {
+                    dev_free += f;
+                }
             }
+            dev_free += igpu_free;
             const uint64_t need = mtp_shape ? tpp_gguf_bytes(params.model.path) + tpp_gguf_bytes(sp.draft.mparams.path) + (1536ull << 20) : 0;
             // (no GPU: no MoE cache. LLAMA_SPEC_TPP_FORCE_CACHED=1, a test hook: as if the experts did not fit)
             const char * ce = getenv("LLAMA_SPEC_TPP_CACHED");
@@ -1803,7 +1814,10 @@ private:
                 ggml_backend_dev_t dev = llama_model_get_device(model_tgt, i);
                 ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
                 const char * rn = reg ? ggml_backend_reg_name(reg) : "";
-                device_greedy_ok = dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                // k19-igpu: an integrated GPU too (ggml-cuda reports prop.integrated as IGPU: Strix Halo gfx1151, Jetson, DGX Spark); the
+                // argmax runs in the same graph on the same backend, nothing is sized from memory
+                const enum ggml_backend_dev_type dev_type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+                device_greedy_ok = dev && (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
                     (strcmp(rn, "CUDA") == 0 || strcmp(rn, "ROCm") == 0);
             }
         }
