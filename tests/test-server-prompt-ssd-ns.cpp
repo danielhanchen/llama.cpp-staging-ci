@@ -75,6 +75,12 @@ int main(int argc, char ** argv) {
     check("bool value", ns({ "llama.use_parallel_residual=bool:true" }, none) != ns({ "llama.use_parallel_residual=bool:false" }, none));
     check("str value", ns({ "tokenizer.chat_template=str:a" }, none) != ns({ "tokenizer.chat_template=str:b" }, none));
     check("two overrides vs one", ns({ "llama.rope.freq_base=float:500000", "llama.expert_used_count=int:1" }, none) != rope);
+    // free text is escaped: a str value with a newline cannot forge a second override line, a ':' cannot move the key / value split
+    const std::string forged = "a\nkv_override=llama.expert_used_count:" + std::to_string((int) LLAMA_KV_OVERRIDE_TYPE_INT) + ":1";
+    check("newline in a str value vs two overrides", ns({ "tokenizer.chat_template=str:" + forged }, none) !=
+        ns({ "tokenizer.chat_template=str:a", "llama.expert_used_count=int:1" }, none));
+    const std::string t = std::to_string((int) LLAMA_KV_OVERRIDE_TYPE_STR);
+    check("':' in a key vs in a str value", ns({ "k=str:a:" + t + ":b" }, none) != ns({ "k:" + t + ":a=str:b" }, none));
     check("non-causal attention", ns({}, [](common_params & p) { p.attention_type = LLAMA_ATTENTION_TYPE_NON_CAUSAL; }) != base);
 
     // defaults: no line is added, so the namespace of a default configuration is what it was

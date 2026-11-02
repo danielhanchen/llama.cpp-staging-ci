@@ -21,7 +21,9 @@ namespace fs = std::filesystem;
 
 static constexpr uint32_t SSD_MAGIC     = 0x4353504c; // "LPSC"
 static constexpr uint32_t SSD_MAGIC_END = 0x444e4550; // "PEND"
-static constexpr uint32_t SSD_VERSION   = 1;
+// 2 (k19-fixF): the namespace of 1 did not include --override-kv, so a cache written with overrides by a version-1 build sits in the
+// default namespace; the bump retires every version-1 entry (one miss on upgrade)
+static constexpr uint32_t SSD_VERSION   = 2;
 
 // a fast non-cryptographic 64-bit hash: four lanes of 8-byte words, enough to detect truncation and bit rot
 struct ssd_hasher {
@@ -801,7 +803,23 @@ std::string server_prompt_ssd_namespace(
             case LLAMA_KV_OVERRIDE_TYPE_BOOL:  v = o.val_bool ? "true" : "false";       break;
             case LLAMA_KV_OVERRIDE_TYPE_STR:   v = std::string(o.val_str, strnlen(o.val_str, sizeof(o.val_str))); break;
         }
-        add("kv_override", std::string(o.key, strnlen(o.key, sizeof(o.key))) + ":" + std::to_string((int) o.tag) + ":" + v);
+        // the key and a str value are free text: escaped, so that a newline cannot forge another line and a ':' cannot move the
+        // key / value boundary (k19-fixF)
+        auto esc = [](const std::string & x) {
+            std::string r;
+            for (const char c : x) {
+                switch (c) {
+                    case '\\': r += "\\\\"; break;
+                    case '\n':  r += "\\n";  break;
+                    case '\r':  r += "\\r";  break;
+                    case ':':   r += "\\:";  break;
+                    case '=':   r += "\\=";  break;
+                    default:    r += c;     break;
+                }
+            }
+            return r;
+        };
+        add("kv_override", esc(std::string(o.key, strnlen(o.key, sizeof(o.key)))) + ":" + std::to_string((int) o.tag) + ":" + esc(v));
     }
 
     // --lora-init-without-apply loads the adapters without applying them (until POST /lora-adapters)
