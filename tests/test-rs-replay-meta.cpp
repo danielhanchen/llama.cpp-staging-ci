@@ -94,8 +94,13 @@ int main(int argc, char ** argv) {
         printf("Meta(CPU, CPU) decode with LLAMA_RS_REPLAY=1 failed\nFAIL\n");
         return 1;
     }
-    double max_diff = ref.size() == met.size() ? 0.0 : INFINITY;
+    // a NaN / inf logit fails (std::fmax drops a NaN operand, so a NaN difference would have passed), as do no logits at all
+    double max_diff = ref.size() == met.size() && !ref.empty() ? 0.0 : INFINITY;
     for (size_t i = 0; i < ref.size() && i < met.size(); ++i) {
+        if (!std::isfinite(ref[i]) || !std::isfinite(met[i])) {
+            max_diff = INFINITY;
+            break;
+        }
         max_diff = std::fmax(max_diff, std::fabs((double) ref[i] - met[i]));
     }
     printf("%zu logits, max |CPU - Meta(CPU, CPU)| = %g\n", ref.size(), max_diff);
