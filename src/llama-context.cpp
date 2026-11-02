@@ -5520,6 +5520,12 @@ static bool lm_tiny_cache(double frac) {
     return frac >= 0.0 && frac < max_frac;
 }
 
+// LLAMA_MOE_LM_RELEASE (default on): see the release of the banks in decode_layer_major
+static bool lm_release_on() {
+    static const bool on = getenv("LLAMA_MOE_LM_RELEASE") == nullptr || atoi(getenv("LLAMA_MOE_LM_RELEASE")) != 0;
+    return on;
+}
+
 int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_outputs_all, int64_t n_tokens_all, int64_t & n_outputs_prev,
         int64_t & n_tokens_prev, bool & more, int & ret) {
     auto lm_hybrid_ok = [&]() { return lm_hybrid_frac_ok(moe_cache->cache_frac()); };
@@ -5611,6 +5617,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
 
     lm_arena_used = 0;
     lm_arena_old.clear();
+    // k19-fixF: the group ends with a member with outputs whose narrowed last layer reads the cache banks (a slot map or a device
+    // lookup; see the end of the loop below); such a group must not release the banks
+    bool lm_out_banks = false;
     int64_t n_outputs_group = 0;
     int64_t n_tokens_group  = 0;
     int64_t t_build_us = 0, t_set_us = 0;
@@ -5664,10 +5673,27 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         auto * res = lm_res[k].get();
         res->reset();
         const int64_t tb0 = ggml_time_us();
-        if (tail) {
+        // k19-fixF: a member with outputs narrows its last layer to them, and so few rows take the slot-map lookup of the cache banks.
+        // Where the group will release the banks (a tiny cache, the member is not the first: the group has 2+ members), that lookup
+        // aborted ("the MoE cache is too small": one slot is left). Such a member is built as a large ubatch, as the tail and a ubatch
+        // under the tiny-ubatch release are: the narrowed layer reads the host experts. Groups that keep their banks are unchanged
+        const bool out_large = !tail && n_out > 0 && k >= 1 && lm_release_on() && lm_tiny_cache(moe_cache->cache_frac());
+        if (tail || out_large) {
             moe_cache->set_force_large(true);
         }
         ggml_cgraph * gf = model.build_graph(graph_params(res, ub, mctx, gtype));
+        if (out_large) {
+            moe_cache->set_force_large(false);
+        }
+        // otherwise the member reads the banks if its graph has a slot map or a device lookup (the narrowed layer of few rows)
+        lm_out_banks = false;
+        for (int i = 0; n_out > 0 && !tail && !out_large && gf != nullptr && i < ggml_graph_n_nodes(gf) && !lm_out_banks; ++i) {
+            const ggml_tensor * node = ggml_graph_node(gf, i);
+            lm_out_banks = node->op == GGML_OP_MOE_CACHE_LOOKUP;
+            for (int j = 0; j < GGML_MAX_SRC && !lm_out_banks; ++j) {
+                lm_out_banks = node->src[j] != nullptr && moe_cache->is_slot_map(node->src[j]);
+            }
+        }
         if (tail) {
             moe_cache->set_force_large(false);
             // its ops on host weights run on the device as the large members' do (the backends would leave a short batch on the CPU)
@@ -6124,7 +6150,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             }
         }
     }
-    static const bool lm_release_env = getenv("LLAMA_MOE_LM_RELEASE") == nullptr || atoi(getenv("LLAMA_MOE_LM_RELEASE")) != 0;
+    const bool lm_release_env = lm_release_on();
     bool lm_released = false;
     // k17-small: the release also where the cache is above LLAMA_MOE_LM_RELEASE_FRAC but the group's merged graph does not allocate in
     // the free memory (it would be split): q3m 4 GB without MTP holds 5.1% of the host experts at ctx 16384 (699 MiB) and 4.5% at 20480;
@@ -6183,7 +6209,15 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_use_full_hash(sched.get());
         moe_cache->set_graph(nullptr);
-        if (!ok && over > 0) {
+        if (!ok && over > 0 && lm_out_banks) {
+            // k19-fixF: the last member reads the banks through its slot map (built before this measure), so the banks stay and the
+            // group is split as with LLAMA_MOE_LM_RELEASE_SPLIT=0 (releasing them aborted the narrowed lookup)
+            static int n_log = 0;
+            if (n_log++ < 4) {
+                LLAMA_LOG_INFO("%s: the merged graph of %zu ubatches does not fit, but its last ubatch reads the cache banks for its outputs: "
+                    "the banks are kept and the group is split\n", __func__, group.size());
+            }
+        } else if (!ok && over > 0) {
             static int n_log = 0;
             if (n_log++ < 4) {
                 LLAMA_LOG_INFO("%s: the merged graph of %zu ubatches would grow the compute buffers by %.2f MiB more than the free memory allows, "
@@ -6210,7 +6244,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
         return freed;
     };
-    if (lm_release_env && group.size() >= 2 && lm_tiny) {
+    if (lm_release_env && group.size() >= 2 && lm_tiny && !lm_out_banks) {
         ggml_backend_sched_synchronize(sched.get());
         if (lm_rel_trim) {
             pool_mark_trim(false);
