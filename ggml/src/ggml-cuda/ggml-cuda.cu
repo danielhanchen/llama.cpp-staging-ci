@@ -3203,10 +3203,15 @@ static size_t ggml_backend_cuda_graph_evict_since(ggml_backend_t backend, int64_
 
 // k15-pp: on = the next graph computations of this backend run without CUDA graph bookkeeping (computed once, never replayed)
 static void ggml_backend_cuda_graph_skip_records(ggml_backend_t backend, bool on) {
+#ifdef USE_CUDA_GRAPH
     if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
         return;
     }
     ((ggml_backend_cuda_context *) backend->context)->graphs_skip = on;
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(on);
+#endif
 }
 
 static void ggml_backend_cuda_set_copy_peer(ggml_backend_t copy_backend, ggml_backend_t compute_backend) {
