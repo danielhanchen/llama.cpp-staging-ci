@@ -30,6 +30,14 @@ static void ggml_backend_remoting_device_get_memory(ggml_backend_dev_t dev, size
 }
 
 static bool ggml_backend_remoting_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    // as ggml-rpc and the meta device: the host backend may lack these ops (Metal, Vulkan) and the host runs a graph without asking
+    // it; KQ_MASK (llama, batches of 64+ tokens) is then computed by the guest's CPU and its mask uploaded, as the host mask was.
+    // MOE_CACHE_LOOKUP's op params hold guest pointers; the GATED_DELTA_NET replay window (op_params[1] != 0) is built by llama only
+    // on CUDA / ROCm / MUSA / CPU state buffers
+    if (op->op == GGML_OP_MOE_CACHE_LOOKUP || op->op == GGML_OP_KQ_MASK ||
+            (op->op == GGML_OP_GATED_DELTA_NET && ggml_get_op_params_i32(op, 1) != 0)) {
+        return false;
+    }
 #if USE_ALWAYS_TRUE_SUPPORTS_OP == 1
     /* ggml-rpc cheats it like this */
     /* with the current implementation of serialize_tensor, the src/view aren't properly passed */
