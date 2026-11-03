@@ -155,6 +155,9 @@ struct llama_context {
     bool    mtp_lend_prepare();    // kdp: the host copy at the first lend (host-RAM checked); false: not lendable
     bool    mtp_lend_warm();       // k19-np12c: that copy at load where a prompt group is expected to borrow the drafter's weights
     bool    mtp_lend_active = false; // kdp: the last released layer-major group found too little free memory (llama_mtp_draft_lend_active)
+    // k19-fixG: an MTP context of a draft model that borrows token_embd / output from tgt's model (llama_model_params::model_shared): a
+    // target lends only its own drafter's weights
+    bool    mtp_drafts_for(const llama_context * tgt) const;
     float * nextn_rows_early();
 
     float * get_embeddings_layer_inp(uint32_t lid);

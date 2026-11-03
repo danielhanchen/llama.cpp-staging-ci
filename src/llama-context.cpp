@@ -1326,6 +1326,11 @@ llama_context::llama_context(
     }
 }
 
+// the evictable weights a drafter lends exist only with mtp_borrow_io, which sets model_shared
+bool llama_context::mtp_drafts_for(const llama_context * tgt) const {
+    return this != tgt && &model != &tgt->model && model.model_shared() == &tgt->model;
+}
+
 void llama_context::small_plan_free(uint32_t i) {
     if (gf_res_small_plan[i] != nullptr) {
         ggml_backend_sched_plan_free(gf_res_small_plan[i]);
@@ -1803,7 +1808,7 @@ bool llama_context::mtp_lend_warm() {
     {
         std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
         for (llama_context * c : llama_mtp_ctxs) {
-            if (c != this && &c->model != &model) {
+            if (c->mtp_drafts_for(this)) {
                 dfts.push_back(c);
             }
         }
@@ -6344,7 +6349,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             if (free_min < lend_free) {
                 std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
                 for (llama_context * c : llama_mtp_ctxs) {
-                    if (c != this && &c->model != &model && c->mtp_lend_prepare()) {
+                    if (c->mtp_drafts_for(this) && c->mtp_lend_prepare()) {
                         dfts.push_back(c);
                     }
                 }
