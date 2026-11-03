@@ -3595,11 +3595,6 @@ common_params common_base_params_to_speculative(const common_params & params) {
         }
     }
 
-    // an explicit draft ubatch (--spec-draft-n-ubatch) wins over the caps above
-    if (params_spec.n_ubatch > 0) {
-        result.n_ubatch = params_spec.n_ubatch;
-    }
-
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types
     //       something like `struct common_speculative_type_props common_speculative_type_get_props(...);`
@@ -3608,6 +3603,23 @@ common_params common_base_params_to_speculative(const common_params & params) {
         [](common_speculative_type t) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
+
+    // a block drafter reads the target features of a prompt in ubatches of its own (process() splits a target ubatch, each row is the
+    // encoder and the K/V of each layer: no lm head) and decodes one noise block per sequence: the target's n_ubatch only grew its
+    // compute buffer and its sliding-window cache (Qwen3.8-Flash-Next + DFlash2 at -ub 2048: 1980 -> 30 MiB of compute with
+    // llama_context::sched_reserve, K/V 80 -> 50 MiB). Capped like a separate MTP drafter (LLAMA_DRAFT_UBATCH_MAX, default 512)
+    if (has_block_draft && has_draft) {
+        const uint32_t cap = common_draft_ubatch_max();
+        if (cap > 0 && (uint32_t) result.n_ubatch > cap) {
+            result.n_ubatch = (int32_t) cap;
+            result.n_batch  = std::max(result.n_batch, params.n_ubatch);
+        }
+    }
+
+    // an explicit draft ubatch (--spec-draft-n-ubatch) wins over the caps above
+    if (params_spec.n_ubatch > 0) {
+        result.n_ubatch = params_spec.n_ubatch;
+    }
     if (has_block_draft) {
         // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
         const int32_t per_seq = std::max(1, params_spec.n_max + 1);

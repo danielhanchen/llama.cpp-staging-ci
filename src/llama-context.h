@@ -442,6 +442,11 @@ public:
     std::map<llama_seq_id, llama_sampler *> graph_samplers() const;
     bool graph_reserving = false;
 
+    // sched_reserve: graph_reserve builds an embeddings ubatch (the target features of a DFlash / DSpark drafter), and the sizes of that
+    // graph in a memory probe
+    bool reserve_embd = false;
+    std::vector<size_t> reserve_embd_sizes;
+
 private:
     llm_graph_result * get_gf_res_prev();
 

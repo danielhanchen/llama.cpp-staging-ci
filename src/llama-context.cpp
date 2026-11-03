@@ -2487,18 +2487,51 @@ void llama_context::sched_reserve() {
     int n_inputs_tg        = -1;
     int n_input_tensors_tg = -1;
 
-    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+    // a DFlash / DSpark drafter decodes two kinds of batches: the target features of a prompt or verify batch as embeddings (up to
+    // n_ubatch rows: the encoder and the K/V of each layer, no lm head) and one noise block of tokens per sequence (at most
+    // block_size rows each, the lm head on every row). The token graph reserved at n_ubatch held the logits of n_ubatch rows,
+    // 2000 MiB at n_ubatch 2048 on a 248320-token vocabulary, for batches that never exceed n_seq_max * block_size tokens: both
+    // graphs are reserved at their own sizes (LLAMA_DFLASH_RESERVE_SPLIT=0: the token graph at n_ubatch)
+    uint32_t n_tokens_pp = n_tokens;
+    {
+        static const bool split_env = getenv("LLAMA_DFLASH_RESERVE_SPLIT") == nullptr || atoi(getenv("LLAMA_DFLASH_RESERVE_SPLIT")) != 0;
+        const uint32_t n_block = model.hparams.dflash_block_size;
+        if (split_env && model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult == 0 && n_block > 0 && !cparams.training &&
+                n_seqs * n_block < n_tokens) {
+            n_tokens_pp = n_seqs * n_block;
+            std::vector<size_t> sizes_embd(backend_ptrs.size(), 0);
+            reserve_embd = true;
+            auto * gf_embd = graph_reserve(n_tokens, n_seqs, n_seqs, mctx.get(),
+                    model.hparams.no_alloc, model.hparams.no_alloc ? sizes_embd.data() : nullptr);
+            reserve_embd = false;
+            if (!gf_embd) {
+                throw std::runtime_error("failed to allocate compute embd buffers");
+            }
+            if (model.hparams.no_alloc) {
+                reserve_embd_sizes = sizes_embd;
+            }
+            LLAMA_LOG_INFO("%s: DFlash draft: feature batches reserved at %u rows, noise blocks at %u tokens\n", __func__, n_tokens, n_tokens_pp);
+        }
+    }
+
+    const uint32_t n_outputs_pp = std::min(n_tokens_pp, cparams.n_outputs_max);
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
+        auto * gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get(),
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
+        if (gf && model.hparams.no_alloc && !reserve_embd_sizes.empty()) {
+            for (size_t i = 0; i < backend_buf_exp_size.size() && i < reserve_embd_sizes.size(); ++i) {
+                backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], reserve_embd_sizes[i]);
+            }
+            reserve_embd_sizes.clear();
+        }
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched_new(max_nodes, false);
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+                gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
@@ -2688,7 +2721,7 @@ void llama_context::sched_reserve() {
                 gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc);
                 break;
             default:
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+                gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
         };
 
         if (!gf) {
@@ -7943,6 +7976,11 @@ ggml_cgraph * llama_context::graph_reserve(
 
     llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
     llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
+    if (reserve_embd) {
+        ubatch.data->embd.resize((size_t) n_tokens*llama_batch_ext_select_n_embd_inp(cparams.ctx_type, model.arch, model.hparams));
+        ubatch.embd  = ubatch.data->embd.data();
+        ubatch.token = nullptr;
+    }
 
     ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
 
