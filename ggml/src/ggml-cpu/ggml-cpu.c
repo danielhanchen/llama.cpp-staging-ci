@@ -1806,7 +1806,7 @@ struct ggml_moe_team {
     struct ggml_moe_host_job * job;
     int                        job_n;   // threads of the batch, the caller included
     atomic_int  GGML_CACHE_ALIGN gen;   // one count per batch
-    atomic_int  GGML_CACHE_ALIGN left;  // workers of the batch not done
+    atomic_int  GGML_CACHE_ALIGN left;  // workers that have not finished (or, beyond the batch's threads, not seen) the batch
     atomic_int  sleepers;
     atomic_bool stop;
 };
@@ -1856,8 +1856,10 @@ static thread_ret_t ggml_moe_team_worker(void * arg) {
             seen = g;
             if (i < t->job_n) {
                 ggml_moe_host_ffn_thread(t->job, i);
-                atomic_fetch_add_explicit(&t->left, -1, memory_order_acq_rel);
             }
+            // every worker counts, the ones the batch does not use too: the poster writes the next batch only after all of them
+            // have read this one
+            atomic_fetch_add_explicit(&t->left, -1, memory_order_acq_rel);
             last = ggml_time_us();
             spins = 0;
             continue;
@@ -1957,7 +1959,7 @@ static bool ggml_moe_team_run(struct ggml_moe_host_job * j, int n_threads) {
     }
     t->job   = j;
     t->job_n = n_threads;
-    atomic_store_explicit(&t->left, n_threads - 1, memory_order_relaxed);
+    atomic_store_explicit(&t->left, t->n, memory_order_relaxed);
     atomic_fetch_add(&t->gen, 1);
     if (atomic_load(&t->sleepers) > 0) {
         ggml_mutex_lock(&t->mtx);
