@@ -1384,6 +1384,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
+                // LLAMA_DFLASH_P_CUM=P (default 0 = off): the walk also stops where the product of the steps' probabilities falls below P,
+                // the chance that the whole draft so far is accepted if the selector were calibrated: a verify row costs about the same
+                // wherever it ends, so a long draft of unlikely tokens costs verify rows for few accepted ones
+                static const float p_cum_min = [] {
+                    const char * e = getenv("LLAMA_DFLASH_P_CUM");
+                    return e != nullptr ? std::max(0.0f, (float) atof(e)) : 0.0f;
+                }();
+                const float p_cum_thr = is_dflash2 ? p_cum_min : 0.0f;
+                float p_cum = 1.0f;
+
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
@@ -1392,13 +1402,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + top_k));
-                    if (params.p_min > 0.0f) {
+                    if (params.p_min > 0.0f || p_cum_thr > 0.0f) {
                         // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                         float sum = 0.0f;
                         for (int32_t k = 0; k < top_k; ++k) {
                             sum += std::exp(scores[k] - scores[predecessor]);
                         }
-                        if (1.0f / sum < params.p_min) {
+                        p_cum *= 1.0f / sum;
+                        if (1.0f / sum < params.p_min || p_cum < p_cum_thr) {
                             break;
                         }
                     }
