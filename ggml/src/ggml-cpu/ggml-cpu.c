@@ -1856,7 +1856,7 @@ static thread_ret_t ggml_moe_team_worker(void * arg) {
             seen = g;
             if (i < t->job_n) {
                 ggml_moe_host_ffn_thread(t->job, i);
-                atomic_fetch_sub_explicit(&t->left, 1, memory_order_acq_rel);
+                atomic_fetch_add_explicit(&t->left, -1, memory_order_acq_rel);
             }
             last = ggml_time_us();
             spins = 0;
@@ -1870,14 +1870,15 @@ static thread_ret_t ggml_moe_team_worker(void * arg) {
         if (ggml_time_us() - last < ggml_moe_host_team_spin_us()) {
             continue;
         }
-        // no batch for a while: sleep until the next one (the poster wakes the sleepers after it counts gen up)
-        ggml_mutex_lock(&t->mtx);
+        // no batch for a while: sleep until the next one (the poster wakes the sleepers after it counts gen up; the shared lock as
+        // in the threadpool's wait, which is what ggml_cond_wait takes on Windows)
+        ggml_mutex_lock_shared(&t->mtx);
         atomic_fetch_add(&t->sleepers, 1);
         while (atomic_load(&t->gen) == seen && !atomic_load(&t->stop)) {
             ggml_cond_wait(&t->cv, &t->mtx);
         }
-        atomic_fetch_sub(&t->sleepers, 1);
-        ggml_mutex_unlock(&t->mtx);
+        atomic_fetch_add(&t->sleepers, -1);
+        ggml_mutex_unlock_shared(&t->mtx);
         last = ggml_time_us();
     }
     return (thread_ret_t) 0;
