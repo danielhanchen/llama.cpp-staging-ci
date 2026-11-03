@@ -6760,8 +6760,8 @@ static bool ggml_cuda_mmvf_multi_candidate(const ggml_tensor * node) {
     const ggml_tensor * src1 = node->src[1];
     return (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16) && src0->op == GGML_OP_NONE && src0->view_src == nullptr &&
         ggml_is_contiguous(src0) && ggml_is_matrix(src0) && src0->ne[0] < 4096 && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) &&
-        src1->ne[2] == 1 && src1->ne[3] == 1 && src1->ne[1] >= 1 && src1->ne[1] <= 6 && !ggml_is_empty(node) && ggml_is_contiguous(node) &&
-        !ggml_cuda_side_mv_run(node); // k19-vrow2: 5..6 columns only where ggml_cuda_mul_mat_vec_f_multi_ok takes them (GGML_CUDA_VERIFY_WIDE)
+        src1->ne[2] == 1 && src1->ne[3] == 1 && src1->ne[1] >= 1 && src1->ne[1] <= MMVF_MAX_BATCH_SIZE && !ggml_is_empty(node) &&
+        ggml_is_contiguous(node) && !ggml_cuda_side_mv_run(node); // k19-vrow3: 5..8 columns only where ggml_cuda_mul_mat_vec_f_multi_ok takes them (GGML_CUDA_VERIFY_WIDE)
 }
 
 // node goes to ggml_cuda_mul_mat_vec_f in ggml_cuda_mul_mat (same dispatch, see there)
@@ -8722,7 +8722,12 @@ static bool ggml_cuda_side_mv_run(const ggml_tensor * node) {
     // at several columns only long-K ones (the hc inject, K = 10240): a short-K tiny product (the shared expert gate, K = 2560) joins
     // the multi-matrix launch of its neighbour instead (the router: one launch fewer), GGML_CUDA_SIDE_MV_COLS_MIN_K (default 4096)
     static const int64_t min_k = getenv("GGML_CUDA_SIDE_MV_COLS_MIN_K") ? atoll(getenv("GGML_CUDA_SIDE_MV_COLS_MIN_K")) : 4096;
-    return ncols == 1 || (ncols <= max_cols && node->src[0]->ne[1] <= 4 && node->src[0]->ne[0] >= min_k);
+    // k19-vrow3: in a verify window of 5..8 rows whose F32 products stay on mmvf (GGML_CUDA_VERIFY_WIDE bit 1) as in a 4-row one (not
+    // with GGML_CUDA_SIDE_MV_COLS set)
+    static const bool cols_env = getenv("GGML_CUDA_SIDE_MV_COLS") != nullptr;
+    const int wide_cols = !cols_env && node->src[0]->type == GGML_TYPE_F32 && ncols > max_cols ?
+        ggml_cuda_verify_wide_cols(ggml_cuda_info().devices[ggml_cuda_get_device()].cc, 1) : 0;
+    return ncols == 1 || (ncols <= std::max<int64_t>(max_cols, wide_cols) && node->src[0]->ne[1] <= 4 && node->src[0]->ne[0] >= min_k);
 }
 
 // The side stream is only used while a decode-sized graph is captured into a CUDA graph. Used eagerly, it cost more than it saved:

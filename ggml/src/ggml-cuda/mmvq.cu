@@ -1929,7 +1929,7 @@ static int mul_mat_vec_q_batch_rpb(const int ncols_x, const int nrows_x, const i
     return 0;
 }
 
-// k19-vrow2: a dense 5..6 column launch of a multi-matrix type (no fusion, no ids) as the 4-column launch makes it, only wider: 4 warps,
+// k19-vrow2 / k19-vrow3: a dense 5..8 column launch of a multi-matrix type (no fusion, no ids) as the 4-column launch makes it, only wider: 4 warps,
 // the rows per block and K unroll mul_mat_vec_q_batch_rpb / mul_mat_vec_q_unroll pick for 4 columns. A row's sum depends on the warps
 // and the unroll (the K split and order), not on the rows per block. false: not this type / table (the caller falls back)
 template <ggml_type type>
@@ -1951,7 +1951,7 @@ static bool mul_mat_vec_q_verify_wide(
         const mmvq_parameter_table_id table_id = get_device_table_id(cc);
         const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                                 fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.shared_up != nullptr;
-        if (has_fusion || table_id != MMVQ_PARAMETERS_GENERIC || calc_nwarps(type, 4, table_id) != 4 || ncols_dst < 5 || ncols_dst > 6) {
+        if (has_fusion || table_id != MMVQ_PARAMETERS_GENERIC || calc_nwarps(type, 4, table_id) != 4 || ncols_dst < 5 || ncols_dst > 8) {
             return false;
         }
         const int  rpb    = mul_mat_vec_q_batch_rpb<type>(ncols_x, nrows_x, 4, cc, warp_size, table_id);
@@ -1971,10 +1971,11 @@ static bool mul_mat_vec_q_verify_wide(
 #define MMVQ_VW_NC(NC) \
         if (rpb == 4) { MMVQ_VW_LAUNCH(NC, 4, 1); } else if (rpb == 1) { if (unroll) { MMVQ_VW_LAUNCH(NC, 1, 8); } else { MMVQ_VW_LAUNCH(NC, 1, 1); } } \
         else if (unroll) { MMVQ_VW_LAUNCH(NC, 0, 8); } else { MMVQ_VW_LAUNCH(NC, 0, 1); }
-        if (ncols_dst == 5) {
-            MMVQ_VW_NC(5)
-        } else {
-            MMVQ_VW_NC(6)
+        switch (ncols_dst) {
+            case 5: { MMVQ_VW_NC(5) } break;
+            case 6: { MMVQ_VW_NC(6) } break;
+            case 7: { MMVQ_VW_NC(7) } break;
+            default: { MMVQ_VW_NC(8) } break;
         }
 #undef MMVQ_VW_NC
 #undef MMVQ_VW_LAUNCH
@@ -2091,7 +2092,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         // rc == 0: the batched launch below
     }
 
-    // k19-vrow2 (GGML_CUDA_VERIFY_WIDE bit 2, see ggml_cuda_verify_wide_cols): a dense product without fusion over 5..6 columns of a
+    // k19-vrow2 / k19-vrow3 (GGML_CUDA_VERIFY_WIDE bit 2, see ggml_cuda_verify_wide_cols): a dense product without fusion over 5..8 columns of a
     // verify window keeps the 4 warps of 1..4 columns, so its K split is the 3-row window's: the multi-matrix types with the 4-column
     // launch's rows per block and K unroll (mul_mat_vec_q_verify_wide), the others through the batch invariant 4-warp launch
     if (!exact && ids == nullptr && ncols_dst >= 5 &&
@@ -2395,11 +2396,13 @@ static void mul_mat_vec_q_switch_ncols_dst(
 // k15-mm: n_multi dense matrices of one type and one K that read the same activation, in one launch (see ggml_cuda_mul_mat_vec_q_multi).
 // The launch configuration is the one each matrix's own (non batch invariant, or batch invariant with the K split of one column) launch
 // takes; it depends only on the type, K and the number of columns, so every output gets the bytes of that launch.
-template <ggml_type type, int c_ncols_dst, int n_multi, bool c_small_k = false, bool c_halve_iters = false, int c_rpb = 0, int c_unroll = 1>
+// c_nwarps > 0: that many warps (k19-vrow3: 4 for a 5..8 column verify window, as mul_mat_vec_q_verify_wide)
+template <ggml_type type, int c_ncols_dst, int n_multi, bool c_small_k = false, bool c_halve_iters = false, int c_rpb = 0, int c_unroll = 1,
+          int c_nwarps = 0>
 static void mul_mat_vec_q_multi_launch(
         ggml_cuda_mm_fusion_args_device fusion, const int * nrows, const void * vy, const int ncols_x,
         const int stride_row_x, const int stride_col_y, const int warp_size, const mmvq_parameter_table_id table_id, cudaStream_t stream) {
-    const int nwarps = calc_nwarps(type, c_ncols_dst, table_id, c_small_k, c_halve_iters);
+    const int nwarps = c_nwarps > 0 ? c_nwarps : calc_nwarps(type, c_ncols_dst, table_id, c_small_k, c_halve_iters);
     const int rpb    = c_rpb > 0 ? c_rpb : calc_rows_per_block(type, c_ncols_dst, table_id, c_small_k, nwarps);
     uint32_t nblocks = 0;
     for (int m = 0; m < n_multi; ++m) {
@@ -2410,7 +2413,7 @@ static void mul_mat_vec_q_multi_launch(
     const uint3 zero = make_uint3(0, 0, 0);
     const uint3 one  = init_fastdiv_values(1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dim3(nblocks, 1, 1), dim3(warp_size, nwarps, 1), 0, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, c_small_k, c_halve_iters, 0, n_multi, c_rpb, c_unroll>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, c_small_k, c_halve_iters, c_nwarps, n_multi, c_rpb, c_unroll>, launch_params,
         fusion.multi_x[0], vy, (const int32_t *) nullptr, fusion, fusion.multi_dst[0], (uint32_t) ncols_x, zero, (uint32_t) stride_row_x,
         (uint32_t) stride_col_y, (uint32_t) nrows[0], one, 0u, 0u, 0u, one, 0u, 0u, 0u, 0u);
 }
@@ -2445,6 +2448,31 @@ static void mul_mat_vec_q_multi_switch_ncols(
 #define MMVQ_MULTI_L(NC, RPB, UNR) mul_mat_vec_q_multi_launch<type, NC, n_multi, false, false, RPB, UNR>(fusion, nrows, vy, ncols_x, stride_row_x, stride_col_y, warp_size, table_id, stream)
 #define MMVQ_MULTI(NC) (brpb == 1 ? (unroll ? MMVQ_MULTI_L(NC, 1, 8) : MMVQ_MULTI_L(NC, 1, 1)) : brpb == 4 ? MMVQ_MULTI_L(NC, 4, 1) : \
                         unroll ? MMVQ_MULTI_L(NC, 0, 8) : MMVQ_MULTI_L(NC, 0, 1))
+    // k19-vrow3 (GGML_CUDA_VERIFY_WIDE bit 4, see ggml_cuda_verify_wide_cols): 5..8 columns of a verify window keep the 4 warps of 1..4
+    // columns, with the rows per block and K unroll of the 4-column launch (a row's sum depends on the warps only), so the Q / K / V and
+    // gated delta net in-projections of a deep window get the bytes of a 1..4-row window's, as mul_mat_vec_q_verify_wide for single products
+    if (ncols_dst >= 5 && table_id == MMVQ_PARAMETERS_GENERIC && calc_nwarps(type, 4, table_id) == 4 &&
+            ncols_dst <= ggml_cuda_verify_wide_cols(cc, 4)) {
+        int brpb4 = mul_mat_vec_q_batch_rpb<type>(ncols_x, total_rows, 4, cc, warp_size, table_id);
+        for (int m = 0; m < n_multi; ++m) {
+            if (brpb4 == 4 && nrows[m] % 4 != 0) {
+                brpb4 = 0;
+            }
+        }
+        const bool unroll4 = mul_mat_vec_q_unroll<type>(ncols_x, total_rows, 4, table_id, warp_size);
+#define MMVQ_MULTI_W(NC, RPB, UNR) mul_mat_vec_q_multi_launch<type, NC, n_multi, false, false, RPB, UNR, 4>(fusion, nrows, vy, ncols_x, stride_row_x, stride_col_y, warp_size, table_id, stream)
+#define MMVQ_MULTI_WNC(NC) (brpb4 == 1 ? (unroll4 ? MMVQ_MULTI_W(NC, 1, 8) : MMVQ_MULTI_W(NC, 1, 1)) : brpb4 == 4 ? MMVQ_MULTI_W(NC, 4, 1) : \
+                            unroll4 ? MMVQ_MULTI_W(NC, 0, 8) : MMVQ_MULTI_W(NC, 0, 1))
+        switch (ncols_dst) {
+            case 5: MMVQ_MULTI_WNC(5); break;
+            case 6: MMVQ_MULTI_WNC(6); break;
+            case 7: MMVQ_MULTI_WNC(7); break;
+            default: MMVQ_MULTI_WNC(8); break;
+        }
+#undef MMVQ_MULTI_WNC
+#undef MMVQ_MULTI_W
+        return;
+    }
     switch (ncols_dst) {
         case 1: {
             bool small_k = false;

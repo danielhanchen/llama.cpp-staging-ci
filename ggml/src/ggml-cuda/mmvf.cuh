@@ -21,8 +21,8 @@ struct ggml_cuda_verify_graph_scope {
     bool prev;
 };
 bool ggml_cuda_verify_graph_active();
-// k19-vrow2: the most columns of a verify window that keep a 3-row window's kernels for GGML_CUDA_VERIFY_WIDE bit `bit` (1: F32 mmvf,
-// 2: mmvq warps) on this device, 0 outside a verify graph / off / not NVIDIA Ampere+ / HIP / MUSA
+// k19-vrow2 / k19-vrow3: the most columns of a verify window that keep a 1..4-row window's kernels for GGML_CUDA_VERIFY_WIDE bit `bit`
+// (1: F32 mmvf, 2: mmvq warps, 4: multi-matrix mmvq warps) on this device, 0 outside a verify graph / off / not NVIDIA Ampere+ / HIP / MUSA
 int ggml_cuda_verify_wide_cols(int cc, int bit);
 
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11);

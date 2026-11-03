@@ -11501,6 +11501,72 @@ struct test_fa_bi_exact : public test_case {
     }
 };
 
+// k19-vrow3: a test case whose output node carries the verify flag (a speculative verify window that is not batch invariant), vars
+// tagged vf=1: ggml-cuda then runs 5..8 columns with the kernels of a 1..4-column window (GGML_CUDA_VERIFY_WIDE)
+template <class T> struct test_vf : public T {
+    using T::T;
+    std::string vars() override { return T::vars() + ",vf=1"; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * t = T::build_graph(ctx);
+        t->flags |= GGML_TENSOR_FLAG_VERIFY;
+        return t;
+    }
+};
+
+// k19-vrow3: rows of a verify window are bitwise those of single-row products. In one verify-flagged graph, nm (1..3) products of one
+// type and K over an activation of T columns (adjacent, so the CUDA backend may run them as one multi-matrix launch), minus the same
+// products over each column alone, concatenated: exact means every output is 0 on the backend under test (err = max |out|, tolerance 0;
+// the CPU reference is not used). On CUDA (NVIDIA Ampere+) this holds for 1..4 columns by construction and for 5..8 with
+// GGML_CUDA_VERIFY_WIDE (default 7); GGML_CUDA_VERIFY_WIDE=0 is the negative control (MMF / cuBLAS / 2-warp mmvq at 5..8 columns)
+struct test_vrow_inv : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 3> m; // rows of each product, 0 = absent
+    const int64_t k;
+    const int64_t T;
+
+    std::string vars() override { return VARS_TO_STR4(type, m, k, T); }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "VROW_INV"; }
+    bool run_whole_graph() override { return true; }
+    double max_err() override { return 0.0; }
+    double max_err(ggml_backend_t backend) override { GGML_UNUSED(backend); return 0.0; }
+    double err(const float * a, const float * b, size_t n) override {
+        GGML_UNUSED(b);
+        double mx = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            mx = std::max(mx, (double) std::fabs(a[i]));
+        }
+        return mx;
+    }
+
+    test_vrow_inv(ggml_type type, std::array<int64_t, 3> m, int64_t k, int64_t T) : type(type), m(m), k(k), T(T) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const auto vf = [](ggml_tensor * t) { t->flags |= GGML_TENSOR_FLAG_VERIFY; return t; };
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, T);
+        ggml_set_name(x, "x");
+        std::vector<ggml_tensor *> w, y;
+        for (int i = 0; i < 3 && m[i] > 0; ++i) {
+            w.push_back(ggml_new_tensor_2d(ctx, type, k, m[i]));
+        }
+        for (ggml_tensor * wi : w) {
+            y.push_back(vf(ggml_mul_mat(ctx, wi, x)));
+        }
+        ggml_tensor * out = nullptr;
+        for (size_t i = 0; i < w.size(); ++i) {
+            ggml_tensor * z = nullptr;
+            for (int64_t j = 0; j < T; ++j) {
+                ggml_tensor * xj  = ggml_view_2d(ctx, x, k, 1, x->nb[1], j*x->nb[1]);
+                ggml_tensor * zij = vf(ggml_mul_mat(ctx, w[i], xj));
+                z = z == nullptr ? zij : vf(ggml_concat(ctx, z, zij, 1));
+            }
+            ggml_tensor * d = vf(ggml_sub(ctx, y[i], z));
+            out = out == nullptr ? d : vf(ggml_concat(ctx, out, d, 0));
+        }
+        ggml_set_name(out, "out");
+        return vf(out);
+    }
+};
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
@@ -11524,6 +11590,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         }
     }
+    // k19-vrow3: verify windows of 1..8 rows at the Qwen3.8-Flash-Next (qwen4exp) shapes: the rows of a T-row window against the single
+    // row products, bit for bit (VROW_INV), and the verify-flagged products against the CPU reference. Q8_0: hc down (K 10240, 320 rows:
+    // one row per block + unrolled K), hc up (K 320: 4 rows per block), the gated delta net in-projections (2 products over one input:
+    // the multi-matrix launch), attention q / k / v (3 products), shared expert down; Q6_K (the lm head's type), IQ4_XS, Q4_0 (no
+    // multi-matrix kernel: the batch invariant 4-warp launch); F32: hc inject (split-K), alpha + beta (multi), router, shared expert gate
+    for (int64_t T = 1; T <= 8; ++T) {
+        for (auto c : std::vector<std::tuple<ggml_type, std::array<int64_t, 3>, int64_t>>{
+                 { GGML_TYPE_Q8_0, { 320, 0, 0 }, 10240 }, { GGML_TYPE_Q8_0, { 10240, 0, 0 }, 320 },
+                 { GGML_TYPE_Q8_0, { 6144, 2048, 0 }, 2560 }, { GGML_TYPE_Q8_0, { 1024, 256, 256 }, 2560 },
+                 { GGML_TYPE_Q8_0, { 2560, 0, 0 }, 1024 }, { GGML_TYPE_Q6_K, { 2048, 0, 0 }, 2560 },
+                 { GGML_TYPE_IQ4_XS, { 1024, 0, 0 }, 2560 }, { GGML_TYPE_Q4_0, { 1024, 0, 0 }, 2560 },
+                 { GGML_TYPE_F32, { 4, 0, 0 }, 10240 }, { GGML_TYPE_F32, { 48, 48, 0 }, 2560 },
+                 { GGML_TYPE_F32, { 512, 1, 0 }, 2560 }, { GGML_TYPE_F32, { 512, 0, 0 }, 2560 } }) {
+            const auto [t, m, k] = c;
+            test_cases.emplace_back(new test_vrow_inv(t, m, k, T));
+        }
+        for (auto c : std::vector<std::tuple<ggml_type, int64_t, int64_t>>{
+                 { GGML_TYPE_Q8_0, 320, 10240 }, { GGML_TYPE_Q8_0, 10240, 320 }, { GGML_TYPE_Q8_0, 6144, 2560 }, { GGML_TYPE_Q8_0, 2560, 1024 },
+                 { GGML_TYPE_Q6_K, 2048, 2560 }, { GGML_TYPE_IQ4_XS, 1024, 2560 }, { GGML_TYPE_Q4_0, 1024, 2560 },
+                 { GGML_TYPE_F32, 4, 10240 }, { GGML_TYPE_F32, 48, 2560 }, { GGML_TYPE_F32, 512, 2560 }, { GGML_TYPE_F32, 1, 2560 } }) {
+            const auto [t, m, k] = c;
+            test_cases.emplace_back(new test_vf<test_mul_mat>(t, GGML_TYPE_F32, m, T, k, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
+        }
+    }
+
     std::default_random_engine rng(0);
 
     // unary ops
@@ -14348,6 +14439,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // k19-vrow3: Flash-Next verify products at 1..8 rows, verify-flagged (as a server verify window) and not (the kernels of base)
+    for (int64_t T = 1; T <= 8; ++T) {
+        for (auto c : std::vector<std::tuple<ggml_type, int64_t, int64_t>>{
+                 { GGML_TYPE_Q8_0, 320, 10240 }, { GGML_TYPE_Q8_0, 10240, 320 }, { GGML_TYPE_Q8_0, 6144, 2560 }, { GGML_TYPE_Q8_0, 2560, 1024 },
+                 { GGML_TYPE_Q8_0, 1024, 2560 }, { GGML_TYPE_F32, 4, 10240 }, { GGML_TYPE_F32, 48, 2560 }, { GGML_TYPE_F32, 512, 2560 },
+                 { GGML_TYPE_F32, 1, 2560 } }) {
+            const auto [t, m, k] = c;
+            test_cases.emplace_back(new test_vf<test_mul_mat>(t, GGML_TYPE_F32, m, T, k, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, m, T, k, {1, 1}, {1, 1}));
+        }
+    }
 
     // k15-lfm2: LFM2.5 prompt expert products (2048 tokens, 4 of 64 experts) over the experts alone and over a 2091-slot cache bank
     for (auto tmk : std::vector<std::tuple<ggml_type, int64_t, int64_t>>{ { GGML_TYPE_Q4_K, 1536, 2048 }, { GGML_TYPE_Q5_K, 2048, 1536 } }) {

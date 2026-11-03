@@ -684,9 +684,9 @@ static int64_t mul_mat_vec_f_block_size(const int64_t ncols, const int device) {
 }
 
 bool ggml_cuda_mul_mat_vec_f_multi_ok(const ggml_type type, const int64_t ncols, const int64_t ncols_dst, const int device) {
-    // k19-vrow2: F32 at 5..6 columns in a verify window (GGML_CUDA_VERIFY_WIDE bit 1), where mmvf takes them (one launch for both)
+    // k19-vrow2 / k19-vrow3: F32 at 5..8 columns in a verify window (GGML_CUDA_VERIFY_WIDE bit 1), where mmvf takes them (one launch)
     const int max_cols = ncols_dst <= 4 ? 4 : type == GGML_TYPE_F32 ? ggml_cuda_verify_wide_cols(ggml_cuda_info().devices[device].cc, 1) : 0;
-    return (type == GGML_TYPE_F32 || type == GGML_TYPE_BF16) && ncols % 2 == 0 && ncols_dst >= 1 && ncols_dst <= std::min(max_cols, 6) &&
+    return (type == GGML_TYPE_F32 || type == GGML_TYPE_BF16) && ncols % 2 == 0 && ncols_dst >= 1 && ncols_dst <= std::min(max_cols, MMVF_MAX_BATCH_SIZE) &&
         ggml_cuda_info().devices[device].warp_size == 32 && mul_mat_vec_f_block_size(ncols, device) == 256;
 }
 
@@ -707,6 +707,8 @@ static void mul_mat_vec_f_multi_launch(const ggml_cuda_mm_fusion_args_device & f
         MMVF_MULTI_LAUNCH(4)
         MMVF_MULTI_LAUNCH(5)
         MMVF_MULTI_LAUNCH(6)
+        MMVF_MULTI_LAUNCH(7)
+        MMVF_MULTI_LAUNCH(8)
         default: GGML_ABORT("fatal error");
     }
 #undef MMVF_MULTI_LAUNCH
@@ -1038,15 +1040,16 @@ bool ggml_cuda_verify_graph_active() {
     return ggml_cuda_verify_graph_tls;
 }
 
-// k19-vrow2: GGML_CUDA_VERIFY_WIDE (a mask, default 0 = off; 3 = both): what a verify window of 5..GGML_CUDA_VERIFY_WIDE_MAX (default 6) rows
-// keeps from a 3-row one. 1: F32 weights stay on mmvf (and two F32 products over one activation stay one mmvf multi launch) instead of
-// MMF / cuBLAS; 2: dense mmvq products without fusion keep the 4 warps of 1..4 columns (the generic table halves them from 5). Not
-// bit-identical to a 5-row window without it (f32 summation order, KLD-gated); a row's sums then no longer depend on whether the window
-// had 3 or 6 rows for these products. NVIDIA Ampere and newer only, CUDA builds only: HIP / MUSA and older GPUs keep their kernels
-// Reassociation-class: the f32 reordering can flip a borderline MoE top-k route, and the run then drifts from there (kvr2_tfc1 /
-// k19-v5bug, Qwen3.8-Flash-Next fn4, 4-draft windows, WIDE=3: one expert swap at layer 4, router logit error 3.4e-3 vs 2e-3 without it,
-// grew to KLD 0.54 at long48 prompt 10 pos 64 with fusion on; every op at layer 0 matched the 3-row window up to f32 order). KLD-gated,
-// off by default
+// k19-vrow2 / k19-vrow3: GGML_CUDA_VERIFY_WIDE (a mask, default 7; 0 = off): what a verify window of 5..GGML_CUDA_VERIFY_WIDE_MAX
+// (default 8) rows keeps from a window of 1..4 rows. 1: F32 weights stay on mmvf (and F32 products over one activation stay one mmvf multi
+// launch) instead of MMF (TF32 tensor cores) / cuBLAS; 2: dense mmvq products without fusion keep the 4 warps of 1..4 columns (the generic
+// table halves them from 5); 4: the same for the multi-matrix mmvq launches (Q / K / V, the gated delta net in-projections). mmvf's and
+// mmvq's per-column sums do not depend on the column count once the kernel family and the warps are fixed (block size from K only, rows
+// per block and K unrolling do not change a row's sum), so with all three bits a row of a 5..8-row window gets, for these products, the
+// bytes of the same row in a 1..4-row window, and a deeper window costs the extra columns only. Not bit-identical to a 5..8-row window
+// without it (another f32 summation order than MMF / cuBLAS / 2-warp mmvq: KLD-gated, plans/k19_vrow3.md); windows of 1..4 rows and
+// untagged graphs (prompt chunks) are not touched. NVIDIA Ampere and newer only, CUDA builds only: HIP / MUSA and older GPUs keep their
+// kernels. As any reassociation, it can flip a borderline MoE top-k route that then drifts (kvr2_tfc1 / k19-v5bug, plans/k19_v5bug.md)
 int ggml_cuda_verify_wide_cols(const int cc, const int bit) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(cc, bit);
@@ -1054,16 +1057,11 @@ int ggml_cuda_verify_wide_cols(const int cc, const int bit) {
 #else
     static const int mask = [] {
         const char * e = getenv("GGML_CUDA_VERIFY_WIDE");
-        const int m = e != nullptr ? atoi(e) : 0; // off by default: reassociation-class, KLD-gated, not md5-exact
-        if (m != 0) {
-            GGML_LOG_WARN("%s: GGML_CUDA_VERIFY_WIDE=%d is on: reassociation-class, can flip a borderline MoE top-k route that then drifts "
-                "(kvr2_tfc1 / k19-v5bug); KLD-gated, off by default\n", __func__, m);
-        }
-        return m;
+        return e != nullptr ? atoi(e) : 7;
     }();
     static const int max_cols = [] {
         const char * e = getenv("GGML_CUDA_VERIFY_WIDE_MAX");
-        return std::max(4, std::min(e != nullptr ? atoi(e) : 6, MMVF_MAX_BATCH_SIZE));
+        return std::max(4, std::min(e != nullptr ? atoi(e) : MMVF_MAX_BATCH_SIZE, MMVF_MAX_BATCH_SIZE));
     }();
     if (!ggml_cuda_verify_graph_tls || (mask & bit) == 0 || !GGML_CUDA_CC_IS_NVIDIA(cc) || !ampere_mma_available(cc)) {
         return 0;
@@ -1071,8 +1069,8 @@ int ggml_cuda_verify_wide_cols(const int cc, const int bit) {
     static bool logged = false;
     if (!logged) {
         logged = true;
-        GGML_LOG_INFO("%s: k19-vrow2: verify windows of 5..%d rows keep the kernels of a 3-row one (GGML_CUDA_VERIFY_WIDE=%d: 1 F32 mmvf, "
-            "2 mmvq warps; 0 off)\n", __func__, max_cols, mask);
+        GGML_LOG_INFO("%s: k19-vrow3: verify windows of 5..%d rows keep the kernels of a 1..4-row one (GGML_CUDA_VERIFY_WIDE=%d: 1 F32 mmvf, "
+            "2 mmvq warps, 4 multi-matrix mmvq warps; 0 off)\n", __func__, max_cols, mask);
     }
     return max_cols;
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
@@ -1108,7 +1106,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                         }
                         return true;
                     }
-                    // k19-vrow2: 5..6 rows too (GGML_CUDA_VERIFY_WIDE bit 1)
+                    // k19-vrow2 / k19-vrow3: 5..8 rows too (GGML_CUDA_VERIFY_WIDE bit 1)
                     return ne11 <= 3 || ne11 <= ggml_cuda_verify_wide_cols(cc, 1);
                 }
                 if (cc >= GGML_CUDA_CC_TURING) {
