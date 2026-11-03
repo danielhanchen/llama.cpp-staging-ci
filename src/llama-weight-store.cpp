@@ -13,6 +13,7 @@
 #include <deque>
 #include <fstream>
 #include <mutex>
+#include <string>
 #include <thread>
 
 #ifdef _WIN32
@@ -114,8 +115,17 @@ static bool open_buffered(file_state & fs, const llama_weight_file & f) {
     if (f.path.empty()) {
         return false;
     }
-    fs.h = CreateFileA(f.path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
+    // the path is UTF-8, which CreateFileA would read in the ANSI code page (a path that is not valid UTF-8 is opened as before)
+    const int n_w = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, f.path.c_str(), -1, nullptr, 0);
+    if (n_w > 0) {
+        std::wstring path_w(n_w, L'\0');
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, f.path.c_str(), -1, &path_w[0], n_w);
+        fs.h = CreateFileW(path_w.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
+    } else {
+        fs.h = CreateFileA(f.path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
+    }
     return fs.h != INVALID_HANDLE_VALUE;
 #else
     if (!f.path.empty()) {
