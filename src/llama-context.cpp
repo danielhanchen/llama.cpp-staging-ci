@@ -5619,6 +5619,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     lm_arena_old.clear();
     // k19-fixF: the group ends with a member with outputs whose narrowed last layer reads the cache banks (a slot map or a device
     // lookup; see the end of the loop below); such a group must not release the banks
+    // k19-fixG: any member, not only the output one: device seed plans and fills (MOE_CACHE_LOOKUP nodes on the banks, map and state)
+    // in large members, and device lookups of a member the CPU-miss path serves (GGML_SCHED_PREFETCH_MIN_BATCH <= 255)
     bool lm_out_banks = false;
     int64_t n_outputs_group = 0;
     int64_t n_tokens_group  = 0;
@@ -5685,9 +5687,9 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         if (out_large) {
             moe_cache->set_force_large(false);
         }
-        // otherwise the member reads the banks if its graph has a slot map or a device lookup (the narrowed layer of few rows)
-        lm_out_banks = false;
-        for (int i = 0; n_out > 0 && !tail && !out_large && gf != nullptr && i < ggml_graph_n_nodes(gf) && !lm_out_banks; ++i) {
+        // otherwise the member reads the banks if its graph has a slot map or a MOE_CACHE_LOOKUP node (the narrowed layer of few rows,
+        // a device seed); a graph built as a large ubatch has neither
+        for (int i = 0; gf != nullptr && i < ggml_graph_n_nodes(gf) && !lm_out_banks; ++i) {
             const ggml_tensor * node = ggml_graph_node(gf, i);
             lm_out_banks = node->op == GGML_OP_MOE_CACHE_LOOKUP;
             for (int j = 0; j < GGML_MAX_SRC && !lm_out_banks; ++j) {
@@ -6210,11 +6212,11 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         ggml_backend_sched_use_full_hash(sched.get());
         moe_cache->set_graph(nullptr);
         if (!ok && over > 0 && lm_out_banks) {
-            // k19-fixF: the last member reads the banks through its slot map (built before this measure), so the banks stay and the
-            // group is split as with LLAMA_MOE_LM_RELEASE_SPLIT=0 (releasing them aborted the narrowed lookup)
+            // k19-fixF: a member reads the banks (a slot map, a device lookup or seed, built before this measure), so the banks stay
+            // and the group is split as with LLAMA_MOE_LM_RELEASE_SPLIT=0 (releasing them aborted the narrowed lookup)
             static int n_log = 0;
             if (n_log++ < 4) {
-                LLAMA_LOG_INFO("%s: the merged graph of %zu ubatches does not fit, but its last ubatch reads the cache banks for its outputs: "
+                LLAMA_LOG_INFO("%s: the merged graph of %zu ubatches does not fit, but a ubatch of it reads the cache banks: "
                     "the banks are kept and the group is split\n", __func__, group.size());
             }
         } else if (!ok && over > 0) {
@@ -6244,6 +6246,12 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
         return freed;
     };
+    if (lm_release_env && group.size() >= 2 && lm_tiny && lm_out_banks) {
+        static int n_log = 0;
+        if (n_log++ < 4) {
+            LLAMA_LOG_INFO("%s: a ubatch of the group of %zu reads the cache banks (a device seed or lookup): the banks are kept\n", __func__, group.size());
+        }
+    }
     if (lm_release_env && group.size() >= 2 && lm_tiny && !lm_out_banks) {
         ggml_backend_sched_synchronize(sched.get());
         if (lm_rel_trim) {

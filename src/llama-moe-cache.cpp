@@ -7343,6 +7343,12 @@ struct llama_moe_cache::impl {
         if (!d.released) {
             return false;
         }
+        // k19-fixG: a graph run while released may have placed a bank tensor it still referenced in its compute buffer; the allocation
+        // below skips tensors with data, so every binding is cleared first
+        for (ggml_tensor * t = ggml_get_first_tensor(d.ctx_bank.get()); t != nullptr; t = ggml_get_next_tensor(d.ctx_bank.get(), t)) {
+            t->data   = nullptr;
+            t->buffer = nullptr;
+        }
         d.buf_bank.reset(ggml_backend_alloc_ctx_tensors_from_buft(d.ctx_bank.get(), d.buft));
         if (!d.buf_bank) {
             GGML_ABORT("MoE cache: the released banks (%.2f MiB) could not be allocated again", d.buf_size/1048576.0);
@@ -8364,8 +8370,10 @@ struct llama_moe_cache::impl {
         return std::max<int32_t>(1, std::min<int32_t>(g.lru.n_expert, g.n_slots / (int32_t) g.layers.size()));
     }
 
+    // k19-fixG: none in a graph built as a large ubatch (set_force_large: the tail and output members of a layer-major group that
+    // releases the banks), which must not read or bind the banks
     ggml_tensor * devseed_plan(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_tokens) const {
-        if (n_tokens < devseed_min || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+        if (force_large || n_tokens < devseed_min || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return nullptr;
         }
         const group & g = groups[layers[il].ig];
@@ -8378,6 +8386,9 @@ struct llama_moe_cache::impl {
 
     // the bank of the cached expert tensor w, and its layer
     ggml_tensor * devseed_bank(const ggml_tensor * w, int32_t & il) const {
+        if (force_large) {
+            return nullptr;
+        }
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
             return nullptr;
