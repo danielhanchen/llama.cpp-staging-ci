@@ -168,6 +168,17 @@ static bool llama_verify_tag_env() {
     return value;
 }
 
+// k19-vrow3: LLAMA_SPEC_VERIFY_WIDE_CACHED (default on, =0 off): while an MoE cache runs, a verify batch of 5 or more tokens (a deep
+// MTP / DFlash window; the tpp windows of 3..4 rows stay untagged there) is tagged too, so its dense / F32 products keep the kernels of a
+// 1..4-row window as on a full card (ggml-cuda GGML_CUDA_VERIFY_WIDE): only windows the Studio MTP default never forms
+static bool llama_verify_wide_cached_env() {
+    static const bool value = [] {
+        const char * env = getenv("LLAMA_SPEC_VERIFY_WIDE_CACHED");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return value;
+}
+
 // k19-tpp: no verify tag while an MoE cache runs (LLAMA_SPEC_TPP_CACHED=1: tagged there too; LLAMA_SPEC_TPP_FORCE_CACHED=1, a test
 // hook: as if a cache ran), so a cached tier verifies as LLAMA_SPEC_TPP=0 does there
 static bool llama_tpp_cached_env() {
@@ -5128,7 +5139,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         cparams.batch_invariant = exact_verify && ubatch.n_tokens > 1;
         cparams.exact_split     = cparams.batch_invariant ? llm_graph_exact_split(ubatch) : 0;
         cparams.verify_tag      = llama_verify_tag_env() && cparams.verify && !cparams.batch_invariant && ubatch.n_tokens > 1 && !output_all &&
-            (!(moe_cache_active() || llama_tpp_force_cached_env()) || llama_tpp_cached_env());
+            (!(moe_cache_active() || llama_tpp_force_cached_env()) || llama_tpp_cached_env() ||
+             (ubatch.n_tokens >= 5 && llama_verify_wide_cached_env()));
 
         // k19-tiny-ub: with the banks released every layer is built as a large batch (an output-only last layer would read the banks
         // through a host lookup)
