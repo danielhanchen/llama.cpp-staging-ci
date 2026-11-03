@@ -5585,6 +5585,32 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         int64_t              n_tokens_before; // tokens of the batch before this ubatch
     };
     std::vector<lm_ub> group;
+    // k19-fixG: a failure after the memory of some ubatches was applied removes their entries (the group's and, if given, those of the
+    // ubatch being added), as decode does for a failed process_ubatch
+    auto lm_rollback = [&](const llama_ubatch * cur) {
+        llama_pos pos_min[LLAMA_MAX_SEQ];
+        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            pos_min[s] = std::numeric_limits<llama_pos>::max();
+        }
+        auto add = [&](const llama_ubatch & ub) {
+            for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+                const auto & seq_id = ub.seq_id[i][0];
+                pos_min[seq_id] = std::min(pos_min[seq_id], ub.pos[i]);
+            }
+        };
+        for (const auto & g : group) {
+            add(*g.ub);
+        }
+        if (cur != nullptr) {
+            add(*cur);
+        }
+        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            if (pos_min[s] != std::numeric_limits<llama_pos>::max()) {
+                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
+                memory->seq_rm(s, pos_min[s], -1);
+            }
+        }
+    };
 
     gf_res_prev_active = nullptr; gf_res_epoch_bump(__LINE__);
     moe_cache_ids.clear();
@@ -5660,6 +5686,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+            lm_rollback(&ub);
             ret = -3;
             return -1;
         }
@@ -5745,6 +5772,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         t_build_us += ggml_time_us() - tb0;
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to build the graph of ubatch %zu\n", __func__, k);
+            lm_rollback(&ub);
             ret = -3;
             return -1;
         }
@@ -5798,6 +5826,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             lm_arena_used = 0;
             if (!lm_arena) {
                 LLAMA_LOG_ERROR("%s: failed to allocate %.2f MiB of inputs\n", __func__, want/1048576.0);
+                lm_rollback(&ub);
                 ret = -2;
                 return -1;
             }
@@ -5812,6 +5841,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 off = GGML_PAD(off, align);
                 if (ggml_backend_tensor_alloc(lm_arena.get(), t, base + off) != GGML_STATUS_SUCCESS) {
                     LLAMA_LOG_ERROR("%s: failed to place an input\n", __func__);
+                    lm_rollback(&ub);
                     ret = -2;
                     return -1;
                 }
@@ -7197,22 +7227,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     }
 
     if (status != GGML_STATUS_SUCCESS) {
-        llama_pos pos_min[LLAMA_MAX_SEQ];
-        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-            pos_min[s] = std::numeric_limits<llama_pos>::max();
-        }
-        for (const auto & g : group) {
-            for (uint32_t i = 0; i < g.ub->n_tokens; ++i) {
-                const auto & seq_id = g.ub->seq_id[i][0];
-                pos_min[seq_id] = std::min(pos_min[seq_id], g.ub->pos[i]);
-            }
-        }
-        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-            if (pos_min[s] != std::numeric_limits<llama_pos>::max()) {
-                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
-                memory->seq_rm(s, pos_min[s], -1);
-            }
-        }
+        lm_rollback(nullptr);
         switch (status) {
             case GGML_STATUS_ABORTED:      ret =  2; break;
             case GGML_STATUS_ALLOC_FAILED: ret = -2; break;
