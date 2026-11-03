@@ -2379,6 +2379,68 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
     cparams.moe_cache_size = cache_new;
 }
 
+// the device memory of a DFlash / DSpark draft that cannot be created without its target: returns its K/V cache bytes and sets compute to
+// the larger of its feature graph and its noise-block graph (see llama_context::sched_reserve); 0 and compute unchanged for other drafts
+static size_t common_fit_dflash_estimate(const std::string & path_dft, const llama_context_params & cp, size_t & compute) {
+    ggml_context * meta = nullptr;
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &meta };
+    gguf_context_ptr ctx(gguf_init_from_file(path_dft.c_str(), gp));
+    if (!ctx) {
+        return 0;
+    }
+    ggml_context_ptr meta_ptr(meta);
+    const int64_t arch_id = gguf_find_key(ctx.get(), "general.architecture");
+    if (arch_id < 0 || gguf_get_kv_type(ctx.get(), arch_id) != GGUF_TYPE_STRING || std::string(gguf_get_val_str(ctx.get(), arch_id)) != "dflash") {
+        return 0;
+    }
+    auto u32 = [&](const char * key, int64_t def) -> int64_t {
+        const int64_t id = gguf_find_key(ctx.get(), (std::string("dflash.") + key).c_str());
+        return id >= 0 && gguf_get_kv_type(ctx.get(), id) == GGUF_TYPE_UINT32 ? (int64_t) gguf_get_val_u32(ctx.get(), id) : def;
+    };
+    const int64_t n_layer   = u32("block_count", 0);
+    const int64_t n_embd    = u32("embedding_length", 0);
+    const int64_t n_head_kv = u32("attention.head_count_kv", 0);
+    const int64_t n_head    = u32("attention.head_count", 0);
+    const int64_t d_k       = u32("attention.key_length", n_head > 0 ? n_embd / n_head : 0);
+    const int64_t d_v       = u32("attention.value_length", d_k);
+    const int64_t n_block   = u32("block_size", 16);
+    const int64_t n_swa     = u32("attention.sliding_window", 0);
+    // every layer slides when the pattern says so for each (the only DFlash layout with a window so far), else the cache holds n_ctx
+    bool all_swa = n_swa > 0;
+    const int64_t pat_id = gguf_find_key(ctx.get(), "dflash.attention.sliding_window_pattern");
+    if (all_swa && pat_id >= 0 && gguf_get_kv_type(ctx.get(), pat_id) == GGUF_TYPE_ARRAY && gguf_get_arr_type(ctx.get(), pat_id) == GGUF_TYPE_BOOL) {
+        const bool * pat = (const bool *) gguf_get_arr_data(ctx.get(), pat_id);
+        for (size_t i = 0; i < gguf_get_arr_n(ctx.get(), pat_id); ++i) {
+            all_swa = all_swa && pat[i];
+        }
+    }
+    // the encoder input: the fc matrix reads n_extract target layers
+    const ggml_tensor * fc = ggml_get_tensor(meta, "fc.weight");
+    const int64_t n_embd_enc = fc != nullptr ? fc->ne[0] : 0;
+    // the vocabulary of the lm head (the draft's tokenizer, which matches the target's)
+    int64_t n_vocab = 0;
+    const int64_t tok_id = gguf_find_key(ctx.get(), "tokenizer.ggml.tokens");
+    if (tok_id >= 0 && gguf_get_kv_type(ctx.get(), tok_id) == GGUF_TYPE_ARRAY) {
+        n_vocab = (int64_t) gguf_get_arr_n(ctx.get(), tok_id);
+    }
+    if (n_layer <= 0 || n_embd <= 0 || n_head_kv <= 0 || d_k <= 0 || n_embd_enc <= 0 || n_vocab <= 0) {
+        return 0;
+    }
+    const int64_t n_seq = std::max<int64_t>(1, cp.n_seq_max);
+    const int64_t n_ub  = std::max<int64_t>(1, std::min<int64_t>(cp.n_ubatch, cp.n_ctx));
+    int64_t cells = cp.n_ctx;
+    if (all_swa) {
+        cells = std::min<int64_t>(cp.n_ctx, GGML_PAD(n_swa*n_seq + n_ub, 256));
+    }
+    const double kv_row = (double) n_head_kv*((double) d_k*ggml_type_size(cp.type_k)/ggml_blck_size(cp.type_k) +
+                                              (double) d_v*ggml_type_size(cp.type_v)/ggml_blck_size(cp.type_v));
+    const size_t kv = (size_t) ((double) n_layer*(double) cells*kv_row);
+    const double feat = (double) n_ub*(double) (n_embd_enc + 2*n_embd + 2*n_head_kv*d_k)*sizeof(float);
+    const double tok  = (double) n_seq*(double) n_block*((double) n_vocab*2.0 + 8.0*(double) n_embd)*sizeof(float);
+    compute = (size_t) (std::max(feat, tok) + 32.0*1024*1024);
+    return kv;
+}
+
 // --fit with a separate draft model and a MoE cache: true if the draft model should run on the CPU (see common_init_result)
 // the main model is fitted alone with an unbounded cache (on copies of the parameters), which gives the memory left after its layers;
 // the draft model's device memory at that context size must fit in what the requested cache leaves, plus at most max_frac of the cache
@@ -2462,7 +2524,17 @@ static bool common_fit_draft_on_cpu(
             return false;
         }
         const char * env_c = getenv("LLAMA_FIT_DRAFT_EST_COMPUTE_MIB");
-        const size_t compute = (size_t) (env_c != nullptr ? std::max(0.0, atof(env_c)) : 128.0) * 1024 * 1024;
+        size_t compute = (size_t) (env_c != nullptr ? std::max(0.0, atof(env_c)) : 128.0) * 1024 * 1024;
+        // a DFlash / DSpark draft (it borrows the target's token embeddings and lm head) is priced from its GGUF: the K/V cache and the
+        // larger of its two graphs (llama_context::sched_reserve), the feature batch of n_ubatch rows (the encoder input of n_extract
+        // target layers, its output and the K/V of a layer) and the noise block of block_size rows per sequence on the target's lm head
+        // (logits and the selector's copy). The 128 MiB default held neither the 2000 MiB compute buffer of the token graph at n_ubatch
+        // 2048 (G4 32 GB, Qwen3.8-Flash-Next + DFlash2: cudaMalloc failed, drafting off) nor a full-context K/V cache
+        const size_t kv_dflash = env_c == nullptr ? common_fit_dflash_estimate(path_dft, cparams_dft, compute) : 0;
+        if (kv_dflash > 0 || compute == 0) {
+            LOG_INF("%s: DFlash draft estimate: K/V %.2f MiB, compute %.2f MiB\n", __func__, kv_dflash/MiB, compute/MiB);
+        }
+        compute += kv_dflash;
         dft = weights + compute;
         if (needs_target != nullptr) {
             *needs_target = true;
