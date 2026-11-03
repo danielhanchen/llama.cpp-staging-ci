@@ -2719,9 +2719,42 @@ static void common_draft_mem_reserve(const common_params & params, const llama_m
         }
         devs.resize(bytes.size());
     } catch (const std::exception & e) {
-        COM_WRN("memory measure of the draft for the memory the main context keeps free failed, nothing kept free: %s\n", e.what());
         devs.clear();
         bytes.clear();
+        // a DFlash / DSpark draft cannot be created without its target: its estimate (common_fit_dflash_estimate, the weights from its
+        // GGUF) is kept free on the first GPU it would use. Without it the main context of Qwen3.8-Flash-Next + DFlash2 at 32 / 16 GB
+        // (G4) placed its staging arena in the draft's memory, and its pp graph then failed to allocate once the draft was loaded
+        size_t compute = 0;
+        const size_t kv = has_draft && mparams_dft.n_gpu_layers != 0 ? common_fit_dflash_estimate(params_dft.model.path, cparams_dft, compute) : 0;
+        ggml_backend_dev_t dev = nullptr;
+        if (kv > 0) {
+            if (!params_dft.devices.empty()) {
+                dev = params_dft.devices[0]; // nullptr: the draft is not offloaded
+            } else {
+                for (size_t i = 0; i < ggml_backend_dev_count() && dev == nullptr; ++i) {
+                    ggml_backend_dev_t d = ggml_backend_dev_get(i);
+                    if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        dev = d;
+                    }
+                }
+            }
+        }
+        size_t weights = 0;
+        if (dev != nullptr) {
+            gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+            gguf_context_ptr gctx(gguf_init_from_file(params_dft.model.path.c_str(), gp));
+            for (int64_t i = 0; gctx && i < gguf_get_n_tensors(gctx.get()); i++) {
+                weights += gguf_get_tensor_size(gctx.get(), i);
+            }
+        }
+        if (dev != nullptr && weights > 0) {
+            devs.push_back(dev);
+            bytes.push_back(weights + kv + compute);
+            COM_INF("DFlash draft: %.2f MiB kept free on %s for it (estimate: weights %.2f, K/V %.2f, compute %.2f MiB)\n",
+                bytes.back()/1048576.0, ggml_backend_dev_name(dev), weights/1048576.0, kv/1048576.0, compute/1048576.0);
+        } else {
+            COM_WRN("memory measure of the draft for the memory the main context keeps free failed, nothing kept free: %s\n", e.what());
+        }
     }
 }
 
