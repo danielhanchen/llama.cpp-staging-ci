@@ -62,6 +62,9 @@ struct server_prompt_ssd {
 
     static constexpr int BLOCK_TOKENS = 256;
 
+    // the entry format the reader accepts (written in every header and in the namespace)
+    static constexpr uint32_t FORMAT_VERSION = 2;
+
 private:
     server_prompt_ssd_params params;
 

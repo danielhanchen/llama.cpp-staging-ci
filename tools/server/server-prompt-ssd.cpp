@@ -23,7 +23,7 @@ static constexpr uint32_t SSD_MAGIC     = 0x4353504c; // "LPSC"
 static constexpr uint32_t SSD_MAGIC_END = 0x444e4550; // "PEND"
 // 2 (k19-fixF): the namespace of 1 did not include --override-kv, so a cache written with overrides by a version-1 build sits in the
 // default namespace; the bump retires every version-1 entry (one miss on upgrade)
-static constexpr uint32_t SSD_VERSION   = 2;
+static constexpr uint32_t SSD_VERSION   = server_prompt_ssd::FORMAT_VERSION;
 
 // a fast non-cryptographic 64-bit hash: four lanes of 8-byte words, enough to detect truncation and bit rot
 struct ssd_hasher {

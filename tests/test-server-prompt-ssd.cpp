@@ -72,8 +72,9 @@ int main() {
         check(name, ssd.count() == 1 && found && exists && read);
     }
 
-    // a corrupt entry with a token count that overflows the size check
-    {
+    // a corrupt entry with a token count that overflows the size check, in the reader's format (so the header gets to the count) and in
+    // the retired format 1 (rejected at the version)
+    for (const uint32_t version : { server_prompt_ssd::FORMAT_VERSION, 1u }) {
         std::string ns_dir;
         {
             server_prompt_ssd ssd(params, "corrupt namespace", false);
@@ -81,9 +82,8 @@ int main() {
         }
         const fs::path bad = fs::u8path(ns_dir) / "0000000000000000.lpc";
         {
-            // magic "LPSC", version 1, the namespace hash (the directory name), n_tokens = 2^62 + 16, then 128 bytes
+            // magic "LPSC", the version, the namespace hash (the directory name), n_tokens = 2^62 + 16, then 128 bytes
             const uint32_t magic    = 0x4353504c;
-            const uint32_t version  = 1;
             const uint64_t ns       = std::stoull(fs::u8path(ns_dir).filename().string(), nullptr, 16);
             const uint64_t n_tokens = (1ull << 62) + 16;
             std::vector<uint8_t> buf(sizeof(magic) + sizeof(version) + sizeof(ns) + sizeof(n_tokens) + 128, 0);
@@ -113,7 +113,9 @@ int main() {
             fprintf(stderr, "scan threw: %s\n", err.what());
             threw = true;
         }
-        check("corrupt entry: startup continues, entry skipped and deleted", !threw && n == 0 && !fs::exists(bad, ec));
+        char name[96];
+        snprintf(name, sizeof(name), "corrupt entry (format %u): startup continues, entry skipped and deleted", (unsigned) version);
+        check(name, !threw && n == 0 && !fs::exists(bad, ec));
     }
 
     fs::remove_all(root, ec);
