@@ -43,6 +43,22 @@
 #include <intrin.h>
 #endif
 
+#if defined(__linux__)
+#include <sched.h>
+#endif
+
+// k19-l4b: the logical CPUs this process may run on (the affinity mask on Linux, else the hardware threads)
+static int llama_moe_n_cpus() {
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0 && CPU_COUNT(&set) > 0) {
+        return CPU_COUNT(&set);
+    }
+#endif
+    return (int) std::max(1u, std::thread::hardware_concurrency());
+}
+
 // acquire load / release store / spin pause on the host mailbox words, which the device reads and writes through mapped pinned memory:
 // the GCC / Clang builtins, on MSVC (no __atomic_* / __builtin_ia32_pause) the interlocked intrinsics (full barriers) and _mm_pause
 static inline uint32_t llama_mb_load_acq(const uint32_t * p) {
@@ -2123,6 +2139,7 @@ struct llama_moe_cache::impl {
         std::atomic<bool>    stop{false};
         ggml_backend_ptr     cpu;
         int                  threads = 1;
+        void               (*team_stop)(void) = nullptr; // k19-l4b: joins the CPU backend's host team (the last owner's stop)
         // k18 (LLAMA_MOE_SINGLE_FUSED, default on; =0 the graph of each batch as before): the CPU backend's one-region form of the batch's
         // host experts (ggml_cpu_moe_host_ffn: one barrier instead of the graph's seven, no plan; bit-identical to the graph), with
         // its scratch; null when the CPU backend has none (the graph then)
@@ -2208,6 +2225,21 @@ struct llama_moe_cache::impl {
             // so a team as large as the decode threads puts two threads on one core
             const char * e = getenv("LLAMA_MOE_SINGLE_THREADS");
             h.threads = e != nullptr && atoi(e) > 0 ? atoi(e) : std::max(1, single_threads - 1);
+            // k19-l4b LLAMA_MOE_SINGLE_THREADS_WIDE (default 1, 0 = the decode threads - 1 as above): where the CPU backend runs the
+            // batch on its own team (ggml_cpu_moe_host_team_on, GGML_MOE_HOST_TEAM), the team also takes the second hardware thread of
+            // the decode cores: 2 x the decode threads - 1 (the caller of the graph keeps one), at most the logical CPUs of the process
+            // - 1 and LLAMA_MOE_SINGLE_THREADS_MAX (16), never fewer than before. Colab L4 (6 decode threads, 12 vCPUs): 5 -> 11, as
+            // PolyStrata's 12 CPU threads. The team size does not change a result (each row is computed once with the same kernel) and
+            // the hybrid fetch share is set from the decode threads, so the text is the same.
+            h.team_stop = (void (*)(void)) ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_host_team_stop");
+            auto team_on = (bool (*)(void)) ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_host_team_on");
+            const char * ew = getenv("LLAMA_MOE_SINGLE_THREADS_WIDE");
+            if ((e == nullptr || atoi(e) <= 0) && (ew == nullptr || atoi(ew) != 0) && team_on != nullptr && team_on()) {
+                const char * em = getenv("LLAMA_MOE_SINGLE_THREADS_MAX");
+                const int wmax = em != nullptr && atoi(em) > 0 ? atoi(em) : 16;
+                const int wide = std::min({ 2*single_threads - 1, llama_moe_n_cpus() - 1, wmax });
+                h.threads = std::max(h.threads, wide);
+            }
             if (set_n != nullptr) {
                 set_n(h.cpu.get(), h.threads);
             }
@@ -2514,6 +2546,9 @@ struct llama_moe_cache::impl {
                 h.stop.store(true, std::memory_order_release);
                 h.cv.notify_one();
                 h.thr.join();
+                if (h.team_stop != nullptr) {
+                    h.team_stop();
+                }
                 h.cpu.reset();
             }
             single_reg = false;
