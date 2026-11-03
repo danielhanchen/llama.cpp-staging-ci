@@ -1338,7 +1338,7 @@ static __global__ void mul_mat_vec_q_moe_group(
     const uint32_t slot   = blockIdx.y;
     const uint32_t token  = blockIdx.z;
     const uint32_t nslots = gridDim.y;
-    const int      n_ent  = nslots*ncols_dst;   // <= 64 (host)
+    const int      n_ent  = nslots*ncols_dst;   // <= 128 (host)
     const int      my_e   = token*nslots + slot;
 
     if (uint32_t(row0) >= nrows_x) {
@@ -1355,8 +1355,8 @@ static __global__ void mul_mat_vec_q_moe_group(
         return;
     }
 
-    // the entries of this expert, token-major; an earlier one owns them
-    uint64_t members = 0;
+    // the entries of this expert, token-major, as a 128-bit set (two words); an earlier one owns them
+    uint64_t members[2] = { 0, 0 };
     for (int e0 = 0; e0 < n_ent; e0 += warp_size) {
         const int e = e0 + lane;
         bool hit = false;
@@ -1364,9 +1364,11 @@ static __global__ void mul_mat_vec_q_moe_group(
             const uint32_t t = e / nslots;
             hit = ids[(e - t*nslots) + t*ids_stride] == expert;
         }
-        members |= uint64_t(__ballot_sync(0xFFFFFFFF, hit)) << e0;
+        members[e0 >> 6] |= uint64_t(__ballot_sync(0xFFFFFFFF, hit)) << (e0 & 63);
     }
-    if ((members & ((uint64_t(1) << my_e) - 1)) != 0) {
+    const bool owned_earlier = my_e < 64 ? (members[0] & ((uint64_t(1) << my_e) - 1)) != 0
+                                         : members[0] != 0 || (members[1] & ((uint64_t(1) << (my_e - 64)) - 1)) != 0;
+    if (owned_earlier) {
         return;
     }
 
@@ -1374,7 +1376,7 @@ static __global__ void mul_mat_vec_q_moe_group(
     constexpr int blocks_per_iter = vdr * warp_size / qi;
     const int kbx_offset = expert*stride_channel_x + row0*stride_row_x;
 
-    while (members != 0) {
+    while ((members[0] | members[1]) != 0) {
         int n = 0;
         const block_q8_1 * y[c_group];
         uint32_t           dst_off[c_group];
@@ -1382,9 +1384,10 @@ static __global__ void mul_mat_vec_q_moe_group(
         for (int j = 0; j < c_group; ++j) {
             y[j]       = (const block_q8_1 *) vy;
             dst_off[j] = 0;
-            if (members != 0) {
-                const int      e = __ffsll((long long) members) - 1;
-                members &= members - 1;
+            if ((members[0] | members[1]) != 0) {
+                const int      w = members[0] != 0 ? 0 : 1;
+                const int      e = 64*w + __ffsll((long long) members[w]) - 1;
+                members[w] &= members[w] - 1;
                 const uint32_t t = e / nslots;
                 const uint32_t s = e - t*nslots;
                 y[j]       = ((const block_q8_1 *) vy) + fastmodulo(s, nchannels_y)*stride_channel_y + t*stride_col_y;
@@ -1690,7 +1693,7 @@ static void mul_mat_vec_q_moe_group_launch_cfg(
     }
 }
 
-// false: not taken (switch off, a shared expert, HIP / MUSA, more than 64 entries, rows not a multiple of the shape's rows per warp)
+// false: not taken (switch off, a shared expert, HIP / MUSA, more than 128 entries, rows not a multiple of the shape's rows per warp)
 template <ggml_type type>
 static bool mul_mat_vec_q_moe_group_launch(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1716,7 +1719,7 @@ static bool mul_mat_vec_q_moe_group_launch(
         const mmvq_moe_group_cfg & cfg = mmvq_moe_group_config();
         const bool fused = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
-        if (!(on & (fused ? 1 : 2)) || warp_size != 32 || fusion.shared_up != nullptr || (int64_t) nchannels_dst*ncols_dst > 64 || nrows_x % cfg.rpw != 0) {
+        if (!(on & (fused ? 1 : 2)) || warp_size != 32 || fusion.shared_up != nullptr || (int64_t) nchannels_dst*ncols_dst > 128 || nrows_x % cfg.rpw != 0) {
             return false;
         }
         const int group = cfg.group > 0 ? cfg.group : (int) ncols_dst;
