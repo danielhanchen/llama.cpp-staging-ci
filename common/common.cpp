@@ -2463,6 +2463,21 @@ static size_t common_fit_dflash_estimate(const std::string & path_dft, const lla
     return kv;
 }
 
+bool common_fit_dflash_draft_bytes(const char * path_dft, const llama_context_params & cp_dft, const char * path_tgt, uint32_t n_ubatch_tgt,
+        size_t & weights, size_t & kv, size_t & compute) {
+    weights = kv = compute = 0;
+    kv = common_fit_dflash_estimate(path_dft, cp_dft, compute, path_tgt != nullptr ? path_tgt : "", n_ubatch_tgt);
+    if (kv == 0) {
+        return false;
+    }
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context_ptr gctx(gguf_init_from_file(path_dft, gp));
+    for (int64_t i = 0; gctx && i < gguf_get_n_tensors(gctx.get()); i++) {
+        weights += gguf_get_tensor_size(gctx.get(), i);
+    }
+    return weights > 0;
+}
+
 // --fit with a separate draft model and a MoE cache: true if the draft model should run on the CPU (see common_init_result)
 // the main model is fitted alone with an unbounded cache (on copies of the parameters), which gives the memory left after its layers;
 // the draft model's device memory at that context size must fit in what the requested cache leaves, plus at most max_frac of the cache

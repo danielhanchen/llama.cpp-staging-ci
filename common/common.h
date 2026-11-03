@@ -1042,6 +1042,11 @@ bool common_is_tty(FILE * file);
 // n_ubatch of the draft context of speculative decoding for a target context at n_ubatch u (see common.cpp)
 uint32_t common_draft_n_ubatch(const common_params & params, uint32_t u);
 
+// k19-df3: the device memory of a DFlash / DSpark draft, which cannot be created (and so measured) without its target: weights (its GGUF's
+// tensors), K/V and compute buffer (see common_fit_dflash_estimate in common.cpp); false for other drafts
+bool common_fit_dflash_draft_bytes(const char * path_dft, const llama_context_params & cp_dft, const char * path_tgt, uint32_t n_ubatch_tgt,
+        size_t & weights, size_t & kv, size_t & compute);
+
 // --moe-cache-mib auto (or -1): with fit set the MoE cache request becomes unbounded (COMMON_MOE_CACHE_AUTO_BYTES), so that --fit gives the
 // cache the device memory left after the layers, as for a large explicit size; without the fit there is no cache. Clears moe_cache_auto.
 // Returns true if the request was resolved to the unbounded size.

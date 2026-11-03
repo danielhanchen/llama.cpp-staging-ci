@@ -428,6 +428,7 @@ static void common_params_fit_impl(
                 __func__, cparams->n_ctx, follow ? ", in the placement of the main model" : "");
 
             dmds_t measured;
+            bool estimated = false; // a DFlash draft priced from its GGUF (below)
             const int nextn_main = g_fit_nextn;
             g_fit_nextn = 0; // the extra model is not the target
             try {
@@ -436,28 +437,50 @@ static void common_params_fit_impl(
                 g_fit_nextn = nextn_main;
             } catch (const std::runtime_error & e) {
                 g_fit_nextn = nextn_main;
-                // the extra model is optional, fit the main model alone rather than giving up
-                LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
                 dmds_extra = dmds_t(devs.size() + 1);
                 key_extra = key;
-                return;
-            }
-
-            dmds_extra = dmds_t(devs.size() + 1);
-            dmds_extra.back().mb = measured.back().mb;
-            for (size_t je = 0; je < devs_extra.size(); je++) {
-                for (size_t id = 0; id < devs.size(); id++) {
-                    if (devs_extra[je] == devs[id]) {
-                        dmds_extra[id].mb.model   += measured[je].mb.model;
-                        dmds_extra[id].mb.context += measured[je].mb.context;
-                        dmds_extra[id].mb.compute += measured[je].mb.compute;
-                        break;
+                // a DFlash / DSpark draft needs its target to be created: its estimate (weights, K/V, compute and the target's growth for
+                // the layer inputs it extracts) goes to the first GPU of the main model. Fitted without it, the MoE cache of
+                // Qwen3.8-Flash-Next at 32 GB kept its size and the main context's pp graph failed to allocate once the draft was loaded
+                size_t w = 0, kv = 0, comp = 0;
+                if (!extra->shares_model && mp_x.n_gpu_layers != 0 &&
+                        common_fit_dflash_draft_bytes(extra->path_model, cp_x, path_model, cparams->n_ubatch, w, kv, comp)) {
+                    for (size_t id = 0; id < devs.size(); id++) {
+                        if (ggml_backend_dev_type(devs[id]) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                            dmds_extra[id].mb.model   += w;
+                            dmds_extra[id].mb.context += kv;
+                            dmds_extra[id].mb.compute += comp;
+                            LOG_INF("%s: the extra model (a DFlash draft) is priced from its GGUF on %s: weights %.2f, K/V %.2f, compute %.2f MiB\n",
+                                __func__, ggml_backend_dev_name(devs[id]), w/1048576.0, kv/1048576.0, comp/1048576.0);
+                            estimated = true;
+                            break;
+                        }
                     }
                 }
+                if (!estimated) {
+                    // the extra model is optional, fit the main model alone rather than giving up
+                    LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
+                    return;
+                }
             }
-            if (extra->shares_model) {
-                for (llama_device_memory_data & dmd : dmds_extra) {
-                    dmd.mb.model = 0;
+
+            if (!estimated) {
+                dmds_extra = dmds_t(devs.size() + 1);
+                dmds_extra.back().mb = measured.back().mb;
+                for (size_t je = 0; je < devs_extra.size(); je++) {
+                    for (size_t id = 0; id < devs.size(); id++) {
+                        if (devs_extra[je] == devs[id]) {
+                            dmds_extra[id].mb.model   += measured[je].mb.model;
+                            dmds_extra[id].mb.context += measured[je].mb.context;
+                            dmds_extra[id].mb.compute += measured[je].mb.compute;
+                            break;
+                        }
+                    }
+                }
+                if (extra->shares_model) {
+                    for (llama_device_memory_data & dmd : dmds_extra) {
+                        dmd.mb.model = 0;
+                    }
                 }
             }
 
