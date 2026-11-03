@@ -2380,8 +2380,12 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
 }
 
 // the device memory of a DFlash / DSpark draft that cannot be created without its target: returns its K/V cache bytes and sets compute to
-// the larger of its feature graph and its noise-block graph (see llama_context::sched_reserve); 0 and compute unchanged for other drafts
-static size_t common_fit_dflash_estimate(const std::string & path_dft, const llama_context_params & cp, size_t & compute) {
+// the larger of its feature graph and its noise-block graph (see llama_context::sched_reserve), plus the growth of the target's compute
+// buffer once the draft asks it for the inputs of its n_extract layers (path_tgt, n_ubatch_tgt): each is an output of the target's graph,
+// n_embd floats per token, held twice (qwen4exp builds a stream mean; G4 Flash-Next at -ub 2048: 989.5 -> 1189.5 MiB, 2 x 100 MiB);
+// 0 and compute unchanged for other drafts
+static size_t common_fit_dflash_estimate(const std::string & path_dft, const llama_context_params & cp, size_t & compute,
+        const std::string & path_tgt = std::string(), uint32_t n_ubatch_tgt = 0) {
     ggml_context * meta = nullptr;
     gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &meta };
     gguf_context_ptr ctx(gguf_init_from_file(path_dft.c_str(), gp));
@@ -2438,6 +2442,24 @@ static size_t common_fit_dflash_estimate(const std::string & path_dft, const lla
     const double feat = (double) n_ub*(double) (n_embd_enc + 2*n_embd + 2*n_head_kv*d_k)*sizeof(float);
     const double tok  = (double) n_seq*(double) n_block*((double) n_vocab*2.0 + 8.0*(double) n_embd)*sizeof(float);
     compute = (size_t) (std::max(feat, tok) + 32.0*1024*1024);
+    // the target's layer inputs
+    const int64_t tl_id = gguf_find_key(ctx.get(), "dflash.target_layers");
+    const int64_t n_extract = tl_id >= 0 && gguf_get_kv_type(ctx.get(), tl_id) == GGUF_TYPE_ARRAY ? (int64_t) gguf_get_arr_n(ctx.get(), tl_id) : 0;
+    if (n_extract > 0 && n_ubatch_tgt > 0 && !path_tgt.empty()) {
+        gguf_init_params gpt = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+        gguf_context_ptr ctx_t(gguf_init_from_file(path_tgt.c_str(), gpt));
+        int64_t n_embd_tgt = 0;
+        if (ctx_t) {
+            const int64_t aid = gguf_find_key(ctx_t.get(), "general.architecture");
+            if (aid >= 0 && gguf_get_kv_type(ctx_t.get(), aid) == GGUF_TYPE_STRING) {
+                const int64_t eid = gguf_find_key(ctx_t.get(), (std::string(gguf_get_val_str(ctx_t.get(), aid)) + ".embedding_length").c_str());
+                if (eid >= 0 && gguf_get_kv_type(ctx_t.get(), eid) == GGUF_TYPE_UINT32) {
+                    n_embd_tgt = gguf_get_val_u32(ctx_t.get(), eid);
+                }
+            }
+        }
+        compute += (size_t) (2.0*(double) n_extract*(double) n_embd_tgt*(double) std::min<uint32_t>(n_ubatch_tgt, cp.n_ctx)*sizeof(float));
+    }
     return kv;
 }
 
@@ -2530,7 +2552,7 @@ static bool common_fit_draft_on_cpu(
         // target layers, its output and the K/V of a layer) and the noise block of block_size rows per sequence on the target's lm head
         // (logits and the selector's copy). The 128 MiB default held neither the 2000 MiB compute buffer of the token graph at n_ubatch
         // 2048 (G4 32 GB, Qwen3.8-Flash-Next + DFlash2: cudaMalloc failed, drafting off) nor a full-context K/V cache
-        const size_t kv_dflash = env_c == nullptr ? common_fit_dflash_estimate(path_dft, cparams_dft, compute) : 0;
+        const size_t kv_dflash = env_c == nullptr ? common_fit_dflash_estimate(path_dft, cparams_dft, compute, params.model.path, cparams.n_ubatch) : 0;
         if (kv_dflash > 0 || compute == 0) {
             LOG_INF("%s: DFlash draft estimate: K/V %.2f MiB, compute %.2f MiB\n", __func__, kv_dflash/MiB, compute/MiB);
         }
@@ -2725,7 +2747,7 @@ static void common_draft_mem_reserve(const common_params & params, const llama_m
         // GGUF) is kept free on the first GPU it would use. Without it the main context of Qwen3.8-Flash-Next + DFlash2 at 32 / 16 GB
         // (G4) placed its staging arena in the draft's memory, and its pp graph then failed to allocate once the draft was loaded
         size_t compute = 0;
-        const size_t kv = has_draft && mparams_dft.n_gpu_layers != 0 ? common_fit_dflash_estimate(params_dft.model.path, cparams_dft, compute) : 0;
+        const size_t kv = has_draft && mparams_dft.n_gpu_layers != 0 ? common_fit_dflash_estimate(params_dft.model.path, cparams_dft, compute, params.model.path, cparams.n_ubatch) : 0;
         ggml_backend_dev_t dev = nullptr;
         if (kv > 0) {
             if (!params_dft.devices.empty()) {
