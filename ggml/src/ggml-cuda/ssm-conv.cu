@@ -8,7 +8,7 @@
 // k15-fn: conv-state copies the short-token kernel also writes (see ggml_cuda_try_conv_state_defer): copy c writes, for every channel
 // and sequence, the cols floats of the channel's input row starting at column s_idx[c] to dst[c] + seq * seq_stride[c] + ch * ch_stride[c]
 struct ssm_conv_state_copies {
-    static constexpr int max_copies = 4;
+    static constexpr int max_copies = ssm_conv_state_max_copies;
     float * dst[max_copies];
     int64_t ch_stride[max_copies];
     int64_t seq_stride[max_copies];

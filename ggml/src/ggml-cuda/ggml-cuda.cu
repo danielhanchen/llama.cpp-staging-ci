@@ -5870,7 +5870,7 @@ static bool ggml_cuda_try_conv_state_defer(ggml_backend_cuda_context * cuda_ctx,
                 }
             }
             auto & v = cuda_ctx->conv_state_pending[n];
-            if (v.size() >= 4) {
+            if (v.size() >= (size_t) ssm_conv_state_max_copies) {
                 return ggml_cuda_conv_cat_refuse(cpy->name, 100 + 6);
             }
             v.push_back(cpy);
