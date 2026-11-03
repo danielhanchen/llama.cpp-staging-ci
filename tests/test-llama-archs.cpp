@@ -1140,7 +1140,14 @@ static int check_rs_decode_parity(const std::string & arch_filter, const size_t 
             const float * row = llama_get_logits_ith(dec.second.get(), -1);
             const std::vector<float> a(logits_ref.begin() + (size_t) i*n_vocab, logits_ref.begin() + (size_t) (i + 1)*n_vocab);
             const std::vector<float> b(row, row + n_vocab);
-            nmse_max = std::max(nmse_max, nmse(a, b));
+            // a NaN / inf row fails (std::max drops a NaN operand)
+            const double row_nmse = nmse(a, b);
+            if (!std::isfinite(row_nmse)) {
+                nmse_max = INFINITY;
+                ok = false;
+                break;
+            }
+            nmse_max = std::max(nmse_max, row_nmse);
         }
         ok = ok && nmse_max <= 1e-6;
         printf("|%15s|%30s|%6s|%15.3e|%9s|\n", llm_arch_name(arch), "CPU decode vs prompt", "-", nmse_max,

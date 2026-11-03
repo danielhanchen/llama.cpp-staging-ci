@@ -773,6 +773,9 @@ struct case_k19_fuzz : ctx_test {
                             const float * l_s = llama_get_logits_ith(ctx_s.get(), t);
                             CTX_REQUIRE(l_m != nullptr && l_s != nullptr, "missing logits");
                             for (int v = 0; v < n_vocab; ++v) {
+                                // std::max drops a NaN operand
+                                CTX_REQUIRE(std::isfinite(l_m[v]) && std::isfinite(l_s[v]), "seed " + std::to_string(seed) + " step " +
+                                        std::to_string(step) + ": a non-finite logit of seq " + std::to_string(sp[0]));
                                 l_max  = std::max(l_max,  std::fabs(l_m[v] - l_s[v]));
                                 la_max = std::max(la_max, std::fabs(l_s[v]));
                             }
@@ -921,6 +924,9 @@ struct case_swa_prepare : ctx_test {
                     CTX_REQUIRE(l_m != nullptr && l_s != nullptr, "missing logits");
                     float d = 0.0f;
                     for (int v = 0; v < n_vocab; ++v) {
+                        // std::max drops a NaN operand
+                        CTX_REQUIRE(std::isfinite(l_m[v]) && std::isfinite(l_s[v]), std::string(st) + ": a non-finite logit of seq " +
+                                std::to_string(sp[0]) + " at pos " + std::to_string(sp[1] + t));
                         d      = std::max(d,      std::fabs(l_m[v] - l_s[v]));
                         la_max = std::max(la_max, std::fabs(l_s[v]));
                     }
