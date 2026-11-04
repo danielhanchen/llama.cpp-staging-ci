@@ -538,6 +538,7 @@ int main(int argc, char ** argv) {
     const std::string self = argv[0];
     std::vector<mode> modes = {
         { "neg_moe_one", self, { off }, { off, "GGML_CUDA_MMVQ_MOE_ONE=1" }, true, 0 },
+        { "default",     self, { off }, {} },   // the shipped defaults (G4: 4 rows per warp for the small-K downs, the staged IQ3_S gate / up at 6..8 tokens; Turing: the staged kernel)
         { "bw1",         self, { off }, { "GGML_CUDA_MOE_BW=1" } },
         { "bw1_r8_w8",   self, { off }, { "GGML_CUDA_MOE_BW=1 GGML_CUDA_MOE_BW_CFG=8,8" } },
         { "bw1_r2_w1",   self, { off }, { "GGML_CUDA_MOE_BW=1 GGML_CUDA_MOE_BW_CFG=2,1" } },

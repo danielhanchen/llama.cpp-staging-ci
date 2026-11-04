@@ -1979,15 +1979,29 @@ static void mul_mat_vec_q_moe_launch(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
 
-    // k19-moebw, GGML_CUDA_MOE_RPB (default 2): the rows a warp takes, 4 or 8 = fewer and longer blocks (a row's sum is its own:
-    // the same lanes, K order and reduction); rows a multiple of it, no shared expert
+    // k19-moebw, GGML_CUDA_MOE_RPB (unset = auto, 2 = off, 4 / 8 = always): the rows a warp takes; 4 = fewer and longer blocks (a row's
+    // sum is its own: the same lanes, K order and reduction). Auto: 4 for a product without a fused gate whose K is 1..2 iterations of a
+    // lane at 2..4 tokens (the blocks of 2..4 warps of the down projections are too short there: G4 Flash-Next IQ4_NL down 0.71 / 0.86 /
+    // 0.94x the time at 2 / 3 / 4 tokens, Qwen3.6 Q5_K down 0.74 / 0.87 / 0.96x, Q6_K 0.85 / 0.94 / 1.00x; Q8_0 / Q5_K with 3 iterations
+    // and every fused gate / up: no gain or slower), else 2. Rows a multiple of 4, no shared expert
     static const int rpb_env = [] {
         const char * e = getenv("GGML_CUDA_MOE_RPB");
-        return e == nullptr ? 2 : atoi(e);
+        return e == nullptr ? 0 : atoi(e);
     }();
+    int rpb_moe = rpb_env;
     if constexpr (mmvq_moe_unroll_type(type)) {
-        if ((rpb_env == 4 || rpb_env == 8) && nrows_x % rpb_env == 0 && fusion.shared_up == nullptr) {
-            const dim3 block_nums_r(nrows_x / rpb_env, nchannels_dst);
+        if (rpb_moe == 0) {
+            constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+            constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+            constexpr int vdr = get_vdr_mmvq(type);
+            const int bpi   = vdr * warp_size / qi;
+            const int iters = (ncols_x / qk + bpi - 1) / bpi;
+            rpb_moe = !has_fusion && iters <= 2 && ncols_dst >= 2 && ncols_dst <= 4 ? 4 : 2;
+        }
+    }
+    if constexpr (mmvq_moe_unroll_type(type)) {
+        if ((rpb_moe == 4 || rpb_moe == 8) && nrows_x % rpb_moe == 0 && fusion.shared_up == nullptr) {
+            const dim3 block_nums_r(nrows_x / rpb_moe, nchannels_dst);
             const ggml_cuda_kernel_launch_params launch_params_r = ggml_cuda_kernel_launch_params(block_nums_r, block_dims, 0, stream);
 #define MMVQ_MOE_LAUNCH_R(RPB, FUS) \
             ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, RPB, FUS, 1>, launch_params_r, \
@@ -1995,13 +2009,13 @@ static void mul_mat_vec_q_moe_launch(
                 stride_row_x, stride_col_y, stride_col_dst, \
                 stride_channel_x, stride_channel_y, stride_channel_dst, \
                 ncols_dst, ids_stride)
-            if (rpb_env == 4) {
+            if (rpb_moe == 4) {
                 if (has_fusion) { MMVQ_MOE_LAUNCH_R(4, true); } else { MMVQ_MOE_LAUNCH_R(4, false); }
             } else {
                 if (has_fusion) { MMVQ_MOE_LAUNCH_R(8, true); } else { MMVQ_MOE_LAUNCH_R(8, false); }
             }
 #undef MMVQ_MOE_LAUNCH_R
-            mmvq_moe_unroll_log("mul_mat_vec_q_moe rpb", type, has_fusion, rpb_env, ncols_dst);
+            mmvq_moe_unroll_log("mul_mat_vec_q_moe rpb", type, has_fusion, rpb_moe, ncols_dst);
             return;
         }
     }
@@ -2182,16 +2196,30 @@ static bool mul_mat_vec_q_moe_group_launch(
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
-// k19-moebw, GGML_CUDA_MOE_BW (default: on for Turing, off on Ampere and newer; 0 = off, 1 = on wherever it can run): multi-token
-// MUL_MAT_IDs (2..8 tokens) of IQ3_S / IQ4_NL / IQ4_XS / Q4_K / Q5_K / Q6_K / Q8_0 experts run mul_mat_vec_q_moe_bw, bitwise the same
-// values; NVIDIA Turing and newer (not GB10), no shared expert in the launch, at most 128 (token, slot) entries.
+// on Turing by default for every type (kb4t4 decides; 0 = the Ampere+ rule there too)
+#ifndef MMVQ_MOE_BW_TURING_ALL
+#define MMVQ_MOE_BW_TURING_ALL 1
+#endif
+
+// k19-moebw, GGML_CUDA_MOE_BW (unset = auto, 0 = off, 1 = on wherever it can run): multi-token MUL_MAT_IDs (2..8 tokens) of IQ3_S /
+// IQ4_NL / IQ4_XS / Q4_K / Q5_K / Q6_K / Q8_0 experts run mul_mat_vec_q_moe_bw, bitwise the same values; NVIDIA Turing and newer (not
+// GB10), no shared expert in the launch, at most 128 (token, slot) entries. Auto (TURING_ALL: every such product on Turing): the IQ3_S
+// gate / up with a fused gate at 6..8 tokens, where the grouped kernel's per-pass decode costs more than the copy (G4 Flash-Next:
+// 0.976 / 0.950 / 0.933x the time of mul_mat_vec_q_moe_group at 6 / 7 / 8 tokens, slower below 5 and for every other type there).
 // GGML_CUDA_MOE_BW_CFG=rpw,nwarps,bytes picks the shape (0 = auto: rows per warp up to `bytes` (4096) of weights, 4 warps)
-static bool mmvq_moe_bw_on(const int cc) {
+static bool mmvq_moe_bw_on(const int cc, const ggml_type type, const bool fused, const int ntok) {
     static const int env = [] {
         const char * e = getenv("GGML_CUDA_MOE_BW");
         return e == nullptr ? -1 : atoi(e);
     }();
-    return env < 0 ? cc < GGML_CUDA_CC_AMPERE : env != 0;
+    if (env >= 0) {
+        return env != 0;
+    }
+    constexpr bool turing_all = MMVQ_MOE_BW_TURING_ALL;
+    if (cc < GGML_CUDA_CC_AMPERE && turing_all) {
+        return true;
+    }
+    return type == GGML_TYPE_IQ3_S && fused && ntok >= 6;
 }
 
 static constexpr bool mmvq_moe_bw_type(const ggml_type type) {
@@ -2232,7 +2260,7 @@ static bool mul_mat_vec_q_moe_bw_launch(
     } else {
         constexpr int qk = ggml_cuda_type_traits<type>::qk;
         constexpr int bs = ggml_cuda_type_traits<type>::bs;
-        if (ntok < 2 || !mmvq_moe_bw_on(cc) || warp_size != 32 || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_TURING ||
+        if (ntok < 2 || !mmvq_moe_bw_on(cc, type, fusion.gate != nullptr, ntok) || warp_size != 32 || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_TURING ||
                 get_device_table_id(cc) == MMVQ_PARAMETERS_GB10 ||
                 fusion.shared_up != nullptr || fusion.x_scale != nullptr || fusion.gate_scale != nullptr ||
                 (int64_t) stride_row_x*qk != (int64_t) ncols_x || (int64_t) nchannels_dst*ntok > 128) {
