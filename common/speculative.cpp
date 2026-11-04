@@ -1428,6 +1428,52 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }();
                 const float p_cum_thr = is_dflash2 ? p_cum_min : 0.0f;
                 float p_cum = 1.0f;
+                // k19-handoff: LLAMA_DFLASH_P_CUM_EXP=a (default 1): the product above is of p^a, a temperature for a selector whose
+                // probabilities are not calibrated (a < 1 trusts a low p less)
+                static const float p_cum_exp = [] {
+                    const char * e = getenv("LLAMA_DFLASH_P_CUM_EXP");
+                    return e != nullptr && atof(e) > 0.0 ? (float) atof(e) : 1.0f;
+                }();
+                // k19-handoff: LLAMA_DFLASH_EV="f_0,..,f_(B-1)/c_1,..,c_(n_max+1)" (default off): the window that maximises the expected
+                // tokens per ms, from a calibration table f (the chance that step i is accepted given the steps before it were, by the
+                // step's selector probability in B equal bins of [0, 1]) and the cost c_w of a pass that verifies w rows
+                static const std::pair<std::vector<float>, std::vector<float>> ev_rule = [] {
+                    std::pair<std::vector<float>, std::vector<float>> r;
+                    const char * e = getenv("LLAMA_DFLASH_EV");
+                    if (e == nullptr) {
+                        return r;
+                    }
+                    const std::string v(e);
+                    const size_t sl = v.find('/');
+                    if (sl == std::string::npos) {
+                        return r;
+                    }
+                    auto parse = [](const std::string & t) {
+                        std::vector<float> out;
+                        size_t a = 0;
+                        while (a < t.size()) {
+                            size_t b = t.find(',', a);
+                            if (b == std::string::npos) {
+                                b = t.size();
+                            }
+                            out.push_back((float) atof(t.substr(a, b - a).c_str()));
+                            a = b + 1;
+                        }
+                        return out;
+                    };
+                    r.first  = parse(v.substr(0, sl));
+                    r.second = parse(v.substr(sl + 1));
+                    if (r.first.empty() || r.second.size() < 2) {
+                        r.first.clear();
+                        r.second.clear();
+                    } else {
+                        LOG_INF("DFlash2 window: expected tokens per ms, %zu calibration bins, costs for widths 1..%zu (LLAMA_DFLASH_EV)\n",
+                                r.first.size(), r.second.size());
+                    }
+                    return r;
+                }();
+                const bool use_ev = is_dflash2 && !ev_rule.first.empty();
+                std::vector<float> step_p;
 
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
@@ -1449,18 +1495,40 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         dg.p[seq_id].push_back(1.0f / sum);
                         dg.m[seq_id].push_back(scores[predecessor] - second);
                     }
-                    if (params.p_min > 0.0f || p_cum_thr > 0.0f) {
+                    if (params.p_min > 0.0f || p_cum_thr > 0.0f || use_ev) {
                         // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                         float sum = 0.0f;
                         for (int32_t k = 0; k < top_k; ++k) {
                             sum += std::exp(scores[k] - scores[predecessor]);
                         }
-                        p_cum *= 1.0f / sum;
+                        if (use_ev) {
+                            step_p.push_back(1.0f / sum);
+                        }
+                        p_cum *= p_cum_exp == 1.0f ? 1.0f / sum : std::pow(1.0f / sum, p_cum_exp);
                         if (1.0f / sum < params.p_min || p_cum < p_cum_thr) {
                             break;
                         }
                     }
                     result.push_back((llama_token) row[predecessor]);
+                }
+                if (use_ev && !result.empty()) {
+                    const auto & f = ev_rule.first;
+                    const auto & c = ev_rule.second;
+                    const int32_t nb = (int32_t) f.size();
+                    size_t best_k = 0;
+                    double best = 1.0 / c[0];
+                    double e_tok = 1.0;
+                    double reach = 1.0;
+                    for (size_t k = 1; k <= result.size() && k < c.size(); ++k) {
+                        reach *= f[std::min(nb - 1, std::max(0, (int32_t) (step_p[k - 1] * nb)))];
+                        e_tok += reach;
+                        const double v = e_tok / c[k];
+                        if (v > best) {
+                            best   = v;
+                            best_k = k;
+                        }
+                    }
+                    result.resize(best_k);
                 }
 
                 // k19-handoff (diagnostic, LLAMA_DFLASH_CYCLE=1): the draft is cut to 0, 1, .., n_max tokens in turn, so one run
