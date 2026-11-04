@@ -108,6 +108,7 @@ struct llama_context {
     // synchronize() unless nothing was queued since the last one (see sync_pending): the output getters call this, so that
     // reading several outputs of one decode costs one stream synchronization instead of one per getter (LLAMA_SYNC_SKIP=0: always)
     void synchronize_outputs();
+    void synchronize_pending();
 
     const llama_model   & get_model()   const;
     bool moe_cache_active() const { return moe_cache != nullptr; } // k11-decode

@@ -6,6 +6,8 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#include <atomic>
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
 template <int ncols1, bool oob>
@@ -960,8 +962,180 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+thread_local const ggml_cuda_fattn_kv_len_ctx * ggml_cuda_fattn_kv_len_cur = nullptr;
+thread_local ggml_cuda_fattn_probe *            ggml_cuda_fattn_probe_cur  = nullptr;
+
+static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// k19-graph: a node with a KV length (ggml_flash_attn_ext_set_kv_len) is run as one of
+//   PAD:  the padded node as built, where its launch is the live node's (the sparse gather: its lists, split and blocks follow
+//         n_kv_max, not the cells, and the padding cells are -inf, never listed);
+//   DEV:  the live node's launch choices with the length read on the device (the dense stream-k MMA kernel, ggml_cuda_fattn_dev_len):
+//         its CUDA graph is replayed while the length changes;
+//   LIVE: the live node (K / V / mask views of kv_len cells) with the length as a constant, captured again when it changes.
+// Each computes the bits of the node of kv_len cells. The signature (ggml_cuda_flash_attn_ext_kv_len_sig) changes when the mode,
+// the kernel or the fixup of the live launch changes (and with the length in LIVE), so a CUDA graph is replayed only for a launch
+// it holds. GGML_CUDA_FA_KV_LEN=0: every node runs LIVE (the kill switch: the bits are the same, the graphs follow the length)
+enum ggml_cuda_fattn_kvl_mode {
+    GGML_CUDA_FATTN_KVL_NONE = 0,
+    GGML_CUDA_FATTN_KVL_PAD  = 1,
+    GGML_CUDA_FATTN_KVL_DEV  = 2,
+    GGML_CUDA_FATTN_KVL_LIVE = 3,
+};
+
+struct ggml_cuda_fattn_kvl_plan {
+    int     mode = GGML_CUDA_FATTN_KVL_NONE;
+    int64_t sig  = 0;
+};
+
+struct ggml_cuda_fattn_live_node {
+    ggml_tensor K, V, M, dst;
+};
+
+static int64_t ggml_cuda_fattn_kv_len_host(const ggml_tensor * dst) {
+    const ggml_tensor * kvl = dst->src[5];
+    const int64_t n_pad = dst->src[1]->ne[1];
+    const int64_t n     = ggml_get_op_params_i32(kvl, 0);
+    return n > 0 && n < n_pad ? n : n_pad;
+}
+
+static void ggml_cuda_fattn_make_live(const ggml_tensor * dst, const int64_t n_kv, ggml_cuda_fattn_live_node & ln) {
+    ln.K = *dst->src[1];
+    ln.K.ne[1] = n_kv;
+    ln.V = *dst->src[2];
+    ln.V.ne[1] = n_kv;
+    ln.dst = *dst;
+    ln.dst.src[1] = &ln.K;
+    ln.dst.src[2] = &ln.V;
+    ln.dst.src[5] = nullptr;
+    if (dst->src[3]) {
+        ln.M = *dst->src[3];
+        ln.M.ne[0] = n_kv;
+        ln.dst.src[3] = &ln.M;
+    }
+}
+
+// the kernel reads the length through a plain device pointer: only from this device's memory (a length left in host memory by
+// the placement of the graph's inputs runs LIVE, logged once)
+static bool ggml_cuda_fattn_kv_len_on_device(ggml_backend_cuda_context & ctx, const ggml_tensor * kvl) {
+    cudaPointerAttributes pa = {};
+    const bool ok = kvl->data != nullptr && cudaPointerGetAttributes(&pa, kvl->data) == cudaSuccess &&
+        pa.type == cudaMemoryTypeDevice && pa.device == ctx.device;
+    (void) cudaGetLastError();
+    static std::atomic<int> n_logged { 0 };
+    if (!ok && n_logged++ < 4) {
+        GGML_LOG_WARN("%s: the KV length '%s' (buffer %s, memory type %d, device %d) is not in the memory of device %d: the flash "
+            "attention keeps the length as a constant (re-captured when it changes)\n", __func__, kvl->name,
+            kvl->buffer ? ggml_backend_buffer_name(kvl->buffer) : "none", (int) pa.type, pa.device, ctx.device);
+    }
+    return ok;
+}
+
+static ggml_cuda_fattn_probe ggml_cuda_fattn_run_probe(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_fattn_probe pr;
+    ggml_cuda_fattn_probe * prev = ggml_cuda_fattn_probe_cur;
+    ggml_cuda_fattn_probe_cur = &pr;
+    ggml_cuda_flash_attn_ext_dispatch(ctx, dst);
+    ggml_cuda_fattn_probe_cur = prev;
+    return pr;
+}
+
+static ggml_cuda_fattn_kvl_plan ggml_cuda_fattn_kvl_get_plan(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    ggml_cuda_fattn_kvl_plan plan;
+    if (dst->src[5] == nullptr) {
+        return plan;
+    }
+    static const bool enabled = getenv("GGML_CUDA_FA_KV_LEN") == nullptr || atoi(getenv("GGML_CUDA_FA_KV_LEN")) != 0;
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * M = dst->src[3];
+    const int64_t n_kv = ggml_cuda_fattn_kv_len_host(dst);
+    if (!enabled || (dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT)) {
+        plan.mode = GGML_CUDA_FATTN_KVL_LIVE;
+        plan.sig  = (int64_t(GGML_CUDA_FATTN_KVL_LIVE) << 56) ^ n_kv;
+        return plan;
+    }
+
+    // the plan follows the shapes, types, flags and parameters of the node and the live length only
+    uint64_t h = 0x6b76;
+    const auto mix = [&h](uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); };
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        mix(Q->ne[d]); mix(K->ne[d]); mix(V->ne[d]); mix(M ? M->ne[d] : 0);
+        mix(K->nb[d]); mix(V->nb[d]); mix(M ? M->nb[d] : 0);
+    }
+    mix(K->type); mix(V->type); mix(dst->flags); mix(dst->src[4] != nullptr); mix(n_kv); mix(ctx.device);
+    for (int i = 0; i < 5; ++i) {
+        mix((uint32_t) dst->op_params[i]);
+    }
+    mix(V->view_src == K || (V->view_src && V->view_src == K->view_src && V->view_offs == K->view_offs));
+    mix((uint64_t) (uintptr_t) dst->src[5]->data);
+    static thread_local std::unordered_map<uint64_t, ggml_cuda_fattn_kvl_plan> cache;
+    const auto it = cache.find(h);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    ggml_cuda_fattn_live_node ln;
+    ggml_cuda_fattn_make_live(dst, n_kv, ln);
+    const ggml_cuda_fattn_kv_len_ctx kctx = { dst, nullptr, K->ne[1] };
+    const ggml_cuda_fattn_kv_len_ctx * prev = ggml_cuda_fattn_kv_len_cur;
+    ggml_cuda_fattn_kv_len_cur = &kctx;
+    const ggml_cuda_fattn_probe pl = ggml_cuda_fattn_run_probe(ctx, &ln.dst);
+    ggml_cuda_fattn_kv_len_cur = prev;
+
+    const uint64_t kh = (uint64_t) (uintptr_t) pl.kernel;
+    if (pl.done && pl.use_sparse) {
+        ggml_tensor dp = *dst;
+        dp.src[5] = nullptr;
+        const ggml_cuda_fattn_probe pp = ggml_cuda_fattn_run_probe(ctx, &dp);
+        if (pp.done && pp.use_sparse && pp.kernel == pl.kernel && pp.nblocks == pl.nblocks && pp.fixup == pl.fixup) {
+            plan.mode = GGML_CUDA_FATTN_KVL_PAD;
+            plan.sig  = (int64_t(GGML_CUDA_FATTN_KVL_PAD) << 56) ^ (int64_t) ((kh * 0x9e3779b97f4a7c15ULL) >> 8) ^ (int64_t(pl.nblocks) << 24) ^ pl.fixup;
+        }
+    } else if (pl.done && pl.dev_ok && ggml_cuda_fattn_kv_len_on_device(ctx, dst->src[5])) {
+        plan.mode = GGML_CUDA_FATTN_KVL_DEV;
+        static std::atomic<int> n_dev_logged { 0 };
+        if (n_dev_logged++ == 0) {
+            GGML_LOG_INFO("%s: k19-graph: flash attention reads the KV length on the device ('%s', %s), first at %lld of %lld cells "
+                "(GGML_CUDA_FA_KV_LEN=0: off)\n", __func__, dst->src[5]->name, dst->src[5]->buffer ? ggml_backend_buffer_name(dst->src[5]->buffer) : "none",
+                (long long) n_kv, (long long) K->ne[1]);
+        }
+        plan.sig  = (int64_t(GGML_CUDA_FATTN_KVL_DEV) << 56) ^ (int64_t) ((kh * 0x9e3779b97f4a7c15ULL) >> 8) ^ (int64_t(pl.stream_k) << 4) ^ pl.fixup;
+    }
+    if (plan.mode == GGML_CUDA_FATTN_KVL_NONE) {
+        plan.mode = GGML_CUDA_FATTN_KVL_LIVE;
+        plan.sig  = (int64_t(GGML_CUDA_FATTN_KVL_LIVE) << 56) ^ n_kv;
+    }
+    if (cache.size() > 4096) {
+        cache.clear();
+    }
+    cache.emplace(h, plan);
+    return plan;
+}
+
+int64_t ggml_cuda_flash_attn_ext_kv_len_sig(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    return ggml_cuda_fattn_kvl_get_plan(ctx, dst).sig;
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    const ggml_cuda_fattn_kvl_plan plan = ggml_cuda_fattn_kvl_get_plan(ctx, dst);
+    if (plan.mode == GGML_CUDA_FATTN_KVL_DEV || plan.mode == GGML_CUDA_FATTN_KVL_LIVE) {
+        ggml_cuda_fattn_live_node ln;
+        ggml_cuda_fattn_make_live(dst, ggml_cuda_fattn_kv_len_host(dst), ln);
+        const ggml_cuda_fattn_kv_len_ctx kctx = { dst, plan.mode == GGML_CUDA_FATTN_KVL_DEV ? (const int *) dst->src[5]->data : nullptr, dst->src[1]->ne[1] };
+        const ggml_cuda_fattn_kv_len_ctx * prev = ggml_cuda_fattn_kv_len_cur;
+        ggml_cuda_fattn_kv_len_cur = &kctx;
+        ggml_cuda_flash_attn_ext_dispatch(ctx, &ln.dst);
+        ggml_cuda_fattn_kv_len_cur = prev;
+        return;
+    }
+    ggml_cuda_flash_attn_ext_dispatch(ctx, dst);
+}
+
+static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     // k15-fv: batch invariant node over several queries (speculative verify, the queries of one KV length): every query gets what
     // the node of that query alone gets. The vector kernel at one column per block takes all of them in one launch with the KV
@@ -1039,7 +1213,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                     d_i.src[3] = mask ? &m_i : nullptr;
                     d_i.ne[3]  = 1;
                     d_i.data   = (char *) dst->data + i*dst->nb[2] + s*dst->nb[3];
-                    ggml_cuda_flash_attn_ext(ctx, &d_i);
+                    ggml_cuda_flash_attn_ext_dispatch(ctx, &d_i);
                 }
             }
             return;

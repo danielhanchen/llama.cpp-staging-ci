@@ -4684,6 +4684,16 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        // k19-graph: a graph input's copy in this split carries the input's op params, the host side of the input's value for the
+        // backend that plans its launches by it (ggml_flash_attn_ext_kv_len_set_host): the copy's data is uploaded, its params are not
+        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            struct ggml_tensor * input = split->inputs[input_id];
+            if ((input->flags & GGML_TENSOR_FLAG_INPUT) && input->op == GGML_OP_NONE) {
+                struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+                memcpy(input_cpy->op_params, input->op_params, sizeof(input->op_params));
+            }
+        }
+
         if (!moe_disk.empty()) {
             // the pages streamed for the splits that ran are one-shot prompt traffic
             for (; moe_cold < moe_disk.size() && moe_disk[moe_cold].split < split_id; ++moe_cold) {

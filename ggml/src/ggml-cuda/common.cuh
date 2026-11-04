@@ -1312,8 +1312,12 @@ struct ggml_cuda_graph {
         // a source's type: a graph whose sources sit at the same addresses with the same shapes and strides but another type (F16 and
         // BF16 have the same strides) must not replay an exec captured for the other type (the kernels are chosen by it)
         int32_t  node_src_type[GGML_MAX_SRC];
+        // k19-graph: the launch signature of a flash attention node with a KV length (ggml_cuda_flash_attn_ext_kv_len_sig), 0 else
+        int64_t  fa_sig;
     };
     std::vector<node_properties> node_props;
+    // k19-graph: the flash attention nodes with a KV length, whose signatures are checked even when the graph uid is unchanged
+    std::vector<int> fa_kvl_nodes;
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);

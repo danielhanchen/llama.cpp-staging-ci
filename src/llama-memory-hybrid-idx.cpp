@@ -106,10 +106,34 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             bp.n_kv_min_per_token = 2*n_sel;
         }
         bp.div = getenv("LLAMA_KV_BUCKET_DIV") ? (uint32_t) std::max(1, atoi(getenv("LLAMA_KV_BUCKET_DIV"))) : 8;
+        // k19-graph (LLAMA_KV_BUCKET_DEV: unset = where the backend has it, 0 = off, 1 = forced, for CPU tests): the flash attention
+        // reads the live length on the device (ggml_flash_attn_ext_set_kv_len, ggml-cuda: the bits of the unpadded node), so the
+        // bucket moves no sum and every ubatch of up to LLAMA_KV_BUCKET_DEV_MAX_TOKENS (8, a DFlash2 window of 7 drafts) is bucketed,
+        // LLAMA_KV_BUCKET_DEV_DIV (2) per octave, at least LLAMA_KV_BUCKET_DEV_STEP_MIN (2048) cells: a verify width keeps its graph and
+        // CUDA graph from one request to the next and while the context grows, re-captured only where a bucket starts (G4
+        // Flash-Next DFlash2 / MTP: 8-10 re-captures of each width per request, ~4 ms each, plus an eager pass and instantiation for a
+        // rarely used width). Only while flash attention is on (llama_context, set_n_kv_bucket_dev_allowed)
+        const char * e_dev = getenv("LLAMA_KV_BUCKET_DEV");
+        const int dev_mode = e_dev ? atoi(e_dev) : -1;
+        const bool dev_backend = get_mem_attn()->fa_kv_len_supported();
+        bp.dev_len = dev_mode == 1 || (dev_mode < 0 && dev_backend);
+        if (const char * e = getenv("LLAMA_KV_BUCKET_DEV_MAX_TOKENS")) {
+            bp.dev_n_tokens_max = (uint32_t) std::max(1, atoi(e));
+        }
+        if (const char * e = getenv("LLAMA_KV_BUCKET_DEV_DIV")) {
+            bp.dev_div = (uint32_t) std::max(1, atoi(e));
+        }
+        if (const char * e = getenv("LLAMA_KV_BUCKET_DEV_STEP_MIN")) {
+            bp.dev_step_min = (uint32_t) std::max(256, atoi(e));
+        }
         get_mem_attn()->set_n_kv_bucket(bp);
         mem_idx->set_n_kv_bucket(bp);
         LLAMA_LOG_INFO("%s: n_kv buckets for ubatches of up to %u tokens from %u cells (%u per token), %u per octave (LLAMA_KV_BUCKET=%d)\n",
             __func__, bp.n_tokens_max, bp.n_kv_min, bp.n_kv_min_per_token, bp.div, mode);
+        if (bp.dev_len) {
+            LLAMA_LOG_INFO("%s: with flash attention reading the KV length on the device: ubatches of up to %u tokens, %u per octave, "
+                "at least %u cells (LLAMA_KV_BUCKET_DEV=%d)\n", __func__, bp.dev_n_tokens_max, bp.dev_div, bp.dev_step_min, dev_mode);
+        }
     }
 }
 
@@ -117,6 +141,13 @@ void llama_memory_hybrid_idx::set_n_kv_bucket_allowed(bool value) {
     get_mem_attn()->set_n_kv_bucket_allowed(value);
     if (mem_idx) {
         mem_idx->set_n_kv_bucket_allowed(value);
+    }
+}
+
+void llama_memory_hybrid_idx::set_n_kv_bucket_dev_allowed(bool value) {
+    get_mem_attn()->set_n_kv_bucket_dev_allowed(value);
+    if (mem_idx) {
+        mem_idx->set_n_kv_bucket_dev_allowed(value);
     }
 }
 
@@ -823,8 +854,12 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     // k19-vgraph: a bucketed n_kv brings the pools with it (they change with the cells, every 256 of them), so the indexer, its
     // top_k and the pool inputs keep their shapes too; the extra pools are padding (sentinel members, -inf scores)
     // (only once the selection holds its full top_k/kpool pools without them: else n_sel would follow the padding)
+    // (k19-graph: with the device KV length, always: the attention reads the selection over the live cells only, and the padded
+    // pools are dead slots of the selection, so a longer selection marks the same live cells)
+    // (LLAMA_KV_BUCKET_DEV_POOLS=0: only once the selection is full, as for the sparse-exact buckets)
+    static const bool dev_pools = getenv("LLAMA_KV_BUCKET_DEV_POOLS") == nullptr || atoi(getenv("LLAMA_KV_BUCKET_DEV_POOLS")) != 0;
     st.n_pool_g = 0;
-    if (get_idx()->get_n_kv_bucketed() && kpool_pad(st.n_pool_real) >= mem->get_kpool_top()) {
+    if ((dev_pools && get_idx()->get_n_kv_live() > 0) || (get_idx()->get_n_kv_bucketed() && kpool_pad(st.n_pool_real) >= mem->get_kpool_top())) {
         const uint32_t n_kv = get_idx()->get_n_kv();
         st.n_pool_g = std::max(kpool_pad(st.n_pool_real), kpool_pad(n_kv/kpool));
     }

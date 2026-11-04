@@ -284,6 +284,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-moe-cache-device PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # k19-graph: flash attention with its KV length on the device vs the unpadded node, byte for byte (GPU; SKIP without one)
+    llama_build(test-fa-kvlen-exact.cpp)
+
     # the SSD prompt-cache namespace covers the --override-kv metadata overrides (a restart with another override restored stale state)
     llama_build(test-server-prompt-ssd-ns.cpp)
     target_include_directories(test-server-prompt-ssd-ns PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)

@@ -1376,7 +1376,7 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
     return seq_to_stream[seq_id];
 }
 
-uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, bool * bucketed) const {
+uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, bool * bucketed, uint32_t * n_kv_live) const {
     uint32_t result = 0;
     uint32_t n_cells = 0;
 
@@ -1394,17 +1394,29 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, bool * bucketed) cons
     if (bucketed) {
         *bucketed = false;
     }
+    if (n_kv_live) {
+        *n_kv_live = 0;
+    }
 
     // k19-vgraph: see set_n_kv_bucket. The step is a power of two, so the buckets of one octave end where the next one starts and
     // n_kv only grows with the cells
+    // k19-graph: with the device KV length (dev_len) every ubatch of up to n_tokens_max tokens, steps of at least step_min cells
     const uint32_t n_tokens = (uint32_t) sinfo.size();
-    if (n_kv_bucket.n_tokens_max > 0 && n_kv_bucket_allowed && n_tokens <= n_kv_bucket.n_tokens_max &&
-            result >= std::max(n_kv_bucket.n_kv_min, n_tokens*n_kv_bucket.n_kv_min_per_token)) {
+    const bool dev = n_kv_bucket.dev_len && n_kv_bucket_dev_allowed;
+    const uint32_t n_tokens_max = dev ? n_kv_bucket.dev_n_tokens_max : n_kv_bucket.n_tokens_max;
+    if (n_tokens_max > 0 && n_kv_bucket_allowed && n_tokens <= n_tokens_max &&
+            (dev || result >= std::max(n_kv_bucket.n_kv_min, n_tokens*n_kv_bucket.n_kv_min_per_token))) {
+        if (dev && n_kv_live) {
+            *n_kv_live = result;
+        }
         uint32_t step = 1;
         while (step <= result/2) {
             step *= 2;
         }
-        step = std::max<uint32_t>(n_pad_cur, step/std::max<uint32_t>(1, n_kv_bucket.div));
+        step = std::max<uint32_t>(n_pad_cur, step/std::max<uint32_t>(1, dev ? n_kv_bucket.dev_div : n_kv_bucket.div));
+        if (dev) {
+            step = std::max(step, n_kv_bucket.dev_step_min);
+        }
         if (step % n_pad_cur == 0) {
             const uint32_t b = std::min(n_cells, GGML_PAD(result, step));
             if (bucketed) {
@@ -1415,6 +1427,23 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, bool * bucketed) cons
     }
 
     return result;
+}
+
+bool llama_kv_cache::fa_kv_len_supported() const {
+    if (layers.empty()) {
+        return false;
+    }
+    for (const auto & layer : layers) {
+        if (layer.k == nullptr || layer.k->buffer == nullptr) {
+            return false;
+        }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(layer.k->buffer));
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg == nullptr || ggml_backend_reg_get_proc_address(reg, "ggml_backend_fa_kv_len") == nullptr) {
+            return false;
+        }
+    }
+    return true;
 }
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -3304,7 +3333,7 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
-    n_kv = kv->get_n_kv(sinfos[i_cur], &n_kv_bucketed);
+    n_kv = kv->get_n_kv(sinfos[i_cur], &n_kv_bucketed, &n_kv_live);
 
     return true;
 }

@@ -195,7 +195,8 @@ public:
     // graph_build API
     //
 
-    uint32_t get_n_kv(const slot_info & sinfo, bool * bucketed = nullptr) const;
+    // (k19-graph: n_kv_live, if given, gets the 256-padded n_kv before any bucket; 0 when the ubatch takes no device KV length)
+    uint32_t get_n_kv(const slot_info & sinfo, bool * bucketed = nullptr, uint32_t * n_kv_live = nullptr) const;
 
     // k19-vgraph: coarser n_kv for small ubatches (decode, speculative verify), so their graphs keep their shapes, and their CUDA graphs
     // stay captured, while the context grows by up to an eighth instead of 256 cells (see llama_memory_hybrid_idx, the only user).
@@ -206,10 +207,21 @@ public:
         uint32_t n_kv_min           = 0;
         uint32_t n_kv_min_per_token = 0;
         uint32_t div                = 8;
+        // k19-graph: the attention reads the live length on the device (ggml_flash_attn_ext_set_kv_len), so the bucket cannot move
+        // its sums: every ubatch of up to dev_n_tokens_max tokens is bucketed from the first cell, dev_div buckets per octave of at
+        // least dev_step_min cells (where the context allows it, set_n_kv_bucket_dev_allowed; else the fields above)
+        bool     dev_len            = false;
+        uint32_t dev_n_tokens_max   = 8;
+        uint32_t dev_div            = 2;
+        uint32_t dev_step_min       = 2048;
     };
     void set_n_kv_bucket(const n_kv_bucket_params & p) { n_kv_bucket = p; }
     // a context whose verify rows must equal single token decodes (llm_graph_exact_row_n_kv) keeps the 256 cell padding
     void set_n_kv_bucket_allowed(bool value) { n_kv_bucket_allowed = value; }
+    // k19-graph: the device KV length buckets (n_kv_bucket_params::dev_len) only where flash attention runs (the context's choice)
+    void set_n_kv_bucket_dev_allowed(bool value) { n_kv_bucket_dev_allowed = value; }
+    // k19-graph: every attention layer's K / V sits on a device whose flash attention takes the KV length on the device
+    bool fa_kv_len_supported() const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -314,6 +326,7 @@ private:
     // k19-vgraph: see set_n_kv_bucket
     n_kv_bucket_params n_kv_bucket;
     bool n_kv_bucket_allowed = true;
+    bool n_kv_bucket_dev_allowed = false;
 
     // SWA
     const uint32_t n_swa = 0;
@@ -445,6 +458,9 @@ public:
     // k19-vgraph: whether this ubatch's n_kv was padded past 256 cells (llama_kv_cache::set_n_kv_bucket)
     bool get_n_kv_bucketed() const { return n_kv_bucketed; }
 
+    // k19-graph: the cells the attention reads (256-padded, before the bucket) when it takes its length on the device, else 0
+    uint32_t get_n_kv_live() const { return n_kv_live; }
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -523,4 +539,5 @@ private:
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
     bool    n_kv_bucketed = false;
+    uint32_t n_kv_live    = 0;
 };

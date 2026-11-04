@@ -3062,6 +3062,14 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// k19-graph (proc "ggml_backend_fa_kv_len"): a padded flash attention node with a KV length computes the bits of the node of that
+// length, and its CUDA graph is replayed as the length changes where the launch allows it (see fattn.cu)
+static bool ggml_backend_cuda_fa_kv_len(void) {
+    return true;
+}
+#endif
+
 // k15-fn: the host -> device uploads of n tensors (offset 0, whole size given) as one cudaMemcpyBatchAsync on the backend's stream, in
 // stream order like n cudaMemcpyAsync (the scheduler's graph inputs of a split: 21 per Flash-Next verify graph, issued back to back with
 // the GPU idle between them). Returns false (nothing queued) where the batch API is missing or refuses them: the caller copies one by one
@@ -3392,10 +3400,21 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
             GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
         }
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
-        return false;
+        // k19-graph: the same graph, but the launch of a flash attention node follows its KV length, which is set with the inputs
+        bool fa_changed = false;
+        for (const int i : graph->fa_kvl_nodes) {
+            if (ggml_cuda_flash_attn_ext_kv_len_sig(*cuda_ctx, cgraph->nodes[i]) != graph->node_props[i].fa_sig) {
+                fa_changed = true;
+                break;
+            }
+        }
+        if (!fa_changed) {
+            return false;
+        }
     }
 
     graph->uid = cgraph->uid;
+    graph->fa_kvl_nodes.clear();
 
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
@@ -3415,6 +3434,10 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
                 prop.node_src_type[j] = (int32_t) cgraph->nodes[i]->src[j]->type;
             }
         }
+        if (cgraph->nodes[i]->op == GGML_OP_FLASH_ATTN_EXT && cgraph->nodes[i]->src[5] != nullptr) {
+            prop.fa_sig = ggml_cuda_flash_attn_ext_kv_len_sig(*cuda_ctx, cgraph->nodes[i]);
+            graph->fa_kvl_nodes.push_back(i);
+        }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
             // k15-fn: GGML_CUDA_GRAPH_WHY=N logs the first changed node of up to N re-captures (diagnostic)
@@ -3423,7 +3446,9 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
                 why_left--;
                 const ggml_cuda_graph::node_properties & o = graph->node_props[i];
                 const char * what = "other tensor field";
-                if (o.node.data != prop.node.data) {
+                if (o.fa_sig != prop.fa_sig) {
+                    what = "flash attention launch at the KV length";
+                } else if (o.node.data != prop.node.data) {
                     what = "data";
                 } else if (memcmp(o.node.ne, prop.node.ne, sizeof(o.node.ne)) != 0) {
                     what = "ne";
@@ -11945,6 +11970,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_set_tensors_batch_async") == 0) {
         return (void *)ggml_backend_cuda_set_tensors_batch_async;
     }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // k19-graph: flash attention reads its KV length (ggml_flash_attn_ext_set_kv_len) at the bits of the unpadded node (fattn.cu)
+    if (strcmp(name, "ggml_backend_fa_kv_len") == 0) {
+        return (void *)ggml_backend_cuda_fa_kv_len;
+    }
+#endif
     if (strcmp(name, "ggml_backend_host_pin_range") == 0) {
         return (void *)ggml_backend_cuda_host_pin_range;
     }

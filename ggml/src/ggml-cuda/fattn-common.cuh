@@ -19,6 +19,43 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// k19-graph: the live KV length of a padded flash attention node (ggml_flash_attn_ext_set_kv_len), read on the device by the dense
+// stream-k MMA kernel and its fixup. They take the loop bound and the stream-k block count that the launch of a node of kv_len cells
+// takes (ggml_cuda_fattn_stream_k_blocks, the same function), so the padded node computes the bits of the unpadded one while its
+// launch (the grid of the padded length) and so its CUDA graph stay fixed as the length grows. kv_len == nullptr: off
+struct ggml_cuda_fattn_dev_len {
+    const int * kv_len;
+    int nbatch_fa;      // the host's KV tile, which the block count is planned with
+    int ntiles_dst;
+    int max_blocks;
+    int ntiles_dst_ref; // k19-tpp: the output tiles of the reference window (0: none)
+    int stream_k;       // 0: one block per output tile
+};
+
+// the stream-k blocks of a launch over ntiles_KV KV tiles (launch_fattn); on the device for a length read there
+static __host__ __device__ __forceinline__ int ggml_cuda_fattn_stream_k_blocks(
+        const int ntiles_KV, const int ntiles_dst, const int max_blocks, const int ntiles_dst_ref) {
+    const int max_efficiency_loss_percent = 5;
+    // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
+    // Only do this if the occupancy loss from rounding is acceptable.
+    const int raw     = max_blocks < ntiles_KV*ntiles_dst ? max_blocks : ntiles_KV*ntiles_dst;
+    const int rounded = (raw / ntiles_dst) * ntiles_dst;
+    const int loss    = rounded > 0 ? 100 * (raw - rounded) / raw : 100;
+    int nblocks = loss <= max_efficiency_loss_percent ? rounded : raw;
+    // k19-tpp: one-query tiles of a verify window wider than the reference: the blocks per output tile of the reference window,
+    // so every query's KV range is split at the same cells as there (each tile's split depends only on its block count when the
+    // count divides evenly). Only when the reference launch itself rounds to whole tiles; otherwise as before
+    if (ntiles_dst_ref > 0) {
+        const int raw_ref     = max_blocks < ntiles_KV*ntiles_dst_ref ? max_blocks : ntiles_KV*ntiles_dst_ref;
+        const int rounded_ref = (raw_ref / ntiles_dst_ref) * ntiles_dst_ref;
+        const int loss_ref    = rounded_ref > 0 ? 100 * (raw_ref - rounded_ref) / raw_ref : 100;
+        if (loss_ref <= max_efficiency_loss_percent) {
+            nblocks = (rounded_ref / ntiles_dst_ref) * ntiles_dst;
+        }
+    }
+    return nblocks;
+}
+
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -40,7 +77,8 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        const ggml_cuda_fattn_dev_len dev_len);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -744,10 +782,11 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
         const int ne01, const int ne02,
         const int ne12, const int nblocks_stream_k,
         const int gqa_ratio,
-        const int blocks_per_tile,
+        const int blocks_per_tile_host,
         const uint3 fd_iter_j_z_ne12,
         const uint3 fd_iter_j_z,
-        const uint3 fd_iter_j) {
+        const uint3 fd_iter_j,
+        const ggml_cuda_fattn_dev_len dev_len) {
     constexpr int ncols = ncols1*ncols2;
     ggml_cuda_pdl_lc();
     float        * GGML_CUDA_RESTRICT dst       = dst_ptr;
@@ -758,12 +797,6 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
     const int c        = blockIdx.z;
     const int jc       = j*ncols2 + c;
     const int tid      = threadIdx.x;
-
-    // nblocks_stream_k is a multiple of ntiles_dst (== gridDim.x), so each tile gets the same number of blocks.
-    const int b_first = tile_idx * blocks_per_tile;
-    const int b_last  = b_first + blocks_per_tile - 1;
-
-    const float * dst_fixup_data = ((const float *) dst_fixup) + nblocks_stream_k*(2*2*ncols);
 
     // z_KV == K/V head index, zt_gqa = Q head start index per K/V head, jt = token position start index
     const uint2 dm0 = fast_div_modulo(tile_idx, fd_iter_j_z_ne12);
@@ -784,6 +817,21 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
     dst += sequence*ne02*ne01*D + jt*ne02*(ncols1*D) + zt_Q*D + (j*ne02 + c)*D + tid;
 
     ggml_cuda_pdl_sync();
+
+    // k19-graph: the blocks per tile of the launch at the live length (see ggml_cuda_fattn_dev_len); the buffer layout keeps the
+    // launched grid (nblocks_stream_k), as the kernel's blocks write it
+    int blocks_per_tile = blocks_per_tile_host;
+    if (dev_len.kv_len != nullptr) {
+        blocks_per_tile = ggml_cuda_fattn_stream_k_blocks((*dev_len.kv_len + dev_len.nbatch_fa - 1) / dev_len.nbatch_fa,
+            dev_len.ntiles_dst, dev_len.max_blocks, dev_len.ntiles_dst_ref) / dev_len.ntiles_dst;
+    }
+
+    // nblocks_stream_k is a multiple of ntiles_dst (== gridDim.x), so each tile gets the same number of blocks.
+    const int b_first = tile_idx * blocks_per_tile;
+    const int b_last  = b_first + blocks_per_tile - 1;
+
+    const float * dst_fixup_data = ((const float *) dst_fixup) + nblocks_stream_k*(2*2*ncols);
+
     // Load the partial result that needs a fixup
     float dst_val = *dst;
     float max_val;
@@ -1004,6 +1052,28 @@ static int ggml_cuda_fattn_verify_ref_rows(const ggml_tensor * KQV) {
     return ref > 0 && KQV->src[0]->ne[1] > ref ? ref : 0;
 }
 
+// k19-graph (ggml_cuda_flash_attn_ext): a node whose live KV length (ggml_flash_attn_ext_set_kv_len) is below its padded one is
+// launched as the node of the live length (K / V / mask views of kv_len cells, the launch choices of that node). These tell
+// launch_fattn the graph node behind that copy and, for the device length, the padded length the grid is planned with
+struct ggml_cuda_fattn_kv_len_ctx {
+    const ggml_tensor * node;     // the graph node (its QSA maskless plan, its mask)
+    const int *         kv_len;   // device copy of the live length; nullptr: the launch keeps the live length as a constant
+    int64_t             n_kv_pad; // the node's K / V cells
+};
+// a dry run of the launch choices (no allocation, no launch), see ggml_cuda_flash_attn_ext_kv_len_sig
+struct ggml_cuda_fattn_probe {
+    bool         done       = false;
+    bool         stream_k   = false;
+    bool         use_sparse = false;
+    bool         scan_mask  = false;
+    bool         dev_ok     = false; // the launch can read the length on the device (dense, f16 K / V, uniform or no stream-k fixup)
+    const void * kernel     = nullptr;
+    int          nblocks    = 0;
+    int          fixup      = 0;     // stream-k fixup at this length: 0 none, 1 uniform, 2 general (-1: not stream-k)
+};
+extern thread_local const ggml_cuda_fattn_kv_len_ctx * ggml_cuda_fattn_kv_len_cur;
+extern thread_local ggml_cuda_fattn_probe *            ggml_cuda_fattn_probe_cur;
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1044,11 +1114,17 @@ void launch_fattn(
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
 
+    // k19-graph: the launch of a padded node at its live length (see ggml_cuda_fattn_kv_len_ctx), or a dry run of the choices
+    const ggml_cuda_fattn_kv_len_ctx * kvl = ggml_cuda_fattn_kv_len_cur;
+    ggml_cuda_fattn_probe * probe = ggml_cuda_fattn_probe_cur;
+    const ggml_tensor * node      = kvl ? kvl->node : dst;
+    const ggml_tensor * node_mask = node->src[3];
+
     // k15-mm2 QSA maskless: the graph did not build this node's dense selection mask. A gather takes its lists from the selected
     // cells and reads the causal mask, which equals the dense one at every listed cell; any other kernel gets the dense mask now
     const ggml_cuda_qsa_maskless * qsa = nullptr;
     if (!ctx.qsa_maskless.empty()) {
-        const auto it = ctx.qsa_maskless.find(dst);
+        const auto it = ctx.qsa_maskless.find(node);
         if (it != ctx.qsa_maskless.end()) {
             qsa = &it->second;
         }
@@ -1056,12 +1132,15 @@ void launch_fattn(
     const bool qsa_gather = qsa && !qsa->prompt && use_sparse && ggml_cuda_qsa_maskless_gather_ok(*qsa) && ggml_cuda_qsa_maskless_mode() == 1;
     // the mask node's buffer may hold the selection or the causal mask (the allocator reused it), then a pool copy takes the mask;
     // allocated before the kernel's pool buffers, freed after them
+    // (k19-graph: the dense mask of the graph node, all of its padded cells; the launch reads the live ones through the same strides)
     ggml_cuda_pool_alloc<half> qsa_mask(pool);
     const char * mask_data = mask ? (const char *) mask->data : nullptr;
-    if (qsa_gather) {
+    if (probe) {
+        // a dry run: no copy, no conversion, no allocation
+    } else if (qsa_gather) {
         mask_data = (const char *) qsa->kq->data;
     } else if (qsa) {
-        half * m = qsa->alias ? qsa_mask.alloc(ggml_nelements(mask)) : (half *) mask->data;
+        half * m = qsa->alias ? qsa_mask.alloc(ggml_nelements(node_mask)) : (half *) node_mask->data;
         ggml_cuda_qsa_maskless_materialize(*qsa, m, main_stream);
         mask_data = (const char *) m;
     }
@@ -1086,7 +1165,7 @@ void launch_fattn(
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
-    if (need_f16_K && K->type != GGML_TYPE_F16) {
+    if (need_f16_K && K->type != GGML_TYPE_F16 && !probe) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
@@ -1114,7 +1193,7 @@ void launch_fattn(
         K_data = (char *) K_f16;
     }
 
-    if (need_f16_V && V->type != GGML_TYPE_F16) {
+    if (need_f16_V && V->type != GGML_TYPE_F16 && !probe) {
         if (V_is_K_view) {
             V_data = K_data;
             nb21   = nb11;
@@ -1165,8 +1244,9 @@ void launch_fattn(
 
         const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
 
-        KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
-        if (qsa_gather) {
+        if (probe) {
+            // a dry run
+        } else if (KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists), qsa_gather) {
             ggml_cuda_qsa_maskless_compact(*qsa, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
         } else {
             ggml_tensor mask_m = *mask; // the QSA maskless rebuild may live in a pool copy
@@ -1179,7 +1259,7 @@ void launch_fattn(
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
     const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
-    if (scan_mask) {
+    if (scan_mask && !probe) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1210,6 +1290,12 @@ void launch_fattn(
     const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
     dim3 blocks_num;
+    // k19-graph: see ggml_cuda_fattn_dev_len / ggml_cuda_fattn_probe
+    ggml_cuda_fattn_dev_len dev_len = { nullptr, 0, 0, 0, 0, 0 };
+    int  ntiles_dst_ref = 0;
+    int  fixup_kind     = 0; // stream-k fixup: 0 none, 1 uniform, 2 general
+    bool dev_ok         = false;
+    bool use_stream_k   = false;
     if (stream_k) {
         // Stream-K splits the work before the mask scan is applied, so skipped KV tiles make the blocks uneven.
         const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK && async_kv_preload && scan_mask;
@@ -1231,43 +1317,34 @@ void launch_fattn(
         };
 
         const int  max_blocks   = max_blocks_per_sm*nsm;
-        const bool use_stream_k = should_use_stream_k(cc, ntiles_dst, max_blocks, Q->ne[0]);
+        use_stream_k = should_use_stream_k(cc, ntiles_dst, max_blocks, Q->ne[0]);
 
         blocks_num.x = ntiles_dst;
         blocks_num.y = 1;
         blocks_num.z = 1;
 
         if(use_stream_k) {
-            const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
-            // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
-            // Only do this if the occupancy loss from rounding is acceptable.
-            const int nblocks_stream_k_rounded = (nblocks_stream_k_raw / ntiles_dst) * ntiles_dst;
-            const int max_efficiency_loss_percent = 5;
-            const int efficiency_loss_percent = nblocks_stream_k_rounded > 0
-                ? 100 * (nblocks_stream_k_raw - nblocks_stream_k_rounded) / nblocks_stream_k_raw
-                : 100;
-            const int nblocks_stream_k = efficiency_loss_percent <= max_efficiency_loss_percent
-                ? nblocks_stream_k_rounded
-                : nblocks_stream_k_raw;
-
-            blocks_num.x = nblocks_stream_k;
-
-            // k19-tpp: one-query tiles of a verify window wider than the reference: the blocks per output tile of the reference window,
-            // so every query's KV range is split at the same cells as there (each tile's split depends only on its block count when the
-            // count divides evenly). Only when the reference launch itself rounds to whole tiles; otherwise as before
+            // k19-tpp: one-query tiles of a verify window wider than the reference (see ggml_cuda_fattn_stream_k_blocks)
             const int ref_rows = ncols1 == 1 ? ggml_cuda_fattn_verify_ref_rows(KQV) : 0;
-            if (ref_rows > 0) {
-                const int ntiles_dst_ref = ntiles_dst / ntiles_x * ref_rows;
-                const int raw_ref        = std::min(max_blocks, ntiles_KV*ntiles_dst_ref);
-                const int rounded_ref    = (raw_ref / ntiles_dst_ref) * ntiles_dst_ref;
-                const int loss_ref       = rounded_ref > 0 ? 100 * (raw_ref - rounded_ref) / raw_ref : 100;
-                if (loss_ref <= max_efficiency_loss_percent) {
-                    blocks_num.x = (rounded_ref / ntiles_dst_ref) * ntiles_dst;
-                }
-            }
+            ntiles_dst_ref = ref_rows > 0 ? ntiles_dst / ntiles_x * ref_rows : 0;
+            blocks_num.x = ggml_cuda_fattn_stream_k_blocks(ntiles_KV, ntiles_dst, max_blocks, ntiles_dst_ref);
         }
 
-        if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
+        // k19-graph: the fixup of the launch at this length; the device length takes the dense kernel with a uniform fixup (each
+        // tile the same number of blocks) or none, read again by the kernel and the fixup from the live length
+        const int nblocks_live = blocks_num.x;
+        fixup_kind = (nblocks_live % ntiles_dst == 0 && nblocks_live > ntiles_dst) ? 1 : (ntiles_dst % nblocks_live != 0 ? 2 : 0);
+        dev_ok = !use_sparse && !scan_mask && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 && fixup_kind != 2;
+        if (kvl && kvl->kv_len && !probe) {
+            GGML_ASSERT(dev_ok && "a device KV length needs the launch choices the probe found");
+            // the grid of the padded length (the block count only grows with the length), the blocks past the live count exit
+            const int ntiles_KV_pad = int((kvl->n_kv_pad + nbatch_fa - 1) / nbatch_fa);
+            const int nblocks_pad   = use_stream_k ? ggml_cuda_fattn_stream_k_blocks(ntiles_KV_pad, ntiles_dst, max_blocks, ntiles_dst_ref) : ntiles_dst;
+            blocks_num.x = std::max(nblocks_live, nblocks_pad);
+            dev_len      = { kvl->kv_len, nbatch_fa, ntiles_dst, max_blocks, ntiles_dst_ref, use_stream_k ? 1 : 0 };
+        }
+
+        if (!probe && (ntiles_dst % blocks_num.x != 0 || (dev_len.kv_len && fixup_kind == 1))) { // Fixup is only needed if the SMs work on fractional tiles.
             dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
         }
     } else {
@@ -1334,10 +1411,22 @@ void launch_fattn(
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
 
-        if (parallel_blocks > 1) {
+        if (parallel_blocks > 1 && !probe) {
             dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
             dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
         }
+    }
+
+    if (probe) {
+        probe->done       = true;
+        probe->stream_k   = stream_k && use_stream_k;
+        probe->use_sparse = use_sparse;
+        probe->scan_mask  = scan_mask;
+        probe->dev_ok     = stream_k && dev_ok;
+        probe->kernel     = (const void *) fattn_kernel;
+        probe->nblocks    = stream_k ? (int) blocks_num.x : parallel_blocks;
+        probe->fixup      = stream_k ? fixup_kind : -1;
+        return;
     }
 
     float scale         = 1.0f;
@@ -1380,12 +1469,13 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        dev_len
     );
     CUDA_CHECK(cudaGetLastError());
 
     if (stream_k) {
-        if ((int)blocks_num.x % ntiles_dst == 0 && (int)blocks_num.x > ntiles_dst) {
+        if (dev_len.kv_len ? fixup_kind == 1 : (int)blocks_num.x % ntiles_dst == 0 && (int)blocks_num.x > ntiles_dst) {
             // Optimized fixup: nblocks_stream_k is a multiple of ntiles_dst, launch one block per tile.
             const int nblocks_sk  = (int)blocks_num.x;
             const int bpt         = nblocks_sk / ntiles_dst;
@@ -1401,7 +1491,9 @@ void launch_fattn(
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>, launch_params,
                 (float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
-                 gqa_ratio, bpt, fd0, fd1, fd2);
+                 gqa_ratio, bpt, fd0, fd1, fd2, dev_len);
+        } else if (dev_len.kv_len) {
+            // no fixup at the live length (fixup_kind 0)
         } else if (ntiles_dst % blocks_num.x != 0) {
             // General fixup for the cases where nblocks_stream_k < ntiles_dst.
             const int total_work = ntiles_KV * ntiles_dst;

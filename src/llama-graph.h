@@ -392,6 +392,9 @@ public:
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
 
+    // k19-graph: I32 [1], the live cells of a bucketed n_kv that flash attention reads on the device (llama_kv_cache_context::get_n_kv_live)
+    ggml_tensor * self_kv_len = nullptr;
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return
@@ -1009,6 +1012,9 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    // k19-graph: the KV length input of the attention (llm_graph_input_attn_kv::self_kv_len) and the n_kv of its K / V views
+    ggml_tensor * t_kv_len      = nullptr;
+    int64_t       t_kv_len_n_kv = 0;
 
     std::vector<ggml_tensor *> t_layer_inp;
 
