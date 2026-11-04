@@ -493,6 +493,12 @@ struct common_spec_tpp_cost {
     // Deterministic: no timing
     int  ctx_extra[CTX] = { -1, -1, -1, -1, -1 };
     bool ctx_on         = true;
+    // k19-depth: below deep_pos (LLAMA_SPEC_DEPTH_POS, default 12288) every window drafts deep_extra more past floor + 1, so its width
+    // is fixed at floor + 2 + deep_extra rows there; from deep_pos on the windows are the ones above (floor, floor + 1 where it pays).
+    // The drafter sets deep_extra from its n_max (the server raises Studio's 2 drafts to 4 where it is on: LLAMA_SPEC_DEPTH). One width
+    // per context band, as each width a request mixes pays its own CUDA graph captures (plans/fndec.md section 7). Deterministic
+    int     deep_extra = 0;
+    int64_t deep_pos   = 12288;
 
     common_spec_tpp_cost() {
         if (const char * e = getenv("LLAMA_SPEC_TPP_MARG_PRIOR")) {
@@ -521,6 +527,9 @@ struct common_spec_tpp_cost {
         }
         if (const char * e = getenv("LLAMA_SPEC_TPP_STALE")) {
             stale = std::max(1, atoi(e));
+        }
+        if (const char * e = getenv("LLAMA_SPEC_DEPTH_POS")) {
+            deep_pos = atoll(e);
         }
         if (const char * e = getenv("LLAMA_SPEC_TPP_CTX")) {
             ctx_on = atoi(e) != 0;
@@ -623,8 +632,16 @@ struct common_spec_tpp_cost {
         return ctx_on ? ctx_extra[bk] : -1;
     }
 
+    // k19-depth: the current position is in the deep band (every window drafts floor + 1 + deep_extra)
+    bool deep() const {
+        return deep_extra > 0 && pos_cur < deep_pos;
+    }
+
     // window floor + 1 (expected tokens e_w, chance q_w that every draft holds) against the floor window (e_f)
     bool wide_pays(double e_f, double e_w, double q_w) const {
+        if (deep()) {
+            return true;
+        }
         if (forced_extra() >= 0) {
             return forced_extra() >= 1;
         }

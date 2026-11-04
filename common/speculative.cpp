@@ -1663,8 +1663,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         // k19-tpp: one trained head without shared memory only (chained heads and gemma4's shared KV keep the floor as their length)
         if (this->params.n_floor > 0) {
-            if (!chain_heads && !is_mem_shared && !spec_cost && this->params.n_max == this->params.n_floor + 1) {
+            // (k19-depth: n_floor + 2 and more, the deep windows below LLAMA_SPEC_DEPTH_POS)
+            if (!chain_heads && !is_mem_shared && !spec_cost && this->params.n_max >= this->params.n_floor + 1) {
                 tpp_floor = this->params.n_floor;
+                tpp_cost.deep_extra = this->params.n_max - this->params.n_floor - 1;
             } else {
                 this->params.n_max = std::min(this->params.n_max, this->params.n_floor);
             }
@@ -1697,6 +1699,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // an MoE cache: the policy is off and the window is the floor's, as with LLAMA_SPEC_TPP=0 (a wider window reads more
                 // streamed experts and moves which ones stay resident; G4 fn4 16 GB, ktp_g4e: 0.94-0.96 of base at 16k / 30k)
                 tpp_floor = 0;
+                tpp_cost.deep_extra = 0;
                 this->params.n_max = this->params.n_floor;
                 this->n_max = this->params.n_max;
                 cost_on = spec_cost;
@@ -1711,6 +1714,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 LOG_INF("%s: k19-tppctx: windows fixed per context bucket: drafts past %d per bucket <1536 / <6144 / <12288 / <24576 / longer "
                     "%d / %d / %d / %d / %d (-1 priced; LLAMA_SPEC_TPP_CTX=0: off)\n", __func__, tpp_floor, tpp_cost.ctx_extra[0],
                     tpp_cost.ctx_extra[1], tpp_cost.ctx_extra[2], tpp_cost.ctx_extra[3], tpp_cost.ctx_extra[4]);
+            }
+            if (tpp_cost.deep_extra > 0) {
+                LOG_INF("%s: k19-depth: MTP windows of %d drafts below position %lld (LLAMA_SPEC_DEPTH_POS), the windows below from there "
+                    "(LLAMA_SPEC_DEPTH=0: off)\n", __func__, this->params.n_max, (long long) tpp_cost.deep_pos);
             }
             LOG_INF("%s: k19-tpp: MTP windows of %d drafts, %d where the expected tokens per ms pay for the wider window (LLAMA_SPEC_TPP=0: "
                 "off); round times %s (cost ratio %.2f at 16k, MoE cache %s; LLAMA_SPEC_TPP_LIVE=1: live medians)\n", __func__, tpp_floor,
@@ -1762,8 +1769,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (cost_on && seq_id >= 0 && seq_id < (llama_seq_id) cost_st.size()) {
             if (cost_st[seq_id].t_us > 0) {
                 if (tpp_floor > 0) {
-                    LOG_INF("%s: MTP window cost table (k19-tpp): %s | windows: %d drafts %.0f, %d drafts %.0f\n", __func__, tpp_cost.text().c_str(),
-                        tpp_floor, cost_pol.n_rounds[tpp_floor + 1], tpp_floor + 1, cost_pol.n_rounds[tpp_floor + 2]);
+                    const int n_deep = tpp_floor + 1 + tpp_cost.deep_extra;
+                    LOG_INF("%s: MTP window cost table (k19-tpp): %s | windows: %d drafts %.0f, %d drafts %.0f%s\n", __func__, tpp_cost.text().c_str(),
+                        tpp_floor, cost_pol.n_rounds[tpp_floor + 1], tpp_floor + 1, cost_pol.n_rounds[tpp_floor + 2],
+                        tpp_cost.deep_extra > 0 && n_deep + 1 <= common_spec_mtp_cost::MAX_T ?
+                            string_format(", %d drafts %.0f (k19-depth)", n_deep, cost_pol.n_rounds[n_deep + 1]).c_str() : "");
                 } else {
                     LOG_INF("%s: MTP window cost table: %s\n", __func__, cost_pol.text().c_str());
                 }
@@ -2236,6 +2246,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             n_drafting--;
                             continue;
                         }
+                    } else if ((int) result.size() == tpp_floor + 1 && !tpp_cost.deep()) {
+                        // k19-depth: past the deep band a window ends at floor + 1 drafts, as with n_max floor + 1
+                        drafting[seq_id] = false;
+                        n_drafting--;
+                        continue;
                     }
                 } else if (spec_cost && !dp.result_q) {
                     auto & cs = cost_st[seq_id];
