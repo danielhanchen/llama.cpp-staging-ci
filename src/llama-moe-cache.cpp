@@ -2226,18 +2226,20 @@ struct llama_moe_cache::impl {
             const char * e = getenv("LLAMA_MOE_SINGLE_THREADS");
             h.threads = e != nullptr && atoi(e) > 0 ? atoi(e) : std::max(1, single_threads - 1);
             // k19-l4b LLAMA_MOE_SINGLE_THREADS_WIDE (default 1, 0 = the decode threads - 1 as above): where the CPU backend runs the
-            // batch on its own team (ggml_cpu_moe_host_team_on, GGML_MOE_HOST_TEAM), the team also takes the second hardware thread of
-            // the decode cores: 2 x the decode threads - 1 (the caller of the graph keeps one), at most the logical CPUs of the process
-            // - 1 and LLAMA_MOE_SINGLE_THREADS_MAX (16), never fewer than before. Colab L4 (6 decode threads, 12 vCPUs): 5 -> 11, as
-            // PolyStrata's 12 CPU threads. The team size does not change a result (each row is computed once with the same kernel) and
-            // the hybrid fetch share is set from the decode threads, so the text is the same.
+            // batch on its own team (ggml_cpu_moe_host_team_on, GGML_MOE_HOST_TEAM), the team also takes some second hardware threads:
+            // the decode threads + max(1, the decode threads / 3), at most the logical CPUs of the process - 4 (the caller of the graph
+            // waits on the device, the server and the drafter keep a few) and LLAMA_MOE_SINGLE_THREADS_MAX (16), never fewer than before.
+            // Colab L4 (6 decode threads, 12 vCPUs, LFM2.5 4 GB, k19l4b_l4): 5 -> 8 threads, chat decode +8.9% (36.3-36.9 vs 33.6-35.4
+            // tok/s), 2k within the spread; a team of 11 (every vCPU but the caller's) was bimodal (27.6-38.5) and slower on median.
+            // The team size does not change a result (each row is computed once with the same kernel) and the hybrid fetch share is set
+            // from the decode threads, so the text is the same (md5 equal in every launch).
             h.team_stop = (void (*)(void)) ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_host_team_stop");
             auto team_on = (bool (*)(void)) ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_host_team_on");
             const char * ew = getenv("LLAMA_MOE_SINGLE_THREADS_WIDE");
             if ((e == nullptr || atoi(e) <= 0) && (ew == nullptr || atoi(ew) != 0) && team_on != nullptr && team_on()) {
                 const char * em = getenv("LLAMA_MOE_SINGLE_THREADS_MAX");
                 const int wmax = em != nullptr && atoi(em) > 0 ? atoi(em) : 16;
-                const int wide = std::min({ 2*single_threads - 1, llama_moe_n_cpus() - 1, wmax });
+                const int wide = std::min({ single_threads + std::max(1, single_threads/3), llama_moe_n_cpus() - 4, wmax });
                 h.threads = std::max(h.threads, wide);
             }
             if (set_n != nullptr) {
