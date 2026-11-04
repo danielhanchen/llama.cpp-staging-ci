@@ -322,6 +322,11 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
+    // k19-vrow3: a verify window of 5..8 rows keeps mmvq where the tables below send K-quants to MMQ (Blackwell: Q6_K at 8, the lm head
+    // of a DFlash2 n_max 7 window), so its rows keep the sums of a 1..4-row window (GGML_CUDA_VERIFY_WIDE bit 2)
+    if (ne11 >= 5 && ne11 <= ggml_cuda_verify_wide_cols(cc, 2)) {
+        return true;
+    }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ADA_LOVELACE) {
@@ -1929,6 +1934,18 @@ static int mul_mat_vec_q_batch_rpb(const int ncols_x, const int nrows_x, const i
     return 0;
 }
 
+// k19-vrow3: whether the default launch of ncols_dst columns already gives a row the sums of the 4-warp launch of 1..4 columns: when its
+// warps cover the K blocks of a row in one pass, lane t of both takes K block t / (qi / vdr) and nothing else, and the 4-warp reduction
+// only adds the +0.0 of its idle warps (the hyper-connection up projection, K = 320: 10 Q8_0 blocks, 16 per pass with 2 warps). The
+// default launch then stays (it is faster there); the values are the same up to the sign of a row sum that is exactly zero
+template <ggml_type type>
+static bool mul_mat_vec_q_wide_same_as_default(const int ncols_x, const int ncols_dst, const mmvq_parameter_table_id table_id, const int warp_size) {
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    return ncols_x / qk <= vdr * calc_nwarps(type, ncols_dst, table_id) * warp_size / qi;
+}
+
 // k19-vrow2 / k19-vrow3: a dense 5..8 column launch of a multi-matrix type (no fusion, no ids) as the 4-column launch makes it, only wider: 4 warps,
 // the rows per block and K unroll mul_mat_vec_q_batch_rpb / mul_mat_vec_q_unroll pick for 4 columns. A row's sum depends on the warps
 // and the unroll (the K split and order), not on the rows per block. false: not this type / table (the caller falls back)
@@ -2096,7 +2113,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
     // verify window keeps the 4 warps of 1..4 columns, so its K split is the 3-row window's: the multi-matrix types with the 4-column
     // launch's rows per block and K unroll (mul_mat_vec_q_verify_wide), the others through the batch invariant 4-warp launch
     if (!exact && ids == nullptr && ncols_dst >= 5 &&
-            ncols_dst <= ggml_cuda_verify_wide_cols(ggml_cuda_info().devices[ggml_cuda_get_device()].cc, 2)) {
+            ncols_dst <= ggml_cuda_verify_wide_cols(ggml_cuda_info().devices[ggml_cuda_get_device()].cc, 2) &&
+            !mul_mat_vec_q_wide_same_as_default<type>(ncols_x, ncols_dst, get_device_table_id(ggml_cuda_info().devices[ggml_cuda_get_device()].cc),
+                ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size)) {
         if (mul_mat_vec_q_verify_wide<type>(vx, vy, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_x, nsamples_dst,
                 stride_sample_x, stride_sample_y, stride_sample_dst, stream)) {
@@ -2452,7 +2471,7 @@ static void mul_mat_vec_q_multi_switch_ncols(
     // columns, with the rows per block and K unroll of the 4-column launch (a row's sum depends on the warps only), so the Q / K / V and
     // gated delta net in-projections of a deep window get the bytes of a 1..4-row window's, as mul_mat_vec_q_verify_wide for single products
     if (ncols_dst >= 5 && table_id == MMVQ_PARAMETERS_GENERIC && calc_nwarps(type, 4, table_id) == 4 &&
-            ncols_dst <= ggml_cuda_verify_wide_cols(cc, 4)) {
+            ncols_dst <= ggml_cuda_verify_wide_cols(cc, 4) && !mul_mat_vec_q_wide_same_as_default<type>(ncols_x, ncols_dst, table_id, warp_size)) {
         int brpb4 = mul_mat_vec_q_batch_rpb<type>(ncols_x, total_rows, 4, cc, warp_size, table_id);
         for (int m = 0; m < n_multi; ++m) {
             if (brpb4 == 4 && nrows[m] % 4 != 0) {
