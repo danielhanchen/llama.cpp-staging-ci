@@ -1473,8 +1473,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     return r;
                 }();
                 const bool use_ev = is_dflash2 && !ev_rule.first.empty();
-                // k19-handoff: the default window of a DFlash2 draft beside a target without a MoE cache (LLAMA_DFLASH_WINDOW=0: the whole
-                // walk, as before; LLAMA_DFLASH_EV, --spec-draft-p-min and LLAMA_DFLASH_P_CUM replace it). Of two windows, the short one
+                // k19-handoff: the window of a DFlash2 draft beside a target without a MoE cache, on by default under the exact verify
+                // contract (LLAMA_MTP_EXACT=1: the text does not depend on the window), else opt-in (LLAMA_DFLASH_WINDOW=1: the default
+                // verify's kernels follow the width, so the text changes: srv_kld long48 on G4 mean 0.0016 / p99 0.015 vs the -fa off band
+                // 0.0037 / 0.035, but one position at 0.30 above the band's max 0.155); LLAMA_DFLASH_WINDOW=0: off; LLAMA_DFLASH_EV,
+                // --spec-draft-p-min and LLAMA_DFLASH_P_CUM replace it. Of two windows, the short one
                 // (4 rows below position 4096, 3 above) and the whole draft, the one with more expected tokens per ms: the expected tokens
                 // come from the chance that each step is accepted given its selector probability (calibrated on G4 Flash-Next, 48 prompts
                 // of 2k / 8k tokens: the selector is near calibrated, a little over-confident at the top), the ms from G4's pass cost by
@@ -1482,7 +1485,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // only: each width is one more CUDA graph capture (~20 ms) at every new KV bucket
                 static const bool df2_window = [] {
                     const char * e = getenv("LLAMA_DFLASH_WINDOW");
-                    return e == nullptr || atoi(e) != 0;
+                    return e == nullptr ? llama_exact_verify_enabled() : atoi(e) != 0;
                 }();
                 const bool use_df2w = is_dflash2 && df2_window && !use_ev && params.p_min <= 0.0f && p_cum_thr <= 0.0f &&
                     !llama_moe_cache_active(params.ctx_tgt);
@@ -1490,7 +1493,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     static bool logged = false;
                     if (!logged) {
                         logged = true;
-                        LOG_INF("k19-handoff: DFlash2 window: the short or the whole draft by expected tokens per ms (LLAMA_DFLASH_WINDOW=0 off)\n");
+                        LOG_INF("k19-handoff: DFlash2 window: the short or the whole draft by expected tokens per ms (%s; LLAMA_DFLASH_WINDOW=0 off)\n",
+                                getenv("LLAMA_DFLASH_WINDOW") != nullptr ? "LLAMA_DFLASH_WINDOW=1" : "exact verify");
                     }
                 }
                 std::vector<float> step_p;
