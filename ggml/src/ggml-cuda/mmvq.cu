@@ -1226,11 +1226,12 @@ struct mmvq_moe_wdec<GGML_TYPE_IQ3_S, true> {
                 iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
                 iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
 
-            const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
-            const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+            // k19-moebw: the signs as in vec_dot_iq3_s_q8_1 (0x01 per negative byte, -g = (g ^ 0xFF) + 1 without a carry)
+            const int sb0 = ((signs_packed_8[l0/2] & 0x0F) * 0x00204081) & 0x01010101;
+            const int sb1 = ((signs_packed_8[l0/2] >>   4) * 0x00204081) & 0x01010101;
 
-            grid[l0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
-            grid[l0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
+            grid[l0 + 0] = (grid_pos.x ^ (sb0 * 0xFF)) + sb0;
+            grid[l0 + 1] = (grid_pos.y ^ (sb1 * 0xFF)) + sb1;
         }
 
         scale = 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);

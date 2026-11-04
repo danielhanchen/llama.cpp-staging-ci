@@ -1291,11 +1291,15 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
             iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
             iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
 
-        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+        // k19-moebw: the signs of the 8 values, as 0x01 in each byte of a negative value (bit i of the sign byte -> bit 8 i: the
+        // partial products of the multiply do not overlap), then -g = (g ^ 0xFF) + 1 in each such byte: every iq3s_grid byte is
+        // 1..15, so no byte carries into the next one and the ints are those of __vsub4(g ^ m, m) with the __vcmpne4 masks m (fewer
+        // instructions: the MoE mat-vec of IQ3_S experts is bound by them)
+        const int sb0 = ((signs_packed_8[l0/2] & 0x0F) * 0x00204081) & 0x01010101;
+        const int sb1 = ((signs_packed_8[l0/2] >>   4) * 0x00204081) & 0x01010101;
 
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int grid_l = (grid_pos.x ^ (sb0 * 0xFF)) + sb0;
+        const int grid_h = (grid_pos.y ^ (sb1 * 0xFF)) + sb1;
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
