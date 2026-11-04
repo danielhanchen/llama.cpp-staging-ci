@@ -1664,10 +1664,21 @@ private:
             // LLAMA_SPEC_TPP=1 forces past the device rule, not the MoE cache rule
             const bool on = (e != nullptr ? atoi(e) != 0 : dev_ok) && fits_all;
             if (mtp_shape && on) {
+                // k19-depth (LLAMA_SPEC_DEPTH=0: off, =1: also beside built-in MTP heads): with an MTP drafter of its own (-md), every window
+                // below position 12288 (LLAMA_SPEC_DEPTH_POS) drafts 4, the windows from there are the ones above (2, a 3rd where it pays).
+                // G4 Qwen3.8-Flash-Next fn4 full card (plans/k19_depth.md): 4 drafts +6.8% chat / +10.9% 8k, -13% 30k against 2 + tpp.
+                // Built-in heads (Qwen3.6) stay at the windows above: their extra verify row costs ~20% of a pass (plans/k19_fn_tpp.md)
+                const char * de = getenv("LLAMA_SPEC_DEPTH");
+                const bool deep = de != nullptr ? atoi(de) != 0 : sp.has_dft();
                 sp.draft.n_floor = 2;
-                sp.draft.n_max   = 3;
+                sp.draft.n_max   = deep ? 4 : 3;
                 SRV_INF("k19-tpp: MTP drafts 2, a 3rd where it pays (need %.0f MiB for model + drafter, %.0f MiB free on %d GPUs%s; "
                     "LLAMA_SPEC_TPP=0: off)\n", need/1048576.0, dev_free/1048576.0, n_gpu, n_gpu == 0 ? ", no GPU: forced" : "");
+                if (deep) {
+                    const char * dp = getenv("LLAMA_SPEC_DEPTH_POS");
+                    SRV_INF("k19-depth: MTP drafts 4 in every window below position %s (LLAMA_SPEC_DEPTH_POS; LLAMA_SPEC_DEPTH=0: off)\n",
+                        dp != nullptr ? dp : "12288");
+                }
             } else if (mtp_shape && n_gpu == 0 && e == nullptr) {
                 SRV_INF("%s", "k19-tpp: off: no GPU (LLAMA_SPEC_TPP=1: on)\n");
             } else if (mtp_shape && (e != nullptr ? atoi(e) != 0 : dev_ok)) {
