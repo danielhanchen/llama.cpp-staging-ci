@@ -81,13 +81,15 @@ extern "C" {
     // x86
     // k18: the host experts of one single-graph MoE mailbox batch (see ggml-cpu.c): out[t*n_used + j] = down_e(swiglu(gate_e(x_t), up_e(x_t)))
     // for e = ids[t*n_used + j] >= 0, rows of -1 zeroed; bit-identical to the graph mul_mat_id up / gate, swiglu_split, mul_mat_id down.
-    // false: not handled (no OpenMP build and the host team off, types, scratch too small); the caller computes the graph.
-    // k19-l4b: by default the batch runs on a team of threads of its own (GGML_MOE_HOST_TEAM=0: an OpenMP region as in k18)
+    // false: not handled (no OpenMP build, types, scratch too small); the caller computes the graph.
     GGML_BACKEND_API size_t ggml_cpu_moe_host_ffn_wsize(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
             int n_used, int n_tokens, int n_threads);
     GGML_BACKEND_API bool   ggml_cpu_moe_host_ffn(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
             const float * x, const int32_t * ids, float * out, int n_used, int n_tokens, int n_threads, void * wbuf, size_t wsize);
-    // k19-l4b: whether ggml_cpu_moe_host_ffn runs on its own team (GGML_MOE_HOST_TEAM), and a stop of that team (joins its threads)
+    // k19-l4b: the same batch on a team of threads of its own instead of an OpenMP region (bit-identical; GGML_MOE_HOST_TEAM=0: the
+    // OpenMP region), whether that team is on, and a stop of the team (joins its threads)
+    GGML_BACKEND_API bool   ggml_cpu_moe_host_ffn_team(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
+            const float * x, const int32_t * ids, float * out, int n_used, int n_tokens, int n_threads, void * wbuf, size_t wsize);
     GGML_BACKEND_API bool   ggml_cpu_moe_host_team_on(void);
     GGML_BACKEND_API void   ggml_cpu_moe_host_team_stop(void);
 

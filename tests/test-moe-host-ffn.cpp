@@ -1,6 +1,6 @@
 // k19-l4b: ggml_cpu_moe_host_ffn (the host experts of a single-graph MoE mailbox batch) is bit-identical to the graph it replaces
-// (mul_mat_id up / gate, swiglu_split, mul_mat_id down on the CPU backend) for every thread count, on the host team
-// (GGML_MOE_HOST_TEAM, default) and on the OpenMP region (GGML_MOE_HOST_TEAM=0). Rows of id -1 must be 0. Any byte difference fails.
+// (mul_mat_id up / gate, swiglu_split, mul_mat_id down on the CPU backend) for every thread count, on the OpenMP region and on
+// ggml_cpu_moe_host_ffn_team (the host team; the OpenMP region again with GGML_MOE_HOST_TEAM=0). Rows of id -1 must be 0. Any byte difference fails.
 // "perf" as the first argument times both forms instead (LFM2.5-24B-A2B expert shapes, 1 token, 4 experts per batch).
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -103,13 +103,16 @@ static std::vector<float> run_graph(ffn_case & c, int n_threads) {
     return out;
 }
 
+static bool g_team = true; // ggml_cpu_moe_host_ffn_team, else ggml_cpu_moe_host_ffn (the OpenMP region)
+
 static bool run_fused(ffn_case & c, int n_threads, std::vector<float> & out) {
     const int64_t n_embd = c.up->ne[0];
     const int n_used = (int) c.ids->ne[0], n_tokens = (int) c.ids->ne[1];
     const size_t ws = ggml_cpu_moe_host_ffn_wsize(c.up, c.gate, c.down, n_used, n_tokens, n_threads);
     std::vector<uint8_t> wbuf(ws);
     out.assign((size_t) n_embd*n_used*n_tokens, 12345.0f);
-    return ggml_cpu_moe_host_ffn(c.up, c.gate, c.down, (const float *) c.x->data, (const int32_t *) c.ids->data, out.data(), n_used, n_tokens,
+    auto fn = g_team ? ggml_cpu_moe_host_ffn_team : ggml_cpu_moe_host_ffn;
+    return fn(c.up, c.gate, c.down, (const float *) c.x->data, (const int32_t *) c.ids->data, out.data(), n_used, n_tokens,
         n_threads, wbuf.data(), wbuf.size());
 }
 
@@ -117,7 +120,9 @@ static int perf_main() {
     // LFM2.5-24B-A2B: n_embd 2048, n_ff 1536, 64 experts; gate / up Q4_K, down Q5_K (UD-Q4_K_XL); 4 used, the host gets 2-3 of them
     ffn_case c;
     make_case(c, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 2048, 1536, 64, 4, 1, 7, false);
-    printf("team %s\n", ggml_cpu_moe_host_team_on() ? "on" : "off (GGML_MOE_HOST_TEAM=0)");
+    for (int team = 0; team < 2; ++team) {
+    g_team = team == 1;
+    printf("%s\n", g_team ? (ggml_cpu_moe_host_team_on() ? "team" : "team entry, GGML_MOE_HOST_TEAM=0: OpenMP region") : "OpenMP region");
     for (int nt : { 1, 2, 4, 5, 6, 8, 11, 12, 16 }) {
         std::vector<float> out;
         for (int w = 0; w < 50; ++w) {
@@ -130,6 +135,7 @@ static int perf_main() {
         }
         const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count()/n;
         printf("threads %2d: %8.1f us per batch of 4 experts\n", nt, us);
+    }
     }
     return 0;
 }
@@ -160,9 +166,11 @@ int main(int argc, char ** argv) {
         ffn_case c;
         make_case(c, k.tu, k.td, k.n_embd, k.n_ff, k.n_exp, k.n_used, k.n_tokens, seed++, k.skip);
         const std::vector<float> ref = run_graph(c, 4);
+        for (int team = 0; team < 2; ++team)
         for (int nt : { 1, 2, 3, 5, 7, 11, 16 }) {
             for (int rep = 0; rep < 3; ++rep) {
                 std::vector<float> out;
+                g_team = team == 1;
                 ++runs;
                 if (!run_fused(c, nt, out)) {
                     ++unhandled;

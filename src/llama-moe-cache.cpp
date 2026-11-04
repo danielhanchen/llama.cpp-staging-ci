@@ -2140,6 +2140,7 @@ struct llama_moe_cache::impl {
         ggml_backend_ptr     cpu;
         int                  threads = 1;
         void               (*team_stop)(void) = nullptr; // k19-l4b: joins the CPU backend's host team (the last owner's stop)
+        bool                 team = false;                // k19-l4b: the batches run on that team (LLAMA_MOE_SINGLE_THREADS_WIDE)
         // k18 (LLAMA_MOE_SINGLE_FUSED, default on; =0 the graph of each batch as before): the CPU backend's one-region form of the batch's
         // host experts (ggml_cpu_moe_host_ffn: one barrier instead of the graph's seven, no plan; bit-identical to the graph), with
         // its scratch; null when the CPU backend has none (the graph then)
@@ -2225,29 +2226,37 @@ struct llama_moe_cache::impl {
             // so a team as large as the decode threads puts two threads on one core
             const char * e = getenv("LLAMA_MOE_SINGLE_THREADS");
             h.threads = e != nullptr && atoi(e) > 0 ? atoi(e) : std::max(1, single_threads - 1);
-            // k19-l4b LLAMA_MOE_SINGLE_THREADS_WIDE (default 1, 0 = the decode threads - 1 as above): where the CPU backend runs the
-            // batch on its own team (ggml_cpu_moe_host_team_on, GGML_MOE_HOST_TEAM), the team also takes some second hardware threads:
-            // the decode threads + max(1, the decode threads / 3), at most the logical CPUs of the process - 4 (the caller of the graph
-            // waits on the device, the server and the drafter keep a few) and LLAMA_MOE_SINGLE_THREADS_MAX (16), never fewer than before.
+            // k19-l4b LLAMA_MOE_SINGLE_THREADS_WIDE (default 1; 0 = off, 2 = on every placement): where the host computes most of the
+            // misses (the hybrid gate: a cache of at most LLAMA_MOE_CACHE_HYBRID_MAX_FRAC of the host experts), the host experts are the
+            // critical path of a decode step, so the batch runs on the CPU backend's own team (ggml_cpu_moe_host_ffn_team,
+            // GGML_MOE_HOST_TEAM=0 off) of the decode threads + max(1, the decode threads / 3) threads, at most the logical CPUs of the
+            // process - 4 (the caller of the graph waits on the device, the server and the drafter keep a few) and
+            // LLAMA_MOE_SINGLE_THREADS_MAX (16); only where that is more than the decode threads - 1. Elsewhere the OpenMP region and
+            // the team size of before.
             // Colab L4 (6 decode threads, 12 vCPUs, LFM2.5 4 GB, k19l4b_l4): 5 -> 8 threads, chat decode +8.9% (36.3-36.9 vs 33.6-35.4
             // tok/s), 2k within the spread; a team of 11 (every vCPU but the caller's) was bimodal (27.6-38.5) and slower on median.
-            // The team size does not change a result (each row is computed once with the same kernel) and the hybrid fetch share is set
-            // from the decode threads, so the text is the same (md5 equal in every launch).
+            // Colab G4 q4x 12 GB (CPU-miss rule, not hybrid): the team on every placement cost 0.8% (p1103_g4l4b), so it stays off there.
+            // The team and its size do not change a result (each row is computed once with the same kernel) and the hybrid fetch share
+            // is set from the decode threads, so the text is the same (md5 equal in every launch).
             h.team_stop = (void (*)(void)) ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_host_team_stop");
             auto team_on = (bool (*)(void)) ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_host_team_on");
             const char * ew = getenv("LLAMA_MOE_SINGLE_THREADS_WIDE");
-            if ((e == nullptr || atoi(e) <= 0) && (ew == nullptr || atoi(ew) != 0) && team_on != nullptr && team_on()) {
+            const int wide_mode = ew != nullptr ? atoi(ew) : 1;
+            if ((e == nullptr || atoi(e) <= 0) && wide_mode != 0 && (wide_mode == 2 || hybrid) && team_on != nullptr && team_on()) {
                 const char * em = getenv("LLAMA_MOE_SINGLE_THREADS_MAX");
                 const int wmax = em != nullptr && atoi(em) > 0 ? atoi(em) : 16;
                 const int wide = std::min({ single_threads + std::max(1, single_threads/3), llama_moe_n_cpus() - 4, wmax });
-                h.threads = std::max(h.threads, wide);
+                if (wide > h.threads) {
+                    h.threads = wide;
+                    h.team    = true;
+                }
             }
             if (set_n != nullptr) {
                 set_n(h.cpu.get(), h.threads);
             }
             const char * ef = getenv("LLAMA_MOE_SINGLE_FUSED");
             if (ef == nullptr || atoi(ef) != 0) {
-                h.fused       = (decltype(h.fused))       ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_host_ffn");
+                h.fused       = (decltype(h.fused))       ggml_backend_reg_get_proc_address(creg, h.team ? "ggml_cpu_moe_host_ffn_team" : "ggml_cpu_moe_host_ffn");
                 h.fused_wsize = (decltype(h.fused_wsize)) ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_host_ffn_wsize");
                 if (h.fused == nullptr || h.fused_wsize == nullptr) {
                     h.fused = nullptr;
@@ -2262,7 +2271,8 @@ struct llama_moe_cache::impl {
             h.thr = std::thread(single_service);
         }
         LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses on (LLAMA_MOE_SINGLE): batches of up to %d tokens, %d host threads "
-            "(one host thread for every cache of the process), slow-batch warning above %d ms (merges never time out), %s\n", tag, single_max_tok, h.threads,
+            "(one host thread for every cache of the process%s), slow-batch warning above %d ms (merges never time out), %s\n", tag, single_max_tok, h.threads,
+            h.team ? "; the CPU backend's host team, the host experts are the critical path: LLAMA_MOE_SINGLE_THREADS_WIDE=0 off" : "",
             single_timeout_ms, h.fused != nullptr ? "one-region host experts (LLAMA_MOE_SINGLE_FUSED=0: the graph)" : "host experts by graph");
         return true;
     }

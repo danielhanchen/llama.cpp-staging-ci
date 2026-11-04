@@ -1788,7 +1788,7 @@ static void ggml_moe_host_ffn_thread(struct ggml_moe_host_job * j, int ith) {
     }
 }
 
-// ---- k19-l4b: the host team of ggml_cpu_moe_host_ffn (GGML_MOE_HOST_TEAM, default on; 0 = the OpenMP region of k18) ------------------
+// ---- k19-l4b: the host team of ggml_cpu_moe_host_ffn_team (GGML_MOE_HOST_TEAM, default on; 0 = the OpenMP region of k18) -------------
 // Colab L4 (12 vCPUs, 6 cores) LFM2.5 4 GB: the host experts take most of a decode step (5 threads, 661 us per batch), PolyStrata runs them
 // on 12 threads. A larger OpenMP team does not get there: libgomp counts every OpenMP thread of the process (the decode team as well) and,
 // with more of them than CPUs, stops spinning between regions, so each batch waits for its threads to wake up (k16_l4g: an 11-thread team
@@ -1974,9 +1974,9 @@ static bool ggml_moe_team_run(struct ggml_moe_host_job * j, int n_threads) {
     return true;
 }
 
-bool ggml_cpu_moe_host_ffn(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
-        const float * x, const int32_t * ids, float * out, int n_used, int n_tokens, int n_threads, void * wbuf, size_t wsize) {
-    const bool team = ggml_moe_host_team_mode() == 1 && n_threads <= GGML_MOE_TEAM_MAX;
+static bool ggml_moe_host_ffn_impl(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
+        const float * x, const int32_t * ids, float * out, int n_used, int n_tokens, int n_threads, void * wbuf, size_t wsize, bool use_team) {
+    const bool team = use_team && n_threads <= GGML_MOE_TEAM_MAX;
 #if !defined(GGML_USE_OPENMP)
     if (!team) {
         GGML_UNUSED(up); GGML_UNUSED(gate); GGML_UNUSED(down); GGML_UNUSED(x); GGML_UNUSED(ids); GGML_UNUSED(out);
@@ -2125,6 +2125,18 @@ bool ggml_cpu_moe_host_ffn(const struct ggml_tensor * up, const struct ggml_tens
 #else
     return false;
 #endif
+}
+
+// the OpenMP region (k18)
+bool ggml_cpu_moe_host_ffn(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
+        const float * x, const int32_t * ids, float * out, int n_used, int n_tokens, int n_threads, void * wbuf, size_t wsize) {
+    return ggml_moe_host_ffn_impl(up, gate, down, x, ids, out, n_used, n_tokens, n_threads, wbuf, wsize, false);
+}
+
+// k19-l4b: the host team (GGML_MOE_HOST_TEAM=0: the OpenMP region)
+bool ggml_cpu_moe_host_ffn_team(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
+        const float * x, const int32_t * ids, float * out, int n_used, int n_tokens, int n_threads, void * wbuf, size_t wsize) {
+    return ggml_moe_host_ffn_impl(up, gate, down, x, ids, out, n_used, n_tokens, n_threads, wbuf, wsize, ggml_moe_host_team_mode() == 1);
 }
 
 static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
