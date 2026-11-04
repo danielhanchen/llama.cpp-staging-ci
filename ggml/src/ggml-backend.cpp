@@ -5658,6 +5658,14 @@ ggml_backend_sched_plan_t ggml_backend_sched_plan_save(ggml_backend_sched_t sche
         if (sched->pf[b].n_lent_bufs > 0 || sched->pf[b].lent > 0) {
             why = "lent prefetch buffers";
         }
+        // -sm tensor: a meta buffer maps each allocated tensor to its per-device tensors when the graph is allocated (the two compute
+        // maps rotate with the allocations), so a restored plan whose tensors were allocated again since read the maps of another
+        // graph: the MTP drafter's 1-output draft step wrote its out_ids through the 0-output catch-up batch's map (tensor write out
+        // of bounds). Such a graph is allocated again instead
+        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
+        if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META) {
+            why = "meta backend";
+        }
     }
     if (why != nullptr) {
         if (ggml_backend_sched_plan_debug()) {
