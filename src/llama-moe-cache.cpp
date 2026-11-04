@@ -2194,21 +2194,14 @@ struct llama_moe_cache::impl {
         return e == nullptr || atoi(e) != 0;
     }();
 
-    // k17-models LLAMA_MOE_SINGLE_MAX_TOKENS (1..GGML_MOE_MAILBOX_MAX_TOKENS, default 4 = k15; 8 = opt-in, see k19-graph below): the largest batch that
+    // k17-models LLAMA_MOE_SINGLE_MAX_TOKENS (1..GGML_MOE_MAILBOX_MAX_TOKENS, default 4 = k15; 8 = opt-in): the largest batch that
     // publishes to the mailbox. Above it a batch takes the graph split per MoE layer (device sync, host threads, the CUDA graph cut). The
     // host plans are the split's ops on the same rows, so 5-8 row batches on the mailbox are exact (cloud gate, plans/k17_models.md 4a:
     // md5 equal, 4.7x the host batches). Opt-in because it does not pay: Colab L4 (6 host threads) LFM2.5 8 GB with the same drafts in
     // both arms, 2k 84.9 vs 90.2 tok/s, 8k (LONG_CM=3) 74.5 vs 78.1; G4 Flint long48 within 1% (plans/k17_models.md 4c / 4d)
-    // k19-graph: unset = 8 on a host of at least LLAMA_MOE_SINGLE_MAX_TOKENS_CPUS (24) logical CPUs, else 4. A verify window of 5-8
-    // rows (DFlash2 at 6 drafts, MTP deeper than 3) at the expert-cache tiers otherwise leaves the single graph: G4 Flash-Next 16 GB
-    // DFlash2 n6 ran 87 graph launches and 51 device syncs per pass with 15 ms of GPU idle (plans/prof2_1103.md section 8). The 6-thread
-    // Colab L4 is where 8 lost (LFM2.5 n-gram windows, above); G4 Flint long48 was within 1%. LLAMA_MOE_SINGLE_MAX_TOKENS=4: as before
     const int single_max_tok = [] {
         const char * e = getenv("LLAMA_MOE_SINGLE_MAX_TOKENS");
-        const char * ec = getenv("LLAMA_MOE_SINGLE_MAX_TOKENS_CPUS");
-        const int min_cpus = ec != nullptr ? atoi(ec) : 24;
-        const int def = llama_moe_n_cpus() >= min_cpus ? 8 : 4;
-        return std::max(1, std::min<int>(GGML_MOE_MAILBOX_MAX_TOKENS, e != nullptr ? atoi(e) : def));
+        return std::max(1, std::min<int>(GGML_MOE_MAILBOX_MAX_TOKENS, e != nullptr ? atoi(e) : 4));
     }();
 
     bool single_usable(int64_t n_tokens) const {
