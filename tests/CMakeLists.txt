@@ -391,6 +391,8 @@ llama_build_and_test(test-gdn-tiled-exact.cpp LINK ggml)
 llama_build_and_test(test-meta-k15-ops.cpp LINK ggml)
 # k19-fuse prompt fusions of qwen4exp (PLE conv taps, conv-input concat, QSA mask) vs the plain graphs, byte for byte (F4 also on the CPU)
 llama_build_and_test(test-k19-fuse-exact.cpp LINK ggml)
+# k19-moebw routed-expert mat-vec vs the kernels it replaces, byte for byte (SKIP without a CUDA device)
+llama_build_and_test(test-moe-bw-exact.cpp LINK ggml)
 llama_build_and_test(test-spec-type-gguf.cpp)
 # the build identity of the MoE CPU-miss calibration key: unknown-commit builds differ by content, a relaunch keeps its identity
 llama_build_and_test(test-cal-build-id.cpp LINK ggml)
