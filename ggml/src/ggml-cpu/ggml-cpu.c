@@ -1631,9 +1631,359 @@ size_t ggml_cpu_moe_host_ffn_wsize(const struct ggml_tensor * up, const struct g
     return (size_t) (2*rows + ggml_moe_host_per_thread(up, gate, down, n_tokens)*n_threads + 64);
 }
 
-bool ggml_cpu_moe_host_ffn(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
-        const float * x, const int32_t * ids, float * out, int n_used, int n_tokens, int n_threads, void * wbuf, size_t wsize) {
-#if defined(GGML_USE_OPENMP)
+// k19-l4b: the shared state of one batch, read by every thread that computes it (the OpenMP region or the host team below)
+struct ggml_moe_host_job {
+    const struct ggml_tensor * up;
+    const struct ggml_tensor * gate;
+    const struct ggml_tensor * down;
+    const float * x;
+    float       * out;
+    int     n_tokens;
+    int     n_pair;
+    int     n_grp;
+    int64_t n_embd;
+    int64_t n_ff;
+    const int32_t * pe;
+    const int32_t * po;
+    const int32_t * pt;
+    const int32_t * gstart;
+    const int32_t * glist;
+    float * ub;
+    float * gb;
+    char  * thr0;
+    int64_t per;
+    size_t  rsu;
+    size_t  rsg;
+    size_t  rsd;
+    ggml_vec_dot_t       dot_u, dot_g, dot_d;
+    ggml_from_float_t    q_u, q_g, q_d;
+    ggml_vec_dot_multi_t vdm_u, vdm_g, vdm_d;
+    // the up / gate rows and the down rows are each cut into n_task ranges of equal weight; a thread takes the next free range until
+    // none is left. With n_task = the threads every thread gets one range when all of them run (the k18 ranges); with more, a thread
+    // that is descheduled holds back less. Each output is computed once with the same kernel whichever thread takes it.
+    int n_task;
+    atomic_int next_gu;
+    atomic_int next_dn;
+    atomic_int done_gu;
+};
+
+static void ggml_moe_host_ffn_thread(struct ggml_moe_host_job * j, int ith) {
+    const int64_t n_embd = j->n_embd;
+    const int64_t n_ff   = j->n_ff;
+    const int     n_grp  = j->n_grp;
+    const int32_t * pe = j->pe; const int32_t * po = j->po; const int32_t * pt = j->pt;
+    const int32_t * gstart = j->gstart; const int32_t * glist = j->glist;
+    char  * xu  = j->thr0 + j->per*ith;
+    char  * xg  = xu + ggml_moe_host_pad((int64_t) j->n_tokens*(int64_t) j->rsu);
+    float * act = (float *) (xg + ggml_moe_host_pad((int64_t) j->n_tokens*(int64_t) j->rsg));
+    char  * qb  = (char *) act + ggml_moe_host_pad(n_ff*(int64_t) sizeof(float));
+    const int64_t qstride = ggml_moe_host_pad((int64_t) j->rsd);
+
+    // 1. the activations of each token quantized for up and gate (whole rows: the graph quantizes block ranges, the same bytes)
+    for (int t = 0; t < j->n_tokens; ++t) {
+        j->q_u(j->x + (int64_t) t*n_embd, xu + (size_t) t*j->rsu, n_embd);
+        j->q_g(j->x + (int64_t) t*n_embd, xg + (size_t) t*j->rsg, n_embd);
+    }
+
+    // 2. up and gate rows: items (group, matrix, row), ranges of equal weight
+    {
+        const int64_t w_all = (int64_t) j->n_pair*2*n_ff;
+        for (int k = atomic_fetch_add_explicit(&j->next_gu, 1, memory_order_relaxed); k < j->n_task;
+                 k = atomic_fetch_add_explicit(&j->next_gu, 1, memory_order_relaxed)) {
+            const int64_t i0 = ggml_moe_host_item_at(gstart, n_grp, 2*n_ff, w_all*k/j->n_task);
+            const int64_t i1 = ggml_moe_host_item_at(gstart, n_grp, 2*n_ff, w_all*(k + 1)/j->n_task);
+            for (int64_t it = i0; it < i1; ++it) {
+                const int     g = (int) (it/(2*n_ff));
+                const int     m = (int) ((it/n_ff) % 2);
+                const int64_t r = it % n_ff;
+                const struct ggml_tensor * wt = m == 0 ? j->up : j->gate;
+                const char * row = (const char *) wt->data + (int64_t) pe[glist[gstart[g]]]*wt->nb[2] + r*wt->nb[1];
+                float      * dst = m == 0 ? j->ub : j->gb;
+                const char * xq  = m == 0 ? xu : xg;
+                const size_t rs  = m == 0 ? j->rsu : j->rsg;
+                const int    nc  = gstart[g + 1] - gstart[g];
+                ggml_vec_dot_multi_t const vdm = m == 0 ? j->vdm_u : j->vdm_g;
+                if (nc >= 2 && vdm != NULL) {
+                    for (int c0 = 0; c0 < nc; c0 += GGML_MOE_HOST_COLS) {
+                        const int ncc = MIN(GGML_MOE_HOST_COLS, nc - c0);
+                        const void * cols[GGML_MOE_HOST_COLS];
+                        float res[GGML_MOE_HOST_COLS];
+                        for (int c = 0; c < ncc; ++c) {
+                            cols[c] = xq + (size_t) pt[glist[gstart[g] + c0 + c]]*rs;
+                        }
+                        vdm((int) n_embd, res, row, cols, ncc);
+                        for (int c = 0; c < ncc; ++c) {
+                            dst[(int64_t) glist[gstart[g] + c0 + c]*n_ff + r] = res[c];
+                        }
+                    }
+                } else {
+                    ggml_vec_dot_t const dot = m == 0 ? j->dot_u : j->dot_g;
+                    for (int c = 0; c < nc; ++c) {
+                        const int p = glist[gstart[g] + c];
+                        dot((int) n_embd, dst + (int64_t) p*n_ff + r, 0, row, 0, xq + (size_t) pt[p]*rs, 0, 1);
+                    }
+                }
+            }
+            atomic_fetch_add_explicit(&j->done_gu, 1, memory_order_acq_rel);
+        }
+    }
+
+    // the one barrier: every up and gate row is written
+    while (atomic_load_explicit(&j->done_gu, memory_order_acquire) < j->n_task) {
+        ggml_thread_cpu_relax();
+    }
+
+    // 3. down rows: items (group, row), ranges of equal weight. The SwiGLU rows of a group's pairs and their quantization are formed by
+    //    every thread whose range touches the group (the graph's swiglu_split row and its down quantization, same bytes), once for
+    //    consecutive ranges of the same group
+    {
+        const int64_t w_all = (int64_t) j->n_pair*n_embd;
+        int have_g  = -1;
+        int have_c0 = -1;
+        for (int k = atomic_fetch_add_explicit(&j->next_dn, 1, memory_order_relaxed); k < j->n_task;
+                 k = atomic_fetch_add_explicit(&j->next_dn, 1, memory_order_relaxed)) {
+            const int64_t i0 = ggml_moe_host_item_at(gstart, n_grp, n_embd, w_all*k/j->n_task);
+            const int64_t i1 = ggml_moe_host_item_at(gstart, n_grp, n_embd, w_all*(k + 1)/j->n_task);
+            int64_t it = i0;
+            while (it < i1) {
+                const int     g    = (int) (it/n_embd);
+                const int64_t r0   = it - (int64_t) g*n_embd;
+                const int64_t r1   = MIN(i1, (int64_t) (g + 1)*n_embd) - (int64_t) g*n_embd;
+                const int     nc   = gstart[g + 1] - gstart[g];
+                const char  * w0   = (const char *) j->down->data + (int64_t) pe[glist[gstart[g]]]*j->down->nb[2];
+                for (int c0 = 0; c0 < nc; c0 += GGML_MOE_HOST_COLS) {
+                    const int ncc = MIN(GGML_MOE_HOST_COLS, nc - c0);
+                    const void * cols[GGML_MOE_HOST_COLS];
+                    const bool form = g != have_g || c0 != have_c0;
+                    for (int c = 0; c < ncc; ++c) {
+                        const int p = glist[gstart[g] + c0 + c];
+                        if (form) {
+                            ggml_vec_swiglu_f32((int) n_ff, act, j->gb + (int64_t) p*n_ff, j->ub + (int64_t) p*n_ff);
+                            j->q_d(act, qb + c*qstride, n_ff);
+                        }
+                        cols[c] = qb + c*qstride;
+                    }
+                    have_g  = g;
+                    have_c0 = c0;
+                    if (ncc >= 2 && j->vdm_d != NULL) {
+                        for (int64_t r = r0; r < r1; ++r) {
+                            float res[GGML_MOE_HOST_COLS];
+                            j->vdm_d((int) n_ff, res, w0 + r*j->down->nb[1], cols, ncc);
+                            for (int c = 0; c < ncc; ++c) {
+                                j->out[(int64_t) po[glist[gstart[g] + c0 + c]]*n_embd + r] = res[c];
+                            }
+                        }
+                    } else {
+                        for (int c = 0; c < ncc; ++c) {
+                            float * o = j->out + (int64_t) po[glist[gstart[g] + c0 + c]]*n_embd;
+                            for (int64_t r = r0; r < r1; ++r) {
+                                j->dot_d((int) n_ff, o + r, 0, w0 + r*j->down->nb[1], 0, cols[c], 0, 1);
+                            }
+                        }
+                    }
+                }
+                it = (int64_t) g*n_embd + r1;
+            }
+        }
+    }
+}
+
+// ---- k19-l4b: the host team of ggml_cpu_moe_host_ffn_team (GGML_MOE_HOST_TEAM, default on; 0 = the OpenMP region of k18) -------------
+// Colab L4 (12 vCPUs, 6 cores) LFM2.5 4 GB: the host experts take most of a decode step (5 threads, 661 us per batch), PolyStrata runs them
+// on 12 threads. A larger OpenMP team does not get there: libgomp counts every OpenMP thread of the process (the decode team as well) and,
+// with more of them than CPUs, stops spinning between regions, so each batch waits for its threads to wake up (k16_l4g: an 11-thread team
+// lost 9-34%, 2.7-4.9 cores busy). These threads are the batch's own: the caller is thread 0, the others spin on a counter between
+// batches and sleep after GGML_MOE_HOST_TEAM_SPIN_US (2000) without one. Up to GGML_MOE_TEAM_MAX threads; one batch at a time.
+#define GGML_MOE_TEAM_MAX 64
+
+struct ggml_moe_team {
+    ggml_mutex_t call;         // one batch at a time
+    ggml_mutex_t mtx;          // with cv: the sleep of an idle worker
+    ggml_cond_t  cv;
+    ggml_thread_t thr[GGML_MOE_TEAM_MAX];
+    int           start_gen[GGML_MOE_TEAM_MAX];
+    int           n;           // workers started (threads 1..n)
+    struct ggml_moe_host_job * job;
+    int                        job_n;   // threads of the batch, the caller included
+    atomic_int  GGML_CACHE_ALIGN gen;   // one count per batch
+    atomic_int  GGML_CACHE_ALIGN left;  // workers that have not finished (or, beyond the batch's threads, not seen) the batch
+    atomic_int  sleepers;
+    atomic_bool stop;
+};
+
+static struct ggml_moe_team ggml_moe_team_g;
+static atomic_int ggml_moe_team_init = 0; // 0: not yet, 1: ready
+
+static int ggml_moe_host_team_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char * e = getenv("GGML_MOE_HOST_TEAM");
+        mode = e == NULL || atoi(e) != 0 ? 1 : 0;
+    }
+    return mode;
+}
+
+static int64_t ggml_moe_host_team_spin_us(void) {
+    static int64_t us = -1;
+    if (us < 0) {
+        const char * e = getenv("GGML_MOE_HOST_TEAM_SPIN_US");
+        us = e != NULL && atoll(e) >= 0 ? atoll(e) : 2000;
+    }
+    return us;
+}
+
+static int ggml_moe_host_team_tasks(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char * e = getenv("GGML_MOE_HOST_TEAM_TASKS");
+        n = e != NULL && atoi(e) > 0 ? MIN(atoi(e), 64) : 4;
+    }
+    return n;
+}
+
+static thread_ret_t ggml_moe_team_worker(void * arg) {
+    struct ggml_moe_team * t = &ggml_moe_team_g;
+    const int i = (int) (intptr_t) arg;
+    int seen = t->start_gen[i];
+    int64_t last = ggml_time_us();
+    int spins = 0;
+    for (;;) {
+        const int g = atomic_load_explicit(&t->gen, memory_order_acquire);
+        if (atomic_load_explicit(&t->stop, memory_order_acquire)) {
+            break;
+        }
+        if (g != seen) {
+            seen = g;
+            if (i < t->job_n) {
+                ggml_moe_host_ffn_thread(t->job, i);
+            }
+            // every worker counts, the ones the batch does not use too: the poster writes the next batch only after all of them
+            // have read this one
+            atomic_fetch_add_explicit(&t->left, -1, memory_order_acq_rel);
+            last = ggml_time_us();
+            spins = 0;
+            continue;
+        }
+        if (++spins < 256) {
+            ggml_thread_cpu_relax();
+            continue;
+        }
+        spins = 0;
+        if (ggml_time_us() - last < ggml_moe_host_team_spin_us()) {
+            continue;
+        }
+        // no batch for a while: sleep until the next one (the poster wakes the sleepers after it counts gen up; the shared lock as
+        // in the threadpool's wait, which is what ggml_cond_wait takes on Windows)
+        ggml_mutex_lock_shared(&t->mtx);
+        atomic_fetch_add(&t->sleepers, 1);
+        while (atomic_load(&t->gen) == seen && !atomic_load(&t->stop)) {
+            ggml_cond_wait(&t->cv, &t->mtx);
+        }
+        atomic_fetch_add(&t->sleepers, -1);
+        ggml_mutex_unlock_shared(&t->mtx);
+        last = ggml_time_us();
+    }
+    return (thread_ret_t) 0;
+}
+
+static void ggml_moe_team_ensure_init(void) {
+    if (atomic_load_explicit(&ggml_moe_team_init, memory_order_acquire) == 1) {
+        return;
+    }
+    ggml_critical_section_start();
+    if (atomic_load_explicit(&ggml_moe_team_init, memory_order_relaxed) == 0) {
+        struct ggml_moe_team * t = &ggml_moe_team_g;
+        ggml_mutex_init(&t->call);
+        ggml_mutex_init(&t->mtx);
+        ggml_cond_init(&t->cv);
+        t->n = 0;
+        t->job = NULL;
+        t->job_n = 0;
+        atomic_store(&t->gen, 0);
+        atomic_store(&t->left, 0);
+        atomic_store(&t->sleepers, 0);
+        atomic_store(&t->stop, false);
+        atomic_store_explicit(&ggml_moe_team_init, 1, memory_order_release);
+    }
+    ggml_critical_section_end();
+}
+
+// stops and joins the workers (the next batch starts them again)
+void ggml_cpu_moe_host_team_stop(void) {
+    if (atomic_load_explicit(&ggml_moe_team_init, memory_order_acquire) != 1) {
+        return;
+    }
+    struct ggml_moe_team * t = &ggml_moe_team_g;
+    ggml_mutex_lock(&t->call);
+    if (t->n > 0) {
+        ggml_mutex_lock(&t->mtx);
+        atomic_store(&t->stop, true);
+        ggml_cond_broadcast(&t->cv);
+        ggml_mutex_unlock(&t->mtx);
+        for (int i = 1; i <= t->n; ++i) {
+            ggml_thread_join(t->thr[i], NULL);
+        }
+        t->n = 0;
+        atomic_store(&t->stop, false);
+    }
+    ggml_mutex_unlock(&t->call);
+}
+
+bool ggml_cpu_moe_host_team_on(void) {
+    return ggml_moe_host_team_mode() == 1;
+}
+
+#if defined(__GNUC__) && !defined(_WIN32)
+// the workers run code of this library: they are joined before it is unloaded (GGML_BACKEND_DL)
+__attribute__((destructor)) static void ggml_moe_team_fini(void) {
+    ggml_cpu_moe_host_team_stop();
+}
+#endif
+
+// runs the batch on n_threads threads of the team (the caller is thread 0); false if the team could not start them
+static bool ggml_moe_team_run(struct ggml_moe_host_job * j, int n_threads) {
+    ggml_moe_team_ensure_init();
+    struct ggml_moe_team * t = &ggml_moe_team_g;
+    ggml_mutex_lock(&t->call);
+    while (t->n < n_threads - 1) {
+        const int i = t->n + 1;
+        t->start_gen[i] = atomic_load(&t->gen);
+        if (ggml_thread_create(&t->thr[i], NULL, ggml_moe_team_worker, (void *) (intptr_t) i) != 0) {
+            break;
+        }
+        t->n = i;
+    }
+    if (t->n < n_threads - 1) {
+        ggml_mutex_unlock(&t->call);
+        return false;
+    }
+    t->job   = j;
+    t->job_n = n_threads;
+    atomic_store_explicit(&t->left, t->n, memory_order_relaxed);
+    atomic_fetch_add(&t->gen, 1);
+    if (atomic_load(&t->sleepers) > 0) {
+        ggml_mutex_lock(&t->mtx);
+        ggml_cond_broadcast(&t->cv);
+        ggml_mutex_unlock(&t->mtx);
+    }
+    ggml_moe_host_ffn_thread(j, 0);
+    while (atomic_load_explicit(&t->left, memory_order_acquire) != 0) {
+        ggml_thread_cpu_relax();
+    }
+    ggml_mutex_unlock(&t->call);
+    return true;
+}
+
+static bool ggml_moe_host_ffn_impl(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
+        const float * x, const int32_t * ids, float * out, int n_used, int n_tokens, int n_threads, void * wbuf, size_t wsize, bool use_team) {
+    const bool team = use_team && n_threads <= GGML_MOE_TEAM_MAX;
+#if !defined(GGML_USE_OPENMP)
+    if (!team) {
+        GGML_UNUSED(up); GGML_UNUSED(gate); GGML_UNUSED(down); GGML_UNUSED(x); GGML_UNUSED(ids); GGML_UNUSED(out);
+        GGML_UNUSED(n_used); GGML_UNUSED(n_tokens); GGML_UNUSED(n_threads); GGML_UNUSED(wbuf); GGML_UNUSED(wsize);
+        return false;
+    }
+#endif
     if (up == NULL || gate == NULL || down == NULL || x == NULL || ids == NULL || out == NULL || wbuf == NULL || n_used <= 0 ||
             n_tokens <= 0 || n_threads <= 0 || (int64_t) n_used*n_tokens > GGML_MOE_HOST_MAX_PAIRS) {
         return false;
@@ -1713,148 +2063,80 @@ bool ggml_cpu_moe_host_ffn(const struct ggml_tensor * up, const struct ggml_tens
         glist[gstart[pg[p]] + gcnt[pg[p]]++] = p;
     }
 
+    struct ggml_moe_host_job job;
+    job.up = up; job.gate = gate; job.down = down; job.x = x; job.out = out;
+    job.n_tokens = n_tokens; job.n_pair = n_pair; job.n_grp = n_grp; job.n_embd = n_embd; job.n_ff = n_ff;
+    job.pe = pe; job.po = po; job.pt = pt; job.gstart = gstart; job.glist = glist;
     const enum ggml_type vu = type_traits_cpu[up->type].vec_dot_type;
     const enum ggml_type vg = type_traits_cpu[gate->type].vec_dot_type;
     const enum ggml_type vd = type_traits_cpu[down->type].vec_dot_type;
-    const size_t rsu = ggml_row_size(vu, n_embd);
-    const size_t rsg = ggml_row_size(vg, n_embd);
-    const size_t rsd = ggml_row_size(vd, n_ff);
+    job.rsu = ggml_row_size(vu, n_embd);
+    job.rsg = ggml_row_size(vg, n_embd);
+    job.rsd = ggml_row_size(vd, n_ff);
     const int64_t rows_b = ggml_moe_host_pad((int64_t) n_used*n_tokens*n_ff*(int64_t) sizeof(float));
-    const int64_t per    = ggml_moe_host_per_thread(up, gate, down, n_tokens);
-    char  * base = (char *) GGML_PAD((uintptr_t) wbuf, 64);
-    float * ub   = (float *) base;
-    float * gb   = (float *) (base + rows_b);
-    char  * thr0 = base + 2*rows_b;
-
-    ggml_vec_dot_t const dot_u = type_traits_cpu[up->type].vec_dot;
-    ggml_vec_dot_t const dot_g = type_traits_cpu[gate->type].vec_dot;
-    ggml_vec_dot_t const dot_d = type_traits_cpu[down->type].vec_dot;
-    ggml_from_float_t const q_u = type_traits_cpu[vu].from_float;
-    ggml_from_float_t const q_g = type_traits_cpu[vg].from_float;
-    ggml_from_float_t const q_d = type_traits_cpu[vd].from_float;
+    job.per = ggml_moe_host_per_thread(up, gate, down, n_tokens);
+    char * base = (char *) GGML_PAD((uintptr_t) wbuf, 64);
+    job.ub   = (float *) base;
+    job.gb   = (float *) (base + rows_b);
+    job.thr0 = base + 2*rows_b;
+    job.dot_u = type_traits_cpu[up->type].vec_dot;
+    job.dot_g = type_traits_cpu[gate->type].vec_dot;
+    job.dot_d = type_traits_cpu[down->type].vec_dot;
+    job.q_u = type_traits_cpu[vu].from_float;
+    job.q_g = type_traits_cpu[vg].from_float;
+    job.q_d = type_traits_cpu[vd].from_float;
 #if defined(__AVX2__)
-    ggml_vec_dot_multi_t const vdm_u = ggml_cpu_vec_dot_multi(up->type);
-    ggml_vec_dot_multi_t const vdm_g = ggml_cpu_vec_dot_multi(gate->type);
-    ggml_vec_dot_multi_t const vdm_d = ggml_cpu_vec_dot_multi(down->type);
+    job.vdm_u = ggml_cpu_vec_dot_multi(up->type);
+    job.vdm_g = ggml_cpu_vec_dot_multi(gate->type);
+    job.vdm_d = ggml_cpu_vec_dot_multi(down->type);
 #else
-    ggml_vec_dot_multi_t const vdm_u = NULL;
-    ggml_vec_dot_multi_t const vdm_g = NULL;
-    ggml_vec_dot_multi_t const vdm_d = NULL;
+    job.vdm_u = NULL;
+    job.vdm_g = NULL;
+    job.vdm_d = NULL;
 #endif
+    atomic_store_explicit(&job.next_gu, 0, memory_order_relaxed);
+    atomic_store_explicit(&job.next_dn, 0, memory_order_relaxed);
+    atomic_store_explicit(&job.done_gu, 0, memory_order_relaxed);
 
-    atomic_int arrived;
-    atomic_store_explicit(&arrived, 0, memory_order_relaxed);
-
+    if (team) {
+        job.n_task = n_threads == 1 ? 1 : n_threads*ggml_moe_host_team_tasks();
+        if (n_threads == 1) {
+            ggml_moe_host_ffn_thread(&job, 0);
+            return true;
+        }
+        if (ggml_moe_team_run(&job, n_threads)) {
+            return true;
+        }
+#if !defined(GGML_USE_OPENMP)
+        return false;
+#endif
+        atomic_store_explicit(&job.next_gu, 0, memory_order_relaxed);
+        atomic_store_explicit(&job.next_dn, 0, memory_order_relaxed);
+        atomic_store_explicit(&job.done_gu, 0, memory_order_relaxed);
+    }
+#if defined(GGML_USE_OPENMP)
+    // k18 ranges: one per thread
+    job.n_task = n_threads;
     #pragma omp parallel num_threads(n_threads)
     {
-        const int ith = omp_get_thread_num();
-        const int nth = omp_get_num_threads();
-        char  * xu  = thr0 + per*ith;
-        char  * xg  = xu + ggml_moe_host_pad((int64_t) n_tokens*(int64_t) rsu);
-        float * act = (float *) (xg + ggml_moe_host_pad((int64_t) n_tokens*(int64_t) rsg));
-        char  * qb  = (char *) act + ggml_moe_host_pad(n_ff*(int64_t) sizeof(float));
-        const int64_t qstride = ggml_moe_host_pad((int64_t) rsd);
-
-        // 1. the activations of each token quantized for up and gate (whole rows: the graph quantizes block ranges, the same bytes)
-        for (int t = 0; t < n_tokens; ++t) {
-            q_u(x + (int64_t) t*n_embd, xu + (size_t) t*rsu, n_embd);
-            q_g(x + (int64_t) t*n_embd, xg + (size_t) t*rsg, n_embd);
-        }
-
-        // 2. up and gate rows: items (group, matrix, row) in contiguous ranges per thread
-        {
-            const int64_t w_all = (int64_t) n_pair*2*n_ff;
-            const int64_t i0 = ggml_moe_host_item_at(gstart, n_grp, 2*n_ff, w_all*ith/nth);
-            const int64_t i1 = ggml_moe_host_item_at(gstart, n_grp, 2*n_ff, w_all*(ith + 1)/nth);
-            for (int64_t it = i0; it < i1; ++it) {
-                const int     g = (int) (it/(2*n_ff));
-                const int     m = (int) ((it/n_ff) % 2);
-                const int64_t r = it % n_ff;
-                const struct ggml_tensor * wt = m == 0 ? up : gate;
-                const char * row = (const char *) wt->data + (int64_t) pe[glist[gstart[g]]]*wt->nb[2] + r*wt->nb[1];
-                float      * dst = m == 0 ? ub : gb;
-                const char * xq  = m == 0 ? xu : xg;
-                const size_t rs  = m == 0 ? rsu : rsg;
-                const int    nc  = gstart[g + 1] - gstart[g];
-                ggml_vec_dot_multi_t const vdm = m == 0 ? vdm_u : vdm_g;
-                if (nc >= 2 && vdm != NULL) {
-                    for (int c0 = 0; c0 < nc; c0 += GGML_MOE_HOST_COLS) {
-                        const int ncc = MIN(GGML_MOE_HOST_COLS, nc - c0);
-                        const void * cols[GGML_MOE_HOST_COLS];
-                        float res[GGML_MOE_HOST_COLS];
-                        for (int c = 0; c < ncc; ++c) {
-                            cols[c] = xq + (size_t) pt[glist[gstart[g] + c0 + c]]*rs;
-                        }
-                        vdm((int) n_embd, res, row, cols, ncc);
-                        for (int c = 0; c < ncc; ++c) {
-                            dst[(int64_t) glist[gstart[g] + c0 + c]*n_ff + r] = res[c];
-                        }
-                    }
-                } else {
-                    ggml_vec_dot_t const dot = m == 0 ? dot_u : dot_g;
-                    for (int c = 0; c < nc; ++c) {
-                        const int p = glist[gstart[g] + c];
-                        dot((int) n_embd, dst + (int64_t) p*n_ff + r, 0, row, 0, xq + (size_t) pt[p]*rs, 0, 1);
-                    }
-                }
-            }
-        }
-
-        // the one barrier: every up and gate row is written
-        atomic_fetch_add_explicit(&arrived, 1, memory_order_acq_rel);
-        while (atomic_load_explicit(&arrived, memory_order_acquire) < nth) {
-            ggml_thread_cpu_relax();
-        }
-
-        // 3. down rows: items (group, row) in contiguous ranges per thread. The SwiGLU rows of a group's pairs and their quantization are
-        //    formed by every thread whose range touches the group (the graph's swiglu_split row and its down quantization, same bytes)
-        {
-            const int64_t w_all = (int64_t) n_pair*n_embd;
-            const int64_t i0 = ggml_moe_host_item_at(gstart, n_grp, n_embd, w_all*ith/nth);
-            const int64_t i1 = ggml_moe_host_item_at(gstart, n_grp, n_embd, w_all*(ith + 1)/nth);
-            int64_t it = i0;
-            while (it < i1) {
-                const int     g    = (int) (it/n_embd);
-                const int64_t r0   = it - (int64_t) g*n_embd;
-                const int64_t r1   = MIN(i1, (int64_t) (g + 1)*n_embd) - (int64_t) g*n_embd;
-                const int     nc   = gstart[g + 1] - gstart[g];
-                const char  * w0   = (const char *) down->data + (int64_t) pe[glist[gstart[g]]]*down->nb[2];
-                for (int c0 = 0; c0 < nc; c0 += GGML_MOE_HOST_COLS) {
-                    const int ncc = MIN(GGML_MOE_HOST_COLS, nc - c0);
-                    const void * cols[GGML_MOE_HOST_COLS];
-                    for (int c = 0; c < ncc; ++c) {
-                        const int p = glist[gstart[g] + c0 + c];
-                        ggml_vec_swiglu_f32((int) n_ff, act, gb + (int64_t) p*n_ff, ub + (int64_t) p*n_ff);
-                        q_d(act, qb + c*qstride, n_ff);
-                        cols[c] = qb + c*qstride;
-                    }
-                    if (ncc >= 2 && vdm_d != NULL) {
-                        for (int64_t r = r0; r < r1; ++r) {
-                            float res[GGML_MOE_HOST_COLS];
-                            vdm_d((int) n_ff, res, w0 + r*down->nb[1], cols, ncc);
-                            for (int c = 0; c < ncc; ++c) {
-                                out[(int64_t) po[glist[gstart[g] + c0 + c]]*n_embd + r] = res[c];
-                            }
-                        }
-                    } else {
-                        for (int c = 0; c < ncc; ++c) {
-                            float * o = out + (int64_t) po[glist[gstart[g] + c0 + c]]*n_embd;
-                            for (int64_t r = r0; r < r1; ++r) {
-                                dot_d((int) n_ff, o + r, 0, w0 + r*down->nb[1], 0, cols[c], 0, 1);
-                            }
-                        }
-                    }
-                }
-                it = (int64_t) g*n_embd + r1;
-            }
-        }
+        ggml_moe_host_ffn_thread(&job, omp_get_thread_num());
     }
     return true;
 #else
-    GGML_UNUSED(up); GGML_UNUSED(gate); GGML_UNUSED(down); GGML_UNUSED(x); GGML_UNUSED(ids); GGML_UNUSED(out);
-    GGML_UNUSED(n_used); GGML_UNUSED(n_tokens); GGML_UNUSED(n_threads); GGML_UNUSED(wbuf); GGML_UNUSED(wsize);
     return false;
 #endif
+}
+
+// the OpenMP region (k18)
+bool ggml_cpu_moe_host_ffn(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
+        const float * x, const int32_t * ids, float * out, int n_used, int n_tokens, int n_threads, void * wbuf, size_t wsize) {
+    return ggml_moe_host_ffn_impl(up, gate, down, x, ids, out, n_used, n_tokens, n_threads, wbuf, wsize, false);
+}
+
+// k19-l4b: the host team (GGML_MOE_HOST_TEAM=0: the OpenMP region)
+bool ggml_cpu_moe_host_ffn_team(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
+        const float * x, const int32_t * ids, float * out, int n_used, int n_tokens, int n_threads, void * wbuf, size_t wsize) {
+    return ggml_moe_host_ffn_impl(up, gate, down, x, ids, out, n_used, n_tokens, n_threads, wbuf, wsize, ggml_moe_host_team_mode() == 1);
 }
 
 static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {

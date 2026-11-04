@@ -700,6 +700,15 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_cpu_moe_host_ffn_wsize") == 0) {
         return (void *)ggml_cpu_moe_host_ffn_wsize;
     }
+    if (strcmp(name, "ggml_cpu_moe_host_ffn_team") == 0) {
+        return (void *)ggml_cpu_moe_host_ffn_team;
+    }
+    if (strcmp(name, "ggml_cpu_moe_host_team_on") == 0) {
+        return (void *)ggml_cpu_moe_host_team_on;
+    }
+    if (strcmp(name, "ggml_cpu_moe_host_team_stop") == 0) {
+        return (void *)ggml_cpu_moe_host_team_stop;
+    }
 
     // threadpool - TODO:  move to ggml-base
     if (strcmp(name, "ggml_threadpool_new") == 0) {
