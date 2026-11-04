@@ -38,9 +38,12 @@
 
 static int n_bw_logs = 0;
 
+// MOE_BW_LOG_MATCH=s: count only the launch lines that contain s (k19-moegrp: "vl8,4" = mul_mat_vec_q_moe_vl<8 threads, 4 entries>)
+static const char * log_match = nullptr;
+
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
     if (strstr(text, "k19-moebw:") != nullptr) {
-        n_bw_logs++;
+        n_bw_logs += log_match == nullptr || strstr(text, log_match) != nullptr;
         return;
     }
     if (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN) {
@@ -494,6 +497,7 @@ static std::vector<uint8_t> read_file(const std::string & path) {
 }
 
 int main(int argc, char ** argv) {
+    log_match = getenv("MOE_BW_LOG_MATCH");
     ggml_log_set(log_cb, nullptr);
     ggml_backend_load_all();
     ggml_backend_dev_t dev = nullptr;
@@ -533,12 +537,12 @@ int main(int argc, char ** argv) {
     // neg: a negative control, the two children must differ (GGML_CUDA_MMVQ_MOE_ONE=1 runs one token on the multi-token kernel, whose
     // lane map differs from the single-token launch's: another K split, other float sums). logs: the head child must log unrolled
     // launches (the base child never does)
-    const std::string off = "GGML_CUDA_MOE_UNROLL=1 GGML_CUDA_MMVQ_MOE_GROUP_UNROLL=1 GGML_CUDA_MOE_RPB=2 GGML_CUDA_MOE_BW=0";
+    const std::string off = "GGML_CUDA_MOE_UNROLL=1 GGML_CUDA_MMVQ_MOE_GROUP_UNROLL=1 GGML_CUDA_MOE_RPB=2 GGML_CUDA_MOE_BW=0 GGML_CUDA_MOE_VL=0";
     struct mode { const char * name; std::string exe_base; std::vector<std::string> env_base, env_head; bool neg = false; int logs = 1; };   // logs: 1 must, 0 must not, -1 any
     const std::string self = argv[0];
     std::vector<mode> modes = {
         { "neg_moe_one", self, { off }, { off, "GGML_CUDA_MMVQ_MOE_ONE=1" }, true, 0 },
-        { "default",     self, { off }, {} },   // the shipped defaults (4 rows per warp for the small-K downs at 2..4 tokens; Ampere and newer: the staged IQ3_S gate / up at 6..8)
+        { "default",     self, { off }, {} },   // the shipped defaults (4 rows per warp for the small-K downs at 2..4 tokens; Ampere and newer: the IQ3_S gate / up with 16 threads per row at 3..8 tokens)
         { "bw1",         self, { off }, { "GGML_CUDA_MOE_BW=1" } },
         { "bw1_r8_w8",   self, { off }, { "GGML_CUDA_MOE_BW=1 GGML_CUDA_MOE_BW_CFG=8,8" } },
         { "bw1_r2_w1",   self, { off }, { "GGML_CUDA_MOE_BW=1 GGML_CUDA_MOE_BW_CFG=2,1" } },
@@ -548,10 +552,18 @@ int main(int argc, char ** argv) {
         { "rpb8_g0",     self, { off, "GGML_CUDA_MMVQ_MOE_GROUP=0" }, { "GGML_CUDA_MOE_RPB=8 GGML_CUDA_MOE_BW=0 GGML_CUDA_MMVQ_MOE_GROUP=0" } },
         { "group0_u4",   self, { off, "GGML_CUDA_MMVQ_MOE_GROUP=0" }, { "GGML_CUDA_MMVQ_MOE_GROUP=0 GGML_CUDA_MOE_UNROLL=4 GGML_CUDA_MOE_BW=0" } },
         { "reassoc0_bw", self, { off, "GGML_CUDA_VERIFY_REASSOC=0" }, { "GGML_CUDA_VERIFY_REASSOC=0 GGML_CUDA_MOE_BW=1" } },
+        // k19-moegrp: c_tpr threads per row, c_g entries per weight decode (GGML_CUDA_MOE_VL=tpr,g; the IQ3_S gate / up), every
+        // width; MOE_BW_LOG_MATCH counts only that kernel's launches
+        { "vl8_4",       self, { off }, { "GGML_CUDA_MOE_VL=8,4 MOE_BW_LOG_MATCH=vl8,4" } },
+        { "vl16_4",      self, { off }, { "GGML_CUDA_MOE_VL=16,4 MOE_BW_LOG_MATCH=vl16,4" } },
+        { "vl16_2",      self, { off }, { "GGML_CUDA_MOE_VL=16,2 MOE_BW_LOG_MATCH=vl16,2" } },
+        { "reassoc0_vl", self, { off, "GGML_CUDA_VERIFY_REASSOC=0" }, { "GGML_CUDA_VERIFY_REASSOC=0 GGML_CUDA_MOE_VL=8,4" }, false, -1 },
     };
     if (const char * b = getenv("MOE_BW_BASE_EXE")) {   // the base build (no such switches there): its default vs this build's
         modes.push_back({ "xbin_default",  b, {}, {}, false, -1 });   // the defaults of this GPU vs the base build
         modes.push_back({ "xbin_bw1",      b, {}, { "GGML_CUDA_MOE_BW=1" } });
+        modes.push_back({ "xbin_vl8_4",    b, {}, { "GGML_CUDA_MOE_VL=8,4 MOE_BW_LOG_MATCH=vl8,4" } });
+        modes.push_back({ "xbin_vl16_2",   b, {}, { "GGML_CUDA_MOE_VL=16,2 MOE_BW_LOG_MATCH=vl16,2" } });
         modes.push_back({ "xbin_off",      b, {}, { off }, false, 0 });
         modes.push_back({ "xbin_reassoc0", b, { "GGML_CUDA_VERIFY_REASSOC=0" }, { "GGML_CUDA_VERIFY_REASSOC=0 GGML_CUDA_MOE_BW=1" } });
         modes.push_back({ "xbin_group0",   b, { "GGML_CUDA_MMVQ_MOE_GROUP=0" }, { "GGML_CUDA_MMVQ_MOE_GROUP=0 GGML_CUDA_MOE_RPB=4 GGML_CUDA_MOE_BW=0" } });
