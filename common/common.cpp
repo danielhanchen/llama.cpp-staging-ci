@@ -2460,6 +2460,44 @@ static size_t common_fit_dflash_estimate(const std::string & path_dft, const lla
         }
         compute += (size_t) (2.0*(double) n_extract*(double) n_embd_tgt*(double) std::min<uint32_t>(n_ubatch_tgt, cp.n_ctx)*sizeof(float));
     }
+    // k19-draftcost: a DFlash2 draft's restricted head (llama_model::draft_head_from_target), rows of the target's lm head in its type:
+    // the LLAMA_DFLASH_DRAFT_VOCAB tokens (default 65536) + the LLAMA_MTP_DRAFT_VOCAB_CTX request rows (4096) + the control tokens
+    // (at most 1024 counted)
+    const char * env_dv = getenv("LLAMA_DFLASH_DRAFT_VOCAB");
+    const int64_t n_dv = env_dv != nullptr ? atoi(env_dv) : 65536;
+    if (ggml_get_tensor(meta, "selector_hidden.weight") != nullptr && n_dv > 0 && !path_tgt.empty()) {
+        const char * env_ctx = getenv("LLAMA_MTP_DRAFT_VOCAB_CTX");
+        const int64_t n_rows = n_dv + std::max(0, env_ctx != nullptr ? atoi(env_ctx) : 4096) + 1024;
+        std::string prefix;
+        int n_split = 1;
+        static const std::regex re_split("-([0-9]{5})-of-([0-9]{5})\\.gguf$");
+        std::smatch m;
+        if (std::regex_search(path_tgt, m, re_split)) {
+            prefix  = path_tgt.substr(0, m.position(0));
+            n_split = std::stoi(m[2].str());
+        }
+        for (int i = 0; i < n_split; ++i) {
+            std::string fname = path_tgt;
+            if (n_split > 1) {
+                std::vector<char> split_path(prefix.size() + 32);
+                llama_split_path(split_path.data(), split_path.size(), prefix.c_str(), i, n_split);
+                fname = split_path.data();
+            }
+            ggml_context * meta_t = nullptr;
+            gguf_init_params gpt = { /*.no_alloc =*/ true, /*.ctx =*/ &meta_t };
+            gguf_context_ptr ctx_t(gguf_init_from_file(fname.c_str(), gpt));
+            if (!ctx_t) {
+                break;
+            }
+            ggml_context_ptr meta_t_ptr(meta_t);
+            if (const ggml_tensor * out = ggml_get_tensor(meta_t, "output.weight")) {
+                if (n_rows*10 <= out->ne[1]*9) {
+                    compute += (size_t) n_rows*ggml_row_size(out->type, out->ne[0]);
+                }
+                break;
+            }
+        }
+    }
     return kv;
 }
 
@@ -2653,8 +2691,19 @@ static bool common_fit_draft_on_cpu(
     if (const char * e = getenv("LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT")) {
         rq_min_tok = std::max(0.0, atof(e));
     }
+    // k19-draftcost (LLAMA_FIT_DRAFT_REQUANT_SHARE, default 0.25; 0 = only the rescue above): a draft admitted at its file's types that
+    // takes more than this share of the cache it would get is requantized the same way when that leaves a larger cache. Strata's MTP
+    // layer holds 871 MiB (Q2_0 experts) against our Q8_0 drafter's 3109 MiB: G4 Qwen3.8-Flash-Next UD-IQ4_XS 16 GB, cache 8271 -> 4576
+    // MiB with the Q8_0 drafter (45% of it). At 32 GB the drafter is 13% of the cache, so it keeps its types. Drafts are verified: only
+    // the acceptance and the cache size move (q3_k experts drafted as well as Q8_0 ones on the same text, plans/k16_draft.md section 6b)
+    double rq_share = 0.25;
+    if (const char * e = getenv("LLAMA_FIT_DRAFT_REQUANT_SHARE")) {
+        rq_share = std::max(0.0, atof(e));
+    }
+    const bool rq_heavy = gpu && rq_share > 0.0 && cache > 0 && take > rq_share*(double) cache;
     double rq_tok = -1.0, rq_dft = 0.0;
-    if (!gpu && !rq_off && !rq_set && rq_min_tok > 0.0 && host > 0.0 && (needs_target == nullptr || !*needs_target)) {
+    bool   rq_taken = false;
+    if ((!gpu || rq_heavy) && !rq_off && !rq_set && rq_min_tok > 0.0 && host > 0.0 && (needs_target == nullptr || !*needs_target)) {
         std::vector<llama_model_kv_override> kvo;
         if (mparams_dft.kv_overrides != nullptr) {
             for (const llama_model_kv_override * p = mparams_dft.kv_overrides; p->key[0] != 0; ++p) {
@@ -2689,8 +2738,9 @@ static bool common_fit_draft_on_cpu(
             const bool   lm_rq   = left_rq < common_lm_hybrid_frac()*host || left_rq > common_moe_hybrid_max_frac()*host;
             const double host_layers = std::min<double>((double) sbt.n_layer, host/((double) sbt.sum*(double) std::max<int64_t>(sbt.n_expert, 1)) + 0.5);
             rq_tok = left_rq/((double) sbt.sum*(double) sbt.n_used*std::max(host_layers, 1.0));
-            if (lm_rq && rq_tok >= rq_min_tok) {
+            if (lm_rq && (rq_heavy || rq_tok >= rq_min_tok)) {
                 gpu = true;
+                rq_taken = true;
                 common_set_env("LLAMA_DRAFT_REQUANT", "q3_k");
                 common_set_env("LLAMA_DRAFT_REQUANT_OUTPUT", "q4_k");
             }
@@ -2709,7 +2759,8 @@ static bool common_fit_draft_on_cpu(
         LOG_INF("%s: draft requantized at load (q3_k FFN / experts, LLAMA_DRAFT_REQUANT_FALLBACK where q3_k blocks do not divide the rows, q4_k output): %.0f MiB of device memory, the cache it leaves holds the experts "
             "of %.1f tokens per layer -> %s (at least %.2f, LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT(_MULTI): verify window cost %.2fx a token, %s %.2f "
             "LLAMA_FIT_DRAFT_REQUANT_MAX_VERIFY_RATIO; LLAMA_DRAFT_REQUANT=off disables)\n", __func__,
-            rq_dft/MiB, rq_tok, gpu ? "draft model on the GPU, requantized" : "refused", rq_min_tok, v_ratio,
+            rq_dft/MiB, rq_tok, rq_taken ? (rq_heavy ? "draft model on the GPU, requantized (it took "
+            "more than LLAMA_FIT_DRAFT_REQUANT_SHARE of the cache)" : "draft model on the GPU, requantized") : (gpu ? "kept at its types" : "refused"), rq_min_tok, v_ratio,
             v_ratio >= 0.0 && v_ratio <= v_max ? "at most" : "over", v_max);
     } else if (!gpu && rq_off) {
         LOG_INF("%s: draft refused at its file's types; requantization off (LLAMA_DRAFT_REQUANT=off)\n", __func__);
