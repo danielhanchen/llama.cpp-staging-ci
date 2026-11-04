@@ -193,6 +193,17 @@ LLAMA_API bool llama_moe_cache_active(const struct llama_context * ctx);
 // calls it when its slots go idle, so the next prompt does not pay for it (no-op otherwise; LLAMA_PP_RERESERVE=0: off)
 LLAMA_API bool llama_prepare_prompt_plan(struct llama_context * ctx);
 
+// k19-rollback: the recurrent state of a sequence copied to host memory and back, on the streams that compute it (no host wait, no
+// per-token rows on the device): llama_rs_snap_save before a drafted verify window, llama_rs_snap_restore when it is not fully accepted
+// (the state and the sequence's recurrent position go back to the copy; remove the positions after it with llama_memory_seq_rm, then
+// decode the accepted tokens again). Supported for a context with a recurrent memory without rollback rows (n_rs_seq 0) and one
+// sequence, not under -sm tensor. False when unsupported or when the restore does not match the copy
+LLAMA_API bool llama_rs_snap_supported(const struct llama_context * ctx);
+// k19-rollback: layer weights of the model are in host memory while others are on a device (host experts, a MoE cache, layers on the CPU)
+LLAMA_API bool llama_model_weights_spill(const struct llama_model * model);
+LLAMA_API bool llama_rs_snap_save     (struct llama_context * ctx, llama_seq_id seq_id);
+LLAMA_API bool llama_rs_snap_restore  (struct llama_context * ctx, llama_seq_id seq_id);
+
 // k11-decode: what a speculative rollback of the architecture (general.architecture) keeps: 0 nothing but KV cells, 1 a small
 // recurrent state (LFM2 short conv), 2 a large recurrent / compressor state (Mamba, GDN, DeepSeek-V4: a snapshot per drafted
 // token is tens of MiB), -1 unknown

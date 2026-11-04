@@ -193,9 +193,13 @@ static bool server_spec_spill_flint_on() {
     return e == nullptr || atoi(e) != 0;
 }
 
-static int server_spec_spill_mode(const std::string & arch, int32_t host_mode, int32_t n_threads = -1) {
+static int server_spec_spill_mode(const std::string & arch, int32_t host_mode, int32_t n_threads = -1, int32_t drop_spill = -1) {
     if (const char * e = getenv("LLAMA_SPEC_SPILL")) {
         return std::max(0, std::min(3, atoi(e)));
+    }
+    // k19-rollback: the n-gram drafts that replace a draft model --fit left out take their own mode (LLAMA_SPEC_DROP_NGRAM_SPILL)
+    if (drop_spill >= 0) {
+        return host_mode == 0 ? 0 : drop_spill;
     }
     if (host_mode == 0) {
         return 0;
