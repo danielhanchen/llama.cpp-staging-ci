@@ -127,6 +127,19 @@ void common_speculative_draft(common_speculative * spec);
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
+// k19-handoff diagnostics of the DFlash2 drafter: LLAMA_DFLASH_TRACE=1 (selector probabilities per draft, logged at accept),
+// LLAMA_DFLASH_CYCLE=1 (drafts cut to 0..n_max tokens in turn), LLAMA_PASS_TIMING=1 (host time of the draft call's parts)
+struct common_dflash_diag_t {
+    bool trace  = false;
+    bool cycle  = false;
+    bool timing = false;
+    uint64_t n_cycle = 0;
+    std::vector<std::vector<float>> p, m;
+    std::vector<int32_t> pos0;
+    int64_t t_launch = 0, t_wait = 0, t_walk = 0, n_draft = 0; // us: llama_process call, lattice read (sync), walk
+};
+common_dflash_diag_t & common_dflash_diag();
+
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);

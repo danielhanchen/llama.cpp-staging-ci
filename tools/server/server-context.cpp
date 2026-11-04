@@ -190,6 +190,94 @@ enum slot_state {
 
 struct server_slot; // forward declaration
 
+// k19-handoff (diagnostic, LLAMA_PASS_TIMING=1): host wall time between the steps of a speculative pass of one generating slot,
+// averaged per request (printed with the timings): draft call, the host work up to the target's decode call, the decode call, its
+// wait, the drafter's pass over the verify rows, the accept, the accepted tokens' handling and the loop back to the next draft
+struct server_pass_timer {
+    enum { DRAFT0, DRAFT1, DEC0, DEC1, DEC2, PROC0, PROC1, ACC0, ACC1, TOK1, N_STAMP };
+    bool    on = false;
+    int64_t t[N_STAMP] = {};
+    int32_t width = 0;
+    double  sum[N_STAMP] = {};
+    int64_t n = 0;
+    double  w_sum[32] = {};
+    int64_t w_n[32] = {};
+    server_pass_timer() {
+        const char * e = getenv("LLAMA_PASS_TIMING");
+        on = e != nullptr && atoi(e) != 0;
+    }
+    void stamp(int k) {
+        if (!on) {
+            return;
+        }
+        const int64_t now = ggml_time_us();
+        if (k == DRAFT0) {
+            bool full = t[DRAFT0] > 0;
+            for (int i = 1; i < N_STAMP && full; ++i) {
+                full = t[i] >= t[i - 1];
+            }
+            if (full) {
+                for (int i = 0; i + 1 < N_STAMP; ++i) {
+                    sum[i] += (double) (t[i + 1] - t[i]);
+                }
+                sum[N_STAMP - 1] += (double) (now - t[TOK1]);
+                n += 1;
+            }
+            for (int i = 0; i < N_STAMP; ++i) {
+                t[i] = 0;
+            }
+        }
+        t[k] = now;
+        if (k == DEC2 && t[DEC0] > 0 && width > 0 && width < 32) {
+            w_sum[width] += (double) (now - t[DEC0]);
+            w_n[width]   += 1;
+        }
+    }
+    std::string report() {
+        static const char * names[N_STAMP] = { "draft", "to_dec", "dec_call", "dec_wait", "to_proc", "proc", "to_acc", "acc", "tokens", "to_draft" };
+        std::string r;
+        char b[96];
+        if (n == 0) {
+            return r;
+        }
+        double tot = 0.0;
+        for (int i = 0; i < N_STAMP; ++i) {
+            tot += sum[i];
+        }
+        snprintf(b, sizeof(b), "pass timing: %" PRId64 " passes, %.3f ms/pass:", n, tot / n / 1e3); r += b;
+        for (int i = 0; i < N_STAMP; ++i) {
+            snprintf(b, sizeof(b), " %s %.3f", names[i], sum[i] / n / 1e3); r += b;
+        }
+        r += " | verify ms by width:";
+        for (int w = 1; w < 32; ++w) {
+            if (w_n[w] > 0) {
+                snprintf(b, sizeof(b), " w%d %.3f (%" PRId64 ")", w, w_sum[w] / w_n[w] / 1e3, w_n[w]); r += b;
+            }
+        }
+        const auto & dg = common_dflash_diag();
+        if (dg.n_draft > 0) {
+            snprintf(b, sizeof(b), " | dflash call: launch %.3f wait %.3f walk %.3f ms (%" PRId64 ")", dg.t_launch / 1e3 / dg.n_draft,
+                    dg.t_wait / 1e3 / dg.n_draft, dg.t_walk / 1e3 / dg.n_draft, dg.n_draft); r += b;
+        }
+        return r;
+    }
+    void reset() {
+        for (int i = 0; i < N_STAMP; ++i) {
+            sum[i] = 0; t[i] = 0;
+        }
+        for (int w = 0; w < 32; ++w) {
+            w_sum[w] = 0; w_n[w] = 0;
+        }
+        n = 0;
+        auto & dg = common_dflash_diag();
+        dg.t_launch = dg.t_wait = dg.t_walk = dg.n_draft = 0;
+    }
+};
+static server_pass_timer & srv_pass_timer() {
+    static server_pass_timer t;
+    return t;
+}
+
 struct server_batch {
     common_batch view; // the rendered sub-batch [off, off + n_tokens), see render()
 
@@ -927,6 +1015,13 @@ struct server_slot {
     }
 
     void print_timings() const {
+        if (srv_pass_timer().on) {
+            const std::string r = srv_pass_timer().report();
+            if (!r.empty()) {
+                SLT_INF(*this, "%s\n", r.c_str());
+            }
+            srv_pass_timer().reset();
+        }
         const double t_prompt_total = stats.t_prompt_ms();
         const double t_gen_total    = stats.t_gen_ms();
 
@@ -4766,9 +4861,11 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            srv_pass_timer().stamp(server_pass_timer::DRAFT0);
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            srv_pass_timer().stamp(server_pass_timer::DRAFT1);
         }
 
         // make checkpoints if needed
@@ -5721,12 +5818,23 @@ private:
                 SRV_INF("srv phase n=%d: %-22s %8.2f ms\n", batch.view.size(), what, (ggml_time_us() - t_ph0)/1e3);
             }
         };
+        const bool pt_on = srv_pass_timer().on && batch.view.size() <= 32;
+        if (pt_on) {
+            srv_pass_timer().stamp(server_pass_timer::DEC0);
+            srv_pass_timer().width = batch.view.size();
+        }
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             srv_ph("target returned");
+            if (pt_on) {
+                srv_pass_timer().stamp(server_pass_timer::DEC1);
+            }
             if (ret == 0 && has_output && !sync_after) {
                 llama_synchronize(ctx_tgt);
                 srv_ph("target synced");
+            }
+            if (pt_on) {
+                srv_pass_timer().stamp(server_pass_timer::DEC2);
             }
         });
         // k19-host: a drafter pass beside this decode is complete before anything below reads the rows or the speculative state
@@ -6002,6 +6110,9 @@ private:
                         spec_bg.group ? " (group mode, LLAMA_MTP_PROMPT_BG_GROUP=0 off)" : "");
                 srv_ph("drafter launched");
             }
+            if (pt_on) {
+                srv_pass_timer().stamp(server_pass_timer::PROC0);
+            }
             queue_tasks.yield_to_queue([&]() {
                 if (!ok || bg || skip || dft_off) {
                     return;
@@ -6024,6 +6135,9 @@ private:
             });
 
             srv_ph("drafter processed");
+            if (pt_on) {
+                srv_pass_timer().stamp(server_pass_timer::PROC1);
+            }
             if (!ok && spec_fail_soft("the drafter's pass failed")) {
                 ok = true;
             } else if (ok && restored && !bg && !skip && !dft_off) {
@@ -6249,6 +6363,7 @@ private:
                 // drafters that fill no distribution fall back here
                 const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
 
+                srv_pass_timer().stamp(server_pass_timer::ACC0);
                 std::vector<llama_token> accepted;
                 if (!synth_probs.empty()) {
                     // synthetic acceptance replaces verification entirely, so it comes first
@@ -6268,6 +6383,7 @@ private:
                 } else {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 }
+                srv_pass_timer().stamp(server_pass_timer::ACC1);
                 // k13: the probabilities of the accepted tokens come from their verify rows, read now (a rollback below may decode
                 // again); they were left empty, so drafted positions looked like a uniform distribution to the KLD gate
                 slot.spec_probs.clear();
@@ -6394,6 +6510,7 @@ private:
             }
 
             slot.print_timings_tg();
+            srv_pass_timer().stamp(server_pass_timer::TOK1);
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });

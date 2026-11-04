@@ -1023,6 +1023,20 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
+// k19-handoff diagnostics of the DFlash2 drafter (all off by default; none changes a draft except LLAMA_DFLASH_CYCLE)
+common_dflash_diag_t & common_dflash_diag() {
+    static common_dflash_diag_t d = [] {
+        common_dflash_diag_t x;
+        auto on = [](const char * n) { const char * e = getenv(n); return e != nullptr && atoi(e) != 0; };
+        x.trace  = on("LLAMA_DFLASH_TRACE");
+        x.cycle  = on("LLAMA_DFLASH_CYCLE");
+        x.timing = on("LLAMA_PASS_TIMING");
+        x.p.resize(64); x.m.resize(64); x.pos0.assign(64, 0);
+        return x;
+    }();
+    return d;
+}
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool row_offset_ok() const override { return false; }
@@ -1368,11 +1382,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
+        const bool    tm   = common_dflash_diag().timing;
+        const int64_t t_d0 = tm ? ggml_time_us() : 0;
         int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (ret != 0) {
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
             return;
         }
+        const int64_t t_d1 = tm ? ggml_time_us() : 0;
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
@@ -1391,6 +1408,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // Both DFlash and LiliCorr greedily walk the candidate lattice.
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
+                const int64_t t_d2 = tm ? ggml_time_us() : 0;
+                auto & dg = common_dflash_diag();
+                // k19-handoff (diagnostic, LLAMA_DFLASH_TRACE=1): the selector's per-step probability and score margin of each draft,
+                // logged with its accepted count in accept(); the draft itself is unchanged
+                const bool trace = is_dflash2 && dg.trace && seq_id < (llama_seq_id) dg.p.size();
+                if (trace) {
+                    dg.p[seq_id].clear();
+                    dg.m[seq_id].clear();
+                    dg.pos0[seq_id] = dp.pos0;
+                }
 
                 // LLAMA_DFLASH_P_CUM=P (default 0 = off): the walk also stops where the product of the steps' probabilities falls below P,
                 // the chance that the whole draft so far is accepted if the selector were calibrated: a verify row costs about the same
@@ -1410,6 +1437,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + top_k));
+                    if (trace) {
+                        float sum = 0.0f;
+                        float second = -INFINITY;
+                        for (int32_t k = 0; k < top_k; ++k) {
+                            sum += std::exp(scores[k] - scores[predecessor]);
+                            if (k != predecessor) {
+                                second = std::max(second, scores[k]);
+                            }
+                        }
+                        dg.p[seq_id].push_back(1.0f / sum);
+                        dg.m[seq_id].push_back(scores[predecessor] - second);
+                    }
                     if (params.p_min > 0.0f || p_cum_thr > 0.0f) {
                         // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                         float sum = 0.0f;
@@ -1424,8 +1463,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     result.push_back((llama_token) row[predecessor]);
                 }
 
+                // k19-handoff (diagnostic, LLAMA_DFLASH_CYCLE=1): the draft is cut to 0, 1, .., n_max tokens in turn, so one run
+                // times every verify width at the same contexts (under the exact verify contract the text does not change)
+                if (is_dflash2 && dg.cycle) {
+                    const size_t keep = (size_t) (dg.n_cycle++ % (uint64_t) (params.n_max + 1));
+                    if (result.size() > keep) {
+                        result.resize(keep);
+                    }
+                }
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
+                }
+                if (tm) {
+                    const int64_t t_d3 = ggml_time_us();
+                    dg.t_launch += t_d1 - t_d0;
+                    dg.t_wait   += t_d2 - t_d1;
+                    dg.t_walk   += t_d3 - t_d2;
+                    dg.n_draft  += 1;
                 }
                 continue;
             }
@@ -1489,8 +1543,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
-        // noop
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        auto & dg = common_dflash_diag();
+        if (is_dflash2 && dg.trace && seq_id >= 0 && seq_id < (llama_seq_id) dg.p.size() && !dg.p[seq_id].empty()) {
+            std::string sp, sm;
+            char b[32];
+            for (size_t i = 0; i < dg.p[seq_id].size(); ++i) {
+                snprintf(b, sizeof(b), "%s%.4f", i ? "," : "", dg.p[seq_id][i]); sp += b;
+                snprintf(b, sizeof(b), "%s%.3f", i ? "," : "", dg.m[seq_id][i]); sm += b;
+            }
+            LOG_INF("df2 trace: pos %d acc %d p %s m %s\n", (int) dg.pos0[seq_id], (int) n_accepted, sp.c_str(), sm.c_str());
+            dg.p[seq_id].clear();
+        }
     }
 };
 
