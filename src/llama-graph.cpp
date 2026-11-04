@@ -627,6 +627,18 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// k19-graph: the live length on the device, and its host copy for the backend's launch plan (ggml_flash_attn_ext_kv_len_set_host);
+// every input that holds an attention KV length sets it here (llm_graph_input_attn_kv, llm_graph_input_mem_hybrid)
+static void set_input_kv_len(ggml_tensor * kv_len, const llama_kv_cache_context * mctx) {
+    if (kv_len == nullptr || kv_len->buffer == nullptr) {
+        return;
+    }
+    const int32_t n = (int32_t) mctx->get_n_kv_live();
+    GGML_ASSERT(n > 0 && (uint32_t) n <= mctx->get_n_kv() && "a KV length input without a live length");
+    ggml_flash_attn_ext_kv_len_set_host(kv_len, n);
+    ggml_backend_tensor_set(kv_len, &n, 0, sizeof(n));
+}
+
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     // the idxs are left unallocated when the KV cache is bypassed during training
     if (self_k_idxs && self_k_idxs->buffer) {
@@ -650,12 +662,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_v_rot(self_v_rot);
     }
 
-    // k19-graph: the live length on the device, and its host copy for the backend's launch plan (ggml_flash_attn_ext_kv_len_set_host)
-    if (self_kv_len && self_kv_len->buffer) {
-        const int32_t n = (int32_t) mctx->get_n_kv_live();
-        ggml_flash_attn_ext_kv_len_set_host(self_kv_len, n);
-        ggml_backend_tensor_set(self_kv_len, &n, 0, sizeof(n));
-    }
+    set_input_kv_len(self_kv_len, mctx);
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -670,7 +677,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
 
-    res &= (self_kv_len != nullptr) == (mctx->get_n_kv_live() > 0);
+    res &= (self_kv_len != nullptr) == (mctx->get_n_kv_live() > 0 && params.cparams.flash_attn);
 
     return res;
 }
@@ -1277,6 +1284,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
 
+    set_input_kv_len(inp_attn->self_kv_len, mctx->get_attn());
+
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     rs_replay_set_input(inp_rs.get(), mctx->get_recr());
@@ -1311,6 +1320,9 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+
+    // k19-graph: a graph with a KV length input only for a ubatch that has a live length (and the other way round)
+    res &= (inp_attn->self_kv_len != nullptr) == (mctx->get_attn()->get_n_kv_live() > 0 && params.cparams.flash_attn);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
