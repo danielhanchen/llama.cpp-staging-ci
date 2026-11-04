@@ -363,6 +363,8 @@ struct server_slot {
     std::vector<completion_token_output> spec_probs; // k13: n_probs of the accepted tokens, read from their verify rows before any rollback
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    // k19-rollback: the speculative checkpoint of the target is the host copy of its recurrent rows (llama_rs_snap_save), not spec_ckpt's data
+    bool spec_rs_snap = false;
 
     // k9-draft: speculation cost governor (common/spec-governor.h); gov_step: what the current step is for it
     // (0 = not governed, 1 = plain because the governor held drafting back, 2 = a draft is verified, 3 = drafting gave no draft)
@@ -597,6 +599,7 @@ struct server_slot {
         spec_off_req   = false;
         spec_lent_req  = false;
         spec_is_replay = false;
+        spec_rs_snap   = false;
 
         last_nl_pos    = 0;
         generated      = {};
@@ -1846,10 +1849,15 @@ private:
 
         // --fit placed the draft model on the CPU, where drafting is slower than none (see common_init_result)
         if (has_spec && params_base.speculative.draft.fit_off) {
-            SRV_WRN("%s", "--fit: the draft model does not fit on the GPU beside the main model and its MoE cache, speculative decoding is off "
-                "(LLAMA_FIT_DRAFT_CPU=1 drafts on the CPU, LLAMA_FIT_DRAFT_LAST=0 restores the old placement)\n");
+            // k19-rollback: or the n-gram suffix drafts --fit put in its place (common_fit_drop_ngram, LLAMA_SPEC_DROP_NGRAM)
+            const bool drop_ngram = params_base.speculative.ngram_suffix.drop_fallback;
+            SRV_WRN("--fit: the draft model does not fit on the GPU beside the main model and its MoE cache, %s "
+                "(LLAMA_FIT_DRAFT_CPU=1 drafts on the CPU, LLAMA_FIT_DRAFT_LAST=0 restores the old placement)\n",
+                drop_ngram ? "n-gram suffix drafts instead of the draft model" : "speculative decoding is off");
             has_spec = false;
-            params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+            if (!drop_ngram) {
+                params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+            }
             params_base.speculative.draft.mparams = {};
             load_progress_callback(1.0f, &load_progress_spec);
         }
@@ -2094,7 +2102,8 @@ private:
         // server_spec_spill_min_match tokens (short repeats cost a verify window of host experts for little)
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO && params_base.speculative.ngram_suffix.auto_mode && server_spec_auto_exact() &&
                 !llama_verify_exact_placement(ctx_tgt) &&
-                server_spec_spill_mode(server_spec_auto_arch(params_base.model.path), llama_moe_host_mode(ctx_tgt), params_base.cpuparams.n_threads) > 0) {
+                server_spec_spill_mode(server_spec_auto_arch(params_base.model.path), llama_moe_host_mode(ctx_tgt), params_base.cpuparams.n_threads,
+                    params_base.speculative.ngram_suffix.drop_spill) > 0) {
             auto & ns = params_base.speculative.ngram_suffix;
             const int mm = server_spec_spill_min_match(llama_moe_host_mode(ctx_tgt));
             if (mm > ns.n_min_match) {
@@ -2162,7 +2171,8 @@ private:
                 }
                 const int32_t host_mode = llama_moe_host_mode(ctx_tgt);
                 const int     spill     = llama_verify_exact_placement(ctx_tgt) ? -1 :
-                                          server_spec_spill_mode(server_spec_auto_arch(params_base.model.path), host_mode, params_base.cpuparams.n_threads);
+                                          server_spec_spill_mode(server_spec_auto_arch(params_base.model.path), host_mode, params_base.cpuparams.n_threads,
+                                              params_base.speculative.ngram_suffix.drop_spill);
                 if (spill < 0) {
                     llama_set_verify_exact(ctx_tgt, true);
                     auto_verify_exact = true;
@@ -4725,7 +4735,7 @@ private:
                     if (!slot.spec_draft.empty()) {
                         // we have a previous (partial) draft to reuse
                         if (use_ckpt_tgt) {
-                            GGML_ASSERT(!slot.spec_ckpt.empty());
+                            GGML_ASSERT(!slot.spec_ckpt.empty() || slot.spec_rs_snap);
                         }
                     } else {
                         GGML_ASSERT(slot.spec_i_batch.empty());
@@ -4801,8 +4811,18 @@ private:
                 const bool use_ckpt_dft =
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
 
-                if (use_ckpt_tgt) {
+                // k19-rollback: a recurrent target without rollback rows copies its state rows to host memory on the device stream instead
+                // (llama_rs_snap_save: no host wait, no serialised state). A replay of the accepted tokens starts from that same copy, so
+                // it keeps it. LLAMA_SPEC_RS_SNAP=0: the serialised checkpoint, as before
+                static const bool rs_snap_env = getenv("LLAMA_SPEC_RS_SNAP") == nullptr || atoi(getenv("LLAMA_SPEC_RS_SNAP")) != 0;
+                if (use_ckpt_tgt && slot.spec_is_replay && slot.spec_rs_snap) {
+                    // the copy of the window this replay restored
+                } else if (use_ckpt_tgt && rs_snap_env && llama_rs_snap_save(ctx_tgt, slot.id)) {
+                    ckpt.clear_tgt();
+                    slot.spec_rs_snap = true;
+                } else if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
+                    slot.spec_rs_snap = false;
 
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
@@ -6305,7 +6325,11 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
-                        GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                        if (slot.spec_rs_snap) {
+                            GGML_ASSERT(llama_rs_snap_restore(slot.ctx_tgt, slot.id) && "host copy of the recurrent state not restored");
+                        } else {
+                            GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                        }
 
                         if (slot.ctx_dft) {
                             GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));

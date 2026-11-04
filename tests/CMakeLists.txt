@@ -298,6 +298,22 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-server-prompt-ssd-ns PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # k19-rollback: a drafted window rolled back by the host copy of the recurrent state (no rollback rows) = the accepted tokens decoded alone
+    llama_build(test-rs-snap.cpp)
+    llama_test(
+        test-rs-snap
+        LABEL main
+        ARGS "${MODEL_DIR}/qwen4exp-moe.gguf"
+    )
+    set_tests_properties(test-rs-snap PROPERTIES FIXTURES_REQUIRED generate-models)
+    llama_test(
+        test-rs-snap
+        NAME test-rs-snap-qwen35
+        LABEL main
+        ARGS "${MODEL_DIR}/qwen35-dense.gguf"
+    )
+    set_tests_properties(test-rs-snap-qwen35 PROPERTIES FIXTURES_REQUIRED generate-models)
+
     # -sm tensor (Meta(CPU, CPU)) with LLAMA_RS_REPLAY=1: the delta-net rollback keeps the snapshot rows and matches the CPU decode
     llama_build(test-rs-replay-meta.cpp)
     llama_test(

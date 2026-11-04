@@ -1447,6 +1447,41 @@ static int64_t common_gguf_u32(const std::string & path, const char * key) {
 // and the state capture of a drafting server), the default capture count. Before this the server ran in the "draft left out" mode:
 // a 16384-token layer-major batch, the capture and refill of a drafting context, and its prompts and checkpoints differed from a
 // plain launch (2k / 8k text not equal to it). The trial fit runs with these context parameters, so the placement is that launch's
+// k19-rollback: where --fit leaves the draft model out (no room on the device beside the main model and its MoE cache: G4 capped at 8 GB,
+// Qwen3.8-Flash-Next UD-IQ4_XS + its Q8_0 MTP drafter), the server drafts n-gram suffix windows instead (cost-priced, as the server's own
+// n-gram drafting). Their rollback keeps no per-token recurrent rows on the device: the dropped draft's context already runs with n_rs_seq 0,
+// so a partly accepted window of a recurrent model restores the server's checkpoint of the state (host memory) and decodes the accepted
+// tokens again. Where nothing repeats nothing is drafted, and the launch is the plain one (no rows, no checkpoint).
+// LLAMA_SPEC_DROP_NGRAM: 0 off (the server runs without drafts, as before), 1 on; LLAMA_SPEC_DROP_NGRAM_SPILL: the drafting mode under a
+// MoE cache with host experts (server_spec_spill_mode; default 1: drafts verified as ordinary batches with the host path, other text)
+static int common_fit_drop_ngram_env() {
+    const char * e = getenv("LLAMA_SPEC_DROP_NGRAM");
+    return e != nullptr ? atoi(e) : 0;
+}
+
+static bool common_fit_drop_ngram(common_params & params, llama_context_params & cp) {
+    auto & sp = params.speculative;
+    if (common_fit_drop_ngram_env() == 0 || params.embedding || params.n_parallel < 1 || sp.has_synth() ||
+            !sp.ngram_cache.lookup_cache_static.empty() || !sp.ngram_cache.lookup_cache_dynamic.empty()) {
+        return false;
+    }
+    sp.types = { COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX };
+    sp.ngram_suffix.auto_mode     = true;
+    sp.ngram_suffix.drop_fallback = true;
+    const char * es = getenv("LLAMA_SPEC_DROP_NGRAM_SPILL");
+    sp.ngram_suffix.drop_spill = es != nullptr ? std::max(0, std::min(3, atoi(es))) : 1;
+    // the verify windows need their outputs (the server sized them for the dropped drafter's n_max)
+    const common_speculative_output_limits lim = common_speculative_get_output_limits(params.n_batch, params.n_parallel, common_speculative_n_max(&sp));
+    params.n_outputs_max         = std::max(params.n_outputs_max, lim.total);
+    params.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, lim.per_seq);
+    cp.n_outputs_max             = std::max(params.n_outputs_max, 0);
+    cp.n_outputs_max_per_seq     = std::max(params.n_outputs_max_per_seq, 0);
+    cp.n_rs_seq                  = 0;
+    COM_INF("%s: --fit: the draft model does not fit: n-gram suffix drafts instead, %d tokens per window at most, rolled back from a host "
+        "checkpoint (no recurrent rows on the device; LLAMA_SPEC_DROP_NGRAM=0: no drafts)\n", __func__, common_speculative_n_max(&sp));
+    return true;
+}
+
 static void common_fit_plain_launch(common_params & params, llama_context_params & cp) {
     params.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
     const common_speculative_output_limits lim = common_speculative_get_output_limits(params.n_batch, params.n_parallel, 0);
@@ -3298,6 +3333,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 // fitted and run as without a draft model, the caller turns drafting off
                 cparams.n_rs_seq = 0;
                 mparams.load_mtp = params.load_mtp;
+                // k19-rollback: or drafts n-gram windows instead (LLAMA_SPEC_DROP_NGRAM)
+                common_fit_drop_ngram(params, cparams);
             }
         }
 
@@ -3696,6 +3733,27 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.mem_reserve_devs = reserve_devs.data();
         cparams.mem_reserve      = reserve_bytes.data();
         cparams.n_mem_reserve    = reserve_bytes.size();
+    }
+
+    // k19-rollback: the n-gram suffix drafter alone asked for the recurrent rollback rows (need_n_rs_seq) of a model whose rollback
+    // keeps a large state per drafted token (GDN / Mamba hybrids), and the layer weights spill to host memory: the rows (7 x 8.4 MiB conv
+    // rows + replay stores on G4 Qwen3.8-Flash-Next, 59 MiB at 8 GB, where the small-device placement has ~50 MiB left) go, and a
+    // window that is not fully accepted is rolled back from the host copy of the state (llama_rs_snap_save, one sequence). Nothing stays
+    // on the device for the drafter; where nothing repeats the launch runs as one without it. The fit priced the rows, so their memory
+    // stays free. LLAMA_SPEC_SUFFIX_RS=1 keeps the rows (=0 never takes them, as before)
+    if (cparams.n_rs_seq > 0 && getenv("LLAMA_SPEC_SUFFIX_RS") == nullptr && params.n_parallel == 1) {
+        const auto & ty = params.speculative.types;
+        const bool model_rows = std::any_of(ty.begin(), ty.end(), [](auto t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        }) && !params.speculative.draft.fit_off;
+        char arch[64] = {};
+        const bool big_state = llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) > 0 && llama_arch_rollback_state(arch) == 2;
+        if (!model_rows && big_state && params.speculative.suffix_n_max() > 0 && llama_model_weights_spill(model)) {
+            COM_INF("%s: n-gram drafts beside host weights: no recurrent rollback rows on the device (%u asked), a window that is not "
+                "fully accepted goes back to a host copy of the state (LLAMA_SPEC_SUFFIX_RS=1 keeps the rows)\n", __func__, cparams.n_rs_seq);
+            cparams.n_rs_seq = 0;
+        }
     }
 
     // -t given: the threads that compute missing experts on the host are the user's too (k11 LLAMA_MOE_HOST_THREADS)

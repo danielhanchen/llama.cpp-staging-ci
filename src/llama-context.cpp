@@ -2047,6 +2047,10 @@ llama_context::~llama_context() {
             c.bytes_populated/1048576.0, c.n_node, c.n_tensor, c.n_dropped, c.n_colded);
         disk_ranges.clear();
     }
+    if (const llama_memory_recurrent * ms = rs_snap_mem(); ms != nullptr && ms->n_snap_save > 0) {
+        LLAMA_LOG_INFO("%s: host rollback copies of the recurrent state: %" PRIu64 " taken, %" PRIu64 " restored (%.2f MiB each)\n", __func__,
+                ms->n_snap_save, ms->n_snap_restore, ms->snap_bytes()/1024.0/1024.0);
+    }
     if (rs_replay_mem != nullptr && rs_replay_mem->n_replay_commit > 0) {
         LLAMA_LOG_INFO("%s: recurrent replay commits: %" PRIu64 " (%" PRIu64 " reused graphs), %.2f ms total, %.3f ms each (host)\n", __func__,
                 rs_replay_mem->n_replay_commit, rs_reused, rs_replay_us/1e3, rs_replay_us/1e3/rs_replay_mem->n_replay_commit);
@@ -11221,6 +11225,101 @@ uint32_t llama_n_ubatch(const llama_context * ctx) {
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {
     return ctx->n_seq_max();
+}
+
+// k19-rollback: see llama_rs_snap_save
+llama_memory_recurrent * llama_context::rs_snap_mem() const {
+    if (!memory || model.hparams.no_alloc) {
+        return nullptr;
+    }
+    if (std::any_of(model.devices.begin(), model.devices.end(), [](const auto & d) { return d.is_meta; })) {
+        return nullptr;
+    }
+    llama_memory_recurrent * mr = dynamic_cast<llama_memory_recurrent *>(memory.get());
+    if (auto * mh = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        mr = mh->get_mem_recr();
+    } else if (auto * mhi = dynamic_cast<llama_memory_hybrid_iswa *>(memory.get())) {
+        mr = mhi->get_mem_recr();
+    }
+    return mr != nullptr && mr->snap_supported() ? mr : nullptr;
+}
+
+bool llama_context::rs_snap_save(llama_seq_id seq_id) {
+    llama_memory_recurrent * mr = rs_snap_mem();
+    if (mr == nullptr) {
+        return false;
+    }
+    // the copy is queued on the stream of the backend that computes each row, after the decode that wrote it; rows of a buffer no
+    // backend here reads asynchronously are read by the host after the decodes finished
+    bool synced = false;
+    auto be = [&](const ggml_tensor * t) -> ggml_backend_t {
+        ggml_backend_buffer_t buf = t->view_src != nullptr ? t->view_src->buffer : t->buffer;
+        if (buf == nullptr || ggml_backend_buffer_is_host(buf)) {
+            if (!synced) { synchronize(); synced = true; }
+            return nullptr;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        for (const auto & b : backends) {
+            if (ggml_backend_get_device(b.get()) == dev && ggml_backend_supports_buft(b.get(), buft)) {
+                return b.get();
+            }
+        }
+        if (!synced) { synchronize(); synced = true; }
+        return nullptr;
+    };
+    return mr->snap_save(seq_id, be);
+}
+
+bool llama_context::rs_snap_restore(llama_seq_id seq_id) {
+    llama_memory_recurrent * mr = rs_snap_mem();
+    if (mr == nullptr) {
+        return false;
+    }
+    // an asynchronous state save still reading the rows (a prompt checkpoint) must finish before they are written
+    state_async_wait_reads();
+    bool synced = false;
+    auto be = [&](const ggml_tensor * t) -> ggml_backend_t {
+        ggml_backend_buffer_t buf = t->view_src != nullptr ? t->view_src->buffer : t->buffer;
+        if (buf != nullptr && !ggml_backend_buffer_is_host(buf)) {
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            for (const auto & b : backends) {
+                if (ggml_backend_get_device(b.get()) == dev && ggml_backend_supports_buft(b.get(), buft)) {
+                    return b.get();
+                }
+            }
+        }
+        if (!synced) { synchronize(); synced = true; }
+        return nullptr;
+    };
+    return mr->snap_restore(seq_id, be);
+}
+
+bool llama_model_weights_spill(const llama_model * model) {
+    if (model == nullptr) {
+        return false;
+    }
+    bool on_host = false, on_dev = false;
+    for (const auto & [name, t] : model->tensors_by_name) {
+        if (t == nullptr || t->buffer == nullptr || name.compare(0, 4, "blk.") != 0) {
+            continue;
+        }
+        (ggml_backend_buffer_is_host(t->buffer) ? on_host : on_dev) = true;
+    }
+    return on_host && on_dev;
+}
+
+bool llama_rs_snap_supported(const llama_context * ctx) {
+    return ctx != nullptr && ctx->rs_snap_mem() != nullptr;
+}
+
+bool llama_rs_snap_save(llama_context * ctx, llama_seq_id seq_id) {
+    return ctx != nullptr && ctx->rs_snap_save(seq_id);
+}
+
+bool llama_rs_snap_restore(llama_context * ctx, llama_seq_id seq_id) {
+    return ctx != nullptr && ctx->rs_snap_restore(seq_id);
 }
 
 uint32_t llama_n_rs_seq(const llama_context * ctx) {

@@ -400,6 +400,11 @@ struct common_params_speculative_ngram_suffix {
     int32_t win_long_prompt   = 0;
     int32_t n_max_short_long  = 0;
     int32_t n_long_match_long = 0;
+    // k19-rollback: the server drafts these windows in place of a draft model that --fit left out (LLAMA_SPEC_DROP_NGRAM, common_fit_drop_ngram);
+    // their rollback keeps no per-token recurrent rows on the device. drop_spill: the mode of server_spec_spill_mode under a MoE cache with
+    // host experts (-1: the model's own); an explicit LLAMA_SPEC_SPILL still wins
+    bool    drop_fallback = false;
+    int32_t drop_spill    = -1;
 };
 
 struct common_params_speculative_ngram_map {

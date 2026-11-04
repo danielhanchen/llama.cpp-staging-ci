@@ -145,6 +145,18 @@ public:
     void replay_mark(const llama_ubatch & ubatch);
     uint64_t n_rollback_copy = 0;
 
+    // k19-rollback: a copy of one sequence's state rows (every r / s / PLE row of its cell) in host memory, pinned where the device has a
+    // host buffer type. snap_save / snap_restore read and write the rows on the stream of the backend `be` gives for each tensor (ordered
+    // with the decodes before and after, the host does not wait); `be` returns nullptr for rows the host reads directly. This is the rollback
+    // of a drafted verify window that keeps no per-token rows on the device (n_rs_seq 0): the copy is taken before the window and put back
+    // when a draft is not fully accepted, and the accepted tokens are decoded again (llama-server's speculative checkpoint, LLAMA_SPEC_RS_SNAP).
+    // One sequence per memory only (a ubatch of several sequences may move the cell between the copy and its restore)
+    bool snap_supported() const { return n_rs_seq == 0 && !replay && n_seq_max == 1 && !is_empty(); }
+    bool snap_save   (llama_seq_id seq_id, const std::function<ggml_backend_t(const ggml_tensor *)> & be);
+    bool snap_restore(llama_seq_id seq_id, const std::function<ggml_backend_t(const ggml_tensor *)> & be);
+    size_t snap_bytes() const { return snap_size; }
+    uint64_t n_snap_save = 0, n_snap_restore = 0;
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -215,6 +227,14 @@ private:
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
 
     void state_clear(llama_seq_id seq_id, uint32_t cell_head, uint32_t cell_count);
+
+    // k19-rollback: see snap_save
+    ggml_backend_buffer_ptr snap_buf;
+    size_t       snap_size = 0;
+    int32_t      snap_cell = -1;
+    llama_seq_id snap_seq  = -1;
+    llama_pos    snap_pos  = -1;
+    bool snap_rows(int32_t cell, const std::function<void(ggml_tensor *, size_t off, size_t size, size_t off_host)> & fn) const;
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {
