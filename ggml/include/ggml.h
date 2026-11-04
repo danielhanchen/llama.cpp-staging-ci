@@ -2680,6 +2680,20 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // kv_len (I32 [1], optional, src[5]): the attention reads only the first kv_len cells of K / V and the mask; the cells after them
+    // are padding (masked with -INFINITY in every row), so a graph built for k->ne[1] cells keeps its shapes while the live length grows.
+    // A backend may take the length from the device (ggml-cuda: the stream-k split and loop bound of the dense kernel follow the live
+    // length, so the node computes exactly what a node of kv_len cells computes and its CUDA graph is replayed as the length changes);
+    // the others compute over every cell (the padding adds exact zeros only where the backend's split does not follow ne[1]).
+    // ggml_flash_attn_ext_kv_len_set_host keeps a host copy in kv_len->op_params[0], set together with the data, for the backend's launch plan
+    GGML_API void ggml_flash_attn_ext_set_kv_len(
+            struct ggml_tensor * a,
+            struct ggml_tensor * kv_len);
+
+    GGML_API void ggml_flash_attn_ext_kv_len_set_host(
+            struct ggml_tensor * kv_len,
+            int32_t              n);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
