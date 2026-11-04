@@ -2999,6 +2999,15 @@ void llama_context::synchronize_outputs() {
     synchronize();
 }
 
+// k19-graph: the sampler's wait before it reads the outputs (common_sampler_sample); nothing queued, nothing to wait for (the decode
+// stats are counted at the sync that follows the decode, which this does not skip)
+void llama_context::synchronize_pending() {
+    if (!sync_pending && n_queued_tokens == 0 && llama_sync_skip_enabled()) {
+        return;
+    }
+    synchronize();
+}
+
 void llama_context::synchronize() {
     if (!sched) {
         state_async_wait();
@@ -11259,6 +11268,10 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
+}
+
+void llama_synchronize_pending(llama_context * ctx) {
+    ctx->synchronize_pending();
 }
 
 float * llama_get_logits(llama_context * ctx) {

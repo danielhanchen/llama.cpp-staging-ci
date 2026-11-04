@@ -1207,6 +1207,9 @@ extern "C" {
     // and is not necessary to call it explicitly in most cases
     LLAMA_API void llama_synchronize(struct llama_context * ctx);
 
+    // k19-graph: llama_synchronize only while a decode or its output copies are still queued (the getters below already wait so)
+    LLAMA_API void llama_synchronize_pending(struct llama_context * ctx);
+
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously
     // in the order they have appeared in the batch.

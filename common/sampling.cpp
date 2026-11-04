@@ -910,7 +910,8 @@ int32_t common_sampler_device_topk(const struct common_sampler * gsmpl, int32_t 
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
-    llama_synchronize(ctx);
+    // k19-graph: only while work is queued (the second and later rows of a verify window found the stream idle: 2-4 syncs per pass)
+    llama_synchronize_pending(ctx);
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
