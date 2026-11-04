@@ -856,8 +856,10 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     // (only once the selection holds its full top_k/kpool pools without them: else n_sel would follow the padding)
     // (k19-graph: with the device KV length, always: the attention reads the selection over the live cells only, and the padded
     // pools are dead slots of the selection, so a longer selection marks the same live cells)
+    // (LLAMA_KV_BUCKET_DEV_POOLS=0: only once the selection is full, as for the sparse-exact buckets)
+    static const bool dev_pools = getenv("LLAMA_KV_BUCKET_DEV_POOLS") == nullptr || atoi(getenv("LLAMA_KV_BUCKET_DEV_POOLS")) != 0;
     st.n_pool_g = 0;
-    if (get_idx()->get_n_kv_live() > 0 || (get_idx()->get_n_kv_bucketed() && kpool_pad(st.n_pool_real) >= mem->get_kpool_top())) {
+    if ((dev_pools && get_idx()->get_n_kv_live() > 0) || (get_idx()->get_n_kv_bucketed() && kpool_pad(st.n_pool_real) >= mem->get_kpool_top())) {
         const uint32_t n_kv = get_idx()->get_n_kv();
         st.n_pool_g = std::max(kpool_pad(st.n_pool_real), kpool_pad(n_kv/kpool));
     }
