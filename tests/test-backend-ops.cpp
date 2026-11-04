@@ -8684,14 +8684,16 @@ struct test_conv_cat_state : public test_case {
     const int64_t n_t;
     const int64_t n_slots;
     const bool    cpy_after;
+    const int64_t n_gap; // k19-vrow3: unrelated nodes between the copies and the convolution (the state gather of qwen4exp)
     std::vector<ggml_tensor *> checked;
 
     std::string vars() override {
-        return VARS_TO_STR5(channels, d_conv, n_t, n_slots, cpy_after);
+        return VARS_TO_STR5(channels, d_conv, n_t, n_slots, cpy_after) + (n_gap > 0 ? "," + VAR_TO_STR(n_gap) : "");
     }
 
-    test_conv_cat_state(int64_t channels = 10240, int64_t d_conv = 4, int64_t n_t = 1, int64_t n_slots = 3, bool cpy_after = false)
-        : channels(channels), d_conv(d_conv), n_t(n_t), n_slots(n_slots), cpy_after(cpy_after) {}
+    test_conv_cat_state(int64_t channels = 10240, int64_t d_conv = 4, int64_t n_t = 1, int64_t n_slots = 3, bool cpy_after = false,
+            int64_t n_gap = 0)
+        : channels(channels), d_conv(d_conv), n_t(n_t), n_slots(n_slots), cpy_after(cpy_after), n_gap(n_gap) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t sc = d_conv - 1, C = channels, mem_size = 2, head = 1;
@@ -8717,8 +8719,22 @@ struct test_conv_cat_state : public test_case {
                 ggml_build_forward_expand(gf, c);
             }
         }
+        ggml_tensor * gap = nullptr;
+        if (n_gap > 0) {
+            gap = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 256);
+            ggml_set_name(gap, "gap_in");
+            for (int64_t g = 0; g < n_gap; ++g) {
+                gap = ggml_scale(ctx, gap, 0.5f);
+            }
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, gap);
+            }
+        }
         ggml_tensor * out = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, w));
         ggml_set_name(out, "conv_out");
+        if (gap != nullptr) {
+            out = ggml_add(ctx, out, ggml_sum(ctx, gap)); // keeps the gap chain in the checked output
+        }
         if (mode == MODE_TEST) {
             ggml_build_forward_expand(gf, out);
             if (cpy_after) {
@@ -14360,6 +14376,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gate_cont(128, 48, nt, false));
     }
     test_cases.emplace_back(new test_conv_cat_state(10240, 4, 1, 1, false));        // one rollback slot (no drafting)
+    // k19-vrow3: the deep verify windows (DFlash2 n_max 4 / 6 / 7: 5 / 7 / 8 rows and rollback slots), with the qwen4exp state gather's
+    // nodes between the copies and the convolution (the elision looks GGML_CUDA_CONV_CAT_LOOKAHEAD nodes ahead)
+    for (int64_t nt : { 5, 7, 8 }) {
+        test_cases.emplace_back(new test_conv_cat_state(10240, 4, nt, nt, false));
+        test_cases.emplace_back(new test_conv_cat_state(10240, 4, nt, nt, false, 6));
+        test_cases.emplace_back(new test_conv_cat_state(10240, 4, nt, nt, true));
+    }
     // k19-fuse F5 prompt ubatches (kill GGML_CUDA_DISABLE_CONV_CAT_PROMPT=1): past the 32-token boundary, a partial tile, 512 / 2048
     for (int64_t nt : { 33, 100, 512, 2048 }) {
         test_cases.emplace_back(new test_conv_cat_state(10240, 4, nt, 3, false));

@@ -5820,6 +5820,12 @@ static void ggml_cuda_conv_state_flush(ggml_backend_cuda_context * cuda_ctx) {
     cuda_ctx->conv_state_pending.clear();
 }
 
+// k19-vrow3: how many graph nodes after a conv-input concat (and after each of its state copies) its short convolution is looked for. The
+// state copies of a verify window are 3 nodes per rollback slot (tail view, slot view, copy), then the state gather before the
+// convolution: 24 nodes held 5 slots (a 5-row window); 7 slots (DFlash2 n_max 6, a 7-row window) put the convolution past 24 and the
+// concat ran (concat_non_cont, 0.25 ms per pass at 7 rows, G4 fn4). 48 holds the 8 slots of an 8-row window
+static constexpr int GGML_CUDA_CONV_CAT_LOOKAHEAD = 48;
+
 // GGML_CUDA_FUSION_TRACE=1: why a conv-input concat was not elided (refusal point, concat name)
 static bool ggml_cuda_conv_cat_refuse(const char * name, int where) {
     static const bool trace = ggml_cuda_env_flag("GGML_CUDA_FUSION_TRACE");
@@ -5851,7 +5857,7 @@ static bool ggml_cuda_try_conv_state_defer(ggml_backend_cuda_context * cuda_ctx,
         offs / sizeof(float) + tail->ne[0] > (size_t) input->ne[0]) {
         return ggml_cuda_conv_cat_refuse(cpy->name, 100 + 2);
     }
-    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 24; ++j) {
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + GGML_CUDA_CONV_CAT_LOOKAHEAD; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
         if (n->op == GGML_OP_SSM_CONV && n->src[0] == input) {
             const ggml_tensor * w = n->src[1];
@@ -5923,7 +5929,7 @@ static bool ggml_cuda_try_conv_cat_elide(ggml_backend_cuda_context * cuda_ctx, c
         return ggml_cuda_conv_cat_refuse(cat_dbg_name, 2);
     }
     int jc = -1;
-    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 24; ++j) {
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + GGML_CUDA_CONV_CAT_LOOKAHEAD; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
         if (n->op == GGML_OP_SSM_CONV && n->src[0] == cat) {
             const ggml_tensor * w = n->src[1];
@@ -6004,7 +6010,7 @@ static bool ggml_cuda_try_conv_cat_elide_prompt(ggml_backend_cuda_context * cuda
     const int64_t sc = a->ne[0];
     std::vector<ggml_tensor *> cpys;
     int jc = -1;
-    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 24; ++j) {
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + GGML_CUDA_CONV_CAT_LOOKAHEAD; ++j) {
         ggml_tensor * n = cgraph->nodes[j];
         if (n->op == GGML_OP_SSM_CONV && n->src[0] == cat) {
             const ggml_tensor * w = n->src[1];
@@ -9869,7 +9875,7 @@ static const ggml_tensor * ggml_cuda_fused_match(const ggml_cgraph * cgraph, int
     static const bool cat_alias = ggml_cuda_env_flag("GGML_CUDA_CONV_CAT_ALIAS");
     if (!cat_alias && n0->op == GGML_OP_CONCAT && ggml_get_op_params_i32(n0, 0) == 0 && n0->type == GGML_TYPE_F32 && n0->src[1] != nullptr &&
             n0->src[1]->ne[0] <= 8) {
-        for (int j = i + 1; j < cgraph->n_nodes && j <= i + 24; ++j) {
+        for (int j = i + 1; j < cgraph->n_nodes && j <= i + GGML_CUDA_CONV_CAT_LOOKAHEAD; ++j) {
             ggml_tensor * conv = cgraph->nodes[j];
             if (conv->op != GGML_OP_SSM_CONV || conv->src[0] != n0) {
                 continue;
