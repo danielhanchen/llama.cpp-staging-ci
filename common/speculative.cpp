@@ -1473,6 +1473,26 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     return r;
                 }();
                 const bool use_ev = is_dflash2 && !ev_rule.first.empty();
+                // k19-handoff: the default window of a DFlash2 draft beside a target without a MoE cache (LLAMA_DFLASH_WINDOW=0: the whole
+                // walk, as before; LLAMA_DFLASH_EV, --spec-draft-p-min and LLAMA_DFLASH_P_CUM replace it). Of two windows, the short one
+                // (4 rows below position 4096, 3 above) and the whole draft, the one with more expected tokens per ms: the expected tokens
+                // come from the chance that each step is accepted given its selector probability (calibrated on G4 Flash-Next, 48 prompts
+                // of 2k / 8k tokens: the selector is near calibrated, a little over-confident at the top), the ms from G4's pass cost by
+                // verify width (the drafter and host ~1.25 ms plus the verify, ~0.9 ms per row below 4096 and ~1.1 above). Two widths
+                // only: each width is one more CUDA graph capture (~20 ms) at every new KV bucket
+                static const bool df2_window = [] {
+                    const char * e = getenv("LLAMA_DFLASH_WINDOW");
+                    return e == nullptr || atoi(e) != 0;
+                }();
+                const bool use_df2w = is_dflash2 && df2_window && !use_ev && params.p_min <= 0.0f && p_cum_thr <= 0.0f &&
+                    !llama_moe_cache_active(params.ctx_tgt);
+                if (use_df2w) {
+                    static bool logged = false;
+                    if (!logged) {
+                        logged = true;
+                        LOG_INF("k19-handoff: DFlash2 window: the short or the whole draft by expected tokens per ms (LLAMA_DFLASH_WINDOW=0 off)\n");
+                    }
+                }
                 std::vector<float> step_p;
 
                 int32_t predecessor = 0;
@@ -1495,13 +1515,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         dg.p[seq_id].push_back(1.0f / sum);
                         dg.m[seq_id].push_back(scores[predecessor] - second);
                     }
-                    if (params.p_min > 0.0f || p_cum_thr > 0.0f || use_ev) {
+                    if (params.p_min > 0.0f || p_cum_thr > 0.0f || use_ev || use_df2w) {
                         // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                         float sum = 0.0f;
                         for (int32_t k = 0; k < top_k; ++k) {
                             sum += std::exp(scores[k] - scores[predecessor]);
                         }
-                        if (use_ev) {
+                        if (use_ev || use_df2w) {
                             step_p.push_back(1.0f / sum);
                         }
                         p_cum *= p_cum_exp == 1.0f ? 1.0f / sum : std::pow(1.0f / sum, p_cum_exp);
@@ -1510,6 +1530,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                     }
                     result.push_back((llama_token) row[predecessor]);
+                }
+                if (use_df2w && !result.empty()) {
+                    static const float df2_cal[20] = { 0.141f, 0.141f, 0.141f, 0.141f, 0.203f, 0.264f, 0.278f, 0.339f, 0.363f, 0.423f,
+                                                       0.460f, 0.492f, 0.583f, 0.614f, 0.614f, 0.619f, 0.657f, 0.748f, 0.814f, 0.929f };
+                    const bool   lng   = dp.pos0 >= 4096;
+                    const size_t w_lo  = lng ? 3 : 4;                       // verify rows of the short window
+                    const size_t w_hi  = result.size() + 1;                 // the whole draft
+                    const double c_lo  = lng ? 11.05 : 11.80;               // ms per pass at w_lo
+                    const double slope = lng ? 1.125 : 0.933;               // ms per further row
+                    if (w_lo < w_hi) {
+                        double e_tok = 1.0, reach = 1.0, e_lo = 0.0;
+                        for (size_t k = 1; k < w_hi; ++k) {
+                            reach *= df2_cal[std::min(19, std::max(0, (int) (step_p[k - 1] * 20)))];
+                            e_tok += reach;
+                            if (k + 1 == w_lo) {
+                                e_lo = e_tok;
+                            }
+                        }
+                        const double c_hi = c_lo + slope * (double) (w_hi - w_lo);
+                        if (e_lo / c_lo > e_tok / c_hi) {
+                            result.resize(w_lo - 1);
+                        }
+                    }
                 }
                 if (use_ev && !result.empty()) {
                     const auto & f = ev_rule.first;
