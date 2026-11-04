@@ -11730,9 +11730,26 @@ static size_t ggml_backend_cuda_pool_mark_trim(ggml_backend_t backend, bool trim
     }
     if (!trim) {
         // the streams a later call may need are created now, while the device has memory for them: G4 4 GB q3m 16k release-split,
-        // a prompt checkpoint (state_get_async) inside the released window failed in cudaStreamCreateWithFlags
+        // a prompt checkpoint (state_get_async) inside the released window failed in cudaStreamCreateWithFlags.
+        // k19-tierfix-fit: best effort, as their only purpose is to come before that call: a device already full leaves the rest to be
+        // created where they are used (G4 capped at 8 GB, Qwen3.8-Flash-Next UD-IQ4_XS with the route tail skip off: the CUDA_CHECK
+        // here aborted the first 8k prompt, while the release itself needs none of these streams)
         for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
-            (void) ctx->stream(ctx->device, s);
+            if (ctx->streams[ctx->device][s] != nullptr) {
+                continue;
+            }
+            cudaStream_t st = nullptr;
+            const cudaError_t err = cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+            if (err != cudaSuccess) {
+                (void) cudaGetLastError();
+                static int n_warn = 0;
+                if (n_warn++ < 4) {
+                    GGML_LOG_WARN("%s: device %d: stream %d of %d not created ahead (%s)\n", __func__, ctx->device, s,
+                        GGML_CUDA_MAX_STREAMS, cudaGetErrorString(err));
+                }
+                break;
+            }
+            ctx->streams[ctx->device][s] = st;
         }
     }
     size_t freed = 0;
