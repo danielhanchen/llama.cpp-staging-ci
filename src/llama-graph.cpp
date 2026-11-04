@@ -649,6 +649,13 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot && self_v_rot->buffer) {
         mctx->set_input_v_rot(self_v_rot);
     }
+
+    // k19-graph: the live length on the device, and its host copy for the backend's launch plan (ggml_flash_attn_ext_kv_len_set_host)
+    if (self_kv_len && self_kv_len->buffer) {
+        const int32_t n = (int32_t) mctx->get_n_kv_live();
+        ggml_flash_attn_ext_kv_len_set_host(self_kv_len, n);
+        ggml_backend_tensor_set(self_kv_len, &n, 0, sizeof(n));
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -662,6 +669,8 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    res &= (self_kv_len != nullptr) == (mctx->get_n_kv_live() > 0);
 
     return res;
 }
@@ -1568,6 +1577,8 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_kv_len      = nullptr;
+    t_kv_len_n_kv = 0;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -3666,6 +3677,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             ggml_flash_attn_ext_add_sinks(cur, sinks);
             ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
             ggml_prec_set_acc(cur, GGML_PREC_F32);
+            // k19-graph: the live cells of a bucketed n_kv, read on the device (the K / V views of the attention input's cache)
+            if (res->t_kv_len && k->ne[1] == res->t_kv_len_n_kv && kq_mask && kq_mask->ne[0] == k->ne[1]) {
+                ggml_flash_attn_ext_set_kv_len(cur, res->t_kv_len);
+            }
         }
 
         if (v_mla) {
@@ -3868,6 +3883,13 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
+    // k19-graph: a bucketed n_kv whose live length the flash attention reads on the device (see llama_kv_cache::n_kv_bucket_params)
+    if (mctx_cur->get_n_kv_live() > 0 && cparams.flash_attn) {
+        inp->self_kv_len = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+        ggml_set_name(inp->self_kv_len, "attn_kv_len");
+        ggml_set_input(inp->self_kv_len);
+    }
+
     return inp;
 }
 
@@ -3875,6 +3897,8 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+    res->t_kv_len      = inp->self_kv_len;
+    res->t_kv_len_n_kv = mctx_cur->get_n_kv();
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
@@ -4716,6 +4740,8 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
     auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    res->t_kv_len      = inp_attn->self_kv_len;
+    res->t_kv_len_n_kv = mctx_cur->get_attn()->get_n_kv();
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 

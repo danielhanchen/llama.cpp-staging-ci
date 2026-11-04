@@ -80,6 +80,8 @@ public:
 
     // k19-vgraph: see llama_kv_cache::set_n_kv_bucket_allowed (both caches)
     void set_n_kv_bucket_allowed(bool value);
+    // k19-graph: see llama_kv_cache::set_n_kv_bucket_dev_allowed (both caches)
+    void set_n_kv_bucket_dev_allowed(bool value);
 
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }

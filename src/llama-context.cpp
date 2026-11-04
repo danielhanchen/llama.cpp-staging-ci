@@ -4956,6 +4956,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // llm_graph_exact_row_n_kv splits the verify rows by
     if (auto * mem_idx = dynamic_cast<llama_memory_hybrid_idx *>(memory.get())) {
         mem_idx->set_n_kv_bucket_allowed(!(llama_exact_verify_env() || cparams.verify_exact));
+        // k19-graph: the device KV length is read by flash attention only
+        mem_idx->set_n_kv_bucket_dev_allowed(cparams.flash_attn);
     }
 
     while (true) {
