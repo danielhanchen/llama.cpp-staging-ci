@@ -10102,6 +10102,28 @@ struct test_arange : public test_case {
 };
 
 // GGML_OP_KQ_MASK (k15-pp)
+// k19-handoff: GGML_OP_DFLASH2_CONV (the DFlash2 drafter's dynamic grouped conv)
+struct test_dflash2_conv : public test_case {
+    const int64_t H, T;
+    const int K, gs, n_blocks, side;
+
+    std::string vars() override {
+        return VARS_TO_STR6(H, T, K, gs, n_blocks, side);
+    }
+
+    test_dflash2_conv(int64_t H = 2560, int64_t T = 7, int K = 2, int gs = 16, int n_blocks = 1, int side = 0)
+        : H(H), T(T), K(K), gs(gs), n_blocks(n_blocks), side(side) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, T);
+        ggml_tensor * dyn  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (H / gs) * K * 2, T);
+        ggml_tensor * base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H, K, 2);
+        ggml_tensor * out  = ggml_dflash2_conv(ctx, x, dyn, ggml_view_1d(ctx, base, H * K, side * base->nb[2]), K, gs, n_blocks, side);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_kq_mask : public test_case {
     const ggml_type type;
     const int64_t n_kv, n_tps, n_stream;
@@ -13719,6 +13741,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_roll());
     test_cases.emplace_back(new test_roll(3, -2, 1, -1, true));
     test_cases.emplace_back(new test_arange());
+    test_cases.emplace_back(new test_dflash2_conv(2560, 7, 2, 16, 1, 0));
+    test_cases.emplace_back(new test_dflash2_conv(2560, 8, 2, 16, 1, 1));
+    test_cases.emplace_back(new test_dflash2_conv(2560, 512, 2, 16, 1, 0));
+    test_cases.emplace_back(new test_dflash2_conv(2560, 16, 2, 16, 2, 1));
+    test_cases.emplace_back(new test_dflash2_conv(256, 6, 4, 32, 3, 0));
     for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
         test_cases.emplace_back(new test_kq_mask(t, 1024, 64, 1, 0, 0, 0));
         test_cases.emplace_back(new test_kq_mask(t, 4096, 2048, 1, 0, 0, 0));

@@ -408,6 +408,8 @@ llama_build_and_test(test-meta-k15-ops.cpp LINK ggml)
 llama_build_and_test(test-k19-fuse-exact.cpp LINK ggml)
 # k19-moebw routed-expert mat-vec vs the kernels it replaces, byte for byte (SKIP without a CUDA device)
 llama_build_and_test(test-moe-bw-exact.cpp LINK ggml)
+# k19-handoff: ggml_dflash2_conv vs the add / mul / pad chain of the DFlash2 drafter's conv, byte for byte on every device (CPU always)
+llama_build_and_test(test-dflash2-conv-exact.cpp LINK ggml)
 llama_build_and_test(test-spec-type-gguf.cpp)
 # the build identity of the MoE CPU-miss calibration key: unknown-commit builds differ by content, a relaunch keeps its identity
 llama_build_and_test(test-cal-build-id.cpp LINK ggml)

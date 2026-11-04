@@ -155,7 +155,8 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
 static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     // the MoE cache lookup reads and writes per-device slot state through raw pointers, it has no split state
-    if (op->op == GGML_OP_MOE_CACHE_LOOKUP) {
+    // k19-handoff: DFLASH2_CONV (the DFlash2 drafter) has no split state
+    if (op->op == GGML_OP_MOE_CACHE_LOOKUP || op->op == GGML_OP_DFLASH2_CONV) {
         return false;
     }
     // KQ_MASK has no split state either (llama builds it for batches of 64+ tokens): the scheduler puts it on the CPU and copies the

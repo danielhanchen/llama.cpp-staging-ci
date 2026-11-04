@@ -1123,9 +1123,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MOE_CACHE_LOOKUP",
 
     "KQ_MASK",
+
+    "DFLASH2_CONV",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1242,9 +1244,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "moe_cache_lookup(ids, map, state, banks)",
 
     "kq_mask(cells, toks)",
+
+    "dflash2_conv(x, dyn, base)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3456,6 +3460,37 @@ struct ggml_tensor * ggml_mul_mat_id(
 }
 
 // ggml_moe_cache_lookup
+
+struct ggml_tensor * ggml_dflash2_conv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * dyn,
+        struct ggml_tensor  * base,
+        int                   kernel_size,
+        int                   group_size,
+        int                   n_blocks,
+        int                   side) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && dyn->type == GGML_TYPE_F32 && base->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(dyn) && ggml_is_contiguous(base));
+    GGML_ASSERT(kernel_size > 0 && group_size > 0 && n_blocks > 0 && (side == 0 || side == 1));
+    const int64_t H = x->ne[0];
+    const int64_t T = x->ne[1];
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1 && H % group_size == 0 && T % n_blocks == 0);
+    GGML_ASSERT(dyn->ne[0] == (H / group_size) * kernel_size * 2 && ggml_nrows(dyn) == T);
+    GGML_ASSERT(ggml_nelements(base) == H * kernel_size);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, T);
+
+    const int32_t params[4] = { kernel_size, group_size, n_blocks, side };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_DFLASH2_CONV;
+    result->src[0] = x;
+    result->src[1] = dyn;
+    result->src[2] = base;
+
+    return result;
+}
 
 struct ggml_tensor * ggml_kq_mask(
         struct ggml_context * ctx,

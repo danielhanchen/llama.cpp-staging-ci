@@ -506,6 +506,23 @@ static ggml_tensor * build_dflash2_conv(
     if (!ggml_is_contiguous(dynamic) || dynamic->ne[1] != n_tokens) {
         dynamic = ggml_cont_2d(ctx0, dynamic, dynamic->ne[0], n_tokens);
     }
+    // k19-handoff: the chain below in one op with its values (ggml_dflash2_conv: 22 calls of ~9 small kernels per drafter pass on
+    // Flash-Next's DFlash2); LLAMA_DFLASH2_CONV_FUSED=0: the chain
+    static const bool fused = [] {
+        const char * e = getenv("LLAMA_DFLASH2_CONV_FUSED");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (fused && hidden->type == GGML_TYPE_F32 && dynamic->type == GGML_TYPE_F32 && base->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(dynamic) && ggml_is_contiguous(base) && dynamic->ne[0] == n_groups * kernel_size * 2) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LLAMA_LOG_INFO("k19-handoff: DFlash2 conv fused (ggml_dflash2_conv, LLAMA_DFLASH2_CONV_FUSED=0 off)\n");
+        }
+        ggml_tensor * base_1d = ggml_view_1d(ctx0, base, hidden_size * kernel_size, side * base->nb[2]);
+        return ggml_dflash2_conv(ctx0, hidden, dynamic, base_1d, (int) kernel_size, (int) group_size, (int) n_blocks, side);
+    }
+
     ggml_tensor * blocks = ggml_reshape_3d(ctx0, hidden, hidden_size, block_size, n_blocks);
     ggml_tensor * coeffs = ggml_reshape_4d(ctx0, dynamic, n_groups, kernel_size, 2, n_tokens);
     ggml_tensor * coeffs_side = ggml_view_3d(ctx0, coeffs, n_groups, kernel_size, n_tokens,

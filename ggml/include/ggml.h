@@ -607,6 +607,8 @@ extern "C" {
 
         GGML_OP_KQ_MASK,
 
+        GGML_OP_DFLASH2_CONV,
+
         GGML_OP_COUNT,
     };
 
@@ -1535,6 +1537,22 @@ extern "C" {
     // cells: I32 [5, n_kv, n_stream]: position (INT32_MIN = empty cell), sequence bits 0-31, sequence bits 32-63, 2D x, 2D y
     // toks:  I32 [8, n_tps, n_stream]: position, sequence id (< 64), causal, SWA type (enum llama_swa_type), n_swa, 2D (M-RoPE), x, y
     // result: type (F16 or F32) [n_kv, n_tps, 1, n_stream]
+    // k19-handoff: the DFlash2 drafter's dynamic grouped convolution over each block of block_size = T / n_blocks rows, in one op.
+    // x: F32 [H, T] contiguous; dyn: F32 [n_groups * K * 2, T] contiguous (coefficients [n_groups, K, 2 sides]); base: F32 [H * K]
+    // contiguous (the side's base weights [group_size, n_groups, K]); H = group_size * n_groups.
+    // w_k[h, t] = dyn[(h / group_size) + n_groups * (k + K * side), t] + base[h + H * k]; v_k[h, t] = x[h, t - k] within the block, 0.0f
+    // before its start; result = w_0 * v_0, then result = result + w_k * v_k for k = 1 .. min(K, block_size) - 1, each operation rounded
+    // in f32 (no fused multiply-add): the values of the add / mul / pad chain it replaces
+    GGML_API struct ggml_tensor * ggml_dflash2_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * dyn,
+            struct ggml_tensor  * base,
+            int                   kernel_size,
+            int                   group_size,
+            int                   n_blocks,
+            int                   side);
+
     GGML_API struct ggml_tensor * ggml_kq_mask(
             struct ggml_context * ctx,
             struct ggml_tensor  * cells,

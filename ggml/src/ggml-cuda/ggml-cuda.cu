@@ -4,6 +4,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/kq-mask.cuh"
+#include "ggml-cuda/dflash2-conv.cuh"
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -3001,6 +3002,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_KQ_MASK:
             ggml_cuda_op_kq_mask(ctx, dst);
+            break;
+        case GGML_OP_DFLASH2_CONV:
+            ggml_cuda_op_dflash2_conv(ctx, dst);
             break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
@@ -11355,6 +11359,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_moe_cache_lookup_supported(op);
         case GGML_OP_KQ_MASK:
             return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
+        case GGML_OP_DFLASH2_CONV:
+            return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                ggml_is_contiguous(op->src[2]);
         case GGML_OP_DSV4_HC_POST:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&

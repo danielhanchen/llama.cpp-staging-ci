@@ -34,7 +34,8 @@ static bool ggml_backend_remoting_device_supports_op(ggml_backend_dev_t dev, con
     // it; KQ_MASK (llama, batches of 64+ tokens) is then computed by the guest's CPU and its mask uploaded, as the host mask was.
     // MOE_CACHE_LOOKUP's op params hold guest pointers; the GATED_DELTA_NET replay window (op_params[1] != 0) is built by llama only
     // on CUDA / ROCm / MUSA / CPU state buffers
-    if (op->op == GGML_OP_MOE_CACHE_LOOKUP || op->op == GGML_OP_KQ_MASK ||
+    // k19-handoff: DFLASH2_CONV is a fork op the host backend may lack: the guest's CPU computes it
+    if (op->op == GGML_OP_MOE_CACHE_LOOKUP || op->op == GGML_OP_KQ_MASK || op->op == GGML_OP_DFLASH2_CONV ||
             (op->op == GGML_OP_GATED_DELTA_NET && ggml_get_op_params_i32(op, 1) != 0)) {
         return false;
     }

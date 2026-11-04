@@ -2430,6 +2430,54 @@ static bool ggml_compute_forward_batch_invariant(struct ggml_compute_params * pa
     return false;
 }
 
+// k19-handoff: GGML_OP_DFLASH2_CONV (see ggml_dflash2_conv), the rows split over the threads; every multiply and add is rounded on
+// its own, as the add / mul ops it replaces (no contraction into a fused multiply-add)
+#if defined(__clang__)
+#define GGML_DFLASH2_NO_CONTRACT
+#elif defined(__GNUC__)
+#define GGML_DFLASH2_NO_CONTRACT __attribute__((optimize("fp-contract=off")))
+#else
+#define GGML_DFLASH2_NO_CONTRACT
+#endif
+GGML_DFLASH2_NO_CONTRACT
+static void ggml_compute_forward_dflash2_conv(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    const struct ggml_tensor * x    = dst->src[0];
+    const struct ggml_tensor * dyn  = dst->src[1];
+    const struct ggml_tensor * base = dst->src[2];
+    const int32_t K    = ggml_get_op_params_i32(dst, 0);
+    const int32_t gs   = ggml_get_op_params_i32(dst, 1);
+    const int32_t nblk = ggml_get_op_params_i32(dst, 2);
+    const int32_t side = ggml_get_op_params_i32(dst, 3);
+    const int64_t H  = x->ne[0];
+    const int64_t T  = x->ne[1];
+    const int64_t ng = H / gs;
+    const int64_t bs = T / nblk;
+    const int64_t nt = K < bs ? K : bs;
+    const float * xd = (const float *) x->data;
+    const float * dd = (const float *) dyn->data;
+    const float * bd = (const float *) base->data;
+    float       * od = (float *) dst->data;
+    const int64_t dr = dyn->ne[0];
+    for (int64_t t = params->ith; t < T; t += params->nth) {
+        const int64_t j = t % bs;
+        const float * c = dd + t * dr + ng * K * side;
+        for (int64_t h = 0; h < H; ++h) {
+            const int64_t g = h / gs;
+            float r = (c[g] + bd[h]) * xd[t * H + h];
+            for (int64_t k = 1; k < nt; ++k) {
+                const float w = c[g + ng * k] + bd[h + H * k];
+                const float v = j >= k ? xd[(t - k) * H + h] : 0.0f;
+                volatile float m = w * v; // rounded on its own on any compiler
+                r = r + m;
+            }
+            od[t * H + h] = r;
+        }
+    }
+}
+
 // k15-pp: GGML_OP_KQ_MASK (see ggml_kq_mask), the rows split over the threads
 static bool ggml_kq_mask_swa_masked(int32_t swa_type, int32_t n_swa, int32_t p0, int32_t p1) {
     switch (swa_type) {
@@ -2919,6 +2967,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_kq_mask(params, tensor);
             } break;
+        case GGML_OP_DFLASH2_CONV:
+            {
+                ggml_compute_forward_dflash2_conv(params, tensor);
+            } break;
         case GGML_OP_COUNT:
             {
                 GGML_ABORT("fatal error");
@@ -3098,6 +3150,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             }
             break;
         case GGML_OP_KQ_MASK:
+        case GGML_OP_DFLASH2_CONV:
             {
                 n_tasks = n_threads;
             } break;
