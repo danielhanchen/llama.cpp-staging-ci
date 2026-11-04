@@ -2175,6 +2175,55 @@ static bool llama_buft_rows_readable(ggml_backend_buffer_type_t bt) {
     return dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
 }
 
+// the token list of a restricted draft head, sorted and unique: LLAMA_MTP_DRAFT_VOCAB_FILE (int32 ids), else the GGUF array
+// tokenizer.ggml.draft_vocab of meta, else the n first tokens by merge rank / score (llama_vocab::draft_vocab), each plus the control /
+// user-defined tokens
+static std::vector<llama_token> llama_draft_vocab_ids(const llama_vocab & vocab, int32_t n_sub, const gguf_context * meta, std::string & source) {
+    std::vector<llama_token> ids;
+    const int32_t n_vocab = (int32_t) vocab.n_tokens();
+    if (const char * path = getenv("LLAMA_MTP_DRAFT_VOCAB_FILE")) {
+        FILE * f = fopen(path, "rb");
+        if (!f) {
+            throw std::runtime_error(format("LLAMA_MTP_DRAFT_VOCAB_FILE: cannot open %s", path));
+        }
+        int32_t id;
+        while (fread(&id, sizeof(id), 1, f) == 1 && (int32_t) ids.size() < n_sub) {
+            if (id >= 0 && id < n_vocab) {
+                ids.push_back(id);
+            }
+        }
+        fclose(f);
+        source = path;
+    } else {
+        const int kid = meta != nullptr ? gguf_find_key(meta, "tokenizer.ggml.draft_vocab") : -1;
+        if (kid >= 0 && gguf_get_kv_type(meta, kid) == GGUF_TYPE_ARRAY && gguf_get_arr_type(meta, kid) == GGUF_TYPE_INT32) {
+            const int32_t * v = (const int32_t *) gguf_get_arr_data(meta, kid);
+            for (size_t i = 0; i < gguf_get_arr_n(meta, kid) && (int32_t) ids.size() < n_sub; ++i) {
+                if (v[i] >= 0 && v[i] < n_vocab) {
+                    ids.push_back(v[i]);
+                }
+            }
+            source = "tokenizer.ggml.draft_vocab";
+        } else {
+            ids = vocab.draft_vocab(n_sub);
+            source = "merge ranks / scores";
+        }
+        // the control tokens (end of generation, chat template) always: a draft that cannot end a turn rejects there
+        std::vector<char> in(n_vocab, 0);
+        for (llama_token t : ids) {
+            in[t] = 1;
+        }
+        for (int32_t t = 0; t < n_vocab; ++t) {
+            if (!in[t] && (vocab.token_get_attr(t) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED))) {
+                ids.push_back(t);
+            }
+        }
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    return ids;
+}
+
 void llama_model_base::load_tensors_draft_head(llama_model_loader & ml, bool dry) {
     draft_head = {};
     if (hparams.n_layer_nextn == 0) {
@@ -2235,48 +2284,8 @@ void llama_model_base::load_tensors_draft_head(llama_model_loader & ml, bool dry
     }
 
     // the token list
-    std::vector<llama_token> ids;
     std::string source;
-    if (const char * path = getenv("LLAMA_MTP_DRAFT_VOCAB_FILE")) {
-        FILE * f = fopen(path, "rb");
-        if (!f) {
-            throw std::runtime_error(format("LLAMA_MTP_DRAFT_VOCAB_FILE: cannot open %s", path));
-        }
-        int32_t id;
-        while (fread(&id, sizeof(id), 1, f) == 1 && (int32_t) ids.size() < n_sub) {
-            if (id >= 0 && id < n_vocab) {
-                ids.push_back(id);
-            }
-        }
-        fclose(f);
-        source = path;
-    } else {
-        const int kid = gguf_find_key(ml.metadata, "tokenizer.ggml.draft_vocab");
-        if (kid >= 0 && gguf_get_kv_type(ml.metadata, kid) == GGUF_TYPE_ARRAY && gguf_get_arr_type(ml.metadata, kid) == GGUF_TYPE_INT32) {
-            const int32_t * v = (const int32_t *) gguf_get_arr_data(ml.metadata, kid);
-            for (size_t i = 0; i < gguf_get_arr_n(ml.metadata, kid) && (int32_t) ids.size() < n_sub; ++i) {
-                if (v[i] >= 0 && v[i] < n_vocab) {
-                    ids.push_back(v[i]);
-                }
-            }
-            source = "tokenizer.ggml.draft_vocab";
-        } else {
-            ids = vocab.draft_vocab(n_sub);
-            source = "merge ranks / scores";
-        }
-        // the control tokens (end of generation, chat template) always: a draft that cannot end a turn rejects there
-        std::vector<char> in(n_vocab, 0);
-        for (llama_token t : ids) {
-            in[t] = 1;
-        }
-        for (int32_t t = 0; t < n_vocab; ++t) {
-            if (!in[t] && (vocab.token_get_attr(t) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED))) {
-                ids.push_back(t);
-            }
-        }
-    }
-    std::sort(ids.begin(), ids.end());
-    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    std::vector<llama_token> ids = llama_draft_vocab_ids(vocab, n_sub, ml.metadata, source);
     const int32_t n_base = (int32_t) ids.size();
     // rows for the tokens of the requests that the list lacks (identifiers of pasted code, names of a document): their rows are
     // read back from the head, which needs its plain layout (not a CPU repack buffer)
@@ -2358,6 +2367,99 @@ void llama_model_base::load_tensors_draft_head(llama_model_loader & ml, bool dry
     std::vector<ggml_backend_buffer_ptr> bufs;
     bufs.emplace_back(std::move(buf));
     pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
+}
+
+// k19-draftcost: the restricted draft head of a DFlash2 draft. The noise block projects onto the target's lm head (ctx_other), all 248320
+// rows for each of its 8 tokens, and the selector keeps only the top-k (16) of each row (G4 Flash-Next: the head is 0.36 of the 1.47 ms
+// drafter graph; Strata drafts over 106299 tokens at 0.17 ms). The rows of the restricted vocabulary (llama_draft_vocab_ids, plus the
+// LLAMA_MTP_DRAFT_VOCAB_CTX request rows of llama_model_draft_head_add) are copied from the target's head, in its type and on its
+// buffer type, into a head of the draft; the selector takes its top-k over them and maps it to token ids through d2t_i32 (dflash.cpp).
+// Only the drafts change: the target verifies every token. LLAMA_DFLASH_DRAFT_VOCAB=n (default 65536), 0: the full head
+bool llama_model::draft_head_from_target(const llama_model & tgt) {
+    if (draft_head.w != nullptr || arch != LLM_ARCH_DFLASH || dflash_selector_hidden == nullptr || output != nullptr || d2t != nullptr) {
+        return false;
+    }
+    const char * env_n = getenv("LLAMA_DFLASH_DRAFT_VOCAB");
+    int32_t n_sub = env_n ? atoi(env_n) : 65536;
+    if (n_sub <= 0) {
+        return false;
+    }
+    ggml_tensor * src   = tgt.output;
+    ggml_tensor * src_s = tgt.output_s;
+    const int32_t n_vocab = (int32_t) tgt.vocab.n_tokens();
+    if (!src || src->ne[1] != n_vocab || n_vocab != (int32_t) vocab.n_tokens() || src->buffer == nullptr || ggml_n_dims(src) != 2 ||
+            !ggml_is_contiguous(src) || tgt.split_mode() == LLAMA_SPLIT_MODE_ROW) {
+        return false;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(src->buffer);
+    if ((src_s && ggml_nelements(src_s) != 1) || !llama_buft_rows_readable(buft)) {
+        LLAMA_LOG_WARN("%s: the target's lm head %s has per-row scales or is not readable in its plain layout (%s), keeping the "
+                "full-vocabulary DFlash2 draft head\n", __func__, ggml_get_name(src), ggml_backend_buft_name(buft));
+        return false;
+    }
+    std::string source;
+    std::vector<llama_token> ids = llama_draft_vocab_ids(tgt.vocab, n_sub, nullptr, source);
+    const int32_t n_base = (int32_t) ids.size();
+    const char * env_ctx = getenv("LLAMA_MTP_DRAFT_VOCAB_CTX");
+    const int32_t n_ctx_rows = std::max(0, env_ctx ? atoi(env_ctx) : 4096);
+    n_sub = n_base + n_ctx_rows;
+    if (n_base == 0 || n_sub * 10 > n_vocab * 9) {
+        return false;
+    }
+    ids.resize(n_sub, ids[0]);
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ 3*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(ip) };
+    ggml_tensor * sub = ggml_new_tensor_2d(ctx.get(), src->type, src->ne[0], n_sub);
+    ggml_set_name(sub, "dflash_draft_head.weight");
+    ggml_tensor * map64 = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, n_sub);
+    ggml_set_name(map64, "dflash_draft_head.d2t");
+    ggml_tensor * map32 = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, n_sub);
+    ggml_set_name(map32, "dflash_draft_head.d2t_i32");
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+    if (!buf) {
+        LLAMA_LOG_WARN("%s: cannot allocate the %d-token DFlash2 draft head on %s, keeping the full-vocabulary head\n",
+                __func__, n_sub, ggml_backend_buft_name(buft));
+        return false;
+    }
+    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    const size_t rs = src->nb[1];
+    {
+        // one read of the whole head (a per-row read is a device sync each)
+        std::vector<uint8_t> all(ggml_nbytes(src));
+        ggml_backend_tensor_get(src, all.data(), 0, all.size());
+        std::vector<uint8_t> rows((size_t) n_sub * rs);
+        for (int32_t i = 0; i < n_sub; ++i) {
+            memcpy(rows.data() + (size_t) i * rs, all.data() + (size_t) ids[i] * rs, rs);
+        }
+        ggml_backend_tensor_set(sub, rows.data(), 0, rows.size());
+    }
+    std::vector<int64_t> m64(ids.begin(), ids.end());
+    ggml_backend_tensor_set(map64, m64.data(), 0, m64.size() * sizeof(int64_t));
+    ggml_backend_tensor_set(map32, ids.data(), 0, ids.size() * sizeof(int32_t));
+    LLAMA_LOG_INFO("%s: DFlash2 draft head restricted to %d of %d tokens (%s) + %d rows for request tokens, %.1f MiB on %s "
+            "(LLAMA_DFLASH_DRAFT_VOCAB=0: full head)\n", __func__, n_base, n_vocab, source.c_str(), n_ctx_rows,
+            ggml_nbytes(sub) / 1048576.0, ggml_backend_buft_name(buft));
+    draft_head.src     = src;
+    draft_head.w       = sub;
+    draft_head.d2t     = map64;
+    draft_head.d2t_i32 = map32;
+    draft_head.n_base  = n_base;
+    draft_head.n_ctx   = n_ctx_rows;
+    draft_head.next    = 0;
+    draft_head.ids.assign(ids.begin(), ids.end());
+    draft_head.in.assign(n_vocab, 0);
+    for (int32_t i = 0; i < n_base; ++i) {
+        draft_head.in[ids[i]] = 1;
+    }
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    bufs.emplace_back(std::move(buf));
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
+    return true;
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
@@ -4454,6 +4556,10 @@ int32_t llama_model_draft_head_add(const struct llama_model * model_c, const lla
     }
     if (n_added > 0) {
         ggml_backend_tensor_set(dh.d2t, dh.ids.data(), 0, dh.ids.size() * sizeof(int64_t));
+        if (dh.d2t_i32 != nullptr) {
+            std::vector<int32_t> m32(dh.ids.begin(), dh.ids.end());
+            ggml_backend_tensor_set(dh.d2t_i32, m32.data(), 0, m32.size() * sizeof(int32_t));
+        }
     }
     return n_added;
 }

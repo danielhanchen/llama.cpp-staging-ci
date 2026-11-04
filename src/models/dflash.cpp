@@ -547,7 +547,8 @@ static ggml_tensor * build_dflash2_conv(
 
 // DFlash2 selector: top-k candidates per block position plus the pairwise
 // transition scores, packed into the nextn output slot for the CPU-side walk.
-static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+// d2t: the token id of each logits row as I32 [1, n_rows] (a restricted draft head), else null (the rows are the token ids)
+static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens, ggml_tensor * d2t) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -572,6 +573,9 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
     ggml_tensor * unary       = ggml_reshape_2d(ctx0,
             ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);
+    if (d2t) {
+        candidates = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, d2t, ggml_reshape_1d(ctx0, candidates, top_k * n_tokens)), top_k, n_tokens);
+    }
     ggml_tensor * gate        = g.build_lora_mm(model.dflash_selector_hidden, res->t_embd);
 
     // Everything below indexes [.., tokens_per_block, n_blocks]: the block
@@ -1060,7 +1064,22 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         output_s = model_other->output_s;
     }
 
-    cur = build_lora_mm(output, cur, output_s);
+    // k19-draftcost: a DFlash2 draft with a restricted head (llama_model::draft_head_from_target) projects onto its rows only; the
+    // selector maps its top-k to token ids (build_dflash2_selector) and nothing reads these logits
+    const auto & dh = model.draft_head;
+    const bool dh_on = model.dflash_selector_hidden && dh.w != nullptr && dh.d2t_i32 != nullptr && dh.src == output;
+    if (dh_on) {
+        cur = build_hadamard_input(output, cur);
+        cur = ggml_mul_mat(ctx0, dh.w, cur); // [n_sub, n_tokens]
+        if (prec_policy) {
+            prec_policy->apply(cur);
+        }
+        if (output_s) {
+            cur = ggml_mul(ctx0, cur, output_s); // a single scale (per-row scales keep the full head)
+        }
+    } else {
+        cur = build_lora_mm(output, cur, output_s);
+    }
 
     // DFlash2 feeds these logits to the selector, so they need the target's output
     // transforms; DFlash1 and DSpark read them through the sampler instead
@@ -1099,7 +1118,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     if (model.dflash_selector_hidden) {
-        build_dflash2_selector(*this, model, inp_tokens);
+        build_dflash2_selector(*this, model, inp_tokens, dh_on ? dh.d2t_i32 : nullptr);
     } else if (model.lilicorr_pass_hidden_proj && ubatch.embd_state && n_tokens == (int64_t) hparams.dflash_block_size * ubatch.n_seqs_unq) {
         build_lilicorr_scores(*this, model, tok_embd, inp_anchor);
     }

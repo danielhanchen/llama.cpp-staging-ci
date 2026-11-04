@@ -461,6 +461,10 @@ llama_context::llama_context(
                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
             }
             cparams.ctx_other = params.ctx_other;
+            // k19-draftcost: a DFlash2 draft drafts over a restricted vocabulary of the target's head (LLAMA_DFLASH_DRAFT_VOCAB)
+            if (model.arch == LLM_ARCH_DFLASH && model.output == nullptr) {
+                const_cast<llama_model &>(model).draft_head_from_target(*llama_get_model(params.ctx_other));
+            }
         }
     }
 

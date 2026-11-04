@@ -735,6 +735,7 @@ struct llama_model {
         ggml_tensor * src = nullptr;
         ggml_tensor * w   = nullptr;
         ggml_tensor * d2t = nullptr;
+        ggml_tensor * d2t_i32 = nullptr; // the same ids as I32 [1, n] (a DFlash2 draft maps its top-k rows with get_rows), or null
         int32_t n_base = 0;              // rows of the frequent-token list
         int32_t n_ctx  = 0;              // rows for request tokens after them (LLAMA_MTP_DRAFT_VOCAB_CTX, default 4096)
         int32_t next   = 0;              // the request-token row written next (ring)
@@ -938,6 +939,11 @@ struct llama_model {
     bool   weights_evicted() const;
     bool   weights_evictable() const;       // false once the lend is disabled (the buffers can still be restored)
     size_t weights_evictable_bytes() const; // the host copy the lend needs
+    // k19-draftcost: a DFlash2 draft (which projects with the target's lm head, ctx_other) gets the restricted draft head cut from
+    // that head (draft_head; LLAMA_DFLASH_DRAFT_VOCAB, see llama_model::draft_head_from_target); true if made. Call once, before the
+    // draft context reserves its graphs
+    bool draft_head_from_target(const llama_model & tgt);
+
     // k19-fixG: the target model whose token_embd / output an MTP draft model borrows (llama_model_params::model_shared), or null
     const llama_model * model_shared() const { return params.model_shared; }
     void   weights_lend_disable();

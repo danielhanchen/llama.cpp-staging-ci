@@ -1209,6 +1209,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        if (is_dflash2) {
+            // k19-draftcost: the restricted DFlash2 draft head (LLAMA_DFLASH_DRAFT_VOCAB) gets rows for the prompt's tokens it lacks
+            const int32_t n_add = llama_model_draft_head_add(llama_get_model(params.ctx_dft), prompt.data(), N);
+            if (n_add > 0) {
+                SPC_DBG("%s: draft head: %d prompt tokens added\n", __func__, n_add);
+            }
+        }
+
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
         if (pos_max < N - 1) {
             LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - process() did not run on every prefill ubatch. "
