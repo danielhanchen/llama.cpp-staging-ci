@@ -304,6 +304,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-rs-replay-meta PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # -sm tensor with MTP drafting: the restricted draft head (request-token rows read from the vocabulary-split LM head) and the
+    # full head run on Meta(CPU, CPU) and give the tokens of the CPU run
+    llama_build(test-mtp-meta.cpp)
+    llama_test(
+        test-mtp-meta
+        LABEL main
+        ARGS "${MODEL_DIR}/mtp/qwen35moe-mtp.gguf"
+    )
+    set_tests_properties(test-mtp-meta PROPERTIES FIXTURES_REQUIRED generate-models)
+
     # the greedy fast path of common_sampler_sample samples what the sampler chain samples, in every mode of its env knobs
     llama_build(test-sampling-greedy-fast.cpp)
     foreach(GF_ENV "" "LLAMA_SAMPLE_GREEDY_FAST=0" "LLAMA_SAMPLE_GREEDY_FAST=1" "LLAMA_SAMPLE_GREEDY_FAST=3"
@@ -385,6 +395,8 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+# --fit: the run-time reserve of a small-device placement (common/fit.h)
+llama_build_and_test(test-fit-small-reserve.cpp)
 # token-tiled gated delta-net vs the AR kernel, byte for byte on the GPU backend (SKIP without one)
 llama_build_and_test(test-gdn-tiled-exact.cpp LINK ggml)
 # the ops added here (KQ_MASK, MOE_CACHE_LOOKUP, the GDN replay window) are refused by the meta backend (-sm tensor) and RPC and run on the CPU

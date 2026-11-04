@@ -59,6 +59,25 @@ bool common_fit_small_device() {
     return g_small_device;
 }
 
+int64_t common_fit_small_reserve_mib(int64_t cache_mib) {
+    static const int64_t reserve_mib = [] {
+        const char * e = getenv("LLAMA_FIT_SMALL_RESERVE_MIB");
+        return e != nullptr ? std::max<int64_t>(0, atoll(e)) : 128;
+    }();
+    static const int64_t floor_mib = [] {
+        const char * e = getenv("LLAMA_FIT_SMALL_RESERVE_MIN_CACHE_MIB");
+        return e != nullptr ? std::max<int64_t>(0, atoll(e)) : 64;
+    }();
+    return common_fit_small_reserve_plan(cache_mib, reserve_mib, floor_mib);
+}
+
+int64_t common_fit_small_reserve_plan(int64_t cache_mib, int64_t reserve_mib, int64_t floor_mib) {
+    if (reserve_mib <= 0 || cache_mib <= floor_mib) {
+        return 0;
+    }
+    return std::min(reserve_mib, cache_mib - floor_mib);
+}
+
 // the margin of a device beside a MoE cache for the default margin m (see common_fit_set_moe_margin_auto)
 static int64_t common_fit_moe_margin(int64_t m, int64_t free_dev, int64_t cache_want, bool has_drafter) {
     constexpr int64_t MiB_ = 1024*1024;
@@ -1319,6 +1338,29 @@ static void common_params_fit_impl(
                             cparams->moe_cache_size = size_unc;
                             dmds_cpu_moe = dmds_unc;
                             g_moe_margin_gain = gain_unc;
+                        }
+                    }
+                    // k19-tierfix-fit: the run-time reserve (common_fit_small_reserve_mib) is added to the reduced margin, taken from the
+                    // cache down to its floor; the placement of before is kept where that one does not fit. Only at the first reduced
+                    // margin: a placement that needed the second one (LLAMA_FIT_SMALL_MARGIN_MIN_MIB, the MTP margin) has no room for it
+                    if (ok && m_ok == small_mib) {
+                        const int64_t extra_mib = common_fit_small_reserve_mib(int64_t(cparams->moe_cache_size/MiB));
+                        if (extra_mib > 0) {
+                            const size_t  size_ok   = cparams->moe_cache_size;
+                            const dmds_t  dmds_ok   = dmds_cpu_moe;
+                            const int64_t gain_ok   = g_moe_margin_gain;
+                            const int64_t margin_ok = margins[0];
+                            if (try_fit(size_before, dmds_cpu_moe_req, m_ok + extra_mib)) {
+                                LOG_INF("%s: small device: %" PRId64 " MiB of the MoE cache kept free for the run-time buffers (CUDA pool, "
+                                    "graphs, streams): cache %zu -> %zu MiB (LLAMA_FIT_SMALL_RESERVE_MIB=0 keeps the cache)\n", __func__,
+                                    extra_mib, size_ok/MiB, cparams->moe_cache_size/MiB);
+                                m_ok += extra_mib;
+                            } else {
+                                cparams->moe_cache_size = size_ok;
+                                dmds_cpu_moe            = dmds_ok;
+                                g_moe_margin_gain       = gain_ok;
+                                margins[0]              = margin_ok;
+                            }
                         }
                     }
                     if (ok) {

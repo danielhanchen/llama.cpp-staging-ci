@@ -78,7 +78,8 @@ void llama_model_saver::add_kv(const enum llm_kv key, const char value) {
 template <typename Container>
 void llama_model_saver::add_kv(const enum llm_kv key, const Container & value, const bool per_layer) {
     GGML_ASSERT(model != nullptr || !per_layer);
-    const size_t n_values = per_layer ? size_t(model->hparams.n_layer()) : value.size();
+    // per layer: every block of block_count (n_layer_all), the NextN / MTP blocks included, as the loader reads them
+    const size_t n_values = per_layer ? size_t(model->hparams.n_layer_all) : value.size();
     GGML_ASSERT(n_values <= value.size());
 
     if (n_values == 0) {
@@ -123,6 +124,7 @@ void llama_model_saver::add_kv(const enum llm_kv key, const Container & value, c
 template void llama_model_saver::add_kv<std::vector<uint32_t>>(const enum llm_kv, const std::vector<uint32_t> &, const bool);
 template void llama_model_saver::add_kv<std::vector<float>>(const enum llm_kv, const std::vector<float> &, const bool);
 template void llama_model_saver::add_kv<std::vector<uint64_t>>(const enum llm_kv, const std::vector<uint64_t> &, const bool);
+template void llama_model_saver::add_kv<std::vector<int32_t>>(const enum llm_kv, const std::vector<int32_t> &, const bool);
 
 void llama_model_saver::add_kv(const enum llm_kv key, const std::vector<std::string> & value) {
     std::vector<const char *> tmp(value.size());

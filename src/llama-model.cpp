@@ -2168,6 +2168,10 @@ static bool llama_buft_rows_readable(ggml_backend_buffer_type_t bt) {
     if (bt == ggml_backend_cpu_buffer_type() || strstr(ggml_backend_buft_name(bt), "_Host") != nullptr) {
         return true;
     }
+    ggml_backend_dev_t dev_bt = ggml_backend_buft_get_device(bt);
+    if (dev_bt != nullptr && ggml_backend_dev_type(dev_bt) == GGML_BACKEND_DEVICE_TYPE_META) {
+        return true; // -sm tensor: the meta buffer reads its rows from the devices' plain buffers (Meta(CPU, CPU) is a host buffer too)
+    }
     if (ggml_backend_buft_is_host(bt)) {
         return false;
     }

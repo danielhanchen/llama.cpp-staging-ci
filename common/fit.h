@@ -62,6 +62,18 @@ int64_t common_fit_moe_margin_gain();
 // k13-small: the fit kept every layer on a small device with the reduced margin (LLAMA_FIT_SMALL_MARGIN_MIB); set once per process
 bool    common_fit_small_device();
 
+// k19-tierfix-fit: the run-time reserve of a small-device placement, in MiB added to its reduced margin and taken from its cache.
+// The placement is measured at the reserve sizes of its buffers; what runs later allocates more in the margin: the CUDA pool of
+// full-ubatch expert products, the CUDA graphs and streams of the decode and prompt paths, the layer-major groups (which merge only
+// with 128 MiB of headroom left). G4 capped at 8 GB, Qwen3.8-Flash-Next UD-IQ4_XS, -ub 2048: margin 256 MiB, 277 MiB projected free,
+// 110.6 MiB free at the first 8k group with the route tail skip and none with it off (CUDA graphs failed to instantiate in the chat
+// decode, then a stream creation aborted). The cache keeps at least floor_mib (a cache group needs n_expert_used slots):
+//   - common_fit_small_reserve_plan: min(reserve_mib, cache_mib - floor_mib), 0 when the cache is not above the floor
+//   - common_fit_small_reserve_mib: the plan with LLAMA_FIT_SMALL_RESERVE_MIB (128, 0 = off: the margin of before) and
+//     LLAMA_FIT_SMALL_RESERVE_MIN_CACHE_MIB (64)
+int64_t common_fit_small_reserve_plan(int64_t cache_mib, int64_t reserve_mib, int64_t floor_mib);
+int64_t common_fit_small_reserve_mib(int64_t cache_mib);
+
 // print estimated memory to stdout
 void common_fit_print(
                          const char * path_model,

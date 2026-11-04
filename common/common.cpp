@@ -3373,12 +3373,17 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             // ctx 16384 ran out of device memory at the first prompt save in 2 of 2 launches (k15g4c8), with LLAMA_STATE_CAPTURE_MAX=1 too.
             // The capture is dropped there as above (the server checkpoints as with LLAMA_LM_CKPT_CAPTURE=0; md5 = k14); the placement
             // is the fit's, unchanged. LLAMA_FIT_CAPTURE_GUARD=0 keeps the capture
+            // k19-tierfix-fit: also where --fit dropped the draft model: cparams.spec_draft stays set (layer-major prompts), so the
+            // server still captures and the snapshots are allocated from the margin all the same. G4 capped at 8 GB, Qwen3.8-Flash-Next
+            // UD-IQ4_XS + the dropped Q8_0 MTP drafter: the 8k prompt asked for 112.57 MiB snapshots with 110.56 MiB free (3 times in
+            // a prompt). LLAMA_FIT_CAPTURE_GUARD_DROPPED=0 keeps the capture beside a dropped draft
             static const bool guard      = getenv("LLAMA_FIT_CAPTURE_GUARD") == nullptr || atoi(getenv("LLAMA_FIT_CAPTURE_GUARD")) != 0;
-            if (!counted && guard && cparams_in.n_state_capture < 0 && cparams.n_state_capture < 0 && cparams_in.spec_draft && !draft_off &&
+            static const bool guard_drop = getenv("LLAMA_FIT_CAPTURE_GUARD_DROPPED") == nullptr || atoi(getenv("LLAMA_FIT_CAPTURE_GUARD_DROPPED")) != 0;
+            if (!counted && guard && cparams_in.n_state_capture < 0 && cparams.n_state_capture < 0 && cparams_in.spec_draft && (!draft_off || guard_drop) &&
                     n_layer > 0 && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && (common_fit_small_device() || layers() < n_layer + 1)) {
                 cparams.n_state_capture = 0;
-                COM_INF("%s: --fit: %s: no state capture (its snapshots are not counted and would not fit; LLAMA_FIT_CAPTURE_GUARD=0 keeps it)\n",
-                    __func__, common_fit_small_device() ? "small device" : "layers in system memory");
+                COM_INF("%s: --fit: %s%s: no state capture (its snapshots are not counted and would not fit; LLAMA_FIT_CAPTURE_GUARD=0 keeps it)\n",
+                    __func__, common_fit_small_device() ? "small device" : "layers in system memory", draft_off ? ", draft model dropped" : "");
             }
         }
         // k15-small4 (after the k15-c capture shrink, from the same inputs): an MTP drafter (the target's own NextN layers, no -md) that costs whole layers on a small device is dropped, as a
