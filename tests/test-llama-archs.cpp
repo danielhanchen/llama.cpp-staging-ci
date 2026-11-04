@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <filesystem>
 #include <random>
 #include <regex>
 #include <stdexcept>
@@ -1040,6 +1041,54 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
             const std::string path = dir + "/" + llm_arch_name(arch) + (moe ? "-moe.gguf" : "-dense.gguf");
             LOG_INF("%s: Saving %s model (%s) to %s...\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense", path.c_str());
             llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
+        }
+    }
+    // a qwen35moe with its NextN (MTP) block, for test-mtp-meta; in a directory of its own (test-llama-context loads every model of dir)
+    if (arch_matches(arch_filter, LLM_ARCH_QWEN35MOE)) {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN35MOE, true);
+        const std::string arch = llm_arch_name(LLM_ARCH_QWEN35MOE);
+        const int64_t kid = gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str());
+        GGML_ASSERT(kid >= 0);
+        gguf_set_val_u32(gguf_ctx.get(), (arch + ".block_count").c_str(), gguf_get_val_u32(gguf_ctx.get(), kid) + 1);
+        gguf_set_val_u32(gguf_ctx.get(), (arch + ".nextn_predict_layers").c_str(), 1);
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback = silent_model_load_progress;
+        std::vector<ggml_backend_dev_t> devs = { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr };
+        model_params.devices         = devs.data();
+        model_params.use_extra_bufts = false;
+        model_params.load_mtp        = true;
+        tensor_data_params tensor_params = { seed, stdev };
+        llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
+        if (!model) {
+            LOG_ERR("%s: failed to create the qwen35moe MTP model\n", __func__);
+            llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+            return 1;
+        }
+        std::filesystem::create_directories(dir + "/mtp");
+        const std::string path = dir + "/mtp/" + arch + "-mtp.gguf";
+        LOG_INF("%s: Saving %s model (MTP) to %s...\n", __func__, arch.c_str(), path.c_str());
+        const std::string path_tmp = path + ".tmp";
+        llama_model_save_to_file(model.get(), path_tmp.c_str());
+        // without the NextN block's own LM head (as the Qwen3.5 / 3.6 GGUFs): the MTP graph projects with output.weight, which a
+        // tensor split divides by vocabulary rows
+        ggml_context * tctx = nullptr;
+        gguf_context_ptr src(gguf_init_from_file(path_tmp.c_str(), { /*.no_alloc =*/ false, /*.ctx =*/ &tctx }));
+        GGML_ASSERT(src && tctx != nullptr);
+        gguf_context_ptr dst(gguf_init_empty());
+        gguf_set_kv(dst.get(), src.get());
+        for (int64_t i = 0; i < gguf_get_n_tensors(src.get()); ++i) {
+            const char * name = gguf_get_tensor_name(src.get(), i);
+            if (strstr(name, "nextn.shared_head_head") == nullptr) {
+                gguf_add_tensor(dst.get(), ggml_get_tensor(tctx, name));
+            }
+        }
+        const bool ok = gguf_write_to_file(dst.get(), path.c_str(), false);
+        ggml_free(tctx);
+        std::remove(path_tmp.c_str());
+        if (!ok) {
+            LOG_ERR("%s: failed to write %s\n", __func__, path.c_str());
+            llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+            return 1;
         }
     }
     llama_log_set(ud.log_old.callback, ud.log_old.user_data);

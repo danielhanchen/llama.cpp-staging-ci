@@ -304,6 +304,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-rs-replay-meta PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # -sm tensor with MTP drafting: the restricted draft head (request-token rows read from the vocabulary-split LM head) and the
+    # full head run on Meta(CPU, CPU) and give the tokens of the CPU run
+    llama_build(test-mtp-meta.cpp)
+    llama_test(
+        test-mtp-meta
+        LABEL main
+        ARGS "${MODEL_DIR}/mtp/qwen35moe-mtp.gguf"
+    )
+    set_tests_properties(test-mtp-meta PROPERTIES FIXTURES_REQUIRED generate-models)
+
     # the greedy fast path of common_sampler_sample samples what the sampler chain samples, in every mode of its env knobs
     llama_build(test-sampling-greedy-fast.cpp)
     foreach(GF_ENV "" "LLAMA_SAMPLE_GREEDY_FAST=0" "LLAMA_SAMPLE_GREEDY_FAST=1" "LLAMA_SAMPLE_GREEDY_FAST=3"
