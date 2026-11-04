@@ -3467,10 +3467,11 @@ static int ggml_iq_avx512_mode(void) {
     static int mode = -1;
     if (mode < 0) {
         const char * e = getenv("GGML_CPU_IQ_AVX512");
-        mode = e == NULL ? 1 : atoi(e);
-        if (mode < 0 || mode > 2) {
-            mode = 1;
+        int m = e == NULL ? 1 : atoi(e);
+        if (m < 0 || m > 2) {
+            m = 1;
         }
+        mode = m;
     }
     return mode;
 }
@@ -3591,6 +3592,15 @@ static void ggml_vec_dot_iq3_s_q8_K_multi_avx512(int n, float * GGML_RESTRICT s,
 }
 
 #endif // k19-hostrow AVX-512
+
+// k19-hostrow: once per process (ggml_cpu_init), which IQ3_S kernel this CPU variant runs
+void ggml_cpu_iq_kernels_log(void) {
+#if defined(GGML_IQ_AVX512)
+    const int m = ggml_iq_avx512_mode();
+    GGML_LOG_INFO("ggml-cpu: IQ3_S dot products on the %s (GGML_CPU_IQ_AVX512=%d)\n",
+        m == 0 ? "AVX2 kernel" : m == 1 ? "AVX-512 kernel, grid gather" : "AVX-512 kernel, grid inserts", m);
+#endif
+}
 
 void ggml_vec_dot_iq3_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK_K == 0);
