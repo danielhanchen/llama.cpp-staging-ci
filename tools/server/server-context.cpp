@@ -273,6 +273,26 @@ struct server_pass_timer {
         dg.t_launch = dg.t_wait = dg.t_walk = dg.n_draft = 0;
     }
 };
+// k19-handoff: the server yields its task queue to a worker while a decode runs; ending a yield waits for that worker to wake and
+// stop (two thread hand-offs), which a short speculative pass pays three times (draft, verify, the drafter's pass over the rows).
+// LLAMA_SERVER_YIELD_SMALL=0: work of at most 32 tokens runs without the yield (queued tasks then wait for the end of the pass);
+// default 1 = always yield, as before
+static bool srv_yield_small() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_SERVER_YIELD_SMALL");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return v;
+}
+template <typename Q, typename F>
+static void srv_yield_or_run(Q & q, bool small, F && f) {
+    if (small && !srv_yield_small()) {
+        f();
+        return;
+    }
+    q.yield_to_queue(std::forward<F>(f));
+}
+
 static server_pass_timer & srv_pass_timer() {
     static server_pass_timer t;
     return t;
@@ -4862,7 +4882,7 @@ private:
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             srv_pass_timer().stamp(server_pass_timer::DRAFT0);
-            queue_tasks.yield_to_queue([&]() {
+            srv_yield_or_run(queue_tasks, true, [&]() {
                 common_speculative_draft(spec.get());
             });
             srv_pass_timer().stamp(server_pass_timer::DRAFT1);
@@ -5823,7 +5843,7 @@ private:
             srv_pass_timer().stamp(server_pass_timer::DEC0);
             srv_pass_timer().width = batch.view.size();
         }
-        queue_tasks.yield_to_queue([&]() {
+        srv_yield_or_run(queue_tasks, batch.view.size() <= 32, [&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             srv_ph("target returned");
             if (pt_on) {
@@ -6113,7 +6133,7 @@ private:
             if (pt_on) {
                 srv_pass_timer().stamp(server_pass_timer::PROC0);
             }
-            queue_tasks.yield_to_queue([&]() {
+            srv_yield_or_run(queue_tasks, batch.view.size() <= 32, [&]() {
                 if (!ok || bg || skip || dft_off) {
                     return;
                 }
