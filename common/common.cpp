@@ -2691,12 +2691,13 @@ static bool common_fit_draft_on_cpu(
     if (const char * e = getenv("LLAMA_FIT_DRAFT_MIN_TOKENS_REQUANT")) {
         rq_min_tok = std::max(0.0, atof(e));
     }
-    // k19-draftcost (LLAMA_FIT_DRAFT_REQUANT_SHARE, default 0.25; 0 = only the rescue above): a draft admitted at its file's types that
-    // takes more than this share of the cache it would get is requantized the same way when that leaves a larger cache. Strata's MTP
-    // layer holds 871 MiB (Q2_0 experts) against our Q8_0 drafter's 3109 MiB: G4 Qwen3.8-Flash-Next UD-IQ4_XS 16 GB, cache 8271 -> 4576
-    // MiB with the Q8_0 drafter (45% of it). At 32 GB the drafter is 13% of the cache, so it keeps its types. Drafts are verified: only
-    // the acceptance and the cache size move (q3_k experts drafted as well as Q8_0 ones on the same text, plans/k16_draft.md section 6b)
-    double rq_share = 0.25;
+    // k19-draftcost (LLAMA_FIT_DRAFT_REQUANT_SHARE, default 0.10; 0 = only the rescue above): a draft admitted at its file's types that
+    // takes more than this share of the cache it would get is requantized the same way, which leaves a larger cache. Strata's MTP layer
+    // holds 871 MiB (Q2_0 experts). G4 Qwen3.8-Flash-Next UD-IQ4_XS 32 GB ctx 32768 + its Q8_0 MTP drafter (3109 MiB, 12.5% of the
+    // 24800 MiB cache): 1608 MiB requantized, cache 21687 -> 23187 MiB, decode chat / 8k / 30k +4.5 / +18 / +20%. Its Q4_K_M drafter at
+    // 16 GB (2229 MiB, 31%) was admitted as is with a smaller cache than the rescued Q8_0 one. Drafts are verified: only the acceptance
+    // and the cache size move (same text, full card: the requantized drafter accepts 4.20 / 3.88 tokens per pass against Q8_0's 4.13 / 3.88)
+    double rq_share = 0.10;
     if (const char * e = getenv("LLAMA_FIT_DRAFT_REQUANT_SHARE")) {
         rq_share = std::max(0.0, atof(e));
     }
