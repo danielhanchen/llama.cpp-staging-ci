@@ -988,6 +988,18 @@ struct llama_moe_cache::impl {
     // LLAMA_MOE_CPU_MISS_FROZEN_FETCH=1: the freeze pins only the decisions (host path on for the frozen sizes, no trials or windows);
     // small batches still fetch their share and the assign still admits, so the cache follows the decode (not exact under drafts)
     bool     cm_frozen_fetch = false;
+    // k19-flint LLAMA_MOE_CPU_MISS_DECODE (default 0 = off; 1 = on): decode batches of 1..LLAMA_MOE_CPU_MISS_DECODE_MAX tokens (default
+    // and at most the mailbox's single-graph sizes) take the host path at the fixed fetch share LLAMA_MOE_CPU_MISS_DECODE_SHARE (default
+    // 1/8) once calibrated, with no cost-model or timing-trial verdict: the device fetches the misses with the highest use counters
+    // (staged, they become hits) and the host team computes the rest through the mailbox while the device computes the hits. Where the
+    // cache holds a large share of the experts (Colab L4 Flint 16 GB, 55.8%) the timing trials only count batches of the sizes the rule
+    // turned on (3 and more there), n-gram verify windows are too rare to fill one, so the warm phase's "host path off" stays for the
+    // whole launch (0 host experts) and every single-token miss is read over PCIe (~44 experts, 80 MiB per pass). Only with the mailbox
+    // (no per-layer graph split) and not with frozen small batches. The host's expert products are not the device's bit for bit (int8
+    // activations on the host): other text, KLD-gated; the share is fixed, so one prompt gives one text in every launch
+    int      cm_dec_on    = -1;    // -1 not read yet
+    int64_t  cm_dec_max   = 0;
+    float    cm_dec_share = 0.125f;
     bool     cm_small_ok   = true;  // the last trial kept the host path for small batches
     bool     cm_small_live = true;  // the graphs of small batches use it now
     int      cmt_done   = -1;       // small batches of the running trial, -1 if none
@@ -2168,6 +2180,7 @@ struct llama_moe_cache::impl {
     int  single_form_state = 0; // 0: no MoE layer seen, 1: every one has the form, -1: one does not (or no mailboxes on its device)
     void single_note_form(int32_t il, bool ok) {
         if (!ok) {
+            cm_gen += single_form_state != -1 && cm_dec_on > 0 ? 1 : 0; // k19-flint: the decode host path is off from now on
             single_form_state = -1;
         } else if (single_form_state == 0) {
             ggml_backend_dev_t dev = il >= 0 && il < (int32_t) layers.size() && layers[il].ig >= 0 ? ggml_backend_get_device(backend(il)) : nullptr;
@@ -2175,6 +2188,7 @@ struct llama_moe_cache::impl {
             const bool alloc = reg != nullptr && ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_mailbox_alloc") != nullptr &&
                 (!single_auto || strcmp(ggml_backend_reg_name(reg), "CUDA") == 0);
             single_form_state = alloc ? 1 : -1;
+            cm_gen += !alloc && cm_dec_on > 0 ? 1 : 0;
             if (single_form_state == 1) {
                 cm_skip_trials(true);
             }
@@ -5066,6 +5080,23 @@ struct llama_moe_cache::impl {
             (pt_eligible(n_tokens) && pt_arm != 0) || short_eligible(n_tokens));
     }
 
+    void cm_dec_init() {
+        if (cm_dec_on >= 0) {
+            return;
+        }
+        const char * e  = getenv("LLAMA_MOE_CPU_MISS_DECODE");
+        const char * em = getenv("LLAMA_MOE_CPU_MISS_DECODE_MAX");
+        const char * es = getenv("LLAMA_MOE_CPU_MISS_DECODE_SHARE");
+        cm_dec_on    = e != nullptr && atoi(e) != 0 ? 1 : 0;
+        cm_dec_max   = std::max<int64_t>(1, std::min<int64_t>(single_max_tok, em != nullptr && atoi(em) > 0 ? atoi(em) : single_max_tok));
+        cm_dec_share = es != nullptr ? (float) std::min(1.0, std::max(0.0, atof(es))) : 0.125f;
+    }
+    // k19-flint: a decode batch of n_tokens on the fixed-share host path (LLAMA_MOE_CPU_MISS_DECODE)
+    bool cm_decode(int64_t n_tokens) const {
+        return cm_dec_on > 0 && cm && cm_cal && !cm_force && !cm_frozen && n_tokens >= 1 && n_tokens <= cm_dec_max && n_tokens <= max_batch &&
+            n_tokens <= cm_max && single_form_state >= 0 && single_usable(n_tokens);
+    }
+
     // the host computes the misses of a batch of n_tokens: the fetch share, 1 = every missing expert is fetched
     float cm_share_of(int64_t n_tokens) const {
         if (cm_prompt_off()) {
@@ -5073,6 +5104,9 @@ struct llama_moe_cache::impl {
         }
         if (cm_frozen && !cm_frozen_fetch && cm && cm_cal && n_tokens >= 1 && n_tokens <= std::min<int64_t>({ cm_frozen_max, max_batch, cm_max })) {
             return 0.0f;
+        }
+        if (cm_decode(n_tokens)) {
+            return cm_dec_share;
         }
         if (cm && cm_cal && n_tokens > max_batch && n_tokens <= cm_prompt_force) {
             // default: at most 1/4 fetched. The rule's share (capped at 3/4) left 71 ms of zero-copy fetch kernels in a 38-token LFM2.5 8 GB
@@ -5096,6 +5130,9 @@ struct llama_moe_cache::impl {
     bool cm_any_on() const {
         if (!cm || !cm_cal) {
             return false;
+        }
+        if (cm_decode(1)) {
+            return true;
         }
         for (int64_t n = 1; n <= cm_max; ++n) {
             if (n > max_batch && pt_eligible(n) && pt_state != 0) {
@@ -6193,6 +6230,7 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: fetch share now %.3f (1 token), %.3f (4)\n", tag, cm_share[1], cm_share[std::min<int64_t>(4, cm_max)]);
             return;
         }
+        cm_dec_init();
         cm_cal = true;
         cm_recal_wait = cm_from_file ? -1 : cm_recal_after; // k19-determinism: no re-calibration from a persisted one
         // the first prompt and tokens run before any measured miss rate: a prior from the cached share c of the experts, (1 - c)^4
@@ -6237,6 +6275,12 @@ struct llama_moe_cache::impl {
             "decided from a prior miss rate, then from the measured one after %d small batches (%.1f ms)\n", tag,
             cm_t1, g.expert_bytes/cm_t1/1e3, cm_dt, cm_tup, g.expert_bytes/cm_tup/1e3, cm_split, cm_share[1], cm_share[std::min<int64_t>(4, cm_max)],
             (int) std::min<int64_t>(4, cm_max), cm_share[cm_max], cm_max, n_max_share, cm_skip + cm_win1, (ggml_time_us() - t_start)/1e3);
+        if (cm_dec_on > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: k19-flint decode host path (LLAMA_MOE_CPU_MISS_DECODE=1): batches of 1..%" PRId64 " tokens "
+                "fetch %.3f of their missing experts (the most used) and the host computes the rest through the mailbox, no rule or trial "
+                "(%s; changes the output, KLD-gated)\n", tag, cm_dec_max, cm_dec_share,
+                cm_decode(1) ? "mailbox usable" : "not used here: no single-graph mailbox, frozen small batches or LLAMA_MOE_CPU_MISS=2");
+        }
     }
 
     // true if the host path took at least cmt_host_bad times as long as the plain cache
@@ -6250,7 +6294,7 @@ struct llama_moe_cache::impl {
 
     // a small batch whose size the model lets the host path take (the trial times only those)
     bool cmt_counted(int64_t n_tokens) const {
-        return n_tokens >= 1 && n_tokens <= max_batch && n_tokens <= cm_max && cm_on[n_tokens] != 0;
+        return n_tokens >= 1 && n_tokens <= max_batch && n_tokens <= cm_max && cm_on[n_tokens] != 0 && !cm_decode(n_tokens);
     }
 
     // the ubatch timed by the trial was computed (backends synchronized): its time from the tick (graph build + compute; the time of
