@@ -2196,16 +2196,12 @@ static bool mul_mat_vec_q_moe_group_launch(
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
-// on Turing by default for every type (kb4t4 decides; 0 = the Ampere+ rule there too)
-#ifndef MMVQ_MOE_BW_TURING_ALL
-#define MMVQ_MOE_BW_TURING_ALL 1
-#endif
-
 // k19-moebw, GGML_CUDA_MOE_BW (unset = auto, 0 = off, 1 = on wherever it can run): multi-token MUL_MAT_IDs (2..8 tokens) of IQ3_S /
 // IQ4_NL / IQ4_XS / Q4_K / Q5_K / Q6_K / Q8_0 experts run mul_mat_vec_q_moe_bw, bitwise the same values; NVIDIA Turing and newer (not
-// GB10), no shared expert in the launch, at most 128 (token, slot) entries. Auto (TURING_ALL: every such product on Turing): the IQ3_S
-// gate / up with a fused gate at 6..8 tokens, where the grouped kernel's per-pass decode costs more than the copy (G4 Flash-Next:
-// 0.976 / 0.950 / 0.933x the time of mul_mat_vec_q_moe_group at 6 / 7 / 8 tokens, slower below 5 and for every other type there).
+// GB10), no shared expert in the launch, at most 128 (token, slot) entries. Auto: Ampere and newer, the IQ3_S gate / up with a fused
+// gate at 6..8 tokens, where the grouped kernel's per-pass decode costs more than the copy (G4 Flash-Next: 0.976 / 0.950 / 0.933x the
+// time of mul_mat_vec_q_moe_group at 6 / 7 / 8 tokens, slower below 5 and for every other type there). Not on Turing: on a T4 the
+// kernel is 0.6-0.85x the time of the ones it replaces at 3..8 tokens, but Qwen3.6 UD-Q4_K_XL at 12 GB decodes 1.8% slower with it.
 // GGML_CUDA_MOE_BW_CFG=rpw,nwarps,bytes picks the shape (0 = auto: rows per warp up to `bytes` (4096) of weights, 4 warps)
 static bool mmvq_moe_bw_on(const int cc, const ggml_type type, const bool fused, const int ntok) {
     static const int env = [] {
@@ -2215,11 +2211,7 @@ static bool mmvq_moe_bw_on(const int cc, const ggml_type type, const bool fused,
     if (env >= 0) {
         return env != 0;
     }
-    constexpr bool turing_all = MMVQ_MOE_BW_TURING_ALL;
-    if (cc < GGML_CUDA_CC_AMPERE && turing_all) {
-        return true;
-    }
-    return type == GGML_TYPE_IQ3_S && fused && ntok >= 6;
+    return cc >= GGML_CUDA_CC_AMPERE && type == GGML_TYPE_IQ3_S && fused && ntok >= 6;
 }
 
 static constexpr bool mmvq_moe_bw_type(const ggml_type type) {

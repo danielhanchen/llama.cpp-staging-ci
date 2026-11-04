@@ -538,7 +538,7 @@ int main(int argc, char ** argv) {
     const std::string self = argv[0];
     std::vector<mode> modes = {
         { "neg_moe_one", self, { off }, { off, "GGML_CUDA_MMVQ_MOE_ONE=1" }, true, 0 },
-        { "default",     self, { off }, {} },   // the shipped defaults (G4: 4 rows per warp for the small-K downs, the staged IQ3_S gate / up at 6..8 tokens; Turing: the staged kernel)
+        { "default",     self, { off }, {} },   // the shipped defaults (4 rows per warp for the small-K downs at 2..4 tokens; Ampere and newer: the staged IQ3_S gate / up at 6..8)
         { "bw1",         self, { off }, { "GGML_CUDA_MOE_BW=1" } },
         { "bw1_r8_w8",   self, { off }, { "GGML_CUDA_MOE_BW=1 GGML_CUDA_MOE_BW_CFG=8,8" } },
         { "bw1_r2_w1",   self, { off }, { "GGML_CUDA_MOE_BW=1 GGML_CUDA_MOE_BW_CFG=2,1" } },
@@ -550,7 +550,7 @@ int main(int argc, char ** argv) {
         { "reassoc0_bw", self, { off, "GGML_CUDA_VERIFY_REASSOC=0" }, { "GGML_CUDA_VERIFY_REASSOC=0 GGML_CUDA_MOE_BW=1" } },
     };
     if (const char * b = getenv("MOE_BW_BASE_EXE")) {   // the base build (no such switches there): its default vs this build's
-        modes.push_back({ "xbin_default",  b, {}, {}, false, -1 });   // the defaults of this GPU (Turing: the staged kernel; else the IQ3_S signs only)
+        modes.push_back({ "xbin_default",  b, {}, {}, false, -1 });   // the defaults of this GPU vs the base build
         modes.push_back({ "xbin_bw1",      b, {}, { "GGML_CUDA_MOE_BW=1" } });
         modes.push_back({ "xbin_off",      b, {}, { off }, false, 0 });
         modes.push_back({ "xbin_reassoc0", b, { "GGML_CUDA_VERIFY_REASSOC=0" }, { "GGML_CUDA_VERIFY_REASSOC=0 GGML_CUDA_MOE_BW=1" } });
