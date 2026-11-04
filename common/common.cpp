@@ -2461,10 +2461,10 @@ static size_t common_fit_dflash_estimate(const std::string & path_dft, const lla
         compute += (size_t) (2.0*(double) n_extract*(double) n_embd_tgt*(double) std::min<uint32_t>(n_ubatch_tgt, cp.n_ctx)*sizeof(float));
     }
     // k19-draftcost: a DFlash2 draft's restricted head (llama_model::draft_head_from_target), rows of the target's lm head in its type:
-    // the LLAMA_DFLASH_DRAFT_VOCAB tokens (default 65536) + the LLAMA_MTP_DRAFT_VOCAB_CTX request rows (4096) + the control tokens
-    // (at most 1024 counted)
+    // the LLAMA_DFLASH_DRAFT_VOCAB tokens + the LLAMA_MTP_DRAFT_VOCAB_CTX request rows (4096) + the control tokens (at most 1024
+    // counted). Only when set: by default the head is made only for a target without a MoE cache, which this estimate does not size
     const char * env_dv = getenv("LLAMA_DFLASH_DRAFT_VOCAB");
-    const int64_t n_dv = env_dv != nullptr ? atoi(env_dv) : 65536;
+    const int64_t n_dv = env_dv != nullptr ? atoi(env_dv) : 0;
     if (ggml_get_tensor(meta, "selector_hidden.weight") != nullptr && n_dv > 0 && !path_tgt.empty()) {
         const char * env_ctx = getenv("LLAMA_MTP_DRAFT_VOCAB_CTX");
         const int64_t n_rows = n_dv + std::max(0, env_ctx != nullptr ? atoi(env_ctx) : 4096) + 1024;

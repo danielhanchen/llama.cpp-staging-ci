@@ -461,9 +461,17 @@ llama_context::llama_context(
                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
             }
             cparams.ctx_other = params.ctx_other;
-            // k19-draftcost: a DFlash2 draft drafts over a restricted vocabulary of the target's head (LLAMA_DFLASH_DRAFT_VOCAB)
+            // k19-draftcost: a DFlash2 draft drafts over a restricted vocabulary of the target's head (LLAMA_DFLASH_DRAFT_VOCAB). By
+            // default only for a target without a MoE cache: there the target's text is unchanged (G4 Flash-Next full card, md5 = full
+            // head). Beside a cache the head's memory comes from the cache, which moves the target's placement and so its text
+            // (srv_kld long48 at 32 GB above the -fa off band of the full card); an explicit LLAMA_DFLASH_DRAFT_VOCAB=n opts in there
             if (model.arch == LLM_ARCH_DFLASH && model.output == nullptr) {
-                const_cast<llama_model &>(model).draft_head_from_target(*llama_get_model(params.ctx_other));
+                if (!params.ctx_other->moe_cache_active() || getenv("LLAMA_DFLASH_DRAFT_VOCAB") != nullptr) {
+                    const_cast<llama_model &>(model).draft_head_from_target(*llama_get_model(params.ctx_other));
+                } else {
+                    LLAMA_LOG_INFO("%s: the target has a MoE cache: the DFlash2 draft keeps the full head (LLAMA_DFLASH_DRAFT_VOCAB=n: "
+                            "a restricted one)\n", __func__);
+                }
             }
         }
     }
