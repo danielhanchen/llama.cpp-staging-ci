@@ -4025,7 +4025,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // re-captured instead of replayed
     // (LLAMA_GRAPH_SMALL_CACHE_DRAFT=0: as before)
     static const bool small_cache_draft = getenv("LLAMA_GRAPH_SMALL_CACHE_DRAFT") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_CACHE_DRAFT")) != 0;
-    const bool small_cache_dft = small_cache_mode == 1 && small_cache_draft && cparams.embeddings_nextn_masked && moe_cache == nullptr;
+    // k19-handoff (LLAMA_GRAPH_SMALL_CACHE_DFLASH=0: off): the DFlash drafter's context too: its injection of the verify rows' features and
+    // its noise block alternate every pass, so the shared graph was built again twice per pass (~0.17 ms of host time on G4 Flash-Next
+    // with the GPU idle); each keeps its graph per size instead
+    static const bool small_cache_dflash = getenv("LLAMA_GRAPH_SMALL_CACHE_DFLASH") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_CACHE_DFLASH")) != 0;
+    const bool small_cache_dft = small_cache_mode == 1 && small_cache_draft && moe_cache == nullptr &&
+        (cparams.embeddings_nextn_masked || (small_cache_dflash && model.arch == LLM_ARCH_DFLASH && cparams.embeddings_nextn));
     // k15-fn: with the saved allocations (LLAMA_SCHED_SIZE_CACHE=0: off) a target with a drafter keeps its decode and verify graphs
     // per size also with a MoE cache: a window of another size restores its own split, allocation and CUDA graph
     static const bool size_cache = getenv("LLAMA_SCHED_SIZE_CACHE") == nullptr || atoi(getenv("LLAMA_SCHED_SIZE_CACHE")) != 0;
@@ -4042,9 +4047,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     uint32_t i_small = 0; // the kept graph used: n_small*GF_SMALL_WAYS + way
     if (n_small > 0) {
         int way = -1;
+        // k19-handoff: in the DFlash drafter's context the previous graph of this size is the other kind (injection vs noise block), so
+        // it is taken only when it can be reused: else each would rebuild the other's way every pass
+        const bool dflash_ways = small_cache_dflash && model.arch == LLM_ARCH_DFLASH;
         for (uint32_t w = 0; w < GF_SMALL_WAYS && way < 0; ++w) {
-            const auto & r = gf_res_small[n_small*GF_SMALL_WAYS + w];
-            if (r && r.get() == gf_res_prev_active) {
+            const uint32_t i = n_small*GF_SMALL_WAYS + w;
+            const auto & r = gf_res_small[i];
+            if (r && r.get() == gf_res_prev_active && (!dflash_ways || (gf_res_small_built[i] && gf_res_small_epoch[i] == gf_res_epoch &&
+                    r->can_reuse(graph_params(r.get(), ubatch, mctx, gtype))))) {
                 way = (int) w;
             }
         }
