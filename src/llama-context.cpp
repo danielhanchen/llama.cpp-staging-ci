@@ -1113,6 +1113,7 @@ llama_context::llama_context(
             if (em == nullptr || atoi(em) == 0) {
                 lm_enabled = false;
             } else {
+                place8_grow = (size_t) std::max(0, atoi(em)) << 20;
                 LLAMA_LOG_INFO("%s: MoE cache: k19-placemid: graphs reserved at %lld tokens, layer-major prompt groups %s\n", __func__,
                     (long long) tiny_rel_ub, lm_enabled ? "kept (they release the banks for the merged graph)" : "off");
             }
@@ -6941,6 +6942,12 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                     back = std::max(back, lm_merged_peak[i] - cur);
                 }
             }
+        }
+        // k19-placemid: the graphs were reserved at the decode size, so a released group grows its buffers from that size: the cap also
+        // allows the memory the fit moved from the prompt compute buffers to the cache (whose banks the group released). Without it the
+        // first 8k group of G4 12 GB fn4 (1840 MiB of growth, 5668 MiB free) split down to single ubatches: 8k TTFT 1647 -> 3580 ms
+        if (place8_rel && lm_released) {
+            back += place8_grow;
         }
         return lm_grow_max + back;
     };

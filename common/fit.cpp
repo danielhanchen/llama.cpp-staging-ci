@@ -97,9 +97,10 @@ bool common_fit_place8_mid() {
     return g_place8 && g_place8_mid;
 }
 
-static void common_fit_place8_env(uint32_t ub, bool mid = false) {
+// grow_mib (mid only): the compute buffer memory the cache took, which a released layer-major group may grow back into
+static void common_fit_place8_env(uint32_t ub, bool mid = false, int64_t grow_mib = 0) {
     common_set_env("LLAMA_MOE_PLACE8_UB", ub > 0 ? std::to_string(ub) : "");
-    common_set_env("LLAMA_MOE_PLACE8_MID", ub > 0 && mid ? "1" : "");
+    common_set_env("LLAMA_MOE_PLACE8_MID", ub > 0 && mid ? std::to_string(std::max<int64_t>(1, grow_mib)) : "");
     g_place8     = ub > 0;
     g_place8_mid = ub > 0 && mid;
 }
@@ -1588,6 +1589,7 @@ static void common_params_fit_impl(
                     }
                     cparams->n_ubatch = ub_full;
                     if (got) {
+                        common_fit_place8_env(ub_rel, true, grow/MiB);
                         LOG_INF("%s: the MoE cache takes the memory of the prompt compute buffers (%" PRId64 " MiB): cache %zu -> %zu MiB; "
                             "ubatches of more than %u tokens run with the cache banks released, layer-major groups as before (k19-placemid; "
                             "LLAMA_FIT_PLACEMID=0 off)\n", __func__, grow/MiB, size_ok/MiB, cparams->moe_cache_size/MiB, ub_rel);
