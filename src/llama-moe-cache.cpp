@@ -1064,6 +1064,12 @@ struct llama_moe_cache::impl {
     // candidate (and so a trial possible) only if its gain beats cm_split_scale times the calibrated split (G4 Qwen3.6 UD-Q3_K_M 12 GB
     // MTP: 14 host batches per launch, every trial off, -7% decode from the trials alone). LLAMA_MOE_CPU_MISS_SPLIT_SCALE (3)
     double   cm_split_scale = 3.0;
+    bool     cm_split_scale_env = false; // LLAMA_MOE_CPU_MISS_SPLIT_SCALE set: it applies to every size (k19-l4poly)
+    static double cm_split_scale_team() {
+        static const double s = getenv("LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM") != nullptr ?
+            std::max(0.0, atof(getenv("LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM"))) : 0.5;
+        return s;
+    }
     double   cm_act   = 0.0;   // us per token: its activations to the host and its expert output back
 
     // " (mtp)" for the cache of an MTP context, in its log lines
@@ -1203,6 +1209,7 @@ struct llama_moe_cache::impl {
                 }
                 if (const char * env_s = getenv("LLAMA_MOE_CPU_MISS_SPLIT_SCALE")) {
                     cm_split_scale = std::max(0.0, atof(env_s));
+                    cm_split_scale_env = true;
                 }
                 if (const char * env_r = getenv("LLAMA_MOE_CPU_MISS_RECAL")) {
                     cm_recal_after = std::max(0, atoi(env_r));
@@ -2230,6 +2237,25 @@ struct llama_moe_cache::impl {
         const char * e = getenv("LLAMA_MOE_SINGLE_MAX_TOKENS");
         return std::max(1, std::min<int>(GGML_MOE_MAILBOX_MAX_TOKENS, e != nullptr ? atoi(e) : 4));
     }();
+
+    // k19-l4poly: the CPU backend's host team serves (or, before the first mailbox, would serve) this cache's host batches: a small
+    // host whose expert compute is the critical path (the rule of single_register: decode threads + a third, more than the old team)
+    bool single_team_host() const {
+        if (single_reg) {
+            return single_hub().team;
+        }
+        const char * e  = getenv("LLAMA_MOE_SINGLE_THREADS");
+        const char * ew = getenv("LLAMA_MOE_SINGLE_THREADS_WIDE");
+        const char * et = getenv("GGML_MOE_HOST_TEAM");
+        const char * em = getenv("LLAMA_MOE_SINGLE_THREADS_MAX");
+        const int wide_mode = ew != nullptr ? atoi(ew) : 1;
+        if ((e != nullptr && atoi(e) > 0) || wide_mode == 0 || !(wide_mode == 2 || hybrid) || (et != nullptr && atoi(et) == 0) || single_threads <= 0) {
+            return false;
+        }
+        const int wmax = em != nullptr && atoi(em) > 0 ? atoi(em) : 16;
+        const int wide = std::min({ single_threads + std::max(1, single_threads/3), llama_moe_n_cpus() - 4, wmax });
+        return wide > std::max(1, single_threads - 1);
+    }
 
     bool single_usable(int64_t n_tokens) const {
         return single_req && !single_off && !single_no_alloc && n_tokens >= 1 && n_tokens <= single_max_tok;
@@ -6642,7 +6668,15 @@ struct llama_moe_cache::impl {
                     return e != nullptr ? std::max(0.0, atof(e)) : 0.0;
                 }();
                 const bool mb_cheap = n <= max_batch && single_weigh() && single_usable(n) && m >= mb_min_misses;
-                const double need = (n <= max_batch ? cm_margin*cm_split_scale*cm_split*(mb_cheap ? single_split_frac : 1.0) :
+                // k19-l4poly: a mailbox size served by the host team (a small host, see single_team_host) where the timing trials run
+                // is a candidate at LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM (0.5) times the weighed split instead of cm_split_scale (3, set on
+                // G4 for the graph split's unmodelled cost): the trial then decides it. Colab L4 Flint 16 GB (55.8% cached, trials on):
+                // 1-token batches gain ~60 us per layer against a weighed split of 1.5 x 3 x 0.2 x 200-330 us, so decode fetched every
+                // miss over PCIe, while a fixed host share of 1/4 decoded +13% (k19-flint). An explicit LLAMA_MOE_CPU_MISS_SPLIT_SCALE
+                // applies to every size as before
+                const double scale = mb_cheap && !cm_split_scale_env && cm_trial && !cm_trials_skipped && !cm_force && single_team_host() ?
+                    cm_split_scale_team() : cm_split_scale;
+                const double need = (n <= max_batch ? cm_margin*scale*cm_split*(mb_cheap ? single_split_frac : 1.0) :
                                      cm_margin_p*(cm_split + n*cm_act))*
                                     (cm_on[n] && cm_measured ? cm_hyst : 1.0);
                 // a batch above max_batch runs the host path in the groups whose slots hold its experts (see use_device), the
