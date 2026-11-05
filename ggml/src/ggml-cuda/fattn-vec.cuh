@@ -125,6 +125,10 @@ static __global__ void flash_attn_ext_vec(
     V += nb23*sequence + nb22*(head / gqa_ratio);
 
     const half * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + nb31*ic0);
+    // k19-nanfix: the rows of the mask are nb31 apart, not ne11 cells: a node at its live length (k19-graph, ggml_cuda_fattn_make_live)
+    // keeps the row stride of the padded mask (2048 cells for 768 live ones), so row 1 of a 2-token verify window read the masked tail of
+    // row 0, saw no cell and wrote NaN (G4 Flash-Next 8 GB, n-gram windows of 1 draft: token 0 forever)
+    const int stride_mask = nb31 / sizeof(half);
 
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
 
@@ -280,7 +284,7 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
                 if (ngqa > 1 || ncols == 1 || ic0 + j < int(ne01.z)) {
-                    live |= __half2float(maskh[(ngqa > 1 ? 0 : j)*ne11 + threadIdx.y*WARP_SIZE + threadIdx.x]) != -INFINITY;
+                    live |= __half2float(maskh[(ngqa > 1 ? 0 : j)*stride_mask + threadIdx.y*WARP_SIZE + threadIdx.x]) != -INFINITY;
                 }
             }
             if (!__any_sync(0xFFFFFFFF, live)) {
@@ -311,7 +315,7 @@ static __global__ void flash_attn_ext_vec(
                 }
 
                 if (mask && (ngqa > 1 || ncols == 1 || ic0 + j < int(ne01.z))) {
-                    sum += slope*__half2float(maskh[(ngqa > 1 ? 0 : j)*ne11 + i_KQ]);
+                    sum += slope*__half2float(maskh[(ngqa > 1 ? 0 : j)*stride_mask + i_KQ]);
                 }
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
