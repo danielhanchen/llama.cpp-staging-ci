@@ -2603,7 +2603,7 @@ static bool common_fit_draft_on_cpu(
     }
     // k19-place8: a small device whose cache was sized for decode keeps no device drafter (as the placement before it, where none fit):
     // its verify windows are multi-token hybrid batches, open on k19-nanfix (plans/k19_lookup8.md section 4)
-    if (common_fit_place8()) {
+    if (common_fit_place8() && !common_fit_place8_mid()) {
         LOG_INF("%s: small device with the decode-sized MoE cache (k19-place8): the draft model is placed on the CPU\n", __func__);
         return true;
     }

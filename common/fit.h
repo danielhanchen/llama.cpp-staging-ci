@@ -67,6 +67,8 @@ bool    common_fit_place8();
 // LLAMA_FIT_HOSTBOUND_MAX_FRAC of the host experts) the small-device placement; implies common_fit_small_device()
 bool    common_fit_hostbound();
 double  common_fit_hostbound_max_frac();
+// k19-placemid: the k19-place8 placement on a device of the regular fit (12 / 16 GB class): drafting and layer-major prompts as usual
+bool    common_fit_place8_mid();
 
 // k19-tierfix-fit: the run-time reserve of a small-device placement, in MiB added to its reduced margin and taken from its cache.
 // The placement is measured at the reserve sizes of its buffers; what runs later allocates more in the margin: the CUDA pool of
