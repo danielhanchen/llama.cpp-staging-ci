@@ -936,6 +936,7 @@ private:
     int64_t tiny_rel_res_ub  = 0;     // > 0: sched_reserve reserves the graphs of at most this many tokens (also an MTP drafter of such a context)
     bool    tiny_rel_held    = false; // the banks are released by tiny_rel_enter
     bool    tiny_rel_routed  = false; // LLAMA_MOE_TINY_RELEASE_ROUTED=1: the slots come back with the experts the last large ubatch routed most
+    bool place8_rel = false; // k19-place8: the release was set up by common's fit (LLAMA_MOE_PLACE8_UB), see tiny_rel_leave
     int64_t tiny_rel_n_enter = 0;
     int64_t tiny_rel_n_leave = 0;
     double  tiny_rel_ms      = 0.0;   // host time of the restores (frees, trims, bank allocation, refill)

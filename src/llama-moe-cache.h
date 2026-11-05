@@ -232,6 +232,8 @@ public:
     // them again and refills the slots; nothing may look up or upload experts in between (the layer-major group does neither)
     bool release();
     void restore();
+    // k19-place8: a restore whose banks do not allocate leaves them released (released() stays true) instead of aborting
+    void set_restore_soft(bool on);
     bool released() const;
     // the next restore refills the slots with the experts the recorded routing used most (set_refill_counts), as LLAMA_MOE_CACHE_REFILL_ROUTED=1
     void set_refill_routed_once(bool on);

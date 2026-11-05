@@ -59,6 +59,41 @@ bool common_fit_small_device() {
     return g_small_device;
 }
 
+// k19-place8: see the small-device branch of common_params_fit_impl. Skipped where the user set LLAMA_MOE_TINY_RELEASE_FORCE (the test
+// knob of the same release) before the first fit; LLAMA_FIT_PLACE8=0 off; LLAMA_FIT_PLACE8_UB (31): the largest ubatch the decode-sized
+// context runs beside the whole cache
+static bool g_place8 = false;
+
+bool common_fit_place8() {
+    return g_place8;
+}
+
+static bool common_fit_place8_on() {
+    static const bool user_env = getenv("LLAMA_MOE_TINY_RELEASE_FORCE") != nullptr;
+    static const bool on = getenv("LLAMA_FIT_PLACE8") == nullptr || atoi(getenv("LLAMA_FIT_PLACE8")) != 0;
+    return on && !user_env;
+}
+
+// the default is one token below the batch from which the CUDA backend copies host weights to compute an op on the device
+// (GGML_OP_OFFLOAD_MIN_BATCH, 32): a reserve at 32 tokens holds the expert copies of a split (G4 8 GB fn4: 1709 MiB of compute, the
+// cache grew 65 -> 669 MiB only), one at 31 computes the experts its slots do not hold on the host
+static uint32_t common_fit_place8_ub() {
+    static const uint32_t ub = [] {
+        if (const char * e = getenv("LLAMA_FIT_PLACE8_UB")) {
+            return (uint32_t) std::max(1, atoi(e));
+        }
+        const char * e = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
+        return (uint32_t) std::max(1, (e != nullptr ? atoi(e) : 32) - 1);
+    }();
+    return ub;
+}
+
+// read by the context (llama_context, see tiny_rel_ub) when it is created: set for the loaded context, never for a measurement
+static void common_fit_place8_env(uint32_t ub) {
+    common_set_env("LLAMA_MOE_PLACE8_UB", ub > 0 ? std::to_string(ub) : "");
+    g_place8 = ub > 0;
+}
+
 int64_t common_fit_small_reserve_mib(int64_t cache_mib) {
     static const int64_t reserve_mib = [] {
         const char * e = getenv("LLAMA_FIT_SMALL_RESERVE_MIB");
@@ -360,6 +395,10 @@ static void common_params_fit_impl(
         enum common_fit_kv_resident kv_resident) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
+    }
+    // k19-place8: every fit measures without the release a previous fit set up (the small-device branch decides it again)
+    if (g_place8) {
+        common_fit_place8_env(0);
     }
     constexpr int64_t MiB = 1024*1024;
     typedef std::vector<llama_device_memory_data> dmds_t;
@@ -1361,6 +1400,72 @@ static void common_params_fit_impl(
                                 g_moe_margin_gain       = gain_ok;
                                 margins[0]              = margin_ok;
                             }
+                        }
+                    }
+                    // k19-place8: the compute buffer is sized for the largest prompt ubatch (G4 at 8 GB, Qwen3.8-Flash-Next UD-IQ4_XS with -ub
+                    // 2048: 2312 MiB, 1275 of them the staging arena of the prefetched expert copies) beside a cache of a few dozen slots
+                    // (65 MiB, ~1% decode hits), and it sits idle during decode. Here the cache takes that memory instead: the context
+                    // reserves its graphs at LLAMA_FIT_PLACE8_UB (31) tokens, small batches whose missing experts run on the host, and a larger ubatch runs with the
+                    // cache banks released while its compute buffers grow into their memory; the next small ubatch frees the compute buffers
+                    // and refills the banks with the experts they held (the k19-tiny-ub release, llama_context::tiny_rel_enter / leave,
+                    // byte-exact at a fixed placement). The cache grows by the measured difference between the two placements, so a released
+                    // prompt uses what the fit measured for it. Kept only if the larger cache meets the margin; otherwise the placement above
+                    // stays. One device only (the small-device rule). LLAMA_FIT_PLACE8=0 off
+                    // measured on G4 8 GB only: devices with less free memory than LLAMA_FIT_PLACE8_MIN_FREE_MIB (6144) keep the old placement
+                    static const int64_t place8_min_free = int64_t(getenv("LLAMA_FIT_PLACE8_MIN_FREE_MIB") != nullptr ?
+                        std::max(0, atoi(getenv("LLAMA_FIT_PLACE8_MIN_FREE_MIB"))) : 6144)*MiB;
+                    if (ok && common_fit_place8_on() && cparams->n_ubatch > common_fit_place8_ub() && int64_t(dmds_cpu_moe[0].free) >= place8_min_free) {
+                        const uint32_t ub_full = cparams->n_ubatch;
+                        const uint32_t ub_rel  = common_fit_place8_ub();
+                        const size_t   size_ok = cparams->moe_cache_size;
+                        const dmds_t   dmds_ok = dmds_cpu_moe;
+                        bool           got     = false;
+                        int64_t        grow    = 0;
+                        cparams->n_ubatch = ub_rel;
+                        common_fit_place8_env(ub_rel); // the cache of a measurement reads the gate of its small batches (place8_single)
+                        auto measure8 = [&](size_t cache, dmds_t & d) {
+                            cparams->moe_cache_size = cache;
+                            try {
+                                d = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                            } catch (const std::runtime_error &) {
+                                return false;
+                            }
+                            add_extra_memory(d);
+                            return true;
+                        };
+                        dmds_t d_s;
+                        if (measure8(size_ok, d_s)) {
+                            grow = int64_t(dmds_ok[0].mb.total()) - int64_t(d_s[0].mb.total());
+                        }
+                        if (grow >= 256*MiB) {
+                            int64_t req = int64_t(size_ok) + grow;
+                            for (int it = 0; it < 3 && req >= int64_t(size_ok) + 128*MiB; it++) {
+                                dmds_t d8;
+                                if (!measure8(size_t(req), d8)) {
+                                    break;
+                                }
+                                const int64_t s8 = int64_t(d8[0].free) - int64_t(d8[0].mb.total()) - margins[0];
+                                LOG_TRC("%s: k19-place8: ubatches of up to %u tokens beside a cache of %" PRId64 " MiB: compute %zu MiB, %" PRId64
+                                    " MiB over the margin\n", __func__, ub_rel, req/MiB, d8[0].mb.compute/MiB, s8/MiB);
+                                if (s8 >= 0) {
+                                    dmds_cpu_moe = d8;
+                                    got = true;
+                                    break;
+                                }
+                                req += s8 - 16*MiB;
+                            }
+                        }
+                        cparams->n_ubatch = ub_full;
+                        if (got) {
+                            LOG_INF("%s: small device: the MoE cache takes the memory of the prompt compute buffers (%" PRId64 " MiB): cache %zu -> "
+                                "%zu MiB; ubatches of more than %u tokens run with the cache banks released (k19-place8; LLAMA_FIT_PLACE8=0 off)\n",
+                                __func__, grow/MiB, size_ok/MiB, cparams->moe_cache_size/MiB, ub_rel);
+                        } else {
+                            common_fit_place8_env(0);
+                            cparams->moe_cache_size = size_ok;
+                            dmds_cpu_moe            = dmds_ok;
+                            LOG_INF("%s: small device: the MoE cache keeps its size (k19-place8: %" PRId64 " MiB of prompt compute buffers, no "
+                                "larger cache within the margin)\n", __func__, grow/MiB);
                         }
                     }
                     if (ok) {

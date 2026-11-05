@@ -496,6 +496,8 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_alloc_lend_graph(ggml_backend_sched_t sched, bool enable);
     // k13-small: frees the compute buffers of the devices (not the host ones): the next graph allocates them at the size it needs
     GGML_API void                 ggml_backend_sched_free_device_buffers(ggml_backend_sched_t sched);
+    // k19-place8: frees the host weight prefetch staging arenas of the device backends (allocated again by the next prefetched graph)
+    GGML_API void                 ggml_backend_sched_free_prefetch_arenas(ggml_backend_sched_t sched);
 
     // Set a callback that places prefetched copies in memory lent by the user instead of the staging arena
     GGML_API void                 ggml_backend_sched_set_lend_callback(ggml_backend_sched_t sched, ggml_backend_sched_lend_callback callback, void * user_data);

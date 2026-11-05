@@ -912,6 +912,14 @@ struct llama_moe_cache::impl {
     // the rest), instead of every expert of the window on the CPU
     bool    hybrid_wide     = false;
     int64_t wide_max        = 8;
+    // k19-place8 (LLAMA_MOE_PLACE8_UB set by common's fit, see common_fit_place8): a hybrid group's small batch of 2+ tokens takes the
+    // CPU path of a batch whose experts do not fit the slots (every expert of the batch on the host), as with the few dozen slots of the
+    // placement before, not the hybrid assign. The decode-sized cache holds the experts of tens of tokens, so the prompt's short tail
+    // batches would take the multi-token hybrid assign, which writes non-finite values at fn4 8 GB (plans/k19_lookup8.md section 4,
+    // fixed on k19-nanfix); LLAMA_MOE_PLACE8_SINGLE=0 lets them take it
+    bool    place8_single   = false;
+    bool    restore_soft    = false; // k19-place8: restore leaves the banks released when they do not allocate (set_restore_soft)
+    int     n_restore_fail  = 0;
     // k11 LLAMA_MOE_CPU_MISS_PROMPT=N (opt-in, default 0 = off): prompt ubatches of max_batch + 1 .. N tokens always take the host path
     // once calibrated, at the rule's fetch share but at most 1/4 (the host computes at least three quarters of the misses, the experts
     // with the fewest uses), without waiting for a trial on the small batches. G4, LFM2.5-24B-A2B 8 GB, a 38-token prompt: 6.1 GB of uploads
@@ -4809,7 +4817,7 @@ struct llama_moe_cache::impl {
 
     bool use_device(const group & g, int64_t n_tokens) const {
         return !force_large && g.dev_lookup && g.n_slots > 0 && n_tokens > 0 && (n_tokens <= max_batch || cm_serves(n_tokens)) &&
-            (slots_fit(g, n_tokens) || wide_ok(g, n_tokens));
+            (slots_fit(g, n_tokens) || wide_ok(g, n_tokens)) && !(place8_single && (hybrid || cm) && n_tokens > 1);
     }
 
     // k15-lfm2: llama_moe_cpu_miss_drop_slow. Once calibrated: where the cache holds at least LLAMA_MOE_CPU_MISS_DROP_FRAC (0.75) of the
@@ -5259,6 +5267,9 @@ struct llama_moe_cache::impl {
             const int  v     = e != nullptr ? atoi(e) : 0;
             hybrid_wide = v > 0 && !exact;
             wide_max    = v > 1 ? std::min<int64_t>(n_small_max, v) : 8;
+            const char * e8  = getenv("LLAMA_MOE_PLACE8_UB");
+            const char * e8s = getenv("LLAMA_MOE_PLACE8_SINGLE");
+            place8_single = e8 != nullptr && atoi(e8) > 0 && (e8s == nullptr || atoi(e8s) != 0);
             if (hybrid_wide && !model.hparams.no_alloc) {
                 LLAMA_LOG_INFO("%s: k19-hostrow: hybrid small batches of up to %" PRId64 " tokens may outnumber the slots (LLAMA_MOE_HYBRID_WIDE)\n",
                     __func__, wide_max);
@@ -7486,6 +7497,14 @@ struct llama_moe_cache::impl {
             t->buffer = nullptr;
         }
         d.buf_bank.reset(ggml_backend_alloc_ctx_tensors_from_buft(d.ctx_bank.get(), d.buft));
+        if (!d.buf_bank && restore_soft) {
+            // k19-place8 (see set_restore_soft): the banks stay released, the caller runs as during a prompt and tries again later
+            if (n_restore_fail++ < 4) {
+                LLAMA_LOG_WARN("%s: MoE cache: the released banks (%.2f MiB) could not be allocated again: they stay released, tried again "
+                    "at the next small batch\n", __func__, d.buf_size/1048576.0);
+            }
+            return false;
+        }
         if (!d.buf_bank) {
             GGML_ABORT("MoE cache: the released banks (%.2f MiB) could not be allocated again", d.buf_size/1048576.0);
         }
@@ -9789,6 +9808,10 @@ void llama_moe_cache::restore() {
     for (size_t id = 0; id < pimpl->devices.size(); ++id) {
         pimpl->restore((int32_t) id);
     }
+}
+
+void llama_moe_cache::set_restore_soft(bool on) {
+    pimpl->restore_soft = on;
 }
 
 void llama_moe_cache::set_refill_routed_once(bool on) {

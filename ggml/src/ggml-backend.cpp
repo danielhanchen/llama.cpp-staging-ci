@@ -5974,6 +5974,20 @@ void ggml_backend_sched_free_device_buffers(ggml_backend_sched_t sched) {
     }
 }
 
+void ggml_backend_sched_free_prefetch_arenas(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    ggml_backend_sched_synchronize(sched);
+    ggml_backend_sched_prefetch_sync(sched);
+    for (int b = 0; b < sched->n_backends; b++) {
+        struct ggml_backend_sched_prefetch * pf = &sched->pf[b];
+        if (pf->arena != NULL) {
+            ggml_backend_buffer_free(pf->arena);
+            pf->arena      = NULL;
+            pf->arena_size = 0;
+        }
+    }
+}
+
 size_t ggml_backend_sched_get_alloc_over(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->alloc_over;
