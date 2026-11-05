@@ -63,6 +63,10 @@ int64_t common_fit_moe_margin_gain();
 bool    common_fit_small_device();
 // k19-place8: the last fit sized a small device's MoE cache for decode, prompts release its banks (LLAMA_MOE_PLACE8_UB set)
 bool    common_fit_place8();
+// k19-l4poly: the last fit gave a host-bound small device (every layer fit within the default margin beside a cache of at most
+// LLAMA_FIT_HOSTBOUND_MAX_FRAC of the host experts) the small-device placement; implies common_fit_small_device()
+bool    common_fit_hostbound();
+double  common_fit_hostbound_max_frac();
 
 // k19-tierfix-fit: the run-time reserve of a small-device placement, in MiB added to its reduced margin and taken from its cache.
 // The placement is measured at the reserve sizes of its buffers; what runs later allocates more in the margin: the CUDA pool of

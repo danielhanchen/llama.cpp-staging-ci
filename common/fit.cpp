@@ -94,6 +94,46 @@ static void common_fit_place8_env(uint32_t ub) {
     g_place8 = ub > 0;
 }
 
+// k19-l4poly: a host-bound small device. A device with less than LLAMA_FIT_PLACE8_MIN_FREE_MIB (6144) free whose every layer fits
+// within the default margin, but beside a MoE cache of at most LLAMA_FIT_HOSTBOUND_MAX_FRAC (0.10, the share of the hybrid gate,
+// LLAMA_MOE_CACHE_HYBRID_MAX_FRAC) of the host experts: the host computes most misses of every decode step and a larger cache is what
+// shortens it. Colab L4 capped at 4 GB, LFM2.5-24B-A2B UD-Q4_K_XL ctx 16384 (3696 MiB free, 13371 MiB of host experts): a 1157 MiB
+// cache at the 1024 MiB margin, 663 MiB of it after the tiny-cache n_ubatch rule (117 slots, 4.8%), against PolyStrata's 322 experts
+// (1.73 GiB, 352 MiB left free). Such a device takes the small-device placement (the 256 MiB margin + the run-time reserve) and its
+// k19-place8 decode-sized cache. LLAMA_FIT_HOSTBOUND=0 off
+static bool g_hostbound = false;
+
+bool common_fit_hostbound() {
+    return g_hostbound;
+}
+
+double common_fit_hostbound_max_frac() {
+    static const double f = getenv("LLAMA_FIT_HOSTBOUND_MAX_FRAC") != nullptr ? std::max(0.0, atof(getenv("LLAMA_FIT_HOSTBOUND_MAX_FRAC"))) : 0.10;
+    return f;
+}
+
+// the k19-place8 multi-token guard (LLAMA_MOE_PLACE8_SINGLE) is off on a host-bound device: k19-nanfix (the cause) is merged, and its
+// verify windows otherwise run every expert on the host. Only set while the user has not set it, and taken back by the next fit
+static void common_fit_hostbound_env(bool on) {
+    static bool set_by_fit = false;
+    if (on && getenv("LLAMA_MOE_PLACE8_SINGLE") == nullptr) {
+        common_set_env("LLAMA_MOE_PLACE8_SINGLE", "0");
+        set_by_fit = true;
+    } else if (!on && set_by_fit) {
+        common_set_env("LLAMA_MOE_PLACE8_SINGLE", "");
+        set_by_fit = false;
+    }
+    g_hostbound = on;
+}
+
+static bool common_fit_hostbound_place(int64_t free_dev, int64_t cache, int64_t host_experts) {
+    static const bool on = getenv("LLAMA_FIT_HOSTBOUND") == nullptr || atoi(getenv("LLAMA_FIT_HOSTBOUND")) != 0;
+    static const int64_t max_free = int64_t(getenv("LLAMA_FIT_PLACE8_MIN_FREE_MIB") != nullptr ?
+        std::max(0, atoi(getenv("LLAMA_FIT_PLACE8_MIN_FREE_MIB"))) : 6144)*1024*1024;
+    return on && g_moe_margin_auto && host_experts > 0 && cache > 0 && free_dev < max_free &&
+        double(cache) <= common_fit_hostbound_max_frac()*double(host_experts);
+}
+
 int64_t common_fit_small_reserve_mib(int64_t cache_mib) {
     static const int64_t reserve_mib = [] {
         const char * e = getenv("LLAMA_FIT_SMALL_RESERVE_MIB");
@@ -396,6 +436,7 @@ static void common_params_fit_impl(
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
+    common_fit_hostbound_env(false); // k19-l4poly: decided again by every fit
     // k19-place8: every fit measures without the release a previous fit set up (the small-device branch decides it again)
     if (g_place8) {
         common_fit_place8_env(0);
@@ -1307,6 +1348,14 @@ static void common_params_fit_impl(
             for (size_t id = 0; id < nd; id++) {
                 fits_per_device = fits_per_device && int64_t(dmds_cpu_moe[id].free) - int64_t(dmds_cpu_moe[id].mb.total()) >= margins[id];
             }
+            // k19-l4poly: a host-bound small device (see common_fit_hostbound_place): every layer fits within the default margin, but
+            // beside a cache of at most a tenth of the host experts, so the host computes most misses of every token. It takes the
+            // small-device placement below (smaller margin, the k19-place8 decode-sized cache) although it fits
+            const size_t  size_fit_hb = cparams->moe_cache_size;
+            const int64_t gain_fit_hb = g_moe_margin_gain;
+            const bool    hostbound   = fits_per_device && nd == 1 && size_before > 0 &&
+                common_fit_hostbound_place(int64_t(dmds_cpu_moe[0].free), int64_t(size_fit_hb),
+                    int64_t(dmds_cpu_moe.back().mb.model) - int64_t(dmds_full.back().mb.model));
             // k13-small: a small device (G4 ballasted to 4 GB, Qwen3.6-35B-A3B Q3_K_M + MTP: the dense weights of every layer, the context and
             // a cache fit only inside the 1024 MiB margin). Without this the fit moves 13 of 41 whole layers (attention, KV, recurrent state)
             // to the CPU and drops the cache, so every token pays a graph split per CPU layer and per MoE layer (k12: 91 tok/s against
@@ -1314,7 +1363,7 @@ static void common_params_fit_impl(
             // LLAMA_FIT_SMALL_MARGIN_MIB (256) instead: every layer stays on the device beside a small cache, whose host misses the
             // single-graph path computes (no graph split). The placement is the one of -fitt 256; one GPU only, default margin only (an
             // explicit smaller -fitt is the user's), LLAMA_FIT_SMALL_MARGIN_MIB=0 keeps the k12 placement.
-            if (!fits_per_device && nd == 1 && size_before > 0) {
+            if ((!fits_per_device || hostbound) && nd == 1 && size_before > 0) {
                 const char * e_sm = getenv("LLAMA_FIT_SMALL_MARGIN_MIB");
                 const int64_t small_mib = e_sm != nullptr ? std::max<int64_t>(0, atoll(e_sm)) : 256;
                 constexpr int64_t m_default = 1024*MiB;
@@ -1414,7 +1463,8 @@ static void common_params_fit_impl(
                     // measured on G4 8 GB only: devices with less free memory than LLAMA_FIT_PLACE8_MIN_FREE_MIB (6144) keep the old placement
                     static const int64_t place8_min_free = int64_t(getenv("LLAMA_FIT_PLACE8_MIN_FREE_MIB") != nullptr ?
                         std::max(0, atoi(getenv("LLAMA_FIT_PLACE8_MIN_FREE_MIB"))) : 6144)*MiB;
-                    if (ok && common_fit_place8_on() && cparams->n_ubatch > common_fit_place8_ub() && int64_t(dmds_cpu_moe[0].free) >= place8_min_free) {
+                    if (ok && common_fit_place8_on() && cparams->n_ubatch > common_fit_place8_ub() &&
+                            (int64_t(dmds_cpu_moe[0].free) >= place8_min_free || hostbound)) {
                         const uint32_t ub_full = cparams->n_ubatch;
                         const uint32_t ub_rel  = common_fit_place8_ub();
                         const size_t   size_ok = cparams->moe_cache_size;
@@ -1468,17 +1518,26 @@ static void common_params_fit_impl(
                                 "larger cache within the margin)\n", __func__, grow/MiB);
                         }
                     }
-                    if (ok) {
+                    if (ok && hostbound) {
+                        LOG_INF("%s: small device, host-bound: every layer fits within the margin of %" PRId64 " MiB beside a MoE cache of %zu MiB "
+                            "(at most %.0f%% of the host experts); the margin drops to %" PRId64 " MiB and the cache grows to %zu MiB (k19-l4poly; "
+                            "LLAMA_FIT_HOSTBOUND=0 off)\n", __func__, margin_saved/MiB, size_fit_hb/MiB, 100.0*common_fit_hostbound_max_frac(),
+                            margins[0]/MiB, cparams->moe_cache_size/MiB);
+                        g_small_device = true;
+                        common_fit_hostbound_env(true);
+                    } else if (ok) {
                         LOG_INF("%s: small device: every layer stays in device memory beside a MoE cache of %zu MiB, the fit margin drops from "
                             "%" PRId64 " to %" PRId64 " MiB (otherwise layers move to the CPU; LLAMA_FIT_SMALL_MARGIN_MIB=0 keeps that)\n",
                             __func__, cparams->moe_cache_size/MiB, margin_saved/MiB, margins[0]/MiB);
                         fits_per_device = true;
                         g_small_device  = true;
                     } else {
+                        // k19-l4poly: a host-bound device that fitted keeps that placement
+                        common_fit_place8_env(0);
                         margins[0] = margin_saved;
                         dmds_cpu_moe = dmds_nc_saved;
-                        cparams->moe_cache_size = 0;
-                        g_moe_margin_gain = 0;
+                        cparams->moe_cache_size = hostbound ? size_fit_hb : 0;
+                        g_moe_margin_gain = hostbound ? gain_fit_hb : 0;
                     }
                 }
             }
