@@ -4679,10 +4679,30 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         ggml_moe_disk_splits(sched, moe_disk);
     }
 
+    // k19-vcost (GGML_SCHED_HOST_TIMING=N, diagnostic): host time of each split's iteration (input copies + compute call), host-buffer
+    // splits apart, for graphs of over 1000 nodes; the averages are logged every N such graphs
+    static const int st_every = getenv("GGML_SCHED_HOST_TIMING") ? atoi(getenv("GGML_SCHED_HOST_TIMING")) : 0;
+    static int64_t st_n = 0, st_host = 0, st_dev = 0, st_tot = 0, st_nh = 0, st_nd = 0;
+    const bool st_on = st_every > 0 && sched->graph.n_nodes > 1000;
+    const int64_t st_t0 = st_on ? ggml_time_us() : 0;
+    int64_t st_prev = st_t0;
+    int st_prev_host = -1;
+    auto st_mark = [&](int next_host) {
+        if (!st_on) {
+            return;
+        }
+        const int64_t t = ggml_time_us();
+        if (st_prev_host == 1) { st_host += t - st_prev; st_nh++; }
+        if (st_prev_host == 0) { st_dev  += t - st_prev; st_nd++; }
+        st_prev = t;
+        st_prev_host = next_host;
+    };
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        st_mark(ggml_backend_buft_is_host(sched->bufts[split_backend_id]) ? 1 : 0);
 
         // k19-graph: a graph input's copy in this split carries the input's op params, the host side of the input's value for the
         // backend that plans its launches by it (ggml_flash_attn_ext_kv_len_set_host): the copy's data is uploaded, its params are not
@@ -4973,6 +4993,17 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
     for (; moe_cold < moe_disk.size(); ++moe_cold) {
         for (const ggml_tensor * w : moe_disk[moe_cold].host_weights) {
             ggml_moe_prefetch_cold(w);
+        }
+    }
+
+    if (st_on) {
+        st_mark(-1);
+        st_tot += ggml_time_us() - st_t0;
+        if (++st_n % st_every == 0) {
+            GGML_LOG_INFO("%s: k19-vcost host timing over %lld graphs: %.1f us per graph, host splits %.1f us (%.1f per graph), device splits %.1f us (%.1f per graph), %d nodes\n",
+                __func__, (long long) st_n, (double) st_tot / st_n, (double) st_host / st_n, (double) st_nh / st_n, (double) st_dev / st_n,
+                (double) st_nd / st_n, sched->graph.n_nodes);
+            st_n = st_host = st_dev = st_tot = st_nh = st_nd = 0;
         }
     }
 
