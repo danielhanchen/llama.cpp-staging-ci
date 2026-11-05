@@ -3,8 +3,10 @@
 // (head size 256, 24 query heads over 2 KV heads, q8_0 or f16 K / V in the KV cache layout), with the KV length read on the device
 // (ggml_flash_attn_ext_set_kv_len, the n_kv bucket of LLAMA_KV_BUCKET_DEV) and without it, against a double precision reference of
 // the visible cells. Every output must be finite and within the tolerance of the reference: row t of T sees the cells [0, L - T + 1 + t)
-// of a padded node of P cells (the causal mask of a window that ends at cell L - 1), the cells past L hold zeros (a cleared cache).
-// The reproducer of the 8 GB G4 token-0 bug (plans/k19_nanfix.md) is T = 2, P = 2048, q8_0, L = 2 or 643.
+// of a padded node of P cells (the causal mask of a window that ends at cell L - 1), the cells past L hold zeros (a cleared cache), the
+// device length is L rounded up to 256 cells. The 8 GB G4 token-0 bug (plans/k19_nanfix.md): T = 2, P = 2048, q8_0, L = 2 (the seq_rm
+// probe) or 643 (a verify window after a 640 token prompt) take the vector kernel at the live length, which read row j of the mask at
+// j*ne11 (the live cells) instead of its row stride (the padded cells): row 1 read row 0's masked tail, saw no cell and wrote NaN.
 // usage: test-fa-kvlen-rows [-v]. No GPU: the CPU backend (checks the reference only).
 
 #include "ggml.h"
@@ -243,13 +245,14 @@ int main(int argc, char ** argv) {
                     continue;
                 }
                 const std::vector<float> ref = reference(st, L, T);
-                // the node of L cells (rounded up to 256, the plain padding), the padded node with the device length, without it
+                // the node of the live cells (L rounded up to 256, the plain padding, which is also the device length llama sets:
+                // llama_kv_cache::get_n_kv before the bucket), the padded node with the device length, the padded node without it
                 const int64_t n_live = std::min<int64_t>(P, (L + 255)/256*256);
                 for (int mode = 0; mode < 3; ++mode) {
                     for (const bool sparse : { false, true }) {
                         const int64_t n_kv = mode == 0 ? n_live : P;
                         fa_graph g = build_fa(be, st, n_kv, T, sparse, mode == 1);
-                        const std::vector<float> got = run(be, g, causal_mask(n_kv, L, T), (int32_t) L);
+                        const std::vector<float> got = run(be, g, causal_mask(n_kv, L, T), (int32_t) n_live);
                         g.free_all();
                         int nf = 0;
                         double worst = 0.0;
