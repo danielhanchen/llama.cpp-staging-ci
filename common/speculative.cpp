@@ -2894,6 +2894,16 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         int64_t n_lookups = 0, n_matches = 0, n_drafts = 0, n_drafted = 0, n_accepted = 0, n_yield = 0;
         common_spec_round_timer timer;   // k11-decode: round times of this sequence (policy_on)
         int64_t n_probe = 0;
+        int64_t n_win[common_spec_cost_policy::MAX_T + 1] = {};   // k19-lookup8: drafted rounds by window (rows), this request
+        std::string win_text() const {
+            std::string o;
+            for (int t = 2; t <= common_spec_cost_policy::MAX_T; ++t) {
+                if (n_win[t] > 0) {
+                    o += " T" + std::to_string(t) + "=" + std::to_string(n_win[t]);
+                }
+            }
+            return o;
+        }
         int min_match = 3;               // k15-spec: this request's shortest repeat (n_min_match, n_min_match_long for a long prompt)
         int n_short   = 3;               // k15-lfm2: this request's short window and full-window match (n_max_short / n_long_match, or
         int n_long    = 8;               //           n_max_short_long / n_long_match_long for a long prompt)
@@ -2943,6 +2953,17 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
             const char * e = getenv("LLAMA_SPEC_SUFFIX_POLICY");
             policy_on = !with_model && (e != nullptr ? atoi(e) != 0 : params.auto_mode);
             policy.short_k = params.n_max_short;
+            // k19-lookup8: LLAMA_SPEC_SUFFIX_SIZES="2,3,4,8" prices every listed window size (rows), see common_spec_cost_policy::choose_sizes
+            policy.sizes = common_spec_cost_policy::parse_sizes(getenv("LLAMA_SPEC_SUFFIX_SIZES"));
+        }
+        if (policy_on && policy.sizes != 0) {
+            std::string ls;
+            for (int t = 2; t <= common_spec_cost_policy::MAX_T; ++t) {
+                if (policy.allowed(t)) {
+                    ls += (ls.empty() ? "" : ",") + std::to_string(t);
+                }
+            }
+            SPC_INF("ngram-suffix: k19-lookup8 window sizes %s (rows), each priced by its measured round time (LLAMA_SPEC_SUFFIX_SIZES)\n", ls.c_str());
         }
         if (policy_on) {
             SPC_INF("ngram-suffix: cost-priced windows of %d / %d drafts (margin %.2f)%s; LLAMA_SPEC_SUFFIX_POLICY=0 for the fixed gate\n",
@@ -3112,9 +3133,13 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
             SPC_INF("ngram-suffix seq %d: round ms by window 1 / %d / %d: %.2f (%.0f) / %.2f (%.0f) / %.2f (%.0f), realized gain %.2f (%.0f) / %.2f (%.0f), %"
                     PRId64 " probes\n", seq_id, ts, tl, policy.cost_ms(1), policy.cost_n[1], policy.cost_ms(ts), policy.cost_n[ts], policy.cost_ms(tl),
                     policy.cost_n[tl], policy.gain[ts], policy.gain_n[ts], policy.gain[tl], policy.gain_n[tl], si.n_probe);
+            if (policy.sizes != 0) {
+                SPC_INF("ngram-suffix seq %d: k19-lookup8 round ms by window:%s; drafts by window:%s\n", seq_id, policy.text().c_str(), si.win_text().c_str());
+            }
         }
         si.n_lookups = si.n_matches = si.n_drafts = si.n_drafted = si.n_accepted = si.n_yield = 0;
         si.n_probe = 0;
+        std::fill(si.n_win, si.n_win + common_spec_cost_policy::MAX_T + 1, 0);
         si.k_last = 0;
         si.timer.reset();
         si.min_match = (params.long_prompt > 0 && params.n_min_match_long > 0 && (int64_t) prompt.size() >= params.long_prompt) ?
@@ -3172,7 +3197,11 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
             } else if (policy_on) {
                 // k11-decode: the window that commits the most tokens per measured ms, or none (common/spec-cost-policy.h)
                 const int k_full = std::min(offered, win);
-                k = policy.choose(k_full, std::min(k_full, si.n_short), q, si.n_short != params.n_max_short);
+                k = policy.sizes != 0 ? policy.choose_sizes(offered, q) :
+                    policy.choose(k_full, std::min(k_full, si.n_short), q, si.n_short != params.n_max_short);
+                if (k > 0) {
+                    si.n_win[std::min(k + 1, common_spec_cost_policy::MAX_T)]++;
+                }
                 if (k > 0 && policy.cost_n[std::min(k + 1, common_spec_cost_policy::MAX_T)] < common_spec_cost_policy::PROBES) {
                     si.n_probe++;
                 }

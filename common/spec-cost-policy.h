@@ -175,6 +175,92 @@ struct common_spec_cost_policy {
         }
         return 0;
     }
+
+    // k19-lookup8 (LLAMA_SPEC_SUFFIX_SIZES): the window is any allowed size up to the offered drafts, not only the short and the full
+    // one. Bit t of `sizes` allows a verify window of t rows (t - 1 drafts); every allowed size is its own target graph, so the set stays
+    // small. The size with the most expected tokens per measured ms is taken when it beats a plain round by the margin; a size not
+    // measured PROBES times yet (or not for STALE rounds) is probed only where the class is right at least P_PROBE of the time, and
+    // the probe is the largest allowed size the drafts reach (the small ones get measured by the rounds that choose them). The idea is
+    // Strata's lookup window choice (clean-room: no code taken)
+    unsigned sizes = 0;
+
+    static unsigned parse_sizes(const char * s) {
+        unsigned m = 0;
+        if (s == nullptr) {
+            return 0;
+        }
+        for (const char * p = s; *p != '\0'; ) {
+            const int t = atoi(p);
+            if (t >= 2 && t <= MAX_T) {
+                m |= 1u << t;
+            }
+            while (*p != '\0' && *p != ',') {
+                ++p;
+            }
+            if (*p == ',') {
+                ++p;
+            }
+        }
+        return m;
+    }
+
+    bool allowed(int t) const {
+        return t >= 2 && t <= MAX_T && ((sizes >> t) & 1u);
+    }
+
+    // drafts of the largest allowed window that k drafts fill (0: none)
+    int fit(int k) const {
+        for (int t = std::min(k + 1, MAX_T); t >= 2; --t) {
+            if (allowed(t)) {
+                return t - 1;
+            }
+        }
+        return 0;
+    }
+
+    int choose_sizes(int k_avail, double q) const {
+        const int k_full = fit(k_avail);
+        if (k_full <= 0) {
+            return 0;
+        }
+        const double base = 1.0/cost_ms(1);
+        double e = 1.0, qi = 1.0, best = 0.0;
+        int best_k = 0;
+        for (int k = 1; k <= k_full; ++k) {
+            qi *= q;
+            e  += qi;
+            if (!allowed(k + 1)) {
+                continue;
+            }
+            const double r = e/cost_ms(k + 1);
+            if (r > best) {
+                best   = r;
+                best_k = k;
+            }
+        }
+        if (best_k > 0 && best > base*(1.0 + margin)) {
+            if (best_k < k_full && q >= P_PROBE && stale(k_full + 1)) {
+                return k_full;
+            }
+            return best_k;
+        }
+        if ((cost_n[k_full + 1] < PROBES && q >= P_PROBE) || (stale(k_full + 1) && q >= P_STALE)) {
+            return k_full;
+        }
+        return 0;
+    }
+
+    std::string text() const {
+        std::string out;
+        char b[64];
+        for (int t = 1; t <= MAX_T; ++t) {
+            if (cost_n[t] > 0) {
+                snprintf(b, sizeof(b), " T%d %.2f(n=%.0f)", t, cost[t], cost_n[t]);
+                out += b;
+            }
+        }
+        return out;
+    }
 };
 
 // the round timer of one sequence: the time between two draft() calls is one round (verify + sampling) of the window drafted at
