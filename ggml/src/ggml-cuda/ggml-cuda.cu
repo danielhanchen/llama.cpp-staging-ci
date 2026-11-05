@@ -467,6 +467,17 @@ static ggml_cuda_device_info ggml_cuda_init() {
             CUDA_CHECK(cudaSetDevice(physical_id));
             CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleSpin));
         }
+        // k19-l4poly test knob GGML_CUDA_SCHEDULE=spin|yield|blocking: how a host thread waits for the device (default: the driver's
+        // auto, which spins while there are fewer contexts than CPUs). On a small host whose MoE host team takes most CPUs, the
+        // thread that waits for the graph competes with the team while it spins
+        if (const char * e_sched = getenv("GGML_CUDA_SCHEDULE"); e_sched != nullptr && *e_sched != '\0') {
+            const std::string m = e_sched;
+            const unsigned int f = m == "spin" ? cudaDeviceScheduleSpin : m == "yield" ? cudaDeviceScheduleYield :
+                                   m == "blocking" ? cudaDeviceScheduleBlockingSync : cudaDeviceScheduleAuto;
+            CUDA_CHECK(cudaSetDevice(physical_id));
+            CUDA_CHECK(cudaSetDeviceFlags(f));
+            GGML_LOG_INFO("%s: device %d waits by %s (GGML_CUDA_SCHEDULE)\n", __func__, id, m.c_str());
+        }
 
 #endif  // defined(GGML_USE_HIP)
     }

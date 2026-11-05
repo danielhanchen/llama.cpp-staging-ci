@@ -2265,8 +2265,16 @@ struct llama_moe_cache::impl {
             return false;
         }
         const int wmax = em != nullptr && atoi(em) > 0 ? atoi(em) : 16;
-        const int wide = std::min({ single_threads + std::max(1, single_threads/3), llama_moe_n_cpus() - 4, wmax });
-        return wide > std::max(1, single_threads - 1);
+        return single_team_size(wmax) > std::max(1, single_threads - 1);
+    }
+    // the host team's size: the decode threads + a third, at most the CPUs - 4 and wmax; k19-l4poly LLAMA_MOE_SINGLE_THREADS_TEAM=N (test
+    // knob): N threads, at most the CPUs - 1
+    int single_team_size(int wmax) const {
+        static const int team_env = getenv("LLAMA_MOE_SINGLE_THREADS_TEAM") != nullptr ? atoi(getenv("LLAMA_MOE_SINGLE_THREADS_TEAM")) : 0;
+        if (team_env > 0) {
+            return std::max(1, std::min(team_env, llama_moe_n_cpus() - 1));
+        }
+        return std::min({ single_threads + std::max(1, single_threads/3), llama_moe_n_cpus() - 4, wmax });
     }
 
     bool single_usable(int64_t n_tokens) const {
@@ -2310,7 +2318,7 @@ struct llama_moe_cache::impl {
             if ((e == nullptr || atoi(e) <= 0) && wide_mode != 0 && (wide_mode == 2 || hybrid) && team_on != nullptr && team_on()) {
                 const char * em = getenv("LLAMA_MOE_SINGLE_THREADS_MAX");
                 const int wmax = em != nullptr && atoi(em) > 0 ? atoi(em) : 16;
-                const int wide = std::min({ single_threads + std::max(1, single_threads/3), llama_moe_n_cpus() - 4, wmax });
+                const int wide = single_team_size(wmax);
                 if (wide > h.threads) {
                     h.threads = wide;
                     h.team    = true;
