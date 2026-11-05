@@ -3542,7 +3542,8 @@ struct ggml_tensor * ggml_moe_cache_assign(
 
     const int64_t n_slots = (ggml_nelements(state) - 8)/3;
     GGML_ASSERT(n_slots > 0 && ggml_nelements(state) == 8 + 3*n_slots);
-    GGML_ASSERT(MIN(ggml_nelements(ids), map->ne[0]) <= n_slots && "more distinct experts than slots");
+    // k19-hostrow: no "distinct experts <= slots" condition here (the plain lookup keeps it): the assign admits at most the slots
+    // the lookup does not pin and leaves the other misses to the host (LLAMA_MOE_HYBRID_WIDE windows)
 
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], 5*ids->ne[1] + 1);
 
