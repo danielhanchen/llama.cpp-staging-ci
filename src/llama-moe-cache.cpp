@@ -2185,6 +2185,7 @@ struct llama_moe_cache::impl {
         int                  threads = 1;
         void               (*team_stop)(void) = nullptr; // k19-l4b: joins the CPU backend's host team (the last owner's stop)
         bool                 team = false;                // k19-l4b: the batches run on that team (LLAMA_MOE_SINGLE_THREADS_WIDE)
+        bool                 blocking = false;            // k19-l4poly: the CUDA device wait blocks while this team runs
         // k18 (LLAMA_MOE_SINGLE_FUSED, default on; =0 the graph of each batch as before): the CPU backend's one-region form of the batch's
         // host experts (ggml_cpu_moe_host_ffn: one barrier instead of the graph's seven, no plan; bit-identical to the graph), with
         // its scratch; null when the CPU backend has none (the graph then)
@@ -2274,7 +2275,7 @@ struct llama_moe_cache::impl {
         if (team_env > 0) {
             return std::max(1, std::min(team_env, llama_moe_n_cpus() - 1));
         }
-        if (single_wait_blocking() != nullptr) {
+        if (single_wait_blocking_here()) {
             return std::min({ single_threads + std::max(1, 2*single_threads/3), llama_moe_n_cpus() - 2, wmax });
         }
         return std::min({ single_threads + std::max(1, single_threads/3), llama_moe_n_cpus() - 4, wmax });
@@ -2283,6 +2284,14 @@ struct llama_moe_cache::impl {
     // for the graph sleeps instead of spinning, so the host team takes the decode threads + two thirds (at most the CPUs - 2) instead
     // of + a third (CPUs - 4). Colab L4 (6 decode threads, 12 vCPUs) LFM2.5 4 GB chat: 10 threads blocking 45.2 tok/s, 10 spinning
     // 41.9, 11 blocking 43.0, 11 yielding 33.5 (bimodal), 8 spinning (k19-l4b) 42.0; PolyStrata 46.4 (l4p_g5a)
+    // only where the cache holds at most LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC (0.25) of the host experts, so the host computes most
+    // misses: Colab L4 Flint 16 GB (55.8% cached) with a team of 10 waiting blocked: chat 57.6 [50.0-57.6] vs 58.3, 2k 66.1 vs 73.3;
+    // LFM2.5 8 GB (40%): chat +3.0%, 2k / 8k -5.8 / -1.9% (l4p_g5a / g5b)
+    bool single_wait_blocking_here() const {
+        static const double max_frac = getenv("LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC") != nullptr ?
+            std::max(0.0, atof(getenv("LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC"))) : 0.25;
+        return single_wait_blocking() != nullptr && cache_frac >= 0.0 && cache_frac <= max_frac;
+    }
     static void (*single_wait_blocking())(bool) {
         static void (*fn)(bool) = [] {
             const char * e = getenv("LLAMA_MOE_SINGLE_WAIT_BLOCKING");
@@ -2340,8 +2349,9 @@ struct llama_moe_cache::impl {
                 if (wide > h.threads) {
                     h.threads = wide;
                     h.team    = true;
-                    if (single_wait_blocking() != nullptr) {
+                    if (single_wait_blocking_here()) {
                         single_wait_blocking()(true);
+                        h.blocking = true;
                     }
                 }
             }
@@ -2366,7 +2376,7 @@ struct llama_moe_cache::impl {
         }
         LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses on (LLAMA_MOE_SINGLE): batches of up to %d tokens, %d host threads "
             "(one host thread for every cache of the process%s), slow-batch warning above %d ms (merges never time out), %s\n", tag, single_max_tok, h.threads,
-            h.team ? (single_wait_blocking() != nullptr ? "; the CPU backend's host team, the host experts are the critical path: LLAMA_MOE_SINGLE_THREADS_WIDE=0 off; "
+            h.team ? (h.blocking ? "; the CPU backend's host team, the host experts are the critical path: LLAMA_MOE_SINGLE_THREADS_WIDE=0 off; "
                 "the device wait blocks (LLAMA_MOE_SINGLE_WAIT_BLOCKING=0 off)" :
                 "; the CPU backend's host team, the host experts are the critical path: LLAMA_MOE_SINGLE_THREADS_WIDE=0 off") : "",
             single_timeout_ms, h.fused != nullptr ? "one-region host experts (LLAMA_MOE_SINGLE_FUSED=0: the graph)" : "host experts by graph");
@@ -2657,9 +2667,10 @@ struct llama_moe_cache::impl {
                 if (h.team_stop != nullptr) {
                     h.team_stop();
                 }
-                if (h.team && single_wait_blocking() != nullptr) {
+                if (h.blocking && single_wait_blocking() != nullptr) {
                     single_wait_blocking()(false);
                 }
+                h.blocking = false;
                 h.team = false;
                 h.cpu.reset();
             }
