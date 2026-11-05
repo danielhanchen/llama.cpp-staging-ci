@@ -60,7 +60,7 @@ bool common_fit_small_device() {
 }
 
 // k19-place8: see the small-device branch of common_params_fit_impl. Skipped where the user set LLAMA_MOE_TINY_RELEASE_FORCE (the test
-// knob of the same release) before the first fit; LLAMA_FIT_PLACE8=0 off; LLAMA_FIT_PLACE8_UB (32): the largest ubatch the decode-sized
+// knob of the same release) before the first fit; LLAMA_FIT_PLACE8=0 off; LLAMA_FIT_PLACE8_UB (31): the largest ubatch the decode-sized
 // context runs beside the whole cache
 static bool g_place8 = false;
 
@@ -74,8 +74,17 @@ static bool common_fit_place8_on() {
     return on && !user_env;
 }
 
+// the default is one token below the batch from which the CUDA backend copies host weights to compute an op on the device
+// (GGML_OP_OFFLOAD_MIN_BATCH, 32): a reserve at 32 tokens holds the expert copies of a split (G4 8 GB fn4: 1709 MiB of compute, the
+// cache grew 65 -> 669 MiB only), one at 31 computes the experts its slots do not hold on the host
 static uint32_t common_fit_place8_ub() {
-    static const uint32_t ub = getenv("LLAMA_FIT_PLACE8_UB") != nullptr ? (uint32_t) std::max(1, atoi(getenv("LLAMA_FIT_PLACE8_UB"))) : 32;
+    static const uint32_t ub = [] {
+        if (const char * e = getenv("LLAMA_FIT_PLACE8_UB")) {
+            return (uint32_t) std::max(1, atoi(e));
+        }
+        const char * e = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
+        return (uint32_t) std::max(1, (e != nullptr ? atoi(e) : 32) - 1);
+    }();
     return ub;
 }
 
@@ -1396,7 +1405,7 @@ static void common_params_fit_impl(
                     // k19-place8: the compute buffer is sized for the largest prompt ubatch (G4 at 8 GB, Qwen3.8-Flash-Next UD-IQ4_XS with -ub
                     // 2048: 2312 MiB, 1275 of them the staging arena of the prefetched expert copies) beside a cache of a few dozen slots
                     // (65 MiB, ~1% decode hits), and it sits idle during decode. Here the cache takes that memory instead: the context
-                    // reserves its graphs at LLAMA_FIT_PLACE8_UB (32) tokens, the batches the cache serves, and a larger ubatch runs with the
+                    // reserves its graphs at LLAMA_FIT_PLACE8_UB (31) tokens, small batches whose missing experts run on the host, and a larger ubatch runs with the
                     // cache banks released while its compute buffers grow into their memory; the next small ubatch frees the compute buffers
                     // and refills the banks with the experts they held (the k19-tiny-ub release, llama_context::tiny_rel_enter / leave,
                     // byte-exact at a fixed placement). The cache grows by the measured difference between the two placements, so a released
