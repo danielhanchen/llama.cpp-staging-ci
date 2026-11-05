@@ -12,6 +12,14 @@
 #include "sampling.h"
 #include "spec-cost-policy.h"
 
+// k19-df2pp: the DFlash2 window beside a small MoE cache (see the draft window below)
+#ifndef K19_DF2PP_TOK_ALL
+#define K19_DF2PP_TOK_ALL 5
+#endif
+#ifndef K19_DF2PP_POS_MIN
+#define K19_DF2PP_POS_MIN 16384
+#endif
+
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
@@ -1549,8 +1557,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 static const int32_t df2_cached_tok_max = getenv("LLAMA_DFLASH_CACHED_TOKENS_MAX") ? atoi(getenv("LLAMA_DFLASH_CACHED_TOKENS_MAX")) : 12;
                 const bool df2_cached = is_dflash2 && llama_moe_cache_active(params.ctx_tgt) &&
                     llama_moe_cache_tokens(params.ctx_tgt) < df2_cached_tok_max;
+                // where the slots hold at least LLAMA_DFLASH_CACHED_TOKENS_ALL (K19_DF2PP_TOK_ALL) tokens, only from position
+                // LLAMA_DFLASH_CACHED_POS_MIN (K19_DF2PP_POS_MIN) on: there the whole draft paid at chat / 8k (G4 fn4 16 GB, slots of 7 tokens)
+                static const int32_t df2_cached_tok_all = getenv("LLAMA_DFLASH_CACHED_TOKENS_ALL") ? atoi(getenv("LLAMA_DFLASH_CACHED_TOKENS_ALL")) : K19_DF2PP_TOK_ALL;
+                static const int32_t df2_cached_pos_min = getenv("LLAMA_DFLASH_CACHED_POS_MIN") ? atoi(getenv("LLAMA_DFLASH_CACHED_POS_MIN")) : K19_DF2PP_POS_MIN;
+                const bool df2_cached_here = df2_cached && (df2_window_cached ||
+                    llama_moe_cache_tokens(params.ctx_tgt) < df2_cached_tok_all || dp.pos0 >= df2_cached_pos_min);
                 const bool use_df2w = is_dflash2 && !use_ev && params.p_min <= 0.0f && p_cum_thr <= 0.0f &&
-                    (df2_cached ? (df2_window_cached || df2_window_cache_on) : df2_window);
+                    (df2_cached ? df2_cached_here && (df2_window_cached || df2_window_cache_on) : df2_window);
                 const bool df2w_cached_costs = df2_cached && !df2_window_cached;
                 if (use_df2w) {
                     static bool logged = false;
