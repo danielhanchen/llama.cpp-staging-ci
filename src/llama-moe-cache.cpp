@@ -6668,14 +6668,17 @@ struct llama_moe_cache::impl {
                     return e != nullptr ? std::max(0.0, atof(e)) : 0.0;
                 }();
                 const bool mb_cheap = n <= max_batch && single_weigh() && single_usable(n) && m >= mb_min_misses;
-                // k19-l4poly: a mailbox size served by the host team (a small host, see single_team_host) where the timing trials run
-                // is a candidate at LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM (0.5) times the weighed split instead of cm_split_scale (3, set on
-                // G4 for the graph split's unmodelled cost): the trial then decides it. Colab L4 Flint 16 GB (55.8% cached, trials on):
-                // 1-token batches gain ~60 us per layer against a weighed split of 1.5 x 3 x 0.2 x 200-330 us, so decode fetched every
-                // miss over PCIe, while a fixed host share of 1/4 decoded +13% (k19-flint). An explicit LLAMA_MOE_CPU_MISS_SPLIT_SCALE
-                // applies to every size as before
-                const double scale = mb_cheap && !cm_split_scale_env && cm_trial && !cm_trials_skipped && !cm_force && single_team_host() ?
-                    cm_split_scale_team() : cm_split_scale;
+                // k19-l4poly: on a host whose host experts run on the host team (a small host, see single_team_host), where the timing
+                // trials run, a small batch is a candidate at LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM (0.5) times the weighed split instead of
+                // cm_split_scale (3, set on G4 for the graph split's unmodelled cost): the trial then decides it. Colab L4 Flint 16 GB
+                // (55.8% cached, trials on): 1-token batches gain ~60 us per layer against a weighed split of 1.5 x 3 x 0.2 x 200-330 us,
+                // so decode fetched every miss over PCIe, while a fixed host share of 1/4 decoded +13% (k19-flint); the scale 0.5 on the
+                // same VM: chat +8.4%, 2k +32% (l4p_b2). LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM_MAILBOX=1: mailbox sizes only. An explicit
+                // LLAMA_MOE_CPU_MISS_SPLIT_SCALE applies to every size as before
+                static const bool team_mb_only = getenv("LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM_MAILBOX") != nullptr &&
+                    atoi(getenv("LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM_MAILBOX")) != 0;
+                const double scale = (mb_cheap || !team_mb_only) && !cm_split_scale_env && cm_trial && !cm_trials_skipped && !cm_force &&
+                    single_team_host() ? cm_split_scale_team() : cm_split_scale;
                 const double need = (n <= max_batch ? cm_margin*scale*cm_split*(mb_cheap ? single_split_frac : 1.0) :
                                      cm_margin_p*(cm_split + n*cm_act))*
                                     (cm_on[n] && cm_measured ? cm_hyst : 1.0);
