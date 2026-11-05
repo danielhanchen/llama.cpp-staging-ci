@@ -3318,9 +3318,27 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     return true;
 }
 
+// k19-l4poly: blocking device waits, set by the MoE cache while its host team takes most of the CPUs (ggml_backend_cuda_set_wait_blocking,
+// LLAMA_MOE_SINGLE_WAIT_BLOCKING): the thread that waits for a graph sleeps on an event instead of spinning on a CPU the team needs.
+// Colab L4 (12 vCPUs) LFM2.5 4 GB chat with a host team of 10: 45.2 tok/s waiting by blocking sync, 41.9 spinning (team of 8: 42.0)
+static std::atomic<bool> g_cuda_wait_blocking{false};
+
+static void ggml_backend_cuda_set_wait_blocking(bool on) {
+    g_cuda_wait_blocking.store(on, std::memory_order_relaxed);
+}
+
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    if (g_cuda_wait_blocking.load(std::memory_order_relaxed)) {
+        ggml_cuda_set_device(cuda_ctx->device);
+        cudaEvent_t ev;
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventBlockingSync | cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventRecord(ev, cuda_ctx->stream()));
+        CUDA_CHECK(cudaEventSynchronize(ev));
+        CUDA_CHECK(cudaEventDestroy(ev));
+        return;
+    }
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 
     GGML_UNUSED(backend);
@@ -12217,6 +12235,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
 #else
         return nullptr;
 #endif
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_wait_blocking") == 0) {
+        return (void *)ggml_backend_cuda_set_wait_blocking;
     }
     if (strcmp(name, "ggml_backend_moe_mailbox_free") == 0) {
         return (void *)ggml_backend_cuda_moe_mailbox_free;

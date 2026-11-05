@@ -2274,7 +2274,25 @@ struct llama_moe_cache::impl {
         if (team_env > 0) {
             return std::max(1, std::min(team_env, llama_moe_n_cpus() - 1));
         }
+        if (single_wait_blocking() != nullptr) {
+            return std::min({ single_threads + std::max(1, 2*single_threads/3), llama_moe_n_cpus() - 2, wmax });
+        }
         return std::min({ single_threads + std::max(1, single_threads/3), llama_moe_n_cpus() - 4, wmax });
+    }
+    // k19-l4poly (LLAMA_MOE_SINGLE_WAIT_BLOCKING, default 1; 0 = off): the CUDA backend's blocking device wait. With it the thread that waits
+    // for the graph sleeps instead of spinning, so the host team takes the decode threads + two thirds (at most the CPUs - 2) instead
+    // of + a third (CPUs - 4). Colab L4 (6 decode threads, 12 vCPUs) LFM2.5 4 GB chat: 10 threads blocking 45.2 tok/s, 10 spinning
+    // 41.9, 11 blocking 43.0, 11 yielding 33.5 (bimodal), 8 spinning (k19-l4b) 42.0; PolyStrata 46.4 (l4p_g5a)
+    static void (*single_wait_blocking())(bool) {
+        static void (*fn)(bool) = [] {
+            const char * e = getenv("LLAMA_MOE_SINGLE_WAIT_BLOCKING");
+            if (e != nullptr && atoi(e) == 0) {
+                return (void (*)(bool)) nullptr;
+            }
+            ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+            return reg != nullptr ? (void (*)(bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_wait_blocking") : nullptr;
+        }();
+        return fn;
     }
 
     bool single_usable(int64_t n_tokens) const {
@@ -2322,6 +2340,9 @@ struct llama_moe_cache::impl {
                 if (wide > h.threads) {
                     h.threads = wide;
                     h.team    = true;
+                    if (single_wait_blocking() != nullptr) {
+                        single_wait_blocking()(true);
+                    }
                 }
             }
             if (set_n != nullptr) {
@@ -2345,7 +2366,9 @@ struct llama_moe_cache::impl {
         }
         LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses on (LLAMA_MOE_SINGLE): batches of up to %d tokens, %d host threads "
             "(one host thread for every cache of the process%s), slow-batch warning above %d ms (merges never time out), %s\n", tag, single_max_tok, h.threads,
-            h.team ? "; the CPU backend's host team, the host experts are the critical path: LLAMA_MOE_SINGLE_THREADS_WIDE=0 off" : "",
+            h.team ? (single_wait_blocking() != nullptr ? "; the CPU backend's host team, the host experts are the critical path: LLAMA_MOE_SINGLE_THREADS_WIDE=0 off; "
+                "the device wait blocks (LLAMA_MOE_SINGLE_WAIT_BLOCKING=0 off)" :
+                "; the CPU backend's host team, the host experts are the critical path: LLAMA_MOE_SINGLE_THREADS_WIDE=0 off") : "",
             single_timeout_ms, h.fused != nullptr ? "one-region host experts (LLAMA_MOE_SINGLE_FUSED=0: the graph)" : "host experts by graph");
         return true;
     }
@@ -2634,6 +2657,10 @@ struct llama_moe_cache::impl {
                 if (h.team_stop != nullptr) {
                     h.team_stop();
                 }
+                if (h.team && single_wait_blocking() != nullptr) {
+                    single_wait_blocking()(false);
+                }
+                h.team = false;
                 h.cpu.reset();
             }
             single_reg = false;
