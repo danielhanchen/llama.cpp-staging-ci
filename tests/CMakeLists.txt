@@ -286,6 +286,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     # k19-graph: flash attention with its KV length on the device vs the unpadded node, byte for byte (GPU; SKIP without one)
     llama_build(test-fa-kvlen-exact.cpp)
+    llama_build(test-fa-kvlen-rows.cpp)   # k19-nanfix: small-batch flash attention with the device KV length, finite and against a reference
 
     # the SSD prompt-cache namespace covers the --override-kv metadata overrides (a restart with another override restored stale state)
     llama_build(test-server-prompt-ssd-ns.cpp)
