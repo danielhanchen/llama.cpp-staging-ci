@@ -2284,12 +2284,12 @@ struct llama_moe_cache::impl {
     // for the graph sleeps instead of spinning, so the host team takes the decode threads + two thirds (at most the CPUs - 2) instead
     // of + a third (CPUs - 4). Colab L4 (6 decode threads, 12 vCPUs) LFM2.5 4 GB chat: 10 threads blocking 45.2 tok/s, 10 spinning
     // 41.9, 11 blocking 43.0, 11 yielding 33.5 (bimodal), 8 spinning (k19-l4b) 42.0; PolyStrata 46.4 (l4p_g5a)
-    // only where the cache holds at most LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC (0.5; the trials' share with the mailbox) of the host
-    // experts: Colab L4 Flint 16 GB (55.8% cached) with a team of 10 waiting blocked: chat 57.6 [50.0-57.6] vs 58.3, 2k 66.1 vs 73.3;
-    // LFM2.5 8 GB (40%) chat / 2k / 8k +3.0 / -5.8 / -1.9% (l4p_g5a) and +8.0 / +9.1 / +13.2% (l4p_a7) on two VMs
+    // only where the cache holds at most LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC (0.25) of the host experts: Colab L4 Flint 16 GB
+    // (55.8% cached) with a team of 10 waiting blocked: chat 57.6 [50.0-57.6] vs 58.3, 2k 66.1 vs 73.3; LFM2.5 8 GB (40%) on the base's
+    // own texts chat +4%, 2k -3%, 8k -4% (l4p_f1; l4p_g5a +3.0 / -5.8 / -1.9%, l4p_a7 +8 / +9 / +13% on a slower VM)
     bool single_wait_blocking_here() const {
         static const double max_frac = getenv("LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC") != nullptr ?
-            std::max(0.0, atof(getenv("LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC"))) : 0.5;
+            std::max(0.0, atof(getenv("LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC"))) : 0.25;
         return single_wait_blocking() != nullptr && cache_frac >= 0.0 && cache_frac <= max_frac;
     }
     static void (*single_wait_blocking())(bool) {
