@@ -5173,12 +5173,17 @@ struct llama_moe_cache::impl {
             short_fast(n_tokens) &&
             n_tokens > cm_prompt_force && cm_on[n_tokens] != 0 && cmt_host_ok && !cm_prompt_off();
     }
-    static bool cm_pin_short() {
+    // only where the cache holds at most LLAMA_MOE_PIN_PROMPT_SHORT_MAX_FRAC (0.25) of the host experts: srv_kld short192 against the
+    // base (l4p_f3), LFM2.5 4 GB (14.6% cached) first-token KLD mean / p99 / top-1 0.099 / 0.84 / 0.885 inside the -fa off band
+    // (0.154 / 1.32 / 0.854); 8 GB (40%) 0.144 / 1.53 / 0.849, p99 and top-1 just outside it (1.16 / 0.854)
+    bool cm_pin_short() const {
         static const bool pin_short = [] {
             const char * e = getenv("LLAMA_MOE_PIN_PROMPT_SHORT");
             return e == nullptr || atoi(e) != 0;
         }();
-        return pin_short;
+        static const double max_frac = getenv("LLAMA_MOE_PIN_PROMPT_SHORT_MAX_FRAC") != nullptr ?
+            std::max(0.0, atof(getenv("LLAMA_MOE_PIN_PROMPT_SHORT_MAX_FRAC"))) : 0.25;
+        return pin_short && cache_frac >= 0.0 && cache_frac <= max_frac;
     }
     bool cm_prompt_off() const {
         static const bool pin_dev = [] {
