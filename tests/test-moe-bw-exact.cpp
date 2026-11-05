@@ -240,6 +240,14 @@ struct moe_graph {
             ggml_set_output(out[l]);
             ggml_build_forward_expand(gf, out[l]);
         }
+        // k19-ampere: MOE_BENCH_VERIFY_TAG=1 tags every node as a speculative verify graph (GGML_TENSOR_FLAG_VERIFY), so the
+        // verify-window kernel choices (GGML_CUDA_VERIFY_WIDE) apply to the bench as they do to a server's verify batches
+        static const bool vtag = getenv("MOE_BENCH_VERIFY_TAG") != nullptr && atoi(getenv("MOE_BENCH_VERIFY_TAG")) != 0;
+        if (vtag) {
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_graph_node(gf, i)->flags |= GGML_TENSOR_FLAG_VERIFY;
+            }
+        }
         ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
         if (!ggml_gallocr_alloc_graph(ga, gf)) {
             return false;
