@@ -1114,6 +1114,11 @@ llama_context::llama_context(
                 lm_enabled = false;
             } else {
                 place8_grow = (size_t) std::max(0, atoi(em)) << 20;
+                // the refill after a released prompt ubatch takes the experts it routed most (LLAMA_MOE_TINY_RELEASE_ROUTED=0: the experts
+                // held before), as the layer-major groups below (see lm_release_routed): G4 12 / 16 GB fn4 + MTP, 2 launches each,
+                // decode chat / 8k / 30k held-before 129.5 / 107.4 / 105.1 -> 139.6 / 126.3 / 103.0 (12 GB), 147.7 / 151.3 / 107.8 ->
+                // 159.0 / 137.9 / 129.2 (16 GB); base 120.0 / 100.1 / 91.0 and 141.0 / 100.0 / 109.8 (k19pm_g3a / g3b)
+                tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") == nullptr || atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0;
                 LLAMA_LOG_INFO("%s: MoE cache: k19-placemid: graphs reserved at %lld tokens, layer-major prompt groups %s\n", __func__,
                     (long long) tiny_rel_ub, lm_enabled ? "kept (they release the banks for the merged graph)" : "off");
             }
@@ -7303,7 +7308,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         // Qwen3.6 Q4_K_XL: 238 experts admitted by the prompts against 1399 ubatch by ubatch, decode -0.7..-2.2%). It changes only which
         // experts the cache holds. LLAMA_MOE_LM_RELEASE_ROUTED=0 off, =1 on with a draft too
         static const char * lm_rr_env = getenv("LLAMA_MOE_LM_RELEASE_ROUTED");
-        const bool lm_release_routed = lm_rr_env != nullptr ? atoi(lm_rr_env) != 0 : !cparams.spec_draft;
+        // k19-placemid: also with a draft where the graphs are reserved at the decode size (place8_grow, see the measurement there)
+        const bool lm_release_routed = lm_rr_env != nullptr ? atoi(lm_rr_env) != 0 : (!cparams.spec_draft || place8_grow > 0);
         if (lm_release_routed && status == GGML_STATUS_SUCCESS) {
             moe_cache->set_refill_routed_once(true);
             moe_cache_ids = lm_record;
