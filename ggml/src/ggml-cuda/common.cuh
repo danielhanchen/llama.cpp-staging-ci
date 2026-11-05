@@ -1496,6 +1496,9 @@ struct ggml_cuda_q8_1_cache {
     size_t slot_size = 0;
     int    next      = 0;
     int    pending   = -1; // slot reserved by a producer, see reserve()
+    // k19-vcost: slots handed out so far (get() misses + reserve()), never reset within an evaluation: a side-stream branch that reads
+    // slots is joined before the main stream could hand any of them out again (see ggml_cuda_side_chain_plan)
+    uint64_t n_claims = 0;
     entry  entries[n_slots];
     std::unordered_set<const void *> norm_targets; // producer tensors whose kernel writes the q8_1 copy (see ggml_cuda_q8_1_cache_slot_size)
     // k15-mm2: the reader's row length of a producer target whose rows differ from the reader's (any width: the gated producer writes its
@@ -1536,6 +1539,7 @@ struct ggml_cuda_q8_1_cache {
         }
         const int i = next;
         next = (next + 1) % n_slots;
+        n_claims++;
         entry & e = entries[i];
         e.src_lo = (const char *) src;
         e.src_hi = (const char *) src + src_nbytes;
@@ -1553,6 +1557,7 @@ struct ggml_cuda_q8_1_cache {
         }
         const int i = next;
         next = (next + 1) % n_slots;
+        n_claims++;
         entry & e = entries[i];
         e.src_lo = (const char *) src;
         e.src_hi = (const char *) src + src_nbytes;
@@ -1718,6 +1723,20 @@ struct ggml_backend_cuda_context {
     int                      side_mv_n_nodes = 0;
     cudaEvent_t              side_mv_fork = nullptr;
     std::vector<cudaEvent_t> side_mv_join;
+    // k19-vcost: side-stream branches of several nodes (a shared expert: gate / up products, GLU, down product) that graph_optimize moved
+    // right after their input's producer, run on the side stream while a decode-sized graph is captured, joined before their reader
+    // (see ggml_cuda_side_chain_plan): first node -> { last node, first reader }; planned for the same node array as side_mv
+    struct side_chain_t { const ggml_tensor * last; const ggml_tensor * reader; };
+    std::unordered_map<const ggml_tensor *, side_chain_t> side_chain;
+    // set while a branch's nodes are enqueued on the side stream: the q8_1 cache and the multi-matrix launches are used as on the main
+    // stream (the branch's slots stay untouched until its join), lookahead fusions stop at the branch's last node
+    bool side_chain_active = false;
+    int  side_chain_last   = -1;
+
+    // the q8_1 activation cache and the multi-matrix product launches only run on the main stream, or inside a side-stream branch
+    bool q8_1_stream_ok() const {
+        return curr_stream_no == 0 || side_chain_active;
+    }
 
     ggml_cuda_q8_1_cache q8_1_cache;
     // k15-mm: products of this graph evaluation already computed by an earlier multi-matrix mul_mat_vec_q launch (ggml_cuda_try_fuse_mmvq_multi)

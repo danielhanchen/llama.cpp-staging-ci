@@ -389,7 +389,7 @@ static bool ggml_cuda_gated_q8_1_disabled() {
 // reader's row width (ggml_cuda_q8_1_cache::norm_target_ne10, else the gated row width n) and its padded width
 static void * unary_gated_q8_1_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const int64_t n, int64_t & ne10, int64_t & ne10q) {
     ggml_cuda_q8_1_cache & cache = ctx.q8_1_cache;
-    if (ggml_cuda_gated_q8_1_disabled() || !cache.active() || ctx.curr_stream_no != 0 || dst->type != GGML_TYPE_F32 ||
+    if (ggml_cuda_gated_q8_1_disabled() || !cache.active() || !ctx.q8_1_stream_ok() || dst->type != GGML_TYPE_F32 ||
             !ggml_is_contiguous(dst) || !cache.norm_targets.count(dst)) {
         return nullptr;
     }
