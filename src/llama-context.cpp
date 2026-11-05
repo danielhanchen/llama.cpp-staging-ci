@@ -1104,6 +1104,7 @@ llama_context::llama_context(
             // buffers; the graphs are reserved at that many tokens and larger ubatches run with the banks released, as for the tiny-cache rule
             tiny_rel_ub     = atoi(e8);
             tiny_rel_res_ub = tiny_rel_ub;
+            place8_rel      = true;
             tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") != nullptr && atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0;
             lm_enabled      = false;
             LLAMA_LOG_INFO("%s: MoE cache: k19-place8: ubatches of more than %lld tokens (up to n_ubatch %u) run with the cache banks released, "
@@ -1995,6 +1996,11 @@ void llama_context::tiny_rel_leave() {
     }
     TINY_TRACE("%s: trace: free own compute (%.2f MiB)\n", __func__, freed/1048576.0);
     ggml_backend_sched_free_device_buffers(sched.get());
+    // k19-place8: the context reserved no staging arena (its graphs are reserved below the prefetched sizes), the prompt allocated one in
+    // the memory of the released banks: it goes too, the next prefetched graph allocates it again (while the banks are released)
+    if (place8_rel) {
+        ggml_backend_sched_free_prefetch_arenas(sched.get());
+    }
     size_t freed_dft = 0;
     for (llama_context * c : llama_mtp_ctxs_of(this, model)) {
         if (c->sched) {
