@@ -1363,7 +1363,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int32_t n = (int32_t) dp.pos0;
 
             const int32_t n_draft = params.n_max;
-            const int32_t n_block_tokens = is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+            // k19-df2acc (LLAMA_DFLASH_FULL_BLOCK=1): a DFlash2 draft decodes the whole trained block (the anchor + block_size - 1 masks)
+            // and walks only its first n_max rows. The attention over the block is not causal, so a block cut to n_max + 1 rows changes
+            // every row's draft against the block the drafter was trained on
+            static const bool full_block = getenv("LLAMA_DFLASH_FULL_BLOCK") != nullptr && atoi(getenv("LLAMA_DFLASH_FULL_BLOCK")) != 0;
+            const int32_t n_block_tokens = is_lilicorr ? block_size :
+                (is_dflash2 && full_block && n + block_size <= (int32_t) llama_n_ctx(ctx_dft)) ? std::max<int32_t>(block_size, n_draft + 1) : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
@@ -1500,7 +1505,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 std::vector<float> step_p;
 
                 int32_t predecessor = 0;
-                for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
+                for (int32_t i = 1; i < (is_dflash2 ? std::min(n_block_tokens, params.n_max + 1) : params.n_max + 1); ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const int32_t top_k = is_dflash2 ? selector_top_k : lilicorr_top_k;
                     const float * scores = row + top_k + (size_t) predecessor * top_k;
