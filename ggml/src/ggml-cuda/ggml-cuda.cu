@@ -2131,7 +2131,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
         return false;
     }
 
-    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc)) {
+    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > ggml_cuda_mmvq_mmid_max_batch(src0->type, cc)) {
         return false;
     }
 
@@ -2401,7 +2401,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
         if (ggml_is_quantized(src0->type)) {
             // batch invariant: the single token mul_mat_vec_q per token (see ggml_cuda_mul_mat_id)
-            if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc) || (dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT)) {
+            if (dst->ne[2] <= ggml_cuda_mmvq_mmid_max_batch(src0->type, cc) || (dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT)) {
                 return false;
             }
         } else if (GGML_CUDA_CC_IS_AMD(cc)) {
@@ -2442,7 +2442,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
-                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+                const int mmvq_mmid_max = ggml_cuda_mmvq_mmid_max_batch(src0->type, cc);
                 // batch invariant (verify batches): mul_mat_vec_q runs the single token kernel per token
                 if (ne2 <= mmvq_mmid_max || (dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT)) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);

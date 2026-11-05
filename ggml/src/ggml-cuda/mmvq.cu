@@ -319,6 +319,18 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
+// k19-ampere (GGML_CUDA_VERIFY_WIDE bit 8): the Turing / Ampere table sends some MUL_MAT_IDs of 7..8 tokens to MMQ (IQ3_S from 7: the
+// Flash-Next gate / up of a DFlash2 n_max 6 window). Inside a verify-tagged graph those columns keep the multi-token mmvq kernels a
+// 2..6-row window and every Ada / Blackwell window runs (mul_mat_vec_q_moe_vl for the fused IQ3_S gate / up). Not bit-identical to the
+// MMQ launch it replaces (another f32 summation order: reassociation, KLD-gated, plans/k19_ampere.md)
+int ggml_cuda_mmvq_mmid_max_batch(ggml_type type, int cc) {
+    const int table = get_mmvq_mmid_max_batch(type, cc);
+    if (table >= MMVQ_MAX_BATCH_SIZE) {
+        return table;
+    }
+    return std::max(table, ggml_cuda_verify_wide_cols(cc, 8));
+}
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
@@ -3109,6 +3121,25 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 ncols_dst, ids_stride, warp_size, nchannels_dst, stream)) {
             return;
         }
+        // k19-ampere: more tokens than this device's mul_mat_vec_q_moe instances take (their __launch_bounds__ follow the per-architecture
+        // table: a verify window kept on mmvq by ggml_cuda_mmvq_mmid_max_batch) run in chunks of that size; each warp owns one token, so
+        // every column keeps its bytes
+        const int moe_max = get_mmvq_mmid_max_batch(type, cc);
+        if (ncols_dst > moe_max) {
+            for (int j0 = 0; j0 < ncols_dst; j0 += moe_max) {
+                ggml_cuda_mm_fusion_args_device fusion_j = fusion;
+                if (fusion_j.shared_dst != nullptr) {
+                    fusion_j.shared_dst = fusion.shared_dst + (size_t) j0*fusion.shared_stride_col_dst;
+                }
+                mul_mat_vec_q_moe_launch<type>(
+                    vx, (const char *) vy + (size_t) j0*stride_col_y*sizeof(block_q8_1), ids + (size_t) j0*ids_stride, fusion_j,
+                    dst + (size_t) j0*stride_col_dst, ncols_x, nchannels_y_fd, nrows_x,
+                    stride_row_x, stride_col_y, stride_col_dst,
+                    stride_channel_x, stride_channel_y, stride_channel_dst,
+                    std::min(moe_max, ncols_dst - j0), ids_stride, warp_size, nchannels_dst, stream);
+            }
+            return;
+        }
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel (GGML_CUDA_MMVQ_MOE_ONE=1: one token too)
         mul_mat_vec_q_moe_launch<type>(
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
@@ -3635,6 +3666,16 @@ void ggml_cuda_mul_mat_vec_q(
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
 
+    // k19-ampere: engagement line (once) of a verify MUL_MAT_ID kept here past the per-architecture table (GGML_CUDA_VERIFY_WIDE bit 8)
+    if (ids && dst->ne[2] > 1 && !(dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) &&
+            dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        static std::once_flag once;
+        std::call_once(once, [&] {
+            GGML_LOG_INFO("k19-ampere: a verify MUL_MAT_ID of %d tokens (%s%s) on the multi-token mmvq kernels instead of MMQ "
+                "(GGML_CUDA_VERIFY_WIDE bit 8)\n", (int) dst->ne[2], ggml_type_name(src0->type), fusion && fusion->gate ? ", fused gate" : "");
+        });
+    }
+
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
@@ -3643,7 +3684,7 @@ void ggml_cuda_mul_mat_vec_q(
 
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-        GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
+        GGML_ASSERT( !ids || dst->ne[2] <= ggml_cuda_mmvq_mmid_max_batch(src0->type, cc));
         GGML_ASSERT(  ids || dst->ne[1] == 1);
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
