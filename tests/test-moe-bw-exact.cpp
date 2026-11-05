@@ -10,7 +10,7 @@
 // default child must log launches, the kill-switch child none, so a silent fallback fails the test; a negative control
 // (GGML_CUDA_MMVQ_MOE_ONE=1: one token on the multi-token kernel, another K split) must differ. No CUDA device: SKIP, exit 0.
 //
-// --bench NAME L REPS P T,T,..: microbench of one shape (fn4gu fn4gux fn4dn fn4dq8 q4xgu q4xdn q4xdn6 lfmgu lfmdn): L layers of
+// --bench NAME L REPS P T,T,..: microbench of one shape (fn4gu fn4gux fn4gun fn4dn fn4dq8 q4xgu q4xdn q4xdn6 lfmgu lfmdn): L layers of
 // random experts (cold in L2), REPS graph computes with rotating routing; per T: distinct experts, md5 of all outputs, median graph
 // ms, us per layer and the GB/s of the distinct experts' weight bytes at that time.
 
@@ -240,6 +240,14 @@ struct moe_graph {
             ggml_set_output(out[l]);
             ggml_build_forward_expand(gf, out[l]);
         }
+        // k19-ampere: MOE_BENCH_VERIFY_TAG=1 tags every node as a speculative verify graph (GGML_TENSOR_FLAG_VERIFY), so the
+        // verify-window kernel choices (GGML_CUDA_VERIFY_WIDE) apply to the bench as they do to a server's verify batches
+        static const bool vtag = getenv("MOE_BENCH_VERIFY_TAG") != nullptr && atoi(getenv("MOE_BENCH_VERIFY_TAG")) != 0;
+        if (vtag) {
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_graph_node(gf, i)->flags |= GGML_TENSOR_FLAG_VERIFY;
+            }
+        }
         ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
         if (!ggml_gallocr_alloc_graph(ga, gf)) {
             return false;
@@ -264,6 +272,7 @@ struct moe_graph {
 static const moe_shape bench_shapes[] = {
     { "fn4gu",  GGML_TYPE_IQ3_S,  2560,  640, 128, 10, true  },
     { "fn4gux", GGML_TYPE_IQ4_XS, 2560,  640, 128, 10, true  },
+    { "fn4gun", GGML_TYPE_IQ3_S,  2560,  640, 128, 10, false },   // k19-ampere: the gate or up alone (MoE cache tiers: no fused gate)
     { "fn4dn",  GGML_TYPE_IQ4_NL,  640, 2560, 128, 10, false },
     { "fn4dq8", GGML_TYPE_Q8_0,    640, 2560, 128, 10, false },
     { "q4xgu",  GGML_TYPE_Q4_K,   2048,  512, 256,  8, true  },
