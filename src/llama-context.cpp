@@ -1107,7 +1107,21 @@ llama_context::llama_context(
             place8_rel      = true;
             moe_cache->set_restore_soft(true);
             tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") != nullptr && atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0;
-            lm_enabled      = false;
+            // k19-placemid (LLAMA_MOE_PLACE8_MID, set with it by the fit of a mid-size device): prompts keep their layer-major groups,
+            // which release the banks for the merged graph; only a large ubatch outside a group takes the release above
+            const char * em = getenv("LLAMA_MOE_PLACE8_MID");
+            if (em == nullptr || atoi(em) == 0) {
+                lm_enabled = false;
+            } else {
+                place8_grow = (size_t) std::max(0, atoi(em)) << 20;
+                // the refill after a released prompt ubatch takes the experts it routed most (LLAMA_MOE_TINY_RELEASE_ROUTED=0: the experts
+                // held before), as the layer-major groups below (see lm_release_routed): G4 12 / 16 GB fn4 + MTP, 2 launches each,
+                // decode chat / 8k / 30k held-before 129.5 / 107.4 / 105.1 -> 139.6 / 126.3 / 103.0 (12 GB), 147.7 / 151.3 / 107.8 ->
+                // 159.0 / 137.9 / 129.2 (16 GB); base 120.0 / 100.1 / 91.0 and 141.0 / 100.0 / 109.8 (k19pm_g3a / g3b)
+                tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") == nullptr || atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0;
+                LLAMA_LOG_INFO("%s: MoE cache: k19-placemid: graphs reserved at %lld tokens, layer-major prompt groups %s\n", __func__,
+                    (long long) tiny_rel_ub, lm_enabled ? "kept (they release the banks for the merged graph)" : "off");
+            }
             LLAMA_LOG_INFO("%s: MoE cache: k19-place8: ubatches of more than %lld tokens (up to n_ubatch %u) run with the cache banks released, "
                 "the next smaller ubatch frees the compute buffers and refills the banks (%s; LLAMA_FIT_PLACE8=0 off)\n", __func__,
                 (long long) tiny_rel_ub, cparams.n_ubatch, tiny_rel_routed ? "with the experts the last large ubatch routed most" :
@@ -5035,8 +5049,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         mem_idx->set_n_kv_bucket_dev_allowed(cparams.flash_attn);
     }
 
+    // k19-placemid (LLAMA_MOE_PLACE8_CHUNK_MAX=N; default 64 on a mid-size device, 0 = off, at 8 GB opt-in): a short prompt of at most N
+    // tokens runs as ubatches of the decode size, served by the cache, instead of one ubatch with the banks released and refilled. G4
+    // fn4 + MTP, the 42-token chat prompt (k19pm_g4a): 16 GB TTFT 514 -> 286 ms (base 352; the refill of 7.7 GB of banks took 145 ms),
+    // 12 GB 391 -> 359 ms (base 361), decode unchanged or better (12 GB 137.2 -> 137.8, 16 GB 150.5 -> 162.6 tok/s, other texts)
+    static const int64_t place8_chunk_env = getenv("LLAMA_MOE_PLACE8_CHUNK_MAX") ? std::max(0, atoi(getenv("LLAMA_MOE_PLACE8_CHUNK_MAX"))) : -1;
+    const int64_t place8_chunk_max = place8_chunk_env >= 0 ? place8_chunk_env : (place8_grow > 0 ? 64 : 0);
+    const uint32_t n_ubatch_split = place8_rel && place8_chunk_max > 0 && tiny_rel_ub > 0 && !cparams.verify && !embd_all &&
+        (int64_t) n_tokens_all > tiny_rel_ub && (int64_t) n_tokens_all <= place8_chunk_max ? (uint32_t) tiny_rel_ub : cparams.n_ubatch;
+
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
+        mctx = memory->init_batch(*balloc, n_ubatch_split, embd_all);
         if (!mctx) {
             return -2;
         }
@@ -6321,7 +6344,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     static const double lm_rel_split_frac = getenv("LLAMA_MOE_LM_RELEASE_SPLIT_FRAC") ? std::max(0.0, atof(getenv("LLAMA_MOE_LM_RELEASE_SPLIT_FRAC"))) : 0.10;
     static const size_t lm_rel_grow_max   = (size_t) (getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB"))) : 1024) << 20;
     const double lm_cf   = moe_cache->cache_frac();
-    bool         lm_tiny = lm_tiny_cache(lm_cf);
+    // k19-placemid: the graphs are reserved at the decode size (LLAMA_MOE_PLACE8_MID), a merged group never fits beside the banks
+    bool         lm_tiny = lm_tiny_cache(lm_cf) || place8_rel;
     if (lm_release_env && lm_rel_split && !lm_tiny && gm != nullptr && group.size() >= 2 && lm_cf >= 0.0 && lm_cf < lm_rel_split_frac) {
         // k19 (LLAMA_MOE_LM_MEASURE_RESTORE=0 off): the measure allocates the merged graph when it fits, which sets the data of its
         // nodes; the graph allocator takes a node with data as preallocated, so the allocation that runs the graph planned only the
@@ -6403,13 +6427,14 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
         return freed;
     };
-    if (lm_release_env && group.size() >= 2 && lm_tiny && lm_out_banks) {
+    if (lm_release_env && (group.size() >= 2 || place8_rel) && lm_tiny && lm_out_banks) {
         static int n_log = 0;
         if (n_log++ < 4) {
             LLAMA_LOG_INFO("%s: a ubatch of the group of %zu reads the cache banks (a device seed or lookup): the banks are kept\n", __func__, group.size());
         }
     }
-    if (lm_release_env && group.size() >= 2 && lm_tiny && !lm_out_banks) {
+    // k19-placemid: a group of one ubatch does not fit beside the banks either
+    if (lm_release_env && (group.size() >= 2 || place8_rel) && lm_tiny && !lm_out_banks) {
         ggml_backend_sched_synchronize(sched.get());
         if (lm_rel_trim) {
             pool_mark_trim(false);
@@ -6932,6 +6957,12 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 }
             }
         }
+        // k19-placemid: the graphs were reserved at the decode size, so a released group grows its buffers from that size: the cap also
+        // allows the memory the fit moved from the prompt compute buffers to the cache (whose banks the group released). Without it the
+        // first 8k group of G4 12 GB fn4 (1840 MiB of growth, 5668 MiB free) split down to single ubatches: 8k TTFT 1647 -> 3580 ms
+        if (place8_rel && lm_released) {
+            back += place8_grow;
+        }
         return lm_grow_max + back;
     };
     int n_sub = 0;
@@ -7280,7 +7311,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         // Qwen3.6 Q4_K_XL: 238 experts admitted by the prompts against 1399 ubatch by ubatch, decode -0.7..-2.2%). It changes only which
         // experts the cache holds. LLAMA_MOE_LM_RELEASE_ROUTED=0 off, =1 on with a draft too
         static const char * lm_rr_env = getenv("LLAMA_MOE_LM_RELEASE_ROUTED");
-        const bool lm_release_routed = lm_rr_env != nullptr ? atoi(lm_rr_env) != 0 : !cparams.spec_draft;
+        // k19-placemid: also with a draft where the graphs are reserved at the decode size (place8_grow, see the measurement there)
+        const bool lm_release_routed = lm_rr_env != nullptr ? atoi(lm_rr_env) != 0 : (!cparams.spec_draft || place8_grow > 0);
         if (lm_release_routed && status == GGML_STATUS_SUCCESS) {
             moe_cache->set_refill_routed_once(true);
             moe_cache_ids = lm_record;
@@ -7295,6 +7327,11 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         ggml_backend_sched_free_device_buffers(sched.get());
         // k19-fn16: and the staging arena to its size before the group (a no-op without LLAMA_MOE_LM_RELEASE_DEPTH)
         ggml_backend_sched_set_prefetch_depth_scope(sched.get(), 0);
+        // k19-placemid: the graphs were reserved below the prefetched sizes, so the arena the group allocated lives in the memory of the
+        // released banks: it goes too (as in tiny_rel_leave), the next prefetched graph allocates it again
+        if (place8_rel) {
+            ggml_backend_sched_free_prefetch_arenas(sched.get());
+        }
         if (lm_rel_trim) {
             const size_t trimmed = pool_mark_trim(true);
             static int n_trim_log = 0;

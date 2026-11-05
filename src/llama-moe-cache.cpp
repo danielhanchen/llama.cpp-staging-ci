@@ -5269,7 +5269,8 @@ struct llama_moe_cache::impl {
             wide_max    = v > 1 ? std::min<int64_t>(n_small_max, v) : 8;
             const char * e8  = getenv("LLAMA_MOE_PLACE8_UB");
             const char * e8s = getenv("LLAMA_MOE_PLACE8_SINGLE");
-            place8_single = e8 != nullptr && atoi(e8) > 0 && (e8s == nullptr || atoi(e8s) != 0);
+            const char * e8m = getenv("LLAMA_MOE_PLACE8_MID"); // k19-placemid: the 8 GB guard only (k19-nanfix is merged)
+            place8_single = e8 != nullptr && atoi(e8) > 0 && (e8s == nullptr || atoi(e8s) != 0) && (e8m == nullptr || atoi(e8m) == 0);
             if (hybrid_wide && !model.hparams.no_alloc) {
                 LLAMA_LOG_INFO("%s: k19-hostrow: hybrid small batches of up to %" PRId64 " tokens may outnumber the slots (LLAMA_MOE_HYBRID_WIDE)\n",
                     __func__, wide_max);
