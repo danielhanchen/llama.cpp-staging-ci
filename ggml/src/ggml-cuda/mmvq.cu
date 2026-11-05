@@ -3720,7 +3720,7 @@ void ggml_cuda_mul_mat_vec_q(
 
         // reuse the q8_1 copy of src1 if an earlier mul_mat_vec_q of this graph already quantized it
         bool quantized = false;
-        if (ctx.curr_stream_no == 0) {
+        if (ctx.q8_1_stream_ok()) {
             // the q8_1 rows are written in logical order: a contiguous src1 only depends on the number of rows,
             // e.g. [ne10, 1, n_tokens] for MUL_MAT_ID and [ne10, n_tokens] for MUL_MAT share one copy;
             // its strides are keyed as -1, which no real stride (0 for a broadcast view) can match
@@ -3817,7 +3817,7 @@ void ggml_cuda_mul_mat_vec_q_multi(ggml_backend_cuda_context & ctx, const int n,
     char * src1_q8_1 = nullptr;
     bool quantized = false;
     const int64_t s11 = src1->nb[1] / sizeof(float);
-    if (ctx.curr_stream_no == 0) {
+    if (ctx.q8_1_stream_ok()) {
         int64_t key[ggml_cuda_q8_1_cache::n_key];
         ggml_cuda_q8_1_cache::key_contiguous(ne10, ne11, key);
         src1_q8_1 = ctx.q8_1_cache.get(src1->data, ggml_nbytes(src1), key, q8_1_size, quantized);
@@ -3955,7 +3955,7 @@ const char * ggml_cuda_mmvq_src1_q8_1(ggml_backend_cuda_context & ctx, const ggm
     const size_t  q8_1_size   = ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
     char * q = nullptr;
     bool quantized = false;
-    if (ctx.curr_stream_no == 0) {
+    if (ctx.q8_1_stream_ok()) {
         int64_t key[ggml_cuda_q8_1_cache::n_key];
         ggml_cuda_q8_1_cache::key_contiguous(ne10, ne11, key);
         q = ctx.q8_1_cache.get(src1->data, ggml_nbytes(src1), key, q8_1_size, quantized);

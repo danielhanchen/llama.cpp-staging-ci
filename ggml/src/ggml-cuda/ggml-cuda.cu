@@ -5661,7 +5661,7 @@ static void ggml_cuda_qsa_maskless_plan(ggml_backend_cuda_context * cuda_ctx, co
 
 static int ggml_cuda_try_fuse_mmvq_multi(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     if (ggml_cuda_mmvq_multi_disabled() || ggml_cuda_fusion_disabled() || !cuda_ctx->stream_context().concurrent_events.empty() ||
-            cuda_ctx->curr_stream_no != 0) {
+            !cuda_ctx->q8_1_stream_ok()) {
         return -1;
     }
     ggml_tensor * node = cgraph->nodes[i];
@@ -5669,9 +5669,11 @@ static int ggml_cuda_try_fuse_mmvq_multi(ggml_backend_cuda_context * cuda_ctx, g
     if (!ggml_cuda_mmvq_multi_candidate(node) || node->src[1]->ne[1] > MMVQ_MAX_BATCH_SIZE) {
         return -1;
     }
+    // k19-vcost: inside a side-stream branch the members are its own nodes only
+    const int j_last = std::min(i + GGML_CUDA_MMVQ_MULTI_LOOKAHEAD, cuda_ctx->side_chain_active ? cuda_ctx->side_chain_last : INT_MAX);
     {
         bool any = false;
-        for (int j = i + 1; j < cgraph->n_nodes && j <= i + GGML_CUDA_MMVQ_MULTI_LOOKAHEAD && !any; ++j) {
+        for (int j = i + 1; j < cgraph->n_nodes && j <= j_last && !any; ++j) {
             const ggml_tensor * t = cgraph->nodes[j];
             any = t->op == GGML_OP_MUL_MAT && t->src[1] == node->src[1];
         }
@@ -5687,7 +5689,7 @@ static int ggml_cuda_try_fuse_mmvq_multi(ggml_backend_cuda_context * cuda_ctx, g
     const ggml_tensor * src0[GGML_CUDA_MMVQ_MULTI_MAX] = { node->src[0] };
     int idx[GGML_CUDA_MMVQ_MULTI_MAX] = { i };
     int n = 1;
-    for (int j = i + 1; j < cgraph->n_nodes && j <= i + GGML_CUDA_MMVQ_MULTI_LOOKAHEAD && n < GGML_CUDA_MMVQ_MULTI_MAX; ++j) {
+    for (int j = i + 1; j < cgraph->n_nodes && j <= j_last && n < GGML_CUDA_MMVQ_MULTI_MAX; ++j) {
         ggml_tensor * t = cgraph->nodes[j];
         if (cuda_ctx->mmvq_done_early.count(t)) {
             continue;
@@ -9055,6 +9057,39 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx->side_mv_fork, cudaEventDisableTiming));
                 }
             }
+            // k19-vcost: side-stream branches of this graph (see ggml_cuda_side_chain_plan): first node index -> { last node index, reader index }
+            std::unordered_map<int, std::pair<int, int>> side_chain_at;
+            if (!cuda_ctx->side_chain.empty() && stream_ctx.concurrent_events.empty() && use_cuda_graph && cuda_graph_update_required &&
+                    cuda_ctx->side_mv_nodes != nullptr && cgraph->n_nodes > 0 && cgraph->nodes >= cuda_ctx->side_mv_nodes &&
+                    cgraph->nodes + cgraph->n_nodes <= cuda_ctx->side_mv_nodes + cuda_ctx->side_mv_n_nodes) {
+                if (idx.empty()) {
+                    for (int i = 0; i < cgraph->n_nodes; ++i) {
+                        idx[cgraph->nodes[i]] = i;
+                    }
+                }
+                for (const auto & [first, sc] : cuda_ctx->side_chain) {
+                    const auto a = idx.find(first);
+                    const auto b = idx.find(sc.last);
+                    const auto r = idx.find(sc.reader);
+                    if (a != idx.end() && b != idx.end() && r != idx.end() && a->second <= b->second && b->second < r->second &&
+                            !side_mv_at.count(a->second)) {
+                        side_chain_at[a->second] = { b->second, r->second };
+                    }
+                }
+                if (!side_chain_at.empty() && cuda_ctx->side_mv_fork == nullptr) {
+                    CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx->side_mv_fork, cudaEventDisableTiming));
+                }
+            }
+            // the first capture with branches is logged (engagement), GGML_CUDA_SIDE_CHAIN_LOG=N: the first N
+            static const int side_chain_log = getenv("GGML_CUDA_SIDE_CHAIN_LOG") != nullptr ? atoi(getenv("GGML_CUDA_SIDE_CHAIN_LOG")) : 1;
+            if (!side_chain_at.empty()) {
+                static int n_logged = 0;
+                if (n_logged++ < side_chain_log) {
+                    GGML_LOG_INFO("k19-vcost: side-stream branches in a captured graph: %zu (%d nodes)\n", side_chain_at.size(), cgraph->n_nodes);
+                }
+            }
+            uint64_t side_chain_claims0 = 0;    // q8_1 cache claims when the open branch was forked
+            int      side_chain_reader  = -1;   // reader of the branch whose join is pending (the claim guard)
             size_t side_mv_n_events = 0;
             const auto side_mv_join_until = [&](int last) {
                 for (size_t k = 0; k < side_mv_pending.size();) {
@@ -9080,9 +9115,55 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_qsa_sel_plan(cuda_ctx, cgraph);
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (cuda_ctx->side_chain_active && i > cuda_ctx->side_chain_last) {
+                    // the branch's nodes are enqueued: its join event, the main stream continues
+                    if (side_mv_n_events == cuda_ctx->side_mv_join.size()) {
+                        cudaEvent_t ev;
+                        CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+                        cuda_ctx->side_mv_join.push_back(ev);
+                    }
+                    cudaEvent_t join = cuda_ctx->side_mv_join[side_mv_n_events++];
+                    CUDA_CHECK(cudaEventRecord(join, cuda_ctx->stream(cuda_ctx->device, GGML_CUDA_SIDE_MV_STREAM)));
+                    side_mv_pending.push_back({ side_chain_reader, join });
+                    cuda_ctx->src1_memo.release();
+                    cuda_ctx->src1_memo.share_next = false;
+                    cuda_ctx->side_chain_active = false;
+                    cuda_ctx->side_chain_last   = -1;
+                    cuda_ctx->curr_stream_no    = 0;
+                }
+                if (side_chain_reader >= 0 && !cuda_ctx->side_chain_active &&
+                        cuda_ctx->q8_1_cache.n_claims - side_chain_claims0 + 3 >= (uint64_t) ggml_cuda_q8_1_cache::n_slots) {
+                    // the main stream could next hand out a q8_1 cache slot the branch reads or writes: join it now
+                    side_mv_join_until(side_chain_reader);
+                    side_chain_reader = -1;
+                }
                 if (!side_mv_pending.empty()) {
                     // a fused group starting here may cover the reader, so join a few nodes early
                     side_mv_join_until(i + GGML_CUDA_SIDE_MV_LOOKAHEAD);
+                    if (side_chain_reader >= 0 && i + GGML_CUDA_SIDE_MV_LOOKAHEAD >= side_chain_reader) {
+                        side_chain_reader = -1;
+                    }
+                }
+                if (!side_chain_at.empty() && !cuda_ctx->side_chain_active) {
+                    const auto it = side_chain_at.find(i);
+                    if (it != side_chain_at.end()) {
+                        if (side_chain_reader >= 0) {
+                            // one branch open at a time for the claim guard: the previous one joins here
+                            side_mv_join_until(side_chain_reader);
+                            side_chain_reader = -1;
+                        }
+                        cudaStream_t side = cuda_ctx->stream(cuda_ctx->device, GGML_CUDA_SIDE_MV_STREAM);
+                        CUDA_CHECK(cudaEventRecord(cuda_ctx->side_mv_fork, cuda_ctx->stream(cuda_ctx->device, 0)));
+                        CUDA_CHECK(cudaStreamWaitEvent(side, cuda_ctx->side_mv_fork, 0));
+                        cuda_ctx->src1_memo.release();
+                        cuda_ctx->src1_memo.share_next = false;
+                        cuda_ctx->curr_stream_no    = GGML_CUDA_SIDE_MV_STREAM;
+                        cuda_ctx->side_chain_active = true;
+                        cuda_ctx->side_chain_last   = it->second.first;
+                        side_chain_reader  = it->second.second;
+                        // the slot of x's q8_1 copy was handed out before the fork: counted from one claim earlier
+                        side_chain_claims0 = cuda_ctx->q8_1_cache.n_claims - 1;
+                    }
                 }
                 if (!side_mv_at.empty()) {
                     const auto it = side_mv_at.find(i);
@@ -9343,7 +9424,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                }
             }
 
-            // a capture must not end with unjoined work on the side stream
+            // a capture must not end with unjoined work on the side stream (a branch that ends the graph is closed first)
+            if (cuda_ctx->side_chain_active) {
+                CUDA_CHECK(cudaEventRecord(cuda_ctx->side_mv_fork, cuda_ctx->stream(cuda_ctx->device, GGML_CUDA_SIDE_MV_STREAM)));
+                CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(cuda_ctx->device, 0), cuda_ctx->side_mv_fork, 0));
+                cuda_ctx->side_chain_active = false;
+                cuda_ctx->side_chain_last   = -1;
+                cuda_ctx->curr_stream_no    = 0;
+            }
             side_mv_join_until(INT_MAX);
             cuda_ctx->src1_memo.release();
             cuda_ctx->src1_memo.share_next = false;
@@ -9726,6 +9814,152 @@ static void ggml_cuda_side_mv_plan(ggml_backend_cuda_context * cuda_ctx, ggml_cg
     }
 }
 
+// k19-vcost: side-stream branches of several nodes. A shared expert in a MoE layer (Qwen3.8-Flash-Next, Qwen3.5 / 3.6 MoE, ...) is a
+// product pair of the layer's FFN input x (gate, up), their GLU and the down product of it, read only by the combine at the end of the
+// layer. Its four launches (~10 us per layer at 5..8 rows on an RTX PRO 6000) ran after the router, the top-k and the routed experts,
+// while the router's tiny products and the top-k leave most SMs idle. The branch is moved right after x's producer (before the
+// allocation, so the allocator keeps its tensors and inputs apart from everything until the reader) and, while a verify-sized graph is
+// captured, enqueued on the side stream; the main stream waits for it a few nodes before the reader. Every node computes the same values
+// with the same kernels (the q8_1 activation cache and the multi-matrix launch are used inside the branch as on the main stream; the
+// branch's cache slots cannot be handed out again before its join, see the claim guard in the evaluation): only the overlap changes.
+// Only graphs of 2..GGML_CUDA_SIDE_CHAIN_COLS (default 8) columns are planned (speculative verify windows): prompts and single-token
+// decodes keep their node order and kernels. GGML_CUDA_SIDE_CHAIN=0 turns it off.
+static int ggml_cuda_side_chain_cols() {
+    static const int v = getenv("GGML_CUDA_SIDE_CHAIN_COLS") ? atoi(getenv("GGML_CUDA_SIDE_CHAIN_COLS")) : 8;
+    return std::min(v, (int) MMVQ_MAX_BATCH_SIZE);
+}
+
+static void ggml_cuda_side_chain_plan(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+    const int n = cgraph->n_nodes;
+    auto index_of = [&](const ggml_tensor * t, int from) -> int {   // backwards from `from`
+        for (int j = from; j >= 0; --j) {
+            if (cgraph->nodes[j] == t) {
+                return j;
+            }
+        }
+        return -1;
+    };
+    auto reads = [](const ggml_tensor * u, const ggml_tensor * t) -> bool {
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            if (u->src[k] == t) {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto first_reader = [&](const ggml_tensor * t, int from, int & count) -> int {
+        int first = -1;
+        count = 0;
+        for (int j = from + 1; j < n; ++j) {
+            if (reads(cgraph->nodes[j], t) || cgraph->nodes[j]->view_src == t) {
+                count++;
+                if (first < 0) {
+                    first = j;
+                }
+            }
+        }
+        return first;
+    };
+    for (int ig = 0; ig < n; ++ig) {
+        ggml_tensor * g = cgraph->nodes[ig];
+        if (g->op != GGML_OP_GLU || !(g->flags & GGML_TENSOR_FLAG_COMPUTE) || (g->flags & GGML_TENSOR_FLAG_OUTPUT) || g->view_src != nullptr) {
+            continue;
+        }
+        ggml_tensor * a = g->src[0];
+        ggml_tensor * b = g->src[1];
+        if (a == nullptr || b == nullptr || a == b || !ggml_cuda_mmvq_multi_candidate(a) || !ggml_cuda_mmvq_multi_candidate(b) ||
+                a->src[1] != b->src[1] || (a->flags & GGML_TENSOR_FLAG_OUTPUT) || (b->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            continue;
+        }
+        const ggml_tensor * x = a->src[1];
+        const int64_t ncols = x->ne[1];
+        if (ncols < 2 || ncols > ggml_cuda_side_chain_cols()) {
+            continue;
+        }
+        const int ia = index_of(a, ig - 1);
+        const int ib = index_of(b, ig - 1);
+        if (ia < 0 || ib < 0) {
+            continue;
+        }
+        int cnt = 0;
+        const int id = first_reader(g, ig, cnt);
+        if (id < 0 || cnt != 1) {
+            continue;
+        }
+        ggml_tensor * d = cgraph->nodes[id];
+        if (!ggml_cuda_mmvq_multi_candidate(d) || d->src[1] != g || (d->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            continue;
+        }
+        int ca = 0, cb = 0;
+        if (first_reader(a, ia, ca) < 0 || ca != 1 || first_reader(b, ib, cb) < 0 || cb != 1) {
+            continue;   // a and b are read by the GLU only
+        }
+        int cr = 0;
+        const int ir = first_reader(d, id, cr);
+        if (ir < 0) {
+            continue;
+        }
+        // the producer of x: x itself or, through views (a reshape of the layer input), the node they view
+        std::vector<int> views;
+        const ggml_tensor * src = x;
+        int p = index_of(src, std::min(ia, ib) - 1);
+        while (p >= 0 && ggml_cuda_is_view_or_noop(cgraph->nodes[p]) && views.size() < 4) {
+            views.push_back(p);
+            const ggml_tensor * v = cgraph->nodes[p];
+            int q = -1;
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                if (v->src[k] != nullptr) {
+                    q = std::max(q, index_of(v->src[k], p - 1));
+                }
+            }
+            p = q;
+        }
+        if (p < 0 || ir - p < GGML_CUDA_SIDE_MV_MIN_GAP) {
+            continue;
+        }
+        // the branch's nodes (the views first): nothing between x's producer and them writes x (an in-place op over it)
+        const ggml_tensor * xb = x->view_src ? x->view_src : x;
+        bool ok = true;
+        const int lo = std::min(ia, ib);
+        for (int j = p + 1; j < lo && ok; ++j) {
+            const ggml_tensor * u = cgraph->nodes[j];
+            if (!ggml_cuda_is_view_or_noop(u) && u->view_src != nullptr && (u->view_src == xb || u->view_src == x)) {
+                ok = false;
+            }
+        }
+        if (!ok) {
+            continue;
+        }
+        std::vector<ggml_tensor *> blk;
+        for (int k = (int) views.size() - 1; k >= 0; --k) {
+            blk.push_back(cgraph->nodes[views[k]]);
+        }
+        std::vector<int> order = { ia, ib, ig, id };
+        std::sort(order.begin(), order.end());
+        for (int j : order) {
+            blk.push_back(cgraph->nodes[j]);
+        }
+        // move the block right after p, keeping the relative order of both groups (a stable partition of nodes p+1 .. id)
+        std::unordered_set<const ggml_tensor *> in_blk(blk.begin(), blk.end());
+        std::stable_partition(cgraph->nodes + p + 1, cgraph->nodes + id + 1, [&](const ggml_tensor * t) { return in_blk.count(t) > 0; });
+        // the branch's tensors and their sources stay allocated until the reader: the main stream runs the nodes in between at the same
+        // time, so none of them may be placed over the branch's memory
+        for (ggml_tensor * t : blk) {
+            if (ggml_cuda_is_view_or_noop(t)) {
+                continue;
+            }
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                if (t->src[k] != nullptr) {
+                    params->add_alloc_dep(params->user_data, t->src[k], cgraph->nodes[ir]);
+                }
+            }
+            params->add_alloc_dep(params->user_data, t, cgraph->nodes[ir]);
+        }
+        cuda_ctx->side_chain[blk[views.size()]] = { d, cgraph->nodes[ir] };
+        ig = std::max(ig, id);
+    }
+}
+
 // k16-race: see ggml_backend_cuda_graph_optimize. Returns the last node the fused kernel writes (nullptr: no match) and the inputs it reads
 static const ggml_tensor * ggml_cuda_fused_match(const ggml_cgraph * cgraph, int i, std::vector<ggml_tensor *> & inputs) {
     static const bool all_alias = ggml_cuda_env_flag("GGML_CUDA_FUSED_ALIAS");
@@ -9961,6 +10195,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     // the side-stream matrix-vector products of the previous graph do not apply to this one
     cuda_ctx->side_mv.clear();
+    cuda_ctx->side_chain.clear();
     cuda_ctx->side_mv_nodes   = cgraph->nodes;
     cuda_ctx->side_mv_n_nodes = cgraph->n_nodes;
 
@@ -10082,6 +10317,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         const bool side_mv_arch_ok = GGML_CUDA_CC_IS_NVIDIA(side_mv_cc) && side_mv_cc >= GGML_CUDA_CC_AMPERE;
         if (!disable_fusion && !side_mv_disabled && side_mv_arch_ok && !(graph_opt != nullptr && atoi(graph_opt) == 1)) {
             ggml_cuda_side_mv_plan(cuda_ctx, cgraph, params);
+        }
+        static const bool side_chain_on = getenv("GGML_CUDA_SIDE_CHAIN") == nullptr || atoi(getenv("GGML_CUDA_SIDE_CHAIN")) != 0;
+        if (!disable_fusion && side_chain_on && side_mv_arch_ok && !(graph_opt != nullptr && atoi(graph_opt) == 1)) {
+            ggml_cuda_side_chain_plan(cuda_ctx, cgraph, params);
         }
     }
 

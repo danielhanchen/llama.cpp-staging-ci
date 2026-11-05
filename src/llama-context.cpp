@@ -4778,6 +4778,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     struct phase_end {
         ~phase_end() { llama_phase("return"); }
     } phase_end_guard;
+    // k19-vcost (diagnostic, with LLAMA_UBATCH_TIMING=1): the host time of the whole call for a small batch, beside process_ubatch's own line
+    struct decode_timer {
+        int64_t t0 = 0; size_t n = 0;
+        ~decode_timer() {
+            if (t0) {
+                LLAMA_LOG_INFO("decode: k19-vcost %zu tokens: host %.3f ms\n", n, (ggml_time_us() - t0) / 1000.0);
+            }
+        }
+    } decode_timer_guard;
+    {
+        static const bool ub_timing_d = getenv("LLAMA_UBATCH_TIMING") != nullptr && atoi(getenv("LLAMA_UBATCH_TIMING")) != 0;
+        if (ub_timing_d && batch_inp.tokens.size() <= 16) {
+            decode_timer_guard.t0 = ggml_time_us();
+            decode_timer_guard.n  = batch_inp.tokens.size();
+        }
+    }
     // an asynchronous state save queued before this call has reached its destination when this call returns (LLAMA_STATE_ASYNC_LAZY=0)
     struct state_async_join {
         llama_context * ctx;
