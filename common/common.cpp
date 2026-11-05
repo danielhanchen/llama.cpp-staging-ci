@@ -2597,6 +2597,12 @@ static bool common_fit_draft_on_cpu(
         LOG_INF("%s: the main model alone does not fit, the draft model is placed on the CPU\n", __func__);
         return true;
     }
+    // k19-place8: a small device whose cache was sized for decode keeps no device drafter (as the placement before it, where none fit):
+    // its verify windows are multi-token hybrid batches, open on k19-nanfix (plans/k19_lookup8.md section 4)
+    if (common_fit_place8()) {
+        LOG_INF("%s: small device with the decode-sized MoE cache (k19-place8): the draft model is placed on the CPU\n", __func__);
+        return true;
+    }
     const size_t pot   = cp.moe_cache_size;            // memory the cache gets once the layers are placed
     const size_t cache = std::min(requested, pot);     // what it would hold without the draft model
     const size_t free_ = pot - cache;                  // memory the cache leaves unused
