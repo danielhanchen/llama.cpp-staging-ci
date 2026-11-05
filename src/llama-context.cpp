@@ -1105,6 +1105,7 @@ llama_context::llama_context(
             tiny_rel_ub     = atoi(e8);
             tiny_rel_res_ub = tiny_rel_ub;
             place8_rel      = true;
+            moe_cache->set_restore_soft(true);
             tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") != nullptr && atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0;
             lm_enabled      = false;
             LLAMA_LOG_INFO("%s: MoE cache: k19-place8: ubatches of more than %lld tokens (up to n_ubatch %u) run with the cache banks released, "
@@ -2016,7 +2017,12 @@ void llama_context::tiny_rel_leave() {
     TINY_TRACE("%s: trace: restore\n", __func__);
     moe_cache->restore();
     TINY_TRACE("%s: trace: restored\n", __func__);
-    tiny_rel_held = false;
+    // k19-place8: banks that did not allocate stay released (set_restore_soft): the next ubatches run as while released and the next
+    // small one tries again
+    tiny_rel_held = place8_rel && moe_cache->released();
+    if (tiny_rel_held) {
+        return;
+    }
     tiny_rel_n_leave++;
     const double ms = (ggml_time_us() - t0)/1e3;
     tiny_rel_ms += ms;

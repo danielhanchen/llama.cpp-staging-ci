@@ -918,6 +918,8 @@ struct llama_moe_cache::impl {
     // batches would take the multi-token hybrid assign, which writes non-finite values at fn4 8 GB (plans/k19_lookup8.md section 4,
     // fixed on k19-nanfix); LLAMA_MOE_PLACE8_SINGLE=0 lets them take it
     bool    place8_single   = false;
+    bool    restore_soft    = false; // k19-place8: restore leaves the banks released when they do not allocate (set_restore_soft)
+    int     n_restore_fail  = 0;
     // k11 LLAMA_MOE_CPU_MISS_PROMPT=N (opt-in, default 0 = off): prompt ubatches of max_batch + 1 .. N tokens always take the host path
     // once calibrated, at the rule's fetch share but at most 1/4 (the host computes at least three quarters of the misses, the experts
     // with the fewest uses), without waiting for a trial on the small batches. G4, LFM2.5-24B-A2B 8 GB, a 38-token prompt: 6.1 GB of uploads
@@ -7495,6 +7497,14 @@ struct llama_moe_cache::impl {
             t->buffer = nullptr;
         }
         d.buf_bank.reset(ggml_backend_alloc_ctx_tensors_from_buft(d.ctx_bank.get(), d.buft));
+        if (!d.buf_bank && restore_soft) {
+            // k19-place8 (see set_restore_soft): the banks stay released, the caller runs as during a prompt and tries again later
+            if (n_restore_fail++ < 4) {
+                LLAMA_LOG_WARN("%s: MoE cache: the released banks (%.2f MiB) could not be allocated again: they stay released, tried again "
+                    "at the next small batch\n", __func__, d.buf_size/1048576.0);
+            }
+            return false;
+        }
         if (!d.buf_bank) {
             GGML_ABORT("MoE cache: the released banks (%.2f MiB) could not be allocated again", d.buf_size/1048576.0);
         }
@@ -9798,6 +9808,10 @@ void llama_moe_cache::restore() {
     for (size_t id = 0; id < pimpl->devices.size(); ++id) {
         pimpl->restore((int32_t) id);
     }
+}
+
+void llama_moe_cache::set_restore_soft(bool on) {
+    pimpl->restore_soft = on;
 }
 
 void llama_moe_cache::set_refill_routed_once(bool on) {
