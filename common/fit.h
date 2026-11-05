@@ -61,6 +61,8 @@ int64_t common_fit_moe_margin_gain();
 
 // k13-small: the fit kept every layer on a small device with the reduced margin (LLAMA_FIT_SMALL_MARGIN_MIB); set once per process
 bool    common_fit_small_device();
+// k19-place8: the last fit sized a small device's MoE cache for decode, prompts release its banks (LLAMA_MOE_PLACE8_UB set)
+bool    common_fit_place8();
 
 // k19-tierfix-fit: the run-time reserve of a small-device placement, in MiB added to its reduced margin and taken from its cache.
 // The placement is measured at the reserve sizes of its buffers; what runs later allocates more in the margin: the CUDA pool of

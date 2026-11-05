@@ -1098,6 +1098,18 @@ llama_context::llama_context(
             tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") != nullptr && atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0;
             lm_enabled      = false;
             LLAMA_LOG_INFO("%s: MoE cache: ubatches of more than %d tokens run with the cache banks released (LLAMA_MOE_TINY_RELEASE_FORCE)\n", __func__, tiny_force);
+        } else if (const char * e8 = getenv("LLAMA_MOE_PLACE8_UB"); e8 != nullptr && atoi(e8) > 0 && moe_cache && !model.hparams.no_alloc &&
+                cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && (int64_t) cparams.n_ubatch > atoi(e8)) {
+            // k19-place8 (set by common's fit, common_fit_place8): the cache of a small device took the memory of the prompt compute
+            // buffers; the graphs are reserved at that many tokens and larger ubatches run with the banks released, as for the tiny-cache rule
+            tiny_rel_ub     = atoi(e8);
+            tiny_rel_res_ub = tiny_rel_ub;
+            tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") != nullptr && atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0;
+            lm_enabled      = false;
+            LLAMA_LOG_INFO("%s: MoE cache: k19-place8: ubatches of more than %lld tokens (up to n_ubatch %u) run with the cache banks released, "
+                "the next smaller ubatch frees the compute buffers and refills the banks (%s; LLAMA_FIT_PLACE8=0 off)\n", __func__,
+                (long long) tiny_rel_ub, cparams.n_ubatch, tiny_rel_routed ? "with the experts the last large ubatch routed most" :
+                "with the experts they held before");
         } else if (const char * e = getenv("LLAMA_MOE_TINY_RELEASE"); e != nullptr && *e != '\0' && moe_cache && !model.hparams.no_alloc &&
                 cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
             unsigned long long ub_d = 0, ub_t = 0, cache_b = 0;
