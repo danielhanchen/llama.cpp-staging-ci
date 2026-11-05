@@ -1801,7 +1801,9 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
     // k13-small: no larger n_ubatch beside the small-device placement (common_fit_small_device): its 256 MiB margin has no room for the
     // run-time buffers of a larger ubatch. G4 4 GB q3m without a draft: "every expert cached" took n_ubatch 2048 (compute 804 MiB) and the
     // first 2k prompt ran out of device memory (CUDA error). LLAMA_MOE_PREFILL_UB=N still forces N
-    if (force < 0 && common_fit_small_device()) {
+    // k19-l4poly: not on a host-bound small device (common_fit_hostbound): its larger ubatches run with the cache banks released (the
+    // tiny-cache rule below, k19-tiny-ub, or the k19-place8 context), so they are sized within the cache, which keeps its size
+    if (force < 0 && common_fit_small_device() && !common_fit_hostbound()) {
         COM_INF("MoE cache: small device: n_ubatch stays %u (LLAMA_MOE_PREFILL_UB=N forces N)\n", cparams.n_ubatch);
         return;
     }
@@ -2006,7 +2008,7 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
         // k13-small: not beside the small-device placement (common_fit_small_device), whose 256 MiB margin has no room for the larger
         // ubatch's run-time buffers: G4 4 GB q3m without a draft grew to n_ubatch 2048 (compute 804 MiB) and ran out of device memory
         // in a request (CUDA error); LLAMA_MOE_PREFILL_UB_TINY=N still forces N
-        const bool small_dev = common_fit_small_device() && force_t <= 0;
+        const bool small_dev = common_fit_small_device() && !common_fit_hostbound() && force_t <= 0;
         if (force_t != 0 && !small_dev && force <= 0 && !rule_frac && common_moe_slot_bytes_of(params.model.path, sbt) && sbt.n_used > 0 && sbt.n_layer > 0) {
             const double  token_bytes = (double) sbt.n_layer*(double) sbt.n_used*(double) sbt.sum;
             const double  tokens      = (double) cache/token_bytes;
@@ -2096,8 +2098,10 @@ static void common_moe_cache_auto_ubatch_rules(common_params & params, llama_mod
                     }
 #endif
                     const int64_t kv_grow  = std::max<int64_t>(0, kv_t(m_t) - kv_t(m_def));
-                    const bool    tiny_rel = tiny_rel_env && m_t.n_dev == 1 && m_def.n_dev == 1 && !has_draft && tokens >= tiny_rel_min_tokens &&
-                        tiny_rel_ram;
+                    // k19-l4poly: a host-bound small device always releases (its 384 MiB margin has no room for the growth beside the
+                    // cache; with k19-place8 the context releases the banks for every larger ubatch anyway)
+                    const bool    tiny_rel = (common_fit_hostbound() && m_t.n_dev == 1 && m_def.n_dev == 1 && !has_draft) ||
+                        (tiny_rel_env && m_t.n_dev == 1 && m_def.n_dev == 1 && !has_draft && tokens >= tiny_rel_min_tokens && tiny_rel_ram);
                     const int64_t cache_t  = cache - (tiny_rel ? kv_grow : taken_t);
                     if (tiny_rel) {
                         COM_INF("MoE cache: n_ubatch = %u (default %u, rule: tiny cache, the experts of %.1f tokens < %.1f, experts spill): +%.2f MiB of compute "

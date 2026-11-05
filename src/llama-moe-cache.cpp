@@ -973,6 +973,18 @@ struct llama_moe_cache::impl {
         const char * e = getenv("LLAMA_MOE_CPU_MISS_SMALL_HALF");
         return !cm_stable ? 0.354 : e != nullptr ? std::min(0.612, std::max(0.177, atof(e))) : 0.47;
     }();
+    // k19-l4poly (LLAMA_MOE_CPU_MISS_SMALL_HALF_TEAM, default 0.6): on a host whose host experts run on the host team (single_team_host,
+    // a small host), small batches take 1/4 up to a raw share of 0.6 (a host up to 1.5x the upload time per expert). Colab L4 Flint 16 GB
+    // sits on the 0.47 boundary: start-up / persisted calibrations of 116-121 us per expert (raw 0.45) fetched 1/4, those of 158-160 us
+    // (raw 0.53, a cold first launch, then persisted for the bin) fetched 1/2 and lost their trials (chat 54.7 vs 57.5 tok/s, same head);
+    // a fixed 1/4 decoded +13% (k19-flint), 1/8 +10%, every miss on the host -12% at 2k. Unchanged where LLAMA_MOE_CPU_MISS_SMALL_HALF
+    // is set, without cm_stable, and on hosts without the team (G4, 4-vCPU T4)
+    double cm_small_half_eff() const {
+        static const double team_half = getenv("LLAMA_MOE_CPU_MISS_SMALL_HALF_TEAM") != nullptr ?
+            std::min(0.80, std::max(0.177, atof(getenv("LLAMA_MOE_CPU_MISS_SMALL_HALF_TEAM")))) : 0.6;
+        static const bool user_half = getenv("LLAMA_MOE_CPU_MISS_SMALL_HALF") != nullptr;
+        return cm_stable && !user_half && single_team_host() ? std::max(cm_small_half, team_half) : cm_small_half;
+    }
     bool     cm_recal_pending = false; // (timed only between requests: 2 x ~40 ms inside a reply cost chat decode 2% on G4)
     int      cm_nb    = 0;     // batches in the window
     int      cm_win   = cm_win1;
@@ -1064,6 +1076,12 @@ struct llama_moe_cache::impl {
     // candidate (and so a trial possible) only if its gain beats cm_split_scale times the calibrated split (G4 Qwen3.6 UD-Q3_K_M 12 GB
     // MTP: 14 host batches per launch, every trial off, -7% decode from the trials alone). LLAMA_MOE_CPU_MISS_SPLIT_SCALE (3)
     double   cm_split_scale = 3.0;
+    bool     cm_split_scale_env = false; // LLAMA_MOE_CPU_MISS_SPLIT_SCALE set: it applies to every size (k19-l4poly)
+    static double cm_split_scale_team() {
+        static const double s = getenv("LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM") != nullptr ?
+            std::max(0.0, atof(getenv("LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM"))) : 0.5;
+        return s;
+    }
     double   cm_act   = 0.0;   // us per token: its activations to the host and its expert output back
 
     // " (mtp)" for the cache of an MTP context, in its log lines
@@ -1203,6 +1221,7 @@ struct llama_moe_cache::impl {
                 }
                 if (const char * env_s = getenv("LLAMA_MOE_CPU_MISS_SPLIT_SCALE")) {
                     cm_split_scale = std::max(0.0, atof(env_s));
+                    cm_split_scale_env = true;
                 }
                 if (const char * env_r = getenv("LLAMA_MOE_CPU_MISS_RECAL")) {
                     cm_recal_after = std::max(0, atoi(env_r));
@@ -2166,6 +2185,7 @@ struct llama_moe_cache::impl {
         int                  threads = 1;
         void               (*team_stop)(void) = nullptr; // k19-l4b: joins the CPU backend's host team (the last owner's stop)
         bool                 team = false;                // k19-l4b: the batches run on that team (LLAMA_MOE_SINGLE_THREADS_WIDE)
+        bool                 blocking = false;            // k19-l4poly: the CUDA device wait blocks while this team runs
         // k18 (LLAMA_MOE_SINGLE_FUSED, default on; =0 the graph of each batch as before): the CPU backend's one-region form of the batch's
         // host experts (ggml_cpu_moe_host_ffn: one barrier instead of the graph's seven, no plan; bit-identical to the graph), with
         // its scratch; null when the CPU backend has none (the graph then)
@@ -2231,6 +2251,59 @@ struct llama_moe_cache::impl {
         return std::max(1, std::min<int>(GGML_MOE_MAILBOX_MAX_TOKENS, e != nullptr ? atoi(e) : 4));
     }();
 
+    // k19-l4poly: the CPU backend's host team serves (or, before the first mailbox, would serve) this cache's host batches: a small
+    // host whose expert compute is the critical path (the rule of single_register: decode threads + a third, more than the old team)
+    bool single_team_host() const {
+        if (single_reg) {
+            return single_hub().team;
+        }
+        const char * e  = getenv("LLAMA_MOE_SINGLE_THREADS");
+        const char * ew = getenv("LLAMA_MOE_SINGLE_THREADS_WIDE");
+        const char * et = getenv("GGML_MOE_HOST_TEAM");
+        const char * em = getenv("LLAMA_MOE_SINGLE_THREADS_MAX");
+        const int wide_mode = ew != nullptr ? atoi(ew) : 1;
+        if ((e != nullptr && atoi(e) > 0) || wide_mode == 0 || !(wide_mode == 2 || hybrid) || (et != nullptr && atoi(et) == 0) || single_threads <= 0) {
+            return false;
+        }
+        const int wmax = em != nullptr && atoi(em) > 0 ? atoi(em) : 16;
+        return single_team_size(wmax) > std::max(1, single_threads - 1);
+    }
+    // the host team's size: the decode threads + a third, at most the CPUs - 4 and wmax; k19-l4poly LLAMA_MOE_SINGLE_THREADS_TEAM=N (test
+    // knob): N threads, at most the CPUs - 1
+    int single_team_size(int wmax) const {
+        static const int team_env = getenv("LLAMA_MOE_SINGLE_THREADS_TEAM") != nullptr ? atoi(getenv("LLAMA_MOE_SINGLE_THREADS_TEAM")) : 0;
+        if (team_env > 0) {
+            return std::max(1, std::min(team_env, llama_moe_n_cpus() - 1));
+        }
+        if (single_wait_blocking_here()) {
+            return std::min({ single_threads + std::max(1, 2*single_threads/3), llama_moe_n_cpus() - 2, wmax });
+        }
+        return std::min({ single_threads + std::max(1, single_threads/3), llama_moe_n_cpus() - 4, wmax });
+    }
+    // k19-l4poly (LLAMA_MOE_SINGLE_WAIT_BLOCKING, default 1; 0 = off): the CUDA backend's blocking device wait. With it the thread that waits
+    // for the graph sleeps instead of spinning, so the host team takes the decode threads + two thirds (at most the CPUs - 2) instead
+    // of + a third (CPUs - 4). Colab L4 (6 decode threads, 12 vCPUs) LFM2.5 4 GB chat: 10 threads blocking 45.2 tok/s, 10 spinning
+    // 41.9, 11 blocking 43.0, 11 yielding 33.5 (bimodal), 8 spinning (k19-l4b) 42.0; PolyStrata 46.4 (l4p_g5a)
+    // only where the cache holds at most LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC (0.25) of the host experts: Colab L4 Flint 16 GB
+    // (55.8% cached) with a team of 10 waiting blocked: chat 57.6 [50.0-57.6] vs 58.3, 2k 66.1 vs 73.3; LFM2.5 8 GB (40%) on the base's
+    // own texts chat +4%, 2k -3%, 8k -4% (l4p_f1; l4p_g5a +3.0 / -5.8 / -1.9%, l4p_a7 +8 / +9 / +13% on a slower VM)
+    bool single_wait_blocking_here() const {
+        static const double max_frac = getenv("LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC") != nullptr ?
+            std::max(0.0, atof(getenv("LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC"))) : 0.25;
+        return single_wait_blocking() != nullptr && cache_frac >= 0.0 && cache_frac <= max_frac;
+    }
+    static void (*single_wait_blocking())(bool) {
+        static void (*fn)(bool) = [] {
+            const char * e = getenv("LLAMA_MOE_SINGLE_WAIT_BLOCKING");
+            if (e != nullptr && atoi(e) == 0) {
+                return (void (*)(bool)) nullptr;
+            }
+            ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+            return reg != nullptr ? (void (*)(bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_wait_blocking") : nullptr;
+        }();
+        return fn;
+    }
+
     bool single_usable(int64_t n_tokens) const {
         return single_req && !single_off && !single_no_alloc && n_tokens >= 1 && n_tokens <= single_max_tok;
     }
@@ -2272,10 +2345,14 @@ struct llama_moe_cache::impl {
             if ((e == nullptr || atoi(e) <= 0) && wide_mode != 0 && (wide_mode == 2 || hybrid) && team_on != nullptr && team_on()) {
                 const char * em = getenv("LLAMA_MOE_SINGLE_THREADS_MAX");
                 const int wmax = em != nullptr && atoi(em) > 0 ? atoi(em) : 16;
-                const int wide = std::min({ single_threads + std::max(1, single_threads/3), llama_moe_n_cpus() - 4, wmax });
+                const int wide = single_team_size(wmax);
                 if (wide > h.threads) {
                     h.threads = wide;
                     h.team    = true;
+                    if (single_wait_blocking_here()) {
+                        single_wait_blocking()(true);
+                        h.blocking = true;
+                    }
                 }
             }
             if (set_n != nullptr) {
@@ -2299,7 +2376,9 @@ struct llama_moe_cache::impl {
         }
         LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses on (LLAMA_MOE_SINGLE): batches of up to %d tokens, %d host threads "
             "(one host thread for every cache of the process%s), slow-batch warning above %d ms (merges never time out), %s\n", tag, single_max_tok, h.threads,
-            h.team ? "; the CPU backend's host team, the host experts are the critical path: LLAMA_MOE_SINGLE_THREADS_WIDE=0 off" : "",
+            h.team ? (h.blocking ? "; the CPU backend's host team, the host experts are the critical path: LLAMA_MOE_SINGLE_THREADS_WIDE=0 off; "
+                "the device wait blocks (LLAMA_MOE_SINGLE_WAIT_BLOCKING=0 off)" :
+                "; the CPU backend's host team, the host experts are the critical path: LLAMA_MOE_SINGLE_THREADS_WIDE=0 off") : "",
             single_timeout_ms, h.fused != nullptr ? "one-region host experts (LLAMA_MOE_SINGLE_FUSED=0: the graph)" : "host experts by graph");
         return true;
     }
@@ -2588,6 +2667,11 @@ struct llama_moe_cache::impl {
                 if (h.team_stop != nullptr) {
                     h.team_stop();
                 }
+                if (h.blocking && single_wait_blocking() != nullptr) {
+                    single_wait_blocking()(false);
+                }
+                h.blocking = false;
+                h.team = false;
                 h.cpu.reset();
             }
             single_reg = false;
@@ -4863,10 +4947,14 @@ struct llama_moe_cache::impl {
         cmw_on        = false;
         cm_small_ok   = true;
         cm_small_live = true;
+        // k19-l4poly: on a host-team host the short prompts (k17-ttft, see cm_prompt_off) keep the cost model's verdict of the
+        // calibration (persisted per build and host, so the same in every launch); LLAMA_MOE_PIN_PROMPT_SHORT=0 off
+        const bool keep_short = cm_pin_short() && single_team_host();
         for (int64_t n = 1; n <= cm_max; ++n) {
             // batches above the frozen sizes (short prompts) keep the plain cache: their calibrated host path is timing-driven, and
             // a frozen cache gives the same text in every run
-            cm_on[n] = n <= std::min<int64_t>({ cm_frozen_max, max_batch }) ? 1 : 0;
+            const bool short_n = keep_short && n > max_batch && n <= cm_short_max;
+            cm_on[n] = n <= std::min<int64_t>({ cm_frozen_max, max_batch }) ? 1 : short_n ? cm_on[n] : 0;
         }
         cm_gen++;
         if (cm_pin_lifted_once) {
@@ -5085,6 +5173,18 @@ struct llama_moe_cache::impl {
             short_fast(n_tokens) &&
             n_tokens > cm_prompt_force && cm_on[n_tokens] != 0 && cmt_host_ok && !cm_prompt_off();
     }
+    // only where the cache holds at most LLAMA_MOE_PIN_PROMPT_SHORT_MAX_FRAC (0.25) of the host experts: srv_kld short192 against the
+    // base (l4p_f3), LFM2.5 4 GB (14.6% cached) first-token KLD mean / p99 / top-1 0.099 / 0.84 / 0.885 inside the -fa off band
+    // (0.154 / 1.32 / 0.854); 8 GB (40%) 0.144 / 1.53 / 0.849, p99 and top-1 just outside it (1.16 / 0.854)
+    bool cm_pin_short() const {
+        static const bool pin_short = [] {
+            const char * e = getenv("LLAMA_MOE_PIN_PROMPT_SHORT");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        static const double max_frac = getenv("LLAMA_MOE_PIN_PROMPT_SHORT_MAX_FRAC") != nullptr ?
+            std::max(0.0, atof(getenv("LLAMA_MOE_PIN_PROMPT_SHORT_MAX_FRAC"))) : 0.25;
+        return pin_short && cache_frac >= 0.0 && cache_frac <= max_frac;
+    }
     bool cm_prompt_off() const {
         static const bool pin_dev = [] {
             const char * e = getenv("LLAMA_MOE_PIN_PROMPT_DEV");
@@ -5094,7 +5194,13 @@ struct llama_moe_cache::impl {
             const char * e = getenv("LLAMA_MOE_CPU_MISS_PROMPT_DEV");
             return e != nullptr && atoi(e) != 0;
         }();
-        return cm_prompt_now && cm && ((cm_frozen && cm_frozen_fetch && pin_dev) || all_dev);
+        // k19-l4poly (LLAMA_MOE_PIN_PROMPT_SHORT, default 1; 0 = off): on a host-team host (single_team_host) a short prompt (the k17-ttft
+        // rule, at most LLAMA_MOE_CPU_MISS_SHORT tokens in all) keeps its host path beside the pinned small batches: the pin is for the
+        // small checkpoint tail of a long prompt (k15), while a chat turn's prompt otherwise uploads the misses of every layer. Colab L4
+        // LFM2.5 4 / 8 GB with n-gram drafting (pinned): a 38-token prompt 875 / 739 ms, 498 ms at 8 GB without drafting (not pinned);
+        // PolyStrata 526 ms
+        const bool pinned = cm_frozen && cm_frozen_fetch && pin_dev && !(cm_pin_short() && short_live() && single_team_host());
+        return cm_prompt_now && cm && (pinned || all_dev);
     }
 
     // r22b: a prompt ubatch the cost model puts on the host path, outside the forced and the trial-gated rules
@@ -6268,7 +6374,7 @@ struct llama_moe_cache::impl {
             const double raw  = tc/(tc + cm_tup)*fetch_scale;
             // log levels: two calibrations a little apart rarely fall on two sides of a level. k15-lfm2: small batches (at most
             // max_batch tokens) take 1/4 up to cm_small_half instead of the geometric midpoint 0.354 (see cm_small_half)
-            const double half = n <= max_batch ? cm_small_half : 0.354;
+            const double half = n <= max_batch ? cm_small_half_eff() : 0.354;
             cm_share[n] = raw <= 0.177 ? 0.125f : raw <= half ? 0.25f : raw <= 0.612 ? 0.5f : raw <= 0.80 ? 0.75f : 1.0f;
             if (fetch_scale != 1.0 && raw <= 0.088) {
                 cm_share[n] = 0.0625f;
@@ -6643,7 +6749,18 @@ struct llama_moe_cache::impl {
                     return e != nullptr ? std::max(0.0, atof(e)) : 0.0;
                 }();
                 const bool mb_cheap = n <= max_batch && single_weigh() && single_usable(n) && m >= mb_min_misses;
-                const double need = (n <= max_batch ? cm_margin*cm_split_scale*cm_split*(mb_cheap ? single_split_frac : 1.0) :
+                // k19-l4poly: on a host whose host experts run on the host team (a small host, see single_team_host), where the timing
+                // trials run, a small batch is a candidate at LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM (0.5) times the weighed split instead of
+                // cm_split_scale (3, set on G4 for the graph split's unmodelled cost): the trial then decides it. Colab L4 Flint 16 GB
+                // (55.8% cached, trials on): 1-token batches gain ~60 us per layer against a weighed split of 1.5 x 3 x 0.2 x 200-330 us,
+                // so decode fetched every miss over PCIe, while a fixed host share of 1/4 decoded +13% (k19-flint); the scale 0.5 on the
+                // same VM: chat +8.4%, 2k +32% (l4p_b2). LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM_MAILBOX=1: mailbox sizes only. An explicit
+                // LLAMA_MOE_CPU_MISS_SPLIT_SCALE applies to every size as before
+                static const bool team_mb_only = getenv("LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM_MAILBOX") != nullptr &&
+                    atoi(getenv("LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM_MAILBOX")) != 0;
+                const double scale = (mb_cheap || !team_mb_only) && !cm_split_scale_env && cm_trial && !cm_trials_skipped && !cm_force &&
+                    single_team_host() ? cm_split_scale_team() : cm_split_scale;
+                const double need = (n <= max_batch ? cm_margin*scale*cm_split*(mb_cheap ? single_split_frac : 1.0) :
                                      cm_margin_p*(cm_split + n*cm_act))*
                                     (cm_on[n] && cm_measured ? cm_hyst : 1.0);
                 // a batch above max_batch runs the host path in the groups whose slots hold its experts (see use_device), the
