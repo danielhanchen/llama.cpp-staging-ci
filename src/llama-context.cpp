@@ -5695,8 +5695,12 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     if (lm_refused_min <= 2) {
         return 0;
     }
+    // k19-df2pp: the layer inputs a DFlash drafter reads (embeddings_layer_inp) are extracted per member right after the graph that
+    // computed them (extract_upto), so such a target runs its prompts layer-major too (before: every ubatch alone, G4 Flash-Next 12 GB
+    // DFlash2 8k / 30k TTFT 2.7x the MTP arm's). LLAMA_MOE_LAYER_MAJOR_LAYER_INP=0: refused, as before
+    static const bool lm_layer_inp = getenv("LLAMA_MOE_LAYER_MAJOR_LAYER_INP") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_LAYER_INP")) != 0;
     if (!moe_cache || cparams.embeddings || !cparams.causal_attn || cparams.verify || ple.enabled ||
-            std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool b) { return b; }) ||
+            (!lm_layer_inp && std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool b) { return b; })) ||
             n_tokens_all - n_tokens_prev <= (int64_t) cparams.n_ubatch + llama_moe_cache::n_small_max || !eligible(mctx->get_ubatch()) ||
             moe_cache->lends_graph_to(mctx->get_ubatch().n_tokens) || (moe_cache->hybrid_fixed() && !lm_hybrid_ok()) ||
             (moe_cache_devseed_on && !lm_devseed)) {
@@ -6739,7 +6743,17 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits.data + n_outputs_prev*n_vocab, 0, n_outputs*n_vocab*sizeof(float));
             }
 
-            bool extract_all_idxs = false;
+            // k19-df2pp: the member's layer inputs (a DFlash drafter's target features), at its rows of the batch
+            bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+            if (extract_all_idxs) {
+                lm_layer_inp_rows += ubatch.n_tokens;
+                if (!lm_layer_inp_logged) {
+                    lm_layer_inp_logged = true;
+                    LLAMA_LOG_INFO("%s: k19-df2pp: the drafter's layer inputs (%d layers) are read from each layer-major member "
+                        "(LLAMA_MOE_LAYER_MAJOR_LAYER_INP=0 off)\n", __func__,
+                        (int) std::count(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), true));
+                }
+            }
             {
                 const bool masked    = cparams.embeddings_nextn_masked;
                 const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
@@ -6757,7 +6771,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                         GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data + offset*n_embd, 0, n_rows*n_embd*sizeof(float));
                     }
-                    extract_all_idxs = !masked;
+                    extract_all_idxs = extract_all_idxs || !masked;
                 }
             }
             if (extract_all_idxs) {
@@ -7206,10 +7220,10 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     if (lm_verbose) {
         LLAMA_LOG_INFO("%s: compute buffers %.2f -> %.2f MiB\n", __func__, buf_before/1048576.0, buf_after/1048576.0);
         LLAMA_LOG_INFO("%s: %zu ubatches (%" PRId64 " tokens each at most), %zu pieces, %d nodes, %d splits: build %.2f ms (graphs %.2f, inputs %.2f), "
-            "compute (queued) %.2f ms%s, %d graphs, last member %u tokens (%" PRId64 " tails so far)\n",
+            "compute (queued) %.2f ms%s, %d graphs, last member %u tokens (%" PRId64 " tails so far, %zu layer-input rows)\n",
             __func__, group.size(), n_tokens_max, cut_w.size(), gm ? ggml_graph_n_nodes(gm) : -1, ggml_backend_sched_get_n_splits(sched.get()),
             (t1_us - t0_us)/1000.0, t_build_us/1000.0, t_set_us/1000.0, (ggml_time_us() - t1_us)/1000.0, gm ? "" : " (one by one)", n_sub,
-            group.back().ub->n_tokens, lm_n_tail);
+            group.back().ub->n_tokens, lm_n_tail, lm_layer_inp_rows);
     }
 
     bool seeded = lm_seed_active && !lm_seeded.empty();

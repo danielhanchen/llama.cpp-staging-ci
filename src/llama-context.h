@@ -712,6 +712,8 @@ private:
     int  lm_ub_max  = 16;     // ubatches per layer-major graph [LLAMA_MOE_LAYER_MAJOR_UB_MAX]
     int64_t lm_n_tail = 0;    // k15-pp2: short last ubatches run as the last member of a group (LLAMA_LM_TAIL)
     bool lm_verbose = false;  // [LLAMA_MOE_LAYER_MAJOR_LOG]
+    bool   lm_layer_inp_logged = false; // k19-df2pp: the first layer-major member that extracted layer inputs was logged
+    size_t lm_layer_inp_rows   = 0;     // k19-df2pp: rows of layer inputs extracted from layer-major members
     bool lm_replay_logged = false; // k11: the first replayed device seed is logged (see decode_layer_major)
     // beside the device seed of prompt ubatches (moe_cache_devseed_on): groups run [LLAMA_MOE_LAYER_MAJOR_DEVSEED, default 1] and the
     // group seeds from the routing of the ubatch before its last one, as with the host seed [LLAMA_MOE_LAYER_MAJOR_DEVSEED_SEED, default 1]

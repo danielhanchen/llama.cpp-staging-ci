@@ -1039,7 +1039,13 @@ common_dflash_diag_t & common_dflash_diag() {
 
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
-    bool row_offset_ok() const override { return false; }
+    // k19-df2pp: process() reads the target's layer inputs at the segment's rows of the decode (nextn_row_offset), so a merged prompt
+    // batch (the server's checkpoint break inside one layer-major decode) feeds the drafter as the separate batches did.
+    // LLAMA_DFLASH_ROW_OFFSET=0: refused, the server splits the batch at the checkpoint as before
+    bool row_offset_ok() const override {
+        static const bool on = getenv("LLAMA_DFLASH_ROW_OFFSET") == nullptr || atoi(getenv("LLAMA_DFLASH_ROW_OFFSET")) != 0;
+        return on;
+    }
 
     common_params_speculative_draft params;
 
@@ -1301,7 +1307,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     for (int32_t i = 0; i < n_chunk; ++i) {
                         float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                        const float * src = layer + (size_t) (nextn_row_offset + i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
                 }
