@@ -1944,6 +1944,19 @@ size_t llama_context::release_device_compute() {
     return bytes;
 }
 
+size_t llama_context::graph_evict_since_dev(int64_t t_us) {
+    size_t n = 0;
+    for (auto & bk : backend_ptrs) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(bk);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto fn = reg ? (size_t (*)(ggml_backend_t, int64_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_evict_since") : nullptr;
+        if (fn != nullptr) {
+            n += fn(bk, t_us);
+        }
+    }
+    return n;
+}
+
 size_t llama_context::pool_mark_trim_dev(bool trim) {
     size_t freed = 0;
     for (auto & bk : backend_ptrs) {
@@ -1978,6 +1991,7 @@ void llama_context::tiny_rel_enter(const char * why) {
     }
     ggml_backend_sched_synchronize(sched.get());
     pool_mark_trim_dev(false);
+    tiny_rel_t_mark = ggml_time_us();
     tiny_rel_held = moe_cache->release();
     tiny_rel_n_enter += tiny_rel_held ? 1 : 0;
     if (!tiny_rel_held) {
@@ -2028,6 +2042,20 @@ void llama_context::tiny_rel_leave() {
     }
     TINY_TRACE("%s: trace: trim\n", __func__);
     const size_t trimmed = pool_mark_trim_dev(true);
+    // k19-df2pp: the CUDA graphs captured or replayed while the pools were above the mark hold pointers into the range the trim unmapped
+    // (the temporaries the ops take from the pool are not graph nodes, so the replay check does not see them). A later window replayed
+    // one before its pool had grown back that far: G4 fn4 12 GB DFlash2, srv_kld long48, CUDA illegal address in the ubatch after a
+    // released layer-major group, the 6th 8200-token prompt in two runs (k19pp_k1 / d1); with the group's trim off the pool stayed large
+    // enough and nothing failed. They are evicted with the trim (recaptured by the next window). LLAMA_MOE_TRIM_EVICT=0: kept, as before
+    static const bool trim_evict = getenv("LLAMA_MOE_TRIM_EVICT") == nullptr || atoi(getenv("LLAMA_MOE_TRIM_EVICT")) != 0;
+    if (trim_evict && trimmed > 0) {
+        const size_t n_ev = graph_evict_since_dev(tiny_rel_t_mark);
+        static int n_ev_log = 0;
+        if (n_ev > 0 && n_ev_log++ < 4) {
+            LLAMA_LOG_INFO("%s: %zu CUDA graphs of the released window evicted with the %.2f MiB the pools gave back (LLAMA_MOE_TRIM_EVICT=0 keeps them)\n",
+                __func__, n_ev, trimmed/1048576.0);
+        }
+    }
     TINY_TRACE("%s: trace: restore\n", __func__);
     moe_cache->restore();
     TINY_TRACE("%s: trace: restored\n", __func__);
@@ -5695,8 +5723,12 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     if (lm_refused_min <= 2) {
         return 0;
     }
+    // k19-df2pp: the layer inputs a DFlash drafter reads (embeddings_layer_inp) are extracted per member right after the graph that
+    // computed them (extract_upto), so such a target runs its prompts layer-major too (before: every ubatch alone, G4 Flash-Next 12 GB
+    // DFlash2 8k / 30k TTFT 2.7x the MTP arm's). LLAMA_MOE_LAYER_MAJOR_LAYER_INP=0: refused, as before
+    static const bool lm_layer_inp = getenv("LLAMA_MOE_LAYER_MAJOR_LAYER_INP") == nullptr || atoi(getenv("LLAMA_MOE_LAYER_MAJOR_LAYER_INP")) != 0;
     if (!moe_cache || cparams.embeddings || !cparams.causal_attn || cparams.verify || ple.enabled ||
-            std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool b) { return b; }) ||
+            (!lm_layer_inp && std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool b) { return b; })) ||
             n_tokens_all - n_tokens_prev <= (int64_t) cparams.n_ubatch + llama_moe_cache::n_small_max || !eligible(mctx->get_ubatch()) ||
             moe_cache->lends_graph_to(mctx->get_ubatch().n_tokens) || (moe_cache->hybrid_fixed() && !lm_hybrid_ok()) ||
             (moe_cache_devseed_on && !lm_devseed)) {
@@ -6739,7 +6771,17 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits.data + n_outputs_prev*n_vocab, 0, n_outputs*n_vocab*sizeof(float));
             }
 
-            bool extract_all_idxs = false;
+            // k19-df2pp: the member's layer inputs (a DFlash drafter's target features), at its rows of the batch
+            bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+            if (extract_all_idxs) {
+                lm_layer_inp_rows += ubatch.n_tokens;
+                if (!lm_layer_inp_logged) {
+                    lm_layer_inp_logged = true;
+                    LLAMA_LOG_INFO("%s: k19-df2pp: the drafter's layer inputs (%d layers) are read from each layer-major member "
+                        "(LLAMA_MOE_LAYER_MAJOR_LAYER_INP=0 off)\n", __func__,
+                        (int) std::count(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), true));
+                }
+            }
             {
                 const bool masked    = cparams.embeddings_nextn_masked;
                 const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
@@ -6757,7 +6799,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
                         GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data + offset*n_embd, 0, n_rows*n_embd*sizeof(float));
                     }
-                    extract_all_idxs = !masked;
+                    extract_all_idxs = extract_all_idxs || !masked;
                 }
             }
             if (extract_all_idxs) {
@@ -7206,10 +7248,10 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     if (lm_verbose) {
         LLAMA_LOG_INFO("%s: compute buffers %.2f -> %.2f MiB\n", __func__, buf_before/1048576.0, buf_after/1048576.0);
         LLAMA_LOG_INFO("%s: %zu ubatches (%" PRId64 " tokens each at most), %zu pieces, %d nodes, %d splits: build %.2f ms (graphs %.2f, inputs %.2f), "
-            "compute (queued) %.2f ms%s, %d graphs, last member %u tokens (%" PRId64 " tails so far)\n",
+            "compute (queued) %.2f ms%s, %d graphs, last member %u tokens (%" PRId64 " tails so far, %zu layer-input rows)\n",
             __func__, group.size(), n_tokens_max, cut_w.size(), gm ? ggml_graph_n_nodes(gm) : -1, ggml_backend_sched_get_n_splits(sched.get()),
             (t1_us - t0_us)/1000.0, t_build_us/1000.0, t_set_us/1000.0, (ggml_time_us() - t1_us)/1000.0, gm ? "" : " (one by one)", n_sub,
-            group.back().ub->n_tokens, lm_n_tail);
+            group.back().ub->n_tokens, lm_n_tail, lm_layer_inp_rows);
     }
 
     bool seeded = lm_seed_active && !lm_seeded.empty();
@@ -7334,6 +7376,11 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
         if (lm_rel_trim) {
             const size_t trimmed = pool_mark_trim(true);
+            // k19-df2pp: as in tiny_rel_leave (the group's own graphs are evicted at its end unless LLAMA_MOE_LM_KEEP_HOST=1)
+            static const bool trim_evict = getenv("LLAMA_MOE_TRIM_EVICT") == nullptr || atoi(getenv("LLAMA_MOE_TRIM_EVICT")) != 0;
+            if (trim_evict && trimmed > 0) {
+                graph_evict_since_dev(lm_t_start);
+            }
             static int n_trim_log = 0;
             if (trimmed > 0 && n_trim_log++ < 4) {
                 LLAMA_LOG_INFO("%s: %.2f MiB of CUDA pool memory the released group took given back before the banks return "
@@ -11897,6 +11944,13 @@ int32_t llama_verify_device_max_tokens(const llama_context * ctx) {
         return -1;
     }
     return (int32_t) std::max<int64_t>(1, ctx->get_moe_cache()->n_tokens_cached());
+}
+
+int32_t llama_moe_cache_tokens(const llama_context * ctx) {
+    if (ctx == nullptr || ctx->get_moe_cache() == nullptr) {
+        return -1;
+    }
+    return (int32_t) ctx->get_moe_cache()->n_tokens_cached();
 }
 
 bool llama_prepare_prompt_plan(llama_context * ctx) {
