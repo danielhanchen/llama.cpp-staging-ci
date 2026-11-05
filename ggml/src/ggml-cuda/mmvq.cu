@@ -2155,6 +2155,28 @@ static constexpr bool mmvq_moe_unroll_type(const ggml_type type) {
     }
 }
 
+// k19-ampere, GGML_CUDA_MOE_AMPERE (default 1; 0 = the Blackwell-tuned shapes there too): on sm_80 (A100; measured there only, sm_86 /
+// sm_87 keep the old rules) the multi-token MoE mat-vecs pick other shapes of the same kernels, every one bitwise the kernel it replaces
+// (test-moe-bw-exact on A100: rpb8_g0 / bw1 / vl16_4 0 floats differ). A100 microbench (test-moe-bw-exact --bench, Flash-Next shapes,
+// 128 experts, P 0.55; us per layer vs the old rule): IQ4_NL down at 5..8 tokens 8 rows per warp block 0.86 / 0.84 / 0.88 / 0.83;
+// IQ3_S gate or up without a fused gate (MoE cache tiers) at 5..8 tokens the staged kernel 0.90 / 0.92 / 0.87 / 0.87, the fused gate / up
+// at 2 tokens 0.81; mul_mat_vec_q_moe_vl with 4 entries per decode at 3..5 tokens 0.91 / 0.88 / 0.86 (plans/k19_ampere.md)
+static bool mmvq_moe_ampere(const int cc) {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_MOE_AMPERE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on && GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE;
+}
+
+static void mmvq_moe_ampere_log(const char * what, const ggml_type type, const int ntok) {
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        GGML_LOG_INFO("k19-ampere: sm_80 MoE mat-vec shapes engaged (first: %s, %s, %d tokens; GGML_CUDA_MOE_AMPERE=0 off)\n", what,
+            ggml_type_name(type), ntok);
+    });
+}
+
 // k19-moebw, GGML_CUDA_MOE_UNROLL (default 4; 0 or 1 = off): a multi-token MUL_MAT_ID (verify window) lane runs up to this many of its
 // K iterations per pass (2 or 4), so their loads are in flight together instead of one iteration's at a time; the warps of the MoE
 // kernels are few and short (one row pair per token, 1..4 iterations of K), so they wait on L1TEX / L2 / DRAM latency (Nsight Compute
@@ -2232,6 +2254,13 @@ static void mul_mat_vec_q_moe_launch(
             const int bpi   = vdr * warp_size / qi;
             const int iters = (ncols_x / qk + bpi - 1) / bpi;
             rpb_moe = !has_fusion && iters <= 2 && ncols_dst >= 2 && ncols_dst <= 4 ? 4 : 2;
+            // k19-ampere: sm_80, 5..8 tokens: 8 rows per warp block
+            const int cc_rpb = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+            if (!has_fusion && iters <= 2 && ncols_dst >= 5 && ncols_dst <= 8 && mmvq_moe_ampere(cc_rpb) && nrows_x % 8 == 0 &&
+                    fusion.shared_up == nullptr) {
+                rpb_moe = 8;
+                mmvq_moe_ampere_log("8 rows per warp block", type, (int) ncols_dst);
+            }
         }
     }
     if constexpr (mmvq_moe_unroll_type(type)) {
@@ -2439,13 +2468,20 @@ static bool mul_mat_vec_q_moe_group_launch(
 // that product first unless GGML_CUDA_MOE_VL=0). Not on Turing: on a T4 the
 // kernel is 0.6-0.85x the time of the ones it replaces at 3..8 tokens, but Qwen3.6 UD-Q4_K_XL at 12 GB decodes 1.8% slower with it.
 // GGML_CUDA_MOE_BW_CFG=rpw,nwarps,bytes picks the shape (0 = auto: rows per warp up to `bytes` (4096) of weights, 4 warps)
-static bool mmvq_moe_bw_on(const int cc, const ggml_type type, const bool fused, const int ntok) {
+static bool mmvq_moe_bw_on(const int cc, const ggml_type type, const bool fused, const int ntok, bool * ampere_rule = nullptr) {
     static const int env = [] {
         const char * e = getenv("GGML_CUDA_MOE_BW");
         return e == nullptr ? -1 : atoi(e);
     }();
     if (env >= 0) {
         return env != 0;
+    }
+    // k19-ampere: sm_80 also the IQ3_S gate or up without a fused gate at 5..8 tokens and the fused gate / up at 2
+    if (mmvq_moe_ampere(cc) && type == GGML_TYPE_IQ3_S && ((!fused && ntok >= 5) || (fused && ntok == 2))) {
+        if (ampere_rule) {
+            *ampere_rule = true;
+        }
+        return true;
     }
     return cc >= GGML_CUDA_CC_AMPERE && type == GGML_TYPE_IQ3_S && fused && ntok >= 6;
 }
@@ -2488,7 +2524,8 @@ static bool mul_mat_vec_q_moe_bw_launch(
     } else {
         constexpr int qk = ggml_cuda_type_traits<type>::qk;
         constexpr int bs = ggml_cuda_type_traits<type>::bs;
-        if (ntok < 2 || !mmvq_moe_bw_on(cc, type, fusion.gate != nullptr, ntok) || warp_size != 32 || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_TURING ||
+        bool ampere_rule = false;
+        if (ntok < 2 || !mmvq_moe_bw_on(cc, type, fusion.gate != nullptr, ntok, &ampere_rule) || warp_size != 32 || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_TURING ||
                 get_device_table_id(cc) == MMVQ_PARAMETERS_GB10 ||
                 fusion.shared_up != nullptr || fusion.x_scale != nullptr || fusion.gate_scale != nullptr ||
                 (int64_t) stride_row_x*qk != (int64_t) ncols_x || (int64_t) nchannels_dst*ntok > 128) {
@@ -2539,6 +2576,9 @@ static bool mul_mat_vec_q_moe_bw_launch(
                 stride_channel_x, stride_channel_y, stride_channel_dst, ntok, ids_stride, rpw, smem_mat);
         }
         mmvq_moe_bw_log(type, fusion.gate != nullptr, ntok, nchannels_dst, rpw, nwarps);
+        if (ampere_rule) {
+            mmvq_moe_ampere_log(fusion.gate != nullptr ? "staged weights, fused gate" : "staged weights", type, (int) ntok);
+        }
         return true;
     }
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
@@ -2574,6 +2614,11 @@ static mmvq_moe_vl_cfg mmvq_moe_vl_config(const ggml_type type, const bool fused
     if (cc >= GGML_CUDA_CC_AMPERE && type == GGML_TYPE_IQ3_S && fused && ntok >= 3) {
         c.tpr = 16;
         c.g   = ntok <= 5 ? 2 : 4;
+        // k19-ampere: sm_80, 4 entries per decode from 3 tokens
+        if (ntok <= 5 && mmvq_moe_ampere(cc)) {
+            c.g = 4;
+            mmvq_moe_ampere_log("4 entries per decode", type, ntok);
+        }
     }
     return c;
 }
