@@ -275,6 +275,10 @@ struct llama_context {
     void rs_replay_setup();
     // k19-npmtp: moves the pending windows (stores and conv snapshot rows) of cells that find_slot swapped, in swap order
     void rs_replay_move(llama_memory_recurrent * mem, const std::vector<std::pair<uint32_t, uint32_t>> & swaps);
+    // k19-rollback: the host copy of a sequence's recurrent state rows for a speculative rollback (llama_memory_recurrent::snap_save)
+    llama_memory_recurrent * rs_snap_mem() const;
+    bool rs_snap_save(llama_seq_id seq_id);
+    bool rs_snap_restore(llama_seq_id seq_id);
     // the commit graph of the pending cells (worst: every cell with a full window, the pending state untouched, for the reserve)
     void rs_commit_build(ggml_context * ctx, ggml_cgraph * gf, bool worst);
     ggml_gallocr_ptr         rs_ga_fb; // one backend: the reserved fallback allocation (null: not reserved)

@@ -802,6 +802,97 @@ void llama_memory_recurrent::replay_mark(const llama_ubatch & ubatch) {
     }
 }
 
+// k19-rollback: the rows of `cell` in every state tensor (n_rs_seq 0: row = cell), packed back to back in the host copy
+bool llama_memory_recurrent::snap_rows(int32_t cell, const std::function<void(ggml_tensor *, size_t, size_t, size_t)> & fn) const {
+    if (cell < 0 || (uint32_t) cell >= size) {
+        return false;
+    }
+    size_t off_host = 0;
+    for (const auto * v : { &r_l, &s_l, &p_l }) {
+        for (ggml_tensor * t : *v) {
+            if (t == nullptr) {
+                continue;
+            }
+            const size_t row = ggml_row_size(t->type, t->ne[0]);
+            fn(t, (size_t) cell*t->nb[1], row, off_host);
+            off_host += GGML_PAD(row, 64);
+        }
+    }
+    return true;
+}
+
+bool llama_memory_recurrent::snap_save(llama_seq_id seq_id, const std::function<ggml_backend_t(const ggml_tensor *)> & be) {
+    if (!snap_supported() || seq_id < 0 || (uint32_t) seq_id >= size) {
+        return false;
+    }
+    const int32_t cell = cells[seq_id].tail;
+    if (cell < 0 || cells[cell].seq_id.size() != 1) {
+        return false;
+    }
+    size_t need = 0;
+    snap_rows(cell, [&](ggml_tensor *, size_t, size_t sz, size_t off_host) { need = std::max(need, off_host + GGML_PAD(sz, 64)); });
+    if (!snap_buf || ggml_backend_buffer_get_size(snap_buf.get()) < need) {
+        // pinned host memory of the device the first device row is on (async copies), else ordinary host memory
+        ggml_backend_buffer_type_t hbt = nullptr;
+        for (const auto * v : { &r_l, &s_l, &p_l }) {
+            for (ggml_tensor * t : *v) {
+                if (hbt == nullptr && t != nullptr && t->buffer != nullptr && !ggml_backend_buffer_is_host(t->buffer)) {
+                    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+                    hbt = dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+                }
+            }
+        }
+        snap_buf.reset();
+        ggml_backend_buffer_t b = hbt != nullptr ? ggml_backend_buft_alloc_buffer(hbt, need) : nullptr;
+        if (b == nullptr) {
+            b = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), need);
+        }
+        if (b == nullptr) {
+            return false;
+        }
+        snap_buf.reset(b);
+        LLAMA_LOG_INFO("%s: host rollback copy of the recurrent state: %.2f MiB in %s (no per-token rows on the device; LLAMA_SPEC_RS_SNAP=0: "
+            "the server's checkpoint)\n", __func__, need/1024.0/1024.0, ggml_backend_buffer_name(b));
+    }
+    uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(snap_buf.get());
+    snap_rows(cell, [&](ggml_tensor * t, size_t off, size_t sz, size_t off_host) {
+        ggml_backend_t b = be(t);
+        if (b != nullptr) {
+            ggml_backend_tensor_get_async(b, t, base + off_host, off, sz);
+        } else {
+            ggml_backend_tensor_get(t, base + off_host, off, sz);
+        }
+    });
+    snap_size = need;
+    snap_cell = cell;
+    snap_seq  = seq_id;
+    snap_pos  = cells[cell].pos;
+    n_snap_save++;
+    return true;
+}
+
+bool llama_memory_recurrent::snap_restore(llama_seq_id seq_id, const std::function<ggml_backend_t(const ggml_tensor *)> & be) {
+    if (!snap_supported() || !snap_buf || snap_seq != seq_id || seq_id < 0 || (uint32_t) seq_id >= size || cells[seq_id].tail != snap_cell) {
+        return false;
+    }
+    auto & cell = cells[snap_cell];
+    if (!cell.has_seq_id(seq_id) || cell.seq_id.size() != 1 || cell.pos < snap_pos) {
+        return false;
+    }
+    const uint8_t * base = (const uint8_t *) ggml_backend_buffer_get_base(snap_buf.get());
+    snap_rows(snap_cell, [&](ggml_tensor * t, size_t off, size_t sz, size_t off_host) {
+        ggml_backend_t b = be(t);
+        if (b != nullptr) {
+            ggml_backend_tensor_set_async(b, t, base + off_host, off, sz);
+        } else {
+            ggml_backend_tensor_set(t, base + off_host, off, sz);
+        }
+    });
+    cell.pos = snap_pos;
+    n_snap_restore++;
+    return true;
+}
+
 bool llama_memory_recurrent::rollback_copy(uint32_t cell, uint32_t group) {
     static const bool enabled = [] {
         const char * e = getenv("LLAMA_RS_ROLLBACK_COPY");
