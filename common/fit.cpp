@@ -1410,6 +1410,7 @@ static void common_params_fit_impl(
                         bool           got     = false;
                         int64_t        grow    = 0;
                         cparams->n_ubatch = ub_rel;
+                        common_fit_place8_env(ub_rel); // the cache of a measurement reads the gate of its small batches (place8_single)
                         auto measure8 = [&](size_t cache, dmds_t & d) {
                             cparams->moe_cache_size = cache;
                             try {
@@ -1444,11 +1445,11 @@ static void common_params_fit_impl(
                         }
                         cparams->n_ubatch = ub_full;
                         if (got) {
-                            common_fit_place8_env(ub_rel);
                             LOG_INF("%s: small device: the MoE cache takes the memory of the prompt compute buffers (%" PRId64 " MiB): cache %zu -> "
                                 "%zu MiB; ubatches of more than %u tokens run with the cache banks released (k19-place8; LLAMA_FIT_PLACE8=0 off)\n",
                                 __func__, grow/MiB, size_ok/MiB, cparams->moe_cache_size/MiB, ub_rel);
                         } else {
+                            common_fit_place8_env(0);
                             cparams->moe_cache_size = size_ok;
                             dmds_cpu_moe            = dmds_ok;
                             LOG_INF("%s: small device: the MoE cache keeps its size (k19-place8: %" PRId64 " MiB of prompt compute buffers, no "
