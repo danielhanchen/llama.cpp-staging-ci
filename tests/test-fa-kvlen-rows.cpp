@@ -260,10 +260,12 @@ int main(int argc, char ** argv) {
                         const bool bad = nf > 0 || !(worst <= tol);
                         n_cases++;
                         n_bad += bad;
-                        if (bad || g_verbose) {
+                        // every case on a GPU (a crash names the case it was in: the line before it is the last one that ran)
+                        if (bad || g_verbose || gpu) {
                             printf("%s %s L %4" PRId64 " T %d %s n_kv %4" PRId64 "%s: rel err %.3g%s\n", bad ? "FAIL" : "ok  ",
                                 ggml_type_name(type), L, T, mode == 0 ? "live  " : mode == 1 ? "devlen" : "padded", n_kv,
                                 sparse ? " n_kv_max 2051" : "", worst, rows.c_str());
+                            fflush(stdout);
                         }
                     }
                 }
