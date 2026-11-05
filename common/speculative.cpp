@@ -1492,8 +1492,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const char * e = getenv("LLAMA_DFLASH_WINDOW");
                     return e == nullptr ? llama_exact_verify_enabled() : atoi(e) != 0;
                 }();
+                // k19-placemid (LLAMA_DFLASH_WINDOW=2, opt-in, measurement): the rule beside a MoE cache too, with the same pass costs
+                static const bool df2_window_cached = getenv("LLAMA_DFLASH_WINDOW") != nullptr && atoi(getenv("LLAMA_DFLASH_WINDOW")) == 2;
                 const bool use_df2w = is_dflash2 && df2_window && !use_ev && params.p_min <= 0.0f && p_cum_thr <= 0.0f &&
-                    !llama_moe_cache_active(params.ctx_tgt);
+                    (!llama_moe_cache_active(params.ctx_tgt) || df2_window_cached);
                 if (use_df2w) {
                     static bool logged = false;
                     if (!logged) {

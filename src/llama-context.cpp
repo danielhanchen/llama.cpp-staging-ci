@@ -5044,8 +5044,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         mem_idx->set_n_kv_bucket_dev_allowed(cparams.flash_attn);
     }
 
+    // k19-placemid (LLAMA_MOE_PLACE8_CHUNK_MAX=N, opt-in): a short prompt of at most N tokens runs as ubatches of the decode size, served
+    // by the cache, instead of one ubatch with the banks released and refilled (G4 16 GB fn4: chat TTFT 351 -> 506 ms, 145 ms of refill)
+    static const int64_t place8_chunk_max = getenv("LLAMA_MOE_PLACE8_CHUNK_MAX") ? std::max(0, atoi(getenv("LLAMA_MOE_PLACE8_CHUNK_MAX"))) : 0;
+    const uint32_t n_ubatch_split = place8_rel && place8_chunk_max > 0 && tiny_rel_ub > 0 && !cparams.verify && !embd_all &&
+        (int64_t) n_tokens_all > tiny_rel_ub && (int64_t) n_tokens_all <= place8_chunk_max ? (uint32_t) tiny_rel_ub : cparams.n_ubatch;
+
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
+        mctx = memory->init_batch(*balloc, n_ubatch_split, embd_all);
         if (!mctx) {
             return -2;
         }
