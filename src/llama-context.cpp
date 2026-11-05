@@ -1944,6 +1944,19 @@ size_t llama_context::release_device_compute() {
     return bytes;
 }
 
+size_t llama_context::graph_evict_since_dev(int64_t t_us) {
+    size_t n = 0;
+    for (auto & bk : backend_ptrs) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(bk);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto fn = reg ? (size_t (*)(ggml_backend_t, int64_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_evict_since") : nullptr;
+        if (fn != nullptr) {
+            n += fn(bk, t_us);
+        }
+    }
+    return n;
+}
+
 size_t llama_context::pool_mark_trim_dev(bool trim) {
     size_t freed = 0;
     for (auto & bk : backend_ptrs) {
@@ -1978,6 +1991,7 @@ void llama_context::tiny_rel_enter(const char * why) {
     }
     ggml_backend_sched_synchronize(sched.get());
     pool_mark_trim_dev(false);
+    tiny_rel_t_mark = ggml_time_us();
     tiny_rel_held = moe_cache->release();
     tiny_rel_n_enter += tiny_rel_held ? 1 : 0;
     if (!tiny_rel_held) {
@@ -2028,6 +2042,20 @@ void llama_context::tiny_rel_leave() {
     }
     TINY_TRACE("%s: trace: trim\n", __func__);
     const size_t trimmed = pool_mark_trim_dev(true);
+    // k19-df2pp: the CUDA graphs captured or replayed while the pools were above the mark hold pointers into the range the trim unmapped
+    // (the temporaries the ops take from the pool are not graph nodes, so the replay check does not see them). A later window replayed
+    // one before its pool had grown back that far: G4 fn4 12 GB DFlash2, srv_kld long48, CUDA illegal address in the ubatch after a
+    // released layer-major group, the 6th 8200-token prompt in two runs (k19pp_k1 / d1); with the group's trim off the pool stayed large
+    // enough and nothing failed. They are evicted with the trim (recaptured by the next window). LLAMA_MOE_TRIM_EVICT=0: kept, as before
+    static const bool trim_evict = getenv("LLAMA_MOE_TRIM_EVICT") == nullptr || atoi(getenv("LLAMA_MOE_TRIM_EVICT")) != 0;
+    if (trim_evict && trimmed > 0) {
+        const size_t n_ev = graph_evict_since_dev(tiny_rel_t_mark);
+        static int n_ev_log = 0;
+        if (n_ev > 0 && n_ev_log++ < 4) {
+            LLAMA_LOG_INFO("%s: %zu CUDA graphs of the released window evicted with the %.2f MiB the pools gave back (LLAMA_MOE_TRIM_EVICT=0 keeps them)\n",
+                __func__, n_ev, trimmed/1048576.0);
+        }
+    }
     TINY_TRACE("%s: trace: restore\n", __func__);
     moe_cache->restore();
     TINY_TRACE("%s: trace: restored\n", __func__);
@@ -7348,6 +7376,11 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
         if (lm_rel_trim) {
             const size_t trimmed = pool_mark_trim(true);
+            // k19-df2pp: as in tiny_rel_leave (the group's own graphs are evicted at its end unless LLAMA_MOE_LM_KEEP_HOST=1)
+            static const bool trim_evict = getenv("LLAMA_MOE_TRIM_EVICT") == nullptr || atoi(getenv("LLAMA_MOE_TRIM_EVICT")) != 0;
+            if (trim_evict && trimmed > 0) {
+                graph_evict_since_dev(lm_t_start);
+            }
             static int n_trim_log = 0;
             if (trimmed > 0 && n_trim_log++ < 4) {
                 LLAMA_LOG_INFO("%s: %.2f MiB of CUDA pool memory the released group took given back before the banks return "
@@ -11911,6 +11944,13 @@ int32_t llama_verify_device_max_tokens(const llama_context * ctx) {
         return -1;
     }
     return (int32_t) std::max<int64_t>(1, ctx->get_moe_cache()->n_tokens_cached());
+}
+
+int32_t llama_moe_cache_tokens(const llama_context * ctx) {
+    if (ctx == nullptr || ctx->get_moe_cache() == nullptr) {
+        return -1;
+    }
+    return (int32_t) ctx->get_moe_cache()->n_tokens_cached();
 }
 
 bool llama_prepare_prompt_plan(llama_context * ctx) {

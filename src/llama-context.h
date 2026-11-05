@@ -944,6 +944,8 @@ private:
     int64_t tiny_rel_n_leave = 0;
     double  tiny_rel_ms      = 0.0;   // host time of the restores (frees, trims, bank allocation, refill)
     size_t  pool_mark_trim_dev(bool trim); // mark / trim the CUDA pools of this context's backends (ggml_backend_pool_mark_trim)
+    size_t  graph_evict_since_dev(int64_t t_us); // k19-df2pp: the backends' CUDA graphs used since t_us are evicted
+    int64_t tiny_rel_t_mark = 0;            // k19-df2pp: when tiny_rel_enter marked the pools
     void    tiny_rel_enter(const char * why);
     void    tiny_rel_leave();
 

@@ -1053,6 +1053,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_batch batch_inject; // target features for KV cache injection
 
     std::vector<float> features_buf; // [n_chunk, n_embd_enc] gathered target features
+    std::vector<uint64_t> feat_hash_v; // k19-df2pp: LLAMA_DFLASH_FEAT_HASH running hash per sequence
+    std::vector<int64_t>  feat_hash_n;
 
     std::vector<common_sampler_ptr> smpls;
 
@@ -1312,6 +1314,27 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
+                // k19-df2pp (diagnostic, LLAMA_DFLASH_FEAT_HASH=1): a running FNV-1a hash of the features the drafter takes, in position
+                // order per sequence, logged after each chunk: equal hashes = the drafter saw bit-identical target features
+                static const bool feat_hash = getenv("LLAMA_DFLASH_FEAT_HASH") != nullptr && atoi(getenv("LLAMA_DFLASH_FEAT_HASH")) != 0;
+                if (feat_hash) {
+                    if (feat_hash_v.size() < (size_t) n_seq) {
+                        feat_hash_v.resize(n_seq, 1469598103934665603ULL);
+                        feat_hash_n.resize(n_seq, 0);
+                    }
+                    if (batch_in.tokens[i_batch_beg[seq_id] + offset].pos[0] == 0) {
+                        feat_hash_v[seq_id] = 1469598103934665603ULL; // a prompt from position 0: a new hash
+                        feat_hash_n[seq_id] = 0;
+                    }
+                    const auto * b = (const uint8_t *) features_buf.data();
+                    for (size_t x = 0; x < (size_t) n_chunk * n_embd_enc * sizeof(float); ++x) {
+                        feat_hash_v[seq_id] = (feat_hash_v[seq_id] ^ b[x]) * 1099511628211ULL;
+                    }
+                    feat_hash_n[seq_id] += n_chunk;
+                    LOG_INF("k19-df2pp: dflash features seq %d: %" PRId64 " rows up to pos %d, hash %016" PRIx64 "\n", (int) seq_id,
+                            feat_hash_n[seq_id], (int) batch_in.tokens[i_batch_beg[seq_id] + offset + n_chunk - 1].pos[0], feat_hash_v[seq_id]);
+                }
+
                 batch_inject.clear();
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     const llama_pos p = batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
@@ -1500,14 +1523,47 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }();
                 // k19-placemid (LLAMA_DFLASH_WINDOW=2, opt-in, measurement): the rule beside a MoE cache too, with the same pass costs
                 static const bool df2_window_cached = getenv("LLAMA_DFLASH_WINDOW") != nullptr && atoi(getenv("LLAMA_DFLASH_WINDOW")) == 2;
-                const bool use_df2w = is_dflash2 && df2_window && !use_ev && params.p_min <= 0.0f && p_cum_thr <= 0.0f &&
-                    (!llama_moe_cache_active(params.ctx_tgt) || df2_window_cached);
+                // k19-df2pp: beside a MoE cache each further verify row costs ~3.4 ms (the experts it misses), not the ~1 ms of a full card,
+                // so the whole 7-row draft lost to MTP at long contexts (G4 Flash-Next fn4, default verify: 3 rows ~17 / 20 ms, 7 rows ~29 / 35 ms
+                // per pass at 16 / 12 GB, the same ratio 1.7 at both). There the rule runs by default with those costs: the short window is
+                // 3 rows at every position, LLAMA_DFLASH_CACHED_COST="c_lo,slope" (ms) overrides them; LLAMA_DFLASH_CACHED_WINDOW=0 (or
+                // LLAMA_DFLASH_WINDOW=0) off, LLAMA_DFLASH_WINDOW=2 keeps the full-card costs beside the cache. The EV rule over every width
+                // (LLAMA_DFLASH_EV) won 30k too but lost chat / 8k: each width is one more CUDA graph capture per KV bucket
+                static const bool df2_window_cache_on = [] {
+                    const char * w = getenv("LLAMA_DFLASH_WINDOW");
+                    const char * e = getenv("LLAMA_DFLASH_CACHED_WINDOW");
+                    return (w == nullptr || atoi(w) != 0) && (e == nullptr || atoi(e) != 0);
+                }();
+                static const std::pair<double, double> df2_cached_cost = [] {
+                    std::pair<double, double> c = { 18.5, 3.4 };
+                    if (const char * e = getenv("LLAMA_DFLASH_CACHED_COST")) {
+                        double lo = 0.0, sl = 0.0;
+                        if (sscanf(e, "%lf,%lf", &lo, &sl) == 2 && lo > 0.0 && sl >= 0.0) {
+                            c = { lo, sl };
+                        }
+                    }
+                    return c;
+                }();
+                // only where the cache's device slots hold the experts of fewer than LLAMA_DFLASH_CACHED_TOKENS_MAX (12) tokens: G4 fn4 12 / 16 GB
+                // hold 3 / 7, 48 GB 32 (there the full-card costs stay opt-in, LLAMA_DFLASH_WINDOW=2)
+                static const int32_t df2_cached_tok_max = getenv("LLAMA_DFLASH_CACHED_TOKENS_MAX") ? atoi(getenv("LLAMA_DFLASH_CACHED_TOKENS_MAX")) : 12;
+                const bool df2_cached = is_dflash2 && llama_moe_cache_active(params.ctx_tgt) &&
+                    llama_moe_cache_tokens(params.ctx_tgt) < df2_cached_tok_max;
+                const bool use_df2w = is_dflash2 && !use_ev && params.p_min <= 0.0f && p_cum_thr <= 0.0f &&
+                    (df2_cached ? (df2_window_cached || df2_window_cache_on) : df2_window);
+                const bool df2w_cached_costs = df2_cached && !df2_window_cached;
                 if (use_df2w) {
                     static bool logged = false;
                     if (!logged) {
                         logged = true;
-                        LOG_INF("k19-handoff: DFlash2 window: the short or the whole draft by expected tokens per ms (%s; LLAMA_DFLASH_WINDOW=0 off)\n",
-                                getenv("LLAMA_DFLASH_WINDOW") != nullptr ? "LLAMA_DFLASH_WINDOW=1" : "exact verify");
+                        if (df2w_cached_costs) {
+                            LOG_INF("k19-df2pp: DFlash2 window beside the MoE cache (its slots hold %d tokens): the 3-row or the whole draft by "
+                                    "expected tokens per ms, %.2f ms at 3 rows + %.2f per row (LLAMA_DFLASH_CACHED_WINDOW=0 off)\n",
+                                    (int) llama_moe_cache_tokens(params.ctx_tgt), df2_cached_cost.first, df2_cached_cost.second);
+                        } else {
+                            LOG_INF("k19-handoff: DFlash2 window: the short or the whole draft by expected tokens per ms (%s; LLAMA_DFLASH_WINDOW=0 off)\n",
+                                    getenv("LLAMA_DFLASH_WINDOW") != nullptr ? "LLAMA_DFLASH_WINDOW=1" : "exact verify");
+                        }
                     }
                 }
                 std::vector<float> step_p;
@@ -1552,10 +1608,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     static const float df2_cal[20] = { 0.141f, 0.141f, 0.141f, 0.141f, 0.203f, 0.264f, 0.278f, 0.339f, 0.363f, 0.423f,
                                                        0.460f, 0.492f, 0.583f, 0.614f, 0.614f, 0.619f, 0.657f, 0.748f, 0.814f, 0.929f };
                     const bool   lng   = dp.pos0 >= 4096;
-                    const size_t w_lo  = lng ? 3 : 4;                       // verify rows of the short window
-                    const size_t w_hi  = result.size() + 1;                 // the whole draft
-                    const double c_lo  = lng ? 11.05 : 11.80;               // ms per pass at w_lo
-                    const double slope = lng ? 1.125 : 0.933;               // ms per further row
+                    const size_t w_lo  = df2w_cached_costs ? 3 : lng ? 3 : 4;  // verify rows of the short window
+                    const size_t w_hi  = result.size() + 1;                    // the whole draft
+                    const double c_lo  = df2w_cached_costs ? df2_cached_cost.first  : lng ? 11.05 : 11.80; // ms per pass at w_lo
+                    const double slope = df2w_cached_costs ? df2_cached_cost.second : lng ? 1.125 : 0.933; // ms per further row
                     if (w_lo < w_hi) {
                         double e_tok = 1.0, reach = 1.0, e_lo = 0.0;
                         for (size_t k = 1; k < w_hi; ++k) {
