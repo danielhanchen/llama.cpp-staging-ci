@@ -973,6 +973,18 @@ struct llama_moe_cache::impl {
         const char * e = getenv("LLAMA_MOE_CPU_MISS_SMALL_HALF");
         return !cm_stable ? 0.354 : e != nullptr ? std::min(0.612, std::max(0.177, atof(e))) : 0.47;
     }();
+    // k19-l4poly (LLAMA_MOE_CPU_MISS_SMALL_HALF_TEAM, default 0.6): on a host whose host experts run on the host team (single_team_host,
+    // a small host), small batches take 1/4 up to a raw share of 0.6 (a host up to 1.5x the upload time per expert). Colab L4 Flint 16 GB
+    // sits on the 0.47 boundary: start-up / persisted calibrations of 116-121 us per expert (raw 0.45) fetched 1/4, those of 158-160 us
+    // (raw 0.53, a cold first launch, then persisted for the bin) fetched 1/2 and lost their trials (chat 54.7 vs 57.5 tok/s, same head);
+    // a fixed 1/4 decoded +13% (k19-flint), 1/8 +10%, every miss on the host -12% at 2k. Unchanged where LLAMA_MOE_CPU_MISS_SMALL_HALF
+    // is set, without cm_stable, and on hosts without the team (G4, 4-vCPU T4)
+    double cm_small_half_eff() const {
+        static const double team_half = getenv("LLAMA_MOE_CPU_MISS_SMALL_HALF_TEAM") != nullptr ?
+            std::min(0.80, std::max(0.177, atof(getenv("LLAMA_MOE_CPU_MISS_SMALL_HALF_TEAM")))) : 0.6;
+        static const bool user_half = getenv("LLAMA_MOE_CPU_MISS_SMALL_HALF") != nullptr;
+        return cm_stable && !user_half && single_team_host() ? std::max(cm_small_half, team_half) : cm_small_half;
+    }
     bool     cm_recal_pending = false; // (timed only between requests: 2 x ~40 ms inside a reply cost chat decode 2% on G4)
     int      cm_nb    = 0;     // batches in the window
     int      cm_win   = cm_win1;
@@ -6293,7 +6305,7 @@ struct llama_moe_cache::impl {
             const double raw  = tc/(tc + cm_tup)*fetch_scale;
             // log levels: two calibrations a little apart rarely fall on two sides of a level. k15-lfm2: small batches (at most
             // max_batch tokens) take 1/4 up to cm_small_half instead of the geometric midpoint 0.354 (see cm_small_half)
-            const double half = n <= max_batch ? cm_small_half : 0.354;
+            const double half = n <= max_batch ? cm_small_half_eff() : 0.354;
             cm_share[n] = raw <= 0.177 ? 0.125f : raw <= half ? 0.25f : raw <= 0.612 ? 0.5f : raw <= 0.80 ? 0.75f : 1.0f;
             if (fetch_scale != 1.0 && raw <= 0.088) {
                 cm_share[n] = 0.0625f;
