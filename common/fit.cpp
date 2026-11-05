@@ -1411,7 +1411,10 @@ static void common_params_fit_impl(
                     // byte-exact at a fixed placement). The cache grows by the measured difference between the two placements, so a released
                     // prompt uses what the fit measured for it. Kept only if the larger cache meets the margin; otherwise the placement above
                     // stays. One device only (the small-device rule). LLAMA_FIT_PLACE8=0 off
-                    if (ok && common_fit_place8_on() && cparams->n_ubatch > common_fit_place8_ub()) {
+                    // measured on G4 8 GB only: devices with less free memory than LLAMA_FIT_PLACE8_MIN_FREE_MIB (6144) keep the old placement
+                    static const int64_t place8_min_free = int64_t(getenv("LLAMA_FIT_PLACE8_MIN_FREE_MIB") != nullptr ?
+                        std::max(0, atoi(getenv("LLAMA_FIT_PLACE8_MIN_FREE_MIB"))) : 6144)*MiB;
+                    if (ok && common_fit_place8_on() && cparams->n_ubatch > common_fit_place8_ub() && int64_t(dmds_cpu_moe[0].free) >= place8_min_free) {
                         const uint32_t ub_full = cparams->n_ubatch;
                         const uint32_t ub_rel  = common_fit_place8_ub();
                         const size_t   size_ok = cparams->moe_cache_size;
