@@ -4759,6 +4759,9 @@ void ggml_cpu_init(void) {
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
         }
 
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+        ggml_cpu_iq_kernels_log();
+#endif
         is_first_call = false;
     }
 

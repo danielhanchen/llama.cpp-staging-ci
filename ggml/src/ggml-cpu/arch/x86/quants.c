@@ -3446,6 +3446,162 @@ void ggml_vec_dot_iq3_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 #endif
 }
 
+// ---- k19-hostrow: an AVX-512 IQ3_S dot product (single and multi-column), bit-identical to the AVX2 kernel -------------------------
+// The host experts of a spilled MoE (Flash-Next UD-IQ4_XS at 8 GB: gate / up IQ3_S, down IQ4_NL, ~0.2% of the experts on the device)
+// are bound by the IQ3_S decode, not by DRAM: with 24 threads the AVX2 kernel reads 73 GB/s of weights from the LLC and 60-72 GB/s from
+// DRAM against a 141-195 GB/s read roofline (Xeon 8559C, scripts/k19hostrow/bench_host.cpp; IQ4_NL runs 210-230 GB/s from the LLC),
+// so every verified row of a draft window costs about one more token of host time. Here the 16 grid entries of 64 weights come from
+// one 512-bit gather (the AVX2 kernel inserts them one by one through the shuffle port), the signs are a 64-bit mask (a masked negate
+// of the activations), and one 512-bit maddubs / madd covers two sub-blocks of 32. The int32 lanes of the two sub-blocks are added
+// (the AVX2 kernel's sumi1 + sumi2: the same integers, no saturation possible: grid values <= 15, |q8| <= 127) and the float part is
+// the AVX2 kernel's own (one 8-lane fma per super-block with the same scale, the same horizontal sum), so each result is the AVX2
+// result bit for bit, single or multi-column. GGML_CPU_IQ_AVX512: 1 (default) the gather, 2 scalar loads and inserts, 0 the AVX2 kernel.
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX2__)
+#define GGML_IQ_AVX512 1
+#if defined(_MSC_VER) && !defined(__clang__)
+#define GGML_IQ512_INLINE static __forceinline
+#else
+#define GGML_IQ512_INLINE static inline __attribute__((always_inline))
+#endif
+static int ggml_iq_avx512_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char * e = getenv("GGML_CPU_IQ_AVX512");
+        int m = e == NULL ? 1 : atoi(e);
+        if (m < 0 || m > 2) {
+            m = 1;
+        }
+        mode = m;
+    }
+    return mode;
+}
+
+// grid entries of the 64 weights of sub-blocks (2j, 2j+1): qs[0..15], their 9th index bits in qh0 / qh1
+static inline __m512i ggml_iq3s_grid64(const uint8_t * GGML_RESTRICT qs, const uint32_t qh0, const uint32_t qh1, const int gather) {
+    if (gather) {
+        // one 512-bit gather of the 16 entries (2.2-3.4x the AVX2 kernel per thread on a Xeon 8559C)
+        const __m512i idx_l = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *) qs));
+        const __m512i shift = _mm512_set_epi32(1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8);
+        const __m512i hb    = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_set1_epi32((int) qh0)), _mm256_set1_epi32((int) qh1), 1);
+        const __m512i idx   = _mm512_or_si512(idx_l, _mm512_and_si512(_mm512_sllv_epi32(hb, shift), _mm512_set1_epi32(256)));
+        return _mm512_i32gather_epi32(idx, (const void *) iq3s_grid, 4);
+    }
+    // the AVX2 kernel's scalar loads and inserts, four 128-bit rows
+    __m128i r[4];
+    for (int k = 0; k < 4; ++k) {
+        const uint8_t * GGML_RESTRICT q = qs + 4*k;
+        const uint32_t h = k < 2 ? qh0 : qh1;
+        const int b = 4*(k & 1);
+        r[k] = _mm_set_epi32((int) iq3s_grid[q[3] | ((h << (5 - b)) & 256)], (int) iq3s_grid[q[2] | ((h << (6 - b)) & 256)],
+                             (int) iq3s_grid[q[1] | ((h << (7 - b)) & 256)], (int) iq3s_grid[q[0] | ((h << (8 - b)) & 256)]);
+    }
+    __m512i v = _mm512_castsi128_si512(r[0]);
+    v = _mm512_inserti32x4(v, r[1], 1);
+    v = _mm512_inserti32x4(v, r[2], 2);
+    return _mm512_inserti32x4(v, r[3], 3);
+}
+
+static void ggml_vec_dot_iq3_s_q8_K_avx512(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, const int gather) {
+    const block_iq3_s * GGML_RESTRICT x = vx;
+    const block_q8_K  * GGML_RESTRICT y = vy;
+    const int nb = n / QK_K;
+    const __m512i zero = _mm512_setzero_si512();
+    __m256 accumf = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
+        const uint8_t * GGML_RESTRICT qs = x[i].qs;
+        const uint8_t * GGML_RESTRICT qh = x[i].qh;
+        const uint8_t * GGML_RESTRICT sg = x[i].signs;
+        const int8_t  * GGML_RESTRICT q8 = y[i].qs;
+        __m512i sumi = _mm512_setzero_si512();
+        for (int ib32 = 0; ib32 < QK_K/32; ib32 += 2) {
+            const __m512i q2 = ggml_iq3s_grid64(qs, qh[ib32], qh[ib32 + 1], gather); qs += 16;
+            uint64_t m; memcpy(&m, sg, 8); sg += 8;
+            const __m512i q8v = _mm512_loadu_si512((const void *) q8); q8 += 64;
+            const __m512i q8s = _mm512_mask_sub_epi8(q8v, (__mmask64) m, zero, q8v);
+            const __m512i dot = _mm512_maddubs_epi16(q2, q8s);
+            const int16_t ls1 = 2*(x[i].scales[ib32/2] & 0xf) + 1;
+            const int16_t ls2 = 2*(x[i].scales[ib32/2] >>  4) + 1;
+            const __m512i sc  = _mm512_mask_blend_epi16((__mmask32) 0xFFFF0000u, _mm512_set1_epi16(ls1), _mm512_set1_epi16(ls2));
+            sumi = _mm512_add_epi32(sumi, _mm512_madd_epi16(dot, sc));
+        }
+        const __m256i si = _mm256_add_epi32(_mm512_castsi512_si256(sumi), _mm512_extracti64x4_epi64(sumi, 1));
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(si), accumf);
+    }
+    *s = hsum_float_8(accumf);
+}
+
+// nc columns (an expert routed to 2-8 rows): the decode once, each column the single-column sequence above
+GGML_IQ512_INLINE void ggml_vec_dot_iq3_s_q8_K_multi_avx512_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx,
+        const void * const * vy, const int nc, const int gather) {
+    const block_iq3_s * GGML_RESTRICT x = vx;
+    const int nb = n / QK_K;
+    const __m512i zero = _mm512_setzero_si512();
+    __m256 accumf[8];
+    for (int c = 0; c < nc; ++c) {
+        accumf[c] = _mm256_setzero_ps();
+    }
+    for (int i = 0; i < nb; ++i) {
+        const float xd = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const uint8_t * GGML_RESTRICT qs = x[i].qs;
+        const uint8_t * GGML_RESTRICT qh = x[i].qh;
+        const uint8_t * GGML_RESTRICT sg = x[i].signs;
+        __m512i sumi[8];
+        for (int c = 0; c < nc; ++c) {
+            sumi[c] = _mm512_setzero_si512();
+        }
+        for (int ib32 = 0; ib32 < QK_K/32; ib32 += 2) {
+            const __m512i q2 = ggml_iq3s_grid64(qs, qh[ib32], qh[ib32 + 1], gather); qs += 16;
+            uint64_t m; memcpy(&m, sg, 8); sg += 8;
+            const int16_t ls1 = 2*(x[i].scales[ib32/2] & 0xf) + 1;
+            const int16_t ls2 = 2*(x[i].scales[ib32/2] >>  4) + 1;
+            const __m512i sc  = _mm512_mask_blend_epi16((__mmask32) 0xFFFF0000u, _mm512_set1_epi16(ls1), _mm512_set1_epi16(ls2));
+            for (int c = 0; c < nc; ++c) {
+                const int8_t * GGML_RESTRICT q8 = ((const block_q8_K *) vy[c])[i].qs + 32*ib32;
+                const __m512i q8v = _mm512_loadu_si512((const void *) q8);
+                const __m512i q8s = _mm512_mask_sub_epi8(q8v, (__mmask64) m, zero, q8v);
+                sumi[c] = _mm512_add_epi32(sumi[c], _mm512_madd_epi16(_mm512_maddubs_epi16(q2, q8s), sc));
+            }
+        }
+        for (int c = 0; c < nc; ++c) {
+            const float d = xd * ((const block_q8_K *) vy[c])[i].d;
+            const __m256i si = _mm256_add_epi32(_mm512_castsi512_si256(sumi[c]), _mm512_extracti64x4_epi64(sumi[c], 1));
+            accumf[c] = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(si), accumf[c]);
+        }
+    }
+    for (int c = 0; c < nc; ++c) {
+        s[c] = hsum_float_8(accumf[c]);
+    }
+}
+
+static void ggml_vec_dot_iq3_s_q8_K_multi_avx512(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
+    const int g = ggml_iq_avx512_mode() == 1;
+    switch (nc) {
+        case 2:  ggml_vec_dot_iq3_s_q8_K_multi_avx512_n(n, s, vx, vy, 2, g); break;
+        case 3:  ggml_vec_dot_iq3_s_q8_K_multi_avx512_n(n, s, vx, vy, 3, g); break;
+        case 4:  ggml_vec_dot_iq3_s_q8_K_multi_avx512_n(n, s, vx, vy, 4, g); break;
+        case 5:  ggml_vec_dot_iq3_s_q8_K_multi_avx512_n(n, s, vx, vy, 5, g); break;
+        case 6:  ggml_vec_dot_iq3_s_q8_K_multi_avx512_n(n, s, vx, vy, 6, g); break;
+        case 7:  ggml_vec_dot_iq3_s_q8_K_multi_avx512_n(n, s, vx, vy, 7, g); break;
+        case 8:  ggml_vec_dot_iq3_s_q8_K_multi_avx512_n(n, s, vx, vy, 8, g); break;
+        default: for (int c0 = 0; c0 < nc; c0 += 8) {
+                     const int k = nc - c0 < 8 ? nc - c0 : 8;
+                     ggml_vec_dot_iq3_s_q8_K_multi_avx512_n(n, s + c0, vx, vy + c0, k, g);
+                 } break;
+    }
+}
+
+#endif // k19-hostrow AVX-512
+
+// k19-hostrow: once per process (ggml_cpu_init), which IQ3_S kernel this CPU variant runs
+void ggml_cpu_iq_kernels_log(void) {
+#if defined(GGML_IQ_AVX512)
+    const int m = ggml_iq_avx512_mode();
+    GGML_LOG_INFO("ggml-cpu: IQ3_S dot products on the %s (GGML_CPU_IQ_AVX512=%d)\n",
+        m == 0 ? "AVX2 kernel" : m == 1 ? "AVX-512 kernel, grid gather" : "AVX-512 kernel, grid inserts", m);
+#endif
+}
+
 void ggml_vec_dot_iq3_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK_K == 0);
     assert(nrc == 1);
@@ -3458,6 +3614,13 @@ void ggml_vec_dot_iq3_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
     const block_q8_K  * GGML_RESTRICT y = vy;
 
     const int nb = n / QK_K;
+
+#if defined(GGML_IQ_AVX512)
+    if (ggml_iq_avx512_mode() != 0) {
+        ggml_vec_dot_iq3_s_q8_K_avx512(n, s, vx, vy, ggml_iq_avx512_mode() == 1);
+        return;
+    }
+#endif
 
 #if defined(__AVX2__)
 
@@ -4922,7 +5085,12 @@ ggml_vec_dot_multi_t ggml_cpu_vec_dot_multi(enum ggml_type type) {
         on_k = e == NULL || atoi(e) != 0;
     }
     switch (type) {
+#if defined(GGML_IQ_AVX512)
+        // k19-hostrow: the AVX-512 kernels (GGML_CPU_IQ_AVX512=0: the AVX2 ones), bit-identical
+        case GGML_TYPE_IQ3_S:  return ggml_iq_avx512_mode() != 0 ? ggml_vec_dot_iq3_s_q8_K_multi_avx512 : ggml_vec_dot_iq3_s_q8_K_multi;
+#else
         case GGML_TYPE_IQ3_S:  return ggml_vec_dot_iq3_s_q8_K_multi;
+#endif
         case GGML_TYPE_IQ4_NL: return ggml_vec_dot_iq4_nl_q8_0_multi;
         case GGML_TYPE_IQ1_S:   return ggml_vec_dot_iq1_s_q8_K_multi;
         case GGML_TYPE_IQ2_XXS: return ggml_vec_dot_iq2_xxs_q8_K_multi;

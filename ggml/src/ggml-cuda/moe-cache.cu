@@ -246,6 +246,13 @@ static __global__ void moe_cache_assign(
         take_e = victim + n_ids;
         const int64_t acc = (int64_t) (uint32_t) stat[2] + (int64_t) fetch_q*n_miss;
         n_take = max((int) (acc >> 16), min(n_miss, n_slots - state[6]));
+        // k19-hostrow (LLAMA_MOE_HYBRID_WIDE): a window whose experts may outnumber the slots admits at most the slots this lookup does
+        // not pin (its hits); the rest go to the host. Never binds while the distinct ids fit the slots (every earlier caller)
+        int n_pin = n_hit;
+        for (int off = MOE_CACHE_LANES/2; off > 0; off >>= 1) {
+            n_pin += __shfl_xor_sync(full, n_pin, off, MOE_CACHE_LANES);
+        }
+        n_take = min(n_take, n_slots - n_pin);
         int n_sel = 0;
         for (int j0 = 0; j0 < n_miss; j0 += MOE_CACHE_LANES) {
             const int j = j0 + lane;
