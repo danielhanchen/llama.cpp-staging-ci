@@ -5140,7 +5140,17 @@ struct llama_moe_cache::impl {
             const char * e = getenv("LLAMA_MOE_CPU_MISS_PROMPT_DEV");
             return e != nullptr && atoi(e) != 0;
         }();
-        return cm_prompt_now && cm && ((cm_frozen && cm_frozen_fetch && pin_dev) || all_dev);
+        // k19-l4poly (LLAMA_MOE_PIN_PROMPT_SHORT, default 1; 0 = off): on a host-team host (single_team_host) a short prompt (the k17-ttft
+        // rule, at most LLAMA_MOE_CPU_MISS_SHORT tokens in all) keeps its host path beside the pinned small batches: the pin is for the
+        // small checkpoint tail of a long prompt (k15), while a chat turn's prompt otherwise uploads the misses of every layer. Colab L4
+        // LFM2.5 4 / 8 GB with n-gram drafting (pinned): a 38-token prompt 875 / 739 ms, 498 ms at 8 GB without drafting (not pinned);
+        // PolyStrata 526 ms
+        static const bool pin_short = [] {
+            const char * e = getenv("LLAMA_MOE_PIN_PROMPT_SHORT");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        const bool pinned = cm_frozen && cm_frozen_fetch && pin_dev && !(pin_short && short_live() && single_team_host());
+        return cm_prompt_now && cm && (pinned || all_dev);
     }
 
     // r22b: a prompt ubatch the cost model puts on the host path, outside the forced and the trial-gated rules
