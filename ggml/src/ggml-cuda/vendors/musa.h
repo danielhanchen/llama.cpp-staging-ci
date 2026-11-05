@@ -58,6 +58,7 @@
 #define cudaErrorPeerAccessNotEnabled musaErrorPeerAccessNotEnabled
 #define cudaEventCreate musaEventCreate
 #define cudaEventCreateWithFlags musaEventCreateWithFlags
+#define cudaEventBlockingSync musaEventBlockingSync
 #define cudaEventDisableTiming musaEventDisableTiming
 #define cudaEventRecord musaEventRecord
 #define cudaEventSynchronize musaEventSynchronize
