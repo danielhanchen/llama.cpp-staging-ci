@@ -907,6 +907,11 @@ struct llama_moe_cache::impl {
     int32_t tail_rank       = 0;
     bool    tail_dflt       = false;
     int64_t tail_max_tokens = 8;
+    // k19-hostrow: wide hybrid windows (LLAMA_MOE_HYBRID_WIDE, see use_device): a hybrid small batch of up to wide_max tokens takes the
+    // assign path even when its routed experts may outnumber the slots (the assign admits at most the unpinned slots, the host computes
+    // the rest), instead of every expert of the window on the CPU
+    bool    hybrid_wide     = false;
+    int64_t wide_max        = 8;
     // k11 LLAMA_MOE_CPU_MISS_PROMPT=N (opt-in, default 0 = off): prompt ubatches of max_batch + 1 .. N tokens always take the host path
     // once calibrated, at the rule's fetch share but at most 1/4 (the host computes at least three quarters of the misses, the experts
     // with the fewest uses), without waiting for a trial on the small batches. G4, LFM2.5-24B-A2B 8 GB, a 38-token prompt: 6.1 GB of uploads
@@ -4787,9 +4792,24 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // every routed expert of a ubatch of n_tokens fits the slots of the group (the plain lookup's condition)
+    bool slots_fit(const group & g, int64_t n_tokens) const {
+        return std::min<int64_t>(n_tokens*n_expert_used, g.ref[0]->ne[2]) <= g.n_slots;
+    }
+
+    // k19-hostrow (LLAMA_MOE_HYBRID_WIDE=1, default off): a hybrid group's small batch of at most wide_max tokens whose experts do not
+    // fit the slots. fn4 UD-IQ4_XS at 8 GB on G4: 23 slots per group serve 2 tokens, so a verify window of 3-8 tokens read every one
+    // of its experts on the CPU (no fetch share over PCIe, no route tail skip): ~12 ms per extra row against ~16 ms for a whole token.
+    // With it the window takes the hybrid assign like a single token (hits on the device, the fetch share of the misses copied into
+    // the unpinned slots, the rest on the host). Not exact against the CPU path it replaces (another split of the experts between
+    // device and host); off in the exact modes (LLAMA_MTP_EXACT=1, LLAMA_MOE_CPU_MISS=0)
+    bool wide_ok(const group & g, int64_t n_tokens) const {
+        return hybrid_wide && g.counts != nullptr && (hybrid || cm) && n_tokens <= wide_max;
+    }
+
     bool use_device(const group & g, int64_t n_tokens) const {
         return !force_large && g.dev_lookup && g.n_slots > 0 && n_tokens > 0 && (n_tokens <= max_batch || cm_serves(n_tokens)) &&
-            std::min<int64_t>(n_tokens*n_expert_used, g.ref[0]->ne[2]) <= g.n_slots;
+            (slots_fit(g, n_tokens) || wide_ok(g, n_tokens));
     }
 
     // k15-lfm2: llama_moe_cpu_miss_drop_slow. Once calibrated: where the cache holds at least LLAMA_MOE_CPU_MISS_DROP_FRAC (0.75) of the
@@ -5157,7 +5177,7 @@ struct llama_moe_cache::impl {
         }
         const layer & l = layers[il];
         const group & g = groups[l.ig];
-        if (!use_device(g, n_ubatch) || ids->ne[1] > n_ubatch || ids->ne[0] > n_expert_used || l.host_dev.size() != g.banks.size()) {
+        if (!use_device(g, n_ubatch) || !slots_fit(g, n_ubatch) || ids->ne[1] > n_ubatch || ids->ne[0] > n_expert_used || l.host_dev.size() != g.banks.size()) {
             return nullptr;
         }
         std::vector<ggml_tensor *> banks = g.banks;
@@ -5198,6 +5218,18 @@ struct llama_moe_cache::impl {
             share = host ? hybrid_share : 1.0f;
         }
         const group & g = groups[layers[il].ig];
+        if (!slots_fit(g, n_ubatch)) {
+            // wide window (wide_ok): only with the host path, which computes the misses the slots cannot take
+            if (!host) {
+                return nullptr;
+            }
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true)) {
+                LLAMA_LOG_INFO("llama_moe_cache: k19-hostrow wide hybrid windows: a small batch of %" PRId64 " tokens takes the hybrid assign beyond "
+                    "the %d slots of its group (the misses they cannot take run on the host; LLAMA_MOE_HYBRID_WIDE=0: the CPU path)\n",
+                    n_ubatch, (int) g.n_slots);
+            }
+        }
         ggml_tensor * op = ggml_moe_cache_assign(ctx, ids, g.map, g.state, g.counts, share, il);
         if (host && split_frozen()) {
             // k13: frozen small batches admit nothing between prompts, not even to the empty slots a lent graph left: the n-gram
@@ -5219,6 +5251,19 @@ struct llama_moe_cache::impl {
     // biases (the bias would still be added). LLAMA_MOE_ROUTE_TAIL_SKIP=0: off (the exact path); =N: rank N, also where the default is off.
     // Changes the output (Strata: KL 0.003-0.006, top-1 ~98%, docs/DETAILS.md)
     void tail_skip_init(const llama_model & model, layer_set set) {
+        {
+            const char * e       = getenv("LLAMA_MOE_HYBRID_WIDE");
+            const char * e_exact = getenv("LLAMA_MTP_EXACT");
+            const char * e_miss  = getenv("LLAMA_MOE_CPU_MISS");
+            const bool exact = (e_exact != nullptr && atoi(e_exact) != 0) || (e_miss != nullptr && atoi(e_miss) == 0);
+            const int  v     = e != nullptr ? atoi(e) : 0;
+            hybrid_wide = v > 0 && !exact;
+            wide_max    = v > 1 ? std::min<int64_t>(n_small_max, v) : 8;
+            if (hybrid_wide && !model.hparams.no_alloc) {
+                LLAMA_LOG_INFO("%s: k19-hostrow: hybrid small batches of up to %" PRId64 " tokens may outnumber the slots (LLAMA_MOE_HYBRID_WIDE)\n",
+                    __func__, wide_max);
+            }
+        }
         const char * env = getenv("LLAMA_MOE_ROUTE_TAIL_SKIP");
         if (const char * e = getenv("LLAMA_MOE_ROUTE_TAIL_SKIP_MAX_TOKENS")) {
             tail_max_tokens = std::max<int64_t>(1, std::min<int64_t>(n_small_max, atoll(e)));
