@@ -1353,7 +1353,8 @@ static void common_params_fit_impl(
             // small-device placement below (smaller margin, the k19-place8 decode-sized cache) although it fits
             const size_t  size_fit_hb = cparams->moe_cache_size;
             const int64_t gain_fit_hb = g_moe_margin_gain;
-            const bool    hostbound   = fits_per_device && nd == 1 && size_before > 0 &&
+            // not beside a draft model or MTP heads (as the k18 margin rule): their run-time pools were never measured at this margin
+            const bool    hostbound   = fits_per_device && nd == 1 && size_before > 0 && !has_drafter &&
                 common_fit_hostbound_place(int64_t(dmds_cpu_moe[0].free), int64_t(size_fit_hb),
                     int64_t(dmds_cpu_moe.back().mb.model) - int64_t(dmds_full.back().mb.model));
             // k13-small: a small device (G4 ballasted to 4 GB, Qwen3.6-35B-A3B Q3_K_M + MTP: the dense weights of every layer, the context and
