@@ -1487,7 +1487,10 @@ static void common_params_fit_impl(
                         if (measure8(size_ok, d_s)) {
                             grow = int64_t(dmds_ok[0].mb.total()) - int64_t(d_s[0].mb.total());
                         }
-                        if (grow >= 256*MiB) {
+                        // k19-l4poly: a host-bound device takes even a smaller difference (LLAMA_FIT_HOSTBOUND_PLACE8_MIN_MIB, 256 as elsewhere)
+                        static const int64_t hb_min = int64_t(getenv("LLAMA_FIT_HOSTBOUND_PLACE8_MIN_MIB") != nullptr ?
+                            std::max(1, atoi(getenv("LLAMA_FIT_HOSTBOUND_PLACE8_MIN_MIB"))) : 256)*MiB;
+                        if (grow >= (hostbound ? hb_min : 256*MiB)) {
                             int64_t req = int64_t(size_ok) + grow;
                             for (int it = 0; it < 3 && req >= int64_t(size_ok) + 128*MiB; it++) {
                                 dmds_t d8;
