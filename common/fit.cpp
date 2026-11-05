@@ -89,9 +89,19 @@ static uint32_t common_fit_place8_ub() {
 }
 
 // read by the context (llama_context, see tiny_rel_ub) when it is created: set for the loaded context, never for a measurement
-static void common_fit_place8_env(uint32_t ub) {
+// mid: k19-placemid (a device of the regular fit, not the small-device branch): the context keeps its layer-major prompt groups, the
+// cache keeps multi-token hybrid batches (LLAMA_MOE_PLACE8_MID) and the draft model is fitted as usual
+static bool g_place8_mid = false;
+
+bool common_fit_place8_mid() {
+    return g_place8 && g_place8_mid;
+}
+
+static void common_fit_place8_env(uint32_t ub, bool mid = false) {
     common_set_env("LLAMA_MOE_PLACE8_UB", ub > 0 ? std::to_string(ub) : "");
-    g_place8 = ub > 0;
+    common_set_env("LLAMA_MOE_PLACE8_MID", ub > 0 && mid ? "1" : "");
+    g_place8     = ub > 0;
+    g_place8_mid = ub > 0 && mid;
 }
 
 int64_t common_fit_small_reserve_mib(int64_t cache_mib) {
@@ -1523,6 +1533,72 @@ static void common_params_fit_impl(
                     g_small_device = true;
                     LOG_INF("%s: small device: every layer stays in device memory beside a MoE cache of %zu MiB within the margin of %" PRId64 " MiB\n",
                         __func__, cparams->moe_cache_size/MiB, margins[0]/MiB);
+                }
+                // k19-placemid: the k19-place8 placement on a mid-size device (G4 12 / 16 GB, Qwen3.8-Flash-Next UD-IQ4_XS ctx 32768 -ub 2048:
+                // a 2264 MiB compute buffer, 1275 MiB of it the staging arena of the prefetched expert copies, beside a cache of 3068 MiB,
+                // idle during decode). The graphs are reserved at LLAMA_FIT_PLACE8_UB (31) tokens and the cache takes the difference; prompts
+                // keep their layer-major groups, which release the banks for the merged graph (as they already do where it does not fit),
+                // and a prompt ubatch outside a group releases them as at 8 GB. Only where the freed memory is at least
+                // LLAMA_FIT_PLACEMID_MIN_FRAC (0.10) of the cache: at 24 / 48 GB the staging copies are already lent from the cache (989 MiB
+                // compute) and every prompt would refill tens of GB of banks. One device; LLAMA_FIT_PLACEMID=0 (or LLAMA_FIT_PLACE8=0) off
+                static const bool placemid_on = getenv("LLAMA_FIT_PLACEMID") == nullptr || atoi(getenv("LLAMA_FIT_PLACEMID")) != 0;
+                static const double placemid_min_frac = getenv("LLAMA_FIT_PLACEMID_MIN_FRAC") != nullptr ?
+                    std::max(0.0, atof(getenv("LLAMA_FIT_PLACEMID_MIN_FRAC"))) : 0.10;
+                if (!g_small_device && nd == 1 && placemid_on && common_fit_place8_on() && cparams->moe_cache_size > 0 &&
+                        cparams->n_ubatch > common_fit_place8_ub()) {
+                    const uint32_t ub_full = cparams->n_ubatch;
+                    const uint32_t ub_rel  = common_fit_place8_ub();
+                    const size_t   size_ok = cparams->moe_cache_size;
+                    const dmds_t   dmds_ok = dmds_cpu_moe;
+                    bool           got     = false;
+                    int64_t        grow    = 0;
+                    cparams->n_ubatch = ub_rel;
+                    common_fit_place8_env(ub_rel, true);
+                    auto measure_mid = [&](size_t cache, dmds_t & d) {
+                        cparams->moe_cache_size = cache;
+                        try {
+                            d = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                        } catch (const std::runtime_error &) {
+                            return false;
+                        }
+                        add_extra_memory(d);
+                        return true;
+                    };
+                    dmds_t d_s;
+                    if (measure_mid(size_ok, d_s)) {
+                        grow = int64_t(dmds_ok[0].mb.total()) - int64_t(d_s[0].mb.total());
+                    }
+                    if (grow >= 256*MiB && double(grow) >= placemid_min_frac*double(size_ok)) {
+                        int64_t req = int64_t(size_ok) + grow;
+                        for (int it = 0; it < 3 && req >= int64_t(size_ok) + 128*MiB; it++) {
+                            dmds_t dm;
+                            if (!measure_mid(size_t(req), dm)) {
+                                break;
+                            }
+                            const int64_t sm = int64_t(dm[0].free) - int64_t(dm[0].mb.total()) - margins[0];
+                            LOG_TRC("%s: k19-placemid: ubatches of up to %u tokens beside a cache of %" PRId64 " MiB: compute %zu MiB, %" PRId64
+                                " MiB over the margin\n", __func__, ub_rel, req/MiB, dm[0].mb.compute/MiB, sm/MiB);
+                            if (sm >= 0) {
+                                dmds_cpu_moe = dm;
+                                got = true;
+                                break;
+                            }
+                            req += sm - 16*MiB;
+                        }
+                    }
+                    cparams->n_ubatch = ub_full;
+                    if (got) {
+                        LOG_INF("%s: the MoE cache takes the memory of the prompt compute buffers (%" PRId64 " MiB): cache %zu -> %zu MiB; "
+                            "ubatches of more than %u tokens run with the cache banks released, layer-major groups as before (k19-placemid; "
+                            "LLAMA_FIT_PLACEMID=0 off)\n", __func__, grow/MiB, size_ok/MiB, cparams->moe_cache_size/MiB, ub_rel);
+                    } else {
+                        common_fit_place8_env(0);
+                        cparams->moe_cache_size = size_ok;
+                        dmds_cpu_moe            = dmds_ok;
+                        LOG_INF("%s: the MoE cache keeps its size (k19-placemid: %" PRId64 " MiB of prompt compute buffers beside a cache of %zu "
+                            "MiB, at least %.0f%% of it and 256 MiB wanted, LLAMA_FIT_PLACEMID_MIN_FRAC)\n", __func__, grow/MiB, size_ok/MiB,
+                            100.0*placemid_min_frac);
+                    }
                 }
                 // every layer in device memory with all experts in system memory and the cache: the placement of --cpu-moe
                 LOG_TRC("%s: all layers in device memory, MoE tensors in system memory, MoE cache of %zu MiB\n",
