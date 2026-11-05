@@ -2284,12 +2284,12 @@ struct llama_moe_cache::impl {
     // for the graph sleeps instead of spinning, so the host team takes the decode threads + two thirds (at most the CPUs - 2) instead
     // of + a third (CPUs - 4). Colab L4 (6 decode threads, 12 vCPUs) LFM2.5 4 GB chat: 10 threads blocking 45.2 tok/s, 10 spinning
     // 41.9, 11 blocking 43.0, 11 yielding 33.5 (bimodal), 8 spinning (k19-l4b) 42.0; PolyStrata 46.4 (l4p_g5a)
-    // only where the cache holds at most LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC (0.25) of the host experts, so the host computes most
-    // misses: Colab L4 Flint 16 GB (55.8% cached) with a team of 10 waiting blocked: chat 57.6 [50.0-57.6] vs 58.3, 2k 66.1 vs 73.3;
-    // LFM2.5 8 GB (40%): chat +3.0%, 2k / 8k -5.8 / -1.9% (l4p_g5a / g5b)
+    // only where the cache holds at most LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC (0.5; the trials' share with the mailbox) of the host
+    // experts: Colab L4 Flint 16 GB (55.8% cached) with a team of 10 waiting blocked: chat 57.6 [50.0-57.6] vs 58.3, 2k 66.1 vs 73.3;
+    // LFM2.5 8 GB (40%) chat / 2k / 8k +3.0 / -5.8 / -1.9% (l4p_g5a) and +8.0 / +9.1 / +13.2% (l4p_a7) on two VMs
     bool single_wait_blocking_here() const {
         static const double max_frac = getenv("LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC") != nullptr ?
-            std::max(0.0, atof(getenv("LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC"))) : 0.25;
+            std::max(0.0, atof(getenv("LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC"))) : 0.5;
         return single_wait_blocking() != nullptr && cache_frac >= 0.0 && cache_frac <= max_frac;
     }
     static void (*single_wait_blocking())(bool) {
@@ -4947,10 +4947,14 @@ struct llama_moe_cache::impl {
         cmw_on        = false;
         cm_small_ok   = true;
         cm_small_live = true;
+        // k19-l4poly: on a host-team host the short prompts (k17-ttft, see cm_prompt_off) keep the cost model's verdict of the
+        // calibration (persisted per build and host, so the same in every launch); LLAMA_MOE_PIN_PROMPT_SHORT=0 off
+        const bool keep_short = cm_pin_short() && single_team_host();
         for (int64_t n = 1; n <= cm_max; ++n) {
             // batches above the frozen sizes (short prompts) keep the plain cache: their calibrated host path is timing-driven, and
             // a frozen cache gives the same text in every run
-            cm_on[n] = n <= std::min<int64_t>({ cm_frozen_max, max_batch }) ? 1 : 0;
+            const bool short_n = keep_short && n > max_batch && n <= cm_short_max;
+            cm_on[n] = n <= std::min<int64_t>({ cm_frozen_max, max_batch }) ? 1 : short_n ? cm_on[n] : 0;
         }
         cm_gen++;
         if (cm_pin_lifted_once) {
@@ -5169,6 +5173,13 @@ struct llama_moe_cache::impl {
             short_fast(n_tokens) &&
             n_tokens > cm_prompt_force && cm_on[n_tokens] != 0 && cmt_host_ok && !cm_prompt_off();
     }
+    static bool cm_pin_short() {
+        static const bool pin_short = [] {
+            const char * e = getenv("LLAMA_MOE_PIN_PROMPT_SHORT");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        return pin_short;
+    }
     bool cm_prompt_off() const {
         static const bool pin_dev = [] {
             const char * e = getenv("LLAMA_MOE_PIN_PROMPT_DEV");
@@ -5183,11 +5194,7 @@ struct llama_moe_cache::impl {
         // small checkpoint tail of a long prompt (k15), while a chat turn's prompt otherwise uploads the misses of every layer. Colab L4
         // LFM2.5 4 / 8 GB with n-gram drafting (pinned): a 38-token prompt 875 / 739 ms, 498 ms at 8 GB without drafting (not pinned);
         // PolyStrata 526 ms
-        static const bool pin_short = [] {
-            const char * e = getenv("LLAMA_MOE_PIN_PROMPT_SHORT");
-            return e == nullptr || atoi(e) != 0;
-        }();
-        const bool pinned = cm_frozen && cm_frozen_fetch && pin_dev && !(pin_short && short_live() && single_team_host());
+        const bool pinned = cm_frozen && cm_frozen_fetch && pin_dev && !(cm_pin_short() && short_live() && single_team_host());
         return cm_prompt_now && cm && (pinned || all_dev);
     }
 
