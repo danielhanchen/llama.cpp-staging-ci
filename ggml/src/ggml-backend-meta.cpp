@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <memory>
 #include <set>
@@ -443,8 +444,10 @@ struct ggml_backend_meta_buffer_context {
     // context of the model, so the rotation of the compute containers above, driven by the graph rebuilds of any of them, freed the
     // views of a graph that another context kept and computed again (the MTP drafter's graphs rotated the target's views away: wrong
     // target tokens under -sm tensor with MTP). They are kept for the buffer's lifetime instead, one set per distinct view (the same
-    // source, offset, shape, op and sources give the same per-device tensors), so a graph rebuilt every step adds nothing
-    std::vector<ggml_backend_meta_simple_tensor_container> stc_views_chunks;
+    // source, offset, shape, op and sources give the same per-device tensors), so a graph rebuilt every step adds nothing.
+    // A deque: a new chunk never relocates the others (the MSVC STL's std::map move constructor is not noexcept, so a std::vector
+    // of these would copy them on growth, and the std::unique_ptr contexts cannot be copied: Windows builds failed to compile)
+    std::deque<ggml_backend_meta_simple_tensor_container> stc_views_chunks;
     size_t stc_views_used = 0; // tensors in the last chunk (per device)
     static constexpr size_t stc_views_chunk = 1024;
     std::map<const ggml_tensor *, std::vector<ggml_tensor *>> stc_views;
