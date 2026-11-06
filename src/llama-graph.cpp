@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstring>
 #include <numeric>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -58,6 +59,18 @@ static bool kq_mask_device_ok(const llama_ubatch & ubatch, const llama_hparams &
     static const uint32_t min_tokens = getenv("LLAMA_KQ_MASK_DEVICE_MIN_TOKENS") ? (uint32_t) std::max(1, atoi(getenv("LLAMA_KQ_MASK_DEVICE_MIN_TOKENS"))) : 64;
     return env && ubatch.n_tokens >= min_tokens && cparams.offload_kqv && !hparams.use_alibi && cparams.n_seq_max <= 64 &&
         (cparams.causal_attn || hparams.non_causal_type != LLAMA_NON_CAUSAL_TYPE_SWA_FULL);
+}
+
+// k19-uma: the largest ubatch whose KV-cached attention keeps the host KQ mask while larger ones build it on the device (0: every ubatch
+// has the same kind of mask). The two kinds differ in graph nodes, so the worst-case pp reservation does not cover the small graphs
+uint32_t llm_graph_kq_mask_host_max_tokens(const llama_hparams & hparams, const llama_cparams & cparams) {
+    llama_ubatch ub = {};
+    ub.n_tokens = std::numeric_limits<uint32_t>::max();
+    if (!kq_mask_device_ok(ub, hparams, cparams)) {
+        return 0;
+    }
+    static const uint32_t min_tokens = getenv("LLAMA_KQ_MASK_DEVICE_MIN_TOKENS") ? (uint32_t) std::max(1, atoi(getenv("LLAMA_KQ_MASK_DEVICE_MIN_TOKENS"))) : 64;
+    return min_tokens - 1;
 }
 
 static ggml_tensor * build_attn_inp_kq_mask(

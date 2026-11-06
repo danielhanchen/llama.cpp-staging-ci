@@ -4264,6 +4264,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         n_small_swaps++;
         ub_reused = true;
     } else {
+        if (n_small == 0) {
+            reserve_small_max(ubatch);
+        }
         gf_res_prev_active = nullptr; // (k11: not an invalidation of the kept small graphs)
         if (n_small > 0) {
             small_plan_free(i_small); // its tensors go now
@@ -8132,6 +8135,9 @@ ggml_cgraph * llama_context::graph_reserve(
 
     ggml_backend_sched_reset(sched.get());
     moe_cache_ids.clear();
+    if (!split_only) {
+        sched_plan_small_max = 0;
+    }
 
     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
     for (auto & res : gf_res_prev) {
@@ -8315,8 +8321,47 @@ bool llama_context::restore_pp_plan(bool idle) {
     return true;
 }
 
+// k19-uma: a ubatch of fewer than LLAMA_KQ_MASK_DEVICE_MIN_TOKENS tokens keeps the host KQ mask (k15-pp), so its graph has other nodes
+// than the worst-case pp reservation (device-built masks) and the scheduler re-plans the graph allocator for it, sized for that ubatch:
+// a later larger small ubatch with the same nodes then did not fit and re-planned again ("unexpected graph reallocation" with
+// GGML_SCHED_DEBUG_REALLOC=1, test-llama-context rf on ROCm0: a 24-token decode after an 8-token one; on CPU the allocator re-plans a
+// single buffer silently). The first such graph after a pp plan reserves the largest host-mask ubatch instead, with every cell, as
+// the pp reservation does: the small ubatches up to it then fit one plan (upstream: one plan fits every ubatch). Only the allocation
+// plan changes, not the computation. The kept small graphs (k11-decode) keep their own plans. LLAMA_SMALL_PLAN_MAX=0: off
+void llama_context::reserve_small_max(const llama_ubatch & ubatch) {
+    static const bool env = getenv("LLAMA_SMALL_PLAN_MAX") == nullptr || atoi(getenv("LLAMA_SMALL_PLAN_MAX")) != 0;
+    if (!env || sched_plan_small_max > 0 || !memory || moe_cache || model.hparams.no_alloc || sched_need_reserve) {
+        return;
+    }
+    const uint32_t n_host = llm_graph_kq_mask_host_max_tokens(model.hparams, cparams);
+    if (n_host == 0 || ubatch.n_tokens > n_host || std::min(cparams.n_ctx, cparams.n_ubatch) <= n_host) {
+        return;
+    }
+    const uint32_t n_seqs_r = (model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_MINIMAX_01) ? 1 : cparams.n_seq_max;
+    const uint32_t n_tokens_r = n_host/n_seqs_r*n_seqs_r;
+    if (n_tokens_r < ubatch.n_tokens) {
+        return;
+    }
+    auto mctx_full = memory->init_full();
+    if (!mctx_full) {
+        return;
+    }
+    if (graph_reserve(n_tokens_r, n_seqs_r, std::min(n_tokens_r, cparams.n_outputs_max), mctx_full.get()) == nullptr) {
+        LLAMA_LOG_WARN("%s: reserving the small graph failed\n", __func__);
+        sched_need_reserve = true;
+        return;
+    }
+    sched_plan_small_max = n_tokens_r;
+    sched_plan_small     = true; // a prompt of several ubatches reserves the pp graph again (restore_pp_plan)
+}
+
 void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
+
+    // k19-uma: a larger graph replaced the plan of the largest host-mask ubatch
+    if (lctx->prefetch_n_tokens > lctx->sched_plan_small_max) {
+        lctx->sched_plan_small_max = 0;
+    }
 
     if (lctx->prefetch_n_tokens <= 2*GF_SMALL_MAX) {
         lctx->sched_plan_small = true;

@@ -112,6 +112,7 @@ struct llm_graph_params;
 // number of rows that see fewer cells than the whole ubatch (a ubatch crossing a multiple of the 256 cell padding)
 int64_t  llm_graph_exact_row_n_kv(const llama_ubatch & ubatch, int64_t i, int64_t n_kv);
 uint32_t llm_graph_exact_split(const llama_ubatch & ubatch);
+uint32_t llm_graph_kq_mask_host_max_tokens(const llama_hparams & hparams, const llama_cparams & cparams); // k19-uma, see the definition
 
 //
 // llm_graph_input
