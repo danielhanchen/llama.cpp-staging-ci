@@ -6293,7 +6293,15 @@ struct llama_moe_cache::impl {
         const int n_warm = cal_robust ? 3 : 1;
         int n_set_log = 0;
         // one sample set: n_warm untimed repetitions, then n_rep timed ones of the three graphs
+        // k19-calib: a set during which other processes kept more than LLAMA_MOE_CPU_MISS_CAL_BUSY_MAX CPUs (0.75) busy is contended (kcal_l4:
+        // every slow-mode set had 1.0-1.5 other CPUs busy, the fast ones at most 0.5): it is retried after a pause, up to 6 more sets
+        static const double busy_max = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_CAL_BUSY_MAX");
+            return e != nullptr ? atof(e) : 0.75;
+        }();
+        double set_others = -1.0;
         auto sample_set = [&](std::vector<int64_t> & ta, std::vector<int64_t> & tb, std::vector<int64_t> & tt) {
+            set_others = -1.0;
 #if defined(__linux__)
             auto proc_busy = []() {   // (busy, total) jiffies of the whole host
                 long long v[10] = {0};
@@ -6312,7 +6320,8 @@ struct llama_moe_cache::impl {
             };
             rusage ru0 = {}, ru1 = {};
             std::pair<long long, long long> ps0 = {0, 0};
-            if (cal_log) {
+            const bool measure = cal_log || cal_robust;
+            if (measure) {
                 getrusage(RUSAGE_SELF, &ru0);
                 ps0 = proc_busy();
             }
@@ -6335,7 +6344,7 @@ struct llama_moe_cache::impl {
                 }
             }
 #if defined(__linux__)
-            if (cal_log) {
+            if (measure) {
                 const double wall = (double) (ggml_time_us() - tw0);
                 getrusage(RUSAGE_SELF, &ru1);
                 const std::pair<long long, long long> ps1 = proc_busy();
@@ -6344,6 +6353,14 @@ struct llama_moe_cache::impl {
                 const long long d_tot = ps1.second - ps0.second, d_busy = ps1.first - ps0.first;
                 const double ncpu = (double) std::thread::hardware_concurrency();
                 const double host_busy = d_tot > 0 ? ncpu*(double) d_busy/(double) d_tot : -1.0;
+                set_others = host_busy >= 0.0 ? host_busy - cpu_us/std::max(1.0, wall) : -1.0;
+            }
+            if (cal_log) {
+                const double wall = (double) (ggml_time_us() - tw0);
+                const double cpu_us = (ru1.ru_utime.tv_sec - ru0.ru_utime.tv_sec)*1e6 + (ru1.ru_utime.tv_usec - ru0.ru_utime.tv_usec) +
+                                      (ru1.ru_stime.tv_sec - ru0.ru_stime.tv_sec)*1e6 + (ru1.ru_stime.tv_usec - ru0.ru_stime.tv_usec);
+                const double ncpu = (double) std::thread::hardware_concurrency();
+                const double host_busy = set_others >= 0.0 ? set_others + cpu_us/std::max(1.0, wall) : -1.0;
                 std::string sa, sb, st;
                 for (size_t i = 0; i < ta.size(); ++i) {
                     sa += (i ? " " : "") + std::to_string(ta[i]);
@@ -6367,20 +6384,40 @@ struct llama_moe_cache::impl {
         bool ok = false;
         int attempt = 0;
         for (; attempt < 3 && !ok; ++attempt) {
-            double ma = 0.0, mb = 0.0, mt = 0.0, iqr = 0.0;
-            for (int k = 0; k < n_sets_rb; ++k) {
-                if (k > 0) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            double ma = 0.0, mb = 0.0, mt = 0.0, iqr = 0.0;     // over the clean sets
+            double ca = 0.0, cb = 0.0, ct = 0.0, ciqr = 0.0;   // over every set (all contended: these)
+            int n_clean = 0, n_all = 0, n_busy = 0;
+            const int n_extra = cal_robust ? 6 : 0;
+            while (n_clean < n_sets_rb && n_all < n_sets_rb + n_extra && !(n_all >= n_sets_rb && n_busy == 0)) {
+                if (n_all > 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(n_busy > 0 ? 25 : 10));
                 }
                 std::vector<int64_t> ta, tb, tt;
                 if (!sample_set(ta, tb, tt)) {
                     return;
                 }
-                const double a = median(ta), b = median(tb), t = median(tt);
-                ma = k == 0 ? a : std::min(ma, a);
-                mb = k == 0 ? b : std::min(mb, b);
-                mt = k == 0 ? t : std::min(mt, t);
-                iqr = k == 0 ? std::max(rel_iqr(ta), rel_iqr(tb)) : std::min(iqr, std::max(rel_iqr(ta), rel_iqr(tb)));
+                const double a = median(ta), b = median(tb), t = median(tt), q = std::max(rel_iqr(ta), rel_iqr(tb));
+                ca = n_all == 0 ? a : std::min(ca, a);
+                cb = n_all == 0 ? b : std::min(cb, b);
+                ct = n_all == 0 ? t : std::min(ct, t);
+                ciqr = n_all == 0 ? q : std::min(ciqr, q);
+                n_all++;
+                if (cal_robust && set_others > busy_max) {
+                    n_busy++;
+                    continue;
+                }
+                ma = n_clean == 0 ? a : std::min(ma, a);
+                mb = n_clean == 0 ? b : std::min(mb, b);
+                mt = n_clean == 0 ? t : std::min(mt, t);
+                iqr = n_clean == 0 ? q : std::min(iqr, q);
+                n_clean++;
+            }
+            if (n_clean == 0) {
+                ma = ca; mb = cb; mt = ct; iqr = ciqr;
+            }
+            if (cal_log && n_busy > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: CPU-miss calibration: %d of %d sets contended (other processes above %.2f busy CPUs), %d clean\n",
+                    tag, n_busy, n_all, busy_max, n_clean);
             }
             d_a = ma;
             d_b = mb;
@@ -6475,7 +6512,10 @@ struct llama_moe_cache::impl {
             double spread = 0.0;
             const bool noisy = cm_cal_noisy(t1s, iqr, cm_cal_max_spread(), spread);
             const double t1w = med(t1s), dtw = med(dts), daw = med(das);
-            double v[4] = { t1w, dtw, std::max(median(tu)/ka, 0.05), std::max(0.0, daw - ka*t1w) + 2.0*median(trt) };
+            // k19-calib: robust: the file keeps the faster of the start-up and the re-calibration per quantity (as this launch does below),
+            // so one slow draw of either does not decide every later launch on this host
+            const double t1p = cal_robust ? std::min(t1w, cm_t1) : t1w, dtp = cal_robust ? std::min(dtw, cm_dt) : dtw;
+            double v[4] = { t1p, dtp, std::max(median(tu)/ka, 0.05), std::max(0.0, daw - ka*t1w) + 2.0*median(trt) };
             cm_persist_pending = false;
             if (noisy) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: calibration not kept, the host timings spread %.0f%% (above %.0f%%, "
