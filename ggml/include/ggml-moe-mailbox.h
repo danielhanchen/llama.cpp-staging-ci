@@ -26,7 +26,9 @@ struct ggml_moe_mailbox_hdr {
     uint32_t busy;      uint32_t pad5[31]; // host -> device: nonzero while the host thread computes a batch of any mailbox
     // k19-overlap GGML_MOE_MAILBOX_TIMING=1 (diagnostic, off by default): running sums the device stores here (plain stores, never
     // read back by it): [0] batches, [1] ns from the end of the publish to the merge's start (the device work beside the host),
-    // [2] ns the merge waited for the host, [3] batches whose merge waited over 2 us, [4] ns from the publish to the end of the wait
+    // [2] ns the merge waited for the host, [3] batches whose merge waited over 2 us, [4] ns from the publish to the end of the wait,
+    // [5] ns from the host's completion stamp ([7], host CLOCK_REALTIME) to the end of the wait; [6] the publish's globaltimer stamp,
+    // stored before the request (the host reads it at the pickup); [7] the host's CLOCK_REALTIME stamp, stored before completed
     uint64_t tm[8];     uint64_t pad6[8];
 };
 
@@ -37,8 +39,8 @@ struct ggml_moe_mailbox_ctl {
     uint32_t failed;  // a merge gave up
     uint32_t pad0;
     uint64_t t_pub;   // k19-overlap GGML_MOE_MAILBOX_TIMING: globaltimer at the end of the last publish with host rows
-    uint64_t sums[5]; // k19-overlap GGML_MOE_MAILBOX_TIMING: the sums of ggml_moe_mailbox_hdr::tm, kept here and stored there
-    uint32_t pad[48];
+    uint64_t sums[6]; // k19-overlap GGML_MOE_MAILBOX_TIMING: the sums of ggml_moe_mailbox_hdr::tm, kept here and stored there
+    uint32_t pad[46];
 };
 
 GGML_MOE_MAILBOX_FN size_t ggml_moe_mailbox_align(size_t n) {

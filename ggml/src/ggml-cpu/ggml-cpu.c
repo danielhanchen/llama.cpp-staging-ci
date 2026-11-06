@@ -1587,7 +1587,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 // activations itself (no barrier), computes its share of the up and gate rows (shares of equal weight: a row counts once per pair it serves), waits at the one barrier, then forms the SwiGLU rows
 // (and their quantization) of the pairs its down rows need and computes those down rows. Each output is the same vec_dot (or, for an
 // expert routed to 2+ rows, the same multi-column kernel, bit-identical to vec_dot per column) of the same quantized rows as in the graph,
-// so the result is the graph's bit for bit. Rows of id -1 are 0, as the graph writes them.
+// so the result is the graph's bit for bit. Rows of id -1 are left as they are (k19-overlap; GGML_MOE_HOST_LEAN=0: 0, as the graph
+// writes them): the mailbox merge reads only the host rows.
 // false (not handled: no OpenMP, a type or layout the path does not take, the tiled kernels forced): the caller computes the graph.
 #define GGML_MOE_HOST_MAX_PAIRS 256
 #define GGML_MOE_HOST_COLS      8
@@ -2018,12 +2019,15 @@ static bool ggml_moe_host_ffn_impl(const struct ggml_tensor * up, const struct g
         return false;
     }
 
-    // k19-overlap GGML_MOE_HOST_LEAN (bits, default 0): 1 = rows of id -1 are not written (the mailbox merge reads only the host rows),
-    // 2 = the gate activations reuse the up activations' quantized bytes when both have the same vec_dot type (the same bytes)
+    // k19-overlap GGML_MOE_HOST_LEAN (bits, default 3; 0 = the k18 form): 1 = rows of id -1 are not written (the mailbox merge reads
+    // only the host rows; the k18 form zeroed up to 7 of every 8 rows of the mapped mailbox on the calling thread before the region),
+    // 2 = the gate activations reuse the up activations' quantized bytes when both have the same vec_dot type (the same bytes). Every
+    // host row keeps its bytes. Colab G4 Flash-Next UD-IQ4_XS 24 / 32 GB (ov_r1): 106 -> 88 us per 3-row host batch, decode +0.5..+3.3%,
+    // md5 equal in all 8 cells
     static int lean = -1;
     if (lean < 0) {
         const char * el = getenv("GGML_MOE_HOST_LEAN");
-        lean = el != NULL ? atoi(el) : 0;
+        lean = el != NULL ? atoi(el) : 3;
     }
 
     // the pairs (slot j of token t) with a host expert, tokens outer and slots inner (the order of the graph's row mapping), grouped

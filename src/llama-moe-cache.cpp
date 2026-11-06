@@ -2139,6 +2139,9 @@ struct llama_moe_cache::impl {
         uint32_t done = 0;
         int64_t  h_us = 0; // k19-overlap GGML_MOE_MAILBOX_TIMING: host time of this mailbox's batches
         int64_t  h_n  = 0;
+        int64_t  h_pick_ns = 0; // sum of (host CLOCK_REALTIME at the pickup - the publish's globaltimer stamp)
+        int64_t  h_pick_n  = 0;
+        int64_t  h_pick_neg = 0; // pickups stamped before the publish (the clocks disagree)
         single_plan plans[GGML_MOE_MAILBOX_MAX_TOKENS + 1];
     };
     // LLAMA_MOE_SINGLE unset: on where it was tested (k11 round 16): CUDA (the backend has mapped mailboxes: not HIP / MUSA), one GPU
@@ -2215,6 +2218,10 @@ struct llama_moe_cache::impl {
         static single_hub_t h;
         return h;
     }
+    static int64_t single_rt_ns() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
     static int64_t single_now_us() {
         return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     }
@@ -2515,9 +2522,11 @@ struct llama_moe_cache::impl {
         if (e == nullptr || atoi(e) == 0) {
             return;
         }
-        double t[5] = { 0, 0, 0, 0, 0 };
+        double t[6] = { 0, 0, 0, 0, 0, 0 };
         int64_t hn = 0;
         int64_t hus = 0;
+        double  pick = 0;
+        int64_t pick_n = 0, pick_neg = 0;
         std::string bands;
         double b[5] = { 0, 0, 0, 0, 0 };
         int64_t bhn = 0, bhus = 0;
@@ -2525,10 +2534,13 @@ struct llama_moe_cache::impl {
         for (size_t i = 0; i < mboxes.size(); ++i) {
             if (mboxes[i]) {
                 const volatile uint64_t * tm = ((ggml_moe_mailbox_hdr *) mboxes[i]->host)->tm;
-                for (int k = 0; k < 5; ++k) {
+                for (int k = 0; k < 6; ++k) {
                     t[k] += (double) tm[k];
+                }
+                for (int k = 0; k < 5; ++k) {
                     b[k] += (double) tm[k];
                 }
+                pick += (double) mboxes[i]->h_pick_ns; pick_n += mboxes[i]->h_pick_n; pick_neg += mboxes[i]->h_pick_neg;
                 hn  += mboxes[i]->h_n;  bhn  += mboxes[i]->h_n;
                 hus += mboxes[i]->h_us; bhus += mboxes[i]->h_us;
             }
@@ -2552,6 +2564,9 @@ struct llama_moe_cache::impl {
             "(%.1f%% waited over 2 us; %.1f ms in all), publish to merge end %.1f us, host %.1f us per batch (%" PRId64 " host batches); "
             "by layers device/wait/host us:%s\n", tag, t[0], t[1]/t[0]/1e3, t[2]/t[0]/1e3, 100.0*t[3]/t[0], t[2]/1e6, t[4]/t[0]/1e3,
             hn > 0 ? (double) hus/hn : 0.0, hn, bands.c_str());
+        LLAMA_LOG_INFO("llama_moe_cache%s: GGML_MOE_MAILBOX_TIMING: publish to host pickup %.1f us (%" PRId64 " stamped, %" PRId64 " before the "
+            "publish: clocks apart), host completion to the end of the merge's wait %.1f us (host CLOCK_REALTIME vs device globaltimer)\n", tag,
+            pick_n > 0 ? pick/pick_n/1e3 : 0.0, pick_n, pick_neg, t[5]/t[0]/1e3);
     }
 
     // the plan of n_tokens tokens of a mailbox: the experts of the host ids, reading and writing the mailbox
@@ -2613,6 +2628,17 @@ struct llama_moe_cache::impl {
             bool ok = false;
             const int n_tokens = hdr->n_tokens;
             single_plan * p = nullptr;
+            // k19-overlap GGML_MOE_MAILBOX_TIMING: the pickup against the publish's device stamp (both clocks in ns since the epoch)
+            static const bool tm_on = [] { const char * e = getenv("GGML_MOE_MAILBOX_TIMING"); return e != nullptr && atoi(e) != 0; }();
+            if (tm_on) {
+                const int64_t d = single_rt_ns() - (int64_t) ((volatile uint64_t *) hdr->tm)[6];
+                if (d < 0) {
+                    mb.h_pick_neg++;
+                } else {
+                    mb.h_pick_ns += d;
+                    mb.h_pick_n++;
+                }
+            }
             // picked up: the merge on the device waits for this batch without a timeout from now on (see moe_mailbox_merge)
             llama_mb_store_rel(&hdr->started, req);
             if (!single_failed.load(std::memory_order_relaxed) && n_tokens >= 1 && n_tokens <= GGML_MOE_MAILBOX_MAX_TOKENS &&
@@ -2662,6 +2688,9 @@ struct llama_moe_cache::impl {
             }
             single_batches++;
             mb.done = req;
+            if (tm_on) {
+                ((volatile uint64_t *) hdr->tm)[7] = (uint64_t) single_rt_ns();
+            }
             llama_mb_store_rel(&hdr->completed, req);
         }
         return work;

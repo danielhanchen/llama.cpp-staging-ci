@@ -904,6 +904,9 @@ static __global__ void moe_mailbox_publish(const int32_t * hid, const int n_ids,
         ctl->seq     = seq;
         ctl->pending = 1;
         dst[0]       = 1;
+        if (timing) {
+            ((volatile uint64_t *) hdr->tm)[6] = moe_mailbox_ns();
+        }
         moe_mailbox_store_release(&hdr->request, seq);
         if (timing) {
             ctl->t_pub = moe_mailbox_ns();
@@ -970,7 +973,9 @@ static __global__ void moe_mailbox_merge(const float * d, const int32_t * hid, c
                     ctl->sums[3] += wait > 2000;
                     ctl->sums[4] += dev + wait;
                     volatile uint64_t * tm = hdr->tm;
-                    for (int k = 0; k < 5; ++k) {
+                    const uint64_t t_host = tm[7];
+                    ctl->sums[5] += t_out > t_host ? t_out - t_host : 0;
+                    for (int k = 0; k < 6; ++k) {
                         tm[k] = ctl->sums[k];
                     }
                 }
