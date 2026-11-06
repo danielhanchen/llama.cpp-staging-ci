@@ -2087,6 +2087,15 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
 }
 
+// k19-specpass (LLAMA_SPEC_ROW_GRAPH=0: off): see get_rs_alias and llama_context::process_ubatch's kept-graph choice
+bool llama_spec_row_graph_env() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_SPEC_ROW_GRAPH");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return v;
+}
+
 int32_t llama_memory_recurrent_context::get_rs_alias(const llama_ubatch & ubatch) const {
     static const bool enabled = [] {
         const char * env = getenv("LLAMA_RS_ALIAS");
@@ -2119,6 +2128,15 @@ int32_t llama_memory_recurrent_context::get_rs_alias(const llama_ubatch & ubatch
             if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
                 idx = mem->rs_idx[seq];
             }
+        }
+
+        // k19-specpass: a state left in a rollback row by a verify (idx = accepted drafts) is gathered (s_copy), not read in place:
+        // the in-place row is part of the graph, so a single-token decode after a verify that kept another row than the last time
+        // rebuilt its graph and re-captured its CUDA graph (G4 Flash-Next: 1-row target passes 13.6-15.5 ms after verifies vs 8.3 in a
+        // row). The gather copies the same state (exact); it also returns the state to row 0 (s_copy clears idx), so the following
+        // single-token decodes read in place again. LLAMA_SPEC_ROW_GRAPH=0: read in place from any row, as before
+        if (idx != 0 && llama_spec_row_graph_env()) {
+            return -1;
         }
 
         const int32_t val = (int32_t)(idx * mem->size) + cell.src0;

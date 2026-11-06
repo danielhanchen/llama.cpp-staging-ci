@@ -14,6 +14,9 @@
 // llama_memory_recurrent
 //
 
+// k19-specpass: LLAMA_SPEC_ROW_GRAPH (default on): single-token decodes keep one graph across verifies (see get_rs_alias)
+bool llama_spec_row_graph_env();
+
 // TODO: extract the cache state used for graph computation into llama_memory_recurrent_context_i
 //       see the implementation of llama_kv_cache_context_i for an example how to do it
 class llama_memory_recurrent : public llama_memory_i {
