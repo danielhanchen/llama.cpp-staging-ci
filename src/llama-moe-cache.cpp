@@ -5449,12 +5449,11 @@ struct llama_moe_cache::impl {
 
     // the layer can use the hybrid lookup for a ubatch of this size
     bool hybrid_layer(int32_t il, int64_t n_ubatch) const {
-        if (force_large || !(hybrid || overlap_batch(n_ubatch) || overlap_small_batch(n_ubatch)) || il < 0 || il >= (int32_t) layers.size() ||
-                layers[il].ig < 0) {
+        if (force_large || !(hybrid || overlap_batch(n_ubatch)) || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return false;
         }
-        // CPU misses off for this batch size: the graph of k9 (plain lookup, or the fetch overlap of single tokens / small batches)
-        if (cm && cm_share_of(n_ubatch) >= 1.0f && !overlap_batch(n_ubatch) && !overlap_small_batch(n_ubatch)) {
+        // CPU misses off for this batch size: the graph of k9 (plain lookup, or the fetch overlap of single tokens)
+        if (cm && cm_share_of(n_ubatch) >= 1.0f && !overlap_batch(n_ubatch)) {
             return false;
         }
         const group & g = groups[layers[il].ig];
@@ -5714,14 +5713,18 @@ struct llama_moe_cache::impl {
         return overlap && ov_live && n_ubatch == 1;
     }
 
-    // k19-overlap LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL=N (2..GGML_MOE_MAILBOX_MAX_TOKENS; default 1 = off): ubatches of 2..N tokens take the
-    // fetch overlap of single tokens: the copies of the admitted experts run on a side stream beside the hits (cached before the lookup),
-    // then the admitted experts are computed. Every (token, slot) entry is computed once by the multi-token mmvq kernels, which give each
-    // entry its own sums, so the output is the one of the serial fetch. Independent of the single-token rule (ov_live)
+    // k19-overlap LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL=N (1..GGML_MOE_MAILBOX_MAX_TOKENS; default 4, 1 = off): ubatches of 2..N tokens that
+    // take the hybrid path (the CPU-miss rule has the host path on for them, see hybrid_layer) copy their admitted experts on the side
+    // stream beside the hits (cached before the lookup), then compute the admitted experts, as single tokens do. Every (token, slot) entry
+    // is computed once by the multi-token mmvq kernels, which give each entry its own sums, so the output is the serial fetch's.
+    // Independent of the single-token rule (ov_live). Colab G4 Flash-Next UD-IQ4_XS MTP n2 (3-row windows; ov_r2, md5 equal): 32 GB
+    // chat / 8k +5.1 / +5.8%, 24 GB +2.9 / +4.0% (device beside the host 100 -> 83 us per layer). DFlash2 7-row windows (N = 8): 32 GB
+    // +3.6 / +5.9% but 24 GB -2.5 / -3.6%, so the default stops at 4. Ubatches whose host path is off (48 GB) keep the plain lookup:
+    // taking the hybrid lookup there for the overlap changed the text (ov_r2), so hybrid_layer does not widen for it
     bool overlap_small_batch(int64_t n_ubatch) const {
         static const int64_t mx = [] {
             const char * e = getenv("LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL");
-            return e != nullptr ? std::max<int64_t>(1, std::min<int64_t>(GGML_MOE_MAILBOX_MAX_TOKENS, atoll(e))) : (int64_t) 1;
+            return e != nullptr ? std::max<int64_t>(1, std::min<int64_t>(GGML_MOE_MAILBOX_MAX_TOKENS, atoll(e))) : (int64_t) 4;
         }();
         return overlap && n_ubatch > 1 && n_ubatch <= mx;
     }
