@@ -60,6 +60,7 @@ static std::atomic<int> g_big_captures{0};
 static std::atomic<int> g_rebuilds{0}; // kept graphs not reused (LLAMA_GRAPH_SMALL_WHY=N)
 static std::atomic<int> g_invalid{0};  // kept graphs invalidated (LLAMA_GRAPH_SMALL_WHY=N)
 static int g_big_nodes = 1000;
+static const bool g_log_all = getenv("VG_LOG_ALL") != nullptr; // k19-vwidth: every log line
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
     const char * p = strstr(text, "CUDA graph capture ");
@@ -77,7 +78,7 @@ static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
         g_invalid++;
     }
     if (level >= GGML_LOG_LEVEL_WARN || p || strstr(text, "changed at node") || strstr(text, "n_kv buckets") ||
-            strstr(text, "not reused") || strstr(text, "invalidated")) {
+            strstr(text, "not reused") || strstr(text, "invalidated") || strstr(text, "k19-vwidth") || g_log_all) {
         fputs(text, stderr);
     }
 }
@@ -143,6 +144,9 @@ int main(int argc, char ** argv) {
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int n_vocab = llama_vocab_n_tokens(vocab);
+    // k19-vwidth: small vocabularies (the tiny test models) draw their tokens from the whole vocabulary
+    const int      tok_lo  = n_vocab > 60000 ? 1000 : 0;
+    const uint64_t tok_rnd = (uint64_t) std::max(1, std::min(50000, n_vocab - tok_lo));
     const int n_batch = llama_n_batch(ctx);
 
     std::vector<int> lens;
@@ -166,7 +170,7 @@ int main(int argc, char ** argv) {
         // the prompt: synthetic ids away from the special tokens
         std::vector<llama_token> prompt(L);
         for (int i = 0; i < L; ++i) {
-            prompt[i] = (llama_token) (1000 + rng_next(rs) % (uint64_t) std::max(1, std::min(n_vocab, 150000) - 2000));
+            prompt[i] = (llama_token) (tok_lo + rng_next(rs) % (uint64_t) std::max(1, n_vocab > 60000 ? std::min(n_vocab, 150000) - 2000 : n_vocab));
         }
         llama_memory_clear(llama_get_memory(ctx), true);
         llama_batch batch = llama_batch_init(std::max(n_batch, 16), 0, 1);
@@ -208,7 +212,7 @@ int main(int argc, char ** argv) {
                 req++;
                 batch.n_tokens = 0;
                 for (int i = 0; i < n_turn; ++i) {
-                    batch_add(batch, (llama_token) (1000 + rng_next(rs) % 50000), P + i, i == n_turn - 1);
+                    batch_add(batch, (llama_token) (tok_lo + rng_next(rs) % tok_rnd), P + i, i == n_turn - 1);
                 }
                 const int64_t tt0 = ggml_time_us();
                 if (llama_decode(ctx, batch) != 0) {
@@ -235,7 +239,7 @@ int main(int argc, char ** argv) {
             const int a = fixed > 0 ? w - 1 : (int) (rng_next(rs) % (uint64_t) w); // accepted drafts
             batch.n_tokens = 0;
             for (int i = 0; i < w; ++i) {
-                const llama_token t = i == 0 ? cur : (llama_token) (1000 + rng_next(rs) % 50000);
+                const llama_token t = i == 0 ? cur : (llama_token) (tok_lo + rng_next(rs) % tok_rnd);
                 batch_add(batch, t, P + i, true);
             }
             const int64_t t0 = ggml_time_us();

@@ -93,6 +93,96 @@ static uint64_t tpp_gguf_bytes(const std::string & path) {
     return ec ? 0 : (uint64_t) b;
 }
 
+// k19-vwidth (LLAMA_SPEC_PREWARM=N: widths 1..N, opt-in): a target with a drafter and no MoE cache decodes, at load, a
+// dummy prompt of LLAMA_SPEC_PREWARM_POS (640) tokens, then windows of every width 1..N, LLAMA_SPEC_PREWARM_REPS (10) times each,
+// appended after it (a 1-row decode as a plain decode, wider ones as verify windows, as the server runs them), then forgets them: each
+// width's kept graph (llama_context gf_res_small) is built and its CUDA graph warmed up, captured and launched at least 8 times in the
+// KV bucket of a short request. The prompt matters: graphs built on an empty memory take other branches (no pooled keys: G4 fn4
+// 7570 vs 7613 nodes) and a request could not reuse them. 8 launches keep a CUDA graph through idle time (ggml-cuda evicts the
+// others after 10 s, GGML_CUDA_GRAPH_KEEP) and let a new KV bucket re-capture it directly (GGML_CUDA_GRAPH_DIRECT_RECAPTURE, no eager
+// pass). A width a request uses for the first time (a confidence rule's, or a draft the n_predict limit cut at the end of a request)
+// then replays a captured graph instead of an eager pass plus a capture (~15-20 ms each on G4 Flash-Next). The memory is cleared
+// after; no value of a later request depends on these decodes
+// Opt-in (LLAMA_SPEC_PREWARM=N, up to 8; unset or 0: off): the prewarm built on an empty memory or before the device samplers did not
+// match a request's graphs on G4 (vw_t2a / vw_t4: prewarm on = off within noise); this version (after the samplers, after a prompt)
+// was not measured on a GPU yet, so it costs no default load time until it is
+// (widths up to the outputs the context takes per sequence, the server's widest window)
+// (the graphs carry the slot's device sampler: each chain of `chains` is swapped in for its own windows, raw logits off as for a request
+// it serves; `restore` / `restore_raw` are put back after. No chain: the windows run once with the context's sampler state)
+static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max, const std::vector<llama_sampler *> & chains,
+        llama_sampler * restore, bool restore_raw) {
+    const char * e = getenv("LLAMA_SPEC_PREWARM");
+    GGML_UNUSED(gpu);
+    int w_max = e != nullptr ? std::max(0, std::min(8, atoi(e))) : 0;
+    if (n_out_max > 0) {
+        w_max = std::min(w_max, (int) n_out_max);
+    }
+    static const int reps  = getenv("LLAMA_SPEC_PREWARM_REPS") ? std::max(2, atoi(getenv("LLAMA_SPEC_PREWARM_REPS"))) : 9;
+    static const int n_pre = getenv("LLAMA_SPEC_PREWARM_POS")  ? std::max(0, atoi(getenv("LLAMA_SPEC_PREWARM_POS")))  : 640;
+    const int n_chain = std::max<int>(1, (int) chains.size());
+    const int n_end = n_pre + n_chain*reps*w_max*(w_max + 1)/2;
+    if (w_max <= 0 || ctx == nullptr || llama_moe_cache_active(ctx) || llama_n_batch(ctx) < (uint32_t) std::max(w_max, std::min(n_pre, 1)) ||
+            (int) llama_n_ctx_seq(ctx) < n_end + 64) {
+        return;
+    }
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const llama_token   tok   = llama_vocab_bos(vocab) != LLAMA_TOKEN_NULL ? llama_vocab_bos(vocab) : 0;
+    llama_memory_t mem = llama_get_memory(ctx);
+    const int64_t t0 = ggml_time_us();
+    const int n_b = std::max(w_max, (int) std::min<uint32_t>(llama_n_batch(ctx), (uint32_t) std::max(n_pre, 1)));
+    llama_batch b = llama_batch_init(n_b, 0, 1);
+    llama_pos pos = 0;
+    bool ok = true;
+    auto add = [&](int n, bool all_out) {
+        b.n_tokens = n;
+        for (int i = 0; i < n; ++i) {
+            b.token[i]     = tok;
+            b.pos[i]       = pos + i;
+            b.n_seq_id[i]  = 1;
+            b.seq_id[i][0] = 0;
+            b.logits[i]    = all_out || i == n - 1;
+        }
+        pos += n;
+    };
+    llama_set_verify(ctx, false);
+    for (int done = 0; done < n_pre && ok; ) {
+        const int n = std::min(n_b, n_pre - done);
+        add(n, false);
+        ok = llama_decode(ctx, b) == 0;
+        done += n;
+    }
+    int n_ok = 0;
+    for (int c = 0; c < n_chain && ok; ++c) {
+        if (!chains.empty()) {
+            ok = llama_set_sampler_swap(ctx, 0, chains[c]);
+            llama_set_sampler_raw_logits(ctx, 0, false);
+        }
+        n_ok = 0;
+        for (int w = 1; w <= w_max && ok; ++w) {
+            for (int rep = 0; rep < reps && ok; ++rep) {
+                add(w, true);
+                llama_set_verify(ctx, w > 1);
+                ok = llama_decode(ctx, b) == 0;
+                llama_synchronize(ctx);
+            }
+            n_ok += ok;
+        }
+    }
+    if (!ok) {
+        SRV_WRN("k19-vwidth: verify graph prewarm stopped at %d rows (a decode or sampler swap failed)\n", n_ok + 1);
+    }
+    if (!chains.empty()) {
+        llama_set_sampler_swap(ctx, 0, restore);
+        llama_set_sampler_raw_logits(ctx, 0, restore_raw);
+    }
+    llama_set_verify(ctx, false);
+    llama_batch_free(b);
+    llama_memory_clear(mem, true);
+    llama_synchronize(ctx);
+    SRV_INF("k19-vwidth: the decode / verify graphs of 1..%d rows warmed up after a %d-token prompt, %d decodes each, %d sampler chain(s) (%.1f ms; LLAMA_SPEC_PREWARM, opt-in)\n",
+            n_ok, n_pre, reps, (int) chains.size(), (ggml_time_us() - t0)/1000.0);
+}
+
 static bool spec_replay_reverify() {
     static const bool v = getenv("LLAMA_SPEC_REPLAY_REVERIFY") != nullptr && atoi(getenv("LLAMA_SPEC_REPLAY_REVERIFY")) != 0;
     return v;
@@ -2340,6 +2430,7 @@ private:
             llama_mtp_draft_lend_warm(ctx_tgt);
         }
 
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
@@ -2426,6 +2517,25 @@ private:
                 }
             }
             SRV_INF("greedy requests are sampled on the device: %s (LLAMA_SERVER_DEVICE_GREEDY=0 to disable)\n", all ? "on" : "off");
+        }
+
+        // k19-vwidth: every verify width's graph captured ahead (server_spec_prewarm), after the slots' device samplers are set: their
+        // nodes are part of the graphs (G4 Flash-Next: 7613 nodes with the greedy chain vs 7570 without), so each chain slot 0 can take
+        // for a request (greedy, masked greedy, top-k) gets its own windows
+        // (a set LLAMA_SPEC_PREWARM also without a draft model, e.g. n-gram drafts in CPU tests)
+        if (spec && (ctx_dft != nullptr || getenv("LLAMA_SPEC_PREWARM") != nullptr) && params_base.warmup && !slots.empty()) {
+            std::vector<llama_sampler *> chains;
+            const auto & s0 = slots[0];
+            if (s0.smpl_dev_set) {
+                for (llama_sampler * c : { s0.smpl_dev.get(), s0.smpl_dev_m.get(), s0.smpl_dev_k.get() }) {
+                    if (c != nullptr) {
+                        chains.push_back(c);
+                    }
+                }
+            }
+            server_spec_prewarm(ctx_tgt, llama_supports_gpu_offload() && params_base.n_gpu_layers != 0,
+                params_base.n_outputs_max_per_seq > 0 ? params_base.n_outputs_max_per_seq : params_base.n_outputs_max,
+                chains, s0.smpl_dev.get(), true);
         }
 
         {
