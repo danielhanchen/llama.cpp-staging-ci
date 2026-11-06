@@ -2271,7 +2271,11 @@ struct llama_moe_cache::impl {
     // the largest batch on the mailbox now: the wide default only where the cache holds at least LLAMA_MOE_SINGLE_WIDE_MIN_FRAC of the
     // host experts (cache_frac is known after the slots are sized; before that the wide default counts)
     int single_max() const {
-        static const double min_frac = getenv("LLAMA_MOE_SINGLE_WIDE_MIN_FRAC") != nullptr ? atof(getenv("LLAMA_MOE_SINGLE_WIDE_MIN_FRAC")) : 0.0;
+        // LLAMA_MOE_SINGLE_WIDE_MIN_FRAC (default 0.20): below it the host expert compute of a 5..8-row batch is the critical path and
+        // the eager split (which overlaps a little device work per layer) is level or better: G4 fn4 16 GB (14.8% cached) chat -0.6%, 8k
+        // -4.5% (same text), 12 GB DFlash2 admitted -4% (prof_1105_small 2d, w7 37-41 -> 47.8 ms); 24 GB (27.5%) +6 / +3.5%, 32 GB (42%)
+        // +6.7%
+        static const double min_frac = getenv("LLAMA_MOE_SINGLE_WIDE_MIN_FRAC") != nullptr ? atof(getenv("LLAMA_MOE_SINGLE_WIDE_MIN_FRAC")) : 0.20;
         return !single_max_env && single_max_tok > 4 && cache_frac >= 0.0 && cache_frac < min_frac ? 4 : single_max_tok;
     }
 
