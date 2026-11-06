@@ -124,13 +124,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         if (const char * e = getenv("LLAMA_KV_BUCKET_DEV_DIV")) {
             bp.dev_div = (uint32_t) std::max(1, atoi(e));
         }
-        // k19-fullcost: at least 16384 cells by default (was 2048): a chat request and an 8k one then share the bucket of the verify graphs
-        // the server prewarmed at load (server_spec_prewarm), so an 8k request replays them instead of re-capturing each width (G4 fn4
-        // full card, fc_r3: width rule over every width 8k 264.9 -> 292.7 tok/s; at a fixed width the extra masked cells cost nothing,
-        // MTP n2 chat / 8k 306.7 / 255.2 -> 307.8 / 257.2 in fc_r1)
-        bp.dev_step_min = 16384;
         if (const char * e = getenv("LLAMA_KV_BUCKET_DEV_STEP_MIN")) {
             bp.dev_step_min = (uint32_t) std::max(256, atoi(e));
+            dev_step_min_env = true;
         }
         get_mem_attn()->set_n_kv_bucket(bp);
         mem_idx->set_n_kv_bucket(bp);
@@ -154,6 +150,17 @@ void llama_memory_hybrid_idx::set_n_kv_bucket_dev_allowed(bool value) {
     get_mem_attn()->set_n_kv_bucket_dev_allowed(value);
     if (mem_idx) {
         mem_idx->set_n_kv_bucket_dev_allowed(value);
+    }
+}
+
+void llama_memory_hybrid_idx::set_n_kv_bucket_dev_wide(bool wide) {
+    if (dev_step_min_env) {
+        return;
+    }
+    const uint32_t v = wide ? 16384 : 2048;
+    get_mem_attn()->set_n_kv_bucket_dev_step_min(v);
+    if (mem_idx) {
+        mem_idx->set_n_kv_bucket_dev_step_min(v);
     }
 }
 

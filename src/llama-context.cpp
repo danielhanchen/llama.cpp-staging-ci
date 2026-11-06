@@ -5100,6 +5100,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         mem_idx->set_n_kv_bucket_allowed(!(llama_exact_verify_env() || cparams.verify_exact));
         // k19-graph: the device KV length is read by flash attention only
         mem_idx->set_n_kv_bucket_dev_allowed(cparams.flash_attn);
+        // k19-fullcost (LLAMA_KV_BUCKET_DEV_STEP_MIN=N overrides): without a MoE cache, device KV buckets of at least 16384 cells (was
+        // 2048), so a chat request and an 8k one share the bucket of the verify graphs the server prewarmed at load
+        // (server_spec_prewarm) and replay them instead of re-capturing each width (G4 fn4 full card, fc_r3: the width rule over every
+        // width 8k 264.9 -> 292.7 tok/s; at a fixed width the extra masked cells cost nothing there, MTP n2 chat / 8k 306.7 / 255.2 ->
+        // 307.8 / 257.2 in fc_r1). Beside a MoE cache (no prewarm there) the 2048-cell step stays: fc_r4 16 / 32 GB were 2-4% slower
+        // with 16384 (host input fill beside the host's expert work)
+        mem_idx->set_n_kv_bucket_dev_wide(moe_cache == nullptr);
     }
 
     // k19-placemid (LLAMA_MOE_PLACE8_CHUNK_MAX=N; default 64 on a mid-size device, 0 = off, at 8 GB opt-in): a short prompt of at most N
