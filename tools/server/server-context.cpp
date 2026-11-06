@@ -93,7 +93,7 @@ static uint64_t tpp_gguf_bytes(const std::string & path) {
     return ec ? 0 : (uint64_t) b;
 }
 
-// k19-vwidth (LLAMA_SPEC_PREWARM=0: off, =N: widths 1..N, default 8): a target with a drafter and no MoE cache decodes, at load, a
+// k19-vwidth (LLAMA_SPEC_PREWARM=N: widths 1..N, opt-in): a target with a drafter and no MoE cache decodes, at load, a
 // dummy prompt of LLAMA_SPEC_PREWARM_POS (640) tokens, then windows of every width 1..N, LLAMA_SPEC_PREWARM_REPS (10) times each,
 // appended after it (a 1-row decode as a plain decode, wider ones as verify windows, as the server runs them), then forgets them: each
 // width's kept graph (llama_context gf_res_small) is built and its CUDA graph warmed up, captured and launched at least 8 times in the
@@ -103,14 +103,17 @@ static uint64_t tpp_gguf_bytes(const std::string & path) {
 // pass). A width a request uses for the first time (a confidence rule's, or a draft the n_predict limit cut at the end of a request)
 // then replays a captured graph instead of an eager pass plus a capture (~15-20 ms each on G4 Flash-Next). The memory is cleared
 // after; no value of a later request depends on these decodes
-// (by default only where the target offloads to a GPU; a set LLAMA_SPEC_PREWARM=N runs it anywhere, e.g. CPU tests)
+// Opt-in (LLAMA_SPEC_PREWARM=N, up to 8; unset or 0: off): the prewarm built on an empty memory or before the device samplers did not
+// match a request's graphs on G4 (vw_t2a / vw_t4: prewarm on = off within noise); this version (after the samplers, after a prompt)
+// was not measured on a GPU yet, so it costs no default load time until it is
 // (widths up to the outputs the context takes per sequence, the server's widest window)
 // (the graphs carry the slot's device sampler: each chain of `chains` is swapped in for its own windows, raw logits off as for a request
 // it serves; `restore` / `restore_raw` are put back after. No chain: the windows run once with the context's sampler state)
 static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max, const std::vector<llama_sampler *> & chains,
         llama_sampler * restore, bool restore_raw) {
     const char * e = getenv("LLAMA_SPEC_PREWARM");
-    int w_max = e != nullptr ? std::max(0, std::min(8, atoi(e))) : gpu ? 8 : 0;
+    GGML_UNUSED(gpu);
+    int w_max = e != nullptr ? std::max(0, std::min(8, atoi(e))) : 0;
     if (n_out_max > 0) {
         w_max = std::min(w_max, (int) n_out_max);
     }
@@ -176,7 +179,7 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     llama_batch_free(b);
     llama_memory_clear(mem, true);
     llama_synchronize(ctx);
-    SRV_INF("k19-vwidth: the decode / verify graphs of 1..%d rows warmed up after a %d-token prompt, %d decodes each, %d sampler chain(s) (%.1f ms; LLAMA_SPEC_PREWARM=0 off)\n",
+    SRV_INF("k19-vwidth: the decode / verify graphs of 1..%d rows warmed up after a %d-token prompt, %d decodes each, %d sampler chain(s) (%.1f ms; LLAMA_SPEC_PREWARM, opt-in)\n",
             n_ok, n_pre, reps, (int) chains.size(), (ggml_time_us() - t0)/1000.0);
 }
 
