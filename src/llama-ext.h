@@ -220,6 +220,8 @@ LLAMA_API bool llama_verify_exact_placement(const struct llama_context * ctx);
 LLAMA_API int32_t llama_verify_device_max_tokens(const struct llama_context * ctx);
 // k19-df2pp: the tokens whose experts the MoE cache's device slots hold at once (llama_moe_cache::n_tokens_cached, at most 32), -1 without a cache
 LLAMA_API int32_t llama_moe_cache_tokens(const struct llama_context * ctx);
+// k19-df2cost: the cached share of the MoE cache's host expert bytes (0..1), -1 without a cache or before its slots are sized
+LLAMA_API double llama_moe_cache_frac(const struct llama_context * ctx);
 
 // k15-ttft: a prompt run as one ubatch instead of [n-4] [4] differs from the split run only by IEEE reassociation (plans/k11.md
 // "Equivalence rule"): every layer weight is computed on a CUDA device with no host-computed expert (llama_verify_exact_placement and

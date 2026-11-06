@@ -1285,6 +1285,13 @@ static int64_t common_model_n_layer(const std::string & path, std::vector<uint8_
 // lend_*: the group of layers with the same expert sizes that holds the most expert bytes (the MoE cache splits its budget between such
 // groups by their host bytes and lends a graph allocation from a bank tail of its largest group, see llama_moe_cache lend): its slot,
 // its largest tensor per expert and its share of the expert bytes of the model
+// k19-df2cost: the DFlash2 cached window band's upper cached share (common/speculative.cpp) and the device memory it keeps for its second width
+#ifndef K19_DF2COST_FRAC_MAX
+#define K19_DF2COST_FRAC_MAX 0.5
+#endif
+#ifndef K19_DF2COST_RESERVE_MIB
+#define K19_DF2COST_RESERVE_MIB 512
+#endif
 struct common_moe_slot_bytes { int64_t n_expert = 0; int64_t sum = 0; int64_t max = 0; int64_t total = 0; int64_t n_layer = 0; int64_t n_used = 0;
     int64_t lend_sum = 0; int64_t lend_max = 0; double lend_share = 1.0; };
 static bool common_moe_slot_bytes_of(const std::string & path, common_moe_slot_bytes & out) {
@@ -3673,6 +3680,32 @@ uma_restart:
             __func__, cparams.moe_cache_size/(1024*1024), moe_margin_gain/(1024*1024));
     } else {
         moe_margin_gain = 0;
+    }
+
+    // k19-df2cost: where the DFlash2 cached window band engages (a DFlash drafter, the cache holding LLAMA_DFLASH_CACHED_FRAC_MIN ..
+    // LLAMA_DFLASH_CACHED_FRAC_MAX of the host experts, see common/speculative.cpp) the target keeps the verify graphs of two widths
+    // (3 rows and the whole draft) and their CUDA graphs, which the fit did not price: G4 Qwen3.8-Flash-Next UD-IQ4_XS 32 GB, srv_kld long48
+    // aborted with CUDA out of memory after a 2096-token prompt. The cache leaves LLAMA_DFLASH_CACHED_RESERVE_MIB (K19_DF2COST_RESERVE_MIB)
+    // of device memory for them (0: none)
+    if (!model_only && cparams.moe_cache_size > 0 && cparams.moe_cache_size < COMMON_MOE_CACHE_AUTO_BYTES &&
+            std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end()) {
+        const char * ew  = getenv("LLAMA_DFLASH_WINDOW");
+        const char * ecw = getenv("LLAMA_DFLASH_CACHED_WINDOW");
+        const double lo  = getenv("LLAMA_DFLASH_CACHED_FRAC_MIN") ? atof(getenv("LLAMA_DFLASH_CACHED_FRAC_MIN")) : 0.20;
+        const double hi  = getenv("LLAMA_DFLASH_CACHED_FRAC_MAX") ? atof(getenv("LLAMA_DFLASH_CACHED_FRAC_MAX")) : K19_DF2COST_FRAC_MAX;
+        const int64_t rs = (getenv("LLAMA_DFLASH_CACHED_RESERVE_MIB") ? std::max<int64_t>(0, atoll(getenv("LLAMA_DFLASH_CACHED_RESERVE_MIB"))) :
+            (int64_t) K19_DF2COST_RESERVE_MIB)*1024*1024;
+        common_moe_slot_bytes sbt;
+        if ((ew == nullptr || atoi(ew) != 0) && (ecw == nullptr || atoi(ecw) != 0) && rs > 0 && hi > lo &&
+                common_moe_slot_bytes_of(params.model.path, sbt) && sbt.total > 0) {
+            const double share = (double) cparams.moe_cache_size/(double) sbt.total;
+            if (share >= lo && share < hi && (int64_t) cparams.moe_cache_size > 2*rs) {
+                cparams.moe_cache_size -= (size_t) rs;
+                params.moe_cache_size   = cparams.moe_cache_size;
+                COM_INF("%s: MoE cache %zu MiB: -%" PRId64 " MiB for the DFlash2 cached window's second verify width (%.1f%% of the host "
+                    "experts cached; LLAMA_DFLASH_CACHED_RESERVE_MIB)\n", __func__, cparams.moe_cache_size/(1024*1024), rs/(1024*1024), 100.0*share);
+            }
+        }
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
