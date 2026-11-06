@@ -192,8 +192,8 @@ struct llama_context {
     void set_verify(bool value);
     void set_verify_exact(bool value);
     bool get_verify_exact() const; // k17-strict
-    bool restore_pp_plan(bool idle = false);
-    void reserve_small_max(const llama_ubatch & ubatch); // k19-uma (see the definition) // k11-decode (see the definition); idle: from llama_prepare_prompt_plan
+    bool restore_pp_plan(bool idle = false); // k11-decode (see the definition); idle: from llama_prepare_prompt_plan
+    void reserve_small_max(const llama_ubatch & ubatch); // k19-uma (see the definition)
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
 
@@ -660,8 +660,8 @@ private:
     // k11-decode: the graph allocator was re-planned for a small graph (a decode step or a verify window) since the worst-case pp
     // reservation: the next prompt reserves the pp graph again before its first ubatch (LLAMA_PP_RERESERVE=0: off)
     bool sched_plan_small = false;
-    // k19-uma: the graph allocator holds the plan of the largest host-KQ-mask ubatch (see reserve_small_max), up to this many tokens
-    uint32_t sched_plan_small_max = 0;
+    // k19-uma: the graph allocator holds the plan of a small host-KQ-mask graph of this many tokens (0: another plan; see reserve_small_max)
+    uint32_t sched_plan_small_tokens = 0;
     int64_t n_pp_rereserve = 0;
     int32_t n_reallocs_diff = 0;
 
