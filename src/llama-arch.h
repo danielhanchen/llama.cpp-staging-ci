@@ -830,6 +830,7 @@ struct LLM_KV {
 
     llm_arch arch;
     const char * suffix;
+    std::string prefix; // k19-agn: the file's own arch name when it is an alias (llm_arch_from_string), "" = LLM_ARCH_NAMES
 
     std::string operator()(llm_kv kv) const;
 };

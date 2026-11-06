@@ -3,6 +3,7 @@
 
 #include "llama-impl.h"
 
+#include <cstdlib>
 #include <map>
 #include <vector>
 
@@ -1156,7 +1157,7 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}
 
 std::string LLM_KV::operator()(llm_kv kv) const {
-    std::string name = ::format(LLM_KV_NAMES.at(kv), LLM_ARCH_NAMES.at(arch));
+    std::string name = ::format(LLM_KV_NAMES.at(kv), prefix.empty() ? LLM_ARCH_NAMES.at(arch) : prefix.c_str());
 
     if (suffix != nullptr) {
         name += ".";
@@ -1205,6 +1206,12 @@ llm_arch llm_arch_from_string(const std::string & name) {
         if (kv.second == name) {
             return kv.first;
         }
+    }
+    // k19-agn: GLM 5.3 Flash GGUFs made before the mainline rename (unsloth/GLM-5.3-Flash-GGUF shard 1 before its Shard_Rewrite,
+    // PolyStrata's pinned revision) name the arch and its keys glm5next (LLAMA_ARCH_ALIAS=0: refused as before)
+    static const bool alias_on = getenv("LLAMA_ARCH_ALIAS") == nullptr || atoi(getenv("LLAMA_ARCH_ALIAS")) != 0;
+    if (alias_on && name == "glm5next") {
+        return LLM_ARCH_GLM5_NEXT;
     }
 
     return LLM_ARCH_UNKNOWN;

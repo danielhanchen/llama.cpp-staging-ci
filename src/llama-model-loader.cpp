@@ -616,6 +616,9 @@ llama_model_loader::llama_model_loader(
 
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+        if (llm_kv.arch != LLM_ARCH_UNKNOWN && arch_name != llm_arch_name(llm_kv.arch)) {
+            llm_kv.prefix = arch_name; // k19-agn: an alias arch name (glm5next): its keys keep the file's prefix
+        }
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
         file_paths.emplace_back(fname);
@@ -737,6 +740,9 @@ llama_model_loader::llama_model_loader(
 
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+        if (llm_kv.arch != LLM_ARCH_UNKNOWN && arch_name != llm_arch_name(llm_kv.arch)) {
+            llm_kv.prefix = arch_name; // k19-agn: an alias arch name (glm5next): its keys keep the file's prefix
+        }
 
         files.emplace_back(new llama_file(file));
         file_paths.emplace_back();
@@ -756,6 +762,9 @@ llama_model_loader::llama_model_loader(
     } else {
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+        if (llm_kv.arch != LLM_ARCH_UNKNOWN && arch_name != llm_arch_name(llm_kv.arch)) {
+            llm_kv.prefix = arch_name; // k19-agn: an alias arch name (glm5next): its keys keep the file's prefix
+        }
     }
 
     n_kv      = gguf_get_n_kv(metadata);
