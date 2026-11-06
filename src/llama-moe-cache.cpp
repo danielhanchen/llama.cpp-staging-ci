@@ -1200,7 +1200,18 @@ struct llama_moe_cache::impl {
             // the missing experts per batch size where a calibration at the first small batch says it is faster (see cm_calibrate, cm_rule)
             {
                 const char * env_cm = getenv("LLAMA_MOE_CPU_MISS");
-                cm = hybrid && env == nullptr && env_f == nullptr && (env_cm == nullptr || atoi(env_cm) != 0);
+                // k19-uma: unset = off where every cache device is an integrated GPU (unified memory, e.g. Strix Halo gfx1151): a fetch there
+                // is a copy within the same DRAM, not over PCIe, so the rule's calibration prices the host path against a transfer that does
+                // not exist (gfx1151 Qwen3.6-35B-A3B at an 8 GiB budget and LFM2.5-24B-A2B at 4 GiB: LLAMA_MOE_CPU_MISS=0 decodes 3-8% faster,
+                // Linux and Windows). Discrete GPUs (GGML_BACKEND_DEVICE_TYPE_GPU) are unchanged; LLAMA_MOE_CPU_MISS=1 turns it on there too
+                bool uma = !devices.empty();
+                for (const auto & d : devices) {
+                    uma = uma && ggml_backend_dev_type(ggml_backend_get_device(d.backend)) == GGML_BACKEND_DEVICE_TYPE_IGPU;
+                }
+                cm = hybrid && env == nullptr && env_f == nullptr && (env_cm == nullptr ? !uma : atoi(env_cm) != 0);
+                if (uma && env_cm == nullptr && hybrid && env == nullptr && env_f == nullptr && !model.hparams.no_alloc) {
+                    LLAMA_LOG_INFO("%s: MoE cache on an integrated GPU (unified memory): CPU misses off (LLAMA_MOE_CPU_MISS=1 on)\n", __func__);
+                }
                 // =2 (diagnostic, KLD gates): on for every batch size once calibrated, without the rule (the share is at most 3/4)
                 cm_force = cm && env_cm != nullptr && atoi(env_cm) == 2;
                 const char * env_t = getenv("LLAMA_MOE_CPU_MISS_TRIAL");

@@ -3019,6 +3019,32 @@ static bool common_moe_resident_ubatch_try(common_params & params, llama_model_p
 // (the fit caps the cache at the bytes of the host experts and at the free device memory)
 static constexpr size_t COMMON_MOE_CACHE_AUTO_BYTES = (size_t) 1 << 40;
 
+// k9-prompt-pass: unified memory: every offload device an integrated GPU (e.g. AMD Strix Halo gfx1151, GGML_BACKEND_DEVICE_TYPE_IGPU
+// from the device's integrated attribute); LLAMA_MOE_UMA=1 / 0 forces the decision
+static bool common_moe_uma(const common_params & params) {
+    if (const char * e = getenv("LLAMA_MOE_UMA")) {
+        return atoi(e) != 0;
+    }
+    int n_gpu = 0, n_igpu = 0;
+    const auto count = [&](ggml_backend_dev_t dev) {
+        const auto t = ggml_backend_dev_type(dev);
+        n_gpu  += t == GGML_BACKEND_DEVICE_TYPE_GPU;
+        n_igpu += t == GGML_BACKEND_DEVICE_TYPE_IGPU;
+    };
+    if (!params.devices.empty()) {
+        for (ggml_backend_dev_t dev : params.devices) {
+            if (dev != nullptr) {
+                count(dev);
+            }
+        }
+    } else {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            count(ggml_backend_dev_get(i));
+        }
+    }
+    return n_igpu > 0 && n_gpu == 0;
+}
+
 bool common_moe_cache_auto_resolve(common_params & params, bool fit) {
     if (!params.moe_cache_auto) {
         return false;
@@ -3035,6 +3061,10 @@ bool common_moe_cache_auto_resolve(common_params & params, bool fit) {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    // k19-uma: the parameters as given, for the launch again without a MoE cache (see below)
+    const common_params params_given = params;
+    bool uma_no_cache = false;
+uma_restart:
     // k15-up2: built-in MTP heads (no -md model) for the context's prefetch depth rule (llama_context::sched_new), before any fit probe
     common_set_env("LLAMA_SPEC_MTP_HEADS", !params.speculative.has_dft() && std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
         [](auto t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP; }) ? "1" : "0");
@@ -3078,29 +3108,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (!model_only && !params.embedding && (moe_cache_auto || params.moe_cache_size > 0)) {
         const char * env_ub  = getenv("LLAMA_MOE_UMA_UB");
         const int64_t uma_ub = env_ub != nullptr ? atoll(env_ub) : 2048;
-        bool uma = false;
-        if (const char * e = getenv("LLAMA_MOE_UMA")) {
-            uma = atoi(e) != 0;
-        } else {
-            int n_gpu = 0, n_igpu = 0;
-            const auto count = [&](ggml_backend_dev_t dev) {
-                const auto t = ggml_backend_dev_type(dev);
-                n_gpu  += t == GGML_BACKEND_DEVICE_TYPE_GPU;
-                n_igpu += t == GGML_BACKEND_DEVICE_TYPE_IGPU;
-            };
-            if (!params.devices.empty()) {
-                for (ggml_backend_dev_t dev : params.devices) {
-                    if (dev != nullptr) {
-                        count(dev);
-                    }
-                }
-            } else {
-                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                    count(ggml_backend_dev_get(i));
-                }
-            }
-            uma = n_igpu > 0 && n_gpu == 0;
-        }
+        const bool uma = common_moe_uma(params);
         // LLAMA_MOE_UMA_KEEP_BATCH=1 / 0: keep n_batch on unified memory (default: Windows only)
 #ifdef _WIN32
         bool keep_batch = true;
@@ -3599,6 +3607,30 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
         // the fit may have reduced the MoE cache (it gets the memory left after the layers), the load mode below follows the fitted size
         params.moe_cache_size = cparams.moe_cache_size;
+
+        // k19-uma: unified memory (common_moe_uma: every offload device an integrated GPU), --moe-cache-mib auto: a fitted cache of at
+        // most the hybrid gate's share (LLAMA_MOE_CACHE_HYBRID_MAX_FRAC, 0.10) of the host experts is not used. There the device and the
+        // host read the same DRAM: the host experts that ggml-cpu computes in place (upstream's --cpu-moe path) are not slower to reach
+        // than the cache's copies, and the cache's fit costs the rest of the placement: gfx1151 Qwen3.6-35B-A3B UD-Q4_K_XL + MTP at an
+        // emulated 4 GiB device (3.1% cached), the fit dropped the MTP drafter to keep the cache and the layers on the device, decode 43.1
+        // tok/s vs 52.7 with --moe-cache-mib 0 (MTP kept, 35 of 42 layers on the device) and upstream's 50.7. The launch is fitted again
+        // from the given parameters as with --moe-cache-mib 0. Discrete GPUs are unchanged; LLAMA_MOE_UMA_MIN_FRAC=0 keeps the cache
+        if (moe_cache_auto && !uma_no_cache && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && cparams.moe_cache_size > 0 &&
+                !model_only && common_moe_uma(params)) {
+            const char * e_mf = getenv("LLAMA_MOE_UMA_MIN_FRAC");
+            const double min_frac = e_mf != nullptr ? std::max(0.0, atof(e_mf)) : common_moe_hybrid_max_frac();
+            const double host = common_moe_host_expert_bytes(params.model.path, mparams.tensor_buft_overrides, mparams.n_gpu_layers);
+            if (min_frac > 0.0 && host > 0.0 && (double) cparams.moe_cache_size <= min_frac*host) {
+                COM_INF("%s: --moe-cache-mib auto on unified memory: a MoE cache of %zu MiB holds %.1f%% of the host experts (at most %.1f%%): "
+                    "no MoE cache, the host computes its experts (LLAMA_MOE_UMA_MIN_FRAC=0 keeps the cache)\n", __func__,
+                    cparams.moe_cache_size/(1024*1024), 100.0*(double) cparams.moe_cache_size/host, 100.0*min_frac);
+                params = params_given;
+                params.moe_cache_auto = false;
+                params.moe_cache_size = 0;
+                uma_no_cache = true;
+                goto uma_restart;
+            }
+        }
 
         // k9-prompt-pass: every expert on the device (the MoE cache was asked for and has nothing to hold): the prompt runs at
         // LLAMA_MOE_RESIDENT_UB (2048) instead of the default n_ubatch when the fit still places every expert on the device at that
