@@ -908,6 +908,8 @@ private:
     std::array<uint64_t, GF_SMALL_N>             gf_res_small_used{};
     std::array<uint64_t, GF_SMALL_N>             gf_res_small_nuse{}; // k15-fn: uses since the kept graph was built
     uint64_t gf_res_epoch = 1;
+    // k19-fullcost: set by restore_pp_plan around its graph_reserve: the kept graphs stay valid when the reserve replaced no buffer
+    bool reserve_keep_small = false;
     // k15-fn debug (LLAMA_GRAPH_SMALL_WHY=N): every invalidation of the kept graphs is logged with its source line
     void gf_res_epoch_bump(int line);
     uint64_t n_small_swaps = 0;

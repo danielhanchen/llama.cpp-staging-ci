@@ -436,6 +436,9 @@ extern "C" {
     GGML_API bool                      ggml_backend_sched_plan_restore(ggml_backend_sched_t sched, ggml_backend_sched_plan_t plan);
     GGML_API void                      ggml_backend_sched_plan_free   (ggml_backend_sched_plan_t plan);
     GGML_API size_t                    ggml_backend_sched_plan_bytes  (ggml_backend_sched_plan_t plan); // host memory of the plan
+    // k19-fullcost: the graph allocator's generation (ggml_gallocr_get_generation): it changes whenever a buffer of the allocator is
+    // replaced or lent memory changes, i.e. when the addresses of a graph allocated before may no longer be valid
+    GGML_API uint64_t                  ggml_backend_sched_get_alloc_generation(ggml_backend_sched_t sched);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
