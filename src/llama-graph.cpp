@@ -2925,7 +2925,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
             overlap = overlap && (w == nullptr || ggml_is_quantized(w->type));
         }
-        if (overlap) {
+        // k19-l4c deferred admission (LLAMA_MOE_FETCH_DEFER): the host computes the admitted experts too (they were published in the
+        // host ids of the assign above), the copies only fill their slots for later batches; the device computes the hits alone
+        if (overlap && single_pub != nullptr && hybrid_host && hybrid->ne[1] == 6 && moe_cache->fetch_defer(n_tokens)) {
+            ggml_tensor * fetched = moe_cache->hybrid_fetch_experts(ctx0, il, hybrid, true);
+            ggml_moe_cache_set_defer(hybrid, fetched);
+            ggml_backend_sched_set_tensor_backend(sched, fetched, dev);
+            cb(fetched, "ffn_moe_fetch_deferred", il);
+            ggml_build_forward_expand(gf, fetched);
+
+            ggml_tensor * hits = ggml_view_2d(ctx0, hybrid, n_used, n_rows, hybrid->nb[1], (4*n_rows + 1)*hybrid->nb[1]);
+            cb(hits, "ffn_moe_hit_slots", il);
+            experts_d = build_experts(cur, hits, false, up_exps_s, gate_exps_s, down_exps_s, up_exps_b, gate_exps_b, gate_up_exps_b);
+            cb(experts_d, "ffn_moe_down_hits", il);
+        } else if (overlap) {
             // the copies of the admitted experts run beside the hits (cached before this lookup), then the admitted experts are computed
             ggml_tensor * fetched = moe_cache->hybrid_fetch_experts(ctx0, il, hybrid, true);
             ggml_backend_sched_set_tensor_backend(sched, fetched, dev);

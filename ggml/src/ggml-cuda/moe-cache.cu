@@ -90,7 +90,7 @@ static __global__ void moe_cache_assign(
         const int n_ids, const int ne0, const int n_expert, const int il, const int n_slots,
         int32_t * __restrict__ counts, const int n_layer, const int fetch_q,
         int32_t * __restrict__ scores, const int grow, const int advance, const int n_scores, const int frozen = 0,
-        const int tail_rank = 0, int32_t * __restrict__ skip_stat = nullptr, int ids_s1 = 0) {
+        const int tail_rank = 0, int32_t * __restrict__ skip_stat = nullptr, int ids_s1 = 0, const int defer = 0) {
     if (ids_s1 <= 0) {
         ids_s1 = ne0;
     }
@@ -455,8 +455,10 @@ static __global__ void moe_cache_assign(
             slots[i] = row[moe_cache_id(ids, i, n_expert, ne0, ids_s1)];
         }
         if (counts != nullptr) {
-            // after the copy list: the experts left to the host
-            fill_s[n_ids + i] = slots[i] < 0 && !skip ? moe_cache_id(ids, i, n_expert, ne0, ids_s1) : -1;
+            // after the copy list: the experts left to the host; k19-l4c deferred admission (ggml_moe_cache_set_defer): every expert that
+            // was not cached before this lookup (the hit slots row), the admitted ones too, which the copies make hits for later batches
+            const bool to_host = defer ? fill_s[2*n_ids + i] < 0 : slots[i] < 0;
+            fill_s[n_ids + i] = to_host && !skip ? moe_cache_id(ids, i, n_expert, ne0, ids_s1) : -1;
         }
     }
 
@@ -1065,6 +1067,40 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
             moe_cache_fetch_launch(stream, dst, dst->src + 1, ggml_get_op_params_i32(dst, 1), (const int32_t *) res->data, n_ids, ne0);
             return;
         }
+        if (ggml_get_op_params_i32(dst, 12) == 2) {
+            // k19-l4c deferred admission (ggml_moe_cache_set_defer): the host computes the admitted experts of this batch, the copies only
+            // fill their slots for later batches. They run on the side stream without a join in the graph: the end of the graph waits
+            // for them (moe_join_pending, see ggml_backend_cuda_graph_compute). The assign result is a graph tensor whose memory the
+            // nodes after this one may reuse, so the copy list is first copied to a buffer of the context, one entry per layer (the
+            // previous graph's copies, which read that entry, were waited for at its end); the result (dst) is neither read nor written
+            const int il     = ggml_get_op_params_i32(dst, 0);
+            const int n_info = 3*n_ids + ne0; // slots, fill count row, fill experts, fill slots
+            cudaStream_t side = ctx.stream(ctx.device, GGML_CUDA_MAX_STREAMS - 1);
+            if (ctx.moe_defer_info == nullptr) {
+                CUDA_CHECK(cudaMalloc(&ctx.moe_defer_info, (size_t) GGML_CUDA_MOE_DEFER_LAYERS*GGML_CUDA_MOE_DEFER_STRIDE*sizeof(int32_t)));
+            }
+            if (ctx.moe_fork == nullptr) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&ctx.moe_fork, cudaEventDisableTiming));
+                CUDA_CHECK(cudaEventCreateWithFlags(&ctx.moe_join, cudaEventDisableTiming));
+            }
+            if (il < 0 || il >= GGML_CUDA_MOE_DEFER_LAYERS || n_info > GGML_CUDA_MOE_DEFER_STRIDE) {
+                // no entry for it: the copies run here in the stream (the host still computes the admitted experts: same output)
+                moe_cache_fetch_launch(stream, dst, dst->src + 1, ggml_get_op_params_i32(dst, 1), (const int32_t *) res->data, n_ids, ne0);
+                return;
+            }
+            int32_t * info = ctx.moe_defer_info + (size_t) il*GGML_CUDA_MOE_DEFER_STRIDE;
+            CUDA_CHECK(cudaMemcpyAsync(info, res->data, n_info*sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaEventRecord(ctx.moe_fork, stream));
+            CUDA_CHECK(cudaStreamWaitEvent(side, ctx.moe_fork, 0));
+            static const int max_z = [] {
+                const char * env = getenv("GGML_CUDA_MOE_FETCH_OVERLAP_Z");
+                return env != nullptr ? std::max(0, atoi(env)) : 2;
+            }();
+            moe_cache_fetch_launch(side, dst, dst->src + 1, ggml_get_op_params_i32(dst, 1), info, n_ids, ne0, max_z, nullptr);
+            CUDA_CHECK(cudaEventRecord(ctx.moe_join, side));
+            ctx.moe_join_pending = true;
+            return;
+        }
         // overlap: the copies run on a side stream after the assign, ggml_moe_cache_join makes the main stream wait for them;
         // the hits only read slots cached before this lookup, which the copies (into its victims) never touch
         if (ctx.moe_fork == nullptr) {
@@ -1155,7 +1191,8 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
             (const int32_t *) ids->data, (int32_t *) map->data, (int32_t *) state->data, (int32_t *) dst->data,
             n_ids, ne0, n_expert, il, n_slots, (int32_t *) counts->data, (int) map->ne[1], fetch_q,
             scores != nullptr ? (int32_t *) scores->data : nullptr, grow, advance, n_scores, ggml_get_op_params_i32(dst, 15),
-            tail_rank, tail_rank > 0 ? (int32_t *) counts->data + (int64_t) map->ne[1]*n_expert + 4 : nullptr, ids_s1);
+            tail_rank, tail_rank > 0 ? (int32_t *) counts->data + (int64_t) map->ne[1]*n_expert + 4 : nullptr, ids_s1,
+            ggml_get_op_params_i32(dst, 9));
         CUDA_CHECK(cudaGetLastError());
         return;
     }

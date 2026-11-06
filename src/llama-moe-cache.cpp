@@ -5569,6 +5569,32 @@ struct llama_moe_cache::impl {
         return overlap && ov_live && n_ubatch == 1;
     }
 
+    // k19-l4c deferred admission (LLAMA_MOE_FETCH_DEFER, default 1; 0 = off, 2 = also on hosts without the host team): a single token
+    // ubatch on the overlapped hybrid path with the single-graph mailbox hands the experts its assign admits to the host as well, and
+    // their copies to the slots run beside the rest of the graph, waited for only at its end (ggml_moe_cache_set_defer). Before, the
+    // layer waited for the copies (zero-copy reads at the link speed, ~470 us per 5.4 MiB expert on Colab L4) to compute the admitted
+    // experts on the device. nsys (l4c_p1, i3f, Colab L4, chat, ms per pass): LFM2.5 8 GB 6.7 of 21.2 waiting for copies (4.1 for the host),
+    // LFM2.5 4 GB 12.4 of 27.5, Flint 16 GB 5.0 of 22.8; PolyStrata stages its experts with DMA beside the compute and its CPU computes the
+    // misses of the token. Only on hosts whose host experts run on the host team (single_team_host: Colab L4 / A100 class; not the G4
+    // EPYC, whose host has no team, nor a 4-vCPU T4). The admissions and the cache state are the same as without it; the admitted
+    // experts are computed on the host (int8 activations) instead of the device, so the output changes: KLD-gated
+    bool fetch_defer(int64_t n_ubatch) const {
+        static const int mode = [] {
+            const char * e = getenv("LLAMA_MOE_FETCH_DEFER");
+            return e != nullptr ? atoi(e) : 1;
+        }();
+        if (mode == 0 || !overlap_batch(n_ubatch) || !single_req || single_off) {
+            return false;
+        }
+        const bool on = mode == 2 || single_team_host();
+        static std::atomic<bool> logged{false};
+        if (on && !logged.exchange(true)) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4c deferred admission: single token ubatches compute the admitted experts on the host, their "
+                "copies to the slots finish beside the graph (LLAMA_MOE_FETCH_DEFER=0 off)\n", tag);
+        }
+        return on;
+    }
+
     bool ov_pending() const {
         return ov_rule || (ov_auto && (ov_done >= 0 || ov_wait >= 0));
     }
@@ -9474,6 +9500,10 @@ ggml_tensor * llama_moe_cache::hybrid_fetch_experts(ggml_context * ctx, int32_t 
 
 bool llama_moe_cache::overlap(int64_t n_ubatch) const {
     return pimpl->overlap_batch(n_ubatch);
+}
+
+bool llama_moe_cache::fetch_defer(int64_t n_ubatch) const {
+    return pimpl->fetch_defer(n_ubatch);
 }
 
 bool llama_moe_cache::hybrid_active() const {

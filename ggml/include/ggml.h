@@ -1601,6 +1601,12 @@ extern "C" {
             int                   n_banks,
             bool                  overlap);
 
+    // k19-l4c deferred admission: assign (ggml_moe_cache_assign) also writes the experts it admits to its host ids (the host computes every
+    // expert that was not cached before the lookup), and fetch (an overlapped ggml_moe_cache_fetch of that assign) copies the admitted
+    // experts to their slots beside the rest of the graph without a join: nothing in the graph reads them (the result of fetch is unused),
+    // the backend waits for the copies at the end of the graph, so the next graph finds them cached. Only for a single token batch
+    GGML_API void ggml_moe_cache_set_defer(struct ggml_tensor * assign, struct ggml_tensor * fetch);
+
     // waits for the copies of an overlapped ggml_moe_cache_fetch (a), result: a (in place)
     GGML_API struct ggml_tensor * ggml_moe_cache_join(
             struct ggml_context * ctx,
