@@ -366,6 +366,31 @@ private:
     // maps from a sequence id to a stream id
     std::vector<uint32_t> seq_to_stream;
 
+public:
+    // k19-vwidth: the first KQ mask row of a sequence in a decode, kept with the position of the cells' modification log it was read
+    // at, so the next decode copies it and recomputes only the cells logged since then plus the cells of the sequence whose positions
+    // lie between the two rows' positions (set_input_kq_mask)
+    struct kq_row_entry {
+        const void * cells = nullptr;
+        uint32_t     strm  = 0;
+        llama_seq_id seq   = -1;
+        uint32_t     flags = 0;
+        size_t       elem  = 0;
+        llama_pos    p1 = 0, p1_x = 0, p1_y = 0, spm = 0;
+        uint64_t     log_pos = 0;
+        uint64_t     used    = 0;
+        std::vector<uint8_t> row; // row.size()/elem cells are valid
+    };
+    struct kq_row_cache {
+        std::vector<kq_row_entry> entries;
+        uint64_t n_use  = 0;
+        uint64_t n_hit  = 0;
+        uint64_t n_miss = 0;
+    };
+
+private:
+    mutable kq_row_cache kq_rows;
+
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
 

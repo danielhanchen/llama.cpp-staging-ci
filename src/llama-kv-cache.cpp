@@ -1717,7 +1717,176 @@ struct args_set_input_kq_mask {
     int64_t n_kv;
     int64_t n_stream;
     int64_t n_tps;
+
+    // k19-vwidth: the kept first rows (nullptr: every row computed in full)
+    llama_kv_cache::kq_row_cache * rows = nullptr;
 };
+
+// k19-vwidth: the mask value of one cell for a token of sequence seq_id at position p1 (2D position p1_x, p1_y), spm the smallest
+// position of that sequence in the ubatch: the rule of the loop in set_input_kq_mask_rows (no ALiBi)
+template<typename T, bool causal, bool swa, bool is_2d>
+static inline T kq_mask_cell(const args_set_input_kq_mask & args, const llama_kv_cells & cells, uint32_t j, llama_seq_id seq_id,
+        llama_pos p1, llama_pos p1_x, llama_pos p1_y, llama_pos spm) {
+    const T mask_keep = llama_cast<T>(0.0f);
+    const T mask_drop = llama_cast<T>(-INFINITY);
+    if (cells.is_empty(j) || !cells.seq_has(j, seq_id)) {
+        return mask_drop;
+    }
+    const llama_pos p0 = cells.pos_get(j);
+    if (causal) {
+        if (p0 > p1) {
+            return mask_drop;
+        }
+        if (is_2d && p0 == p1 && cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
+            return mask_drop;
+        }
+    }
+    if (swa) {
+        const bool in_span = !causal && args.hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL && p0 >= spm;
+        if (!in_span && llama_hparams::is_masked_swa(args.n_swa, args.swa_type, p0, p1)) {
+            return mask_drop;
+        }
+    }
+    return mask_keep;
+}
+
+// k19-vwidth (LLAMA_KQ_MASK_INC=0: off): the first row of a sequence from its kept row. A cell's value depends only on the cell (its
+// position, sequences, 2D position: every change is in the cells' log) and, through the causal / SWA / in-span rules, on whether its
+// position lies on one side or the other of p1 (p1 - n_swa, spm): so a cell that is not logged since the kept row and whose position
+// lies outside [min - n_swa - 2, max + n_swa + 2] of the two rows' p1 and spm has the same value in both rows. Those that remain
+// are recomputed with kq_mask_cell (the full loop's rule). idxs gets the cells the full loop records (sequence seq_id, position at
+// least spm - n_swa - 32), in another order (the rows after the first only recompute them, each on its own)
+// returns false when the row must be computed in full (no kept row or too much changed); kq_mask_row_keep then keeps it
+template<typename T, bool causal, bool swa, bool is_2d>
+static bool kq_mask_row_inc(const args_set_input_kq_mask & args, uint32_t strm, const llama_kv_cells & cells, llama_seq_id seq_id,
+        llama_pos p1, llama_pos p1_x, llama_pos p1_y, llama_pos spm, T * dst, std::vector<uint32_t> & idxs) {
+    auto & rc = *args.rows;
+    const int64_t  n_kv  = args.n_kv;
+    const uint32_t flags = (causal ? 1u : 0u) | (swa ? 2u : 0u) | (is_2d ? 4u : 0u);
+    llama_kv_cache::kq_row_entry * e = nullptr;
+    for (auto & x : rc.entries) {
+        if (x.cells == (const void *) &cells && x.strm == strm && x.seq == seq_id && x.flags == flags && x.elem == sizeof(T)) {
+            e = &x;
+            break;
+        }
+    }
+    if (e == nullptr || e->log_pos < cells.mod_base()) {
+        rc.n_miss++;
+        return false;
+    }
+    const uint64_t n_log  = cells.mod_end() - e->log_pos;
+    const int64_t  n_kept = (int64_t) (e->row.size()/sizeof(T));
+    const int64_t  budget = std::max<int64_t>(64, std::max<int64_t>(n_kv, n_kept)/4);
+    if ((int64_t) n_log > budget) {
+        rc.n_miss++;
+        return false;
+    }
+    const int32_t   w  = swa ? (int32_t) args.n_swa + 2 : 1;
+    const llama_pos lo = std::min({ e->p1, p1, e->spm, spm }) - w;
+    const llama_pos hi = std::max({ e->p1, p1, e->spm, spm }) + w;
+    const auto & sp = cells.seq_pos_get(seq_id);
+    auto it0 = sp.lower_bound({ lo, 0u });
+    {
+        int64_t n_span = 0;
+        for (auto it = it0; it != sp.end() && it->first <= hi; ++it) {
+            if (++n_span > budget) {
+                rc.n_miss++;
+                return false;
+            }
+        }
+    }
+    if (n_kv > n_kept) {
+        e->row.resize((size_t) n_kv*sizeof(T));
+    }
+    T * row = (T *) e->row.data();
+    const int64_t n_row = std::max(n_kv, n_kept);
+    for (int64_t j = n_kept; j < n_kv; ++j) {
+        row[j] = kq_mask_cell<T, causal, swa, is_2d>(args, cells, (uint32_t) j, seq_id, p1, p1_x, p1_y, spm);
+    }
+    const uint32_t * lg = cells.mod_since(e->log_pos);
+    for (uint64_t k = 0; k < n_log; ++k) {
+        const uint32_t j = lg[k];
+        if ((int64_t) j < n_row) {
+            row[j] = kq_mask_cell<T, causal, swa, is_2d>(args, cells, j, seq_id, p1, p1_x, p1_y, spm);
+        }
+    }
+    for (auto it = it0; it != sp.end() && it->first <= hi; ++it) {
+        if ((int64_t) it->second < n_row) {
+            row[it->second] = kq_mask_cell<T, causal, swa, is_2d>(args, cells, it->second, seq_id, p1, p1_x, p1_y, spm);
+        }
+    }
+    e->p1 = p1; e->p1_x = p1_x; e->p1_y = p1_y; e->spm = spm;
+    e->log_pos = cells.mod_end();
+    e->used    = ++rc.n_use;
+    memcpy(dst, row, (size_t) n_kv*sizeof(T));
+
+    idxs.clear();
+    const llama_pos q_min = spm - (llama_pos) (args.n_swa + 32);
+    for (auto it = sp.lower_bound({ q_min, 0u }); it != sp.end(); ++it) {
+        if ((int64_t) it->second < n_kv) {
+            idxs.push_back(it->second);
+        }
+    }
+    rc.n_hit++;
+
+    // LLAMA_KQ_MASK_INC_CHECK=1 (debug): the row and the recorded cells against the full loop's
+    static const bool check = getenv("LLAMA_KQ_MASK_INC_CHECK") != nullptr && atoi(getenv("LLAMA_KQ_MASK_INC_CHECK")) != 0;
+    if (check) {
+        std::vector<uint32_t> ref_idxs;
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const T v = kq_mask_cell<T, causal, swa, is_2d>(args, cells, (uint32_t) j, seq_id, p1, p1_x, p1_y, spm);
+            if (memcmp(&v, &dst[j], sizeof(T)) != 0) {
+                GGML_ABORT("k19-vwidth: incremental KQ mask row differs at cell %lld (seq %d, p1 %d, n_kv %lld)", (long long) j, seq_id, p1, (long long) n_kv);
+            }
+            if (!cells.is_empty(j) && cells.seq_has(j, seq_id) && cells.pos_get(j) + (int32_t) (args.n_swa + 32) >= spm) {
+                ref_idxs.push_back((uint32_t) j);
+            }
+        }
+        std::vector<uint32_t> got = idxs;
+        std::sort(got.begin(), got.end());
+        if (got != ref_idxs) {
+            GGML_ABORT("k19-vwidth: incremental KQ mask recorded cells differ (%zu vs %zu)", got.size(), ref_idxs.size());
+        }
+        static std::atomic<int64_t> n_checked { 0 };
+        if (++n_checked % 1000 == 1) {
+            LLAMA_LOG_INFO("%s: k19-vwidth: incremental KQ mask check: %lld rows equal so far\n", __func__, (long long) n_checked);
+        }
+    }
+    return true;
+}
+
+// k19-vwidth: keeps the first row of a sequence the full loop computed, for kq_mask_row_inc
+template<typename T, bool causal, bool swa, bool is_2d>
+static void kq_mask_row_keep(const args_set_input_kq_mask & args, uint32_t strm, const llama_kv_cells & cells, llama_seq_id seq_id,
+        llama_pos p1, llama_pos p1_x, llama_pos p1_y, llama_pos spm, const T * src) {
+    auto & rc = *args.rows;
+    const uint32_t flags = (causal ? 1u : 0u) | (swa ? 2u : 0u) | (is_2d ? 4u : 0u);
+    llama_kv_cache::kq_row_entry * e = nullptr;
+    for (auto & x : rc.entries) {
+        if (x.cells == (const void *) &cells && x.strm == strm && x.seq == seq_id && x.flags == flags && x.elem == sizeof(T)) {
+            e = &x;
+            break;
+        }
+    }
+    if (e == nullptr) {
+        if (rc.entries.size() < 8) {
+            rc.entries.emplace_back();
+            e = &rc.entries.back();
+        } else {
+            e = &rc.entries[0];
+            for (auto & x : rc.entries) {
+                if (x.used < e->used) {
+                    e = &x;
+                }
+            }
+        }
+    }
+    e->cells = (const void *) &cells; e->strm = strm; e->seq = seq_id; e->flags = flags; e->elem = sizeof(T);
+    e->p1 = p1; e->p1_x = p1_x; e->p1_y = p1_y; e->spm = spm;
+    e->log_pos = cells.mod_end();
+    e->used    = ++rc.n_use;
+    e->row.assign((const uint8_t *) src, (const uint8_t *) (src + args.n_kv));
+}
 
 // fills the mask rows of the tokens [ii0, ii1) of every stream
 // each row only depends on its own token and the cells, so disjoint row ranges can be filled concurrently;
@@ -1779,6 +1948,7 @@ static void set_input_kq_mask_rows(const args_set_input_kq_mask & args, const ll
             // note: this optimization is not compatible with Alibi position encoding
             // ref:  https://github.com/ggml-org/llama.cpp/pull/18842
             bool prev = false;
+            bool first_full = false; // k19-vwidth: the sequence's first row, computed in full (kept for the next decode)
 
             auto & idxs = seq_idxs[seq_id];
 
@@ -1826,6 +1996,12 @@ static void set_input_kq_mask_rows(const args_set_input_kq_mask & args, const ll
 
                     seq_srct[seq_id] = i;
                     seq_last[seq_id] = { i, p1 };
+
+                    if (args.rows != nullptr && kq_mask_row_inc<T, causal, swa, is_2d>(args, s, cells, seq_id, p1, p1_x, p1_y,
+                                seq_pos_min[seq_id], data + idst, idxs)) {
+                        continue;
+                    }
+                    first_full = true;
                 }
             }
 
@@ -1900,6 +2076,12 @@ static void set_input_kq_mask_rows(const args_set_input_kq_mask & args, const ll
 skip:
                 data[idst + j] = mask_drop;
             }
+
+            if constexpr (!alibi) {
+                if (first_full && args.rows != nullptr) {
+                    kq_mask_row_keep<T, causal, swa, is_2d>(args, s, cells, seq_id, p1, p1_x, p1_y, seq_pos_min[seq_id], data + idst);
+                }
+            }
         }
     }
 }
@@ -1942,6 +2124,9 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }();
 
     if (check && sorted) {
+        args_set_input_kq_mask a0 = args;
+        a0.rows = nullptr;
+        const auto & args = a0;
         std::vector<T> ref((size_t) n_elem);
         set_input_kq_mask_rows<T, causal, swa, is_2d, alibi>(args, seq_pos_min, ref.data(), 0, n_tps, false);
         set_input_kq_mask_rows<T, causal, swa, is_2d, alibi>(args, seq_pos_min, data, 0, n_tps, true);
@@ -1956,10 +2141,24 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 
     if (n_threads <= 1) {
-        set_input_kq_mask_rows<T, causal, swa, is_2d, alibi>(args, seq_pos_min, data, 0, n_tps, sorted);
+        // k19-vwidth (LLAMA_KQ_MASK_INC=0: off): decode ubatches (up to 64 tokens per stream) start each sequence from its kept row
+        static const bool inc = getenv("LLAMA_KQ_MASK_INC") == nullptr || atoi(getenv("LLAMA_KQ_MASK_INC")) != 0;
+        if (inc && !alibi && args.rows != nullptr && n_tps <= 64) {
+            static std::atomic<bool> logged { false };
+            if (!logged.exchange(true)) {
+                LLAMA_LOG_INFO("%s: k19-vwidth: decode KQ masks start from the kept first rows (LLAMA_KQ_MASK_INC=0: off)\n", __func__);
+            }
+            set_input_kq_mask_rows<T, causal, swa, is_2d, alibi>(args, seq_pos_min, data, 0, n_tps, sorted);
+            return;
+        }
+        args_set_input_kq_mask a = args;
+        a.rows = nullptr;
+        set_input_kq_mask_rows<T, causal, swa, is_2d, alibi>(a, seq_pos_min, data, 0, n_tps, sorted);
         return;
     }
 
+    args_set_input_kq_mask a1 = args;
+    a1.rows = nullptr;
     std::vector<std::thread> workers;
     workers.reserve(n_threads - 1);
     const int64_t chunk = (n_tps + n_threads - 1)/n_threads;
@@ -1967,12 +2166,12 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
         const int64_t ii0 = std::min(n_tps, t*chunk);
         const int64_t ii1 = std::min(n_tps, ii0 + chunk);
         if (ii0 < ii1) {
-            workers.emplace_back([&args, &seq_pos_min, data, ii0, ii1]() {
-                set_input_kq_mask_rows<T, causal, swa, is_2d, alibi>(args, seq_pos_min, data, ii0, ii1, sorted);
+            workers.emplace_back([&a1, &seq_pos_min, data, ii0, ii1]() {
+                set_input_kq_mask_rows<T, causal, swa, is_2d, alibi>(a1, seq_pos_min, data, ii0, ii1, sorted);
             });
         }
     }
-    set_input_kq_mask_rows<T, causal, swa, is_2d, alibi>(args, seq_pos_min, data, 0, std::min(n_tps, chunk), sorted);
+    set_input_kq_mask_rows<T, causal, swa, is_2d, alibi>(a1, seq_pos_min, data, 0, std::min(n_tps, chunk), sorted);
     for (auto & w : workers) {
         w.join();
     }
@@ -2171,6 +2370,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
+        /*.rows             =*/ &kq_rows,
     };
 
     if (dst->type == GGML_TYPE_F16) {

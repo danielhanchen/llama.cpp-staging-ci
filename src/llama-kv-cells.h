@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <algorithm>
 #include <bitset>
 #include <cassert>
 #include <cstring>
@@ -48,6 +49,8 @@ public:
         has_shift = false;
 
         used.clear();
+
+        mark_all();
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
@@ -169,6 +172,8 @@ public:
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
             const auto idx = i + j;
 
+            mark(idx);
+
             if (pos[idx] == -1 && other.pos[j] != -1) {
                 used.insert(i + j);
             }
@@ -200,6 +205,8 @@ public:
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
             const auto idx = idxs[j];
 
+            mark(idx);
+
             if (pos[idx] == -1 && other.pos[j] != -1) {
                 used.insert(idx);
             }
@@ -229,6 +236,8 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
 
+        mark(i);
+
         seq_pos_rm(i);
         seq[i].reset();
 
@@ -246,6 +255,8 @@ public:
         assert(seq[i].test(seq_id));
         assert(pos[i] != -1);
         assert(seq_id >= 0);
+
+        mark(i);
 
         seq[i].reset(seq_id);
         seq_pos_dec(seq_id, i);
@@ -266,6 +277,10 @@ public:
     // return true if the cell becomes empty (i.e. it did not contain seq_id before the call)
     bool seq_keep(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());
+
+        if (seq[i].any()) {
+            mark(i);
+        }
 
         if (seq[i].test(seq_id)) {
             seq_pos_rm(i);
@@ -350,6 +365,8 @@ public:
         assert(pos[i] != -1);
         assert(!seq[i].test(seq_id));
 
+        mark(i);
+
         seq[i].set(seq_id);
         seq_pos_inc(seq_id, i);
     }
@@ -432,6 +449,8 @@ public:
         assert(pos[i] == -1);
         assert(seq[i].none());
 
+        mark(i);
+
         pos[i] = p;
 
         used.insert(i);
@@ -439,6 +458,7 @@ public:
 
     void ext_set(uint32_t i, llama_kv_cell_ext p) {
         assert(i < ext.size());
+        mark(i);
         ext[i] = p;
     }
 
@@ -448,6 +468,8 @@ public:
     bool pos_add(uint32_t i, llama_pos d) {
         assert(i < pos.size());
         assert(pos[i] != -1);
+
+        mark(i);
 
         seq_pos_rm(i);
 
@@ -480,6 +502,8 @@ public:
 
         const llama_pos p_old = pos[i];
 
+        mark(i);
+
         seq_pos_rm(i);
 
         pos[i]   /= d;
@@ -490,7 +514,35 @@ public:
         has_shift = true;
     }
 
+    // k19-vwidth: a log of the cells whose position, sequences or 2D position changed, for consumers that keep a result derived from
+    // the cells (the incremental KQ mask row, llama_kv_cache::set_input_kq_mask) and recompute only the cells logged since they read
+    // it. mod_base() counts the entries dropped from the front of the log: a consumer whose position is below it recomputes everything,
+    // as after reset() / resize() (the log is dropped there too)
+    uint64_t mod_base() const { return log_base; }
+    uint64_t mod_end()  const { return log_base + log.size(); }
+    // the cells logged from position p (p >= mod_base())
+    const uint32_t * mod_since(uint64_t p) const { return log.data() + (p - log_base); }
+
 private:
+    void mark(uint32_t i) {
+        if (log.size() >= log_max) {
+            log_base += log.size() + 1;
+            log.clear();
+            return;
+        }
+        log.push_back(i);
+    }
+
+    void mark_all() {
+        log_base += log.size() + 1;
+        log.clear();
+        log_max = std::max<size_t>(4096, pos.size());
+    }
+
+    uint64_t              log_base = 0;
+    size_t                log_max  = 4096;
+    std::vector<uint32_t> log;
+
     bool has_shift = false;
 
     // set of indices of used cells (i.e. pos[i] != -1, allowed to not have any seq_id)
