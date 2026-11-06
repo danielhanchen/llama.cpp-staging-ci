@@ -12060,6 +12060,13 @@ int32_t llama_moe_cache_tokens(const llama_context * ctx) {
     return (int32_t) ctx->get_moe_cache()->n_tokens_cached();
 }
 
+double llama_moe_cache_frac(const llama_context * ctx) {
+    if (ctx == nullptr || ctx->get_moe_cache() == nullptr) {
+        return -1.0;
+    }
+    return ctx->get_moe_cache()->cache_frac();
+}
+
 bool llama_prepare_prompt_plan(llama_context * ctx) {
     return ctx->restore_pp_plan(true);
 }

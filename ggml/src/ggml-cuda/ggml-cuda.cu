@@ -3459,13 +3459,27 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         graph->node_props.resize(cgraph->n_nodes);
     }
 
+    // k19-df2cost (GGML_CUDA_GRAPH_SKIP_IDLE=1, opt-in: no decode speed change measured on G4, the re-captures it removed were followed by
+    // re-captures for real changes; default: compare every node as before): a node without GGML_TENSOR_FLAG_COMPUTE (a branch that
+    // ggml_build_forward_select did not pick, e.g. the mixed-embedding input of a batch of tokens) is never launched (the evaluation skips
+    // it) and no computed node reads it, so where the allocator put it and its sources does not change the captured graph: its addresses
+    // are left out of the compare (its op, shape and flags stay in). Beside a MoE cache a verify window of another width moved such a
+    // node, so each change of width re-captured the 8000-node verify graph (G4 Flash-Next fn4 24 GB, DFlash2 with a confidence window:
+    // 4-9 ms of host time per pass)
+    static const bool skip_idle = getenv("GGML_CUDA_GRAPH_SKIP_IDLE") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_SKIP_IDLE")) != 0;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_cuda_graph::node_properties prop = {};
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
+        const bool idle = skip_idle && (cgraph->nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0;
+        if (idle) {
+            prop.node.data   = nullptr;
+            prop.node.buffer = nullptr;
+            prop.node.extra  = nullptr;
+        }
 
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             if (cgraph->nodes[i]->src[j]) {
-                prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j]->data;
+                prop.node_src_data_ptrs[j] = idle ? nullptr : cgraph->nodes[i]->src[j]->data;
                 memcpy(prop.node_src_ne[j], cgraph->nodes[i]->src[j]->ne, sizeof(prop.node_src_ne[j]));
                 memcpy(prop.node_src_nb[j], cgraph->nodes[i]->src[j]->nb, sizeof(prop.node_src_nb[j]));
                 prop.node_src_type[j] = (int32_t) cgraph->nodes[i]->src[j]->type;

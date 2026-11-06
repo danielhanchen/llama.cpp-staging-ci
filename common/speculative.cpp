@@ -1555,13 +1555,40 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // only where the cache's device slots hold the experts of fewer than LLAMA_DFLASH_CACHED_TOKENS_MAX (12) tokens: G4 fn4 12 / 16 GB
                 // hold 3 / 7, 48 GB 32 (there the full-card costs stay opt-in, LLAMA_DFLASH_WINDOW=2)
                 static const int32_t df2_cached_tok_max = getenv("LLAMA_DFLASH_CACHED_TOKENS_MAX") ? atoi(getenv("LLAMA_DFLASH_CACHED_TOKENS_MAX")) : 12;
-                const bool df2_cached = is_dflash2 && llama_moe_cache_active(params.ctx_tgt) &&
-                    llama_moe_cache_tokens(params.ctx_tgt) < df2_cached_tok_max;
+                // k19-df2cost (LLAMA_DFLASH_CACHED_FRAC_MAX, default K19_DF2COST_FRAC_MAX 0.5; 0 = off; the cache leaves
+                // LLAMA_DFLASH_CACHED_RESERVE_MIB for the second width's graphs, see common.cpp: without it the srv_kld gate at 32 GB died
+                // of a CUDA out of memory, plans/k19_df2cost.md round 6): also
+                // where the cache holds LLAMA_DFLASH_CACHED_FRAC_MIN (0.20) .. LLAMA_DFLASH_CACHED_FRAC_MAX of the
+                // host experts (llama_moe_cache_frac; G4 fn4 24 GB 27.5%, 32 GB 42%), at every position, with that band's pass costs
+                // (LLAMA_DFLASH_CACHED_COST_MID="c_lo,slope", default 15 ms at 3 rows + 2.3 ms per further row: G4 fn4 fixed-width passes
+                // w3 14.8 / 16.1 ms, w7 23.0 / 25.9 ms at 32 / 24 GB, k19-df2cost round 2). The whole 7-row window there cost 8-11 ms more
+                // than a 3-row one at 8k (dc_r6, 3 launches: 32 GB 143.6 -> 166.0, 24 GB 105.2 -> 129.8 tok/s; chat +1 / +5%).
+                // LLAMA_DFLASH_CACHED_WINDOW=0 turns it off with the band below it
+                static const double df2_mid_lo = getenv("LLAMA_DFLASH_CACHED_FRAC_MIN") ? atof(getenv("LLAMA_DFLASH_CACHED_FRAC_MIN")) : 0.20;
+#ifndef K19_DF2COST_FRAC_MAX
+#define K19_DF2COST_FRAC_MAX 0.5
+#endif
+                static const double df2_mid_hi = getenv("LLAMA_DFLASH_CACHED_FRAC_MAX") ? atof(getenv("LLAMA_DFLASH_CACHED_FRAC_MAX")) : K19_DF2COST_FRAC_MAX;
+                static const std::pair<double, double> df2_mid_cost = [] {
+                    std::pair<double, double> c = { 15.0, 2.3 };
+                    if (const char * e = getenv("LLAMA_DFLASH_CACHED_COST_MID")) {
+                        double lo = 0.0, sl = 0.0;
+                        if (sscanf(e, "%lf,%lf", &lo, &sl) == 2 && lo > 0.0 && sl >= 0.0) {
+                            c = { lo, sl };
+                        }
+                    }
+                    return c;
+                }();
+                const bool   df2_cache_on = is_dflash2 && llama_moe_cache_active(params.ctx_tgt);
+                const double df2_frac     = df2_cache_on ? llama_moe_cache_frac(params.ctx_tgt) : -1.0;
+                const bool   df2_mid      = df2_cache_on && llama_moe_cache_tokens(params.ctx_tgt) >= df2_cached_tok_max &&
+                    df2_frac >= df2_mid_lo && df2_frac < df2_mid_hi;
+                const bool df2_cached = df2_cache_on && (llama_moe_cache_tokens(params.ctx_tgt) < df2_cached_tok_max || df2_mid);
                 // where the slots hold at least LLAMA_DFLASH_CACHED_TOKENS_ALL (K19_DF2PP_TOK_ALL) tokens, only from position
                 // LLAMA_DFLASH_CACHED_POS_MIN (K19_DF2PP_POS_MIN) on: there the whole draft paid at chat / 8k (G4 fn4 16 GB, slots of 7 tokens)
                 static const int32_t df2_cached_tok_all = getenv("LLAMA_DFLASH_CACHED_TOKENS_ALL") ? atoi(getenv("LLAMA_DFLASH_CACHED_TOKENS_ALL")) : K19_DF2PP_TOK_ALL;
                 static const int32_t df2_cached_pos_min = getenv("LLAMA_DFLASH_CACHED_POS_MIN") ? atoi(getenv("LLAMA_DFLASH_CACHED_POS_MIN")) : K19_DF2PP_POS_MIN;
-                const bool df2_cached_here = df2_cached && (df2_window_cached ||
+                const bool df2_cached_here = df2_cached && (df2_window_cached || df2_mid ||
                     llama_moe_cache_tokens(params.ctx_tgt) < df2_cached_tok_all || dp.pos0 >= df2_cached_pos_min);
                 const bool use_df2w = is_dflash2 && !use_ev && params.p_min <= 0.0f && p_cum_thr <= 0.0f &&
                     (df2_cached ? df2_cached_here && (df2_window_cached || df2_window_cache_on) : df2_window);
@@ -1571,9 +1598,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     if (!logged) {
                         logged = true;
                         if (df2w_cached_costs) {
-                            LOG_INF("k19-df2pp: DFlash2 window beside the MoE cache (its slots hold %d tokens): the 3-row or the whole draft by "
-                                    "expected tokens per ms, %.2f ms at 3 rows + %.2f per row (LLAMA_DFLASH_CACHED_WINDOW=0 off)\n",
-                                    (int) llama_moe_cache_tokens(params.ctx_tgt), df2_cached_cost.first, df2_cached_cost.second);
+                            LOG_INF("%s: DFlash2 window beside the MoE cache (its slots hold %d tokens, %.1f%% of the host experts): the 3-row or "
+                                    "the whole draft by expected tokens per ms, %.2f ms at 3 rows + %.2f per row (LLAMA_DFLASH_CACHED_WINDOW=0 off)\n",
+                                    df2_mid ? "k19-df2cost" : "k19-df2pp", (int) llama_moe_cache_tokens(params.ctx_tgt), 100.0*df2_frac,
+                                    df2_mid ? df2_mid_cost.first : df2_cached_cost.first, df2_mid ? df2_mid_cost.second : df2_cached_cost.second);
                         } else {
                             LOG_INF("k19-handoff: DFlash2 window: the short or the whole draft by expected tokens per ms (%s; LLAMA_DFLASH_WINDOW=0 off)\n",
                                     getenv("LLAMA_DFLASH_WINDOW") != nullptr ? "LLAMA_DFLASH_WINDOW=1" : "exact verify");
@@ -1624,8 +1652,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const bool   lng   = dp.pos0 >= 4096;
                     const size_t w_lo  = df2w_cached_costs ? 3 : lng ? 3 : 4;  // verify rows of the short window
                     const size_t w_hi  = result.size() + 1;                    // the whole draft
-                    const double c_lo  = df2w_cached_costs ? df2_cached_cost.first  : lng ? 11.05 : 11.80; // ms per pass at w_lo
-                    const double slope = df2w_cached_costs ? df2_cached_cost.second : lng ? 1.125 : 0.933; // ms per further row
+                    const double c_lo  = df2w_cached_costs ? (df2_mid ? df2_mid_cost.first  : df2_cached_cost.first)  : lng ? 11.05 : 11.80; // ms per pass at w_lo
+                    const double slope = df2w_cached_costs ? (df2_mid ? df2_mid_cost.second : df2_cached_cost.second) : lng ? 1.125 : 0.933; // ms per further row
                     if (w_lo < w_hi) {
                         double e_tok = 1.0, reach = 1.0, e_lo = 0.0;
                         for (size_t k = 1; k < w_hi; ++k) {
