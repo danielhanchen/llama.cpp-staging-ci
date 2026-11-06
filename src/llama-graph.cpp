@@ -2934,7 +2934,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_backend_t dev = moe_cache->backend(il);
         ggml_tensor * experts_d = nullptr;
         // the overlap needs quantized experts: their single token products (mul_mat_vec_q) compute every slot on its own
-        bool overlap = moe_cache->overlap(n_tokens);
+        // k19-overlap: small multi-token ubatches too (LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL; their mmvq kernels also give each entry its own sums)
+        bool overlap = moe_cache->overlap(n_tokens) || moe_cache->overlap_small(n_tokens);
         for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
             overlap = overlap && (w == nullptr || ggml_is_quantized(w->type));
         }

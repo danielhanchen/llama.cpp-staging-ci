@@ -93,6 +93,8 @@ public:
     // the missing experts run beside the experts already cached (see ggml_moe_cache_fetch); true if the graph of a ubatch of n_ubatch
     // tokens uses it now
     bool overlap(int64_t n_ubatch) const;
+    // k19-overlap: small multi-token ubatches (verify windows) copy their admitted experts beside the hits too (LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL)
+    bool overlap_small(int64_t n_ubatch) const;
     // k19-l4c (LLAMA_MOE_FETCH_DEFER): an overlapped single token ubatch with the single-graph mailbox defers its admissions: the host
     // computes the admitted experts, their copies finish beside the graph (see ggml_moe_cache_set_defer)
     bool fetch_defer(int64_t n_ubatch) const;

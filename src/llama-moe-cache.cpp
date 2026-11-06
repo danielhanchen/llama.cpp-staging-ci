@@ -5420,11 +5420,12 @@ struct llama_moe_cache::impl {
 
     // the layer can use the hybrid lookup for a ubatch of this size
     bool hybrid_layer(int32_t il, int64_t n_ubatch) const {
-        if (force_large || !(hybrid || overlap_batch(n_ubatch)) || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+        if (force_large || !(hybrid || overlap_batch(n_ubatch) || overlap_small_batch(n_ubatch)) || il < 0 || il >= (int32_t) layers.size() ||
+                layers[il].ig < 0) {
             return false;
         }
-        // CPU misses off for this batch size: the graph of k9 (plain lookup, or the fetch overlap of single tokens)
-        if (cm && cm_share_of(n_ubatch) >= 1.0f && !overlap_batch(n_ubatch)) {
+        // CPU misses off for this batch size: the graph of k9 (plain lookup, or the fetch overlap of single tokens / small batches)
+        if (cm && cm_share_of(n_ubatch) >= 1.0f && !overlap_batch(n_ubatch) && !overlap_small_batch(n_ubatch)) {
             return false;
         }
         const group & g = groups[layers[il].ig];
@@ -5682,6 +5683,18 @@ struct llama_moe_cache::impl {
     // splitting the slots between two chains gives the same results; larger ubatches may pick kernels whose tiling depends on the slots
     bool overlap_batch(int64_t n_ubatch) const {
         return overlap && ov_live && n_ubatch == 1;
+    }
+
+    // k19-overlap LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL=N (2..GGML_MOE_MAILBOX_MAX_TOKENS; default 1 = off): ubatches of 2..N tokens take the
+    // fetch overlap of single tokens: the copies of the admitted experts run on a side stream beside the hits (cached before the lookup),
+    // then the admitted experts are computed. Every (token, slot) entry is computed once by the multi-token mmvq kernels, which give each
+    // entry its own sums, so the output is the one of the serial fetch. Independent of the single-token rule (ov_live)
+    bool overlap_small_batch(int64_t n_ubatch) const {
+        static const int64_t mx = [] {
+            const char * e = getenv("LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL");
+            return e != nullptr ? std::max<int64_t>(1, std::min<int64_t>(GGML_MOE_MAILBOX_MAX_TOKENS, atoll(e))) : (int64_t) 1;
+        }();
+        return overlap && n_ubatch > 1 && n_ubatch <= mx;
     }
 
     // k19-l4c deferred admission (LLAMA_MOE_FETCH_DEFER, default 1; 0 = off, 2 = also on hosts without the host team): a single token
@@ -9620,6 +9633,10 @@ ggml_tensor * llama_moe_cache::hybrid_fetch_experts(ggml_context * ctx, int32_t 
 
 bool llama_moe_cache::overlap(int64_t n_ubatch) const {
     return pimpl->overlap_batch(n_ubatch);
+}
+
+bool llama_moe_cache::overlap_small(int64_t n_ubatch) const {
+    return pimpl->overlap_small_batch(n_ubatch);
 }
 
 bool llama_moe_cache::fetch_defer(int64_t n_ubatch) const {
