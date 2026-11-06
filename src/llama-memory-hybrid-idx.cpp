@@ -110,7 +110,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         // k19-graph (LLAMA_KV_BUCKET_DEV: unset = where the backend has it, 0 = off, 1 = forced, for CPU tests): the flash attention
         // reads the live length on the device (ggml_flash_attn_ext_set_kv_len, ggml-cuda: the bits of the unpadded node), so the
         // bucket moves no sum and every ubatch of up to LLAMA_KV_BUCKET_DEV_MAX_TOKENS (8, a DFlash2 window of 7 drafts) is bucketed,
-        // LLAMA_KV_BUCKET_DEV_DIV (2) per octave, at least LLAMA_KV_BUCKET_DEV_STEP_MIN (2048) cells: a verify width keeps its graph and
+        // LLAMA_KV_BUCKET_DEV_DIV (2) per octave, at least LLAMA_KV_BUCKET_DEV_STEP_MIN (16384, k19-fullcost; was 2048) cells: a verify width keeps its graph and
         // CUDA graph from one request to the next and while the context grows, re-captured only where a bucket starts (G4
         // Flash-Next DFlash2 / MTP: 8-10 re-captures of each width per request, ~4 ms each, plus an eager pass and instantiation for a
         // rarely used width). Only while flash attention is on (llama_context, set_n_kv_bucket_dev_allowed)
@@ -124,6 +124,11 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         if (const char * e = getenv("LLAMA_KV_BUCKET_DEV_DIV")) {
             bp.dev_div = (uint32_t) std::max(1, atoi(e));
         }
+        // k19-fullcost: at least 16384 cells by default (was 2048): a chat request and an 8k one then share the bucket of the verify graphs
+        // the server prewarmed at load (server_spec_prewarm), so an 8k request replays them instead of re-capturing each width (G4 fn4
+        // full card, fc_r3: width rule over every width 8k 264.9 -> 292.7 tok/s; at a fixed width the extra masked cells cost nothing,
+        // MTP n2 chat / 8k 306.7 / 255.2 -> 307.8 / 257.2 in fc_r1)
+        bp.dev_step_min = 16384;
         if (const char * e = getenv("LLAMA_KV_BUCKET_DEV_STEP_MIN")) {
             bp.dev_step_min = (uint32_t) std::max(256, atoi(e));
         }
