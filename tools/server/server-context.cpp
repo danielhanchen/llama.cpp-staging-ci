@@ -94,13 +94,15 @@ static uint64_t tpp_gguf_bytes(const std::string & path) {
 }
 
 // k19-vwidth (LLAMA_SPEC_PREWARM=0: off, =N: widths 1..N, default 8): a target with a drafter and no MoE cache decodes, at load, a
-// dummy window of every width 1..N LLAMA_SPEC_PREWARM_REPS (10) times (a 1-row decode as a plain decode, wider ones as verify
-// windows, as the server runs them), then forgets them: each width's kept graph (llama_context gf_res_small) is built and its CUDA
-// graph warmed up, captured and launched at least 8 times in the first KV bucket, which every request below its size uses. 8 launches
-// keep a CUDA graph through idle time (ggml-cuda evicts the others after 10 s, GGML_CUDA_GRAPH_KEEP) and let a new KV bucket
-// re-capture it directly (GGML_CUDA_GRAPH_DIRECT_RECAPTURE, no eager pass). A verify width that a confidence rule picks for the first
-// time in a request then replays a captured graph instead of an eager pass plus a capture (~15-20 ms each on G4 Flash-Next). The
-// memory is cleared after; no value of a later request depends on these decodes
+// dummy prompt of LLAMA_SPEC_PREWARM_POS (640) tokens, then windows of every width 1..N, LLAMA_SPEC_PREWARM_REPS (10) times each,
+// appended after it (a 1-row decode as a plain decode, wider ones as verify windows, as the server runs them), then forgets them: each
+// width's kept graph (llama_context gf_res_small) is built and its CUDA graph warmed up, captured and launched at least 8 times in the
+// KV bucket of a short request. The prompt matters: graphs built on an empty memory take other branches (no pooled keys: G4 fn4
+// 7570 vs 7613 nodes) and a request could not reuse them. 8 launches keep a CUDA graph through idle time (ggml-cuda evicts the
+// others after 10 s, GGML_CUDA_GRAPH_KEEP) and let a new KV bucket re-capture it directly (GGML_CUDA_GRAPH_DIRECT_RECAPTURE, no eager
+// pass). A width a request uses for the first time (a confidence rule's, or a draft the n_predict limit cut at the end of a request)
+// then replays a captured graph instead of an eager pass plus a capture (~15-20 ms each on G4 Flash-Next). The memory is cleared
+// after; no value of a later request depends on these decodes
 // (by default only where the target offloads to a GPU; a set LLAMA_SPEC_PREWARM=N runs it anywhere, e.g. CPU tests)
 // (widths up to the outputs the context takes per sequence, the server's widest window)
 static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max) {
@@ -109,44 +111,58 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     if (n_out_max > 0) {
         w_max = std::min(w_max, (int) n_out_max);
     }
-    if (w_max <= 0 || ctx == nullptr || llama_moe_cache_active(ctx) || llama_n_batch(ctx) < (uint32_t) w_max) {
+    static const int reps  = getenv("LLAMA_SPEC_PREWARM_REPS") ? std::max(2, atoi(getenv("LLAMA_SPEC_PREWARM_REPS"))) : 10;
+    static const int n_pre = getenv("LLAMA_SPEC_PREWARM_POS")  ? std::max(0, atoi(getenv("LLAMA_SPEC_PREWARM_POS")))  : 640;
+    const int n_end = n_pre + reps*w_max*(w_max + 1)/2;
+    if (w_max <= 0 || ctx == nullptr || llama_moe_cache_active(ctx) || llama_n_batch(ctx) < (uint32_t) std::max(w_max, std::min(n_pre, 1)) ||
+            (int) llama_n_ctx_seq(ctx) < n_end + 64) {
         return;
     }
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
     const llama_token   tok   = llama_vocab_bos(vocab) != LLAMA_TOKEN_NULL ? llama_vocab_bos(vocab) : 0;
-    static const int reps = getenv("LLAMA_SPEC_PREWARM_REPS") ? std::max(2, atoi(getenv("LLAMA_SPEC_PREWARM_REPS"))) : 10;
     llama_memory_t mem = llama_get_memory(ctx);
     const int64_t t0 = ggml_time_us();
-    llama_batch b = llama_batch_init(w_max, 0, 1);
-    int n_ok = 0;
-    for (int w = 1; w <= w_max; ++w) {
-        for (int rep = 0; rep < reps; ++rep) {
-            b.n_tokens = w;
-            for (int i = 0; i < w; ++i) {
-                b.token[i]     = tok;
-                b.pos[i]       = i;
-                b.n_seq_id[i]  = 1;
-                b.seq_id[i][0] = 0;
-                b.logits[i]    = true;
-            }
-            llama_set_verify(ctx, w > 1);
-            const int rc = llama_decode(ctx, b);
-            llama_synchronize(ctx);
-            llama_memory_seq_rm(mem, 0, -1, -1);
-            if (rc != 0) {
-                SRV_WRN("k19-vwidth: verify graph prewarm stopped at %d rows (decode %d)\n", w, rc);
-                w = w_max + 1;
-                break;
-            }
+    const int n_b = std::max(w_max, (int) std::min<uint32_t>(llama_n_batch(ctx), (uint32_t) std::max(n_pre, 1)));
+    llama_batch b = llama_batch_init(n_b, 0, 1);
+    llama_pos pos = 0;
+    bool ok = true;
+    auto add = [&](int n, bool all_out) {
+        b.n_tokens = n;
+        for (int i = 0; i < n; ++i) {
+            b.token[i]     = tok;
+            b.pos[i]       = pos + i;
+            b.n_seq_id[i]  = 1;
+            b.seq_id[i][0] = 0;
+            b.logits[i]    = all_out || i == n - 1;
         }
-        n_ok += w <= w_max;
+        pos += n;
+    };
+    llama_set_verify(ctx, false);
+    for (int done = 0; done < n_pre && ok; ) {
+        const int n = std::min(n_b, n_pre - done);
+        add(n, false);
+        ok = llama_decode(ctx, b) == 0;
+        done += n;
+    }
+    int n_ok = 0;
+    for (int w = 1; w <= w_max && ok; ++w) {
+        for (int rep = 0; rep < reps && ok; ++rep) {
+            add(w, true);
+            llama_set_verify(ctx, w > 1);
+            ok = llama_decode(ctx, b) == 0;
+            llama_synchronize(ctx);
+        }
+        n_ok += ok;
+    }
+    if (!ok) {
+        SRV_WRN("k19-vwidth: verify graph prewarm stopped at %d rows (a decode failed)\n", n_ok + 1);
     }
     llama_set_verify(ctx, false);
     llama_batch_free(b);
     llama_memory_clear(mem, true);
     llama_synchronize(ctx);
-    SRV_INF("k19-vwidth: the decode / verify graphs of 1..%d rows warmed up in the first KV bucket, %d decodes each (%.1f ms; LLAMA_SPEC_PREWARM=0 off)\n",
-            n_ok, reps, (ggml_time_us() - t0)/1000.0);
+    SRV_INF("k19-vwidth: the decode / verify graphs of 1..%d rows warmed up after a %d-token prompt, %d decodes each (%.1f ms; LLAMA_SPEC_PREWARM=0 off)\n",
+            n_ok, n_pre, reps, (ggml_time_us() - t0)/1000.0);
 }
 
 static bool spec_replay_reverify() {
