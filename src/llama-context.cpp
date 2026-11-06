@@ -4137,7 +4137,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         int way = -1;
         // k19-handoff: in the DFlash drafter's context the previous graph of this size is the other kind (injection vs noise block), so
         // it is taken only when it can be reused: else each would rebuild the other's way every pass
-        const bool dflash_ways = small_cache_dflash && model.arch == LLM_ARCH_DFLASH;
+        // k19-specpass (LLAMA_SPEC_ROW_GRAPH=0: off): the same in the target of a speculative decoder for single-token decodes, which
+        // come in two kinds (a state in a rollback row after a verify is gathered, else read in place, see get_rs_alias): the previous
+        // graph of the other kind was rebuilt in place instead of taking the kept way of this kind
+        const bool dflash_ways = (small_cache_dflash && model.arch == LLM_ARCH_DFLASH) ||
+            (n_small == 1 && small_cache_tgt && llama_spec_row_graph_env());
         for (uint32_t w = 0; w < GF_SMALL_WAYS && way < 0; ++w) {
             const uint32_t i = n_small*GF_SMALL_WAYS + w;
             const auto & r = gf_res_small[i];
