@@ -6381,9 +6381,11 @@ struct llama_moe_cache::impl {
 
         // a busy host gives inconsistent times (more experts not slower, an implausible bandwidth): measured again, at most 3 times
         double d_a = 0.0, d_b = 0.0, d_t = 0.0, slope = 0.0;
+        double slope_med = 0.0;   // k19-calib: the median of the clean sets' own host times per expert (what the file keeps, see below)
         bool ok = false;
         int attempt = 0;
         for (; attempt < 3 && !ok; ++attempt) {
+            std::vector<double> slopes, slopes_all;
             double ma = 0.0, mb = 0.0, mt = 0.0, iqr = 0.0;     // over the clean sets
             double ca = 0.0, cb = 0.0, ct = 0.0, ciqr = 0.0;   // over every set (all contended: these)
             int n_clean = 0, n_all = 0, n_busy = 0;
@@ -6401,6 +6403,7 @@ struct llama_moe_cache::impl {
                 cb = n_all == 0 ? b : std::min(cb, b);
                 ct = n_all == 0 ? t : std::min(ct, t);
                 ciqr = n_all == 0 ? q : std::min(ciqr, q);
+                slopes_all.push_back(kb > ka ? (b - a)/(kb - ka) : a/ka);
                 n_all++;
                 if (cal_robust && set_others > busy_max) {
                     n_busy++;
@@ -6410,11 +6413,15 @@ struct llama_moe_cache::impl {
                 mb = n_clean == 0 ? b : std::min(mb, b);
                 mt = n_clean == 0 ? t : std::min(mt, t);
                 iqr = n_clean == 0 ? q : std::min(iqr, q);
+                slopes.push_back(slopes_all.back());
                 n_clean++;
             }
             if (n_clean == 0) {
                 ma = ca; mb = cb; mt = ct; iqr = ciqr;
+                slopes = slopes_all;
             }
+            std::sort(slopes.begin(), slopes.end());
+            slope_med = slopes.empty() ? 0.0 : slopes[slopes.size()/2];
             if (cal_log && n_busy > 0) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: CPU-miss calibration: %d of %d sets contended (other processes above %.2f busy CPUs), %d clean\n",
                     tag, n_busy, n_all, busy_max, n_clean);
@@ -6512,9 +6519,11 @@ struct llama_moe_cache::impl {
             double spread = 0.0;
             const bool noisy = cm_cal_noisy(t1s, iqr, cm_cal_max_spread(), spread);
             const double t1w = med(t1s), dtw = med(dts), daw = med(das);
-            // k19-calib: robust: the file keeps the faster of the start-up and the re-calibration per quantity (as this launch does below),
-            // so one slow draw of either does not decide every later launch on this host
-            const double t1p = cal_robust ? std::min(t1w, cm_t1) : t1w, dtp = cal_robust ? std::min(dtw, cm_dt) : dtw;
+            // k19-calib: robust: the file keeps the faster further-token time of the start-up and the re-calibration (the bimodal quantity:
+            // a slow draw of either no longer decides every later launch on this host) and, as before, the host time per expert of the
+            // host as it is after warm-up (the median of the re-calibration's clean sets: on G4 Flash-Next 24 GB chat the decode-time 34-36
+            // us per expert decoded 2.5-3% faster than the start-up 23 on its own text, kcal_g4 / kcal2_g4)
+            const double t1p = cal_robust ? std::max(slope_med, 0.05) : t1w, dtp = cal_robust ? std::min(dtw, cm_dt) : dtw;
             double v[4] = { t1p, dtp, std::max(median(tu)/ka, 0.05), std::max(0.0, daw - ka*t1w) + 2.0*median(trt) };
             cm_persist_pending = false;
             if (noisy) {
