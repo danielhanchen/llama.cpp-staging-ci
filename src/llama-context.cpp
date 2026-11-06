@@ -3593,6 +3593,24 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+
+    // k19-ttft (LLAMA_NEXTN_PREALLOC=0: at the first long prompt, as before): beside a MoE cache the unmasked next-n store (the target rows a
+    // separate drafter reads) is pinned now, at n_batch rows, instead of at the first prompt longer than one ubatch. That allocation
+    // (cudaMallocHost, 320 MiB at n_batch 8192) ran beside the layer-major group but held the driver lock, so the request's own launches
+    // waited on it: G4 Flash-Next UD-IQ4_XS + Q8_0 MTP drafter 48 GB, 42 ms of the first 8k / 30k request (cudaEventRecord blocked 42.6 ms).
+    // The same store the first long prompt would make (it never shrinks); without a MoE cache the prompt rows go to the device sink
+    static const bool prealloc = getenv("LLAMA_NEXTN_PREALLOC") == nullptr || atoi(getenv("LLAMA_NEXTN_PREALLOC")) != 0;
+    if (prealloc && value && !masked && moe_cache && (!buf_nextn || nextn_cap_rows < cparams.n_batch)) {
+        static const bool nextn_lazy = getenv("LLAMA_NEXTN_LAZY") == nullptr || atoi(getenv("LLAMA_NEXTN_LAZY")) != 0;
+        if (nextn_lazy) {
+            const int64_t t0 = ggml_time_us();
+            nextn_async_ok = false;
+            if (nextn_store_ensure((size_t) cparams.n_batch)) {
+                LLAMA_LOG_INFO("%s: next-n store of %zu rows pinned at load in %.2f ms (LLAMA_NEXTN_PREALLOC=0: at the first long prompt)\n",
+                    __func__, nextn_cap_rows, (ggml_time_us() - t0)/1000.0);
+            }
+        }
+    }
 }
 
 void llama_context::set_verify(bool value) {
