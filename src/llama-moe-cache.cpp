@@ -5583,7 +5583,11 @@ struct llama_moe_cache::impl {
             const char * e = getenv("LLAMA_MOE_FETCH_DEFER");
             return e != nullptr ? atoi(e) : 1;
         }();
-        if (mode == 0 || !overlap_batch(n_ubatch) || !single_req || single_off) {
+        // LLAMA_MOE_FETCH_DEFER_MAX_TOKENS (default 1): small batches of up to that many tokens (the mailbox's sizes) defer too (verify
+        // windows; a single token needs the overlap, which keeps the hits apart from the admitted experts)
+        static const int64_t max_tok = getenv("LLAMA_MOE_FETCH_DEFER_MAX_TOKENS") != nullptr ?
+            std::max<int64_t>(1, atoll(getenv("LLAMA_MOE_FETCH_DEFER_MAX_TOKENS"))) : 1;
+        if (mode == 0 || n_ubatch < 1 || n_ubatch > max_tok || (n_ubatch == 1 && !overlap_batch(n_ubatch)) || !single_req || single_off) {
             return false;
         }
         // only where the cache holds more than LLAMA_MOE_FETCH_DEFER_MIN_FRAC (0.25) of the host experts: a host-bound cache (Colab L4

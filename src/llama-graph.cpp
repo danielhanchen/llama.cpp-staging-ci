@@ -2927,7 +2927,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
         // k19-l4c deferred admission (LLAMA_MOE_FETCH_DEFER): the host computes the admitted experts too (they were published in the
         // host ids of the assign above), the copies only fill their slots for later batches; the device computes the hits alone
-        if (overlap && single_pub != nullptr && hybrid_host && hybrid->ne[1] == 6 && moe_cache->fetch_defer(n_tokens)) {
+        bool quant = true;
+        for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
+            quant = quant && (w == nullptr || ggml_is_quantized(w->type));
+        }
+        if ((overlap || n_tokens > 1) && quant && single_pub != nullptr && hybrid_host && moe_cache->fetch_defer(n_tokens)) {
             ggml_tensor * fetched = moe_cache->hybrid_fetch_experts(ctx0, il, hybrid, true);
             ggml_moe_cache_set_defer(hybrid, fetched);
             ggml_backend_sched_set_tensor_backend(sched, fetched, dev);

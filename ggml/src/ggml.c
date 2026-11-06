@@ -3791,7 +3791,7 @@ struct ggml_tensor * ggml_moe_cache_seed_fill(
 void ggml_moe_cache_set_defer(struct ggml_tensor * assign, struct ggml_tensor * fetch) {
     GGML_ASSERT(assign->op == GGML_OP_MOE_CACHE_LOOKUP && ggml_get_op_params_i32(assign, 10) == 1);
     GGML_ASSERT(fetch->op == GGML_OP_MOE_CACHE_LOOKUP && ggml_get_op_params_i32(fetch, 10) == 2 && ggml_get_op_params_i32(fetch, 12) == 1);
-    GGML_ASSERT(fetch->src[0] == assign && assign->ne[1] == 6); // one token: 5 rows of ids + the fill count row
+    GGML_ASSERT(fetch->src[0] == assign);
     // op param 9 of the assign (unused: host pointers of a lookup) = 1: admitted experts go to the host ids too
     ggml_set_op_params_i32(assign, 9, 1);
     // op param 12 of the fetch = 2: overlapped, never joined in the graph
