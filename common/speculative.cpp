@@ -13,6 +13,10 @@
 #include "spec-cost-policy.h"
 
 // k19-df2pp: the DFlash2 window beside a small MoE cache (see the draft window below)
+// k19-df2cost: (cached share at least, probability product bar) pairs of the DFlash2 window beside a MoE cache, first match wins
+#ifndef K19_DF2COST_CONF
+#define K19_DF2COST_CONF { 0.0, 0.0f }
+#endif
 #ifndef K19_DF2PP_TOK_ALL
 #define K19_DF2PP_TOK_ALL 5
 #endif
@@ -1468,7 +1472,51 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const char * e = getenv("LLAMA_DFLASH_P_CUM");
                     return e != nullptr ? std::max(0.0f, (float) atof(e)) : 0.0f;
                 }();
-                const float p_cum_thr = is_dflash2 ? p_cum_min : 0.0f;
+                // k19-df2cost: beside a MoE cache every further verify row pays the experts it misses, so by default the window of a
+                // DFlash2 draft ends where that product falls below a bar set by the cache's share of the host experts (a smaller cache: a
+                // higher bar, fewer rows). LLAMA_DFLASH_CACHED_CONF="s_0:c_0,s_1:c_1,..." (share at least s_i -> bar c_i, first match wins)
+                // replaces the table, LLAMA_DFLASH_CACHED_CONF=0 off; LLAMA_DFLASH_P_CUM set overrides it
+                static const bool p_cum_env = getenv("LLAMA_DFLASH_P_CUM") != nullptr;
+                static const std::vector<std::pair<double, float>> cached_conf = [] {
+                    std::vector<std::pair<double, float>> r = { K19_DF2COST_CONF };
+                    if (const char * e = getenv("LLAMA_DFLASH_CACHED_CONF")) {
+                        r.clear();
+                        const std::string v(e);
+                        size_t a = 0;
+                        while (a < v.size()) {
+                            size_t b = v.find(',', a);
+                            if (b == std::string::npos) {
+                                b = v.size();
+                            }
+                            double sh = 0.0;
+                            float  cf = 0.0f;
+                            if (sscanf(v.substr(a, b - a).c_str(), "%lf:%f", &sh, &cf) == 2) {
+                                r.push_back({ sh, cf });
+                            }
+                            a = b + 1;
+                        }
+                    }
+                    return r;
+                }();
+                float p_cum_cached = 0.0f;
+                if (is_dflash2 && !p_cum_env && !cached_conf.empty() && llama_moe_cache_active(params.ctx_tgt)) {
+                    const double share = llama_moe_cache_frac(params.ctx_tgt);
+                    if (share >= 0.0) {
+                        for (const auto & sc : cached_conf) {
+                            if (share >= sc.first) {
+                                p_cum_cached = sc.second;
+                                break;
+                            }
+                        }
+                        static bool logged = false;
+                        if (!logged && p_cum_cached > 0.0f) {
+                            logged = true;
+                            LOG_INF("k19-df2cost: DFlash2 window beside the MoE cache (cached share %.3f) ends where the drafts' probability "
+                                    "product falls below %.2f (LLAMA_DFLASH_CACHED_CONF=0 off)\n", share, (double) p_cum_cached);
+                        }
+                    }
+                }
+                const float p_cum_thr = is_dflash2 ? (p_cum_env ? p_cum_min : p_cum_cached) : 0.0f;
                 float p_cum = 1.0f;
                 // k19-handoff: LLAMA_DFLASH_P_CUM_EXP=a (default 1): the product above is of p^a, a temperature for a selector whose
                 // probabilities are not calibrated (a < 1 trusts a low p less)
