@@ -973,11 +973,16 @@ static __global__ void moe_mailbox_merge(const float * d, const int32_t * hid, c
                     ctl->sums[3] += wait > 2000;
                     ctl->sums[4] += dev + wait;
                     volatile uint64_t * tm = hdr->tm;
-                    const uint64_t t_host = tm[7];
-                    ctl->sums[5] += t_out > t_host ? t_out - t_host : 0;
+                    // signed: the two clocks are apart by an offset (sums wrap as two's complement)
+                    const int64_t d2 = (int64_t) (t_out - tm[7]);
+                    ctl->sums[5] += (uint64_t) d2;
+                    if (ctl->sums[0] == 1 || d2 < ctl->min_d2) {
+                        ctl->min_d2 = d2;
+                    }
                     for (int k = 0; k < 6; ++k) {
                         tm[k] = ctl->sums[k];
                     }
+                    tm[8] = (uint64_t) ctl->min_d2;
                 }
             }
         }

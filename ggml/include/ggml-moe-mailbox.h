@@ -28,8 +28,9 @@ struct ggml_moe_mailbox_hdr {
     // read back by it): [0] batches, [1] ns from the end of the publish to the merge's start (the device work beside the host),
     // [2] ns the merge waited for the host, [3] batches whose merge waited over 2 us, [4] ns from the publish to the end of the wait,
     // [5] ns from the host's completion stamp ([7], host CLOCK_REALTIME) to the end of the wait; [6] the publish's globaltimer stamp,
-    // stored before the request (the host reads it at the pickup); [7] the host's CLOCK_REALTIME stamp, stored before completed
-    uint64_t tm[8];     uint64_t pad6[8];
+    // stored before the request (the host reads it at the pickup); [7] the host's CLOCK_REALTIME stamp, stored before completed;
+    // [8] the smallest (end of the wait - [7]) as int64, for the clock offset (see llama_moe_cache single_timing_report)
+    uint64_t tm[12];    uint64_t pad6[4];
 };
 
 // device memory of a mailbox (zeroed at allocation)
@@ -40,7 +41,8 @@ struct ggml_moe_mailbox_ctl {
     uint32_t pad0;
     uint64_t t_pub;   // k19-overlap GGML_MOE_MAILBOX_TIMING: globaltimer at the end of the last publish with host rows
     uint64_t sums[6]; // k19-overlap GGML_MOE_MAILBOX_TIMING: the sums of ggml_moe_mailbox_hdr::tm, kept here and stored there
-    uint32_t pad[46];
+    int64_t  min_d2;  // k19-overlap GGML_MOE_MAILBOX_TIMING: hdr tm[8] (0 = none yet)
+    uint32_t pad[44];
 };
 
 GGML_MOE_MAILBOX_FN size_t ggml_moe_mailbox_align(size_t n) {
