@@ -2867,11 +2867,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // anyway, and the early note only lowers the weighed split before they do: G4 q4x 16 GB + MTP (61% cached) and q3m 12 GB (55%)
         // turned the host path on for the first windows' 7-12% misses (k15g4n), -5..-9% chat decode against NOTE_PLAIN=0; the gate
         // gives NOTE_PLAIN=0's decode there (k15g4g: 316 vs 299, 336 vs 305 tok/s) and k15's where it wins, decisions and md5 included
-        // k19-miss48: a mailbox that takes 5..8-token batches (many-core host, see single_max_tok) notes the form at any share; above
-        // the gate only those wide sizes weigh the mailbox's split from it (single_narrow_blocked)
-        static const double note_plain_max = llama_moe_cache::note_plain_max_frac();
+        static const double note_plain_max = [] {
+            const char * e = getenv("LLAMA_MOE_SINGLE_NOTE_PLAIN_MAX_FRAC");
+            return e != nullptr ? atof(e) : llama_moe_cache::trial_frac_single();
+        }();
         const double note_frac = moe_cache ? moe_cache->cache_frac() : -1.0;
-        if (note_plain && slots != nullptr && hybrid_ok && note_frac >= 0.0 && (note_frac < note_plain_max || moe_cache->single_wide_note())) {
+        if (note_plain && slots != nullptr && hybrid_ok && note_frac >= 0.0 && note_frac < note_plain_max) {
             moe_cache->single_note_form(il, type_op == LLM_FFN_SILU && up_exps && gate_exps && !gate_up_exps && !up_exps_s_h && !gate_exps_s_h &&
                 !down_exps_s && !up_exps_b_h && !gate_exps_b_h && !gate_up_exps_b_h && !(il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f));
         }

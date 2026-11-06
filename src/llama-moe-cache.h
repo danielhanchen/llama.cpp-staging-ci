@@ -47,9 +47,6 @@ public:
 
     // the share of the host experts below which a mailbox cache skips its timing trials (LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE, 0.50)
     static double trial_frac_single();
-    // k15-np: the share of the host experts below which every graph notes the mailbox form early (LLAMA_MOE_SINGLE_NOTE_PLAIN_MAX_FRAC,
-    // default trial_frac_single())
-    static double note_plain_max_frac();
 
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     // size is already the share of the layer set (see budget)
@@ -151,9 +148,6 @@ public:
     ggml_tensor * single_merge(ggml_context * ctx, ggml_tensor * dev, ggml_tensor * pub) const;
     // the graph builder tells whether layer il has the expert form the host plans compute (see single_weigh)
     void single_note_form(int32_t il, bool ok) const;
-    // k19-miss48: the mailbox takes batches of more than 4 tokens (a many-core host): the form is noted early at any cached share, only
-    // those wide sizes weigh the mailbox's split from it above note_plain_max_frac()
-    bool single_wide_note() const;
     // k15: the context marks each decode: a prompt batch (tokens without outputs) keeps its ubatches off the CPU-miss host path while
     // the small batches are pinned (see cm_prompt_off)
     void set_prompt_batch(bool prompt, int64_t n_tokens_all = 0);
