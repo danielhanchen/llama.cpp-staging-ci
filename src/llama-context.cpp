@@ -8327,14 +8327,17 @@ bool llama_context::restore_pp_plan(bool idle) {
 // GGML_SCHED_DEBUG_REALLOC=1, test-llama-context rf on ROCm0: a 24-token decode after an 8-token one; on CPU the allocator re-plans a
 // single buffer silently). The first such graph after a pp plan reserves the largest host-mask ubatch instead, with every cell, as
 // the pp reservation does: the small ubatches up to it then fit one plan (upstream: one plan fits every ubatch). Only the allocation
-// plan changes, not the computation. The kept small graphs (k11-decode) keep their own plans. LLAMA_SMALL_PLAN_MAX=0: off
+// plan changes, not the computation. The kept small graphs (k11-decode) keep their own plans, single-token decodes re-plan for
+// themselves as before (see below). LLAMA_SMALL_PLAN_MAX=0: off
 void llama_context::reserve_small_max(const llama_ubatch & ubatch) {
     static const bool env = getenv("LLAMA_SMALL_PLAN_MAX") == nullptr || atoi(getenv("LLAMA_SMALL_PLAN_MAX")) != 0;
     if (!env || sched_plan_small_max > 0 || !memory || moe_cache || model.hparams.no_alloc || sched_need_reserve) {
         return;
     }
+    // single-token decodes keep re-planning for their own graph, as before: it is the cheaper plan, and the reserve (a graph build and
+    // split more) at the first token after every prompt cost L4 Qwen3.5-0.8B 2k prompts ~3% (TTFT); the next multi-token one reserves
     const uint32_t n_host = llm_graph_kq_mask_host_max_tokens(model.hparams, cparams);
-    if (n_host == 0 || ubatch.n_tokens > n_host || std::min(cparams.n_ctx, cparams.n_ubatch) <= n_host) {
+    if (n_host == 0 || ubatch.n_tokens < 2 || ubatch.n_tokens > n_host || std::min(cparams.n_ctx, cparams.n_ubatch) <= n_host) {
         return;
     }
     const uint32_t n_seqs_r = (model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_MINIMAX_01) ? 1 : cparams.n_seq_max;
@@ -8358,10 +8361,8 @@ void llama_context::reserve_small_max(const llama_ubatch & ubatch) {
 void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
-    // k19-uma: a larger graph replaced the plan of the largest host-mask ubatch
-    if (lctx->prefetch_n_tokens > lctx->sched_plan_small_max) {
-        lctx->sched_plan_small_max = 0;
-    }
+    // k19-uma: another graph replaced the plan of the largest host-mask ubatch
+    lctx->sched_plan_small_max = 0;
 
     if (lctx->prefetch_n_tokens <= 2*GF_SMALL_MAX) {
         lctx->sched_plan_small = true;
