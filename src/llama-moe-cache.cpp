@@ -6277,9 +6277,9 @@ struct llama_moe_cache::impl {
         // k19-calib (LLAMA_MOE_CPU_MISS_CAL_ROBUST, default 1; 0 = the single sample set of before): one sample set of 11 repetitions
         // (about 50 ms) is a launch lottery on a small host: Colab L4 LFM2.5 (12 vCPUs, 6 decode threads) timed the further token of an
         // expert at ~73 or ~130 us per launch for the same bin (u13g_l4 / u12_l4b / i3h_l4, both bins), the slow value moved the fetch
-        // shares and the per-launch decode by ~3%. Robust: 3 untimed warm-up repetitions, then cm_cal_sets() sample sets with a pause
-        // between them (the pool's threads park and are placed again), each quantity the fastest set median (a slow set is a busy or
-        // badly placed host, never a faster path). LLAMA_MOE_CPU_MISS_CAL_LOG=1: every sample, the process CPU time per wall time, the
+        // shares and the per-launch decode by ~3%. Robust: 3 untimed warm-up repetitions, then 3 (start-up) / 5 (re-calibration) sample
+        // sets, a set during which other processes kept CPUs busy retried after a pause; each graph time is the fastest clean set median
+        // (a slow set is a busy host, never a faster path), the file keeps the median host time per expert (see below). LLAMA_MOE_CPU_MISS_CAL_LOG=1: every sample, the process CPU time per wall time, the
         // other processes' busy CPUs, context switches and page faults of each set (the diagnosis of k19-calib)
         static const bool cal_robust = [] {
             const char * e = getenv("LLAMA_MOE_CPU_MISS_CAL_ROBUST");
@@ -6389,10 +6389,13 @@ struct llama_moe_cache::impl {
             double ma = 0.0, mb = 0.0, mt = 0.0, iqr = 0.0;     // over the clean sets
             double ca = 0.0, cb = 0.0, ct = 0.0, ciqr = 0.0;   // over every set (all contended: these)
             int n_clean = 0, n_all = 0, n_busy = 0;
+            bool last_busy = false;
             const int n_extra = cal_robust ? 6 : 0;
             while (n_clean < n_sets_rb && n_all < n_sets_rb + n_extra && !(n_all >= n_sets_rb && n_busy == 0)) {
-                if (n_all > 0) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(n_busy > 0 ? 25 : 10));
+                // back to back as before unless the last set was contended (a pause re-places the pool's threads: on G4 it also turned the
+                // re-calibration's decode-time 34-36 us per expert into the idle 23, which decodes 24 GB chat 2-3% slower, kcal3_g4)
+                if (last_busy) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(25));
                 }
                 std::vector<int64_t> ta, tb, tt;
                 if (!sample_set(ta, tb, tt)) {
@@ -6405,7 +6408,8 @@ struct llama_moe_cache::impl {
                 ciqr = n_all == 0 ? q : std::min(ciqr, q);
                 slopes_all.push_back(kb > ka ? (b - a)/(kb - ka) : a/ka);
                 n_all++;
-                if (cal_robust && set_others > busy_max) {
+                last_busy = cal_robust && set_others > busy_max;
+                if (last_busy) {
                     n_busy++;
                     continue;
                 }
