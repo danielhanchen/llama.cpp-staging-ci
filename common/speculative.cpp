@@ -1555,8 +1555,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // only where the cache's device slots hold the experts of fewer than LLAMA_DFLASH_CACHED_TOKENS_MAX (12) tokens: G4 fn4 12 / 16 GB
                 // hold 3 / 7, 48 GB 32 (there the full-card costs stay opt-in, LLAMA_DFLASH_WINDOW=2)
                 static const int32_t df2_cached_tok_max = getenv("LLAMA_DFLASH_CACHED_TOKENS_MAX") ? atoi(getenv("LLAMA_DFLASH_CACHED_TOKENS_MAX")) : 12;
-                // k19-df2cost (opt-in: LLAMA_DFLASH_CACHED_FRAC_MAX=0.5; default 0 = off: the srv_kld gate at 32 GB died of a CUDA out of
-                // memory with it, the MoE cache fit leaves no room for the second width's graphs, plans/k19_df2cost.md round 6): also
+                // k19-df2cost (LLAMA_DFLASH_CACHED_FRAC_MAX, default K19_DF2COST_FRAC_MAX 0.5; 0 = off; the cache leaves
+                // LLAMA_DFLASH_CACHED_RESERVE_MIB for the second width's graphs, see common.cpp: without it the srv_kld gate at 32 GB died
+                // of a CUDA out of memory, plans/k19_df2cost.md round 6): also
                 // where the cache holds LLAMA_DFLASH_CACHED_FRAC_MIN (0.20) .. LLAMA_DFLASH_CACHED_FRAC_MAX of the
                 // host experts (llama_moe_cache_frac; G4 fn4 24 GB 27.5%, 32 GB 42%), at every position, with that band's pass costs
                 // (LLAMA_DFLASH_CACHED_COST_MID="c_lo,slope", default 15 ms at 3 rows + 2.3 ms per further row: G4 fn4 fixed-width passes
@@ -1564,7 +1565,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // than a 3-row one at 8k (dc_r6, 3 launches: 32 GB 143.6 -> 166.0, 24 GB 105.2 -> 129.8 tok/s; chat +1 / +5%).
                 // LLAMA_DFLASH_CACHED_WINDOW=0 turns it off with the band below it
                 static const double df2_mid_lo = getenv("LLAMA_DFLASH_CACHED_FRAC_MIN") ? atof(getenv("LLAMA_DFLASH_CACHED_FRAC_MIN")) : 0.20;
-                static const double df2_mid_hi = getenv("LLAMA_DFLASH_CACHED_FRAC_MAX") ? atof(getenv("LLAMA_DFLASH_CACHED_FRAC_MAX")) : 0.0;
+#ifndef K19_DF2COST_FRAC_MAX
+#define K19_DF2COST_FRAC_MAX 0.5
+#endif
+                static const double df2_mid_hi = getenv("LLAMA_DFLASH_CACHED_FRAC_MAX") ? atof(getenv("LLAMA_DFLASH_CACHED_FRAC_MAX")) : K19_DF2COST_FRAC_MAX;
                 static const std::pair<double, double> df2_mid_cost = [] {
                     std::pair<double, double> c = { 15.0, 2.3 };
                     if (const char * e = getenv("LLAMA_DFLASH_CACHED_COST_MID")) {
