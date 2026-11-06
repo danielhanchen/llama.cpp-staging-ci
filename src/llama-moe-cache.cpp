@@ -2287,10 +2287,29 @@ struct llama_moe_cache::impl {
     // only where the cache holds at most LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC (0.25) of the host experts: Colab L4 Flint 16 GB
     // (55.8% cached) with a team of 10 waiting blocked: chat 57.6 [50.0-57.6] vs 58.3, 2k 66.1 vs 73.3; LFM2.5 8 GB (40%) on the base's
     // own texts chat +4%, 2k -3%, 8k -4% (l4p_f1; l4p_g5a +3.0 / -5.8 / -1.9%, l4p_a7 +8 / +9 / +13% on a slower VM)
+    // k19-l4c: also where the deferred admission takes the cache (fetch_defer_frac: more than a quarter of the host experts cached): it
+    // moves the admitted experts to the host, so the host team is the critical path there too. Colab L4 LFM2.5 8 GB (40% cached), ms per
+    // pass at chat: base 18.7, deferral 18.2, deferral + team of 10 waiting blocked 17.3, PolyStrata 17.0; at 2k / 8k the same text
+    // costs the same per pass with either team (39.7 vs 39.8 / 37.9 ms at 3.61 tokens per pass, 28.1 vs 27.9 / 27.7 at 2.39) (l4c_a3).
+    // An explicit LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC keeps its meaning
     bool single_wait_blocking_here() const {
-        static const double max_frac = getenv("LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC") != nullptr ?
-            std::max(0.0, atof(getenv("LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC"))) : 0.25;
-        return single_wait_blocking() != nullptr && cache_frac >= 0.0 && cache_frac <= max_frac;
+        static const bool user_frac = getenv("LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC") != nullptr;
+        static const double max_frac = user_frac ? std::max(0.0, atof(getenv("LLAMA_MOE_SINGLE_WAIT_BLOCKING_MAX_FRAC"))) : 0.25;
+        return single_wait_blocking() != nullptr && cache_frac >= 0.0 && (cache_frac <= max_frac || (!user_frac && fetch_defer_frac()));
+    }
+    // k19-l4c: the deferred admission's own gate without the host-team test (LLAMA_MOE_FETCH_DEFER on, more than
+    // LLAMA_MOE_FETCH_DEFER_MIN_FRAC of the host experts cached); fetch_defer adds the team, the batch size and the mailbox
+    static int fetch_defer_mode() {
+        static const int mode = [] {
+            const char * e = getenv("LLAMA_MOE_FETCH_DEFER");
+            return e != nullptr ? atoi(e) : 1;
+        }();
+        return mode;
+    }
+    bool fetch_defer_frac() const {
+        static const double min_frac = getenv("LLAMA_MOE_FETCH_DEFER_MIN_FRAC") != nullptr ?
+            std::max(0.0, atof(getenv("LLAMA_MOE_FETCH_DEFER_MIN_FRAC"))) : 0.25;
+        return fetch_defer_mode() != 0 && cache_frac > min_frac;
     }
     static void (*single_wait_blocking())(bool) {
         static void (*fn)(bool) = [] {
@@ -5579,10 +5598,7 @@ struct llama_moe_cache::impl {
     // EPYC, whose host has no team, nor a 4-vCPU T4). The admissions and the cache state are the same as without it; the admitted
     // experts are computed on the host (int8 activations) instead of the device, so the output changes: KLD-gated
     bool fetch_defer(int64_t n_ubatch) const {
-        static const int mode = [] {
-            const char * e = getenv("LLAMA_MOE_FETCH_DEFER");
-            return e != nullptr ? atoi(e) : 1;
-        }();
+        const int mode = fetch_defer_mode();
         // LLAMA_MOE_FETCH_DEFER_MAX_TOKENS (default 1): small batches of up to that many tokens (the mailbox's sizes) defer too (verify
         // windows; a single token needs the overlap, which keeps the hits apart from the admitted experts)
         static const int64_t max_tok = getenv("LLAMA_MOE_FETCH_DEFER_MAX_TOKENS") != nullptr ?
@@ -5590,12 +5606,10 @@ struct llama_moe_cache::impl {
         if (mode == 0 || n_ubatch < 1 || n_ubatch > max_tok || (n_ubatch == 1 && !overlap_batch(n_ubatch)) || !single_req || single_off) {
             return false;
         }
-        // only where the cache holds more than LLAMA_MOE_FETCH_DEFER_MIN_FRAC (0.25) of the host experts: a host-bound cache (Colab L4
-        // LFM2.5 4 GB, 16% cached) already keeps the host team busy for the whole step, the admitted experts on top of it cost more than
-        // the copies they save (l4c_a2: chat 42.9 vs 44.7 tok/s); LFM2.5 8 GB (40%) +3.5%, Flint 16 GB (56%)
-        static const double min_frac = getenv("LLAMA_MOE_FETCH_DEFER_MIN_FRAC") != nullptr ?
-            std::max(0.0, atof(getenv("LLAMA_MOE_FETCH_DEFER_MIN_FRAC"))) : 0.25;
-        const bool on = (mode == 2 || single_team_host()) && cache_frac > min_frac;
+        // only where the cache holds more than LLAMA_MOE_FETCH_DEFER_MIN_FRAC (0.25) of the host experts (fetch_defer_frac): a host-bound
+        // cache (Colab L4 LFM2.5 4 GB, 16% cached) already keeps the host team busy for the whole step, the admitted experts on top of
+        // it cost more than the copies they save (l4c_a2: chat 42.9 vs 44.7 tok/s); LFM2.5 8 GB (40%) +4%, Flint 16 GB (56%) +1%
+        const bool on = (mode == 2 || single_team_host()) && fetch_defer_frac();
         static std::atomic<bool> logged{false};
         if (on && !logged.exchange(true)) {
             LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4c deferred admission: single token ubatches compute the admitted experts on the host, their "
