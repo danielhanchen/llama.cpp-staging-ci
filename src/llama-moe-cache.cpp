@@ -2306,10 +2306,16 @@ struct llama_moe_cache::impl {
         }();
         return mode;
     }
+    // and at most LLAMA_MOE_FETCH_DEFER_MAX_FRAC (0.5): Colab L4 Flint 16 GB (56% cached) gained only on chat (59.9 vs 59.1 tok/s)
+    // while its 2k cell lost 19% (59.6 vs 73.4: the cheaper single token steps price the n-gram windows out, 27 vs 90 accepted
+    // drafts per 256, the same text in 3 of 3 launches), and with its host path off (the stack's k19-l4poly levers off) the blocking
+    // wait alone cost 2.4% (52.7 vs 54.0, same text) (l4c_f4)
     bool fetch_defer_frac() const {
         static const double min_frac = getenv("LLAMA_MOE_FETCH_DEFER_MIN_FRAC") != nullptr ?
             std::max(0.0, atof(getenv("LLAMA_MOE_FETCH_DEFER_MIN_FRAC"))) : 0.25;
-        return fetch_defer_mode() != 0 && cache_frac > min_frac;
+        static const double max_frac = getenv("LLAMA_MOE_FETCH_DEFER_MAX_FRAC") != nullptr ?
+            std::max(0.0, atof(getenv("LLAMA_MOE_FETCH_DEFER_MAX_FRAC"))) : 0.50;
+        return fetch_defer_mode() != 0 && cache_frac > min_frac && cache_frac <= max_frac;
     }
     static void (*single_wait_blocking())(bool) {
         static void (*fn)(bool) = [] {
@@ -5606,9 +5612,10 @@ struct llama_moe_cache::impl {
         if (mode == 0 || n_ubatch < 1 || n_ubatch > max_tok || (n_ubatch == 1 && !overlap_batch(n_ubatch)) || !single_req || single_off) {
             return false;
         }
-        // only where the cache holds more than LLAMA_MOE_FETCH_DEFER_MIN_FRAC (0.25) of the host experts (fetch_defer_frac): a host-bound
-        // cache (Colab L4 LFM2.5 4 GB, 16% cached) already keeps the host team busy for the whole step, the admitted experts on top of
-        // it cost more than the copies they save (l4c_a2: chat 42.9 vs 44.7 tok/s); LFM2.5 8 GB (40%) +4%, Flint 16 GB (56%) +1%
+        // only where the cache holds more than LLAMA_MOE_FETCH_DEFER_MIN_FRAC (0.25) and at most LLAMA_MOE_FETCH_DEFER_MAX_FRAC (0.5) of the
+        // host experts (fetch_defer_frac): a host-bound cache (Colab L4 LFM2.5 4 GB, 16% cached) already keeps the host team busy for
+        // the whole step, the admitted experts on top of it cost more than the copies they save (l4c_a2: chat 42.9 vs 44.7 tok/s);
+        // LFM2.5 8 GB (40%) +4% alone, +8-12% with the team of 10 waiting blocked; Flint 16 GB (56%): see fetch_defer_frac
         const bool on = (mode == 2 || single_team_host()) && fetch_defer_frac();
         static std::atomic<bool> logged{false};
         if (on && !logged.exchange(true)) {
