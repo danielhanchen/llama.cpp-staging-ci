@@ -5586,7 +5586,12 @@ struct llama_moe_cache::impl {
         if (mode == 0 || !overlap_batch(n_ubatch) || !single_req || single_off) {
             return false;
         }
-        const bool on = mode == 2 || single_team_host();
+        // only where the cache holds more than LLAMA_MOE_FETCH_DEFER_MIN_FRAC (0.25) of the host experts: a host-bound cache (Colab L4
+        // LFM2.5 4 GB, 16% cached) already keeps the host team busy for the whole step, the admitted experts on top of it cost more than
+        // the copies they save (l4c_a2: chat 42.9 vs 44.7 tok/s); LFM2.5 8 GB (40%) +3.5%, Flint 16 GB (56%)
+        static const double min_frac = getenv("LLAMA_MOE_FETCH_DEFER_MIN_FRAC") != nullptr ?
+            std::max(0.0, atof(getenv("LLAMA_MOE_FETCH_DEFER_MIN_FRAC"))) : 0.25;
+        const bool on = (mode == 2 || single_team_host()) && cache_frac > min_frac;
         static std::atomic<bool> logged{false};
         if (on && !logged.exchange(true)) {
             LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4c deferred admission: single token ubatches compute the admitted experts on the host, their "
