@@ -5100,6 +5100,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         mem_idx->set_n_kv_bucket_allowed(!(llama_exact_verify_env() || cparams.verify_exact));
         // k19-graph: the device KV length is read by flash attention only
         mem_idx->set_n_kv_bucket_dev_allowed(cparams.flash_attn);
+        // k19-fullcost (LLAMA_KV_BUCKET_DEV_STEP_MIN=N overrides): without a MoE cache, device KV buckets of at least 16384 cells (was
+        // 2048), so a chat request and an 8k one share the bucket of the verify graphs the server prewarmed at load
+        // (server_spec_prewarm) and replay them instead of re-capturing each width (G4 fn4 full card, fc_r3: the width rule over every
+        // width 8k 264.9 -> 292.7 tok/s; at a fixed width the extra masked cells cost nothing there, MTP n2 chat / 8k 306.7 / 255.2 ->
+        // 307.8 / 257.2 in fc_r1). Beside a MoE cache (no prewarm there) the 2048-cell step stays: fc_r4 16 / 32 GB were 2-4% slower
+        // with 16384 (host input fill beside the host's expert work)
+        mem_idx->set_n_kv_bucket_dev_wide(moe_cache == nullptr);
     }
 
     // k19-placemid (LLAMA_MOE_PLACE8_CHUNK_MAX=N; default 64 on a mid-size device, 0 = off, at 8 GB opt-in): a short prompt of at most N
@@ -8167,7 +8174,19 @@ ggml_cgraph * llama_context::graph_reserve(
             res->reset();
         }
     }
-    gf_res_prev_active = nullptr; gf_res_epoch_bump(__LINE__);
+    gf_res_prev_active = nullptr;
+    // k19-fullcost (LLAMA_PP_RERESERVE_KEEP_SMALL=0: off): the idle re-reserve of the pp graph (restore_pp_plan) invalidated the kept
+    // decode / verify graphs of every size at each request's start, so a request built every verify width again (graph build, an eager
+    // pass and a CUDA graph capture under a new key: ~47 ms per width on G4 Flash-Next; a width rule over every width paid 1.3-2 ms per
+    // pass in chat / 8k, and the prewarmed widths of LLAMA_SPEC_PREWARM never matched a request). The reserve only plans the allocator's
+    // addresses: a kept graph is invalid only if a buffer of the allocator was replaced, which the allocator's generation tells (the same
+    // check ggml_backend_sched_plan_restore makes). So the kept graphs survive a re-reserve that replaced no buffer
+    static const bool keep_small_env = getenv("LLAMA_PP_RERESERVE_KEEP_SMALL") == nullptr || atoi(getenv("LLAMA_PP_RERESERVE_KEEP_SMALL")) != 0;
+    const bool     keep_small = keep_small_env && reserve_keep_small && !split_only;
+    const uint64_t gen_before = keep_small ? ggml_backend_sched_get_alloc_generation(sched.get()) : 0;
+    if (!keep_small) {
+        gf_res_epoch_bump(__LINE__);
+    }
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -8220,7 +8239,21 @@ ggml_cgraph * llama_context::graph_reserve(
     } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
         GGML_ASSERT(!sizes);
         LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+        if (keep_small) {
+            gf_res_epoch_bump(__LINE__);
+        }
         return nullptr;
+    }
+    if (keep_small) {
+        if (ggml_backend_sched_get_alloc_generation(sched.get()) != gen_before) {
+            gf_res_epoch_bump(__LINE__);
+        } else {
+            static int n_log = 0;
+            if (n_log++ == 0) {
+                LLAMA_LOG_INFO("%s: k19-fullcost: the pp graph re-reserve replaced no buffer: the kept decode / verify graphs stay valid "
+                    "(LLAMA_PP_RERESERVE_KEEP_SMALL=0: off)\n", __func__);
+            }
+        }
     }
 
     // k16-draft (debug, LLAMA_RESERVE_TRACE=1): every reserve's device buffer sizes, also in a memory probe (whose log the fit silences)
@@ -8332,7 +8365,10 @@ bool llama_context::restore_pp_plan(bool idle) {
     const uint32_t n_seqs_r    = (model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_MINIMAX_01) ? 1 : cparams.n_seq_max;
     const uint32_t n_tokens_r  = std::min(cparams.n_ctx, cparams.n_ubatch);
     const uint32_t n_outputs_r = std::min(n_tokens_r, cparams.n_outputs_max);
-    if (graph_reserve(n_tokens_r, n_seqs_r, n_outputs_r, mctx_full.get()) == nullptr) {
+    reserve_keep_small = true;
+    ggml_cgraph * gf_r = graph_reserve(n_tokens_r, n_seqs_r, n_outputs_r, mctx_full.get());
+    reserve_keep_small = false;
+    if (gf_r == nullptr) {
         LLAMA_LOG_WARN("%s: re-reserving the pp graph failed\n", __func__);
         return false;
     }

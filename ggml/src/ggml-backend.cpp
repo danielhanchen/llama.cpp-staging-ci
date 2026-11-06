@@ -5765,6 +5765,10 @@ ggml_backend_sched_plan_t ggml_backend_sched_plan_save(ggml_backend_sched_t sche
     return p;
 }
 
+uint64_t ggml_backend_sched_get_alloc_generation(ggml_backend_sched_t sched) {
+    return ggml_gallocr_get_generation(sched->galloc);
+}
+
 bool ggml_backend_sched_plan_restore(ggml_backend_sched_t sched, ggml_backend_sched_plan_t p) {
     const char * why = p == NULL ? "no plan" : p->sched != sched ? "other scheduler" : p->gen != ggml_gallocr_get_generation(sched->galloc) ?
         "graph buffers replaced" : ggml_gallocr_has_external(sched->galloc) ? "lent memory" :

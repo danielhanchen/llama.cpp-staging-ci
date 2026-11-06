@@ -82,6 +82,9 @@ public:
     void set_n_kv_bucket_allowed(bool value);
     // k19-graph: see llama_kv_cache::set_n_kv_bucket_dev_allowed (both caches)
     void set_n_kv_bucket_dev_allowed(bool value);
+    // k19-fullcost: device KV buckets of at least 16384 cells (wide) instead of 2048, unless LLAMA_KV_BUCKET_DEV_STEP_MIN is set (both
+    // caches; llama_context: a context without a MoE cache, where the server prewarms the verify graphs)
+    void set_n_kv_bucket_dev_wide(bool wide);
 
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
@@ -136,6 +139,7 @@ private:
     llama_pos mem_idx_stale_pos(llama_seq_id seq_id, llama_pos p0) const;
 
     stale_pos_t mem_idx_stale = stale_pos_clean();
+    bool dev_step_min_env = false; // k19-fullcost: LLAMA_KV_BUCKET_DEV_STEP_MIN given
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {

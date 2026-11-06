@@ -220,6 +220,8 @@ public:
     void set_n_kv_bucket_allowed(bool value) { n_kv_bucket_allowed = value; }
     // k19-graph: the device KV length buckets (n_kv_bucket_params::dev_len) only where flash attention runs (the context's choice)
     void set_n_kv_bucket_dev_allowed(bool value) { n_kv_bucket_dev_allowed = value; }
+    // k19-fullcost: see llama_memory_hybrid_idx::set_n_kv_bucket_dev_wide
+    void set_n_kv_bucket_dev_step_min(uint32_t value) { n_kv_bucket.dev_step_min = value; }
     // k19-graph: every attention layer's K / V sits on a device whose flash attention takes the KV length on the device
     bool fa_kv_len_supported() const;
 
