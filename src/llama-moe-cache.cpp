@@ -2246,10 +2246,36 @@ struct llama_moe_cache::impl {
     // host plans are the split's ops on the same rows, so 5-8 row batches on the mailbox are exact (cloud gate, plans/k17_models.md 4a:
     // md5 equal, 4.7x the host batches). Opt-in because it does not pay: Colab L4 (6 host threads) LFM2.5 8 GB with the same drafts in
     // both arms, 2k 84.9 vs 90.2 tok/s, 8k (LONG_CM=3) 74.5 vs 78.1; G4 Flint long48 within 1% (plans/k17_models.md 4c / 4d)
+    // k19-miss48: on a many-core host (LLAMA_MOE_SINGLE_WIDE_MIN_CPUS, default 32 logical CPUs; LLAMA_MOE_SINGLE_WIDE=0 off) the default
+    // is GGML_MOE_MAILBOX_MAX_TOKENS (8), so a DFlash2 7-row verify publishes its host experts to the mailbox instead of taking the
+    // eager split (32 GB) or fetching every miss over PCIe (48 GB). Colab G4 (48 vCPU, 23 decode threads), Flash-Next UD-IQ4_XS
+    // DFlash2 n6: see plans/k19_miss48.md. The 12-vCPU hosts of the k17 / k19-ampere measurements (L4, A100) keep 4
+    static bool single_wide_host() {
+        static const bool v = [] {
+            const char * e  = getenv("LLAMA_MOE_SINGLE_WIDE");
+            const char * em = getenv("LLAMA_MOE_SINGLE_WIDE_MIN_CPUS");
+            const int min_cpus = em != nullptr ? atoi(em) : 32;
+            return !(e != nullptr && atoi(e) == 0) && llama_moe_n_cpus() >= min_cpus;
+        }();
+        return v;
+    }
     const int single_max_tok = [] {
         const char * e = getenv("LLAMA_MOE_SINGLE_MAX_TOKENS");
-        return std::max(1, std::min<int>(GGML_MOE_MAILBOX_MAX_TOKENS, e != nullptr ? atoi(e) : 4));
+        return std::max(1, std::min<int>(GGML_MOE_MAILBOX_MAX_TOKENS, e != nullptr ? atoi(e) : (single_wide_host() ? GGML_MOE_MAILBOX_MAX_TOKENS : 4)));
     }();
+    // k19-miss48: batches of up to 4 tokens (the k15 mailbox sizes) keep their k15-np rule: above LLAMA_MOE_SINGLE_NOTE_PLAIN_MAX_FRAC
+    // of the host experts cached (see llama-graph.cpp) they are weighed with the full split until a batch of that size published
+    // (single_narrow_seen); only the wide sizes (5..single_max_tok) take the mailbox's split from the early note there. So MTP's 1-3
+    // row batches at 48 GB keep the base's decisions. LLAMA_MOE_SINGLE_WIDE_NARROW=1: every size from the early note
+    static constexpr int single_narrow_max = 4;
+    bool single_narrow_seen = false;
+    bool single_wide_note() const {
+        return single_max_tok > single_narrow_max && single_req && !single_off && !single_no_alloc;
+    }
+    bool single_narrow_blocked(int64_t n) const {
+        static const bool narrow_env = getenv("LLAMA_MOE_SINGLE_WIDE_NARROW") != nullptr && atoi(getenv("LLAMA_MOE_SINGLE_WIDE_NARROW")) != 0;
+        return n <= single_narrow_max && !narrow_env && !single_narrow_seen && cache_frac >= llama_moe_cache::note_plain_max_frac();
+    }
 
     // k19-l4poly: the CPU backend's host team serves (or, before the first mailbox, would serve) this cache's host batches: a small
     // host whose expert compute is the critical path (the rule of single_register: decode threads + a third, more than the old team)
@@ -6748,7 +6774,7 @@ struct llama_moe_cache::impl {
                     const char * e = getenv("LLAMA_MOE_SINGLE_MIN_MISSES");
                     return e != nullptr ? std::max(0.0, atof(e)) : 0.0;
                 }();
-                const bool mb_cheap = n <= max_batch && single_weigh() && single_usable(n) && m >= mb_min_misses;
+                const bool mb_cheap = n <= max_batch && single_weigh() && single_usable(n) && m >= mb_min_misses && !single_narrow_blocked(n);
                 // k19-l4poly: on a host whose host experts run on the host team (a small host, see single_team_host), where the timing
                 // trials run, a small batch is a candidate at LLAMA_MOE_CPU_MISS_SPLIT_SCALE_TEAM (0.5) times the weighed split instead of
                 // cm_split_scale (3, set on G4 for the graph split's unmodelled cost): the trial then decides it. Colab L4 Flint 16 GB
@@ -9442,6 +9468,18 @@ size_t llama_moe_cache::budget(const llama_model & model, size_t size, layer_set
     return set == layer_set::nextn ? mtp : size - mtp;
 }
 
+double llama_moe_cache::note_plain_max_frac() {
+    static const double v = [] {
+        const char * e = getenv("LLAMA_MOE_SINGLE_NOTE_PLAIN_MAX_FRAC");
+        return e != nullptr ? atof(e) : llama_moe_cache::trial_frac_single();
+    }();
+    return v;
+}
+
+bool llama_moe_cache::single_wide_note() const {
+    return pimpl->single_wide_note();
+}
+
 double llama_moe_cache::trial_frac_single() {
     static const double v = [] {
         const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_FRAC_SINGLE");
@@ -9628,6 +9666,9 @@ ggml_tensor * llama_moe_cache::single_publish(ggml_context * ctx, int32_t il, gg
     auto * mb = pimpl->single_mailbox(il, (int) host_ids->ne[0], (int) x->ne[0], up, gate, down);
     if (mb == nullptr) {
         return nullptr;
+    }
+    if (host_ids->ne[1] <= impl::single_narrow_max) {
+        pimpl->single_narrow_seen = true;
     }
     return ggml_moe_mailbox_publish(ctx, host_ids, x, mb->mdev, mb->ctl, il);
 }
