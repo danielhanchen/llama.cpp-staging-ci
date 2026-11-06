@@ -34,6 +34,10 @@
 #define SPEC_SPILL_LFM_CM     3
 #define SPEC_SPILL_GEMMA4_GATE 0
 #define SPEC_SPILL_GEMMA4_CM  0
+// k19-agn: spill mode of the archs not named in server_spec_spill_mode (gpt-oss, Kolibri, GLM without its MTP block, ...)
+#ifndef SPEC_SPILL_GENERIC
+#define SPEC_SPILL_GENERIC    1
+#endif
 #endif
 #ifndef SPEC_SPILL_MIN_MATCH_GATE
 #define SPEC_SPILL_MIN_MATCH_GATE 16
@@ -221,5 +225,12 @@ static int server_spec_spill_mode(const std::string & arch, int32_t host_mode, i
     if (arch == "gemma4") {
         return host_mode == 1 ? SPEC_SPILL_GEMMA4_GATE : SPEC_SPILL_GEMMA4_CM;
     }
-    return 0;
+    // k19-agn: every other arch took mode 0, so a MoE cache with the CPU-miss rule (or the hybrid gate) dropped the default drafts that
+    // the same cache without it keeps (verified with the reassociated verify): G4 gpt-oss-20b Q2_K 8 GB 8k 250 tok/s by default vs 412 with
+    // LLAMA_MOE_CPU_MISS=0. Mode 1 (drafts verified as ordinary batches with the host path, nothing pinned) is Flint's, the arch-neutral
+    // one; changes text where it drafts, KLD-gated (plans/k19_agn.md). LLAMA_SPEC_SPILL_GENERIC=0: mode 0 (the previous default), N: mode N
+    if (const char * e = getenv("LLAMA_SPEC_SPILL_GENERIC")) {
+        return std::max(0, std::min(3, atoi(e)));
+    }
+    return SPEC_SPILL_GENERIC;
 }
