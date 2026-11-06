@@ -865,6 +865,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         CUDA_CHECK(cudaEventDestroy(moe_fork));
         CUDA_CHECK(cudaEventDestroy(moe_join));
     }
+    if (moe_defer_info != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(moe_defer_info));
+    }
     if (side_mv_fork != nullptr) {
         CUDA_CHECK(cudaEventDestroy(side_mv_fork));
     }

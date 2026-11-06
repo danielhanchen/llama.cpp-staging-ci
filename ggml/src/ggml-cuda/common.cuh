@@ -1706,6 +1706,9 @@ struct ggml_cuda_qsa_maskless {
     bool prompt; // k19-fuse F6: a prompt batch (more than GGML_CUDA_QSA_MASKLESS_MAX_TOKENS tokens), rebuilt in place, never gathered
 };
 
+#define GGML_CUDA_MOE_DEFER_LAYERS 512
+#define GGML_CUDA_MOE_DEFER_STRIDE 256
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1713,6 +1716,9 @@ struct ggml_backend_cuda_context {
     cudaEvent_t moe_fork   = nullptr; // overlapped MoE cache fetch (see ggml_moe_cache_fetch)
     cudaEvent_t moe_join   = nullptr;
     bool        moe_join_pending = false; // moe_join was recorded and the main stream has not waited for it yet
+    // k19-l4c deferred admission (ggml_moe_cache_set_defer): the copy list of each layer's deferred fetch, read by its copies on the
+    // side stream after the graph has moved on (GGML_CUDA_MOE_DEFER_LAYERS entries of GGML_CUDA_MOE_DEFER_STRIDE int32)
+    int32_t *   moe_defer_info = nullptr;
 
     // small matrix-vector products that graph_optimize moved next to their inputs, run on a side stream until their first
     // reader (see ggml_cuda_side_mv_plan): node -> first reader
