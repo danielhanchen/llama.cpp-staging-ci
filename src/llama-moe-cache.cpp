@@ -32,6 +32,9 @@
 #include <stdexcept>
 #include <tuple>
 #include <unordered_map>
+#if defined(__linux__)
+#include <sys/resource.h>
+#endif
 #include <vector>
 
 #if defined(__linux__) || defined(__APPLE__)
@@ -6271,15 +6274,53 @@ struct llama_moe_cache::impl {
             return ggml_time_us() - t0;
         };
 
-        // a busy host gives inconsistent times (more experts not slower, an implausible bandwidth): measured again, at most 3 times
-        double d_a = 0.0, d_b = 0.0, d_t = 0.0, slope = 0.0;
-        bool ok = false;
-        int attempt = 0;
-        for (; attempt < 3 && !ok; ++attempt) {
-            std::vector<int64_t> ta, tb, tt;
-            for (int r = 0; r <= n_rep; ++r) {
+        // k19-calib (LLAMA_MOE_CPU_MISS_CAL_ROBUST, default 1; 0 = the single sample set of before): one sample set of 11 repetitions
+        // (about 50 ms) is a launch lottery on a small host: Colab L4 LFM2.5 (12 vCPUs, 6 decode threads) timed the further token of an
+        // expert at ~73 or ~130 us per launch for the same bin (u13g_l4 / u12_l4b / i3h_l4, both bins), the slow value moved the fetch
+        // shares and the per-launch decode by ~3%. Robust: 3 untimed warm-up repetitions, then cm_cal_sets() sample sets with a pause
+        // between them (the pool's threads park and are placed again), each quantity the fastest set median (a slow set is a busy or
+        // badly placed host, never a faster path). LLAMA_MOE_CPU_MISS_CAL_LOG=1: every sample, the process CPU time per wall time, the
+        // other processes' busy CPUs, context switches and page faults of each set (the diagnosis of k19-calib)
+        static const bool cal_robust = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_CAL_ROBUST");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        static const bool cal_log = getenv("LLAMA_MOE_CPU_MISS_CAL_LOG") != nullptr && atoi(getenv("LLAMA_MOE_CPU_MISS_CAL_LOG")) != 0;
+        const int n_sets_rb = !cal_robust ? 1 : [&] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_CAL_ROBUST_SETS");
+            return e != nullptr ? std::max(1, std::min(32, atoi(e))) : (recal ? 5 : 3);
+        }();
+        const int n_warm = cal_robust ? 3 : 1;
+        int n_set_log = 0;
+        // one sample set: n_warm untimed repetitions, then n_rep timed ones of the three graphs
+        auto sample_set = [&](std::vector<int64_t> & ta, std::vector<int64_t> & tb, std::vector<int64_t> & tt) {
+#if defined(__linux__)
+            auto proc_busy = []() {   // (busy, total) jiffies of the whole host
+                long long v[10] = {0};
+                FILE * f = fopen("/proc/stat", "r");
+                if (f != nullptr) {
+                    if (fscanf(f, "cpu %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9]) < 4) {
+                        v[0] = 0;
+                    }
+                    fclose(f);
+                }
+                long long tot = 0;
+                for (long long x : v) {
+                    tot += x;
+                }
+                return std::make_pair(tot - v[3] - v[4], tot);
+            };
+            rusage ru0 = {}, ru1 = {};
+            std::pair<long long, long long> ps0 = {0, 0};
+            if (cal_log) {
+                getrusage(RUSAGE_SELF, &ru0);
+                ps0 = proc_busy();
+            }
+#endif
+            const int64_t tw0 = ggml_time_us();
+            for (int r = 0; r < n_warm + n_rep; ++r) {
                 if (aborted()) {
-                    return;
+                    return false;
                 }
                 set_ids(ids_a, ka, 1);
                 const int64_t da = timed(gf_a);
@@ -6287,19 +6328,72 @@ struct llama_moe_cache::impl {
                 const int64_t db = timed(gf_b);
                 set_ids(ids_t, ka, T);
                 const int64_t dt = timed(gf_t);
-                if (r > 0) {
+                if (r >= n_warm) {
                     ta.push_back(da);
                     tb.push_back(db);
                     tt.push_back(dt);
                 }
             }
-            d_a = median(ta);
-            d_b = median(tb);
-            d_t = median(tt);
-            cal_spread = std::max(rel_iqr(ta), rel_iqr(tb));
+#if defined(__linux__)
+            if (cal_log) {
+                const double wall = (double) (ggml_time_us() - tw0);
+                getrusage(RUSAGE_SELF, &ru1);
+                const std::pair<long long, long long> ps1 = proc_busy();
+                const double cpu_us = (ru1.ru_utime.tv_sec - ru0.ru_utime.tv_sec)*1e6 + (ru1.ru_utime.tv_usec - ru0.ru_utime.tv_usec) +
+                                      (ru1.ru_stime.tv_sec - ru0.ru_stime.tv_sec)*1e6 + (ru1.ru_stime.tv_usec - ru0.ru_stime.tv_usec);
+                const long long d_tot = ps1.second - ps0.second, d_busy = ps1.first - ps0.first;
+                const double ncpu = (double) std::thread::hardware_concurrency();
+                const double host_busy = d_tot > 0 ? ncpu*(double) d_busy/(double) d_tot : -1.0;
+                std::string sa, sb, st;
+                for (size_t i = 0; i < ta.size(); ++i) {
+                    sa += (i ? " " : "") + std::to_string(ta[i]);
+                    sb += (i ? " " : "") + std::to_string(tb[i]);
+                    st += (i ? " " : "") + std::to_string(tt[i]);
+                }
+                LLAMA_LOG_INFO("llama_moe_cache%s: CPU-miss calibration samples (%s set %d, %d warm-up): a [%s] b [%s] t [%s] us; process CPU %.2f per wall, "
+                    "host busy %.2f of %.0f CPUs, others %.2f; ctx switches %ld vol / %ld invol, page faults %ld minor / %ld major; t+%.3f s\n",
+                    tag, recal ? "re-cal" : "start-up", n_set_log, n_warm, sa.c_str(), sb.c_str(), st.c_str(), cpu_us/std::max(1.0, wall),
+                    host_busy, ncpu, host_busy - cpu_us/std::max(1.0, wall), ru1.ru_nvcsw - ru0.ru_nvcsw, ru1.ru_nivcsw - ru0.ru_nivcsw,
+                    ru1.ru_minflt - ru0.ru_minflt, ru1.ru_majflt - ru0.ru_majflt, ggml_time_us()/1e6);
+            }
+#endif
+            GGML_UNUSED(tw0);
+            n_set_log++;
+            return true;
+        };
+
+        // a busy host gives inconsistent times (more experts not slower, an implausible bandwidth): measured again, at most 3 times
+        double d_a = 0.0, d_b = 0.0, d_t = 0.0, slope = 0.0;
+        bool ok = false;
+        int attempt = 0;
+        for (; attempt < 3 && !ok; ++attempt) {
+            double ma = 0.0, mb = 0.0, mt = 0.0, iqr = 0.0;
+            for (int k = 0; k < n_sets_rb; ++k) {
+                if (k > 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+                std::vector<int64_t> ta, tb, tt;
+                if (!sample_set(ta, tb, tt)) {
+                    return;
+                }
+                const double a = median(ta), b = median(tb), t = median(tt);
+                ma = k == 0 ? a : std::min(ma, a);
+                mb = k == 0 ? b : std::min(mb, b);
+                mt = k == 0 ? t : std::min(mt, t);
+                iqr = k == 0 ? std::max(rel_iqr(ta), rel_iqr(tb)) : std::min(iqr, std::max(rel_iqr(ta), rel_iqr(tb)));
+            }
+            d_a = ma;
+            d_b = mb;
+            d_t = mt;
+            cal_spread = iqr;
             slope = kb > ka ? (d_b - d_a)/(kb - ka) : d_a/ka;
             const double gbs = slope > 0.0 ? g.expert_bytes/slope/1e3 : 0.0;
             ok = slope > 0.0 && gbs >= 0.2 && gbs <= 400.0 && d_t >= 0.9*d_a;
+        }
+        if (cal_log) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU-miss calibration %s: %d set(s) (robust %d), a %.1f b %.1f t %.1f us -> host %.1f us per expert, "
+                "%.2f us per further token (ka %d kb %d T %d, %d attempt(s))\n", tag, recal ? "re-cal" : "start-up", n_sets_rb, cal_robust ? 1 : 0,
+                d_a, d_b, d_t, std::max(slope, 0.05), std::max(0.0, (d_t - d_a)/((double) ka*(T - 1))), ka, kb, T, attempt);
         }
         if (!ok && recal) {
             LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: re-calibration inconsistent, the start-up calibration stays\n", tag);
@@ -6346,7 +6440,8 @@ struct llama_moe_cache::impl {
 
         if (recal && cm_persist_pending) {
             // option (a): the host as it is during decode, the median of LLAMA_MOE_CPU_MISS_CAL_SETS (3) sample sets (this one and more)
-            static const int n_sets = [] {
+            // k19-calib: with the robust sampling the sets were taken above (the fastest set median of each quantity): one entry here
+            static const int n_sets = cal_robust ? 1 : [] {
                 const char * e = getenv("LLAMA_MOE_CPU_MISS_CAL_SETS");
                 return e != nullptr ? std::max(1, atoi(e)) : 3;
             }();
@@ -6405,16 +6500,23 @@ struct llama_moe_cache::impl {
             if (rel <= cm_recal_tol && cm_stable) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: re-calibration %.1f us per expert agrees with %.1f (within %.0f%%), host %.1f "
                     "us per expert kept\n", tag, t1_new, cm_t1, 100.0*cm_recal_tol, std::min(cm_t1, t1_new));
-                cm_dt = t1_new < cm_t1 ? dt_new : cm_dt;
+                // k19-calib: the further token is its own quantity (the bimodal one), the faster of the two is kept on its own
+                cm_dt = cal_robust ? std::min(cm_dt, dt_new) : t1_new < cm_t1 ? dt_new : cm_dt;
                 cm_t1 = std::min(cm_t1, t1_new);
-            } else if (rel <= cm_recal_tol) {
+            } else if (rel <= cm_recal_tol && !(cal_robust && dt_new < (1.0 - cm_recal_tol)*cm_dt)) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: re-calibration %.1f us per expert agrees with %.1f (within %.0f%%)\n", tag,
                     t1_new, cm_t1, 100.0*cm_recal_tol);
                 return;
+            } else if (rel <= cm_recal_tol) {
+                // k19-calib: the host time agrees but the further token is more than cm_recal_tol faster: the start-up set was the slow mode
+                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: re-calibration %.2f us per further token vs %.2f at start-up: kept\n", tag,
+                    dt_new, cm_dt);
+                cm_dt = dt_new;
+                cm_t1 = std::min(cm_t1, t1_new);
             } else {
                 const double t1_old = cm_t1;
                 cm_t1 = std::min(cm_t1, t1_new);
-                cm_dt = t1_new < t1_old ? dt_new : cm_dt;
+                cm_dt = cal_robust ? std::min(cm_dt, dt_new) : t1_new < t1_old ? dt_new : cm_dt;
                 LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: re-calibration %.1f us per expert vs %.1f at start-up (%.0f%% apart): host %.1f us "
                     "per expert kept\n", tag, t1_new, t1_old, 100.0*rel, cm_t1);
             }
