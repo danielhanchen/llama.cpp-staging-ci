@@ -24,6 +24,10 @@ struct ggml_moe_mailbox_hdr {
     int32_t  n_tokens;  int32_t  pad3[31]; // tokens of the published batch
     uint32_t started;   uint32_t pad4[31]; // host -> device: sequence of the batch the host computes now (picked up)
     uint32_t busy;      uint32_t pad5[31]; // host -> device: nonzero while the host thread computes a batch of any mailbox
+    // k19-overlap GGML_MOE_MAILBOX_TIMING=1 (diagnostic, off by default): running sums the device stores here (plain stores, never
+    // read back by it): [0] batches, [1] ns from the end of the publish to the merge's start (the device work beside the host),
+    // [2] ns the merge waited for the host, [3] batches whose merge waited over 2 us, [4] ns from the publish to the end of the wait
+    uint64_t tm[8];     uint64_t pad6[8];
 };
 
 // device memory of a mailbox (zeroed at allocation)
@@ -31,7 +35,10 @@ struct ggml_moe_mailbox_ctl {
     uint32_t seq;     // sequence of the last published batch
     uint32_t pending; // the last publish had host rows
     uint32_t failed;  // a merge gave up
-    uint32_t pad[61];
+    uint32_t pad0;
+    uint64_t t_pub;   // k19-overlap GGML_MOE_MAILBOX_TIMING: globaltimer at the end of the last publish with host rows
+    uint64_t sums[5]; // k19-overlap GGML_MOE_MAILBOX_TIMING: the sums of ggml_moe_mailbox_hdr::tm, kept here and stored there
+    uint32_t pad[48];
 };
 
 GGML_MOE_MAILBOX_FN size_t ggml_moe_mailbox_align(size_t n) {

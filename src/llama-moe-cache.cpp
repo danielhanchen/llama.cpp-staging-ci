@@ -2137,6 +2137,8 @@ struct llama_moe_cache::impl {
         ggml_tensor * w_down = nullptr;
         ggml_backend_buffer_ptr buf; // the mailbox as a CPU buffer (the inputs and output of the plans)
         uint32_t done = 0;
+        int64_t  h_us = 0; // k19-overlap GGML_MOE_MAILBOX_TIMING: host time of this mailbox's batches
+        int64_t  h_n  = 0;
         single_plan plans[GGML_MOE_MAILBOX_MAX_TOKENS + 1];
     };
     // LLAMA_MOE_SINGLE unset: on where it was tested (k11 round 16): CUDA (the backend has mapped mailboxes: not HIP / MUSA), one GPU
@@ -2506,6 +2508,52 @@ struct llama_moe_cache::impl {
         return mboxes[il].get();
     }
 
+    // k19-overlap GGML_MOE_MAILBOX_TIMING=1 (diagnostic): per layer, the device work between the publish and the merge, the merge's wait
+    // for the host (device clock, see moe_mailbox_merge) and the host time of the batches (host clock), totals and by bands of layers
+    void single_timing_report() {
+        const char * e = getenv("GGML_MOE_MAILBOX_TIMING");
+        if (e == nullptr || atoi(e) == 0) {
+            return;
+        }
+        double t[5] = { 0, 0, 0, 0, 0 };
+        int64_t hn = 0;
+        int64_t hus = 0;
+        std::string bands;
+        double b[5] = { 0, 0, 0, 0, 0 };
+        int64_t bhn = 0, bhus = 0;
+        int b0 = 0;
+        for (size_t i = 0; i < mboxes.size(); ++i) {
+            if (mboxes[i]) {
+                const volatile uint64_t * tm = ((ggml_moe_mailbox_hdr *) mboxes[i]->host)->tm;
+                for (int k = 0; k < 5; ++k) {
+                    t[k] += (double) tm[k];
+                    b[k] += (double) tm[k];
+                }
+                hn  += mboxes[i]->h_n;  bhn  += mboxes[i]->h_n;
+                hus += mboxes[i]->h_us; bhus += mboxes[i]->h_us;
+            }
+            if ((i + 1) % 8 == 0 || i + 1 == mboxes.size()) {
+                if (b[0] > 0) {
+                    bands += " L" + std::to_string(b0) + "-" + std::to_string(i) + " " + std::to_string((int) (b[1]/b[0]/1e3 + 0.5)) + "/" +
+                        std::to_string((int) (b[2]/b[0]/1e3 + 0.5)) + "/" + std::to_string(bhn > 0 ? (int) ((double) bhus/bhn + 0.5) : 0);
+                }
+                for (double & x : b) {
+                    x = 0;
+                }
+                bhn = bhus = 0;
+                b0 = (int) i + 1;
+            }
+        }
+        if (t[0] <= 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: GGML_MOE_MAILBOX_TIMING: no timed batch\n", tag);
+            return;
+        }
+        LLAMA_LOG_INFO("llama_moe_cache%s: GGML_MOE_MAILBOX_TIMING: %.0f batches: device beside the host %.1f us, merge wait %.1f us "
+            "(%.1f%% waited over 2 us; %.1f ms in all), publish to merge end %.1f us, host %.1f us per batch (%" PRId64 " host batches); "
+            "by layers device/wait/host us:%s\n", tag, t[0], t[1]/t[0]/1e3, t[2]/t[0]/1e3, 100.0*t[3]/t[0], t[2]/1e6, t[4]/t[0]/1e3,
+            hn > 0 ? (double) hus/hn : 0.0, hn, bands.c_str());
+    }
+
     // the plan of n_tokens tokens of a mailbox: the experts of the host ids, reading and writing the mailbox
     static bool single_plan_get(mailbox & mb, int n_tokens, single_plan *& out) {
         single_plan & p = mb.plans[n_tokens];
@@ -2595,6 +2643,8 @@ struct llama_moe_cache::impl {
                 single_hub_busy(false);
                 const int64_t dt = single_now_us() - t0;
                 single_us += dt;
+                mb.h_us += dt;
+                mb.h_n++;
                 single_slow += dt > 1000;
                 single_max_us = std::max(single_max_us, dt);
                 if (single_timeout_ms > 0 && dt > 1000*(int64_t) single_timeout_ms && single_warned++ < 8) {
@@ -2745,6 +2795,7 @@ struct llama_moe_cache::impl {
                     single_rows > 0 ? (double) single_us/single_rows : 0.0, single_slow, single_max_us/1e3);
                 LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses: %" PRIu64 " of the process's host batches in one region "
                     "(LLAMA_MOE_SINGLE_FUSED)\n", tag, single_hub().fused_batches);
+                single_timing_report();
             }
         }
         for (auto & mb : mboxes) {

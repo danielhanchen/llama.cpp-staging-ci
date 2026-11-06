@@ -1658,6 +1658,7 @@ struct ggml_moe_host_job {
     ggml_vec_dot_t       dot_u, dot_g, dot_d;
     ggml_from_float_t    q_u, q_g, q_d;
     ggml_vec_dot_multi_t vdm_u, vdm_g, vdm_d;
+    bool qshare; // k19-overlap: the gate activations are the up activations' bytes (same type), quantized once
     // the up / gate rows and the down rows are each cut into n_task ranges of equal weight; a thread takes the next free range until
     // none is left. With n_task = the threads every thread gets one range when all of them run (the k18 ranges); with more, a thread
     // that is descheduled holds back less. Each output is computed once with the same kernel whichever thread takes it.
@@ -1674,15 +1675,18 @@ static void ggml_moe_host_ffn_thread(struct ggml_moe_host_job * j, int ith) {
     const int32_t * pe = j->pe; const int32_t * po = j->po; const int32_t * pt = j->pt;
     const int32_t * gstart = j->gstart; const int32_t * glist = j->glist;
     char  * xu  = j->thr0 + j->per*ith;
-    char  * xg  = xu + ggml_moe_host_pad((int64_t) j->n_tokens*(int64_t) j->rsu);
-    float * act = (float *) (xg + ggml_moe_host_pad((int64_t) j->n_tokens*(int64_t) j->rsg));
+    char  * xg0 = xu + ggml_moe_host_pad((int64_t) j->n_tokens*(int64_t) j->rsu);
+    float * act = (float *) (xg0 + ggml_moe_host_pad((int64_t) j->n_tokens*(int64_t) j->rsg));
     char  * qb  = (char *) act + ggml_moe_host_pad(n_ff*(int64_t) sizeof(float));
     const int64_t qstride = ggml_moe_host_pad((int64_t) j->rsd);
+    char  * xg  = j->qshare ? xu : xg0;
 
     // 1. the activations of each token quantized for up and gate (whole rows: the graph quantizes block ranges, the same bytes)
     for (int t = 0; t < j->n_tokens; ++t) {
         j->q_u(j->x + (int64_t) t*n_embd, xu + (size_t) t*j->rsu, n_embd);
-        j->q_g(j->x + (int64_t) t*n_embd, xg + (size_t) t*j->rsg, n_embd);
+        if (!j->qshare) {
+            j->q_g(j->x + (int64_t) t*n_embd, xg + (size_t) t*j->rsg, n_embd);
+        }
     }
 
     // 2. up and gate rows: items (group, matrix, row), ranges of equal weight
@@ -2014,6 +2018,14 @@ static bool ggml_moe_host_ffn_impl(const struct ggml_tensor * up, const struct g
         return false;
     }
 
+    // k19-overlap GGML_MOE_HOST_LEAN (bits, default 0): 1 = rows of id -1 are not written (the mailbox merge reads only the host rows),
+    // 2 = the gate activations reuse the up activations' quantized bytes when both have the same vec_dot type (the same bytes)
+    static int lean = -1;
+    if (lean < 0) {
+        const char * el = getenv("GGML_MOE_HOST_LEAN");
+        lean = el != NULL ? atoi(el) : 0;
+    }
+
     // the pairs (slot j of token t) with a host expert, tokens outer and slots inner (the order of the graph's row mapping), grouped
     // by expert in the order of first use
     int32_t pe[GGML_MOE_HOST_MAX_PAIRS];     // expert of pair p
@@ -2029,7 +2041,9 @@ static bool ggml_moe_host_ffn_impl(const struct ggml_tensor * up, const struct g
         for (int j = 0; j < n_used; ++j) {
             const int32_t e = ids[(int64_t) t*n_used + j];
             if (e < 0) {
-                memset(out + ((int64_t) t*n_used + j)*n_embd, 0, n_embd*sizeof(float));
+                if (!(lean & 1)) {
+                    memset(out + ((int64_t) t*n_used + j)*n_embd, 0, n_embd*sizeof(float));
+                }
                 continue;
             }
             if (e >= n_exp) {
@@ -2085,6 +2099,7 @@ static bool ggml_moe_host_ffn_impl(const struct ggml_tensor * up, const struct g
     job.q_u = type_traits_cpu[vu].from_float;
     job.q_g = type_traits_cpu[vg].from_float;
     job.q_d = type_traits_cpu[vd].from_float;
+    job.qshare = (lean & 2) != 0 && vu == vg && job.q_u == job.q_g;
 #if defined(__AVX2__)
     job.vdm_u = ggml_cpu_vec_dot_multi(up->type);
     job.vdm_g = ggml_cpu_vec_dot_multi(gate->type);
