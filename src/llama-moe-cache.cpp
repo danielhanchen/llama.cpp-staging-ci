@@ -2257,10 +2257,38 @@ struct llama_moe_cache::impl {
     // host plans are the split's ops on the same rows, so 5-8 row batches on the mailbox are exact (cloud gate, plans/k17_models.md 4a:
     // md5 equal, 4.7x the host batches). Opt-in because it does not pay: Colab L4 (6 host threads) LFM2.5 8 GB with the same drafts in
     // both arms, 2k 84.9 vs 90.2 tok/s, 8k (LONG_CM=3) 74.5 vs 78.1; G4 Flint long48 within 1% (plans/k17_models.md 4c / 4d)
+    // k19-miss48: on a many-core host (LLAMA_MOE_SINGLE_WIDE_MIN_CPUS, default 32 logical CPUs; LLAMA_MOE_SINGLE_WIDE=0 off) the default
+    // is GGML_MOE_MAILBOX_MAX_TOKENS (8), so a DFlash2 7-row verify publishes its host experts to the mailbox instead of taking the
+    // eager graph split of each MoE layer (device sync, host graph, CUDA graph cut). Colab G4 (48 vCPU, 23 decode threads), Flash-Next
+    // UD-IQ4_XS DFlash2 n6, same text (md5 equal): 32 GB chat 193.8 / 191.3 -> 205.3 / 205.8 tok/s, 8k 127.2 / 126.9 -> 135.1 / 135.9
+    // (plans/k19_miss48.md). Only where the cache holds at least LLAMA_MOE_SINGLE_WIDE_MIN_FRAC of the host experts (see single_max).
+    // The 12-vCPU hosts of the k17 / k19-ampere measurements (Colab L4 / A100: 8 rows did not pay) keep 4. Above the k15-np share (0.50,
+    // LLAMA_MOE_SINGLE_NOTE_PLAIN_MAX_FRAC) the rule still weighs the full split, so a 48 GB tier (70.8% cached) keeps fetching its
+    // misses: there the host path was level per pass and cost MTP 6% (round 1)
+    static bool single_wide_host() {
+        static const bool v = [] {
+            const char * e  = getenv("LLAMA_MOE_SINGLE_WIDE");
+            const char * em = getenv("LLAMA_MOE_SINGLE_WIDE_MIN_CPUS");
+            const int min_cpus = em != nullptr ? atoi(em) : 32;
+            return !(e != nullptr && atoi(e) == 0) && llama_moe_n_cpus() >= min_cpus;
+        }();
+        return v;
+    }
+    const bool single_max_env = getenv("LLAMA_MOE_SINGLE_MAX_TOKENS") != nullptr;
     const int single_max_tok = [] {
         const char * e = getenv("LLAMA_MOE_SINGLE_MAX_TOKENS");
-        return std::max(1, std::min<int>(GGML_MOE_MAILBOX_MAX_TOKENS, e != nullptr ? atoi(e) : 4));
+        return std::max(1, std::min<int>(GGML_MOE_MAILBOX_MAX_TOKENS, e != nullptr ? atoi(e) : (single_wide_host() ? GGML_MOE_MAILBOX_MAX_TOKENS : 4)));
     }();
+    // the largest batch on the mailbox now: the wide default only where the cache holds at least LLAMA_MOE_SINGLE_WIDE_MIN_FRAC of the
+    // host experts (cache_frac is known after the slots are sized; before that the wide default counts)
+    int single_max() const {
+        // LLAMA_MOE_SINGLE_WIDE_MIN_FRAC (default 0.20): below it the host expert compute of a 5..8-row batch is the critical path and
+        // the eager split (which overlaps a little device work per layer) is level or better: G4 fn4 16 GB (14.8% cached) chat -0.6%, 8k
+        // -4.5% (same text), 12 GB DFlash2 admitted -4% (prof_1105_small 2d, w7 37-41 -> 47.8 ms); 24 GB (27.5%) +6 / +3.5%, 32 GB (42%)
+        // +6.7%
+        static const double min_frac = getenv("LLAMA_MOE_SINGLE_WIDE_MIN_FRAC") != nullptr ? atof(getenv("LLAMA_MOE_SINGLE_WIDE_MIN_FRAC")) : 0.20;
+        return !single_max_env && single_max_tok > 4 && cache_frac >= 0.0 && cache_frac < min_frac ? 4 : single_max_tok;
+    }
 
     // k19-l4poly: the CPU backend's host team serves (or, before the first mailbox, would serve) this cache's host batches: a small
     // host whose expert compute is the critical path (the rule of single_register: decode threads + a third, more than the old team)
@@ -2341,7 +2369,7 @@ struct llama_moe_cache::impl {
     }
 
     bool single_usable(int64_t n_tokens) const {
-        return single_req && !single_off && !single_no_alloc && n_tokens >= 1 && n_tokens <= single_max_tok;
+        return single_req && !single_off && !single_no_alloc && n_tokens >= 1 && n_tokens <= single_max();
     }
 
     bool single_register() {
@@ -2411,7 +2439,7 @@ struct llama_moe_cache::impl {
             h.thr = std::thread(single_service);
         }
         LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses on (LLAMA_MOE_SINGLE): batches of up to %d tokens, %d host threads "
-            "(one host thread for every cache of the process%s), slow-batch warning above %d ms (merges never time out), %s\n", tag, single_max_tok, h.threads,
+            "(one host thread for every cache of the process%s), slow-batch warning above %d ms (merges never time out), %s\n", tag, single_max(), h.threads,
             h.team ? (h.blocking ? "; the CPU backend's host team, the host experts are the critical path: LLAMA_MOE_SINGLE_THREADS_WIDE=0 off; "
                 "the device wait blocks (LLAMA_MOE_SINGLE_WAIT_BLOCKING=0 off)" :
                 "; the CPU backend's host team, the host experts are the critical path: LLAMA_MOE_SINGLE_THREADS_WIDE=0 off") : "",
@@ -2668,7 +2696,7 @@ struct llama_moe_cache::impl {
             cm_gen++;
             return;
         }
-        if (n_tokens < 1 || n_tokens > single_max_tok) {
+        if (n_tokens < 1 || n_tokens > single_max()) {
             return;
         }
         // no publish while the CPU-miss rule has the host path off for this batch size: the host thread sleeps instead of polling
@@ -5258,7 +5286,7 @@ struct llama_moe_cache::impl {
         const char * em = getenv("LLAMA_MOE_CPU_MISS_DECODE_MAX");
         const char * es = getenv("LLAMA_MOE_CPU_MISS_DECODE_SHARE");
         cm_dec_on    = e != nullptr && atoi(e) != 0 ? 1 : 0;
-        cm_dec_max   = std::max<int64_t>(1, std::min<int64_t>(single_max_tok, em != nullptr && atoi(em) > 0 ? atoi(em) : single_max_tok));
+        cm_dec_max   = std::max<int64_t>(1, std::min<int64_t>(single_max(), em != nullptr && atoi(em) > 0 ? atoi(em) : single_max()));
         cm_dec_share = es != nullptr ? (float) std::min(1.0, std::max(0.0, atof(es))) : 0.125f;
     }
     // k19-flint: a decode batch of n_tokens on the fixed-share host path (LLAMA_MOE_CPU_MISS_DECODE)
