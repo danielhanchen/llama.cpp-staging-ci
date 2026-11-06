@@ -920,7 +920,7 @@ static __global__ void moe_mailbox_publish(const int32_t * hid, const int n_ids,
 // polled, error every 16th poll and no sleep, so a wait costs one mapped read per poll instead of four plus 100 ns; the host rows are
 // read 16 bytes at a time (a quarter of the mapped reads). The same sums of the same values, in the same order per element.
 static __global__ void moe_mailbox_merge(const float * d, const int32_t * hid, const int n_embd, const char * mbox, const int n_used,
-        ggml_moe_mailbox_ctl * ctl, float * dst, const uint64_t timeout_ns, const int fast, const int timing) {
+        ggml_moe_mailbox_ctl * ctl, float * dst, const uint64_t timeout_ns, const int fast, const int timing, const int poll) {
     const int row = blockIdx.x;
     __shared__ int st;
     if (threadIdx.x == 0) {
@@ -934,12 +934,35 @@ static __global__ void moe_mailbox_merge(const float * d, const int32_t * hid, c
                 uint64_t t0 = moe_mailbox_ns();
                 const uint64_t t_in = t0;
                 s = 1;
-                if (fast && timeout_ns == 0) {
+                // k19-overlap GGML_MOE_MAILBOX_POLL=1: only the block of the first host row reads completed over the link and passes
+                // the sequence on in device memory; the other host rows' blocks wait on that (and still read completed every 64th
+                // turn, so they never depend on that block being resident)
+                bool poller = true;
+                if (poll == 1 && fast && timeout_ns == 0) {
+                    for (int r = 0; poller && r < row; ++r) {
+                        poller = hid[r] < 0;
+                    }
+                }
+                if (fast && timeout_ns == 0 && !poller) {
+                    for (uint32_t it = 1; ; ++it) {
+                        uint32_t v;
+                        asm volatile("ld.acquire.gpu.u32 %0, [%1];" : "=r"(v) : "l"(&ctl->done) : "memory");
+                        if (v == seq || ((it & 63) == 0 && moe_mailbox_load_acquire(&hdr->completed) == seq)) {
+                            break;
+                        }
+                    }
+                    if (moe_mailbox_load_acquire(&hdr->completed) != seq) {
+                        s = 2; // the poller saw the error
+                    }
+                } else if (fast && timeout_ns == 0) {
                     for (uint32_t it = 1; moe_mailbox_load_acquire(&hdr->completed) != seq; ++it) {
                         if ((it & 15) == 0 && moe_mailbox_load_acquire(&hdr->error) != 0) {
                             s = 2;
                             break;
                         }
+                    }
+                    if (poll == 1) {
+                        asm volatile("st.release.gpu.u32 [%0], %1;" :: "l"(&ctl->done), "r"(seq) : "memory");
                     }
                 }
                 while (s == 1 && moe_mailbox_load_acquire(&hdr->completed) != seq) {
@@ -1043,9 +1066,14 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
                 const char * e = getenv("GGML_MOE_MAILBOX_FAST");
                 return e == nullptr || atoi(e) != 0 ? 1 : 0;
             }();
+            // k19-overlap GGML_MOE_MAILBOX_POLL (default 0): 1 = one block per merge reads completed over the link (see moe_mailbox_merge)
+            static const int poll = [] {
+                const char * e = getenv("GGML_MOE_MAILBOX_POLL");
+                return e != nullptr ? atoi(e) : 0;
+            }();
             moe_mailbox_merge<<<n_rows, 256, 0, ctx.stream()>>>((const float *) d->data, (const int32_t *) hid->data, n_embd,
                 (const char *) mbox, (int) d->ne[1], (ggml_moe_mailbox_ctl *) ctl, (float *) dst->data, timeout_ns, fast,
-                ggml_moe_mailbox_timing());
+                ggml_moe_mailbox_timing(), poll);
         }
         CUDA_CHECK(cudaGetLastError());
         return;
