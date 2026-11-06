@@ -105,6 +105,12 @@ static std::vector<float> run_graph(ffn_case & c, int n_threads) {
 
 static bool g_team = true; // ggml_cpu_moe_host_ffn_team, else ggml_cpu_moe_host_ffn (the OpenMP region)
 
+// k19-overlap: GGML_MOE_HOST_LEAN bit 1 (default on) leaves the rows of id -1 as they were (run_fused fills them with 12345)
+static bool lean_skip_rows() {
+    const char * e = getenv("GGML_MOE_HOST_LEAN");
+    return ((e != nullptr ? atoi(e) : 3) & 1) != 0;
+}
+
 static bool run_fused(ffn_case & c, int n_threads, std::vector<float> & out) {
     const int64_t n_embd = c.up->ne[0];
     const int n_used = (int) c.ids->ne[0], n_tokens = (int) c.ids->ne[1];
@@ -178,6 +184,23 @@ int main(int argc, char ** argv) {
                     ++unhandled;
                     printf("  %s/%s tokens %d threads %d: not handled\n", ggml_type_name(k.tu), ggml_type_name(k.td), k.n_tokens, nt);
                     break;
+                }
+                if (lean_skip_rows()) {
+                    // rows of id -1 must be untouched; then they take the reference's zeros for the comparison below
+                    const int64_t n_embd = c.up->ne[0];
+                    for (int j = 0; j < (int) ggml_nelements(c.ids); ++j) {
+                        if (((const int32_t *) c.ids->data)[j] >= 0) {
+                            continue;
+                        }
+                        for (int64_t i = 0; i < n_embd; ++i) {
+                            if (out[(size_t) j*n_embd + i] != 12345.0f) {
+                                printf("  FAIL row %d of id -1 written (GGML_MOE_HOST_LEAN bit 1)\n", j);
+                                ++fails;
+                                break;
+                            }
+                        }
+                        memcpy(out.data() + (size_t) j*n_embd, ref.data() + (size_t) j*n_embd, n_embd*sizeof(float));
+                    }
                 }
                 if (memcmp(out.data(), ref.data(), ref.size()*sizeof(float)) != 0) {
                     size_t bad = 0;

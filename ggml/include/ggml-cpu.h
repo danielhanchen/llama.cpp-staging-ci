@@ -80,7 +80,8 @@ extern "C" {
 
     // x86
     // k18: the host experts of one single-graph MoE mailbox batch (see ggml-cpu.c): out[t*n_used + j] = down_e(swiglu(gate_e(x_t), up_e(x_t)))
-    // for e = ids[t*n_used + j] >= 0, rows of -1 zeroed; bit-identical to the graph mul_mat_id up / gate, swiglu_split, mul_mat_id down.
+    // for e = ids[t*n_used + j] >= 0, rows of -1 left as they are (GGML_MOE_HOST_LEAN=0: zeroed); bit-identical to the graph mul_mat_id
+    // up / gate, swiglu_split, mul_mat_id down.
     // false: not handled (no OpenMP build, types, scratch too small); the caller computes the graph.
     GGML_BACKEND_API size_t ggml_cpu_moe_host_ffn_wsize(const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
             int n_used, int n_tokens, int n_threads);

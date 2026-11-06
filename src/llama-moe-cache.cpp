@@ -2137,6 +2137,13 @@ struct llama_moe_cache::impl {
         ggml_tensor * w_down = nullptr;
         ggml_backend_buffer_ptr buf; // the mailbox as a CPU buffer (the inputs and output of the plans)
         uint32_t done = 0;
+        int64_t  h_us = 0; // k19-overlap GGML_MOE_MAILBOX_TIMING: host time of this mailbox's batches
+        int64_t  h_n  = 0;
+        int64_t  h_pick_ns  = 0; // sum of (host CLOCK_REALTIME at the pickup - the publish's globaltimer stamp), signed
+        int64_t  h_pick_n   = 0;
+        int64_t  h_pick_min = INT64_MAX;
+        int64_t  h_pre_ns   = 0; // pickup -> start of the host compute, end of it -> completed (host steady clock)
+        int64_t  h_post_ns  = 0;
         single_plan plans[GGML_MOE_MAILBOX_MAX_TOKENS + 1];
     };
     // LLAMA_MOE_SINGLE unset: on where it was tested (k11 round 16): CUDA (the backend has mapped mailboxes: not HIP / MUSA), one GPU
@@ -2213,6 +2220,14 @@ struct llama_moe_cache::impl {
         static single_hub_t h;
         return h;
     }
+    static int64_t single_steady_ns() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    static int64_t single_rt_ns() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
     static int64_t single_now_us() {
         return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     }
@@ -2506,6 +2521,72 @@ struct llama_moe_cache::impl {
         return mboxes[il].get();
     }
 
+    // k19-overlap GGML_MOE_MAILBOX_TIMING=1 (diagnostic): per layer, the device work between the publish and the merge, the merge's wait
+    // for the host (device clock, see moe_mailbox_merge) and the host time of the batches (host clock), totals and by bands of layers
+    void single_timing_report() {
+        const char * e = getenv("GGML_MOE_MAILBOX_TIMING");
+        if (e == nullptr || atoi(e) == 0) {
+            return;
+        }
+        double t[6] = { 0, 0, 0, 0, 0, 0 };
+        int64_t hn = 0;
+        int64_t hus = 0;
+        double  pick = 0, pre = 0, post = 0;
+        int64_t pick_n = 0;
+        int64_t min_d1 = INT64_MAX, min_d2 = INT64_MAX;
+        std::string bands;
+        double b[5] = { 0, 0, 0, 0, 0 };
+        int64_t bhn = 0, bhus = 0;
+        int b0 = 0;
+        for (size_t i = 0; i < mboxes.size(); ++i) {
+            if (mboxes[i]) {
+                const volatile uint64_t * tm = ((ggml_moe_mailbox_hdr *) mboxes[i]->host)->tm;
+                for (int k = 0; k < 6; ++k) {
+                    t[k] += k == 5 ? (double) (int64_t) tm[k] : (double) tm[k]; // [5]: a signed sum (two clocks)
+                }
+                for (int k = 0; k < 5; ++k) {
+                    b[k] += (double) tm[k];
+                }
+                pick += (double) mboxes[i]->h_pick_ns; pick_n += mboxes[i]->h_pick_n;
+                pre  += (double) mboxes[i]->h_pre_ns;  post += (double) mboxes[i]->h_post_ns;
+                min_d1 = std::min(min_d1, mboxes[i]->h_pick_min);
+                if (tm[0] > 0) {
+                    min_d2 = std::min(min_d2, (int64_t) tm[8]);
+                }
+                hn  += mboxes[i]->h_n;  bhn  += mboxes[i]->h_n;
+                hus += mboxes[i]->h_us; bhus += mboxes[i]->h_us;
+            }
+            if ((i + 1) % 8 == 0 || i + 1 == mboxes.size()) {
+                if (b[0] > 0) {
+                    bands += " L" + std::to_string(b0) + "-" + std::to_string(i) + " " + std::to_string((int) (b[1]/b[0]/1e3 + 0.5)) + "/" +
+                        std::to_string((int) (b[2]/b[0]/1e3 + 0.5)) + "/" + std::to_string(bhn > 0 ? (int) ((double) bhus/bhn + 0.5) : 0);
+                }
+                for (double & x : b) {
+                    x = 0;
+                }
+                bhn = bhus = 0;
+                b0 = (int) i + 1;
+            }
+        }
+        if (t[0] <= 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: GGML_MOE_MAILBOX_TIMING: no timed batch\n", tag);
+            return;
+        }
+        LLAMA_LOG_INFO("llama_moe_cache%s: GGML_MOE_MAILBOX_TIMING: %.0f batches: device beside the host %.1f us, merge wait %.1f us "
+            "(%.1f%% waited over 2 us; %.1f ms in all), publish to merge end %.1f us, host %.1f us per batch (%" PRId64 " host batches); "
+            "by layers device/wait/host us:%s\n", tag, t[0], t[1]/t[0]/1e3, t[2]/t[0]/1e3, 100.0*t[3]/t[0], t[2]/1e6, t[4]/t[0]/1e3,
+            hn > 0 ? (double) hus/hn : 0.0, hn, bands.c_str());
+        // the two clocks (host CLOCK_REALTIME, device globaltimer) are apart by an offset: taken as half the difference of the smallest
+        // one-way samples each way (equal smallest latencies assumed)
+        const double d1 = pick_n > 0 ? pick/pick_n : 0.0;
+        const double d2 = t[5]/t[0];
+        const double off = pick_n > 0 && min_d2 != INT64_MAX ? 0.5*((double) min_d1 - (double) min_d2) : 0.0;
+        LLAMA_LOG_INFO("llama_moe_cache%s: GGML_MOE_MAILBOX_TIMING: publish to host pickup %.1f us, host completion to the end of the merge's "
+            "wait %.1f us (clock offset %.1f us from the smallest samples %.1f / %.1f us); host pickup to compute %.2f us, compute to completed "
+            "%.2f us\n", tag, (d1 - off)/1e3, (d2 + off)/1e3, off/1e3, min_d1/1e3, min_d2/1e3, pick_n > 0 ? pre/pick_n/1e3 : 0.0,
+            pick_n > 0 ? post/pick_n/1e3 : 0.0);
+    }
+
     // the plan of n_tokens tokens of a mailbox: the experts of the host ids, reading and writing the mailbox
     static bool single_plan_get(mailbox & mb, int n_tokens, single_plan *& out) {
         single_plan & p = mb.plans[n_tokens];
@@ -2565,11 +2646,24 @@ struct llama_moe_cache::impl {
             bool ok = false;
             const int n_tokens = hdr->n_tokens;
             single_plan * p = nullptr;
+            // k19-overlap GGML_MOE_MAILBOX_TIMING: the pickup against the publish's device stamp (both clocks in ns since the epoch)
+            static const bool tm_on = [] { const char * e = getenv("GGML_MOE_MAILBOX_TIMING"); return e != nullptr && atoi(e) != 0; }();
+            const int64_t t_pick = tm_on ? single_steady_ns() : 0;
+            int64_t t_end = 0;
+            if (tm_on) {
+                const int64_t d = single_rt_ns() - (int64_t) ((volatile uint64_t *) hdr->tm)[6];
+                mb.h_pick_ns += d;
+                mb.h_pick_n++;
+                mb.h_pick_min = std::min(mb.h_pick_min, d);
+            }
             // picked up: the merge on the device waits for this batch without a timeout from now on (see moe_mailbox_merge)
             llama_mb_store_rel(&hdr->started, req);
             if (!single_failed.load(std::memory_order_relaxed) && n_tokens >= 1 && n_tokens <= GGML_MOE_MAILBOX_MAX_TOKENS &&
                     single_plan_get(mb, n_tokens, p)) {
                 const int64_t t0 = single_now_us();
+                if (tm_on) {
+                    mb.h_pre_ns += single_steady_ns() - t_pick;
+                }
                 single_hub_busy(true);
                 single_debug_delay(true);
                 single_hub_t & hub = single_hub();
@@ -2594,7 +2688,10 @@ struct llama_moe_cache::impl {
                 }
                 single_hub_busy(false);
                 const int64_t dt = single_now_us() - t0;
+                t_end = tm_on ? single_steady_ns() : 0;
                 single_us += dt;
+                mb.h_us += dt;
+                mb.h_n++;
                 single_slow += dt > 1000;
                 single_max_us = std::max(single_max_us, dt);
                 if (single_timeout_ms > 0 && dt > 1000*(int64_t) single_timeout_ms && single_warned++ < 8) {
@@ -2612,6 +2709,12 @@ struct llama_moe_cache::impl {
             }
             single_batches++;
             mb.done = req;
+            if (tm_on) {
+                if (t_end != 0) {
+                    mb.h_post_ns += single_steady_ns() - t_end;
+                }
+                ((volatile uint64_t *) hdr->tm)[7] = (uint64_t) single_rt_ns();
+            }
             llama_mb_store_rel(&hdr->completed, req);
         }
         return work;
@@ -2745,6 +2848,7 @@ struct llama_moe_cache::impl {
                     single_rows > 0 ? (double) single_us/single_rows : 0.0, single_slow, single_max_us/1e3);
                 LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses: %" PRIu64 " of the process's host batches in one region "
                     "(LLAMA_MOE_SINGLE_FUSED)\n", tag, single_hub().fused_batches);
+                single_timing_report();
             }
         }
         for (auto & mb : mboxes) {
@@ -5631,6 +5735,22 @@ struct llama_moe_cache::impl {
     // splitting the slots between two chains gives the same results; larger ubatches may pick kernels whose tiling depends on the slots
     bool overlap_batch(int64_t n_ubatch) const {
         return overlap && ov_live && n_ubatch == 1;
+    }
+
+    // k19-overlap LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL=N (1..GGML_MOE_MAILBOX_MAX_TOKENS; default 4, 1 = off): ubatches of 2..N tokens that
+    // take the hybrid path (the CPU-miss rule has the host path on for them, see hybrid_layer) copy their admitted experts on the side
+    // stream beside the hits (cached before the lookup), then compute the admitted experts, as single tokens do. Every (token, slot) entry
+    // is computed once by the multi-token mmvq kernels, which give each entry its own sums, so the output is the serial fetch's.
+    // Independent of the single-token rule (ov_live). Colab G4 Flash-Next UD-IQ4_XS MTP n2 (3-row windows; ov_r2, md5 equal): 32 GB
+    // chat / 8k +5.1 / +5.8%, 24 GB +2.9 / +4.0% (device beside the host 100 -> 83 us per layer). DFlash2 7-row windows (N = 8): 32 GB
+    // +3.6 / +5.9% but 24 GB -2.5 / -3.6%, so the default stops at 4. Ubatches whose host path is off (48 GB) keep the plain lookup:
+    // taking the hybrid lookup there for the overlap changed the text (ov_r2), so hybrid_layer does not widen for it
+    bool overlap_small_batch(int64_t n_ubatch) const {
+        static const int64_t mx = [] {
+            const char * e = getenv("LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL");
+            return e != nullptr ? std::max<int64_t>(1, std::min<int64_t>(GGML_MOE_MAILBOX_MAX_TOKENS, atoll(e))) : (int64_t) 4;
+        }();
+        return overlap && n_ubatch > 1 && n_ubatch <= mx;
     }
 
     // k19-l4c deferred admission (LLAMA_MOE_FETCH_DEFER, default 1; 0 = off, 2 = also on hosts without the host team): a single token
@@ -9569,6 +9689,10 @@ ggml_tensor * llama_moe_cache::hybrid_fetch_experts(ggml_context * ctx, int32_t 
 
 bool llama_moe_cache::overlap(int64_t n_ubatch) const {
     return pimpl->overlap_batch(n_ubatch);
+}
+
+bool llama_moe_cache::overlap_small(int64_t n_ubatch) const {
+    return pimpl->overlap_small_batch(n_ubatch);
 }
 
 bool llama_moe_cache::fetch_defer(int64_t n_ubatch) const {
