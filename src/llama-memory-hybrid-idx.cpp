@@ -2,6 +2,7 @@
 #include "llama-memory-hybrid-idx.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <type_traits>
 
@@ -420,11 +421,24 @@ struct llama_memory_hybrid_idx::kpool_layout {
 
         // Where the pool scan stopped, so an append resumes instead of starting over.
         size_t j_next = 0;
+
+        // k19-vwidth: the number of leading pools no update changed (members, cells, stream) since set_input_kpool last wrote this
+        // sequence's pools into its kept arrays (it sets it back to pools.size())
+        mutable size_t min_keep = 0;
     };
 
     std::array<seq, LLAMA_MAX_SEQ> seqs;
 
     uint32_t n_pool_real = 0;
+
+    // k19-vwidth (LLAMA_KPOOL_INPUT_INC=0: off): the pool cells, members and end positions set_input_kpool last wrote, per global
+    // pool index, and where each sequence's pools started there and how many were written (unified KV only)
+    mutable std::vector<int32_t>   c_pcell;
+    mutable std::vector<int32_t>   c_pidx;
+    mutable std::vector<llama_pos> c_pend;
+    mutable std::array<uint32_t, LLAMA_MAX_SEQ> c_start {};
+    mutable std::array<uint32_t, LLAMA_MAX_SEQ> c_count {};
+    mutable uint32_t c_kpool = 0;
 };
 
 // Which pools of the layout the current ubatch must re-pool, in the layout's pool order.
@@ -492,6 +506,12 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
         const auto & cells = mem_idx->get_cells(unified ? 0 : s);
         const auto & sp    = cells.seq_pos_get(s);
 
+        // k19-vwidth: the leading pools this update keeps as they were
+        size_t keep = sq.pools.size();
+        if (sq.strm != (unified ? 0 : mem_idx->get_stream(s))) {
+            keep = 0;
+        }
+
         sq.strm = unified ? 0 : mem_idx->get_stream(s);
 
         if (mem_idx_stale[s] == POS_CLEAN && !sq.cells.empty() && !sp.empty() &&
@@ -515,6 +535,7 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
             while (!sq.pools.empty() && sq.pools.back() + kpool > nk) {
                 sq.pools.pop_back();
             }
+            keep = std::min(keep, sq.pools.size());
             sq.j_next = sq.pools.empty() ? 0 : sq.pools.back() + kpool;
             for (auto it = sp.lower_bound(std::make_pair(p0, 0u)); it != sp.end(); ++it) {
                 sq.cells.push_back(*it);
@@ -529,7 +550,9 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
             sq.pools.clear();
             sq.j_next  = 0;
             sq.pos_min = sp.empty() ? 0 : sp.begin()->first;
+            keep = 0;
         }
+        sq.min_keep = std::min(sq.min_keep, keep);
 
         // Pools start at the first valid token
         size_t j = sq.j_next;
@@ -998,6 +1021,22 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         std::fill(npos, npos + 4*n_new_g, 0);
     }
 
+    // k19-vwidth (LLAMA_KPOOL_INPUT_INC=0: off): with a unified KV the leading pools of a sequence that no layout update changed since
+    // the last fill (lay.seqs[s].min_keep) and that start at the same global index are copied from the kept arrays instead of read
+    // from the layout again; the rest are written as before and kept. LLAMA_KPOOL_INPUT_INC=2 checks the copies against the layout
+    static const int inp_inc = getenv("LLAMA_KPOOL_INPUT_INC") ? atoi(getenv("LLAMA_KPOOL_INPUT_INC")) : 1;
+    const bool use_inc = inp_inc > 0 && !writes_only && n_stream_kv == 1;
+    if (use_inc && lay.c_kpool != kpool) {
+        lay.c_kpool = kpool;
+        lay.c_count.fill(0);
+    }
+    if (use_inc) {
+        static std::atomic<bool> logged { false };
+        if (!logged.exchange(true)) {
+            LLAMA_LOG_INFO("%s: k19-vwidth: k-pool inputs keep the unchanged pools of the last fill (LLAMA_KPOOL_INPUT_INC=0: off)\n", __func__);
+        }
+    }
+
     uint32_t i_new = 0;
     for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
         const auto & sq = lay.seqs[s];
@@ -1005,17 +1044,42 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
         const bool inert = n_stream_kv > 1 && !seq_in_ub[s];
 
+        size_t n_kept = 0;
+        if (use_inc) {
+            const uint32_t start = seq_pool_start[s];
+            n_kept = lay.c_start[s] == start ? std::min<size_t>({ (size_t) lay.c_count[s], sq.min_keep, sq.pools.size() }) : 0;
+            if (n_kept > 0) {
+                GGML_ASSERT(start + n_kept < n_pool);
+                memcpy(pcell + start, lay.c_pcell.data() + start, n_kept*sizeof(int32_t));
+                memcpy(pidx + (size_t) start*kpool, lay.c_pidx.data() + (size_t) start*kpool, n_kept*kpool*sizeof(int32_t));
+                pool_end.insert(pool_end.end(), lay.c_pend.begin() + start, lay.c_pend.begin() + start + n_kept);
+                if (inp_inc >= 2) {
+                    for (size_t pi = 0; pi < n_kept; ++pi) {
+                        const uint32_t j  = sq.pools[pi];
+                        const uint32_t ip = start + (uint32_t) pi;
+                        GGML_ASSERT(pcell[ip] == (int32_t) gcell(sq, sq.cells[j + kpool - 1].second));
+                        GGML_ASSERT(pool_end[ip] == sq.cells[j + kpool - 1].first);
+                        for (uint32_t k = 0; k < kpool; ++k) {
+                            GGML_ASSERT(pidx[(size_t) ip*kpool + k] == (int32_t) sq.cells[j + k].second && "LLAMA_KPOOL_INPUT_INC=2: kept pool differs");
+                        }
+                    }
+                }
+            }
+        }
+
         for (size_t pi = 0; pi < sq.pools.size(); ++pi) {
             const uint32_t j  = sq.pools[pi];
-            const uint32_t ip = (uint32_t) pool_end.size();
+            const uint32_t ip = pi < n_kept ? seq_pool_start[s] + (uint32_t) pi : (uint32_t) pool_end.size();
             GGML_ASSERT(ip + 1 < n_pool);
 
             // The pooled key lives in the last member's row.
             const uint32_t rep = sq.cells[j + kpool - 1].second;
-            pcell[ip] = (int32_t) gcell(sq, rep);
+            if (pi >= n_kept) {
+                pcell[ip] = (int32_t) gcell(sq, rep);
 
-            for (uint32_t k = 0; k < kpool; ++k) {
-                pidx[(size_t) ip*kpool + k] = inert ? sentinel : (int32_t) sq.cells[j + k].second;
+                for (uint32_t k = 0; k < kpool; ++k) {
+                    pidx[(size_t) ip*kpool + k] = inert ? sentinel : (int32_t) sq.cells[j + k].second;
+                }
             }
 
             if (st.is_new[ip] == st.generation) {
@@ -1036,7 +1100,28 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
                 ++i_new;
             }
 
-            pool_end.push_back(sq.cells[j + kpool - 1].first);
+            if (pi >= n_kept) {
+                pool_end.push_back(sq.cells[j + kpool - 1].first);
+            }
+        }
+
+        if (use_inc) {
+            // keep this sequence's pools as written
+            const uint32_t start = seq_pool_start[s];
+            const size_t   n     = sq.pools.size();
+            if (lay.c_pcell.size() < start + n) {
+                lay.c_pcell.resize(start + n);
+                lay.c_pend.resize(start + n);
+                lay.c_pidx.resize((size_t) (start + n)*kpool);
+            }
+            if (n > n_kept) {
+                memcpy(lay.c_pcell.data() + start + n_kept, pcell + start + n_kept, (n - n_kept)*sizeof(int32_t));
+                memcpy(lay.c_pidx.data() + (size_t) (start + n_kept)*kpool, pidx + (size_t) (start + n_kept)*kpool, (n - n_kept)*kpool*sizeof(int32_t));
+                std::copy(pool_end.begin() + start + n_kept, pool_end.begin() + start + n, lay.c_pend.begin() + start + n_kept);
+            }
+            lay.c_start[s] = start;
+            lay.c_count[s] = (uint32_t) n;
+            sq.min_keep    = n;
         }
     }
     GGML_ASSERT(i_new == n_new);
