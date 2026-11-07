@@ -3737,9 +3737,15 @@ uma_restart:
         // -sm layer runs the GPUs one after the other; -sm tensor runs both on half of every layer. Kaggle 2x T4, Qwen3.8-27B UD-Q3_K_XL
         // ctx 16384: no draft chat 13.2 -> 18.6 tok/s, MTP n2 chat 23.8 -> 31.4, 8k 22.0 -> 30.2; Qwen3.6-35B-A3B UD-Q4_K_XL + MTP
         // chat 101.7 -> 108.7, 8k 93.0 -> 105.8 (plans/k19_mgpu.md). A draft model follows the target's split mode (common_base_params_to_speculative)
+        // Dense models only by default (LLAMA_SPLIT_AUTO_TENSOR=2 also MoE): on Qwen3.6-35B-A3B UD-Q4_K_XL the -sm tensor text left the
+        // -fa off band of srv_kld long48 on the first token (KLD mean 0.00184 vs 0.00145, p99 0.0144 vs 0.0086), Qwen3.8-27B stayed inside
         {
             static const char * e_auto = getenv("LLAMA_SPLIT_AUTO_TENSOR");
-            const bool on = e_auto == nullptr || atoi(e_auto) != 0;
+            const int  mode = e_auto == nullptr ? 1 : atoi(e_auto);
+            std::vector<uint8_t> exps_t;
+            common_model_n_layer(params.model.path, exps_t);
+            const bool moe = std::any_of(exps_t.begin(), exps_t.end(), [](uint8_t e) { return e != 0; });
+            const bool on  = mode >= 2 || (mode == 1 && !moe);
             std::vector<ggml_backend_dev_t> gpus;
             if (!params.devices.empty()) {
                 for (ggml_backend_dev_t d : params.devices) {
@@ -3754,6 +3760,9 @@ uma_restart:
                         gpus.push_back(d);
                     }
                 }
+            }
+            if (mode == 1 && moe && gpus.size() >= 2 && !params.split_mode_set && !model_only) {
+                COM_INF("%s: --fit: MoE model: -sm layer (LLAMA_SPLIT_AUTO_TENSOR=2 lets the fit pick -sm tensor for MoE models too)\n", __func__);
             }
             const bool ts_user = std::any_of(ts_in.begin(), ts_in.end(), [](float x) { return x != 0.0f; });
             const bool ngl_user = mparams_in.n_gpu_layers != llama_model_default_params().n_gpu_layers;
@@ -3815,6 +3824,13 @@ uma_restart:
                         mparams.n_gpu_layers   = mp.n_gpu_layers;
                         params.split_mode      = LLAMA_SPLIT_MODE_TENSOR;
                         params.split_mode_auto = true;
+                        // F32 on the AllReduce wire on every host: off the P2P path (no peer access, e.g. some Kaggle 2x T4 VMs) the
+                        // AllReduce defaults to a BF16 wire, a second text class besides the P2P path's exact F32 sum (q38s chat md5
+                        // 75d741 vs f813a2); with F32 both paths add the same two halves, so the text does not depend on the host.
+                        // An explicit GGML_CUDA_AR_BF16_THRESHOLD wins
+                        if (getenv("GGML_CUDA_AR_BF16_THRESHOLD") == nullptr) {
+                            common_set_env("GGML_CUDA_AR_BF16_THRESHOLD", "0");
+                        }
                         params.n_gpu_layers    = mp.n_gpu_layers;
                         std::fill(params.tensor_split, params.tensor_split + 128, 0.0f);
                         mparams.tensor_split   = params.tensor_split;
