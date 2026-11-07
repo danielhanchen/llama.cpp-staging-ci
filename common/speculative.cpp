@@ -1098,6 +1098,92 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
+    // k19-a100chat (LLAMA_DFLASH_EV_AUTO): the DFlash2 window that maximises the expected tokens per ms, with both inputs measured in
+    // this run instead of taken from a G4 table (LLAMA_DFLASH_EV): the pass cost by verify width (host time from the end of the draft
+    // to the target's accept, plus the draft call itself) and the chance that a step is accepted given its selector probability (20
+    // bins, a prior of the G4 calibration worth 10 drafts per bin). Beside a MoE cache whose slots hold most of the host experts (no
+    // other window rule runs there: A100 80 GB fn4n full card / 48 GB) every further verify row costs 2.7 / 4.4 ms (tc_n1a: w3 16.2 /
+    // 25.6 ms, w7 26.8 / 43.0), more than on G4, so the whole 7-row window verifies rows that are rarely accepted. The window then
+    // follows timing, so the default-mode text can differ between launches; under the exact verify contract it does not
+    struct eva_t {
+        static constexpr int W  = 10; // widths 1..9
+        static constexpr int NB = 20;
+        double  v_sum[W] = {}, v_n[W] = {};          // decayed sums / counts of the verify ms by width
+        double  d_ms = 0.0, d_n = 0.0;               // decayed draft call ms
+        double  f_acc[NB] = {}, f_reach[NB] = {};    // accepted / reached steps by selector probability bin
+        int64_t n_meas = 0, n_cut = 0, n_rows_cut = 0;
+        int64_t picks[W] = {};
+        std::vector<int64_t> t_end;                  // per seq: end of the last draft call (0 = nothing pending)
+        std::vector<int32_t> w_last;                 // per seq: verify rows of that draft
+        std::vector<std::vector<float>> p_last;      // per seq: its steps' selector probabilities
+        bool init = false;
+    } eva;
+
+    // 0 = off, 1 = on wherever a DFlash2 draft runs without another window rule, 2 = default: one sequence, no MoE cache (A100 fn4n full
+    // card: the 26.8 GiB PLE table is the only host part) or a cache whose slots hold more than LLAMA_DFLASH_CACHED_FRAC_MAX of the host
+    // experts and >= LLAMA_DFLASH_CACHED_TOKENS_MAX tokens (A100 48 GB: 70.7%, 36 tokens); the cached bands below keep their own rules
+    static int eva_mode() {
+        static const int m = [] {
+            const char * e = getenv("LLAMA_DFLASH_EV_AUTO");
+            return e == nullptr ? 2 : (atoi(e) != 0 ? 1 : 0);
+        }();
+        return m;
+    }
+
+    // verify ms of a pass of w rows: the decayed mean where measured, shrunk towards the shape of A100 / G4 cached passes
+    // (v(w) ~ 0.3 + 0.1 w of v(7): tc_n1a v3 / v7 = 0.60 at full card and 48 GB) scaled by the most measured width
+    double eva_verify_ms(int w) const {
+        int wr = -1;
+        for (int i = 1; i < eva_t::W; ++i) {
+            if (eva.v_n[i] > 0.0 && (wr < 0 || eva.v_n[i] > eva.v_n[wr])) {
+                wr = i;
+            }
+        }
+        if (wr < 0) {
+            return 1.0;
+        }
+        const double m_ref = eva.v_sum[wr] / eva.v_n[wr];
+        const double prior = m_ref * (0.3 + 0.1 * w) / (0.3 + 0.1 * wr);
+        const double k     = 4.0;
+        const double n     = w < eva_t::W ? eva.v_n[w] : 0.0;
+        const double m     = n > 0.0 ? eva.v_sum[w] / n : prior;
+        return (n * m + k * prior) / (n + k);
+    }
+
+    double eva_f(float p) const {
+        const int b = std::min(eva_t::NB - 1, std::max(0, (int) (p * eva_t::NB)));
+        return eva.f_acc[b] / eva.f_reach[b];
+    }
+
+    void eva_init() {
+        if (eva.init) {
+            return;
+        }
+        eva.init = true;
+        static const float cal[eva_t::NB] = { 0.141f, 0.141f, 0.141f, 0.141f, 0.203f, 0.264f, 0.278f, 0.339f, 0.363f, 0.423f,
+                                              0.460f, 0.492f, 0.583f, 0.614f, 0.614f, 0.619f, 0.657f, 0.748f, 0.814f, 0.929f };
+        for (int b = 0; b < eva_t::NB; ++b) {
+            eva.f_reach[b] = 10.0;
+            eva.f_acc[b]   = 10.0 * cal[b];
+        }
+        eva.t_end.assign(n_seq, 0);
+        eva.w_last.assign(n_seq, 0);
+        eva.p_last.assign(n_seq, {});
+    }
+
+    void eva_log(const char * when) const {
+        std::string s;
+        char b[64];
+        for (int w = 1; w < eva_t::W; ++w) {
+            if (eva.v_n[w] > 0.0 || eva.picks[w] > 0) {
+                snprintf(b, sizeof(b), " w%d %.2f (%.0f, %" PRId64 ")", w, eva_verify_ms(w), eva.v_n[w], eva.picks[w]);
+                s += b;
+            }
+        }
+        LOG_INF("k19-a100chat: DFlash2 EV-auto %s: %" PRId64 " passes measured, draft %.2f ms, %" PRId64 " drafts cut by %" PRId64 " rows; verify ms (decayed n, picks):%s\n",
+                when, eva.n_meas, eva.d_n > 0.0 ? eva.d_ms / eva.d_n : 0.0, eva.n_cut, eva.n_rows_cut, s.c_str());
+    }
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq, params.draft.n_max)
@@ -1216,6 +1302,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_dflash() override {
+        if (eva.init) {
+            eva_log("at exit");
+        }
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1381,6 +1470,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
+
+        const int64_t t_eva0 = is_dflash2 && eva_mode() != 0 ? ggml_time_us() : 0;
 
         batch.clear();
 
@@ -1608,6 +1699,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                     }
                 }
+                // k19-a100chat: the measured EV window (see eva_t), where neither LLAMA_DFLASH_EV nor a two-width window runs
+                const bool use_eva = is_dflash2 && !use_ev && !use_df2w && eva_mode() != 0 &&
+                    (eva_mode() == 1 || (n_seq == 1 && (!df2_cache_on || (!df2_cached && df2_frac >= df2_mid_hi))));
+                if (use_eva) {
+                    eva_init();
+                    static bool logged = false;
+                    if (!logged) {
+                        logged = true;
+                        LOG_INF("k19-a100chat: DFlash2 window by expected tokens per ms from this run's measured pass costs and acceptance "
+                                "(MoE cache %s, %.1f%% of the host experts; LLAMA_DFLASH_EV_AUTO=0 off)\n",
+                                df2_cache_on ? "on" : "off", df2_cache_on ? 100.0*df2_frac : 0.0);
+                    }
+                }
                 std::vector<float> step_p;
 
                 int32_t predecessor = 0;
@@ -1630,13 +1734,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         dg.p[seq_id].push_back(1.0f / sum);
                         dg.m[seq_id].push_back(scores[predecessor] - second);
                     }
-                    if (params.p_min > 0.0f || p_cum_thr > 0.0f || use_ev || use_df2w) {
+                    if (params.p_min > 0.0f || p_cum_thr > 0.0f || use_ev || use_df2w || use_eva) {
                         // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                         float sum = 0.0f;
                         for (int32_t k = 0; k < top_k; ++k) {
                             sum += std::exp(scores[k] - scores[predecessor]);
                         }
-                        if (use_ev || use_df2w) {
+                        if (use_ev || use_df2w || use_eva) {
                             step_p.push_back(1.0f / sum);
                         }
                         p_cum *= p_cum_exp == 1.0f ? 1.0f / sum : std::pow(1.0f / sum, p_cum_exp);
@@ -1688,6 +1792,32 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     result.resize(best_k);
                 }
+                // k19-a100chat: the cut of the measured EV rule. The first LLAMA_DFLASH_EV_AUTO_WARM (8) passes keep the whole draft so
+                // the most used width is measured first; at least one draft token stays (an empty draft skips the verify and its timing)
+                if (use_eva && !result.empty()) {
+                    static const int64_t warm = getenv("LLAMA_DFLASH_EV_AUTO_WARM") ? atoll(getenv("LLAMA_DFLASH_EV_AUTO_WARM")) : 8;
+                    if (eva.n_meas >= warm) {
+                        const double d_ms = eva.d_n > 0.0 ? eva.d_ms / eva.d_n : 0.0;
+                        size_t best_k = result.size();
+                        double best   = -1.0;
+                        double e_tok  = 1.0;
+                        double reach  = 1.0;
+                        for (size_t k = 1; k <= result.size() && k + 1 < (size_t) eva_t::W; ++k) {
+                            reach *= eva_f(step_p[k - 1]);
+                            e_tok += reach;
+                            const double v = e_tok / (d_ms + eva_verify_ms((int) k + 1));
+                            if (v > best) {
+                                best   = v;
+                                best_k = k;
+                            }
+                        }
+                        if (best_k < result.size()) {
+                            eva.n_cut++;
+                            eva.n_rows_cut += (int64_t) (result.size() - best_k);
+                            result.resize(best_k);
+                        }
+                    }
+                }
 
                 // k19-handoff (diagnostic, LLAMA_DFLASH_CYCLE=1): the draft is cut to 0, 1, .., n_max tokens in turn, so one run
                 // times every verify width at the same contexts (under the exact verify contract the text does not change)
@@ -1699,6 +1829,26 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
+                }
+                // k19-a100chat: the pass of this draft is timed until its accept (the verify, sampling and rollback) and the draft call
+                // itself; the server's own cut (dp.n_max) is the width it verifies
+                if (use_eva) {
+                    const int64_t now = ggml_time_us();
+                    const double  dms = (now - t_eva0) / 1000.0;
+                    if (dms > 0.0 && dms < 200.0) {
+                        eva.d_ms = 0.97 * eva.d_ms + dms;
+                        eva.d_n  = 0.97 * eva.d_n  + 1.0;
+                    }
+                    size_t n_ver = result.size();
+                    if (dp.n_max > 0) {
+                        n_ver = std::min(n_ver, (size_t) dp.n_max);
+                    }
+                    eva.t_end [seq_id] = n_ver > 0 ? now : 0;
+                    eva.w_last[seq_id] = (int32_t) n_ver + 1;
+                    eva.p_last[seq_id].assign(step_p.begin(), step_p.begin() + std::min(step_p.size(), n_ver));
+                    if (n_ver + 1 < (size_t) eva_t::W) {
+                        eva.picks[n_ver + 1]++;
+                    }
                 }
                 if (tm) {
                     const int64_t t_d3 = ggml_time_us();
@@ -1770,6 +1920,32 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        // k19-a100chat: the measured pass cost of the draft's width and the acceptance of its steps (LLAMA_DFLASH_EV_AUTO)
+        if (is_dflash2 && eva.init && seq_id >= 0 && seq_id < (llama_seq_id) eva.t_end.size() && eva.t_end[seq_id] > 0) {
+            const double ms = (ggml_time_us() - eva.t_end[seq_id]) / 1000.0;
+            const int    w  = eva.w_last[seq_id];
+            eva.t_end[seq_id] = 0;
+            if (w > 0 && w < eva_t::W) {
+                // a pass that also re-captured graphs or waited for something else (> 3x its width's mean once measured) is left out
+                const double m = eva.v_n[w] >= 3.0 ? eva.v_sum[w] / eva.v_n[w] : 0.0;
+                if (ms > 0.0 && ms < 2000.0 && (m == 0.0 || ms < 3.0 * m)) {
+                    eva.v_sum[w] = 0.97 * eva.v_sum[w] + ms;
+                    eva.v_n[w]   = 0.97 * eva.v_n[w]   + 1.0;
+                    eva.n_meas++;
+                    if (eva.n_meas % 512 == 0) {
+                        eva_log("so far");
+                    }
+                }
+            }
+            const auto & ps = eva.p_last[seq_id];
+            for (size_t k = 0; k < ps.size() && k <= (size_t) n_accepted; ++k) {
+                const int b = std::min(eva_t::NB - 1, std::max(0, (int) (ps[k] * eva_t::NB)));
+                eva.f_reach[b] += 1.0;
+                if (k < (size_t) n_accepted) {
+                    eva.f_acc[b] += 1.0;
+                }
+            }
+        }
         auto & dg = common_dflash_diag();
         if (is_dflash2 && dg.trace && seq_id >= 0 && seq_id < (llama_seq_id) dg.p.size() && !dg.p[seq_id].empty()) {
             std::string sp, sm;
