@@ -566,6 +566,8 @@ struct common_params {
     bool fit_params_target_set = false; // --fit-target given (the margin beside a MoE cache is then kept as given)
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
+    bool split_mode_set  = false; // -sm given (k19-mgpu: the fit then never picks the split mode)
+    bool split_mode_auto = false; // k19-mgpu: -sm tensor picked by the fit (a reload from params fits again from -sm layer)
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
 
     enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
