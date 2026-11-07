@@ -435,6 +435,15 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     const int n_experts = logits->ne[0];
     const int n_rows    = logits->ne[1];
 
+    // k19-dsv4: GGML_CUDA_TOPK_MOE_LOG=1 logs every fused launch (test-topk384-exact counts them: a silent fallback fails it)
+    static const bool log_launch = [] {
+        const char * e = getenv("GGML_CUDA_TOPK_MOE_LOG");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (log_launch) {
+        GGML_LOG_INFO("%s: topk moe fused launch: %d experts, %d rows\n", __func__, n_experts, n_rows);
+    }
+
     const float * logits_d  = (const float *) logits->data;
     float *       weights_d = (float *) weights->data;
     int32_t *     ids_d     = (int32_t *) ids->data;
