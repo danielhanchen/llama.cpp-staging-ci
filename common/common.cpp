@@ -3135,6 +3135,12 @@ uma_restart:
         }
     }
 
+    // k19-mgpu: a reload from params (the server waking from sleep) fits again from -sm layer and decides the split mode again
+    if (params.split_mode_auto) {
+        params.split_mode      = LLAMA_SPLIT_MODE_LAYER;
+        params.split_mode_auto = false;
+    }
+
     auto mparams = common_model_params_to_llama_impl(params, params.fit_params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -3723,6 +3729,114 @@ uma_restart:
                 target = std::max(target, t);
             }
             common_set_env("LLAMA_FIT_TARGET_MIB", std::to_string(target/(1024*1024)));
+        }
+
+        // k19-mgpu (LLAMA_SPLIT_AUTO_TENSOR=0 off): on two or more GPUs, without -sm / -ts / -ngl / -ot given, where the fit kept the whole
+        // model on the devices (no host experts, no MoE cache, the draft not on the CPU) and the architecture splits by tensor, the model
+        // loads with -sm tensor when a measure of that placement (every layer, an even split) leaves each GPU its fit margin. Decode on
+        // -sm layer runs the GPUs one after the other; -sm tensor runs both on half of every layer. Kaggle 2x T4, Qwen3.8-27B UD-Q3_K_XL
+        // ctx 16384: no draft chat 13.2 -> 18.6 tok/s, MTP n2 chat 23.8 -> 31.4, 8k 22.0 -> 30.2; Qwen3.6-35B-A3B UD-Q4_K_XL + MTP
+        // chat 101.7 -> 108.7, 8k 93.0 -> 105.8 (plans/k19_mgpu.md). A draft model follows the target's split mode (common_base_params_to_speculative)
+        // Dense models only by default (LLAMA_SPLIT_AUTO_TENSOR=2 also MoE): on Qwen3.6-35B-A3B UD-Q4_K_XL the -sm tensor text left the
+        // -fa off band of srv_kld long48 on the first token (KLD mean 0.00184 vs 0.00145, p99 0.0144 vs 0.0086), Qwen3.8-27B stayed inside
+        {
+            static const char * e_auto = getenv("LLAMA_SPLIT_AUTO_TENSOR");
+            const int  mode = e_auto == nullptr ? 1 : atoi(e_auto);
+            std::vector<uint8_t> exps_t;
+            common_model_n_layer(params.model.path, exps_t);
+            const bool moe = std::any_of(exps_t.begin(), exps_t.end(), [](uint8_t e) { return e != 0; });
+            const bool on  = mode >= 2 || (mode == 1 && !moe);
+            std::vector<ggml_backend_dev_t> gpus;
+            if (!params.devices.empty()) {
+                for (ggml_backend_dev_t d : params.devices) {
+                    if (d != nullptr && ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        gpus.push_back(d);
+                    }
+                }
+            } else {
+                for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                    ggml_backend_dev_t d = ggml_backend_dev_get(i);
+                    if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        gpus.push_back(d);
+                    }
+                }
+            }
+            if (mode == 1 && moe && gpus.size() >= 2 && !params.split_mode_set && !model_only) {
+                COM_INF("%s: --fit: MoE model: -sm layer (LLAMA_SPLIT_AUTO_TENSOR=2 lets the fit pick -sm tensor for MoE models too)\n", __func__);
+            }
+            const bool ts_user = std::any_of(ts_in.begin(), ts_in.end(), [](float x) { return x != 0.0f; });
+            const bool ngl_user = mparams_in.n_gpu_layers != llama_model_default_params().n_gpu_layers;
+            const bool tbo_none = std::none_of(params.tensor_buft_overrides.begin(), params.tensor_buft_overrides.end(),
+                [](const llama_model_tensor_buft_override & o) { return o.pattern != nullptr; });
+            if (on && !model_only && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && gpus.size() >= 2 && !params.split_mode_set &&
+                    mparams.split_mode == LLAMA_SPLIT_MODE_LAYER && !ts_user && !ngl_user && tbo_none && cparams.moe_cache_size == 0 &&
+                    !draft_cpu) {
+                llama_model_params   mp = mparams;
+                llama_context_params cp = cparams;
+                mp.split_mode           = LLAMA_SPLIT_MODE_TENSOR;
+                mp.n_gpu_layers         = llama_model_default_params().n_gpu_layers;
+                mp.tensor_split         = nullptr;
+                mp.tensor_buft_overrides = nullptr;
+                int64_t need = -1;
+                try {
+                    std::vector<ggml_backend_dev_t> devs_t;
+                    uint32_t ngl_t = 0, nct_t = 0, nex_t = 0;
+                    const common_device_memory_data_vec dm = common_get_device_memory_data(params.model.path.c_str(), &mp, &cp, devs_t,
+                        ngl_t, nct_t, nex_t, fit_log_level);
+                    need = 0;
+                    for (size_t i = 0; i + 1 < dm.size(); i++) { // the last entry is the host
+                        // the no_alloc measure sizes each split weight and K/V tensor whole (the Meta buffer type's alloc size of the
+                        // full tensor), so per GPU it is that total over the GPUs (+3% for the slices' rounding and the copied small
+                        // tensors); the compute buffer is measured per GPU. q38s: 12240 MiB measured vs 5837 MiB loaded per T4
+                        const int64_t split = (int64_t) (dm[i].model + dm[i].context);
+                        need = std::max<int64_t>(need, split/(int64_t) gpus.size()*103/100 + (int64_t) dm[i].compute);
+                    }
+                } catch (const std::exception & e) {
+                    COM_INF("%s: --fit: -sm tensor not measured (%s): -sm layer\n", __func__, e.what());
+                    need = -1;
+                }
+                if (need > 0) {
+                    // the draft model (-md) loads beside it with the same split: its weights per GPU plus its context
+                    int64_t dft = 0;
+                    if (has_draft && !draft_off) {
+                        std::error_code ec;
+                        const auto sz = std::filesystem::file_size(params.speculative.draft.mparams.path, ec);
+                        dft = (ec ? 0 : (int64_t) sz/(int64_t) gpus.size()) + (int64_t) 512*1024*1024;
+                    } else if (spec_mtp && !draft_off) {
+                        dft = (int64_t) 256*1024*1024; // the MTP context of the built-in heads (their weights are in the measure)
+                    }
+                    bool fits = true;
+                    int64_t free_min = INT64_MAX;
+                    for (size_t i = 0; i < gpus.size(); i++) {
+                        size_t f = 0, t = 0;
+                        ggml_backend_dev_memory(gpus[i], &f, &t);
+                        const int64_t margin = (int64_t) (i < params.fit_params_target.size() ? params.fit_params_target[i] : params.fit_params_target[0]);
+                        free_min = std::min<int64_t>(free_min, (int64_t) f);
+                        if ((int64_t) f - need - dft < margin) {
+                            fits = false;
+                        }
+                    }
+                    COM_INF("%s: --fit: whole model on %zu GPUs: %s (-sm tensor needs %" PRId64 " + %" PRId64 " MiB per GPU, least free %" PRId64
+                        " MiB, margin %zu MiB; LLAMA_SPLIT_AUTO_TENSOR=0 keeps -sm layer)\n", __func__, gpus.size(), fits ? "-sm tensor" : "-sm layer",
+                        need/(1024*1024), dft/(1024*1024), free_min/(1024*1024), params.fit_params_target[0]/(1024*1024));
+                    if (fits) {
+                        mparams.split_mode     = LLAMA_SPLIT_MODE_TENSOR;
+                        mparams.n_gpu_layers   = mp.n_gpu_layers;
+                        params.split_mode      = LLAMA_SPLIT_MODE_TENSOR;
+                        params.split_mode_auto = true;
+                        // F32 on the AllReduce wire on every host: off the P2P path (no peer access, e.g. some Kaggle 2x T4 VMs) the
+                        // AllReduce defaults to a BF16 wire, a second text class besides the P2P path's exact F32 sum (q38s chat md5
+                        // 75d741 vs f813a2); with F32 both paths add the same two halves, so the text does not depend on the host.
+                        // An explicit GGML_CUDA_AR_BF16_THRESHOLD wins
+                        if (getenv("GGML_CUDA_AR_BF16_THRESHOLD") == nullptr) {
+                            common_set_env("GGML_CUDA_AR_BF16_THRESHOLD", "0");
+                        }
+                        params.n_gpu_layers    = mp.n_gpu_layers;
+                        std::fill(params.tensor_split, params.tensor_split + 128, 0.0f);
+                        mparams.tensor_split   = params.tensor_split;
+                    }
+                }
+            }
         }
     }
 

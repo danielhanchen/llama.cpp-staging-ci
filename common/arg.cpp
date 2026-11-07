@@ -2961,6 +2961,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             } else {
                 throw std::invalid_argument("invalid value");
             }
+            params.split_mode_set = true;
             if (!llama_supports_gpu_offload()) {
                 fprintf(stderr, "warning: llama.cpp was compiled without support for GPU offload. Setting the split mode has no effect.\n");
             }
