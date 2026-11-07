@@ -3513,6 +3513,64 @@ uma_restart:
                 moe_gain_mtp_trial = true;
             }
         }
+        // k19-q38d: the k15-small4 rule above for a separate draft model (-md: an MTP head GGUF, a DFlash / EAGLE drafter, a small model)
+        // fitted beside a target without a MoE cache, on a host with few threads. Where the drafter's weights, context and verify buffers
+        // push whole target layers to the CPU, every token and every verify row runs those layers on the host's few threads: Kaggle T4
+        // (2 threads), dense Qwen3.8-27B UD-Q3_K_XL + its MTP head GGUF, ctx 16384: 60 of 66 layers on the device with the drafter, MTP
+        // decode 3.9 tok/s (717 ms per pass) against 11.5 without it (every layer on the device). With many host threads the drafts still
+        // pay beside spilled layers (G4 48 threads, Qwen3.8-27B UD-Q4_K_XL capped at 16 GB: MTP 43.5 tok/s against 24.7 without), so the
+        // rule needs fewer than LLAMA_FIT_DRAFT_SPILL_MIN_THREADS (8) host threads; the fit then runs again without the drafter and drafting
+        // is off if that keeps every layer on the device. Exact: the text is the no-draft text. LLAMA_FIT_DRAFT_SPILL_DROP=0: keep the drafter
+        {
+            const char * e_sd = getenv("LLAMA_FIT_DRAFT_SPILL_DROP");
+            const char * e_st = getenv("LLAMA_FIT_DRAFT_SPILL_MIN_THREADS");
+            const int    min_threads = e_st != nullptr ? std::max(0, atoi(e_st)) : 8;
+            const int32_t n_threads  = params.cpuparams.n_threads;
+            if ((e_sd == nullptr || atoi(e_sd) != 0) && has_draft && !draft_off && !params.speculative.draft.fit_off &&
+                    params.speculative.draft.fit_can_drop && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS &&
+                    mparams.n_gpu_layers != llama_model_default_params().n_gpu_layers &&
+                    mparams_in.n_gpu_layers == llama_model_default_params().n_gpu_layers &&
+                    n_threads > 0 && n_threads < min_threads && [&] {
+                        // a target without expert tensors (no MoE cache: the spilled weights are whole layers)
+                        std::vector<uint8_t> exps;
+                        return common_model_n_layer(params.model.path, exps) > 0 && !exps.empty() &&
+                            std::all_of(exps.begin(), exps.end(), [](uint8_t x) { return x == 0; });
+                    }()) {
+                llama_model_params   mp = mparams_in;
+                llama_context_params cp = cparams_in;
+                std::vector<float>   ts = ts_in;
+                std::vector<llama_model_tensor_buft_override> tbo = tbo_in;
+                std::vector<size_t>  mg = margins_in;
+                mp.tensor_split = ts.data();
+                if (mparams_in.tensor_buft_overrides == params.tensor_buft_overrides.data()) {
+                    mp.tensor_buft_overrides = tbo.data();
+                }
+                common_params params_plain3 = params;
+                common_fit_plain_launch(params_plain3, cp);
+                common_fit_set_moe_margin_auto(!params.fit_params_target_set);
+                const common_params_fit_status st4 = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(), tbo.empty() ? nullptr : tbo.data(),
+                    mg.data(), params.fit_params_min_ctx, nullptr, fit_log_level, params.fit_kv_resident);
+                if (st4 == COMMON_PARAMS_FIT_STATUS_SUCCESS && mp.n_gpu_layers == llama_model_default_params().n_gpu_layers) {
+                    COM_WRN("%s: --fit: %d host threads: the draft model would move layers to the CPU (%d layers on the device with it, all "
+                        "without it): speculative decoding is off (LLAMA_FIT_DRAFT_SPILL_DROP=0 keeps it)\n", __func__, n_threads, mparams.n_gpu_layers);
+                    std::copy(ts.begin(), ts.end(), params.tensor_split);
+                    std::copy(tbo.begin(), tbo.end(), params.tensor_buft_overrides.begin());
+                    params.fit_params_target = mg;
+                    const bool tbo_ours = mp.tensor_buft_overrides != nullptr && mp.tensor_buft_overrides == tbo.data();
+                    mparams = mp;
+                    cparams = cp;
+                    mparams.tensor_split = params.tensor_split;
+                    if (tbo_ours) {
+                        mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
+                    }
+                    fit_status = st4;
+                    params.speculative.draft.fit_off = true;
+                    common_set_env("LLAMA_FIT_DRAFT_DROPPED", "1");
+                    llama_context_params cp_plain = cparams;
+                    common_fit_plain_launch(params, cp_plain);
+                }
+            }
+        }
         // k17-small: on a small device with few host threads an MTP drafter that keeps every layer on the device can still take most of
         // the MoE cache (Qwen3.6-35B-A3B 4 GB, ctx 16384: UD-Q3_K_M cache 31 MiB with it, 699 MiB without; UD-Q4_K_XL 99 vs 535). There
         // the host computes nearly every expert of every drafted verify window on its few threads (Kaggle T4 half, 2 threads, ctx 32768:
