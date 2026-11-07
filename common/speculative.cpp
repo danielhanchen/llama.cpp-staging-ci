@@ -1119,9 +1119,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         bool init = false;
     } eva;
 
-    // 0 = off, 1 = on wherever a DFlash2 draft runs without another window rule, 2 = default: one sequence, no MoE cache (A100 fn4n full
-    // card: the 26.8 GiB PLE table is the only host part) or a cache whose slots hold more than LLAMA_DFLASH_CACHED_FRAC_MAX of the host
-    // experts and >= LLAMA_DFLASH_CACHED_TOKENS_MAX tokens (A100 48 GB: 70.7%, 36 tokens); the cached bands below keep their own rules.
+    // 0 = off, 1 = on wherever a DFlash2 draft runs without another window rule, 2 = default: one sequence beside a MoE cache whose
+    // slots hold more than LLAMA_DFLASH_CACHED_FRAC_MAX of the host experts and >= LLAMA_DFLASH_CACHED_TOKENS_MAX tokens (A100 48 GB:
+    // 70.7%, 36 tokens; chat +6.2%, 8k +20% vs the kill switch, ac_a48b); the cached bands below keep their own rules. Not without a
+    // cache: A100 fn4n full card (the 26.8 GiB PLE table is the only host part) has a flat cost curve, chat level (169.7 vs 170.1,
+    // ac_a0), and srv_kld long48 put one position above the -fa off band's max there (0.090 vs 0.075).
     // Under the exact verify contract beside a MoE cache it stays off by default: there the cache's host path computes the misses of
     // some batch sizes on the CPU (ac_a48 48 GB 8k: EV-auto on / off gave two exact texts; plans/k19_a100chat.md); =1 forces it
     static int eva_mode() {
@@ -1703,7 +1705,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
                 // k19-a100chat: the measured EV window (see eva_t), where neither LLAMA_DFLASH_EV nor a two-width window runs
                 const bool use_eva = is_dflash2 && !use_ev && !use_df2w && eva_mode() != 0 &&
-                    (eva_mode() == 1 || (n_seq == 1 && (!df2_cache_on || (!df2_cached && df2_frac >= df2_mid_hi && !llama_exact_verify_enabled()))));
+                    (eva_mode() == 1 || (n_seq == 1 && df2_cache_on && !df2_cached && df2_frac >= df2_mid_hi && !llama_exact_verify_enabled()));
                 if (use_eva) {
                     eva_init();
                     static bool logged = false;
