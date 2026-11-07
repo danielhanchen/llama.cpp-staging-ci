@@ -2100,9 +2100,9 @@ void llama_context::tiny_rel_leave() {
 
 void llama_context::gf_res_epoch_bump(int line) {
     gf_res_epoch++;
-    static const bool why = getenv("LLAMA_GRAPH_SMALL_WHY") != nullptr && atoi(getenv("LLAMA_GRAPH_SMALL_WHY")) > 0;
+    static const int why = getenv("LLAMA_GRAPH_SMALL_WHY") != nullptr ? std::max(0, atoi(getenv("LLAMA_GRAPH_SMALL_WHY"))) : 0;
     static int n_logged = 0;
-    if (why && n_logged < 64) {
+    if (why > 0 && n_logged < std::max(64, why)) {
         n_logged++;
         LLAMA_LOG_INFO("%s: kept graphs invalidated (epoch %llu) at llama-context.cpp:%d\n", __func__, (unsigned long long) gf_res_epoch, line);
     }
