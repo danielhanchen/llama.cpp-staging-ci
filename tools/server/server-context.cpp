@@ -121,12 +121,48 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     }
     static const int reps  = getenv("LLAMA_SPEC_PREWARM_REPS") ? std::max(2, atoi(getenv("LLAMA_SPEC_PREWARM_REPS"))) : 9;
     static const int n_pre = getenv("LLAMA_SPEC_PREWARM_POS")  ? std::max(0, atoi(getenv("LLAMA_SPEC_PREWARM_POS")))  : 640;
+    // k19-fullcost (LLAMA_SPEC_PREWARM_CACHED=1, opt-in): beside a MoE cache too; LLAMA_SPEC_PREWARM_WIDTHS="1,3,7" prewarms only those
+    // widths (default 1..w_max). LLAMA_SPEC_PREWARM_MEM=1 logs the device's free memory after each width (the graph memory per width)
+    static const bool cached_ok = getenv("LLAMA_SPEC_PREWARM_CACHED") != nullptr && atoi(getenv("LLAMA_SPEC_PREWARM_CACHED")) != 0;
+    static const bool mem_log   = getenv("LLAMA_SPEC_PREWARM_MEM") != nullptr && atoi(getenv("LLAMA_SPEC_PREWARM_MEM")) != 0;
+    std::vector<int> widths;
+    if (const char * ew = getenv("LLAMA_SPEC_PREWARM_WIDTHS")) {
+        for (const char * q = ew; *q; ) {
+            const int w = atoi(q);
+            if (w >= 1 && w <= w_max && std::find(widths.begin(), widths.end(), w) == widths.end()) {
+                widths.push_back(w);
+            }
+            while (*q && *q != ',') { ++q; }
+            if (*q == ',') { ++q; }
+        }
+        std::sort(widths.begin(), widths.end());
+    } else {
+        for (int w = 1; w <= w_max; ++w) {
+            widths.push_back(w);
+        }
+    }
+    int sum_w = 0;
+    for (int w : widths) {
+        sum_w += w;
+    }
     const int n_chain = std::max<int>(1, (int) chains.size());
-    const int n_end = n_pre + n_chain*reps*w_max*(w_max + 1)/2;
-    if (w_max <= 0 || ctx == nullptr || llama_moe_cache_active(ctx) || llama_n_batch(ctx) < (uint32_t) std::max(w_max, std::min(n_pre, 1)) ||
-            (int) llama_n_ctx_seq(ctx) < n_end + 64) {
+    const int n_end = n_pre + n_chain*reps*sum_w;
+    if (widths.empty() || ctx == nullptr || (llama_moe_cache_active(ctx) && !cached_ok) ||
+            llama_n_batch(ctx) < (uint32_t) std::max(w_max, std::min(n_pre, 1)) || (int) llama_n_ctx_seq(ctx) < n_end + 64) {
         return;
     }
+    auto dev_free_mib = []() -> double {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                size_t f = 0, t = 0;
+                ggml_backend_dev_memory(dev, &f, &t);
+                return f/1048576.0;
+            }
+        }
+        return 0.0;
+    };
+    double free_prev = mem_log ? dev_free_mib() : 0.0;
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
     const llama_token   tok   = llama_vocab_bos(vocab) != LLAMA_TOKEN_NULL ? llama_vocab_bos(vocab) : 0;
     llama_memory_t mem = llama_get_memory(ctx);
@@ -160,7 +196,10 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
             llama_set_sampler_raw_logits(ctx, 0, false);
         }
         n_ok = 0;
-        for (int w = 1; w <= w_max && ok; ++w) {
+        for (int w : widths) {
+            if (!ok) {
+                break;
+            }
             for (int rep = 0; rep < reps && ok; ++rep) {
                 add(w, true);
                 llama_set_verify(ctx, w > 1);
@@ -168,6 +207,11 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
                 llama_synchronize(ctx);
             }
             n_ok += ok;
+            if (mem_log) {
+                const double fr = dev_free_mib();
+                SRV_INF("k19-fullcost: prewarm chain %d width %d: device free %.1f MiB (%+.1f)\n", c, w, fr, fr - free_prev);
+                free_prev = fr;
+            }
         }
     }
     if (!ok) {
