@@ -76,8 +76,10 @@ static std::vector<uint8_t> run_case(ggml_backend_t backend, const tcase & c, in
     }
     // no ggml_set_output: an output flag on a node inside the pattern blocks the fusion (ggml_can_fuse); every tensor has its own
     // buffer (ggml_backend_alloc_ctx_tensors), so ids and weights are read after the compute as they are
+    // expand the weights only (ids is reached through get_rows): the fusion matcher wants the graph order the model produces,
+    // softplus -> sqrt -> reshape(probs) -> add(bias) -> argsort -> ...; expanding ids first put the reshape after the argsort, so
+    // nothing fused (A100 r7 and Kaggle T4 r8: 0 fused launches logged)
     ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, ids);
     ggml_build_forward_expand(gf, w);
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
 
