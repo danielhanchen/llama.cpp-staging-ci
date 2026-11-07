@@ -431,6 +431,7 @@ llama_build_and_test(test-dflash2-conv-exact.cpp LINK ggml)
 llama_build_and_test(test-spec-type-gguf.cpp)
 # the build identity of the MoE CPU-miss calibration key: unknown-commit builds differ by content, a relaunch keeps its identity
 llama_build_and_test(test-cal-build-id.cpp LINK ggml)
+llama_build_and_test(test-moe-trial-persist.cpp)   # k19-cmtpersist: CPU-miss trial verdicts in the calibration file
 if (NOT WIN32)
     target_link_libraries(test-cal-build-id PRIVATE ${CMAKE_DL_LIBS})
 endif()
