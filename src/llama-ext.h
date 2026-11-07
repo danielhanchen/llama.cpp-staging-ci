@@ -209,6 +209,8 @@ LLAMA_API bool llama_moe_cpu_miss_drop_slow(struct llama_context * ctx);
 
 // k13: 0 = no MoE cache or its host never computes an expert, 1 = hybrid path with a fixed share (small caches), 2 = CPU-miss rule
 LLAMA_API int32_t llama_moe_host_mode(const struct llama_context * ctx);
+// k19-tokcost: pause the MoE cache's CPU-miss rule statistics (miss-rate windows) while the caller decodes dummy batches (no-op without a cache)
+LLAMA_API void llama_moe_cache_stats_pause(struct llama_context * ctx, bool on);
 
 // k15-ttft: a MoE cache runs (experts stream from host memory into device slots)
 LLAMA_API bool llama_moe_cache_active(const struct llama_context * ctx);

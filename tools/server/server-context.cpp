@@ -222,6 +222,13 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
         }
         pos += n;
     };
+    // k19-tokcost: the dummy windows (one repeated token) must not feed the MoE cache's CPU-miss rule: one such miss-rate window
+    // (0.7%) turned the host path off for the next request (fn4 24 GB, fc_r13: P_CUM 0.5 chat 153 vs 184 tok/s; 16 GB prewarm -20%).
+    // LLAMA_SPEC_PREWARM_CM_PAUSE=0: counted as before
+    static const bool cm_pause = getenv("LLAMA_SPEC_PREWARM_CM_PAUSE") == nullptr || atoi(getenv("LLAMA_SPEC_PREWARM_CM_PAUSE")) != 0;
+    if (cm_pause) {
+        llama_moe_cache_stats_pause(ctx, true);
+    }
     llama_set_verify(ctx, false);
     for (int done = 0; done < n_pre && ok; ) {
         const int n = std::min(n_b, n_pre - done);
@@ -265,6 +272,9 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     llama_batch_free(b);
     llama_memory_clear(mem, true);
     llama_synchronize(ctx);
+    if (cm_pause) {
+        llama_moe_cache_stats_pause(ctx, false);
+    }
     SRV_INF("k19-vwidth: the decode / verify graphs of 1..%d rows warmed up after a %d-token prompt, %d decodes each, %d sampler chain(s) (%.1f ms; LLAMA_SPEC_PREWARM=0: off)\n",
             n_ok, n_pre, reps, (int) chains.size(), (ggml_time_us() - t0)/1000.0);
 }
