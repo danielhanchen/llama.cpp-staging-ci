@@ -1922,6 +1922,12 @@ bool llama_context::mtp_weights_restore() {
     return ok;
 }
 
+// k19-fullcost: see release_device_compute / graph_reserve
+static bool llama_graph_small_keep_buffers() {
+    static const bool v = getenv("LLAMA_GRAPH_SMALL_KEEP_BUFFERS") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_KEEP_BUFFERS")) != 0;
+    return v;
+}
+
 size_t llama_context::release_device_compute() {
     size_t bytes = 0;
     for (auto & bk : backend_ptrs) {
@@ -1939,7 +1945,15 @@ size_t llama_context::release_device_compute() {
             res->reset();
         }
     }
-    gf_res_prev_active = nullptr; gf_res_epoch_bump(__LINE__);
+    gf_res_prev_active = nullptr;
+    // k19-fullcost (LLAMA_GRAPH_SMALL_KEEP_BUFFERS=0: off): freeing the compute buffers (beside a MoE cache, around a long prompt that
+    // stages in lent slots) does not invalidate the kept decode / verify graphs: freeing a buffer bumps the allocator's generation, so a
+    // kept graph's saved plan is refused and its swap-in allocates it again (ggml_backend_sched_alloc_graph from its built state), the
+    // same graph at new addresses; its CUDA graph is captured again under its warm key instead of a graph build, an eager pass and a
+    // capture under a new key for every width
+    if (!llama_graph_small_keep_buffers()) {
+        gf_res_epoch_bump(__LINE__);
+    }
     ggml_backend_sched_free_device_buffers(sched.get());
     return bytes;
 }
@@ -8182,7 +8196,11 @@ ggml_cgraph * llama_context::graph_reserve(
     // addresses: a kept graph is invalid only if a buffer of the allocator was replaced, which the allocator's generation tells (the same
     // check ggml_backend_sched_plan_restore makes). So the kept graphs survive a re-reserve that replaced no buffer
     static const bool keep_small_env = getenv("LLAMA_PP_RERESERVE_KEEP_SMALL") == nullptr || atoi(getenv("LLAMA_PP_RERESERVE_KEEP_SMALL")) != 0;
-    const bool     keep_small = keep_small_env && reserve_keep_small && !split_only;
+    // k19-fullcost (LLAMA_GRAPH_SMALL_KEEP_BUFFERS=0: off): a reserve from any other caller that keeps the scheduler (beside a MoE cache:
+    // around long prompts) keeps them too; there a replaced buffer only means the kept graphs are allocated again at their swap-in (the
+    // saved plans check the allocator's generation), so no bump at all
+    const bool     keep_any   = llama_graph_small_keep_buffers() && !reserve_keep_small && !split_only;
+    const bool     keep_small = (keep_small_env && reserve_keep_small && !split_only) || keep_any;
     const uint64_t gen_before = keep_small ? ggml_backend_sched_get_alloc_generation(sched.get()) : 0;
     if (!keep_small) {
         gf_res_epoch_bump(__LINE__);
@@ -8244,7 +8262,7 @@ ggml_cgraph * llama_context::graph_reserve(
         }
         return nullptr;
     }
-    if (keep_small) {
+    if (keep_small && !keep_any) {
         if (ggml_backend_sched_get_alloc_generation(sched.get()) != gen_before) {
             gf_res_epoch_bump(__LINE__);
         } else {
