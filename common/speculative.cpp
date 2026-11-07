@@ -2008,6 +2008,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (tpp_floor > 0) {
             const bool cached = this->params.ctx_tgt != nullptr && llama_moe_cache_active(this->params.ctx_tgt);
             tpp_cost.set_cached(cached);
+            // k19-q38d: a dense target (no <arch>.expert_count) keeps the deep windows at every position. Its verify reads each weight
+            // once for all the window's rows, so the deeper window's extra rows cost little at long context too: G4 Qwen3.8-27B
+            // UD-Q4_K_XL + its MTP head, full card, 30k prompt: 4 drafts past position 12288 151.1 tok/s (3.12 tokens, 20.7 ms per pass)
+            // against 134.5 with 2 (2.44, 18.1 ms); chat / 8k unchanged (deep band already). MoE targets keep 12288 (fn4 full card: 4
+            // drafts -13% at 30k, plans/k19_depth.md). LLAMA_SPEC_DEPTH_POS set: that position; LLAMA_SPEC_DEPTH_DENSE=0: 12288 as before
+            if (tpp_cost.deep_extra > 0 && getenv("LLAMA_SPEC_DEPTH_POS") == nullptr && this->params.ctx_tgt != nullptr &&
+                    (getenv("LLAMA_SPEC_DEPTH_DENSE") == nullptr || atoi(getenv("LLAMA_SPEC_DEPTH_DENSE")) != 0)) {
+                const llama_model * mt = llama_get_model(this->params.ctx_tgt);
+                char arch[128] = {0};
+                char nexp[32]  = {0};
+                const bool dense = mt != nullptr && llama_model_meta_val_str(mt, "general.architecture", arch, sizeof(arch)) > 0 &&
+                    (llama_model_meta_val_str(mt, (std::string(arch) + ".expert_count").c_str(), nexp, sizeof(nexp)) < 0 || atoi(nexp) == 0);
+                if (dense) {
+                    tpp_cost.deep_pos = INT64_MAX;
+                    LOG_INF("%s: k19-q38d: dense target: the deep MTP windows at every position (LLAMA_SPEC_DEPTH_DENSE=0: below 12288)\n", __func__);
+                }
+            }
             if (tpp_cost.ctx_on) {
                 LOG_INF("%s: k19-tppctx: windows fixed per context bucket: drafts past %d per bucket <1536 / <6144 / <12288 / <24576 / longer "
                     "%d / %d / %d / %d / %d (-1 priced; LLAMA_SPEC_TPP_CTX=0: off)\n", __func__, tpp_floor, tpp_cost.ctx_extra[0],
