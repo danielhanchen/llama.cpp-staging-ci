@@ -27,6 +27,12 @@ enum llama_moe_host_policy {
 // into RAM: the pinned slots then mostly replace the page cache the run had and the copies cost what the RAM hits save (L4, the experts of
 // 1.4 tokens on the device: 38% device hits, 84% RAM hits, SSD bytes -3..-5%, 28k copies back, decode after 8k -14%; the experts of 6.9
 // tokens: 71% device hits, SSD bytes -25%, 8k prompt -27%, decode +22..93%; 10.7 and 12.4 tokens: 8k prompt -48% / -40%)
+// k19-disktier: that loss is the exclusive policy's copies back. Below the minimum, where the streamed experts do not fit the RAM the tier may
+// plan into (mapped > avail: the disk tier, the page cache cannot hold them either), the tier goes on with the INCLUSIVE policy instead (no
+// copies back; misses are read into RAM slots, the prompt's uploads only fill free slots). Without it the decode reads its misses through
+// the page cache, whose LRU churns on a working set larger than itself: Colab L4 12 GB, Flash-Next UD-IQ4_XS 94 GB, 52 GB RAM (3.3 / 3.9
+// tokens, tier off): MTP n2 chat 80.4 / 8k 1.95 tok/s, DFlash2 chat 4.0 / 8k 41.8, 31-87 GB read per request; the same VM with the tier
+// on (5.2 tokens, MTP n4): 38.9 / 31.9. disk_inclusive = false (LLAMA_MOE_HOST_DISK_INCLUSIVE=0): off below the minimum, as before
 #define LLAMA_MOE_HOST_MIN_TOKENS 4
 
 struct llama_moe_host_plan {
@@ -40,9 +46,10 @@ struct llama_moe_host_plan {
 
 // e_bytes: host bytes of the streamed experts, v_bytes: their device slots, mapped: every mapped host weight the page cache serves,
 // avail: MemAvailable, token_bytes: bytes one token routes over the streamed layers, host_mib: --moe-host-cache-mib (-1 auto, 0 off),
-// policy_env: -1 or a forced llama_moe_host_policy, force: LLAMA_MOE_HOST_CACHE=1 (the auto budget even below the device minimum)
+// policy_env: -1 or a forced llama_moe_host_policy, force: LLAMA_MOE_HOST_CACHE=1 (the auto budget even below the device minimum),
+// disk_inclusive: below the device minimum on a disk tier, on with the inclusive policy (see LLAMA_MOE_HOST_MIN_TOKENS)
 llama_moe_host_plan llama_moe_host_decide(size_t e_bytes, size_t v_bytes, size_t mapped, size_t avail, size_t token_bytes, int64_t host_mib,
-        int policy_env, bool force);
+        int policy_env, bool force, bool disk_inclusive = true);
 
 class llama_moe_host_cache {
 public:
