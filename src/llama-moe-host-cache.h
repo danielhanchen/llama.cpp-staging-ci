@@ -32,8 +32,13 @@ enum llama_moe_host_policy {
 // copies back; misses are read into RAM slots, the prompt's uploads only fill free slots). Without it the decode reads its misses through
 // the page cache, whose LRU churns on a working set larger than itself: Colab L4 12 GB, Flash-Next UD-IQ4_XS 94 GB, 52 GB RAM (3.3 / 3.9
 // tokens, tier off): MTP n2 chat 80.4 / 8k 1.95 tok/s, DFlash2 chat 4.0 / 8k 41.8, 31-87 GB read per request; the same VM with the tier
-// on (5.2 tokens, MTP n4): 38.9 / 31.9. disk_inclusive = false (LLAMA_MOE_HOST_DISK_INCLUSIVE=0): off below the minimum, as before
+// on (5.2 tokens, plain decode): 39.2 / 32.9. Only where the budget holds at least LLAMA_MOE_HOST_DISK_MIN_FRAC of the streamed
+// experts: with the tier on its misses are read unbuffered, so it replaces the page cache instead of adding to it, and a small tier
+// loses to it (Kaggle T4, Qwen3.6-35B-A3B UD-Q4_K_XL under a RAM cap, 1.1-1.2 tokens: inclusive at 23% / 33% of the experts = the page
+// cache within -8..+9%; at 42% / 52%: +38% / +31% chat, +22% / +39% 2k, same md5). disk_inclusive = false
+// (LLAMA_MOE_HOST_DISK_INCLUSIVE=0): off below the minimum, as before
 #define LLAMA_MOE_HOST_MIN_TOKENS 4
+#define LLAMA_MOE_HOST_DISK_MIN_FRAC 0.4
 
 struct llama_moe_host_plan {
     bool        on       = false;
@@ -47,9 +52,10 @@ struct llama_moe_host_plan {
 // e_bytes: host bytes of the streamed experts, v_bytes: their device slots, mapped: every mapped host weight the page cache serves,
 // avail: MemAvailable, token_bytes: bytes one token routes over the streamed layers, host_mib: --moe-host-cache-mib (-1 auto, 0 off),
 // policy_env: -1 or a forced llama_moe_host_policy, force: LLAMA_MOE_HOST_CACHE=1 (the auto budget even below the device minimum),
-// disk_inclusive: below the device minimum on a disk tier, on with the inclusive policy (see LLAMA_MOE_HOST_MIN_TOKENS)
+// disk_inclusive: below the device minimum on a disk tier, on with the inclusive policy (see LLAMA_MOE_HOST_MIN_TOKENS), with a budget of at
+// least disk_min_frac of e_bytes
 llama_moe_host_plan llama_moe_host_decide(size_t e_bytes, size_t v_bytes, size_t mapped, size_t avail, size_t token_bytes, int64_t host_mib,
-        int policy_env, bool force, bool disk_inclusive = true);
+        int policy_env, bool force, bool disk_inclusive = true, double disk_min_frac = LLAMA_MOE_HOST_DISK_MIN_FRAC);
 
 class llama_moe_host_cache {
 public:

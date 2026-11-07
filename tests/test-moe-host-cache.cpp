@@ -109,6 +109,14 @@ static void test_decide() {
         CHECK(l.on && l.policy == 1 && l.budget > mib(22858) && l.budget < mib(22878));
         // the default argument is the new rule
         CHECK(llama_moe_host_decide(e, mib(1020.4), mapped, mib(29212.6), tok, -1, -1, false).on);
+        // a budget below LLAMA_MOE_HOST_DISK_MIN_FRAC of the experts: off (22.8 of 38 GiB = 60%: on at 0.6, off at 0.61; the Kaggle
+        // 33% tier: off; tc_n2's L4 budget, 35.6 of 57.6 GiB: on)
+        CHECK( llama_moe_host_decide(e, mib(1020.4), mapped, mib(29212.6), tok, -1, -1, false, true, 0.59).on);
+        CHECK(!llama_moe_host_decide(e, mib(1020.4), mapped, mib(29212.6), tok, -1, -1, false, true, 0.61).on);
+        const size_t ek = mib(18726.0), mk = mib(19705.3), tk = mib(590.0);
+        CHECK(!llama_moe_host_decide(ek, mib(637.2), mk, mib(17376.7 - 6144.0), tk, -1, -1, false).on);
+        CHECK( llama_moe_host_decide(ek, mib(637.2), mk, mib(17376.7 - 2048.0), tk, -1, -1, false).on);
+        CHECK( llama_moe_host_decide(mib(57587.5), mib(3754.4), mib(57909.6), mib(51559.3 - 6144.0), mib(1137.0), -1, -1, false).on);
     }
     // L4 8 GB: the device slots hold the experts of 1.4 tokens (measured with the exclusive tier: no gain, decode after 8k -14%) -> off
     // under the kill switch
