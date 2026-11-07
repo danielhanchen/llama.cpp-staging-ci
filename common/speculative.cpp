@@ -2012,9 +2012,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // once for all the window's rows, so the deeper window's extra rows cost little at long context too: G4 Qwen3.8-27B
             // UD-Q4_K_XL + its MTP head, full card, 30k prompt: 4 drafts past position 12288 151.1 tok/s (3.12 tokens, 20.7 ms per pass)
             // against 134.5 with 2 (2.44, 18.1 ms); chat / 8k unchanged (deep band already). MoE targets keep 12288 (fn4 full card: 4
-            // drafts -13% at 30k, plans/k19_depth.md). LLAMA_SPEC_DEPTH_POS set: that position; LLAMA_SPEC_DEPTH_DENSE=0: 12288 as before
+            // drafts -13% at 30k, plans/k19_depth.md). LLAMA_SPEC_DEPTH_POS set: that position; LLAMA_SPEC_DEPTH_DENSE=0: 12288 as before.
+            // Not on the HBM data-centre parts (compute capability 8.0 / 9.0: A100, A30, H100, H200), whose bandwidth per dp4a op makes the
+            // extra verify rows dear: A100 80 GB, the same model and prompt, 30k 86.6 tok/s with every position deep against 90.1 at 12288
+            // (-3.9%; chat / 8k equal). L4 (8.9) +10.6% and G4 (12.0) +12.5% at 30k. LLAMA_SPEC_DEPTH_DENSE=1 forces it on any GPU
+            const char * e_dd = getenv("LLAMA_SPEC_DEPTH_DENSE");
+            const bool hbm_dc = [] {
+                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                    ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                    if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        continue;
+                    }
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                    auto cc_fn = reg ? (int (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_compute_capability") : nullptr;
+                    const int cc = cc_fn != nullptr ? cc_fn(dev) : -1;
+                    if (cc == 800 || cc == 900) {
+                        return true;
+                    }
+                }
+                return false;
+            }();
             if (tpp_cost.deep_extra > 0 && getenv("LLAMA_SPEC_DEPTH_POS") == nullptr && this->params.ctx_tgt != nullptr &&
-                    (getenv("LLAMA_SPEC_DEPTH_DENSE") == nullptr || atoi(getenv("LLAMA_SPEC_DEPTH_DENSE")) != 0)) {
+                    (e_dd != nullptr ? atoi(e_dd) != 0 : !hbm_dc)) {
                 const llama_model * mt = llama_get_model(this->params.ctx_tgt);
                 char arch[128] = {0};
                 char nexp[32]  = {0};
@@ -2024,6 +2043,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     tpp_cost.deep_pos = INT64_MAX;
                     LOG_INF("%s: k19-q38d: dense target: the deep MTP windows at every position (LLAMA_SPEC_DEPTH_DENSE=0: below 12288)\n", __func__);
                 }
+            } else if (tpp_cost.deep_extra > 0 && hbm_dc && e_dd == nullptr && getenv("LLAMA_SPEC_DEPTH_POS") == nullptr) {
+                LOG_INF("%s: k19-q38d: an A100 / H100-class GPU (compute capability 8.0 / 9.0): the deep MTP windows stay below 12288 (LLAMA_SPEC_DEPTH_DENSE=1: every position for a dense target)\n", __func__);
             }
             if (tpp_cost.ctx_on) {
                 LOG_INF("%s: k19-tppctx: windows fixed per context bucket: drafts past %d per bucket <1536 / <6144 / <12288 / <24576 / longer "
