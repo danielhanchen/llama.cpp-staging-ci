@@ -3776,7 +3776,11 @@ uma_restart:
                         ngl_t, nct_t, nex_t, fit_log_level);
                     need = 0;
                     for (size_t i = 0; i + 1 < dm.size(); i++) { // the last entry is the host
-                        need = std::max<int64_t>(need, (int64_t) (dm[i].model + dm[i].context + dm[i].compute));
+                        // the no_alloc measure sizes each split weight and K/V tensor whole (the Meta buffer type's alloc size of the
+                        // full tensor), so per GPU it is that total over the GPUs (+3% for the slices' rounding and the copied small
+                        // tensors); the compute buffer is measured per GPU. q38s: 12240 MiB measured vs 5837 MiB loaded per T4
+                        const int64_t split = (int64_t) (dm[i].model + dm[i].context);
+                        need = std::max<int64_t>(need, split/(int64_t) gpus.size()*103/100 + (int64_t) dm[i].compute);
                     }
                 } catch (const std::exception & e) {
                     COM_INF("%s: --fit: -sm tensor not measured (%s): -sm layer\n", __func__, e.what());
