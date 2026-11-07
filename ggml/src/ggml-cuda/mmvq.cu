@@ -3268,6 +3268,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const auto cols_cfg_launch = [&](auto nc_tag) -> bool {
         constexpr int c_ncols_dst = decltype(nc_tag)::value;
         if constexpr (!mmvq_cols_type(type)) {
+            GGML_UNUSED(c_ncols_dst);
             return false;
         } else {
             const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
