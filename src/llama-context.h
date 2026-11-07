@@ -242,6 +242,7 @@ struct llama_context {
 
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp);
+    int64_t prompt_run_tokens(int64_t n_outputs_all, int64_t n_tokens_all); // k19-ttft4
 
     // compat version
     int encode(const llama_batch & batch_inp);
@@ -945,6 +946,11 @@ private:
     bool    tiny_rel_routed  = false; // LLAMA_MOE_TINY_RELEASE_ROUTED=1: the slots come back with the experts the last large ubatch routed most
     bool place8_rel = false; // k19-place8: the release was set up by common's fit (LLAMA_MOE_PLACE8_UB), see tiny_rel_leave
     size_t place8_grow = 0;   // k19-placemid: the compute buffer memory the fit gave the cache (LLAMA_MOE_PLACE8_MID, MiB), see decode_layer_major
+    // k19-ttft4: the prompt calls of one sequence that follow each other (a prompt and the server's separate pass of its last 4 tokens)
+    // count as one prompt for the MoE cache's short-prompt rule (see decode, LLAMA_MOE_PROMPT_RUN)
+    int64_t      prompt_run_n   = 0;
+    llama_pos    prompt_run_end = -1;
+    llama_seq_id prompt_run_seq = -1;
     int64_t tiny_rel_n_enter = 0;
     int64_t tiny_rel_n_leave = 0;
     double  tiny_rel_ms      = 0.0;   // host time of the restores (frees, trims, bank allocation, refill)
