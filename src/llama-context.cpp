@@ -4870,6 +4870,39 @@ static void llama_phase(const char * what) {
     }
 }
 
+// k19-ttft4 (LLAMA_MOE_PROMPT_RUN, default 1; 0 = each call on its own, as before): the tokens of the prompt run this call belongs to. The
+// server runs a prompt's last 4 tokens as a call of their own after its context checkpoint; that call is a prompt batch of 4 tokens,
+// which the MoE cache's short-prompt rule (llama_moe_cache::set_prompt_batch, k17-ttft / k19-l4poly: a chat turn of at most
+// LLAMA_MOE_CPU_MISS_SHORT tokens computes its misses on the host where the cost model says so) did not count as part of the chat turn:
+// it kept those 4 tokens on the uploads of a pinned cache (k15), every routed miss of every layer copied for 4 tokens. Colab L4 LFM2.5
+// 4 GB (14.6% of the host experts cached), a 38-token chat prompt: the 34-token call 568 ms on the host path, the 4-token call 230 ms
+// of uploads. Counted as one run (same sequence, the next call starts where the last prompt call ended, no generation between them),
+// the 4-token call takes the short prompt's host path too. A call with an output for every token (generation, verify) ends a run
+int64_t llama_context::prompt_run_tokens(int64_t n_outputs_all, int64_t n_tokens_all) {
+    static const bool on = getenv("LLAMA_MOE_PROMPT_RUN") == nullptr || atoi(getenv("LLAMA_MOE_PROMPT_RUN")) != 0;
+    const llama_batch & b = balloc->get_batch();
+    llama_seq_id seq = -1;
+    bool one_seq = n_tokens_all > 0 && b.pos != nullptr && b.n_seq_id != nullptr && b.seq_id != nullptr;
+    for (int64_t i = 0; one_seq && i < n_tokens_all; ++i) {
+        if (b.n_seq_id[i] != 1 || (i > 0 && b.seq_id[i][0] != seq)) {
+            one_seq = false;
+        }
+        seq = b.seq_id[i][0];
+    }
+    if (!on || n_outputs_all >= n_tokens_all || !one_seq) {
+        prompt_run_n   = 0;
+        prompt_run_end = -1;
+        prompt_run_seq = -1;
+        return n_tokens_all;
+    }
+    const llama_pos p0 = b.pos[0];
+    const int64_t   n  = prompt_run_seq == seq && prompt_run_end == p0 && prompt_run_n > 0 ? prompt_run_n + n_tokens_all : n_tokens_all;
+    prompt_run_n   = n;
+    prompt_run_end = b.pos[n_tokens_all - 1] + 1;
+    prompt_run_seq = seq;
+    return n;
+}
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
     // kdp: a drafter whose weights a target group borrowed maps them back before it computes (the server does it first on its thread)
     if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !mtp_weights_restore()) {
@@ -5200,7 +5233,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         llama_moe_cache * mc;
         moe_prompt_mark(llama_moe_cache * mc, bool prompt, int64_t n_all) : mc(mc) { if (mc) { mc->set_prompt_batch(prompt, n_all); } }
         ~moe_prompt_mark() { if (mc) { mc->set_prompt_batch(false); } }
-    } moe_prompt_guard(moe_cache.get(), (int64_t) n_outputs_all < (int64_t) n_tokens_all, (int64_t) n_tokens_all);
+    } moe_prompt_guard(moe_cache.get(), (int64_t) n_outputs_all < (int64_t) n_tokens_all, prompt_run_tokens(n_outputs_all, n_tokens_all));
 
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
