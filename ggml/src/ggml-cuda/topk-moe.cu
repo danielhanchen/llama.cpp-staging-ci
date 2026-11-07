@@ -3,6 +3,7 @@
 #include "topk-moe.cuh"
 
 #include <cmath>
+#include <cstdlib>
 #include <initializer_list>
 
 // Kernel config struct - passed by value to CUDA kernel
@@ -402,6 +403,10 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
             ggml_cuda_kernel_launch(topk_moe_cuda<288, has_bias>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
+        case 384: // DeepSeek V4.1
+            ggml_cuda_kernel_launch(topk_moe_cuda<384, has_bias>, launch_params,
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+            break;
         case 512:
             ggml_cuda_kernel_launch(topk_moe_cuda<512, has_bias>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
@@ -429,6 +434,15 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
 
     const int n_experts = logits->ne[0];
     const int n_rows    = logits->ne[1];
+
+    // k19-dsv4: GGML_CUDA_TOPK_MOE_LOG=1 logs every fused launch (test-topk384-exact counts them: a silent fallback fails it)
+    static const bool log_launch = [] {
+        const char * e = getenv("GGML_CUDA_TOPK_MOE_LOG");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (log_launch) {
+        GGML_LOG_INFO("%s: topk moe fused launch: %d experts, %d rows\n", __func__, n_experts, n_rows);
+    }
 
     const float * logits_d  = (const float *) logits->data;
     float *       weights_d = (float *) weights->data;
@@ -472,7 +486,16 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
     // must match an instantiation of launch_topk_moe_cuda: a power of 2 up to 512,
     // or one of the non-power-of-2 expert counts of supported models
     const int n_expert = ids->nb[1] / ids->nb[0];
-    if (((n_expert & (n_expert - 1)) != 0 || n_expert > 512) && n_expert != 288 && n_expert != 576) {
+    if (((n_expert & (n_expert - 1)) != 0 || n_expert > 512) && n_expert != 288 && n_expert != 384 && n_expert != 576) {
+        return false;
+    }
+    // k19-dsv4: GGML_CUDA_TOPK_MOE_384=0 keeps 384-expert routing (DeepSeek-V4.1) on the unfused path (GGML_CUDA_DISABLE_FUSION=1 turns
+    // off every fusion)
+    static const bool fuse_384 = [] {
+        const char * e = getenv("GGML_CUDA_TOPK_MOE_384");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (n_expert == 384 && !fuse_384) {
         return false;
     }
 
