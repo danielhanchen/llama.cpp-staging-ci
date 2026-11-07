@@ -3545,6 +3545,7 @@ uma_restart:
                 if (mparams_in.tensor_buft_overrides == params.tensor_buft_overrides.data()) {
                     mp.tensor_buft_overrides = tbo.data();
                 }
+                mp.load_mtp = params.load_mtp;   // a plain launch loads no MTP tensors (-md draft-mtp sets load_mtp on the target: +569 MiB on T4)
                 common_params params_plain3 = params;
                 common_fit_plain_launch(params_plain3, cp);
                 common_fit_set_moe_margin_auto(!params.fit_params_target_set);
