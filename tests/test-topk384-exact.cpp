@@ -74,8 +74,8 @@ static std::vector<uint8_t> run_case(ggml_backend_t backend, const tcase & c, in
     if (c.scale_w) {
         w = ggml_scale(ctx, w, c.scale_w);
     }
-    ggml_set_output(ids);
-    ggml_set_output(w);
+    // no ggml_set_output: an output flag on a node inside the pattern blocks the fusion (ggml_can_fuse); every tensor has its own
+    // buffer (ggml_backend_alloc_ctx_tensors), so ids and weights are read after the compute as they are
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, ids);
     ggml_build_forward_expand(gf, w);
