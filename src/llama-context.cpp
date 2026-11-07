@@ -5840,7 +5840,15 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
     };
 
-    gf_res_prev_active = nullptr; gf_res_epoch_bump(__LINE__);
+    // k19-fullcost (LLAMA_GRAPH_SMALL_KEEP_BUFFERS=0: off): the group builds its graphs in results of its own (lm_res) and only resets the
+    // scheduler, lends cache slots and replaces compute buffers: the kept decode / verify graphs stay valid and are allocated again at
+    // their swap-in (their saved plans check the allocator's generation and lent memory). Before, every long prompt beside a MoE cache
+    // made each verify width of the next decode rebuild its graph and capture its CUDA graph under a new key (G4 fn4 24 GB 8k: ~2 ms
+    // of host time per pass)
+    gf_res_prev_active = nullptr;
+    if (!llama_graph_small_keep_buffers()) {
+        gf_res_epoch_bump(__LINE__);
+    }
     moe_cache_ids.clear();
     ggml_backend_sched_reset(sched.get());
     ggml_backend_sched_use_full_hash(sched.get());
@@ -7521,8 +7529,11 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
     }
 
-    // the next graph is built anew
-    gf_res_prev_active = nullptr; gf_res_epoch_bump(__LINE__);
+    // the next graph is built anew (k19-fullcost: the kept ones are allocated again, see the group's start)
+    gf_res_prev_active = nullptr;
+    if (!llama_graph_small_keep_buffers()) {
+        gf_res_epoch_bump(__LINE__);
+    }
 
     // k15-small4: the host memory of the group (its input arena, mostly the KQ masks of every member, and the members' graph results) is
     // freed after it instead of kept for the next prompt: kept, it stayed in the process after every long prompt (q3m 4 GB, 8k prompt:
