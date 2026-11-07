@@ -8,6 +8,7 @@
 #include "llama-weight-store.h"
 #include "llama-moe-host-cache.h"
 #include "llama-build-id.h"
+#include "llama-moe-trial-persist.h"
 
 #include "ggml-cpp.h"
 #include "ggml-alloc.h"
@@ -1042,6 +1043,15 @@ struct llama_moe_cache::impl {
     // short prompts do not take it either
     static constexpr double cmt_host_bad = 1.25;
     bool     cmt_host_ok = true;
+    // k19-cmtpersist (LLAMA_MOE_CPU_MISS_PERSIST, default 1; =0 off): the trials' verdicts in the calibration file, replayed by later
+    // launches with the same file and tag (see src/llama-moe-trial-persist.h); hysteresis LLAMA_MOE_CPU_MISS_TRIAL_HYST (default 0.03)
+    // on the trials a launch times after its first verdict
+    int      cmt_ps_state = -1;           // -1 not set up yet, 0 off, 1 on
+    std::vector<llama_moe_tp::rec> cmt_rec;   // replayed and appended verdicts, in trial order
+    size_t   cmt_rec_file = 0;            // how many of them came from the file
+    bool     cmt_rec_dirty = false;       // timed verdicts not in the file yet
+    std::string cmt_ps_path, cmt_ps_key, cmt_ps_tag;
+    int      cmt_len_now = 0;             // counted small batches of the running trial (cmt_done before an early end)
     // k15-pred r22b, short prompts (LLAMA_MOE_CPU_MISS_PROMPT_AUTO=1, opt-in; 2 = every size a candidate, diagnostic): a prompt ubatch of max_batch + 1 .. cm_max
     // tokens that the cost model puts on the host path (cm_on, from the calibration and the measured miss rate) takes it without the
     // small-batch trials, but only while timing says it pays, as Strata's STRATA_PREFILL_CPU_SHARE=auto does: the first such ubatches
@@ -6655,6 +6665,9 @@ struct llama_moe_cache::impl {
                     "LLAMA_MOE_CPU_MISS_CAL_MAX_SPREAD): the next launch times the host again\n", tag, 100.0*spread, 100.0*cm_cal_max_spread());
             } else {
                 const bool w = cm_cal_write(cm_pend_dir, cm_pend_path, cm_pend_key, v, persist == 2);
+                if (w) {
+                    cmt_ps_flush(); // k19-cmtpersist: verdicts timed before the file existed
+                }
                 LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: calibration %s %s: host %.1f us per expert (%.2f us per further token), upload %.1f us, "
                     "host split %.1f us (re-calibration, %zu sets, spread %.0f%%)\n", tag, w ? "written to" : "could not be written to",
                     cm_pend_path.c_str(), v[0], v[1], v[2], v[3], t1s.size(), 100.0*spread);
@@ -6816,6 +6829,67 @@ struct llama_moe_cache::impl {
         }
     }
 
+    static bool cmt_persist_on() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_PERSIST");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        return on && cm_persist_mode() != 0;
+    }
+    static double cmt_hyst() {
+        static const double h = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_HYST");
+            return e != nullptr ? std::max(0.0, atof(e)) : 0.03;
+        }();
+        return cmt_persist_on() ? h : 0.0;
+    }
+    // k19-cmtpersist: the calibration file and this cache's tag, and the verdicts recorded there (once, before the first trial ends)
+    void cmt_ps_setup() {
+        if (cmt_ps_state >= 0) {
+            return;
+        }
+        cmt_ps_state = 0;
+        if (!cmt_persist_on()) {
+            return;
+        }
+        const group * gp = nullptr;
+        for (const group & g : groups) {
+            if (g.dev_lookup && g.n_slots > 0 && g.counts != nullptr && !g.layers.empty()) {
+                gp = &g;
+                break;
+            }
+        }
+        const std::string dir = gp != nullptr ? cm_cal_dir() : std::string();
+        if (dir.empty()) {
+            return;
+        }
+        long long slots = 0;
+        for (const group & g : groups) {
+            slots += g.n_slots;
+        }
+        cmt_ps_key   = cm_cal_key(*gp, layers[gp->layers[0]]);
+        cmt_ps_path  = cm_cal_path(dir, cmt_ps_key);
+        cmt_ps_tag   = llama_moe_tp::tag_of(slots, (int) layers.size(), (long long) max_batch);
+        cmt_ps_state = 1;
+        std::vector<llama_moe_tp::rec> r;
+        if (llama_moe_tp::read(cmt_ps_path, cmt_ps_key, cmt_ps_tag, r)) {
+            cmt_rec      = r;
+            cmt_rec_file = r.size();
+        }
+        LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: %zu trial verdict(s) recorded for %s in %s%s (LLAMA_MOE_CPU_MISS_PERSIST=0: timed in every launch)\n",
+            tag, cmt_rec_file, cmt_ps_tag.c_str(), cmt_ps_path.c_str(), cmt_rec_file > 0 ? ": replayed in order" : ": this launch times and records them");
+    }
+    // writes the verdicts not yet in the file (needs the calibration file: a launch that has none yet writes them after its re-calibration)
+    void cmt_ps_flush() {
+        if (cmt_ps_state != 1 || !cmt_rec_dirty) {
+            return;
+        }
+        if (llama_moe_tp::write(cmt_ps_path, cmt_ps_key, cmt_ps_tag, cmt_rec, (long long) ggml_time_us())) {
+            cmt_rec_dirty = false;
+            LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: %zu trial verdict(s) written to %s\n", tag, cmt_rec.size(), cmt_ps_path.c_str());
+        }
+    }
+
     // true if the host path took at least cmt_host_bad times as long as the plain cache
     static bool cmt_host_slow(double t_on, double t_off) {
         return t_off > 0.0 && t_on >= cmt_host_bad*t_off;
@@ -6927,36 +7001,66 @@ struct llama_moe_cache::impl {
             std::sort(v.begin(), v.end());
             return v.empty() ? 0.0 : (double) v[v.size()/2];
         };
+        // k19-cmtpersist: a recorded trial runs its recorded length and takes its recorded verdict (no timing decides)
+        cmt_ps_setup();
+        const bool replay = cmt_ps_state == 1 && (size_t) cmt_n < cmt_rec_file;
+        const int  end_at = replay ? std::min(cmt_rec[cmt_n].len, 5*cmt_block) : 5*cmt_block;
+        cmt_len_now = cmt_done;
         // the host path much slower than without it ends the trial early
-        if (cmt_t[0].size() >= 4 && cmt_t[1].size() >= 4 &&
+        if (!replay && cmt_t[0].size() >= 4 && cmt_t[1].size() >= 4 &&
                 *std::min_element(cmt_t[1].begin(), cmt_t[1].end()) > (1.0 + 8*cmt_margin)*median(cmt_t[0])) {
             cmt_done = 5*cmt_block;
         }
-        if (cmt_done >= 5*cmt_block) {
+        if (cmt_done >= end_at) {
             cmt_done = -1;
             const double t_off = median(cmt_t[0]);
             const double t_on  = median(cmt_t[1]);
-            const bool   on    = cmt_t[0].size() >= 3 && cmt_t[1].size() >= 3 && t_on < (1.0 - cmt_margin)*t_off;
+            bool on, host_ok;
+            int  gap_next;
+            if (replay) {
+                const llama_moe_tp::rec & r = cmt_rec[cmt_n];
+                on       = r.on != 0;
+                host_ok  = r.host_ok != 0;
+                gap_next = std::max(1, r.gap);
+            } else {
+                // hysteresis only where the verdicts are persisted, against this launch's (or the record's) last verdict
+                on       = llama_moe_tp::decide(t_on, t_off, cmt_t[0].size(), cmt_t[1].size(), cmt_n > 0, cm_small_ok, cmt_margin, cmt_hyst());
+                host_ok  = !cmt_host_slow(t_on, t_off);
+                // a clear loss is checked again much later: each trial runs 2 blocks on the slower path, and their fewer admissions leave
+                // the cache colder for a while (G4 Qwen3.6 UD-Q4_K_XL 12 GB, gpt-oss-20b 8 GB: -4..-8% decode with the path off but re-tried)
+                gap_next = std::min(on || t_on < 1.05*t_off ? 2*cmt_gap : std::max(4*cmt_gap, 512), cmt_gap_max);
+                if (cmt_ps_state == 1) {
+                    llama_moe_tp::rec r;
+                    r.on = on; r.host_ok = host_ok; r.gap = gap_next; r.len = cmt_len_now; r.ratio = t_off > 0.0 ? t_on/t_off : 0.0;
+                    cmt_rec.push_back(r);
+                    cmt_rec_dirty = true;
+                }
+            }
             cmt_n++;
             if (cmt_n <= 4 || on != cm_small_ok || cm_dbg) {
-                LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses trial %d: %.3f ms per small batch without the host path, %.3f ms with it (medians of %zu and %zu) -> %s for small batches%s\n",
-                    tag, cmt_n, t_off/1e3, t_on/1e3, cmt_t[0].size(), cmt_t[1].size(), on ? "on" : "off",
-                    cmt_host_slow(t_on, t_off) ? ", off for short prompts (the host is slower than calibrated)" : "");
+                if (replay) {
+                    LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses trial %d: replayed from the calibration file -> %s for small batches "
+                        "(recorded t_on / t_off %.3f; this launch %.3f / %.3f ms, medians of %zu and %zu)\n",
+                        tag, cmt_n, on ? "on" : "off", cmt_rec[cmt_n - 1].ratio, t_off/1e3, t_on/1e3, cmt_t[0].size(), cmt_t[1].size());
+                } else {
+                    LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses trial %d: %.3f ms per small batch without the host path, %.3f ms with it (medians of %zu and %zu) -> %s for small batches%s%s\n",
+                        tag, cmt_n, t_off/1e3, t_on/1e3, cmt_t[0].size(), cmt_t[1].size(), on ? "on" : "off",
+                        !host_ok ? ", off for short prompts (the host is slower than calibrated)" : "",
+                        cmt_n > 1 && cmt_hyst() > 0.0 ? " (hysteresis, LLAMA_MOE_CPU_MISS_TRIAL_HYST)" : "");
+                }
             }
             cmt_t[0].clear();
             cmt_t[1].clear();
             cm_gen++; // the small batches and the short prompts (cm_prompt_ok) may change
             cm_small_ok   = on;
             cm_small_live = on;
-            const bool host_ok = !cmt_host_slow(t_on, t_off);
             if (host_ok != cmt_host_ok) {
                 cm_gen++;
             }
             cmt_host_ok = host_ok;
             cmt_wait = cmt_gap;
-            // a clear loss is checked again much later: each trial runs 2 blocks on the slower path, and their fewer admissions leave
-            // the cache colder for a while (G4 Qwen3.6 UD-Q4_K_XL 12 GB, gpt-oss-20b 8 GB: -4..-8% decode with the path off but re-tried)
-            cmt_gap  = std::min(on || t_on < 1.05*t_off ? 2*cmt_gap : std::max(4*cmt_gap, 512), cmt_gap_max);
+            cmt_gap  = gap_next;
+            cmt_ps_flush();
             return;
         }
         const int blk = cmt_done/cmt_block;
