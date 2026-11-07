@@ -2751,6 +2751,50 @@ static int mul_mat_vec_q_nwarps_1(const int ncols_x, const bool has_ids, const i
     return calc_nwarps(type, 1, table_id, small_k, halve_iters);
 }
 
+// k19-mmvqcols: more rows per block for a dense 2..8 column launch (speculative verify windows) of the types whose lanes each read one
+// q8_1 block per 32 weights (IQ3_S, IQ2_XXS, Q3_K): a warp's 32-bit activation load then spans 9 cache lines, the per-column cost of these
+// launches is L1 wavefronts, and the rows of a block share those loads. Rows alone keep every row's sum (the K split and the reduction are
+// per row): bitwise the launch they replace, also on the exact (batch invariant) verify path. Rows per arch from the benches
+// (plans/k19_mmvqcols.md): Turing 8 at 2..8 columns (Kaggle T4); Ampere cc 8.0 4 at 2..8 (Colab A100: 8 lost up to 35%, register
+// pressure); Ada cc 8.9 4 from IQ2_XXS 4, Q3_K 5, IQ3_S 7 columns (Colab L4: below that within +-5%); other archs unchanged until measured.
+// GGML_CUDA_MMVQ_COLS_CFG: unset / AUTO = that table, 0 = off, R4 / R8 = those rows for every listed type, width and NVIDIA table.
+// Returns the rows (0: not taken)
+static constexpr bool mmvq_cols_type(const ggml_type type) {
+    return type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_Q3_K;
+}
+static int mmvq_cols_rows(const ggml_type type, const int ncols_dst, const mmvq_parameter_table_id table_id) {
+    static const int cfg = [] {
+        const char * e = getenv("GGML_CUDA_MMVQ_COLS_CFG");
+        if (e == nullptr) {
+            return -1;
+        }
+        const std::string v = e;
+        return v == "R4" ? 4 : v == "R8" ? 8 : v == "AUTO" ? -1 : 0;
+    }();
+    if (!mmvq_cols_type(type) || ncols_dst < 2 || ncols_dst > 8) {
+        return 0;
+    }
+    if (table_id != MMVQ_PARAMETERS_GENERIC && table_id != MMVQ_PARAMETERS_TURING) {
+        return 0;
+    }
+    if (cfg >= 0) {
+        return cfg;
+    }
+    const int  cc  = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool nv  = GGML_CUDA_CC_IS_NVIDIA(cc);
+    const int  ada = type == GGML_TYPE_IQ2_XXS ? 4 : type == GGML_TYPE_Q3_K ? 5 : 7;
+    return table_id == MMVQ_PARAMETERS_TURING ? 8 :
+           nv && cc == GGML_CUDA_CC_AMPERE ? 4 :
+           nv && cc == GGML_CUDA_CC_ADA_LOVELACE && ncols_dst >= ada ? 4 : 0;
+}
+// GGML_CUDA_MMVQ_COLS_LOG=1: one line per launch the rows lever takes (tests/test-mmvqcols-exact counts them)
+static void mmvq_cols_log(const ggml_type type, const int ncols_dst, const int rpb, const int nwarps, const char * where) {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_MMVQ_COLS_LOG"); return e != nullptr && atoi(e) != 0; }();
+    if (on) {
+        GGML_LOG_INFO("k19-mmvqcols: %s ncols %d rpb %d nwarps %d %s\n", ggml_type_name(type), ncols_dst, rpb, nwarps, where);
+    }
+}
+
 template <ggml_type type, int c_ncols_dst, int c_nwarps>
 static void mul_mat_vec_q_launch_nwarps(
         const void * vx, const void * vy, float * dst,
@@ -2760,6 +2804,29 @@ static void mul_mat_vec_q_launch_nwarps(
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
         const int nchannels_dst, const int nsamples_dst, const int warp_size, cudaStream_t stream) {
     static_assert(c_nwarps > 0, "c_nwarps");
+    // k19-mmvqcols: the rows lever for the exact / verify-wide launches (mmvq_cols_rows)
+    if constexpr (mmvq_cols_type(type) && c_ncols_dst > 1) {
+        const mmvq_parameter_table_id table_id = get_device_table_id(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+        const int r = mmvq_cols_rows(type, c_ncols_dst, table_id);
+        if ((r == 4 || r == 8) && nrows_x % r == 0) {
+            const dim3 bn(nrows_x / r, nchannels_dst, nsamples_dst);
+            const dim3 bd(warp_size, c_nwarps, 1);
+            const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(bn, bd, 0, stream);
+            const ggml_cuda_mm_fusion_args_device nf{};
+#define MMVQ_COLS_NW_LAUNCH(R) ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, false, false, c_nwarps, 0, R, 1>, lp, \
+                vx, vy, (const int32_t *) nullptr, nf, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst, \
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst, \
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, 0u)
+            if (r == 4) {
+                MMVQ_COLS_NW_LAUNCH(4);
+            } else {
+                MMVQ_COLS_NW_LAUNCH(8);
+            }
+#undef MMVQ_COLS_NW_LAUNCH
+            mmvq_cols_log(type, c_ncols_dst, r, c_nwarps, "nwarps");
+            return;
+        }
+    }
     constexpr int rpb = 2; // calc_rows_per_block for 2..8 columns (generic, Turing and GB10 tables)
     const dim3 block_nums((nrows_x + rpb - 1) / rpb, nchannels_dst, nsamples_dst);
     const dim3 block_dims(warp_size, c_nwarps, 1);
@@ -3197,6 +3264,37 @@ static void mul_mat_vec_q_switch_ncols_dst(
     // k15-mm: few rows of a long K: the K loop unrolled (mul_mat_vec_q_unroll)
     const bool unroll = !has_ids && mul_mat_vec_q_unroll<type>(ncols_x, (int64_t) nrows_x*nchannels_dst*nsamples_dst, ncols_dst, table_id, warp_size);
 
+    // k19-mmvqcols: the rows lever (mmvq_cols_rows) for a dense 2..8 column launch without ids or fusion
+    const auto cols_cfg_launch = [&](auto nc_tag) -> bool {
+        constexpr int c_ncols_dst = decltype(nc_tag)::value;
+        if constexpr (!mmvq_cols_type(type)) {
+            return false;
+        } else {
+            const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                                    fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.shared_up != nullptr;
+            const int rpb = mmvq_cols_rows(type, c_ncols_dst, table_id);
+            if ((rpb != 4 && rpb != 8) || ids != nullptr || has_fusion || nrows_x % rpb != 0) {
+                return false;
+            }
+            const int nwarps = calc_nwarps(type, c_ncols_dst, table_id);
+            const dim3 block_nums(nrows_x / rpb, nchannels_dst, nsamples_dst);
+            const dim3 block_dims(warp_size, nwarps, 1);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+#define MMVQ_COLS_LAUNCH(RPB) ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, false, false, 0, 0, RPB, 1>, launch_params, \
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst, \
+                channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, \
+                sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride)
+            if (rpb == 4) {
+                MMVQ_COLS_LAUNCH(4);
+            } else {
+                MMVQ_COLS_LAUNCH(8);
+            }
+#undef MMVQ_COLS_LAUNCH
+            mmvq_cols_log(type, c_ncols_dst, rpb, nwarps, "batched");
+            return true;
+        }
+    };
+
     // k15-mm: a 2..8 column dense launch with other rows per block (mul_mat_vec_q_batch_rpb); false = the default launch
     const auto batch_rpb_launch = [&](auto nc_tag) -> bool {
         constexpr int c_ncols_dst = decltype(nc_tag)::value;
@@ -3302,7 +3400,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 2: {
             constexpr int c_ncols_dst = 2;
-            if (batch_rpb_launch(std::integral_constant<int, c_ncols_dst>{})) {
+            if (cols_cfg_launch(std::integral_constant<int, c_ncols_dst>{}) || batch_rpb_launch(std::integral_constant<int, c_ncols_dst>{})) {
                 break;
             }
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
@@ -3313,7 +3411,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 3: {
             constexpr int c_ncols_dst = 3;
-            if (batch_rpb_launch(std::integral_constant<int, c_ncols_dst>{})) {
+            if (cols_cfg_launch(std::integral_constant<int, c_ncols_dst>{}) || batch_rpb_launch(std::integral_constant<int, c_ncols_dst>{})) {
                 break;
             }
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
@@ -3324,7 +3422,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 4: {
             constexpr int c_ncols_dst = 4;
-            if (batch_rpb_launch(std::integral_constant<int, c_ncols_dst>{})) {
+            if (cols_cfg_launch(std::integral_constant<int, c_ncols_dst>{}) || batch_rpb_launch(std::integral_constant<int, c_ncols_dst>{})) {
                 break;
             }
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
@@ -3335,7 +3433,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 5: {
             constexpr int c_ncols_dst = 5;
-            if (batch_rpb_launch(std::integral_constant<int, c_ncols_dst>{})) {
+            if (cols_cfg_launch(std::integral_constant<int, c_ncols_dst>{}) || batch_rpb_launch(std::integral_constant<int, c_ncols_dst>{})) {
                 break;
             }
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
@@ -3346,7 +3444,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 6: {
             constexpr int c_ncols_dst = 6;
-            if (batch_rpb_launch(std::integral_constant<int, c_ncols_dst>{})) {
+            if (cols_cfg_launch(std::integral_constant<int, c_ncols_dst>{}) || batch_rpb_launch(std::integral_constant<int, c_ncols_dst>{})) {
                 break;
             }
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
@@ -3357,7 +3455,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 7: {
             constexpr int c_ncols_dst = 7;
-            if (batch_rpb_launch(std::integral_constant<int, c_ncols_dst>{})) {
+            if (cols_cfg_launch(std::integral_constant<int, c_ncols_dst>{}) || batch_rpb_launch(std::integral_constant<int, c_ncols_dst>{})) {
                 break;
             }
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
@@ -3368,7 +3466,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 8: {
             constexpr int c_ncols_dst = 8;
-            if (batch_rpb_launch(std::integral_constant<int, c_ncols_dst>{})) {
+            if (cols_cfg_launch(std::integral_constant<int, c_ncols_dst>{}) || batch_rpb_launch(std::integral_constant<int, c_ncols_dst>{})) {
                 break;
             }
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
