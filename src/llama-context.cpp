@@ -8425,7 +8425,30 @@ bool llama_context::restore_pp_plan(bool idle) {
         return false;
     }
     const uint32_t n_seqs_r    = (model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_MINIMAX_01) ? 1 : cparams.n_seq_max;
-    const uint32_t n_tokens_r  = std::min(cparams.n_ctx, cparams.n_ubatch);
+    uint32_t       n_tokens_r  = std::min(cparams.n_ctx, cparams.n_ubatch);
+    // k19-a100chat (LLAMA_PP_RERESERVE_DFLASH_SPLIT=0: off): a DFlash drafter is reserved as at load (sched_reserve,
+    // LLAMA_DFLASH_RESERVE_SPLIT): its feature batches at n_ubatch rows, its token graph at one noise block per sequence. The plain pp
+    // reservation here was a token graph of n_ubatch rows with the lm head on every row: 500 MiB for a drafter that runs 30 MiB (Colab
+    // A100 48 GB, fn4n DFlash2, n_ubatch 512). At every request end it freed the drafter's 30 MiB buffer to plan the 500 MiB one; with
+    // the device nearly full that failed ("re-reserving the pp graph failed"), the next prompt's 512-row injection then needed its
+    // 30 MiB again after the target's graphs had taken the memory, and its allocation failed: HTTP 500 (srv_kld long48, -fa on).
+    // Where 500 MiB were free it took them from the target's graphs
+    static const bool dflash_split_env = (getenv("LLAMA_PP_RERESERVE_DFLASH_SPLIT") == nullptr || atoi(getenv("LLAMA_PP_RERESERVE_DFLASH_SPLIT")) != 0) &&
+        (getenv("LLAMA_DFLASH_RESERVE_SPLIT") == nullptr || atoi(getenv("LLAMA_DFLASH_RESERVE_SPLIT")) != 0);
+    const uint32_t n_block_r = model.hparams.dflash_block_size;
+    if (dflash_split_env && model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult == 0 && n_block_r > 0 && !cparams.training &&
+            n_seqs_r * n_block_r < n_tokens_r) {
+        reserve_keep_small = true;
+        reserve_embd       = true;
+        ggml_cgraph * gf_e = graph_reserve(n_tokens_r, n_seqs_r, n_seqs_r, mctx_full.get());
+        reserve_embd       = false;
+        reserve_keep_small = false;
+        if (gf_e == nullptr) {
+            LLAMA_LOG_WARN("%s: re-reserving the DFlash feature graph failed\n", __func__);
+            return false;
+        }
+        n_tokens_r = n_seqs_r * n_block_r;
+    }
     const uint32_t n_outputs_r = std::min(n_tokens_r, cparams.n_outputs_max);
     reserve_keep_small = true;
     ggml_cgraph * gf_r = graph_reserve(n_tokens_r, n_seqs_r, n_outputs_r, mctx_full.get());
