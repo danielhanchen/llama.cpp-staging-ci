@@ -518,6 +518,12 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             ids = ggml_repeat_4d(ctx0, ggml_reshape_4d(ctx0, ids, n_comp, 1, 1, 1), n_comp, n_tok, 1, n_stream);
             top_k = ggml_cast(ctx0, ids, GGML_TYPE_I32);
             cb(top_k, "idx_top_k_all", il);
+            static bool logged_all = false;
+            if (!logged_all) {
+                logged_all = true;
+                LLAMA_LOG_INFO("%s: DeepSeek-V4.1 top-k keeps all %lld compressed rows: indexer skipped (LLAMA_DSV41_TOPK_ALL=0 off)\n",
+                        __func__, (long long) n_comp);
+            }
             topk_of[il] = top_k;
             if (hparams.dsv41_cand_src == il) {
                 cand_skipped = true;
