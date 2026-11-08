@@ -1516,6 +1516,9 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
         // k19-dsv4p window gather (LLAMA_DSV41_WIN_GATHER=0 disables): the raw (window) cache cells each query may see, picked once
         // per graph from the shared raw mask, sorted; n_win = the sliding window padded to the FA stride
         bool          win_gather = true;
+        // k19-dsv4p (LLAMA_DSV41_TOPK_ALL=0 disables): skip the indexer + top-k when every compressed row would be selected
+        bool          topk_all     = true;
+        bool          cand_skipped = false;
         ggml_tensor * win_sel    = nullptr;
         ggml_tensor * win_mask   = nullptr;
     };

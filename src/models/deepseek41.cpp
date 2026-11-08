@@ -505,7 +505,32 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         const int64_t n_stream = comp_all->ne[3];
 
         ggml_tensor * top_k = topk_of[hparams.dsv41_topk_src[il]];
-        if (hparams.dsv41_topk_src[il] == il) {
+        // k19-dsv4p (LLAMA_DSV41_TOPK_ALL=0 off): with at most indexer_top_k compressed rows the top-k keeps every row, so the
+        // indexer scores, the top-k (and the candidate-block pick, whose top-k of n_comp / block_size <= top_k / block_size
+        // blocks keeps every block too) are skipped and the selection is the rows in order: the ids the gather path sorts to,
+        // and the same mask for the dense path, so the output keeps its bytes. Consumers of a skipped candidate source share
+        // its compress ratio (load check), hence its n_comp, and skip as well.
+        const bool all_rows = topk_all && n_comp <= (int64_t) hparams.indexer_top_k &&
+            (hparams.dsv41_cand_src != il || (n_comp + hparams.dsv41_cand_block_size - 1)/hparams.dsv41_cand_block_size <= (int64_t) hparams.dsv41_cand_topk_blocks);
+        if (hparams.dsv41_topk_src[il] == il && all_rows) {
+            const int64_t n_tok = nt/n_stream;
+            ggml_tensor * ids = ggml_arange(ctx0, 0.0f, (float) n_comp, 1.0f);   // F32, exact below 2^24
+            ids = ggml_repeat_4d(ctx0, ggml_reshape_4d(ctx0, ids, n_comp, 1, 1, 1), n_comp, n_tok, 1, n_stream);
+            top_k = ggml_cast(ctx0, ids, GGML_TYPE_I32);
+            cb(top_k, "idx_top_k_all", il);
+            static bool logged_all = false;
+            if (!logged_all) {
+                logged_all = true;
+                LLAMA_LOG_INFO("%s: DeepSeek-V4.1 top-k keeps all %lld compressed rows: indexer skipped (LLAMA_DSV41_TOPK_ALL=0 off)\n",
+                        __func__, (long long) n_comp);
+            }
+            topk_of[il] = top_k;
+            if (hparams.dsv41_cand_src == il) {
+                cand_skipped = true;
+            }
+        } else if (hparams.dsv41_topk_src[il] == il) {
+            GGML_ASSERT(!(cand_skipped && hparams.dsv41_cand_src >= 0 && hparams.dsv41_cand_src < il) &&
+                "DeepSeek-V4.1: a candidate consumer scores rows its skipped source did not pick");
             ggml_tensor * ik = ggml_view_4d(ctx0, comp_all, n_idx_embd, 1, n_comp, n_stream,
                     comp_all->nb[1], comp_all->nb[2], comp_all->nb[3], ggml_row_size(comp_all->type, n_embd_head));
             // the fused indexer reads the strided view in place, the unfused path needs it contiguous; CUDA has no same-type copy of
@@ -791,6 +816,8 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     sparse = sparse_env;
     static const bool win_gather_env = dsv41_env_on("LLAMA_DSV41_WIN_GATHER");
     win_gather = win_gather_env;
+    static const bool topk_all_env = dsv41_env_on("LLAMA_DSV41_TOPK_ALL");
+    topk_all = topk_all_env;
 
     topk_of.assign(n_layer, nullptr);
 
