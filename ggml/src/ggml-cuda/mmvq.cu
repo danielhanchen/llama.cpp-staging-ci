@@ -960,28 +960,18 @@ static __global__ void mul_mat_vec_q(
     // k19-q38t: grid table in shared memory (see mmvq_grid_smem_off)
     constexpr int grid_n = mmvq_grid_smem_n(type);
     __shared__ uint32_t grid_sm[grid_n > 0 ? grid_n : 1];
-    [[maybe_unused]] bool grid_shared = false;
+    const uint32_t * grid = grid_sm;
     if constexpr (grid_n > 0) {
-        if (!mmvq_grid_smem_off) {
-            const uint32_t * grid_g = type == GGML_TYPE_IQ3_S ? iq3s_grid : iq3xxs_grid;
+        const uint32_t * grid_g = type == GGML_TYPE_IQ3_S ? iq3s_grid : iq3xxs_grid;
+        if (mmvq_grid_smem_off) {
+            grid = grid_g;
+        } else {
             for (int e = tid; e < grid_n; e += nwarps*warp_size) {
                 grid_sm[e] = grid_g[e];
             }
             __syncthreads();
-            grid_shared = true;
         }
     }
-    // each branch passes a table of a known state space (shared: LDS, global: LDG), not a pointer that may be either (generic loads)
-    auto vec_dot = [&](const void * vxp, const block_q8_1 * yp, const int kbx_i, const int kqs_i) -> float {
-        if constexpr (grid_n > 0) {
-            if (grid_shared) {
-                return mmvq_vec_dot<type>(grid_sm, vxp, yp, kbx_i, kqs_i);
-            }
-            return mmvq_vec_dot<type>(type == GGML_TYPE_IQ3_S ? iq3s_grid : iq3xxs_grid, vxp, yp, kbx_i, kqs_i);
-        } else {
-            return mmvq_vec_dot<type>(nullptr, vxp, yp, kbx_i, kqs_i);
-        }
-    };
 
     // partial sum for each thread
     float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
@@ -1024,11 +1014,11 @@ static __global__ void mul_mat_vec_q(
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot(
+                tmp[j][i] += mmvq_vec_dot<type>(grid,
                     vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        tmp_gate[j][i] += vec_dot(
+                        tmp_gate[j][i] += mmvq_vec_dot<type>(grid,
                             vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                     }
                 }
@@ -1067,11 +1057,11 @@ static __global__ void mul_mat_vec_q(
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot(
+                tmp[j][i] += mmvq_vec_dot<type>(grid,
                     vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        tmp_gate[j][i] += vec_dot(
+                        tmp_gate[j][i] += mmvq_vec_dot<type>(grid,
                             vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                     }
                 }
