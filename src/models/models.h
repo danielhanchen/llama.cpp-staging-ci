@@ -1512,6 +1512,12 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
         std::map<std::pair<int32_t, int32_t>, ggml_tensor *> gather_k_of;
         std::map<int32_t, ggml_tensor *> gather_sel_of;
         std::map<int32_t, ggml_tensor *> gather_mask_of;
+        std::map<int32_t, ggml_tensor *> gather_win_mask_of;
+        // k19-dsv4p window gather (LLAMA_DSV41_WIN_GATHER=0 disables): the raw (window) cache cells each query may see, picked once
+        // per graph from the shared raw mask, sorted; n_win = the sliding window padded to the FA stride
+        bool          win_gather = true;
+        ggml_tensor * win_sel    = nullptr;
+        ggml_tensor * win_mask   = nullptr;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

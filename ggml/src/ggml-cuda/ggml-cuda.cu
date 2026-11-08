@@ -3554,6 +3554,21 @@ static bool ggml_cuda_graph_drop_failed_instance(ggml_cuda_graph * graph, cudaEr
         (void)cudaGetLastError();
         graph->graph = nullptr;
     }
+    // k19-am17an: the chunks after the first go with it (none of them was launched: the chunks are launched after all instantiated)
+    for (cudaGraphExec_t & e : graph->chunk_instances) {
+        if (e != nullptr) {
+            (void)cudaGraphExecDestroy(e);
+            (void)cudaGetLastError();
+        }
+    }
+    graph->chunk_instances.clear();
+    for (cudaGraph_t & g : graph->chunk_graphs) {
+        if (g != nullptr) {
+            (void)cudaGraphDestroy(g);
+            (void)cudaGetLastError();
+        }
+    }
+    graph->chunk_graphs.clear();
     static int n_logged = 0;
     if (n_logged++ < 4) {
         GGML_LOG_WARN("%s: instantiating the CUDA graph %s gave %s: this evaluation runs without the graph, it is captured again at the next one "
@@ -3563,9 +3578,9 @@ static bool ggml_cuda_graph_drop_failed_instance(ggml_cuda_graph * graph, cudaEr
 }
 
 // returns false when the exec could not be instantiated again (see ggml_cuda_graph_drop_failed_instance): the caller runs eagerly
-static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-
+// k19-am17an: one chunk of the graph, its exec and its newly captured graph (chunk 0: the graph's own graph / instance; the chunks after
+// it: chunk_graphs / chunk_instances)
+static bool ggml_cuda_graph_update_chunk(ggml_cuda_graph * graph, cudaGraphExec_t & instance, cudaGraph_t cgraph_chunk) {
     // GGML_CUDA_GRAPH_UPDATE_DEBUG=1 (debug): the error pending before the update and whether the exec handle is still valid, logged
     // when the update fails with another error than an update failure (a sticky / earlier error vs a bad handle)
     static const bool update_debug = ggml_cuda_env_flag("GGML_CUDA_GRAPH_UPDATE_DEBUG");
@@ -3573,11 +3588,11 @@ static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
 
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
-    cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &result_info);
+    cudaError_t stat = cudaGraphExecUpdate(instance, cgraph_chunk, &result_info);
 #else
     cudaGraphNode_t errorNode;
     cudaGraphExecUpdateResult result_info;
-    cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &errorNode, &result_info);
+    cudaError_t stat = cudaGraphExecUpdate(instance, cgraph_chunk, &errorNode, &result_info);
 #endif // CUDART_VERSION >= 12000
 
     // k11: GGML_CUDA_GRAPH_UPDATE_FAULT=N (debug) makes every Nth update fail as if the device were out of memory
@@ -3598,12 +3613,12 @@ static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         const cudaError_t probe = cudaSuccess; // cudaGraphExecGetFlags is CUDA 12.0+
 #else
         unsigned long long flags = 0;
-        const cudaError_t probe = cudaGraphExecGetFlags(graph->instance, &flags);
+        const cudaError_t probe = cudaGraphExecGetFlags(instance, &flags);
 #endif
         size_t n_nodes = 0;
-        const cudaError_t gprobe = cudaGraphGetNodes(graph->graph, nullptr, &n_nodes);
+        const cudaError_t gprobe = cudaGraphGetNodes(cgraph_chunk, nullptr, &n_nodes);
         GGML_LOG_WARN("%s: update gave %s; pending before it %s; exec %p probe %s; graph %p probe %s (%zu nodes); last error now %s\n", __func__,
-            cudaGetErrorString(stat), cudaGetErrorString(pending), (void *) graph->instance, cudaGetErrorString(probe), (void *) graph->graph,
+            cudaGetErrorString(stat), cudaGetErrorString(pending), (void *) instance, cudaGetErrorString(probe), (void *) cgraph_chunk,
             cudaGetErrorString(gprobe), n_nodes, cudaGetErrorString(cudaPeekAtLastError()));
     }
     if (update_error) {
@@ -3630,31 +3645,32 @@ static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
             // A leaked exec keeps its device memory, which matters under the memory pressure that made the update fail: the error is
             // cleared and the destroy tried once more; the handle is dropped (leaked) only when that fails too
             static const bool destroy_fault = ggml_cuda_env_flag("GGML_CUDA_GRAPH_DESTROY_FAULT");
-            cudaError_t de = graph->instance == nullptr ? cudaSuccess : destroy_fault ? cudaErrorInvalidValue : cudaGraphExecDestroy(graph->instance);
+            cudaError_t de = instance == nullptr ? cudaSuccess : destroy_fault ? cudaErrorInvalidValue : cudaGraphExecDestroy(instance);
             if (de != cudaSuccess) {
                 (void)cudaGetLastError();
-                const cudaError_t de2 = destroy_fault ? de : cudaGraphExecDestroy(graph->instance);
+                const cudaError_t de2 = destroy_fault ? de : cudaGraphExecDestroy(instance);
                 (void)cudaGetLastError();
                 GGML_LOG_WARN("%s: destroying the exec after the failed update gave %s, again %s: %s, instantiating a new one\n", __func__,
                     cudaGetErrorString(de), cudaGetErrorString(de2), de2 == cudaSuccess ? "destroyed" : "dropped");
                 de = de2;
             }
         } else {
-            CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+            CUDA_CHECK(cudaGraphExecDestroy(instance));
         }
-        graph->instance = nullptr;
-        cudaError_t inst = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+        instance = nullptr;
+        cudaError_t inst = cudaGraphInstantiate(&instance, cgraph_chunk, NULL, NULL, 0);
         // k11: out of memory may pass once other processes free some; a few tries before the error is fatal
         for (int k = 0; k < 20 && inst == cudaErrorMemoryAllocation && update_retry; ++k) {
             (void)cudaGetLastError();
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            inst = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+            inst = cudaGraphInstantiate(&instance, cgraph_chunk, NULL, NULL, 0);
         }
         static const bool inst_fault = ggml_cuda_env_flag("GGML_CUDA_GRAPH_INSTANTIATE_FAULT");
         if (inst_fault && inst == cudaSuccess) {
             inst = cudaErrorInvalidValue;
         }
         if (inst != cudaSuccess) {
+            instance = nullptr; // (not an exec: nothing to destroy)
             return ggml_cuda_graph_drop_failed_instance(graph, inst, "after a failed update");
         }
     } else {
@@ -3662,6 +3678,39 @@ static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
             GGML_LOG_ERROR("%s: CUDA graph update failed with %s (%d)\n", __func__, cudaGetErrorString(stat), (int) stat);
         }
         GGML_ASSERT(stat == cudaSuccess);
+    }
+    return true;
+}
+
+// returns false when an exec could not be instantiated again (see ggml_cuda_graph_drop_failed_instance): the caller runs eagerly
+// k19-am17an: every chunk of a newly captured graph: the execs of the chunks it kept are updated, a chunk new to it is instantiated, the
+// execs of chunks it no longer has (a shorter graph) are destroyed
+static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    if (!ggml_cuda_graph_update_chunk(graph, graph->instance, graph->graph)) {
+        return false;
+    }
+    while (graph->chunk_instances.size() > graph->chunk_graphs.size()) {
+        if (graph->chunk_instances.back() != nullptr) {
+            CUDA_CHECK(cudaGraphExecDestroy(graph->chunk_instances.back()));
+        }
+        graph->chunk_instances.pop_back();
+    }
+    for (size_t k = 0; k < graph->chunk_graphs.size(); ++k) {
+        if (k < graph->chunk_instances.size() && graph->chunk_instances[k] != nullptr) {
+            if (!ggml_cuda_graph_update_chunk(graph, graph->chunk_instances[k], graph->chunk_graphs[k])) {
+                return false;
+            }
+            continue;
+        }
+        if (k >= graph->chunk_instances.size()) {
+            graph->chunk_instances.push_back(nullptr);
+        }
+        const cudaError_t inst = cudaGraphInstantiate(&graph->chunk_instances[k], graph->chunk_graphs[k], NULL, NULL, 0);
+        if (inst != cudaSuccess) {
+            graph->chunk_instances[k] = nullptr;
+            return ggml_cuda_graph_drop_failed_instance(graph, inst, "of a chunk after its capture");
+        }
     }
     return true;
 }
@@ -8966,8 +9015,34 @@ static void ggml_cuda_src1_memo_plan_products(ggml_backend_cuda_context * ctx, c
     }
 }
 
+#ifdef USE_CUDA_GRAPH
+// k19-am17an: port of an upstream llama.cpp change by Aman Gupta (am17an), MIT: a captured ggml graph
+// becomes a series of CUDA graphs of about GGML_CUDA_GRAPH_CHUNK_SIZE ggml nodes each (default 512, upstream's), launched one after the
+// other on the same stream, so the GPU starts on the first chunk while the next ones are still being launched (the launch cost of a CUDA
+// graph grows with its size). The same kernels in the same order on one stream: the results do not change.
+// GGML_CUDA_GRAPH_CHUNK_SIZE=0: one CUDA graph per ggml graph, as before.
+// Unlike upstream the chunks are not launched while the graph is captured but after all of them are instantiated, so a failed
+// instantiation still runs the whole evaluation eagerly (ggml_cuda_graph_drop_failed_instance). A chunk ends only where no work is open
+// on another stream (side-stream branches / products, concurrent regions, an overlapped MoE cache fetch): a capture must not end with
+// unjoined streams, and an event recorded in one capture cannot be waited on in another
+static int ggml_cuda_graph_chunk_size() {
+    static const int chunk_size = [] {
+        const char * env = getenv("GGML_CUDA_GRAPH_CHUNK_SIZE");
+        return env != nullptr ? std::max(0, atoi(env)) : 512;
+    }();
+    return chunk_size;
+}
+#endif // USE_CUDA_GRAPH
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
+
+#ifdef USE_CUDA_GRAPH
+    // k19-am17an: the chunks of this capture before its last one (see ggml_cuda_graph_chunk_size)
+    const int  chunk_size = ggml_cuda_graph_chunk_size();
+    const bool chunking   = use_cuda_graph && cuda_graph_update_required && chunk_size > 0;
+    std::vector<cudaGraph_t> chunks_captured;
+#endif // USE_CUDA_GRAPH
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -9160,8 +9235,23 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ++ggml_cuda_eval_gen;   // k15-fn: per-pass caches (ggml_cuda_reader_index) are rebuilt on first use
             ggml_cuda_qsa_maskless_plan(cuda_ctx, cgraph);
             ggml_cuda_qsa_sel_plan(cuda_ctx, cgraph);
+#ifdef USE_CUDA_GRAPH
+            int chunk_end = chunk_size;
+#endif // USE_CUDA_GRAPH
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+#ifdef USE_CUDA_GRAPH
+                // k19-am17an: the next chunk starts here (fused nodes are skipped together, so a cut never splits a fusion), only with no
+                // work open on another stream (see ggml_cuda_graph_chunk_size)
+                if (chunking && i >= chunk_end && !is_concurrent_event_active && !cuda_ctx->side_chain_active && side_mv_pending.empty() &&
+                        !cuda_ctx->moe_join_pending && cuda_ctx->curr_stream_no == 0) {
+                    cudaGraph_t chunk = nullptr;
+                    CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &chunk));
+                    chunks_captured.push_back(chunk);
+                    CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+                    chunk_end = i + chunk_size;
+                }
+#endif // USE_CUDA_GRAPH
                 if (cuda_ctx->side_chain_active && i > cuda_ctx->side_chain_last) {
                     // the branch's nodes are enqueued: its join event, the main stream continues
                     if (side_mv_n_events == cuda_ctx->side_mv_join.size()) {
@@ -9506,8 +9596,32 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 CUDA_CHECK(cudaGraphDestroy(graph->graph));
                 graph->graph = nullptr;
             }
+            // k19-am17an: the chunks of the previous capture go, the first chunk of this one is graph->graph, the others follow it
+            for (cudaGraph_t g : graph->chunk_graphs) {
+                if (g != nullptr) {
+                    CUDA_CHECK(cudaGraphDestroy(g));
+                }
+            }
+            graph->chunk_graphs.clear();
 
-            CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+            cudaGraph_t last_chunk = nullptr;
+            CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &last_chunk));
+            if (chunks_captured.empty()) {
+                graph->graph = last_chunk;
+            } else {
+                graph->graph = chunks_captured[0];
+                graph->chunk_graphs.assign(chunks_captured.begin() + 1, chunks_captured.end());
+                graph->chunk_graphs.push_back(last_chunk);
+                // engagement: the first chunked captures are logged (GGML_CUDA_GRAPH_CHUNK_LOG=N: the first N, default 2)
+                static const int chunk_log = getenv("GGML_CUDA_GRAPH_CHUNK_LOG") != nullptr ? atoi(getenv("GGML_CUDA_GRAPH_CHUNK_LOG")) : 2;
+                static int n_chunk_logged = 0;
+                if (n_chunk_logged < chunk_log) {
+                    n_chunk_logged++;
+                    GGML_LOG_INFO("k19-am17an: CUDA graph of %d ggml nodes captured in %zu chunks (GGML_CUDA_GRAPH_CHUNK_SIZE=%d; =0 off)\n",
+                        cgraph->n_nodes, graph->chunk_graphs.size() + 1, chunk_size);
+                }
+            }
+            chunks_captured.clear();
             graph_evaluated_or_captured = true; // CUDA graph has been captured
             // k15-fn debug (GGML_CUDA_GRAPH_CAPTURE_LOG=1): every capture, with the launches of the key's previous exec
             static const bool cap_log = getenv("GGML_CUDA_GRAPH_CAPTURE_LOG") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_CAPTURE_LOG")) != 0;
@@ -9610,6 +9724,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             static int64_t lt_n[2] = { 0, 0 }, lt_t[2] = { 0, 0 }, lt_nodes[2] = { 0, 0 };
             const int64_t lt0 = lt_every > 0 ? ggml_time_us() : 0;
             CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+            // k19-am17an: the chunks after the first, in order on the same stream
+            for (cudaGraphExec_t chunk : graph->chunk_instances) {
+                CUDA_CHECK(cudaGraphLaunch(chunk, cuda_ctx->stream()));
+            }
             graph->n_launch_since_capture++;
             graph->n_launch_total++;
             if (lt_every > 0) {

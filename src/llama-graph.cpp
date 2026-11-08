@@ -3171,6 +3171,10 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     }
     ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
     cb(slots, "ffn_moe_slots", il);
+    // k19-l4full: the route tail skip of the device lookup, for the host lookup of a streamed layer (LLAMA_MOE_ROUTE_TAIL_SKIP_HOST=0 off)
+    if (tail_ok) {
+        moe_cache->tail_skip_host(slots, il, n_tokens);
+    }
 
     // add the lookup now: the transform of a Hadamard-folded expert reads host weights and would start its split first
     ggml_build_forward_expand(gf, slots);

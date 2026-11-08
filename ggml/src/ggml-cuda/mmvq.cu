@@ -742,18 +742,102 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_grid(const uint32_t
     return d * sumi;
 }
 
-// the vec_dot of the dense kernel: grid types read their table through grid (shared memory, or the global table under the switch)
-template <ggml_type type>
-static __device__ __forceinline__ float mmvq_vec_dot(const uint32_t * grid,
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
-    if constexpr (type == GGML_TYPE_IQ3_S) {
-        return vec_dot_iq3_s_q8_1_grid(grid, vbq, bq8_1, kbx, iqs);
+// k19-dsv4p (GGML_CUDA_MMVQ_IQ_TAB): IQ1_S / IQ2_XXS single column mat-vec with the codebook in shared memory. Each vec_dot of these
+// types gathers 4 codebook entries at random indices; from global memory (L1) a warp-wide gather of 32 random entries of the 8 KB
+// IQ1_S grid touches ~25 cache lines and is replayed per line, from shared memory it costs a few bank conflicts. The entries and the
+// integer / float arithmetic are those of vec_dot_iq1_s_q8_1 / vec_dot_iq2_xxs_q8_1, so every sum keeps its bytes.
+static constexpr __host__ __device__ bool mmvq_tab_type(ggml_type type) {
+    return type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ2_XXS;
+}
+
+static constexpr __host__ __device__ int mmvq_tab_words(ggml_type type) {
+    return type == GGML_TYPE_IQ1_S ? NGRID_IQ1S : type == GGML_TYPE_IQ2_XXS ? 2*256 : 1;
+}
+
+static __device__ __forceinline__ float vec_dot_iq1_s_q8_1_tab(
+    const uint32_t * __restrict__ tab, const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const block_iq1_s * bq1 = (const block_iq1_s *) vbq + kbx;
+
+    const int       qs_packed = get_int_b2(bq1->qs, iqs);
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+    const int qh = bq1->qh[iqs];
+
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int grid = tab[qs[l0/2] | (((qh >> 3*(l0/2)) & 0x07) << 8)];
+
+        const int grid0 = (grid >> 0) & 0x0F0F0F0F;
+        const int grid1 = (grid >> 4) & 0x0F0F0F0F;
+
+        const int u0 = get_int_b4(bq8_1[iqs].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs].qs, l0 + 1);
+
+        sumi = ggml_cuda_dp4a(grid0, u0, sumi);
+        sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+    }
+
+    const float  d1q   = __half2float(bq1->d) * (((qh >> 11) & 0x0E) + 1);
+    const float  delta = -1.0f + IQ1S_DELTA - (qh & 0x8000) * (2.0f*IQ1S_DELTA/0x8000);
+    const float2 ds    = __half22float2(bq8_1[iqs].ds);
+    return d1q * (ds.x*sumi + ds.y*delta);
+}
+
+static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1_tab(
+    const uint2 * __restrict__ tab, const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_iq2_xxs * bq2 = (const block_iq2_xxs *) vbq + kbx;
+
+    const int q2 = get_int_b2(bq2->qs, iqs);
+    const uint8_t * aux8 = (const uint8_t *) &q2;
+    const uint32_t aux32 = get_int_b2(bq2->qs, iqs + 1);
+
+    int sumi = 0;
+#pragma unroll
+    for (int k0 = 0; k0 < 8; k0 += 2) {
+        const uint2 grid_pos = tab[aux8[k0/2]];
+        const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
+
+        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+        const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, k0 + 0);
+        sumi = ggml_cuda_dp4a(grid0, u0, sumi);
+
+        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+        const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, k0 + 1);
+        sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+    }
+
+    const int ls = aux32 >> 27 | 1; // (scale * 2 + 1)
+    sumi = sumi * ls / 8;           // (sumi * scale + sumi / 2) / 4
+    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+
+// the vec_dot of the kernel: with c_tab the shared memory codebook variant of an mmvq_tab_type (k19-dsv4p), the IQ3_S / IQ3_XXS
+// grid through grid (k19-q38t: shared memory, or the global table under GGML_CUDA_MMVQ_GRID_SMEM=0), else vec_dot_q_cuda
+template <ggml_type type, bool c_tab>
+static __device__ __forceinline__ float mmvq_vec_dot(const void * tab, const uint32_t * grid,
+        const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const int kbx, const int kqs) {
+    if constexpr (c_tab && type == GGML_TYPE_IQ1_S) {
+        GGML_UNUSED(grid);
+        return vec_dot_iq1_s_q8_1_tab((const uint32_t *) tab, vx, y, kbx, kqs);
+    } else if constexpr (c_tab && type == GGML_TYPE_IQ2_XXS) {
+        GGML_UNUSED(grid);
+        return vec_dot_iq2_xxs_q8_1_tab((const uint2 *) tab, vx, y, kbx, kqs);
+    } else if constexpr (type == GGML_TYPE_IQ3_S) {
+        GGML_UNUSED(tab);
+        return vec_dot_iq3_s_q8_1_grid(grid, vx, y, kbx, kqs);
     } else if constexpr (type == GGML_TYPE_IQ3_XXS) {
-        return vec_dot_iq3_xxs_q8_1_grid(grid, vbq, bq8_1, kbx, iqs);
+        GGML_UNUSED(tab);
+        return vec_dot_iq3_xxs_q8_1_grid(grid, vx, y, kbx, kqs);
     } else {
+        GGML_UNUSED(tab);
         GGML_UNUSED(grid);
         constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
-        return vec_dot_q_cuda(vbq, bq8_1, kbx, iqs);
+        return vec_dot_q_cuda(vx, y, kbx, kqs);
     }
 }
 
@@ -762,7 +846,8 @@ static __device__ __forceinline__ float mmvq_vec_dot(const uint32_t * grid,
 // rows of one of them exactly as that matrix's own launch would (same warps, rows per block and reduction)
 // c_unroll > 1: the K loop unrolled c_unroll times, so that a thread has the weight loads of several iterations in flight (few rows,
 // long K: the grid covers few SMs and waits on memory latency); every thread adds its blocks in the same order, so the bytes are the same
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int c_nwarps = 0, int n_multi = 0, int c_rpb = 0, int c_unroll = 1, bool c_ewq = false>
+// c_tab: the codebook of an mmvq_tab_type in shared memory (k19-dsv4p, mmvq_vec_dot)
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int c_nwarps = 0, int n_multi = 0, int c_rpb = 0, int c_unroll = 1, bool c_ewq = false, bool c_tab = false>
 __launch_bounds__((c_nwarps > 0 ? c_nwarps : calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters))*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -789,6 +874,19 @@ static __global__ void mul_mat_vec_q(
               int row0 = rows_per_cuda_block*blockIdx.x;
     const     int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+
+    // k19-dsv4p: the codebook into shared memory (constant data: before the PDL wait, every thread of the block passes here)
+    constexpr bool use_tab = c_tab && mmvq_tab_type(type);
+    [[maybe_unused]] const void * tab = nullptr;
+    if constexpr (use_tab) {
+        __shared__ alignas(16) uint32_t tab_shared[mmvq_tab_words(type)];
+        const uint32_t * tab_src = type == GGML_TYPE_IQ1_S ? (const uint32_t *) iq1s_grid_gpu : (const uint32_t *) iq2xxs_grid;
+        for (int i = tid; i < mmvq_tab_words(type); i += nwarps*warp_size) {
+            tab_shared[i] = tab_src[i];
+        }
+        __syncthreads();
+        tab = tab_shared;
+    }
 
     if constexpr (n_multi > 1) {
         static_assert(!has_fusion && n_multi <= GGML_CUDA_MMVQ_MULTI_MAX, "multi-matrix mul_mat_vec_q");
@@ -1014,11 +1112,11 @@ static __global__ void mul_mat_vec_q(
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += mmvq_vec_dot<type>(grid,
+                tmp[j][i] += mmvq_vec_dot<type, use_tab>(tab, grid,
                     vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        tmp_gate[j][i] += mmvq_vec_dot<type>(grid,
+                        tmp_gate[j][i] += mmvq_vec_dot<type, use_tab>(tab, grid,
                             vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                     }
                 }
@@ -1057,11 +1155,11 @@ static __global__ void mul_mat_vec_q(
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += mmvq_vec_dot<type>(grid,
+                tmp[j][i] += mmvq_vec_dot<type, use_tab>(tab, grid,
                     vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        tmp_gate[j][i] += mmvq_vec_dot<type>(grid,
+                        tmp_gate[j][i] += mmvq_vec_dot<type, use_tab>(tab, grid,
                             vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                     }
                 }
@@ -3134,6 +3232,84 @@ static bool mul_mat_vec_q_verify_wide(
     }
 }
 
+// k19-dsv4p: the single column launch of an mmvq_tab_type with the codebook in shared memory (mul_mat_vec_q c_tab). The warps and the
+// K split are those of the launch it replaces, so each row's sum keeps its bytes; the rows per block (which do not change a row's sum)
+// are the small-K rows (= warps) for a small K, GGML_CUDA_MMVQ_TURING_IDS_ROWS (default 2; 1 / 4) for a MUL_MAT_ID launch, which also
+// shares the shared-memory load between more rows, and k16-turing's 2 rows (turing_2rows) or the table's rows for a dense launch.
+// GGML_CUDA_MMVQ_IQ_TAB: 1 (default) = sm_75 binaries on the TURING table (as k16-turing), 0 = off (the launches as before),
+// 2 = every NVIDIA table (a byte check elsewhere, not a tuned setting). No shared-expert fusion, unrolled or wider (halve_iters) launch.
+template <ggml_type type>
+static bool mul_mat_vec_q_tab_launch(
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const int ncols_x, const uint3 nchannels_y_fd, const int nrows_x, const int stride_row_x, const int stride_col_y,
+        const int stride_col_dst, const uint3 channel_ratio_fd, const int stride_channel_x, const int stride_channel_y,
+        const int stride_channel_dst, const uint3 sample_ratio_fd, const int stride_sample_x, const int stride_sample_y,
+        const int stride_sample_dst, const int nchannels_dst, const int nsamples_dst, const int ids_stride,
+        const bool small_k, const bool other_launch, const bool turing_2rows, const int cc, const mmvq_parameter_table_id table_id,
+        const int warp_size, cudaStream_t stream) {
+    if constexpr (!mmvq_tab_type(type)) {
+        GGML_UNUSED_VARS(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+            channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd, stride_sample_x,
+            stride_sample_y, stride_sample_dst, nchannels_dst, nsamples_dst, ids_stride, small_k, other_launch, turing_2rows, cc,
+            table_id, warp_size, stream);
+        return false;
+    } else {
+        static const int tab_env = [] {
+            const char * e = getenv("GGML_CUDA_MMVQ_IQ_TAB");
+            return e != nullptr ? atoi(e) : 1;
+        }();
+        static const int ids_rows_env = [] {
+            const char * e = getenv("GGML_CUDA_MMVQ_TURING_IDS_ROWS");
+            const int v = e != nullptr ? atoi(e) : 2;
+            return v == 1 || v == 4 ? v : 2;
+        }();
+        if (tab_env == 0 || other_launch || fusion.shared_up != nullptr || !GGML_CUDA_CC_IS_NVIDIA(cc) || table_id == MMVQ_PARAMETERS_GB10) {
+            return false;
+        }
+        if (tab_env == 1 && !(table_id == MMVQ_PARAMETERS_TURING && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING)) {
+            return false;
+        }
+        const int nwarps = calc_nwarps(type, 1, table_id);
+        if (nwarps != 4) {   // the instances below are 4-warp launches (TURING / GENERIC tables at one column)
+            return false;
+        }
+        int rpb = small_k ? nwarps : calc_rows_per_block(type, 1, table_id);
+        if (!small_k) {
+            if (ids != nullptr) {
+                rpb = std::max(rpb, ids_rows_env);
+            } else if (turing_2rows) {
+                rpb = std::max(rpb, 2);
+            }
+        }
+        if (rpb > 1 && nrows_x % rpb != 0) {   // a block reads the weights of all its rows
+            return false;
+        }
+        const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                                fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+        const dim3 block_nums(nrows_x / rpb, nchannels_dst, nsamples_dst);
+        const dim3 block_dims(warp_size, nwarps, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+#define MMVQ_TAB_LAUNCH(FUS, RPB) ggml_cuda_kernel_launch(mul_mat_vec_q<type, 1, FUS, false, false, 4, 0, RPB, 1, false, true>, launch_params, \
+            vx, vy, ids, fusion, dst, (uint32_t) ncols_x, nchannels_y_fd, (uint32_t) stride_row_x, (uint32_t) stride_col_y, (uint32_t) stride_col_dst, \
+            channel_ratio_fd, (uint32_t) stride_channel_x, (uint32_t) stride_channel_y, (uint32_t) stride_channel_dst, \
+            sample_ratio_fd, (uint32_t) stride_sample_x, (uint32_t) stride_sample_y, (uint32_t) stride_sample_dst, (uint32_t) ids_stride)
+        switch (rpb) {
+            case 1: if (has_fusion) { MMVQ_TAB_LAUNCH(true, 1); } else { MMVQ_TAB_LAUNCH(false, 1); } break;
+            case 2: if (has_fusion) { MMVQ_TAB_LAUNCH(true, 2); } else { MMVQ_TAB_LAUNCH(false, 2); } break;
+            case 4: if (has_fusion) { MMVQ_TAB_LAUNCH(true, 4); } else { MMVQ_TAB_LAUNCH(false, 4); } break;
+            default: return false;
+        }
+#undef MMVQ_TAB_LAUNCH
+        static bool logged = false;
+        if (!logged && getenv("GGML_CUDA_MMVQ_IQ_TAB_LOG") != nullptr) {
+            logged = true;
+            GGML_LOG_INFO("%s: k19-dsv4p codebook in shared memory: %s, %d rows per block, ids %d, small_k %d\n", __func__,
+                ggml_type_name(type), rpb, ids != nullptr, (int) small_k);
+        }
+        return true;
+    }
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -3502,6 +3678,13 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 calc_rows_per_block(type, 1, table_id) == 1 &&
                 ((turing_2rows_env == 1 && table_id == MMVQ_PARAMETERS_TURING && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
                  (turing_2rows_env == 2 && (table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GENERIC)));
+            // k19-dsv4p: IQ1_S / IQ2_XXS with the codebook in shared memory (mul_mat_vec_q_tab_launch); false = the launches below
+            if (mul_mat_vec_q_tab_launch<type>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x, stride_row_x, stride_col_y,
+                    stride_col_dst, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                    stride_sample_x, stride_sample_y, stride_sample_dst, nchannels_dst, nsamples_dst, ids_stride,
+                    should_use_small_k(c_ncols_dst), unroll || should_halve_iters(), turing_2rows, cc, table_id, warp_size, stream)) {
+                break;
+            }
             if constexpr (type != GGML_TYPE_Q3_K) {
                 if (turing_2rows) {
                     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
