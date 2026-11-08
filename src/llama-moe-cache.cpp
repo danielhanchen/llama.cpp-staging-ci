@@ -4728,6 +4728,7 @@ struct llama_moe_cache::impl {
     // per call (cudaMemcpyBatchAsync) instead of one cudaMemcpyAsync per expert run: the refill after an 8k Flash-Next prompt is ~3800
     // copies of 0.3-1.7 MB, which reached ~40 GB/s busy (B200 nsys) against 52 GB/s for the batched prompt copies. Same bytes, same slots,
     // same stream order. LLAMA_MOE_FILL_BATCH=0: one copy per run, as before
+    bool hprof_on = false; // upload_fills of a profiled host lookup (LLAMA_MOE_HOST_PROF)
     std::vector<ggml_backend_copy_region> fill_regions;
     bool fill_batch = [] {
         const char * env = getenv("LLAMA_MOE_FILL_BATCH");
@@ -4765,8 +4766,14 @@ struct llama_moe_cache::impl {
                 }
             }
             // exclusive: the evicted experts move to RAM before their device slots are overwritten (same backend, in order)
+            int64_t tp = hprof_on ? ggml_time_us() : 0;
             if (ev != nullptr && host->exclusive()) {
                 demote(backend, g, *ev);
+            }
+            if (hprof_on) {
+                const int64_t t = ggml_time_us();
+                hprof.demote_us += t - tp;
+                tp = t;
             }
             for (const auto & f : fl) {
                 const int32_t s = host->find(il, f.expert);
@@ -4835,7 +4842,15 @@ struct llama_moe_cache::impl {
                     }
                 }
             }
+            if (hprof_on) {
+                const int64_t t = ggml_time_us();
+                hprof.ram_us += t - tp;
+                tp = t;
+            }
             host->commit(backend);
+            if (hprof_on) {
+                hprof.commit_us += ggml_time_us() - tp;
+            }
             rest = &fills_rest;
         }
 
@@ -4867,7 +4882,13 @@ struct llama_moe_cache::impl {
                 i += n;
             }
         }
-        if (ws && !wstore->upload_batch(backend, ws_regions.data(), ws_regions.size())) {
+        const int64_t t_ws = hprof_on && ws ? ggml_time_us() : 0;
+        const bool ws_ok = !ws || wstore->upload_batch(backend, ws_regions.data(), ws_regions.size());
+        if (hprof_on && ws) {
+            hprof.disk_us += ggml_time_us() - t_ws;
+            hprof.n_disk  += rest->size();
+        }
+        if (!ws_ok) {
             for (const auto & r : ws_regions) {
                 ggml_backend_tensor_set_async(backend, r.dst, (const uint8_t *) r.src->data + r.src_off, r.dst_off, r.size);
             }
@@ -5666,8 +5687,119 @@ struct llama_moe_cache::impl {
         ggml_moe_cache_set_tail_skip(op, tail_rank, tail_dflt, stat);
     }
 
+    // k19-l4full: route tail skip for host lookups (see llama_moe_cache::tail_skip_host). A layer streamed through the weight store
+    // (and the RAM tier) is looked up by the copy callback of its slot map get_rows, not by the device op, so the k16 rule announced
+    // at init ("rank 7 by default") never ran there: full Colab L4 + fn4nd on the VM disk (dt_l6) skipped 0 experts while Strata
+    // skipped 58% of its decode misses with the same rule. The rule is the device op's (moe_cache_tail_skip): an entry at rank >= the
+    // threshold whose expert is not in a device slot before this lookup and that no entry of the window routes at a lower rank is
+    // left out of the plan (not admitted, not fetched, no copy back), its slot stays -1 and the product's rows are 0. The default is
+    // taken on CUDA devices only (their MUL_MAT_ID zeroes the rows of slot -1; the device op takes it on NVIDIA and RDNA4, a host
+    // lookup can run on other backends), an explicit LLAMA_MOE_ROUTE_TAIL_SKIP=N on CUDA / ROCm. LLAMA_MOE_ROUTE_TAIL_SKIP_HOST=0 off
+    static constexpr int32_t tail_host_tag = 0x7a110000;
+    static bool tail_host_on() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_MOE_ROUTE_TAIL_SKIP_HOST");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        return on;
+    }
+    uint64_t tail_host_skipped = 0; // entries left out by host lookups
+    uint64_t tail_host_experts = 0; // distinct (layer, expert) per lookup left out
+    std::vector<uint32_t> tail_head_gen; // [n_expert] generation of the experts some entry routes at a rank below the threshold
+    uint32_t tail_gen = 0;
+    std::vector<int32_t>  ids_kept;      // the entries of a host lookup the plan sees
+
+    void tail_skip_host(ggml_tensor * op, int32_t il, int64_t n_tokens) const {
+        if (!tail_host_on() || tail_rank <= 0 || op == nullptr || op->op != GGML_OP_GET_ROWS || n_tokens > tail_max_tokens || il < 0 ||
+                il >= (int32_t) layers.size() || layers[il].ig < 0) {
+            return;
+        }
+        const group & g = groups[layers[il].ig];
+        if (g.dev_lookup || g.n_slots == 0) {
+            return;
+        }
+        const char * name = ggml_backend_name(devices[g.id].backend);
+        const bool cuda = name != nullptr && strncmp(name, "CUDA", 4) == 0;
+        const bool rocm = name != nullptr && strncmp(name, "ROCm", 4) == 0;
+        if (!(cuda || (rocm && !tail_dflt))) {
+            return;
+        }
+        op->op_params[0] = tail_host_tag | tail_rank;
+    }
+
+    // the entries of a host lookup's ids that its plan sees: all, or without the route tail skip's entries (see tail_skip_host)
+    void tail_filter_host(const ggml_tensor * lookup, const group & g, int32_t il, const std::vector<int32_t> & ids,
+            const int32_t *& out, size_t & n_out) {
+        out   = ids.data();
+        n_out = ids.size();
+        const int32_t tag  = lookup->op_params[0];
+        const int32_t rank = (tag & 0xffff0000) == tail_host_tag ? (tag & 0xff) : 0;
+        const int64_t neu  = n_expert_used;
+        if (rank <= 0 || neu <= rank || ids.empty() || ids.size() % (size_t) neu != 0 || (int64_t) ids.size() > tail_max_tokens*neu ||
+                g.lru.slot_map[il] == nullptr) {
+            return;
+        }
+        const int32_t * sm = g.lru.slot_map[il];
+        const int32_t n_expert = g.lru.n_expert;
+        if ((int32_t) tail_head_gen.size() < n_expert) {
+            tail_head_gen.assign(n_expert, 0);
+        }
+        if (++tail_gen == 0) {
+            std::fill(tail_head_gen.begin(), tail_head_gen.end(), 0);
+            tail_gen = 1;
+        }
+        bool any = false;
+        for (size_t i = 0; i < ids.size(); ++i) {
+            const int32_t e = ids[i];
+            if (e < 0 || e >= n_expert) {
+                return; // the plan asserts on it, as before
+            }
+            if ((int64_t) (i % neu) < rank) {
+                tail_head_gen[e] = tail_gen;
+            }
+        }
+        for (size_t i = 0; i < ids.size() && !any; ++i) {
+            const int32_t e = ids[i];
+            any = (int64_t) (i % neu) >= rank && sm[e] < 0 && tail_head_gen[e] != tail_gen;
+        }
+        if (!any) {
+            return;
+        }
+        ids_kept.clear();
+        const uint32_t gen_skip = ++tail_gen; // marks the distinct skipped experts (never 0: the head marks used the previous value)
+        for (size_t i = 0; i < ids.size(); ++i) {
+            const int32_t e = ids[i];
+            if ((int64_t) (i % neu) >= rank && sm[e] < 0 && tail_head_gen[e] != gen_skip - 1) {
+                tail_host_skipped++;
+                if (tail_head_gen[e] != gen_skip) {
+                    tail_head_gen[e] = gen_skip;
+                    tail_host_experts++;
+                }
+                continue;
+            }
+            ids_kept.push_back(e);
+        }
+        out   = ids_kept.data();
+        n_out = ids_kept.size();
+    }
+
+    // k19-l4full LLAMA_MOE_HOST_PROF (diagnostic, default 0 = off; 1 = host timers of the small-batch host lookups, 2 = also waits for
+    // the lookup's copies before the device computes the layer, which splits the next lookup's sync into compute and copies; 2 changes
+    // timing, never what is computed)
+    static int host_prof_mode() {
+        static const int m = [] {
+            const char * e = getenv("LLAMA_MOE_HOST_PROF");
+            return e != nullptr ? atoi(e) : 0;
+        }();
+        return m;
+    }
+    struct {
+        uint64_t n = 0, sync_us = 0, plan_us = 0, up_us = 0, demote_us = 0, ram_us = 0, disk_us = 0, commit_us = 0, copy_us = 0;
+        uint64_t n_disk = 0, n_skip_lookups = 0;
+    } hprof;
+
     uint64_t tail_skipped() const {
-        uint64_t n = 0;
+        uint64_t n = tail_host_skipped;
         for (const group & g : groups) {
             if (g.counts == nullptr || g.counts->data == nullptr || !g.dev_lookup || g.counts->ne[0] < 6) {
                 continue;
@@ -8995,8 +9127,16 @@ struct llama_moe_cache::impl {
             }
         }
 
+        const bool prof = host_prof_mode() > 0 && ids.size() <= (size_t) 8*n_expert_used;
+        int64_t t_prof = prof ? ggml_time_us() : 0;
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         ggml_backend_synchronize(backend);
+        if (prof) {
+            const int64_t t = ggml_time_us();
+            hprof.sync_us += t - t_prof;
+            hprof.n++;
+            t_prof = t;
+        }
 
         if (ahead) {
             ahead_wait_routed(il);
@@ -9011,10 +9151,22 @@ struct llama_moe_cache::impl {
             }
         }
 
+        // k19-l4full: the route tail skip of a host lookup leaves its entries out of the plan (see tail_skip_host)
+        const int32_t * pids  = ids.data();
+        size_t          n_ids = ids.size();
+        {
+            const uint64_t n0 = tail_host_skipped;
+            tail_filter_host(lookup, g, il, ids, pids, n_ids);
+            if (prof && tail_host_skipped != n0) {
+                hprof.n_skip_lookups++;
+            }
+        }
+
         // RAM tier: the experts routed by this call keep their RAM slots while it runs
         if (tiered) {
             host->begin_call();
-            for (int32_t e : ids) {
+            for (size_t i = 0; i < n_ids; ++i) {
+                const int32_t e  = pids[i];
                 const int32_t sl = e >= 0 && e < (int32_t) g.lru.n_expert ? host->find(il, e, false) : -1;
                 if (sl >= 0) {
                     host->pin(sl);
@@ -9023,12 +9175,27 @@ struct llama_moe_cache::impl {
         }
 
         size_t n_hit = 0;
-        if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit, tiered && host->exclusive() ? &evicted_tmp : nullptr)) {
+        if (!g.lru.plan(il, pids, n_ids, fills, n_hit, tiered && host->exclusive() ? &evicted_tmp : nullptr)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+        }
+        if (prof) {
+            const int64_t t = ggml_time_us();
+            hprof.plan_us += t - t_prof;
+            t_prof = t;
         }
 
         // upload the missing experts (from the RAM tier, the model files or the mapping)
+        hprof_on = prof;
         const size_t bytes = upload_fills(backend, il, fills, tiered && host->exclusive() ? &evicted_tmp : nullptr);
+        hprof_on = false;
+        if (prof) {
+            const int64_t t = ggml_time_us();
+            hprof.up_us += t - t_prof;
+            if (host_prof_mode() >= 2) {
+                ggml_backend_synchronize(backend);
+                hprof.copy_us += ggml_time_us() - t;
+            }
+        }
 
         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
         st.hits   += n_hit;
@@ -9766,6 +9933,17 @@ struct llama_moe_cache::impl {
             if (tail_rank > 0) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: route tail skip (rank %d%s): %llu missing experts skipped in windows of at most %" PRId64 " tokens\n",
                     tag, tail_rank, tail_dflt ? ", default" : "", (unsigned long long) tail_skipped(), tail_max_tokens);
+                if (tail_host_on()) {
+                    LLAMA_LOG_INFO("llama_moe_cache%s: route tail skip in host lookups: %llu entries, %llu experts left out of the plan "
+                        "(LLAMA_MOE_ROUTE_TAIL_SKIP_HOST=0 off)\n", tag, (unsigned long long) tail_host_skipped, (unsigned long long) tail_host_experts);
+                }
+            }
+            if (host_prof_mode() > 0 && hprof.n > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: host lookups (LLAMA_MOE_HOST_PROF=%d): %llu small lookups, sync %.1f ms, plan %.1f ms, uploads %.1f ms "
+                    "(copies back issued %.1f, RAM uploads issued %.1f, commit %.1f, file reads + uploads %.1f for %llu experts), copies waited %.1f ms, "
+                    "%llu lookups with tail skips\n", tag, host_prof_mode(), (unsigned long long) hprof.n, hprof.sync_us/1000.0, hprof.plan_us/1000.0,
+                    hprof.up_us/1000.0, hprof.demote_us/1000.0, hprof.ram_us/1000.0, hprof.commit_us/1000.0, hprof.disk_us/1000.0,
+                    (unsigned long long) hprof.n_disk, hprof.copy_us/1000.0, (unsigned long long) hprof.n_skip_lookups);
             }
             if (cm && cm_cal) {
                 uint64_t c[3];
@@ -9999,6 +10177,10 @@ bool llama_moe_cache::host_split_frozen() const {
 
 void llama_moe_cache::tail_skip(ggml_tensor * op, int32_t il, int64_t n_tokens) const {
     pimpl->tail_skip(op, il, n_tokens);
+}
+
+void llama_moe_cache::tail_skip_host(ggml_tensor * get_rows, int32_t il, int64_t n_tokens) const {
+    pimpl->tail_skip_host(get_rows, il, n_tokens);
 }
 
 bool llama_moe_cache::tail_skip_off_exact() const {
