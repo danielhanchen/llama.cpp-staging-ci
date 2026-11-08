@@ -3581,7 +3581,24 @@ uma_restart:
                     common_fit_set_moe_margin_auto(!params.fit_params_target_set);
                     const common_params_fit_status st = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(),
                         tbo.empty() ? nullptr : tbo.data(), mg.data(), params.fit_params_min_ctx, &extra_sq, fit_log_level, params.fit_kv_resident);
-                    if (st == COMMON_PARAMS_FIT_STATUS_SUCCESS && mp.n_gpu_layers == llama_model_default_params().n_gpu_layers) {
+                    // every layer on the device: the fit leaves -ngl at its default ("no changes needed") or sets it to all of them
+                    // (trunk + output, the target's NextN block is not loaded beside -md) without moving tensors to the host
+                    const auto n_tbo = [](const std::vector<llama_model_tensor_buft_override> & v) {
+                        size_t n = 0;
+                        for (const auto & o : v) {
+                            if (o.pattern == nullptr) {
+                                break;
+                            }
+                            n++;
+                        }
+                        return n;
+                    };
+                    std::vector<uint8_t> exps_sq;
+                    const int64_t n_layer_sq = common_model_n_layer(params.model.path, exps_sq);
+                    const int64_t n_nextn_sq = std::max<int64_t>(0, common_gguf_u32(params.model.path, "nextn_predict_layers"));
+                    const bool all_dev = mp.n_gpu_layers == llama_model_default_params().n_gpu_layers ||
+                        (n_layer_sq > 0 && mp.n_gpu_layers >= n_layer_sq + 1 - (mp.load_mtp ? 0 : n_nextn_sq) && n_tbo(tbo) == n_tbo(tbo_in));
+                    if (st == COMMON_PARAMS_FIT_STATUS_SUCCESS && all_dev) {
                         COM_WRN("%s: --fit: k19-q38t: the MTP drafter stays with every layer on the device (%d layers with it before): its "
                             "context reads the prompt in ubatches of %u tokens%s (LLAMA_FIT_DRAFT_SQUEEZE=0 off)\n", __func__, ngl_spilled,
                             cp_dft_sq.n_ubatch, step == 1 ? ", beside a smaller device margin" : "");
