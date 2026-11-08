@@ -1286,9 +1286,23 @@ struct ggml_cuda_graph {
         if (graph != nullptr) {
             CUDA_CHECK(cudaGraphDestroy(graph));
         }
+        for (cudaGraphExec_t e : chunk_instances) {
+            if (e != nullptr) {
+                CUDA_CHECK(cudaGraphExecDestroy(e));
+            }
+        }
+        for (cudaGraph_t g : chunk_graphs) {
+            if (g != nullptr) {
+                CUDA_CHECK(cudaGraphDestroy(g));
+            }
+        }
     }
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
+    // k19-am17an (port of an upstream llama.cpp change by Aman Gupta, GGML_CUDA_GRAPH_CHUNK_SIZE): a ggml graph captured as a series of CUDA graphs keeps
+    // its first chunk in graph / instance and the chunks after it here, launched in order on the same stream
+    std::vector<cudaGraph_t>     chunk_graphs;
+    std::vector<cudaGraphExec_t> chunk_instances;
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
