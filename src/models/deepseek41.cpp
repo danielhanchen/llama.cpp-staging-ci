@@ -703,6 +703,12 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 win_mask = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, raw_mask, 1, n_raw, nt), win_sel);
                 win_mask = ggml_cast(ctx0, ggml_reshape_4d(ctx0, win_mask, n_win, 1, 1, nt), GGML_TYPE_F16);
                 cb(win_mask, "win_mask", il);
+                static bool logged = false;
+                if (!logged) {
+                    logged = true;
+                    LLAMA_LOG_INFO("%s: DeepSeek-V4.1 window gather: %lld of %lld window cells per query (LLAMA_DSV41_WIN_GATHER=0 off)\n",
+                            __func__, (long long) n_win, (long long) n_raw);
+                }
             }
 
             ggml_tensor * k_all = nullptr;
