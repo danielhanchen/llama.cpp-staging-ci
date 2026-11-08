@@ -1436,16 +1436,41 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             feat_hash_n[seq_id], (int) batch_in.tokens[i_batch_beg[seq_id] + offset + n_chunk - 1].pos[0], feat_hash_v[seq_id]);
                 }
 
-                batch_inject.clear();
-                for (int32_t i = 0; i < n_chunk; ++i) {
-                    const llama_pos p = batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
-                    const llama_pos pos_arr[4] = { p, p, p, 0 };
-                    batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
+                auto inject = [&](int32_t i0, int32_t i1) {
+                    batch_inject.clear();
+                    for (int32_t i = i0; i < i1; ++i) {
+                        const llama_pos p = batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
+                        const llama_pos pos_arr[4] = { p, p, p, 0 };
+                        batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
+                    }
+                    return llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                };
+                // k19-a100chat (LLAMA_DFLASH_INJECT_SPLIT=0: off): a chunk whose graph does not get its compute buffer (rc -2: the
+                // allocation failed, the drafter's KV from the chunk's first position on is removed) is injected again from the first
+                // row not yet in, in halves down to 32 rows: a smaller graph needs a smaller buffer. Before, the request failed with an
+                // HTTP 500 (Colab A100 48 GB fn4n, default cache, -fa on, srv_kld long48: the 512-row graph's 30 MiB did not fit).
+                // Only after a failed allocation, so every run that did not fail is unchanged
+                static const bool inject_split = getenv("LLAMA_DFLASH_INJECT_SPLIT") == nullptr || atoi(getenv("LLAMA_DFLASH_INJECT_SPLIT")) != 0;
+                int32_t done = 0;
+                int32_t part = n_chunk;
+                int32_t rc   = 0;
+                while (done < n_chunk) {
+                    const int32_t end = std::min(n_chunk, done + part);
+                    rc = inject(done, end);
+                    if (rc == 0) {
+                        done = end;
+                        continue;
+                    }
+                    if (!inject_split || is_lilicorr || rc != -2 || part <= 32) {
+                        break;
+                    }
+                    part = std::max<int32_t>(32, part/2);
+                    LOG_WRN("%s: the drafter's %d-row injection did not get its compute buffer: rows %d.. again in pieces of %d "
+                            "(LLAMA_DFLASH_INJECT_SPLIT=0 off)\n", __func__, (int) (end - done), (int) done, (int) part);
                 }
-                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
                 if (rc != 0) {
                     LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
+                            __func__, rc, (int) n_chunk, (int) (offset + done));
                     return false;
                 }
                 if (is_lilicorr) {
