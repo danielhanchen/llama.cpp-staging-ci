@@ -3737,15 +3737,20 @@ uma_restart:
         // -sm layer runs the GPUs one after the other; -sm tensor runs both on half of every layer. Kaggle 2x T4, Qwen3.8-27B UD-Q3_K_XL
         // ctx 16384: no draft chat 13.2 -> 18.6 tok/s, MTP n2 chat 23.8 -> 31.4, 8k 22.0 -> 30.2; Qwen3.6-35B-A3B UD-Q4_K_XL + MTP
         // chat 101.7 -> 108.7, 8k 93.0 -> 105.8 (plans/k19_mgpu.md). A draft model follows the target's split mode (common_base_params_to_speculative)
-        // Dense models only by default (LLAMA_SPLIT_AUTO_TENSOR=2 also MoE): on Qwen3.6-35B-A3B UD-Q4_K_XL the -sm tensor text left the
-        // -fa off band of srv_kld long48 on the first token (KLD mean 0.00184 vs 0.00145, p99 0.0144 vs 0.0086), Qwen3.8-27B stayed inside
+        // MoE models too by default (k19-moetp; LLAMA_SPLIT_AUTO_TENSOR=3 = dense models only, the k19-mgpu default). The Qwen3.6-35B-A3B
+        // UD-Q4_K_XL "out of band" verdict (srv_kld long48 first-token KLD mean 0.00184 vs the -fa off arm's 0.00145) was the gate, not the
+        // split: the AllReduce adds the two F32 halves exactly (P2P) at quant-block-aligned splits, and a rounding-only change on the layer
+        // path (GGML_CUDA_DISABLE_FUSION=1) lands at 0.00101 on the same prompts; the three arms' means overlap (bootstrap 95% CIs), tensor
+        // vs -fa off paired p = 0.43, 24 / 48 prompts worse, median / geometric mean lower (0.00048 / 0.00047 vs 0.00065 / 0.00049): one
+        // MoE routing flip anywhere in a 2100-8200 token prompt moves the first token by ~1e-3 whatever the size of the rounding change.
+        // Kaggle 2x T4 q4x: MTP 101.9 -> 106.9 chat, 94.3 -> 106.0 8k; no draft 66.1 -> 81.4, 63.5 -> 79.9 (plans/k19_moetp.md)
         {
             static const char * e_auto = getenv("LLAMA_SPLIT_AUTO_TENSOR");
             const int  mode = e_auto == nullptr ? 1 : atoi(e_auto);
             std::vector<uint8_t> exps_t;
             common_model_n_layer(params.model.path, exps_t);
             const bool moe = std::any_of(exps_t.begin(), exps_t.end(), [](uint8_t e) { return e != 0; });
-            const bool on  = mode >= 2 || (mode == 1 && !moe);
+            const bool on  = mode > 0 && !(mode == 3 && moe);
             std::vector<ggml_backend_dev_t> gpus;
             if (!params.devices.empty()) {
                 for (ggml_backend_dev_t d : params.devices) {
@@ -3761,8 +3766,8 @@ uma_restart:
                     }
                 }
             }
-            if (mode == 1 && moe && gpus.size() >= 2 && !params.split_mode_set && !model_only) {
-                COM_INF("%s: --fit: MoE model: -sm layer (LLAMA_SPLIT_AUTO_TENSOR=2 lets the fit pick -sm tensor for MoE models too)\n", __func__);
+            if (mode == 3 && moe && gpus.size() >= 2 && !params.split_mode_set && !model_only) {
+                COM_INF("%s: --fit: MoE model: -sm layer (LLAMA_SPLIT_AUTO_TENSOR=3: -sm tensor for dense models only)\n", __func__);
             }
             const bool ts_user = std::any_of(ts_in.begin(), ts_in.end(), [](float x) { return x != 0.0f; });
             const bool ngl_user = mparams_in.n_gpu_layers != llama_model_default_params().n_gpu_layers;
