@@ -9704,7 +9704,11 @@ struct llama_moe_cache::impl {
             sd.gen = g.lru.gen;
             if (tiered) {
                 // exclusive: the experts the seed evicts move to RAM before any of their device slots is overwritten
+                // k19-ramevict: a large batch seeds layer b.il after its experts were staged, so the RAM slots they need make room in the
+                // layers this pass has finished first (see llama_moe_host_cache::set_stream_layer); decode never seeds
+                host->set_stream_layer(b.il);
                 shadow_slots(backend, g, evicted_tmp);
+                host->set_stream_layer(-1);
             }
         }
 
@@ -10029,6 +10033,9 @@ struct llama_moe_cache::impl {
                     "registered expert buffers = %.2f MiB, MemAvailable %.1f MiB at start, %.1f MiB now\n",
                     host->n_slots(), hs.peak_held, (unsigned long long) hs.evicted, (unsigned long long) hs.no_slot, (unsigned long long) hs.waits,
                     host->pinned_bytes()/1048576.0, host->budget_bytes()/1048576.0, hst.registered/1048576.0, hst.avail_init/1048576.0, meminfo_avail()/1048576.0);
+            LLAMA_LOG_INFO("llama_moe_cache: host tier: prompt seeds evicted %llu RAM experts: %llu by the finished-layer rule, %llu of layers the pass had not reached "
+                    "(LLAMA_MOE_HOST_EVICT_DONE=%d)\n", (unsigned long long) hs.stream_evicted, (unsigned long long) hs.done_evicted,
+                    (unsigned long long) hs.ahead_evicted, host->evict_done_on() ? 1 : 0);
             LLAMA_LOG_INFO("llama_moe_cache: host tier: %.1f ms pinning slot memory, %llu allocation failures, %.2f MiB pageable (%llu chunks past the pin cap or a failed pin)\n",
                     hs.alloc_us/1000.0, (unsigned long long) hs.alloc_fail, host->pageable_bytes()/1048576.0, (unsigned long long) hs.pin_fallbacks);
             if (ahead_depth > 0) {
