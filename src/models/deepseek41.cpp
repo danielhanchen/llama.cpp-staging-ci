@@ -685,14 +685,44 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                     raw_k = ggml_repeat_4d(ctx0, raw_k, n_embd_head, 1, n_raw, nt);
                 }
             }
-            ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
+            // k19-dsv4p window gather: the raw cache holds n_swa + n_ubatch cells (2304 with -ub 2048) of which a query sees at most
+            // n_swa (128); the dense window part made every gather layer copy the whole raw cache into k_all and run FA over all of
+            // its cells. Instead the cells a query may see are picked once per graph (top-k of the shared raw mask: every visible
+            // cell is 0, the rest -inf, and at most n_swa are visible, so the n_win >= n_swa picked cells hold all of them; the
+            // extra picks keep their -inf), sorted by cell (the dense order), and each layer gathers only those K rows and mask
+            // values. Same visible keys in the same order with fewer masked ones: not bit-exact (FA tiling), checked by KLD.
+            const int64_t n_win = std::min<int64_t>(GGML_PAD(std::max<int64_t>(hparams.n_swa, 1), 256), n_raw);
+            const bool use_win = win_gather && n_stream == 1 && hparams.n_swa > 0 && n_win < n_raw && !ggml_is_quantized(raw_k->type) &&
+                raw_mask->ne[0] == n_raw && ggml_nelements(raw_mask) == n_raw*nt && ggml_is_contiguous(raw_mask);
+            if (use_win && !win_sel) {
+                ggml_tensor * mf  = ggml_cast(ctx0, ggml_reshape_2d(ctx0, raw_mask, n_raw, nt), GGML_TYPE_F32);
+                ggml_tensor * wid = ggml_top_k(ctx0, mf, n_win);
+                ggml_tensor * ord = ggml_argsort(ctx0, ggml_cast(ctx0, wid, GGML_TYPE_F32), GGML_SORT_ORDER_ASC);
+                win_sel  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, wid, 1, n_win, nt), ord), n_win, nt);
+                cb(win_sel, "win_sel", il);
+                win_mask = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, raw_mask, 1, n_raw, nt), win_sel);
+                win_mask = ggml_cast(ctx0, ggml_reshape_4d(ctx0, win_mask, n_win, 1, 1, nt), GGML_TYPE_F16);
+                cb(win_mask, "win_mask", il);
+            }
+
+            ggml_tensor * k_all = nullptr;
+            if (use_win) {
+                ggml_tensor * k0       = inp_attn->mctx->get_k(ctx0, il); // [n_embd_head, 1, n_raw, 1]
+                ggml_tensor * src_rows = ggml_view_2d(ctx0, k0, n_embd_head, n_raw, k0->nb[2], 0);
+                ggml_tensor * win_k = ggml_get_rows(ctx0, src_rows, ggml_reshape_1d(ctx0, win_sel, n_win*nt)); // F32
+                win_k = ggml_cast(ctx0, ggml_reshape_4d(ctx0, win_k, n_embd_head, 1, n_win, nt), raw_k->type);    // exact
+                cb(win_k, "win_k", il);
+                k_all = ggml_concat(ctx0, win_k, comp_k, 2);
+            } else {
+                k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
+            }
 
             // window mask, then the comp mask at the selected rows (-inf where top-k picked an invisible row); one per top-k source
-            ggml_tensor *& kq_mask = gather_mask_of[topk_src];
+            ggml_tensor *& kq_mask = use_win ? gather_win_mask_of[topk_src] : gather_mask_of[topk_src];
             if (!kq_mask) {
                 ggml_tensor * sel_mask = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, ci.kq_mask, 1, n_comp, nt), sel);
                 sel_mask = ggml_cast(ctx0, ggml_reshape_4d(ctx0, sel_mask, k_sel, 1, 1, nt), GGML_TYPE_F16);
-                kq_mask = ggml_concat(ctx0, ggml_reshape_4d(ctx0, raw_mask, raw_mask->ne[0], 1, 1, nt), sel_mask, 0);
+                kq_mask = ggml_concat(ctx0, use_win ? win_mask : ggml_reshape_4d(ctx0, raw_mask, raw_mask->ne[0], 1, 1, nt), sel_mask, 0);
                 cb(kq_mask, "comp_kq_mask_sel", il);
             }
 
@@ -753,6 +783,8 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
 
     static const bool sparse_env = dsv41_env_on("LLAMA_DSV41_SPARSE");
     sparse = sparse_env;
+    static const bool win_gather_env = dsv41_env_on("LLAMA_DSV41_WIN_GATHER");
+    win_gather = win_gather_env;
 
     topk_of.assign(n_layer, nullptr);
 
