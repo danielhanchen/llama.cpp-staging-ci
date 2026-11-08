@@ -130,7 +130,10 @@ public:
     // k19-ramevict: the layer a prompt pass is streaming (-1: none, e.g. decode). While set, an evicting reservation that finds no
     // duplicate takes its victim first from the experts of the layers the pass has finished (layer <= il: not needed again until the
     // next pass), by the CLOCK over them, and only then from any layer (the plain CLOCK). Placement only: what a slot holds is unchanged.
-    // Idea from Straydog (MIT). LLAMA_MOE_HOST_EVICT_DONE=0: the plain CLOCK (the counters below still count)
+    // Idea from Straydog (MIT). Off by default, LLAMA_MOE_HOST_EVICT_DONE=1 on (the counters below count either way). Kaggle T4, Qwen3.6-35B-A3B
+    // UD-Q4_K_XL, tier 8 under a 15 GiB RAM cap (exclusive tier, disk misses), 3 launches each: same md5, the upcoming-layer evictions of the
+    // prompt seeds 1057-1122 -> 11-13 per launch, disk bytes per request 8k -2.1%, 16k -3.2%, but TTFT 8k / 16k within the A/A spread and
+    // decode after 8k -3% (the finished layers' experts are what the decode reads next)
     void set_stream_layer(int32_t il) { stream_il = il; }
     bool evict_done_on() const { return evict_done; }
     bool is_dup(int32_t s) const { return slots[s].dup != 0; }

@@ -73,7 +73,7 @@ llama_moe_host_cache::llama_moe_host_cache(ggml_backend_buffer_type_t buft, size
     slot_of.resize(layer_sizes.size());
     {
         const char * env = getenv("LLAMA_MOE_HOST_EVICT_DONE");
-        evict_done = env == nullptr || atoi(env) != 0;
+        evict_done = env != nullptr && atoi(env) != 0; // off by default: see the header
     }
     std::vector<int32_t> n_layers;
     for (size_t il = 0; il < layer_sizes.size(); ++il) {
