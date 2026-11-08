@@ -5798,6 +5798,20 @@ struct llama_moe_cache::impl {
         uint64_t n_disk = 0, n_skip_lookups = 0;
     } hprof;
 
+    // k19-ramevict: missing experts the hybrid assign left to the host because of its admission margin (LLAMA_MOE_CACHE_ADMIT_MARGIN)
+    uint64_t admit_rejected() const {
+        uint64_t n = 0;
+        for (const group & g : groups) {
+            if (g.counts == nullptr || g.counts->data == nullptr || !g.dev_lookup || g.counts->ne[0] < 8) {
+                continue;
+            }
+            uint64_t cnt = 0;
+            ggml_backend_tensor_get(g.counts, &cnt, ((size_t) g.counts->ne[0]*(g.counts->ne[1] - 1) + 6)*sizeof(int32_t), sizeof(cnt));
+            n += cnt;
+        }
+        return n;
+    }
+
     uint64_t tail_skipped() const {
         uint64_t n = tail_host_skipped;
         for (const group & g : groups) {
@@ -9935,6 +9949,11 @@ struct llama_moe_cache::impl {
                 st.bytes  += cnt[1]*g.expert_bytes;
             }
             log("device lookups (ubatch <= 32)", st);
+            if (getenv("LLAMA_MOE_CACHE_ADMIT_MARGIN") != nullptr) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: admission margin %s (+%s): %llu missing experts left to the host instead of replacing a resident\n", tag,
+                    getenv("LLAMA_MOE_CACHE_ADMIT_MARGIN"), getenv("LLAMA_MOE_CACHE_ADMIT_ADD") ? getenv("LLAMA_MOE_CACHE_ADMIT_ADD") : "0",
+                    (unsigned long long) admit_rejected());
+            }
             if (tail_rank > 0) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: route tail skip (rank %d%s): %llu missing experts skipped in windows of at most %" PRId64 " tokens\n",
                     tag, tail_rank, tail_dflt ? ", default" : "", (unsigned long long) tail_skipped(), tail_max_tokens);
