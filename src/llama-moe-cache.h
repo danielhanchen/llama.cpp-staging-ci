@@ -112,6 +112,10 @@ public:
     // tail_skip_max_tokens() tokens, a missing expert that every token routes at rank >= the threshold is neither fetched nor computed
     // (zero contribution, no renormalisation); sets it on the lookup / assign op of layer il when it applies to this cache
     void tail_skip(ggml_tensor * op, int32_t il, int64_t n_tokens) const;
+    // k19-l4full: the same rule for a host lookup (the slot map get_rows of a layer streamed through the weight store / RAM tier, which
+    // the device lookup never serves): marks the get_rows node, the copy callback then leaves the skipped experts out of its plan, so
+    // their slot reads -1 (rows 0, as the device lookup's skip). LLAMA_MOE_ROUTE_TAIL_SKIP_HOST=0 off
+    void tail_skip_host(ggml_tensor * get_rows, int32_t il, int64_t n_tokens) const;
     // k19-fixB: the skip is the default rule (no LLAMA_MOE_ROUTE_TAIL_SKIP=N) and LLAMA_MOE_ROUTE_TAIL_SKIP_EXACT=1 does not keep it
     // in the exact modes: exact verify set through llama_set_verify_exact turns it off as LLAMA_MTP_EXACT=1 does at init
     bool tail_skip_off_exact() const;
