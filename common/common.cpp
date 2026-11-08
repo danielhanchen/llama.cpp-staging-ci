@@ -3528,6 +3528,7 @@ uma_restart:
         // before. Kaggle T4, Qwen3.8-27B UD-Q3_K_XL + its MTP GGUF, ctx 16384: the drafter stays with every layer on the device
         // instead of being dropped. Drafting changes the text as on any GPU where the drafter fits (the exact contract,
         // LLAMA_MTP_EXACT=1 GGML_CUDA_VERIFY_REASSOC=0, keeps the no-draft text). LLAMA_FIT_DRAFT_SQUEEZE=0: off
+        bool draft_squeezed = false;
         {
             const char * e_sq = getenv("LLAMA_FIT_DRAFT_SQUEEZE");
             const char * e_sd = getenv("LLAMA_FIT_DRAFT_SPILL_DROP");
@@ -3599,8 +3600,8 @@ uma_restart:
                     const bool all_dev = mp.n_gpu_layers == llama_model_default_params().n_gpu_layers ||
                         (n_layer_sq > 0 && mp.n_gpu_layers >= n_layer_sq + 1 - (mp.load_mtp ? 0 : n_nextn_sq) && n_tbo(tbo) == n_tbo(tbo_in));
                     if (st == COMMON_PARAMS_FIT_STATUS_SUCCESS && all_dev) {
-                        COM_WRN("%s: --fit: k19-q38t: the MTP drafter stays with every layer on the device (%d layers with it before): its "
-                            "context reads the prompt in ubatches of %u tokens%s (LLAMA_FIT_DRAFT_SQUEEZE=0 off)\n", __func__, ngl_spilled,
+                        COM_WRN("%s: --fit: k19-q38t: the MTP drafter stays with every layer on the device (-ngl %d with tensors on the host before): "
+                            "its context reads the prompt in ubatches of %u tokens%s (LLAMA_FIT_DRAFT_SQUEEZE=0 off)\n", __func__, ngl_spilled,
                             cp_dft_sq.n_ubatch, step == 1 ? ", beside a smaller device margin" : "");
                         std::copy(ts.begin(), ts.end(), params.tensor_split);
                         std::copy(tbo.begin(), tbo.end(), params.tensor_buft_overrides.begin());
@@ -3615,6 +3616,7 @@ uma_restart:
                         fit_status = st;
                         params.speculative.draft.n_ubatch = (int32_t) cp_dft_sq.n_ubatch;
                         cparams_dft.n_ubatch = cp_dft_sq.n_ubatch;
+                        draft_squeezed = true;
                         break;
                     }
                 }
@@ -3633,7 +3635,7 @@ uma_restart:
             const char * e_st = getenv("LLAMA_FIT_DRAFT_SPILL_MIN_THREADS");
             const int    min_threads = e_st != nullptr ? std::max(0, atoi(e_st)) : 8;
             const int32_t n_threads  = params.cpuparams.n_threads;
-            if ((e_sd == nullptr || atoi(e_sd) != 0) && has_draft && !draft_off && !params.speculative.draft.fit_off &&
+            if ((e_sd == nullptr || atoi(e_sd) != 0) && has_draft && !draft_off && !params.speculative.draft.fit_off && !draft_squeezed &&
                     params.speculative.draft.fit_can_drop && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS &&
                     mparams.n_gpu_layers != llama_model_default_params().n_gpu_layers &&
                     mparams_in.n_gpu_layers == llama_model_default_params().n_gpu_layers &&
