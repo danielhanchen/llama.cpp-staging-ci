@@ -647,8 +647,6 @@ static constexpr __host__ __device__ bool mmvq_tab_type(ggml_type type) {
     return type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ2_XXS;
 }
 
-#define MMVQ_TAB_Y_MAX_KB 192 // q8_1 blocks of the activation column staged by c_tab = 2 (K <= 6144)
-
 static constexpr __host__ __device__ int mmvq_tab_words(ggml_type type) {
     return type == GGML_TYPE_IQ1_S ? NGRID_IQ1S : type == GGML_TYPE_IQ2_XXS ? 2*256 : 1;
 }
@@ -735,10 +733,8 @@ static __device__ __forceinline__ float mmvq_vec_dot(
 // rows of one of them exactly as that matrix's own launch would (same warps, rows per block and reduction)
 // c_unroll > 1: the K loop unrolled c_unroll times, so that a thread has the weight loads of several iterations in flight (few rows,
 // long K: the grid covers few SMs and waits on memory latency); every thread adds its blocks in the same order, so the bytes are the same
-// c_tab: 1 = the codebook of an mmvq_tab_type in shared memory (k19-dsv4p, mmvq_vec_dot), 2 = also the q8_1 activation column
-// (one column, at most MMVQ_TAB_Y_MAX_KB blocks): a thread reads a whole q8_1 block with 8 4-byte loads, so a warp's load touches
-// one 36-byte block per thread (~9 L1 wavefronts from global memory, one from shared memory: a stride of 9 words has no bank conflict)
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int c_nwarps = 0, int n_multi = 0, int c_rpb = 0, int c_unroll = 1, bool c_ewq = false, int c_tab = 0>
+// c_tab: the codebook of an mmvq_tab_type in shared memory (k19-dsv4p, mmvq_vec_dot)
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int c_nwarps = 0, int n_multi = 0, int c_rpb = 0, int c_unroll = 1, bool c_ewq = false, bool c_tab = false>
 __launch_bounds__((c_nwarps > 0 ? c_nwarps : calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters))*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -769,8 +765,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
 
     // k19-dsv4p: the codebook into shared memory (constant data: before the PDL wait, every thread of the block passes here)
-    constexpr bool use_tab = c_tab > 0 && mmvq_tab_type(type);
-    constexpr bool use_ys  = c_tab > 1 && use_tab && ncols_dst == 1 && !c_ewq;
+    constexpr bool use_tab = c_tab && mmvq_tab_type(type);
     [[maybe_unused]] const void * tab = nullptr;
     if constexpr (use_tab) {
         __shared__ alignas(16) uint32_t tab_shared[mmvq_tab_words(type)];
@@ -954,19 +949,6 @@ static __global__ void mul_mat_vec_q(
     float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
-    if constexpr (use_ys) {
-        // k19-dsv4p: the activation column into shared memory (the host checks blocks_per_row_x*qk/QK8_1 <= MMVQ_TAB_Y_MAX_KB);
-        // every thread passes here (a skipped slot left the whole block above)
-        constexpr int wpb = sizeof(block_q8_1)/sizeof(int);
-        __shared__ int y_shared[MMVQ_TAB_Y_MAX_KB*wpb];
-        const int * y_src = (const int *) y;
-        const int nw = blocks_per_row_x*(qk/QK8_1)*wpb;
-        for (int i = tid; i < nw; i += nwarps*warp_size) {
-            y_shared[i] = y_src[i];
-        }
-        __syncthreads();
-        y = (const block_q8_1 *) y_shared;
-    }
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
     // c_unroll == 1 keeps the loop as it was (no pragma: the compiler's own unrolling), c_unroll > 1 unrolls it that many times
@@ -3149,11 +3131,6 @@ static bool mul_mat_vec_q_tab_launch(
             const char * e = getenv("GGML_CUDA_MMVQ_IQ_TAB");
             return e != nullptr ? atoi(e) : 1;
         }();
-        // GGML_CUDA_MMVQ_IQ_TAB_Y (default 1, 0 off): also the activation column in shared memory (c_tab = 2) when it fits
-        static const int tab_y_env = [] {
-            const char * e = getenv("GGML_CUDA_MMVQ_IQ_TAB_Y");
-            return e != nullptr ? atoi(e) : 1;
-        }();
         static const int ids_rows_env = [] {
             const char * e = getenv("GGML_CUDA_MMVQ_TURING_IDS_ROWS");
             const int v = e != nullptr ? atoi(e) : 2;
@@ -3185,10 +3162,7 @@ static bool mul_mat_vec_q_tab_launch(
         const dim3 block_nums(nrows_x / rpb, nchannels_dst, nsamples_dst);
         const dim3 block_dims(warp_size, nwarps, 1);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-        constexpr int qk = ggml_cuda_type_traits<type>::qk;
-        const bool tab_y = tab_y_env != 0 && (ncols_x/qk)*(qk/QK8_1) <= MMVQ_TAB_Y_MAX_KB;
-#define MMVQ_TAB_LAUNCH(FUS, RPB) if (tab_y) { MMVQ_TAB_LAUNCH_T(FUS, RPB, 2); } else { MMVQ_TAB_LAUNCH_T(FUS, RPB, 1); }
-#define MMVQ_TAB_LAUNCH_T(FUS, RPB, TAB) ggml_cuda_kernel_launch(mul_mat_vec_q<type, 1, FUS, false, false, 4, 0, RPB, 1, false, TAB>, launch_params, \
+#define MMVQ_TAB_LAUNCH(FUS, RPB) ggml_cuda_kernel_launch(mul_mat_vec_q<type, 1, FUS, false, false, 4, 0, RPB, 1, false, true>, launch_params, \
             vx, vy, ids, fusion, dst, (uint32_t) ncols_x, nchannels_y_fd, (uint32_t) stride_row_x, (uint32_t) stride_col_y, (uint32_t) stride_col_dst, \
             channel_ratio_fd, (uint32_t) stride_channel_x, (uint32_t) stride_channel_y, (uint32_t) stride_channel_dst, \
             sample_ratio_fd, (uint32_t) stride_sample_x, (uint32_t) stride_sample_y, (uint32_t) stride_sample_dst, (uint32_t) ids_stride)
@@ -3199,12 +3173,11 @@ static bool mul_mat_vec_q_tab_launch(
             default: return false;
         }
 #undef MMVQ_TAB_LAUNCH
-#undef MMVQ_TAB_LAUNCH_T
         static bool logged = false;
         if (!logged && getenv("GGML_CUDA_MMVQ_IQ_TAB_LOG") != nullptr) {
             logged = true;
-            GGML_LOG_INFO("%s: k19-dsv4p codebook in shared memory: %s, %d rows per block, ids %d, small_k %d, activation in shared memory %d\n", __func__,
-                ggml_type_name(type), rpb, ids != nullptr, (int) small_k, (int) tab_y);
+            GGML_LOG_INFO("%s: k19-dsv4p codebook in shared memory: %s, %d rows per block, ids %d, small_k %d\n", __func__,
+                ggml_type_name(type), rpb, ids != nullptr, (int) small_k);
         }
         return true;
     }
