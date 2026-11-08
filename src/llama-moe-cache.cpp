@@ -3110,6 +3110,14 @@ struct llama_moe_cache::impl {
             policy_env = strcmp(env_p, "inclusive") == 0 ? LLAMA_MOE_HOST_INCLUSIVE : LLAMA_MOE_HOST_EXCLUSIVE;
         }
         const bool force = env != nullptr && atoi(env) > 0;
+        // k19-disktier: below the device minimum on a disk tier the tier goes on inclusive (see LLAMA_MOE_HOST_MIN_TOKENS);
+        // LLAMA_MOE_HOST_DISK_INCLUSIVE=0: off there, as before
+        const char * env_di = getenv("LLAMA_MOE_HOST_DISK_INCLUSIVE");
+        const bool disk_incl = env_di == nullptr || atoi(env_di) != 0;
+        double disk_frac = LLAMA_MOE_HOST_DISK_MIN_FRAC; // LLAMA_MOE_HOST_DISK_MIN_FRAC: the budget's minimum share of the streamed experts
+        if (const char * e = getenv("LLAMA_MOE_HOST_DISK_MIN_FRAC")) {
+            disk_frac = std::max(0.0, atof(e));
+        }
         // k18-lowram: the tier never plans into a host reserve kept for the rest of the machine (a Studio user's desktop, browser and the
         // backend live there): LLAMA_MOE_HOST_RESERVE_MIB (default 6144, 0 = the auto budget as before). Only this path reaches it: the tier
         // exists where the weight store streams the experts, so every host that pins them loads as before. G4 Flash-Next UD-IQ4_XS 32 GB
@@ -3119,7 +3127,7 @@ struct llama_moe_cache::impl {
             reserve = (size_t) std::max<long long>(0, atoll(e)) << 20;
         }
         const size_t avail_plan = avail > reserve ? avail - reserve : 0;
-        llama_moe_host_plan plan = llama_moe_host_decide(e_bytes, v_bytes, mapped, avail_plan, token_bytes, host_mib, policy_env, force);
+        llama_moe_host_plan plan = llama_moe_host_decide(e_bytes, v_bytes, mapped, avail_plan, token_bytes, host_mib, policy_env, force, disk_incl, disk_frac);
         // where the whole reserve would cost the union of RAM and the device slots (the experts the device does not hold no longer fit),
         // but the budget without it holds them: the budget is that complement + 1 GiB, so resident mode stays and the reserve gets the
         // rest. G4 Flash-Next 32 GB at 48 GiB: the full 6 GiB reserve left 35.4 GB for 35.4 GB of complement, resident mode was lost and
@@ -3129,7 +3137,7 @@ struct llama_moe_cache::impl {
         const bool reserve_strict = getenv("LLAMA_MOE_HOST_RESERVE_STRICT") != nullptr && atoi(getenv("LLAMA_MOE_HOST_RESERVE_STRICT")) != 0;
         if (reserve > 0 && host_mib < 0 && e_bytes > v_bytes && !reserve_strict) {
             const size_t need = e_bytes - v_bytes + ((size_t) 1 << 30);
-            const llama_moe_host_plan full = llama_moe_host_decide(e_bytes, v_bytes, mapped, avail, token_bytes, host_mib, policy_env, force);
+            const llama_moe_host_plan full = llama_moe_host_decide(e_bytes, v_bytes, mapped, avail, token_bytes, host_mib, policy_env, force, disk_incl, disk_frac);
             if (full.on && full.budget >= need && (!plan.on || plan.budget < need)) {
                 plan = full;
                 plan.budget = need;

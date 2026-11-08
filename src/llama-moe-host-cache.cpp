@@ -11,7 +11,7 @@ static size_t round_up_page(size_t x) {
 }
 
 llama_moe_host_plan llama_moe_host_decide(size_t e_bytes, size_t v_bytes, size_t mapped, size_t avail, size_t token_bytes, int64_t host_mib,
-        int policy_env, bool force) {
+        int policy_env, bool force, bool disk_inclusive, double disk_min_frac) {
     llama_moe_host_plan p;
     p.tokens = token_bytes > 0 ? (double) v_bytes/token_bytes : 0.0;
     if (host_mib == 0 || e_bytes == 0) {
@@ -46,6 +46,17 @@ llama_moe_host_plan llama_moe_host_decide(size_t e_bytes, size_t v_bytes, size_t
         return p;
     }
     if (host_mib < 0 && !force && p.tokens < LLAMA_MOE_HOST_MIN_TOKENS) {
+        // k19-disktier: the mapped host weights exceed what the tier may plan into (the page cache cannot hold the streamed experts
+        // either): inclusive, so no miss costs a copy back (an explicitly forced exclusive policy keeps the old rule), where the budget
+        // holds enough of the experts to beat the page cache it replaces
+        if (disk_inclusive && token_bytes > 0 && mapped > avail && policy_env != LLAMA_MOE_HOST_EXCLUSIVE &&
+                (double) budget >= disk_min_frac*(double) e_bytes) {
+            p.policy = LLAMA_MOE_HOST_INCLUSIVE;
+            p.spare  = false;
+            p.on     = true;
+            p.why    = "auto, disk tier below the device minimum: inclusive (LLAMA_MOE_HOST_DISK_INCLUSIVE=0 off)";
+            return p;
+        }
         p.why = "the device slots hold the experts of too few tokens, nearly every routed expert misses them";
         return p;
     }
