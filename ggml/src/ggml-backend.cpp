@@ -2358,6 +2358,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->pf_lent  = false;
         split->ov_prefix = -1;
         int cur_backend_id = split->backend_id;
+        // k19-am17an: port of an upstream llama.cpp change by Aman Gupta (am17an), MIT: a split with nodes but no inputs (e.g. after a CPU split that only writes
+        // the recurrent state into a host buffer, hybrid model + -nkvo) also starts a new split at a weight of an incompatible backend.
+        // Before, only a split that already had inputs did, so the MoE cache lookup (a host weight) could land in the split of its
+        // router and top-k and the load aborted ("selected in the same split as their MoE cache lookup").
+        // GGML_SCHED_SPLIT_NO_INPUTS=0: as before (only splits with inputs)
+        static const bool split_no_inputs = getenv("GGML_SCHED_SPLIT_NO_INPUTS") == nullptr || atoi(getenv("GGML_SCHED_SPLIT_NO_INPUTS")) != 0;
+        bool split_has_nodes = false;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
 
@@ -2370,8 +2377,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             GGML_ASSERT(node_backend_id != -1); // all nodes should be assigned by now, this can happen if there is no CPU fallback
 
             // check if we should start a new split based on the sources of the current node
+            // (this also applies to a split without inputs, e.g. one that follows a split that only writes to a host buffer)
             bool need_new_split = false;
-            if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
+            if (node_backend_id == cur_backend_id && (split_no_inputs ? split_has_nodes : split->n_inputs > 0)) {
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
                     if (src == NULL) {
@@ -2418,6 +2426,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->ov_prefix = -1;
                 cur_backend_id = node_backend_id;
             }
+            split_has_nodes = true;
 
             // find inputs that are not on the same backend
             for (int j = 0; j < GGML_MAX_SRC; j++) {
