@@ -557,9 +557,22 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 std::max({ (n_tok + 63)/64, (INT64_C(1) << 26)/(n_idx_head*n_comp*n_stream), INT64_C(1) });
 
             const int32_t cand_src = hparams.dsv41_cand_src;
-            const bool    pick_blk = cand_src == il && cand_pin;              // level one: pick the candidate blocks
-            const bool    use_blk  = cand_src >= 0 && cand_src < il && cand_sel; // level two: score inside them
             const int64_t bs       = hparams.dsv41_cand_block_size;
+            // k19-dsv4p (LLAMA_DSV41_CAND_ALL=0 off): with at most candidate_top_k_blocks blocks (16k rows at 2048 x 8) the block
+            // pick keeps every block, so its consumers' block mask is +0 everywhere: skip the pick and the masks (the consumers
+            // see cand_sel == nullptr and score every row, as the all-zero mask let them)
+            const bool    cand_all = cand_all_env && cand_src == il && cand_pin &&
+                (n_comp + bs - 1)/bs <= (int64_t) hparams.dsv41_cand_topk_blocks;
+            if (cand_all) {
+                static bool logged_cand = false;
+                if (!logged_cand) {
+                    logged_cand = true;
+                    LLAMA_LOG_INFO("%s: DeepSeek-V4.1 candidate pick keeps all %lld blocks: skipped (LLAMA_DSV41_CAND_ALL=0 off)\n",
+                            __func__, (long long) ((n_comp + bs - 1)/bs));
+                }
+            }
+            const bool    pick_blk = cand_src == il && cand_pin && !cand_all;  // level one: pick the candidate blocks
+            const bool    use_blk  = cand_src >= 0 && cand_src < il && cand_sel; // level two: score inside them
             const int64_t n_blk    = pick_blk || use_blk ? (n_comp + bs - 1)/bs : 0;
             GGML_ASSERT(!pick_blk || cand_pin->ne[0] == n_blk);
             GGML_ASSERT(!use_blk  || cand_n_comp == n_comp);
@@ -818,6 +831,8 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     win_gather = win_gather_env;
     static const bool topk_all_env = dsv41_env_on("LLAMA_DSV41_TOPK_ALL");
     topk_all = topk_all_env;
+    static const bool cand_all_ev = dsv41_env_on("LLAMA_DSV41_CAND_ALL");
+    cand_all_env = cand_all_ev;
 
     topk_of.assign(n_layer, nullptr);
 

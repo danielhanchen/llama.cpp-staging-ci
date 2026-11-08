@@ -1519,6 +1519,7 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
         // k19-dsv4p (LLAMA_DSV41_TOPK_ALL=0 disables): skip the indexer + top-k when every compressed row would be selected
         bool          topk_all     = true;
         bool          cand_skipped = false;
+        bool          cand_all_env = true;  // k19-dsv4p (LLAMA_DSV41_CAND_ALL=0 disables): skip a block pick that keeps every block
         ggml_tensor * win_sel    = nullptr;
         ggml_tensor * win_mask   = nullptr;
     };
