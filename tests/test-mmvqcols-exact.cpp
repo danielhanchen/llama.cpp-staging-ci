@@ -378,6 +378,12 @@ int main(int argc, char ** argv) {
         // the shipped default (unset = AUTO; off on archs without a measurement, so bytes only)
         { "default",     self, "GGML_CUDA_MMVQ_COLS_CFG=0", "MMVQCOLS_DEFAULT=1", -1 },
         { "default_exact", self, "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_VERIFY_REASSOC=0", "GGML_CUDA_VERIFY_REASSOC=0", -1 },
+        // k19-q38t: IQ3_S / IQ3_XXS grid tables in shared memory (default) against the global tables (GGML_CUDA_MMVQ_GRID_SMEM=0),
+        // with the rows lever off, at its default and on the exact verify path (logs: not counted, -2)
+        { "grid",        self, "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_MMVQ_GRID_SMEM=0", "GGML_CUDA_MMVQ_COLS_CFG=0", -2 },
+        { "grid_cols",   self, "GGML_CUDA_MMVQ_GRID_SMEM=0", "MMVQCOLS_DEFAULT=1", -2 },
+        { "grid_exact",  self, "GGML_CUDA_MMVQ_GRID_SMEM=0 GGML_CUDA_VERIFY_REASSOC=0", "GGML_CUDA_VERIFY_REASSOC=0", -2 },
+        { "grid_mmq0",   self, "GGML_CUDA_MMVQ_GRID_SMEM=0 GGML_CUDA_VERIFY_MMQ=0", "GGML_CUDA_VERIFY_MMQ=0", -2 },
     };
     int n_fail = 0;
     for (const auto & md : modes) {
@@ -396,7 +402,7 @@ int main(int argc, char ** argv) {
             }
         }
         const bool head_off = false;
-        const bool ok = rb == 0 && rh == 0 && !db.empty() && db.size() == dh.size() && ndiff == 0 && lb == 0 &&
+        const bool ok = rb == 0 && rh == 0 && !db.empty() && db.size() == dh.size() && ndiff == 0 && (md.logs == -2 || lb == 0) &&
                         (md.logs < 0 || (head_off ? lh == 0 : lh > 0));
         printf("%s %-14s base rc %d logs %d hash %016llx | head rc %d logs %d hash %016llx | %zu bytes, %zu floats differ\n",
             ok ? "OK  " : "FAIL", md.name, rb, lb, (unsigned long long) fnv(db.data(), db.size()), rh, lh,
