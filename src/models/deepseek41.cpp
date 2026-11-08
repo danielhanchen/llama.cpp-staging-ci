@@ -563,6 +563,14 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             // see cand_sel == nullptr and score every row, as the all-zero mask let them)
             const bool    cand_all = cand_all_env && cand_src == il && cand_pin &&
                 (n_comp + bs - 1)/bs <= (int64_t) hparams.dsv41_cand_topk_blocks;
+            if (cand_all) {
+                static bool logged_cand = false;
+                if (!logged_cand) {
+                    logged_cand = true;
+                    LLAMA_LOG_INFO("%s: DeepSeek-V4.1 candidate pick keeps all %lld blocks: skipped (LLAMA_DSV41_CAND_ALL=0 off)\n",
+                            __func__, (long long) ((n_comp + bs - 1)/bs));
+                }
+            }
             const bool    pick_blk = cand_src == il && cand_pin && !cand_all;  // level one: pick the candidate blocks
             const bool    use_blk  = cand_src >= 0 && cand_src < il && cand_sel; // level two: score inside them
             const int64_t n_blk    = pick_blk || use_blk ? (n_comp + bs - 1)/bs : 0;
