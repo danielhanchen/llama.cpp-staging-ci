@@ -184,7 +184,23 @@ static bool llama_verify_wide_cached_env() {
 static bool llama_tpp_cached_env() {
     static const bool value = [] {
         const char * env = getenv("LLAMA_SPEC_TPP_CACHED");
-        return env != nullptr && atoi(env) != 0;
+        return env != nullptr && atoi(env) == 1;
+    }();
+    return value;
+}
+
+// k19-a100chat (LLAMA_SPEC_TPP_CACHED=2, opt-in): beside a MoE cache the 2..4-row verify windows are tagged only from KV position
+// LLAMA_SPEC_TPP_CACHED_POS (default 4096) on. Untagged, the F32 products of a 4-row window go to cuBLAS (TF32 sgemm + split-K, outside
+// the CUDA graph: 3.7 ms of kernels and ~12 ms of host time per pass, Colab A100 48 GB fn4n, ac_r2a nsys). Tagged everywhere
+// (=1) that won 8k (+15% with EV-auto) but lost chat (-2.5%, ac_r3a), so the position gate keeps chat-length contexts as before
+static int32_t llama_tpp_cached_pos_min() {
+    static const int32_t value = [] {
+        const char * env = getenv("LLAMA_SPEC_TPP_CACHED");
+        if (env == nullptr || atoi(env) != 2) {
+            return -1;
+        }
+        const char * p = getenv("LLAMA_SPEC_TPP_CACHED_POS");
+        return p != nullptr ? std::max(0, atoi(p)) : 4096;
     }();
     return value;
 }
@@ -5347,6 +5363,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         cparams.exact_split     = cparams.batch_invariant ? llm_graph_exact_split(ubatch) : 0;
         cparams.verify_tag      = llama_verify_tag_env() && cparams.verify && !cparams.batch_invariant && ubatch.n_tokens > 1 && !output_all &&
             (!(moe_cache_active() || llama_tpp_force_cached_env()) || llama_tpp_cached_env() ||
+             (llama_tpp_cached_pos_min() >= 0 && ubatch.pos != nullptr && ubatch.pos[0] >= llama_tpp_cached_pos_min()) ||
              (ubatch.n_tokens >= 5 && llama_verify_wide_cached_env()));
 
         // k19-tiny-ub: with the banks released every layer is built as a large batch (an output-only last layer would read the banks
