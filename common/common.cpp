@@ -4809,6 +4809,24 @@ static struct llama_model_params common_model_params_to_llama_impl(common_params
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    // k19-q38t: with a separate MTP drafter (-md + draft-mtp) the draft context runs on the drafter's own NextN block and draft head
+    // (common_speculative_init_result), so the target's NextN layers and the restricted draft head built from them were loaded for
+    // nothing: Qwen3.8-27B UD-Q3_K_XL on a T4, 569 MiB of device memory (12240 vs 11671 MiB of weights), enough to push 6 of 66 layers
+    // to the host and drop the drafter there. The target is loaded without them (the drafter's file loads its own: its path is the
+    // model path of the draft params). The target graph never reads them, so its text is unchanged.
+    // LLAMA_MTP_MD_TARGET_NEXTN=1: load them as before
+    if (mparams.load_mtp && !params.load_mtp && params.speculative.has_dft() && params.model.path != params.speculative.draft.mparams.path) {
+        static const bool keep = getenv("LLAMA_MTP_MD_TARGET_NEXTN") != nullptr && atoi(getenv("LLAMA_MTP_MD_TARGET_NEXTN")) != 0;
+        if (!keep) {
+            mparams.load_mtp = false;
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                COM_INF("k19-q38t: the target's own NextN layers are not loaded: the MTP drafter is '%s' (LLAMA_MTP_MD_TARGET_NEXTN=1 "
+                    "loads them)\n", params.speculative.draft.mparams.path.c_str());
+            }
+        }
+    }
     mparams.mtp_borrow_io               = params.mtp_borrow_io;
 
     return mparams;
