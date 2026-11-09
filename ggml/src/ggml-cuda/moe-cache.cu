@@ -94,7 +94,7 @@ static __global__ void moe_cache_assign(
         int32_t * __restrict__ counts, const int n_layer, const int fetch_q,
         int32_t * __restrict__ scores, const int grow, const int advance, const int n_scores, const int frozen = 0,
         const int tail_rank = 0, int32_t * __restrict__ skip_stat = nullptr, int ids_s1 = 0, const int defer = 0,
-        const int margin_q = 0, const int margin_add_q = 0) {
+        const int margin_q = 0, const int margin_add_q = 0, const int lookup_counts = 0) {
     if (ids_s1 <= 0) {
         ids_s1 = ne0;
     }
@@ -117,6 +117,9 @@ static __global__ void moe_cache_assign(
     int32_t * fill_s = fill_e + n_ids;
     int32_t * cnt    = counts != nullptr ? counts + (int64_t) il*n_expert : nullptr;
     int32_t * sc     = scores != nullptr ? scores + (int64_t) il*n_expert : nullptr;
+    // k19-q4xcache (ggml_moe_cache_assign_lookup_counts): an assign that stands in for the plain lookup (every miss fetched) leaves the
+    // use counters as the lookup does, so the host / fetch ranking of later hybrid batches is the same as without it
+    int32_t * cnt_w  = lookup_counts ? nullptr : cnt;
 
     // frozen (ggml_moe_cache_assign_freeze, hybrid only): the cached experts are hits, every other one goes to the host; nothing is
     // admitted and the state, counters and scores are not written (only the statistics), so a token gets the same slots in any batch
@@ -199,8 +202,8 @@ static __global__ void moe_cache_assign(
             if ((uint32_t) atomicExch(&pin[s], (int32_t) epoch) != epoch) {
                 n_hit++;
                 const int32_t e = moe_cache_id(ids, i, n_expert, ne0, ids_s1);
-                if (cnt != nullptr) {
-                    cnt[e] += cnt[e] < 0x7fffffff;
+                if (cnt_w != nullptr) {
+                    cnt_w[e] += cnt_w[e] < 0x7fffffff;
                 }
                 if (sc != nullptr) {
                     sc[e] = min(sc[e] + w, MOE_CACHE_SCORE_MAX);
@@ -232,8 +235,8 @@ static __global__ void moe_cache_assign(
             if (!skip) {
                 miss_e[n_miss + __popc(m & ((1u << lane) - 1))] = e;
             }
-            if (cnt != nullptr) {
-                cnt[e] += cnt[e] < 0x7fffffff;
+            if (cnt_w != nullptr) {
+                cnt_w[e] += cnt_w[e] < 0x7fffffff;
             }
             if (sc != nullptr) {
                 sc[e] = min(sc[e] + w, MOE_CACHE_SCORE_MAX);
@@ -1295,7 +1298,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
             n_ids, ne0, n_expert, il, n_slots, (int32_t *) counts->data, (int) map->ne[1], fetch_q,
             scores != nullptr ? (int32_t *) scores->data : nullptr, grow, advance, n_scores, ggml_get_op_params_i32(dst, 15),
             tail_rank, tail_rank > 0 ? (int32_t *) counts->data + (int64_t) map->ne[1]*n_expert + 4 : nullptr, ids_s1,
-            ggml_get_op_params_i32(dst, 9), n_expert >= 8 ? admit_margin_q : 0, admit_add_q);
+            ggml_get_op_params_i32(dst, 9), n_expert >= 8 ? admit_margin_q : 0, admit_add_q, ggml_get_op_params_i32(dst, 8));
         CUDA_CHECK(cudaGetLastError());
         return;
     }

@@ -3798,6 +3798,15 @@ void ggml_moe_cache_set_defer(struct ggml_tensor * assign, struct ggml_tensor * 
     ggml_set_op_params_i32(fetch, 12, 2);
 }
 
+// k19-q4xcache: an assign at fetch share 1 that stands in for ggml_moe_cache_lookup leaves the use counters unwritten, as the lookup
+// (declared by its caller, llama-moe-cache.cpp, so that ggml.h and every file including it stay unchanged)
+GGML_API void ggml_moe_cache_assign_lookup_counts(struct ggml_tensor * op);
+GGML_API void ggml_moe_cache_assign_lookup_counts(struct ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_MOE_CACHE_LOOKUP && ggml_get_op_params_i32(op, 10) == 1);
+    // op param 8 of the assign (unused: host pointers of a lookup) = 1: the use counters are not written (see moe_cache_assign)
+    ggml_set_op_params_i32(op, 8, 1);
+}
+
 void ggml_moe_cache_assign_freeze(struct ggml_tensor * op) {
     GGML_ASSERT(op->op == GGML_OP_MOE_CACHE_LOOKUP && ggml_get_op_params_i32(op, 10) == 1);
     ggml_set_op_params_i32(op, 15, 1);

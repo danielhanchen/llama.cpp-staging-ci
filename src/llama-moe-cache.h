@@ -95,6 +95,9 @@ public:
     bool overlap(int64_t n_ubatch) const;
     // k19-overlap: small multi-token ubatches (verify windows) copy their admitted experts beside the hits too (LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL)
     bool overlap_small(int64_t n_ubatch) const;
+    // k19-q4xcache: layer il takes the hybrid assign for a ubatch of n_ubatch tokens only for the overlap, in place of the plain lookup
+    // (LLAMA_MOE_OVERLAP_SMALL_PLAIN): its graph keeps the plain lookup's other choices
+    bool overlap_plain(int32_t il, int64_t n_ubatch) const;
     // k19-l4c (LLAMA_MOE_FETCH_DEFER): an overlapped single token ubatch with the single-graph mailbox defers its admissions: the host
     // computes the admitted experts, their copies finish beside the graph (see ggml_moe_cache_set_defer)
     bool fetch_defer(int64_t n_ubatch) const;
