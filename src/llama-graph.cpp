@@ -2865,7 +2865,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     };
 
     ggml_tensor * experts = nullptr;
-    if (hybrid == nullptr) {
+    // k19-q4xcache: a window that takes the hybrid assign only for the overlap (in place of the plain lookup, see
+    // llama_moe_cache::overlap_plain) notes the expert form as the plain lookup's graph does
+    const bool ov_plain = hybrid != nullptr && !hybrid_host && moe_cache->overlap_plain(il, n_tokens);
+    if (hybrid == nullptr || ov_plain) {
         // k15: a cache layer's graph without the host path also notes the single-graph form, so the CPU-miss rule weighs the mailbox
         // split from the first graph on. Before, only a graph with the host path noted it: a cache whose rule kept every decode size
         // off while it weighed a full split never built one (G4 Qwen3.6 UD-Q3_K_M 8 GB + MTP, 24% cached: host path on for [4, 128]
@@ -2885,12 +2888,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             return e != nullptr ? atof(e) : llama_moe_cache::trial_frac_single();
         }();
         const double note_frac = moe_cache ? moe_cache->cache_frac() : -1.0;
-        if (note_plain && slots != nullptr && hybrid_ok && note_frac >= 0.0 && note_frac < note_plain_max) {
+        if (note_plain && (slots != nullptr || ov_plain) && hybrid_ok && note_frac >= 0.0 && note_frac < note_plain_max) {
             moe_cache->single_note_form(il, type_op == LLM_FFN_SILU && up_exps && gate_exps && !gate_up_exps && !up_exps_s_h && !gate_exps_s_h &&
                 !down_exps_s && !up_exps_b_h && !gate_exps_b_h && !gate_up_exps_b_h && !(il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f));
         }
-        experts = build_experts(cur, slots, false, up_exps_s, gate_exps_s, down_exps_s, up_exps_b, gate_exps_b, gate_up_exps_b);
-    } else {
+        if (!ov_plain) {
+            experts = build_experts(cur, slots, false, up_exps_s, gate_exps_s, down_exps_s, up_exps_b, gate_exps_b, gate_up_exps_b);
+        }
+    }
+    if (hybrid != nullptr) {
         // assign result rows: slots, fill count, fill experts, fill slots, host ids, hit slots (see ggml_moe_cache_assign)
         const int64_t n_used = hybrid->ne[0];
         const int64_t n_rows = (hybrid->ne[1] - 1)/5;
@@ -2902,7 +2908,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // expert form the host thread computes (separate gate and up, SiLU, no biases, scales or clamp)
         const bool single_form = type_op == LLM_FFN_SILU && up_exps && gate_exps && !gate_up_exps && !up_exps_s_h && !gate_exps_s_h &&
             !down_exps_s && !up_exps_b_h && !gate_exps_b_h && !gate_up_exps_b_h && !(il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f);
-        moe_cache->single_note_form(il, single_form);
+        if (!ov_plain) {
+            moe_cache->single_note_form(il, single_form);
+        }
         if (hybrid_host) {
             ggml_tensor * host_ids = ggml_view_2d(ctx0, hybrid, n_used, n_rows, hybrid->nb[1], (3*n_rows + 1)*hybrid->nb[1]);
             cb(host_ids, "ffn_moe_host_ids", il);

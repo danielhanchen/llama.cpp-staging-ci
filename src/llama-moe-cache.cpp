@@ -14,6 +14,9 @@
 #include "ggml-alloc.h"
 #include "ggml-moe-mailbox.h"
 
+// k19-q4xcache: see ggml.c (declared here so that ggml.h stays unchanged)
+extern "C" GGML_API void ggml_moe_cache_assign_lookup_counts(struct ggml_tensor * op);
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -5549,28 +5552,63 @@ struct llama_moe_cache::impl {
         return op;
     }
 
-    // the layer can use the hybrid lookup for a ubatch of this size
-    bool hybrid_layer(int32_t il, int64_t n_ubatch) const {
-        if (force_large || !(hybrid || overlap_batch(n_ubatch)) || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+    // k19-q4xcache LLAMA_MOE_OVERLAP_SMALL_PLAIN (default 1; 0 = off, the plain lookup as before): a verify window of 2..N tokens
+    // (N = LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL, default 4) whose host path is off took the plain lookup, which copies its missing
+    // experts in the compute stream before any expert of the layer is computed (Kaggle T4 Qwen3.6-35B-A3B UD-Q4_K_XL, MTP n2, nsys:
+    // moe_cache_fetch 10.8 ms of a 42.0 ms pass at full card, 16.5 of 47.7 at 12 GB, serial). It now takes the hybrid assign at fetch
+    // share 1 with the overlap of k19-overlap: the copies run on the side stream beside the hits (cached before the lookup), then the
+    // fetched experts are computed. Exact: the assign at share 1 picks the lookup's slots and victims, admits every miss and leaves the
+    // use counters unwritten as the lookup does (ggml_moe_cache_assign_lookup_counts), the CPU-miss rule sees the same counters, and the
+    // multi-token mmvq kernels give each (token, slot) entry its own sums (each entry is computed once, by one side; the other side's
+    // row is +0)
+    static bool overlap_plain_on() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_MOE_OVERLAP_SMALL_PLAIN");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        return on;
+    }
+    bool overlap_plain_batch(int64_t n_ubatch) const {
+        return overlap_plain_on() && overlap_small_batch(n_ubatch);
+    }
+    mutable uint64_t n_ov_plain = 0; // layer graphs built with it (engagement)
+
+    // the layer can use the hybrid lookup for a ubatch of this size; plain (k19-q4xcache): only for the overlap, in place of the plain lookup
+    bool hybrid_layer(int32_t il, int64_t n_ubatch, bool * plain = nullptr) const {
+        if (plain != nullptr) {
+            *plain = false;
+        }
+        bool widened = !(hybrid || overlap_batch(n_ubatch));
+        if (force_large || (widened && !overlap_plain_batch(n_ubatch)) || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return false;
         }
         // CPU misses off for this batch size: the graph of k9 (plain lookup, or the fetch overlap of single tokens)
         if (cm && cm_share_of(n_ubatch) >= 1.0f && !overlap_batch(n_ubatch)) {
-            return false;
+            if (!overlap_plain_batch(n_ubatch)) {
+                return false;
+            }
+            widened = true;
         }
         const group & g = groups[layers[il].ig];
-        return g.counts != nullptr && use_device(g, n_ubatch) && layers[il].host_dev.size() == g.banks.size();
+        const bool ok = g.counts != nullptr && use_device(g, n_ubatch) && layers[il].host_dev.size() == g.banks.size();
+        if (plain != nullptr) {
+            *plain = ok && widened;
+        }
+        return ok;
     }
 
     // while the hybrid path is off but may be used (probe, trials), the lookup fetches every missing expert (share 1, same results
     // as ggml_moe_cache_lookup) and keeps the use counters up to date
     ggml_tensor * hybrid_assign(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch, bool & host) const {
         host = false;
-        if (!hybrid_layer(il, n_ubatch) || ids->ne[1] > n_ubatch || ids->ne[0] > n_expert_used) {
+        bool plain = false;
+        if (!hybrid_layer(il, n_ubatch, &plain) || ids->ne[1] > n_ubatch || ids->ne[0] > n_expert_used) {
             return nullptr;
         }
         float share = 1.0f;
-        if (cm) {
+        if (plain) {
+            // k19-q4xcache: in place of the plain lookup (see overlap_plain_batch): every miss is fetched, nothing goes to the host
+        } else if (cm) {
             share = cm_share_of(n_ubatch);
             host  = share < 1.0f;
         } else {
@@ -5578,6 +5616,9 @@ struct llama_moe_cache::impl {
             share = host ? hybrid_share : 1.0f;
         }
         const group & g = groups[layers[il].ig];
+        if (plain && !slots_fit(g, n_ubatch)) {
+            return nullptr; // the plain lookup refuses it too
+        }
         if (!slots_fit(g, n_ubatch)) {
             // wide window (wide_ok): only with the host path, which computes the misses the slots cannot take
             if (!host) {
@@ -5591,6 +5632,13 @@ struct llama_moe_cache::impl {
             }
         }
         ggml_tensor * op = ggml_moe_cache_assign(ctx, ids, g.map, g.state, g.counts, share, il);
+        if (plain) {
+            ggml_moe_cache_assign_lookup_counts(op);
+            if (n_ov_plain++ == 0) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: k19-q4xcache: verify windows of %" PRId64 " tokens with the host path off copy their missing "
+                    "experts beside the cached ones (LLAMA_MOE_OVERLAP_SMALL_PLAIN=0 off)\n", tag, n_ubatch);
+            }
+        }
         if (host && split_frozen()) {
             // k13: frozen small batches admit nothing between prompts, not even to the empty slots a lent graph left: the n-gram
             // drafts of a verify window (rejected ones too) would admit experts a single token decode never sees
@@ -9985,6 +10033,9 @@ struct llama_moe_cache::impl {
                 st.bytes  += cnt[1]*g.expert_bytes;
             }
             log("device lookups (ubatch <= 32)", st);
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-q4xcache: %llu layer graphs of 2-%d token windows with the host path off overlapped their "
+                "copies (LLAMA_MOE_OVERLAP_SMALL_PLAIN=%d)\n", tag, (unsigned long long) n_ov_plain, (int) std::max<int64_t>(2,
+                getenv("LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL") ? atoll(getenv("LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL")) : 4), overlap_plain_on() ? 1 : 0);
             if (getenv("LLAMA_MOE_CACHE_ADMIT_MARGIN") != nullptr) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: admission margin %s (+%s): %llu missing experts left to the host instead of replacing a resident\n", tag,
                     getenv("LLAMA_MOE_CACHE_ADMIT_MARGIN"), getenv("LLAMA_MOE_CACHE_ADMIT_ADD") ? getenv("LLAMA_MOE_CACHE_ADMIT_ADD") : "0",
@@ -10205,6 +10256,11 @@ bool llama_moe_cache::overlap(int64_t n_ubatch) const {
 
 bool llama_moe_cache::overlap_small(int64_t n_ubatch) const {
     return pimpl->overlap_small_batch(n_ubatch);
+}
+
+bool llama_moe_cache::overlap_plain(int32_t il, int64_t n_ubatch) const {
+    bool plain = false;
+    return pimpl->hybrid_layer(il, n_ubatch, &plain) && plain;
 }
 
 bool llama_moe_cache::fetch_defer(int64_t n_ubatch) const {
