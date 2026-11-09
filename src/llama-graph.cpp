@@ -2758,7 +2758,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         switch (type_op) {
             case LLM_FFN_SILU:
-                if (gate_exps) {
+                // k19-dsv4long: the merged gate_up layout clamps too (cur / up are its gate / up views); no arch with a clamp loads
+                // merged experts today, so this changes no current graph, it keeps a repacked checkpoint from dropping the limit silently
+                if (has_gate) {
                     if (il >= 0) {
                         const float limit = hparams.swiglu_clamp_exp[il];
                         constexpr float eps = 1e-6f;
