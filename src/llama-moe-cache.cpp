@@ -2901,6 +2901,21 @@ struct llama_moe_cache::impl {
         ua_shutdown();
         log_stats();
         ua_free();
+        for (auto & d : d2h_devs) {
+            if (d.be) {
+                ggml_backend_synchronize(d.be);
+            }
+            for (auto * e : d.ev) {
+                ggml_backend_event_free(e);
+            }
+            if (d.start) {
+                ggml_backend_event_free(d.start);
+            }
+            if (d.be) {
+                ggml_backend_free(d.be);
+            }
+        }
+        d2h_devs.clear();
         for (const auto & [unmap, buf] : mapped) {
             unmap(buf);
         }
@@ -4696,6 +4711,71 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // k19-d2hstream: the copies back of a host lookup (exclusive tier) go out on a second stream of the device, in chunks with an event
+    // each, and the uploads into the evicted slots of a chunk wait for its event only: the D2H of chunk c+1 runs beside the H2D of chunk
+    // c (PCIe is full duplex; on one stream every copy back finished before the first upload began). The side stream starts where the
+    // compute stream is (event), every upload into a slot waits for that slot's copy back, and the compute stream has waited for every
+    // chunk before the RAM tier commits, so the bytes, slots and their order per slot are unchanged: exact by construction.
+    // LLAMA_MOE_D2H_STREAM=0: on the compute stream as before; LLAMA_MOE_D2H_STREAM_CHUNKS=N (default 4, 2..16)
+    struct d2h_dev_t {
+        bool tried = false;
+        ggml_backend_t be = nullptr;
+        ggml_backend_event_t start = nullptr;
+        std::vector<ggml_backend_event_t> ev;
+    };
+    std::vector<d2h_dev_t> d2h_devs;
+    bool d2h_on = [] {
+        const char * e = getenv("LLAMA_MOE_D2H_STREAM");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    int d2h_nchunk = [] {
+        const char * e = getenv("LLAMA_MOE_D2H_STREAM_CHUNKS");
+        return e != nullptr ? std::min(16, std::max(2, atoi(e))) : 4;
+    }();
+    struct { uint64_t calls = 0, chunks = 0, uploads = 0, early = 0, fail = 0; } d2hs;
+    std::vector<int8_t> d2h_slot_chunk; // [slot of the group being uploaded] chunk of its copy back, -1 = none
+    std::vector<std::pair<int32_t, int32_t>> d2h_sub;
+
+    d2h_dev_t * d2h_get(int32_t id, ggml_backend_t backend) {
+        if (d2h_devs.size() < devices.size()) {
+            d2h_devs.resize(devices.size());
+        }
+        d2h_dev_t & d = d2h_devs[id];
+        if (!d.tried) {
+            d.tried = true;
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            d.be = dev != nullptr ? ggml_backend_dev_init(dev, nullptr) : nullptr;
+            bool ok = d.be != nullptr;
+            if (ok) {
+                d.start = ggml_backend_event_new(dev);
+                ok = d.start != nullptr;
+                for (int i = 0; i < d2h_nchunk && ok; ++i) {
+                    d.ev.push_back(ggml_backend_event_new(dev));
+                    ok = d.ev.back() != nullptr;
+                }
+            }
+            if (!ok) {
+                for (auto * e : d.ev) {
+                    if (e) {
+                        ggml_backend_event_free(e);
+                    }
+                }
+                d.ev.clear();
+                if (d.start) {
+                    ggml_backend_event_free(d.start);
+                    d.start = nullptr;
+                }
+                if (d.be) {
+                    ggml_backend_free(d.be);
+                    d.be = nullptr;
+                }
+                d2hs.fail++;
+                LLAMA_LOG_WARN("%s: MoE cache: no second stream / events on device %d: copies back stay on the compute stream\n", __func__, id);
+            }
+        }
+        return d.be != nullptr ? &d : nullptr;
+    }
+
     // exclusive: the experts evicted from device slots are copied back into RAM before the slots are overwritten (same backend, in order)
     void demote(ggml_backend_t backend, group & g, const std::vector<std::pair<int32_t, int32_t>> & ev) {
         const int32_t n_expert = g.lru.n_expert;
@@ -4790,9 +4870,37 @@ struct llama_moe_cache::impl {
             }
             // exclusive: the evicted experts move to RAM before their device slots are overwritten (same backend, in order)
             int64_t tp = hprof_on ? ggml_time_us() : 0;
+            d2h_dev_t * dd = nullptr;
+            int n_ck = 0;     // chunks of copies back on the side stream (0: on the compute stream)
+            int waited = -1;  // the last chunk event the compute stream waits for
             if (ev != nullptr && host->exclusive()) {
-                demote(backend, g, *ev);
+                if (d2h_on && ev->size() >= 2 && (dd = d2h_get(g.id, backend)) != nullptr) {
+                    n_ck = (int) std::min<size_t>((size_t) d2h_nchunk, ev->size());
+                    if ((int32_t) d2h_slot_chunk.size() < g.n_slots) {
+                        d2h_slot_chunk.assign(g.n_slots, -1);
+                    }
+                    ggml_backend_event_record(dd->start, backend);
+                    ggml_backend_event_wait(dd->be, dd->start);
+                    const size_t n_ev = ev->size();
+                    for (int c = 0; c < n_ck; ++c) {
+                        d2h_sub.assign(ev->begin() + c*n_ev/n_ck, ev->begin() + (c + 1)*n_ev/n_ck);
+                        for (const auto & pr : d2h_sub) {
+                            d2h_slot_chunk[pr.first] = (int8_t) c;
+                        }
+                        demote(dd->be, g, d2h_sub);
+                        ggml_backend_event_record(dd->ev[c], dd->be);
+                    }
+                    d2hs.calls++;
+                    d2hs.chunks += n_ck;
+                } else {
+                    demote(backend, g, *ev);
+                }
             }
+            auto d2h_wait = [&](int upto) {
+                for (; waited < upto; ++waited) {
+                    ggml_backend_event_wait(backend, dd->ev[waited + 1]);
+                }
+            };
             if (hprof_on) {
                 const int64_t t = ggml_time_us();
                 hprof.demote_us += t - tp;
@@ -4801,6 +4909,12 @@ struct llama_moe_cache::impl {
             for (const auto & f : fl) {
                 const int32_t s = host->find(il, f.expert);
                 if (s >= 0) {
+                    if (n_ck > 0) {
+                        const int c = f.slot >= 0 && f.slot < (int32_t) d2h_slot_chunk.size() ? d2h_slot_chunk[f.slot] : -1;
+                        d2h_wait(c);
+                        d2hs.uploads++;
+                        d2hs.early += waited < n_ck - 1;
+                    }
                     for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                         const size_t nb = l.experts[ip]->nb[2];
                         if (host_verify) {
@@ -4839,6 +4953,13 @@ struct llama_moe_cache::impl {
                     continue;
                 }
                 fills_rest.push_back(f);
+            }
+            if (n_ck > 0) {
+                // every other write into the slots (reads from the files, the rest below) and the RAM commit after all copies back
+                d2h_wait(n_ck - 1);
+                for (const auto & pr : *ev) {
+                    d2h_slot_chunk[pr.first] = -1;
+                }
             }
             if (!host_pending.empty()) {
                 if (wstore->read_host(host_reads.data(), host_reads.size(), true)) {
@@ -10061,6 +10182,11 @@ struct llama_moe_cache::impl {
                     host->exclusive() ? "exclusive" : "inclusive", (unsigned long long) hst.hits, (unsigned long long) hst.misses, n ? 100.0*hst.hits/n : 0.0,
                     hst.up_bytes/1048576.0, (unsigned long long) hst.read, hst.read_bytes/1048576.0, (unsigned long long) hst.demoted, hst.demote_bytes/1048576.0,
                     (unsigned long long) hst.demote_skip, (unsigned long long) hst.promoted, (unsigned long long) hst.admitted, (unsigned long long) hst.demote_kept);
+            if (d2hs.calls > 0 || !d2h_on) {
+                LLAMA_LOG_INFO("llama_moe_cache: copies back on a side stream: %llu host lookups, %llu chunks, %llu uploads from RAM of which %llu "
+                        "issued before the last copy back finished (LLAMA_MOE_D2H_STREAM=%d, %d chunks)\n", (unsigned long long) d2hs.calls,
+                        (unsigned long long) d2hs.chunks, (unsigned long long) d2hs.uploads, (unsigned long long) d2hs.early, d2h_on ? 1 : 0, d2h_nchunk);
+            }
             LLAMA_LOG_INFO("llama_moe_cache: copy back of evicted experts: %llu done (%.2f MiB), %llu skipped as RAM held them (%.2f MiB), "
                     "%llu forced over the RAM copy (%.2f MiB) (LLAMA_MOE_COPYBACK_SKIP=%d)\n",
                     (unsigned long long) hst.demoted, hst.demote_bytes/1048576.0, (unsigned long long) hst.demote_kept, hst.demote_kept_bytes/1048576.0,
