@@ -3430,17 +3430,48 @@ static bool mul_mat_vec_q_tab_launch(
         if (rpb > 1 && nrows_x % rpb != 0) {   // a block reads the weights of all its rows
             return false;
         }
+        // k19-iqsmem (GGML_CUDA_MMVQ_GRID_IDS_WARPS, default 1; 0 = always 4): an IQ3 MUL_MAT_ID row whose K blocks 2 warps cover in one
+        // pass (K <= 2048 for IQ3_XXS / IQ3_S: Qwen3.6-35B-A3B's experts) runs with 2 warps. Lane t of both launches then takes K block
+        // t / (qi / vdr) and nothing else, and the 4-warp launch only adds the +0.0 of its idle warps (every partial sum starts at +0.0,
+        // so none is -0.0 and x + 0.0 == x): bitwise the same row sums from half the threads
+        static const bool grid_warps_env = [] {
+            const char * e = getenv("GGML_CUDA_MMVQ_GRID_IDS_WARPS");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        int nwarps_l = nwarps;
+        if constexpr (grid_type) {
+            constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+            constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+            constexpr int vdr = get_vdr_mmvq(type);
+            if (grid_warps_env && warp_size == 32 && ncols_x / qk <= 2 * (vdr * warp_size / qi)) {
+                nwarps_l = 2;
+            }
+        }
         const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                                 fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
         const dim3 block_nums(nrows_x / rpb, nchannels_dst, nsamples_dst);
-        const dim3 block_dims(warp_size, nwarps, 1);
+        const dim3 block_dims(warp_size, nwarps_l, 1);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
         // c_tab only for the codebook types: the grid types' kernel (grid_n) is the same with either value
-#define MMVQ_TAB_LAUNCH(FUS, RPB) ggml_cuda_kernel_launch(mul_mat_vec_q<type, 1, FUS, false, false, 4, 0, RPB, 1, false, !grid_type>, launch_params, \
+#define MMVQ_TAB_LAUNCH_W(FUS, RPB, NW) ggml_cuda_kernel_launch(mul_mat_vec_q<type, 1, FUS, false, false, NW, 0, RPB, 1, false, !grid_type>, launch_params, \
             vx, vy, ids, fusion, dst, (uint32_t) ncols_x, nchannels_y_fd, (uint32_t) stride_row_x, (uint32_t) stride_col_y, (uint32_t) stride_col_dst, \
             channel_ratio_fd, (uint32_t) stride_channel_x, (uint32_t) stride_channel_y, (uint32_t) stride_channel_dst, \
             sample_ratio_fd, (uint32_t) stride_sample_x, (uint32_t) stride_sample_y, (uint32_t) stride_sample_dst, (uint32_t) ids_stride)
+#define MMVQ_TAB_LAUNCH(FUS, RPB) MMVQ_TAB_LAUNCH_W(FUS, RPB, 4)
         constexpr bool rpb8_type = grid_type || mmvq_tab_iq2_type(type);
+        bool launched = false;
+        if constexpr (grid_type) {
+            if (nwarps_l == 2) {
+                switch (rpb) {
+                    case 2: if (has_fusion) { MMVQ_TAB_LAUNCH_W(true, 2, 2); } else { MMVQ_TAB_LAUNCH_W(false, 2, 2); } break;
+                    case 4: if (has_fusion) { MMVQ_TAB_LAUNCH_W(true, 4, 2); } else { MMVQ_TAB_LAUNCH_W(false, 4, 2); } break;
+                    case 8: if (has_fusion) { MMVQ_TAB_LAUNCH_W(true, 8, 2); } else { MMVQ_TAB_LAUNCH_W(false, 8, 2); } break;
+                    default: return false;
+                }
+                launched = true;
+            }
+        }
+        if (!launched) {
         switch (rpb) {
             case 1: if (has_fusion) { MMVQ_TAB_LAUNCH(true, 1); } else { MMVQ_TAB_LAUNCH(false, 1); } break;
             case 2: if (has_fusion) { MMVQ_TAB_LAUNCH(true, 2); } else { MMVQ_TAB_LAUNCH(false, 2); } break;
@@ -3454,7 +3485,9 @@ static bool mul_mat_vec_q_tab_launch(
                 }
             default: return false;
         }
+        }
 #undef MMVQ_TAB_LAUNCH
+#undef MMVQ_TAB_LAUNCH_W
         static bool logged = false;
         if (!logged && getenv("GGML_CUDA_MMVQ_IQ_TAB_LOG") != nullptr) {
             logged = true;
@@ -3467,8 +3500,8 @@ static bool mul_mat_vec_q_tab_launch(
             static bool engaged = false;
             if (!engaged) {
                 engaged = true;
-                GGML_LOG_INFO("k19-iqsmem: %s %s engaged (%d rows per block, ids %d)\n", ggml_type_name(type),
-                    grid_type ? "MUL_MAT_ID grid launch" : "codebook in shared memory", rpb, ids != nullptr);
+                GGML_LOG_INFO("k19-iqsmem: %s %s engaged (%d rows per block, %d warps, ids %d)\n", ggml_type_name(type),
+                    grid_type ? "MUL_MAT_ID grid launch" : "codebook in shared memory", rpb, nwarps_l, ids != nullptr);
             }
         }
         return true;

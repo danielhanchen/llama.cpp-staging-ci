@@ -1,5 +1,6 @@
 // k19-iqsmem: bit identity of the IQ shared-memory table launches against the launches they replace, byte for byte:
-//   - GGML_CUDA_MMVQ_GRID_IDS: IQ3_S / IQ3_XXS single token MUL_MAT_ID (MoE experts) with 2 / 4 / 8 rows per block (0 = one row);
+//   - GGML_CUDA_MMVQ_GRID_IDS: IQ3_S / IQ3_XXS single token MUL_MAT_ID (MoE experts) with 2 / 4 / 8 rows per block (0 = one row),
+//     2 warps instead of 4 where 2 cover a row's K blocks in one pass (GGML_CUDA_MMVQ_GRID_IDS_WARPS=0: always 4);
 //   - GGML_CUDA_MMVQ_IQ2_TAB: IQ2_XS / IQ2_S single column mat-vec (dense and MUL_MAT_ID) with the codebook in shared memory
 //     (GGML_CUDA_MMVQ_IQ2_TAB_ROWS 2 / 4 / 8 rows per dense block);
 // at the expert shapes of Qwen3.6-35B-A3B (K 2048, 512 rows, top-8) and Qwen3.8-Flash-Next (K 2560, 640 rows, top-10), the dense
@@ -411,6 +412,8 @@ int main(int argc, char ** argv) {
         { "grid_ids",     off, "GGML_CUDA_MMVQ_IQ2_TAB=0", 1, false },
         { "grid_ids4",    off, "GGML_CUDA_MMVQ_IQ2_TAB=0 GGML_CUDA_MMVQ_GRID_IDS=4", 1, false },
         { "grid_ids8",    off, "GGML_CUDA_MMVQ_IQ2_TAB=0 GGML_CUDA_MMVQ_GRID_IDS=8", 1, false },
+        { "grid_ids_w4",  off, "GGML_CUDA_MMVQ_IQ2_TAB=0 GGML_CUDA_MMVQ_GRID_IDS_WARPS=0", 1, false },
+        { "grid_ids4_w4", off, "GGML_CUDA_MMVQ_IQ2_TAB=0 GGML_CUDA_MMVQ_GRID_IDS=4 GGML_CUDA_MMVQ_GRID_IDS_WARPS=0", 1, false },
         { "grid_ids_gsm0", off + " GGML_CUDA_MMVQ_GRID_SMEM=0", "GGML_CUDA_MMVQ_IQ2_TAB=0 GGML_CUDA_MMVQ_GRID_SMEM=0", 1, false },
         { "iq2tab",       off, "GGML_CUDA_MMVQ_GRID_IDS=0", 1, false },
         { "iq2tab_r4",    off, "GGML_CUDA_MMVQ_GRID_IDS=0 GGML_CUDA_MMVQ_IQ2_TAB_ROWS=4", 1, false },
