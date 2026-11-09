@@ -8468,7 +8468,9 @@ uint32_t llama_context::dsv41_far_rows(const llama_ubatch & ubatch, const std::v
     if (e == std::numeric_limits<llama_pos>::max()) {
         return 0;
     }
-    const int64_t B = (int64_t) (hp.n_layer() - hp.dsv41_far_layer + 1)*hp.n_swa + cparams.n_rs_seq;
+    // LLAMA_DSV41_FAR_B=N: diagnostic override of the bound (a value below it breaks exactness on purpose: the negative control)
+    static const int64_t B_env = getenv("LLAMA_DSV41_FAR_B") ? atoll(getenv("LLAMA_DSV41_FAR_B")) : 0;
+    const int64_t B = B_env > 0 ? B_env : (int64_t) (hp.n_layer() - hp.dsv41_far_layer + 1)*hp.n_swa + cparams.n_rs_seq;
     int64_t far = (int64_t) e - B - p0;
     const int64_t keep = std::max<int64_t>(n_out + 1, moe_cache ? llama_moe_cache::n_small_max + 1 : 1);
     far = std::min<int64_t>(far, (int64_t) ubatch.n_tokens - keep);
