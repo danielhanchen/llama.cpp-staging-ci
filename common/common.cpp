@@ -3686,12 +3686,116 @@ uma_restart:
                 mp.load_mtp = params.load_mtp;   // a plain launch loads no MTP tensors (-md draft-mtp sets load_mtp on the target: +569 MiB on T4)
                 common_params params_plain3 = params;
                 common_fit_plain_launch(params_plain3, cp);
+                const bool tbo_local0 = mp.tensor_buft_overrides != nullptr && mp.tensor_buft_overrides == tbo.data();
+                const llama_model_params   mp0 = mp;
+                const llama_context_params cp0 = cp;
+                const std::vector<float>   ts0 = ts;
+                const std::vector<llama_model_tensor_buft_override> tbo0 = tbo;
                 common_fit_set_moe_margin_auto(!params.fit_params_target_set);
-                const common_params_fit_status st4 = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(), tbo.empty() ? nullptr : tbo.data(),
+                common_params_fit_status st4 = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(), tbo.empty() ? nullptr : tbo.data(),
                     mg.data(), params.fit_params_min_ctx, nullptr, fit_log_level, params.fit_kv_resident);
-                if (st4 == COMMON_PARAMS_FIT_STATUS_SUCCESS && mp.n_gpu_layers == llama_model_default_params().n_gpu_layers) {
-                    COM_WRN("%s: --fit: %d host threads: the draft model would move layers to the CPU (%d layers on the device with it, all "
-                        "without it): speculative decoding is off (LLAMA_FIT_DRAFT_SPILL_DROP=0 keeps it)\n", __func__, n_threads, mparams.n_gpu_layers);
+                // k19-spilldrop: at a long context the launch without the drafter can spill too (Kaggle T4, Qwen3.8-27B UD-Q3_K_XL + its
+                // MTP GGUF, ctx 32768: 57 of 65 blocks with the drafter, 60 without at the 1024 MiB margin), and the rule above kept the
+                // drafter beside 8 host blocks: 3.49 / 2.89 / 2.22 tok/s (chat / 8k / 16k), against 4.41 / 4.09 / 3.60 without it at 60
+                // blocks and 8.70 / 9.86 / 9.51 without it with every block on the device beside a 256 MiB margin (205 MiB free at the
+                // lowest during a 16k decode). So where the plain fit spills, it is tried again beside the margins of
+                // LLAMA_FIT_DRAFT_SPILL_MARGINS_MIB (512,448,256,192; never above a --fit-target given; the drafter launch's plain fit
+                // projects 14565 of 14806 MiB there, 14 MiB short of 256): the first that keeps every block
+                // drops the drafter; where none does, the drafter still goes if the plain fit keeps more blocks on the device than the
+                // fit with it (every host block costs each verify pass as much as a token). LLAMA_FIT_DRAFT_SPILL_LONG=0: the rule as before
+                const char * e_sl = getenv("LLAMA_FIT_DRAFT_SPILL_LONG");
+                const bool spill_long = e_sl == nullptr || atoi(e_sl) != 0;
+                const bool all_plain0 = st4 == COMMON_PARAMS_FIT_STATUS_SUCCESS && mp.n_gpu_layers == llama_model_default_params().n_gpu_layers;
+                const char * how = "all without it";
+                if (spill_long && !all_plain0 && !params.fit_params_target_set) {
+                    std::vector<size_t> steps;
+                    {
+                        const char * e_m = getenv("LLAMA_FIT_DRAFT_SPILL_MARGINS_MIB");
+                        const std::string str = e_m != nullptr ? e_m : "512,448,256,192";
+                        size_t pos = 0;
+                        while (pos < str.size()) {
+                            const size_t c = str.find(',', pos);
+                            const std::string tok = str.substr(pos, c == std::string::npos ? std::string::npos : c - pos);
+                            if (!tok.empty()) {
+                                steps.push_back((size_t) std::max(0, atoi(tok.c_str())) * 1024 * 1024);
+                            }
+                            if (c == std::string::npos) {
+                                break;
+                            }
+                            pos = c + 1;
+                        }
+                    }
+                    const llama_model_params   mp_d  = mp;   // the plain fit beside the default margin
+                    const llama_context_params cp_d  = cp;
+                    const std::vector<float>   ts_d  = ts;
+                    const std::vector<llama_model_tensor_buft_override> tbo_d = tbo;
+                    const std::vector<size_t>  mg_d  = mg;
+                    const common_params_fit_status st_d = st4;
+                    bool found = false;
+                    for (const size_t m_step : steps) {
+                        std::vector<size_t> mgs = margins_in;
+                        bool lower = false;
+                        for (auto & m : mgs) {
+                            if (m > m_step) {
+                                m = m_step;
+                                lower = true;
+                            }
+                        }
+                        if (!lower) {
+                            continue;
+                        }
+                        llama_model_params   mps = mp0;
+                        llama_context_params cps = cp0;
+                        std::vector<float>   tss = ts0;
+                        std::vector<llama_model_tensor_buft_override> tbos = tbo0;
+                        mps.tensor_split = tss.data();
+                        if (tbo_local0) {
+                            mps.tensor_buft_overrides = tbos.data();
+                        }
+                        common_fit_set_moe_margin_auto(!params.fit_params_target_set);
+                        const common_params_fit_status sts = common_fit_params(params.model.path.c_str(), &mps, &cps, tss.data(),
+                            tbos.empty() ? nullptr : tbos.data(), mgs.data(), params.fit_params_min_ctx, nullptr, fit_log_level, params.fit_kv_resident);
+                        if (sts == COMMON_PARAMS_FIT_STATUS_SUCCESS && mps.n_gpu_layers == llama_model_default_params().n_gpu_layers) {
+                            const bool tbo_s = mps.tensor_buft_overrides != nullptr && mps.tensor_buft_overrides == tbos.data();
+                            mp = mps; cp = cps; ts = tss; tbo = tbos; mg = mgs; st4 = sts;
+                            mp.tensor_split = ts.data();
+                            if (tbo_s) {
+                                mp.tensor_buft_overrides = tbo.data();
+                            }
+                            how = "all without it beside a smaller device margin";
+                            COM_INF("%s: --fit: k19-spilldrop: without the drafter every block fits beside a %zu MiB margin\n", __func__,
+                                m_step/(1024*1024));
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        // back to the plain fit beside the default margin (the trials ran on copies)
+                        const bool tbo_s = mp_d.tensor_buft_overrides != nullptr && mp_d.tensor_buft_overrides == tbo_d.data();
+                        mp = mp_d; cp = cp_d; ts = ts_d; tbo = tbo_d; mg = mg_d; st4 = st_d;
+                        mp.tensor_split = ts.data();
+                        if (tbo_s) {
+                            mp.tensor_buft_overrides = tbo.data();
+                        }
+                        if (st4 == COMMON_PARAMS_FIT_STATUS_SUCCESS && mp.n_gpu_layers > mparams.n_gpu_layers) {
+                            how = "more without it";
+                            found = true;
+                        }
+                    }
+                    if (found) {
+                        COM_INF("%s: --fit: k19-spilldrop: %d layers on the device without the drafter, %d with it (LLAMA_FIT_DRAFT_SPILL_LONG=0: "
+                            "keep the drafter unless every layer fits without it)\n", __func__,
+                            mp.n_gpu_layers == llama_model_default_params().n_gpu_layers ? -1 : mp.n_gpu_layers, mparams.n_gpu_layers);
+                    }
+                    if (!found) {
+                        st4 = COMMON_PARAMS_FIT_STATUS_FAILURE; // keep the drafter (the condition below does not hold)
+                    }
+                }
+                const bool drop = st4 == COMMON_PARAMS_FIT_STATUS_SUCCESS &&
+                    (mp.n_gpu_layers == llama_model_default_params().n_gpu_layers || (spill_long && mp.n_gpu_layers > mparams.n_gpu_layers));
+                if (drop) {
+                    COM_WRN("%s: --fit: %d host threads: the draft model would move layers to the CPU (%d layers on the device with it, %s): "
+                        "speculative decoding is off (LLAMA_FIT_DRAFT_SPILL_DROP=0 keeps it)\n", __func__, n_threads, mparams.n_gpu_layers, how);
                     std::copy(ts.begin(), ts.end(), params.tensor_split);
                     std::copy(tbo.begin(), tbo.end(), params.tensor_buft_overrides.begin());
                     params.fit_params_target = mg;
