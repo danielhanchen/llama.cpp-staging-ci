@@ -10,6 +10,7 @@
 
 #include "llama-prefetch.h"
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -891,6 +892,8 @@ struct llama_model {
     llama_ple_prompt_reader * ple_prompt_reader() const;
     mutable std::once_flag ple_reader_once;
     mutable std::unique_ptr<llama_ple_prompt_reader> ple_reader;
+    // set once the whole PLE table was read into RAM (LLAMA_PLE_RESIDENT): the prompt reads are skipped from then on
+    mutable std::atomic<bool> ple_table_resident {false};
 
     // k16 dense host pin (llama_context::dense_host_pin): mappings of the memory-mapped buffers that hold the weights of layers left in
     // system memory, registered once per model for the copies of offloaded prompt ops; released in ~llama_model, before the buffers

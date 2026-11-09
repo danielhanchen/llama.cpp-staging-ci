@@ -1337,7 +1337,8 @@ llama_context::llama_context(
                     std::atomic<bool> * stop = &ple_res.stop;
                     const size_t limit = admit ? table : part;
                     const bool partial = !admit;
-                    auto work = [t, table, limit, partial, fd, offs, tname, stop](bool background) {
+                    std::atomic<bool> * whole_done = &model.ple_table_resident;
+                    auto work = [t, table, limit, partial, fd, offs, tname, stop, whole_done](bool background) {
                         const int64_t t0 = ggml_time_us();
                         if (background) {
                             // idle I/O class (a request's own reads go first) and the lowest CPU priority, this thread only
@@ -1432,6 +1433,9 @@ llama_context::llama_context(
                         }
                         const int lr = mlock(a0, len);
                         const int le = errno;
+                        if (lr == 0) {
+                            whole_done->store(true); // k19-disktt: locked, every row stays in RAM: the prompt reads stop
+                        }
                         LLAMA_LOG_INFO("%s: PLE table '%s' resident: %.1f GiB read in %.1f s%s (populate %s), %s%s\n", __func__, tname.c_str(),
                             len/1073741824.0, t_read, background ? " in the background" : "", pop_ok ? "ok" : "by touch",
                             lr == 0 ? "locked" : "not locked: ", lr == 0 ? "" : strerror(le));
