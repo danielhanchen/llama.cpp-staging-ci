@@ -476,13 +476,8 @@ int main(int argc, char ** argv) {
             ok ? "OK  " : "FAIL", md.name, rb, lb, (unsigned long long) fnv(db.data(), db.size()), rh, lh,
             (unsigned long long) fnv(dh.data(), dh.size()), db.size(), ndiff);
         fflush(stdout);
-        // the exact verify path (GGML_CUDA_VERIFY_REASSOC=0) varies run to run with every k19-iqsmem switch off (off_twice_exact,
-        // Kaggle T4: the fused flagged MUL_MAT_ID of 66 rows at 3..4 tokens, IQ1_S / IQ2_XXS / IQ2_XS / IQ2_S): advisory, not counted
-        const bool advisory = strstr(md.name, "exact") != nullptr;
-        if (!ok && advisory) {
-            printf("  ADVISORY %s (pre-existing run-to-run variation of the exact verify path)\n", md.name);
-        }
-        n_fail += !ok && !advisory;
+        // the exact verify modes count too: their run-to-run variation (66-row MUL_MAT_ID) was the single column row guard, fixed in k19-exactdet
+        n_fail += !ok;
     }
     printf("%s: %d of %zu modes failed\n", n_fail ? "FAIL" : "PASS", n_fail, modes.size());
     return n_fail ? 1 : 0;

@@ -6,7 +6,8 @@
 //   - sentinel: the tensor allocated right after dst (dst bytes a multiple of the buffer alignment) keeps its bytes;
 //   - reference: the CUDA output against the CPU backend's, within one RMS of the output (a row of another expert is far off);
 //   - repeat: REPS more computes of the same graph give the same bytes as the first.
-// The default run also runs itself in the two exact verify modes (GGML_CUDA_VERIFY_REASSOC=0, and with GGML_CUDA_MMVQ_EXACT_IDS_MERGE=0).
+// The default run also runs itself in the two exact verify modes (GGML_CUDA_VERIFY_REASSOC=0, and with GGML_CUDA_MMVQ_EXACT_IDS_MERGE=0)
+// and with every single column launch lever on / off / at its other rows per block, plain and exact (TAIL_NO_LEVERS=1: not).
 // --bench: median us of the fused gate + up product at a Qwen3.6-35B-A3B expert shape and at the 66-row shape (1 and 4 tokens).
 // No CUDA device: SKIP, exit 0.
 
@@ -27,7 +28,16 @@
 #include <string>
 #include <vector>
 
+static int n_engaged = 0;   // the shared-memory table / grid launches' INFO lines (GGML_CUDA_MMVQ_IQ_TAB_LOG=1 in the lever children)
+
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
+    if (strstr(text, " engaged (") != nullptr || strstr(text, " in shared memory: ") != nullptr) {
+        n_engaged++;
+        if (getenv("TAIL_PRINT_LOGS")) {
+            fputs(text, stdout);
+        }
+        return;
+    }
     if (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN) {
         fputs(text, stderr);
     }
@@ -173,8 +183,11 @@ static std::vector<tcase> make_cases() {
         { 1024, 66, 32, 16, false },
         { 2048, 70, 40, 32, true  },
         { 1024, 64, 32, 16, true  },   // control: rows a multiple of 4
+        { 1024, 68, 32, 16, true  },   // rows a multiple of 4, not of 8 (8 rows per block levers)
+        { 4096, 70, 16, 16, true  },   // K of 16 super-blocks: no small-K launch, the codebook / grid launches with 2 / 4 / 8 rows
+        { 4096, 72, 16, 16, true  },   // same, rows a multiple of 8
     };
-    const ggml_type types[] = { GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS,
+    const ggml_type types[] = { GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
                                 GGML_TYPE_Q4_K, GGML_TYPE_Q4_0 };
     std::vector<tcase> cs;
     for (const ggml_type t : types) {
@@ -311,7 +324,8 @@ int main(int argc, char ** argv) {
         }
     }
     const char * mode = getenv("TAIL_MODE") ? getenv("TAIL_MODE") : "default";
-    printf("%s [%s]: %d of %d cases failed (sentinel %d, reference %d, repeat %d)\n", n_fail ? "FAIL" : "PASS", mode, n_fail, n_case, n_sent, n_ref, n_rep);
+    printf("%s [%s]: %d of %d cases failed (sentinel %d, reference %d, repeat %d), %d engagement lines\n", n_fail ? "FAIL" : "PASS", mode, n_fail,
+        n_case, n_sent, n_ref, n_rep, n_engaged);
     fflush(stdout);
     ggml_backend_free(cpu);
     ggml_backend_free(be);
@@ -320,9 +334,34 @@ int main(int argc, char ** argv) {
     // the exact verify modes (the switches are read once per process: a child each): GGML_CUDA_VERIFY_REASSOC=0 runs a verify batch
     // of MUL_MAT_ID as one single column launch with the tokens as samples, GGML_CUDA_MMVQ_EXACT_IDS_MERGE=0 as one launch per token
     if (getenv("TAIL_MODE") == nullptr && !one) {
-        const char * envs[] = { "TAIL_MODE=exact GGML_CUDA_VERIFY_REASSOC=0", "TAIL_MODE=exact_per_token GGML_CUDA_VERIFY_REASSOC=0 GGML_CUDA_MMVQ_EXACT_IDS_MERGE=0" };
-        for (const char * e : envs) {
-            const std::string cmd = std::string("env ") + e + " \"" + argv[0] + "\" --reps " + std::to_string(reps);
+        std::vector<std::string> envs = { "TAIL_MODE=exact GGML_CUDA_VERIFY_REASSOC=0", "TAIL_MODE=exact_per_token GGML_CUDA_VERIFY_REASSOC=0 GGML_CUDA_MMVQ_EXACT_IDS_MERGE=0" };
+        // every single column launch lever on (default) / off / at its other rows per block, plain and in the exact verify mode
+        const char * levers[][2] = {
+            { "iqtab0",    "GGML_CUDA_MMVQ_IQ_TAB=0" },                // k19-dsv4p IQ1_S / IQ2_XXS codebook off
+            { "iqtab2",    "GGML_CUDA_MMVQ_IQ_TAB=2" },                // and forced on (any table)
+            { "idsrows1",  "GGML_CUDA_MMVQ_TURING_IDS_ROWS=1" },       // its MUL_MAT_ID rows per block 1 / 4 (default 2)
+            { "idsrows4",  "GGML_CUDA_MMVQ_TURING_IDS_ROWS=4" },
+            { "gsm0",      "GGML_CUDA_MMVQ_GRID_SMEM=0" },             // k19-q38t IQ3 grid in shared memory off
+            { "gids0",     "GGML_CUDA_MMVQ_GRID_IDS=0" },              // k19-iqsmem IQ3 MUL_MAT_ID rows: off / 2 / 4 / 8
+            { "gids2",     "GGML_CUDA_MMVQ_GRID_IDS=2" },
+            { "gids4",     "GGML_CUDA_MMVQ_GRID_IDS=4" },
+            { "gids8",     "GGML_CUDA_MMVQ_GRID_IDS=8" },
+            { "gidsw0",    "GGML_CUDA_MMVQ_GRID_IDS_WARPS=0" },        // its 2 warps off
+            { "gids8w0",   "GGML_CUDA_MMVQ_GRID_IDS=8 GGML_CUDA_MMVQ_GRID_IDS_WARPS=0" },
+            { "iq2tab0",   "GGML_CUDA_MMVQ_IQ2_TAB=0" },               // k19-iqsmem IQ2_XS / IQ2_S codebook off
+            { "iq2r4",     "GGML_CUDA_MMVQ_IQ2_TAB_ROWS=4" },          // its dense rows 4 / 8
+            { "iq2r8",     "GGML_CUDA_MMVQ_IQ2_TAB_ROWS=8" },
+            { "alloff",    "GGML_CUDA_MMVQ_IQ_TAB=0 GGML_CUDA_MMVQ_IQ2_TAB=0 GGML_CUDA_MMVQ_GRID_IDS=0 GGML_CUDA_MMVQ_GRID_SMEM=0" },
+        };
+        if (!getenv("TAIL_NO_LEVERS")) {
+            envs.push_back("TAIL_MODE=default_log GGML_CUDA_MMVQ_IQ_TAB_LOG=1");
+            for (const auto & l : levers) {
+                envs.push_back(std::string("TAIL_MODE=") + l[0] + " GGML_CUDA_MMVQ_IQ_TAB_LOG=1 " + l[1]);
+                envs.push_back(std::string("TAIL_MODE=") + l[0] + "_exact GGML_CUDA_MMVQ_IQ_TAB_LOG=1 GGML_CUDA_VERIFY_REASSOC=0 " + l[1]);
+            }
+        }
+        for (const auto & e : envs) {
+            const std::string cmd = "env " + e + " \"" + argv[0] + "\" --reps " + std::to_string(std::min(reps, e.find("_LOG") != std::string::npos ? 20 : reps));
             rc |= system(cmd.c_str()) != 0;
         }
     }
