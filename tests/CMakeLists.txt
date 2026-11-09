@@ -430,6 +430,8 @@ llama_build_and_test(test-moe-bw-exact.cpp LINK ggml)
 llama_build_and_test(test-dflash2-conv-exact.cpp LINK ggml)
 # k19-mmvqcols: the rows-per-block lever of the dense 2..8 column mat-vec vs the launch it replaces, byte for byte (SKIP without a CUDA device)
 llama_build_and_test(test-mmvqcols-exact.cpp LINK ggml)
+# k19-iqsmem: IQ3 MUL_MAT_ID grid rows + IQ2_XS / IQ2_S codebook in shared memory vs the launches they replace, byte for byte (SKIP without a CUDA device)
+llama_build_and_test(test-iqsmem-exact.cpp LINK ggml)
 llama_build_and_test(test-spec-type-gguf.cpp)
 # the build identity of the MoE CPU-miss calibration key: unknown-commit builds differ by content, a relaunch keeps its identity
 llama_build_and_test(test-cal-build-id.cpp LINK ggml)
