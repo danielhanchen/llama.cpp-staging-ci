@@ -118,6 +118,27 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
         hparams.dsv41_tok_hist = true;
         hparams.dsv41_hist_len = engram_max_ngram > 0 ? (uint32_t) engram_max_ngram - 1 : 0;
     }
+
+    // k19-dsv4long far-token skip: from layer c on, no layer owns a compressor (its compressed rows come from a kv source < c) and
+    // none has Engram, so a row's work at layers >= c leaves only its own window K rows behind (the indexer queries, top-k and
+    // candidate picks are per query). A row whose window K rows no later query that matters can see may stop after layer c - 1
+    // (see llama_context::dsv41_far_rows). Every layer from c on must also be a compressed one (ratio-0 layers use their own mask).
+    {
+        int32_t c = 0;
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            if (hparams.dsv41_kv_src[il] == (int32_t) il) {
+                c = std::max<int32_t>(c, il + 1);
+            }
+        }
+        for (const uint32_t il : e_layers) {
+            c = std::max<int32_t>(c, il + 1);
+        }
+        bool ok = c > 0 && c < (int32_t) n_layer && hparams.n_swa > 0;
+        for (uint32_t il = std::max<int32_t>(c, 0); ok && il < n_layer; ++il) {
+            ok = hparams.dsv4_compress_ratios[il] != 0 && hparams.dsv41_kv_src[il] >= 0 && hparams.dsv41_kv_src[il] < c;
+        }
+        hparams.dsv41_far_layer = ok ? c : -1;
+    }
 }
 
 void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
@@ -275,6 +296,8 @@ public:
     ggml_tensor * engram_keep = nullptr;    // 0 for embedding (image) tokens; only in mixed ubatches
     ggml_tensor * cand_pin = nullptr;
     bool cand_csa = false;
+    ggml_tensor * out_near = nullptr;   // k19-dsv4long: output rows of the cut graph (ubatch row - far)
+    int64_t       far      = 0;         // cparams.dsv41_far the graph was built for
 
     const llama_model_deepseek41 & model;
     const llama_kv_cache_dsv4_context * mctx;
@@ -332,12 +355,27 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
         }
         ggml_backend_tensor_set(cand_pin, pin.data(), 0, pin.size()*sizeof(float));
     }
+
+    if (out_near && out_near->buffer && out_near->ne[0] > 0) {
+        std::vector<int32_t> ids;
+        for (int64_t i = 0; i < (int64_t) ubatch->n_tokens; ++i) {
+            if (ubatch->output && ubatch->output[i]) {
+                GGML_ASSERT(i >= far);
+                ids.push_back((int32_t) (i - far));
+            }
+        }
+        GGML_ASSERT((int64_t) ids.size() == out_near->ne[0]);
+        ggml_backend_tensor_set(out_near, ids.data(), 0, ids.size()*sizeof(int32_t));
+    }
 }
 
 bool llm_graph_input_dsv41::can_reuse(const llm_graph_params & params) {
     mctx = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx);
 
-    bool res = true;
+    bool res = far == (int64_t) params.cparams.dsv41_far;
+    if (out_near) {
+        res &= out_near->ne[0] == (int64_t) params.n_outputs;
+    }
     for (auto * t : engram_ids) {
         res &= t->ne[0] == (int64_t) model.engram_n_cols()*params.ubatch.n_tokens;
     }
@@ -391,6 +429,25 @@ ggml_tensor * llama_model_deepseek41::graph::build_engram(
     return ggml_add(ctx0, x, ggml_mul(ctx0, ggml_repeat_4d(ctx0, value, n_embd, hc, nt, 1), gate));
 }
 
+// k19-dsv4long: the rows far_r0 .. n_tokens - 1 of a per-token tensor (the token dim is the outermost one of n_tokens entries); a
+// view, contiguous when the tensor is (the dims past the token dim are 1)
+ggml_tensor * llama_model_deepseek41::graph::cut_tok(ggml_tensor * t) const {
+    const int64_t r0 = cparams.dsv41_far;
+    int d = GGML_MAX_DIMS - 1;
+    while (d >= 0 && t->ne[d] != n_tokens) {
+        --d;
+    }
+    GGML_ASSERT(d >= 0 && r0 > 0 && r0 < n_tokens);
+    for (int i = d + 1; i < GGML_MAX_DIMS; ++i) {
+        GGML_ASSERT(t->ne[i] == 1);
+    }
+    int64_t ne[GGML_MAX_DIMS] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
+    ne[d] = n_tokens - r0;
+    ggml_tensor * v = ggml_view_4d(ctx0, t, ne[0], ne[1], ne[2], ne[3], t->nb[1], t->nb[2], t->nb[3], r0*t->nb[d]);
+    // kernels may load masks / ids with 16-byte vectors: a misaligned start gets its own copy (cache widths are padded, so rare)
+    return (r0*t->nb[d]) % 16 == 0 ? v : ggml_cont(ctx0, v);
+}
+
 ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         const llama_model_deepseek41 & model,
         llm_graph_input_dsv4 * inp_dsv4,
@@ -438,7 +495,12 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
     kv = rope(ggml_reshape_3d(ctx0, kv, n_embd_head, 1, nt), inp_pos, n_embd_head_nope);
     cb(kv, "kv", il);
 
-    const auto & ci         = ratio == 2 ? inp_dsv4->get_csa()             : inp_dsv4->get_hca();
+    // k19-dsv4long: past the far-token cut the per-token inputs are viewed at the kept rows (a copy of the pointers)
+    auto ci                 = ratio == 2 ? inp_dsv4->get_csa()             : inp_dsv4->get_hca();
+    if (far_r0 > 0) {
+        GGML_ASSERT(hparams.dsv41_kv_src[il] != il && ci.kq_mask);
+        ci.kq_mask = cut_tok(ci.kq_mask);
+    }
     const auto * comp_ctx   = ratio == 2 ? inp_dsv4->mctx->get_csa()       : inp_dsv4->mctx->get_hca();
     const auto * comp_state = ratio == 2 ? inp_dsv4->mctx->get_csa_state() : inp_dsv4->mctx->get_hca_state();
 
@@ -658,10 +720,11 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         }
         ggml_build_forward_expand(gf, q);
         ggml_build_forward_expand(gf, kv);
-        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
+        ggml_tensor * k_idxs = far_r0 > 0 ? cut_tok(inp_attn->get_k_idxs()) : inp_attn->get_k_idxs();
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, kv, k_idxs, il));
 
         ggml_tensor * raw_k    = inp_attn->mctx->get_k(ctx0, il);
-        ggml_tensor * raw_mask = inp_attn->get_kq_mask();
+        ggml_tensor * raw_mask = far_r0 > 0 ? cut_tok(inp_attn->get_kq_mask()) : inp_attn->get_kq_mask();
 
         const int32_t kv_src   = hparams.dsv41_kv_src[il];
         const int32_t topk_src = hparams.dsv41_topk_src[il];
@@ -670,7 +733,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
 
         // few queries per stream: attend over [window | top-k rows of the query], one FA stream per query; same keys and mask as
         // dense, different key order
-        const bool gather = sparse && cparams.flash_attn && raw_mask->type == GGML_TYPE_F16 && ci.kq_mask->type == GGML_TYPE_F16 &&
+        const bool gather = sparse && far_r0 == 0 && cparams.flash_attn && raw_mask->type == GGML_TYPE_F16 && ci.kq_mask->type == GGML_TYPE_F16 &&
                 ((n_stream == 1 && nt <= 32) || nt == n_stream);
 
         if (gather) {
@@ -840,11 +903,30 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
 
     ggml_tensor * inp = build_inp_embd(model.tok_embd);
     ggml_tensor * inp_pos = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
     ggml_build_forward_expand(gf, inp_dsv4->get_raw()->self_kq_mask);
 
+    // k19-dsv4long far-token skip: the leading cparams.dsv41_far rows (prompt rows no output, later query or captured state can
+    // see past layer c, see llama_context::dsv41_far_rows) stop after layer c - 1. A layer >= c without visible compressed rows
+    // would take the window-only path over the whole raw mask: no cut then.
+    const int32_t far_c   = hparams.dsv41_far_layer;
+    const int64_t far_req = cparams.dsv41_far;
+    bool far_cut = far_req > 0 && far_c > 0 && far_req < n_tokens && ubatch.n_seqs_unq == 1 && n_outputs < n_tokens;
+    for (int il = std::max(far_c, 0); far_cut && il < n_layer; ++il) {
+        far_cut = (hparams.dsv4_compress_ratios[il] == 2 ? inp_dsv4->get_csa() : inp_dsv4->get_hca()).kq_mask != nullptr;
+    }
+
     auto inp41 = std::make_unique<llm_graph_input_dsv41>(model, inp_dsv4->mctx);
+    inp41->far = far_req;
+    ggml_tensor * inp_out_ids = nullptr;
+    if (far_cut) {
+        inp_out_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_outputs);
+        ggml_set_input(inp_out_ids);
+        ggml_set_name(inp_out_ids, "out_ids_far");
+        inp41->out_near = inp_out_ids;
+    } else {
+        inp_out_ids = build_inp_out_ids();
+    }
     // embedding input has no token ids: it skips Engram, like the reference's masked (image) positions
     for (size_t e = 0; ubatch.token && e < model.engram_layers.size(); ++e) {
         ggml_tensor * ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) model.engram_n_cols()*n_tokens);
@@ -883,6 +965,28 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
+
+        if (far_cut && il == far_c) {
+            inpL     = cut_tok(inpL);
+            pre_prev = cut_tok(pre_prev);
+            inp_pos  = cut_tok(inp_pos);
+            if (cand_pin) {
+                cand_pin = cut_tok(cand_pin);
+            }
+            for (auto & t : topk_of) {
+                t = t ? cut_tok(t) : nullptr;
+            }
+            if (cand_sel) {
+                cand_sel = cut_tok(cand_sel);
+            }
+            gather_k_of.clear();
+            gather_sel_of.clear();
+            gather_mask_of.clear();
+            gather_win_mask_of.clear();
+            win_sel  = nullptr;
+            win_mask = nullptr;
+            far_r0   = far_req;
+        }
 
         const int e = model.engram_index(il);
         if (e >= 0 && !inp41_ptr->engram_ids.empty()) {
@@ -960,7 +1064,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
 
     // no hc_head: collapse with the last FFN's pre-mix
     if (inp_out_ids) {
-        inpL     = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens), inp_out_ids), n_embd, hc, inp_out_ids->ne[0]);
+        inpL     = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, inpL, n_embd*hc, inpL->ne[2]), inp_out_ids), n_embd, hc, inp_out_ids->ne[0]);
         pre_prev = ggml_get_rows(ctx0, pre_prev, inp_out_ids);
     }
     cur = build_hc_pre(inpL, pre_prev, -1);

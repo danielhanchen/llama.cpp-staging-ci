@@ -1522,6 +1522,10 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
         bool          cand_all_env = true;  // k19-dsv4p (LLAMA_DSV41_CAND_ALL=0 disables): skip a block pick that keeps every block
         ggml_tensor * win_sel    = nullptr;
         ggml_tensor * win_mask   = nullptr;
+        // k19-dsv4long far-token skip (LLAMA_DSV41_FAR_SKIP=0 disables): from layer hparams.dsv41_far_layer on the graph carries only
+        // the ubatch rows from far_r0 on (llama_context::dsv41_far_rows); cut_tok views a per-token tensor at those rows
+        int64_t       far_r0     = 0;
+        ggml_tensor * cut_tok(ggml_tensor * t) const;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

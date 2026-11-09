@@ -20,6 +20,7 @@
 #include "llama-sysmem.h"
 #include "llama-weight-store.h"
 #include "ggml-moe-prefetch.h"
+#include <limits>
 #include <cerrno>
 #include <mutex>
 #include <vector>
@@ -436,6 +437,7 @@ llama_context::llama_context(
     cparams.batch_invariant         = false;
     cparams.verify_tag              = false;
     cparams.exact_split             = 0;
+    cparams.dsv41_far               = 0;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
@@ -5256,6 +5258,46 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         llama_sampler_backend_begin(entry.second);
     }
 
+    // k19-dsv4long far-token skip (LLAMA_DSV41_FAR_SKIP=0 off): the read ends of this batch for one sequence: its end, every output
+    // and every state capture (a later decode, a restored checkpoint, a rollback can only start at or after one of them)
+    std::vector<llama_pos> far_ends;
+    int64_t far_rows_all = 0;
+    {
+        static const bool far_env = getenv("LLAMA_DSV41_FAR_SKIP") == nullptr || atoi(getenv("LLAMA_DSV41_FAR_SKIP")) != 0;
+        const auto & hp = model.hparams;
+        const llama_batch & b = balloc->get_batch();
+        if (far_env && model.arch == LLM_ARCH_DEEPSEEK41 && hp.dsv41_far_layer > 0 && !output_all && !cparams.embeddings_nextn &&
+                cparams.causal_attn && b.n_tokens > 0 && n_outputs_all < n_tokens_all && b.pos && b.seq_id && b.n_seq_id) {
+            bool one_seq = true;
+            llama_pos p_max = -1;
+            for (int32_t i = 0; i < b.n_tokens && one_seq; ++i) {
+                one_seq = b.n_seq_id[i] == 1 && b.seq_id[i][0] == b.seq_id[0][0];
+                p_max = std::max(p_max, b.pos[i]);
+                if (b.logits && b.logits[i]) {
+                    far_ends.push_back(b.pos[i] + 1);
+                }
+            }
+            for (int s = 0; one_seq && s < cap_max; ++s) {
+                if (cap[s].idx >= 0 && !cap[s].done && cap[s].idx < b.n_tokens) {
+                    far_ends.push_back(b.pos[cap[s].idx]);
+                }
+            }
+            far_ends.push_back(p_max + 1);
+            if (!one_seq) {
+                far_ends.clear();
+            }
+        }
+    }
+    struct far_log {
+        const int64_t & rows; const int32_t layer; const int64_t n;
+        ~far_log() {
+            if (rows > 0) {
+                LLAMA_LOG_INFO("decode: DeepSeek-V4.1 far-token skip: %lld of %lld prompt rows stop before layer %d (LLAMA_DSV41_FAR_SKIP=0 off)\n",
+                        (long long) rows, (long long) n, layer);
+            }
+        }
+    } far_log_guard { far_rows_all, model.hparams.dsv41_far_layer, (int64_t) n_tokens_all };
+
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
     rows_ev_n = 0; // k15-pp3: no early nextn rows from this decode yet
@@ -5371,7 +5413,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         if (tiny_rel_now) {
             moe_cache->set_force_large(true);
         }
+        cparams.dsv41_far = far_ends.empty() ? 0 : dsv41_far_rows(ubatch, far_ends, n_outputs);
+        far_rows_all += cparams.dsv41_far;
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        cparams.dsv41_far = 0;
         if (tiny_rel_now) {
             moe_cache->set_force_large(false);
         }
@@ -8392,6 +8437,49 @@ llm_graph_params llama_context::graph_params(
         /*.res         =*/ res,
         /*.h_dev_src   =*/ mtp_dev_h_src,
     };
+}
+
+// k19-dsv4long far-token skip (LLAMA_DSV41_FAR_SKIP=0 off). From layer c = hparams.dsv41_far_layer on, a row leaves only its own
+// window K rows behind (no compressor, no Engram past c: compressed rows, index keys and candidate blocks of layers >= c come from kv
+// sources < c, which every row still computes; queries, top-k and block picks are per row). A window row at position s is visible to
+// queries at s .. s + n_swa - 1 only, so a wrong (or never written) row at layer L can reach the hidden state of layer L + 1 only n_swa
+// positions later. Rows below e - B, B = (n_layer - c + 1)*n_swa + n_rs_seq, for every read end e at or after them (the batch end,
+// every output + 1, every state capture), can therefore skip layers c .. n_layer - 1: every output, every window row a later query
+// can read (a later decode starts at a read end, a rollback at most n_rs_seq before it) and every captured state equal the full
+// computation. Partial removals further back are refused by the DSV4 cache (seq_rm), so no query ever restarts inside the cut.
+// Returns the leading rows of the ubatch to cut (0 = none); keeps at least one non-output row (and the MoE cache's large-batch size).
+uint32_t llama_context::dsv41_far_rows(const llama_ubatch & ubatch, const std::vector<llama_pos> & ends, int32_t n_out) const {
+    const auto & hp = model.hparams;
+    if (ubatch.n_tokens < 2 || !ubatch.pos || ubatch.n_seqs_unq != 1 || ubatch.embd || hp.dsv41_far_layer <= 0) {
+        return 0;
+    }
+    const llama_pos p0 = ubatch.pos[0];
+    for (uint32_t i = 1; i < ubatch.n_tokens; ++i) {
+        if (ubatch.pos[i] != p0 + (llama_pos) i) {
+            return 0;
+        }
+    }
+    llama_pos e = std::numeric_limits<llama_pos>::max();
+    for (const llama_pos x : ends) {
+        if (x > p0) {
+            e = std::min(e, x);
+        }
+    }
+    if (e == std::numeric_limits<llama_pos>::max()) {
+        return 0;
+    }
+    const int64_t B = (int64_t) (hp.n_layer() - hp.dsv41_far_layer + 1)*hp.n_swa + cparams.n_rs_seq;
+    int64_t far = (int64_t) e - B - p0;
+    const int64_t keep = std::max<int64_t>(n_out + 1, moe_cache ? llama_moe_cache::n_small_max + 1 : 1);
+    far = std::min<int64_t>(far, (int64_t) ubatch.n_tokens - keep);
+    if (far <= 0) {
+        return 0;
+    }
+    // no output among the cut rows (an output o bounds the cut at o + 1 - B)
+    for (int64_t i = 0; i < far; ++i) {
+        GGML_ASSERT(!ubatch.output || !ubatch.output[i]);
+    }
+    return (uint32_t) far;
 }
 
 // k11-decode: a small graph (a speculative verify window has its own node count) re-plans the graph allocator, so the ubatches of the
