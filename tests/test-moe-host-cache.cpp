@@ -455,6 +455,40 @@ static void test_slots(ggml_backend_t backend) {
         CHECK(hc.st.waits == 0);
     }
 
+    // k19-ramevict: a prompt pass streaming layer L evicts from the layers <= L first, then (none left) from any layer
+    {
+        const std::vector<std::vector<size_t>> lsz(6, std::vector<size_t>{ 3000, 3000 });
+        llama_moe_host_cache hc(ggml_backend_cpu_buffer_type(), 6*24576, LLAMA_MOE_HOST_EXCLUSIVE, n_expert, lsz);
+        CHECK(hc.n_slots() == 6);
+        for (int32_t il = 0; il < 6; ++il) {
+            const int32_t s = hc.reserve(il, 0);
+            CHECK(s >= 0);
+            hc.publish(s);
+        }
+        // layers 3..5 used more: the plain CLOCK would take layer 0 first anyway, so make the finished layers the hot ones
+        for (int k = 0; k < 4; ++k) {
+            hc.find(0, 0); hc.find(1, 0); hc.find(2, 0);
+        }
+        hc.set_stream_layer(2);
+        for (int32_t e = 1; e <= 3; ++e) {
+            const int32_t s = hc.reserve(2, e);
+            CHECK(s >= 0);
+            hc.publish(s);
+        }
+        CHECK(hc.st.done_evicted == 3 && hc.st.ahead_evicted == 0 && hc.st.stream_evicted == 3);
+        CHECK(hc.contains(3, 0) && hc.contains(4, 0) && hc.contains(5, 0)); // the layers still to come keep their experts
+        // layer 0 streaming: nothing finished but layer 0, which holds nothing: the plain CLOCK takes an expert of a layer to come
+        hc.set_stream_layer(0);
+        const int32_t s = hc.reserve(0, 5);
+        CHECK(s >= 0);
+        CHECK(hc.st.ahead_evicted == 1 && hc.st.done_evicted == 3);
+        hc.set_stream_layer(-1);
+        hc.publish(s);
+        const uint64_t ev = hc.st.stream_evicted;
+        CHECK(hc.reserve(1, 6) >= 0);
+        CHECK(hc.st.stream_evicted == ev); // decode: not counted, the plain CLOCK
+    }
+
     // no budget
     {
         llama_moe_host_cache hc(ggml_backend_cpu_buffer_type(), 1000, LLAMA_MOE_HOST_EXCLUSIVE, n_expert, sizes);

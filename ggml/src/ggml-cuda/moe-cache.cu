@@ -4,7 +4,10 @@
 #include "moe-cache.cuh"
 #include "ggml-moe-mailbox.h"
 
+#include <algorithm>
 #include <climits>
+#include <cmath>
+#include <cstdlib>
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #define MOE_MAILBOX_OK 1 // single-graph host misses (ggml_moe_mailbox_publish)
@@ -90,7 +93,8 @@ static __global__ void moe_cache_assign(
         const int n_ids, const int ne0, const int n_expert, const int il, const int n_slots,
         int32_t * __restrict__ counts, const int n_layer, const int fetch_q,
         int32_t * __restrict__ scores, const int grow, const int advance, const int n_scores, const int frozen = 0,
-        const int tail_rank = 0, int32_t * __restrict__ skip_stat = nullptr, int ids_s1 = 0, const int defer = 0) {
+        const int tail_rank = 0, int32_t * __restrict__ skip_stat = nullptr, int ids_s1 = 0, const int defer = 0,
+        const int margin_q = 0, const int margin_add_q = 0) {
     if (ids_s1 <= 0) {
         ids_s1 = ne0;
     }
@@ -347,6 +351,47 @@ static __global__ void moe_cache_assign(
             __syncthreads();
         }
         h = h + far + 1 < n_slots ? h + far + 1 : h + far + 1 - n_slots;
+
+        // k19-ramevict admission margin (hybrid, LLAMA_MOE_CACHE_ADMIT_MARGIN): a missing expert replaces a resident only if its decayed
+        // count beats the victim's by the margin (score > victim*margin_q/65536 + w*margin_add_q/65536); empty slots always admit. The
+        // victims were taken in rising score order, the candidates go in falling score order (ties by expert id), so the admitted ones
+        // are a prefix of both; the rest go to the host as the experts the fetch share leaves out (the victims keep their experts).
+        // Placement only on the device; the host computes the rejected experts (host rounding). Idea from Straydog (MIT)
+        if (margin_q > 0 && counts != nullptr && sc != nullptr) {
+            int n_acc = 0;
+            if (lane == 0) {
+                for (int a = 1; a < n_take; ++a) { // insertion sort of the candidates, highest score first
+                    const int32_t ea = take_e[a];
+                    int b = a - 1;
+                    while (b >= 0 && (sc[take_e[b]] < sc[ea] || (sc[take_e[b]] == sc[ea] && take_e[b] > ea))) {
+                        take_e[b + 1] = take_e[b];
+                        b--;
+                    }
+                    take_e[b + 1] = ea;
+                }
+                for (; n_acc < n_take; ++n_acc) {
+                    const int32_t key = key_of[victim[n_acc]];
+                    if (key < 0) {
+                        continue;
+                    }
+                    const long long need = ((long long) scores[key]*margin_q + (long long) w*margin_add_q) >> 16;
+                    if ((long long) sc[take_e[n_acc]] <= need) {
+                        break;
+                    }
+                }
+                for (int j = n_acc; j < n_take; ++j) {
+                    row[take_e[j]] = -1; // left to the host
+                }
+                const int n_rej = n_take - n_acc;
+                if (n_rej > 0) {
+                    moe_cache_add_u64(stat, (unsigned long long) n_rej);      // experts left to the host
+                    moe_cache_add_u64(stat + 6, (unsigned long long) n_rej);  // of them by the margin
+                }
+            }
+            n_take = __shfl_sync(full, n_acc, 0, MOE_CACHE_LANES);
+            found  = n_take;
+            __syncthreads();
+        }
     }
     if (scores != nullptr) {
         // decayed counts, more missing experts than lanes (multi-token batches): one window per missing expert
@@ -1225,6 +1270,19 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
 #endif // defined(GGML_USE_HIP)
     }
 
+    // k19-ramevict: LLAMA_MOE_CACHE_ADMIT_MARGIN=M (e.g. 1.25; unset / 0 = off) and LLAMA_MOE_CACHE_ADMIT_ADD=A (share of one use's weight,
+    // default 0): the admission margin of the hybrid assign with decayed counts (see moe_cache_assign)
+    static const int admit_margin_q = [] {
+        const char * e = getenv("LLAMA_MOE_CACHE_ADMIT_MARGIN");
+        const double m = e != nullptr ? atof(e) : 0.0;
+        return m > 0.0 ? (int) lrint(std::min(m, 16.0)*65536.0) : 0;
+    }();
+    static const int admit_add_q = [] {
+        const char * e = getenv("LLAMA_MOE_CACHE_ADMIT_ADD");
+        const double a = e != nullptr ? atof(e) : 0.0;
+        return a > 0.0 ? (int) lrint(std::min(a, 16.0)*65536.0) : 0;
+    }();
+
     if (mode == 1) {
         // hybrid assign: no copies here, see ggml_moe_cache_fetch
         ggml_tensor * counts = dst->src[3];
@@ -1237,7 +1295,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
             n_ids, ne0, n_expert, il, n_slots, (int32_t *) counts->data, (int) map->ne[1], fetch_q,
             scores != nullptr ? (int32_t *) scores->data : nullptr, grow, advance, n_scores, ggml_get_op_params_i32(dst, 15),
             tail_rank, tail_rank > 0 ? (int32_t *) counts->data + (int64_t) map->ne[1]*n_expert + 4 : nullptr, ids_s1,
-            ggml_get_op_params_i32(dst, 9));
+            ggml_get_op_params_i32(dst, 9), n_expert >= 8 ? admit_margin_q : 0, admit_add_q);
         CUDA_CHECK(cudaGetLastError());
         return;
     }

@@ -1,6 +1,7 @@
 #include "llama-moe-host-cache.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 
@@ -70,6 +71,10 @@ llama_moe_host_cache::llama_moe_host_cache(ggml_backend_buffer_type_t buft, size
         buft(buft), buft_pageable(buft_pageable), pin_cap(pin_cap), budget(budget), policy(policy), n_expert(n_expert), chunk_size(chunk_size ? chunk_size : (size_t) 256 << 20) {
     layer_class.assign(layer_sizes.size(), -1);
     slot_of.resize(layer_sizes.size());
+    {
+        const char * env = getenv("LLAMA_MOE_HOST_EVICT_DONE");
+        evict_done = env != nullptr && atoi(env) != 0; // off by default: see the header
+    }
     std::vector<int32_t> n_layers;
     for (size_t il = 0; il < layer_sizes.size(); ++il) {
         const auto & sz = layer_sizes[il];
@@ -334,8 +339,47 @@ int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict, u
         st.evicted++;
         st.dup_taken++;
     }
+    // k19-ramevict: a prompt pass streaming layer stream_il takes its victims from the finished layers first (see set_stream_layer)
+    // the hand passes the other slots without lowering their counts
+    const bool streaming = stream_il >= 0 && allow_evict;
+    if (s < 0 && streaming && evict_done && c.n_alloc > 0) {
+        const int64_t max_steps = (int64_t) c.n_alloc*9;
+        bool seen = false; // a candidate of a finished layer in the last revolution
+        for (int64_t step = 0; step < max_steps; ++step) {
+            if (step > 0 && step % c.n_alloc == 0) {
+                if (!seen) {
+                    break;
+                }
+                seen = false;
+            }
+            const int32_t cand = c.first + c.hand;
+            c.hand = (c.hand + 1) % c.n_alloc;
+            slot_t & sl = slots[cand];
+            if (sl.key < 0 || sl.key / n_expert > stream_il) {
+                continue;
+            }
+            if ((sl.state != SLOT_VALID && sl.state != SLOT_WRITING) || sl.pin == call_epoch || sl.lease_id == plan_id ||
+                    sl.read_seq == seq_next || sl.write_seq == seq_next) {
+                continue;
+            }
+            if (min_age > 0 && std::max(sl.read_seq, sl.write_seq) + min_age >= seq_next && std::max(sl.read_seq, sl.write_seq) > seq_done) {
+                continue;
+            }
+            seen = true;
+            if (sl.count > 0) {
+                sl.count--;
+                continue;
+            }
+            s = cand;
+            evict(s);
+            st.evicted++;
+            st.stream_evicted++;
+            st.done_evicted++;
+            break;
+        }
+    }
     if (s >= 0) {
-        // taken from the duplicates
+        // taken from the duplicates or a finished layer
     } else if (allow_evict && c.n_alloc > 0) {
         // CLOCK over the decayed counts: the hand lowers the count of each slot it passes, the first at zero is evicted
         const int64_t max_steps = (int64_t) c.n_alloc*9;
@@ -354,6 +398,10 @@ int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict, u
             if (sl.count > 0) {
                 sl.count--;
                 continue;
+            }
+            if (streaming) {
+                st.stream_evicted++;
+                st.ahead_evicted += sl.key / n_expert > stream_il ? 1 : 0;
             }
             s = cand;
             evict(s);

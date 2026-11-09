@@ -5834,6 +5834,20 @@ struct llama_moe_cache::impl {
         uint64_t n_disk = 0, n_skip_lookups = 0;
     } hprof;
 
+    // k19-ramevict: missing experts the hybrid assign left to the host because of its admission margin (LLAMA_MOE_CACHE_ADMIT_MARGIN)
+    uint64_t admit_rejected() const {
+        uint64_t n = 0;
+        for (const group & g : groups) {
+            if (g.counts == nullptr || g.counts->data == nullptr || !g.dev_lookup || g.counts->ne[0] < 8) {
+                continue;
+            }
+            uint64_t cnt = 0;
+            ggml_backend_tensor_get(g.counts, &cnt, ((size_t) g.counts->ne[0]*(g.counts->ne[1] - 1) + 6)*sizeof(int32_t), sizeof(cnt));
+            n += cnt;
+        }
+        return n;
+    }
+
     uint64_t tail_skipped() const {
         uint64_t n = tail_host_skipped;
         for (const group & g : groups) {
@@ -9740,7 +9754,11 @@ struct llama_moe_cache::impl {
             sd.gen = g.lru.gen;
             if (tiered) {
                 // exclusive: the experts the seed evicts move to RAM before any of their device slots is overwritten
+                // k19-ramevict: a large batch seeds layer b.il after its experts were staged, so the RAM slots they need make room in the
+                // layers this pass has finished first (see llama_moe_host_cache::set_stream_layer); decode never seeds
+                host->set_stream_layer(b.il);
                 shadow_slots(backend, g, evicted_tmp);
+                host->set_stream_layer(-1);
             }
         }
 
@@ -9967,6 +9985,11 @@ struct llama_moe_cache::impl {
                 st.bytes  += cnt[1]*g.expert_bytes;
             }
             log("device lookups (ubatch <= 32)", st);
+            if (getenv("LLAMA_MOE_CACHE_ADMIT_MARGIN") != nullptr) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: admission margin %s (+%s): %llu missing experts left to the host instead of replacing a resident\n", tag,
+                    getenv("LLAMA_MOE_CACHE_ADMIT_MARGIN"), getenv("LLAMA_MOE_CACHE_ADMIT_ADD") ? getenv("LLAMA_MOE_CACHE_ADMIT_ADD") : "0",
+                    (unsigned long long) admit_rejected());
+            }
             if (tail_rank > 0) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: route tail skip (rank %d%s): %llu missing experts skipped in windows of at most %" PRId64 " tokens\n",
                     tag, tail_rank, tail_dflt ? ", default" : "", (unsigned long long) tail_skipped(), tail_max_tokens);
@@ -10069,6 +10092,9 @@ struct llama_moe_cache::impl {
                     "registered expert buffers = %.2f MiB, MemAvailable %.1f MiB at start, %.1f MiB now\n",
                     host->n_slots(), hs.peak_held, (unsigned long long) hs.evicted, (unsigned long long) hs.no_slot, (unsigned long long) hs.waits,
                     host->pinned_bytes()/1048576.0, host->budget_bytes()/1048576.0, hst.registered/1048576.0, hst.avail_init/1048576.0, meminfo_avail()/1048576.0);
+            LLAMA_LOG_INFO("llama_moe_cache: host tier: prompt seeds evicted %llu RAM experts: %llu by the finished-layer rule, %llu of layers the pass had not reached "
+                    "(LLAMA_MOE_HOST_EVICT_DONE=%d)\n", (unsigned long long) hs.stream_evicted, (unsigned long long) hs.done_evicted,
+                    (unsigned long long) hs.ahead_evicted, host->evict_done_on() ? 1 : 0);
             LLAMA_LOG_INFO("llama_moe_cache: host tier: %.1f ms pinning slot memory, %llu allocation failures, %.2f MiB pageable (%llu chunks past the pin cap or a failed pin)\n",
                     hs.alloc_us/1000.0, (unsigned long long) hs.alloc_fail, host->pageable_bytes()/1048576.0, (unsigned long long) hs.pin_fallbacks);
             if (ahead_depth > 0) {

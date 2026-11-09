@@ -127,6 +127,15 @@ public:
     // exclusive: a held slot whose expert the device also holds (a duplicate) is the first a reservation takes, before the CLOCK;
     // set_dup(s, false) once RAM holds the only copy again (the device evicted it)
     void set_dup(int32_t s, bool dup);
+    // k19-ramevict: the layer a prompt pass is streaming (-1: none, e.g. decode). While set, an evicting reservation that finds no
+    // duplicate takes its victim first from the experts of the layers the pass has finished (layer <= il: not needed again until the
+    // next pass), by the CLOCK over them, and only then from any layer (the plain CLOCK). Placement only: what a slot holds is unchanged.
+    // Idea from Straydog (MIT). Off by default, LLAMA_MOE_HOST_EVICT_DONE=1 on (the counters below count either way). Kaggle T4, Qwen3.6-35B-A3B
+    // UD-Q4_K_XL, tier 8 under a 15 GiB RAM cap (exclusive tier, disk misses), 3 launches each: same md5, the upcoming-layer evictions of the
+    // prompt seeds 1057-1122 -> 11-13 per launch, disk bytes per request 8k -2.1%, 16k -3.2%, but TTFT 8k / 16k within the A/A spread and
+    // decode after 8k -3% (the finished layers' experts are what the decode reads next)
+    void set_stream_layer(int32_t il) { stream_il = il; }
+    bool evict_done_on() const { return evict_done; }
     bool is_dup(int32_t s) const { return slots[s].dup != 0; }
     bool is_async(int32_t s) const { return slots[s].async != 0; }
 
@@ -153,6 +162,9 @@ public:
         uint64_t alloc_us   = 0; // time spent allocating (pinning) slot memory
         uint64_t pin_fallbacks = 0; // chunks allocated pageable (pin cap reached or pinning failed)
         uint64_t dup_taken  = 0; // reservations that took a duplicate
+        uint64_t stream_evicted = 0; // evictions while a prompt layer was set (see set_stream_layer)
+        uint64_t done_evicted   = 0; // ... taken by the finished-layer rule
+        uint64_t ahead_evicted  = 0; // ... of an expert of a layer the pass has not reached yet (the plain CLOCK; the rule's fallback)
         size_t   peak_held  = 0; // most slots holding an expert at once
     };
     stats st;
@@ -215,6 +227,9 @@ private:
     std::vector<uint16_t> leads;   // [slot][max_tensors]
     std::vector<uint32_t> got;     // [slot][max_tensors] fill_piece progress
     int max_tensors = 0;
+
+    int32_t  stream_il  = -1;
+    bool     evict_done = true;
 
     uint32_t call_epoch = 1;
     uint32_t plan_id    = 1;
