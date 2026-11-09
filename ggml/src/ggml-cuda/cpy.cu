@@ -42,62 +42,6 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
     cpy_1(cx + x_offset, cdst + dst_offset);
 }
 
-// k19-q4xt: cpy_scalar with 32-bit index math (the 64-bit divisions of cpy_scalar dominate small strided copies: the GDN conv
-// state copies of a verify window, ~24k floats per copy, ran ~15 us per launch on a T4). Taken only when every element index and
-// byte offset of both tensors fits in 31 bits (cpy_u32_ok); the same element goes to the same place, so the bytes are the same.
-// GGML_CUDA_CPY_U32=0: the 64-bit kernels everywhere.
-template <cpy_kernel_t cpy_1>
-static __global__ void cpy_scalar_u32(const char * cx, char * cdst, const uint32_t ne,
-                                  const uint32_t ne00, const uint32_t ne01, const uint32_t ne02, const uint32_t nb00, const uint32_t nb01, const uint32_t nb02,
-                                  const uint32_t nb03, const uint32_t ne10, const uint32_t ne11, const uint32_t ne12, const uint32_t nb10, const uint32_t nb11,
-                                  const uint32_t nb12, const uint32_t nb13) {
-    ggml_cuda_pdl_lc();
-    const uint32_t i = blockDim.x*blockIdx.x + threadIdx.x;
-
-    if (i >= ne) {
-        return;
-    }
-
-    const uint32_t i03 = i/(ne00 * ne01 * ne02);
-    const uint32_t i02 = (i - i03*ne00*ne01*ne02 )/ (ne00*ne01);
-    const uint32_t i01 = (i - i03*ne00*ne01*ne02  -  i02*ne01*ne00) / ne00;
-    const uint32_t i00 = i - i03*ne00*ne01*ne02 - i02*ne01*ne00 - i01*ne00;
-    const uint32_t x_offset = i00*nb00 + i01*nb01 + i02*nb02 + i03 * nb03;
-
-    const uint32_t i13 = i/(ne10 * ne11 * ne12);
-    const uint32_t i12 = (i - i13*ne10*ne11*ne12) / (ne10*ne11);
-    const uint32_t i11 = (i - i13*ne10*ne11*ne12 - i12*ne10*ne11) / ne10;
-    const uint32_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
-    const uint32_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13 * nb13;
-
-    ggml_cuda_pdl_sync();
-    cpy_1(cx + x_offset, cdst + dst_offset);
-}
-
-static bool cpy_u32_enabled() {
-    static const bool v = [] {
-        const char * e = getenv("GGML_CUDA_CPY_U32");
-        return e == nullptr || atoi(e) != 0;
-    }();
-    return v;
-}
-
-// every index and byte offset below 2^31 (ne03 / ne13 implied by ne)
-static bool cpy_u32_ok(const int64_t ne, const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01,
-        const int64_t nb02, const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
-        const int64_t nb12, const int64_t nb13) {
-    constexpr int64_t lim = INT32_MAX;
-    if (!cpy_u32_enabled() || ne <= 0 || ne >= lim || ne00 <= 0 || ne01 <= 0 || ne02 <= 0 || ne10 <= 0 || ne11 <= 0 || ne12 <= 0) {
-        return false;
-    }
-    const int64_t ne03 = (ne + ne00*ne01*ne02 - 1) / (ne00*ne01*ne02);
-    const int64_t ne13 = (ne + ne10*ne11*ne12 - 1) / (ne10*ne11*ne12);
-    const int64_t xmax = (ne00 - 1)*nb00 + (ne01 - 1)*nb01 + (ne02 - 1)*nb02 + (ne03 - 1)*nb03 + 16;
-    const int64_t dmax = (ne10 - 1)*nb10 + (ne11 - 1)*nb11 + (ne12 - 1)*nb12 + (ne13 - 1)*nb13 + 16;
-    return nb00 >= 0 && nb01 >= 0 && nb02 >= 0 && nb03 >= 0 && nb10 >= 0 && nb11 >= 0 && nb12 >= 0 && nb13 >= 0 &&
-           xmax < lim && dmax < lim && ne00*ne01*ne02 < lim && ne10*ne11*ne12 < lim;
-}
-
 template <typename T>
 static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const int64_t ne,
                                const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
@@ -269,12 +213,6 @@ static void ggml_cpy_scalar_cuda(
         const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
         GGML_ASSERT(num_blocks <= INT_MAX);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream);
-        if (cpy_u32_ok(ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13)) {
-            ggml_cuda_kernel_launch(cpy_scalar_u32<cpy_1_scalar<src_t, dst_t>>, launch_params,
-                cx, cdst, (uint32_t) ne, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne02, (uint32_t) nb00, (uint32_t) nb01, (uint32_t) nb02,
-                (uint32_t) nb03, (uint32_t) ne10, (uint32_t) ne11, (uint32_t) ne12, (uint32_t) nb10, (uint32_t) nb11, (uint32_t) nb12, (uint32_t) nb13);
-            return;
-        }
         ggml_cuda_kernel_launch(cpy_scalar<cpy_1_scalar<src_t, dst_t>>, launch_params,
             cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
     };
@@ -585,35 +523,6 @@ static __global__ void cpy_scalar_multi(const cpy_multi_ptrs ptrs, const int64_t
     cpy_1(ptrs.x[blockIdx.y] + x_offset, ptrs.d[blockIdx.y] + dst_offset);
 }
 
-// cpy_scalar_multi with the 32-bit index math of cpy_scalar_u32 (k19-q4xt)
-template <cpy_kernel_t cpy_1>
-static __global__ void cpy_scalar_multi_u32(const cpy_multi_ptrs ptrs, const uint32_t ne,
-                                  const uint32_t ne00, const uint32_t ne01, const uint32_t ne02, const uint32_t nb00, const uint32_t nb01, const uint32_t nb02,
-                                  const uint32_t nb03, const uint32_t ne10, const uint32_t ne11, const uint32_t ne12, const uint32_t nb10, const uint32_t nb11,
-                                  const uint32_t nb12, const uint32_t nb13) {
-    ggml_cuda_pdl_lc();
-    const uint32_t i = blockDim.x*blockIdx.x + threadIdx.x;
-
-    if (i >= ne) {
-        return;
-    }
-
-    const uint32_t i03 = i/(ne00 * ne01 * ne02);
-    const uint32_t i02 = (i - i03*ne00*ne01*ne02 )/ (ne00*ne01);
-    const uint32_t i01 = (i - i03*ne00*ne01*ne02  -  i02*ne01*ne00) / ne00;
-    const uint32_t i00 = i - i03*ne00*ne01*ne02 - i02*ne01*ne00 - i01*ne00;
-    const uint32_t x_offset = i00*nb00 + i01*nb01 + i02*nb02 + i03 * nb03;
-
-    const uint32_t i13 = i/(ne10 * ne11 * ne12);
-    const uint32_t i12 = (i - i13*ne10*ne11*ne12) / (ne10*ne11);
-    const uint32_t i11 = (i - i13*ne10*ne11*ne12 - i12*ne10*ne11) / ne10;
-    const uint32_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
-    const uint32_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13 * nb13;
-
-    ggml_cuda_pdl_sync();
-    cpy_1(ptrs.x[blockIdx.y] + x_offset, ptrs.d[blockIdx.y] + dst_offset);
-}
-
 bool ggml_cuda_cpy_multi_enabled() {
     static const bool v = [] {
         const char * e = getenv("GGML_CUDA_CPY_MULTI");
@@ -656,14 +565,6 @@ void ggml_cuda_cpy_multi(ggml_backend_cuda_context & ctx, const ggml_tensor * co
     GGML_ASSERT(num_blocks <= INT_MAX);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dim3((unsigned) num_blocks, (unsigned) n, 1),
         CUDA_CPY_BLOCK_SIZE, 0, ctx.stream());
-    if (cpy_u32_ok(ne, a->ne[0], a->ne[1], a->ne[2], (int64_t) a->nb[0], (int64_t) a->nb[1], (int64_t) a->nb[2], (int64_t) a->nb[3],
-            b->ne[0], b->ne[1], b->ne[2], (int64_t) b->nb[0], (int64_t) b->nb[1], (int64_t) b->nb[2], (int64_t) b->nb[3])) {
-        ggml_cuda_kernel_launch(cpy_scalar_multi_u32<cpy_1_scalar<float, float>>, launch_params,
-            ptrs, (uint32_t) ne, (uint32_t) a->ne[0], (uint32_t) a->ne[1], (uint32_t) a->ne[2], (uint32_t) a->nb[0], (uint32_t) a->nb[1],
-            (uint32_t) a->nb[2], (uint32_t) a->nb[3], (uint32_t) b->ne[0], (uint32_t) b->ne[1], (uint32_t) b->ne[2], (uint32_t) b->nb[0],
-            (uint32_t) b->nb[1], (uint32_t) b->nb[2], (uint32_t) b->nb[3]);
-        return;
-    }
     ggml_cuda_kernel_launch(cpy_scalar_multi<cpy_1_scalar<float, float>>, launch_params,
         ptrs, ne, a->ne[0], a->ne[1], a->ne[2], (int64_t) a->nb[0], (int64_t) a->nb[1], (int64_t) a->nb[2], (int64_t) a->nb[3],
         b->ne[0], b->ne[1], b->ne[2], (int64_t) b->nb[0], (int64_t) b->nb[1], (int64_t) b->nb[2], (int64_t) b->nb[3]);
