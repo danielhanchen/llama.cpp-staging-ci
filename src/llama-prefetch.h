@@ -113,6 +113,8 @@ struct llama_ple_prompt_reader {
         std::atomic<uint64_t> n_reads {0}; // pread calls done
         std::atomic<uint64_t> n_errors{0};
         std::atomic<uint64_t> t_us    {0}; // time spent in submit() (with LLAMA_PLE_PROMPT_READ_SYNC=1: until the reads are done)
+        std::atomic<uint64_t> n_resident {0}; // LLAMA_PLE_PROMPT_READ_STATS=1: pages found in the page cache at submit (mincore)
+        std::atomic<uint64_t> n_probed   {0}; // pages checked
     };
 
     // fd: buffered descriptor of the file holding the tensor (not owned); file_offs: offset of tensor->data in that file
@@ -138,6 +140,7 @@ private:
     int          fd;
     size_t       file_offs;
     bool         sync = false;
+    bool         probe = false; // LLAMA_PLE_PROMPT_READ_STATS=1
 
     std::mutex              mtx;
     std::condition_variable cv;      // workers: a run was queued

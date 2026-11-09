@@ -409,7 +409,8 @@ llama_ple_prompt_reader::llama_ple_prompt_reader(const ggml_tensor * tensor, int
         page = (size_t) ps;
     }
 #endif
-    sync = getenv("LLAMA_PLE_PROMPT_READ_SYNC") != nullptr && atoi(getenv("LLAMA_PLE_PROMPT_READ_SYNC")) != 0;
+    sync  = getenv("LLAMA_PLE_PROMPT_READ_SYNC") != nullptr && atoi(getenv("LLAMA_PLE_PROMPT_READ_SYNC")) != 0;
+    probe = getenv("LLAMA_PLE_PROMPT_READ_STATS") != nullptr && atoi(getenv("LLAMA_PLE_PROMPT_READ_STATS")) != 0;
     n_threads = std::max(1, std::min(n_threads, 256));
     workers.reserve(n_threads);
     for (int i = 0; i < n_threads; ++i) {
@@ -502,6 +503,26 @@ void llama_ple_prompt_reader::read(const int32_t * rows, size_t n) {
         rs[m++] = r;
     }
     rs.resize(m);
+#if !defined(_WIN32)
+    if (probe) {
+        // diagnostic: how many of these pages the page cache holds right now (the mapping starts at file offset 0)
+        std::vector<unsigned char> vec;
+        uint64_t res = 0, all = 0;
+        for (const auto & r : rs) {
+            const size_t np = (size_t) ((r.second - r.first) / page);
+            vec.resize(np);
+            void * addr = (void *) (data - file_offs + r.first);
+            if (mincore(addr, (size_t) (r.second - r.first), (decltype(&vec[0])) vec.data()) == 0) {
+                for (size_t q = 0; q < np; ++q) {
+                    res += vec[q] & 1;
+                }
+                all += np;
+            }
+        }
+        st.n_resident += res;
+        st.n_probed   += all;
+    }
+#endif
     {
         std::lock_guard<std::mutex> lock(mtx);
         for (const auto & r : rs) {

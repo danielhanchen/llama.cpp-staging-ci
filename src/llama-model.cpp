@@ -1378,6 +1378,10 @@ llama_model::~llama_model() {
         LLAMA_LOG_INFO("%s: PLE prompt reads: %" PRIu64 " ubatches, %" PRIu64 " rows, %" PRIu64 " pages in %" PRIu64 " reads by %d threads, "
             "%.1f ms in the calls, %" PRIu64 " errors\n", __func__, st.n_calls.load(), st.n_rows.load(), st.n_pages.load(), st.n_reads.load(),
             ple_reader->get_n_threads(), st.t_us.load()/1e3, st.n_errors.load());
+        if (st.n_probed > 0) {
+            LLAMA_LOG_INFO("%s: PLE prompt reads: %" PRIu64 " of %" PRIu64 " pages (%.1f%%) were in the page cache when queued\n", __func__,
+                st.n_resident.load(), st.n_probed.load(), 100.0*st.n_resident.load()/st.n_probed.load());
+        }
     }
     ple_reader.reset();
     for (auto & [_, lf] : lazy_files) {
