@@ -9797,7 +9797,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (graph->is_enabled()) {
         // a graph with the uid of the last walked one is that same graph, unchanged (the uid is renewed whenever the scheduler splits a
         // graph, and the property compare below already returns early on it): its compatibility is the cached answer.
-        // Idea from ikawrakow/ik_llama.cpp PR #2316 (MIT)
+        // Idea from ik_llama.cpp by ikawrakow (MIT)
         bool graph_compatible;
         if (ggml_cuda_graph_uid_enabled() && cgraph->uid != 0 && cgraph->uid == graph->compat_uid) {
             graph_compatible = graph->compat_ok;

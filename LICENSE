@@ -2,7 +2,7 @@ MIT License
 
 Copyright (c) 2023-2026 The ggml authors
 Copyright (c) 2024-2025 The ik_llama.cpp authors (https://github.com/ikawrakow/ik_llama.cpp/blob/main/AUTHORS)
-  (ggml/src/ggml-moe-prefetch.cpp, ggml/include/ggml-moe-prefetch.h: ported from ik_llama.cpp PR #2101 by dmaivel)
+  (ggml/src/ggml-moe-prefetch.cpp, ggml/include/ggml-moe-prefetch.h: ported from ik_llama.cpp at e34d163a, author dmaivel, MIT)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

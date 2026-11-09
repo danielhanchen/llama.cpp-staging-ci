@@ -116,7 +116,7 @@ struct llama_model_loader {
         std::set<std::string>                  tensors;
     } lazy;
 
-    // k16-draft (idea from ikawrakow/ik_llama.cpp PR #2403): an MTP draft model (hparams.n_layer_nextn > 0) loaded with mtp_borrow_io
+    // k16-draft (idea from ik_llama.cpp by ikawrakow): an MTP draft model (hparams.n_layer_nextn > 0) loaded with mtp_borrow_io
     // takes token_embd / output from model_shared, the target it drafts for, instead of its own copies (see borrow_io)
     const struct llama_model * model_shared = nullptr;
     bool   mtp_borrow_io        = false;

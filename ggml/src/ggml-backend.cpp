@@ -4548,7 +4548,7 @@ static void ggml_backend_sched_prefetch_plan(ggml_backend_sched_t sched) {
     sched->callback_plan(srcs.data(), (int) srcs.size(), sched->callback_plan_user_data);
 }
 
-// k16-disk: disk prefetch lookahead of host experts (ported from ik_llama.cpp PR #2101, see ggml-moe-prefetch.cpp). The host expert
+// k16-disk: disk prefetch lookahead of host experts (ported from ik_llama.cpp at e34d163a, author dmaivel, MIT, see ggml-moe-prefetch.cpp). The host expert
 // tensors (host buffer, WEIGHTS usage, ne[2] > 1) that the engine has registered (expert ranges of file mappings, by llama) of the
 // next GGML_MOE_PREFETCH_AHEAD (default 3, ggml_moe_prefetch_set_ahead) MoE splits of a batch of >= 32 tokens are streamed into the
 // page cache while the current split runs, and the pages the streamer read for a split are MADV_COLD after it, so prompt streaming

@@ -505,7 +505,7 @@ static void top_k_radix_cuda(
     }
 }
 
-// k19 (idea from ikawrakow/ik_llama.cpp PR #2767, Joel Farthing, MIT): the radix select above in one launch per call, one block per
+// k19 (idea from ik_llama.cpp, author Joel Farthing, MIT): the radix select above in one launch per call, one block per
 // row. The same four 8-bit histogram passes over the same keys pick the same threshold key and the same count of kept ties, and the
 // gather writes the same order: the keys above the threshold in column order, then the first kept ties in column order. So the output
 // is bitwise that of top_k_radix_cuda (init + 4 x (histogram + select) + gather = 10 launches per call). GGML_CUDA_TOPK_ONEBLOCK=0: off.

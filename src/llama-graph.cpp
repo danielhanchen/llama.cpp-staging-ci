@@ -1934,7 +1934,7 @@ llm_graph_amax_src1 llm_graph_context::build_amax_src1_f16(
     ggml_tensor * ab = ggml_abs(ctx0, cur);
     ggml_tensor * amax = ggml_pool_1d(ctx0, ab, GGML_OP_POOL_MAX, n_embd, n_embd, 0);
 
-    // ref: https://github.com/ggml-org/llama.cpp/pull/26223
+    // ref: upstream llama.cpp
     constexpr float k_log2_e = 1.4426950408889634f; // 1 / ln(2)
     constexpr float k_ln_2   = 0.6931471805599453f;
 

@@ -1759,7 +1759,7 @@ void llama_context::rs_replay_commit(bool sync) {
 }
 
 // k16-disk: runtime disk prefetch of host experts read through the file mappings (ggml/src/ggml-moe-prefetch.cpp, ported from
-// ik_llama.cpp PR #2101). The host expert tensors of file mappings are registered with the engine; the CPU MUL_MAT_ID streams the
+// ik_llama.cpp at e34d163a, author dmaivel, MIT). The host expert tensors of file mappings are registered with the engine; the CPU MUL_MAT_ID streams the
 // routed experts of each product with its worker threads, the scheduler streams the next MoE splits of a prompt whose uploads read
 // the mapping (not when the weight store reads them). Page cache only: the kernels read the same mapped bytes (exact).
 // LLAMA_MOE_DISK_PREFETCH: unset = on when those experts exceed 80% of the available RAM (cgroup-aware, the weight store's rule),
@@ -4631,7 +4631,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
 
     // always use non-causal attention for encoder graphs
     // TODO: this is a tmp solution until we have a proper way to support enc-dec models
-    //       ref: https://github.com/ggml-org/llama.cpp/pull/12181#issuecomment-2730451223
+    //       ref: upstream llama.cpp discussion of this case
     cparams.causal_attn = false;
 
     ggml_status status;
@@ -8644,7 +8644,7 @@ void llama_context::vram_watch_sample(bool force) {
     }
 }
 
-// LLAMA_MOE_HOST_PIN=1 (opt-in, k11; the dedicated pool of ggml-org/llama.cpp#30971): the host-miss ubatches run on an own ggml
+// LLAMA_MOE_HOST_PIN=1 (opt-in, k11; the dedicated pool idea from upstream llama.cpp): the host-miss ubatches run on an own ggml
 // threadpool, one worker per physical core (the first allowed SMT sibling, at most 32 and the cgroup quota), each pinned to its CPU
 // (strict_cpu), polling LLAMA_MOE_HOST_POLL (default 50) before it sleeps; GGML_CPU_PIN_CALLER=1 also pins the calling thread to
 // worker 0's CPU. Only builds without OpenMP use the pool's CPU masks (GGML_OPENMP=OFF); with OpenMP the team ignores them.

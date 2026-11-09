@@ -1,4 +1,4 @@
-// Ported from ikawrakow/ik_llama.cpp ggml/src/ggml-moe-prefetch.h at e34d163a (PR #2101, author dmaivel), MIT.
+// Ported from ikawrakow/ik_llama.cpp ggml/src/ggml-moe-prefetch.h at e34d163a (author dmaivel), MIT.
 // Copyright (c) 2024-2025 The ik_llama.cpp authors. See LICENSE.
 // k16-disk changes: public header (GGML_API), the registry holds expert tensor ranges with a reference count (not whole mappings),
 // a lookahead byte budget, MADV_RANDOM on the registered ranges, counters (ggml_moe_prefetch_stats).

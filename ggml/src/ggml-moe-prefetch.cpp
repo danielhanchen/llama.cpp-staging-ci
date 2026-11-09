@@ -1,4 +1,4 @@
-// Ported from ikawrakow/ik_llama.cpp ggml/src/ggml-moe-prefetch.cpp at e34d163a (PR #2101, author dmaivel), MIT.
+// Ported from ikawrakow/ik_llama.cpp ggml/src/ggml-moe-prefetch.cpp at e34d163a (author dmaivel), MIT.
 // Copyright (c) 2024-2025 The ik_llama.cpp authors. See LICENSE.
 //
 // k16-disk changes to the copy (the worker pool, the chunking, the mincore skip, the tickets and MADV_COLD are ik's):

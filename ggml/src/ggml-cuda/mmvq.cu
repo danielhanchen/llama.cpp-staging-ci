@@ -3865,7 +3865,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             // the q8_1 loads of the activation between the rows and adds weight loads in flight. A row's sum does not depend on the rows
             // per block (the K split and the reduction are per row), so the output keeps its bytes. sm_75 binaries only (the TURING table
             // also covers Volta, where it did not gain), not Q3_K, not the small-K / unrolled / MoE (ids) / shared-expert launches, and
-            // only an even number of rows (a block reads the weights of both its rows). Idea from ikawrakow/ik_llama.cpp PR #2701 (MIT).
+            // only an even number of rows (a block reads the weights of both its rows). Idea from ik_llama.cpp by ikawrakow (MIT).
             // =0 off; =2 also on other NVIDIA tables (a check that the bytes do not change, not a tuned setting)
             static const int turing_2rows_env = [] {
                 const char * e = getenv("GGML_CUDA_MMVQ_TURING_2ROWS");
