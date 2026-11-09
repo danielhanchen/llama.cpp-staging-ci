@@ -1,6 +1,8 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "llama-model.h"
 
+#include <cinttypes>
+
 #include "llama-arch.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
@@ -1371,9 +1373,32 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
+    if (ple_reader && ple_reader->st.n_calls > 0) {
+        const auto & st = ple_reader->st;
+        LLAMA_LOG_INFO("%s: PLE prompt reads: %" PRIu64 " ubatches, %" PRIu64 " rows, %" PRIu64 " pages in %" PRIu64 " reads by %d threads, "
+            "%.1f ms in all, %" PRIu64 " errors\n", __func__, st.n_calls.load(), st.n_rows.load(), st.n_pages.load(), st.n_reads.load(),
+            ple_reader->get_n_threads(), st.t_us.load()/1e3, st.n_errors.load());
+    }
+    ple_reader.reset();
     for (auto & [_, lf] : lazy_files) {
         llama_prefetch_close_fd(lf.fd);
     }
+}
+
+llama_ple_prompt_reader * llama_model::ple_prompt_reader() const {
+    std::call_once(ple_reader_once, [this] {
+        const ggml_tensor * t = per_layer_tok_embd;
+        const auto it = t ? lazy_files.find(t) : lazy_files.end();
+        if (it == lazy_files.end() || !can_prefetch.count(t) || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+            return;
+        }
+        ple_reader.reset(llama_ple_prompt_reader_make(t, it->second.fd, it->second.offs));
+        if (ple_reader) {
+            LLAMA_LOG_INFO("%s: PLE rows of prompt ubatches (%zu+ rows) are read by %d threads before their gather "
+                "(LLAMA_PLE_PROMPT_READ=0 off)\n", __func__, llama_ple_prompt_read_min_rows(), ple_reader->get_n_threads());
+        }
+    });
+    return ple_reader.get();
 }
 
 const ggml_tensor * llama_model::ple_rows(const llama_ubatch & ub, const llama_ubatch * pending,

@@ -96,3 +96,61 @@ enum llama_ple_prefetch_mode llama_ple_prefetch_resolve(enum llama_ple_prefetch_
 // -1 where unsupported; the caller owns it (llama_prefetch_close_fd)
 int  llama_prefetch_reopen_fd(int fd, size_t offs, size_t size);
 void llama_prefetch_close_fd(int fd);
+
+// k19-disktt: the pages a prompt ubatch gathers from a lazily mapped table on a disk (the Flash-Next PLE table, 16 rows of 90 bytes on
+// 16 random pages per token), read before the gather by a pool of threads with buffered preads (the page cache then serves the gather's
+// faults). The gather of a lazy MADV_RANDOM mapping faults one 4 KiB page at a time on its threads, and the WILLNEED hint is dropped when
+// the kernel finds no free page cache for it, so a prompt read ~100k pages at the queue depth of the CPU threads (an 8k prompt on a
+// model larger than RAM: 400 MB in ~35 s on a Colab A100 40 GB VM). Nothing is written to the mapping and the gather reads the same
+// bytes, so the outputs cannot change.
+struct llama_ple_prompt_reader {
+    struct stats {
+        std::atomic<uint64_t> n_calls {0};
+        std::atomic<uint64_t> n_rows  {0};
+        std::atomic<uint64_t> n_pages {0}; // pages read (runs of adjacent pages are read whole)
+        std::atomic<uint64_t> n_reads {0}; // pread calls
+        std::atomic<uint64_t> n_errors{0};
+        std::atomic<uint64_t> t_us    {0}; // wall time of read(), summed
+    };
+
+    // fd: buffered descriptor of the file holding the tensor (not owned); file_offs: offset of tensor->data in that file
+    llama_ple_prompt_reader(const ggml_tensor * tensor, int fd, size_t file_offs, int n_threads);
+    ~llama_ple_prompt_reader();
+
+    // reads the pages of the given rows (negative or out of range ids skipped), returns when all reads are done
+    void read(const int32_t * rows, size_t n_rows);
+
+    int get_n_threads() const { return (int) workers.size() + 1; }
+
+    stats st;
+
+private:
+    void work();
+    void worker_main();
+
+    const char * data;
+    size_t       row_bytes;
+    size_t       row_stride;
+    int64_t      n_rows_max;
+    size_t       page = 4096;
+    int          fd;
+    size_t       file_offs;
+
+    std::vector<std::pair<uint64_t, uint64_t>> runs; // [file offset, length) of the current call
+    std::atomic<size_t> run_next {0};
+
+    std::mutex              mtx;
+    std::condition_variable cv;
+    std::condition_variable cv_done;
+    uint64_t                phase    = 0;
+    int                     n_active = 0;
+    bool                    stop     = false;
+    std::mutex              call_mtx; // one read() at a time (contexts sharing the model)
+    std::vector<std::thread> workers;
+};
+
+// the reader for a lazily mapped table on a real file system (not tmpfs / ramfs), Linux / macOS / BSD; nullptr where it does not apply or
+// LLAMA_PLE_PROMPT_READ=0 (threads: LLAMA_PLE_PROMPT_READ_THREADS, default 32)
+llama_ple_prompt_reader * llama_ple_prompt_reader_make(const ggml_tensor * tensor, int fd, size_t file_offs);
+// rows at least this many (LLAMA_PLE_PROMPT_READ_MIN_ROWS, default 256) go through the reader, fewer keep the WILLNEED hint
+size_t llama_ple_prompt_read_min_rows();
