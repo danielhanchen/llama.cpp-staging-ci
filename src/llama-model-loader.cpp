@@ -1165,7 +1165,7 @@ static bool llama_mtp_borrow_io_env() {
     return e == nullptr || atoi(e) != 0;
 }
 
-// k16-draft (idea from ikawrakow/ik_llama.cpp PR #2403, shared MTP companions without their own IO): a separate MTP draft model
+// k16-draft (idea from ik_llama.cpp by ikawrakow, shared MTP companions without their own IO): a separate MTP draft model
 // (Qwen3.8-Flash-Next mtp-*.gguf) ships its own token_embd and output, the same weights the target already holds. With mtp_borrow_io
 // and the target as model_shared the draft uses the target's tensors instead: its own copies are neither allocated nor read (the
 // lm head was 644 MiB of device memory at Q8_0, the embeddings 644 MiB of mapped host memory). Only a draft verifies nothing: the

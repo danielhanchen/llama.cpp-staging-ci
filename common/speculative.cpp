@@ -4091,7 +4091,7 @@ static bool common_gguf_tensor_ne(const std::string & path, const char * name, i
     return false;
 }
 
-// k16-draft (idea from ikawrakow/ik_llama.cpp PR #2403): a separate MTP draft model (-md with --spec-type draft-mtp) uses the target's
+// k16-draft (idea from ik_llama.cpp by ikawrakow): a separate MTP draft model (-md with --spec-type draft-mtp) uses the target's
 // token_embd and output when both files hold them with the same shapes (llama_model_loader::borrow_io checks again at load, against
 // the loaded target). Decided here so the fit's measurements of the draft (no target loaded yet) count the lm head as the target's.
 // LLAMA_MTP_BORROW_IO=0: the draft loads its own copies

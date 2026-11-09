@@ -793,7 +793,7 @@ static __device__ __forceinline__ void ggml_cuda_mad(half2 & acc, const half2 v,
 #endif // FAST_FP16_AVAILABLE
 }
 
-// PDL and __restrict__ need to be mutually exclusive, see https://github.com/ggml-org/llama.cpp/pull/24030
+// PDL and __restrict__ need to be mutually exclusive (see upstream llama.cpp)
 # if (defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER)
 # define GGML_CUDA_RESTRICT
 # else
