@@ -935,6 +935,11 @@ static __global__ void mul_mat_vec_q(
     }
     channel_x  = shared_expert ? 0 : ncols_dst == 1 && ids ? ids[channel_dst] : fastdiv(channel_dst, channel_ratio);
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
+    // k19-exactdet: the rows of dst, the bound of a partial last row block (rows_per_cuda_block > 1: small K, rows not a multiple of the
+    // rows per block). Dense: the column stride. MUL_MAT_ID at one column: the slot stride (stride_col_dst is the token stride there, so
+    // the last block of a slot wrote its rows past the expert into the next slot's first rows, which that slot's block also writes: the
+    // bytes depended on which block wrote last, and the last slot of the last token wrote past dst)
+    const uint32_t nrows_dst = ncols_dst == 1 && ids && !shared_expert ? stride_channel_dst : stride_col_dst;
 
     // the selected expert is uniform in the block, so the whole block leaves on a skipped slot
     if (!shared_expert && ncols_dst == 1 && ids && ids[channel_dst] == -1) {
@@ -944,7 +949,7 @@ static __global__ void mul_mat_vec_q(
             for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
+                    if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < nrows_dst)) {
                         dst[j*stride_col_dst + i] = 0.0f;
                     }
                 }
@@ -996,7 +1001,7 @@ static __global__ void mul_mat_vec_q(
         // 2. load only on threads that won't die after partial sum calculation
         const uint32_t channel_bias = ids ? channel_x : channel_dst;
         if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
-            (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
+            (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_dst)) {
             if (use_bias) {
                 x_bias = x_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
 #pragma unroll
@@ -1213,7 +1218,7 @@ static __global__ void mul_mat_vec_q(
                 }
             }
 
-            if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
+            if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < nrows_dst)) {
                 float result = tmp[j][i];
                 if constexpr (has_fusion) {
                     if constexpr (type == GGML_TYPE_NVFP4) {
