@@ -29,6 +29,7 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/resource.h>
+#include <sys/vfs.h>
 #include <fcntl.h>
 #include <unistd.h>
 #endif
@@ -1281,25 +1282,62 @@ llama_context::llama_context(
                 const uint64_t avail = llama_sysmem::available();
                 const uint64_t need  = (uint64_t) table + host + (8ull << 30);
 #if defined(__linux__)
-                const bool admit = res_env == 1 || (avail > 0 && avail >= need);
+                // (LLAMA_PLE_RESIDENT=2: the part rule below even where the whole table would fit; a test hook)
+                const bool admit = res_env == 1 || (res_env != 2 && avail > 0 && avail >= need);
 #else
                 const bool admit = false; // the read-in and the lock are Linux only
 #endif
                 static const bool res_sync = getenv("LLAMA_PLE_RESIDENT_SYNC") != nullptr && atoi(getenv("LLAMA_PLE_RESIDENT_SYNC")) != 0;
-                LLAMA_LOG_INFO("%s: PLE table '%s' (%.1f GiB) %s in RAM: %.1f GiB available, %.1f GiB needed (table + %.1f GiB other host weights + "
-                    "8 GiB; LLAMA_PLE_RESIDENT=0 off, =1 always)%s\n", __func__, t->name, table/1073741824.0, admit ? "made resident" : "left lazy",
-                    avail/1073741824.0, need/1073741824.0, host/1073741824.0, admit ? (res_sync ? ", read during the load" : ", read in the background") : "");
-#if defined(__linux__)
-                if (admit) {
-                    int    fd   = -1;
-                    size_t offs = 0;
-                    if (const auto it = model.lazy_files.find(t); it != model.lazy_files.end()) {
-                        fd   = it->second.fd;
-                        offs = it->second.offs;
+                int    fd   = -1;
+                size_t offs = 0;
+                if (const auto it = model.lazy_files.find(t); it != model.lazy_files.end()) {
+                    fd   = it->second.fd;
+                    offs = it->second.offs;
+                }
+                // k19-disktt: a table that does not fit beside the other host weights is read in part, as far as the RAM left after them
+                // and a reserve (LLAMA_PLE_RESIDENT_PARTIAL_RESERVE_MIB, 4096) holds: the page cache keeps those pages (not locked), and a
+                // prompt's gather faults only the rows past them. A100 40 GB VM (83 GB RAM), Flash-Next UD-IQ4_XS on the VM disk: 57.6 GB of
+                // registered host experts beside the 26.8 GiB table; every 8k prompt read ~100k random pages of it (~36 s on a 3k IOPS
+                // disk). The same bytes through the same mapping, so exact. Only for files on a disk (not tmpfs / ramfs).
+                // LLAMA_PLE_RESIDENT_PARTIAL=0: off (the table stays lazy, as before)
+                size_t part = 0;
+#if !defined(__linux__)
+                GGML_UNUSED(fd);
+                GGML_UNUSED(offs);
+#else
+                static const int part_env = getenv("LLAMA_PLE_RESIDENT_PARTIAL") ? atoi(getenv("LLAMA_PLE_RESIDENT_PARTIAL")) : -1;
+                struct statfs psfs;
+                const bool on_disk = fd >= 0 && fstatfs(fd, &psfs) == 0 && (unsigned long) psfs.f_type != 0x01021994UL &&
+                    (unsigned long) psfs.f_type != 0x858458f6UL;
+                if (!admit && part_env != 0 && on_disk && avail > 0) {
+                    const uint64_t reserve = (uint64_t) (getenv("LLAMA_PLE_RESIDENT_PARTIAL_RESERVE_MIB") ?
+                        std::max(0, atoi(getenv("LLAMA_PLE_RESIDENT_PARTIAL_RESERVE_MIB"))) : 4096) << 20;
+                    const uint64_t keep = (uint64_t) host + reserve;
+                    if (avail > keep + (1ull << 30)) {
+                        part = (size_t) std::min<uint64_t>(table, (avail - keep) & ~((8ull << 20) - 1));
                     }
+                }
+#endif
+                // the part is read during the load unless LLAMA_PLE_RESIDENT_PARTIAL_BG=1: a background read waits out every ubatch, so under
+                // steady requests it would not finish, and on an IOPS-bound disk each request would pay its own reads meanwhile
+                static const bool part_bg = getenv("LLAMA_PLE_RESIDENT_PARTIAL_BG") != nullptr && atoi(getenv("LLAMA_PLE_RESIDENT_PARTIAL_BG")) != 0;
+                const bool sync = res_sync || (!admit && part > 0 && !part_bg);
+                LLAMA_LOG_INFO("%s: PLE table '%s' (%.1f GiB) %s in RAM: %.1f GiB available, %.1f GiB needed (table + %.1f GiB other host weights + "
+                    "8 GiB; LLAMA_PLE_RESIDENT=0 off, =1 always)%s\n", __func__, t->name, table/1073741824.0,
+                    admit ? "made resident" : part > 0 ? "read in part" : "left lazy",
+                    avail/1073741824.0, need/1073741824.0, host/1073741824.0, admit || part > 0 ? (sync ? ", read during the load" : ", read in the background") : "");
+                if (part > 0) {
+                    LLAMA_LOG_INFO("%s: PLE table: the first %.1f of %.1f GiB go to the page cache, not locked (%.1f GiB available - %.1f GiB of host "
+                        "weights - the reserve; LLAMA_PLE_RESIDENT_PARTIAL=0 off)\n", __func__, part/1073741824.0, table/1073741824.0,
+                        avail/1073741824.0, host/1073741824.0);
+                }
+#if defined(__linux__)
+                if (admit || part > 0) {
                     const std::string tname = t->name;
                     std::atomic<bool> * stop = &ple_res.stop;
-                    auto work = [t, table, fd, offs, tname, stop](bool background) {
+                    const size_t limit = admit ? table : part;
+                    const bool partial = !admit;
+                    auto work = [t, table, limit, partial, fd, offs, tname, stop](bool background) {
                         const int64_t t0 = ggml_time_us();
                         if (background) {
                             // idle I/O class (a request's own reads go first) and the lowest CPU priority, this thread only
@@ -1308,7 +1346,7 @@ llama_context::llama_context(
                         }
                         const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
                         uint8_t * a0 = (uint8_t *) ((uintptr_t) t->data & ~(uintptr_t) (pg - 1));
-                        const size_t len = (size_t) ((uint8_t *) t->data + table - a0);
+                        const size_t len = (size_t) ((uint8_t *) t->data + limit - a0);
                         const size_t lead = (size_t) ((uint8_t *) t->data - a0);
                         // 8 MiB per step: a step waits while any context ran a ubatch in the last 300 ms (a request's own reads and faults
                         // go first: with the mq-deadline / none schedulers of NVMe the idle class is not enforced), then reads the chunk
@@ -1316,43 +1354,77 @@ llama_context::llama_context(
                         // it and stalled the request's own mapping calls, G4 k15gk: 8k TTFT 17-48 s), then maps the cached pages
                         const size_t chunk = 8ull << 20;
                         static const int64_t gap_us = getenv("LLAMA_PLE_RESIDENT_GAP_MS") ? 1000ll*atoll(getenv("LLAMA_PLE_RESIDENT_GAP_MS")) : 300000;
-                        std::vector<uint8_t> rbuf(fd >= 0 ? chunk : 0);
-                        bool pop_ok = true;
-                        size_t done = 0;
-                        for (size_t o = 0; o < len && !stop->load(std::memory_order_relaxed); o += chunk) {
-                            while (background && !stop->load(std::memory_order_relaxed) &&
-                                    ggml_time_us() - llama_ple_busy_us.load(std::memory_order_relaxed) < gap_us) {
-                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                            }
-                            const size_t n = std::min(chunk, len - o);
-                            if (fd >= 0 && o + n > lead) {
-                                const size_t skip = o < lead ? lead - o : 0;
-                                size_t fo = offs + (o + skip - lead), left = n - skip;
-                                while (left > 0) {
-                                    const ssize_t r = pread(fd, rbuf.data(), left, (off_t) fo);
-                                    if (r <= 0) {
-                                        break;
+                        std::atomic<bool>   pop_ok_a {true};
+                        std::atomic<size_t> next {0};
+                        std::atomic<size_t> done_a {0};
+                        auto run = [&]() {
+                            std::vector<uint8_t> rbuf(fd >= 0 ? chunk : 0);
+                            for (;;) {
+                                if (stop->load(std::memory_order_relaxed)) {
+                                    break;
+                                }
+                                while (background && !stop->load(std::memory_order_relaxed) &&
+                                        ggml_time_us() - llama_ple_busy_us.load(std::memory_order_relaxed) < gap_us) {
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                                }
+                                const size_t o = next.fetch_add(chunk);
+                                if (o >= len) {
+                                    break;
+                                }
+                                const size_t n = std::min(chunk, len - o);
+                                if (fd >= 0 && o + n > lead) {
+                                    const size_t skip = o < lead ? lead - o : 0;
+                                    size_t fo = offs + (o + skip - lead), left = n - skip;
+                                    while (left > 0) {
+                                        const ssize_t r = pread(fd, rbuf.data(), left, (off_t) fo);
+                                        if (r <= 0) {
+                                            break;
+                                        }
+                                        fo += (size_t) r; left -= (size_t) r;
                                     }
-                                    fo += (size_t) r; left -= (size_t) r;
                                 }
-                            }
-                            if (pop_ok && madvise(a0 + o, n, 22 /* MADV_POPULATE_READ, Linux 5.14 */) != 0) {
-                                pop_ok = false;
-                            }
-                            if (!pop_ok) {
-                                volatile uint8_t sink = 0;
-                                for (size_t q = 0; q < n; q += pg) {
-                                    sink ^= a0[o + q];
+                                if (pop_ok_a.load() && madvise(a0 + o, n, 22 /* MADV_POPULATE_READ, Linux 5.14 */) != 0) {
+                                    pop_ok_a = false;
                                 }
-                                (void) sink;
+                                if (!pop_ok_a.load()) {
+                                    volatile uint8_t sink = 0;
+                                    for (size_t q = 0; q < n; q += pg) {
+                                        sink ^= a0[o + q];
+                                    }
+                                    (void) sink;
+                                }
+                                done_a += n;
                             }
-                            done += n;
+                        };
+                        // k19-disktt: a read during the load runs on LLAMA_PLE_RESIDENT_THREADS (4) threads over disjoint chunks (a cloud disk
+                        // reaches its throughput only with several reads in flight); the background read stays one thread
+                        int n_thr = 1;
+                        if (!background) {
+                            n_thr = getenv("LLAMA_PLE_RESIDENT_THREADS") ? std::max(1, atoi(getenv("LLAMA_PLE_RESIDENT_THREADS"))) : 4;
                         }
+                        {
+                            std::vector<std::thread> thr;
+                            for (int i = 1; i < n_thr; ++i) {
+                                thr.emplace_back(run);
+                            }
+                            run();
+                            for (auto & th : thr) {
+                                th.join();
+                            }
+                        }
+                        const bool   pop_ok = pop_ok_a.load();
+                        const size_t done   = done_a.load();
                         if (stop->load(std::memory_order_relaxed)) {
                             LLAMA_LOG_INFO("%s: PLE table read-in stopped at %.1f of %.1f GiB (context freed)\n", __func__, done/1073741824.0, len/1073741824.0);
                             return;
                         }
                         const double t_read = (ggml_time_us() - t0)/1e6;
+                        if (partial) {
+                            LLAMA_LOG_INFO("%s: PLE table '%s': %.1f of %.1f GiB read into the page cache in %.1f s%s (populate %s), not locked\n",
+                                __func__, tname.c_str(), len/1073741824.0, table/1073741824.0, t_read, background ? " in the background" : "",
+                                pop_ok ? "ok" : "by touch");
+                            return;
+                        }
                         struct rlimit rl;
                         if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < rl.rlim_max) {
                             rl.rlim_cur = rl.rlim_max;
@@ -1364,7 +1436,7 @@ llama_context::llama_context(
                             len/1073741824.0, t_read, background ? " in the background" : "", pop_ok ? "ok" : "by touch",
                             lr == 0 ? "locked" : "not locked: ", lr == 0 ? "" : strerror(le));
                     };
-                    if (res_sync) {
+                    if (sync) {
                         work(false);
                     } else {
                         ple_res.th = std::thread(work, true);
