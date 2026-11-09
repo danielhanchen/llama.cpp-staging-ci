@@ -455,10 +455,25 @@ static void test_slots(ggml_backend_t backend) {
         CHECK(hc.st.waits == 0);
     }
 
-    // k19-ramevict: a prompt pass streaming layer L evicts from the layers <= L first, then (none left) from any layer
+    // k19-ramevict: a prompt pass streaming layer L evicts from the layers <= L first, then (none left) from any layer. The rule is
+    // off by default (LLAMA_MOE_HOST_EVICT_DONE=1 on, read when the cache is built): the default is checked, then the rule with it on
     {
         const std::vector<std::vector<size_t>> lsz(6, std::vector<size_t>{ 3000, 3000 });
+        const char * prev = getenv("LLAMA_MOE_HOST_EVICT_DONE");
+        const std::string prev_s = prev ? prev : "";
+        unsetenv("LLAMA_MOE_HOST_EVICT_DONE");
+        {
+            llama_moe_host_cache hd(ggml_backend_cpu_buffer_type(), 6*24576, LLAMA_MOE_HOST_EXCLUSIVE, n_expert, lsz);
+            CHECK(!hd.evict_done_on());
+        }
+        setenv("LLAMA_MOE_HOST_EVICT_DONE", "1", 1);
         llama_moe_host_cache hc(ggml_backend_cpu_buffer_type(), 6*24576, LLAMA_MOE_HOST_EXCLUSIVE, n_expert, lsz);
+        if (prev) {
+            setenv("LLAMA_MOE_HOST_EVICT_DONE", prev_s.c_str(), 1);
+        } else {
+            unsetenv("LLAMA_MOE_HOST_EVICT_DONE");
+        }
+        CHECK(hc.evict_done_on());
         CHECK(hc.n_slots() == 6);
         for (int32_t il = 0; il < 6; ++il) {
             const int32_t s = hc.reserve(il, 0);
