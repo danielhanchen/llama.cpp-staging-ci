@@ -535,12 +535,21 @@ struct llama_moe_cache::impl {
     // first to go) and RAM misses fill free slots; without spare room promotions free the RAM slot and misses go to the device only
     // (V16 / R29 and the T4 at R31: keeping duplicates there cost the prompts their RAM admissions, decode -53% / -32%)
     bool host_spare = false;
+    // k19-copyback: a device eviction whose expert RAM still holds (a duplicate kept at promotion) needs no copy back: the weights are
+    // read-only, so the RAM bytes equal the device bytes. LLAMA_MOE_COPYBACK_SKIP=0 copies them back over that RAM copy anyway (same
+    // bytes, same slot, the slot waits for the copy as a real copy back does): the A/B arm for the skip, cache decisions unchanged
+    bool copyback_skip = [] {
+        const char * e = getenv("LLAMA_MOE_COPYBACK_SKIP");
+        return e == nullptr || atoi(e) != 0;
+    }();
     bool host_verify = false;     // LLAMA_WEIGHT_STREAM_VERIFY=1: every upload from the tier is compared with the mapping
     struct host_stats {
         uint64_t hits = 0, misses = 0;        // device misses of small batches (and refills) found / not found in RAM
         uint64_t read = 0, read_bytes = 0;    // RAM misses read into a slot (inclusive)
         uint64_t demoted = 0, demote_bytes = 0, demote_skip = 0; // device evictions copied back into RAM (exclusive)
         uint64_t demote_kept = 0;             // device evictions RAM still held a copy of (no copy back)
+        uint64_t demote_kept_bytes = 0;       // the bytes of those copies back skipped
+        uint64_t demote_forced = 0, demote_forced_bytes = 0; // LLAMA_MOE_COPYBACK_SKIP=0: copied back over the identical RAM copy anyway
         uint64_t promoted = 0;                // RAM experts moved to the device (exclusive: their slots are freed)
         uint64_t up_bytes = 0;                // bytes uploaded from RAM by small batches and refills
         uint64_t admitted = 0;                // experts admitted from the uploads of prompts
@@ -4701,7 +4710,21 @@ struct llama_moe_cache::impl {
                 const int32_t h = host->held(il, e);
                 if (h >= 0) {
                     host->set_dup(h, false);
-                    hst.demote_kept++;
+                    const layer & l = layers[il];
+                    if (copyback_skip) {
+                        hst.demote_kept++;
+                        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                            hst.demote_kept_bytes += l.experts[ip]->nb[2];
+                        }
+                    } else {
+                        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                            const size_t nb = l.experts[ip]->nb[2];
+                            ggml_backend_tensor_get_async(backend, g.banks[ip], host->data(h, (int) ip), (size_t) s*nb, nb);
+                            hst.demote_forced_bytes += nb;
+                        }
+                        host->mark_write(h);
+                        hst.demote_forced++;
+                    }
                 }
                 continue;
             }
@@ -4918,7 +4941,20 @@ struct llama_moe_cache::impl {
                 const int32_t h = host->held(il, e);
                 if (h >= 0) {
                     host->set_dup(h, false);
-                    hst.demote_kept++;
+                    const layer & l = layers[il];
+                    if (copyback_skip) {
+                        hst.demote_kept++;
+                        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                            hst.demote_kept_bytes += l.experts[ip]->nb[2];
+                        }
+                    } else {
+                        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                            const size_t nb = l.experts[ip]->nb[2];
+                            ggml_backend_tensor_get(g.banks[ip], host->data(h, (int) ip), (size_t) s*nb, nb);
+                            hst.demote_forced_bytes += nb;
+                        }
+                        hst.demote_forced++;
+                    }
                 }
                 continue;
             }
@@ -10025,6 +10061,10 @@ struct llama_moe_cache::impl {
                     host->exclusive() ? "exclusive" : "inclusive", (unsigned long long) hst.hits, (unsigned long long) hst.misses, n ? 100.0*hst.hits/n : 0.0,
                     hst.up_bytes/1048576.0, (unsigned long long) hst.read, hst.read_bytes/1048576.0, (unsigned long long) hst.demoted, hst.demote_bytes/1048576.0,
                     (unsigned long long) hst.demote_skip, (unsigned long long) hst.promoted, (unsigned long long) hst.admitted, (unsigned long long) hst.demote_kept);
+            LLAMA_LOG_INFO("llama_moe_cache: copy back of evicted experts: %llu done (%.2f MiB), %llu skipped as RAM held them (%.2f MiB), "
+                    "%llu forced over the RAM copy (%.2f MiB) (LLAMA_MOE_COPYBACK_SKIP=%d)\n",
+                    (unsigned long long) hst.demoted, hst.demote_bytes/1048576.0, (unsigned long long) hst.demote_kept, hst.demote_kept_bytes/1048576.0,
+                    (unsigned long long) hst.demote_forced, hst.demote_forced_bytes/1048576.0, copyback_skip ? 1 : 0);
             LLAMA_LOG_INFO("llama_moe_cache: host tier: %d slots, peak %zu held, %llu evicted, %llu without a slot, %llu waits, pinned = %.2f MiB of a %.2f MiB budget, "
                     "registered expert buffers = %.2f MiB, MemAvailable %.1f MiB at start, %.1f MiB now\n",
                     host->n_slots(), hs.peak_held, (unsigned long long) hs.evicted, (unsigned long long) hs.no_slot, (unsigned long long) hs.waits,
