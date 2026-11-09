@@ -3358,7 +3358,7 @@ static bool mul_mat_vec_q_verify_wide(
 //  - IQ2_XS / IQ2_S take the same launch under GGML_CUDA_MMVQ_IQ2_TAB (same values 0 / 1 / 2, default 1); a dense launch takes
 //    GGML_CUDA_MMVQ_IQ2_TAB_ROWS rows per block (2 = k16-turing's, default; 4 / 8: the 4 / 8 KiB table load shared by more rows).
 //  - IQ3_S / IQ3_XXS single token MUL_MAT_ID (MoE experts): the grid kernel (k19-q38t, grid in shared memory unless
-//    GGML_CUDA_MMVQ_GRID_SMEM=0) with GGML_CUDA_MMVQ_GRID_IDS rows per block instead of one: unset = 2 on sm_75 binaries on the TURING
+//    GGML_CUDA_MMVQ_GRID_SMEM=0) with GGML_CUDA_MMVQ_GRID_IDS rows per block instead of one: unset = 4 (k19-q4xt; 2 before) on sm_75 binaries on the TURING
 //    table, off elsewhere; 0 / 1 = off (one row per block, as before); 2 / 4 / 8 = that many rows on every NVIDIA table. A Qwen3.6-35B-A3B
 //    expert row (K 2048) is 8 IQ3_XXS blocks, which half of a block's 4 warps cover; the 1 KiB grid copy is then larger than the row.
 //    Same 4 warps and K split as the one-row launch: bitwise the same outputs.
@@ -3420,7 +3420,9 @@ static bool mul_mat_vec_q_tab_launch(
             if (ids == nullptr || small_k || grid_ids_env == 0 || (grid_ids_env < 0 && !sm75)) {
                 return false;
             }
-            rpb_force = grid_ids_env > 0 ? grid_ids_env : 2;
+            // k19-q4xt: the sm_75 default 4 rows (was 2): q36x on a Kaggle T4, 3 launches, md5 equal, full card chat / 8k +2.3% / +3.3%
+            // (A/A +0.3% / +0.4%), 12 GB +0.5% / +1.0%, 8 GB +0.3% / +0.4% (inside the A/A there); 8 rows below 4 in 5 of 6 cells
+            rpb_force = grid_ids_env > 0 ? grid_ids_env : 4;
         } else {
             const int env = mmvq_tab_iq2_type(type) ? tab2_env : tab_env;
             if (env == 0 || (env == 1 && !sm75)) {
