@@ -17,7 +17,7 @@
 #include <vector>
 
 // defined in ggml.c (k19-q4xcache), declared by its users
-extern "C" GGML_API void ggml_moe_cache_assign_lookup_counts(struct ggml_tensor * op);
+extern "C" { GGML_API void ggml_moe_cache_assign_lookup_counts(struct ggml_tensor * op); }
 
 static int g_fail = 0;
 #define CHECK(c, ...) do { if (!(c)) { if (g_fail++ < 20) { printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } } while (0)

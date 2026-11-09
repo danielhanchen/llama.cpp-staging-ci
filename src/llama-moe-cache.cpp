@@ -15,7 +15,7 @@
 #include "ggml-moe-mailbox.h"
 
 // k19-q4xcache: see ggml.c (declared here so that ggml.h stays unchanged)
-extern "C" GGML_API void ggml_moe_cache_assign_lookup_counts(struct ggml_tensor * op);
+extern "C" { GGML_API void ggml_moe_cache_assign_lookup_counts(struct ggml_tensor * op); }
 
 #include <algorithm>
 #include <atomic>
