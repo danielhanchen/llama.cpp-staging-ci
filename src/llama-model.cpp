@@ -1399,7 +1399,7 @@ llama_ple_prompt_reader * llama_model::ple_prompt_reader() const {
         ple_reader.reset(llama_ple_prompt_reader_make(t, it->second.fd, it->second.offs));
         if (ple_reader) {
             LLAMA_LOG_INFO("%s: PLE rows of prompt ubatches (%zu+ rows) are read ahead of their gather by %d threads%s "
-                "(LLAMA_PLE_PROMPT_READ=0 off)\n", __func__, llama_ple_prompt_read_min_rows(), ple_reader->get_n_threads(),
+                "(LLAMA_PLE_PROMPT_READ=1)\n", __func__, llama_ple_prompt_read_min_rows(), ple_reader->get_n_threads(),
                 getenv("LLAMA_PLE_PROMPT_READ_SYNC") && atoi(getenv("LLAMA_PLE_PROMPT_READ_SYNC")) ? ", waited for (LLAMA_PLE_PROMPT_READ_SYNC)" : "");
         }
     });

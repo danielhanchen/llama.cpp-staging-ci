@@ -151,8 +151,8 @@ private:
     std::vector<std::thread> workers;
 };
 
-// the reader for a lazily mapped table on a real file system (not tmpfs / ramfs), Linux / macOS / BSD; nullptr where it does not apply or
-// LLAMA_PLE_PROMPT_READ=0 (threads: LLAMA_PLE_PROMPT_READ_THREADS, default 32)
+// the reader for a lazily mapped table on a real file system (not tmpfs / ramfs), Linux / macOS / BSD, opt-in (LLAMA_PLE_PROMPT_READ=1);
+// nullptr where it does not apply or is off (threads: LLAMA_PLE_PROMPT_READ_THREADS, default 32)
 llama_ple_prompt_reader * llama_ple_prompt_reader_make(const ggml_tensor * tensor, int fd, size_t file_offs);
 // rows at least this many (LLAMA_PLE_PROMPT_READ_MIN_ROWS, default 256) go through the reader, fewer keep the WILLNEED hint
 size_t llama_ple_prompt_read_min_rows();

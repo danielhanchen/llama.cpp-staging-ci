@@ -558,7 +558,9 @@ llama_ple_prompt_reader * llama_ple_prompt_reader_make(const ggml_tensor * tenso
     GGML_UNUSED(file_offs);
     return nullptr;
 #else
-    if (const char * e = getenv("LLAMA_PLE_PROMPT_READ"); e != nullptr && atoi(e) == 0) {
+    // opt-in (LLAMA_PLE_PROMPT_READ=1): on the Colab A100 / L4 VM disks random reads are capped at ~3k/s however many are in flight,
+    // so the pool bought 0.8 s of a 22 s 8k prompt there (one launch), and its blocking form cost the L4 8k +29 s
+    if (const char * e = getenv("LLAMA_PLE_PROMPT_READ"); e == nullptr || atoi(e) == 0) {
         return nullptr;
     }
     if (tensor == nullptr || fd < 0 || !ggml_is_matrix(tensor) || tensor->data == nullptr) {

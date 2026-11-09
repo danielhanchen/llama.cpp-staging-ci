@@ -5,7 +5,7 @@
 //   - the prefetcher is engaged for each mode when the table is lazy (jobs > 0),
 //   - the logits are bit-identical across off / madvise / populate / pread,
 //   - k19-disktt: with the prompt reads of the PLE rows (llama_ple_prompt_reader, every ubatch here) and the part residency path
-//     (LLAMA_PLE_RESIDENT=2) engaged, the logits equal those of a load with the prompt reads off (LLAMA_PLE_PROMPT_READ=0).
+//     (LLAMA_PLE_RESIDENT=2) engaged (LLAMA_PLE_PROMPT_READ=1), the logits equal those of a load with the reads off (=0).
 // usage: test-ple-prefetch <model.gguf> [more models]
 // a tiny qwen4exp model: test-llama-archs -a qwen4exp -o <dir>
 
@@ -171,7 +171,7 @@ int main(int argc, char ** argv) {
     // k19-disktt: every ubatch takes the prompt reads, and the table the part residency read (read once per process)
     setenv("LLAMA_PLE_PROMPT_READ_MIN_ROWS", "1", 1);
     setenv("LLAMA_PLE_RESIDENT", "2", 1);
-    unsetenv("LLAMA_PLE_PROMPT_READ");
+    setenv("LLAMA_PLE_PROMPT_READ", "1", 1);
     unsetenv("LLAMA_PLE_RESIDENT_PARTIAL");
 
     llama_backend_init();
@@ -246,7 +246,7 @@ int main(int argc, char ** argv) {
                     ok_rd = false; // off still read
                 }
             }
-            unsetenv("LLAMA_PLE_PROMPT_READ");
+            setenv("LLAMA_PLE_PROMPT_READ", "1", 1);
         }
         // the part residency line: the first context of the model (the residency rule runs once per table)
         part_read = base.part;
