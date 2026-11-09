@@ -3539,6 +3539,12 @@ uma_restart:
             const int32_t n_threads   = params.cpuparams.n_threads;
             const uint32_t sq_ub      = e_ub != nullptr ? (uint32_t) std::max(1, atoi(e_ub)) : 256u;
             const size_t   sq_margin  = (size_t) (e_mm != nullptr ? std::max(0, atoi(e_mm)) : 512) * 1024 * 1024;
+            // k19-q38r2: a third step beside a margin of LLAMA_FIT_DRAFT_SQUEEZE_MARGIN2_MIB (448). With block 0 no longer left on the
+            // host by the NextN slot (llama-model.cpp), Qwen3.8-27B UD-Q3_K_XL + its MTP GGUF at ctx 16384 needs 14313 of 14806 MiB on a
+            // Kaggle T4 for every layer (493 MiB free): 19 MiB short of 512. Where no step keeps every layer, the 512 MiB step's fit is
+            // still taken when it leaves only one block on the host (what the drafter ran beside before: the old slot left block 0 there)
+            const char * e_m2 = getenv("LLAMA_FIT_DRAFT_SQUEEZE_MARGIN2_MIB");
+            const size_t   sq_margin2 = (size_t) (e_m2 != nullptr ? std::max(0, atoi(e_m2)) : 448) * 1024 * 1024;
             if ((e_sq == nullptr || atoi(e_sq) != 0) && (e_sd == nullptr || atoi(e_sd) != 0) && has_draft && spec_mtp && !draft_off &&
                     !params.speculative.draft.fit_off && params.speculative.draft.fit_can_drop && params.speculative.draft.n_ubatch <= 0 &&
                     fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS &&
@@ -3554,21 +3560,25 @@ uma_restart:
                 common_fit_extra_model extra_sq = extra;
                 extra_sq.cparams = &cp_dft_sq;
                 const int32_t ngl_spilled = mparams.n_gpu_layers;
-                for (int step = 0; step < 2; ++step) {
+                // the fit of the 512 MiB step when it leaves exactly one block on the host (the fallback, see sq_margin2)
+                struct sq_fit { llama_model_params mp; llama_context_params cp; std::vector<float> ts; std::vector<llama_model_tensor_buft_override> tbo;
+                                std::vector<size_t> mg; common_params_fit_status st; bool set = false; } one_off;
+                for (int step = 0; step < 3; ++step) {
                     std::vector<size_t> mg = margins_in;
-                    if (step == 1) {
+                    if (step >= 1) {
                         if (params.fit_params_target_set) {
                             break;
                         }
+                        const size_t mstep = step == 1 ? sq_margin : sq_margin2;
                         bool lower = false;
                         for (auto & m : mg) {
-                            if (m > sq_margin) {
-                                m = sq_margin;
+                            if (m > mstep) {
+                                m = mstep;
                                 lower = true;
                             }
                         }
                         if (!lower) {
-                            break;
+                            continue;
                         }
                     }
                     llama_model_params   mp = mparams_in;
@@ -3599,10 +3609,29 @@ uma_restart:
                     const int64_t n_nextn_sq = std::max<int64_t>(0, common_gguf_u32(params.model.path, "nextn_predict_layers"));
                     const bool all_dev = mp.n_gpu_layers == llama_model_default_params().n_gpu_layers ||
                         (n_layer_sq > 0 && mp.n_gpu_layers >= n_layer_sq + 1 - (mp.load_mtp ? 0 : n_nextn_sq) && n_tbo(tbo) == n_tbo(tbo_in));
-                    if (st == COMMON_PARAMS_FIT_STATUS_SUCCESS && all_dev) {
+                    if (st == COMMON_PARAMS_FIT_STATUS_SUCCESS && !all_dev && step == 1 && n_layer_sq > 0 && n_tbo(tbo) == n_tbo(tbo_in) &&
+                            mp.n_gpu_layers + 1 == n_layer_sq + 1 - (mp.load_mtp ? 0 : n_nextn_sq)) {
+                        one_off = { mp, cp, ts, tbo, mg, st, true };
+                    }
+                    const bool fits_all     = st == COMMON_PARAMS_FIT_STATUS_SUCCESS && all_dev;
+                    const bool take_one_off = !fits_all && step == 2 && one_off.set;
+                    common_params_fit_status st_take = st;
+                    if (take_one_off) {
+                        // the copies are the 512 MiB step's own: re-point the fit's buffers at this step's locals
+                        const bool tbo_one = one_off.mp.tensor_buft_overrides != nullptr && one_off.mp.tensor_buft_overrides == one_off.tbo.data();
+                        mp = one_off.mp; cp = one_off.cp; ts = one_off.ts; tbo = one_off.tbo; mg = one_off.mg; st_take = one_off.st;
+                        mp.tensor_split = ts.data();
+                        if (tbo_one) {
+                            mp.tensor_buft_overrides = tbo.data();
+                        }
+                        COM_WRN("%s: --fit: k19-q38r2: the MTP drafter stays with one block on the host (-ngl %d): every layer did not fit beside "
+                            "a %zu MiB margin either (LLAMA_FIT_DRAFT_SQUEEZE_MARGIN2_MIB)\n", __func__, mp.n_gpu_layers, sq_margin2/(1024*1024));
+                    } else if (fits_all) {
                         COM_WRN("%s: --fit: k19-q38t: the MTP drafter stays with every layer on the device (-ngl %d with tensors on the host before): "
                             "its context reads the prompt in ubatches of %u tokens%s (LLAMA_FIT_DRAFT_SQUEEZE=0 off)\n", __func__, ngl_spilled,
-                            cp_dft_sq.n_ubatch, step == 1 ? ", beside a smaller device margin" : "");
+                            cp_dft_sq.n_ubatch, step == 1 ? ", beside a smaller device margin" : step == 2 ? ", beside a margin of LLAMA_FIT_DRAFT_SQUEEZE_MARGIN2_MIB" : "");
+                    }
+                    if (fits_all || take_one_off) {
                         std::copy(ts.begin(), ts.end(), params.tensor_split);
                         std::copy(tbo.begin(), tbo.end(), params.tensor_buft_overrides.begin());
                         params.fit_params_target = mg;
@@ -3613,7 +3642,7 @@ uma_restart:
                         if (tbo_ours) {
                             mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
                         }
-                        fit_status = st;
+                        fit_status = st_take;
                         params.speculative.draft.n_ubatch = (int32_t) cp_dft_sq.n_ubatch;
                         cparams_dft.n_ubatch = cp_dft_sq.n_ubatch;
                         draft_squeezed = true;

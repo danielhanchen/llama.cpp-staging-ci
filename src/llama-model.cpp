@@ -1701,10 +1701,28 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         splits[i] = split_sum != 0.0f ? splits[i] / split_sum : float(i + 1) / n_devices();
     }
 
-    const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
-    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
-    auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
-        const bool is_swa = il < n_layer_all && hparams.is_swa(il);
+    // k19-q38r2: a dense target that does not load its trailing NextN blocks (load_mtp off, e.g. beside a separate MTP drafter) gave
+    // them an offload slot all the same: --fit counts the layers without them (hp_ngl = n_layer when load_mtp is off), so its "every
+    // layer" (-ngl n_layer + 1) left block 0 on the CPU and any partial count one real block fewer than the fit measured for (Kaggle T4,
+    // Qwen3.8-27B UD-Q3_K_XL + its MTP GGUF, squeezed drafter: block 0, 148 MiB, on 2 host threads, ~65 ms of every 190 ms verify
+    // pass). The unloaded blocks now take no slot: the offload counts run over the loaded blocks + output, and the NextN blocks go
+    // where the output goes. MoE targets keep the old count. LLAMA_NGL_NEXTN_SLOT=1: as before
+    const int n_nextn_skip = [&] {
+        const char * e = getenv("LLAMA_NGL_NEXTN_SLOT");
+        const bool old_slot = e != nullptr && atoi(e) != 0;
+        return !old_slot && !ml.load_mtp && hparams.n_expert == 0 && hparams.n_layer_nextn > 0 &&
+            hparams.n_layer_nextn < (uint32_t) n_layer_all ? (int) hparams.n_layer_nextn : 0;
+    }();
+    const int n_layer_slots = n_layer_all - n_nextn_skip; // loaded blocks; slot n_layer_slots = the output
+    if (n_nextn_skip > 0) {
+        LLAMA_LOG_INFO("%s: k19-q38r2: -ngl counts the %d loaded blocks + output (the %d NextN block(s) are not loaded and take no slot; "
+            "LLAMA_NGL_NEXTN_SLOT=1: as before)\n", __func__, n_layer_slots, n_nextn_skip);
+    }
+    const int i_gpu_start = std::max(n_layer_slots + 1 - n_gpu_layers, 0);
+    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_slots + 1);
+    auto get_layer_buft_list = [&](int il_in) -> llama_model::impl::layer_dev {
+        const bool is_swa = il_in < n_layer_all && hparams.is_swa(il_in);
+        const int  il     = il_in < n_layer_slots ? il_in : n_layer_slots; // the skipped NextN blocks and the output share the output's slot
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
