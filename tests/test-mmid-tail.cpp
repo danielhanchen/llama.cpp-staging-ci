@@ -186,9 +186,11 @@ static std::vector<tcase> make_cases() {
         { 1024, 68, 32, 16, true  },   // rows a multiple of 4, not of 8 (8 rows per block levers)
         { 4096, 70, 16, 16, true  },   // K of 16 super-blocks: no small-K launch, the codebook / grid launches with 2 / 4 / 8 rows
         { 4096, 72, 16, 16, true  },   // same, rows a multiple of 8
+        {  512, 68, 32, 16, false },   // k19-q4xt: K of one warp pass (warp per row launch), rows a multiple of 4, not of 8
+        {  512, 72, 32, 16, true  },   // same, rows a multiple of 8
     };
     const ggml_type types[] = { GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
-                                GGML_TYPE_Q4_K, GGML_TYPE_Q4_0 };
+                                GGML_TYPE_Q4_K, GGML_TYPE_Q4_0, GGML_TYPE_Q5_K };
     std::vector<tcase> cs;
     for (const ggml_type t : types) {
         for (const auto & s : shapes) {
@@ -351,7 +353,11 @@ int main(int argc, char ** argv) {
             { "iq2tab0",   "GGML_CUDA_MMVQ_IQ2_TAB=0" },               // k19-iqsmem IQ2_XS / IQ2_S codebook off
             { "iq2r4",     "GGML_CUDA_MMVQ_IQ2_TAB_ROWS=4" },          // its dense rows 4 / 8
             { "iq2r8",     "GGML_CUDA_MMVQ_IQ2_TAB_ROWS=8" },
-            { "alloff",    "GGML_CUDA_MMVQ_IQ_TAB=0 GGML_CUDA_MMVQ_IQ2_TAB=0 GGML_CUDA_MMVQ_GRID_IDS=0 GGML_CUDA_MMVQ_GRID_SMEM=0" },
+            { "wpr0",      "GGML_CUDA_MMVQ_IDS_WPR=0" },               // k19-q4xt warp per row MUL_MAT_ID launch off
+            { "wprw2r1",   "GGML_CUDA_MMVQ_IDS_WPR_W=2 GGML_CUDA_MMVQ_IDS_WPR_ROWS=1" },   // its warps x rows (default 4 x 2)
+            { "wprw2r2",   "GGML_CUDA_MMVQ_IDS_WPR_W=2 GGML_CUDA_MMVQ_IDS_WPR_ROWS=2" },
+            { "wprw4r4",   "GGML_CUDA_MMVQ_IDS_WPR_W=4 GGML_CUDA_MMVQ_IDS_WPR_ROWS=4" },
+            { "alloff",    "GGML_CUDA_MMVQ_IDS_WPR=0 GGML_CUDA_MMVQ_IQ_TAB=0 GGML_CUDA_MMVQ_IQ2_TAB=0 GGML_CUDA_MMVQ_GRID_IDS=0 GGML_CUDA_MMVQ_GRID_SMEM=0" },
         };
         if (!getenv("TAIL_NO_LEVERS")) {
             envs.push_back("TAIL_MODE=default_log GGML_CUDA_MMVQ_IQ_TAB_LOG=1");
