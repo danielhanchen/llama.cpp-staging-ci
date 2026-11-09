@@ -1930,7 +1930,8 @@ private:
                 const char * d = getenv("LLAMA_SPEC_DEPTH_CACHED");
                 return d != nullptr ? atoi(d) : 3;
             }();
-            const bool deep_cached = mtp_shape && !on && cache_expected && sp.has_dft() && dev_ok && (e == nullptr || atoi(e) != 0) &&
+            // (the device rule as k19-tpp's: NVIDIA Ampere or newer, LLAMA_SPEC_TPP=1 forces past it, =0 turns this off too)
+            const bool deep_cached = mtp_shape && !on && cache_expected && sp.has_dft() && (e != nullptr ? atoi(e) != 0 : dev_ok) &&
                 depth_cached >= 3 && !exact_mtp;
             if (deep_cached) {
                 sp.draft.n_floor     = 2;
