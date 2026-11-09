@@ -738,8 +738,10 @@ static __global__ void lightning_indexer_kernel_tile(
     } else
 
 // k19-dsv4long: key tiles per block of lightning_indexer_kernel_wmma_tiles (1 = lightning_indexer_kernel_wmma). GGML_CUDA_LID_TILES unset:
-// 4 when that still leaves >= 4 blocks per SM (decode rows at long context: n_kv >= ~20k on a T4), else 1; =0 / =1: off; =2 / =4: forced.
-static inline int ggml_cuda_lid_tiles(int64_t n_kv, int64_t n_rows, int nsm) {
+// 4 for one query row of 32 heads with >= 4 blocks per SM left (decode at long context: n_kv >= ~20k on a T4), else 1. Kaggle T4
+// (test-lid-tiles-exact): 32 heads, 1 row, 20000 / 65573 / 122880 F16 keys 130 / 387 / 705 -> 55 / 149 / 265 us; 2-4 rows and 64 heads
+// gained nothing or lost. =0 / =1: off; =2 / =4: forced for every shape.
+static inline int ggml_cuda_lid_tiles(int64_t n_kv, int64_t n_rows, int nsm, int n_head) {
     static const int env = [] {
         const char * e = getenv("GGML_CUDA_LID_TILES");
         return e == nullptr ? -1 : atoi(e);
@@ -750,7 +752,7 @@ static inline int ggml_cuda_lid_tiles(int64_t n_kv, int64_t n_rows, int nsm) {
     if (env == 2 || env == 4) {
         return env;
     }
-    return ((n_kv + 127)/128)*n_rows >= 4*(int64_t) nsm ? 4 : 1;
+    return n_head == 32 && n_rows == 1 && (n_kv + 127)/128 >= 4*(int64_t) nsm ? 4 : 1;
 }
 
 #define LIGHTNING_INDEXER_CASE_TILES(n_embd, n_head, K, type_K, tiles)                                        \
@@ -835,7 +837,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
             int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
             dim3 grid(num_kv_blocks, n_batch, n_stream);
 
-            const int tiles = ggml_cuda_lid_tiles(n_kv, (int64_t) n_batch*n_stream, ggml_cuda_info().devices[device].nsm);
+            const int tiles = ggml_cuda_lid_tiles(n_kv, (int64_t) n_batch*n_stream, ggml_cuda_info().devices[device].nsm, n_head);
             if (tiles == 4) {
                 dim3 grid_t((n_kv + 4*K_VECS_PER_BLOCK - 1) / (4*K_VECS_PER_BLOCK), n_batch, n_stream);
                 LIGHTNING_INDEXER_CASE_TILES(128, 64, k, GGML_TYPE_F16, 4)
@@ -887,7 +889,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
             int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
             dim3 grid(num_kv_blocks, n_batch, n_stream);
 
-            const int tiles = ggml_cuda_lid_tiles(n_kv, (int64_t) n_batch*n_stream, ggml_cuda_info().devices[device].nsm);
+            const int tiles = ggml_cuda_lid_tiles(n_kv, (int64_t) n_batch*n_stream, ggml_cuda_info().devices[device].nsm, n_head);
             if (tiles == 4) {
                 dim3 grid_t((n_kv + 4*K_VECS_PER_BLOCK - 1) / (4*K_VECS_PER_BLOCK), n_batch, n_stream);
                 LIGHTNING_INDEXER_CASE_TILES(128, 32, k, GGML_TYPE_F16, 4)

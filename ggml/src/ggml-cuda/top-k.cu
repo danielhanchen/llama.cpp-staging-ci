@@ -641,7 +641,8 @@ static __global__ void __launch_bounds__(BLOCK_SIZE, 1) top_k_radix_one_block(
 // (counts do not depend on the visit order), the same threshold / kept-tie count, and the same gather order (keys above the threshold
 // in column order, then the first kept ties in column order: one block scan of per-thread counts per BLOCK_SIZE*IPT columns), so the
 // output is bitwise that of top_k_radix_one_block / top_k_radix_cuda. The old kernel issued one 4-byte load per thread and step, so a
-// 60k-column decode row (DeepSeek-V4.1 indexer at long context) took ~250 us on one T4 SM. GGML_CUDA_TOPK_ONEBLOCK_V2=0: off.
+// 60k-column decode row (DeepSeek-V4.1 indexer at long context) took ~200 us on one T4 SM. GGML_CUDA_TOPK_ONEBLOCK_V2=0: off (the old
+// kernel up to 65536 columns, as before).
 #ifndef GGML_CUDA_TOP_K_ONE_BLOCK_V2_MAX_NCOLS
 #    define GGML_CUDA_TOP_K_ONE_BLOCK_V2_MAX_NCOLS (1 << 20)
 #endif // GGML_CUDA_TOP_K_ONE_BLOCK_V2_MAX_NCOLS
@@ -892,8 +893,14 @@ static void ggml_cuda_op_top_k_deterministic(ggml_cuda_pool & pool, const float 
 #endif // GGML_CUDA_USE_CUB
 
     // k19: few rows (one wave of blocks): the same selection and order in one launch, see top_k_radix_one_block
+    // k19-dsv4long (Kaggle T4, test-topk-oneblock-exact): one block per row wins up to ~32k columns (v2: 15360 cols 37 us vs 43
+    // multi-block vs 58 old one-block; 30000: 54 / 58 / 105) and for many rows (40 x 60000: 190 / 355 / 308); for 1-2 rows of more
+    // columns the 64-block-per-row multi-block path is faster (60000: 68 vs 96 v2 vs 194 old; 122880: 62 vs 167), so with v2 on, few
+    // long rows go there (before, the old one-block kernel took them up to 65536 columns)
+    const bool one_block_v2 = ggml_cuda_top_k_one_block_v2_enabled();
     if (ggml_cuda_top_k_one_block_enabled() && nrows <= ggml_cuda_info().devices[device].nsm &&
-            ncols <= (ggml_cuda_top_k_one_block_v2_enabled() ? GGML_CUDA_TOP_K_ONE_BLOCK_V2_MAX_NCOLS : GGML_CUDA_TOP_K_ONE_BLOCK_MAX_NCOLS)) {
+            (one_block_v2 ? ncols <= GGML_CUDA_TOP_K_ONE_BLOCK_V2_MAX_NCOLS && (ncols <= 32768 || nrows >= 16)
+                          : ncols <= GGML_CUDA_TOP_K_ONE_BLOCK_MAX_NCOLS)) {
         top_k_radix_one_block_cuda(src0_d, dst_d, ncols, nrows, k, stream);
         return;
     }
