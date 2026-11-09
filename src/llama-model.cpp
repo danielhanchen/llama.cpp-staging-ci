@@ -1376,7 +1376,7 @@ llama_model::~llama_model() {
     if (ple_reader && ple_reader->st.n_calls > 0) {
         const auto & st = ple_reader->st;
         LLAMA_LOG_INFO("%s: PLE prompt reads: %" PRIu64 " ubatches, %" PRIu64 " rows, %" PRIu64 " pages in %" PRIu64 " reads by %d threads, "
-            "%.1f ms in all, %" PRIu64 " errors\n", __func__, st.n_calls.load(), st.n_rows.load(), st.n_pages.load(), st.n_reads.load(),
+            "%.1f ms in the calls, %" PRIu64 " errors\n", __func__, st.n_calls.load(), st.n_rows.load(), st.n_pages.load(), st.n_reads.load(),
             ple_reader->get_n_threads(), st.t_us.load()/1e3, st.n_errors.load());
     }
     ple_reader.reset();
@@ -1394,8 +1394,9 @@ llama_ple_prompt_reader * llama_model::ple_prompt_reader() const {
         }
         ple_reader.reset(llama_ple_prompt_reader_make(t, it->second.fd, it->second.offs));
         if (ple_reader) {
-            LLAMA_LOG_INFO("%s: PLE rows of prompt ubatches (%zu+ rows) are read by %d threads before their gather "
-                "(LLAMA_PLE_PROMPT_READ=0 off)\n", __func__, llama_ple_prompt_read_min_rows(), ple_reader->get_n_threads());
+            LLAMA_LOG_INFO("%s: PLE rows of prompt ubatches (%zu+ rows) are read ahead of their gather by %d threads%s "
+                "(LLAMA_PLE_PROMPT_READ=0 off)\n", __func__, llama_ple_prompt_read_min_rows(), ple_reader->get_n_threads(),
+                getenv("LLAMA_PLE_PROMPT_READ_SYNC") && atoi(getenv("LLAMA_PLE_PROMPT_READ_SYNC")) ? ", waited for (LLAMA_PLE_PROMPT_READ_SYNC)" : "");
         }
     });
     return ple_reader.get();

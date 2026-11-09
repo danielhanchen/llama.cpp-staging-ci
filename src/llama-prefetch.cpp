@@ -409,9 +409,10 @@ llama_ple_prompt_reader::llama_ple_prompt_reader(const ggml_tensor * tensor, int
         page = (size_t) ps;
     }
 #endif
+    sync = getenv("LLAMA_PLE_PROMPT_READ_SYNC") != nullptr && atoi(getenv("LLAMA_PLE_PROMPT_READ_SYNC")) != 0;
     n_threads = std::max(1, std::min(n_threads, 256));
-    workers.reserve(n_threads - 1);
-    for (int i = 1; i < n_threads; ++i) {
+    workers.reserve(n_threads);
+    for (int i = 0; i < n_threads; ++i) {
         workers.emplace_back([this] { worker_main(); });
     }
 }
@@ -420,6 +421,7 @@ llama_ple_prompt_reader::~llama_ple_prompt_reader() {
     {
         std::lock_guard<std::mutex> lock(mtx);
         stop = true;
+        queue.clear();
     }
     cv.notify_all();
     for (auto & w : workers) {
@@ -427,15 +429,21 @@ llama_ple_prompt_reader::~llama_ple_prompt_reader() {
     }
 }
 
-void llama_ple_prompt_reader::work() {
+void llama_ple_prompt_reader::worker_main() {
 #if !defined(_WIN32)
     std::vector<char> buf;
     for (;;) {
-        const size_t i = run_next.fetch_add(1);
-        if (i >= runs.size()) {
-            break;
+        std::pair<uint64_t, uint64_t> r;
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+            cv.wait(lock, [&] { return stop || !queue.empty(); });
+            if (stop) {
+                return;
+            }
+            r = queue.front();
+            queue.pop_front();
+            n_busy++;
         }
-        const auto & r = runs[i];
         if (buf.size() < r.second) {
             buf.resize(r.second);
         }
@@ -444,32 +452,20 @@ void llama_ple_prompt_reader::work() {
         if (n < 0) {
             st.n_errors++;
         }
+        bool drained;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            n_busy--;
+            drained = queue.empty() && n_busy == 0;
+        }
+        if (drained) {
+            cv_done.notify_all();
+        }
     }
 #endif
 }
 
-void llama_ple_prompt_reader::worker_main() {
-    uint64_t seen = 0;
-    for (;;) {
-        {
-            std::unique_lock<std::mutex> lock(mtx);
-            cv.wait(lock, [&] { return stop || phase != seen; });
-            if (stop) {
-                return;
-            }
-            seen = phase;
-        }
-        work();
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            n_active--;
-        }
-        cv_done.notify_all();
-    }
-}
-
 void llama_ple_prompt_reader::read(const int32_t * rows, size_t n) {
-    std::lock_guard<std::mutex> call_lock(call_mtx);
     const int64_t t0 = ggml_time_us();
     // page-aligned file ranges of the rows (the tensor data starts at file_offs; a row may straddle two pages), merged when adjacent
     std::vector<std::pair<uint64_t, uint64_t>> rs;
@@ -506,23 +502,17 @@ void llama_ple_prompt_reader::read(const int32_t * rows, size_t n) {
         rs[m++] = r;
     }
     rs.resize(m);
-    for (auto & r : rs) {
-        n_pages += (r.second - r.first) / page;
-        r.second -= r.first; // (offset, length)
-    }
     {
         std::lock_guard<std::mutex> lock(mtx);
-        runs = std::move(rs);
-        run_next = 0;
-        n_active = (int) workers.size();
-        phase++;
+        for (const auto & r : rs) {
+            n_pages += (r.second - r.first) / page;
+            queue.emplace_back(r.first, r.second - r.first);
+        }
     }
     cv.notify_all();
-    work();
-    {
+    if (sync) {
         std::unique_lock<std::mutex> lock(mtx);
-        cv_done.wait(lock, [&] { return n_active == 0; });
-        runs.clear();
+        cv_done.wait(lock, [&] { return stop || (queue.empty() && n_busy == 0); });
     }
     st.n_calls++;
     st.n_rows  += n;

@@ -98,34 +98,36 @@ int  llama_prefetch_reopen_fd(int fd, size_t offs, size_t size);
 void llama_prefetch_close_fd(int fd);
 
 // k19-disktt: the pages a prompt ubatch gathers from a lazily mapped table on a disk (the Flash-Next PLE table, 16 rows of 90 bytes on
-// 16 random pages per token), read before the gather by a pool of threads with buffered preads (the page cache then serves the gather's
-// faults). The gather of a lazy MADV_RANDOM mapping faults one 4 KiB page at a time on its threads, and the WILLNEED hint is dropped when
-// the kernel finds no free page cache for it, so a prompt read ~100k pages at the queue depth of the CPU threads (an 8k prompt on a
-// model larger than RAM: 400 MB in ~35 s on a Colab A100 40 GB VM). Nothing is written to the mapping and the gather reads the same
-// bytes, so the outputs cannot change.
+// 16 random pages per token), read by a pool of threads with buffered preads as soon as set_input knows the rows; the call returns at
+// once and the graph's gather finds the pages read or in flight (a fault on a page under read waits for that read). The gather of a
+// lazy MADV_RANDOM mapping alone faults one 4 KiB page at a time per thread, and MADV_WILLNEED reads synchronously on some disk stacks
+// (Colab: 2.5k pages/s, ~36 s for the ~100k pages of an 8k prompt). The pool keeps up to its thread count of reads in flight (a cloud
+// disk caps random reads at ~3.3k/s, so that buys ~1.35x there). Not blocking keeps other disk work (the weight store's expert reads)
+// running beside the reads: a blocking variant (LLAMA_PLE_PROMPT_READ_SYNC=1) cost L4 fn4nd 8k +29 s. Nothing is written to the mapping
+// and the gather reads the same bytes, so the outputs cannot change.
 struct llama_ple_prompt_reader {
     struct stats {
         std::atomic<uint64_t> n_calls {0};
         std::atomic<uint64_t> n_rows  {0};
-        std::atomic<uint64_t> n_pages {0}; // pages read (runs of adjacent pages are read whole)
-        std::atomic<uint64_t> n_reads {0}; // pread calls
+        std::atomic<uint64_t> n_pages {0}; // pages submitted (runs of adjacent pages are read whole)
+        std::atomic<uint64_t> n_reads {0}; // pread calls done
         std::atomic<uint64_t> n_errors{0};
-        std::atomic<uint64_t> t_us    {0}; // wall time of read(), summed
+        std::atomic<uint64_t> t_us    {0}; // time spent in submit() (with LLAMA_PLE_PROMPT_READ_SYNC=1: until the reads are done)
     };
 
     // fd: buffered descriptor of the file holding the tensor (not owned); file_offs: offset of tensor->data in that file
     llama_ple_prompt_reader(const ggml_tensor * tensor, int fd, size_t file_offs, int n_threads);
     ~llama_ple_prompt_reader();
 
-    // reads the pages of the given rows (negative or out of range ids skipped), returns when all reads are done
+    // queues reads of the pages of the given rows (negative or out of range ids skipped) and returns (waits for them with
+    // LLAMA_PLE_PROMPT_READ_SYNC=1)
     void read(const int32_t * rows, size_t n_rows);
 
-    int get_n_threads() const { return (int) workers.size() + 1; }
+    int get_n_threads() const { return (int) workers.size(); }
 
     stats st;
 
 private:
-    void work();
     void worker_main();
 
     const char * data;
@@ -135,17 +137,14 @@ private:
     size_t       page = 4096;
     int          fd;
     size_t       file_offs;
-
-    std::vector<std::pair<uint64_t, uint64_t>> runs; // [file offset, length) of the current call
-    std::atomic<size_t> run_next {0};
+    bool         sync = false;
 
     std::mutex              mtx;
-    std::condition_variable cv;
-    std::condition_variable cv_done;
-    uint64_t                phase    = 0;
-    int                     n_active = 0;
-    bool                    stop     = false;
-    std::mutex              call_mtx; // one read() at a time (contexts sharing the model)
+    std::condition_variable cv;      // workers: a run was queued
+    std::condition_variable cv_done; // sync callers: the queue drained
+    std::deque<std::pair<uint64_t, uint64_t>> queue; // (file offset, length) of runs not started yet
+    int                     n_busy = 0;
+    bool                    stop   = false;
     std::vector<std::thread> workers;
 };
 
