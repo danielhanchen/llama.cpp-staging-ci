@@ -639,6 +639,109 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     return 1;
 }
 
+// k19-q38t: the IQ3_S / IQ3_XXS grid tables (2 / 1 KiB) in shared memory for the dense mul_mat_vec_q. Each lane looks up 8 grid
+// entries per 32 weights at random indices; from the global table a warp's lookup touches ~14 of the 16 cache lines of iq3s_grid
+// (one L1 wavefront each), from shared memory it costs the bank conflicts of 32 random words (~3-4). On a T4 a 1-column IQ3_S
+// product ran at ~104 GB/s against ~258 GB/s for IQ4_XS (k19-mmvqcols micro-bench), i.e. bound by these lookups. The table
+// values, the int arithmetic and the float expressions are those of vec_dot_iq3_s_q8_1 / vec_dot_iq3_xxs_q8_1 (vecdotq.cuh),
+// only the table the entries come from differs, so every output keeps its bytes. GGML_CUDA_MMVQ_GRID_SMEM=0: the global tables
+// (set per device in ggml_backend_cuda_init, ggml_cuda_mmvq_grid_init)
+static __device__ int mmvq_grid_smem_off = 0;
+
+void ggml_cuda_mmvq_grid_init(int device);
+
+void ggml_cuda_mmvq_grid_init(int device) {
+    const char * e = getenv("GGML_CUDA_MMVQ_GRID_SMEM");
+    if (e != nullptr && atoi(e) == 0) {
+        const int off = 1;
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaMemcpyToSymbol(mmvq_grid_smem_off, &off, sizeof(off)));
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_INFO("%s: GGML_CUDA_MMVQ_GRID_SMEM=0: IQ3_S / IQ3_XXS mat-vec grid lookups from the global tables\n", __func__);
+        }
+    }
+}
+
+static constexpr __host__ __device__ int mmvq_grid_smem_n(ggml_type type) {
+    return type == GGML_TYPE_IQ3_S ? 512 : type == GGML_TYPE_IQ3_XXS ? 256 : 0;
+}
+
+static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_grid(const uint32_t * grid,
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_iq3_s * bq3 = (const block_iq3_s *) vbq + kbx;
+
+    const int2      qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+    const int qh = bq3->qh[iqs/2];
+
+    const int       signs_packed_32 = get_int_b2(bq3->signs, iqs/2);
+    const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
+
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos = make_int2(
+            grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+            grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+
+        const int sb0 = ((signs_packed_8[l0/2] & 0x0F) * 0x00204081) & 0x01010101;
+        const int sb1 = ((signs_packed_8[l0/2] >>   4) * 0x00204081) & 0x01010101;
+
+        const int grid_l = (grid_pos.x ^ (sb0 * 0xFF)) + sb0;
+        const int grid_h = (grid_pos.y ^ (sb1 * 0xFF)) + sb1;
+
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+
+        sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
+        sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
+    }
+
+    sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+
+    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+
+static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_grid(const uint32_t * grid,
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vbq + kbx;
+
+    const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs+1));
+    const uint8_t * q3 = (const uint8_t *) &q3_packed;
+    const uint32_t aux32 = get_int_b2(bq3->qs, QK_K/16 + iqs/2);
+
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos = make_int2(grid[q3[l0 + 0]], grid[q3[l0 + 1]]);
+        const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
+
+        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+
+        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+
+        sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
+        sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
+    }
+
+    const int ls = aux32 >> 28;
+    sumi = (ls*sumi + sumi/2)/2;
+    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+
 // k19-dsv4p (GGML_CUDA_MMVQ_IQ_TAB): IQ1_S / IQ2_XXS single column mat-vec with the codebook in shared memory. Each vec_dot of these
 // types gathers 4 codebook entries at random indices; from global memory (L1) a warp-wide gather of 32 random entries of the 8 KB
 // IQ1_S grid touches ~25 cache lines and is replayed per line, from shared memory it costs a few bank conflicts. The entries and the
@@ -713,16 +816,26 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1_tab(
     return d * sumi;
 }
 
-// the vec_dot of the kernel: with c_tab the shared memory codebook variant of the type, else vec_dot_q_cuda
+// the vec_dot of the kernel: with c_tab the shared memory codebook variant of an mmvq_tab_type (k19-dsv4p), the IQ3_S / IQ3_XXS
+// grid through grid (k19-q38t: shared memory, or the global table under GGML_CUDA_MMVQ_GRID_SMEM=0), else vec_dot_q_cuda
 template <ggml_type type, bool c_tab>
-static __device__ __forceinline__ float mmvq_vec_dot(
-        const void * tab, const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const int kbx, const int kqs) {
+static __device__ __forceinline__ float mmvq_vec_dot(const void * tab, const uint32_t * grid,
+        const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const int kbx, const int kqs) {
     if constexpr (c_tab && type == GGML_TYPE_IQ1_S) {
+        GGML_UNUSED(grid);
         return vec_dot_iq1_s_q8_1_tab((const uint32_t *) tab, vx, y, kbx, kqs);
     } else if constexpr (c_tab && type == GGML_TYPE_IQ2_XXS) {
+        GGML_UNUSED(grid);
         return vec_dot_iq2_xxs_q8_1_tab((const uint2 *) tab, vx, y, kbx, kqs);
+    } else if constexpr (type == GGML_TYPE_IQ3_S) {
+        GGML_UNUSED(tab);
+        return vec_dot_iq3_s_q8_1_grid(grid, vx, y, kbx, kqs);
+    } else if constexpr (type == GGML_TYPE_IQ3_XXS) {
+        GGML_UNUSED(tab);
+        return vec_dot_iq3_xxs_q8_1_grid(grid, vx, y, kbx, kqs);
     } else {
         GGML_UNUSED(tab);
+        GGML_UNUSED(grid);
         constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
         return vec_dot_q_cuda(vx, y, kbx, kqs);
     }
@@ -756,8 +869,6 @@ static __global__ void mul_mat_vec_q(
     // c_rpb > 0 overrides the rows per block: a row's sum does not depend on it (the K split and the reduction are per row)
     constexpr int rows_per_cuda_block = c_rpb > 0 ? c_rpb : calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
               int row0 = rows_per_cuda_block*blockIdx.x;
@@ -944,6 +1055,22 @@ static __global__ void mul_mat_vec_q(
         vy = y_ew;
     }
 
+    // k19-q38t: grid table in shared memory (see mmvq_grid_smem_off)
+    constexpr int grid_n = mmvq_grid_smem_n(type);
+    __shared__ uint32_t grid_sm[grid_n > 0 ? grid_n : 1];
+    const uint32_t * grid = grid_sm;
+    if constexpr (grid_n > 0) {
+        const uint32_t * grid_g = type == GGML_TYPE_IQ3_S ? iq3s_grid : iq3xxs_grid;
+        if (mmvq_grid_smem_off) {
+            grid = grid_g;
+        } else {
+            for (int e = tid; e < grid_n; e += nwarps*warp_size) {
+                grid_sm[e] = grid_g[e];
+            }
+            __syncthreads();
+        }
+    }
+
     // partial sum for each thread
     float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
     float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
@@ -985,11 +1112,11 @@ static __global__ void mul_mat_vec_q(
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += mmvq_vec_dot<type, use_tab>(tab,
+                tmp[j][i] += mmvq_vec_dot<type, use_tab>(tab, grid,
                     vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        tmp_gate[j][i] += mmvq_vec_dot<type, use_tab>(tab,
+                        tmp_gate[j][i] += mmvq_vec_dot<type, use_tab>(tab, grid,
                             vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                     }
                 }
@@ -1028,11 +1155,11 @@ static __global__ void mul_mat_vec_q(
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += mmvq_vec_dot<type, use_tab>(tab,
+                tmp[j][i] += mmvq_vec_dot<type, use_tab>(tab, grid,
                     vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        tmp_gate[j][i] += mmvq_vec_dot<type, use_tab>(tab,
+                        tmp_gate[j][i] += mmvq_vec_dot<type, use_tab>(tab, grid,
                             vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                     }
                 }

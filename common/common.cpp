@@ -3519,6 +3519,109 @@ uma_restart:
                 moe_gain_mtp_trial = true;
             }
         }
+        // k19-q38t: before the rule below drops a separate MTP drafter that pushes layers of a dense target to a host with few threads,
+        // the drafter is fitted again squeezed: its context reads the prompt in ubatches of LLAMA_FIT_DRAFT_SQUEEZE_UB (256) tokens (its
+        // compute buffer scales with its ubatch: one block, 569 MiB at -ub 2048 for Qwen3.8-27B's MTP GGUF; it only fills its KV from
+        // the target's rows, a few percent of the prompt time) and, where that alone does not keep every layer, beside a margin of
+        // LLAMA_FIT_DRAFT_SQUEEZE_MARGIN_MIB (512, the floor Studio keeps on every card) instead of the default 1024 (not below a
+        // --fit-target given). The first that keeps every target layer on the device is taken; otherwise the rule below decides as
+        // before. Kaggle T4, Qwen3.8-27B UD-Q3_K_XL + its MTP GGUF, ctx 16384: the drafter stays with every layer on the device
+        // instead of being dropped. Drafting changes the text as on any GPU where the drafter fits (the exact contract,
+        // LLAMA_MTP_EXACT=1 GGML_CUDA_VERIFY_REASSOC=0, keeps the no-draft text). LLAMA_FIT_DRAFT_SQUEEZE=0: off
+        bool draft_squeezed = false;
+        {
+            const char * e_sq = getenv("LLAMA_FIT_DRAFT_SQUEEZE");
+            const char * e_sd = getenv("LLAMA_FIT_DRAFT_SPILL_DROP");
+            const char * e_st = getenv("LLAMA_FIT_DRAFT_SPILL_MIN_THREADS");
+            const char * e_ub = getenv("LLAMA_FIT_DRAFT_SQUEEZE_UB");
+            const char * e_mm = getenv("LLAMA_FIT_DRAFT_SQUEEZE_MARGIN_MIB");
+            const int     min_threads = e_st != nullptr ? std::max(0, atoi(e_st)) : 8;
+            const int32_t n_threads   = params.cpuparams.n_threads;
+            const uint32_t sq_ub      = e_ub != nullptr ? (uint32_t) std::max(1, atoi(e_ub)) : 256u;
+            const size_t   sq_margin  = (size_t) (e_mm != nullptr ? std::max(0, atoi(e_mm)) : 512) * 1024 * 1024;
+            if ((e_sq == nullptr || atoi(e_sq) != 0) && (e_sd == nullptr || atoi(e_sd) != 0) && has_draft && spec_mtp && !draft_off &&
+                    !params.speculative.draft.fit_off && params.speculative.draft.fit_can_drop && params.speculative.draft.n_ubatch <= 0 &&
+                    fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS &&
+                    mparams.n_gpu_layers != llama_model_default_params().n_gpu_layers &&
+                    mparams_in.n_gpu_layers == llama_model_default_params().n_gpu_layers &&
+                    n_threads > 0 && n_threads < min_threads && [&] {
+                        std::vector<uint8_t> exps;
+                        return common_model_n_layer(params.model.path, exps) > 0 && !exps.empty() &&
+                            std::all_of(exps.begin(), exps.end(), [](uint8_t x) { return x == 0; });
+                    }()) {
+                llama_context_params cp_dft_sq = cparams_dft;
+                cp_dft_sq.n_ubatch = std::min(cp_dft_sq.n_ubatch, sq_ub);
+                common_fit_extra_model extra_sq = extra;
+                extra_sq.cparams = &cp_dft_sq;
+                const int32_t ngl_spilled = mparams.n_gpu_layers;
+                for (int step = 0; step < 2; ++step) {
+                    std::vector<size_t> mg = margins_in;
+                    if (step == 1) {
+                        if (params.fit_params_target_set) {
+                            break;
+                        }
+                        bool lower = false;
+                        for (auto & m : mg) {
+                            if (m > sq_margin) {
+                                m = sq_margin;
+                                lower = true;
+                            }
+                        }
+                        if (!lower) {
+                            break;
+                        }
+                    }
+                    llama_model_params   mp = mparams_in;
+                    llama_context_params cp = cparams_in;
+                    std::vector<float>   ts = ts_in;
+                    std::vector<llama_model_tensor_buft_override> tbo = tbo_in;
+                    mp.tensor_split = ts.data();
+                    if (mparams_in.tensor_buft_overrides == params.tensor_buft_overrides.data()) {
+                        mp.tensor_buft_overrides = tbo.data();
+                    }
+                    common_fit_set_moe_margin_auto(!params.fit_params_target_set);
+                    const common_params_fit_status st = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(),
+                        tbo.empty() ? nullptr : tbo.data(), mg.data(), params.fit_params_min_ctx, &extra_sq, fit_log_level, params.fit_kv_resident);
+                    // every layer on the device: the fit leaves -ngl at its default ("no changes needed") or sets it to all of them
+                    // (trunk + output, the target's NextN block is not loaded beside -md) without moving tensors to the host
+                    const auto n_tbo = [](const std::vector<llama_model_tensor_buft_override> & v) {
+                        size_t n = 0;
+                        for (const auto & o : v) {
+                            if (o.pattern == nullptr) {
+                                break;
+                            }
+                            n++;
+                        }
+                        return n;
+                    };
+                    std::vector<uint8_t> exps_sq;
+                    const int64_t n_layer_sq = common_model_n_layer(params.model.path, exps_sq);
+                    const int64_t n_nextn_sq = std::max<int64_t>(0, common_gguf_u32(params.model.path, "nextn_predict_layers"));
+                    const bool all_dev = mp.n_gpu_layers == llama_model_default_params().n_gpu_layers ||
+                        (n_layer_sq > 0 && mp.n_gpu_layers >= n_layer_sq + 1 - (mp.load_mtp ? 0 : n_nextn_sq) && n_tbo(tbo) == n_tbo(tbo_in));
+                    if (st == COMMON_PARAMS_FIT_STATUS_SUCCESS && all_dev) {
+                        COM_WRN("%s: --fit: k19-q38t: the MTP drafter stays with every layer on the device (-ngl %d with tensors on the host before): "
+                            "its context reads the prompt in ubatches of %u tokens%s (LLAMA_FIT_DRAFT_SQUEEZE=0 off)\n", __func__, ngl_spilled,
+                            cp_dft_sq.n_ubatch, step == 1 ? ", beside a smaller device margin" : "");
+                        std::copy(ts.begin(), ts.end(), params.tensor_split);
+                        std::copy(tbo.begin(), tbo.end(), params.tensor_buft_overrides.begin());
+                        params.fit_params_target = mg;
+                        const bool tbo_ours = mp.tensor_buft_overrides != nullptr && mp.tensor_buft_overrides == tbo.data();
+                        mparams = mp;
+                        cparams = cp;
+                        mparams.tensor_split = params.tensor_split;
+                        if (tbo_ours) {
+                            mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
+                        }
+                        fit_status = st;
+                        params.speculative.draft.n_ubatch = (int32_t) cp_dft_sq.n_ubatch;
+                        cparams_dft.n_ubatch = cp_dft_sq.n_ubatch;
+                        draft_squeezed = true;
+                        break;
+                    }
+                }
+            }
+        }
         // k19-q38d: the k15-small4 rule above for a separate draft model (-md: an MTP head GGUF, a DFlash / EAGLE drafter, a small model)
         // fitted beside a target without a MoE cache, on a host with few threads. Where the drafter's weights, context and verify buffers
         // push whole target layers to the CPU, every token and every verify row runs those layers on the host's few threads: Kaggle T4
@@ -3532,7 +3635,7 @@ uma_restart:
             const char * e_st = getenv("LLAMA_FIT_DRAFT_SPILL_MIN_THREADS");
             const int    min_threads = e_st != nullptr ? std::max(0, atoi(e_st)) : 8;
             const int32_t n_threads  = params.cpuparams.n_threads;
-            if ((e_sd == nullptr || atoi(e_sd) != 0) && has_draft && !draft_off && !params.speculative.draft.fit_off &&
+            if ((e_sd == nullptr || atoi(e_sd) != 0) && has_draft && !draft_off && !params.speculative.draft.fit_off && !draft_squeezed &&
                     params.speculative.draft.fit_can_drop && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS &&
                     mparams.n_gpu_layers != llama_model_default_params().n_gpu_layers &&
                     mparams_in.n_gpu_layers == llama_model_default_params().n_gpu_layers &&
@@ -4809,6 +4912,24 @@ static struct llama_model_params common_model_params_to_llama_impl(common_params
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    // k19-q38t: with a separate MTP drafter (-md + draft-mtp) the draft context runs on the drafter's own NextN block and draft head
+    // (common_speculative_init_result), so the target's NextN layers and the restricted draft head built from them were loaded for
+    // nothing: Qwen3.8-27B UD-Q3_K_XL on a T4, 569 MiB of device memory (12240 vs 11671 MiB of weights), enough to push 6 of 66 layers
+    // to the host and drop the drafter there. The target is loaded without them (the drafter's file loads its own: its path is the
+    // model path of the draft params). The target graph never reads them, so its text is unchanged.
+    // LLAMA_MTP_MD_TARGET_NEXTN=1: load them as before
+    if (mparams.load_mtp && !params.load_mtp && params.speculative.has_dft() && params.model.path != params.speculative.draft.mparams.path) {
+        static const bool keep = getenv("LLAMA_MTP_MD_TARGET_NEXTN") != nullptr && atoi(getenv("LLAMA_MTP_MD_TARGET_NEXTN")) != 0;
+        if (!keep) {
+            mparams.load_mtp = false;
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                COM_INF("k19-q38t: the target's own NextN layers are not loaded: the MTP drafter is '%s' (LLAMA_MTP_MD_TARGET_NEXTN=1 "
+                    "loads them)\n", params.speculative.draft.mparams.path.c_str());
+            }
+        }
+    }
     mparams.mtp_borrow_io               = params.mtp_borrow_io;
 
     return mparams;

@@ -12474,11 +12474,16 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
     return &reg;
 }
 
+// k19-q38t (mmvq.cu): applies GGML_CUDA_MMVQ_GRID_SMEM=0 to the device
+void ggml_cuda_mmvq_grid_init(int device);
+
 ggml_backend_t ggml_backend_cuda_init(int device) {
     if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
         GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
         return nullptr;
     }
+
+    ggml_cuda_mmvq_grid_init(device); // k19-q38t: GGML_CUDA_MMVQ_GRID_SMEM (mmvq.cu)
 
     ggml_backend_cuda_context * ctx = new ggml_backend_cuda_context(device);
     if (ctx == nullptr) {
