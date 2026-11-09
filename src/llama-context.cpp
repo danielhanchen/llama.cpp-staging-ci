@@ -1338,7 +1338,8 @@ llama_context::llama_context(
                     const size_t limit = admit ? table : part;
                     const bool partial = !admit;
                     std::atomic<bool> * whole_done = &model.ple_table_resident;
-                    auto work = [t, table, limit, partial, fd, offs, tname, stop, whole_done](bool background) {
+                    ple_res_runner * pr = &ple_res;
+                    auto work = [t, table, limit, partial, fd, offs, tname, stop, whole_done, pr](bool background) {
                         const int64_t t0 = ggml_time_us();
                         if (background) {
                             // idle I/O class (a request's own reads go first) and the lowest CPU priority, this thread only
@@ -1358,6 +1359,15 @@ llama_context::llama_context(
                         std::atomic<bool>   pop_ok_a {true};
                         std::atomic<size_t> next {0};
                         std::atomic<size_t> done_a {0};
+                        // k19-disktt: a part read is activated (each chunk is read twice: pages accessed twice go to the active list, while
+                        // the second copies a loop-device / overlay stack keeps of the same reads were accessed once and are reclaimed
+                        // first; LLAMA_PLE_RESIDENT_PARTIAL_ACTIVATE=0 off), and read in LLAMA_PLE_RESIDENT_PARTIAL_PASSES (2) passes: a later
+                        // pass reads back what the page cache gave up during the earlier one (Colab A100 VM: 19.2 GiB read, ~half of it
+                        // gone again by the first 8k prompt)
+                        static const bool act_env = getenv("LLAMA_PLE_RESIDENT_PARTIAL_ACTIVATE") == nullptr || atoi(getenv("LLAMA_PLE_RESIDENT_PARTIAL_ACTIVATE")) != 0;
+                        const bool activate = partial && act_env;
+                        std::atomic<size_t> evicted_a {0}; // pages a later pass found missing (mincore)
+                        int pass = 0;
                         auto run = [&]() {
                             std::vector<uint8_t> rbuf(fd >= 0 ? chunk : 0);
                             for (;;) {
@@ -1373,15 +1383,27 @@ llama_context::llama_context(
                                     break;
                                 }
                                 const size_t n = std::min(chunk, len - o);
-                                if (fd >= 0 && o + n > lead) {
-                                    const size_t skip = o < lead ? lead - o : 0;
-                                    size_t fo = offs + (o + skip - lead), left = n - skip;
-                                    while (left > 0) {
-                                        const ssize_t r = pread(fd, rbuf.data(), left, (off_t) fo);
-                                        if (r <= 0) {
-                                            break;
+                                if (pass > 0) {
+                                    std::vector<unsigned char> mv((n + pg - 1)/pg);
+                                    if (mincore(a0 + o, n, mv.data()) == 0) {
+                                        size_t miss = 0;
+                                        for (unsigned char c : mv) {
+                                            miss += !(c & 1);
                                         }
-                                        fo += (size_t) r; left -= (size_t) r;
+                                        evicted_a += miss;
+                                    }
+                                }
+                                for (int rep = 0; rep < (activate ? 2 : 1); ++rep) {
+                                    if (fd >= 0 && o + n > lead) {
+                                        const size_t skip = o < lead ? lead - o : 0;
+                                        size_t fo = offs + (o + skip - lead), left = n - skip;
+                                        while (left > 0) {
+                                            const ssize_t r = pread(fd, rbuf.data(), left, (off_t) fo);
+                                            if (r <= 0) {
+                                                break;
+                                            }
+                                            fo += (size_t) r; left -= (size_t) r;
+                                        }
                                     }
                                 }
                                 if (pop_ok_a.load() && madvise(a0 + o, n, 22 /* MADV_POPULATE_READ, Linux 5.14 */) != 0) {
@@ -1394,7 +1416,9 @@ llama_context::llama_context(
                                     }
                                     (void) sink;
                                 }
-                                done_a += n;
+                                if (pass == 0) {
+                                    done_a += n;
+                                }
                             }
                         };
                         // k19-disktt: a read during the load runs on LLAMA_PLE_RESIDENT_THREADS (4) threads over disjoint chunks (a cloud disk
@@ -1403,7 +1427,11 @@ llama_context::llama_context(
                         if (!background) {
                             n_thr = getenv("LLAMA_PLE_RESIDENT_THREADS") ? std::max(1, atoi(getenv("LLAMA_PLE_RESIDENT_THREADS"))) : 4;
                         }
-                        {
+                        static const int passes_env = getenv("LLAMA_PLE_RESIDENT_PARTIAL_PASSES") ? std::max(1, atoi(getenv("LLAMA_PLE_RESIDENT_PARTIAL_PASSES"))) : 2;
+                        const int n_pass = partial ? passes_env : 1;
+                        double t_pass1 = 0.0;
+                        for (pass = 0; pass < n_pass && !stop->load(std::memory_order_relaxed); ++pass) {
+                            next = 0;
                             std::vector<std::thread> thr;
                             for (int i = 1; i < n_thr; ++i) {
                                 thr.emplace_back(run);
@@ -1411,6 +1439,9 @@ llama_context::llama_context(
                             run();
                             for (auto & th : thr) {
                                 th.join();
+                            }
+                            if (pass == 0) {
+                                t_pass1 = (ggml_time_us() - t0)/1e6;
                             }
                         }
                         const bool   pop_ok = pop_ok_a.load();
@@ -1421,9 +1452,40 @@ llama_context::llama_context(
                         }
                         const double t_read = (ggml_time_us() - t0)/1e6;
                         if (partial) {
-                            LLAMA_LOG_INFO("%s: PLE table '%s': %.1f of %.1f GiB read into the page cache in %.1f s%s (populate %s), not locked\n",
+                            // LLAMA_PLE_RESIDENT_PARTIAL_PIN=1: the part is pinned through the first GPU backend's host registration (the
+                            // pages the page cache would otherwise give up first: they were read once, before the drafter and the
+                            // requests read theirs); off by default, as pinned pages cannot be reclaimed when the process grows
+                            static const bool pin_env = getenv("LLAMA_PLE_RESIDENT_PARTIAL_PIN") != nullptr && atoi(getenv("LLAMA_PLE_RESIDENT_PARTIAL_PIN")) != 0;
+                            const char * pin_res = "";
+                            if (pin_env) {
+                                pin_res = ", pin failed";
+                                using host_map_t   = void * (*)(ggml_backend_dev_t, void *, size_t, bool *);
+                                using host_unmap_t = void (*)(void *);
+                                for (size_t di = 0; di < ggml_backend_dev_count(); ++di) {
+                                    ggml_backend_dev_t dev = ggml_backend_dev_get(di);
+                                    if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                                        continue;
+                                    }
+                                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                                    auto hmap   = (host_map_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_map");
+                                    auto hunmap = (host_unmap_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_unmap");
+                                    if (hmap == nullptr || hunmap == nullptr) {
+                                        continue;
+                                    }
+                                    bool registered = false;
+                                    if (hmap(dev, a0, len, &registered) != nullptr && registered) {
+                                        pr->pin_addr  = a0;
+                                        pr->pin_unmap = hunmap;
+                                        pin_res = ", pinned";
+                                    }
+                                    break;
+                                }
+                            }
+                            LLAMA_LOG_INFO("%s: PLE table '%s': %.1f of %.1f GiB read into the page cache in %.1f s%s (populate %s), not locked%s; "
+                                "%d passes (the first %.1f s), %.2f GiB found evicted by the later ones%s\n",
                                 __func__, tname.c_str(), len/1073741824.0, table/1073741824.0, t_read, background ? " in the background" : "",
-                                pop_ok ? "ok" : "by touch");
+                                pop_ok ? "ok" : "by touch", pin_res, n_pass, t_pass1, evicted_a.load()*(double) pg/1073741824.0,
+                                activate ? ", activated" : "");
                             return;
                         }
                         struct rlimit rl;
