@@ -143,13 +143,26 @@ static bool concat_transposed_enabled() {
     return enabled;
 }
 
+// k19-q4xt (GGML_CUDA_CONCAT_TRANSPOSED_MIN, default 2; 32 = as before): the fewest src1 columns (tokens) the tile kernel takes. A
+// speculative verify window (2..8 tokens) of a GDN layer concatenated its conv state through the generic kernel: one 256-thread block
+// per channel (8192 for Qwen3.6-35B-A3B) for 6 values each, ~40 us per layer on a T4, ~1.2 ms per 3-token verify pass. The tile
+// kernel masks the tokens past ne10 (its loops already guard token < ne10); a pure copy either way, so the bytes are the same.
+static int64_t concat_transposed_min_tokens() {
+    static const int64_t v = []() -> int64_t {
+        const char * env = getenv("GGML_CUDA_CONCAT_TRANSPOSED_MIN");
+        const int n = env != nullptr ? atoi(env) : 2;
+        return n >= 1 ? n : 2;
+    }();
+    return v;
+}
+
 // shape gate (any arch): dim 0, every tensor 3D (ne3 == 1), src0 and dst with contiguous rows, src1 the transpose of a
-// tensor with contiguous rows (channels contiguous, tokens strided), at least 32 src1 columns (tokens)
+// tensor with contiguous rows (channels contiguous, tokens strided), at least concat_transposed_min_tokens() src1 columns (tokens)
 template <typename T>
 static bool concat_transposed_src1_dim0_ok(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int dim) {
     return dim == 0 && concat_transposed_enabled() &&
         src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1 &&
-        src1->ne[0] >= 32 &&
+        src1->ne[0] >= concat_transposed_min_tokens() &&
         src0->ne[1] == src1->ne[1] && src0->ne[2] == src1->ne[2] && src1->ne[2] <= 65535 &&
         src0->nb[0] == sizeof(T) && dst->nb[0] == sizeof(T) &&
         src1->nb[1] == sizeof(T) && src1->nb[0] >= (size_t) src1->ne[1]*sizeof(T) &&

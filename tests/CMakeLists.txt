@@ -434,6 +434,8 @@ llama_build_and_test(test-mmvqcols-exact.cpp LINK ggml)
 llama_build_and_test(test-iqsmem-exact.cpp LINK ggml)
 # k19-exactdet: single column MUL_MAT_ID with a partial last row block stays inside its expert's rows (sentinel, CPU reference, repeat bytes; SKIP without a CUDA device)
 llama_build_and_test(test-mmid-tail.cpp LINK ggml)
+# k19-q4xt: single token MUL_MAT_ID warp per row launch (short K-quant / IQ4 expert rows) vs the launch it replaces, byte for byte (SKIP without a CUDA device)
+llama_build_and_test(test-q4xt-exact.cpp LINK ggml)
 llama_build_and_test(test-spec-type-gguf.cpp)
 # the build identity of the MoE CPU-miss calibration key: unknown-commit builds differ by content, a relaunch keeps its identity
 llama_build_and_test(test-cal-build-id.cpp LINK ggml)

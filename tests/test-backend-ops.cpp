@@ -13522,6 +13522,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256,  8, 512, 1}, 256, GGML_ROPE_TYPE_NEOX,   512, 1.0f, 0.0f, 1.0f, false, 0, true)); // gemma4 E2B sliding
     test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {512,  8, 512, 1}, 128, GGML_ROPE_TYPE_NEOX,   512, 1.0f, 0.0f, 1.0f, true,  0, true)); // gemma4 E4B global
 
+    // k19-q4xt: the GDN conv state concat of a speculative verify window (2..8 tokens, transposed src1) and around the tile kernel's
+    // token gate (GGML_CUDA_CONCAT_TRANSPOSED_MIN, default 2), Qwen3.6-35B-A3B (8192 channels) and odd channel counts
+    for (int64_t ch : { 8192, 6144, 100 }) {
+        for (int64_t n_tok : { 1, 2, 3, 4, 5, 8, 31, 33 }) {
+            test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, ch, 1, 1}, n_tok, 0, 16));
+        }
+    }
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F16, {3, 8192, 1, 1}, 3, 0, 16));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 2, 1}, 3, 0, 16));
+
     for (int v : { 0, 1, 2, 3 }) {
         for (int dim : { 0, 1, 2, 3, }) {
             test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {11, 12, 13, 14}, 7, dim, v));

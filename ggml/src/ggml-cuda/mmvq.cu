@@ -949,7 +949,9 @@ static __device__ __forceinline__ float mmvq_vec_dot(const void * tab, const uin
 // c_unroll > 1: the K loop unrolled c_unroll times, so that a thread has the weight loads of several iterations in flight (few rows,
 // long K: the grid covers few SMs and waits on memory latency); every thread adds its blocks in the same order, so the bytes are the same
 // c_tab: the codebook of an mmvq_tab_type in shared memory (k19-dsv4p, mmvq_vec_dot)
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int c_nwarps = 0, int n_multi = 0, int c_rpb = 0, int c_unroll = 1, bool c_ewq = false, bool c_tab = false>
+// c_wpr (k19-q4xt): every warp of the block is a block of its own (one warp, c_rpb rows): warp w takes rows
+// c_rpb*(c_wpr*blockIdx.x + w), no shared memory reduction (c_nwarps = c_wpr warps per block, single column only)
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int c_nwarps = 0, int n_multi = 0, int c_rpb = 0, int c_unroll = 1, bool c_ewq = false, bool c_tab = false, int c_wpr = 0>
 __launch_bounds__((c_nwarps > 0 ? c_nwarps : calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters))*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -971,11 +973,16 @@ static __global__ void mul_mat_vec_q(
     // c_rpb > 0 overrides the rows per block: a row's sum does not depend on it (the K split and the reduction are per row)
     constexpr int rows_per_cuda_block = c_rpb > 0 ? c_rpb : calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr bool wpr = c_wpr > 0;
+    static_assert(!wpr || (ncols_dst == 1 && c_nwarps == c_wpr && n_multi == 0 && !c_ewq && !c_tab && mmvq_grid_smem_n(type) == 0),
+        "c_wpr: single column, plain types");
+    // the warps whose partial sums are reduced together (c_wpr: each warp alone)
+    constexpr int nwarps_red = wpr ? 1 : nwarps;
 
-    const     int tid = warp_size*threadIdx.y + threadIdx.x;
-              int row0 = rows_per_cuda_block*blockIdx.x;
+    const     int tid = wpr ? (int) threadIdx.x : warp_size*threadIdx.y + threadIdx.x;
+              int row0 = wpr ? rows_per_cuda_block*(c_wpr*blockIdx.x + threadIdx.y) : rows_per_cuda_block*blockIdx.x;
     const     int blocks_per_row_x = ncols_x / qk;
-    constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+    constexpr int blocks_per_iter = vdr * nwarps_red*warp_size / qi;
 
     // k19-dsv4p: the codebook into shared memory (constant data: before the PDL wait, every thread of the block passes here)
     constexpr bool use_tab = c_tab && mmvq_tab_type(type);
@@ -1046,7 +1053,7 @@ static __global__ void mul_mat_vec_q(
     // the selected expert is uniform in the block, so the whole block leaves on a skipped slot
     if (!shared_expert && ncols_dst == 1 && ids && ids[channel_dst] == -1) {
         dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
-        if (threadIdx.y == 0) {
+        if (wpr || threadIdx.y == 0) {
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
@@ -1102,7 +1109,7 @@ static __global__ void mul_mat_vec_q(
         // 1. Hide latency by prefetching bias, gates and scales here
         // 2. load only on threads that won't die after partial sum calculation
         const uint32_t channel_bias = ids ? channel_x : channel_dst;
-        if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
+        if (threadIdx.x < rows_per_cuda_block && (wpr || threadIdx.y == 0) &&
             (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_dst)) {
             if (use_bias) {
                 x_bias = x_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
@@ -1275,9 +1282,10 @@ static __global__ void mul_mat_vec_q(
         }
     }
 
-    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
-    [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+    __shared__ float tmp_shared[nwarps_red-1 > 0 ? nwarps_red-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+    [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps_red-1 > 0)) ? nwarps_red-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
 
+    if constexpr (!wpr) {
     if (threadIdx.y > 0) {
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
@@ -1296,6 +1304,7 @@ static __global__ void mul_mat_vec_q(
     if (threadIdx.y > 0) {
         return;
     }
+    }
 
     dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
 
@@ -1305,7 +1314,7 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
         for (int i = 0; i < rows_per_cuda_block; ++i) {
 #pragma unroll
-            for (int l = 0; l < nwarps-1; ++l) {
+            for (int l = 0; l < nwarps_red-1; ++l) {
                 tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
                 if constexpr (has_fusion) {
                     if (use_gate) {
@@ -3349,7 +3358,7 @@ static bool mul_mat_vec_q_verify_wide(
 //  - IQ2_XS / IQ2_S take the same launch under GGML_CUDA_MMVQ_IQ2_TAB (same values 0 / 1 / 2, default 1); a dense launch takes
 //    GGML_CUDA_MMVQ_IQ2_TAB_ROWS rows per block (2 = k16-turing's, default; 4 / 8: the 4 / 8 KiB table load shared by more rows).
 //  - IQ3_S / IQ3_XXS single token MUL_MAT_ID (MoE experts): the grid kernel (k19-q38t, grid in shared memory unless
-//    GGML_CUDA_MMVQ_GRID_SMEM=0) with GGML_CUDA_MMVQ_GRID_IDS rows per block instead of one: unset = 2 on sm_75 binaries on the TURING
+//    GGML_CUDA_MMVQ_GRID_SMEM=0) with GGML_CUDA_MMVQ_GRID_IDS rows per block instead of one: unset = 4 (k19-q4xt; 2 before) on sm_75 binaries on the TURING
 //    table, off elsewhere; 0 / 1 = off (one row per block, as before); 2 / 4 / 8 = that many rows on every NVIDIA table. A Qwen3.6-35B-A3B
 //    expert row (K 2048) is 8 IQ3_XXS blocks, which half of a block's 4 warps cover; the 1 KiB grid copy is then larger than the row.
 //    Same 4 warps and K split as the one-row launch: bitwise the same outputs.
@@ -3411,7 +3420,9 @@ static bool mul_mat_vec_q_tab_launch(
             if (ids == nullptr || small_k || grid_ids_env == 0 || (grid_ids_env < 0 && !sm75)) {
                 return false;
             }
-            rpb_force = grid_ids_env > 0 ? grid_ids_env : 2;
+            // k19-q4xt: the sm_75 default 4 rows (was 2): q36x on a Kaggle T4, 3 launches, md5 equal, full card chat / 8k +2.3% / +3.3%
+            // (A/A +0.3% / +0.4%), 12 GB +0.5% / +1.0%, 8 GB +0.3% / +0.4% (inside the A/A there); 8 rows below 4 in 5 of 6 cells
+            rpb_force = grid_ids_env > 0 ? grid_ids_env : 4;
         } else {
             const int env = mmvq_tab_iq2_type(type) ? tab2_env : tab_env;
             if (env == 0 || (env == 1 && !sm75)) {
@@ -3508,6 +3519,132 @@ static bool mul_mat_vec_q_tab_launch(
                 GGML_LOG_INFO("k19-iqsmem: %s %s engaged (%d rows per block, %d warps, ids %d)\n", ggml_type_name(type),
                     grid_type ? "MUL_MAT_ID grid launch" : "codebook in shared memory", rpb, nwarps_l, ids != nullptr);
             }
+        }
+        return true;
+    }
+}
+
+// k19-q4xt: single token MUL_MAT_ID whose expert rows are short enough that one warp covers a row's K blocks in one pass (the K-quant
+// / Q4_0 / Q5_0 / IQ4 experts of a Qwen3.6-35B-A3B down projection: K 512 = 2 Q5_K blocks, 16 lanes each). The launch it replaces runs
+// 2 (Turing K-quants) or 4 warps per block and only warp 0 has K blocks: the other warps add +0.0 partials (none is -0.0: every partial
+// starts at +0.0) and the block's row count is the resident-block limit's. Here every warp is a block of its own (mul_mat_vec_q c_wpr):
+// lane t takes the K block t / (qi/vdr) exactly as in warp 0 before, the same warp reduction, without the zeros: bitwise the same rows,
+// with every resident warp computing. Rows that 2 warps cover in one pass where the launch had 4 (Q8_0 K 512: the shared expert
+// down) run with 2 warps (c_nwarps 2): warp 1's partial is added to warp 0's as before, only the +0.0 of warps 2 and 3 are gone.
+// Dense single column launches of these shapes too (the shared expert down is a MUL_MAT).
+// GGML_CUDA_MMVQ_IDS_WPR: unset / 1 = sm_75 binaries on the TURING table, 0 = off (the launches as before), 2 = every NVIDIA table (a
+// byte check, untuned); GGML_CUDA_MMVQ_IDS_WPR_W = warps per block of the one-warp rows (2 / 4, default 4),
+// GGML_CUDA_MMVQ_IDS_WPR_ROWS = rows per warp (1 / 2 / 4, default 2; the 2-warp launch: rows per block).
+static constexpr bool mmvq_wpr_type(const ggml_type type) {
+    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q5_0 ||
+           type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q8_0;
+}
+
+template <ggml_type type>
+static bool mul_mat_vec_q_wpr_launch(
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const int ncols_x, const uint3 nchannels_y_fd, const int nrows_x, const int stride_row_x, const int stride_col_y,
+        const int stride_col_dst, const uint3 channel_ratio_fd, const int stride_channel_x, const int stride_channel_y,
+        const int stride_channel_dst, const uint3 sample_ratio_fd, const int stride_sample_x, const int stride_sample_y,
+        const int stride_sample_dst, const int nchannels_dst, const int nsamples_dst, const int ids_stride,
+        const bool small_k, const bool other_launch, const int cc, const mmvq_parameter_table_id table_id,
+        const int warp_size, cudaStream_t stream) {
+    if constexpr (!mmvq_wpr_type(type) || mmvq_tab_launch_type<type>()) {
+        GGML_UNUSED_VARS(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+            channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd, stride_sample_x,
+            stride_sample_y, stride_sample_dst, nchannels_dst, nsamples_dst, ids_stride, small_k, other_launch, cc,
+            table_id, warp_size, stream);
+        return false;
+    } else {
+        static const int env = [] {
+            const char * e = getenv("GGML_CUDA_MMVQ_IDS_WPR");
+            return e != nullptr ? atoi(e) : 1;
+        }();
+        static const int env_w = [] {
+            const char * e = getenv("GGML_CUDA_MMVQ_IDS_WPR_W");
+            const int v = e != nullptr ? atoi(e) : 4;
+            return v == 2 ? 2 : 4;
+        }();
+        static const int env_rows = [] {
+            const char * e = getenv("GGML_CUDA_MMVQ_IDS_WPR_ROWS");
+            const int v = e != nullptr ? atoi(e) : 2;
+            return v == 1 || v == 4 ? v : 2;
+        }();
+        if (env == 0 || other_launch || warp_size != 32 || fusion.shared_up != nullptr || !GGML_CUDA_CC_IS_NVIDIA(cc) ||
+                (table_id != MMVQ_PARAMETERS_TURING && table_id != MMVQ_PARAMETERS_GENERIC)) {
+            return false;
+        }
+        const bool sm75 = table_id == MMVQ_PARAMETERS_TURING && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING;
+        if (env == 1 && !sm75) {
+            return false;
+        }
+        constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+        constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+        constexpr int vdr = get_vdr_mmvq(type);
+        // the launch this replaces: its warps (small_k keeps the table's warps on these tables) and its K split
+        const int nwarps_old = calc_nwarps(type, 1, table_id, small_k, false);
+        const int bpi1       = vdr * warp_size / qi;   // K blocks one warp covers per pass
+        const int needed     = (ncols_x / qk + bpi1 - 1) / bpi1;
+        if (nwarps_old < 2 || needed > 2 || needed >= nwarps_old) {
+            return false;
+        }
+        const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                                fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+        if (needed == 2) {
+            // 2 warps, env_rows rows per block, the shared memory reduction of warp 1 into warp 0 as in the launch it replaces
+            if (nrows_x % env_rows != 0) {
+                return false;
+            }
+            const dim3 block_nums(nrows_x / env_rows, nchannels_dst, nsamples_dst);
+            const dim3 block_dims(warp_size, 2, 1);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+#define MMVQ_W2_LAUNCH(FUS, RPB) ggml_cuda_kernel_launch(mul_mat_vec_q<type, 1, FUS, false, false, 2, 0, RPB, 1, false, false, 0>, launch_params, \
+            vx, vy, ids, fusion, dst, (uint32_t) ncols_x, nchannels_y_fd, (uint32_t) stride_row_x, (uint32_t) stride_col_y, (uint32_t) stride_col_dst, \
+            channel_ratio_fd, (uint32_t) stride_channel_x, (uint32_t) stride_channel_y, (uint32_t) stride_channel_dst, \
+            sample_ratio_fd, (uint32_t) stride_sample_x, (uint32_t) stride_sample_y, (uint32_t) stride_sample_dst, (uint32_t) ids_stride)
+            switch (env_rows) {
+                case 1:  if (has_fusion) { MMVQ_W2_LAUNCH(true, 1); } else { MMVQ_W2_LAUNCH(false, 1); } break;
+                case 4:  if (has_fusion) { MMVQ_W2_LAUNCH(true, 4); } else { MMVQ_W2_LAUNCH(false, 4); } break;
+                default: if (has_fusion) { MMVQ_W2_LAUNCH(true, 2); } else { MMVQ_W2_LAUNCH(false, 2); } break;
+            }
+#undef MMVQ_W2_LAUNCH
+            static bool engaged2 = false;
+            if (!engaged2) {
+                engaged2 = true;
+                GGML_LOG_INFO("k19-q4xt: %s %s 2-warp launch engaged (K %d, %d rows per block, was %d warps)\n", ggml_type_name(type),
+                    ids != nullptr ? "MUL_MAT_ID" : "dense", ncols_x, env_rows, nwarps_old);
+            }
+            return true;
+        }
+        const int rows_block = env_w * env_rows;
+        if (nrows_x % rows_block != 0) {
+            return false;
+        }
+        const dim3 block_nums(nrows_x / rows_block, nchannels_dst, nsamples_dst);
+        const dim3 block_dims(warp_size, env_w, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+#define MMVQ_WPR_LAUNCH(FUS, W, RPW) ggml_cuda_kernel_launch(mul_mat_vec_q<type, 1, FUS, false, false, W, 0, RPW, 1, false, false, W>, launch_params, \
+            vx, vy, ids, fusion, dst, (uint32_t) ncols_x, nchannels_y_fd, (uint32_t) stride_row_x, (uint32_t) stride_col_y, (uint32_t) stride_col_dst, \
+            channel_ratio_fd, (uint32_t) stride_channel_x, (uint32_t) stride_channel_y, (uint32_t) stride_channel_dst, \
+            sample_ratio_fd, (uint32_t) stride_sample_x, (uint32_t) stride_sample_y, (uint32_t) stride_sample_dst, (uint32_t) ids_stride)
+#define MMVQ_WPR_ROWS(W) \
+        switch (env_rows) { \
+            case 1:  if (has_fusion) { MMVQ_WPR_LAUNCH(true, W, 1); } else { MMVQ_WPR_LAUNCH(false, W, 1); } break; \
+            case 4:  if (has_fusion) { MMVQ_WPR_LAUNCH(true, W, 4); } else { MMVQ_WPR_LAUNCH(false, W, 4); } break; \
+            default: if (has_fusion) { MMVQ_WPR_LAUNCH(true, W, 2); } else { MMVQ_WPR_LAUNCH(false, W, 2); } break; \
+        }
+        if (env_w == 2) {
+            MMVQ_WPR_ROWS(2)
+        } else {
+            MMVQ_WPR_ROWS(4)
+        }
+#undef MMVQ_WPR_ROWS
+#undef MMVQ_WPR_LAUNCH
+        static bool engaged = false;
+        if (!engaged) {
+            engaged = true;
+            GGML_LOG_INFO("k19-q4xt: %s %s warp per row launch engaged (K %d, %d warps x %d rows per block, was %d warps)\n",
+                ggml_type_name(type), ids != nullptr ? "MUL_MAT_ID" : "dense", ncols_x, env_w, env_rows, nwarps_old);
         }
         return true;
     }
@@ -3886,6 +4023,13 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     stride_col_dst, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, nchannels_dst, nsamples_dst, ids_stride,
                     should_use_small_k(c_ncols_dst), unroll || should_halve_iters(), turing_2rows, cc, table_id, warp_size, stream)) {
+                break;
+            }
+            // k19-q4xt: short expert rows, every warp its own rows (mul_mat_vec_q_wpr_launch); false = the launches below
+            if (mul_mat_vec_q_wpr_launch<type>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x, stride_row_x, stride_col_y,
+                    stride_col_dst, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                    stride_sample_x, stride_sample_y, stride_sample_dst, nchannels_dst, nsamples_dst, ids_stride,
+                    should_use_small_k(c_ncols_dst), unroll || should_halve_iters(), cc, table_id, warp_size, stream)) {
                 break;
             }
             if constexpr (type != GGML_TYPE_Q3_K) {
