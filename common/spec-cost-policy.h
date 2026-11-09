@@ -585,6 +585,8 @@ struct common_spec_tpp_cost {
     // per context band, as each width a request mixes pays its own CUDA graph captures (plans/fndec.md section 7). Deterministic
     int     deep_extra = 0;
     int64_t deep_pos   = 12288;
+    // k19-fnmtp: the deep band also for a window of floor + 1 drafts (deep_extra 0): set beside a MoE cache by the server's rule
+    bool    deep_all   = false;
 
     common_spec_tpp_cost() {
         if (const char * e = getenv("LLAMA_SPEC_TPP_MARG_PRIOR")) {
@@ -720,7 +722,7 @@ struct common_spec_tpp_cost {
 
     // k19-depth: the current position is in the deep band (every window drafts floor + 1 + deep_extra)
     bool deep() const {
-        return deep_extra > 0 && pos_cur < deep_pos;
+        return (deep_extra > 0 || deep_all) && pos_cur < deep_pos;
     }
 
     // window floor + 1 (expected tokens e_w, chance q_w that every draft holds) against the floor window (e_f)

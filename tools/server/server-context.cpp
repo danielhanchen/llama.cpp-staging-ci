@@ -1917,7 +1917,29 @@ private:
             const bool fits_all = (ce != nullptr && atoi(ce) != 0) || !cache_expected;
             // LLAMA_SPEC_TPP=1 forces past the device rule, not the MoE cache rule
             const bool on = (e != nullptr ? atoi(e) != 0 : dev_ok) && fits_all;
-            if (mtp_shape && on) {
+            // k19-fnmtp (LLAMA_SPEC_DEPTH_CACHED=N drafts, 0: off): beside a MoE cache an MTP drafter of its own (-md) drafts N in every
+            // window below LLAMA_SPEC_DEPTH_POS (12288), the windows from there are k19-tpp's priced ones (2, a 3rd where it pays at the
+            // cache's cost ratio). The 4-row windows get the verify tag there (llama-context, LLAMA_SPEC_VERIFY4_CACHED), so they run
+            // the 3-row kernels instead of cuBLAS. Not with LLAMA_MTP_EXACT=1 (beside a cache the exact text follows the window where the
+            // CPU-miss host path runs, plans/k19_a100chat.md section 5): there the windows stay at 2
+            const bool exact_mtp = [] {
+                const char * x = getenv("LLAMA_MTP_EXACT");
+                return x != nullptr && atoi(x) != 0;
+            }();
+            const int depth_cached = [] {
+                const char * d = getenv("LLAMA_SPEC_DEPTH_CACHED");
+                return d != nullptr ? atoi(d) : 3;
+            }();
+            const bool deep_cached = mtp_shape && !on && cache_expected && sp.has_dft() && dev_ok && (e == nullptr || atoi(e) != 0) &&
+                depth_cached >= 3 && !exact_mtp;
+            if (deep_cached) {
+                sp.draft.n_floor     = 2;
+                sp.draft.n_max       = std::min(depth_cached, 8);
+                sp.draft.deep_cached = true;
+                SRV_INF("k19-fnmtp: MoE cache expected (need %.0f MiB for model + drafter, %.0f MiB free on the GPUs): MTP drafts %d in every "
+                    "window below position %s, 2 and a priced 3rd from there (LLAMA_SPEC_DEPTH_CACHED=0: 2 drafts)\n", need/1048576.0,
+                    dev_free/1048576.0, sp.draft.n_max, getenv("LLAMA_SPEC_DEPTH_POS") != nullptr ? getenv("LLAMA_SPEC_DEPTH_POS") : "12288");
+            } else if (mtp_shape && on) {
                 // k19-depth (LLAMA_SPEC_DEPTH=0: off, =1: also beside built-in MTP heads): with an MTP drafter of its own (-md), every window
                 // below position 12288 (LLAMA_SPEC_DEPTH_POS) drafts 4, the windows from there are the ones above (2, a 3rd where it pays).
                 // G4 Qwen3.8-Flash-Next fn4 full card (plans/k19_depth.md): 4 drafts +6.8% chat / +10.9% 8k, -13% 30k against 2 + tpp.
