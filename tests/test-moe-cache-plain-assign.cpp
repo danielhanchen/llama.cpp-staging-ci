@@ -41,7 +41,7 @@ struct cache {
         state  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, HDR + 3*N_SLOTS);
         counts = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, N_EXPERT, N_LAYER + 1);
         scores = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, N_EXPERT, N_LAYER);
-        bank   = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, ROW_BYTES, 1, N_SLOTS);
+        bank   = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, ROW_BYTES, 1, N_SLOTS + 1); // the lookup takes a spare slot row
         src    = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, ROW_BYTES, 1, N_EXPERT); // the "host" experts (device memory here)
         buf    = ggml_backend_alloc_ctx_tensors(ctx, be);
         std::vector<int32_t> m((size_t) N_EXPERT*N_LAYER, -1);
