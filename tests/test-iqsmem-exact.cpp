@@ -409,6 +409,8 @@ int main(int argc, char ** argv) {
     std::vector<mode> modes = {
         { "neg_moe_one",  off, off + " GGML_CUDA_MMVQ_MOE_ONE=1", 0, true },
         { "off_twice",    off, off, 0, false },
+        { "off_twice_exact", off + " GGML_CUDA_VERIFY_REASSOC=0", off + " GGML_CUDA_VERIFY_REASSOC=0", 0, false },
+        { "dflt_twice_exact", "GGML_CUDA_VERIFY_REASSOC=0", "GGML_CUDA_VERIFY_REASSOC=0", -1, false },
         { "grid_ids",     off, "GGML_CUDA_MMVQ_IQ2_TAB=0", 1, false },
         { "grid_ids4",    off, "GGML_CUDA_MMVQ_IQ2_TAB=0 GGML_CUDA_MMVQ_GRID_IDS=4", 1, false },
         { "grid_ids8",    off, "GGML_CUDA_MMVQ_IQ2_TAB=0 GGML_CUDA_MMVQ_GRID_IDS=8", 1, false },
@@ -446,9 +448,28 @@ int main(int argc, char ** argv) {
                 ndiff += memcmp(&db[i], &dh[i], 4) != 0;
             }
         }
+        if (ndiff > 0 && !md.diff && db.size() == dh.size()) {
+            size_t off_b = 0;
+            int nrep = 0;
+            for (const auto & c : make_cases()) {
+                const size_t nb = (size_t) c.N * (c.E > 0 ? (size_t) c.topk : 1) * c.T * sizeof(float);
+                size_t nd = 0;
+                for (size_t i = off_b; i + 4 <= off_b + nb && i + 4 <= db.size(); i += 4) {
+                    nd += memcmp(&db[i], &dh[i], 4) != 0;
+                }
+                if (nd > 0 && nrep++ < 12) {
+                    printf("  DIFF %s %s K %d N %d E %d topk %d T %d flagged %d fused %d: %zu floats\n", md.name, ggml_type_name(c.type),
+                        c.K, c.N, c.E, c.topk, c.T, (int) c.flagged, (int) c.fused, nd);
+                }
+                off_b += nb;
+            }
+        }
         const bool same_ok = md.diff ? ndiff > 0 : ndiff == 0;
         const bool logs_ok = md.logs < 0 || (md.logs == 0 ? lb == 0 && lh == 0 : lb == 0 && lh > 0);
         const bool ok = rb == 0 && rh == 0 && !db.empty() && db.size() == dh.size() && same_ok && logs_ok;
+        if (!ok) {
+            printf("  WHY %s: rc %d / %d, sizes %zu / %zu, same_ok %d, logs_ok %d\n", md.name, rb, rh, db.size(), dh.size(), (int) same_ok, (int) logs_ok);
+        }
         printf("%s %-15s base rc %d logs %d hash %016llx | head rc %d logs %d hash %016llx | %zu bytes, %zu floats differ\n",
             ok ? "OK  " : "FAIL", md.name, rb, lb, (unsigned long long) fnv(db.data(), db.size()), rh, lh,
             (unsigned long long) fnv(dh.data(), dh.size()), db.size(), ndiff);
