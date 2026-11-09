@@ -9,7 +9,7 @@
 // another K split of the single token MUL_MAT_ID) must differ. Q4XT_BASE_EXE=<a copy of this test in another build's bin dir>: that
 // build's defaults vs this build's (cross-build identity). No CUDA device: SKIP, exit 0.
 //
-// --bench NAMES L REPS: microbench (q4xdn q4xgu q4xup q36dn q4xdn6): L weight copies (cold in L2), REPS graph computes; prints
+// --bench NAMES L REPS: microbench (q4xdn q4xgu q4xup q36dn q4xdn6 q4xdn4 shdn q4xdn8): L weight copies (cold in L2), REPS graph computes; prints
 // median us per product, GB/s and a hash of the outputs.
 
 #include "ggml.h"
@@ -231,6 +231,20 @@ static std::vector<iq_case> make_cases() {
             }
         }
     }
+    // dense single column (the shared expert down of Qwen3.6-35B-A3B: Q8_0 K 512, 2048 rows) and controls
+    struct dshp { int K, N; bool fused; };
+    const dshp dense[] = { { 512, 2048, false }, { 512, 512, true }, { 256, 132, false }, { 2048, 512, true } };
+    const ggml_type dense_types[] = { GGML_TYPE_Q8_0, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q6_K };
+    for (const ggml_type t : dense_types) {
+        for (const auto & s : dense) {
+            for (int T = 1; T <= 3; ++T) {
+                cs.push_back({ t, s.K, s.N, 0, 0, T, false, s.fused });
+                if (T > 1) {
+                    cs.push_back({ t, s.K, s.N, 0, 0, T, true, s.fused });
+                }
+            }
+        }
+    }
     return cs;
 }
 
@@ -268,6 +282,8 @@ static int run_bench(ggml_backend_t be, int argc, char ** argv) {
         { "q36dn",  GGML_TYPE_IQ4_XS, 512, 2048, 256, 8, false },
         { "q4xdn6", GGML_TYPE_Q6_K,   512, 2048, 256, 8, false },
         { "q4xdn4", GGML_TYPE_Q4_K,   512, 2048, 256, 8, false },
+        { "shdn",   GGML_TYPE_Q8_0,   512, 2048,   0, 0, false },
+        { "q4xdn8", GGML_TYPE_Q8_0,   512, 2048, 256, 8, false },
     };
     const std::string name = argc > 2 ? argv[2] : "q4xdn";
     const int L    = argc > 3 ? atoi(argv[3]) : 4;

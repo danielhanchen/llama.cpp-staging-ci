@@ -3527,12 +3527,15 @@ static bool mul_mat_vec_q_tab_launch(
 // 2 (Turing K-quants) or 4 warps per block and only warp 0 has K blocks: the other warps add +0.0 partials (none is -0.0: every partial
 // starts at +0.0) and the block's row count is the resident-block limit's. Here every warp is a block of its own (mul_mat_vec_q c_wpr):
 // lane t takes the K block t / (qi/vdr) exactly as in warp 0 before, the same warp reduction, without the zeros: bitwise the same rows,
-// with every resident warp computing. GGML_CUDA_MMVQ_IDS_WPR: unset / 1 = sm_75 binaries on the TURING table, 0 = off (the launch as
-// before), 2 = every NVIDIA table (a byte check, untuned); GGML_CUDA_MMVQ_IDS_WPR_W = warps per block (2 / 4, default 4),
-// GGML_CUDA_MMVQ_IDS_WPR_ROWS = rows per warp (1 / 2 / 4, default 2).
+// with every resident warp computing. Rows that 2 warps cover in one pass where the launch had 4 (Q8_0 K 512: the shared expert
+// down) run with 2 warps (c_nwarps 2): warp 1's partial is added to warp 0's as before, only the +0.0 of warps 2 and 3 are gone.
+// Dense single column launches of these shapes too (the shared expert down is a MUL_MAT).
+// GGML_CUDA_MMVQ_IDS_WPR: unset / 1 = sm_75 binaries on the TURING table, 0 = off (the launches as before), 2 = every NVIDIA table (a
+// byte check, untuned); GGML_CUDA_MMVQ_IDS_WPR_W = warps per block of the one-warp rows (2 / 4, default 4),
+// GGML_CUDA_MMVQ_IDS_WPR_ROWS = rows per warp (1 / 2 / 4, default 2; the 2-warp launch: rows per block).
 static constexpr bool mmvq_wpr_type(const ggml_type type) {
     return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q5_0 ||
-           type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL;
+           type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q8_0;
 }
 
 template <ggml_type type>
@@ -3565,7 +3568,7 @@ static bool mul_mat_vec_q_wpr_launch(
             const int v = e != nullptr ? atoi(e) : 2;
             return v == 1 || v == 4 ? v : 2;
         }();
-        if (ids == nullptr || env == 0 || other_launch || warp_size != 32 || fusion.shared_up != nullptr || !GGML_CUDA_CC_IS_NVIDIA(cc) ||
+        if (env == 0 || other_launch || warp_size != 32 || fusion.shared_up != nullptr || !GGML_CUDA_CC_IS_NVIDIA(cc) ||
                 (table_id != MMVQ_PARAMETERS_TURING && table_id != MMVQ_PARAMETERS_GENERIC)) {
             return false;
         }
@@ -3578,15 +3581,43 @@ static bool mul_mat_vec_q_wpr_launch(
         constexpr int vdr = get_vdr_mmvq(type);
         // the launch this replaces: its warps (small_k keeps the table's warps on these tables) and its K split
         const int nwarps_old = calc_nwarps(type, 1, table_id, small_k, false);
-        if (nwarps_old < 2 || ncols_x / qk > vdr * warp_size / qi) {
+        const int bpi1       = vdr * warp_size / qi;   // K blocks one warp covers per pass
+        const int needed     = (ncols_x / qk + bpi1 - 1) / bpi1;
+        if (nwarps_old < 2 || needed > 2 || needed >= nwarps_old) {
             return false;
+        }
+        const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                                fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+        if (needed == 2) {
+            // 2 warps, env_rows rows per block, the shared memory reduction of warp 1 into warp 0 as in the launch it replaces
+            if (nrows_x % env_rows != 0) {
+                return false;
+            }
+            const dim3 block_nums(nrows_x / env_rows, nchannels_dst, nsamples_dst);
+            const dim3 block_dims(warp_size, 2, 1);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+#define MMVQ_W2_LAUNCH(FUS, RPB) ggml_cuda_kernel_launch(mul_mat_vec_q<type, 1, FUS, false, false, 2, 0, RPB, 1, false, false, 0>, launch_params, \
+            vx, vy, ids, fusion, dst, (uint32_t) ncols_x, nchannels_y_fd, (uint32_t) stride_row_x, (uint32_t) stride_col_y, (uint32_t) stride_col_dst, \
+            channel_ratio_fd, (uint32_t) stride_channel_x, (uint32_t) stride_channel_y, (uint32_t) stride_channel_dst, \
+            sample_ratio_fd, (uint32_t) stride_sample_x, (uint32_t) stride_sample_y, (uint32_t) stride_sample_dst, (uint32_t) ids_stride)
+            switch (env_rows) {
+                case 1:  if (has_fusion) { MMVQ_W2_LAUNCH(true, 1); } else { MMVQ_W2_LAUNCH(false, 1); } break;
+                case 4:  if (has_fusion) { MMVQ_W2_LAUNCH(true, 4); } else { MMVQ_W2_LAUNCH(false, 4); } break;
+                default: if (has_fusion) { MMVQ_W2_LAUNCH(true, 2); } else { MMVQ_W2_LAUNCH(false, 2); } break;
+            }
+#undef MMVQ_W2_LAUNCH
+            static bool engaged2 = false;
+            if (!engaged2) {
+                engaged2 = true;
+                GGML_LOG_INFO("k19-q4xt: %s %s 2-warp launch engaged (K %d, %d rows per block, was %d warps)\n", ggml_type_name(type),
+                    ids != nullptr ? "MUL_MAT_ID" : "dense", ncols_x, env_rows, nwarps_old);
+            }
+            return true;
         }
         const int rows_block = env_w * env_rows;
         if (nrows_x % rows_block != 0) {
             return false;
         }
-        const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
-                                fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
         const dim3 block_nums(nrows_x / rows_block, nchannels_dst, nsamples_dst);
         const dim3 block_dims(warp_size, env_w, 1);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
@@ -3610,8 +3641,8 @@ static bool mul_mat_vec_q_wpr_launch(
         static bool engaged = false;
         if (!engaged) {
             engaged = true;
-            GGML_LOG_INFO("k19-q4xt: %s MUL_MAT_ID warp per row launch engaged (K %d, %d warps x %d rows per block, was %d warps)\n",
-                ggml_type_name(type), ncols_x, env_w, env_rows, nwarps_old);
+            GGML_LOG_INFO("k19-q4xt: %s %s warp per row launch engaged (K %d, %d warps x %d rows per block, was %d warps)\n",
+                ggml_type_name(type), ids != nullptr ? "MUL_MAT_ID" : "dense", ncols_x, env_w, env_rows, nwarps_old);
         }
         return true;
     }
