@@ -1049,6 +1049,10 @@ static __global__ void mul_mat_vec_q(
     // the last block of a slot wrote its rows past the expert into the next slot's first rows, which that slot's block also writes: the
     // bytes depended on which block wrote last, and the last slot of the last token wrote past dst)
     const uint32_t nrows_dst = ncols_dst == 1 && ids && !shared_expert ? stride_channel_dst : stride_col_dst;
+    // k19-ikfix: the last row a partial last row block reads. Its rows past nrows_dst read the last row again instead of the bytes after
+    // the matrix (past the end of the weight buffer for the last matrix: an out-of-bounds read); their sums are not stored (the row guard
+    // below), the rows that are stored read what they read before, so every output keeps its bytes
+    const int i_last = rows_per_cuda_block == 1 ? 0 : max(0, min(rows_per_cuda_block, (int) nrows_dst - row0) - 1);
 
     // the selected expert is uniform in the block, so the whole block leaves on a skipped slot
     if (!shared_expert && ncols_dst == 1 && ids && ids[channel_dst] == -1) {
@@ -1210,7 +1214,7 @@ static __global__ void mul_mat_vec_q(
             if (kbx_pf < blocks_per_row_x) {
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    const size_t off = (size_t)(kbx_offset + i*stride_row_x + kbx_pf) * ggml_cuda_type_traits<type>::bs;
+                    const size_t off = (size_t)(kbx_offset + min(i, i_last)*stride_row_x + kbx_pf) * ggml_cuda_type_traits<type>::bs;
                     mmvq_prefetch_l2((const char *) vx + off);
                     if constexpr (has_fusion) {
                         if (use_gate) {
@@ -1227,11 +1231,11 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 tmp[j][i] += mmvq_vec_dot<type, use_tab>(tab, grid,
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    vx, &y[j*stride_col_y + kby], kbx_offset + min(i, i_last)*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
                     if (use_gate) {
                         tmp_gate[j][i] += mmvq_vec_dot<type, use_tab>(tab, grid,
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                            vgate, &y[j*stride_col_y + kby], kbx_offset + min(i, i_last)*stride_row_x + kbx, kqs);
                     }
                 }
             }
@@ -1253,7 +1257,7 @@ static __global__ void mul_mat_vec_q(
             if (kbx_pf < blocks_per_row_x) {
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    const size_t off = (size_t)(kbx_offset + i*stride_row_x + kbx_pf) * ggml_cuda_type_traits<type>::bs;
+                    const size_t off = (size_t)(kbx_offset + min(i, i_last)*stride_row_x + kbx_pf) * ggml_cuda_type_traits<type>::bs;
                     mmvq_prefetch_l2((const char *) vx + off);
                     if constexpr (has_fusion) {
                         if (use_gate) {
@@ -1270,11 +1274,11 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 tmp[j][i] += mmvq_vec_dot<type, use_tab>(tab, grid,
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    vx, &y[j*stride_col_y + kby], kbx_offset + min(i, i_last)*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
                     if (use_gate) {
                         tmp_gate[j][i] += mmvq_vec_dot<type, use_tab>(tab, grid,
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                            vgate, &y[j*stride_col_y + kby], kbx_offset + min(i, i_last)*stride_row_x + kbx, kqs);
                     }
                 }
             }
@@ -1458,6 +1462,8 @@ static __global__ void mul_mat_vec_q_moe(
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
     const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
+    // k19-ikfix: rows past nrows_x of a partial last row block read the last row (not the bytes after the expert); their sums are not stored
+    const int i_last = c_rows_per_block == 1 ? 0 : max(0, min(c_rows_per_block, (int) nrows_x - row0) - 1);
 
     // partial sum for each thread
     float tmp[c_rows_per_block] = {0.0f};
@@ -1473,10 +1479,10 @@ static __global__ void mul_mat_vec_q_moe(
                     const int kby = kbx * (qk/QK8_1);
 #pragma unroll
                     for (int i = 0; i < c_rows_per_block; ++i) {
-                        tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + min(i, i_last)*stride_row_x + kbx, kqs);
                         if constexpr (has_fusion) {
                             if (use_gate) {
-                                tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                                tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + min(i, i_last)*stride_row_x + kbx, kqs);
                             }
                         }
                     }
@@ -1490,10 +1496,10 @@ static __global__ void mul_mat_vec_q_moe(
 
 #pragma unroll
         for (int i = 0; i < c_rows_per_block; ++i) {
-            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + min(i, i_last)*stride_row_x + kbx, kqs);
             if constexpr (has_fusion) {
                 if (use_gate) {
-                    tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + min(i, i_last)*stride_row_x + kbx, kqs);
                 }
             }
         }
