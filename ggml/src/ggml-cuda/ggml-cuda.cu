@@ -9805,7 +9805,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 cuda_ctx->src1_memo.share_next = memo_share;
                 cuda_ctx->src1_memo.node_dst   = node;
+                // k19-l4reg diag (GGML_CUDA_NODE_TRACE=<ms>): a node whose host time (launch, plus any sync or copy it does) is above <ms>
+                static const int nt_thr = getenv("GGML_CUDA_NODE_TRACE") ? atoi(getenv("GGML_CUDA_NODE_TRACE")) : 0;
+                const int64_t nt_t0 = nt_thr > 0 ? ggml_time_us() : 0;
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                if (nt_thr > 0) {
+                    const int64_t nt_dt = ggml_time_us() - nt_t0;
+                    if (nt_dt > (int64_t) nt_thr*1000) {
+                        GGML_LOG_INFO("k19-l4reg node trace: %s %s (ne1 %lld, src0 %s) %.2f ms host, graph of %d nodes\n", ggml_op_desc(node), node->name,
+                            (long long) node->ne[1], node->src[0] ? node->src[0]->name : "-", nt_dt/1000.0, cgraph->n_nodes);
+                    }
+                }
                 cuda_ctx->src1_memo.node_dst   = nullptr;
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
