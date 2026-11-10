@@ -3158,6 +3158,30 @@ struct llama_moe_cache::impl {
                         "the budget is that complement + 1 GiB (%.1f MiB), the reserve gets the rest\n", __func__, reserve/1048576.0, need/1048576.0);
             }
         }
+        // k19-l4df2: an exclusive tier whose auto budget stops short of the complement (the streamed experts the device slots do not
+        // hold) only because of the planning room (page cache, host compute buffers, prefetch ring: ~11 GB of a 52 GB host) is sized to
+        // hold it when what is available minus the host reserve and the other mapped host weights does: resident mode, nothing is read
+        // from the model files after load, so the room's streamed reads do not happen, and the reserve is kept. The budget is the
+        // complement + 1 GiB, or what fits if less but at least the complement + 2% (the slot rounding: resident mode needs 98% of the
+        // experts in slots). L4 full card, Flash-Next UD-IQ4_XS read from the disk: the auto budget of 35.9 GB held 86% of the experts in
+        // RAM + device slots, 12% of the device misses were read from the disk (~85% of a decode pass), 13.9 GB of MemAvailable unused.
+        // LLAMA_MOE_HOST_RESIDENT_LEAN=0 off
+        {
+            const char * e_lean = getenv("LLAMA_MOE_HOST_RESIDENT_LEAN");
+            const size_t comp   = e_bytes > v_bytes ? e_bytes - v_bytes : 0;
+            const size_t other  = mapped > e_bytes ? mapped - e_bytes : 0;
+            const size_t fits   = avail_plan > other ? avail_plan - other : 0;
+            const size_t lean   = std::min(comp + ((size_t) 1 << 30), fits);
+            if ((e_lean == nullptr || atoi(e_lean) != 0) && host_mib < 0 && comp > 0 && plan.on && plan.policy == LLAMA_MOE_HOST_EXCLUSIVE &&
+                    plan.budget < lean && (double) lean >= 1.02*(double) comp && getenv("LLAMA_MOE_RESIDENT") == nullptr) {
+                LLAMA_LOG_INFO("%s: MoE host cache: the auto budget of %.1f MiB leaves %.1f MiB of streamed experts outside RAM and the device "
+                        "slots; %.1f MiB available minus the %.1f MiB reserve and %.1f MiB of other mapped weights hold them: budget %.1f MiB, "
+                        "resident (LLAMA_MOE_HOST_RESIDENT_LEAN=0 off)\n", __func__, plan.budget/1048576.0,
+                        (comp > plan.budget ? comp - plan.budget : 0)/1048576.0, avail/1048576.0, reserve/1048576.0, other/1048576.0, lean/1048576.0);
+                plan.budget = lean;
+                plan.spare  = true;
+            }
+        }
         if (reserve > 0 && host_mib < 0) {
             LLAMA_LOG_INFO("%s: MoE host cache: %.1f MiB available, %.1f MiB kept as the host reserve (LLAMA_MOE_HOST_RESERVE_MIB)\n", __func__,
                     avail/1048576.0, reserve/1048576.0);
