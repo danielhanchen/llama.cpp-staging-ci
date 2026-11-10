@@ -330,6 +330,9 @@ struct common_params_model {
     }
 };
 
+// k19-fnmtp: bytes of every routed expert tensor of a GGUF (and its splits), 0 for a model without experts or an unreadable file
+uint64_t common_moe_expert_bytes(const std::string & path);
+
 // draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
