@@ -916,7 +916,7 @@ struct ggml_backend_cuda_buffer_context {
     bool   lazy      = false;
     size_t lazy_size = 0;
     size_t lazy_gran = 0;
-#if defined(GGML_USE_VMM)
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     std::vector<CUmemGenericAllocationHandle> chunks;   // 0 = not backed
 #endif
 
@@ -945,7 +945,7 @@ struct ggml_backend_cuda_buffer_context {
             ggml_cuda_device_free(dev_ptr);
             return;
         }
-#if defined(GGML_USE_VMM)
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         ggml_cuda_set_device(device);
         int64_t freed = 0;
         for (size_t i = 0; i < chunks.size(); ++i) {
@@ -1126,7 +1126,7 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
 
     ggml_cuda_set_device(ctx->device);
     if (ctx->lazy) {
-#if defined(GGML_USE_VMM)
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         // only the backed chunks (a chunk is cleared when it is backed, see ggml_backend_cuda_buffer_commit)
         for (size_t i = 0; i < ctx->chunks.size(); ++i) {
             if (ctx->chunks[i] != 0) {
@@ -1269,7 +1269,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_alloc_lazy(ggml_backend_bu
         return nullptr;
     }
     const int device = ((ggml_backend_cuda_buffer_type_context *) buft->context)->device;
-#if defined(GGML_USE_VMM)
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (device < 0 || device >= ggml_backend_cuda_get_device_count() || !ggml_cuda_info().devices[device].vmm || size == 0) {
         return nullptr;
     }
@@ -1303,7 +1303,7 @@ static bool ggml_backend_cuda_buffer_commit(ggml_backend_buffer_t buffer, size_t
     if (!ctx->lazy) {
         return true;
     }
-#if defined(GGML_USE_VMM)
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (size == 0) {
         return true;
     }
@@ -1371,7 +1371,7 @@ static size_t ggml_backend_cuda_buffer_decommit(ggml_backend_buffer_t buffer, si
     if (!ctx->lazy || size == 0) {
         return 0;
     }
-#if defined(GGML_USE_VMM)
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     const size_t c0 = (offset + ctx->lazy_gran - 1) / ctx->lazy_gran;
     const size_t c1 = std::min(ctx->chunks.size(), (offset + size) / ctx->lazy_gran);
     if (c0 >= c1) {
@@ -1410,7 +1410,7 @@ static size_t ggml_backend_cuda_buffer_committed(ggml_backend_buffer_t buffer) {
         return ggml_backend_buffer_get_size(buffer);
     }
     size_t n = 0;
-#if defined(GGML_USE_VMM)
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     for (auto h : ctx->chunks) {
         n += h != 0 ? ctx->lazy_gran : 0;
     }
