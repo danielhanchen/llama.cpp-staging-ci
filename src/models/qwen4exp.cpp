@@ -1464,7 +1464,12 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         ggml_tensor * ple = model.per_layer_tok_embd;
 
         const bool prefetch = model.can_prefetch.count(ple);
-        if (prefetch) {
+        llama_ple_prompt_reader * reader = prefetch && idx.size() >= llama_ple_prompt_read_min_rows() && !model.ple_table_resident.load() ?
+            model.ple_prompt_reader() : nullptr;
+        if (reader) {
+            // k19-disktt: a prompt ubatch queues parallel preads of its rows' pages for the gather (opt-in LLAMA_PLE_PROMPT_READ=1)
+            reader->read(idx.data(), idx.size());
+        } else if (prefetch) {
             llama_prefetch_rows(ple, idx.data(), idx.size());
         }
     }

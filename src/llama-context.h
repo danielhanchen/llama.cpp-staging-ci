@@ -526,10 +526,16 @@ private:
     struct ple_res_runner {
         std::thread       th;
         std::atomic<bool> stop{false};
+        // k19-disktt: the part of the table pinned by a GPU backend's host registration (LLAMA_PLE_RESIDENT_PARTIAL_PIN=1), released here
+        void *            pin_addr  = nullptr;
+        void (*pin_unmap)(void *)   = nullptr;
         ~ple_res_runner() {
             stop.store(true);
             if (th.joinable()) {
                 th.join();
+            }
+            if (pin_addr != nullptr && pin_unmap != nullptr) {
+                pin_unmap(pin_addr);
             }
         }
     } ple_res;

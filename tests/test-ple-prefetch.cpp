@@ -3,7 +3,9 @@
 //   - every predicted row equals the row set_input computes for that ubatch (LLAMA_PLE_PREFETCH_VERIFY=1),
 //     over multi-ubatch prompts, generation, two interleaved sequences, an EOS inside the prompt and a seq_rm,
 //   - the prefetcher is engaged for each mode when the table is lazy (jobs > 0),
-//   - the logits are bit-identical across off / madvise / populate / pread.
+//   - the logits are bit-identical across off / madvise / populate / pread,
+//   - k19-disktt: with the prompt reads of the PLE rows (llama_ple_prompt_reader, every ubatch here) and the part residency path
+//     (LLAMA_PLE_RESIDENT=2) engaged (LLAMA_PLE_PROMPT_READ=1), the logits equal those of a load with the reads off (=0).
 // usage: test-ple-prefetch <model.gguf> [more models]
 // a tiny qwen4exp model: test-llama-archs -a qwen4exp -o <dir>
 
@@ -51,6 +53,7 @@ struct run_result {
     uint64_t jobs     = 0;
     uint64_t predicted = 0;
     bool     engaged  = false;
+    bool     part     = false; // k19-disktt: the context read the table in part (LLAMA_PLE_RESIDENT=2)
 };
 
 static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & toks, const std::vector<llama_seq_id> & seqs,
@@ -152,6 +155,7 @@ static bool run(llama_model * model, enum llama_ple_prefetch_mode mode, run_resu
     }
     parse_u64(lc.text, "PLE prefetch: jobs = ", res.jobs);
     res.engaged = lc.text.find("PLE prefetch of '") != std::string::npos;
+    res.part    = lc.text.find("read in part") != std::string::npos;
     return true;
 }
 
@@ -164,6 +168,11 @@ int main(int argc, char ** argv) {
     setenv("LLAMA_PLE_PREFETCH_VERIFY", "1", 1);
     setenv("LLAMA_PLE_PREFETCH_STATS",  "1", 1);
     unsetenv("LLAMA_PLE_PREFETCH");
+    // k19-disktt: every ubatch takes the prompt reads, and the table the part residency read (read once per process)
+    setenv("LLAMA_PLE_PROMPT_READ_MIN_ROWS", "1", 1);
+    setenv("LLAMA_PLE_RESIDENT", "2", 1);
+    setenv("LLAMA_PLE_PROMPT_READ", "1", 1);
+    unsetenv("LLAMA_PLE_RESIDENT_PARTIAL");
 
     llama_backend_init();
 
@@ -204,6 +213,48 @@ int main(int argc, char ** argv) {
         }
 
         llama_model_free(model);
+
+        // k19-disktt: the same runs on a fresh load with the prompt reads on (and the part residency read), then off; the reads are
+        // counted when the model is freed
+        std::vector<float> logits_rd[2];
+        bool part_read = false;
+        uint64_t rd_calls = 0;
+        bool ok_rd = true;
+        for (int off = 0; off < 2 && ok_rd; ++off) {
+            if (off) {
+                setenv("LLAMA_PLE_PROMPT_READ", "0", 1);
+            }
+            log_capture lc;
+            llama_log_set(log_cb, &lc);
+            llama_model * m2 = llama_model_load_from_file(argv[a], mp);
+            llama_log_set(nullptr, nullptr);
+            if (!m2) {
+                ok_rd = false;
+                break;
+            }
+            run_result r;
+            ok_rd = run(m2, LLAMA_PLE_PREFETCH_OFF, r);
+            logits_rd[off] = r.logits;
+            llama_log_set(log_cb, &lc);
+            llama_model_free(m2);
+            llama_log_set(nullptr, nullptr);
+            if (!off) {
+                parse_u64(lc.text, "PLE prompt reads: ", rd_calls);
+            } else {
+                uint64_t c = 0;
+                if (parse_u64(lc.text, "PLE prompt reads: ", c) && c > 0) {
+                    ok_rd = false; // off still read
+                }
+            }
+            setenv("LLAMA_PLE_PROMPT_READ", "1", 1);
+        }
+        // the part residency line: the first context of the model (the residency rule runs once per table)
+        part_read = base.part;
+        bool pass = ok_rd && rd_calls > 0 && part_read && logits_rd[0].size() == logits_rd[1].size() && !logits_rd[0].empty() &&
+            memcmp(logits_rd[0].data(), logits_rd[1].data(), logits_rd[0].size()*sizeof(float)) == 0;
+        printf("%-60s %-9s prompt reads = %" PRIu64 " ubatches, part residency %s, logits %s : %s\n", argv[a], "disktt", rd_calls,
+                part_read ? "read" : "NOT read", ok_rd && logits_rd[0] == logits_rd[1] ? "equal to reads off" : "DIFFER", pass ? "OK" : "FAIL");
+        n_fail += !pass;
     }
 
     llama_backend_free();

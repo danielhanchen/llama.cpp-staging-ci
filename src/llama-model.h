@@ -8,6 +8,9 @@
 #include "llama-memory.h"
 #include "llama-vocab.h"
 
+#include "llama-prefetch.h"
+
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -883,6 +886,14 @@ struct llama_model {
         size_t offs = 0;
     };
     std::unordered_map<const ggml_tensor *, lazy_file> lazy_files;
+
+    // k19-disktt: parallel page reads of the PLE rows of prompt ubatches before their gather (llama_ple_prompt_reader_make), made at the
+    // first prompt ubatch (the mapping is set by then); nullptr where it does not apply; freed in ~llama_model before the descriptors
+    llama_ple_prompt_reader * ple_prompt_reader() const;
+    mutable std::once_flag ple_reader_once;
+    mutable std::unique_ptr<llama_ple_prompt_reader> ple_reader;
+    // set once the whole PLE table was read into RAM (LLAMA_PLE_RESIDENT): the prompt reads are skipped from then on
+    mutable std::atomic<bool> ple_table_resident {false};
 
     // k16 dense host pin (llama_context::dense_host_pin): mappings of the memory-mapped buffers that hold the weights of layers left in
     // system memory, registered once per model for the copies of offloaded prompt ops; released in ~llama_model, before the buffers

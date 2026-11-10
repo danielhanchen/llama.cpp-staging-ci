@@ -25,6 +25,10 @@
     #include <unistd.h>
 #endif
 
+#if defined(__linux__)
+    #include <sys/vfs.h>
+#endif
+
 #if defined(__linux__) && !defined(MADV_POPULATE_READ)
     #define MADV_POPULATE_READ 22 // Linux 5.14, older headers lack it
 #endif
@@ -388,4 +392,191 @@ void llama_row_prefetcher::worker_main(int id) {
         st.n_bytes   += n_bytes;
         st.t_busy_us += ggml_time_us() - j.t_submit_us;
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------- k19-disktt
+
+llama_ple_prompt_reader::llama_ple_prompt_reader(const ggml_tensor * tensor, int fd, size_t file_offs, int n_threads)
+    : fd(fd), file_offs(file_offs) {
+    GGML_ASSERT(ggml_is_matrix(tensor) && tensor->data);
+    data       = (const char *) tensor->data;
+    row_bytes  = ggml_row_size(tensor->type, tensor->ne[0]);
+    row_stride = tensor->nb[1];
+    n_rows_max = tensor->ne[1];
+#if !defined(_WIN32)
+    const long ps = sysconf(_SC_PAGESIZE);
+    if (ps > 0) {
+        page = (size_t) ps;
+    }
+#endif
+    sync  = getenv("LLAMA_PLE_PROMPT_READ_SYNC") != nullptr && atoi(getenv("LLAMA_PLE_PROMPT_READ_SYNC")) != 0;
+    probe = getenv("LLAMA_PLE_PROMPT_READ_STATS") != nullptr && atoi(getenv("LLAMA_PLE_PROMPT_READ_STATS")) != 0;
+    n_threads = std::max(1, std::min(n_threads, 256));
+    workers.reserve(n_threads);
+    for (int i = 0; i < n_threads; ++i) {
+        workers.emplace_back([this] { worker_main(); });
+    }
+}
+
+llama_ple_prompt_reader::~llama_ple_prompt_reader() {
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        stop = true;
+        queue.clear();
+    }
+    cv.notify_all();
+    for (auto & w : workers) {
+        w.join();
+    }
+}
+
+void llama_ple_prompt_reader::worker_main() {
+#if !defined(_WIN32)
+    std::vector<char> buf;
+    for (;;) {
+        std::pair<uint64_t, uint64_t> r;
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+            cv.wait(lock, [&] { return stop || !queue.empty(); });
+            if (stop) {
+                return;
+            }
+            r = queue.front();
+            queue.pop_front();
+            n_busy++;
+        }
+        if (buf.size() < r.second) {
+            buf.resize(r.second);
+        }
+        const ssize_t n = pread(fd, buf.data(), r.second, (off_t) r.first);
+        st.n_reads++;
+        if (n < 0) {
+            st.n_errors++;
+        }
+        bool drained;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            n_busy--;
+            drained = queue.empty() && n_busy == 0;
+        }
+        if (drained) {
+            cv_done.notify_all();
+        }
+    }
+#endif
+}
+
+void llama_ple_prompt_reader::read(const int32_t * rows, size_t n) {
+    const int64_t t0 = ggml_time_us();
+    // page-aligned file ranges of the rows (the tensor data starts at file_offs; a row may straddle two pages), merged when adjacent
+    std::vector<std::pair<uint64_t, uint64_t>> rs;
+    rs.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const int32_t r = rows[i];
+        if (r < 0 || r >= n_rows_max) {
+            continue;
+        }
+        const uint64_t a     = (uint64_t) file_offs + (uint64_t) r * row_stride;
+        const uint64_t first = a / page * page;
+        const uint64_t last  = (a + row_bytes + page - 1) / page * page;
+        rs.emplace_back(first, last);
+    }
+    std::sort(rs.begin(), rs.end());
+    size_t m = 0;
+    uint64_t n_pages = 0;
+    constexpr uint64_t max_run = 1u << 20; // a long run is split, so that the threads share it
+    for (size_t i = 0; i < rs.size(); ++i) {
+        auto r = rs[i];
+        if (m > 0) {
+            auto & c = rs[m - 1];
+            if (r.second <= c.second) {
+                continue; // inside the previous run
+            }
+            if (r.first <= c.second) {
+                if (r.second - c.first <= max_run) {
+                    c.second = r.second;
+                    continue;
+                }
+                r.first = c.second; // the rest only
+            }
+        }
+        rs[m++] = r;
+    }
+    rs.resize(m);
+#if !defined(_WIN32)
+    if (probe) {
+        // diagnostic: how many of these pages the page cache holds right now (the mapping starts at file offset 0)
+        std::vector<unsigned char> vec;
+        uint64_t res = 0, all = 0;
+        for (const auto & r : rs) {
+            const size_t np = (size_t) ((r.second - r.first) / page);
+            vec.resize(np);
+            void * addr = (void *) (data - file_offs + r.first);
+#if defined(__APPLE__)
+            const int mc = mincore(addr, (size_t) (r.second - r.first), (char *) vec.data());
+#else
+            const int mc = mincore(addr, (size_t) (r.second - r.first), vec.data());
+#endif
+            if (mc == 0) {
+                for (size_t q = 0; q < np; ++q) {
+                    res += vec[q] & 1;
+                }
+                all += np;
+            }
+        }
+        st.n_resident += res;
+        st.n_probed   += all;
+    }
+#endif
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        for (const auto & r : rs) {
+            n_pages += (r.second - r.first) / page;
+            queue.emplace_back(r.first, r.second - r.first);
+        }
+    }
+    cv.notify_all();
+    if (sync) {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv_done.wait(lock, [&] { return stop || (queue.empty() && n_busy == 0); });
+    }
+    st.n_calls++;
+    st.n_rows  += n;
+    st.n_pages += n_pages;
+    st.t_us    += ggml_time_us() - t0;
+}
+
+size_t llama_ple_prompt_read_min_rows() {
+    static const size_t v = getenv("LLAMA_PLE_PROMPT_READ_MIN_ROWS") ? (size_t) std::max(1, atoi(getenv("LLAMA_PLE_PROMPT_READ_MIN_ROWS"))) : 256;
+    return v;
+}
+
+llama_ple_prompt_reader * llama_ple_prompt_reader_make(const ggml_tensor * tensor, int fd, size_t file_offs) {
+#if defined(_WIN32)
+    GGML_UNUSED(tensor);
+    GGML_UNUSED(fd);
+    GGML_UNUSED(file_offs);
+    return nullptr;
+#else
+    // opt-in (LLAMA_PLE_PROMPT_READ=1): on the Colab A100 / L4 VM disks random reads are capped at ~3k/s however many are in flight,
+    // so the pool bought 0.8 s of a 22 s 8k prompt there (one launch), and its blocking form cost the L4 8k +29 s
+    if (const char * e = getenv("LLAMA_PLE_PROMPT_READ"); e == nullptr || atoi(e) == 0) {
+        return nullptr;
+    }
+    if (tensor == nullptr || fd < 0 || !ggml_is_matrix(tensor) || tensor->data == nullptr) {
+        return nullptr;
+    }
+#if defined(__linux__)
+    // a table in tmpfs / ramfs is RAM already: its faults are minor
+    struct statfs sfs;
+    if (fstatfs(fd, &sfs) == 0 && ((unsigned long) sfs.f_type == 0x01021994UL || (unsigned long) sfs.f_type == 0x858458f6UL)) {
+        return nullptr;
+    }
+#endif
+    int n_threads = 32;
+    if (const char * e = getenv("LLAMA_PLE_PROMPT_READ_THREADS")) {
+        n_threads = std::max(1, atoi(e));
+    }
+    return new llama_ple_prompt_reader(tensor, fd, file_offs, n_threads);
+#endif
 }
