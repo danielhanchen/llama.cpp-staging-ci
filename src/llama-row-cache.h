@@ -29,15 +29,14 @@ struct llama_row_cache {
         std::atomic<uint64_t> n_hits_static {0};
         std::atomic<uint64_t> n_inserts  {0};
         std::atomic<uint64_t> n_evicts   {0};
-        std::atomic<uint64_t> n_skipped  {0}; // rows below skip_below (not cached)
         std::atomic<uint64_t> n_filtered {0}; // hint / prefetch rows dropped because they were cached
         std::atomic<uint64_t> n_verified {0}; // LLAMA_PLE_ROW_CACHE_VERIFY=1: hits compared with the mapping
         std::atomic<uint64_t> n_verify_bad {0};
     };
 
-    // table: the lazily mapped table (host buffer, matrix); budget_bytes: memory for slots + index (static and dynamic);
-    // static_max_bytes: the part of the budget the profile may fill (the rest is dynamic)
-    llama_row_cache(const ggml_tensor * table, size_t budget_bytes, size_t static_max_bytes, int64_t skip_below);
+    // table: the lazily mapped table (host buffer, matrix); dyn_bytes: memory (slots + index) of the dynamic rows; static_max_bytes:
+    // at most this much for the profile's rows (only what load_profile keeps is allocated)
+    llama_row_cache(const ggml_tensor * table, size_t dyn_bytes, size_t static_max_bytes, int64_t skip_below);
     ~llama_row_cache();
 
     // reads a profile written by save_profile (or scripts that use the same format): checks the header against the table,
@@ -50,6 +49,8 @@ struct llama_row_cache {
 
     // copies row `r` into out and returns true when cached (counts a use)
     bool get(int64_t r, uint8_t * out);
+    // the same without counting a use
+    bool peek(int64_t r, uint8_t * out) const;
     // caches row `r` from src (row_bytes bytes; no-op below skip_below or when present)
     void put(int64_t r, const uint8_t * src);
     // true when row `r` is cached (no use counted)
@@ -70,8 +71,12 @@ struct llama_row_cache {
     stats st;
     bool verify = false; // LLAMA_PLE_ROW_CACHE_VERIFY=1
 
-    // FNV-1a 64 of the first and last 64 KiB of the table (the profile's key, with the shape and type)
+    // FNV-1a 64 of the first and last 64 KiB of the table and 62 evenly spread 4 KiB samples (the profile's key, with shape and type)
     static uint64_t fingerprint(const ggml_tensor * table);
+    // checksum of a row's bytes in a profile
+    static uint32_t row_sum(const uint8_t * p, size_t n);
+    // memory per slot (row copy, metadata, index share)
+    static size_t slot_bytes(size_t row_bytes);
 
 private:
     struct shard {
@@ -94,7 +99,7 @@ private:
     static int64_t find(const shard & s, uint32_t key);
     static void    erase(shard & s, uint32_t key);
     static void    insert_key(shard & s, uint32_t key, uint32_t slot);
-    void alloc(const std::vector<uint32_t> & n_stat, size_t n_stat_total);
+    void alloc(const std::vector<uint32_t> & n_stat);
 
     size_t  row_bytes;
     int64_t n_rows;
@@ -102,6 +107,7 @@ private:
     size_t  n_shards;
     mutable std::vector<shard> shards;
     size_t  n_slots_total = 0;
+    size_t  n_dyn_slots   = 0;
     size_t  n_static_max  = 0;
     size_t  n_static_rows = 0;
     size_t  mem_bytes     = 0;

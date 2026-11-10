@@ -11,17 +11,27 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <numeric>
 #include <random>
 
+#if defined(_WIN32)
+#include <process.h>
+#define llama_rc_getpid _getpid
+#else
+#include <unistd.h>
+#define llama_rc_getpid getpid
+#endif
+
 // profile file (little endian):
-//   char     magic[8] = "LLPLERC1"
+//   char     magic[8] = "LLPLERC2"
 //   uint32   row_bytes, ggml type
-//   uint64   n_rows (table), table nbytes, fingerprint, n_entries
-//   uint32   ids[n_entries]      ascending (the rows above a part are a suffix: only that is read)
+//   uint64   n_rows (table), table nbytes, fingerprint (llama_row_cache::fingerprint), n_entries
+//   uint32   ids[n_entries]      strictly ascending, < n_rows (the rows above a part are a suffix: only that is read)
 //   uint32   counts[n_entries]   uses (the rank: a budget keeps the highest counts)
+//   uint32   sums[n_entries]     llama_row_cache::row_sum of each row (every row kept is checked)
 //   uint8    rows[n_entries][row_bytes]
-static const char k_magic[8] = { 'L', 'L', 'P', 'L', 'E', 'R', 'C', '1' };
+static const char k_magic[8] = { 'L', 'L', 'P', 'L', 'E', 'R', 'C', '2' };
 
 struct prof_header {
     char     magic[8];
@@ -49,6 +59,7 @@ int llama_row_cache_mode() {
     return getenv("LLAMA_PLE_ROW_CACHE") ? atoi(getenv("LLAMA_PLE_ROW_CACHE")) : 1;
 }
 
+// FNV-1a 64 over the first and last 64 KiB of the table and 62 4 KiB samples spread evenly between them
 uint64_t llama_row_cache::fingerprint(const ggml_tensor * table) {
     uint64_t h = 0xcbf29ce484222325ull;
     auto mix_bytes = [&](const uint8_t * p, size_t n) {
@@ -59,26 +70,42 @@ uint64_t llama_row_cache::fingerprint(const ggml_tensor * table) {
     };
     const size_t nb = ggml_nbytes(table);
     const size_t w  = std::min<size_t>(nb, 65536);
+    const size_t ws = std::min<size_t>(nb, 4096);
     const auto * d  = (const uint8_t *) table->data;
     mix_bytes(d, w);
+    for (size_t j = 1; j <= 62; ++j) {
+        mix_bytes(d + (size_t) ((uint64_t) j * (uint64_t) (nb - ws) / 63), ws);
+    }
     mix_bytes(d + nb - w, w);
     return h;
 }
 
-// per slot: row bytes + id + count + ref, plus ~2 index entries (key + value) at <= 50% load
-static size_t slot_cost(size_t row_bytes) {
-    return row_bytes + 4 + 4 + 1 + 2*8;
+// a checksum of one row: 8-byte little-endian words (the last one zero padded)
+uint32_t llama_row_cache::row_sum(const uint8_t * p, size_t n) {
+    uint64_t h = 0x9e3779b97f4a7c15ull ^ (uint64_t) n;
+    for (size_t i = 0; i < n; i += 8) {
+        uint64_t w = 0;
+        memcpy(&w, p + i, std::min<size_t>(8, n - i));
+        h = (h ^ w) * 0xff51afd7ed558ccdull;
+        h ^= h >> 31;
+    }
+    return (uint32_t) (h ^ (h >> 32));
 }
 
-llama_row_cache::llama_row_cache(const ggml_tensor * table, size_t budget_bytes, size_t static_max_bytes, int64_t skip_below) :
+// per slot: row bytes + id + count + ref, plus the index (key + value) at a power-of-two size of 2-4x the slots
+size_t llama_row_cache::slot_bytes(size_t row_bytes) {
+    return row_bytes + 4 + 4 + 1 + 4*8;
+}
+
+llama_row_cache::llama_row_cache(const ggml_tensor * table, size_t dyn_bytes, size_t static_max_bytes, int64_t skip_below) :
         table(table), row_bytes(ggml_row_size(table->type, table->ne[0])), n_rows(table->ne[1]), skip_below(skip_below) {
     GGML_ASSERT(n_rows < (int64_t) k_empty);
     verify   = getenv("LLAMA_PLE_ROW_CACHE_VERIFY") != nullptr && atoi(getenv("LLAMA_PLE_ROW_CACHE_VERIFY")) != 0;
     n_shards = 64;
     shards   = std::vector<shard>(n_shards);
-    n_slots_total = budget_bytes / slot_cost(row_bytes);
-    n_static_max  = std::min(n_slots_total, static_max_bytes / slot_cost(row_bytes));
-    alloc(std::vector<uint32_t>(n_shards, 0), 0);
+    n_dyn_slots  = dyn_bytes / slot_bytes(row_bytes);
+    n_static_max = static_max_bytes / slot_bytes(row_bytes);
+    alloc(std::vector<uint32_t>(n_shards, 0));
 }
 
 llama_row_cache::~llama_row_cache() = default;
@@ -145,38 +172,45 @@ size_t llama_row_cache::load_profile(const std::string & path) {
     if (!path.empty() && !f) {
         why = "not found";
     }
+    std::vector<uint32_t> sums;
     if (f) {
+        uint64_t fsize = 0;
+        std::error_code ec;
+        fsize = (uint64_t) std::filesystem::file_size(path, ec);
+        if (ec) {
+            fsize = 0;
+        }
         if (fread(&h, sizeof(h), 1, f) != 1 || memcmp(h.magic, k_magic, 8) != 0) {
             why = "not a PLE row profile";
         } else if (h.row_bytes != row_bytes || h.type != (uint32_t) table->type || h.n_rows != (uint64_t) n_rows ||
                    h.nbytes != ggml_nbytes(table)) {
             why = "made for another table (shape / type)";
+        } else if (h.n_entries > (uint64_t) n_rows || fsize < sizeof(h) || (fsize - sizeof(h)) / (12ull + row_bytes) < h.n_entries) {
+            why = "corrupt or truncated";
         } else if (h.fingerprint != fingerprint(table)) {
             why = "made for another table (fingerprint)";
-        } else if (h.n_entries > (uint64_t) n_rows) {
-            why = "corrupt";
         } else {
             ids.resize(h.n_entries);
             cnts.resize(h.n_entries);
-            if (fread(ids.data(), 4, ids.size(), f) != ids.size() || fread(cnts.data(), 4, cnts.size(), f) != cnts.size()) {
+            sums.resize(h.n_entries);
+            if (fread(ids.data(), 4, ids.size(), f) != ids.size() || fread(cnts.data(), 4, cnts.size(), f) != cnts.size() ||
+                fread(sums.data(), 4, sums.size(), f) != sums.size()) {
                 why = "truncated";
                 ids.clear();
             }
         }
     }
     const int64_t t0 = ggml_time_us();
-    for (size_t i = 1; i < ids.size() && !why; ++i) {
-        if (ids[i] <= ids[i - 1]) {
-            why = "corrupt (ids not ascending)";
+    for (size_t i = 0; i < ids.size() && !why; ++i) {
+        if ((i > 0 && ids[i] <= ids[i - 1]) || (int64_t) ids[i] >= n_rows) {
+            why = "corrupt (ids not ascending or out of range)";
         }
     }
     if (!ids.empty() && !why) {
         // rows at or above skip_below, the highest counts first while the static budget lasts, kept in file order
         const size_t first = std::lower_bound(ids.begin(), ids.end(), (uint32_t) std::max<int64_t>(0, skip_below)) - ids.begin();
         for (size_t i = first; i < ids.size(); ++i) {
-            if ((int64_t) ids[i] < n_rows) {
-                keep.push_back((uint32_t) i);
-            }
+            keep.push_back((uint32_t) i);
         }
         if (keep.size() > n_static_max) {
             std::nth_element(keep.begin(), keep.begin() + n_static_max, keep.end(), [&](uint32_t a, uint32_t b) {
@@ -192,12 +226,12 @@ size_t llama_row_cache::load_profile(const std::string & path) {
     for (uint32_t i : keep) {
         n_stat[(size_t) (mix(ids[i]) >> 58) % n_shards]++;
     }
-    alloc(n_stat, keep.size());
+    alloc(n_stat);
 
     // the row bytes of the kept entries, read sequentially
     size_t n_loaded = 0;
     if (!keep.empty()) {
-        const uint64_t data0 = sizeof(h) + 8ull*h.n_entries;
+        const uint64_t data0 = sizeof(h) + 12ull*h.n_entries;
         std::vector<uint8_t> buf(8u << 20);
         const size_t per = buf.size() / row_bytes;
         size_t k = 0;
@@ -212,6 +246,10 @@ size_t llama_row_cache::load_profile(const std::string & path) {
             }
             for (; k < keep.size() && keep[k] < e1; ++k) {
                 const uint32_t i = keep[k];
+                if (row_sum(buf.data() + (size_t) (i - e0)*row_bytes, row_bytes) != sums[i]) {
+                    why = "corrupt (row checksum)";
+                    break;
+                }
                 shard & s = shard_of(ids[i]);
                 const uint32_t slot = s.n_used++;
                 GGML_ASSERT(slot < s.n_static);
@@ -239,18 +277,15 @@ size_t llama_row_cache::load_profile(const std::string & path) {
             std::vector<uint8_t> tmp(row_bytes);
             for (uint32_t r : probe) {
                 const auto * src = (const uint8_t *) table->data + (size_t) r*table->nb[1];
-                if (!get(r, tmp.data()) || memcmp(tmp.data(), src, row_bytes) != 0) {
+                if (!peek(r, tmp.data()) || memcmp(tmp.data(), src, row_bytes) != 0) {
                     why = "rows differ from the table (stale)";
                     break;
                 }
             }
-            st.n_lookups = 0;
-            st.n_hits = 0;
-            st.n_hits_static = 0;
         }
         if (why) {
             // all dynamic again
-            alloc(std::vector<uint32_t>(n_shards, 0), 0);
+            alloc(std::vector<uint32_t>(n_shards, 0));
             n_loaded = 0;
         }
     }
@@ -269,10 +304,10 @@ size_t llama_row_cache::load_profile(const std::string & path) {
     return n_loaded;
 }
 
-void llama_row_cache::alloc(const std::vector<uint32_t> & n_stat, size_t n_stat_total) {
-    const size_t n_dyn_total = n_slots_total > n_stat_total ? n_slots_total - n_stat_total : 0;
-    const size_t n_dyn = n_dyn_total / n_shards;
+void llama_row_cache::alloc(const std::vector<uint32_t> & n_stat) {
+    const size_t n_dyn = (n_dyn_slots + n_shards - 1) / n_shards;
     mem_bytes = 0;
+    n_slots_total = 0;
     for (size_t si = 0; si < n_shards; ++si) {
         shard & s = shards[si];
         s.n_static = n_stat[si];
@@ -282,20 +317,39 @@ void llama_row_cache::alloc(const std::vector<uint32_t> & n_stat, size_t n_stat_
             tab <<= 1;
         }
         s.mask = (uint32_t) (tab - 1);
-        s.keys.assign(tab, k_empty);
-        s.vals.assign(tab, 0);
+        // fresh vectors: a smaller layout gives the old capacity back
+        std::vector<uint32_t>(tab, k_empty).swap(s.keys);
+        std::vector<uint32_t>(tab, 0).swap(s.vals);
         s.data.reset();
         s.data.reset(new uint8_t[std::max<size_t>(1, (size_t) s.n_slots * row_bytes)]);
-        s.slot_row.assign(s.n_slots, k_empty);
-        s.slot_cnt.assign(s.n_slots, 0);
-        s.slot_ref.assign(s.n_slots, 0);
+        std::vector<uint32_t>(s.n_slots, k_empty).swap(s.slot_row);
+        std::vector<uint32_t>(s.n_slots, 0).swap(s.slot_cnt);
+        std::vector<uint8_t>(s.n_slots, 0).swap(s.slot_ref);
         s.n_used = 0;
         s.hand   = s.n_static;
         mem_bytes += tab*8 + (size_t) s.n_slots*(row_bytes + 9);
+        n_slots_total += s.n_slots;
     }
 }
 
+bool llama_row_cache::peek(int64_t r, uint8_t * out) const {
+    if (r < 0 || r >= n_rows) {
+        return false;
+    }
+    shard & s = shard_of(r);
+    std::lock_guard<std::mutex> lock(s.mtx);
+    const int64_t slot = find(s, (uint32_t) r);
+    if (slot < 0) {
+        return false;
+    }
+    memcpy(out, s.data.get() + (size_t) slot*row_bytes, row_bytes);
+    return true;
+}
+
 bool llama_row_cache::get(int64_t r, uint8_t * out) {
+    if (r < 0 || r >= n_rows) {
+        return false;
+    }
     st.n_lookups.fetch_add(1, std::memory_order_relaxed);
     shard & s = shard_of(r);
     std::lock_guard<std::mutex> lock(s.mtx);
@@ -316,14 +370,16 @@ bool llama_row_cache::get(int64_t r, uint8_t * out) {
 }
 
 bool llama_row_cache::contains(int64_t r) const {
+    if (r < 0 || r >= n_rows) {
+        return false;
+    }
     shard & s = shard_of(r);
     std::lock_guard<std::mutex> lock(s.mtx);
     return find(s, (uint32_t) r) >= 0;
 }
 
 void llama_row_cache::put(int64_t r, const uint8_t * src) {
-    if (r < skip_below) {
-        st.n_skipped.fetch_add(1, std::memory_order_relaxed);
+    if (r < skip_below || r >= n_rows) {
         return;
     }
     shard & s = shard_of(r);
@@ -399,8 +455,10 @@ bool llama_row_cache::save_profile(const std::string & path) const {
         }
     }
     std::sort(es.begin(), es.end(), [](const ent & a, const ent & b) { return a.row < b.row; });
-    const std::string tmp = path + ".tmp";
-    FILE * f = fopen(tmp.c_str(), "wb");
+    // a temporary of this process only, created exclusively (an existing file or link of that name is not followed), then renamed over
+    // the profile (std::filesystem::rename replaces an existing file on Windows too)
+    const std::string tmp = path + ".tmp." + std::to_string((long long) llama_rc_getpid());
+    FILE * f = fopen(tmp.c_str(), "wbx");
     if (!f) {
         LLAMA_LOG_WARN("%s: cannot write %s\n", __func__, tmp.c_str());
         return false;
@@ -421,10 +479,22 @@ bool llama_row_cache::save_profile(const std::string & path) const {
         ok = ok && fwrite(&e.cnt, 4, 1, f) == 1;
     }
     for (const auto & e : es) {
+        const uint32_t sum = row_sum(e.p, row_bytes);
+        ok = ok && fwrite(&sum, 4, 1, f) == 1;
+    }
+    for (const auto & e : es) {
         ok = ok && fwrite(e.p, row_bytes, 1, f) == 1;
     }
     ok = fclose(f) == 0 && ok;
-    ok = ok && rename(tmp.c_str(), path.c_str()) == 0;
+    if (ok) {
+        std::error_code ec;
+        std::filesystem::rename(tmp, path, ec);
+        ok = !ec;
+    }
+    if (!ok) {
+        std::error_code ec;
+        std::filesystem::remove(tmp, ec);
+    }
     LLAMA_LOG_INFO("%s: PLE row profile %s: %zu rows written%s\n", __func__, path.c_str(), es.size(), ok ? "" : " (FAILED)");
     return ok;
 }
@@ -432,8 +502,8 @@ bool llama_row_cache::save_profile(const std::string & path) const {
 std::string llama_row_cache::describe() const {
     char buf[512];
     snprintf(buf, sizeof(buf), "lookups = %" PRIu64 ", hits = %" PRIu64 " (static %" PRIu64 "), inserts = %" PRIu64 ", evictions = %" PRIu64
-        ", skipped (part) = %" PRIu64 ", hint rows dropped = %" PRIu64 ", static rows = %zu, slots = %zu, %.1f MiB",
-        st.n_lookups.load(), st.n_hits.load(), st.n_hits_static.load(), st.n_inserts.load(), st.n_evicts.load(), st.n_skipped.load(),
+        ", hint rows dropped = %" PRIu64 ", static rows = %zu, slots = %zu, %.1f MiB",
+        st.n_lookups.load(), st.n_hits.load(), st.n_hits_static.load(), st.n_inserts.load(), st.n_evicts.load(),
         st.n_filtered.load(), n_static_rows, n_slots_total, mem_bytes/1048576.0);
     std::string s = buf;
     if (verify) {
@@ -456,6 +526,7 @@ static const void * llama_row_cache_source(void * ud, const ggml_tensor * t, int
             rc->st.n_verified.fetch_add(1, std::memory_order_relaxed);
             if (memcmp(tmp, src, rc->get_row_bytes()) != 0) {
                 rc->st.n_verify_bad.fetch_add(1, std::memory_order_relaxed);
+                return src; // the mapping's bytes win
             }
         }
         return tmp;

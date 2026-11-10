@@ -1357,40 +1357,48 @@ llama_context::llama_context(
                         const char * prof_env = getenv("LLAMA_PLE_ROW_PROFILE");
                         const std::string prof = prof_env ? prof_env : "";
                         const size_t row_b = ggml_row_size(t->type, t->ne[0]);
-                        const size_t cost  = row_b + 25;
-                        // rows of the profile (header only), to size the static part
+                        const size_t cost  = llama_row_cache::slot_bytes(row_b);
+                        // rows of the profile (header only): an upper bound of the static part (only the rows load_profile keeps are
+                        // allocated, and the part is reduced by what the cache really holds)
                         uint64_t prof_rows = 0;
                         if (!prof.empty()) {
                             if (FILE * pf = fopen(prof.c_str(), "rb")) {
                                 uint8_t hb[48];
-                                if (fread(hb, 1, sizeof(hb), pf) == sizeof(hb) && memcmp(hb, "LLPLERC1", 8) == 0) {
+                                if (fread(hb, 1, sizeof(hb), pf) == sizeof(hb) && memcmp(hb, "LLPLERC2", 8) == 0) {
                                     memcpy(&prof_rows, hb + 40, 8);
                                 }
                                 fclose(pf);
                             }
                         }
-                        const double above = part > 0 ? 1.0 - (double) part / (double) table : 1.0;
-                        const size_t stat_max = env_mib("LLAMA_PLE_ROW_CACHE_PRELOAD_MIB", part > 0 ? 2048 : 512);
-                        const size_t stat_b   = std::min<size_t>(stat_max, (size_t) (prof_rows * above * 1.02 * cost) + (prof_rows > 0 ? (1u << 20) : 0));
-                        const size_t dyn_b    = env_mib("LLAMA_PLE_ROW_CACHE_MIB", 256);
-                        size_t budget = stat_b + dyn_b;
-                        bool ok = budget > 0;
+                        size_t stat_b = std::min<size_t>(env_mib("LLAMA_PLE_ROW_CACHE_PRELOAD_MIB", part > 0 ? 2048 : 512),
+                                                         (size_t) std::min<uint64_t>(prof_rows, (uint64_t) t->ne[1]) * cost);
+                        size_t dyn_b  = env_mib("LLAMA_PLE_ROW_CACHE_MIB", 256);
+                        bool    ok   = stat_b + dyn_b > 0;
+                        int64_t skip = 0;
+                        size_t  part_min = part;
                         if (ok && part >= table) {
                             // the part holds the whole table: nothing to cache (LLAMA_PLE_ROW_CACHE=2 makes it anyway, beside the part)
                             ok = rc_mode == 2;
                         } else if (ok && part > 0) {
-                            // the cache's memory comes out of the part (a part smaller than 1 GiB after it is dropped)
-                            part = part > budget + (1ull << 30) ? (part - budget) & ~((8ull << 20) - 1) : 0;
-                        } else if (ok && rc_mode != 2 && avail > 0 && avail < (uint64_t) budget + (2ull << 30)) {
+                            // the cache's memory comes out of the part, at most a quarter of it
+                            const size_t cap = part / 4;
+                            dyn_b  = std::min(dyn_b, cap / 4);
+                            stat_b = std::min(stat_b, cap - dyn_b);
+                            part_min = (part - stat_b - dyn_b) & ~((8ull << 20) - 1);
+                            skip = (int64_t) (part_min / t->nb[1]);
+                        } else if (ok && rc_mode != 2 && avail > 0 && avail < (uint64_t) (stat_b + dyn_b) + (2ull << 30)) {
                             ok = false;
                         }
                         if (ok) {
-                            const int64_t skip = part > 0 ? (int64_t) (part / t->nb[1]) : 0;
-                            auto rc = std::make_unique<llama_row_cache>(t, budget, stat_b, skip);
+                            auto rc = std::make_unique<llama_row_cache>(t, dyn_b, stat_b, skip);
                             rc->load_profile(prof);
                             if (llama_row_cache_attach(rc.get())) {
                                 if (getenv("LLAMA_PLE_ROW_PROFILE_SAVE") && atoi(getenv("LLAMA_PLE_ROW_PROFILE_SAVE")) != 0 && !prof.empty()) {
                                     model.ple_row_profile_save = prof;
+                                }
+                                if (part > 0 && part < table) {
+                                    // the part gives up what the cache holds (rows from `skip` up are cached, not part rows)
+                                    part = std::max<size_t>(part_min, (part - std::min(part, rc->bytes())) & ~((size_t) (8ull << 20) - 1));
                                 }
                                 LLAMA_LOG_INFO("%s: PLE row cache of '%s': %.1f MiB (%zu slots, %zu rows preloaded%s), rows from %" PRId64 " up "
                                     "(below: the part in the page cache); LLAMA_PLE_ROW_CACHE=0 off\n", __func__, t->name, rc->bytes()/1048576.0,

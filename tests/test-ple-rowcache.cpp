@@ -120,7 +120,8 @@ static void test_gather(ggml_type type) {
 
     // a cache of ~1500 slots for 6000 rows (evictions), rows < 500 not cached
     const int64_t skip = 500;
-    llama_row_cache rc(g.tab, 1500*(row_b + 25), 0, skip);
+    const size_t  slot = llama_row_cache::slot_bytes(row_b);
+    llama_row_cache rc(g.tab, 1500*slot, 0, skip);
     rc.verify = true;
     rc.load_profile("");
     CHECK(llama_row_cache_attach(&rc), "%s: attach failed", ggml_type_name(type));
@@ -163,7 +164,7 @@ static void test_gather(ggml_type type) {
     CHECK(rc.save_profile(prof), "%s: save failed", ggml_type_name(type));
     llama_row_cache_detach(g.tab);
     {
-        llama_row_cache rc2(g.tab, 3000*(row_b + 25), 1500*(row_b + 25), skip);
+        llama_row_cache rc2(g.tab, 3000*slot, 1500*slot, skip);
         rc2.verify = true;
         const size_t n = rc2.load_profile(prof);
         CHECK(n > 0 && n == rc2.n_static(), "%s: profile preloaded %zu rows", ggml_type_name(type), n);
@@ -194,8 +195,60 @@ static void test_gather(ggml_type type) {
             fputc(c ^ 0x5a, f);
             fclose(f);
         }
-        llama_row_cache rc3(g.tab, 3000*(row_b + 25), 1500*(row_b + 25), skip);
+        llama_row_cache rc3(g.tab, 3000*slot, 3000*slot, skip); // every row of the file kept, the changed one included
         CHECK(rc3.load_profile(prof) == 0 && rc3.n_static() == 0, "%s: a stale profile was accepted", ggml_type_name(type));
+    }
+    {
+        // a profile of more rows than the spot check covers (5000+), one byte of a middle row changed: the row checksums refuse it;
+        // a profile cut short is refused before anything is allocated
+        llama_row_cache big(g.tab, 7000*slot, 0, 0);
+        std::vector<int32_t> all(nrows);
+        for (int64_t r = 0; r < nrows; ++r) {
+            all[r] = (int32_t) r;
+        }
+        llama_row_cache_attach(&big);
+        gather_run(g, std::vector<int32_t>(all.begin(), all.begin() + nids));
+        gather_run(g, std::vector<int32_t>(all.begin() + 1904, all.begin() + 1904 + nids));
+        llama_row_cache_detach(g.tab);
+        CHECK(big.save_profile(prof), "save big");
+        {
+            llama_row_cache ok2(g.tab, 0, 8000*slot, 0);
+            CHECK(ok2.load_profile(prof) > 4096, "%s: big profile: %zu rows preloaded", ggml_type_name(type), ok2.n_static());
+        }
+        FILE * f = fopen(prof.c_str(), "r+b");
+        if (f) {
+            // the entry count from the header, then a byte of entry 2500's row
+            uint64_t n_ent = 0;
+            fseek(f, 40, SEEK_SET);
+            CHECK(fread(&n_ent, 8, 1, f) == 1, "header");
+            const long at = (long) (48 + 12*n_ent + 2500*row_b + 3);
+            fseek(f, at, SEEK_SET);
+            const int c = fgetc(f);
+            fseek(f, at, SEEK_SET);
+            fputc(c ^ 0x01, f);
+            fclose(f);
+        }
+        llama_row_cache bad(g.tab, 0, 8000*slot, 0);
+        CHECK(bad.load_profile(prof) == 0, "%s: a big profile with a corrupt middle row was accepted", ggml_type_name(type));
+        // truncated: drop the last row
+        {
+            FILE * in = fopen(prof.c_str(), "rb");
+            std::vector<uint8_t> bytes;
+            if (in) {
+                int c;
+                while ((c = fgetc(in)) != EOF) {
+                    bytes.push_back((uint8_t) c);
+                }
+                fclose(in);
+            }
+            FILE * out = fopen(prof.c_str(), "wb");
+            if (out) {
+                fwrite(bytes.data(), 1, bytes.size() - row_b, out);
+                fclose(out);
+            }
+        }
+        llama_row_cache cut(g.tab, 0, 8000*slot, 0);
+        CHECK(cut.load_profile(prof) == 0, "%s: a truncated profile was accepted", ggml_type_name(type));
     }
     remove(prof.c_str());
     printf("gather %-7s row %4zu B: %zu sets x %d ids bit-identical (cold, warm, evictions, skip range, preloaded profile); %s\n",
