@@ -1789,10 +1789,10 @@ struct llama_moe_cache::impl {
             // k17-small (lazy KV step 2): with LLAMA_KV_LAZY=1 the banks can give memory back to the KV cache as it grows (shrink);
             // LLAMA_MOE_CACHE_SHRINK=0 keeps them plain buffers (step 1: the KV cache only backs its cells lazily)
             {
-                const char * e_kv = getenv("LLAMA_KV_LAZY");
+                // (k19-vramlend: the banks are lazy where a KV cache allocated now would be, llama_kv_lazy_alloc_on: LLAMA_KV_LAZY=1, or
+                // unset with the fit's grant; a drafter kept by --fit: plain banks, as without LLAMA_KV_LAZY)
                 const char * e_sh = getenv("LLAMA_MOE_CACHE_SHRINK");
-                const char * e_su = getenv("LLAMA_KV_LAZY_SUSPEND");   // a drafter kept by --fit: plain banks, as without LLAMA_KV_LAZY
-                shrink_on = e_kv != nullptr && atoi(e_kv) != 0 && (e_sh == nullptr || atoi(e_sh) != 0) && (e_su == nullptr || atoi(e_su) == 0);
+                shrink_on = llama_kv_lazy_alloc_on() && (e_sh == nullptr || atoi(e_sh) != 0);
             }
             for (device & d : devices) {
                 if (!d.ctx) {
@@ -11085,6 +11085,11 @@ void llama_moe_cache::set_restore_soft(bool on) {
 size_t llama_moe_cache::shrink(ggml_backend_dev_t dev, size_t bytes) {
     const int32_t id = pimpl->dev_id(dev);
     return id >= 0 ? pimpl->shrink(id, bytes) : 0;
+}
+
+bool llama_moe_cache::can_shrink(ggml_backend_dev_t dev) const {
+    const int32_t id = pimpl->dev_id(dev);
+    return id >= 0 && pimpl->shrink_on && pimpl->devices[id].bank_lazy && pimpl->devices[id].buf_bank;
 }
 
 void llama_moe_cache::set_shrink_floor(ggml_backend_dev_t dev, size_t bytes) {

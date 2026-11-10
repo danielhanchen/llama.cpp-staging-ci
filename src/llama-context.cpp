@@ -1062,6 +1062,25 @@ llama_context::llama_context(
         // k17-small (lazy KV step 2): a lazy KV cache (LLAMA_KV_LAZY=1) backs its cells as they grow, and the MoE cache gives the memory
         // for them back (llama_moe_cache::shrink). Its floor is what it holds now less the KV bytes not backed yet: the fit gave it those
         // bytes on top of the size it fitted beside the full-context KV (common_fit), so at the floor every cell fits
+        // k19-vramlend: a lazy KV cache of the automatic mode (LLAMA_KV_LAZY unset, the fit's grant) whose memory no MoE cache can give
+        // back (no cache, e.g. a refit without one, or banks that are not lazy) is backed whole now, as with LLAMA_KV_LAZY=0
+        if (memory && !model.hparams.no_alloc && llama_kv_lazy_mode() == 2) {
+            for (llama_kv_cache * kv : llama_memory_kv_caches(memory.get())) {
+                if (!kv->lazy_on()) {
+                    continue;
+                }
+                bool ok = moe_cache != nullptr;
+                for (const auto & [buft, bytes] : kv->lazy_unbacked()) {
+                    ok = ok && moe_cache->can_shrink(ggml_backend_buft_get_device(buft));
+                }
+                if (!ok) {
+                    if (!kv->lazy_ensure(kv->get_size())) {
+                        throw std::runtime_error("lazy KV: no device memory to back the KV cache whole");
+                    }
+                    LLAMA_LOG_INFO("%s: lazy KV: no MoE cache gives memory back here, the KV cache is backed whole (LLAMA_KV_LAZY=0 at load)\n", __func__);
+                }
+            }
+        }
         if (moe_cache && memory && !model.hparams.no_alloc) {
             std::map<ggml_backend_dev_t, size_t> unbacked;
             for (llama_kv_cache * kv : llama_memory_kv_caches(memory.get())) {

@@ -6,6 +6,8 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include "llama-ext.h"
+
 #include "ggml-alloc.h"
 
 #include <algorithm>
@@ -306,7 +308,8 @@ llama_kv_cache::llama_kv_cache(
     }
 
     // k17-small: LLAMA_KV_LAZY=1 reserves a device buffer's address range and backs only the cells in use (see lazy_ensure)
-    static const bool kv_lazy = getenv("LLAMA_KV_LAZY") != nullptr && atoi(getenv("LLAMA_KV_LAZY")) != 0;
+    // (k19-vramlend: unset = auto, see llama_kv_lazy_mode; read at every allocation, common sets the grant after the fit's measurements)
+    const bool kv_lazy = hparams.no_alloc ? llama_kv_lazy_measure_on() : llama_kv_lazy_alloc_on();
     // the cells backed at load
     const uint32_t lazy_n0 = [&]() {
         const char * e_init = getenv("LLAMA_KV_LAZY_INIT");
@@ -328,8 +331,8 @@ llama_kv_cache::llama_kv_cache(
             // chunk per tensor low left the cache 40 MiB short and the MTP drafter's staging took it, the first request ran out of memory)
             static const bool shrink_on = getenv("LLAMA_MOE_CACHE_SHRINK") == nullptr || atoi(getenv("LLAMA_MOE_CACHE_SHRINK")) != 0;
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-            const char * e_susp = getenv("LLAMA_KV_LAZY_SUSPEND");   // a fit beside a drafter: measured as backed whole (see common_fit)
-            if (kv_lazy && shrink_on && !(e_susp != nullptr && atoi(e_susp) != 0) && n_stream == 1 && !v_trans && dev != nullptr && !ggml_backend_buft_is_host(buft)) {
+            // (a fit beside a drafter: measured as backed whole, LLAMA_KV_LAZY_SUSPEND, see common_fit and llama_kv_lazy_measure_on)
+            if (kv_lazy && shrink_on && n_stream == 1 && !v_trans && dev != nullptr && !ggml_backend_buft_is_host(buft)) {
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
                 auto alloc_fn     = reg ? (ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_alloc_lazy") : nullptr;
                 auto commit_fn    = reg ? (bool (*)(ggml_backend_buffer_t, size_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_commit") : nullptr;
@@ -368,9 +371,7 @@ llama_kv_cache::llama_kv_cache(
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
             // LLAMA_KV_LAZY_SUSPEND=1 (set by common where --fit keeps a drafter): the whole KV cache is backed at load, as without
             // LLAMA_KV_LAZY (read at every allocation: the fit's measurements run before the decision)
-            const char * e_susp = getenv("LLAMA_KV_LAZY_SUSPEND");
-            const bool   susp   = e_susp != nullptr && atoi(e_susp) != 0;
-            if (kv_lazy && !susp && n_stream == 1 && !v_trans && dev != nullptr && !ggml_backend_buft_is_host(buft)) {
+            if (kv_lazy && n_stream == 1 && !v_trans && dev != nullptr && !ggml_backend_buft_is_host(buft)) {
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
                 auto alloc_fn  = reg ? (ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_alloc_lazy") : nullptr;
                 auto commit_fn = reg ? (bool (*)(ggml_backend_buffer_t, size_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_commit") : nullptr;
@@ -3895,4 +3896,34 @@ void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32
 bool llama_kv_cache_context::get_prev_tokens_ahead(const llama_ubatch & ubatch, const llama_ubatch * pending, uint32_t n,
         std::vector<llama_token> & res, std::vector<uint8_t> & known) const {
     return kv->get_prev_tokens_ahead(ubatch, pending, n, res, known);
+}
+
+// k19-vramlend: see llama-ext.h
+int llama_kv_lazy_mode() {
+    const char * e = getenv("LLAMA_KV_LAZY");
+    if (e == nullptr || *e == '\0') {
+        return 2;
+    }
+    return atoi(e) != 0 ? 1 : 0;
+}
+
+static bool llama_kv_lazy_suspended() {
+    const char * e = getenv("LLAMA_KV_LAZY_SUSPEND");
+    return e != nullptr && atoi(e) != 0;
+}
+
+bool llama_kv_lazy_alloc_on() {
+    const int mode = llama_kv_lazy_mode();
+    if (mode == 0 || llama_kv_lazy_suspended()) {
+        return false;
+    }
+    if (mode == 1) {
+        return true;
+    }
+    const char * g = getenv("LLAMA_KV_LAZY_GRANTED");
+    return g != nullptr && atoi(g) != 0;
+}
+
+bool llama_kv_lazy_measure_on() {
+    return llama_kv_lazy_mode() != 0 && !llama_kv_lazy_suspended();
 }

@@ -3924,7 +3924,9 @@ uma_restart:
         {
             const char * e_kv = getenv("LLAMA_KV_LAZY");
             const char * e_fd = getenv("LLAMA_KV_LAZY_FIT_DRAFT");
-            const bool lazy_on  = e_kv != nullptr && atoi(e_kv) != 0;
+            // k19-vramlend: unset = auto (on where the fit gave the MoE cache the unbacked KV), LLAMA_KV_LAZY=0 off (the kill switch)
+            const bool lazy_auto = e_kv == nullptr || *e_kv == '\0';
+            const bool lazy_on   = lazy_auto || atoi(e_kv) != 0;
             const bool draft_on = !params.speculative.draft.fit_off && !params.speculative.draft.fit_on_cpu && (params.speculative.has_dft() ||
                 std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end());
             const bool suspend  = lazy_on && draft_on && !(e_fd != nullptr && atoi(e_fd) != 0);
@@ -3937,6 +3939,16 @@ uma_restart:
                 }
                 COM_INF("%s: lazy KV: a drafter is kept, the KV cache is backed whole at load, MoE cache %zu MiB (%zu MiB of unbacked KV "
                     "given back; LLAMA_KV_LAZY_FIT_DRAFT=1 keeps lazy KV)\n", __func__, cparams.moe_cache_size/(1024*1024), grant/(1024*1024));
+            }
+            // k19-vramlend: the automatic mode backs the KV lazily only where this fit gave the MoE cache the KV it leaves unbacked (the
+            // cache gives it back as the context grows); elsewhere (no MoE cache, several devices, a fit that granted nothing) the KV cache
+            // is backed whole at load as with LLAMA_KV_LAZY=0
+            const size_t grant_now = suspend || !lazy_on ? 0 : common_fit_kv_lazy_grant(cparams.moe_cache_size);
+            common_set_env("LLAMA_KV_LAZY_GRANTED", grant_now > 0 ? "1" : "0");
+            if (grant_now > 0) {
+                COM_INF("%s: lazy KV %s: the KV cache backs the cells in use, the MoE cache (%zu MiB) holds the %zu MiB of KV cells not backed "
+                    "yet and gives them back as the context grows (LLAMA_KV_LAZY=0 to disable)\n", __func__, lazy_auto ? "on (auto)" : "on",
+                    cparams.moe_cache_size/(1024*1024), grant_now/(1024*1024));
             }
         }
 

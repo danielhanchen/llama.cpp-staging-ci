@@ -78,6 +78,15 @@ struct llama_memory_breakdown_data {
     }
 };
 
+// k19-vramlend: lazy KV mode (LLAMA_KV_LAZY): 0 = off (=0, the kill switch), 1 = on (=1: every eligible device KV cache backs its cells
+// lazily, also without a MoE cache to lend to), 2 = auto (unset: a fit measures the KV lazily and gives the MoE cache the bytes the first
+// cells leave unbacked; the KV cache is then lazy only where common set LLAMA_KV_LAZY_GRANTED=1 for that fit, see common_init_result)
+int  llama_kv_lazy_mode();
+// whether a device KV cache allocated now backs its cells lazily (LLAMA_KV_LAZY_SUSPEND=1 always backs it whole)
+bool llama_kv_lazy_alloc_on();
+// whether a measurement (no_alloc) reports the KV bytes a lazy KV cache leaves unbacked at load (mb.kv_lazy)
+bool llama_kv_lazy_measure_on();
+
 struct llama_device_memory_data {
     int64_t total;
     int64_t free;

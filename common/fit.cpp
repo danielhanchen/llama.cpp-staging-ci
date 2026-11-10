@@ -471,7 +471,7 @@ static void common_params_fit_impl(
     {
         const char * e_kv = getenv("LLAMA_KV_LAZY");
         const char * e_fd = getenv("LLAMA_KV_LAZY_FIT_DRAFT");
-        if (e_kv != nullptr && atoi(e_kv) != 0) {
+        if (e_kv == nullptr || *e_kv == '\0' || atoi(e_kv) != 0) {   // k19-vramlend: unset = auto (on)
             const char * v = extra != nullptr && !(e_fd != nullptr && atoi(e_fd) != 0) ? "1" : "0";
 #if defined(_WIN32)
             _putenv_s("LLAMA_KV_LAZY_SUSPEND", v);
