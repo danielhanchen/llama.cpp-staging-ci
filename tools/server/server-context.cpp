@@ -1914,6 +1914,35 @@ private:
             // (experts placed on the host by hand, --cpu-moe / --n-cpu-moe / -ot, or a fixed --moe-cache-mib: a cache tier too)
             const bool host_experts = tpp_host_experts(params.tensor_buft_overrides, params.moe_cache_size, params.moe_cache_auto);
             const bool cache_expected = (fe != nullptr && atoi(fe) != 0) || (n_gpu > 0 && (host_experts || !(need > (1536ull << 20) && need <= dev_free)));
+            // k19-sharegate (LLAMA_SPEC_TPP_SHAREGATE=0: off, the blanket rule above): a cache expected to hold nearly every routed
+            // expert (estimated share = 1 - (need - free) / expert bytes, at least LLAMA_SPEC_TPP_CACHED_SHARE, default 0.85) keeps the
+            // priced 3-draft windows, as LLAMA_SPEC_TPP_CACHED=1. The rule above came from fn4 at a 9-14% share; at ~92% (q4x on a 24 GB
+            // L4) a 4th verify row misses few experts. Not for experts placed on the host by hand, not with LLAMA_MTP_EXACT=1, only
+            // where the routed experts fit in host RAM (misses not read from the disk)
+            const char * sg = getenv("LLAMA_SPEC_TPP_SHAREGATE");
+            const bool share_try = mtp_shape && cache_expected && ce == nullptr && !(fe != nullptr && atoi(fe) != 0) &&
+                !host_experts && n_gpu > 0 && (sg == nullptr || atoi(sg) != 0) &&
+                !(getenv("LLAMA_MTP_EXACT") != nullptr && atoi(getenv("LLAMA_MTP_EXACT")) != 0) &&
+                (e != nullptr ? atoi(e) != 0 : dev_ok);
+            const uint64_t share_exp = share_try ? common_moe_expert_bytes(params.model.path) : 0;
+            const double share_min = [] {
+                const char * s = getenv("LLAMA_SPEC_TPP_CACHED_SHARE");
+                return s != nullptr ? atof(s) : 0.85;
+            }();
+            const uint64_t share_short = need > dev_free ? need - dev_free : 0;
+            const double share_est = share_exp > 0 ? 1.0 - (double) share_short/(double) share_exp : 0.0;
+            const uint64_t share_ram = share_exp > 0 ? llama_available_memory() : 0;
+            const bool share_ok = share_exp > 0 && share_est >= share_min && (share_ram == 0 || share_exp <= share_ram);
+            if (share_try) {
+                SRV_INF("k19-sharegate: MoE cache expected to hold %.1f%% of the routed experts (%.0f MiB short of %.0f MiB, %.0f MiB of RAM): "
+                    "priced 3-draft windows %s (LLAMA_SPEC_TPP_CACHED_SHARE=%.2f; LLAMA_SPEC_TPP_SHAREGATE=0: off)\n", 100.0*share_est,
+                    share_short/1048576.0, share_exp/1048576.0, share_ram/1048576.0, share_ok ? "on" : "off", share_min);
+            }
+            if (share_ok) {
+                // the speculative ctor's cache rule and the verify tag (llama-context.cpp) both read it
+                common_set_env("LLAMA_SPEC_TPP_CACHED", "1");
+                ce = getenv("LLAMA_SPEC_TPP_CACHED");
+            }
             const bool fits_all = (ce != nullptr && atoi(ce) != 0) || !cache_expected;
             // LLAMA_SPEC_TPP=1 forces past the device rule, not the MoE cache rule
             const bool on = (e != nullptr ? atoi(e) != 0 : dev_ok) && fits_all;
@@ -1972,7 +2001,8 @@ private:
                 // G4 Qwen3.8-Flash-Next fn4 full card (plans/k19_depth.md): 4 drafts +6.8% chat / +10.9% 8k, -13% 30k against 2 + tpp.
                 // Built-in heads (Qwen3.6) stay at the windows above: their extra verify row costs ~20% of a pass (plans/k19_fn_tpp.md)
                 const char * de = getenv("LLAMA_SPEC_DEPTH");
-                const bool deep = de != nullptr ? atoi(de) != 0 : sp.has_dft();
+                // (k19-sharegate: beside the cache the deep windows stay opt-in, LLAMA_SPEC_DEPTH=1)
+                const bool deep = de != nullptr ? atoi(de) != 0 : sp.has_dft() && !share_ok;
                 sp.draft.n_floor = 2;
                 sp.draft.n_max   = deep ? 4 : 3;
                 SRV_INF("k19-tpp: MTP drafts 2, a 3rd where it pays (need %.0f MiB for model + drafter, %.0f MiB free on %d GPUs%s; "
