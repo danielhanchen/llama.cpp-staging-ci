@@ -1373,6 +1373,13 @@ llama_context::llama_context(
                         size_t stat_b = std::min<size_t>(env_mib("LLAMA_PLE_ROW_CACHE_PRELOAD_MIB", part > 0 ? 2048 : 512),
                                                          (size_t) std::min<uint64_t>(prof_rows, (uint64_t) t->ne[1]) * cost);
                         size_t dyn_b  = env_mib("LLAMA_PLE_ROW_CACHE_MIB", 256);
+                        // beside a page part, rows the gather faults stay in the page cache anyway: without a profile (or a profile
+                        // to write back, or an explicit LLAMA_PLE_ROW_CACHE_MIB) the cache would only take RAM from the part
+                        // (A100 VM fn4nd 8k, dynamic rows only: 52.9k disk reads vs 47.5k), so it is not made there
+                        const bool prof_save = getenv("LLAMA_PLE_ROW_PROFILE_SAVE") && atoi(getenv("LLAMA_PLE_ROW_PROFILE_SAVE")) != 0;
+                        if (part > 0 && part < table && stat_b == 0 && !prof_save && getenv("LLAMA_PLE_ROW_CACHE_MIB") == nullptr && rc_mode != 2) {
+                            dyn_b = 0;
+                        }
                         bool    ok   = stat_b + dyn_b > 0;
                         int64_t skip = 0;
                         size_t  part_min = part;
@@ -1393,7 +1400,7 @@ llama_context::llama_context(
                             auto rc = std::make_unique<llama_row_cache>(t, dyn_b, stat_b, skip);
                             rc->load_profile(prof);
                             if (llama_row_cache_attach(rc.get())) {
-                                if (getenv("LLAMA_PLE_ROW_PROFILE_SAVE") && atoi(getenv("LLAMA_PLE_ROW_PROFILE_SAVE")) != 0 && !prof.empty()) {
+                                if (prof_save && !prof.empty()) {
                                     model.ple_row_profile_save = prof;
                                 }
                                 if (part > 0 && part < table) {
