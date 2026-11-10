@@ -1917,7 +1917,56 @@ private:
             const bool fits_all = (ce != nullptr && atoi(ce) != 0) || !cache_expected;
             // LLAMA_SPEC_TPP=1 forces past the device rule, not the MoE cache rule
             const bool on = (e != nullptr ? atoi(e) != 0 : dev_ok) && fits_all;
-            if (mtp_shape && on) {
+            // k19-fnmtp (opt-in, LLAMA_SPEC_DEPTH_CACHED=N drafts, N = 3..8; unset / 0: off): beside a MoE cache an MTP drafter of its own
+            // (-md) drafts N in every window below LLAMA_SPEC_DEPTH_POS (12288), the windows from there are k19-tpp's priced ones (2, a 3rd
+            // where it pays at the cache's cost ratio). The 4-row windows then get the verify tag (LLAMA_SPEC_VERIFY4_CACHED=1 is set unless
+            // given), so they run the 3-row kernels instead of cuBLAS. Not with LLAMA_MTP_EXACT=1 (beside a cache the exact text follows the
+            // window where the CPU-miss host path runs, plans/k19_a100chat.md section 5): there the windows stay at 2.
+            // Opt-in because the deeper window does not pay by itself on the measured cached tiers (plans/k19_fnmtp.md, Colab A100 40 GB
+            // Qwen3.8-Flash-Next UD-IQ4_XS from the VM disk, 3 launches, with the PLE table read in part): 3 drafts full card chat +3.4% /
+            // 8k -3.8%, 16 GB chat -6% / 8k +7.6%; 4 drafts full card +1.8% / +6.8%, 16 GB -16% / -14%. A verify row costs ~10 ms there
+            // (PLE rows read from the disk and expert misses copied at ~10 GB/s), against 3.4 -> 4.0 tokens per pass
+            const bool exact_mtp = [] {
+                const char * x = getenv("LLAMA_MTP_EXACT");
+                return x != nullptr && atoi(x) != 0;
+            }();
+            const int depth_cached = [] {
+                const char * d = getenv("LLAMA_SPEC_DEPTH_CACHED");
+                return d != nullptr ? atoi(d) : 0;
+            }();
+            // Only where the routed experts fit in host RAM: where they do not (Colab L4, 52 GB of RAM for the 57.6 GB of experts of fn4n)
+            // the cache's misses are read from the disk and each verify row costs ~27% of a pass (fm_l1: 4 drafts -5% chat), so the windows
+            // stay at 2 there. LLAMA_SPEC_DEPTH_CACHED_DISK=1: on there too; LLAMA_SPEC_DEPTH_CACHED_RAM_MIB=N: N MiB of RAM instead of
+            // MemAvailable (test hook)
+            const uint64_t ram_avail = [] {
+                const char * r = getenv("LLAMA_SPEC_DEPTH_CACHED_RAM_MIB");
+                return r != nullptr ? (uint64_t) (std::max(0.0, atof(r))*1048576.0) : llama_available_memory();
+            }();
+            const bool disk_ok = [] {
+                const char * d = getenv("LLAMA_SPEC_DEPTH_CACHED_DISK");
+                return d != nullptr && atoi(d) != 0;
+            }();
+            const uint64_t expert_bytes = mtp_shape && !on && cache_expected && depth_cached >= 3 ? common_moe_expert_bytes(params.model.path) : 0;
+            const bool ram_fits = ram_avail == 0 || expert_bytes <= ram_avail;
+            // (the device rule as k19-tpp's: NVIDIA Ampere or newer, LLAMA_SPEC_TPP=1 forces past it, =0 turns this off too)
+            const bool deep_cached = mtp_shape && !on && cache_expected && sp.has_dft() && (e != nullptr ? atoi(e) != 0 : dev_ok) &&
+                depth_cached >= 3 && !exact_mtp && (ram_fits || disk_ok);
+            if (mtp_shape && !on && cache_expected && sp.has_dft() && depth_cached >= 3 && !exact_mtp && !(ram_fits || disk_ok)) {
+                SRV_INF("k19-fnmtp: MTP stays at 2 drafts beside the MoE cache: the routed experts (%.0f MiB) do not fit in %.0f MiB of RAM, "
+                    "the cache's misses come from the disk (LLAMA_SPEC_DEPTH_CACHED_DISK=1: deeper windows anyway)\n",
+                    expert_bytes/1048576.0, ram_avail/1048576.0);
+            }
+            if (deep_cached) {
+                sp.draft.n_floor     = 2;
+                sp.draft.n_max       = std::min(depth_cached, 8);
+                sp.draft.deep_cached = true;
+                if (getenv("LLAMA_SPEC_VERIFY4_CACHED") == nullptr) {
+                    common_set_env("LLAMA_SPEC_VERIFY4_CACHED", "1");
+                }
+                SRV_INF("k19-fnmtp: MoE cache expected (need %.0f MiB for model + drafter, %.0f MiB free on the GPUs): MTP drafts %d in every "
+                    "window below position %s, 2 and a priced 3rd from there; 4-row verify windows tagged (LLAMA_SPEC_DEPTH_CACHED=0: 2 drafts)\n", need/1048576.0,
+                    dev_free/1048576.0, sp.draft.n_max, getenv("LLAMA_SPEC_DEPTH_POS") != nullptr ? getenv("LLAMA_SPEC_DEPTH_POS") : "12288");
+            } else if (mtp_shape && on) {
                 // k19-depth (LLAMA_SPEC_DEPTH=0: off, =1: also beside built-in MTP heads): with an MTP drafter of its own (-md), every window
                 // below position 12288 (LLAMA_SPEC_DEPTH_POS) drafts 4, the windows from there are the ones above (2, a 3rd where it pays).
                 // G4 Qwen3.8-Flash-Next fn4 full card (plans/k19_depth.md): 4 drafts +6.8% chat / +10.9% 8k, -13% 30k against 2 + tpp.

@@ -181,6 +181,19 @@ static bool llama_verify_wide_cached_env() {
     return value;
 }
 
+// k19-fnmtp: LLAMA_SPEC_VERIFY4_CACHED=1 (off by default; the server sets it with LLAMA_SPEC_DEPTH_CACHED): beside an MoE cache a
+// 4-token verify batch (a 3-draft MTP window, a 4-row DFlash window) is tagged too. Untagged, its F32 products leave mmvf for cuBLAS
+// (TF32 sgemm + split-K outside the CUDA graph: 3.7 ms of kernels and ~12 ms of host time per pass, Colab A100 48 GB fn4n,
+// plans/k19_a100chat.md R4; fm_m1 A100 40 GB full card: 4-row verify 54.8 ms untagged vs 52.5 tagged); tagged it runs the 3-row
+// window's kernels. 2..3-token windows (Studio's 2-draft MTP default) are never affected
+static bool llama_verify4_cached_env() {
+    static const bool value = [] {
+        const char * env = getenv("LLAMA_SPEC_VERIFY4_CACHED");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return value;
+}
+
 // k19-tpp: no verify tag while an MoE cache runs (LLAMA_SPEC_TPP_CACHED=1: tagged there too; LLAMA_SPEC_TPP_FORCE_CACHED=1, a test
 // hook: as if a cache ran), so a cached tier verifies as LLAMA_SPEC_TPP=0 does there
 static bool llama_tpp_cached_env() {
@@ -5544,7 +5557,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         cparams.verify_tag      = llama_verify_tag_env() && cparams.verify && !cparams.batch_invariant && ubatch.n_tokens > 1 && !output_all &&
             (!(moe_cache_active() || llama_tpp_force_cached_env()) || llama_tpp_cached_env() ||
              (llama_tpp_cached_pos_min() >= 0 && ubatch.pos != nullptr && ubatch.pos[0] >= llama_tpp_cached_pos_min()) ||
-             (ubatch.n_tokens >= 5 && llama_verify_wide_cached_env()));
+             (ubatch.n_tokens >= (llama_verify4_cached_env() ? 4 : 5) && llama_verify_wide_cached_env()));
 
         // k19-tiny-ub: with the banks released every layer is built as a large batch (an output-only last layer would read the banks
         // through a host lookup)

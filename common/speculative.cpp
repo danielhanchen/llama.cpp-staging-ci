@@ -2198,7 +2198,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const char * fe = getenv("LLAMA_SPEC_TPP_FORCE_CACHED");
             const bool cached = (this->params.ctx_tgt != nullptr && llama_moe_cache_active(this->params.ctx_tgt)) || (fe != nullptr && atoi(fe) != 0);
             const char * ce = getenv("LLAMA_SPEC_TPP_CACHED");
-            if (cached && !(ce != nullptr && atoi(ce) != 0)) {
+            // (k19-fnmtp: the server's rule for a cache, params.deep_cached, keeps the windows)
+            if (cached && !(ce != nullptr && atoi(ce) != 0) && !this->params.deep_cached) {
                 // an MoE cache: the policy is off and the window is the floor's, as with LLAMA_SPEC_TPP=0 (a wider window reads more
                 // streamed experts and moves which ones stay resident; G4 fn4 16 GB, ktp_g4e: 0.94-0.96 of base at 16k / 30k)
                 tpp_floor = 0;
@@ -2213,6 +2214,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (tpp_floor > 0) {
             const bool cached = this->params.ctx_tgt != nullptr && llama_moe_cache_active(this->params.ctx_tgt);
             tpp_cost.set_cached(cached);
+            if (this->params.deep_cached) {
+                // k19-fnmtp: every window below deep_pos drafts n_max, also where that is floor + 1 (3 drafts)
+                tpp_cost.deep_all = true;
+                LOG_INF("%s: k19-fnmtp: MoE cache %s: MTP windows of %d drafts below position %lld, from there %d and a priced %d "
+                    "(LLAMA_SPEC_DEPTH_CACHED=0: off)\n", __func__, cached ? "on" : "off (expected by the server)", this->params.n_max,
+                    (long long) tpp_cost.deep_pos, tpp_floor, tpp_floor + 1);
+            }
             // k19-q38d: a dense target (no <arch>.expert_count) keeps the deep windows at every position. Its verify reads each weight
             // once for all the window's rows, so the deeper window's extra rows cost little at long context too: G4 Qwen3.8-27B
             // UD-Q4_K_XL + its MTP head, full card, 30k prompt: 4 drafts past position 12288 151.1 tok/s (3.12 tokens, 20.7 ms per pass)
