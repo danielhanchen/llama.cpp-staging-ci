@@ -179,14 +179,15 @@ static bool llama_verify_wide_cached_env() {
     return value;
 }
 
-// k19-fnmtp: LLAMA_SPEC_VERIFY4_CACHED (default on, =0 off): beside an MoE cache a 4-token verify batch (the deeper MTP windows of
-// LLAMA_SPEC_DEPTH_CACHED, a 4-row DFlash window) is tagged too. Untagged, its F32 products leave mmvf for cuBLAS (TF32 sgemm + split-K
-// outside the CUDA graph: 3.7 ms of kernels and ~12 ms of host time per pass, Colab A100 48 GB fn4n, plans/k19_a100chat.md R4); tagged
-// it runs the 3-row window's kernels. 2..3-token windows (Studio's 2-draft MTP default) stay untagged, so their text is unchanged
+// k19-fnmtp: LLAMA_SPEC_VERIFY4_CACHED=1 (off by default; the server sets it with LLAMA_SPEC_DEPTH_CACHED): beside an MoE cache a
+// 4-token verify batch (a 3-draft MTP window, a 4-row DFlash window) is tagged too. Untagged, its F32 products leave mmvf for cuBLAS
+// (TF32 sgemm + split-K outside the CUDA graph: 3.7 ms of kernels and ~12 ms of host time per pass, Colab A100 48 GB fn4n,
+// plans/k19_a100chat.md R4; fm_m1 A100 40 GB full card: 4-row verify 54.8 ms untagged vs 52.5 tagged); tagged it runs the 3-row
+// window's kernels. 2..3-token windows (Studio's 2-draft MTP default) are never affected
 static bool llama_verify4_cached_env() {
     static const bool value = [] {
         const char * env = getenv("LLAMA_SPEC_VERIFY4_CACHED");
-        return env == nullptr || atoi(env) != 0;
+        return env != nullptr && atoi(env) != 0;
     }();
     return value;
 }
