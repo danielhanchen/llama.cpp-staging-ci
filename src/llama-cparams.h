@@ -41,6 +41,7 @@ struct llama_cparams {
     bool batch_invariant;         // the current ubatch is a verify batch computed batch invariant (LLAMA_MTP_EXACT=1)
     bool verify_tag;              // k19-tpp: the current ubatch is a verify batch of 2+ tokens, not batch invariant: its nodes carry GGML_TENSOR_FLAG_VERIFY
     uint32_t exact_split;         // batch invariant ubatch: rows whose attention sees fewer KV cells (llm_graph_exact_split)
+    uint32_t dsv41_far = 0;       // k19-dsv4long: leading rows of the current ubatch that stop before hparams.dsv41_far_layer (0 = none)
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;

@@ -341,6 +341,7 @@ struct llama_hparams {
     uint32_t dsv41_cand_block_size  = 0;
     bool     dsv41_tok_hist         = false; // KV cells keep token ids for the Engram n-gram history
     uint32_t dsv41_hist_len         = 0;     // Engram: predecessor tokens an n-gram hash reads (max_ngram - 1)
+    int32_t  dsv41_far_layer        = -1;    // k19-dsv4long: first layer a prompt row far from the read's end may skip (-1 = none)
 
     // 0 = full rank (DeepSeek-V4)
     uint32_t hc_low_rank = 0;

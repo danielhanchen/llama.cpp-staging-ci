@@ -637,6 +637,166 @@ static __global__ void __launch_bounds__(BLOCK_SIZE, 1) top_k_radix_one_block(
     }
 }
 
+// k19-dsv4long: top_k_radix_one_block with IPT contiguous columns per thread and pass (vector loads when aligned): the same histograms
+// (counts do not depend on the visit order), the same threshold / kept-tie count, and the same gather order (keys above the threshold
+// in column order, then the first kept ties in column order: one block scan of per-thread counts per BLOCK_SIZE*IPT columns), so the
+// output is bitwise that of top_k_radix_one_block / top_k_radix_cuda. The old kernel issued one 4-byte load per thread and step, so a
+// 60k-column decode row (DeepSeek-V4.1 indexer at long context) took ~200 us on one T4 SM. GGML_CUDA_TOPK_ONEBLOCK_V2=0: off (the old
+// kernel up to 65536 columns, as before).
+#ifndef GGML_CUDA_TOP_K_ONE_BLOCK_V2_MAX_NCOLS
+#    define GGML_CUDA_TOP_K_ONE_BLOCK_V2_MAX_NCOLS (1 << 20)
+#endif // GGML_CUDA_TOP_K_ONE_BLOCK_V2_MAX_NCOLS
+
+template<int IPT>
+static __device__ __forceinline__ void top_k_load_ipt(const float * __restrict__ row, const int c, const int ncols, const bool vec, float (&v)[IPT]) {
+    if (vec && c + IPT <= ncols) {
+#pragma unroll
+        for (int j = 0; j < IPT; j += 4) {
+            const float4 t = *(const float4 *) (row + c + j);
+            v[j + 0] = t.x; v[j + 1] = t.y; v[j + 2] = t.z; v[j + 3] = t.w;
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < IPT; ++j) {
+            v[j] = c + j < ncols ? row[c + j] : 0.0f;
+        }
+    }
+}
+
+template<int BLOCK_SIZE, int IPT>
+static __global__ void __launch_bounds__(BLOCK_SIZE, 1) top_k_radix_one_block_v2(
+        const float * __restrict__ src, int * __restrict__ dst, const int ncols, const int k) {
+    constexpr int RADIX_BITS = 8;
+    constexpr int NBINS      = 1 << RADIX_BITS;
+    constexpr int NWARPS     = BLOCK_SIZE / WARP_SIZE;
+    constexpr int CHUNK      = BLOCK_SIZE * IPT;
+    static_assert(BLOCK_SIZE >= NBINS && BLOCK_SIZE % WARP_SIZE == 0, "one thread per bin");
+    static_assert(CHUNK < (1 << 15), "two 16 bit counters per int");
+    static_assert(IPT % 4 == 0, "float4 loads");
+
+    const int tid  = threadIdx.x;
+    const int warp = tid / WARP_SIZE;
+    const int lane = tid % WARP_SIZE;
+    const float * row_src = src + (size_t) blockIdx.x * ncols;
+    int *         row_dst = dst + (size_t) blockIdx.x * k;
+    const bool    vec     = ((uintptr_t) row_src % 16) == 0;
+
+    __shared__ int      histogram[NBINS];
+    __shared__ int      warp_counts[NWARPS];
+    __shared__ uint32_t s_prefix;
+    __shared__ int      s_rank;
+
+    uint32_t prefix      = 0;
+    uint32_t prefix_mask = 0;
+    int      rank        = k;
+    for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
+        if (tid < NBINS) {
+            histogram[tid] = 0;
+        }
+        __syncthreads();
+        for (int col0 = 0; col0 < ncols; col0 += CHUNK) {
+            const int c = col0 + tid*IPT;
+            float v[IPT];
+            top_k_load_ipt<IPT>(row_src, c, ncols, vec, v);
+#pragma unroll
+            for (int j = 0; j < IPT; ++j) {
+                const uint32_t key   = top_k_float_to_ordered(v[j]);
+                const bool     match = c + j < ncols && (key & prefix_mask) == prefix;
+                top_k_histogram_add(histogram, (key >> shift) & (NBINS - 1), match);
+            }
+        }
+        __syncthreads();
+
+        const int bin = NBINS - 1 - tid;
+        const int h   = tid < NBINS ? histogram[bin] : 0;
+        int incl = warp_prefix_inclusive_sum<int>(h);
+        if (lane == WARP_SIZE - 1) {
+            warp_counts[warp] = incl;
+        }
+        __syncthreads();
+        if (tid < NBINS) {
+            for (int w = 0; w < warp; ++w) {
+                incl += warp_counts[w];
+            }
+            const int excl = incl - h; // S(bin + 1)
+            if (excl < rank && (incl >= rank || bin == 0)) {
+                s_prefix = prefix | ((uint32_t) bin << shift);
+                s_rank   = rank - excl;
+            }
+        }
+        __syncthreads();
+        prefix       = s_prefix;
+        rank         = s_rank;
+        prefix_mask |= (uint32_t) (NBINS - 1) << shift;
+    }
+
+    const int n_equal   = rank;
+    const int n_greater = k - n_equal;
+    int pos_greater = 0;
+    int pos_equal   = 0;
+    for (int col0 = 0; col0 < ncols; col0 += CHUNK) {
+        if (pos_greater >= n_greater && pos_equal >= n_equal) {
+            break; // uniform: every thread holds the same counters
+        }
+        const int c = col0 + tid*IPT;
+        float v[IPT];
+        top_k_load_ipt<IPT>(row_src, c, ncols, vec, v);
+        int n_g = 0;
+        int n_e = 0;
+#pragma unroll
+        for (int j = 0; j < IPT; ++j) {
+            const uint32_t key = top_k_float_to_ordered(v[j]);
+            n_g += c + j < ncols && key >  prefix;
+            n_e += c + j < ncols && key == prefix;
+        }
+
+        const int flags     = n_g | (n_e << 16);
+        const int inclusive = warp_prefix_inclusive_sum<int>(flags);
+        if (lane == WARP_SIZE - 1) {
+            warp_counts[warp] = inclusive;
+        }
+        __syncthreads();
+
+        int before = 0;
+        int total  = 0;
+#pragma unroll
+        for (int w = 0; w < NWARPS; ++w) {
+            const int cw = warp_counts[w];
+            before += w < warp ? cw : 0;
+            total  += cw;
+        }
+        const int exclusive = before + inclusive - flags;
+
+        if (n_g | n_e) {
+            int og = pos_greater + (exclusive & 0xFFFF);
+            int oe = pos_equal   + (exclusive >> 16);
+#pragma unroll
+            for (int j = 0; j < IPT; ++j) {
+                const uint32_t key = top_k_float_to_ordered(v[j]);
+                if (c + j < ncols && key > prefix) {
+                    row_dst[og++] = c + j;
+                } else if (c + j < ncols && key == prefix) {
+                    if (oe < n_equal) {
+                        row_dst[n_greater + oe] = c + j;
+                    }
+                    oe++;
+                }
+            }
+        }
+        pos_greater += total & 0xFFFF;
+        pos_equal   += total >> 16;
+        __syncthreads();
+    }
+}
+
+static bool ggml_cuda_top_k_one_block_v2_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_TOPK_ONEBLOCK_V2");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static bool ggml_cuda_top_k_one_block_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_TOPK_ONEBLOCK");
@@ -647,6 +807,16 @@ static bool ggml_cuda_top_k_one_block_enabled() {
 
 static void top_k_radix_one_block_cuda(const float * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
     constexpr int BLOCK_SIZE = 1024;
+    if (ggml_cuda_top_k_one_block_v2_enabled()) {
+        top_k_radix_one_block_v2<BLOCK_SIZE, 8><<<(unsigned int) nrows, BLOCK_SIZE, 0, stream>>>(src, dst, ncols, k);
+        static bool logged_v2 = false;
+        if (!logged_v2) {
+            logged_v2 = true;
+            GGML_LOG_INFO("%s: k19 top-k radix select in one launch, 8 columns per thread (%lld rows of %d; GGML_CUDA_TOPK_ONEBLOCK_V2=0: off)\n",
+                    __func__, (long long) nrows, ncols);
+        }
+        return;
+    }
     top_k_radix_one_block<BLOCK_SIZE><<<(unsigned int) nrows, BLOCK_SIZE, 0, stream>>>(src, dst, ncols, k);
     static bool logged = false;
     if (!logged) {
@@ -723,8 +893,14 @@ static void ggml_cuda_op_top_k_deterministic(ggml_cuda_pool & pool, const float 
 #endif // GGML_CUDA_USE_CUB
 
     // k19: few rows (one wave of blocks): the same selection and order in one launch, see top_k_radix_one_block
+    // k19-dsv4long (Kaggle T4, test-topk-oneblock-exact): one block per row wins up to ~32k columns (v2: 15360 cols 37 us vs 43
+    // multi-block vs 58 old one-block; 30000: 54 / 58 / 105) and for many rows (40 x 60000: 190 / 355 / 308); for 1-2 rows of more
+    // columns the 64-block-per-row multi-block path is faster (60000: 68 vs 96 v2 vs 194 old; 122880: 62 vs 167), so with v2 on, few
+    // long rows go there (before, the old one-block kernel took them up to 65536 columns)
+    const bool one_block_v2 = ggml_cuda_top_k_one_block_v2_enabled();
     if (ggml_cuda_top_k_one_block_enabled() && nrows <= ggml_cuda_info().devices[device].nsm &&
-            ncols <= GGML_CUDA_TOP_K_ONE_BLOCK_MAX_NCOLS) {
+            (one_block_v2 ? ncols <= GGML_CUDA_TOP_K_ONE_BLOCK_V2_MAX_NCOLS && (ncols <= 32768 || nrows >= 16)
+                          : ncols <= GGML_CUDA_TOP_K_ONE_BLOCK_MAX_NCOLS)) {
         top_k_radix_one_block_cuda(src0_d, dst_d, ncols, nrows, k, stream);
         return;
     }

@@ -193,6 +193,7 @@ struct llama_context {
     void set_verify_exact(bool value);
     bool get_verify_exact() const; // k17-strict
     bool restore_pp_plan(bool idle = false); // k11-decode (see the definition); idle: from llama_prepare_prompt_plan
+    uint32_t dsv41_far_rows(const llama_ubatch & ubatch, const std::vector<llama_pos> & ends, int32_t n_out) const; // k19-dsv4long
     void reserve_small_max(const llama_ubatch & ubatch); // k19-uma (see the definition)
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);

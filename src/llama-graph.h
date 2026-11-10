@@ -948,6 +948,7 @@ struct llm_graph_params {
             cparams.verify_tag              == other.cparams.verify_tag              &&
             // a verify ubatch crossing a padding block of the KV cells splits its attention by rows: rebuilt every time
             cparams.exact_split == 0 && other.cparams.exact_split == 0 &&
+            cparams.dsv41_far               == other.cparams.dsv41_far               &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
             arch  == other.arch  &&
             gtype == other.gtype &&

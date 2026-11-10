@@ -14110,6 +14110,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
     }
+    // k19-dsv4long: the DeepSeek-V4.1 SwiGLU limit on its UD-IQ1_S expert types (fused single-column MUL_MAT_ID, incl. the sm_75
+    // codebook-in-shared-memory launch) and its dense shared-expert types (fused MUL_MAT)
+    for (ggml_type t : { GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS }) {
+        for (bool b : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(t, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256, true, 16, 8, b, false, true, false));
+        }
+    }
+    for (ggml_type t : { GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0 }) {
+        for (bool b : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(t, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256, false, 1, 1, b, false, true, false));
+        }
+    }
 
     for (const char * op : { "sigmoid", "silu" }) {
         for (int64_t m : { 1, 3, 17 }) {
