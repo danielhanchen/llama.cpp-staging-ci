@@ -3935,6 +3935,59 @@ private:
         create_checkpoint(slot, slot.prompt.n_tokens() - n_tokens_at, pmin, pos_at, true);
     }
 
+    // k19-ckptkeep: which checkpoint a full list keeps no matter what. Agentic clients send many requests that share the system prompt +
+    // tools but diverge after it (a new conversation, a rewritten history, a sub-agent); a hybrid / recurrent model cannot roll its state
+    // back, so once no checkpoint lies inside that prefix such a request re-reads the whole prompt. The prefix checkpoint is the last one
+    // at or before the first user message of the current prompt (the break the server makes there), else the oldest (no message spans:
+    // a raw prompt, a slot file). Only which checkpoint survives changes, never how one is made or restored, so outputs are those of a
+    // full re-read. LLAMA_SERVER_CKPT_KEEP_PREFIX=0: no checkpoint is protected, the oldest is evicted first (the old behaviour).
+    static bool ckpt_keep_prefix() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_SERVER_CKPT_KEEP_PREFIX");
+            const bool v = e == nullptr || atoi(e) != 0;
+            SRV_INF("context checkpoint eviction: %s (LLAMA_SERVER_CKPT_KEEP_PREFIX=%s)\n",
+                    v ? "keep the prefix checkpoint (system + tools)" : "evict the oldest", e ? e : "unset");
+            return v;
+        }();
+        return on;
+    }
+
+    static int32_t ckpt_first_user_pos(const server_slot & slot) {
+        if (slot.task) {
+            for (const auto & sp : slot.task->params.message_spans.spans) {
+                if (sp.role == COMMON_CHAT_ROLE_USER) {
+                    return (int32_t) sp.pos;
+                }
+            }
+        }
+        return -1;
+    }
+
+    // the protected checkpoint, or end() (kill switch, or a list of at most one: keeping it would block every newer checkpoint)
+    static std::list<common_prompt_checkpoint>::iterator ckpt_prefix_pos(std::list<common_prompt_checkpoint> & checkpoints, int32_t n_max,
+            int32_t first_user) {
+        if (!ckpt_keep_prefix() || n_max < 2 || checkpoints.empty()) {
+            return checkpoints.end();
+        }
+        auto prot = checkpoints.begin();
+        if (first_user > 0) {
+            for (auto it = checkpoints.begin(); it != checkpoints.end() && it->n_tokens <= first_user; ++it) {
+                prot = it;
+            }
+        }
+        return prot;
+    }
+
+    // the checkpoint a full list gives up for a new one: the oldest one that is not protected (with -ctxcp 2: the list stays prefix + newest)
+    static std::list<common_prompt_checkpoint>::iterator ckpt_evict_pos(std::list<common_prompt_checkpoint> & checkpoints,
+            std::list<common_prompt_checkpoint>::iterator prot) {
+        auto it = checkpoints.begin();
+        if (it == prot && checkpoints.size() >= 2) {
+            ++it;
+        }
+        return it;
+    }
+
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool captured = false) {
         const int id_task = slot.task->id;
         // k19-host: with the drafter's pass on the worker (LLAMA_MTP_PROMPT_BG) the draft part is queued behind it; the launch completed
@@ -3952,11 +4005,14 @@ private:
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
         std::list<common_prompt_checkpoint> dropped;
 
+        // k19-ckptkeep: neither loop below drops the prefix checkpoint (ckpt_prefix_pos); list erasures keep the iterator valid
+        const auto prot = ckpt_prefix_pos(slot.prompt.checkpoints, params_base.n_ctx_checkpoints, ckpt_first_user_pos(slot));
+
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin();
                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
                 it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+            if (it != prot && it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
@@ -3972,12 +4028,16 @@ private:
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            // k19-ckptkeep: not the prefix checkpoint (system prompt + tools), which a new conversation or an edited history can still
+            // restore; the oldest other one instead (ckpt_evict_pos)
+            const auto victim = ckpt_evict_pos(slot.prompt.checkpoints, prot);
+            const auto & cur = *victim;
 
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)%s\n",
+                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024,
+                    prot == slot.prompt.checkpoints.end() ? "" : ", keeping the prefix checkpoint");
 
-            dropped.splice(dropped.end(), slot.prompt.checkpoints, slot.prompt.checkpoints.begin());
+            dropped.splice(dropped.end(), slot.prompt.checkpoints, victim);
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
@@ -4185,7 +4245,8 @@ private:
             }
             checkpoints.push_back(std::move(cur));
             if (checkpoints.size() > (size_t) params_base.n_ctx_checkpoints) {
-                checkpoints.pop_front();
+                // k19-ckptkeep: as create_checkpoint, no message spans here: the oldest is the protected one
+                checkpoints.erase(ckpt_evict_pos(checkpoints, ckpt_prefix_pos(checkpoints, params_base.n_ctx_checkpoints, -1)));
             }
         }
         // the slot file does not check the draft context - test-load one draft checkpoint, drop the draft data if it does not fit
