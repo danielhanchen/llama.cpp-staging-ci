@@ -321,7 +321,14 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
             all.insert(all.end(), ids[e].begin(), ids[e].end());
         }
         if (model.can_prefetch.count(model.per_layer_tok_embd)) {
-            llama_prefetch_rows(model.per_layer_tok_embd, all.data(), all.size());
+            // k19-plerow: rows the row cache holds need no page
+            size_t n_hint = all.size();
+            if (model.ple_row_cache && model.ple_row_cache->table == model.per_layer_tok_embd) {
+                n_hint = model.ple_row_cache->filter_uncached(all.data(), all.size());
+            }
+            if (n_hint > 0) {
+                llama_prefetch_rows(model.per_layer_tok_embd, all.data(), n_hint);
+            }
         }
         for (size_t e = 0; e < engram_ids.size(); ++e) {
             if (engram_ids[e]->buffer) {

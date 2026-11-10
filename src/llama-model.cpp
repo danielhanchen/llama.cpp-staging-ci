@@ -1383,6 +1383,14 @@ llama_model::~llama_model() {
                 st.n_resident.load(), st.n_probed.load(), 100.0*st.n_resident.load()/st.n_probed.load());
         }
     }
+    if (ple_row_cache) {
+        llama_row_cache_detach(ple_row_cache->table);
+        LLAMA_LOG_INFO("%s: PLE row cache: %s\n", __func__, ple_row_cache->describe().c_str());
+        if (!ple_row_profile_save.empty()) {
+            ple_row_cache->save_profile(ple_row_profile_save);
+        }
+        ple_row_cache.reset();
+    }
     ple_reader.reset();
     for (auto & [_, lf] : lazy_files) {
         llama_prefetch_close_fd(lf.fd);

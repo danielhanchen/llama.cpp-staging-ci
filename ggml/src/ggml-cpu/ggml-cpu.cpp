@@ -693,6 +693,10 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
         return (void *)ggml_backend_cpu_set_use_ref;
     }
 
+    // k19-plerow: the row source of a lazily mapped table's GET_ROWS (llama_row_cache)
+    if (strcmp(name, "ggml_backend_cpu_set_row_source") == 0) {
+        return (void *)ggml_backend_cpu_set_row_source;
+    }
     // k18: the single-graph MoE mailbox host experts (llama_moe_cache)
     if (strcmp(name, "ggml_cpu_moe_host_ffn") == 0) {
         return (void *)ggml_cpu_moe_host_ffn;

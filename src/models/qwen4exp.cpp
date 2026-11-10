@@ -1382,6 +1382,7 @@ public:
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
+    std::vector<int32_t>     miss; // k19-plerow: the rows the row cache does not hold
 };
 
 // the rows of the PLE table that a ubatch gathers, from its tokens and the n_gram - 1 predecessors of each token
@@ -1464,13 +1465,27 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         ggml_tensor * ple = model.per_layer_tok_embd;
 
         const bool prefetch = model.can_prefetch.count(ple);
+        // k19-plerow: rows the row cache holds need no page: the hint and the prompt reads take only the others
+        const int32_t * hint   = idx.data();
+        size_t          n_hint = idx.size();
+        if (prefetch && model.ple_row_cache && model.ple_row_cache->table == ple) {
+            miss.assign(idx.begin(), idx.end());
+            n_hint = model.ple_row_cache->filter_uncached(miss.data(), miss.size());
+            hint   = miss.data();
+            if (idx.size() >= 4096) {
+                LLAMA_LOG_INFO("%s: PLE row cache: %zu of %zu rows of this ubatch cached; %s\n", __func__, idx.size() - n_hint, idx.size(),
+                    model.ple_row_cache->describe().c_str());
+            }
+        }
         llama_ple_prompt_reader * reader = prefetch && idx.size() >= llama_ple_prompt_read_min_rows() && !model.ple_table_resident.load() ?
             model.ple_prompt_reader() : nullptr;
-        if (reader) {
+        if (n_hint == 0) {
+            // every row is cached
+        } else if (reader) {
             // k19-disktt: a prompt ubatch queues parallel preads of its rows' pages for the gather (opt-in LLAMA_PLE_PROMPT_READ=1)
-            reader->read(idx.data(), idx.size());
+            reader->read(hint, n_hint);
         } else if (prefetch) {
-            llama_prefetch_rows(ple, idx.data(), idx.size());
+            llama_prefetch_rows(ple, hint, n_hint);
         }
     }
 

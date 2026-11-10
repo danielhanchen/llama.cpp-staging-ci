@@ -10,6 +10,8 @@
 #include "vec.h"
 
 #include <algorithm>
+#include <atomic>
+#include <mutex>
 #include <cfloat>
 #include <cmath>
 
@@ -5335,6 +5337,70 @@ void ggml_compute_forward_cont(
 
 // ggml_compute_forward_get_rows
 
+// k19-plerow: row sources of GET_ROWS (ggml_backend_cpu_set_row_source); the count is checked before any lookup, so a gather of a
+// table without a source runs as before
+namespace {
+struct ggml_cpu_row_source_entry {
+    const ggml_tensor *   t  = nullptr;
+    ggml_cpu_row_source_t fn = nullptr;
+    void *                ud = nullptr;
+};
+std::mutex                g_row_source_mtx;
+ggml_cpu_row_source_entry g_row_source[4];
+std::atomic<int>          g_row_source_n {0};
+}
+
+bool ggml_backend_cpu_set_row_source(const ggml_tensor * t, ggml_cpu_row_source_t fn, void * ud) {
+    if (t == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_row_source_mtx);
+    if (fn != nullptr && (t->ne[2] != 1 || t->ne[3] != 1 || ggml_row_size(t->type, t->ne[0]) > GGML_CPU_ROW_SOURCE_MAX_BYTES)) {
+        return false;
+    }
+    for (auto & e : g_row_source) {
+        if (e.t == t) {
+            e.fn = fn;
+            e.ud = ud;
+            if (fn == nullptr) {
+                e.t = nullptr;
+            }
+            int n = 0;
+            for (const auto & f : g_row_source) {
+                n += f.t != nullptr;
+            }
+            g_row_source_n.store(n, std::memory_order_release);
+            return true;
+        }
+    }
+    if (fn == nullptr) {
+        return true;
+    }
+    for (auto & e : g_row_source) {
+        if (e.t == nullptr) {
+            e.t  = t;
+            e.fn = fn;
+            e.ud = ud;
+            g_row_source_n.fetch_add(1, std::memory_order_release);
+            return true;
+        }
+    }
+    return false;
+}
+
+static ggml_cpu_row_source_entry ggml_cpu_row_source_of(const ggml_tensor * t) {
+    if (g_row_source_n.load(std::memory_order_acquire) == 0) {
+        return {};
+    }
+    std::lock_guard<std::mutex> lock(g_row_source_mtx);
+    for (const auto & e : g_row_source) {
+        if (e.t == t) {
+            return e;
+        }
+    }
+    return {};
+}
+
 static void ggml_compute_forward_get_rows_q(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
@@ -5365,6 +5431,10 @@ static void ggml_compute_forward_get_rows_q(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    // k19-plerow: a registered row source (llama_row_cache) hands the bytes of each row, its own copy or the table's
+    const ggml_cpu_row_source_entry rs = ggml_cpu_row_source_of(src0);
+    alignas(64) uint8_t rs_tmp[GGML_CPU_ROW_SOURCE_MAX_BYTES];
+
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
@@ -5373,8 +5443,13 @@ static void ggml_compute_forward_get_rows_q(
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
+        const char * row = (const char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03;
+        if (rs.fn) {
+            row = (const char *) rs.fn(rs.ud, src0, i01, rs_tmp);
+        }
+
         dequantize_row_q(
-                (const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
+                (const void *) (row),
                      (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
     }
 }
@@ -5406,6 +5481,10 @@ static void ggml_compute_forward_get_rows_f16(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    // k19-plerow: a registered row source (llama_row_cache), as in get_rows_q
+    const ggml_cpu_row_source_entry rs = ggml_cpu_row_source_of(src0);
+    alignas(64) uint8_t rs_tmp[GGML_CPU_ROW_SOURCE_MAX_BYTES];
+
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
@@ -5414,8 +5493,13 @@ static void ggml_compute_forward_get_rows_f16(
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
+        const char * row = (const char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03;
+        if (rs.fn) {
+            row = (const char *) rs.fn(rs.ud, src0, i01, rs_tmp);
+        }
+
         ggml_cpu_fp16_to_fp32(
-            (const ggml_fp16_t*) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
+            (const ggml_fp16_t*) (row),
                        (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
     }
 }
@@ -5447,6 +5531,10 @@ static void ggml_compute_forward_get_rows_bf16(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    // k19-plerow: a registered row source (llama_row_cache), as in get_rows_q
+    const ggml_cpu_row_source_entry rs = ggml_cpu_row_source_of(src0);
+    alignas(64) uint8_t rs_tmp[GGML_CPU_ROW_SOURCE_MAX_BYTES];
+
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
@@ -5455,8 +5543,13 @@ static void ggml_compute_forward_get_rows_bf16(
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
+        const char * row = (const char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03;
+        if (rs.fn) {
+            row = (const char *) rs.fn(rs.ud, src0, i01, rs_tmp);
+        }
+
         ggml_cpu_bf16_to_fp32(
-            (const ggml_bf16_t *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
+            (const ggml_bf16_t *) (row),
                         (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
     }
 }
@@ -5488,6 +5581,10 @@ static void ggml_compute_forward_get_rows_f32(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    // k19-plerow: a registered row source (llama_row_cache), as in get_rows_q
+    const ggml_cpu_row_source_entry rs = ggml_cpu_row_source_of(src0);
+    alignas(64) uint8_t rs_tmp[GGML_CPU_ROW_SOURCE_MAX_BYTES];
+
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
@@ -5496,9 +5593,14 @@ static void ggml_compute_forward_get_rows_f32(
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
+        const char * row = (const char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03;
+        if (rs.fn) {
+            row = (const char *) rs.fn(rs.ud, src0, i01, rs_tmp);
+        }
+
         ggml_vec_cpy_f32(nc,
                 (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3),
-                (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03));
+                (float *) (row));
     }
 }
 

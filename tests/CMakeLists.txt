@@ -366,6 +366,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-ple-prefetch PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # k19-plerow: the PLE row cache leaves every gather and the logits bit-identical
+    llama_build(test-ple-rowcache.cpp)
+    llama_test(
+        test-ple-rowcache
+        LABEL main
+        ARGS "${MODEL_DIR}/qwen4exp-moe.gguf"
+    )
+    set_tests_properties(test-ple-rowcache PROPERTIES FIXTURES_REQUIRED generate-models)
+
     llama_build(test-fusion.cpp)
 endif()
 

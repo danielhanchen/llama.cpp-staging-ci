@@ -9,6 +9,7 @@
 #include "llama-vocab.h"
 
 #include "llama-prefetch.h"
+#include "llama-row-cache.h"
 
 #include <atomic>
 #include <map>
@@ -894,6 +895,11 @@ struct llama_model {
     mutable std::unique_ptr<llama_ple_prompt_reader> ple_reader;
     // set once the whole PLE table was read into RAM (LLAMA_PLE_RESIDENT): the prompt reads are skipped from then on
     mutable std::atomic<bool> ple_table_resident {false};
+    // k19-plerow: the row cache in front of the lazy PLE / Engram table (llama_row_cache), made by the residency rule of the first
+    // context (llama_context); the CPU gather of the table reads through it. Freed (and its profile saved where asked) in ~llama_model
+    mutable std::unique_ptr<llama_row_cache> ple_row_cache;
+    mutable std::atomic<bool> ple_res_done {false}; // the residency rule of the PLE table ran (llama_context)
+    mutable std::string ple_row_profile_save;
 
     // k16 dense host pin (llama_context::dense_host_pin): mappings of the memory-mapped buffers that hold the weights of layers left in
     // system memory, registered once per model for the copies of offloaded prompt ops; released in ~llama_model, before the buffers

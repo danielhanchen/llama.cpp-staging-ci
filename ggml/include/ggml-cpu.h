@@ -163,6 +163,15 @@ extern "C" {
     GGML_BACKEND_API void ggml_cpu_fp32_to_bf16(const float *, ggml_bf16_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_bf16_to_fp32(const ggml_bf16_t *, float *, int64_t);
 
+    // k19-plerow: a row source for the GET_ROWS of one host matrix (a lazily mapped embedding table): fn returns the address of the
+    // bytes of row `row` (the tensor's own row, or a copy of it written to tmp, which holds GGML_CPU_ROW_SOURCE_MAX_BYTES); the gather
+    // dequantizes those bytes as before, so a source that returns copies of the same bytes leaves the results bit-identical.
+    // fn == NULL removes the source of t. At most 4 tensors; rows of more than GGML_CPU_ROW_SOURCE_MAX_BYTES bytes are refused.
+    // Returns true when set (or removed). Also reachable as the proc address "ggml_backend_cpu_set_row_source".
+#define GGML_CPU_ROW_SOURCE_MAX_BYTES 4096
+    typedef const void * (*ggml_cpu_row_source_t)(void * ud, const struct ggml_tensor * t, int64_t row, void * tmp);
+    GGML_BACKEND_API bool ggml_backend_cpu_set_row_source(const struct ggml_tensor * t, ggml_cpu_row_source_t fn, void * ud);
+
 #ifdef __cplusplus
 }
 #endif

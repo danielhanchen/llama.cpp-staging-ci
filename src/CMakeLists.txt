@@ -37,6 +37,7 @@ set(LLAMA_CORE_SOURCES
     llama-memory-recurrent.cpp
     llama-mmap.cpp
     llama-prefetch.cpp
+    llama-row-cache.cpp
     llama-model-loader.cpp
     llama-model-saver.cpp
     llama-model.cpp
