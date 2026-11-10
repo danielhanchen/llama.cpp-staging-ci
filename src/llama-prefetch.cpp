@@ -511,7 +511,7 @@ void llama_ple_prompt_reader::read(const int32_t * rows, size_t n) {
         for (const auto & r : rs) {
             const size_t np = (size_t) ((r.second - r.first) / page);
             vec.resize(np);
-            void * addr = (void *) (data - file_offs + r.first);
+            void * addr = const_cast<char *>(data - file_offs + r.first);
 #if defined(__APPLE__)
             const int mc = mincore(addr, (size_t) (r.second - r.first), (char *) vec.data());
 #else
