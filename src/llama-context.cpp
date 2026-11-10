@@ -1282,11 +1282,11 @@ llama_context::llama_context(
         const ggml_tensor * t = model.per_layer_tok_embd;
         static const int res_env = getenv("LLAMA_PLE_RESIDENT") ? atoi(getenv("LLAMA_PLE_RESIDENT")) : -1;
         static std::mutex res_mtx;
-        static std::unordered_set<const ggml_tensor *> res_done;
         if (res_env != 0 && t && model.can_prefetch.count(t) && t->data && t->buffer && ggml_backend_buffer_is_host(t->buffer) &&
                 cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
             std::lock_guard<std::mutex> lock(res_mtx);
-            if (res_done.insert(t).second) {
+            // once per model (k19-plerow: a flag of the model, not a set of tensor addresses, which a later model can reuse)
+            if (!model.ple_res_done.exchange(true)) {
                 const size_t table = ggml_nbytes(t);
                 size_t host = 0;
                 for (const auto & [name, w] : model.tensors_by_name) {
@@ -1333,6 +1333,90 @@ llama_context::llama_context(
                     }
                 }
 #endif
+                // k19-plerow: a row cache in front of a table that is not made resident and sits on a disk (LLAMA_PLE_ROW_CACHE=0 off,
+                // =2 forced: test hook). A row reached through the mapping faults its whole 4 KiB page (Flash-Next: 90-byte rows, 45x
+                // the bytes); the cache keeps packed copies of rows: the hottest rows of a saved profile (LLAMA_PLE_ROW_PROFILE=path,
+                // read sequentially now, up to LLAMA_PLE_ROW_CACHE_PRELOAD_MIB: 2048 beside a part, else 512) and the rows the gather
+                // faults (clock, LLAMA_PLE_ROW_CACHE_MIB: 256). Its memory comes out of the part (rows under the part are not cached),
+                // so the RAM the rule above leaves to the host weights (the expert tier included) is unchanged; without a part (the
+                // expert tier's budget is fixed by now) it comes out of the host reserve, and only where MemAvailable exceeds it by
+                // 2 GiB. The gather reads the same bytes (copies), so exact. LLAMA_PLE_ROW_PROFILE_SAVE=1: the cached rows are written
+                // back to the profile path at exit.
+                {
+                    const int rc_mode = llama_row_cache_mode();
+                    bool rc_disk = false;
+#if defined(__linux__)
+                    rc_disk = on_disk;
+#endif
+                    if (rc_mode != 0 && !model.ple_row_cache && (rc_mode == 2 || (!admit && rc_disk)) && ggml_is_matrix(t) &&
+                            ggml_row_size(t->type, t->ne[0]) <= GGML_CPU_ROW_SOURCE_MAX_BYTES && t->nb[1] == ggml_row_size(t->type, t->ne[0])) {
+                        auto env_mib = [](const char * name, double def) {
+                            const char * v = getenv(name);
+                            return (size_t) (std::max(0.0, v ? atof(v) : def) * 1048576.0);
+                        };
+                        const char * prof_env = getenv("LLAMA_PLE_ROW_PROFILE");
+                        const std::string prof = prof_env ? prof_env : "";
+                        const size_t row_b = ggml_row_size(t->type, t->ne[0]);
+                        const size_t cost  = llama_row_cache::slot_bytes(row_b);
+                        // rows of the profile (header only): an upper bound of the static part (only the rows load_profile keeps are
+                        // allocated, and the part is reduced by what the cache really holds)
+                        uint64_t prof_rows = 0;
+                        if (!prof.empty()) {
+                            if (FILE * pf = fopen(prof.c_str(), "rb")) {
+                                uint8_t hb[48];
+                                if (fread(hb, 1, sizeof(hb), pf) == sizeof(hb) && memcmp(hb, "LLPLERC2", 8) == 0) {
+                                    memcpy(&prof_rows, hb + 40, 8);
+                                }
+                                fclose(pf);
+                            }
+                        }
+                        size_t stat_b = std::min<size_t>(env_mib("LLAMA_PLE_ROW_CACHE_PRELOAD_MIB", part > 0 ? 2048 : 512),
+                                                         (size_t) std::min<uint64_t>(prof_rows, (uint64_t) t->ne[1]) * cost);
+                        size_t dyn_b  = env_mib("LLAMA_PLE_ROW_CACHE_MIB", 256);
+                        // beside a page part, rows the gather faults stay in the page cache anyway: without a profile (or a profile
+                        // to write back, or an explicit LLAMA_PLE_ROW_CACHE_MIB) the cache would only take RAM from the part
+                        // (A100 VM fn4nd 8k, dynamic rows only: 52.9k disk reads vs 47.5k), so it is not made there
+                        const bool prof_save = getenv("LLAMA_PLE_ROW_PROFILE_SAVE") && atoi(getenv("LLAMA_PLE_ROW_PROFILE_SAVE")) != 0;
+                        if (part > 0 && part < table && stat_b == 0 && !prof_save && getenv("LLAMA_PLE_ROW_CACHE_MIB") == nullptr && rc_mode != 2) {
+                            dyn_b = 0;
+                        }
+                        bool    ok   = stat_b + dyn_b > 0;
+                        int64_t skip = 0;
+                        size_t  part_min = part;
+                        if (ok && part >= table) {
+                            // the part holds the whole table: nothing to cache (LLAMA_PLE_ROW_CACHE=2 makes it anyway, beside the part)
+                            ok = rc_mode == 2;
+                        } else if (ok && part > 0) {
+                            // the cache's memory comes out of the part, at most a quarter of it
+                            const size_t cap = part / 4;
+                            dyn_b  = std::min(dyn_b, cap / 4);
+                            stat_b = std::min(stat_b, cap - dyn_b);
+                            part_min = (part - stat_b - dyn_b) & ~((8ull << 20) - 1);
+                            skip = (int64_t) (part_min / t->nb[1]);
+                        } else if (ok && rc_mode != 2 && avail > 0 && avail < (uint64_t) (stat_b + dyn_b) + (2ull << 30)) {
+                            ok = false;
+                        }
+                        if (ok) {
+                            auto rc = std::make_unique<llama_row_cache>(t, dyn_b, stat_b, skip);
+                            rc->load_profile(prof);
+                            if (llama_row_cache_attach(rc.get())) {
+                                if (prof_save && !prof.empty()) {
+                                    model.ple_row_profile_save = prof;
+                                }
+                                if (part > 0 && part < table) {
+                                    // the part gives up what the cache holds (rows from `skip` up are cached, not part rows)
+                                    part = std::max<size_t>(part_min, (part - std::min(part, rc->bytes())) & ~((size_t) (8ull << 20) - 1));
+                                }
+                                LLAMA_LOG_INFO("%s: PLE row cache of '%s': %.1f MiB (%zu slots, %zu rows preloaded%s), rows from %" PRId64 " up "
+                                    "(below: the part in the page cache); LLAMA_PLE_ROW_CACHE=0 off\n", __func__, t->name, rc->bytes()/1048576.0,
+                                    rc->capacity(), rc->n_static(), prof.empty() ? ", no profile" : "", skip);
+                                model.ple_row_cache = std::move(rc);
+                            } else {
+                                LLAMA_LOG_WARN("%s: PLE row cache: the CPU backend has no row source hook, off\n", __func__);
+                            }
+                        }
+                    }
+                }
                 // the part is read during the load unless LLAMA_PLE_RESIDENT_PARTIAL_BG=1: a background read waits out every ubatch, so under
                 // steady requests it would not finish, and on an IOPS-bound disk each request would pay its own reads meanwhile
                 static const bool part_bg = getenv("LLAMA_PLE_RESIDENT_PARTIAL_BG") != nullptr && atoi(getenv("LLAMA_PLE_RESIDENT_PARTIAL_BG")) != 0;
@@ -8807,6 +8891,10 @@ void llama_context::ple_prefetch_ahead(const llama_ubatch & ubatch, const llama_
             out = ple.scratch;
         }
         if (ple_prefetcher) {
+            // k19-plerow: rows the row cache holds need no page
+            if (model.ple_row_cache && model.ple_row_cache->table == t) {
+                model.ple_row_cache->mask_cached(ple.scratch.data(), ple.scratch.size());
+            }
             ple_prefetcher->submit(std::move(ple.scratch));
         }
         ple.scratch.clear();
