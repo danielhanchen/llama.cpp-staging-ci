@@ -357,6 +357,20 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         endif()
     endforeach()
 
+    # k19-sharednoise: the shared-noise draw samples the chain's distribution (with and without LLAMA_SHARED_NOISE=1), and a drafter with
+    # the target's logits proposes the target's token
+    llama_build(test-shared-noise.cpp)
+    foreach(SN_ENV "LLAMA_SHARED_NOISE=0" "LLAMA_SHARED_NOISE=1")
+        string(REGEX REPLACE "^LLAMA_SHARED_NOISE=([0-9])$" "\\1" SN_SUFFIX "${SN_ENV}")
+        llama_test(
+            test-shared-noise
+            NAME test-shared-noise-${SN_SUFFIX}
+            LABEL main
+            ARGS "${MODEL_DIR}/llama-dense.gguf" 8000
+        )
+        set_tests_properties(test-shared-noise-${SN_SUFFIX} PROPERTIES FIXTURES_REQUIRED generate-models ENVIRONMENT "${SN_ENV}")
+    endforeach()
+
     # the advisory PLE prefetch predicts the rows set_input gathers, on the generated qwen4exp model
     llama_build(test-ple-prefetch.cpp)
     llama_test(

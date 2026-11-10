@@ -106,6 +106,47 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
+// k19-sharednoise: shared-noise (Gumbel-max) sampling, LLAMA_SHARED_NOISE=1 (default off; 0 = off, the kill switch).
+// The final draw of a sampled chain (the one `dist` makes) becomes argmax_i(l_i + g(seed, n, i)) over the candidates the chain left
+// (after penalties, truncation and temperature), with g a Gumbel(0, 1) variate computed from a counter-based hash of the request
+// seed, the number n of tokens the sampler has accepted so far, and the token id. That is an exact sample of softmax(l): the
+// target's distribution does not change, only how the randomness maps to a token. A drafter that picks argmax(draft logit / T + the
+// same g) for the token it drafts at n, n+1, .. then agrees with the target almost as often as under greedy decoding, and a plain
+// sample-and-match verify keeps the output an exact sample of the target (it is the token the target draws with that noise).
+bool  common_shared_noise_enabled();
+// the Gumbel(0, 1) variate of (seed, pos, token)
+float common_shared_noise_gumbel(uint32_t seed, uint64_t pos, llama_token token);
+// the shared-noise final stage alone (tests): argmax(logit + g(seed, n_accepted, id)), p = softmax(logit)
+struct llama_sampler * common_sampler_init_shared_noise(uint32_t seed);
+
+// what a drafter needs to draw its tokens with the target's noise: the key of the target's next draw and a copy of the target
+// chain's penalties / truncation / temperature, applied to the draft's own candidates (an approximation of the target chain: it only
+// moves acceptance, never the output distribution)
+struct common_shared_noise_draft {
+    bool     on   = false;
+    uint32_t seed = 0;
+    uint64_t pos  = 0;                            // the key of the target's next draw: the first drafted token
+    std::vector<enum common_sampler_type> samplers;
+    float    temp        = 1.0f;
+    int32_t  top_k       = 0;
+    float    top_p       = 1.0f;
+    float    min_p       = 0.0f;
+    int32_t  pen_last_n  = 0;
+    float    pen_repeat  = 1.0f;
+    float    pen_freq    = 0.0f;
+    float    pen_present = 0.0f;
+    std::vector<llama_token> window;              // the target's last pen_last_n accepted tokens
+    std::vector<std::pair<llama_token, float>> scratch;
+};
+
+// fills sn from the target sampler: false (sn.on = false) when its chain does not end in the shared-noise stage
+bool common_sampler_shared_noise_draft_init(const struct common_sampler * gsmpl, common_shared_noise_draft & sn);
+
+// the token a drafter proposes at draft index i (0 = the token after the target's last one) from its candidates cand[0..n) (raw
+// logits); drafted = the i tokens drafted before it. p_pick (optional): the token's probability under the mirrored chain
+llama_token common_shared_noise_draft_pick(common_shared_noise_draft & sn, int32_t i, const llama_token * drafted,
+        const llama_token_data * cand, size_t n, float * p_pick);
+
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 

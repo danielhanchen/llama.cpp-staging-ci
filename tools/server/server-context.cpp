@@ -234,6 +234,16 @@ static bool spec_replay_reverify() {
     return v;
 }
 
+// k19-sharednoise: drafts take the target's shared noise when the target draws with it (LLAMA_SHARED_NOISE=1);
+// LLAMA_SHARED_NOISE_DRAFT=0: they do not (the target's draws stay counter-based)
+static bool spec_sn_draft_on() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_SHARED_NOISE_DRAFT");
+        return common_shared_noise_enabled() && (e == nullptr || atoi(e) != 0);
+    }();
+    return v;
+}
+
 // k19-host30k (LLAMA_STATE_ASYNC_EXT=0: off): the prompt-cache save of a long prompt (larger than LLAMA_PROMPT_SAVE_ASYNC_MAX_MIB, or than
 // the staging at a request) was synchronous on the server thread: G4 Qwen3.8-Flash-Next UD-IQ4_XS, the 642 MiB save of a 16k prompt
 // took 175-360 ms of the next (30k) request's TTFT at 24 / 32 GB (a MoE cache: saved at the request) and ~140 ms at full card (saved at
@@ -602,6 +612,8 @@ struct server_slot {
 
     // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
     std::vector<std::vector<llama_token_data>> spec_draft_q;
+    // k19-sharednoise: the key and the mirrored chain of the target's shared-noise draws, read by the drafter
+    common_shared_noise_draft spec_sn;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     std::vector<completion_token_output> spec_probs; // k13: n_probs of the accepted tokens, read from their verify rows before any rollback
@@ -5178,6 +5190,20 @@ private:
                             /* .top_p    = */ slot.task->params.sampling.top_p,
                             /* .min_p    = */ slot.task->params.sampling.min_p,
                         };
+
+                        // k19-sharednoise: the target draws with shared noise (LLAMA_SHARED_NOISE=1): the drafter takes the same noise
+                        // and the verify samples and matches (LLAMA_SHARED_NOISE_DRAFT=0: the drafter as before, for attribution)
+                        if (spec_sn_draft_on() && common_sampler_shared_noise_draft_init(slot.smpl.get(), slot.spec_sn)) {
+                            auto & dpr = common_speculative_get_draft_params(spec.get(), slot.id);
+                            dpr.sn       = &slot.spec_sn;
+                            dpr.result_q = nullptr;
+                            static bool logged = false;
+                            if (!logged) {
+                                logged = true;
+                                SLT_INF(slot, "shared noise: drafts take the target's noise (seed %u, key %llu); verify by sample-and-match\n",
+                                        slot.spec_sn.seed, (unsigned long long) slot.spec_sn.pos);
+                            }
+                        }
 
                         drafting.push_back(&slot);
                     }

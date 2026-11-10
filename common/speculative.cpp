@@ -417,7 +417,8 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
-            if (!params.probabilistic) {
+            // k19-sharednoise: so does a draft drawn with the target's noise (sample-and-match is what keeps it exact)
+            if (!params.probabilistic || (dp.sn != nullptr && dp.sn->on)) {
                 dp.result_q = nullptr;
             }
 
@@ -466,7 +467,16 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
+                auto & dp = dparams.at(seq_id);
+                auto & result = *dp.result;
+
+                // k19-sharednoise: the draft takes the target's noise at its position (the probability fed to the window policies
+                // is the picked token's under the mirrored chain; they calibrate it against what held)
+                float p_draft = cur_p->data[0].p;
+                const bool sn_on = dp.sn != nullptr && dp.sn->on;
+                const llama_token id = sn_on ? common_shared_noise_draft_pick(*dp.sn, (int32_t) result.size(), result.data(), cur_p->data, cur_p->size, &p_draft) :
+                                       dp.result_q ? id_sampled : cur_p->data[0].id;
+                GGML_UNUSED(p_draft);
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
@@ -477,9 +487,6 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 }
 
                 common_sampler_accept(smpl, id, true);
-
-                auto & dp = dparams.at(seq_id);
-                auto & result = *dp.result;
 
                 result.push_back(id);
 
@@ -1744,6 +1751,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 std::vector<float> step_p;
 
                 int32_t predecessor = 0;
+                std::vector<llama_token_data> sn_cand;
                 for (int32_t i = 1; i < (is_dflash2 ? std::min(n_block_tokens, params.n_max + 1) : params.n_max + 1); ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const int32_t top_k = is_dflash2 ? selector_top_k : lilicorr_top_k;
@@ -1751,6 +1759,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + top_k));
+                    // k19-sharednoise: the step takes the target's noise at its position over the selector's candidates
+                    if (dp.sn != nullptr && dp.sn->on) {
+                        sn_cand.resize(top_k);
+                        for (int32_t k = 0; k < top_k; ++k) {
+                            sn_cand[k] = llama_token_data{ (llama_token) row[k], scores[k], 0.0f };
+                        }
+                        const llama_token pick = common_shared_noise_draft_pick(*dp.sn, (int32_t) result.size(), result.data(), sn_cand.data(), sn_cand.size(), nullptr);
+                        for (int32_t k = 0; k < top_k; ++k) {
+                            if ((llama_token) row[k] == pick) {
+                                predecessor = k;
+                                break;
+                            }
+                        }
+                    }
                     if (trace) {
                         float sum = 0.0f;
                         float second = -INFINITY;
@@ -2658,7 +2680,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
-            if (!params.probabilistic) {
+            // k19-sharednoise: so does a draft drawn with the target's noise (sample-and-match is what keeps it exact)
+            if (!params.probabilistic || (dp.sn != nullptr && dp.sn->on)) {
                 dp.result_q = nullptr;
             }
 
@@ -2757,7 +2780,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
+                auto & dp = dparams.at(seq_id);
+                auto & result = *dp.result;
+
+                // k19-sharednoise: the draft takes the target's noise at its position (the probability fed to the window policies
+                // is the picked token's under the mirrored chain; they calibrate it against what held)
+                float p_draft = cur_p->data[0].p;
+                const bool sn_on = dp.sn != nullptr && dp.sn->on;
+                const llama_token id = sn_on ? common_shared_noise_draft_pick(*dp.sn, (int32_t) result.size(), result.data(), cur_p->data, cur_p->size, &p_draft) :
+                                       dp.result_q ? id_sampled : cur_p->data[0].id;
+                GGML_UNUSED(p_draft);
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
@@ -2769,9 +2801,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
-                auto & result = *dp.result;
-
                 result.push_back(id);
 
                 if (dp.result_q) {
@@ -2780,7 +2809,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 if (tpp_floor > 0 && !dp.result_q) {
                     auto & cs = cost_st[seq_id];
-                    cs.probs.push_back(cur_p->data[0].p);
+                    cs.probs.push_back(p_draft);
                     // after the floor's drafts: one more where the wider window, its next draft as likely to hold as the last, pays
                     if ((int) result.size() == tpp_floor) {
                         bool more = !tpp_cost.need_floor() && (dp.n_max <= 0 || dp.n_max > tpp_floor);
@@ -2803,9 +2832,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     }
                 } else if (spec_cost && !dp.result_q) {
                     auto & cs = cost_st[seq_id];
-                    cs.probs.push_back(cur_p->data[0].p);
+                    cs.probs.push_back(p_draft);
                     const int cap = 1 + (dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max);
-                    if (!cost_pol.keep_draft(cs.chain, (int) result.size() - 1, cur_p->data[0].p, cap)) {
+                    if (!cost_pol.keep_draft(cs.chain, (int) result.size() - 1, p_draft, cap)) {
                         drafting[seq_id] = false;
                         n_drafting--;
                         continue;
