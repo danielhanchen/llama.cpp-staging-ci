@@ -96,6 +96,17 @@ static inline void llama_mb_spin_pause() {
 #endif
 }
 
+// k19-exactmtp: LLAMA_MTP_EXACT=1 (the drafted text equals the no-draft text) and LLAMA_MOE_EXACT_HOST unset or 0: the MoE cache never
+// computes an expert on the host unless LLAMA_MOE_CACHE_HYBRID / LLAMA_MOE_CACHE_FETCH / LLAMA_MOE_CPU_MISS=1 asks for it
+static bool llama_moe_exact_host_off() {
+    static const bool value = [] {
+        const char * x = getenv("LLAMA_MTP_EXACT");
+        const char * k = getenv("LLAMA_MOE_EXACT_HOST");
+        return x != nullptr && atoi(x) != 0 && (k == nullptr || atoi(k) == 0);
+    }();
+    return value;
+}
+
 bool llama_moe_cache_device_lookup_supported(ggml_backend_dev_t dev) {
     if (dev == nullptr) {
         return false;
@@ -1221,6 +1232,20 @@ struct llama_moe_cache::impl {
             }
             // LLAMA_MOE_CACHE_HYBRID=0 turns it off even with LLAMA_MOE_CACHE_FETCH set
             hybrid = device_lookup && mode != 0 && model.hparams.n_expert >= 4;
+            // k19-exactmtp: with LLAMA_MTP_EXACT=1 the host never computes an expert by default (no CPU-miss rule, no hybrid gate), as
+            // LLAMA_MOE_CPU_MISS=0 LLAMA_MOE_CACHE_HYBRID=0 would. A missing expert computed on the host runs CPU kernels where the device
+            // runs MMVQ, and which experts miss follows the residency (drafts touch the experts of rejected tokens) and the timed rule, so
+            // the drafted text left the no-draft text (L4 full card, q4x + MTP chat: 82 experts on the host in the drafted launch, none in
+            // the no-draft one, other text after token 64). LLAMA_MOE_CACHE_HYBRID / _FETCH / LLAMA_MOE_CPU_MISS set by hand keep their
+            // meaning; LLAMA_MOE_EXACT_HOST=1 keeps the default rules under LLAMA_MTP_EXACT=1 (the old behaviour)
+            const char * env_cm0 = getenv("LLAMA_MOE_CPU_MISS");
+            if (hybrid && env == nullptr && env_f == nullptr && (env_cm0 == nullptr || atoi(env_cm0) == 0) && llama_moe_exact_host_off()) {
+                hybrid = false;
+                if (!model.hparams.no_alloc) {
+                    LLAMA_LOG_INFO("%s: MoE cache: LLAMA_MTP_EXACT=1: missing experts are fetched, never computed on the host (no CPU misses, "
+                        "no hybrid gate; LLAMA_MOE_EXACT_HOST=1 keeps them)\n", __func__);
+                }
+            }
             // LLAMA_MOE_CPU_MISS (unset or 1 = on, 0 = off): with LLAMA_MOE_CACHE_HYBRID and LLAMA_MOE_CACHE_FETCH unset, the host computes
             // the missing experts per batch size where a calibration at the first small batch says it is faster (see cm_calibrate, cm_rule)
             {

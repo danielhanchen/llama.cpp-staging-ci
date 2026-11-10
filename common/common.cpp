@@ -4846,6 +4846,14 @@ static bool common_moe_hybrid_gate_on(const common_params & params, const llama_
     if ((env_cm != nullptr && atoi(env_cm) == 2) || ((env_cm == nullptr || atoi(env_cm) != 0) && env_cg != nullptr && atoi(env_cg) == 0)) {
         return false;
     }
+    // k19-exactmtp: LLAMA_MTP_EXACT=1 turns the cache's host path off (no hybrid gate) unless LLAMA_MOE_CPU_MISS=1 / LLAMA_MOE_EXACT_HOST=1
+    {
+        const char * x = getenv("LLAMA_MTP_EXACT");
+        const char * k = getenv("LLAMA_MOE_EXACT_HOST");
+        if (x != nullptr && atoi(x) != 0 && (k == nullptr || atoi(k) == 0) && (env_cm == nullptr || atoi(env_cm) == 0)) {
+            return false;
+        }
+    }
     const double host = common_moe_host_expert_bytes(params.model.path, overrides, n_gpu_layers);
     return host > 0.0 && (double) params.moe_cache_size <= common_moe_hybrid_max_frac()*host;
 }
