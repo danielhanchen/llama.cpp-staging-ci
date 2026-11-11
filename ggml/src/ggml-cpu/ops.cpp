@@ -5600,7 +5600,7 @@ static void ggml_compute_forward_get_rows_f32(
 
         ggml_vec_cpy_f32(nc,
                 (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3),
-                (float *) (row));
+                (const float *) (row));
     }
 }
 

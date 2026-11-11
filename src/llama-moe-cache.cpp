@@ -280,6 +280,27 @@ struct moe_cache_lru {
         gen++;
     }
 
+    // k17-small (lazy KV step 2, see llama_moe_cache::shrink): the slots [n_new, n_slots) leave the cache for good (their experts are
+    // evicted, they leave the list); no slot may be lent
+    void retire(int32_t n_new) {
+        GGML_ASSERT(n_lent == 0 && n_new > n_core && n_new <= n_slots); // (k19-ptres: never into the core)
+        for (int32_t s = n_new; s < n_slots; ++s) {
+            if (key_of[s] >= 0) {
+                slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
+                key_of[s] = -1;
+            }
+            unlink(s);
+        }
+        n_slots = n_new;
+        key_of.resize(n_new);
+        prev.resize(n_new);
+        next.resize(n_new);
+        if (!pinned.empty()) {
+            pinned.resize(n_new);
+        }
+        gen++;
+    }
+
     // move slot s to the tail (most recently used); a core slot stays out of the list
     void touch(int32_t s) {
         if (s == tail || s < n_core) {
@@ -597,6 +618,18 @@ struct llama_moe_cache::impl {
     // k11: the graph allocation of the graph allocated next may be lent too (a merged layer-major group, see llama_moe_cache::set_graph_lend)
     bool graph_lend_scope = false;
     int64_t n_releases = 0; // release (k13-small)
+
+    // k17-small (lazy KV step 2, LLAMA_KV_LAZY=1 with LLAMA_MOE_CACHE_SHRINK unset or != 0): the banks of a device are a lazy buffer of the
+    // CUDA backend (address range reserved whole, backed at load), so the cache can give memory back to a KV cache that grows (shrink)
+    bool shrink_on = false;
+    ggml_backend_buffer_t (*lazy_alloc_fn)(ggml_backend_buffer_type_t, size_t) = nullptr;
+    bool   (*lazy_commit_fn)(ggml_backend_buffer_t, size_t, size_t)            = nullptr;
+    size_t (*lazy_decommit_fn)(ggml_backend_buffer_t, size_t, size_t)          = nullptr;
+    int64_t n_shrinks     = 0; // shrink calls that gave memory back
+    int64_t n_retired     = 0; // slots retired by them
+    size_t  shrunk_bytes  = 0; // device memory they gave back
+    bool    graphs_stale  = false; // a shrink changed the slot counts the graphs were built with (see take_graphs_stale)
+    ggml_context_ptr ctx_banks_op; // the views of group::banks_op
     std::vector<llama_weight_store::region> ws_regions;
 
     // RAM tier (see llama_moe_host_cache): experts of the groups streamed from the model files, behind the device slots
@@ -704,6 +737,8 @@ struct llama_moe_cache::impl {
         size_t dry_save = 0; // k15-fn: the staging copies a measurement found the device would lend (lend_saves), see lend_save_need
         bool lend_saving = false; // k15-fn: lending is on for the memory it frees (lend_saves), see unlend
         size_t mem_reserve = 0; // device memory kept free for a later model or context (set_mem_reserve), not free for lend_decide
+        bool   bank_lazy    = false; // k17-small: buf_bank is a lazy buffer (shrink_on), see alloc_banks
+        size_t shrink_floor = SIZE_MAX; // k17-small: shrink keeps at least this many bytes of slots on the device (set_shrink_floor)
     };
 
     // LLAMA_MOE_CACHE_SEED_CHECK=1: after each seeding ubatch, compare the seeded slots with the host experts (debug)
@@ -741,6 +776,11 @@ struct llama_moe_cache::impl {
         std::vector<ggml_tensor *> banks; // device storage of all slots, one per expert tensor
         size_t host_bytes = 0;
         int32_t n_slots = 0;
+        int32_t n_slots_load = 0; // k17-small: n_slots at load (the banks keep that size, shrink retires the tail slots)
+        int32_t n_slots_min  = 0; // k17-small: shrink keeps at least this many (set_shrink_floor; 0: not set, nothing is retired)
+        // k17-small: once slots are retired, views of the banks over the slots left and the spare slot ([ne0, ne1, n_slots + 1], the
+        // shape the lookup ops require), passed to the device lookup / fetch ops instead of the banks (see op_banks); empty before
+        std::vector<ggml_tensor *> banks_op;
         moe_cache_lru lru;
         seed_state sd;
         // k15-pred r19: the key each slot held when the device lookups of the last small ubatches had used it (-1: not used); the
@@ -1188,17 +1228,16 @@ struct llama_moe_cache::impl {
     // fetched expert compute the same, so the output is unchanged unless experts are computed on the host (CPU misses), whose split follows
     // the residency. LLAMA_MOE_CACHE_PROFILE_SEED (1): the share of each layer a prompt may still seed with its routing when a profile
     // was loaded (0: prompts do not seed, the profile set stays until decode misses replace it)
-    struct prof_entry {
-        int32_t il;
-        int32_t e;
-        float   heat;
-    };
+    using prof_entry = llama_moe_profile_entry;
     std::string profile_file;      // load
     std::string profile_save_file; // save at exit
     std::vector<prof_entry> profile;
     bool   profile_loaded = false;
     double profile_seed   = 1.0;
     size_t profile_filled = 0;
+    // k19-ramprof: LLAMA_MOE_HOST_PROFILE=<path> (a file of the format above, <path>.<n_layer>.<n_expert>[.mtp]) fills the RAM tier at load
+    // in its order (llama_moe_profile_ram_order) before the page-cache fill (prefill_resident); unset or 0 = off (the page-cache fill alone)
+    std::string host_profile_file;
 
     // k19-ptres (LLAMA_MOE_CORE=1, opt-in): a never-evicted core of the device cache whose host copies are given back to the OS. With a
     // routing profile (LLAMA_MOE_CACHE_PROFILE, or kept by the cache itself in the calibration directory), the hottest experts of each
@@ -1256,6 +1295,9 @@ struct llama_moe_cache::impl {
                         core_profile_auto = true;
                     }
                 }
+            }
+            if (const char * e = getenv("LLAMA_MOE_HOST_PROFILE"); e != nullptr && *e && strcmp(e, "0") != 0 && !model.hparams.no_alloc) {
+                host_profile_file = e + sfx;
             }
         }
         for (size_t i = 0; i < backends.size(); ++i) {
@@ -1660,6 +1702,7 @@ struct llama_moe_cache::impl {
                 grow_q16 = (int32_t) std::min(2.0*65536.0, std::max(65537.0, std::round(65536.0*std::exp2(1.0/hl))));
             }
             g.lru.init(model.layers.size(), n_expert, g.n_slots, grow_q16, g.layers[0]);
+            g.n_slots_load = g.n_slots;
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size()) + (device_lookup ? 2 : 0) + (hybrid || overlap ? 1 : 0) +
                 (device_lookup && grow_q16 > 0 ? 1 : 0);
             for (int32_t il : g.layers) {
@@ -1843,11 +1886,19 @@ struct llama_moe_cache::impl {
                 t->buffer = buf_host.get();
             }
         } else {
+            // k17-small (lazy KV step 2): with LLAMA_KV_LAZY=1 the banks can give memory back to the KV cache as it grows (shrink);
+            // LLAMA_MOE_CACHE_SHRINK=0 keeps them plain buffers (step 1: the KV cache only backs its cells lazily)
+            {
+                // (k19-vramlend: the banks are lazy where a KV cache allocated now would be, llama_kv_lazy_alloc_on: LLAMA_KV_LAZY=1, or
+                // unset with the fit's grant; a drafter kept by --fit: plain banks, as without LLAMA_KV_LAZY)
+                const char * e_sh = getenv("LLAMA_MOE_CACHE_SHRINK");
+                shrink_on = llama_kv_lazy_alloc_on() && (e_sh == nullptr || atoi(e_sh) != 0);
+            }
             for (device & d : devices) {
                 if (!d.ctx) {
                     continue;
                 }
-                d.buf_bank.reset(ggml_backend_alloc_ctx_tensors_from_buft(d.ctx_bank.get(), d.buft));
+                d.buf_bank.reset(alloc_banks(d));
                 if (!d.buf_bank) {
                     throw std::runtime_error("failed to allocate the MoE cache buffers");
                 }
@@ -2107,29 +2158,9 @@ struct llama_moe_cache::impl {
 
     // the ranked (layer, expert) list of profile_file, see prof_entry; false (and a warning) if it is missing or does not match
     bool profile_read() {
-        FILE * f = fopen(profile_file.c_str(), "r");
-        if (f == nullptr) {
-            LLAMA_LOG_WARN("llama_moe_cache%s: LLAMA_MOE_CACHE_PROFILE: no profile %s, the cache starts empty\n", tag, profile_file.c_str());
-            return false;
-        }
-        int ver = 0;
-        long n_layer = 0;
-        bool ok = fscanf(f, "moe-cache-profile %d %ld", &ver, &n_layer) == 2 && ver == 1 && n_layer == (long) layers.size();
-        profile.clear();
-        std::set<int64_t> seen;
-        prof_entry p;
-        while (ok && fscanf(f, "%d %d %f", &p.il, &p.e, &p.heat) == 3) {
-            if (p.il < 0 || p.il >= (int32_t) layers.size() || layers[p.il].ig < 0 || p.e < 0 || p.e >= groups[layers[p.il].ig].lru.n_expert ||
-                    !seen.insert((int64_t) p.il << 32 | p.e).second) {
-                ok = false;
-                break;
-            }
-            profile.push_back(p);
-        }
-        fclose(f);
-        if (!ok || profile.empty()) {
-            LLAMA_LOG_WARN("llama_moe_cache%s: LLAMA_MOE_CACHE_PROFILE: %s does not match this model's cache, ignored\n", tag, profile_file.c_str());
-            profile.clear();
+        if (!llama_moe_profile_load(profile_file, profile_n_expert(), profile)) {
+            LLAMA_LOG_WARN("llama_moe_cache%s: LLAMA_MOE_CACHE_PROFILE: %s is missing or does not match this model's cache, the cache starts empty\n",
+                    tag, profile_file.c_str());
             return false;
         }
         return true;
@@ -2399,6 +2430,17 @@ struct llama_moe_cache::impl {
 #endif
     }
 
+    // experts per layer of the cache (0: a layer it does not cache), the shape a profile must match
+    std::vector<int32_t> profile_n_expert() const {
+        std::vector<int32_t> n(layers.size(), 0);
+        for (size_t il = 0; il < layers.size(); ++il) {
+            if (layers[il].ig >= 0) {
+                n[il] = groups[layers[il].ig].lru.n_expert;
+            }
+        }
+        return n;
+    }
+
     // fill the device slots of each group at load with the first profile entries of its layers (as many as it has slots)
     bool prefill_profile() {
         size_t n_fill  = 0;
@@ -2530,22 +2572,12 @@ struct llama_moe_cache::impl {
         if (quiet && out_res.size() + out_rest.size() < (size_t) std::max<int64_t>(1, (int64_t) profile.size()/2)) {
             return;
         }
-        const std::string tmp = profile_save_file + ".tmp";
-        FILE * f = fopen(tmp.c_str(), "w");
-        if (f == nullptr) {
-            LLAMA_LOG_WARN("llama_moe_cache%s: LLAMA_MOE_CACHE_PROFILE_SAVE: cannot write %s\n", tag, tmp.c_str());
-            return;
-        }
-        fprintf(f, "moe-cache-profile 1 %zu\n", layers.size());
-        for (const auto * v : { &out_res, &out_rest }) {
-            for (const prof_entry & p : *v) {
-                fprintf(f, "%d %d %.6g\n", p.il, p.e, p.heat);
-            }
-        }
-        const bool ok = fclose(f) == 0 && rename(tmp.c_str(), profile_save_file.c_str()) == 0;
+        const size_t n_rest = out_rest.size();
+        out_res.insert(out_res.end(), out_rest.begin(), out_rest.end());
+        const bool ok = llama_moe_profile_write(profile_save_file, layers.size(), out_res);
         if (core_saves++ < 2 || !quiet) {
             LLAMA_LOG_INFO("llama_moe_cache%s: MoE cache profile %s %s: %zu resident + %zu other used experts\n", tag, ok ? "saved to" : "NOT saved to",
-                    profile_save_file.c_str(), out_res.size(), out_rest.size());
+                    profile_save_file.c_str(), out_res.size() - n_rest, n_rest);
         }
     }
 
@@ -3743,10 +3775,131 @@ struct llama_moe_cache::impl {
                 host->describe().c_str(), host_verify ? ", VERIFY" : "");
     }
 
+#if defined(__linux__) || defined(__APPLE__)
+    // k19-ramprof: fills free RAM-tier slots at load in the order of the routing profile host_profile_file (LLAMA_MOE_HOST_PROFILE), most
+    // used first over every layer (llama_moe_profile_ram_order), before the page-cache fill: an expert whose pages are in the page cache is
+    // copied, the others are read from the model files by the weight store (unbuffered reads, in batches), up to LLAMA_MOE_HOST_PROFILE_READ_MIB
+    // MiB of reads (unset: no limit; the page-cache copies are not counted). An exclusive tier skips the experts the device slots hold.
+    // Placement only: a slot holds the bytes of the mapping, as a slot the first prompt fills. Returns the experts filled.
+    size_t prefill_host_profile() {
+        std::vector<prof_entry> prof;
+        if (!llama_moe_profile_load(host_profile_file, profile_n_expert(), prof)) {
+            LLAMA_LOG_WARN("%s: MoE host cache: LLAMA_MOE_HOST_PROFILE: %s is missing or does not match this model's cache, the RAM tier is "
+                    "filled from the page cache only\n", __func__, host_profile_file.c_str());
+            return 0;
+        }
+        size_t read_cap = SIZE_MAX;
+        if (const char * e = getenv("LLAMA_MOE_HOST_PROFILE_READ_MIB")) {
+            read_cap = (size_t) std::max(0.0, atof(e))*1048576;
+        }
+        const int64_t t0 = ggml_time_us();
+        const std::vector<prof_entry> order = llama_moe_profile_ram_order(prof);
+        const size_t pg = (size_t) std::max(4096L, sysconf(_SC_PAGESIZE));
+        // [il][e]: 1 if every page of every expert tensor of the expert is in the page cache (mincore), per layer when first needed
+        std::vector<std::vector<uint8_t>> pc(layers.size());
+        std::vector<unsigned char> vec;
+        auto cached = [&](int32_t il, int32_t e) -> bool {
+            std::vector<uint8_t> & r = pc[il];
+            if (r.empty()) {
+                const layer & l = layers[il];
+                const int32_t n_expert = (int32_t) l.experts[0]->ne[2];
+                r.assign(n_expert, 1);
+                for (const ggml_tensor * w : l.experts) {
+                    const uintptr_t p0 = (uintptr_t) w->data / pg * pg;
+                    const uintptr_t p1 = ((uintptr_t) w->data + ggml_nbytes(w) + pg - 1) / pg * pg;
+                    vec.resize((p1 - p0) / pg);
+#if defined(__APPLE__)
+                    const bool ok = mincore((void *) p0, p1 - p0, (char *) vec.data()) == 0;
+#else
+                    const bool ok = mincore((void *) p0, p1 - p0, vec.data()) == 0;
+#endif
+                    const size_t nb = w->nb[2];
+                    for (int32_t x = 0; x < n_expert; ++x) {
+                        const uintptr_t a = (uintptr_t) w->data + (size_t) x*nb;
+                        bool all = ok;
+                        for (uintptr_t q = a / pg * pg; q < a + nb && all; q += pg) {
+                            all = (vec[(q - p0) / pg] & 1) != 0;
+                        }
+                        r[x] = r[x] && all;
+                    }
+                }
+            }
+            return r[e] != 0;
+        };
+        size_t n_pc = 0, n_file = 0, n_fallback = 0, b_pc = 0, b_file = 0;
+        std::vector<llama_weight_store::host_read> rd;
+        std::vector<std::pair<int32_t, int32_t>> rd_slots; // (slot, layer) of the reads in rd, n_tensors reads each
+        auto flush = [&]() {
+            if (rd.empty()) {
+                return;
+            }
+            const bool ok = wstore != nullptr && wstore->read_host(rd.data(), rd.size(), true);
+            size_t k = 0;
+            for (const auto & [s, il] : rd_slots) {
+                const layer & l = layers[il];
+                for (size_t ip = 0; ip < l.experts.size(); ++ip, ++k) {
+                    if (ok) {
+                        host->set_lead(s, (int) ip, rd[k].lead);
+                    } else {
+                        host->set_lead(s, (int) ip, 0);
+                        memcpy(host->area(s, (int) ip), (const uint8_t *) rd[k].src->data + rd[k].src_off, rd[k].size);
+                    }
+                }
+                host->publish(s);
+            }
+            n_fallback += ok ? 0 : rd_slots.size();
+            rd.clear();
+            rd_slots.clear();
+        };
+        auto want = [&](int32_t il, int32_t e) -> bool {
+            if (!host_layer(il) || (host->exclusive() && in_device(il, e))) {
+                return false;
+            }
+            return b_file < read_cap || cached(il, e);
+        };
+        auto take = [&](size_t i, int32_t s) {
+            const int32_t il = order[i].il;
+            const int32_t e  = order[i].e;
+            const layer & l = layers[il];
+            if (cached(il, e)) {
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    host->set_lead(s, (int) ip, 0);
+                    memcpy(host->area(s, (int) ip), (const uint8_t *) w->data + (size_t) e*w->nb[2], w->nb[2]);
+                    b_pc += w->nb[2];
+                }
+                host->publish(s);
+                n_pc++;
+                return;
+            }
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                const ggml_tensor * w = l.experts[ip];
+                rd.push_back({ w, (size_t) e*w->nb[2], w->nb[2], host->area(s, (int) ip), 0 });
+                b_file += w->nb[2];
+            }
+            rd_slots.emplace_back(s, il);
+            n_file++;
+            if (rd_slots.size() >= 64) {
+                flush();
+            }
+        };
+        const size_t n = llama_moe_profile_reserve(*host, order, want, take);
+        flush();
+        LLAMA_LOG_INFO("%s: MoE host cache: profile %s: %zu of %zu profile experts into RAM slots in %.1f s, most used first: %zu (%.1f MiB) "
+                "from the page cache, %zu (%.1f MiB) read from the files%s (LLAMA_MOE_HOST_PROFILE unset or 0 off, "
+                "LLAMA_MOE_HOST_PROFILE_READ_MIB caps the reads)\n", __func__, host_profile_file.c_str(), n, prof.size(), (ggml_time_us() - t0)/1e6,
+                n_pc, b_pc/1048576.0, n_file, b_file/1048576.0, n_fallback > 0 ? ", some copied from the mapping (the store could not read them)" : "");
+        return n;
+    }
+#endif
+
     // the experts whose pages are in the page cache (e.g. read while loading) are copied into free slots: pinning the slots would
     // otherwise evict those pages and the first prompt would read them again (LLAMA_MOE_HOST_CACHE_PREFILL=0 off)
     void prefill_resident() {
 #if defined(__linux__) || defined(__APPLE__)
+        // k19-ramprof: a routing profile fills the RAM tier first (the resident mode reads every expert anyway)
+        const size_t n_prof = !resident_mode && !host_profile_file.empty() ? prefill_host_profile() : 0;
+        hst.prefilled = n_prof;
         const char * env_pf = getenv("LLAMA_MOE_HOST_CACHE_PREFILL");
         if (env_pf != nullptr && atoi(env_pf) == 0) {
             return;
@@ -3834,7 +3987,7 @@ struct llama_moe_cache::impl {
                 }
             }
         }
-        hst.prefilled = n_fill;
+        hst.prefilled = n_fill + n_prof;
         LLAMA_LOG_INFO("%s: MoE host cache: %zu experts (%.1f MiB) copied from the page cache into RAM slots in %.1f ms, %zu of them read from the files"
                 " (LLAMA_MOE_HOST_CACHE_PREFILL=0 off, 2 also reads the experts that are not in the page cache)\n",
                 __func__, n_fill, n_bytes/1048576.0, (ggml_time_us() - t0)/1000.0, n_file);
@@ -5475,7 +5628,7 @@ struct llama_moe_cache::impl {
         const int64_t n_tokens = std::max<int64_t>(1, std::min<int64_t>(max_batch, g.n_slots/n_expert_used));
         ggml_tensor * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, n_expert_used, n_tokens);
         std::vector<const void *> host(g.banks.size(), nullptr);
-        std::vector<ggml_tensor *> banks = g.banks;
+        std::vector<ggml_tensor *> banks = op_banks(g);
         ggml_tensor * op = ggml_moe_cache_lookup(ctx.get(), ids, g.map, g.state, banks.data(), host.data(), (int) banks.size(), g.layers[0]);
         if (g.scores != nullptr) {
             ggml_moe_cache_set_scores(op, g.scores, g.lru.grow_q16, true);
@@ -6036,7 +6189,7 @@ struct llama_moe_cache::impl {
         if (!use_device(g, n_ubatch) || !slots_fit(g, n_ubatch) || ids->ne[1] > n_ubatch || ids->ne[0] > n_expert_used || l.host_dev.size() != g.banks.size()) {
             return nullptr;
         }
-        std::vector<ggml_tensor *> banks = g.banks;
+        std::vector<ggml_tensor *> banks = op_banks(g);
         std::vector<const void *>  host  = l.host_dev;
         ggml_tensor * op = ggml_moe_cache_lookup(ctx, ids, g.map, g.state, banks.data(), host.data(), (int) banks.size(), il);
         if (g.scores != nullptr) {
@@ -6418,7 +6571,7 @@ struct llama_moe_cache::impl {
     ggml_tensor * hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res, bool ov) const {
         const layer & l = layers[il];
         const group & g = groups[l.ig];
-        std::vector<ggml_tensor *> banks = g.banks;
+        std::vector<ggml_tensor *> banks = op_banks(g);
         std::vector<const void *>  host  = l.host_dev;
         return ggml_moe_cache_fetch(ctx, res, banks.data(), host.data(), (int) banks.size(), ov);
     }
@@ -6464,9 +6617,10 @@ struct llama_moe_cache::impl {
             }
             g.lru.clear();
             // the banks as allocated (cleared), kernels may read a little past the end of an expert
+            // (k17-small: the slots left and the spare slot; the rows shrink retired are not backed)
             for (ggml_tensor * bank : g.banks) {
-                // (k19-ptres: the core keeps its experts)
-                ggml_backend_tensor_memset(bank, 0, (size_t) g.lru.n_core*bank->nb[2], ggml_nbytes(bank) - (size_t) g.lru.n_core*bank->nb[2]);
+                // (k17-small: the slots left and the spare slot, not the retired rows; k19-ptres: the core keeps its experts)
+                ggml_backend_tensor_memset(bank, 0, (size_t) g.lru.n_core*bank->nb[2], (size_t) (g.n_slots + 1 - g.lru.n_core)*bank->nb[2]);
             }
             // the use counters and the residual; the count of experts computed on the host (statistics, stat[0..1]) is kept
             const size_t n_cnt = (size_t) g.counts->ne[0]*(g.counts->ne[1] - 1);
@@ -8751,6 +8905,273 @@ struct llama_moe_cache::impl {
         return d.lend_auto != 0;
     }
 
+    // k17-small (lazy KV step 2): the bank buffer of device d. With shrink_on it is a lazy buffer of the backend (the address range of
+    // every bank is reserved whole, as the plain buffer would place them) and backed for the slots the groups have now (all of them at
+    // load; after a shrink, restore backs only the slots left, the retired tails stay unbacked). A plain buffer otherwise, or if the
+    // backend has no lazy buffers (then shrink gives nothing back)
+    ggml_backend_buffer_t alloc_banks(device & d) {
+        d.bank_lazy = false;
+        if (shrink_on) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(d.buft);
+            ggml_backend_reg_t reg = dev != nullptr && !ggml_backend_buft_is_host(d.buft) ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            if (reg != nullptr && lazy_alloc_fn == nullptr) {
+                lazy_alloc_fn    = (ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_alloc_lazy");
+                lazy_commit_fn   = (bool (*)(ggml_backend_buffer_t, size_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_commit");
+                lazy_decommit_fn = (size_t (*)(ggml_backend_buffer_t, size_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_decommit");
+            }
+            const size_t sz = ggml_backend_alloc_ctx_tensors_from_buft_size(d.ctx_bank.get(), d.buft);
+            ggml_backend_buffer_t buf = reg != nullptr && lazy_alloc_fn != nullptr && lazy_commit_fn != nullptr && lazy_decommit_fn != nullptr && sz > 0 ?
+                lazy_alloc_fn(d.buft, sz) : nullptr;
+            if (buf != nullptr) {
+                // as ggml_backend_alloc_ctx_tensors: the banks first, then their views
+                bool ok = true;
+                ggml_tallocr ta = ggml_tallocr_new(buf);
+                for (ggml_tensor * t = ggml_get_first_tensor(d.ctx_bank.get()); ok && t != nullptr; t = ggml_get_next_tensor(d.ctx_bank.get(), t)) {
+                    if (t->data == nullptr && t->view_src == nullptr) {
+                        ok = ggml_tallocr_alloc(&ta, t) == GGML_STATUS_SUCCESS;
+                    }
+                }
+                for (ggml_tensor * t = ggml_get_first_tensor(d.ctx_bank.get()); ok && t != nullptr; t = ggml_get_next_tensor(d.ctx_bank.get(), t)) {
+                    if (t->data == nullptr && t->view_src != nullptr) {
+                        ok = ggml_backend_view_init(t) == GGML_STATUS_SUCCESS;
+                    }
+                }
+                // back the slots of every group (and the spare slot after them)
+                const char * base = (const char *) ggml_backend_buffer_get_base(buf);
+                for (const group & g : groups) {
+                    if (!ok || &devices[g.id] != &d || g.n_slots == 0) {
+                        continue;
+                    }
+                    for (const ggml_tensor * bank : g.banks) {
+                        ok = ok && lazy_commit_fn(buf, (const char *) bank->data - base, (size_t) (g.n_slots + 1)*bank->nb[2]);
+                    }
+                }
+                if (ok) {
+                    d.bank_lazy = true;
+                    return buf;
+                }
+                for (ggml_tensor * t = ggml_get_first_tensor(d.ctx_bank.get()); t != nullptr; t = ggml_get_next_tensor(d.ctx_bank.get(), t)) {
+                    t->data   = nullptr;
+                    t->buffer = nullptr;
+                }
+                ggml_backend_buffer_free(buf);
+                return nullptr; // no memory for the banks: as the plain allocation failing
+            }
+        }
+        return ggml_backend_alloc_ctx_tensors_from_buft(d.ctx_bank.get(), d.buft);
+    }
+
+    // k17-small: the bank tensors the lookup ops of g read and write: the banks, or after a shrink their views over the slots left (they
+    // follow the banks to the buffer they are in now, which restore replaces)
+    std::vector<ggml_tensor *> op_banks(const group & g) const {
+        if (g.banks_op.empty()) {
+            return g.banks;
+        }
+        for (size_t i = 0; i < g.banks.size(); ++i) {
+            g.banks_op[i]->data   = g.banks[i]->data;
+            g.banks_op[i]->buffer = g.banks[i]->buffer;
+        }
+        return g.banks_op;
+    }
+
+    // k17-small: the index of the device of the cache on dev (-1: none)
+    int32_t dev_id(ggml_backend_dev_t dev) const {
+        for (size_t i = 0; i < devices.size(); ++i) {
+            if (devices[i].backend != nullptr && ggml_backend_get_device(devices[i].backend) == dev) {
+                return (int32_t) i;
+            }
+        }
+        return -1;
+    }
+
+    // k17-small: the bytes of the slots the groups of device id hold now
+    size_t slot_bytes(int32_t id) const {
+        size_t n = 0;
+        for (const group & g : groups) {
+            if (g.id == id) {
+                n += (size_t) g.n_slots*g.expert_bytes;
+            }
+        }
+        return n;
+    }
+
+    // k17-small: the bytes of the slots the groups of device id held at load
+    size_t slot_bytes_load(int32_t id) const {
+        size_t n = 0;
+        for (const group & g : groups) {
+            if (g.id == id) {
+                n += (size_t) g.n_slots_load*g.expert_bytes;
+            }
+        }
+        return n;
+    }
+
+    // k17-small: shrink keeps at least floor bytes of slots on device id, every group in proportion to its slots at load (at least the
+    // experts of one token)
+    void set_shrink_floor(int32_t id, size_t floor) {
+        devices[id].shrink_floor = floor;
+        size_t load = 0;
+        for (const group & g : groups) {
+            if (g.id == id) {
+                load += (size_t) g.n_slots_load*g.expert_bytes;
+            }
+        }
+        for (group & g : groups) {
+            if (g.id != id || g.n_slots_load == 0) {
+                continue;
+            }
+            const double  share = load > 0 ? std::min(1.0, (double) floor/(double) load) : 1.0;
+            const int32_t n_min = (int32_t) std::ceil(share*g.n_slots_load);
+            g.n_slots_min = std::min(g.n_slots_load, std::max<int32_t>(n_min, std::min<int32_t>(n_expert_used, g.n_slots_load)));
+        }
+    }
+
+    // k17-small: retire the slots [n_new, n_slots) of g for good and give back the device memory of the bank pages wholly inside the rows
+    // that are no longer used. The slot after the last one stays backed: it is the spare slot (probe uploads, CUDA MMQ reads past the
+    // last expert into it). Every slot count the cache uses (the host LRU, lend's tail, the device lookup state, whose length the kernels
+    // read) follows g.n_slots, so nothing can map an expert to a retired slot; the banks and their views keep their load size, so the
+    // graphs keep their shapes. Returns the bytes given back
+    size_t retire(group & g, int32_t n_new) {
+        device & d = devices[g.id];
+        ggml_backend_t backend = d.backend;
+        const int32_t n_old = g.n_slots;
+        // k19-ptres: never into the core, and a whole layer of slots stays above it (as core_place leaves)
+        if (g.lru.n_core > 0) {
+            n_new = std::max(n_new, std::min(n_old, g.lru.n_core + g.lru.n_expert));
+        }
+        if (n_new >= n_old) {
+            return 0;
+        }
+        if (host && (size_t) (&g - groups.data()) < host_group.size() && host_group[&g - groups.data()]) {
+            // the RAM tier keeps a copy of the experts the retired slots held, as for slots that are lent (see release)
+            evicted_tmp.clear();
+            for (int32_t s = n_new; s < n_old; ++s) {
+                if (g.lru.key_of[s] >= 0) {
+                    evicted_tmp.emplace_back(s, g.lru.key_of[s]);
+                }
+            }
+            shadow_slots(backend, g, evicted_tmp);
+        }
+        g.lru.retire(n_new);
+        g.n_slots = n_new;
+        if (!g.ua_dec_key.empty()) {
+            g.ua_dec_key.resize(n_new);
+        }
+        if (g.state != nullptr) {
+            // the device lookup reads the slot count from the length of its state (n_hdr + 3*n_slots)
+            g.state->ne[0] = n_hdr + 3*(int64_t) n_new;
+            for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                g.state->nb[i] = g.state->nb[i - 1]*g.state->ne[i - 1];
+            }
+        }
+        // the lookup ops require banks of n_slots + 1 slots: views of the banks over the slots left
+        if (g.banks_op.empty()) {
+            if (!ctx_banks_op) {
+                size_t n_banks = 0;
+                for (const group & gi : groups) {
+                    n_banks += gi.banks.size();
+                }
+                ggml_init_params params = {
+                    /*.mem_size   =*/ (n_banks + 1)*ggml_tensor_overhead(),
+                    /*.mem_buffer =*/ nullptr,
+                    /*.no_alloc   =*/ true,
+                };
+                ctx_banks_op.reset(ggml_init(params));
+            }
+            for (ggml_tensor * bank : g.banks) {
+                ggml_tensor * v = ggml_view_3d(ctx_banks_op.get(), bank, bank->ne[0], bank->ne[1], n_new + 1, bank->nb[1], bank->nb[2], 0);
+                ggml_format_name(v, "%s.op", bank->name);
+                g.banks_op.push_back(v);
+            }
+        }
+        for (ggml_tensor * v : g.banks_op) {
+            v->ne[2] = n_new + 1;
+            v->nb[3] = v->nb[2]*v->ne[2];
+        }
+        // the new spare slot held an expert: cleared as unlend clears the slots that come back
+        for (ggml_tensor * bank : g.banks) {
+            ggml_backend_tensor_memset(bank, 0, (size_t) n_new*bank->nb[2], bank->nb[2]);
+        }
+        if (g.dev_lookup && g.map != nullptr && g.state != nullptr) {
+            upload(g);
+        }
+        size_t freed = 0;
+        if (d.bank_lazy && d.buf_bank) {
+            const char * base = (const char *) ggml_backend_buffer_get_base(d.buf_bank.get());
+            for (const ggml_tensor * bank : g.banks) {
+                // (lend places a padded copy at most an alignment past the spare slot: 64 KiB more stay backed)
+                const size_t off  = (size_t) ((const char *) bank->data - base);
+                const size_t keep = std::min(ggml_nbytes(bank), (size_t) (n_new + 1)*bank->nb[2] + (size_t) 64*1024);
+                freed += lazy_decommit_fn(d.buf_bank.get(), off + keep, ggml_nbytes(bank) - keep);
+            }
+        }
+        n_retired += n_old - n_new;
+        graphs_stale = true;
+        return freed;
+    }
+
+    // k17-small (lazy KV step 2, llama_moe_cache::shrink): give back at least bytes of device memory of device id by retiring the tail
+    // slots of its groups (spread over the groups in proportion to what each holds above its floor) down to the shrink floor. The work of
+    // the slots stops first: the uploads ahead are dropped, a pending seed ends, the device state is read back and lent slots come back
+    // (unlend; the next large graph lends again). Not while the banks are released (they hold no memory then). Returns the bytes freed
+    size_t shrink(int32_t id, size_t bytes) {
+        device & d = devices[id];
+        if (!shrink_on || bytes == 0 || !d.buf_bank || !d.bank_lazy || d.released || d.shrink_floor == SIZE_MAX) {
+            return 0;
+        }
+        // at the floor: nothing to give, and nothing is stopped
+        if (std::none_of(groups.begin(), groups.end(), [&](const group & g) { return g.id == id && g.n_slots > g.n_slots_min; })) {
+            return 0;
+        }
+        ggml_backend_t backend = d.backend;
+        ua_release(id);
+        ggml_backend_synchronize(backend);
+        // a graph built before reuses its allocation without a lend callback: after the lent slots come back it must be built again
+        graphs_stale = true;
+        for (group & g : groups) {
+            if (g.id != id || g.n_slots == 0) {
+                continue;
+            }
+            seed_end(g);
+            if (g.dev_lookup && g.dev_newer) {
+                download(g);
+            }
+            if (g.lru.n_lent > 0) {
+                unlend(g);
+            }
+        }
+        const size_t before = slot_bytes(id);
+        size_t  freed     = 0;
+        int32_t n_retired0 = (int32_t) n_retired;
+        while (freed < bytes) {
+            int32_t n_avail = 0;
+            for (const group & g : groups) {
+                n_avail += g.id == id && g.n_slots > g.n_slots_min ? 1 : 0;
+            }
+            if (n_avail == 0) {
+                break;
+            }
+            for (group & g : groups) {
+                if (g.id != id || g.n_slots <= g.n_slots_min || freed >= bytes) {
+                    continue;
+                }
+                const size_t  want = (bytes - freed + n_avail - 1)/n_avail;
+                const int32_t k    = (int32_t) std::min<int64_t>(g.n_slots - g.n_slots_min, std::max<int64_t>(1, (int64_t) ((want + g.expert_bytes - 1)/g.expert_bytes)));
+                freed += retire(g, g.n_slots - k);
+            }
+        }
+        if (freed > 0) {
+            n_shrinks++;
+            shrunk_bytes += freed;
+            d.buf_size -= std::min(d.buf_size, freed);
+        }
+        LLAMA_LOG_INFO("%s: %s: MoE cache shrink %" PRId64 " for the KV cache: asked %.2f MiB, gave back %.2f MiB (%d slots retired), slots %.2f -> %.2f MiB "
+            "(floor %.2f MiB); total %.2f MiB, %" PRId64 " slots (LLAMA_MOE_CACHE_SHRINK=0 to disable)\n", __func__, ggml_backend_name(backend), n_shrinks,
+            bytes/1048576.0, freed/1048576.0, (int32_t) n_retired - n_retired0, before/1048576.0, slot_bytes(id)/1048576.0, d.shrink_floor/1048576.0,
+            shrunk_bytes/1048576.0, n_retired);
+        return freed;
+    }
+
     // the lent slots come back empty: they are cleared once the work that used them is done, because kernels may read a little past
     // the end of the expert in the slot before (e.g. CUDA MMQ in the padding of the last row) and the copies left arbitrary bytes there
     // the experts that a seed could not admit while slots were lent are then uploaded from host memory (LLAMA_MOE_CACHE_REFILL=0 to disable)
@@ -8835,7 +9256,7 @@ struct llama_moe_cache::impl {
             t->data   = nullptr;
             t->buffer = nullptr;
         }
-        d.buf_bank.reset(ggml_backend_alloc_ctx_tensors_from_buft(d.ctx_bank.get(), d.buft));
+        d.buf_bank.reset(alloc_banks(d));
         if (!d.buf_bank && restore_soft) {
             // k19-place8 (see set_restore_soft): the banks stay released, the caller runs as during a prompt and tries again later
             if (n_restore_fail++ < 4) {
@@ -9894,8 +10315,8 @@ struct llama_moe_cache::impl {
         }
         g.lru.clear();
         for (ggml_tensor * bank : g.banks) {
-            // (k19-ptres: the core keeps its experts)
-            ggml_backend_tensor_memset(bank, 0, (size_t) g.lru.n_core*bank->nb[2], ggml_nbytes(bank) - (size_t) g.lru.n_core*bank->nb[2]);
+            // (k17-small: the slots left and the spare slot, not the retired rows; k19-ptres: the core keeps its experts)
+            ggml_backend_tensor_memset(bank, 0, (size_t) g.lru.n_core*bank->nb[2], (size_t) (g.n_slots + 1 - g.lru.n_core)*bank->nb[2]);
         }
         g.dev_newer = false;
         g.dev_gen   = UINT64_MAX;
@@ -10998,6 +11419,23 @@ double llama_moe_cache::cache_frac() const {
     return pimpl->cache_frac;
 }
 
+double llama_moe_cache::release_frac() const {
+    size_t load  = 0;
+    size_t floor = 0;
+    bool   any   = false;
+    for (size_t id = 0; id < pimpl->devices.size(); ++id) {
+        const size_t l = pimpl->slot_bytes_load((int32_t) id);
+        const size_t f = pimpl->devices[id].shrink_floor;
+        load  += l;
+        floor += f == SIZE_MAX ? l : std::min(f, l);
+        any    = any || f != SIZE_MAX;
+    }
+    if (!any || load == 0 || pimpl->cache_frac < 0.0) {
+        return pimpl->cache_frac;
+    }
+    return pimpl->cache_frac*(double) floor/(double) load;
+}
+
 void llama_moe_cache::hybrid_reset() {
     pimpl->hybrid_reset();
 }
@@ -11283,6 +11721,34 @@ void llama_moe_cache::set_restore_soft(bool on) {
     pimpl->restore_soft = on;
 }
 
+size_t llama_moe_cache::shrink(ggml_backend_dev_t dev, size_t bytes) {
+    const int32_t id = pimpl->dev_id(dev);
+    return id >= 0 ? pimpl->shrink(id, bytes) : 0;
+}
+
+bool llama_moe_cache::can_shrink(ggml_backend_dev_t dev) const {
+    const int32_t id = pimpl->dev_id(dev);
+    return id >= 0 && pimpl->shrink_on && pimpl->devices[id].bank_lazy && pimpl->devices[id].buf_bank;
+}
+
+void llama_moe_cache::set_shrink_floor(ggml_backend_dev_t dev, size_t bytes) {
+    const int32_t id = pimpl->dev_id(dev);
+    if (id >= 0) {
+        pimpl->set_shrink_floor(id, bytes);
+    }
+}
+
+size_t llama_moe_cache::slot_bytes(ggml_backend_dev_t dev) const {
+    const int32_t id = pimpl->dev_id(dev);
+    return id >= 0 ? pimpl->slot_bytes(id) : 0;
+}
+
+bool llama_moe_cache::take_graphs_stale() {
+    const bool res = pimpl->graphs_stale;
+    pimpl->graphs_stale = false;
+    return res;
+}
+
 void llama_moe_cache::set_refill_routed_once(bool on) {
     pimpl->refill_routed_once = on;
 }
@@ -11441,4 +11907,83 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
         res[ggml_backend_buffer_get_type(pimpl->buf_host.get())] += pimpl->buf_host_size;
     }
     return res;
+}
+
+//
+// k19-ramprof: the routing profile file
+//
+
+bool llama_moe_profile_load(const std::string & path, const std::vector<int32_t> & n_expert, std::vector<llama_moe_profile_entry> & out) {
+    out.clear();
+    FILE * f = fopen(path.c_str(), "r");
+    if (f == nullptr) {
+        return false;
+    }
+    int  ver     = 0;
+    long n_layer = 0;
+    bool ok = fscanf(f, "moe-cache-profile %d %ld", &ver, &n_layer) == 2 && ver == 1 && n_layer == (long) n_expert.size();
+    std::set<int64_t> seen;
+    llama_moe_profile_entry p;
+    int r = 0;
+    while (ok && (r = fscanf(f, "%d %d %f", &p.il, &p.e, &p.heat)) == 3) {
+        if (p.il < 0 || p.il >= (int32_t) n_expert.size() || p.e < 0 || p.e >= n_expert[p.il] || !std::isfinite(p.heat) ||
+                !seen.insert((int64_t) p.il << 32 | p.e).second) {
+            ok = false;
+            break;
+        }
+        out.push_back(p);
+    }
+    // a line cut short (a partial last line) is a truncated file, not the end of the list
+    ok = ok && r == EOF && !ferror(f);
+    fclose(f);
+    if (!ok || out.empty()) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+bool llama_moe_profile_write(const std::string & path, size_t n_layer, const std::vector<llama_moe_profile_entry> & entries) {
+    const std::string tmp = path + ".tmp";
+    FILE * f = fopen(tmp.c_str(), "w");
+    if (f == nullptr) {
+        return false;
+    }
+    bool ok = fprintf(f, "moe-cache-profile 1 %zu\n", n_layer) > 0;
+    for (const llama_moe_profile_entry & p : entries) {
+        ok = ok && fprintf(f, "%d %d %.6g\n", p.il, p.e, p.heat) > 0;
+    }
+    ok = fclose(f) == 0 && ok;
+    ok = ok && rename(tmp.c_str(), path.c_str()) == 0;
+    if (!ok) {
+        remove(tmp.c_str());
+    }
+    return ok;
+}
+
+std::vector<llama_moe_profile_entry> llama_moe_profile_ram_order(const std::vector<llama_moe_profile_entry> & entries) {
+    std::vector<llama_moe_profile_entry> v = entries;
+    std::stable_sort(v.begin(), v.end(), [](const llama_moe_profile_entry & a, const llama_moe_profile_entry & b) { return a.heat > b.heat; });
+    return v;
+}
+
+size_t llama_moe_profile_reserve(llama_moe_host_cache & host, const std::vector<llama_moe_profile_entry> & order,
+        const std::function<bool(int32_t il, int32_t e)> & want, const std::function<void(size_t i, int32_t s)> & take) {
+    size_t n = 0;
+    std::set<int32_t> full; // layers whose layout has no free slot left (a reservation there failed)
+    for (size_t i = 0; i < order.size(); ++i) {
+        const int32_t il = order[i].il;
+        const int32_t e  = order[i].e;
+        if (!host.caches(il) || full.count(il) > 0 || host.contains(il, e) || !want(il, e)) {
+            continue;
+        }
+        const int32_t s = host.reserve(il, e, false);
+        if (s < 0) {
+            full.insert(il);
+            continue;
+        }
+        take(i, s);
+        n++;
+    }
+    return n;
 }

@@ -71,11 +71,22 @@ struct llama_memory_breakdown_data {
     size_t context = 0; // memory allocated for the context
     size_t compute = 0; // memory allocated for temporary compute buffers
     size_t lend_freed = 0; // k15-fn: of a measurement (no_alloc), the staging arena the MoE cache lends for, not in total() (see sched_reserve)
+    size_t kv_lazy    = 0; // k17-small: the bytes of context a lazy KV cache leaves unbacked (a measurement: at load), in total()
 
     size_t total() const {
         return model + context + compute;
     }
 };
+
+// k19-vramlend: lazy KV mode (LLAMA_KV_LAZY): 0 = off (=0, the kill switch), 1 = on (=1: every eligible device KV cache backs its cells
+// lazily, also without a MoE cache to lend to), 2 = auto (unset: a fit measures the KV lazily and gives the MoE cache the bytes the first
+// cells leave unbacked; the KV cache is then lazy only where common set LLAMA_KV_LAZY_GRANTED=1 for that fit, see common_init_result)
+// (k19-vramlend-optin: unset = 0, the automatic mode is LLAMA_KV_LAZY=auto)
+int  llama_kv_lazy_mode();
+// whether a device KV cache allocated now backs its cells lazily (LLAMA_KV_LAZY_SUSPEND=1 always backs it whole)
+bool llama_kv_lazy_alloc_on();
+// whether a measurement (no_alloc) reports the KV bytes a lazy KV cache leaves unbacked at load (mb.kv_lazy)
+bool llama_kv_lazy_measure_on();
 
 struct llama_device_memory_data {
     int64_t total;

@@ -3,8 +3,10 @@
 
 #include "ggml-backend.h"
 
+#include <functional>
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 struct llama_model;
@@ -187,6 +189,9 @@ public:
     bool hybrid_fixed() const;
     // k13-small: the cached share of the host experts' bytes (-1 before the slots are sized)
     double cache_frac() const;
+    // k17-small (lazy KV step 2): cache_frac of the slots the cache keeps for itself, its shrink floor (the rest is the KV cache's,
+    // see shrink): what the bank release of a layer-major prompt group is decided on (cache_frac where no floor is set)
+    double release_frac() const;
     void hybrid_reset();
     // k19-ptres (LLAMA_MOE_CORE=1): bytes of the core experts' host copies left out of the registration and dropped from the page cache
     size_t core_dropped_bytes() const;
@@ -252,6 +257,18 @@ public:
     // k19-place8: a restore whose banks do not allocate leaves them released (released() stays true) instead of aborting
     void set_restore_soft(bool on);
     bool released() const;
+    // k17-small (lazy KV step 2, LLAMA_KV_LAZY=1, LLAMA_MOE_CACHE_SHRINK=0 off): give back at least bytes of the device memory of dev to a
+    // KV cache that grows by retiring tail slots for good (down to the floor set_shrink_floor sets); returns the bytes freed (0: none,
+    // e.g. no lazy banks, no floor set, at the floor, banks released). Between batches only (no graph of this cache may be pending)
+    size_t shrink(ggml_backend_dev_t dev, size_t bytes);
+    // k19-vramlend: whether shrink can give memory back on dev (lazy banks there)
+    bool can_shrink(ggml_backend_dev_t dev) const;
+    // the bytes of slots shrink keeps on dev (not set: nothing is retired)
+    void set_shrink_floor(ggml_backend_dev_t dev, size_t bytes);
+    // the bytes of the slots the cache holds on dev now
+    size_t slot_bytes(ggml_backend_dev_t dev) const;
+    // true once after a shrink: the graphs built before it read the old slot counts and must be built again
+    bool take_graphs_stale();
     // the next restore refills the slots with the experts the recorded routing used most (set_refill_counts), as LLAMA_MOE_CACHE_REFILL_ROUTED=1
     void set_refill_routed_once(bool on);
     // the cache lends slots on some device (decided by the first large graph)
@@ -371,3 +388,28 @@ private:
 };
 
 using llama_moe_cache_ptr = std::unique_ptr<llama_moe_cache>;
+
+// k19-ramprof: the routing profile file of the MoE cache ("moe-cache-profile 1 <n_layer>", then one "<layer> <expert> <heat>" line per
+// expert, written by LLAMA_MOE_CACHE_PROFILE_SAVE at exit). heat = decayed use, in uses.
+struct llama_moe_profile_entry {
+    int32_t il;
+    int32_t e;
+    float   heat;
+};
+
+// reads path into out; n_expert[il] = the experts of layer il the cache holds (0: not cached). false (out empty) if the file is missing,
+// has another layer count, names a layer / expert out of range or twice, or lists nothing
+bool llama_moe_profile_load(const std::string & path, const std::vector<int32_t> & n_expert, std::vector<llama_moe_profile_entry> & out);
+
+// writes the entries in their order (to path.tmp, renamed over path); false on an I/O error
+bool llama_moe_profile_write(const std::string & path, size_t n_layer, const std::vector<llama_moe_profile_entry> & entries);
+
+// the order the RAM tier is filled in at load: the most used first over every layer (heat descending), ties in file order
+std::vector<llama_moe_profile_entry> llama_moe_profile_ram_order(const std::vector<llama_moe_profile_entry> & entries);
+
+class llama_moe_host_cache;
+
+// reserves free RAM-tier slots (never evicting) for the entries in order, those want(il, e) accepts, each layout up to its slots; calls
+// take(index of the entry, slot) for each reserved slot (the caller fills and publishes it); returns the slots reserved
+size_t llama_moe_profile_reserve(llama_moe_host_cache & host, const std::vector<llama_moe_profile_entry> & order,
+        const std::function<bool(int32_t il, int32_t e)> & want, const std::function<void(size_t i, int32_t s)> & take);
