@@ -2560,7 +2560,10 @@ struct llama_moe_cache::impl {
                     continue;
                 }
                 std::vector<int32_t> key(g.lru.n_core);
-                if (g.dev_lookup && g.state != nullptr && g.state->data != nullptr && !devices[g.id].released) {
+                // the device state only where it is current (newer than the host's, or uploaded since the last host change): before the
+                // first upload it is empty, and an upload replaces it with the host state anyway
+                const bool dev_cur = g.dev_newer || g.dev_gen == g.lru.gen;
+                if (dev_cur && g.dev_lookup && g.state != nullptr && g.state->data != nullptr && !devices[g.id].released) {
                     ggml_backend_synchronize(devices[g.id].backend);
                     ggml_backend_tensor_get(g.state, key.data(), n_hdr*sizeof(int32_t), key.size()*sizeof(int32_t));
                 } else {
