@@ -307,6 +307,157 @@ static bool common_sampler_greedy_fast(const common_params_sampling & params, co
     return true;
 }
 
+// k19-sharednoise (see sampling.h): the shared-noise final stage
+bool common_shared_noise_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_SHARED_NOISE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+
+static inline uint64_t sn_mix64(uint64_t x) {
+    // splitmix64 finalizer (a bijection with full avalanche)
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ull;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebull;
+    x ^= x >> 31;
+    return x;
+}
+
+float common_shared_noise_gumbel(uint32_t seed, uint64_t pos, llama_token token) {
+    uint64_t x = sn_mix64(((uint64_t) seed << 32) ^ 0x9e3779b97f4a7c15ull ^ sn_mix64(pos + 0x632be59bd9b4e019ull));
+    x = sn_mix64(x ^ ((uint64_t) (uint32_t) token * 0xc2b2ae3d27d4eb4full));
+    // u in (0, 1): 53 bits, never 0 or 1, so g is finite (|g| < 38)
+    const double u = ((double) (x >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+    return (float) -std::log(-std::log(u));
+}
+
+// g never exceeds -log(-log(1 - 2^-54)) = 37.43: a candidate whose logit is that far below the best perturbed one cannot win
+static constexpr float SN_G_MAX = 37.5f;
+
+struct sn_sampler_ctx {
+    uint32_t seed;     // as requested (LLAMA_DEFAULT_SEED: a random one per reset)
+    uint32_t seed_cur; // in use
+    uint64_t n_acc;    // tokens accepted since the last reset: the key of the next draw
+};
+
+static uint32_t sn_resolve_seed(uint32_t seed) {
+    if (seed != LLAMA_DEFAULT_SEED) {
+        return seed;
+    }
+    std::random_device rd;
+    return rd();
+}
+
+static const char * sn_name(const struct llama_sampler * /*smpl*/) {
+    return "shared-noise";
+}
+
+static void sn_accept(struct llama_sampler * smpl, llama_token /*token*/) {
+    ((sn_sampler_ctx *) smpl->ctx)->n_acc++;
+}
+
+static void sn_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    const auto * ctx = (const sn_sampler_ctx *) smpl->ctx;
+    if (cur_p->size == 0) {
+        cur_p->selected = -1;
+        return;
+    }
+    if (cur_p->size == 1) {
+        cur_p->selected = 0;
+        cur_p->data[0].p = 1.0f;
+        return;
+    }
+    // probabilities as dist leaves them (softmax of the candidates' logits, in place, any order)
+    size_t i_max = 0;
+    for (size_t i = 1; i < cur_p->size; ++i) {
+        if (cur_p->data[i].logit > cur_p->data[i_max].logit) {
+            i_max = i;
+        }
+    }
+    const float max_l = cur_p->data[i_max].logit;
+    double sum = 0.0;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        const float p = expf(cur_p->data[i].logit - max_l);
+        cur_p->data[i].p = p;
+        sum += p;
+    }
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        cur_p->data[i].p = (float) (cur_p->data[i].p / sum);
+    }
+    // Gumbel-max: argmax(logit + g); -inf logits never win, ties go to the lower index
+    const uint64_t pos = ctx->n_acc;
+    size_t best   = i_max;
+    float  best_v = max_l + common_shared_noise_gumbel(ctx->seed_cur, pos, cur_p->data[i_max].id);
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        const float l = cur_p->data[i].logit;
+        if (i == i_max || !(l + SN_G_MAX >= best_v)) {
+            continue;
+        }
+        const float v = l + common_shared_noise_gumbel(ctx->seed_cur, pos, cur_p->data[i].id);
+        if (v > best_v || (v == best_v && i < best)) {
+            best_v = v;
+            best   = i;
+        }
+    }
+    cur_p->selected = (int64_t) best;
+}
+
+static void sn_reset(struct llama_sampler * smpl) {
+    auto * ctx = (sn_sampler_ctx *) smpl->ctx;
+    ctx->seed_cur = sn_resolve_seed(ctx->seed);
+    ctx->n_acc    = 0;
+}
+
+static struct llama_sampler * sn_clone(const struct llama_sampler * smpl) {
+    const auto * ctx = (const sn_sampler_ctx *) smpl->ctx;
+    auto * res = common_sampler_init_shared_noise(ctx->seed);
+    *(sn_sampler_ctx *) res->ctx = *ctx;
+    return res;
+}
+
+static void sn_free(struct llama_sampler * smpl) {
+    delete (sn_sampler_ctx *) smpl->ctx;
+}
+
+static void sn_copy_state(const struct llama_sampler * src, struct llama_sampler * dst) {
+    *(sn_sampler_ctx *) dst->ctx = *(const sn_sampler_ctx *) src->ctx;
+}
+
+static struct llama_sampler_i sn_sampler_i = {
+    /* .name              = */ sn_name,
+    /* .accept            = */ sn_accept,
+    /* .apply             = */ sn_apply,
+    /* .reset             = */ sn_reset,
+    /* .clone             = */ sn_clone,
+    /* .free              = */ sn_free,
+    /* .backend_init      = */ nullptr,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ nullptr,
+    /* .backend_set_input = */ nullptr,
+    /* .backend_reset     = */ nullptr,
+    /* .copy_state        = */ sn_copy_state,
+};
+
+struct llama_sampler * common_sampler_init_shared_noise(uint32_t seed) {
+    return llama_sampler_init(&sn_sampler_i, new sn_sampler_ctx { seed, sn_resolve_seed(seed), 0 });
+}
+
+// the shared-noise stage of a chain (its last sampler), or nullptr
+static const sn_sampler_ctx * sn_of_chain(const struct llama_sampler * chain) {
+    if (chain == nullptr) {
+        return nullptr;
+    }
+    const int32_t n = llama_sampler_chain_n(chain);
+    if (n <= 0) {
+        return nullptr;
+    }
+    const llama_sampler * last = llama_sampler_chain_get(const_cast<llama_sampler *>(chain), n - 1);
+    return last != nullptr && last->iface == &sn_sampler_i ? (const sn_sampler_ctx *) last->ctx : nullptr;
+}
+
 struct common_sampler * common_sampler_init(
         const struct llama_model * model,
         struct common_params_sampling & params) {
@@ -524,7 +675,18 @@ struct common_sampler * common_sampler_init(
             const bool greedy = params.n_probs == 0 && !params.samplers.empty() &&
                 ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
                  (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
-            samplers.push_back(greedy ? llama_sampler_init_greedy() : llama_sampler_init_dist(params.seed));
+            // k19-sharednoise: LLAMA_SHARED_NOISE=1: the sampled draw is the counter-based Gumbel-max stage (the same distribution as
+            // dist). Not with backend sampling (the chain runs on the device there)
+            const bool shared_noise = !greedy && common_shared_noise_enabled() && !params.backend_sampling;
+            if (shared_noise) {
+                static bool logged = false;
+                if (!logged) {
+                    logged = true;
+                    LOG_INF("%s: shared noise: sampled draws are counter-based Gumbel-max (LLAMA_SHARED_NOISE=1)\n", __func__);
+                }
+            }
+            samplers.push_back(greedy ? llama_sampler_init_greedy() :
+                               shared_noise ? common_sampler_init_shared_noise(params.seed) : llama_sampler_init_dist(params.seed));
         }
     } else if (params.mirostat == 1) {
         samplers.push_back(llama_sampler_init_temp(params.temp));
@@ -561,7 +723,7 @@ struct common_sampler * common_sampler_init(
         /* .cur     = */ {},
         /* .cur_p   = */ {},
         // mix it, the chain and the draft are seeded from this one too
-        /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
+        /* .rng     = */ std::mt19937((sn_of_chain(chain) ? sn_of_chain(chain)->seed_cur : llama_sampler_get_seed(chain)) ^ 0x9e3779b9u),
         /* .greedy_fast = */ false,
         /* .bias_dense  = */ {},
         /* .bias_sparse = */ {},
@@ -1303,7 +1465,153 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
+    if (const auto * sn = sn_of_chain(gsmpl->chain)) {
+        return sn->seed_cur;
+    }
     return llama_sampler_get_seed(gsmpl->chain);
+}
+
+bool common_sampler_shared_noise_draft_init(const struct common_sampler * gsmpl, common_shared_noise_draft & sn) {
+    sn.on = false;
+    const sn_sampler_ctx * c = gsmpl != nullptr ? sn_of_chain(gsmpl->chain) : nullptr;
+    if (c == nullptr) {
+        return false;
+    }
+    const auto & p = gsmpl->params;
+    sn.on          = true;
+    sn.seed        = c->seed_cur;
+    sn.pos         = c->n_acc;
+    sn.samplers    = p.samplers;
+    sn.temp        = p.temp;
+    sn.top_k       = p.top_k;
+    sn.top_p       = p.top_p;
+    sn.min_p       = p.min_p;
+    sn.pen_last_n  = p.penalty_last_n;
+    sn.pen_repeat  = p.penalty_repeat;
+    sn.pen_freq    = p.penalty_freq;
+    sn.pen_present = p.penalty_present;
+    sn.window.clear();
+    const bool pen = p.penalty_last_n != 0 && (p.penalty_repeat != 1.0f || p.penalty_freq != 0.0f || p.penalty_present != 0.0f);
+    if (pen) {
+        // prev holds the most recent max(32, n_prev) accepted tokens; a longer window is cut there (an approximation: acceptance only)
+        const size_t n_win = p.penalty_last_n < 0 ? gsmpl->prev.size() : std::min<size_t>((size_t) p.penalty_last_n, gsmpl->prev.size());
+        for (size_t i = n_win; i-- > 0; ) {
+            sn.window.push_back(gsmpl->prev.rat(i));
+        }
+    }
+    return true;
+}
+
+llama_token common_shared_noise_draft_pick(common_shared_noise_draft & sn, int32_t i, const llama_token * drafted,
+        const llama_token_data * cand, size_t n, float * p_pick) {
+    GGML_ASSERT(sn.on && n > 0);
+    auto & c = sn.scratch; // (id, logit), kept sorted by logit, descending
+    c.clear();
+    for (size_t k = 0; k < n; ++k) {
+        c.emplace_back(cand[k].id, cand[k].logit);
+    }
+    auto sort_desc = [&]() {
+        std::sort(c.begin(), c.end(), [](const auto & a, const auto & b) { return a.second > b.second || (a.second == b.second && a.first < b.first); });
+    };
+    // softmax of c (sorted) at the logits as they are, written into probs
+    std::vector<float> probs;
+    auto softmax = [&]() {
+        probs.resize(c.size());
+        double s = 0.0;
+        for (size_t k = 0; k < c.size(); ++k) {
+            probs[k] = expf(c[k].second - c[0].second);
+            s += probs[k];
+        }
+        for (auto & q : probs) {
+            q = (float) (q / s);
+        }
+    };
+    sort_desc();
+    for (const auto t : sn.samplers) {
+        if (c.size() <= 1) {
+            break;
+        }
+        switch (t) {
+            case COMMON_SAMPLER_TYPE_PENALTIES: {
+                if (sn.pen_last_n == 0 || (sn.pen_repeat == 1.0f && sn.pen_freq == 0.0f && sn.pen_present == 0.0f)) {
+                    break;
+                }
+                for (auto & e : c) {
+                    int cnt = 0;
+                    for (const llama_token w : sn.window) {
+                        cnt += w == e.first;
+                    }
+                    for (int32_t j = 0; j < i; ++j) {
+                        cnt += drafted[j] == e.first;
+                    }
+                    if (cnt == 0) {
+                        continue;
+                    }
+                    e.second = e.second <= 0.0f ? e.second * sn.pen_repeat : e.second / sn.pen_repeat;
+                    e.second -= (float) cnt * sn.pen_freq + sn.pen_present;
+                }
+                sort_desc();
+                break;
+            }
+            case COMMON_SAMPLER_TYPE_TOP_K:
+                if (sn.top_k > 0 && (size_t) sn.top_k < c.size()) {
+                    c.resize(sn.top_k);
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_P:
+                if (sn.top_p < 1.0f) {
+                    softmax();
+                    double cum = 0.0;
+                    size_t keep = c.size();
+                    for (size_t k = 0; k < c.size(); ++k) {
+                        cum += probs[k];
+                        if (cum >= sn.top_p) {
+                            keep = k + 1;
+                            break;
+                        }
+                    }
+                    c.resize(keep);
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_MIN_P:
+                if (sn.min_p > 0.0f) {
+                    softmax();
+                    size_t keep = 1;
+                    while (keep < c.size() && probs[keep] >= sn.min_p * probs[0]) {
+                        keep++;
+                    }
+                    c.resize(keep);
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                if (sn.temp > 0.0f) {
+                    for (auto & e : c) {
+                        e.second /= sn.temp;
+                    }
+                }
+                break;
+            default: // dry, xtc, typical, top-n-sigma, ...: not mirrored
+                break;
+        }
+    }
+    const uint64_t pos = sn.pos + (uint64_t) i;
+    size_t best = 0;
+    float best_v = -INFINITY;
+    for (size_t k = 0; k < c.size(); ++k) {
+        if (!(c[k].second + SN_G_MAX >= best_v)) {
+            continue;
+        }
+        const float v = c[k].second + common_shared_noise_gumbel(sn.seed, pos, c[k].first);
+        if (v > best_v) {
+            best_v = v;
+            best   = k;
+        }
+    }
+    if (p_pick != nullptr) {
+        softmax();
+        *p_pick = probs[best];
+    }
+    return c[best].first;
 }
 
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {

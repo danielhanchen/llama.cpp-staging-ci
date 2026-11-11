@@ -91,6 +91,10 @@ struct common_speculative_draft_params {
     int32_t top_k = 40;
     float   top_p = 1.0f;
     float   min_p = 0.0f;
+
+    // k19-sharednoise: set (on) when the target draws with shared noise (LLAMA_SHARED_NOISE=1): the drafter proposes
+    // argmax(its logit / T + the target's noise) at each drafted position (common_shared_noise_draft_pick) and fills no result_q
+    struct common_shared_noise_draft * sn = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
