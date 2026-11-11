@@ -215,6 +215,7 @@ static void test_spec() {
     // room for a request: the full tier frees its last unused guess ((3,0)), nothing else
     CHECK(hc.n_free() == 0);
     CHECK(hc.drop_spec(5) == 1 && hc.n_free() == 1 && hc.n_spec_slots() == 0 && hc.st.spec_dropped == 1);
+    CHECK(hc.n_slots_of(2) == 6 && hc.n_free_of(2) == 1 && hc.n_slots_of(9) == 0);
     CHECK(hc.find(3, 0, false) < 0 && hc.find(0, 0, false) == s00 && hc.find(1, 1, false) == s11);
 }
 

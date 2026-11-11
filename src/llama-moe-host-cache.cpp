@@ -310,6 +310,18 @@ int32_t llama_moe_host_cache::n_free() const {
     return n;
 }
 
+int32_t llama_moe_host_cache::n_free_of(int32_t il) const {
+    if (!caches(il)) {
+        return 0;
+    }
+    const klass & c = classes[layer_class[il]];
+    return (int32_t) c.free_list.size() + (c.n - c.n_alloc);
+}
+
+int32_t llama_moe_host_cache::n_slots_of(int32_t il) const {
+    return caches(il) ? classes[layer_class[il]].n : 0;
+}
+
 size_t llama_moe_host_cache::drop_spec(size_t n) {
     size_t done = 0;
     bool any = true;

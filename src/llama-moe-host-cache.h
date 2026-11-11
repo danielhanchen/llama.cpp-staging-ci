@@ -150,6 +150,9 @@ public:
     size_t n_spec_slots() const { return n_spec; }
     // slots without an expert (free, or not allocated yet within the budget)
     int32_t n_free() const;
+    // ... of the layout of layer il, and its slots
+    int32_t n_free_of(int32_t il) const;
+    int32_t n_slots_of(int32_t il) const;
     // releases up to n unused guesses (the coldest of each layer first, the layers in turn; never one in use by this call / plan or read
     // by uncommitted copies): a prompt's plan leases every held slot of its layers, so only free slots take what it reads; returns the
     // number released

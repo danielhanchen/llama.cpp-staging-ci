@@ -1198,6 +1198,10 @@ struct llama_moe_cache::impl {
     bool   hprof_pinned    = false;        // the slots of the background reads were allocated (one pass)
     int    hprof_inflight_max = 1024;      // background reads in flight at most (experts), topped up at each small batch
     size_t hprof_load_read = (size_t) 6144 << 20; // LLAMA_MOE_HOST_PROFILE_LOAD_READ_MIB: background reads issued at the first batch (during the load)
+    // k19-ramprof2 (inclusive tier): the share of each layout's slots the profile fill leaves free (LLAMA_MOE_HOST_PROFILE_ROOM, default 0.15
+    // there, 0 on the exclusive tier, whose promotions free slots): the misses of the first requests are read into RAM by the CLOCK once no
+    // slot is free, and a slot read once is as likely a victim as a guess (12 GB: the repeated chat re-read the first chat's experts)
+    double hprof_room = 0.0;
     std::vector<uint64_t>   hprof_ticket;  // [slot] ticket of its background read, 0 = none
     std::deque<int32_t>     hprof_q;       // slots with a ticket (or collected since), issue order
     size_t hprof_read_cap  = SIZE_MAX;     // LLAMA_MOE_HOST_PROFILE_READ_MIB
@@ -3392,8 +3396,16 @@ struct llama_moe_cache::impl {
             hprof_read_cap = (size_t) std::max(0.0, atof(e))*1048576;
         }
         hprof_read_left = hprof_read_cap;
+        // inclusive tier: no reads during the load by default (L4 12 GB: 6 GiB of them made the load 10% longer, the copies capture more there)
+        hprof_room = host->exclusive() ? 0.0 : 0.15;
+        if (!host->exclusive()) {
+            hprof_load_read = 0;
+        }
         if (const char * e = getenv("LLAMA_MOE_HOST_PROFILE_LOAD_READ_MIB")) {
             hprof_load_read = (size_t) std::max(0.0, atof(e))*1048576;
+        }
+        if (const char * e = getenv("LLAMA_MOE_HOST_PROFILE_ROOM")) {
+            hprof_room = std::min(1.0, std::max(0.0, atof(e)));
         }
         if (const char * e = getenv("LLAMA_MOE_HOST_PROFILE_INFLIGHT")) {
             hprof_inflight_max = std::max(1, atoi(e));
@@ -3447,7 +3459,7 @@ struct llama_moe_cache::impl {
         };
         size_t b_pc = 0;
         auto want = [&](int32_t il, int32_t e) -> bool {
-            if (!host_layer(il) || (host->exclusive() && in_device(il, e))) {
+            if (!host_layer(il) || (host->exclusive() && in_device(il, e)) || !hprof_has_room(il)) {
                 return false;
             }
             if (resident(il, e)) {
@@ -3547,6 +3559,11 @@ struct llama_moe_cache::impl {
         hprof_prev_large = large;
     }
 
+    // the layout of layer il has more free slots than the room the profile fill leaves (hprof_room)
+    bool hprof_has_room(int32_t il) const {
+        return hprof_room <= 0.0 || host->n_free_of(il) > (int32_t) (hprof_room*host->n_slots_of(il));
+    }
+
     // k19-ramprof2: a background read of the profile is complete: the slot holds its expert (a guess, unless the device took the expert
     // meanwhile on an exclusive tier: then it is a duplicate, the first slot to go)
     void hprof_complete(int32_t s) {
@@ -3587,7 +3604,7 @@ struct llama_moe_cache::impl {
             return;
         }
         auto skip = [&](const prof_entry & p) {
-            return !host_layer(p.il) || (host->exclusive() && in_device(p.il, p.e)) || host->contains(p.il, p.e);
+            return !host_layer(p.il) || (host->exclusive() && in_device(p.il, p.e)) || host->contains(p.il, p.e) || !hprof_has_room(p.il);
         };
         if (pin_all && !hprof_pinned) {
             hprof_pinned = true;
