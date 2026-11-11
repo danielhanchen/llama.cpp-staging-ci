@@ -1194,7 +1194,9 @@ struct llama_moe_cache::impl {
     bool   hprof_prompted  = false;        // a large batch ran since the copy (the background reads may start)
     bool   hprof_prev_large = false;
     double hprof_prompt_free = 0.15;
-    std::vector<prof_entry> hprof_pending; // heat order
+    std::deque<prof_entry>  hprof_pending; // heat order
+    bool   hprof_pinned    = false;        // the slots of the background reads were allocated (one pass)
+    int    hprof_inflight_max = 1024;      // background reads in flight at most (experts), topped up at each small batch
     std::vector<uint64_t>   hprof_ticket;  // [slot] ticket of its background read, 0 = none
     std::deque<int32_t>     hprof_q;       // slots with a ticket (or collected since), issue order
     size_t hprof_read_cap  = SIZE_MAX;     // LLAMA_MOE_HOST_PROFILE_READ_MIB
@@ -3389,6 +3391,9 @@ struct llama_moe_cache::impl {
             hprof_read_cap = (size_t) std::max(0.0, atof(e))*1048576;
         }
         hprof_read_left = hprof_read_cap;
+        if (const char * e = getenv("LLAMA_MOE_HOST_PROFILE_INFLIGHT")) {
+            hprof_inflight_max = std::max(1, atoi(e));
+        }
         if (const char * e = getenv("LLAMA_MOE_HOST_PROFILE_PROMPT_FREE")) {
             hprof_prompt_free = std::min(1.0, std::max(0.0, atof(e)));
         }
@@ -3565,38 +3570,62 @@ struct llama_moe_cache::impl {
         }
     }
 
-    // the pending entries are read into free slots (never a guess, never evicting), in heat order; the entries without a slot, already
-    // held, or (exclusive) in the device slots now are dropped
+    // the pending entries are read into free slots (never a guess, never evicting), in heat order, at most hprof_inflight_max in flight
+    // (a cancel stays cheap); the entries without a slot, already held, or (exclusive) in the device slots now are dropped. The first
+    // call allocates (pins) the slot memory of every pending entry at once (then frees the slots): pinning costs ~0.7 s per GB, once,
+    // instead of a chunk at a time inside later decode steps
     void hprof_issue() {
         if (hprof_pending.empty() || wstore == nullptr || !host) {
             return;
         }
-        hps.rounds++;
-        std::vector<prof_entry> order;
-        order.swap(hprof_pending);
-        std::vector<llama_weight_store::host_read> rd;
-        auto want = [&](int32_t il, int32_t e) -> bool {
-            if (!host_layer(il) || (host->exclusive() && in_device(il, e)) || hprof_read_left == 0) {
-                return false;
-            }
-            return true;
+        auto skip = [&](const prof_entry & p) {
+            return !host_layer(p.il) || (host->exclusive() && in_device(p.il, p.e)) || host->contains(p.il, p.e);
         };
-        auto take = [&](size_t i, int32_t s) {
-            const int32_t il = order[i].il;
-            const int32_t e  = order[i].e;
-            const layer & l = layers[il];
+        if (!hprof_pinned) {
+            hprof_pinned = true;
+            const int64_t t0 = ggml_time_us();
+            std::vector<int32_t> tmp;
+            for (const prof_entry & p : hprof_pending) {
+                if (skip(p)) {
+                    continue;
+                }
+                const int32_t s = host->reserve(p.il, p.e, false, 0, false);
+                if (s >= 0) {
+                    tmp.push_back(s);
+                }
+            }
+            for (const int32_t s : tmp) {
+                host->abort(s);
+            }
+            LLAMA_LOG_INFO("%s: MoE host cache: profile: slot memory of %zu background reads allocated in %.1f ms\n", __func__, tmp.size(),
+                    (ggml_time_us() - t0)/1000.0);
+        }
+        hps.rounds++;
+        std::vector<llama_weight_store::host_read> rd;
+        while (!hprof_pending.empty() && (int) hprof_q.size() < hprof_inflight_max && hprof_read_left > 0) {
+            const prof_entry p = hprof_pending.front();
+            hprof_pending.pop_front();
+            if (skip(p)) {
+                continue;
+            }
+            const int32_t s = host->reserve(p.il, p.e, false, 0, false);
+            if (s < 0) {
+                hps.no_slot++;
+                continue;
+            }
+            const layer & l = layers[p.il];
             rd.clear();
             size_t nb = 0;
             for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                 const ggml_tensor * w = l.experts[ip];
-                rd.push_back({ w, (size_t) e*w->nb[2], w->nb[2], host->area(s, (int) ip), 0 });
+                rd.push_back({ w, (size_t) p.e*w->nb[2], w->nb[2], host->area(s, (int) ip), 0 });
                 nb += w->nb[2];
             }
             const uint64_t t = wstore->read_host_async(rd.data(), rd.size(), true);
             if (t == 0) {
                 host->abort(s);
                 hps.failed++;
-                return;
+                continue;
             }
             for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                 host->set_lead(s, (int) ip, rd[ip].lead);
@@ -3607,9 +3636,7 @@ struct llama_moe_cache::impl {
             hps.issued++;
             hps.issued_bytes += nb;
             hprof_read_left = nb >= hprof_read_left ? 0 : hprof_read_left - nb;
-        };
-        const size_t n = llama_moe_profile_reserve(*host, order, want, take);
-        hps.no_slot += order.size() - n;
+        }
     }
 
     // the background reads that did not start are cancelled (their slots are free again, their entries pending); the started ones (at
@@ -3617,6 +3644,7 @@ struct llama_moe_cache::impl {
     // promotions release RAM slots of experts they admit to the device)
     void hprof_cancel() {
         size_t n = 0;
+        std::vector<prof_entry> back;
         for (const int32_t s : hprof_q) {
             if (hprof_ticket[s] == 0) {
                 continue;
@@ -3629,7 +3657,7 @@ struct llama_moe_cache::impl {
             const int32_t key = host->key(s);
             hprof_ticket[s] = 0;
             host->abort(s);
-            hprof_pending.push_back({ key / host->n_expert_of(), key % host->n_expert_of(), 0.0f });
+            back.push_back({ key / host->n_expert_of(), key % host->n_expert_of(), 0.0f });
             if (hprof_read_left != SIZE_MAX) {
                 for (const ggml_tensor * w : layers[key / host->n_expert_of()].experts) {
                     hprof_read_left += w->nb[2];
@@ -3638,6 +3666,7 @@ struct llama_moe_cache::impl {
             n++;
         }
         hprof_q.clear();
+        hprof_pending.insert(hprof_pending.begin(), back.begin(), back.end());
         hps.cancelled += n;
     }
 
