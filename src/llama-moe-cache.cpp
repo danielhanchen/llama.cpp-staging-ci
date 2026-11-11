@@ -16,6 +16,7 @@
 
 // k19-q4xcache: see ggml.c (declared here so that ggml.h stays unchanged)
 extern "C" { GGML_API void ggml_moe_cache_assign_lookup_counts(struct ggml_tensor * op); }
+extern "C" { GGML_API void ggml_moe_cache_set_core(struct ggml_tensor * op, int32_t n_core); }
 
 #include <algorithm>
 #include <atomic>
@@ -52,6 +53,7 @@ extern "C" { GGML_API void ggml_moe_cache_assign_lookup_counts(struct ggml_tenso
 
 #if defined(__linux__)
 #include <sched.h>
+#include <fcntl.h>
 #endif
 
 // k19-l4b: the logical CPUs this process may run on (the affinity mask on Linux, else the hardware threads)
@@ -140,6 +142,9 @@ struct moe_cache_lru {
     uint64_t gen = 0; // incremented by each change of the slots, so the device copy of the state can be refreshed
 
     int32_t n_lent = 0; // the last n_lent slots are lent (see set_lent): they are not in the list and hold no expert
+    // k19-ptres: the first n_core slots are a core (see set_core): they hold their experts for good, are not in the list (never a
+    // victim) and keep their experts through clear and load
+    int32_t n_core = 0;
 
     // LLAMA_MOE_CACHE_POLICY=decay: decayed use counters of all experts [n_layer*n_expert], also kept for the experts that are not
     // cached, shared with the device lookup (ggml_moe_cache_set_scores): growing weights, each distinct expert of a plan adds w, the
@@ -179,16 +184,51 @@ struct moe_cache_lru {
     // every slot empty, in the order of init
     void clear() {
         GGML_ASSERT(n_lent == 0);
-        std::fill(key_of.begin(), key_of.end(), -1);
+        std::fill(key_of.begin() + n_core, key_of.end(), -1);
         std::fill(scores.begin(), scores.end(), 0);
         w = w_init;
-        for (int32_t s = 0; s < n_slots; ++s) {
-            prev[s] = s - 1;
+        for (int32_t s = n_core; s < n_slots; ++s) {
+            prev[s] = s > n_core ? s - 1 : -1;
             next[s] = s + 1 < n_slots ? s + 1 : -1;
         }
-        head = n_slots > 0 ? 0 : -1;
-        tail = n_slots - 1;
+        // the core keeps its experts (callers may have emptied the slot maps)
+        for (int32_t s = 0; s < n_core; ++s) {
+            slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = s;
+        }
+        head = n_slots > n_core ? n_core : -1;
+        tail = n_slots > n_core ? n_slots - 1 : -1;
         gen++;
+    }
+
+    // k19-ptres: slots [0, n) become the core: each must hold an expert; they leave the list for good (n = 0: the core slots come back
+    // to the list as the most recently used)
+    bool set_core(int32_t n) {
+        GGML_ASSERT(n >= 0 && n + n_lent < n_slots);
+        if (n > 0) {
+            GGML_ASSERT(n_core == 0);
+            for (int32_t s = 0; s < n; ++s) {
+                if (key_of[s] < 0) {
+                    return false;
+                }
+            }
+            for (int32_t s = 0; s < n; ++s) {
+                unlink(s);
+            }
+        } else {
+            for (int32_t s = 0; s < n_core; ++s) {
+                prev[s] = tail;
+                next[s] = -1;
+                if (tail >= 0) {
+                    next[tail] = s;
+                } else {
+                    head = s;
+                }
+                tail = s;
+            }
+        }
+        n_core = n;
+        gen++;
+        return true;
     }
 
     void unlink(int32_t s) {
@@ -206,8 +246,9 @@ struct moe_cache_lru {
         next[s] = -1;
     }
 
-    // empty slot s (it stays in the list, k13-small release)
+    // empty slot s (it stays in the list, k13-small release); never a core slot
     void evict(int32_t s) {
+        GGML_ASSERT(s >= n_core);
         if (key_of[s] >= 0) {
             slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
             key_of[s] = -1;
@@ -217,7 +258,7 @@ struct moe_cache_lru {
 
     // lend the last n slots (their experts are evicted), the slots no longer lent come back empty as the least recently used
     void set_lent(int32_t n) {
-        GGML_ASSERT(n >= 0 && n < n_slots);
+        GGML_ASSERT(n >= 0 && n < n_slots && n_slots - n >= n_core + (n_core > 0 ? 1 : 0));
         for (int32_t s = n_slots - n; s < n_slots - n_lent; ++s) {
             if (key_of[s] >= 0) {
                 slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
@@ -239,9 +280,9 @@ struct moe_cache_lru {
         gen++;
     }
 
-    // move slot s to the tail (most recently used)
+    // move slot s to the tail (most recently used); a core slot stays out of the list
     void touch(int32_t s) {
-        if (s == tail) {
+        if (s == tail || s < n_core) {
             return;
         }
         if (prev[s] >= 0) {
@@ -259,7 +300,7 @@ struct moe_cache_lru {
 
     // move slot s to the head (the next to be evicted), k15-pred
     void to_head(int32_t s) {
-        if (s == head) {
+        if (s == head || s < n_core) {
             return;
         }
         unlink(s);
@@ -303,6 +344,16 @@ struct moe_cache_lru {
         }
         if (uniq.size() > (size_t) (n_slots - n_lent)) {
             return false;
+        }
+        if (n_core > 0) {
+            // the misses and the hits outside the core take slots of the list
+            size_t n_in_core = 0;
+            for (int32_t e : uniq) {
+                n_in_core += slot_map[il][e] >= 0 && slot_map[il][e] < n_core;
+            }
+            if (uniq.size() - n_in_core > (size_t) (n_slots - n_lent - n_core)) {
+                return false;
+            }
         }
 
         gen++;
@@ -425,8 +476,15 @@ struct moe_cache_lru {
             prev[s]   = -1;
             next[s]   = -1;
         }
+        // the core (never evicted by the device) keeps its experts and stays out of the list
+        for (int32_t s = 0; s < n_core; ++s) {
+            GGML_ASSERT(dev_key_of[s] == key_of[s]);
+            slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = s;
+            prev[s] = -1;
+            next[s] = -1;
+        }
         for (int pass = 0; pass < 2; ++pass) {
-            for (int32_t s = 0; s < n_slots - n_lent; ++s) {
+            for (int32_t s = n_core; s < n_slots - n_lent; ++s) {
                 const bool used = dev_key_of[s] >= 0 && dev_ref[s] != 0;
                 if ((pass == 0) == used) {
                     continue;
@@ -1142,6 +1200,25 @@ struct llama_moe_cache::impl {
     double profile_seed   = 1.0;
     size_t profile_filled = 0;
 
+    // k19-ptres (LLAMA_MOE_CORE=1, opt-in): a never-evicted core of the device cache whose host copies are given back to the OS. With a
+    // routing profile (LLAMA_MOE_CACHE_PROFILE, or kept by the cache itself in the calibration directory), the hottest experts of each
+    // group are placed in its first slots at load and no lookup, assign, seed or lend ever evicts them (moe_cache_lru::set_core,
+    // ggml_moe_cache_set_core); their pages of the model file are left out of the device registration and dropped from the page cache,
+    // so the RAM they held goes to what the host needs (llama_context: the PLE table's part, see core_dropped_bytes). Every other expert
+    // keeps today's paths (CPU misses and device copies from the registered mapping). Size: LLAMA_MOE_CORE_MIB, else what the PLE table
+    // needs (table + other host weights + 6 GiB - MemAvailable); at most LLAMA_MOE_CORE_MAX_FRAC (0.4) of each group's slots, only
+    // where the cache holds at least 25% of the host experts (smaller caches release their banks for prompts), one device, no RAM tier
+    int    core_mode     = 0;
+    bool   core_on       = false;   // the core was placed (groups with n_core > 0)
+    size_t core_want     = 0;       // bytes asked for
+    size_t core_bytes    = 0;       // bytes of the experts placed in the core
+    size_t core_dropped  = 0;       // bytes of their pages not resident after the drop (mincore)
+    size_t core_holes_b  = 0;       // bytes of whole pages inside core experts (left out of the registration)
+    bool   core_profile_auto = false;
+    uint64_t core_refused = 0;      // bank releases refused (they would empty the core)
+    uint64_t core_saves   = 0;
+    std::vector<std::pair<uintptr_t, uintptr_t>> core_holes; // page ranges of the core experts' host copies, sorted
+
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
             layer_set set, llama_weight_store * ws, int64_t host_mib) :
             wstore(ws), n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
@@ -1158,6 +1235,27 @@ struct llama_moe_cache::impl {
             }
             if (const char * e = getenv("LLAMA_MOE_CACHE_PROFILE_SEED")) {
                 profile_seed = std::min(1.0, std::max(0.0, atof(e)));
+            }
+            // k19-ptres: the core needs a profile; without one given, the cache keeps its own (read at load, written at each new request)
+            if (const char * e = getenv("LLAMA_MOE_CORE"); e != nullptr && atoi(e) != 0 && set != layer_set::nextn && !model.hparams.no_alloc) {
+                core_mode = atoi(e);
+                if (profile_file.empty() && profile_save_file.empty()) {
+                    const std::string dir = cm_cal_dir();
+                    if (!dir.empty()) {
+                        std::error_code ec;
+                        std::filesystem::create_directories(dir, ec);
+                        uint64_t h = 1469598103934665603ull;
+                        for (unsigned char c : model.desc() + "|" + std::to_string(model.n_elements()) + "|" + std::to_string(model.size())) {
+                            h ^= c;
+                            h *= 1099511628211ull;
+                        }
+                        char name[64];
+                        snprintf(name, sizeof(name), "/moe_core_profile_%016llx", (unsigned long long) h);
+                        profile_file      = dir + name + sfx;
+                        profile_save_file = profile_file;
+                        core_profile_auto = true;
+                    }
+                }
             }
         }
         for (size_t i = 0; i < backends.size(); ++i) {
@@ -1789,7 +1887,8 @@ struct llama_moe_cache::impl {
         if (!model.hparams.no_alloc) {
             const char * env  = getenv("LLAMA_MOE_CACHE_PREFILL");
             const int    seed = seed_mode();
-            if (!profile_file.empty() && profile_read() && prefill_profile()) {
+            // k19-ptres: the core (LLAMA_MOE_CORE=1) takes the first slots before the rest of the profile fills the others
+            if (!profile_file.empty() && profile_read() && (core_place(model) || true) && prefill_profile()) {
                 profile_loaded = true;
             } else if (env != nullptr ? atoi(env) != 0 : seed == 1) {
                 prefill();
@@ -2036,6 +2135,267 @@ struct llama_moe_cache::impl {
         return true;
     }
 
+    // k19-ptres: the bytes the core should hold (0: no core), see core_mode
+    size_t core_target(const llama_model & model) const {
+        if (const char * e = getenv("LLAMA_MOE_CORE_MIB")) {
+            return (size_t) std::max<int64_t>(0, atoll(e)) << 20;
+        }
+        const ggml_tensor * t = model.per_layer_tok_embd;
+        if (t == nullptr || t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
+            return 0; // the freed RAM goes to a lazy PLE table: none here
+        }
+        uint64_t host = 0;
+        for (const auto & [name, w] : model.tensors_by_name) {
+            if (w != t && w->buffer != nullptr && ggml_backend_buffer_is_host(w->buffer)) {
+                host += ggml_nbytes(w);
+            }
+        }
+        const uint64_t avail = llama_sysmem::available();
+        // the PLE rule's reserve (4 GiB) plus 2 GiB for the other file pages the page cache keeps beside the table
+        const uint64_t need  = (uint64_t) ggml_nbytes(t) + host + (6ull << 30);
+        return avail > 0 && need > avail ? (size_t) (need - avail) : 0;
+    }
+
+    // k19-ptres: places the core of each group (the first profile entries of its layers) in its first slots; false if no core
+    bool core_place(const llama_model & model) {
+        if (core_mode == 0 || profile.empty()) {
+            return false;
+        }
+        size_t host_b = 0;
+        size_t cache_b = 0;
+        for (size_t il = 0; il < layers.size(); ++il) {
+            if (layers[il].ig >= 0) {
+                for (const ggml_tensor * w : layers[il].experts) {
+                    host_b += ggml_nbytes(w);
+                }
+            }
+        }
+        for (const group & g : groups) {
+            cache_b += (size_t) g.n_slots*g.expert_bytes;
+        }
+        const char * why = nullptr;
+        if (devices.size() != 1) {
+            why = "the cache spans several devices";
+        } else if (wstore != nullptr) {
+            why = "the experts are streamed (weight store)";
+        } else if (host_b == 0 || cache_b < host_b/4) {
+            why = "the cache holds less than 25% of the host experts";
+        }
+        core_want = why == nullptr ? core_target(model) : 0;
+        if (why == nullptr && core_want == 0) {
+            why = "nothing to make room for (no lazy PLE table short of RAM; LLAMA_MOE_CORE_MIB sets a size)";
+        }
+        if (why != nullptr) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-ptres core: off: %s\n", tag, why);
+            return false;
+        }
+        static const double max_frac = getenv("LLAMA_MOE_CORE_MAX_FRAC") ? std::min(0.9, std::max(0.0, atof(getenv("LLAMA_MOE_CORE_MAX_FRAC")))) : 0.4;
+        const double share = std::min(max_frac, (double) core_want/(double) cache_b);
+        size_t n_core_all = 0;
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            group & g = groups[ig];
+            if (g.n_slots == 0 || g.lru.n_lent > 0) {
+                continue;
+            }
+            const int32_t n_want = (int32_t) std::floor(share*g.n_slots);
+            std::vector<std::vector<int32_t>> core_ids(layers.size());
+            int32_t n_take = 0;
+            for (const prof_entry & p : profile) {
+                if (layers[p.il].ig == (int32_t) ig && n_take < n_want) {
+                    core_ids[p.il].push_back(p.e);
+                    n_take++;
+                }
+            }
+            if (n_take == 0) {
+                continue;
+            }
+            // the list is in slot order (init): the misses of each plan take the next slots from 0 up
+            bool ok = true;
+            for (int32_t il : g.layers) {
+                std::vector<int32_t> & ids = core_ids[il];
+                if (ids.empty()) {
+                    continue;
+                }
+                std::sort(ids.begin(), ids.end());
+                size_t n_hit = 0;
+                if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit) || n_hit != 0) {
+                    ok = false;
+                    break;
+                }
+                const layer & l = layers[il];
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    const size_t expert_size = w->nb[2];
+                    for (const auto & f : fills) {
+                        ok = ok && f.slot < n_take;
+                        ggml_backend_tensor_set(g.banks[ip], (const uint8_t *) w->data + f.expert*expert_size, f.slot*expert_size, expert_size);
+                    }
+                }
+            }
+            if (!ok || !g.lru.set_core(n_take)) {
+                LLAMA_LOG_WARN("llama_moe_cache%s: k19-ptres core: group %zu could not be placed in its first %d slots: no core there\n", tag, ig, n_take);
+                continue;
+            }
+            core_bytes += (size_t) n_take*g.expert_bytes;
+            n_core_all += n_take;
+            // the page ranges inside the core experts' host copies (memory-mapped model files only)
+            for (int32_t s = 0; s < n_take; ++s) {
+                const int32_t il = g.lru.key_of[s] / g.lru.n_expert;
+                const int32_t e  = g.lru.key_of[s] % g.lru.n_expert;
+                for (const ggml_tensor * w : layers[il].experts) {
+                    if (strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(w->buffer)), "CPU_Mapped") != 0) {
+                        continue;
+                    }
+                    const uintptr_t page = 4096;
+                    const uintptr_t a = ((uintptr_t) w->data + (uintptr_t) e*w->nb[2] + page - 1) & ~(page - 1);
+                    const uintptr_t b = ((uintptr_t) w->data + (uintptr_t) (e + 1)*w->nb[2]) & ~(page - 1);
+                    if (b > a) {
+                        core_holes.emplace_back(a, b);
+                    }
+                }
+            }
+        }
+        std::sort(core_holes.begin(), core_holes.end());
+        std::vector<std::pair<uintptr_t, uintptr_t>> merged;
+        for (const auto & h : core_holes) {
+            if (!merged.empty() && h.first <= merged.back().second) {
+                merged.back().second = std::max(merged.back().second, h.second);
+            } else {
+                merged.push_back(h);
+            }
+        }
+        core_holes = std::move(merged);
+        for (const auto & h : core_holes) {
+            core_holes_b += h.second - h.first;
+        }
+        core_on = n_core_all > 0;
+        LLAMA_LOG_INFO("llama_moe_cache%s: k19-ptres core: %zu experts (%.1f MiB of %.1f MiB asked, at most %.0f%% of each group's slots) placed for good from %s, "
+            "%.1f MiB of their host pages to leave out of the registration (LLAMA_MOE_CORE=0 off)\n", tag, n_core_all, core_bytes/1048576.0,
+            core_want/1048576.0, 100.0*max_frac, profile_file.c_str(), core_holes_b/1048576.0);
+        return core_on;
+    }
+
+    // k19-ptres: the core holes inside [base, base + size)
+    bool core_holes_in(uintptr_t base, size_t size) const {
+        auto it = std::lower_bound(core_holes.begin(), core_holes.end(), std::make_pair(base, (uintptr_t) 0));
+        if (it != core_holes.begin() && std::prev(it)->second > base) {
+            return true;
+        }
+        return it != core_holes.end() && it->first < base + size;
+    }
+
+    // k19-ptres: registers [base, base + size) except the core holes, one mapping per run between them; the device reads registered
+    // memory at its host address, so the runs together stand for the buffer (nullptr if a run fails or the device maps it elsewhere)
+    void * core_map_buffer(ggml_backend_dev_t dev, void * (*host_map)(ggml_backend_dev_t, void *, size_t, bool *), void (*host_unmap)(void *),
+            void * base, size_t size) {
+        const size_t n_mapped = mapped.size();
+        size_t bytes = 0;
+        uintptr_t b = (uintptr_t) base;
+        const uintptr_t end = (uintptr_t) base + size;
+        auto it = std::lower_bound(core_holes.begin(), core_holes.end(), std::make_pair(b, (uintptr_t) 0));
+        if (it != core_holes.begin() && std::prev(it)->second > b) {
+            --it;
+        }
+        bool ok = true;
+        while (b < end && ok) {
+            uintptr_t e = end;
+            uintptr_t next = end;
+            if (it != core_holes.end() && it->first < end) {
+                e    = std::max(b, it->first);
+                next = std::min(end, it->second);
+                ++it;
+            }
+            if (e > b) {
+                bool registered = false;
+                void * dp = host_map(dev, (void *) b, e - b, &registered);
+                ok = dp == (void *) b;
+                if (registered) {
+                    mapped.emplace_back(host_unmap, (void *) b);
+                    bytes += e - b;
+                }
+            }
+            b = std::max(b, next);
+        }
+        if (!ok) {
+            for (size_t i = n_mapped; i < mapped.size(); ++i) {
+                mapped[i].first(mapped[i].second);
+            }
+            mapped.resize(n_mapped);
+            return nullptr;
+        }
+        hst.registered += bytes;
+        return base;
+    }
+
+    // k19-ptres: drops the pages of the core holes from this process and the page cache (they are only read again if something reads
+    // the core experts on the host); core_dropped = the bytes found not resident afterwards
+    void core_drop() {
+#if defined(__linux__)
+        struct map_ent { uintptr_t lo, hi; uint64_t off; std::string path; };
+        std::vector<map_ent> maps;
+        if (FILE * f = fopen("/proc/self/maps", "r")) {
+            char line[4096];
+            while (fgets(line, sizeof(line), f) != nullptr) {
+                unsigned long lo = 0, hi = 0, off = 0;
+                char perms[8] = {}, devs[32] = {};
+                unsigned long inode = 0;
+                int n_used = 0;
+                if (sscanf(line, "%lx-%lx %7s %lx %31s %lu %n", &lo, &hi, perms, &off, devs, &inode, &n_used) >= 6 && inode != 0 && n_used > 0) {
+                    std::string path = line + n_used;
+                    while (!path.empty() && (path.back() == '\n' || path.back() == ' ')) {
+                        path.pop_back();
+                    }
+                    if (!path.empty() && path[0] == '/') {
+                        maps.push_back({ lo, hi, off, path });
+                    }
+                }
+            }
+            fclose(f);
+        }
+        std::map<std::string, int> fds;
+        const int64_t t0 = ggml_time_us();
+        size_t n_fadv = 0;
+        for (const auto & h : core_holes) {
+            madvise((void *) h.first, h.second - h.first, MADV_DONTNEED);
+            for (const map_ent & m : maps) {
+                const uintptr_t a = std::max<uintptr_t>(h.first, m.lo);
+                const uintptr_t b = std::min<uintptr_t>(h.second, m.hi);
+                if (a >= b) {
+                    continue;
+                }
+                auto it = fds.find(m.path);
+                if (it == fds.end()) {
+                    it = fds.emplace(m.path, open(m.path.c_str(), O_RDONLY)).first;
+                }
+                if (it->second >= 0 && posix_fadvise(it->second, (off_t) (m.off + (a - m.lo)), (off_t) (b - a), POSIX_FADV_DONTNEED) == 0) {
+                    n_fadv++;
+                }
+            }
+        }
+        for (auto & [path, fd] : fds) {
+            if (fd >= 0) {
+                close(fd);
+            }
+        }
+        size_t resident = 0;
+        std::vector<unsigned char> vec;
+        for (const auto & h : core_holes) {
+            const size_t n_pages = (h.second - h.first)/4096;
+            vec.assign(n_pages, 0);
+            if (mincore((void *) h.first, h.second - h.first, vec.data()) == 0) {
+                for (unsigned char c : vec) {
+                    resident += (c & 1) ? 4096 : 0;
+                }
+            } else {
+                resident += h.second - h.first;
+            }
+        }
+        core_dropped = core_holes_b - std::min(core_holes_b, resident);
+        LLAMA_LOG_INFO("llama_moe_cache%s: k19-ptres core: host copies of the core dropped: %.1f of %.1f MiB no longer resident (%zu ranges, %zu fadvise calls "
+            "over %zu files, %.1f ms)\n", tag, core_dropped/1048576.0, core_holes_b/1048576.0, core_holes.size(), n_fadv, fds.size(), (ggml_time_us() - t0)/1000.0);
+#endif
+    }
+
     // fill the device slots of each group at load with the first profile entries of its layers (as many as it has slots)
     bool prefill_profile() {
         size_t n_fill  = 0;
@@ -2103,7 +2463,7 @@ struct llama_moe_cache::impl {
     // at exit (LLAMA_MOE_CACHE_PROFILE_SAVE): the resident experts of every group by decayed use (the device state when the device
     // lookup planned last), then the used experts that are not resident; heat = counter / weight of one use (resident without the
     // decay policy: 1)
-    void profile_save() {
+    void profile_save(bool quiet = false) {
         if (profile_save_file.empty()) {
             return;
         }
@@ -2125,6 +2485,21 @@ struct llama_moe_cache::impl {
                 }
             }
             const bool decay = !sc.empty() && w > 0;
+            // k19-ptres (LLAMA_MOE_CORE): without decayed counts the use counters of the assign rank the experts (resident or not, one list):
+            // the core takes the first entries of each group
+            if (core_mode != 0 && !decay && g.counts != nullptr && g.counts->data != nullptr) {
+                std::vector<int32_t> cnt((size_t) g.counts->ne[0]*g.counts->ne[1]);
+                ggml_backend_tensor_get(g.counts, cnt.data(), 0, cnt.size()*sizeof(int32_t));
+                for (int32_t il : g.layers) {
+                    for (int32_t e = 0; e < n_expert; ++e) {
+                        const int32_t c = cnt[(size_t) il*g.counts->ne[0] + e];
+                        if (c > 0) {
+                            out_res.push_back({ il, e, (float) c });
+                        }
+                    }
+                }
+                continue;
+            }
             std::vector<bool> res((size_t) layers.size()*n_expert, false);
             for (int32_t k : key_of) {
                 if (k >= 0 && k < (int32_t) res.size()) {
@@ -2161,8 +2536,44 @@ struct llama_moe_cache::impl {
             }
         }
         const bool ok = fclose(f) == 0 && rename(tmp.c_str(), profile_save_file.c_str()) == 0;
-        LLAMA_LOG_INFO("llama_moe_cache%s: MoE cache profile %s %s: %zu resident + %zu other used experts\n", tag, ok ? "saved to" : "NOT saved to",
-                profile_save_file.c_str(), out_res.size(), out_rest.size());
+        if (core_saves++ < 2 || !quiet) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: MoE cache profile %s %s: %zu resident + %zu other used experts\n", tag, ok ? "saved to" : "NOT saved to",
+                    profile_save_file.c_str(), out_res.size(), out_rest.size());
+        }
+    }
+
+    // k19-ptres: at each new request (llama_context, before its first batch): the core still in its slots on the device (a slot that lost
+    // its expert would make the device read a host copy that is no longer registered), and the profile written for the next load
+    uint64_t core_checks = 0;
+    uint64_t core_bad    = 0;
+    void core_request() {
+        if (core_mode == 0) {
+            return;
+        }
+        if (core_on) {
+            for (group & g : groups) {
+                if (g.lru.n_core == 0) {
+                    continue;
+                }
+                std::vector<int32_t> key(g.lru.n_core);
+                if (g.dev_lookup && g.state != nullptr && g.state->data != nullptr && !devices[g.id].released) {
+                    ggml_backend_synchronize(devices[g.id].backend);
+                    ggml_backend_tensor_get(g.state, key.data(), n_hdr*sizeof(int32_t), key.size()*sizeof(int32_t));
+                } else {
+                    std::copy(g.lru.key_of.begin(), g.lru.key_of.begin() + g.lru.n_core, key.begin());
+                }
+                for (int32_t s = 0; s < g.lru.n_core; ++s) {
+                    const int32_t k = g.lru.key_of[s];
+                    const bool ok = key[s] == k && k >= 0 && g.lru.slot_map[k / g.lru.n_expert][k % g.lru.n_expert] == s;
+                    core_bad += ok ? 0 : 1;
+                }
+                core_checks += g.lru.n_core;
+            }
+            if (core_bad > 0) {
+                GGML_ABORT("k19-ptres core: %llu core slots lost their expert (a host copy the device may read is no longer registered)", (unsigned long long) core_bad);
+            }
+        }
+        profile_save(true);
     }
 
     // single-graph host misses (k11, LLAMA_MOE_SINGLE=1, opt-in): batches of up to GGML_MOE_MAILBOX_MAX_TOKENS tokens publish the host ids
@@ -2928,6 +3339,11 @@ struct llama_moe_cache::impl {
         profile_save();
         ua_shutdown();
         log_stats();
+        if (core_mode != 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-ptres core: %s, %.1f MiB of experts, %.1f MiB of host pages dropped, %llu core slot checks, %llu lost, "
+                "%llu bank releases refused\n", tag, core_on ? "on" : "off", core_bytes/1048576.0, core_dropped/1048576.0,
+                (unsigned long long) core_checks, (unsigned long long) core_bad, (unsigned long long) core_refused);
+        }
         ua_free();
         for (const auto & [unmap, buf] : mapped) {
             unmap(buf);
@@ -5144,6 +5560,15 @@ struct llama_moe_cache::impl {
             for (size_t i = 0; i < g.layers.size() && ok; ++i) {
                 for (const ggml_tensor * t : layers[g.layers[i]].experts) {
                     auto it = dev_base.find({ dev, t->buffer });
+                    if (it == dev_base.end() && core_on && core_holes_in((uintptr_t) ggml_backend_buffer_get_base(t->buffer), ggml_backend_buffer_get_size(t->buffer))) {
+                        // k19-ptres: the pages of the core experts stay out of the registration (the device never reads them: they never leave the slots)
+                        void * base = ggml_backend_buffer_get_base(t->buffer);
+                        void * dev_ptr = core_map_buffer(dev, host_map, host_unmap, base, ggml_backend_buffer_get_size(t->buffer));
+                        if (dev_ptr != nullptr) {
+                            added.emplace_back(dev, t->buffer);
+                        }
+                        it = dev_base.emplace(std::make_pair(dev, t->buffer), (uint8_t *) dev_ptr).first;
+                    }
                     if (it == dev_base.end()) {
                         void * base = ggml_backend_buffer_get_base(t->buffer);
                         bool registered = false;
@@ -5186,11 +5611,14 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("%s: %s: MoE cache lookups of small batches run on the device for %zu layers (LLAMA_MOE_CACHE_DEVICE=0 to disable)\n",
                 __func__, ggml_backend_name(backend), g.layers.size());
         }
+        if (core_on) {
+            core_drop();
+        }
     }
 
     // every routed expert of a ubatch of n_tokens fits the slots of the group (the plain lookup's condition)
     bool slots_fit(const group & g, int64_t n_tokens) const {
-        return std::min<int64_t>(n_tokens*n_expert_used, g.ref[0]->ne[2]) <= g.n_slots;
+        return std::min<int64_t>(n_tokens*n_expert_used, g.ref[0]->ne[2]) <= g.n_slots - g.lru.n_core;
     }
 
     // k19-hostrow (LLAMA_MOE_HYBRID_WIDE=1, default off): a hybrid group's small batch of at most wide_max tokens whose experts do not
@@ -5604,6 +6032,9 @@ struct llama_moe_cache::impl {
         if (g.scores != nullptr) {
             ggml_moe_cache_set_scores(op, g.scores, g.lru.grow_q16, il == g.layers[0]);
         }
+        if (g.lru.n_core > 0) {
+            ggml_moe_cache_set_core(op, g.lru.n_core);
+        }
         return op;
     }
 
@@ -5687,6 +6118,9 @@ struct llama_moe_cache::impl {
             }
         }
         ggml_tensor * op = ggml_moe_cache_assign(ctx, ids, g.map, g.state, g.counts, share, il);
+        if (g.lru.n_core > 0) {
+            ggml_moe_cache_set_core(op, g.lru.n_core);
+        }
         if (plain) {
             ggml_moe_cache_assign_lookup_counts(op);
             if (n_ov_plain++ == 0) {
@@ -6021,7 +6455,8 @@ struct llama_moe_cache::impl {
             g.lru.clear();
             // the banks as allocated (cleared), kernels may read a little past the end of an expert
             for (ggml_tensor * bank : g.banks) {
-                ggml_backend_tensor_memset(bank, 0, 0, ggml_nbytes(bank));
+                // (k19-ptres: the core keeps its experts)
+                ggml_backend_tensor_memset(bank, 0, (size_t) g.lru.n_core*bank->nb[2], ggml_nbytes(bank) - (size_t) g.lru.n_core*bank->nb[2]);
             }
             // the use counters and the residual; the count of experts computed on the host (statistics, stat[0..1]) is kept
             const size_t n_cnt = (size_t) g.counts->ne[0]*(g.counts->ne[1] - 1);
@@ -8038,9 +8473,11 @@ struct llama_moe_cache::impl {
         // front of the copies; with the graph allocation (never with host lookups, see above) every slot but those of one layer (a batch
         // that looks up its experts in the cache needs up to all experts of a layer resident at once)
         const int32_t n_keep = std::min<int32_t>(g.n_slots / 2, g.lru.n_expert + 1);
-        const int32_t n_max  = guard       ? (int32_t) std::min<int64_t>(g.n_slots / 2, g.n_slots - g.host_need - 1)
+        const int32_t n_max0 = guard       ? (int32_t) std::min<int64_t>(g.n_slots / 2, g.n_slots - g.host_need - 1)
                              : n_graph > 0 ? std::max<int32_t>(g.n_slots / 2, g.n_slots - n_keep)
                              :               g.n_slots / 2;
+        // k19-ptres: never into the core
+        const int32_t n_max  = g.lru.n_core > 0 ? std::min<int32_t>(n_max0, g.n_slots - g.lru.n_core - 2) : n_max0;
         int32_t n = (int32_t) std::min<size_t>((need + g.expert_bytes - 1) / g.expert_bytes, (size_t) n_max + 1);
         const int32_t step = std::max<int32_t>(1, n / 16);
         std::vector<size_t> offsets(n_copies);
@@ -8313,6 +8750,13 @@ struct llama_moe_cache::impl {
     bool release(int32_t id) {
         device & d = devices[id];
         if (d.released || !d.buf_bank || !d.ctx_bank || single_no_alloc) {
+            return false;
+        }
+        // k19-ptres: released banks would empty the core, whose host copies are gone: the banks stay
+        if (core_on) {
+            if (core_refused++ == 0) {
+                LLAMA_LOG_WARN("%s: MoE cache: k19-ptres core: the banks are not released (the core has no host copies to refill from)\n", __func__);
+            }
             return false;
         }
         ggml_backend_t backend = d.backend;
@@ -8876,7 +9320,7 @@ struct llama_moe_cache::impl {
             // lending evicts experts, which a layer then misses: grow until the rings hold the most misses of a layer
             int32_t m = prompt_misses_max(g);
             for (int it = 0; it < 4 && prompt_rings*m > g.lru.n_lent; ++it) {
-                const int32_t n = std::min<int32_t>(g.n_slots/2, prompt_rings*m);
+                const int32_t n = std::min<int32_t>(g.lru.n_core > 0 ? std::min<int32_t>(g.n_slots/2, g.n_slots - g.lru.n_core - 2) : g.n_slots/2, prompt_rings*m);
                 if (n <= g.lru.n_lent) {
                     break;
                 }
@@ -8899,7 +9343,7 @@ struct llama_moe_cache::impl {
             }
             int32_t m = prompt_misses_max(g);
             for (int it = 0; it < 4 && prompt_rings*m > g.lru.n_lent; ++it) {
-                const int32_t n = std::min<int32_t>(g.n_slots/2, prompt_rings*m);
+                const int32_t n = std::min<int32_t>(g.lru.n_core > 0 ? std::min<int32_t>(g.n_slots/2, g.n_slots - g.lru.n_core - 2) : g.n_slots/2, prompt_rings*m);
                 if (n <= g.lru.n_lent) {
                     break;
                 }
@@ -9411,7 +9855,8 @@ struct llama_moe_cache::impl {
         }
         g.lru.clear();
         for (ggml_tensor * bank : g.banks) {
-            ggml_backend_tensor_memset(bank, 0, 0, ggml_nbytes(bank));
+            // (k19-ptres: the core keeps its experts)
+            ggml_backend_tensor_memset(bank, 0, (size_t) g.lru.n_core*bank->nb[2], ggml_nbytes(bank) - (size_t) g.lru.n_core*bank->nb[2]);
         }
         g.dev_newer = false;
         g.dev_gen   = UINT64_MAX;
@@ -9457,7 +9902,11 @@ struct llama_moe_cache::impl {
             return nullptr;
         }
         const int32_t pos = (int32_t) (std::find(g.layers.begin(), g.layers.end(), il) - g.layers.begin());
-        return ggml_moe_cache_seed_plan(ctx, ids, g.map, g.state, g.scores, devseed_max(g), il, pos);
+        ggml_tensor * plan = ggml_moe_cache_seed_plan(ctx, ids, g.map, g.state, g.scores, devseed_max(g), il, pos);
+        if (g.lru.n_core > 0) {
+            ggml_moe_cache_set_core(plan, g.lru.n_core);
+        }
+        return plan;
     }
 
     // the bank of the cached expert tensor w, and its layer
@@ -10510,7 +10959,12 @@ double llama_moe_cache::cache_frac() const {
 }
 
 void llama_moe_cache::hybrid_reset() {
+    pimpl->core_request();
     pimpl->hybrid_reset();
+}
+
+size_t llama_moe_cache::core_dropped_bytes() const {
+    return pimpl->core_dropped;
 }
 
 bool llama_moe_cache::overlap_trial_pending() const {

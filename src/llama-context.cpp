@@ -1294,6 +1294,13 @@ llama_context::llama_context(
                         host += ggml_nbytes(w);
                     }
                 }
+                // k19-ptres (LLAMA_MOE_CORE=1): the host copies of the MoE cache's core are not in RAM (see llama_moe_cache::core_dropped_bytes)
+                if (moe_cache && moe_cache->core_dropped_bytes() > 0) {
+                    const size_t dropped = std::min(host, moe_cache->core_dropped_bytes());
+                    LLAMA_LOG_INFO("%s: PLE table: %.1f GiB of host weights are a MoE cache core without host copies (k19-ptres)\n", __func__,
+                        dropped/1073741824.0);
+                    host -= dropped;
+                }
                 const uint64_t avail = llama_sysmem::available();
                 const uint64_t need  = (uint64_t) table + host + (8ull << 30);
 #if defined(__linux__)

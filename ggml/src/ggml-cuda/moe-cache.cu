@@ -94,7 +94,7 @@ static __global__ void moe_cache_assign(
         int32_t * __restrict__ counts, const int n_layer, const int fetch_q,
         int32_t * __restrict__ scores, const int grow, const int advance, const int n_scores, const int frozen = 0,
         const int tail_rank = 0, int32_t * __restrict__ skip_stat = nullptr, int ids_s1 = 0, const int defer = 0,
-        const int margin_q = 0, const int margin_add_q = 0, const int lookup_counts = 0) {
+        const int margin_q = 0, const int margin_add_q = 0, const int lookup_counts = 0, const int lo = 0) {
     if (ids_s1 <= 0) {
         ids_s1 = ne0;
     }
@@ -259,7 +259,7 @@ static __global__ void moe_cache_assign(
         for (int off = MOE_CACHE_LANES/2; off > 0; off >>= 1) {
             n_pin += __shfl_xor_sync(full, n_pin, off, MOE_CACHE_LANES);
         }
-        n_take = min(n_take, n_slots - n_pin);
+        n_take = lo > 0 ? max(0, min(n_take, n_slots - lo - n_pin)) : min(n_take, n_slots - n_pin);
         int n_sel = 0;
         for (int j0 = 0; j0 < n_miss; j0 += MOE_CACHE_LANES) {
             const int j = j0 + lane;
@@ -296,8 +296,13 @@ static __global__ void moe_cache_assign(
 
     // victims: CLOCK sweep, 32 slots at a time, the slots used by this lookup are skipped
     // there are enough unpinned slots because the number of distinct ids is at most the number of slots
+    // k19-ptres core (ggml_moe_cache_set_core, lo > 0): the victims come from slots [lo, n_slots) only, ns of them; lo = 0: as before
+    const int ns = n_slots - lo;
     int h = state[0];
-    const int width = min(MOE_CACHE_LANES, n_slots);
+    if (lo > 0 && (h < lo || h >= n_slots)) {
+        h = lo;
+    }
+    const int width = min(MOE_CACHE_LANES, ns);
     int found = 0;
     if (scores != nullptr && n_take > 0 && n_take <= MOE_CACHE_LANES) {
         // decayed counts, one window for all the missing experts: the scores and hand offsets of the first MOE_CACHE_WINDOW unpinned
@@ -305,10 +310,10 @@ static __global__ void moe_cache_assign(
         int32_t * cv = smem + (counts != nullptr ? 3 : 2)*n_ids; // [MOE_CACHE_WINDOW] scores
         int32_t * co = cv + MOE_CACHE_WINDOW;                    // [MOE_CACHE_WINDOW] offsets from the hand
         int seen = 0;
-        for (int off0 = 0; off0 < n_slots && seen < MOE_CACHE_WINDOW; off0 += MOE_CACHE_LANES) {
+        for (int off0 = 0; off0 < ns && seen < MOE_CACHE_WINDOW; off0 += MOE_CACHE_LANES) {
             const int  off    = off0 + lane;
-            const bool active = off < n_slots;
-            const int  s      = active ? (h + off < n_slots ? h + off : h + off - n_slots) : 0;
+            const bool active = off < ns;
+            const int  s      = active ? (h + off < n_slots ? h + off : h + off - ns) : 0;
             const bool free_s = active && (uint32_t) pin[s] != epoch;
             const unsigned m  = moe_cache_ballot(free_s);
             const int rank    = seen + __popc(m & ((1u << lane) - 1));
@@ -342,7 +347,7 @@ static __global__ void moe_cache_assign(
                     best_i = i2;
                 }
             }
-            const int s = h + best_o < n_slots ? h + best_o : h + best_o - n_slots;
+            const int s = h + best_o < n_slots ? h + best_o : h + best_o - ns;
             far = max(far, best_o);
             __syncthreads();
             if (lane == 0) {
@@ -353,7 +358,7 @@ static __global__ void moe_cache_assign(
             }
             __syncthreads();
         }
-        h = h + far + 1 < n_slots ? h + far + 1 : h + far + 1 - n_slots;
+        h = h + far + 1 < n_slots ? h + far + 1 : h + far + 1 - ns;
 
         // k19-ramevict admission margin (hybrid, LLAMA_MOE_CACHE_ADMIT_MARGIN): a missing expert replaces a resident only if its decayed
         // count beats the victim's by the margin (score > victim*margin_q/65536 + w*margin_add_q/65536); empty slots always admit. The
@@ -403,10 +408,10 @@ static __global__ void moe_cache_assign(
             int best_sc  = INT_MAX;
             int best_off = INT_MAX;
             int seen     = 0;
-            for (int off0 = 0; off0 < n_slots && seen < MOE_CACHE_WINDOW; off0 += MOE_CACHE_LANES) {
+            for (int off0 = 0; off0 < ns && seen < MOE_CACHE_WINDOW; off0 += MOE_CACHE_LANES) {
                 const int  off    = off0 + lane;
-                const bool active = off < n_slots;
-                const int  s      = active ? (h + off < n_slots ? h + off : h + off - n_slots) : 0;
+                const bool active = off < ns;
+                const int  s      = active ? (h + off < n_slots ? h + off : h + off - ns) : 0;
                 const bool free_s = active && (uint32_t) pin[s] != epoch;
                 const unsigned m  = moe_cache_ballot(free_s);
                 const int rank    = __popc(m & ((1u << lane) - 1));
@@ -428,19 +433,19 @@ static __global__ void moe_cache_assign(
                     best_off = o2;
                 }
             }
-            const int s = h + best_off < n_slots ? h + best_off : h + best_off - n_slots;
+            const int s = h + best_off < n_slots ? h + best_off : h + best_off - ns;
             __syncthreads();
             if (lane == 0) {
                 victim[found] = s;
                 pin[s]        = (int32_t) epoch;
             }
-            h = s + 1 < n_slots ? s + 1 : 0;
+            h = s + 1 < n_slots ? s + 1 : lo;
             __syncthreads();
         }
     }
     while (found < n_take) {
         const bool active = lane < width;
-        const int  s      = active ? (h + lane < n_slots ? h + lane : h + lane - n_slots) : 0;
+        const int  s      = active ? (h + lane < n_slots ? h + lane : h + lane - ns) : 0;
         const bool pinned = active && (uint32_t) pin[s] == epoch;
         const bool r      = active && ref[s] != 0;
         const bool elig   = active && !pinned && !r;
@@ -468,7 +473,7 @@ static __global__ void moe_cache_assign(
         found += __popc(take);
         h += adv;
         if (h >= n_slots) {
-            h -= n_slots;
+            h -= ns;
         }
         __syncthreads();
     }
@@ -615,7 +620,7 @@ static __device__ int moe_seed_scan(int * buf, const int v) {
 static __global__ void moe_cache_seed_plan(
         const int32_t * __restrict__ ids, const int n_ids, int32_t * __restrict__ map, int32_t * __restrict__ state,
         int32_t * __restrict__ scores, int32_t * __restrict__ out, const int n_expert, const int il, const int n_slots,
-        const int n_victim, const int n_seed, const int n_seed_max, const int pos) {
+        const int n_victim, const int n_seed, const int n_seed_max, const int pos, const int lo = 0) {
     extern __shared__ int32_t smem[];
     int32_t * cnt  = smem;                    // [n_expert] uses of each expert
     int32_t * sel  = cnt + n_expert;          // [n_seed] the selected experts by rank, -1 none
@@ -649,7 +654,8 @@ static __global__ void moe_cache_seed_plan(
         s_new   = 0;
     }
     __syncthreads();
-    if (n_seed == 0 || n_victim == 0) {
+    // k19-ptres core (lo > 0): the victims come from slots [lo, n_victim) only
+    if (n_seed == 0 || n_victim <= lo) {
         if (t == 0) {
             out[0] = 0;
         }
@@ -715,14 +721,15 @@ static __global__ void moe_cache_seed_plan(
     const int n_miss = s_miss;
 
     // victims, in hand order by class: 0 empty, 1 reference bit 0, 2 reference bit 1
-    const int h = state[0] >= 0 && state[0] < n_victim ? state[0] : 0;
+    const int nv = n_victim - lo;
+    const int h = state[0] >= lo && state[0] < n_victim ? state[0] : lo;
     for (int cls = 0; cls < 3 && s_found < n_miss; ++cls) {
-        for (int off0 = 0; off0 < n_victim && s_found < n_miss; off0 += MOE_SEED_THREADS) {
+        for (int off0 = 0; off0 < nv && s_found < n_miss; off0 += MOE_SEED_THREADS) {
             const int off = off0 + t;
             bool elig = false;
             int  s    = 0;
-            if (off < n_victim) {
-                s = h + off < n_victim ? h + off : h + off - n_victim;
+            if (off < nv) {
+                s = h + off < n_victim ? h + off : h + off - nv;
                 const int32_t  key = key_of[s];
                 const uint32_t p   = (uint32_t) pin[s];
                 const bool pinned  = p != 0 && epoch - p <= (uint32_t) pos;
@@ -1119,7 +1126,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
         moe_cache_seed_plan<<<1, MOE_SEED_THREADS, smem, ctx.stream()>>>(
             (const int32_t *) ids->data, n_ids, (int32_t *) map->data, (int32_t *) state->data,
             scores != nullptr ? (int32_t *) scores->data : nullptr, (int32_t *) dst->data, n_expert, il, n_slots,
-            n_victim, n_seed, n_seed_max, pos);
+            n_victim, n_seed, n_seed_max, pos, ggml_get_op_params_i32(dst, 7));
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -1298,7 +1305,8 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
             n_ids, ne0, n_expert, il, n_slots, (int32_t *) counts->data, (int) map->ne[1], fetch_q,
             scores != nullptr ? (int32_t *) scores->data : nullptr, grow, advance, n_scores, ggml_get_op_params_i32(dst, 15),
             tail_rank, tail_rank > 0 ? (int32_t *) counts->data + (int64_t) map->ne[1]*n_expert + 4 : nullptr, ids_s1,
-            ggml_get_op_params_i32(dst, 9), n_expert >= 8 ? admit_margin_q : 0, admit_add_q, ggml_get_op_params_i32(dst, 8));
+            ggml_get_op_params_i32(dst, 9), n_expert >= 8 ? admit_margin_q : 0, admit_add_q, ggml_get_op_params_i32(dst, 8),
+            ggml_get_op_params_i32(dst, 7));
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -1310,7 +1318,8 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
         (const int32_t *) ids->data, (int32_t *) map->data, (int32_t *) state->data, (int32_t *) dst->data,
         n_ids, ne0, n_expert, il, n_slots, nullptr, 0, 0,
         scores != nullptr ? (int32_t *) scores->data : nullptr, grow, advance, n_scores, 0,
-        tail_rank, tail_rank > 0 && skip_counts != nullptr ? (int32_t *) skip_counts->data + (int64_t) map->ne[1]*n_expert + 4 : nullptr, ids_s1);
+        tail_rank, tail_rank > 0 && skip_counts != nullptr ? (int32_t *) skip_counts->data + (int64_t) map->ne[1]*n_expert + 4 : nullptr, ids_s1,
+        0, 0, 0, 0, n_banks <= 3 ? ggml_get_op_params_i32(dst, 9) : 0); // core: op param 9 (host pointers of a 4th bank otherwise)
     CUDA_CHECK(cudaGetLastError());
 
     moe_cache_fetch_launch(stream, dst, dst->src + 3, n_banks, (const int32_t *) dst->data, n_ids, ne0);
