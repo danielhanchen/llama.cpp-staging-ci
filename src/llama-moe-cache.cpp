@@ -7153,6 +7153,19 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // k19-ptres: the next expert id from nx on (mod n_expert) that is not in the core: the timings read host copies, which the core
+    // has none of (with no core: nx++ % n_expert, as before)
+    int64_t not_core(const group & g, int32_t il, int64_t & nx, int64_t n_expert) const {
+        const int32_t * cs = g.lru.n_core > 0 ? g.lru.slot_map[il] : nullptr;
+        for (int64_t k = 0; k < n_expert; ++k) {
+            const int64_t e = nx++ % n_expert;
+            if (cs == nullptr || cs[e] < 0 || cs[e] >= g.lru.n_core) {
+                return e;
+            }
+        }
+        return nx++ % n_expert;
+    }
+
     void cm_calibrate(ggml_backend_t backend_cpu) {
         cm_cal_aborted = false;
         const bool hybrid_probe_was = hybrid_probe;
@@ -7268,9 +7281,8 @@ struct llama_moe_cache::impl {
         auto set_ids = [&](ggml_tensor * ids, int n, int rows) {
             std::vector<int32_t> v((size_t) n*rows);
             for (int i = 0; i < n; ++i) {
-                v[i] = (int32_t) ((next + i) % n_expert);
+                v[i] = (int32_t) not_core(g, g.layers[0], next, n_expert);
             }
-            next += n;
             for (int r = 1; r < rows; ++r) {
                 std::copy(v.begin(), v.begin() + n, v.begin() + (size_t) r*n);
             }
@@ -7488,7 +7500,7 @@ struct llama_moe_cache::impl {
         for (int r = 0; r <= n_rep; ++r) {
             const int64_t t0 = ggml_time_us();
             for (int i = 0; i < ka; ++i) {
-                const int64_t e = next++ % n_expert;
+                const int64_t e = not_core(g, g.layers[0], next, n_expert);
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                     const size_t nb = l.experts[ip]->nb[2];
                     ggml_backend_tensor_set_async(backend, g.banks[ip], (const uint8_t *) l.experts[ip]->data + e*nb, (size_t) g.n_slots*nb, nb);
@@ -8220,7 +8232,7 @@ struct llama_moe_cache::impl {
         auto set_ids = [&](ggml_tensor * ids, int n) {
             std::vector<int32_t> v(n);
             for (int i = 0; i < n; ++i) {
-                v[i] = (int32_t) (next++ % n_expert);
+                v[i] = (int32_t) not_core(g, g.layers[0], next, n_expert);
             }
             ggml_backend_tensor_set(ids, v.data(), 0, n*sizeof(int32_t));
         };
@@ -8250,7 +8262,7 @@ struct llama_moe_cache::impl {
         for (int r = 0; r <= n_rep; ++r) {
             const int64_t t0 = ggml_time_us();
             for (int i = 0; i < k; ++i) {
-                const int64_t e = next++ % n_expert;
+                const int64_t e = not_core(g, g.layers[0], next, n_expert);
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                     const size_t nb = l.experts[ip]->nb[2];
                     ggml_backend_tensor_set(g.banks[ip], (const uint8_t *) l.experts[ip]->data + e*nb, (size_t) g.n_slots*nb, nb);
