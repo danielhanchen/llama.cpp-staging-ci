@@ -1810,6 +1810,38 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
+    // k19-crash8k: the cache also leaves the host this much available memory (LLAMA_PROMPT_CACHE_HOST_FLOOR_MIB, default 6144, 0 = off):
+    // the oldest entries go first, and a state that does not fit even then is not saved. --cache-ram (default 8192 MiB) is a limit of
+    // its own that nothing else plans around: the MoE host tier takes MemAvailable minus its reserve and room at load (pinned, so not
+    // reclaimable), and on Linux a large allocation does not fail (no bad_alloc above) - the kernel kills the process later instead.
+    // Flash-Next UD-IQ4_XS from the disk at 12 GB on a 54 GB L4 VM: 35.6 GB inclusive tier + 5.4 GB ring / prefetch staging pinned,
+    // 12 saved 8200-token prompts (4.3 GB) left 0.6-3.6 GB available, the 13th prompt's prefill was OOM-killed (SIGKILL, no log line)
+    {
+        static const size_t floor_bytes = [] {
+            const char * e = getenv("LLAMA_PROMPT_CACHE_HOST_FLOOR_MIB");
+            return (size_t) (e != nullptr ? std::max<long long>(0, atoll(e)) : 6144) << 20;
+        }();
+        const uint64_t avail = floor_bytes > 0 ? llama_available_memory() : 0;
+        if (avail > 0) {
+            const size_t need  = state_size_new + floor_bytes;
+            size_t       freed = 0;
+            int          n_ev  = 0;
+            while (!states.empty() && avail + freed < need) {
+                freed += states.front().size();
+                evict_front();
+                n_ev++;
+            }
+            if (n_ev > 0 || avail + freed < need) {
+                SRV_WRN(" - host memory: %.1f MiB available, the new state %.1f MiB + a floor of %.1f MiB: %d oldest entries removed "
+                        "(%.1f MiB)%s (LLAMA_PROMPT_CACHE_HOST_FLOOR_MIB)\n", avail / 1048576.0, state_size_new / 1048576.0,
+                        floor_bytes / 1048576.0, n_ev, freed / 1048576.0, avail + freed < need ? ", the state is not saved" : "");
+            }
+            if (avail + freed < need) {
+                return nullptr;
+            }
+        }
+    }
+
     common_state_buf state_data_tgt;
     common_state_buf state_data_dft;
 
