@@ -1197,6 +1197,7 @@ struct llama_moe_cache::impl {
     std::deque<prof_entry>  hprof_pending; // heat order
     bool   hprof_pinned    = false;        // the slots of the background reads were allocated (one pass)
     int    hprof_inflight_max = 1024;      // background reads in flight at most (experts), topped up at each small batch
+    size_t hprof_load_read = (size_t) 6144 << 20; // LLAMA_MOE_HOST_PROFILE_LOAD_READ_MIB: background reads issued at the first batch (during the load)
     std::vector<uint64_t>   hprof_ticket;  // [slot] ticket of its background read, 0 = none
     std::deque<int32_t>     hprof_q;       // slots with a ticket (or collected since), issue order
     size_t hprof_read_cap  = SIZE_MAX;     // LLAMA_MOE_HOST_PROFILE_READ_MIB
@@ -3391,6 +3392,9 @@ struct llama_moe_cache::impl {
             hprof_read_cap = (size_t) std::max(0.0, atof(e))*1048576;
         }
         hprof_read_left = hprof_read_cap;
+        if (const char * e = getenv("LLAMA_MOE_HOST_PROFILE_LOAD_READ_MIB")) {
+            hprof_load_read = (size_t) std::max(0.0, atof(e))*1048576;
+        }
         if (const char * e = getenv("LLAMA_MOE_HOST_PROFILE_INFLIGHT")) {
             hprof_inflight_max = std::max(1, atoi(e));
         }
@@ -3512,10 +3516,14 @@ struct llama_moe_cache::impl {
         const bool large = n_tokens > n_small_max;
         if (!hprof_copied) {
             hprof_copy();
+            // the hottest of the rest are read while the load finishes (the draft model, the warmup), at most hprof_load_read bytes
+            if (hprof_load_read > 0) {
+                hprof_issue(hprof_load_read, 1 << 30, false);
+            }
         }
         if (large) {
             if (!hprof_q.empty()) {
-                hprof_cancel();
+                hprof_cancel(false);
             }
             if (!hprof_prev_large) {
                 // a request starts: room for its reads
@@ -3533,7 +3541,7 @@ struct llama_moe_cache::impl {
         } else {
             hprof_reap();
             if (hprof_prompted) {
-                hprof_issue();
+                hprof_issue(SIZE_MAX, hprof_inflight_max, true);
             }
         }
         hprof_prev_large = large;
@@ -3574,14 +3582,14 @@ struct llama_moe_cache::impl {
     // (a cancel stays cheap); the entries without a slot, already held, or (exclusive) in the device slots now are dropped. The first
     // call allocates (pins) the slot memory of every pending entry at once (then frees the slots): pinning costs ~0.7 s per GB, once,
     // instead of a chunk at a time inside later decode steps
-    void hprof_issue() {
+    void hprof_issue(size_t max_bytes, int max_inflight, bool pin_all) {
         if (hprof_pending.empty() || wstore == nullptr || !host) {
             return;
         }
         auto skip = [&](const prof_entry & p) {
             return !host_layer(p.il) || (host->exclusive() && in_device(p.il, p.e)) || host->contains(p.il, p.e);
         };
-        if (!hprof_pinned) {
+        if (pin_all && !hprof_pinned) {
             hprof_pinned = true;
             const int64_t t0 = ggml_time_us();
             std::vector<int32_t> tmp;
@@ -3602,7 +3610,8 @@ struct llama_moe_cache::impl {
         }
         hps.rounds++;
         std::vector<llama_weight_store::host_read> rd;
-        while (!hprof_pending.empty() && (int) hprof_q.size() < hprof_inflight_max && hprof_read_left > 0) {
+        size_t bytes = 0;
+        while (!hprof_pending.empty() && (int) hprof_q.size() < max_inflight && hprof_read_left > 0 && bytes < max_bytes) {
             const prof_entry p = hprof_pending.front();
             hprof_pending.pop_front();
             if (skip(p)) {
@@ -3635,23 +3644,28 @@ struct llama_moe_cache::impl {
             hprof_q.push_back(s);
             hps.issued++;
             hps.issued_bytes += nb;
+            bytes += nb;
             hprof_read_left = nb >= hprof_read_left ? 0 : hprof_read_left - nb;
         }
     }
 
-    // the background reads that did not start are cancelled (their slots are free again, their entries pending); the started ones (at
-    // most one per IO thread) are waited for, so no slot is being read in the background while a large batch runs (its seeds and
-    // promotions release RAM slots of experts they admit to the device)
-    void hprof_cancel() {
+    // the background reads that did not start are cancelled (their slots are free again, their entries back in front of the pending ones);
+    // the started ones complete as issued (wait_started: they are waited for, e.g. before the store is detached)
+    void hprof_cancel(bool wait_started) {
         size_t n = 0;
         std::vector<prof_entry> back;
+        std::deque<int32_t> keep;
         for (const int32_t s : hprof_q) {
             if (hprof_ticket[s] == 0) {
                 continue;
             }
             if (!wstore->host_cancel(hprof_ticket[s])) {
-                wstore->host_wait(hprof_ticket[s]);
-                hprof_complete(s);
+                if (wait_started) {
+                    wstore->host_wait(hprof_ticket[s]);
+                    hprof_complete(s);
+                } else {
+                    keep.push_back(s);
+                }
                 continue;
             }
             const int32_t key = host->key(s);
@@ -3665,7 +3679,7 @@ struct llama_moe_cache::impl {
             }
             n++;
         }
-        hprof_q.clear();
+        hprof_q.swap(keep);
         hprof_pending.insert(hprof_pending.begin(), back.begin(), back.end());
         hps.cancelled += n;
     }
@@ -3673,7 +3687,7 @@ struct llama_moe_cache::impl {
     // every background read is cancelled or waited for (before the store is detached or the RAM tier is dropped)
     void hprof_stop() {
         if (host && wstore != nullptr && !hprof_q.empty()) {
-            hprof_cancel();
+            hprof_cancel(true);
         }
     }
 
@@ -9947,7 +9961,7 @@ struct llama_moe_cache::impl {
             t_prof = t;
         }
 
-        if (tiered && !hprof_q.empty()) {
+        if (tiered && hprof_prompted && !hprof_q.empty()) {
             hprof_wait_routed(il);
         }
         if (ahead) {
@@ -10595,7 +10609,8 @@ struct llama_moe_cache::impl {
                             host->set_dup(h, true);
                             hst.promoted++;
                         }
-                    } else if (host->contains(sd.il, f.expert)) {
+                    } else if (host->contains(sd.il, f.expert) && !host->is_async(host->slot_of_key(sd.il, f.expert))) {
+                        // (k19-ramprof2: a slot being read in the background is left to its read: published, it is a duplicate)
                         host->release_key(sd.il, f.expert);
                         hst.promoted++;
                     }
