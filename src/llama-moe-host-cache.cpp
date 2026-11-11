@@ -302,6 +302,43 @@ void llama_moe_host_cache::set_spec(int32_t s) {
     spec_of[sl.key / n_expert].push_back(s);
 }
 
+int32_t llama_moe_host_cache::n_free() const {
+    int32_t n = 0;
+    for (const klass & c : classes) {
+        n += (int32_t) c.free_list.size() + (c.n - c.n_alloc);
+    }
+    return n;
+}
+
+size_t llama_moe_host_cache::drop_spec(size_t n) {
+    size_t done = 0;
+    bool any = true;
+    while (done < n && n_spec > 0 && any) {
+        any = false;
+        for (size_t j = 0; j < spec_of.size() && done < n; ++j) {
+            std::vector<int32_t> & v = spec_of[j];
+            while (!v.empty()) {
+                const int32_t s = v.back();
+                const slot_t & sl = slots[s];
+                if (!sl.spec || sl.key < 0 || sl.key / n_expert != (int32_t) j) {
+                    v.pop_back();
+                    continue;
+                }
+                if (sl.state != SLOT_VALID || sl.pin == call_epoch || sl.lease_id == plan_id || sl.read_seq == seq_next || sl.write_seq == seq_next) {
+                    break;
+                }
+                v.pop_back();
+                release(s);
+                st.spec_dropped++;
+                done++;
+                any = true;
+                break;
+            }
+        }
+    }
+    return done;
+}
+
 // a marked slot of layer il's layout that a reservation may take (see set_spec): the layers a prompt pass has finished first (from the
 // streamed layer down), else from the layer before il down (wrapping), the last marked slot of a layer first; -1 if none
 int32_t llama_moe_host_cache::spec_victim(int32_t il, uint32_t min_age) {

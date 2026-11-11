@@ -148,6 +148,12 @@ public:
     void   set_spec(int32_t s);
     bool   is_spec(int32_t s) const { return slots[s].spec != 0; }
     size_t n_spec_slots() const { return n_spec; }
+    // slots without an expert (free, or not allocated yet within the budget)
+    int32_t n_free() const;
+    // releases up to n unused guesses (the coldest of each layer first, the layers in turn; never one in use by this call / plan or read
+    // by uncommitted copies): a prompt's plan leases every held slot of its layers, so only free slots take what it reads; returns the
+    // number released
+    size_t drop_spec(size_t n);
 
     // events: the copies that read slots (mark_read) or write them (mark_write, e.g. device -> host) since the last commit are recorded
     // on backend; a slot is reused or read by the host only after them
@@ -178,6 +184,7 @@ public:
         uint64_t spec_set   = 0; // k19-ramprof2: slots marked by set_spec
         uint64_t spec_used  = 0; // ... used while marked (the guess was right)
         uint64_t spec_taken = 0; // ... taken by a reservation while still unused
+        uint64_t spec_dropped = 0; // ... released by drop_spec while still unused
         size_t   peak_held  = 0; // most slots holding an expert at once
     };
     stats st;

@@ -212,6 +212,10 @@ static void test_spec() {
     CHECK(hc.n_spec_slots() == 1 && hc.st.spec_taken == 3 && hc.st.evicted == 3);
     // the bytes of the kept guesses and uses are unchanged
     CHECK(hc.data(s00, 0)[0] == 0x40 + 0 && hc.data(s30, 1)[0] == 0x40 + 3*8);
+    // room for a request: the full tier frees its last unused guess ((3,0)), nothing else
+    CHECK(hc.n_free() == 0);
+    CHECK(hc.drop_spec(5) == 1 && hc.n_free() == 1 && hc.n_spec_slots() == 0 && hc.st.spec_dropped == 1);
+    CHECK(hc.find(3, 0, false) < 0 && hc.find(0, 0, false) == s00 && hc.find(1, 1, false) == s11);
 }
 
 int main(int argc, char ** argv) {
