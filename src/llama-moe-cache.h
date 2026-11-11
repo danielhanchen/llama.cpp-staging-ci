@@ -3,8 +3,10 @@
 
 #include "ggml-backend.h"
 
+#include <functional>
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 struct llama_model;
@@ -381,3 +383,28 @@ private:
 };
 
 using llama_moe_cache_ptr = std::unique_ptr<llama_moe_cache>;
+
+// k19-ramprof: the routing profile file of the MoE cache ("moe-cache-profile 1 <n_layer>", then one "<layer> <expert> <heat>" line per
+// expert, written by LLAMA_MOE_CACHE_PROFILE_SAVE at exit). heat = decayed use, in uses.
+struct llama_moe_profile_entry {
+    int32_t il;
+    int32_t e;
+    float   heat;
+};
+
+// reads path into out; n_expert[il] = the experts of layer il the cache holds (0: not cached). false (out empty) if the file is missing,
+// has another layer count, names a layer / expert out of range or twice, or lists nothing
+bool llama_moe_profile_load(const std::string & path, const std::vector<int32_t> & n_expert, std::vector<llama_moe_profile_entry> & out);
+
+// writes the entries in their order (to path.tmp, renamed over path); false on an I/O error
+bool llama_moe_profile_write(const std::string & path, size_t n_layer, const std::vector<llama_moe_profile_entry> & entries);
+
+// the order the RAM tier is filled in at load: the most used first over every layer (heat descending), ties in file order
+std::vector<llama_moe_profile_entry> llama_moe_profile_ram_order(const std::vector<llama_moe_profile_entry> & entries);
+
+class llama_moe_host_cache;
+
+// reserves free RAM-tier slots (never evicting) for the entries in order, those want(il, e) accepts, each layout up to its slots; calls
+// take(index of the entry, slot) for each reserved slot (the caller fills and publishes it); returns the slots reserved
+size_t llama_moe_profile_reserve(llama_moe_host_cache & host, const std::vector<llama_moe_profile_entry> & order,
+        const std::function<bool(int32_t il, int32_t e)> & want, const std::function<void(size_t i, int32_t s)> & take);

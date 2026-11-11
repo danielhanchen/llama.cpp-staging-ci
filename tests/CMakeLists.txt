@@ -475,6 +475,7 @@ endif()
 if (NOT WIN32 AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-weight-store.cpp)
     llama_build_and_test(test-moe-host-cache.cpp)
+    llama_build_and_test(test-moe-ram-profile.cpp) # k19-ramprof: routing profile file + RAM-tier fill order
     llama_build_and_test(test-moe-cache-tail-skip.cpp)
 endif()
 # k19-q4xcache: the assign standing in for the plain lookup keeps the lookup's cache state (GPU backend, skipped without one)
