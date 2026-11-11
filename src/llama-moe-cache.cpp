@@ -2070,7 +2070,7 @@ struct llama_moe_cache::impl {
             const int32_t n_expert = g.lru.n_expert;
             const size_t  n_layer  = g.layers.size();
             // a late prefill (see seed_unavailable) leaves the lent slots to the staging copies
-            const int32_t n_slots  = g.n_slots - g.lru.n_lent;
+            const int32_t n_slots  = g.n_slots - g.lru.n_lent - g.lru.n_core; // (k19-ptres: not into the core)
             for (size_t i = 0; i < n_layer; ++i) {
                 const int32_t il = g.layers[i];
                 const int32_t n  = std::min<int32_t>(n_expert, n_slots/n_layer + (i < n_slots % n_layer ? 1 : 0));
@@ -2197,7 +2197,9 @@ struct llama_moe_cache::impl {
             if (g.n_slots == 0 || g.lru.n_lent > 0) {
                 continue;
             }
-            const int32_t n_want = (int32_t) std::floor(share*g.n_slots);
+            // above the core the group keeps the slots of one whole layer, so every batch whose experts fit the slots without a core
+            // still fits them (slots_fit), and large batches and their seeds keep a layer's worth of slots
+            const int32_t n_want = std::min<int32_t>((int32_t) std::floor(share*g.n_slots), std::max<int32_t>(0, g.n_slots - g.lru.n_expert));
             std::vector<std::vector<int32_t>> core_ids(layers.size());
             int32_t n_take = 0;
             for (const prof_entry & p : profile) {
@@ -9175,9 +9177,10 @@ struct llama_moe_cache::impl {
                     continue;
                 }
                 const std::vector<int32_t> & counts = *cp;
-                const size_t n_avail = (size_t) (g.n_slots - g.lru.n_lent);
+                // (k19-ptres: the core slots take no seeds)
+                const size_t n_avail = (size_t) (g.n_slots - g.lru.n_lent - g.lru.n_core);
                 size_t n_seed = n_avail / g.layers.size();
-                size_t n_full = g.n_slots / g.layers.size();
+                size_t n_full = (size_t) (g.n_slots - g.lru.n_core) / g.layers.size();
                 if (n_full == 0) {
                     const size_t pos = std::find(g.layers.begin(), g.layers.end(), il) - g.layers.begin();
                     n_full = pos < (size_t) g.n_slots ? 1 : 0;
@@ -10280,9 +10283,10 @@ struct llama_moe_cache::impl {
 
             const int32_t n_expert = g.lru.n_expert;
             // while slots are lent, the experts that the lent slots would hold are uploaded when they come back (see unlend)
-            const size_t  n_avail  = (size_t) (g.n_slots - g.lru.n_lent);
+            // (k19-ptres: the core slots take no seeds)
+            const size_t  n_avail  = (size_t) (g.n_slots - g.lru.n_lent - g.lru.n_core);
             size_t        n_seed   = n_avail / g.layers.size();
-            size_t        n_full   = g.n_slots / g.layers.size();
+            size_t        n_full   = (size_t) (g.n_slots - g.lru.n_core) / g.layers.size();
             if (n_full == 0) {
                 // fewer slots than layers: one expert for each of the first layers of the group, instead of none
                 const size_t pos = std::find(g.layers.begin(), g.layers.end(), b.il) - g.layers.begin();
