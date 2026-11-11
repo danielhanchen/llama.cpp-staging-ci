@@ -3183,6 +3183,36 @@ struct llama_moe_cache::impl {
                         "the budget is that complement + 1 GiB (%.1f MiB), the reserve gets the rest\n", __func__, reserve/1048576.0, need/1048576.0);
             }
         }
+        // k19-l4df2: on a disk tier (the mapped host weights exceed what is available, so the page cache cannot hold the streamed experts
+        // the tier leaves out) the auto budget's planning room (max(4 GiB, 15%) + min(4 GiB, 1/16) of the available RAM, ~9.7 GB of a
+        // 52 GB host) mostly buys page cache that cannot serve those experts: each device miss outside RAM is read from the disk. There
+        // the exclusive tier plans into the available RAM minus the host reserve, the other mapped host weights and a fixed room
+        // LLAMA_MOE_HOST_LEAN_ROOM_MIB (default 5632), up to the complement of the device slots + 1 GiB, filled on demand as before
+        // (resident mode only where the budget reaches it under its own rule). L4 full card, Flash-Next UD-IQ4_XS from the disk: auto
+        // 35.9 GB = 86% of the experts in RAM + device slots, 12% of device misses from the disk (~85% of a decode pass), 13.9 GB of
+        // MemAvailable unused; the whole complement (44.9 GB, resident) froze the 54 GB VM at load, so the room stays.
+        // LLAMA_MOE_HOST_LEAN=0 off
+        {
+            const char * e_lean = getenv("LLAMA_MOE_HOST_LEAN");
+            size_t room_lean = (size_t) 5632 << 20;
+            if (const char * e = getenv("LLAMA_MOE_HOST_LEAN_ROOM_MIB")) {
+                room_lean = (size_t) std::max<long long>(0, atoll(e)) << 20;
+            }
+            const size_t comp  = e_bytes > v_bytes ? e_bytes - v_bytes : 0;
+            const size_t other = mapped > e_bytes ? mapped - e_bytes : 0;
+            const size_t keep  = other + room_lean;
+            const size_t lean  = std::min(comp + ((size_t) 1 << 30), avail_plan > keep ? avail_plan - keep : 0);
+            if ((e_lean == nullptr || atoi(e_lean) != 0) && host_mib < 0 && comp > 0 && mapped > avail && plan.on &&
+                    plan.policy == LLAMA_MOE_HOST_EXCLUSIVE && plan.budget < lean) {
+                LLAMA_LOG_INFO("%s: MoE host cache: disk tier: the budget plans into %.1f MiB available minus the %.1f MiB reserve, %.1f MiB "
+                        "of other mapped weights and a %.1f MiB room: %.1f -> %.1f MiB (%.1f MiB of streamed experts outside RAM and the device "
+                        "slots -> %.1f) (LLAMA_MOE_HOST_LEAN=0 off, LLAMA_MOE_HOST_LEAN_ROOM_MIB)\n", __func__, avail/1048576.0,
+                        reserve/1048576.0, other/1048576.0, room_lean/1048576.0, plan.budget/1048576.0, lean/1048576.0,
+                        (comp > plan.budget ? comp - plan.budget : 0)/1048576.0, (comp > lean ? comp - lean : 0)/1048576.0);
+                plan.budget = lean;
+                plan.spare  = lean + v_bytes >= e_bytes;
+            }
+        }
         if (reserve > 0 && host_mib < 0) {
             LLAMA_LOG_INFO("%s: MoE host cache: %.1f MiB available, %.1f MiB kept as the host reserve (LLAMA_MOE_HOST_RESERVE_MIB)\n", __func__,
                     avail/1048576.0, reserve/1048576.0);
