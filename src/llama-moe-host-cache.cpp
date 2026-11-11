@@ -71,6 +71,7 @@ llama_moe_host_cache::llama_moe_host_cache(ggml_backend_buffer_type_t buft, size
         buft(buft), buft_pageable(buft_pageable), pin_cap(pin_cap), budget(budget), policy(policy), n_expert(n_expert), chunk_size(chunk_size ? chunk_size : (size_t) 256 << 20) {
     layer_class.assign(layer_sizes.size(), -1);
     slot_of.resize(layer_sizes.size());
+    spec_of.resize(layer_sizes.size());
     {
         const char * env = getenv("LLAMA_MOE_HOST_EVICT_DONE");
         evict_done = env != nullptr && atoi(env) != 0; // off by default: see the header
@@ -230,6 +231,11 @@ uint8_t * llama_moe_host_cache::data(int32_t s, int ip) const {
 
 void llama_moe_host_cache::set_key(int32_t s, int32_t key) {
     slot_t & sl = slots[s];
+    if (sl.spec) {
+        // replaced before it was used (the list entry is pruned when it is reached)
+        sl.spec = 0;
+        n_spec--;
+    }
     if (sl.key >= 0) {
         slot_of[sl.key / n_expert][sl.key % n_expert] = -1;
     }
@@ -272,8 +278,58 @@ int32_t llama_moe_host_cache::find(int32_t il, int32_t e, bool touch) {
     if (touch) {
         st.hits++;
         sl.count = (uint8_t) std::min<int>(sl.count + 1, 7);
+        spec_use(sl);
     }
     return s;
+}
+
+void llama_moe_host_cache::spec_use(slot_t & sl) {
+    if (sl.spec) {
+        sl.spec = 0;
+        n_spec--;
+        st.spec_used++;
+    }
+}
+
+void llama_moe_host_cache::set_spec(int32_t s) {
+    slot_t & sl = slots[s];
+    if (sl.spec || sl.state != SLOT_VALID || sl.key < 0) {
+        return;
+    }
+    sl.spec = 1;
+    n_spec++;
+    st.spec_set++;
+    spec_of[sl.key / n_expert].push_back(s);
+}
+
+// a marked slot of layer il's layout that a reservation may take (see set_spec): the layers a prompt pass has finished first (from the
+// streamed layer down), else from the layer before il down (wrapping), the last marked slot of a layer first; -1 if none
+int32_t llama_moe_host_cache::spec_victim(int32_t il, uint32_t min_age) {
+    const int32_t c    = layer_class[il];
+    const int32_t nl   = (int32_t) spec_of.size();
+    const int32_t from = stream_il >= 0 ? stream_il : il - 1;
+    for (int32_t k = 0; k < nl; ++k) {
+        const int32_t j = ((from - k) % nl + nl) % nl;
+        if (layer_class[j] != c) {
+            continue;
+        }
+        std::vector<int32_t> & v = spec_of[j];
+        while (!v.empty()) {
+            const int32_t s = v.back();
+            const slot_t & sl = slots[s];
+            if (!sl.spec || sl.key < 0 || sl.key / n_expert != j) {
+                v.pop_back(); // used or replaced since it was marked
+                continue;
+            }
+            if (sl.state != SLOT_VALID || sl.pin == call_epoch || sl.lease_id == plan_id || sl.read_seq == seq_next || sl.write_seq == seq_next ||
+                    (min_age > 0 && std::max(sl.read_seq, sl.write_seq) + min_age >= seq_next && std::max(sl.read_seq, sl.write_seq) > seq_done)) {
+                break; // in use by this call / plan: try the next layer
+            }
+            v.pop_back();
+            return s;
+        }
+    }
+    return -1;
 }
 
 int32_t llama_moe_host_cache::held(int32_t il, int32_t e) const {
@@ -307,7 +363,7 @@ void llama_moe_host_cache::set_dup(int32_t s, bool dup) {
     sl.dup = dup && (sl.state == SLOT_VALID || sl.state == SLOT_WRITING) ? 1 : 0;
 }
 
-int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict, uint32_t min_age) {
+int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict, uint32_t min_age, bool take_spec) {
     if (!caches(il) || slot_of[il][e] >= 0) {
         return -1;
     }
@@ -338,6 +394,15 @@ int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict, u
         evict(s);
         st.evicted++;
         st.dup_taken++;
+    }
+    // k19-ramprof2: an unused guess of a routing profile is as good as a free slot (see set_spec)
+    if (s < 0 && take_spec && n_spec > 0) {
+        s = spec_victim(il, min_age);
+        if (s >= 0) {
+            evict(s);
+            st.evicted++;
+            st.spec_taken++;
+        }
     }
     // k19-ramevict: a prompt pass streaming layer stream_il takes its victims from the finished layers first (see set_stream_layer)
     // the hand passes the other slots without lowering their counts
@@ -379,7 +444,7 @@ int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict, u
         }
     }
     if (s >= 0) {
-        // taken from the duplicates or a finished layer
+        // taken from the duplicates, the unused guesses or a finished layer
     } else if (allow_evict && c.n_alloc > 0) {
         // CLOCK over the decayed counts: the hand lowers the count of each slot it passes, the first at zero is evicted
         const int64_t max_steps = (int64_t) c.n_alloc*9;
@@ -540,12 +605,14 @@ bool llama_moe_host_cache::fill_piece(int32_t s, int ip, size_t off, const uint8
 }
 
 void llama_moe_host_cache::mark_read(int32_t s) {
+    spec_use(slots[s]);
     slots[s].read_seq = seq_next;
     marks = true;
 }
 
 void llama_moe_host_cache::mark_write(int32_t s) {
     slot_t & sl = slots[s];
+    spec_use(sl);
     sl.write_seq = seq_next;
     if (sl.state == SLOT_FILLING) {
         n_held++;

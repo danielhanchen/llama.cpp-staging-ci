@@ -90,7 +90,8 @@ public:
     // pinned, leased or being filled if no slot is free, and waits for the copies that still read the slot; -1 if none can be taken
     // evict = false: only a free slot (or memory still in the budget); min_age > 0: never evicts a slot read or written by the last
     // min_age commits (the reservation then never waits for the device)
-    int32_t reserve(int32_t il, int32_t e, bool evict = true, uint32_t min_age = 0);
+    // take_spec: a slot set_spec marked (filled from a routing profile, not used since) counts as free (see set_spec)
+    int32_t reserve(int32_t il, int32_t e, bool evict = true, uint32_t min_age = 0, bool take_spec = true);
     void    publish(int32_t s);  // the slot holds its expert
     void    abort(int32_t s);    // the slot is free again
     void    release(int32_t s);  // drops the expert (exclusive promotion), the slot is reused once the copies that read it are done
@@ -139,6 +140,15 @@ public:
     bool is_dup(int32_t s) const { return slots[s].dup != 0; }
     bool is_async(int32_t s) const { return slots[s].async != 0; }
 
+    // k19-ramprof2: a held slot filled from a routing profile (a guess, LLAMA_MOE_HOST_PROFILE) is marked until it is used (a touching
+    // find, a read by a copy, a write) or replaced. A reservation (take_spec) takes a marked slot when no slot is free and no duplicate
+    // can go, before any eviction by the CLOCK, so a full tier of guesses still keeps what the prompts and misses read (as free slots
+    // would); the layers a prompt pass has finished go first (see set_stream_layer), then the layers before the reserving one, coldest
+    // of a layer first (marked in heat order). Placement only. Without marked slots nothing changes.
+    void   set_spec(int32_t s);
+    bool   is_spec(int32_t s) const { return slots[s].spec != 0; }
+    size_t n_spec_slots() const { return n_spec; }
+
     // events: the copies that read slots (mark_read) or write them (mark_write, e.g. device -> host) since the last commit are recorded
     // on backend; a slot is reused or read by the host only after them
     void mark_read(int32_t s);
@@ -165,6 +175,9 @@ public:
         uint64_t stream_evicted = 0; // evictions while a prompt layer was set (see set_stream_layer)
         uint64_t done_evicted   = 0; // ... taken by the finished-layer rule
         uint64_t ahead_evicted  = 0; // ... of an expert of a layer the pass has not reached yet (the plain CLOCK; the rule's fallback)
+        uint64_t spec_set   = 0; // k19-ramprof2: slots marked by set_spec
+        uint64_t spec_used  = 0; // ... used while marked (the guess was right)
+        uint64_t spec_taken = 0; // ... taken by a reservation while still unused
         size_t   peak_held  = 0; // most slots holding an expert at once
     };
     stats st;
@@ -182,6 +195,7 @@ private:
         uint8_t  pieces   = 0;  // the slot is filled from pieces
         uint8_t  async    = 0;  // filled by an asynchronous read (see set_async)
         uint8_t  dup      = 0;  // the device also holds the expert (see set_dup)
+        uint8_t  spec     = 0;  // filled from a routing profile and not used since (see set_spec)
         uint32_t pin      = 0;  // call epoch that pinned it
         uint32_t lease_id = 0;  // plan that leased it
         uint64_t read_seq  = 0; // last commit that reads it
@@ -228,6 +242,9 @@ private:
     std::vector<uint32_t> got;     // [slot][max_tensors] fill_piece progress
     int max_tensors = 0;
 
+    std::vector<std::vector<int32_t>> spec_of; // [n_layer] slots marked by set_spec (lazily pruned), coldest last
+    size_t   n_spec     = 0;
+
     int32_t  stream_il  = -1;
     bool     evict_done = true;
 
@@ -249,4 +266,6 @@ private:
     void wait_seq(uint64_t seq);
     void evict(int32_t s);
     void set_key(int32_t s, int32_t key);
+    void spec_use(slot_t & sl);
+    int32_t spec_victim(int32_t il, uint32_t min_age);
 };
