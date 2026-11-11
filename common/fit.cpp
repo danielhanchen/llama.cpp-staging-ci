@@ -1709,7 +1709,22 @@ static void common_params_fit_impl(
                     LOG_INF("%s: lazy KV: a drafter is fitted, the MoE cache keeps %zu MiB, not the %zu MiB of KV cells not backed at load on top "
                         "(LLAMA_KV_LAZY_FIT_DRAFT=1 to give them)\n", __func__, cparams->moe_cache_size/MiB, dmds_cpu_moe[0].mb.kv_lazy/MiB);
                 }
-                if (kv_lazy_fit && kv_lazy_draft_ok && nd == 1 && dmds_cpu_moe[0].mb.kv_lazy > 0 && cparams->moe_cache_size > 0 && cparams->moe_cache_size < size_before) {
+                // k19-vramlend: in the automatic mode (LLAMA_KV_LAZY unset) only where the unbacked KV is at least LLAMA_KV_LAZY_AUTO_MIN_FRAC
+                // (0.10) of the fitted cache: Colab T4 q4x ctx 32768 no draft, 4 GB (grant 4x the cache) decode +9..+17%, 8 GB (+14%) +2..+5%;
+                // L4 12 GB (+7%) -2..-6% (the larger cache tipped the CPU-miss rule off for 1-token batches; exact env +2..+3%)
+                static const double kv_lazy_auto_min = getenv("LLAMA_KV_LAZY_AUTO_MIN_FRAC") != nullptr ?
+                    std::max(0.0, atof(getenv("LLAMA_KV_LAZY_AUTO_MIN_FRAC"))) : 0.10;
+                const char * e_kvl = getenv("LLAMA_KV_LAZY");
+                const bool   kv_lazy_auto = e_kvl == nullptr || *e_kvl == '\0';
+                const size_t kv_lazy_add  = cparams->moe_cache_size > 0 && cparams->moe_cache_size < size_before ?
+                    std::min(dmds_cpu_moe[0].mb.kv_lazy, size_before - cparams->moe_cache_size) : 0;
+                const bool   kv_lazy_gate = !kv_lazy_auto || double(kv_lazy_add) >= kv_lazy_auto_min*double(cparams->moe_cache_size);
+                if (kv_lazy_fit && kv_lazy_draft_ok && nd == 1 && kv_lazy_add > 0 && !kv_lazy_gate) {
+                    LOG_INF("%s: lazy KV (auto): the %zu MiB of KV cells not backed at load are under %.0f%% of the MoE cache (%zu MiB): the KV cache "
+                        "is backed whole (LLAMA_KV_LAZY_AUTO_MIN_FRAC, LLAMA_KV_LAZY=1 lends them anyway)\n", __func__, kv_lazy_add/MiB,
+                        100.0*kv_lazy_auto_min, cparams->moe_cache_size/MiB);
+                }
+                if (kv_lazy_fit && kv_lazy_draft_ok && kv_lazy_gate && nd == 1 && dmds_cpu_moe[0].mb.kv_lazy > 0 && cparams->moe_cache_size > 0 && cparams->moe_cache_size < size_before) {
                     const size_t floor = cparams->moe_cache_size;
                     cparams->moe_cache_size += std::min(dmds_cpu_moe[0].mb.kv_lazy, size_before - floor);
                     g_kv_lazy_grants.emplace_back(cparams->moe_cache_size, cparams->moe_cache_size - floor);
