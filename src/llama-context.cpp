@@ -1513,7 +1513,9 @@ llama_context::llama_context(
                     const bool partial = !admit;
                     std::atomic<bool> * whole_done = &model.ple_table_resident;
                     ple_res_runner * pr = &ple_res;
-                    auto work = [t, table, limit, partial, fd, offs, tname, stop, whole_done, pr](bool background) {
+                    // k19-ptres: a MoE cache core freed the RAM the whole table is read into (see the pin below)
+                    const bool core_freed = moe_cache && moe_cache->core_dropped_bytes() > 0;
+                    auto work = [t, table, limit, partial, fd, offs, tname, stop, whole_done, pr, core_freed](bool background) {
                         const int64_t t0 = ggml_time_us();
                         if (background) {
                             // idle I/O class (a request's own reads go first) and the lowest CPU priority, this thread only
@@ -1628,10 +1630,21 @@ llama_context::llama_context(
                         if (partial) {
                             // LLAMA_PLE_RESIDENT_PARTIAL_PIN=1: the part is pinned through the first GPU backend's host registration (the
                             // pages the page cache would otherwise give up first: they were read once, before the drafter and the
-                            // requests read theirs); off by default, as pinned pages cannot be reclaimed when the process grows
-                            static const bool pin_env = getenv("LLAMA_PLE_RESIDENT_PARTIAL_PIN") != nullptr && atoi(getenv("LLAMA_PLE_RESIDENT_PARTIAL_PIN")) != 0;
+                            // requests read theirs); pinned pages cannot be reclaimed when the process grows, so by default only where a MoE
+                            // cache core (LLAMA_MOE_CORE=1) dropped its host copies, the whole table was read and the RAM left after the pin
+                            // keeps 4 GiB (k19-ptres, Colab A100 fn4nd 32 GB, 3 launches: 8k TTFT 9.5 -> 5.6 s, the pinned pages stopped
+                            // the ~100 MB of PLE re-reads per 8k prompt); =1 always, =0 never (the page cache alone, as before)
+                            static const int pin_env = getenv("LLAMA_PLE_RESIDENT_PARTIAL_PIN") ? atoi(getenv("LLAMA_PLE_RESIDENT_PARTIAL_PIN")) : -1;
+                            bool pin_on = pin_env > 0;
+                            const char * pin_why = "";
+                            if (pin_env < 0 && core_freed) {
+                                const uint64_t avail_now = llama_sysmem::available();
+                                pin_on = limit >= table && avail_now >= (uint64_t) len + (4ull << 30);
+                                pin_why = pin_on ? " (a MoE cache core freed the RAM; LLAMA_PLE_RESIDENT_PARTIAL_PIN=0 off)" :
+                                    " (not pinned: the table is not whole or the RAM left after a pin would be under 4 GiB)";
+                            }
                             const char * pin_res = "";
-                            if (pin_env) {
+                            if (pin_on) {
                                 pin_res = ", pin failed";
                                 using host_map_t   = void * (*)(ggml_backend_dev_t, void *, size_t, bool *);
                                 using host_unmap_t = void (*)(void *);
@@ -1656,10 +1669,10 @@ llama_context::llama_context(
                                 }
                             }
                             LLAMA_LOG_INFO("%s: PLE table '%s': %.1f of %.1f GiB read into the page cache in %.1f s%s (populate %s), not locked%s; "
-                                "%d passes (the first %.1f s), %.2f GiB found evicted by the later ones%s\n",
+                                "%d passes (the first %.1f s), %.2f GiB found evicted by the later ones%s%s\n",
                                 __func__, tname.c_str(), len/1073741824.0, table/1073741824.0, t_read, background ? " in the background" : "",
                                 pop_ok ? "ok" : "by touch", pin_res, n_pass, t_pass1, evicted_a.load()*(double) pg/1073741824.0,
-                                activate ? ", activated" : "");
+                                activate ? ", activated" : "", pin_why);
                             return;
                         }
                         struct rlimit rl;
