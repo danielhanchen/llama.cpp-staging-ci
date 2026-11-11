@@ -2229,6 +2229,10 @@ static bool ggml_cuda_dense_tc_route(const ggml_tensor * src0, const ggml_tensor
     if (n_min <= 0 || !ggml_is_quantized(src0->type) || src1->ne[1] < n_min || !GGML_CUDA_CC_IS_NVIDIA(cc)) {
         return false;
     }
+    // weights only: a non-contiguous quantized view needs a strided dequantizer, which most types lack (test-backend-ops views)
+    if (!ggml_is_contiguously_allocated(src0)) {
+        return false;
+    }
     if (ggml_cuda_dense_tc_acc() == 1) {
         return true; // k13 behaviour: whatever ggml_cuda_mul_mat_cublas does for this product
     }
