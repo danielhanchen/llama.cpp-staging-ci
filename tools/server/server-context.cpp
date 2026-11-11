@@ -229,6 +229,18 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
             n_ok, n_pre, reps, (int) chains.size(), (ggml_time_us() - t0)/1000.0);
 }
 
+// k19-l4reg: see server_slot::get_n_draft_max (default on, LLAMA_SPEC_END_FULL_WINDOW=0: the draft is cut to the tokens left as before)
+static bool spec_end_full_window() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_SPEC_END_FULL_WINDOW");
+        const bool on = e == nullptr || atoi(e) != 0;
+        LOG_INF("k19-l4reg: the last pass before the n_predict limit keeps the full draft window: %s (LLAMA_SPEC_END_FULL_WINDOW=0: off)\n",
+            on ? "on" : "off");
+        return on;
+    }();
+    return v;
+}
+
 static bool spec_replay_reverify() {
     static const bool v = getenv("LLAMA_SPEC_REPLAY_REVERIFY") != nullptr && atoi(getenv("LLAMA_SPEC_REPLAY_REVERIFY")) != 0;
     return v;
@@ -1017,8 +1029,21 @@ struct server_slot {
         //       also, need to leave space for 1 extra token to allow context shifts
         int n_draft_max = n_ctx - prompt.n_tokens() - 2;
 
-        if (n_remaining() > 0) {
-            n_draft_max = std::min(n_draft_max, n_remaining() - 1);
+        // k19-l4reg (LLAMA_SPEC_END_FULL_WINDOW=0: off): near the n_predict limit the draft is no longer cut to the tokens left, so the
+        // last pass of a request runs the width every other pass ran instead of a new one (process_token stops at the limit and drops
+        // the rest). A width a request never ran before builds its graph at that pass: Colab L4 12 GB Qwen3.8-Flash-Next UD-IQ4_XS MTP,
+        // the 1-row decode a text left for its last token took 0.86-1.30 s against 30 ms for a 3-row verify window
+        if (n_remaining() > 0 && n_remaining() - 1 < n_draft_max) {
+            if (!spec_end_full_window()) {
+                n_draft_max = n_remaining() - 1;
+            } else if (n_remaining() - 1 < common_speculative_n_max(spec)) {
+                static std::atomic<int64_t> n_kept{0};
+                const int64_t k = ++n_kept;
+                if (k <= 2 || (k & (k - 1)) == 0) {
+                    SLT_INF(*this, "k19-l4reg: %d token(s) left before the n_predict limit: the draft window is kept (engaged %" PRId64 " times)\n",
+                        n_remaining(), k);
+                }
+            }
         }
 
         // k17-strict: batch invariant verify under a MoE cache: the window (the sampled token + the drafts) stays within the tokens
