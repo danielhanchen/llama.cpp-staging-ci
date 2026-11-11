@@ -10841,6 +10841,13 @@ static std::unordered_map<void *, ggml_cuda_host_mapping> & ggml_cuda_host_mappi
     return m;
 }
 
+// k19-ptres: the same mappings ordered by address (start -> end, they never overlap), so ggml_cuda_host_is_mapped is a search, not a
+// scan: an MoE cache core registers the expert buffers as ~11k runs, and every host region of a batched expert copy is looked up
+static std::map<uintptr_t, uintptr_t> & ggml_cuda_host_mapping_index() {
+    static std::map<uintptr_t, uintptr_t> m;
+    return m;
+}
+
 static void * ggml_cuda_host_map(int device, void * buffer, size_t size, bool * registered) {
     *registered = false;
     void * dev_ptr = nullptr;
@@ -10901,6 +10908,7 @@ static void * ggml_cuda_host_map(int device, void * buffer, size_t size, bool * 
     ggml_cuda_host_mapping & m = mappings[buffer];
     m = {};
     m.size = size;
+    ggml_cuda_host_mapping_index()[(uintptr_t) buffer] = (uintptr_t) buffer + size;
     m.dev_ptr[device] = dev_ptr;
     m.refs = 1;
     *registered = true;
@@ -10983,6 +10991,7 @@ static void * ggml_cuda_host_map_range(int device, void * ptr, size_t size, void
     ggml_cuda_host_mapping & m = mappings[pb];
     m = {};
     m.size = len;
+    ggml_cuda_host_mapping_index()[(uintptr_t) pb] = (uintptr_t) pb + len;
     m.dev_ptr[device] = pb;
     m.refs = 1;
     *base       = pb;
@@ -11038,6 +11047,7 @@ static void ggml_backend_cuda_host_unmap(void * buffer) {
         return;
     }
     mappings.erase(it);
+    ggml_cuda_host_mapping_index().erase((uintptr_t) buffer);
     if (cudaHostUnregister(buffer) != cudaSuccess) {
         (void)cudaGetLastError();
     }
@@ -11981,12 +11991,13 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 // host memory registered by ggml_backend_cuda_host_map (pinned)
 static bool ggml_cuda_host_is_mapped(const void * ptr, size_t size) {
     std::lock_guard<std::mutex> lock(ggml_cuda_host_mappings_mutex());
-    for (const auto & [base, m] : ggml_cuda_host_mappings()) {
-        if ((const char *) ptr >= (const char *) base && (const char *) ptr + size <= (const char *) base + m.size) {
-            return true;
-        }
+    const auto & idx = ggml_cuda_host_mapping_index();
+    auto it = idx.upper_bound((uintptr_t) ptr);
+    if (it == idx.begin()) {
+        return false;
     }
-    return false;
+    --it;
+    return (uintptr_t) ptr + size <= it->second;
 }
 
 // device copies of a copy-only instance (the scheduler copy queue): the kernel, except copy engines on compute capability 10.x where they measured faster (GGML_CUDA_COPY_QUEUE_KERNEL=0/1 overrides)
