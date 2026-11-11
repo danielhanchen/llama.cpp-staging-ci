@@ -3901,7 +3901,11 @@ bool llama_kv_cache_context::get_prev_tokens_ahead(const llama_ubatch & ubatch, 
 // k19-vramlend: see llama-ext.h
 int llama_kv_lazy_mode() {
     const char * e = getenv("LLAMA_KV_LAZY");
+    // (k19-vramlend opt-in variant: unset = off; LLAMA_KV_LAZY=auto = the automatic mode, see llama-ext.h)
     if (e == nullptr || *e == '\0') {
+        return 0;
+    }
+    if (strcmp(e, "auto") == 0) {
         return 2;
     }
     return atoi(e) != 0 ? 1 : 0;

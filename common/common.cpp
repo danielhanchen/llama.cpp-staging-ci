@@ -3927,8 +3927,8 @@ uma_restart:
             const char * e_kv = getenv("LLAMA_KV_LAZY");
             const char * e_fd = getenv("LLAMA_KV_LAZY_FIT_DRAFT");
             // k19-vramlend: unset = auto (on where the fit gave the MoE cache the unbacked KV), LLAMA_KV_LAZY=0 off (the kill switch)
-            const bool lazy_auto = e_kv == nullptr || *e_kv == '\0';
-            const bool lazy_on   = lazy_auto || atoi(e_kv) != 0;
+            const bool lazy_auto = e_kv != nullptr && strcmp(e_kv, "auto") == 0;   // (opt-in variant: LLAMA_KV_LAZY=auto)
+            const bool lazy_on   = lazy_auto || (e_kv != nullptr && atoi(e_kv) != 0);
             const bool draft_on = !params.speculative.draft.fit_off && !params.speculative.draft.fit_on_cpu && (params.speculative.has_dft() ||
                 std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end());
             const bool suspend  = lazy_on && draft_on && !(e_fd != nullptr && atoi(e_fd) != 0);

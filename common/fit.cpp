@@ -8,6 +8,7 @@
 #include "../src/llama-ext.h"
 
 #include <algorithm>
+#include <cstring>
 #include <array>
 #include <cassert>
 #include <cstdlib>
@@ -471,7 +472,7 @@ static void common_params_fit_impl(
     {
         const char * e_kv = getenv("LLAMA_KV_LAZY");
         const char * e_fd = getenv("LLAMA_KV_LAZY_FIT_DRAFT");
-        if (e_kv == nullptr || *e_kv == '\0' || atoi(e_kv) != 0) {   // k19-vramlend: unset = auto (on)
+        if (e_kv != nullptr && (strcmp(e_kv, "auto") == 0 || atoi(e_kv) != 0)) {   // k19-vramlend: LLAMA_KV_LAZY=auto or 1
             const char * v = extra != nullptr && !(e_fd != nullptr && atoi(e_fd) != 0) ? "1" : "0";
 #if defined(_WIN32)
             _putenv_s("LLAMA_KV_LAZY_SUSPEND", v);
@@ -1715,7 +1716,7 @@ static void common_params_fit_impl(
                 static const double kv_lazy_auto_min = getenv("LLAMA_KV_LAZY_AUTO_MIN_FRAC") != nullptr ?
                     std::max(0.0, atof(getenv("LLAMA_KV_LAZY_AUTO_MIN_FRAC"))) : 0.10;
                 const char * e_kvl = getenv("LLAMA_KV_LAZY");
-                const bool   kv_lazy_auto = e_kvl == nullptr || *e_kvl == '\0';
+                const bool   kv_lazy_auto = e_kvl != nullptr && strcmp(e_kvl, "auto") == 0;
                 const size_t kv_lazy_add  = cparams->moe_cache_size > 0 && cparams->moe_cache_size < size_before ?
                     std::min(dmds_cpu_moe[0].mb.kv_lazy, size_before - cparams->moe_cache_size) : 0;
                 const bool   kv_lazy_gate = !kv_lazy_auto || double(kv_lazy_add) >= kv_lazy_auto_min*double(cparams->moe_cache_size);
