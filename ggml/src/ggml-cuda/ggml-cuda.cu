@@ -1872,8 +1872,10 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
 };
 
+// k19-tcgemm: force_f32_out = F16 / BF16 inputs with FP32 accumulation and FP32 output (the dense prompt route below)
 template<ggml_type compute_type>
-static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const bool force_f32_out = false) {
     using traits = batched_mul_mat_traits<compute_type>;
     using cuda_t = typename traits::cuda_type;
 
@@ -2007,6 +2009,9 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
     } else if (compute_type == GGML_TYPE_BF16) {
         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
+    }
+    if (compute_type != GGML_TYPE_F32 && force_f32_out) {
+        prefer_f32_output = true;
     }
 
     if (prefer_f32_output) {
@@ -2192,6 +2197,63 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
             break;
         default:
             GGML_ABORT("fatal error");
+    }
+}
+
+// k19-tcgemm: dense prompt products on tensor cores (see ggml_cuda_mul_mat). 0 = f32 accumulate (F16 in), 1 = k13 F16 accumulate, 2 = BF16 in
+static int ggml_cuda_dense_tc_acc() {
+    static const int acc = [] {
+        const char * e = getenv("GGML_CUDA_DENSE_CUBLAS_ACC");
+        if (e == nullptr || strcmp(e, "f32") == 0) {
+            return 0;
+        }
+        if (strcmp(e, "f16") == 0) {
+            return 1;
+        }
+        if (strcmp(e, "bf16") == 0) {
+            return 2;
+        }
+        GGML_LOG_WARN("%s: unknown GGML_CUDA_DENSE_CUBLAS_ACC=%s, using f32\n", __func__, e);
+        return 0;
+    }();
+    return acc;
+}
+
+static int ggml_cuda_dense_tc_min() {
+    static const int n = getenv("GGML_CUDA_DENSE_CUBLAS_MIN") ? atoi(getenv("GGML_CUDA_DENSE_CUBLAS_MIN")) : 0;
+    return n;
+}
+
+static bool ggml_cuda_dense_tc_route(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, const int cc) {
+    const int n_min = ggml_cuda_dense_tc_min();
+    if (n_min <= 0 || !ggml_is_quantized(src0->type) || src1->ne[1] < n_min || !GGML_CUDA_CC_IS_NVIDIA(cc)) {
+        return false;
+    }
+    // weights only: a non-contiguous quantized view needs a strided dequantizer, which most types lack (test-backend-ops views)
+    if (!ggml_is_contiguously_allocated(src0)) {
+        return false;
+    }
+    if (ggml_cuda_dense_tc_acc() == 1) {
+        return true; // k13 behaviour: whatever ggml_cuda_mul_mat_cublas does for this product
+    }
+    if (ggml_cuda_dense_tc_acc() == 2 && !fast_bf16_hardware_available(cc)) {
+        return false;
+    }
+    return fast_fp16_hardware_available(cc) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) &&
+        ggml_get_to_fp16_cuda(src0->type) != nullptr && ggml_get_to_bf16_cuda(src0->type) != nullptr;
+}
+
+static void ggml_cuda_mul_mat_dense_tc(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    switch (ggml_cuda_dense_tc_acc()) {
+        case 1:
+            ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+            break;
+        case 2:
+            ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_BF16>(ctx, src0, src1, dst, /*force_f32_out =*/ true);
+            break;
+        default:
+            ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(ctx, src0, src1, dst, /*force_f32_out =*/ true);
+            break;
     }
 }
 
@@ -2584,9 +2646,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     // k13-pp: GGML_CUDA_DENSE_CUBLAS_MIN=N (opt-in, 0 = off): quantized dense products of at least N columns are dequantized to FP16 and
     // multiplied by cuBLAS instead of MMQ (Strata's prompt path for dense layers). Other rounding (KLD-gated)
-    static const int dense_cublas_min = getenv("GGML_CUDA_DENSE_CUBLAS_MIN") ? atoi(getenv("GGML_CUDA_DENSE_CUBLAS_MIN")) : 0;
-    if (dense_cublas_min > 0 && ggml_is_quantized(src0->type) && ne11 >= dense_cublas_min && GGML_CUDA_CC_IS_NVIDIA(cc)) {
-        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+    // k19-tcgemm: the route dequantizes the weight into a pool scratch buffer (no second copy kept) and runs a tensor-core GEMM with FP32
+    // accumulation and FP32 output; GGML_CUDA_DENSE_CUBLAS_ACC=f16 restores the k13 FP16-accumulate path, =bf16 uses BF16 inputs
+    if (ggml_cuda_dense_tc_route(src0, src1, dst, cc)) {
+        ggml_cuda_mul_mat_dense_tc(ctx, src0, src1, dst);
         return;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
@@ -9171,7 +9234,8 @@ static void ggml_cuda_src1_memo_plan_products(ggml_backend_cuda_context * ctx, c
         int64_t key[ggml_cuda_src1_memo::n_key] = {};
         size_t  nbytes = 0;
         if (ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_NVFP4 && src0->type != GGML_TYPE_MXFP4 &&
-                ne11 > MMVQ_MAX_BATCH_SIZE && ggml_cuda_should_use_mmq(src0->type, cc, ne11, 0)) {
+                ne11 > MMVQ_MAX_BATCH_SIZE && ggml_cuda_should_use_mmq(src0->type, cc, ne11, 0) &&
+                !ggml_cuda_dense_tc_route(src0, src1, node, cc)) { // k19-tcgemm: that product converts src1 itself
             const mmq_q8_1_ds_layout layout = mmq_get_q8_1_ds_layout(src0->type);
             if (layout != MMQ_Q8_1_DS_LAYOUT_D4 && layout != MMQ_Q8_1_DS_LAYOUT_DS4) {
                 continue;
