@@ -366,7 +366,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             test-shared-noise
             NAME test-shared-noise-${SN_SUFFIX}
             LABEL main
-            ARGS "${MODEL_DIR}/llama-dense.gguf" 8000
+            ARGS "${MODEL_DIR}/qwen3tts-dense.gguf" 8000   # the generated model with a vocab of at least 1000 tokens (3072)
         )
         set_tests_properties(test-shared-noise-${SN_SUFFIX} PROPERTIES FIXTURES_REQUIRED generate-models ENVIRONMENT "${SN_ENV}")
     endforeach()
