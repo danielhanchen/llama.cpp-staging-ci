@@ -5335,6 +5335,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         LLAMA_LOG_INFO("%s: tail debug batch (%u tokens, %u outputs, ctx %p):%s\n", __func__, n_tokens_all, n_outputs_all, (void *) this, t.c_str());
     }
 
+    // k19-ptres (LLAMA_MOE_CORE=1): at a new request the core is checked and the routing profile written (llama_moe_cache::core_request)
+    if (moe_cache && moe_cache->core_wanted()) {
+        bool fresh = true;
+        for (const auto & tok : batch_inp.tokens) {
+            for (auto seq_id : tok.seq_ids) {
+                fresh = fresh && memory->seq_pos_max(seq_id) < 0;
+            }
+        }
+        if (fresh) {
+            moe_cache->core_request();
+        }
+    }
+
     // hybrid MoE cache with a fixed share: a new request (every sequence of the batch is empty) starts from an empty cache
     if (moe_cache && moe_cache->hybrid_fixed()) {
         bool fresh = true;

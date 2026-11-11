@@ -2523,6 +2523,10 @@ struct llama_moe_cache::impl {
         };
         std::sort(out_res.begin(), out_res.end(), by_heat);
         std::sort(out_rest.begin(), out_rest.end(), by_heat);
+        // k19-ptres: a request boundary early in a launch (few experts used yet) keeps the profile of the earlier launch
+        if (quiet && out_res.size() + out_rest.size() < (size_t) std::max<int64_t>(1, (int64_t) profile.size()/2)) {
+            return;
+        }
         const std::string tmp = profile_save_file + ".tmp";
         FILE * f = fopen(tmp.c_str(), "w");
         if (f == nullptr) {
@@ -10959,8 +10963,15 @@ double llama_moe_cache::cache_frac() const {
 }
 
 void llama_moe_cache::hybrid_reset() {
-    pimpl->core_request();
     pimpl->hybrid_reset();
+}
+
+bool llama_moe_cache::core_wanted() const {
+    return pimpl->core_mode != 0;
+}
+
+void llama_moe_cache::core_request() {
+    pimpl->core_request();
 }
 
 size_t llama_moe_cache::core_dropped_bytes() const {

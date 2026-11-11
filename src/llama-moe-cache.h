@@ -187,10 +187,12 @@ public:
     bool hybrid_fixed() const;
     // k13-small: the cached share of the host experts' bytes (-1 before the slots are sized)
     double cache_frac() const;
-    // (also k19-ptres: checks the core and writes the routing profile at each new request)
     void hybrid_reset();
     // k19-ptres (LLAMA_MOE_CORE=1): bytes of the core experts' host copies left out of the registration and dropped from the page cache
     size_t core_dropped_bytes() const;
+    // k19-ptres: LLAMA_MOE_CORE is set; core_request at each new request: checks the core and writes the routing profile
+    bool core_wanted() const;
+    void core_request();
 
     // auto mode: before the graph of each ubatch while the trial runs, after the previous ubatch finished (backends synchronized);
     // switches between the plain and the hybrid path, then keeps the faster one (see hybrid_active)
