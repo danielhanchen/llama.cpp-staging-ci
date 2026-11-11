@@ -3871,8 +3871,10 @@ uma_restart:
                 const common_params_fit_status st3 = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(), tbo.empty() ? nullptr : tbo.data(),
                     mg.data(), params.fit_params_min_ctx, nullptr, fit_log_level, params.fit_kv_resident);
                 const int64_t gain_wo = common_fit_moe_margin_gain();
+                // (k19-vramlend: without the unbacked KV a lazy grant added to the cache of the trial, so the keep / drop decision is the
+                // one of LLAMA_KV_LAZY=0)
                 const int64_t c_wo    = st3 == COMMON_PARAMS_FIT_STATUS_SUCCESS && cp.moe_cache_size < COMMON_MOE_CACHE_AUTO_BYTES ?
-                    (int64_t) cp.moe_cache_size + gain_wo : -1;
+                    (int64_t) (cp.moe_cache_size - std::min(cp.moe_cache_size, common_fit_kv_lazy_grant(cp.moe_cache_size))) + gain_wo : -1;
                 const bool drop = st3 == COMMON_PARAMS_FIT_STATUS_SUCCESS && mp.n_gpu_layers == llama_model_default_params().n_gpu_layers &&
                     c_wo >= c_with + gain_mib*mib && c_wo >= 2*c_with;
                 if (drop) {
