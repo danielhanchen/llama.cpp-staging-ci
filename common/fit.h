@@ -82,6 +82,9 @@ bool    common_fit_place8_mid();
 int64_t common_fit_small_reserve_plan(int64_t cache_mib, int64_t reserve_mib, int64_t floor_mib);
 int64_t common_fit_small_reserve_mib(int64_t cache_mib);
 
+// k17-small (lazy KV): the bytes a fit added to a MoE cache of this final size for the KV cells not backed at load (0: none)
+size_t  common_fit_kv_lazy_grant(size_t moe_cache_size);
+
 // print estimated memory to stdout
 void common_fit_print(
                          const char * path_model,

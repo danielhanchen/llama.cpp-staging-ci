@@ -407,6 +407,28 @@ static void tiny_rel_sig(int sig) {
 #endif
 #define TINY_TRACE(...) do { if (tiny_rel_trace()) { LLAMA_LOG_INFO(__VA_ARGS__); } } while (0)
 
+// k17-small (lazy KV step 2): the KV caches of a memory module (the attention caches of a hybrid or iSWA memory)
+static std::vector<llama_kv_cache *> llama_memory_kv_caches(llama_memory_i * mem) {
+    std::vector<llama_kv_cache *> res;
+    auto add_iswa = [&](llama_kv_cache_iswa * m) {
+        if (m != nullptr) {
+            res.push_back(m->get_base());
+            res.push_back(m->get_swa());
+        }
+    };
+    if (auto * m = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        add_iswa(m->get_mem_attn());
+    } else if (auto * m = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        res.push_back(m->get_mem_attn());
+    } else if (auto * m = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        add_iswa(m);
+    } else if (auto * m = dynamic_cast<llama_kv_cache *>(mem)) {
+        res.push_back(m);
+    }
+    res.erase(std::remove(res.begin(), res.end(), nullptr), res.end());
+    return res;
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -1036,6 +1058,52 @@ llama_context::llama_context(
         }
         if (moe_cache) {
             moe_cache->prompt_inplace_block(lm_enabled); // k15-lfm2: layer-major seeds read the staging copies
+        }
+        // k17-small (lazy KV step 2): a lazy KV cache (LLAMA_KV_LAZY=1) backs its cells as they grow, and the MoE cache gives the memory
+        // for them back (llama_moe_cache::shrink). Its floor is what it holds now less the KV bytes not backed yet: the fit gave it those
+        // bytes on top of the size it fitted beside the full-context KV (common_fit), so at the floor every cell fits
+        // k19-vramlend: a lazy KV cache of the automatic mode (LLAMA_KV_LAZY unset, the fit's grant) whose memory no MoE cache can give
+        // back (no cache, e.g. a refit without one, or banks that are not lazy) is backed whole now, as with LLAMA_KV_LAZY=0
+        if (memory && !model.hparams.no_alloc && llama_kv_lazy_mode() == 2) {
+            for (llama_kv_cache * kv : llama_memory_kv_caches(memory.get())) {
+                if (!kv->lazy_on()) {
+                    continue;
+                }
+                bool ok = moe_cache != nullptr;
+                for (const auto & [buft, bytes] : kv->lazy_unbacked()) {
+                    ok = ok && moe_cache->can_shrink(ggml_backend_buft_get_device(buft));
+                }
+                if (!ok) {
+                    if (!kv->lazy_ensure(kv->get_size())) {
+                        throw std::runtime_error("lazy KV: no device memory to back the KV cache whole");
+                    }
+                    LLAMA_LOG_INFO("%s: lazy KV: no MoE cache gives memory back here, the KV cache is backed whole (LLAMA_KV_LAZY=0 at load)\n", __func__);
+                }
+            }
+        }
+        if (moe_cache && memory && !model.hparams.no_alloc) {
+            std::map<ggml_backend_dev_t, size_t> unbacked;
+            for (llama_kv_cache * kv : llama_memory_kv_caches(memory.get())) {
+                if (!kv->lazy_on()) {
+                    continue;
+                }
+                llama_moe_cache * mc = moe_cache.get();
+                kv->lazy_set_shrink([mc](ggml_backend_dev_t dev, size_t bytes) { return mc->shrink(dev, bytes); });
+                for (const auto & [buft, bytes] : kv->lazy_unbacked()) {
+                    unbacked[ggml_backend_buft_get_device(buft)] += bytes;
+                }
+            }
+            for (const auto & [dev, bytes] : unbacked) {
+                if (dev == nullptr) {
+                    continue;
+                }
+                const size_t held  = moe_cache->slot_bytes(dev);
+                const size_t floor = held - std::min(held, bytes);
+                moe_cache->set_shrink_floor(dev, floor);
+                LLAMA_LOG_INFO("%s: lazy KV: %.2f MiB of KV cells not backed yet on %s, the MoE cache (%.2f MiB of slots) gives them back as "
+                    "they grow, down to %.2f MiB (LLAMA_MOE_CACHE_SHRINK=0 to disable)\n", __func__, bytes/1048576.0, ggml_backend_dev_name(dev),
+                    held/1048576.0, floor/1048576.0);
+            }
         }
         if (lm_enabled && !model.hparams.no_alloc) {
             LLAMA_LOG_INFO("%s: MoE cache: layer-major prompts%s, up to %d ubatches of %u tokens per graph (LLAMA_MOE_LAYER_MAJOR_UB_MAX; "
@@ -4326,6 +4394,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+    // k17-small (lazy KV step 2): the MoE cache retired slots for the KV cache (llama_moe_cache::shrink): the graphs built before read the
+    // old slot counts, they are built again
+    if (moe_cache && moe_cache->take_graphs_stale()) {
+        gf_res_prev_active = nullptr; gf_res_epoch++;
+    }
 
     // hybrid MoE cache: the fetch share is measured with the threads of the small batches, before their first graph is built
     // (CPU misses: at the first ubatch of any size, with the decode threads, so that the first prompt can use the host path)
@@ -6759,8 +6832,10 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     static const bool   lm_rel_split      = getenv("LLAMA_MOE_LM_RELEASE_SPLIT") == nullptr || atoi(getenv("LLAMA_MOE_LM_RELEASE_SPLIT")) != 0;
     static const double lm_rel_split_frac = getenv("LLAMA_MOE_LM_RELEASE_SPLIT_FRAC") ? std::max(0.0, atof(getenv("LLAMA_MOE_LM_RELEASE_SPLIT_FRAC"))) : 0.10;
     static const size_t lm_rel_grow_max   = (size_t) (getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB") ? std::max(0, atoi(getenv("LLAMA_MOE_LAYER_MAJOR_GROW_MIB"))) : 1024) << 20;
-    const double lm_cf   = moe_cache->cache_frac();
     // k19-placemid: the graphs are reserved at the decode size (LLAMA_MOE_PLACE8_MID), a merged group never fits beside the banks
+    // (k17-small, lazy KV step 2: the share of the cache's own slots, its shrink floor; the slots above it are the KV cache's and the
+    // placement of the prompt is that of the cache the fit sized beside the full-context KV)
+    const double lm_cf   = moe_cache->release_frac();
     bool         lm_tiny = lm_tiny_cache(lm_cf) || place8_rel;
     if (lm_release_env && lm_rel_split && !lm_tiny && gm != nullptr && group.size() >= 2 && lm_cf >= 0.0 && lm_cf < lm_rel_split_frac) {
         // k19 (LLAMA_MOE_LM_MEASURE_RESTORE=0 off): the measure allocates the merged graph when it fits, which sets the data of its
@@ -11412,6 +11487,12 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     if (memory) {
         for (const auto & [buft, size] : memory->memory_breakdown()) {
             ret[buft].context += size;
+        }
+        // k17-small (lazy KV step 2): the KV bytes a lazy KV cache leaves unbacked (of a measurement: at load)
+        for (llama_kv_cache * kv : llama_memory_kv_caches(memory.get())) {
+            for (const auto & [buft, size] : kv->lazy_unbacked()) {
+                ret[buft].kv_lazy += size;
+            }
         }
     }
     if (moe_cache) {

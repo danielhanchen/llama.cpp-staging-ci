@@ -187,6 +187,9 @@ public:
     bool hybrid_fixed() const;
     // k13-small: the cached share of the host experts' bytes (-1 before the slots are sized)
     double cache_frac() const;
+    // k17-small (lazy KV step 2): cache_frac of the slots the cache keeps for itself, its shrink floor (the rest is the KV cache's,
+    // see shrink): what the bank release of a layer-major prompt group is decided on (cache_frac where no floor is set)
+    double release_frac() const;
     void hybrid_reset();
 
     // auto mode: before the graph of each ubatch while the trial runs, after the previous ubatch finished (backends synchronized);
@@ -247,6 +250,18 @@ public:
     // k19-place8: a restore whose banks do not allocate leaves them released (released() stays true) instead of aborting
     void set_restore_soft(bool on);
     bool released() const;
+    // k17-small (lazy KV step 2, LLAMA_KV_LAZY=1, LLAMA_MOE_CACHE_SHRINK=0 off): give back at least bytes of the device memory of dev to a
+    // KV cache that grows by retiring tail slots for good (down to the floor set_shrink_floor sets); returns the bytes freed (0: none,
+    // e.g. no lazy banks, no floor set, at the floor, banks released). Between batches only (no graph of this cache may be pending)
+    size_t shrink(ggml_backend_dev_t dev, size_t bytes);
+    // k19-vramlend: whether shrink can give memory back on dev (lazy banks there)
+    bool can_shrink(ggml_backend_dev_t dev) const;
+    // the bytes of slots shrink keeps on dev (not set: nothing is retired)
+    void set_shrink_floor(ggml_backend_dev_t dev, size_t bytes);
+    // the bytes of the slots the cache holds on dev now
+    size_t slot_bytes(ggml_backend_dev_t dev) const;
+    // true once after a shrink: the graphs built before it read the old slot counts and must be built again
+    bool take_graphs_stale();
     // the next restore refills the slots with the experts the recorded routing used most (set_refill_counts), as LLAMA_MOE_CACHE_REFILL_ROUTED=1
     void set_refill_routed_once(bool on);
     // the cache lends slots on some device (decided by the first large graph)

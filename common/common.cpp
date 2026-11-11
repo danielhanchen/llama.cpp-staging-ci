@@ -3871,8 +3871,10 @@ uma_restart:
                 const common_params_fit_status st3 = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(), tbo.empty() ? nullptr : tbo.data(),
                     mg.data(), params.fit_params_min_ctx, nullptr, fit_log_level, params.fit_kv_resident);
                 const int64_t gain_wo = common_fit_moe_margin_gain();
+                // (k19-vramlend: without the unbacked KV a lazy grant added to the cache of the trial, so the keep / drop decision is the
+                // one of LLAMA_KV_LAZY=0)
                 const int64_t c_wo    = st3 == COMMON_PARAMS_FIT_STATUS_SUCCESS && cp.moe_cache_size < COMMON_MOE_CACHE_AUTO_BYTES ?
-                    (int64_t) cp.moe_cache_size + gain_wo : -1;
+                    (int64_t) (cp.moe_cache_size - std::min(cp.moe_cache_size, common_fit_kv_lazy_grant(cp.moe_cache_size))) + gain_wo : -1;
                 const bool drop = st3 == COMMON_PARAMS_FIT_STATUS_SUCCESS && mp.n_gpu_layers == llama_model_default_params().n_gpu_layers &&
                     c_wo >= c_with + gain_mib*mib && c_wo >= 2*c_with;
                 if (drop) {
@@ -3916,6 +3918,40 @@ uma_restart:
             cparams.moe_cache_size = 0;
         } else if (moe_cache_auto) {
             COM_INF("%s: --moe-cache-mib auto: MoE cache %zu MiB\n", __func__, cparams.moe_cache_size/(1024*1024));
+        }
+        // k17-small (lazy KV): where the fit keeps a drafter (a draft model or the MTP heads) the KV cache is backed whole at load and the
+        // MoE cache keeps its floor (common_fit does not give it the unbacked KV beside a drafter): G4 q4x 4 GB 16k + MTP ran out of memory
+        // at the first request 3/3 with the bigger cache, q3m 16k + MTP was 5-17% slower. Without a drafter (none asked, or dropped by the
+        // fit) lazy KV stays on. LLAMA_KV_LAZY_FIT_DRAFT=1 keeps it on beside a drafter
+        {
+            const char * e_kv = getenv("LLAMA_KV_LAZY");
+            const char * e_fd = getenv("LLAMA_KV_LAZY_FIT_DRAFT");
+            // k19-vramlend: unset = auto (on where the fit gave the MoE cache the unbacked KV), LLAMA_KV_LAZY=0 off (the kill switch)
+            const bool lazy_auto = e_kv != nullptr && strcmp(e_kv, "auto") == 0;   // (opt-in variant: LLAMA_KV_LAZY=auto)
+            const bool lazy_on   = lazy_auto || (e_kv != nullptr && atoi(e_kv) != 0);
+            const bool draft_on = !params.speculative.draft.fit_off && !params.speculative.draft.fit_on_cpu && (params.speculative.has_dft() ||
+                std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end());
+            const bool suspend  = lazy_on && draft_on && !(e_fd != nullptr && atoi(e_fd) != 0);
+            common_set_env("LLAMA_KV_LAZY_SUSPEND", suspend ? "1" : "0");
+            if (suspend) {
+                // the whole KV is backed now: a cache the fit raised by the unbacked KV (a fit that ran without the drafter) gives it back
+                const size_t grant = common_fit_kv_lazy_grant(cparams.moe_cache_size);
+                if (grant > 0 && cparams.moe_cache_size > grant) {
+                    cparams.moe_cache_size -= grant;
+                }
+                COM_INF("%s: lazy KV: a drafter is kept, the KV cache is backed whole at load, MoE cache %zu MiB (%zu MiB of unbacked KV "
+                    "given back; LLAMA_KV_LAZY_FIT_DRAFT=1 keeps lazy KV)\n", __func__, cparams.moe_cache_size/(1024*1024), grant/(1024*1024));
+            }
+            // k19-vramlend: the automatic mode backs the KV lazily only where this fit gave the MoE cache the KV it leaves unbacked (the
+            // cache gives it back as the context grows); elsewhere (no MoE cache, several devices, a fit that granted nothing) the KV cache
+            // is backed whole at load as with LLAMA_KV_LAZY=0
+            const size_t grant_now = suspend || !lazy_on ? 0 : common_fit_kv_lazy_grant(cparams.moe_cache_size);
+            common_set_env("LLAMA_KV_LAZY_GRANTED", grant_now > 0 ? "1" : "0");
+            if (grant_now > 0) {
+                COM_INF("%s: lazy KV %s: the KV cache backs the cells in use, the MoE cache (%zu MiB) holds the %zu MiB of KV cells not backed "
+                    "yet and gives them back as the context grows (LLAMA_KV_LAZY=0 to disable)\n", __func__, lazy_auto ? "on (auto)" : "on",
+                    cparams.moe_cache_size/(1024*1024), grant_now/(1024*1024));
+            }
         }
 
         // the fit may have reduced the MoE cache (it gets the memory left after the layers), the load mode below follows the fitted size

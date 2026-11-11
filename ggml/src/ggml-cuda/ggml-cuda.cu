@@ -910,6 +910,15 @@ struct ggml_backend_cuda_buffer_context {
 #if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     CUmemGenericAllocationHandle vmm_handle = 0;
 #endif
+    // k17-small (lazy KV): a buffer whose address range is reserved whole and backed with device memory chunk by chunk on request
+    // (ggml_backend_cuda_buffer_commit), so its tensors keep one base pointer (kernels and CUDA graphs see the same addresses) while only
+    // the part in use takes memory. lazy_size = the reserved size; chunks = one physical allocation per granularity-aligned chunk
+    bool   lazy      = false;
+    size_t lazy_size = 0;
+    size_t lazy_gran = 0;
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    std::vector<CUmemGenericAllocationHandle> chunks;   // 0 = not backed
+#endif
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -932,7 +941,23 @@ struct ggml_backend_cuda_buffer_context {
             return;
         }
 #endif
-        ggml_cuda_device_free(dev_ptr);
+        if (!lazy) {
+            ggml_cuda_device_free(dev_ptr);
+            return;
+        }
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        ggml_cuda_set_device(device);
+        int64_t freed = 0;
+        for (size_t i = 0; i < chunks.size(); ++i) {
+            if (chunks[i] != 0) {
+                CU_CHECK(cuMemUnmap((CUdeviceptr) dev_ptr + i*lazy_gran, lazy_gran));
+                CU_CHECK(cuMemRelease(chunks[i]));
+                freed += (int64_t) lazy_gran;
+            }
+        }
+        ggml_cuda_own_add(device, -freed);
+        CU_CHECK(cuMemAddressFree((CUdeviceptr) dev_ptr, lazy_size));
+#endif
     }
 };
 
@@ -1100,7 +1125,18 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
+    if (ctx->lazy) {
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        // only the backed chunks (a chunk is cleared when it is backed, see ggml_backend_cuda_buffer_commit)
+        for (size_t i = 0; i < ctx->chunks.size(); ++i) {
+            if (ctx->chunks[i] != 0) {
+                CUDA_CHECK(cudaMemsetAsync((char *) ctx->dev_ptr + i*ctx->lazy_gran, value, ctx->lazy_gran, cudaStreamPerThread));
+            }
+        }
+#endif
+    } else {
+        CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
+    }
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -1223,6 +1259,163 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     }
 
     return &ggml_backend_cuda_buffer_types[device];
+}
+
+// k17-small (lazy KV): a CUDA buffer of `size` bytes whose address range is reserved but not backed (nullptr without VMM support or if the
+// reservation fails). Its buffer type is the device's CUDA buffer type, so it is a CUDA buffer for every other purpose. Memory is backed
+// with ggml_backend_cuda_buffer_commit before a range is used; the backed bytes count as this process's own (GGML_CUDA_FAKE_FREE_MIB)
+static ggml_backend_buffer_t ggml_backend_cuda_buffer_alloc_lazy(ggml_backend_buffer_type_t buft, size_t size) {
+    if (buft == nullptr || !ggml_backend_buft_is_cuda(buft)) {
+        return nullptr;
+    }
+    const int device = ((ggml_backend_cuda_buffer_type_context *) buft->context)->device;
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count() || !ggml_cuda_info().devices[device].vmm || size == 0) {
+        return nullptr;
+    }
+    ggml_cuda_set_device(device);
+    const size_t gran = ggml_cuda_info().devices[device].vmm_granularity;
+    const size_t res  = gran * ((size + gran - 1) / gran);
+    CUdeviceptr  addr = 0;
+    if (cuMemAddressReserve(&addr, res, 0, 0, 0) != CUDA_SUCCESS) {
+        return nullptr;
+    }
+    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(device, (void *) addr);
+    ctx->lazy      = true;
+    ctx->lazy_size = res;
+    ctx->lazy_gran = gran;
+    ctx->chunks.assign(res / gran, 0);
+    return ggml_backend_buffer_init(ggml_backend_cuda_buffer_type(device), ggml_backend_cuda_buffer_interface, ctx, size);
+#else
+    GGML_UNUSED(device);
+    GGML_UNUSED(size);
+    return nullptr;
+#endif
+}
+
+// back [offset, offset + size) of a lazy buffer with device memory (whole chunks, newly backed chunks cleared to 0). Returns false if the
+// device has no memory for it (the chunks backed before the failure stay). A buffer that is not lazy is always backed: true
+static bool ggml_backend_cuda_buffer_commit(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
+        return true;
+    }
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (!ctx->lazy) {
+        return true;
+    }
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (size == 0) {
+        return true;
+    }
+    const size_t c0 = offset / ctx->lazy_gran;
+    const size_t c1 = std::min(ctx->chunks.size(), (offset + size + ctx->lazy_gran - 1) / ctx->lazy_gran);
+    ggml_cuda_set_device(ctx->device);
+    static const bool   fake_strict = getenv("GGML_CUDA_FAKE_FREE_STRICT") != nullptr && atoi(getenv("GGML_CUDA_FAKE_FREE_STRICT")) != 0 &&
+                                      getenv("GGML_CUDA_FAKE_FREE_MIB") != nullptr && atoll(getenv("GGML_CUDA_FAKE_FREE_MIB")) > 0;
+    static const int64_t fake_cap   = fake_strict ? (int64_t) atoll(getenv("GGML_CUDA_FAKE_FREE_MIB")) << 20 : 0;
+    const int physical = ggml_cuda_get_physical_device(ctx->device);
+    for (size_t i = c0; i < c1; ++i) {
+        if (ctx->chunks[i] != 0) {
+            continue;
+        }
+        if (fake_strict) {   // a fake small card refuses past its budget, as a real one would
+            std::lock_guard<std::mutex> lock(ggml_cuda_own_mutex);
+            if (ggml_cuda_own_bytes[ctx->device] + (int64_t) ctx->lazy_gran > fake_cap) {
+                return false;
+            }
+        }
+        CUmemAllocationProp prop = {};
+        prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id   = physical;
+        CUmemGenericAllocationHandle h = 0;
+        if (cuMemCreate(&h, ctx->lazy_gran, &prop, 0) != CUDA_SUCCESS) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        const CUdeviceptr at = (CUdeviceptr) ctx->dev_ptr + i*ctx->lazy_gran;
+        if (cuMemMap(at, ctx->lazy_gran, 0, h, 0) != CUDA_SUCCESS) {
+            CU_CHECK(cuMemRelease(h));
+            return false;
+        }
+        CUmemAccessDesc access = {};
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id   = physical;
+        access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        if (cuMemSetAccess(at, ctx->lazy_gran, &access, 1) != CUDA_SUCCESS) {
+            CU_CHECK(cuMemUnmap(at, ctx->lazy_gran));
+            CU_CHECK(cuMemRelease(h));
+            return false;
+        }
+        ctx->chunks[i] = h;
+        ggml_cuda_own_add(ctx->device, (int64_t) ctx->lazy_gran);
+        CUDA_CHECK(cudaMemsetAsync((void *) at, 0, ctx->lazy_gran, cudaStreamPerThread));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    return true;
+#else
+    GGML_UNUSED(offset);
+    GGML_UNUSED(size);
+    return true;
+#endif
+}
+
+// k17-small (lazy KV step 2): give back the device memory of the chunks that lie wholly inside [offset, offset + size) of a lazy buffer
+// (the address range stays reserved, a later commit backs them again, cleared). Returns the bytes freed (0 for a buffer that is not lazy).
+// The caller makes sure nothing reads or writes that range any more (the device is synchronized here first)
+static size_t ggml_backend_cuda_buffer_decommit(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
+        return 0;
+    }
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (!ctx->lazy || size == 0) {
+        return 0;
+    }
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const size_t c0 = (offset + ctx->lazy_gran - 1) / ctx->lazy_gran;
+    const size_t c1 = std::min(ctx->chunks.size(), (offset + size) / ctx->lazy_gran);
+    if (c0 >= c1) {
+        return 0;
+    }
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    size_t freed = 0;
+    for (size_t i = c0; i < c1; ++i) {
+        if (ctx->chunks[i] == 0) {
+            continue;
+        }
+        const CUdeviceptr at = (CUdeviceptr) ctx->dev_ptr + i*ctx->lazy_gran;
+        CU_CHECK(cuMemUnmap(at, ctx->lazy_gran));
+        CU_CHECK(cuMemRelease(ctx->chunks[i]));
+        ctx->chunks[i] = 0;
+        freed += ctx->lazy_gran;
+    }
+    if (freed > 0) {
+        ggml_cuda_own_add(ctx->device, -(int64_t) freed);
+    }
+    return freed;
+#else
+    GGML_UNUSED(offset);
+    return 0;
+#endif
+}
+
+// the backed bytes of a lazy buffer (its size if it is not lazy)
+static size_t ggml_backend_cuda_buffer_committed(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
+        return buffer != nullptr ? ggml_backend_buffer_get_size(buffer) : 0;
+    }
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (!ctx->lazy) {
+        return ggml_backend_buffer_get_size(buffer);
+    }
+    size_t n = 0;
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    for (auto h : ctx->chunks) {
+        n += h != 0 ? ctx->lazy_gran : 0;
+    }
+#endif
+    return n;
 }
 
 // Communication context for multi-GPU AllReduce during tensor parallelism.
@@ -12328,6 +12521,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_buffer_restore") == 0) {
         return (void *)ggml_backend_cuda_buffer_restore;
+    }
+    if (strcmp(name, "ggml_backend_buffer_alloc_lazy") == 0) {
+        return (void *)ggml_backend_cuda_buffer_alloc_lazy;
+    }
+    if (strcmp(name, "ggml_backend_buffer_commit") == 0) {
+        return (void *)ggml_backend_cuda_buffer_commit;
+    }
+    if (strcmp(name, "ggml_backend_buffer_committed") == 0) {
+        return (void *)ggml_backend_cuda_buffer_committed;
+    }
+    if (strcmp(name, "ggml_backend_buffer_decommit") == 0) {
+        return (void *)ggml_backend_cuda_buffer_decommit;
     }
     if (strcmp(name, "ggml_backend_moe_fetch_overlap_default") == 0) {
         return (void *)ggml_backend_cuda_moe_fetch_overlap_default;
