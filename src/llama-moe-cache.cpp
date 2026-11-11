@@ -2247,7 +2247,8 @@ struct llama_moe_cache::impl {
                         continue;
                     }
                     const uintptr_t page = 4096;
-                    const uintptr_t a = ((uintptr_t) w->data + (uintptr_t) e*w->nb[2] + page - 1) & ~(page - 1);
+                    // (the first 512 bytes stay registered: a copy of the experts before it reads them as padding)
+                    const uintptr_t a = ((uintptr_t) w->data + (uintptr_t) e*w->nb[2] + 512 + page - 1) & ~(page - 1);
                     const uintptr_t b = ((uintptr_t) w->data + (uintptr_t) (e + 1)*w->nb[2]) & ~(page - 1);
                     if (b > a) {
                         core_holes.emplace_back(a, b);
@@ -9611,6 +9612,34 @@ struct llama_moe_cache::impl {
         const group & g = groups[layers[b.il].ig];
         if (ggml_backend_get_device(backend) != ggml_backend_get_device(devices[g.id].backend)) {
             return 0;
+        }
+
+        // k19-ptres: a core expert is always copied from its slot (its host copy is not registered and not in RAM): the core slots never
+        // change, so the host map is right for them even where the device state is newer
+        if (g.lru.n_core > 0) {
+            const int32_t * cs = g.lru.slot_map[b.il];
+            if (cs != nullptr && cs[e] >= 0 && cs[e] < g.lru.n_core) {
+                int64_t n = 1;
+                while (e + n <= last && cs[e + n] == cs[e] + n && cs[e + n] < g.lru.n_core) {
+                    n++;
+                }
+                ggml_tensor * bank = g.banks[b.ip];
+                GGML_ASSERT(bank->nb[2] == dst->nb[2]);
+                if (regions != nullptr) {
+                    regions->push_back({ bank, (size_t) cs[e]*bank->nb[2], dst, (size_t) e*dst->nb[2], (size_t) n*bank->nb[2] });
+                    return n;
+                }
+                ggml_reset(ctx_views.get());
+                ggml_tensor * src_view = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], cs[e]*bank->nb[2]);
+                ggml_tensor * dst_view = ggml_view_3d(ctx_views.get(), dst,  dst->ne[0],  dst->ne[1],  n, dst->nb[1],  dst->nb[2],  e*dst->nb[2]);
+                ggml_backend_view_init(src_view);
+                ggml_backend_view_init(dst_view);
+                ggml_backend_tensor_copy_async(backend, backend, src_view, dst_view);
+                stats_copy.hits  += n;
+                stats_copy.bytes += ggml_nbytes(src_view);
+                stats_copy.calls += 1;
+                return n;
+            }
         }
 
         ua_dbg[0]++;
