@@ -5,6 +5,7 @@
 #include "log.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <thread>
 
@@ -172,9 +173,11 @@ void server_queue::worker_loop() {
             if (worker.stop) {
                 return;
             }
+            worker.released = false;
         }
 
         // process tasks while the yield is active
+        bool released = false;
         while (true) {
             bool terminated = false;
             try {
@@ -193,9 +196,24 @@ void server_queue::worker_loop() {
             if (!queue_tasks.empty()) {
                 continue; // a new task arrived in the meantime
             }
+            worker.parked = true;
             condition_tasks.wait(lock, [&]{
-                return worker.stop || !running || !worker.yielding || !queue_tasks.empty();
+                return worker.stop || !running || !worker.yielding || !queue_tasks.empty() || worker.released;
             });
+            worker.parked = false;
+            if (worker.released) {
+                // k19-hostgap: the yield ended while this thread was parked and yield_to_queue() took busy back; the wake-up may
+                // have been meant for another waiter of condition_tasks (the start_loop() thread, a wait_until_no_sleep() caller):
+                // it is passed on
+                worker.released = false;
+                released = true;
+                lock.unlock();
+                condition_tasks.notify_all();
+                break;
+            }
+        }
+        if (released) {
+            continue; // busy was cleared by yield_to_queue(): back to the wait for the next yield (which may have started)
         }
 
         // signal to yield_to_queue() that no more tasks will be processed
@@ -205,6 +223,24 @@ void server_queue::worker_loop() {
         }
         condition_tasks.notify_all();
     }
+}
+
+// k19-hostgap (LLAMA_SERVER_YIELD_FAST=0: off): a yield that ends while the worker is parked (waiting for a task, none in hand) does not
+// wait for the worker to wake and acknowledge (two thread hand-offs on the critical path of every speculative pass step)
+static std::atomic<int64_t> g_yield_fast{0};
+static std::atomic<int64_t> g_yield_total{0};
+
+void server_queue_yield_counts(int64_t & n_fast, int64_t & n_total) {
+    n_fast  = g_yield_fast.load(std::memory_order_relaxed);
+    n_total = g_yield_total.load(std::memory_order_relaxed);
+}
+
+static bool server_yield_fast() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_SERVER_YIELD_FAST");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return v;
 }
 
 void server_queue::worker_stop() {
@@ -225,13 +261,19 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
 
     QUE_DBG("%s", "yielding to queue\n");
 
+    bool kick = false;
     {
         std::unique_lock<std::mutex> lock(mutex_tasks);
         GGML_ASSERT(!worker.busy && "yield_to_queue() cannot be nested");
         worker.busy     = true;
         worker.yielding = true;
+        // k19-hostgap: a worker left parked by the last yield (see below) does not wait on cv: it is woken here if tasks wait
+        kick = worker.parked && !queue_tasks.empty();
     }
     worker.cv.notify_one();
+    if (kick) {
+        condition_tasks.notify_all();
+    }
 
     // run the work on the current thread, so that all ggml compute stays on the same thread
     std::exception_ptr exception;
@@ -246,10 +288,21 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
 
         // the yield is over, wait for the worker to finish its current task
         worker.yielding = false;
-        condition_tasks.notify_all();
-        condition_tasks.wait(lock, [&]{
-            return !worker.busy;
-        });
+        g_yield_total.fetch_add(1, std::memory_order_relaxed);
+        // k19-hostgap: parked = no task in hand and none taken until the lock is released: it is told so and left asleep. Only with
+        // an empty queue: a task queued before this point (e.g. posted right before the yield, while the worker kicked at the
+        // start was not scheduled yet) is processed by the worker before the yield returns, as in the waiting path below; a fast
+        // end with tasks queued left them to the start_loop() thread after the slot code (one server loop later)
+        if (server_yield_fast() && worker.busy && worker.parked && queue_tasks.empty()) {
+            worker.released = true;
+            worker.busy     = false;
+            g_yield_fast.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            condition_tasks.notify_all();
+            condition_tasks.wait(lock, [&]{
+                return !worker.busy;
+            });
+        }
 
         // put the declined tasks back, keeping their order
         while (!queue_tasks_unhandled.empty()) {

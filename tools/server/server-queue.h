@@ -13,6 +13,9 @@
 
 // struct for managing server tasks
 // in most cases, use server_response_reader to post new tasks and retrieve results
+// k19-hostgap: yields ended so far, and how many of them ended without waiting for the worker (LLAMA_SERVER_YIELD_FAST)
+void server_queue_yield_counts(int64_t & n_fast, int64_t & n_total);
+
 struct server_queue {
 private:
     int id = 0;
@@ -39,6 +42,11 @@ private:
         bool stop     = false;
         bool busy     = false; // set by yield_to_queue(), cleared by the worker once it is done processing tasks
         bool yielding = false; // work() is still running on the start_loop() thread
+        // k19-hostgap (LLAMA_SERVER_YIELD_FAST, default 1): the worker waits for tasks on condition_tasks with nothing in hand
+        // (parked); a yield that ends while it is parked takes busy back without waking it (released): it sleeps on and, when
+        // something wakes it, returns to the wait on cv without processing a task
+        bool parked   = false;
+        bool released = false;
     };
     worker_t worker;
 

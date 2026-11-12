@@ -1212,6 +1212,13 @@ struct server_slot {
     }
 
     void print_timings() const {
+        {
+            // k19-hostgap: engagement of the task-queue yield's fast end (LLAMA_SERVER_YIELD_FAST=0: off), counts since start
+            int64_t n_fast = 0, n_total = 0;
+            server_queue_yield_counts(n_fast, n_total);
+            SLT_INF(*this, "k19-hostgap: %" PRId64 " of %" PRId64 " task-queue yields ended without waiting for the worker (LLAMA_SERVER_YIELD_FAST=0 off)\n",
+                    n_fast, n_total);
+        }
         if (srv_pass_timer().on) {
             const std::string r = srv_pass_timer().report();
             if (!r.empty()) {
