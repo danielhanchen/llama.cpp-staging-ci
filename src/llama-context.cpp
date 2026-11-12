@@ -5712,7 +5712,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // width 8k 264.9 -> 292.7 tok/s; at a fixed width the extra masked cells cost nothing there, MTP n2 chat / 8k 306.7 / 255.2 ->
         // 307.8 / 257.2 in fc_r1). Beside a MoE cache (no prewarm there) the 2048-cell step stays: fc_r4 16 / 32 GB were 2-4% slower
         // with 16384 (host input fill beside the host's expert work)
-        mem_idx->set_n_kv_bucket_dev_wide(moe_cache == nullptr);
+        // (k19-bigverify: also beside a MoE cache that holds most of the experts, llama_moe_cache_wide_graphs)
+        mem_idx->set_n_kv_bucket_dev_wide(moe_cache == nullptr || llama_moe_cache_wide_graphs(this));
     }
 
     // k19-placemid (LLAMA_MOE_PLACE8_CHUNK_MAX=N; default 64 on a mid-size device, 0 = off, at 8 GB opt-in): a short prompt of at most N
@@ -12818,6 +12819,33 @@ bool llama_prepare_prompt_plan(llama_context * ctx) {
 
 bool llama_context::moe_freeze_small() {
     return moe_cache != nullptr && moe_cache->freeze_small();
+}
+
+static double llama_moe_cache_wide_graphs_frac() {
+    static const double f = [] {
+        const char * e = getenv("LLAMA_MOE_CACHE_WIDE_GRAPHS_FRAC");
+        return e != nullptr ? atof(e) : 0.6;
+    }();
+    return f;
+}
+
+// k19-bigverify (see llama-ext.h). Colab G4 Qwen3.8-Flash-Next UD-IQ4_XS DFlash2 n6 at a 48 GB cap (70.7% cached), bv_s1g: the first use of
+// each verify width (graph build, eager pass, capture: 24-44 ms against 20 ms for a replayed 7-row window) took 19-21% of a chat
+// request; prewarmed: 224.5 -> 264.5 tok/s, same text. Below the share the 2048-cell step and no prewarm stay (k19-fullcost: 16 GB -20%,
+// the prewarmed 5-row graphs ran the single-graph host path; 16 / 32 GB 2-4% slower with 16384-cell buckets)
+bool llama_moe_cache_wide_graphs(const llama_context * ctx) {
+    if (ctx == nullptr || ctx->get_moe_cache() == nullptr) {
+        return false;
+    }
+    const double f = llama_moe_cache_wide_graphs_frac();
+    const double c = ctx->get_moe_cache()->cache_frac();
+    const bool on = f > 0.0 && c >= f;
+    static std::atomic<bool> logged{false};
+    if (on && !logged.exchange(true)) {
+        LLAMA_LOG_INFO("%s: k19-bigverify: the MoE cache holds %.1f%% of the host experts: verify graphs prewarmed and kept as without a cache "
+            "(device KV buckets of 16384 cells; LLAMA_MOE_CACHE_WIDE_GRAPHS_FRAC=0: off)\n", __func__, 100.0*c);
+    }
+    return on;
 }
 
 bool llama_moe_freeze_small(llama_context * ctx) {

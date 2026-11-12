@@ -14,6 +14,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "gguf.h"
 #include "../../src/llama-ext.h" // staging API: llama_set_verify
 #include "log.h"
 #include "sampling.h"
@@ -94,6 +95,42 @@ static uint64_t tpp_gguf_bytes(const std::string & path) {
     return ec ? 0 : (uint64_t) b;
 }
 
+// k19-bigverify: bytes of the GGUF's per-layer token embedding table (per_layer_token_embd.weight), an input-layer GET_ROWS table that
+// the loader keeps in host memory whatever the device split (Qwen3.8-Flash-Next UD-IQ4_XS: 26.8 GiB of its 87.2 GiB). 0 if absent or
+// unreadable (the caller then counts the whole file, as before)
+static uint64_t tpp_host_input_bytes(const std::string & path) {
+    if (path.empty()) {
+        return 0;
+    }
+    std::vector<std::string> files = { path };
+    int k = 0, n = 0;
+    const size_t at = path.rfind("-of-");
+    if (at != std::string::npos && at >= 6 && path.size() >= at + 4 + 5 + 5 &&
+            sscanf(path.c_str() + at - 5, "%5d-of-%5d.gguf", &k, &n) == 2 && n > 1) {
+        const std::string prefix = path.substr(0, at - 6);
+        files.clear();
+        for (int i = 0; i < n; ++i) {
+            char sp[4096];
+            llama_split_path(sp, sizeof(sp), prefix.c_str(), i, n);
+            files.emplace_back(sp);
+        }
+    }
+    uint64_t sum = 0;
+    for (const std::string & f : files) {
+        struct gguf_init_params gp = { /* .no_alloc = */ true, /* .ctx = */ nullptr };
+        gguf_context * g = gguf_init_from_file(f.c_str(), gp);
+        if (g == nullptr) {
+            return 0;
+        }
+        const int64_t id = gguf_find_tensor(g, "per_layer_token_embd.weight");
+        if (id >= 0) {
+            sum += gguf_get_tensor_size(g, id);
+        }
+        gguf_free(g);
+    }
+    return sum;
+}
+
 // k19-vwidth (LLAMA_SPEC_PREWARM=N: widths 1..N, opt-in): a target with a drafter and no MoE cache decodes, at load, a
 // dummy prompt of LLAMA_SPEC_PREWARM_POS (640) tokens, then windows of every width 1..N, LLAMA_SPEC_PREWARM_REPS (10) times each,
 // appended after it (a 1-row decode as a plain decode, wider ones as verify windows, as the server runs them), then forgets them: each
@@ -124,7 +161,9 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     static const int n_pre = getenv("LLAMA_SPEC_PREWARM_POS")  ? std::max(0, atoi(getenv("LLAMA_SPEC_PREWARM_POS")))  : 640;
     // k19-fullcost (LLAMA_SPEC_PREWARM_CACHED=1, opt-in): beside a MoE cache too; LLAMA_SPEC_PREWARM_WIDTHS="1,3,7" prewarms only those
     // widths (default 1..w_max). LLAMA_SPEC_PREWARM_MEM=1 logs the device's free memory after each width (the graph memory per width)
-    static const bool cached_ok = getenv("LLAMA_SPEC_PREWARM_CACHED") != nullptr && atoi(getenv("LLAMA_SPEC_PREWARM_CACHED")) != 0;
+    // (k19-bigverify: unset, on beside a cache that holds most of the experts, llama_moe_cache_wide_graphs; =0 off there too)
+    const bool cached_ok = getenv("LLAMA_SPEC_PREWARM_CACHED") != nullptr ? atoi(getenv("LLAMA_SPEC_PREWARM_CACHED")) != 0 :
+        llama_moe_cache_wide_graphs(ctx);
     static const bool mem_log   = getenv("LLAMA_SPEC_PREWARM_MEM") != nullptr && atoi(getenv("LLAMA_SPEC_PREWARM_MEM")) != 0;
     std::vector<int> widths;
     if (const char * ew = getenv("LLAMA_SPEC_PREWARM_WIDTHS")) {
@@ -1961,7 +2000,20 @@ private:
                 }
             }
             dev_free += igpu_free;
-            const uint64_t need = mtp_shape ? tpp_gguf_bytes(params.model.path) + tpp_gguf_bytes(sp.draft.mparams.path) + (1536ull << 20) : 0;
+            // k19-bigverify (opt-in, LLAMA_SPEC_TPP_NEED_PLE=0): without tensor overrides the per-layer embedding table never takes device
+            // memory, so it can be left out of the need. Colab A100 80 GB, Qwen3.8-Flash-Next UD-IQ4_XS + MTP drafter: need 94815 MiB with
+            // its 26.8 GiB table against 80725 MiB free keeps the windows at 2 drafts although the fit places every expert on the card and
+            // runs no MoE cache. Left out (bv_abh), k19-tpp + k19-depth's 4-draft windows there: chat 156.1 -> 159.7 tok/s (+2.3%) but 8k
+            // 148.2 -> 120.6 (-18.6%: each verify row costs ~2.9 ms on that card, 4.06 / 3.05 tokens per pass at 25.5 / 25.3 ms). So the
+            // default (unset / 1) still counts the whole file until the deep windows are priced per device
+            const uint64_t tgt_bytes = mtp_shape ? tpp_gguf_bytes(params.model.path) : 0;
+            const uint64_t ple_bytes = mtp_shape && tgt_bytes > 0 && !tpp_host_experts(params.tensor_buft_overrides, params.moe_cache_size, params.moe_cache_auto) &&
+                getenv("LLAMA_SPEC_TPP_NEED_PLE") != nullptr && atoi(getenv("LLAMA_SPEC_TPP_NEED_PLE")) == 0 ? tpp_host_input_bytes(params.model.path) : 0;
+            const uint64_t need = mtp_shape ? tgt_bytes - std::min(ple_bytes, tgt_bytes) + tpp_gguf_bytes(sp.draft.mparams.path) + (1536ull << 20) : 0;
+            if (ple_bytes > 0) {
+                SRV_INF("k19-bigverify: the per-layer embedding table (%.0f MiB) stays in host memory: not counted in the device need of the "
+                    "draft window rule (LLAMA_SPEC_TPP_NEED_PLE=0; unset: counted)\n", ple_bytes/1048576.0);
+            }
             // (no GPU: no MoE cache. LLAMA_SPEC_TPP_FORCE_CACHED=1, a test hook: as if the experts did not fit)
             const char * ce = getenv("LLAMA_SPEC_TPP_CACHED");
             const char * fe = getenv("LLAMA_SPEC_TPP_FORCE_CACHED");

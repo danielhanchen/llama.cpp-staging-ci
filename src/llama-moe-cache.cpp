@@ -6524,6 +6524,7 @@ struct llama_moe_cache::impl {
         return overlap_plain_on() && overlap_small_batch(n_ubatch);
     }
     mutable uint64_t n_ov_plain = 0; // layer graphs built with it (engagement)
+    mutable uint64_t n_ov_plain_wide = 0; // k19-bigverify: of them, windows of 5+ tokens (overlap_plain_wide)
 
     // the layer can use the hybrid lookup for a ubatch of this size; plain (k19-q4xcache): only for the overlap, in place of the plain lookup
     bool hybrid_layer(int32_t il, int64_t n_ubatch, bool * plain = nullptr) const {
@@ -6589,6 +6590,9 @@ struct llama_moe_cache::impl {
         }
         if (plain) {
             ggml_moe_cache_assign_lookup_counts(op);
+            if (n_ubatch > 4) {
+                n_ov_plain_wide++;
+            }
             if (n_ov_plain++ == 0) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: k19-q4xcache: verify windows of %" PRId64 " tokens with the host path off copy their missing "
                     "experts beside the cached ones (LLAMA_MOE_OVERLAP_SMALL_PLAIN=0 off)\n", tag, n_ubatch);
@@ -6958,7 +6962,28 @@ struct llama_moe_cache::impl {
             const char * e = getenv("LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL");
             return e != nullptr ? std::max<int64_t>(1, std::min<int64_t>(GGML_MOE_MAILBOX_MAX_TOKENS, atoll(e))) : (int64_t) 4;
         }();
-        return overlap && n_ubatch > 1 && n_ubatch <= mx;
+        if (!overlap || n_ubatch <= 1) {
+            return false;
+        }
+        return n_ubatch <= mx || overlap_plain_wide(n_ubatch);
+    }
+
+    // k19-bigverify LLAMA_MOE_OVERLAP_PLAIN_MAX=N (default 8, at most GGML_MOE_MAILBOX_MAX_TOKENS; <= 4 = off): verify windows of 5..N tokens
+    // whose host path is off (the plain lookup, k19-q4xcache) take the overlap too: their missing experts are copied on the side stream
+    // beside the cached ones instead of in the compute stream before any expert of the layer. Windows with the host path on keep the 4-token
+    // limit above (DFlash2 7-row windows on the hybrid path: -2.5 / -3.6% at 24 GB, k19-overlap). Same results as the plain lookup (see
+    // overlap_plain_on). Colab G4 Qwen3.8-Flash-Next UD-IQ4_XS DFlash2 n6 at a 48 GB cap (70.7% of the host experts cached, host path off),
+    // bv_s1g: 208.1 -> 224.5 tok/s chat, same text
+    bool overlap_plain_wide(int64_t n_ubatch) const {
+        static const int64_t mxp = [] {
+            const char * e = getenv("LLAMA_MOE_OVERLAP_PLAIN_MAX");
+            return e != nullptr ? std::max<int64_t>(1, std::min<int64_t>(GGML_MOE_MAILBOX_MAX_TOKENS, atoll(e))) : std::min<int64_t>(GGML_MOE_MAILBOX_MAX_TOKENS, 8);
+        }();
+        if (n_ubatch > mxp || !overlap_plain_on() || force_large) {
+            return false;
+        }
+        // the host path is off for this size: what hybrid_assign would treat as the plain lookup
+        return cm ? cm_share_of(n_ubatch) >= 1.0f : !hybrid_active();
     }
 
     // k19-l4c deferred admission (LLAMA_MOE_FETCH_DEFER, default 1; 0 = off, 2 = also on hosts without the host team): a single token
@@ -11322,8 +11347,8 @@ struct llama_moe_cache::impl {
             }
             log("device lookups (ubatch <= 32)", st);
             LLAMA_LOG_INFO("llama_moe_cache%s: k19-q4xcache: %llu layer graphs of 2-%d token windows with the host path off overlapped their "
-                "copies (LLAMA_MOE_OVERLAP_SMALL_PLAIN=%d)\n", tag, (unsigned long long) n_ov_plain, (int) std::max<int64_t>(2,
-                getenv("LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL") ? atoll(getenv("LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL")) : 4), overlap_plain_on() ? 1 : 0);
+                "copies, %llu of them 5+ tokens (k19-bigverify, LLAMA_MOE_OVERLAP_PLAIN_MAX) (LLAMA_MOE_OVERLAP_SMALL_PLAIN=%d)\n", tag,
+                (unsigned long long) n_ov_plain, (int) GGML_MOE_MAILBOX_MAX_TOKENS, (unsigned long long) n_ov_plain_wide, overlap_plain_on() ? 1 : 0);
             if (getenv("LLAMA_MOE_CACHE_ADMIT_MARGIN") != nullptr) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: admission margin %s (+%s): %llu missing experts left to the host instead of replacing a resident\n", tag,
                     getenv("LLAMA_MOE_CACHE_ADMIT_MARGIN"), getenv("LLAMA_MOE_CACHE_ADMIT_ADD") ? getenv("LLAMA_MOE_CACHE_ADMIT_ADD") : "0",
