@@ -1087,7 +1087,10 @@ void launch_fattn(
     const int block_z = 1,
     // k15-mm2: the vector kernel's KV split may be capped (fattn_vec_kv_split_cap): it is a split-K over the KV cells with an f32
     // combine, and the vector kernel accumulates VKQ in f32 on NVIDIA, so a cap only reorders f32 sums
-    const bool vec_kv_cap = false
+    const bool vec_kv_cap = false,
+    // k19-fattnq8: the occupancy (so the parallel / stream-k blocks) of this kernel at this shared memory instead of fattn_kernel's: a
+    // kernel reading quantized K / V in place splits the KV as the f16 kernel of the staged launch does
+    fattn_kernel_t occ_kernel = nullptr, const size_t occ_nbytes_shared = 0
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1279,8 +1282,9 @@ void launch_fattn(
     const dim3 block_dim(warp_size, nwarps, block_z);
     GGML_ASSERT(block_z == 1 || pb_kernel != nullptr);
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, pb_kernel ? pb_kernel : fattn_kernel,
-        pb_kernel ? block_dim.x * block_dim.y : block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+    GGML_ASSERT(occ_kernel == nullptr || pb_kernel == nullptr);
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, pb_kernel ? pb_kernel : (occ_kernel ? occ_kernel : fattn_kernel),
+        pb_kernel ? block_dim.x * block_dim.y : block_dim.x * block_dim.y * block_dim.z, occ_kernel ? occ_nbytes_shared : nbytes_shared));
     GGML_ASSERT(max_blocks_per_sm > 0);
     GGML_ASSERT(pb_kernel == nullptr || !stream_k);
     const int ntiles_dst_pb = pb_kernel ? ntiles_x * ((gqa_ratio + pb_ncols2 - 1) / pb_ncols2) * K->ne[2] * Q->ne[3] : ntiles_dst;
@@ -1334,7 +1338,9 @@ void launch_fattn(
         // tile the same number of blocks) or none, read again by the kernel and the fixup from the live length
         const int nblocks_live = blocks_num.x;
         fixup_kind = (nblocks_live % ntiles_dst == 0 && nblocks_live > ntiles_dst) ? 1 : (ntiles_dst % nblocks_live != 0 ? 2 : 0);
-        dev_ok = !use_sparse && !scan_mask && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 && fixup_kind != 2;
+        // (k19-fattnq8: or K / V read in place by the kernel, need_f16_* false: no conversion that follows the length)
+        dev_ok = !use_sparse && !scan_mask && (K->type == GGML_TYPE_F16 || !need_f16_K) && (V->type == GGML_TYPE_F16 || !need_f16_V) &&
+            fixup_kind != 2;
         if (kvl && kvl->kv_len && !probe) {
             GGML_ASSERT(dev_ok && "a device KV length needs the launch choices the probe found");
             // the grid of the padded length (the block count only grows with the length), the blocks past the live count exit

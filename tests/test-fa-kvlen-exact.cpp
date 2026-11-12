@@ -7,6 +7,7 @@
 // graph of L cells. GGML_CUDA_GRAPH_CAPTURE_LOG counts the captures of the padded graphs: with the device length they follow the
 // launch signature (a few per graph), not the length. Negative control: the padded node without its length must differ somewhere
 // (the dense stream-k split follows the cells). GGML_CUDA_FA_KV_LEN=0 (the kill switch) must pass too, with a capture per length.
+// k19-fattnq8: the same with a q8_0 K / V cache (the MMA kernel reads it in place, so its padded node takes the device length too).
 // No GPU: SKIP, exit 0.
 
 #include "ggml.h"
@@ -97,8 +98,8 @@ static fa_graph build_fa(ggml_backend_t be, const kv_store & st, int64_t n_kv, i
     g.ctx = ggml_init(ip);
     ggml_tensor * q = ggml_view_3d(g.ctx, st.q, D, H, T, st.q->nb[1], st.q->nb[2], 0);
     q = ggml_permute(g.ctx, q, 0, 2, 1, 3); // [D, T, H]
-    ggml_tensor * k = ggml_view_3d(g.ctx, st.k, D, n_kv, HKV, st.k->nb[1], D*ggml_element_size(st.k), 0);
-    ggml_tensor * v = ggml_view_3d(g.ctx, st.v, D, n_kv, HKV, st.v->nb[1], D*ggml_element_size(st.v), 0);
+    ggml_tensor * k = ggml_view_3d(g.ctx, st.k, D, n_kv, HKV, st.k->nb[1], ggml_row_size(st.k->type, D), 0);
+    ggml_tensor * v = ggml_view_3d(g.ctx, st.v, D, n_kv, HKV, st.v->nb[1], ggml_row_size(st.v->type, D), 0);
     g.mask = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F16, n_kv, T);
     ggml_set_input(g.mask);
     g.out = ggml_flash_attn_ext(g.ctx, q, k, v, g.mask, 1.0f/sqrtf((float) D), 0.0f, 0.0f);
@@ -145,24 +146,28 @@ int main(int argc, char ** argv) {
         return 0;
     }
     const bool kill = getenv("GGML_CUDA_FA_KV_LEN") && atoi(getenv("GGML_CUDA_FA_KV_LEN")) == 0;
-
+    bool ok_all = true;
+    for (const ggml_type kv_type : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+    n_captures = 0;
     const int64_t P_max = 16384;
     const int     T_max = 8;
     kv_store st;
     {
         ggml_init_params ip = { 4*ggml_tensor_overhead(), nullptr, true };
         st.ctx = ggml_init(ip);
-        st.k = ggml_new_tensor_2d(st.ctx, GGML_TYPE_F16, D*HKV, P_max);
-        st.v = ggml_new_tensor_2d(st.ctx, GGML_TYPE_F16, D*HKV, P_max);
+        st.k = ggml_new_tensor_2d(st.ctx, kv_type, D*HKV, P_max);
+        st.v = ggml_new_tensor_2d(st.ctx, kv_type, D*HKV, P_max);
         st.q = ggml_new_tensor_3d(st.ctx, GGML_TYPE_F32, D, H, T_max);
         st.buf = ggml_backend_alloc_ctx_tensors(st.ctx, be);
         std::mt19937 rng(1234);
         std::uniform_real_distribution<float> u(-1.0f, 1.0f);
-        std::vector<ggml_fp16_t> kv((size_t) D*HKV*P_max);
-        for (auto & x : kv) { x = ggml_fp32_to_fp16(u(rng)); }
-        ggml_backend_tensor_set(st.k, kv.data(), 0, kv.size()*sizeof(ggml_fp16_t));
-        for (auto & x : kv) { x = ggml_fp32_to_fp16(u(rng)); }
-        ggml_backend_tensor_set(st.v, kv.data(), 0, kv.size()*sizeof(ggml_fp16_t));
+        std::vector<float> kvf((size_t) D*HKV*P_max);
+        std::vector<uint8_t> kvb(ggml_nbytes(st.k));
+        for (ggml_tensor * t : { st.k, st.v }) {
+            for (auto & x : kvf) { x = u(rng); }
+            ggml_quantize_chunk(kv_type, kvf.data(), kvb.data(), 0, P_max, D*HKV, nullptr);
+            ggml_backend_tensor_set(t, kvb.data(), 0, kvb.size());
+        }
         std::vector<float> qv((size_t) D*H*T_max);
         for (auto & x : qv) { x = 4.0f*u(rng); }
         ggml_backend_tensor_set(st.q, qv.data(), 0, qv.size()*sizeof(float));
@@ -226,12 +231,14 @@ int main(int argc, char ** argv) {
             }
         }
     }
-    printf("test-fa-kvlen-exact: %d cases, %d differ; control (padded without the length) differs in %d of %d dense cases%s\n",
-        n_cases, n_bad, n_ctrl_diff, n_ctrl, kill ? " (GGML_CUDA_FA_KV_LEN=0)" : "");
+    printf("test-fa-kvlen-exact: K / V %s: %d cases, %d differ; control (padded without the length) differs in %d of %d dense cases%s\n",
+        ggml_type_name(kv_type), n_cases, n_bad, n_ctrl_diff, n_ctrl, kill ? " (GGML_CUDA_FA_KV_LEN=0)" : "");
     const bool ok = n_bad == 0 && n_ctrl_diff > 0;
-    printf("test-fa-kvlen-exact: %s\n", ok ? "PASS" : "FAIL");
+    ok_all = ok_all && ok;
     ggml_backend_buffer_free(st.buf);
     ggml_free(st.ctx);
+    }
+    printf("test-fa-kvlen-exact: %s\n", ok_all ? "PASS" : "FAIL");
     ggml_backend_free(be);
-    return ok ? 0 : 1;
+    return ok_all ? 0 : 1;
 }
