@@ -195,6 +195,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-server-component.cpp)
     target_include_directories(test-server-component PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-component PRIVATE server-context)
+    # k19-hostgap: the task-queue yield with and without its fast end (LLAMA_SERVER_YIELD_FAST)
+    llama_build(test-server-queue-yield.cpp)
+    target_include_directories(test-server-queue-yield PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-queue-yield PRIVATE server-context)
+    foreach(YF 0 1)
+        llama_test(test-server-queue-yield NAME test-server-queue-yield-fast${YF} LABEL main)
+        set_tests_properties(test-server-queue-yield-fast${YF} PROPERTIES ENVIRONMENT "LLAMA_SERVER_YIELD_FAST=${YF}")
+    endforeach()
     llama_build_and_test(test-server-prompt-ssd.cpp)
     target_include_directories(test-server-prompt-ssd PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-prompt-ssd PRIVATE server-context)
@@ -343,6 +351,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS "${MODEL_DIR}/mtp/qwen35moe-mtp.gguf"
     )
     set_tests_properties(test-mtp-draft-topk PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    # k19-hostgap: KV seq_rm over the used cells (LLAMA_KV_SEQ_RM_USED) leaves tokens, drafts and the memory state unchanged
+    llama_build(test-hostgap-exact.cpp)
+    llama_test(
+        test-hostgap-exact
+        LABEL main
+        ARGS "${MODEL_DIR}/mtp/qwen35moe-mtp.gguf"
+    )
+    set_tests_properties(test-hostgap-exact PROPERTIES FIXTURES_REQUIRED generate-models)
 
     # the greedy fast path of common_sampler_sample samples what the sampler chain samples, in every mode of its env knobs
     llama_build(test-sampling-greedy-fast.cpp)

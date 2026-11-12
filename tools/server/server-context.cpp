@@ -28,6 +28,7 @@
 #include <climits>
 #include <cstddef>
 #include <cinttypes>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -1212,6 +1213,13 @@ struct server_slot {
     }
 
     void print_timings() const {
+        {
+            // k19-hostgap: engagement of the task-queue yield's fast end (LLAMA_SERVER_YIELD_FAST=0: off), counts since start
+            int64_t n_fast = 0, n_total = 0;
+            server_queue_yield_counts(n_fast, n_total);
+            SLT_INF(*this, "k19-hostgap: %" PRId64 " of %" PRId64 " task-queue yields ended without waiting for the worker (LLAMA_SERVER_YIELD_FAST=0 off)\n",
+                    n_fast, n_total);
+        }
         if (srv_pass_timer().on) {
             const std::string r = srv_pass_timer().report();
             if (!r.empty()) {
@@ -5217,7 +5225,23 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        // k19-hostgap (LLAMA_SPEC_PROMPT_INCR=0: a full copy each time, as before): the drafter's copy of the prompt
+                        // is extended by the tokens past its length when it is still a prefix of the slot's tokens (text-only
+                        // slots, where the text tokens are the tokens): the same vector, without copying the whole context every
+                        // pass (8k context on a Colab A100 host: ~17 us per pass, with the GPU idle)
+                        static const bool incr_env = getenv("LLAMA_SPEC_PROMPT_INCR") == nullptr || atoi(getenv("LLAMA_SPEC_PROMPT_INCR")) != 0;
+                        const llama_tokens & cur = slot.prompt.tokens.get_tokens();
+                        auto & sp = slot.spec_prompt;
+                        if (incr_env && !slot.prompt.tokens.has_mtmd && sp.size() <= cur.size() &&
+                                (sp.empty() || memcmp(sp.data(), cur.data(), sp.size()*sizeof(llama_token)) == 0)) {
+                            for (size_t k = sp.size(); k < cur.size(); ++k) {
+                                if (cur[k] != LLAMA_TOKEN_NULL) {
+                                    sp.push_back(cur[k]); // (as get_text_tokens: a prefix that matched holds no null token)
+                                }
+                            }
+                        } else {
+                            sp = slot.prompt.tokens.get_text_tokens();
+                        }
 
                         const bool spec_reject = slot.use_spec_rejection();
 
