@@ -160,7 +160,9 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     static const int n_pre = getenv("LLAMA_SPEC_PREWARM_POS")  ? std::max(0, atoi(getenv("LLAMA_SPEC_PREWARM_POS")))  : 640;
     // k19-fullcost (LLAMA_SPEC_PREWARM_CACHED=1, opt-in): beside a MoE cache too; LLAMA_SPEC_PREWARM_WIDTHS="1,3,7" prewarms only those
     // widths (default 1..w_max). LLAMA_SPEC_PREWARM_MEM=1 logs the device's free memory after each width (the graph memory per width)
-    static const bool cached_ok = getenv("LLAMA_SPEC_PREWARM_CACHED") != nullptr && atoi(getenv("LLAMA_SPEC_PREWARM_CACHED")) != 0;
+    // (k19-bigverify: unset, on beside a cache that holds most of the experts, llama_moe_cache_wide_graphs; =0 off there too)
+    const bool cached_ok = getenv("LLAMA_SPEC_PREWARM_CACHED") != nullptr ? atoi(getenv("LLAMA_SPEC_PREWARM_CACHED")) != 0 :
+        llama_moe_cache_wide_graphs(ctx);
     static const bool mem_log   = getenv("LLAMA_SPEC_PREWARM_MEM") != nullptr && atoi(getenv("LLAMA_SPEC_PREWARM_MEM")) != 0;
     std::vector<int> widths;
     if (const char * ew = getenv("LLAMA_SPEC_PREWARM_WIDTHS")) {
