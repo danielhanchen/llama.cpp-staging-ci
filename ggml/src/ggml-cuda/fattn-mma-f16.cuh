@@ -508,54 +508,80 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
     }
 }
 
-// k19-fattnq8: a K / V tile read from a q8_0 cache in place (or from its raw copy in shared memory, q8_kv 2). KV points at the first q8_0 block of the head's row, stride_KV is the row
-// stride in bytes, D2 the half2 per row (the whole head: q8_0 tiles are never split along D). Each 16 byte chunk of the f16 tile (8 values)
-// comes from 8 quants of one block and its scale: f16(q) * d in one f16 multiply, the value the staging conversion writes (convert.cu
-// dequantize_block_q8_0_f16: __hmul2 of exact f16 operands, rounded once), so the tile holds the bits the f16 kernel reads from the
-// staged copy. Same rows, zero rows and swizzled layout as flash_attn_ext_f16_load_tile; the blocks are 2 byte aligned (34 bytes), so
-// the quants are read as 16 bit words.
+// k19-fattnq8: a K / V tile read from a q8_0 cache in place (or from its raw rows in shared memory, q8_kv 2). KV points at the first
+// q8_0 block of the head's row, stride_KV is the row stride in bytes, D2 the half2 per row (the whole head: q8_0 tiles are never split
+// along D). Each thread takes a pair of blocks (68 bytes = 17 aligned 32 bit words: rows start 4 byte aligned) and writes their 64
+// values as 8 chunks of 16 bytes into the f16 tile, in the swizzled layout of flash_attn_ext_f16_load_tile (zeros for skipped rows).
+// The value is f16(q) * d in one f16 multiply, the staging conversion's (convert.cu dequantize_block_q8_0_f16: __hmul2 of exact f16
+// operands, rounded once): f16(q) is built exactly as (1024 + (q ^ 0x80)) - 1152, so the tile holds the bits the f16 kernel reads
+// from the staged copy.
 template<int stride_tile, int nwarps, int nbatch_fa, int D2, bool oob_check, bool use_sparse>
 static __device__ __forceinline__ void flash_attn_ext_q8_load_tile(
         const char * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int stride_KV,
         const int k_VKQ_0, const int i_sup, const int32_t * const __restrict__ indices) {
-    constexpr int warp_size      = ggml_cuda_get_physical_warp_size();
-    constexpr int chunks_per_row = D2/4; // 4 half2 = 8 values = 16 bytes per chunk, 4 chunks per q8_0 block
-    constexpr int nchunks        = nbatch_fa*chunks_per_row;
-    static_assert(D2 % (QK8_0/2) == 0, "q8_0 rows must hold whole blocks");
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    static_assert(D2 % QK8_0 == 0, "q8_0 rows must hold whole pairs of blocks");
+    constexpr int npair = D2/QK8_0; // pairs of q8_0 blocks per row (64 values each)
+    constexpr int ntot  = nbatch_fa*npair;
+    constexpr int nthr  = nwarps*warp_size;
+    const half2 off = make_half2(1152.0f, 1152.0f);
 #pragma unroll
-    for (int ic0 = 0; ic0 < nchunks; ic0 += nwarps*warp_size) {
-        const int ic = ic0 + threadIdx.y*warp_size + threadIdx.x;
-        if (nchunks % (nwarps*warp_size) != 0 && ic >= nchunks) {
+    for (int ip0 = 0; ip0 < ntot; ip0 += nthr) {
+        const int ip = ip0 + threadIdx.y*warp_size + threadIdx.x;
+        if (ntot % nthr != 0 && ip >= ntot) {
             break;
         }
-        const int i = ic / chunks_per_row;
-        const int k = ic % chunks_per_row;
+        const int i = ip / npair;
+        const int p = ip % npair;
 
         int64_t row;
         bool    zero;
         if constexpr (use_sparse) {
             const int32_t index = i < i_sup ? indices[k_VKQ_0 + i] : -1;
             zero = index < 0;
-            row  = index;
+            row  = zero ? 0 : index;
         } else {
             zero = oob_check && i >= i_sup;
-            row  = k_VKQ_0 + i;
+            row  = zero ? 0 : k_VKQ_0 + i;
         }
 
-        int v[4] = {0, 0, 0, 0}; // the 4 half2 of the chunk, f16 zeros for a skipped row
+        uint32_t w[17];
         if (!zero) {
-            const char     * blk = KV + row*stride_KV + (k/4)*int(sizeof(block_q8_0));
-            const half2      d2  = __half2half2(*(const half *) blk);
-            const uint16_t * q16 = (const uint16_t *) (blk + sizeof(half) + (k%4)*8);
+            const uint32_t * src = (const uint32_t *) (KV + row*stride_KV + p*int(2*sizeof(block_q8_0)));
 #pragma unroll
-            for (int l = 0; l < 4; ++l) {
-                const uint16_t q  = q16[l];
-                const half2    qh = make_half2(__int2half_rn((int8_t) (q & 0xFF)), __int2half_rn((int8_t) (q >> 8)));
-                const half2    r  = __hmul2(qh, d2);
-                v[l] = *(const int *) &r;
+            for (int l = 0; l < 17; ++l) {
+                w[l] = src[l];
+            }
+        } else {
+#pragma unroll
+            for (int l = 0; l < 17; ++l) {
+                w[l] = 0;
             }
         }
-        *(int4 *) swizzle<stride_tile>(tile_KV, i*stride_tile + k*4, i) = make_int4(v[0], v[1], v[2], v[3]);
+#pragma unroll
+        for (int blk = 0; blk < 2; ++blk) {
+            // block 0: d in the low half of w[0], quants at bytes 2..33; block 1: d in the high half of w[8], quants in w[9..16]
+            const uint16_t d_bits = blk == 0 ? (uint16_t) (w[0] & 0xFFFF) : (uint16_t) (w[8] >> 16);
+            const half2    d2     = __half2half2(__ushort_as_half(d_bits));
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                int v[4];
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int      j  = 2*c + h;
+                    const uint32_t qs = blk == 0 ? __funnelshift_r(w[j], w[j + 1], 16) : w[9 + j];
+                    const uint32_t u  = qs ^ 0x80808080u;
+                    const uint32_t lo = __byte_perm(u, 0x64646464u, 0x5140);
+                    const uint32_t hi = __byte_perm(u, 0x64646464u, 0x7362);
+                    const half2    r0 = __hmul2(__hsub2(*(const half2 *) &lo, off), d2);
+                    const half2    r1 = __hmul2(__hsub2(*(const half2 *) &hi, off), d2);
+                    v[2*h + 0] = zero ? 0 : *(const int *) &r0;
+                    v[2*h + 1] = zero ? 0 : *(const int *) &r1;
+                }
+                const int k = p*8 + blk*4 + c; // 16 byte chunk of the row
+                *(int4 *) swizzle<stride_tile>(tile_KV, i*stride_tile + k*4, i) = make_int4(v[0], v[1], v[2], v[3]);
+            }
+        }
     }
 }
 
@@ -2201,6 +2227,9 @@ static __global__ void flash_attn_ext_f16(
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2);
 // k19-fattnq8: the MMA kernel reads this node's q8_0 K / V in place (no staged f16 copy); fattn.cu
 bool ggml_cuda_flash_attn_ext_mma_q8_inplace(const int device, const ggml_tensor * dst);
+static inline bool ggml_cuda_fattn_q8_no_data(const ggml_tensor * t) {
+    return ggml_cuda_fattn_probe_cur != nullptr || t->data == nullptr;
+}
 
 template <int DKQ, int DV, int ncols1, int ncols2>
 void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -2311,6 +2340,9 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         if (logit_softcap == 0.0f && ggml_cuda_flash_attn_ext_mma_q8_inplace(id, dst)) {
             const ggml_tensor * K = dst->src[1];
             const ggml_tensor * V = dst->src[2];
+            // rows start 4 byte aligned (ggml_cuda_flash_attn_ext_mma_q8_inplace checked the strides; buffers and cache views keep it)
+            GGML_ASSERT(ggml_cuda_fattn_q8_no_data(K) || (uintptr_t) K->data % 4 == 0);
+            GGML_ASSERT(ggml_cuda_fattn_q8_no_data(V) || (uintptr_t) V->data % 4 == 0);
             bool aligned16 = true;
             for (const ggml_tensor * t : {K, V}) {
                 aligned16 = aligned16 && (uintptr_t) t->data % 16 == 0 && t->nb[1] % 16 == 0 && t->nb[2] % 16 == 0 && t->nb[3] % 16 == 0;

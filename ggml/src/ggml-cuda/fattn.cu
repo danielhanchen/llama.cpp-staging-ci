@@ -360,7 +360,7 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 }
 
 // k19-fattnq8: q8_0 K and V of a head size with a q8_0 instance (ggml_cuda_flash_attn_ext_mma_q8_may_use), on NVIDIA with Turing
-// tensor cores, rows of whole 2 byte aligned blocks: the MMA kernel reads them in place. The same answer for the launch and for the
+// tensor cores, rows of whole blocks starting 4 byte aligned: the MMA kernel reads them in place. The same answer for the launch and for the
 // graph allocation (ggml_cuda_flash_attn_ext_get_alloc_size: no f16 copy behind the output). GGML_CUDA_FATTN_Q8_INPLACE=0: off
 bool ggml_cuda_flash_attn_ext_mma_q8_inplace(const int device, const ggml_tensor * dst) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
@@ -385,7 +385,7 @@ bool ggml_cuda_flash_attn_ext_mma_q8_inplace(const int device, const ggml_tensor
         return false;
     }
     for (const ggml_tensor * t : {K, V}) {
-        if (t->nb[0] != sizeof(block_q8_0) || t->nb[1] % 2 != 0 || t->nb[2] % 2 != 0 || t->nb[3] % 2 != 0 ||
+        if (t->nb[0] != sizeof(block_q8_0) || t->nb[1] % 4 != 0 || t->nb[2] % 4 != 0 || t->nb[3] % 4 != 0 ||
                 t->nb[1] > INT32_MAX || t->nb[2] > INT32_MAX) {
             return false;
         }
