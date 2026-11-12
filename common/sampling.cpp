@@ -1148,6 +1148,11 @@ int32_t common_sampler_device_topk(const struct common_sampler * gsmpl, int32_t 
 //     order (same values, ties by the lower id), and the chain after them sees the same candidates. Otherwise the full row is sampled
 //     (same RNG state: one chain draw happened on each side)
 //   - grammar_first = true: the same count on the masked C before the chain, else the full row
+// not inlined: inlined, it changed the code of common_sampler_sample's full-row path (A100 q4x tools with LLAMA_DEVICE_TOPK_GRAMMAR=0:
+// +0.5 ms of host sampling per pass against the base bin)
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
 static llama_token common_sampler_sample_dev_gram(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     auto * grmr    = gsmpl->grmr;
     auto * rbudget = gsmpl->rbudget;
