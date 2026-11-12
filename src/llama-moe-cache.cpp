@@ -4214,6 +4214,12 @@ struct llama_moe_cache::impl {
         // (readahead of each layer's expert tensors first), skipping the experts the device slots hold: with the device cache prefilled
         // (LLAMA_MOE_CACHE_PREFILL=1) the first prompt then reads nothing from the files when RAM + VRAM hold every expert (low-RAM boxes)
         const bool from_file = (env_pf != nullptr && atoi(env_pf) >= 2) || resident_mode;
+        // k19-l4ttft (LLAMA_MOE_HOST_PREFILL_GUESS=1, opt-in): what the page cache held at load is not a choice (whatever the load read),
+        // so the experts copied from it are marked as unused guesses (set_spec, as the routing profile's): a prompt whose copies read
+        // only the experts it routes (GGML_SCHED_PREFETCH_MIN_BATCH) then keeps its reads in the slots of the ones it did not use when
+        // no slot is free. Placement only (what a slot holds is the expert's bytes); exclusive tier only
+        static const bool guess = [] { const char * e = getenv("LLAMA_MOE_HOST_PREFILL_GUESS"); return e != nullptr && atoi(e) != 0; }();
+        const bool mark = guess && !from_file && host->exclusive();
         const int64_t t0 = ggml_time_us();
         size_t n_file = 0;
         const size_t pg = (size_t) std::max(4096L, sysconf(_SC_PAGESIZE));
@@ -4288,6 +4294,9 @@ struct llama_moe_cache::impl {
                         n_bytes += w->nb[2];
                     }
                     host->publish(s);
+                    if (mark) {
+                        host->set_spec(s);
+                    }
                     n_fill++;
                     n_file += file ? 1 : 0;
                 }
@@ -4295,8 +4304,8 @@ struct llama_moe_cache::impl {
         }
         hst.prefilled = n_fill + n_prof;
         LLAMA_LOG_INFO("%s: MoE host cache: %zu experts (%.1f MiB) copied from the page cache into RAM slots in %.1f ms, %zu of them read from the files"
-                " (LLAMA_MOE_HOST_CACHE_PREFILL=0 off, 2 also reads the experts that are not in the page cache)\n",
-                __func__, n_fill, n_bytes/1048576.0, (ggml_time_us() - t0)/1000.0, n_file);
+                " (LLAMA_MOE_HOST_CACHE_PREFILL=0 off, 2 also reads the experts that are not in the page cache)%s\n",
+                __func__, n_fill, n_bytes/1048576.0, (ggml_time_us() - t0)/1000.0, n_file, mark ? "; k19-l4ttft: marked as guesses" : "");
 #endif
     }
 
