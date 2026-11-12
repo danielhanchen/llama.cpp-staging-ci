@@ -796,7 +796,9 @@ static __global__ void __launch_bounds__(BLOCK_SIZE, 1) top_k_radix_one_block_v2
 // and writes the radix select's output order: the picked keys above the k-th in column order, then the picked ties in column order.
 // The top k under (key desc, column asc) are exactly the radix select's keys above its threshold plus its lowest-column ties, so the
 // output is the same ids in the same order. GGML_CUDA_TOPK_TWO_STAGE=0: the radix select.
-#define TOP_K_TWO_STAGE_MAX_K    32
+// k: one round per pick per block, so it pays for small k only (A100, test-topk-twostage-exact: k 1 / 10 at 0.14-0.94x the radix
+// select's time over 32769-262144 columns, k 32 at 1.5-4.1x)
+#define TOP_K_TWO_STAGE_MAX_K    10
 #define TOP_K_TWO_STAGE_MAX_ROWS 8
 #define TOP_K_TWO_STAGE_NONE     0x7FFFFFFF
 
