@@ -1650,8 +1650,13 @@ llama_context::llama_context(
                                 // (default 16384: kernel, the process, the 8 GiB prompt cache; 0 = off)
                                 static const uint64_t room_b = (uint64_t) std::max<int64_t>(0, getenv("LLAMA_PLE_PIN_ROOM_MIB") ?
                                     atoll(getenv("LLAMA_PLE_PIN_ROOM_MIB")) : 16384) << 20;
+                                // the reclaimable RAM (MemAvailable minus the registered model pages, llama_sysmem::available_reclaimable,
+                                // the figure the server's prompt cache floor uses) still holds the table's pages now; after the pin it
+                                // must keep the room. Also against MemTotal - the other host weights (a host whose registration is unknown)
                                 const uint64_t total_now = llama_sysmem::total();
-                                const bool room_ok = room_b == 0 || (total_now > 0 && total_now >= (uint64_t) host_b + len + room_b);
+                                const uint64_t recl_now  = llama_sysmem::available_reclaimable();
+                                const bool room_ok = room_b == 0 || (total_now > 0 && total_now >= (uint64_t) host_b + len + room_b &&
+                                    recl_now >= (uint64_t) len + room_b);
                                 pin_on = limit >= table && avail_now >= (uint64_t) len + floor_b && room_ok;
                                 pin_why = pin_on ? " (a MoE cache core freed the RAM; LLAMA_PLE_RESIDENT_PARTIAL_PIN=0 off)" : !room_ok ?
                                     " (not pinned: MemTotal - the other host weights - the table is under LLAMA_PLE_PIN_ROOM_MIB, 16 GiB)" :
@@ -1677,6 +1682,8 @@ llama_context::llama_context(
                                     if (hmap(dev, a0, len, &registered) != nullptr && registered) {
                                         pr->pin_addr  = a0;
                                         pr->pin_unmap = hunmap;
+                                        pr->pin_len   = len;
+                                        llama_sysmem::pinned_file_add((int64_t) len); // k19-core2: the pinned table pages are not reclaimable
                                         pin_res = ", pinned";
                                     }
                                     break;

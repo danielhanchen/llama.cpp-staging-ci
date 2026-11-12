@@ -122,6 +122,21 @@ int main() {
     // the live system gives a value
     printf("live: %llu MiB\n", (unsigned long long) (llama_sysmem::available() >> 20));
 
+    // k19-core2: the reclaimable figure (MemAvailable minus the registered model pages; 1 when nothing is left, 0 when unknown)
+    {
+        constexpr uint64_t GiB = 1024*MiB;
+        check("reclaimable: nothing pinned", llama_sysmem::reclaimable(79*GiB, 0), 79*GiB);
+        check("reclaimable: A100 fn4nd core (48.5 GiB registered)", llama_sysmem::reclaimable(79*GiB, (int64_t) (48.5*GiB)), (uint64_t) (30.5*GiB));
+        check("reclaimable: + the 26.8 GiB pin", llama_sysmem::reclaimable(79*GiB, (int64_t) (75.3*GiB)), (uint64_t) (79*GiB - (uint64_t) (75.3*GiB)));
+        check("reclaimable: more pinned than available -> 1", llama_sysmem::reclaimable(10*GiB, (int64_t) (20*GiB)), 1);
+        check("reclaimable: unknown stays unknown", llama_sysmem::reclaimable(0, (int64_t) (20*GiB)), 0);
+        const int64_t p0 = llama_sysmem::pinned_file_bytes().load();
+        llama_sysmem::pinned_file_add((int64_t) (3*GiB));
+        check("pinned_file_add +3 GiB", (uint64_t) (llama_sysmem::pinned_file_bytes().load() - p0), 3*GiB);
+        llama_sysmem::pinned_file_add(-(int64_t) (3*GiB));
+        check("pinned_file_add -3 GiB", (uint64_t) (llama_sysmem::pinned_file_bytes().load() - p0), 0);
+    }
+
     fs::remove_all(root);
     printf("%s\n", n_fail == 0 ? "ALL OK" : "FAILED");
     return n_fail == 0 ? 0 : 1;

@@ -615,6 +615,9 @@ extern "C" {
     // system memory usable without swapping in bytes, 0 if unknown; on Linux MemAvailable capped by the cgroup limits, where the
     // reclaimable page cache of a cgroup does not count as used
     LLAMA_API uint64_t llama_available_memory(void);
+    // llama_available_memory() minus the file-backed host pages this process pinned for a device (registered model mappings): what the
+    // kernel can still hand out; for budgets that grow after the load (the server's prompt cache)
+    LLAMA_API uint64_t llama_available_memory_reclaimable(void);
 
     LLAMA_API bool llama_supports_mmap       (void);
     LLAMA_API bool llama_supports_mlock      (void);

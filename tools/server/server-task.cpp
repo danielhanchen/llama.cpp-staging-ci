@@ -1821,7 +1821,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             const char * e = getenv("LLAMA_PROMPT_CACHE_HOST_FLOOR_MIB");
             return (size_t) (e != nullptr ? std::max<long long>(0, atoll(e)) : 6144) << 20;
         }();
-        const uint64_t avail = floor_bytes > 0 ? llama_available_memory() : 0;
+        // k19-core2: minus the registered (pinned) model pages MemAvailable still counts (LLAMA_PROMPT_CACHE_HOST_FLOOR_RAW=1: MemAvailable)
+        static const bool raw = getenv("LLAMA_PROMPT_CACHE_HOST_FLOOR_RAW") != nullptr && atoi(getenv("LLAMA_PROMPT_CACHE_HOST_FLOOR_RAW")) != 0;
+        const uint64_t avail = floor_bytes > 0 ? (raw ? llama_available_memory() : llama_available_memory_reclaimable()) : 0;
         if (avail > 0) {
             const size_t need  = state_size_new + floor_bytes;
             size_t       freed = 0;
