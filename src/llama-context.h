@@ -11,6 +11,7 @@
 #include "llama-moe-cache.h"
 #include "llama-prefetch.h"
 #include "llama-weight-store.h"
+#include "llama-sysmem.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -529,6 +530,7 @@ private:
         // k19-disktt: the part of the table pinned by a GPU backend's host registration (LLAMA_PLE_RESIDENT_PARTIAL_PIN=1), released here
         void *            pin_addr  = nullptr;
         void (*pin_unmap)(void *)   = nullptr;
+        size_t            pin_len   = 0; // k19-core2: published to llama_sysmem::pinned_file_bytes while pinned
         ~ple_res_runner() {
             stop.store(true);
             if (th.joinable()) {
@@ -536,6 +538,7 @@ private:
             }
             if (pin_addr != nullptr && pin_unmap != nullptr) {
                 pin_unmap(pin_addr);
+                llama_sysmem::pinned_file_add(-(int64_t) pin_len);
             }
         }
     } ple_res;

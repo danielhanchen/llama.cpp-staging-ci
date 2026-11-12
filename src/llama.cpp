@@ -97,6 +97,10 @@ uint64_t llama_available_memory(void) {
     return llama_sysmem::available();
 }
 
+uint64_t llama_available_memory_reclaimable(void) {
+    return llama_sysmem::available_reclaimable();
+}
+
 bool llama_supports_mmap(void) {
     return llama_mmap::SUPPORTED;
 }

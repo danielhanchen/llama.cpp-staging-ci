@@ -2417,6 +2417,7 @@ struct llama_moe_cache::impl {
             return nullptr;
         }
         hst.registered += bytes;
+        file_pin_add(bytes); // core runs: CPU_Mapped buffers only
         return base;
     }
 
@@ -3449,6 +3450,14 @@ struct llama_moe_cache::impl {
         for (const auto & [unmap, buf] : mapped) {
             unmap(buf);
         }
+        llama_sysmem::pinned_file_add(-file_pinned);
+    }
+
+    // k19-core2: file-backed (model file) bytes this cache registered, published to llama_sysmem::pinned_file_bytes
+    int64_t file_pinned = 0;
+    void file_pin_add(size_t bytes) {
+        file_pinned += (int64_t) bytes;
+        llama_sysmem::pinned_file_add((int64_t) bytes);
     }
 
     using host_map_t   = void * (*)(ggml_backend_dev_t, void *, size_t, bool *);
@@ -6031,6 +6040,9 @@ struct llama_moe_cache::impl {
                             mapped.emplace_back(host_unmap, base);
                             added.emplace_back(dev, t->buffer);
                             hst.registered += ggml_backend_buffer_get_size(t->buffer);
+                            if (strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer)), "CPU_Mapped") == 0) {
+                                file_pin_add(ggml_backend_buffer_get_size(t->buffer));
+                            }
                         }
                         it = dev_base.emplace(std::make_pair(dev, t->buffer), (uint8_t *) dev_ptr).first;
                     }

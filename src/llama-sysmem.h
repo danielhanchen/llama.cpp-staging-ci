@@ -22,6 +22,8 @@
 #include <mach/mach.h>
 #endif
 
+#include <atomic>
+
 namespace llama_sysmem {
 
 // first number in a file, false if it is missing or not a number (e.g. "max")
@@ -185,6 +187,33 @@ inline uint64_t available() {
 #else
     return 0;
 #endif
+}
+
+// k19-core2: host bytes of file-backed mappings (the model file's pages) that a device registration pinned. They stay in Cached, so
+// MemAvailable counts them as reclaimable, but the kernel cannot reclaim them (Colab A100 fn4nd full card: 48.5 GiB of registered expert
+// pages + a 26.8 GiB PLE pin left 8.2 GiB, MemAvailable still read ~79 GiB, and a server's prompt cache froze the VM). The MoE cache and
+// the PLE pin add / subtract what they register; reclaimable() is MemAvailable minus it (1 when nothing is left, 0 when unknown).
+inline std::atomic<int64_t> & pinned_file_bytes() {
+    static std::atomic<int64_t> v{0};
+    return v;
+}
+
+inline void pinned_file_add(int64_t bytes) {
+    pinned_file_bytes().fetch_add(bytes);
+}
+
+inline uint64_t reclaimable(uint64_t avail, int64_t pinned) {
+    if (avail == 0) {
+        return 0;
+    }
+    if (pinned <= 0) {
+        return avail;
+    }
+    return (uint64_t) pinned < avail ? avail - (uint64_t) pinned : 1;
+}
+
+inline uint64_t available_reclaimable() {
+    return reclaimable(available(), pinned_file_bytes().load());
 }
 
 // CPUs a cgroup quota allows (cpu.max "quota period" on v2, cpu.cfs_quota_us / cpu.cfs_period_us on v1, the tightest of the cgroup and
