@@ -32,6 +32,7 @@ extern "C" { GGML_API void ggml_moe_cache_set_core(struct ggml_tensor * op, int3
 #include <set>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <string>
 #include <stdexcept>
@@ -1238,6 +1239,39 @@ struct llama_moe_cache::impl {
     // k19-ramprof: LLAMA_MOE_HOST_PROFILE=<path> (a file of the format above, <path>.<n_layer>.<n_expert>[.mtp]) fills the RAM tier at load
     // in its order (llama_moe_profile_ram_order) before the page-cache fill (prefill_resident); unset or 0 = off (the page-cache fill alone)
     std::string host_profile_file;
+    // k19-ramprof2 (see prepare): the profile is read at load (hprof_order), its experts in the page cache are copied at the first batch
+    // (the warmup run, after the device prefill: the load pins no more than the page-cache fill it replaces, the device prefill reads as
+    // before), the others are read by the weight store in the background (read_host_async: behind every demand read) from the first small
+    // batch after a prompt on (not during the load), into free slots in heat order. A large batch cancels the reads that did not start
+    // (back to hprof_pending, issued again at the next small batch into the slots its prompt left free) and, at the start of a request,
+    // releases unused guesses until LLAMA_MOE_HOST_PROFILE_PROMPT_FREE (0.15) of the slots are free (its plan leases every held slot, so
+    // only free slots keep what it reads). A lookup that routes an expert being read waits for it (its read moves in front). The slots
+    // are guesses (llama_moe_host_cache::set_spec): any reservation takes them while unused.
+    std::vector<prof_entry> hprof_order;   // heat order, until the copy
+    bool   hprof_copied    = false;
+    bool   hprof_prompted  = false;        // a large batch ran since the copy (the background reads may start)
+    bool   hprof_prev_large = false;
+    double hprof_prompt_free = 0.15;
+    std::deque<prof_entry>  hprof_pending; // heat order
+    bool   hprof_pinned    = false;        // the slots of the background reads were allocated (one pass)
+    int    hprof_inflight_max = 1024;      // background reads in flight at most (experts), topped up at each small batch
+    size_t hprof_load_read = (size_t) 6144 << 20; // LLAMA_MOE_HOST_PROFILE_LOAD_READ_MIB: background reads issued at the first batch (during the load)
+    // k19-ramprof2 (inclusive tier): the share of each layout's slots the profile fill leaves free (LLAMA_MOE_HOST_PROFILE_ROOM, default 0.15
+    // there, 0 on the exclusive tier, whose promotions free slots): the misses of the first requests are read into RAM by the CLOCK once no
+    // slot is free, and a slot read once is as likely a victim as a guess (12 GB: the repeated chat re-read the first chat's experts)
+    double hprof_room = 0.0;
+    std::vector<uint64_t>   hprof_ticket;  // [slot] ticket of its background read, 0 = none
+    std::deque<int32_t>     hprof_q;       // slots with a ticket (or collected since), issue order
+    size_t hprof_read_cap  = SIZE_MAX;     // LLAMA_MOE_HOST_PROFILE_READ_MIB
+    size_t hprof_read_left = SIZE_MAX;
+    struct hprof_stats {
+        uint64_t issued = 0, issued_bytes = 0, done = 0, waited = 0, waited_us = 0, cancelled = 0, rounds = 0, no_slot = 0, failed = 0, dup = 0;
+        uint64_t load_copied = 0, load_copied_bytes = 0, load_skipped_uncached = 0, dropped = 0, requests = 0;
+    } hps;
+    // per request (k19-ramprof2 diagnostics): the counters at the start of the last request
+    struct hprof_snap {
+        uint64_t hits = 0, misses = 0, read = 0, admitted = 0, evicted = 0, no_slot = 0, spec_taken = 0, spec_used = 0, spec_dropped = 0, done = 0;
+    } hprof_last;
 
     // k19-ptres (LLAMA_MOE_CORE=1, opt-in): a never-evicted core of the device cache whose host copies are given back to the OS. With a
     // routing profile (LLAMA_MOE_CACHE_PROFILE, or kept by the cache itself in the calibration directory), the hottest experts of each
@@ -3775,12 +3809,9 @@ struct llama_moe_cache::impl {
                 host->describe().c_str(), host_verify ? ", VERIFY" : "");
     }
 
-#if defined(__linux__) || defined(__APPLE__)
-    // k19-ramprof: fills free RAM-tier slots at load in the order of the routing profile host_profile_file (LLAMA_MOE_HOST_PROFILE), most
-    // used first over every layer (llama_moe_profile_ram_order), before the page-cache fill: an expert whose pages are in the page cache is
-    // copied, the others are read from the model files by the weight store (unbuffered reads, in batches), up to LLAMA_MOE_HOST_PROFILE_READ_MIB
-    // MiB of reads (unset: no limit; the page-cache copies are not counted). An exclusive tier skips the experts the device slots hold.
-    // Placement only: a slot holds the bytes of the mapping, as a slot the first prompt fills. Returns the experts filled.
+    // k19-ramprof: the routing profile host_profile_file (LLAMA_MOE_HOST_PROFILE) fills the RAM tier in its order, most used first over every
+    // layer (llama_moe_profile_ram_order). k19-ramprof2: read here (load), filled from the first batch on (see hprof_order). Returns the
+    // entries (0: no profile, the page-cache fill runs as before)
     size_t prefill_host_profile() {
         std::vector<prof_entry> prof;
         if (!llama_moe_profile_load(host_profile_file, profile_n_expert(), prof)) {
@@ -3788,110 +3819,341 @@ struct llama_moe_cache::impl {
                     "filled from the page cache only\n", __func__, host_profile_file.c_str());
             return 0;
         }
-        size_t read_cap = SIZE_MAX;
         if (const char * e = getenv("LLAMA_MOE_HOST_PROFILE_READ_MIB")) {
-            read_cap = (size_t) std::max(0.0, atof(e))*1048576;
+            hprof_read_cap = (size_t) std::max(0.0, atof(e))*1048576;
         }
+        hprof_read_left = hprof_read_cap;
+        // inclusive tier: no reads during the load by default (L4 12 GB: 6 GiB of them made the load 10% longer, the copies capture more there)
+        hprof_room = host->exclusive() ? 0.0 : 0.15;
+        if (!host->exclusive()) {
+            hprof_load_read = 0;
+        }
+        if (const char * e = getenv("LLAMA_MOE_HOST_PROFILE_LOAD_READ_MIB")) {
+            hprof_load_read = (size_t) std::max(0.0, atof(e))*1048576;
+        }
+        if (const char * e = getenv("LLAMA_MOE_HOST_PROFILE_ROOM")) {
+            hprof_room = std::min(1.0, std::max(0.0, atof(e)));
+        }
+        if (const char * e = getenv("LLAMA_MOE_HOST_PROFILE_INFLIGHT")) {
+            hprof_inflight_max = std::max(1, atoi(e));
+        }
+        if (const char * e = getenv("LLAMA_MOE_HOST_PROFILE_PROMPT_FREE")) {
+            hprof_prompt_free = std::min(1.0, std::max(0.0, atof(e)));
+        }
+        hprof_order = llama_moe_profile_ram_order(prof);
+        hprof_ticket.assign(host->n_slots(), 0);
+        LLAMA_LOG_INFO("%s: MoE host cache: profile %s: %zu experts, filled from the first batch on: the ones in the page cache copied, the others "
+                "read in the background after the first prompt (LLAMA_MOE_HOST_PROFILE unset or 0 off, LLAMA_MOE_HOST_PROFILE_READ_MIB caps the reads, "
+                "LLAMA_MOE_HOST_PROFILE_PROMPT_FREE = %.2f of the slots kept free for a request's reads)\n", __func__, host_profile_file.c_str(),
+                prof.size(), hprof_prompt_free);
+        return prof.size();
+    }
+
+    // k19-ramprof2: the profile experts in the page cache are copied into free slots in heat order (an exclusive tier skips the experts the
+    // device slots hold); the others go to hprof_pending. Residency is checked per expert right before its copy (an answer taken earlier
+    // goes stale while the slots being pinned evict file pages: the copies then faulted their experts back from the disk, 30 GB in
+    // 107-124 s), and the pages of a copied expert are marked cold (MADV_COLD), so the kernel reclaims them, not the ones still to copy.
+    // Placement only: a slot holds the bytes of the mapping, as a slot the first prompt fills.
+    void hprof_copy() {
+        hprof_copied = true;
+        const std::vector<prof_entry> order = std::move(hprof_order);
+        hprof_order.clear();
+        hprof_pending.clear();
+#if defined(__linux__) || defined(__APPLE__)
         const int64_t t0 = ggml_time_us();
-        const std::vector<prof_entry> order = llama_moe_profile_ram_order(prof);
         const size_t pg = (size_t) std::max(4096L, sysconf(_SC_PAGESIZE));
-        // [il][e]: 1 if every page of every expert tensor of the expert is in the page cache (mincore), per layer when first needed
-        std::vector<std::vector<uint8_t>> pc(layers.size());
         std::vector<unsigned char> vec;
-        auto cached = [&](int32_t il, int32_t e) -> bool {
-            std::vector<uint8_t> & r = pc[il];
-            if (r.empty()) {
-                const layer & l = layers[il];
-                const int32_t n_expert = (int32_t) l.experts[0]->ne[2];
-                r.assign(n_expert, 1);
-                for (const ggml_tensor * w : l.experts) {
-                    const uintptr_t p0 = (uintptr_t) w->data / pg * pg;
-                    const uintptr_t p1 = ((uintptr_t) w->data + ggml_nbytes(w) + pg - 1) / pg * pg;
-                    vec.resize((p1 - p0) / pg);
+        auto resident = [&](int32_t il, int32_t e) -> bool {
+            for (const ggml_tensor * w : layers[il].experts) {
+                const uintptr_t a  = (uintptr_t) w->data + (size_t) e*w->nb[2];
+                const uintptr_t p0 = a / pg * pg;
+                const uintptr_t p1 = (a + w->nb[2] + pg - 1) / pg * pg;
+                vec.resize((p1 - p0) / pg);
 #if defined(__APPLE__)
-                    const bool ok = mincore((void *) p0, p1 - p0, (char *) vec.data()) == 0;
+                if (mincore((void *) p0, p1 - p0, (char *) vec.data()) != 0) {
 #else
-                    const bool ok = mincore((void *) p0, p1 - p0, vec.data()) == 0;
+                if (mincore((void *) p0, p1 - p0, vec.data()) != 0) {
 #endif
-                    const size_t nb = w->nb[2];
-                    for (int32_t x = 0; x < n_expert; ++x) {
-                        const uintptr_t a = (uintptr_t) w->data + (size_t) x*nb;
-                        bool all = ok;
-                        for (uintptr_t q = a / pg * pg; q < a + nb && all; q += pg) {
-                            all = (vec[(q - p0) / pg] & 1) != 0;
-                        }
-                        r[x] = r[x] && all;
+                    return false;
+                }
+                for (unsigned char v : vec) {
+                    if ((v & 1) == 0) {
+                        return false;
                     }
                 }
             }
-            return r[e] != 0;
+            return true;
         };
-        size_t n_pc = 0, n_file = 0, n_fallback = 0, b_pc = 0, b_file = 0;
-        std::vector<llama_weight_store::host_read> rd;
-        std::vector<std::pair<int32_t, int32_t>> rd_slots; // (slot, layer) of the reads in rd, n_tensors reads each
-        auto flush = [&]() {
-            if (rd.empty()) {
-                return;
-            }
-            const bool ok = wstore != nullptr && wstore->read_host(rd.data(), rd.size(), true);
-            size_t k = 0;
-            for (const auto & [s, il] : rd_slots) {
-                const layer & l = layers[il];
-                for (size_t ip = 0; ip < l.experts.size(); ++ip, ++k) {
-                    if (ok) {
-                        host->set_lead(s, (int) ip, rd[k].lead);
-                    } else {
-                        host->set_lead(s, (int) ip, 0);
-                        memcpy(host->area(s, (int) ip), (const uint8_t *) rd[k].src->data + rd[k].src_off, rd[k].size);
-                    }
-                }
-                host->publish(s);
-            }
-            n_fallback += ok ? 0 : rd_slots.size();
-            rd.clear();
-            rd_slots.clear();
-        };
+        size_t b_pc = 0;
         auto want = [&](int32_t il, int32_t e) -> bool {
-            if (!host_layer(il) || (host->exclusive() && in_device(il, e))) {
+            if (!host_layer(il) || (host->exclusive() && in_device(il, e)) || !hprof_has_room(il)) {
                 return false;
             }
-            return b_file < read_cap || cached(il, e);
+            if (resident(il, e)) {
+                return true;
+            }
+            hprof_pending.push_back({ il, e, 0.0f });
+            hps.load_skipped_uncached++;
+            return false;
         };
         auto take = [&](size_t i, int32_t s) {
             const int32_t il = order[i].il;
             const int32_t e  = order[i].e;
             const layer & l = layers[il];
-            if (cached(il, e)) {
-                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
-                    const ggml_tensor * w = l.experts[ip];
-                    host->set_lead(s, (int) ip, 0);
-                    memcpy(host->area(s, (int) ip), (const uint8_t *) w->data + (size_t) e*w->nb[2], w->nb[2]);
-                    b_pc += w->nb[2];
-                }
-                host->publish(s);
-                n_pc++;
-                return;
-            }
             for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                 const ggml_tensor * w = l.experts[ip];
-                rd.push_back({ w, (size_t) e*w->nb[2], w->nb[2], host->area(s, (int) ip), 0 });
-                b_file += w->nb[2];
+                const uint8_t * src = (const uint8_t *) w->data + (size_t) e*w->nb[2];
+                host->set_lead(s, (int) ip, 0);
+                memcpy(host->area(s, (int) ip), src, w->nb[2]);
+                b_pc += w->nb[2];
+#if defined(MADV_COLD)
+                // the whole pages of the expert (a page shared with a neighbour stays as it is); not the ones the device slots hold
+                if (!in_device(il, e)) {
+                    const uintptr_t p0 = ((uintptr_t) src + pg - 1) / pg * pg;
+                    const uintptr_t p1 = ((uintptr_t) src + w->nb[2]) / pg * pg;
+                    if (p1 > p0) {
+                        madvise((void *) p0, p1 - p0, MADV_COLD);
+                    }
+                }
+#endif
             }
-            rd_slots.emplace_back(s, il);
-            n_file++;
-            if (rd_slots.size() >= 64) {
-                flush();
-            }
+            host->publish(s);
+            host->set_spec(s);
         };
         const size_t n = llama_moe_profile_reserve(*host, order, want, take);
-        flush();
-        LLAMA_LOG_INFO("%s: MoE host cache: profile %s: %zu of %zu profile experts into RAM slots in %.1f s, most used first: %zu (%.1f MiB) "
-                "from the page cache, %zu (%.1f MiB) read from the files%s (LLAMA_MOE_HOST_PROFILE unset or 0 off, "
-                "LLAMA_MOE_HOST_PROFILE_READ_MIB caps the reads)\n", __func__, host_profile_file.c_str(), n, prof.size(), (ggml_time_us() - t0)/1e6,
-                n_pc, b_pc/1048576.0, n_file, b_file/1048576.0, n_fallback > 0 ? ", some copied from the mapping (the store could not read them)" : "");
-        return n;
-    }
+        hps.load_copied = n;
+        hps.load_copied_bytes = b_pc;
+        hst.prefilled = n;
+        if (hprof_read_cap == 0 || wstore == nullptr) {
+            hprof_pending.clear();
+        }
+        LLAMA_LOG_INFO("%s: MoE host cache: profile %s: %zu of %zu profile experts copied from the page cache into RAM slots in %.1f s (%.1f MiB), "
+                "most used first; %zu not in the page cache are read in the background after the first prompt, into the slots left free\n",
+                __func__, host_profile_file.c_str(), n, order.size(), (ggml_time_us() - t0)/1e6, b_pc/1048576.0, hprof_pending.size());
 #endif
+    }
+
+    // k19-ramprof2 diagnostics: the RAM-tier counters of the request that just ended (LLAMA_MOE_HOST_PROFILE only)
+    void hprof_request_log(const char * when) {
+        const auto & hs = host->st;
+        hprof_snap now;
+        now.hits = hst.hits; now.misses = hst.misses; now.read = hst.read; now.admitted = hst.admitted; now.evicted = hs.evicted;
+        now.no_slot = hs.no_slot; now.spec_taken = hs.spec_taken; now.spec_used = hs.spec_used; now.spec_dropped = hs.spec_dropped; now.done = hps.done;
+        const hprof_snap & o = hprof_last;
+        LLAMA_LOG_INFO("llama_moe_cache: host profile, request %llu (%s): device misses %llu RAM hits / %llu RAM misses, %llu read into RAM, %llu admitted "
+                "from prompts, %llu evicted, %llu without a slot; guesses %llu used, %llu taken, %llu dropped, %zu unused; %llu background reads done; "
+                "%d slots free\n", (unsigned long long) hps.requests, when, (unsigned long long) (now.hits - o.hits), (unsigned long long) (now.misses - o.misses),
+                (unsigned long long) (now.read - o.read), (unsigned long long) (now.admitted - o.admitted), (unsigned long long) (now.evicted - o.evicted),
+                (unsigned long long) (now.no_slot - o.no_slot), (unsigned long long) (now.spec_used - o.spec_used),
+                (unsigned long long) (now.spec_taken - o.spec_taken), (unsigned long long) (now.spec_dropped - o.spec_dropped), host->n_spec_slots(),
+                (unsigned long long) (now.done - o.done), host->n_free());
+        hprof_last = now;
+    }
+
+    // k19-ramprof2: the batch hook (prepare): see hprof_order
+    void hprof_prepare(int64_t n_tokens) {
+        const bool large = n_tokens > n_small_max;
+        if (!hprof_copied) {
+            hprof_copy();
+            // the hottest of the rest are read while the load finishes (the draft model, the warmup), at most hprof_load_read bytes
+            if (hprof_load_read > 0) {
+                hprof_issue(hprof_load_read, 1 << 30, false);
+            }
+        }
+        if (large) {
+            if (!hprof_q.empty()) {
+                hprof_cancel(false);
+            }
+            if (!hprof_prev_large) {
+                // a request starts: room for its reads
+                if (hprof_prompted) {
+                    hprof_request_log("done");
+                }
+                hps.requests++;
+                const int32_t want_free = (int32_t) (hprof_prompt_free*host->n_slots());
+                const int32_t n_free = host->n_free();
+                if (want_free > n_free && host->n_spec_slots() > 0) {
+                    hps.dropped += host->drop_spec((size_t) (want_free - n_free));
+                }
+            }
+            hprof_prompted = true;
+        } else {
+            hprof_reap();
+            if (hprof_prompted) {
+                hprof_issue(SIZE_MAX, hprof_inflight_max, true);
+            }
+        }
+        hprof_prev_large = large;
+    }
+
+    // the layout of layer il has more free slots than the room the profile fill leaves (hprof_room)
+    bool hprof_has_room(int32_t il) const {
+        return hprof_room <= 0.0 || host->n_free_of(il) > (int32_t) (hprof_room*host->n_slots_of(il));
+    }
+
+    // k19-ramprof2: a background read of the profile is complete: the slot holds its expert (a guess, unless the device took the expert
+    // meanwhile on an exclusive tier: then it is a duplicate, the first slot to go)
+    void hprof_complete(int32_t s) {
+        host->publish(s);
+        hprof_ticket[s] = 0;
+        hps.done++;
+        const int32_t key = host->key(s);
+        const int32_t il  = key / host->n_expert_of();
+        const int32_t e   = key % host->n_expert_of();
+        if (host->exclusive() && in_device(il, e)) {
+            host->set_dup(s, true);
+            hps.dup++;
+        } else {
+            host->set_spec(s);
+        }
+    }
+
+    // the background reads that are done publish their slots, in issue order (never blocks)
+    void hprof_reap() {
+        while (!hprof_q.empty()) {
+            const int32_t s = hprof_q.front();
+            if (hprof_ticket[s] != 0) {
+                if (!wstore->host_done(hprof_ticket[s])) {
+                    break;
+                }
+                hprof_complete(s);
+            }
+            hprof_q.pop_front();
+        }
+    }
+
+    // the pending entries are read into free slots (never a guess, never evicting), in heat order, at most hprof_inflight_max in flight
+    // (a cancel stays cheap); the entries without a slot, already held, or (exclusive) in the device slots now are dropped. The first
+    // call allocates (pins) the slot memory of every pending entry at once (then frees the slots): pinning costs ~0.7 s per GB, once,
+    // instead of a chunk at a time inside later decode steps
+    void hprof_issue(size_t max_bytes, int max_inflight, bool pin_all) {
+        if (hprof_pending.empty() || wstore == nullptr || !host) {
+            return;
+        }
+        auto skip = [&](const prof_entry & p) {
+            return !host_layer(p.il) || (host->exclusive() && in_device(p.il, p.e)) || host->contains(p.il, p.e) || !hprof_has_room(p.il);
+        };
+        if (pin_all && !hprof_pinned) {
+            hprof_pinned = true;
+            const int64_t t0 = ggml_time_us();
+            std::vector<int32_t> tmp;
+            for (const prof_entry & p : hprof_pending) {
+                if (skip(p)) {
+                    continue;
+                }
+                const int32_t s = host->reserve(p.il, p.e, false, 0, false);
+                if (s >= 0) {
+                    tmp.push_back(s);
+                }
+            }
+            for (const int32_t s : tmp) {
+                host->abort(s);
+            }
+            LLAMA_LOG_INFO("%s: MoE host cache: profile: slot memory of %zu background reads allocated in %.1f ms\n", __func__, tmp.size(),
+                    (ggml_time_us() - t0)/1000.0);
+        }
+        hps.rounds++;
+        std::vector<llama_weight_store::host_read> rd;
+        size_t bytes = 0;
+        while (!hprof_pending.empty() && (int) hprof_q.size() < max_inflight && hprof_read_left > 0 && bytes < max_bytes) {
+            const prof_entry p = hprof_pending.front();
+            hprof_pending.pop_front();
+            if (skip(p)) {
+                continue;
+            }
+            const int32_t s = host->reserve(p.il, p.e, false, 0, false);
+            if (s < 0) {
+                hps.no_slot++;
+                continue;
+            }
+            const layer & l = layers[p.il];
+            rd.clear();
+            size_t nb = 0;
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                const ggml_tensor * w = l.experts[ip];
+                rd.push_back({ w, (size_t) p.e*w->nb[2], w->nb[2], host->area(s, (int) ip), 0 });
+                nb += w->nb[2];
+            }
+            const uint64_t t = wstore->read_host_async(rd.data(), rd.size(), true);
+            if (t == 0) {
+                host->abort(s);
+                hps.failed++;
+                continue;
+            }
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                host->set_lead(s, (int) ip, rd[ip].lead);
+            }
+            host->set_async(s, 1);
+            hprof_ticket[s] = t;
+            hprof_q.push_back(s);
+            hps.issued++;
+            hps.issued_bytes += nb;
+            bytes += nb;
+            hprof_read_left = nb >= hprof_read_left ? 0 : hprof_read_left - nb;
+        }
+    }
+
+    // the background reads that did not start are cancelled (their slots are free again, their entries back in front of the pending ones);
+    // the started ones complete as issued (wait_started: they are waited for, e.g. before the store is detached)
+    void hprof_cancel(bool wait_started) {
+        size_t n = 0;
+        std::vector<prof_entry> back;
+        std::deque<int32_t> keep;
+        for (const int32_t s : hprof_q) {
+            if (hprof_ticket[s] == 0) {
+                continue;
+            }
+            if (!wstore->host_cancel(hprof_ticket[s])) {
+                if (wait_started) {
+                    wstore->host_wait(hprof_ticket[s]);
+                    hprof_complete(s);
+                } else {
+                    keep.push_back(s);
+                }
+                continue;
+            }
+            const int32_t key = host->key(s);
+            hprof_ticket[s] = 0;
+            host->abort(s);
+            back.push_back({ key / host->n_expert_of(), key % host->n_expert_of(), 0.0f });
+            if (hprof_read_left != SIZE_MAX) {
+                for (const ggml_tensor * w : layers[key / host->n_expert_of()].experts) {
+                    hprof_read_left += w->nb[2];
+                }
+            }
+            n++;
+        }
+        hprof_q.swap(keep);
+        hprof_pending.insert(hprof_pending.begin(), back.begin(), back.end());
+        hps.cancelled += n;
+    }
+
+    // every background read is cancelled or waited for (before the store is detached or the RAM tier is dropped)
+    void hprof_stop() {
+        if (host && wstore != nullptr && !hprof_q.empty()) {
+            hprof_cancel(true);
+        }
+    }
+
+    // at a lookup of layer il: its routed experts that are being read in the background are waited for (their reads go first)
+    void hprof_wait_routed(int32_t il) {
+        for (const int32_t e : ids) {
+            if (e < 0) {
+                continue;
+            }
+            const int32_t s = host->slot_of_key(il, e);
+            if (s < 0 || hprof_ticket[s] == 0) {
+                continue;
+            }
+            if (!wstore->host_done(hprof_ticket[s])) {
+                const int64_t t0 = ggml_time_us();
+                wstore->host_wait(hprof_ticket[s]);
+                hps.waited_us += ggml_time_us() - t0;
+                hps.waited++;
+            }
+            hprof_complete(s);
+        }
+    }
 
     // the experts whose pages are in the page cache (e.g. read while loading) are copied into free slots: pinning the slots would
     // otherwise evict those pages and the first prompt would read them again (LLAMA_MOE_HOST_CACHE_PREFILL=0 off)
@@ -3899,9 +4161,13 @@ struct llama_moe_cache::impl {
 #if defined(__linux__) || defined(__APPLE__)
         // k19-ramprof: a routing profile fills the RAM tier first (the resident mode reads every expert anyway)
         const size_t n_prof = !resident_mode && !host_profile_file.empty() ? prefill_host_profile() : 0;
-        hst.prefilled = n_prof;
+        hst.prefilled = 0; // k19-ramprof2: the profile copy at the first batch sets it
         const char * env_pf = getenv("LLAMA_MOE_HOST_CACHE_PREFILL");
         if (env_pf != nullptr && atoi(env_pf) == 0) {
+            return;
+        }
+        // k19-ramprof2: the profile's copy at the first batch replaces the page-cache fill (it would take the slots for experts in layer order)
+        if (n_prof > 0) {
             return;
         }
         // LLAMA_MOE_HOST_CACHE_PREFILL=2: also read the experts that are not in the page cache, layer by layer from the model files
@@ -8428,6 +8694,10 @@ struct llama_moe_cache::impl {
 
     void prepare(int64_t n_tokens) {
         ua_drain();
+        // k19-ramprof2: the profile fill (see hprof_order)
+        if (host && wstore != nullptr && !hprof_ticket.empty()) {
+            hprof_prepare(n_tokens);
+        }
         // a medium ubatch right after a large one is the tail of the same prompt: the large ubatch just seeded the cache with the
         // experts this text routes, and evicting them for guesses costs more than the overlap gains (G4 q4x 12 GB multi-turn tails +8%)
         ua_skip = ua_prev_tokens > ua_max_tokens;
@@ -10208,6 +10478,9 @@ struct llama_moe_cache::impl {
             t_prof = t;
         }
 
+        if (tiered && hprof_prompted && !hprof_q.empty()) {
+            hprof_wait_routed(il);
+        }
         if (ahead) {
             ahead_wait_routed(il);
             if (xin != nullptr && !xin_async) {
@@ -10859,7 +11132,8 @@ struct llama_moe_cache::impl {
                             host->set_dup(h, true);
                             hst.promoted++;
                         }
-                    } else if (host->contains(sd.il, f.expert)) {
+                    } else if (host->contains(sd.il, f.expert) && !host->is_async(host->slot_of_key(sd.il, f.expert))) {
+                        // (k19-ramprof2: a slot being read in the background is left to its read: published, it is a duplicate)
                         host->release_key(sd.il, f.expert);
                         hst.promoted++;
                     }
@@ -11125,6 +11399,16 @@ struct llama_moe_cache::impl {
                     (unsigned long long) hs.ahead_evicted, host->evict_done_on() ? 1 : 0);
             LLAMA_LOG_INFO("llama_moe_cache: host tier: %.1f ms pinning slot memory, %llu allocation failures, %.2f MiB pageable (%llu chunks past the pin cap or a failed pin)\n",
                     hs.alloc_us/1000.0, (unsigned long long) hs.alloc_fail, host->pageable_bytes()/1048576.0, (unsigned long long) hs.pin_fallbacks);
+            if (!hprof_ticket.empty()) {
+                hprof_request_log("at exit");
+                LLAMA_LOG_INFO("llama_moe_cache: host profile (k19-ramprof2): %llu dropped for requests' reads, %llu copied at the first batch (%.1f MiB), %llu background reads issued (%.1f MiB) in %llu rounds, "
+                        "%llu done, %llu waited for by a lookup (%.1f ms), %llu cancelled by a large batch, %llu without a free slot, %llu failed, %llu duplicates of "
+                        "device experts; guesses: %llu marked, %llu used, %llu replaced unused, %zu still unused\n",
+                        (unsigned long long) hps.dropped, (unsigned long long) hps.load_copied, hps.load_copied_bytes/1048576.0, (unsigned long long) hps.issued, hps.issued_bytes/1048576.0,
+                        (unsigned long long) hps.rounds, (unsigned long long) hps.done, (unsigned long long) hps.waited, hps.waited_us/1000.0,
+                        (unsigned long long) hps.cancelled, (unsigned long long) hps.no_slot, (unsigned long long) hps.failed, (unsigned long long) hps.dup,
+                        (unsigned long long) hs.spec_set, (unsigned long long) hs.spec_used, (unsigned long long) hs.spec_taken, host->n_spec_slots());
+            }
             if (ahead_depth > 0) {
                 LLAMA_LOG_INFO("llama_moe_cache: host tier reads ahead (%d layers): %llu layer predictions, %llu experts predicted, %llu already held, %llu read ahead = %.2f MiB, "
                         "%llu used, %llu waited for (%.1f ms), %llu without a slot, recall %.2f%% (%llu of %llu routed), predicting %.1f ms, %llu cancelled, %llu over the in-flight cap\n", ahead_depth,
@@ -11594,6 +11878,7 @@ bool llama_moe_cache::is_slot_map(const ggml_tensor * t) const {
 void llama_moe_cache::set_weight_store(llama_weight_store * ws) {
     // the RAM tier reads through the store: it moves with it (and is dropped without one); its reads ahead complete first
     if (pimpl->host && pimpl->wstore != nullptr && pimpl->wstore != ws) {
+        pimpl->hprof_stop();
         pimpl->ahead_drain();
         pimpl->ahead_il = -1;
         pimpl->wstore->set_tier(nullptr);
@@ -11989,7 +12274,7 @@ size_t llama_moe_profile_reserve(llama_moe_host_cache & host, const std::vector<
         if (!host.caches(il) || full.count(il) > 0 || host.contains(il, e) || !want(il, e)) {
             continue;
         }
-        const int32_t s = host.reserve(il, e, false);
+        const int32_t s = host.reserve(il, e, false, 0, false);
         if (s < 0) {
             full.insert(il);
             continue;
