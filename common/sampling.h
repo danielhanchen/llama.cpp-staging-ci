@@ -67,6 +67,21 @@ int32_t common_sampler_device_topk(const struct common_sampler * gsmpl, int32_t 
 void common_sampler_set_device_topk(struct common_sampler * gsmpl, bool on);
 // k15-fn: the sampler takes the token a device greedy chain picked for the row (the server sets it for device greedy requests)
 void common_sampler_set_device_token(struct common_sampler * gsmpl, bool on);
+// k19-gramdev: a device top-k request with a grammar or a reasoning budget also needs its raw rows on the host
+// (llama_set_sampler_keep_logits) for the positions the candidates cannot decide
+bool common_sampler_device_topk_needs_raw(const struct common_sampler * gsmpl);
+// k19-gramdev: LLAMA_DEVICE_TOPK_GRAMMAR (default 1); 0: grammar / reasoning budget requests sample the full rows on the host as before
+bool common_sampler_device_topk_grammar_enabled();
+// k19-gramdev: rows sampled from device top-k candidates with a grammar / reasoning budget; rejected = the grammar rejected the chain's
+// token, fallback = the candidates could not decide the resample, forced = the reasoning budget was forcing; full = full rows sampled
+struct common_sampler_dev_stats {
+    int64_t n_rows     = 0;
+    int64_t n_rejected = 0;
+    int64_t n_fallback = 0;
+    int64_t n_forced   = 0;
+    int64_t n_full     = 0;
+};
+common_sampler_dev_stats common_sampler_get_dev_stats(const struct common_sampler * gsmpl);
 
 // extended sampling implementation:
 //

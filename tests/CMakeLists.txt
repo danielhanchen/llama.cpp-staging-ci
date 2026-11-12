@@ -381,6 +381,26 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         set_tests_properties(test-shared-noise-${SN_SUFFIX} PROPERTIES FIXTURES_REQUIRED generate-models ENVIRONMENT "${SN_ENV}")
     endforeach()
 
+    # k19-gramdev: grammar / reasoning budget requests sample the same tokens from device top-k candidates (CPU backend sampler) as
+    # from the full rows; the kill switch keeps them on the full rows; the deliberately inexact no-fallback mode must make it fail
+    llama_build(test-dtopk-grammar.cpp)
+    foreach(DG_MODE "" "kill" "broken")
+        if (DG_MODE STREQUAL "")
+            set(DG_NAME test-dtopk-grammar)
+        else()
+            set(DG_NAME test-dtopk-grammar-${DG_MODE})
+        endif()
+        if (DG_MODE STREQUAL "broken")
+            llama_test(test-dtopk-grammar NAME ${DG_NAME} LABEL main ARGS "${MODEL_DIR}/qwen3tts-dense.gguf" --expect-diff)
+        else()
+            llama_test(test-dtopk-grammar NAME ${DG_NAME} LABEL main ARGS "${MODEL_DIR}/qwen3tts-dense.gguf")
+        endif()
+        set_tests_properties(${DG_NAME} PROPERTIES FIXTURES_REQUIRED generate-models)
+        if (DG_MODE STREQUAL "kill")
+            set_tests_properties(${DG_NAME} PROPERTIES ENVIRONMENT "LLAMA_DEVICE_TOPK_GRAMMAR=0")
+        endif()
+    endforeach()
+
     # the advisory PLE prefetch predicts the rows set_input gathers, on the generated qwen4exp model
     llama_build(test-ple-prefetch.cpp)
     llama_test(
