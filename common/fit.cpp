@@ -2328,3 +2328,60 @@ void common_fit_print(
     printf("%zu ", dmd.back().mb.compute/1024/1024);
     printf("\n");
 }
+
+// k19-fitplain: see fit.h
+std::vector<size_t> common_fit_margin_steps_mib(const char * spec) {
+    std::vector<size_t> steps;
+    const std::string str = spec != nullptr ? spec : "";
+    size_t pos = 0;
+    while (pos < str.size()) {
+        const size_t c = str.find(',', pos);
+        const std::string tok = str.substr(pos, c == std::string::npos ? std::string::npos : c - pos);
+        if (!tok.empty()) {
+            steps.push_back((size_t) std::max(0, atoi(tok.c_str())) * 1024 * 1024);
+        }
+        if (c == std::string::npos) {
+            break;
+        }
+        pos = c + 1;
+    }
+    return steps;
+}
+
+std::vector<std::vector<size_t>> common_fit_margin_trials(const std::vector<size_t> & margins, const std::vector<size_t> & steps) {
+    std::vector<std::vector<size_t>> trials;
+    for (const size_t step : steps) {
+        std::vector<size_t> mg = margins;
+        bool lower = false;
+        for (auto & m : mg) {
+            if (m > step) {
+                m = step;
+                lower = true;
+            }
+        }
+        if (lower && (trials.empty() || trials.back() != mg)) {
+            trials.push_back(mg);
+        }
+    }
+    return trials;
+}
+
+bool common_fit_plain_spill_gate(const std::vector<int> & headless, const char * force) {
+    if (force != nullptr && force[0] != '\0') {
+        return atoi(force) != 0;
+    }
+    return !headless.empty() && std::all_of(headless.begin(), headless.end(), [](int h) { return h == 1; });
+}
+
+std::vector<int> common_fit_devices_headless(const std::vector<ggml_backend_dev_t> & devs) {
+    std::vector<int> res;
+    for (ggml_backend_dev_t dev : devs) {
+        if (dev == nullptr) {
+            continue;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        auto fn = reg ? (int (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_headless") : nullptr;
+        res.push_back(fn != nullptr ? fn(dev) : -1);
+    }
+    return res;
+}

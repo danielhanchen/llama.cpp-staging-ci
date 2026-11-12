@@ -102,6 +102,9 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#if !defined(_WIN32)
+#include <dlfcn.h>
+#endif
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
@@ -12421,6 +12424,91 @@ static int ggml_backend_cuda_dev_compute_capability(ggml_backend_dev_t dev) {
     return cc >= GGML_CUDA_CC_OFFSET_MTHREADS ? -1 : cc;   // NVIDIA only (AMD / Moore Threads carry an offset)
 }
 
+// k19-fitplain: whether a CUDA device drives a display: 1 no display (headless), 0 a display or a display watchdog, -1 unknown.
+// 0 where the device has a kernel run time limit (cudaDevAttrKernelExecTimeout: set by the display watchdog, X / a compositor on
+// Linux, every WDDM device on Windows) or where NVML reports a display initialized on the device (nvmlDeviceGetDisplayActive: an X
+// server / compositor / framebuffer holding screen memory). 1 only where neither holds and NVML answered (Linux), or for a TCC device
+// (Windows). nvmlDeviceGetDisplayMode is logged, not used: datacenter boards report it enabled without any display.
+// Anything that cannot be read is -1: the caller keeps its default device margin. Read once per device
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(_WIN32)
+static int ggml_cuda_nvml_display(const char * pci_bus_id, int & active, int & mode) {
+    typedef int (*nvml_init_t)(void);
+    typedef int (*nvml_by_pci_t)(const char *, void **);
+    typedef int (*nvml_state_t)(void *, int *);
+    void * lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY | RTLD_LOCAL);
+    if (lib == nullptr) {
+        return -1;
+    }
+    auto f_init   = (nvml_init_t)   dlsym(lib, "nvmlInit_v2");
+    auto f_shut   = (nvml_init_t)   dlsym(lib, "nvmlShutdown");
+    auto f_by_pci = (nvml_by_pci_t) dlsym(lib, "nvmlDeviceGetHandleByPciBusId_v2");
+    auto f_active = (nvml_state_t)  dlsym(lib, "nvmlDeviceGetDisplayActive");
+    auto f_mode   = (nvml_state_t)  dlsym(lib, "nvmlDeviceGetDisplayMode");
+    int ret = -1;
+    if (f_init != nullptr && f_shut != nullptr && f_by_pci != nullptr && f_active != nullptr && f_mode != nullptr && f_init() == 0) {
+        void * h = nullptr;
+        if (f_by_pci(pci_bus_id, &h) == 0 && f_active(h, &active) == 0) {
+            // NVML_FEATURE_DISABLED = 0. Display mode (a connector enabled) is logged only: datacenter boards report it enabled with
+            // no display (Colab L4: mode 1, display active 0, no run time limit)
+            if (f_mode(h, &mode) != 0) {
+                mode = -1;
+            }
+            ret = active == 0 ? 1 : 0;
+        }
+        f_shut();
+    }
+    dlclose(lib);
+    return ret;
+}
+#endif
+
+static int ggml_backend_cuda_dev_headless(ggml_backend_dev_t dev) {
+    if (dev == nullptr || ggml_backend_dev_backend_reg(dev) != ggml_backend_cuda_reg()) {
+        return -1;
+    }
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    return -1;
+#else
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    static std::mutex mtx;
+    static std::map<int, int> known;
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = known.find(device);
+    if (it != known.end()) {
+        return it->second;
+    }
+    int res = -1;
+    int timeout = 0;
+    int active  = -1;   // NVML display active / display mode (-1: not read)
+    int mode    = -1;
+    if (cudaDeviceGetAttribute(&timeout, cudaDevAttrKernelExecTimeout, device) != cudaSuccess) {
+        (void) cudaGetLastError();
+    } else if (timeout != 0) {
+        res = 0;
+    } else {
+#ifdef _WIN32
+        int tcc = 0;
+        if (cudaDeviceGetAttribute(&tcc, cudaDevAttrTccDriver, device) != cudaSuccess) {
+            (void) cudaGetLastError();
+        } else if (tcc != 0) {
+            res = 1;
+        }
+#else
+        char pci[32] = {0};
+        if (cudaDeviceGetPCIBusId(pci, (int) sizeof(pci), device) != cudaSuccess) {
+            (void) cudaGetLastError();
+        } else {
+            res = ggml_cuda_nvml_display(pci, active, mode);
+        }
+#endif
+    }
+    GGML_LOG_INFO("%s: device %d: kernel run time limit %d, NVML display active %d mode %d: display %s\n", __func__, device, timeout,
+        active, mode, res == 1 ? "none (headless)" : res == 0 ? "attached or watchdog" : "unknown");
+    known[device] = res;
+    return res;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
 // k17-small (release-split): mark / trim every memory pool of a CUDA backend (see ggml_cuda_pool::mark / trim); trim synchronizes the
 // device first and returns the bytes given back. Other backends: nothing (0)
 static size_t ggml_backend_cuda_pool_mark_trim(ggml_backend_t backend, bool trim) {
@@ -12581,6 +12669,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_dev_compute_capability") == 0) {
         return (void *)ggml_backend_cuda_dev_compute_capability;
+    }
+    if (strcmp(name, "ggml_backend_dev_headless") == 0) {
+        return (void *)ggml_backend_cuda_dev_headless;
     }
     if (strcmp(name, "ggml_backend_pool_mark_trim") == 0) {
         return (void *)ggml_backend_cuda_pool_mark_trim;

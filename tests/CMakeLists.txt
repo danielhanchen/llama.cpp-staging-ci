@@ -440,6 +440,8 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 llama_build_and_test(test-arg-parser.cpp)
 # --fit: the run-time reserve of a small-device placement (common/fit.h)
 llama_build_and_test(test-fit-small-reserve.cpp)
+# --fit: the margin step-down of a plain dense launch on a device with no display (common/fit.h)
+llama_build_and_test(test-fit-plain-spill.cpp)
 # token-tiled gated delta-net vs the AR kernel, byte for byte on the GPU backend (SKIP without one)
 llama_build_and_test(test-gdn-tiled-exact.cpp LINK ggml)
 # the ops added here (KQ_MASK, MOE_CACHE_LOOKUP, the GDN replay window) are refused by the meta backend (-sm tensor) and RPC and run on the CPU

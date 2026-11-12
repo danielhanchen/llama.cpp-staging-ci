@@ -3909,6 +3909,107 @@ uma_restart:
                 }
             }
         }
+        // k19-fitplain: the k19-spilldrop step-down for a plain launch (no draft model, no MTP heads asked) of a dense model. Where the
+        // fit at the default 1024 MiB margin moves whole layers to the CPU, every token runs those layers on the host: Kaggle T4,
+        // Qwen3.8-27B UD-Q3_K_XL, ctx 32768: 5 of 65 blocks on the CPU, 4.41 / 4.09 / 3.60 tok/s (chat / 8k / 16k), against 8.70 / 9.86
+        // / 9.51 with every block on the device beside a 256 MiB margin (157-159 MiB free at the lowest with 192 MiB). So the fit runs
+        // again beside the margins of LLAMA_FIT_PLAIN_SPILL_MARGINS_MIB (512,448,256,192), and the first that keeps every layer on the
+        // device is taken; where none does, the default placement stays. Only on devices that drive no display (the CUDA backend's
+        // ggml_backend_dev_headless: no kernel run time limit and NVML reports no display active or connected): a desktop's compositor
+        // and other apps take and give back device memory while the server runs, which the smaller margin does not cover. An unknown
+        // signal (no NVML, another backend, Windows WDDM) keeps 1024 MiB. Not with a --fit-target or -ngl given (the user's),
+        // nor for a model with experts (their own small-device margin, k13-small). Placement only: the text is the one of the same
+        // launch with -fitt at that margin. LLAMA_FIT_PLAIN_SPILL=0: off; LLAMA_FIT_PLAIN_HEADLESS=1 / 0: take / refuse the step-down
+        // whatever the signal (a desktop user who knows the headroom, or a test)
+        {
+            const char * e_ps = getenv("LLAMA_FIT_PLAIN_SPILL");
+            const bool   on   = e_ps == nullptr || atoi(e_ps) != 0;
+            // a placement keeps every weight on the device: every layer, and no tensor override beyond the given ones (the
+            // KV-resident placement moves FFN tensors of every-layer placements to system memory by overrides)
+            const auto n_tbo = [](const llama_model_params & mp) {
+                size_t n = 0;
+                for (const llama_model_tensor_buft_override * t = mp.tensor_buft_overrides; t != nullptr && t->pattern != nullptr; t++) {
+                    n++;
+                }
+                return n;
+            };
+            const size_t n_tbo_in = n_tbo(mparams_in);
+            const auto all_on_device = [&](const llama_model_params & mp) {
+                return mp.n_gpu_layers == llama_model_default_params().n_gpu_layers && n_tbo(mp) <= n_tbo_in;
+            };
+            if (on && !model_only && !has_draft && !spec_mtp && !params.fit_params_target_set &&
+                    fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && !all_on_device(mparams) &&
+                    mparams_in.n_gpu_layers == llama_model_default_params().n_gpu_layers && [&] {
+                        std::vector<uint8_t> exps;
+                        return common_model_n_layer(params.model.path, exps) > 0 && !exps.empty() &&
+                            std::all_of(exps.begin(), exps.end(), [](uint8_t x) { return x == 0; });
+                    }()) {
+                std::vector<ggml_backend_dev_t> devs;
+                if (!params.devices.empty()) {
+                    devs = params.devices;
+                } else {
+                    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+                        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                            devs.push_back(dev);
+                        }
+                    }
+                }
+                const std::vector<int> headless = common_fit_devices_headless(devs);
+                const char * e_hl = getenv("LLAMA_FIT_PLAIN_HEADLESS");
+                std::string sig;
+                for (int h : headless) {
+                    sig += sig.empty() ? "" : ",";
+                    sig += h == 1 ? "headless" : h == 0 ? "display" : "unknown";
+                }
+                if (!common_fit_plain_spill_gate(headless, e_hl)) {
+                    COM_INF("%s: --fit: k19-fitplain: %d layers on the device beside the default margin; device display signal [%s]: "
+                        "the margin stays (LLAMA_FIT_PLAIN_HEADLESS=1 steps it down)\n", __func__, mparams.n_gpu_layers, sig.c_str());
+                } else {
+                    const char * e_m = getenv("LLAMA_FIT_PLAIN_SPILL_MARGINS_MIB");
+                    const std::vector<std::vector<size_t>> trials = common_fit_margin_trials(margins_in,
+                        common_fit_margin_steps_mib(e_m != nullptr ? e_m : "512,448,256,192"));
+                    for (const std::vector<size_t> & mgs : trials) {
+                        llama_model_params   mps  = mparams_in;
+                        llama_context_params cps  = cparams_in;
+                        std::vector<float>   tss  = ts_in;
+                        std::vector<llama_model_tensor_buft_override> tbos = tbo_in;
+                        std::vector<size_t>  mgt  = mgs;
+                        mps.tensor_split = tss.data();
+                        if (mparams_in.tensor_buft_overrides != nullptr && !tbo_in.empty()) {
+                            mps.tensor_buft_overrides = tbos.data();
+                        }
+                        common_fit_set_moe_margin_auto(!params.fit_params_target_set);
+                        const common_params_fit_status sts = common_fit_params(params.model.path.c_str(), &mps, &cps, tss.data(),
+                            tbos.empty() ? nullptr : tbos.data(), mgt.data(), params.fit_params_min_ctx, nullptr, fit_log_level,
+                            params.fit_kv_resident);
+                        if (sts != COMMON_PARAMS_FIT_STATUS_SUCCESS || !all_on_device(mps)) {
+                            continue;
+                        }
+                        COM_WRN("%s: --fit: k19-fitplain: %d layers on the device beside the default margin (-1: every layer, tensors moved), every layer beside a %zu MiB "
+                            "margin on a device with no display [%s]: the smaller margin is used (LLAMA_FIT_PLAIN_SPILL=0 keeps the default)\n",
+                            __func__, mparams.n_gpu_layers, mgt[0]/(1024*1024), sig.c_str());
+                        params.tensor_buft_overrides = tbos;
+                        std::copy(tss.begin(), tss.end(), params.tensor_split);
+                        params.fit_params_target = mgt;
+                        const bool tbo_ours = mps.tensor_buft_overrides != nullptr && mps.tensor_buft_overrides == tbos.data();
+                        mparams = mps;
+                        cparams = cps;
+                        mparams.tensor_split = params.tensor_split;
+                        if (tbo_ours) {
+                            mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
+                        }
+                        fit_status = sts;
+                        break;
+                    }
+                    if (!all_on_device(mparams)) {
+                        COM_INF("%s: --fit: k19-fitplain: no margin of the step list keeps every layer on the device, the default "
+                            "placement stays\n", __func__);
+                    }
+                }
+            }
+        }
         moe_margin_gain = fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS ? (moe_gain_mtp_trial ? moe_gain_first : common_fit_moe_margin_gain()) : 0;
 
         // --moe-cache-mib auto that the fit did not size (a failed or skipped fit, no host experts on a device) is no cache, as with
