@@ -5,7 +5,9 @@
 // The device top-k runs on the CPU backend here (a backend sampler chain), with a small k_dev so that the full-row fallback is taken.
 //
 // The model's tokenizer is replaced by an SPM vocabulary of real text pieces (single characters, JSON pieces, <tool_call>, <think>,
-// words), written next to the input model, so the grammars see text.
+// words), written next to the input model, so the grammars see text. Its F32 / F16 weights are drawn again from a fixed seed
+// (DTOPK_TEST_SEED, default below), as test-llama-archs draws them: the generate-models fixture seeds from std::random_device, so
+// without this every ctest run tested another model, and on some the greedy reply had no token to trigger a lazy grammar mid-reply.
 //
 // Usage: test-dtopk-grammar <model.gguf (vocab >= 1024)> [--expect-diff]
 //   --expect-diff: run with LLAMA_DEVICE_TOPK_GRAMMAR_NOFALLBACK=1 (the candidates decide every position, inexact): passes only if
@@ -27,6 +29,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <set>
+#include <functional>
+#include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -93,6 +98,10 @@ static std::vector<std::string> make_vocab(uint32_t n_vocab) {
     return v;
 }
 
+// a seed with which every case has its setup (a token to trigger a lazy grammar mid-reply in each preset and mode, a reply that
+// differs under LLAMA_DEVICE_TOPK_GRAMMAR_NOFALLBACK=1)
+#define DTOPK_SEED_DEFAULT 1234
+
 static bool write_spm_model(const char * in, const std::string & out, uint32_t * n_vocab_out) {
     ggml_context * gctx = nullptr;
     gguf_init_params ip = { /*no_alloc =*/ false, /*ctx =*/ &gctx };
@@ -127,8 +136,25 @@ static bool write_spm_model(const char * in, const std::string & out, uint32_t *
     gguf_set_val_u32(dst, "tokenizer.ggml.bos_token_id", 1);
     gguf_set_val_u32(dst, "tokenizer.ggml.eos_token_id", 2);
 
+    // the weights: normal(0, 0.1) keyed on the tensor name, as test-llama-archs fill_normal, from a fixed seed (its property fillers,
+    // ssm_a / _resid_, keep the fixture's values: the architectures used here have none)
+    const char * es = getenv("DTOPK_TEST_SEED");
+    const size_t seed = es != nullptr ? (size_t) strtoull(es, nullptr, 10) : (size_t) DTOPK_SEED_DEFAULT;
     for (int64_t i = 0; i < gguf_get_n_tensors(src); ++i) {
-        const ggml_tensor * t = ggml_get_tensor(gctx, gguf_get_tensor_name(src, i));
+        ggml_tensor * t = ggml_get_tensor(gctx, gguf_get_tensor_name(src, i));
+        if ((t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) && strstr(t->name, "ssm_a") == nullptr && strstr(t->name, "_resid_") == nullptr) {
+            std::mt19937 gen(seed ^ std::hash<std::string>{}(t->name));
+            std::normal_distribution<float> dis(0.0f, 0.1f);
+            const int64_t n = ggml_nelements(t);
+            for (int64_t j = 0; j < n; ++j) {
+                const float v = dis(gen);
+                if (t->type == GGML_TYPE_F32) {
+                    ((float *) t->data)[j] = v;
+                } else {
+                    ((ggml_fp16_t *) t->data)[j] = ggml_fp32_to_fp16(v);
+                }
+            }
+        }
         gguf_add_tensor(dst, t);
     }
     const bool ok = gguf_write_to_file(dst, out.c_str(), false);
@@ -319,12 +345,16 @@ static run_result run(const run_cfg & cfg, const std::vector<llama_token> & prom
 static std::string text_of(const std::vector<llama_token> & toks) {
     std::string s;
     for (auto t : toks) {
-        s += common_token_to_piece(g_vocab, t, true);
+        s += t >= 0 && t < g_n_vocab ? common_token_to_piece(g_vocab, t, true) : std::string("<bad id ") + std::to_string(t) + ">";
     }
     return s;
 }
 
-int main(int argc, char ** argv) {
+static bool in_vocab(const std::vector<llama_token> & toks) {
+    return std::all_of(toks.begin(), toks.end(), [](llama_token t) { return t >= 0 && t < g_n_vocab; });
+}
+
+static int run_main(int argc, char ** argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s <model.gguf> [--expect-diff]\n", argv[0]);
         return 2;
@@ -459,10 +489,14 @@ int main(int argc, char ** argv) {
             cm.mode = mode;
             cm.ref = &r0row.toks;
             r0 = run(cm, prompt, false);
+            if (r0.threw || r0.toks.size() != 64 || !in_vocab(r0.toks)) {
+                check(std::string(pr.name) + " / " + mname + ": reference reply (" + r0.err + ")", false);
+                continue;
+            }
         }
         llama_token t_mid = LLAMA_TOKEN_NULL;
         size_t at_mid = 0;
-        for (size_t i = 10; i < 30 && t_mid < 0; ++i) {
+        for (size_t i = 8; i < 40 && t_mid < 0; ++i) {
             const llama_token t = r0.toks[i];
             const std::string pc = common_token_to_piece(g_vocab, t, true);
             const bool printable = !pc.empty() && std::all_of(pc.begin(), pc.end(), [](char ch) { return ch > 0x20 && ch < 0x7f && ch != '"' && ch != '\\'; });
@@ -479,6 +513,11 @@ int main(int argc, char ** argv) {
             t_never = t;
         }
         check(std::string(pr.name) + " / " + mname + ": a trigger token mid-reply", t_mid >= 0);
+        if (t_mid < 0) {
+            // the reply repeats itself from the start: the lazy cases cannot be set up (a FAIL above, not a skip)
+            printf("  no token of the reply at 8..39 is new (as a token and as text) and printable: %s\n", text_of(r0.toks).c_str());
+            continue;
+        }
         const std::string p_mid = common_token_to_piece(g_vocab, t_mid, true);
 
         struct gcase { std::string name; common_params_sampling sp; llama_token pre = LLAMA_TOKEN_NULL; std::string expect = {}; bool ref0 = false; };
@@ -581,6 +620,9 @@ int main(int argc, char ** argv) {
                 const run_result d = run(c, prompt, true);
                 n_cases++;
                 const bool same = !a.threw && !d.threw && a.toks == d.toks;
+                if (!expect_diff) {
+                    check(nm + ": every sampled id is in the vocabulary", in_vocab(a.toks) && in_vocab(d.toks));
+                }
                 n_diff += !same;
                 tot_rows += d.st.n_rows; tot_rej += d.st.n_rejected; tot_fb += d.st.n_fallback; tot_forced += d.st.n_forced;
                 char info[160];
@@ -634,4 +676,16 @@ int main(int argc, char ** argv) {
     llama_backend_free();
     printf("%s\n", g_fail ? "FAIL" : "PASS");
     return g_fail;
+}
+
+int main(int argc, char ** argv) {
+    // a FAIL with the message, never an abort
+    try {
+        return run_main(argc, argv);
+    } catch (const std::exception & e) {
+        printf("uncaught exception: %s\nFAIL\n", e.what());
+    } catch (...) {
+        printf("uncaught exception\nFAIL\n");
+    }
+    return 1;
 }
