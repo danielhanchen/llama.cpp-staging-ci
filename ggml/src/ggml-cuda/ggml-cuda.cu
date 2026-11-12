@@ -12427,10 +12427,11 @@ static int ggml_backend_cuda_dev_compute_capability(ggml_backend_dev_t dev) {
 // k19-fitplain: whether a CUDA device drives a display: 1 no display (headless), 0 a display or a display watchdog, -1 unknown.
 // 0 where the device has a kernel run time limit (cudaDevAttrKernelExecTimeout: set by the display watchdog, X / a compositor on
 // Linux, every WDDM device on Windows) or where NVML reports a display initialized (nvmlDeviceGetDisplayActive) or a display
-// connected (nvmlDeviceGetDisplayMode). 1 only where none holds and NVML answered both (Linux), or for a TCC device (Windows).
+// connected (nvmlDeviceGetDisplayMode, where the device reports it). 1 only where none holds and NVML answered (Linux), or for a TCC
+// device (Windows).
 // Anything that cannot be read is -1: the caller keeps its default device margin. Read once per device
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(_WIN32)
-static int ggml_cuda_nvml_display(const char * pci_bus_id) {
+static int ggml_cuda_nvml_display(const char * pci_bus_id, int & active, int & mode) {
     typedef int (*nvml_init_t)(void);
     typedef int (*nvml_by_pci_t)(const char *, void **);
     typedef int (*nvml_state_t)(void *, int *);
@@ -12446,10 +12447,16 @@ static int ggml_cuda_nvml_display(const char * pci_bus_id) {
     int ret = -1;
     if (f_init != nullptr && f_shut != nullptr && f_by_pci != nullptr && f_active != nullptr && f_mode != nullptr && f_init() == 0) {
         void * h = nullptr;
-        int active = -1;
-        int mode   = -1;
-        if (f_by_pci(pci_bus_id, &h) == 0 && f_active(h, &active) == 0 && f_mode(h, &mode) == 0) {
-            ret = active == 0 && mode == 0 ? 1 : 0;   // NVML_FEATURE_DISABLED = 0
+        if (f_by_pci(pci_bus_id, &h) == 0 && f_active(h, &active) == 0) {
+            // NVML_FEATURE_DISABLED = 0; a display mode the device does not report (NVML_ERROR_NOT_SUPPORTED = 3) is -2 and leaves
+            // the answer to display active, any other error is unknown
+            const int rm = f_mode(h, &mode);
+            if (rm == 3) {
+                mode = -2;
+            }
+            if (rm == 0 || rm == 3) {
+                ret = active == 0 && (mode == 0 || mode == -2) ? 1 : 0;
+            }
         }
         f_shut();
     }
@@ -12475,6 +12482,8 @@ static int ggml_backend_cuda_dev_headless(ggml_backend_dev_t dev) {
     }
     int res = -1;
     int timeout = 0;
+    int active  = -1;   // NVML display active / display mode (-1: not read)
+    int mode    = -1;
     if (cudaDeviceGetAttribute(&timeout, cudaDevAttrKernelExecTimeout, device) != cudaSuccess) {
         (void) cudaGetLastError();
     } else if (timeout != 0) {
@@ -12492,12 +12501,12 @@ static int ggml_backend_cuda_dev_headless(ggml_backend_dev_t dev) {
         if (cudaDeviceGetPCIBusId(pci, (int) sizeof(pci), device) != cudaSuccess) {
             (void) cudaGetLastError();
         } else {
-            res = ggml_cuda_nvml_display(pci);
+            res = ggml_cuda_nvml_display(pci, active, mode);
         }
 #endif
     }
-    GGML_LOG_INFO("%s: device %d: kernel run time limit %d, display %s\n", __func__, device, timeout,
-        res == 1 ? "none (headless)" : res == 0 ? "attached or watchdog" : "unknown");
+    GGML_LOG_INFO("%s: device %d: kernel run time limit %d, NVML display active %d mode %d: display %s\n", __func__, device, timeout,
+        active, mode, res == 1 ? "none (headless)" : res == 0 ? "attached or watchdog" : "unknown");
     known[device] = res;
     return res;
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
