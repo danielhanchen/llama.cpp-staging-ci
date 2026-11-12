@@ -1983,17 +1983,19 @@ private:
                 }
             }
             dev_free += igpu_free;
-            // k19-bigverify (LLAMA_SPEC_TPP_NEED_PLE=1: the whole file, as before): without tensor overrides the per-layer embedding table
-            // never takes device memory, so it is not counted. Colab A100 80 GB, Qwen3.8-Flash-Next UD-IQ4_XS + MTP drafter: need 94815 MiB
-            // with it against 80725 MiB free, so the windows stayed at 2 drafts, while the fit placed every layer and expert on the card
-            // and ran no MoE cache (rb12_h2: 2.78 tokens per pass, the G4 full card 4.20 with k19-depth's windows)
+            // k19-bigverify (opt-in, LLAMA_SPEC_TPP_NEED_PLE=0): without tensor overrides the per-layer embedding table never takes device
+            // memory, so it can be left out of the need. Colab A100 80 GB, Qwen3.8-Flash-Next UD-IQ4_XS + MTP drafter: need 94815 MiB with
+            // its 26.8 GiB table against 80725 MiB free keeps the windows at 2 drafts although the fit places every expert on the card and
+            // runs no MoE cache. Left out (bv_abh), k19-tpp + k19-depth's 4-draft windows there: chat 156.1 -> 159.7 tok/s (+2.3%) but 8k
+            // 148.2 -> 120.6 (-18.6%: each verify row costs ~2.9 ms on that card, 4.06 / 3.05 tokens per pass at 25.5 / 25.3 ms). So the
+            // default (unset / 1) still counts the whole file until the deep windows are priced per device
             const uint64_t tgt_bytes = mtp_shape ? tpp_gguf_bytes(params.model.path) : 0;
             const uint64_t ple_bytes = mtp_shape && tgt_bytes > 0 && !tpp_host_experts(params.tensor_buft_overrides, params.moe_cache_size, params.moe_cache_auto) &&
-                !(getenv("LLAMA_SPEC_TPP_NEED_PLE") != nullptr && atoi(getenv("LLAMA_SPEC_TPP_NEED_PLE")) != 0) ? tpp_host_input_bytes(params.model.path) : 0;
+                getenv("LLAMA_SPEC_TPP_NEED_PLE") != nullptr && atoi(getenv("LLAMA_SPEC_TPP_NEED_PLE")) == 0 ? tpp_host_input_bytes(params.model.path) : 0;
             const uint64_t need = mtp_shape ? tgt_bytes - std::min(ple_bytes, tgt_bytes) + tpp_gguf_bytes(sp.draft.mparams.path) + (1536ull << 20) : 0;
             if (ple_bytes > 0) {
                 SRV_INF("k19-bigverify: the per-layer embedding table (%.0f MiB) stays in host memory: not counted in the device need of the "
-                    "draft window rule (LLAMA_SPEC_TPP_NEED_PLE=1: counted)\n", ple_bytes/1048576.0);
+                    "draft window rule (LLAMA_SPEC_TPP_NEED_PLE=0; unset: counted)\n", ple_bytes/1048576.0);
             }
             // (no GPU: no MoE cache. LLAMA_SPEC_TPP_FORCE_CACHED=1, a test hook: as if the experts did not fit)
             const char * ce = getenv("LLAMA_SPEC_TPP_CACHED");
