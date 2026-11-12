@@ -3,6 +3,7 @@
 
 #include "llama.h"
 #include "common.h"
+#include <cstdio>
 
 struct common_speculative;
 
@@ -29,6 +30,10 @@ std::string common_speculative_type_to_str(enum common_speculative_type type);
 
 // return the max number of draft tokens based on the speculative parameters
 int32_t common_speculative_n_max(const common_params_speculative * spec);
+
+// k19-q4xaccept diagnostic: LLAMA_SPEC_ACC_LOG=path appends one line per draft token (D), verify (V) and request (R / P), in order;
+// null when unset
+FILE * common_spec_acc_log();
 
 // return the max number of draft tokens from the initialized implementations
 int32_t common_speculative_n_max(const common_speculative * spec);

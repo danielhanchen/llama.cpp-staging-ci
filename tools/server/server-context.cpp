@@ -242,6 +242,20 @@ static bool spec_end_full_window() {
     return v;
 }
 
+// k19-q4xaccept: a request with penalties (Studio sends presence 1.5 for every Qwen3.5 / 3.6 / 3.8 request; the server's window is
+// the last 64 tokens) drafts the argmax of the draft's candidates AFTER those penalties (window = the target's last tokens plus the
+// ones drafted before them), the token the target most likely emits; before, the draft's raw argmax was often a token the penalty had
+// just pushed down (a word of the last 64 tokens), which the target then rejected. Drafts only: the verify is unchanged (greedy:
+// argmax match, sampled: sample-and-match with the target's own RNG), so the output is unchanged.
+// LLAMA_SPEC_DRAFT_PEN=0: the raw argmax (as before)
+static bool spec_draft_pen_on() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_SPEC_DRAFT_PEN");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return v;
+}
+
 static bool spec_replay_reverify() {
     static const bool v = getenv("LLAMA_SPEC_REPLAY_REVERIFY") != nullptr && atoi(getenv("LLAMA_SPEC_REPLAY_REVERIFY")) != 0;
     return v;
@@ -893,6 +907,7 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+        n_spec_pen = 0;
 
         n_predict_max = -1;
 
@@ -1004,6 +1019,8 @@ struct server_slot {
     bool can_speculate() const {
         return !!spec && !spec_off_req;
     }
+
+    int32_t n_spec_pen = 0; // k19-q4xaccept: passes drafted with the request's penalties (this request)
 
     // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
     bool use_spec_rejection() const {
@@ -1285,6 +1302,9 @@ struct server_slot {
             SLT_INF(*this,
                     "draft acceptance = %0.5f (%5d accepted / %5d generated), mean len = %5.2f\n",
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
+            if (n_spec_pen > 0) {
+                SLT_INF(*this, "penalty-aware drafts: %d passes drafted after the request's penalties (LLAMA_SPEC_DRAFT_PEN)\n", n_spec_pen);
+            }
             if (gov.enabled) {
                 SLT_INF(*this, "spec governor: %" PRId64 " wins, %" PRId64 " losses, %" PRId64 " parked steps, %" PRId64 " drafted / %" PRId64
                         " plain steps (session)\n", gov.n_wins, gov.n_losses, gov.n_parked, gov.n_spec_steps, gov.n_plain_steps);
@@ -5272,6 +5292,19 @@ private:
                                 SLT_INF(slot, "shared noise: drafts take the target's noise (seed %u, key %llu); verify by sample-and-match\n",
                                         slot.spec_sn.seed, (unsigned long long) slot.spec_sn.pos);
                             }
+                        } else if (spec_draft_pen_on() && !params_base.speculative.draft.probabilistic &&
+                                   common_sampler_penalty_draft_init(slot.smpl.get(), slot.spec_sn)) {
+                            // k19-q4xaccept: the request has penalties: drafts are the argmax after them (spec_draft_pen_on)
+                            auto & dpr = common_speculative_get_draft_params(spec.get(), slot.id);
+                            dpr.sn       = &slot.spec_sn;
+                            dpr.result_q = nullptr;
+                            slot.n_spec_pen++;
+                            static bool logged = false;
+                            if (!logged) {
+                                logged = true;
+                                SLT_INF(slot, "%s", "penalty-aware drafts: the request's penalties apply to the draft's candidates before its argmax "
+                                        "(LLAMA_SPEC_DRAFT_PEN=0: off)\n");
+                            }
                         }
 
                         drafting.push_back(&slot);
@@ -6700,6 +6733,17 @@ private:
                 }
 
                 if (slot.can_speculate()) {
+                    if (FILE * lf = common_spec_acc_log()) {
+                        const auto & sp = slot.task->params.sampling;
+                        fprintf(lf, "R %d temp=%.3f top_k=%d top_p=%.3f min_p=%.3f seed=%u n_max=%d\n", slot.task->id, sp.temp, sp.top_k, sp.top_p,
+                                sp.min_p, sp.seed, common_speculative_n_max(spec.get()));
+                        const auto toks = slot.prompt.tokens.get_text_tokens();
+                        std::string ps = "P";
+                        for (llama_token t : toks) {
+                            ps += " " + std::to_string(t);
+                        }
+                        fprintf(lf, "%s\n", ps.c_str());
+                    }
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                     slot.gov.new_sequence();
                     slot.gov_t_last = 0;
@@ -6815,6 +6859,18 @@ private:
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 }
                 srv_pass_timer().stamp(server_pass_timer::ACC1);
+                if (FILE * lf = common_spec_acc_log(); lf != nullptr && synth_probs.empty()) {
+                    // k19-q4xaccept diagnostic: drafts, then the tokens kept (the last one is the target's own at the first mismatch)
+                    std::string vs = string_format("V %d %d %d", slot.spec_is_replay ? 1 : 0, (int) slot.spec_draft.size(), use_rejection ? 1 : 0);
+                    for (llama_token t : slot.spec_draft) {
+                        vs += " " + std::to_string(t);
+                    }
+                    vs += " |";
+                    for (llama_token t : accepted) {
+                        vs += " " + std::to_string(t);
+                    }
+                    fprintf(lf, "%s\n", vs.c_str());
+                }
                 // k13: the probabilities of the accepted tokens come from their verify rows, read now (a rollback below may decode
                 // again); they were left empty, so drafted positions looked like a uniform distribution to the KLD gate
                 slot.spec_probs.clear();

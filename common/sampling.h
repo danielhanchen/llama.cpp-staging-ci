@@ -152,10 +152,19 @@ struct common_shared_noise_draft {
     float    pen_present = 0.0f;
     std::vector<llama_token> window;              // the target's last pen_last_n accepted tokens
     std::vector<std::pair<llama_token, float>> scratch;
+    // k19-q4xaccept: 0 = Gumbel-max with the target's shared noise; 2 = the argmax of the mirrored chain (the request's penalties applied
+    // to the draft's candidates)
+    int32_t mode = 0;
 };
 
 // fills sn from the target sampler: false (sn.on = false) when its chain does not end in the shared-noise stage
 bool common_sampler_shared_noise_draft_init(const struct common_sampler * gsmpl, common_shared_noise_draft & sn);
+
+// k19-q4xaccept: fills sn (mode 2) from a target sampler whose request has penalties (repeat / frequency / presence over a window):
+// the drafter then proposes the argmax of its candidates after the request's penalties (window = the target's last tokens plus the ones
+// drafted before), the token the target is most likely to pick. false (sn.on = false) without penalties (the argmax is unchanged
+// then), for shared noise, mirostat and backend sampling
+bool common_sampler_penalty_draft_init(const struct common_sampler * gsmpl, common_shared_noise_draft & sn);
 
 // the token a drafter proposes at draft index i (0 = the token after the target's last one) from its candidates cand[0..n) (raw
 // logits); drafted = the i tokens drafted before it. p_pick (optional): the token's probability under the mirrored chain

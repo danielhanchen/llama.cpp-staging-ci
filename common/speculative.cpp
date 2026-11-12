@@ -2803,6 +2803,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
+                if (FILE * lf = common_spec_acc_log()) {
+                    // pos, picked id, its draft probability, the draft's top id / p, 2nd p
+                    fprintf(lf, "D %d %d %.5f %d %.5f %.5f\n", (int) result.size() - 1, id, p_draft, cur_p->data[0].id, cur_p->data[0].p,
+                            cur_p->size > 1 ? cur_p->data[1].p : 0.0f);
+                }
+
                 if (dp.result_q) {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
@@ -3950,6 +3956,21 @@ static uint32_t common_get_enabled_speculative_configs(const std::vector<common_
         result |= (1u << configs[i]);
     }
     return result;
+}
+
+FILE * common_spec_acc_log() {
+    static FILE * f = [] () -> FILE * {
+        const char * p = getenv("LLAMA_SPEC_ACC_LOG");
+        if (p == nullptr || *p == 0) {
+            return nullptr;
+        }
+        FILE * h = fopen(p, "a");
+        if (h != nullptr) {
+            setvbuf(h, nullptr, _IOLBF, 1 << 16);
+        }
+        return h;
+    }();
+    return f;
 }
 
 int32_t common_speculative_n_max(const common_params_speculative * spec) {
