@@ -1973,7 +1973,11 @@ struct llama_moe_cache::impl {
             const char * env  = getenv("LLAMA_MOE_CACHE_PREFILL");
             const int    seed = seed_mode();
             // k19-ptres: the core (LLAMA_MOE_CORE=1) takes the first slots before the rest of the profile fills the others
-            if (!profile_file.empty() && profile_read() && (core_place(model) || true) && prefill_profile()) {
+            // k19-core2: the profile LLAMA_MOE_CORE keeps by itself warm-starts the cache only where a core was placed
+            // (LLAMA_MOE_CORE_WARM: unset = so, 1 = also without a core, 0 = never); without a core the warm start alone changed the text
+            // and cost decode on Colab L4 fn4nd full card (8k decode 15.5 -> 13.9 tok/s) and A100 16 GB (8k 50.1 -> 47.5 tok/s), so
+            // those tiers keep the cold start of LLAMA_MOE_CORE unset. An explicit LLAMA_MOE_CACHE_PROFILE always warm-starts.
+            if (!profile_file.empty() && profile_read() && (core_place(model) || true) && core_warm_ok() && prefill_profile()) {
                 profile_loaded = true;
             } else if (env != nullptr ? atoi(env) != 0 : seed == 1) {
                 prefill();
@@ -2221,6 +2225,27 @@ struct llama_moe_cache::impl {
         return avail > 0 && need > avail ? (size_t) (need - avail) : 0;
     }
 
+    // k19-core2: whether the auto profile of LLAMA_MOE_CORE warm-starts the cache (see the load)
+    bool core_warm_ok() const {
+        if (!core_profile_auto) {
+            return true;
+        }
+        static const int w = getenv("LLAMA_MOE_CORE_WARM") ? atoi(getenv("LLAMA_MOE_CORE_WARM")) : -1;
+        const bool ok = w > 0 || (w < 0 && core_on);
+        if (!ok) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-core2: no warm start from the core's profile %s: %s (LLAMA_MOE_CORE_WARM=1 warm-starts anyway)\n",
+                tag, profile_file.c_str(), w == 0 ? "LLAMA_MOE_CORE_WARM=0" : "no core was placed");
+        }
+        return ok;
+    }
+
+    // k19-core2: the smallest share of the host experts the device cache must hold for a core (LLAMA_MOE_CORE_MIN_FRAC, default 0.25):
+    // smaller caches release their banks for prompts, which a core refuses
+    static double core_min_frac() {
+        static const double f = getenv("LLAMA_MOE_CORE_MIN_FRAC") ? std::max(0.0, atof(getenv("LLAMA_MOE_CORE_MIN_FRAC"))) : 0.25;
+        return f;
+    }
+
     // k19-ptres: places the core of each group (the first profile entries of its layers) in its first slots; false if no core
     bool core_place(const llama_model & model) {
         if (core_mode == 0 || profile.empty()) {
@@ -2243,8 +2268,8 @@ struct llama_moe_cache::impl {
             why = "the cache spans several devices";
         } else if (wstore != nullptr) {
             why = "the experts are streamed (weight store)";
-        } else if (host_b == 0 || cache_b < host_b/4) {
-            why = "the cache holds less than 25% of the host experts";
+        } else if (host_b == 0 || (double) cache_b < core_min_frac()*(double) host_b) {
+            why = "the cache holds less than LLAMA_MOE_CORE_MIN_FRAC (default 25%) of the host experts";
         }
         core_want = why == nullptr ? core_target(model) : 0;
         if (why == nullptr && core_want == 0) {
