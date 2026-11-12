@@ -93,6 +93,19 @@ void common_fit_print(
 
 void common_memory_breakdown_print(const llama_context * ctx);
 
+// k19-fitplain: the default-margin step-down of a plain launch (no draft model, no MTP heads) of a dense model whose fit spills
+// whole layers to the CPU at the 1024 MiB margin (see common_init_result). Pure helpers, unit-tested in test-fit-plain-spill:
+//   - common_fit_margin_steps_mib: a comma list of MiB ("512,448,256,192") as bytes; empty tokens skipped, negatives as 0
+//   - common_fit_margin_trials: per step the margins lowered to it (a margin already at or below a step stays); a step that
+//     lowers none of them is left out, so the trials run from the largest margin down and never above the given margins
+//   - common_fit_plain_spill_gate: whether the step-down may act given each used device's display signal (1 headless, 0 a
+//     display / watchdog, -1 unknown): only if every device is headless; force "1" acts anyway, "0" never (LLAMA_FIT_PLAIN_HEADLESS)
+//   - common_fit_devices_headless: that signal for each device (the CUDA backend's ggml_backend_dev_headless, -1 elsewhere)
+std::vector<size_t>              common_fit_margin_steps_mib(const char * spec);
+std::vector<std::vector<size_t>> common_fit_margin_trials(const std::vector<size_t> & margins, const std::vector<size_t> & steps);
+bool                             common_fit_plain_spill_gate(const std::vector<int> & headless, const char * force);
+std::vector<int>                 common_fit_devices_headless(const std::vector<ggml_backend_dev_t> & devs);
+
 struct common_device_memory_data {
     int64_t total;
     int64_t free;
