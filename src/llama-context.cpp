@@ -9631,6 +9631,10 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
                     st.counts[id]++;
                 }
             }
+            // k19-l4ttft: the misses of every expert tensor of this layer are read now, in one batch (layers streamed through the RAM tier)
+            if (lctx->moe_cache && lctx->moe_cache->get_experts(src) != nullptr) {
+                lctx->moe_cache->prompt_layer_read(backend, src, st.used);
+            }
         }
 
         st.ids = ids;
