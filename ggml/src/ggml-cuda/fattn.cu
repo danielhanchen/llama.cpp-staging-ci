@@ -368,9 +368,13 @@ bool ggml_cuda_flash_attn_ext_mma_q8_inplace(const int device, const ggml_tensor
     return false;
 #else
     static const bool enabled = getenv("GGML_CUDA_FATTN_Q8_INPLACE") == nullptr || atoi(getenv("GGML_CUDA_FATTN_Q8_INPLACE")) != 0;
+    // only for few query rows (decode, verify windows): every query tile converts the K / V it reads, so a prompt ubatch of 2048
+    // rows converts the cache once per tile and loses to the one staged copy (A100, head size 256: 1.3-1.8x the staged time at
+    // 512 / 2048 rows, 0.44-0.9x at 2..17 rows). GGML_CUDA_FATTN_Q8_INPLACE_MAX_ROWS: the row limit (default 16)
+    static const int64_t max_rows = getenv("GGML_CUDA_FATTN_Q8_INPLACE_MAX_ROWS") ? atoll(getenv("GGML_CUDA_FATTN_Q8_INPLACE_MAX_ROWS")) : 16;
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    if (!enabled || K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q8_0) {
+    if (!enabled || K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q8_0 || dst->src[0]->ne[1] > max_rows) {
         return false;
     }
     const int cc = ggml_cuda_info().devices[device].cc;

@@ -259,6 +259,7 @@ int main(int argc, char ** argv) {
     for (int mode = 0; mode < 3; ++mode) {
         const std::string path = std::string(argc > 1 ? argv[1] : ".") + "/fattn_q8_exact_" + std::to_string(mode) + ".bin";
         set_env("GGML_CUDA_FATTN_Q8_INPLACE", mode == 2 ? "0" : "1");
+        set_env("GGML_CUDA_FATTN_Q8_INPLACE_MAX_ROWS", "1000000"); // every case in place (the default keeps prompt batches staged)
         set_env("GGML_CUDA_FATTN_Q8_MODE", mode == 1 ? "1" : "0");
         fflush(stdout);
         const std::string cmd = "\"" + std::string(argv[0]) + "\" --child " + std::to_string(mode) + " \"" + path + "\"";
