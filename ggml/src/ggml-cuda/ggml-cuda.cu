@@ -12426,9 +12426,9 @@ static int ggml_backend_cuda_dev_compute_capability(ggml_backend_dev_t dev) {
 
 // k19-fitplain: whether a CUDA device drives a display: 1 no display (headless), 0 a display or a display watchdog, -1 unknown.
 // 0 where the device has a kernel run time limit (cudaDevAttrKernelExecTimeout: set by the display watchdog, X / a compositor on
-// Linux, every WDDM device on Windows) or where NVML reports a display initialized (nvmlDeviceGetDisplayActive) or a display
-// connected (nvmlDeviceGetDisplayMode, where the device reports it). 1 only where none holds and NVML answered (Linux), or for a TCC
-// device (Windows).
+// Linux, every WDDM device on Windows) or where NVML reports a display initialized on the device (nvmlDeviceGetDisplayActive: an X
+// server / compositor / framebuffer holding screen memory). 1 only where neither holds and NVML answered (Linux), or for a TCC device
+// (Windows). nvmlDeviceGetDisplayMode is logged, not used: datacenter boards report it enabled without any display.
 // Anything that cannot be read is -1: the caller keeps its default device margin. Read once per device
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(_WIN32)
 static int ggml_cuda_nvml_display(const char * pci_bus_id, int & active, int & mode) {
@@ -12448,15 +12448,12 @@ static int ggml_cuda_nvml_display(const char * pci_bus_id, int & active, int & m
     if (f_init != nullptr && f_shut != nullptr && f_by_pci != nullptr && f_active != nullptr && f_mode != nullptr && f_init() == 0) {
         void * h = nullptr;
         if (f_by_pci(pci_bus_id, &h) == 0 && f_active(h, &active) == 0) {
-            // NVML_FEATURE_DISABLED = 0; a display mode the device does not report (NVML_ERROR_NOT_SUPPORTED = 3) is -2 and leaves
-            // the answer to display active, any other error is unknown
-            const int rm = f_mode(h, &mode);
-            if (rm == 3) {
-                mode = -2;
+            // NVML_FEATURE_DISABLED = 0. Display mode (a connector enabled) is logged only: datacenter boards report it enabled with
+            // no display (Colab L4: mode 1, display active 0, no run time limit)
+            if (f_mode(h, &mode) != 0) {
+                mode = -1;
             }
-            if (rm == 0 || rm == 3) {
-                ret = active == 0 && (mode == 0 || mode == -2) ? 1 : 0;
-            }
+            ret = active == 0 ? 1 : 0;
         }
         f_shut();
     }
