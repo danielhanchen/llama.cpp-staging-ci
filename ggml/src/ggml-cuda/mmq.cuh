@@ -1513,7 +1513,7 @@ static __global__ void mul_mat_q(
         ntx_host, nexperts_compact, tile_prefix);
 }
 
-// k19-mmq-pipe: compiled for sm 120 (consumer Blackwell) only; the host launches it there only (ggml_cuda_mmq_pipe_code)
+// k19-mmq-pipe: compiled for sm 120 (consumer Blackwell) and, k19-a100tc, sm 80 (A100); the host launches it there only (mmq_pipe_kernel)
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, int pipe>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1), (pipe & MMQ_PIPE_OCC2) ? 2 : 1)
 static __global__ void mul_mat_q_pipe(
@@ -1524,7 +1524,8 @@ static __global__ void mul_mat_q_pipe(
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const uint3 ntx_host, const int nexperts_compact, const int32_t * __restrict__ tile_prefix) {
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && \
+    ((__CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN) || __CUDA_ARCH__ == GGML_CUDA_CC_AMPERE)
     mul_mat_q_body<type, J, fallback, prec_src1, pipe>(
         x, y, ids_dst, expert_bounds, dst, tmp_fixup, y_scale,
         blocks_per_ne00, nrows_x, ncols_dst, stride_row_x, ncols_y, stride_col_dst,
@@ -1534,7 +1535,7 @@ static __global__ void mul_mat_q_pipe(
 #else
     GGML_UNUSED_VARS(x, y, ids_dst, expert_bounds, dst, tmp_fixup, y_scale, blocks_per_ne00, nrows_x, ncols_dst, stride_row_x, ncols_y, stride_col_dst, channel_ratio, nchannels_y, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, nsamples_y, stride_sample_x, stride_sample_y, stride_sample_dst, ntx_host, nexperts_compact, tile_prefix);
     NO_DEVICE_CODE;
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (sm 12x || sm 80)
 }
 
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
@@ -1752,7 +1753,7 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // k19-mmq-pipe: GGML_CUDA_MMQ_PIPE: unset = the measured choice per type / tile width (mmq_pipe_policy), 0 = off (the base kernel),
-// N > 0 = force the MMQ_PIPE_* bits N where a kernel for them is built (else the base). Only on sm 12x (consumer Blackwell), only for
+// N > 0 = force the MMQ_PIPE_* bits N where a kernel for them is built (else the base). Only on sm 12x (consumer Blackwell) and sm 80, only for
 // the MoE products (ids) of the types below at J <= 64 without the out-of-bounds fallback; everything else runs the base kernel.
 static int ggml_cuda_mmq_pipe_env() {
     static const int v = [] {
@@ -1858,7 +1859,15 @@ static mmq_kernel_t mmq_pipe_kernel(const mmq_args & args, const int cc, const i
     }
     const bool sm12x = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_BLACKWELL && cc < GGML_CUDA_CC_RUBIN &&
         ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_BLACKWELL;
-    if (!sm12x) {
+    // k19-a100tc: the same kernels on the A100 (cc 8.0 exactly, sm_80 code: the 164 KiB of shared memory per SM hold two 45-49 KiB
+    // tiles; prefetch.global.L2 exists there). GGML_CUDA_MMQ_PIPE_SM80=0 is the kill switch of this addition (sm 12x only, as before)
+    static const bool sm80_on = [] {
+        const char * e = getenv("GGML_CUDA_MMQ_PIPE_SM80");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const bool sm80 = sm80_on && GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE &&
+        ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_AMPERE;
+    if (!sm12x && !sm80) {
         return nullptr;
     }
     mmq_kernel_t k = nullptr;
