@@ -115,6 +115,10 @@ LLAMA_API void llama_set_sampler_keep_logits(struct llama_context * ctx, llama_s
 LLAMA_API float * llama_get_raw_logits_ith(struct llama_context * ctx, int32_t i);
 // k15-fn: reserve the graphs now if a change (e.g. llama_set_sampler) asked for it, instead of at the next decode
 LLAMA_API void llama_sched_reserve_now(struct llama_context * ctx);
+// k19-fnttft: once the whole load is over (drafter, warm-ups), read back the pages of a PLE table read in part at the load that the page
+// cache gave up since, up to the reclaimable RAM less the part read's reserve; page cache only, exact. Returns the bytes read (0: nothing
+// to do or not applicable). LLAMA_PLE_TOPUP=0: off
+LLAMA_API size_t llama_ple_topup(struct llama_context * ctx);
 // k15-fn: replace the backend sampler of seq_id, which has one, without reserving the graphs again: the caller reserved them with a
 // sampler whose graph is at least as large (e.g. the masked greedy of an ignore_eos request, swapped for the plain one). False: nothing
 // was changed (no sampler set for seq_id, or this one cannot run on the backend)

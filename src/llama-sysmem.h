@@ -202,6 +202,13 @@ inline void pinned_file_add(int64_t bytes) {
     pinned_file_bytes().fetch_add(bytes);
 }
 
+// k19-fnttft: set (process-wide) when a model's lazy PLE table on a disk was not admitted whole into RAM: the page cache is the table's
+// only room, so a model loaded after it (the MTP drafter) drops the page cache of the tensors it copied to a device (llama_model_loader)
+inline std::atomic<bool> & ple_page_cache_short() {
+    static std::atomic<bool> v{false};
+    return v;
+}
+
 inline uint64_t reclaimable(uint64_t avail, int64_t pinned) {
     if (avail == 0) {
         return 0;

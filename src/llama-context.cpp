@@ -1407,6 +1407,15 @@ llama_context::llama_context(
                         part = (size_t) std::min<uint64_t>(table, (avail - keep) & ~((8ull << 20) - 1));
                     }
                 }
+                // k19-fnttft: the page cache is the table's only room: models loaded after this one drop the page cache of what they copy to
+                // a device (llama_model_loader::drop_device_cache); LLAMA_PLE_TOPUP=0 turns this off with the top-up (llama_ple_topup)
+                static const bool topup_off = getenv("LLAMA_PLE_TOPUP") != nullptr && atoi(getenv("LLAMA_PLE_TOPUP")) == 0;
+                if (!admit && on_disk && !topup_off) {
+                    llama_sysmem::ple_page_cache_short().store(true);
+                    // and this model's own tensors copied to a device (Flash-Next: ~3.9 GiB of attention / dense / shared-expert pages,
+                    // read once at the load) leave the page cache before the table is read into it
+                    model.drop_device_cache();
+                }
 #endif
                 // k19-plerow: a row cache in front of a table that is not made resident and sits on a disk (LLAMA_PLE_ROW_CACHE=0 off,
                 // =2 forced: test hook). A row reached through the mapping faults its whole 4 KiB page (Flash-Next: 90-byte rows, 45x
@@ -1694,6 +1703,16 @@ llama_context::llama_context(
                                 __func__, tname.c_str(), len/1073741824.0, table/1073741824.0, t_read, background ? " in the background" : "",
                                 pop_ok ? "ok" : "by touch", pin_res, n_pass, t_pass1, evicted_a.load()*(double) pg/1073741824.0,
                                 activate ? ", activated" : "", pin_why);
+                            if (pr->pin_addr == nullptr) {
+                                // k19-fnttft: the span for a later top-up (llama_ple_topup), the whole table's pages
+                                pr->span_addr = a0;
+                                pr->span_len  = (size_t) (((uintptr_t) t->data + table - (uintptr_t) a0 + pg - 1) & ~(uintptr_t) (pg - 1));
+                                pr->part_len  = len;
+                                pr->fd        = fd;
+                                pr->fd_offs   = offs;
+                                pr->lead      = lead;
+                                pr->part_done.store(true);
+                            }
                             return;
                         }
                         struct rlimit rl;
@@ -2879,6 +2898,158 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
         ggml_backend_sched_set_prefetch_plan_callback(sched.get(), sched_stream_plan, this);
         ggml_backend_sched_set_prefetch_source_callback(sched.get(), sched_stream_source, this);
     }
+}
+
+// k19-fnttft: after the load's part read of a PLE table that does not fit beside the host weights (k19-disktt), the page cache gives part
+// of it back before the first prompt: the loads that follow it (the MTP drafter, the warm-ups) and the process growing take their pages
+// from the oldest file pages. Colab A100 40 GB, fn4nd full card: an 8k prompt then reads ~50k random 4 KiB table pages from a disk capped
+// at ~3k reads/s (16-19 s of its 22 s TTFT, /proc/diskstats). Called once the load is over (llama_ple_topup: the server after the drafter
+// and the prewarm), this reads the table's missing pages back into the page cache, from the start of the table, up to what the reclaimable
+// RAM (MemAvailable minus the registered model pages, llama_sysmem::available_reclaimable) leaves after the part read's reserve
+// (LLAMA_PLE_RESIDENT_PARTIAL_RESERVE_MIB, 4096). Page cache only (never locked or pinned), the same bytes through the same mapping: exact.
+// The missing pages come in runs (the load read the table in 8 MiB chunks, the page cache gives them up in that order), read in runs of up
+// to 8 MiB on 4 threads, each twice (the active list, as the load read). LLAMA_PLE_TOPUP=0: off (=2: test hook, the table is dropped from
+// the page cache first). Returns the bytes read.
+size_t llama_context::ple_topup() {
+#if defined(__linux__)
+    static const int env = getenv("LLAMA_PLE_TOPUP") ? atoi(getenv("LLAMA_PLE_TOPUP")) : -1;
+    if (env == 0 || !ple_res.part_done.load() || ple_res.pin_addr != nullptr || model.ple_table_resident.load() ||
+            ple_res.span_addr == nullptr || ple_res.span_len == 0) {
+        return 0;
+    }
+    const int64_t t0 = ggml_time_us();
+    const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
+    uint8_t * a0 = ple_res.span_addr;
+    const size_t span = ple_res.span_len;
+    const size_t npg  = span / pg;
+    std::vector<unsigned char> mv(npg);
+    if (env == 2 && ple_res.fd >= 0) {
+        // test hook: the table's pages leave the mapping and the page cache first, so the read-back path runs on any host
+        (void) madvise(a0, span, MADV_DONTNEED);
+        (void) posix_fadvise(ple_res.fd, (off_t) (ple_res.fd_offs > ple_res.lead ? ple_res.fd_offs - ple_res.lead : 0), (off_t) span,
+            POSIX_FADV_DONTNEED);
+    }
+    if (mincore(a0, span, mv.data()) != 0) {
+        return 0;
+    }
+    size_t res = 0;
+    for (unsigned char c : mv) {
+        res += c & 1;
+    }
+    const uint64_t reserve = (uint64_t) (getenv("LLAMA_PLE_RESIDENT_PARTIAL_RESERVE_MIB") ?
+        std::max(0, atoi(getenv("LLAMA_PLE_RESIDENT_PARTIAL_RESERVE_MIB"))) : 4096) << 20;
+    const uint64_t recl = llama_sysmem::available_reclaimable();
+    // the reclaimable RAM still counts the table's own cached pages: the table may hold at most recl - reserve
+    const uint64_t target = std::min<uint64_t>(span, recl > reserve ? recl - reserve : 0);
+    const uint64_t have   = (uint64_t) res * pg;
+    if (target <= have + std::min<uint64_t>(64ull << 20, span / 64)) {   // less than 64 MiB (1/64 of a small table) to gain: no read
+        LLAMA_LOG_INFO("%s: k19-fnttft: PLE table top-up: %.0f of %.0f MiB in the page cache, nothing to read back (reclaimable %.1f GiB - "
+            "%.1f GiB reserve; LLAMA_PLE_TOPUP=0 off)\n", __func__, have/1048576.0, span/1048576.0, recl/1073741824.0,
+            reserve/1073741824.0);
+        return 0;
+    }
+    // runs of missing pages from the start of the table, at most 8 MiB each, until the target is reached
+    struct run { size_t p0, n; };
+    std::vector<run> runs;
+    uint64_t want = target - have;
+    const size_t max_run = (8ull << 20) / pg;
+    for (size_t p = 0; p < npg && want > 0; ) {
+        if (mv[p] & 1) {
+            ++p;
+            continue;
+        }
+        size_t q = p;
+        while (q < npg && !(mv[q] & 1) && q - p < max_run && (uint64_t) (q - p) * pg < want) {
+            ++q;
+        }
+        runs.push_back({ p, q - p });
+        want -= std::min<uint64_t>(want, (uint64_t) (q - p) * pg);
+        p = q;
+    }
+    // in batches of ~512 MiB: a batch whose reads did not raise the table's resident pages by half of what they read evicted the table's
+    // own pages (no room after all): the top-up stops there
+    std::atomic<size_t> next {0};
+    std::atomic<size_t> done {0};
+    const int    fd   = ple_res.fd;
+    const size_t offs = ple_res.fd_offs;
+    const size_t lead = ple_res.lead;
+    std::atomic<bool> * stop = &ple_res.stop;
+    size_t i_end = 0;
+    auto work = [&]() {
+        std::vector<uint8_t> buf(fd >= 0 ? max_run * pg : 0);
+        for (;;) {
+            const size_t i = next.fetch_add(1);
+            if (i >= i_end || stop->load(std::memory_order_relaxed)) {
+                break;
+            }
+            const size_t o = runs[i].p0 * pg, n = runs[i].n * pg;
+            for (int rep = 0; rep < 2; ++rep) {
+                if (fd >= 0 && o + n > lead) {
+                    const size_t skip = o < lead ? lead - o : 0;
+                    size_t fo = offs + (o + skip - lead), left = n - skip;
+                    while (left > 0) {
+                        const ssize_t r = pread(fd, buf.data(), left, (off_t) fo);
+                        if (r <= 0) {
+                            break;
+                        }
+                        fo += (size_t) r; left -= (size_t) r;
+                    }
+                }
+            }
+            if (madvise(a0 + o, n, 22 /* MADV_POPULATE_READ */) != 0) {
+                volatile uint8_t sink = 0;
+                for (size_t q = 0; q < n; q += pg) {
+                    sink ^= a0[o + q];
+                }
+                (void) sink;
+            }
+            done += n;
+        }
+    };
+    auto count_res = [&]() {
+        size_t c = 0;
+        if (mincore(a0, span, mv.data()) == 0) {
+            for (unsigned char x : mv) {
+                c += x & 1;
+            }
+        }
+        return c;
+    };
+    size_t res2 = res;
+    bool churn = false;
+    for (size_t b0 = 0; b0 < runs.size() && !stop->load(); ) {
+        size_t bytes = 0;
+        i_end = b0;
+        while (i_end < runs.size() && bytes < (512ull << 20)) {
+            bytes += runs[i_end].n * pg;
+            ++i_end;
+        }
+        next = b0;
+        std::vector<std::thread> thr;
+        for (int i = 1; i < 4; ++i) {
+            thr.emplace_back(work);
+        }
+        work();
+        for (auto & th : thr) {
+            th.join();
+        }
+        const size_t now = count_res();
+        const bool gained = now > res2 && (now - res2) * pg * 2 >= bytes;
+        res2 = now;
+        b0 = i_end;
+        if (!gained) {
+            churn = true;
+            break;
+        }
+    }
+    LLAMA_LOG_INFO("%s: k19-fnttft: PLE table top-up: %.0f of %.0f MiB were in the page cache, %.0f MiB read back in %zu runs in %.1f s, "
+        "%.0f MiB now (reclaimable %.1f GiB - %.1f GiB reserve%s; LLAMA_PLE_TOPUP=0 off)\n", __func__, have/1048576.0, span/1048576.0,
+        done.load()/1048576.0, runs.size(), (ggml_time_us() - t0)/1e6, (double) res2*pg/1048576.0, recl/1073741824.0,
+        reserve/1073741824.0, churn ? "; stopped: the reads evicted the table's own pages" : "");
+    return done.load();
+#else
+    return 0;
+#endif
 }
 
 void llama_context::sched_reserve() {
@@ -12924,6 +13095,10 @@ float * llama_get_raw_logits_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize_outputs();
 
     return ctx->get_logits_ith(i);
+}
+
+size_t llama_ple_topup(llama_context * ctx) {
+    return ctx ? ctx->ple_topup() : 0;
 }
 
 void llama_sched_reserve_now(llama_context * ctx) {
