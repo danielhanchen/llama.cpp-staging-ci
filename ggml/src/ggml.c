@@ -3807,6 +3807,22 @@ GGML_API void ggml_moe_cache_assign_lookup_counts(struct ggml_tensor * op) {
     ggml_set_op_params_i32(op, 8, 1);
 }
 
+// k19-ptres: the first n_core slots of the cache are a core that no lookup, assign or seed plan evicts (their victims come from the
+// slots above it); 0 = no core (the default). Op param 9 of a lookup (unused with at most 3 banks), 7 of an assign or a seed plan.
+// (declared by its caller, llama-moe-cache.cpp, so that ggml.h and every file including it stay unchanged)
+GGML_API void ggml_moe_cache_set_core(struct ggml_tensor * op, int32_t n_core);
+GGML_API void ggml_moe_cache_set_core(struct ggml_tensor * op, int32_t n_core) {
+    GGML_ASSERT(op->op == GGML_OP_MOE_CACHE_LOOKUP && n_core >= 0);
+    const int mode = ggml_get_op_params_i32(op, 10);
+    GGML_ASSERT(mode == 0 || mode == 1 || mode == 4);
+    if (mode == 0) {
+        GGML_ASSERT(ggml_get_op_params_i32(op, 1) <= 3);
+        ggml_set_op_params_i32(op, 9, n_core);
+    } else {
+        ggml_set_op_params_i32(op, 7, n_core);
+    }
+}
+
 void ggml_moe_cache_assign_freeze(struct ggml_tensor * op) {
     GGML_ASSERT(op->op == GGML_OP_MOE_CACHE_LOOKUP && ggml_get_op_params_i32(op, 10) == 1);
     ggml_set_op_params_i32(op, 15, 1);

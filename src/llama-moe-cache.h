@@ -193,6 +193,11 @@ public:
     // see shrink): what the bank release of a layer-major prompt group is decided on (cache_frac where no floor is set)
     double release_frac() const;
     void hybrid_reset();
+    // k19-ptres (LLAMA_MOE_CORE=1): bytes of the core experts' host copies left out of the registration and dropped from the page cache
+    size_t core_dropped_bytes() const;
+    // k19-ptres: LLAMA_MOE_CORE is set; core_request at each new request: checks the core and writes the routing profile
+    bool core_wanted() const;
+    void core_request();
 
     // auto mode: before the graph of each ubatch while the trial runs, after the previous ubatch finished (backends synchronized);
     // switches between the plain and the hybrid path, then keeps the faster one (see hybrid_active)
