@@ -359,6 +359,45 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+// k19-fattnq8: q8_0 K and V of a head size with a q8_0 instance (ggml_cuda_flash_attn_ext_mma_q8_may_use), on NVIDIA with Turing
+// tensor cores, rows of whole blocks starting 4 byte aligned: the MMA kernel reads them in place. The same answer for the launch and for the
+// graph allocation (ggml_cuda_flash_attn_ext_get_alloc_size: no f16 copy behind the output). GGML_CUDA_FATTN_Q8_INPLACE=0: off
+bool ggml_cuda_flash_attn_ext_mma_q8_inplace(const int device, const ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(device, dst);
+    return false;
+#else
+    static const bool enabled = getenv("GGML_CUDA_FATTN_Q8_INPLACE") == nullptr || atoi(getenv("GGML_CUDA_FATTN_Q8_INPLACE")) != 0;
+    // only for few query rows (decode, verify windows): every query tile converts the K / V it reads, so a prompt ubatch of 2048
+    // rows converts the cache once per tile and loses to the one staged copy (A100, head size 256: 1.3-1.8x the staged time at
+    // 512 / 2048 rows, 0.44-0.9x at 2..17 rows). GGML_CUDA_FATTN_Q8_INPLACE_MAX_ROWS: the row limit (default 16)
+    static const int64_t max_rows = getenv("GGML_CUDA_FATTN_Q8_INPLACE_MAX_ROWS") ? atoll(getenv("GGML_CUDA_FATTN_Q8_INPLACE_MAX_ROWS")) : 16;
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (!enabled || K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q8_0 || dst->src[0]->ne[1] > max_rows) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !turing_mma_available(cc)) {
+        return false;
+    }
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+    if (dst->src[0]->ne[0] != K->ne[0] ||
+            !ggml_cuda_flash_attn_ext_mma_q8_may_use(K->ne[0], V->ne[0], logit_softcap != 0.0f, V_is_K_view)) {
+        return false;
+    }
+    for (const ggml_tensor * t : {K, V}) {
+        if (t->nb[0] != sizeof(block_q8_0) || t->nb[1] % 4 != 0 || t->nb[2] % 4 != 0 || t->nb[3] % 4 != 0 ||
+                t->nb[1] > INT32_MAX || t->nb[2] > INT32_MAX) {
+            return false;
+        }
+    }
+    return true;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -943,9 +982,13 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
+            break;
+        case BEST_FATTN_KERNEL_MMA_F16:
+            // k19-fattnq8: no f16 copy when the kernel reads q8_0 K / V in place
+            need_f16_K = !ggml_cuda_flash_attn_ext_mma_q8_inplace(device, dst);
+            need_f16_V = need_f16_K;
             break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
