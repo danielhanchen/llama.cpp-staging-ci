@@ -107,6 +107,12 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // k15-fn: with a sampler set for seq_id (llama_set_sampler), raw = true still copies the raw logits of its rows to the host (the host
 // sampler of a request that the device sampler cannot serve), raw = false copies only what the sampler outputs. No new graph reserve
 LLAMA_API void llama_set_sampler_raw_logits(struct llama_context * ctx, llama_seq_id seq_id, bool raw);
+// k19-gramdev: keep = true copies the raw logits of seq_id's rows to the host as well, while its sampler stays in the graph (a device
+// top-k whose host chain may need the full row of one position: grammar, reasoning budget); read them with llama_get_raw_logits_ith
+LLAMA_API void llama_set_sampler_keep_logits(struct llama_context * ctx, llama_seq_id seq_id, bool keep);
+// k19-gramdev: the raw logits of output i (llama_get_logits_ith returns the sampler's candidates when it output some); only valid for
+// rows whose raw logits were copied (no sampler, llama_set_sampler_raw_logits or llama_set_sampler_keep_logits)
+LLAMA_API float * llama_get_raw_logits_ith(struct llama_context * ctx, int32_t i);
 // k15-fn: reserve the graphs now if a change (e.g. llama_set_sampler) asked for it, instead of at the next decode
 LLAMA_API void llama_sched_reserve_now(struct llama_context * ctx);
 // k15-fn: replace the backend sampler of seq_id, which has one, without reserving the graphs again: the caller reserved them with a

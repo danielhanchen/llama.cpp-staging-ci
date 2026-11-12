@@ -446,6 +446,7 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
     void set_sampler_raw_logits(llama_seq_id seq_id, bool raw);
+    void set_sampler_keep_logits(llama_seq_id seq_id, bool keep);
     bool set_sampler_swap(llama_seq_id seq_id, llama_sampler * sampler);
     // the samplers the graph of a ubatch applies (graph_params): not those of the sequences copying raw logits, except in a reserve
     std::map<llama_seq_id, llama_sampler *> graph_samplers() const;
@@ -600,6 +601,8 @@ private:
         // k15-fn: sequences whose raw logits are still copied although a sampler is set (llama_set_sampler_raw_logits): the sampler
         // stays in the graph (no new reserve) while a request that needs the host sampler runs
         std::set<llama_seq_id> raw;
+        // k19-gramdev: sequences whose raw logits are copied too while their sampler stays in the graph (llama_set_sampler_keep_logits)
+        std::set<llama_seq_id> keep;
 
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};

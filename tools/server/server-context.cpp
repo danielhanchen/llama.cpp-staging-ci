@@ -901,6 +901,7 @@ struct server_slot {
         } else {
             llama_set_sampler_raw_logits(ctx_tgt, id, true);
         }
+        llama_set_sampler_keep_logits(ctx_tgt, id, false);
 
         // clear alora start
         alora_invocation_start = -1;
@@ -1217,6 +1218,14 @@ struct server_slot {
                 SLT_INF(*this, "%s\n", r.c_str());
             }
             srv_pass_timer().reset();
+        }
+        {
+            // k19-gramdev: device top-k rows of a grammar / reasoning budget request
+            const auto ds = common_sampler_get_dev_stats(smpl.get());
+            if (ds.n_rows > 0) {
+                SLT_INF(*this, "device top-k grammar: %" PRId64 " rows, %" PRId64 " rejected, %" PRId64 " fallback, %" PRId64 " forced, %" PRId64 " full rows\n",
+                        ds.n_rows, ds.n_rejected, ds.n_fallback, ds.n_forced, ds.n_full);
+            }
         }
         const double t_prompt_total = stats.t_prompt_ms();
         const double t_gen_total    = stats.t_gen_ms();
@@ -3362,12 +3371,19 @@ private:
                 dev_greedy = dev_greedy && slot.smpl_dev_set;
                 dev_topk   = dev_topk && slot.smpl_dev_set;
                 llama_set_sampler_raw_logits(ctx_tgt, slot.id, !dev_greedy && !dev_topk);
+                // k19-gramdev: a grammar / reasoning budget request on the device top-k copies its raw rows too, for the positions the
+                // candidates cannot decide (common_sampler_device_topk)
+                llama_set_sampler_keep_logits(ctx_tgt, slot.id, dev_topk && common_sampler_device_topk_needs_raw(slot.smpl.get()));
                 common_sampler_set_device_token(slot.smpl.get(), dev_greedy);
                 common_sampler_set_device_topk(slot.smpl.get(), dev_topk);
             } else {
                 common_sampler_set_device_token(slot.smpl.get(), false);
                 common_sampler_set_device_topk(slot.smpl.get(), false);
+                llama_set_sampler_keep_logits(ctx_tgt, slot.id, false);
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
+            }
+            if (use_backend_sampling) {
+                llama_set_sampler_keep_logits(ctx_tgt, slot.id, false);
             }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());

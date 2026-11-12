@@ -5,6 +5,7 @@
 #include "fit.h"
 #include "log.h"
 #include "reasoning-budget.h"
+#include "../src/llama-ext.h" // llama_get_raw_logits_ith
 
 #include "ggml.h"
 
@@ -140,6 +141,23 @@ struct common_sampler {
     bool dev_topk = false;                                  // k15-fn: the row's logits are the device top-k candidates (common_sampler_set_device_topk)
     int32_t dev_n_bias = 0;                                 // k15-fn: tokens with a bias (logit_bias + suppress tokens), for common_sampler_device_topk
     bool dev_bias_pos  = false;                             //         one of those biases can raise a logit
+    // k19-gramdev: the device top-k serves a request with a grammar or a reasoning budget (common_sampler_device_topk); the raw rows are
+    // on the host too (llama_set_sampler_keep_logits) for the positions the candidates cannot decide
+    bool    dev_gram  = false;
+    int32_t dev_kneed = 0;                                  //         k + m of common_sampler_device_topk
+    common_sampler_dev_stats dev_stats = {};
+
+    // k19-gramdev: the full raw row of idx (the candidates of a device top-k are in cur otherwise)
+    void set_logits_full(struct llama_context * ctx, int idx) {
+        const float * logits = llama_get_raw_logits_ith(ctx, idx);
+        GGML_ASSERT(logits != nullptr && "device top-k with a grammar / reasoning budget needs the raw rows (llama_set_sampler_keep_logits)");
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        cur.resize(n_vocab);
+        for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+            cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+        }
+        cur_p = { cur.data(), cur.size(), -1, false };
+    }
 
     // the token a backend sampler picked for row idx, if this sampler takes it (backend sampling, or the device greedy chain of the server)
     llama_token sampled_token(struct llama_context * ctx, int idx) const {
@@ -867,7 +885,7 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
+    auto * res = new common_sampler {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
@@ -889,6 +907,9 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .dev_n_bias  = */ gsmpl->dev_n_bias,
         /* .dev_bias_pos = */ gsmpl->dev_bias_pos,
     };
+    res->dev_gram  = gsmpl->dev_gram;
+    res->dev_kneed = gsmpl->dev_kneed;
+    return res;
 }
 
 void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
@@ -918,6 +939,9 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->dev_topk    = src->dev_topk;
     dst->dev_n_bias  = src->dev_n_bias;
     dst->dev_bias_pos = src->dev_bias_pos;
+    dst->dev_gram     = src->dev_gram;
+    dst->dev_kneed    = src->dev_kneed;
+    dst->dev_stats    = src->dev_stats;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -974,10 +998,31 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+static int64_t common_sampler_device_topk_need(const struct common_sampler * gsmpl);
+
 void common_sampler_set_device_topk(struct common_sampler * gsmpl, bool on) {
     if (gsmpl != nullptr) {
-        gsmpl->dev_topk = on;
+        gsmpl->dev_topk  = on;
+        gsmpl->dev_gram  = on && (gsmpl->grmr != nullptr || gsmpl->rbudget != nullptr);
+        gsmpl->dev_kneed = on ? (int32_t) std::max<int64_t>(0, common_sampler_device_topk_need(gsmpl)) : 0;
     }
+}
+
+bool common_sampler_device_topk_needs_raw(const struct common_sampler * gsmpl) {
+    return gsmpl != nullptr && (gsmpl->grmr != nullptr || gsmpl->rbudget != nullptr);
+}
+
+common_sampler_dev_stats common_sampler_get_dev_stats(const struct common_sampler * gsmpl) {
+    return gsmpl != nullptr ? gsmpl->dev_stats : common_sampler_dev_stats {};
+}
+
+// k19-gramdev: LLAMA_DEVICE_TOPK_GRAMMAR=0: requests with a grammar or a reasoning budget copy the full rows and sample on the host, as before
+bool common_sampler_device_topk_grammar_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_DEVICE_TOPK_GRAMMAR");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
 }
 
 void common_sampler_set_device_token(struct common_sampler * gsmpl, bool on) {
@@ -1010,7 +1055,8 @@ bool common_sampler_device_greedy_masked(const struct common_sampler * gsmpl, st
     return true;
 }
 
-int32_t common_sampler_device_topk(const struct common_sampler * gsmpl, int32_t k_dev) {
+// k + m of common_sampler_device_topk (the candidates the chain needs), or 0 when the chain cannot finish from a device top-k
+static int64_t common_sampler_device_topk_need(const struct common_sampler * gsmpl) {
     // k15-fn: the chain runs on the k_dev highest raw logits of the row (a device top-k) and still gives the token, the
     // candidates and the probabilities of the full row, when
     //   - everything before the chain's top_k (or before its final greedy) only lowers logits or does nothing: penalties with
@@ -1018,14 +1064,20 @@ int32_t common_sampler_device_topk(const struct common_sampler * gsmpl, int32_t 
     //     top_n_sigma, typical, top_p, min_p, xtc;
     //   - k + m <= k_dev, k the top_k (1 for greedy), m the tokens whose logit can change before it (the penalty window + the
     //     biased tokens): the k highest lowered logits are then among the k + m highest raw ones;
-    //   - no grammar, reasoning budget, mirostat, adaptive-p, infill, dynamic temperature or probabilities output.
+    //   - no mirostat, adaptive-p, infill, dynamic temperature or probabilities output.
     // The host top_k breaks ties by the lower id, so the full row and its device top-k give the same sorted candidates.
+    // k19-gramdev: a grammar or a reasoning budget qualifies too (LLAMA_DEVICE_TOPK_GRAMMAR=0: not), with the raw rows also copied to
+    // the host: common_sampler_sample_dev_gram decides each position from the candidates when that is provably the full row's result
+    // and samples the full row otherwise.
     // Returns k_dev when the request qualifies, 0 otherwise (the raw logits are copied as before)
-    if (gsmpl == nullptr || gsmpl->grmr != nullptr || gsmpl->rbudget != nullptr || gsmpl->dev_bias_pos) {
+    if (gsmpl == nullptr || gsmpl->dev_bias_pos) {
+        return 0;
+    }
+    if ((gsmpl->grmr != nullptr || gsmpl->rbudget != nullptr) && !common_sampler_device_topk_grammar_enabled()) {
         return 0;
     }
     const auto & p = gsmpl->params;
-    if (p.mirostat != 0 || p.n_probs != 0 || p.samplers.empty() || k_dev <= 0) {
+    if (p.mirostat != 0 || p.n_probs != 0 || p.samplers.empty()) {
         return 0;
     }
     const bool pen_active = p.penalty_last_n != 0 && (p.penalty_repeat != 1.0f || p.penalty_freq != 0.0f || p.penalty_present != 0.0f);
@@ -1068,7 +1120,163 @@ int32_t common_sampler_device_topk(const struct common_sampler * gsmpl, int32_t 
         }
     }
     const int64_t m = (pen_active ? (int64_t) p.penalty_last_n : 0) + gsmpl->dev_n_bias;
-    return (int64_t) k + m <= (int64_t) k_dev ? k_dev : 0;
+    return (int64_t) k + m;
+}
+
+int32_t common_sampler_device_topk(const struct common_sampler * gsmpl, int32_t k_dev) {
+    if (k_dev <= 0) {
+        return 0;
+    }
+    const int64_t need = common_sampler_device_topk_need(gsmpl);
+    return need > 0 && need <= (int64_t) k_dev ? k_dev : 0;
+}
+
+// k19-gramdev: one row of a device top-k request with a grammar or a reasoning budget (the candidates C, the k_dev highest raw logits,
+// are in cur, in id order; the full raw row is on the host). Today's host path, step by step, with the reason each step on C gives the
+// result of the same step on the full row:
+//   - the reasoning budget passes the logits through unless it is forcing; forcing (a few tokens per request): the full row
+//   - the chain on C picks the full row's token and leaves its candidates (common_sampler_device_topk, k + m <= k_dev): the grammar
+//     plays no part in it (grammar_first = false), and the RNG of the chain advances alike
+//   - the token is tested against the grammar alone: same token, same grammar state, same verdict (an untriggered lazy grammar
+//     accepts every token, as before)
+//   - rejected: the resample runs the chain on the grammar-masked row. Let tau = the lowest raw logit of C; every token outside C has
+//     a raw logit <= tau, and the grammar and every stage before the chain's top_k only lower logits. If at least k + m tokens of C
+//     are valid with a raw logit > tau, at least k of them keep it (m bounds the tokens a penalty or a bias can move), so every token
+//     outside C has k tokens strictly above it and is not in the full row's top k: the top k of the masked row are in C, in the same
+//     order (same values, ties by the lower id), and the chain after them sees the same candidates. Otherwise the full row is sampled
+//     (same RNG state: one chain draw happened on each side)
+//   - grammar_first = true: the same count on the masked C before the chain, else the full row
+static llama_token common_sampler_sample_dev_gram(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+    auto * grmr    = gsmpl->grmr;
+    auto * rbudget = gsmpl->rbudget;
+    auto * chain   = gsmpl->chain;
+    auto & cur_p   = gsmpl->cur_p;
+    auto & st      = gsmpl->dev_stats;
+
+    st.n_rows++;
+
+    // the host path of common_sampler_sample on the full row, from the start
+    auto full_row = [&]() {
+        st.n_full++;
+        gsmpl->set_logits_full(ctx, idx);
+        llama_sampler_apply(rbudget, &cur_p);
+        if (grammar_first && grammar_should_apply(gsmpl)) {
+            llama_sampler_apply(grmr, &cur_p);
+        }
+        llama_sampler_apply(chain, &cur_p);
+        llama_token id = cur_p.data[cur_p.selected].id;
+        if (grammar_first || !grammar_should_apply(gsmpl)) {
+            return id;
+        }
+        {
+            llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
+            llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
+            llama_sampler_apply(grmr, &single_token_data_array);
+            if (single_token_data_array.data[0].logit != -INFINITY) {
+                return id;
+            }
+        }
+        gsmpl->set_logits_full(ctx, idx);
+        llama_sampler_apply(rbudget, &cur_p);
+        if (grammar_should_apply(gsmpl)) {
+            llama_sampler_apply(grmr, &cur_p);
+        }
+        llama_sampler_apply(chain, &cur_p);
+        GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+        return cur_p.data[cur_p.selected].id;
+    };
+
+    if (rbudget != nullptr && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING) {
+        st.n_forced++;
+        return full_row();
+    }
+
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+
+    // tokens of the masked C (grammar applied to cur_p) that are valid with a raw logit above tau: enough when >= k + m
+    // LLAMA_DEVICE_TOPK_GRAMMAR_NOFALLBACK=1: test only, deliberately inexact (the candidates decide every position): shows that
+    // test-dtopk-grammar can fail
+    static const bool no_fallback = [] {
+        const char * e = getenv("LLAMA_DEVICE_TOPK_GRAMMAR_NOFALLBACK");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    auto enough = [&](float tau, size_t n_c) {
+        if ((int64_t) n_c >= (int64_t) n_vocab || no_fallback) {
+            return true; // C is the row
+        }
+        int64_t n_ok = 0;
+        for (size_t i = 0; i < cur_p.size; ++i) {
+            n_ok += cur_p.data[i].logit > tau;
+        }
+        return gsmpl->dev_kneed > 0 && n_ok >= (int64_t) gsmpl->dev_kneed;
+    };
+    auto tau_of = [&]() {
+        float tau = INFINITY;
+        for (size_t i = 0; i < cur_p.size; ++i) {
+            tau = std::min(tau, cur_p.data[i].logit);
+        }
+        return tau;
+    };
+
+    // cur_p holds C (set_logits)
+    llama_sampler_apply(rbudget, &cur_p); // not forcing: passes through
+
+    if (grammar_first && grammar_should_apply(gsmpl)) {
+        const float  tau = tau_of();
+        const size_t n_c = cur_p.size;
+        llama_sampler_apply(grmr, &cur_p);
+        if (!enough(tau, n_c)) {
+            st.n_fallback++;
+            return full_row();
+        }
+        llama_sampler_apply(chain, &cur_p);
+        return cur_p.data[cur_p.selected].id;
+    }
+
+    llama_sampler_apply(chain, &cur_p);
+
+    llama_token id = cur_p.data[cur_p.selected].id;
+
+    if (grammar_first || !grammar_should_apply(gsmpl)) {
+        return id;
+    }
+
+    {
+        llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
+        llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
+
+        llama_sampler_apply(grmr, &single_token_data_array);
+
+        if (single_token_data_array.data[0].logit != -INFINITY) {
+            return id;
+        }
+    }
+
+    st.n_rejected++;
+
+    // resample on the masked C if it decides the full row's result
+    gsmpl->set_logits(ctx, idx);
+    const float  tau = tau_of();
+    const size_t n_c = cur_p.size;
+    llama_sampler_apply(rbudget, &cur_p);
+    if (grammar_should_apply(gsmpl)) {
+        llama_sampler_apply(grmr, &cur_p);
+    }
+    if (!enough(tau, n_c)) {
+        st.n_fallback++;
+        // the second half of the host path on the full row (the chain drew once on each side)
+        st.n_full++;
+        gsmpl->set_logits_full(ctx, idx);
+        llama_sampler_apply(rbudget, &cur_p);
+        if (grammar_should_apply(gsmpl)) {
+            llama_sampler_apply(grmr, &cur_p);
+        }
+    }
+    llama_sampler_apply(chain, &cur_p);
+
+    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+
+    return cur_p.data[cur_p.selected].id;
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
@@ -1254,6 +1462,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
             return id;
         }
+    }
+
+    // k19-gramdev: device top-k candidates of a request with a grammar or a reasoning budget
+    if (gsmpl->dev_topk && gsmpl->dev_gram && llama_get_sampled_logits_ith(ctx, idx) != nullptr && llama_get_sampled_probs_ith(ctx, idx) == nullptr) {
+        return common_sampler_sample_dev_gram(gsmpl, ctx, idx, grammar_first);
     }
 
     // apply reasoning budget first
