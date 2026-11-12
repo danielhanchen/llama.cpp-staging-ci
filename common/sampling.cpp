@@ -941,7 +941,6 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->dev_bias_pos = src->dev_bias_pos;
     dst->dev_gram     = src->dev_gram;
     dst->dev_kneed    = src->dev_kneed;
-    dst->dev_stats    = src->dev_stats;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
