@@ -1639,9 +1639,12 @@ llama_context::llama_context(
                             const char * pin_why = "";
                             if (pin_env < 0 && core_freed) {
                                 const uint64_t avail_now = llama_sysmem::available();
-                                pin_on = limit >= table && avail_now >= (uint64_t) len + (4ull << 30);
+                                // k19-core2: the RAM left after the pin, LLAMA_PLE_PIN_FLOOR_MIB (default 4096)
+                                static const uint64_t floor_b = (uint64_t) std::max<int64_t>(0, getenv("LLAMA_PLE_PIN_FLOOR_MIB") ?
+                                    atoll(getenv("LLAMA_PLE_PIN_FLOOR_MIB")) : 4096) << 20;
+                                pin_on = limit >= table && avail_now >= (uint64_t) len + floor_b;
                                 pin_why = pin_on ? " (a MoE cache core freed the RAM; LLAMA_PLE_RESIDENT_PARTIAL_PIN=0 off)" :
-                                    " (not pinned: the table is not whole or the RAM left after a pin would be under 4 GiB)";
+                                    " (not pinned: the table is not whole or the RAM left after a pin would be under LLAMA_PLE_PIN_FLOOR_MIB, 4 GiB)";
                             }
                             const char * pin_res = "";
                             if (pin_on) {

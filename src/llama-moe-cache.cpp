@@ -2187,6 +2187,13 @@ struct llama_moe_cache::impl {
         return avail > 0 && need > avail ? (size_t) (need - avail) : 0;
     }
 
+    // k19-core2: the smallest share of the host experts the device cache must hold for a core (LLAMA_MOE_CORE_MIN_FRAC, default 0.25):
+    // smaller caches release their banks for prompts, which a core refuses
+    static double core_min_frac() {
+        static const double f = getenv("LLAMA_MOE_CORE_MIN_FRAC") ? std::max(0.0, atof(getenv("LLAMA_MOE_CORE_MIN_FRAC"))) : 0.25;
+        return f;
+    }
+
     // k19-ptres: places the core of each group (the first profile entries of its layers) in its first slots; false if no core
     bool core_place(const llama_model & model) {
         if (core_mode == 0 || profile.empty()) {
@@ -2209,8 +2216,8 @@ struct llama_moe_cache::impl {
             why = "the cache spans several devices";
         } else if (wstore != nullptr) {
             why = "the experts are streamed (weight store)";
-        } else if (host_b == 0 || cache_b < host_b/4) {
-            why = "the cache holds less than 25% of the host experts";
+        } else if (host_b == 0 || (double) cache_b < core_min_frac()*(double) host_b) {
+            why = "the cache holds less than LLAMA_MOE_CORE_MIN_FRAC (default 25%) of the host experts";
         }
         core_want = why == nullptr ? core_target(model) : 0;
         if (why == nullptr && core_want == 0) {
