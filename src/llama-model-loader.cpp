@@ -1971,6 +1971,9 @@ bool llama_model_loader::load_all_data(
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
+                if (cur->buffer != nullptr && !ggml_backend_buffer_is_host(cur->buffer) && !lazy.has(cur)) {
+                    device_ranges.push_back({ weight->idx, weight->offs, n_size });
+                }
                 // with mmap, only the pinned experts are in host buffers that are not the mapping (see pin_expert)
                 if (n_experts_pinned > 0 && cur->buffer != nullptr && ggml_backend_buffer_is_host(cur->buffer)) {
                     pinned_ranges.push_back({ weight->idx, weight->offs, n_size });
@@ -2098,6 +2101,7 @@ bool llama_model_loader::load_all_data(
                 }
             }
             settle_pinned_cache();
+            drop_device_cache();
         }
         if (progress_callback) {
             // Even though the model is done loading, we still honor
@@ -2240,6 +2244,36 @@ bool llama_model_loader::pin_expert(size_t nbytes) {
     experts_pinned_bytes += nbytes;
     n_experts_pinned++;
     return true;
+}
+
+// k19-fnttft: a model loaded after a lazy PLE table that did not fit in RAM (llama_sysmem::ple_page_cache_short; the MTP drafter of
+// Flash-Next: 3.1 GB copied to the GPU, then never read again) leaves its file pages in the page cache, the youngest there, and the page
+// cache gives up the table's pages for them (the table's part was read before the drafter's load). The page cache of the tensors this
+// load copied into device buffers is dropped (POSIX_FADV_DONTNEED; pages still mapped are kept by the kernel); not for tmpfs.
+// LLAMA_MODEL_DROP_DEVICE_CACHE=0: off, 1: always
+void llama_model_loader::drop_device_cache() {
+#if defined(__linux__)
+    static const int env = getenv("LLAMA_MODEL_DROP_DEVICE_CACHE") ? atoi(getenv("LLAMA_MODEL_DROP_DEVICE_CACHE")) : -1;
+    if (device_ranges.empty() || env == 0 || (env < 0 && !llama_sysmem::ple_page_cache_short().load())) {
+        device_ranges.clear();
+        return;
+    }
+    size_t n_dropped = 0, n_skipped = 0;
+    for (const auto & r : device_ranges) {
+        struct statfs sfs;
+        if (r.idx >= files.size() || (fstatfs(files[r.idx]->file_id(), &sfs) == 0 && (unsigned long) sfs.f_type == 0x01021994UL)) {
+            n_skipped += r.size;
+            continue;
+        }
+        if (posix_fadvise(files[r.idx]->file_id(), (off_t) r.offs, (off_t) r.size, POSIX_FADV_DONTNEED) == 0) {
+            n_dropped += r.size;
+        }
+    }
+    LLAMA_LOG_INFO("%s: k19-fnttft: dropped the page cache of %zu tensors copied to a device (%.2f MiB%s): a lazy PLE table is short of "
+        "RAM (LLAMA_MODEL_DROP_DEVICE_CACHE=0 keeps it)\n", __func__, device_ranges.size(), n_dropped/1048576.0,
+        n_skipped > 0 ? ", tmpfs files left alone" : "");
+#endif
+    device_ranges.clear();
 }
 
 // After a pinned load on a host whose RAM cannot hold the model file beside the pinned copy (the pinned memory is shmem, not

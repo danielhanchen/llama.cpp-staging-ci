@@ -200,7 +200,9 @@ struct llama_model_loader {
     };
     std::vector<pinned_range> pinned_ranges;
     std::vector<pinned_range> mapped_ranges;
+    std::vector<pinned_range> device_ranges; // k19-fnttft: tensors copied from a mapping into a device buffer
     void settle_pinned_cache();
+    void drop_device_cache();
     std::string first_tensor_moved_name;
     std::string first_tensor_moved_type_name;
     ggml_backend_buffer_type_t first_moved_from_buft = nullptr;

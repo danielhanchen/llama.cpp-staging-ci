@@ -104,6 +104,9 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
+    // k19-fnttft: read back the PLE table pages the page cache gave up after the load's part read (see llama_ple_topup)
+    size_t ple_topup();
+
     void synchronize();
 
     // synchronize() unless nothing was queued since the last one (see sync_pending): the output getters call this, so that
@@ -531,6 +534,14 @@ private:
         void *            pin_addr  = nullptr;
         void (*pin_unmap)(void *)   = nullptr;
         size_t            pin_len   = 0; // k19-core2: published to llama_sysmem::pinned_file_bytes while pinned
+        // k19-fnttft: the table's page span once a part read (not locked, not pinned) finished during the load, for ple_topup
+        std::atomic<bool> part_done{false};
+        uint8_t *         span_addr = nullptr;
+        size_t            span_len  = 0;
+        size_t            part_len  = 0; // the bytes of the span the load read
+        int               fd        = -1;
+        size_t            fd_offs   = 0; // file offset of span_addr + lead
+        size_t            lead      = 0;
         ~ple_res_runner() {
             stop.store(true);
             if (th.joinable()) {

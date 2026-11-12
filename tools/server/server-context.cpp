@@ -2700,6 +2700,10 @@ private:
                 chains, s0.smpl_dev.get(), true);
         }
 
+        // k19-fnttft: the load is over (target, drafter, warm-ups): read back the PLE table pages the page cache gave up since the
+        // load's part read, before the first request (llama_ple_topup; LLAMA_PLE_TOPUP=0 off)
+        llama_ple_topup(ctx_tgt);
+
         {
             const char * LLAMA_TRACE = getenv("LLAMA_TRACE");
             trace = LLAMA_TRACE ? atoi(LLAMA_TRACE) : 0;
