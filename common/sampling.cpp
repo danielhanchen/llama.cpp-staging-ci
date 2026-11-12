@@ -764,6 +764,9 @@ struct common_sampler * common_sampler_init(
         }
         std::sort(bt.begin(), bt.end());
         result->dev_n_bias = (int32_t) (std::unique(bt.begin(), bt.end()) - bt.begin());
+        // k19-gramdev: a token listed twice (e.g. a user bias on an EOG token + ignore_eos) gets every bias on the full row (where position =
+        // id) but only its first one on the candidates (the logit-bias sampler's search loop stops at the first match): no device top-k
+        result->dev_bias_pos = result->dev_bias_pos || (size_t) result->dev_n_bias < merged_bias.size();
     }
 
     result->greedy_fast = common_sampler_greedy_fast(params, grmr, rbudget);

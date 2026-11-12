@@ -368,6 +368,19 @@ int main(int argc, char ** argv) {
     }
     check("prompt tokens resolved", std::find(prompt.begin(), prompt.end(), LLAMA_TOKEN_NULL) == prompt.end());
 
+    // a token with two biases: the candidates would get only the first one (the logit-bias sampler), so no device top-k
+    {
+        common_params_sampling sp;
+        sp.logit_bias = { { 7, -1.0f }, { 7, -1.0f } };
+        common_sampler * s1 = common_sampler_init(g_model, sp);
+        sp.logit_bias = { { 7, -1.0f }, { 8, -1.0f } };
+        common_sampler * s2 = common_sampler_init(g_model, sp);
+        check("a token biased twice does not qualify for the device top-k (two distinct tokens do)",
+              common_sampler_device_topk(s1, 64) == 0 && common_sampler_device_topk(s2, 64) == 64);
+        common_sampler_free(s1);
+        common_sampler_free(s2);
+    }
+
     // presets: greedy, Studio sampled (temp 0.6 / 1.0, top_p 0.95, top_k 20, min_p 0), one with repetition penalties and ignore_eos
     struct preset { const char * name; float temp; int top_k; float top_p; float rep; int last_n; bool ignore_eos; int32_t k_dev; };
     const std::vector<preset> presets = {
