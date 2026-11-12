@@ -16,6 +16,10 @@
 #ifndef _WIN32
 #include <unistd.h>
 #endif
+#if defined(__linux__)
+#include <fcntl.h>
+#include <sys/vfs.h>
+#endif
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1397,6 +1401,42 @@ llama_model::~llama_model() {
     }
 }
 
+// k19-fnttft: see device_cache; POSIX_FADV_DONTNEED per range (mapped pages are kept by the kernel), files in tmpfs left alone
+void llama_model::drop_device_cache() const {
+#if defined(__linux__)
+    static const int env = getenv("LLAMA_MODEL_DROP_DEVICE_CACHE") ? atoi(getenv("LLAMA_MODEL_DROP_DEVICE_CACHE")) : -1;
+    if (env == 0 || device_cache.empty()) {
+        device_cache.clear();
+        return;
+    }
+    std::map<std::string, int> fds;
+    size_t n_dropped = 0;
+    for (const auto & r : device_cache) {
+        auto it = fds.find(r.path);
+        if (it == fds.end()) {
+            int fd = open(r.path.c_str(), O_RDONLY);
+            struct statfs sfs;
+            if (fd >= 0 && fstatfs(fd, &sfs) == 0 && (unsigned long) sfs.f_type == 0x01021994UL) { // TMPFS_MAGIC
+                close(fd);
+                fd = -1;
+            }
+            it = fds.emplace(r.path, fd).first;
+        }
+        if (it->second >= 0 && posix_fadvise(it->second, (off_t) r.offs, (off_t) r.size, POSIX_FADV_DONTNEED) == 0) {
+            n_dropped += r.size;
+        }
+    }
+    for (auto & [_, fd] : fds) {
+        if (fd >= 0) {
+            close(fd);
+        }
+    }
+    LLAMA_LOG_INFO("%s: k19-fnttft: dropped the page cache of %zu tensors copied to a device (%.2f MiB): the model's PLE table is short "
+        "of RAM (LLAMA_MODEL_DROP_DEVICE_CACHE=0 keeps it)\n", __func__, device_cache.size(), n_dropped/1048576.0);
+#endif
+    device_cache.clear();
+}
+
 llama_ple_prompt_reader * llama_model::ple_prompt_reader() const {
     std::call_once(ple_reader_once, [this] {
         const ggml_tensor * t = per_layer_tok_embd;
@@ -2147,6 +2187,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
+    }
+
+    // k19-fnttft: the ranges of the tensors copied to a device that the loader did not drop yet (llama_model::drop_device_cache)
+    if (ml.use_mmap) {
+        for (const auto & r : ml.device_ranges) {
+            if (r.idx < ml.file_paths.size()) {
+                device_cache.push_back({ ml.file_paths[r.idx], r.offs, r.size });
+            }
+        }
+        ml.device_ranges.clear();
     }
 
     // the file extents of the host weights read from the mapping, while the loader knows the file offsets (llama_weight_store)

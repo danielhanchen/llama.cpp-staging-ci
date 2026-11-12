@@ -888,6 +888,16 @@ struct llama_model {
     };
     std::unordered_map<const ggml_tensor *, lazy_file> lazy_files;
 
+    // k19-fnttft: file ranges of the tensors this load copied from the mapping into device buffers (their page cache is never read
+    // again); dropped by drop_device_cache when a lazy PLE table of this model is short of RAM (llama_context), then cleared
+    struct device_file_range {
+        std::string path;
+        size_t      offs = 0;
+        size_t      size = 0;
+    };
+    mutable std::vector<device_file_range> device_cache;
+    void drop_device_cache() const;
+
     // k19-disktt: parallel page reads of the PLE rows of prompt ubatches before their gather (llama_ple_prompt_reader_make), made at the
     // first prompt ubatch (the mapping is set by then); nullptr where it does not apply; freed in ~llama_model before the descriptors
     llama_ple_prompt_reader * ple_prompt_reader() const;

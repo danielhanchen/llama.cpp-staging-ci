@@ -2249,14 +2249,18 @@ bool llama_model_loader::pin_expert(size_t nbytes) {
 // k19-fnttft: a model loaded after a lazy PLE table that did not fit in RAM (llama_sysmem::ple_page_cache_short; the MTP drafter of
 // Flash-Next: 3.1 GB copied to the GPU, then never read again) leaves its file pages in the page cache, the youngest there, and the page
 // cache gives up the table's pages for them (the table's part was read before the drafter's load). The page cache of the tensors this
-// load copied into device buffers is dropped (POSIX_FADV_DONTNEED; pages still mapped are kept by the kernel); not for tmpfs.
-// LLAMA_MODEL_DROP_DEVICE_CACHE=0: off, 1: always
+// load copied into device buffers is dropped (POSIX_FADV_DONTNEED; pages still mapped are kept by the kernel); not for tmpfs. A model
+// loaded before the flag was set keeps the ranges (llama_model::drop_device_cache: its own context drops them when its PLE table is
+// short of RAM, before the table is read). LLAMA_MODEL_DROP_DEVICE_CACHE=0: off, 1: always
 void llama_model_loader::drop_device_cache() {
 #if defined(__linux__)
     static const int env = getenv("LLAMA_MODEL_DROP_DEVICE_CACHE") ? atoi(getenv("LLAMA_MODEL_DROP_DEVICE_CACHE")) : -1;
-    if (device_ranges.empty() || env == 0 || (env < 0 && !llama_sysmem::ple_page_cache_short().load())) {
+    if (device_ranges.empty() || env == 0) {
         device_ranges.clear();
         return;
+    }
+    if (env < 0 && !llama_sysmem::ple_page_cache_short().load()) {
+        return; // kept: the model takes them (llama_model::drop_device_cache, called by a context whose PLE table is short of RAM)
     }
     size_t n_dropped = 0, n_skipped = 0;
     for (const auto & r : device_ranges) {
