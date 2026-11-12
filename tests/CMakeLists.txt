@@ -352,6 +352,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-mtp-draft-topk PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # k19-hostgap: KV seq_rm over the used cells (LLAMA_KV_SEQ_RM_USED) leaves tokens, drafts and the memory state unchanged
+    llama_build(test-hostgap-exact.cpp)
+    llama_test(
+        test-hostgap-exact
+        LABEL main
+        ARGS "${MODEL_DIR}/mtp/qwen35moe-mtp.gguf"
+    )
+    set_tests_properties(test-hostgap-exact PROPERTIES FIXTURES_REQUIRED generate-models)
+
     # the greedy fast path of common_sampler_sample samples what the sampler chain samples, in every mode of its env knobs
     llama_build(test-sampling-greedy-fast.cpp)
     foreach(GF_ENV "" "LLAMA_SAMPLE_GREEDY_FAST=0" "LLAMA_SAMPLE_GREEDY_FAST=1" "LLAMA_SAMPLE_GREEDY_FAST=3"

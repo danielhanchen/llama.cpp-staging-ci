@@ -525,6 +525,15 @@ void llama_kv_cache::clear(bool data) {
     }
 }
 
+// k19-hostgap (LLAMA_KV_SEQ_RM_USED=0: off): seq_rm visits the cells below the last used one only. A cell at or past used_max_p1() is
+// empty (pos -1, no sequence: pos_set() puts a cell in `used`, every path that empties it takes it out), so pos_in() is false there and
+// the loop does nothing; with a 32768-cell cache and a few hundred used cells the full loop cost ~27 us per call on a Colab A100 host,
+// three calls per speculative pass (the drafter's rewind before the verify, the target's and the drafter's after the accept)
+static bool llama_kv_seq_rm_used() {
+    static const bool v = getenv("LLAMA_KV_SEQ_RM_USED") == nullptr || atoi(getenv("LLAMA_KV_SEQ_RM_USED")) != 0;
+    return v;
+}
+
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -548,7 +557,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
+        const uint32_t n_scan = llama_kv_seq_rm_used() ? std::min<uint32_t>(cells.size(), cells.used_max_p1()) : cells.size();
+        for (uint32_t i = 0; i < n_scan; ++i) {
             if (!cells.pos_in(i, p0, p1)) {
                 continue;
             }
@@ -572,7 +582,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
             uint32_t new_head = cells.size();
 
-            for (uint32_t i = 0; i < cells.size(); ++i) {
+            const uint32_t n_scan = llama_kv_seq_rm_used() ? std::min<uint32_t>(cells.size(), cells.used_max_p1()) : cells.size();
+            for (uint32_t i = 0; i < n_scan; ++i) {
                 if (!cells.pos_in(i, p0, p1)) {
                     continue;
                 }
