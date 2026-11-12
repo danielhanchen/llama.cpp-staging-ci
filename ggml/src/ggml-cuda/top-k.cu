@@ -789,6 +789,194 @@ static __global__ void __launch_bounds__(BLOCK_SIZE, 1) top_k_radix_one_block_v2
     }
 }
 
+// k19-dtopk: few rows of many columns and a small k (the MTP draft step's backend top_k(10) over 69632 / 248320 logits): the
+// multi-block radix select is 10 dependent launches (init, 4 x histogram + select, gather), latency-bound at one row. Here one
+// launch: each block picks its k best columns of its slice by (key desc, column asc), one per round (key = top_k_float_to_ordered:
+// -0 == +0, the radix order of every value incl. NaN); the block that finishes last for a row merges the blocks' picks the same way
+// and writes the radix select's output order: the picked keys above the k-th in column order, then the picked ties in column order.
+// The top k under (key desc, column asc) are exactly the radix select's keys above its threshold plus its lowest-column ties, so the
+// output is the same ids in the same order. GGML_CUDA_TOPK_TWO_STAGE=0: the radix select.
+// k: one round per pick per block, so it pays for small k only (A100, test-topk-twostage-exact: k 1 / 10 at 0.14-0.94x the radix
+// select's time over 32769-262144 columns, k 32 at 1.5-4.1x)
+#define TOP_K_TWO_STAGE_MAX_K    10
+#define TOP_K_TWO_STAGE_MAX_ROWS 8
+#define TOP_K_TWO_STAGE_NONE     0x7FFFFFFF
+
+// (ka, ca) before (kb, cb): higher key, then lower column; a column NONE is after everything
+static __device__ __forceinline__ bool top_k_ts_before(uint32_t ka, int ca, uint32_t kb, int cb) {
+    return ca != TOP_K_TWO_STAGE_NONE && (cb == TOP_K_TWO_STAGE_NONE || ka > kb || (ka == kb && ca < cb));
+}
+
+// the block's first (key, col) in the order; every thread gets it
+template<int BLOCK_SIZE>
+static __device__ __forceinline__ void top_k_ts_block_best(uint32_t & key, int & col, uint32_t * s_key, int * s_col) {
+    const int tid = threadIdx.x;
+#pragma unroll
+    for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+        const uint32_t ko = __shfl_xor_sync(0xFFFFFFFF, key, off, WARP_SIZE);
+        const int      co = __shfl_xor_sync(0xFFFFFFFF, col, off, WARP_SIZE);
+        if (top_k_ts_before(ko, co, key, col)) {
+            key = ko;
+            col = co;
+        }
+    }
+    if (tid % WARP_SIZE == 0) {
+        s_key[tid / WARP_SIZE] = key;
+        s_col[tid / WARP_SIZE] = col;
+    }
+    __syncthreads();
+    if (tid < WARP_SIZE) {
+        key = tid < BLOCK_SIZE / WARP_SIZE ? s_key[tid] : 0;
+        col = tid < BLOCK_SIZE / WARP_SIZE ? s_col[tid] : TOP_K_TWO_STAGE_NONE;
+#pragma unroll
+        for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+            const uint32_t ko = __shfl_xor_sync(0xFFFFFFFF, key, off, WARP_SIZE);
+            const int      co = __shfl_xor_sync(0xFFFFFFFF, col, off, WARP_SIZE);
+            if (top_k_ts_before(ko, co, key, col)) {
+                key = ko;
+                col = co;
+            }
+        }
+        if (tid == 0) {
+            s_key[0] = key;
+            s_col[0] = col;
+        }
+    }
+    __syncthreads();
+    key = s_key[0];
+    col = s_col[0];
+    __syncthreads();
+}
+
+template<int BLOCK_SIZE>
+static __global__ void top_k_two_stage(const float * __restrict__ src, int * __restrict__ dst, uint2 * __restrict__ part,
+                                       unsigned int * __restrict__ counters, int ncols, int k, int blocks_per_row, int cols_per_block) {
+    __shared__ uint32_t s_key[BLOCK_SIZE / WARP_SIZE];
+    __shared__ int      s_col[BLOCK_SIZE / WARP_SIZE];
+    __shared__ uint32_t sel_key[TOP_K_TWO_STAGE_MAX_K];
+    __shared__ int      sel_col[TOP_K_TWO_STAGE_MAX_K];
+    __shared__ bool     s_last;
+
+    const int row = blockIdx.x / blocks_per_row;
+    const int rb  = blockIdx.x % blocks_per_row;
+    const int tid = threadIdx.x;
+    const float * row_src = src + (size_t) row * ncols;
+    const int c0 = rb * cols_per_block;
+    const int c1 = min(ncols, c0 + cols_per_block);
+    uint2 * my_part = part + (size_t) blockIdx.x * k;
+
+    // stage 1: this block's k first (key, col) of its slice, one per round: each round takes the first one after the previous pick
+    uint32_t pk = 0;
+    int      pc = -1;
+    for (int r = 0; r < k; ++r) {
+        uint32_t bk = 0;
+        int      bc = TOP_K_TWO_STAGE_NONE;
+        for (int c = c0 + tid; c < c1; c += BLOCK_SIZE) {
+            const uint32_t key = top_k_float_to_ordered(row_src[c]);
+            const bool after = r == 0 || key < pk || (key == pk && c > pc);
+            if (after && top_k_ts_before(key, c, bk, bc)) {
+                bk = key;
+                bc = c;
+            }
+        }
+        top_k_ts_block_best<BLOCK_SIZE>(bk, bc, s_key, s_col);
+        if (tid == 0) {
+            my_part[r] = make_uint2(bk, (unsigned int) bc);
+        }
+        pk = bk;
+        pc = bc;
+    }
+
+    // the last block of the row to finish merges
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        s_last = atomicAdd(&counters[row], 1u) == (unsigned int) (blocks_per_row - 1);
+    }
+    __syncthreads();
+    if (!s_last) {
+        return;
+    }
+    __threadfence();
+
+    const uint2 * row_part = part + (size_t) row * blocks_per_row * k;
+    const int n_cand = blocks_per_row * k;
+    pk = 0;
+    pc = -1;
+    for (int r = 0; r < k; ++r) {
+        uint32_t bk = 0;
+        int      bc = TOP_K_TWO_STAGE_NONE;
+        for (int i = tid; i < n_cand; i += BLOCK_SIZE) {
+            const uint2 e = __ldcg(row_part + i);
+            const uint32_t key = e.x;
+            const int      c   = (int) e.y;
+            if (c == TOP_K_TWO_STAGE_NONE) {
+                continue;
+            }
+            const bool after = r == 0 || key < pk || (key == pk && c > pc);
+            if (after && top_k_ts_before(key, c, bk, bc)) {
+                bk = key;
+                bc = c;
+            }
+        }
+        top_k_ts_block_best<BLOCK_SIZE>(bk, bc, s_key, s_col);
+        if (tid == 0) {
+            sel_key[r] = bk;
+            sel_col[r] = bc;
+        }
+        pk = bk;
+        pc = bc;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        // the radix select's order: the keys above the k-th in column order, then the ties of the k-th in column order
+        const uint32_t thr = sel_key[k - 1];
+        int * row_dst = dst + (size_t) row * k;
+        int n = 0;
+        for (int pass = 0; pass < 2; ++pass) {
+            const int n0 = n;
+            for (int i = 0; i < k; ++i) {
+                if ((pass == 0) != (sel_key[i] > thr)) {
+                    continue;
+                }
+                // insertion by column among this pass's entries
+                int j = n;
+                while (j > n0 && row_dst[j - 1] > sel_col[i]) {
+                    row_dst[j] = row_dst[j - 1];
+                    j--;
+                }
+                row_dst[j] = sel_col[i];
+                n++;
+            }
+        }
+    }
+}
+
+static bool ggml_cuda_top_k_two_stage_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_TOPK_TWO_STAGE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static void top_k_two_stage_cuda(ggml_cuda_pool & pool, const float * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
+    constexpr int BLOCK_SIZE = 256;
+    const int blocks_per_row = (int) std::min<int64_t>(((int64_t) ncols + 1023) / 1024, 128);
+    const int cols_per_block = (ncols + blocks_per_row - 1) / blocks_per_row;
+    ggml_cuda_pool_alloc<uint2>        part_alloc(pool, (size_t) nrows * blocks_per_row * k);
+    ggml_cuda_pool_alloc<unsigned int> cnt_alloc(pool, (size_t) nrows);
+    CUDA_CHECK(cudaMemsetAsync(cnt_alloc.get(), 0, nrows * sizeof(unsigned int), stream));
+    top_k_two_stage<BLOCK_SIZE><<<(unsigned int) (nrows * blocks_per_row), BLOCK_SIZE, 0, stream>>>(
+        src, dst, part_alloc.get(), cnt_alloc.get(), ncols, k, blocks_per_row, cols_per_block);
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        GGML_LOG_INFO("%s: k19-dtopk top-k of %d in one two-stage launch (%lld rows of %d; GGML_CUDA_TOPK_TWO_STAGE=0: radix select)\n",
+                __func__, k, (long long) nrows, ncols);
+    }
+}
+
 static bool ggml_cuda_top_k_one_block_v2_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_TOPK_ONEBLOCK_V2");
@@ -902,6 +1090,11 @@ static void ggml_cuda_op_top_k_deterministic(ggml_cuda_pool & pool, const float 
             (one_block_v2 ? ncols <= GGML_CUDA_TOP_K_ONE_BLOCK_V2_MAX_NCOLS && (ncols <= 32768 || nrows >= 16)
                           : ncols <= GGML_CUDA_TOP_K_ONE_BLOCK_MAX_NCOLS)) {
         top_k_radix_one_block_cuda(src0_d, dst_d, ncols, nrows, k, stream);
+        return;
+    }
+
+    if (ggml_cuda_top_k_two_stage_enabled() && k <= TOP_K_TWO_STAGE_MAX_K && nrows <= TOP_K_TWO_STAGE_MAX_ROWS && ncols >= 2048) {
+        top_k_two_stage_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
         return;
     }
 

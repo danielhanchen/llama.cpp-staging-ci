@@ -745,7 +745,15 @@ struct llama_model {
         int32_t next   = 0;              // the request-token row written next (ring)
         std::vector<int64_t> ids;        // host copy of d2t
         std::vector<uint8_t> in;         // per token id: has a row
+        // k19-dtopk: the rows in ascending token order (I32 [n]): perm = row index (n: a -inf column, the request rows not yet
+        // filled), cand = its token id. The backend draft top-k runs over get_rows(logits, perm) and maps through cand, which
+        // keeps the full-vocabulary top-k's selection and order (see llm_graph_context::draft_topk_rows); null: off
+        ggml_tensor * perm = nullptr;
+        ggml_tensor * cand = nullptr;
     } draft_head;
+
+    // k19-dtopk: rewrites draft_head.perm / cand from draft_head.ids (call between decodes)
+    void draft_head_order_update();
 
     // see llama_model_set_attn_rot
     bool attn_rot = true;
@@ -1005,6 +1013,9 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
 llama_model * llama_model_create(llama_model_loader & ml, const llama_model_params & params);
 
 // model must inherit from this
+// k19-dtopk: false with LLAMA_MTP_DRAFT_TOPK_FULL=1 (the draft top-k over the full-vocabulary scatter, as before)
+bool llama_mtp_draft_topk_on();
+
 struct llama_model_base : public llama_model {
     friend struct llama_model;
 

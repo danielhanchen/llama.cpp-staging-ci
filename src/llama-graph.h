@@ -1014,6 +1014,11 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    // k19-dtopk: an MTP draft step's restricted head logits [n_sub, n_outputs] before their scatter into t_logits, and its
+    // token-ordered row map (llama_model::draft_head perm / cand): build_sampling runs a leading top-k over them (draft_topk_rows)
+    ggml_tensor * t_dh_logits   = nullptr;
+    ggml_tensor * t_dh_perm     = nullptr;
+    ggml_tensor * t_dh_cand     = nullptr;
     // k19-graph: the KV length input of the attention (llm_graph_input_attn_kv::self_kv_len) and the n_kv of its K / V views
     ggml_tensor * t_kv_len      = nullptr;
     int64_t       t_kv_len_n_kv = 0;
@@ -1561,6 +1566,11 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
+
+    // k19-dtopk: true if every sampled row of this ubatch goes through a backend chain that starts with a top-k and no row needs the
+    // raw logits, so build_sampling takes the top-k over the restricted draft head's logits (res->t_dh_*) and t_logits (the scatter
+    // into the full vocabulary) is not computed
+    bool draft_topk_rows() const;
 
     //
     // dense (out)

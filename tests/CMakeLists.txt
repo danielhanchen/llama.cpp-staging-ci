@@ -334,6 +334,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-mtp-meta PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # k19-dtopk: the MTP draft top-k over the restricted head's rows in token order gives the full-vocabulary top-k's candidates,
+    # logits and order (ops on every backend, with ties), and the same tokens and drafts as LLAMA_MTP_DRAFT_TOPK_FULL=1
+    llama_build(test-mtp-draft-topk.cpp)
+    llama_test(
+        test-mtp-draft-topk
+        LABEL main
+        ARGS "${MODEL_DIR}/mtp/qwen35moe-mtp.gguf"
+    )
+    set_tests_properties(test-mtp-draft-topk PROPERTIES FIXTURES_REQUIRED generate-models)
+
     # the greedy fast path of common_sampler_sample samples what the sampler chain samples, in every mode of its env knobs
     llama_build(test-sampling-greedy-fast.cpp)
     foreach(GF_ENV "" "LLAMA_SAMPLE_GREEDY_FAST=0" "LLAMA_SAMPLE_GREEDY_FAST=1" "LLAMA_SAMPLE_GREEDY_FAST=3"
@@ -450,6 +460,7 @@ llama_build_and_test(test-meta-k15-ops.cpp LINK ggml)
 llama_build_and_test(test-k19-fuse-exact.cpp LINK ggml)
 llama_build_and_test(test-topk384-exact.cpp LINK ggml)
 llama_build_and_test(test-topk-oneblock-exact.cpp LINK ggml)
+llama_build_and_test(test-topk-twostage-exact.cpp LINK ggml)   # k19-dtopk: two-stage one-launch top-k == radix select, byte for byte
 # k19-moebw routed-expert mat-vec vs the kernels it replaces, byte for byte (SKIP without a CUDA device)
 llama_build_and_test(test-moe-bw-exact.cpp LINK ggml)
 # k19-handoff: ggml_dflash2_conv vs the add / mul / pad chain of the DFlash2 drafter's conv, byte for byte on every device (CPU always)
