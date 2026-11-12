@@ -6958,7 +6958,28 @@ struct llama_moe_cache::impl {
             const char * e = getenv("LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL");
             return e != nullptr ? std::max<int64_t>(1, std::min<int64_t>(GGML_MOE_MAILBOX_MAX_TOKENS, atoll(e))) : (int64_t) 4;
         }();
-        return overlap && n_ubatch > 1 && n_ubatch <= mx;
+        if (!overlap || n_ubatch <= 1) {
+            return false;
+        }
+        return n_ubatch <= mx || overlap_plain_wide(n_ubatch);
+    }
+
+    // k19-bigverify LLAMA_MOE_OVERLAP_PLAIN_MAX=N (default 8, at most GGML_MOE_MAILBOX_MAX_TOKENS; <= 4 = off): verify windows of 5..N tokens
+    // whose host path is off (the plain lookup, k19-q4xcache) take the overlap too: their missing experts are copied on the side stream
+    // beside the cached ones instead of in the compute stream before any expert of the layer. Windows with the host path on keep the 4-token
+    // limit above (DFlash2 7-row windows on the hybrid path: -2.5 / -3.6% at 24 GB, k19-overlap). Same results as the plain lookup (see
+    // overlap_plain_on). Colab G4 Qwen3.8-Flash-Next UD-IQ4_XS DFlash2 n6 at a 48 GB cap (70.7% of the host experts cached, host path off),
+    // bv_s1g: 208.1 -> 224.5 tok/s chat, same text
+    bool overlap_plain_wide(int64_t n_ubatch) const {
+        static const int64_t mxp = [] {
+            const char * e = getenv("LLAMA_MOE_OVERLAP_PLAIN_MAX");
+            return e != nullptr ? std::max<int64_t>(1, std::min<int64_t>(GGML_MOE_MAILBOX_MAX_TOKENS, atoll(e))) : std::min<int64_t>(GGML_MOE_MAILBOX_MAX_TOKENS, 8);
+        }();
+        if (n_ubatch > mxp || !overlap_plain_on() || force_large) {
+            return false;
+        }
+        // the host path is off for this size: what hybrid_assign would treat as the plain lookup
+        return cm ? cm_share_of(n_ubatch) >= 1.0f : !hybrid_active();
     }
 
     // k19-l4c deferred admission (LLAMA_MOE_FETCH_DEFER, default 1; 0 = off, 2 = also on hosts without the host team): a single token
