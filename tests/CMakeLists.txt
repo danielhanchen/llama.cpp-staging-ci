@@ -334,6 +334,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-mtp-meta PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # k19-dtopk: the MTP draft top-k over the restricted head's rows in token order gives the full-vocabulary top-k's candidates,
+    # logits and order (ops on every backend, with ties), and the same tokens and drafts as LLAMA_MTP_DRAFT_TOPK_FULL=1
+    llama_build(test-mtp-draft-topk.cpp)
+    llama_test(
+        test-mtp-draft-topk
+        LABEL main
+        ARGS "${MODEL_DIR}/mtp/qwen35moe-mtp.gguf"
+    )
+    set_tests_properties(test-mtp-draft-topk PROPERTIES FIXTURES_REQUIRED generate-models)
+
     # the greedy fast path of common_sampler_sample samples what the sampler chain samples, in every mode of its env knobs
     llama_build(test-sampling-greedy-fast.cpp)
     foreach(GF_ENV "" "LLAMA_SAMPLE_GREEDY_FAST=0" "LLAMA_SAMPLE_GREEDY_FAST=1" "LLAMA_SAMPLE_GREEDY_FAST=3"

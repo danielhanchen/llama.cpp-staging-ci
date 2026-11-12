@@ -2364,7 +2364,7 @@ void llama_model_base::load_tensors_draft_head(llama_model_loader & ml, bool dry
     ids.resize(n_sub, ids[0]);
 
     ggml_init_params ip = {
-        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_size   =*/ 4*ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
         /*.no_alloc   =*/ true,
     };
@@ -2373,6 +2373,16 @@ void llama_model_base::load_tensors_draft_head(llama_model_loader & ml, bool dry
     ggml_set_name(sub, "mtp_draft_head.weight");
     ggml_tensor * d2t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, n_sub);
     ggml_set_name(d2t, "mtp_draft_head.d2t");
+    // k19-dtopk: the token-ordered row map of the backend draft top-k (LLAMA_MTP_DRAFT_TOPK_FULL=1: none, the top-k runs over the
+    // full-vocabulary scatter as before)
+    ggml_tensor * perm = nullptr;
+    ggml_tensor * cand = nullptr;
+    if (llama_mtp_draft_topk_on()) {
+        perm = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n_sub);
+        ggml_set_name(perm, "mtp_draft_head.perm");
+        cand = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n_sub);
+        ggml_set_name(cand, "mtp_draft_head.cand");
+    }
 
     ggml_backend_buffer_ptr buf;
     if (dry) {
@@ -2382,6 +2392,10 @@ void llama_model_base::load_tensors_draft_head(llama_model_loader & ml, bool dry
         }
         sub->buffer = buf.get();
         d2t->buffer = buf.get();
+        if (perm != nullptr) {
+            perm->buffer = buf.get();
+            cand->buffer = buf.get();
+        }
     } else {
         buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
         if (!buf) {
@@ -2423,6 +2437,11 @@ void llama_model_base::load_tensors_draft_head(llama_model_loader & ml, bool dry
     draft_head.in.assign(n_vocab, 0);
     for (int32_t i = 0; i < n_base; ++i) {
         draft_head.in[ids[i]] = 1;
+    }
+    draft_head.perm = perm;
+    draft_head.cand = cand;
+    if (!dry) {
+        draft_head_order_update();
     }
     std::vector<ggml_backend_buffer_ptr> bufs;
     bufs.emplace_back(std::move(buf));
@@ -4587,6 +4606,53 @@ uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const l
     return n_tokens * (uint32_t) tensor->ne[0];
 }
 
+// k19-dtopk: the draft step's backend top-k over the restricted head's logits instead of their scatter into the full vocabulary
+// (248320 columns on Qwen3.5 / 3.6, 3.6x the 69632 rows): LLAMA_MTP_DRAFT_TOPK_FULL=1 restores the full-vocabulary top-k
+bool llama_mtp_draft_topk_on() {
+    static const bool on = [] {
+        const char * env = getenv("LLAMA_MTP_DRAFT_TOPK_FULL");
+        return env == nullptr || atoi(env) == 0;
+    }();
+    return on;
+}
+
+// k19-dtopk: perm / cand list the rows that hold a token of their own in ascending token order (the frequent-token rows are sorted
+// already, the request rows are merged in); the request rows not yet written (copies of row 0, see load_tensors_draft_head) map to
+// the -inf column n after them, so their duplicate of the first token is never a candidate
+void llama_model::draft_head_order_update() {
+    auto & dh = draft_head;
+    if (dh.perm == nullptr || dh.cand == nullptr || dh.perm->data == nullptr) {
+        return;
+    }
+    const int32_t n = (int32_t) dh.ids.size();
+    std::vector<int32_t> extra;
+    for (int32_t r = dh.n_base; r < n; ++r) {
+        if (dh.ids[r] != dh.ids[0]) {
+            extra.push_back(r);
+        }
+    }
+    std::sort(extra.begin(), extra.end(), [&](int32_t a, int32_t b) { return dh.ids[a] < dh.ids[b]; });
+    std::vector<int32_t> perm;
+    std::vector<int32_t> cand;
+    perm.reserve(n);
+    cand.reserve(n);
+    int32_t i = 0;
+    size_t  j = 0;
+    while (i < dh.n_base || j < extra.size()) {
+        const bool take_base = j == extra.size() || (i < dh.n_base && dh.ids[i] < dh.ids[extra[j]]);
+        const int32_t r = take_base ? i++ : extra[j++];
+        GGML_ASSERT(perm.empty() || dh.ids[r] > (int64_t) cand.back()); // strictly ascending: one row per token
+        perm.push_back(r);
+        cand.push_back((int32_t) dh.ids[r]);
+    }
+    while ((int32_t) perm.size() < n) {
+        perm.push_back(n);
+        cand.push_back((int32_t) dh.ids[0]);
+    }
+    ggml_backend_tensor_set(dh.perm, perm.data(), 0, perm.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(dh.cand, cand.data(), 0, cand.size() * sizeof(int32_t));
+}
+
 // k9-draft: gives the request tokens that the restricted MTP draft head lacks a row of their own (see load_tensors_draft_head).
 // Call between decodes (no graph of the model in flight): the rows are written in place, so the graphs keep their shapes.
 int32_t llama_model_draft_head_add(const struct llama_model * model_c, const llama_token * tokens, int32_t n_tokens) {
@@ -4616,6 +4682,7 @@ int32_t llama_model_draft_head_add(const struct llama_model * model_c, const lla
     }
     if (n_added > 0) {
         ggml_backend_tensor_set(dh.d2t, dh.ids.data(), 0, dh.ids.size() * sizeof(int64_t));
+        const_cast<llama_model *>(model_c)->draft_head_order_update();
         if (dh.d2t_i32 != nullptr) {
             std::vector<int32_t> m32(dh.ids.begin(), dh.ids.end());
             ggml_backend_tensor_set(dh.d2t_i32, m32.data(), 0, m32.size() * sizeof(int32_t));

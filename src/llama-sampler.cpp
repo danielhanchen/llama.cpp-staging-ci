@@ -1723,6 +1723,21 @@ static struct llama_sampler_i llama_sampler_top_k_i = {
     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_top_k>,
 };
 
+int32_t llama_sampler_backend_top_k_first(const llama_sampler * sampler) {
+    if (sampler == nullptr || sampler->iface != &llama_sampler_chain_i) {
+        return 0;
+    }
+    const auto * chain = (const llama_sampler_chain *) sampler->ctx;
+    if (!chain->is_init || chain->samplers.empty() || !chain->samplers[0].is_backend) {
+        return 0;
+    }
+    const llama_sampler * first = chain->samplers[0].ptr;
+    if (first == nullptr || first->iface != &llama_sampler_top_k_i) {
+        return 0;
+    }
+    return ((const llama_sampler_top_k *) first->ctx)->k;
+}
+
 struct llama_sampler * llama_sampler_init_top_k(int32_t k) {
     const bool is_empty = (k <= 0);
 

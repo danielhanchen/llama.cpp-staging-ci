@@ -1602,6 +1602,9 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_dh_logits   = nullptr;
+    t_dh_perm     = nullptr;
+    t_dh_cand     = nullptr;
     t_kv_len      = nullptr;
     t_kv_len_n_kv = 0;
 
@@ -1914,6 +1917,24 @@ ggml_tensor * llm_graph_context::build_draft_head(
     const int64_t n_sub     = res->ne[0];
     const int64_t n_outputs = res->ne[1];
     const int64_t n_vocab   = w->ne[1];
+    // k19-dtopk: the backend top-k may run over the restricted logits in token order (get_rows by perm) where it selects and orders
+    // as over the full-vocabulary scatter: the ops' order rule depends only on the values and the columns' relative order there
+    // (CPU: sorted by value, then the lowest column; CUDA deterministic top-k past the 4096-column sort paths: the keys above the k-th
+    // value in column order, then the kept ties, lowest columns first: the full row always takes that path)
+    if (dh.perm != nullptr && dh.cand != nullptr && dh.w->buffer != nullptr) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(dh.w->buffer));
+        bool order_ok = dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        ggml_backend_reg_t reg = order_ok ? nullptr : ggml_backend_dev_backend_reg(dev); // a meta device (-sm tensor) has none: off
+        if (reg != nullptr && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
+            const char * det = getenv("GGML_CUDA_TOPK_DETERMINISTIC");
+            order_ok = n_sub > 4096 && n_vocab > 4096 && (det == nullptr || atoi(det) != 0);
+        }
+        if (order_ok) {
+            this->res->t_dh_logits = res;
+            this->res->t_dh_perm   = dh.perm;
+            this->res->t_dh_cand   = dh.cand;
+        }
+    }
     ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_outputs), -INFINITY);
     full = ggml_set_rows(ctx0, full,
             ggml_reshape_3d(ctx0, res,    1,     n_sub, n_outputs),
@@ -4979,14 +5000,51 @@ void llm_graph_context::build_logits() const {
     }
 
     // the models declare t_logits without expanding it, so the LM head is computed only when it is expanded here
-    if (res->t_logits != nullptr) {
+    // (k19-dtopk: not when only the draft top-k reads it, see draft_topk_rows)
+    if (res->t_logits != nullptr && !draft_topk_rows()) {
         ggml_build_forward_expand(gf, res->t_logits);
     }
+}
+
+bool llm_graph_context::draft_topk_rows() const {
+    if (res->t_dh_logits == nullptr || res->t_logits == nullptr || samplers.empty() || res->t_dh_logits->ne[1] != n_outputs) {
+        return false;
+    }
+    const int64_t n_sub = res->t_dh_logits->ne[0];
+    for (const auto & entry : samplers) {
+        const int32_t k = llama_sampler_backend_top_k_first(entry.second);
+        if (k <= 0 || k > n_sub) {
+            return false;
+        }
+    }
+    // the rows copy t_logits to the host only for a sequence without a graph sampler (needs_raw_logits)
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (!ubatch.output[i]) {
+            continue;
+        }
+        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+            if (samplers.find(ubatch.seq_id[i][j]) == samplers.end()) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 void llm_graph_context::build_sampling() const {
     if (samplers.empty() || !res->t_logits) {
         return;
+    }
+
+    // k19-dtopk: the top-k over the restricted head's logits in token order: [logits | -inf] (the -inf column n_sub stands for the
+    // request rows not written yet), each chain's row gathered by perm, and its candidates mapped to token ids by cand
+    const bool dtopk = draft_topk_rows();
+    if (dtopk) {
+        static std::atomic<bool> logged { false };
+        if (!logged.exchange(true)) {
+            LLAMA_LOG_INFO("k19-dtopk: MTP draft top-k over the %lld restricted head rows (not the %lld-token scatter; "
+                    "LLAMA_MTP_DRAFT_TOPK_FULL=1: full vocabulary)\n", (long long) res->t_dh_logits->ne[0], (long long) res->t_logits->ne[0]);
+        }
     }
 
     std::array<ggml_tensor *, 2> outs;
@@ -5012,7 +5070,16 @@ void llm_graph_context::build_sampling() const {
     GGML_ASSERT(res->t_logits != nullptr && "missing t_logits tensor");
 
     // the padding row gives the chains without a row of the ubatch a valid input, even with no output at all
-    ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
+    ggml_tensor * logits_t = nullptr;
+    if (dtopk) {
+        ggml_tensor * sub  = res->t_dh_logits;
+        ggml_tensor * ninf = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, sub->ne[1]), -INFINITY);
+        logits_t = ggml_pad(ctx0, ggml_concat(ctx0, sub, ninf, 0), 0, 1, 0, 0);
+        ggml_set_name(logits_t, "draft_topk_logits");
+        outs[0] = logits_t;
+    } else {
+        logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
+    }
 
     for (const auto & entry : samplers) {
         if (entry.second->iface->backend_reset) {
@@ -5034,13 +5101,19 @@ void llm_graph_context::build_sampling() const {
             const int      i_out  = active ? 1       : 0;
 
             ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row * logits_t->nb[1]);
+            ggml_tensor * cand_seq   = nullptr;
+            if (dtopk) {
+                const int64_t n_sub = res->t_dh_perm->ne[0];
+                logits_seq = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, logits_seq, 1, logits_seq->ne[0]), res->t_dh_perm), n_sub);
+                cand_seq   = res->t_dh_cand;
+            }
             ggml_format_name(logits_seq, "logits_seq_%d_%u", seq_id, i);
 
             struct llama_sampler_data data = {
                 /*.logits       =*/ logits_seq,
                 /*.probs        =*/ nullptr,
                 /*.sampled      =*/ nullptr,
-                /*.candidates   =*/ nullptr,
+                /*.candidates   =*/ cand_seq,
             };
 
             assert(sampler->iface->backend_apply);
