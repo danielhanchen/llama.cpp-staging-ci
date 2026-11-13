@@ -370,7 +370,9 @@ static int run_main(int argc, char ** argv) {
         llama_log_set([](ggml_log_level, const char *, void *) {}, nullptr);
     }
 
-    const std::string spm = std::string(argv[1]) + (expect_diff ? ".dtopk-spm-x.gguf" : kill ? ".dtopk-spm-k.gguf" : ".dtopk-spm.gguf");
+    // not *.gguf: the copy sits in the shared test-models dir, which test-llama-context scans for *.gguf while ctest -j runs
+    // this test beside it (it found the copy half written or already removed)
+    const std::string spm = std::string(argv[1]) + (expect_diff ? ".dtopk-spm-x.tmp" : kill ? ".dtopk-spm-k.tmp" : ".dtopk-spm.tmp");
     uint32_t nv = 0;
     if (!write_spm_model(argv[1], spm, &nv) || nv < 1024) {
         fprintf(stderr, "cannot write the SPM copy of %s (vocab %u)\n", argv[1], nv);
