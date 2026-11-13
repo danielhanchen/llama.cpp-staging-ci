@@ -6303,11 +6303,12 @@ struct llama_moe_cache::impl {
         return on;
     }
     uint64_t n_shadow_async = 0;
-    void shadow_slots(ggml_backend_t backend, group & g, const std::vector<std::pair<int32_t, int32_t>> & ev) {
+    // async only from a seed (allow_async): lend / retire / release hand the slots to the graph allocation or free them right after
+    void shadow_slots(ggml_backend_t backend, group & g, const std::vector<std::pair<int32_t, int32_t>> & ev, bool allow_async = false) {
         if (!host || ev.empty()) {
             return;
         }
-        const bool as = shadow_async();
+        const bool as = allow_async && shadow_async();
         // the copies into the device slots may be on the compute backend or the copy queue of the device: both done (async: the copies
         // back are queued behind the work of backend, only another queue is waited for)
         if (!as) {
@@ -11578,7 +11579,7 @@ struct llama_moe_cache::impl {
                 // k19-ramevict: a large batch seeds layer b.il after its experts were staged, so the RAM slots they need make room in the
                 // layers this pass has finished first (see llama_moe_host_cache::set_stream_layer); decode never seeds
                 host->set_stream_layer(b.il);
-                shadow_slots(backend, g, evicted_tmp);
+                shadow_slots(backend, g, evicted_tmp, true);
                 host->set_stream_layer(-1);
             }
         }
