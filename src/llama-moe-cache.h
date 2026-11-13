@@ -395,6 +395,7 @@ public:
     void fill_counts_begin();
     void fill_counts(const ggml_tensor * w, const std::vector<int32_t> & counts);
     void fill_stop(); // its reads that did not start are cancelled, the started ones waited for
+    void fill_idle(); // the server is idle: the freed slots are refilled (the reads run until the next batch)
     bool refills_routed() const; // LLAMA_MOE_CACHE_REFILL_ROUTED=1 (opt-in)
     const std::vector<int32_t> * get_seed_counts(const ggml_tensor * w) const; // nullptr if there are none for the layer of w
     void clear_seed_counts();

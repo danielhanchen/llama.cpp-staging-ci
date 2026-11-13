@@ -861,6 +861,9 @@ private:
     // the end of a prompt that did not seed: the lent slots that come back get the experts its last large ubatch used most
     void moe_cache_refill_from_ids();
     void moe_cache_fill_from_ids(); // k19-l4fill
+public:
+    void moe_fill_idle(); // k19-l4fill (llama_moe_host_fill_idle)
+private:
 
     // ubatches of at least this many tokens prefetch the host weights on the scheduler copy queue, MoE experts whole [GGML_SCHED_PREFETCH_MIN_BATCH]
     // smaller ubatches (e.g. generation) copy only the routed experts or use the MoE cache, with no staging or event work

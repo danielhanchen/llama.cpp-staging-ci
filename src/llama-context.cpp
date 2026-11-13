@@ -13216,6 +13216,18 @@ size_t llama_ple_topup(llama_context * ctx) {
     return ctx ? ctx->ple_topup() : 0;
 }
 
+void llama_moe_host_fill_idle(llama_context * ctx) {
+    if (ctx) {
+        ctx->moe_fill_idle();
+    }
+}
+
+void llama_context::moe_fill_idle() {
+    if (moe_cache) {
+        moe_cache->fill_idle();
+    }
+}
+
 void llama_sched_reserve_now(llama_context * ctx) {
     ctx->sched_reserve();
 }

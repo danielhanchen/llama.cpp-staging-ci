@@ -1280,12 +1280,15 @@ struct llama_moe_cache::impl {
     // the evictions RAM still held a copy of are filled by promotions with no demotion beside them. Colab L4 full card, Qwen3.8-Flash-Next
     // UD-IQ4_XS from the VM disk: the 640-token request fills the tier (16692 slots), the chat after it starts with 1.3-1.4k free and
     // 13.1-13.5% of the experts held nowhere instead of ~8%, and misses that share of its routing. The routing of each prompt's last large
-    // ubatch is counted (llama_context reads its recorded ids at the end of the prompt, fill_counts; older prompts halved); from the first
-    // small batch after a prompt on, the experts with a count that are neither on the device nor in RAM are read by the weight store into
-    // free slots (or duplicates) whose memory is already allocated (never evicting, never a new pinned chunk), most routed first, as
-    // speculative reads (behind every demand read and ring read, at most LLAMA_MOE_HOST_FILL_PARALLEL (2) at once), topped up at every small
-    // batch; a large batch cancels the reads that did not start. A filled slot is a guess (set_spec): until it is used any reservation
-    // takes it like a free slot, so the next prompt's reads still find room. Placement only: a slot holds the file's bytes.
+    // ubatch is counted (llama_context reads its recorded ids at the end of the prompt, fill_counts; older prompts halved); when the server
+    // goes idle (llama_moe_host_fill_idle), the experts with a count that are neither on the device nor in RAM are read by the weight store
+    // into free slots (or duplicates) whose memory is already allocated (never evicting, never a new pinned chunk), most routed first, as
+    // speculative reads (behind every demand read and ring read, at most LLAMA_MOE_HOST_FILL_PARALLEL (2) at once); the next batch
+    // publishes the done ones and cancels the reads that did not start. A filled slot is a guess (set_spec): until it is used any
+    // reservation takes it like a free slot, so the next prompt's reads still find room. Placement only: a slot holds the file's bytes.
+    // Not during the decode: refilled at every small batch (LLAMA_MOE_HOST_FILL=2, the first version) the reads shared the disk with the
+    // decode's misses and the demotions took the guesses again (L4 full card: 9046 reads, 20 GB per launch; chat decode 18.1-18.2 s ->
+    // 25.5-29.8 s for 256 tokens), while the chat after a 30 s idle gap found the tier full either way.
     // LLAMA_MOE_HOST_FILL=0 off (also off with a routing profile, LLAMA_MOE_HOST_PROFILE, or the reads ahead)
     int    fill_mode = [] { const char * e = getenv("LLAMA_MOE_HOST_FILL"); return e == nullptr ? 1 : atoi(e); }();
     int    fill_parallel = [] { const char * e = getenv("LLAMA_MOE_HOST_FILL_PARALLEL"); return e == nullptr ? 2 : std::max(0, atoi(e)); }();
@@ -1305,7 +1308,7 @@ struct llama_moe_cache::impl {
     bool     fill_prev_large = false;
     bool     fill_store_set = false;
     struct fill_stats {
-        uint64_t issued = 0, issued_bytes = 0, done = 0, dup = 0, cancelled = 0, waited = 0, waited_us = 0, rounds = 0, failed = 0, prompts = 0;
+        uint64_t issued = 0, issued_bytes = 0, done = 0, dup = 0, cancelled = 0, waited = 0, waited_us = 0, rounds = 0, failed = 0, prompts = 0, idle_rounds = 0;
     } fls;
     // k19-l4fill diagnostics: where the free slots come from (exclusive tier)
     struct slot_src_stats {
@@ -4348,18 +4351,21 @@ struct llama_moe_cache::impl {
         }
     }
 
-    // the reads that are done publish their slots, in issue order (never blocks)
+    // the reads that are done publish their slots (never blocks; out of issue order: a read still running does not hold back the ones
+    // after it, which a prompt would otherwise read again)
     void fill_reap() {
-        while (!fill_q.empty()) {
-            const int32_t s = fill_q.front();
-            if (fill_ticket[s] != 0) {
-                if (!wstore->host_done(fill_ticket[s])) {
-                    break;
-                }
-                fill_complete(s);
+        std::deque<int32_t> keep;
+        for (const int32_t s : fill_q) {
+            if (fill_ticket[s] == 0) {
+                continue;
             }
-            fill_q.pop_front();
+            if (wstore->host_done(fill_ticket[s])) {
+                fill_complete(s);
+            } else {
+                keep.push_back(s);
+            }
         }
+        fill_q.swap(keep);
     }
 
     // the reads that did not start are cancelled (their slots are free again); the started ones complete as issued (wait_started: waited for)
@@ -4486,7 +4492,9 @@ struct llama_moe_cache::impl {
             (unsigned long long) fls.waited, fls.waited_us/1000.0, fls.issued_bytes/1048576.0);
     }
 
-    // the batch hook (prepare): a large batch cancels the reads that did not start, a small batch publishes the done ones and issues more
+    // the batch hook (prepare): the done reads publish their slots; LLAMA_MOE_HOST_FILL=1 (default): every batch cancels the reads that did
+    // not start (they run between requests only, see fill_idle); =2: also issued at every small batch after a prompt (the decode), a
+    // large batch cancels them
     void fill_prepare(int64_t n_tokens) {
         const bool large = n_tokens > n_small_max;
         const bool on = fill_active();
@@ -4497,15 +4505,30 @@ struct llama_moe_cache::impl {
             fill_diag(large ? "a request's first large batch" : "the first small batch after a prompt");
         }
         if (on) {
-            if (large) {
-                if (!fill_q.empty()) {
-                    fill_cancel(false);
-                }
-            } else {
+            if ((large || fill_mode == 1) && !fill_q.empty()) {
+                fill_cancel(false);
+            }
+            if (!large && fill_mode >= 2) {
                 fill_issue();
             }
         }
         fill_prev_large = large;
+    }
+
+    // the server is idle (no request runs, none waits): the freed slots are refilled now, the reads run until the next batch
+    void fill_idle() {
+        if (!fill_active()) {
+            return;
+        }
+        if (!fill_q.empty()) {
+            fill_reap();
+        }
+        const uint64_t n0 = fls.issued;
+        fill_issue();
+        fls.idle_rounds++;
+        if (fill_log && fls.issued > n0) {
+            fill_diag("the server's idle point (refill issued)");
+        }
     }
 
     // the experts whose pages are in the page cache (e.g. read while loading) are copied into free slots: pinning the slots would
@@ -12258,8 +12281,9 @@ struct llama_moe_cache::impl {
                     (unsigned long long) host->quota_slack, n_prefill_dup);
             if (host->exclusive()) {
                 LLAMA_LOG_INFO("llama_moe_cache: k19-l4fill: refill of freed RAM slots %s (LLAMA_MOE_HOST_FILL=%d, %d speculative reads at once): %llu prompts "
-                        "counted, %llu rounds, %llu read (%.1f MiB), %llu done (%llu duplicates), %llu cancelled, %llu failed, %llu waited for (%.1f ms)\n",
+                        "counted, %llu rounds (%llu at the server's idle point), %llu read (%.1f MiB), %llu done (%llu duplicates), %llu cancelled, %llu failed, %llu waited for (%.1f ms)\n",
                         fill_mode != 0 ? "on" : "off", fill_mode, fill_parallel, (unsigned long long) fls.prompts, (unsigned long long) fls.rounds,
+                        (unsigned long long) fls.idle_rounds,
                         (unsigned long long) fls.issued, fls.issued_bytes/1048576.0, (unsigned long long) fls.done, (unsigned long long) fls.dup,
                         (unsigned long long) fls.cancelled, (unsigned long long) fls.failed, (unsigned long long) fls.waited, fls.waited_us/1000.0);
                 fill_diag("exit");
@@ -13079,6 +13103,10 @@ bool llama_moe_cache::fill_wants_counts() const {
 
 void llama_moe_cache::fill_stop() {
     pimpl->fill_stop();
+}
+
+void llama_moe_cache::fill_idle() {
+    pimpl->fill_idle();
 }
 
 void llama_moe_cache::fill_counts_begin() {
