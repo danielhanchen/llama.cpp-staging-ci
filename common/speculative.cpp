@@ -1755,9 +1755,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // k19-a80verify (LLAMA_DFLASH_N_MAX_SM80, default 4, 0 = off): a DFlash2 draft walks at most that many steps where every
                 // GPU is compute capability 8.0 (A100 / A30). There each further verify row costs 2.6-2.9 ms of a ~27 ms 7-row pass (no
                 // MoE cache) and the drafter's 5th / 6th steps are accepted too rarely to pay for theirs: Colab A100 80 GB, Qwen3.8-Flash-Next
-                // fn4n full card, --spec-draft-n-max 6: n_max 4 chat 186.8 vs 165.0 tok/s, 8k 109.7 vs 93.1, the same text (md5 equal), 5
+                // fn4n full card, --spec-draft-n-max 6: capped chat 182.9 vs 165.9 tok/s, 8k 109.8 vs 93.2, the same text (md5 equal), 5
                 // rows (n_max 4) at 21.2 ms vs 7 rows at 26.8 (plans/k19_a80verify.md). The window rules below (EV, P_CUM, p_min) still
-                // cut inside it. A user's --spec-draft-n-max below it is kept
+                // cut inside it. A user's --spec-draft-n-max below it is kept. Not beside a MoE cache (LLAMA_DFLASH_N_MAX_SM80_CACHED=1: there
+                // too): there the measured EV window (eva_t) already picks the width, and the route tail skip makes the text follow the
+                // window: A100 80 GB at a 48 GB cap, chat 119.5 vs 115.0 tok/s (same text), 8k 84.0 vs 93.9 (other text, 2.98 vs 3.41
+                // tokens per pass at about the same pass time)
                 static const int32_t df2_n_max_sm80 = [] {
                     const char * e = getenv("LLAMA_DFLASH_N_MAX_SM80");
                     const int32_t n = e != nullptr ? atoi(e) : 4;
@@ -1779,13 +1782,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     return n_gpu > 0 ? n : 0;
                 }();
-                const int32_t df2_n_max = is_dflash2 && df2_n_max_sm80 > 0 ? std::min(params.n_max, df2_n_max_sm80) : params.n_max;
+                static const bool df2_n_max_sm80_cached = [] {
+                    const char * e = getenv("LLAMA_DFLASH_N_MAX_SM80_CACHED");
+                    return e != nullptr && atoi(e) != 0;
+                }();
+                const bool df2_cap_here = is_dflash2 && df2_n_max_sm80 > 0 &&
+                    (df2_n_max_sm80_cached || params.ctx_tgt == nullptr || !llama_moe_cache_active(params.ctx_tgt));
+                const int32_t df2_n_max = df2_cap_here ? std::min(params.n_max, df2_n_max_sm80) : params.n_max;
                 if (is_dflash2 && df2_n_max < params.n_max) {
                     static bool logged = false;
                     if (!logged) {
                         logged = true;
-                        LOG_INF("k19-a80verify: DFlash2 drafts of at most %d steps (%d asked) on a compute capability 8.0 GPU "
-                                "(LLAMA_DFLASH_N_MAX_SM80=0 off)\n", df2_n_max, params.n_max);
+                        LOG_INF("k19-a80verify: DFlash2 drafts of at most %d steps (%d asked) on a compute capability 8.0 GPU without a MoE cache "
+                                "(LLAMA_DFLASH_N_MAX_SM80=0 off, LLAMA_DFLASH_N_MAX_SM80_CACHED=1 beside a cache too)\n", df2_n_max, params.n_max);
                     }
                 }
                 for (int32_t i = 1; i < (is_dflash2 ? std::min(n_block_tokens, df2_n_max + 1) : params.n_max + 1); ++i) {
