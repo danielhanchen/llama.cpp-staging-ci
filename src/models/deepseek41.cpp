@@ -878,14 +878,16 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             // k19-dsv4next (LLAMA_DSV41_PREFILL_SPARSE=1: the backend's own threshold only): prompt rows prefer the sparse gather.
             // ggml-cuda's default rule (K >= 2 * 8 * n_kv_max, tuned for decode / verify rows) keeps 8k prompts on the dense kernel,
             // where the gather was 8-10% faster in TTFT (A100, G4; neutral at 2k). op_params[5] = 1 on the attention node asks for
-            // the gather from K >= 2 * n_kv_max (backends without a sparse kernel ignore it)
+            // the gather from K >= 2 * n_kv_max (backends without a sparse kernel ignore it). With flash attention off there is
+            // no FLASH_ATTN_EXT node (soft_max path): nothing to tag, the hint does not apply.
             if (n_kv_max > 0 && prefill_sparse > 1) {
                 ggml_tensor * fa = out;
                 while (fa && fa->op != GGML_OP_FLASH_ATTN_EXT) {
                     fa = fa->src[0];
                 }
-                GGML_ASSERT(fa && "DeepSeek-V4.1: no attention node behind build_attn_mha");
-                fa->op_params[5] = 1;
+                if (fa) {
+                    fa->op_params[5] = 1;
+                }
             }
         }
         if (k_rot) {
