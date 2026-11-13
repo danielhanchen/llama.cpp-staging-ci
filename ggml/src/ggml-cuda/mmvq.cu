@@ -333,17 +333,20 @@ int ggml_cuda_mmvq_mmid_max_batch(ggml_type type, int cc) {
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 
-// k19-a80verify (GGML_CUDA_VERIFY_DENSE_MMQ_SM80="min[:mask]", unset = "5:1", 0 = off): on cc 8.0 (A100 / A30) a dense quantized product
+// k19-a80verify (GGML_CUDA_VERIFY_DENSE_MMQ_SM80="min[:mask]", opt-in: unset / 0 = off, "5" = Q6_K from 5 columns): on cc 8.0 (A100 / A30) a dense quantized product
 // of min..8 columns inside a verify-tagged graph runs MMQ (int8 tensor cores) instead of the batched mmvq, for the types of the mask
 // (1 Q6_K, 2 Q8_0, 4 the other K / legacy quants MMQ takes). The A100 mmvq pays every further column of these products in full (Colab
 // A100 80 GB, Qwen3.8-Flash-Next fn4n full card, node trace of a 7-row DFlash2 verify: the 8192-row Q6_K in-projections 87.5 us at 7
 // columns vs 47.4 at 3, the dense mat-vecs 1.36 ms of the 2.9 ms each verify row costs, plans/k19_a80verify.md). MUL_MAT_IDs keep their
 // rule (ggml_cuda_mmvq_mmid_max_batch); 1..min-1 columns, prompt chunks (untagged graphs) and the exact (batch invariant) verify keep
-// mmvq. Not bit-identical to the mmvq launch it replaces (another f32 order of the same int8 dot products: reassociation, KLD-gated)
+// mmvq. Not bit-identical to the mmvq launch it replaces (another f32 order of the same int8 dot products: reassociation, KLD-gated).
+// Opt-in: full card 7-row DFlash2 chat +4.0% (165.8 -> 172.5 tok/s, md5 equal), but MMQ's pool scratch beside a MoE cache that fills
+// the card ran the 48 GB tier out of memory (cuMemCreate in ggml_cuda_mul_mat_q at the first verify); Q8_0 (mask 2) is slower on MMQ
+// at these sizes
 static bool ggml_cuda_verify_dense_mmq_sm80(const ggml_type type, const int cc, const int64_t ne11) {
     struct cfg_t { int min_cols; int mask; };
     static const cfg_t cfg = [] {
-        cfg_t c = { 5, 1 };
+        cfg_t c = { 0, 1 };
         if (const char * e = getenv("GGML_CUDA_VERIFY_DENSE_MMQ_SM80")) {
             int mc = 0, mask = 1;
             const int n = sscanf(e, "%d:%d", &mc, &mask);
