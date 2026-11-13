@@ -5020,9 +5020,24 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             }
             GGML_LOG_INFO("k19-l4reg split trace: graph of %d nodes, %d splits, %.1f ms host: inputs %.1f, host weights %.1f, compute calls %.1f ms\n",
                 sched->graph.n_nodes, sched->n_splits, tot/1000.0, s_in/1000.0, s_hw/1000.0, s_cmp/1000.0);
+            // k19-l4held: the same sums for the host-buffer splits and the device splits apart, and the splits with / without host weights
+            int64_t a[2][2][3] = {}; int na[2][2] = {};
+            for (const sp_rec & r : sp_recs) {
+                const int h  = ggml_backend_buft_is_host(sched->bufts[splits[r.id].backend_id]) ? 1 : 0;
+                const int hw = r.n_hw > 0 ? 1 : 0;
+                a[h][hw][0] += r.t_hw - r.t_in; a[h][hw][1] += r.t_cmp - r.t_hw; a[h][hw][2] += r.t_end - r.t_cmp; na[h][hw]++;
+            }
+            for (int h = 0; h < 2; h++) {
+                for (int hw = 0; hw < 2; hw++) {
+                    if (na[h][hw] > 0) {
+                        GGML_LOG_INFO("k19-l4held split trace:   %s splits %s host weights: %d, inputs %.1f, host weights %.1f, compute calls %.1f ms\n",
+                            h ? "host" : "device", hw ? "with" : "without", na[h][hw], a[h][hw][0]/1000.0, a[h][hw][1]/1000.0, a[h][hw][2]/1000.0);
+                    }
+                }
+            }
             std::vector<sp_rec> top = sp_recs;
             std::sort(top.begin(), top.end(), [](const sp_rec & x, const sp_rec & y) { return x.t_end - x.t_in > y.t_end - y.t_in; });
-            for (size_t i = 0; i < top.size() && i < 12; i++) {
+            for (size_t i = 0; i < top.size() && i < 24; i++) {
                 const sp_rec & r = top[i];
                 const struct ggml_backend_sched_split * sp = &splits[r.id];
                 const struct ggml_tensor * n0 = sp->graph.n_nodes > 0 ? sp->graph.nodes[0] : NULL;
