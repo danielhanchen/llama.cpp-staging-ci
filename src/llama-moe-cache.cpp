@@ -3812,11 +3812,13 @@ struct llama_moe_cache::impl {
         }
         tier.m = this;
         wstore->set_tier(&tier);
-        // k19-l4held: per-layer quota of the RAM tier (see llama_moe_host_cache::set_layer_quota): LLAMA_MOE_HOST_LAYER_QUOTA unset or 1 =
+        // k19-l4held: per-layer quota of the RAM tier (see llama_moe_host_cache::set_layer_quota): LLAMA_MOE_HOST_LAYER_QUOTA=1 =
         // the exclusive tier, 2 = also the inclusive one, 0 = off (also leaves the device prefill's RAM copies unmarked, see prefill)
         {
             const char * eq = getenv("LLAMA_MOE_HOST_LAYER_QUOTA");
-            const int    mq = eq != nullptr ? atoi(eq) : 1;
+            // default off (k19-l4held job l4h_x1: the quota left ~2.6k RAM slots empty and the chat's misses follow the share of experts held
+            // nowhere, not how they spread over the layers: 1122-1190 misses vs 765-792 without it, chat TTFT 12.1 vs 7.0 s)
+            const int    mq = eq != nullptr ? atoi(eq) : 0;
             host_quota_mode = mq;
             host->set_layer_quota(mq >= 2 || (mq == 1 && host->exclusive()));
             LLAMA_LOG_INFO("%s: k19-l4held: RAM tier layer quota %s (LLAMA_MOE_HOST_LAYER_QUOTA=%d; 0 off, 1 exclusive tier, 2 both)\n", __func__,
@@ -5831,7 +5833,7 @@ struct llama_moe_cache::impl {
         }
     }
     bool prompt_rank_copy(const ggml_tensor * w, std::vector<bool> & used) {
-        if (rank_mode() == 0 || !host || !host->layer_quota_on()) {
+        if (rank_mode() == 0 || !host) {
             return false;
         }
         const auto it = bindings.find(w);
@@ -5849,7 +5851,7 @@ struct llama_moe_cache::impl {
         rank_mask[il] = used;
         rank_any = true;
         // the layer's room under its quota goes to the routed experts held nowhere first, then to the unrouted ones (lowest ids)
-        int64_t room = (int64_t) host->quota_of(il) - host->n_keys_of(il);
+        int64_t room = host->layer_quota_on() ? (int64_t) host->quota_of(il) - host->n_keys_of(il) : INT64_MAX/2;
         int64_t n_routed_miss = 0;
         for (int32_t e = 0; e < n_expert; ++e) {
             if (used[e] && !in_device(il, e) && !host->contains(il, e)) {
@@ -5894,6 +5896,22 @@ struct llama_moe_cache::impl {
             plr.p_t0 = ggml_time_us();
             plr.p_ws = wstore->get_stats();
             plr.p_miss_layer.assign(layers.size(), -1);
+            // k19-l4held: the RAM tier as the prompt finds it (free slots, duplicates of device-held experts)
+            if (diag && host) {
+                uint64_t n_dup = 0, n_held = 0;
+                for (size_t jl = 0; jl < layers.size(); ++jl) {
+                    if (!host_layer((int32_t) jl) || layers[jl].experts.empty()) {
+                        continue;
+                    }
+                    for (int32_t e = 0; e < (int32_t) layers[jl].experts[0]->ne[2]; ++e) {
+                        const bool r = host->held((int32_t) jl, e) >= 0;
+                        n_held += r;
+                        n_dup  += r && in_device((int32_t) jl, e);
+                    }
+                }
+                LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4held prompt start: RAM tier %llu held (%llu also on the device) of %d slots, %d free\n", tag,
+                    (unsigned long long) n_held, (unsigned long long) n_dup, host->n_slots(), host->n_free());
+            }
         }
         std::vector<int32_t> miss;
         uint64_t n_used = 0, n_dev = 0, n_ram = 0;

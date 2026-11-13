@@ -545,6 +545,15 @@ int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict, u
             st.spec_taken++;
         }
     }
+    // k19-l4held: no free slot, a reservation with keep (a prompt's routed expert) takes an expert of the same layer keep does not mark
+    if (s < 0 && keep != nullptr && !allow_evict) {
+        s = quota_victim(il, false, min_age, take_spec, keep);
+        if (s >= 0) {
+            quota_ranked++;
+            evict(s);
+            st.evicted++;
+        }
+    }
     // k19-ramevict: a prompt pass streaming layer stream_il takes its victims from the finished layers first (see set_stream_layer)
     // the hand passes the other slots without lowering their counts
     const bool streaming = stream_il >= 0 && allow_evict;
