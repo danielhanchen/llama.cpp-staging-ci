@@ -6311,13 +6311,17 @@ struct llama_moe_cache::impl {
     }
 
     // the device slots that are lent (or overwritten by a seed) lose their experts: the RAM tier keeps a copy (synchronous, once per prompt)
-    // k19-l4held (LLAMA_MOE_SHADOW_ASYNC=0: synchronous, as before): the copies back are queued on backend (the stream that then writes
+    // k19-l4held (LLAMA_MOE_SHADOW_ASYNC=1, opt-in; unset: synchronous, as before): the copies back are queued on backend (the stream that then writes
     // the device slots, so each copy reads the slot before it is overwritten) and the RAM slots are published when they complete (mark_write
     // + commit, as demote does) instead of a device sync and one synchronous copy per expert tensor. A prompt that seeds the device slots
     // of an exclusive tier (the 42-token chat on the Colab L4 full card: ~90 evictions per layer) waited for each layer's device work and
     // then ~270 synchronous 2-3 MB copies per layer
+    // opt-in (LLAMA_MOE_SHADOW_ASYNC=1): Colab L4 full card, fn4nd chat after the 640-token request (job l4h_c2, 3 launches each, md5 equal):
+    // seeds 47-102 ms vs 1090-1103 ms synchronous, but chat TTFT 8.70 [7.40-9.43] vs 7.44 [7.34-9.03] s: in 2 of 3 launches the RAM tier
+    // held 785-1004 duplicates of device experts at the chat's start (234-236 otherwise) and the chat missed 862-914 experts vs 777-787;
+    // not explained, so not a default
     static bool shadow_async() {
-        static const bool on = [] { const char * e = getenv("LLAMA_MOE_SHADOW_ASYNC"); return e == nullptr || atoi(e) != 0; }();
+        static const bool on = [] { const char * e = getenv("LLAMA_MOE_SHADOW_ASYNC"); return e != nullptr && atoi(e) != 0; }();
         return on;
     }
     uint64_t n_shadow_async = 0;
