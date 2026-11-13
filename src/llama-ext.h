@@ -246,7 +246,8 @@ LLAMA_API double llama_moe_cache_frac(const struct llama_context * ctx);
 // k19-bigverify: a MoE cache that holds at least LLAMA_MOE_CACHE_WIDE_GRAPHS_FRAC (0.6; 0 = off, as before) of its host expert bytes
 // keeps the verify graphs of a no-cache target: the server prewarms every verify width at load (server_spec_prewarm, as
 // LLAMA_SPEC_PREWARM_CACHED=1) and device KV buckets are at least 16384 cells (k19-fullcost), so a request replays the captured widths
-// instead of building and capturing each one. False without a cache or before its slots are sized
+// instead of building and capturing each one. k19-widefix: only where its host experts are at least LLAMA_MOE_CACHE_WIDE_GRAPHS_MIN_MIB
+// (32768; 0 = any size). False without a cache or before its slots are sized
 LLAMA_API bool llama_moe_cache_wide_graphs(const struct llama_context * ctx);
 
 // k15-ttft: a prompt run as one ubatch instead of [n-4] [4] differs from the split run only by IEEE reassociation (plans/k11.md

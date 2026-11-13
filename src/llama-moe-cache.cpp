@@ -955,6 +955,7 @@ struct llama_moe_cache::impl {
     double hybrid_max_frac = 0.10; // LLAMA_MOE_CACHE_HYBRID_MAX_FRAC
     double cache_frac      = -1.0; // cached share of the host experts' bytes, -1 before the slots are sized
     double host_uncached   = 0.0;  // bytes of the host experts the slots cannot hold (host experts minus slots, uncached groups count whole)
+    double host_total      = 0.0;  // k19-widefix: bytes of the host experts (cache_frac's denominator)
     static constexpr double hybrid_k = 6.0; // see set_threads
     bool  overlap      = false; // LLAMA_MOE_CACHE_FETCH_OVERLAP: single token ubatches compute the hits while the missing experts are copied
 
@@ -1762,6 +1763,7 @@ struct llama_moe_cache::impl {
             }
             cache_frac    = host > 0.0 ? std::min(1.0, cached/host) : 1.0;
             host_uncached = std::max(0.0, host - cached);
+            host_total    = host;
         }
         tail_skip_init(model, set);
         // k13-small: the default single-graph host misses need a cache that holds a real share of the experts. With almost every expert
@@ -11775,6 +11777,10 @@ bool llama_moe_cache::hybrid_fixed() const {
 
 double llama_moe_cache::cache_frac() const {
     return pimpl->cache_frac;
+}
+
+double llama_moe_cache::host_total_bytes() const {
+    return pimpl->host_total;
 }
 
 double llama_moe_cache::release_frac() const {
