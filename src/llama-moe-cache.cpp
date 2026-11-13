@@ -3447,6 +3447,16 @@ struct llama_moe_cache::impl {
                 (unsigned long long) core_checks, (unsigned long long) core_bad, (unsigned long long) core_refused);
         }
         ua_free();
+        if (n_pad_zero > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4ttft: %llu padding pieces after uploaded runs written as zeros instead of read from the files "
+                "(LLAMA_MOE_PROMPT_PAD_ZERO=0 off)\n", tag, (unsigned long long) n_pad_zero);
+        }
+        if (plr.layers > 0 || plr.over > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4ttft: prompt layer reads: %llu layers, %llu experts, %.1f MiB in %.1f ms, %llu past the scratch "
+                "(LLAMA_MOE_PROMPT_LAYER_READ=1 opt-in)\n", tag, (unsigned long long) plr.layers, (unsigned long long) plr.experts, plr.bytes/1048576.0,
+                plr.read_us/1000.0, (unsigned long long) plr.over);
+        }
+        plr_free();
         for (const auto & [unmap, buf] : mapped) {
             unmap(buf);
         }
@@ -4208,6 +4218,12 @@ struct llama_moe_cache::impl {
         // (readahead of each layer's expert tensors first), skipping the experts the device slots hold: with the device cache prefilled
         // (LLAMA_MOE_CACHE_PREFILL=1) the first prompt then reads nothing from the files when RAM + VRAM hold every expert (low-RAM boxes)
         const bool from_file = (env_pf != nullptr && atoi(env_pf) >= 2) || resident_mode;
+        // k19-l4ttft (LLAMA_MOE_HOST_PREFILL_GUESS=1, opt-in): what the page cache held at load is not a choice (whatever the load read),
+        // so the experts copied from it are marked as unused guesses (set_spec, as the routing profile's): a prompt whose copies read
+        // only the experts it routes (GGML_SCHED_PREFETCH_MIN_BATCH) then keeps its reads in the slots of the ones it did not use when
+        // no slot is free. Placement only (what a slot holds is the expert's bytes); exclusive tier only
+        static const bool guess = [] { const char * e = getenv("LLAMA_MOE_HOST_PREFILL_GUESS"); return e != nullptr && atoi(e) != 0; }();
+        const bool mark = guess && !from_file && host->exclusive();
         const int64_t t0 = ggml_time_us();
         size_t n_file = 0;
         const size_t pg = (size_t) std::max(4096L, sysconf(_SC_PAGESIZE));
@@ -4282,6 +4298,9 @@ struct llama_moe_cache::impl {
                         n_bytes += w->nb[2];
                     }
                     host->publish(s);
+                    if (mark) {
+                        host->set_spec(s);
+                    }
                     n_fill++;
                     n_file += file ? 1 : 0;
                 }
@@ -4289,8 +4308,8 @@ struct llama_moe_cache::impl {
         }
         hst.prefilled = n_fill + n_prof;
         LLAMA_LOG_INFO("%s: MoE host cache: %zu experts (%.1f MiB) copied from the page cache into RAM slots in %.1f ms, %zu of them read from the files"
-                " (LLAMA_MOE_HOST_CACHE_PREFILL=0 off, 2 also reads the experts that are not in the page cache)\n",
-                __func__, n_fill, n_bytes/1048576.0, (ggml_time_us() - t0)/1000.0, n_file);
+                " (LLAMA_MOE_HOST_CACHE_PREFILL=0 off, 2 also reads the experts that are not in the page cache)%s\n",
+                __func__, n_fill, n_bytes/1048576.0, (ggml_time_us() - t0)/1000.0, n_file, mark ? "; k19-l4ttft: marked as guesses" : "");
 #endif
     }
 
@@ -5551,6 +5570,12 @@ struct llama_moe_cache::impl {
         }
     }
 
+    static bool pad_zero_on() {
+        static const bool on = [] { const char * e = getenv("LLAMA_MOE_PROMPT_PAD_ZERO"); return e == nullptr || atoi(e) != 0; }();
+        return on;
+    }
+    uint64_t n_pad_zero = 0;
+
     void tier_runs(const ggml_tensor * src, size_t off, size_t size, bool lease, std::vector<llama_weight_tier::run> & out) {
         const auto it = bindings.find(src);
         if (it == bindings.end() || !host_layer(it->second.il)) {
@@ -5565,7 +5590,28 @@ struct llama_moe_cache::impl {
             const int32_t e  = (int32_t) (o / nb);
             const size_t  e1 = std::min(end, (size_t) (e + 1)*nb);
             // planning (under the store lock) does not wait for copies back into RAM, the upload does
+            // k19-l4ttft: the experts the prompt layer read put in the scratch (uploads only)
+            const uint8_t * pp = !lease && e < src->ne[2] ? plr_find(il, ip, e, o - (size_t) e*nb) : nullptr;
+            if (pp != nullptr) {
+                // the RAM tier is offered these bytes as the upload of a demand read offered them (same call, same order)
+                tier_offer(src, o, e1 - o, pp);
+                out.push_back({ o, e1 - o, pp, false });
+                o = e1;
+                continue;
+            }
             const int32_t sl = e >= src->ne[2] ? -1 : lease ? host->held(il, e) : host->find(il, e, false);
+            // k19-l4ttft (LLAMA_MOE_PROMPT_PAD_ZERO, default 1; 0 = read them): the copy of a run of routed experts ends with the first
+            // min(expert, 512) bytes of the next expert, which the prompt does not route, as padding for the CUDA MMQ kernels (they read
+            // past the last row of an expert: the bytes only have to be finite). Where neither RAM nor the scratch holds that expert, the
+            // upload read them from the file: one 4 KiB read per run end, ~3900 per 42-token chat on the L4 disk tier (~1.1 s of its TTFT).
+            // Zeros instead (a zero block is finite in every quant type); nothing is offered to the tier for them
+            if (!lease && sl < 0 && pad_zero_on() && e < src->ne[2] && o == (size_t) e*nb && end - o <= 512 && end - o < nb) {
+                static const uint8_t zeros[512] = {};
+                out.push_back({ o, end - o, zeros, false });
+                n_pad_zero++;
+                o = end;
+                continue;
+            }
             if (sl >= 0) {
                 if (lease) {
                     host->lease(sl);
@@ -5631,6 +5677,263 @@ struct llama_moe_cache::impl {
             }
             o = e1;
         }
+    }
+
+    // k19-l4ttft: prompt layer reads (LLAMA_MOE_PROMPT_LAYER_READ=1, opt-in: measured no faster on the L4 disk tier, chat TTFT 8.32 vs 6.81 s
+    // median with it off, and its pinned scratch cost the 8k after it 103 vs 87 s; the per-byte read rate is the loop device's either way). A prompt ubatch whose expert copies read the routing (the copy callback's routed-only path, ubatches below the
+    // prefetch size) used to read each expert tensor's misses on its own when its split started: the reads of the gate, up and down
+    // tensors of a layer were three waits with the device work between them, the disk idle in between. Colab L4 full card, Qwen3.8-Flash-Next
+    // UD-IQ4_XS from the VM disk (k19_l4ttft): the 42-token chat read 1.5-1.8 GB in 8.3-8.8 s with the disk busy 64-69% of it. Here
+    // the copy of the layer's first expert tensor (the one that reads the routing) reads the routed experts of the layer that neither the
+    // device slots nor the RAM tier hold, every expert tensor of each, in one batch into a pinned scratch (unbuffered, the store's IO
+    // threads); the copies of all of the layer's expert tensors then upload those experts from it (tier_runs returns the scratch as held
+    // bytes). The same bytes as the reads they replace, and each upload from the scratch offers them to the RAM tier as the upload of
+    // a demand read did (free slots only, the same calls in the same order), so what each tier holds is unchanged: placement and text
+    // as without it.
+    // Scratch LLAMA_MOE_PROMPT_LAYER_READ_MIB (512), pinned at the first use only if llama_sysmem::available_reclaimable() keeps
+    // LLAMA_MOE_PROMPT_LAYER_READ_FLOOR_MIB (4096) after it, else pageable; experts past it take the old per-tensor path.
+    // LLAMA_MOE_PROMPT_DIAG=1 (log only): one line per prompt with the routed / device / RAM / read experts and the read time per layer
+    struct plr_t {
+        ggml_backend_buffer_t buf = nullptr;
+        std::vector<uint8_t> pageable; // when the pinned scratch was refused
+        uint8_t * base = nullptr;
+        size_t    size = 0;
+        bool      tried = false;
+        int32_t   il = -1;                    // the layer the scratch holds
+        std::vector<std::vector<int64_t>> off; // [ip][e] offset of the expert's bytes in the scratch, -1 none
+        std::vector<int32_t> filled;          // experts of il in the scratch
+        // per prompt (diag) and per process
+        uint64_t p_layers = 0, p_used = 0, p_dev = 0, p_ram = 0, p_miss = 0, p_read = 0, p_over = 0, p_bytes = 0, p_us = 0;
+        std::vector<int32_t> p_miss_layer;
+        int64_t  p_t0 = 0;
+        uint64_t p_sync_us = 0, p_up_us = 0, p_ncopy = 0; // host time in the routing reads (device work before them) and the copies' issue
+        llama_weight_store::stats p_ws;                    // the store's counters at the first layer
+        uint64_t layers = 0, experts = 0, bytes = 0, read_us = 0, over = 0, prompts = 0;
+    } plr;
+    static int plr_mode() {
+        static const int m = [] { const char * e = getenv("LLAMA_MOE_PROMPT_LAYER_READ"); return e == nullptr ? 0 : atoi(e); }();
+        return m;
+    }
+    static bool plr_diag() {
+        static const bool d = [] { const char * e = getenv("LLAMA_MOE_PROMPT_DIAG"); return e != nullptr && atoi(e) != 0; }();
+        return d;
+    }
+
+    bool plr_alloc(ggml_backend_t backend) {
+        if (plr.tried) {
+            return plr.base != nullptr;
+        }
+        plr.tried = true;
+        const char * em = getenv("LLAMA_MOE_PROMPT_LAYER_READ_MIB");
+        const char * ef = getenv("LLAMA_MOE_PROMPT_LAYER_READ_FLOOR_MIB");
+        const size_t want  = (size_t) std::max<int64_t>(16, em != nullptr ? atoll(em) : 512) << 20;
+        const size_t floor = (size_t) std::max<int64_t>(0, ef != nullptr ? atoll(ef) : 4096) << 20;
+        const uint64_t recl = llama_sysmem::available_reclaimable();
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_buffer_type_t hb = dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        if (hb != nullptr && recl >= want + floor) {
+            plr.buf = ggml_backend_buft_alloc_buffer(hb, want);
+        }
+        if (plr.buf != nullptr) {
+            plr.base = (uint8_t *) ggml_backend_buffer_get_base(plr.buf);
+            plr.size = want;
+        } else if (recl >= want + floor / 2) {
+            // pageable: slower uploads, but still one batch of reads per layer
+            plr.pageable.resize(want + 4096);
+            plr.base = (uint8_t *) (((uintptr_t) plr.pageable.data() + 4095) & ~(uintptr_t) 4095);
+            plr.size = want;
+        }
+        LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4ttft: prompt layer reads: %s (%.0f MiB scratch, %.0f MiB reclaimable, floor %.0f MiB; "
+            "LLAMA_MOE_PROMPT_LAYER_READ=1 opt-in)\n", tag, plr.base == nullptr ? "off, no room" : plr.buf != nullptr ? "on, pinned" : "on, pageable",
+            want/1048576.0, recl/1048576.0, floor/1048576.0);
+        return plr.base != nullptr;
+    }
+
+    void plr_free() {
+        if (plr.buf != nullptr) {
+            ggml_backend_buffer_free(plr.buf);
+            plr.buf = nullptr;
+        }
+        plr.pageable.clear();
+        plr.pageable.shrink_to_fit();
+        plr.base = nullptr;
+        plr.il   = -1;
+    }
+
+    void plr_clear() {
+        if (plr.il < 0) {
+            return;
+        }
+        for (auto & v : plr.off) {
+            for (int32_t e : plr.filled) {
+                v[e] = -1;
+            }
+        }
+        plr.filled.clear();
+        plr.il = -1;
+    }
+
+    // the scratch bytes [o, o + n) of expert tensor ip of layer il, nullptr if the scratch does not hold that expert
+    const uint8_t * plr_find(int32_t il, int ip, int32_t e, size_t a) const {
+        if (plr.il != il || ip < 0 || ip >= (int) plr.off.size() || e < 0 || e >= (int32_t) plr.off[ip].size() || plr.off[ip][e] < 0) {
+            return nullptr;
+        }
+        return plr.base + plr.off[ip][e] + a;
+    }
+
+    void prompt_layer_read(ggml_backend_t backend, const ggml_tensor * w, const std::vector<bool> & used) {
+        const int mode = plr_mode();
+        const bool diag = plr_diag();
+        if ((mode == 0 && !diag) || wstore == nullptr) {
+            return;
+        }
+        const auto it = bindings.find(w);
+        if (it == bindings.end() || !host_layer(it->second.il)) {
+            return;
+        }
+        const int32_t il = it->second.il;
+        const layer & l = layers[il];
+        const int32_t n_expert = (int32_t) w->ne[2];
+        if ((int32_t) used.size() != n_expert) {
+            return;
+        }
+        if (plr.p_t0 == 0) {
+            plr.p_t0 = ggml_time_us();
+            plr.p_ws = wstore->get_stats();
+            plr.p_miss_layer.assign(layers.size(), -1);
+        }
+        std::vector<int32_t> miss;
+        uint64_t n_used = 0, n_dev = 0, n_ram = 0;
+        for (int32_t e = 0; e < n_expert; ++e) {
+            if (!used[e]) {
+                continue;
+            }
+            n_used++;
+            if (in_device(il, e)) {
+                n_dev++;
+            } else if (host->contains(il, e)) {
+                n_ram++;
+            } else {
+                miss.push_back(e);
+            }
+        }
+        plr.p_layers++;
+        plr.p_used += n_used;
+        plr.p_dev  += n_dev;
+        plr.p_ram  += n_ram;
+        plr.p_miss += miss.size();
+        if (il < (int32_t) plr.p_miss_layer.size()) {
+            plr.p_miss_layer[il] = (int32_t) miss.size();
+        }
+        if (mode == 0 || miss.empty()) {
+            plr_clear();
+            return;
+        }
+        if (!plr_alloc(backend)) {
+            return;
+        }
+        // the uploads from the scratch of the previous layer were queued on this stream (the routing read synchronized it already)
+        ggml_backend_synchronize(backend);
+        plr_clear();
+        if (plr.off.size() < l.experts.size()) {
+            plr.off.resize(l.experts.size());
+        }
+        for (auto & v : plr.off) {
+            if ((int32_t) v.size() < n_expert) {
+                v.assign(n_expert, -1);
+            }
+        }
+        std::vector<llama_weight_store::host_read> rd;
+        rd.reserve(miss.size()*l.experts.size());
+        size_t pos = 0;
+        size_t n_fit = 0;
+        for (int32_t e : miss) {
+            size_t need = 0;
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                need += (l.experts[ip]->nb[2] + 8192 + 4095) & ~(size_t) 4095;
+            }
+            if (pos + need > plr.size) {
+                break;
+            }
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                const ggml_tensor * t = l.experts[ip];
+                const size_t nb = t->nb[2];
+                rd.push_back({ t, (size_t) e*nb, nb, plr.base + pos, 0 });
+                pos += (nb + 8192 + 4095) & ~(size_t) 4095;
+            }
+            n_fit++;
+        }
+        plr.p_over += miss.size() - n_fit;
+        plr.over   += miss.size() - n_fit;
+        if (n_fit == 0) {
+            return;
+        }
+        const int64_t t0 = ggml_time_us();
+        if (!wstore->read_host(rd.data(), rd.size(), true)) {
+            return; // nothing held: the copies read on demand as before
+        }
+        const int64_t dt = ggml_time_us() - t0;
+        size_t k = 0;
+        uint64_t bytes = 0;
+        for (size_t i = 0; i < n_fit; ++i) {
+            const int32_t e = miss[i];
+            for (size_t ip = 0; ip < l.experts.size(); ++ip, ++k) {
+                plr.off[ip][e] = (int64_t) (rd[k].area - plr.base) + (int64_t) rd[k].lead;
+                bytes += rd[k].size;
+            }
+            plr.filled.push_back(e);
+        }
+        plr.il = il;
+        plr.p_read  += n_fit;
+        plr.p_bytes += bytes;
+        plr.p_us    += dt;
+        plr.layers++;
+        plr.experts += n_fit;
+        plr.bytes   += bytes;
+        plr.read_us += dt;
+    }
+
+    // the copy callback's host time of a prompt ubatch's expert tensor: the routing read (sync_us: waits for the device work queued
+    // before it) and the copies' issue (up_us: the plan, the RAM uploads and the per-tensor demand reads), LLAMA_MOE_PROMPT_DIAG only
+    void prompt_diag_time(int64_t sync_us, int64_t up_us) {
+        if (plr.p_t0 == 0) {
+            return;
+        }
+        plr.p_sync_us += sync_us;
+        plr.p_up_us   += up_us;
+        plr.p_ncopy++;
+    }
+
+    // the end of a prompt (the first small batch after large ones): the scratch is dropped, the diagnostic line
+    void plr_prompt_end() {
+        plr_clear();
+        if (plr.p_t0 == 0) {
+            return;
+        }
+        plr.prompts++;
+        if (plr_diag()) {
+            std::string ml;
+            for (size_t il = 0; il < plr.p_miss_layer.size(); ++il) {
+                if (plr.p_miss_layer[il] >= 0) {
+                    ml += (ml.empty() ? "" : " ") + std::to_string(plr.p_miss_layer[il]);
+                }
+            }
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4ttft prompt %llu: %llu layers, routed %llu = device %llu + RAM %llu + missing %llu; read in layer "
+                "batches %llu experts (%.1f MiB) in %.1f ms, %llu past the scratch; %.1f ms since the first layer; missing per layer: %s\n", tag,
+                (unsigned long long) plr.prompts, (unsigned long long) plr.p_layers, (unsigned long long) plr.p_used, (unsigned long long) plr.p_dev,
+                (unsigned long long) plr.p_ram, (unsigned long long) plr.p_miss, (unsigned long long) plr.p_read, plr.p_bytes/1048576.0, plr.p_us/1000.0,
+                (unsigned long long) plr.p_over, (ggml_time_us() - plr.p_t0)/1000.0, ml.c_str());
+            const llama_weight_store::stats w = wstore != nullptr ? wstore->get_stats() : plr.p_ws;
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4ttft prompt %llu: %llu copies: routing reads waited %.1f ms, copies issued in %.1f ms; store: "
+                "%.1f MiB uploaded from the RAM tier, %.1f MiB demand reads (%llu regions), %.1f MiB host reads, %.1f MiB ring reads, waited %.1f ms\n", tag,
+                (unsigned long long) plr.prompts, (unsigned long long) plr.p_ncopy, plr.p_sync_us/1000.0, plr.p_up_us/1000.0,
+                (w.tier_uploaded - plr.p_ws.tier_uploaded)/1048576.0, (w.demand_bytes - plr.p_ws.demand_bytes)/1048576.0,
+                (unsigned long long) (w.demand_regions - plr.p_ws.demand_regions), (w.host_read_bytes - plr.p_ws.host_read_bytes)/1048576.0,
+                (w.plan_bytes - plr.p_ws.plan_bytes)/1048576.0, (w.wait_us - plr.p_ws.wait_us)/1000.0);
+        }
+        plr.p_sync_us = plr.p_up_us = plr.p_ncopy = 0;
+        plr.p_layers = plr.p_used = plr.p_dev = plr.p_ram = plr.p_miss = plr.p_read = plr.p_over = plr.p_bytes = plr.p_us = 0;
+        plr.p_t0 = 0;
     }
 
     // exclusive: the experts evicted from device slots are copied back into RAM before the slots are overwritten (same backend, in order)
@@ -8756,6 +9059,10 @@ struct llama_moe_cache::impl {
 
     void prepare(int64_t n_tokens) {
         ua_drain();
+        // k19-l4ttft: a small batch ends the prompt (the scratch of the prompt layer reads is not read again)
+        if (n_tokens <= n_small_max && (plr.il >= 0 || plr.p_t0 != 0)) {
+            plr_prompt_end();
+        }
         // k19-ramprof2: the profile fill (see hprof_order)
         if (host && wstore != nullptr && !hprof_ticket.empty()) {
             hprof_prepare(n_tokens);
@@ -11991,6 +12298,14 @@ bool llama_moe_cache::prompt_inplace_on() const {
 
 bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
     return pimpl->copy(backend, src, dst, graph);
+}
+
+void llama_moe_cache::prompt_layer_read(ggml_backend_t backend, const ggml_tensor * w, const std::vector<bool> & used) {
+    pimpl->prompt_layer_read(backend, w, used);
+}
+
+void llama_moe_cache::prompt_diag_time(int64_t sync_us, int64_t up_us) {
+    pimpl->prompt_diag_time(sync_us, up_us);
 }
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last, std::vector<ggml_backend_copy_region> * regions) {

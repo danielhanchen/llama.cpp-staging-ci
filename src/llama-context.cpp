@@ -9618,8 +9618,10 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
                 backend_ids = backend;
             }
             st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
+            const int64_t t_ids0 = ggml_time_us();
             ggml_backend_tensor_get_async(backend_ids, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
             ggml_backend_synchronize(backend_ids);
+            st.sync_us = ggml_time_us() - t_ids0;
 
             st.used.assign(n_expert, false);
             st.counts.assign(n_expert, 0);
@@ -9630,6 +9632,10 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
                     st.used[id] = true;
                     st.counts[id]++;
                 }
+            }
+            // k19-l4ttft: the misses of every expert tensor of this layer are read now, in one batch (layers streamed through the RAM tier)
+            if (lctx->moe_cache && lctx->moe_cache->get_experts(src) != nullptr) {
+                lctx->moe_cache->prompt_layer_read(backend, src, st.used);
             }
         }
 
@@ -9722,6 +9728,7 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
     if (ua) {
         lctx->moe_cache->upload_ahead_wait(backend, src);
     }
+    const int64_t t_up0 = ggml_time_us();
     if (!done) {
         plan(false);
         // the weight store reads the uploads from the model file (prefetched ahead into its ring, or all of them at once)
@@ -9733,6 +9740,10 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
         if (ua) {
             lctx->moe_cache->upload_ahead_mark(backend, src);
         }
+    }
+    if (lctx->moe_cache && !st.all && lctx->moe_cache->get_experts(src) != nullptr) {
+        lctx->moe_cache->prompt_diag_time(st.sync_us, ggml_time_us() - t_up0);
+        st.sync_us = 0;
     }
 
     // st.used: the experts staged in dst, the only ones a seed may copy into the cache

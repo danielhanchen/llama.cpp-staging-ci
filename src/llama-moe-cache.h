@@ -335,6 +335,12 @@ public:
     // returns the number of experts copied, 0 if expert e is not in the cache, -n if a run of n cached experts is too short to copy
     // with regions != nullptr, every cached run is appended to regions instead of being copied (and is not counted)
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last, std::vector<ggml_backend_copy_region> * regions = nullptr);
+    // k19-l4ttft: the copy of a prompt ubatch that read the routing of expert tensor w (used: its routed experts) reads the routed experts
+    // of w's layer that neither the device slots nor the RAM tier hold, every expert tensor of each, in one batch; the copies of the
+    // layer's expert tensors upload them from there (LLAMA_MOE_PROMPT_LAYER_READ=0 off, LLAMA_MOE_PROMPT_DIAG=1 logs per prompt)
+    void prompt_layer_read(ggml_backend_t backend, const ggml_tensor * w, const std::vector<bool> & used);
+    // k19-l4ttft (LLAMA_MOE_PROMPT_DIAG=1): host time of a prompt copy's routing read and of its copies' issue
+    void prompt_diag_time(int64_t sync_us, int64_t up_us);
 
     // for large batches: count the copies of a batch of the experts of w issued by the caller (copies from the cache and uploads)
     void count_batch(const ggml_tensor * w, const std::vector<ggml_backend_copy_region> & regions);
