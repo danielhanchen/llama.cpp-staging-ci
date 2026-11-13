@@ -2500,7 +2500,15 @@ void llama_context::ext_park(const char * why) {
     }
     const int64_t t0 = ggml_time_us();
     const size_t freed = moe_cache->ext_park();
-    ext_grown = false;
+    // (released banks cannot be parked: the extension then stays until a park finds them back; the grow below never runs while released)
+    ext_grown = moe_cache->ext_bytes() > 0;
+    if (ext_grown) {
+        static int n_warn = 0;
+        if (n_warn++ < 2) {
+            LLAMA_LOG_WARN("%s: MoE cache k19-t4small decode extension: not parked (%s): the banks are released\n", __func__, why);
+        }
+        return;
+    }
     ext_n_park++;
     ext_ms += (ggml_time_us() - t0)/1e3;
     if (ext_n_park <= 2) {
@@ -5928,6 +5936,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
     rows_ev_n = 0; // k15-pp3: no early nextn rows from this decode yet
+
+    // k19-t4small (decode extension): a prompt goes back to the fitted slots before anything of it runs, its layer-major groups
+    // included (they are built before the per-ubatch check below)
+    if (ext_grown && moe_cache && moe_cache->ext_on() && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && (int64_t) n_tokens_all > ext_ub()) {
+        ext_park("prompt");
+    }
 
     for (bool more = true; more; ) {
         // k15-pp: the state before the ubatch that starts at the capture index (a layer-major group captures inside its graph)
