@@ -1691,16 +1691,46 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
 }
 
+// the request's chain parameters and penalty window, mirrored by common_shared_noise_draft_pick
+static void common_sampler_draft_mirror(const struct common_sampler * gsmpl, common_shared_noise_draft & sn);
+
 bool common_sampler_shared_noise_draft_init(const struct common_sampler * gsmpl, common_shared_noise_draft & sn) {
     sn.on = false;
     const sn_sampler_ctx * c = gsmpl != nullptr ? sn_of_chain(gsmpl->chain) : nullptr;
     if (c == nullptr) {
         return false;
     }
-    const auto & p = gsmpl->params;
     sn.on          = true;
+    sn.mode        = 0;
     sn.seed        = c->seed_cur;
     sn.pos         = c->n_acc;
+    common_sampler_draft_mirror(gsmpl, sn);
+    return true;
+}
+
+bool common_sampler_penalty_draft_init(const struct common_sampler * gsmpl, common_shared_noise_draft & sn) {
+    sn.on = false;
+    if (gsmpl == nullptr || gsmpl->chain == nullptr || gsmpl->params.backend_sampling || gsmpl->params.mirostat != 0 ||
+            sn_of_chain(gsmpl->chain) != nullptr) {
+        return false;
+    }
+    const auto & p = gsmpl->params;
+    const bool pen = p.penalty_last_n != 0 && (p.penalty_repeat != 1.0f || p.penalty_freq != 0.0f || p.penalty_present != 0.0f);
+    bool has_pen_stage = false;
+    for (const auto t : p.samplers) {
+        has_pen_stage |= t == COMMON_SAMPLER_TYPE_PENALTIES;
+    }
+    if (!pen || !has_pen_stage) {
+        return false;
+    }
+    sn.on   = true;
+    sn.mode = 2;
+    common_sampler_draft_mirror(gsmpl, sn);
+    return true;
+}
+
+static void common_sampler_draft_mirror(const struct common_sampler * gsmpl, common_shared_noise_draft & sn) {
+    const auto & p = gsmpl->params;
     sn.samplers    = p.samplers;
     sn.temp        = p.temp;
     sn.top_k       = p.top_k;
@@ -1719,7 +1749,6 @@ bool common_sampler_shared_noise_draft_init(const struct common_sampler * gsmpl,
             sn.window.push_back(gsmpl->prev.rat(i));
         }
     }
-    return true;
 }
 
 llama_token common_shared_noise_draft_pick(common_shared_noise_draft & sn, int32_t i, const llama_token * drafted,
@@ -1813,6 +1842,19 @@ llama_token common_shared_noise_draft_pick(common_shared_noise_draft & sn, int32
             default: // dry, xtc, typical, top-n-sigma, ...: not mirrored
                 break;
         }
+    }
+    if (sn.mode == 2) {
+        // k19-q4xaccept: the mirrored chain keeps c in descending order (penalties re-sort it, truncations keep the head). The window
+        // policies get the draft's own probability of the token, as for a raw argmax draft (only the token changes)
+        if (p_pick != nullptr) {
+            for (size_t k = 0; k < n; ++k) {
+                if (cand[k].id == c[0].first) {
+                    *p_pick = cand[k].p;
+                    break;
+                }
+            }
+        }
+        return c[0].first;
     }
     const uint64_t pos = sn.pos + (uint64_t) i;
     size_t best = 0;
