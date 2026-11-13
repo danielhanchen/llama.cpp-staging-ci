@@ -2149,14 +2149,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool    cost_on   = false; // spec_cost || tpp_floor > 0: the round times and draft probabilities are recorded
     common_spec_mtp_cost cost_pol;
     common_spec_tpp_cost tpp_cost;
-    // k19-adraft (params.adraft): > 0: the greedy window's drafts; sampled requests use cost_pol (LLAMA_SPEC_ADRAFT_FLOOR: fewest drafts)
+    // k19-adraft (params.adraft > 0: the greedy window's drafts). Sampled requests, LLAMA_SPEC_ADRAFT=1: confidence gate, the 2nd draft
+    // is kept when its probability is at least adraft_p2 (LLAMA_SPEC_ADRAFT_P2, default 0: always), every later one when at least adraft_p
+    // (LLAMA_SPEC_ADRAFT_P, default 0.9), the window ending at the first draft below its bar (a function of the text: no timing).
+    // =2: priced by cost_pol (expected tokens per ms, live round times; LLAMA_SPEC_ADRAFT_FLOOR: fewest drafts)
     int32_t adraft_keep  = 0;
+    int32_t adraft_mode  = 0;
     int32_t adraft_floor = 0;
+    float   adraft_p     = 0.9f;
+    float   adraft_p2    = 0.0f;
+    std::array<int64_t, 9> adraft_hist{};   // sampled windows by kept drafts
     static bool sampled(const common_speculative_draft_params & dp) {
         return dp.temp > 0.0f;
     }
     bool priced(const common_speculative_draft_params & dp) const {
-        return !dp.result_q && (spec_cost || (adraft_keep > 0 && sampled(dp)));
+        return !dp.result_q && (spec_cost || (adraft_mode == 2 && adraft_keep > 0 && sampled(dp)));
+    }
+    bool gated(const common_speculative_draft_params & dp) const {
+        return !dp.result_q && adraft_mode == 1 && adraft_keep > 0 && sampled(dp);
     }
     struct cost_seq {
         int64_t t_us = 0;            // the previous draft() call (0: none since the request began)
@@ -2254,19 +2264,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // k19-adraft: one trained head without shared memory, no other window policy
         if (this->params.adraft > 0) {
             if (!chain_heads && !is_mem_shared && !spec_cost && tpp_floor == 0 && this->params.n_max > this->params.adraft) {
+                const char * m = getenv("LLAMA_SPEC_ADRAFT");
                 adraft_keep  = this->params.adraft;
+                adraft_mode  = m != nullptr && atoi(m) == 2 ? 2 : 1;
                 adraft_floor = [] {
                     const char * f = getenv("LLAMA_SPEC_ADRAFT_FLOOR");
                     return f != nullptr ? std::max(0, atoi(f)) : 0;
                 }();
                 adraft_floor = std::min(adraft_floor, this->params.n_max);
-                LOG_INF("%s: k19-adraft: sampled requests: MTP windows by expected tokens per ms, %d..%d drafts; greedy requests: %d drafts "
-                    "(LLAMA_SPEC_ADRAFT=0: off)\n", __func__, adraft_floor, this->params.n_max, adraft_keep);
+                if (const char * e = getenv("LLAMA_SPEC_ADRAFT_P")) {
+                    adraft_p = (float) atof(e);
+                }
+                if (const char * e = getenv("LLAMA_SPEC_ADRAFT_P2")) {
+                    adraft_p2 = (float) atof(e);
+                }
+                if (adraft_mode == 1) {
+                    LOG_INF("%s: k19-adraft: sampled requests: MTP windows of 1..%d drafts, the 2nd kept at p >= %.2f, later ones at p >= %.2f; "
+                        "greedy requests: %d drafts (LLAMA_SPEC_ADRAFT=0: off)\n", __func__, this->params.n_max, adraft_p2, adraft_p, adraft_keep);
+                } else {
+                    LOG_INF("%s: k19-adraft: sampled requests: MTP windows by expected tokens per ms, %d..%d drafts; greedy requests: %d drafts "
+                        "(LLAMA_SPEC_ADRAFT=2; =0: off)\n", __func__, adraft_floor, this->params.n_max, adraft_keep);
+                }
             } else {
                 this->params.n_max = std::min(this->params.n_max, this->params.adraft);
             }
         }
-        cost_on = spec_cost || tpp_floor > 0 || adraft_keep > 0;
+        cost_on = spec_cost || tpp_floor > 0 || adraft_mode == 2;
         this->n_max = this->params.n_max;
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
@@ -2407,6 +2430,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
+        if (adraft_mode == 1) {
+            int64_t n = 0;
+            std::string h;
+            for (size_t k = 0; k <= (size_t) params.n_max && k < adraft_hist.size(); ++k) {
+                n += adraft_hist[k];
+                h += string_format(" %zu:%lld", k, (long long) adraft_hist[k]);
+            }
+            if (n > 0) {
+                LOG_INF("%s: k19-adraft: sampled windows by drafts kept (so far):%s\n", __func__, h.c_str());
+            }
+        }
         if (cost_on && seq_id >= 0 && seq_id < (llama_seq_id) cost_st.size()) {
             if (cost_st[seq_id].t_us > 0) {
                 if (tpp_floor > 0) {
@@ -2870,6 +2904,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
+                // k19-adraft: the confidence gate (the draft below its bar is not proposed)
+                if (gated(dp) && !result.empty() && p_draft < (result.size() == 1 ? adraft_p2 : adraft_p)) {
+                    drafting[seq_id] = false;
+                    n_drafting--;
+
+                    continue;
+                }
+
                 common_sampler_accept(smpl, id, true);
 
                 result.push_back(id);
@@ -2917,7 +2959,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         n_drafting--;
                         continue;
                     }
-                } else if (adraft_keep > 0 && (int) result.size() >= adraft_keep) {
+                } else if (adraft_keep > 0 && !gated(dp) && (int) result.size() >= adraft_keep) {
                     // k19-adraft: a greedy request's window, as with n_max = adraft_keep
                     drafting[seq_id] = false;
                     n_drafting--;
@@ -2993,6 +3035,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+            }
+
+            if (gated(dp)) {
+                adraft_hist[std::min<size_t>(dp.result->size(), adraft_hist.size() - 1)]++;
             }
 
             if (cost_on) {
