@@ -2149,10 +2149,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool    cost_on   = false; // spec_cost || tpp_floor > 0: the round times and draft probabilities are recorded
     common_spec_mtp_cost cost_pol;
     common_spec_tpp_cost tpp_cost;
+    // k19-adraft (params.adraft): > 0: the greedy window's drafts; sampled requests use cost_pol (LLAMA_SPEC_ADRAFT_FLOOR: fewest drafts)
+    int32_t adraft_keep  = 0;
+    int32_t adraft_floor = 0;
+    static bool sampled(const common_speculative_draft_params & dp) {
+        return dp.temp > 0.0f;
+    }
+    bool priced(const common_speculative_draft_params & dp) const {
+        return !dp.result_q && (spec_cost || (adraft_keep > 0 && sampled(dp)));
+    }
     struct cost_seq {
         int64_t t_us = 0;            // the previous draft() call (0: none since the request began)
         int     rows = 1;            // the window drafted then
         int     drafted = 0;         // k19-tpp: the drafts made then (more than rows - 1: a wider window was drafted and not kept)
+        bool    cal = true;          // k19-adraft: its drafts calibrate the hold rates (sampled rounds only)
         std::vector<float> probs;    // its drafts' probabilities
         common_spec_mtp_cost::chain_state chain;
     };
@@ -2241,7 +2251,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 this->params.n_max = std::min(this->params.n_max, this->params.n_floor);
             }
         }
-        cost_on = spec_cost || tpp_floor > 0;
+        // k19-adraft: one trained head without shared memory, no other window policy
+        if (this->params.adraft > 0) {
+            if (!chain_heads && !is_mem_shared && !spec_cost && tpp_floor == 0 && this->params.n_max > this->params.adraft) {
+                adraft_keep  = this->params.adraft;
+                adraft_floor = [] {
+                    const char * f = getenv("LLAMA_SPEC_ADRAFT_FLOOR");
+                    return f != nullptr ? std::max(0, atoi(f)) : 0;
+                }();
+                adraft_floor = std::min(adraft_floor, this->params.n_max);
+                LOG_INF("%s: k19-adraft: sampled requests: MTP windows by expected tokens per ms, %d..%d drafts; greedy requests: %d drafts "
+                    "(LLAMA_SPEC_ADRAFT=0: off)\n", __func__, adraft_floor, this->params.n_max, adraft_keep);
+            } else {
+                this->params.n_max = std::min(this->params.n_max, this->params.adraft);
+            }
+        }
+        cost_on = spec_cost || tpp_floor > 0 || adraft_keep > 0;
         this->n_max = this->params.n_max;
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
@@ -2752,6 +2777,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 cs.t_us  = now;
                 cs.rows  = 1;
                 cs.chain = {};
+                cs.cal   = adraft_keep == 0 || sampled(dp);
                 cs.probs.clear();
             }
 
@@ -2881,15 +2907,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         n_drafting--;
                         continue;
                     }
-                } else if (spec_cost && !dp.result_q) {
+                } else if (priced(dp)) {
                     auto & cs = cost_st[seq_id];
                     cs.probs.push_back(p_draft);
                     const int cap = 1 + (dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max);
-                    if (!cost_pol.keep_draft(cs.chain, (int) result.size() - 1, p_draft, cap)) {
+                    const bool more = cost_pol.keep_draft(cs.chain, (int) result.size() - 1, p_draft, cap);
+                    if (!more && (int) result.size() >= adraft_floor) {
                         drafting[seq_id] = false;
                         n_drafting--;
                         continue;
                     }
+                } else if (adraft_keep > 0 && (int) result.size() >= adraft_keep) {
+                    // k19-adraft: a greedy request's window, as with n_max = adraft_keep
+                    drafting[seq_id] = false;
+                    n_drafting--;
+                    continue;
                 }
 
                 if (params.n_max <= (int) result.size()) {
@@ -2951,9 +2983,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         dp.result->resize(tpp_floor);
                     }
                 }
-            } else if (spec_cost && !dp.result_q) {
-                // the window keeps the drafts of the best expected tokens per ms
-                const size_t kept = (size_t) std::max(0, cost_st[seq_id].chain.best_rows - 1);
+            } else if (priced(dp)) {
+                // the window keeps the drafts of the best expected tokens per ms (k19-adraft: at least adraft_floor)
+                const size_t kept = (size_t) std::max(adraft_floor, cost_st[seq_id].chain.best_rows - 1);
                 if (dp.result->size() > kept) {
                     dp.result->resize(kept);
                 }
@@ -2983,7 +3015,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 tpp_cost.observe_marginal(cost_pol.draft_rate(cs.probs[tpp_floor]), n_accepted > tpp_floor);
             }
             if (!cs.probs.empty()) {
-                cost_pol.observe_probs(cs.probs.data(), (int) cs.probs.size(), n_accepted);
+                if (cs.cal) {
+                    cost_pol.observe_probs(cs.probs.data(), (int) cs.probs.size(), n_accepted);
+                }
                 cs.probs.clear();
             }
         }
