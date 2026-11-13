@@ -7,7 +7,8 @@
 // shapes of Qwen3.8-27B (K 5120 / 6144 / 17408) and odd ones (rows not a multiple of 4 / 8, K of one super-block), 1..4 tokens,
 // plain and as a batch invariant verify batch, with and without a fused gate. Each mode runs in a child process (the switches are
 // read once per process) that dumps every output; the parent compares the dumps byte for byte. The head child of a lever must log
-// its engagement ("k19-iqsmem:"), the base child none, so a silent fallback fails; a negative control (GGML_CUDA_MMVQ_MOE_ONE=1:
+// its engagement ("k19-iqsmem:"), the base child none, so a silent fallback fails (only where the lever is enabled:
+// gate_t, from the device compute capability; elsewhere neither child may log and the bytes are still compared); a negative control (GGML_CUDA_MMVQ_MOE_ONE=1:
 // another K split of the single token MUL_MAT_ID) must differ. IQS_BASE_EXE=<a copy of this test in another build's bin dir>: that
 // build's defaults vs this build's (cross-build identity). No CUDA device: SKIP, exit 0.
 //
@@ -49,6 +50,33 @@ static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
     if (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN) {
         fputs(text, stderr);
     }
+}
+
+// Where the code under test enables a lever (read from mmvq.cu, the gates must follow it): GATE_ANY = everywhere the mode runs
+// (the original expectation), GATE_SM75 = the default (unset) switch value, which engages only on sm_75 binaries on the TURING
+// table (ggml_cuda_highest_compiled_arch(cc) == 750: a compute capability 7.5 device), GATE_NVIDIA = an explicit "every NVIDIA
+// table" value, which engages on the TURING / GENERIC tables (not GB10, cc 12.1, whose table depends on whether the build has
+// sm_121: engagement not checked there). A mode whose lever is not expected on this device must not log in either child (the
+// default stays off there) and still compares bytes; one that is expected and does not log fails as before.
+enum gate_t { GATE_ANY = 0, GATE_SM75, GATE_NVIDIA };
+
+// the device compute capability (major*100 + minor*10), -1 if unknown (the backend lacks ggml_backend_dev_compute_capability)
+static int device_cc(ggml_backend_dev_t dev) {
+    typedef int (*cc_fn_t)(ggml_backend_dev_t);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    cc_fn_t fn = reg ? (cc_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_compute_capability") : nullptr;
+    return fn ? fn(dev) : -1;
+}
+
+// 1 = engagement expected, 0 = not expected, -1 = not checked; cc -1 (unknown) keeps the original expectation
+static int gate_expect(gate_t g, int cc) {
+    if (g == GATE_ANY || cc < 0) {
+        return 1;
+    }
+    if (g == GATE_SM75) {
+        return cc == 750 ? 1 : 0;
+    }
+    return cc == 1210 ? -1 : 1;
 }
 
 static uint64_t fnv(const void * d, size_t n, uint64_t h = 0xcbf29ce484222325ull) {
@@ -399,31 +427,35 @@ int main(int argc, char ** argv) {
     }
 
     printf("device %s, %zu cases\n", ggml_backend_dev_description(dev), make_cases().size());
+    const int cc = device_cc(dev);
+    printf("compute capability %d\n", cc);
     const char * tmp = getenv("TMPDIR");
     const std::string dir = tmp ? tmp : ".";
     const std::string tag = std::to_string((long) getpid());
     const std::string self = argv[0];
     const std::string off = "GGML_CUDA_MMVQ_GRID_IDS=0 GGML_CUDA_MMVQ_IQ2_TAB=0";
     // logs: 1 = the head child must log and the base child must not, 0 = neither logs, -1 = not checked; diff: the dumps must differ
-    struct mode { const char * name; std::string env_base, env_head; int logs; bool diff; std::string exe_base = ""; };
+    struct mode { const char * name; std::string env_base, env_head; int logs; bool diff; std::string exe_base = ""; gate_t gate = GATE_ANY; };
     std::vector<mode> modes = {
         { "neg_moe_one",  off, off + " GGML_CUDA_MMVQ_MOE_ONE=1", 0, true },
         { "off_twice",    off, off, 0, false },
         { "off_twice_exact", off + " GGML_CUDA_VERIFY_REASSOC=0", off + " GGML_CUDA_VERIFY_REASSOC=0", 0, false },
         { "dflt_twice_exact", "GGML_CUDA_VERIFY_REASSOC=0", "GGML_CUDA_VERIFY_REASSOC=0", -1, false },
-        { "grid_ids",     off, "GGML_CUDA_MMVQ_IQ2_TAB=0", 1, false },
-        { "grid_ids4",    off, "GGML_CUDA_MMVQ_IQ2_TAB=0 GGML_CUDA_MMVQ_GRID_IDS=4", 1, false },
-        { "grid_ids8",    off, "GGML_CUDA_MMVQ_IQ2_TAB=0 GGML_CUDA_MMVQ_GRID_IDS=8", 1, false },
-        { "grid_ids_w4",  off, "GGML_CUDA_MMVQ_IQ2_TAB=0 GGML_CUDA_MMVQ_GRID_IDS_WARPS=0", 1, false },
-        { "grid_ids4_w4", off, "GGML_CUDA_MMVQ_IQ2_TAB=0 GGML_CUDA_MMVQ_GRID_IDS=4 GGML_CUDA_MMVQ_GRID_IDS_WARPS=0", 1, false },
-        { "grid_ids_gsm0", off + " GGML_CUDA_MMVQ_GRID_SMEM=0", "GGML_CUDA_MMVQ_IQ2_TAB=0 GGML_CUDA_MMVQ_GRID_SMEM=0", 1, false },
-        { "iq2tab",       off, "GGML_CUDA_MMVQ_GRID_IDS=0", 1, false },
-        { "iq2tab_r4",    off, "GGML_CUDA_MMVQ_GRID_IDS=0 GGML_CUDA_MMVQ_IQ2_TAB_ROWS=4", 1, false },
-        { "iq2tab_r8",    off, "GGML_CUDA_MMVQ_GRID_IDS=0 GGML_CUDA_MMVQ_IQ2_TAB_ROWS=8", 1, false },
-        { "iq2tab_ids4",  off, "GGML_CUDA_MMVQ_GRID_IDS=0 GGML_CUDA_MMVQ_TURING_IDS_ROWS=4", 1, false },
-        { "default",      off, "", 1, false },
-        { "default_exact", off + " GGML_CUDA_VERIFY_REASSOC=0", "GGML_CUDA_VERIFY_REASSOC=0", 1, false },
-        { "default_iqtab0", off + " GGML_CUDA_MMVQ_IQ_TAB=0", "GGML_CUDA_MMVQ_IQ_TAB=0", 1, false },
+        { "grid_ids",     off, "GGML_CUDA_MMVQ_IQ2_TAB=0", 1, false, "", GATE_SM75 },
+        { "grid_ids4",    off, "GGML_CUDA_MMVQ_IQ2_TAB=0 GGML_CUDA_MMVQ_GRID_IDS=4", 1, false, "", GATE_NVIDIA },
+        { "grid_ids8",    off, "GGML_CUDA_MMVQ_IQ2_TAB=0 GGML_CUDA_MMVQ_GRID_IDS=8", 1, false, "", GATE_NVIDIA },
+        { "grid_ids_w4",  off, "GGML_CUDA_MMVQ_IQ2_TAB=0 GGML_CUDA_MMVQ_GRID_IDS_WARPS=0", 1, false, "", GATE_SM75 },
+        { "grid_ids4_w4", off, "GGML_CUDA_MMVQ_IQ2_TAB=0 GGML_CUDA_MMVQ_GRID_IDS=4 GGML_CUDA_MMVQ_GRID_IDS_WARPS=0", 1, false, "", GATE_NVIDIA },
+        { "grid_ids_gsm0", off + " GGML_CUDA_MMVQ_GRID_SMEM=0", "GGML_CUDA_MMVQ_IQ2_TAB=0 GGML_CUDA_MMVQ_GRID_SMEM=0", 1, false, "", GATE_SM75 },
+        { "iq2tab",       off, "GGML_CUDA_MMVQ_GRID_IDS=0", 1, false, "", GATE_SM75 },
+        { "iq2tab_r4",    off, "GGML_CUDA_MMVQ_GRID_IDS=0 GGML_CUDA_MMVQ_IQ2_TAB_ROWS=4", 1, false, "", GATE_SM75 },
+        { "iq2tab_r8",    off, "GGML_CUDA_MMVQ_GRID_IDS=0 GGML_CUDA_MMVQ_IQ2_TAB_ROWS=8", 1, false, "", GATE_SM75 },
+        { "iq2tab_ids4",  off, "GGML_CUDA_MMVQ_GRID_IDS=0 GGML_CUDA_MMVQ_TURING_IDS_ROWS=4", 1, false, "", GATE_SM75 },
+        // IQ2_TAB=2: the codebook launch on every NVIDIA table (the path the sm_75-only modes above cannot reach on other archs)
+        { "iq2tab_any",   off, "GGML_CUDA_MMVQ_GRID_IDS=0 GGML_CUDA_MMVQ_IQ2_TAB=2", 1, false, "", GATE_NVIDIA },
+        { "default",      off, "", 1, false, "", GATE_SM75 },
+        { "default_exact", off + " GGML_CUDA_VERIFY_REASSOC=0", "GGML_CUDA_VERIFY_REASSOC=0", 1, false, "", GATE_SM75 },
+        { "default_iqtab0", off + " GGML_CUDA_MMVQ_IQ_TAB=0", "GGML_CUDA_MMVQ_IQ_TAB=0", 1, false, "", GATE_SM75 },
     };
     if (const char * be = getenv("IQS_BASE_EXE")) {
         // a copy of this test in the other build's bin dir (the CUDA backend is loaded from the executable's directory, so
@@ -467,7 +499,15 @@ int main(int argc, char ** argv) {
             }
         }
         const bool same_ok = md.diff ? ndiff > 0 : ndiff == 0;
-        const bool logs_ok = md.logs < 0 || (md.logs == 0 ? lb == 0 && lh == 0 : lb == 0 && lh > 0);
+        int logs = md.logs;
+        if (logs == 1) {
+            const int ex = gate_expect(md.gate, cc);
+            if (ex <= 0) {
+                printf("  NOTE %s: engagement %s on cc %d (bytes still compared)\n", md.name, ex == 0 ? "not expected" : "not checked", cc);
+                logs = ex;   // 0: neither child may log (the lever stays off here), -1: not checked
+            }
+        }
+        const bool logs_ok = logs < 0 || (logs == 0 ? lb == 0 && lh == 0 : lb == 0 && lh > 0);
         const bool ok = rb == 0 && rh == 0 && !db.empty() && db.size() == dh.size() && same_ok && logs_ok;
         if (!ok) {
             printf("  WHY %s: rc %d / %d, sizes %zu / %zu, same_ok %d, logs_ok %d\n", md.name, rb, rh, db.size(), dh.size(), (int) same_ok, (int) logs_ok);
