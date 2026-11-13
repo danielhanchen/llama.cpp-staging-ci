@@ -248,7 +248,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         test-llama-archs
         NAME test-generate-models
         LABEL main
-        ARGS -o "${MODEL_DIR}"
+        # fixed seed: the fork's tests that read these models (test-dtopk-grammar, test-mtp-draft-topk, ...) need the same weights
+        # on every run; with the default random seed they were flaky
+        ARGS -s 1234 -o "${MODEL_DIR}"
     )
     set_tests_properties(test-generate-models PROPERTIES
         FIXTURES_SETUP generate-models
