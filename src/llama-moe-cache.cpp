@@ -3453,7 +3453,7 @@ struct llama_moe_cache::impl {
         }
         if (plr.layers > 0 || plr.over > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4ttft: prompt layer reads: %llu layers, %llu experts, %.1f MiB in %.1f ms, %llu past the scratch "
-                "(LLAMA_MOE_PROMPT_LAYER_READ=0 off)\n", tag, (unsigned long long) plr.layers, (unsigned long long) plr.experts, plr.bytes/1048576.0,
+                "(LLAMA_MOE_PROMPT_LAYER_READ=1 opt-in)\n", tag, (unsigned long long) plr.layers, (unsigned long long) plr.experts, plr.bytes/1048576.0,
                 plr.read_us/1000.0, (unsigned long long) plr.over);
         }
         plr_free();
@@ -5679,8 +5679,8 @@ struct llama_moe_cache::impl {
         }
     }
 
-    // k19-l4ttft: prompt layer reads (LLAMA_MOE_PROMPT_LAYER_READ, default 1 where the RAM tier serves layers streamed from the model
-    // files; 0 = off). A prompt ubatch whose expert copies read the routing (the copy callback's routed-only path, ubatches below the
+    // k19-l4ttft: prompt layer reads (LLAMA_MOE_PROMPT_LAYER_READ=1, opt-in: measured no faster on the L4 disk tier, chat TTFT 8.32 vs 6.81 s
+    // median with it off, and its pinned scratch cost the 8k after it 103 vs 87 s; the per-byte read rate is the loop device's either way). A prompt ubatch whose expert copies read the routing (the copy callback's routed-only path, ubatches below the
     // prefetch size) used to read each expert tensor's misses on its own when its split started: the reads of the gate, up and down
     // tensors of a layer were three waits with the device work between them, the disk idle in between. Colab L4 full card, Qwen3.8-Flash-Next
     // UD-IQ4_XS from the VM disk (k19_l4ttft): the 42-token chat read 1.5-1.8 GB in 8.3-8.8 s with the disk busy 64-69% of it. Here
@@ -5711,7 +5711,7 @@ struct llama_moe_cache::impl {
         uint64_t layers = 0, experts = 0, bytes = 0, read_us = 0, over = 0, prompts = 0;
     } plr;
     static int plr_mode() {
-        static const int m = [] { const char * e = getenv("LLAMA_MOE_PROMPT_LAYER_READ"); return e == nullptr ? 1 : atoi(e); }();
+        static const int m = [] { const char * e = getenv("LLAMA_MOE_PROMPT_LAYER_READ"); return e == nullptr ? 0 : atoi(e); }();
         return m;
     }
     static bool plr_diag() {
@@ -5744,7 +5744,7 @@ struct llama_moe_cache::impl {
             plr.size = want;
         }
         LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4ttft: prompt layer reads: %s (%.0f MiB scratch, %.0f MiB reclaimable, floor %.0f MiB; "
-            "LLAMA_MOE_PROMPT_LAYER_READ=0 off)\n", tag, plr.base == nullptr ? "off, no room" : plr.buf != nullptr ? "on, pinned" : "on, pageable",
+            "LLAMA_MOE_PROMPT_LAYER_READ=1 opt-in)\n", tag, plr.base == nullptr ? "off, no room" : plr.buf != nullptr ? "on, pinned" : "on, pageable",
             want/1048576.0, recl/1048576.0, floor/1048576.0);
         return plr.base != nullptr;
     }
