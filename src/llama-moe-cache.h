@@ -263,6 +263,13 @@ public:
     // KV cache that grows by retiring tail slots for good (down to the floor set_shrink_floor sets); returns the bytes freed (0: none,
     // e.g. no lazy banks, no floor set, at the floor, banks released). Between batches only (no graph of this cache may be pending)
     size_t shrink(ggml_backend_dev_t dev, size_t bytes);
+    // k19-t4small (decode extension, LLAMA_MOE_DECODE_EXT): the banks have room past the slots the fit sized (a lazy buffer, only the
+    // fitted slots backed at load); between prompts the cache grows into device memory that is free while the decode runs (ext_grow)
+    // and goes back to the fitted slots before a prompt ubatch (ext_park), so a prompt sees the memory the fit planned
+    bool   ext_on() const;
+    size_t ext_grow(ggml_backend_dev_t dev, size_t bytes); // the bytes of slots added
+    size_t ext_park();                                      // the bytes given back
+    size_t ext_bytes() const;                               // the bytes of slots above the fitted ones now
     // k19-vramlend: whether shrink can give memory back on dev (lazy banks there)
     bool can_shrink(ggml_backend_dev_t dev) const;
     // the bytes of slots shrink keeps on dev (not set: nothing is retired)

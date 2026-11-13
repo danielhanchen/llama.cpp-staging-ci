@@ -2479,6 +2479,99 @@ void llama_context::tiny_rel_leave() {
     }
 }
 
+// k19-t4small: the largest ubatch that runs beside the grown cache: the tiny-cache rule's, else one token below the batch from which the
+// CUDA backend copies host weights for an op (GGML_OP_OFFLOAD_MIN_BATCH, 32), as k19-place8
+int64_t llama_context::ext_ub() const {
+    if (tiny_rel_ub > 0) {
+        return tiny_rel_ub;
+    }
+    static const int64_t ub = [] {
+        const char * e = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
+        return (int64_t) std::max(1, (e != nullptr ? atoi(e) : 32) - 1);
+    }();
+    return ub;
+}
+
+// k19-t4small: before a prompt ubatch the cache goes back to the slots the fit sized, so the prompt's compute buffers (and its MTP
+// drafter's) find the memory the fit planned for them
+void llama_context::ext_park(const char * why) {
+    if (!ext_grown || !moe_cache) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    const size_t freed = moe_cache->ext_park();
+    // (released banks cannot be parked: the extension then stays until a park finds them back; the grow below never runs while released)
+    ext_grown = moe_cache->ext_bytes() > 0;
+    if (ext_grown) {
+        static int n_warn = 0;
+        if (n_warn++ < 2) {
+            LLAMA_LOG_WARN("%s: MoE cache k19-t4small decode extension: not parked (%s): the banks are released\n", __func__, why);
+        }
+        return;
+    }
+    ext_n_park++;
+    ext_ms += (ggml_time_us() - t0)/1e3;
+    if (ext_n_park <= 2) {
+        LLAMA_LOG_INFO("%s: MoE cache k19-t4small decode extension parked (%s): %.2f MiB given back, %.1f ms\n", __func__, why,
+            freed/1048576.0, (ggml_time_us() - t0)/1e3);
+    }
+}
+
+// k19-t4small: after a prompt, at the first decode step: this context's and its MTP drafters' device compute buffers are freed (their
+// next graphs allocate what a decode step needs, as tiny_rel_leave does), then the cache grows into the free device memory less
+// LLAMA_MOE_DECODE_EXT_KEEP_MIB (384, in steps of 64 MiB). PolyStrata's engine keeps ~235 MiB free beside its expert cache this way
+void llama_context::ext_unpark() {
+    if (ext_grown || !moe_cache) {
+        return;
+    }
+    ext_grown = true; // also when nothing could be added: tried again after the next prompt
+    const int64_t t0 = ggml_time_us();
+    nextn_hold_wait(); // a drafter pass in flight beside this decode ends before its buffers go
+    moe_cache_ids.clear();
+    moe_cache_seq      = -1;
+    moe_cache_pos_next = -1;
+    moe_cache->clear_seed_counts();
+    size_t freed = 0;
+    ggml_backend_dev_t dev_gpu = nullptr;
+    for (auto & bk : backend_ptrs) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(bk);
+        if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            freed += ggml_backend_sched_get_buffer_size(sched.get(), bk);
+            if (dev_gpu == nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                dev_gpu = dev;
+            }
+        }
+    }
+    if (dev_gpu == nullptr) {
+        return;
+    }
+    ggml_backend_sched_free_device_buffers(sched.get());
+    size_t freed_dft = 0;
+    for (llama_context * c : llama_mtp_ctxs_of(this, model)) {
+        if (c->sched) {
+            c->lm_ids_host_keep();
+            freed_dft += c->release_device_compute();
+        }
+    }
+    static const size_t keep = [] {
+        const char * e = getenv("LLAMA_MOE_DECODE_EXT_KEEP_MIB");
+        return (size_t) std::max<long long>(64, e != nullptr ? atoll(e) : 384) << 20;
+    }();
+    constexpr size_t step = (size_t) 64 << 20;
+    size_t fr = 0, tot = 0;
+    ggml_backend_dev_memory(dev_gpu, &fr, &tot);
+    const size_t grant = fr > keep + step ? ((fr - keep)/step)*step : 0;
+    const size_t grown = grant > 0 ? moe_cache->ext_grow(dev_gpu, grant) : 0;
+    ext_n_grow++;
+    ext_max = std::max(ext_max, grown);
+    ext_ms += (ggml_time_us() - t0)/1e3;
+    if (ext_n_grow <= 3) {
+        LLAMA_LOG_INFO("%s: MoE cache k19-t4small decode extension: compute buffers freed %.2f MiB (MTP drafters %.2f MiB), %.1f MiB free, "
+            "%.2f MiB of slots added (keep %.0f MiB), %.1f ms\n", __func__, freed/1048576.0, freed_dft/1048576.0, fr/1048576.0,
+            grown/1048576.0, keep/1048576.0, (ggml_time_us() - t0)/1e3);
+    }
+}
+
 void llama_context::gf_res_epoch_bump(int line) {
     gf_res_epoch++;
     static const int why = getenv("LLAMA_GRAPH_SMALL_WHY") != nullptr ? std::max(0, atoi(getenv("LLAMA_GRAPH_SMALL_WHY"))) : 0;
@@ -5844,6 +5937,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_tokens_prev  = 0;
     rows_ev_n = 0; // k15-pp3: no early nextn rows from this decode yet
 
+    // k19-t4small (decode extension): a prompt goes back to the fitted slots before anything of it runs, its layer-major groups
+    // included (they are built before the per-ubatch check below)
+    if (ext_grown && moe_cache && moe_cache->ext_on() && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && (int64_t) n_tokens_all > ext_ub()) {
+        ext_park("prompt");
+    }
+
     for (bool more = true; more; ) {
         // k15-pp: the state before the ubatch that starts at the capture index (a layer-major group captures inside its graph)
         for (int s = 0; s < cap_max; ++s) {
@@ -5893,6 +5992,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             wstore->set_wrap(!(n_outputs > 0 && n_outputs < ubatch.n_tokens));
         }
 
+        // k19-t4small (decode extension): a prompt ubatch runs with the cache at its fitted slots (before the release below takes the
+        // banks); the first verify window after it, or a single-token step without a drafter, grows the cache (after the banks are back)
+        const bool ext_here = moe_cache && moe_cache->ext_on() && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && cparams.n_seq_max == 1;
+        if (ext_here && ext_grown && (int64_t) ubatch.n_tokens > ext_ub()) {
+            ext_park("prompt");
+        }
         // k19-tiny-ub: a ubatch of more than the default n_ubatch runs with the cache banks released, the next smaller one gets them back
         if (tiny_rel_ub > 0 && moe_cache) {
             if ((int64_t) ubatch.n_tokens > tiny_rel_ub) {
@@ -5902,6 +6007,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             } else if (tiny_rel_held) {
                 tiny_rel_leave();
             }
+        }
+        if (ext_here && !ext_grown && (int64_t) ubatch.n_tokens <= ext_ub() && !moe_cache->released() &&
+                (cparams.verify || (ubatch.n_tokens == 1 && n_outputs == 1 && llama_mtp_ctxs_of(this, model).empty()))) {
+            ext_unpark();
         }
         const bool tiny_rel_now = tiny_rel_held && moe_cache && moe_cache->released();
         bool tiny_rel_record = false;

@@ -984,6 +984,19 @@ private:
     void    tiny_rel_enter(const char * why);
     void    tiny_rel_leave();
 
+    // k19-t4small (decode extension, llama_moe_cache::ext_grow; LLAMA_MOE_DECODE_EXT=0 off): a ubatch of more than ext_ub() tokens runs
+    // with the cache at its fitted slots (ext_park); the first verify window after it (or a single-token step without a drafter) frees
+    // this context's and its MTP drafters' device compute buffers and grows the cache into the device memory then free, less
+    // LLAMA_MOE_DECODE_EXT_KEEP_MIB (384) (ext_unpark)
+    bool    ext_grown   = false;
+    int64_t ext_n_grow  = 0;
+    int64_t ext_n_park  = 0;
+    double  ext_ms      = 0.0;
+    size_t  ext_max     = 0;
+    int64_t ext_ub() const;
+    void    ext_park(const char * why);
+    void    ext_unpark();
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
     // k15-pp: unmasked next-n rows (MTP) in their own host buffer, sized by the batches that copy them to the host instead of n_batch
