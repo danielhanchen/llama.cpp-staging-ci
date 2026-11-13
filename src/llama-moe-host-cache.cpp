@@ -369,6 +369,43 @@ int32_t llama_moe_host_cache::n_free() const {
     return n;
 }
 
+bool llama_moe_host_cache::can_take_alloc(int32_t il) const {
+    if (!caches(il)) {
+        return false;
+    }
+    const klass & c = classes[layer_class[il]];
+    if (!c.free_list.empty()) {
+        return true;
+    }
+    if (c.n_alloc < c.n) {
+        return false; // reserve would allocate (pin) a chunk before it looks at the duplicates
+    }
+    for (const int32_t cand : c.dups) {
+        const slot_t & sl = slots[cand];
+        if (sl.dup && (sl.state == SLOT_VALID || sl.state == SLOT_WRITING) && sl.pin != call_epoch && sl.lease_id != plan_id &&
+                sl.read_seq != seq_next && sl.write_seq != seq_next) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int32_t llama_moe_host_cache::n_dup_slots() const {
+    int32_t n = 0;
+    for (const slot_t & sl : slots) {
+        n += sl.dup && (sl.state == SLOT_VALID || sl.state == SLOT_WRITING) ? 1 : 0;
+    }
+    return n;
+}
+
+int32_t llama_moe_host_cache::n_filling() const {
+    int32_t n = 0;
+    for (const slot_t & sl : slots) {
+        n += sl.state == SLOT_FILLING ? 1 : 0;
+    }
+    return n;
+}
+
 int32_t llama_moe_host_cache::n_free_of(int32_t il) const {
     if (!caches(il)) {
         return 0;

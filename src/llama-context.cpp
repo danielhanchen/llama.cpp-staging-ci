@@ -2491,6 +2491,11 @@ void llama_context::gf_res_epoch_bump(int line) {
 
 llama_context::~llama_context() {
     nextn_join();
+    // k19-l4fill: the refill reads of the RAM tier that did not start are cancelled before the weight store goes (its destructor would
+    // read every queued one)
+    if (moe_cache) {
+        moe_cache->fill_stop();
+    }
     if (tiny_rel_ub > 0) {
         LLAMA_LOG_INFO("%s: MoE cache tiny-cache release (LLAMA_MOE_PREFILL_UB_TINY_RELEASE): %lld releases, %lld restores, %.1f ms restoring "
             "(%.1f ms each)\n", __func__, (long long) tiny_rel_n_enter, (long long) tiny_rel_n_leave, tiny_rel_ms,
@@ -9865,6 +9870,9 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
     if (cont && !moe_cache_ids.empty() && n_outputs_ub != 0 && !large && !moe_cache_seeded && moe_cache->refills_routed()) {
         moe_cache_refill_from_ids();
     }
+    if (cont && !moe_cache_ids.empty() && n_outputs_ub != 0 && !large) {
+        moe_cache_fill_from_ids();
+    }
     moe_cache_ids.clear();
 
     // the last large ubatch of the batch seeds the cache even without outputs: a caller may run the last prompt tokens as a separate small batch (e.g. server checkpoints)
@@ -9972,6 +9980,9 @@ void llama_context::moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_ou
         if (n_outputs_ub != 0 && recorded && !moe_cache_seeded && !moe_cache_ids.empty() && moe_cache->refills_routed()) {
             moe_cache_refill_from_ids();
         }
+        if (n_outputs_ub != 0 && recorded && !moe_cache_ids.empty()) {
+            moe_cache_fill_from_ids();
+        }
         moe_cache_seq      = -1;
         moe_cache_pos_next = -1;
         moe_cache_ids.clear();
@@ -10013,6 +10024,31 @@ void llama_context::lm_ids_host_keep() {
     }
     lm_ids_ctx = std::move(ctx);
     lm_ids_buf = std::move(buf);
+}
+
+// k19-l4fill: the routing of the recorded ubatch (the last large one of a prompt) to the RAM tier's refill of its freed slots
+void llama_context::moe_cache_fill_from_ids() {
+    if (moe_cache_ids.empty() || !moe_cache->fill_wants_counts()) {
+        return;
+    }
+    ggml_backend_sched_synchronize(sched.get());
+    moe_cache->fill_counts_begin();
+    std::vector<int32_t> ids_data;
+    std::vector<int32_t> counts;
+    for (const auto & [w, ids] : moe_cache_ids) {
+        if (ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids) || ids->buffer == nullptr) {
+            continue;
+        }
+        ids_data.resize(ggml_nelements(ids));
+        ggml_backend_tensor_get(ids, ids_data.data(), 0, ggml_nbytes(ids));
+        counts.assign(w->ne[2], 0);
+        for (const int32_t id : ids_data) {
+            if (id >= 0 && id < w->ne[2]) {
+                counts[id]++;
+            }
+        }
+        moe_cache->fill_counts(w, counts);
+    }
 }
 
 void llama_context::moe_cache_refill_from_ids() {

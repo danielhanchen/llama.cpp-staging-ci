@@ -389,6 +389,12 @@ public:
     void set_seed_counts(const ggml_tensor * w, const std::vector<int32_t> & counts);
     // the routing of the last large ubatch of a prompt that did not seed: the lent slots that come back get its most used experts
     void set_refill_counts(const ggml_tensor * w, const std::vector<int32_t> & counts);
+    // k19-l4fill: the exclusive RAM tier refills the slots it freed with the experts the last prompts routed most that neither tier holds
+    // (LLAMA_MOE_HOST_FILL=0 off): the routing counts of a prompt's last large ubatch, once per prompt (begin, then each expert tensor)
+    bool fill_wants_counts() const;
+    void fill_counts_begin();
+    void fill_counts(const ggml_tensor * w, const std::vector<int32_t> & counts);
+    void fill_stop(); // its reads that did not start are cancelled, the started ones waited for
     bool refills_routed() const; // LLAMA_MOE_CACHE_REFILL_ROUTED=1 (opt-in)
     const std::vector<int32_t> * get_seed_counts(const ggml_tensor * w) const; // nullptr if there are none for the layer of w
     void clear_seed_counts();

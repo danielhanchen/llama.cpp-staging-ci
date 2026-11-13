@@ -663,12 +663,54 @@ static void test_quota() {
     printf("test_quota: done\n");
 }
 
+// k19-l4fill: can_take_alloc names exactly the reservations a refill may make without evicting or pinning a new chunk
+static void test_fill_take() {
+    const int32_t n_expert = 8;
+    const std::vector<std::vector<size_t>> lsz = { { 3000, 3000 }, { 3000, 3000 } };
+    // chunks of 2 slots: 4 slots in the budget, none allocated yet
+    llama_moe_host_cache hc(ggml_backend_cpu_buffer_type(), 4*24576, LLAMA_MOE_HOST_EXCLUSIVE, n_expert, lsz, 2*24576);
+    CHECK(hc.n_slots() == 4 && !hc.can_take_alloc(0) && hc.n_filling() == 0 && hc.n_dup_slots() == 0);
+    int32_t s0 = hc.reserve(0, 0, false); // allocates the first chunk (2 slots)
+    CHECK(s0 >= 0 && hc.n_filling() == 1);
+    if (s0 >= 0) { hc.publish(s0); }
+    CHECK(hc.can_take_alloc(0) && hc.can_take_alloc(1)); // the second slot of the chunk is free
+    int32_t s1 = hc.reserve(1, 0, false);
+    if (s1 >= 0) { hc.publish(s1); }
+    // no free slot with memory, budget left: a reservation would pin a new chunk, the refill may not
+    CHECK(!hc.can_take_alloc(0) && hc.n_free() == 2);
+    // fill the budget, then a duplicate is takeable, a guess is not
+    int32_t s2 = hc.reserve(0, 1, false);
+    if (s2 >= 0) { hc.publish(s2); }
+    int32_t s3 = hc.reserve(0, 2, false);
+    if (s3 >= 0) { hc.publish(s3); }
+    CHECK(hc.n_free() == 0 && !hc.can_take_alloc(0));
+    hc.set_spec(s3);
+    CHECK(!hc.can_take_alloc(0));
+    hc.set_dup(s2, true);
+    CHECK(hc.can_take_alloc(0) && hc.can_take_alloc(1) && hc.n_dup_slots() == 1);
+    // pinned by the current call: not takeable
+    hc.begin_call();
+    hc.pin(s2);
+    CHECK(!hc.can_take_alloc(0));
+    hc.begin_call();
+    const int32_t r = hc.reserve(1, 1, false, 0, false);
+    CHECK(r == s2 && !hc.contains(0, 1) && hc.contains(0, 2) && hc.n_spec_slots() == 1);
+    // an async fill is left alone by release / eviction until published
+    if (r >= 0) {
+        hc.set_async(r, 1);
+        CHECK(hc.n_filling() == 1 && hc.find(1, 1) < 0);
+        hc.publish(r);
+        CHECK(hc.find(1, 1) == r && hc.n_filling() == 0);
+    }
+}
+
 int main(int argc, char ** argv) {
     ggml_backend_t backend = ggml_backend_cpu_init();
 
     test_decide();
     test_slots(backend);
     test_quota();
+    test_fill_take();
 
     const std::string path = argc > 1 ? argv[1] : "test-moe-host-cache.bin";
     const size_t file_size = (size_t) 8 << 20;

@@ -168,6 +168,13 @@ public:
 
     // slots without an expert (free, or not allocated yet within the budget)
     int32_t n_free() const;
+    // k19-l4fill: a non-evicting reservation of layer il would find a slot whose memory is already allocated: a free one or a duplicate
+    // of a device-held expert that no current call / plan / uncommitted copy uses (never a guess, never memory still to be pinned)
+    bool    can_take_alloc(int32_t il) const;
+    // ... the number of such duplicates over every layout (the diagnostics)
+    int32_t n_dup_slots() const;
+    // slots being filled (reserved, not published yet)
+    int32_t n_filling() const;
     // ... of the layout of layer il, and its slots
     int32_t n_free_of(int32_t il) const;
     int32_t n_slots_of(int32_t il) const;
