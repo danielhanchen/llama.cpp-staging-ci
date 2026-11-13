@@ -162,8 +162,16 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     // k19-fullcost (LLAMA_SPEC_PREWARM_CACHED=1, opt-in): beside a MoE cache too; LLAMA_SPEC_PREWARM_WIDTHS="1,3,7" prewarms only those
     // widths (default 1..w_max). LLAMA_SPEC_PREWARM_MEM=1 logs the device's free memory after each width (the graph memory per width)
     // (k19-bigverify: unset, on beside a cache that holds most of the experts, llama_moe_cache_wide_graphs; =0 off there too)
+    // k19-g4cap: unset, also beside a cache that holds at least LLAMA_SPEC_PREWARM_CACHED_FRAC of its host expert bytes (default 0.3;
+    // 0 = only the wide-graph rule, as before). Only the prewarm: the device KV buckets keep their 2048-cell step there. Colab G4
+    // Qwen3.8-Flash-Next UD-IQ4_XS at a 32 GB cap (41.4% cached), gc_s1: the warm request leaves the 4..7-row verify widths to be built and
+    // captured inside the next request (36-129 ms per width); prewarmed (LLAMA_SPEC_PREWARM_CACHED=1) DFlash2 chat 205.6 -> 230.0 tok/s
+    // with the same text. At 16 GB (15.5% cached) it stays off (k19-fullcost: the prewarmed graphs lost there)
+    static const double cached_frac_min = getenv("LLAMA_SPEC_PREWARM_CACHED_FRAC") != nullptr ?
+        atof(getenv("LLAMA_SPEC_PREWARM_CACHED_FRAC")) : 0.3;
+    const double cache_frac = llama_moe_cache_frac(ctx);
     const bool cached_ok = getenv("LLAMA_SPEC_PREWARM_CACHED") != nullptr ? atoi(getenv("LLAMA_SPEC_PREWARM_CACHED")) != 0 :
-        llama_moe_cache_wide_graphs(ctx);
+        (llama_moe_cache_wide_graphs(ctx) || (cached_frac_min > 0.0 && cache_frac >= cached_frac_min));
     static const bool mem_log   = getenv("LLAMA_SPEC_PREWARM_MEM") != nullptr && atoi(getenv("LLAMA_SPEC_PREWARM_MEM")) != 0;
     std::vector<int> widths;
     if (const char * ew = getenv("LLAMA_SPEC_PREWARM_WIDTHS")) {
@@ -190,6 +198,10 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     if (widths.empty() || ctx == nullptr || (llama_moe_cache_active(ctx) && !cached_ok) ||
             llama_n_batch(ctx) < (uint32_t) std::max(w_max, std::min(n_pre, 1)) || (int) llama_n_ctx_seq(ctx) < n_end + 64) {
         return;
+    }
+    if (cached_ok && llama_moe_cache_active(ctx) && !llama_moe_cache_wide_graphs(ctx)) {
+        SRV_INF("k19-g4cap: verify graphs prewarmed beside a MoE cache that holds %.1f%% of the host experts (LLAMA_SPEC_PREWARM_CACHED_FRAC "
+                "%.2f; =0: off)\n", 100.0*cache_frac, cached_frac_min);
     }
     auto dev_free_mib = []() -> double {
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
