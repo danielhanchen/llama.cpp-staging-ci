@@ -1520,6 +1520,10 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
         bool          topk_all     = true;
         bool          cand_skipped = false;
         bool          cand_all_env = true;  // k19-dsv4p (LLAMA_DSV41_CAND_ALL=0 disables): skip a block pick that keeps every block
+        // k19-dsv4next (LLAMA_DSV41_PREFILL_SPARSE=0 disables): the dense (prompt) attention passes the bound on finite mask entries
+        // per query (window + top-k) to flash attention, so CUDA gathers only those K rows instead of reading every compressed row;
+        // 2 (default) also marks the node to prefer the gather from K >= 2 * bound, 1 = the backend's own threshold
+        int           prefill_sparse = 2;
         ggml_tensor * win_sel    = nullptr;
         ggml_tensor * win_mask   = nullptr;
         // k19-dsv4long far-token skip (LLAMA_DSV41_FAR_SKIP=0 disables): from layer hparams.dsv41_far_layer on the graph carries only
