@@ -2158,6 +2158,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t adraft_floor = 0;
     float   adraft_p     = 0.9f;
     float   adraft_p2    = 0.0f;
+    bool    adraft_prev  = false;   // LLAMA_SPEC_ADRAFT_PREV=1: the bar is checked on the last kept draft, so a draft is made only when kept
     std::array<int64_t, 9> adraft_hist{};   // sampled windows by kept drafts
     static bool sampled(const common_speculative_draft_params & dp) {
         return dp.temp > 0.0f;
@@ -2278,9 +2279,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (const char * e = getenv("LLAMA_SPEC_ADRAFT_P2")) {
                     adraft_p2 = (float) atof(e);
                 }
+                if (const char * e = getenv("LLAMA_SPEC_ADRAFT_PREV")) {
+                    adraft_prev = atoi(e) != 0;
+                }
                 if (adraft_mode == 1) {
-                    LOG_INF("%s: k19-adraft: sampled requests: MTP windows of 1..%d drafts, the 2nd kept at p >= %.2f, later ones at p >= %.2f; "
-                        "greedy requests: %d drafts (LLAMA_SPEC_ADRAFT=0: off)\n", __func__, this->params.n_max, adraft_p2, adraft_p, adraft_keep);
+                    LOG_INF("%s: k19-adraft: sampled requests: MTP windows of 1..%d drafts, the 2nd kept at p >= %.2f, later ones at p >= %.2f, "
+                        "bar on %s; greedy requests: %d drafts (LLAMA_SPEC_ADRAFT=0: off)\n", __func__, this->params.n_max, adraft_p2, adraft_p,
+                        adraft_prev ? "the draft before (LLAMA_SPEC_ADRAFT_PREV)" : "the draft itself", adraft_keep);
                 } else {
                     LOG_INF("%s: k19-adraft: sampled requests: MTP windows by expected tokens per ms, %d..%d drafts; greedy requests: %d drafts "
                         "(LLAMA_SPEC_ADRAFT=2; =0: off)\n", __func__, adraft_floor, this->params.n_max, adraft_keep);
@@ -2905,7 +2910,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // k19-adraft: the confidence gate (the draft below its bar is not proposed)
-                if (gated(dp) && !result.empty() && p_draft < (result.size() == 1 ? adraft_p2 : adraft_p)) {
+                if (gated(dp) && !adraft_prev && !result.empty() && p_draft < (result.size() == 1 ? adraft_p2 : adraft_p)) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -2959,6 +2964,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         n_drafting--;
                         continue;
                     }
+                } else if (gated(dp) && adraft_prev && p_draft < (result.size() == 1 ? adraft_p2 : adraft_p)) {
+                    // k19-adraft (LLAMA_SPEC_ADRAFT_PREV=1): the next draft is made only when this one clears the next one's bar
+                    drafting[seq_id] = false;
+                    n_drafting--;
+                    continue;
                 } else if (adraft_keep > 0 && !gated(dp) && (int) result.size() >= adraft_keep) {
                     // k19-adraft: a greedy request's window, as with n_max = adraft_keep
                     drafting[seq_id] = false;
