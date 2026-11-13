@@ -70,6 +70,8 @@ llama_moe_host_cache::llama_moe_host_cache(ggml_backend_buffer_type_t buft, size
         const std::vector<std::vector<size_t>> & layer_sizes, size_t chunk_size, ggml_backend_buffer_type_t buft_pageable, size_t pin_cap) :
         buft(buft), buft_pageable(buft_pageable), pin_cap(pin_cap), budget(budget), policy(policy), n_expert(n_expert), chunk_size(chunk_size ? chunk_size : (size_t) 256 << 20) {
     layer_class.assign(layer_sizes.size(), -1);
+    n_key_layer.assign(layer_sizes.size(), 0);
+    quota.assign(layer_sizes.size(), INT32_MAX);
     slot_of.resize(layer_sizes.size());
     spec_of.resize(layer_sizes.size());
     {
@@ -238,11 +240,66 @@ void llama_moe_host_cache::set_key(int32_t s, int32_t key) {
     }
     if (sl.key >= 0) {
         slot_of[sl.key / n_expert][sl.key % n_expert] = -1;
+        n_key_layer[sl.key / n_expert]--;
     }
     sl.key = key;
     if (key >= 0) {
         slot_of[key / n_expert][key % n_expert] = s;
+        n_key_layer[key / n_expert]++;
     }
+}
+
+void llama_moe_host_cache::set_layer_quota(bool on) {
+    quota_on = on;
+    std::vector<int32_t> n_layers(classes.size(), 0);
+    for (size_t il = 0; il < layer_class.size(); ++il) {
+        if (layer_class[il] >= 0) {
+            n_layers[layer_class[il]]++;
+        }
+    }
+    for (size_t il = 0; il < layer_class.size(); ++il) {
+        const int32_t c = layer_class[il];
+        quota[il] = !on || c < 0 || n_layers[c] == 0 ? INT32_MAX : (classes[c].n + n_layers[c] - 1) / n_layers[c];
+    }
+}
+
+// k19-l4held: a slot of layer il for a reservation of a layer at its quota (see set_layer_quota): a duplicate first, then an unused
+// guess, then (allow_evict) the lowest count; never a slot pinned, leased or read / written by uncommitted copies (or too recent: min_age)
+int32_t llama_moe_host_cache::quota_victim(int32_t il, bool allow_evict, uint32_t min_age, bool take_spec, const std::vector<bool> * keep) {
+    int32_t best = -1;
+    int     best_rank = INT32_MAX;
+    for (int32_t e = 0; e < n_expert; ++e) {
+        const int32_t s = slot_of[il][e];
+        if (s < 0) {
+            continue;
+        }
+        const slot_t & sl = slots[s];
+        if ((sl.state != SLOT_VALID && sl.state != SLOT_WRITING) || sl.async || sl.pin == call_epoch || sl.lease_id == plan_id ||
+                sl.read_seq == seq_next || sl.write_seq == seq_next) {
+            continue;
+        }
+        if (min_age > 0 && std::max(sl.read_seq, sl.write_seq) + min_age >= seq_next && std::max(sl.read_seq, sl.write_seq) > seq_done) {
+            continue;
+        }
+        int rank;
+        if (sl.dup) {
+            rank = 0;
+        } else if (sl.spec && take_spec) {
+            rank = 1;
+        } else if (allow_evict || (keep != nullptr && (size_t) e < keep->size() && !(*keep)[e])) {
+            rank = 2 + sl.count;
+        } else {
+            continue;
+        }
+        if (rank < best_rank) {
+            best_rank = rank;
+            best = s;
+            if (rank == 0) {
+                break;
+            }
+        }
+    }
+    return best;
 }
 
 void llama_moe_host_cache::wait_seq(uint64_t seq) {
@@ -412,7 +469,7 @@ void llama_moe_host_cache::set_dup(int32_t s, bool dup) {
     sl.dup = dup && (sl.state == SLOT_VALID || sl.state == SLOT_WRITING) ? 1 : 0;
 }
 
-int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict, uint32_t min_age, bool take_spec) {
+int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict, uint32_t min_age, bool take_spec, const std::vector<bool> * keep) {
     if (!caches(il) || slot_of[il][e] >= 0) {
         return -1;
     }
@@ -422,7 +479,40 @@ int32_t llama_moe_host_cache::reserve(int32_t il, int32_t e, bool allow_evict, u
         return -1;
     }
     int32_t s = -1;
-    if (!c.free_list.empty() || alloc_chunk(c)) {
+    // k19-l4held: a layer at its quota takes a free slot only when the layout keeps enough for the layers below theirs, else a slot of
+    // its own (see set_layer_quota)
+    if (quota_on && n_key_layer[il] >= quota[il]) {
+        int64_t deficit = 0;
+        for (size_t j = 0; j < layer_class.size(); ++j) {
+            if (layer_class[j] == layer_class[il] && n_key_layer[j] < quota[j]) {
+                deficit += quota[j] - n_key_layer[j];
+            }
+        }
+        if ((int64_t) c.free_list.size() + (c.n - c.n_alloc) > deficit && (!c.free_list.empty() || alloc_chunk(c))) {
+            s = c.free_list.back();
+            c.free_list.pop_back();
+            quota_slack++;
+        } else {
+            s = quota_victim(il, allow_evict, min_age, take_spec, keep);
+            if (s >= 0 && keep != nullptr && !allow_evict && !slots[s].dup && !slots[s].spec) {
+                quota_ranked++;
+            }
+            if (s < 0) {
+                quota_refused++;
+                st.no_slot++;
+                return -1;
+            }
+            const slot_t & v = slots[s];
+            if (v.dup) {
+                st.dup_taken++;
+            } else if (v.spec) {
+                st.spec_taken++;
+            }
+            evict(s);
+            st.evicted++;
+            quota_same++;
+        }
+    } else if (!c.free_list.empty() || alloc_chunk(c)) {
         s = c.free_list.back();
         c.free_list.pop_back();
     }

@@ -9517,6 +9517,13 @@ bool llama_context::sched_copy_all_experts(const ggml_tensor * src, const ggml_t
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
     if (!lctx->lm_seed_async || !lctx->lm_seed_active) {
+        // k19-l4held (LLAMA_MOE_PROMPT_DIAG=1): the whole callback's host time of a prompt (the diag counts only inside a prompt)
+        if (lctx->moe_cache && lctx->moe_cache->get_experts(src) != nullptr) {
+            const int64_t t0 = ggml_time_us();
+            const bool ok = sched_copy_experts_body(backend, src, dst, graph, user_data);
+            lctx->moe_cache->prompt_diag_extra(0, ggml_time_us() - t0);
+            return ok;
+        }
         return sched_copy_experts_body(backend, src, dst, graph, user_data);
     }
     if (graph != lctx->lm_copy_graph) {
@@ -9636,6 +9643,11 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
             // k19-l4ttft: the misses of every expert tensor of this layer are read now, in one batch (layers streamed through the RAM tier)
             if (lctx->moe_cache && lctx->moe_cache->get_experts(src) != nullptr) {
                 lctx->moe_cache->prompt_layer_read(backend, src, st.used);
+                // k19-l4held (LLAMA_MOE_PROMPT_RANK=1): a prompt ubatch of 256+ tokens on this path also stages the experts held
+                // nowhere that fit the layer's RAM quota, its routed misses ranked first (st.counts keeps the routing for the seed)
+                if (ids->ne[1] >= 256) {
+                    lctx->moe_cache->prompt_rank_copy(src, st.used);
+                }
             }
         }
 
@@ -9726,7 +9738,9 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
         }
     }
     if (ua) {
+        const int64_t t_ua0 = ggml_time_us();
         lctx->moe_cache->upload_ahead_wait(backend, src);
+        lctx->moe_cache->prompt_diag_extra(2, ggml_time_us() - t_ua0);
     }
     const int64_t t_up0 = ggml_time_us();
     if (!done) {
@@ -9747,13 +9761,16 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
     }
 
     // st.used: the experts staged in dst, the only ones a seed may copy into the cache
+    const int64_t t_seed0 = ggml_time_us();
     if (seed && !st.counts.empty()) {
         lctx->moe_cache->seed(backend, src, dst, st.counts, st.used);
+        lctx->moe_cache->prompt_diag_extra(1, ggml_time_us() - t_seed0);
     } else if (lctx->moe_cache_seed_prev && lctx->moe_cache->get_experts(src) != nullptr) {
         // all experts copied (prefetched): use the routing of an earlier ubatch; else the ids of this ubatch were read and only its routed experts staged
         const std::vector<int32_t> * counts = st.all ? lctx->moe_cache->get_seed_counts(src) : &st.counts;
         if (counts != nullptr && !counts->empty() && (!lctx->lm_seed_active || lctx->lm_seeded.insert(src).second)) {
             lctx->moe_cache->seed(backend, src, dst, *counts, st.used);
+            lctx->moe_cache->prompt_diag_extra(1, ggml_time_us() - t_seed0);
         }
     }
     // layer-major graph: the routing that seeds this layer may come later, the seed then copies from this copy (see lm_eval_cb)
