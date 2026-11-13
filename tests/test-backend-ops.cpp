@@ -14897,6 +14897,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
     }
 
+    // k19-dsv4next: DeepSeek-V4.1 prompt attention: 64 query heads on one K=V head of 512, sinks, prompt rows, bound = window 128 +
+    // top-k 512 finite entries per row (the CUDA sparse gather from K >= 10240 vs the CPU's dense reference)
+    for (int64_t kv : {12288, 16384}) {
+        for (int nb : {64, 131}) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 640));
+        }
+    }
+
     // k15-mm2: decode attention (vector kernel) for the KV split cap (GGML_CUDA_FA_PB_MIN_TILES / GGML_CUDA_FA_PB_MAX):
     // LFM2.5 (64, 8 KV heads x 4), Qwen3.6 / Flash-Next full attention (256, 2 x 8; 1 and 3 queries), gemma-4 26B (sliding 256 and
     // global 512), gpt-oss (64, 8 x 8, sinks)
