@@ -2138,7 +2138,7 @@ private:
                     SRV_INF("k19-depth: MTP drafts 4 in every window below position %s (LLAMA_SPEC_DEPTH_POS; LLAMA_SPEC_DEPTH=0: off)\n",
                         dp != nullptr ? dp : "12288");
                 }
-            } else if (mtp_shape && n_gpu > 0 && cache_expected && !exact_mtp && [] {
+            } else if (mtp_shape && cache_expected && !exact_mtp && [] {
                     const char * a = getenv("LLAMA_SPEC_ADRAFT");
                     return a != nullptr && atoi(a) != 0;
                 }()) {
