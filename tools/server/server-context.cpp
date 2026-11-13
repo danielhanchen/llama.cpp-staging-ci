@@ -2945,6 +2945,10 @@ private:
         });
         queue_tasks.on_idle_work([this]() {
             spec_bg_join_or_abort();
+            // k19-l4fill: the RAM tier refills the slots it freed while the server idles (the reads stop at the next batch)
+            if (ctx_tgt) {
+                llama_moe_host_fill_idle(ctx_tgt);
+            }
             // k15-ttft: the prompt-cache save that the next request's slot selection makes (get_available_slot: the slot's prompt with its
             // checkpoints, 65 MiB for a short Qwen3.6 chat, 8-19 ms on a B200 ahead of the prompt) is made here instead, as the slot went
             // idle: the same entry, saved in the same order before the next request's load. LLAMA_PCS_IDLE_SAVE=0: at the request, as

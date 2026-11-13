@@ -1309,6 +1309,54 @@ struct llama_moe_cache::impl {
         uint64_t hits = 0, misses = 0, read = 0, admitted = 0, evicted = 0, no_slot = 0, spec_taken = 0, spec_used = 0, spec_dropped = 0, done = 0;
     } hprof_last;
 
+    // k19-l4fill: the exclusive RAM tier refills the slots it freed with the experts the last prompts routed most that neither tier holds.
+    // On the exclusive tier a device admission from RAM (a promotion) frees its RAM slot, and only a device eviction copied back (a demotion)
+    // or a prompt's uploads (free slots only) fill one again: the slots the device takes back empty after a prompt (the lent slots) and
+    // the evictions RAM still held a copy of are filled by promotions with no demotion beside them. Colab L4 full card, Qwen3.8-Flash-Next
+    // UD-IQ4_XS from the VM disk: the 640-token request fills the tier (16692 slots), the chat after it starts with 1.3-1.4k free and
+    // 13.1-13.5% of the experts held nowhere instead of ~8%, and misses that share of its routing. The routing of each prompt's last large
+    // ubatch is counted (llama_context reads its recorded ids at the end of the prompt, fill_counts; older prompts halved); when the server
+    // goes idle (llama_moe_host_fill_idle), the experts with a count that are neither on the device nor in RAM are read by the weight store
+    // into free slots (or duplicates) whose memory is already allocated (never evicting, never a new pinned chunk), most routed first, as
+    // speculative reads (behind every demand read and ring read, at most LLAMA_MOE_HOST_FILL_PARALLEL (2) at once); the next batch
+    // publishes the done ones and cancels the reads that did not start. A filled slot is a guess (set_spec): until it is used any
+    // reservation takes it like a free slot, so the next prompt's reads still find room. Placement only: a slot holds the file's bytes.
+    // Not during the decode: refilled at every small batch (LLAMA_MOE_HOST_FILL=2, the first version) the reads shared the disk with the
+    // decode's misses and the demotions took the guesses again (L4 full card: 9046 reads, 20 GB per launch; chat decode 18.1-18.2 s ->
+    // 25.5-29.8 s for 256 tokens), while the chat after a 30 s idle gap found the tier full either way.
+    // LLAMA_MOE_HOST_FILL=0 off (also off with a routing profile, LLAMA_MOE_HOST_PROFILE, or the reads ahead)
+    int    fill_mode = [] { const char * e = getenv("LLAMA_MOE_HOST_FILL"); return e == nullptr ? 1 : atoi(e); }();
+    int    fill_parallel = [] { const char * e = getenv("LLAMA_MOE_HOST_FILL_PARALLEL"); return e == nullptr ? 2 : std::max(0, atoi(e)); }();
+    bool   fill_log = [] {
+        const char * a = getenv("LLAMA_MOE_HOST_FILL_LOG");
+        const char * b = getenv("LLAMA_MOE_PROMPT_DIAG");
+        return (a != nullptr && atoi(a) != 0) || (b != nullptr && atoi(b) != 0);
+    }();
+    std::vector<std::vector<float>> fill_cnt;   // [n_layer][n_expert] routing counts of the last prompts (halved per prompt)
+    std::vector<uint32_t> fill_layer_epoch;      // [n_layer] epoch whose counts the layer took (its expert tensors share one routing)
+    uint32_t fill_epoch = 0;
+    bool     fill_have = false;                  // counts were recorded
+    bool     fill_order_dirty = false;
+    std::vector<int32_t> hfill_order;            // keys (il*n_expert + e) with a count, most routed first
+    std::vector<uint64_t> fill_ticket;           // [slot] ticket of its read, 0 = none
+    std::deque<int32_t>   fill_q;                // slots with a ticket (or collected since), issue order
+    bool     fill_prev_large = false;
+    bool     fill_store_set = false;
+    struct fill_stats {
+        uint64_t issued = 0, issued_bytes = 0, done = 0, dup = 0, cancelled = 0, waited = 0, waited_us = 0, rounds = 0, failed = 0, prompts = 0, idle_rounds = 0, dup_marked = 0;
+    } fls;
+    // k19-l4fill diagnostics: where the free slots come from (exclusive tier)
+    struct slot_src_stats {
+        uint64_t prom_ev = 0;      // promotions by uploads with device evictions beside them (small batches)
+        uint64_t prom_noev = 0;    // ... without (the refill of slots that came back, uploads into empty slots)
+        uint64_t prom_seed = 0;    // promotions by a prompt's seed
+        uint64_t dem_free = 0;     // demotions into a free slot or a duplicate
+        uint64_t dem_evict = 0;    // demotions that evicted a RAM expert (or an unused guess)
+        uint64_t dem_kept = 0;     // device evictions RAM still held (no slot taken)
+        uint64_t dem_none = 0;     // demotions without a slot
+        uint64_t empty_fills = 0;  // experts uploaded into device slots that held nothing (no eviction)
+    } sss;
+
     // k19-ptres (LLAMA_MOE_CORE=1, opt-in): a never-evicted core of the device cache whose host copies are given back to the OS. With a
     // routing profile (LLAMA_MOE_CACHE_PROFILE, or kept by the cache itself in the calibration directory), the hottest experts of each
     // group are placed in its first slots at load and no lookup, assign, seed or lend ever evicts them (moe_cache_lru::set_core,
@@ -2258,11 +2306,25 @@ struct llama_moe_cache::impl {
                     }
                 }
                 n_fill += fills.size();
+                // k19-l4held: on an exclusive tier the RAM copies of the experts the device now holds (the page-cache fill at load runs
+                // first) are duplicates, the first slots a reservation takes (the layer quota counts them; LLAMA_MOE_HOST_LAYER_QUOTA=0 off)
+                // k19-l4fill: also with the refill of freed slots (LLAMA_MOE_HOST_FILL, default on): where the bench's warm read left more
+                // of the model in the page cache, 761-1254 such copies stayed in the tier to the chat after the 640-token request
+                if (host && host->exclusive() && (host_quota_mode != 0 || fill_mode != 0) && host_layer(il)) {
+                    for (const auto & f : fills) {
+                        const int32_t h = host->held(il, f.expert);
+                        if (h >= 0 && !host->is_dup(h)) {
+                            host->set_dup(h, true);
+                            n_prefill_dup++;
+                        }
+                    }
+                }
             }
         }
         if (n_fill > 0) {
             prefilled_dev = true;
-            LLAMA_LOG_INFO("%s: MoE cache prefilled with %zu experts, %.2f MiB (LLAMA_MOE_CACHE_PREFILL=0 to disable)\n", __func__, n_fill, n_bytes/1024.0/1024.0);
+            LLAMA_LOG_INFO("%s: MoE cache prefilled with %zu experts, %.2f MiB (LLAMA_MOE_CACHE_PREFILL=0 to disable)%s\n", __func__, n_fill, n_bytes/1024.0/1024.0,
+                n_prefill_dup > 0 ? (std::string("; k19-l4held: ") + std::to_string(n_prefill_dup) + " RAM copies of them marked as duplicates").c_str() : "");
         }
     }
 
@@ -3519,6 +3581,16 @@ struct llama_moe_cache::impl {
                 (unsigned long long) core_checks, (unsigned long long) core_bad, (unsigned long long) core_refused);
         }
         ua_free();
+        if (n_pad_zero > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4ttft: %llu padding pieces after uploaded runs written as zeros instead of read from the files "
+                "(LLAMA_MOE_PROMPT_PAD_ZERO=0 off)\n", tag, (unsigned long long) n_pad_zero);
+        }
+        if (plr.layers > 0 || plr.over > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4ttft: prompt layer reads: %llu layers, %llu experts, %.1f MiB in %.1f ms, %llu past the scratch "
+                "(LLAMA_MOE_PROMPT_LAYER_READ=1 opt-in)\n", tag, (unsigned long long) plr.layers, (unsigned long long) plr.experts, plr.bytes/1048576.0,
+                plr.read_us/1000.0, (unsigned long long) plr.over);
+        }
+        plr_free();
         for (const auto & [unmap, buf] : mapped) {
             unmap(buf);
         }
@@ -3862,6 +3934,18 @@ struct llama_moe_cache::impl {
         }
         tier.m = this;
         wstore->set_tier(&tier);
+        // k19-l4held: per-layer quota of the RAM tier (see llama_moe_host_cache::set_layer_quota): LLAMA_MOE_HOST_LAYER_QUOTA=1 =
+        // the exclusive tier, 2 = also the inclusive one, 0 = off (also leaves the device prefill's RAM copies unmarked, see prefill)
+        {
+            const char * eq = getenv("LLAMA_MOE_HOST_LAYER_QUOTA");
+            // default off (k19-l4held job l4h_x1: the quota left ~2.6k RAM slots empty and the chat's misses follow the share of experts held
+            // nowhere, not how they spread over the layers: 1122-1190 misses vs 765-792 without it, chat TTFT 12.1 vs 7.0 s)
+            const int    mq = eq != nullptr ? atoi(eq) : 0;
+            host_quota_mode = mq;
+            host->set_layer_quota(mq >= 2 || (mq == 1 && host->exclusive()));
+            LLAMA_LOG_INFO("%s: k19-l4held: RAM tier layer quota %s (LLAMA_MOE_HOST_LAYER_QUOTA=%d; 0 off, 1 exclusive tier, 2 both)\n", __func__,
+                host->layer_quota_on() ? "on" : "off", mq);
+        }
         // resident mode (the layout of Strata's --resident-experts): when the RAM tier and the device slots can hold every streamed
         // expert (RAM slots + device slots), the device slots are prefilled at load (unless
         // LLAMA_MOE_CACHE_PREFILL=0) and the RAM tier is filled from the model files with every expert the device does not hold, so no
@@ -4261,6 +4345,279 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // k19-l4fill (see fill_mode): the refill of the slots the exclusive tier freed
+    bool fill_active() const {
+        return fill_mode != 0 && host && host->exclusive() && wstore != nullptr && hprof_ticket.empty() && !ahead_on();
+    }
+
+    // the routing counts of a prompt's last large ubatch (llama_context, once per prompt: fill_counts_begin, then each expert tensor)
+    void fill_counts_begin() {
+        fill_epoch++;
+        if (fill_cnt.size() != layers.size()) {
+            fill_cnt.assign(layers.size(), {});
+            fill_layer_epoch.assign(layers.size(), 0);
+        }
+        for (auto & c : fill_cnt) {
+            for (float & v : c) {
+                v *= 0.5f;
+            }
+        }
+        fls.prompts++;
+    }
+
+    void fill_counts(const ggml_tensor * w, const std::vector<int32_t> & counts) {
+        const auto it = bindings.find(w);
+        if (it == bindings.end() || fill_cnt.size() != layers.size()) {
+            return;
+        }
+        const int32_t il = it->second.il;
+        if (!host_layer(il) || fill_layer_epoch[il] == fill_epoch) {
+            return;
+        }
+        fill_layer_epoch[il] = fill_epoch;
+        std::vector<float> & c = fill_cnt[il];
+        if (c.size() != counts.size()) {
+            c.assign(counts.size(), 0.0f);
+        }
+        for (size_t e = 0; e < counts.size(); ++e) {
+            c[e] += (float) counts[e];
+        }
+        fill_have = true;
+        fill_order_dirty = true;
+    }
+
+    void fill_rebuild_order() {
+        fill_order_dirty = false;
+        hfill_order.clear();
+        const int32_t ne = host->n_expert_of();
+        std::vector<std::pair<float, int32_t>> v;
+        for (int32_t il = 0; il < (int32_t) fill_cnt.size(); ++il) {
+            const std::vector<float> & c = fill_cnt[il];
+            for (int32_t e = 0; e < (int32_t) c.size() && e < ne; ++e) {
+                if (c[e] > 0.0f) {
+                    v.emplace_back(c[e], il*ne + e);
+                }
+            }
+        }
+        // most routed first; ties go to the lower layer and expert, so the order does not depend on the sort
+        std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
+        hfill_order.reserve(v.size());
+        for (const auto & p : v) {
+            hfill_order.push_back(p.second);
+        }
+    }
+
+    // a read is complete: the slot holds its expert, a guess until used (a duplicate if the device took the expert meanwhile)
+    void fill_complete(int32_t s) {
+        host->publish(s);
+        fill_ticket[s] = 0;
+        fls.done++;
+        const int32_t key = host->key(s);
+        const int32_t il  = key / host->n_expert_of();
+        const int32_t e   = key % host->n_expert_of();
+        if (in_device(il, e)) {
+            host->set_dup(s, true);
+            fls.dup++;
+        } else {
+            host->set_spec(s);
+        }
+    }
+
+    // the reads that are done publish their slots (never blocks; out of issue order: a read still running does not hold back the ones
+    // after it, which a prompt would otherwise read again)
+    void fill_reap() {
+        std::deque<int32_t> keep;
+        for (const int32_t s : fill_q) {
+            if (fill_ticket[s] == 0) {
+                continue;
+            }
+            if (wstore->host_done(fill_ticket[s])) {
+                fill_complete(s);
+            } else {
+                keep.push_back(s);
+            }
+        }
+        fill_q.swap(keep);
+    }
+
+    // the reads that did not start are cancelled (their slots are free again); the started ones complete as issued (wait_started: waited for)
+    void fill_cancel(bool wait_started) {
+        std::deque<int32_t> keep;
+        for (const int32_t s : fill_q) {
+            if (fill_ticket[s] == 0) {
+                continue;
+            }
+            if (!wstore->host_cancel(fill_ticket[s])) {
+                if (wait_started) {
+                    wstore->host_wait(fill_ticket[s]);
+                    fill_complete(s);
+                } else {
+                    keep.push_back(s);
+                }
+                continue;
+            }
+            fill_ticket[s] = 0;
+            host->abort(s);
+            fls.cancelled++;
+        }
+        fill_q.swap(keep);
+    }
+
+    void fill_stop() {
+        if (host && wstore != nullptr && !fill_q.empty()) {
+            fill_cancel(true);
+        }
+    }
+
+    // free slots (and duplicates) whose memory is allocated get the most routed experts that neither tier holds
+    void fill_issue() {
+        if (!fill_have) {
+            return;
+        }
+        if (fill_order_dirty) {
+            fill_rebuild_order();
+        }
+        if (fill_ticket.size() != (size_t) host->n_slots()) {
+            fill_ticket.assign(host->n_slots(), 0);
+        }
+        if (!fill_store_set) {
+            wstore->set_spec_parallel(fill_parallel);
+            fill_store_set = true;
+        }
+        fls.rounds++;
+        const int32_t ne = host->n_expert_of();
+        // RAM copies of experts the device also holds that are not marked as duplicates (the page-cache fill at load copies whatever the
+        // page cache holds, also experts of the device prefill: Colab L4 VMs whose page cache kept more of the model after the drop started
+        // the chat with 761-1254 of them instead of ~236, and missed 908-910 experts instead of ~780) are marked: they go first, like free slots
+        for (int32_t il = 0; il < (int32_t) layers.size(); ++il) {
+            if (!host_layer(il) || layers[il].experts.empty()) {
+                continue;
+            }
+            for (int32_t e = 0; e < (int32_t) layers[il].experts[0]->ne[2]; ++e) {
+                const int32_t s = host->held(il, e);
+                if (s >= 0 && !host->is_dup(s) && !host->is_async(s) && in_device(il, e)) {
+                    host->set_dup(s, true);
+                    fls.dup_marked++;
+                }
+            }
+        }
+        std::vector<char> full(layers.size(), 0);
+        std::vector<llama_weight_store::host_read> rd;
+        for (const int32_t key : hfill_order) {
+            const int32_t il = key / ne;
+            const int32_t e  = key % ne;
+            if (full[il] || !host_layer(il) || in_device(il, e) || host->contains(il, e)) {
+                continue;
+            }
+            if (!host->can_take_alloc(il)) {
+                full[il] = 1;
+                continue;
+            }
+            const int32_t s = host->reserve(il, e, false, 0, false);
+            if (s < 0) {
+                full[il] = 1;
+                continue;
+            }
+            const layer & l = layers[il];
+            rd.clear();
+            size_t nb = 0;
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                const ggml_tensor * w = l.experts[ip];
+                rd.push_back({ w, (size_t) e*w->nb[2], w->nb[2], host->area(s, (int) ip), 0 });
+                nb += w->nb[2];
+            }
+            const uint64_t t = wstore->read_host_async(rd.data(), rd.size(), true);
+            if (t == 0) {
+                host->abort(s);
+                fls.failed++;
+                continue;
+            }
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                host->set_lead(s, (int) ip, rd[ip].lead);
+            }
+            host->set_async(s, 1);
+            fill_ticket[s] = t;
+            fill_q.push_back(s);
+            fls.issued++;
+            fls.issued_bytes += nb;
+        }
+    }
+
+    // at a lookup of layer il: its routed experts that are being read are waited for (their reads go first)
+    void fill_wait_routed(int32_t il) {
+        for (const int32_t e : ids) {
+            if (e < 0) {
+                continue;
+            }
+            const int32_t s = host->slot_of_key(il, e);
+            if (s < 0 || (size_t) s >= fill_ticket.size() || fill_ticket[s] == 0) {
+                continue;
+            }
+            if (!wstore->host_done(fill_ticket[s])) {
+                const int64_t t0 = ggml_time_us();
+                wstore->host_wait(fill_ticket[s]);
+                fls.waited_us += ggml_time_us() - t0;
+                fls.waited++;
+            }
+            fill_complete(s);
+        }
+    }
+
+    void fill_diag(const char * when) {
+        const int32_t n_slots = host->n_slots();
+        const int32_t n_free  = host->n_free();
+        const int32_t n_fill  = host->n_filling();
+        LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4fill RAM tier at %s: %d held (%d duplicates of device experts, %zu unused guesses), %d free, %d being "
+            "filled, of %d slots; since load: promoted %llu with device evictions / %llu without / %llu by seeds, uploads into empty device slots %llu, "
+            "demoted %llu into free slots or duplicates / %llu evicting / %llu kept (RAM held them) / %llu without a slot, admitted from prompts %llu, "
+            "page-cache fill %llu; fill %s: %llu read, %llu done (%llu duplicates), %llu cancelled, %llu waited for (%.1f ms), %.1f MiB\n",
+            tag, when, n_slots - n_free - n_fill, host->n_dup_slots(), host->n_spec_slots(), n_free, n_fill, n_slots,
+            (unsigned long long) sss.prom_ev, (unsigned long long) sss.prom_noev, (unsigned long long) sss.prom_seed, (unsigned long long) sss.empty_fills,
+            (unsigned long long) sss.dem_free, (unsigned long long) sss.dem_evict, (unsigned long long) sss.dem_kept, (unsigned long long) sss.dem_none,
+            (unsigned long long) hst.admitted, (unsigned long long) hst.prefilled, fill_active() ? "on" : "off",
+            (unsigned long long) fls.issued, (unsigned long long) fls.done, (unsigned long long) fls.dup, (unsigned long long) fls.cancelled,
+            (unsigned long long) fls.waited, fls.waited_us/1000.0, fls.issued_bytes/1048576.0);
+    }
+
+    // the batch hook (prepare): the done reads publish their slots; LLAMA_MOE_HOST_FILL=1 (default): every batch cancels the reads that did
+    // not start (they run between requests only, see fill_idle); =2: also issued at every small batch after a prompt (the decode), a
+    // large batch cancels them
+    void fill_prepare(int64_t n_tokens) {
+        const bool large = n_tokens > n_small_max;
+        const bool on = fill_active();
+        if (on && !fill_q.empty()) {
+            fill_reap();
+        }
+        if (fill_log && large != fill_prev_large) {
+            fill_diag(large ? "a request's first large batch" : "the first small batch after a prompt");
+        }
+        if (on) {
+            if ((large || fill_mode == 1) && !fill_q.empty()) {
+                fill_cancel(false);
+            }
+            if (!large && fill_mode >= 2) {
+                fill_issue();
+            }
+        }
+        fill_prev_large = large;
+    }
+
+    // the server is idle (no request runs, none waits): the freed slots are refilled now, the reads run until the next batch
+    void fill_idle() {
+        if (!fill_active()) {
+            return;
+        }
+        if (!fill_q.empty()) {
+            fill_reap();
+        }
+        const uint64_t n0 = fls.issued;
+        fill_issue();
+        fls.idle_rounds++;
+        if (fill_log && fls.issued > n0) {
+            fill_diag("the server's idle point (refill issued)");
+        }
+    }
+
     // the experts whose pages are in the page cache (e.g. read while loading) are copied into free slots: pinning the slots would
     // otherwise evict those pages and the first prompt would read them again (LLAMA_MOE_HOST_CACHE_PREFILL=0 off)
     void prefill_resident() {
@@ -4280,6 +4637,12 @@ struct llama_moe_cache::impl {
         // (readahead of each layer's expert tensors first), skipping the experts the device slots hold: with the device cache prefilled
         // (LLAMA_MOE_CACHE_PREFILL=1) the first prompt then reads nothing from the files when RAM + VRAM hold every expert (low-RAM boxes)
         const bool from_file = (env_pf != nullptr && atoi(env_pf) >= 2) || resident_mode;
+        // k19-l4ttft (LLAMA_MOE_HOST_PREFILL_GUESS=1, opt-in): what the page cache held at load is not a choice (whatever the load read),
+        // so the experts copied from it are marked as unused guesses (set_spec, as the routing profile's): a prompt whose copies read
+        // only the experts it routes (GGML_SCHED_PREFETCH_MIN_BATCH) then keeps its reads in the slots of the ones it did not use when
+        // no slot is free. Placement only (what a slot holds is the expert's bytes); exclusive tier only
+        static const bool guess = [] { const char * e = getenv("LLAMA_MOE_HOST_PREFILL_GUESS"); return e != nullptr && atoi(e) != 0; }();
+        const bool mark = guess && !from_file && host->exclusive();
         const int64_t t0 = ggml_time_us();
         size_t n_file = 0;
         const size_t pg = (size_t) std::max(4096L, sysconf(_SC_PAGESIZE));
@@ -4342,6 +4705,10 @@ struct llama_moe_cache::impl {
                     }
                     const int32_t s = host->reserve(il, e, false);
                     if (s < 0) {
+                        // k19-l4held: this layer is at its quota, the next layer may still take slots
+                        if (host->at_quota(il)) {
+                            break;
+                        }
                         // the slots of this layer's expert layout are used up; the file fill goes on with the layers of the other
                         // layouts (Flash-Next IQ2_XS has three: stopping at the first full one left 3137 RAM slots empty)
                         full = !from_file;
@@ -4354,6 +4721,9 @@ struct llama_moe_cache::impl {
                         n_bytes += w->nb[2];
                     }
                     host->publish(s);
+                    if (mark) {
+                        host->set_spec(s);
+                    }
                     n_fill++;
                     n_file += file ? 1 : 0;
                 }
@@ -4361,8 +4731,8 @@ struct llama_moe_cache::impl {
         }
         hst.prefilled = n_fill + n_prof;
         LLAMA_LOG_INFO("%s: MoE host cache: %zu experts (%.1f MiB) copied from the page cache into RAM slots in %.1f ms, %zu of them read from the files"
-                " (LLAMA_MOE_HOST_CACHE_PREFILL=0 off, 2 also reads the experts that are not in the page cache)\n",
-                __func__, n_fill, n_bytes/1048576.0, (ggml_time_us() - t0)/1000.0, n_file);
+                " (LLAMA_MOE_HOST_CACHE_PREFILL=0 off, 2 also reads the experts that are not in the page cache)%s\n",
+                __func__, n_fill, n_bytes/1048576.0, (ggml_time_us() - t0)/1000.0, n_file, mark ? "; k19-l4ttft: marked as guesses" : "");
 #endif
     }
 
@@ -5623,6 +5993,15 @@ struct llama_moe_cache::impl {
         }
     }
 
+    int    host_quota_mode = 1;   // k19-l4held: LLAMA_MOE_HOST_LAYER_QUOTA
+    size_t n_prefill_dup   = 0;   // k19-l4held: RAM copies of device-prefilled experts marked as duplicates
+
+    static bool pad_zero_on() {
+        static const bool on = [] { const char * e = getenv("LLAMA_MOE_PROMPT_PAD_ZERO"); return e == nullptr || atoi(e) != 0; }();
+        return on;
+    }
+    uint64_t n_pad_zero = 0;
+
     void tier_runs(const ggml_tensor * src, size_t off, size_t size, bool lease, std::vector<llama_weight_tier::run> & out) {
         const auto it = bindings.find(src);
         if (it == bindings.end() || !host_layer(it->second.il)) {
@@ -5637,7 +6016,28 @@ struct llama_moe_cache::impl {
             const int32_t e  = (int32_t) (o / nb);
             const size_t  e1 = std::min(end, (size_t) (e + 1)*nb);
             // planning (under the store lock) does not wait for copies back into RAM, the upload does
+            // k19-l4ttft: the experts the prompt layer read put in the scratch (uploads only)
+            const uint8_t * pp = !lease && e < src->ne[2] ? plr_find(il, ip, e, o - (size_t) e*nb) : nullptr;
+            if (pp != nullptr) {
+                // the RAM tier is offered these bytes as the upload of a demand read offered them (same call, same order)
+                tier_offer(src, o, e1 - o, pp);
+                out.push_back({ o, e1 - o, pp, false });
+                o = e1;
+                continue;
+            }
             const int32_t sl = e >= src->ne[2] ? -1 : lease ? host->held(il, e) : host->find(il, e, false);
+            // k19-l4ttft (LLAMA_MOE_PROMPT_PAD_ZERO, default 1; 0 = read them): the copy of a run of routed experts ends with the first
+            // min(expert, 512) bytes of the next expert, which the prompt does not route, as padding for the CUDA MMQ kernels (they read
+            // past the last row of an expert: the bytes only have to be finite). Where neither RAM nor the scratch holds that expert, the
+            // upload read them from the file: one 4 KiB read per run end, ~3900 per 42-token chat on the L4 disk tier (~1.1 s of its TTFT).
+            // Zeros instead (a zero block is finite in every quant type); nothing is offered to the tier for them
+            if (!lease && sl < 0 && pad_zero_on() && e < src->ne[2] && o == (size_t) e*nb && end - o <= 512 && end - o < nb) {
+                static const uint8_t zeros[512] = {};
+                out.push_back({ o, end - o, zeros, false });
+                n_pad_zero++;
+                o = end;
+                continue;
+            }
             if (sl >= 0) {
                 if (lease) {
                     host->lease(sl);
@@ -5696,13 +6096,387 @@ struct llama_moe_cache::impl {
                 sl = host->find(il, e, false) >= 0 ? -1 : host->slot_of_key(il, e);
             } else if (ip == 0 && a == 0 && (e1 - o == nb || e1 - o > 512) && (!host->exclusive() || !in_device(il, e))) {
                 // not from the bytes of padding uploaded after a run of experts (min(expert, 512)): that expert is not uploaded
-                sl = host->reserve(il, e, false);
+                // k19-l4held rank mode: an expert the prompt routes may take the slot of an unrouted one of its layer at the quota
+                const std::vector<bool> * rk = rank_any && (size_t) il < rank_mask.size() && (int32_t) rank_mask[il].size() > e &&
+                    rank_mask[il][e] ? &rank_mask[il] : nullptr;
+                sl = host->reserve(il, e, false, 0, true, rk);
             }
             if (sl >= 0 && host->filling(sl) && host->fill_piece(sl, ip, a, p + (o - off), e1 - o)) {
                 hst.admitted++;
             }
             o = e1;
         }
+    }
+
+    // k19-l4ttft: prompt layer reads (LLAMA_MOE_PROMPT_LAYER_READ=1, opt-in: measured no faster on the L4 disk tier, chat TTFT 8.32 vs 6.81 s
+    // median with it off, and its pinned scratch cost the 8k after it 103 vs 87 s; the per-byte read rate is the loop device's either way). A prompt ubatch whose expert copies read the routing (the copy callback's routed-only path, ubatches below the
+    // prefetch size) used to read each expert tensor's misses on its own when its split started: the reads of the gate, up and down
+    // tensors of a layer were three waits with the device work between them, the disk idle in between. Colab L4 full card, Qwen3.8-Flash-Next
+    // UD-IQ4_XS from the VM disk (k19_l4ttft): the 42-token chat read 1.5-1.8 GB in 8.3-8.8 s with the disk busy 64-69% of it. Here
+    // the copy of the layer's first expert tensor (the one that reads the routing) reads the routed experts of the layer that neither the
+    // device slots nor the RAM tier hold, every expert tensor of each, in one batch into a pinned scratch (unbuffered, the store's IO
+    // threads); the copies of all of the layer's expert tensors then upload those experts from it (tier_runs returns the scratch as held
+    // bytes). The same bytes as the reads they replace, and each upload from the scratch offers them to the RAM tier as the upload of
+    // a demand read did (free slots only, the same calls in the same order), so what each tier holds is unchanged: placement and text
+    // as without it.
+    // Scratch LLAMA_MOE_PROMPT_LAYER_READ_MIB (512), pinned at the first use only if llama_sysmem::available_reclaimable() keeps
+    // LLAMA_MOE_PROMPT_LAYER_READ_FLOOR_MIB (4096) after it, else pageable; experts past it take the old per-tensor path.
+    // LLAMA_MOE_PROMPT_DIAG=1 (log only): one line per prompt with the routed / device / RAM / read experts and the read time per layer
+    struct plr_t {
+        ggml_backend_buffer_t buf = nullptr;
+        std::vector<uint8_t> pageable; // when the pinned scratch was refused
+        uint8_t * base = nullptr;
+        size_t    size = 0;
+        bool      tried = false;
+        int32_t   il = -1;                    // the layer the scratch holds
+        std::vector<std::vector<int64_t>> off; // [ip][e] offset of the expert's bytes in the scratch, -1 none
+        std::vector<int32_t> filled;          // experts of il in the scratch
+        // per prompt (diag) and per process
+        uint64_t p_layers = 0, p_used = 0, p_dev = 0, p_ram = 0, p_miss = 0, p_read = 0, p_over = 0, p_bytes = 0, p_us = 0;
+        std::vector<int32_t> p_miss_layer;
+        int64_t  p_t0 = 0;
+        uint64_t p_sync_us = 0, p_up_us = 0, p_ncopy = 0; // host time in the routing reads (device work before them) and the copies' issue
+        uint64_t p_x_us[3] = { 0, 0, 0 };                  // k19-l4held: whole copy callbacks, seeds, upload-ahead waits
+        llama_weight_store::stats p_ws;                    // the store's counters at the first layer
+        uint64_t layers = 0, experts = 0, bytes = 0, read_us = 0, over = 0, prompts = 0;
+    } plr;
+    static int plr_mode() {
+        static const int m = [] { const char * e = getenv("LLAMA_MOE_PROMPT_LAYER_READ"); return e == nullptr ? 0 : atoi(e); }();
+        return m;
+    }
+    static bool plr_diag() {
+        static const bool d = [] { const char * e = getenv("LLAMA_MOE_PROMPT_DIAG"); return e != nullptr && atoi(e) != 0; }();
+        return d;
+    }
+
+    bool plr_alloc(ggml_backend_t backend) {
+        if (plr.tried) {
+            return plr.base != nullptr;
+        }
+        plr.tried = true;
+        const char * em = getenv("LLAMA_MOE_PROMPT_LAYER_READ_MIB");
+        const char * ef = getenv("LLAMA_MOE_PROMPT_LAYER_READ_FLOOR_MIB");
+        const size_t want  = (size_t) std::max<int64_t>(16, em != nullptr ? atoll(em) : 512) << 20;
+        const size_t floor = (size_t) std::max<int64_t>(0, ef != nullptr ? atoll(ef) : 4096) << 20;
+        const uint64_t recl = llama_sysmem::available_reclaimable();
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_buffer_type_t hb = dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        if (hb != nullptr && recl >= want + floor) {
+            plr.buf = ggml_backend_buft_alloc_buffer(hb, want);
+        }
+        if (plr.buf != nullptr) {
+            plr.base = (uint8_t *) ggml_backend_buffer_get_base(plr.buf);
+            plr.size = want;
+        } else if (recl >= want + floor / 2) {
+            // pageable: slower uploads, but still one batch of reads per layer
+            plr.pageable.resize(want + 4096);
+            plr.base = (uint8_t *) (((uintptr_t) plr.pageable.data() + 4095) & ~(uintptr_t) 4095);
+            plr.size = want;
+        }
+        LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4ttft: prompt layer reads: %s (%.0f MiB scratch, %.0f MiB reclaimable, floor %.0f MiB; "
+            "LLAMA_MOE_PROMPT_LAYER_READ=1 opt-in)\n", tag, plr.base == nullptr ? "off, no room" : plr.buf != nullptr ? "on, pinned" : "on, pageable",
+            want/1048576.0, recl/1048576.0, floor/1048576.0);
+        return plr.base != nullptr;
+    }
+
+    void plr_free() {
+        if (plr.buf != nullptr) {
+            ggml_backend_buffer_free(plr.buf);
+            plr.buf = nullptr;
+        }
+        plr.pageable.clear();
+        plr.pageable.shrink_to_fit();
+        plr.base = nullptr;
+        plr.il   = -1;
+    }
+
+    void plr_clear() {
+        if (plr.il < 0) {
+            return;
+        }
+        for (auto & v : plr.off) {
+            for (int32_t e : plr.filled) {
+                v[e] = -1;
+            }
+        }
+        plr.filled.clear();
+        plr.il = -1;
+    }
+
+    // the scratch bytes [o, o + n) of expert tensor ip of layer il, nullptr if the scratch does not hold that expert
+    const uint8_t * plr_find(int32_t il, int ip, int32_t e, size_t a) const {
+        if (plr.il != il || ip < 0 || ip >= (int) plr.off.size() || e < 0 || e >= (int32_t) plr.off[ip].size() || plr.off[ip][e] < 0) {
+            return nullptr;
+        }
+        return plr.base + plr.off[ip][e] + a;
+    }
+
+    // k19-l4held rank mode (see llama_moe_cache::prompt_rank_copy)
+    std::vector<std::vector<bool>> rank_mask; // [il] experts the current ubatch routes (empty: none)
+    bool     rank_any = false;
+    uint64_t rank_layers = 0, rank_routed = 0, rank_extra = 0, rank_skipped = 0;
+    static int rank_mode() {
+        static const int m = [] { const char * e = getenv("LLAMA_MOE_PROMPT_RANK"); return e == nullptr ? 0 : atoi(e); }();
+        return m;
+    }
+    void rank_clear() {
+        if (rank_any) {
+            for (auto & m : rank_mask) {
+                m.clear();
+            }
+            rank_any = false;
+        }
+    }
+    bool prompt_rank_copy(const ggml_tensor * w, std::vector<bool> & used) {
+        if (rank_mode() == 0 || !host) {
+            return false;
+        }
+        const auto it = bindings.find(w);
+        if (it == bindings.end() || !host_layer(it->second.il)) {
+            return false;
+        }
+        const int32_t il = it->second.il;
+        const int32_t n_expert = (int32_t) w->ne[2];
+        if ((int32_t) used.size() != n_expert) {
+            return false;
+        }
+        if (rank_mask.size() != layers.size()) {
+            rank_mask.resize(layers.size());
+        }
+        rank_mask[il] = used;
+        rank_any = true;
+        // the layer's room under its quota goes to the routed experts held nowhere first, then to the unrouted ones (lowest ids)
+        int64_t room = host->layer_quota_on() ? (int64_t) host->quota_of(il) - host->n_keys_of(il) : INT64_MAX/2;
+        int64_t n_routed_miss = 0;
+        for (int32_t e = 0; e < n_expert; ++e) {
+            if (used[e] && !in_device(il, e) && !host->contains(il, e)) {
+                n_routed_miss++;
+            }
+        }
+        int64_t extra = room - n_routed_miss;
+        for (int32_t e = 0; e < n_expert; ++e) {
+            if (used[e] || in_device(il, e) || host->contains(il, e)) {
+                continue;
+            }
+            if (extra > 0) {
+                used[e] = true;
+                extra--;
+                rank_extra++;
+            } else {
+                rank_skipped++;
+            }
+        }
+        rank_layers++;
+        rank_routed += n_routed_miss;
+        return true;
+    }
+
+    void prompt_layer_read(ggml_backend_t backend, const ggml_tensor * w, const std::vector<bool> & used) {
+        const int mode = plr_mode();
+        const bool diag = plr_diag();
+        if ((mode == 0 && !diag) || wstore == nullptr) {
+            return;
+        }
+        const auto it = bindings.find(w);
+        if (it == bindings.end() || !host_layer(it->second.il)) {
+            return;
+        }
+        const int32_t il = it->second.il;
+        const layer & l = layers[il];
+        const int32_t n_expert = (int32_t) w->ne[2];
+        if ((int32_t) used.size() != n_expert) {
+            return;
+        }
+        if (plr.p_t0 == 0) {
+            plr.p_t0 = ggml_time_us();
+            plr.p_ws = wstore->get_stats();
+            plr.p_miss_layer.assign(layers.size(), -1);
+            // k19-l4held: the RAM tier as the prompt finds it (free slots, duplicates of device-held experts)
+            if (diag && host) {
+                uint64_t n_dup = 0, n_held = 0;
+                for (size_t jl = 0; jl < layers.size(); ++jl) {
+                    if (!host_layer((int32_t) jl) || layers[jl].experts.empty()) {
+                        continue;
+                    }
+                    for (int32_t e = 0; e < (int32_t) layers[jl].experts[0]->ne[2]; ++e) {
+                        const bool r = host->held((int32_t) jl, e) >= 0;
+                        n_held += r;
+                        n_dup  += r && in_device((int32_t) jl, e);
+                    }
+                }
+                LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4held prompt start: RAM tier %llu held (%llu also on the device) of %d slots, %d free\n", tag,
+                    (unsigned long long) n_held, (unsigned long long) n_dup, host->n_slots(), host->n_free());
+            }
+        }
+        std::vector<int32_t> miss;
+        uint64_t n_used = 0, n_dev = 0, n_ram = 0;
+        for (int32_t e = 0; e < n_expert; ++e) {
+            if (!used[e]) {
+                continue;
+            }
+            n_used++;
+            if (in_device(il, e)) {
+                n_dev++;
+            } else if (host->contains(il, e)) {
+                n_ram++;
+            } else {
+                miss.push_back(e);
+            }
+        }
+        plr.p_layers++;
+        plr.p_used += n_used;
+        plr.p_dev  += n_dev;
+        plr.p_ram  += n_ram;
+        plr.p_miss += miss.size();
+        if (il < (int32_t) plr.p_miss_layer.size()) {
+            plr.p_miss_layer[il] = (int32_t) miss.size();
+        }
+        if (mode == 0 || miss.empty()) {
+            plr_clear();
+            return;
+        }
+        if (!plr_alloc(backend)) {
+            return;
+        }
+        // the uploads from the scratch of the previous layer were queued on this stream (the routing read synchronized it already)
+        ggml_backend_synchronize(backend);
+        plr_clear();
+        if (plr.off.size() < l.experts.size()) {
+            plr.off.resize(l.experts.size());
+        }
+        for (auto & v : plr.off) {
+            if ((int32_t) v.size() < n_expert) {
+                v.assign(n_expert, -1);
+            }
+        }
+        std::vector<llama_weight_store::host_read> rd;
+        rd.reserve(miss.size()*l.experts.size());
+        size_t pos = 0;
+        size_t n_fit = 0;
+        for (int32_t e : miss) {
+            size_t need = 0;
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                need += (l.experts[ip]->nb[2] + 8192 + 4095) & ~(size_t) 4095;
+            }
+            if (pos + need > plr.size) {
+                break;
+            }
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                const ggml_tensor * t = l.experts[ip];
+                const size_t nb = t->nb[2];
+                rd.push_back({ t, (size_t) e*nb, nb, plr.base + pos, 0 });
+                pos += (nb + 8192 + 4095) & ~(size_t) 4095;
+            }
+            n_fit++;
+        }
+        plr.p_over += miss.size() - n_fit;
+        plr.over   += miss.size() - n_fit;
+        if (n_fit == 0) {
+            return;
+        }
+        const int64_t t0 = ggml_time_us();
+        if (!wstore->read_host(rd.data(), rd.size(), true)) {
+            return; // nothing held: the copies read on demand as before
+        }
+        const int64_t dt = ggml_time_us() - t0;
+        size_t k = 0;
+        uint64_t bytes = 0;
+        for (size_t i = 0; i < n_fit; ++i) {
+            const int32_t e = miss[i];
+            for (size_t ip = 0; ip < l.experts.size(); ++ip, ++k) {
+                plr.off[ip][e] = (int64_t) (rd[k].area - plr.base) + (int64_t) rd[k].lead;
+                bytes += rd[k].size;
+            }
+            plr.filled.push_back(e);
+        }
+        plr.il = il;
+        plr.p_read  += n_fit;
+        plr.p_bytes += bytes;
+        plr.p_us    += dt;
+        plr.layers++;
+        plr.experts += n_fit;
+        plr.bytes   += bytes;
+        plr.read_us += dt;
+    }
+
+    // the copy callback's host time of a prompt ubatch's expert tensor: the routing read (sync_us: waits for the device work queued
+    // before it) and the copies' issue (up_us: the plan, the RAM uploads and the per-tensor demand reads), LLAMA_MOE_PROMPT_DIAG only
+    void prompt_diag_time(int64_t sync_us, int64_t up_us) {
+        if (plr.p_t0 == 0) {
+            return;
+        }
+        plr.p_sync_us += sync_us;
+        plr.p_up_us   += up_us;
+        plr.p_ncopy++;
+    }
+    void prompt_diag_extra(int k, int64_t us) {
+        if (plr.p_t0 == 0 || k < 0 || k > 2) {
+            return;
+        }
+        plr.p_x_us[k] += us;
+    }
+
+    // the end of a prompt (the first small batch after large ones): the scratch is dropped, the diagnostic line
+    void plr_prompt_end() {
+        plr_clear();
+        if (plr.p_t0 == 0) {
+            return;
+        }
+        plr.prompts++;
+        if (plr_diag()) {
+            std::string ml;
+            for (size_t il = 0; il < plr.p_miss_layer.size(); ++il) {
+                if (plr.p_miss_layer[il] >= 0) {
+                    ml += (ml.empty() ? "" : " ") + std::to_string(plr.p_miss_layer[il]);
+                }
+            }
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4ttft prompt %llu: %llu layers, routed %llu = device %llu + RAM %llu + missing %llu; read in layer "
+                "batches %llu experts (%.1f MiB) in %.1f ms, %llu past the scratch; %.1f ms since the first layer; missing per layer: %s\n", tag,
+                (unsigned long long) plr.prompts, (unsigned long long) plr.p_layers, (unsigned long long) plr.p_used, (unsigned long long) plr.p_dev,
+                (unsigned long long) plr.p_ram, (unsigned long long) plr.p_miss, (unsigned long long) plr.p_read, plr.p_bytes/1048576.0, plr.p_us/1000.0,
+                (unsigned long long) plr.p_over, (ggml_time_us() - plr.p_t0)/1000.0, ml.c_str());
+            const llama_weight_store::stats w = wstore != nullptr ? wstore->get_stats() : plr.p_ws;
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4ttft prompt %llu: %llu copies: routing reads waited %.1f ms, copies issued in %.1f ms; store: "
+                "%.1f MiB uploaded from the RAM tier, %.1f MiB demand reads (%llu regions), %.1f MiB host reads, %.1f MiB ring reads, waited %.1f ms\n", tag,
+                (unsigned long long) plr.prompts, (unsigned long long) plr.p_ncopy, plr.p_sync_us/1000.0, plr.p_up_us/1000.0,
+                (w.tier_uploaded - plr.p_ws.tier_uploaded)/1048576.0, (w.demand_bytes - plr.p_ws.demand_bytes)/1048576.0,
+                (unsigned long long) (w.demand_regions - plr.p_ws.demand_regions), (w.host_read_bytes - plr.p_ws.host_read_bytes)/1048576.0,
+                (w.plan_bytes - plr.p_ws.plan_bytes)/1048576.0, (w.wait_us - plr.p_ws.wait_us)/1000.0);
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4held prompt %llu: copy callbacks %.1f ms in all, seeds %.1f ms, upload-ahead %.1f ms\n", tag,
+                (unsigned long long) plr.prompts, plr.p_x_us[0]/1000.0, plr.p_x_us[1]/1000.0, plr.p_x_us[2]/1000.0);
+            // where the experts are after the prompt: device / RAM / both / neither, per layer (neither) and the layer quota's counters
+            if (host) {
+                uint64_t n_d = 0, n_r = 0, n_b = 0, n_n = 0;
+                std::string nl, rl;
+                for (size_t il = 0; il < layers.size(); ++il) {
+                    if (!host_layer((int32_t) il) || layers[il].experts.empty()) {
+                        continue;
+                    }
+                    const int32_t ne = (int32_t) layers[il].experts[0]->ne[2];
+                    int32_t none = 0, ram = 0;
+                    for (int32_t e = 0; e < ne; ++e) {
+                        const bool d = in_device((int32_t) il, e);
+                        const bool r = host->held((int32_t) il, e) >= 0;
+                        n_d += d && !r; n_r += r && !d; n_b += d && r; n_n += !d && !r;
+                        none += !d && !r;
+                        ram  += r;
+                    }
+                    nl += (nl.empty() ? "" : " ") + std::to_string(none);
+                    rl += (rl.empty() ? "" : " ") + std::to_string(ram);
+                }
+                LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4held prompt %llu: held after it: device only %llu, RAM only %llu, both %llu, neither %llu; "
+                    "quota %s (refused %llu, same-layer %llu (%llu ranked), slack %llu); rank mode: %llu layers, %llu routed misses, %llu extra staged, %llu not staged; "
+                    "neither per layer: %s; RAM per layer: %s\n", tag, (unsigned long long) plr.prompts,
+                    (unsigned long long) n_d, (unsigned long long) n_r, (unsigned long long) n_b, (unsigned long long) n_n,
+                    host->layer_quota_on() ? "on" : "off", (unsigned long long) host->quota_refused, (unsigned long long) host->quota_same,
+                    (unsigned long long) host->quota_ranked, (unsigned long long) host->quota_slack, (unsigned long long) rank_layers,
+                    (unsigned long long) rank_routed, (unsigned long long) rank_extra, (unsigned long long) rank_skipped, nl.c_str(), rl.c_str());
+            }
+        }
+        plr.p_x_us[0] = plr.p_x_us[1] = plr.p_x_us[2] = 0;
+        plr.p_sync_us = plr.p_up_us = plr.p_ncopy = 0;
+        plr.p_layers = plr.p_used = plr.p_dev = plr.p_ram = plr.p_miss = plr.p_read = plr.p_over = plr.p_bytes = plr.p_us = 0;
+        plr.p_t0 = 0;
     }
 
     // exclusive: the experts evicted from device slots are copied back into RAM before the slots are overwritten (same backend, in order)
@@ -5716,6 +6490,7 @@ struct llama_moe_cache::impl {
             }
             if (host->contains(il, e)) {
                 // RAM kept a copy when it was promoted: now its only copy, no copy back
+                sss.dem_kept++;
                 const int32_t h = host->held(il, e);
                 if (h >= 0) {
                     host->set_dup(h, false);
@@ -5737,10 +6512,19 @@ struct llama_moe_cache::impl {
                 }
                 continue;
             }
-            const int32_t r = host->reserve(il, e);
+            // k19-l4held rank mode: at the layer's quota the copy back takes an expert the prompt does not route first
+            const std::vector<bool> * rk = rank_any && (size_t) il < rank_mask.size() && (int32_t) rank_mask[il].size() > e ? &rank_mask[il] : nullptr;
+            const uint64_t ev0 = host->st.evicted - host->st.dup_taken;
+            const int32_t r = host->reserve(il, e, true, 0, true, rk);
             if (r < 0) {
                 hst.demote_skip++;
+                sss.dem_none++;
                 continue;
+            }
+            if (host->st.evicted - host->st.dup_taken > ev0) {
+                sss.dem_evict++;
+            } else {
+                sss.dem_free++;
             }
             const layer & l = layers[il];
             for (size_t ip = 0; ip < l.experts.size(); ++ip) {
@@ -5788,6 +6572,7 @@ struct llama_moe_cache::impl {
         size_t bytes = 0;
         const std::vector<moe_cache_lru::fill> * rest = &fl;
         if (host_layer(il)) {
+            sss.empty_fills += fl.size() > (ev != nullptr ? ev->size() : 0) ? fl.size() - (ev != nullptr ? ev->size() : 0) : 0;
             fills_rest.clear();
             host_reads.clear();
             host_pending.clear();
@@ -5833,6 +6618,11 @@ struct llama_moe_cache::impl {
                             host->release(s);
                         }
                         hst.promoted++;
+                        if (ev != nullptr) {
+                            sss.prom_ev++;
+                        } else {
+                            sss.prom_noev++;
+                        }
                     }
                     continue;
                 }
@@ -5930,14 +6720,39 @@ struct llama_moe_cache::impl {
     }
 
     // the device slots that are lent (or overwritten by a seed) lose their experts: the RAM tier keeps a copy (synchronous, once per prompt)
-    void shadow_slots(ggml_backend_t backend, group & g, const std::vector<std::pair<int32_t, int32_t>> & ev) {
+    // k19-l4held (LLAMA_MOE_SHADOW_ASYNC=1, opt-in; unset: synchronous, as before): the copies back are queued on backend (the stream that then writes
+    // the device slots, so each copy reads the slot before it is overwritten) and the RAM slots are published when they complete (mark_write
+    // + commit, as demote does) instead of a device sync and one synchronous copy per expert tensor. A prompt that seeds the device slots
+    // of an exclusive tier (the 42-token chat on the Colab L4 full card: ~90 evictions per layer) waited for each layer's device work and
+    // then ~270 synchronous 2-3 MB copies per layer
+    // opt-in (LLAMA_MOE_SHADOW_ASYNC=1): Colab L4 full card, fn4nd chat after the 640-token request (job l4h_c2, 3 launches each, md5 equal):
+    // seeds 47-102 ms vs 1090-1103 ms synchronous, but chat TTFT 8.70 [7.40-9.43] vs 7.44 [7.34-9.03] s: in 2 of 3 launches the RAM tier
+    // held 785-1004 duplicates of device experts at the chat's start (234-236 otherwise) and the chat missed 862-914 experts vs 777-787;
+    // not explained, so not a default
+    static bool shadow_async() {
+        static const bool on = [] { const char * e = getenv("LLAMA_MOE_SHADOW_ASYNC"); return e != nullptr && atoi(e) != 0; }();
+        return on;
+    }
+    uint64_t n_shadow_async = 0;
+    // async only from a seed (allow_async): lend / retire / release hand the slots to the graph allocation or free them right after
+    void shadow_slots(ggml_backend_t backend, group & g, const std::vector<std::pair<int32_t, int32_t>> & ev, bool allow_async = false) {
         if (!host || ev.empty()) {
             return;
         }
-        // the copies into the device slots may be on the compute backend or the copy queue of the device: both done
-        ggml_backend_synchronize(backend);
+        const bool as = allow_async && shadow_async();
+        // the copies into the device slots may be on the compute backend or the copy queue of the device: both done (async: the copies
+        // back are queued behind the work of backend, only another queue is waited for)
+        if (!as) {
+            ggml_backend_synchronize(backend);
+        }
         if (devices[g.id].backend != backend) {
             ggml_backend_synchronize(devices[g.id].backend);
+        }
+        if (as) {
+            demote(backend, g, ev);
+            host->commit(backend);
+            n_shadow_async += ev.size();
+            return;
         }
         const int32_t n_expert = g.lru.n_expert;
         for (const auto & [s, key] : ev) {
@@ -5947,6 +6762,7 @@ struct llama_moe_cache::impl {
                 continue;
             }
             if (host->contains(il, e)) {
+                sss.dem_kept++;
                 const int32_t h = host->held(il, e);
                 if (h >= 0) {
                     host->set_dup(h, false);
@@ -5967,10 +6783,19 @@ struct llama_moe_cache::impl {
                 }
                 continue;
             }
-            const int32_t r = host->reserve(il, e);
+            // k19-l4held rank mode: at the layer's quota the copy back takes an expert the prompt does not route first
+            const std::vector<bool> * rk = rank_any && (size_t) il < rank_mask.size() && (int32_t) rank_mask[il].size() > e ? &rank_mask[il] : nullptr;
+            const uint64_t ev0 = host->st.evicted - host->st.dup_taken;
+            const int32_t r = host->reserve(il, e, true, 0, true, rk);
             if (r < 0) {
                 hst.demote_skip++;
+                sss.dem_none++;
                 continue;
+            }
+            if (host->st.evicted - host->st.dup_taken > ev0) {
+                sss.dem_evict++;
+            } else {
+                sss.dem_free++;
             }
             const layer & l = layers[il];
             for (size_t ip = 0; ip < l.experts.size(); ++ip) {
@@ -8828,9 +9653,17 @@ struct llama_moe_cache::impl {
 
     void prepare(int64_t n_tokens) {
         ua_drain();
+        // k19-l4ttft: a small batch ends the prompt (the scratch of the prompt layer reads is not read again)
+        if (n_tokens <= n_small_max && (plr.il >= 0 || plr.p_t0 != 0)) {
+            plr_prompt_end();
+        }
         // k19-ramprof2: the profile fill (see hprof_order)
         if (host && wstore != nullptr && !hprof_ticket.empty()) {
             hprof_prepare(n_tokens);
+        }
+        // k19-l4fill: the refill of the freed RAM slots (see fill_mode)
+        if (host) {
+            fill_prepare(n_tokens);
         }
         // a medium ubatch right after a large one is the tail of the same prompt: the large ubatch just seeded the cache with the
         // experts this text routes, and evicting them for guesses costs more than the overlap gains (G4 q4x 12 GB multi-turn tails +8%)
@@ -10810,6 +11643,9 @@ struct llama_moe_cache::impl {
         if (tiered && hprof_prompted && !hprof_q.empty()) {
             hprof_wait_routed(il);
         }
+        if (tiered && !fill_q.empty()) {
+            fill_wait_routed(il);
+        }
         if (ahead) {
             ahead_wait_routed(il);
             if (xin != nullptr && !xin_async) {
@@ -11384,7 +12220,7 @@ struct llama_moe_cache::impl {
                 // k19-ramevict: a large batch seeds layer b.il after its experts were staged, so the RAM slots they need make room in the
                 // layers this pass has finished first (see llama_moe_host_cache::set_stream_layer); decode never seeds
                 host->set_stream_layer(b.il);
-                shadow_slots(backend, g, evicted_tmp);
+                shadow_slots(backend, g, evicted_tmp, true);
                 host->set_stream_layer(-1);
             }
         }
@@ -11465,6 +12301,7 @@ struct llama_moe_cache::impl {
                         // (k19-ramprof2: a slot being read in the background is left to its read: published, it is a duplicate)
                         host->release_key(sd.il, f.expert);
                         hst.promoted++;
+                        sss.prom_seed++;
                     }
                 }
             }
@@ -11724,6 +12561,22 @@ struct llama_moe_cache::impl {
                     "%llu forced over the RAM copy (%.2f MiB) (LLAMA_MOE_COPYBACK_SKIP=%d)\n",
                     (unsigned long long) hst.demoted, hst.demote_bytes/1048576.0, (unsigned long long) hst.demote_kept, hst.demote_kept_bytes/1048576.0,
                     (unsigned long long) hst.demote_forced, hst.demote_forced_bytes/1048576.0, copyback_skip ? 1 : 0);
+            LLAMA_LOG_INFO("llama_moe_cache: k19-l4held: %llu seed evictions copied back asynchronously (LLAMA_MOE_SHADOW_ASYNC=%d); RAM tier layer quota %s: "
+                    "%llu refused, %llu same-layer, %llu ranked, %llu slack; %zu device-prefill RAM copies marked as duplicates\n",
+                    (unsigned long long) n_shadow_async, shadow_async() ? 1 : 0, host->layer_quota_on() ? "on" : "off",
+                    (unsigned long long) host->quota_refused, (unsigned long long) host->quota_same, (unsigned long long) host->quota_ranked,
+                    (unsigned long long) host->quota_slack, n_prefill_dup);
+            if (host->exclusive()) {
+                LLAMA_LOG_INFO("llama_moe_cache: k19-l4fill: refill of freed RAM slots %s (LLAMA_MOE_HOST_FILL=%d, %d speculative reads at once): %llu prompts "
+                        "counted, %llu rounds (%llu at the server's idle point), %llu read (%.1f MiB), %llu done (%llu duplicates), %llu cancelled, %llu failed, %llu waited for (%.1f ms), "
+                        "%llu unmarked RAM copies of device experts marked as duplicates\n",
+                        fill_mode != 0 ? "on" : "off", fill_mode, fill_parallel, (unsigned long long) fls.prompts, (unsigned long long) fls.rounds,
+                        (unsigned long long) fls.idle_rounds,
+                        (unsigned long long) fls.issued, fls.issued_bytes/1048576.0, (unsigned long long) fls.done, (unsigned long long) fls.dup,
+                        (unsigned long long) fls.cancelled, (unsigned long long) fls.failed, (unsigned long long) fls.waited, fls.waited_us/1000.0,
+                        (unsigned long long) fls.dup_marked);
+                fill_diag("exit");
+            }
             LLAMA_LOG_INFO("llama_moe_cache: host tier: %d slots, peak %zu held, %llu evicted, %llu without a slot, %llu waits, pinned = %.2f MiB of a %.2f MiB budget, "
                     "registered expert buffers = %.2f MiB, MemAvailable %.1f MiB at start, %.1f MiB now\n",
                     host->n_slots(), hs.peak_held, (unsigned long long) hs.evicted, (unsigned long long) hs.no_slot, (unsigned long long) hs.waits,
@@ -12217,6 +13070,7 @@ void llama_moe_cache::set_weight_store(llama_weight_store * ws) {
     // the RAM tier reads through the store: it moves with it (and is dropped without one); its reads ahead complete first
     if (pimpl->host && pimpl->wstore != nullptr && pimpl->wstore != ws) {
         pimpl->hprof_stop();
+        pimpl->fill_stop();
         pimpl->ahead_drain();
         pimpl->ahead_il = -1;
         pimpl->wstore->set_tier(nullptr);
@@ -12251,6 +13105,7 @@ void llama_moe_cache::prompt_inplace_block(bool blocked) {
 }
 
 void llama_moe_cache::prompt_ubatch(bool ok, bool seed_prev) {
+    pimpl->rank_clear(); // k19-l4held: the routing of the previous ubatch no longer ranks the offers
     // LLAMA_MOE_PROMPT_INPLACE_SEED=0: a ubatch that seeds from an earlier routing keeps the staging copies
     static const bool seed_on = [] { const char * e = getenv("LLAMA_MOE_PROMPT_INPLACE_SEED"); return e == nullptr || atoi(e) != 0; }();
     pimpl->prompt_ubatch_ok   = ok && (!seed_prev || seed_on);
@@ -12267,6 +13122,22 @@ bool llama_moe_cache::prompt_inplace_on() const {
 
 bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
     return pimpl->copy(backend, src, dst, graph);
+}
+
+void llama_moe_cache::prompt_layer_read(ggml_backend_t backend, const ggml_tensor * w, const std::vector<bool> & used) {
+    pimpl->prompt_layer_read(backend, w, used);
+}
+
+void llama_moe_cache::prompt_diag_time(int64_t sync_us, int64_t up_us) {
+    pimpl->prompt_diag_time(sync_us, up_us);
+}
+
+void llama_moe_cache::prompt_diag_extra(int k, int64_t us) {
+    pimpl->prompt_diag_extra(k, us);
+}
+
+bool llama_moe_cache::prompt_rank_copy(const ggml_tensor * w, std::vector<bool> & used) {
+    return pimpl->prompt_rank_copy(w, used);
 }
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last, std::vector<ggml_backend_copy_region> * regions) {
@@ -12538,6 +13409,26 @@ void llama_moe_cache::set_seed_counts(const ggml_tensor * w, const std::vector<i
 
 bool llama_moe_cache::refills_routed() const {
     return pimpl->refill_routed;
+}
+
+bool llama_moe_cache::fill_wants_counts() const {
+    return pimpl->fill_active();
+}
+
+void llama_moe_cache::fill_stop() {
+    pimpl->fill_stop();
+}
+
+void llama_moe_cache::fill_idle() {
+    pimpl->fill_idle();
+}
+
+void llama_moe_cache::fill_counts_begin() {
+    pimpl->fill_counts_begin();
+}
+
+void llama_moe_cache::fill_counts(const ggml_tensor * w, const std::vector<int32_t> & counts) {
+    pimpl->fill_counts(w, counts);
 }
 
 void llama_moe_cache::set_refill_counts(const ggml_tensor * w, const std::vector<int32_t> & counts) {

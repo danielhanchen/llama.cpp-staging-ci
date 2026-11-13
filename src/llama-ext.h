@@ -119,6 +119,9 @@ LLAMA_API void llama_sched_reserve_now(struct llama_context * ctx);
 // cache gave up since, up to the reclaimable RAM less the part read's reserve; page cache only, exact. Returns the bytes read (0: nothing
 // to do or not applicable). LLAMA_PLE_TOPUP=0: off
 LLAMA_API size_t llama_ple_topup(struct llama_context * ctx);
+// k19-l4fill: the server is idle (no request runs or waits): the exclusive RAM tier of the MoE cache reads the experts the last prompts
+// routed most that neither tier holds into the slots it freed, in the background until the next batch. Placement only. LLAMA_MOE_HOST_FILL=0: off
+LLAMA_API void llama_moe_host_fill_idle(struct llama_context * ctx);
 // k15-fn: replace the backend sampler of seq_id, which has one, without reserving the graphs again: the caller reserved them with a
 // sampler whose graph is at least as large (e.g. the masked greedy of an ignore_eos request, swapped for the plain one). False: nothing
 // was changed (no sampler set for seq_id, or this one cannot run on the backend)

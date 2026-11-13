@@ -344,6 +344,18 @@ public:
     // returns the number of experts copied, 0 if expert e is not in the cache, -n if a run of n cached experts is too short to copy
     // with regions != nullptr, every cached run is appended to regions instead of being copied (and is not counted)
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last, std::vector<ggml_backend_copy_region> * regions = nullptr);
+    // k19-l4ttft: the copy of a prompt ubatch that read the routing of expert tensor w (used: its routed experts) reads the routed experts
+    // of w's layer that neither the device slots nor the RAM tier hold, every expert tensor of each, in one batch; the copies of the
+    // layer's expert tensors upload them from there (LLAMA_MOE_PROMPT_LAYER_READ=0 off, LLAMA_MOE_PROMPT_DIAG=1 logs per prompt)
+    void prompt_layer_read(ggml_backend_t backend, const ggml_tensor * w, const std::vector<bool> & used);
+    // k19-l4held (LLAMA_MOE_PROMPT_RANK=1, opt-in): a prompt ubatch of at least 256 tokens whose copies read the routing (not prefetched)
+    // stages its routed experts plus the experts held nowhere that fit its layer's RAM quota, and its routed misses replace the RAM
+    // tier's unrouted experts of the layer at its quota; used: routed in, staged out; true when it changed used
+    bool prompt_rank_copy(const ggml_tensor * w, std::vector<bool> & used);
+    // k19-l4ttft (LLAMA_MOE_PROMPT_DIAG=1): host time of a prompt copy's routing read and of its copies' issue
+    void prompt_diag_time(int64_t sync_us, int64_t up_us);
+    // k19-l4held (LLAMA_MOE_PROMPT_DIAG=1): host time of a prompt's whole copy callbacks (k = 0), seeds (1), upload-ahead waits (2)
+    void prompt_diag_extra(int k, int64_t us);
 
     // for large batches: count the copies of a batch of the experts of w issued by the caller (copies from the cache and uploads)
     void count_batch(const ggml_tensor * w, const std::vector<ggml_backend_copy_region> & regions);
@@ -384,6 +396,13 @@ public:
     void set_seed_counts(const ggml_tensor * w, const std::vector<int32_t> & counts);
     // the routing of the last large ubatch of a prompt that did not seed: the lent slots that come back get its most used experts
     void set_refill_counts(const ggml_tensor * w, const std::vector<int32_t> & counts);
+    // k19-l4fill: the exclusive RAM tier refills the slots it freed with the experts the last prompts routed most that neither tier holds
+    // (LLAMA_MOE_HOST_FILL=0 off): the routing counts of a prompt's last large ubatch, once per prompt (begin, then each expert tensor)
+    bool fill_wants_counts() const;
+    void fill_counts_begin();
+    void fill_counts(const ggml_tensor * w, const std::vector<int32_t> & counts);
+    void fill_stop(); // its reads that did not start are cancelled, the started ones waited for
+    void fill_idle(); // the server is idle: the freed slots are refilled (the reads run until the next batch)
     bool refills_routed() const; // LLAMA_MOE_CACHE_REFILL_ROUTED=1 (opt-in)
     const std::vector<int32_t> * get_seed_counts(const ggml_tensor * w) const; // nullptr if there are none for the layer of w
     void clear_seed_counts();

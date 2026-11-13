@@ -2584,6 +2584,11 @@ void llama_context::gf_res_epoch_bump(int line) {
 
 llama_context::~llama_context() {
     nextn_join();
+    // k19-l4fill: the refill reads of the RAM tier that did not start are cancelled before the weight store goes (its destructor would
+    // read every queued one)
+    if (moe_cache) {
+        moe_cache->fill_stop();
+    }
     if (tiny_rel_ub > 0) {
         LLAMA_LOG_INFO("%s: MoE cache tiny-cache release (LLAMA_MOE_PREFILL_UB_TINY_RELEASE): %lld releases, %lld restores, %.1f ms restoring "
             "(%.1f ms each)\n", __func__, (long long) tiny_rel_n_enter, (long long) tiny_rel_n_leave, tiny_rel_ms,
@@ -9626,6 +9631,13 @@ bool llama_context::sched_copy_all_experts(const ggml_tensor * src, const ggml_t
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
     if (!lctx->lm_seed_async || !lctx->lm_seed_active) {
+        // k19-l4held (LLAMA_MOE_PROMPT_DIAG=1): the whole callback's host time of a prompt (the diag counts only inside a prompt)
+        if (lctx->moe_cache && lctx->moe_cache->get_experts(src) != nullptr) {
+            const int64_t t0 = ggml_time_us();
+            const bool ok = sched_copy_experts_body(backend, src, dst, graph, user_data);
+            lctx->moe_cache->prompt_diag_extra(0, ggml_time_us() - t0);
+            return ok;
+        }
         return sched_copy_experts_body(backend, src, dst, graph, user_data);
     }
     if (graph != lctx->lm_copy_graph) {
@@ -9727,8 +9739,10 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
                 backend_ids = backend;
             }
             st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
+            const int64_t t_ids0 = ggml_time_us();
             ggml_backend_tensor_get_async(backend_ids, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
             ggml_backend_synchronize(backend_ids);
+            st.sync_us = ggml_time_us() - t_ids0;
 
             st.used.assign(n_expert, false);
             st.counts.assign(n_expert, 0);
@@ -9738,6 +9752,15 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
                     GGML_ASSERT(id >= 0 && id < n_expert);
                     st.used[id] = true;
                     st.counts[id]++;
+                }
+            }
+            // k19-l4ttft: the misses of every expert tensor of this layer are read now, in one batch (layers streamed through the RAM tier)
+            if (lctx->moe_cache && lctx->moe_cache->get_experts(src) != nullptr) {
+                lctx->moe_cache->prompt_layer_read(backend, src, st.used);
+                // k19-l4held (LLAMA_MOE_PROMPT_RANK=1): a prompt ubatch of 256+ tokens on this path also stages the experts held
+                // nowhere that fit the layer's RAM quota, its routed misses ranked first (st.counts keeps the routing for the seed)
+                if (ids->ne[1] >= 256) {
+                    lctx->moe_cache->prompt_rank_copy(src, st.used);
                 }
             }
         }
@@ -9829,8 +9852,11 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
         }
     }
     if (ua) {
+        const int64_t t_ua0 = ggml_time_us();
         lctx->moe_cache->upload_ahead_wait(backend, src);
+        lctx->moe_cache->prompt_diag_extra(2, ggml_time_us() - t_ua0);
     }
+    const int64_t t_up0 = ggml_time_us();
     if (!done) {
         plan(false);
         // the weight store reads the uploads from the model file (prefetched ahead into its ring, or all of them at once)
@@ -9843,15 +9869,22 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
             lctx->moe_cache->upload_ahead_mark(backend, src);
         }
     }
+    if (lctx->moe_cache && !st.all && lctx->moe_cache->get_experts(src) != nullptr) {
+        lctx->moe_cache->prompt_diag_time(st.sync_us, ggml_time_us() - t_up0);
+        st.sync_us = 0;
+    }
 
     // st.used: the experts staged in dst, the only ones a seed may copy into the cache
+    const int64_t t_seed0 = ggml_time_us();
     if (seed && !st.counts.empty()) {
         lctx->moe_cache->seed(backend, src, dst, st.counts, st.used);
+        lctx->moe_cache->prompt_diag_extra(1, ggml_time_us() - t_seed0);
     } else if (lctx->moe_cache_seed_prev && lctx->moe_cache->get_experts(src) != nullptr) {
         // all experts copied (prefetched): use the routing of an earlier ubatch; else the ids of this ubatch were read and only its routed experts staged
         const std::vector<int32_t> * counts = st.all ? lctx->moe_cache->get_seed_counts(src) : &st.counts;
         if (counts != nullptr && !counts->empty() && (!lctx->lm_seed_active || lctx->lm_seeded.insert(src).second)) {
             lctx->moe_cache->seed(backend, src, dst, *counts, st.used);
+            lctx->moe_cache->prompt_diag_extra(1, ggml_time_us() - t_seed0);
         }
     }
     // layer-major graph: the routing that seeds this layer may come later, the seed then copies from this copy (see lm_eval_cb)
@@ -9945,6 +9978,9 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
     // a ubatch with outputs after a large one that did not seed ends the prompt (e.g. the server runs the last tokens as a separate batch)
     if (cont && !moe_cache_ids.empty() && n_outputs_ub != 0 && !large && !moe_cache_seeded && moe_cache->refills_routed()) {
         moe_cache_refill_from_ids();
+    }
+    if (cont && !moe_cache_ids.empty() && n_outputs_ub != 0 && !large) {
+        moe_cache_fill_from_ids();
     }
     moe_cache_ids.clear();
 
@@ -10053,6 +10089,9 @@ void llama_context::moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_ou
         if (n_outputs_ub != 0 && recorded && !moe_cache_seeded && !moe_cache_ids.empty() && moe_cache->refills_routed()) {
             moe_cache_refill_from_ids();
         }
+        if (n_outputs_ub != 0 && recorded && !moe_cache_ids.empty()) {
+            moe_cache_fill_from_ids();
+        }
         moe_cache_seq      = -1;
         moe_cache_pos_next = -1;
         moe_cache_ids.clear();
@@ -10094,6 +10133,31 @@ void llama_context::lm_ids_host_keep() {
     }
     lm_ids_ctx = std::move(ctx);
     lm_ids_buf = std::move(buf);
+}
+
+// k19-l4fill: the routing of the recorded ubatch (the last large one of a prompt) to the RAM tier's refill of its freed slots
+void llama_context::moe_cache_fill_from_ids() {
+    if (moe_cache_ids.empty() || !moe_cache->fill_wants_counts()) {
+        return;
+    }
+    ggml_backend_sched_synchronize(sched.get());
+    moe_cache->fill_counts_begin();
+    std::vector<int32_t> ids_data;
+    std::vector<int32_t> counts;
+    for (const auto & [w, ids] : moe_cache_ids) {
+        if (ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids) || ids->buffer == nullptr) {
+            continue;
+        }
+        ids_data.resize(ggml_nelements(ids));
+        ggml_backend_tensor_get(ids, ids_data.data(), 0, ggml_nbytes(ids));
+        counts.assign(w->ne[2], 0);
+        for (const int32_t id : ids_data) {
+            if (id >= 0 && id < w->ne[2]) {
+                counts[id]++;
+            }
+        }
+        moe_cache->fill_counts(w, counts);
+    }
 }
 
 void llama_context::moe_cache_refill_from_ids() {
@@ -13259,6 +13323,18 @@ float * llama_get_raw_logits_ith(llama_context * ctx, int32_t i) {
 
 size_t llama_ple_topup(llama_context * ctx) {
     return ctx ? ctx->ple_topup() : 0;
+}
+
+void llama_moe_host_fill_idle(llama_context * ctx) {
+    if (ctx) {
+        ctx->moe_fill_idle();
+    }
+}
+
+void llama_context::moe_fill_idle() {
+    if (moe_cache) {
+        moe_cache->fill_idle();
+    }
 }
 
 void llama_sched_reserve_now(llama_context * ctx) {

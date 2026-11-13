@@ -664,6 +664,7 @@ private:
         std::vector<bool>    used;
         std::vector<int32_t> counts; // tokens routed to each expert, empty if the ids were not read
         bool                 all = false; // used was set to every expert without reading the ids
+        int64_t              sync_us = 0; // k19-l4ttft diagnostic: host time of the last routing read
 
         std::vector<std::pair<size_t, size_t>> uploads; // offset and size of the uploads of the current copy
         std::vector<ggml_backend_copy_region>   regions; // the copies of the current copy, when the backend batches them
@@ -859,6 +860,10 @@ private:
     void moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_outputs_ub);
     // the end of a prompt that did not seed: the lent slots that come back get the experts its last large ubatch used most
     void moe_cache_refill_from_ids();
+    void moe_cache_fill_from_ids(); // k19-l4fill
+public:
+    void moe_fill_idle(); // k19-l4fill (llama_moe_host_fill_idle)
+private:
 
     // ubatches of at least this many tokens prefetch the host weights on the scheduler copy queue, MoE experts whole [GGML_SCHED_PREFETCH_MIN_BATCH]
     // smaller ubatches (e.g. generation) copy only the routed experts or use the MoE cache, with no staging or event work

@@ -91,7 +91,9 @@ public:
     // evict = false: only a free slot (or memory still in the budget); min_age > 0: never evicts a slot read or written by the last
     // min_age commits (the reservation then never waits for the device)
     // take_spec: a slot set_spec marked (filled from a routing profile, not used since) counts as free (see set_spec)
-    int32_t reserve(int32_t il, int32_t e, bool evict = true, uint32_t min_age = 0, bool take_spec = true);
+    // keep (k19-l4held, a layer at its quota): a non-evicting reservation may also take a slot of the same layer whose expert keep does
+    // not mark (e.g. not routed by the prompt that offers e), lowest count first
+    int32_t reserve(int32_t il, int32_t e, bool evict = true, uint32_t min_age = 0, bool take_spec = true, const std::vector<bool> * keep = nullptr);
     void    publish(int32_t s);  // the slot holds its expert
     void    abort(int32_t s);    // the slot is free again
     void    release(int32_t s);  // drops the expert (exclusive promotion), the slot is reused once the copies that read it are done
@@ -148,8 +150,31 @@ public:
     void   set_spec(int32_t s);
     bool   is_spec(int32_t s) const { return slots[s].spec != 0; }
     size_t n_spec_slots() const { return n_spec; }
+    // k19-l4held: per-layer share of a layout's slots (LLAMA_MOE_HOST_LAYER_QUOTA, set by the MoE cache: exclusive tier by default).
+    // Every reservation fills the free slots of its layout, so the experts of the layers that come first in a fill (the page-cache
+    // fill at load, the uploads of the first prompt, both in layer order) took a layout's slots and the layers after them kept only
+    // their device slots: Colab L4 full card, Qwen3.8-Flash-Next UD-IQ4_XS from the VM disk, 42-token chat after a 640-token prompt:
+    // layers 0-3 missed 55-96 of their ~120 routed experts, 30 of 48 layers none, 760 misses of 5741 where 8% of the experts held
+    // nowhere at random would give ~460. With the quota a layer holds at most ceil(slots of its layout / its layers) slots: a
+    // reservation of a layer at its quota takes a free slot only when the layout keeps enough free slots for the layers below theirs,
+    // else a slot of the same layer (a duplicate of a device-held expert, an unused guess, or, when it may evict, the lowest count),
+    // else nothing. Placement only: what a slot holds is the expert's bytes; the tier still fills completely.
+    void    set_layer_quota(bool on);
+    bool    layer_quota_on() const { return quota_on; }
+    bool    at_quota(int32_t il) const { return quota_on && caches(il) && n_key_layer[il] >= quota[il]; }
+    int32_t quota_of(int32_t il) const { return caches(il) ? quota[il] : 0; }
+    int32_t n_keys_of(int32_t il) const { return caches(il) ? n_key_layer[il] : 0; }
+    uint64_t quota_refused = 0, quota_same = 0, quota_slack = 0, quota_ranked = 0;
+
     // slots without an expert (free, or not allocated yet within the budget)
     int32_t n_free() const;
+    // k19-l4fill: a non-evicting reservation of layer il would find a slot whose memory is already allocated: a free one or a duplicate
+    // of a device-held expert that no current call / plan / uncommitted copy uses (never a guess, never memory still to be pinned)
+    bool    can_take_alloc(int32_t il) const;
+    // ... the number of such duplicates over every layout (the diagnostics)
+    int32_t n_dup_slots() const;
+    // slots being filled (reserved, not published yet)
+    int32_t n_filling() const;
     // ... of the layout of layer il, and its slots
     int32_t n_free_of(int32_t il) const;
     int32_t n_slots_of(int32_t il) const;
@@ -254,6 +279,11 @@ private:
 
     std::vector<std::vector<int32_t>> spec_of; // [n_layer] slots marked by set_spec (lazily pruned), coldest last
     size_t   n_spec     = 0;
+
+    std::vector<int32_t> n_key_layer; // [n_layer] slots whose key is of the layer (any state but free)
+    std::vector<int32_t> quota;       // [n_layer] k19-l4held layer quota
+    bool     quota_on   = false;
+    int32_t  quota_victim(int32_t il, bool allow_evict, uint32_t min_age, bool take_spec, const std::vector<bool> * keep);
 
     int32_t  stream_il  = -1;
     bool     evict_done = true;

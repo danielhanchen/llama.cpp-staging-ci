@@ -362,6 +362,8 @@ struct llama_weight_store::impl {
         size_t               bytes = 0;
     };
     std::deque<ws_task *> spec;
+    int spec_parallel = 0; // k19-l4fill: at most this many speculative reads at once (0: no limit)
+    int spec_running  = 0;
     std::unordered_map<uint64_t, std::unique_ptr<spec_req>> spec_reqs; // tickets not collected yet (main thread)
     uint64_t spec_next = 1;
 
@@ -868,13 +870,15 @@ struct llama_weight_store::impl {
                     continue;
                 }
             }
-            if (!spec.empty()) {
+            if (!spec.empty() && (spec_parallel <= 0 || spec_running < spec_parallel)) {
                 ws_task * t = spec.front();
                 spec.pop_front();
+                spec_running++;
                 lock.unlock();
                 read_exact(t->file, t->foff, t->len, t->base, t->lead, t->direct && file_direct_ok(t->file));
                 s_spec_reads++;
                 lock.lock();
+                spec_running--;
                 if (t->remaining->fetch_sub(1) == 1) {
                     cv_main.notify_all();
                 }
@@ -1547,6 +1551,12 @@ uint64_t llama_weight_store::read_host_async(host_read * reads, size_t n, bool d
 
 bool llama_weight_store::host_done(uint64_t ticket) {
     return ticket == 0 || pimpl->host_done(ticket);
+}
+
+void llama_weight_store::set_spec_parallel(int n) {
+    std::lock_guard<std::mutex> lock(pimpl->mtx);
+    pimpl->spec_parallel = std::max(0, n);
+    pimpl->cv_io.notify_all();
 }
 
 bool llama_weight_store::host_cancel(uint64_t ticket) {
