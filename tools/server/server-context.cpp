@@ -2145,7 +2145,7 @@ private:
                 // k19-adraft (opt-in, LLAMA_SPEC_ADRAFT=1): where the windows stay at 2 drafts beside a MoE cache, a sampled request's window
                 // holds up to LLAMA_SPEC_ADRAFT_MAX drafts (default 3), each past the 2nd kept while its draft probability is at least
                 // LLAMA_SPEC_ADRAFT_P (0.9; the drafter's confidence gate, a function of the text). =2: priced by expected tokens per ms
-                // instead. Greedy requests keep 2 drafts. Sampled verify is sample-and-match with the target's chain and RNG, so only the
+                // instead; =3: one width per stretch of the request from the running share of drafts that held; =4: by position. Greedy requests keep 2 drafts. Sampled verify is sample-and-match with the target's chain and RNG, so only the
                 // proposals change
                 const char * am = getenv("LLAMA_SPEC_ADRAFT_MAX");
                 sp.draft.adraft = sp.draft.n_max;
