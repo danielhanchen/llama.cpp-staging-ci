@@ -302,6 +302,31 @@ struct moe_cache_lru {
         gen++;
     }
 
+    // k19-t4small (decode extension, see llama_moe_cache::ext_grow): the slots [n_slots, n_new) join the cache empty, as the least
+    // recently used (the next victims); no slot may be lent
+    void unretire(int32_t n_new) {
+        GGML_ASSERT(n_lent == 0 && n_new >= n_slots);
+        const int32_t n_old = n_slots;
+        key_of.resize(n_new, -1);
+        prev.resize(n_new, -1);
+        next.resize(n_new, -1);
+        if (!pinned.empty()) {
+            pinned.resize(n_new, 0);
+        }
+        n_slots = n_new;
+        for (int32_t s = n_new - 1; s >= n_old; --s) {
+            prev[s] = -1;
+            next[s] = head;
+            if (head >= 0) {
+                prev[head] = s;
+            } else {
+                tail = s;
+            }
+            head = s;
+        }
+        gen++;
+    }
+
     // move slot s to the tail (most recently used); a core slot stays out of the list
     void touch(int32_t s) {
         if (s == tail || s < n_core) {
@@ -626,10 +651,18 @@ struct llama_moe_cache::impl {
     ggml_backend_buffer_t (*lazy_alloc_fn)(ggml_backend_buffer_type_t, size_t) = nullptr;
     bool   (*lazy_commit_fn)(ggml_backend_buffer_t, size_t, size_t)            = nullptr;
     size_t (*lazy_decommit_fn)(ggml_backend_buffer_t, size_t, size_t)          = nullptr;
+    bool   (*lazy_commit_run_fn)(ggml_backend_buffer_t, size_t, size_t)        = nullptr; // k19-t4small: one allocation per span
     int64_t n_shrinks     = 0; // shrink calls that gave memory back
     int64_t n_retired     = 0; // slots retired by them
     size_t  shrunk_bytes  = 0; // device memory they gave back
     bool    graphs_stale  = false; // a shrink changed the slot counts the graphs were built with (see take_graphs_stale)
+    // k19-t4small (decode extension, see llama_moe_cache::ext_grow): the banks are a lazy buffer with room for group::n_slots_cap slots
+    bool    ext_on        = false;
+    int64_t n_ext_grows   = 0;
+    int64_t n_ext_parks   = 0;
+    size_t  ext_max_bytes = 0; // the most the extension held
+    int64_t ext_us        = 0; // host time of ext_grow / ext_park
+    int32_t ext_fail      = 0; // grows that could not back their slots
     ggml_context_ptr ctx_banks_op; // the views of group::banks_op
     std::vector<llama_weight_store::region> ws_regions;
 
@@ -779,6 +812,8 @@ struct llama_moe_cache::impl {
         int32_t n_slots = 0;
         int32_t n_slots_load = 0; // k17-small: n_slots at load (the banks keep that size, shrink retires the tail slots)
         int32_t n_slots_min  = 0; // k17-small: shrink keeps at least this many (set_shrink_floor; 0: not set, nothing is retired)
+        int32_t n_slots_fit  = 0; // k19-t4small: the slots the budget gave (ext_park goes back to them)
+        int32_t n_slots_cap  = 0; // k19-t4small: the slots the banks have room for (n_slots_fit + the decode extension, see ext_grow)
         // k17-small: once slots are retired, views of the banks over the slots left and the spare slot ([ne0, ne1, n_slots + 1], the
         // shape the lookup ops require), passed to the device lookup / fetch ops instead of the banks (see op_banks); empty before
         std::vector<ggml_tensor *> banks_op;
@@ -1713,6 +1748,22 @@ struct llama_moe_cache::impl {
             }
         }
 
+        // k19-t4small (decode extension, LLAMA_MOE_DECODE_EXT: unset = on where it can be, 0 off): the banks of the cache of the main
+        // model (not an MTP context's) on a single device with CUDA VMM get room for LLAMA_MOE_DECODE_EXT_MAX_FRAC (0.6) more slots per
+        // group, unbacked at load; the context grows the cache into the device memory the decode leaves free (llama_context::ext_unpark).
+        // Not with the lazy KV cache's shrink (LLAMA_KV_LAZY), which retires slots for good
+        double ext_frac = 0.0;
+        {
+            const char * e  = getenv("LLAMA_MOE_DECODE_EXT");
+            const char * ef = getenv("LLAMA_MOE_DECODE_EXT_MAX_FRAC");
+            ext_frac = ef != nullptr ? std::max(0.0, atof(ef)) : 0.6;
+            const bool want = (e == nullptr || atoi(e) != 0) && ext_frac > 0.0 && set != layer_set::nextn && !model.hparams.no_alloc &&
+                devices.size() == 1 && !llama_kv_lazy_alloc_on();
+            ext_on = want && ext_probe(devices[0]);
+            if (!ext_on) {
+                ext_frac = 0.0;
+            }
+        }
         for (size_t ig = 0; ig < groups.size(); ++ig) {
             group & g = groups[ig];
             const int32_t n_expert  = g.ref[0]->ne[2];
@@ -1737,6 +1788,8 @@ struct llama_moe_cache::impl {
             }
             g.lru.init(model.layers.size(), n_expert, g.n_slots, grow_q16, g.layers[0]);
             g.n_slots_load = g.n_slots;
+            g.n_slots_fit  = g.n_slots;
+            g.n_slots_cap  = ext_on ? std::min<int32_t>(max_slots, g.n_slots + (int32_t) std::ceil(ext_frac*g.n_slots)) : g.n_slots;
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size()) + (device_lookup ? 2 : 0) + (hybrid || overlap ? 1 : 0) +
                 (device_lookup && grow_q16 > 0 ? 1 : 0);
             for (int32_t il : g.layers) {
@@ -1840,7 +1893,8 @@ struct llama_moe_cache::impl {
             ggml_context * ctx = devices[g.id].ctx.get();
             ggml_context * ctx_bank = devices[g.id].ctx_bank.get();
             for (const ggml_tensor * t : g.ref) {
-                ggml_tensor * bank = ggml_new_tensor_3d(ctx_bank, t->type, t->ne[0], t->ne[1], g.n_slots + 1);
+                // (k19-t4small: room for n_slots_cap slots, = n_slots without the decode extension)
+                ggml_tensor * bank = ggml_new_tensor_3d(ctx_bank, t->type, t->ne[0], t->ne[1], g.n_slots_cap + 1);
                 GGML_ASSERT(bank->nb[2] == t->nb[2]);
                 ggml_format_name(bank, "moe_cache.%zu.%s", ig, t->name);
                 g.banks.push_back(bank);
@@ -1851,7 +1905,7 @@ struct llama_moe_cache::impl {
                 l.experts = llama_moe_cache_layer_experts(model.layers[il]);
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                     ggml_tensor * bank   = g.banks[ip];
-                    ggml_tensor * cached = ggml_view_3d(ctx_bank, bank, bank->ne[0], bank->ne[1], g.n_slots, bank->nb[1], bank->nb[2], 0);
+                    ggml_tensor * cached = ggml_view_3d(ctx_bank, bank, bank->ne[0], bank->ne[1], g.n_slots_cap, bank->nb[1], bank->nb[2], 0);
                     ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
                     bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
                 }
@@ -1879,7 +1933,7 @@ struct llama_moe_cache::impl {
             if (device_lookup) {
                 const size_t alignment = ggml_backend_buft_get_alignment(devices[g.id].buft);
                 g.map   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, g.ref[0]->ne[2], model.layers.size());
-                g.state = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 8 + 3*(int64_t) g.n_slots);
+                g.state = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 8 + 3*(int64_t) g.n_slots_cap);
                 ggml_format_name(g.map,   "moe_cache.%zu.map",   ig);
                 ggml_format_name(g.state, "moe_cache.%zu.state", ig);
                 devices[g.id].buf_size += GGML_PAD(ggml_nbytes(g.map), alignment) + GGML_PAD(ggml_nbytes(g.state), alignment);
@@ -1946,6 +2000,21 @@ struct llama_moe_cache::impl {
                     ggml_backend_buffer_clear(d.buf.get(), 0);
                     d.buf_size += ggml_backend_buffer_get_size(d.buf.get());
                 }
+            }
+            // k19-t4small: the banks have room for n_slots_cap slots, the cache starts with the fitted ones (as after a shrink to them)
+            for (group & g : groups) {
+                if (g.n_slots > 0 && g.n_slots_cap > g.n_slots) {
+                    set_slot_count(g, g.n_slots);
+                }
+            }
+            if (ext_on) {
+                size_t fit = 0, cap = 0;
+                for (const group & g : groups) {
+                    fit += (size_t) g.n_slots_fit*g.expert_bytes;
+                    cap += (size_t) g.n_slots_cap*g.expert_bytes;
+                }
+                LLAMA_LOG_INFO("%s: MoE cache: k19-t4small decode extension: room for %.2f MiB of slots past the %.2f MiB fitted (unbacked "
+                    "until the decode grows into free device memory; LLAMA_MOE_DECODE_EXT=0 off)\n", __func__, (cap - fit)/1048576.0, fit/1048576.0);
             }
             buf_host.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_host.get(), buft_host));
             if (!buf_host) {
@@ -9255,7 +9324,7 @@ struct llama_moe_cache::impl {
     // backend has no lazy buffers (then shrink gives nothing back)
     ggml_backend_buffer_t alloc_banks(device & d) {
         d.bank_lazy = false;
-        if (shrink_on) {
+        if (shrink_on || ext_on) { // (k19-t4small: the decode extension backs only the slots in use)
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(d.buft);
             ggml_backend_reg_t reg = dev != nullptr && !ggml_backend_buft_is_host(d.buft) ? ggml_backend_dev_backend_reg(dev) : nullptr;
             if (reg != nullptr && lazy_alloc_fn == nullptr) {
@@ -9287,7 +9356,11 @@ struct llama_moe_cache::impl {
                         continue;
                     }
                     for (const ggml_tensor * bank : g.banks) {
-                        ok = ok && lazy_commit_fn(buf, (const char *) bank->data - base, (size_t) (g.n_slots + 1)*bank->nb[2]);
+                        // (k19-t4small: the decode extension backs a bank's rows as one allocation, and up to where ext_park keeps them)
+                        ok = ok && (ext_on && lazy_commit_run_fn != nullptr ?
+                            lazy_commit_run_fn(buf, (const char *) bank->data - base,
+                                std::min(ggml_nbytes(bank), (size_t) (g.n_slots + 1)*bank->nb[2] + (size_t) 64*1024)) :
+                            lazy_commit_fn(buf, (const char *) bank->data - base, (size_t) (g.n_slots + 1)*bank->nb[2]));
                     }
                 }
                 if (ok) {
@@ -9452,6 +9525,197 @@ struct llama_moe_cache::impl {
         n_retired += n_old - n_new;
         graphs_stale = true;
         return freed;
+    }
+
+    // k19-t4small: the lookup state and the op views of g follow a slot count n (as retire sets them)
+    void set_slot_count(group & g, int32_t n) {
+        if (g.state != nullptr) {
+            // the device lookup reads the slot count from the length of its state (n_hdr + 3*n_slots)
+            g.state->ne[0] = n_hdr + 3*(int64_t) n;
+            for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                g.state->nb[i] = g.state->nb[i - 1]*g.state->ne[i - 1];
+            }
+        }
+        if (g.banks_op.empty()) {
+            if (!ctx_banks_op) {
+                size_t n_banks = 0;
+                for (const group & gi : groups) {
+                    n_banks += gi.banks.size();
+                }
+                ggml_init_params params = {
+                    /*.mem_size   =*/ (n_banks + 1)*ggml_tensor_overhead(),
+                    /*.mem_buffer =*/ nullptr,
+                    /*.no_alloc   =*/ true,
+                };
+                ctx_banks_op.reset(ggml_init(params));
+            }
+            for (ggml_tensor * bank : g.banks) {
+                ggml_tensor * v = ggml_view_3d(ctx_banks_op.get(), bank, bank->ne[0], bank->ne[1], n + 1, bank->nb[1], bank->nb[2], 0);
+                ggml_format_name(v, "%s.op", bank->name);
+                g.banks_op.push_back(v);
+            }
+        }
+        for (ggml_tensor * v : g.banks_op) {
+            v->ne[2] = n + 1;
+            v->nb[3] = v->nb[2]*v->ne[2];
+        }
+    }
+
+    // k19-t4small: the CUDA backend has lazy buffers (VMM) on the device of d: a probe reservation is made and freed
+    bool ext_probe(device & d) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(d.buft);
+        ggml_backend_reg_t reg = dev != nullptr && !ggml_backend_buft_is_host(d.buft) ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg == nullptr) {
+            return false;
+        }
+        if (lazy_alloc_fn == nullptr) {
+            lazy_alloc_fn    = (ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_alloc_lazy");
+            lazy_commit_fn   = (bool (*)(ggml_backend_buffer_t, size_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_commit");
+            lazy_decommit_fn = (size_t (*)(ggml_backend_buffer_t, size_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_decommit");
+        }
+        lazy_commit_run_fn = (bool (*)(ggml_backend_buffer_t, size_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_commit_run");
+        if (lazy_alloc_fn == nullptr || lazy_commit_fn == nullptr || lazy_decommit_fn == nullptr || lazy_commit_run_fn == nullptr) {
+            return false;
+        }
+        ggml_backend_buffer_t buf = lazy_alloc_fn(d.buft, (size_t) 2*1024*1024);
+        if (buf == nullptr) {
+            return false;
+        }
+        ggml_backend_buffer_free(buf);
+        return true;
+    }
+
+    // k19-t4small (llama_moe_cache::ext_grow): back and add slots to the groups of device id, in proportion to their fitted slots, for
+    // about bytes of device memory (each group at most to n_slots_cap). The new slots are empty, the next victims: the decode admits
+    // its misses into them. Not while the banks are released or slots are lent. Returns the bytes of slots added
+    size_t ext_grow(int32_t id, size_t bytes) {
+        device & d = devices[id];
+        if (!ext_on || bytes == 0 || !d.buf_bank || !d.bank_lazy || d.released || core_on) {
+            return 0;
+        }
+        size_t fit = 0;
+        for (const group & g : groups) {
+            if (g.id == id && g.n_slots > 0 && g.n_slots_cap > g.n_slots && g.lru.n_lent == 0) {
+                fit += (size_t) g.n_slots_fit*g.expert_bytes;
+            }
+        }
+        if (fit == 0) {
+            return 0;
+        }
+        const int64_t t0 = ggml_time_us();
+        ggml_backend_t backend = d.backend;
+        ua_release(id);
+        ggml_backend_synchronize(backend);
+        const double frac = (double) bytes/(double) fit;
+        const char * base = (const char *) ggml_backend_buffer_get_base(d.buf_bank.get());
+        size_t  grown   = 0;
+        int32_t n_added = 0;
+        bool    failed  = false;
+        for (group & g : groups) {
+            if (g.id != id || g.n_slots == 0 || g.n_slots_cap <= g.n_slots || g.lru.n_lent > 0 || failed) {
+                continue;
+            }
+            const int32_t n_old = g.n_slots;
+            // the rows backed stay a granularity chunk (2 MiB) short of the bank's end, so the allocation that backs them never takes a
+            // chunk the next bank shares and ext_park gives it back whole
+            size_t nb_min = SIZE_MAX;
+            for (const ggml_tensor * bank : g.banks) {
+                nb_min = std::min(nb_min, (size_t) bank->nb[2]);
+            }
+            const int32_t slack = (int32_t) ((((size_t) 2*1024*1024 + (size_t) 64*1024) + nb_min - 1)/nb_min) + 1;
+            const int32_t n_new = std::min<int32_t>(g.n_slots_cap - slack, g.n_slots_fit + (int32_t) std::floor(frac*g.n_slots_fit));
+            if (n_new <= n_old) {
+                continue;
+            }
+            seed_end(g);
+            if (g.dev_lookup && g.dev_newer) {
+                download(g);
+            }
+            // back the rows of the new slots and the new spare slot (and the 64 KiB past it a lent copy may pad into, as retire keeps)
+            bool ok = true;
+            for (const ggml_tensor * bank : g.banks) {
+                const size_t off  = (size_t) ((const char *) bank->data - base);
+                const size_t want = std::min(ggml_nbytes(bank), (size_t) (n_new + 1)*bank->nb[2] + (size_t) 64*1024);
+                ok = ok && lazy_commit_run_fn(d.buf_bank.get(), off, want);
+            }
+            if (!ok) {
+                // no device memory for them: what was backed stays unused until the next park gives it back
+                failed = true;
+                ext_fail++;
+                break;
+            }
+            // newly backed rows are cleared by the commit; the old spare slot and what follows it may hold bytes of a lent copy
+            for (ggml_tensor * bank : g.banks) {
+                ggml_backend_tensor_memset(bank, 0, (size_t) n_old*bank->nb[2], (size_t) (n_new + 1 - n_old)*bank->nb[2]);
+            }
+            g.lru.unretire(n_new);
+            g.n_slots = n_new;
+            if (!g.ua_dec_key.empty()) {
+                g.ua_dec_key.resize(n_new, -1);
+            }
+            set_slot_count(g, n_new);
+            if (g.dev_lookup && g.map != nullptr && g.state != nullptr) {
+                upload(g);
+            }
+            grown   += (size_t) (n_new - n_old)*g.expert_bytes;
+            n_added += n_new - n_old;
+        }
+        if (n_added > 0) {
+            graphs_stale = true;
+            n_ext_grows++;
+        }
+        ext_max_bytes = std::max(ext_max_bytes, ext_bytes(id));
+        ext_us += ggml_time_us() - t0;
+        if (n_ext_grows <= 3 && n_added > 0) {
+            LLAMA_LOG_INFO("%s: %s: MoE cache k19-t4small decode extension: +%d slots (%.2f MiB) for %.2f MiB of free device memory%s, "
+                "%.1f ms (LLAMA_MOE_DECODE_EXT=0 off)\n", __func__, ggml_backend_name(backend), n_added, grown/1048576.0, bytes/1048576.0,
+                failed ? " (stopped: the device had no memory for more)" : "", (ggml_time_us() - t0)/1000.0);
+        }
+        return grown;
+    }
+
+    // k19-t4small (llama_moe_cache::ext_park): the groups of device id go back to their fitted slots, the rows above them are given
+    // back to the device (retire). Returns the bytes given back
+    size_t ext_park(int32_t id) {
+        device & d = devices[id];
+        if (!ext_on || !d.buf_bank || !d.bank_lazy || d.released) {
+            return 0;
+        }
+        if (std::none_of(groups.begin(), groups.end(), [&](const group & g) { return g.id == id && g.n_slots > g.n_slots_fit; })) {
+            return 0;
+        }
+        const int64_t t0 = ggml_time_us();
+        ggml_backend_t backend = d.backend;
+        ua_release(id);
+        ggml_backend_synchronize(backend);
+        size_t freed = 0;
+        for (group & g : groups) {
+            if (g.id != id || g.n_slots <= g.n_slots_fit) {
+                continue;
+            }
+            seed_end(g);
+            if (g.dev_lookup && g.dev_newer) {
+                download(g);
+            }
+            if (g.lru.n_lent > 0) {
+                unlend(g);
+            }
+            freed += retire(g, g.n_slots_fit);
+        }
+        n_ext_parks++;
+        ext_us += ggml_time_us() - t0;
+        return freed;
+    }
+
+    // k19-t4small: the bytes of slots above the fitted ones on device id
+    size_t ext_bytes(int32_t id) const {
+        size_t n = 0;
+        for (const group & g : groups) {
+            if (g.id == id && g.n_slots > g.n_slots_fit) {
+                n += (size_t) (g.n_slots - g.n_slots_fit)*g.expert_bytes;
+            }
+        }
+        return n;
     }
 
     // k17-small (lazy KV step 2, llama_moe_cache::shrink): give back at least bytes of device memory of device id by retiring the tail
@@ -11349,6 +11613,11 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("llama_moe_cache%s: k19-q4xcache: %llu layer graphs of 2-%d token windows with the host path off overlapped their "
                 "copies, %llu of them 5+ tokens (k19-bigverify, LLAMA_MOE_OVERLAP_PLAIN_MAX) (LLAMA_MOE_OVERLAP_SMALL_PLAIN=%d)\n", tag,
                 (unsigned long long) n_ov_plain, (int) GGML_MOE_MAILBOX_MAX_TOKENS, (unsigned long long) n_ov_plain_wide, overlap_plain_on() ? 1 : 0);
+            if (ext_on) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: k19-t4small decode extension: %lld grows, %lld parks, at most %.2f MiB above the fitted slots, "
+                    "%.1f ms in all%s (LLAMA_MOE_DECODE_EXT=0 off)\n", tag, (long long) n_ext_grows, (long long) n_ext_parks,
+                    ext_max_bytes/1048576.0, ext_us/1000.0, ext_fail > 0 ? ", some grows stopped short (no device memory)" : "");
+            }
             if (getenv("LLAMA_MOE_CACHE_ADMIT_MARGIN") != nullptr) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: admission margin %s (+%s): %llu missing experts left to the host instead of replacing a resident\n", tag,
                     getenv("LLAMA_MOE_CACHE_ADMIT_MARGIN"), getenv("LLAMA_MOE_CACHE_ADMIT_ADD") ? getenv("LLAMA_MOE_CACHE_ADMIT_ADD") : "0",
@@ -12083,6 +12352,31 @@ void llama_moe_cache::set_restore_soft(bool on) {
 size_t llama_moe_cache::shrink(ggml_backend_dev_t dev, size_t bytes) {
     const int32_t id = pimpl->dev_id(dev);
     return id >= 0 ? pimpl->shrink(id, bytes) : 0;
+}
+
+bool llama_moe_cache::ext_on() const {
+    return pimpl->ext_on;
+}
+
+size_t llama_moe_cache::ext_grow(ggml_backend_dev_t dev, size_t bytes) {
+    const int32_t id = pimpl->dev_id(dev);
+    return id >= 0 ? pimpl->ext_grow(id, bytes) : 0;
+}
+
+size_t llama_moe_cache::ext_park() {
+    size_t n = 0;
+    for (size_t id = 0; id < pimpl->devices.size(); ++id) {
+        n += pimpl->ext_park((int32_t) id);
+    }
+    return n;
+}
+
+size_t llama_moe_cache::ext_bytes() const {
+    size_t n = 0;
+    for (size_t id = 0; id < pimpl->devices.size(); ++id) {
+        n += pimpl->ext_bytes((int32_t) id);
+    }
+    return n;
 }
 
 bool llama_moe_cache::can_shrink(ggml_backend_dev_t dev) const {

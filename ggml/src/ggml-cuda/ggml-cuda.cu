@@ -921,6 +921,9 @@ struct ggml_backend_cuda_buffer_context {
     size_t lazy_gran = 0;
 #if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     std::vector<CUmemGenericAllocationHandle> chunks;   // 0 = not backed
+    // k19-t4small: a physical allocation may back a run of chunks (ggml_backend_cuda_buffer_commit_run): runs[i] = the number of chunks
+    // of the run that starts at chunk i (1 for a chunk backed alone), 0 inside a run or where nothing is backed; its chunks share a handle
+    std::vector<uint32_t> runs;
 #endif
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
@@ -952,10 +955,12 @@ struct ggml_backend_cuda_buffer_context {
         ggml_cuda_set_device(device);
         int64_t freed = 0;
         for (size_t i = 0; i < chunks.size(); ++i) {
-            if (chunks[i] != 0) {
-                CU_CHECK(cuMemUnmap((CUdeviceptr) dev_ptr + i*lazy_gran, lazy_gran));
+            if (chunks[i] != 0 && runs[i] > 0) {
+                const size_t n = runs[i];
+                CU_CHECK(cuMemUnmap((CUdeviceptr) dev_ptr + i*lazy_gran, n*lazy_gran));
                 CU_CHECK(cuMemRelease(chunks[i]));
-                freed += (int64_t) lazy_gran;
+                freed += (int64_t) (n*lazy_gran);
+                i += n - 1;
             }
         }
         ggml_cuda_own_add(device, -freed);
@@ -1133,7 +1138,12 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
         // only the backed chunks (a chunk is cleared when it is backed, see ggml_backend_cuda_buffer_commit)
         for (size_t i = 0; i < ctx->chunks.size(); ++i) {
             if (ctx->chunks[i] != 0) {
-                CUDA_CHECK(cudaMemsetAsync((char *) ctx->dev_ptr + i*ctx->lazy_gran, value, ctx->lazy_gran, cudaStreamPerThread));
+                size_t j = i; // (k19-t4small: one memset per span of backed chunks)
+                while (j + 1 < ctx->chunks.size() && ctx->chunks[j + 1] != 0) {
+                    j++;
+                }
+                CUDA_CHECK(cudaMemsetAsync((char *) ctx->dev_ptr + i*ctx->lazy_gran, value, (j + 1 - i)*ctx->lazy_gran, cudaStreamPerThread));
+                i = j;
             }
         }
 #endif
@@ -1288,6 +1298,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_alloc_lazy(ggml_backend_bu
     ctx->lazy_size = res;
     ctx->lazy_gran = gran;
     ctx->chunks.assign(res / gran, 0);
+    ctx->runs.assign(res / gran, 0);
     return ggml_backend_buffer_init(ggml_backend_cuda_buffer_type(device), ggml_backend_cuda_buffer_interface, ctx, size);
 #else
     GGML_UNUSED(device);
@@ -1351,6 +1362,7 @@ static bool ggml_backend_cuda_buffer_commit(ggml_backend_buffer_t buffer, size_t
             return false;
         }
         ctx->chunks[i] = h;
+        ctx->runs[i]   = 1;
         ggml_cuda_own_add(ctx->device, (int64_t) ctx->lazy_gran);
         CUDA_CHECK(cudaMemsetAsync((void *) at, 0, ctx->lazy_gran, cudaStreamPerThread));
     }
@@ -1384,14 +1396,20 @@ static size_t ggml_backend_cuda_buffer_decommit(ggml_backend_buffer_t buffer, si
     CUDA_CHECK(cudaDeviceSynchronize());
     size_t freed = 0;
     for (size_t i = c0; i < c1; ++i) {
-        if (ctx->chunks[i] == 0) {
+        // (k19-t4small: a run is given back whole, so one that starts before c0 or ends after c1 stays backed)
+        if (ctx->chunks[i] == 0 || ctx->runs[i] == 0 || i + ctx->runs[i] > c1) {
             continue;
         }
+        const size_t n = ctx->runs[i];
         const CUdeviceptr at = (CUdeviceptr) ctx->dev_ptr + i*ctx->lazy_gran;
-        CU_CHECK(cuMemUnmap(at, ctx->lazy_gran));
+        CU_CHECK(cuMemUnmap(at, n*ctx->lazy_gran));
         CU_CHECK(cuMemRelease(ctx->chunks[i]));
-        ctx->chunks[i] = 0;
-        freed += ctx->lazy_gran;
+        for (size_t j = i; j < i + n; ++j) {
+            ctx->chunks[j] = 0;
+            ctx->runs[j]   = 0;
+        }
+        freed += n*ctx->lazy_gran;
+        i += n - 1;
     }
     if (freed > 0) {
         ggml_cuda_own_add(ctx->device, -(int64_t) freed);
@@ -1400,6 +1418,84 @@ static size_t ggml_backend_cuda_buffer_decommit(ggml_backend_buffer_t buffer, si
 #else
     GGML_UNUSED(offset);
     return 0;
+#endif
+}
+
+// k19-t4small: as ggml_backend_cuda_buffer_commit, but each span of chunks not backed yet inside [offset, offset + size) is backed by one
+// physical allocation (mapped, given access and cleared once): the MoE cache's decode extension backs and gives back hundreds of MiB per
+// request, which chunk by chunk took ~70 us per 2 MiB each way. A span the device cannot back whole is backed chunk by chunk
+static bool ggml_backend_cuda_buffer_commit_run(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
+        return true;
+    }
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (!ctx->lazy) {
+        return true;
+    }
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (size == 0) {
+        return true;
+    }
+    const size_t c0 = offset / ctx->lazy_gran;
+    const size_t c1 = std::min(ctx->chunks.size(), (offset + size + ctx->lazy_gran - 1) / ctx->lazy_gran);
+    ggml_cuda_set_device(ctx->device);
+    const int physical = ggml_cuda_get_physical_device(ctx->device);
+    for (size_t i = c0; i < c1; ++i) {
+        if (ctx->chunks[i] != 0) {
+            continue;
+        }
+        size_t j = i;
+        while (j + 1 < c1 && ctx->chunks[j + 1] == 0) {
+            j++;
+        }
+        const size_t n  = j + 1 - i;
+        const size_t sz = n*ctx->lazy_gran;
+        const CUdeviceptr at = (CUdeviceptr) ctx->dev_ptr + i*ctx->lazy_gran;
+        CUmemAllocationProp prop = {};
+        prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id   = physical;
+        CUmemGenericAllocationHandle h = 0;
+        bool ok = n > 1 && cuMemCreate(&h, sz, &prop, 0) == CUDA_SUCCESS;
+        if (ok && cuMemMap(at, sz, 0, h, 0) != CUDA_SUCCESS) {
+            CU_CHECK(cuMemRelease(h));
+            ok = false;
+        }
+        if (ok) {
+            CUmemAccessDesc access = {};
+            access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            access.location.id   = physical;
+            access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            if (cuMemSetAccess(at, sz, &access, 1) != CUDA_SUCCESS) {
+                CU_CHECK(cuMemUnmap(at, sz));
+                CU_CHECK(cuMemRelease(h));
+                ok = false;
+            }
+        }
+        if (!ok) {
+            (void) cudaGetLastError();
+            // chunk by chunk (also a span of one chunk)
+            if (!ggml_backend_cuda_buffer_commit(buffer, i*ctx->lazy_gran, sz)) {
+                return false;
+            }
+            i = j;
+            continue;
+        }
+        for (size_t k = i; k <= j; ++k) {
+            ctx->chunks[k] = h;
+            ctx->runs[k]   = 0;
+        }
+        ctx->runs[i] = (uint32_t) n;
+        ggml_cuda_own_add(ctx->device, (int64_t) sz);
+        CUDA_CHECK(cudaMemsetAsync((void *) at, 0, sz, cudaStreamPerThread));
+        i = j;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    return true;
+#else
+    GGML_UNUSED(offset);
+    GGML_UNUSED(size);
+    return true;
 #endif
 }
 
@@ -12699,6 +12795,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_buffer_decommit") == 0) {
         return (void *)ggml_backend_cuda_buffer_decommit;
+    }
+    if (strcmp(name, "ggml_backend_buffer_commit_run") == 0) {
+        return (void *)ggml_backend_cuda_buffer_commit_run;
     }
     if (strcmp(name, "ggml_backend_moe_fetch_overlap_default") == 0) {
         return (void *)ggml_backend_cuda_moe_fetch_overlap_default;
