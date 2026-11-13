@@ -1,0 +1,311 @@
+// k19-autoprof: the self-learned profile files (src/llama-autoprof.h, the PLE row recorder of src/llama-row-cache.*).
+//   1. the directory (the CPU-miss calibration's: LLAMA_MOE_CPU_MISS_CAL_DIR, LLAMA_CACHE, XDG_CACHE_HOME, HOME; LLAMA_MOE_AUTOPROF_DIR
+//      overrides), the switch LLAMA_MOE_AUTOPROF (0 off, 1 record + use, 2 record only, 3 use only), the file names and the model key;
+//   2. the atomic write: the file holds the new body, no temporary is left, a write that cannot complete leaves the old file;
+//   3. the MoE routing profile body (as written by the cache) reads back with llama_moe_profile_load; no file / a cut file reads nothing;
+//   4. the PLE recorder: a record-only cache (no slots) gathers bit-identical rows, counts every read and keeps each row's bytes; its
+//      profile preloads exactly the recorded rows in a later cache (gathers still bit-identical, static hits); a second session adds its
+//      reads to the halved loaded counts; the memory cap holds; a missing profile preloads nothing.
+// usage: test-autoprof
+
+#include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
+
+#include "../src/llama-autoprof.h"
+#include "../src/llama-moe-cache.h"
+#include "../src/llama-row-cache.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <random>
+#include <set>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#ifdef _WIN32
+static int setenv(const char * name, const char * value, int /*overwrite*/) { return _putenv_s(name, value); }
+static int unsetenv(const char * name) { return _putenv_s(name, ""); }
+#endif
+
+static int n_fail = 0;
+
+#define CHECK(cond, ...) do { if (!(cond)) { fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); n_fail++; } } while (0)
+
+namespace fs = std::filesystem;
+
+static std::string slurp(const std::string & p) {
+    std::ifstream f(p, std::ios::binary);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+static size_t n_tmp_left(const fs::path & d) {
+    size_t n = 0;
+    std::error_code ec;
+    for (const auto & e : fs::directory_iterator(d, ec)) {
+        n += e.path().filename().string().find(".tmp") != std::string::npos ? 1 : 0;
+    }
+    return n;
+}
+
+static void test_names(const fs::path & root) {
+    unsetenv("LLAMA_MOE_CPU_MISS_CAL_DIR");
+    unsetenv("LLAMA_CACHE");
+    unsetenv("LLAMA_MOE_AUTOPROF_DIR");
+    setenv("XDG_CACHE_HOME", (root / "xdg").string().c_str(), 1);
+#if !defined(_WIN32)
+    CHECK(llama_autoprof::cal_dir() == (root / "xdg").string() + "/llama.cpp", "XDG dir: %s", llama_autoprof::cal_dir().c_str());
+#endif
+    setenv("LLAMA_CACHE", (root / "lc").string().c_str(), 1);
+    CHECK(llama_autoprof::cal_dir() == (root / "lc").string(), "LLAMA_CACHE dir: %s", llama_autoprof::cal_dir().c_str());
+    setenv("LLAMA_MOE_CPU_MISS_CAL_DIR", (root / "cal").string().c_str(), 1);
+    CHECK(llama_autoprof::cal_dir() == (root / "cal").string(), "calibration dir: %s", llama_autoprof::cal_dir().c_str());
+    CHECK(llama_autoprof::dir() == llama_autoprof::cal_dir(), "the profile directory is the calibration directory by default");
+    setenv("LLAMA_MOE_AUTOPROF_DIR", (root / "ap").string().c_str(), 1);
+    CHECK(llama_autoprof::dir() == (root / "ap").string(), "LLAMA_MOE_AUTOPROF_DIR: %s", llama_autoprof::dir().c_str());
+
+    struct { const char * v; int m; } modes[] = { { nullptr, 1 }, { "", 1 }, { "0", 0 }, { "1", 1 }, { "2", 2 }, { "3", 3 }, { "7", 1 } };
+    for (const auto & t : modes) {
+        if (t.v) {
+            setenv("LLAMA_MOE_AUTOPROF", t.v, 1);
+        } else {
+            unsetenv("LLAMA_MOE_AUTOPROF");
+        }
+        CHECK(llama_autoprof::mode() == t.m, "LLAMA_MOE_AUTOPROF=%s -> %d", t.v ? t.v : "(unset)", llama_autoprof::mode());
+    }
+    unsetenv("LLAMA_MOE_AUTOPROF");
+    CHECK(!llama_autoprof::records(0) && !llama_autoprof::uses(0), "0 = off");
+    CHECK(llama_autoprof::records(1) && llama_autoprof::uses(1), "1 = record + use");
+    CHECK(llama_autoprof::records(2) && !llama_autoprof::uses(2), "2 = record only");
+    CHECK(!llama_autoprof::records(3) && llama_autoprof::uses(3), "3 = use only");
+
+    const uint64_t h1 = llama_autoprof::model_hash("qwen 35B IQ4_XS", 1000, 2000);
+    CHECK(h1 == llama_autoprof::model_hash("qwen 35B IQ4_XS", 1000, 2000), "model key is deterministic");
+    CHECK(h1 != llama_autoprof::model_hash("qwen 35B IQ4_XS", 1000, 2001), "model key names the size");
+    CHECK(h1 != llama_autoprof::model_hash("qwen 35B Q4_K", 1000, 2000), "model key names the description");
+    const std::string p = llama_autoprof::path("/d", "moe", 0x1234, ".48.512");
+#if !defined(_WIN32)
+    CHECK(p == "/d/autoprof_moe_0000000000001234.48.512", "path: %s", p.c_str());
+#endif
+    CHECK(llama_autoprof::path("", "moe", 1, "").empty(), "no directory, no path");
+}
+
+static void test_write(const fs::path & root) {
+    const fs::path d = root / "w" / "sub";
+    const std::string f = (d / "x.txt").string();
+    CHECK(llama_autoprof::write_atomic(f, "first\n"), "write into a new directory");
+    CHECK(slurp(f) == "first\n", "content");
+    std::string big(1 << 20, 'a');
+    CHECK(llama_autoprof::write_atomic(f, big), "overwrite");
+    CHECK(slurp(f) == big, "overwritten content");
+    CHECK(n_tmp_left(d) == 0, "no temporary left");
+    // the target is a directory: the rename fails, the temporary is removed, the directory untouched
+    const fs::path dd = d / "isdir";
+    fs::create_directories(dd / "keep");
+    CHECK(!llama_autoprof::write_atomic(dd.string(), "y"), "a write over a directory fails");
+    CHECK(fs::is_directory(dd / "keep"), "the directory is untouched");
+    CHECK(n_tmp_left(d) == 0, "no temporary left after a failed write");
+    // a directory that cannot be made (a file in the way): false, the old file kept
+    CHECK(!llama_autoprof::write_atomic((fs::path(f) / "z").string(), "z"), "a path under a file fails");
+    CHECK(slurp(f) == big, "the old file is kept");
+    CHECK(!llama_autoprof::write_atomic("", "z"), "no path, no write");
+}
+
+static void test_moe_body(const fs::path & root) {
+    // the body ap_save writes (heat descending), read with the shared reader
+    const std::string f = (root / "autoprof_moe_test.3.8").string();
+    std::vector<int32_t> ne = { 8, 8, 8 };
+    std::vector<llama_moe_profile_entry> out;
+    CHECK(!llama_moe_profile_load(f, ne, out) && out.empty(), "no file: nothing read");
+    std::string body = "moe-cache-profile 1 3\n";
+    const int il[] = { 1, 0, 2, 0 }, e[] = { 3, 7, 0, 1 };
+    const float h[] = { 96.5f, 40.0f, 3.0f, 0.5f };
+    char buf[64];
+    for (int i = 0; i < 4; ++i) {
+        snprintf(buf, sizeof(buf), "%d %d %.6g\n", il[i], e[i], h[i]);
+        body += buf;
+    }
+    CHECK(llama_autoprof::write_atomic(f, body), "write");
+    CHECK(llama_moe_profile_load(f, ne, out) && out.size() == 4, "read back %zu", out.size());
+    for (size_t i = 0; i < out.size() && i < 4; ++i) {
+        CHECK(out[i].il == il[i] && out[i].e == e[i] && out[i].heat == h[i], "entry %zu", i);
+    }
+    CHECK(!llama_moe_profile_load(f, { 8, 8 }, out), "another layer count is refused");
+    CHECK(llama_autoprof::write_atomic(f, body.substr(0, body.size() - 6)), "write a cut body");
+    CHECK(!llama_moe_profile_load(f, ne, out), "a cut file is refused");
+}
+
+// ------------------------------------------------------------------------------------------------------------------------------------
+// PLE recorder
+
+struct gather_env {
+    ggml_backend_t        be  = nullptr;
+    ggml_context *        ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_tensor *         tab = nullptr;
+    ggml_tensor *         ids = nullptr;
+    ggml_tensor *         out = nullptr;
+    ggml_cgraph *         gf  = nullptr;
+};
+
+static bool gather_init(gather_env & g, ggml_type type, int64_t ncols, int64_t nrows, int64_t nids, std::mt19937 & rng) {
+    g.be = ggml_backend_cpu_init();
+    ggml_backend_cpu_set_n_threads(g.be, 4);
+    ggml_init_params ip = { ggml_tensor_overhead()*8 + ggml_graph_overhead(), nullptr, true };
+    g.ctx = ggml_init(ip);
+    g.tab = ggml_new_tensor_2d(g.ctx, type, ncols, nrows);
+    g.ids = ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, nids);
+    g.out = ggml_get_rows(g.ctx, g.tab, g.ids);
+    g.gf  = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, g.out);
+    g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, g.be);
+    if (!g.buf) {
+        return false;
+    }
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> f(ncols*nrows);
+    for (auto & x : f) {
+        x = nd(rng);
+    }
+    std::vector<uint8_t> q(ggml_nbytes(g.tab));
+    ggml_quantize_chunk(type, f.data(), q.data(), 0, nrows, ncols, nullptr);
+    ggml_backend_tensor_set(g.tab, q.data(), 0, q.size());
+    return true;
+}
+
+static std::vector<float> gather_run(gather_env & g, const std::vector<int32_t> & ids) {
+    ggml_backend_tensor_set(g.ids, ids.data(), 0, ids.size()*sizeof(int32_t));
+    ggml_backend_graph_compute(g.be, g.gf);
+    std::vector<float> out(ggml_nelements(g.out));
+    ggml_backend_tensor_get(g.out, out.data(), 0, out.size()*sizeof(float));
+    return out;
+}
+
+static uint64_t prof_entries(const std::string & p) {
+    const std::string s = slurp(p);
+    uint64_t n = UINT64_MAX;
+    if (s.size() >= 48 && memcmp(s.data(), "LLPLERC2", 8) == 0) {
+        memcpy(&n, s.data() + 40, 8);
+    }
+    return n;
+}
+
+static void test_recorder(const fs::path & root) {
+    std::mt19937 rng(77);
+    const int64_t ncols = 256, nrows = 5000, nids = 2048;
+    const ggml_type type = GGML_TYPE_Q8_0;
+    gather_env g;
+    if (!gather_init(g, type, ncols, nrows, nids, rng)) {
+        CHECK(false, "alloc failed");
+        return;
+    }
+    const size_t row_b = ggml_row_size(type, ncols);
+    std::vector<std::vector<int32_t>> sets;
+    std::set<int32_t> seen;
+    for (int i = 0; i < 4; ++i) {
+        std::vector<int32_t> v(nids);
+        for (auto & x : v) {
+            x = (rng() & 1) ? (int32_t) (rng() % 200) * 13 % nrows : (int32_t) (rng() % nrows);
+        }
+        seen.insert(v.begin(), v.end());
+        sets.push_back(v);
+    }
+    std::vector<std::vector<float>> ref;
+    for (const auto & s : sets) {
+        ref.push_back(gather_run(g, s));
+    }
+    const std::string prof = (root / "autoprof_ple_test.5000").string();
+
+    // session 1: record only (no slots, part below row 1000: those rows are recorded too)
+    {
+        llama_row_cache rc(g.tab, 0, 0, 1000);
+        size_t n0 = rc.load_profile(fs::exists(prof) ? prof : (root / "missing.prof").string());
+        CHECK(n0 == 0, "a missing profile preloads nothing");
+        rc.enable_recorder(64u << 20);
+        CHECK(rc.capacity() == 0, "record only: no slots (%zu)", rc.capacity());
+        CHECK(llama_row_cache_attach(&rc), "attach");
+        for (size_t i = 0; i < sets.size(); ++i) {
+            const auto out = gather_run(g, sets[i]);
+            CHECK(memcmp(out.data(), ref[i].data(), out.size()*sizeof(float)) == 0, "session 1 set %zu: gather differs", i);
+        }
+        llama_row_cache_detach(g.tab);
+        CHECK(rc.st.n_recorded.load() == (uint64_t) (nids*sets.size()), "every read recorded: %llu", (unsigned long long) rc.st.n_recorded.load());
+        CHECK(rc.n_recorded_rows() == seen.size(), "distinct rows %zu vs %zu", rc.n_recorded_rows(), seen.size());
+        CHECK(rc.st.n_hits.load() == 0, "record only: no hits");
+        CHECK(rc.save_profile(prof), "save");
+        CHECK(prof_entries(prof) == seen.size(), "profile rows %llu", (unsigned long long) prof_entries(prof));
+        CHECK(n_tmp_left(root) == 0, "no temporary left");
+    }
+    // session 2: the profile preloads the recorded rows above the part; gathers identical; the recorder adds this session's reads
+    {
+        const size_t slot = llama_row_cache::slot_bytes(row_b);
+        llama_row_cache rc(g.tab, 200*slot, 100000*slot, 1000);
+        const size_t n = rc.load_profile(prof);
+        size_t above = 0;
+        for (int32_t r : seen) {
+            above += r >= 1000 ? 1 : 0;
+        }
+        CHECK(n == above, "preloaded %zu of %zu recorded rows above the part", n, above);
+        rc.enable_recorder(64u << 20);
+        rc.verify = true;
+        CHECK(llama_row_cache_attach(&rc), "attach");
+        for (size_t i = 0; i < sets.size(); ++i) {
+            const auto out = gather_run(g, sets[i]);
+            CHECK(memcmp(out.data(), ref[i].data(), out.size()*sizeof(float)) == 0, "session 2 set %zu: gather differs", i);
+        }
+        llama_row_cache_detach(g.tab);
+        CHECK(rc.st.n_hits_static.load() > 0 && rc.st.n_verify_bad.load() == 0, "static hits %llu, bad %llu",
+            (unsigned long long) rc.st.n_hits_static.load(), (unsigned long long) rc.st.n_verify_bad.load());
+        CHECK(rc.save_profile(prof), "save 2");
+        CHECK(prof_entries(prof) == seen.size(), "profile rows after session 2: %llu", (unsigned long long) prof_entries(prof));
+    }
+    // a third cache: the rows' bytes in the file are the table's (load checks every row's checksum and spot-checks the mapping)
+    {
+        llama_row_cache rc(g.tab, 0, 1u << 30, 0);
+        CHECK(rc.load_profile(prof) == seen.size(), "every recorded row loads");
+        std::vector<uint8_t> tmp(row_b);
+        size_t bad = 0;
+        for (int32_t r : seen) {
+            bad += !rc.peek(r, tmp.data()) || memcmp(tmp.data(), (const uint8_t *) g.tab->data + (size_t) r*g.tab->nb[1], row_b) != 0;
+        }
+        CHECK(bad == 0, "%zu rows differ from the table", bad);
+    }
+    // the memory cap: about 100 rows
+    {
+        llama_row_cache rc(g.tab, 0, 0, 0);
+        rc.enable_recorder(100*(row_b + 24));
+        CHECK(llama_row_cache_attach(&rc), "attach");
+        gather_run(g, sets[0]);
+        llama_row_cache_detach(g.tab);
+        CHECK(rc.n_recorded_rows() <= 100 && rc.n_recorded_rows() >= 90 && rc.st.n_rec_full.load() > 0, "cap: %zu rows, %llu refused",
+            rc.n_recorded_rows(), (unsigned long long) rc.st.n_rec_full.load());
+    }
+    ggml_backend_buffer_free(g.buf);
+    ggml_free(g.ctx);
+    ggml_backend_free(g.be);
+}
+
+int main() {
+    const fs::path root = fs::absolute("test-autoprof.tmp");
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    fs::create_directories(root);
+    test_names(root);
+    test_write(root);
+    test_moe_body(root);
+    test_recorder(root);
+    fs::remove_all(root, ec);
+    if (n_fail == 0) {
+        printf("test-autoprof: ALL OK\n");
+        return 0;
+    }
+    printf("test-autoprof: %d FAILED\n", n_fail);
+    return 1;
+}

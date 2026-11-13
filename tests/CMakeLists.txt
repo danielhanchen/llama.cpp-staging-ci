@@ -529,6 +529,7 @@ if (NOT WIN32 AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-weight-store.cpp)
     llama_build_and_test(test-moe-host-cache.cpp)
     llama_build_and_test(test-moe-ram-profile.cpp) # k19-ramprof: routing profile file + RAM-tier fill order
+    llama_build_and_test(test-autoprof.cpp)        # k19-autoprof: self-learned profile files, atomic write, PLE row recorder
     llama_build_and_test(test-moe-cache-tail-skip.cpp)
 endif()
 

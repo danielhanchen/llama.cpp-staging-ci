@@ -32,6 +32,8 @@ struct llama_row_cache {
         std::atomic<uint64_t> n_filtered {0}; // hint / prefetch rows dropped because they were cached
         std::atomic<uint64_t> n_verified {0}; // LLAMA_PLE_ROW_CACHE_VERIFY=1: hits compared with the mapping
         std::atomic<uint64_t> n_verify_bad {0};
+        std::atomic<uint64_t> n_recorded {0};   // k19-autoprof: row reads counted by the recorder
+        std::atomic<uint64_t> n_rec_full {0};   // ... of new rows past the recorder's memory cap (not kept)
     };
 
     // table: the lazily mapped table (host buffer, matrix); dyn_bytes: memory (slots + index) of the dynamic rows; static_max_bytes:
@@ -44,8 +46,18 @@ struct llama_row_cache {
     // skip_below: the ids are ascending), and spot-checks up to 64 of
     // them (every one when the profile is small) against the mapping; a mismatch drops them all. Returns the rows kept.
     size_t load_profile(const std::string & path);
-    // writes every cached row (static and dynamic) with its uses (static counts carried over, halved) to path (tmp + rename)
+    // writes every cached row (static and dynamic) with its uses (static counts carried over, halved) to path (tmp + rename); with the
+    // recorder on, the recorded rows (their reads of this launch) instead of the dynamic slots' counts
     bool save_profile(const std::string & path) const;
+
+    // k19-autoprof: a recorder of the rows the gather reads (every row of the table, also below skip_below and rows the cache holds):
+    // a count per row and a copy of its bytes taken at its first read (the bytes the gather reads anyway), at most max_bytes of memory
+    // (rows first seen past it are not kept); written by save_profile. The cache itself may have no slots (record only): the gather
+    // then reads every row from the mapping as without a cache
+    void enable_recorder(size_t max_bytes);
+    bool recording() const { return rec_on; }
+    void record(int64_t r, const uint8_t * bytes);
+    size_t n_recorded_rows() const;
 
     // copies row `r` into out and returns true when cached (counts a use)
     bool get(int64_t r, uint8_t * out);
@@ -92,6 +104,13 @@ private:
         uint32_t n_static  = 0;   // slots [0, n_static) are static
         uint32_t n_used    = 0;   // slots in use (static + dynamic, filled from the front)
         uint32_t hand      = 0;   // clock hand over the dynamic slots
+        // k19-autoprof recorder: open addressing row -> entry
+        std::vector<uint32_t> rec_keys;
+        std::vector<uint32_t> rec_vals;
+        uint32_t rec_mask = 0;
+        std::vector<uint32_t> rec_row;
+        std::vector<uint32_t> rec_cnt;
+        std::vector<uint8_t>  rec_data;
     };
 
     shard & shard_of(int64_t r) const { return shards[(size_t) (mix(r) >> 58) % n_shards]; }
@@ -111,6 +130,9 @@ private:
     size_t  n_static_max  = 0;
     size_t  n_static_rows = 0;
     size_t  mem_bytes     = 0;
+    bool    rec_on        = false;
+    size_t  rec_max_bytes = 0;
+    std::atomic<size_t> rec_bytes {0};
 };
 
 // makes rc the row source of the CPU GET_ROWS of rc->table (ggml_backend_cpu_set_row_source); false where the CPU backend lacks it
