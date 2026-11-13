@@ -2149,10 +2149,60 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool    cost_on   = false; // spec_cost || tpp_floor > 0: the round times and draft probabilities are recorded
     common_spec_mtp_cost cost_pol;
     common_spec_tpp_cost tpp_cost;
+    // k19-adraft (params.adraft > 0: the greedy window's drafts). Sampled requests, LLAMA_SPEC_ADRAFT=1: confidence gate, the 2nd draft
+    // is kept when its probability is at least adraft_p2 (LLAMA_SPEC_ADRAFT_P2, default 0: always), every later one when at least adraft_p
+    // (LLAMA_SPEC_ADRAFT_P, default 0.9), the window ending at the first draft below its bar (a function of the text: no timing).
+    // =2: priced by cost_pol (expected tokens per ms, live round times; LLAMA_SPEC_ADRAFT_FLOOR: fewest drafts)
+    int32_t adraft_keep  = 0;
+    int32_t adraft_mode  = 0;
+    int32_t adraft_floor = 0;
+    float   adraft_p     = 0.9f;
+    float   adraft_p2    = 0.0f;
+    bool    adraft_prev  = false;   // LLAMA_SPEC_ADRAFT_PREV=1: the bar is checked on the last kept draft, so a draft is made only when kept
+    std::array<int64_t, 9> adraft_hist{};   // sampled windows by kept drafts
+    // =3: one width per stretch of the request: a sampled request drafts n_max while the running share of its drafts that held (EMA,
+    // weight 1/LLAMA_SPEC_ADRAFT_EMA_N, 16) is at least LLAMA_SPEC_ADRAFT_ON (0.75), adraft_keep once it falls below LLAMA_SPEC_ADRAFT_OFF
+    // (0.65), switching at most every LLAMA_SPEC_ADRAFT_DWELL (16) rounds (each width switch costs the cached tier a graph change);
+    // =4: n_max below position LLAMA_SPEC_ADRAFT_POS (1536), adraft_keep from there. Both functions of the text
+    double  adraft_on  = 0.75, adraft_off = 0.65, adraft_ema_n = 16.0;
+    int32_t adraft_dwell = 16;
+    int64_t adraft_pos   = 1536;
+    struct adraft_seq {
+        double ema    = 0.0;
+        int    rounds = 0;      // rounds since the request began
+        int    since  = 0;      // rounds since the last width switch
+        bool   deep   = false;
+        int    drafted = 0;     // drafts of the window in flight
+    };
+    std::vector<adraft_seq> adraft_st;
+    int64_t adraft_switches = 0;
+    static bool sampled(const common_speculative_draft_params & dp) {
+        return dp.temp > 0.0f;
+    }
+    bool priced(const common_speculative_draft_params & dp) const {
+        return !dp.result_q && (spec_cost || (adraft_mode == 2 && adraft_keep > 0 && sampled(dp)));
+    }
+    bool gated(const common_speculative_draft_params & dp) const {
+        return !dp.result_q && adraft_mode == 1 && adraft_keep > 0 && sampled(dp);
+    }
+    // the window cap of a request that is neither gated nor priced (k19-adraft modes 3 / 4: per-stretch width; else adraft_keep)
+    int adraft_cap(llama_seq_id seq_id, const common_speculative_draft_params & dp) const {
+        if (dp.result_q || !sampled(dp) || adraft_keep <= 0) {
+            return adraft_keep;
+        }
+        if (adraft_mode == 3) {
+            return adraft_st[seq_id].deep ? params.n_max : adraft_keep;
+        }
+        if (adraft_mode == 4) {
+            return dp.pos0 < adraft_pos ? params.n_max : adraft_keep;
+        }
+        return adraft_keep;
+    }
     struct cost_seq {
         int64_t t_us = 0;            // the previous draft() call (0: none since the request began)
         int     rows = 1;            // the window drafted then
         int     drafted = 0;         // k19-tpp: the drafts made then (more than rows - 1: a wider window was drafted and not kept)
+        bool    cal = true;          // k19-adraft: its drafts calibrate the hold rates (sampled rounds only)
         std::vector<float> probs;    // its drafts' probabilities
         common_spec_mtp_cost::chain_state chain;
     };
@@ -2241,7 +2291,57 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 this->params.n_max = std::min(this->params.n_max, this->params.n_floor);
             }
         }
-        cost_on = spec_cost || tpp_floor > 0;
+        // k19-adraft: one trained head without shared memory, no other window policy
+        if (this->params.adraft > 0) {
+            if (!chain_heads && !is_mem_shared && !spec_cost && tpp_floor == 0 && this->params.n_max > this->params.adraft) {
+                const char * m = getenv("LLAMA_SPEC_ADRAFT");
+                adraft_keep  = this->params.adraft;
+                adraft_mode  = m != nullptr && atoi(m) >= 2 && atoi(m) <= 4 ? atoi(m) : 1;
+                auto envf = [](const char * n, double & v) { if (const char * e = getenv(n)) { v = atof(e); } };
+                envf("LLAMA_SPEC_ADRAFT_ON", adraft_on);
+                envf("LLAMA_SPEC_ADRAFT_OFF", adraft_off);
+                envf("LLAMA_SPEC_ADRAFT_EMA_N", adraft_ema_n);
+                adraft_ema_n = std::max(1.0, adraft_ema_n);
+                if (const char * e = getenv("LLAMA_SPEC_ADRAFT_DWELL")) {
+                    adraft_dwell = std::max(1, atoi(e));
+                }
+                if (const char * e = getenv("LLAMA_SPEC_ADRAFT_POS")) {
+                    adraft_pos = atoll(e);
+                }
+                adraft_floor = [] {
+                    const char * f = getenv("LLAMA_SPEC_ADRAFT_FLOOR");
+                    return f != nullptr ? std::max(0, atoi(f)) : 0;
+                }();
+                adraft_floor = std::min(adraft_floor, this->params.n_max);
+                if (const char * e = getenv("LLAMA_SPEC_ADRAFT_P")) {
+                    adraft_p = (float) atof(e);
+                }
+                if (const char * e = getenv("LLAMA_SPEC_ADRAFT_P2")) {
+                    adraft_p2 = (float) atof(e);
+                }
+                if (const char * e = getenv("LLAMA_SPEC_ADRAFT_PREV")) {
+                    adraft_prev = atoi(e) != 0;
+                }
+                if (adraft_mode == 3) {
+                    LOG_INF("%s: k19-adraft: sampled requests: %d drafts while the running hold share is >= %.2f, %d below %.2f, at most one "
+                        "switch per %d rounds; greedy requests: %d drafts (LLAMA_SPEC_ADRAFT=0: off)\n", __func__, this->params.n_max, adraft_on,
+                        adraft_keep, adraft_off, adraft_dwell, adraft_keep);
+                } else if (adraft_mode == 4) {
+                    LOG_INF("%s: k19-adraft: sampled requests: %d drafts below position %lld, %d from there; greedy requests: %d drafts "
+                        "(LLAMA_SPEC_ADRAFT=0: off)\n", __func__, this->params.n_max, (long long) adraft_pos, adraft_keep, adraft_keep);
+                } else if (adraft_mode == 1) {
+                    LOG_INF("%s: k19-adraft: sampled requests: MTP windows of 1..%d drafts, the 2nd kept at p >= %.2f, later ones at p >= %.2f, "
+                        "bar on %s; greedy requests: %d drafts (LLAMA_SPEC_ADRAFT=0: off)\n", __func__, this->params.n_max, adraft_p2, adraft_p,
+                        adraft_prev ? "the draft before (LLAMA_SPEC_ADRAFT_PREV)" : "the draft itself", adraft_keep);
+                } else {
+                    LOG_INF("%s: k19-adraft: sampled requests: MTP windows by expected tokens per ms, %d..%d drafts; greedy requests: %d drafts "
+                        "(LLAMA_SPEC_ADRAFT=2; =0: off)\n", __func__, adraft_floor, this->params.n_max, adraft_keep);
+                }
+            } else {
+                this->params.n_max = std::min(this->params.n_max, this->params.adraft);
+            }
+        }
+        cost_on = spec_cost || tpp_floor > 0 || adraft_mode == 2;
         this->n_max = this->params.n_max;
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
@@ -2257,6 +2357,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         pending_dev.assign(n_seq, 0);
         verify_dev.assign(n_seq, 0);
         cost_st.assign(n_seq, {});
+        adraft_st.assign(n_seq, {});
         if (spec_cost) {
             LOG_INF("%s: MTP window by expected tokens per ms (LLAMA_SPEC_COST=1), up to %d drafts\n", __func__, this->params.n_max);
         }
@@ -2382,6 +2483,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
+        if (adraft_mode == 3 && seq_id >= 0 && seq_id < (llama_seq_id) adraft_st.size()) {
+            adraft_st[seq_id] = {};
+        }
+        if (adraft_mode == 1 || adraft_mode >= 3) {
+            int64_t n = 0;
+            std::string h;
+            for (size_t k = 0; k <= (size_t) params.n_max && k < adraft_hist.size(); ++k) {
+                n += adraft_hist[k];
+                h += string_format(" %zu:%lld", k, (long long) adraft_hist[k]);
+            }
+            if (n > 0) {
+                LOG_INF("%s: k19-adraft: sampled windows by drafts kept (so far):%s, width switches %lld\n", __func__, h.c_str(),
+                    (long long) adraft_switches);
+            }
+        }
         if (cost_on && seq_id >= 0 && seq_id < (llama_seq_id) cost_st.size()) {
             if (cost_st[seq_id].t_us > 0) {
                 if (tpp_floor > 0) {
@@ -2752,6 +2868,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 cs.t_us  = now;
                 cs.rows  = 1;
                 cs.chain = {};
+                cs.cal   = adraft_keep == 0 || sampled(dp);
                 cs.probs.clear();
             }
 
@@ -2844,6 +2961,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
+                // k19-adraft: the confidence gate (the draft below its bar is not proposed)
+                if (gated(dp) && !adraft_prev && !result.empty() && p_draft < (result.size() == 1 ? adraft_p2 : adraft_p)) {
+                    drafting[seq_id] = false;
+                    n_drafting--;
+
+                    continue;
+                }
+
                 common_sampler_accept(smpl, id, true);
 
                 result.push_back(id);
@@ -2881,15 +3006,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         n_drafting--;
                         continue;
                     }
-                } else if (spec_cost && !dp.result_q) {
+                } else if (priced(dp)) {
                     auto & cs = cost_st[seq_id];
                     cs.probs.push_back(p_draft);
                     const int cap = 1 + (dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max);
-                    if (!cost_pol.keep_draft(cs.chain, (int) result.size() - 1, p_draft, cap)) {
+                    const bool more = cost_pol.keep_draft(cs.chain, (int) result.size() - 1, p_draft, cap);
+                    if (!more && (int) result.size() >= adraft_floor) {
                         drafting[seq_id] = false;
                         n_drafting--;
                         continue;
                     }
+                } else if (gated(dp) && adraft_prev && p_draft < (result.size() == 1 ? adraft_p2 : adraft_p)) {
+                    // k19-adraft (LLAMA_SPEC_ADRAFT_PREV=1): the next draft is made only when this one clears the next one's bar
+                    drafting[seq_id] = false;
+                    n_drafting--;
+                    continue;
+                } else if (adraft_keep > 0 && !gated(dp) && (int) result.size() >= adraft_cap(seq_id, dp)) {
+                    // k19-adraft: a greedy request's window, as with n_max = adraft_keep (modes 3 / 4: the stretch's width)
+                    drafting[seq_id] = false;
+                    n_drafting--;
+                    continue;
                 }
 
                 if (params.n_max <= (int) result.size()) {
@@ -2951,9 +3087,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         dp.result->resize(tpp_floor);
                     }
                 }
-            } else if (spec_cost && !dp.result_q) {
-                // the window keeps the drafts of the best expected tokens per ms
-                const size_t kept = (size_t) std::max(0, cost_st[seq_id].chain.best_rows - 1);
+            } else if (priced(dp)) {
+                // the window keeps the drafts of the best expected tokens per ms (k19-adraft: at least adraft_floor)
+                const size_t kept = (size_t) std::max(adraft_floor, cost_st[seq_id].chain.best_rows - 1);
                 if (dp.result->size() > kept) {
                     dp.result->resize(kept);
                 }
@@ -2961,6 +3097,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+            }
+
+            if (gated(dp) || (adraft_mode >= 3 && adraft_keep > 0 && !dp.result_q && sampled(dp))) {
+                adraft_hist[std::min<size_t>(dp.result->size(), adraft_hist.size() - 1)]++;
+            }
+            if (adraft_mode == 3 && seq_id < (llama_seq_id) adraft_st.size()) {
+                adraft_st[seq_id].drafted = sampled(dp) && !dp.result_q ? (int) dp.result->size() : 0;
             }
 
             if (cost_on) {
@@ -2976,6 +3119,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
+        if (adraft_mode == 3 && seq_id < (llama_seq_id) adraft_st.size() && adraft_st[seq_id].drafted > 0) {
+            // k19-adraft: the share of this window's drafts that held, into the request's running share; a width switch past the dwell
+            auto & a = adraft_st[seq_id];
+            const double held = std::min(1.0, (double) n_accepted / a.drafted);
+            a.ema = a.rounds == 0 ? held : a.ema + (held - a.ema)/adraft_ema_n;
+            a.rounds++;
+            a.since++;
+            a.drafted = 0;
+            if (a.rounds >= adraft_dwell && a.since >= adraft_dwell && (a.deep ? a.ema < adraft_off : a.ema >= adraft_on)) {
+                a.deep  = !a.deep;
+                a.since = 0;
+                adraft_switches++;
+            }
+        }
+
         if (cost_on) {
             auto & cs = cost_st[seq_id];
             // k19-tpp: a kept draft past the floor, reached (the floor's drafts held): did it hold, against its predicted rate
@@ -2983,7 +3141,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 tpp_cost.observe_marginal(cost_pol.draft_rate(cs.probs[tpp_floor]), n_accepted > tpp_floor);
             }
             if (!cs.probs.empty()) {
-                cost_pol.observe_probs(cs.probs.data(), (int) cs.probs.size(), n_accepted);
+                if (cs.cal) {
+                    cost_pol.observe_probs(cs.probs.data(), (int) cs.probs.size(), n_accepted);
+                }
                 cs.probs.clear();
             }
         }

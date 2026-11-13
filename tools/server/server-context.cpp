@@ -2138,6 +2138,24 @@ private:
                     SRV_INF("k19-depth: MTP drafts 4 in every window below position %s (LLAMA_SPEC_DEPTH_POS; LLAMA_SPEC_DEPTH=0: off)\n",
                         dp != nullptr ? dp : "12288");
                 }
+            } else if (mtp_shape && cache_expected && !exact_mtp && [] {
+                    const char * a = getenv("LLAMA_SPEC_ADRAFT");
+                    return a != nullptr && atoi(a) != 0;
+                }()) {
+                // k19-adraft (opt-in, LLAMA_SPEC_ADRAFT=1): where the windows stay at 2 drafts beside a MoE cache, a sampled request's window
+                // holds up to LLAMA_SPEC_ADRAFT_MAX drafts (default 3), each past the 2nd kept while its draft probability is at least
+                // LLAMA_SPEC_ADRAFT_P (0.9; the drafter's confidence gate, a function of the text). =2: priced by expected tokens per ms
+                // instead; =3: one width per stretch of the request from the running share of drafts that held; =4: by position. Greedy requests keep 2 drafts. Sampled verify is sample-and-match with the target's chain and RNG, so only the
+                // proposals change
+                const char * am = getenv("LLAMA_SPEC_ADRAFT_MAX");
+                sp.draft.adraft = sp.draft.n_max;
+                sp.draft.n_max  = std::clamp(am != nullptr ? atoi(am) : 3, sp.draft.n_max + 1, 8);
+                if (getenv("LLAMA_SPEC_VERIFY4_CACHED") == nullptr) {
+                    common_set_env("LLAMA_SPEC_VERIFY4_CACHED", "1");
+                }
+                SRV_INF("k19-adraft: MoE cache expected (need %.0f MiB, %.0f MiB free on the GPUs): sampled requests draft up to %d, "
+                    "greedy ones %d (LLAMA_SPEC_ADRAFT=0: off)\n", need/1048576.0, dev_free/1048576.0,
+                    sp.draft.n_max, sp.draft.adraft);
             } else if (mtp_shape && n_gpu == 0 && e == nullptr) {
                 SRV_INF("%s", "k19-tpp: off: no GPU (LLAMA_SPEC_TPP=1: on)\n");
             } else if (mtp_shape && (e != nullptr ? atoi(e) != 0 : dev_ok)) {
