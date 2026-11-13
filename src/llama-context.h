@@ -664,6 +664,7 @@ private:
         std::vector<bool>    used;
         std::vector<int32_t> counts; // tokens routed to each expert, empty if the ids were not read
         bool                 all = false; // used was set to every expert without reading the ids
+        int64_t              sync_us = 0; // k19-l4ttft diagnostic: host time of the last routing read
 
         std::vector<std::pair<size_t, size_t>> uploads; // offset and size of the uploads of the current copy
         std::vector<ggml_backend_copy_region>   regions; // the copies of the current copy, when the backend batches them

@@ -4707,11 +4707,26 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
         st_prev_host = next_host;
     };
 
+    // k19-l4reg diag (GGML_SCHED_SPLIT_TRACE=<ms>): per split host time of the non-weight input copies, the host weight copies and the
+    // compute call; a graph whose host time is above <ms> logs its slowest splits (diagnostic, default off)
+    static const int sp_thr = getenv("GGML_SCHED_SPLIT_TRACE") ? atoi(getenv("GGML_SCHED_SPLIT_TRACE")) : 0;
+    struct sp_rec { int id; int64_t t_in, t_hw, t_cmp, t_end; int n_in, n_hw; };
+    std::vector<sp_rec> sp_recs;
+    const int64_t sp_t0 = sp_thr > 0 ? ggml_time_us() : 0;
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
         st_mark(ggml_backend_buft_is_host(sched->bufts[split_backend_id]) ? 1 : 0);
+        sp_rec sp_cur = {};
+        if (sp_thr > 0) {
+            sp_cur.id = split_id;
+            sp_cur.t_in = ggml_time_us();
+            sp_cur.n_in = split->n_inputs;
+            for (int q = 0; q < split->n_inputs; q++) {
+                sp_cur.n_hw += ggml_backend_sched_is_host_weight(split->inputs[q]) ? 1 : 0;
+            }
+        }
 
         // k19-graph: a graph input's copy in this split carries the input's op params, the host side of the input's value for the
         // backend that plans its launches by it (ggml_flash_attn_ext_kv_len_set_host): the copy's data is uploaded, its params are not
@@ -4851,6 +4866,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             ggml_backend_event_record(sched->ov[split_backend_id].upload, split_backend);
             sched->ov[split_backend_id].upload_pending = true;
         }
+        if (sp_thr > 0) {
+            sp_cur.t_hw = ggml_time_us();
+        }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
                 if (split->pf_async && ggml_backend_sched_prefetch_is_bound(sched, split, split->inputs[input_id])) {
@@ -4910,6 +4928,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             }
         }
 
+        if (sp_thr > 0) {
+            sp_cur.t_cmp = ggml_time_us();
+        }
         if (sched->pre_split == split_id) {
             // the leading nodes were launched with the previous split
             if (sched->pre_nodes < split->graph.n_nodes) {
@@ -4984,7 +5005,48 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             ggml_backend_sched_prefetch_issue(sched);
         }
 
+        if (sp_thr > 0) {
+            sp_cur.t_end = ggml_time_us();
+            sp_recs.push_back(sp_cur);
+        }
         prev_backend_id = split_backend_id;
+    }
+    if (sp_thr > 0) {
+        const int64_t tot = ggml_time_us() - sp_t0;
+        if (tot > (int64_t) sp_thr*1000) {
+            int64_t s_in = 0, s_hw = 0, s_cmp = 0;
+            for (const sp_rec & r : sp_recs) {
+                s_in += r.t_hw - r.t_in; s_hw += r.t_cmp - r.t_hw; s_cmp += r.t_end - r.t_cmp;
+            }
+            GGML_LOG_INFO("k19-l4reg split trace: graph of %d nodes, %d splits, %.1f ms host: inputs %.1f, host weights %.1f, compute calls %.1f ms\n",
+                sched->graph.n_nodes, sched->n_splits, tot/1000.0, s_in/1000.0, s_hw/1000.0, s_cmp/1000.0);
+            // k19-l4held: the same sums for the host-buffer splits and the device splits apart, and the splits with / without host weights
+            int64_t a[2][2][3] = {}; int na[2][2] = {};
+            for (const sp_rec & r : sp_recs) {
+                const int h  = ggml_backend_buft_is_host(sched->bufts[splits[r.id].backend_id]) ? 1 : 0;
+                const int hw = r.n_hw > 0 ? 1 : 0;
+                a[h][hw][0] += r.t_hw - r.t_in; a[h][hw][1] += r.t_cmp - r.t_hw; a[h][hw][2] += r.t_end - r.t_cmp; na[h][hw]++;
+            }
+            for (int h = 0; h < 2; h++) {
+                for (int hw = 0; hw < 2; hw++) {
+                    if (na[h][hw] > 0) {
+                        GGML_LOG_INFO("k19-l4held split trace:   %s splits %s host weights: %d, inputs %.1f, host weights %.1f, compute calls %.1f ms\n",
+                            h ? "host" : "device", hw ? "with" : "without", na[h][hw], a[h][hw][0]/1000.0, a[h][hw][1]/1000.0, a[h][hw][2]/1000.0);
+                    }
+                }
+            }
+            std::vector<sp_rec> top = sp_recs;
+            std::sort(top.begin(), top.end(), [](const sp_rec & x, const sp_rec & y) { return x.t_end - x.t_in > y.t_end - y.t_in; });
+            for (size_t i = 0; i < top.size() && i < 24; i++) {
+                const sp_rec & r = top[i];
+                const struct ggml_backend_sched_split * sp = &splits[r.id];
+                const struct ggml_tensor * n0 = sp->graph.n_nodes > 0 ? sp->graph.nodes[0] : NULL;
+                const struct ggml_tensor * nl = sp->graph.n_nodes > 0 ? sp->graph.nodes[sp->graph.n_nodes - 1] : NULL;
+                GGML_LOG_INFO("k19-l4reg split trace:   split %d (%s, %d nodes, %s %s .. %s %s): inputs %d (%d host weights) %.2f ms, host weights %.2f ms, compute %.2f ms\n",
+                    r.id, ggml_backend_name(sched->backends[sp->backend_id]), sp->graph.n_nodes, n0 ? ggml_op_desc(n0) : "-", n0 ? n0->name : "-",
+                    nl ? ggml_op_desc(nl) : "-", nl ? nl->name : "-", r.n_in, r.n_hw, (r.t_hw - r.t_in)/1000.0, (r.t_cmp - r.t_hw)/1000.0, (r.t_end - r.t_cmp)/1000.0);
+            }
+        }
     }
 
     // the caller may write graph inputs before the next sched call (llama reuses graphs), and gallocr can place a
