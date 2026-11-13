@@ -1749,7 +1749,8 @@ struct llama_moe_cache::impl {
             }
         }
 
-        // k19-t4small (decode extension, LLAMA_MOE_DECODE_EXT: unset = on where it can be, 0 off): the banks of the cache of the main
+        // k19-t4small (decode extension, LLAMA_MOE_DECODE_EXT=1: on where it can be; unset or 0 off, opt-in until it is measured beyond
+        // the T4 12 / 8 GB caps and its long48 max outliers are decided): the banks of the cache of the main
         // model (not an MTP context's) on a single device with CUDA VMM get room for LLAMA_MOE_DECODE_EXT_MAX_FRAC (0.6) more slots per
         // group, unbacked at load; the context grows the cache into the device memory the decode leaves free (llama_context::ext_unpark).
         // Not with the lazy KV cache's shrink (LLAMA_KV_LAZY), which retires slots for good
@@ -1758,7 +1759,7 @@ struct llama_moe_cache::impl {
             const char * e  = getenv("LLAMA_MOE_DECODE_EXT");
             const char * ef = getenv("LLAMA_MOE_DECODE_EXT_MAX_FRAC");
             ext_frac = ef != nullptr ? std::max(0.0, atof(ef)) : 0.6;
-            const bool want = (e == nullptr || atoi(e) != 0) && ext_frac > 0.0 && set != layer_set::nextn && !model.hparams.no_alloc &&
+            const bool want = (e != nullptr && atoi(e) != 0) && ext_frac > 0.0 && set != layer_set::nextn && !model.hparams.no_alloc &&
                 devices.size() == 1 && !llama_kv_lazy_alloc_on();
             ext_on = want && ext_probe(devices[0]);
             if (!ext_on) {
