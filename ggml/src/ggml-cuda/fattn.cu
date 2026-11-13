@@ -354,7 +354,10 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 
     // k19-dsv4next diagnostic: GGML_CUDA_FATTN_SPARSE_MIN_KV=N replaces the K length threshold below (unset: the rule as is)
     static const int64_t min_kv_env = getenv("GGML_CUDA_FATTN_SPARSE_MIN_KV") ? atoll(getenv("GGML_CUDA_FATTN_SPARSE_MIN_KV")) : -1;
-    const int64_t min_kv = min_kv_env >= 0 ? min_kv_env : std::max<int64_t>(4096, 2*n_gather);
+    // k19-dsv4next: op_params[5] == 1 (set by the model on prompt attention whose rows see few of the K rows, DeepSeek-V4.1): the
+    // gather from K >= 2 * n_kv_max per query, since every query tile of a prompt reads the whole K otherwise
+    const bool    prefer   = dst->op_params[5] == 1;
+    const int64_t min_kv = min_kv_env >= 0 ? min_kv_env : prefer ? 2*(int64_t) n_kv_max : std::max<int64_t>(4096, 2*n_gather);
 
     return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&

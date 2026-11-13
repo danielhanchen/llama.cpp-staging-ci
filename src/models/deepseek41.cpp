@@ -872,9 +872,21 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             // query it compacts the finite columns (ascending) and gathers only those K rows, instead of reading every compressed
             // row of the context per query tile. Same keys in the same order; the online softmax sees other tile boundaries, so
             // not bitwise. Idea and bound as in upstream llama.cpp's DeepSeek-V4.1 dense path and in deepseek4.cpp here.
-            const int64_t n_kv_max = sparse && prefill_sparse && hparams.n_swa > 0 ?
+            const int64_t n_kv_max = sparse && prefill_sparse > 0 && hparams.n_swa > 0 ?
                 std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + k_sel : 0;
             out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks, nullptr, n_kv_max, kq_scale, il);
+            // k19-dsv4next (LLAMA_DSV41_PREFILL_SPARSE=1: the backend's own threshold only): prompt rows prefer the sparse gather.
+            // ggml-cuda's default rule (K >= 2 * 8 * n_kv_max, tuned for decode / verify rows) keeps 8k prompts on the dense kernel,
+            // where the gather was 8-10% faster in TTFT (A100, G4; neutral at 2k). op_params[5] = 1 on the attention node asks for
+            // the gather from K >= 2 * n_kv_max (backends without a sparse kernel ignore it)
+            if (n_kv_max > 0 && prefill_sparse > 1) {
+                ggml_tensor * fa = out;
+                while (fa && fa->op != GGML_OP_FLASH_ATTN_EXT) {
+                    fa = fa->src[0];
+                }
+                GGML_ASSERT(fa && "DeepSeek-V4.1: no attention node behind build_attn_mha");
+                fa->op_params[5] = 1;
+            }
         }
         if (k_rot) {
             out = llama_mul_mat_hadamard(ctx0, out, k_rot);
@@ -911,7 +923,8 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     topk_all = topk_all_env;
     static const bool cand_all_ev = dsv41_env_on("LLAMA_DSV41_CAND_ALL");
     cand_all_env = cand_all_ev;
-    static const bool prefill_sparse_env = dsv41_env_on("LLAMA_DSV41_PREFILL_SPARSE");
+    // 0 = off, 1 = the window + top-k bound only, 2 (default) = bound + prompt rows prefer the sparse gather
+    static const int prefill_sparse_env = getenv("LLAMA_DSV41_PREFILL_SPARSE") ? atoi(getenv("LLAMA_DSV41_PREFILL_SPARSE")) : 2;
     prefill_sparse = prefill_sparse_env;
 
     topk_of.assign(n_layer, nullptr);
