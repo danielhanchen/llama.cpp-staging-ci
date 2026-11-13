@@ -1308,7 +1308,7 @@ struct llama_moe_cache::impl {
     bool     fill_prev_large = false;
     bool     fill_store_set = false;
     struct fill_stats {
-        uint64_t issued = 0, issued_bytes = 0, done = 0, dup = 0, cancelled = 0, waited = 0, waited_us = 0, rounds = 0, failed = 0, prompts = 0, idle_rounds = 0;
+        uint64_t issued = 0, issued_bytes = 0, done = 0, dup = 0, cancelled = 0, waited = 0, waited_us = 0, rounds = 0, failed = 0, prompts = 0, idle_rounds = 0, dup_marked = 0;
     } fls;
     // k19-l4fill diagnostics: where the free slots come from (exclusive tier)
     struct slot_src_stats {
@@ -4414,6 +4414,21 @@ struct llama_moe_cache::impl {
         }
         fls.rounds++;
         const int32_t ne = host->n_expert_of();
+        // RAM copies of experts the device also holds that are not marked as duplicates (the page-cache fill at load copies whatever the
+        // page cache holds, also experts of the device prefill: Colab L4 VMs whose page cache kept more of the model after the drop started
+        // the chat with 761-1254 of them instead of ~236, and missed 908-910 experts instead of ~780) are marked: they go first, like free slots
+        for (int32_t il = 0; il < (int32_t) layers.size(); ++il) {
+            if (!host_layer(il) || layers[il].experts.empty()) {
+                continue;
+            }
+            for (int32_t e = 0; e < (int32_t) layers[il].experts[0]->ne[2]; ++e) {
+                const int32_t s = host->held(il, e);
+                if (s >= 0 && !host->is_dup(s) && !host->is_async(s) && in_device(il, e)) {
+                    host->set_dup(s, true);
+                    fls.dup_marked++;
+                }
+            }
+        }
         std::vector<char> full(layers.size(), 0);
         std::vector<llama_weight_store::host_read> rd;
         for (const int32_t key : hfill_order) {
@@ -12281,11 +12296,13 @@ struct llama_moe_cache::impl {
                     (unsigned long long) host->quota_slack, n_prefill_dup);
             if (host->exclusive()) {
                 LLAMA_LOG_INFO("llama_moe_cache: k19-l4fill: refill of freed RAM slots %s (LLAMA_MOE_HOST_FILL=%d, %d speculative reads at once): %llu prompts "
-                        "counted, %llu rounds (%llu at the server's idle point), %llu read (%.1f MiB), %llu done (%llu duplicates), %llu cancelled, %llu failed, %llu waited for (%.1f ms)\n",
+                        "counted, %llu rounds (%llu at the server's idle point), %llu read (%.1f MiB), %llu done (%llu duplicates), %llu cancelled, %llu failed, %llu waited for (%.1f ms), "
+                        "%llu unmarked RAM copies of device experts marked as duplicates\n",
                         fill_mode != 0 ? "on" : "off", fill_mode, fill_parallel, (unsigned long long) fls.prompts, (unsigned long long) fls.rounds,
                         (unsigned long long) fls.idle_rounds,
                         (unsigned long long) fls.issued, fls.issued_bytes/1048576.0, (unsigned long long) fls.done, (unsigned long long) fls.dup,
-                        (unsigned long long) fls.cancelled, (unsigned long long) fls.failed, (unsigned long long) fls.waited, fls.waited_us/1000.0);
+                        (unsigned long long) fls.cancelled, (unsigned long long) fls.failed, (unsigned long long) fls.waited, fls.waited_us/1000.0,
+                        (unsigned long long) fls.dup_marked);
                 fill_diag("exit");
             }
             LLAMA_LOG_INFO("llama_moe_cache: host tier: %d slots, peak %zu held, %llu evicted, %llu without a slot, %llu waits, pinned = %.2f MiB of a %.2f MiB budget, "
