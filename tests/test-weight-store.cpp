@@ -164,12 +164,20 @@ int main(int argc, char ** argv) {
 
     for (int io : { LLAMA_WEIGHT_STREAM_IO_BUFFERED, LLAMA_WEIGHT_STREAM_IO_DIRECT, LLAMA_WEIGHT_STREAM_IO_AUTO }) {
         for (int fmode : { 0, 1, 2, 3, 4 }) {
+            size_t n_dropped = 0; // pages the drop below really evicted (a kernel may keep a large folio that spans the range)
             if (io == LLAMA_WEIGHT_STREAM_IO_AUTO) {
                 // auto copies the resident pages from the mapping and reads the others unbuffered: drop every other 1 MiB of the file
                 fsync(fd);
                 for (size_t o = 0; o < file_size; o += (size_t) 2 << 20) {
                     madvise((uint8_t *) map + o, (size_t) 1 << 20, MADV_DONTNEED); // mapped pages are not dropped from the page cache
                     posix_fadvise(fd, (off_t) o, (off_t) 1 << 20, POSIX_FADV_DONTNEED);
+                }
+                const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
+                std::vector<unsigned char> res((file_size + pg - 1) / pg);
+                if (mincore(map, file_size, res.data()) == 0) {
+                    for (unsigned char r : res) {
+                        n_dropped += (r & 1) == 0;
+                    }
                 }
             }
             fault flt;
@@ -254,7 +262,11 @@ int main(int argc, char ** argv) {
             }
             if (fmode == 0 && io == LLAMA_WEIGHT_STREAM_IO_AUTO) {
                 CHECK(st.cached_bytes > 0);
-                CHECK(st.direct_bytes > 0 || st.direct_disabled > 0);
+                if (n_dropped > 0) {
+                    CHECK(st.direct_bytes > 0 || st.direct_disabled > 0);
+                } else {
+                    printf("%s: the page cache kept every page of the file (nothing to read unbuffered), direct check skipped\n", what);
+                }
                 printf("%s: cached %.1f MiB, direct %.1f MiB, buffered %.1f MiB\n", what, st.cached_bytes/1048576.0, st.direct_bytes/1048576.0, st.buffered_bytes/1048576.0);
             }
             if (fmode == 0 && io == LLAMA_WEIGHT_STREAM_IO_DIRECT) {
