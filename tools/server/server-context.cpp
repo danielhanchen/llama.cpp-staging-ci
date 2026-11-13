@@ -167,8 +167,9 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     // MTP's 1..3-row graphs are captured by the first request's own short windows). Only the prewarm: the device KV buckets keep their
     // 2048-cell step there. Colab G4 Qwen3.8-Flash-Next UD-IQ4_XS at a 32 GB cap (41.4% cached): the warm-up request leaves the 4..7-row
     // verify widths to be built and captured inside the next one (36-129 ms per width); prewarmed, with the CPU-miss windows paused (below),
-    // DFlash2 n6 chat 207.6 -> 230.0 tok/s (same text), 8k 178.0 -> 193.8 (other text: the prewarm moves the cached experts, so the
-    // host-computed ones), gc_ab1, 3 launches. At 16 GB (15.5% cached) it stays off: level with the pause, -24% without it
+    // DFlash2 n6 chat 203.1 -> 224.1 tok/s (same text), 8k 172.7 -> 190.3 (other text: the prewarm moves the cached experts, so the
+    // host-computed ones; srv_kld long48 inside the -fa off band), 3 launches on one VM with the CPU-miss calibration pinned for both
+    // builds. At 16 GB (15.5% cached) it stays off: level with the pause, -24% without it
     static const double cached_frac_min = getenv("LLAMA_SPEC_PREWARM_CACHED_FRAC") != nullptr ?
         atof(getenv("LLAMA_SPEC_PREWARM_CACHED_FRAC")) : 0.3;
     static const int cached_min_w = getenv("LLAMA_SPEC_PREWARM_CACHED_MIN_W") != nullptr ?
