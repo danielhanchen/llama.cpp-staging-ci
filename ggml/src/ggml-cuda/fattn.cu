@@ -352,10 +352,14 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     const int64_t n_q      = ref_rows > 0 ? ref_rows : Q->ne[1];
     const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(n_q, 64/ncols2) : ncols1) * (int64_t) n_kv_max;
 
+    // k19-dsv4next diagnostic: GGML_CUDA_FATTN_SPARSE_MIN_KV=N replaces the K length threshold below (unset: the rule as is)
+    static const int64_t min_kv_env = getenv("GGML_CUDA_FATTN_SPARSE_MIN_KV") ? atoll(getenv("GGML_CUDA_FATTN_SPARSE_MIN_KV")) : -1;
+    const int64_t min_kv = min_kv_env >= 0 ? min_kv_env : std::max<int64_t>(4096, 2*n_gather);
+
     return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
-        K->ne[1] >= std::max<int64_t>(4096, 2*n_gather);
+        K->ne[1] >= min_kv;
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
