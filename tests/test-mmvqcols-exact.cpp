@@ -55,7 +55,7 @@ static uint64_t fnv(const void * d, size_t n, uint64_t h = 0xcbf29ce484222325ull
 
 static const ggml_type all_types[] = {
     GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
-    GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K,
+    GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K,
 };
 
 // N rows of K, every row a copy of one of npool rows quantized from N(0, 1) values (quantizing large matrices to IQ2 is slow; the pool
@@ -231,8 +231,8 @@ static int run_bench(ggml_backend_t be, int argc, char ** argv) {
     const std::string shapes = argc > 5 ? argv[5] : "gu,dn,qkv,o";
     struct shp { const char * name; int K, N; };
     const shp all_shapes[] = { { "gu", 5120, 17408 }, { "dn", 17408, 5120 }, { "qkv", 5120, 10240 }, { "o", 6144, 5120 } };
-    printf("bench L %d REPS %d COLS_CFG=%s FLAG=%s\n", L, REPS, getenv("GGML_CUDA_MMVQ_COLS_CFG") ? getenv("GGML_CUDA_MMVQ_COLS_CFG") : "-",
-        getenv("MMVQCOLS_BENCH_FLAG") ? getenv("MMVQCOLS_BENCH_FLAG") : "-");
+    printf("bench L %d REPS %d COLS_CFG=%s KQ_ROWS=%s FLAG=%s\n", L, REPS, getenv("GGML_CUDA_MMVQ_COLS_CFG") ? getenv("GGML_CUDA_MMVQ_COLS_CFG") : "-",
+        getenv("GGML_CUDA_MMVQ_KQ_ROWS") ? getenv("GGML_CUDA_MMVQ_KQ_ROWS") : "-", getenv("MMVQCOLS_BENCH_FLAG") ? getenv("MMVQCOLS_BENCH_FLAG") : "-");
     for (const ggml_type t : all_types) {
         if (types != "all" && (("," + types + ",").find("," + std::string(ggml_type_name(t)) + ",") == std::string::npos)) {
             continue;
@@ -370,17 +370,24 @@ int main(int argc, char ** argv) {
     // base side: the default launch (never logs); head side: the lever (must log)
     struct mode { const char * name; std::string exe_base, env_base, env_head; int logs; };
     std::vector<mode> modes = {
-        { "r4",          self, "GGML_CUDA_MMVQ_COLS_CFG=0", "GGML_CUDA_MMVQ_COLS_CFG=R4", 1 },
-        { "r8",          self, "GGML_CUDA_MMVQ_COLS_CFG=0", "GGML_CUDA_MMVQ_COLS_CFG=R8", 1 },
-        { "r4_reassoc0", self, "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_VERIFY_REASSOC=0", "GGML_CUDA_MMVQ_COLS_CFG=R4 GGML_CUDA_VERIFY_REASSOC=0", 1 },
-        { "r8_reassoc0", self, "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_VERIFY_REASSOC=0", "GGML_CUDA_MMVQ_COLS_CFG=R8 GGML_CUDA_VERIFY_REASSOC=0", 1 },
-        { "r4_mmq0",     self, "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_VERIFY_MMQ=0", "GGML_CUDA_MMVQ_COLS_CFG=R4 GGML_CUDA_VERIFY_MMQ=0", 1 },
+        { "r4",          self, "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_MMVQ_COLS_CFG=0", "GGML_CUDA_MMVQ_COLS_CFG=R4", 1 },
+        { "r8",          self, "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_MMVQ_COLS_CFG=0", "GGML_CUDA_MMVQ_COLS_CFG=R8", 1 },
+        { "r4_reassoc0", self, "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_VERIFY_REASSOC=0", "GGML_CUDA_MMVQ_COLS_CFG=R4 GGML_CUDA_VERIFY_REASSOC=0", 1 },
+        { "r8_reassoc0", self, "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_VERIFY_REASSOC=0", "GGML_CUDA_MMVQ_COLS_CFG=R8 GGML_CUDA_VERIFY_REASSOC=0", 1 },
+        // k19-q38next: the K-quant / IQ4_XS rows (GGML_CUDA_MMVQ_KQ_ROWS=R4) against the same launch without them, plain, verify and exact
+        // (the IQ lever off on both sides, so only the K-quant launches log)
+        { "kq_r4",       self, "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_MMVQ_KQ_ROWS=0", "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_MMVQ_KQ_ROWS=R4", 1 },
+        { "kq_r4_reassoc0", self, "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_VERIFY_REASSOC=0",
+                         "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_MMVQ_KQ_ROWS=R4 GGML_CUDA_VERIFY_REASSOC=0", 1 },
+        { "kq_r4_mmq0",  self, "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_VERIFY_MMQ=0",
+                         "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_MMVQ_KQ_ROWS=R4 GGML_CUDA_VERIFY_MMQ=0", 1 },
+        { "r4_mmq0",     self, "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_VERIFY_MMQ=0", "GGML_CUDA_MMVQ_COLS_CFG=R4 GGML_CUDA_VERIFY_MMQ=0", 1 },
         // the shipped default (unset = AUTO; off on archs without a measurement, so bytes only)
-        { "default",     self, "GGML_CUDA_MMVQ_COLS_CFG=0", "MMVQCOLS_DEFAULT=1", -1 },
-        { "default_exact", self, "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_VERIFY_REASSOC=0", "GGML_CUDA_VERIFY_REASSOC=0", -1 },
+        { "default",     self, "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_MMVQ_COLS_CFG=0", "MMVQCOLS_DEFAULT=1", -1 },
+        { "default_exact", self, "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_VERIFY_REASSOC=0", "GGML_CUDA_VERIFY_REASSOC=0", -1 },
         // k19-q38t: IQ3_S / IQ3_XXS grid tables in shared memory (default) against the global tables (GGML_CUDA_MMVQ_GRID_SMEM=0),
         // with the rows lever off, at its default and on the exact verify path (logs: not counted, -2)
-        { "grid",        self, "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_MMVQ_GRID_SMEM=0", "GGML_CUDA_MMVQ_COLS_CFG=0", -2 },
+        { "grid",        self, "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_MMVQ_GRID_SMEM=0", "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_MMVQ_COLS_CFG=0", -2 },
         { "grid_cols",   self, "GGML_CUDA_MMVQ_GRID_SMEM=0", "MMVQCOLS_DEFAULT=1", -2 },
         { "grid_exact",  self, "GGML_CUDA_MMVQ_GRID_SMEM=0 GGML_CUDA_VERIFY_REASSOC=0", "GGML_CUDA_VERIFY_REASSOC=0", -2 },
         { "grid_mmq0",   self, "GGML_CUDA_MMVQ_GRID_SMEM=0 GGML_CUDA_VERIFY_MMQ=0", "GGML_CUDA_VERIFY_MMQ=0", -2 },

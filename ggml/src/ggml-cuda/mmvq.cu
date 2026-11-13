@@ -3155,10 +3155,53 @@ static int mul_mat_vec_q_nwarps_1(const int ncols_x, const bool has_ids, const i
 // pressure); Ada cc 8.9 4 from IQ2_XXS 4, Q3_K 5, IQ3_S 7 columns (Colab L4: below that within +-5%); other archs unchanged until measured.
 // GGML_CUDA_MMVQ_COLS_CFG: unset / AUTO = that table, 0 = off, R4 / R8 = those rows for every listed type, width and NVIDIA table.
 // Returns the rows (0: not taken)
+// k19-q38next: the same lever for the K-quant / IQ4_XS products of a dense model's verify windows (Qwen3.8-27B UD-Q4_K_XL: Q5_K / IQ4_XS
+// / Q4_K / Q6_K, 85% of an L4 MTP pass at 5 rows, each 1.5-1.9x its 1-row launch). Their lanes read 16 bytes of a q8_1 block per load, 8
+// such groups per warp load (~5 cache lines), 6 loads per 16 weights per column: the activation loads of a 5-column launch are ~3x its
+// weight loads in L1 wavefronts, and the rows of a block share them. Rows only: bitwise the launch it replaces (plain, verify-wide,
+// multi-matrix and exact launches). GENERIC table only (Turing sends these widths to MMQ). GGML_CUDA_MMVQ_KQ_ROWS: unset / AUTO = the
+// per-arch table (mmvq_kq_rows_auto), 0 = off, R4 = 4 rows at every 2..8 column width (8 rows lost to register pressure on Ampere / Ada
+// for the IQ types, k19-mmvqcols, and are not compiled for these types); GGML_CUDA_MMVQ_KQ_COLS_MIN (default 2)
+static constexpr bool mmvq_kq_type(const ggml_type type) {
+    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ4_XS;
+}
+// AUTO: Ada (cc 8.9) 4 rows at 2..8 columns for all four types: Colab L4, Qwen3.8-27B UD-Q4_K_XL + MTP drafter (5-row verify windows),
+// 3 interleaved launches, chat 34.3 -> 39.5 tok/s, 8k 30.4 -> 35.1 (+15%), text unchanged (default and exact verify). Ampere cc 8.0
+// stays off: on a Colab A100 the 4-row launch of Q4_K / Q5_K / Q6_K at 5 columns ran 1-16% slower (test-mmvqcols-exact --bench, register
+// pressure; plans/k19_q38next.md). Other archs off until measured
+static int mmvq_kq_rows_auto(const ggml_type type, const int ncols_dst, const int cc) {
+    GGML_UNUSED(type); GGML_UNUSED(ncols_dst);
+    return cc == GGML_CUDA_CC_ADA_LOVELACE ? 4 : 0;
+}
+static int mmvq_kq_rows(const ggml_type type, const int ncols_dst, const mmvq_parameter_table_id table_id) {
+    static const int cfg = [] {
+        const char * e = getenv("GGML_CUDA_MMVQ_KQ_ROWS");
+        if (e == nullptr) {
+            return -1;
+        }
+        const std::string v = e;
+        return v == "R4" || v == "4" ? 4 : v == "AUTO" ? -1 : 0;
+    }();
+    static const int cols_min = [] {
+        const char * e = getenv("GGML_CUDA_MMVQ_KQ_COLS_MIN");
+        return e != nullptr ? std::max(2, atoi(e)) : 2;
+    }();
+    if (!mmvq_kq_type(type) || ncols_dst < cols_min || ncols_dst > 8 || table_id != MMVQ_PARAMETERS_GENERIC) {
+        return 0;
+    }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc)) {
+        return 0;
+    }
+    return cfg >= 0 ? cfg : mmvq_kq_rows_auto(type, ncols_dst, cc);
+}
 static constexpr bool mmvq_cols_type(const ggml_type type) {
-    return type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_Q3_K;
+    return type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_Q3_K || mmvq_kq_type(type);
 }
 static int mmvq_cols_rows(const ggml_type type, const int ncols_dst, const mmvq_parameter_table_id table_id) {
+    if (mmvq_kq_type(type)) {
+        return mmvq_kq_rows(type, ncols_dst, table_id);
+    }
     static const int cfg = [] {
         const char * e = getenv("GGML_CUDA_MMVQ_COLS_CFG");
         if (e == nullptr) {
@@ -3213,7 +3256,9 @@ static void mul_mat_vec_q_launch_nwarps(
                 vx, vy, (const int32_t *) nullptr, nf, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst, \
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst, \
                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, 0u)
-            if (r == 4) {
+            if constexpr (mmvq_kq_type(type)) {
+                MMVQ_COLS_NW_LAUNCH(4);
+            } else if (r == 4) {
                 MMVQ_COLS_NW_LAUNCH(4);
             } else {
                 MMVQ_COLS_NW_LAUNCH(8);
@@ -3369,8 +3414,14 @@ static bool mul_mat_vec_q_verify_wide(
         if (has_fusion || table_id != MMVQ_PARAMETERS_GENERIC || calc_nwarps(type, 4, table_id) != 4 || ncols_dst < 5 || ncols_dst > 8) {
             return false;
         }
-        const int  rpb    = mul_mat_vec_q_batch_rpb<type>(ncols_x, nrows_x, 4, cc, warp_size, table_id);
+              int  rpb    = mul_mat_vec_q_batch_rpb<type>(ncols_x, nrows_x, 4, cc, warp_size, table_id);
         const bool unroll = mul_mat_vec_q_unroll<type>(ncols_x, (int64_t) nrows_x*nchannels_dst*nsamples_dst, 4, table_id, warp_size);
+        // k19-q38next: the K-quant rows lever (mmvq_kq_rows) where the 4-column rule keeps the default rows and the K loop rolled
+        const int  kqr    = rpb == 0 && !unroll ? mmvq_kq_rows(type, ncols_dst, table_id) : 0;
+        if (kqr == 4 && nrows_x % kqr == 0) {
+            rpb = kqr;
+            mmvq_cols_log(type, ncols_dst, kqr, 4, "verify-wide");
+        }
         const int  rpb_l  = rpb > 0 ? rpb : 2; // calc_rows_per_block for 2..8 columns
         const uint3 nchannels_y_fd   = make_uint3(0, 0, 0);
         const uint3 channel_ratio_fd = init_fastdiv_values(nchannels_dst / nchannels_x);
@@ -3983,7 +4034,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst, \
                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, \
                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride)
-            if (rpb == 4) {
+            if constexpr (mmvq_kq_type(type)) {
+                MMVQ_COLS_LAUNCH(4);
+            } else if (rpb == 4) {
                 MMVQ_COLS_LAUNCH(4);
             } else {
                 MMVQ_COLS_LAUNCH(8);
@@ -4245,6 +4298,25 @@ static void mul_mat_vec_q_multi_switch_ncols(
     }
     GGML_UNUSED(rows_min);
     const bool unroll = mul_mat_vec_q_unroll<type>(ncols_x, total_rows, ncols_dst, table_id, warp_size);
+    // k19-q38next: the K-quant rows lever (mmvq_kq_rows) for the Q / K / V and gate / up launches of 2..8 columns: rows only, so every
+    // matrix keeps the bytes of its own launch; only where the rule above keeps the default rows, the K loop rolled and every matrix's
+    // rows divide evenly (a block reads all its rows)
+    const auto kq_rows = [&](const int nc, const int r0, const bool unr) {
+        const int r = r0 == 0 && !unr ? mmvq_kq_rows(type, nc, table_id) : 0;
+        if (r != 4) {
+            return r0;
+        }
+        for (int m = 0; m < n_multi; ++m) {
+            if (nrows[m] % r != 0) {
+                return r0;
+            }
+        }
+        mmvq_cols_log(type, nc, r, nc >= 5 ? 4 : calc_nwarps(type, nc, table_id), "multi");
+        return r;
+    };
+    if (ncols_dst > 1 && ncols_dst < 5) {
+        brpb = kq_rows(ncols_dst, brpb, unroll);
+    }
 #define MMVQ_MULTI_L(NC, RPB, UNR) mul_mat_vec_q_multi_launch<type, NC, n_multi, false, false, RPB, UNR>(fusion, nrows, vy, ncols_x, stride_row_x, stride_col_y, warp_size, table_id, stream)
 #define MMVQ_MULTI(NC) (brpb == 1 ? (unroll ? MMVQ_MULTI_L(NC, 1, 8) : MMVQ_MULTI_L(NC, 1, 1)) : brpb == 4 ? MMVQ_MULTI_L(NC, 4, 1) : \
                         unroll ? MMVQ_MULTI_L(NC, 0, 8) : MMVQ_MULTI_L(NC, 0, 1))
@@ -4260,6 +4332,7 @@ static void mul_mat_vec_q_multi_switch_ncols(
             }
         }
         const bool unroll4 = mul_mat_vec_q_unroll<type>(ncols_x, total_rows, 4, table_id, warp_size);
+        brpb4 = kq_rows(ncols_dst, brpb4, unroll4);
 #define MMVQ_MULTI_W(NC, RPB, UNR) mul_mat_vec_q_multi_launch<type, NC, n_multi, false, false, RPB, UNR, 4>(fusion, nrows, vy, ncols_x, stride_row_x, stride_col_y, warp_size, table_id, stream)
 #define MMVQ_MULTI_WNC(NC) (brpb4 == 1 ? (unroll4 ? MMVQ_MULTI_W(NC, 1, 8) : MMVQ_MULTI_W(NC, 1, 1)) : brpb4 == 4 ? MMVQ_MULTI_W(NC, 4, 1) : \
                             unroll4 ? MMVQ_MULTI_W(NC, 0, 8) : MMVQ_MULTI_W(NC, 0, 1))
