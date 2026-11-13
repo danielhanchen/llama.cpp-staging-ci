@@ -324,6 +324,14 @@ static std::vector<uint8_t> read_file(const std::string & path) {
     return d;
 }
 
+// the device compute capability (major*100 + minor*10), -1 if unknown (the backend lacks ggml_backend_dev_compute_capability)
+static int device_cc(ggml_backend_dev_t dev) {
+    typedef int (*cc_fn_t)(ggml_backend_dev_t);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    cc_fn_t fn = reg ? (cc_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_compute_capability") : nullptr;
+    return fn ? fn(dev) : -1;
+}
+
 int main(int argc, char ** argv) {
 #if defined(_WIN32)
     // the child processes are spawned through `env`
@@ -392,6 +400,7 @@ int main(int argc, char ** argv) {
         { "grid_exact",  self, "GGML_CUDA_MMVQ_GRID_SMEM=0 GGML_CUDA_VERIFY_REASSOC=0", "GGML_CUDA_VERIFY_REASSOC=0", -2 },
         { "grid_mmq0",   self, "GGML_CUDA_MMVQ_GRID_SMEM=0 GGML_CUDA_VERIFY_MMQ=0", "GGML_CUDA_VERIFY_MMQ=0", -2 },
     };
+    const int cc = device_cc(dev);
     int n_fail = 0;
     for (const auto & md : modes) {
         const std::string fb = dir + "/mmvqcols_" + tag + "_" + md.name + "_b.bin";
@@ -408,9 +417,13 @@ int main(int argc, char ** argv) {
                 ndiff += memcmp(&db[i], &dh[i], 4) != 0;
             }
         }
-        const bool head_off = false;
-        const bool ok = rb == 0 && rh == 0 && !db.empty() && db.size() == dh.size() && ndiff == 0 && (md.logs == -2 || lb == 0) &&
-                        (md.logs < 0 || (head_off ? lh == 0 : lh > 0));
+        // the K-quant rows (kq_*) apply only to the GENERIC mat-vec table: a Volta / Turing device (cc 7.x, TURING table) must not
+        // log them, a GB10 (cc 12.1, its table depends on the build) is not checked; unknown cc keeps the original expectation
+        const bool kq = strncmp(md.name, "kq_", 3) == 0;
+        const bool head_off = kq && cc >= 700 && cc < 800;
+        const int  logs = kq && cc == 1210 ? -1 : md.logs;
+        const bool ok = rb == 0 && rh == 0 && !db.empty() && db.size() == dh.size() && ndiff == 0 && (logs == -2 || lb == 0) &&
+                        (logs < 0 || (head_off ? lh == 0 : lh > 0));
         printf("%s %-14s base rc %d logs %d hash %016llx | head rc %d logs %d hash %016llx | %zu bytes, %zu floats differ\n",
             ok ? "OK  " : "FAIL", md.name, rb, lb, (unsigned long long) fnv(db.data(), db.size()), rh, lh,
             (unsigned long long) fnv(dh.data(), dh.size()), db.size(), ndiff);
