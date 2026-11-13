@@ -3447,6 +3447,10 @@ struct llama_moe_cache::impl {
                 (unsigned long long) core_checks, (unsigned long long) core_bad, (unsigned long long) core_refused);
         }
         ua_free();
+        if (n_pad_zero > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4ttft: %llu padding pieces after uploaded runs written as zeros instead of read from the files "
+                "(LLAMA_MOE_PROMPT_PAD_ZERO=0 off)\n", tag, (unsigned long long) n_pad_zero);
+        }
         if (plr.layers > 0 || plr.over > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4ttft: prompt layer reads: %llu layers, %llu experts, %.1f MiB in %.1f ms, %llu past the scratch "
                 "(LLAMA_MOE_PROMPT_LAYER_READ=0 off)\n", tag, (unsigned long long) plr.layers, (unsigned long long) plr.experts, plr.bytes/1048576.0,
@@ -5566,6 +5570,12 @@ struct llama_moe_cache::impl {
         }
     }
 
+    static bool pad_zero_on() {
+        static const bool on = [] { const char * e = getenv("LLAMA_MOE_PROMPT_PAD_ZERO"); return e == nullptr || atoi(e) != 0; }();
+        return on;
+    }
+    uint64_t n_pad_zero = 0;
+
     void tier_runs(const ggml_tensor * src, size_t off, size_t size, bool lease, std::vector<llama_weight_tier::run> & out) {
         const auto it = bindings.find(src);
         if (it == bindings.end() || !host_layer(it->second.il)) {
@@ -5590,6 +5600,18 @@ struct llama_moe_cache::impl {
                 continue;
             }
             const int32_t sl = e >= src->ne[2] ? -1 : lease ? host->held(il, e) : host->find(il, e, false);
+            // k19-l4ttft (LLAMA_MOE_PROMPT_PAD_ZERO, default 1; 0 = read them): the copy of a run of routed experts ends with the first
+            // min(expert, 512) bytes of the next expert, which the prompt does not route, as padding for the CUDA MMQ kernels (they read
+            // past the last row of an expert: the bytes only have to be finite). Where neither RAM nor the scratch holds that expert, the
+            // upload read them from the file: one 4 KiB read per run end, ~3900 per 42-token chat on the L4 disk tier (~1.1 s of its TTFT).
+            // Zeros instead (a zero block is finite in every quant type); nothing is offered to the tier for them
+            if (!lease && sl < 0 && pad_zero_on() && e < src->ne[2] && o == (size_t) e*nb && end - o <= 512 && end - o < nb) {
+                static const uint8_t zeros[512] = {};
+                out.push_back({ o, end - o, zeros, false });
+                n_pad_zero++;
+                o = end;
+                continue;
+            }
             if (sl >= 0) {
                 if (lease) {
                     host->lease(sl);
