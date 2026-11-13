@@ -331,8 +331,49 @@ int ggml_cuda_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return std::max(table, ggml_cuda_verify_wide_cols(cc, 8));
 }
 
+bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
+
+// k19-a80verify (GGML_CUDA_VERIFY_DENSE_MMQ_SM80="min[:mask]", unset = "5:1", 0 = off): on cc 8.0 (A100 / A30) a dense quantized product
+// of min..8 columns inside a verify-tagged graph runs MMQ (int8 tensor cores) instead of the batched mmvq, for the types of the mask
+// (1 Q6_K, 2 Q8_0, 4 the other K / legacy quants MMQ takes). The A100 mmvq pays every further column of these products in full (Colab
+// A100 80 GB, Qwen3.8-Flash-Next fn4n full card, node trace of a 7-row DFlash2 verify: the 8192-row Q6_K in-projections 87.5 us at 7
+// columns vs 47.4 at 3, the dense mat-vecs 1.36 ms of the 2.9 ms each verify row costs, plans/k19_a80verify.md). MUL_MAT_IDs keep their
+// rule (ggml_cuda_mmvq_mmid_max_batch); 1..min-1 columns, prompt chunks (untagged graphs) and the exact (batch invariant) verify keep
+// mmvq. Not bit-identical to the mmvq launch it replaces (another f32 order of the same int8 dot products: reassociation, KLD-gated)
+static bool ggml_cuda_verify_dense_mmq_sm80(const ggml_type type, const int cc, const int64_t ne11) {
+    struct cfg_t { int min_cols; int mask; };
+    static const cfg_t cfg = [] {
+        cfg_t c = { 5, 1 };
+        if (const char * e = getenv("GGML_CUDA_VERIFY_DENSE_MMQ_SM80")) {
+            int mc = 0, mask = 1;
+            const int n = sscanf(e, "%d:%d", &mc, &mask);
+            c.min_cols = n >= 1 ? mc : 0;
+            c.mask     = n >= 2 ? mask : 1;
+        }
+        return c;
+    }();
+    if (cfg.min_cols <= 0 || ne11 < std::max(2, cfg.min_cols) || ne11 > MMVQ_MAX_BATCH_SIZE || !GGML_CUDA_CC_IS_NVIDIA(cc) ||
+            cc != GGML_CUDA_CC_AMPERE || !ggml_cuda_verify_graph_active()) {
+        return false;
+    }
+    const int bit = type == GGML_TYPE_Q6_K ? 1 : type == GGML_TYPE_Q8_0 ? 2 : 4;
+    if ((cfg.mask & bit) == 0 || !ggml_cuda_should_use_mmq(type, cc, ne11, /*n_experts =*/ 0)) {
+        return false;
+    }
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        GGML_LOG_INFO("k19-a80verify: dense verify products of %d..%d columns on MMQ on cc 8.0 (types mask %d: 1 Q6_K, 2 Q8_0, 4 others; "
+            "first: %s, %lld columns; GGML_CUDA_VERIFY_DENSE_MMQ_SM80=0 off)\n", std::max(2, cfg.min_cols), MMVQ_MAX_BATCH_SIZE, cfg.mask,
+            ggml_type_name(type), (long long) ne11);
+    });
+    return true;
+}
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
+        return false;
+    }
+    if (ggml_cuda_verify_dense_mmq_sm80(type, cc, ne11)) {
         return false;
     }
     // k19-vrow3: a verify window of 5..8 rows keeps mmvq where the tables below send K-quants to MMQ (Blackwell: Q6_K at 8, the lm head
