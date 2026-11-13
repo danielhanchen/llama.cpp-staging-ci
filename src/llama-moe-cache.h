@@ -339,6 +339,8 @@ public:
     // of w's layer that neither the device slots nor the RAM tier hold, every expert tensor of each, in one batch; the copies of the
     // layer's expert tensors upload them from there (LLAMA_MOE_PROMPT_LAYER_READ=0 off, LLAMA_MOE_PROMPT_DIAG=1 logs per prompt)
     void prompt_layer_read(ggml_backend_t backend, const ggml_tensor * w, const std::vector<bool> & used);
+    // k19-l4ttft (LLAMA_MOE_PROMPT_DIAG=1): host time of a prompt copy's routing read and of its copies' issue
+    void prompt_diag_time(int64_t sync_us, int64_t up_us);
 
     // for large batches: count the copies of a batch of the experts of w issued by the caller (copies from the cache and uploads)
     void count_batch(const ggml_tensor * w, const std::vector<ggml_backend_copy_region> & regions);

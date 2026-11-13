@@ -5684,6 +5684,8 @@ struct llama_moe_cache::impl {
         uint64_t p_layers = 0, p_used = 0, p_dev = 0, p_ram = 0, p_miss = 0, p_read = 0, p_over = 0, p_bytes = 0, p_us = 0;
         std::vector<int32_t> p_miss_layer;
         int64_t  p_t0 = 0;
+        uint64_t p_sync_us = 0, p_up_us = 0, p_ncopy = 0; // host time in the routing reads (device work before them) and the copies' issue
+        llama_weight_store::stats p_ws;                    // the store's counters at the first layer
         uint64_t layers = 0, experts = 0, bytes = 0, read_us = 0, over = 0, prompts = 0;
     } plr;
     static int plr_mode() {
@@ -5775,6 +5777,7 @@ struct llama_moe_cache::impl {
         }
         if (plr.p_t0 == 0) {
             plr.p_t0 = ggml_time_us();
+            plr.p_ws = wstore->get_stats();
             plr.p_miss_layer.assign(layers.size(), -1);
         }
         std::vector<int32_t> miss;
@@ -5868,6 +5871,17 @@ struct llama_moe_cache::impl {
         plr.read_us += dt;
     }
 
+    // the copy callback's host time of a prompt ubatch's expert tensor: the routing read (sync_us: waits for the device work queued
+    // before it) and the copies' issue (up_us: the plan, the RAM uploads and the per-tensor demand reads), LLAMA_MOE_PROMPT_DIAG only
+    void prompt_diag_time(int64_t sync_us, int64_t up_us) {
+        if (plr.p_t0 == 0) {
+            return;
+        }
+        plr.p_sync_us += sync_us;
+        plr.p_up_us   += up_us;
+        plr.p_ncopy++;
+    }
+
     // the end of a prompt (the first small batch after large ones): the scratch is dropped, the diagnostic line
     void plr_prompt_end() {
         plr_clear();
@@ -5887,7 +5901,15 @@ struct llama_moe_cache::impl {
                 (unsigned long long) plr.prompts, (unsigned long long) plr.p_layers, (unsigned long long) plr.p_used, (unsigned long long) plr.p_dev,
                 (unsigned long long) plr.p_ram, (unsigned long long) plr.p_miss, (unsigned long long) plr.p_read, plr.p_bytes/1048576.0, plr.p_us/1000.0,
                 (unsigned long long) plr.p_over, (ggml_time_us() - plr.p_t0)/1000.0, ml.c_str());
+            const llama_weight_store::stats w = wstore != nullptr ? wstore->get_stats() : plr.p_ws;
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-l4ttft prompt %llu: %llu copies: routing reads waited %.1f ms, copies issued in %.1f ms; store: "
+                "%.1f MiB uploaded from the RAM tier, %.1f MiB demand reads (%llu regions), %.1f MiB host reads, %.1f MiB ring reads, waited %.1f ms\n", tag,
+                (unsigned long long) plr.prompts, (unsigned long long) plr.p_ncopy, plr.p_sync_us/1000.0, plr.p_up_us/1000.0,
+                (w.tier_uploaded - plr.p_ws.tier_uploaded)/1048576.0, (w.demand_bytes - plr.p_ws.demand_bytes)/1048576.0,
+                (unsigned long long) (w.demand_regions - plr.p_ws.demand_regions), (w.host_read_bytes - plr.p_ws.host_read_bytes)/1048576.0,
+                (w.plan_bytes - plr.p_ws.plan_bytes)/1048576.0, (w.wait_us - plr.p_ws.wait_us)/1000.0);
         }
+        plr.p_sync_us = plr.p_up_us = plr.p_ncopy = 0;
         plr.p_layers = plr.p_used = plr.p_dev = plr.p_ram = plr.p_miss = plr.p_read = plr.p_over = plr.p_bytes = plr.p_us = 0;
         plr.p_t0 = 0;
     }
@@ -12258,6 +12280,10 @@ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
 
 void llama_moe_cache::prompt_layer_read(ggml_backend_t backend, const ggml_tensor * w, const std::vector<bool> & used) {
     pimpl->prompt_layer_read(backend, w, used);
+}
+
+void llama_moe_cache::prompt_diag_time(int64_t sync_us, int64_t up_us) {
+    pimpl->prompt_diag_time(sync_us, up_us);
 }
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last, std::vector<ggml_backend_copy_region> * regions) {
