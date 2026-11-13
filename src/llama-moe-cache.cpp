@@ -6098,7 +6098,9 @@ struct llama_moe_cache::impl {
                 }
                 continue;
             }
-            const int32_t r = host->reserve(il, e);
+            // k19-l4held rank mode: at the layer's quota the copy back takes an expert the prompt does not route first
+            const std::vector<bool> * rk = rank_any && (size_t) il < rank_mask.size() && (int32_t) rank_mask[il].size() > e ? &rank_mask[il] : nullptr;
+            const int32_t r = host->reserve(il, e, true, 0, true, rk);
             if (r < 0) {
                 hst.demote_skip++;
                 continue;
@@ -6328,7 +6330,9 @@ struct llama_moe_cache::impl {
                 }
                 continue;
             }
-            const int32_t r = host->reserve(il, e);
+            // k19-l4held rank mode: at the layer's quota the copy back takes an expert the prompt does not route first
+            const std::vector<bool> * rk = rank_any && (size_t) il < rank_mask.size() && (int32_t) rank_mask[il].size() > e ? &rank_mask[il] : nullptr;
+            const int32_t r = host->reserve(il, e, true, 0, true, rk);
             if (r < 0) {
                 hst.demote_skip++;
                 continue;

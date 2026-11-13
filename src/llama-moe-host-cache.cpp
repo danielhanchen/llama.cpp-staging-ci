@@ -286,8 +286,10 @@ int32_t llama_moe_host_cache::quota_victim(int32_t il, bool allow_evict, uint32_
             rank = 0;
         } else if (sl.spec && take_spec) {
             rank = 1;
-        } else if (allow_evict || (keep != nullptr && (size_t) e < keep->size() && !(*keep)[e])) {
-            rank = 2 + sl.count;
+        } else if (keep != nullptr && (size_t) e < keep->size() && !(*keep)[e]) {
+            rank = 2 + sl.count;  // not kept (e.g. not routed by the prompt): first
+        } else if (allow_evict) {
+            rank = 10 + sl.count;
         } else {
             continue;
         }
