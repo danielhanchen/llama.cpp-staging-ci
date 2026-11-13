@@ -6293,14 +6293,34 @@ struct llama_moe_cache::impl {
     }
 
     // the device slots that are lent (or overwritten by a seed) lose their experts: the RAM tier keeps a copy (synchronous, once per prompt)
+    // k19-l4held (LLAMA_MOE_SHADOW_ASYNC=0: synchronous, as before): the copies back are queued on backend (the stream that then writes
+    // the device slots, so each copy reads the slot before it is overwritten) and the RAM slots are published when they complete (mark_write
+    // + commit, as demote does) instead of a device sync and one synchronous copy per expert tensor. A prompt that seeds the device slots
+    // of an exclusive tier (the 42-token chat on the Colab L4 full card: ~90 evictions per layer) waited for each layer's device work and
+    // then ~270 synchronous 2-3 MB copies per layer
+    static bool shadow_async() {
+        static const bool on = [] { const char * e = getenv("LLAMA_MOE_SHADOW_ASYNC"); return e == nullptr || atoi(e) != 0; }();
+        return on;
+    }
+    uint64_t n_shadow_async = 0;
     void shadow_slots(ggml_backend_t backend, group & g, const std::vector<std::pair<int32_t, int32_t>> & ev) {
         if (!host || ev.empty()) {
             return;
         }
-        // the copies into the device slots may be on the compute backend or the copy queue of the device: both done
-        ggml_backend_synchronize(backend);
+        const bool as = shadow_async();
+        // the copies into the device slots may be on the compute backend or the copy queue of the device: both done (async: the copies
+        // back are queued behind the work of backend, only another queue is waited for)
+        if (!as) {
+            ggml_backend_synchronize(backend);
+        }
         if (devices[g.id].backend != backend) {
             ggml_backend_synchronize(devices[g.id].backend);
+        }
+        if (as) {
+            demote(backend, g, ev);
+            host->commit(backend);
+            n_shadow_async += ev.size();
+            return;
         }
         const int32_t n_expert = g.lru.n_expert;
         for (const auto & [s, key] : ev) {
@@ -11893,6 +11913,11 @@ struct llama_moe_cache::impl {
                     "%llu forced over the RAM copy (%.2f MiB) (LLAMA_MOE_COPYBACK_SKIP=%d)\n",
                     (unsigned long long) hst.demoted, hst.demote_bytes/1048576.0, (unsigned long long) hst.demote_kept, hst.demote_kept_bytes/1048576.0,
                     (unsigned long long) hst.demote_forced, hst.demote_forced_bytes/1048576.0, copyback_skip ? 1 : 0);
+            LLAMA_LOG_INFO("llama_moe_cache: k19-l4held: %llu seed evictions copied back asynchronously (LLAMA_MOE_SHADOW_ASYNC=%d); RAM tier layer quota %s: "
+                    "%llu refused, %llu same-layer, %llu ranked, %llu slack; %zu device-prefill RAM copies marked as duplicates\n",
+                    (unsigned long long) n_shadow_async, shadow_async() ? 1 : 0, host->layer_quota_on() ? "on" : "off",
+                    (unsigned long long) host->quota_refused, (unsigned long long) host->quota_same, (unsigned long long) host->quota_ranked,
+                    (unsigned long long) host->quota_slack, n_prefill_dup);
             LLAMA_LOG_INFO("llama_moe_cache: host tier: %d slots, peak %zu held, %llu evicted, %llu without a slot, %llu waits, pinned = %.2f MiB of a %.2f MiB budget, "
                     "registered expert buffers = %.2f MiB, MemAvailable %.1f MiB at start, %.1f MiB now\n",
                     host->n_slots(), hs.peak_held, (unsigned long long) hs.evicted, (unsigned long long) hs.no_slot, (unsigned long long) hs.waits,
