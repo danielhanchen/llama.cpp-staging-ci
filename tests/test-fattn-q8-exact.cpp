@@ -167,7 +167,7 @@ static std::vector<uint8_t> run_case(ggml_backend_t backend, const tcase & c, co
     ggml_tensor * k = ggml_permute(ctx, ggml_view_3d(ctx, k_s, c.D, c.HKV, c.n_kv, ggml_row_size(GGML_TYPE_Q8_0, c.D), k_s->nb[1], 0), 0, 2, 1, 3);
     ggml_tensor * v = ggml_permute(ctx, ggml_view_3d(ctx, v_s, c.D, c.HKV, c.n_kv, ggml_row_size(GGML_TYPE_Q8_0, c.D), v_s->nb[1], 0), 0, 2, 1, 3);
     ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f/sqrtf((float) c.D), 0.0f, 0.0f);
-    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
     if (c.nsel > 0) {
         ggml_flash_attn_ext_set_n_kv_max(out, c.nsel);
     }
