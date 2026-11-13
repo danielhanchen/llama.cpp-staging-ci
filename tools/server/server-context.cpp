@@ -163,15 +163,21 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     // widths (default 1..w_max). LLAMA_SPEC_PREWARM_MEM=1 logs the device's free memory after each width (the graph memory per width)
     // (k19-bigverify: unset, on beside a cache that holds most of the experts, llama_moe_cache_wide_graphs; =0 off there too)
     // k19-g4cap: unset, also beside a cache that holds at least LLAMA_SPEC_PREWARM_CACHED_FRAC of its host expert bytes (default 0.3;
-    // 0 = only the wide-graph rule, as before). Only the prewarm: the device KV buckets keep their 2048-cell step there. Colab G4
-    // Qwen3.8-Flash-Next UD-IQ4_XS at a 32 GB cap (41.4% cached), gc_s1: the warm request leaves the 4..7-row verify widths to be built and
-    // captured inside the next request (36-129 ms per width); prewarmed (LLAMA_SPEC_PREWARM_CACHED=1) DFlash2 chat 205.6 -> 230.0 tok/s
-    // with the same text. At 16 GB (15.5% cached) it stays off (k19-fullcost: the prewarmed graphs lost there)
+    // 0 = only the wide-graph rule, as before) where the widest window is at least LLAMA_SPEC_PREWARM_CACHED_MIN_W (5) rows (DFlash2:
+    // MTP's 1..3-row graphs are captured by the first request's own short windows). Only the prewarm: the device KV buckets keep their
+    // 2048-cell step there. Colab G4 Qwen3.8-Flash-Next UD-IQ4_XS at a 32 GB cap (41.4% cached): the warm-up request leaves the 4..7-row
+    // verify widths to be built and captured inside the next one (36-129 ms per width); prewarmed, with the CPU-miss windows paused (below),
+    // DFlash2 n6 chat 207.6 -> 230.0 tok/s (same text), 8k 178.0 -> 193.8 (other text: the prewarm moves the cached experts, so the
+    // host-computed ones), gc_ab1, 3 launches. At 16 GB (15.5% cached) it stays off: level with the pause, -24% without it
     static const double cached_frac_min = getenv("LLAMA_SPEC_PREWARM_CACHED_FRAC") != nullptr ?
         atof(getenv("LLAMA_SPEC_PREWARM_CACHED_FRAC")) : 0.3;
+    static const int cached_min_w = getenv("LLAMA_SPEC_PREWARM_CACHED_MIN_W") != nullptr ?
+        atoi(getenv("LLAMA_SPEC_PREWARM_CACHED_MIN_W")) : 5;
     const double cache_frac = llama_moe_cache_frac(ctx);
+    const bool wide_graphs  = llama_moe_cache_wide_graphs(ctx);
+    const bool band_ok      = !wide_graphs && cached_frac_min > 0.0 && cache_frac >= cached_frac_min && w_max >= cached_min_w;
     const bool cached_ok = getenv("LLAMA_SPEC_PREWARM_CACHED") != nullptr ? atoi(getenv("LLAMA_SPEC_PREWARM_CACHED")) != 0 :
-        (llama_moe_cache_wide_graphs(ctx) || (cached_frac_min > 0.0 && cache_frac >= cached_frac_min));
+        (wide_graphs || band_ok);
     static const bool mem_log   = getenv("LLAMA_SPEC_PREWARM_MEM") != nullptr && atoi(getenv("LLAMA_SPEC_PREWARM_MEM")) != 0;
     std::vector<int> widths;
     if (const char * ew = getenv("LLAMA_SPEC_PREWARM_WIDTHS")) {
@@ -199,7 +205,7 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
             llama_n_batch(ctx) < (uint32_t) std::max(w_max, std::min(n_pre, 1)) || (int) llama_n_ctx_seq(ctx) < n_end + 64) {
         return;
     }
-    if (cached_ok && llama_moe_cache_active(ctx) && !llama_moe_cache_wide_graphs(ctx)) {
+    if (cached_ok && llama_moe_cache_active(ctx) && !wide_graphs) {
         SRV_INF("k19-g4cap: verify graphs prewarmed beside a MoE cache that holds %.1f%% of the host experts (LLAMA_SPEC_PREWARM_CACHED_FRAC "
                 "%.2f; =0: off)\n", 100.0*cache_frac, cached_frac_min);
     }
@@ -236,8 +242,13 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     };
     // k19-tokcost: the dummy windows (one repeated token) must not feed the MoE cache's CPU-miss rule: one such miss-rate window
     // (0.7%) turned the host path off for the next request (fn4 24 GB, fc_r13: P_CUM 0.5 chat 153 vs 184 tok/s; 16 GB prewarm -20%).
-    // LLAMA_SPEC_PREWARM_CM_PAUSE=0: counted as before
-    static const bool cm_pause = getenv("LLAMA_SPEC_PREWARM_CM_PAUSE") == nullptr || atoi(getenv("LLAMA_SPEC_PREWARM_CM_PAUSE")) != 0;
+    // k19-g4cap: LLAMA_SPEC_PREWARM_CM_PAUSE unset = paused beside a cache under the wide-graph share (llama_moe_cache_wide_graphs), where
+    // the host path carries the decode (G4 Flash-Next 32 GB: 8k 172.7 -> 193.8 tok/s and chat TTFT 0.26 -> 0.22 s with the pause; 16 GB
+    // forced prewarm chat 125.8 -> 162.8). Over the share the prewarm keeps counting, as before: there the windows it feeds turn the host
+    // path off, which a timing trial confirms (G4 48 GB, 14.7 vs 16.6 ms per small batch), and the pause would move the warm phase and
+    // the trial into the first request (gc_ab1 48 GB DFlash2 chat 269.8 -> 246.1). =1 always, =0 never
+    const char * e_cmp = getenv("LLAMA_SPEC_PREWARM_CM_PAUSE");
+    const bool cm_pause = e_cmp != nullptr ? atoi(e_cmp) != 0 : !wide_graphs;
     if (cm_pause) {
         llama_moe_cache_stats_pause(ctx, true);
     }
