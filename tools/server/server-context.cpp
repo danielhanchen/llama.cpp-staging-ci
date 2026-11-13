@@ -162,16 +162,16 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     // k19-fullcost (LLAMA_SPEC_PREWARM_CACHED=1, opt-in): beside a MoE cache too; LLAMA_SPEC_PREWARM_WIDTHS="1,3,7" prewarms only those
     // widths (default 1..w_max). LLAMA_SPEC_PREWARM_MEM=1 logs the device's free memory after each width (the graph memory per width)
     // (k19-bigverify: unset, on beside a cache that holds most of the experts, llama_moe_cache_wide_graphs; =0 off there too)
-    // k19-g4cap: unset, also beside a cache that holds at least LLAMA_SPEC_PREWARM_CACHED_FRAC of its host expert bytes (default 0.3;
-    // 0 = only the wide-graph rule, as before) where the widest window is at least LLAMA_SPEC_PREWARM_CACHED_MIN_W (5) rows (DFlash2:
+    // k19-g4cap (opt-in, LLAMA_SPEC_PREWARM_CACHED_FRAC=f, e.g. 0.3; unset / 0 = only the wide-graph rule, as before): also beside a cache
+    // that holds at least f of its host expert bytes, where the widest window is at least LLAMA_SPEC_PREWARM_CACHED_MIN_W (5) rows (DFlash2:
     // MTP's 1..3-row graphs are captured by the first request's own short windows). Only the prewarm: the device KV buckets keep their
     // 2048-cell step there. Colab G4 Qwen3.8-Flash-Next UD-IQ4_XS at a 32 GB cap (41.4% cached): the warm-up request leaves the 4..7-row
     // verify widths to be built and captured inside the next one (36-129 ms per width); prewarmed, with the CPU-miss windows paused (below),
     // DFlash2 n6 chat 203.1 -> 224.1 tok/s (same text), 8k 172.7 -> 190.3 (other text: the prewarm moves the cached experts, so the
     // host-computed ones; srv_kld long48 inside the -fa off band), 3 launches on one VM with the CPU-miss calibration pinned for both
-    // builds. At 16 GB (15.5% cached) it stays off: level with the pause, -24% without it
+    // builds. At 16 GB (15.5% cached) keep it off: level with the pause, -24% without it. Opt-in because the 8k text changes (exact in chat)
     static const double cached_frac_min = getenv("LLAMA_SPEC_PREWARM_CACHED_FRAC") != nullptr ?
-        atof(getenv("LLAMA_SPEC_PREWARM_CACHED_FRAC")) : 0.3;
+        atof(getenv("LLAMA_SPEC_PREWARM_CACHED_FRAC")) : 0.0;
     static const int cached_min_w = getenv("LLAMA_SPEC_PREWARM_CACHED_MIN_W") != nullptr ?
         atoi(getenv("LLAMA_SPEC_PREWARM_CACHED_MIN_W")) : 5;
     const double cache_frac = llama_moe_cache_frac(ctx);
@@ -208,7 +208,7 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     }
     if (cached_ok && llama_moe_cache_active(ctx) && !wide_graphs) {
         SRV_INF("k19-g4cap: verify graphs prewarmed beside a MoE cache that holds %.1f%% of the host experts (LLAMA_SPEC_PREWARM_CACHED_FRAC "
-                "%.2f; =0: off)\n", 100.0*cache_frac, cached_frac_min);
+                "%.2f)\n", 100.0*cache_frac, cached_frac_min);
     }
     auto dev_free_mib = []() -> double {
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
