@@ -375,9 +375,12 @@ int main(int argc, char ** argv) {
         { "r4_reassoc0", self, "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_VERIFY_REASSOC=0", "GGML_CUDA_MMVQ_COLS_CFG=R4 GGML_CUDA_VERIFY_REASSOC=0", 1 },
         { "r8_reassoc0", self, "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_VERIFY_REASSOC=0", "GGML_CUDA_MMVQ_COLS_CFG=R8 GGML_CUDA_VERIFY_REASSOC=0", 1 },
         // k19-q38next: the K-quant / IQ4_XS rows (GGML_CUDA_MMVQ_KQ_ROWS=R4) against the same launch without them, plain, verify and exact
-        { "kq_r4",       self, "GGML_CUDA_MMVQ_KQ_ROWS=0", "GGML_CUDA_MMVQ_KQ_ROWS=R4", 1 },
-        { "kq_r4_reassoc0", self, "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_VERIFY_REASSOC=0", "GGML_CUDA_MMVQ_KQ_ROWS=R4 GGML_CUDA_VERIFY_REASSOC=0", 1 },
-        { "kq_r4_mmq0",  self, "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_VERIFY_MMQ=0", "GGML_CUDA_MMVQ_KQ_ROWS=R4 GGML_CUDA_VERIFY_MMQ=0", 1 },
+        // (the IQ lever off on both sides, so only the K-quant launches log)
+        { "kq_r4",       self, "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_MMVQ_KQ_ROWS=0", "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_MMVQ_KQ_ROWS=R4", 1 },
+        { "kq_r4_reassoc0", self, "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_VERIFY_REASSOC=0",
+                         "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_MMVQ_KQ_ROWS=R4 GGML_CUDA_VERIFY_REASSOC=0", 1 },
+        { "kq_r4_mmq0",  self, "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_VERIFY_MMQ=0",
+                         "GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_MMVQ_KQ_ROWS=R4 GGML_CUDA_VERIFY_MMQ=0", 1 },
         { "r4_mmq0",     self, "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_MMVQ_COLS_CFG=0 GGML_CUDA_VERIFY_MMQ=0", "GGML_CUDA_MMVQ_COLS_CFG=R4 GGML_CUDA_VERIFY_MMQ=0", 1 },
         // the shipped default (unset = AUTO; off on archs without a measurement, so bytes only)
         { "default",     self, "GGML_CUDA_MMVQ_KQ_ROWS=0 GGML_CUDA_MMVQ_COLS_CFG=0", "MMVQCOLS_DEFAULT=1", -1 },

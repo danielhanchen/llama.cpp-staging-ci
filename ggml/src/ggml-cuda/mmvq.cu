@@ -3121,9 +3121,13 @@ static int mul_mat_vec_q_nwarps_1(const int ncols_x, const bool has_ids, const i
 static constexpr bool mmvq_kq_type(const ggml_type type) {
     return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ4_XS;
 }
+// AUTO: Ada (cc 8.9) 4 rows at 2..8 columns for all four types: Colab L4, Qwen3.8-27B UD-Q4_K_XL + MTP drafter (5-row verify windows),
+// 3 interleaved launches, chat 34.3 -> 39.5 tok/s, 8k 30.4 -> 35.1 (+15%), text unchanged (default and exact verify). Ampere cc 8.0
+// stays off: on a Colab A100 the 4-row launch of Q4_K / Q5_K / Q6_K at 5 columns ran 1-16% slower (test-mmvqcols-exact --bench, register
+// pressure; plans/k19_q38next.md). Other archs off until measured
 static int mmvq_kq_rows_auto(const ggml_type type, const int ncols_dst, const int cc) {
-    GGML_UNUSED(type); GGML_UNUSED(ncols_dst); GGML_UNUSED(cc);
-    return 0;
+    GGML_UNUSED(type); GGML_UNUSED(ncols_dst);
+    return cc == GGML_CUDA_CC_ADA_LOVELACE ? 4 : 0;
 }
 static int mmvq_kq_rows(const ggml_type type, const int ncols_dst, const mmvq_parameter_table_id table_id) {
     static const int cfg = [] {
