@@ -2238,7 +2238,9 @@ struct llama_moe_cache::impl {
                 n_fill += fills.size();
                 // k19-l4held: on an exclusive tier the RAM copies of the experts the device now holds (the page-cache fill at load runs
                 // first) are duplicates, the first slots a reservation takes (the layer quota counts them; LLAMA_MOE_HOST_LAYER_QUOTA=0 off)
-                if (host && host->exclusive() && host_quota_mode != 0 && host_layer(il)) {
+                // k19-l4fill: also with the refill of freed slots (LLAMA_MOE_HOST_FILL, default on): where the bench's warm read left more
+                // of the model in the page cache, 761-1254 such copies stayed in the tier to the chat after the 640-token request
+                if (host && host->exclusive() && (host_quota_mode != 0 || fill_mode != 0) && host_layer(il)) {
                     for (const auto & f : fills) {
                         const int32_t h = host->held(il, f.expert);
                         if (h >= 0 && !host->is_dup(h)) {
