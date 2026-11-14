@@ -2793,6 +2793,13 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int * sections,
                             int   il);
 
+        // the mask of build_qsa_sel from the selected cells (k19-p2qsa: the scored or the all-fit selection)
+        ggml_tensor * build_qsa_sel_mask(
+          llm_graph_input_kpool * inp_kpool,
+                    ggml_tensor * sel_idx,
+                    ggml_tensor * kq_mask,
+                            int   il);
+
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
                     ggml_tensor * cur,

@@ -354,6 +354,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-mtp-draft-topk PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # k19-p2qsa: the QSA selection without indexer scoring while every pool fits the top_k (LLAMA_QSA_ALLFIT) == the scored one, byte for byte
+    llama_build(test-qsa-allfit-exact.cpp)
+    llama_test(
+        test-qsa-allfit-exact
+        LABEL main
+        ARGS "${MODEL_DIR}/qwen4exp-moe.gguf"
+    )
+    set_tests_properties(test-qsa-allfit-exact PROPERTIES FIXTURES_REQUIRED generate-models)
+
     # k19-hostgap: KV seq_rm over the used cells (LLAMA_KV_SEQ_RM_USED) leaves tokens, drafts and the memory state unchanged
     llama_build(test-hostgap-exact.cpp)
     llama_test(
@@ -509,6 +518,7 @@ llama_build_and_test(test-topk384-exact.cpp LINK ggml)
 llama_build_and_test(test-topk-oneblock-exact.cpp LINK ggml)
 llama_build_and_test(test-topk-twostage-exact.cpp LINK ggml)   # k19-dtopk: two-stage one-launch top-k == radix select, byte for byte
 llama_build_and_test(test-topk-batch-exact.cpp LINK ggml)      # k19-p3topk: one top-k over a verify window == one per row, byte for byte
+llama_build_and_test(test-fa-sparse-smem-exact.cpp LINK ggml)   # k19-p2qsa: sparse MMA flash attention at its one-stage shared memory == the two-stage launch, byte for byte
 llama_build_and_test(test-fattn-q8-exact.cpp LINK ggml)   # k19-fattnq8: MMA flash attention reading q8_0 K / V in place == the staged f16 copy, byte for byte
 # k19-moebw routed-expert mat-vec vs the kernels it replaces, byte for byte (SKIP without a CUDA device)
 llama_build_and_test(test-moe-bw-exact.cpp LINK ggml)
