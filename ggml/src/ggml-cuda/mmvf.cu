@@ -143,7 +143,7 @@ static __global__ void mul_mat_vec_f(
     }
 
     if (block_size > warp_size) {
-        // k19-p1fuse one_bar: one zeroed partial slice of warp_size floats per column (ggml_cuda_mmvf_shared_bytes), else the one slice
+        // k19-p1fuse one_bar: one zeroed partial slice of warp_size floats per column (nbytes_shared), else the one slice
         const int nzero = one_bar ? ncols_dst*warp_size : warp_size;
         for (int i = tid; i < nzero; i += block_size) {
             buf_iw[i] = 0.0f;
