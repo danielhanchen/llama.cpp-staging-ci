@@ -39,7 +39,6 @@
 #include "ggml-cuda/mmvf-splitk.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmq-few.cuh"
-#include "ggml-cuda/mmvq-kqtc.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -2683,7 +2682,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             const char * e = getenv("GGML_CUDA_VERIFY_REASSOC");
             return e == nullptr || atoi(e) != 0;
         }();
-        // k19-kqtc: the ported few-row MMQ (GGML_CUDA_MMQ_FEW, opt-in) takes the verify product where it applies, unless the verify is
+        // k19-kqtc: the ported few-row MMQ (GGML_CUDA_MMQ_FEW, AUTO per architecture) takes the verify product where it applies, unless the verify is
         // the bit-exact one (GGML_CUDA_VERIFY_REASSOC=0)
         if (reassoc_ok && ggml_cuda_should_use_mmq_few(src0, src1, cc)) {
             ggml_cuda_mul_mat_q_few(ctx, src0, src1, dst);
@@ -2747,7 +2746,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    // k19-kqtc: the ported few-row MMQ (GGML_CUDA_MMQ_FEW, opt-in) before mmvq / MMQ
+    // k19-kqtc: the ported few-row MMQ (GGML_CUDA_MMQ_FEW, AUTO per architecture) before mmvq / MMQ
     if (ggml_cuda_should_use_mmq_few(src0, src1, cc)) {
         ggml_cuda_mul_mat_q_few(ctx, src0, src1, dst);
         return;
@@ -5944,7 +5943,7 @@ static bool ggml_cuda_turing_multi_mmq(const ggml_tensor * node, const int cc) {
     const ggml_tensor * src0 = node->src[0];
     const int64_t       ne11 = node->src[1]->ne[1];
     if (min_cols == 0 || verify_mmq_off || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_TURING || cc >= GGML_CUDA_CC_AMPERE ||
-            !(node->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) || ne11 < min_cols || ne11 > 16 || !ggml_cuda_mmvq_kqtc_reassoc_ok() ||
+            !(node->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) || ne11 < min_cols || ne11 > 16 || !ggml_cuda_verify_reassoc_ok() ||
             !turing_mma_available(cc) || !ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         return false;
     }
@@ -5975,7 +5974,7 @@ static bool ggml_cuda_mmvq_multi_runtime_ok(const ggml_backend_cuda_context * ct
         return false;
     }
     // k19-kqtc: a product the few-row MMQ takes in ggml_cuda_mul_mat stays a single product
-    if (ne11 > 1 && (!exact || ggml_cuda_mmvq_kqtc_reassoc_ok()) && ggml_cuda_should_use_mmq_few(src0, src1, cc)) {
+    if (ne11 > 1 && (!exact || ggml_cuda_verify_reassoc_ok()) && ggml_cuda_should_use_mmq_few(src0, src1, cc)) {
         return false;
     }
     if (ggml_cuda_turing_multi_mmq(node, cc)) {

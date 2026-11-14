@@ -507,7 +507,7 @@ llama_build_and_test(test-moe-bw-exact.cpp LINK ggml)
 llama_build_and_test(test-dflash2-conv-exact.cpp LINK ggml)
 # k19-mmvqcols: the rows-per-block lever of the dense 2..8 column mat-vec vs the launch it replaces, byte for byte (SKIP without a CUDA device)
 llama_build_and_test(test-mmvqcols-exact.cpp LINK ggml)
-# k19-kqtc: int8 tensor-core mat-vec of dense K-quant / IQ4_XS / Q8_0 products at 2..8 columns vs mmvq + fp64 reference (NMSE gates,
+# k19-kqtc: the ported few-row int8 MMQ (GGML_CUDA_MMQ_FEW) on dense K-quant / IQ4_XS / Q8_0 products at 2..8 columns vs mmvq + fp64 reference (NMSE gates,
 # column invariance and exact-verify bytes; SKIP without a CUDA device)
 llama_build_and_test(test-kqtc-exact.cpp LINK ggml)
 # k19-iqsmem: IQ3 MUL_MAT_ID grid rows + IQ2_XS / IQ2_S codebook in shared memory vs the launches they replace, byte for byte (SKIP without a CUDA device)

@@ -10,6 +10,14 @@
 #include <mutex>
 #include <type_traits>
 
+bool ggml_cuda_verify_reassoc_ok() {
+    static const bool reassoc = [] {
+        const char * e = getenv("GGML_CUDA_VERIFY_REASSOC");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return reassoc;
+}
+
 // NVIDIA only: the kernel uses the NVIDIA int8 MMA fragment layout and cp.async.
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
@@ -849,7 +857,7 @@ void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int ncg    = mmq_few_ncg(ne11);
 
     static const bool log_each = [] {
-        const char * e = getenv("GGML_CUDA_MMVQ_KQTC_LOG");
+        const char * e = getenv("GGML_CUDA_MMQ_FEW_LOG");
         return e != nullptr && atoi(e) != 0;
     }();
     if (log_each) {

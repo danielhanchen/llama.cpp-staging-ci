@@ -1,12 +1,13 @@
-// k19-kqtc: the int8 tensor-core mat-vec of dense Q4_K / Q5_K / Q6_K / IQ4_XS / Q8_0 products at 2..8 columns (GGML_CUDA_MMVQ_KQTC)
-// against the mul_mat_vec_q launch it replaces and an fp64 CPU reference (dequantized weights x f32 activations).
-// The lever only reorders f32 sums of the same int8 products, so it cannot be bit-identical to mmvq; the gates are:
-//  - accuracy: NMSE(kqtc, mmvq) <= 1e-10 per case and NMSE(kqtc, ref) <= 1.02 * NMSE(mmvq, ref) + 1e-12 (the q8_1 activation rounding,
-//    ~1e-5, dominates both; a wrong scale / nibble / permutation gives >= 1e-4); a negative control (outputs x (1 + 2^-7)) must fail it;
-//  - exact properties: a column's bytes do not depend on the launch's number of columns (2..8) nor on the row tiles per warp
-//    (GGML_CUDA_MMVQ_KQTC_CFG 4x1 == 4x2, 8x1 == 8x2); 1-column products keep the mmvq bytes; under the bit-exact verify
-//    (batch invariant + GGML_CUDA_VERIFY_REASSOC=0) every flagged product keeps the mmvq bytes and the lever does not engage;
-//  - engagement: the lever logs launches (single and multi-matrix: two products of one activation, as gate / up), mmvq side logs none.
+// k19-kqtc: the few-row int8 MMQ ported from upstream (GGML_CUDA_MMQ_FEW: unset = AUTO per architecture, 0 = off, 1 = upstream's
+// per-type table, N = from N columns) on dense Q4_K / Q5_K / Q6_K / IQ4_XS / Q8_0 products of 2..8 columns, against the mul_mat_vec_q /
+// MMQ launch it replaces (GGML_CUDA_MMQ_FEW=0) and an fp64 CPU reference (dequantized weights x f32 activations). It quantizes the
+// activations itself (x * (127 / amax)), so it cannot be bit-identical; the gates are:
+//  - accuracy: NMSE(lever, ref) <= 1.10 * NMSE(replaced launch, ref) + 1e-12 per case (the q8_1 activation rounding, ~1e-5, dominates;
+//    a wrong scale / nibble / layout gives >= 1e-4); a negative control (outputs x (1 + 2^-7)) must fail it;
+//  - exact properties: 1-column products and products it does not take keep the bytes of the replaced launch; under the bit-exact
+//    verify (batch invariant + GGML_CUDA_VERIFY_REASSOC=0) every flagged product keeps them and the lever does not engage;
+//  - engagement (GGML_CUDA_MMQ_FEW_LOG=1 logs each launch): every type engages on Ampere and newer; the AUTO mode only on the devices
+//    of its table (cc 8.0 / 8.9 / 12.0), never elsewhere; never on Turing. Column invariance across widths is reported (informational).
 // Each mode runs in a child process (the switches are read once per process). No CUDA device: SKIP, exit 0.
 //
 // --bench L REPS [TYPES] [SHAPES]: Qwen3.8-27B shapes (gu = gate + up 5120 -> 2 x 17408 on one activation, dn 17408 -> 5120,
@@ -40,7 +41,7 @@ static int n_logs = 0, n_logs_multi = 0;
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
     if (strstr(text, "k19-kqtc:") != nullptr) {
-        if (strstr(text, " columns ") != nullptr) { // per launch line (GGML_CUDA_MMVQ_KQTC_LOG=1)
+        if (strstr(text, " columns ") != nullptr) { // per launch line (GGML_CUDA_MMQ_FEW_LOG=1)
             n_logs++;
             if (strstr(text, " 2 matrices") != nullptr) {
                 n_logs_multi++;
@@ -260,8 +261,8 @@ static int run_bench(ggml_backend_t be, int argc, char ** argv) {
     struct bshp { const char * name; int K, N; bool pair; };
     const bshp all_shapes[] = { { "gu", 5120, 17408, true }, { "dn", 17408, 5120, false }, { "qkv", 5120, 10240, false }, { "o", 6144, 5120, false } };
     static const bool bflag = getenv("KQTC_BENCH_FLAG") != nullptr && atoi(getenv("KQTC_BENCH_FLAG")) != 0;
-    printf("bench L %d REPS %d FLAG %d KQTC=%s CFG=%s KQ_ROWS=%s VERIFY_MMQ=%s\n", L, REPS, (int) bflag,
-        getenv("GGML_CUDA_MMVQ_KQTC") ? getenv("GGML_CUDA_MMVQ_KQTC") : "-", getenv("GGML_CUDA_MMVQ_KQTC_CFG") ? getenv("GGML_CUDA_MMVQ_KQTC_CFG") : "-",
+    printf("bench L %d REPS %d FLAG %d MMQ_FEW=%s KQ_ROWS=%s VERIFY_MMQ=%s\n", L, REPS, (int) bflag,
+        getenv("GGML_CUDA_MMQ_FEW") ? getenv("GGML_CUDA_MMQ_FEW") : "-",
         getenv("GGML_CUDA_MMVQ_KQ_ROWS") ? getenv("GGML_CUDA_MMVQ_KQ_ROWS") : "-", getenv("GGML_CUDA_VERIFY_MMQ") ? getenv("GGML_CUDA_VERIFY_MMQ") : "-");
     for (const ggml_type t : all_types) {
         if (types != "all" && (("," + types + ",").find("," + std::string(ggml_type_name(t)) + ",") == std::string::npos)) {
@@ -323,7 +324,7 @@ static int run_bench(ggml_backend_t be, int argc, char ** argv) {
 }
 
 static int spawn_child(const std::string & exe, const std::string & env, const std::string & out, int * logs, int * logs_multi) {
-    const std::string cmd = "env " + env + " GGML_CUDA_MMVQ_KQTC_LOG=1 \"" + exe + "\" --child \"" + out + "\"";
+    const std::string cmd = "env " + env + " GGML_CUDA_MMQ_FEW_LOG=1 \"" + exe + "\" --child \"" + out + "\"";
 #if defined(_WIN32)
     FILE * p = _popen(cmd.c_str(), "r");
 #else
@@ -466,22 +467,12 @@ int main(int argc, char ** argv) {
 
     struct mode { const char * name; const char * env; };
     const mode modes[] = {
-        { "base",       "GGML_CUDA_MMVQ_KQTC=0 GGML_CUDA_MMQ_FEW=0" },
-        { "tc",         "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_MMQ_FEW=0" },
-        { "tc_4x1",     "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_MMVQ_KQTC_CFG=4x1 GGML_CUDA_MMQ_FEW=0" },
-        { "tc_4x2",     "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_MMVQ_KQTC_CFG=4x2 GGML_CUDA_MMQ_FEW=0" },
-        { "tc_8x1",     "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_MMVQ_KQTC_CFG=8x1 GGML_CUDA_MMQ_FEW=0" },
-        { "tc_8x2",     "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_MMVQ_KQTC_CFG=8x2 GGML_CUDA_MMQ_FEW=0" },
-        { "base_exact", "GGML_CUDA_MMVQ_KQTC=0 GGML_CUDA_VERIFY_REASSOC=0 GGML_CUDA_MMQ_FEW=0" },
-        { "tc_exact",   "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_VERIFY_REASSOC=0 GGML_CUDA_MMQ_FEW=0" },
-        { "base_mmq0",  "GGML_CUDA_MMVQ_KQTC=0 GGML_CUDA_VERIFY_MMQ=0 GGML_CUDA_MMQ_FEW=0" },
-        { "tc_mmq0",    "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_VERIFY_MMQ=0 GGML_CUDA_MMQ_FEW=0" },
-        // the few-row MMQ ported from upstream (GGML_CUDA_MMQ_FEW): own src1 quantization (x * (127 / amax) instead of x / d), so
-        // only the fp64-reference gate; Ampere and newer, K >= 2048 only
+        { "base",       "GGML_CUDA_MMQ_FEW=0" },
+        { "base_exact", "GGML_CUDA_MMQ_FEW=0 GGML_CUDA_VERIFY_REASSOC=0" },
         { "few",        "GGML_CUDA_MMQ_FEW=2" },
         { "few_up",     "GGML_CUDA_MMQ_FEW=1" },
         { "few_exact",  "GGML_CUDA_MMQ_FEW=2 GGML_CUDA_VERIFY_REASSOC=0" },
-        { "few_auto",   "GGML_CUDA_MMVQ_KQTC=0" },   // the shipped default: GGML_CUDA_MMQ_FEW unset = the per-architecture table
+        { "few_auto",   "GGML_CUDA_MMQ_FEW_LOG=1" },   // the shipped default: GGML_CUDA_MMQ_FEW unset = the per-architecture table
     };
     const int nm = (int) (sizeof(modes)/sizeof(modes[0]));
     std::vector<std::vector<uint8_t>> dumps(nm);
@@ -511,9 +502,9 @@ int main(int argc, char ** argv) {
         }
         return -1;
     };
-    const int ib = M("base"), it = M("tc"), ibe = M("base_exact"), ite = M("tc_exact"), ibm = M("base_mmq0"), itm = M("tc_mmq0");
+    const int ib = M("base"), it = M("few"), ibe = M("base_exact"), ite = -1, ibm = -1, itm = -1;
     const int ife = M("few_exact");
-    const auto is_lever = [&](int i) { return strncmp(modes[i].name, "tc", 2) == 0 || strncmp(modes[i].name, "few", 3) == 0; };
+    const auto is_lever = [&](int i) { return strncmp(modes[i].name, "few", 3) == 0; };
     const auto is_few   = [&](int i) { return strncmp(modes[i].name, "few", 3) == 0; };
     const bool few_dev  = cc < 0 || cc >= 800; // the few-row MMQ needs the Ampere MMA
     const bool auto_dev = cc == 800 || cc == 890 || cc == 1200; // devices of its AUTO table
@@ -568,7 +559,7 @@ int main(int argc, char ** argv) {
                 }
                 continue;
             }
-            if (!is_few(i)) {
+            if (i == it) {
                 engaged_by_type[(int) c.type]++;
             }
             const double d_base = nmse(fi, fbi, n);
@@ -591,14 +582,14 @@ int main(int argc, char ** argv) {
                     s.N, c.T, c.flagged ? " flagged" : "", d_base, e_tc, e_bi);
                 n_fail++;
             }
-            // negative control (mode tc only): the outputs x (1 + 2^-7) must fail the accuracy gate
+            // negative control (mode few only): the outputs x (1 + 2^-7) must fail the accuracy gate
             if (i == it) {
                 std::vector<float> pert(fi, fi + n);
                 for (auto & v : pert) {
                     v *= 1.0f + 1.0f/128.0f;
                 }
                 n_neg++;
-                if (nmse(pert.data(), fbi, n) <= 1e-10 && nmse_ref(pert.data(), ref.data(), n) <= 1.02*e_bi + 1e-12) {
+                if (nmse_ref(pert.data(), ref.data(), n) <= 1.10*e_bi + 1e-12) {
                     n_neg_fail++;
                 }
             }
@@ -607,7 +598,7 @@ int main(int argc, char ** argv) {
         off += n*sizeof(float);
     }
     for (const ggml_type t : all_types) {
-        if (engaged_by_type[(int) t] == 0) {
+        if (few_dev && engaged_by_type[(int) t] == 0) {
             printf("FAIL %s: the lever never engaged\n", ggml_type_name(t));
             n_fail++;
         }
@@ -656,17 +647,10 @@ int main(int argc, char ** argv) {
     }
     n_fail += n_inv_fail;
 
-    // row tiles per warp do not change a sum: 4x1 == 4x2, 8x1 == 8x2 (whole dumps)
-    const std::pair<const char *, const char *> tile_pairs[] = { { "tc_4x1", "tc_4x2" }, { "tc_8x1", "tc_8x2" } };
-    for (const auto & tp : tile_pairs) {
-        const bool same = dumps[M(tp.first)] == dumps[M(tp.second)];
-        printf("%s tiles %s == %s\n", same ? "OK  " : "FAIL", tp.first, tp.second);
-        n_fail += !same;
-    }
     printf("%s negative control: %d of %d perturbed cases passed the gate (must be 0)\n", n_neg_fail == 0 && n_neg > 0 ? "OK  " : "FAIL",
         n_neg_fail, n_neg);
-    n_fail += n_neg_fail != 0 || n_neg == 0;
-    printf("lever cases %d: worst nmse vs mmvq %.3g, worst nmse(kqtc, ref) / nmse(mmvq, ref) %.6f; invariance %d checked, %d failed\n",
+    n_fail += n_neg_fail != 0 || (few_dev && n_neg == 0);
+    printf("(own-kernel cases %d, worst %.3g / %.6f; invariance %d checked, %d failed: none since the own kernel was dropped)\n",
         n_tc_cases, worst_tc, worst_ratio, n_inv, n_inv_fail);
     printf("few-row MMQ cases %d: worst nmse vs mmvq %.3g, worst nmse(few, ref) / nmse(mmvq, ref) %.6f; column invariance %d of %d differ "
         "(informational)\n", n_few_cases, worst_few, worst_few_ratio, n_inv_few_diff, n_inv_few);
