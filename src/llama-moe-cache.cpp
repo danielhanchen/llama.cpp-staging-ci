@@ -4412,6 +4412,26 @@ struct llama_moe_cache::impl {
         return !prefilled_dev && (size_t) il < ap_dev_pred.size() && (size_t) e < ap_dev_pred[il].size() && ap_dev_pred[il][e] != 0;
     }
 
+    // the exclusive tier keeps no RAM copy of a device-held expert (a promotion takes it out of RAM), so those are not RAM targets and the
+    // page-cache fill leaves them; the inclusive tier keeps what the device holds too (a device eviction is not copied back: only a RAM
+    // copy saves its read), so every expert may be a target there
+    bool ap_dev_skip(int32_t il, int32_t e) const {
+        return host->exclusive() && ap_on_dev(il, e);
+    }
+
+    // k19-autoprof2 (LLAMA_MOE_AUTOPROF_INCL, opt-in =1): the inclusive RAM tier (a capped card whose device slots hold the experts of
+    // fewer than LLAMA_MOE_HOST_MIN_TOKENS tokens on a disk tier, e.g. Colab L4 @12 GB with MTP) also uses the profile: the page-cache
+    // fill hottest first, the target set (hottest experts of each layout, as many as its slots, device-held ones included), cold
+    // experts marked as guesses at each request's first large batch (a miss read or a prompt upload takes them before the CLOCK evicts
+    // anything), a prompt's uploads take a free slot for a cold expert only while the layout keeps one per target expert held nowhere.
+    // Placement only (which RAM slot holds which expert's file bytes): exact. Opt-in: Colab L4 @12 GB fn4n MTP n2 against a base with
+    // its PLE profile, 3 interleaved launches: decode after 8k +19%, chat TTFT -3%, but 8k TTFT +11% (8k request level). Unset / 0: the
+    // inclusive tier records only, as before
+    static bool ap_incl_env() {
+        static const bool on = [] { const char * e = getenv("LLAMA_MOE_AUTOPROF_INCL"); return e != nullptr && atoi(e) != 0; }();
+        return on;
+    }
+
     bool ap_target(int32_t il, int32_t e) const {
         return (size_t) il < ap_tgt.size() && (size_t) e < ap_tgt[il].size() && ap_tgt[il][e] != 0;
     }
@@ -4456,11 +4476,12 @@ struct llama_moe_cache::impl {
                 }
             }
         }
-        ap_use = have && llama_autoprof::uses(ap_mode) && host->exclusive() && !resident_mode && wstore != nullptr;
+        ap_use = have && llama_autoprof::uses(ap_mode) && (host->exclusive() || ap_incl_env()) && !resident_mode && wstore != nullptr;
         if (ap_use) {
             ap_rebuild_target();
-            // the refill of the free slots (k19-l4fill) starts from the profile: one prompt's worth of counts per layer, halved per prompt
-            if (fill_mode != 0) {
+            // the refill of the free slots (k19-l4fill, exclusive tier) starts from the profile: one prompt's worth of counts per layer,
+            // halved per prompt
+            if (fill_mode != 0 && host->exclusive()) {
                 fill_cnt.assign(layers.size(), {});
                 fill_layer_epoch.assign(layers.size(), 0);
                 for (size_t il = 0; il < layers.size(); ++il) {
@@ -4482,7 +4503,8 @@ struct llama_moe_cache::impl {
         }
         LLAMA_LOG_INFO("llama_moe_cache%s: k19-autoprof: routing profile %s %s (%zu experts)%s; LLAMA_MOE_AUTOPROF=0 off, 3 read only\n", tag,
             ap_file.c_str(), have ? "read" : "not found", aps.loaded,
-            ap_use ? ": the RAM tier is filled hottest first" : have ? ": not used (needs the exclusive RAM tier of the weight store, LLAMA_MOE_AUTOPROF 1 / 3)" :
+            ap_use ? (host->exclusive() ? ": the RAM tier is filled hottest first" : ": the inclusive RAM tier is filled hottest first (LLAMA_MOE_AUTOPROF_INCL=1)") :
+            have ? ": not used (needs a RAM tier of the weight store, LLAMA_MOE_AUTOPROF 1 / 3, LLAMA_MOE_AUTOPROF_INCL for the inclusive tier)" :
             ap_rec ? ": recording" : "");
     }
 
@@ -4504,7 +4526,7 @@ struct llama_moe_cache::impl {
             const int32_t c = host->class_of(il);
             slots_of_class[c] = host->n_slots_of(il);
             for (int32_t e = 0; e < (int32_t) ap_cnt[il].size() && e < ne_max; ++e) {
-                if (ap_cnt[il][e] > 0.0f && !ap_on_dev(il, e)) {
+                if (ap_cnt[il][e] > 0.0f && !ap_dev_skip(il, e)) {
                     by_class[c].emplace_back(ap_cnt[il][e], il*ne_max + e);
                 }
             }
@@ -4535,7 +4557,7 @@ struct llama_moe_cache::impl {
             const int32_t c = host->class_of(il);
             for (int32_t e = 0; e < (int32_t) ap_tgt[il].size(); ++e) {
                 const bool held = host->contains(il, e);
-                if (ap_tgt[il][e] && !held && !ap_on_dev(il, e)) {
+                if (ap_tgt[il][e] && !held && !ap_dev_skip(il, e)) {
                     ap_need[c]++;
                 }
                 if (held) {
@@ -4598,8 +4620,11 @@ struct llama_moe_cache::impl {
             return true;
         }
         take_spec = false;
+        // k19-autoprof2 (LLAMA_MOE_AUTOPROF_REFUSE=0, diagnostic): a cold expert takes any free slot (as a guess, see tier_offer), the
+        // target experts then take guesses like free slots
+        static const bool refuse = [] { const char * e = getenv("LLAMA_MOE_AUTOPROF_REFUSE"); return e == nullptr || atoi(e) != 0; }();
         // (a duplicate of a device-held expert is as good as a free slot; counted per large batch)
-        if (c >= 0 && (size_t) c < ap_need.size() && (int64_t) host->n_free_of(il) + ap_dup[c] <= ap_need[c]) {
+        if (refuse && c >= 0 && (size_t) c < ap_need.size() && (int64_t) host->n_free_of(il) + ap_dup[c] <= ap_need[c]) {
             aps.cold_refused++;
             return false;
         }
@@ -5048,7 +5073,7 @@ struct llama_moe_cache::impl {
                     if (!all || host->contains(il, e) || (from_file && on_dev)) {
                         continue;
                     }
-                    if (ap_order && ap_on_dev(il, e)) {
+                    if (ap_order && ap_dev_skip(il, e)) {
                         continue;
                     }
                     if (ap_order) {
