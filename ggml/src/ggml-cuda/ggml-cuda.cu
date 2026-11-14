@@ -872,8 +872,16 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             __func__, (long long) src1_memo.n_reused, src1_memo.bytes_skipped / 1048576.0, (long long) src1_memo.n_produced);
     }
 
+    if (mmid_route.n_reused_down > 0) {
+        GGML_LOG_INFO("%s: MMID routing maps reused by %lld fused-SwiGLU down products (GGML_CUDA_MMID_MEMO_DOWN=0 turns it off)\n",
+            __func__, (long long) mmid_route.n_reused_down);
+    }
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
+    }
+    if (mmid_route.buf != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(mmid_route.buf));
     }
     if (mmvf_splitk_part != nullptr) {
         ggml_cuda_set_device(device);
@@ -9612,6 +9620,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
             };
 
+            cuda_ctx->mmid_route.invalidate(); // k19-p5mmq: maps of another graph (or an earlier run of this one) are not reused
             cuda_ctx->mmvq_done_early.clear();
             cuda_ctx->gdn_state_in_place.clear();
             cuda_ctx->gdn_gates_in.clear();
@@ -9628,6 +9637,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif // USE_CUDA_GRAPH
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                // k19-p5mmq: a node writing over the ids of the kept MoE routing maps drops them (the maps' ids are only read by the
+                // products in the graphs built here; a group fused into an earlier node is not checked)
+                cuda_ctx->mmid_route.check_node(node);
 #ifdef USE_CUDA_GRAPH
                 // k19-am17an: the next chunk starts here (fused nodes are skipped together, so a cut never splits a fusion), only with no
                 // work open on another stream (see ggml_cuda_graph_chunk_size)
@@ -9960,6 +9972,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             side_mv_join_until(INT_MAX);
             cuda_ctx->src1_memo.release();
             cuda_ctx->src1_memo.share_next = false;
+            cuda_ctx->mmid_route.invalidate();
             cuda_ctx->q8_1_cache.end();
             cuda_ctx->mmvq_done_early.clear();
             cuda_ctx->gdn_state_in_place.clear();

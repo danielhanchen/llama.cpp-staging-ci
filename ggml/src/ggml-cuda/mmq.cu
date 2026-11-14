@@ -135,6 +135,12 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
     return GGML_PREC_Q4;
 }
 
+// k19-p5mmq: GGML_CUDA_MMID_MEMO_DOWN=0: every MoE MMQ product builds its routing maps (see ggml_cuda_mmid_route_memo)
+static bool ggml_cuda_mmid_memo_down_enabled() {
+    static const bool on = getenv("GGML_CUDA_MMID_MEMO_DOWN") == nullptr || atoi(getenv("GGML_CUDA_MMID_MEMO_DOWN")) != 0;
+    return on;
+}
+
 static int ggml_cuda_mmq_skip_empty_mode() {
     static const int mode = getenv("GGML_CUDA_MMQ_SKIP_EMPTY") ? atoi(getenv("GGML_CUDA_MMQ_SKIP_EMPTY")) : 1;
     return mode;
@@ -378,23 +384,69 @@ void ggml_cuda_mul_mat_q(
     }
     char * memo_base = (memo_hit || memo_hold) ? (char *) memo.ptr : nullptr;
 
+    // k19-p5mmq: the routing maps with the inverse map (gate / up with one row per token, the fused-SwiGLU down) depend only on the ids
+    // and their shape: kept in ctx.mmid_route by the product that builds them for the next ones with the same ids (see
+    // ggml_cuda_mmid_route_memo). Same integers, so the same bytes
+    const bool write_inverse = dedup_bcast || swiglu_src1;
+    ggml_cuda_mmid_route_memo & route = ctx.mmid_route;
+    const int64_t route_key[ggml_cuda_mmid_route_memo::n_key] = {
+        ne02, ne12, n_expert_used, si1, (int64_t) (intptr_t) ids->data, (int64_t) ggml_nbytes(ids), (int64_t) ids->nb[1] };
+    const size_t route_off_dst = GGML_PAD(ne_get_rows*sizeof(int32_t), 256);
+    const size_t route_off_eb  = route_off_dst + GGML_PAD((ne_get_rows + 127)*sizeof(int32_t), 256);
+    const size_t route_size    = route_off_eb  + GGML_PAD((ne02 + 1)*sizeof(int32_t), 256);
+    bool route_use = false;
+    if (write_inverse && ggml_cuda_mmid_memo_down_enabled() && ctx.curr_stream_no == 0) {
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+        route_use = capture == cudaStreamCaptureStatusNone;
+    }
+    const bool route_hit = route_use && route.match(ids, route_key);
+    if (route_use && !route_hit && route.cap < route_size) {
+        route.invalidate();
+        if (route.buf != nullptr) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(cudaFree(route.buf));
+            route.buf = nullptr;
+            route.cap = 0;
+        }
+        const size_t cap = std::max<size_t>(route_size + route_size/2, 1 << 20);
+        CUDA_CHECK(cudaMalloc((void **) &route.buf, cap));
+        route.cap = cap;
+    }
+
     ggml_cuda_pool_alloc<int32_t> ids_src1_a(ctx.pool());
     ggml_cuda_pool_alloc<int32_t> ids_dst_a(ctx.pool());
     ggml_cuda_pool_alloc<int32_t> expert_bounds_a(ctx.pool());
-    if (!memo_base) {
+    if (!memo_base && !route_use) {
         ids_src1_a.alloc(ne_get_rows);
         ids_dst_a.alloc(ne_get_rows + J_best-1); // Needs to be padded for unconditional memory access.
         expert_bounds_a.alloc(ne02 + 1);
     }
-    int32_t * ids_src1_p      = memo_base ? (int32_t *) memo_base                  : ids_src1_a.get();
-    int32_t * ids_dst_p       = memo_base ? (int32_t *) (memo_base + memo_off_dst) : ids_dst_a.get();
-    int32_t * expert_bounds_p = memo_base ? (int32_t *) (memo_base + memo_off_eb)  : expert_bounds_a.get();
+    char * route_base = route_use ? route.buf : nullptr;
+    int32_t * ids_src1_p      = route_base ? (int32_t *) route_base                   :
+                                memo_base  ? (int32_t *) memo_base                    : ids_src1_a.get();
+    int32_t * ids_dst_p       = route_base ? (int32_t *) (route_base + route_off_dst) :
+                                memo_base  ? (int32_t *) (memo_base + memo_off_dst)   : ids_dst_a.get();
+    int32_t * expert_bounds_p = route_base ? (int32_t *) (route_base + route_off_eb)  :
+                                memo_base  ? (int32_t *) (memo_base + memo_off_eb)    : expert_bounds_a.get();
+    // the maps are in place: kept for these ids, or (without the route memo) built by the product that held the src1 memo
+    const bool maps_ready = route_use ? route_hit : memo_hit;
+    if (route_hit && swiglu_src1) {
+        route.n_reused_down++;
+        if (route.n_reused_down == 1 || route.n_reused_down == 1000 || route.n_reused_down == 100000) {
+            GGML_LOG_INFO("ggml_cuda: MMID routing maps reused by the fused-SwiGLU down: %lld products (GGML_CUDA_MMID_MEMO_DOWN=0 turns it off)\n",
+                (long long) route.n_reused_down);
+        }
+    }
 
     {
-        if (!memo_hit) {
+        if (!maps_ready) {
             ggml_cuda_launch_mm_ids_helper(ctx.pool(), (const int32_t *) ids->data, ids_src1_p, ids_dst_p, expert_bounds_p,
-                ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast || swiglu_src1, stream);
+                ne02, ne12, n_expert_used, ne11, si1, sis1, write_inverse, stream);
             CUDA_CHECK(cudaGetLastError());
+            if (route_use) {
+                route.set(ids, route_key);
+            }
         }
 
         // the matmul below only writes the rows an expert owns, the rest are skipped slots
