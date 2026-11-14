@@ -207,12 +207,14 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
         sum_w += w;
     }
     const int n_chain = std::max<int>(1, (int) chains.size());
-    // k19-p2qsa / k19-int3fix: the QSA form of the prewarmed decode / verify graphs. LLAMA_SPEC_PREWARM_ALLFIT unset (or 2) = both forms
-    // when the model selects QSA pools: the scored graphs (a request past 512 pools replays them) and the all-fit graphs (every shorter
-    // request replays them); 0 = scored only (k19-p2qsa 7f298b321bd: the first short request then builds its all-fit widths inside its
-    // decode, G4 Flash-Next 48 GB DFlash2 chat 281.5 -> 259.9 tok/s, +1.8 ms per pass); 1 = all-fit only (before 7f298b321bd: the first
-    // request past 512 pools builds the scored widths, G4 full card MTP 8k after chat -2.9%)
-    static const int pw_mode = getenv("LLAMA_SPEC_PREWARM_ALLFIT") != nullptr ? atoi(getenv("LLAMA_SPEC_PREWARM_ALLFIT")) : 2;
+    // k19-p2qsa / k19-int3fix: the QSA form of the prewarmed decode / verify graphs. LLAMA_SPEC_PREWARM_ALLFIT unset = the all-fit form
+    // beside a MoE cache (the host tiers, where the first request building its all-fit widths costs: G4 Flash-Next 48 GB DFlash2 chat 281.0
+    // tok/s with the all-fit prewarm vs 253.9 with the scored one, base without all-fit 265.8) and the scored form without one (full card:
+    // chat 391.6 vs 382.8, 8k 236.1 vs 232.0: a request past 512 pools then replays them); 0 = scored only (k19-p2qsa 7f298b321bd), 1 =
+    // all-fit only, 2 = both when the model selects QSA pools (twice the graphs: out of device memory at G4 48 GB without the floor below,
+    // 245.2 tok/s with it)
+    static const int pw_env  = getenv("LLAMA_SPEC_PREWARM_ALLFIT") != nullptr ? atoi(getenv("LLAMA_SPEC_PREWARM_ALLFIT")) : -1;
+    const int  pw_mode  = pw_env >= 0 ? pw_env : (llama_moe_cache_active(ctx) ? 1 : 0);
     const bool pw_both  = pw_mode >= 2 && llama_qsa_allfit_capable(ctx);
     const int  n_forms  = pw_both ? 2 : 1;
     const int  n_end    = n_pre + n_forms*n_chain*reps*sum_w;
