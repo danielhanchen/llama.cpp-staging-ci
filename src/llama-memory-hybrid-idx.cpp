@@ -10,6 +10,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-model.h"
+#include "llama-ext.h"
 
 
 #include <algorithm>
@@ -798,6 +799,13 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
 // A seq_* edit regroups the pools from the edited position on, so it stales them and the first ubatch of the next batch
 // rebuilds them from the still-valid key | gate rows, rewriting the (possibly different) rep rows.
 // Orphaned pooled slots are never cleared, a slot is only ever read through pool_cells, which follows the current grouping.
+// k19-p2qsa: see llama_qsa_allfit_pause (llama-ext.h)
+static std::atomic<int> g_qsa_allfit_pause { 0 };
+
+void llama_qsa_allfit_pause(bool on) {
+    g_qsa_allfit_pause.fetch_add(on ? 1 : -1);
+}
+
 void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & ubatch) {
     const auto & lay = mem->kpool_layout_get();
     auto & st = *kpool_st;
@@ -904,7 +912,7 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     // one (kpool_pad, or the bucket above), so with at most top pools in each sequence of the ubatch the top_k of the indexer keeps every
     // visible pool: the selection is known without scoring (LLAMA_QSA_ALLFIT=0: always score)
     static const bool allfit_on = getenv("LLAMA_QSA_ALLFIT") == nullptr || atoi(getenv("LLAMA_QSA_ALLFIT")) != 0;
-    st.allfit = allfit_on && mem->get_kpool_top() > 0;
+    st.allfit = allfit_on && g_qsa_allfit_pause.load() <= 0 && mem->get_kpool_top() > 0;
     for (uint32_t i = 0; i < ubatch.n_tokens && st.allfit; ++i) {
         st.allfit = lay.seqs[ubatch.seq_id[i][0]].pools.size() <= mem->get_kpool_top();
     }

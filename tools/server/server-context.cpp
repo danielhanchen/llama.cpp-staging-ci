@@ -275,6 +275,14 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     if (cm_pause) {
         llama_moe_cache_stats_pause(ctx, true);
     }
+    // k19-p2qsa: the prewarmed graphs in the scored QSA form (LLAMA_QSA_ALLFIT), the kept graphs a request past 512 pools replays: an all-fit
+    // prewarm left only all-fit graphs, so the first verify / decode of such a request rebuilt every width inside its decode (G4 Flash-Next
+    // full card, MTP 8k after chat: 4 builds, -2.9%). The first short request builds its all-fit graphs beside them instead (its own ways),
+    // a one-time cost per width. LLAMA_SPEC_PREWARM_ALLFIT=1: prewarm the all-fit form instead
+    static const bool pw_allfit = getenv("LLAMA_SPEC_PREWARM_ALLFIT") != nullptr && atoi(getenv("LLAMA_SPEC_PREWARM_ALLFIT")) != 0;
+    if (!pw_allfit) {
+        llama_qsa_allfit_pause(true);
+    }
     llama_set_verify(ctx, false);
     for (int done = 0; done < n_pre && ok; ) {
         const int n = std::min(n_b, n_pre - done);
@@ -318,6 +326,9 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     llama_batch_free(b);
     llama_memory_clear(mem, true);
     llama_synchronize(ctx);
+    if (!pw_allfit) {
+        llama_qsa_allfit_pause(false);
+    }
     if (cm_pause) {
         llama_moe_cache_stats_pause(ctx, false);
     }

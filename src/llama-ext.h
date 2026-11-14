@@ -219,6 +219,10 @@ LLAMA_API bool llama_moe_cache_prewarm_end(struct llama_context * ctx);
 // k19-prewexact diagnostic (LLAMA_MOE_CACHE_FP_LOG=1): logs hashes of the MoE cache state (no-op without a cache or without the env)
 LLAMA_API void llama_moe_cache_fingerprint(struct llama_context * ctx, const char * when);
 
+// k19-p2qsa: while paused (calls nest), QSA graphs score their selection even where every pool fits the top_k (LLAMA_QSA_ALLFIT): a server
+// prewarms its decode / verify graphs in the scored form, the one requests past 512 pools need, as before the all-fit graphs (process wide)
+LLAMA_API void llama_qsa_allfit_pause(bool on);
+
 // k15-ttft: a MoE cache runs (experts stream from host memory into device slots)
 LLAMA_API bool llama_moe_cache_active(const struct llama_context * ctx);
 
