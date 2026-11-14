@@ -415,6 +415,14 @@ public:
     void clear_seed_counts();
     bool has_seed_counts() const;
 
+    // k19-prewexact: the server's verify-graph prewarm (dummy windows of one repeated token) leaves the cache as it found it.
+    // prewarm_begin snapshots what a decode moves (slots, LRU / clock state, the device map / state / counters, seed and refill
+    // bookkeeping) and quiets the rules (no CPU-miss window, timing trial, overlap rule or trial, prompt trial or probe moves);
+    // prewarm_end copies back the expert of every slot that changed and restores the rest. false: refused (logged), the state stays
+    bool prewarm_begin();
+    bool prewarm_end();
+    void fingerprint(const char * when); // LLAMA_MOE_CACHE_FP_LOG=1 diagnostic: hashes of the cache state
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
 private:

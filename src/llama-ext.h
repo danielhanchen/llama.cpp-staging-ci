@@ -211,6 +211,13 @@ LLAMA_API bool llama_moe_cpu_miss_drop_slow(struct llama_context * ctx);
 LLAMA_API int32_t llama_moe_host_mode(const struct llama_context * ctx);
 // k19-tokcost: pause the MoE cache's CPU-miss rule statistics (miss-rate windows) while the caller decodes dummy batches (no-op without a cache)
 LLAMA_API void llama_moe_cache_stats_pause(struct llama_context * ctx, bool on);
+// k19-prewexact: snapshot what a decode moves in the MoE cache before dummy batches (slots, replacement state, device counters, rule
+// state; the rules stay quiet until the end) and take it back after them, so the next request sees the cache it would have seen without
+// them. begin: false without a cache or if refused; end: false if nothing was taken back (refused: logged, the state stays as moved)
+LLAMA_API bool llama_moe_cache_prewarm_begin(struct llama_context * ctx);
+LLAMA_API bool llama_moe_cache_prewarm_end(struct llama_context * ctx);
+// k19-prewexact diagnostic (LLAMA_MOE_CACHE_FP_LOG=1): logs hashes of the MoE cache state (no-op without a cache or without the env)
+LLAMA_API void llama_moe_cache_fingerprint(struct llama_context * ctx, const char * when);
 
 // k15-ttft: a MoE cache runs (experts stream from host memory into device slots)
 LLAMA_API bool llama_moe_cache_active(const struct llama_context * ctx);

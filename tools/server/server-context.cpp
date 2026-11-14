@@ -174,6 +174,7 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
         atof(getenv("LLAMA_SPEC_PREWARM_CACHED_FRAC")) : 0.0;
     static const int cached_min_w = getenv("LLAMA_SPEC_PREWARM_CACHED_MIN_W") != nullptr ?
         atoi(getenv("LLAMA_SPEC_PREWARM_CACHED_MIN_W")) : 5;
+    llama_moe_cache_fingerprint(ctx, "prewarm point"); // k19-prewexact diagnostic (LLAMA_MOE_CACHE_FP_LOG=1)
     const double cache_frac = llama_moe_cache_frac(ctx);
     const bool wide_graphs  = llama_moe_cache_wide_graphs(ctx);
     const bool band_ok      = !wide_graphs && cached_frac_min > 0.0 && cache_frac >= cached_frac_min && w_max >= cached_min_w;
@@ -248,8 +249,20 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     // forced prewarm chat 125.8 -> 162.8). Over the share the prewarm keeps counting, as before: there the windows it feeds turn the host
     // path off, which a timing trial confirms (G4 48 GB, 14.7 vs 16.6 ms per small batch), and the pause would move the warm phase and
     // the trial into the first request (gc_ab1 48 GB DFlash2 chat 269.8 -> 246.1). =1 always, =0 never
+    // k19-prewexact: beside a MoE cache the dummy windows also move what the cache holds (the 640-token prompt seeds it, every window
+    // admits and evicts by the clock), so the next requests compute other experts on the host: G4 Flash-Next 32 GB with the band prewarm
+    // gave chat the same text but 8k another one (832d4d83 vs 6974c3ad). Exact: the cache's state is snapshotted before the windows and
+    // taken back after them (the experts of the slots that changed are copied back into the banks, slots / clock / device counters /
+    // seed and refill bookkeeping restored) and its rules are quiet meanwhile (no CPU-miss window, timing trial, overlap rule or trial
+    // moves), so the first request sees the cache it would have seen without the prewarm and only the captured graphs remain.
+    // LLAMA_SPEC_PREWARM_EXACT unset = exact for the band prewarm (a cache under the wide-graph share), 1 = also over it, 0 = never (the
+    // k19-tokcost pause below then)
+    const char * e_ex  = getenv("LLAMA_SPEC_PREWARM_EXACT");
+    const int    ex_env = e_ex != nullptr ? atoi(e_ex) : -1;
+    const bool   exact  = llama_moe_cache_active(ctx) && (ex_env > 0 || (ex_env < 0 && !wide_graphs)) &&
+                          llama_moe_cache_prewarm_begin(ctx);
     const char * e_cmp = getenv("LLAMA_SPEC_PREWARM_CM_PAUSE");
-    const bool cm_pause = e_cmp != nullptr ? atoi(e_cmp) != 0 : !wide_graphs;
+    const bool cm_pause = !exact && (e_cmp != nullptr ? atoi(e_cmp) != 0 : !wide_graphs);
     if (cm_pause) {
         llama_moe_cache_stats_pause(ctx, true);
     }
@@ -299,6 +312,10 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     if (cm_pause) {
         llama_moe_cache_stats_pause(ctx, false);
     }
+    if (exact) {
+        llama_moe_cache_prewarm_end(ctx);
+    }
+    llama_moe_cache_fingerprint(ctx, "after the prewarm");
     SRV_INF("k19-vwidth: the decode / verify graphs of 1..%d rows warmed up after a %d-token prompt, %d decodes each, %d sampler chain(s) (%.1f ms; LLAMA_SPEC_PREWARM=0: off)\n",
             n_ok, n_pre, reps, (int) chains.size(), (ggml_time_us() - t0)/1000.0);
 }
