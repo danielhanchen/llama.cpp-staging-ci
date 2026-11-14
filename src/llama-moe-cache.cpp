@@ -4383,14 +4383,25 @@ struct llama_moe_cache::impl {
     std::vector<std::vector<float>>   ap_cnt;    // [n_layer][n_expert] heat: the file's (halved) + this launch's routing counts
     std::vector<std::vector<uint8_t>> ap_tgt;    // [n_layer][n_expert] in the target set
     std::vector<int64_t>  ap_need;               // [class] target experts held neither in RAM nor on the device
+    std::vector<int64_t>  ap_dup;                // [class] RAM copies of device-held experts (a reservation takes them first)
+    std::vector<std::vector<uint8_t>> ap_dev_pred; // [n_layer][n_expert] the device prefill's experts, before it ran (lowest ids per layer)
     std::vector<uint32_t> ap_layer_epoch;
     uint32_t ap_epoch = 0;
     uint64_t ap_new   = 0;                       // routings counted since the last write
     bool     ap_prev_large = false;
     struct {
         size_t   loaded = 0, ubatches = 0, saves = 0, save_fail = 0, targets = 0, marked = 0, rebuilds = 0;
-        uint64_t routings = 0, cold_refused = 0, cold_taken = 0, hot_taken = 0, pf_hot = 0, pf_cold = 0;
+        uint64_t routings = 0, cold_refused = 0, cold_taken = 0, hot_taken = 0, pf_hot = 0, pf_cold = 0, pf_stale = 0;
     } aps;
+
+    // on the device, or (before the device prefill ran) one of the experts it will put there: the lowest ids of each layer, an equal
+    // share of the group's slots per layer (see prefill), so the page-cache fill does not copy experts the device is about to hold
+    bool ap_on_dev(int32_t il, int32_t e) const {
+        if (in_device(il, e)) {
+            return true;
+        }
+        return !prefilled_dev && (size_t) il < ap_dev_pred.size() && (size_t) e < ap_dev_pred[il].size() && ap_dev_pred[il][e] != 0;
+    }
 
     bool ap_target(int32_t il, int32_t e) const {
         return (size_t) il < ap_tgt.size() && (size_t) e < ap_tgt[il].size() && ap_tgt[il][e] != 0;
@@ -4420,6 +4431,22 @@ struct llama_moe_cache::impl {
             }
         }
         aps.loaded = have ? prof.size() : 0;
+        ap_dev_pred.assign(layers.size(), {});
+        if (!prefilled_dev) {
+            for (const group & g : groups) {
+                if (g.n_slots == 0 || g.layers.empty()) {
+                    continue;
+                }
+                const int32_t n_slots = g.n_slots - g.lru.n_lent - g.lru.n_core;
+                const size_t  n_layer = g.layers.size();
+                for (size_t i = 0; i < n_layer; ++i) {
+                    const int32_t il = g.layers[i];
+                    const int32_t n  = std::max<int32_t>(0, std::min<int32_t>(g.lru.n_expert, n_slots/(int32_t) n_layer + (i < (size_t) (n_slots % n_layer) ? 1 : 0)));
+                    ap_dev_pred[il].assign(g.lru.n_expert, 0);
+                    std::fill(ap_dev_pred[il].begin(), ap_dev_pred[il].begin() + n, 1);
+                }
+            }
+        }
         ap_use = have && llama_autoprof::uses(ap_mode) && host->exclusive() && !resident_mode && wstore != nullptr;
         if (ap_use) {
             ap_rebuild_target();
@@ -4468,12 +4495,13 @@ struct llama_moe_cache::impl {
             const int32_t c = host->class_of(il);
             slots_of_class[c] = host->n_slots_of(il);
             for (int32_t e = 0; e < (int32_t) ap_cnt[il].size() && e < ne_max; ++e) {
-                if (ap_cnt[il][e] > 0.0f && !in_device(il, e)) {
+                if (ap_cnt[il][e] > 0.0f && !ap_on_dev(il, e)) {
                     by_class[c].emplace_back(ap_cnt[il][e], il*ne_max + e);
                 }
             }
         }
         ap_need.assign(n_class, 0);
+        ap_dup.assign(n_class, 0);
         aps.targets = 0;
         for (int32_t c = 0; c < n_class; ++c) {
             auto & v = by_class[c];
@@ -4490,14 +4518,20 @@ struct llama_moe_cache::impl {
 
     void ap_count_need() {
         std::fill(ap_need.begin(), ap_need.end(), 0);
+        std::fill(ap_dup.begin(), ap_dup.end(), 0);
         for (int32_t il = 0; il < (int32_t) ap_tgt.size(); ++il) {
             if (!host_layer(il)) {
                 continue;
             }
             const int32_t c = host->class_of(il);
             for (int32_t e = 0; e < (int32_t) ap_tgt[il].size(); ++e) {
-                if (ap_tgt[il][e] && !host->contains(il, e) && !in_device(il, e)) {
+                const bool held = host->contains(il, e);
+                if (ap_tgt[il][e] && !held && !ap_on_dev(il, e)) {
                     ap_need[c]++;
+                }
+                if (held) {
+                    const int32_t s = host->held(il, e);
+                    ap_dup[c] += s >= 0 && host->is_dup(s) ? 1 : 0;
                 }
             }
         }
@@ -4555,7 +4589,8 @@ struct llama_moe_cache::impl {
             return true;
         }
         take_spec = false;
-        if (c >= 0 && (size_t) c < ap_need.size() && (int64_t) host->n_free_of(il) <= ap_need[c]) {
+        // (a duplicate of a device-held expert is as good as a free slot; counted per large batch)
+        if (c >= 0 && (size_t) c < ap_need.size() && (int64_t) host->n_free_of(il) + ap_dup[c] <= ap_need[c]) {
             aps.cold_refused++;
             return false;
         }
@@ -5004,6 +5039,9 @@ struct llama_moe_cache::impl {
                     if (!all || host->contains(il, e) || (from_file && on_dev)) {
                         continue;
                     }
+                    if (ap_order && ap_on_dev(il, e)) {
+                        continue;
+                    }
                     if (ap_order) {
                         ap_cand.emplace_back((size_t) il < ap_cnt.size() && (size_t) e < ap_cnt[il].size() ? ap_cnt[il][e] : 0.0f,
                             il*host->n_expert_of() + e);
@@ -5042,6 +5080,27 @@ struct llama_moe_cache::impl {
                 if (!hot && c >= 0 && (size_t) c < ap_need.size() && (int64_t) host->n_free_of(il) <= ap_need[c]) {
                     continue;
                 }
+                // still in the page cache right now (the residency above went stale while earlier copies pinned slots: a copy of
+                // evicted pages would read the expert back from the disk one page at a time)
+                bool still = true;
+                for (const ggml_tensor * w : layers[il].experts) {
+                    const uintptr_t a  = (uintptr_t) w->data + (size_t) e*w->nb[2];
+                    const uintptr_t q0 = a / pg * pg;
+                    const uintptr_t q1 = (a + w->nb[2] + pg - 1) / pg * pg;
+                    vec.resize((q1 - q0) / pg);
+#if defined(__APPLE__)
+                    still = still && mincore((void *) q0, q1 - q0, (char *) vec.data()) == 0;
+#else
+                    still = still && mincore((void *) q0, q1 - q0, vec.data()) == 0;
+#endif
+                    for (size_t k = 0; k < vec.size() && still; ++k) {
+                        still = (vec[k] & 1) != 0;
+                    }
+                }
+                if (!still) {
+                    aps.pf_stale++;
+                    continue;
+                }
                 const int32_t s = host->reserve(il, e, false);
                 if (s < 0) {
                     full_class.insert(c);
@@ -5053,8 +5112,9 @@ struct llama_moe_cache::impl {
                 aps.pf_cold += hot ? 0 : 1;
             }
             ap_mark_cold();
-            LLAMA_LOG_INFO("%s: k19-autoprof: the page-cache fill copied %llu target + %llu other experts of %zu resident, hottest first\n", __func__,
-                (unsigned long long) aps.pf_hot, (unsigned long long) aps.pf_cold, ap_cand.size());
+            LLAMA_LOG_INFO("%s: k19-autoprof: the page-cache fill copied %llu target + %llu other experts of %zu resident, hottest first (%llu no longer "
+                "resident when their turn came, not copied)\n", __func__, (unsigned long long) aps.pf_hot, (unsigned long long) aps.pf_cold, ap_cand.size(),
+                (unsigned long long) aps.pf_stale);
         }
         hst.prefilled = n_fill + n_prof;
         LLAMA_LOG_INFO("%s: MoE host cache: %zu experts (%.1f MiB) copied from the page cache into RAM slots in %.1f ms, %zu of them read from the files"
