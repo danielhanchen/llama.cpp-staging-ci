@@ -5925,6 +5925,37 @@ static bool ggml_cuda_mmvq_multi_has_partner(const ggml_cgraph * cgraph, const i
     return false;
 }
 
+// k19-kqtc, GGML_CUDA_TURING_MULTI_MMQ (opt-in; unset / 0 = off, 1 = from 5 columns, N >= 2 = from N columns): on Turing (cc 7.5)
+// a verify product of a multi-matrix group (gate / up, Q / K / V) of at least N columns stays a single product, so that the Turing
+// verify rule (GGML_CUDA_VERIFY_MMQ, default on there) runs it on MMQ like the single products, instead of the multi-matrix mmvq.
+// T4 micro-bench (Qwen3.8-27B gate + up, 5120 -> 2 x 17408, verify-flagged): Q4_K 5..8 columns 73 / 65 / 62 / 57%, Q5_K 71 / 68 / 62 /
+// 59% of the multi-matrix mmvq; 2..4 columns about even. Not bit-identical to the mmvq launch (another f32 order of the same int8
+// products, as the Turing verify MMQ already is): KLD-gated. Never under the bit-exact verify (GGML_CUDA_VERIFY_REASSOC=0)
+static bool ggml_cuda_turing_multi_mmq(const ggml_tensor * node, const int cc) {
+    static const int min_cols = [] {
+        const char * e = getenv("GGML_CUDA_TURING_MULTI_MMQ");
+        const int v = e != nullptr ? atoi(e) : 0;
+        return v <= 0 ? 0 : v == 1 ? 5 : v;
+    }();
+    static const bool verify_mmq_off = [] {
+        const char * e = getenv("GGML_CUDA_VERIFY_MMQ");
+        return e != nullptr && atoi(e) == 0;
+    }();
+    const ggml_tensor * src0 = node->src[0];
+    const int64_t       ne11 = node->src[1]->ne[1];
+    if (min_cols == 0 || verify_mmq_off || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_TURING || cc >= GGML_CUDA_CC_AMPERE ||
+            !(node->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) || ne11 < min_cols || ne11 > 16 || !ggml_cuda_mmvq_kqtc_reassoc_ok() ||
+            !turing_mma_available(cc) || !ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+        return false;
+    }
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        GGML_LOG_INFO("k19-kqtc: Turing multi-matrix verify products of %d+ columns run single on MMQ (first: %s, %lld columns; "
+            "GGML_CUDA_TURING_MULTI_MMQ=0 off)\n", min_cols, ggml_type_name(src0->type), (long long) ne11);
+    });
+    return true;
+}
+
 // node i is a product that ggml_cuda_mul_mat sends to ggml_cuda_mul_mat_vec_q (same dispatch, see there) and that has a multi kernel
 static bool ggml_cuda_mmvq_multi_runtime_ok(const ggml_backend_cuda_context * ctx, const ggml_tensor * node) {
     if (!ggml_cuda_mmvq_multi_candidate(node) || ggml_cuda_op_mul_mat_use_fwht(node)) {
@@ -5945,6 +5976,9 @@ static bool ggml_cuda_mmvq_multi_runtime_ok(const ggml_backend_cuda_context * ct
     }
     // k19-kqtc: a product the few-row MMQ takes in ggml_cuda_mul_mat stays a single product
     if (ne11 > 1 && (!exact || ggml_cuda_mmvq_kqtc_reassoc_ok()) && ggml_cuda_should_use_mmq_few(src0, src1, cc)) {
+        return false;
+    }
+    if (ggml_cuda_turing_multi_mmq(node, cc)) {
         return false;
     }
     if (exact && ne11 > 1) {
