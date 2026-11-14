@@ -7,7 +7,8 @@
 // Three children of this binary run every case and dump the outputs: "head" (defaults), "kill" (the three switches off = the code
 // before k19-p5mmq) and "force" (one block per tile for every bank product). Checks, byte for byte:
 //   - force: bank product == the same product without the bank (op param 2 = 0: the compact tiling of the products without skip_empty,
-//     one block per tile at these sizes: >= 10 waves on any card up to 204 SMs). Both sum all of K per tile: same bytes.
+//     one block per tile at the large sizes: >= 10 waves on any card up to 204 SMs). Both sum all of K per tile: same bytes. The small
+//     cases are not compared (their plain product is split too).
 //   - head:  bank product == the force one or the kill one (the device picked one of the two forms); both forms seen (stats lines).
 //   - kill:  negative control: a bank product split over the SMs differs from the one-block-per-tile result in at least one case
 //            (the split changes the rounding: the comparison above can see a K split).
@@ -314,8 +315,10 @@ int main(int argc, char ** argv) {
         const auto & fb = outs[2][k]; const auto & fp = outs[2][k + 1];
         // the products without the bank do not change in any child
         const bool plain_ok = same(hp, kp) && same(hp, fp);
-        // force: one block per tile == the plain compact tiling (all of K per tile in both)
-        const bool force_ok = same(fb, fp);
+        // force: one block per tile == the plain compact tiling (all of K per tile in both). Only where the plain product runs one block per
+        // tile, i.e. the large cases (>= 10 waves); the small ones run the plain product split as well
+        const bool big = c.tokens >= 512;
+        const bool force_ok = !big || same(fb, fp);
         // head: one of the two forms
         const bool head_tiles = same(hb, fb);
         const bool head_split = same(hb, kb);
@@ -324,7 +327,7 @@ int main(int argc, char ** argv) {
         neg_fired = neg_fired || kill_differs;
         const bool ok = plain_ok && force_ok && head_ok;
         printf("  %-24s plain same in all %s, force bank == plain %s, head bank == %s, kill split %s\n", c.name.c_str(),
-            plain_ok ? "yes" : "NO", force_ok ? "yes" : "NO",
+            plain_ok ? "yes" : "NO", !big ? (same(fb, fp) ? "yes (not checked)" : "no (not checked: plain split too)") : force_ok ? "yes" : "NO",
             head_tiles && head_split ? "tiles == split" : head_tiles ? "tiles" : head_split ? "split" : "NEITHER",
             kill_differs ? "differs (other rounding)" : "same bytes");
         n_fail += !ok;
