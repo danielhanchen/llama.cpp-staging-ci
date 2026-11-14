@@ -14,6 +14,7 @@
 #include <mutex>
 #include <cfloat>
 #include <cmath>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -12700,12 +12701,35 @@ void ggml_compute_forward_lightning_indexer(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    // candidate blocks (src[4], I32 [k_b, n_tokens, 1, n_stream], block size op_params[0]): only the rows of a token's candidate
+    // blocks are scored (same arithmetic per row), every other row is -inf; ids may repeat or point past n_kv (ignored)
+    const ggml_tensor * c  = dst->src[4];
+    const int64_t       bs = c ? ggml_get_op_params_i32(dst, 0) : 0;
+    std::vector<uint8_t> cand_blk;
+    if (c) {
+        GGML_ASSERT(c->type == GGML_TYPE_I32 && bs > 0 && c->ne[1] == n_tokens && c->ne[2] == 1 && c->ne[3] == n_stream);
+        GGML_ASSERT(c->nb[0] == sizeof(int32_t));
+        cand_blk.assign((n_kv + bs - 1)/bs, 0);
+    }
+
     for (int s = 0; s < n_stream; ++s) {
         for (int t = 0; t < n_tokens; ++t) {
             const float       *   w_row =       (float *) ((char *)   w->data + t*nbw1 +        s*nbw3);
             const ggml_fp16_t *   m_row = (ggml_fp16_t *) ((char *)   m->data + t*nbm1 + (s%nem3)*nbm3);
             float             * dst_row =       (float *) ((char *) dst->data + t*nb1  +        s*nb3 );
+            const int32_t     *   c_row = c ? (const int32_t *) ((const char *) c->data + t*c->nb[1] + s*c->nb[3]) : nullptr;
+            if (c_row) {
+                for (int64_t i = 0; i < c->ne[0]; ++i) {
+                    if (c_row[i] >= 0 && (int64_t) c_row[i] < (int64_t) cand_blk.size()) {
+                        cand_blk[c_row[i]] = 1;
+                    }
+                }
+            }
             for (int ik = ir0; ik < ir1; ++ik) {
+                if (c_row && !cand_blk[ik/bs]) {
+                    dst_row[ik] = -INFINITY;
+                    continue;
+                }
                 char * k_row = (char *) k->data + ik*nbk2 + s*nbk3;
                 if (k_to_float) {
                     k_to_float(k_row, k_row_f32, n_embd);
@@ -12723,6 +12747,13 @@ void ggml_compute_forward_lightning_indexer(
                 }
                 // apply mask
                 dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
+            }
+            if (c_row) {
+                for (int64_t i = 0; i < c->ne[0]; ++i) {
+                    if (c_row[i] >= 0 && (int64_t) c_row[i] < (int64_t) cand_blk.size()) {
+                        cand_blk[c_row[i]] = 0;
+                    }
+                }
             }
         }
     }

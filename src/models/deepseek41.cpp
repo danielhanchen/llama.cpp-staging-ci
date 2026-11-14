@@ -642,6 +642,11 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             }
             const bool    pick_blk = cand_src == il && cand_pin && !cand_all;  // level one: pick the candidate blocks
             const bool    use_blk  = cand_src >= 0 && cand_src < il && cand_sel; // level two: score inside them
+            // k19-p6dsv (LLAMA_DSV41_CAND_SCORE=0 off): the fused indexer takes the candidate blocks (src[4], block size in
+            // op_params[0]) and scores only their rows, every other row is -inf: the bytes of score + the 0 / -inf block mask
+            // (rows inside: s + 0 = s, s is never -0; outside: -inf for every finite or -inf s), without the mask
+            static const bool cand_score_env = dsv41_env_on("LLAMA_DSV41_CAND_SCORE");
+            const bool    cand_score = use_blk && fused_idx && cand_score_env;
             const int64_t n_blk    = pick_blk || use_blk ? (n_comp + bs - 1)/bs : 0;
             GGML_ASSERT(!pick_blk || cand_pin->ne[0] == n_blk);
             GGML_ASSERT(!use_blk  || cand_n_comp == n_comp);
@@ -657,6 +662,20 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 ggml_tensor * score = nullptr;
                 if (fused_idx) {
                     score = ggml_lightning_indexer(ctx0, iq, ik, iw, ci.kq_mask);
+                    if (cand_score) {
+                        GGML_ASSERT(nc == n_tok); // the fused indexer runs as one chunk
+                        ggml_tensor * bsel = ggml_cont(ctx0, rows(cand_sel));
+                        GGML_ASSERT(bsel->type == GGML_TYPE_I32 && bsel->ne[1] == n_tok && bsel->ne[3] == n_stream);
+                        score->src[4]       = bsel;
+                        score->op_params[0] = (int32_t) bs;
+                        // logged at powers of two (the first graphs may be built while --fit silences the log)
+                        static int64_t n_cs = 0;
+                        if ((++n_cs & (n_cs - 1)) == 0) {
+                            LLAMA_LOG_INFO("%s: DeepSeek-V4.1 candidate scoring (graph %lld): layer %d indexer scores %lld candidate blocks x %lld "
+                                    "of %lld rows (LLAMA_DSV41_CAND_SCORE=0 off)\n", __func__, (long long) n_cs, il, (long long) bsel->ne[0],
+                                    (long long) bs, (long long) n_comp);
+                        }
+                    }
                     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
                 } else {
                     ggml_tensor * iqc = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], nc, n_stream, iq->nb[1], iq->nb[2], iq->nb[3], t0*iq->nb[2]);
@@ -683,7 +702,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                     bmax = ggml_add(ctx0, ggml_reshape_4d(ctx0, bmax, n_blk, nc, 1, n_stream), rows(cand_pin));
                     cb(bmax, "cand_block_score", il);
                     parts_sel.push_back(ggml_top_k(ctx0, bmax, std::min<int64_t>(hparams.dsv41_cand_topk_blocks, n_blk)));
-                } else if (use_blk) {
+                } else if (use_blk && !cand_score) {
                     // own scores, restricted to the source's candidate blocks: 0 inside them, -inf elsewhere
                     ggml_tensor * bsel = ggml_cont(ctx0, rows(cand_sel));
                     const int64_t k_b = bsel->ne[0];

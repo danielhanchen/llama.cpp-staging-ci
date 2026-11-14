@@ -536,6 +536,11 @@ llama_build_and_test(test-mmid-tail.cpp LINK ggml)
 llama_build_and_test(test-mmvq-lastrow.cpp LINK ggml)
 # k19-q4xt: single token MUL_MAT_ID warp per row launch (short K-quant / IQ4 expert rows) vs the launch it replaces, byte for byte (SKIP without a CUDA device)
 llama_build_and_test(test-q4xt-exact.cpp LINK ggml)
+# k19-p6dsv: DeepSeek-V4.1 candidate scoring (lightning indexer over the candidate blocks only) == indexer + block mask, byte for byte
+# (scores and top-k ids, ties and -inf), with a negative control; the CPU, and the first CUDA / ROCm device (SKIP without one)
+llama_build_and_test(test-dsv41-cand-score-exact.cpp LINK ggml)
+llama_test(test-dsv41-cand-score-exact NAME test-dsv41-cand-score-gpu-exact ARGS --gpu)
+set_tests_properties(test-dsv41-cand-score-exact test-dsv41-cand-score-gpu-exact PROPERTIES SKIP_RETURN_CODE 77)
 llama_build_and_test(test-spec-type-gguf.cpp)
 # the build identity of the MoE CPU-miss calibration key: unknown-commit builds differ by content, a relaunch keeps its identity
 llama_build_and_test(test-cal-build-id.cpp LINK ggml)
