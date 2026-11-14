@@ -174,8 +174,9 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     // CPU-miss calibration pinned, 3 launches (px_c32): chat 213.1 (int3) / 209.8 (FRAC unset) -> 231.5 tok/s, 8k 180.5 / 180.5 -> 179.9,
     // md5 equal in every launch; the 8k gain of the prewarm without the restore (195.8) came with its other text. 24 GB (27.1% cached)
     // is under 0.3, so no prewarm there
+    // (k19-prewexact: on by default at 0.3 now that the prewarm is exact, LLAMA_SPEC_PREWARM_CACHED_FRAC=0 off)
     static const double cached_frac_min = getenv("LLAMA_SPEC_PREWARM_CACHED_FRAC") != nullptr ?
-        atof(getenv("LLAMA_SPEC_PREWARM_CACHED_FRAC")) : 0.0;
+        atof(getenv("LLAMA_SPEC_PREWARM_CACHED_FRAC")) : 0.3;
     static const int cached_min_w = getenv("LLAMA_SPEC_PREWARM_CACHED_MIN_W") != nullptr ?
         atoi(getenv("LLAMA_SPEC_PREWARM_CACHED_MIN_W")) : 5;
     llama_moe_cache_fingerprint(ctx, "prewarm point"); // k19-prewexact diagnostic (LLAMA_MOE_CACHE_FP_LOG=1)
