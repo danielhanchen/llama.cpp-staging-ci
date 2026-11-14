@@ -1788,23 +1788,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }();
                 const bool df2_cap_here = is_dflash2 && df2_n_max_sm80 > 0 &&
                     (df2_n_max_sm80_cached || params.ctx_tgt == nullptr || !llama_moe_cache_active(params.ctx_tgt));
-                // k19-g4mid (opt-in LLAMA_DFLASH_CACHED_N_MAX=N, unset / 0 = off): a DFlash2 draft beside a MoE cache walks at most N steps.
-                // There each further verify row costs ~2.2 ms (its missed experts), not the ~1 ms of a full card, and the 7th row rarely
-                // pays: Colab G4 Flash-Next UD-IQ4_XS DFlash2 n6 32 GB (41% cached, LLAMA_SPEC_PREWARM_CACHED_FRAC=0.3) chat, N = 5:
-                // 58 passes either way, w6 19.5 ms vs w7 21.7, 221.2 -> 231.9 tok/s, the same text; 8k level with other text (the
-                // host path makes the window width move which misses the host computes), so it stays opt-in (gm_p1)
-                static const int32_t df2_cached_n_max = getenv("LLAMA_DFLASH_CACHED_N_MAX") ? std::max(0, atoi(getenv("LLAMA_DFLASH_CACHED_N_MAX"))) : 0;
-                const bool df2_cached_cap = is_dflash2 && df2_cached_n_max > 0 && df2_cache_on;
-                const int32_t df2_n_max = std::min(df2_cap_here ? std::min(params.n_max, df2_n_max_sm80) : params.n_max,
-                    df2_cached_cap ? df2_cached_n_max : params.n_max);
-                if (df2_cached_cap && df2_cached_n_max < params.n_max) {
-                    static bool logged = false;
-                    if (!logged) {
-                        logged = true;
-                        LOG_INF("k19-g4mid: DFlash2 drafts of at most %d steps (%d asked) beside the MoE cache (LLAMA_DFLASH_CACHED_N_MAX)\n",
-                                df2_cached_n_max, params.n_max);
-                    }
-                }
+                const int32_t df2_n_max = df2_cap_here ? std::min(params.n_max, df2_n_max_sm80) : params.n_max;
                 if (is_dflash2 && df2_n_max < params.n_max) {
                     static bool logged = false;
                     if (!logged) {

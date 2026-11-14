@@ -7907,9 +7907,13 @@ struct llama_moe_cache::impl {
     // Flash-Next UD-IQ4_XS DFlash2 n6 32 GB chat, GGML_MOE_MAILBOX_TIMING: device beside the host 126.2 us, host 115.4 us per batch, merge
     // wait 23.5 us; nsys (node trace, 0am): moe_cache_fetch of a 7-row window 110-125 us per layer, serial before the hits. Beside the hits
     // the copies leave the host as the longer side, so the pass shortens by the device's excess (w7 21.7 -> 20.1-21.5 ms; gm_p1 / gp_ab1 /
-    // gp_ab3, same text in every cell: chat +1.4..+4.3%, 8k +2.7..+3.0%). Not below the band: at 24 GB (27.5% cached) the host's share of
-    // the misses is larger, its batch is the longer side already, and the overlap only moved the wait onto it: there the pass follows the
-    // host batch time, which varied by launch (145-170 us, gp_ab2), so the gain was mixed (chat median -2.2% over 7 launches, spread 10.8%)
+    // gp_ab3, same text in every cell: chat +1.4..+4.3%, 8k +2.7..+3.0%; gm_s3, 3 launches: device beside the host 123.4 -> 106.0 us, host
+    // 114-123 us, chat 206.0 -> 214.0, 8k 176.2 -> 180.4; gm_ab32, 3 interleaved launches vs the base build: chat 203.6 -> 207.5, 8k
+    // 174.7 -> 180.5, with LLAMA_SPEC_PREWARM_CACHED_FRAC=0.3 chat 223.1 -> 233.1, 8k 189.7 -> 194.9, md5 equal in every cell; 48 GB
+    // (70.7%) is outside the band, its windows have the host path off). Not below the band by default: at 24 GB (27.5% cached) the device
+    // side and the host batch are already level (144.9 vs 145.6-163.7 us), so with the overlap the pass follows the host batch time, which varies by
+    // launch on the G4 host (145-170 us, in both arms): gp_ab1 + gp_ab2 chat median -2.2% over 7 launches (spread 10.8%), gm_s3 +3.9% chat
+    // / +2.5% 8k over 3 (host 144-146 us in every overlapped launch). LLAMA_MOE_G4MID_OV_MIN_FRAC=0.2 takes 24 GB in
     static bool g4mid_on() {
         static const bool on = [] {
             const char * e = getenv("LLAMA_MOE_G4MID");
