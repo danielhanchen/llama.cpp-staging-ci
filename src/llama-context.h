@@ -861,6 +861,7 @@ private:
     void moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_outputs_ub);
     // the end of a prompt that did not seed: the lent slots that come back get the experts its last large ubatch used most
     void moe_cache_refill_from_ids();
+    void moe_cache_resident_record(const llm_graph_result * res); // k19-mgpu2
     void moe_cache_fill_from_ids(); // k19-l4fill
     void moe_cache_autoprof_from_ids(); // k19-autoprof
     bool moe_ap_counted = false;        // k19-autoprof: the recorded routing (moe_cache_ids) was counted

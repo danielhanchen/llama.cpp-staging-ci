@@ -387,6 +387,12 @@ public:
 
     // the exclusive RAM tier and the device slots hold every streamed expert (resident mode, see init_host_cache)
     bool resident_union() const;
+    // k19-mgpu2: resident mode swaps the experts a prompt's last large ubatch routed into each card's slots at the prompt end
+    // (LLAMA_MOE_RESIDENT_FILL=0 off); the context records the routing of every large ubatch with set_resident_counts
+    bool resident_fill_wanted() const;
+    void resident_fill();
+    void set_resident_counts(int32_t il, const std::vector<int32_t> & counts);
+    bool has_resident_counts() const;
     // prompts never seed (llama_context, k18-lowram): no seed split in the lent memory either
     void seeds_off();
 
