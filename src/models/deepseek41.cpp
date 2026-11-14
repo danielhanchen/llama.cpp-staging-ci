@@ -668,11 +668,12 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                         GGML_ASSERT(bsel->type == GGML_TYPE_I32 && bsel->ne[1] == n_tok && bsel->ne[3] == n_stream);
                         score->src[4]       = bsel;
                         score->op_params[0] = (int32_t) bs;
-                        static bool logged_cs = false;
-                        if (!logged_cs) {
-                            logged_cs = true;
-                            LLAMA_LOG_INFO("%s: DeepSeek-V4.1 candidate scoring: layer %d indexer scores %lld candidate blocks x %lld of %lld rows "
-                                    "(LLAMA_DSV41_CAND_SCORE=0 off)\n", __func__, il, (long long) bsel->ne[0], (long long) bs, (long long) n_comp);
+                        // logged at powers of two (the first graphs may be built while --fit silences the log)
+                        static int64_t n_cs = 0;
+                        if ((++n_cs & (n_cs - 1)) == 0) {
+                            LLAMA_LOG_INFO("%s: DeepSeek-V4.1 candidate scoring (graph %lld): layer %d indexer scores %lld candidate blocks x %lld "
+                                    "of %lld rows (LLAMA_DSV41_CAND_SCORE=0 off)\n", __func__, (long long) n_cs, il, (long long) bsel->ne[0],
+                                    (long long) bs, (long long) n_comp);
                         }
                     }
                     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
