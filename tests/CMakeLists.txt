@@ -420,6 +420,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         endif()
     endforeach()
 
+    # k19-p3topk: the verify window's backend top-k in one launch (LLAMA_DEV_TOPK_BATCH) gives every row the candidates, logits and
+    # tokens of one top-k per row
+    llama_build(test-topk-batch-sampling.cpp)
+    llama_test(test-topk-batch-sampling LABEL main ARGS "${MODEL_DIR}/qwen3tts-dense.gguf")
+    set_tests_properties(test-topk-batch-sampling PROPERTIES FIXTURES_REQUIRED generate-models)
+
     # the advisory PLE prefetch predicts the rows set_input gathers, on the generated qwen4exp model
     llama_build(test-ple-prefetch.cpp)
     llama_test(
@@ -500,6 +506,7 @@ llama_build_and_test(test-k19-fuse-exact.cpp LINK ggml)
 llama_build_and_test(test-topk384-exact.cpp LINK ggml)
 llama_build_and_test(test-topk-oneblock-exact.cpp LINK ggml)
 llama_build_and_test(test-topk-twostage-exact.cpp LINK ggml)   # k19-dtopk: two-stage one-launch top-k == radix select, byte for byte
+llama_build_and_test(test-topk-batch-exact.cpp LINK ggml)      # k19-p3topk: one top-k over a verify window == one per row, byte for byte
 llama_build_and_test(test-fattn-q8-exact.cpp LINK ggml)   # k19-fattnq8: MMA flash attention reading q8_0 K / V in place == the staged f16 copy, byte for byte
 # k19-moebw routed-expert mat-vec vs the kernels it replaces, byte for byte (SKIP without a CUDA device)
 llama_build_and_test(test-moe-bw-exact.cpp LINK ggml)

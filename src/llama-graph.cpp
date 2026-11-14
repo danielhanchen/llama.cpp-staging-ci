@@ -5031,6 +5031,11 @@ bool llm_graph_context::draft_topk_rows() const {
     return true;
 }
 
+static bool llama_sampler_outputs_all() {
+    static const bool on = getenv("LLAMA_SAMPLER_OUTPUTS_ALL") == nullptr || atoi(getenv("LLAMA_SAMPLER_OUTPUTS_ALL")) != 0;
+    return on;
+}
+
 void llm_graph_context::build_sampling() const {
     if (samplers.empty() || !res->t_logits) {
         return;
@@ -5095,29 +5100,104 @@ void llm_graph_context::build_sampling() const {
         const auto it = sampling_rows.find(seq_id);
         const auto & rows = it != sampling_rows.end() ? it->second : no_rows;
 
+        // k19-p3topk: a chain that starts with a backend top-k (the server's device top-k for sampled requests) runs that top-k once
+        // per window of the sequence's consecutive output rows ([n_vocab, n] -> [k, n]) and one get_rows gathers every row's top logits;
+        // each row's chain then continues after its top-k on its slice. Each slice holds the bits that row's own top-k / get_rows wrote
+        // before (cparams.topk_batch: the output device's top-k works per row; the same columns, in the same order), so the
+        // candidates, the logits and every later stage are unchanged; only the launches drop from one radix select per row to one per
+        // window (248320 columns: ~10 launches, 80-99 us per row on A100).
+        // Windows of at most topk_batch_max_rows rows (CUDA: below 16, where one row and several rows take the same kernels). The
+        // topology stays static, as for the chains themselves: always ceil(n_outputs_max_per_seq / max_rows) windows, each over its
+        // rows (a window without a row: 1 row on row 0, not selected), and every chain, with a row or not, reads a slice of its window
+        // (no row: slice 0, not selected). bt_cand / bt_logits are graph outputs (the rows' slices are views of them).
+        // Rows that are not consecutive outputs: one top-k per row, as before (another topology, allocated again).
+        std::vector<ggml_tensor *> bt_cand;   // per window: [k, n_window]
+        std::vector<ggml_tensor *> bt_logits; // per window: [1, k, n_window]
+        uint32_t bt_chunk = 0;
+        {
+            const int32_t  k_first = cparams.topk_batch && !dtopk ? llama_sampler_backend_top_k_first(sampler) : 0;
+            const uint32_t n_max   = cparams.n_outputs_max_per_seq;
+            const uint32_t n_act   = (uint32_t) std::min<size_t>(rows.size(), n_max);
+            if (k_first > 0 && k_first <= logits_t->ne[0] && logits_t->ne[0] >= cparams.topk_batch_min_cols &&
+                    (n_act == 0 || rows[n_act - 1] - rows[0] == n_act - 1)) {
+                bt_chunk = std::max<uint32_t>(1, std::min(cparams.topk_batch_max_rows, n_max));
+                for (uint32_t c0 = 0; c0 < n_max; c0 += bt_chunk) {
+                    const uint32_t nc   = c0 < n_act ? std::min(bt_chunk, n_act - c0) : 0;
+                    const uint32_t row0 = nc > 0 ? rows[0] + c0 : 0;
+                    ggml_tensor * x = ggml_view_2d(ctx0, logits_t, logits_t->ne[0], std::max<uint32_t>(nc, 1), logits_t->nb[1], row0 * logits_t->nb[1]);
+                    ggml_format_name(x, "logits_win_%d_%u", seq_id, c0);
+                    ggml_tensor * tc = ggml_top_k(ctx0, x, k_first);
+                    ggml_format_name(tc, "top_k_win_%d_%u", seq_id, c0);
+                    ggml_tensor * tl = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, x, 1, x->ne[0], x->ne[1]), tc);
+                    ggml_format_name(tl, "top_k_rows_win_%d_%u", seq_id, c0);
+                    ggml_set_output(tc);
+                    ggml_set_output(tl);
+                    bt_cand.push_back(tc);
+                    bt_logits.push_back(tl);
+                }
+
+                static std::atomic<bool> logged { false };
+                if (n_act >= 2 && !logged.exchange(true)) {
+                    LLAMA_LOG_INFO("k19-p3topk: the verify rows' backend top-k of %d in one launch per window (%u rows of %lld, up to %u "
+                            "per launch; LLAMA_DEV_TOPK_BATCH=0: one per row)\n", k_first, n_act, (long long) logits_t->ne[0], bt_chunk);
+                }
+            }
+        }
+
         for (uint32_t i = 0; i < cparams.n_outputs_max_per_seq; ++i) {
             const bool     active = i < rows.size();
             const uint32_t row    = active ? rows[i] : 0;
             const int      i_out  = active ? 1       : 0;
 
-            ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row * logits_t->nb[1]);
-            ggml_tensor * cand_seq   = nullptr;
-            if (dtopk) {
-                const int64_t n_sub = res->t_dh_perm->ne[0];
-                logits_seq = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, logits_seq, 1, logits_seq->ne[0]), res->t_dh_perm), n_sub);
-                cand_seq   = res->t_dh_cand;
-            }
-            ggml_format_name(logits_seq, "logits_seq_%d_%u", seq_id, i);
-
             struct llama_sampler_data data = {
-                /*.logits       =*/ logits_seq,
+                /*.logits       =*/ nullptr,
                 /*.probs        =*/ nullptr,
                 /*.sampled      =*/ nullptr,
-                /*.candidates   =*/ cand_seq,
+                /*.candidates   =*/ nullptr,
             };
 
-            assert(sampler->iface->backend_apply);
-            sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+            if (!bt_cand.empty()) {
+                ggml_tensor * tc = bt_cand[i / bt_chunk];
+                ggml_tensor * tl = bt_logits[i / bt_chunk];
+                const uint32_t j = active ? i % bt_chunk : 0;
+                const int64_t  k = tc->ne[0];
+                data.candidates = ggml_view_1d(ctx0, tc, k, j * tc->nb[1]);
+                data.logits     = ggml_view_2d(ctx0, tl, 1, k, tl->nb[1], j * tl->nb[2]);
+                ggml_format_name(data.candidates, "top_k_%d_%u", seq_id, i);
+                ggml_format_name(data.logits,     "top_k_rows_%d_%u", seq_id, i);
+                llama_sampler_backend_apply_after_top_k(sampler, ctx0, gf, &data);
+            } else {
+                ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row * logits_t->nb[1]);
+                ggml_tensor * cand_seq   = nullptr;
+                if (dtopk) {
+                    const int64_t n_sub = res->t_dh_perm->ne[0];
+                    logits_seq = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, logits_seq, 1, logits_seq->ne[0]), res->t_dh_perm), n_sub);
+                    cand_seq   = res->t_dh_cand;
+                }
+                ggml_format_name(logits_seq, "logits_seq_%d_%u", seq_id, i);
+
+                data.logits     = logits_seq;
+                data.candidates = cand_seq;
+
+                assert(sampler->iface->backend_apply);
+                sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+            }
+
+            // every chain's outputs are graph outputs, the chains without a row too (and the tensors an output views): ggml-alloc
+            // reuses the allocation plan of an earlier graph of the same topology (ggml_gallocr_needs_realloc compares the node count
+            // and sizes, not the output flags), so with outputs flagged only on the chains that have a row, a plan made for a ubatch
+            // whose rows sat in other chains could place a chain's candidates where the next chain's top-k writes (a 5-row window after
+            // a two-sequence batch: row 3 read row 4's candidates on CUDA). LLAMA_SAMPLER_OUTPUTS_ALL=0: as before
+            if (llama_sampler_outputs_all()) {
+                for (ggml_tensor * t : { data.sampled, data.probs, data.logits, data.candidates }) {
+                    if (t != nullptr) {
+                        ggml_set_output(t);
+                        if (t->view_src != nullptr) {
+                            ggml_set_output(t->view_src);
+                        }
+                    }
+                }
+            }
 
             if (data.sampled != nullptr) {
                 if (active) {

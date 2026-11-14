@@ -1738,6 +1738,21 @@ int32_t llama_sampler_backend_top_k_first(const llama_sampler * sampler) {
     return ((const llama_sampler_top_k *) first->ctx)->k;
 }
 
+void llama_sampler_backend_apply_after_top_k(llama_sampler * sampler, ggml_context * ctx, ggml_cgraph * gf, llama_sampler_data * data) {
+    GGML_ASSERT(llama_sampler_backend_top_k_first(sampler) > 0);
+    auto * chain = (llama_sampler_chain *) sampler->ctx;
+    // the loop of llama_sampler_chain_backend_apply from the second sampler on
+    for (size_t i = 1; i < chain->samplers.size(); ++i) {
+        auto & smpl = chain->samplers[i];
+        if (!smpl.is_backend) {
+            break;
+        }
+        if (smpl.ptr->iface->backend_apply) {
+            smpl.ptr->iface->backend_apply(smpl.ptr, ctx, gf, data);
+        }
+    }
+}
+
 struct llama_sampler * llama_sampler_init_top_k(int32_t k) {
     const bool is_empty = (k <= 0);
 

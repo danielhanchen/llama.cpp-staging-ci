@@ -41,6 +41,9 @@ uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
 bool llama_sampler_chain_is_init(const llama_sampler * sampler);
 // k19-dtopk: k of a backend sampler whose first graph stage is a top-k (a chain whose first sampler is a backend top-k), else 0
 int32_t llama_sampler_backend_top_k_first(const llama_sampler * sampler);
+// k19-p3topk: the backend stages of such a chain after its leading top-k (build_sampling ran that top-k over several rows at once and
+// passes this row's candidates and logits, as the top-k stage leaves them)
+void llama_sampler_backend_apply_after_top_k(llama_sampler * sampler, ggml_context * ctx, ggml_cgraph * gf, llama_sampler_data * data);
 // k15-fn: the sampler keeps graph inputs bound to the graph built last (dist, penalties, logit_bias): such a graph is not reused once
 // another graph was built with the sampler (llm_graph_input_sampling::can_reuse)
 bool llama_sampler_graph_bound(const llama_sampler * sampler);
