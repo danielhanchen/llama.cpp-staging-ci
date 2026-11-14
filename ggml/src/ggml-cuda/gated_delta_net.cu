@@ -617,15 +617,22 @@ bool ggml_cuda_gated_delta_net_may_use_mma(const ggml_tensor * dst) {
     if (!(g->ne[0] == 1 && ggml_get_op_params_i32(dst, 0) < v->ne[2] && v->ne[0] == 128 && q->ne[0] == 128)) {
         return false;
     }
-    static const bool exact_pred = [] {
+    // k19-int3fix: GGML_CUDA_GDN_FUSE_PRED unset / 1 = the dispatch test below 64 tokens only (decode, verify and replay windows), the
+    // shape-only test for prompt chunks; 2 = the dispatch test for every op (d328d72e2cc); 0 = the shape-only test everywhere. On A100
+    // (cc 8.0: no chunked mma kernel) the dispatch test let the fusions into the prompt chunks and those run slower there: q4x 8k
+    // TTFT 1.177 -> 1.256 s (+6.8%), decode unchanged; the decode / verify gains of the predicate are below 64 tokens
+    static const int pred_mode = [] {
         const char * e = getenv("GGML_CUDA_GDN_FUSE_PRED");
-        return e == nullptr || atoi(e) != 0;
+        return e == nullptr ? 1 : atoi(e);
     }();
-    if (!exact_pred) {
+    if (pred_mode == 0) {
         return true;
     }
     if (ggml_get_op_params_i32(dst, 1) == 1) {
         return false; // replay window: always the per-token kernel
+    }
+    if (pred_mode == 1 && v->ne[2] >= 64) {
+        return true; // a prompt chunk: the fusions stay refused, as before the dispatch test
     }
     return ggml_cuda_gdn_mma_candidate(ggml_cuda_get_device(), ggml_cuda_gdn_mma_args_from_tensor(dst));
 }
