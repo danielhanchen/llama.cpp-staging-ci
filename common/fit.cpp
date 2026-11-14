@@ -54,6 +54,12 @@ int64_t common_fit_moe_margin_gain() {
     return g_moe_margin_gain;
 }
 
+static int g_prewarm_graphs = 0;
+
+void common_fit_set_prewarm_graphs(int n_graphs) {
+    g_prewarm_graphs = std::max(0, n_graphs);
+}
+
 static bool g_small_device = false;
 
 bool common_fit_small_device() {
@@ -761,8 +767,9 @@ static void common_params_fit_impl(
     // memory needs the total shrunk by its deficit scaled by its share of the cache (a total surplus can hide a device that misses its target)
     auto fit_moe_cache_size = [&](dmds_t & dmds, const llama_model_params * mp, const bool use_margins) -> int64_t {
         g_moe_margin_gain = 0; // the last sizing of the cache decides
+        int64_t pw_reserve = 0; // k19-int3fix2: prewarmed verify graphs beside a wide-graphs cache (common_fit_set_prewarm_graphs)
         auto margin_of = [&](size_t id) -> int64_t {
-            return use_margins ? int64_t(margins[id]) : 0;
+            return use_margins ? int64_t(margins[id]) + pw_reserve : 0;
         };
         auto surplus_of = [&](const dmds_t & d) {
             int64_t s = 0;
@@ -831,6 +838,32 @@ static void common_params_fit_impl(
             return need;
         };
 
+        // k19-int3fix2: the server's verify graph prewarm (server_spec_prewarm) runs beside a cache that holds at least the wide-graphs
+        // share of the host experts (llama_moe_cache_wide_graphs) and keeps its graphs' device memory, which no measure here sees: A100
+        // 80 GB with 48 GB free, Qwen3.8-Flash-Next + DFlash2 (n_max 6), 3 chains x 7 widths took 828 -> 64 MiB of the 1024 MiB margin
+        // (22-66 MiB per graph), and the few-row MMQ graphs the rest (2 MiB, CUDA out of memory at the first request). That memory is
+        // kept free here from the cache, estimated per graph (LLAMA_FIT_PREWARM_GRAPH_MIB, opt-in, e.g. 40); the server's free-memory
+        // floor (LLAMA_SPEC_PREWARM_MIN_FREE_MIB, default 512) is the default guard
+        if (use_margins && has_drafter && g_prewarm_graphs > 0) {
+            // opt-in (default 0): measured at 48 GB the reserve lets the server prewarm all 21 graphs, and those windows replay slower
+            // than the ones the 512 MiB floor leaves eager: G4 Flash-Next DFlash2 chat 254.5 tok/s with 40 vs 274.6 without (base
+            // 262.2), A100 80 GB 110.7 vs 120.4 (base 115.6); both run (the reserve alone also kept the A100 alive with the floor off)
+            static const double graph_mib = getenv("LLAMA_FIT_PREWARM_GRAPH_MIB") != nullptr ?
+                std::max(0.0, atof(getenv("LLAMA_FIT_PREWARM_GRAPH_MIB"))) : 0.0;
+            static const double wide_frac = getenv("LLAMA_MOE_CACHE_WIDE_GRAPHS_FRAC") != nullptr ?
+                atof(getenv("LLAMA_MOE_CACHE_WIDE_GRAPHS_FRAC")) : 0.6;
+            static const double wide_min = (getenv("LLAMA_MOE_CACHE_WIDE_GRAPHS_MIN_MIB") != nullptr ?
+                std::max(0.0, atof(getenv("LLAMA_MOE_CACHE_WIDE_GRAPHS_MIN_MIB"))) : 32768.0)*1024.0*1024.0;
+            const double  experts = (double) common_moe_expert_bytes(path_model);
+            const int64_t need_pl = shortfall(dmds);
+            const double  cache_e = need_pl == INT64_MAX ? 0.0 : (double) (std::min(size_requested, cache_bytes) - need_pl);
+            if (graph_mib > 0.0 && wide_frac > 0.0 && experts > 0.0 && experts >= wide_min && cache_e >= wide_frac*experts) {
+                pw_reserve = int64_t(graph_mib*(double) g_prewarm_graphs)*MiB;
+                LOG_INF("%s: k19-int3fix2: %" PRId64 " MiB kept free from the MoE cache for %d prewarmed verify graphs (cache %.0f MiB = %.1f%% of "
+                    "%.0f MiB of host experts; LLAMA_FIT_PREWARM_GRAPH_MIB=0: off)\n", __func__, pw_reserve/MiB, g_prewarm_graphs,
+                    cache_e/MiB, 100.0*cache_e/experts, experts/MiB);
+            }
+        }
         const int64_t need0 = shortfall(dmds);
         int64_t size = need0 == INT64_MAX ? 0 : std::min(size_requested, cache_bytes) - need0;
         for (int it = 0; it < 6 && size > 0 && surplus_nc > 0; it++) {

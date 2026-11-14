@@ -59,6 +59,12 @@ common_params_fit_status common_fit_params(
 void    common_fit_set_moe_margin_auto(bool auto_margin);
 int64_t common_fit_moe_margin_gain();
 
+// k19-int3fix2: the server prewarms N verify CUDA graphs (sampler chains x verify widths, server_spec_prewarm) beside a MoE cache that
+// holds at least LLAMA_MOE_CACHE_WIDE_GRAPHS_FRAC of the host experts; each keeps device memory no fit measure sees. With N > 0 (set
+// before a fit with a draft model or MTP heads, 0 = none) the fit keeps N x LLAMA_FIT_PREWARM_GRAPH_MIB (opt-in, default 0) more free
+// on every device beside such a cache, taken from the cache
+void    common_fit_set_prewarm_graphs(int n_graphs);
+
 // k13-small: the fit kept every layer on a small device with the reduced margin (LLAMA_FIT_SMALL_MARGIN_MIB); set once per process
 bool    common_fit_small_device();
 // k19-place8: the last fit sized a small device's MoE cache for decode, prompts release its banks (LLAMA_MOE_PLACE8_UB set)

@@ -12853,6 +12853,29 @@ static bool ggml_backend_cuda_buffer_restore(ggml_backend_buffer_t buffer) {
 #endif
 }
 
+// k19-int3fix2: whether the few-row MMQ (GGML_CUDA_MMQ_FEW, its AUTO table and env included) would take a dense product of src0 type /
+// ne00 x ne01 over ncols contiguous F32 columns on this device (tests: test-backend-ops VROW_INV compares such verify rows only with the
+// lever off, see test_vrow_inv). Exposed as the "ggml_backend_cuda_mmq_few_takes" proc address
+static bool ggml_backend_cuda_mmq_few_takes(ggml_backend_dev_t dev, enum ggml_type type, int64_t ne00, int64_t ne01, int64_t ncols) {
+    if (dev == nullptr || ggml_backend_dev_backend_reg(dev) != ggml_backend_cuda_reg() || ncols < 1 || ne00 % ggml_blck_size(type) != 0) {
+        return false;
+    }
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    ggml_cuda_set_device(device);
+    ggml_tensor src0 = {};
+    ggml_tensor src1 = {};
+    src0.type  = type;
+    src0.ne[0] = ne00; src0.ne[1] = ne01; src0.ne[2] = 1; src0.ne[3] = 1;
+    src0.nb[0] = ggml_type_size(type);
+    src0.nb[1] = ggml_row_size(type, ne00);
+    src0.nb[2] = src0.nb[1]*ne01; src0.nb[3] = src0.nb[2];
+    src1.type  = GGML_TYPE_F32;
+    src1.ne[0] = ne00; src1.ne[1] = ncols; src1.ne[2] = 1; src1.ne[3] = 1;
+    src1.nb[0] = sizeof(float); src1.nb[1] = ne00*sizeof(float);
+    src1.nb[2] = src1.nb[1]*ncols; src1.nb[3] = src1.nb[2];
+    return ggml_cuda_should_use_mmq_few(&src0, &src1, ggml_cuda_info().devices[device].cc);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_moe_fetch_overlap_min_bytes") == 0) {
@@ -12860,6 +12883,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_dev_compute_capability") == 0) {
         return (void *)ggml_backend_cuda_dev_compute_capability;
+    }
+    if (strcmp(name, "ggml_backend_cuda_mmq_few_takes") == 0) {
+        return (void *)ggml_backend_cuda_mmq_few_takes;
     }
     if (strcmp(name, "ggml_backend_dev_headless") == 0) {
         return (void *)ggml_backend_cuda_dev_headless;
