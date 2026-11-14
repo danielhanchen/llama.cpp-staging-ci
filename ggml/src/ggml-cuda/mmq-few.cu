@@ -43,6 +43,13 @@ static __device__ __forceinline__ void cp_async_wait_group() {
 #endif // CP_ASYNC_AVAILABLE
 }
 
+// The 6-bit scales 4*ksc .. 4*ksc + 3 of a q3_K block, minus 32, as int8 (upstream mmq-load-tiles.cuh).
+static __device__ __forceinline__ int unpack_scales_q3_K(const uint8_t * scales, const int ksc) {
+    const int sc_low  = (get_int_b2(scales, ksc % 2) >> (4 * (ksc / 2))) & 0x0F0F0F0F;
+    const int sc_high = ((get_int_b2(scales, 2) >> (2 * ksc)) << 4) & 0x30303030;
+    return __vsub4(sc_low | sc_high, 0x20202020);
+}
+
 // src1 of the few-row MMQ in the layout of the MMA fragments. Per channel, 256 values and group of MMQ_FEW_NCOLS columns:
 //   qs: int4[4][32], [j][lane] holds the B fragments of sub-blocks 2j and 2j+1 of lane (g, t): the values [4t, 4t + 4) and [16 + 4t, 16 + 4t + 4) of column g.
 //   ds: int4[4][4], [t][j] holds d (D4, float) or (d, sum) (DS4, half2) of the columns 2t and 2t+1 for sub-block 2j, then 2j+1.
