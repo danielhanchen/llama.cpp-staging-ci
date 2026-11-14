@@ -288,9 +288,9 @@ static __device__ __forceinline__ void kqtc_tile(const kqtc_raw<type> & r0, cons
 template <ggml_type type, int nw, int ntiles>
 static __global__ void __launch_bounds__(nw*WARP_SIZE, 16/nw) mul_mat_vec_q_kqtc(const kqtc_args args) {
 #if defined(KQTC_ENABLED) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
-    __shared__ int   s_y[nw][8*KQTC_SROW];
-    __shared__ float s_d[nw][8*8];               // [block][column]
-    __shared__ float s_red[nw][ntiles*16*8];     // [row][column]
+    __shared__ __align__(16) int   s_y[nw][8*KQTC_SROW];
+    __shared__ __align__(16) float s_d[nw][8*8];           // [block][column], read as float2
+    __shared__ __align__(16) float s_red[nw][ntiles*16*8]; // [row][column]
 
     const int lane = threadIdx.x;
     const int w    = threadIdx.y;
@@ -334,6 +334,8 @@ static __global__ void __launch_bounds__(nw*WARP_SIZE, 16/nw) mul_mat_vec_q_kqtc
         acc[tt][0] = acc[tt][1] = acc[tt][2] = acc[tt][3] = 0.0f;
     }
 
+    // the last unit of a Q8_0 row whose K is not a multiple of 256 stages q8_1 blocks past K: the q8_1 rows are padded to
+    // MATRIX_ROW_PADDING (512) values with zeros by quantize_row_q8_1_cuda (the launcher checks the padding)
     constexpr bool pair_ints = kqtc_pair_ints<type>();
     const int nints = ncols*72; // 8 blocks x 9 ints per column
 
@@ -535,6 +537,9 @@ bool ggml_cuda_mmvq_kqtc_launch(const ggml_type type, const int n_mat, const voi
     const kqtc_cfg & cfg = kqtc_config();
     const int nb32   = (int) (ncols_x / 32);
     const int nunits = (int) ((ncols_x + 255) / 256);
+    if (stride_col_y*32 < (int64_t) nunits*256) {
+        return false; // a staged unit would leave the padded q8_1 row
+    }
     // the warps per block (which fix the K split, so the f32 order) depend on K only: a column's bytes do not depend on the launch's
     // columns or matrices
     const int nw     = cfg.nw > 0 ? cfg.nw : nunits >= 32 ? 8 : 4;
