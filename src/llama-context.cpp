@@ -10318,7 +10318,7 @@ void llama_context::moe_cache_resident_record(const llm_graph_result * res) {
     }
     static int n_log = 0;
     if (n_log++ < 3) {
-        LLAMA_LOG_INFO("%s: k19-mgpu2: resident prompt fill: routing of %d layers recorded from a large ubatch (LLAMA_MOE_RESIDENT_FILL=0 off)\n", __func__, n_rec);
+        LLAMA_LOG_INFO("%s: k19-mgpu2: resident prompt fill: routing of %d layers recorded from a large ubatch (LLAMA_MOE_RESIDENT_FILL=1)\n", __func__, n_rec);
     }
 }
 

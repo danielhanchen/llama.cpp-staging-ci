@@ -4420,7 +4420,7 @@ struct llama_moe_cache::impl {
         uint64_t routings = 0, cold_refused = 0, cold_taken = 0, hot_taken = 0, pf_hot = 0, pf_cold = 0, pf_stale = 0;
     } aps;
 
-    // k19-mgpu2 (LLAMA_MOE_RESIDENT_PROF: unset / 2 = record only, 1 = record + use, 0 = off): the device slots of resident mode can
+    // k19-mgpu2 (LLAMA_MOE_RESIDENT_PROF: unset / 0 = off, 2 = record only, 1 = record + use): the device slots of resident mode can
     // start from the decode routing of earlier launches. Resident mode (the exclusive RAM tier and the device slots hold every streamed expert, e.g. Flash-Next UD-IQ1_S on
     // Kaggle 2x T4) never seeds the device cache from prompts (k18-lowram) and filled each layer's lowest expert ids at load, so a decode
     // paid its working set one miss at a time: an upload from RAM plus the copy back of the victim, ~26 misses per token over the first
@@ -4444,8 +4444,9 @@ struct llama_moe_cache::impl {
     static int rp_mode() {
         static const int m = [] {
             const char * e = getenv("LLAMA_MOE_RESIDENT_PROF");
-            const int v = e != nullptr && *e ? atoi(e) : 2;
-            return v >= 0 && v <= 2 ? v : 2;
+            // off unless asked: the held-out warm start gained nothing measurable (Kaggle 2x T4 fn1, inside the launch spread)
+            const int v = e != nullptr && *e ? atoi(e) : 0;
+            return v >= 0 && v <= 2 ? v : 0;
         }();
         return m;
     }
@@ -4504,7 +4505,7 @@ struct llama_moe_cache::impl {
         prefilled_dev = true;
         rps.used = true;
         LLAMA_LOG_INFO("%s: k19-mgpu2: resident device slots from the routing profile %s: %zu experts (%.2f MiB), %zu hottest of %zu profile "
-            "entries + %zu by id (LLAMA_MOE_RESIDENT_PROF=1; 2 = record only, the default)\n", __func__, ap_file.c_str(), n_fill, n_bytes/1048576.0, rps.taken, rps.read, rps.padded);
+            "entries + %zu by id (LLAMA_MOE_RESIDENT_PROF=1; 2 = record only)\n", __func__, ap_file.c_str(), n_fill, n_bytes/1048576.0, rps.taken, rps.read, rps.padded);
         return true;
     }
 
@@ -4524,7 +4525,7 @@ struct llama_moe_cache::impl {
         rps.lookups++;
     }
 
-    // k19-mgpu2 resident prompt fill (LLAMA_MOE_RESIDENT_FILL, default 1; 0 off). One GPU (not resident: the exclusive tier holds what
+    // k19-mgpu2 resident prompt fill (LLAMA_MOE_RESIDENT_FILL=1, opt-in). One GPU (not resident: the exclusive tier holds what
     // the device does not, the rest is read from the files) admits the experts a prompt routes, so its decode starts on the request's
     // working set (fn1 1x T4 chat: 5718 experts admitted, then no miss at all, 50 tok/s). Resident mode (every streamed expert in RAM or
     // in a device slot, e.g. fn1 on 2x T4) never did: prompts do not seed there (k18-lowram: a seed's copies back found no RAM slot and
@@ -4535,9 +4536,13 @@ struct llama_moe_cache::impl {
     // needs one free RAM slot however many it swaps and no expert ever leaves both tiers. Victims RAM still holds need no copy.
     // Placement only: every expert is computed by the same kernels wherever it came from; the text changes only through the route tail
     // skip (missing experts it drops follow the residency): with LLAMA_MOE_ROUTE_TAIL_SKIP=0 the text is the kill switch's.
+    // Opt-in (LLAMA_MOE_RESIDENT_FILL=1): Kaggle 2x T4, fn1, 3 launches with the PLE row profile on both sides: decode chat +11% / 8k
+    // +12% for +3 s chat / +6 s 8k first-token time (~6k experts moved per prompt); for a 256-token answer the wait costs more than
+    // the decode saves. LLAMA_MOE_RESIDENT_FILL_DEFER=1 moves the swaps into decode (8k decode -15..-23%); a cap
+    // (LLAMA_MOE_RESIDENT_FILL_MAX=1500) costs ~0.7 s and gains nothing measurable
     bool rpf_on = [] {
         const char * e = getenv("LLAMA_MOE_RESIDENT_FILL");
-        return e == nullptr || atoi(e) != 0;
+        return e != nullptr && atoi(e) != 0;
     }();
     std::vector<std::vector<int32_t>> rpf_counts; // [il] routing counts of the prompt's last large ubatch
     std::vector<int32_t> rpf_ids;
