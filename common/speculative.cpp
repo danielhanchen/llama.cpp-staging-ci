@@ -4321,8 +4321,9 @@ uint32_t common_draft_ubatch_max() {
     return v;
 }
 
-// k16-draft: the shape of tensor `name` in a GGUF (split-aware: a target's lm head is usually in a later shard), false if absent
-static bool common_gguf_tensor_ne(const std::string & path, const char * name, int64_t ne[GGML_MAX_DIMS]) {
+// k16-draft: the shape (and type) of tensor `name` in a GGUF (split-aware: a target's lm head is usually in a later shard): 1 found,
+// 0 absent from every readable shard, -1 a shard could not be read
+static int common_gguf_tensor_find(const std::string & path, const char * name, int64_t ne[GGML_MAX_DIMS], ggml_type * type = nullptr) {
     std::string prefix;
     int n_split = 1;
     const size_t at = path.rfind("-00001-of-");
@@ -4341,34 +4342,58 @@ static bool common_gguf_tensor_ne(const std::string & path, const char * name, i
         gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &meta };
         gguf_context_ptr ctx(gguf_init_from_file(fname.c_str(), gp));
         if (!ctx) {
-            return false;
+            return -1;
         }
         ggml_context_ptr meta_ptr(meta);
         if (const ggml_tensor * t = ggml_get_tensor(meta, name)) {
             for (int d = 0; d < GGML_MAX_DIMS; ++d) {
                 ne[d] = t->ne[d];
             }
-            return true;
+            if (type != nullptr) {
+                *type = t->type;
+            }
+            return 1;
         }
     }
-    return false;
+    return 0;
 }
 
 // k16-draft (idea from ik_llama.cpp by ikawrakow): a separate MTP draft model (-md with --spec-type draft-mtp) uses the target's
 // token_embd and output when both files hold them with the same shapes (llama_model_loader::borrow_io checks again at load, against
 // the loaded target). Decided here so the fit's measurements of the draft (no target loaded yet) count the lm head as the target's.
 // LLAMA_MTP_BORROW_IO=0: the draft loads its own copies
-static bool common_mtp_borrow_io_ok(const std::string & path_tgt, const std::string & path_dft) {
+// k19-pr374 (ported from LeoBorcherding's Qwen4Exp shared MTP heads, unslothai/llama.cpp, MIT): a shared drafter (mtp-*-shared-*.gguf)
+// has neither tensor (a drafter missing only one keeps the old rule: no borrow); it borrows both, and `missing` gets the target's type of each one it lacks (the measurement prices them in it).
+// LLAMA_MTP_BORROW_MISSING=0: a drafter without them is not borrowed for (its load fails on the missing tensor, as before)
+static bool common_mtp_borrow_io_ok(const std::string & path_tgt, const std::string & path_dft,
+        std::vector<std::pair<std::string, ggml_type>> * missing = nullptr) {
     const char * e = getenv("LLAMA_MTP_BORROW_IO");
     if ((e != nullptr && atoi(e) == 0) || path_tgt.empty() || path_dft.empty() || path_tgt == path_dft) {
         return false;
     }
+    const char * em = getenv("LLAMA_MTP_BORROW_MISSING");
+    const bool allow_missing = em == nullptr || atoi(em) != 0;
+    std::vector<std::pair<std::string, ggml_type>> miss;
     for (const char * name : { "token_embd.weight", "output.weight" }) {
         int64_t a[GGML_MAX_DIMS] = {}, b[GGML_MAX_DIMS] = {};
-        if (!common_gguf_tensor_ne(path_tgt, name, a) || !common_gguf_tensor_ne(path_dft, name, b) ||
-                !std::equal(a, a + GGML_MAX_DIMS, b)) {
+        ggml_type ta = GGML_TYPE_COUNT;
+        if (common_gguf_tensor_find(path_tgt, name, a, &ta) != 1) {
             return false;
         }
+        const int fd = common_gguf_tensor_find(path_dft, name, b);
+        if (fd == 0 && allow_missing) {
+            miss.emplace_back(name, ta);
+            continue;
+        }
+        if (fd != 1 || !std::equal(a, a + GGML_MAX_DIMS, b)) {
+            return false;
+        }
+    }
+    if (miss.size() == 1) {
+        return false; // only a drafter with neither is a shared one: one with its own token_embd and no output ties its head to it
+    }
+    if (missing != nullptr) {
+        *missing = std::move(miss);
     }
     return true;
 }
@@ -4437,7 +4462,22 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.moe_cache_size = spec_mtp && !has_draft ? params.moe_cache_size : 0;
 
     // k16-draft: borrowed token_embd / output (llama_model_params::mtp_borrow_io)
-    result.mtp_borrow_io = spec_mtp && has_draft && common_mtp_borrow_io_ok(params.model.path, params_spec.mparams.path);
+    std::vector<std::pair<std::string, ggml_type>> borrow_missing;
+    result.mtp_borrow_io = spec_mtp && has_draft && common_mtp_borrow_io_ok(params.model.path, params_spec.mparams.path, &borrow_missing);
+    // k19-pr374: a shared drafter's absent token_embd / output, in the target's types, for the memory measurement of the draft
+    // (llama_model_loader::borrow_missing_type)
+    for (const auto & [name, type] : borrow_missing) {
+        if (!result.kv_overrides.empty() && result.kv_overrides.back().key[0] == 0) {
+            result.kv_overrides.pop_back();
+        }
+        llama_model_kv_override o = {};
+        snprintf(o.key, sizeof(o.key), "%s", name == "token_embd.weight" ? "general.mtp_borrow_token_embd_type" : "general.mtp_borrow_output_type");
+        o.tag = LLAMA_KV_OVERRIDE_TYPE_STR;
+        snprintf(o.val_str, sizeof(o.val_str), "%s", ggml_type_name(type));
+        result.kv_overrides.push_back(o);
+        result.kv_overrides.emplace_back();
+        result.kv_overrides.back().key[0] = 0;
+    }
 
     // a separate MTP drafter (-md) is one block: its context reads the prompt in ubatches of at most common_draft_ubatch_max()
     // tokens (it splits the target's larger ubatches itself), so its compute buffer stays small and the MoE cache of the target

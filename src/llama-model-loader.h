@@ -123,6 +123,11 @@ struct llama_model_loader {
     bool   output_borrowed      = false;   // output is the target's tensor (load_tensors_draft_head copies its rows from it)
     ggml_backend_buffer_type_t output_dry_buft = nullptr; // no_alloc: the device buffer type output would have taken (the draft head's)
     size_t borrowed_bytes       = 0;
+    // k19-pr374: a shared MTP drafter (mtp-*-shared-*.gguf) has no token_embd / output of its own; with mtp_borrow_io it takes the
+    // target's. The memory measurement (no_alloc, no target loaded) prices them as a self-contained drafter's borrowed copies, in the
+    // target's types (KV overrides general.mtp_borrow_token_embd_type / general.mtp_borrow_output_type, set by common)
+    ggml_type borrow_missing_type(llm_tensor t) const;
+    bool      shared_drafter_file() const; // the file has neither token_embd.weight nor output.weight
 
     llama_files files;
     std::vector<std::string> file_paths; // path of each file, empty if opened from a FILE pointer
