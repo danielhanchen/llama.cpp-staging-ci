@@ -7,7 +7,7 @@
 //  - exact properties: 1-column products and products it does not take keep the bytes of the replaced launch; under the bit-exact
 //    verify (batch invariant + GGML_CUDA_VERIFY_REASSOC=0) every flagged product keeps them and the lever does not engage;
 //  - engagement (GGML_CUDA_MMQ_FEW_LOG=1 logs each launch): every type engages on Ampere and newer; the AUTO mode only on the devices
-//    of its table (cc 8.0 / 8.9 / 12.0), never elsewhere; never on Turing. Column invariance across widths is reported (informational).
+//    of its table (cc 8.0 / 8.9), never elsewhere; never on Turing. Column invariance across widths is reported (informational).
 // Each mode runs in a child process (the switches are read once per process). No CUDA device: SKIP, exit 0.
 //
 // --bench L REPS [TYPES] [SHAPES]: Qwen3.8-27B shapes (gu = gate + up 5120 -> 2 x 17408 on one activation, dn 17408 -> 5120,
@@ -507,7 +507,7 @@ int main(int argc, char ** argv) {
     const auto is_lever = [&](int i) { return strncmp(modes[i].name, "few", 3) == 0; };
     const auto is_few   = [&](int i) { return strncmp(modes[i].name, "few", 3) == 0; };
     const bool few_dev  = cc < 0 || cc >= 800; // the few-row MMQ needs the Ampere MMA
-    const bool auto_dev = cc == 800 || cc == 890 || cc == 1200; // devices of its AUTO table
+    const bool auto_dev = cc == 800 || cc == 890; // devices of its AUTO table (k19-int3fix: cc 12.0 off)
 
     // engagement: base never logs, every lever mode logs (single and multi-matrix launches)
     for (int i = 0; i < nm; ++i) {
