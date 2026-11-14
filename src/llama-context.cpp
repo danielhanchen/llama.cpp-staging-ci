@@ -6168,6 +6168,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             moe_cache_ids.clear();
             moe_cache_record = false;
         }
+        // k19-mgpu2: resident mode keeps the routing of each large ubatch for the fill at the prompt end (see moe_cache_resident_record)
+        if (moe_cache && res && !moe_cache->small_batch(ubatch.n_tokens) && moe_cache->resident_fill_wanted()) {
+            moe_cache_resident_record(res);
+        }
         if (moe_cache) {
             moe_cache_seed_end(ubatch, res ? n_outputs : -1);
         }
@@ -8196,6 +8200,38 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     lm_seeded.clear();
     ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
+    // k19-mgpu2: resident prompt fill on the layer-major path: the routing of the group's last member (its ffn routing outputs, read
+    // before the compute buffers are freed) for the fill at the end of the prompt, here when the group ends it
+    if (status == GGML_STATUS_SUCCESS && moe_cache->resident_fill_wanted() && !lm_record.empty()) {
+        ggml_backend_sched_synchronize(sched.get());
+        std::vector<int32_t> ids_data;
+        std::vector<int32_t> counts;
+        int n_rec = 0;
+        for (const auto & [w, ids] : lm_record) {
+            const int32_t il = moe_cache->layer_of_weight(w);
+            if (il < 0 || ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids) || ids->buffer == nullptr || ids->data == nullptr) {
+                continue;
+            }
+            ids_data.resize(ggml_nelements(ids));
+            ggml_backend_tensor_get(ids, ids_data.data(), 0, ggml_nbytes(ids));
+            counts.assign(w->ne[2], 0);
+            for (const int32_t id : ids_data) {
+                if (id >= 0 && id < w->ne[2]) {
+                    counts[id]++;
+                }
+            }
+            moe_cache->set_resident_counts(il, counts); // the gate, up and down weights of a layer share one routing: the same counts
+            n_rec++;
+        }
+        static int n_log = 0;
+        if (n_log++ < 3) {
+            LLAMA_LOG_INFO("%s: k19-mgpu2: resident prompt fill: routing of %d weights recorded from a layer-major group\n", __func__, n_rec);
+        }
+        if (group.back().n_outputs > 0 && moe_cache->has_resident_counts()) {
+            moe_cache->resident_fill();
+        }
+    }
+
     // the state moe_cache_seed_end leaves after the last ubatch of the group: its routing is kept for a later seed while the prompt goes on
     moe_cache_ids.clear();
     moe_cache_seeded = seeded || replayed;
@@ -10017,6 +10053,10 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
     moe_cache->prompt_ubatch(true);
     const bool large = !moe_cache->small_batch(ubatch.n_tokens);
     if (!moe_cache_seed_enabled) {
+        // k19-mgpu2: a server may run the last prompt token(s) as a separate small batch with the outputs: that one ends the prompt
+        if (!large && n_outputs_ub != 0 && moe_cache->resident_fill_wanted() && moe_cache->has_resident_counts()) {
+            moe_cache->resident_fill();
+        }
         return;
     }
 
@@ -10170,6 +10210,9 @@ void llama_context::moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_ou
 
     // the prompt ends at a ubatch with outputs (or a failed one), the next one may belong to another prompt
     if (n_outputs_ub != 0 || ubatch.n_seqs_unq != 1) {
+        if (n_outputs_ub > 0 && moe_cache->resident_fill_wanted() && moe_cache->has_resident_counts()) {
+            moe_cache->resident_fill(); // k19-mgpu2: the prompt's routed experts into each card's slots
+        }
         if (n_outputs_ub != 0 && recorded && !moe_cache_seeded && !moe_cache_ids.empty() && moe_cache->refills_routed()) {
             moe_cache_refill_from_ids();
         }
@@ -10282,6 +10325,43 @@ void llama_context::moe_cache_autoprof_from_ids() {
             }
         }
         moe_cache->autoprof_counts(w, counts);
+    }
+}
+
+// k19-mgpu2: the routing of a large ubatch in resident mode (its ffn_moe_topk_out-<il> outputs on every card), kept per layer for the
+// fill at the end of the prompt (the last large ubatch wins)
+void llama_context::moe_cache_resident_record(const llm_graph_result * res) {
+    ggml_cgraph * gf = res->get_gf();
+    const int64_t n_expert = model.hparams.n_expert;
+    if (gf == nullptr || n_expert <= 0) {
+        return;
+    }
+    ggml_backend_sched_synchronize(sched.get());
+    std::vector<int32_t> ids_data;
+    std::vector<int32_t> counts;
+    static const char * pfx = "ffn_moe_topk_out-";
+    const size_t n_pfx = strlen(pfx);
+    int n_rec = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * t = ggml_graph_node(gf, i);
+        if (strncmp(t->name, pfx, n_pfx) != 0 || t->type != GGML_TYPE_I32 || !ggml_is_contiguous(t) || t->buffer == nullptr || t->data == nullptr) {
+            continue;
+        }
+        const int il = atoi(t->name + n_pfx);
+        ids_data.resize(ggml_nelements(t));
+        ggml_backend_tensor_get(t, ids_data.data(), 0, ggml_nbytes(t));
+        counts.assign(n_expert, 0);
+        for (const int32_t id : ids_data) {
+            if (id >= 0 && id < n_expert) {
+                counts[id]++;
+            }
+        }
+        moe_cache->set_resident_counts(il, counts);
+        n_rec++;
+    }
+    static int n_log = 0;
+    if (n_log++ < 3) {
+        LLAMA_LOG_INFO("%s: k19-mgpu2: resident prompt fill: routing of %d layers recorded from a large ubatch (LLAMA_MOE_RESIDENT_FILL=1)\n", __func__, n_rec);
     }
 }
 

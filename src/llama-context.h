@@ -864,6 +864,7 @@ private:
     // count: the same routing also goes to the RAM tier's refill (k19-l4fill) and the self-learned profile (k19-autoprof), see
     // moe_cache_released_counts
     void moe_cache_refill_from_ids(bool count = false);
+    void moe_cache_resident_record(const llm_graph_result * res); // k19-mgpu2
     void moe_cache_fill_from_ids(); // k19-l4fill
     void moe_cache_autoprof_from_ids(); // k19-autoprof
     bool moe_ap_counted = false;        // k19-autoprof: the recorded routing (moe_cache_ids) was counted

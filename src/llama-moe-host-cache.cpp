@@ -736,6 +736,22 @@ void llama_moe_host_cache::release_key(int32_t il, int32_t e) {
     release(slot_of[il][e]);
 }
 
+bool llama_moe_host_cache::rekey(int32_t s, int32_t il, int32_t e) {
+    if (!caches(il) || e < 0 || e >= n_expert || slot_of[il][e] >= 0 || slot_class[s] != layer_class[il]) {
+        return false;
+    }
+    slot_t & sl = slots[s];
+    if (sl.state != SLOT_VALID && sl.state != SLOT_WRITING) {
+        return false;
+    }
+    set_key(s, il*n_expert + e);
+    sl.dup      = 0;
+    sl.count    = 0;
+    sl.lease_id = 0;
+    gen++;
+    return true;
+}
+
 void llama_moe_host_cache::begin_call() {
     call_epoch++;
 }

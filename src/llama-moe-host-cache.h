@@ -115,6 +115,9 @@ public:
     // experts routed by the current call: never evicted until the next begin_call
     void begin_call();
     void pin(int32_t s);
+    // k19-mgpu2: slot s (a held expert of the same slot class) now holds expert e of layer il instead: the caller orders the copies (the
+    // old expert's last read before the new bytes are written, on one stream) and marks the write; false if the key is held or the class differs
+    bool rekey(int32_t s, int32_t il, int32_t e);
 
     // the held experts the reads ahead of the current plan skip: never evicted until the next new_plan, which also drops the bundles
     // that were being filled from the uploads of the plan and did not complete

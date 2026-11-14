@@ -58,6 +58,9 @@ public:
             layer_set set = layer_set::all, llama_weight_store * ws = nullptr, int64_t host_mib = -1);
     ~llama_moe_cache();
 
+    // k19-mgpu2: the layer of a cached expert weight, -1 if w is not one
+    int32_t layer_of_weight(const ggml_tensor * w) const;
+
     // the device that caches layer il
     ggml_backend_t backend(int32_t il) const;
 
@@ -387,6 +390,12 @@ public:
 
     // the exclusive RAM tier and the device slots hold every streamed expert (resident mode, see init_host_cache)
     bool resident_union() const;
+    // k19-mgpu2: resident mode swaps the experts a prompt's last large ubatch routed into each card's slots at the prompt end
+    // (LLAMA_MOE_RESIDENT_FILL=0 off); the context records the routing of every large ubatch with set_resident_counts
+    bool resident_fill_wanted() const;
+    void resident_fill();
+    void set_resident_counts(int32_t il, const std::vector<int32_t> & counts);
+    bool has_resident_counts() const;
     // prompts never seed (llama_context, k18-lowram): no seed split in the lent memory either
     void seeds_off();
 
@@ -449,6 +458,12 @@ bool llama_moe_profile_write(const std::string & path, size_t n_layer, const std
 
 // the order the RAM tier is filled in at load: the most used first over every layer (heat descending), ties in file order
 std::vector<llama_moe_profile_entry> llama_moe_profile_ram_order(const std::vector<llama_moe_profile_entry> & entries);
+
+// k19-mgpu2: the experts a group's n_avail device slots take at load from a routing profile: the hottest (layer, expert) pairs of the
+// group's layers (heat > 0, heat descending, ties in file order), then the lowest ids not taken, one layer after the other in turn.
+// [i] = the experts of layers[i] in id order; *n_prof / *n_pad (may be null) count the two kinds
+std::vector<std::vector<int32_t>> llama_moe_profile_pick(const std::vector<llama_moe_profile_entry> & entries, const std::vector<int32_t> & layers,
+        int32_t n_expert, int32_t n_avail, size_t * n_prof, size_t * n_pad);
 
 class llama_moe_host_cache;
 

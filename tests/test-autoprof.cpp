@@ -3,6 +3,7 @@
 //      overrides), the switch LLAMA_MOE_AUTOPROF (0 off, 1 record + use, 2 record only, 3 use only), the file names and the model key;
 //   2. the atomic write: the file holds the new body, no temporary is left, a write that cannot complete leaves the old file;
 //   3. the MoE routing profile body (as written by the cache) reads back with llama_moe_profile_load; no file / a cut file reads nothing;
+//      llama_moe_profile_pick (k19-mgpu2, resident device prefill): hottest pairs of a group first, then the lowest ids in turn;
 //   4. the PLE recorder: a record-only cache (no slots) gathers bit-identical rows, counts every read and keeps each row's bytes; its
 //      profile preloads exactly the recorded rows in a later cache (gathers still bit-identical, static hits); a second session adds its
 //      reads to the halved loaded counts; the memory cap holds; a missing profile preloads nothing.
@@ -140,6 +141,33 @@ static void test_moe_body(const fs::path & root) {
     CHECK(!llama_moe_profile_load(f, { 8, 8 }, out), "another layer count is refused");
     CHECK(llama_autoprof::write_atomic(f, body.substr(0, body.size() - 6)), "write a cut body");
     CHECK(!llama_moe_profile_load(f, ne, out), "a cut file is refused");
+}
+
+// k19-mgpu2: llama_moe_profile_pick, the resident device prefill from a profile: the hottest pairs of the group's layers over all of them
+// (heat descending, zero heat and other layers ignored), then the lowest ids not taken, one layer after the other, up to the slot count
+static void test_pick() {
+    // layers 4 and 6 form the group (6 experts each), layer 5 is another group's
+    const std::vector<llama_moe_profile_entry> prof = {
+        { 6, 5, 2.0f }, { 4, 3, 9.0f }, { 5, 0, 50.0f }, { 6, 1, 7.5f }, { 4, 3, 1.0f }, { 4, 2, 0.0f }, { 6, 4, 2.0f },
+    };
+    size_t np = 0, nd = 0;
+    // 3 slots: the three hottest of layers 4 / 6 (9.0, 7.5, then the first 2.0 in file order), nothing by id
+    auto p = llama_moe_profile_pick(prof, { 4, 6 }, 6, 3, &np, &nd);
+    CHECK(p.size() == 2 && p[0] == std::vector<int32_t>({ 3 }) && p[1] == std::vector<int32_t>({ 1, 5 }) && np == 3 && nd == 0,
+        "3 slots: %zu / %zu, %zu + %zu", p.size() > 0 ? p[0].size() : 0, p.size() > 1 ? p[1].size() : 0, np, nd);
+    // 8 slots: 4 from the profile (zero heat and the duplicate skipped), then by id in turn: 4:0, 6:0, 4:1, 6:2
+    p = llama_moe_profile_pick(prof, { 4, 6 }, 6, 8, &np, &nd);
+    CHECK(np == 4 && nd == 4, "8 slots: %zu + %zu", np, nd);
+    CHECK(p[0] == std::vector<int32_t>({ 0, 1, 3 }) && p[1] == std::vector<int32_t>({ 0, 1, 2, 4, 5 }), "8 slots: the picked ids");
+    // more slots than experts: every expert once
+    p = llama_moe_profile_pick(prof, { 4, 6 }, 6, 20, &np, &nd);
+    CHECK(p[0].size() == 6 && p[1].size() == 6 && np + nd == 12, "20 slots: %zu / %zu", p[0].size(), p[1].size());
+    // no profile: the lowest ids per layer in turn (the prefill by id)
+    p = llama_moe_profile_pick({}, { 4, 6 }, 6, 5, &np, &nd);
+    CHECK(np == 0 && nd == 5 && p[0] == std::vector<int32_t>({ 0, 1, 2 }) && p[1] == std::vector<int32_t>({ 0, 1 }), "no profile");
+    // no slots
+    p = llama_moe_profile_pick(prof, { 4, 6 }, 6, 0, &np, &nd);
+    CHECK(p[0].empty() && p[1].empty() && np == 0 && nd == 0, "0 slots");
 }
 
 // ------------------------------------------------------------------------------------------------------------------------------------
@@ -306,6 +334,7 @@ int main() {
     test_names(root);
     test_write(root);
     test_moe_body(root);
+    test_pick();
     test_recorder(root);
     fs::remove_all(root, ec);
     if (n_fail == 0) {
