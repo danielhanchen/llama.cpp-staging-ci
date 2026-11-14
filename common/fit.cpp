@@ -63,6 +63,43 @@ int64_t common_fit_faoff_kq_bytes(int64_t n_head, int64_t n_ubatch, int64_t n_ct
     return std::max<int64_t>(0, n_head)*std::max<int64_t>(0, n_ubatch)*std::max<int64_t>(0, n_ctx)*2;
 }
 
+// k19-fitfaoff: -ub / LLAMA_ARG_UBATCH given (common_fit_set_ubatch_user): the fit keeps that n_ubatch without flash attention
+static bool     g_fit_ub_user    = false;
+// k19-fitfaoff: the smallest n_ubatch a fit without flash attention chose since the last reset (0: none chosen)
+static uint32_t g_fit_faoff_ub   = 0;
+
+void common_fit_set_ubatch_user(bool ub_user) {
+    g_fit_ub_user = ub_user;
+}
+
+uint32_t common_fit_faoff_ubatch() {
+    return g_fit_faoff_ub;
+}
+
+void common_fit_faoff_ubatch_reset() {
+    g_fit_faoff_ub = 0;
+}
+
+uint32_t common_fit_faoff_ubatch_plan(uint32_t ub, uint32_t ub_floor, const std::function<bool(uint32_t)> & fits) {
+    while (ub > ub_floor && !fits(ub)) {
+        ub = std::max(ub_floor, ub/2);
+    }
+    return ub;
+}
+
+// LLAMA_FIT_FAOFF_UB: 1 (default) without flash attention and without -ub the fit lowers n_ubatch before moving layers, 0 = off
+static bool common_fit_faoff_ub_on() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_FIT_FAOFF_UB");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+bool common_fit_faoff_pin_ubatch(bool ub_user, bool fa_off, bool keep, bool ub_on, bool has_gpu) {
+    return !ub_user && fa_off && keep && ub_on && has_gpu;
+}
+
 // LLAMA_FIT_FAOFF_MARGIN: 1 (default) the full margin beside a MoE cache without flash attention, 0 = the reduced one as before
 static bool common_fit_faoff_keep() {
     static const bool keep = [] {
@@ -738,6 +775,53 @@ static void common_params_fit_impl(
         for (size_t id = 0; id < nd; id++) {
             margins.push_back(margins_s[id]);
         }
+    }
+
+    // k19-fitfaoff (LLAMA_FIT_FAOFF_UB=0 off, LLAMA_FIT_FAOFF_MARGIN=0 both off): without flash attention and without -ub, the KQ copy
+    // reserve below scales with n_ubatch, so the fit first halves n_ubatch (down to 512) while the whole model at that ubatch misses a
+    // GPU's margin plus the reserve, and only then moves layers / experts to the host. Kaggle 2x T4 dsf8 -fa off ctx 16384: at -ub 2048
+    // the 4096 MiB reserve put 8 of 9 layers on the host (4.5 / 2.5 tok/s chat / 8k), at -ub 512 (1024 MiB) 52.7 / 17.1 without an abort
+    bool has_gpu = false;
+    for (size_t id = 0; id < nd; id++) {
+        has_gpu = has_gpu || ggml_backend_dev_type(devs[id]) == GGML_BACKEND_DEVICE_TYPE_GPU;
+    }
+    if (common_fit_faoff_pin_ubatch(g_fit_ub_user, g_fit_fa_off, common_fit_faoff_keep(), common_fit_faoff_ub_on(), has_gpu)) {
+        constexpr uint32_t ub_floor = 512;
+        const uint32_t ub0 = cparams->n_ubatch;
+        if (ub0 > ub_floor) {
+            auto fits = [&](uint32_t ub) -> bool {
+                llama_context_params cp = *cparams;
+                cp.n_ubatch       = ub;
+                cp.moe_cache_size = 0; // the whole model on its devices, as placed; the cache only takes what is left
+                dmds_t d;
+                try {
+                    d = common_get_device_memory_data_impl(path_model, mparams, &cp, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                } catch (const std::runtime_error &) {
+                    return false;
+                }
+                add_extra_memory(d, mparams, &cp);
+                const int64_t kq = g_fit_faoff_kq;
+                for (size_t id = 0; id < nd; id++) {
+                    if (ggml_backend_dev_type(devs[id]) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                            int64_t(d[id].free) - int64_t(d[id].mb.total()) - margins[id] - kq < 0) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            const uint32_t ub = common_fit_faoff_ubatch_plan(ub0, ub_floor, fits);
+            if (ub != ub0) {
+                cparams->n_ubatch = ub;
+                if (cparams->n_batch < ub) {
+                    cparams->n_batch = ub;
+                }
+                dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                add_extra_memory(dmds_full);
+                LOG_INF("%s: flash attention off: n_ubatch %u -> %u before moving layers to the host (the KQ copies scale with it; "
+                    "LLAMA_FIT_FAOFF_UB=0 keeps it)\n", __func__, ub0, ub);
+            }
+        }
+        g_fit_faoff_ub = g_fit_faoff_ub == 0 ? cparams->n_ubatch : std::min(g_fit_faoff_ub, cparams->n_ubatch);
     }
 
     // k19-fitfaoff (LLAMA_FIT_FAOFF_MARGIN=0 off): without flash attention the KQ / KQV mat-muls take F16 copies of the KQ matrix

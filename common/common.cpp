@@ -3151,6 +3151,8 @@ uma_restart:
 
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
+        common_fit_set_ubatch_user(params.n_ubatch_set); // k19-fitfaoff
+        common_fit_faoff_ubatch_reset();
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 
         // the draft context is created from the same base params and follows the main context, fit both together
@@ -4080,6 +4082,19 @@ uma_restart:
                 uma_no_cache = true;
                 goto uma_restart;
             }
+        }
+
+        // k19-fitfaoff (LLAMA_FIT_FAOFF_UB=0 off): without flash attention and without -ub the fit chose n_ubatch for the F16 copies of
+        // the KQ matrix it reserves (common_fit_faoff_ubatch_plan); it stays as if given with -ub, so the n_ubatch growth rules below
+        // (resident ubatch, the MoE cache's auto ubatch, up to 2048 and more), which do not price those copies, keep it. Kaggle 2x T4
+        // dsf8 -fa off ctx 16384: -ub 2048 with its 4096 MiB reserve 4.5 / 2.5 tok/s chat / 8k, -ub 512 52.7 / 17.1, both without an abort
+        if (fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && !params.n_ubatch_set && common_fit_faoff_ubatch() > 0) {
+            const uint32_t ub = std::min<uint32_t>(cparams.n_ubatch, common_fit_faoff_ubatch());
+            COM_INF("%s: --fit: flash attention off: n_ubatch %u kept (the KQ copies are reserved at it; LLAMA_FIT_FAOFF_UB=0 lets it grow)\n",
+                __func__, ub);
+            cparams.n_ubatch      = ub;
+            params.n_ubatch       = (int32_t) ub;
+            params.n_ubatch_set   = true;
         }
 
         // k9-prompt-pass: every expert on the device (the MoE cache was asked for and has nothing to hold): the prompt runs at

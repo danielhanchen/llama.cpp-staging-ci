@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <functional>
 #include <vector>
 
 enum common_params_fit_status {
@@ -92,6 +93,19 @@ int64_t common_fit_moe_margin_fa_plan(int64_t m, int64_t m_reduced, bool flash_a
 //     without flash attention (the KQV mat-mul converts the F32 KQ to F16 in the CUDA pool, outside the measured compute buffer)
 int64_t common_fit_faoff_kq_bytes(int64_t n_head, int64_t n_ubatch, int64_t n_ctx);
 bool    common_fit_last_flash_attn();
+// k19-fitfaoff (LLAMA_FIT_FAOFF_UB, default 1; LLAMA_FIT_FAOFF_MARGIN=0 turns it off too): without flash attention and without -ub the
+// fit halves n_ubatch down to 512 while the whole model at that ubatch misses a GPU's margin plus the KQ copy reserve, before it moves
+// layers to the host; common.cpp then pins that n_ubatch (the MoE cache's n_ubatch growth rules run after the fit and do not price
+// the KQ copies)
+//   - common_fit_set_ubatch_user: -ub given (the fit keeps it, the reserve then grows with it)
+//   - common_fit_faoff_ubatch_plan: halve ub (not below ub_floor) while !fits(ub)
+//   - common_fit_faoff_pin_ubatch: whether the rule applies (no -ub, flash attention off, both switches on, a GPU)
+//   - common_fit_faoff_ubatch: the smallest n_ubatch such a fit chose since common_fit_faoff_ubatch_reset (0: none)
+void     common_fit_set_ubatch_user(bool ub_user);
+uint32_t common_fit_faoff_ubatch_plan(uint32_t ub, uint32_t ub_floor, const std::function<bool(uint32_t)> & fits);
+bool     common_fit_faoff_pin_ubatch(bool ub_user, bool fa_off, bool keep, bool ub_on, bool has_gpu);
+uint32_t common_fit_faoff_ubatch();
+void     common_fit_faoff_ubatch_reset();
 int64_t common_fit_small_reserve_mib(int64_t cache_mib);
 
 // k17-small (lazy KV): the bytes a fit added to a MoE cache of this final size for the KV cells not backed at load (0: none)
