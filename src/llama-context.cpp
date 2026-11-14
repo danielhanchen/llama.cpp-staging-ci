@@ -13146,7 +13146,14 @@ bool llama_moe_pin_small_set(llama_context * ctx, bool on) {
     return ctx != nullptr && ctx->moe_pin_small_set(on);
 }
 
+static bool llama_moe_cache_fp_log();
+
 void llama_context::moe_request_begin() {
+    // k19-prewexact diagnostic: the state each request starts from (LLAMA_MOE_CACHE_FP_LOG=1)
+    if (moe_cache != nullptr && llama_moe_cache_fp_log()) {
+        llama_synchronize(this);
+        moe_cache->fingerprint("request");
+    }
     // k19-fixD: the banks the tiny-ubatch rule released come back before the per-request reset (LLAMA_MOE_CPU_MISS_PER_REQUEST=1)
     // clears them: hybrid_reset skips a released device, so the request started from the previous request's cache
     if (moe_cache != nullptr && moe_cache->request_resets()) {
@@ -13197,6 +13204,34 @@ bool llama_moe_cache_active(const llama_context * ctx) {
 void llama_moe_cache_stats_pause(llama_context * ctx, bool on) {
     if (ctx != nullptr && ctx->get_moe_cache() != nullptr) {
         ctx->get_moe_cache_mut()->cpu_miss_pause(on);
+    }
+}
+
+bool llama_moe_cache_prewarm_begin(llama_context * ctx) {
+    if (ctx == nullptr || ctx->get_moe_cache() == nullptr) {
+        return false;
+    }
+    llama_synchronize(ctx);
+    return ctx->get_moe_cache_mut()->prewarm_begin();
+}
+
+bool llama_moe_cache_prewarm_end(llama_context * ctx) {
+    if (ctx == nullptr || ctx->get_moe_cache() == nullptr) {
+        return false;
+    }
+    llama_synchronize(ctx);
+    return ctx->get_moe_cache_mut()->prewarm_end();
+}
+
+static bool llama_moe_cache_fp_log() {
+    static const bool on = [] { const char * e = getenv("LLAMA_MOE_CACHE_FP_LOG"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+
+void llama_moe_cache_fingerprint(llama_context * ctx, const char * when) {
+    if (ctx != nullptr && ctx->get_moe_cache() != nullptr && llama_moe_cache_fp_log()) {
+        llama_synchronize(ctx);
+        ctx->get_moe_cache_mut()->fingerprint(when);
     }
 }
 

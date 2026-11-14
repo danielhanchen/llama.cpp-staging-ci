@@ -12866,6 +12866,281 @@ struct llama_moe_cache::impl {
         return std::any_of(seed_counts.begin(), seed_counts.end(), [](const std::vector<int32_t> & c) { return !c.empty(); });
     }
 
+    // k19-prewexact: see llama_moe_cache::prewarm_begin. The state a decode moves, as it was before the server's verify-graph prewarm
+    struct pw_group {
+        moe_cache_lru lru;
+        std::vector<std::vector<int32_t>> slot_maps; // [layers of the group] the host slot maps
+        std::vector<uint8_t> dev[4];                 // the device map, state, counts, scores (raw)
+        std::vector<int32_t> key;                    // the expert each slot holds (the device's key_of if it is newer, else the host's)
+        std::vector<int32_t> ua_dec_key;
+        seed_state sd;
+        uint64_t dev_gen   = 0;
+        bool     dev_newer = false;
+        int32_t  n_slots   = 0;
+    };
+    bool pw_active = false; // a snapshot is held, the rules are quiet (pw_quiet)
+    bool pw_quiet  = false; // no CPU-miss window, timing trial, overlap rule / trial, prompt trial or probe moves
+    bool pw_cm_paused = false;
+    std::vector<pw_group> pw_groups;
+    std::vector<std::vector<int32_t>> pw_seed_counts;
+    std::vector<std::vector<int32_t>> pw_refill;
+    std::vector<std::vector<int32_t>> pw_refill_counts;
+    std::vector<int32_t> pw_seed_ids;
+    stats   pw_stats[6];
+    size_t  pw_n_large = 0;
+    size_t  pw_n_batches = 0;
+    size_t  pw_n_refill_routed = 0;
+    bool    pw_refill_routed_once = false;
+    bool    pw_st_after_large = false;
+    bool    pw_ua_skip = false;
+    int64_t pw_ua_prev_tokens = 0;
+    bool    pw_flags[3] = { false, false, false }; // seed_own, prefill_deferred, prefilled_dev
+
+    static void pw_get(const ggml_tensor * t, std::vector<uint8_t> & out) {
+        out.clear();
+        if (t != nullptr && t->buffer != nullptr) {
+            out.resize(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, out.data(), 0, out.size());
+        }
+    }
+
+    std::vector<int32_t> pw_key(const group & g) const {
+        if (g.dev_newer && g.dev_lookup && g.state != nullptr && g.state->buffer != nullptr) {
+            std::vector<int32_t> k(g.n_slots);
+            ggml_backend_tensor_get(g.state, k.data(), n_hdr*sizeof(int32_t), k.size()*sizeof(int32_t));
+            return k;
+        }
+        return g.lru.key_of;
+    }
+
+    // why the state cannot be taken back exactly (nullptr: it can)
+    const char * pw_refused() const {
+        if (host) {
+            return "a RAM tier is active";
+        }
+        for (const device & d : devices) {
+            if (d.released) {
+                return "the banks are released";
+            }
+        }
+        return nullptr;
+    }
+
+    bool prewarm_begin() {
+        if (pw_active) {
+            return true;
+        }
+        if (const char * why = pw_refused()) {
+            LLAMA_LOG_WARN("llama_moe_cache%s: k19-prewexact: no snapshot before the verify-graph prewarm (%s): the prewarm moves the cache\n", tag, why);
+            return false;
+        }
+        ua_drain();
+        for (const device & d : devices) {
+            if (d.backend != nullptr) {
+                ggml_backend_synchronize(d.backend);
+            }
+        }
+        pw_groups.assign(groups.size(), pw_group());
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            const group & g = groups[ig];
+            pw_group & s = pw_groups[ig];
+            s.lru = g.lru;
+            s.slot_maps.resize(g.layers.size());
+            for (size_t j = 0; j < g.layers.size(); ++j) {
+                const int32_t * p = g.lru.slot_map[g.layers[j]];
+                s.slot_maps[j].assign(p, p + (p != nullptr ? g.lru.n_expert : 0));
+            }
+            pw_get(g.map,    s.dev[0]);
+            pw_get(g.state,  s.dev[1]);
+            pw_get(g.counts, s.dev[2]);
+            pw_get(g.scores, s.dev[3]);
+            s.key        = pw_key(g);
+            s.ua_dec_key = g.ua_dec_key;
+            s.sd         = g.sd;
+            s.dev_gen    = g.dev_gen;
+            s.dev_newer  = g.dev_newer;
+            s.n_slots    = g.n_slots;
+        }
+        pw_seed_counts   = seed_counts;
+        pw_refill        = refill;
+        pw_refill_counts = refill_counts;
+        pw_seed_ids      = seed_ids;
+        pw_stats[0] = stats_small; pw_stats[1] = stats_large; pw_stats[2] = stats_copy;
+        pw_stats[3] = stats_upload; pw_stats[4] = stats_seed; pw_stats[5] = stats_refill;
+        pw_n_large            = n_large_ubatches;
+        pw_n_batches          = n_batches;
+        pw_n_refill_routed    = n_refill_routed;
+        pw_refill_routed_once = refill_routed_once;
+        pw_st_after_large     = st_after_large;
+        pw_ua_skip            = ua_skip;
+        pw_ua_prev_tokens     = ua_prev_tokens;
+        pw_flags[0] = seed_own; pw_flags[1] = prefill_deferred; pw_flags[2] = prefilled_dev;
+        pw_cm_paused = cm_paused;
+        cm_paused    = true; // cm_tick moves nothing (not cpu_miss_pause: its end starts a fresh window)
+        pw_quiet     = true;
+        pw_active    = true;
+        return true;
+    }
+
+    // the experts of the slots that changed come back into the banks, then every saved value; false: refused (the state stays as the
+    // prewarm left it, the rules resume as after the k19-tokcost pause)
+    bool prewarm_end() {
+        if (!pw_active) {
+            return false;
+        }
+        pw_active = false;
+        pw_quiet  = false;
+        const char * why = pw_refused();
+        for (size_t ig = 0; ig < groups.size() && why == nullptr; ++ig) {
+            const group & g = groups[ig];
+            // (the lent slots may differ: the snapshot's lent slots hold no expert and the next large batch lends them as it would
+            // have, with the same refill list)
+            if (g.n_slots != pw_groups[ig].n_slots || g.lru.n_slots != pw_groups[ig].lru.n_slots) {
+                why = "the slot count changed";
+            }
+        }
+        if (why != nullptr) {
+            LLAMA_LOG_WARN("llama_moe_cache%s: k19-prewexact: the cache is not taken back after the verify-graph prewarm (%s)\n", tag, why);
+            cm_paused = pw_cm_paused;
+            cm_have0  = false;
+            cm_nb     = 0;
+            pw_groups.clear();
+            return false;
+        }
+        ua_drain();
+        for (const device & d : devices) {
+            if (d.backend != nullptr) {
+                ggml_backend_synchronize(d.backend);
+            }
+        }
+        size_t n_copied = 0;
+        size_t bytes    = 0;
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            group & g = groups[ig];
+            pw_group & s = pw_groups[ig];
+            ggml_backend_t backend = devices[g.id].backend;
+            const std::vector<int32_t> cur = pw_key(g);
+            const int32_t n_expert = g.lru.n_expert;
+            std::vector<llama_weight_store::region> regions;
+            for (int32_t sl = 0; sl < g.n_slots - s.lru.n_lent; ++sl) {
+                const int32_t k = s.key[sl];
+                if (k < 0 || cur[sl] == k) {
+                    continue;
+                }
+                const int32_t il = k / n_expert;
+                const int32_t e  = k % n_expert;
+                const layer & l = layers[il];
+                for (size_t ip = 0; ip < l.experts.size() && ip < g.banks.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    const size_t nb = w->nb[2];
+                    if (wstore != nullptr && wstore->covers(w)) {
+                        regions.push_back({ w, (size_t) e*nb, g.banks[ip], (size_t) sl*nb, nb });
+                    } else {
+                        ggml_backend_tensor_set_async(backend, g.banks[ip], (const uint8_t *) w->data + (size_t) e*nb, (size_t) sl*nb, nb);
+                    }
+                    bytes += nb;
+                }
+                n_copied++;
+            }
+            if (!regions.empty() && !wstore->upload_batch(backend, regions.data(), regions.size())) {
+                for (const auto & r : regions) {
+                    ggml_backend_tensor_set_async(backend, r.dst, (const uint8_t *) r.src->data + r.src_off, r.dst_off, r.size);
+                }
+            }
+            g.lru = s.lru;
+            for (size_t j = 0; j < g.layers.size(); ++j) {
+                int32_t * p = g.lru.slot_map[g.layers[j]];
+                if (p != nullptr && !s.slot_maps[j].empty()) {
+                    memcpy(p, s.slot_maps[j].data(), s.slot_maps[j].size()*sizeof(int32_t));
+                }
+            }
+            ggml_tensor * ts[4] = { g.map, g.state, g.counts, g.scores };
+            for (int k = 0; k < 4; ++k) {
+                if (ts[k] != nullptr && ts[k]->buffer != nullptr && s.dev[k].size() == ggml_nbytes(ts[k])) {
+                    ggml_backend_tensor_set_async(backend, ts[k], s.dev[k].data(), 0, s.dev[k].size());
+                }
+            }
+            g.ua_dec_key = s.ua_dec_key;
+            g.sd         = s.sd;
+            g.dev_gen    = s.dev_gen;
+            g.dev_newer  = s.dev_newer;
+            ggml_backend_synchronize(backend);
+        }
+        seed_counts   = pw_seed_counts;
+        refill        = pw_refill;
+        refill_counts = pw_refill_counts;
+        seed_ids      = pw_seed_ids;
+        stats_small = pw_stats[0]; stats_large = pw_stats[1]; stats_copy = pw_stats[2];
+        stats_upload = pw_stats[3]; stats_seed = pw_stats[4]; stats_refill = pw_stats[5];
+        n_large_ubatches   = pw_n_large;
+        n_batches          = pw_n_batches;
+        n_refill_routed    = pw_n_refill_routed;
+        refill_routed_once = pw_refill_routed_once;
+        st_after_large     = pw_st_after_large;
+        ua_skip            = pw_ua_skip;
+        ua_prev_tokens     = pw_ua_prev_tokens;
+        seed_own = pw_flags[0]; prefill_deferred = pw_flags[1]; prefilled_dev = pw_flags[2];
+        cm_paused          = pw_cm_paused; // the window goes on where it was (its counters are back too)
+        pw_groups.clear();
+        LLAMA_LOG_INFO("llama_moe_cache%s: k19-prewexact: the cache is back as before the verify-graph prewarm: %zu slots got their expert "
+            "back (%.1f MiB), slot state, counters and rule state restored (LLAMA_SPEC_PREWARM_EXACT=0: off)\n", tag, n_copied, bytes/1048576.0);
+        return true;
+    }
+
+    // LLAMA_MOE_CACHE_FP_LOG=1 (diagnostic): hashes of the device state, the host LRU, the rule state and the bookkeeping
+    void fingerprint(const char * when) {
+        auto h0 = []() { return (uint64_t) 1469598103934665603ULL; };
+        auto mixb = [](uint64_t & h, const void * p, size_t n) {
+            const uint8_t * b = (const uint8_t *) p;
+            for (size_t i = 0; i < n; ++i) {
+                h = (h ^ b[i])*1099511628211ULL;
+            }
+        };
+        auto mixv = [&](uint64_t & h, auto v) { mixb(h, &v, sizeof(v)); };
+        uint64_t hd = h0(), hl = h0(), hr = h0(), ha = h0();
+        for (const device & d : devices) {
+            if (d.backend != nullptr) {
+                ggml_backend_synchronize(d.backend);
+            }
+        }
+        std::vector<uint8_t> buf;
+        for (const group & g : groups) {
+            const ggml_tensor * ts[4] = { g.map, g.state, g.counts, g.scores };
+            for (int k = 0; k < 4; ++k) {
+                pw_get(ts[k], buf);
+                mixb(hd, buf.data(), buf.size());
+            }
+            mixb(hl, g.lru.key_of.data(), g.lru.key_of.size()*sizeof(int32_t));
+            mixb(hl, g.lru.prev.data(),   g.lru.prev.size()*sizeof(int32_t));
+            mixb(hl, g.lru.next.data(),   g.lru.next.size()*sizeof(int32_t));
+            mixb(hl, g.lru.scores.data(), g.lru.scores.size()*sizeof(int32_t));
+            mixv(hl, g.lru.head); mixv(hl, g.lru.tail); mixv(hl, g.lru.w); mixv(hl, g.lru.n_lent); mixv(hl, g.lru.n_core);
+            for (int32_t il : g.layers) {
+                if (g.lru.slot_map[il] != nullptr) {
+                    mixb(hl, g.lru.slot_map[il], g.lru.n_expert*sizeof(int32_t));
+                }
+            }
+            mixv(ha, g.lru.gen); mixv(ha, g.dev_gen); mixv(ha, (int) g.dev_newer); mixv(ha, g.n_slots);
+        }
+        mixv(hr, (int) cm); mixv(hr, (int) hybrid); mixb(hr, cm_on.data(), cm_on.size()); mixv(hr, cm_rate); mixv(hr, (int) cm_measured);
+        mixv(hr, (int) cm_have0); mixv(hr, cm_nb); mixv(hr, cm_win); mixv(hr, cm_seen); mixv(hr, cm_nwin); mixv(hr, cm_gen);
+        mixv(hr, cmt_wait); mixv(hr, cmt_done); mixv(hr, cmt_n); mixv(hr, (int) cmw_on); mixv(hr, cmw_n); mixv(hr, cm_n_prompt);
+        mixv(hr, cm_n_small); mixb(hr, cm_c0, sizeof(cm_c0)); mixv(hr, (int) ov_live); mixv(hr, ov_seen); mixv(hr, (int) ov_have0);
+        mixv(hr, ov_n1); mixv(hr, ov_done); mixv(hr, ov_wait); mixv(hr, win_done); mixv(hr, win_wait); mixv(hr, (int) hybrid_probe);
+        mixv(hr, cm_recal_wait); mixv(hr, (int) cm_paused);
+        const stats * st[6] = { &stats_small, &stats_large, &stats_copy, &stats_upload, &stats_seed, &stats_refill };
+        for (const stats * s : st) {
+            mixv(ha, s->hits); mixv(ha, s->misses); mixv(ha, s->bytes); mixv(ha, s->calls);
+        }
+        mixv(ha, n_large_ubatches); mixv(ha, n_batches); mixv(ha, ua_prev_tokens);
+        mixv(ha, (int) seed_own); mixv(ha, (int) prefill_deferred); mixv(ha, (int) prefilled_dev);
+        for (const auto & v : seed_counts)   { mixb(ha, v.data(), v.size()*sizeof(int32_t)); mixv(ha, v.size()); }
+        for (const auto & v : refill)        { mixb(ha, v.data(), v.size()*sizeof(int32_t)); mixv(ha, v.size()); }
+        for (const auto & v : refill_counts) { mixb(ha, v.data(), v.size()*sizeof(int32_t)); mixv(ha, v.size()); }
+        LLAMA_LOG_INFO("llama_moe_cache%s: k19-prewexact fp %s: device %016llx lru %016llx rules %016llx aux %016llx\n", tag, when,
+            (unsigned long long) hd, (unsigned long long) hl, (unsigned long long) hr, (unsigned long long) ha);
+    }
+
     void log_stats() {
         if (pin_layers_want > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: pinned expert ranges: %zu of %zu layers, %.2f MiB\n", tag, pin_layers, pin_layers_want, pin_bytes/1048576.0);
@@ -13297,7 +13572,7 @@ bool llama_moe_cache::force_large() const {
 }
 
 bool llama_moe_cache::recal_pending() const {
-    return pimpl->cm && pimpl->cm_cal && pimpl->cm_recal_pending;
+    return pimpl->cm && pimpl->cm_cal && pimpl->cm_recal_pending && !pimpl->pw_quiet;
 }
 
 bool llama_moe_cache::recal(ggml_backend_t backend_cpu, bool (*abort)(void *), void * abort_data) {
@@ -13316,7 +13591,7 @@ bool llama_moe_cache::recal(ggml_backend_t backend_cpu, bool (*abort)(void *), v
 }
 
 bool llama_moe_cache::hybrid_probe_pending() const {
-    return pimpl->hybrid && pimpl->hybrid_probe;
+    return pimpl->hybrid && pimpl->hybrid_probe && !pimpl->pw_quiet;
 }
 
 void llama_moe_cache::hybrid_probe(ggml_backend_t backend_cpu) {
@@ -13406,7 +13681,7 @@ size_t llama_moe_cache::core_dropped_bytes() const {
 }
 
 bool llama_moe_cache::overlap_trial_pending() const {
-    return pimpl->ov_pending();
+    return pimpl->ov_pending() && !pimpl->pw_quiet;
 }
 
 bool llama_moe_cache::overlap_tick_sync() const {
@@ -13418,6 +13693,9 @@ void llama_moe_cache::overlap_tick(int64_t n_tokens) {
 }
 
 bool llama_moe_cache::hybrid_window_pending() const {
+    if (pimpl->pw_quiet) {
+        return false;
+    }
     if (pimpl->cm) {
         return pimpl->cmt_pending();
     }
@@ -13429,7 +13707,7 @@ bool llama_moe_cache::hybrid_tick_sync() const {
 }
 
 bool llama_moe_cache::prompt_auto_pending() const {
-    return pimpl->pt_pending();
+    return pimpl->pt_pending() && !pimpl->pw_quiet;
 }
 
 void llama_moe_cache::prompt_auto_tick(int64_t n_tokens) {
@@ -13923,6 +14201,18 @@ void llama_moe_cache::clear_seed_counts() {
 
 bool llama_moe_cache::has_seed_counts() const {
     return pimpl->has_seed_counts();
+}
+
+bool llama_moe_cache::prewarm_begin() {
+    return pimpl->prewarm_begin();
+}
+
+bool llama_moe_cache::prewarm_end() {
+    return pimpl->prewarm_end();
+}
+
+void llama_moe_cache::fingerprint(const char * when) {
+    pimpl->fingerprint(when);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
