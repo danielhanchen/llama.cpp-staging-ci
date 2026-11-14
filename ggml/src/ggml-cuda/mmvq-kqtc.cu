@@ -36,7 +36,7 @@ struct kqtc_args {
     int          n_mat;
     const int  * y;              // q8_1 activations as ints (a block_q8_1 is 9 ints)
     int64_t      stride_col_y;   // in block_q8_1
-    int64_t      stride_col_dst; // in floats
+    int64_t      stride_col_dst[GGML_CUDA_MMVQ_MULTI_MAX]; // in floats, per matrix (a matrix's dst rows = its own rows)
     int64_t      stride_row_x;   // in bytes
     int          nunits;         // 256-value units along K
     int          nb32;           // 32-value blocks along K (Q8_0 tail)
@@ -306,6 +306,7 @@ static __global__ void __launch_bounds__(nw*WARP_SIZE, 16/nw) mul_mat_vec_q_kqtc
     const int    nrows = m2 ? args.nrows[2] : m1 ? args.nrows[1] : args.nrows[0];
     const char * x     = m2 ? args.x[2] : m1 ? args.x[1] : args.x[0];
     float      * dst   = m2 ? args.dst[2] : m1 ? args.dst[1] : args.dst[0];
+    const int64_t stride_col_dst = m2 ? args.stride_col_dst[2] : m1 ? args.stride_col_dst[1] : args.stride_col_dst[0];
     const int    ncols = args.ncols;
 
     // columns >= ncols stay zero (their results are not written)
@@ -407,7 +408,7 @@ static __global__ void __launch_bounds__(nw*WARP_SIZE, 16/nw) mul_mat_vec_q_kqtc
         for (int ww = 1; ww < nw; ++ww) {
             sum += s_red[ww][i];
         }
-        dst[col*args.stride_col_dst + row0 + row] = sum;
+        dst[col*stride_col_dst + row0 + row] = sum;
     }
 #else
     GGML_UNUSED(args);
@@ -517,7 +518,7 @@ static void kqtc_launch_type(const kqtc_args & args, const int nblocks, const in
 }
 
 bool ggml_cuda_mmvq_kqtc_launch(const ggml_type type, const int n_mat, const void * const * vx, float * const * dst, const int64_t * nrows,
-        const int64_t stride_row_x, const void * vy, const int64_t stride_col_y, const int64_t stride_col_dst, const int64_t ncols_x,
+        const int64_t stride_row_x, const void * vy, const int64_t stride_col_y, const int64_t * stride_col_dst, const int64_t ncols_x,
         const int64_t ncols_dst, cudaStream_t stream) {
 #if defined(KQTC_ENABLED)
     GGML_ASSERT(n_mat >= 1 && n_mat <= GGML_CUDA_MMVQ_MULTI_MAX);
@@ -550,12 +551,12 @@ bool ggml_cuda_mmvq_kqtc_launch(const ggml_type type, const int n_mat, const voi
         args.dst[i]    = dst[i];
         args.nrows[i]  = (int) nrows[i];
         args.block0[i] = nblocks;
+        args.stride_col_dst[i] = stride_col_dst[i];
         nblocks += (int) ((nrows[i] + 16*ntiles - 1) / (16*ntiles));
     }
     args.n_mat          = n_mat;
     args.y              = (const int *) vy;
     args.stride_col_y   = stride_col_y;
-    args.stride_col_dst = stride_col_dst;
     args.stride_row_x   = stride_row_x;
     args.nunits         = nunits;
     args.nb32           = nb32;

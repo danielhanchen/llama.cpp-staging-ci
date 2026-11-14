@@ -91,10 +91,15 @@ static std::vector<uint8_t> make_rows(ggml_type type, int K, int64_t N, uint32_t
 struct shp {
     int  K, N;
     bool pair; // two products of one activation (the multi-matrix launch)
+    int  N2 = 0; // rows of the second matrix of a pair (0: N), e.g. Q (6144 rows) and K (1024) of one activation
 };
 
+// rows of matrix i of a shape, and the output floats of a T-column case (the matrices back to back)
+static int shp_rows(const shp & s, int i) { return i == 0 || s.N2 == 0 ? s.N : s.N2; }
+static size_t shp_out(const shp & s, int T) { return (size_t) T*(shp_rows(s, 0) + (s.pair ? shp_rows(s, 1) : 0)); }
+
 static const shp test_shapes[] = {
-    { 5120, 64, false }, { 17408, 40, false }, { 6144, 37, false }, { 256, 19, false }, { 5120, 48, true }, { 1280, 21, true },
+    { 5120, 64, false }, { 17408, 40, false }, { 6144, 37, false }, { 256, 19, false }, { 5120, 48, true }, { 1280, 21, true }, { 5120, 48, true, 16 }, { 6144, 21, true, 64 },
     { 320, 33, false }, { 1056, 16, false }, // K not a multiple of 256 (Q8_0 only)
 };
 
@@ -135,7 +140,7 @@ static const host_data & get_host(ggml_type type, int si) {
         const uint32_t seed = 1000u*(uint32_t) type + 17u*(uint32_t) si;
         h.w[0] = make_rows(type, s.K, s.N, seed + 1);
         if (s.pair) {
-            h.w[1] = make_rows(type, s.K, s.N, seed + 2);
+            h.w[1] = make_rows(type, s.K, shp_rows(s, 1), seed + 2);
         }
         h.x.resize((size_t) 8*s.K);
         std::mt19937 gen(seed + 3);
@@ -156,13 +161,13 @@ struct mm_graph {
     std::vector<ggml_tensor *> out;
 
     bool build(ggml_backend_t be, ggml_type type, int K, int N, bool pair, int T, bool flagged, int L,
-               const std::vector<uint8_t> * w, const float * xh) {
+               const std::vector<uint8_t> * w, const float * xh, int N2 = 0) {
         const int nw = pair ? 2 : 1;
         ggml_init_params wp = { (size_t) (nw*L + 4) * ggml_tensor_overhead(), nullptr, true };
         wctx = ggml_init(wp);
         std::vector<ggml_tensor *> a((size_t) nw*L);
-        for (auto & t : a) {
-            t = ggml_new_tensor_2d(wctx, type, K, N);
+        for (size_t i = 0; i < a.size(); ++i) {
+            a[i] = ggml_new_tensor_2d(wctx, type, K, i % nw == 1 && N2 > 0 ? N2 : N);
         }
         wbuf = ggml_backend_alloc_ctx_tensors(wctx, be);
         if (!wbuf) {
@@ -228,7 +233,7 @@ static int run_child(ggml_backend_t be, const char * path) {
         const host_data & h = get_host(c.type, c.shape);
         const int logs0 = n_logs;
         mm_graph mg;
-        if (!mg.build(be, c.type, s.K, s.N, s.pair, c.T, c.flagged, 1, h.w, h.x.data())) {
+        if (!mg.build(be, c.type, s.K, s.N, s.pair, c.T, c.flagged, 1, h.w, h.x.data(), s.N2)) {
             fprintf(stderr, "build failed %s K %d N %d T %d\n", ggml_type_name(c.type), s.K, s.N, c.T);
             return 1;
         }
@@ -367,10 +372,12 @@ static std::vector<double> reference(ggml_type type, int si, int T) {
     const auto * tr = ggml_get_type_traits(type);
     const size_t rb = ggml_row_size(type, s.K);
     const int nw = s.pair ? 2 : 1;
-    std::vector<double> out((size_t) nw*T*s.N);
+    std::vector<double> out(shp_out(s, T));
     std::vector<float> wr(s.K);
+    size_t base = 0;
     for (int i = 0; i < nw; ++i) {
-        for (int r = 0; r < s.N; ++r) {
+        const int N = shp_rows(s, i);
+        for (int r = 0; r < N; ++r) {
             tr->to_float(h.w[i].data() + (size_t) r*rb, wr.data(), s.K);
             for (int c = 0; c < T; ++c) {
                 double acc = 0.0;
@@ -378,9 +385,10 @@ static std::vector<double> reference(ggml_type type, int si, int T) {
                 for (int k = 0; k < s.K; ++k) {
                     acc += (double) wr[k]*xc[k];
                 }
-                out[(size_t) i*T*s.N + (size_t) c*s.N + r] = acc;
+                out[base + (size_t) c*N + r] = acc;
             }
         }
+        base += (size_t) T*N;
     }
     return out;
 }
@@ -532,8 +540,7 @@ int main(int argc, char ** argv) {
     for (size_t ci = 0; ci < ncase; ++ci) {
         const mm_case & c = cases[ci];
         const shp & s = test_shapes[c.shape];
-        const int nw = s.pair ? 2 : 1;
-        const size_t n = (size_t) nw*c.T*s.N;
+        const size_t n = shp_out(s, c.T);
         const std::vector<double> ref = reference(c.type, c.shape, c.T);
         for (int i = 0; i < nm; ++i) {
             if (!is_lever(i)) {
@@ -626,7 +633,9 @@ int main(int argc, char ** argv) {
         const float * b = (const float *) (dumps[p.mode].data() + p8->off);
         bool same = true;
         for (int i = 0; i < nw && same; ++i) {
-            same = memcmp(a + (size_t) i*p.T*s.N, b + (size_t) i*8*s.N, (size_t) p.T*s.N*sizeof(float)) == 0;
+            const size_t oa = i == 0 ? 0 : (size_t) p.T*shp_rows(s, 0);
+            const size_t ob = i == 0 ? 0 : (size_t) 8*shp_rows(s, 0);
+            same = memcmp(a + oa, b + ob, (size_t) p.T*shp_rows(s, i)*sizeof(float)) == 0;
         }
         if (is_few(p.mode)) {
             n_inv_few++;

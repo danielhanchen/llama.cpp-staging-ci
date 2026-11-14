@@ -19,8 +19,8 @@ bool ggml_cuda_mmvq_kqtc_ok(ggml_type type, int64_t ncols_x, int64_t ncols_dst, 
 bool ggml_cuda_mmvq_kqtc_reassoc_ok();
 
 // n_mat (1..GGML_CUDA_MMVQ_MULTI_MAX) matrices of one type and K (ncols_x) with row stride stride_row_x bytes, over the q8_1 activation
-// vy (column c at vy + c*stride_col_y blocks), dst[m] column c at dst[m] + c*stride_col_dst. Returns false (nothing launched) when the
-// layout rules it out (alignment).
+// vy (column c at vy + c*stride_col_y blocks), dst[m] column c at dst[m] + c*stride_col_dst[m]. Returns false (nothing launched) when
+// the layout rules it out (alignment).
 bool ggml_cuda_mmvq_kqtc_launch(ggml_type type, int n_mat, const void * const * vx, float * const * dst, const int64_t * nrows,
-    int64_t stride_row_x, const void * vy, int64_t stride_col_y, int64_t stride_col_dst, int64_t ncols_x, int64_t ncols_dst,
+    int64_t stride_row_x, const void * vy, int64_t stride_col_y, const int64_t * stride_col_dst, int64_t ncols_x, int64_t ncols_dst,
     cudaStream_t stream);

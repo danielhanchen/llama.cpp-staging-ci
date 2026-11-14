@@ -4750,7 +4750,8 @@ void ggml_cuda_mul_mat_vec_q(
         const void * kx[1] = { src0->data };
         float      * kd[1] = { dst_d };
         const int64_t kr[1] = { ne01 };
-        if (ggml_cuda_mmvq_kqtc_launch(src0->type, 1, kx, kd, kr, nb01, src1_q8_1, stride_col_y, stride_col_dst, ne00, ncols_dst, stream)) {
+        const int64_t ks[1] = { stride_col_dst };
+        if (ggml_cuda_mmvq_kqtc_launch(src0->type, 1, kx, kd, kr, nb01, src1_q8_1, stride_col_y, ks, ne00, ncols_dst, stream)) {
             return;
         }
     }
@@ -4823,12 +4824,14 @@ void ggml_cuda_mul_mat_vec_q_multi(ggml_backend_cuda_context & ctx, const int n,
         const void * kx[GGML_CUDA_MMVQ_MULTI_MAX] = {};
         float      * kd[GGML_CUDA_MMVQ_MULTI_MAX] = {};
         int64_t      kr[GGML_CUDA_MMVQ_MULTI_MAX] = {};
+        int64_t      ks[GGML_CUDA_MMVQ_MULTI_MAX] = {};
         for (int m = 0; m < n; ++m) {
             kx[m] = src0[m]->data;
             kd[m] = (float *) dst[m]->data;
             kr[m] = src0[m]->ne[1];
+            ks[m] = dst[m]->nb[1] / sizeof(float);
         }
-        if (ggml_cuda_mmvq_kqtc_launch(type, n, kx, kd, kr, src0[0]->nb[1], src1_q8_1, stride_col_y, dst[0]->nb[1] / sizeof(float), ne10, ne11,
+        if (ggml_cuda_mmvq_kqtc_launch(type, n, kx, kd, kr, src0[0]->nb[1], src1_q8_1, stride_col_y, ks, ne10, ne11,
                 stream)) {
             return;
         }
