@@ -442,6 +442,12 @@ bool llama_moe_profile_write(const std::string & path, size_t n_layer, const std
 // the order the RAM tier is filled in at load: the most used first over every layer (heat descending), ties in file order
 std::vector<llama_moe_profile_entry> llama_moe_profile_ram_order(const std::vector<llama_moe_profile_entry> & entries);
 
+// k19-mgpu2: the experts a group's n_avail device slots take at load from a routing profile: the hottest (layer, expert) pairs of the
+// group's layers (heat > 0, heat descending, ties in file order), then the lowest ids not taken, one layer after the other in turn.
+// [i] = the experts of layers[i] in id order; *n_prof / *n_pad (may be null) count the two kinds
+std::vector<std::vector<int32_t>> llama_moe_profile_pick(const std::vector<llama_moe_profile_entry> & entries, const std::vector<int32_t> & layers,
+        int32_t n_expert, int32_t n_avail, size_t * n_prof, size_t * n_pad);
+
 class llama_moe_host_cache;
 
 // reserves free RAM-tier slots (never evicting) for the entries in order, those want(il, e) accepts, each layout up to its slots; calls

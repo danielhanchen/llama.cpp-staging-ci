@@ -3599,6 +3599,11 @@ struct llama_moe_cache::impl {
                 aps.rebuilds, aps.marked, (unsigned long long) aps.hot_taken, (unsigned long long) aps.cold_taken,
                 (unsigned long long) aps.cold_refused, (unsigned long long) aps.pf_hot, (unsigned long long) aps.pf_cold);
         }
+        if (rps.used || rp_rec) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-mgpu2: resident device prefill %s (%zu profile entries read, %zu taken, %zu by id); decode routing "
+                "%s: %llu routed experts in %llu host lookups\n", tag, rps.used ? "from the profile" : "by id", rps.read, rps.taken, rps.padded,
+                rp_rec ? "recorded" : "not recorded", (unsigned long long) rps.counted, (unsigned long long) rps.lookups);
+        }
         ua_shutdown();
         log_stats();
         if (core_mode != 0) {
@@ -4005,7 +4010,9 @@ struct llama_moe_cache::impl {
                 (m_res >= 1 || (double) n_hold >= min_frac*(double) n_streamed);
             if (resident_mode) {
                 if (!prefilled_dev && (e_dp == nullptr || atoi(e_dp) != 0)) {
-                    prefill();
+                    if (!rp_prefill()) { // k19-mgpu2: the hottest experts of the earlier launches' decodes, when recorded
+                        prefill();
+                    }
                 }
                 prefill_deferred = false;
                 LLAMA_LOG_INFO("%s: MoE cache resident mode: %zu RAM slots + %zu device slots for the %zu streamed experts: device slots %s, "
@@ -4018,6 +4025,7 @@ struct llama_moe_cache::impl {
             }
         }
         ap_init();
+        rp_rec = resident_mode && rp_on() && ap_rec && !ap_cnt.empty(); // k19-mgpu2: the decode routing goes into the profile
         prefill_resident();
         LLAMA_LOG_INFO("%s: MoE host cache on: %s, budget %.1f MiB (%s) for %.1f MiB of streamed experts (of %.1f MiB mapped), %.1f MiB in device slots, "
                 "the experts of %.1f tokens, MemAvailable %.1f MiB, pinned on first use (%s)%s (LLAMA_MOE_HOST_CACHE=0 off)\n", __func__,
@@ -4402,6 +4410,107 @@ struct llama_moe_cache::impl {
         size_t   loaded = 0, ubatches = 0, saves = 0, save_fail = 0, targets = 0, marked = 0, rebuilds = 0;
         uint64_t routings = 0, cold_refused = 0, cold_taken = 0, hot_taken = 0, pf_hot = 0, pf_cold = 0, pf_stale = 0;
     } aps;
+
+    // k19-mgpu2 (LLAMA_MOE_RESIDENT_PROF, unset / 1 = on, 0 = off): the device slots of resident mode start from the decode routing of
+    // earlier launches. Resident mode (the exclusive RAM tier and the device slots hold every streamed expert, e.g. Flash-Next UD-IQ1_S on
+    // Kaggle 2x T4) never seeds the device cache from prompts (k18-lowram) and filled each layer's lowest expert ids at load, so a decode
+    // paid its working set one miss at a time: an upload from RAM plus the copy back of the victim, ~26 misses per token over the first
+    // ~100 tokens of a chat (22 tok/s, then 33-34 once the CLOCK had converged). With it:
+    //  - the host lookups of small batches (decode, verify windows; the host reads their routing anyway) add each routed expert to the
+    //    autoprof heat (k19-autoprof file, previous launches at half weight), written at the server's idle point and at exit;
+    //  - at load, with that file, each group's slots take its hottest (layer, expert) pairs over all its layers (Strata's --expert-profile
+    //    order), the rest of the slots the lowest ids as before; the RAM tier takes every other expert (unchanged).
+    // Placement only: every expert is computed by the same kernels wherever it was copied from; the text changes only through the route
+    // tail skip (a skipped expert is a missing one, so it follows the residency; LLAMA_MOE_ROUTE_TAIL_SKIP=0: identical text). A first
+    // launch (no file) fills by id as before and records. LLAMA_MOE_AUTOPROF=0 / 2 / 3 also gate it (no file / record only / read only).
+    bool rp_rec = false; // host lookups count the routing of small batches into ap_cnt (resident mode, recording)
+    struct {
+        uint64_t counted = 0, lookups = 0;
+        size_t   read = 0, taken = 0, padded = 0;
+        bool     used = false;
+    } rps;
+
+    static bool rp_on() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_MOE_RESIDENT_PROF");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        return on;
+    }
+
+    // resident mode's device prefill from the autoprof file (see rp_rec); false = no file, the caller fills by id (prefill)
+    bool rp_prefill() {
+        if (!rp_on() || ap_mode == 0 || ap_file.empty() || !llama_autoprof::uses(ap_mode) || !profile_file.empty() || prefilled_dev) {
+            return false;
+        }
+        std::vector<prof_entry> prof;
+        if (!llama_moe_profile_load(ap_file, profile_n_expert(), prof)) {
+            LLAMA_LOG_INFO("%s: k19-mgpu2: no routing profile at %s yet: resident device slots by expert id, this launch records the decode "
+                "routing (LLAMA_MOE_RESIDENT_PROF=0 off)\n", __func__, ap_file.c_str());
+            return false;
+        }
+        rps.read = prof.size();
+        size_t n_fill  = 0;
+        size_t n_bytes = 0;
+        for (group & g : groups) {
+            if (g.n_slots == 0 || g.layers.empty()) {
+                continue;
+            }
+            size_t n_prof = 0;
+            size_t n_pad  = 0;
+            const std::vector<std::vector<int32_t>> pick = llama_moe_profile_pick(prof, g.layers, g.lru.n_expert,
+                g.n_slots - g.lru.n_lent - g.lru.n_core, &n_prof, &n_pad);
+            rps.taken  += n_prof;
+            rps.padded += n_pad;
+            for (size_t i = 0; i < g.layers.size(); ++i) {
+                const int32_t il = g.layers[i];
+                const std::vector<int32_t> & ids = pick[i];
+                size_t n_hit = 0;
+                if (ids.empty() || !g.lru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
+                    continue;
+                }
+                const layer & l = layers[il];
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    const size_t expert_size = w->nb[2];
+                    for (size_t j = 0; j < fills.size();) {
+                        size_t m = 1;
+                        while (j + m < fills.size() && fills[j + m].expert == fills[j].expert + (int32_t) m && fills[j + m].slot == fills[j].slot + (int32_t) m) {
+                            m++;
+                        }
+                        ggml_backend_tensor_set(g.banks[ip], (const uint8_t *) w->data + fills[j].expert*expert_size, fills[j].slot*expert_size, m*expert_size);
+                        n_bytes += m*expert_size;
+                        j += m;
+                    }
+                }
+                n_fill += fills.size();
+            }
+        }
+        if (n_fill == 0) {
+            return false;
+        }
+        prefilled_dev = true;
+        rps.used = true;
+        LLAMA_LOG_INFO("%s: k19-mgpu2: resident device slots from the routing profile %s: %zu experts (%.2f MiB), %zu hottest of %zu profile "
+            "entries + %zu by id (LLAMA_MOE_RESIDENT_PROF=0 off)\n", __func__, ap_file.c_str(), n_fill, n_bytes/1048576.0, rps.taken, rps.read, rps.padded);
+        return true;
+    }
+
+    // a host lookup of a small batch read its routing: each routed expert adds 1 to the heat (see rp_rec)
+    void rp_count(int32_t il, const std::vector<int32_t> & v) {
+        if (il < 0 || (size_t) il >= ap_cnt.size()) {
+            return;
+        }
+        std::vector<float> & c = ap_cnt[il];
+        for (const int32_t e : v) {
+            if (e >= 0 && (size_t) e < c.size()) {
+                c[e] += 1.0f;
+                ap_new++;
+                rps.counted++;
+            }
+        }
+        rps.lookups++;
+    }
 
     // on the device, or (before the device prefill ran) one of the experts it will put there: the lowest ids of each layer, an equal
     // share of the group's slots per layer (see prefill), so the page-cache fill does not copy experts the device is about to hold
@@ -12089,6 +12198,11 @@ struct llama_moe_cache::impl {
             t_prof = t;
         }
 
+        // k19-mgpu2: the routing of a decode / verify window, for the next launch's resident device prefill (see rp_rec)
+        if (rp_rec && tiered && ids.size() <= (size_t) 8*n_expert_used) {
+            rp_count(il, ids);
+        }
+
         if (tiered && hprof_prompted && !hprof_q.empty()) {
             hprof_wait_routed(il);
         }
@@ -13994,6 +14108,63 @@ std::vector<llama_moe_profile_entry> llama_moe_profile_ram_order(const std::vect
     std::vector<llama_moe_profile_entry> v = entries;
     std::stable_sort(v.begin(), v.end(), [](const llama_moe_profile_entry & a, const llama_moe_profile_entry & b) { return a.heat > b.heat; });
     return v;
+}
+
+std::vector<std::vector<int32_t>> llama_moe_profile_pick(const std::vector<llama_moe_profile_entry> & entries, const std::vector<int32_t> & layers,
+        int32_t n_expert, int32_t n_avail, size_t * n_prof, size_t * n_pad) {
+    const size_t n_layer = layers.size();
+    std::vector<std::vector<uint8_t>> take(n_layer, std::vector<uint8_t>(std::max<int32_t>(0, n_expert), 0));
+    std::map<int32_t, size_t> pos;
+    for (size_t i = 0; i < n_layer; ++i) {
+        pos.emplace(layers[i], i);
+    }
+    size_t np = 0;
+    size_t nd = 0;
+    int32_t n_take = 0;
+    for (const llama_moe_profile_entry & p : llama_moe_profile_ram_order(entries)) {
+        if (n_take >= n_avail) {
+            break;
+        }
+        const auto it = pos.find(p.il);
+        if (it == pos.end() || p.e < 0 || p.e >= n_expert || !(p.heat > 0.0f) || take[it->second][p.e]) {
+            continue;
+        }
+        take[it->second][p.e] = 1;
+        n_take++;
+        np++;
+    }
+    std::vector<int32_t> next(n_layer, 0);
+    for (bool any = true; n_take < n_avail && any;) {
+        any = false;
+        for (size_t i = 0; i < n_layer && n_take < n_avail; ++i) {
+            int32_t & e = next[i];
+            while (e < n_expert && take[i][e]) {
+                e++;
+            }
+            if (e < n_expert) {
+                take[i][e] = 1;
+                e++;
+                n_take++;
+                nd++;
+                any = true;
+            }
+        }
+    }
+    std::vector<std::vector<int32_t>> out(n_layer);
+    for (size_t i = 0; i < n_layer; ++i) {
+        for (int32_t e = 0; e < n_expert; ++e) {
+            if (take[i][e]) {
+                out[i].push_back(e);
+            }
+        }
+    }
+    if (n_prof != nullptr) {
+        *n_prof = np;
+    }
+    if (n_pad != nullptr) {
+        *n_pad = nd;
+    }
+    return out;
 }
 
 size_t llama_moe_profile_reserve(llama_moe_host_cache & host, const std::vector<llama_moe_profile_entry> & order,
