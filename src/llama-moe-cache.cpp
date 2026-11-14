@@ -1151,6 +1151,9 @@ struct llama_moe_cache::impl {
     int      cm_nb    = 0;     // batches in the window
     int      cm_win   = cm_win1;
     bool     cm_have0 = false;
+    // k19-tokcost: the server's verify-graph prewarm (dummy windows of one repeated token) is not a decode: while paused, its batches
+    // count in no miss-rate window (one such window measured 0.7% and turned the host path off for the next request: fn4 24 GB)
+    bool     cm_paused = false;
     uint64_t cm_c0[3] = { 0, 0, 0 }; // hits, fetched, left to the host at the start of the window
     int      cm_nwin  = 0;
     double   cm_rate  = -1.0;  // miss rate of the distinct experts looked up in the last window
@@ -9252,12 +9255,12 @@ struct llama_moe_cache::impl {
     }
 
     bool cm_tick_reads(int64_t n_tokens) const {
-        return cm && cm_cal && !cm_force && cm_counted(n_tokens) && cm_seen >= cm_skip && (!cm_have0 || cm_nb + 1 >= cm_win);
+        return cm && cm_cal && !cm_force && !cm_paused && cm_counted(n_tokens) && cm_seen >= cm_skip && (!cm_have0 || cm_nb + 1 >= cm_win);
     }
 
     // before the graph of every ubatch (backends synchronized when cm_tick_reads)
     void cm_tick(int64_t n_tokens) {
-        if (!cm || !cm_cal || !cm_counted(n_tokens)) {
+        if (!cm || !cm_cal || cm_paused || !cm_counted(n_tokens)) {
             return;
         }
         if (cm_share_of(n_tokens) < 1.0f) {
@@ -12816,6 +12819,18 @@ void llama_moe_cache::cpu_miss_tick(int64_t n_tokens) {
         memcpy(prev_c, c, sizeof(c));
     }
     pimpl->cm_tick(n_tokens);
+}
+
+void llama_moe_cache::cpu_miss_pause(bool on) {
+    if (pimpl->cm_paused == on) {
+        return;
+    }
+    pimpl->cm_paused = on;
+    if (!on) {
+        // the next counted batch starts a fresh window: nothing the paused batches moved is in it
+        pimpl->cm_have0 = false;
+        pimpl->cm_nb    = 0;
+    }
 }
 
 bool llama_moe_cache::small_batch(int64_t n_tokens) const {

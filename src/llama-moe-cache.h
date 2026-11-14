@@ -141,6 +141,8 @@ public:
     int host_mode() const;
     bool cpu_miss_tick_sync(int64_t n_tokens) const;
     void cpu_miss_tick(int64_t n_tokens);
+    // k19-tokcost: while on, small batches move no CPU-miss window (the server's verify-graph prewarm); off starts a fresh window
+    void cpu_miss_pause(bool on);
     // the ubatch of n_tokens is looked up on the device like a small batch: at most n_small_max tokens, or a short prompt whose missing
     // experts the host computes (the large batch path, its copies and its seed do not apply)
     bool small_batch(int64_t n_tokens) const;

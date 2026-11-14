@@ -13112,6 +13112,12 @@ bool llama_moe_cache_active(const llama_context * ctx) {
     return ctx != nullptr && ctx->moe_cache_active();
 }
 
+void llama_moe_cache_stats_pause(llama_context * ctx, bool on) {
+    if (ctx != nullptr && ctx->get_moe_cache() != nullptr) {
+        ctx->get_moe_cache_mut()->cpu_miss_pause(on);
+    }
+}
+
 int32_t llama_moe_host_mode(const llama_context * ctx) {
     return ctx != nullptr && ctx->get_moe_cache() != nullptr ? ctx->get_moe_cache()->host_mode() : 0;
 }
