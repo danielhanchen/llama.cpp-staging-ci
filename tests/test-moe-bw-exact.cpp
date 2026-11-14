@@ -280,6 +280,10 @@ static const moe_shape bench_shapes[] = {
     { "q4xdn6", GGML_TYPE_Q6_K,    512, 2048, 256,  8, false },
     { "lfmgu",  GGML_TYPE_Q4_K,   2048, 1536,  64,  4, true  },
     { "lfmdn",  GGML_TYPE_Q5_K,   1536, 2048,  64,  4, false },
+    // k19-ampmoe: the other Qwen3.8-Flash-Next UD-IQ4_XS (fn4n) routed types
+    { "fn4nq5",  GGML_TYPE_Q5_0,    640, 2560, 128, 10, false },
+    { "fn4nxx",  GGML_TYPE_IQ3_XXS, 2560,  640, 128, 10, true  },
+    { "fn4n2s",  GGML_TYPE_IQ2_S,   2560,  640, 128, 10, true  },
 };
 
 static int run_bench(ggml_backend_t be, int argc, char ** argv) {

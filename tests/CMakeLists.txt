@@ -503,6 +503,7 @@ llama_build_and_test(test-topk-twostage-exact.cpp LINK ggml)   # k19-dtopk: two-
 llama_build_and_test(test-fattn-q8-exact.cpp LINK ggml)   # k19-fattnq8: MMA flash attention reading q8_0 K / V in place == the staged f16 copy, byte for byte
 # k19-moebw routed-expert mat-vec vs the kernels it replaces, byte for byte (SKIP without a CUDA device)
 llama_build_and_test(test-moe-bw-exact.cpp LINK ggml)
+llama_build_and_test(test-moe-tc-exact.cpp LINK ggml)
 # k19-handoff: ggml_dflash2_conv vs the add / mul / pad chain of the DFlash2 drafter's conv, byte for byte on every device (CPU always)
 llama_build_and_test(test-dflash2-conv-exact.cpp LINK ggml)
 # k19-mmvqcols: the rows-per-block lever of the dense 2..8 column mat-vec vs the launch it replaces, byte for byte (SKIP without a CUDA device)

@@ -6,6 +6,7 @@
 #include "cp-async.cuh"
 #include "mmvf-splitk.cuh"
 #include "mmvf.cuh"
+#include "mmvq-moetc.cuh"
 
 #include <cstdint>
 #include <type_traits>
@@ -323,12 +324,13 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
 // Flash-Next gate / up of a DFlash2 n_max 6 window). Inside a verify-tagged graph those columns keep the multi-token mmvq kernels a
 // 2..6-row window and every Ada / Blackwell window runs (mul_mat_vec_q_moe_vl for the fused IQ3_S gate / up). Not bit-identical to the
 // MMQ launch it replaces (another f32 summation order: reassociation, KLD-gated, plans/k19_ampere.md)
+// k19-ampmoe: also 8 where the int8 tensor-core MoE kernel (mmvq-moetc.cuh) takes the type inside a verify window
 int ggml_cuda_mmvq_mmid_max_batch(ggml_type type, int cc) {
     const int table = get_mmvq_mmid_max_batch(type, cc);
     if (table >= MMVQ_MAX_BATCH_SIZE) {
         return table;
     }
-    return std::max(table, ggml_cuda_verify_wide_cols(cc, 8));
+    return std::max({table, ggml_cuda_verify_wide_cols(cc, 8), ggml_cuda_moe_tc_max_batch(type, cc)});
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
@@ -3751,6 +3753,9 @@ static bool mul_mat_vec_q_wpr_launch(
     }
 }
 
+// k19-ampmoe: set while the batch invariant MUL_MAT_ID columns run (mul_mat_vec_q_switch_ncols_dst), so they never reach mmvq-moetc
+static thread_local bool mmvq_moetc_blocked = false;
+
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -3785,6 +3790,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
                                 fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.shared_up != nullptr;
     const bool reassoc_path = exact && reassoc && ncols_dst > 1 && (ids != nullptr ? nsamples_x == 1 && nsamples_dst == 1 : !has_fusion_any);
     if ((moe_path || (reassoc_path && ids != nullptr)) && ncols_dst > 1) {
+        // k19-ampmoe: the batch invariant columns below never take the tensor-core MoE kernel (mmvq-moetc.cuh), whatever its mode
+        struct moetc_guard { bool prev; moetc_guard() : prev(mmvq_moetc_blocked) { mmvq_moetc_blocked = true; } ~moetc_guard() { mmvq_moetc_blocked = prev; } } moetc_g;
         const int cc_m  = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const int max_b = get_mmvq_mmid_max_batch(type, cc_m);
         if (ncols_dst > max_b) {
@@ -3958,6 +3965,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
     };
 
     if (has_ids && (ncols_dst > 1 || moe_path)) {
+        // k19-ampmoe (GGML_CUDA_MOE_TC, mmvq-moetc.cuh): 2..8 tokens of a verify window on int8 tensor cores (NVIDIA Ampere / Ada); not on
+        // the batch invariant path (exact, or the reassociating chunks above)
+        if (!exact && !mmvq_moetc_blocked && ncols_dst > 1 && nsamples_x == 1 && nsamples_dst == 1 &&
+                ggml_cuda_moe_tc_ok(type, ncols_x, ncols_dst, cc, fusion) &&
+                ggml_cuda_moe_tc_launch(type, vx, vy, ids, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                    stride_channel_x, stride_channel_y, stride_channel_dst, nchannels_y, nchannels_dst, ncols_dst, ids_stride, stream)) {
+            return;
+        }
         // k19-moegrp (GGML_CUDA_MOE_VL): the same values, c_tpr threads per row, an expert's entries c_g per weight decode
         if (ncols_dst > 1 && nsamples_x == 1 && nsamples_dst == 1 && mul_mat_vec_q_moe_vl_launch<type>(
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
