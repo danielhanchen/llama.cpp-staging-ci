@@ -287,11 +287,23 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     // prewarm left only all-fit graphs, so the first verify / decode of such a request rebuilt every width inside its decode (G4 Flash-Next
     // full card, MTP 8k after chat: 4 builds, -2.9%). The first short request builds its all-fit graphs beside them instead (its own ways),
     // a one-time cost per width. LLAMA_SPEC_PREWARM_ALLFIT=1: prewarm the all-fit form instead
-    // the first (or only) form is the scored one unless LLAMA_SPEC_PREWARM_ALLFIT=1; with both forms the pause ends before the second
-    bool pw_paused = pw_mode != 1;
-    if (pw_paused) {
-        llama_qsa_allfit_pause(true);
-    }
+    // the first (or only) form is the scored one unless LLAMA_SPEC_PREWARM_ALLFIT=1; with both forms each chain prewarms its scored widths,
+    // then its all-fit widths (the greedy chain first, so a memory floor below cuts the rarely used chains first)
+    bool pw_paused = false;
+    auto pw_pause = [&](bool on) {
+        if (on != pw_paused) {
+            llama_qsa_allfit_pause(on);
+            pw_paused = on;
+        }
+    };
+    pw_pause(pw_mode != 1);
+    // k19-int3fix: every captured verify graph keeps device memory the fit does not count (A100 80 GB with 48 GB free, Flash-Next + DFlash2
+    // MoE cache: 22-66 MiB per graph, 3 chains x 7 widths took 828 -> 64 MiB free on ec9072e9789 and -> 2 MiB with the few-row MMQ, whose
+    // first request then died in a pool alloc). LLAMA_SPEC_PREWARM_MIN_FREE_MIB (default 512, 0 = no floor): no further width is
+    // prewarmed below that much free device memory; the widths left out are captured when a request first needs them
+    static const double min_free = getenv("LLAMA_SPEC_PREWARM_MIN_FREE_MIB") != nullptr ? atof(getenv("LLAMA_SPEC_PREWARM_MIN_FREE_MIB")) : 512.0;
+    bool floor_hit = false;
+    int  n_skipped = 0;
     llama_set_verify(ctx, false);
     for (int done = 0; done < n_pre && ok; ) {
         const int n = std::min(n_b, n_pre - done);
@@ -300,36 +312,42 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
         done += n;
     }
     int n_ok = 0;
-    for (int form = 0; form < n_forms && ok; ++form) {
-    if (form == 1 && pw_paused) {
-        llama_qsa_allfit_pause(false); // second form: all-fit
-        pw_paused = false;
-    }
     for (int c = 0; c < n_chain && ok; ++c) {
         if (!chains.empty()) {
             ok = llama_set_sampler_swap(ctx, 0, chains[c]);
             llama_set_sampler_raw_logits(ctx, 0, false);
         }
-        n_ok = 0;
-        for (int w : widths) {
-            if (!ok) {
-                break;
-            }
-            for (int rep = 0; rep < reps && ok; ++rep) {
-                add(w, true);
-                llama_set_verify(ctx, w > 1);
-                ok = llama_decode(ctx, b) == 0;
-                llama_synchronize(ctx);
-            }
-            n_ok += ok;
-            if (mem_log) {
-                const double fr = dev_free_mib();
-                SRV_INF("k19-fullcost: prewarm chain %d width %d: device free %.1f MiB (%+.1f)\n", c, w, fr, fr - free_prev);
-                free_prev = fr;
+        for (int form = 0; form < n_forms && ok; ++form) {
+            pw_pause(pw_mode != 1 && form == 0);
+            n_ok = 0;
+            for (int w : widths) {
+                if (!ok) {
+                    break;
+                }
+                if (min_free > 0.0 && gpu && (floor_hit || dev_free_mib() < min_free)) {
+                    floor_hit = true;
+                    n_skipped++;
+                    continue;
+                }
+                for (int rep = 0; rep < reps && ok; ++rep) {
+                    add(w, true);
+                    llama_set_verify(ctx, w > 1);
+                    ok = llama_decode(ctx, b) == 0;
+                    llama_synchronize(ctx);
+                }
+                n_ok += ok;
+                if (mem_log) {
+                    const double fr = dev_free_mib();
+                    SRV_INF("k19-fullcost: prewarm chain %d form %d width %d: device free %.1f MiB (%+.1f)\n", c, form, w, fr, fr - free_prev);
+                    free_prev = fr;
+                }
             }
         }
     }
-    } // forms
+    if (floor_hit) {
+        SRV_INF("k19-int3fix: verify graph prewarm left %d of %d chain x form x width graphs to the first request that needs them: device free "
+                "memory under %.0f MiB (LLAMA_SPEC_PREWARM_MIN_FREE_MIB=0: no floor)\n", n_skipped, n_chain*n_forms*(int) widths.size(), min_free);
+    }
     if (pw_both && ok) {
         SRV_INF("k19-int3fix: verify graphs prewarmed in both QSA forms, scored and all-fit, %d widths (LLAMA_SPEC_PREWARM_ALLFIT=0: scored only)\n", (int) widths.size());
     }
@@ -344,9 +362,7 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     llama_batch_free(b);
     llama_memory_clear(mem, true);
     llama_synchronize(ctx);
-    if (pw_paused) {
-        llama_qsa_allfit_pause(false);
-    }
+    pw_pause(false);
     if (cm_pause) {
         llama_moe_cache_stats_pause(ctx, false);
     }
