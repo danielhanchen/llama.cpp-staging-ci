@@ -3111,11 +3111,7 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     // hybrid small batches: the lookup only assigns the slots, the caller builds the host path and then the copies (see build_moe_ffn)
     if (assign != nullptr) {
         ggml_tensor * ids = selected_experts;
-        // k19-g4fuse (LLAMA_MOE_ASSIGN_IDS_VIEW=0 off): the assign reads the router's top-k view (rows strided) as the lookup does
-        // (k15-fn), one CONT launch less per MoE layer of a hybrid / overlapped verify graph (G4 Flash-Next 48 GB: 48 of ~2120 kernels)
-        static const bool ids_view = getenv("LLAMA_MOE_ASSIGN_IDS_VIEW") == nullptr || atoi(getenv("LLAMA_MOE_ASSIGN_IDS_VIEW")) != 0;
-        const bool rows_ok = ids->nb[0] == ggml_type_size(ids->type) && ids->ne[2] == 1 && ids->ne[3] == 1;
-        if (!ggml_is_contiguous(ids) && !(ids_view && rows_ok)) {
+        if (!ggml_is_contiguous(ids)) {
             ids = ggml_cont(ctx0, ids);
         }
         bool use_host = false;
