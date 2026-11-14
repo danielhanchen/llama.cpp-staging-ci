@@ -2095,8 +2095,11 @@ bool ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, con
         return false;
     }
     // k19-p1fuse: the gate op (sigmoid, or silu unless GGML_CUDA_GATED_NORM_SILU=0)
+    if (unary->op != GGML_OP_UNARY) {
+        return false;
+    }
     const ggml_unary_op gate_op = ggml_get_unary_op(unary);
-    if (unary->op != GGML_OP_UNARY || (gate_op != GGML_UNARY_OP_SIGMOID && (gate_op != GGML_UNARY_OP_SILU || !ggml_cuda_gated_norm_silu_enabled()))) {
+    if (gate_op != GGML_UNARY_OP_SIGMOID && (gate_op != GGML_UNARY_OP_SILU || !ggml_cuda_gated_norm_silu_enabled())) {
         return false;
     }
     const bool silu = gate_op == GGML_UNARY_OP_SILU;
