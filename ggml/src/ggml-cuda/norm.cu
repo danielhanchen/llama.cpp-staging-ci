@@ -2,6 +2,7 @@
 #include "norm.cuh"
 #include "convert.cuh"
 #include "rope-common.cuh"
+#include "unary.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -1747,7 +1748,18 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 // unary_gated_q8_1_kernel) with one value per lane and the same 32-lane reductions as quantize_q8_1. So dst and the copy are bitwise
 // those of the unfused kernels. Needs ncols % QK8_1 == 0 and ne10 % QK8_1 == 0 (checked by the caller); the weight row is not broadcast
 // along the columns (mul_ncols == ncols).
-template <int block_size, int vpt, bool do_vec>
+// k19-p1fuse: the gate of the fused gated norm: op_sigmoid(z) (qwen4exp) or op_silu(z) (qwen35 / qwen35moe, GGML_CUDA_GATED_NORM_SILU=0
+// off), each the expression unary_gated_q8_1_kernel / unary_gated_op_kernel apply for that op, so the product is bitwise theirs
+template <bool silu>
+static __device__ __forceinline__ float k19_gated_norm_gate(const float z) {
+    if constexpr (silu) {
+        return ggml_cuda_op_silu_single(z);
+    } else {
+        return 1.0f / (1.0f + expf(-z));
+    }
+}
+
+template <int block_size, int vpt, bool do_vec, bool silu = false>
 static __global__ void rms_norm_mul_sigmoid_gate_f32(const float * x,
                                                      float *       dst,
                                                      void *        vq,
@@ -1817,7 +1829,7 @@ static __global__ void rms_norm_mul_sigmoid_gate_f32(const float * x,
             block_q8_1 * y = (block_q8_1 *) vq;
             for (int i0 = tid; i0 < ncols; i0 += block_size) { // ncols % QK8_1 == 0: whole warps
                 const float nv = scale * xc[i0] * mulc[i0];
-                const float v  = 1.0f / (1.0f + expf(-gc[i0])) * nv; // op_sigmoid(z) * g, as unary_gated_q8_1_kernel
+                const float v  = k19_gated_norm_gate<silu>(gc[i0]) * nv; // op(z) * g, as unary_gated_q8_1_kernel
                 dstc[i0] = v;
                 if (vq == nullptr) {
                     continue; // uniform
@@ -1864,7 +1876,7 @@ static __global__ void rms_norm_mul_sigmoid_gate_f32(const float * x,
 // of rms_norm_mul_sigmoid_gate_f32 (same launch choice); each warp holds 32 consecutive outputs (ncols % 32 == 0, K_out % 128 == 0),
 // one q8_1 scale group of quantize_mmq_q8_1, whose D4 scale only needs their largest magnitude (a max, so the lane order does not
 // matter), and each value is quantized by its expressions: the bytes are those of the unfused gated norm + quantize_mmq_q8_1.
-template <int block_size, int vpt, bool do_vec>
+template <int block_size, int vpt, bool do_vec, bool silu = false>
 static __global__ void rms_norm_mul_sigmoid_gate_mmq_f32(const float * x,
                                                          float *       dst,
                                                          void *        vout,
@@ -1933,7 +1945,7 @@ static __global__ void rms_norm_mul_sigmoid_gate_mmq_f32(const float * x,
 
             for (int i0 = tid; i0 < ncols; i0 += block_size) { // ncols % WARP_SIZE == 0: whole warps
                 const float nv = scale * xc[i0] * mulc[i0];
-                const float v  = 1.0f / (1.0f + expf(-gc[i0])) * nv; // op_sigmoid(z) * g, as unary_gated_q8_1_kernel
+                const float v  = k19_gated_norm_gate<silu>(gc[i0]) * nv; // op(z) * g, as unary_gated_q8_1_kernel
                 dstc[i0] = v;
 
                 // quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4> of the 32 values of this warp
@@ -1960,6 +1972,14 @@ static __global__ void rms_norm_mul_sigmoid_gate_mmq_f32(const float * x,
             }
         }
     }
+}
+
+bool ggml_cuda_gated_norm_silu_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_GATED_NORM_SILU");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
 }
 
 bool ggml_cuda_op_rms_norm_mul_sigmoid_gate_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * mul_w,
@@ -2001,6 +2021,8 @@ bool ggml_cuda_op_rms_norm_mul_sigmoid_gate_mmq(ggml_backend_cuda_context & ctx,
     float * dst_d = (float *) mul_gate->data;
     cudaStream_t stream = ctx.stream();
 
+    const bool silu = ggml_get_unary_op(unary) == GGML_UNARY_OP_SILU;
+
     // the launch choice of ggml_cuda_op_rms_norm_mul_sigmoid_gate
     bool vec = ne00 % 4 == 0 && ne00 > 0 && ((uintptr_t) mul_w->data & 15) == 0;
     vec = vec && ggml_cuda_is_aligned(x, 16) && ggml_cuda_is_aligned(w, 16);
@@ -2010,6 +2032,12 @@ bool ggml_cuda_op_rms_norm_mul_sigmoid_gate_mmq(ggml_backend_cuda_context & ctx,
     do { \
         const dim3 block_dims(BLOCK_SIZE, 1, 1); \
         const ggml_cuda_kernel_launch_params launch_params{ blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, stream }; \
+        if (silu) { \
+            ggml_cuda_kernel_launch(rms_norm_mul_sigmoid_gate_mmq_f32<BLOCK_SIZE, VPT, VEC, true>, launch_params, x_d, dst_d, memo.ptr, (int) ne00, \
+                (int) ne02, (int) ne03, s01, s02, s03, eps, w_d, mul_s01, mul_s02, mul_s03, mul_nrows_packed, mul_nchannels_packed, \
+                mul_nsamples_packed, z_d, gate_s1, memo.K_out, memo.N_out); \
+            break; \
+        } \
         ggml_cuda_kernel_launch(rms_norm_mul_sigmoid_gate_mmq_f32<BLOCK_SIZE, VPT, VEC>, launch_params, x_d, dst_d, memo.ptr, (int) ne00, \
             (int) ne02, (int) ne03, s01, s02, s03, eps, w_d, mul_s01, mul_s02, mul_s03, mul_nrows_packed, mul_nchannels_packed, \
             mul_nsamples_packed, z_d, gate_s1, memo.K_out, memo.N_out); \
@@ -2066,6 +2094,15 @@ bool ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, con
     if (ggml_nrows(z) > 1 && (z->nb[2] != z->ne[1]*z->nb[1] || z->nb[3] != z->ne[2]*z->nb[2])) {
         return false;
     }
+    // k19-p1fuse: the gate op (sigmoid, or silu unless GGML_CUDA_GATED_NORM_SILU=0)
+    if (unary->op != GGML_OP_UNARY) {
+        return false;
+    }
+    const ggml_unary_op gate_op = ggml_get_unary_op(unary);
+    if (gate_op != GGML_UNARY_OP_SIGMOID && (gate_op != GGML_UNARY_OP_SILU || !ggml_cuda_gated_norm_silu_enabled())) {
+        return false;
+    }
+    const bool silu = gate_op == GGML_UNARY_OP_SILU;
     if (check_only) {
         return true;
     }
@@ -2096,6 +2133,12 @@ bool ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, con
     do { \
         const dim3 block_dims(BLOCK_SIZE, 1, 1); \
         const ggml_cuda_kernel_launch_params launch_params{ blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, stream }; \
+        if (silu) { \
+            ggml_cuda_kernel_launch(rms_norm_mul_sigmoid_gate_f32<BLOCK_SIZE, VPT, VEC, true>, launch_params, x_d, dst_d, q8_1_out, (int) ne00, \
+                (int) ne02, (int) ne03, s01, s02, s03, eps, w_d, mul_s01, mul_s02, mul_s03, mul_nrows_packed, mul_nchannels_packed, \
+                mul_nsamples_packed, z_d, gate_s1, ne10, ne10q); \
+            break; \
+        } \
         ggml_cuda_kernel_launch(rms_norm_mul_sigmoid_gate_f32<BLOCK_SIZE, VPT, VEC>, launch_params, x_d, dst_d, q8_1_out, (int) ne00, \
             (int) ne02, (int) ne03, s01, s02, s03, eps, w_d, mul_s01, mul_s02, mul_s03, mul_nrows_packed, mul_nchannels_packed, \
             mul_nsamples_packed, z_d, gate_s1, ne10, ne10q); \

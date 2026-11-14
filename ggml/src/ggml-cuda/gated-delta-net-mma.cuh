@@ -33,3 +33,5 @@ struct ggml_cuda_gdn_mma_args {
 };
 
 bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & args, cudaStream_t stream);
+// k19-p1fuse: false when ggml_cuda_gdn_mma_launch would refuse args for its shape, device or switches (the AR kernel runs)
+bool ggml_cuda_gdn_mma_candidate(int device, const ggml_cuda_gdn_mma_args & args);

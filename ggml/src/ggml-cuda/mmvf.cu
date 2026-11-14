@@ -1,11 +1,21 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "ggml.h"
+#include "p1fuse-stats.cuh"
 #include "common.cuh"
 #include "unary.cuh"
 #include "mmvf.cuh"
 #include "mmvf-splitk.cuh"
 #include "mmf.cuh"
 #include "convert.cuh"
+
+// k19-p1fuse: GGML_CUDA_MMVF_ONEBAR=0 restores the per-column barrier pair of the mul_mat_vec_f epilogue
+static bool ggml_cuda_mmvf_one_bar() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_MMVF_ONEBAR");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
 
 // k15-mm2: is_multi = up to GGML_CUDA_MMVQ_MULTI_MAX matrices of one type and K over the same activation in one launch (alpha + beta of
 // a gated delta net layer, the router + the shared expert gate, ...): blocks [multi_block0[m], multi_block0[m + 1]) compute matrix m's
@@ -16,7 +26,7 @@ static __global__ void mul_mat_vec_f(
         const int ncols2, const uint3 nchannels_y, const int stride_row, const int stride_col_y2, const int stride_col_dst_arg,
         const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride) {
+        const int ids_stride, const bool one_bar) {
     int m_sel = 0;
     if constexpr (is_multi) {
 #pragma unroll
@@ -129,15 +139,17 @@ static __global__ void mul_mat_vec_f(
     float * buf_iw = (float *) data_mmv;
     [[maybe_unused]] float * buf_iw_gate = nullptr;
     if constexpr (has_fusion) {
-        buf_iw_gate = (float *) (data_mmv + warp_size*sizeof(float));
+        buf_iw_gate = (float *) (data_mmv + ncols_dst*warp_size*sizeof(float)); // has_fusion: ncols_dst == 1
     }
 
     if (block_size > warp_size) {
-        if (tid < warp_size) {
-            buf_iw[tid] = 0.0f;
+        // k19-p1fuse one_bar: one zeroed partial slice of warp_size floats per column (nbytes_shared), else the one slice
+        const int nzero = one_bar ? ncols_dst*warp_size : warp_size;
+        for (int i = tid; i < nzero; i += block_size) {
+            buf_iw[i] = 0.0f;
             if constexpr (has_fusion) {
                 if (use_gate) {
-                    buf_iw_gate[tid] = 0.0f;
+                    buf_iw_gate[i] = 0.0f;
                 }
             }
         }
@@ -332,6 +344,36 @@ static __global__ void mul_mat_vec_f(
     }
 
     ggml_cuda_pdl_lc();
+    if (block_size > warp_size && one_bar) {
+        // k19-p1fuse (GGML_CUDA_MMVF_ONEBAR=0: the per-column barrier pair below): every warp writes its partial of every column into that
+        // column's slice, one barrier, then warp 0 reduces each slice. The values and the reduction order of each column are those of
+        // the per-column loop, so the output is bitwise the same; 1 barrier instead of 2 * ncols_dst
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+            buf_iw[j*warp_size + tid/warp_size] = sumf[j];
+            if constexpr (has_fusion) {
+                if (use_gate) {
+                    sumf_gate[j] = warp_reduce_sum<warp_size>(sumf_gate[j]);
+                    buf_iw_gate[j*warp_size + tid/warp_size] = sumf_gate[j];
+                }
+            }
+        }
+        __syncthreads();
+        if (tid < warp_size) {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                sumf[j] = buf_iw[j*warp_size + tid];
+                sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        sumf_gate[j] = buf_iw_gate[j*warp_size + tid];
+                        sumf_gate[j] = warp_reduce_sum<warp_size>(sumf_gate[j]);
+                    }
+                }
+            }
+        }
+    } else {
 #pragma unroll
     for (int j = 0; j < ncols_dst; ++j) {
         sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
@@ -365,6 +407,7 @@ static __global__ void mul_mat_vec_f(
                 __syncthreads();
             }
         }
+    }
     }
 
     if (tid >= ncols_dst) {
@@ -427,7 +470,7 @@ static void mul_mat_vec_f_switch_fusion(
             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
                 x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, ggml_cuda_mmvf_one_bar());
             return;
        }
     }
@@ -437,7 +480,7 @@ static void mul_mat_vec_f_switch_fusion(
     ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id>, launch_params,
         x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, ggml_cuda_mmvf_one_bar());
 
 }
 
@@ -478,7 +521,13 @@ void launch_mul_mat_vec_f_cuda(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
 
-    const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
+    // k19-p1fuse: ncols_dst partial slices for the one-barrier epilogue (has_fusion: ncols_dst == 1, so the gate slice follows at the
+    // same offset either way)
+    const bool one_bar = ggml_cuda_mmvf_one_bar();
+    if (block_size_best > warp_size) {
+        ggml_cuda_p1_stat(one_bar ? GGML_CUDA_P1_MMVF_ONEBAR : GGML_CUDA_P1_MMVF_TWOBAR);
+    }
+    const int nbytes_shared = (one_bar ? ncols_dst : 1)*warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(block_size_best, 1, 1);
     switch (block_size_best) {
@@ -696,10 +745,12 @@ static void mul_mat_vec_f_multi_launch(const ggml_cuda_mm_fusion_args_device & f
     const uint3 one = init_fastdiv_values(1);
     const dim3 block_nums(nblocks, 1, 1);
     const dim3 block_dims(256, 1, 1);
-    const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, (int) (32*sizeof(float)), stream};
+    const bool one_bar = ggml_cuda_mmvf_one_bar();
+    ggml_cuda_p1_stat(one_bar ? GGML_CUDA_P1_MMVF_ONEBAR : GGML_CUDA_P1_MMVF_TWOBAR);
+    const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, (int) ((one_bar ? ncols_dst : 1)*32*sizeof(float)), stream};
 #define MMVF_MULTI_LAUNCH(NC) case NC: ggml_cuda_kernel_launch(mul_mat_vec_f<T, float, NC, 256, false, false, true>, launch_params, \
         (const T *) nullptr, y, (const int32_t *) nullptr, fusion, (float *) nullptr, (int) (ncols/2), make_uint3(0, 0, 0), (int) stride_row, \
-        (int) (stride_col_y/2), 0, one, 0, 0, 0, one, 0, 0, 0, 0); break;
+        (int) (stride_col_y/2), 0, one, 0, 0, 0, one, 0, 0, 0, 0, one_bar); break;
     switch (ncols_dst) {
         MMVF_MULTI_LAUNCH(1)
         MMVF_MULTI_LAUNCH(2)

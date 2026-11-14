@@ -503,6 +503,8 @@ llama_build_and_test(test-gdn-tiled-exact.cpp LINK ggml)
 llama_build_and_test(test-meta-k15-ops.cpp LINK ggml)
 # k19-fuse prompt fusions of qwen4exp (PLE conv taps, conv-input concat, QSA mask) vs the plain graphs, byte for byte (F4 also on the CPU)
 llama_build_and_test(test-k19-fuse-exact.cpp LINK ggml)
+# k19-p1fuse: GDN fusion predicate (replay windows), silu gated norm, one-barrier mmvf == the code before them and the unfused graph, byte for byte
+llama_build_and_test(test-k19-p1fuse-exact.cpp LINK ggml)
 llama_build_and_test(test-topk384-exact.cpp LINK ggml)
 llama_build_and_test(test-topk-oneblock-exact.cpp LINK ggml)
 llama_build_and_test(test-topk-twostage-exact.cpp LINK ggml)   # k19-dtopk: two-stage one-launch top-k == radix select, byte for byte
