@@ -6,6 +6,7 @@
 #include "cp-async.cuh"
 #include "mmvf-splitk.cuh"
 #include "mmvf.cuh"
+#include "mmvq-kqtc.cuh"
 
 #include <cstdint>
 #include <type_traits>
@@ -4741,6 +4742,19 @@ void ggml_cuda_mul_mat_vec_q(
 
     const bool exact = (dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) != 0;
 
+    // k19-kqtc (GGML_CUDA_MMVQ_KQTC, opt-in): a dense product of 2..8 columns without fusion on int8 tensor cores (mmvq-kqtc.cu); not
+    // on the bit-exact verify (batch invariant with GGML_CUDA_VERIFY_REASSOC=0)
+    if (ids == nullptr && fusion == nullptr && ncols_dst >= 2 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            (!exact || ggml_cuda_mmvq_kqtc_reassoc_ok()) &&
+            ggml_cuda_mmvq_kqtc_ok(src0->type, ne00, ncols_dst, ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        const void * kx[1] = { src0->data };
+        float      * kd[1] = { dst_d };
+        const int64_t kr[1] = { ne01 };
+        if (ggml_cuda_mmvq_kqtc_launch(src0->type, 1, kx, kd, kr, nb01, src1_q8_1, stride_col_y, stride_col_dst, ne00, ncols_dst, stream)) {
+            return;
+        }
+    }
+
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
@@ -4801,6 +4815,25 @@ void ggml_cuda_mul_mat_vec_q_multi(ggml_backend_cuda_context & ctx, const int n,
 
     const int stride_row_x = src0[0]->nb[1] / ggml_type_size(type);
     const int stride_col_y = ne10_padded / QK8_1;
+
+    // k19-kqtc (GGML_CUDA_MMVQ_KQTC, opt-in): the matrices of a 2..8 column launch on int8 tensor cores, as for a single product
+    const bool exact = (dst[0]->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) != 0;
+    if (ne11 >= 2 && (!exact || ggml_cuda_mmvq_kqtc_reassoc_ok()) &&
+            ggml_cuda_mmvq_kqtc_ok(type, ne10, ne11, ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        const void * kx[GGML_CUDA_MMVQ_MULTI_MAX] = {};
+        float      * kd[GGML_CUDA_MMVQ_MULTI_MAX] = {};
+        int64_t      kr[GGML_CUDA_MMVQ_MULTI_MAX] = {};
+        for (int m = 0; m < n; ++m) {
+            kx[m] = src0[m]->data;
+            kd[m] = (float *) dst[m]->data;
+            kr[m] = src0[m]->ne[1];
+        }
+        if (ggml_cuda_mmvq_kqtc_launch(type, n, kx, kd, kr, src0[0]->nb[1], src1_q8_1, stride_col_y, dst[0]->nb[1] / sizeof(float), ne10, ne11,
+                stream)) {
+            return;
+        }
+    }
+
     const bool ok = mul_mat_vec_q_multi_switch_type(type, fusion, n, nrows, src1_q8_1, ne10, ne11, stride_row_x, stride_col_y, stream);
     GGML_ASSERT(ok);
 }
