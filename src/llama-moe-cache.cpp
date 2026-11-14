@@ -4010,7 +4010,7 @@ struct llama_moe_cache::impl {
                 (m_res >= 1 || (double) n_hold >= min_frac*(double) n_streamed);
             if (resident_mode) {
                 if (!prefilled_dev && (e_dp == nullptr || atoi(e_dp) != 0)) {
-                    if (!rp_prefill()) { // k19-mgpu2: the hottest experts of the earlier launches' decodes, when recorded
+                    if (!rp_prefill()) { // k19-mgpu2: the hottest experts of the earlier launches' decodes (LLAMA_MOE_RESIDENT_PROF=1)
                         prefill();
                     }
                 }
@@ -4025,7 +4025,7 @@ struct llama_moe_cache::impl {
             }
         }
         ap_init();
-        rp_rec = resident_mode && rp_on() && ap_rec && !ap_cnt.empty(); // k19-mgpu2: the decode routing goes into the profile
+        rp_rec = resident_mode && rp_mode() != 0 && ap_rec && !ap_cnt.empty(); // k19-mgpu2: the decode routing goes into the profile
         prefill_resident();
         LLAMA_LOG_INFO("%s: MoE host cache on: %s, budget %.1f MiB (%s) for %.1f MiB of streamed experts (of %.1f MiB mapped), %.1f MiB in device slots, "
                 "the experts of %.1f tokens, MemAvailable %.1f MiB, pinned on first use (%s)%s (LLAMA_MOE_HOST_CACHE=0 off)\n", __func__,
@@ -4411,8 +4411,8 @@ struct llama_moe_cache::impl {
         uint64_t routings = 0, cold_refused = 0, cold_taken = 0, hot_taken = 0, pf_hot = 0, pf_cold = 0, pf_stale = 0;
     } aps;
 
-    // k19-mgpu2 (LLAMA_MOE_RESIDENT_PROF, unset / 1 = on, 0 = off): the device slots of resident mode start from the decode routing of
-    // earlier launches. Resident mode (the exclusive RAM tier and the device slots hold every streamed expert, e.g. Flash-Next UD-IQ1_S on
+    // k19-mgpu2 (LLAMA_MOE_RESIDENT_PROF: unset / 2 = record only, 1 = record + use, 0 = off): the device slots of resident mode can
+    // start from the decode routing of earlier launches. Resident mode (the exclusive RAM tier and the device slots hold every streamed expert, e.g. Flash-Next UD-IQ1_S on
     // Kaggle 2x T4) never seeds the device cache from prompts (k18-lowram) and filled each layer's lowest expert ids at load, so a decode
     // paid its working set one miss at a time: an upload from RAM plus the copy back of the victim, ~26 misses per token over the first
     // ~100 tokens of a chat (22 tok/s, then 33-34 once the CLOCK had converged). With it:
@@ -4423,6 +4423,8 @@ struct llama_moe_cache::impl {
     // Placement only: every expert is computed by the same kernels wherever it was copied from; the text changes only through the route
     // tail skip (a skipped expert is a missing one, so it follows the residency; LLAMA_MOE_ROUTE_TAIL_SKIP=0: identical text). A first
     // launch (no file) fills by id as before and records. LLAMA_MOE_AUTOPROF=0 / 2 / 3 also gate it (no file / record only / read only).
+    // The use is opt-in because of that text change (=1); the default records only (counting changes nothing computed), so a file is
+    // in place when it is turned on.
     bool rp_rec = false; // host lookups count the routing of small batches into ap_cnt (resident mode, recording)
     struct {
         uint64_t counted = 0, lookups = 0;
@@ -4430,23 +4432,24 @@ struct llama_moe_cache::impl {
         bool     used = false;
     } rps;
 
-    static bool rp_on() {
-        static const bool on = [] {
+    static int rp_mode() {
+        static const int m = [] {
             const char * e = getenv("LLAMA_MOE_RESIDENT_PROF");
-            return e == nullptr || atoi(e) != 0;
+            const int v = e != nullptr && *e ? atoi(e) : 2;
+            return v >= 0 && v <= 2 ? v : 2;
         }();
-        return on;
+        return m;
     }
 
     // resident mode's device prefill from the autoprof file (see rp_rec); false = no file, the caller fills by id (prefill)
     bool rp_prefill() {
-        if (!rp_on() || ap_mode == 0 || ap_file.empty() || !llama_autoprof::uses(ap_mode) || !profile_file.empty() || prefilled_dev) {
+        if (rp_mode() != 1 || ap_mode == 0 || ap_file.empty() || !llama_autoprof::uses(ap_mode) || !profile_file.empty() || prefilled_dev) {
             return false;
         }
         std::vector<prof_entry> prof;
         if (!llama_moe_profile_load(ap_file, profile_n_expert(), prof)) {
             LLAMA_LOG_INFO("%s: k19-mgpu2: no routing profile at %s yet: resident device slots by expert id, this launch records the decode "
-                "routing (LLAMA_MOE_RESIDENT_PROF=0 off)\n", __func__, ap_file.c_str());
+                "routing (LLAMA_MOE_RESIDENT_PROF=1)\n", __func__, ap_file.c_str());
             return false;
         }
         rps.read = prof.size();
@@ -4492,7 +4495,7 @@ struct llama_moe_cache::impl {
         prefilled_dev = true;
         rps.used = true;
         LLAMA_LOG_INFO("%s: k19-mgpu2: resident device slots from the routing profile %s: %zu experts (%.2f MiB), %zu hottest of %zu profile "
-            "entries + %zu by id (LLAMA_MOE_RESIDENT_PROF=0 off)\n", __func__, ap_file.c_str(), n_fill, n_bytes/1048576.0, rps.taken, rps.read, rps.padded);
+            "entries + %zu by id (LLAMA_MOE_RESIDENT_PROF=1; 2 = record only, the default)\n", __func__, ap_file.c_str(), n_fill, n_bytes/1048576.0, rps.taken, rps.read, rps.padded);
         return true;
     }
 
