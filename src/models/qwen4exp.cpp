@@ -713,9 +713,10 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        // k19-pf: a kv_only graph (writes_only) has none of the four selection inputs
-        mctx->set_input_kpool(writes_only ? nullptr : pool_cells, writes_only ? nullptr : pool_idxs, writes_only ? nullptr : pool_mask,
-                              writes_only ? nullptr : tail_idxs, nullptr, new_pool_idxs, new_pool_rep,
+        // k19-pf: a kv_only graph (writes_only) has none of the four selection inputs (k19-p2qsa: nor an all-fit graph)
+        const bool no_sel = writes_only || allfit;
+        mctx->set_input_kpool(no_sel ? nullptr : pool_cells, no_sel ? nullptr : pool_idxs, no_sel ? nullptr : pool_mask,
+                              no_sel ? nullptr : tail_idxs, nullptr, new_pool_idxs, new_pool_rep,
                               ubatch, new_pool_pos, allfit_idx);
     }
 
@@ -777,16 +778,21 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
     inp->pool_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
     inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
-    ggml_set_input(inp->pool_cells);
-    ggml_set_input(inp->pool_idxs);
-    ggml_set_input(inp->pool_mask);
-    ggml_set_input(inp->tail_idxs);
+
+    // k19-p2qsa: every sequence of the ubatch within the top pools: the top_k would keep every visible pool, so the selection comes from
+    // the host (allfit_idx: the members of the visible pools, then the tail) and build_qsa_sel scores nothing. The four scoring inputs
+    // then stay out of the graph (only their shapes are read) and set_input does not fill them, as for kv_only
+    inp->allfit = !kv_only && mctx_hyb->get_kpool_allfit();
 
     // set_input fills them all, so keep them allocated even when no op reads them. k19-pf: a kv_only graph (only the scoring reads
     // them) leaves them out and set_input does not fill them: kept in the graph with no reader, their memory was not theirs (the CPU
     // backend handed it to the token ids; CPU test with a fake drafter)
     inp->writes_only = kv_only;
-    if (!kv_only) {
+    if (!kv_only && !inp->allfit) {
+        ggml_set_input(inp->pool_cells);
+        ggml_set_input(inp->pool_idxs);
+        ggml_set_input(inp->pool_mask);
+        ggml_set_input(inp->tail_idxs);
         ggml_build_forward_expand(gf, inp->pool_cells);
         ggml_build_forward_expand(gf, inp->pool_idxs);
         ggml_build_forward_expand(gf, inp->pool_mask);
@@ -808,9 +814,6 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     inp->new_pool_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*inp->n_new);
     ggml_set_input(inp->new_pool_pos);
 
-    // k19-p2qsa: every sequence of the ubatch within the top pools: the top_k would keep every visible pool, so the selection comes from
-    // the host (the members of the visible pools, then the tail) and build_qsa_sel scores nothing
-    inp->allfit = !kv_only && mctx_hyb->get_kpool_allfit();
     if (inp->allfit) {
         inp->allfit_idx = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, inp->n_sel, n_tokens);
         ggml_set_input(inp->allfit_idx);
