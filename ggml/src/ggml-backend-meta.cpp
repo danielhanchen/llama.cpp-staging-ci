@@ -1043,7 +1043,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_pad(src_ss);
             } break;
             case GGML_OP_ARANGE: {
-                // k19-2xt4 (as upstream 259d91709d6, #30499): no sources, every device computes the full range. Before, the
+                // k19-2xt4 (matches upstream llama.cpp (MIT)): no sources, every device computes the full range. Before, the
                 // generic rule found no source state and asserted: DeepSeek-V4.1 under -sm tensor (the --fit auto pick on 2 GPUs)
                 // aborted at warmup on its "top-k keeps all rows" arange. GGML_META_ARANGE_MIRRORED=0 = the old rule (kill switch).
                 static const bool mirrored = [] {
