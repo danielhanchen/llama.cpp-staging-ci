@@ -623,9 +623,10 @@ llama_context::llama_context(
 
     // k19-p3topk: one top-k over all the verify rows of a sequence instead of one per row, where the output device's top-k returns
     // for each row of a multi-row input what that row alone returns (same set, same order): the CPU (std::partial_sort per row) and
-    // the CUDA deterministic top-k (per-row selection; past the 4096-column sort paths every path, single row or several, writes
-    // the keys above the k-th in column order then the kept ties, lowest columns first, see build_sampling). Not: other backends, a
-    // meta device (-sm tensor), GGML_CUDA_TOPK_DETERMINISTIC=0. LLAMA_DEV_TOPK_BATCH=0: one top-k per row as before
+    // the CUDA deterministic top-k past 32768 columns in launches of at most 15 rows, where one row and several rows take the same
+    // kernels (the multi-block radix select; k <= 10 and <= 8 rows: the two-stage kernel, whose order is the radix select's): the
+    // one-block kernel (<= 32768 columns, or 16+ rows) is never reached by one side only. Not: other backends, a meta device
+    // (-sm tensor), GGML_CUDA_TOPK_DETERMINISTIC=0. LLAMA_DEV_TOPK_BATCH=0: one top-k per row as before
     {
         const char * env = getenv("LLAMA_DEV_TOPK_BATCH");
         bool ok = env == nullptr || atoi(env) != 0;
@@ -636,7 +637,8 @@ llama_context::llama_context(
             ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
             const char * det = getenv("GGML_CUDA_TOPK_DETERMINISTIC");
             ok = reg != nullptr && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 && (det == nullptr || atoi(det) != 0);
-            cparams.topk_batch_min_cols = 4097;
+            cparams.topk_batch_min_cols = 32769;
+            cparams.topk_batch_max_rows = 15;
         }
         cparams.topk_batch = ok;
     }

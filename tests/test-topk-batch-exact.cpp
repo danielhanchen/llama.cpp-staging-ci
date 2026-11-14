@@ -1,7 +1,9 @@
 // k19-p3topk: build_sampling's batched verify-window top-k (one ggml_top_k over n consecutive rows of the padded logits + one
 // get_rows of every row's top logits, then a slice per row) vs what each row's chain built before (a top-k over that row alone + a
 // get_rows), byte for byte: the candidate ids, their order and the logits. Every backend of the build (CPU, CUDA / ROCm when present)
-// runs the cases where cparams.topk_batch lets them engage: the CPU any width, CUDA past 4096 columns. Values: a normal draw, a coarse
+// runs every case; the gate is what build_sampling batches (cparams.topk_batch: the CPU any width, CUDA past 32768 columns and at most
+// 15 rows per launch): a difference inside it fails, outside it is reported only. Each case also runs the per-row graph twice (the
+// device's own repeatability, inside the gate it must hold). Values: a normal draw, a coarse
 // grid (many ties, also at the k-th), a masked suffix (-inf) and signed zeros. Rows 2 .. 17 (17: the CUDA one-block path for 16+ rows),
 // k 1 / 10 / 20 / 40 / 256, columns 4097 .. 262144 (151936 / 248320: Qwen vocabularies).
 // Control (GPU only): 3 rows of 2048 columns, where a single row takes the sorted CUB path and several rows the column-order path;
@@ -158,6 +160,24 @@ static bool same(const result & a, const result & b) {
            memcmp(a.logits.data(), b.logits.data(), a.logits.size() * sizeof(float)) == 0;
 }
 
+// the first difference: row, position, id and logit of each side
+static std::string first_diff(const tcase & c, const result & a, const result & b) {
+    for (size_t i = 0; i < a.ids.size() && i < b.ids.size(); ++i) {
+        if (a.ids[i] != b.ids[i] || memcmp(&a.logits[i], &b.logits[i], sizeof(float)) != 0) {
+            char buf[160];
+            snprintf(buf, sizeof(buf), "row %d pos %d: id %d / %d logit %g / %g", (int) (i / c.k), (int) (i % c.k), a.ids[i], b.ids[i],
+                    a.logits[i], b.logits[i]);
+            return buf;
+        }
+    }
+    return "sizes differ";
+}
+
+// where build_sampling batches on this device (llama_context: cparams.topk_batch_min_cols / topk_batch_max_rows)
+static bool in_gate(const tcase & c, bool gpu) {
+    return !gpu || (c.ncols > 32768 && c.nrows <= 15);
+}
+
 int main(int argc, char ** argv) {
     const bool bench = argc > 1 && strcmp(argv[1], "--bench") == 0;
     ggml_backend_load_all();
@@ -185,16 +205,25 @@ int main(int argc, char ** argv) {
         printf("device %s (%s)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
         const auto cs = cases(gpu);
         int n_dev_bad = 0;
+        int n_out_gate = 0;
         for (size_t i = 0; i < cs.size(); ++i) {
             const std::vector<float> x = make_data(cs[i], 11 + (int) i);
             const int nt = bench && gpu ? 30 : 0;
-            const result a = run_case(backend, cs[i], x, false, nt);
-            const result b = run_case(backend, cs[i], x, true,  nt);
-            const bool ok = same(a, b);
-            n_dev_bad += !ok;
+            const result a  = run_case(backend, cs[i], x, false, nt);
+            const result b  = run_case(backend, cs[i], x, true,  nt);
+            const result a2 = run_case(backend, cs[i], x, false, 0); // the per-row graph again: is the device's top-k repeatable here?
+            const bool ok   = same(a, b);
+            const bool rep  = same(a, a2);
+            const bool gate = in_gate(cs[i], gpu);
+            n_dev_bad += gate && (!ok || !rep);
+            n_out_gate += !gate && !ok;
             n_run++;
-            if (!ok || bench) {
-                printf("  %s: %s", cs[i].str().c_str(), ok ? "equal" : "DIFF  <- FAIL");
+            if (!ok || !rep || bench) {
+                printf("  %s: %s%s%s", cs[i].str().c_str(), ok ? "equal" : "DIFF", rep ? "" : " (per-row not repeatable)",
+                        !gate ? " [outside the gate: not batched on this device]" : (ok && rep ? "" : "  <- FAIL"));
+                if (!ok) {
+                    printf(" first: %s", first_diff(cs[i], a, b).c_str());
+                }
                 if (nt > 0) {
                     printf(" | us per-row %8.1f batched %8.1f", a.us, b.us);
                 }
@@ -210,7 +239,8 @@ int main(int argc, char ** argv) {
                     ok ? "differs as expected" : "EQUAL <- the comparison cannot see an order change (FAIL)");
             n_dev_bad += !ok;
         }
-        printf("  %s: %zu cases, %d differ\n", ggml_backend_dev_name(dev), cs.size(), n_dev_bad);
+        printf("  %s: %zu cases, %d differ inside the gate (%d differ outside it, not batched there)\n", ggml_backend_dev_name(dev), cs.size(),
+                n_dev_bad, n_out_gate);
         n_bad += n_dev_bad;
         ggml_backend_free(backend);
     }

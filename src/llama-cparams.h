@@ -20,7 +20,8 @@ struct llama_cparams {
     // k19-p3topk: build_sampling may run the leading backend top-k of a sequence's chains once over all its rows of the ubatch (the
     // output device's top-k gives each row of a multi-row input the result of that row alone; LLAMA_DEV_TOPK_BATCH=0: off)
     bool     topk_batch = false;
-    int64_t  topk_batch_min_cols = 0; // the narrowest row it engages for (CUDA: past the 4096-column sort paths)
+    int64_t  topk_batch_min_cols = 0;  // the narrowest row it engages for (CUDA: past the one-block path's 32768 columns)
+    uint32_t topk_batch_max_rows = 64; // rows per top-k launch (CUDA: 15, below the one-block path's 16 rows)
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
 
