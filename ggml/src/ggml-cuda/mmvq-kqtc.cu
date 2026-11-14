@@ -297,16 +297,15 @@ static __global__ void __launch_bounds__(nw*WARP_SIZE, 16/nw) mul_mat_vec_q_kqtc
     const int g    = lane >> 2;
     const int t    = lane & 3;
 
-    int m = 0;
-#pragma unroll
-    for (int i = 1; i < GGML_CUDA_MMVQ_MULTI_MAX; ++i) {
-        if (i < args.n_mat && (int) blockIdx.x >= args.block0[i]) {
-            m = i;
-        }
-    }
-    const int    row0  = ((int) blockIdx.x - args.block0[m]) * (16*ntiles);
-    const int    nrows = args.nrows[m];
-    const char * x     = args.x[m];
+    // the matrix of this block, selected without indexing the parameter arrays at run time (that would copy them to the stack)
+    static_assert(GGML_CUDA_MMVQ_MULTI_MAX == 3, "matrix selection below");
+    const bool   m1    = args.n_mat > 1 && (int) blockIdx.x >= args.block0[1];
+    const bool   m2    = args.n_mat > 2 && (int) blockIdx.x >= args.block0[2];
+    const int    blk0  = m2 ? args.block0[2] : m1 ? args.block0[1] : args.block0[0];
+    const int    row0  = ((int) blockIdx.x - blk0) * (16*ntiles);
+    const int    nrows = m2 ? args.nrows[2] : m1 ? args.nrows[1] : args.nrows[0];
+    const char * x     = m2 ? args.x[2] : m1 ? args.x[1] : args.x[0];
+    float      * dst   = m2 ? args.dst[2] : m1 ? args.dst[1] : args.dst[0];
     const int    ncols = args.ncols;
 
     // columns >= ncols stay zero (their results are not written)
@@ -397,7 +396,6 @@ static __global__ void __launch_bounds__(nw*WARP_SIZE, 16/nw) mul_mat_vec_q_kqtc
     }
     __syncthreads();
 
-    float * dst = args.dst[m];
     for (int i = w*WARP_SIZE + lane; i < ntiles*16*8; i += nw*WARP_SIZE) {
         const int row = i >> 3;
         const int col = i & 7;
