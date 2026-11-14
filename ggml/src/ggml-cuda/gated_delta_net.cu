@@ -1,5 +1,6 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "gated_delta_net.cuh"
+#include "p1fuse-stats.cuh"
 #include "gated-delta-net-mma.cuh"
 #include "ggml-cuda/common.cuh"
 
@@ -602,12 +603,31 @@ static void launch_gated_delta_net(
     }
 }
 
-// k15-fn: whether ggml_cuda_op_gated_delta_net may take the mma kernel for dst (the predicate of ggml_cuda_gdn_mma_args_from_tensor)
+static ggml_cuda_gdn_mma_args ggml_cuda_gdn_mma_args_from_tensor(const ggml_tensor * dst);
+
+// k15-fn: whether ggml_cuda_op_gated_delta_net may take the mma kernel for dst (the predicate of ggml_cuda_gdn_mma_args_from_tensor).
+// k19-p1fuse (GGML_CUDA_GDN_FUSE_PRED=0: the shape-only test as before): the dispatch itself, so that the fusions which make the op
+// take the AR kernel (the in-place state read, the gates) are not refused where the AR kernel runs anyway: a replay window (the per-token
+// kernel, before the mma launch), fewer than 64 tokens, a GPU or head layout the mma kernel does not take. Conservative: a launch whose
+// kernel set-up would fail still counts as mma (fusion refused, as before)
 bool ggml_cuda_gated_delta_net_may_use_mma(const ggml_tensor * dst) {
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * v = dst->src[2];
     const ggml_tensor * g = dst->src[3];
-    return g->ne[0] == 1 && ggml_get_op_params_i32(dst, 0) < v->ne[2] && v->ne[0] == 128 && q->ne[0] == 128;
+    if (!(g->ne[0] == 1 && ggml_get_op_params_i32(dst, 0) < v->ne[2] && v->ne[0] == 128 && q->ne[0] == 128)) {
+        return false;
+    }
+    static const bool exact_pred = [] {
+        const char * e = getenv("GGML_CUDA_GDN_FUSE_PRED");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (!exact_pred) {
+        return true;
+    }
+    if (ggml_get_op_params_i32(dst, 1) == 1) {
+        return false; // replay window: always the per-token kernel
+    }
+    return ggml_cuda_gdn_mma_candidate(ggml_cuda_get_device(), ggml_cuda_gdn_mma_args_from_tensor(dst));
 }
 
 static ggml_cuda_gdn_mma_args ggml_cuda_gdn_mma_args_from_tensor(const ggml_tensor * dst) {
@@ -746,6 +766,13 @@ static void ggml_cuda_op_gated_delta_net_impl(
             ga_bias  = it->second.bias;
             ga_scale = it->second.scale;
             ctx.gdn_gates_in.erase(it);
+        }
+    }
+
+    if (s_ids != nullptr || beta_raw != nullptr || ga != nullptr) {
+        ggml_cuda_p1_stat(GGML_CUDA_P1_GDN_FUSED);
+        if (src_g->ne[0] == 1 && K < n_tokens && S_v == 128 && neq0 == 128) {
+            ggml_cuda_p1_stat(GGML_CUDA_P1_GDN_FUSED_NEW); // refused by the shape-only test (k19-p1fuse)
         }
     }
 

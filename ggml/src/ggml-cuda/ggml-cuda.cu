@@ -1,5 +1,6 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
 #include "ggml-cuda.h"
+#include "p1fuse-stats.cuh"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
@@ -150,6 +151,24 @@ int ggml_cuda_get_device() {
     int id;
     CUDA_CHECK(cudaGetDevice(&id));
     return id;
+}
+
+void ggml_cuda_p1_stat(ggml_cuda_p1_stat_kind kind) {
+    static const bool on = getenv("GGML_CUDA_P1FUSE_STATS") != nullptr && atoi(getenv("GGML_CUDA_P1FUSE_STATS")) != 0;
+    static std::atomic<long long> counts[GGML_CUDA_P1_COUNT];
+    if (!on) {
+        return;
+    }
+    static std::once_flag once;
+    std::call_once(once, [] {
+        atexit([] {
+            fprintf(stderr, "k19-p1fuse stats: gdn_fused_new=%lld gdn_fused=%lld gated_norm_silu=%lld gated_norm_sigmoid=%lld mmvf_onebar=%lld mmvf_twobar=%lld\n",
+                (long long) counts[GGML_CUDA_P1_GDN_FUSED_NEW], (long long) counts[GGML_CUDA_P1_GDN_FUSED],
+                (long long) counts[GGML_CUDA_P1_GATED_NORM_SILU], (long long) counts[GGML_CUDA_P1_GATED_NORM_SIG],
+                (long long) counts[GGML_CUDA_P1_MMVF_ONEBAR], (long long) counts[GGML_CUDA_P1_MMVF_TWOBAR]);
+        });
+    });
+    counts[kind]++;
 }
 
 static bool ggml_cuda_env_flag(const char * name) {
@@ -8971,6 +8990,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // MUL, in one kernel that also writes the q8_1 copy the out projection reads (ggml_cuda_op_rms_norm_mul_sigmoid_gate); before, the
     // norm * weight kernel and the sigmoid * product kernel (with the q8_1 copy). Bitwise the two kernels. View nodes may sit between
     // the four (z's reshape comes right before the sigmoid), as long as they view none of the fused nodes
+    // k19-p1fuse (GGML_CUDA_GATED_NORM_SILU=0 off): also the silu gate of qwen35 / qwen35moe (build_norm_gated), op_silu(z) * g as the
+    // unfused unary_mul kernel computes it: the same kernels with the gate expression a template parameter
     static const bool k19_gated_norm_off = ggml_cuda_env_flag("GGML_CUDA_DISABLE_GATED_NORM_Q8");
     if (node->op == GGML_OP_RMS_NORM && !k19_gated_norm_off) {
         const int ia = ggml_cuda_k19_next_compute(cgraph, i);
@@ -8984,7 +9005,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_op ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
             const int out_nodes[] = { ic };
             if (mul_w->op == GGML_OP_MUL && (mul_w->src[0] == node || mul_w->src[1] == node) && unary->op == GGML_OP_UNARY &&
-                    ggml_get_unary_op(unary) == GGML_UNARY_OP_SIGMOID && mul_g->op == GGML_OP_MUL &&
+                    (ggml_get_unary_op(unary) == GGML_UNARY_OP_SIGMOID ||
+                     (ggml_get_unary_op(unary) == GGML_UNARY_OP_SILU && ggml_cuda_gated_norm_silu_enabled())) && mul_g->op == GGML_OP_MUL &&
                     ((mul_g->src[0] == mul_w && mul_g->src[1] == unary) || (mul_g->src[0] == unary && mul_g->src[1] == mul_w)) &&
                     ggml_are_same_shape(mul_w, node) && ggml_are_same_shape(mul_g, mul_w) && ggml_are_same_shape(unary, mul_w) &&
                     ggml_cuda_k19_views_between_ok(cgraph, i, ic, idxs, 4) &&
@@ -9008,17 +9030,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         q8_1_out = cache.reserve(mul_g->data, ggml_nbytes(mul_g), key, nrows*ne10q/QK8_1*sizeof(block_q8_1));
                     }
                 }
+                const bool silu_gate = ggml_get_unary_op(unary) == GGML_UNARY_OP_SILU;
                 if (!target && ggml_cuda_try_gated_norm_mmq(cuda_ctx, cgraph, node, mul_w, unary, mul_g, ic)) {
+                    ggml_cuda_p1_stat(silu_gate ? GGML_CUDA_P1_GATED_NORM_SILU : GGML_CUDA_P1_GATED_NORM_SIG);
                     return ic - i;
                 }
                 if (q8_1_out != nullptr || !target) {
                     const bool ok = ggml_cuda_op_rms_norm_mul_sigmoid_gate(*cuda_ctx, node, mul_w, unary, mul_g, q8_1_out, ne10, ne10q);
                     GGML_ASSERT(ok);
-                    static bool logged = false;
-                    if (!logged) {
-                        logged = true;
-                        GGML_LOG_INFO("%s: k19 gated norm: rms_norm * w * sigmoid(z)%s in one kernel (GGML_CUDA_DISABLE_GATED_NORM_Q8=1: off)\n",
-                                      __func__, q8_1_out ? " + q8_1" : "");
+                    ggml_cuda_p1_stat(silu_gate ? GGML_CUDA_P1_GATED_NORM_SILU : GGML_CUDA_P1_GATED_NORM_SIG);
+                    static bool logged[2] = { false, false };
+                    if (!logged[silu_gate]) {
+                        logged[silu_gate] = true;
+                        GGML_LOG_INFO("%s: k19 gated norm: rms_norm * w * %s(z)%s in one kernel (GGML_CUDA_DISABLE_GATED_NORM_Q8=1: off%s)\n",
+                                      __func__, silu_gate ? "silu" : "sigmoid", q8_1_out ? " + q8_1" : "",
+                                      silu_gate ? "; GGML_CUDA_GATED_NORM_SILU=0: sigmoid only" : "");
                     }
                     return ic - i;
                 }

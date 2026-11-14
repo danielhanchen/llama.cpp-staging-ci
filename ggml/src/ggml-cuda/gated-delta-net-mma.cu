@@ -384,21 +384,20 @@ template <int C, int V, int BLOCKS = 1> bool init(int device) {
 
 enum class gdn_path { ar, slice32_one_block, slice32_two_blocks, slice64, whole_head };
 
-static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a) {
+// k19-p1fuse: the shape / device / switch part of select_gdn_mma_path, without the kernel set-up (init): false = the AR kernel for
+// sure. ggml_cuda_gdn_mma_candidate exports it for the fusion matchers (ggml_cuda_gated_delta_net_may_use_mma)
+static bool gdn_mma_candidate(int device, const ggml_cuda_gdn_mma_args & a) {
     GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
     if (!a.eligible || a.H_k != 16 || (a.H != 16 && a.H != 32 && a.H != 48 && a.H != 64) || a.n_tokens < 64 ||
         a.n_tokens > INT64_MAX - 32 || a.rq3 <= 0 || a.n_seqs <= 0 || a.n_seqs > INT_MAX / (a.H * 4)) {
-        return gdn_path::ar;
+        return false;
     }
     const auto & info = ggml_cuda_info().devices[device];
 #ifdef GGML_USE_HIP
-    if (!GGML_CUDA_CC_IS_RDNA3_5(info.cc) || a.n_tokens < 2048) {
-        return gdn_path::ar;
-    }
-    return init<16, 64>(device) ? gdn_path::slice64 : gdn_path::ar;
+    return GGML_CUDA_CC_IS_RDNA3_5(info.cc) && a.n_tokens >= 2048;
 #elif defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(info);
-    return gdn_path::ar;
+    return false;
 #else
     // Enable only architectures benchmarked for this schedule. MMA support alone does not imply a speedup.
     // k15-mm2: B200 (cc 1000) added: prefill 512 / 2048 tokens with 16 key heads (Qwen3.6-35B-A3B, Flash-Next / Qwen3.6-27B) 1.6-3.3x
@@ -413,11 +412,22 @@ static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a
         const char * e = getenv("GGML_CUDA_GDN_MMA_B200");
         return e == nullptr || atoi(e) != 0;
     }();
-    if (force == 0 || !ampere_mma_available(info.cc) ||
+    return !(force == 0 || !ampere_mma_available(info.cc) ||
         (force != 1 && info.cc != GGML_CUDA_CC_AMPERE_GA10X && info.cc != GGML_CUDA_CC_ADA_LOVELACE && (info.cc != 1000 || !b200) &&
-         info.cc != GGML_CUDA_CC_BLACKWELL && info.cc != GGML_CUDA_CC_DGX_SPARK)) {
+         info.cc != GGML_CUDA_CC_BLACKWELL && info.cc != GGML_CUDA_CC_DGX_SPARK));
+#endif // GGML_USE_HIP
+}
+
+static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a) {
+    if (!gdn_mma_candidate(device, a)) {
         return gdn_path::ar;
     }
+#ifdef GGML_USE_HIP
+    return init<16, 64>(device) ? gdn_path::slice64 : gdn_path::ar;
+#elif defined(GGML_USE_MUSA)
+    return gdn_path::ar;
+#else
+    const auto & info = ggml_cuda_info().devices[device];
     // Value splitting pays off when whole heads leave at least half the SMs idle.
     if (a.H * a.n_seqs * 2 <= info.nsm) {
         // A grid that already fits in one wave benefits from a larger register budget.
@@ -430,6 +440,10 @@ static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a
 #endif // GGML_USE_HIP
 }
 }  // namespace
+
+bool ggml_cuda_gdn_mma_candidate(int device, const ggml_cuda_gdn_mma_args & a) {
+    return gdn_mma_candidate(device, a);
+}
 
 bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & a, cudaStream_t stream) {
     if (!a.state_out) {

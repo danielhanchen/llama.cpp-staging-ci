@@ -74,9 +74,12 @@ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
-// k19: RMS_NORM -> MUL (weight) -> MUL by SIGMOID(z) in one kernel (+ the q8_1 copy in the reader's rows ne10 / ne10q when q8_1_out),
-// bitwise the unfused kernels; false (nothing launched) if the shapes do not fit. check_only: the test alone (q8_1_out != nullptr
-// asks it for a copy of ne10 / ne10q rows)
+// k19-p1fuse: the silu gate of the fused gated norm (qwen35 / qwen35moe) is on (GGML_CUDA_GATED_NORM_SILU=0: sigmoid only)
+bool ggml_cuda_gated_norm_silu_enabled();
+
+// k19: RMS_NORM -> MUL (weight) -> MUL by SIGMOID(z) (k19-p1fuse: or SILU(z)) in one kernel (+ the q8_1 copy in the reader's rows ne10 /
+// ne10q when q8_1_out), bitwise the unfused kernels; false (nothing launched) if the shapes or the op do not fit. check_only: the test
+// alone (q8_1_out != nullptr asks it for a copy of ne10 / ne10q rows)
 bool ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * mul_w,
                                             const ggml_tensor * unary, ggml_tensor * mul_gate, void * q8_1_out, int64_t ne10, int64_t ne10q,
                                             bool check_only = false);
