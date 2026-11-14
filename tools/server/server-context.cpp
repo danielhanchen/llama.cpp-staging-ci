@@ -170,6 +170,10 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     // DFlash2 n6 chat 203.1 -> 224.1 tok/s (same text), 8k 172.7 -> 190.3 (other text: the prewarm moves the cached experts, so the
     // host-computed ones; srv_kld long48 inside the -fa off band), 3 launches on one VM with the CPU-miss calibration pinned for both
     // builds. At 16 GB (15.5% cached) keep it off: level with the pause, -24% without it. Opt-in because the 8k text changes (exact in chat)
+    // k19-prewexact: with the cache taken back after the windows (exact, below) the text is that of no prewarm in chat and 8k: same VM,
+    // CPU-miss calibration pinned, 3 launches (px_c32): chat 213.1 (int3) / 209.8 (FRAC unset) -> 231.5 tok/s, 8k 180.5 / 180.5 -> 179.9,
+    // md5 equal in every launch; the 8k gain of the prewarm without the restore (195.8) came with its other text. 24 GB (27.1% cached)
+    // is under 0.3, so no prewarm there
     static const double cached_frac_min = getenv("LLAMA_SPEC_PREWARM_CACHED_FRAC") != nullptr ?
         atof(getenv("LLAMA_SPEC_PREWARM_CACHED_FRAC")) : 0.0;
     static const int cached_min_w = getenv("LLAMA_SPEC_PREWARM_CACHED_MIN_W") != nullptr ?
@@ -254,7 +258,11 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     // gave chat the same text but 8k another one (832d4d83 vs 6974c3ad). Exact: the cache's state is snapshotted before the windows and
     // taken back after them (the experts of the slots that changed are copied back into the banks, slots / clock / device counters /
     // seed and refill bookkeeping restored) and its rules are quiet meanwhile (no CPU-miss window, timing trial, overlap rule or trial
-    // moves), so the first request sees the cache it would have seen without the prewarm and only the captured graphs remain.
+    // moves), so the first request sees the cache it would have seen without the prewarm and only the captured graphs remain
+    // (G4 Flash-Next 32 GB: 337 slots get their expert back, 795 MiB, per launch; the state fingerprints at every request begin equal
+    // those of a launch without the prewarm, LLAMA_MOE_CACHE_FP_LOG=1). Not the default for the wide-graph prewarm (>= 60% cached, G4
+    // 48 GB): there its windows end the CPU-miss warm phase and timing trial before the first request, and exact moves them into it
+    // (px_ab48b DFlash2 chat 261.7 -> 245.0 tok/s); the 48 GB 8k text varies per launch with or without a prewarm (the timing trial).
     // LLAMA_SPEC_PREWARM_EXACT unset = exact for the band prewarm (a cache under the wide-graph share), 1 = also over it, 0 = never (the
     // k19-tokcost pause below then)
     const char * e_ex  = getenv("LLAMA_SPEC_PREWARM_EXACT");
