@@ -222,6 +222,8 @@ LLAMA_API void llama_moe_cache_fingerprint(struct llama_context * ctx, const cha
 // k19-p2qsa: while paused (calls nest), QSA graphs score their selection even where every pool fits the top_k (LLAMA_QSA_ALLFIT): a server
 // prewarms its decode / verify graphs in the scored form, the one requests past 512 pools need, as before the all-fit graphs (process wide)
 LLAMA_API void llama_qsa_allfit_pause(bool on);
+// k19-int3fix: the context's memory selects QSA pools (Flash-Next indexer with a pool top_k): the all-fit graph form exists for it
+LLAMA_API bool llama_qsa_allfit_capable(const struct llama_context * ctx);
 
 // k15-ttft: a MoE cache runs (experts stream from host memory into device slots)
 LLAMA_API bool llama_moe_cache_active(const struct llama_context * ctx);

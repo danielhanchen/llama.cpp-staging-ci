@@ -207,7 +207,15 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
         sum_w += w;
     }
     const int n_chain = std::max<int>(1, (int) chains.size());
-    const int n_end = n_pre + n_chain*reps*sum_w;
+    // k19-p2qsa / k19-int3fix: the QSA form of the prewarmed decode / verify graphs. LLAMA_SPEC_PREWARM_ALLFIT unset (or 2) = both forms
+    // when the model selects QSA pools: the scored graphs (a request past 512 pools replays them) and the all-fit graphs (every shorter
+    // request replays them); 0 = scored only (k19-p2qsa 7f298b321bd: the first short request then builds its all-fit widths inside its
+    // decode, G4 Flash-Next 48 GB DFlash2 chat 281.5 -> 259.9 tok/s, +1.8 ms per pass); 1 = all-fit only (before 7f298b321bd: the first
+    // request past 512 pools builds the scored widths, G4 full card MTP 8k after chat -2.9%)
+    static const int pw_mode = getenv("LLAMA_SPEC_PREWARM_ALLFIT") != nullptr ? atoi(getenv("LLAMA_SPEC_PREWARM_ALLFIT")) : 2;
+    const bool pw_both  = pw_mode >= 2 && llama_qsa_allfit_capable(ctx);
+    const int  n_forms  = pw_both ? 2 : 1;
+    const int  n_end    = n_pre + n_forms*n_chain*reps*sum_w;
     if (widths.empty() || ctx == nullptr || (llama_moe_cache_active(ctx) && !cached_ok) ||
             llama_n_batch(ctx) < (uint32_t) std::max(w_max, std::min(n_pre, 1)) || (int) llama_n_ctx_seq(ctx) < n_end + 64) {
         return;
@@ -279,8 +287,9 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     // prewarm left only all-fit graphs, so the first verify / decode of such a request rebuilt every width inside its decode (G4 Flash-Next
     // full card, MTP 8k after chat: 4 builds, -2.9%). The first short request builds its all-fit graphs beside them instead (its own ways),
     // a one-time cost per width. LLAMA_SPEC_PREWARM_ALLFIT=1: prewarm the all-fit form instead
-    static const bool pw_allfit = getenv("LLAMA_SPEC_PREWARM_ALLFIT") != nullptr && atoi(getenv("LLAMA_SPEC_PREWARM_ALLFIT")) != 0;
-    if (!pw_allfit) {
+    // the first (or only) form is the scored one unless LLAMA_SPEC_PREWARM_ALLFIT=1; with both forms the pause ends before the second
+    bool pw_paused = pw_mode != 1;
+    if (pw_paused) {
         llama_qsa_allfit_pause(true);
     }
     llama_set_verify(ctx, false);
@@ -291,6 +300,11 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
         done += n;
     }
     int n_ok = 0;
+    for (int form = 0; form < n_forms && ok; ++form) {
+    if (form == 1 && pw_paused) {
+        llama_qsa_allfit_pause(false); // second form: all-fit
+        pw_paused = false;
+    }
     for (int c = 0; c < n_chain && ok; ++c) {
         if (!chains.empty()) {
             ok = llama_set_sampler_swap(ctx, 0, chains[c]);
@@ -315,6 +329,10 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
             }
         }
     }
+    } // forms
+    if (pw_both && ok) {
+        SRV_INF("k19-int3fix: verify graphs prewarmed in both QSA forms, scored and all-fit, %d widths (LLAMA_SPEC_PREWARM_ALLFIT=0: scored only)\n", (int) widths.size());
+    }
     if (!ok) {
         SRV_WRN("k19-vwidth: verify graph prewarm stopped at %d rows (a decode or sampler swap failed)\n", n_ok + 1);
     }
@@ -326,7 +344,7 @@ static void server_spec_prewarm(llama_context * ctx, bool gpu, int32_t n_out_max
     llama_batch_free(b);
     llama_memory_clear(mem, true);
     llama_synchronize(ctx);
-    if (!pw_allfit) {
+    if (pw_paused) {
         llama_qsa_allfit_pause(false);
     }
     if (cm_pause) {

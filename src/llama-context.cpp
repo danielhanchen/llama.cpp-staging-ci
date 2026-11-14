@@ -13352,6 +13352,12 @@ bool llama_moe_cpu_miss_drop_slow(llama_context * ctx) {
     return ctx != nullptr && ctx->moe_cpu_miss_drop_slow();
 }
 
+// k19-int3fix: see llama-ext.h
+bool llama_qsa_allfit_capable(const llama_context * ctx) {
+    const auto * mem_idx = ctx != nullptr ? dynamic_cast<const llama_memory_hybrid_idx *>(ctx->get_memory()) : nullptr;
+    return mem_idx != nullptr && mem_idx->get_kpool_top() > 0;
+}
+
 bool llama_moe_cache_active(const llama_context * ctx) {
     return ctx != nullptr && ctx->moe_cache_active();
 }
