@@ -1165,6 +1165,36 @@ static bool llama_mtp_borrow_io_env() {
     return e == nullptr || atoi(e) != 0;
 }
 
+// k19-pr374 (ported from LeoBorcherding's Qwen4Exp shared MTP heads, unslothai/llama.cpp, MIT): a shared MTP drafter ships neither
+// token_embd nor output and borrows both from its target. LLAMA_MTP_BORROW_MISSING=0: such a drafter is refused at load (as before)
+static bool llama_mtp_borrow_missing_env() {
+    const char * e = getenv("LLAMA_MTP_BORROW_MISSING");
+    return e == nullptr || atoi(e) != 0;
+}
+
+bool llama_model_loader::shared_drafter_file() const {
+    return get_weight("token_embd.weight") == nullptr && get_weight("output.weight") == nullptr;
+}
+
+ggml_type llama_model_loader::borrow_missing_type(llm_tensor t) const {
+    const char * key = t == LLM_TENSOR_TOKEN_EMBD ? "general.mtp_borrow_token_embd_type" :
+                       t == LLM_TENSOR_OUTPUT     ? "general.mtp_borrow_output_type"     : nullptr;
+    if (key == nullptr) {
+        return GGML_TYPE_COUNT;
+    }
+    auto it = kv_overrides.find(key);
+    if (it == kv_overrides.end() || it->second.tag != LLAMA_KV_OVERRIDE_TYPE_STR) {
+        return GGML_TYPE_COUNT;
+    }
+    for (int i = 0; i < GGML_TYPE_COUNT; ++i) {
+        const char * n = ggml_type_name((ggml_type) i);
+        if (n != nullptr && strcmp(n, it->second.val_str) == 0 && ggml_type_size((ggml_type) i) > 0) {
+            return (ggml_type) i;
+        }
+    }
+    return GGML_TYPE_COUNT;
+}
+
 // k16-draft (idea from ik_llama.cpp by ikawrakow, shared MTP companions without their own IO): a separate MTP draft model
 // (Qwen3.8-Flash-Next mtp-*.gguf) ships its own token_embd and output, the same weights the target already holds. With mtp_borrow_io
 // and the target as model_shared the draft uses the target's tensors instead: its own copies are neither allocated nor read (the
@@ -1178,8 +1208,10 @@ struct ggml_tensor * llama_model_loader::borrow_io(const llama_hparams & hparams
         return nullptr;
     }
     const std::string name = tn.str();
+    // w == nullptr: a shared drafter without its own copy (k19-pr374), which only the target's tensor can stand in for
+    // (only a file with neither tensor is one: a drafter with its own token_embd and no output ties its head to that copy, as before)
     const llama_tensor_weight * w = get_weight(name.c_str());
-    if (w == nullptr) {
+    if (w == nullptr && (!llama_mtp_borrow_missing_env() || !shared_drafter_file())) {
         return nullptr;
     }
     ggml_tensor * src = nullptr;
@@ -1192,15 +1224,27 @@ struct ggml_tensor * llama_model_loader::borrow_io(const llama_hparams & hparams
     bool same = src != nullptr && src->buffer != nullptr && ggml_n_dims(src) <= 2;
     size_t dim = 0;
     for (const int64_t n : ne) {
-        same = same && dim < GGML_MAX_DIMS && src->ne[dim] == n && w->tensor->ne[dim] == n;
+        same = same && dim < GGML_MAX_DIMS && src->ne[dim] == n && (w == nullptr || w->tensor->ne[dim] == n);
         dim++;
     }
     for (; same && dim < GGML_MAX_DIMS; dim++) {
         same = src->ne[dim] == 1;
     }
     if (!same) {
+        if (w == nullptr) {
+            return nullptr; // the draft has no copy to keep: create_tensor reports the missing tensor as before
+        }
         LLAMA_LOG_WARN("%s: %s: the target has no tensor of the same shape, the draft keeps its own copy\n", __func__, name.c_str());
         return nullptr;
+    }
+    if (w == nullptr) {
+        if (tn.tensor == LLM_TENSOR_OUTPUT) {
+            output_borrowed = true;
+        }
+        LLAMA_LOG_INFO("%s: %s taken from the target model (%s on %s; the draft file has none: a shared MTP drafter; "
+                "LLAMA_MTP_BORROW_MISSING=0 refuses it)\n", __func__, name.c_str(), ggml_type_name(src->type),
+                ggml_backend_buffer_name(src->buffer));
+        return src;
     }
     // the file's tensor is accounted as used and never read (as an unused tensor)
     const size_t nbytes = ggml_nbytes(w->tensor);
@@ -1446,6 +1490,42 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     if (ggml_tensor * shared = borrow_io(hparams, tn, ne, flags)) {
         return shared;
+    }
+
+    // k19-pr374: the memory measurement (no_alloc) of a shared MTP drafter, no target loaded yet: token_embd / output, absent from its
+    // file, are priced as the borrowed copies of a self-contained drafter are (below and in the host branch of the output): in the
+    // target's type, on the host, the device buffer type the output would take kept for the draft head made from it
+    if (no_alloc && mtp_borrow_io && model_shared == nullptr && hparams.n_layer_nextn > 0 && !(flags & TENSOR_DUPLICATED) &&
+            (tn.tensor == LLM_TENSOR_TOKEN_EMBD || tn.tensor == LLM_TENSOR_OUTPUT) && llama_mtp_borrow_io_env() &&
+            llama_mtp_borrow_missing_env() && shared_drafter_file()) {
+        const ggml_type bt = borrow_missing_type(tn.tensor);
+        if (bt != GGML_TYPE_COUNT && ne.size() >= 1 && ne.begin()[0] % ggml_blck_size(bt) == 0) {
+            ggml_tensor t_meta;
+            memset(&t_meta, 0, sizeof(ggml_tensor));
+            t_meta.type = bt;
+            for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
+                t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
+                if (dim == 0) {
+                    t_meta.nb[dim] = ggml_type_size(bt);
+                } else if (dim == 1) {
+                    t_meta.nb[dim] = ggml_row_size(bt, t_meta.ne[dim-1]);
+                } else {
+                    t_meta.nb[dim] = t_meta.nb[dim-1]*t_meta.ne[dim-1];
+                }
+            }
+            ggml_set_name(&t_meta, tn.str().c_str());
+            ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+            GGML_ASSERT(buft != nullptr);
+            if (tn.tensor == LLM_TENSOR_OUTPUT && !ggml_backend_buft_is_host(buft)) {
+                output_dry_buft = buft;
+                buft = ggml_backend_cpu_buffer_type();
+            }
+            ggml_tensor * t = ggml_dup_tensor(ctx_for_buft(buft), &t_meta);
+            ggml_set_name(t, tn.str().c_str());
+            LLAMA_LOG_INFO("%s: %s: not in the draft file, measured as the target's %s (a shared MTP drafter)\n", __func__,
+                    tn.str().c_str(), ggml_type_name(bt));
+            return t;
+        }
     }
 
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
