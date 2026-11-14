@@ -466,21 +466,22 @@ int main(int argc, char ** argv) {
 
     struct mode { const char * name; const char * env; };
     const mode modes[] = {
-        { "base",       "GGML_CUDA_MMVQ_KQTC=0" },
-        { "tc",         "GGML_CUDA_MMVQ_KQTC=1" },
-        { "tc_4x1",     "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_MMVQ_KQTC_CFG=4x1" },
-        { "tc_4x2",     "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_MMVQ_KQTC_CFG=4x2" },
-        { "tc_8x1",     "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_MMVQ_KQTC_CFG=8x1" },
-        { "tc_8x2",     "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_MMVQ_KQTC_CFG=8x2" },
-        { "base_exact", "GGML_CUDA_MMVQ_KQTC=0 GGML_CUDA_VERIFY_REASSOC=0" },
-        { "tc_exact",   "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_VERIFY_REASSOC=0" },
-        { "base_mmq0",  "GGML_CUDA_MMVQ_KQTC=0 GGML_CUDA_VERIFY_MMQ=0" },
-        { "tc_mmq0",    "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_VERIFY_MMQ=0" },
+        { "base",       "GGML_CUDA_MMVQ_KQTC=0 GGML_CUDA_MMQ_FEW=0" },
+        { "tc",         "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_MMQ_FEW=0" },
+        { "tc_4x1",     "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_MMVQ_KQTC_CFG=4x1 GGML_CUDA_MMQ_FEW=0" },
+        { "tc_4x2",     "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_MMVQ_KQTC_CFG=4x2 GGML_CUDA_MMQ_FEW=0" },
+        { "tc_8x1",     "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_MMVQ_KQTC_CFG=8x1 GGML_CUDA_MMQ_FEW=0" },
+        { "tc_8x2",     "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_MMVQ_KQTC_CFG=8x2 GGML_CUDA_MMQ_FEW=0" },
+        { "base_exact", "GGML_CUDA_MMVQ_KQTC=0 GGML_CUDA_VERIFY_REASSOC=0 GGML_CUDA_MMQ_FEW=0" },
+        { "tc_exact",   "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_VERIFY_REASSOC=0 GGML_CUDA_MMQ_FEW=0" },
+        { "base_mmq0",  "GGML_CUDA_MMVQ_KQTC=0 GGML_CUDA_VERIFY_MMQ=0 GGML_CUDA_MMQ_FEW=0" },
+        { "tc_mmq0",    "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_VERIFY_MMQ=0 GGML_CUDA_MMQ_FEW=0" },
         // the few-row MMQ ported from upstream (GGML_CUDA_MMQ_FEW): own src1 quantization (x * (127 / amax) instead of x / d), so
         // only the fp64-reference gate; Ampere and newer, K >= 2048 only
         { "few",        "GGML_CUDA_MMQ_FEW=2" },
         { "few_up",     "GGML_CUDA_MMQ_FEW=1" },
         { "few_exact",  "GGML_CUDA_MMQ_FEW=2 GGML_CUDA_VERIFY_REASSOC=0" },
+        { "few_auto",   "GGML_CUDA_MMVQ_KQTC=0" },   // the shipped default: GGML_CUDA_MMQ_FEW unset = the per-architecture table
     };
     const int nm = (int) (sizeof(modes)/sizeof(modes[0]));
     std::vector<std::vector<uint8_t>> dumps(nm);
@@ -515,11 +516,13 @@ int main(int argc, char ** argv) {
     const auto is_lever = [&](int i) { return strncmp(modes[i].name, "tc", 2) == 0 || strncmp(modes[i].name, "few", 3) == 0; };
     const auto is_few   = [&](int i) { return strncmp(modes[i].name, "few", 3) == 0; };
     const bool few_dev  = cc < 0 || cc >= 800; // the few-row MMQ needs the Ampere MMA
+    const bool auto_dev = cc == 800 || cc == 890 || cc == 1200; // devices of its AUTO table
 
     // engagement: base never logs, every lever mode logs (single and multi-matrix launches)
     for (int i = 0; i < nm; ++i) {
         const bool lever = is_lever(i);
-        const bool ok = !lever ? logs[i] == 0 : is_few(i) ? (few_dev ? logs[i] > 0 : logs[i] == 0) : logs[i] > 0 && logs_m[i] > 0;
+        const bool dev_i = strcmp(modes[i].name, "few_auto") == 0 ? auto_dev : few_dev;
+        const bool ok = !lever ? logs[i] == 0 : is_few(i) ? (dev_i ? logs[i] > 0 : logs[i] == 0) : logs[i] > 0 && logs_m[i] > 0;
         if (!ok) {
             printf("FAIL engagement %s: %d launches (%d multi)\n", modes[i].name, logs[i], logs_m[i]);
             n_fail++;

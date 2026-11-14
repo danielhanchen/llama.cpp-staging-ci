@@ -70,12 +70,14 @@ static constexpr int MMQ_FEW_MAX_NCG = 3;  // max. number of column groups
 static constexpr int MMQ_FEW_NROWS   = 16; // src0 rows of one MMA tile
 static constexpr int MMQ_FEW_NWARPS  = 4;
 
-// k19-kqtc: GGML_CUDA_MMQ_FEW (opt-in): unset / 0 = off, 1 = the upstream per-type minimum columns (ggml_cuda_mmq_few_min_ncols), N >= 2 = from N columns for
-// every type it decodes; GGML_CUDA_MMQ_FEW_MAX (default 8) = the most columns taken (upstream: 24)
+// k19-kqtc: GGML_CUDA_MMQ_FEW: unset = AUTO (the per-architecture table in ggml_cuda_mmq_few_auto_min_ncols: A100 / A30 and Ada
+// measured, off elsewhere), 0 = off, 1 = the upstream per-type minimum columns (ggml_cuda_mmq_few_min_ncols) on every Ampere+ device,
+// N >= 2 = from N columns for every type it decodes; GGML_CUDA_MMQ_FEW_MAX (default 8, the verify widths) = the most columns taken
+// (upstream: 24; wider products keep MMQ)
 struct mmq_few_env_t { int mode; int max_cols; };
 static const mmq_few_env_t & mmq_few_env() {
     static const mmq_few_env_t e = [] {
-        mmq_few_env_t r = { 0, 8 };
+        mmq_few_env_t r = { -1, 8 };
         if (const char * v = getenv("GGML_CUDA_MMQ_FEW")) {
             r.mode = atoi(v);
         }
@@ -856,7 +858,7 @@ void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor 
     }
     static std::once_flag once;
     std::call_once(once, [&] {
-        GGML_LOG_INFO("k19-kqtc: few-row MMQ (GGML_CUDA_MMQ_FEW=%d, up to %d columns) takes dense products (first: %s, %lld columns, K %lld)\n",
+        GGML_LOG_INFO("k19-kqtc: few-row MMQ (GGML_CUDA_MMQ_FEW=%d (-1 = AUTO), up to %d columns; =0 off) takes dense products (first: %s, %lld columns, K %lld)\n",
             mmq_few_env().mode, mmq_few_env().max_cols, ggml_type_name(src0->type), (long long) ne11, (long long) ne00);
     });
 
@@ -928,12 +930,40 @@ static int ggml_cuda_mmq_few_min_ncols(const ggml_type type, const int cc, const
     }
 }
 
+// k19-kqtc AUTO table (min columns, 0 = off), from Qwen3.8-27B UD-Q4_K_XL + MTP verify passes (plans/k19_kqtc.md):
+// - cc 8.0 (A100 / A30): K-quants from 2 columns (micro-bench 5 columns: Q4_K 53%, Q5_K 57% of the batched mmvq; q38d MTP +41% chat,
+//   +39% 8k on an A100 40 GB), Q6_K / IQ4_XS from 3, Q8_0 from 5 (from 2 it moved q4x's Q8_0 verify text: -5% chat by acceptance);
+// - cc 8.9 (Ada, L4): the upstream table (L4 q38d +8.5% chat, +5.4% 8k);
+// - cc 12.0 (RTX PRO 6000 / RTX 50xx): the upstream table (G4 q38d +2.1% chat, flat 8k);
+// - other devices: off (not measured); GGML_CUDA_MMQ_FEW=1 / N turns it on.
+static int ggml_cuda_mmq_few_auto_min_ncols(const ggml_type type, const int cc, const int64_t ne00) {
+    const int up = ggml_cuda_mmq_few_min_ncols(type, cc, ne00);
+    if (up == 0 || !GGML_CUDA_CC_IS_NVIDIA(cc)) {
+        return 0;
+    }
+    if (cc == GGML_CUDA_CC_AMPERE) {
+        switch (type) {
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:   return 2;
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_IQ4_XS: return 3;
+            case GGML_TYPE_Q8_0:   return 5;
+            default:               return up;
+        }
+    }
+    if (cc == GGML_CUDA_CC_ADA_LOVELACE || cc == GGML_CUDA_CC_BLACKWELL) {
+        return up;
+    }
+    return 0;
+}
+
 bool ggml_cuda_should_use_mmq_few(const ggml_tensor * src0, const ggml_tensor * src1, const int cc) {
     const mmq_few_env_t & env = mmq_few_env();
-    if (env.mode <= 0) {
+    if (env.mode == 0) {
         return false;
     }
-    int min_ncols = ggml_cuda_mmq_few_min_ncols(src0->type, cc, src0->ne[0]);
+    int min_ncols = env.mode < 0 ? ggml_cuda_mmq_few_auto_min_ncols(src0->type, cc, src0->ne[0]) :
+                                   ggml_cuda_mmq_few_min_ncols(src0->type, cc, src0->ne[0]);
     if (min_ncols != 0 && env.mode >= 2) {
         min_ncols = env.mode;
     }
