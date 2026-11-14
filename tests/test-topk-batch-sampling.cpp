@@ -6,6 +6,8 @@
 // (top-k 256 / 20 alone) and a sampling chain (top-k 20, temp 0.7, dist with a fixed seed). Gate: the dumps are equal and the
 // batched top-k engaged in the default mode only (no batched windows: FAIL, the comparison would prove nothing); a third child
 // repeats the per-row mode, and the two per-row runs must agree (else the device is not repeatable and nothing is proven).
+// A fourth child decodes the same batches without a backend sampler and takes each row's top-k set from the raw logits on the host
+// (lowest columns on ties): the batched sets must equal it (a check independent of the per-row path).
 //
 // Usage: test-topk-batch-sampling <model.gguf> [cpu|gpu]
 
@@ -14,6 +16,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <map>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -50,7 +53,48 @@ static uint64_t fnv(const void * p, size_t n) {
 static int g_chain = 0;
 static int g_call  = 0;
 
+static bool g_ref   = false; // reference child: no backend sampler, the top-k set of the raw logits row on the host
+static int  g_n_vocab = 0;
+
+static uint32_t ordered_key(float v) {
+    uint32_t bits;
+    memcpy(&bits, &v, 4);
+    if (v == 0.0f) {
+        bits = 0;
+    }
+    const uint32_t mask = (uint32_t) (-(int32_t) (bits >> 31)) | 0x80000000U;
+    return bits ^ mask;
+}
+
+// hash of the sorted ids of the k best columns by (key desc, column asc): the set every device's deterministic top-k selects
+static uint64_t set_hash(const llama_token * ids, size_t n) {
+    std::vector<llama_token> v(ids, ids + n);
+    std::sort(v.begin(), v.end());
+    return fnv(v.data(), v.size() * sizeof(llama_token));
+}
+
+static uint64_t ref_set(const float * row, int n, int k) {
+    std::vector<llama_token> idx(n);
+    for (int i = 0; i < n; ++i) {
+        idx[i] = i;
+    }
+    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](llama_token a, llama_token b) {
+        const uint32_t ka = ordered_key(row[a]);
+        const uint32_t kb = ordered_key(row[b]);
+        return ka != kb ? ka > kb : a < b;
+    });
+    return set_hash(idx.data(), k);
+}
+
 static void dump_row(FILE * f, llama_context * ctx, int32_t idx) {
+    if (g_ref) {
+        if (g_chain < 2) {
+            const float * row = llama_get_logits_ith(ctx, idx);
+            fprintf(f, "chain %d decode %2d row %2d: set %016llx\n", g_chain, g_call, idx,
+                    (unsigned long long) ref_set(row, g_n_vocab, g_chain == 0 ? std::min(256, g_n_vocab) : 20));
+        }
+        return;
+    }
     const uint32_t nc = llama_get_sampled_candidates_count_ith(ctx, idx);
     const llama_token * c = llama_get_sampled_candidates_ith(ctx, idx);
     const uint32_t nl = llama_get_sampled_logits_count_ith(ctx, idx);
@@ -61,6 +105,9 @@ static void dump_row(FILE * f, llama_context * ctx, int32_t idx) {
     fprintf(f, "chain %d decode %2d row %2d: cand %u %016llx logits %u %016llx probs %u %016llx token %d first %d\n", g_chain, g_call, idx,
             nc, (unsigned long long) (c ? fnv(c, nc * sizeof(llama_token)) : 0), nl, (unsigned long long) (l ? fnv(l, nl * sizeof(float)) : 0),
             np, (unsigned long long) (p ? fnv(p, np * sizeof(float)) : 0), t, c && nc > 0 ? c[0] : -1);
+    if (g_chain < 2) {
+        fprintf(f, "chain %d decode %2d row %2d: set %016llx\n", g_chain, g_call, idx, (unsigned long long) (c ? set_hash(c, nc) : 0));
+    }
 }
 
 static int run_child(const char * model_path, const char * device, const char * out_path) {
@@ -85,13 +132,15 @@ static int run_child(const char * model_path, const char * device, const char * 
     }
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    g_n_vocab = n_vocab;
+    g_ref     = getenv("TOPK_BATCH_TEST_REF") != nullptr;
 
     FILE * f = fopen(out_path, "w");
     if (f == nullptr) {
         return 5;
     }
 
-    for (int chain_kind = 0; chain_kind < 3; ++chain_kind) {
+    for (int chain_kind = 0; chain_kind < (g_ref ? 2 : 3); ++chain_kind) {
         g_chain = chain_kind;
         g_call  = 0;
         // 0: device top-k 256 (the server's dev_topk chain), 1: top-k 20, 2: top-k 20 + temp 0.7 + dist(seed 1234)
@@ -113,8 +162,8 @@ static int run_child(const char * model_path, const char * device, const char * 
         cparams.n_seq_max = 2;
         cparams.n_outputs_max_per_seq = 20;
         cparams.kv_unified = true;
-        cparams.samplers = cfg;
-        cparams.n_samplers = 2;
+        cparams.samplers = g_ref ? nullptr : cfg;
+        cparams.n_samplers = g_ref ? 0 : 2;
         llama_context * ctx = llama_init_from_model(model, cparams);
         if (ctx == nullptr) {
             return 6;
@@ -213,12 +262,16 @@ int main(int argc, char ** argv) {
             return 0;
         }
     }
-    // mode 0: default (batched), 1: LLAMA_DEV_TOPK_BATCH=0, 2: LLAMA_DEV_TOPK_BATCH=0 again (the device's own repeatability)
-    std::vector<std::string> lines[3];
-    int eng[3] = { -1, -1, -1 };
-    for (int mode = 0; mode < 3; ++mode) {
+    // mode 0: default (batched), 1: LLAMA_DEV_TOPK_BATCH=0, 2: LLAMA_DEV_TOPK_BATCH=0 again (the device's own repeatability),
+    // 3: the reference (no backend sampler: the top-k sets of the raw logits rows on the host, top-k chains only)
+    std::vector<std::string> lines[4];
+    int eng[4] = { -1, -1, -1, -1 };
+    for (int mode = 0; mode < 4; ++mode) {
         const std::string path = std::string(argv[1]) + ".topk_batch_" + device + "_" + std::to_string(mode) + ".txt";
         set_env("LLAMA_DEV_TOPK_BATCH", mode == 0 ? "1" : "0");
+        if (mode == 3) {
+            set_env("TOPK_BATCH_TEST_REF", "1");
+        }
         const std::string cmd = "\"" + std::string(argv[0]) + "\" --child \"" + argv[1] + "\" " + device + " \"" + path + "\"";
         const int rc = std::system(cmd.c_str());
         if (rc != 0) {
@@ -251,6 +304,35 @@ int main(int argc, char ** argv) {
         }
         return n;
     };
+    // the top-k sets against the reference
+    auto sets = [&](int m) {
+        std::map<std::string, std::string> r;
+        for (const auto & l : lines[m]) {
+            const size_t p = l.find(": set ");
+            if (p != std::string::npos) {
+                r[l.substr(0, p)] = l.substr(p + 6);
+            }
+        }
+        return r;
+    };
+    const auto ref = sets(3);
+    int n_ref_bad[2] = { 0, 0 };
+    for (int m = 0; m < 2; ++m) {
+        const auto got = sets(m);
+        for (const auto & [key, val] : ref) {
+            const auto it = got.find(key);
+            if (it == got.end() || it->second != val) {
+                if (n_ref_bad[m]++ < 4) {
+                    printf("  %s: mode %d set differs from the reference\n", key.c_str(), m);
+                }
+            }
+        }
+    }
+    printf("reference: %zu top-k rows; sets differing from it: batched %d, per-row %d\n", ref.size(), n_ref_bad[0], n_ref_bad[1]);
+    if (ref.empty() || n_ref_bad[0] != 0) {
+        printf("FAIL: the batched top-k does not select the reference set\n");
+        return 1;
+    }
     const int d_rep = ndiff(1, 2, true);
     const int d_on  = ndiff(0, 1, true);
     const bool rows_equal = d_on == 0 && !lines[0].empty();
