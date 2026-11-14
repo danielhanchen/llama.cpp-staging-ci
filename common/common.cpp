@@ -4151,11 +4151,30 @@ uma_restart:
             const bool ngl_user = mparams_in.n_gpu_layers != llama_model_default_params().n_gpu_layers;
             const bool tbo_none = std::none_of(params.tensor_buft_overrides.begin(), params.tensor_buft_overrides.end(),
                 [](const llama_model_tensor_buft_override & o) { return o.pattern != nullptr; });
+            // k19-2xt4 (LLAMA_SPLIT_AUTO_TENSOR_HOST=0 off): a MoE model whose -sm layer fit put routed experts on the host (its
+            // -ot overrides and a MoE cache, none given by the user) is measured for -sm tensor too: where the tensor split holds the
+            // whole model, the fit's host experts and cache are dropped and it loads split by tensor. Layer split places whole layers
+            // per GPU, so a model of few large layers (DeepSeek-V4.1 8-layer fake: 2.64 GiB of experts per layer, 24.1 GiB) leaves
+            // slack on both cards that the even tensor split uses. Kaggle 2x T4 dsf8 (plans/k19_2xt4board.md): -sm layer + 2 x 8.9 GB
+            // MoE cache 65.6 / 63.1 tok/s (chat / 8k), 8k TTFT 11.5 s; -sm tensor 75.1 / 69.3, 5.05 s
+            // srv_kld long48 on dsf8 (vs the layer + cache default): first-token KLD mean 0.0091 / p99 0.134 / top1 0.917, per position
+            // 0.0027 / 0.133 / 0.9725 vs rounding-only bands 0.0035-0.0061 / 0.018-0.133 / 0.938-0.958 and 0.0017-0.0019 / 0.047-0.056 /
+            // 0.981-0.982 (GGML_CUDA_DISABLE_FUSION=1, one T4; the -fa off band OOMs there): outside the band, so opt-in
+            // (LLAMA_SPLIT_AUTO_TENSOR_HOST=1); unset / 0 = the layer fit's host experts and cache as before
+            static const bool host_on = [] {
+                const char * e = getenv("LLAMA_SPLIT_AUTO_TENSOR_HOST");
+                return e != nullptr && atoi(e) != 0;
+            }();
+            const bool tbo_user_none = std::none_of(tbo_in.begin(), tbo_in.end(),
+                [](const llama_model_tensor_buft_override & o) { return o.pattern != nullptr; });
+            const bool fit_host = moe && host_on && tbo_user_none && (!tbo_none || cparams.moe_cache_size > 0) && cparams_in.moe_cache_size > 0 &&
+                params.moe_cache_size > 0;
             if (on && !model_only && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && gpus.size() >= 2 && !params.split_mode_set &&
-                    mparams.split_mode == LLAMA_SPLIT_MODE_LAYER && !ts_user && !ngl_user && tbo_none && cparams.moe_cache_size == 0 &&
+                    mparams.split_mode == LLAMA_SPLIT_MODE_LAYER && !ts_user && !ngl_user && ((tbo_none && cparams.moe_cache_size == 0) || fit_host) &&
                     !draft_cpu) {
                 llama_model_params   mp = mparams;
                 llama_context_params cp = cparams;
+                cp.moe_cache_size       = 0;   // k19-2xt4: a fit_host launch is measured without the fit's cache (no-op otherwise)
                 mp.split_mode           = LLAMA_SPLIT_MODE_TENSOR;
                 mp.n_gpu_layers         = llama_model_default_params().n_gpu_layers;
                 mp.tensor_split         = nullptr;
@@ -4202,6 +4221,19 @@ uma_restart:
                     COM_INF("%s: --fit: whole model on %zu GPUs: %s (-sm tensor needs %" PRId64 " + %" PRId64 " MiB per GPU, least free %" PRId64
                         " MiB, margin %zu MiB; LLAMA_SPLIT_AUTO_TENSOR=0 keeps -sm layer)\n", __func__, gpus.size(), fits ? "-sm tensor" : "-sm layer",
                         need/(1024*1024), dft/(1024*1024), free_min/(1024*1024), params.fit_params_target[0]/(1024*1024));
+                    if (fits && fit_host) {
+                        // k19-2xt4: the tensor split replaces the fit's host experts and MoE cache
+                        const size_t n_fit_tbo = (size_t) std::count_if(params.tensor_buft_overrides.begin(), params.tensor_buft_overrides.end(),
+                            [](const llama_model_tensor_buft_override & o) { return o.pattern != nullptr; });
+                        COM_INF("%s: --fit: -sm tensor holds the whole model: the layer fit's host experts (%zu overrides) and %zu MiB MoE "
+                            "cache dropped (LLAMA_SPLIT_AUTO_TENSOR_HOST=1; unset keeps them)\n", __func__, n_fit_tbo,
+                            cparams.moe_cache_size/(1024*1024));
+                        params.tensor_buft_overrides = tbo_in;
+                        mparams.tensor_buft_overrides = mparams_in.tensor_buft_overrides != nullptr && !params.tensor_buft_overrides.empty() ?
+                            params.tensor_buft_overrides.data() : mparams_in.tensor_buft_overrides;
+                        cparams.moe_cache_size = 0;
+                        params.moe_cache_size  = 0;
+                    }
                     if (fits) {
                         mparams.split_mode     = LLAMA_SPLIT_MODE_TENSOR;
                         mparams.n_gpu_layers   = mp.n_gpu_layers;
