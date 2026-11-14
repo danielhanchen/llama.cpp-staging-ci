@@ -51,6 +51,7 @@ static uint64_t fnv(const void * p, size_t n) {
 }
 
 static int g_chain = 0;
+static int g_trace = -1;
 static int g_call  = 0;
 
 static bool g_ref   = false; // reference child: no backend sampler, the top-k set of the raw logits row on the host
@@ -108,9 +109,36 @@ static void dump_row(FILE * f, llama_context * ctx, int32_t idx) {
     if (g_chain < 2) {
         fprintf(f, "chain %d decode %2d row %2d: set %016llx\n", g_chain, g_call, idx, (unsigned long long) (c ? set_hash(c, nc) : 0));
     }
+    if (g_trace == g_call && g_chain < 2 && c != nullptr && nc >= 3) {
+        fprintf(stderr, "trace chain %d decode %d host row %d ids %d %d %d\n", g_chain, g_call, idx, c[0], c[1], c[2]);
+    }
+}
+
+// TOPK_BATCH_TEST_TRACE=D (diagnosis): during decode D of chains 0 / 1 every top-k / get_rows node of the sampling graph is printed to
+// stderr after it runs: name, its source, data address and the first ids / values
+static bool trace_cb(struct ggml_tensor * t, bool ask, void * /*user*/) {
+    const bool want = g_trace == g_call && g_chain < 2 && (t->op == GGML_OP_TOP_K || t->op == GGML_OP_GET_ROWS) &&
+        (strncmp(t->name, "top_k", 5) == 0);
+    if (ask) {
+        return want;
+    }
+    if (want) {
+        int32_t v[3] = { 0, 0, 0 };
+        float   w[3] = { 0, 0, 0 };
+        const size_t n = std::min<size_t>(3, ggml_nelements(t));
+        if (t->type == GGML_TYPE_I32) {
+            ggml_backend_tensor_get(t, v, 0, n * sizeof(int32_t));
+        } else if (t->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(t, w, 0, n * sizeof(float));
+        }
+        fprintf(stderr, "trace chain %d decode %d %-20s src0 %-28s src1 %-12s data %p flags %x ids %d %d %d vals %g %g %g\n", g_chain, g_call,
+                t->name, t->src[0] ? t->src[0]->name : "-", t->src[1] ? t->src[1]->name : "-", t->data, t->flags, v[0], v[1], v[2], w[0], w[1], w[2]);
+    }
+    return true;
 }
 
 static int run_child(const char * model_path, const char * device, const char * out_path) {
+    g_trace = getenv("TOPK_BATCH_TEST_TRACE") ? atoi(getenv("TOPK_BATCH_TEST_TRACE")) : -1;
     llama_log_set(log_cb, nullptr);
     ggml_backend_load_all();
     auto mparams = llama_model_default_params();
@@ -164,6 +192,10 @@ static int run_child(const char * model_path, const char * device, const char * 
         cparams.kv_unified = true;
         cparams.samplers = g_ref ? nullptr : cfg;
         cparams.n_samplers = g_ref ? 0 : 2;
+        if (g_trace >= 0) {
+            cparams.cb_eval           = trace_cb;
+            cparams.cb_eval_user_data = nullptr;
+        }
         llama_context * ctx = llama_init_from_model(model, cparams);
         if (ctx == nullptr) {
             return 6;
