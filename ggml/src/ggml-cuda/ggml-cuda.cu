@@ -168,7 +168,13 @@ void ggml_cuda_p1_stat(ggml_cuda_p1_stat_kind kind) {
                 (long long) counts[GGML_CUDA_P1_MMVF_ONEBAR], (long long) counts[GGML_CUDA_P1_MMVF_TWOBAR]);
         });
     });
-    counts[kind]++;
+    // a running server is usually stopped by a signal (no exit handler): log each count when it reaches a power of two
+    static const char * names[GGML_CUDA_P1_COUNT] = { "gdn_fused_new", "gdn_fused", "gated_norm_silu", "gated_norm_sigmoid", "mmvf_onebar",
+                                                      "mmvf_twobar" };
+    const long long n = ++counts[kind];
+    if ((n & (n - 1)) == 0) {
+        GGML_LOG_INFO("k19-p1fuse stat: %s = %lld\n", names[kind], n);
+    }
 }
 
 static bool ggml_cuda_env_flag(const char * name) {
