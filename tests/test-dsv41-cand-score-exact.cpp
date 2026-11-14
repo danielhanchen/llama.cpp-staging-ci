@@ -10,7 +10,8 @@
 //     (so -inf ties decide the tail of the top-k); the newest block always a candidate (as cand_pin pins it).
 //   - negative control: the candidate graph with ONE candidate block replaced by a non-candidate block that has finite scores must
 //     differ from the mask graph (else the comparison could not see a wrong candidate set) -> FAIL if equal.
-// Usage: (no args) the CPU; --gpu the first CUDA / ROCm device (exit 77 = SKIP without one); --bench adds per-graph timings.
+// Usage: (no args) the CPU; --gpu the first CUDA / ROCm device (exit 77 = SKIP without one); --bench adds per-graph timings;
+// --gallocr allocates with a bare graph allocator (buffer reuse without the backend graph_optimize rules: diagnostic only).
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -141,6 +142,8 @@ static inputs make_inputs(const tcase & c, int seed) {
     return in;
 }
 
+static bool g_gallocr = false; // --gallocr: a bare graph allocator (buffer reuse) instead of one buffer per tensor (diagnostic)
+
 struct result {
     std::vector<float>   score;
     std::vector<int32_t> ids;
@@ -199,10 +202,22 @@ static result run_case(ggml_backend_t backend, const tcase & c, const inputs & i
         ggml_free(ctx);
         return r;
     }
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
-        fprintf(stderr, "alloc failed\n");
-        exit(1);
+    // every tensor gets its own memory: a graph allocator reusing buffers needs the backend's graph_optimize allocation rules
+    // (ggml_backend_sched applies them, a bare gallocr does not), and the comparison is about the op, not about buffer reuse
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_gallocr_t galloc = nullptr;
+    if (g_gallocr) {
+        galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+            fprintf(stderr, "alloc failed\n");
+            exit(1);
+        }
+    } else {
+        buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (!buf) {
+            fprintf(stderr, "alloc failed\n");
+            exit(1);
+        }
     }
     ggml_backend_tensor_set(q, in.q.data(), 0, ggml_nbytes(q));
     ggml_backend_tensor_set(kf, in.k.data(), 0, ggml_nbytes(kf));
@@ -226,7 +241,12 @@ static result run_case(ggml_backend_t backend, const tcase & c, const inputs & i
     r.ids.resize(ggml_nelements(ids));
     ggml_backend_tensor_get(score, r.score.data(), 0, ggml_nbytes(score));
     ggml_backend_tensor_get(ids, r.ids.data(), 0, ggml_nbytes(ids));
-    ggml_gallocr_free(galloc);
+    if (galloc) {
+        ggml_gallocr_free(galloc);
+    }
+    if (buf) {
+        ggml_backend_buffer_free(buf);
+    }
     ggml_free(ctx);
     return r;
 }
@@ -237,7 +257,21 @@ static bool same(const result & a, const result & b) {
 }
 
 static std::string first_diff(const result & a, const result & b) {
-    char buf[200];
+    char buf[400];
+    size_t n_diff = 0, first = SIZE_MAX, last = 0, n_zero_a = 0;
+    for (size_t i = 0; i < a.score.size() && i < b.score.size(); ++i) {
+        if (memcmp(&a.score[i], &b.score[i], sizeof(float)) != 0) {
+            n_diff++;
+            first = std::min(first, i);
+            last  = i;
+            n_zero_a += a.score[i] == 0.0f;
+        }
+    }
+    if (n_diff > 0) {
+        snprintf(buf, sizeof(buf), "%zu scores differ in [%zu, %zu] (%zu of them 0 in the first), ids %s; score[%zu] %a / %a", n_diff, first,
+                last, n_zero_a, a.ids == b.ids ? "equal" : "differ", first, a.score[first], b.score[first]);
+        return buf;
+    }
     for (size_t i = 0; i < a.score.size() && i < b.score.size(); ++i) {
         if (memcmp(&a.score[i], &b.score[i], sizeof(float)) != 0) {
             snprintf(buf, sizeof(buf), "score[%zu] %a / %a", i, a.score[i], b.score[i]);
@@ -275,6 +309,7 @@ int main(int argc, char ** argv) {
     for (int i = 1; i < argc; ++i) {
         want_gpu |= strcmp(argv[i], "--gpu") == 0;
         bench    |= strcmp(argv[i], "--bench") == 0;
+        g_gallocr |= strcmp(argv[i], "--gallocr") == 0;
     }
     ggml_backend_load_all();
     ggml_backend_dev_t dev = nullptr;
