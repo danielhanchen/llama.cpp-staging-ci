@@ -468,6 +468,11 @@ int main(int argc, char ** argv) {
         { "tc_exact",   "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_VERIFY_REASSOC=0" },
         { "base_mmq0",  "GGML_CUDA_MMVQ_KQTC=0 GGML_CUDA_VERIFY_MMQ=0" },
         { "tc_mmq0",    "GGML_CUDA_MMVQ_KQTC=1 GGML_CUDA_VERIFY_MMQ=0" },
+        // the few-row MMQ ported from upstream (GGML_CUDA_MMQ_FEW): own src1 quantization (d = amax / 127 times 1 / d instead of a
+        // division), so a looser bound vs mmvq; Ampere and newer, K >= 2048 only
+        { "few",        "GGML_CUDA_MMQ_FEW=2" },
+        { "few_up",     "GGML_CUDA_MMQ_FEW=1" },
+        { "few_exact",  "GGML_CUDA_MMQ_FEW=2 GGML_CUDA_VERIFY_REASSOC=0" },
     };
     const int nm = (int) (sizeof(modes)/sizeof(modes[0]));
     std::vector<std::vector<uint8_t>> dumps(nm);
@@ -498,11 +503,15 @@ int main(int argc, char ** argv) {
         return -1;
     };
     const int ib = M("base"), it = M("tc"), ibe = M("base_exact"), ite = M("tc_exact"), ibm = M("base_mmq0"), itm = M("tc_mmq0");
+    const int ife = M("few_exact");
+    const auto is_lever = [&](int i) { return strncmp(modes[i].name, "tc", 2) == 0 || strncmp(modes[i].name, "few", 3) == 0; };
+    const auto is_few   = [&](int i) { return strncmp(modes[i].name, "few", 3) == 0; };
+    const bool few_dev  = cc < 0 || cc >= 800; // the few-row MMQ needs the Ampere MMA
 
     // engagement: base never logs, every lever mode logs (single and multi-matrix launches)
     for (int i = 0; i < nm; ++i) {
-        const bool lever = strncmp(modes[i].name, "tc", 2) == 0;
-        const bool ok = lever ? logs[i] > 0 && logs_m[i] > 0 : logs[i] == 0;
+        const bool lever = is_lever(i);
+        const bool ok = !lever ? logs[i] == 0 : is_few(i) ? (few_dev ? logs[i] > 0 : logs[i] == 0) : logs[i] > 0 && logs_m[i] > 0;
         if (!ok) {
             printf("FAIL engagement %s: %d launches (%d multi)\n", modes[i].name, logs[i], logs_m[i]);
             n_fail++;
@@ -515,7 +524,8 @@ int main(int argc, char ** argv) {
     const size_t body  = dumps[0].size() - ncase*sizeof(int32_t);
     size_t off = 0;
     double worst_tc = 0.0, worst_ratio = 0.0;
-    int n_tc_cases = 0, n_neg_fail = 0, n_neg = 0;
+    int n_tc_cases = 0, n_neg_fail = 0, n_neg = 0, n_few_cases = 0;
+    double worst_few = 0.0, worst_few_ratio = 0.0;
     std::map<int, int> engaged_by_type;
     struct pending { int mode, type, shape, T; bool flagged; size_t off; };
     std::vector<pending> pend;
@@ -526,15 +536,14 @@ int main(int argc, char ** argv) {
         const size_t n = (size_t) nw*c.T*s.N;
         const std::vector<double> ref = reference(c.type, c.shape, c.T);
         for (int i = 0; i < nm; ++i) {
-            const bool lever = strncmp(modes[i].name, "tc", 2) == 0;
-            if (!lever) {
+            if (!is_lever(i)) {
                 continue;
             }
             const int32_t eng = ((const int32_t *) (dumps[i].data() + body))[ci];
             const float * fi  = (const float *) (dumps[i].data() + off);
-            const int    ib_i = i == ite ? ibe : i == itm ? ibm : ib;
+            const int    ib_i = i == ite || i == ife ? ibe : i == itm ? ibm : ib;
             const float * fbi = (const float *) (dumps[ib_i].data() + off);
-            const bool allowed = c.T >= 2 && !(i == ite && c.flagged);
+            const bool allowed = c.T >= 2 && !((i == ite || i == ife) && c.flagged);
             if (eng > 0 && !allowed) {
                 printf("FAIL %s %s K %d N %d T %d%s: the lever engaged where it must not\n", modes[i].name, ggml_type_name(c.type), s.K, s.N,
                     c.T, c.flagged ? " flagged" : "");
@@ -549,14 +558,22 @@ int main(int argc, char ** argv) {
                 }
                 continue;
             }
-            engaged_by_type[(int) c.type]++;
+            if (!is_few(i)) {
+                engaged_by_type[(int) c.type]++;
+            }
             const double d_base = nmse(fi, fbi, n);
             const double e_tc   = nmse_ref(fi, ref.data(), n);
             const double e_bi   = nmse_ref(fbi, ref.data(), n);
-            const bool ok = d_base <= 1e-10 && e_tc <= 1.02*e_bi + 1e-12;
-            worst_tc    = std::max(worst_tc, d_base);
-            worst_ratio = std::max(worst_ratio, e_bi > 0 ? e_tc/e_bi : 0.0);
-            n_tc_cases++;
+            const bool ok = is_few(i) ? d_base <= 1e-6 && e_tc <= 1.05*e_bi + 1e-12 : d_base <= 1e-10 && e_tc <= 1.02*e_bi + 1e-12;
+            if (is_few(i)) {
+                worst_few       = std::max(worst_few, d_base);
+                worst_few_ratio = std::max(worst_few_ratio, e_bi > 0 ? e_tc/e_bi : 0.0);
+                n_few_cases++;
+            } else {
+                worst_tc    = std::max(worst_tc, d_base);
+                worst_ratio = std::max(worst_ratio, e_bi > 0 ? e_tc/e_bi : 0.0);
+                n_tc_cases++;
+            }
             if (!ok) {
                 printf("FAIL %s %s K %d N %d T %d%s: nmse vs mmvq %.3g, vs ref %.3g (mmvq %.3g)\n", modes[i].name, ggml_type_name(c.type), s.K,
                     s.N, c.T, c.flagged ? " flagged" : "", d_base, e_tc, e_bi);
@@ -587,7 +604,7 @@ int main(int argc, char ** argv) {
     // the other base modes against base: GGML_CUDA_VERIFY_REASSOC=0 / VERIFY_MMQ=0 only change flagged products (no check), so nothing here
 
     // column invariance: a lever mode's T-column outputs (2 <= T <= 8) == the first T columns of its 8-column outputs, byte for byte
-    int n_inv = 0, n_inv_fail = 0;
+    int n_inv = 0, n_inv_fail = 0, n_inv_few = 0, n_inv_few_diff = 0;
     for (const auto & p : pend) {
         if (p.T == 8) {
             continue;
@@ -608,6 +625,11 @@ int main(int argc, char ** argv) {
         bool same = true;
         for (int i = 0; i < nw && same; ++i) {
             same = memcmp(a + (size_t) i*p.T*s.N, b + (size_t) i*8*s.N, (size_t) p.T*s.N*sizeof(float)) == 0;
+        }
+        if (is_few(p.mode)) {
+            n_inv_few++;
+            n_inv_few_diff += !same;
+            continue;
         }
         n_inv++;
         if (!same) {
@@ -632,6 +654,8 @@ int main(int argc, char ** argv) {
     n_fail += n_neg_fail != 0 || n_neg == 0;
     printf("lever cases %d: worst nmse vs mmvq %.3g, worst nmse(kqtc, ref) / nmse(mmvq, ref) %.6f; invariance %d checked, %d failed\n",
         n_tc_cases, worst_tc, worst_ratio, n_inv, n_inv_fail);
+    printf("few-row MMQ cases %d: worst nmse vs mmvq %.3g, worst nmse(few, ref) / nmse(mmvq, ref) %.6f; column invariance %d of %d differ "
+        "(informational)\n", n_few_cases, worst_few, worst_few_ratio, n_inv_few_diff, n_inv_few);
     printf("%s: %d failures\n", n_fail ? "FAIL" : "PASS", n_fail);
     return n_fail ? 1 : 0;
 #endif

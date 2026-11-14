@@ -38,6 +38,8 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvf-splitk.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmq-few.cuh"
+#include "ggml-cuda/mmvq-kqtc.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -2681,6 +2683,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             const char * e = getenv("GGML_CUDA_VERIFY_REASSOC");
             return e == nullptr || atoi(e) != 0;
         }();
+        // k19-kqtc: the ported few-row MMQ (GGML_CUDA_MMQ_FEW, opt-in) takes the verify product where it applies, unless the verify is
+        // the bit-exact one (GGML_CUDA_VERIFY_REASSOC=0)
+        if (reassoc_ok && ggml_cuda_should_use_mmq_few(src0, src1, cc)) {
+            ggml_cuda_mul_mat_q_few(ctx, src0, src1, dst);
+            return;
+        }
         const bool verify_mmq = verify_mmq_env > 0 ||
             (verify_mmq_env < 0 && reassoc_ok && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING && cc < GGML_CUDA_CC_AMPERE);
         const bool take_mmq = verify_mmq && ne11 <= 16 && ne12*ne13 == 1 && ggml_is_quantized(src0->type) && turing_mma_available(cc) &&
@@ -2737,6 +2745,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // k19-kqtc: the ported few-row MMQ (GGML_CUDA_MMQ_FEW, opt-in) before mmvq / MMQ
+    if (ggml_cuda_should_use_mmq_few(src0, src1, cc)) {
+        ggml_cuda_mul_mat_q_few(ctx, src0, src1, dst);
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
@@ -5928,6 +5941,10 @@ static bool ggml_cuda_mmvq_multi_runtime_ok(const ggml_backend_cuda_context * ct
     const int64_t ne11      = src1->ne[1];
     const bool    exact     = (node->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) != 0;
     if (ne11 > MMVQ_MAX_BATCH_SIZE) {
+        return false;
+    }
+    // k19-kqtc: a product the few-row MMQ takes in ggml_cuda_mul_mat stays a single product
+    if (ne11 > 1 && (!exact || ggml_cuda_mmvq_kqtc_reassoc_ok()) && ggml_cuda_should_use_mmq_few(src0, src1, cc)) {
         return false;
     }
     if (exact && ne11 > 1) {
