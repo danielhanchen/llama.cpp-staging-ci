@@ -310,7 +310,7 @@ static __global__ void mm_ids_scatter(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst,
         const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ hist,
         const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y,
-        const int si1, const int sis1, const bool write_inverse, const int tpb, const int W) {
+        const int si1, const int sis1, const bool write_inverse, const int tpb, const int W, const bool match_any) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
 
@@ -349,12 +349,24 @@ static __global__ void mm_ids_scatter(
         // rank by lane among lanes with the same expert: keeps the token-major, slot-minor order of mm_ids_helper
         int rank = 0;
         int cnt  = 0;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+        // k19-p5mmq: the lanes holding the same expert in one warp match instead of 32 shuffles (GGML_CUDA_MMID_MATCH_ANY=0: the
+        // shuffles). The same rank and count, so the same maps
+        if (match_any) {
+            const unsigned int same = __match_any_sync(0xFFFFFFFF, expert_used);
+            rank = __popc(same & ((1u << lane) - 1u));
+            cnt  = __popc(same);
+        } else
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+        {
+            GGML_UNUSED(match_any);
 #pragma unroll
-        for (int j = 0; j < warp_size; ++j) {
-            const int ej = __shfl_sync(0xFFFFFFFF, expert_used, j, warp_size);
-            if (ej == expert_used) {
-                cnt++;
-                rank += j < lane;
+            for (int j = 0; j < warp_size; ++j) {
+                const int ej = __shfl_sync(0xFFFFFFFF, expert_used, j, warp_size);
+                if (ej == expert_used) {
+                    cnt++;
+                    rank += j < lane;
+                }
             }
         }
 
@@ -385,6 +397,12 @@ static __global__ void mm_ids_scatter(
             ids_src1[i] = 0;
         }
     }
+}
+
+// k19-p5mmq: GGML_CUDA_MMID_MATCH_ANY=0 ranks the scatter's lanes by 32 shuffles as before (sm >= 70 only; same maps either way)
+static bool mm_ids_match_any() {
+    static const bool on = getenv("GGML_CUDA_MMID_MATCH_ANY") == nullptr || atoi(getenv("GGML_CUDA_MMID_MATCH_ANY")) != 0;
+    return on;
 }
 
 template <int n_expert_used_template>
@@ -422,7 +440,7 @@ static void launch_mm_ids_counting_sort(
 
     mm_ids_scatter<n_expert_used_template><<<W, warp_size, nbytes_shared, stream>>>
         (ids, ids_src1, ids_dst, expert_bounds, hist.ptr, n_experts, n_tokens, n_expert_used_var,
-         nchannels_y, si1, sis1, write_inverse, tpb, W);
+         nchannels_y, si1, sis1, write_inverse, tpb, W, mm_ids_match_any());
     CUDA_CHECK(cudaGetLastError());
 }
 

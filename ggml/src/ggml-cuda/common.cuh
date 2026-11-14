@@ -1711,6 +1711,55 @@ struct ggml_cuda_src1_memo {
     }
 };
 
+// k19-p5mmq: the routing maps (inverse map, compact -> slot map, expert bounds: mm_ids_helper with write_inverse) of the last MoE MMQ
+// product that built them, kept in a buffer of the context so that the next products with the same ids (the gate / up of a layer and
+// its fused-SwiGLU down, whose maps are the same integers) do not build them again. Valid from the product that built them until the
+// end of the graph, the next build, or a node writing over the ids; never while a CUDA graph is captured.
+// GGML_CUDA_MMID_MEMO_DOWN=0 turns it off.
+struct ggml_cuda_mmid_route_memo {
+    static constexpr int n_key = 7;
+
+    bool                valid = false;
+    const ggml_tensor * ids   = nullptr;
+    int64_t             key[n_key] = {};
+    char *              buf   = nullptr; // cudaMalloc, grown on demand (stream synchronized first)
+    size_t              cap   = 0;
+    int64_t             n_reused_down = 0;
+
+    bool match(const ggml_tensor * ids_, const int64_t key_[n_key]) const {
+        return valid && ids == ids_ && std::equal(key, key + n_key, key_);
+    }
+
+    void set(const ggml_tensor * ids_, const int64_t key_[n_key]) {
+        valid = true;
+        ids   = ids_;
+        std::copy(key_, key_ + n_key, key);
+    }
+
+    void invalidate() {
+        valid = false;
+        ids   = nullptr;
+    }
+
+    // a node about to run: drop the maps if it writes over the ids they were built from
+    void check_node(const ggml_tensor * node) {
+        if (!valid || node == nullptr || node->data == nullptr || ids->data == nullptr || node == ids) {
+            return;
+        }
+        if (node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE ||
+                node->op == GGML_OP_TRANSPOSE) {
+            return; // writes nothing
+        }
+        const char * a0 = (const char *) node->data;
+        const char * a1 = a0 + ggml_nbytes(node);
+        const char * b0 = (const char *) ids->data;
+        const char * b1 = b0 + ggml_nbytes(ids);
+        if (a0 < b1 && b0 < a1) {
+            invalidate();
+        }
+    }
+};
+
 // k15-mm2: a QSA flash attention node whose dense selection mask is not built: the selected cells per token (I32 [n_sel, n_tokens],
 // dead slots >= n_kv) and the causal mask the dense one adds them to
 struct ggml_cuda_qsa_maskless {
@@ -1799,6 +1848,7 @@ struct ggml_backend_cuda_context {
     std::unordered_map<const ggml_tensor *, ggml_cuda_qsa_maskless> qsa_maskless;
     std::unordered_set<const ggml_tensor *> qsa_skip;
     ggml_cuda_src1_memo  src1_memo;
+    ggml_cuda_mmid_route_memo mmid_route; // k19-p5mmq
     // k19-fu2 F3: the SWIGLU node whose MUL_MAT_ID reader computes it in its gathered quantize (set around that product only)
     const ggml_tensor *  mmq_swiglu_src1 = nullptr;
 

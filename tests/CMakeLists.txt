@@ -523,6 +523,9 @@ llama_build_and_test(test-meta-k15-ops.cpp LINK ggml)
 llama_build_and_test(test-k19-fuse-exact.cpp LINK ggml)
 # k19-p1fuse: GDN fusion predicate (replay windows), silu gated norm, one-barrier mmvf == the code before them and the unfused graph, byte for byte
 llama_build_and_test(test-k19-p1fuse-exact.cpp LINK ggml)
+# k19-p5mmq: MoE cache-bank MMQ products one block per exact tile == the compact tiling without the bank, else the split as before;
+# the fused-SwiGLU down reusing its gate / up routing maps and the match-any scatter == the code before them, byte for byte (SKIP without CUDA)
+llama_build_and_test(test-k19-p5mmq-exact.cpp LINK ggml)
 llama_build_and_test(test-topk384-exact.cpp LINK ggml)
 llama_build_and_test(test-topk-oneblock-exact.cpp LINK ggml)
 llama_build_and_test(test-topk-twostage-exact.cpp LINK ggml)   # k19-dtopk: two-stage one-launch top-k == radix select, byte for byte
