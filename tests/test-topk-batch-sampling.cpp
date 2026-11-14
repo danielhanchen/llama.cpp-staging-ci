@@ -7,7 +7,8 @@
 // batched top-k engaged in the default mode only (no batched windows: FAIL, the comparison would prove nothing); a third child
 // repeats the per-row mode, and the two per-row runs must agree (else the device is not repeatable and nothing is proven).
 // A fourth child decodes the same batches without a backend sampler and takes each row's top-k set from the raw logits on the host
-// (lowest columns on ties): the batched sets must equal it (a check independent of the per-row path).
+// (lowest columns on ties): the batched and the per-row sets must equal it (a check independent of either path; on CUDA the per-row
+// path failed it before the sampling chains' outputs were all graph outputs, LLAMA_SAMPLER_OUTPUTS_ALL=0 restores that).
 //
 // Usage: test-topk-batch-sampling <model.gguf> [cpu|gpu]
 
@@ -361,8 +362,8 @@ int main(int argc, char ** argv) {
         }
     }
     printf("reference: %zu top-k rows; sets differing from it: batched %d, per-row %d\n", ref.size(), n_ref_bad[0], n_ref_bad[1]);
-    if (ref.empty() || n_ref_bad[0] != 0) {
-        printf("FAIL: the batched top-k does not select the reference set\n");
+    if (ref.empty() || n_ref_bad[0] != 0 || n_ref_bad[1] != 0) {
+        printf("FAIL: the %s top-k does not select the reference set\n", n_ref_bad[0] != 0 ? "batched" : "per-row");
         return 1;
     }
     const int d_rep = ndiff(1, 2, true);

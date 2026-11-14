@@ -5031,6 +5031,11 @@ bool llm_graph_context::draft_topk_rows() const {
     return true;
 }
 
+static bool llama_sampler_outputs_all() {
+    static const bool on = getenv("LLAMA_SAMPLER_OUTPUTS_ALL") == nullptr || atoi(getenv("LLAMA_SAMPLER_OUTPUTS_ALL")) != 0;
+    return on;
+}
+
 void llm_graph_context::build_sampling() const {
     if (samplers.empty() || !res->t_logits) {
         return;
@@ -5172,6 +5177,22 @@ void llm_graph_context::build_sampling() const {
 
                 assert(sampler->iface->backend_apply);
                 sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+            }
+
+            // every chain's outputs are graph outputs, the chains without a row too (and the tensors an output views): ggml-alloc
+            // reuses the allocation plan of an earlier graph of the same topology (ggml_gallocr_needs_realloc compares the node count
+            // and sizes, not the output flags), so with outputs flagged only on the chains that have a row, a plan made for a ubatch
+            // whose rows sat in other chains could place a chain's candidates where the next chain's top-k writes (a 5-row window after
+            // a two-sequence batch: row 3 read row 4's candidates on CUDA). LLAMA_SAMPLER_OUTPUTS_ALL=0: as before
+            if (llama_sampler_outputs_all()) {
+                for (ggml_tensor * t : { data.sampled, data.probs, data.logits, data.candidates }) {
+                    if (t != nullptr) {
+                        ggml_set_output(t);
+                        if (t->view_src != nullptr) {
+                            ggml_set_output(t->view_src);
+                        }
+                    }
+                }
             }
 
             if (data.sampled != nullptr) {
