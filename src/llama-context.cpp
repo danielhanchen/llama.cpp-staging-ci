@@ -10247,22 +10247,27 @@ void llama_context::moe_cache_autoprof_from_ids() {
     }
 }
 
-// k19-autoprof2 (LLAMA_MOE_RELEASE_COUNTS, default 1): a prompt whose large ubatches run with the cache banks released (the tiny-cache
+// k19-autoprof2 (LLAMA_MOE_RELEASE_COUNTS): a prompt whose large ubatches run with the cache banks released (the tiny-cache
 // rule / k19-place8 / k19-placemid: a capped or small card, e.g. Colab L4 @12 GB or a T4 with Flash-Next) skips moe_cache_seed_begin's
 // recording (released banks take no seed) and its layer-major groups clear the routing without counting it, so the RAM tier's idle
 // refill (k19-l4fill) and the self-learned profile (k19-autoprof) never got a count there ("0 prompts counted ... 0 read"). The routed
 // refill of the banks reads that routing after the ubatch / group anyway (one sync, one read of the ids per prompt): the counts come
 // from that same read, no extra sync or device read, nothing on the decode path. Counting only orders RAM-tier placement: exact.
-// =0: as before
+// =1 (default): the refill's counts only; =2: also the self-learned profile (opt-in: with a fair base, i.e. base with its PLE profile,
+// using the MoE profile there gave decode +3..+19% but TTFT +7..+15% on a Colab T4 (Flash-Next IQ1_S, 30 GiB) and +11% on the L4 @12
+// GB MTP 8k, level on L4 @12 no drafter); =0: as before
+static int moe_cache_release_counts_mode() {
+    static const int m = [] { const char * e = getenv("LLAMA_MOE_RELEASE_COUNTS"); return e == nullptr ? 1 : atoi(e); }();
+    return m;
+}
 static bool moe_cache_released_counts() {
-    static const bool on = [] { const char * e = getenv("LLAMA_MOE_RELEASE_COUNTS"); return e == nullptr || atoi(e) != 0; }();
-    return on;
+    return moe_cache_release_counts_mode() != 0;
 }
 
 void llama_context::moe_cache_refill_from_ids(bool count) {
     ggml_backend_sched_synchronize(sched.get());
     const bool fill = count && moe_cache->fill_wants_counts();
-    const bool ap   = count && !moe_ap_counted && moe_cache->autoprof_wants_counts();
+    const bool ap   = count && moe_cache_release_counts_mode() >= 2 && !moe_ap_counted && moe_cache->autoprof_wants_counts();
     if (fill) {
         moe_cache->fill_counts_begin();
     }

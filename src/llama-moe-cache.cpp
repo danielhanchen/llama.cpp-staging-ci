@@ -4419,14 +4419,16 @@ struct llama_moe_cache::impl {
         return host->exclusive() && ap_on_dev(il, e);
     }
 
-    // k19-autoprof2 (LLAMA_MOE_AUTOPROF_INCL, default 1): the inclusive RAM tier (a capped card whose device slots hold the experts of
+    // k19-autoprof2 (LLAMA_MOE_AUTOPROF_INCL, opt-in =1): the inclusive RAM tier (a capped card whose device slots hold the experts of
     // fewer than LLAMA_MOE_HOST_MIN_TOKENS tokens on a disk tier, e.g. Colab L4 @12 GB with MTP) also uses the profile: the page-cache
     // fill hottest first, the target set (hottest experts of each layout, as many as its slots, device-held ones included), cold
     // experts marked as guesses at each request's first large batch (a miss read or a prompt upload takes them before the CLOCK evicts
     // anything), a prompt's uploads take a free slot for a cold expert only while the layout keeps one per target expert held nowhere.
-    // Placement only (which RAM slot holds which expert's file bytes): exact. =0: the inclusive tier records only, as before
+    // Placement only (which RAM slot holds which expert's file bytes): exact. Opt-in: Colab L4 @12 GB fn4n MTP n2 against a base with
+    // its PLE profile, 3 interleaved launches: decode after 8k +19%, chat TTFT -3%, but 8k TTFT +11% (8k request level). Unset / 0: the
+    // inclusive tier records only, as before
     static bool ap_incl_env() {
-        static const bool on = [] { const char * e = getenv("LLAMA_MOE_AUTOPROF_INCL"); return e == nullptr || atoi(e) != 0; }();
+        static const bool on = [] { const char * e = getenv("LLAMA_MOE_AUTOPROF_INCL"); return e != nullptr && atoi(e) != 0; }();
         return on;
     }
 
@@ -4501,7 +4503,7 @@ struct llama_moe_cache::impl {
         }
         LLAMA_LOG_INFO("llama_moe_cache%s: k19-autoprof: routing profile %s %s (%zu experts)%s; LLAMA_MOE_AUTOPROF=0 off, 3 read only\n", tag,
             ap_file.c_str(), have ? "read" : "not found", aps.loaded,
-            ap_use ? (host->exclusive() ? ": the RAM tier is filled hottest first" : ": the inclusive RAM tier is filled hottest first (LLAMA_MOE_AUTOPROF_INCL=0 off)") :
+            ap_use ? (host->exclusive() ? ": the RAM tier is filled hottest first" : ": the inclusive RAM tier is filled hottest first (LLAMA_MOE_AUTOPROF_INCL=1)") :
             have ? ": not used (needs a RAM tier of the weight store, LLAMA_MOE_AUTOPROF 1 / 3, LLAMA_MOE_AUTOPROF_INCL for the inclusive tier)" :
             ap_rec ? ": recording" : "");
     }
