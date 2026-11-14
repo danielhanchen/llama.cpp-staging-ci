@@ -8291,9 +8291,40 @@ struct llama_moe_cache::impl {
             n_ov_wide_host++;
             return true;
         }
+        if (e == nullptr && n_ubatch > mx && g4pass_on() && g4mid_ov_band() && single_usable(n_ubatch)) {
+            n_ov_wide_mid++;
+            return true;
+        }
         return n_ubatch <= mx || overlap_plain_wide(n_ubatch);
     }
     mutable uint64_t n_ov_wide_host = 0; // k19-g4pass: overlap_small_batch calls answered by the mailbox rule above (engagement)
+    mutable uint64_t n_ov_wide_mid  = 0; // k19-g4mid: the same, answered by the band rule (g4mid_ov_band)
+
+    // k19-g4mid (default on; LLAMA_MOE_G4MID=0 off): the side-stream copy overlap of a 5..8-row mailbox window (k19-g4pass above) also where
+    // the cache holds LLAMA_MOE_G4MID_OV_MIN_FRAC (0.35) .. LLAMA_MOE_G4MID_OV_MAX_FRAC (0.60) of the host experts (G4 fn4n 32 GB: 41.4%).
+    // There a wide window's device side (the admitted experts' copies, then the hits) is the longer of the two per layer: Colab G4
+    // Flash-Next UD-IQ4_XS DFlash2 n6 32 GB chat, GGML_MOE_MAILBOX_TIMING: device beside the host 126.2 us, host 115.4 us per batch, merge
+    // wait 23.5 us; nsys (node trace, 0am): moe_cache_fetch of a 7-row window 110-125 us per layer, serial before the hits. Beside the hits
+    // the copies leave the host as the longer side, so the pass shortens by the device's excess (w7 21.7 -> 20.1-21.5 ms; gm_p1 / gp_ab1 /
+    // gp_ab3, same text in every cell: chat +1.4..+4.3%, 8k +2.7..+3.0%; gm_s3, 3 launches: device beside the host 123.4 -> 106.0 us, host
+    // 114-123 us, chat 206.0 -> 214.0, 8k 176.2 -> 180.4; gm_ab32, 3 interleaved launches vs the base build: chat 203.6 -> 207.5, 8k
+    // 174.7 -> 180.5, with LLAMA_SPEC_PREWARM_CACHED_FRAC=0.3 chat 223.1 -> 233.1, 8k 189.7 -> 194.9, md5 equal in every cell; 48 GB
+    // (70.7%) is outside the band, its windows have the host path off). Not below the band by default: at 24 GB (27.5% cached) the device
+    // side and the host batch are already level (144.9 vs 145.6-163.7 us), so with the overlap the pass follows the host batch time, which varies by
+    // launch on the G4 host (145-170 us, in both arms): gp_ab1 + gp_ab2 chat median -2.2% over 7 launches (spread 10.8%), gm_s3 +3.9% chat
+    // / +2.5% 8k over 3 (host 144-146 us in every overlapped launch). LLAMA_MOE_G4MID_OV_MIN_FRAC=0.2 takes 24 GB in
+    static bool g4mid_on() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_MOE_G4MID");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        return on;
+    }
+    bool g4mid_ov_band() const {
+        static const double lo = getenv("LLAMA_MOE_G4MID_OV_MIN_FRAC") != nullptr ? atof(getenv("LLAMA_MOE_G4MID_OV_MIN_FRAC")) : 0.35;
+        static const double hi = getenv("LLAMA_MOE_G4MID_OV_MAX_FRAC") != nullptr ? atof(getenv("LLAMA_MOE_G4MID_OV_MAX_FRAC")) : 0.60;
+        return g4mid_on() && cache_frac >= 0.0 && cache_frac >= lo && cache_frac < hi;
+    }
 
     // k19-bigverify LLAMA_MOE_OVERLAP_PLAIN_MAX=N (default 8, at most GGML_MOE_MAILBOX_MAX_TOKENS; <= 4 = off): verify windows of 5..N tokens
     // whose host path is off (the plain lookup, k19-q4xcache) take the overlap too: their missing experts are copied on the side stream
@@ -12873,6 +12904,9 @@ struct llama_moe_cache::impl {
                 (unsigned long long) n_ov_plain, (int) GGML_MOE_MAILBOX_MAX_TOKENS, (unsigned long long) n_ov_plain_wide, overlap_plain_on() ? 1 : 0);
             LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4pass: %llu overlap queries of 5-%d token windows on the single-graph mailbox took the copy "
                 "overlap (LLAMA_MOE_G4PASS=%d)\n", tag, (unsigned long long) n_ov_wide_host, (int) GGML_MOE_MAILBOX_MAX_TOKENS, g4pass_on() ? 1 : 0);
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4mid: %llu overlap queries of 5-%d token mailbox windows took the copy overlap in the "
+                "%.1f%% cached band (LLAMA_MOE_G4MID=%d)\n", tag, (unsigned long long) n_ov_wide_mid, (int) GGML_MOE_MAILBOX_MAX_TOKENS,
+                100.0*cache_frac, g4mid_on() ? 1 : 0);
             if (ext_on) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: k19-t4small decode extension: %lld grows, %lld parks, at most %.2f MiB above the fitted slots, "
                     "%.1f ms in all%s (LLAMA_MOE_DECODE_EXT=0 off)\n", tag, (long long) n_ext_grows, (long long) n_ext_parks,
