@@ -3001,7 +3001,13 @@ struct llama_moe_cache::impl {
         // the eager split (which overlaps a little device work per layer) is level or better: G4 fn4 16 GB (14.8% cached) chat -0.6%, 8k
         // -4.5% (same text), 12 GB DFlash2 admitted -4% (prof_1105_small 2d, w7 37-41 -> 47.8 ms); 24 GB (27.5%) +6 / +3.5%, 32 GB (42%)
         // +6.7%
-        static const double min_frac = getenv("LLAMA_MOE_SINGLE_WIDE_MIN_FRAC") != nullptr ? atof(getenv("LLAMA_MOE_SINGLE_WIDE_MIN_FRAC")) : 0.20;
+        // k19-g4pass: default 0.12 (LLAMA_MOE_G4PASS=0: 0.20). Since k19-overlap (one activation quantization, no id -1 rows) the mailbox
+        // wins at 16 GB too: Colab G4 Flash-Next UD-IQ4_XS DFlash2 n6, 16 GB (15.5% cached), same text, w7 27.1 -> 24.9 ms, chat 161.9 ->
+        // 179.1 tok/s, 8k 120.9 -> 126.9 (gp_p1, 2 launches). nsys (node trace, ms per w7 pass): eager split 33.5 wall = 25.0 busy + 7.7 idle
+        // inside the verify (111 launches, the device waiting on each layer's host split) vs the mailbox 29.8 = 27.3 + 1.6 (29 launches,
+        // host-expert wait + merge 3.6). 12 GB (about 9% cached, DFlash2 not admitted by default) keeps the split
+        static const double min_frac = getenv("LLAMA_MOE_SINGLE_WIDE_MIN_FRAC") != nullptr ? atof(getenv("LLAMA_MOE_SINGLE_WIDE_MIN_FRAC")) :
+            (g4pass_on() ? 0.12 : 0.20);
         return !single_max_env && single_max_tok > 4 && cache_frac >= 0.0 && cache_frac < min_frac ? 4 : single_max_tok;
     }
 
@@ -7857,16 +7863,38 @@ struct llama_moe_cache::impl {
     // chat / 8k +5.1 / +5.8%, 24 GB +2.9 / +4.0% (device beside the host 100 -> 83 us per layer). DFlash2 7-row windows (N = 8): 32 GB
     // +3.6 / +5.9% but 24 GB -2.5 / -3.6%, so the default stops at 4. Ubatches whose host path is off (48 GB) keep the plain lookup:
     // taking the hybrid lookup there for the overlap changed the text (ov_r2), so hybrid_layer does not widen for it
-    bool overlap_small_batch(int64_t n_ubatch) const {
-        static const int64_t mx = [] {
-            const char * e = getenv("LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL");
-            return e != nullptr ? std::max<int64_t>(1, std::min<int64_t>(GGML_MOE_MAILBOX_MAX_TOKENS, atoll(e))) : (int64_t) 4;
+    // k19-g4pass (default on; LLAMA_MOE_G4PASS=0 or an explicit LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL: off): a window of 5..8 rows that
+    // publishes its host experts to the single-graph mailbox (single_usable: a many-core host, see single_max) takes the overlap too.
+    // The 24 GB loss above was the k19-overlap round 2 bin (before LEAN, 2 launches). On the mailbox the admitted experts' copies
+    // (moe_cache_fetch, 8.0 of 29.8 ms per traced w7 pass at 16 GB) ran serially before the hits while the host computed; beside the
+    // hits they shorten the device side of every host layer. Colab G4 Flash-Next UD-IQ4_XS DFlash2 n6 16 GB, same text: w7 24.9 -> 23.8
+    // ms, chat 179.1 -> 186.6 tok/s, 8k 126.9 -> 136.5 (gp_p1, 2 launches). Windows on the eager split (fewer CPUs, smaller caches)
+    // keep the 4-token limit. Only below LLAMA_MOE_G4PASS_OV_MAX_FRAC (default 0.20) of the host experts cached, the share where the
+    // wide mailbox is new (see single_max) and the copies are largest. gp_ab1 / gp_ab2 (G4, 3-4 interleaved launches, same text): 16 GB
+    // chat 167.2 -> 178.3 (launches 2+: 166-168 -> 174.9-186.1), 8k 120.6 -> 134.8; above the share it was mixed: 24 GB (27.5%) chat
+    // 203.7 -> 199.3 median over 7 launches (head 189-211, its host batches slower in the slow launches), 8k +2.4%; 32 GB (42%) chat /
+    // 8k +4.3 / +2.9% (3 launches). LLAMA_MOE_G4PASS_OV_MAX_FRAC=1: every mailbox window
+    static bool g4pass_on() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_MOE_G4PASS");
+            return e == nullptr || atoi(e) != 0;
         }();
+        return on;
+    }
+    bool overlap_small_batch(int64_t n_ubatch) const {
+        static const char * e = getenv("LLAMA_MOE_CACHE_FETCH_OVERLAP_SMALL");
+        static const int64_t mx = e != nullptr ? std::max<int64_t>(1, std::min<int64_t>(GGML_MOE_MAILBOX_MAX_TOKENS, atoll(e))) : (int64_t) 4;
         if (!overlap || n_ubatch <= 1) {
             return false;
         }
+        static const double ov_max_frac = getenv("LLAMA_MOE_G4PASS_OV_MAX_FRAC") != nullptr ? atof(getenv("LLAMA_MOE_G4PASS_OV_MAX_FRAC")) : 0.20;
+        if (e == nullptr && n_ubatch > mx && g4pass_on() && cache_frac >= 0.0 && cache_frac < ov_max_frac && single_usable(n_ubatch)) {
+            n_ov_wide_host++;
+            return true;
+        }
         return n_ubatch <= mx || overlap_plain_wide(n_ubatch);
     }
+    mutable uint64_t n_ov_wide_host = 0; // k19-g4pass: overlap_small_batch calls answered by the mailbox rule above (engagement)
 
     // k19-bigverify LLAMA_MOE_OVERLAP_PLAIN_MAX=N (default 8, at most GGML_MOE_MAILBOX_MAX_TOKENS; <= 4 = off): verify windows of 5..N tokens
     // whose host path is off (the plain lookup, k19-q4xcache) take the overlap too: their missing experts are copied on the side stream
@@ -12456,6 +12484,8 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("llama_moe_cache%s: k19-q4xcache: %llu layer graphs of 2-%d token windows with the host path off overlapped their "
                 "copies, %llu of them 5+ tokens (k19-bigverify, LLAMA_MOE_OVERLAP_PLAIN_MAX) (LLAMA_MOE_OVERLAP_SMALL_PLAIN=%d)\n", tag,
                 (unsigned long long) n_ov_plain, (int) GGML_MOE_MAILBOX_MAX_TOKENS, (unsigned long long) n_ov_plain_wide, overlap_plain_on() ? 1 : 0);
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4pass: %llu overlap queries of 5-%d token windows on the single-graph mailbox took the copy "
+                "overlap (LLAMA_MOE_G4PASS=%d)\n", tag, (unsigned long long) n_ov_wide_host, (int) GGML_MOE_MAILBOX_MAX_TOKENS, g4pass_on() ? 1 : 0);
             if (ext_on) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: k19-t4small decode extension: %lld grows, %lld parks, at most %.2f MiB above the fitted slots, "
                     "%.1f ms in all%s (LLAMA_MOE_DECODE_EXT=0 off)\n", tag, (long long) n_ext_grows, (long long) n_ext_parks,
