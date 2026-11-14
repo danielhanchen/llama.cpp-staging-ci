@@ -61,7 +61,7 @@ int64_t common_fit_moe_margin_gain();
 
 // k19-int3fix2: the server prewarms N verify CUDA graphs (sampler chains x verify widths, server_spec_prewarm) beside a MoE cache that
 // holds at least LLAMA_MOE_CACHE_WIDE_GRAPHS_FRAC of the host experts; each keeps device memory no fit measure sees. With N > 0 (set
-// before a fit with a draft model or MTP heads, 0 = none) the fit keeps N x LLAMA_FIT_PREWARM_GRAPH_MIB (default 40, 0 = off) more free
+// before a fit with a draft model or MTP heads, 0 = none) the fit keeps N x LLAMA_FIT_PREWARM_GRAPH_MIB (opt-in, default 0) more free
 // on every device beside such a cache, taken from the cache
 void    common_fit_set_prewarm_graphs(int n_graphs);
 

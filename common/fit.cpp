@@ -842,11 +842,14 @@ static void common_params_fit_impl(
         // share of the host experts (llama_moe_cache_wide_graphs) and keeps its graphs' device memory, which no measure here sees: A100
         // 80 GB with 48 GB free, Qwen3.8-Flash-Next + DFlash2 (n_max 6), 3 chains x 7 widths took 828 -> 64 MiB of the 1024 MiB margin
         // (22-66 MiB per graph), and the few-row MMQ graphs the rest (2 MiB, CUDA out of memory at the first request). That memory is
-        // kept free here from the cache, estimated per graph (LLAMA_FIT_PREWARM_GRAPH_MIB, default 40; 0 = off); the server's free-memory
-        // floor (LLAMA_SPEC_PREWARM_MIN_FREE_MIB) stays as the fallback
+        // kept free here from the cache, estimated per graph (LLAMA_FIT_PREWARM_GRAPH_MIB, opt-in, e.g. 40); the server's free-memory
+        // floor (LLAMA_SPEC_PREWARM_MIN_FREE_MIB, default 512) is the default guard
         if (use_margins && has_drafter && g_prewarm_graphs > 0) {
+            // opt-in (default 0): measured at 48 GB the reserve lets the server prewarm all 21 graphs, and those windows replay slower
+            // than the ones the 512 MiB floor leaves eager: G4 Flash-Next DFlash2 chat 254.5 tok/s with 40 vs 274.6 without (base
+            // 262.2), A100 80 GB 110.7 vs 120.4 (base 115.6); both run (the reserve alone also kept the A100 alive with the floor off)
             static const double graph_mib = getenv("LLAMA_FIT_PREWARM_GRAPH_MIB") != nullptr ?
-                std::max(0.0, atof(getenv("LLAMA_FIT_PREWARM_GRAPH_MIB"))) : 40.0;
+                std::max(0.0, atof(getenv("LLAMA_FIT_PREWARM_GRAPH_MIB"))) : 0.0;
             static const double wide_frac = getenv("LLAMA_MOE_CACHE_WIDE_GRAPHS_FRAC") != nullptr ?
                 atof(getenv("LLAMA_MOE_CACHE_WIDE_GRAPHS_FRAC")) : 0.6;
             static const double wide_min = (getenv("LLAMA_MOE_CACHE_WIDE_GRAPHS_MIN_MIB") != nullptr ?
