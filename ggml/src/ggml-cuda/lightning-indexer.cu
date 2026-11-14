@@ -4,6 +4,43 @@
 #include "fattn-common.cuh"
 #include "convert.cuh"
 
+#include <climits>
+
+// candidate blocks (DeepSeek-V4.1 candidate scoring, dst->src[4]): the key slots of a block are mapped to the rows of the token's
+// candidate blocks (slot -> block id -> row), so only those rows are scored; every other row of dst is -inf (filled beforehand)
+struct li_cand {
+    const char * C;       // I32 [n_cand, n_batch, 1, n_stream]
+    int          n_slots; // n_cand * bs
+    int          bs;      // rows per block
+    size_t       nbc1;
+    size_t       nbc3;
+};
+
+// key row of a slot, -1 when it has none
+template <bool CAND>
+static __device__ __forceinline__ int li_key_row(const li_cand & cand, const int32_t * c_row, const int slot, const int64_t n_kv) {
+    if constexpr (!CAND) {
+        GGML_UNUSED_VARS(cand, c_row);
+        return slot < n_kv ? slot : -1;
+    } else {
+        if (slot >= cand.n_slots) {
+            return -1;
+        }
+        const int64_t row = (int64_t) c_row[slot / cand.bs]*cand.bs + slot % cand.bs;
+        return row >= 0 && row < n_kv ? (int) row : -1;
+    }
+}
+
+template <bool CAND>
+static __device__ __forceinline__ const int32_t * li_cand_row(const li_cand & cand, const int i_batch, const int i_stream) {
+    if constexpr (!CAND) {
+        GGML_UNUSED_VARS(cand, i_batch, i_stream);
+        return nullptr;
+    } else {
+        return (const int32_t *) (cand.C + i_batch*cand.nbc1 + i_stream*cand.nbc3);
+    }
+}
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #if defined(TURING_MMA_AVAILABLE)
 
@@ -16,7 +53,7 @@ typedef union {
 #include <mma.h>
 namespace wmma = nvcuda::wmma;
 
-template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K>
+template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K, bool CAND>
 static __global__ void lightning_indexer_kernel_wmma(
         const float * Q, const char * K, const float * W, const half * M, float * dst,
         int64_t n_stream, int64_t n_batch, int64_t n_kv,
@@ -25,7 +62,7 @@ static __global__ void lightning_indexer_kernel_wmma(
         size_t nbk1, size_t nbk2, size_t nbk3,
         size_t nbw1, size_t nbw2, size_t nbw3,
         size_t nbm1, size_t nbm2, size_t nbm3,
-        int64_t nem3
+        int64_t nem3, const li_cand cand
     ) {
 
     constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * WARP_SIZE;
@@ -39,8 +76,9 @@ static __global__ void lightning_indexer_kernel_wmma(
     const int i_lane   = threadIdx.x;
     const int tid      = i_warp * WARP_SIZE + i_lane;
 
-    // each block processes K_VECS_PER_BLOCK K vectors
+    // each block processes K_VECS_PER_BLOCK K vectors (key slots: rows, or candidate rows)
     const int start_kv = blockIdx.x * K_VECS_PER_BLOCK;
+    const int32_t * c_row = li_cand_row<CAND>(cand, i_batch, i_stream);
 
     const char  * q_base = (const char  *)                 Q + i_batch*nbq2 + i_stream*nbq3;
     const float * w_base = (const float *) ((const char *) W + i_batch*nbw1 + i_stream*nbw3);
@@ -81,8 +119,8 @@ static __global__ void lightning_indexer_kernel_wmma(
         for (int i_k = tid; i_k < n_k; i_k += THREADS_PER_BLOCK) {
             const int i_k_vec = i_k / (N_EMBD / 4);
             const int i_embd = i_k % (N_EMBD / 4);
-            const int i_kv = start_kv + i_k_vec;
-            if (i_kv < n_kv) {
+            const int i_kv = li_key_row<CAND>(cand, c_row, start_kv + i_k_vec, n_kv);
+            if (i_kv >= 0) {
                 const int2 * k_base = (const int2 *) ((const char *) K + i_kv*nbk2 + i_stream*nbk3);
                 *(int2*) &k_shared_h[i_k_vec][i_embd] = k_base[i_embd];
             } else {
@@ -95,8 +133,8 @@ static __global__ void lightning_indexer_kernel_wmma(
         for (int i_k = tid; i_k < n_k; i_k += THREADS_PER_BLOCK) {
             const int i_k_vec = i_k / (N_EMBD / 4);
             const int i_embd = i_k % (N_EMBD / 4);
-            const int i_kv = start_kv + i_k_vec;
-            if (i_kv < n_kv) {
+            const int i_kv = li_key_row<CAND>(cand, c_row, start_kv + i_k_vec, n_kv);
+            if (i_kv >= 0) {
                 const void * k_base = (const void *) ((const char *) K + i_kv*nbk2 + i_stream*nbk3);
                 dequantize_k(k_base, &k_shared_h[i_k_vec][i_embd][0], i_embd * 4);
             } else {
@@ -202,8 +240,8 @@ static __global__ void lightning_indexer_kernel_wmma(
     // phase 4 - store output to VRAM
 
     if (tid < K_VECS_PER_BLOCK) {
-        const int i_kv = start_kv + tid;
-        if (i_kv < n_kv) {
+        const int i_kv = li_key_row<CAND>(cand, c_row, start_kv + tid, n_kv);
+        if (i_kv >= 0) {
             const half * m_base = (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
             float * dst_base = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
             dst_base[i_kv] = score_k + __half2float(m_base[i_kv]);
@@ -213,7 +251,7 @@ static __global__ void lightning_indexer_kernel_wmma(
 
 #else // defined(TURING_MMA_AVAILABLE)
 
-template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K>
+template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K, bool CAND>
 static __global__ void lightning_indexer_kernel_wmma(
         const float * Q, const char * K, const float * W, const half * M, float * dst,
         int64_t n_stream, int64_t n_batch, int64_t n_kv,
@@ -222,7 +260,7 @@ static __global__ void lightning_indexer_kernel_wmma(
         size_t nbk1, size_t nbk2, size_t nbk3,
         size_t nbw1, size_t nbw2, size_t nbw3,
         size_t nbm1, size_t nbm2, size_t nbm3,
-        int64_t nem3
+        int64_t nem3, const li_cand cand
     ) {
     GGML_UNUSED_VARS(Q, K, W, M, dst,
         n_stream, n_batch, n_kv,
@@ -230,7 +268,7 @@ static __global__ void lightning_indexer_kernel_wmma(
         nbq1, nbq2, nbq3,
         nbk1, nbk2, nbk3,
         nbw1, nbw2, nbw3,
-        nem3);
+        nem3, cand);
     NO_DEVICE_CODE;
 }
 
@@ -252,7 +290,7 @@ static __global__ void lightning_indexer_kernel_wmma(
 // thanks to that one warp operating on float4 processes whole indexer K/Q vectors
 // 32 * 4 = 128 (N_EMBD)
 
-template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K>
+template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K, bool CAND>
 static __global__ void lightning_indexer_kernel_vec(
         const float * Q, const char * K, const float * W, const half * M, float * dst,
         int64_t n_stream, int64_t n_batch, int64_t n_kv,
@@ -261,7 +299,7 @@ static __global__ void lightning_indexer_kernel_vec(
         size_t nbk1, size_t nbk2, size_t nbk3,
         size_t nbw1, size_t nbw2, size_t nbw3,
         size_t nbm1, size_t nbm2, size_t nbm3,
-        int64_t nem3
+        int64_t nem3, const li_cand cand
     ) {
 
     constexpr int K_VECS_PER_WARP = K_VECS_PER_BLOCK / WARPS_PER_BLOCK;
@@ -276,6 +314,7 @@ static __global__ void lightning_indexer_kernel_vec(
     // each warp processes K_VECS_PER_WARP K vectors
     const int start_kv_block = blockIdx.x * K_VECS_PER_BLOCK;
     const int start_kv = start_kv_block + i_warp * K_VECS_PER_WARP;
+    const int32_t * c_row = li_cand_row<CAND>(cand, i_batch, i_stream);
 
     const char  * q_base = (const char  *)                 Q + i_batch*nbq2 + i_stream*nbq3;
     const float * w_base = (const float *) ((const char *) W + i_batch*nbw1 + i_stream*nbw3);
@@ -288,8 +327,8 @@ static __global__ void lightning_indexer_kernel_vec(
         // direct copy of float4
 #pragma unroll
         for (int k = 0; k < K_VECS_PER_WARP; ++k) {
-            int i_kv = start_kv + k;
-            if (i_kv < n_kv) {
+            const int i_kv = li_key_row<CAND>(cand, c_row, start_kv + k, n_kv);
+            if (i_kv >= 0) {
                 const float4 * k_base = (const float4 *) ((const char *) K + i_kv*nbk2 + i_stream*nbk3);
                 k_reg_f[k] = k_base[i_lane];
             } else {
@@ -301,8 +340,8 @@ static __global__ void lightning_indexer_kernel_vec(
         constexpr dequantize_V_t dequantize_k = get_dequantize_V<TYPE_K, float, 4>();
 #pragma unroll
         for (int k = 0; k < K_VECS_PER_WARP; ++k) {
-            int i_kv = start_kv + k;
-            if (i_kv < n_kv) {
+            const int i_kv = li_key_row<CAND>(cand, c_row, start_kv + k, n_kv);
+            if (i_kv >= 0) {
                 const void * k_base = (const void *) ((const char *) K + i_kv*nbk2 + i_stream*nbk3);
                 dequantize_k(k_base, &k_reg_f[k], i_lane * 4);
             } else {
@@ -385,8 +424,8 @@ static __global__ void lightning_indexer_kernel_vec(
     // phase 5 - write from shared memory to VRAM in coalesced manner
 
     if (tid < K_VECS_PER_BLOCK) {
-        int i_kv = start_kv_block + tid;
-        if (i_kv < n_kv) {
+        const int i_kv = li_key_row<CAND>(cand, c_row, start_kv_block + tid, n_kv);
+        if (i_kv >= 0) {
             const half * m_base = (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
             float * dst_base = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
             dst_base[i_kv] = dst_shared[tid] + __half2float(m_base[i_kv]);
@@ -398,7 +437,7 @@ static __global__ void lightning_indexer_kernel_vec(
 // staged in half precision and the queries of every head in float, each thread owns KEYS_PER_THREAD
 // keys for one token, a warp shares its token so the query reads are broadcasts, and every key
 // element is widened once for all heads, so no dot product needs a cross thread reduction
-template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K>
+template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K, bool CAND>
 static __global__ void lightning_indexer_kernel_tile(
         const float * Q, const char * K, const float * W, const half * M, float * dst,
         int64_t n_stream, int64_t n_batch, int64_t n_kv,
@@ -407,7 +446,7 @@ static __global__ void lightning_indexer_kernel_tile(
         size_t nbk1, size_t nbk2, size_t nbk3,
         size_t nbw1, size_t nbw2, size_t nbw3,
         size_t nbm1, size_t nbm2, size_t nbm3,
-        int64_t nem3
+        int64_t nem3, const li_cand cand
     ) {
 
     constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * WARP_SIZE;
@@ -420,6 +459,8 @@ static __global__ void lightning_indexer_kernel_tile(
     static_assert(THREADS_PER_BLOCK % TOKENS_PER_BLOCK == 0, "threads must cover the token tile");
     static_assert(K_VECS_PER_BLOCK % KEY_LANES == 0, "key lanes must cover the key tile");
     static_assert(N_HEAD % HEADS_PER_PASS == 0, "head passes must cover the heads");
+    static_assert(!CAND, "the tile kernel shares keys across tokens: candidates are applied after it");
+    GGML_UNUSED(cand);
 
     const int tid         = threadIdx.y * WARP_SIZE + threadIdx.x;
     const int start_kv    = blockIdx.x * K_VECS_PER_BLOCK;
@@ -552,20 +593,71 @@ static __global__ void lightning_indexer_kernel_tile(
     }
 }
 
-#define LIGHTNING_INDEXER_CASE(lightning_indexer_kernel, n_embd, n_head, K, type_K)         \
-    if (K->type == (type_K)) {                                                              \
-        lightning_indexer_kernel<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, n_embd, n_head, type_K> \
-            <<<grid, block, 0, ctx.stream()>>>(                                             \
-            q_d, k_d, w_d, m_d, dst_d,                                                      \
-            n_stream, n_batch, n_kv,                                                        \
-            nb1, nb2, nb3,                                                                  \
-            nbq1, nbq2, nbq3,                                                               \
-            nbk1, nbk2, nbk3,                                                               \
-            nbw1, nbw2, nbw3,                                                               \
-            nbm1, nbm2, nbm3,                                                               \
-            nem3                                                                            \
-        );                                                                                  \
+#define LIGHTNING_INDEXER_LAUNCH(lightning_indexer_kernel, n_embd, n_head, type_K, cand_t, grid_l) \
+        lightning_indexer_kernel<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, n_embd, n_head, type_K, cand_t>  \
+            <<<grid_l, block, 0, ctx.stream()>>>(                                                 \
+            q_d, k_d, w_d, m_d, dst_d,                                                            \
+            n_stream, n_batch, n_kv,                                                              \
+            nb1, nb2, nb3,                                                                        \
+            nbq1, nbq2, nbq3,                                                                     \
+            nbk1, nbk2, nbk3,                                                                     \
+            nbw1, nbw2, nbw3,                                                                     \
+            nbm1, nbm2, nbm3,                                                                     \
+            nem3, cand                                                                            \
+        );
+
+// per token kernels: with candidates the grid covers only the candidate slots
+#define LIGHTNING_INDEXER_CASE(lightning_indexer_kernel, n_embd, n_head, K, type_K)                                       \
+    if (K->type == (type_K)) {                                                                                            \
+        if (cand.C) {                                                                                                     \
+            const dim3 grid_c((cand.n_slots + K_VECS_PER_BLOCK - 1) / K_VECS_PER_BLOCK, n_batch, n_stream);               \
+            LIGHTNING_INDEXER_LAUNCH(lightning_indexer_kernel, n_embd, n_head, type_K, true, grid_c)                     \
+        } else {                                                                                                          \
+            LIGHTNING_INDEXER_LAUNCH(lightning_indexer_kernel, n_embd, n_head, type_K, false, grid)                      \
+        }                                                                                                                 \
     } else
+
+// the tile kernel always scores every row, candidates are applied after it
+#define LIGHTNING_INDEXER_CASE_ALL(lightning_indexer_kernel, n_embd, n_head, K, type_K)                                   \
+    if (K->type == (type_K)) {                                                                                            \
+        LIGHTNING_INDEXER_LAUNCH(lightning_indexer_kernel, n_embd, n_head, type_K, false, grid)                          \
+    } else
+
+// every row of dst -> -inf (the candidate kernels write only the candidate rows)
+static __global__ void lightning_indexer_fill_ninf(float * dst, const int64_t n_kv, const size_t nb1, const size_t nb3) {
+    float * row = (float *) ((char *) dst + blockIdx.y*nb1 + blockIdx.z*nb3);
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n_kv; i += (int64_t) gridDim.x*blockDim.x) {
+        row[i] = -INFINITY;
+    }
+}
+
+// flags[token][block] = 1 for the token's candidate blocks
+static __global__ void lightning_indexer_cand_flags(const li_cand cand, uint8_t * flags, const int64_t n_blk, const int n_batch) {
+    const int i_batch  = blockIdx.x;
+    const int i_stream = blockIdx.y;
+    const int32_t * c_row = (const int32_t *) (cand.C + i_batch*cand.nbc1 + i_stream*cand.nbc3);
+    uint8_t * f = flags + ((int64_t) i_stream*n_batch + i_batch)*n_blk;
+    for (int i = threadIdx.x; i < cand.n_slots / cand.bs; i += blockDim.x) {
+        const int32_t b = c_row[i];
+        if (b >= 0 && b < n_blk) {
+            f[b] = 1;
+        }
+    }
+}
+
+// rows outside the token's candidate blocks -> -inf
+static __global__ void lightning_indexer_cand_apply(const uint8_t * flags, float * dst, const int64_t n_kv, const int64_t n_blk,
+        const int bs, const int n_batch, const size_t nb1, const size_t nb3) {
+    const int i_batch  = blockIdx.y;
+    const int i_stream = blockIdx.z;
+    const uint8_t * f = flags + ((int64_t) i_stream*n_batch + i_batch)*n_blk;
+    float * row = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n_kv; i += (int64_t) gridDim.x*blockDim.x) {
+        if (!f[i / bs]) {
+            row[i] = -INFINITY;
+        }
+    }
+}
 
 void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * q = dst->src[0];
@@ -615,6 +707,24 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int device = ggml_cuda_get_device();
     const int cc     = ggml_cuda_info().devices[device].cc;
+
+    // candidate blocks (optional): I32 [n_cand, n_batch, 1, n_stream], rows per block in op_params[0]
+    const ggml_tensor * c = dst->src[4];
+    li_cand cand = { nullptr, 0, 1, 0, 0 };
+    if (c) {
+        GGML_ASSERT(c->type == GGML_TYPE_I32 && c->nb[0] == sizeof(int32_t));
+        GGML_ASSERT(c->ne[1] == n_batch && c->ne[2] == 1 && c->ne[3] == n_stream);
+        const int bs = ggml_get_op_params_i32(dst, 0);
+        GGML_ASSERT(bs > 0 && c->ne[0]*bs <= INT_MAX);
+        cand = { (const char *) c->data, (int) (c->ne[0]*bs), bs, c->nb[1], c->nb[3] };
+    }
+    const bool tile = n_embd == 128 && n_head == 4 && n_batch >= LIGHTNING_INDEXER_TILE_TOKENS &&
+        !(dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT);
+    if (cand.C && !tile) {
+        // the per token kernels write only the candidate rows
+        const dim3 grid_f(std::min<int64_t>((n_kv + 255)/256, 64), n_batch, n_stream);
+        lightning_indexer_fill_ninf<<<grid_f, 256, 0, ctx.stream()>>>(dst_d, n_kv, nb1, nb3);
+    }
 
     if (n_embd == 128 && n_head == 64) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -698,8 +808,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_F32)
             GGML_ABORT("fatal error");
         }
-    } else if (n_embd == 128 && n_head == 4 && n_batch >= LIGHTNING_INDEXER_TILE_TOKENS &&
-               !(dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT)) { // batch invariant: per token, as for one token
+    } else if (tile) { // batch invariant: per token, as for one token
         // too few heads for a wmma tile, the tile kernel shares the keys across the tokens
         constexpr int WARPS_PER_BLOCK = 8;
         constexpr int K_VECS_PER_BLOCK = 64;
@@ -709,15 +818,25 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
         int num_batch_blocks = (n_batch + LIGHTNING_INDEXER_TILE_TOKENS - 1) / LIGHTNING_INDEXER_TILE_TOKENS;
         dim3 grid(num_kv_blocks, num_batch_blocks, n_stream);
 
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_F16)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_Q4_0)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_Q4_1)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_Q5_0)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_Q5_1)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_Q8_0)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_BF16)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_F32)
+        LIGHTNING_INDEXER_CASE_ALL(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_F16)
+        LIGHTNING_INDEXER_CASE_ALL(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_Q4_0)
+        LIGHTNING_INDEXER_CASE_ALL(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_Q4_1)
+        LIGHTNING_INDEXER_CASE_ALL(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_Q5_0)
+        LIGHTNING_INDEXER_CASE_ALL(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_Q5_1)
+        LIGHTNING_INDEXER_CASE_ALL(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_Q8_0)
+        LIGHTNING_INDEXER_CASE_ALL(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_BF16)
+        LIGHTNING_INDEXER_CASE_ALL(lightning_indexer_kernel_tile, 128, 4, k, GGML_TYPE_F32)
         GGML_ABORT("fatal error");
+
+        if (cand.C) {
+            // every row was scored: rows outside the token's candidate blocks -> -inf
+            const int64_t n_blk = (n_kv + cand.bs - 1)/cand.bs;
+            ggml_cuda_pool_alloc<uint8_t> flags(ctx.pool(), n_blk*n_batch*n_stream);
+            CUDA_CHECK(cudaMemsetAsync(flags.get(), 0, n_blk*n_batch*n_stream, ctx.stream()));
+            lightning_indexer_cand_flags<<<dim3(n_batch, n_stream), 256, 0, ctx.stream()>>>(cand, flags.get(), n_blk, n_batch);
+            const dim3 grid_a(std::min<int64_t>((n_kv + 255)/256, 64), n_batch, n_stream);
+            lightning_indexer_cand_apply<<<grid_a, 256, 0, ctx.stream()>>>(flags.get(), dst_d, n_kv, n_blk, cand.bs, n_batch, nb1, nb3);
+        }
     } else if (n_embd == 128 && n_head == 4) {
         // a batch smaller than a token tile, use vector kernel
         constexpr int K_VECS_PER_WARP = 8;
@@ -766,6 +885,13 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst) 
     }
 
     if (neq1 != 64 && neq1 != 32 && neq1 != 4) {
+        return false;
+    }
+
+    // candidate blocks (optional)
+    const ggml_tensor * c = dst->src[4];
+    if (c && (c->type != GGML_TYPE_I32 || c->nb[0] != sizeof(int32_t) || c->ne[1] != neq2 || c->ne[2] != 1 || c->ne[3] != neq3 ||
+              ggml_get_op_params_i32(dst, 0) <= 0)) {
         return false;
     }
 
