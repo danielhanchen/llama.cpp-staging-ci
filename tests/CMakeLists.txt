@@ -276,6 +276,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS --rs-decode-parity -s 1
     )
 
+    # k19-mgpucache: delta-net replay commits of a state split over two devices (two in-process RPC servers over the CPU; skipped without
+    # the RPC backend) give the logits of one device, with the cached commit graphs of alternating windows reused through the scheduler
+    llama_test(
+        test-llama-archs
+        NAME test-rs-replay-sched
+        LABEL main
+        ARGS --rs-replay-sched -s 1
+    )
+
     # an exact verify row keeps every cell of its sequence when the cells do not follow the positions (two sequences in a unified KV)
     llama_build(test-exact-verify-cells.cpp)
     llama_test(

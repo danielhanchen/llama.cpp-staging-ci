@@ -1997,6 +1997,21 @@ void llama_context::rs_replay_commit(bool sync) {
     }
     static const bool reuse = getenv("LLAMA_RS_REPLAY_REUSE") == nullptr || atoi(getenv("LLAMA_RS_REPLAY_REUSE")) != 0;
     auto hit = reuse ? rs_graphs.find(key) : rs_graphs.end();
+    // k19-mgpucache: with the commit graphs run through a scheduler (the recurrent states on several devices, e.g. -sm layer over 2
+    // GPUs) a cached graph is reused only while it is the scheduler's current allocation. Splitting a graph rewrites the inputs of its
+    // nodes that live on another backend to the scheduler's own copies (node->src[j], ggml_backend_sched_split_graph pass 5); those copies
+    // belong to the scheduler's context, which the next graph's split frees and rebuilds. A cached graph allocated again after another
+    // key's graph read the other graph's copies: a CONT of a 2-entry gate / beta window read an 8-entry one, and the commit aborted in
+    // the copy op (ne == ggml_nelements(src1), CUDA cpy.cu; Kaggle 2x T4 Qwen3.8-Flash-Next + MTP at the server's prompt save, every
+    // arm of a 48-prompt srv_kld; reproduced on two RPC CPU devices). Such a hit is built again instead (one graph build per key change).
+    // LLAMA_RS_REPLAY_SCHED_REBUILD=0: the old reuse
+    static const bool sched_rebuild = getenv("LLAMA_RS_REPLAY_SCHED_REBUILD") == nullptr || atoi(getenv("LLAMA_RS_REPLAY_SCHED_REBUILD")) != 0;
+    if (hit != rs_graphs.end() && rs_mode < 0 && key != rs_key && sched_rebuild) {
+        ggml_backend_sched_synchronize(rs_sched.get()); // the graph about to be freed is not the current one, but it may have run last but one
+        rs_graphs.erase(hit);
+        hit = rs_graphs.end();
+        rs_sched_rebuilt++;
+    }
     if (hit != rs_graphs.end()) {
         for (uint32_t c = 0; c < mem->size; ++c) {
             mem->pend_n[c]  = 0;
@@ -2669,8 +2684,9 @@ llama_context::~llama_context() {
                 ms->n_snap_save, ms->n_snap_restore, ms->snap_bytes()/1024.0/1024.0);
     }
     if (rs_replay_mem != nullptr && rs_replay_mem->n_replay_commit > 0) {
-        LLAMA_LOG_INFO("%s: recurrent replay commits: %" PRIu64 " (%" PRIu64 " reused graphs), %.2f ms total, %.3f ms each (host)\n", __func__,
-                rs_replay_mem->n_replay_commit, rs_reused, rs_replay_us/1e3, rs_replay_us/1e3/rs_replay_mem->n_replay_commit);
+        LLAMA_LOG_INFO("%s: recurrent replay commits: %" PRIu64 " (%" PRIu64 " reused graphs, %" PRIu64 " built again through the scheduler "
+                "after another key's graph, LLAMA_RS_REPLAY_SCHED_REBUILD), %.2f ms total, %.3f ms each (host)\n", __func__,
+                rs_replay_mem->n_replay_commit, rs_reused, rs_sched_rebuilt, rs_replay_us/1e3, rs_replay_us/1e3/rs_replay_mem->n_replay_commit);
         LLAMA_LOG_INFO("%s: recurrent replay windows moved with their cells: %" PRIu64 "\n", __func__, rs_replay_mem->n_replay_move);
         LLAMA_LOG_INFO("%s: replay commit graph allocations: %.2f MiB at most, %" PRIu64 " commits in the reserved fallback buffer\n", __func__,
                 rs_ga_bytes_max/1024.0/1024.0, rs_fb_used);
