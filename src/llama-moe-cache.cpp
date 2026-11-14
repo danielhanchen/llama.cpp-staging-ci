@@ -12993,10 +12993,10 @@ struct llama_moe_cache::impl {
         const char * why = pw_refused();
         for (size_t ig = 0; ig < groups.size() && why == nullptr; ++ig) {
             const group & g = groups[ig];
+            // (the lent slots may differ: the snapshot's lent slots hold no expert and the next large batch lends them as it would
+            // have, with the same refill list)
             if (g.n_slots != pw_groups[ig].n_slots || g.lru.n_slots != pw_groups[ig].lru.n_slots) {
                 why = "the slot count changed";
-            } else if (g.lru.n_lent != pw_groups[ig].lru.n_lent) {
-                why = "the lent slots changed";
             }
         }
         if (why != nullptr) {
@@ -13022,7 +13022,7 @@ struct llama_moe_cache::impl {
             const std::vector<int32_t> cur = pw_key(g);
             const int32_t n_expert = g.lru.n_expert;
             std::vector<llama_weight_store::region> regions;
-            for (int32_t sl = 0; sl < g.n_slots - g.lru.n_lent; ++sl) {
+            for (int32_t sl = 0; sl < g.n_slots - s.lru.n_lent; ++sl) {
                 const int32_t k = s.key[sl];
                 if (k < 0 || cur[sl] == k) {
                     continue;
