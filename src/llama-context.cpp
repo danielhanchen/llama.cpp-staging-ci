@@ -38,6 +38,7 @@
 #endif
 #include "llama-ext.h"
 #include "llama-sampler.h"
+
 #include "llama.h"
 
 #include <algorithm>
@@ -64,6 +65,8 @@
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/resource.h>
 #endif
+
+static bool moe_cache_released_counts(); // k19-autoprof2 (defined beside moe_cache_refill_from_ids)
 
 //
 // llama_context
@@ -6121,7 +6124,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             // k19-tiny-ub: the slots that come back get the experts this ubatch routed most (read before its compute buffers are freed)
             if (res && !moe_cache_ids.empty()) {
                 moe_cache->set_refill_routed_once(true);
-                moe_cache_refill_from_ids();
+                // k19-autoprof2: the prompt's routing also to the RAM tier's refill and the profile (see moe_cache_released_counts)
+                moe_cache_refill_from_ids(moe_cache_released_counts());
             }
             moe_cache_ids.clear();
             moe_cache_record = false;
@@ -8200,7 +8204,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             moe_cache->set_refill_routed_once(true);
             moe_cache_ids = lm_record;
             moe_ap_counted = false;
-            moe_cache_refill_from_ids();
+            // k19-autoprof2: the group's routing also to the RAM tier's refill and the profile (see moe_cache_released_counts)
+            moe_cache_refill_from_ids(moe_cache_released_counts());
         }
         // the routing of the group is in its compute buffers, which are freed: no later seed reads it
         moe_cache_ids.clear();
@@ -10242,8 +10247,29 @@ void llama_context::moe_cache_autoprof_from_ids() {
     }
 }
 
-void llama_context::moe_cache_refill_from_ids() {
+// k19-autoprof2 (LLAMA_MOE_RELEASE_COUNTS, default 1): a prompt whose large ubatches run with the cache banks released (the tiny-cache
+// rule / k19-place8 / k19-placemid: a capped or small card, e.g. Colab L4 @12 GB or a T4 with Flash-Next) skips moe_cache_seed_begin's
+// recording (released banks take no seed) and its layer-major groups clear the routing without counting it, so the RAM tier's idle
+// refill (k19-l4fill) and the self-learned profile (k19-autoprof) never got a count there ("0 prompts counted ... 0 read"). The routed
+// refill of the banks reads that routing after the ubatch / group anyway (one sync, one read of the ids per prompt): the counts come
+// from that same read, no extra sync or device read, nothing on the decode path. Counting only orders RAM-tier placement: exact.
+// =0: as before
+static bool moe_cache_released_counts() {
+    static const bool on = [] { const char * e = getenv("LLAMA_MOE_RELEASE_COUNTS"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
+void llama_context::moe_cache_refill_from_ids(bool count) {
     ggml_backend_sched_synchronize(sched.get());
+    const bool fill = count && moe_cache->fill_wants_counts();
+    const bool ap   = count && !moe_ap_counted && moe_cache->autoprof_wants_counts();
+    if (fill) {
+        moe_cache->fill_counts_begin();
+    }
+    if (ap) {
+        moe_ap_counted = true;
+        moe_cache->autoprof_counts_begin();
+    }
     std::vector<int32_t> ids_data;
     std::vector<int32_t> counts;
     for (const auto & [w, ids] : moe_cache_ids) {
@@ -10259,6 +10285,12 @@ void llama_context::moe_cache_refill_from_ids() {
             }
         }
         moe_cache->set_refill_counts(w, counts);
+        if (fill) {
+            moe_cache->fill_counts(w, counts);
+        }
+        if (ap) {
+            moe_cache->autoprof_counts(w, counts);
+        }
     }
 }
 

@@ -860,7 +860,9 @@ private:
     void moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_large, int64_t n_outputs_ub, bool early = false);
     void moe_cache_seed_end(const llama_ubatch & ubatch, int64_t n_outputs_ub);
     // the end of a prompt that did not seed: the lent slots that come back get the experts its last large ubatch used most
-    void moe_cache_refill_from_ids();
+    // count: the same routing also goes to the RAM tier's refill (k19-l4fill) and the self-learned profile (k19-autoprof), see
+    // moe_cache_released_counts
+    void moe_cache_refill_from_ids(bool count = false);
     void moe_cache_fill_from_ids(); // k19-l4fill
     void moe_cache_autoprof_from_ids(); // k19-autoprof
     bool moe_ap_counted = false;        // k19-autoprof: the recorded routing (moe_cache_ids) was counted
