@@ -79,7 +79,7 @@ static constexpr int MMQ_FEW_NROWS   = 16; // src0 rows of one MMA tile
 static constexpr int MMQ_FEW_NWARPS  = 4;
 
 // k19-kqtc: GGML_CUDA_MMQ_FEW: unset = AUTO (the per-architecture table in ggml_cuda_mmq_few_auto_min_ncols: A100 / A30 and Ada
-// measured, off elsewhere), 0 = off, 1 = the upstream per-type minimum columns (ggml_cuda_mmq_few_min_ncols) on every Ampere+ device,
+// measured, off elsewhere, also on cc 12.0 since k19-int3fix), 0 = off, 1 = the upstream per-type minimum columns (ggml_cuda_mmq_few_min_ncols) on every Ampere+ device,
 // N >= 2 = from N columns for every type it decodes; GGML_CUDA_MMQ_FEW_MAX (default 8, the verify widths) = the most columns taken
 // (upstream: 24; wider products keep MMQ)
 struct mmq_few_env_t { int mode; int max_cols; };
@@ -942,7 +942,10 @@ static int ggml_cuda_mmq_few_min_ncols(const ggml_type type, const int cc, const
 // - cc 8.0 (A100 / A30): K-quants from 2 columns (micro-bench 5 columns: Q4_K 53%, Q5_K 57% of the batched mmvq; q38d MTP +41% chat,
 //   +39% 8k on an A100 40 GB), Q6_K / IQ4_XS from 3, Q8_0 from 5 (from 2 it moved q4x's Q8_0 verify text: -5% chat by acceptance);
 // - cc 8.9 (Ada, L4): the upstream table (L4 q38d +8.5% chat, +5.4% 8k);
-// - cc 12.0 (RTX PRO 6000 / RTX 50xx): the upstream table (G4 q38d +2.1% chat, flat 8k);
+// - cc 12.0 (RTX PRO 6000 / RTX 50xx): off (k19-int3fix; GGML_CUDA_MMQ_FEW=1 = the upstream table). The table gained G4 q38d +2.1% chat
+//   (flat 8k) but cost Flash-Next, whose dense products are K 2560 Q6_K / Q8_0 / IQ4_XS: G4 full card MTP chat 338.3 -> 325.1 tok/s at
+//   the same text, MTP 8k 278.9 -> 251.2 (other text, +8.7% passes), DFlash2 48 GB chat 255.4 -> 248.8, and its verify rows broke the
+//   row invariance of test-backend-ops VROW_INV (22 of 96);
 // - other devices: off (not measured); GGML_CUDA_MMQ_FEW=1 / N turns it on.
 static int ggml_cuda_mmq_few_auto_min_ncols(const ggml_type type, const int cc, const int64_t ne00) {
     const int up = ggml_cuda_mmq_few_min_ncols(type, cc, ne00);
@@ -959,7 +962,7 @@ static int ggml_cuda_mmq_few_auto_min_ncols(const ggml_type type, const int cc, 
             default:               return up;
         }
     }
-    if (cc == GGML_CUDA_CC_ADA_LOVELACE || cc == GGML_CUDA_CC_BLACKWELL) {
+    if (cc == GGML_CUDA_CC_ADA_LOVELACE) {
         return up;
     }
     return 0;
