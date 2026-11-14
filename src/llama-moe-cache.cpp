@@ -7869,7 +7869,11 @@ struct llama_moe_cache::impl {
     // (moe_cache_fetch, 8.0 of 29.8 ms per traced w7 pass at 16 GB) ran serially before the hits while the host computed; beside the
     // hits they shorten the device side of every host layer. Colab G4 Flash-Next UD-IQ4_XS DFlash2 n6 16 GB, same text: w7 24.9 -> 23.8
     // ms, chat 179.1 -> 186.6 tok/s, 8k 126.9 -> 136.5 (gp_p1, 2 launches). Windows on the eager split (fewer CPUs, smaller caches)
-    // keep the 4-token limit
+    // keep the 4-token limit. Only below LLAMA_MOE_G4PASS_OV_MAX_FRAC (default 0.20) of the host experts cached, the share where the
+    // wide mailbox is new (see single_max) and the copies are largest. gp_ab1 / gp_ab2 (G4, 3-4 interleaved launches, same text): 16 GB
+    // chat 167.2 -> 178.3 (launches 2+: 166-168 -> 174.9-186.1), 8k 120.6 -> 134.8; above the share it was mixed: 24 GB (27.5%) chat
+    // 203.7 -> 199.3 median over 7 launches (head 189-211, its host batches slower in the slow launches), 8k +2.4%; 32 GB (42%) chat /
+    // 8k +4.3 / +2.9% (3 launches). LLAMA_MOE_G4PASS_OV_MAX_FRAC=1: every mailbox window
     static bool g4pass_on() {
         static const bool on = [] {
             const char * e = getenv("LLAMA_MOE_G4PASS");
@@ -7883,7 +7887,8 @@ struct llama_moe_cache::impl {
         if (!overlap || n_ubatch <= 1) {
             return false;
         }
-        if (e == nullptr && n_ubatch > mx && g4pass_on() && single_usable(n_ubatch)) {
+        static const double ov_max_frac = getenv("LLAMA_MOE_G4PASS_OV_MAX_FRAC") != nullptr ? atof(getenv("LLAMA_MOE_G4PASS_OV_MAX_FRAC")) : 0.20;
+        if (e == nullptr && n_ubatch > mx && g4pass_on() && cache_frac >= 0.0 && cache_frac < ov_max_frac && single_usable(n_ubatch)) {
             n_ov_wide_host++;
             return true;
         }
