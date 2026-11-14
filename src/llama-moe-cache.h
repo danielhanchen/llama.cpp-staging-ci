@@ -58,6 +58,9 @@ public:
             layer_set set = layer_set::all, llama_weight_store * ws = nullptr, int64_t host_mib = -1);
     ~llama_moe_cache();
 
+    // k19-mgpu2: the layer of a cached expert weight, -1 if w is not one
+    int32_t layer_of_weight(const ggml_tensor * w) const;
+
     // the device that caches layer il
     ggml_backend_t backend(int32_t il) const;
 

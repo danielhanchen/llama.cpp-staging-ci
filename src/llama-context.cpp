@@ -8158,6 +8158,38 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
     lm_seeded.clear();
     ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
+    // k19-mgpu2: resident prompt fill on the layer-major path: the routing of the group's last member (its ffn routing outputs, read
+    // before the compute buffers are freed) for the fill at the end of the prompt, here when the group ends it
+    if (status == GGML_STATUS_SUCCESS && moe_cache->resident_fill_wanted() && !lm_record.empty()) {
+        ggml_backend_sched_synchronize(sched.get());
+        std::vector<int32_t> ids_data;
+        std::vector<int32_t> counts;
+        int n_rec = 0;
+        for (const auto & [w, ids] : lm_record) {
+            const int32_t il = moe_cache->layer_of_weight(w);
+            if (il < 0 || ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids) || ids->buffer == nullptr || ids->data == nullptr) {
+                continue;
+            }
+            ids_data.resize(ggml_nelements(ids));
+            ggml_backend_tensor_get(ids, ids_data.data(), 0, ggml_nbytes(ids));
+            counts.assign(w->ne[2], 0);
+            for (const int32_t id : ids_data) {
+                if (id >= 0 && id < w->ne[2]) {
+                    counts[id]++;
+                }
+            }
+            moe_cache->set_resident_counts(il, counts); // the gate, up and down weights of a layer share one routing: the same counts
+            n_rec++;
+        }
+        static int n_log = 0;
+        if (n_log++ < 3) {
+            LLAMA_LOG_INFO("%s: k19-mgpu2: resident prompt fill: routing of %d weights recorded from a layer-major group\n", __func__, n_rec);
+        }
+        if (group.back().n_outputs > 0 && moe_cache->has_resident_counts()) {
+            moe_cache->resident_fill();
+        }
+    }
+
     // the state moe_cache_seed_end leaves after the last ubatch of the group: its routing is kept for a later seed while the prompt goes on
     moe_cache_ids.clear();
     moe_cache_seeded = seeded || replayed;

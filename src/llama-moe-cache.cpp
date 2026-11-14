@@ -3602,10 +3602,11 @@ struct llama_moe_cache::impl {
         if (resident_mode) {
             LLAMA_LOG_INFO("llama_moe_cache%s: k19-mgpu2: resident prompt fill: %llu prompts, %llu layers, %llu experts wanted, %llu swapped in "
                 "(%.2f MiB), %llu copies back chained into the promoted experts' RAM slots, %llu into fresh slots, %llu kept (RAM held them), "
-                "%llu dropped, %llu read from the files, %.1f ms (LLAMA_MOE_RESIDENT_FILL=%d)\n", tag, (unsigned long long) rpfs.prompts,
+                "%llu dropped, %llu read from the files, %.1f ms (LLAMA_MOE_RESIDENT_FILL=%d, MIN %d, MAX %lld, DEFER %d: %llu layer swaps in decode lookups, PASS %lld)\n", tag, (unsigned long long) rpfs.prompts,
                 (unsigned long long) rpfs.layers, (unsigned long long) rpfs.wanted, (unsigned long long) rpfs.swapped, rpfs.bytes/1048576.0,
                 (unsigned long long) rpfs.chained, (unsigned long long) rpfs.fresh, (unsigned long long) rpfs.kept, (unsigned long long) rpfs.dropped,
-                (unsigned long long) rpfs.from_file, rpfs.us/1000.0, rpf_on ? 1 : 0);
+                (unsigned long long) rpfs.from_file, rpfs.us/1000.0, rpf_on ? 1 : 0, rpf_min, (long long) rpf_max, rpf_defer ? 1 : 0,
+                (unsigned long long) rpf_deferred_layers, (long long) rpf_pass);
         }
         if (rps.used || rp_rec) {
             LLAMA_LOG_INFO("llama_moe_cache%s: k19-mgpu2: resident device prefill %s (%zu profile entries read, %zu taken, %zu by id); decode routing "
@@ -4563,12 +4564,183 @@ struct llama_moe_cache::impl {
         return std::any_of(rpf_counts.begin(), rpf_counts.end(), [](const std::vector<int32_t> & c) { return !c.empty(); });
     }
 
+    // LLAMA_MOE_RESIDENT_FILL_MIN (1): an expert is swapped in only when the prompt's last large ubatch routed it at least this many times;
+    // LLAMA_MOE_RESIDENT_FILL_MAX (0 = no cap): at most this many experts per prompt, the most routed first over all layers;
+    // LLAMA_MOE_RESIDENT_FILL_DEFER (0): 1 = not at the prompt end (the first token waits for none of it) but in the decode's host lookups,
+    // each layer's swaps just before its lookup, at most LLAMA_MOE_RESIDENT_FILL_PASS (256) experts per decode pass
+    int32_t rpf_min   = [] { const char * e = getenv("LLAMA_MOE_RESIDENT_FILL_MIN");   return e != nullptr ? std::max(1, atoi(e)) : 1; }();
+    int64_t rpf_max   = [] { const char * e = getenv("LLAMA_MOE_RESIDENT_FILL_MAX");   return e != nullptr ? std::max<int64_t>(0, atoll(e)) : 0; }();
+    bool    rpf_defer = [] { const char * e = getenv("LLAMA_MOE_RESIDENT_FILL_DEFER"); return e != nullptr && atoi(e) != 0; }();
+    int64_t rpf_pass  = [] { const char * e = getenv("LLAMA_MOE_RESIDENT_FILL_PASS");  return e != nullptr ? std::max<int64_t>(1, atoll(e)) : 256; }();
+    std::vector<std::vector<int32_t>> rpf_pending; // [il] experts still to swap in (deferred mode), most routed first
+    int64_t rpf_pass_left = 0;
+    int32_t rpf_last_il   = -1;
+    uint64_t rpf_deferred_layers = 0;
+
+    // the experts of each layer to swap in, most routed first: count >= rpf_min, at most the group's slots per layer, at most rpf_max over all
+    void resident_fill_select(std::vector<std::vector<int32_t>> & sel) {
+        sel.assign(layers.size(), {});
+        std::vector<std::pair<int32_t, std::pair<int32_t, int32_t>>> all; // (count, (il, e)) for the global cap
+        for (group & g : groups) {
+            if (g.n_slots == 0 || g.layers.empty()) {
+                continue;
+            }
+            const int32_t n_expert  = g.lru.n_expert;
+            const int32_t per_layer = std::max<int32_t>(1, (g.n_slots - g.lru.n_lent - g.lru.n_core)/(int32_t) g.layers.size());
+            for (const int32_t il : g.layers) {
+                if (!host_layer(il) || (size_t) il >= rpf_counts.size() || (int32_t) rpf_counts[il].size() != n_expert) {
+                    continue;
+                }
+                const std::vector<int32_t> & c = rpf_counts[il];
+                std::vector<int32_t> & ids = sel[il];
+                for (int32_t e = 0; e < n_expert; ++e) {
+                    if (c[e] >= rpf_min) {
+                        ids.push_back(e);
+                    }
+                }
+                std::stable_sort(ids.begin(), ids.end(), [&c](int32_t a, int32_t b) { return c[a] > c[b]; });
+                if ((int32_t) ids.size() > per_layer) {
+                    ids.resize(per_layer);
+                }
+                for (const int32_t e : ids) {
+                    all.push_back({ c[e], { il, e } });
+                }
+            }
+        }
+        if (rpf_max > 0 && (int64_t) all.size() > rpf_max) {
+            std::stable_sort(all.begin(), all.end(), [](const auto & x, const auto & y) { return x.first > y.first; });
+            for (auto & v : sel) {
+                v.clear();
+            }
+            for (int64_t k = 0; k < rpf_max; ++k) {
+                sel[all[k].second.first].push_back(all[k].second.second); // still most routed first per layer
+            }
+        }
+    }
+
+    // swaps the experts ids (most routed first) of host layer il into its group's slots as one chain on the device's stream (see above);
+    // returns false when nothing was planned
+    bool resident_fill_layer(group & g, ggml_backend_t backend, int32_t il, const std::vector<int32_t> & ids_in) {
+        const int32_t n_expert = g.lru.n_expert;
+        if ((int32_t) rpf_victim.size() != g.n_slots) {
+            rpf_victim.assign(g.n_slots, -1);
+        }
+        rpf_ids = ids_in;
+        if (rpf_ids.empty()) {
+            return false;
+        }
+        ua_lookup_guard(backend, g, il);
+        host->begin_call();
+        for (const int32_t e : rpf_ids) {
+            const int32_t sl = host->find(il, e, false);
+            if (sl >= 0) {
+                host->pin(sl); // a fresh slot for a copy back is never one of the experts being promoted
+            }
+        }
+        size_t n_hit = 0;
+        evicted_tmp.clear();
+        if (!g.lru.plan(il, rpf_ids.data(), rpf_ids.size(), rpf_fills, n_hit, &evicted_tmp) || rpf_fills.empty()) {
+            return false;
+        }
+        for (const auto & [s, key] : evicted_tmp) {
+            rpf_victim[s] = key;
+        }
+        const layer & l = layers[il];
+        int32_t carry = -1; // the RAM slot the last promotion was uploaded from: free for a copy back once that upload ran
+        for (const auto & f : rpf_fills) {
+            const int32_t key = rpf_victim[f.slot];
+            rpf_victim[f.slot] = -1;
+            // 1. the victim leaves the slot first (RAM keeps it)
+            if (key >= 0 && host_layer(key / n_expert)) {
+                const int32_t vil = key / n_expert;
+                const int32_t ve  = key % n_expert;
+                const layer & vl = layers[vil];
+                if (host->contains(vil, ve)) {
+                    const int32_t h = host->held(vil, ve);
+                    if (h >= 0) {
+                        host->set_dup(h, false);
+                    }
+                    rpfs.kept++;
+                } else {
+                    int32_t r = -1;
+                    if (carry >= 0 && host->rekey(carry, vil, ve)) {
+                        r = carry;
+                        rpfs.chained++;
+                    } else {
+                        r = host->reserve(vil, ve, false);
+                        if (r < 0) {
+                            r = host->reserve(vil, ve, true); // evicts an expert RAM alone holds (counted: it is read from the files later)
+                            rpfs.dropped += r >= 0 ? 1 : 0;
+                        }
+                        rpfs.fresh += r >= 0 ? 1 : 0;
+                    }
+                    carry = r == carry ? -1 : carry;
+                    if (r >= 0) {
+                        for (size_t ip = 0; ip < vl.experts.size(); ++ip) {
+                            const size_t nb = vl.experts[ip]->nb[2];
+                            host->set_lead(r, (int) ip, 0);
+                            ggml_backend_tensor_get_async(backend, g.banks[ip], host->area(r, (int) ip), (size_t) f.slot*nb, nb);
+                            hst.demote_bytes += nb;
+                        }
+                        host->mark_write(r);
+                        hst.demoted++;
+                    } else {
+                        hst.demote_skip++;
+                        rpfs.dropped++;
+                    }
+                }
+            }
+            // 2. the promoted expert from its RAM slot (exclusive: it leaves RAM; with spare room its copy stays as a duplicate
+            // until a later copy back re-keys it)
+            const int32_t s = host->find(il, f.expert, false);
+            if (s >= 0) {
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const size_t nb = l.experts[ip]->nb[2];
+                    ggml_backend_tensor_set_async(backend, g.banks[ip], host->data(s, (int) ip), (size_t) f.slot*nb, nb);
+                    rpfs.bytes += nb;
+                    hst.up_bytes += nb;
+                }
+                host->mark_read(s);
+                host->set_dup(s, true); // the device holds it now; re-keyed by the next copy back (or released below)
+                hst.promoted++;
+                carry = s;
+            } else {
+                // not in RAM (the few experts slot rounding left to the files): read from the mapping
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    const size_t nb = w->nb[2];
+                    ggml_backend_tensor_set_async(backend, g.banks[ip], (const uint8_t *) w->data + (size_t) f.expert*nb, (size_t) f.slot*nb, nb);
+                    rpfs.bytes += nb;
+                }
+                rpfs.from_file++;
+            }
+            rpfs.swapped++;
+        }
+        if (carry >= 0 && !host_spare) {
+            host->release(carry); // no spare room: the last promotion leaves RAM (exclusive), as upload_fills does
+        }
+        host->commit(backend);
+        return true;
+    }
+
     void resident_fill() {
         if (!resident_fill_wanted() || rpf_counts.empty()) {
             rpf_counts.clear();
             return;
         }
         const int64_t t0 = ggml_time_us();
+        std::vector<std::vector<int32_t>> sel;
+        resident_fill_select(sel);
+        rpf_counts.clear();
+        if (rpf_defer) {
+            // the decode's host lookups swap them in (resident_fill_lookup); a new prompt replaces what is left
+            rpf_pending   = std::move(sel);
+            rpf_pass_left = rpf_pass;
+            rpf_last_il   = -1;
+            rpfs.prompts++;
+            rpfs.us += ggml_time_us() - t0;
+            return;
+        }
         bool any = false;
         for (group & g : groups) {
             if (g.n_slots == 0 || g.layers.empty() || devices[g.id].released) {
@@ -4578,130 +4750,45 @@ struct llama_moe_cache::impl {
                 download(g);
             }
             ggml_backend_t backend = devices[g.id].backend;
-            const int32_t n_expert  = g.lru.n_expert;
-            const int32_t per_layer = std::max<int32_t>(1, (g.n_slots - g.lru.n_lent - g.lru.n_core)/(int32_t) g.layers.size());
-            rpf_victim.assign(g.n_slots, -1);
             bool used = false;
             for (const int32_t il : g.layers) {
-                if (!host_layer(il) || (size_t) il >= rpf_counts.size() || (int32_t) rpf_counts[il].size() != n_expert) {
-                    continue;
+                if ((size_t) il < sel.size() && !sel[il].empty()) {
+                    rpfs.wanted += sel[il].size();
+                    rpfs.layers++;
+                    used = resident_fill_layer(g, backend, il, sel[il]) || used;
                 }
-                const std::vector<int32_t> & c = rpf_counts[il];
-                rpf_ids.clear();
-                for (int32_t e = 0; e < n_expert; ++e) {
-                    if (c[e] > 0) {
-                        rpf_ids.push_back(e);
-                    }
-                }
-                std::stable_sort(rpf_ids.begin(), rpf_ids.end(), [&c](int32_t a, int32_t b) { return c[a] > c[b]; });
-                if ((int32_t) rpf_ids.size() > per_layer) {
-                    rpf_ids.resize(per_layer);
-                }
-                if (rpf_ids.empty()) {
-                    continue;
-                }
-                rpfs.wanted += rpf_ids.size();
-                rpfs.layers++;
-                ua_lookup_guard(backend, g, il);
-                host->begin_call();
-                for (const int32_t e : rpf_ids) {
-                    const int32_t sl = host->find(il, e, false);
-                    if (sl >= 0) {
-                        host->pin(sl); // a fresh slot for a copy back is never one of the experts being promoted
-                    }
-                }
-                size_t n_hit = 0;
-                evicted_tmp.clear();
-                if (!g.lru.plan(il, rpf_ids.data(), rpf_ids.size(), rpf_fills, n_hit, &evicted_tmp) || rpf_fills.empty()) {
-                    continue;
-                }
-                for (const auto & [s, key] : evicted_tmp) {
-                    rpf_victim[s] = key;
-                }
-                const layer & l = layers[il];
-                int32_t carry = -1; // the RAM slot the last promotion was uploaded from: free for a copy back once that upload ran
-                for (const auto & f : rpf_fills) {
-                    const int32_t key = rpf_victim[f.slot];
-                    rpf_victim[f.slot] = -1;
-                    // 1. the victim leaves the slot first (RAM keeps it)
-                    if (key >= 0 && host_layer(key / n_expert)) {
-                        const int32_t vil = key / n_expert;
-                        const int32_t ve  = key % n_expert;
-                        const layer & vl = layers[vil];
-                        if (host->contains(vil, ve)) {
-                            const int32_t h = host->held(vil, ve);
-                            if (h >= 0) {
-                                host->set_dup(h, false);
-                            }
-                            rpfs.kept++;
-                        } else {
-                            int32_t r = -1;
-                            if (carry >= 0 && host->rekey(carry, vil, ve)) {
-                                r = carry;
-                                rpfs.chained++;
-                            } else {
-                                r = host->reserve(vil, ve, false);
-                                if (r < 0) {
-                                    r = host->reserve(vil, ve, true); // evicts an expert RAM alone holds (counted: it is read from the files later)
-                                    rpfs.dropped += r >= 0 ? 1 : 0;
-                                }
-                                rpfs.fresh += r >= 0 ? 1 : 0;
-                            }
-                            carry = r == carry ? -1 : carry;
-                            if (r >= 0) {
-                                for (size_t ip = 0; ip < vl.experts.size(); ++ip) {
-                                    const size_t nb = vl.experts[ip]->nb[2];
-                                    host->set_lead(r, (int) ip, 0);
-                                    ggml_backend_tensor_get_async(backend, g.banks[ip], host->area(r, (int) ip), (size_t) f.slot*nb, nb);
-                                    hst.demote_bytes += nb;
-                                }
-                                host->mark_write(r);
-                                hst.demoted++;
-                            } else {
-                                hst.demote_skip++;
-                                rpfs.dropped++;
-                            }
-                        }
-                    }
-                    // 2. the promoted expert from its RAM slot (exclusive: it leaves RAM; with spare room its copy stays as a duplicate
-                    // until a later copy back re-keys it)
-                    const int32_t s = host->find(il, f.expert, false);
-                    if (s >= 0) {
-                        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
-                            const size_t nb = l.experts[ip]->nb[2];
-                            ggml_backend_tensor_set_async(backend, g.banks[ip], host->data(s, (int) ip), (size_t) f.slot*nb, nb);
-                            rpfs.bytes += nb;
-                            hst.up_bytes += nb;
-                        }
-                        host->mark_read(s);
-                        host->set_dup(s, true); // the device holds it now; re-keyed by the next copy back (or released below)
-                        hst.promoted++;
-                        carry = s;
-                    } else {
-                        // not in RAM (the few experts slot rounding left to the files): read from the mapping
-                        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
-                            const ggml_tensor * w = l.experts[ip];
-                            const size_t nb = w->nb[2];
-                            ggml_backend_tensor_set_async(backend, g.banks[ip], (const uint8_t *) w->data + (size_t) f.expert*nb, (size_t) f.slot*nb, nb);
-                            rpfs.bytes += nb;
-                        }
-                        rpfs.from_file++;
-                    }
-                    rpfs.swapped++;
-                }
-                if (carry >= 0 && !host_spare) {
-                    host->release(carry); // no spare room: the last promotion leaves RAM (exclusive), as upload_fills does
-                }
-                host->commit(backend);
-                used = true;
             }
             if (used) {
                 ggml_backend_synchronize(backend);
                 any = true;
             }
         }
-        rpf_counts.clear();
         rpfs.prompts += any ? 1 : 0;
+        rpfs.us += ggml_time_us() - t0;
+    }
+
+    // deferred mode: in the host lookup of a small batch of layer il, before its plan: its pending swaps, within the pass budget
+    void resident_fill_lookup(group & g, ggml_backend_t backend, int32_t il) {
+        if ((size_t) il >= rpf_pending.size() || rpf_pending[il].empty()) {
+            return;
+        }
+        if (il <= rpf_last_il) {
+            rpf_pass_left = rpf_pass; // a new pass (the layers of a pass come in increasing order)
+        }
+        rpf_last_il = il;
+        if (rpf_pass_left <= 0) {
+            return;
+        }
+        const int64_t t0 = ggml_time_us();
+        std::vector<int32_t> & p = rpf_pending[il];
+        const size_t n = std::min<size_t>(p.size(), (size_t) rpf_pass_left);
+        std::vector<int32_t> ids(p.begin(), p.begin() + n);
+        p.erase(p.begin(), p.begin() + n);
+        rpf_pass_left -= (int64_t) n;
+        rpfs.wanted += n;
+        rpfs.layers++;
+        rpf_deferred_layers++;
+        resident_fill_layer(g, backend, il, ids);
         rpfs.us += ggml_time_us() - t0;
     }
 
@@ -12426,6 +12513,11 @@ struct llama_moe_cache::impl {
             }
         }
 
+        // k19-mgpu2: deferred resident prompt fill: this layer's pending swaps go first, on the same stream, within the pass budget
+        if (tiered && !rpf_pending.empty() && ids.size() <= (size_t) 8*n_expert_used && host->exclusive()) {
+            resident_fill_lookup(g, backend, il);
+        }
+
         // RAM tier: the experts routed by this call keep their RAM slots while it runs
         if (tiered) {
             host->begin_call();
@@ -12576,6 +12668,11 @@ struct llama_moe_cache::impl {
     }
 
     // the bank of the cached expert tensor w, and its layer
+    int32_t layer_of_weight(const ggml_tensor * w) const {
+        const auto it = bindings.find(w);
+        return it == bindings.end() ? -1 : it->second.il;
+    }
+
     ggml_tensor * devseed_bank(const ggml_tensor * w, int32_t & il) const {
         if (force_large) {
             return nullptr;
@@ -13942,6 +14039,10 @@ void llama_moe_cache::seed_unavailable() {
         pimpl->prefill_deferred = false;
         pimpl->prefill();
     }
+}
+
+int32_t llama_moe_cache::layer_of_weight(const ggml_tensor * w) const {
+    return pimpl->layer_of_weight(w);
 }
 
 bool llama_moe_cache::resident_fill_wanted() const {
