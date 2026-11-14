@@ -4,7 +4,7 @@
 // The generated qwen4exp (MoE) model with the indexer top_k overridden to 32 (8 pools of 4 cells), so the switch between the two graphs happens
 // at 32..36 cells instead of 2048: two sequences in a unified KV cache, prompts in several ubatches (all-fit, scored, and an all-fit
 // ubatch of one sequence next to a scored one of the other), single-token decodes across the boundary, a two-sequence decode batch, and a
-// seq_rm back below the boundary (pools re-pooled, all-fit again). Each setting runs in a child process (the switch is read once per
+// cleared sequence prompted again below the boundary (all-fit again). Each setting runs in a child process (the switch is read once per
 // process) that dumps the logits of every output row of every decode; the parent compares the dumps and the graph kinds the children
 // logged (LLAMA_QSA_ALLFIT_LOG=1): the all-fit child must build both kinds, the scored child only scored graphs.
 // usage: test-qsa-allfit-exact qwen4exp-model.gguf   (not a .gguf file: SKIP, exit 0)
@@ -88,7 +88,8 @@ static int run_child(const char * model_path, const char * out_path) {
     memset(kvo.data(), 0, kvo.size()*sizeof(kvo[0]));
     kvo[0].tag = LLAMA_KV_OVERRIDE_TYPE_INT;
     snprintf(kvo[0].key, sizeof(kvo[0].key), "qwen4exp.attention.indexer.top_k");
-    kvo[0].val_i64 = 32;
+    // (QSA_ALLFIT_TEST_TOPK: another top_k, for a manual control: 131072 keeps every pool, so its logits must differ past 32 cells)
+    kvo[0].val_i64 = getenv("QSA_ALLFIT_TEST_TOPK") ? atoll(getenv("QSA_ALLFIT_TEST_TOPK")) : 32;
 
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 0;
@@ -123,16 +124,18 @@ static int run_child(const char * model_path, const char * out_path) {
     }
     // sequence 1: a 44-token prompt in one batch (ubatches of 16: all-fit, all-fit, scored)
     ok = ok && decode_seq(ctx, span(1, 0, 44), n_vocab, d);
-    // both sequences in one batch (scored), then sequence 0 back to 26 cells (pools 7..15 dropped)
+    // both sequences in one batch (scored), then sequence 0 cleared (a recurrent state cannot be cut partially) and prompted again
+    // with 26 tokens in one ubatch-split batch (6 pools: all-fit)
     ok = ok && decode_seq(ctx, { { 0, 60 }, { 1, 44 } }, n_vocab, d);
-    ok = ok && llama_memory_seq_rm(mem, 0, 26, -1);
+    ok = ok && llama_memory_seq_rm(mem, 0, -1, -1);
+    ok = ok && decode_seq(ctx, span(0, 0, 26), n_vocab, d);
     // sequence 0 alone (6 pools again: all-fit), across the boundary once more, a 3-row verify-like batch each step
     for (llama_pos p = 26; ok && p < 50; p += 3) {
         ok = ok && decode_seq(ctx, span(0, p, 3), n_vocab, d);
     }
-    // sequence 1 shrunk below the boundary while sequence 0 is past it: a batch of each, the sequence-1 one all-fit
-    ok = ok && llama_memory_seq_rm(mem, 1, 12, -1);
-    ok = ok && decode_seq(ctx, span(1, 12, 5), n_vocab, d);
+    // sequence 1 again below the boundary while sequence 0 is past it: a batch of each, the sequence-1 one all-fit
+    ok = ok && llama_memory_seq_rm(mem, 1, -1, -1);
+    ok = ok && decode_seq(ctx, span(1, 0, 17), n_vocab, d);
     ok = ok && decode_seq(ctx, span(0, 50, 2), n_vocab, d);
 
     llama_free(ctx);
