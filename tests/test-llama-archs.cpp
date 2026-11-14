@@ -141,6 +141,7 @@ static void usage(char ** argv) {
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --rs-decode-parity       Only check CPU single-token decodes against one prompt for RWKV6 / RWKV7 / Mamba\n");
     LOG("  --rs-replay-sched        Only check qwen35 replay commits through the scheduler on two in-process RPC devices\n");
+    LOG("  --small-backends         Only check that kept small graphs keep the graph builder's backend assignments\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -1705,6 +1706,108 @@ static int check_qwen35_replay_sched(const size_t seed, const float stdev) {
 #endif
 }
 
+
+// k19-mgpu3: a kept small graph allocated again without being built again (its first swap-in, which saves the plan later swap-ins
+// restore) keeps the backends the graph builder assigned. The scheduler reset before it dropped them, so on a GPU the get_rows of an
+// MoE cache slot map went to the CPU and the copy callback that looks up and uploads the routed experts never ran (1x T4 Flash-Next:
+// degenerate text). On the CPU the builder's "norm" assignments of small ubatches are the witnesses: LLAMA_GRAPH_SMALL_CHECK=1 counts
+// those the scheduler does not hold at a kept graph's allocation (fails with LLAMA_GRAPH_SMALL_BACKENDS=0)
+static std::string g_small_check_line;
+static void small_check_log(enum ggml_log_level level, const char * text, void * user_data) {
+    GGML_UNUSED(level);
+    GGML_UNUSED(user_data);
+    if (text != nullptr && strstr(text, "k19-mgpu3 small graph backends:") != nullptr) {
+        g_small_check_line = text;
+    }
+}
+
+static int check_small_graph_backends(const size_t seed, const float stdev) {
+#ifdef _WIN32
+    _putenv_s("LLAMA_GRAPH_SMALL_CACHE", "2");
+    _putenv_s("LLAMA_GRAPH_SMALL_CHECK", "1");
+#else
+    setenv("LLAMA_GRAPH_SMALL_CACHE", "2", 1); // keep a graph per small ubatch size (as a target with a drafter does)
+    setenv("LLAMA_GRAPH_SMALL_CHECK", "1", 1);
+#endif
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_LLAMA, false);
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    ggml_backend_dev_t devs[2] = { cpu_dev, nullptr };
+    model_params.devices = devs;
+    tensor_data_params tensor_params = { seed, stdev };
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
+    if (!model) {
+        fprintf(stderr, "%s: FAIL: could not create the model\n", __func__);
+        return 1;
+    }
+    llama_log_set(small_check_log, nullptr);
+    {
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx           = 256;
+        ctx_params.n_batch         = 64;
+        ctx_params.n_ubatch        = 64;
+        ctx_params.n_threads       = 2;
+        ctx_params.n_threads_batch = 2;
+        llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+        if (!lctx) {
+            fprintf(stderr, "%s: FAIL: could not create the context\n", __func__);
+            return 1;
+        }
+        const uint32_t n_vocab = (uint32_t) llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        const std::vector<llama_token> toks = get_tokens(128, n_vocab, seed);
+        llama_memory_t mem = llama_get_memory(lctx.get());
+        llama_batch batch = llama_batch_init(64, 0, 1);
+        auto decode = [&](int32_t pos, int32_t n) -> bool {
+            batch.n_tokens = n;
+            for (int32_t i = 0; i < n; ++i) {
+                batch.token[i] = toks[(size_t) (pos + i) % toks.size()];
+                batch.pos[i] = pos + i;
+                batch.n_seq_id[i] = 1;
+                batch.seq_id[i][0] = 0;
+                batch.logits[i] = 1;
+            }
+            return llama_decode(lctx.get(), batch) == 0;
+        };
+        bool ok = decode(0, 12);
+        int32_t pos = 12;
+        // single-token decodes and verify windows of 3 alternate: each size keeps its graph, every switch swaps the other one in
+        for (int r = 0; r < 6 && ok; ++r) {
+            llama_set_verify(lctx.get(), false);
+            ok = decode(pos, 1);
+            pos += 1;
+            llama_set_verify(lctx.get(), true);
+            ok = ok && decode(pos, 3);
+            ok = ok && llama_memory_seq_rm(mem, 0, pos + 2, -1); // the last row is rejected
+            pos += 2;
+        }
+        llama_set_verify(lctx.get(), false);
+        llama_batch_free(batch);
+        if (!ok) {
+            llama_log_set(nullptr, nullptr);
+            fprintf(stderr, "%s: FAIL: a decode failed\n", __func__);
+            return 1;
+        }
+    }
+    llama_log_set(nullptr, nullptr);
+    unsigned long long assigned = 0, lost = 0;
+    const char * p = strstr(g_small_check_line.c_str(), "backends: ");
+    if (p == nullptr || sscanf(p, "backends: %llu builder assignments at kept graph allocations, %llu lost", &assigned, &lost) != 2) {
+        fprintf(stderr, "%s: FAIL: no small graph check line (kept graphs not swapped in?)\n", __func__);
+        return 1;
+    }
+    if (assigned == 0) {
+        fprintf(stderr, "%s: FAIL: no builder assignment seen at a kept graph allocation (the check proves nothing)\n", __func__);
+        return 1;
+    }
+    if (lost != 0) {
+        fprintf(stderr, "%s: FAIL: %llu of %llu builder backend assignments lost when a kept graph was allocated again\n", __func__, lost, assigned);
+        return 1;
+    }
+    printf("%s: OK (%llu builder assignments kept at kept graph allocations)\n", __func__, assigned);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     // exact speculative verify is checked by default (LLAMA_MTP_EXACT=0 skips the check)
 #ifdef _WIN32
@@ -1728,6 +1831,7 @@ int main(int argc, char ** argv) {
     const char * target_backend = nullptr;
     bool rs_decode_parity = false;
     bool rs_replay_sched  = false; // k19-mgpucache
+    bool small_backends   = false; // k19-mgpu3
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1786,6 +1890,8 @@ int main(int argc, char ** argv) {
             rs_decode_parity = true;
         } else if (strcmp(argv[i], "--rs-replay-sched") == 0) {
             rs_replay_sched = true;
+        } else if (strcmp(argv[i], "--small-backends") == 0) {
+            small_backends = true;
         } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--backend") == 0) {
             if (i + 1 < argc) {
                 const char * backend_name = argv[++i];
@@ -1820,6 +1926,9 @@ int main(int argc, char ** argv) {
         }
         if (rs_replay_sched) {
             return check_qwen35_replay_sched(seed, stdev);
+        }
+        if (small_backends) {
+            return check_small_graph_backends(seed, stdev);
         }
         int ret = 0;
         if (arch_matches(arch_filter, LLM_ARCH_QWEN4EXP) && target_backend == nullptr) {

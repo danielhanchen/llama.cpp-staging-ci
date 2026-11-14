@@ -960,8 +960,12 @@ private:
         ggml_backend_buffer_t buffer;
         void * extra;
         int32_t flags;
+        ggml_backend_t backend; // the backend the graph builder assigned (nullptr: the scheduler's choice)
     };
     std::array<std::vector<gf_tensor_state>, GF_SMALL_N> gf_res_small_state;
+    uint64_t n_small_backends = 0; // k19-mgpu3: builder assignments given back to kept graphs allocated again
+    uint64_t n_small_check_assigned = 0; // LLAMA_GRAPH_SMALL_CHECK: builder assignments seen at kept graph allocations
+    uint64_t n_small_check_lost     = 0; //   of them not held by the scheduler at that allocation
     // k15-fn: the scheduler's split and allocation of each kept graph (LLAMA_SCHED_SIZE_CACHE, on by default): a swap-in restores it
     // instead of splitting and allocating the graph again, so the tensors keep their addresses and the CUDA graph is replayed
     std::array<ggml_backend_sched_plan_t, GF_SMALL_N> gf_res_small_plan{};
