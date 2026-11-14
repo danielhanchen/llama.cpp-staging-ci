@@ -716,7 +716,7 @@ public:
         // k19-pf: a kv_only graph (writes_only) has none of the four selection inputs
         mctx->set_input_kpool(writes_only ? nullptr : pool_cells, writes_only ? nullptr : pool_idxs, writes_only ? nullptr : pool_mask,
                               writes_only ? nullptr : tail_idxs, nullptr, new_pool_idxs, new_pool_rep,
-                              ubatch, new_pool_pos);
+                              ubatch, new_pool_pos, allfit_idx);
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -736,6 +736,8 @@ public:
         // the scatter mask shape follows n_kv
         res &= n_kv              == idx->get_n_kv();
         res &= n_new             == mctx->get_n_kpool_new();
+        // k19-p2qsa: an all-fit graph has no indexer scoring, so a ubatch past the top pools needs the full graph and back
+        res &= allfit            == (!writes_only && mctx->get_kpool_allfit());
 
         return res;
     }
@@ -749,10 +751,13 @@ public:
     ggml_tensor * new_pool_flat = nullptr; // I32 [kpool*n_new]    view of new_pool_idxs, shared by the QSA layers
     ggml_tensor * new_pool_rep  = nullptr; // I64 [n_new]          cell to write each new pooled key into
     ggml_tensor * new_pool_pos  = nullptr; // I32 [4*n_new]        M-RoPE position of each new block's first member
+    ggml_tensor * allfit_idx    = nullptr; // I32 [n_sel, n_tokens] k19-p2qsa: the selection when the top_k keeps every visible pool
+    ggml_tensor * allfit_idx3   = nullptr; // [n_sel, n_tokens, 1] view of allfit_idx, shared by the QSA layers
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t kpool;
     bool writes_only = false; // k19-pf: kv_only graph, only the new pools are filled (see graph_mtp)
+    bool allfit = false; // k19-p2qsa: allfit_idx replaces the indexer scoring (llama_memory_hybrid_idx_context::get_kpool_allfit)
     uint32_t n_new = 0; // padded to a stable bound, never below 1
     uint32_t n_sel = 0;
     uint32_t n_kv  = 0;
@@ -803,6 +808,26 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     inp->new_pool_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*inp->n_new);
     ggml_set_input(inp->new_pool_pos);
 
+    // k19-p2qsa: every sequence of the ubatch within the top pools: the top_k would keep every visible pool, so the selection comes from
+    // the host (the members of the visible pools, then the tail) and build_qsa_sel scores nothing
+    inp->allfit = !kv_only && mctx_hyb->get_kpool_allfit();
+    if (inp->allfit) {
+        inp->allfit_idx = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, inp->n_sel, n_tokens);
+        ggml_set_input(inp->allfit_idx);
+        // one view for all layers, as new_pool_flat
+        inp->allfit_idx3 = ggml_reshape_3d(ctx0, inp->allfit_idx, inp->n_sel, n_tokens, 1);
+        static std::atomic<bool> logged { false };
+        if (!logged.exchange(true)) {
+            LLAMA_LOG_INFO("%s: k19-p2qsa: QSA selection without indexer scoring while every pool fits the top_k (LLAMA_QSA_ALLFIT=0: off)\n", __func__);
+        }
+    }
+    {
+        static const bool log_graphs = getenv("LLAMA_QSA_ALLFIT_LOG") != nullptr && atoi(getenv("LLAMA_QSA_ALLFIT_LOG")) != 0;
+        if (log_graphs && !kv_only) {
+            LLAMA_LOG_INFO("k19-p2qsa graph: %s (n_tokens %d, n_pool %u)\n", inp->allfit ? "allfit" : "scored", (int) n_tokens, n_pool);
+        }
+    }
+
     return (llm_graph_input_kpool *) res->add_input(std::move(inp));
 }
 
@@ -830,8 +855,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
     // k15-mm2: the indexer q product next to k's (one multi-matrix mat-vec), see build_qkvz
     // (k19-pf: kv_only reads no query; q_raw then stays out of the graph, no op uses it)
-    ggml_tensor * q_raw = build_lora_mm(model.layers[il].index_q_proj, cur);
-    if (proj_adjacent() && !kv_only) {
+    // (k19-p2qsa: nor does an all-fit graph, see inp_kpool->allfit)
+    const bool allfit = inp_kpool->allfit;
+    ggml_tensor * q_raw = allfit ? nullptr : build_lora_mm(model.layers[il].index_q_proj, cur);
+    if (proj_adjacent() && !kv_only && !allfit) {
         ggml_build_forward_expand(gf, k_raw);
         ggml_build_forward_expand(gf, q_raw);
     }
@@ -877,6 +904,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     if (kv_only) {
         return nullptr; // k19-pf: the cache writes only (graph_mtp)
     }
+    if (allfit) {
+        return build_qsa_sel_mask(inp_kpool, inp_kpool->allfit_idx3, kq_mask, il);
+    }
     ggml_tensor * pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);
     cb(pooled, "indexer_k", il);
@@ -914,22 +944,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
 
     ggml_build_forward_expand(gf, sel_idx);
 
-    // TODO: figure out to reduce the large copmute buffer that this creates
-
-    // scatter zeros for the selected cells into an all -inf row, each dead slot into its own dump row n_kv + slot
-    // seeding from sel_idx ties the scatter storage lifetime to this layer
     const int64_t n_kv = inp_kpool->n_kv;
-
-    ggml_tensor * mask_all = ggml_new_tensor_4d(ctx0, kq_mask->type, n_kv + n_sel, 1, 1, 1);
-    mask_all = ggml_fill(ctx0, mask_all, -INFINITY);
-    mask_all = ggml_repeat_4d(ctx0, mask_all, n_kv + n_sel, n_tokens, 1, 1);
-    mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_kv + n_sel, n_tokens);
-
-    // (per layer: the CUDA maskless attention matches this fill chain as private to the layer, see ggml_cuda_qsa_maskless_plan)
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, kq_mask->type, n_sel, 1, 1, 1);
-    zeros = ggml_fill(ctx0, zeros, 0.0f);
-    zeros = ggml_repeat_4d(ctx0, zeros, n_sel, n_tokens, 1, 1);
-    zeros = ggml_reshape_3d(ctx0, zeros, 1, n_sel, n_tokens);
 
     // live slots address disjoint cells, but padded pools and missing tail cells share the n_kv sentinel, and
     // top_k fills a short selection with invisible pools that can overlap the tail, so the scatter would write
@@ -961,7 +976,36 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     idx_f   = ggml_add(ctx0, ggml_mul(ctx0, ggml_sub(ctx0, idx_f, dump), live), dump);
     sel_idx = ggml_cast(ctx0, idx_f, GGML_TYPE_I32);
 
-    ggml_tensor * sel = ggml_set_rows(ctx0, mask_all, zeros, ggml_reshape_3d(ctx0, sel_idx, n_sel, n_tokens, 1));
+    return build_qsa_sel_mask(inp_kpool, ggml_reshape_3d(ctx0, sel_idx, n_sel, n_tokens, 1), kq_mask, il);
+}
+
+// the dense selection mask from the selected cells (I32 [n_sel, n_tokens, 1], every dead slot its own dump row >= n_kv): -inf, 0 at the
+// selected cells, plus the causal mask. k19-p2qsa: shared by the scored and the all-fit selection, so both are the same chain (the CUDA
+// maskless attention matches it, see ggml_cuda_qsa_maskless_plan)
+ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel_mask(
+        llm_graph_input_kpool * inp_kpool,
+        ggml_tensor *           sel_idx,
+        ggml_tensor *           kq_mask,
+        int                     il) {
+    const int64_t n_sel = inp_kpool->n_sel;
+    const int64_t n_kv  = inp_kpool->n_kv;
+    GGML_ASSERT(sel_idx->ne[0] == n_sel && sel_idx->ne[1] == n_tokens);
+
+    // TODO: figure out to reduce the large copmute buffer that this creates
+
+    // scatter zeros for the selected cells into an all -inf row, each dead slot into its own dump row n_kv + slot
+    ggml_tensor * mask_all = ggml_new_tensor_4d(ctx0, kq_mask->type, n_kv + n_sel, 1, 1, 1);
+    mask_all = ggml_fill(ctx0, mask_all, -INFINITY);
+    mask_all = ggml_repeat_4d(ctx0, mask_all, n_kv + n_sel, n_tokens, 1, 1);
+    mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_kv + n_sel, n_tokens);
+
+    // (per layer: the CUDA maskless attention matches this fill chain as private to the layer, see ggml_cuda_qsa_maskless_plan)
+    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, kq_mask->type, n_sel, 1, 1, 1);
+    zeros = ggml_fill(ctx0, zeros, 0.0f);
+    zeros = ggml_repeat_4d(ctx0, zeros, n_sel, n_tokens, 1, 1);
+    zeros = ggml_reshape_3d(ctx0, zeros, 1, n_sel, n_tokens);
+
+    ggml_tensor * sel = ggml_set_rows(ctx0, mask_all, zeros, sel_idx);
 
     GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[1]*kq_mask->ne[2]*kq_mask->ne[3] == n_tokens);
     const size_t row = sel->nb[2];

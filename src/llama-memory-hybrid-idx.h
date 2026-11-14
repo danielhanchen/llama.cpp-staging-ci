@@ -203,12 +203,17 @@ public:
     // glm5-next and qwen4exp, complete pools of kpool cells per sequence, scored as whole pools.
     uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.
     uint32_t get_n_kpool_new() const; // Pools to re-pool this ubatch, padded to a stable bound, never below 1.
+    // k19-p2qsa: every token of this ubatch belongs to a sequence of at most indexer_top_k / kpool pools, so the indexer's top_k keeps
+    // all of its visible pools (LLAMA_QSA_ALLFIT=0: never)
+    bool     get_kpool_allfit() const;
     kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
     // sel_mask (F32 [n_sel, 1, 1, n_tokens], can be null): 0 for the live selection slots, -inf for the dead ones
     // new_pool_pos (I32 [4*n_new]): M-RoPE position of each new pool's first member, for pooled keys rotated at pooling time
+    // allfit_idx (I32 [n_sel, n_tokens], only when get_kpool_allfit()): the selection when the top_k keeps every visible pool: the members
+    // of the token's visible pools in pool order, then dead slots, then the tail; a dead slot s (padding, missing tail cell) is n_kv + s
     void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
                          ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
-                         const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr) const;
+                         const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr, ggml_tensor * allfit_idx = nullptr) const;
 
 private:
     llama_memory_hybrid_idx * mem = nullptr;

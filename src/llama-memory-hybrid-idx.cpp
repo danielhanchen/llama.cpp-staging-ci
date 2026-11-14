@@ -463,6 +463,7 @@ struct llama_memory_hybrid_idx_context::kpool_state {
     uint32_t n_new       = 0;
     uint32_t n_new_g     = 1; // graph size of the new pool list, stable across decode steps
     uint32_t n_pool_g    = 0; // k19-vgraph: graph pool count when n_kv is bucketed (0: kpool_pad(n_pool_real))
+    bool     allfit      = false; // k19-p2qsa: see get_kpool_allfit
 };
 
 namespace {
@@ -898,6 +899,19 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
         const uint32_t n_kv = get_idx()->get_n_kv();
         st.n_pool_g = std::max(kpool_pad(st.n_pool_real), kpool_pad(n_kv/kpool));
     }
+
+    // k19-p2qsa: a token sees at most the pools of its sequence (set_input_kpool fill_mask), and the graph's pool count is above the real
+    // one (kpool_pad, or the bucket above), so with at most top pools in each sequence of the ubatch the top_k of the indexer keeps every
+    // visible pool: the selection is known without scoring (LLAMA_QSA_ALLFIT=0: always score)
+    static const bool allfit_on = getenv("LLAMA_QSA_ALLFIT") == nullptr || atoi(getenv("LLAMA_QSA_ALLFIT")) != 0;
+    st.allfit = allfit_on && mem->get_kpool_top() > 0;
+    for (uint32_t i = 0; i < ubatch.n_tokens && st.allfit; ++i) {
+        st.allfit = lay.seqs[ubatch.seq_id[i][0]].pools.size() <= mem->get_kpool_top();
+    }
+}
+
+bool llama_memory_hybrid_idx_context::get_kpool_allfit() const {
+    return kpool_cur().allfit;
 }
 
 const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_context::kpool_cur() const {
@@ -917,7 +931,7 @@ uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
 
 void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
         ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
-        const llama_ubatch * ubatch, ggml_tensor * new_pool_pos) const {
+        const llama_ubatch * ubatch, ggml_tensor * new_pool_pos, ggml_tensor * allfit_idx) const {
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
     // k19-pf: a graph that only writes the indexer cache (the qwen4exp MTP drafter's kv_only prompt pass) has no pool cells / idxs,
     // mask or tail inputs (pass all four as nullptr): only the new pools' members, reps and positions are filled
@@ -1001,6 +1015,20 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     float *  gm    = nullptr;
     uint32_t n_sel = 0;
     uint32_t n_top = 0; // Pools per token in the selection.
+    // k19-p2qsa: the selection of an all-fit ubatch (see get_kpool_allfit), filled with the pool mask and the tail below
+    int32_t * af = nullptr;
+    uint32_t  af_sel = 0;
+    uint32_t  af_top = 0;
+    if (allfit_idx != nullptr) {
+        GGML_ASSERT(!writes_only && st.allfit);
+        GGML_ASSERT(ggml_backend_buffer_is_host(allfit_idx->buffer) && allfit_idx->type == GGML_TYPE_I32);
+        GGML_ASSERT(allfit_idx->ne[1] == (int64_t) n_tokens && ggml_is_contiguous(allfit_idx));
+        af_sel = (uint32_t) allfit_idx->ne[0];
+        af_top = af_sel / kpool;
+        // the top pools plus the tail, as build_inp_kpool sizes n_sel
+        GGML_ASSERT(af_sel == kpool*std::min(n_pool, mem->get_kpool_top()) + kpool - 1);
+        af = (int32_t *) allfit_idx->data;
+    }
     if (sel_mask != nullptr) {
         GGML_ASSERT(ggml_backend_buffer_is_host(sel_mask->buffer));
         GGML_ASSERT(sel_mask->type == GGML_TYPE_F32);
@@ -1210,6 +1238,16 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
                 (uint32_t) (std::upper_bound(pool_end.begin() + p0, pool_end.begin() + p1, p) - (pool_end.begin() + p0));
             std::fill(row + p0, row + p0 + nv, keep);
 
+            // k19-p2qsa: the members of the nv visible pools (the finite scores the top_k keeps, all of them here), then dead slots
+            if (af != nullptr) {
+                GGML_ASSERT(nv <= af_top);
+                int32_t * arow = af + (size_t) i*af_sel;
+                memcpy(arow, pidx + (size_t) p0*kpool, (size_t) nv*kpool*sizeof(int32_t));
+                for (uint32_t k = nv*kpool; k < af_top*kpool; ++k) {
+                    arow[k] = sentinel + (int32_t) k;
+                }
+            }
+
             // Finite visible pools occupy the first min(nv, n_top) ranked slots.
             if (gm != nullptr) {
                 const uint32_t nvc = std::min(nv, n_top);
@@ -1251,6 +1289,11 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
                 }
             }
             tidx[(size_t) i*(kpool - 1) + k] = cell;
+            if (af != nullptr) {
+                // a tail cell is live unless it is the n_kv sentinel (build_qsa_sel's live_tail)
+                const uint32_t slot = af_top*kpool + k;
+                af[(size_t) i*af_sel + slot] = cell != sentinel ? cell : sentinel + (int32_t) slot;
+            }
 
             if (gm != nullptr && n_sel % kpool != 0) {
                 gm[(size_t) i*n_sel + (size_t) n_top*kpool + k] = real ? 0.0f : -INFINITY;

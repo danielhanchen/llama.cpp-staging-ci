@@ -2265,9 +2265,11 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     const size_t nbytes_shared_KV = nstages <= 1 ? nbytes_shared_KV_1stage : nbytes_shared_KV_2stage;
 
-    const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
+    size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
         std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask) :
                  nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
+    // k19-p2qsa: the shared memory whose occupancy the sparse launch keeps (0: its own), see GGML_CUDA_FA_SPARSE_SMEM_FIX below
+    size_t sparse_occ_nbytes = 0;
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
@@ -2292,6 +2294,32 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                 if (!shared_memory_limit_raised[id]) {
                     CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
                     shared_memory_limit_raised[id] = true;
+                }
+
+                // k19-p2qsa: the sparse kernel loads K / V in one stage (device ggml_cuda_fattn_mma_get_nstages), but the size above is the
+                // two-stage one. GGML_CUDA_FA_SPARSE_SMEM_FIX (default 1): launch it with the one-stage size, its occupancy (so the stream-k
+                // split) still that of the two-stage size, so every output is bitwise the same; 2: the occupancy of the one-stage size too
+                // (more blocks per SM where shared memory bound them: another KV split, rounding-level); 0: as before
+                static const int smem_fix = getenv("GGML_CUDA_FA_SPARSE_SMEM_FIX") ? atoi(getenv("GGML_CUDA_FA_SPARSE_SMEM_FIX")) : 1;
+                if (smem_fix != 0 && nstages > 1) {
+                    const size_t nbytes_shared_sparse = std::max(nbytes_shared_combine, Q_in_reg ?
+                        std::max(nbytes_shared_Q,  nbytes_shared_KV_1stage + nbytes_shared_mask) :
+                                 nbytes_shared_Q + nbytes_shared_KV_1stage + nbytes_shared_mask);
+                    static std::atomic<int> n_logged { 0 };
+                    if (ggml_cuda_fattn_probe_cur == nullptr && n_logged++ == 0) {
+                        int occ_old = 0, occ_new = 0;
+                        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_old, fattn_kernel, nthreads, nbytes_shared_total));
+                        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_new, fattn_kernel, nthreads, nbytes_shared_sparse));
+                        GGML_LOG_INFO("%s: k19-p2qsa: sparse flash attention with one-stage shared memory, first D %d ncols %d x %d: %zu -> %zu bytes, "
+                            "%d -> %d blocks/SM, occupancy %s (GGML_CUDA_FA_SPARSE_SMEM_FIX=0: off)\n", __func__, DKQ, ncols1, ncols2,
+                            nbytes_shared_total, nbytes_shared_sparse, occ_old, occ_new, smem_fix == 2 ? "free" : "pinned");
+                    }
+                    if (smem_fix == 2) {
+                        nbytes_shared_total = nbytes_shared_sparse;
+                    } else {
+                        sparse_occ_nbytes   = nbytes_shared_total;
+                        nbytes_shared_total = nbytes_shared_sparse;
+                    }
                 }
             } else {
                 constexpr bool use_sparse_kernel = false;
@@ -2383,12 +2411,19 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
             }
             launch_fattn<DV, ncols1, ncols2>
                 (ctx, dst, q8_kernel, nwarps, nbytes_shared_q8, nbatch_fa, false, false, true, use_sparse, warp_size_host, async_kv_preload,
-                 nullptr, 1, 1, false, fattn_kernel, nbytes_shared_total);
+                 nullptr, 1, 1, false, fattn_kernel, sparse_occ_nbytes ? sparse_occ_nbytes : nbytes_shared_total);
             return;
         }
     }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
+    if (sparse_occ_nbytes) {
+        // k19-p2qsa: the launch geometry of the two-stage size (GGML_CUDA_FA_SPARSE_SMEM_FIX=1)
+        launch_fattn<DV, ncols1, ncols2>
+            (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, use_sparse, warp_size_host, async_kv_preload,
+             nullptr, 1, 1, false, fattn_kernel, sparse_occ_nbytes);
+        return;
+    }
     launch_fattn<DV, ncols1, ncols2>
         (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, use_sparse, warp_size_host, async_kv_preload);
 }
