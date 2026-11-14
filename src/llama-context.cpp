@@ -12797,6 +12797,11 @@ bool llama_get_causal_attn(const llama_context * ctx) {
     return ctx->get_causal_attn();
 }
 
+// k19-fitfaoff: whether this context runs attention with flash attention (after the auto resolution at context creation)
+bool llama_get_flash_attn(const llama_context * ctx) {
+    return ctx->get_cparams().flash_attn;
+}
+
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
 }

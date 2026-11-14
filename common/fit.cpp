@@ -46,6 +46,26 @@ class common_params_fit_exception : public std::runtime_error {
 static bool    g_moe_margin_auto = true;
 static int64_t g_moe_margin_gain = 0;
 
+// k19-fitfaoff: the last measured context ran attention without flash attention (-fa off, or auto resolved off)
+static bool    g_fit_fa_off      = false;
+
+bool common_fit_last_flash_attn() {
+    return !g_fit_fa_off;
+}
+
+int64_t common_fit_moe_margin_fa_plan(int64_t m, int64_t m_reduced, bool flash_attn, bool keep_faoff) {
+    return !flash_attn && keep_faoff ? m : m_reduced;
+}
+
+// LLAMA_FIT_FAOFF_MARGIN: 1 (default) the full margin beside a MoE cache without flash attention, 0 = the reduced one as before
+static bool common_fit_faoff_keep() {
+    static const bool keep = [] {
+        const char * e = getenv("LLAMA_FIT_FAOFF_MARGIN");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return keep;
+}
+
 void common_fit_set_moe_margin_auto(bool auto_margin) {
     g_moe_margin_auto = auto_margin;
 }
@@ -178,7 +198,29 @@ size_t common_fit_kv_lazy_grant(size_t moe_cache_size) {
 }
 
 // the margin of a device beside a MoE cache for the default margin m (see common_fit_set_moe_margin_auto)
+static int64_t common_fit_moe_margin_impl(int64_t m, int64_t free_dev, int64_t cache_want, bool has_drafter);
+
+// k19-fitfaoff (LLAMA_FIT_FAOFF_MARGIN=0 off): without flash attention the reduced margin beside a MoE cache is not taken. The
+// attention then runs as KQ / KQV mat-muls whose F16 copies of the KQ matrix (n_kv x n_tokens x n_head) come from the CUDA pool at
+// run time, outside the measured compute buffer; the reduced margin (256 MiB, gated with flash attention on) does not hold them.
+// Kaggle 2x T4, DeepSeek-V4.1 fake dsf8, -fa off, --moe-cache-mib auto, ctx 16384: fit projected 1297 MiB free on CUDA1 at the 1024 MiB
+// margin, the cache then took +768 MiB per device (+1536 total), and the first 2100-token prompt aborted with CUDA out of memory in
+// the pool (cuMemCreate). The measured compute buffer itself matched the run (CUDA1 10768 MiB both)
 static int64_t common_fit_moe_margin(int64_t m, int64_t free_dev, int64_t cache_want, bool has_drafter) {
+    const int64_t r = common_fit_moe_margin_impl(m, free_dev, cache_want, has_drafter);
+    const int64_t k = common_fit_moe_margin_fa_plan(m, r, !g_fit_fa_off, common_fit_faoff_keep());
+    if (k != r) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LOG_INF("%s: flash attention off: the full margin beside the MoE cache stays (%" PRId64 " MiB, not %" PRId64 "; LLAMA_FIT_FAOFF_MARGIN=0 for the reduced one)\n",
+                __func__, k/(1024*1024), r/(1024*1024));
+        }
+    }
+    return k;
+}
+
+static int64_t common_fit_moe_margin_impl(int64_t m, int64_t free_dev, int64_t cache_want, bool has_drafter) {
     constexpr int64_t MiB_ = 1024*1024;
     constexpr int64_t m_default = 1024*MiB_;
     if (!g_moe_margin_auto || m < m_default) {
@@ -325,6 +367,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to create llama_context from model");
     }
+    g_fit_fa_off = !llama_get_flash_attn(ctx); // k19-fitfaoff: as resolved by the context (auto included)
 
     // k17-small: measure the graphs the context runs once an MTP draft is attached (unmasked for the target, masked for the drafter,
     // as common_speculative sets them)

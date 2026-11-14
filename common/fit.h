@@ -80,6 +80,15 @@ bool    common_fit_place8_mid();
 //   - common_fit_small_reserve_mib: the plan with LLAMA_FIT_SMALL_RESERVE_MIB (128, 0 = off: the margin of before) and
 //     LLAMA_FIT_SMALL_RESERVE_MIN_CACHE_MIB (64)
 int64_t common_fit_small_reserve_plan(int64_t cache_mib, int64_t reserve_mib, int64_t floor_mib);
+
+// k19-fitfaoff: the margin beside a MoE cache without flash attention. The fit may take part of the default margin m for the cache
+// (m_reduced, LLAMA_MOE_FIT_MARGIN); without flash attention (flash_attn = false: -fa off, or auto resolved off at the measured
+// context) the full margin stays when keep_faoff (LLAMA_FIT_FAOFF_MARGIN, default 1): the KQ / KQV mat-muls take F16 copies of the
+// KQ matrix from the CUDA pool at run time, outside the measured compute buffer.
+//   - common_fit_moe_margin_fa_plan: m when !flash_attn && keep_faoff, else m_reduced
+//   - common_fit_last_flash_attn: flash attention of the last context the fit measured
+int64_t common_fit_moe_margin_fa_plan(int64_t m, int64_t m_reduced, bool flash_attn, bool keep_faoff);
+bool    common_fit_last_flash_attn();
 int64_t common_fit_small_reserve_mib(int64_t cache_mib);
 
 // k17-small (lazy KV): the bytes a fit added to a MoE cache of this final size for the KV cells not backed at load (0: none)
