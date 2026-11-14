@@ -5100,31 +5100,35 @@ void llm_graph_context::build_sampling() const {
         const auto it = sampling_rows.find(seq_id);
         const auto & rows = it != sampling_rows.end() ? it->second : no_rows;
 
-        // k19-p3topk: a chain that starts with a backend top-k and has 2+ rows of this ubatch, in consecutive outputs (a verify window):
-        // that top-k runs once over the rows ([n_vocab, n] -> [k, n]) and one get_rows gathers every row's top logits; each row's chain
-        // then continues after its top-k on its slice. Each row's slice holds the bits its own top-k / get_rows wrote before
-        // (cparams.topk_batch: the output device's top-k works per row; the same columns, in the same order), so the candidates, the
-        // logits and every later stage are unchanged; only the launches drop from one radix select per row to one per window
-        // (248320 columns: ~10 launches, 80-99 us per row on A100). Chains without a row keep the unselected build on row 0 below.
-        // chunks of at most topk_batch_max_rows rows (CUDA: below 16, where one row and several rows take the multi-block radix select /
-        // the two-stage kernel; 16+ rows would take the one-block kernel); bt_cand / bt_logits are graph outputs: the rows' slices are
-        // the tensors the host reads, and a view output does not keep the tensor it views alive in the allocator
-        std::vector<ggml_tensor *> bt_cand;   // per chunk: [k, n_chunk]
-        std::vector<ggml_tensor *> bt_logits; // per chunk: [1, k, n_chunk]
+        // k19-p3topk: a chain that starts with a backend top-k (the server's device top-k for sampled requests) runs that top-k once
+        // per window of the sequence's consecutive output rows ([n_vocab, n] -> [k, n]) and one get_rows gathers every row's top logits;
+        // each row's chain then continues after its top-k on its slice. Each slice holds the bits that row's own top-k / get_rows wrote
+        // before (cparams.topk_batch: the output device's top-k works per row; the same columns, in the same order), so the
+        // candidates, the logits and every later stage are unchanged; only the launches drop from one radix select per row to one per
+        // window (248320 columns: ~10 launches, 80-99 us per row on A100).
+        // Windows of at most topk_batch_max_rows rows (CUDA: below 16, where one row and several rows take the same kernels). The
+        // topology stays static, as for the chains themselves: always ceil(n_outputs_max_per_seq / max_rows) windows, each over its
+        // rows (a window without a row: 1 row on row 0, not selected), and every chain, with a row or not, reads a slice of its window
+        // (no row: slice 0, not selected). bt_cand / bt_logits are graph outputs (the rows' slices are views of them).
+        // Rows that are not consecutive outputs: one top-k per row, as before (another topology, allocated again).
+        std::vector<ggml_tensor *> bt_cand;   // per window: [k, n_window]
+        std::vector<ggml_tensor *> bt_logits; // per window: [1, k, n_window]
         uint32_t bt_chunk = 0;
         {
             const int32_t  k_first = cparams.topk_batch && !dtopk ? llama_sampler_backend_top_k_first(sampler) : 0;
-            const uint32_t n_act   = (uint32_t) std::min<size_t>(rows.size(), cparams.n_outputs_max_per_seq);
-            if (k_first > 0 && k_first <= logits_t->ne[0] && logits_t->ne[0] >= cparams.topk_batch_min_cols && n_act >= 2 &&
-                    rows[n_act - 1] - rows[0] == n_act - 1) {
-                bt_chunk = std::max<uint32_t>(1, cparams.topk_batch_max_rows);
-                for (uint32_t c0 = 0; c0 < n_act; c0 += bt_chunk) {
-                    const uint32_t nc = std::min(bt_chunk, n_act - c0);
-                    ggml_tensor * x = ggml_view_2d(ctx0, logits_t, logits_t->ne[0], nc, logits_t->nb[1], (rows[0] + c0) * logits_t->nb[1]);
+            const uint32_t n_max   = cparams.n_outputs_max_per_seq;
+            const uint32_t n_act   = (uint32_t) std::min<size_t>(rows.size(), n_max);
+            if (k_first > 0 && k_first <= logits_t->ne[0] && logits_t->ne[0] >= cparams.topk_batch_min_cols &&
+                    (n_act == 0 || rows[n_act - 1] - rows[0] == n_act - 1)) {
+                bt_chunk = std::max<uint32_t>(1, std::min(cparams.topk_batch_max_rows, n_max));
+                for (uint32_t c0 = 0; c0 < n_max; c0 += bt_chunk) {
+                    const uint32_t nc   = c0 < n_act ? std::min(bt_chunk, n_act - c0) : 0;
+                    const uint32_t row0 = nc > 0 ? rows[0] + c0 : 0;
+                    ggml_tensor * x = ggml_view_2d(ctx0, logits_t, logits_t->ne[0], std::max<uint32_t>(nc, 1), logits_t->nb[1], row0 * logits_t->nb[1]);
                     ggml_format_name(x, "logits_win_%d_%u", seq_id, c0);
                     ggml_tensor * tc = ggml_top_k(ctx0, x, k_first);
                     ggml_format_name(tc, "top_k_win_%d_%u", seq_id, c0);
-                    ggml_tensor * tl = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, x, 1, x->ne[0], nc), tc);
+                    ggml_tensor * tl = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, x, 1, x->ne[0], x->ne[1]), tc);
                     ggml_format_name(tl, "top_k_rows_win_%d_%u", seq_id, c0);
                     ggml_set_output(tc);
                     ggml_set_output(tl);
@@ -5133,7 +5137,7 @@ void llm_graph_context::build_sampling() const {
                 }
 
                 static std::atomic<bool> logged { false };
-                if (!logged.exchange(true)) {
+                if (n_act >= 2 && !logged.exchange(true)) {
                     LLAMA_LOG_INFO("k19-p3topk: the verify rows' backend top-k of %d in one launch per window (%u rows of %lld, up to %u "
                             "per launch; LLAMA_DEV_TOPK_BATCH=0: one per row)\n", k_first, n_act, (long long) logits_t->ne[0], bt_chunk);
                 }
@@ -5152,10 +5156,10 @@ void llm_graph_context::build_sampling() const {
                 /*.candidates   =*/ nullptr,
             };
 
-            if (!bt_cand.empty() && active) {
+            if (!bt_cand.empty()) {
                 ggml_tensor * tc = bt_cand[i / bt_chunk];
                 ggml_tensor * tl = bt_logits[i / bt_chunk];
-                const uint32_t j = i % bt_chunk;
+                const uint32_t j = active ? i % bt_chunk : 0;
                 const int64_t  k = tc->ne[0];
                 data.candidates = ggml_view_1d(ctx0, tc, k, j * tc->nb[1]);
                 data.logits     = ggml_view_2d(ctx0, tl, 1, k, tl->nb[1], j * tl->nb[2]);
