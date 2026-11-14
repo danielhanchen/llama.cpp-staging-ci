@@ -5095,29 +5095,68 @@ void llm_graph_context::build_sampling() const {
         const auto it = sampling_rows.find(seq_id);
         const auto & rows = it != sampling_rows.end() ? it->second : no_rows;
 
+        // k19-p3topk: a chain that starts with a backend top-k and has 2+ rows of this ubatch, in consecutive outputs (a verify window):
+        // that top-k runs once over the rows ([n_vocab, n] -> [k, n]) and one get_rows gathers every row's top logits; each row's chain
+        // then continues after its top-k on its slice. Each row's slice holds the bits its own top-k / get_rows wrote before
+        // (cparams.topk_batch: the output device's top-k works per row; the same columns, in the same order), so the candidates, the
+        // logits and every later stage are unchanged; only the launches drop from one radix select per row to one per window
+        // (248320 columns: ~10 launches, 80-99 us per row on A100). Chains without a row keep the unselected build on row 0 below.
+        ggml_tensor * bt_cand   = nullptr; // [k, n]
+        ggml_tensor * bt_logits = nullptr; // [1, k, n]
+        {
+            const int32_t  k_first = cparams.topk_batch && !dtopk ? llama_sampler_backend_top_k_first(sampler) : 0;
+            const uint32_t n_act   = (uint32_t) std::min<size_t>(rows.size(), cparams.n_outputs_max_per_seq);
+            if (k_first > 0 && k_first <= logits_t->ne[0] && logits_t->ne[0] >= cparams.topk_batch_min_cols && n_act >= 2 && rows[n_act - 1] - rows[0] == n_act - 1) {
+                ggml_tensor * x = ggml_view_2d(ctx0, logits_t, logits_t->ne[0], n_act, logits_t->nb[1], rows[0] * logits_t->nb[1]);
+                ggml_format_name(x, "logits_win_%d", seq_id);
+                bt_cand = ggml_top_k(ctx0, x, k_first);
+                ggml_format_name(bt_cand, "top_k_win_%d", seq_id);
+                bt_logits = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, x, 1, x->ne[0], n_act), bt_cand);
+                ggml_format_name(bt_logits, "top_k_rows_win_%d", seq_id);
+
+                static std::atomic<bool> logged { false };
+                if (!logged.exchange(true)) {
+                    LLAMA_LOG_INFO("k19-p3topk: the verify rows' backend top-k of %d in one launch per window (%u rows of %lld; "
+                            "LLAMA_DEV_TOPK_BATCH=0: one per row)\n", k_first, n_act, (long long) logits_t->ne[0]);
+                }
+            }
+        }
+
         for (uint32_t i = 0; i < cparams.n_outputs_max_per_seq; ++i) {
             const bool     active = i < rows.size();
             const uint32_t row    = active ? rows[i] : 0;
             const int      i_out  = active ? 1       : 0;
 
-            ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row * logits_t->nb[1]);
-            ggml_tensor * cand_seq   = nullptr;
-            if (dtopk) {
-                const int64_t n_sub = res->t_dh_perm->ne[0];
-                logits_seq = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, logits_seq, 1, logits_seq->ne[0]), res->t_dh_perm), n_sub);
-                cand_seq   = res->t_dh_cand;
-            }
-            ggml_format_name(logits_seq, "logits_seq_%d_%u", seq_id, i);
-
             struct llama_sampler_data data = {
-                /*.logits       =*/ logits_seq,
+                /*.logits       =*/ nullptr,
                 /*.probs        =*/ nullptr,
                 /*.sampled      =*/ nullptr,
-                /*.candidates   =*/ cand_seq,
+                /*.candidates   =*/ nullptr,
             };
 
-            assert(sampler->iface->backend_apply);
-            sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+            if (bt_cand != nullptr && active) {
+                const int64_t k = bt_cand->ne[0];
+                data.candidates = ggml_view_1d(ctx0, bt_cand, k, i * bt_cand->nb[1]);
+                data.logits     = ggml_view_2d(ctx0, bt_logits, 1, k, bt_logits->nb[1], i * bt_logits->nb[2]);
+                ggml_format_name(data.candidates, "top_k_%d_%u", seq_id, i);
+                ggml_format_name(data.logits,     "top_k_rows_%d_%u", seq_id, i);
+                llama_sampler_backend_apply_after_top_k(sampler, ctx0, gf, &data);
+            } else {
+                ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row * logits_t->nb[1]);
+                ggml_tensor * cand_seq   = nullptr;
+                if (dtopk) {
+                    const int64_t n_sub = res->t_dh_perm->ne[0];
+                    logits_seq = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, logits_seq, 1, logits_seq->ne[0]), res->t_dh_perm), n_sub);
+                    cand_seq   = res->t_dh_cand;
+                }
+                ggml_format_name(logits_seq, "logits_seq_%d_%u", seq_id, i);
+
+                data.logits     = logits_seq;
+                data.candidates = cand_seq;
+
+                assert(sampler->iface->backend_apply);
+                sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+            }
 
             if (data.sampled != nullptr) {
                 if (active) {

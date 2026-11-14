@@ -621,6 +621,26 @@ llama_context::llama_context(
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
 
+    // k19-p3topk: one top-k over all the verify rows of a sequence instead of one per row, where the output device's top-k returns
+    // for each row of a multi-row input what that row alone returns (same set, same order): the CPU (std::partial_sort per row) and
+    // the CUDA deterministic top-k (per-row selection; past the 4096-column sort paths every path, single row or several, writes
+    // the keys above the k-th in column order then the kept ties, lowest columns first, see build_sampling). Not: other backends, a
+    // meta device (-sm tensor), GGML_CUDA_TOPK_DETERMINISTIC=0. LLAMA_DEV_TOPK_BATCH=0: one top-k per row as before
+    {
+        const char * env = getenv("LLAMA_DEV_TOPK_BATCH");
+        bool ok = env == nullptr || atoi(env) != 0;
+        ggml_backend_dev_t dev = ok ? model.dev_output() : nullptr;
+        if (dev == nullptr) {
+            ok = false;
+        } else if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            const char * det = getenv("GGML_CUDA_TOPK_DETERMINISTIC");
+            ok = reg != nullptr && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 && (det == nullptr || atoi(det) != 0);
+            cparams.topk_batch_min_cols = 4097;
+        }
+        cparams.topk_batch = ok;
+    }
+
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
     // re-reserve when graph nodes change.
