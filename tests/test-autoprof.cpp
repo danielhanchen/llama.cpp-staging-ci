@@ -265,6 +265,12 @@ static void test_recorder(const fs::path & root) {
             (unsigned long long) rc.st.n_hits_static.load(), (unsigned long long) rc.st.n_verify_bad.load());
         CHECK(rc.save_profile(prof), "save 2");
         CHECK(prof_entries(prof) == seen.size(), "profile rows after session 2: %llu", (unsigned long long) prof_entries(prof));
+        // k19-autoprof2: a profile directory that does not exist yet is created (the first save on a host-lookup tier)
+        const fs::path sub = root / "new_dir" / "deeper";
+        CHECK(!fs::exists(sub), "fresh directory");
+        CHECK(rc.save_profile((sub / "autoprof_ple_test.5000").string()), "save into a missing directory");
+        CHECK(prof_entries((sub / "autoprof_ple_test.5000").string()) == seen.size(), "profile rows in the new directory");
+        CHECK(n_tmp_left(sub) == 0, "no temporary left in the new directory");
     }
     // a third cache: the rows' bytes in the file are the table's (load checks every row's checksum and spot-checks the mapping)
     {

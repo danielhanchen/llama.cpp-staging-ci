@@ -481,6 +481,15 @@ bool llama_row_cache::save_profile(const std::string & path) const {
     // a temporary of this process only, created exclusively (an existing file or link of that name is not followed), then renamed over
     // the profile (std::filesystem::rename replaces an existing file on Windows too)
     const std::string tmp = path + ".tmp." + std::to_string((long long) llama_rc_getpid());
+    // k19-autoprof2: the directory may not exist yet (the self-learned profile's directory is made by the first write into it; where no
+    // MoE profile or CPU-miss calibration was written before, e.g. host-lookup tiers, the PLE profile was never saved: "cannot write")
+    {
+        std::error_code ec;
+        const std::filesystem::path pp(path);
+        if (pp.has_parent_path()) {
+            std::filesystem::create_directories(pp.parent_path(), ec);
+        }
+    }
     FILE * f = fopen(tmp.c_str(), "wbx");
     if (!f) {
         LLAMA_LOG_WARN("%s: cannot write %s\n", __func__, tmp.c_str());

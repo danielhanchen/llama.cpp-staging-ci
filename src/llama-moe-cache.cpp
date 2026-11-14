@@ -4618,8 +4618,11 @@ struct llama_moe_cache::impl {
             return true;
         }
         take_spec = false;
+        // k19-autoprof2 (LLAMA_MOE_AUTOPROF_REFUSE=0, diagnostic): a cold expert takes any free slot (as a guess, see tier_offer), the
+        // target experts then take guesses like free slots
+        static const bool refuse = [] { const char * e = getenv("LLAMA_MOE_AUTOPROF_REFUSE"); return e == nullptr || atoi(e) != 0; }();
         // (a duplicate of a device-held expert is as good as a free slot; counted per large batch)
-        if (c >= 0 && (size_t) c < ap_need.size() && (int64_t) host->n_free_of(il) + ap_dup[c] <= ap_need[c]) {
+        if (refuse && c >= 0 && (size_t) c < ap_need.size() && (int64_t) host->n_free_of(il) + ap_dup[c] <= ap_need[c]) {
             aps.cold_refused++;
             return false;
         }
