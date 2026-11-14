@@ -9,6 +9,7 @@
 #include "llama-moe-host-cache.h"
 #include "llama-build-id.h"
 #include "llama-moe-trial-persist.h"
+#include "llama-autoprof.h"
 
 #include "ggml-cpp.h"
 #include "ggml-alloc.h"
@@ -1419,6 +1420,14 @@ struct llama_moe_cache::impl {
             }
             if (const char * e = getenv("LLAMA_MOE_HOST_PROFILE"); e != nullptr && *e && strcmp(e, "0") != 0 && !model.hparams.no_alloc) {
                 host_profile_file = e + sfx;
+            }
+            // k19-autoprof: the self-learned routing profile (main cache only; an explicit LLAMA_MOE_HOST_PROFILE wins)
+            if (set != layer_set::nextn && !model.hparams.no_alloc && host_profile_file.empty()) {
+                ap_mode = llama_autoprof::mode();
+                if (ap_mode != 0) {
+                    ap_file = llama_autoprof::path(llama_autoprof::dir(), "moe",
+                        llama_autoprof::model_hash(model.desc(), model.n_elements(), model.size()), sfx);
+                }
             }
         }
         for (size_t i = 0; i < backends.size(); ++i) {
@@ -3582,6 +3591,14 @@ struct llama_moe_cache::impl {
         // still allocated then; wstore is not used here
         single_stop_all();
         profile_save();
+        ap_save(true);
+        if (ap_rec || ap_use) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-autoprof: %s; %zu ubatches / %llu routings counted, %zu profile experts read, target set %zu "
+                "(rebuilt %zu times), %zu cold experts marked, offers: %llu target, %llu cold taken, %llu cold refused; page-cache fill %llu target / "
+                "%llu cold\n", tag, ap_use ? "used" : "recorded only", aps.ubatches, (unsigned long long) aps.routings, aps.loaded, aps.targets,
+                aps.rebuilds, aps.marked, (unsigned long long) aps.hot_taken, (unsigned long long) aps.cold_taken,
+                (unsigned long long) aps.cold_refused, (unsigned long long) aps.pf_hot, (unsigned long long) aps.pf_cold);
+        }
         ua_shutdown();
         log_stats();
         if (core_mode != 0) {
@@ -4000,6 +4017,7 @@ struct llama_moe_cache::impl {
                         100.0*n_hold/n_streamed, n_streamed, 100.0*min_frac);
             }
         }
+        ap_init();
         prefill_resident();
         LLAMA_LOG_INFO("%s: MoE host cache on: %s, budget %.1f MiB (%s) for %.1f MiB of streamed experts (of %.1f MiB mapped), %.1f MiB in device slots, "
                 "the experts of %.1f tokens, MemAvailable %.1f MiB, pinned on first use (%s)%s (LLAMA_MOE_HOST_CACHE=0 off)\n", __func__,
@@ -4354,6 +4372,306 @@ struct llama_moe_cache::impl {
         }
     }
 
+    // k19-autoprof (LLAMA_MOE_AUTOPROF, see llama-autoprof.h): a routing profile the cache learns itself. Recorded wherever a RAM tier
+    // exists: the routing of every large ubatch of every prompt (llama_context reads the recorded ids: the prompt end, as k19-l4fill,
+    // and the earlier ubatches at the start of the next one), counted per (layer, expert) on top of the previous launches' heats
+    // (halved at load), written to <dir>/autoprof_moe_<model hash>.<n_layer>.<n_expert> (the moe-cache-profile format) at the
+    // server's idle point when it changed and at exit. Used on the exclusive tier when the file was read at load:
+    //  - the page-cache fill copies the resident experts hottest first over every layer (not in layer order);
+    //  - the target set of each expert layout = its hottest experts that the device does not hold, as many as its RAM slots; at a
+    //    request's first large batch the held experts outside it are marked as guesses (set_spec: a reservation takes them like free
+    //    slots, coldest first), and every large batch counts the target experts held nowhere (ap_need);
+    //  - a prompt's uploads offered to the tier (tier_offer) take a free slot for an expert outside the target set only while the
+    //    layout keeps a free slot for each target expert still held nowhere (and mark it as a guess), target experts may also take a
+    //    guess; the l4fill refill order is seeded with the profile (an idle server fills its free slots hottest first).
+    // Placement only (which slot holds which expert's file bytes): exact. No file: nothing is used (the recording reads the ids only).
+    int      ap_mode = 0;
+    std::string ap_file;
+    bool     ap_rec  = false;                    // recording (a RAM tier exists, LLAMA_MOE_AUTOPROF 1 / 2)
+    bool     ap_use  = false;                    // a profile was read and the exclusive tier uses it
+    std::vector<std::vector<float>>   ap_cnt;    // [n_layer][n_expert] heat: the file's (halved) + this launch's routing counts
+    std::vector<std::vector<uint8_t>> ap_tgt;    // [n_layer][n_expert] in the target set
+    std::vector<int64_t>  ap_need;               // [class] target experts held neither in RAM nor on the device
+    std::vector<int64_t>  ap_dup;                // [class] RAM copies of device-held experts (a reservation takes them first)
+    std::vector<std::vector<uint8_t>> ap_dev_pred; // [n_layer][n_expert] the device prefill's experts, before it ran (lowest ids per layer)
+    std::vector<uint32_t> ap_layer_epoch;
+    uint32_t ap_epoch = 0;
+    uint64_t ap_new   = 0;                       // routings counted since the last write
+    bool     ap_prev_large = false;
+    struct {
+        size_t   loaded = 0, ubatches = 0, saves = 0, save_fail = 0, targets = 0, marked = 0, rebuilds = 0;
+        uint64_t routings = 0, cold_refused = 0, cold_taken = 0, hot_taken = 0, pf_hot = 0, pf_cold = 0, pf_stale = 0;
+    } aps;
+
+    // on the device, or (before the device prefill ran) one of the experts it will put there: the lowest ids of each layer, an equal
+    // share of the group's slots per layer (see prefill), so the page-cache fill does not copy experts the device is about to hold
+    bool ap_on_dev(int32_t il, int32_t e) const {
+        if (in_device(il, e)) {
+            return true;
+        }
+        return !prefilled_dev && (size_t) il < ap_dev_pred.size() && (size_t) e < ap_dev_pred[il].size() && ap_dev_pred[il][e] != 0;
+    }
+
+    bool ap_target(int32_t il, int32_t e) const {
+        return (size_t) il < ap_tgt.size() && (size_t) e < ap_tgt[il].size() && ap_tgt[il][e] != 0;
+    }
+
+    // at the RAM tier's creation (before the page-cache fill): the file of the previous launches
+    void ap_init() {
+        ap_rec = false;
+        ap_use = false;
+        if (ap_mode == 0 || ap_file.empty() || !host) {
+            return;
+        }
+        const std::vector<int32_t> ne = profile_n_expert();
+        ap_cnt.assign(layers.size(), {});
+        for (size_t il = 0; il < layers.size(); ++il) {
+            ap_cnt[il].assign(ne[il] > 0 ? ne[il] : 0, 0.0f);
+        }
+        ap_layer_epoch.assign(layers.size(), 0);
+        ap_rec = llama_autoprof::records(ap_mode);
+        std::vector<prof_entry> prof;
+        const bool have = llama_moe_profile_load(ap_file, ne, prof);
+        if (have) {
+            for (const prof_entry & p : prof) {
+                if (p.heat > 0.0f && (size_t) p.e < ap_cnt[p.il].size()) {
+                    ap_cnt[p.il][p.e] = 0.5f*p.heat; // the previous launches count half
+                }
+            }
+        }
+        aps.loaded = have ? prof.size() : 0;
+        ap_dev_pred.assign(layers.size(), {});
+        if (!prefilled_dev) {
+            for (const group & g : groups) {
+                if (g.n_slots == 0 || g.layers.empty()) {
+                    continue;
+                }
+                const int32_t n_slots = g.n_slots - g.lru.n_lent - g.lru.n_core;
+                const size_t  n_layer = g.layers.size();
+                for (size_t i = 0; i < n_layer; ++i) {
+                    const int32_t il = g.layers[i];
+                    const int32_t n  = std::max<int32_t>(0, std::min<int32_t>(g.lru.n_expert, n_slots/(int32_t) n_layer + (i < (size_t) (n_slots % n_layer) ? 1 : 0)));
+                    ap_dev_pred[il].assign(g.lru.n_expert, 0);
+                    std::fill(ap_dev_pred[il].begin(), ap_dev_pred[il].begin() + n, 1);
+                }
+            }
+        }
+        ap_use = have && llama_autoprof::uses(ap_mode) && host->exclusive() && !resident_mode && wstore != nullptr;
+        if (ap_use) {
+            ap_rebuild_target();
+            // the refill of the free slots (k19-l4fill) starts from the profile: one prompt's worth of counts per layer, halved per prompt
+            if (fill_mode != 0) {
+                fill_cnt.assign(layers.size(), {});
+                fill_layer_epoch.assign(layers.size(), 0);
+                for (size_t il = 0; il < layers.size(); ++il) {
+                    if (!host_layer((int32_t) il)) {
+                        continue;
+                    }
+                    double sum = 0.0;
+                    for (float h : ap_cnt[il]) {
+                        sum += h;
+                    }
+                    fill_cnt[il].assign(ap_cnt[il].size(), 0.0f);
+                    for (size_t e = 0; e < ap_cnt[il].size() && sum > 0.0; ++e) {
+                        fill_cnt[il][e] = (float) (ap_cnt[il][e]/sum*512.0*(double) n_expert_used);
+                    }
+                }
+                fill_have = true;
+                fill_order_dirty = true;
+            }
+        }
+        LLAMA_LOG_INFO("llama_moe_cache%s: k19-autoprof: routing profile %s %s (%zu experts)%s; LLAMA_MOE_AUTOPROF=0 off, 3 read only\n", tag,
+            ap_file.c_str(), have ? "read" : "not found", aps.loaded,
+            ap_use ? ": the RAM tier is filled hottest first" : have ? ": not used (needs the exclusive RAM tier of the weight store, LLAMA_MOE_AUTOPROF 1 / 3)" :
+            ap_rec ? ": recording" : "");
+    }
+
+    // the target set: per expert layout its hottest experts (heat > 0) that the device does not hold, as many as its slots
+    void ap_rebuild_target() {
+        const int32_t ne_max = host->n_expert_of();
+        ap_tgt.assign(layers.size(), {});
+        int32_t n_class = 0;
+        for (int32_t il = 0; il < (int32_t) layers.size(); ++il) {
+            n_class = std::max(n_class, host->class_of(il) + 1);
+        }
+        std::vector<std::vector<std::pair<float, int32_t>>> by_class(n_class);
+        std::vector<int32_t> slots_of_class(n_class, 0);
+        for (int32_t il = 0; il < (int32_t) layers.size(); ++il) {
+            ap_tgt[il].assign(il < (int32_t) ap_cnt.size() ? ap_cnt[il].size() : 0, 0);
+            if (!host_layer(il) || ap_cnt[il].empty()) {
+                continue;
+            }
+            const int32_t c = host->class_of(il);
+            slots_of_class[c] = host->n_slots_of(il);
+            for (int32_t e = 0; e < (int32_t) ap_cnt[il].size() && e < ne_max; ++e) {
+                if (ap_cnt[il][e] > 0.0f && !ap_on_dev(il, e)) {
+                    by_class[c].emplace_back(ap_cnt[il][e], il*ne_max + e);
+                }
+            }
+        }
+        ap_need.assign(n_class, 0);
+        ap_dup.assign(n_class, 0);
+        aps.targets = 0;
+        for (int32_t c = 0; c < n_class; ++c) {
+            auto & v = by_class[c];
+            std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
+            const size_t n = std::min(v.size(), (size_t) std::max(0, slots_of_class[c]));
+            for (size_t i = 0; i < n; ++i) {
+                ap_tgt[v[i].second / ne_max][v[i].second % ne_max] = 1;
+            }
+            aps.targets += n;
+        }
+        aps.rebuilds++;
+        ap_count_need();
+    }
+
+    void ap_count_need() {
+        std::fill(ap_need.begin(), ap_need.end(), 0);
+        std::fill(ap_dup.begin(), ap_dup.end(), 0);
+        for (int32_t il = 0; il < (int32_t) ap_tgt.size(); ++il) {
+            if (!host_layer(il)) {
+                continue;
+            }
+            const int32_t c = host->class_of(il);
+            for (int32_t e = 0; e < (int32_t) ap_tgt[il].size(); ++e) {
+                const bool held = host->contains(il, e);
+                if (ap_tgt[il][e] && !held && !ap_on_dev(il, e)) {
+                    ap_need[c]++;
+                }
+                if (held) {
+                    const int32_t s = host->held(il, e);
+                    ap_dup[c] += s >= 0 && host->is_dup(s) ? 1 : 0;
+                }
+            }
+        }
+    }
+
+    // the held experts outside the target set become guesses, hottest first (the coldest is the first a reservation takes)
+    void ap_mark_cold() {
+        std::vector<std::pair<float, int32_t>> v;
+        for (int32_t il = 0; il < (int32_t) ap_tgt.size(); ++il) {
+            if (!host_layer(il)) {
+                continue;
+            }
+            for (int32_t e = 0; e < (int32_t) ap_tgt[il].size(); ++e) {
+                if (ap_tgt[il][e]) {
+                    continue;
+                }
+                const int32_t s = host->held(il, e);
+                if (s >= 0 && !host->is_spec(s) && !host->is_dup(s) && !host->is_async(s)) {
+                    v.emplace_back(ap_cnt[il][e], s);
+                }
+            }
+        }
+        std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
+        for (const auto & p : v) {
+            host->set_spec(p.second);
+        }
+        aps.marked += v.size();
+    }
+
+    // the batch hook: a request's first large batch rebuilds the target set from the counts so far and marks the cold experts; every
+    // large batch counts the target experts held nowhere
+    void ap_prepare(int64_t n_tokens) {
+        const bool large = n_tokens > n_small_max;
+        if (ap_use && large) {
+            if (!ap_prev_large) {
+                ap_rebuild_target();
+                ap_mark_cold();
+            } else {
+                ap_count_need();
+            }
+        }
+        ap_prev_large = large;
+    }
+
+    // an offered upload of expert e of layer il may take a slot: target experts always (also a guess), the others only a free slot
+    // while the layout keeps one for each target expert held nowhere
+    bool ap_offer_ok(int32_t il, int32_t e, bool & take_spec) {
+        take_spec = true;
+        if (!ap_use) {
+            return true;
+        }
+        const int32_t c = host->class_of(il);
+        if (ap_target(il, e)) {
+            aps.hot_taken++;
+            return true;
+        }
+        take_spec = false;
+        // (a duplicate of a device-held expert is as good as a free slot; counted per large batch)
+        if (c >= 0 && (size_t) c < ap_need.size() && (int64_t) host->n_free_of(il) + ap_dup[c] <= ap_need[c]) {
+            aps.cold_refused++;
+            return false;
+        }
+        aps.cold_taken++;
+        return true;
+    }
+
+    // a target expert was admitted: one fewer held nowhere
+    void ap_admitted(int32_t il, int32_t e) {
+        const int32_t c = ap_use && ap_target(il, e) ? host->class_of(il) : -1;
+        if (c >= 0 && (size_t) c < ap_need.size() && ap_need[c] > 0) {
+            ap_need[c]--;
+        }
+    }
+
+    void ap_counts_begin() {
+        ap_epoch++;
+        aps.ubatches++;
+    }
+
+    void ap_counts(const ggml_tensor * w, const std::vector<int32_t> & counts) {
+        const auto it = bindings.find(w);
+        if (!ap_rec || it == bindings.end()) {
+            return;
+        }
+        const int32_t il = it->second.il;
+        if (il < 0 || (size_t) il >= ap_cnt.size() || ap_layer_epoch[il] == ap_epoch) {
+            return;
+        }
+        ap_layer_epoch[il] = ap_epoch;
+        std::vector<float> & c = ap_cnt[il];
+        for (size_t e = 0; e < counts.size() && e < c.size(); ++e) {
+            c[e] += (float) counts[e];
+            ap_new += (uint64_t) counts[e];
+            aps.routings += (uint64_t) counts[e];
+        }
+    }
+
+    // writes the profile when this launch counted something new (the idle point, exit)
+    void ap_save(bool at_exit) {
+        if (!ap_rec || ap_new == 0 || ap_file.empty()) {
+            return;
+        }
+        std::vector<prof_entry> v;
+        for (int32_t il = 0; il < (int32_t) ap_cnt.size(); ++il) {
+            for (int32_t e = 0; e < (int32_t) ap_cnt[il].size(); ++e) {
+                if (ap_cnt[il][e] > 0.0f) {
+                    v.push_back({ il, e, ap_cnt[il][e] });
+                }
+            }
+        }
+        std::sort(v.begin(), v.end(), [](const prof_entry & a, const prof_entry & b) {
+            return a.heat != b.heat ? a.heat > b.heat : a.il != b.il ? a.il < b.il : a.e < b.e;
+        });
+        std::string body = "moe-cache-profile 1 " + std::to_string(layers.size()) + "\n";
+        char buf[64];
+        for (const prof_entry & p : v) {
+            snprintf(buf, sizeof(buf), "%d %d %.6g\n", p.il, p.e, p.heat);
+            body += buf;
+        }
+        const bool ok = llama_autoprof::write_atomic(ap_file, body);
+        aps.saves += ok ? 1 : 0;
+        aps.save_fail += ok ? 0 : 1;
+        if (ok) {
+            ap_new = 0;
+        }
+        if (at_exit || aps.saves + aps.save_fail <= 2) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-autoprof: routing profile %s %s (%zu experts, %zu ubatches counted in this launch)\n", tag,
+                ok ? "written to" : "NOT written to", ap_file.c_str(), v.size(), aps.ubatches);
+        }
+    }
+
     // k19-l4fill (see fill_mode): the refill of the slots the exclusive tier freed
     bool fill_active() const {
         return fill_mode != 0 && host && host->exclusive() && wstore != nullptr && hprof_ticket.empty() && !ahead_on();
@@ -4613,6 +4931,7 @@ struct llama_moe_cache::impl {
 
     // the server is idle (no request runs, none waits): the freed slots are refilled now, the reads run until the next batch
     void fill_idle() {
+        ap_save(false); // k19-autoprof: the profile, when this launch counted something new since the last write
         if (!fill_active()) {
             return;
         }
@@ -4660,6 +4979,23 @@ struct llama_moe_cache::impl {
         size_t n_fill = 0;
         size_t n_bytes = 0;
         bool full = false;
+        // k19-autoprof: with a profile the resident experts are collected over every layer and copied hottest first (below)
+        const bool ap_order = ap_use && !from_file;
+        std::vector<std::pair<float, int32_t>> ap_cand; // (heat, il*n_expert + e)
+        auto copy_one = [&](int32_t il, int32_t e, int32_t s) {
+            const layer & l = layers[il];
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                const ggml_tensor * w = l.experts[ip];
+                host->set_lead(s, (int) ip, 0);
+                memcpy(host->area(s, (int) ip), (const uint8_t *) w->data + (size_t) e*w->nb[2], w->nb[2]);
+                n_bytes += w->nb[2];
+            }
+            host->publish(s);
+            if (mark) {
+                host->set_spec(s);
+            }
+            n_fill++;
+        };
         for (size_t ig = 0; ig < groups.size() && !full; ++ig) {
             if (!host_group[ig]) {
                 continue;
@@ -4712,6 +5048,14 @@ struct llama_moe_cache::impl {
                     if (!all || host->contains(il, e) || (from_file && on_dev)) {
                         continue;
                     }
+                    if (ap_order && ap_on_dev(il, e)) {
+                        continue;
+                    }
+                    if (ap_order) {
+                        ap_cand.emplace_back((size_t) il < ap_cnt.size() && (size_t) e < ap_cnt[il].size() ? ap_cnt[il][e] : 0.0f,
+                            il*host->n_expert_of() + e);
+                        continue;
+                    }
                     const int32_t s = host->reserve(il, e, false);
                     if (s < 0) {
                         // k19-l4held: this layer is at its quota, the next layer may still take slots
@@ -4723,20 +5067,63 @@ struct llama_moe_cache::impl {
                         full = !from_file;
                         break;
                     }
-                    for (size_t ip = 0; ip < l.experts.size(); ++ip) {
-                        const ggml_tensor * w = l.experts[ip];
-                        host->set_lead(s, (int) ip, 0);
-                        memcpy(host->area(s, (int) ip), (const uint8_t *) w->data + (size_t) e*w->nb[2], w->nb[2]);
-                        n_bytes += w->nb[2];
-                    }
-                    host->publish(s);
-                    if (mark) {
-                        host->set_spec(s);
-                    }
-                    n_fill++;
+                    copy_one(il, e, s);
                     n_file += file ? 1 : 0;
                 }
             }
+        }
+        if (ap_order) {
+            // hottest first (ties: layer, expert); an expert outside the target set only while its layout keeps a free slot for each
+            // target expert held nowhere; then the copied cold experts become guesses
+            std::sort(ap_cand.begin(), ap_cand.end(), [](const auto & a, const auto & b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
+            const int32_t ne = host->n_expert_of();
+            std::set<int32_t> full_class;
+            for (const auto & cnd : ap_cand) {
+                const int32_t il = cnd.second / ne;
+                const int32_t e  = cnd.second % ne;
+                const int32_t c  = host->class_of(il);
+                if (full_class.count(c) > 0) {
+                    continue;
+                }
+                const bool hot = ap_target(il, e);
+                if (!hot && c >= 0 && (size_t) c < ap_need.size() && (int64_t) host->n_free_of(il) <= ap_need[c]) {
+                    continue;
+                }
+                // still in the page cache right now (the residency above went stale while earlier copies pinned slots: a copy of
+                // evicted pages would read the expert back from the disk one page at a time)
+                bool still = true;
+                for (const ggml_tensor * w : layers[il].experts) {
+                    const uintptr_t a  = (uintptr_t) w->data + (size_t) e*w->nb[2];
+                    const uintptr_t q0 = a / pg * pg;
+                    const uintptr_t q1 = (a + w->nb[2] + pg - 1) / pg * pg;
+                    vec.resize((q1 - q0) / pg);
+#if defined(__APPLE__)
+                    still = still && mincore((void *) q0, q1 - q0, (char *) vec.data()) == 0;
+#else
+                    still = still && mincore((void *) q0, q1 - q0, vec.data()) == 0;
+#endif
+                    for (size_t k = 0; k < vec.size() && still; ++k) {
+                        still = (vec[k] & 1) != 0;
+                    }
+                }
+                if (!still) {
+                    aps.pf_stale++;
+                    continue;
+                }
+                const int32_t s = host->reserve(il, e, false);
+                if (s < 0) {
+                    full_class.insert(c);
+                    continue;
+                }
+                ap_admitted(il, e);
+                copy_one(il, e, s);
+                aps.pf_hot  += hot ? 1 : 0;
+                aps.pf_cold += hot ? 0 : 1;
+            }
+            ap_mark_cold();
+            LLAMA_LOG_INFO("%s: k19-autoprof: the page-cache fill copied %llu target + %llu other experts of %zu resident, hottest first (%llu no longer "
+                "resident when their turn came, not copied)\n", __func__, (unsigned long long) aps.pf_hot, (unsigned long long) aps.pf_cold, ap_cand.size(),
+                (unsigned long long) aps.pf_stale);
         }
         hst.prefilled = n_fill + n_prof;
         LLAMA_LOG_INFO("%s: MoE host cache: %zu experts (%.1f MiB) copied from the page cache into RAM slots in %.1f ms, %zu of them read from the files"
@@ -6108,10 +6495,22 @@ struct llama_moe_cache::impl {
                 // k19-l4held rank mode: an expert the prompt routes may take the slot of an unrouted one of its layer at the quota
                 const std::vector<bool> * rk = rank_any && (size_t) il < rank_mask.size() && (int32_t) rank_mask[il].size() > e &&
                     rank_mask[il][e] ? &rank_mask[il] : nullptr;
-                sl = host->reserve(il, e, false, 0, true, rk);
+                // k19-autoprof: an expert outside the target set takes a free slot only while the layout keeps one per target expert
+                // held nowhere, and never a guess
+                bool take_spec = true;
+                if (ap_offer_ok(il, e, take_spec)) {
+                    sl = host->reserve(il, e, false, 0, take_spec, rk);
+                    if (sl >= 0) {
+                        ap_admitted(il, e);
+                    }
+                }
             }
             if (sl >= 0 && host->filling(sl) && host->fill_piece(sl, ip, a, p + (o - off), e1 - o)) {
                 hst.admitted++;
+                // k19-autoprof: a cold expert is a guess (the first a reservation takes)
+                if (ap_use && !ap_target(il, e)) {
+                    host->set_spec(sl);
+                }
             }
             o = e1;
         }
@@ -8266,25 +8665,9 @@ struct llama_moe_cache::impl {
         return id;
     }
 
+    // (k19-autoprof: the same directory keeps the self-learned profiles, see llama-autoprof.h)
     static std::string cm_cal_dir() {
-        auto env = [](const char * n) { const char * e = getenv(n); return std::string(e != nullptr ? e : ""); };
-        std::string d = env("LLAMA_MOE_CPU_MISS_CAL_DIR");
-        if (d.empty()) {
-            d = env("LLAMA_CACHE");
-        }
-#if defined(_WIN32)
-        if (d.empty() && !env("LOCALAPPDATA").empty()) {
-            d = env("LOCALAPPDATA") + "\\llama.cpp";
-        }
-#else
-        if (d.empty() && !env("XDG_CACHE_HOME").empty()) {
-            d = env("XDG_CACHE_HOME") + "/llama.cpp";
-        }
-        if (d.empty() && !env("HOME").empty()) {
-            d = env("HOME") + "/.cache/llama.cpp";
-        }
-#endif
-        return d;
+        return llama_autoprof::cal_dir();
     }
 
     // what the timings depend on: the device, the host threads and CPU count, the cache (main / MTP) and the expert form
@@ -9691,6 +10074,10 @@ struct llama_moe_cache::impl {
         // k19-ramprof2: the profile fill (see hprof_order)
         if (host && wstore != nullptr && !hprof_ticket.empty()) {
             hprof_prepare(n_tokens);
+        }
+        // k19-autoprof: the target set at a request's first large batch (see ap_use)
+        if (host) {
+            ap_prepare(n_tokens);
         }
         // k19-l4fill: the refill of the freed RAM slots (see fill_mode)
         if (host) {
@@ -13458,6 +13845,18 @@ bool llama_moe_cache::refills_routed() const {
 
 bool llama_moe_cache::fill_wants_counts() const {
     return pimpl->fill_active();
+}
+
+bool llama_moe_cache::autoprof_wants_counts() const {
+    return pimpl->ap_rec;
+}
+
+void llama_moe_cache::autoprof_counts_begin() {
+    pimpl->ap_counts_begin();
+}
+
+void llama_moe_cache::autoprof_counts(const ggml_tensor * w, const std::vector<int32_t> & counts) {
+    pimpl->ap_counts(w, counts);
 }
 
 void llama_moe_cache::fill_stop() {

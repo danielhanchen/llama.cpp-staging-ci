@@ -77,6 +77,8 @@ public:
     size_t  pageable_bytes() const { return bytes_pageable; }
     size_t  budget_bytes() const { return budget; }
     bool    caches(int32_t il) const { return il >= 0 && (size_t) il < layer_class.size() && layer_class[il] >= 0; }
+    // the expert layout (class) of layer il, -1 if not cached
+    int32_t class_of(int32_t il) const { return caches(il) ? layer_class[il] : -1; }
 
     // the slot of expert e of layer il if it holds the expert (a copy back from the device is waited for), -1 otherwise
     // counts a use (decayed count) when touch

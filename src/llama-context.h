@@ -862,6 +862,8 @@ private:
     // the end of a prompt that did not seed: the lent slots that come back get the experts its last large ubatch used most
     void moe_cache_refill_from_ids();
     void moe_cache_fill_from_ids(); // k19-l4fill
+    void moe_cache_autoprof_from_ids(); // k19-autoprof
+    bool moe_ap_counted = false;        // k19-autoprof: the recorded routing (moe_cache_ids) was counted
 public:
     void moe_fill_idle(); // k19-l4fill (llama_moe_host_fill_idle)
 private:

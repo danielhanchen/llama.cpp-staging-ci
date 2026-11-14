@@ -403,6 +403,11 @@ public:
     bool fill_wants_counts() const;
     void fill_counts_begin();
     void fill_counts(const ggml_tensor * w, const std::vector<int32_t> & counts);
+    // k19-autoprof (LLAMA_MOE_AUTOPROF): the routing of every large prompt ubatch is counted into the self-learned profile (begin, then
+    // each expert tensor; the expert tensors of a layer share one routing)
+    bool autoprof_wants_counts() const;
+    void autoprof_counts_begin();
+    void autoprof_counts(const ggml_tensor * w, const std::vector<int32_t> & counts);
     void fill_stop(); // its reads that did not start are cancelled, the started ones waited for
     void fill_idle(); // the server is idle: the freed slots are refilled (the reads run until the next batch)
     bool refills_routed() const; // LLAMA_MOE_CACHE_REFILL_ROUTED=1 (opt-in)

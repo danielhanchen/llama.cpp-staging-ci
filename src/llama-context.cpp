@@ -20,6 +20,8 @@
 #include "llama-sysmem.h"
 #include "llama-weight-store.h"
 #include "ggml-moe-prefetch.h"
+#include "llama-autoprof.h"
+#include <filesystem>
 #include <limits>
 #include <cerrno>
 #include <mutex>
@@ -1439,7 +1441,25 @@ llama_context::llama_context(
                             return (size_t) (std::max(0.0, v ? atof(v) : def) * 1048576.0);
                         };
                         const char * prof_env = getenv("LLAMA_PLE_ROW_PROFILE");
-                        const std::string prof = prof_env ? prof_env : "";
+                        std::string prof = prof_env ? prof_env : "";
+                        // k19-autoprof (LLAMA_MOE_AUTOPROF, see llama-autoprof.h): without an explicit profile the cache uses the one the
+                        // earlier launches of this model recorded (<dir>/autoprof_ple_<model hash>.<rows>) and records this launch's rows
+                        // for the next: a recorder beside the cache counts every row the gather reads (with a copy of its bytes, at most
+                        // LLAMA_MOE_AUTOPROF_PLE_MIB, 256) and the profile is written at exit. Beside a part with no profile yet the cache
+                        // has no slots (record only), so the recording launch reads exactly what it would without the cache
+                        const int ap_mode = prof_env == nullptr ? llama_autoprof::mode() : 0;
+                        std::string ap_path;
+                        bool ap_have = false;
+                        if (ap_mode != 0) {
+                            ap_path = llama_autoprof::path(llama_autoprof::dir(), "ple",
+                                llama_autoprof::model_hash(model.desc(), model.n_elements(), model.size()), "." + std::to_string(t->ne[1]));
+                            std::error_code ec;
+                            ap_have = !ap_path.empty() && std::filesystem::exists(ap_path, ec);
+                            if (ap_have && llama_autoprof::uses(ap_mode)) {
+                                prof = ap_path;
+                            }
+                        }
+                        const bool ap_rec = !ap_path.empty() && llama_autoprof::records(ap_mode);
                         const size_t row_b = ggml_row_size(t->type, t->ne[0]);
                         const size_t cost  = llama_row_cache::slot_bytes(row_b);
                         // rows of the profile (header only): an upper bound of the static part (only the rows load_profile keeps are
@@ -1464,29 +1484,42 @@ llama_context::llama_context(
                         if (part > 0 && part < table && stat_b == 0 && !prof_save && getenv("LLAMA_PLE_ROW_CACHE_MIB") == nullptr && rc_mode != 2) {
                             dyn_b = 0;
                         }
-                        bool    ok   = stat_b + dyn_b > 0;
+                        // k19-autoprof: the recorder alone is enough to make the cache (no slots beside a part without a profile)
+                        bool    ok   = stat_b + dyn_b > 0 || ap_rec;
                         int64_t skip = 0;
                         size_t  part_min = part;
                         if (ok && part >= table) {
                             // the part holds the whole table: nothing to cache (LLAMA_PLE_ROW_CACHE=2 makes it anyway, beside the part)
                             ok = rc_mode == 2;
-                        } else if (ok && part > 0) {
+                        } else if (ok && part > 0 && stat_b + dyn_b > 0) {
                             // the cache's memory comes out of the part, at most a quarter of it
                             const size_t cap = part / 4;
                             dyn_b  = std::min(dyn_b, cap / 4);
                             stat_b = std::min(stat_b, cap - dyn_b);
                             part_min = (part - stat_b - dyn_b) & ~((8ull << 20) - 1);
                             skip = (int64_t) (part_min / t->nb[1]);
-                        } else if (ok && rc_mode != 2 && avail > 0 && avail < (uint64_t) (stat_b + dyn_b) + (2ull << 30)) {
-                            ok = false;
+                        } else if (ok && part == 0 && rc_mode != 2 && avail > 0 && avail < (uint64_t) (stat_b + dyn_b) + (2ull << 30)) {
+                            // (k19-autoprof: then the recorder alone, no slots)
+                            ok = ap_rec;
+                            stat_b = 0;
+                            dyn_b  = 0;
                         }
                         if (ok) {
                             auto rc = std::make_unique<llama_row_cache>(t, dyn_b, stat_b, skip);
                             rc->load_profile(prof);
+                            if (ap_rec) {
+                                const char * em = getenv("LLAMA_MOE_AUTOPROF_PLE_MIB");
+                                rc->enable_recorder((size_t) (std::max(0.0, em ? atof(em) : 256.0) * 1048576.0));
+                            }
                             if (llama_row_cache_attach(rc.get())) {
                                 if (prof_save && !prof.empty()) {
                                     model.ple_row_profile_save = prof;
                                 }
+                                if (ap_rec) {
+                                    model.ple_row_profile_save = ap_path;
+                                }
+                                LLAMA_LOG_INFO("%s: k19-autoprof: PLE row profile %s %s%s; LLAMA_MOE_AUTOPROF=0 off, 3 read only\n", __func__,
+                                    ap_path.c_str(), ap_have ? "found" : "not found", ap_rec ? ", this launch's rows are recorded and written at exit" : "");
                                 if (part > 0 && part < table) {
                                     // the part gives up what the cache holds (rows from `skip` up are cached, not part rows)
                                     part = std::max<size_t>(part_min, (part - std::min(part, rc->bytes())) & ~((size_t) (8ull << 20) - 1));
@@ -8128,6 +8161,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         const auto & last = group.back();
         if (status == GGML_STATUS_SUCCESS && last.n_outputs == 0 && last.ub->n_seqs_unq == 1 && moe_cache_seed_sync) {
             moe_cache_ids = lm_record;
+            moe_ap_counted = false;
             llama_pos pos_max = last.ub->pos[0];
             for (uint32_t i = 1; i < last.ub->n_tokens; ++i) {
                 pos_max = std::max(pos_max, last.ub->pos[i]);
@@ -8165,6 +8199,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         if (lm_release_routed && status == GGML_STATUS_SUCCESS) {
             moe_cache->set_refill_routed_once(true);
             moe_cache_ids = lm_record;
+            moe_ap_counted = false;
             moe_cache_refill_from_ids();
         }
         // the routing of the group is in its compute buffers, which are freed: no later seed reads it
@@ -9910,6 +9945,7 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
     if (lctx->moe_cache_record && (ids->flags & GGML_TENSOR_FLAG_OUTPUT) && lctx->moe_cache->get_experts(src) != nullptr &&
             std::none_of(lctx->moe_cache_ids.begin(), lctx->moe_cache_ids.end(), [&](const auto & r) { return r.second == ids; })) {
         lctx->moe_cache_ids.emplace_back(src, ids);
+        lctx->moe_ap_counted = false;
     }
     if (ua) {
         lctx->moe_cache->upload_ahead_end(backend, src);
@@ -9982,7 +10018,11 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
     if (cont && !moe_cache_ids.empty() && n_outputs_ub != 0 && !large) {
         moe_cache_fill_from_ids();
     }
+    if (cont) {
+        moe_cache_autoprof_from_ids();
+    }
     moe_cache_ids.clear();
+    moe_ap_counted = false;
 
     // the last large ubatch of the batch seeds the cache even without outputs: a caller may run the last prompt tokens as a separate small batch (e.g. server checkpoints)
     // a ubatch below the prefetch threshold reads its ids for its copies anyway, it seeds from them
@@ -10049,6 +10089,7 @@ bool llama_context::moe_prompt_copy(ggml_backend_t backend, ggml_tensor * dst, g
         for (const ggml_tensor * w : experts) {
             if (std::none_of(moe_cache_ids.begin(), moe_cache_ids.end(), [&](const auto & r) { return r.first == w; })) {
                 moe_cache_ids.emplace_back(w, sel);
+                moe_ap_counted = false;
             }
         }
     }
@@ -10137,11 +10178,20 @@ void llama_context::lm_ids_host_keep() {
 
 // k19-l4fill: the routing of the recorded ubatch (the last large one of a prompt) to the RAM tier's refill of its freed slots
 void llama_context::moe_cache_fill_from_ids() {
-    if (moe_cache_ids.empty() || !moe_cache->fill_wants_counts()) {
+    const bool fill = moe_cache->fill_wants_counts();
+    // k19-autoprof: the same routing goes into the self-learned profile
+    const bool ap   = moe_cache->autoprof_wants_counts();
+    if (moe_cache_ids.empty() || (!fill && !ap)) {
         return;
     }
+    moe_ap_counted = true;
     ggml_backend_sched_synchronize(sched.get());
-    moe_cache->fill_counts_begin();
+    if (fill) {
+        moe_cache->fill_counts_begin();
+    }
+    if (ap) {
+        moe_cache->autoprof_counts_begin();
+    }
     std::vector<int32_t> ids_data;
     std::vector<int32_t> counts;
     for (const auto & [w, ids] : moe_cache_ids) {
@@ -10156,7 +10206,39 @@ void llama_context::moe_cache_fill_from_ids() {
                 counts[id]++;
             }
         }
-        moe_cache->fill_counts(w, counts);
+        if (fill) {
+            moe_cache->fill_counts(w, counts);
+        }
+        if (ap) {
+            moe_cache->autoprof_counts(w, counts);
+        }
+    }
+}
+
+// k19-autoprof: the routing of a large ubatch inside a prompt (read at the start of the next ubatch of the same prompt, before its graph
+// replaces the outputs) into the self-learned profile; the prompt's last ubatch goes through moe_cache_fill_from_ids
+void llama_context::moe_cache_autoprof_from_ids() {
+    if (moe_cache_ids.empty() || moe_ap_counted || !moe_cache->autoprof_wants_counts()) {
+        return;
+    }
+    moe_ap_counted = true;
+    ggml_backend_sched_synchronize(sched.get());
+    moe_cache->autoprof_counts_begin();
+    std::vector<int32_t> ids_data;
+    std::vector<int32_t> counts;
+    for (const auto & [w, ids] : moe_cache_ids) {
+        if (ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids) || ids->buffer == nullptr) {
+            continue;
+        }
+        ids_data.resize(ggml_nelements(ids));
+        ggml_backend_tensor_get(ids, ids_data.data(), 0, ggml_nbytes(ids));
+        counts.assign(w->ne[2], 0);
+        for (const int32_t id : ids_data) {
+            if (id >= 0 && id < w->ne[2]) {
+                counts[id]++;
+            }
+        }
+        moe_cache->autoprof_counts(w, counts);
     }
 }
 

@@ -359,7 +359,8 @@ bool llama_row_cache::get(int64_t r, uint8_t * out) {
     }
     memcpy(out, s.data.get() + (size_t) slot*row_bytes, row_bytes);
     s.slot_ref[slot] = 1;
-    if (s.slot_cnt[slot] != UINT32_MAX) {
+    // (with the recorder the reads are counted there: a static row keeps its loaded count)
+    if (!rec_on && s.slot_cnt[slot] != UINT32_MAX) {
         s.slot_cnt[slot]++;
     }
     st.n_hits.fetch_add(1, std::memory_order_relaxed);
@@ -449,12 +450,34 @@ bool llama_row_cache::save_profile(const std::string & path) const {
             if (s.slot_row[q] == k_empty) {
                 continue;
             }
-            // carried over counts of the static rows decay by half per session
+            // carried over counts of the static rows decay by half per session (k19-autoprof: with the recorder, the reads of this launch
+            // are its counts: the static rows carry their loaded count halved, the dynamic slots are left to the recorder)
+            if (rec_on && q >= s.n_static) {
+                continue;
+            }
             const uint32_t c = q < s.n_static ? std::max<uint32_t>(1, s.slot_cnt[q] / 2) : s.slot_cnt[q];
             es.push_back({ s.slot_row[q], c, s.data.get() + (size_t) q*row_bytes });
         }
+        for (size_t j = 0; j < s.rec_row.size(); ++j) {
+            es.push_back({ s.rec_row[j], s.rec_cnt[j], s.rec_data.data() + j*row_bytes });
+        }
     }
     std::sort(es.begin(), es.end(), [](const ent & a, const ent & b) { return a.row < b.row; });
+    // a row both preloaded and recorded: one entry, the counts added
+    {
+        size_t o = 0;
+        for (size_t i = 0; i < es.size(); ++i) {
+            if (o > 0 && es[o - 1].row == es[i].row) {
+                es[o - 1].cnt = (uint32_t) std::min<uint64_t>(UINT32_MAX, (uint64_t) es[o - 1].cnt + es[i].cnt);
+                continue;
+            }
+            es[o++] = es[i];
+        }
+        es.resize(o);
+    }
+    if (rec_on && es.empty()) {
+        return false; // k19-autoprof: nothing read in this launch, the file (if any) stays
+    }
     // a temporary of this process only, created exclusively (an existing file or link of that name is not followed), then renamed over
     // the profile (std::filesystem::rename replaces an existing file on Windows too)
     const std::string tmp = path + ".tmp." + std::to_string((long long) llama_rc_getpid());
@@ -499,6 +522,74 @@ bool llama_row_cache::save_profile(const std::string & path) const {
     return ok;
 }
 
+void llama_row_cache::enable_recorder(size_t max_bytes) {
+    rec_on        = true;
+    rec_max_bytes = max_bytes;
+}
+
+size_t llama_row_cache::n_recorded_rows() const {
+    size_t n = 0;
+    for (const auto & s : shards) {
+        std::lock_guard<std::mutex> lock(s.mtx);
+        n += s.rec_row.size();
+    }
+    return n;
+}
+
+void llama_row_cache::record(int64_t r, const uint8_t * bytes) {
+    if (!rec_on || r < 0 || r >= n_rows) {
+        return;
+    }
+    st.n_recorded.fetch_add(1, std::memory_order_relaxed);
+    shard & s = shard_of(r);
+    const uint32_t key = (uint32_t) r;
+    std::lock_guard<std::mutex> lock(s.mtx);
+    if (!s.rec_keys.empty()) {
+        for (uint32_t i = (uint32_t) mix(key) & s.rec_mask;; i = (i + 1) & s.rec_mask) {
+            const uint32_t k = s.rec_keys[i];
+            if (k == key) {
+                uint32_t & c = s.rec_cnt[s.rec_vals[i]];
+                c += c != UINT32_MAX ? 1 : 0;
+                return;
+            }
+            if (k == k_empty) {
+                break;
+            }
+        }
+    }
+    // a new row: entry (row, count, bytes) + its share of the index (at most half full)
+    const size_t per = row_bytes + 8 + 16;
+    if (rec_bytes.load(std::memory_order_relaxed) + per > rec_max_bytes) {
+        st.n_rec_full.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    rec_bytes.fetch_add(per, std::memory_order_relaxed);
+    if (2*(s.rec_row.size() + 1) > s.rec_keys.size()) {
+        const size_t tab = std::max<size_t>(64, 2*s.rec_keys.size());
+        std::vector<uint32_t>(tab, k_empty).swap(s.rec_keys);
+        std::vector<uint32_t>(tab, 0).swap(s.rec_vals);
+        s.rec_mask = (uint32_t) (tab - 1);
+        for (uint32_t j = 0; j < (uint32_t) s.rec_row.size(); ++j) {
+            uint32_t i = (uint32_t) mix(s.rec_row[j]) & s.rec_mask;
+            while (s.rec_keys[i] != k_empty) {
+                i = (i + 1) & s.rec_mask;
+            }
+            s.rec_keys[i] = s.rec_row[j];
+            s.rec_vals[i] = j;
+        }
+    }
+    const uint32_t j = (uint32_t) s.rec_row.size();
+    s.rec_row.push_back(key);
+    s.rec_cnt.push_back(1);
+    s.rec_data.insert(s.rec_data.end(), bytes, bytes + row_bytes);
+    uint32_t i = (uint32_t) mix(key) & s.rec_mask;
+    while (s.rec_keys[i] != k_empty) {
+        i = (i + 1) & s.rec_mask;
+    }
+    s.rec_keys[i] = key;
+    s.rec_vals[i] = j;
+}
+
 std::string llama_row_cache::describe() const {
     char buf[512];
     snprintf(buf, sizeof(buf), "lookups = %" PRIu64 ", hits = %" PRIu64 " (static %" PRIu64 "), inserts = %" PRIu64 ", evictions = %" PRIu64
@@ -506,6 +597,11 @@ std::string llama_row_cache::describe() const {
         st.n_lookups.load(), st.n_hits.load(), st.n_hits_static.load(), st.n_inserts.load(), st.n_evicts.load(),
         st.n_filtered.load(), n_static_rows, n_slots_total, mem_bytes/1048576.0);
     std::string s = buf;
+    if (rec_on) {
+        snprintf(buf, sizeof(buf), ", k19-autoprof recorder: %" PRIu64 " row reads, %zu rows (%.1f MiB), %" PRIu64 " new rows past the cap",
+            st.n_recorded.load(), n_recorded_rows(), rec_bytes.load()/1048576.0, st.n_rec_full.load());
+        s += buf;
+    }
     if (verify) {
         snprintf(buf, sizeof(buf), ", verified hits = %" PRIu64 ", mismatched = %" PRIu64, st.n_verified.load(), st.n_verify_bad.load());
         s += buf;
@@ -518,7 +614,11 @@ std::string llama_row_cache::describe() const {
 static const void * llama_row_cache_source(void * ud, const ggml_tensor * t, int64_t row, void * tmp) {
     auto * rc = (llama_row_cache *) ud;
     const auto * src = (const uint8_t *) t->data + (size_t) row*t->nb[1];
+    const bool rec = rc->recording(); // k19-autoprof: the row (and the bytes the gather reads) to the recorder
     if (row < rc->get_skip_below()) {
+        if (rec) {
+            rc->record(row, src);
+        }
         return src; // the part the page cache holds (k19-disktt)
     }
     if (rc->get(row, (uint8_t *) tmp)) {
@@ -526,12 +626,21 @@ static const void * llama_row_cache_source(void * ud, const ggml_tensor * t, int
             rc->st.n_verified.fetch_add(1, std::memory_order_relaxed);
             if (memcmp(tmp, src, rc->get_row_bytes()) != 0) {
                 rc->st.n_verify_bad.fetch_add(1, std::memory_order_relaxed);
+                if (rec) {
+                    rc->record(row, src);
+                }
                 return src; // the mapping's bytes win
             }
+        }
+        if (rec) {
+            rc->record(row, (const uint8_t *) tmp);
         }
         return tmp;
     }
     rc->put(row, src);
+    if (rec) {
+        rc->record(row, src);
+    }
     return src;
 }
 
