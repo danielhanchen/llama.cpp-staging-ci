@@ -4810,6 +4810,60 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 }
 
 
+// k19-g4fuse: the overlapped verify of the MoE cache computes the hit experts and the fetched experts as two products and adds them
+// (ADD, every slot computed by exactly one side, the other side's rows 0), then the weighted reduction of the experts, then (Qwen3-Next
+// family) the ADD of the shared expert, whose gate ran beside the copies: three launches per MoE layer. One launch here: the reduction
+// kernel reads both products (their sum per element, as the ADD computes it, then the reduction's own order) and adds the following
+// ADD's other operand to its result (float addition commutes): the bytes of the three launches. GGML_CUDA_MOE_RED_FUSE=0: off.
+static int ggml_cuda_try_fuse_moe_red_add2(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool on = getenv("GGML_CUDA_MOE_RED_FUSE") == nullptr || atoi(getenv("GGML_CUDA_MOE_RED_FUSE")) != 0;
+    ggml_tensor * add = cgraph->nodes[i];
+    if (!on || add->op != GGML_OP_ADD || i + 1 >= cgraph->n_nodes || add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add)) {
+        return 0;
+    }
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    if (a == nullptr || b == nullptr || a == b || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || !ggml_is_contiguous(a) ||
+            !ggml_is_contiguous(b) || !ggml_are_same_shape(a, add) || !ggml_are_same_shape(b, add)) {
+        return 0;
+    }
+    ggml_cuda_moe_weighted_reduction_match match;
+    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, i + 1, match) || match.experts != add) {
+        return 0;
+    }
+    int n = 1 + match.node_count;
+    ggml_tensor * dst   = match.dst;
+    const ggml_tensor * extra = nullptr;
+    if (i + n < cgraph->n_nodes) {
+        ggml_tensor * t = cgraph->nodes[i + n];
+        const ggml_tensor * o = t->src[0] == dst ? t->src[1] : t->src[1] == dst ? t->src[0] : nullptr;
+        if (t->op == GGML_OP_ADD && o != nullptr && o != dst && t->type == GGML_TYPE_F32 && o->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(t) && ggml_is_contiguous(o) && ggml_are_same_shape(t, dst) && ggml_are_same_shape(o, dst)) {
+            extra = o;
+            dst   = t;
+            n++;
+        }
+    }
+    std::vector<int>     idx(n);
+    std::vector<ggml_op> ops(n);
+    for (int k = 0; k < n; ++k) {
+        idx[k] = i + k;
+        ops[k] = cgraph->nodes[i + k]->op;
+    }
+    const int outs[1] = { i + n - 1 };
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idx.data(), n, ops.data(), outs, 1) || !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n, outs, 1)) {
+        return 0;
+    }
+    ggml_cuda_op_moe_weighted_reduction_add2(*cuda_ctx, a, b, match.expert_scale, match.weights, extra, dst);
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        GGML_LOG_INFO("%s: k19-g4fuse: the MoE cache's hit + fetched expert ADD%s in the weighted reduction launch (%s, %d nodes; "
+            "GGML_CUDA_MOE_RED_FUSE=0: off)\n", __func__, extra != nullptr ? " and the following ADD" : "", dst->name, n);
+    }
+    return n - 1;
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -8240,6 +8294,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_ADD) {
+        if (const int n = ggml_cuda_try_fuse_moe_red_add2(cuda_ctx, cgraph, i)) {
+            return n;
+        }
+    }
 
     if (node->op == GGML_OP_GLU) {
         if (const int n = ggml_cuda_try_fuse_swiglu_mmid(cuda_ctx, cgraph, i)) {
