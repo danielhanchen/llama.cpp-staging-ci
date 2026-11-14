@@ -14,6 +14,14 @@
 #include "../src/llama-model-saver.h"
 
 #include <algorithm>
+#include <chrono>
+#include <thread>
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 #include <cinttypes>
 #include <cmath>
 #include <cstddef>
@@ -132,6 +140,7 @@ static void usage(char ** argv) {
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --rs-decode-parity       Only check CPU single-token decodes against one prompt for RWKV6 / RWKV7 / Mamba\n");
+    LOG("  --rs-replay-sched        Only check qwen35 replay commits through the scheduler on two in-process RPC devices\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -1499,6 +1508,203 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
     return all_ok ? 0 : 1;
 }
 
+// k19-mgpucache: the delta-net replay commit graphs of a recurrent state split over two devices run through a scheduler
+// (llama_context::rs_replay_commit). Splitting such a graph rewrites node inputs that live on another backend to the scheduler's own
+// copies; a cached commit graph allocated again after another key's graph read the other graph's copies and the copy op aborted
+// (ne == ggml_nelements(src1); Kaggle 2x T4 Qwen3.8-Flash-Next + MTP at the server's prompt save). Two in-process RPC servers over the
+// CPU give the two devices (skipped without the RPC backend or on Windows); qwen35 with 4 layers (delta-net layers 0 and 2) split 1:2
+// puts a delta-net state on each. Verify windows of 2-4 tokens (the last one rejected) and a state size query after each (it commits the pending
+// window) alternate the commit keys A, B, A, ...; the logits after every window must match a single-device run of the same calls.
+#ifndef _WIN32
+static bool rs_port_open(int port) {
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return false;
+    }
+    sockaddr_in a = {};
+    a.sin_family      = AF_INET;
+    a.sin_port        = htons((uint16_t) port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    const bool ok = connect(fd, (const sockaddr *) &a, sizeof(a)) == 0;
+    close(fd);
+    return ok;
+}
+#endif
+
+static int check_qwen35_replay_sched(const size_t seed, const float stdev) {
+#ifdef _WIN32
+    GGML_UNUSED(seed);
+    GGML_UNUSED(stdev);
+    return 0;
+#else
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (rpc_reg == nullptr) {
+        printf("%s: RPC backend not built, skipped\n", __func__);
+        return 0;
+    }
+    typedef void (*start_server_t)(const char *, const char *, size_t, size_t, ggml_backend_dev_t *);
+    typedef ggml_backend_reg_t (*add_server_t)(const char *);
+    auto start_server = (start_server_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_start_server");
+    auto add_server   = (add_server_t)   ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (start_server == nullptr || add_server == nullptr || cpu_dev == nullptr) {
+        fprintf(stderr, "%s: FAIL: no RPC server entry points\n", __func__);
+        return 1;
+    }
+    std::vector<ggml_backend_dev_t> rpc_devs;
+    int port = 21000 + (int) (getpid() % 30000);
+    for (int k = 0; k < 2; ++k) {
+        for (int i = 0; i < 40 && rs_port_open(port); ++i) {
+            port++;
+        }
+        const std::string ep = "127.0.0.1:" + std::to_string(port);
+        port++;
+        // the servers never return; the process ends with them running
+        std::thread([start_server, ep, cpu_dev]() {
+            ggml_backend_dev_t sdevs[1] = { cpu_dev };
+            start_server(ep.c_str(), nullptr, 2, 1, sdevs);
+        }).detach();
+        bool up = false;
+        for (int i = 0; i < 200 && !up; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            up = rs_port_open(port - 1);
+        }
+        ggml_backend_reg_t reg = up ? add_server(ep.c_str()) : nullptr;
+        if (reg == nullptr || ggml_backend_reg_dev_count(reg) == 0) {
+            fprintf(stderr, "%s: FAIL: could not connect to %s\n", __func__, ep.c_str());
+            return 1;
+        }
+        rpc_devs.push_back(ggml_backend_reg_dev_get(reg, 0));
+    }
+    setenv("LLAMA_RS_REPLAY", "1", 1); // replay rollback (auto picks it only where weights spill to the host)
+
+    auto run = [&](const std::vector<ggml_backend_dev_t> & devs, std::vector<std::vector<float>> & out) -> bool {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN35, false);
+        const std::string arch = llm_arch_name(LLM_ARCH_QWEN35);
+        const uint32_t n_layer0 = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str()));
+        const uint32_t n_layer  = 4;
+        gguf_set_val_u32(gguf_ctx.get(), (arch + ".block_count").c_str(), n_layer);
+        // per-layer arrays of the generated model: the first entries repeated
+        for (int64_t k = 0; k < gguf_get_n_kv(gguf_ctx.get()); ++k) {
+            if (gguf_get_kv_type(gguf_ctx.get(), k) != GGUF_TYPE_ARRAY || gguf_get_arr_n(gguf_ctx.get(), k) != n_layer0) {
+                continue;
+            }
+            const enum gguf_type t = gguf_get_arr_type(gguf_ctx.get(), k);
+            if (t == GGUF_TYPE_STRING) {
+                continue;
+            }
+            size_t es = 0;
+            switch (t) {
+                case GGUF_TYPE_UINT8:   case GGUF_TYPE_INT8:   case GGUF_TYPE_BOOL: es = 1; break;
+                case GGUF_TYPE_UINT16:  case GGUF_TYPE_INT16:  es = 2; break;
+                case GGUF_TYPE_UINT32:  case GGUF_TYPE_INT32:  case GGUF_TYPE_FLOAT32: es = 4; break;
+                case GGUF_TYPE_UINT64:  case GGUF_TYPE_INT64:  case GGUF_TYPE_FLOAT64: es = 8; break;
+                default: break;
+            }
+            if (es == 0) {
+                continue;
+            }
+            const uint8_t * d = (const uint8_t *) gguf_get_arr_data(gguf_ctx.get(), k);
+            std::vector<uint8_t> v(es*n_layer);
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                memcpy(v.data() + il*es, d + (il % n_layer0)*es, es);
+            }
+            const std::string key = gguf_get_key(gguf_ctx.get(), k);
+            gguf_set_arr_data(gguf_ctx.get(), key.c_str(), t, v.data(), n_layer);
+        }
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback = silent_model_load_progress;
+        std::vector<ggml_backend_dev_t> devs_copy = devs;
+        devs_copy.push_back(nullptr);
+        model_params.devices      = devs_copy.data();
+        model_params.split_mode   = LLAMA_SPLIT_MODE_LAYER;
+        model_params.n_gpu_layers = 99;
+        std::vector<float> ts(llama_max_devices(), 0.0f);
+        if (devs.size() == 2) {
+            ts[0] = 1.0f;
+            ts[1] = 2.0f;
+            model_params.tensor_split = ts.data();
+        }
+        tensor_data_params tensor_params = { seed, stdev };
+        llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
+        if (!model) {
+            fprintf(stderr, "%s: failed to create the model\n", __func__);
+            return false;
+        }
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx           = 256;
+        ctx_params.n_batch         = 64;
+        ctx_params.n_ubatch        = 64;
+        ctx_params.n_threads       = 2;
+        ctx_params.n_threads_batch = 2;
+        ctx_params.n_rs_seq        = 7;
+        llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+        if (!lctx) {
+            fprintf(stderr, "%s: failed to create the context\n", __func__);
+            return false;
+        }
+        const uint32_t n_vocab = (uint32_t) llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        const std::vector<llama_token> toks = get_tokens(128, n_vocab, seed);
+        llama_memory_t mem = llama_get_memory(lctx.get());
+        llama_batch batch = llama_batch_init(64, 0, 1);
+        auto decode = [&](int32_t pos, int32_t n, int32_t i0) -> bool {
+            batch.n_tokens = n;
+            for (int32_t i = 0; i < n; ++i) {
+                batch.token[i] = toks[(size_t) (i0 + i) % toks.size()];
+                batch.pos[i] = pos + i;
+                batch.n_seq_id[i] = 1;
+                batch.seq_id[i][0] = 0;
+                batch.logits[i] = 1;
+            }
+            return llama_decode(lctx.get(), batch) == 0;
+        };
+        bool ok = decode(0, 20, 0);
+        int32_t pos = 20;
+        const int32_t widths[] = { 4, 2, 4, 2, 3, 4, 2, 4 };
+        for (size_t w = 0; w < sizeof(widths)/sizeof(widths[0]) && ok; ++w) {
+            const int32_t n = widths[w];
+            ok = decode(pos, n, pos);
+            if (!ok) {
+                break;
+            }
+            const float * lg = llama_get_logits_ith(lctx.get(), 0);
+            out.emplace_back(lg, lg + n_vocab);
+            // the last token of the window is rejected: the replay commits the other n - 1 (a key per width)
+            ok = llama_memory_seq_rm(mem, 0, pos + n - 1, -1);
+            pos += n - 1;
+            // a state size query commits the pending window (the server's prompt save does it)
+            ok = ok && llama_state_seq_get_size(lctx.get(), 0) > 0;
+        }
+        llama_batch_free(batch);
+        return ok;
+    };
+
+    std::vector<std::vector<float>> ref, two;
+    if (!run({ cpu_dev }, ref)) {
+        fprintf(stderr, "%s: FAIL: the single-device run failed\n", __func__);
+        return 1;
+    }
+    if (!run(rpc_devs, two)) {
+        fprintf(stderr, "%s: FAIL: the two-device run failed\n", __func__);
+        return 1;
+    }
+    int ret = 0;
+    for (size_t i = 0; i < ref.size() && i < two.size(); ++i) {
+        const double e = nmse(ref[i], two[i]);
+        if (!(e < 1e-6)) {
+            fprintf(stderr, "%s: FAIL: window %zu: logits differ from the single-device run, nmse %g\n", __func__, i, e);
+            ret = 1;
+        }
+    }
+    if (ref.size() != two.size()) {
+        fprintf(stderr, "%s: FAIL: %zu vs %zu windows\n", __func__, ref.size(), two.size());
+        ret = 1;
+    }
+    printf("%s: %s (%zu verify windows, replay commits through the scheduler on 2 RPC devices)\n", __func__, ret == 0 ? "OK" : "FAIL", two.size());
+    return ret;
+#endif
+}
+
 int main(int argc, char ** argv) {
     // exact speculative verify is checked by default (LLAMA_MTP_EXACT=0 skips the check)
 #ifdef _WIN32
@@ -1521,6 +1727,7 @@ int main(int argc, char ** argv) {
     std::string out;
     const char * target_backend = nullptr;
     bool rs_decode_parity = false;
+    bool rs_replay_sched  = false; // k19-mgpucache
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1577,6 +1784,8 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[i], "--rs-decode-parity") == 0) {
             rs_decode_parity = true;
+        } else if (strcmp(argv[i], "--rs-replay-sched") == 0) {
+            rs_replay_sched = true;
         } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--backend") == 0) {
             if (i + 1 < argc) {
                 const char * backend_name = argv[++i];
@@ -1608,6 +1817,9 @@ int main(int argc, char ** argv) {
         }
         if (rs_decode_parity) {
             return check_rs_decode_parity(arch_filter, seed, stdev);
+        }
+        if (rs_replay_sched) {
+            return check_qwen35_replay_sched(seed, stdev);
         }
         int ret = 0;
         if (arch_matches(arch_filter, LLM_ARCH_QWEN4EXP) && target_backend == nullptr) {
