@@ -39,6 +39,14 @@ int main() {
         const int64_t free_kept    = free_cuda1 - (m - common_fit_moe_margin_fa_plan(m, m_reduced, false, true));
         CHECK(free_reduced == 529*MiB);
         CHECK(free_kept    == 1297*MiB);
+        // the full margin was not enough either: with it kept (k19-fitfaoff first step) the 7986-token prompt still aborted in a pool
+        // allocation. One F16 copy of the KQ matrix at the full context (64 heads x 2048 x 16384) is what the margin has to hold
+        const int64_t kq = common_fit_faoff_kq_bytes(64, 2048, 16384);
+        CHECK(kq == int64_t(4096)*MiB);
+        CHECK(kq > free_kept);
+        // half the F32 KQ the measured compute buffer holds (CUDA1 10768 MiB, of which the F32 KQ is 8 GiB)
+        CHECK(2*kq <= 10768*MiB);
+        CHECK(common_fit_faoff_kq_bytes(-1, 2048, 16384) == 0);
     }
 
     // the measure reads back the flash attention of the context it created

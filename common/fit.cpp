@@ -48,6 +48,8 @@ static int64_t g_moe_margin_gain = 0;
 
 // k19-fitfaoff: the last measured context ran attention without flash attention (-fa off, or auto resolved off)
 static bool    g_fit_fa_off      = false;
+// k19-fitfaoff: bytes of one F16 copy of the largest KQ matrix of the last measured context without flash attention (0 with it)
+static int64_t g_fit_faoff_kq    = 0;
 
 bool common_fit_last_flash_attn() {
     return !g_fit_fa_off;
@@ -55,6 +57,10 @@ bool common_fit_last_flash_attn() {
 
 int64_t common_fit_moe_margin_fa_plan(int64_t m, int64_t m_reduced, bool flash_attn, bool keep_faoff) {
     return !flash_attn && keep_faoff ? m : m_reduced;
+}
+
+int64_t common_fit_faoff_kq_bytes(int64_t n_head, int64_t n_ubatch, int64_t n_ctx) {
+    return std::max<int64_t>(0, n_head)*std::max<int64_t>(0, n_ubatch)*std::max<int64_t>(0, n_ctx)*2;
 }
 
 // LLAMA_FIT_FAOFF_MARGIN: 1 (default) the full margin beside a MoE cache without flash attention, 0 = the reduced one as before
@@ -368,6 +374,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         throw std::runtime_error("failed to create llama_context from model");
     }
     g_fit_fa_off = !llama_get_flash_attn(ctx); // k19-fitfaoff: as resolved by the context (auto included)
+    g_fit_faoff_kq = g_fit_fa_off ? common_fit_faoff_kq_bytes(llama_model_n_head(model), llama_n_ubatch(ctx), llama_n_ctx(ctx)) : 0;
 
     // k17-small: measure the graphs the context runs once an MTP draft is attached (unmasked for the target, masked for the drafter,
     // as common_speculative sets them)
@@ -731,6 +738,20 @@ static void common_params_fit_impl(
         for (size_t id = 0; id < nd; id++) {
             margins.push_back(margins_s[id]);
         }
+    }
+
+    // k19-fitfaoff (LLAMA_FIT_FAOFF_MARGIN=0 off): without flash attention the KQ / KQV mat-muls take F16 copies of the KQ matrix
+    // (n_head x n_ubatch x n_kv) from the CUDA pool at run time; the measured compute buffer holds the F32 KQ but not those copies.
+    // Each GPU's margin gets one copy at the full context. Kaggle 2x T4, DeepSeek-V4.1 fake dsf8, -fa off, ctx 16384, -ub 2048: with
+    // the 1024 MiB margin (1297 MiB projected free on CUDA1) the 7986-token prompt still aborted in a pool allocation (cuMemCreate)
+    if (g_fit_fa_off && g_fit_faoff_kq > 0 && common_fit_faoff_keep() && nd > 0) {
+        for (size_t id = 0; id < nd; id++) {
+            if (ggml_backend_dev_type(devs[id]) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                margins[id] += g_fit_faoff_kq;
+            }
+        }
+        LOG_INF("%s: flash attention off: each GPU keeps %" PRId64 " MiB more free for the F16 copies of the KQ matrix (n_head x n_ubatch x "
+            "n_ctx; LLAMA_FIT_FAOFF_MARGIN=0 off)\n", __func__, g_fit_faoff_kq/(1024*1024));
     }
 
     std::vector<std::string> dev_names;

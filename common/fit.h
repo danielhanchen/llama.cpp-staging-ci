@@ -88,6 +88,9 @@ int64_t common_fit_small_reserve_plan(int64_t cache_mib, int64_t reserve_mib, in
 //   - common_fit_moe_margin_fa_plan: m when !flash_attn && keep_faoff, else m_reduced
 //   - common_fit_last_flash_attn: flash attention of the last context the fit measured
 int64_t common_fit_moe_margin_fa_plan(int64_t m, int64_t m_reduced, bool flash_attn, bool keep_faoff);
+//   - common_fit_faoff_kq_bytes: one F16 copy of the KQ matrix, n_head x n_ubatch x n_ctx x 2 bytes, added to every GPU's margin
+//     without flash attention (the KQV mat-mul converts the F32 KQ to F16 in the CUDA pool, outside the measured compute buffer)
+int64_t common_fit_faoff_kq_bytes(int64_t n_head, int64_t n_ubatch, int64_t n_ctx);
 bool    common_fit_last_flash_attn();
 int64_t common_fit_small_reserve_mib(int64_t cache_mib);
 
