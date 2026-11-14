@@ -2706,6 +2706,10 @@ llama_context::~llama_context() {
         rs_move_mem->move_cb = nullptr;
         rs_move_mem->sync_cb = nullptr;
     }
+    if (n_small_check_assigned > 0 || getenv("LLAMA_GRAPH_SMALL_CHECK") != nullptr) {
+        LLAMA_LOG_INFO("%s: k19-mgpu3 small graph backends: %" PRIu64 " builder assignments at kept graph allocations, %" PRIu64 " lost\n", __func__,
+            n_small_check_assigned, n_small_check_lost);
+    }
     if (n_plan_saves > 0) {
         size_t bytes = 0;
         int    n     = 0;
@@ -2714,8 +2718,9 @@ llama_context::~llama_context() {
             n     += p != nullptr;
         }
         LLAMA_LOG_INFO("%s: kept graph allocations (LLAMA_SCHED_SIZE_CACHE): %" PRIu64 " restored, %" PRIu64 " saved, %" PRIu64 " no longer valid, "
-            "%d held, %.2f MiB of host memory, no device memory; kept graph swap-ins %" PRIu64 ", graph reuses %d\n", __func__, n_plan_restores,
-            n_plan_saves, n_plan_invalid, n, bytes/1048576.0, n_small_swaps, (int) n_reused);
+            "%d held, %.2f MiB of host memory, no device memory; kept graph swap-ins %" PRIu64 ", graph reuses %d; %" PRIu64 " builder backend "
+            "assignments given back (LLAMA_GRAPH_SMALL_BACKENDS)\n", __func__, n_plan_restores,
+            n_plan_saves, n_plan_invalid, n, bytes/1048576.0, n_small_swaps, (int) n_reused, n_small_backends);
     }
     for (uint32_t i = 0; i < GF_SMALL_N; ++i) {
         small_plan_free(i);
@@ -4980,12 +4985,33 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             small_plan_free(i_small);
             n_plan_invalid++;
         }
+        // k19-mgpu3 (LLAMA_GRAPH_SMALL_BACKENDS=0: off): the scheduler was reset above, which drops the backends the graph builder assigned
+        // (ggml_backend_sched_set_tensor_backend). A kept graph allocated again without being built again (its first swap-in, which
+        // also saves the plan every later swap-in restores, or a refused plan) was split by the scheduler's own rules: the get_rows of an
+        // MoE cache slot map, a host weight, went to the CPU, so the slot map was never copied to the device, the copy callback that plans and uploads
+        // the routed experts never ran, and every later decode of that size read stale slots (1x T4 Flash-Next: chat decode without a single
+        // lookup, degenerate text). The assignments of the build go back first
+        static const bool keep_backends = getenv("LLAMA_GRAPH_SMALL_BACKENDS") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_BACKENDS")) != 0;
         for (const auto & st : gf_res_small_state[i_small]) {
             memcpy(st.t->src, st.src, sizeof(st.src));
             st.t->data   = st.data;
             st.t->buffer = st.buffer;
             st.t->extra  = st.extra;
             st.t->flags  = st.flags;
+            if (keep_backends && st.backend != nullptr) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), st.t, st.backend);
+                n_small_backends++;
+            }
+        }
+        // LLAMA_GRAPH_SMALL_CHECK=1 (test-llama-archs --small-backends): the builder's assignments the scheduler holds before this allocation
+        static const bool small_check = getenv("LLAMA_GRAPH_SMALL_CHECK") != nullptr && atoi(getenv("LLAMA_GRAPH_SMALL_CHECK")) != 0;
+        if (small_check) {
+            for (const auto & st : gf_res_small_state[i_small]) {
+                if (st.backend != nullptr) {
+                    n_small_check_assigned++;
+                    n_small_check_lost += ggml_backend_sched_get_tensor_backend(sched.get(), st.t) != st.backend;
+                }
+            }
         }
         prefetch_n_tokens = ubatch.n_tokens;
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
@@ -5069,6 +5095,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 st.buffer = t->buffer;
                 st.extra  = t->extra;
                 st.flags  = t->flags;
+                st.backend = ggml_backend_sched_get_tensor_backend(sched.get(), t); // assigned by the graph builder (k19-mgpu3)
                 sv.push_back(st);
             }
         };

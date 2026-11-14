@@ -284,6 +284,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         LABEL main
         ARGS --rs-replay-sched -s 1
     )
+    llama_test(
+        test-llama-archs
+        NAME test-small-backends
+        LABEL main
+        ARGS --small-backends -s 1
+    )
 
     # an exact verify row keeps every cell of its sequence when the cells do not follow the positions (two sequences in a unified KV)
     llama_build(test-exact-verify-cells.cpp)
