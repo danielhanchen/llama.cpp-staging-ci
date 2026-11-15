@@ -3375,7 +3375,19 @@ uma_restart:
             for (const uint8_t e : exps) {
                 has_exps = has_exps || e != 0;
             }
-            const bool ub_may = lc_ub == 2 || (lc_ub == 1 && !params.n_ubatch_set);
+            // not on the disk tier (the host experts do not fit in the available RAM and the model is not on a memory file system): there a
+            // prompt ubatch reads the experts it misses from the disk, so a smaller n_ubatch reads them more often. Colab L4 10 GB,
+            // Flash-Next from the VM disk (57.6 GB of experts, 51 GB of RAM), ctx 262144, n_ubatch 2048 -> 512: decode after an 8k prompt
+            // 1.3 -> 1.8 tok/s but the prompt 18 -> 8 tok/s. LLAMA_FIT_LONGCTX_DISK=1 lowers it there too
+            const bool disk_tier = [&] {
+                if (env_i("LLAMA_FIT_LONGCTX_DISK", 0) != 0) {
+                    return false;
+                }
+                const uint64_t exp_b = common_moe_expert_bytes(params.model.path);
+                const uint64_t avail = llama_available_memory();
+                return exp_b > 0 && avail > 0 && (double) exp_b > 0.8*(double) avail && !common_fit_file_in_ram_fs(params.model.path);
+            }();
+            const bool ub_may = !disk_tier && (lc_ub == 2 || (lc_ub == 1 && !params.n_ubatch_set));
             const bool lc_on = lc_mode != 0 && !model_only && !params.embedding && n_layer > 0 && has_exps &&
                 params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && cparams.offload_kqv && !params.no_kv_offload &&
                 mparams.n_gpu_layers == llama_model_default_params().n_gpu_layers &&

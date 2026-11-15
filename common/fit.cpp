@@ -143,7 +143,7 @@ bool common_fit_place8() {
 }
 
 // whether the model file lives on a memory file system (tmpfs / ramfs, Linux): its pages are in RAM whatever the available memory reads
-static bool common_fit_file_in_ram_fs(const std::string & path) {
+bool common_fit_file_in_ram_fs(const std::string & path) {
 #if defined(__linux__)
     struct statfs sfs;
     if (statfs(path.c_str(), &sfs) == 0) {
