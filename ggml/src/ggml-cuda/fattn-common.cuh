@@ -45,6 +45,10 @@ struct ggml_cuda_fattn_dev_len {
     int64_t nb23_2;
     int32_t nb31_2;
     int64_t nb33_2;
+    // per (mask2 stream, query tile): the second source's KV tiles [x, y) that hold a finite mask value for some row of the tile
+    // (flash_attn_src2_ring_range); nullptr: every tile. The tiles outside are fully masked and skipped (a fully masked tile leaves the
+    // softmax state exactly as it is, so the result is the same bits)
+    const int2 * ring_range;
 };
 
 // the stream-k blocks of a launch over ntiles_KV KV tiles (launch_fattn); on the device for a length read there
@@ -720,6 +724,42 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
     }
 }
 
+// k19-fattnq4: the ring tiles a query tile of a two-source node can see: per (mask2 stream blockIdx.y, query tile blockIdx.x of ncols1
+// rows) the first and one past the last KV tile of nbatch_fa cells with a finite mask2 value in any of the tile's rows (< n_queries)
+__launch_bounds__(256, 1)
+static __global__ void flash_attn_src2_ring_range(
+        const half * __restrict__ mask2, int2 * __restrict__ ranges, const int n_kv2, const int ncols1, const int n_queries,
+        const int nbatch_fa, const int64_t s21, const int64_t s23) {
+    ggml_cuda_pdl_sync();
+    __shared__ int lo_s, hi_s;
+    if (threadIdx.x == 0) {
+        lo_s = n_kv2;
+        hi_s = -1;
+    }
+    __syncthreads();
+    const int q0 = blockIdx.x*ncols1;
+    const int q1 = min(q0 + ncols1, n_queries);
+    const half * m = mask2 + blockIdx.y*s23;
+    int lo = n_kv2, hi = -1;
+    for (int q = q0; q < q1; ++q) {
+        for (int i = threadIdx.x; i < n_kv2; i += blockDim.x) {
+            if (!isinf(__half2float(m[q*s21 + i]))) {
+                lo = min(lo, i);
+                hi = max(hi, i);
+            }
+        }
+    }
+    if (lo <= hi) {
+        atomicMin(&lo_s, lo);
+        atomicMax(&hi_s, hi);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        ranges[blockIdx.y*gridDim.x + blockIdx.x] = hi_s < 0 ? make_int2(0, 0) : make_int2(lo_s / nbatch_fa, hi_s / nbatch_fa + 1);
+    }
+    ggml_cuda_pdl_lc();
+}
+
 template <int ncols1>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(
@@ -1172,6 +1212,7 @@ void launch_fattn(
     // k19-fattnq4: the f16 copies of a two-source node's second source, allocated before the buffers below (the pool frees in reverse order)
     ggml_cuda_pool_alloc<half> K2_f16(pool);
     ggml_cuda_pool_alloc<half> V2_f16(pool);
+    ggml_cuda_pool_alloc<int2> ring_range(pool);
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
@@ -1296,6 +1337,20 @@ void launch_fattn(
         src2.nb11_2 = (int32_t) k2nb[0]; src2.nb12_2 = (int32_t) k2nb[1]; src2.nb13_2 = (int64_t) k2nb[2];
         src2.nb21_2 = (int32_t) v2nb[0]; src2.nb22_2 = (int32_t) v2nb[1]; src2.nb23_2 = (int64_t) v2nb[2];
         src2.nb31_2 = (int32_t) M2->nb[1]; src2.nb33_2 = (int64_t) M2->nb[3];
+        // k19-fattnq4: skip the ring tiles a query tile cannot see (GGML_CUDA_FATTN_SRC2_SKIP=0: off), from
+        // GGML_CUDA_FATTN_SRC2_SKIP_MIN_ROWS query rows (default 17: prompt ubatches, where most of the ring is masked per tile)
+        static const bool skip_on = getenv("GGML_CUDA_FATTN_SRC2_SKIP") == nullptr || atoi(getenv("GGML_CUDA_FATTN_SRC2_SKIP")) != 0;
+        static const int64_t skip_min_rows = getenv("GGML_CUDA_FATTN_SRC2_SKIP_MIN_ROWS") ? atoll(getenv("GGML_CUDA_FATTN_SRC2_SKIP_MIN_ROWS")) : 17;
+        if (skip_on && Q->ne[1] >= skip_min_rows && !probe) {
+            const int ntx = (int) ((Q->ne[1] + ncols1 - 1) / ncols1);
+            ring_range.alloc(size_t(ntx) * M2->ne[3]);
+            const dim3 blocks_rr(ntx, M2->ne[3], 1);
+            const ggml_cuda_kernel_launch_params lp_rr(blocks_rr, dim3(256, 1, 1), 0, main_stream);
+            ggml_cuda_kernel_launch(flash_attn_src2_ring_range, lp_rr, (const half *) M2->data, ring_range.ptr, (int) K2->ne[1], ncols1,
+                (int) Q->ne[1], nbatch_fa, (int64_t) (M2->nb[1] / sizeof(half)), (int64_t) (M2->nb[3] / sizeof(half)));
+            CUDA_CHECK(cudaGetLastError());
+            src2.ring_range = ring_range.ptr;
+        }
     }
 
     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);

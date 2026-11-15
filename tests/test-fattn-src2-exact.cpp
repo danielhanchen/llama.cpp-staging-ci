@@ -72,8 +72,8 @@ static std::vector<tcase> cases() {
     }
     // the priority shapes (head size 256, Qwen3.8-27B 24 / 4, Qwen3.6-35B-A3B 16 / 2): verify windows and a prompt ubatch
     for (int n1 : { 8192, 32768 }) {
-        for (int T : { 1, 3, 8, 512 }) {
-            v.push_back({ Q4, Q8, 256, 256, 24, 4, T, n1, 1792, false });
+        for (int T : { 1, 3, 8, 512, 2048 }) {
+            v.push_back({ Q4, Q8, 256, 256, 24, 4, T, n1, n1 == 32768 && T == 2048 ? 3328 : 1792, false });
             v.push_back({ Q4, Q8, 256, 256, 16, 2, T, n1, 1792, false });
         }
     }
@@ -146,11 +146,11 @@ static case_data make_data(const tcase & c, int seed) {
         quant(c.tr, f, rowv, c.n2, d.v2, d.vc, (size_t) rowv*c.n1);
     }
     // positions: body cell j holds position j; the ring holds the last W positions of the body's visible range (slot s -> position
-    // n1 - W + s), W = n2 - 3 (3 empty slots at the end, -inf for everyone), plus every 97th slot masked (a dead slot)
+    // n1 - W + s), W = min(n2 - 3, 1024) (the slots after W empty, -inf for everyone), plus every 97th slot masked (a dead slot)
     const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY), zero = ggml_fp32_to_fp16(0.0f);
     d.m1.assign((size_t) c.n1*c.T, ninf);
     d.m2.assign((size_t) c.n2*c.T, ninf);
-    const int W = c.n2 - 3;
+    const int W = std::min(c.n2 - 3, 1024); // slots W .. n2 - 1 empty (-inf for every row), like a ring with spare capacity
     for (int t = 0; t < c.T; ++t) {
         const int p_max = c.n1 - 1 - (c.T - 1 - t); // causal: row t sees positions <= p_max
         for (int j = 0; j <= p_max && j < c.n1; ++j) {
@@ -353,6 +353,10 @@ int main(int argc, char ** argv) {
         set_env("GGML_CUDA_FATTN_Q8_INPLACE", mode == 2 ? "0" : "1");
         set_env("GGML_CUDA_FATTN_Q4_INPLACE", mode == 2 ? "0" : "1");
         set_env("GGML_CUDA_FATTN_Q8_MODE", mode == 1 ? "1" : "0");
+        // the ring-tile skip (fully masked ring tiles of a query tile) on at every row count in modes 0 / 2, off in mode 1: the three
+        // must agree, and mode 2 with the plain node over the concatenation (which never skips)
+        set_env("GGML_CUDA_FATTN_SRC2_SKIP", mode == 1 ? "0" : "1");
+        set_env("GGML_CUDA_FATTN_SRC2_SKIP_MIN_ROWS", "1");
         if (mode == 2) {
             set_env("FATTN_SRC2_REF", "1");
         }
@@ -392,9 +396,9 @@ int main(int argc, char ** argv) {
         const bool eq_a = outs[0][i][0] == outs[2][i][0] && outs[1][i][0] == outs[2][i][0];
         const bool eq_b = cs[i].T < 2 || outs[2][i][0] == outs[2][i][1];
         n_bad += !(eq_a && eq_b);
-        char tb[96] = "";
+        char tb[160] = "";
         if (times[2][i] > 0.0) {
-            snprintf(tb, sizeof(tb), " | us in place %.1f sync %.1f staged %.1f (%.3fx)", times[0][i], times[1][i], times[2][i], times[0][i]/times[2][i]);
+            snprintf(tb, sizeof(tb), " | us in place+skip %.1f sync noskip %.1f staged+skip %.1f (%.3fx)", times[0][i], times[1][i], times[2][i], times[0][i]/times[2][i]);
         }
         printf("  %s: in place == staged %s, staged == concatenated %s%s%s\n", cs[i].str().c_str(), eq_a ? "yes" : "NO",
             cs[i].T < 2 ? "(1 row: n/a)" : (eq_b ? "yes" : "NO"), tb,
