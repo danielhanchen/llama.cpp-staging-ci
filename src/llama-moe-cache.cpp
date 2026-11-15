@@ -8745,7 +8745,12 @@ struct llama_moe_cache::impl {
         return g4mid_on() && cache_frac >= 0.0 && cache_frac >= lo && cache_frac < hi;
     }
 
-    // k19-bigverify LLAMA_MOE_OVERLAP_PLAIN_MAX=N (default 8, at most GGML_MOE_MAILBOX_MAX_TOKENS; <= 4 = off): verify windows of 5..N tokens
+    // k19-cohfix: default 4 (off); LLAMA_MOE_OVERLAP_PLAIN_MAX=8 restores the k19-bigverify default. Colab G4 Qwen3.8-Flash-Next UD-IQ4_XS
+    // @48 GB, DFlash2 n6, 8k cell with LLAMA_MOE_ROUTE_TAIL_SKIP=0: the last row of a 7-row verify picked " One" where a full-card
+    // reference gives " America" p 0.84 (" One" outside its top 10), in every launch on 3 VMs; with 5..8-row windows off this path the
+    // same window gives " America". The cause is not pinned (CUDA graphs off, GGML_CUDA_GRAPH_CHUNK_SIZE=0 and
+    // GGML_CUDA_MOE_FETCH_OVERLAP_Z=0 also clear it), so the wide overlap stays off until it is (plans/k19_coherence.md)
+    // k19-bigverify LLAMA_MOE_OVERLAP_PLAIN_MAX=N (was default 8, at most GGML_MOE_MAILBOX_MAX_TOKENS; <= 4 = off): verify windows of 5..N tokens
     // whose host path is off (the plain lookup, k19-q4xcache) take the overlap too: their missing experts are copied on the side stream
     // beside the cached ones instead of in the compute stream before any expert of the layer. Windows with the host path on keep the 4-token
     // limit above (DFlash2 7-row windows on the hybrid path: -2.5 / -3.6% at 24 GB, k19-overlap). Same results as the plain lookup (see
@@ -8754,7 +8759,7 @@ struct llama_moe_cache::impl {
     bool overlap_plain_wide(int64_t n_ubatch) const {
         static const int64_t mxp = [] {
             const char * e = getenv("LLAMA_MOE_OVERLAP_PLAIN_MAX");
-            return e != nullptr ? std::max<int64_t>(1, std::min<int64_t>(GGML_MOE_MAILBOX_MAX_TOKENS, atoll(e))) : std::min<int64_t>(GGML_MOE_MAILBOX_MAX_TOKENS, 8);
+            return e != nullptr ? std::max<int64_t>(1, std::min<int64_t>(GGML_MOE_MAILBOX_MAX_TOKENS, atoll(e))) : std::min<int64_t>(GGML_MOE_MAILBOX_MAX_TOKENS, 4);
         }();
         if (n_ubatch > mxp || !overlap_plain_on() || force_large) {
             return false;
