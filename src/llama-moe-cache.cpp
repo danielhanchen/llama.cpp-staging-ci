@@ -18,6 +18,10 @@
 // k19-q4xcache: see ggml.c (declared here so that ggml.h stays unchanged)
 extern "C" { GGML_API void ggml_moe_cache_assign_lookup_counts(struct ggml_tensor * op); }
 extern "C" { GGML_API void ggml_moe_cache_set_core(struct ggml_tensor * op, int32_t n_core); }
+// k19-g4pref: see ggml.c
+extern "C" { GGML_API struct ggml_tensor * ggml_moe_cache_prefetch(struct ggml_context * ctx, struct ggml_tensor * logits, struct ggml_tensor * map,
+        struct ggml_tensor * state, struct ggml_tensor ** banks, const void ** host, int n_banks, int il, int n_top, int max_fill,
+        int n_core, struct ggml_tensor * scores, struct ggml_tensor * dep); }
 
 #include <algorithm>
 #include <atomic>
@@ -26,6 +30,7 @@ extern "C" { GGML_API void ggml_moe_cache_set_core(struct ggml_tensor * op, int3
 #include <mutex>
 #include <thread>
 #include <cinttypes>
+#include <climits>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -8342,6 +8347,7 @@ struct llama_moe_cache::impl {
     // biases (the bias would still be added). LLAMA_MOE_ROUTE_TAIL_SKIP=0: off (the exact path); =N: rank N, also where the default is off.
     // Changes the output (Strata: KL 0.003-0.006, top-1 ~98%, docs/DETAILS.md)
     void tail_skip_init(const llama_model & model, layer_set set) {
+        pf_quiet = model.hparams.no_alloc; // k19-g4pref: the fit's dry instances do not log the prefetch decision
         {
             const char * e       = getenv("LLAMA_MOE_HYBRID_WIDE");
             const char * e_exact = getenv("LLAMA_MTP_EXACT");
@@ -8597,6 +8603,172 @@ struct llama_moe_cache::impl {
     // slots, so it is not frozen)
     bool split_frozen() const {
         return cm && cm_frozen && !cm_frozen_fetch;
+    }
+
+    // k19-g4pref cross-layer prefetch: in decode / verify windows of at most LLAMA_MOE_PREFETCH_MAX_TOKENS (default 8) tokens, a cache
+    // layer whose previous MoE layer is a cache layer on the same device (both on the device lookup) admits, beside the graph, the N
+    // experts with the largest logits of its router run on the previous layer's MoE input, at most MAX per layer and window; its own
+    // lookup waits for those copies. LLAMA_MOE_PREFETCH=N (1..32) on with N (MAX = LLAMA_MOE_PREFETCH_MAX, default 0 = no cap), =0 off.
+    // Unset: on by default (N = 10, MAX = 1, LLAMA_MOE_PREFETCH_MAX still sets MAX; LLAMA_MOE_PREFETCH_MIN_TOKENS: windows of fewer
+    // tokens do not prefetch, default 1) unless LLAMA_MOE_PREFETCH_AUTO=0, which common sets beside an MTP drafter (the Studio MTP n2
+    // shape at depth 4: 48 GB 8k passes 1-5% longer on 5 of 6 prompts, tok/s geomean 0.90; prefetching only 6+ row windows instead cost
+    // DFlash2 6.5% in chat and 3.5% in 8k, its EV-auto rule then picks wider windows), where every device holding cache slots is a CUDA
+    // device of compute capability 12.0 and the cache holds at least LLAMA_MOE_PREFETCH_AUTO_MIN_FRAC (0.60) of the host experts'
+    // bytes, or from LLAMA_MOE_PREFETCH_AUTO_LO_MIN_FRAC (0.10) to less than LLAMA_MOE_PREFETCH_AUTO_LO_FRAC (0.20) of them (N =
+    // LLAMA_MOE_PREFETCH_AUTO_LO, default 0 = not in that band; 10 was measured); 8 GB (3.7% cached, single-token decode) lost 1-3.5%.
+    // The 16 GB band is opt-in: with DFlash2 it passed (below), with the Studio MTP n2 drafter srv_kld long48 put the first token outside
+    // the -fa off band (mean / p99 0.0040 / 0.049 vs 0.0034 / 0.022: the prompt's small tail batch takes the prefetch there). Off in between (32 GB: 41%, chat +7% but 8k -6..-15%) and on other devices (A100 80 GB at 48 GB: level).
+    // 16 GB (15.5% cached), G4: chat level / +4.5% (two VMs), 8k +7.7 / +7.9% (other texts: host path); srv_kld long48 inside the band
+    // (first-token mean / p99 0.0030 / 0.017 vs 0.0044 / 0.022); reference-scored 1 glitch in 5120 tokens vs 3 with it off. 24 GB
+    // (27.1%) is left out: chat level, 8k +5.5..7.6% (other text), but srv_kld long48 put one position above the band's max (0.230 vs
+    // 0.093; first-token stats inside)
+    // Colab G4 (RTX PRO 6000) Qwen3.8-Flash-Next UD-IQ4_XS DFlash2 n6, 3 interleaved launches per arm: N=10 MAX=1 at 48 GB (70.7%
+    // cached) chat 278.4 -> 292.4 and 286.8 -> 303.5 tok/s on two VMs (same 256-token text), 8k 175.2 -> 197.1 (texts vary per launch
+    // there in every arm); 16 GB chat +4.5%, 8k +7.9% (other texts: host path); 32 GB (41%) chat +7..9% but 8k -6..-15% (more 3-row
+    // windows); A100 80 GB at 48 GB level. 78-91% of the prefetched experts are hit by the next layer. srv_kld long48 at 48 GB inside
+    // the -fa off band (first-token mean 0.0002 vs 0.0067), reference-scored texts 0 glitches in 8192 tokens. The text follows the
+    // residency only through the route tail skip and the host path: LLAMA_MOE_ROUTE_TAIL_SKIP=0 gives the same text with it on and off
+    struct pf_cfg_t {
+        int n        = 0;
+        int max_fill = 0;
+        int min_tok  = 1; // windows of fewer tokens do not prefetch
+    };
+    mutable bool     pf_resolved = false;
+    mutable pf_cfg_t pf_cfg;
+    bool             pf_quiet    = false; // a no_alloc (fit) instance: no log
+
+    // the compute capability of the CUDA device of a backend (major*100 + minor*10), -1 if it is not one
+    static int pf_backend_cc(ggml_backend_t backend) {
+        ggml_backend_dev_t dev = backend != nullptr ? ggml_backend_get_device(backend) : nullptr;
+        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto cc_fn = reg != nullptr ? (int (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_compute_capability") : nullptr;
+        return cc_fn != nullptr ? cc_fn(dev) : -1;
+    }
+
+    pf_cfg_t prefetch_cfg() const {
+        if (pf_resolved) {
+            return pf_cfg;
+        }
+        const char * e  = getenv("LLAMA_MOE_PREFETCH");
+        const char * em = getenv("LLAMA_MOE_PREFETCH_MAX");
+        const char * et = getenv("LLAMA_MOE_PREFETCH_MIN_TOKENS");
+        pf_cfg_t c;
+        if (e != nullptr) {
+            c.n        = std::max(0, std::min(32, atoi(e)));
+            c.max_fill = em != nullptr ? std::max(0, atoi(em)) : 0;
+            c.min_tok  = et != nullptr ? std::max(1, atoi(et)) : 1;
+            pf_cfg = c;
+            pf_resolved = true;
+            return c;
+        }
+        if (cache_frac < 0.0) {
+            return c; // the slots are not sized yet: decided later
+        }
+        // (k19-g4pref-optin: the rule only with LLAMA_MOE_PREFETCH_AUTO=1; srv_kld long48 put one position of the 48 GB DFlash2 cell above
+        // the -fa off band's max in 2 of 3 runs, 0.135 / 0.159 vs 0.116, and the 512-token chat texts differ from it off after ~300 tokens)
+        if (const char * ea = getenv("LLAMA_MOE_PREFETCH_AUTO"); ea == nullptr || atoi(ea) == 0) {
+            if (!pf_quiet) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4pref: cross-layer prefetch off by default: LLAMA_MOE_PREFETCH_AUTO=0 (set beside an "
+                    "MTP drafter; LLAMA_MOE_PREFETCH=N on)\n", tag);
+            }
+            pf_cfg = c;
+            pf_resolved = true;
+            return c;
+        }
+        int  cc_min = INT_MAX;
+        int  cc_max = -1;
+        bool any    = false;
+        for (const group & g : groups) {
+            if (g.n_slots == 0 || !g.dev_lookup) {
+                continue;
+            }
+            const int cc = pf_backend_cc(devices[g.id].backend);
+            cc_min = std::min(cc_min, cc);
+            cc_max = std::max(cc_max, cc);
+            any    = true;
+        }
+        const double hi_frac = getenv("LLAMA_MOE_PREFETCH_AUTO_MIN_FRAC") ? atof(getenv("LLAMA_MOE_PREFETCH_AUTO_MIN_FRAC")) : 0.60;
+        const double lo_frac = getenv("LLAMA_MOE_PREFETCH_AUTO_LO_FRAC") ? atof(getenv("LLAMA_MOE_PREFETCH_AUTO_LO_FRAC")) : 0.20;
+        const int    lo_n    = getenv("LLAMA_MOE_PREFETCH_AUTO_LO") ? std::max(0, std::min(32, atoi(getenv("LLAMA_MOE_PREFETCH_AUTO_LO")))) : 0;
+        const double lo_min  = getenv("LLAMA_MOE_PREFETCH_AUTO_LO_MIN_FRAC") ? atof(getenv("LLAMA_MOE_PREFETCH_AUTO_LO_MIN_FRAC")) : 0.10;
+        const bool   cc_ok   = any && cc_min == 1200 && cc_max == 1200;
+        const char * why     = nullptr;
+        if (!any) {
+            why = "no device lookups";
+        } else if (!cc_ok) {
+            why = "not a compute capability 12.0 device";
+        } else if (cache_frac >= hi_frac) {
+            c.n = 10;
+        } else if (lo_n > 0 && cache_frac < lo_frac && cache_frac >= lo_min) {
+            c.n = lo_n;
+        } else {
+            why = lo_n > 0 && cache_frac < lo_min ? "the cached share is below LLAMA_MOE_PREFETCH_AUTO_LO_MIN_FRAC" :
+                  lo_n > 0 ? "the cached share is in the band between LLAMA_MOE_PREFETCH_AUTO_LO_FRAC and _MIN_FRAC"
+                           : "the cached share is below LLAMA_MOE_PREFETCH_AUTO_MIN_FRAC";
+        }
+        if (c.n > 0) {
+            c.max_fill = em != nullptr ? std::max(0, atoi(em)) : 1;
+            c.min_tok  = et != nullptr ? std::max(1, atoi(et)) : 1;
+        }
+        if (!pf_quiet && any) {
+            if (c.n > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4pref: cross-layer prefetch on by default: compute capability 12.0, %.1f%% of the host "
+                    "experts cached: top %d predicted experts per token, at most %d per layer (LLAMA_MOE_PREFETCH=0 off)\n", tag,
+                    100.0*cache_frac, c.n, c.max_fill);
+            } else {
+                LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4pref: cross-layer prefetch off by default: %s (compute capability %d, %.1f%% of the "
+                    "host experts cached; LLAMA_MOE_PREFETCH=N on)\n", tag, why, cc_max, 100.0*cache_frac);
+            }
+        }
+        pf_cfg = c;
+        pf_resolved = true;
+        return c;
+    }
+    mutable uint64_t n_prefetch_ops = 0; // engagement: prefetch ops built
+
+    bool prefetch_ok(int32_t il_prev, int32_t il, int64_t n_ubatch) const {
+        static const int64_t max_tok = getenv("LLAMA_MOE_PREFETCH_MAX_TOKENS") != nullptr ?
+            std::max<int64_t>(1, atoll(getenv("LLAMA_MOE_PREFETCH_MAX_TOKENS"))) : 8;
+        if (force_large || n_ubatch < 1 || n_ubatch > max_tok || n_ubatch > n_small_max || prefetch_cfg().n <= 0 ||
+                n_ubatch < prefetch_cfg().min_tok) {
+            return false;
+        }
+        // (the groups are per expert type, so neighbouring layers are often in different groups; both on the same device)
+        if (il_prev < 0 || il <= il_prev || il >= (int32_t) layers.size() || layers[il].ig < 0 || layers[il_prev].ig < 0) {
+            return false;
+        }
+        const group & g  = groups[layers[il].ig];
+        const group & gp = groups[layers[il_prev].ig];
+        if (g.id != gp.id || !use_device(g, n_ubatch) || !slots_fit(g, n_ubatch) || layers[il].host_dev.size() != g.banks.size() ||
+                !use_device(gp, n_ubatch) || layers[il_prev].host_dev.size() != gp.banks.size()) {
+            return false;
+        }
+        // frozen small batches admit nothing (k13), and the prefetch admits
+        if (cm && cm_frozen) {
+            return false;
+        }
+        return true;
+    }
+
+    ggml_tensor * prefetch(ggml_context * ctx, int32_t il, ggml_tensor * logits, ggml_tensor * dep, int64_t n_ubatch) const {
+        GGML_UNUSED(n_ubatch);
+        const pf_cfg_t cfg = prefetch_cfg();
+        const int max_fill = cfg.max_fill;
+        const int n_top = std::min<int>(cfg.n, (int) logits->ne[0]);
+        if (n_top <= 0 || n_top*logits->ne[1] > 256) {
+            return nullptr;
+        }
+        const layer & l = layers[il];
+        const group & g = groups[l.ig];
+        std::vector<ggml_tensor *> banks = op_banks(g);
+        std::vector<const void *>  host  = l.host_dev;
+        ggml_tensor * op = ggml_moe_cache_prefetch(ctx, logits, g.map, g.state, banks.data(), host.data(), (int) banks.size(), il, n_top,
+            max_fill, g.lru.n_core, g.scores, dep);
+        if (n_prefetch_ops++ == 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4pref: cross-layer prefetch of the top %d predicted experts per token (max %d per layer, "
+                "0 = no cap; LLAMA_MOE_PREFETCH=0 off)\n", tag, n_top, max_fill);
+        }
+        return op;
     }
 
     ggml_tensor * hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res, bool ov) const {
@@ -13864,6 +14036,14 @@ ggml_tensor * llama_moe_cache::hybrid_assign(ggml_context * ctx, int32_t il, ggm
 
 ggml_tensor * llama_moe_cache::hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res, bool overlap) const {
     return pimpl->hybrid_fetch_experts(ctx, il, res, overlap);
+}
+
+bool llama_moe_cache::prefetch_ok(int32_t il_prev, int32_t il, int64_t n_ubatch) const {
+    return pimpl->prefetch_ok(il_prev, il, n_ubatch);
+}
+
+ggml_tensor * llama_moe_cache::prefetch(ggml_context * ctx, int32_t il, ggml_tensor * logits, ggml_tensor * dep, int64_t n_ubatch) const {
+    return pimpl->prefetch(ctx, il, logits, dep, n_ubatch);
 }
 
 bool llama_moe_cache::overlap(int64_t n_ubatch) const {

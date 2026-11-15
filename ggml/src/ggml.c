@@ -3823,6 +3823,55 @@ GGML_API void ggml_moe_cache_set_core(struct ggml_tensor * op, int32_t n_core) {
     }
 }
 
+// k19-g4pref: cross-layer prefetch of a cache layer (il) from a prediction of its routing (logits: F32 [n_expert, n_tokens], e.g. the
+// router of il run on the input of the layer before it). The backend picks the n_top experts with the largest logits of each token,
+// admits the missing ones into the cache as a lookup of those ids would (victims, core, eviction state; no use counters, scores or
+// lookup statistics), at most max_fill per call (0: no cap), and copies them from host memory beside the graph; the next cache op of
+// the backend (the lookup of il) waits for the copies. dep: a tensor computed after every read of the slots by the layers before il
+// (the op runs after it). scores: optional, the decayed counts of the group (victim choice only, not written). Result: I32 [1], unused.
+// (declared by its caller, llama-moe-cache.cpp, so that ggml.h and every file including it stay unchanged)
+GGML_API struct ggml_tensor * ggml_moe_cache_prefetch(struct ggml_context * ctx, struct ggml_tensor * logits, struct ggml_tensor * map,
+        struct ggml_tensor * state, struct ggml_tensor ** banks, const void ** host, int n_banks, int il, int n_top, int max_fill,
+        int n_core, struct ggml_tensor * scores, struct ggml_tensor * dep);
+GGML_API struct ggml_tensor * ggml_moe_cache_prefetch(struct ggml_context * ctx, struct ggml_tensor * logits, struct ggml_tensor * map,
+        struct ggml_tensor * state, struct ggml_tensor ** banks, const void ** host, int n_banks, int il, int n_top, int max_fill,
+        int n_core, struct ggml_tensor * scores, struct ggml_tensor * dep) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32 && ggml_is_contiguous(logits) && logits->ne[2] == 1 && logits->ne[3] == 1);
+    GGML_ASSERT(map->type == GGML_TYPE_I32 && state->type == GGML_TYPE_I32 && ggml_is_contiguous(map) && ggml_is_contiguous(state));
+    GGML_ASSERT(logits->ne[0] == map->ne[0] && il >= 0 && il < map->ne[1]);
+    GGML_ASSERT(n_banks > 0 && n_banks <= 4 && 5 + n_banks <= GGML_MAX_SRC && dep != NULL);
+    GGML_ASSERT(n_top > 0 && n_top <= 32 && max_fill >= 0 && n_core >= 0);
+    GGML_ASSERT(scores == NULL || (scores->type == GGML_TYPE_I32 && ggml_is_contiguous(scores) && ggml_nelements(scores) == ggml_nelements(map)));
+    for (int i = 0; i < n_banks; ++i) {
+        GGML_ASSERT(banks[i]->ne[3] == 1 && ggml_is_contiguous(banks[i]));
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+
+    int32_t params[16] = { il, n_banks };
+    for (int i = 0; i < n_banks; ++i) {
+        memcpy(&params[2 + 2*i], &host[i], sizeof(void *));
+    }
+    params[10] = 8; // prefetch
+    params[11] = n_top;
+    params[12] = max_fill;
+    params[13] = n_core;
+    static_assert(sizeof(params) <= GGML_MAX_OP_PARAMS, "op params too large");
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_CACHE_LOOKUP;
+    result->src[0] = logits;
+    result->src[1] = map;
+    result->src[2] = state;
+    for (int i = 0; i < n_banks; ++i) {
+        result->src[3 + i] = banks[i];
+    }
+    result->src[3 + n_banks] = dep;
+    result->src[4 + n_banks] = scores;
+
+    return result;
+}
+
 void ggml_moe_cache_assign_freeze(struct ggml_tensor * op) {
     GGML_ASSERT(op->op == GGML_OP_MOE_CACHE_LOOKUP && ggml_get_op_params_i32(op, 10) == 1);
     ggml_set_op_params_i32(op, 15, 1);
