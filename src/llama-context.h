@@ -1049,8 +1049,24 @@ private:
             fn(nextn_hold_ud);
         }
     }
+    // k19-q4x262 (llama_set_nextn_hold_free): a drafter pass outside this context that only the frees of the drafter's buffers wait for
+    void (*nextn_hold_free_fn)(void *) = nullptr;
+    void * nextn_hold_free_ud = nullptr;
+    // before this context frees an MTP drafter's compute buffers or device weights: both holds
+    void nextn_hold_wait_free() {
+        nextn_hold_wait();
+        if (nextn_hold_free_fn != nullptr) {
+            auto * fn = nextn_hold_free_fn;
+            nextn_hold_free_fn = nullptr;
+            const int64_t t0 = ggml_time_us();
+            fn(nextn_hold_free_ud);
+            nextn_hold_free_log((ggml_time_us() - t0)/1e3);
+        }
+    }
+    void nextn_hold_free_log(double ms);
 public:
     void set_nextn_hold(void (*fn)(void *), void * ud) { nextn_hold_fn = fn; nextn_hold_ud = ud; }
+    void set_nextn_hold_free(void (*fn)(void *), void * ud) { nextn_hold_free_fn = fn; nextn_hold_free_ud = ud; }
 private:
 
     // keep copies of the per-sequence memory on the device

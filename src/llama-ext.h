@@ -329,6 +329,11 @@ LLAMA_API float * llama_get_embeddings_nextn_early(struct llama_context * ctx);
 // reorders or frees its next-n rows, or frees an MTP drafter's compute buffers (a reader of the rows outside the context, e.g. a drafter's
 // prompt pass on another thread, is waited for there). nullptr clears it. Not thread-safe: set it from the thread that decodes
 LLAMA_API void llama_set_nextn_hold(struct llama_context * ctx, void (*fn)(void *), void * user_data);
+// k19-q4x262: as llama_set_nextn_hold, but fn(user_data) is called only before the context frees an MTP drafter's compute buffers or
+// device weights (MoE cache banks coming back after a released prompt, the decode extension, a layer-major group's drafter release /
+// lend), not before it writes its own next-n rows: a drafter pass on another thread beside a short decode of this context (whose rows
+// are stashed) ends before the buffers it computes in go. nullptr clears it. Not thread-safe: set it from the thread that decodes
+LLAMA_API void llama_set_nextn_hold_free(struct llama_context * ctx, void (*fn)(void *), void * user_data);
 
 // kdp (LLAMA_MTP_DRAFT_LEND): maps the device weights of a drafter context's model back if a layer-major group of its target borrowed
 // their memory (same addresses, copied back from pinned host memory); a no-op otherwise. false: no device memory for them
