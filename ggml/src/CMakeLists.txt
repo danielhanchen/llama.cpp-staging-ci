@@ -197,6 +197,7 @@ add_library(ggml-base
             ../include/ggml-opt.h
             ../include/gguf.h
             ../include/ggml-moe-prefetch.h
+            ../include/ggml-sel-mask.h
             ggml.c
             ggml.cpp
             ggml-alloc.c
