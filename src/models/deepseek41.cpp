@@ -670,9 +670,10 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                         score->op_params[0] = (int32_t) bs;
                         // logged at powers of two (the first graphs may be built while --fit silences the log)
                         static int64_t n_cs = 0;
-                        if ((++n_cs & (n_cs - 1)) == 0) {
+                        const int64_t k_cs = ++n_cs; // read once: ++n_cs and n_cs in one expression is unsequenced
+                        if ((k_cs & (k_cs - 1)) == 0) {
                             LLAMA_LOG_INFO("%s: DeepSeek-V4.1 candidate scoring (graph %lld): layer %d indexer scores %lld candidate blocks x %lld "
-                                    "of %lld rows (LLAMA_DSV41_CAND_SCORE=0 off)\n", __func__, (long long) n_cs, il, (long long) bsel->ne[0],
+                                    "of %lld rows (LLAMA_DSV41_CAND_SCORE=0 off)\n", __func__, (long long) k_cs, il, (long long) bsel->ne[0],
                                     (long long) bs, (long long) n_comp);
                         }
                     }
