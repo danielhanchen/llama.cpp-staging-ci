@@ -3084,6 +3084,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // k19-int3fix2: the verify graphs a server prewarms beside a drafter (counted by the fits that carry a draft model or MTP heads): up
     // to 3 sampler chains (greedy, masked greedy, top-k) x the verify widths 1 .. n_max + 1 (see common_fit_set_prewarm_graphs)
     common_fit_set_prewarm_graphs(params.warmup ? 3*(std::max(1, common_speculative_n_max(&params.speculative)) + 1) : 0);
+    // k19-l4gap2: the verify window's rows for the disk-tier k19-placemid ubatch (common/fit.cpp)
+    common_fit_set_verify_rows(common_speculative_n_max(&params.speculative) + 1);
     // k19-uma: the parameters as given, for the launch again without a MoE cache (see below)
     const common_params params_given = params;
     bool uma_no_cache = false;
