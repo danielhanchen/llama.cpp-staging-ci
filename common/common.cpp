@@ -1384,6 +1384,14 @@ uint64_t common_moe_expert_bytes(const std::string & path) {
     return common_moe_slot_bytes_of(path, sb) ? (uint64_t) sb.total : 0;
 }
 
+double common_moe_cache_tokens(const std::string & path, uint64_t cache_bytes) {
+    common_moe_slot_bytes sb;
+    if (!common_moe_slot_bytes_of(path, sb) || sb.n_used <= 0 || sb.n_layer <= 0 || sb.sum <= 0) {
+        return -1.0;
+    }
+    return (double) cache_bytes/((double) sb.n_layer*(double) sb.n_used*(double) sb.sum);
+}
+
 // n_ubatch of the draft context of speculative decoding (an MTP context or a draft model) for a target context at n_ubatch u: the MoE
 // cache rules grow the target's n_ubatch so that a prompt uploads the experts it misses fewer times (common_moe_cache_auto_ubatch).
 // The draft gains nothing from that (a draft model's weights are on the device or never uploaded per ubatch, an MTP context processes

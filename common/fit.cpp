@@ -1836,23 +1836,32 @@ static void common_params_fit_impl(
                 static const bool placemid_on = getenv("LLAMA_FIT_PLACEMID") == nullptr || atoi(getenv("LLAMA_FIT_PLACEMID")) != 0;
                 static const double placemid_min_frac = getenv("LLAMA_FIT_PLACEMID_MIN_FRAC") != nullptr ?
                     std::max(0.0, atof(getenv("LLAMA_FIT_PLACEMID_MIN_FRAC"))) : 0.10;
-                // k19-l4gap (LLAMA_FIT_PLACEMID_DISK=1: on there too): not where the host experts do not fit in RAM (more than 0.8 of the
-                // available memory, the disk prefetch rule of llama_context::disk_prefetch_init, and the file not on a memory file system).
-                // The short prompts that k19-placemid runs as ubatches of up to 31 tokens exceed the few tokens the cache serves there (4 / 7
-                // on an L4 at 12 / 16 GB), so their expert products run on the CPU from the mapping, whose pages the disk serves at its random
-                // read rate; with the compute buffers kept a prompt ubatch copies its routed experts from the RAM tier instead. Colab L4,
-                // Qwen3.8-Flash-Next UD-IQ4_XS from the VM disk (57.6 GB of experts, 51 GB of RAM) + MTP n2, chat after the 640-token
-                // request (plans/k19_l4gap.md)
+                // k19-l4gap (LLAMA_FIT_PLACEMID_DISK=1: on there too): not on a disk tier whose cache holds the experts of fewer than
+                // LLAMA_FIT_PLACEMID_DISK_MIN_TOKENS (4, the RAM tier's device minimum, LLAMA_MOE_HOST_MIN_TOKENS) tokens before the growth:
+                // the host experts do not fit in RAM (more than 0.8 of the available memory, the rule of llama_context::disk_prefetch_init,
+                // the file not on a memory file system), the RAM tier goes inclusive either way, and the short prompts that k19-placemid
+                // runs as ubatches of up to 31 tokens exceed the few tokens the device lookups serve (4 there), so their expert products run
+                // on the CPU from the mapping, whose pages the disk serves at its read rate. With the compute buffers kept a prompt ubatch
+                // copies its routed experts from the RAM tier instead. Colab L4, Qwen3.8-Flash-Next UD-IQ4_XS from the VM disk (57.6 GB of
+                // experts, 51 GB of RAM) + MTP n2, the 42-token chat after the 640-token request (plans/k19_l4gap.md): 12 GB (cache 2256 ->
+                // 4173 MiB, 2.1 -> 3.9 tokens) chat TTFT 31.9 -> 18.3 s, decode level, the 640-token request 152 -> 115 s; at 16 GB (6.0
+                // tokens before the growth) the same change left the chat TTFT level (12.5 vs 12.8 s) and cost 13% of the decode, so it
+                // stays there
                 static const bool placemid_disk = getenv("LLAMA_FIT_PLACEMID_DISK") != nullptr && atoi(getenv("LLAMA_FIT_PLACEMID_DISK")) != 0;
+                static const double placemid_disk_tokens = getenv("LLAMA_FIT_PLACEMID_DISK_MIN_TOKENS") != nullptr ?
+                    std::max(0.0, atof(getenv("LLAMA_FIT_PLACEMID_DISK_MIN_TOKENS"))) : 4.0;
                 bool placemid_ram = true;
                 if (!placemid_disk && placemid_on && cparams->moe_cache_size > 0) {
-                    const uint64_t exp_b = common_moe_expert_bytes(path_model);
-                    const uint64_t avail = llama_available_memory();
-                    if (exp_b > 0 && avail > 0 && (double) exp_b > 0.8*(double) avail && !common_fit_file_in_ram_fs(path_model)) {
+                    const uint64_t exp_b  = common_moe_expert_bytes(path_model);
+                    const uint64_t avail  = llama_available_memory();
+                    const double   tokens = common_moe_cache_tokens(path_model, cparams->moe_cache_size);
+                    if (exp_b > 0 && avail > 0 && (double) exp_b > 0.8*(double) avail && tokens >= 0.0 && tokens < placemid_disk_tokens &&
+                            !common_fit_file_in_ram_fs(path_model)) {
                         placemid_ram = false;
-                        LOG_INF("%s: k19-l4gap: no k19-placemid: %.0f MiB of host experts do not fit in %.0f MiB of available RAM (the misses of "
-                            "short prompt ubatches would be read from the disk by the CPU; LLAMA_FIT_PLACEMID_DISK=1: on anyway)\n", __func__,
-                            exp_b/1048576.0, avail/1048576.0);
+                        LOG_INF("%s: k19-l4gap: no k19-placemid: %.0f MiB of host experts do not fit in %.0f MiB of available RAM and the cache of "
+                            "%zu MiB holds the experts of %.1f tokens (below %.1f): short prompts keep one ubatch that copies its experts from the "
+                            "RAM tier (LLAMA_FIT_PLACEMID_DISK=1: on anyway)\n", __func__, exp_b/1048576.0, avail/1048576.0,
+                            cparams->moe_cache_size/MiB, tokens, placemid_disk_tokens);
                     }
                 }
                 if (!g_small_device && nd == 1 && placemid_on && placemid_ram && common_fit_place8_on() && cparams->moe_cache_size > 0 &&
