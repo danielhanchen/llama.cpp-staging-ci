@@ -3487,6 +3487,12 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 static bool ggml_backend_cuda_fa_kv_len(void) {
     return true;
 }
+
+// k19-fattnq4 (proc "ggml_backend_fa_src2"): two-source flash attention (ggml_flash_attn_ext_set_src2) on the MMA kernel, NVIDIA Turing
+// and newer; supports_op answers per node (fattn.cu ggml_cuda_fattn_src2_supported)
+static bool ggml_backend_cuda_fa_src2(void) {
+    return true;
+}
 #endif
 
 // k15-fn: the host -> device uploads of n tensors (offset 0, whole size given) as one cudaMemcpyBatchAsync on the backend's stream, in
@@ -13039,6 +13045,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     // k19-graph: flash attention reads its KV length (ggml_flash_attn_ext_set_kv_len) at the bits of the unpadded node (fattn.cu)
     if (strcmp(name, "ggml_backend_fa_kv_len") == 0) {
         return (void *)ggml_backend_cuda_fa_kv_len;
+    }
+    // k19-fattnq4: two-source flash attention (see ggml_backend_cuda_fa_src2)
+    if (strcmp(name, "ggml_backend_fa_src2") == 0) {
+        static const bool enabled = getenv("GGML_CUDA_FATTN_SRC2") == nullptr || atoi(getenv("GGML_CUDA_FATTN_SRC2")) != 0;
+        return enabled ? (void *)ggml_backend_cuda_fa_src2 : nullptr;
     }
 #endif
     if (strcmp(name, "ggml_backend_host_pin_range") == 0) {

@@ -3842,6 +3842,10 @@ struct ggml_cplan ggml_graph_plan(
                         size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
 
                         cur += MAX(prefill, decode);
+                        // k19-kvwin: the second converted Q of a two-source node (one per thread, the row loop's scratch)
+                        if (node->src[6] != NULL) {
+                            cur += sizeof(float)*n_tasks*(2*DK + 2*DV + CACHE_LINE_SIZE_F32);
+                        }
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {
