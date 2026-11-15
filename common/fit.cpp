@@ -18,6 +18,10 @@
 #include <string>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/vfs.h>
+#endif
+
 // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
 // enum to identify part of a layer for distributing its tensors:
 enum common_layer_fraction_t {
@@ -136,6 +140,20 @@ static bool g_place8 = false;
 
 bool common_fit_place8() {
     return g_place8;
+}
+
+// whether the model file lives on a memory file system (tmpfs / ramfs, Linux): its pages are in RAM whatever the available memory reads
+static bool common_fit_file_in_ram_fs(const std::string & path) {
+#if defined(__linux__)
+    struct statfs sfs;
+    if (statfs(path.c_str(), &sfs) == 0) {
+        const unsigned long t = (unsigned long) sfs.f_type;
+        return t == 0x01021994UL || t == 0x858458f6UL; // TMPFS_MAGIC, RAMFS_MAGIC
+    }
+#else
+    GGML_UNUSED(path);
+#endif
+    return false;
 }
 
 static bool common_fit_place8_on() {
@@ -1818,7 +1836,26 @@ static void common_params_fit_impl(
                 static const bool placemid_on = getenv("LLAMA_FIT_PLACEMID") == nullptr || atoi(getenv("LLAMA_FIT_PLACEMID")) != 0;
                 static const double placemid_min_frac = getenv("LLAMA_FIT_PLACEMID_MIN_FRAC") != nullptr ?
                     std::max(0.0, atof(getenv("LLAMA_FIT_PLACEMID_MIN_FRAC"))) : 0.10;
-                if (!g_small_device && nd == 1 && placemid_on && common_fit_place8_on() && cparams->moe_cache_size > 0 &&
+                // k19-l4gap (LLAMA_FIT_PLACEMID_DISK=1: on there too): not where the host experts do not fit in RAM (more than 0.8 of the
+                // available memory, the disk prefetch rule of llama_context::disk_prefetch_init, and the file not on a memory file system).
+                // The short prompts that k19-placemid runs as ubatches of up to 31 tokens exceed the few tokens the cache serves there (4 / 7
+                // on an L4 at 12 / 16 GB), so their expert products run on the CPU from the mapping, whose pages the disk serves at its random
+                // read rate; with the compute buffers kept a prompt ubatch copies its routed experts from the RAM tier instead. Colab L4,
+                // Qwen3.8-Flash-Next UD-IQ4_XS from the VM disk (57.6 GB of experts, 51 GB of RAM) + MTP n2, chat after the 640-token
+                // request (plans/k19_l4gap.md)
+                static const bool placemid_disk = getenv("LLAMA_FIT_PLACEMID_DISK") != nullptr && atoi(getenv("LLAMA_FIT_PLACEMID_DISK")) != 0;
+                bool placemid_ram = true;
+                if (!placemid_disk && placemid_on && cparams->moe_cache_size > 0) {
+                    const uint64_t exp_b = common_moe_expert_bytes(path_model);
+                    const uint64_t avail = llama_available_memory();
+                    if (exp_b > 0 && avail > 0 && (double) exp_b > 0.8*(double) avail && !common_fit_file_in_ram_fs(path_model)) {
+                        placemid_ram = false;
+                        LOG_INF("%s: k19-l4gap: no k19-placemid: %.0f MiB of host experts do not fit in %.0f MiB of available RAM (the misses of "
+                            "short prompt ubatches would be read from the disk by the CPU; LLAMA_FIT_PLACEMID_DISK=1: on anyway)\n", __func__,
+                            exp_b/1048576.0, avail/1048576.0);
+                    }
+                }
+                if (!g_small_device && nd == 1 && placemid_on && placemid_ram && common_fit_place8_on() && cparams->moe_cache_size > 0 &&
                         cparams->n_ubatch > common_fit_place8_ub()) {
                     const uint32_t ub_full = cparams->n_ubatch;
                     const uint32_t ub_rel  = common_fit_place8_ub();
