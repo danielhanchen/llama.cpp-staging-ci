@@ -6052,6 +6052,26 @@ void ggml_flash_attn_ext_set_kv_len(
     a->src[5] = kv_len;
 }
 
+void ggml_flash_attn_ext_set_src2(
+        struct ggml_tensor * a,
+        struct ggml_tensor * k2,
+        struct ggml_tensor * v2,
+        struct ggml_tensor * mask2) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    if (!k2) {
+        a->src[6] = NULL;
+        a->src[7] = NULL;
+        a->src[8] = NULL;
+        return;
+    }
+    GGML_ASSERT(v2 && mask2 && mask2->type == GGML_TYPE_F16);
+    GGML_ASSERT(k2->ne[0] == a->src[1]->ne[0] && v2->ne[0] == a->src[2]->ne[0] && k2->ne[1] == v2->ne[1] && mask2->ne[0] == k2->ne[1]);
+    GGML_ASSERT(k2->ne[2] == a->src[1]->ne[2] && v2->ne[2] == a->src[2]->ne[2]);
+    a->src[6] = k2;
+    a->src[7] = v2;
+    a->src[8] = mask2;
+}
+
 void ggml_flash_attn_ext_kv_len_set_host(
         struct ggml_tensor * kv_len,
         int32_t              n) {

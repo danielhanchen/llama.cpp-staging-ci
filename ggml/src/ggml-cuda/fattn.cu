@@ -359,7 +359,7 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     const bool    prefer   = dst->op_params[5] == 1;
     const int64_t min_kv = min_kv_env >= 0 ? min_kv_env : prefer ? 2*(int64_t) n_kv_max : std::max<int64_t>(4096, 2*n_gather);
 
-    return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && dst->src[6] == nullptr &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
         K->ne[1] >= min_kv;
@@ -420,6 +420,55 @@ int ggml_cuda_flash_attn_ext_mma_kvq_inplace(const int device, const ggml_tensor
 
 bool ggml_cuda_flash_attn_ext_mma_q8_inplace(const int device, const ggml_tensor * dst) {
     return ggml_cuda_flash_attn_ext_mma_kvq_inplace(device, dst, true) != 0;
+}
+
+// k19-fattnq4: a two-source node (ggml_flash_attn_ext_set_src2) is read in place when its body is (ggml_cuda_flash_attn_ext_mma_kvq_inplace:
+// q4_0 / q4_0 or q8_0 / q8_0, the row limits, alignment) and its ring is q8_0 / q8_0 with 4 byte aligned rows: the compiled
+// combinations (fattn-mma-f16.cuh). Returns code1 | code2 << 8 (type bits | 1), 0 = both staged to f16
+int ggml_cuda_flash_attn_ext_src2_codes(const int device, const ggml_tensor * dst, const bool for_alloc) {
+    const ggml_tensor * K2 = dst->src[6];
+    const ggml_tensor * V2 = dst->src[7];
+    if (K2 == nullptr) {
+        return 0;
+    }
+    const int code1 = ggml_cuda_flash_attn_ext_mma_kvq_inplace(device, dst, for_alloc);
+    if (code1 == 0 || ((code1 & 12) != 12 && (code1 & 12) != 0) || K2->type != GGML_TYPE_Q8_0 || V2->type != GGML_TYPE_Q8_0) {
+        return 0;
+    }
+    for (const ggml_tensor * t : {K2, V2}) {
+        if (t->nb[0] != ggml_type_size(t->type) || t->nb[1] % 4 != 0 || t->nb[2] % 4 != 0 || t->nb[3] % 4 != 0 ||
+                t->nb[1] > INT32_MAX || t->nb[2] > INT32_MAX || (uintptr_t) t->view_offs % 4 != 0) {
+            return 0;
+        }
+    }
+    return code1 | (1 << 8);
+}
+
+// k19-fattnq4: a two-source node this backend can run: NVIDIA Turing+ (the MMA kernel), head sizes 64 / 128 / 256 (K = V) or the
+// MLA 576 / 512, no logit softcap, the second source of supported K / V types with whole 256-cell tiles, its mask F16 shaped like the
+// first's. GGML_CUDA_FATTN_SRC2=0: unsupported (the graph's generic form)
+static bool ggml_cuda_fattn_src2_supported(const int cc, const ggml_tensor * dst) {
+    static const bool enabled = getenv("GGML_CUDA_FATTN_SRC2") == nullptr || atoi(getenv("GGML_CUDA_FATTN_SRC2")) != 0;
+    const ggml_tensor * K  = dst->src[1];
+    const ggml_tensor * V  = dst->src[2];
+    const ggml_tensor * M  = dst->src[3];
+    const ggml_tensor * K2 = dst->src[6];
+    const ggml_tensor * V2 = dst->src[7];
+    const ggml_tensor * M2 = dst->src[8];
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    const bool hs_ok = (K->ne[0] == V->ne[0] && (K->ne[0] == 64 || K->ne[0] == 128 || K->ne[0] == 256)) || (K->ne[0] == 576 && V->ne[0] == 512);
+    const auto type_ok = [](const ggml_type t) {
+        return t == GGML_TYPE_F16 || t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1 || t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q5_1 ||
+            t == GGML_TYPE_Q8_0 || t == GGML_TYPE_BF16;
+    };
+    return enabled && GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && hs_ok && logit_softcap == 0.0f &&
+        V2 != nullptr && M2 != nullptr && M != nullptr && M2->type == GGML_TYPE_F16 &&
+        type_ok(K2->type) && type_ok(V2->type) && K2->ne[0] == K->ne[0] && V2->ne[0] == V->ne[0] &&
+        K2->ne[1] == V2->ne[1] && K2->ne[1] > 0 && K2->ne[1] % FATTN_KQ_STRIDE == 0 && K2->ne[2] == K->ne[2] && V2->ne[2] == V->ne[2] &&
+        K2->ne[3] == K->ne[3] && V2->ne[3] == V->ne[3] &&
+        K2->nb[0] == ggml_type_size(K2->type) && V2->nb[0] == ggml_type_size(V2->type) &&
+        M2->ne[0] == K2->ne[1] && M2->ne[1] == M->ne[1] && M2->ne[2] == 1 && M2->ne[3] == M->ne[3] && M2->nb[0] == sizeof(half);
 }
 
 template <int DKQ, int DV, int ncols2>
@@ -900,6 +949,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
+    // k19-fattnq4: a two-source node runs on the MMA kernel only
+    if (dst->src[6] != nullptr) {
+        if (!ggml_cuda_fattn_src2_supported(ggml_cuda_info().devices[device].cc, dst)) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        if (K->ne[0] == 576 && !gqa_opt_applies) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
@@ -1011,7 +1071,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             // k19-fattnq8: no f16 copy when the kernel reads q8_0 K / V in place (k19-fattnq4: or q4_0)
-            need_f16_K = ggml_cuda_flash_attn_ext_mma_kvq_inplace(device, dst, true) == 0;
+            need_f16_K = dst->src[6] != nullptr ? ggml_cuda_flash_attn_ext_src2_codes(device, dst, true) == 0 :
+                ggml_cuda_flash_attn_ext_mma_kvq_inplace(device, dst, true) == 0;
             need_f16_V = need_f16_K;
             break;
         case BEST_FATTN_KERNEL_VEC: {
@@ -1118,7 +1179,8 @@ static ggml_cuda_fattn_kvl_plan ggml_cuda_fattn_kvl_get_plan(ggml_backend_cuda_c
     const ggml_tensor * V = dst->src[2];
     const ggml_tensor * M = dst->src[3];
     const int64_t n_kv = ggml_cuda_fattn_kv_len_host(dst);
-    if (!enabled || (dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT)) {
+    // (k19-fattnq4: a two-source node takes the first source's live length as a constant)
+    if (!enabled || (dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) || dst->src[6] != nullptr) {
         plan.mode = GGML_CUDA_FATTN_KVL_LIVE;
         plan.sig  = (int64_t(GGML_CUDA_FATTN_KVL_LIVE) << 56) ^ n_kv;
         return plan;
@@ -1208,7 +1270,8 @@ static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, g
     // the node of that query alone gets. The vector kernel at one column per block takes all of them in one launch with the KV
     // split of a single query; any other kernel runs once per query
     const ggml_tensor * Q = dst->src[0];
-    if ((dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) && Q->ne[1] > 1) {
+    // (k19-fattnq4: not a two-source node, which takes the ordinary MMA launch below: correct, not split per query)
+    if ((dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) && Q->ne[1] > 1 && dst->src[6] == nullptr) {
         const ggml_tensor * mask = dst->src[3];
         ggml_tensor q1 = *Q;
         q1.ne[1] = 1;
