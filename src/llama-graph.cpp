@@ -175,6 +175,23 @@ static bool kv_win_can_reuse(const llm_graph_kv_win & w, const llama_kv_cache_co
            w.mask->ne[3] == n_stream_ub;
 }
 
+// k19-kvwin: whether the device that holds the ring (the node's second source) takes this two-source flash attention node
+static bool kv_win_src2_supported(const ggml_tensor * node) {
+    const ggml_tensor * k2 = node->src[6];
+    while (k2 != nullptr && k2->view_src != nullptr) {
+        k2 = k2->view_src;
+    }
+    if (k2 == nullptr || k2->buffer == nullptr) {
+        return false;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(k2->buffer);
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr && buft == ggml_backend_cpu_buffer_type()) {
+        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
+    return dev != nullptr && ggml_backend_dev_supports_op(dev, node);
+}
+
 // impl
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
@@ -3733,32 +3750,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         const llm_graph_attn_src2 * src2) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
-    // k19-kvwin: a second KV source (the recent-window ring). Without the two-source flash attention on the device (stopgap): one
-    // plain node over the cells of both, concatenated in F16 (cast through F32, which every backend converts from the cache types)
-    ggml_tensor * k2 = nullptr;
-    ggml_tensor * v2 = nullptr;
-    ggml_tensor * m2 = nullptr;
-    if (src2 != nullptr && src2->k != nullptr) {
+    // k19-kvwin: a second KV source (the recent-window ring): one two-source flash attention node where the device takes it, else
+    // (stopgap) one plain node over the cells of both, concatenated in F16 (cast through F32, which every backend converts from the
+    // cache types). Decided at the node (kv_win_src2_node below)
+    const bool has_src2 = src2 != nullptr && src2->k != nullptr;
+    if (has_src2) {
         GGML_ASSERT(!v_trans && cparams.flash_attn && kq_b == nullptr && kq_mask != nullptr);
-        if (src2->fused) {
-            k2 = src2->k;
-            v2 = src2->v;
-            m2 = src2->mask;
-        } else {
-            const auto cat = [&](ggml_tensor * a, ggml_tensor * b) {
-                a = ggml_cast(ctx0, a, GGML_TYPE_F32);
-                b = ggml_cast(ctx0, b, GGML_TYPE_F32);
-                return ggml_cast(ctx0, ggml_concat(ctx0, a, b, 2), GGML_TYPE_F16);
-            };
-            k = cat(k, src2->k);
-            v = cat(v, src2->v);
-            kq_mask = ggml_concat(ctx0, kq_mask, src2->mask, 0);
-            // a sparse bound counts the finite entries of a row: the ring's are added
-            if (n_kv_max > 0) {
-                n_kv_max += src2->mask->ne[0];
-            }
-            cb(k, "kv_win_k", il);
-        }
     }
 
     // split the batch into streams if needed
@@ -3798,7 +3795,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // would see, so the backend picks the single query kernel and the KV split of that decode for every row
         const int64_t n_q = q->ne[1];
         // (k19-kvwin: not with a second KV source: the rows read every cell of both)
-        if (cparams.batch_invariant && !(src2 != nullptr && src2->k != nullptr) && n_q > 1 && n_stream == 1 && kq_mask != nullptr && kq_mask->ne[1] == n_q &&
+        if (cparams.batch_invariant && !has_src2 && n_q > 1 && n_stream == 1 && kq_mask != nullptr && kq_mask->ne[1] == n_q &&
                 ubatch.pos != nullptr && (int64_t) ubatch.n_tokens == n_q) {
             const int64_t n_kv = k->ne[1];
             // k15-fv: consecutive queries over the same cells share one attention node (LLAMA_EXACT_FA_GROUP=0: one per query); the
@@ -3855,21 +3852,48 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 cur = cur ? ggml_concat(ctx0, cur, o_i, 2) : o_i;
             }
         } else {
-            cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
-                                      hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            const auto make_fa = [&](ggml_tensor * k_, ggml_tensor * v_, ggml_tensor * m_, int64_t n_kv_max_) {
+                ggml_tensor * t = ggml_flash_attn_ext(ctx0, q, k_, v_, m_, kq_scale, hparams.f_max_alibi_bias,
+                                          hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+                ggml_flash_attn_ext_add_sinks(t, sinks);
+                ggml_flash_attn_ext_set_n_kv_max(t, static_cast<int32_t>(n_kv_max_));
+                ggml_prec_set_acc(t, GGML_PREC_F32);
+                // k19-graph: the live cells of a bucketed n_kv, read on the device (the K / V views of the attention input's cache)
+                if (res->t_kv_len && k_->ne[1] == res->t_kv_len_n_kv && m_ && m_->ne[0] == k_->ne[1]) {
+                    ggml_flash_attn_ext_set_kv_len(t, res->t_kv_len);
+                }
+                return t;
+            };
+            cur = nullptr;
+            if (has_src2) {
+                ggml_tensor * k2 = ggml_permute(ctx0, src2->k, 0, 2, 1, 3);
+                ggml_tensor * v2 = ggml_permute(ctx0, src2->v, 0, 2, 1, 3);
+                // k19-kvwin: the ring as the second source of the same node, where the device that holds it takes the node
+                if (src2->fused) {
+                    cur = make_fa(k, v, kq_mask, n_kv_max);
+                    ggml_flash_attn_ext_set_src2(cur, k2, v2, src2->mask);
+                    if (!kv_win_src2_supported(cur)) {
+                        static std::atomic<bool> logged { false };
+                        if (!logged.exchange(true)) {
+                            LLAMA_LOG_WARN("%s: k19-kvwin: the device does not take this two-source attention node: concat stopgap\n", __func__);
+                        }
+                        cur = nullptr;
+                    }
+                }
+                if (cur == nullptr) {
+                    const auto cat = [&](ggml_tensor * a, ggml_tensor * b) {
+                        a = ggml_cast(ctx0, a, GGML_TYPE_F32);
+                        b = ggml_cast(ctx0, b, GGML_TYPE_F32);
+                        return ggml_cast(ctx0, ggml_concat(ctx0, a, b, 1), GGML_TYPE_F16);
+                    };
+                    // a sparse bound counts the finite entries of a row: the ring's are added
+                    cur = make_fa(cat(k, k2), cat(v, v2), ggml_concat(ctx0, kq_mask, src2->mask, 0),
+                            n_kv_max > 0 ? n_kv_max + src2->mask->ne[0] : 0);
+                }
+            } else {
+                cur = make_fa(k, v, kq_mask, n_kv_max);
+            }
             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
-
-            ggml_flash_attn_ext_add_sinks(cur, sinks);
-            ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
-            ggml_prec_set_acc(cur, GGML_PREC_F32);
-            // k19-graph: the live cells of a bucketed n_kv, read on the device (the K / V views of the attention input's cache)
-            if (res->t_kv_len && k->ne[1] == res->t_kv_len_n_kv && kq_mask && kq_mask->ne[0] == k->ne[1]) {
-                ggml_flash_attn_ext_set_kv_len(cur, res->t_kv_len);
-            }
-            // k19-kvwin: the ring as the second source of the same node
-            if (k2 != nullptr) {
-                ggml_flash_attn_ext_set_src2(cur, ggml_permute(ctx0, k2, 0, 2, 1, 3), ggml_permute(ctx0, v2, 0, 2, 1, 3), m2);
-            }
         }
 
         if (v_mla) {
