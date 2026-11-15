@@ -30,6 +30,7 @@ extern "C" { GGML_API struct ggml_tensor * ggml_moe_cache_prefetch(struct ggml_c
 #include <mutex>
 #include <thread>
 #include <cinttypes>
+#include <climits>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -8346,6 +8347,7 @@ struct llama_moe_cache::impl {
     // biases (the bias would still be added). LLAMA_MOE_ROUTE_TAIL_SKIP=0: off (the exact path); =N: rank N, also where the default is off.
     // Changes the output (Strata: KL 0.003-0.006, top-1 ~98%, docs/DETAILS.md)
     void tail_skip_init(const llama_model & model, layer_set set) {
+        pf_quiet = model.hparams.no_alloc; // k19-g4pref: the fit's dry instances do not log the prefetch decision
         {
             const char * e       = getenv("LLAMA_MOE_HYBRID_WIDE");
             const char * e_exact = getenv("LLAMA_MTP_EXACT");
@@ -8603,29 +8605,105 @@ struct llama_moe_cache::impl {
         return cm && cm_frozen && !cm_frozen_fetch;
     }
 
-    // k19-g4pref cross-layer prefetch. LLAMA_MOE_PREFETCH=N (1..32; unset / 0 = off): in decode / verify windows of at most
-    // LLAMA_MOE_PREFETCH_MAX_TOKENS (default 8) tokens, a cache layer whose previous MoE layer is a cache layer on the same device (both
-    // on the device lookup) admits, beside the graph, the N experts with the largest logits of its router run on the previous layer's
-    // MoE input, at most LLAMA_MOE_PREFETCH_MAX (default 0 = no cap) per layer and window; its own lookup waits for those copies.
+    // k19-g4pref cross-layer prefetch: in decode / verify windows of at most LLAMA_MOE_PREFETCH_MAX_TOKENS (default 8) tokens, a cache
+    // layer whose previous MoE layer is a cache layer on the same device (both on the device lookup) admits, beside the graph, the N
+    // experts with the largest logits of its router run on the previous layer's MoE input, at most MAX per layer and window; its own
+    // lookup waits for those copies. LLAMA_MOE_PREFETCH=N (1..32) on with N (MAX = LLAMA_MOE_PREFETCH_MAX, default 0 = no cap), =0 off.
+    // Unset: on by default (N = 10, MAX = 1, LLAMA_MOE_PREFETCH_MAX still sets MAX) where every device holding cache slots is a CUDA
+    // device of compute capability 12.0 and the cache holds at least LLAMA_MOE_PREFETCH_AUTO_MIN_FRAC (0.60) of the host experts'
+    // bytes; with LLAMA_MOE_PREFETCH_AUTO_LO=N also below LLAMA_MOE_PREFETCH_AUTO_LO_FRAC (0.35) with that N (MAX 1). Off in between
+    // and on other devices.
     // Colab G4 (RTX PRO 6000) Qwen3.8-Flash-Next UD-IQ4_XS DFlash2 n6, 3 interleaved launches per arm: N=10 MAX=1 at 48 GB (70.7%
     // cached) chat 278.4 -> 292.4 and 286.8 -> 303.5 tok/s on two VMs (same 256-token text), 8k 175.2 -> 197.1 (texts vary per launch
-    // there in every arm); 16 GB chat +4.5%, 8k +7.9% (other texts: host path); 32 GB chat +7..9% but 8k -6..-15% (more 3-row windows);
-    // A100 80 GB at 48 GB level. 78-91% of the prefetched experts are hit by the next layer. srv_kld long48 at 48 GB inside the -fa off
-    // band (first-token mean 0.0002 vs 0.0067). The text follows the residency only through the route tail skip and the host path:
-    // LLAMA_MOE_ROUTE_TAIL_SKIP=0 gives the same text with it on and off. Opt-in until a per-tier default is decided
-    static int prefetch_n() {
-        static const int n = [] {
-            const char * e = getenv("LLAMA_MOE_PREFETCH");
-            return e != nullptr ? std::max(0, std::min(32, atoi(e))) : 0;
-        }();
-        return n;
+    // there in every arm); 16 GB chat +4.5%, 8k +7.9% (other texts: host path); 32 GB (41%) chat +7..9% but 8k -6..-15% (more 3-row
+    // windows); A100 80 GB at 48 GB level. 78-91% of the prefetched experts are hit by the next layer. srv_kld long48 at 48 GB inside
+    // the -fa off band (first-token mean 0.0002 vs 0.0067), reference-scored texts 0 glitches in 8192 tokens. The text follows the
+    // residency only through the route tail skip and the host path: LLAMA_MOE_ROUTE_TAIL_SKIP=0 gives the same text with it on and off
+    struct pf_cfg_t {
+        int n        = 0;
+        int max_fill = 0;
+    };
+    mutable bool     pf_resolved = false;
+    mutable pf_cfg_t pf_cfg;
+    bool             pf_quiet    = false; // a no_alloc (fit) instance: no log
+
+    // the compute capability of the CUDA device of a backend (major*100 + minor*10), -1 if it is not one
+    static int pf_backend_cc(ggml_backend_t backend) {
+        ggml_backend_dev_t dev = backend != nullptr ? ggml_backend_get_device(backend) : nullptr;
+        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto cc_fn = reg != nullptr ? (int (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_compute_capability") : nullptr;
+        return cc_fn != nullptr ? cc_fn(dev) : -1;
+    }
+
+    pf_cfg_t prefetch_cfg() const {
+        if (pf_resolved) {
+            return pf_cfg;
+        }
+        const char * e  = getenv("LLAMA_MOE_PREFETCH");
+        const char * em = getenv("LLAMA_MOE_PREFETCH_MAX");
+        pf_cfg_t c;
+        if (e != nullptr) {
+            c.n        = std::max(0, std::min(32, atoi(e)));
+            c.max_fill = em != nullptr ? std::max(0, atoi(em)) : 0;
+            pf_cfg = c;
+            pf_resolved = true;
+            return c;
+        }
+        if (cache_frac < 0.0) {
+            return c; // the slots are not sized yet: decided later
+        }
+        int  cc_min = INT_MAX;
+        int  cc_max = -1;
+        bool any    = false;
+        for (const group & g : groups) {
+            if (g.n_slots == 0 || !g.dev_lookup) {
+                continue;
+            }
+            const int cc = pf_backend_cc(devices[g.id].backend);
+            cc_min = std::min(cc_min, cc);
+            cc_max = std::max(cc_max, cc);
+            any    = true;
+        }
+        const double hi_frac = getenv("LLAMA_MOE_PREFETCH_AUTO_MIN_FRAC") ? atof(getenv("LLAMA_MOE_PREFETCH_AUTO_MIN_FRAC")) : 0.60;
+        const double lo_frac = getenv("LLAMA_MOE_PREFETCH_AUTO_LO_FRAC") ? atof(getenv("LLAMA_MOE_PREFETCH_AUTO_LO_FRAC")) : 0.35;
+        const int    lo_n    = getenv("LLAMA_MOE_PREFETCH_AUTO_LO") ? std::max(0, std::min(32, atoi(getenv("LLAMA_MOE_PREFETCH_AUTO_LO")))) : 0;
+        const bool   cc_ok   = any && cc_min == 1200 && cc_max == 1200;
+        const char * why     = nullptr;
+        if (!any) {
+            why = "no device lookups";
+        } else if (!cc_ok) {
+            why = "not a compute capability 12.0 device";
+        } else if (cache_frac >= hi_frac) {
+            c.n = 10;
+        } else if (lo_n > 0 && cache_frac < lo_frac) {
+            c.n = lo_n;
+        } else {
+            why = lo_n > 0 ? "the cached share is in the band between LLAMA_MOE_PREFETCH_AUTO_LO_FRAC and _MIN_FRAC"
+                           : "the cached share is below LLAMA_MOE_PREFETCH_AUTO_MIN_FRAC";
+        }
+        if (c.n > 0) {
+            c.max_fill = em != nullptr ? std::max(0, atoi(em)) : 1;
+        }
+        if (!pf_quiet && any) {
+            if (c.n > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4pref: cross-layer prefetch on by default: compute capability 12.0, %.1f%% of the host "
+                    "experts cached: top %d predicted experts per token, at most %d per layer (LLAMA_MOE_PREFETCH=0 off)\n", tag,
+                    100.0*cache_frac, c.n, c.max_fill);
+            } else {
+                LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4pref: cross-layer prefetch off by default: %s (compute capability %d, %.1f%% of the "
+                    "host experts cached; LLAMA_MOE_PREFETCH=N on)\n", tag, why, cc_max, 100.0*cache_frac);
+            }
+        }
+        pf_cfg = c;
+        pf_resolved = true;
+        return c;
     }
     mutable uint64_t n_prefetch_ops = 0; // engagement: prefetch ops built
 
     bool prefetch_ok(int32_t il_prev, int32_t il, int64_t n_ubatch) const {
         static const int64_t max_tok = getenv("LLAMA_MOE_PREFETCH_MAX_TOKENS") != nullptr ?
             std::max<int64_t>(1, atoll(getenv("LLAMA_MOE_PREFETCH_MAX_TOKENS"))) : 8;
-        if (prefetch_n() <= 0 || force_large || n_ubatch < 1 || n_ubatch > max_tok || n_ubatch > n_small_max) {
+        if (force_large || n_ubatch < 1 || n_ubatch > max_tok || n_ubatch > n_small_max || prefetch_cfg().n <= 0) {
             return false;
         }
         // (the groups are per expert type, so neighbouring layers are often in different groups; both on the same device)
@@ -8647,8 +8725,9 @@ struct llama_moe_cache::impl {
 
     ggml_tensor * prefetch(ggml_context * ctx, int32_t il, ggml_tensor * logits, ggml_tensor * dep, int64_t n_ubatch) const {
         GGML_UNUSED(n_ubatch);
-        static const int max_fill = getenv("LLAMA_MOE_PREFETCH_MAX") != nullptr ? std::max(0, atoi(getenv("LLAMA_MOE_PREFETCH_MAX"))) : 0;
-        const int n_top = std::min<int>(prefetch_n(), (int) logits->ne[0]);
+        const pf_cfg_t cfg = prefetch_cfg();
+        const int max_fill = cfg.max_fill;
+        const int n_top = std::min<int>(cfg.n, (int) logits->ne[0]);
         if (n_top <= 0 || n_top*logits->ne[1] > 256) {
             return nullptr;
         }

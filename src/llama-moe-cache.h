@@ -93,7 +93,7 @@ public:
     ggml_tensor * hybrid_assign(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch, bool & host) const;
     ggml_tensor * hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res, bool overlap) const;
 
-    // k19-g4pref cross-layer prefetch (LLAMA_MOE_PREFETCH=N, unset / 0 = off): whether a window of n_ubatch tokens prefetches layer il
+    // k19-g4pref cross-layer prefetch (LLAMA_MOE_PREFETCH=N on, 0 off, unset: the default rule, see the impl): whether a window of n_ubatch tokens prefetches layer il
     // (il_prev: the cache layer before it, whose lookup is in the same graph, on the same device), and the op (see ggml_moe_cache_prefetch) that
     // admits the experts of the N largest logits of each token (a prediction of layer il's routing) and copies them beside the graph,
     // after dep; nullptr where it does not apply
