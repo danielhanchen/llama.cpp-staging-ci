@@ -11,7 +11,7 @@
 //   shift     probe with a context shift (seq_rm + seq_add) == plain q8_0 doing the same, bit for bit
 //   multiseq  two sequences in a unified cache, W 32: each equals its own run alone (within the tolerance)
 //   stopgap   LLAMA_KV_WIN_FUSED=0 (the concat graph) ~= the two-source node (cosine)
-// usage: test-kv-win --models DIR [--only NAME]
+// usage: test-kv-win --models DIR [--only NAME] [--ngl N]
 
 #include "llama.h"
 
@@ -155,6 +155,10 @@ static double cosine(const std::vector<float> & a, const std::vector<float> & b)
     return ab/sqrt(aa*bb + 1e-30);
 }
 
+// --ngl N: layers on the GPU. There the bit-for-bit checks against a plain cache become tolerance checks (the stopgap or the
+// two-source kernel and the plain kernels differ in staging and split); rollback / state stay bit for bit (same shapes, same kernels)
+static int g_ngl = 0;
+
 static int n_fail = 0;
 static int n_pass = 0;
 
@@ -276,7 +280,7 @@ static std::vector<float> run_multi(llama_model * model, const cfg & c, const st
 
 static void test_model(const std::string & path, const std::string & name) {
     auto mp = llama_model_default_params();
-    mp.n_gpu_layers = 0;
+    mp.n_gpu_layers = g_ngl;
     llama_model * model = llama_model_load_from_file(path.c_str(), mp);
     if (model == nullptr) {
         report(name.c_str(), "load", false, path.c_str());
@@ -320,8 +324,9 @@ static void test_model(const std::string & path, const std::string & name) {
     }
     {
         const auto r = run_plain(model, probe, prompt, dec);
-        snprintf(buf, sizeof(buf), "max rel %.3g vs q8_0", max_rel(r, r_q8));
-        report(name.c_str(), "probe", bits_equal(r, r_q8), buf);
+        const double gap = max_rel(r_q4, r_q8);
+        snprintf(buf, sizeof(buf), "max rel %.3g vs q8_0 (q4_0 vs q8_0 %.3g)", max_rel(r, r_q8), gap);
+        report(name.c_str(), "probe", g_ngl > 0 ? max_rel(r, r_q8) < std::max(2e-3, 0.3*gap) : bits_equal(r, r_q8), buf);
     }
     {
         const auto r = run_plain(model, ctrl, prompt, dec);
@@ -332,7 +337,7 @@ static void test_model(const std::string & path, const std::string & name) {
             }
         }
         snprintf(buf, sizeof(buf), "max rel %.3g vs q4_0", max_rel(r, r_q4));
-        report(name.c_str(), "control", bits_equal(r, r_q4), buf);
+        report(name.c_str(), "control", g_ngl > 0 ? max_rel(r, r_q4) < std::max(2e-3, 0.3*max_rel(r_q4, r_q8)) : bits_equal(r, r_q4), buf);
     }
     {
         const auto r = run_plain(model, route, prompt, dec);
@@ -377,7 +382,7 @@ static void test_model(const std::string & path, const std::string & name) {
         const auto b = run_shift(model, q8, prompt, dec);
         snprintf(buf, sizeof(buf), "max rel %.3g vs q8_0", max_rel(a, b));
         const bool can_shift = !a.empty() || !b.empty();
-        report(name.c_str(), "shift", !can_shift || bits_equal(a, b), can_shift ? buf : "no K-shift for this model (skipped)");
+        report(name.c_str(), "shift", !can_shift || (g_ngl > 0 ? max_rel(a, b) < 2e-3 : bits_equal(a, b)), can_shift ? buf : "no K-shift for this model (skipped)");
     }
     {
         std::mt19937 g3(9);
@@ -412,6 +417,8 @@ int main(int argc, char ** argv) {
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--models") == 0 && i + 1 < argc) {
             dir = argv[++i];
+        } else if (strcmp(argv[i], "--ngl") == 0 && i + 1 < argc) {
+            g_ngl = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--only") == 0 && i + 1 < argc) {
             only = argv[++i];
         }

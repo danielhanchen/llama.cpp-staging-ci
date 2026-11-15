@@ -18,6 +18,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 
 static ggml_type kv_win_type_from_name(const char * name, ggml_type def) {
     for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
@@ -380,6 +381,27 @@ void llama_kv_cache::set_input_win(ggml_tensor * idxs, ggml_tensor * mask, ggml_
     if (mask == nullptr || mask->buffer == nullptr) {
         return;
     }
+    // LLAMA_KV_WIN_PROF=1: the host time of the ring masks, logged every 256 calls
+    static const bool prof = getenv("LLAMA_KV_WIN_PROF") != nullptr && atoi(getenv("LLAMA_KV_WIN_PROF")) != 0;
+    const int64_t t0 = prof ? ggml_time_us() : 0;
+    struct prof_guard {
+        int64_t t0;
+        uint32_t n;
+        ~prof_guard() {
+            if (t0 == 0) {
+                return;
+            }
+            static std::atomic<int64_t> us { 0 };
+            static std::atomic<int64_t> rows { 0 };
+            static std::atomic<int64_t> calls { 0 };
+            us += ggml_time_us() - t0;
+            rows += n;
+            if (++calls % 256 == 0 || n >= 512) {
+                LLAMA_LOG_INFO("k19-kvwin prof: %lld mask builds, %lld rows, %.3f ms total, %.2f us per row\n", (long long) calls.load(),
+                        (long long) rows.load(), us.load()/1e3, (double) us.load()/std::max<int64_t>(1, rows.load()));
+            }
+        }
+    } pg { t0, n_tokens };
     GGML_ASSERT(ggml_backend_buffer_is_host(mask->buffer));
     GGML_ASSERT(mask->type == GGML_TYPE_F16 && mask->ne[0] == (int64_t) win_r);
 
@@ -389,10 +411,10 @@ void llama_kv_cache::set_input_win(ggml_tensor * idxs, ggml_tensor * mask, ggml_
 
     const ggml_fp16_t f16_ninf = ggml_fp32_to_fp16(-INFINITY);
     ggml_fp16_t * G = (ggml_fp16_t *) mask->data;
-    std::fill(G, G + ggml_nelements(mask), f16_ninf);
 
     // no body mask (a graph that stores K / V without attending): nothing reads the ring mask
     if (kq_mask == nullptr || kq_mask->buffer == nullptr) {
+        std::fill(G, G + ggml_nelements(mask), f16_ninf);
         return;
     }
     GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask->buffer) && kq_mask->type == GGML_TYPE_F16);
@@ -425,29 +447,58 @@ void llama_kv_cache::set_input_win(ggml_tensor * idxs, ggml_tensor * mask, ggml_
         // the sinks: a prefix of the sorted entries
         const auto it_s = std::lower_bound(ents.begin(), ents.end(), (llama_pos) win.n_sinks, [](const entry & e, llama_pos v) { return e.pos < v; });
 
-        for (int64_t ii = 0; ii < n_tps; ++ii) {
-            const int64_t   i = s*n_tps + ii;
-            const llama_pos p = ubatch->pos[i];
-            ggml_fp16_t * Bi = B + i*n_kv;
-            ggml_fp16_t * Gi = G + i*win_r;
+        // rows [ii0, ii1) of this stream; each row writes only its own ring and body rows
+        const auto rows = [&](int64_t ii0, int64_t ii1, uint64_t & moved) {
+            for (int64_t ii = ii0; ii < ii1; ++ii) {
+                const int64_t   i = s*n_tps + ii;
+                const llama_pos p = ubatch->pos[i];
+                ggml_fp16_t * Bi = B + i*n_kv;
+                ggml_fp16_t * Gi = G + i*win_r;
+                std::fill(Gi, Gi + win_r, f16_ninf);
 
-            const auto move = [&](const entry & e) {
-                const ggml_fp16_t v = Bi[e.cell];
-                if (v == f16_ninf) {
-                    return;
+                const auto move = [&](const entry & e) {
+                    const ggml_fp16_t v = Bi[e.cell];
+                    if (v == f16_ninf) {
+                        return;
+                    }
+                    Gi[e.slot] = v;
+                    Bi[e.cell] = f16_ninf;
+                    ++moved;
+                };
+                for (auto it = ents.begin(); it != it_s; ++it) {
+                    move(*it);
                 }
-                Gi[e.slot] = v;
-                Bi[e.cell] = f16_ninf;
-                ++n_moved;
-            };
-            for (auto it = ents.begin(); it != it_s; ++it) {
-                move(*it);
+                // the window (p - W, p]
+                const llama_pos lo_w = (llama_pos) std::max<int64_t>((int64_t) p - win.n_win + 1, win.n_sinks);
+                auto it = std::lower_bound(it_s, ents.end(), lo_w, [](const entry & e, llama_pos v) { return e.pos < v; });
+                for (; it != ents.end() && it->pos <= p; ++it) {
+                    move(*it);
+                }
             }
-            // the window (p - W, p]
-            const llama_pos lo_w = (llama_pos) std::max<int64_t>((int64_t) p - win.n_win + 1, win.n_sinks);
-            auto it = std::lower_bound(it_s, ents.end(), lo_w, [](const entry & e, llama_pos v) { return e.pos < v; });
-            for (; it != ents.end() && it->pos <= p; ++it) {
-                move(*it);
+        };
+        // prompt ubatches on up to 8 threads (LLAMA_KV_WIN_THREADS)
+        static const int max_threads = [] {
+            const char * e = getenv("LLAMA_KV_WIN_THREADS");
+            return e != nullptr ? std::max(1, atoi(e)) : (int) std::max(1u, std::min(8u, std::thread::hardware_concurrency()/2));
+        }();
+        const int64_t n_thr = n_tps >= 256 ? std::min<int64_t>(max_threads, n_tps/128) : 1;
+        if (n_thr <= 1) {
+            rows(0, n_tps, n_moved);
+        } else {
+            std::vector<std::thread> workers;
+            std::vector<uint64_t> moved(n_thr, 0);
+            const int64_t chunk = (n_tps + n_thr - 1)/n_thr;
+            for (int64_t t = 1; t < n_thr; ++t) {
+                const int64_t ii0 = std::min(n_tps, t*chunk);
+                const int64_t ii1 = std::min(n_tps, ii0 + chunk);
+                workers.emplace_back([&rows, &moved, ii0, ii1, t]() { rows(ii0, ii1, moved[t]); });
+            }
+            rows(0, std::min(n_tps, chunk), moved[0]);
+            for (auto & w : workers) {
+                w.join();
+            }
+            for (uint64_t m : moved) {
+                n_moved += m;
             }
         }
     }
