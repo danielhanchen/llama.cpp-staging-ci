@@ -8664,7 +8664,9 @@ struct llama_moe_cache::impl {
         if (cache_frac < 0.0) {
             return c; // the slots are not sized yet: decided later
         }
-        if (const char * ea = getenv("LLAMA_MOE_PREFETCH_AUTO"); ea != nullptr && atoi(ea) == 0) {
+        // (k19-g4pref-optin: the rule only with LLAMA_MOE_PREFETCH_AUTO=1; srv_kld long48 put one position of the 48 GB DFlash2 cell above
+        // the -fa off band's max in 2 of 3 runs, 0.135 / 0.159 vs 0.116, and the 512-token chat texts differ from it off after ~300 tokens)
+        if (const char * ea = getenv("LLAMA_MOE_PREFETCH_AUTO"); ea == nullptr || atoi(ea) == 0) {
             if (!pf_quiet) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4pref: cross-layer prefetch off by default: LLAMA_MOE_PREFETCH_AUTO=0 (set beside an "
                     "MTP drafter; LLAMA_MOE_PREFETCH=N on)\n", tag);
