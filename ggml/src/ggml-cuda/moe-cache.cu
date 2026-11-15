@@ -891,10 +891,91 @@ static __global__ void moe_cache_seed_fill(const int32_t * __restrict__ plan, co
     }
 }
 
+#define MOE_PF_MAX_IDS 256 // k19-g4pref: predicted ids per prefetch (see moe_pf_run)
+
+bool ggml_cuda_moe_cache_lookup_supported(const ggml_tensor * op) {
+    const int mode    = ggml_get_op_params_i32(op, 10);
+    const int n_banks = ggml_get_op_params_i32(op, 1);
+    if (mode == 4) {
+        const int n_expert   = (int) op->src[1]->ne[0];
+        const int n_seed_max = ggml_get_op_params_i32(op, 2);
+        return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 && op->src[2]->type == GGML_TYPE_I32 &&
+            (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_I32) &&
+            (size_t) (n_expert + 3*n_seed_max + MOE_SEED_THREADS)*sizeof(int32_t) <= 48*1024;
+    }
+    if (mode == 5) {
+        return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->op == GGML_OP_MUL_MAT_ID;
+    }
+    if (mode == 8) {
+        const int n_expert = (int) op->src[1]->ne[0];
+        return n_banks >= 1 && n_banks <= 4 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I32 &&
+            op->src[2]->type == GGML_TYPE_I32 && op->src[0]->ne[0] == n_expert && (size_t) n_expert*sizeof(float) <= 48*1024 &&
+            ggml_get_op_params_i32(op, 11)*op->src[0]->ne[1] <= MOE_PF_MAX_IDS;
+    }
+    if (mode == 6 || mode == 7) {
+#if defined(MOE_MAILBOX_OK)
+        if (mode == 6) {
+            return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[1] <= GGML_MOE_MAILBOX_MAX_TOKENS;
+        }
+        return op->src[0]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32;
+#else
+        return false;
+#endif
+    }
+    if (mode == 1) {
+        return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 && op->src[2]->type == GGML_TYPE_I32 &&
+            op->src[3]->type == GGML_TYPE_I32 && ggml_nelements(op->src[0]) <= 4096 &&
+            (op->src[4] == nullptr || op->src[4]->type == GGML_TYPE_I32);
+    }
+    if (mode == 2) {
+        return n_banks >= 1 && n_banks <= 4 && op->src[0]->type == GGML_TYPE_I32;
+    }
+    if (mode == 3) {
+        return op->src[0]->type == GGML_TYPE_I32;
+    }
+    if (mode != 0 || n_banks < 1 || n_banks > 4) {
+        return false;
+    }
+    const int64_t n_ids = ggml_nelements(op->src[0]);
+    const ggml_tensor * scores = op->src[3 + n_banks];
+    return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 && op->src[2]->type == GGML_TYPE_I32 &&
+        n_ids <= 4096 && (scores == nullptr || scores->type == GGML_TYPE_I32);
+}
+
+// max_z > 0: at most max_z blocks per expert and bank (each copies several chunks), so that an overlapped fetch, which mostly waits
+// for host memory, leaves the SMs to the kernels that run beside it
+static void moe_cache_fetch_launch(cudaStream_t stream, const ggml_tensor * dst, const ggml_tensor * const * banks, const int n_banks, const int32_t * info, const int n_ids, const int ne0,
+        const int max_z = 0, int32_t * admitted = nullptr) {
+    moe_cache_fetch_args args = {};
+    int64_t max_nb = 0;
+    for (int b = 0; b < n_banks; ++b) {
+        const ggml_tensor * bank = banks[b];
+        memcpy(&args.src[b], (const int32_t *) dst->op_params + 2 + 2*b, sizeof(void *));
+        args.dst[b] = (char *) bank->data;
+        args.nb[b]  = bank->nb[2];
+        max_nb = std::max(max_nb, (int64_t) bank->nb[2]);
+    }
+
+    // GGML_CUDA_MOE_FETCH_CHUNK: bytes per block of the copies (default 64 KiB); smaller chunks put more blocks, and so more host
+    // memory reads, in flight at once (the copy is the same, only the split of the work changes)
+    static const int64_t chunk_env = [] {
+        const char * env = getenv("GGML_CUDA_MOE_FETCH_CHUNK");
+        const int64_t v = env != nullptr ? atoll(env) : 0;
+        return v >= 4096 ? (v/4096)*4096 : (int64_t) 64*1024;
+    }();
+    const int64_t chunk = max_z > 0 ? (int64_t) 64*1024 : chunk_env;
+    int64_t n_z = (max_nb + chunk - 1)/chunk;
+    if (max_z > 0) {
+        n_z = std::min<int64_t>(n_z, max_z);
+    }
+    const dim3 grid(n_ids, n_banks, (unsigned) std::max<int64_t>(n_z, 1));
+    moe_cache_fetch<<<grid, 256, 0, stream>>>(info, n_ids, ne0, args, chunk, admitted);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // k19-g4pref: the n_top experts with the largest logits of each token (ties: the lower expert id, NaN read as -inf), rank-major:
 // ids[r*n_tokens + t] is the expert of rank r of token t, so the assign meets every token's first choices before any second one
 #define MOE_PF_THREADS 256
-#define MOE_PF_MAX_IDS 256
 static __global__ void moe_pf_topn(const float * __restrict__ logits, const int n_expert, const int n_top, const int n_tokens,
         int32_t * __restrict__ ids) {
     extern __shared__ float pf_v[]; // [n_expert]
@@ -1098,86 +1179,6 @@ static void moe_pf_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     CUDA_CHECK(cudaEventRecord(ctx.moe_join, side));
     ctx.moe_join_pending = true;
     p.pending = true;
-}
-
-bool ggml_cuda_moe_cache_lookup_supported(const ggml_tensor * op) {
-    const int mode    = ggml_get_op_params_i32(op, 10);
-    const int n_banks = ggml_get_op_params_i32(op, 1);
-    if (mode == 4) {
-        const int n_expert   = (int) op->src[1]->ne[0];
-        const int n_seed_max = ggml_get_op_params_i32(op, 2);
-        return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 && op->src[2]->type == GGML_TYPE_I32 &&
-            (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_I32) &&
-            (size_t) (n_expert + 3*n_seed_max + MOE_SEED_THREADS)*sizeof(int32_t) <= 48*1024;
-    }
-    if (mode == 5) {
-        return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->op == GGML_OP_MUL_MAT_ID;
-    }
-    if (mode == 8) {
-        const int n_expert = (int) op->src[1]->ne[0];
-        return n_banks >= 1 && n_banks <= 4 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I32 &&
-            op->src[2]->type == GGML_TYPE_I32 && op->src[0]->ne[0] == n_expert && (size_t) n_expert*sizeof(float) <= 48*1024 &&
-            ggml_get_op_params_i32(op, 11)*op->src[0]->ne[1] <= MOE_PF_MAX_IDS;
-    }
-    if (mode == 6 || mode == 7) {
-#if defined(MOE_MAILBOX_OK)
-        if (mode == 6) {
-            return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[1] <= GGML_MOE_MAILBOX_MAX_TOKENS;
-        }
-        return op->src[0]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32;
-#else
-        return false;
-#endif
-    }
-    if (mode == 1) {
-        return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 && op->src[2]->type == GGML_TYPE_I32 &&
-            op->src[3]->type == GGML_TYPE_I32 && ggml_nelements(op->src[0]) <= 4096 &&
-            (op->src[4] == nullptr || op->src[4]->type == GGML_TYPE_I32);
-    }
-    if (mode == 2) {
-        return n_banks >= 1 && n_banks <= 4 && op->src[0]->type == GGML_TYPE_I32;
-    }
-    if (mode == 3) {
-        return op->src[0]->type == GGML_TYPE_I32;
-    }
-    if (mode != 0 || n_banks < 1 || n_banks > 4) {
-        return false;
-    }
-    const int64_t n_ids = ggml_nelements(op->src[0]);
-    const ggml_tensor * scores = op->src[3 + n_banks];
-    return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 && op->src[2]->type == GGML_TYPE_I32 &&
-        n_ids <= 4096 && (scores == nullptr || scores->type == GGML_TYPE_I32);
-}
-
-// max_z > 0: at most max_z blocks per expert and bank (each copies several chunks), so that an overlapped fetch, which mostly waits
-// for host memory, leaves the SMs to the kernels that run beside it
-static void moe_cache_fetch_launch(cudaStream_t stream, const ggml_tensor * dst, const ggml_tensor * const * banks, const int n_banks, const int32_t * info, const int n_ids, const int ne0,
-        const int max_z = 0, int32_t * admitted = nullptr) {
-    moe_cache_fetch_args args = {};
-    int64_t max_nb = 0;
-    for (int b = 0; b < n_banks; ++b) {
-        const ggml_tensor * bank = banks[b];
-        memcpy(&args.src[b], (const int32_t *) dst->op_params + 2 + 2*b, sizeof(void *));
-        args.dst[b] = (char *) bank->data;
-        args.nb[b]  = bank->nb[2];
-        max_nb = std::max(max_nb, (int64_t) bank->nb[2]);
-    }
-
-    // GGML_CUDA_MOE_FETCH_CHUNK: bytes per block of the copies (default 64 KiB); smaller chunks put more blocks, and so more host
-    // memory reads, in flight at once (the copy is the same, only the split of the work changes)
-    static const int64_t chunk_env = [] {
-        const char * env = getenv("GGML_CUDA_MOE_FETCH_CHUNK");
-        const int64_t v = env != nullptr ? atoll(env) : 0;
-        return v >= 4096 ? (v/4096)*4096 : (int64_t) 64*1024;
-    }();
-    const int64_t chunk = max_z > 0 ? (int64_t) 64*1024 : chunk_env;
-    int64_t n_z = (max_nb + chunk - 1)/chunk;
-    if (max_z > 0) {
-        n_z = std::min<int64_t>(n_z, max_z);
-    }
-    const dim3 grid(n_ids, n_banks, (unsigned) std::max<int64_t>(n_z, 1));
-    moe_cache_fetch<<<grid, 256, 0, stream>>>(info, n_ids, ne0, args, chunk, admitted);
-    CUDA_CHECK(cudaGetLastError());
 }
 
 // single-graph host misses (k11, see ggml_moe_mailbox_publish): flags of the mapped mailbox at system scope
