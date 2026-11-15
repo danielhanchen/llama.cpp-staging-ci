@@ -1169,6 +1169,9 @@ void launch_fattn(
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
 
+    // k19-fattnq4: the f16 copies of a two-source node's second source, allocated before the buffers below (the pool frees in reverse order)
+    ggml_cuda_pool_alloc<half> K2_f16(pool);
+    ggml_cuda_pool_alloc<half> V2_f16(pool);
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
@@ -1252,8 +1255,6 @@ void launch_fattn(
     const ggml_tensor * K2 = dst->src[6];
     const ggml_tensor * V2 = dst->src[7];
     const ggml_tensor * M2 = dst->src[8];
-    ggml_cuda_pool_alloc<half> K2_f16(pool);
-    ggml_cuda_pool_alloc<half> V2_f16(pool);
     ggml_cuda_fattn_dev_len src2 = {};
     if (K2 != nullptr) {
         GGML_ASSERT(V2 != nullptr && M2 != nullptr && M2->type == GGML_TYPE_F16 && !use_sparse);
