@@ -51,6 +51,9 @@
 #endif
 #include <windows.h>
 #endif
+#if defined(__linux__)
+#include <sys/vfs.h>
+#endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
@@ -93,6 +96,21 @@ static uint64_t tpp_gguf_bytes(const std::string & path) {
     }
     const auto b = std::filesystem::file_size(path, ec);
     return ec ? 0 : (uint64_t) b;
+}
+
+// k19-fnmtp2: true if a file lives on a memory file system (tmpfs / ramfs on Linux): its pages are host memory that MemAvailable does
+// not count as available, so a model staged there is resident though the available memory reads lower than its size
+static bool tpp_file_in_ram_fs(const std::string & path) {
+#if defined(__linux__)
+    struct statfs st;
+    if (path.empty() || statfs(path.c_str(), &st) != 0) {
+        return false;
+    }
+    return (unsigned long) st.f_type == 0x01021994ul || (unsigned long) st.f_type == 0x858458f6ul; // TMPFS_MAGIC, RAMFS_MAGIC
+#else
+    (void) path;
+    return false;
+#endif
 }
 
 // k19-bigverify: bytes of the GGUF's per-layer token embedding table (per_layer_token_embd.weight), an input-layer GET_ROWS table that
@@ -2179,22 +2197,18 @@ private:
             const bool fits_all = (ce != nullptr && atoi(ce) != 0) || !cache_expected;
             // LLAMA_SPEC_TPP=1 forces past the device rule, not the MoE cache rule
             const bool on = (e != nullptr ? atoi(e) != 0 : dev_ok) && fits_all;
-            // k19-fnmtp (opt-in, LLAMA_SPEC_DEPTH_CACHED=N drafts, N = 3..8; unset / 0: off): beside a MoE cache an MTP drafter of its own
+            // k19-fnmtp (LLAMA_SPEC_DEPTH_CACHED=N drafts, N = 3..8; 0: off; unset: the k19-fnmtp2 default below): beside a MoE cache an MTP drafter of its own
             // (-md) drafts N in every window below LLAMA_SPEC_DEPTH_POS (12288), the windows from there are k19-tpp's priced ones (2, a 3rd
             // where it pays at the cache's cost ratio). The 4-row windows then get the verify tag (LLAMA_SPEC_VERIFY4_CACHED=1 is set unless
             // given), so they run the 3-row kernels instead of cuBLAS. Not with LLAMA_MTP_EXACT=1 (beside a cache the exact text follows the
             // window where the CPU-miss host path runs, plans/k19_a100chat.md section 5): there the windows stay at 2.
-            // Opt-in because the deeper window does not pay by itself on the measured cached tiers (plans/k19_fnmtp.md, Colab A100 40 GB
+            // Not on by itself because the deeper window does not pay on every measured cached tier (plans/k19_fnmtp.md, Colab A100 40 GB
             // Qwen3.8-Flash-Next UD-IQ4_XS from the VM disk, 3 launches, with the PLE table read in part): 3 drafts full card chat +3.4% /
             // 8k -3.8%, 16 GB chat -6% / 8k +7.6%; 4 drafts full card +1.8% / +6.8%, 16 GB -16% / -14%. A verify row costs ~10 ms there
             // (PLE rows read from the disk and expert misses copied at ~10 GB/s), against 3.4 -> 4.0 tokens per pass
             const bool exact_mtp = [] {
                 const char * x = getenv("LLAMA_MTP_EXACT");
                 return x != nullptr && atoi(x) != 0;
-            }();
-            const int depth_cached = [] {
-                const char * d = getenv("LLAMA_SPEC_DEPTH_CACHED");
-                return d != nullptr ? atoi(d) : 0;
             }();
             // Only where the routed experts fit in host RAM: where they do not (Colab L4, 52 GB of RAM for the 57.6 GB of experts of fn4n)
             // the cache's misses are read from the disk and each verify row costs ~27% of a pass (fm_l1: 4 drafts -5% chat), so the windows
@@ -2204,10 +2218,52 @@ private:
                 const char * r = getenv("LLAMA_SPEC_DEPTH_CACHED_RAM_MIB");
                 return r != nullptr ? (uint64_t) (std::max(0.0, atof(r))*1048576.0) : llama_available_memory();
             }();
-            const bool disk_ok = [] {
+            bool disk_ok = [] {
                 const char * d = getenv("LLAMA_SPEC_DEPTH_CACHED_DISK");
                 return d != nullptr && atoi(d) != 0;
             }();
+            const char * dc_env = getenv("LLAMA_SPEC_DEPTH_CACHED");
+            int depth_cached = dc_env != nullptr ? atoi(dc_env) : 0;
+            // k19-fnmtp2: the default where a verify row beside the cache is cheap (LLAMA_SPEC_DEPTH_CACHED unset; =0: 2 drafts, =N: N).
+            // An MTP drafter of its own (-md) at Studio's shape drafts LLAMA_SPEC_DEPTH_CACHED_N (4) per window below LLAMA_SPEC_DEPTH_POS
+            // when (a) the cache is expected to hold at least LLAMA_SPEC_DEPTH_CACHED_SHARE (0.30) of the routed experts, estimated before
+            // the fit as 1 - (device need without the host-only per-layer embedding table - free) / expert bytes, and (b) the whole target
+            // GGUF is held in host memory (on a memory file system, or its bytes within the available memory), so the rows' expert misses
+            // and per-layer embedding rows come from RAM, not the disk. G4 RTX PRO 6000 96 GB, Qwen3.8-Flash-Next UD-IQ4_XS from RAM + its
+            // MTP drafter, Studio argv, 3 launches (plans/k19_fnmtp.md round 2), this rule against its kill switch: 48 GB (cache 67%) chat
+            // +10.1% / 8k +18.0%, 32 GB (41%) +10.0% / +3.0%; at 16 GB (14%: rule off) 4 drafts measured chat +7.8% (12.8% launch spread) /
+            // 8k -6.7%. A verify row there costs 2.2-2.5 ms of a 12.6-13.0 ms pass at 48 / 32 GB, ~3.5 ms of 15.2 at 16 GB. Colab A100 80 GB
+            // at 48 GB chat +17.7% / 8k +1.6%. The A100 40 GB VM of round 1 (93.7 GB model, 83 GB of RAM: rows read from the disk) stays at 2
+            if (dc_env == nullptr && mtp_shape && !on && cache_expected && sp.has_dft() && !exact_mtp && !host_experts &&
+                    (e != nullptr ? atoi(e) != 0 : dev_ok)) {
+                const uint64_t exp_b    = common_moe_expert_bytes(params.model.path);
+                const uint64_t ple_b    = tpp_host_input_bytes(params.model.path);
+                const uint64_t need_dev = need - std::min(need, ple_b);
+                const uint64_t short_b  = need_dev > dev_free ? need_dev - dev_free : 0;
+                const double   share    = exp_b > 0 ? 1.0 - (double) short_b/(double) exp_b : 0.0;
+                const double   share_min = [] {
+                    const char * x = getenv("LLAMA_SPEC_DEPTH_CACHED_SHARE");
+                    return x != nullptr ? atof(x) : 0.30;
+                }();
+                const int n_def = [] {
+                    const char * x = getenv("LLAMA_SPEC_DEPTH_CACHED_N");
+                    return x != nullptr ? std::clamp(atoi(x), 3, 8) : 4;
+                }();
+                const bool in_ram_fs = tpp_file_in_ram_fs(params.model.path);
+                const bool resident  = in_ram_fs || (tgt_bytes > 0 && ram_avail > 0 && tgt_bytes <= ram_avail);
+                // (short_b == 0: every routed expert is expected on the devices and the need only reads high from the drafter and margin,
+                // k19-bigverify's A100 80 GB full card, where 4 drafts measured 8k -18.6%: not this rule's tier)
+                const bool def_on    = exp_b > 0 && short_b > 0 && share >= share_min && resident;
+                if (def_on) {
+                    depth_cached = n_def;
+                    // (a model on a memory file system: its experts are in RAM whatever MemAvailable reads)
+                    disk_ok = disk_ok || in_ram_fs;
+                }
+                SRV_INF("k19-fnmtp2: MoE cache expected to hold %.1f%% of the routed experts (%.0f MiB short of %.0f MiB); target GGUF %.0f MiB %s "
+                    "(%.0f MiB of RAM available): %s (LLAMA_SPEC_DEPTH_CACHED_SHARE=%.2f; LLAMA_SPEC_DEPTH_CACHED=0: 2 drafts)\n", 100.0*share,
+                    short_b/1048576.0, exp_b/1048576.0, tgt_bytes/1048576.0, in_ram_fs ? "on a memory file system" : resident ? "fits in RAM" :
+                    "does not fit in RAM", ram_avail/1048576.0, def_on ? "deeper MTP windows by default" : "MTP windows of 2 drafts", share_min);
+            }
             const uint64_t expert_bytes = mtp_shape && !on && cache_expected && depth_cached >= 3 ? common_moe_expert_bytes(params.model.path) : 0;
             const bool ram_fits = ram_avail == 0 || expert_bytes <= ram_avail;
             // (the device rule as k19-tpp's: NVIDIA Ampere or newer, LLAMA_SPEC_TPP=1 forces past it, =0 turns this off too)
