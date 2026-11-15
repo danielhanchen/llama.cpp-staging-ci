@@ -1051,8 +1051,9 @@ static std::mutex moe_pf_mutex;
 static std::unordered_map<const void *, moe_pf_group> moe_pf_groups; // key: the state's device pointer
 static std::unordered_map<const ggml_backend_cuda_context *, moe_pf_ctx> moe_pf_ctxs;
 
-static struct moe_pf_report {
-    ~moe_pf_report() {
+// the counters at exit: registered with atexit at the first prefetch, after the CUDA runtime's own exit handlers, so it runs before them
+static void moe_pf_report() {
+    {
         for (auto & [key, g] : moe_pf_groups) {
             unsigned long long c[MOE_PF_STAT_N] = {};
             if (g.stat == nullptr || cudaSetDevice(g.device) != cudaSuccess ||
@@ -1068,7 +1069,7 @@ static struct moe_pf_report {
                 c[MOE_PF_STAT_EVMISS], c[MOE_PF_STAT_REAL], c[MOE_PF_STAT_REAL_FILLS], c[MOE_PF_STAT_SKIPPED]);
         }
     }
-} moe_pf_report_at_exit;
+}
 
 // the prefetch arguments of a real lookup / assign of the group of state (all null without prefetches)
 static moe_pf_args moe_pf_real_args(const ggml_tensor * state) {
@@ -1127,6 +1128,8 @@ static void moe_pf_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     moe_pf_group & g = moe_pf_groups[state->data];
     if (g.stat == nullptr) {
         // first use (also inside a capture: the streams are non-blocking, the capture is relaxed)
+        static const bool reg = std::atexit(moe_pf_report) == 0;
+        GGML_UNUSED(reg);
         g.device  = ctx.device;
         g.n_slots = n_slots;
         CUDA_CHECK(cudaMalloc(&g.mark, (size_t) n_slots*sizeof(int32_t)));
