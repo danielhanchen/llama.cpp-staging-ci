@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <mutex>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -388,12 +389,23 @@ static __host__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, const int DV,
     return cp_async_available(cc) && ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2, cc) : 0;
 }
 
+// k19-fattnq8 / k19-fattnq4: the in-place code q8_kv of the MMA kernel. 0: f16 K / V (or a staged f16 copy). Else the low 2 bits are
+// the load mode (1: synchronous loads converting on the way, 2: the raw rows through the cp.async pipeline, converted in shared
+// memory), bit 2 set: K is q4_0 (else q8_0), bit 3 set: V is q4_0 (else q8_0). 1 / 2 are q8_0 K and V as before
+static constexpr __host__ __device__ int  fattn_kvq_mode(const int q8_kv) { return q8_kv & 3; }
+static constexpr __host__ __device__ bool fattn_kvq_k4  (const int q8_kv) { return (q8_kv & 4) != 0; }
+static constexpr __host__ __device__ bool fattn_kvq_v4  (const int q8_kv) { return (q8_kv & 8) != 0; }
+// bytes of a row of D values of the K (or V) type of a code
+static constexpr __host__ __device__ int  fattn_kvq_row_bytes(const int D, const bool is_q4) {
+    return is_q4 ? (D/QK4_0)*int(sizeof(block_q4_0)) : (D/QK8_0)*int(sizeof(block_q8_0));
+}
+
 static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(
         const int DKQ, const int DV, const int ncols1, const int ncols2, const bool use_sparse, const int q8_kv = 0) {
 #ifdef CP_ASYNC_AVAILABLE
     // k19-fattnq8: q8_0 K / V (q8_kv 1) loaded synchronously, converted on the way into shared memory; q8_kv 2: the raw q8_0 rows
     // through the cp.async pipeline of the f16 kernel, converted in shared memory (see flash_attn_ext_q8_load_raw)
-    const int nstages_target = ncols2 >= 2 && q8_kv != 1 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2) : 0;
+    const int nstages_target = ncols2 >= 2 && fattn_kvq_mode(q8_kv) != 1 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2) : 0;
     // sparse gather is not implemented for multi-stage loading
     return use_sparse && nstages_target > 1 ? 1 : nstages_target;
 #else
@@ -515,15 +527,87 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
 // The value is f16(q) * d in one f16 multiply, the staging conversion's (convert.cu dequantize_block_q8_0_f16: __hmul2 of exact f16
 // operands, rounded once): f16(q) is built exactly as (1024 + (q ^ 0x80)) - 1152, so the tile holds the bits the f16 kernel reads
 // from the staged copy.
-template<int stride_tile, int nwarps, int nbatch_fa, int D2, bool oob_check, bool use_sparse>
+// k19-fattnq4 (is_q4): the same for a q4_0 cache. A pair of q4_0 blocks is 36 bytes = 9 aligned 32 bit words (d of block 0 in the
+// low half of w[0], its 16 quant bytes at bytes 2..17; d of block 1 in the high half of w[4], its quants in w[5..8]); value j < 16 of a
+// block is the low nibble of quant byte j, value j + 16 its high nibble. f16(n - 8) is built exactly as (1024 + n) - 1032 and the value
+// is fma(f16(n - 8), d, +0): the exact product rounded once, as the staging conversion (convert.cu dequantize_block_q4_0: d*n - 8*d in
+// f32, exact, then rounded to f16), including +0 for n == 8 with d < 0 (a plain multiply would give -0 there)
+template<int stride_tile, int nwarps, int nbatch_fa, int D2, bool oob_check, bool use_sparse, bool is_q4 = false>
 static __device__ __forceinline__ void flash_attn_ext_q8_load_tile(
         const char * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int stride_KV,
         const int k_VKQ_0, const int i_sup, const int32_t * const __restrict__ indices) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    static_assert(D2 % QK8_0 == 0, "q8_0 rows must hold whole pairs of blocks");
-    constexpr int npair = D2/QK8_0; // pairs of q8_0 blocks per row (64 values each)
+    static_assert(D2 % QK8_0 == 0, "q8_0 / q4_0 rows must hold whole pairs of blocks");
+    constexpr int npair = D2/QK8_0; // pairs of q8_0 / q4_0 blocks per row (64 values each)
     constexpr int ntot  = nbatch_fa*npair;
     constexpr int nthr  = nwarps*warp_size;
+    if constexpr (is_q4) {
+        const half2 off4 = make_half2(1032.0f, 1032.0f);
+        const half2 zero = make_half2(0.0f, 0.0f);
+#pragma unroll
+        for (int ip0 = 0; ip0 < ntot; ip0 += nthr) {
+            const int ip = ip0 + threadIdx.y*warp_size + threadIdx.x;
+            if (ntot % nthr != 0 && ip >= ntot) {
+                break;
+            }
+            const int i = ip / npair;
+            const int p = ip % npair;
+
+            int64_t row;
+            bool    skip;
+            if constexpr (use_sparse) {
+                const int32_t index = i < i_sup ? indices[k_VKQ_0 + i] : -1;
+                skip = index < 0;
+                row  = skip ? 0 : index;
+            } else {
+                skip = oob_check && i >= i_sup;
+                row  = skip ? 0 : k_VKQ_0 + i;
+            }
+
+            uint32_t w[9];
+            if (!skip) {
+                const uint32_t * src = (const uint32_t *) (KV + row*stride_KV + p*int(2*sizeof(block_q4_0)));
+#pragma unroll
+                for (int l = 0; l < 9; ++l) {
+                    w[l] = src[l];
+                }
+            } else {
+#pragma unroll
+                for (int l = 0; l < 9; ++l) {
+                    w[l] = 0;
+                }
+            }
+#pragma unroll
+            for (int blk = 0; blk < 2; ++blk) {
+                const uint16_t d_bits = blk == 0 ? (uint16_t) (w[0] & 0xFFFF) : (uint16_t) (w[4] >> 16);
+                const half2    d2     = __half2half2(__ushort_as_half(d_bits));
+                uint32_t qw[4]; // quant bytes 0..15 of the block
+#pragma unroll
+                for (int m = 0; m < 4; ++m) {
+                    qw[m] = blk == 0 ? __funnelshift_r(w[m], w[m + 1], 16) : w[5 + m];
+                }
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    // chunk c: values 8c .. 8c+7 = the low (c < 2) or high (c >= 2) nibbles of quant bytes 8*(c%2) .. 8*(c%2)+7
+                    int v[4];
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const uint32_t x  = qw[2*(c % 2) + h];
+                        const uint32_t n  = c < 2 ? x & 0x0F0F0F0Fu : (x >> 4) & 0x0F0F0F0Fu;
+                        const uint32_t lo = __byte_perm(n, 0x64646464u, 0x5140);
+                        const uint32_t hi = __byte_perm(n, 0x64646464u, 0x7362);
+                        const half2    r0 = __hfma2(__hsub2(*(const half2 *) &lo, off4), d2, zero);
+                        const half2    r1 = __hfma2(__hsub2(*(const half2 *) &hi, off4), d2, zero);
+                        v[2*h + 0] = skip ? 0 : *(const int *) &r0;
+                        v[2*h + 1] = skip ? 0 : *(const int *) &r1;
+                    }
+                    const int k = p*8 + blk*4 + c; // 16 byte chunk of the row
+                    *(int4 *) swizzle<stride_tile>(tile_KV, i*stride_tile + k*4, i) = make_int4(v[0], v[1], v[2], v[3]);
+                }
+            }
+        }
+        return;
+    }
     const half2 off = make_half2(1152.0f, 1152.0f);
 #pragma unroll
     for (int ip0 = 0; ip0 < ntot; ip0 += nthr) {
@@ -587,13 +671,13 @@ static __device__ __forceinline__ void flash_attn_ext_q8_load_tile(
 
 // k19-fattnq8 (q8_kv 2): the raw q8_0 rows of a K / V tile (nbatch_fa rows of D2/16 blocks, 16 byte aligned: D 256) into shared
 // memory with cp.async, 16 bytes per copy, rows packed at their size; flash_attn_ext_q8_load_tile converts them into the f16 tile.
-template<int nwarps, int nbatch_fa, int D2>
+// (k19-fattnq4: row_bytes is the size of a row of the type, q8_0 or q4_0)
+template<int nwarps, int nbatch_fa, int row_bytes>
 static __device__ __forceinline__ void flash_attn_ext_q8_load_raw(
         const char * const __restrict__ KV, char * const __restrict__ raw, const int stride_KV, const int k_VKQ_0) {
 #ifdef CP_ASYNC_AVAILABLE
     constexpr int warp_size      = ggml_cuda_get_physical_warp_size();
-    constexpr int row_bytes      = (2*D2/QK8_0)*int(sizeof(block_q8_0));
-    static_assert(row_bytes % 16 == 0, "raw q8_0 rows must be 16 byte multiples");
+    static_assert(row_bytes % 16 == 0, "raw q8_0 / q4_0 rows must be 16 byte multiples");
     constexpr int chunks_per_row = row_bytes/16;
     constexpr int nchunks        = nbatch_fa*chunks_per_row;
     constexpr int preload        = 64;
@@ -765,11 +849,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         constexpr bool use_cp_async = true;
         cp_async_wait_all();
         __syncthreads();
-        if constexpr (q8_kv == 2) {
+        if constexpr (fattn_kvq_mode(q8_kv) == 2) {
             // the K tile's raw rows (preloaded) to f16 in the one f16 tile, then this tile's V rows in flight during KQ
-            flash_attn_ext_q8_load_tile<stride_tile_K, nwarps, nbatch_fa, DKQ/2, false, false>
-                (raw_K, tile_K, (DKQ/QK8_0)*int(sizeof(block_q8_0)), 0, nbatch_fa, nullptr);
-            flash_attn_ext_q8_load_raw<nwarps, nbatch_fa, DV/2>((const char *) V_h2, raw_V, stride_V, k_VKQ_0);
+            flash_attn_ext_q8_load_tile<stride_tile_K, nwarps, nbatch_fa, DKQ/2, false, false, fattn_kvq_k4(q8_kv)>
+                (raw_K, tile_K, fattn_kvq_row_bytes(DKQ, fattn_kvq_k4(q8_kv)), 0, nbatch_fa, nullptr);
+            flash_attn_ext_q8_load_raw<nwarps, nbatch_fa, fattn_kvq_row_bytes(DV, fattn_kvq_v4(q8_kv))>((const char *) V_h2, raw_V, stride_V, k_VKQ_0);
             __syncthreads();
         } else {
             flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
@@ -790,9 +874,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     for (int k0_start = (DKQ/2-1) - (DKQ/2-1) % nbatch_K2; k0_start >= 0; k0_start -= nbatch_K2) {
         const int k0_stop = k0_start + nbatch_K2 < DKQ/2 ? k0_start + nbatch_K2 : DKQ/2;
 
-        if constexpr (q8_kv == 1) {
+        if constexpr (fattn_kvq_mode(q8_kv) == 1) {
             static_assert(nbatch_K2 == DKQ/2 && nstages == 0, "q8_0 K tiles are loaded whole and synchronously");
-            flash_attn_ext_q8_load_tile<stride_tile_K, nwarps, nbatch_fa, DKQ/2, oob_check, use_sparse>
+            flash_attn_ext_q8_load_tile<stride_tile_K, nwarps, nbatch_fa, DKQ/2, oob_check, use_sparse, fattn_kvq_k4(q8_kv)>
                 ((const char *) K_h2, tile_K, stride_K, k_VKQ_0, k_VKQ_sup, indices);
             __syncthreads();
         } else if constexpr (nstages <= 1) {
@@ -1130,24 +1214,24 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         constexpr bool use_cp_async = true;
         cp_async_wait_all();
         __syncthreads();
-        if constexpr (q8_kv == 2) {
+        if constexpr (fattn_kvq_mode(q8_kv) == 2) {
             // every warp is past KQ / softmax: the V rows to f16 over the K tile (one f16 tile), the next K rows in flight during VKQ
-            flash_attn_ext_q8_load_tile<stride_tile_V, nwarps, nbatch_fa, DV/2, false, false>
-                (raw_V, tile_V, (DV/QK8_0)*int(sizeof(block_q8_0)), 0, nbatch_fa, nullptr);
+            flash_attn_ext_q8_load_tile<stride_tile_V, nwarps, nbatch_fa, DV/2, false, false, fattn_kvq_v4(q8_kv)>
+                (raw_V, tile_V, fattn_kvq_row_bytes(DV, fattn_kvq_v4(q8_kv)), 0, nbatch_fa, nullptr);
         }
         if (!last_iter) {
             if (ncols2 > 1 || mask_h) {
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                     (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
             }
-            if constexpr (q8_kv == 2) {
-                flash_attn_ext_q8_load_raw<nwarps, nbatch_fa, DKQ/2>((const char *) K_h2, raw_K, stride_K, k_VKQ_0 + nbatch_fa);
+            if constexpr (fattn_kvq_mode(q8_kv) == 2) {
+                flash_attn_ext_q8_load_raw<nwarps, nbatch_fa, fattn_kvq_row_bytes(DKQ, fattn_kvq_k4(q8_kv))>((const char *) K_h2, raw_K, stride_K, k_VKQ_0 + nbatch_fa);
             } else {
                 flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                     (K_h2, tile_K, nbatch_K2, stride_K, k_VKQ_0 + nbatch_fa, k_VKQ_sup, nullptr);
             }
         }
-        if constexpr (q8_kv == 2) {
+        if constexpr (fattn_kvq_mode(q8_kv) == 2) {
             __syncthreads();
         }
     }
@@ -1159,9 +1243,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         static_assert(DV % (2*nbatch_V2) == 0, "bad loop size");
         const int i0_stop = i0_start + 2*nbatch_V2;
 
-        if constexpr (q8_kv == 1) {
+        if constexpr (fattn_kvq_mode(q8_kv) == 1) {
             static_assert(2*nbatch_V2 == DV && !V_is_K_view && nstages == 0, "q8_0 V tiles are loaded whole and synchronously");
-            flash_attn_ext_q8_load_tile<stride_tile_V, nwarps, nbatch_fa, DV/2, oob_check, use_sparse>
+            flash_attn_ext_q8_load_tile<stride_tile_V, nwarps, nbatch_fa, DV/2, oob_check, use_sparse, fattn_kvq_v4(q8_kv)>
                 ((const char *) V_h2, tile_V, stride_V, k_VKQ_0, k_VKQ_sup, indices);
             __syncthreads();
         } else if constexpr (nstages <= 1) {
@@ -1422,14 +1506,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     extern __shared__ half2 tile_Q[];
     half2 * tile_K    = Q_in_reg              ? tile_Q                             : tile_Q + ncols     * stride_tile_Q;
-    half2 * tile_V    =           nstages > 1 && q8_kv != 2 ? tile_K + nbatch_fa * stride_tile_K : tile_K;
-    half  * tile_mask = (half *) (nstages > 1 && q8_kv != 2 ? tile_V + nbatch_fa * stride_tile_V : tile_V + nbatch_fa * stride_tile_KV_max);
-    // k19-fattnq8 (q8_kv 2): one f16 tile (K, then V), the raw q8_0 rows of K and V behind it, the mask behind them
-    constexpr int raw_row_K = (DKQ/QK8_0)*int(sizeof(block_q8_0));
-    constexpr int raw_row_V = (DV /QK8_0)*int(sizeof(block_q8_0));
+    constexpr bool raw_kv = fattn_kvq_mode(q8_kv) == 2;
+    half2 * tile_V    =           nstages > 1 && !raw_kv ? tile_K + nbatch_fa * stride_tile_K : tile_K;
+    half  * tile_mask = (half *) (nstages > 1 && !raw_kv ? tile_V + nbatch_fa * stride_tile_V : tile_V + nbatch_fa * stride_tile_KV_max);
+    // k19-fattnq8 (q8_kv 2): one f16 tile (K, then V), the raw q8_0 (k19-fattnq4: or q4_0) rows of K and V behind it, the mask behind them
+    constexpr int raw_row_K = fattn_kvq_row_bytes(DKQ, fattn_kvq_k4(q8_kv));
+    constexpr int raw_row_V = fattn_kvq_row_bytes(DV,  fattn_kvq_v4(q8_kv));
     char * raw_K = (char *) tile_mask;
-    char * raw_V = raw_K + (q8_kv == 2 ? nbatch_fa*raw_row_K : 0);
-    if constexpr (q8_kv == 2) {
+    char * raw_V = raw_K + (raw_kv ? nbatch_fa*raw_row_K : 0);
+    if constexpr (raw_kv) {
         tile_mask = (half *) (raw_V + nbatch_fa*raw_row_V);
     }
 
@@ -1523,8 +1608,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                 (mask_h, tile_mask, stride_mask, kb0*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
         }
-        if constexpr (q8_kv == 2) {
-            flash_attn_ext_q8_load_raw<nwarps, nbatch_fa, DKQ/2>((const char *) K_h2, raw_K, stride_K, kb0*nbatch_fa);
+        if constexpr (fattn_kvq_mode(q8_kv) == 2) {
+            flash_attn_ext_q8_load_raw<nwarps, nbatch_fa, raw_row_K>((const char *) K_h2, raw_K, stride_K, kb0*nbatch_fa);
         } else {
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                 (K_h2, tile_K, nbatch_K2, stride_K, kb0*nbatch_fa, k_VKQ_sup, nullptr);
@@ -1979,9 +2064,17 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
 }
 
 // k19-fattnq8: head sizes with a q8_0 kernel (the tiles of these hold whole rows: nbatch_K2 = DKQ/2, nbatch_V2 = DV/2 in every config)
+// (k19-fattnq4: and head size 64, for q8_0 and q4_0)
 static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_q8_may_use(
         const int DKQ, const int DV, const bool use_logit_softcap, const bool V_is_K_view) {
-    return DKQ == DV && (DKQ == 128 || DKQ == 256) && !use_logit_softcap && !V_is_K_view;
+    return DKQ == DV && (DKQ == 64 || DKQ == 128 || DKQ == 256) && !use_logit_softcap && !V_is_K_view;
+}
+
+// k19-fattnq4: the K / V type bits (fattn_kvq_k4 / fattn_kvq_v4) of the in-place kernels compiled for a tile config: q8_0 K / V at
+// every config (k19-fattnq8), the pairs with a q4_0 K or V only where ncols1 <= 16 (at most 16 query rows: the configs a verify window
+// can pick, ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1; wider ones never take the in-place path by default)
+static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_kvq_compiled(const int ncols1, const int kvq_types) {
+    return kvq_types == 0 || ncols1 <= 16;
 }
 
 // k19-fattnq8: q8_kv != 0: K and V are q8_0 (the cache itself, read in place, see flash_attn_ext_q8_load_tile), 1 = synchronous
@@ -2043,7 +2136,7 @@ static __global__ void flash_attn_ext_f16(
         NO_DEVICE_CODE;
         return;
     }
-    if (q8_kv == 2 && (use_sparse || DKQ != 256 || ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse, q8_kv) != 2)) {
+    if (fattn_kvq_mode(q8_kv) == 2 && (use_sparse || DKQ != 256 || ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse, q8_kv) != 2)) {
         NO_DEVICE_CODE;
         return;
     }
@@ -2227,6 +2320,9 @@ static __global__ void flash_attn_ext_f16(
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2);
 // k19-fattnq8: the MMA kernel reads this node's q8_0 K / V in place (no staged f16 copy); fattn.cu
 bool ggml_cuda_flash_attn_ext_mma_q8_inplace(const int device, const ggml_tensor * dst);
+// k19-fattnq4: 0 = staged, else the in-place code (mode bits 1, K / V type bits fattn_kvq_k4 / fattn_kvq_v4) for q8_0 / q4_0 K and V;
+// for_alloc: the answer for the graph allocation (the f16 copy is reserved unless every launch of the node reads in place); fattn.cu
+int ggml_cuda_flash_attn_ext_mma_kvq_inplace(const int device, const ggml_tensor * dst, const bool for_alloc);
 static inline bool ggml_cuda_fattn_q8_no_data(const ggml_tensor * t) {
     return ggml_cuda_fattn_probe_cur != nullptr || t->data == nullptr;
 }
@@ -2364,11 +2460,15 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     // convert on the way. Both write the f16 values of the staging conversion. The launch geometry (stream-k blocks, fixup) is the f16
     // kernel's: its occupancy at its shared memory, so the KV split, and with the same f16 tiles every MMA and sum, is the staged
     // launch's. GGML_CUDA_FATTN_Q8_INPLACE=0: staged as before
+    // k19-fattnq4: the same for q4_0 K and / or V (q4_0 / q4_0, q4_0 / q8_0, q8_0 / q4_0), kvq = the type bits of the code. Kernels with a
+    // q4_0 side exist for ncols1 <= 16 (ggml_cuda_flash_attn_ext_mma_kvq_compiled); a wider config (GGML_CUDA_FATTN_Q4_INPLACE_MAX_ROWS
+    // raised above 16) runs staged, the graph reserved the f16 copy for it (ggml_cuda_flash_attn_ext_get_alloc_size)
     if constexpr (ggml_cuda_flash_attn_ext_mma_q8_may_use(DKQ, DV, false, V_is_K_view)) {
-        if (logit_softcap == 0.0f && ggml_cuda_flash_attn_ext_mma_q8_inplace(id, dst)) {
+        const int kvq_code = logit_softcap == 0.0f ? ggml_cuda_flash_attn_ext_mma_kvq_inplace(id, dst, false) : 0;
+        if (kvq_code != 0 && ggml_cuda_flash_attn_ext_mma_kvq_compiled(ncols1, kvq_code & 12)) {
             const ggml_tensor * K = dst->src[1];
             const ggml_tensor * V = dst->src[2];
-            // rows start 4 byte aligned (ggml_cuda_flash_attn_ext_mma_q8_inplace checked the strides; buffers and cache views keep it)
+            // rows start 4 byte aligned (ggml_cuda_flash_attn_ext_mma_kvq_inplace checked the strides; buffers and cache views keep it)
             GGML_ASSERT(ggml_cuda_fattn_q8_no_data(K) || (uintptr_t) K->data % 4 == 0);
             GGML_ASSERT(ggml_cuda_fattn_q8_no_data(V) || (uintptr_t) V->data % 4 == 0);
             bool aligned16 = true;
@@ -2376,20 +2476,37 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                 aligned16 = aligned16 && (uintptr_t) t->data % 16 == 0 && t->nb[1] % 16 == 0 && t->nb[2] % 16 == 0 && t->nb[3] % 16 == 0;
             }
             static const int q8_mode_env = getenv("GGML_CUDA_FATTN_Q8_MODE") ? atoi(getenv("GGML_CUDA_FATTN_Q8_MODE")) : 0; // 1: never 2
+            const int kvq     = kvq_code & 12;
             const int q8_mode = DKQ == 256 && nstages == 2 && !use_sparse && aligned16 && q8_mode_env != 1 ? 2 : 1;
-            const size_t raw_bytes = q8_mode == 2 ? size_t(nbatch_fa) * (DKQ/QK8_0 + DV/QK8_0) * sizeof(block_q8_0) : 0;
+            const size_t raw_bytes = q8_mode == 2 ?
+                size_t(nbatch_fa) * (fattn_kvq_row_bytes(DKQ, fattn_kvq_k4(kvq)) + fattn_kvq_row_bytes(DV, fattn_kvq_v4(kvq))) : 0;
             const size_t nbytes_shared_q8 = std::max(nbytes_shared_combine, Q_in_reg ?
                 std::max(nbytes_shared_Q,  nbytes_shared_KV_1stage + raw_bytes + nbytes_shared_mask) :
                          nbytes_shared_Q + nbytes_shared_KV_1stage + raw_bytes + nbytes_shared_mask);
             fattn_kernel_t q8_kernel = nullptr;
-            if (use_sparse) {
-                q8_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, V_is_K_view, true, 1>;
-            } else if (q8_mode == 1) {
-                q8_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, V_is_K_view, false, 1>;
-            } else {
-                if constexpr (DKQ == 256) {
-                    q8_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, V_is_K_view, false, 2>;
+            // the in-place kernel of a type pair: [sparse sync, sync, raw pipelined]
+            auto pick = [&](auto kvq_c) {
+                constexpr int c = decltype(kvq_c)::value;
+                if constexpr (ggml_cuda_flash_attn_ext_mma_kvq_compiled(ncols1, c)) {
+                    if (use_sparse) {
+                        if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
+                            q8_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, V_is_K_view, true, c | 1>;
+                        }
+                    } else if (q8_mode == 1) {
+                        q8_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, V_is_K_view, false, c | 1>;
+                    } else {
+                        if constexpr (DKQ == 256) {
+                            q8_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, V_is_K_view, false, c | 2>;
+                        }
+                    }
                 }
+            };
+            switch (kvq) {
+                case  0: pick(std::integral_constant<int,  0>{}); break;
+                case  4: pick(std::integral_constant<int,  4>{}); break;
+                case  8: pick(std::integral_constant<int,  8>{}); break;
+                case 12: pick(std::integral_constant<int, 12>{}); break;
+                default: break;
             }
             GGML_ASSERT(q8_kernel != nullptr);
             {
@@ -2403,11 +2520,21 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                     raised.push_back(key);
                 }
             }
-            static std::atomic<int> n_logged { 0 };
-            if (ggml_cuda_fattn_probe_cur == nullptr && n_logged++ == 0) {
-                GGML_LOG_INFO("%s: k19-fattnq8: tensor-core flash attention reads the q8_0 K / V cache in place, first D %d ncols %d x %d, "
-                    "%s, %lld cells (GGML_CUDA_FATTN_Q8_INPLACE=0: staged f16 copy)\n", __func__, DKQ, ncols1, ncols2,
-                    q8_mode == 2 ? "raw rows pipelined" : "synchronous loads", (long long) K->ne[1]);
+            if (kvq == 0) {
+                static std::atomic<int> n_logged { 0 };
+                if (ggml_cuda_fattn_probe_cur == nullptr && n_logged++ == 0) {
+                    GGML_LOG_INFO("%s: k19-fattnq8: tensor-core flash attention reads the q8_0 K / V cache in place, first D %d ncols %d x %d, "
+                        "%s, %lld cells (GGML_CUDA_FATTN_Q8_INPLACE=0: staged f16 copy)\n", __func__, DKQ, ncols1, ncols2,
+                        q8_mode == 2 ? "raw rows pipelined" : "synchronous loads", (long long) K->ne[1]);
+                }
+            } else {
+                static std::atomic<int> n_logged { 0 };
+                if (ggml_cuda_fattn_probe_cur == nullptr && n_logged++ == 0) {
+                    GGML_LOG_INFO("%s: k19-fattnq4: tensor-core flash attention reads the %s K / %s V cache in place, first D %d ncols %d x %d, "
+                        "%s, %lld cells (GGML_CUDA_FATTN_Q4_INPLACE=0: staged f16 copy)\n", __func__, ggml_type_name(K->type),
+                        ggml_type_name(V->type), DKQ, ncols1, ncols2, q8_mode == 2 ? "raw rows pipelined" : "synchronous loads",
+                        (long long) K->ne[1]);
+                }
             }
             launch_fattn<DV, ncols1, ncols2>
                 (ctx, dst, q8_kernel, nwarps, nbytes_shared_q8, nbatch_fa, false, false, true, use_sparse, warp_size_host, async_kv_preload,
