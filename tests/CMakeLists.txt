@@ -300,6 +300,20 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-exact-verify-cells PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # k19-kvwin: the recent-window ring beside a quantized KV cache (probe = plain q8_0 and control = plain q4_0 bit for bit, routing,
+    # draft rollback, state save / restore, context shift, multi-sequence, the concat stopgap), on generated models of several families
+    llama_build(test-kv-win.cpp)
+    llama_test(
+        test-kv-win
+        LABEL main
+        ARGS --models "${MODEL_DIR}"
+    )
+    set_tests_properties(test-kv-win PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    # k19-kvwin: the CPU two-source flash attention (ggml_flash_attn_ext_set_src2) against the concatenation and a double reference
+    llama_build(test-fa-src2.cpp)
+    llama_test(test-fa-src2 LABEL main)
+
     # --moe-cache-mib with the layers on a GPU outside ggml-cuda (a mock device): the context runs without the MoE cache
     llama_build(test-moe-cache-device.cpp)
     llama_test(

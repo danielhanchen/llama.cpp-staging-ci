@@ -6059,6 +6059,31 @@ void ggml_flash_attn_ext_kv_len_set_host(
     ggml_set_op_params_i32(kv_len, 0, n);
 }
 
+void ggml_flash_attn_ext_set_src2(
+        struct ggml_tensor * a,
+        struct ggml_tensor * k2,
+        struct ggml_tensor * v2,
+        struct ggml_tensor * mask2) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    if (!k2) {
+        a->src[6] = a->src[7] = a->src[8] = NULL;
+        return;
+    }
+    const struct ggml_tensor * q = a->src[0];
+    const struct ggml_tensor * k = a->src[1];
+    const struct ggml_tensor * v = a->src[2];
+    const struct ggml_tensor * m = a->src[3];
+    GGML_ASSERT(v2 && mask2 && m);
+    GGML_ASSERT(k2->ne[0] == k->ne[0] && k2->ne[2] == k->ne[2] && k2->ne[3] == k->ne[3]);
+    GGML_ASSERT(v2->ne[0] == v->ne[0] && v2->ne[1] == k2->ne[1] && v2->ne[2] == v->ne[2] && v2->ne[3] == v->ne[3]);
+    GGML_ASSERT(mask2->type == GGML_TYPE_F16 && ggml_is_contiguous(mask2));
+    GGML_ASSERT(mask2->ne[0] == k2->ne[1] && mask2->ne[1] == m->ne[1] && mask2->ne[2] == m->ne[2] && mask2->ne[3] == m->ne[3]);
+    GGML_ASSERT(q->ne[3] == k2->ne[3]);
+    a->src[6] = k2;
+    a->src[7] = v2;
+    a->src[8] = mask2;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

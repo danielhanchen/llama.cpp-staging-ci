@@ -9100,6 +9100,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
 
+    // k19-kvwin: second KV source (ggml_flash_attn_ext_set_src2), attended after the first one in the same online softmax
+    const ggml_tensor * k2    = dst->src[6];
+    const ggml_tensor * v2    = dst->src[7];
+    const ggml_tensor * mask2 = dst->src[8];
+    const bool two = k2 != nullptr;
+    GGML_ASSERT(!two || (v2 != nullptr && mask2 != nullptr && !write_partials));
+    GGML_ASSERT(!two || (k2->nb[0] == ggml_type_size(k2->type) && v2->nb[0] == ggml_type_size(v2->type)));
+
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
     GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
@@ -9168,6 +9176,17 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
 
+    ggml_type         const k2_vec_dot_type = two ? ggml_get_type_traits_cpu(k2->type)->vec_dot_type : k_vec_dot_type;
+    ggml_from_float_t const q_to_vec_dot2   = ggml_get_type_traits_cpu(k2_vec_dot_type)->from_float;
+    ggml_vec_dot_t    const kq_vec_dot2     = two ? ggml_get_type_traits_cpu(k2->type)->vec_dot : kq_vec_dot;
+    ggml_to_float_t   const v2_to_float     = two ? ggml_get_type_traits(v2->type)->to_float : v_to_float;
+    GGML_ASSERT(!two || (q_to_vec_dot2 && (v2->type == GGML_TYPE_F32 || v2_to_float)));
+
+    // F16 accumulation only when every V source is F16
+    const bool v_f16 = v->type == GGML_TYPE_F16 && (!two || v2->type == GGML_TYPE_F16);
+    // the per-thread scratch holds a second converted Q for the second source (see ggml_graph_plan)
+    const int64_t wstride = (two ? 2*DK : 1*DK) + 2*DV + CACHE_LINE_SIZE_F32;
+
     int ith = params->ith;
 
     for (int ir = ir0; ir < ir1; ++ir) {
@@ -9182,12 +9201,13 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         float S = 0.0f;      // sum
         float M = -INFINITY; // maximum KQ value
 
-        float       * VKQ32 = (float       *) params->wdata + ith*(1*DK + 2*DV + CACHE_LINE_SIZE_F32); // FP32 VKQ accumulator
+        float       * VKQ32 = (float       *) params->wdata + ith*wstride; // FP32 VKQ accumulator
         float       * V32   =                 (VKQ32 + 1*DV); // (temporary) FP32 V buffer
         ggml_fp16_t * VKQ16 = (ggml_fp16_t *) (VKQ32 + 1*DV); // (temporary) FP16 VKQ accumulator
         ggml_fp16_t * Q_q   = (ggml_fp16_t *) (VKQ32 + 2*DV); // (temporary) buffer for Q converted to quantized/FP16
+        ggml_fp16_t * Q_q2  = two ? (ggml_fp16_t *) (VKQ32 + 2*DV + DK) : Q_q; // the same for the second source
 
-        if (v->type == GGML_TYPE_F16) {
+        if (v_f16) {
             memset(VKQ16, 0, DV*sizeof(ggml_fp16_t));
         } else {
             memset(VKQ32, 0, DV*sizeof(float));
@@ -9205,79 +9225,95 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
         q_to_vec_dot(pq, Q_q, DK);
+        if (two && Q_q2 != Q_q) {
+            q_to_vec_dot2(pq, Q_q2, DK);
+        }
 
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
-        for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
-            if (mv == -INFINITY) {
-                continue;
-            }
+        // k19-kvwin: the first source, then (two) the second one, in one online softmax
+        for (int isrc = 0; isrc < (two ? 2 : 1); ++isrc) {
+            const ggml_tensor * ks  = isrc == 0 ? k : k2;
+            const ggml_tensor * vsr = isrc == 0 ? v : v2;
+            const ggml_fp16_t * mps = isrc == 0 ? mp : (const ggml_fp16_t *)((const char *) mask2->data + iq1*mask2->nb[1] +
+                    (iq2%mask2->ne[2])*mask2->nb[2] + (iq3%mask2->ne[3])*mask2->nb[3]);
+            const ggml_vec_dot_t  kq_dot   = isrc == 0 ? kq_vec_dot : kq_vec_dot2;
+            const ggml_to_float_t v_to_f32 = isrc == 0 ? v_to_float : v2_to_float;
+            const ggml_fp16_t *   Qs       = isrc == 0 ? Q_q : Q_q2;
+            const int64_t c0 = isrc == 0 ? ic_start : 0;
+            const int64_t c1 = isrc == 0 ? ic_end   : ks->ne[1];
 
-            float s; // KQ value
-
-            const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
-            kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
-
-            s = s*scale; // scale KQ value
-
-            if (logit_softcap != 0.0f) {
-                s = logit_softcap*tanhf(s);
-            }
-
-            s += mv; // apply mask
-
-            const float Mold = M;
-
-            float ms = 1.0f; // upon new higher max val, scale VKQ and KQ sum with this value
-            float vs = 1.0f; // post-softmax KQ value, expf(s - M)
-
-            const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
-
-            if (v->type == GGML_TYPE_F16) {
-                if (s > M) {
-                    // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
-                    M = s;
-                    ms = expf(Mold - M);
-
-                    // V = V*expf(Mold - M)
-                    ggml_vec_scale_f16(DV, VKQ16, ms);
-                } else {
-                    // no new maximum, ms == 1.0f, vs != 1.0f
-                    vs = expf(s - M);
+            for (int64_t ic = c0; ic < c1; ++ic) {
+                const float mv = mps ? slope*GGML_CPU_FP16_TO_FP32(mps[ic]) : 0.0f;
+                if (mv == -INFINITY) {
+                    continue;
                 }
 
-                // V += v*expf(s - M)
-                ggml_vec_mad_f16(DV, VKQ16, (const ggml_fp16_t *) v_data, vs);
-            } else {
-                if (s > M) {
-                    // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
-                    M = s;
-                    ms = expf(Mold - M);
+                float s; // KQ value
 
-                    // V = V*expf(Mold - M)
-                    ggml_vec_scale_f32(DV, VKQ32, ms);
-                } else {
-                    // no new maximum, ms == 1.0f, vs != 1.0f
-                    vs = expf(s - M);
+                const char * k_data = (const char *) ks->data + (ic*ks->nb[1] + ik2*ks->nb[2] + ik3*ks->nb[3]);
+                kq_dot(DK, &s, 0, k_data, 0, Qs, 0, 1);
+
+                s = s*scale; // scale KQ value
+
+                if (logit_softcap != 0.0f) {
+                    s = logit_softcap*tanhf(s);
                 }
 
-                // V += v*expf(s - M)
-                if (v_to_float) {
-                    v_to_float(v_data, V32, DV);
-                    ggml_vec_mad_f32(DV, VKQ32, V32, vs);
+                s += mv; // apply mask
+
+                const float Mold = M;
+
+                float ms = 1.0f; // upon new higher max val, scale VKQ and KQ sum with this value
+                float vs = 1.0f; // post-softmax KQ value, expf(s - M)
+
+                const char * v_data = (const char *) vsr->data + (ic*vsr->nb[1] + iv2*vsr->nb[2] + iv3*vsr->nb[3]);
+
+                if (v_f16) {
+                    if (s > M) {
+                        // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
+                        M = s;
+                        ms = expf(Mold - M);
+
+                        // V = V*expf(Mold - M)
+                        ggml_vec_scale_f16(DV, VKQ16, ms);
+                    } else {
+                        // no new maximum, ms == 1.0f, vs != 1.0f
+                        vs = expf(s - M);
+                    }
+
+                    // V += v*expf(s - M)
+                    ggml_vec_mad_f16(DV, VKQ16, (const ggml_fp16_t *) v_data, vs);
                 } else {
-                    // V is F32
-                    ggml_vec_mad_f32(DV, VKQ32, (const float *) v_data, vs);
+                    if (s > M) {
+                        // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
+                        M = s;
+                        ms = expf(Mold - M);
+
+                        // V = V*expf(Mold - M)
+                        ggml_vec_scale_f32(DV, VKQ32, ms);
+                    } else {
+                        // no new maximum, ms == 1.0f, vs != 1.0f
+                        vs = expf(s - M);
+                    }
+
+                    // V += v*expf(s - M)
+                    if (v_to_f32) {
+                        v_to_f32(v_data, V32, DV);
+                        ggml_vec_mad_f32(DV, VKQ32, V32, vs);
+                    } else {
+                        // V is F32
+                        ggml_vec_mad_f32(DV, VKQ32, (const float *) v_data, vs);
+                    }
                 }
+
+                S = S*ms + vs; // scale and increment sum with partial sum
             }
-
-            S = S*ms + vs; // scale and increment sum with partial sum
         }
 
-        if (v->type == GGML_TYPE_F16) {
+        if (v_f16) {
             for (int64_t d = 0; d < DV; ++d) {
                 VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[d]);
             }
@@ -9733,7 +9769,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_ref = params->use_ref;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    // k19-kvwin: a second KV source runs the reference row loop (one online softmax over both sources)
+    const bool two_src = dst->src[6] != nullptr;
+    const bool use_split_kv_path = !use_ref && !two_src && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -9790,7 +9828,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        bool use_tiled = !use_ref && !two_src &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&

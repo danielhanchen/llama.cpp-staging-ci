@@ -362,6 +362,22 @@ public:
     const llama_cparams cparams;
 };
 
+// k19-kvwin: the inputs of a cache with a recent-window ring (llama_kv_cache::win_init): the ring row of every token and the ring
+// mask (the cells of each row's window, moved out of the body mask by llama_kv_cache::set_input_win)
+struct llm_graph_kv_win {
+    ggml_tensor * idxs = nullptr; // I64 [n_batch]
+    ggml_tensor * mask = nullptr; // F16 [n_win_slots, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * cells = nullptr; // I32 [n_win_slots, n_batch] the cell of every live slot (0 for the others), per token; on demand
+};
+
+// k19-kvwin: the second KV source of an attention (the ring views and their mask), see build_attn_mha
+struct llm_graph_attn_src2 {
+    ggml_tensor * k    = nullptr; // [n_embd_head_k, n_head_kv, n_slots, n_stream]
+    ggml_tensor * v    = nullptr; // [n_embd_head_v, n_head_kv, n_slots, n_stream]
+    ggml_tensor * mask = nullptr;
+    bool fused = false;           // one two-source flash attention node (ggml_flash_attn_ext_set_src2), else the concat stopgap
+};
+
 class llm_graph_input_attn_kv : public llm_graph_input_i {
 public:
     llm_graph_input_attn_kv(
@@ -399,6 +415,9 @@ public:
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return
+    // k19-kvwin: ring inputs (of the base cache for iSWA), unset without a ring
+    llm_graph_kv_win win;
+
     const llama_hparams hparams;
     const llama_cparams cparams;
 
@@ -434,6 +453,9 @@ public:
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    // k19-kvwin: ring inputs (of the base cache for iSWA), unset without a ring
+    llm_graph_kv_win win;
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -568,6 +590,9 @@ public:
     ggml_tensor * self_k_rot_swa = nullptr;
     ggml_tensor * self_v_rot_swa = nullptr;
 
+    // k19-kvwin: ring inputs (of the base cache for iSWA), unset without a ring
+    llm_graph_kv_win win;
+
     const llama_hparams hparams;
     const llama_cparams cparams;
 
@@ -606,6 +631,9 @@ public:
 
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_k_rot_swa = nullptr;
+
+    // k19-kvwin: ring inputs (of the base cache for iSWA), unset without a ring
+    llm_graph_kv_win win;
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -1358,6 +1386,11 @@ struct llm_graph_context {
     // GPU copy of the cached rows `view` [n_embd_head, n_head_kv, n_kv, 1] with the rows `cur` written at `idxs`
     ggml_tensor * kv_host_stage(ggml_tensor * view, ggml_tensor * cur, ggml_tensor * idxs) const;
 
+    // k19-kvwin: store this ubatch's K / V in the ring of a windowed cache and return the ring as the attention's second source (empty
+    // without a ring); n_embd_v_view > 0: V is a view of K (MLA)
+    llm_graph_attn_src2 build_kv_win_src(const llm_graph_kv_win & w, const llama_kv_cache_context * mctx, ggml_tensor * k_cur,
+            ggml_tensor * v_cur, int il, int64_t n_embd_v_view) const;
+
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_tokens]
@@ -1371,7 +1404,9 @@ struct llm_graph_context {
                     int   il,
             // the cache k / v are views of: an exact verify row reads fewer cells only when it sees none of the cells it drops
             // (nullptr: every row reads all n_kv cells)
-            const llama_kv_cache_context * mctx_kv = nullptr) const;
+            const llama_kv_cache_context * mctx_kv = nullptr,
+            // k19-kvwin: a second KV source (the recent-window ring), nullptr: none
+            const llm_graph_attn_src2 * src2 = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

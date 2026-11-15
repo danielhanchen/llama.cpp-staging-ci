@@ -1009,6 +1009,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel_mask(
     zeros = ggml_reshape_3d(ctx0, zeros, 1, n_sel, n_tokens);
 
     ggml_tensor * sel = ggml_set_rows(ctx0, mask_all, zeros, sel_idx);
+    qsa_c.sel_raw = sel; // k19-kvwin: the ring source takes the same selection (build_attn_qsa)
 
     GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[1]*kq_mask->ne[2]*kq_mask->ne[3] == n_tokens);
     const size_t row = sel->nb[2];
@@ -1068,7 +1069,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, sel, nullptr, nullptr, n_sel, kq_scale, il);
+    // k19-kvwin: the window ring as a second source, restricted to the selected cells: its mask (the window cells, moved out of the
+    // body mask, which sel is built from) plus the selection gathered at each slot's cell
+    llm_graph_attn_src2 src2 = build_kv_win_src(inp->win, mctx_cur, k_cur, v_cur, il, 0);
+    if (src2.k != nullptr) {
+        GGML_ASSERT(qsa_c.sel_raw != nullptr && qsa_c.sel_raw->ne[2] == n_tokens);
+        const int64_t n_slots = src2.mask->ne[0];
+        if (inp->win.cells == nullptr) {
+            inp->win.cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_slots, n_tokens);
+            ggml_set_input(inp->win.cells);
+            ggml_set_name(inp->win.cells, "attn_inp_win_cells");
+        }
+        ggml_tensor * sel_w = ggml_get_rows(ctx0, qsa_c.sel_raw, inp->win.cells); // F32 [1, n_slots, n_tokens]
+        sel_w = ggml_add(ctx0, ggml_reshape_4d(ctx0, sel_w, n_slots, src2.mask->ne[1], src2.mask->ne[2], src2.mask->ne[3]),
+                ggml_cast(ctx0, src2.mask, GGML_TYPE_F32));
+        src2.mask = ggml_cast(ctx0, sel_w, GGML_TYPE_F16);
+        cb(src2.mask, "kq_mask_qsa_win", il);
+    }
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, sel, nullptr, nullptr, n_sel, kq_scale, il, nullptr, src2.k ? &src2 : nullptr);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output

@@ -23,6 +23,7 @@
 #include "llama-autoprof.h"
 #include <filesystem>
 #include <limits>
+#include "llama-kv-cache.h"
 #include <cerrno>
 #include <mutex>
 #include <vector>
@@ -883,7 +884,41 @@ llama_context::llama_context(
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
 
-        memory.reset(model.create_memory(params_mem, cparams));
+        {
+            // k19-kvwin: the caches that are windows themselves take the window types
+            llama_kv_win_params wp = llama_kv_win_params_from(params);
+            if (!cparams.flash_attn) {
+                wp.n_win = -1;
+            }
+            llama_kv_win_creating_scope scope(&wp);
+            memory.reset(model.create_memory(params_mem, cparams));
+        }
+        // k19-kvwin: the recent-window ring of the attention cache (allocated beside it, before any graph is reserved)
+        if (memory) {
+            llama_kv_win_params wp = llama_kv_win_params_from(params);
+            wp.n_ubatch = cparams.n_ubatch;
+            if (wp.n_win >= 0 && !cparams.flash_attn) {
+                LLAMA_LOG_WARN("%s: k19-kvwin: the KV window ring needs flash attention: off\n", __func__);
+                wp.n_win = -1;
+            }
+            if (wp.n_win >= 0) {
+                llama_kv_cache * kv = nullptr;
+                if (auto * m = dynamic_cast<llama_kv_cache *>(memory.get())) {
+                    kv = m;
+                } else if (auto * mi = dynamic_cast<llama_kv_cache_iswa *>(memory.get())) {
+                    kv = mi->get_base();
+                } else if (auto * mh = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+                    kv = mh->get_mem_attn();
+                } else if (auto * mhi = dynamic_cast<llama_memory_hybrid_iswa *>(memory.get())) {
+                    kv = mhi->get_mem_attn()->get_base();
+                }
+                if (kv == nullptr) {
+                    LLAMA_LOG_WARN("%s: k19-kvwin: this model's memory has no plain attention cache for the KV window ring: off\n", __func__);
+                } else {
+                    kv->win_init(wp);
+                }
+            }
+        }
         if (memory) {
             memory->wait_state_reads = [this]() { state_async_wait_reads(); };
             // k16-draft: the replay commit of the delta-net states runs on this context's backends
@@ -12598,6 +12633,10 @@ llama_context_params llama_context_default_params() {
         /*.n_mem_reserve               =*/ 0,
         /*.spec_draft                  =*/ false,
         /*.n_state_capture             =*/ -1,
+        /*.kv_win                      =*/ -1,
+        /*.kv_win_sinks                =*/ 0,
+        /*.type_k_win                  =*/ GGML_TYPE_Q8_0,
+        /*.type_v_win                  =*/ GGML_TYPE_Q8_0,
     };
 
     return result;
@@ -12643,6 +12682,15 @@ llama_context * llama_init_from_model(
     if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) && params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
         return nullptr;
+    }
+
+    // k19-kvwin: the recent-window ring is read by flash attention
+    {
+        const llama_kv_win_params wp = llama_kv_win_params_from(params);
+        if (wp.n_win >= 0 && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+            LLAMA_LOG_INFO("%s: enabling flash_attn since the KV window ring needs it\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
     }
 
     if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {

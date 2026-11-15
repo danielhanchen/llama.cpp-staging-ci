@@ -518,6 +518,11 @@ void llama_kv_cache::clear(bool data) {
         v_heads[s] = 0;
     }
 
+    // k19-kvwin: every slot free again
+    for (auto & rg : v_rings) {
+        rg.reset(win_r, get_size());
+    }
+
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
@@ -841,7 +846,8 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
-    for (const auto & [ctx, buf] : ctxs_bufs) {
+    // k19-kvwin: the ring buffers count with the cache (a fixed cost, never lazily backed)
+    for (const auto * bufs : { &ctxs_bufs, &win_ctxs_bufs }) for (const auto & [ctx, buf] : *bufs) {
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
 
         if (hparams.no_alloc) {
@@ -931,6 +937,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     bool success = true;
 
     lazy_sim = true;
+    win_sim  = true;
     for (const auto & ubatch : ubatches) {
         // only find a suitable slot for the ubatch. don't modify the cells yet
         const auto sinfo_new = find_slot(ubatch, false);
@@ -960,6 +967,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     }
 
     lazy_sim = false;
+    win_sim  = false;
 
     GGML_ASSERT(!states.empty() || !success);
 
@@ -1041,6 +1049,20 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                 if (layer.v_stream[ssrc]) {
                     ggml_backend_tensor_copy(layer.v_stream[ssrc], layer.v_stream[sdst]);
                 }
+
+                // k19-kvwin: the ring rows of the stream go with it (the slot map is copied below)
+                for (ggml_tensor * w : { layer.k_win, layer.v_win }) {
+                    if (w != nullptr) {
+                        const size_t nb = w->nb[2];
+                        std::vector<uint8_t> tmp(nb);
+                        ggml_backend_tensor_get(w, tmp.data(), ssrc*nb, nb);
+                        ggml_backend_tensor_set(w, tmp.data(), sdst*nb, nb);
+                    }
+                }
+            }
+
+            if (win_on()) {
+                v_rings[sdst] = v_rings[ssrc];
             }
         }
     }
@@ -1522,6 +1544,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
+
+    // k19-kvwin: ring slots for the placed cells (not in prepare()'s simulation)
+    win_assign(sinfo, ubatch);
 }
 
 bool llama_kv_cache::get_can_shift() const {
@@ -2868,7 +2893,8 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
                 ggml_tensor * factors,
                       float   freq_base,
                       float   freq_scale,
-                   uint32_t   il) const {
+                   uint32_t   il,
+                       bool   dequant) const {
     const auto & n_ctx_orig = cparams.n_ctx_orig_yarn;
 
     const auto & yarn_ext_factor  = cparams.yarn_ext_factor;
@@ -2886,7 +2912,8 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
                                 : hparams.rope_type;
     ggml_tensor * tmp;
 
-    if (ggml_is_quantized(cur->type)) {
+    // (k19-kvwin: dequant forces this path for rotated rows of a type that is not quantized: an F16 ring beside a rotated cache)
+    if (ggml_is_quantized(cur->type) || dequant) {
         // dequantize to f32 -> RoPE -> quantize back
         tmp = ggml_cast(ctx, cur, GGML_TYPE_F32);
 
@@ -2920,6 +2947,9 @@ public:
 
     ggml_tensor * k_shift; // I32 [kv_size*n_stream]
 
+    // k19-kvwin: the shift of every ring row (its cell's shift), I32 [(win_r + 1)*n_stream]
+    ggml_tensor * win_shift = nullptr;
+
     // note: assumes k_rot^2 == I
     ggml_tensor * k_rot = nullptr;
 
@@ -2931,6 +2961,10 @@ void llm_graph_input_k_shift::set_input(const llama_ubatch * ubatch) {
 
     if (k_shift && k_shift->buffer) {
         kv_self->set_input_k_shift(k_shift);
+    }
+
+    if (win_shift && win_shift->buffer) {
+        kv_self->set_input_win_shift(win_shift);
     }
 
     if (k_rot && k_rot->buffer) {
@@ -2983,6 +3017,22 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
         ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, inp->k_rot, rope_factors, freq_base_l, freq_scale_l, il);
 
         ggml_build_forward_expand(gf, cur);
+
+        // k19-kvwin: the ring rows hold the same K: the same shift
+        if (layer.k_win != nullptr) {
+            if (inp->win_shift == nullptr) {
+                inp->win_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) (win_r + 1)*n_stream);
+                ggml_set_input(inp->win_shift);
+            }
+            ggml_tensor * kw =
+                ggml_view_3d(ctx, layer.k_win,
+                    n_rot, n_head_kv, (int64_t) (win_r + 1)*n_stream,
+                    ggml_row_size(layer.k_win->type, n_embd_head_k),
+                    ggml_row_size(layer.k_win->type, n_embd_k_gqa),
+                    ggml_row_size(layer.k_win->type, n_embd_nope));
+            ggml_build_forward_expand(gf, build_rope_shift(cparams, ctx, kw, inp->win_shift, inp->k_rot, rope_factors, freq_base_l, freq_scale_l, il,
+                        inp->k_rot != nullptr));
+        }
     }
 
     res->add_input(std::move(inp));
@@ -3176,10 +3226,13 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
 void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const {
     const auto & cells = v_cells[cr.strm];
 
+    // k19-kvwin: bit 8 = ring rows follow the K / V rows (state_write_win); a reader without it rejects the blob as a V layout
+    // mismatch instead of misreading it
     const uint32_t v_trans = this->v_trans ? 1 : 0;
     const uint32_t n_layer = layers.size();
 
-    io.write(&v_trans, sizeof(v_trans));
+    const uint32_t v_trans_win = v_trans | (win_on() ? 0x100 : 0);
+    io.write(&v_trans_win, sizeof(v_trans_win));
     io.write(&n_layer, sizeof(n_layer));
     io.write(&n_rot_k, sizeof(n_rot_k));
     io.write(&n_rot_v, sizeof(n_rot_v));
@@ -3271,6 +3324,10 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
                 }
             }
         }
+    }
+
+    if (win_on()) {
+        state_write_win(io, cr);
     }
 }
 
@@ -3373,7 +3430,10 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         // note: apply_ubatch() rebuilds llama_kv_cell_ext from the ubatch
         //       only ext.tok and the M-RoPE 2D position round-trip through it
         //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
+        // (k19-kvwin: the restored cells get ring slots from the blob, state_read_data, not from their positions)
+        win_no_assign = true;
         apply_ubatch(sinfo, ubatch);
+        win_no_assign = false;
 
         // apply_ubatch() takes the 2D position from the ubatch, and that ubatch is built with this
         // cache's own n_pos_per_embd. a cache that does not use M-RoPE itself but mirrors one that
@@ -3493,6 +3553,10 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     io.read(&n_layer, sizeof(n_layer));
     io.read(&n_rot_k_ref, sizeof(n_rot_k_ref));
     io.read(&n_rot_v_ref, sizeof(n_rot_v_ref));
+
+    // k19-kvwin: ring rows follow (state_write_data)
+    const bool blob_win = (v_trans & 0x100) != 0;
+    v_trans &= 0xff;
 
     if (n_layer != layers.size()) {
         LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, (uint32_t) layers.size());
@@ -3628,6 +3692,10 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                 }
             }
         }
+    }
+
+    if (blob_win && !state_read_win(io, strm, cell_count, sinfo)) {
+        return false;
     }
 
     return true;

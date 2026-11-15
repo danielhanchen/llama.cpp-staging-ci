@@ -786,6 +786,11 @@ std::string server_prompt_ssd_namespace(
             params.yarn_beta_slow, params.yarn_orig_ctx));
 
     // k19-fixE: the lines below are added only off their defaults, so that a default configuration keeps its namespace (directory)
+    // k19-kvwin: the KV window ring (its rows are part of the saved states)
+    if (params.kv_win >= 0) {
+        add("kv_win", string_format("%d|%d|%s|%s", params.kv_win, params.kv_win_sinks, ggml_type_name(params.cache_type_k_win),
+                ggml_type_name(params.cache_type_v_win)));
+    }
     if (params.attention_type != LLAMA_ATTENTION_TYPE_UNSPECIFIED) {
         add("attention_type", std::to_string((int) params.attention_type));
     }
