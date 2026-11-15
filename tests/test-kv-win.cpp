@@ -32,6 +32,7 @@ struct cfg {
     uint32_t  n_ctx   = 512;
     uint32_t  n_ubatch = 64;
     uint32_t  n_seq   = 1;
+    bool      unified = true;
 };
 
 static llama_context * make_ctx(llama_model * model, const cfg & c) {
@@ -41,7 +42,7 @@ static llama_context * make_ctx(llama_model * model, const cfg & c) {
     cp.n_ubatch        = c.n_ubatch;
     cp.n_seq_max       = c.n_seq;
     cp.n_rs_seq        = 4; // recurrent states of hybrid models roll back with the drafts
-    cp.kv_unified      = true;
+    cp.kv_unified      = c.unified;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     cp.n_threads       = 4;
     cp.n_threads_batch = 4;
@@ -278,6 +279,30 @@ static std::vector<float> run_multi(llama_model * model, const cfg & c, const st
     return s_out == 0 ? o0 : o1;
 }
 
+// seq_cp of a whole sequence into another stream (the stream copy of update(): cache rows, ring rows, slot map), then decodes there
+static std::vector<float> run_cp_stream(llama_model * model, const cfg & c, const std::vector<llama_token> & prompt,
+        const std::vector<llama_token> & dec) {
+    const int nv = n_vocab_of(model);
+    cfg c2 = c;
+    c2.n_seq = 2;
+    c2.unified = false;
+    llama_context * ctx = make_ctx(model, c2);
+    std::vector<float> out;
+    if (ctx == nullptr) {
+        return out;
+    }
+    bool ok = decode(ctx, prompt, 0, 0, false, &out, nv);
+    llama_memory_seq_cp(llama_get_memory(ctx), 0, 1, -1, -1);
+    for (size_t i = 0; ok && i < dec.size(); ++i) {
+        ok = decode(ctx, { dec[i] }, (llama_pos) (prompt.size() + i), 1, false, &out, nv);
+    }
+    llama_free(ctx);
+    if (!ok) {
+        out.clear();
+    }
+    return out;
+}
+
 static void test_model(const std::string & path, const std::string & name) {
     auto mp = llama_model_default_params();
     mp.n_gpu_layers = g_ngl;
@@ -398,6 +423,17 @@ static void test_model(const std::string & path, const std::string & name) {
         const double e = std::max(max_rel(m0, s0), max_rel(m1, s1));
         snprintf(buf, sizeof(buf), "max rel %.3g vs alone (q8_0 vs q4_0 %.3g)", e, max_rel(r_q8, r_q4));
         report(name.c_str(), "multiseq", e < 2e-3, buf);
+        // one stream per sequence (rings per stream)
+        cfg ws = w32; ws.unified = false;
+        const auto n0 = run_multi(model, ws, prompt, p1, dec, 0);
+        const auto n1 = run_multi(model, ws, prompt, p1, dec, 1);
+        const double e2 = std::max(max_rel(n0, s0), max_rel(n1, s1));
+        snprintf(buf, sizeof(buf), "two streams: max rel %.3g vs alone", e2);
+        report(name.c_str(), "streams", e2 < 2e-3, buf);
+        const auto cp = run_cp_stream(model, w32, prompt, dec);
+        const double e3 = max_rel(cp, s0);
+        snprintf(buf, sizeof(buf), "seq_cp into another stream: max rel %.3g vs alone", e3);
+        report(name.c_str(), "seqcp", e3 < 2e-3, buf);
     }
     {
         const auto a = run_plain(model, w32, prompt, dec);
