@@ -8604,7 +8604,7 @@ struct llama_moe_cache::impl {
     }
 
     // k19-g4pref cross-layer prefetch. LLAMA_MOE_PREFETCH=N (1..32; unset / 0 = off): in decode / verify windows of at most
-    // LLAMA_MOE_PREFETCH_MAX_TOKENS (default 8) tokens, a cache layer whose previous MoE layer is a cache layer of the same group (both
+    // LLAMA_MOE_PREFETCH_MAX_TOKENS (default 8) tokens, a cache layer whose previous MoE layer is a cache layer on the same device (both
     // on the device lookup) admits, beside the graph, the N experts with the largest logits of its router run on the previous layer's
     // MoE input, at most LLAMA_MOE_PREFETCH_MAX (default 0 = no cap) per layer and window; its own lookup waits for those copies
     static int prefetch_n() {
@@ -8622,12 +8622,14 @@ struct llama_moe_cache::impl {
         if (prefetch_n() <= 0 || force_large || n_ubatch < 1 || n_ubatch > max_tok || n_ubatch > n_small_max) {
             return false;
         }
-        if (il_prev < 0 || il <= il_prev || il >= (int32_t) layers.size() || layers[il].ig < 0 || layers[il_prev].ig != layers[il].ig) {
+        // (the groups are per expert type, so neighbouring layers are often in different groups; both on the same device)
+        if (il_prev < 0 || il <= il_prev || il >= (int32_t) layers.size() || layers[il].ig < 0 || layers[il_prev].ig < 0) {
             return false;
         }
-        const group & g = groups[layers[il].ig];
-        if (!use_device(g, n_ubatch) || !slots_fit(g, n_ubatch) || layers[il].host_dev.size() != g.banks.size() ||
-                layers[il_prev].host_dev.size() != g.banks.size()) {
+        const group & g  = groups[layers[il].ig];
+        const group & gp = groups[layers[il_prev].ig];
+        if (g.id != gp.id || !use_device(g, n_ubatch) || !slots_fit(g, n_ubatch) || layers[il].host_dev.size() != g.banks.size() ||
+                !use_device(gp, n_ubatch) || layers[il_prev].host_dev.size() != gp.banks.size()) {
             return false;
         }
         // frozen small batches admit nothing (k13), and the prefetch admits
