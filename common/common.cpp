@@ -3404,7 +3404,12 @@ uma_restart:
             if (lc_on) {
                 const ggml_type t = cparams.type_k == cparams.type_v ? cparams.type_k : GGML_TYPE_COUNT;
                 const kv_probe a = t != GGML_TYPE_COUNT ? probe(t, true, 0) : kv_probe{};
-                if (a.ok && a.layers < n_layer + 1) {
+                // also where every layer fits but experts stay in host memory, with LLAMA_FIT_LONGCTX_UB=2 (or LLAMA_FIT_LONGCTX_CACHE=1):
+                // at a long context the compute buffer takes what the MoE cache and a drafter would get. G4 16 GB, Flash-Next ctx 262144,
+                // -ub 2048: 4924 MiB of compute buffer, no MoE cache, no drafter, chat 37 tok/s (12 GB with n_ubatch 512: 83)
+                const bool lc_cache = a.ok && a.layers >= n_layer + 1 && a.n_host > 0 && ub_may &&
+                    (lc_ub == 2 || env_i("LLAMA_FIT_LONGCTX_CACHE", 0) != 0);
+                if (a.ok && (a.layers < n_layer + 1 || lc_cache)) {
                     // better: more layers, then more MoE cache, then the MTP drafter
                     const auto better = [](const kv_probe & x, const kv_probe & y) {
                         if (!x.ok) {
