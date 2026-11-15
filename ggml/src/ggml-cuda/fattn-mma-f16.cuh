@@ -2572,7 +2572,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         const ggml_tensor * K = dst->src[1];
         const ggml_tensor * V = dst->src[2];
         bool aligned16 = true;
-        for (const ggml_tensor * t : {K, V, dst->src[6], dst->src[7]}) {
+        for (const ggml_tensor * t : {K, V, (const ggml_tensor *) dst->src[6], (const ggml_tensor *) dst->src[7]}) {
             aligned16 = aligned16 && (uintptr_t) t->data % 16 == 0 && t->nb[1] % 16 == 0 && t->nb[2] % 16 == 0 && t->nb[3] % 16 == 0;
         }
         static const int q8_mode_env = getenv("GGML_CUDA_FATTN_Q8_MODE") ? atoi(getenv("GGML_CUDA_FATTN_Q8_MODE")) : 0;
