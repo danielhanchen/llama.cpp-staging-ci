@@ -107,6 +107,10 @@ static std::vector<tcase> cases() {
             v.push_back({ tp.first, tp.second, 256, 24, 4, 2048, n_kv, true, 0 });
         }
     }
+    // FATTN_Q4_EXACT_QUICK=1: the untimed cases only (compute-sanitizer runs)
+    if (getenv("FATTN_Q4_EXACT_QUICK") != nullptr && atoi(getenv("FATTN_Q4_EXACT_QUICK")) != 0) {
+        v.erase(std::remove_if(v.begin(), v.end(), [](const tcase & c) { return c.timed || c.n_kv > 4096; }), v.end());
+    }
     return v;
 }
 
