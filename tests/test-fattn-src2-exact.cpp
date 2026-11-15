@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -69,9 +70,11 @@ static std::vector<tcase> cases() {
         }
     }
     // the priority shapes (head size 256, Qwen3.8-27B 24 / 4, Qwen3.6-35B-A3B 16 / 2): verify windows and a prompt ubatch
-    for (int T : { 3, 8, 512 }) {
-        v.push_back({ Q4, Q8, 256, 256, 24, 4, T, 8192, 1792, false });
-        v.push_back({ Q4, Q8, 256, 256, 16, 2, T, 8192, 1792, false });
+    for (int n1 : { 8192, 32768 }) {
+        for (int T : { 1, 3, 8, 512 }) {
+            v.push_back({ Q4, Q8, 256, 256, 24, 4, T, n1, 1792, false });
+            v.push_back({ Q4, Q8, 256, 256, 16, 2, T, n1, 1792, false });
+        }
     }
     // MLA (K-only cache, V = view of K): staged
     for (int T : { 1, 3, 16 }) {
@@ -191,7 +194,7 @@ static uint64_t fnv(const std::vector<uint8_t> & o) {
 }
 
 // ref: one plain node over the concatenated f16 cells; else the two-source node
-static std::vector<uint8_t> run_case(ggml_backend_t backend, const tcase & c, const case_data & d, bool ref) {
+static std::vector<uint8_t> run_case(ggml_backend_t backend, const tcase & c, const case_data & d, bool ref, double * us = nullptr) {
     ggml_init_params ip = { 32*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
     const int64_t rowk = (int64_t) c.D*c.HKV, rowv = (int64_t) c.DV*c.HKV, nc = c.n1 + c.n2;
@@ -251,6 +254,18 @@ static std::vector<uint8_t> run_case(ggml_backend_t backend, const tcase & c, co
     }
     std::vector<uint8_t> o(ggml_nbytes(out));
     ggml_backend_tensor_get(out, o.data(), 0, o.size());
+    if (us) {
+        std::vector<double> t;
+        for (int it = 0; it < 7; ++it) {
+            ggml_backend_synchronize(backend);
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            ggml_backend_graph_compute(backend, gf);
+            ggml_backend_synchronize(backend);
+            t.push_back(std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count());
+        }
+        std::sort(t.begin(), t.end());
+        *us = t[t.size()/2];
+    }
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     return o;
@@ -288,8 +303,9 @@ static int run_child(const char * path) {
     for (size_t i = 0; i < cs.size(); ++i) {
         const case_data d = make_data(cs[i], 23 + (int) i);
         uint64_t rec[3] = { 0, 0, 0 };
+        double us = 0.0;
         if (supported(dev, cs[i])) {
-            rec[0] = fnv(run_case(backend, cs[i], d, false));
+            rec[0] = fnv(run_case(backend, cs[i], d, false, cs[i].n1 >= 8192 ? &us : nullptr));
             // (one row: the plain node may take the vector kernel, so (b) is checked from 2 rows)
             rec[1] = want_ref && cs[i].T >= 2 ? fnv(run_case(backend, cs[i], d, true)) : 0;
             rec[2] = 1;
@@ -297,6 +313,7 @@ static int run_child(const char * path) {
             n_unsup++;
         }
         fwrite(rec, sizeof(rec), 1, f);
+        fwrite(&us, sizeof(us), 1, f);
     }
     const int32_t eng = g_src2_logged ? 1 : 0;
     fwrite(&eng, sizeof(eng), 1, f);
@@ -328,6 +345,7 @@ int main(int argc, char ** argv) {
     const auto cs = cases();
     const char * names[3] = { "in-place", "in-place sync", "staged" };
     std::vector<std::array<uint64_t, 3>> outs[3];
+    std::vector<double> times[3]; // median us of the two-source node (body >= 8192 cells only)
     int32_t engaged[3] = { 0, 0, 0 };
     for (int mode = 0; mode < 3; ++mode) {
         const std::string path = std::string(argc > 1 ? argv[1] : ".") + "/fattn_src2_exact_" + std::to_string(mode) + ".bin";
@@ -347,11 +365,13 @@ int main(int argc, char ** argv) {
         }
         for (size_t i = 0; i < cs.size(); ++i) {
             std::array<uint64_t, 3> rec = {};
-            if (fread(rec.data(), sizeof(uint64_t), 3, f) != 3) {
+            double us = 0.0;
+            if (fread(rec.data(), sizeof(uint64_t), 3, f) != 3 || fread(&us, sizeof(us), 1, f) != 1) {
                 printf("FAIL: short dump from child %s\n", names[mode]);
                 return 1;
             }
             outs[mode].push_back(rec);
+            times[mode].push_back(us);
         }
         if (fread(&engaged[mode], sizeof(int32_t), 1, f) != 1) {
             printf("FAIL: short dump from child %s\n", names[mode]);
@@ -371,8 +391,12 @@ int main(int argc, char ** argv) {
         const bool eq_a = outs[0][i][0] == outs[2][i][0] && outs[1][i][0] == outs[2][i][0];
         const bool eq_b = cs[i].T < 2 || outs[2][i][0] == outs[2][i][1];
         n_bad += !(eq_a && eq_b);
-        printf("  %s: in place == staged %s, staged == concatenated %s%s\n", cs[i].str().c_str(), eq_a ? "yes" : "NO",
-            cs[i].T < 2 ? "(1 row: n/a)" : (eq_b ? "yes" : "NO"),
+        char tb[96] = "";
+        if (times[2][i] > 0.0) {
+            snprintf(tb, sizeof(tb), " | us in place %.1f sync %.1f staged %.1f (%.3fx)", times[0][i], times[1][i], times[2][i], times[0][i]/times[2][i]);
+        }
+        printf("  %s: in place == staged %s, staged == concatenated %s%s%s\n", cs[i].str().c_str(), eq_a ? "yes" : "NO",
+            cs[i].T < 2 ? "(1 row: n/a)" : (eq_b ? "yes" : "NO"), tb,
             eq_a && eq_b ? "" : "  <- FAIL");
     }
     printf("two-source kernel logged: %d / %d / %d\n", engaged[0], engaged[1], engaged[2]);
