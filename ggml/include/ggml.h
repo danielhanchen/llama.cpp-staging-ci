@@ -2718,19 +2718,6 @@ extern "C" {
             struct ggml_tensor * kv_len,
             int32_t              n);
 
-    // two-source flash attention: attend over the union of (k, v, mask) and (k2, v2, mask2)
-    //   k2:    [n_embd_k, n_kv2, n_head_kv, ne3]   any FA K type, may differ from k's type
-    //   v2:    [n_embd_v, n_kv2, n_head_kv, ne3]   !! not transposed !!, any FA V type
-    //   mask2: [n_kv2, n_batch_pad, ne32, ne33]    F16, contiguous, same ne[1..3] as mask
-    // result = softmax over every cell of both sources (scale, ALiBi slope, softcap and sinks as for the first source; sinks once).
-    // kv_len (src[5]) and n_kv_max (sparse) apply to the first source only. Stored as a->src[6] = k2, a->src[7] = v2, a->src[8] = mask2
-    // (interface of k19-kvwin, plans/k19_kvwin.md)
-    GGML_API void ggml_flash_attn_ext_set_src2(
-            struct ggml_tensor * a,
-            struct ggml_tensor * k2,
-            struct ggml_tensor * v2,
-            struct ggml_tensor * mask2);
-
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

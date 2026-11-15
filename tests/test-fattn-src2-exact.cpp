@@ -16,6 +16,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-fa-src2.h"
 
 #include <algorithm>
 #include <array>
