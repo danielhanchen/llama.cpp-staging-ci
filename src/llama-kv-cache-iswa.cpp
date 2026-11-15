@@ -100,8 +100,9 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
+    // k19-kvwin: the SWA cache is a window already: the window mode keeps it in the window types (the base cache gets the ring)
     kv_swa = std::make_unique<llama_kv_cache>(
-            model, hparams, type_k, type_v,
+            model, hparams, llama_kv_win_window_type(type_k, true), llama_kv_win_window_type(type_v, false),
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share);
 }

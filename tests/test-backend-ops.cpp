@@ -10129,20 +10129,32 @@ struct test_kq_mask : public test_case {
     const ggml_type type;
     const int64_t n_kv, n_tps, n_stream;
     const int swa_type, n_swa, is_2d;
+    const int win_mode, n_win, n_sinks; // k19-kvwin: ggml_kq_mask_win (1 = body without the flagged window cells, 2 = ring)
 
     std::string vars() override {
+        if (win_mode != 0) {
+            return VARS_TO_STR10(type, n_kv, n_tps, n_stream, swa_type, n_swa, is_2d, win_mode, n_win, n_sinks);
+        }
         return VARS_TO_STR7(type, n_kv, n_tps, n_stream, swa_type, n_swa, is_2d);
     }
 
-    test_kq_mask(ggml_type type = GGML_TYPE_F16, int64_t n_kv = 1024, int64_t n_tps = 64, int64_t n_stream = 1, int swa_type = 0, int n_swa = 0, int is_2d = 0)
-        : type(type), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), swa_type(swa_type), n_swa(n_swa), is_2d(is_2d) {}
+    test_kq_mask(ggml_type type = GGML_TYPE_F16, int64_t n_kv = 1024, int64_t n_tps = 64, int64_t n_stream = 1, int swa_type = 0, int n_swa = 0, int is_2d = 0,
+            int win_mode = 0, int n_win = 0, int n_sinks = 0)
+        : type(type), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), swa_type(swa_type), n_swa(n_swa), is_2d(is_2d),
+          win_mode(win_mode), n_win(n_win), n_sinks(n_sinks) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * cells = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 5, n_kv, n_stream);
         ggml_set_name(cells, "cells");
         ggml_tensor * toks = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 8, n_tps, n_stream);
         ggml_set_name(toks, "toks");
-        ggml_tensor * out = ggml_kq_mask(ctx, cells, toks, type);
+        ggml_tensor * flags = nullptr;
+        if (win_mode == 1) {
+            flags = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_stream);
+            ggml_set_name(flags, "flags");
+        }
+        ggml_tensor * out = win_mode != 0 ? ggml_kq_mask_win(ctx, cells, toks, flags, type, win_mode, n_win, n_sinks)
+                                          : ggml_kq_mask(ctx, cells, toks, type);
         ggml_set_name(out, "out");
         return out;
     }
@@ -10173,6 +10185,12 @@ struct test_kq_mask : public test_case {
                     v[8*i + 5] = is_2d;
                     v[8*i + 6] = (int32_t) (rng() % 4);
                     v[8*i + 7] = (int32_t) (rng() % 4);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "flags") == 0) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (auto & x : v) {
+                    x = (int32_t) (rng() % 3 != 0);
                 }
                 ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
             } else {
@@ -13929,6 +13947,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_kq_mask(t, 1024, 64, 1, 3, 100, 0));
         // more than 65535 tokens per stream (the CUDA grid.y limit), two streams
         test_cases.emplace_back(new test_kq_mask(t, 64, 65600, 2, 0, 0, 0));
+        // k19-kvwin: the window rule (body without the flagged window cells / the ring's window cells), sinks, two streams, 2D
+        for (int mode : { 1, 2 }) {
+            test_cases.emplace_back(new test_kq_mask(t, 1024, 64,  1, 0, 0, 0, mode, 100, 4));
+            test_cases.emplace_back(new test_kq_mask(t, 4096, 512, 1, 0, 0, 0, mode, 1024, 0));
+            test_cases.emplace_back(new test_kq_mask(t, 1024, 32,  2, 0, 0, 1, mode, 17, 1));
+            test_cases.emplace_back(new test_kq_mask(t, 1024, 64,  1, 0, 0, 0, mode, 1 << 30, 0));
+        }
     }
     test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, 1048576.0f, 1.0f));
     test_cases.emplace_back(new test_timestep_embedding());

@@ -2516,6 +2516,9 @@ static void ggml_compute_forward_kq_mask(const struct ggml_compute_params * para
     const int64_t dr = (n_rows + params->nth - 1)/params->nth;
     const int64_t r0 = dr*params->ith, r1 = MIN(r0 + dr, n_rows);
     const ggml_fp16_t keep16 = GGML_CPU_FP32_TO_FP16(0.0f), drop16 = GGML_CPU_FP32_TO_FP16(-INFINITY);
+    // k19-kvwin (ggml_kq_mask_win): 1 = without the window cells that have a ring copy (flags), 2 = the ring's window cells only
+    const int32_t win_mode = ggml_get_op_params_i32(dst, 8), n_win = ggml_get_op_params_i32(dst, 9), n_sinks = ggml_get_op_params_i32(dst, 10);
+    const struct ggml_tensor * flags = win_mode == 1 ? dst->src[2] : NULL;
     for (int64_t r = r0; r < r1; ++r) {
         const int64_t s = r / n_tps, i = r % n_tps;
         const int32_t * t = (const int32_t *) ((const char *) toks->data + s*toks->nb[2] + i*toks->nb[1]);
@@ -2536,6 +2539,14 @@ static void ggml_compute_forward_kq_mask(const struct ggml_compute_params * para
             }
             if (keep && swa_type != 0 && ggml_kq_mask_swa_masked(swa_type, n_swa, p0, p1)) {
                 keep = false;
+            }
+            if (keep && win_mode != 0) {
+                const bool in_win = (p0 <= p1 && (int64_t) p0 > (int64_t) p1 - n_win) || p0 < n_sinks;
+                if (win_mode == 1) {
+                    keep = !(in_win && ((const int32_t *) ((const char *) flags->data + s*flags->nb[1]))[j] != 0);
+                } else {
+                    keep = in_win;
+                }
             }
             if (dst->type == GGML_TYPE_F16) {
                 ((ggml_fp16_t *) ((char *) dst->data + s*dst->nb[3] + i*dst->nb[1]))[j] = keep ? keep16 : drop16;
