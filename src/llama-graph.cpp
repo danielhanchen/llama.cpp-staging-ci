@@ -149,8 +149,14 @@ static void kv_win_set(const llm_graph_kv_win & w, const llama_kv_cache_context 
     if (w.idxs == nullptr) {
         return;
     }
-    const bool mask_ok = kq_mask_settable(kq_mask) && kq_mask->op != GGML_OP_KQ_MASK;
-    mctx->set_input_win(w.idxs, w.mask, mask_ok ? kq_mask : nullptr, ubatch, w.cells);
+    const bool mask_ok = w.used && kq_mask_settable(kq_mask) && kq_mask->op != GGML_OP_KQ_MASK;
+    if (!w.used) {
+        static std::atomic<bool> logged { false };
+        if (!logged.exchange(true)) {
+            LLAMA_LOG_WARN("%s: k19-kvwin: no attention of this graph reads the KV window ring: the cache is read as without it\n", __func__);
+        }
+    }
+    mctx->set_input_win(w.idxs, w.used ? w.mask : nullptr, mask_ok ? kq_mask : nullptr, ubatch, w.cells);
 }
 
 static bool kv_win_can_reuse(const llm_graph_kv_win & w, const llama_kv_cache_context * mctx, const llama_ubatch & ubatch,
@@ -4070,6 +4076,7 @@ static llm_graph_attn_src2 kv_win_store_src(ggml_context * ctx0, ggml_cgraph * g
         : mctx->get_v_win(ctx0, il);
     r.mask  = w.mask;
     r.fused = mctx->get_kv()->win_fused();
+    w.used  = r.v != nullptr;
     return r;
 }
 
@@ -4481,6 +4488,8 @@ ggml_tensor * llm_graph_context::build_attn(
             src2.fused = mctx_cur->get_kv()->win_fused();
             if (src2.v == nullptr) {
                 src2 = {};
+            } else {
+                inp->win.used = true;
             }
         }
     }

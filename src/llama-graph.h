@@ -368,6 +368,9 @@ struct llm_graph_kv_win {
     ggml_tensor * idxs = nullptr; // I64 [n_batch]
     ggml_tensor * mask = nullptr; // F16 [n_win_slots, n_batch/n_stream, 1, n_stream]
     ggml_tensor * cells = nullptr; // I32 [n_win_slots, n_batch] the cell of every live slot (0 for the others), per token; on demand
+    // set when an attention of the graph reads the ring (build_kv_win_src): only then are the window cells moved out of the body mask, so
+    // an attention path that does not take the ring (a model's own sparse attention) keeps reading every cell from the cache
+    mutable bool used = false;
 };
 
 // k19-kvwin: the second KV source of an attention (the ring views and their mask), see build_attn_mha

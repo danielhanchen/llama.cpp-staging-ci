@@ -901,6 +901,12 @@ llama_context::llama_context(
                 LLAMA_LOG_WARN("%s: k19-kvwin: the KV window ring needs flash attention: off\n", __func__);
                 wp.n_win = -1;
             }
+            // drafters (MTP heads, DFlash): their caches are written by their own paths (KV injection, K / V-only passes), and their
+            // accuracy only moves the acceptance; the ring is for the target
+            if (wp.n_win >= 0 && (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || model.arch == LLM_ARCH_DFLASH)) {
+                LLAMA_LOG_INFO("%s: k19-kvwin: no KV window ring for a drafter context\n", __func__);
+                wp.n_win = -1;
+            }
             if (wp.n_win >= 0) {
                 llama_kv_cache * kv = nullptr;
                 if (auto * m = dynamic_cast<llama_kv_cache *>(memory.get())) {
