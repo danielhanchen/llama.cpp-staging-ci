@@ -157,7 +157,8 @@ static double cosine(const std::vector<float> & a, const std::vector<float> & b)
 }
 
 // --ngl N: layers on the GPU. There the bit-for-bit checks against a plain cache become tolerance checks (the stopgap or the
-// two-source kernel and the plain kernels differ in staging and split); rollback / state stay bit for bit (same shapes, same kernels)
+// two-source kernel and the plain kernels differ in staging and split); rollback stays bit for bit (same shapes, same kernels), state
+// within the plain cache's own save / restore difference
 static int g_ngl = 0;
 
 static int n_fail = 0;
@@ -388,8 +389,14 @@ static void test_model(const std::string & path, const std::string & name) {
         cfg big = w32; big.win = 1 << 20; // ring = cache: never reclaimed
         const auto a = run_state(model, big, prompt, dec, false);
         const auto b = run_state(model, big, prompt, dec, true);
-        snprintf(buf, sizeof(buf), "full-size ring: max rel %.3g", max_rel(b, a));
-        report(name.c_str(), "state", bits_equal(a, b), buf);
+        // GPU: a restored cache can be read with another split / tile count than the live one (iSWA restores compact the SWA cells),
+        // so there the bound is the plain q4_0 cache's own save / restore difference (the ring adds nothing to it)
+        double e_plain = 0.0;
+        if (g_ngl > 0 && !bits_equal(a, b)) {
+            e_plain = max_rel(run_state(model, q4, prompt, dec, true), run_state(model, q4, prompt, dec, false));
+        }
+        snprintf(buf, sizeof(buf), "full-size ring: max rel %.3g (plain q4_0 save / restore %.3g)", max_rel(b, a), e_plain);
+        report(name.c_str(), "state", bits_equal(a, b) || (g_ngl > 0 && max_rel(b, a) <= std::max(4.0*e_plain, 1e-5)), buf);
         const auto a2 = run_state(model, w32, prompt, dec, false);
         const auto b2 = run_state(model, w32, prompt, dec, true);
         const double e = max_rel(b2, a2);
