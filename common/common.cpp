@@ -3154,6 +3154,8 @@ uma_restart:
 
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
+        common_fit_set_ubatch_user(params.n_ubatch_set); // k19-fitfaoff
+        common_fit_faoff_ubatch_reset();
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 
         // the draft context is created from the same base params and follows the main context, fit both together
@@ -4085,6 +4087,19 @@ uma_restart:
             }
         }
 
+        // k19-fitfaoff (LLAMA_FIT_FAOFF_UB=0 off): without flash attention and without -ub the fit chose n_ubatch for the F16 copies of
+        // the KQ matrix it reserves (common_fit_faoff_ubatch_plan); it stays as if given with -ub, so the n_ubatch growth rules below
+        // (resident ubatch, the MoE cache's auto ubatch, up to 2048 and more), which do not price those copies, keep it. Kaggle 2x T4
+        // dsf8 -fa off ctx 16384: -ub 2048 with its 4096 MiB reserve 4.5 / 2.5 tok/s chat / 8k, -ub 512 52.7 / 17.1, both without an abort
+        if (fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && !params.n_ubatch_set && common_fit_faoff_ubatch() > 0) {
+            const uint32_t ub = std::min<uint32_t>(cparams.n_ubatch, common_fit_faoff_ubatch());
+            COM_INF("%s: --fit: flash attention off: n_ubatch %u kept (the KQ copies are reserved at it; LLAMA_FIT_FAOFF_UB=0 lets it grow)\n",
+                __func__, ub);
+            cparams.n_ubatch      = ub;
+            params.n_ubatch       = (int32_t) ub;
+            params.n_ubatch_set   = true;
+        }
+
         // k9-prompt-pass: every expert on the device (the MoE cache was asked for and has nothing to hold): the prompt runs at
         // LLAMA_MOE_RESIDENT_UB (2048) instead of the default n_ubatch when the fit still places every expert on the device at that
         // ubatch, the KV cache does not grow with it (no sliding-window layers: their cache holds the window plus one ubatch, which every
@@ -4161,12 +4176,11 @@ uma_restart:
             // slack on both cards that the even tensor split uses. Kaggle 2x T4 dsf8 (plans/k19_2xt4board.md): -sm layer + 2 x 8.9 GB
             // MoE cache 65.6 / 63.1 tok/s (chat / 8k), 8k TTFT 11.5 s; -sm tensor 75.1 / 69.3, 5.05 s
             // srv_kld long48 on dsf8 (vs the layer + cache default): first-token KLD mean 0.0091 / p99 0.134 / top1 0.917, per position
-            // 0.0027 / 0.133 / 0.9725 vs rounding-only bands 0.0035-0.0061 / 0.018-0.133 / 0.938-0.958 and 0.0017-0.0019 / 0.047-0.056 /
-            // 0.981-0.982 (GGML_CUDA_DISABLE_FUSION=1, one T4; the -fa off band OOMs there): outside the band, so opt-in
-            // (LLAMA_SPLIT_AUTO_TENSOR_HOST=1); unset / 0 = the layer fit's host experts and cache as before
+            // 0.0027 / 0.133 / 0.9725, inside the -fa off band of the same launch (k19-fitfaoff, -fa off vs on: 0.0095 / 0.143 / 0.917 and
+            // 0.0025 / 0.133 / 0.9736), so on by default; LLAMA_SPLIT_AUTO_TENSOR_HOST=0 = the layer fit's host experts and cache as before
             static const bool host_on = [] {
                 const char * e = getenv("LLAMA_SPLIT_AUTO_TENSOR_HOST");
-                return e != nullptr && atoi(e) != 0;
+                return e == nullptr || atoi(e) != 0;
             }();
             const bool tbo_user_none = std::none_of(tbo_in.begin(), tbo_in.end(),
                 [](const llama_model_tensor_buft_override & o) { return o.pattern != nullptr; });
@@ -4229,7 +4243,7 @@ uma_restart:
                         const size_t n_fit_tbo = (size_t) std::count_if(params.tensor_buft_overrides.begin(), params.tensor_buft_overrides.end(),
                             [](const llama_model_tensor_buft_override & o) { return o.pattern != nullptr; });
                         COM_INF("%s: --fit: -sm tensor holds the whole model: the layer fit's host experts (%zu overrides) and %zu MiB MoE "
-                            "cache dropped (LLAMA_SPLIT_AUTO_TENSOR_HOST=1; unset keeps them)\n", __func__, n_fit_tbo,
+                            "cache dropped (LLAMA_SPLIT_AUTO_TENSOR_HOST=0 keeps them)\n", __func__, n_fit_tbo,
                             cparams.moe_cache_size/(1024*1024));
                         params.tensor_buft_overrides = tbo_in;
                         mparams.tensor_buft_overrides = mparams_in.tensor_buft_overrides != nullptr && !params.tensor_buft_overrides.empty() ?
