@@ -1985,6 +1985,54 @@ void llama_context::rs_replay_commit(bool sync) {
     if (rs_mode == 0) {
         rs_replay_setup();
     }
+    // k19-g4tier (LLAMA_RS_CONV_BATCH=0 off): a commit left with conv snapshots only (every window committed by a fused ubatch: the usual
+    // verify after a rejected draft) is one batched copy on the backend's stream instead of a commit graph of one CPY per conv history
+    // (Flash-Next: 36 copies of 120 KiB launched eagerly, or a re-captured graph, between the drafter and the verify, plus the graph's
+    // host work): the same bytes from the same snapshot rows onto the same live rows, in the same stream order
+    static const bool conv_batch = getenv("LLAMA_RS_CONV_BATCH") == nullptr || atoi(getenv("LLAMA_RS_CONV_BATCH")) != 0;
+    if (conv_batch && rs_mode == 1 && rs_backend != nullptr) {
+        bool conv_only = true;
+        for (uint32_t c = 0; c < mem->size && conv_only; ++c) {
+            conv_only = mem->pend_n[c] == 0;
+        }
+        static const bool batch_ok = ggml_backend_tensor_copy_regions_async(rs_backend, nullptr, 0);
+        if (conv_only && batch_ok) {
+            std::vector<ggml_backend_copy_region> regions;
+            bool ok = true;
+            for (uint32_t c = 0; c < mem->size && ok; ++c) {
+                const uint32_t rb = mem->conv_rb[c];
+                if (rb == 0) {
+                    continue;
+                }
+                for (size_t il = 0; il < mem->s_l.size() && ok; ++il) {
+                    if (mem->s_l[il] == nullptr || mem->rk_l[il] == nullptr) {
+                        continue; // as rs_commit_build: only the layers with a replay window
+                    }
+                    for (ggml_tensor * t : { mem->r_l[il], il < mem->p_l.size() ? mem->p_l[il] : nullptr }) {
+                        if (t == nullptr) {
+                            continue;
+                        }
+                        ok = ok && t->buffer != nullptr && ggml_backend_buffer_get_type(t->buffer) == rs_buft &&
+                            (int64_t) ((size_t) rb * mem->size + c) < t->ne[1];
+                        regions.push_back({ t, ((size_t) rb * mem->size + c) * t->nb[1], t, (size_t) c * t->nb[1], ggml_row_size(t->type, t->ne[0]) });
+                    }
+                }
+            }
+            if (ok && !regions.empty() && ggml_backend_tensor_copy_regions_async(rs_backend, regions.data(), regions.size())) {
+                for (uint32_t c = 0; c < mem->size; ++c) {
+                    mem->pend_rb[c] = 0;
+                    mem->conv_rb[c] = 0;
+                }
+                if (sync) {
+                    ggml_backend_synchronize(rs_backend);
+                }
+                rs_conv_batched++;
+                mem->n_replay_commit++;
+                rs_replay_us += ggml_time_us() - t0;
+                return;
+            }
+        }
+    }
     if (rs_mode < 0 && !rs_sched) {
         rs_sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, false));
     }
@@ -2688,6 +2736,8 @@ llama_context::~llama_context() {
                 "after another key's graph, LLAMA_RS_REPLAY_SCHED_REBUILD), %.2f ms total, %.3f ms each (host)\n", __func__,
                 rs_replay_mem->n_replay_commit, rs_reused, rs_sched_rebuilt, rs_replay_us/1e3, rs_replay_us/1e3/rs_replay_mem->n_replay_commit);
         LLAMA_LOG_INFO("%s: recurrent replay windows moved with their cells: %" PRIu64 "\n", __func__, rs_replay_mem->n_replay_move);
+        LLAMA_LOG_INFO("%s: k19-g4tier: %" PRIu64 " conv-only replay commits as one batched copy (LLAMA_RS_CONV_BATCH=0: commit graphs)\n",
+                __func__, rs_conv_batched);
         LLAMA_LOG_INFO("%s: replay commit graph allocations: %.2f MiB at most, %" PRIu64 " commits in the reserved fallback buffer\n", __func__,
                 rs_ga_bytes_max/1024.0/1024.0, rs_fb_used);
         if (rs_sched) {
@@ -5258,6 +5308,53 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_INFO("%s: KQ mask dump %s [%d x %d]: %lld kept, %lld masked, %lld other (backend %s)\n", __func__, t->name, (int) t->ne[0],
                 (int) t->ne[1], (long long) n_keep, (long long) n_drop, (long long) n_other, t->buffer ? ggml_backend_buffer_name(t->buffer) : "-");
         }
+    }
+    // k19-g4tier (debug): LLAMA_MOE_ROUTE_DUMP=path appends, per decode / verify window (at most 16 tokens), the routed experts of each
+    // MoE layer ("R pass layer n_tokens n_used ids..."), the next-layer router's top 64 on this layer's MoE input ("P pass layer
+    // n_tokens 64 ids...", see qwen4exp) and the MoE cache's fills of the layer ("F pass layer n_fill experts...")
+    static const char * route_dump = getenv("LLAMA_MOE_ROUTE_DUMP");
+    if (route_dump != nullptr && ubatch.n_tokens <= 16 && status == GGML_STATUS_SUCCESS) {
+        static FILE * fp = fopen(route_dump, "a");
+        static int64_t n_pass = 0;
+        ggml_backend_sched_synchronize(sched.get());
+        ggml_cgraph * g = res->get_gf();
+        for (int i = 0; fp != nullptr && i < ggml_graph_n_nodes(g); ++i) {
+            ggml_tensor * t = ggml_graph_node(g, i);
+            const char * nm = t->name;
+            const bool r = strncmp(nm, "ffn_moe_topk-", 13) == 0, pr = strncmp(nm, "rdump_pred-", 11) == 0, fa = strncmp(nm, "ffn_moe_assign-", 15) == 0;
+            if ((!r && !pr && !fa) || t->type != GGML_TYPE_I32 || t->buffer == nullptr || !(t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                continue;
+            }
+            const int layer = atoi(strchr(nm, '-') + 1);
+            std::vector<int32_t> v(ggml_nelements(t));
+            ggml_backend_tensor_get(t, v.data(), 0, v.size()*sizeof(int32_t));
+            if (r || pr) {
+                // rows of a (possibly strided) [k, n_tokens] view
+                const int64_t k = t->ne[0], nt = t->ne[1];
+                std::vector<int32_t> rows((size_t) (k*nt));
+                std::vector<uint8_t> raw(ggml_nbytes(t));
+                ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+                for (int64_t j = 0; j < nt; ++j) {
+                    for (int64_t e = 0; e < k; ++e) {
+                        rows[j*k + e] = *(const int32_t *) (raw.data() + j*t->nb[1] + e*t->nb[0]);
+                    }
+                }
+                fprintf(fp, "%c %lld %d %lld %lld", r ? 'R' : 'P', (long long) n_pass, layer, (long long) nt, (long long) k);
+                for (int32_t x : rows) fprintf(fp, " %d", x);
+                fprintf(fp, "\n");
+            } else {
+                // the assign result (see ggml_moe_cache_assign): slots [n_ids], fill count, fill experts [n_ids], ...
+                const int64_t ne0 = t->ne[0];
+                const int64_t n_tok = (t->ne[1] - 1)/5;
+                const int64_t n_ids = ne0*n_tok;
+                const int32_t nf = v[n_ids];
+                fprintf(fp, "F %lld %d %d", (long long) n_pass, layer, nf);
+                for (int32_t j = 0; j < nf && n_ids + ne0 + j < (int64_t) v.size(); ++j) fprintf(fp, " %d", v[n_ids + ne0 + j]);
+                fprintf(fp, "\n");
+            }
+        }
+        if (fp != nullptr) fflush(fp);
+        n_pass++;
     }
     compute_n_tokens = 0;
     if (t_tr0) {

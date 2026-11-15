@@ -305,6 +305,7 @@ struct llama_context {
     std::map<std::vector<uint32_t>, rs_graph> rs_graphs; // per (cell, tokens, rolled back) set
     std::vector<uint32_t>    rs_key; // the graph the sched holds the allocation of
     uint64_t                 rs_reused = 0;
+    uint64_t                 rs_conv_batched = 0; // k19-g4tier: conv-only commits done as one batched copy (LLAMA_RS_CONV_BATCH)
     uint64_t                 rs_sched_rebuilt = 0; // k19-mgpucache: cached commit graphs built again (see rs_replay_commit)
     // every state and window tensor on one backend: the commit graphs run on it directly, each with its own small allocation, so a
     // switch between cached graphs neither re-allocates nor synchronizes (LLAMA_RS_REPLAY_SCHED=1: through rs_sched instead)
