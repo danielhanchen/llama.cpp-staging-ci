@@ -49,6 +49,8 @@ struct ggml_cuda_fattn_dev_len {
     // (flash_attn_src2_ring_range); nullptr: every tile. The tiles outside are fully masked and skipped (a fully masked tile leaves the
     // softmax state exactly as it is, so the result is the same bits)
     const int2 * ring_range;
+    // the same for the first source's KV tiles (its mask), nullptr: every tile
+    const int2 * body_range;
 };
 
 // the stream-k blocks of a launch over ntiles_KV KV tiles (launch_fattn); on the device for a length read there
@@ -1342,14 +1344,21 @@ void launch_fattn(
         static const bool skip_on = getenv("GGML_CUDA_FATTN_SRC2_SKIP") == nullptr || atoi(getenv("GGML_CUDA_FATTN_SRC2_SKIP")) != 0;
         static const int64_t skip_min_rows = getenv("GGML_CUDA_FATTN_SRC2_SKIP_MIN_ROWS") ? atoll(getenv("GGML_CUDA_FATTN_SRC2_SKIP_MIN_ROWS")) : 17;
         if (skip_on && Q->ne[1] >= skip_min_rows && !probe) {
+            // ring tiles from mask2, body tiles from mask (the window cells are masked in the body: its last ~W + ubatch cells are
+            // fully masked for a query tile of a prompt)
             const int ntx = (int) ((Q->ne[1] + ncols1 - 1) / ncols1);
-            ring_range.alloc(size_t(ntx) * M2->ne[3]);
+            const size_t nr = size_t(ntx) * M2->ne[3];
+            ring_range.alloc(2*nr);
             const dim3 blocks_rr(ntx, M2->ne[3], 1);
             const ggml_cuda_kernel_launch_params lp_rr(blocks_rr, dim3(256, 1, 1), 0, main_stream);
             ggml_cuda_kernel_launch(flash_attn_src2_ring_range, lp_rr, (const half *) M2->data, ring_range.ptr, (int) K2->ne[1], ncols1,
                 (int) Q->ne[1], nbatch_fa, (int64_t) (M2->nb[1] / sizeof(half)), (int64_t) (M2->nb[3] / sizeof(half)));
             CUDA_CHECK(cudaGetLastError());
+            ggml_cuda_kernel_launch(flash_attn_src2_ring_range, lp_rr, (const half *) mask_data, ring_range.ptr + nr, (int) K->ne[1], ncols1,
+                (int) Q->ne[1], nbatch_fa, (int64_t) (mask->nb[1] / sizeof(half)), (int64_t) (mask->nb[3] / sizeof(half)));
+            CUDA_CHECK(cudaGetLastError());
             src2.ring_range = ring_range.ptr;
+            src2.body_range = ring_range.ptr + nr;
         }
     }
 
