@@ -1363,7 +1363,7 @@ void launch_fattn(
 
     dim3 blocks_num;
     // k19-graph: see ggml_cuda_fattn_dev_len / ggml_cuda_fattn_probe
-    ggml_cuda_fattn_dev_len dev_len = { nullptr, 0, 0, 0, 0, 0 };
+    ggml_cuda_fattn_dev_len dev_len = {}; // all members zero (no device length, no second source)
     int  ntiles_dst_ref = 0;
     int  fixup_kind     = 0; // stream-k fixup: 0 none, 1 uniform, 2 general
     bool dev_ok         = false;
@@ -1415,7 +1415,13 @@ void launch_fattn(
             const int ntiles_KV_pad = int((kvl->n_kv_pad + nbatch_fa - 1) / nbatch_fa);
             const int nblocks_pad   = use_stream_k ? ggml_cuda_fattn_stream_k_blocks(ntiles_KV_pad, ntiles_dst, max_blocks, ntiles_dst_ref) : ntiles_dst;
             blocks_num.x = std::max(nblocks_live, nblocks_pad);
-            dev_len      = { kvl->kv_len, nbatch_fa, ntiles_dst, max_blocks, ntiles_dst_ref, use_stream_k ? 1 : 0 };
+            dev_len                = {};
+            dev_len.kv_len         = kvl->kv_len;
+            dev_len.nbatch_fa      = nbatch_fa;
+            dev_len.ntiles_dst     = ntiles_dst;
+            dev_len.max_blocks     = max_blocks;
+            dev_len.ntiles_dst_ref = ntiles_dst_ref;
+            dev_len.stream_k       = use_stream_k ? 1 : 0;
         }
 
         if (!probe && (ntiles_dst % blocks_num.x != 0 || (dev_len.kv_len && fixup_kind == 1))) { // Fixup is only needed if the SMs work on fractional tiles.
