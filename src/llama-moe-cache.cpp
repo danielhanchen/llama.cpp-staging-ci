@@ -8606,7 +8606,13 @@ struct llama_moe_cache::impl {
     // k19-g4pref cross-layer prefetch. LLAMA_MOE_PREFETCH=N (1..32; unset / 0 = off): in decode / verify windows of at most
     // LLAMA_MOE_PREFETCH_MAX_TOKENS (default 8) tokens, a cache layer whose previous MoE layer is a cache layer on the same device (both
     // on the device lookup) admits, beside the graph, the N experts with the largest logits of its router run on the previous layer's
-    // MoE input, at most LLAMA_MOE_PREFETCH_MAX (default 0 = no cap) per layer and window; its own lookup waits for those copies
+    // MoE input, at most LLAMA_MOE_PREFETCH_MAX (default 0 = no cap) per layer and window; its own lookup waits for those copies.
+    // Colab G4 (RTX PRO 6000) Qwen3.8-Flash-Next UD-IQ4_XS DFlash2 n6, 3 interleaved launches per arm: N=10 MAX=1 at 48 GB (70.7%
+    // cached) chat 278.4 -> 292.4 and 286.8 -> 303.5 tok/s on two VMs (same 256-token text), 8k 175.2 -> 197.1 (texts vary per launch
+    // there in every arm); 16 GB chat +4.5%, 8k +7.9% (other texts: host path); 32 GB chat +7..9% but 8k -6..-15% (more 3-row windows);
+    // A100 80 GB at 48 GB level. 78-91% of the prefetched experts are hit by the next layer. srv_kld long48 at 48 GB inside the -fa off
+    // band (first-token mean 0.0002 vs 0.0067). The text follows the residency only through the route tail skip and the host path:
+    // LLAMA_MOE_ROUTE_TAIL_SKIP=0 gives the same text with it on and off. Opt-in until a per-tier default is decided
     static int prefetch_n() {
         static const int n = [] {
             const char * e = getenv("LLAMA_MOE_PREFETCH");
