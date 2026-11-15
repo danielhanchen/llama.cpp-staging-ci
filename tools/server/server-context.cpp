@@ -2230,10 +2230,10 @@ private:
             // the fit as 1 - (device need without the host-only per-layer embedding table - free) / expert bytes, and (b) the whole target
             // GGUF is held in host memory (on a memory file system, or its bytes within the available memory), so the rows' expert misses
             // and per-layer embedding rows come from RAM, not the disk. G4 RTX PRO 6000 96 GB, Qwen3.8-Flash-Next UD-IQ4_XS from RAM + its
-            // MTP drafter, Studio argv, 3 launches (plans/k19_fnmtp.md round 2): 48 GB (cache 67%) chat +10.0% / 8k +17.6%, 32 GB (41%)
-            // +8.3% / +4.5%; 16 GB (14%: rule off) 4 drafts +0.9% / -5.7%. A verify row there costs 2.2-2.5 ms of a 12.6-13.0 ms pass at
-            // 48 / 32 GB, 4.2 ms of 15.1 at 16 GB; Colab A100 80 GB at 48 GB chat +17.8% / 8k +1.9%. The A100 40 GB VM of round 1 (93.7 GB
-            // model, 83 GB of RAM: rows read from the disk) stays at 2
+            // MTP drafter, Studio argv, 3 launches (plans/k19_fnmtp.md round 2), this rule against its kill switch: 48 GB (cache 67%) chat
+            // +10.1% / 8k +18.0%, 32 GB (41%) +10.0% / +3.0%; at 16 GB (14%: rule off) 4 drafts measured chat +7.8% (12.8% launch spread) /
+            // 8k -6.7%. A verify row there costs 2.2-2.5 ms of a 12.6-13.0 ms pass at 48 / 32 GB, ~3.5 ms of 15.2 at 16 GB. Colab A100 80 GB
+            // at 48 GB chat +17.7% / 8k +1.6%. The A100 40 GB VM of round 1 (93.7 GB model, 83 GB of RAM: rows read from the disk) stays at 2
             if (dc_env == nullptr && mtp_shape && !on && cache_expected && sp.has_dft() && !exact_mtp && !host_experts &&
                     (e != nullptr ? atoi(e) != 0 : dev_ok)) {
                 const uint64_t exp_b    = common_moe_expert_bytes(params.model.path);
