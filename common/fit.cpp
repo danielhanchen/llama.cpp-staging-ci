@@ -18,6 +18,10 @@
 #include <string>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/vfs.h>
+#endif
+
 // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
 // enum to identify part of a layer for distributing its tensors:
 enum common_layer_fraction_t {
@@ -136,6 +140,20 @@ static bool g_place8 = false;
 
 bool common_fit_place8() {
     return g_place8;
+}
+
+// whether the model file lives on a memory file system (tmpfs / ramfs, Linux): its pages are in RAM whatever the available memory reads
+static bool common_fit_file_in_ram_fs(const std::string & path) {
+#if defined(__linux__)
+    struct statfs sfs;
+    if (statfs(path.c_str(), &sfs) == 0) {
+        const unsigned long t = (unsigned long) sfs.f_type;
+        return t == 0x01021994UL || t == 0x858458f6UL; // TMPFS_MAGIC, RAMFS_MAGIC
+    }
+#else
+    GGML_UNUSED(path);
+#endif
+    return false;
 }
 
 static bool common_fit_place8_on() {
@@ -1818,7 +1836,34 @@ static void common_params_fit_impl(
                 static const bool placemid_on = getenv("LLAMA_FIT_PLACEMID") == nullptr || atoi(getenv("LLAMA_FIT_PLACEMID")) != 0;
                 static const double placemid_min_frac = getenv("LLAMA_FIT_PLACEMID_MIN_FRAC") != nullptr ?
                     std::max(0.0, atof(getenv("LLAMA_FIT_PLACEMID_MIN_FRAC"))) : 0.10;
-                if (!g_small_device && nd == 1 && placemid_on && common_fit_place8_on() && cparams->moe_cache_size > 0 &&
+                // k19-l4gap (opt-in, LLAMA_FIT_PLACEMID_DISK_SKIP=1): no k19-placemid on a disk tier whose cache holds the experts of fewer
+                // than LLAMA_FIT_PLACEMID_DISK_MIN_TOKENS (4, the RAM tier's device minimum, LLAMA_MOE_HOST_MIN_TOKENS) tokens before the
+                // growth: the host experts do not fit in RAM (more than 0.8 of the available memory, the rule of
+                // llama_context::disk_prefetch_init, the file not on a memory file system), and the short prompts that k19-placemid runs as
+                // ubatches of up to 31 tokens exceed the few tokens the device lookups serve (4 there), so their expert products run on the
+                // CPU from the mapping, whose pages the disk serves at its read rate. With the compute buffers kept a prompt ubatch copies its
+                // routed experts from the RAM tier instead. Colab L4 12 GB, Qwen3.8-Flash-Next UD-IQ4_XS from the VM disk (57.6 GB of
+                // experts, 51 GB of RAM) + MTP n2, 3 interleaved launches (plans/k19_l4gap.md): 42-token chat TTFT 28.1 -> 17.1 s, 8k TTFT
+                // 90.7 -> 85.4 s, but chat decode 5.94 -> 5.59 tok/s (the cache keeps 2256 instead of 4173 MiB): answers longer than ~1000
+                // tokens get slower, so it stays opt-in. Unset: k19-placemid as before (no extra work, no log line)
+                static const bool placemid_disk_skip = getenv("LLAMA_FIT_PLACEMID_DISK_SKIP") != nullptr && atoi(getenv("LLAMA_FIT_PLACEMID_DISK_SKIP")) != 0;
+                bool placemid_ram = true;
+                if (placemid_disk_skip && placemid_on && cparams->moe_cache_size > 0) {
+                    static const double placemid_disk_tokens = getenv("LLAMA_FIT_PLACEMID_DISK_MIN_TOKENS") != nullptr ?
+                        std::max(0.0, atof(getenv("LLAMA_FIT_PLACEMID_DISK_MIN_TOKENS"))) : 4.0;
+                    const uint64_t exp_b  = common_moe_expert_bytes(path_model);
+                    const uint64_t avail  = llama_available_memory();
+                    const double   tokens = common_moe_cache_tokens(path_model, cparams->moe_cache_size);
+                    if (exp_b > 0 && avail > 0 && (double) exp_b > 0.8*(double) avail && tokens >= 0.0 && tokens < placemid_disk_tokens &&
+                            !common_fit_file_in_ram_fs(path_model)) {
+                        placemid_ram = false;
+                        LOG_INF("%s: k19-l4gap: no k19-placemid (LLAMA_FIT_PLACEMID_DISK_SKIP=1): %.0f MiB of host experts do not fit in %.0f MiB of "
+                            "available RAM and the cache of %zu MiB holds the experts of %.1f tokens (below %.1f): short prompts keep one ubatch that "
+                            "copies its experts from the RAM tier\n", __func__, exp_b/1048576.0, avail/1048576.0, cparams->moe_cache_size/MiB, tokens,
+                            placemid_disk_tokens);
+                    }
+                }
+                if (!g_small_device && nd == 1 && placemid_on && placemid_ram && common_fit_place8_on() && cparams->moe_cache_size > 0 &&
                         cparams->n_ubatch > common_fit_place8_ub()) {
                     const uint32_t ub_full = cparams->n_ubatch;
                     const uint32_t ub_rel  = common_fit_place8_ub();
