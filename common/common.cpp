@@ -3456,7 +3456,6 @@ uma_restart:
                             best = *c;
                         }
                     }
-                    std::string list;
                     // the 4-bit K/V step (opt-in): the same ladder with the K/V on the device
                     const char * kv4_env = getenv("LLAMA_FIT_LONGCTX_KV4");
                     const bool   kv4_on  = kv4_env != nullptr && atoi(kv4_env) != 0 && !params.cache_type_k_set && !params.cache_type_v_set &&
@@ -3492,7 +3491,7 @@ uma_restart:
                             }
                         }
                     }
-                    list.clear();
+                    std::string list;
                     for (const auto & c : tried) {
                         list += string_format("%s%s %s ub %u: %s", list.empty() ? "" : "; ", ggml_type_name(c.type), c.kvo ? "K/V device" : "K/V host", c.ub,
                             c.ok ? string_format("%" PRId64 " layers, MoE cache %" PRId64 " MiB", c.layers, c.cache/(1024*1024)).c_str() : "fit failed");
