@@ -8609,7 +8609,10 @@ struct llama_moe_cache::impl {
     // layer whose previous MoE layer is a cache layer on the same device (both on the device lookup) admits, beside the graph, the N
     // experts with the largest logits of its router run on the previous layer's MoE input, at most MAX per layer and window; its own
     // lookup waits for those copies. LLAMA_MOE_PREFETCH=N (1..32) on with N (MAX = LLAMA_MOE_PREFETCH_MAX, default 0 = no cap), =0 off.
-    // Unset: on by default (N = 10, MAX = 1, LLAMA_MOE_PREFETCH_MAX still sets MAX) where every device holding cache slots is a CUDA
+    // Unset: on by default (N = 10, MAX = 1, LLAMA_MOE_PREFETCH_MAX still sets MAX) in windows of at least LLAMA_MOE_PREFETCH_MIN_TOKENS
+    // (6; 1 with an explicit LLAMA_MOE_PREFETCH) tokens: with the Studio MTP n2 drafter (windows of at most 5 rows at depth 4) the
+    // 48 GB passes were 1-5% longer with it on 5 of 6 8k prompts (tok/s geomean 0.90), DFlash2's 6 / 7-row windows gain most;
+    // where every device holding cache slots is a CUDA
     // device of compute capability 12.0 and the cache holds at least LLAMA_MOE_PREFETCH_AUTO_MIN_FRAC (0.60) of the host experts'
     // bytes, or from LLAMA_MOE_PREFETCH_AUTO_LO_MIN_FRAC (0.10) to less than LLAMA_MOE_PREFETCH_AUTO_LO_FRAC (0.20) of them (N =
     // LLAMA_MOE_PREFETCH_AUTO_LO, default 0 = not in that band; 10 was measured); 8 GB (3.7% cached, single-token decode) lost 1-3.5%.
@@ -8628,6 +8631,7 @@ struct llama_moe_cache::impl {
     struct pf_cfg_t {
         int n        = 0;
         int max_fill = 0;
+        int min_tok  = 1; // windows of fewer tokens do not prefetch
     };
     mutable bool     pf_resolved = false;
     mutable pf_cfg_t pf_cfg;
@@ -8647,10 +8651,12 @@ struct llama_moe_cache::impl {
         }
         const char * e  = getenv("LLAMA_MOE_PREFETCH");
         const char * em = getenv("LLAMA_MOE_PREFETCH_MAX");
+        const char * et = getenv("LLAMA_MOE_PREFETCH_MIN_TOKENS");
         pf_cfg_t c;
         if (e != nullptr) {
             c.n        = std::max(0, std::min(32, atoi(e)));
             c.max_fill = em != nullptr ? std::max(0, atoi(em)) : 0;
+            c.min_tok  = et != nullptr ? std::max(1, atoi(et)) : 1;
             pf_cfg = c;
             pf_resolved = true;
             return c;
@@ -8691,12 +8697,13 @@ struct llama_moe_cache::impl {
         }
         if (c.n > 0) {
             c.max_fill = em != nullptr ? std::max(0, atoi(em)) : 1;
+            c.min_tok  = et != nullptr ? std::max(1, atoi(et)) : 6;
         }
         if (!pf_quiet && any) {
             if (c.n > 0) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4pref: cross-layer prefetch on by default: compute capability 12.0, %.1f%% of the host "
-                    "experts cached: top %d predicted experts per token, at most %d per layer (LLAMA_MOE_PREFETCH=0 off)\n", tag,
-                    100.0*cache_frac, c.n, c.max_fill);
+                    "experts cached: top %d predicted experts per token, at most %d per layer, verify windows of %d+ tokens "
+                    "(LLAMA_MOE_PREFETCH=0 off)\n", tag, 100.0*cache_frac, c.n, c.max_fill, c.min_tok);
             } else {
                 LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4pref: cross-layer prefetch off by default: %s (compute capability %d, %.1f%% of the "
                     "host experts cached; LLAMA_MOE_PREFETCH=N on)\n", tag, why, cc_max, 100.0*cache_frac);
@@ -8711,7 +8718,8 @@ struct llama_moe_cache::impl {
     bool prefetch_ok(int32_t il_prev, int32_t il, int64_t n_ubatch) const {
         static const int64_t max_tok = getenv("LLAMA_MOE_PREFETCH_MAX_TOKENS") != nullptr ?
             std::max<int64_t>(1, atoll(getenv("LLAMA_MOE_PREFETCH_MAX_TOKENS"))) : 8;
-        if (force_large || n_ubatch < 1 || n_ubatch > max_tok || n_ubatch > n_small_max || prefetch_cfg().n <= 0) {
+        if (force_large || n_ubatch < 1 || n_ubatch > max_tok || n_ubatch > n_small_max || prefetch_cfg().n <= 0 ||
+                n_ubatch < prefetch_cfg().min_tok) {
             return false;
         }
         // (the groups are per expert type, so neighbouring layers are often in different groups; both on the same device)
