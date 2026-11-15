@@ -436,10 +436,17 @@ static void test_model(const std::string & path, const std::string & name) {
         report(name.c_str(), "seqcp", e3 < 2e-3, buf);
     }
     {
+        // (keeps a caller's LLAMA_KV_WIN_FUSED for the other checks: LLAMA_KV_WIN_FUSED=0 runs the whole test on the stopgap)
+        const char * prev = getenv("LLAMA_KV_WIN_FUSED");
+        const std::string prev_s = prev ? prev : "";
         const auto a = run_plain(model, w32, prompt, dec);
         setenv("LLAMA_KV_WIN_FUSED", "0", 1);
         const auto b = run_plain(model, w32, prompt, dec);
-        unsetenv("LLAMA_KV_WIN_FUSED");
+        if (prev) {
+            setenv("LLAMA_KV_WIN_FUSED", prev_s.c_str(), 1);
+        } else {
+            unsetenv("LLAMA_KV_WIN_FUSED");
+        }
         const double cs = cosine(a, b);
         snprintf(buf, sizeof(buf), "cosine %.6f (max rel %.3g)", cs, max_rel(b, a));
         report(name.c_str(), "stopgap", cs > 0.9999, buf);
