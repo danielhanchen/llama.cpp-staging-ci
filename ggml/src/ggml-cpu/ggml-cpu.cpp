@@ -692,6 +692,10 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
         return (void *)ggml_backend_cpu_set_use_ref;
     }
+    // k19-kvwin: flash attention with a second KV source (ggml_flash_attn_ext_set_src2); the value is only a marker
+    if (strcmp(name, "ggml_backend_fa_src2") == 0) {
+        return (void *)ggml_backend_cpu_get_proc_address;
+    }
 
     // k19-plerow: the row source of a lazily mapped table's GET_ROWS (llama_row_cache)
     if (strcmp(name, "ggml_backend_cpu_set_row_source") == 0) {

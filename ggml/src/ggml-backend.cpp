@@ -800,6 +800,14 @@ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t d
 
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
+    // k19-kvwin: a flash attention node with a second KV source (ggml_flash_attn_ext_set_src2) only where the backend says it reads
+    // it, so no backend computes the first source alone
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[6] != NULL) {
+        ggml_backend_reg_t reg = device->reg;
+        if (reg == NULL || ggml_backend_reg_get_proc_address(reg, "ggml_backend_fa_src2") == NULL) {
+            return false;
+        }
+    }
     return device->iface.supports_op(device, op);
 }
 
