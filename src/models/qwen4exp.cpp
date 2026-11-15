@@ -1375,6 +1375,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
         moe_overlap_extra = ffn_shexp;
     }
 
+    // k19-g4tier (debug, LLAMA_MOE_ROUTE_DUMP=path): the next MoE layer's router run on this layer's MoE input, its top 64 experts kept as
+    // an output for the prefetch study (llama_context dumps them with the routed experts and the MoE cache's fills); decode / verify
+    // windows only (at most 16 tokens). Off: no node is added
+    static const bool route_dump = getenv("LLAMA_MOE_ROUTE_DUMP") != nullptr;
+    if (route_dump && cur->ne[1] <= 16 && il + 1 < (int) model.layers.size() && model.layers[il + 1].ffn_gate_inp != nullptr) {
+        ggml_tensor * nl = build_lora_mm(model.layers[il + 1].ffn_gate_inp, cur); // [n_expert, n_tokens]
+        ggml_tensor * pk = ggml_argsort_top_k(ctx0, nl, std::min<int64_t>(64, nl->ne[0]));
+        ggml_set_name(pk, ("rdump_pred-" + std::to_string(il + 1)).c_str());
+        ggml_set_output(pk);
+        ggml_build_forward_expand(gf, pk);
+    }
+
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,

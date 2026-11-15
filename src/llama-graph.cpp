@@ -2616,6 +2616,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
     cb(selected_experts, "ffn_moe_topk", il);
+    // k19-g4tier (debug, LLAMA_MOE_ROUTE_DUMP): the routed experts of decode / verify windows are kept for the dump (llama_context)
+    static const bool route_dump = getenv("LLAMA_MOE_ROUTE_DUMP") != nullptr;
+    if (route_dump && n_tokens <= 16) {
+        ggml_set_output(selected_experts);
+    }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
@@ -3121,6 +3126,9 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
             }
             ggml_backend_sched_set_tensor_backend(sched, res, moe_cache->backend(il));
             cb(res, "ffn_moe_assign", il);
+            if (getenv("LLAMA_MOE_ROUTE_DUMP") != nullptr && n_tokens <= 16) {
+                ggml_set_output(res); // k19-g4tier debug: the fills of this lookup are dumped (llama_context)
+            }
             ggml_build_forward_expand(gf, res);
             *assign = res;
             if (host != nullptr) {

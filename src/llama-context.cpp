@@ -5309,6 +5309,53 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 (int) t->ne[1], (long long) n_keep, (long long) n_drop, (long long) n_other, t->buffer ? ggml_backend_buffer_name(t->buffer) : "-");
         }
     }
+    // k19-g4tier (debug): LLAMA_MOE_ROUTE_DUMP=path appends, per decode / verify window (at most 16 tokens), the routed experts of each
+    // MoE layer ("R pass layer n_tokens n_used ids..."), the next-layer router's top 64 on this layer's MoE input ("P pass layer
+    // n_tokens 64 ids...", see qwen4exp) and the MoE cache's fills of the layer ("F pass layer n_fill experts...")
+    static const char * route_dump = getenv("LLAMA_MOE_ROUTE_DUMP");
+    if (route_dump != nullptr && ubatch.n_tokens <= 16 && status == GGML_STATUS_SUCCESS) {
+        static FILE * fp = fopen(route_dump, "a");
+        static int64_t n_pass = 0;
+        ggml_backend_sched_synchronize(sched.get());
+        ggml_cgraph * g = res->get_gf();
+        for (int i = 0; fp != nullptr && i < ggml_graph_n_nodes(g); ++i) {
+            ggml_tensor * t = ggml_graph_node(g, i);
+            const char * nm = t->name;
+            const bool r = strncmp(nm, "ffn_moe_topk-", 13) == 0, pr = strncmp(nm, "rdump_pred-", 11) == 0, fa = strncmp(nm, "ffn_moe_assign-", 15) == 0;
+            if ((!r && !pr && !fa) || t->type != GGML_TYPE_I32 || t->buffer == nullptr || !(t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                continue;
+            }
+            const int layer = atoi(strchr(nm, '-') + 1);
+            std::vector<int32_t> v(ggml_nelements(t));
+            ggml_backend_tensor_get(t, v.data(), 0, v.size()*sizeof(int32_t));
+            if (r || pr) {
+                // rows of a (possibly strided) [k, n_tokens] view
+                const int64_t k = t->ne[0], nt = t->ne[1];
+                std::vector<int32_t> rows((size_t) (k*nt));
+                std::vector<uint8_t> raw(ggml_nbytes(t));
+                ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+                for (int64_t j = 0; j < nt; ++j) {
+                    for (int64_t e = 0; e < k; ++e) {
+                        rows[j*k + e] = *(const int32_t *) (raw.data() + j*t->nb[1] + e*t->nb[0]);
+                    }
+                }
+                fprintf(fp, "%c %lld %d %lld %lld", r ? 'R' : 'P', (long long) n_pass, layer, (long long) nt, (long long) k);
+                for (int32_t x : rows) fprintf(fp, " %d", x);
+                fprintf(fp, "\n");
+            } else {
+                // the assign result (see ggml_moe_cache_assign): slots [n_ids], fill count, fill experts [n_ids], ...
+                const int64_t ne0 = t->ne[0];
+                const int64_t n_tok = (t->ne[1] - 1)/5;
+                const int64_t n_ids = ne0*n_tok;
+                const int32_t nf = v[n_ids];
+                fprintf(fp, "F %lld %d %d", (long long) n_pass, layer, nf);
+                for (int32_t j = 0; j < nf && n_ids + ne0 + j < (int64_t) v.size(); ++j) fprintf(fp, " %d", v[n_ids + ne0 + j]);
+                fprintf(fp, "\n");
+            }
+        }
+        if (fp != nullptr) fflush(fp);
+        n_pass++;
+    }
     compute_n_tokens = 0;
     if (t_tr0) {
         const int64_t t_tr_end = ggml_time_us();
