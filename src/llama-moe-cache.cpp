@@ -8611,10 +8611,11 @@ struct llama_moe_cache::impl {
     // lookup waits for those copies. LLAMA_MOE_PREFETCH=N (1..32) on with N (MAX = LLAMA_MOE_PREFETCH_MAX, default 0 = no cap), =0 off.
     // Unset: on by default (N = 10, MAX = 1, LLAMA_MOE_PREFETCH_MAX still sets MAX) where every device holding cache slots is a CUDA
     // device of compute capability 12.0 and the cache holds at least LLAMA_MOE_PREFETCH_AUTO_MIN_FRAC (0.60) of the host experts'
-    // bytes, or less than LLAMA_MOE_PREFETCH_AUTO_LO_FRAC (0.35) of them (N = LLAMA_MOE_PREFETCH_AUTO_LO, default 10; 0 = not in that
-    // band). Off in between (32 GB: 41%, chat +7% but 8k -6..-15%) and on other devices (A100 80 GB at 48 GB: level).
+    // bytes, or from LLAMA_MOE_PREFETCH_AUTO_LO_MIN_FRAC (0.10) to less than LLAMA_MOE_PREFETCH_AUTO_LO_FRAC (0.35) of them (N =
+    // LLAMA_MOE_PREFETCH_AUTO_LO, default 10; 0 = not in that band); 8 GB (3.7% cached, single-token decode) lost 1-3.5% with it. Off in between (32 GB: 41%, chat +7% but 8k -6..-15%) and on other devices (A100 80 GB at 48 GB: level).
     // 16 GB (15.5% cached), G4: chat level / +4.5% (two VMs), 8k +7.7 / +7.9% (other texts: host path); srv_kld long48 inside the band
-    // (first-token mean / p99 0.0030 / 0.017 vs 0.0044 / 0.022); reference-scored 1 glitch in 5120 tokens vs 3 with it off.
+    // (first-token mean / p99 0.0030 / 0.017 vs 0.0044 / 0.022); reference-scored 1 glitch in 5120 tokens vs 3 with it off. 24 GB
+    // (27.1%): chat level, 8k +5.5..7.6% (other text).
     // Colab G4 (RTX PRO 6000) Qwen3.8-Flash-Next UD-IQ4_XS DFlash2 n6, 3 interleaved launches per arm: N=10 MAX=1 at 48 GB (70.7%
     // cached) chat 278.4 -> 292.4 and 286.8 -> 303.5 tok/s on two VMs (same 256-token text), 8k 175.2 -> 197.1 (texts vary per launch
     // there in every arm); 16 GB chat +4.5%, 8k +7.9% (other texts: host path); 32 GB (41%) chat +7..9% but 8k -6..-15% (more 3-row
@@ -8669,6 +8670,7 @@ struct llama_moe_cache::impl {
         const double hi_frac = getenv("LLAMA_MOE_PREFETCH_AUTO_MIN_FRAC") ? atof(getenv("LLAMA_MOE_PREFETCH_AUTO_MIN_FRAC")) : 0.60;
         const double lo_frac = getenv("LLAMA_MOE_PREFETCH_AUTO_LO_FRAC") ? atof(getenv("LLAMA_MOE_PREFETCH_AUTO_LO_FRAC")) : 0.35;
         const int    lo_n    = getenv("LLAMA_MOE_PREFETCH_AUTO_LO") ? std::max(0, std::min(32, atoi(getenv("LLAMA_MOE_PREFETCH_AUTO_LO")))) : 10;
+        const double lo_min  = getenv("LLAMA_MOE_PREFETCH_AUTO_LO_MIN_FRAC") ? atof(getenv("LLAMA_MOE_PREFETCH_AUTO_LO_MIN_FRAC")) : 0.10;
         const bool   cc_ok   = any && cc_min == 1200 && cc_max == 1200;
         const char * why     = nullptr;
         if (!any) {
@@ -8677,10 +8679,11 @@ struct llama_moe_cache::impl {
             why = "not a compute capability 12.0 device";
         } else if (cache_frac >= hi_frac) {
             c.n = 10;
-        } else if (lo_n > 0 && cache_frac < lo_frac) {
+        } else if (lo_n > 0 && cache_frac < lo_frac && cache_frac >= lo_min) {
             c.n = lo_n;
         } else {
-            why = lo_n > 0 ? "the cached share is in the band between LLAMA_MOE_PREFETCH_AUTO_LO_FRAC and _MIN_FRAC"
+            why = lo_n > 0 && cache_frac < lo_min ? "the cached share is below LLAMA_MOE_PREFETCH_AUTO_LO_MIN_FRAC" :
+                  lo_n > 0 ? "the cached share is in the band between LLAMA_MOE_PREFETCH_AUTO_LO_FRAC and _MIN_FRAC"
                            : "the cached share is below LLAMA_MOE_PREFETCH_AUTO_MIN_FRAC";
         }
         if (c.n > 0) {
