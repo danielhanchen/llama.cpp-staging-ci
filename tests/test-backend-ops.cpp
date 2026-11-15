@@ -14099,6 +14099,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // k19-fattnq4: q4_0 K / V and the mixed pairs (q4_0 / q8_0, q8_0 / q4_0) at the head sizes the CUDA MMA kernel reads in place
+    // (64 / 128 / 256), decode (nb 1: the vector kernel, mixed pairs in place too), verify windows and prompt batches (staged by default)
+    for (const auto & tp : { std::make_pair(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0), std::make_pair(GGML_TYPE_Q4_0, GGML_TYPE_Q8_0),
+                             std::make_pair(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0) }) {
+        for (int hs : { 64, 128, 256 }) {
+            for (int nr2 : { 1, 2, 6, 8 }) {
+                for (int kv : { 512, 1000, 1024 }) {
+                    for (int nb : { 1, 2, 3, 8, 16, 75 }) {
+                        for (bool sinks : { false, true }) {
+                            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {nr2, 1}, kv, nb, true, sinks, 0, 0, GGML_PREC_F32,
+                                tp.first, tp.second));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // q8_0 / q8_0 at head size 64 (in place since k19-fattnq4)
+    for (int nr2 : { 1, 2, 8 }) {
+        for (int nb : { 2, 3, 8, 16 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(64, 64, 2, {nr2, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+    }
+
     // k19-fattnq8: q8_0 K / V at the head sizes the CUDA MMA kernel reads in place (128 / 256), GQA 1 / 2 / 6 (Qwen3.8-27B) / 8
     // (Qwen3.6-35B-A3B), verify windows and prompt batches, KV lengths with and without the 256 padding, with and without sinks
     for (int hs : { 128, 256 }) {

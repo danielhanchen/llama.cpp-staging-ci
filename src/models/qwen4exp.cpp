@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-moe-cache.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1367,6 +1368,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
+    // k19-g4pref cross-layer prefetch (LLAMA_MOE_PREFETCH=N, see llama_moe_cache::prefetch): the next layer's router on this layer's MoE
+    // input predicts its routing; its logits are a graph output, so their memory stays theirs while the cache's copy stream reads them
+    // after the main stream has moved on. LLAMA_MOE_PREFETCH_DRY=1 (diagnostic): the logits only, no prefetch. Off: no node is added
+    ggml_tensor * pf_logits = nullptr;
+    const int     il_pf     = il + 1;
+    if (moe_cache != nullptr && il_pf < (int) model.layers.size() && model.layers[il_pf].ffn_gate_inp != nullptr &&
+            moe_cache->prefetch_ok(il, il_pf, n_tokens)) {
+        pf_logits = build_lora_mm(model.layers[il_pf].ffn_gate_inp, cur); // [n_expert, n_tokens]
+        cb(pf_logits, "ffn_moe_pf_logits", il_pf);
+        ggml_set_output(pf_logits);
+        ggml_build_forward_expand(gf, pf_logits);
+    }
+
     // shared experts, as in the Qwen3Next reference
     // (k13-fn: built before the routed experts, as qwen35moe does, so that the MoE cache paths compute it while the missing experts are
     // copied or computed on the host, see moe_overlap_extra; same nodes, same values)
@@ -1429,6 +1443,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
         cb(cur, "ffn_out", il);
     } else {
         cur = moe_out;
+    }
+
+    // k19-g4pref: the prefetch of the next layer runs after this layer's FFN output (every read of this layer's slots is before it)
+    static const bool pf_dry = getenv("LLAMA_MOE_PREFETCH_DRY") != nullptr && atoi(getenv("LLAMA_MOE_PREFETCH_DRY")) != 0;
+    if (pf_logits != nullptr && !pf_dry) {
+        if (ggml_tensor * pf = moe_cache->prefetch(ctx0, il_pf, pf_logits, cur, n_tokens)) {
+            if (ggml_backend_supports_op(moe_cache->backend(il_pf), pf)) {
+                ggml_backend_sched_set_tensor_backend(sched, pf, moe_cache->backend(il_pf));
+                cb(pf, "ffn_moe_prefetch", il_pf);
+                ggml_build_forward_expand(gf, pf);
+            }
+        }
     }
 
     return cur;

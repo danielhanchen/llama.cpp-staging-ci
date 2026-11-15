@@ -1384,6 +1384,14 @@ uint64_t common_moe_expert_bytes(const std::string & path) {
     return common_moe_slot_bytes_of(path, sb) ? (uint64_t) sb.total : 0;
 }
 
+double common_moe_cache_tokens(const std::string & path, uint64_t cache_bytes) {
+    common_moe_slot_bytes sb;
+    if (!common_moe_slot_bytes_of(path, sb) || sb.n_used <= 0 || sb.n_layer <= 0 || sb.sum <= 0) {
+        return -1.0;
+    }
+    return (double) cache_bytes/((double) sb.n_layer*(double) sb.n_used*(double) sb.sum);
+}
+
 // n_ubatch of the draft context of speculative decoding (an MTP context or a draft model) for a target context at n_ubatch u: the MoE
 // cache rules grow the target's n_ubatch so that a prompt uploads the experts it misses fewer times (common_moe_cache_auto_ubatch).
 // The draft gains nothing from that (a draft model's weights are on the device or never uploaded per ubatch, an MTP context processes
@@ -4501,6 +4509,13 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model 
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    // k19-g4pref: the MoE cache's default cross-layer prefetch stays off beside an MTP drafter (G4 Flash-Next Studio MTP n2 at depth 4,
+    // 48 GB: 8k tok/s geomean 0.90 over 6 prompts with it on); an explicit LLAMA_MOE_PREFETCH or LLAMA_MOE_PREFETCH_AUTO is kept
+    if (getenv("LLAMA_MOE_PREFETCH") == nullptr && getenv("LLAMA_MOE_PREFETCH_AUTO") == nullptr &&
+            std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) !=
+            params.speculative.types.end()) {
+        common_set_env("LLAMA_MOE_PREFETCH_AUTO", "0");
+    }
     common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();

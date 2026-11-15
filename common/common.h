@@ -333,6 +333,10 @@ struct common_params_model {
 // k19-fnmtp: bytes of every routed expert tensor of a GGUF (and its splits), 0 for a model without experts or an unreadable file
 uint64_t common_moe_expert_bytes(const std::string & path);
 
+// k19-l4gap: how many tokens' routed experts cache_bytes hold (the tiny-cache rule's estimate: largest layer's expert bytes x n_used x
+// n_layer), -1 when unknown
+double common_moe_cache_tokens(const std::string & path, uint64_t cache_bytes);
+
 // draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
