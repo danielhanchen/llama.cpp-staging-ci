@@ -3512,6 +3512,29 @@ struct ggml_tensor * ggml_kq_mask(
     return result;
 }
 
+struct ggml_tensor * ggml_kq_mask_win(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cells,
+        struct ggml_tensor  * toks,
+        struct ggml_tensor  * flags,
+        enum ggml_type        type,
+        int32_t               mode,
+        int32_t               n_win,
+        int32_t               n_sinks) {
+    GGML_ASSERT(mode == 1 || mode == 2);
+    GGML_ASSERT((mode == 1) == (flags != NULL));
+    struct ggml_tensor * result = ggml_kq_mask(ctx, cells, toks, type);
+    if (flags != NULL) {
+        GGML_ASSERT(flags->type == GGML_TYPE_I32 && ggml_is_contiguous(flags));
+        GGML_ASSERT(flags->ne[0] == cells->ne[1] && flags->ne[1] == cells->ne[2] && flags->ne[2] == 1 && flags->ne[3] == 1);
+        result->src[2] = flags;
+    }
+    ggml_set_op_params_i32(result,  8, mode);
+    ggml_set_op_params_i32(result,  9, n_win);
+    ggml_set_op_params_i32(result, 10, MAX(0, n_sinks));
+    return result;
+}
+
 struct ggml_tensor * ggml_moe_cache_lookup(
         struct ggml_context * ctx,
         struct ggml_tensor  * ids,

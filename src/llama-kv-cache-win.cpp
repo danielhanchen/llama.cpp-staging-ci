@@ -563,6 +563,65 @@ ggml_tensor * llama_kv_cache::cpy_v_win(ggml_context * ctx, ggml_tensor * v_cur,
     return w != nullptr && idxs != nullptr && v_cur != nullptr ? kv_win_store(ctx, w, v_cur, idxs) : nullptr;
 }
 
+void llama_kv_cache::set_input_win_dev(ggml_tensor * rcells, ggml_tensor * flags, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch, bool used) const {
+    GGML_ASSERT(win_on());
+    // (an input the graph does not read has no buffer: nothing to set)
+    const bool r_ok = rcells != nullptr && rcells->buffer != nullptr;
+    const bool f_ok = flags  != nullptr && flags->buffer  != nullptr;
+    GGML_ASSERT(!r_ok || (rcells->ne[0] == 5 && rcells->ne[1] == (int64_t) win_r && rcells->ne[2] == n_stream));
+    GGML_ASSERT(!f_ok || (flags->ne[0] == n_kv && flags->ne[1] == n_stream));
+    const int64_t n_tps = (int64_t) ubatch->n_tokens/n_stream;
+    const bool is_2d = ubatch->is_pos_2d();
+
+    // written in place where the inputs are host memory, else staged and uploaded (as set_input_kq_mask does)
+    const bool r_host = r_ok && ggml_backend_buffer_is_host(rcells->buffer);
+    const bool f_host = f_ok && ggml_backend_buffer_is_host(flags->buffer);
+    std::vector<int32_t> r_stage(r_host ? 0 : 5*(size_t) win_r*n_stream), f_stage(f_host ? 0 : (size_t) n_kv*n_stream);
+    int32_t * rc = r_host ? (int32_t *) rcells->data : r_stage.data();
+    int32_t * fl = f_host ? (int32_t *) flags->data  : f_stage.data();
+
+    for (int64_t s = 0; s < n_stream; ++s) {
+        const uint32_t strm  = seq_to_stream[ubatch->seq_id[s*n_tps][0]];
+        const auto &   rg    = v_rings[strm];
+        const auto &   cells = v_cells[strm];
+        int32_t * fs = fl + s*n_kv;
+        std::fill(fs, fs + n_kv, 0);
+        for (uint32_t j = 0; j < win_r; ++j) {
+            int32_t * cj = rc + 5*((int64_t) s*win_r + j);
+            const int32_t c = rg.slot_cell[j];
+            if (!win_slot_live(strm, (int32_t) j) || c >= n_kv) {
+                cj[0] = INT32_MIN; cj[1] = 0; cj[2] = 0; cj[3] = 0; cj[4] = 0;
+                continue;
+            }
+            // the encoding of llama_kv_cache::set_input_kq_mask (device path): pos, sequence bits 0..31 / 32..63, 2D position
+            uint32_t lo = 0, hi = 0;
+            const auto & bits = cells.seq_get_all(c);
+            for (uint32_t q = 0; q < 64 && q < n_seq_max && q < (uint32_t) bits.size(); ++q) {
+                if (bits.test(q)) {
+                    (q < 32 ? lo : hi) |= 1u << (q & 31);
+                }
+            }
+            cj[0] = cells.pos_get(c); cj[1] = (int32_t) lo; cj[2] = (int32_t) hi;
+            if (is_2d) {
+                const auto & ext = cells.ext_get(c);
+                cj[3] = ext.x; cj[4] = ext.y;
+            } else {
+                cj[3] = 0; cj[4] = 0;
+            }
+            if (used) {
+                fs[c] = 1;
+            }
+        }
+    }
+    if (r_ok && !r_host) {
+        ggml_backend_tensor_set(rcells, r_stage.data(), 0, ggml_nbytes(rcells));
+    }
+    if (f_ok && !f_host) {
+        ggml_backend_tensor_set(flags, f_stage.data(), 0, ggml_nbytes(flags));
+    }
+    // with no attention reading the ring the ring cells stay as they are: the ring mask is then unused (flags 0)
+}
+
 void llama_kv_cache::set_input_win_shift(ggml_tensor * dst) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int32_t * data = (int32_t *) dst->data;
@@ -594,6 +653,10 @@ ggml_tensor * llama_kv_cache_context::build_input_win_mask(ggml_context * ctx, c
 void llama_kv_cache_context::set_input_win(ggml_tensor * idxs, ggml_tensor * mask, ggml_tensor * kq_mask, const llama_ubatch * ubatch,
         ggml_tensor * cells) const {
     kv->set_input_win(idxs, mask, kq_mask, ubatch, sinfos[i_cur], cells);
+}
+
+void llama_kv_cache_context::set_input_win_dev(ggml_tensor * rcells, ggml_tensor * flags, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch, bool used) const {
+    kv->set_input_win_dev(rcells, flags, n_kv, n_stream, ubatch, used);
 }
 
 ggml_tensor * llama_kv_cache_context::get_k_win(ggml_context * ctx, int32_t il) const {

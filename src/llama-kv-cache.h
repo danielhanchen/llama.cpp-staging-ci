@@ -323,6 +323,9 @@ public:
     ggml_tensor * build_input_win_mask(ggml_context * ctx, int64_t n_tps, int64_t n_stream_ub) const;
     void          set_input_win(ggml_tensor * idxs, ggml_tensor * mask, ggml_tensor * kq_mask, const llama_ubatch * ubatch, const slot_info & sinfo,
                                 ggml_tensor * cells = nullptr) const;
+    // device-built masks (ggml_kq_mask_win): the cells of the ring slots (I32 [5, R, n_stream], the KQ mask cell encoding) and the
+    // body flags (I32 [n_kv, n_stream], 1 = the cell has a live ring slot; all 0 when no attention reads the ring)
+    void          set_input_win_dev(ggml_tensor * rcells, ggml_tensor * flags, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch, bool used) const;
     ggml_tensor * get_k_win(ggml_context * ctx, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * get_v_win(ggml_context * ctx, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_k_win(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * idxs, int32_t il) const;
@@ -648,6 +651,7 @@ public:
     ggml_tensor * build_input_win_mask(ggml_context * ctx, const llama_ubatch & ubatch, const llama_cparams & cparams) const;
     void          set_input_win(ggml_tensor * idxs, ggml_tensor * mask, ggml_tensor * kq_mask, const llama_ubatch * ubatch,
                                 ggml_tensor * cells = nullptr) const;
+    void          set_input_win_dev(ggml_tensor * rcells, ggml_tensor * flags, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch, bool used) const;
     ggml_tensor * get_k_win(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v_win(ggml_context * ctx, int32_t il) const;
     ggml_tensor * cpy_k_win(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * idxs, int32_t il) const;
