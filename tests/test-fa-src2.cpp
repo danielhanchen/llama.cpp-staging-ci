@@ -6,7 +6,7 @@
 
 #include "ggml.h"
 #include "ggml-fa-src2.h"
-#include "ggml-cpu.h"
+#include "ggml-backend.h"
 
 #include <cmath>
 #include <cstdio>
@@ -100,7 +100,19 @@ static std::vector<float> run(const shape & sh, ggml_type tk, ggml_type tv, ggml
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out);
-    ggml_graph_compute_with_ctx(ctx, gf, n_threads);
+    // the CPU backend (also where it is a loadable module): the tensors live in the context's memory
+    static ggml_backend_t cpu = nullptr;
+    if (cpu == nullptr) {
+        ggml_backend_load_all();
+        cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        GGML_ASSERT(cpu != nullptr);
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu));
+    auto set_threads = (void (*)(ggml_backend_t, int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+    if (set_threads) {
+        set_threads(cpu, n_threads);
+    }
+    GGML_ASSERT(ggml_backend_graph_compute(cpu, gf) == GGML_STATUS_SUCCESS);
 
     std::vector<float> res(ggml_nelements(out));
     memcpy(res.data(), out->data, ggml_nbytes(out));
