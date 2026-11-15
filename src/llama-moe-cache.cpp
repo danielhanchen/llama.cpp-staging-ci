@@ -8609,10 +8609,10 @@ struct llama_moe_cache::impl {
     // layer whose previous MoE layer is a cache layer on the same device (both on the device lookup) admits, beside the graph, the N
     // experts with the largest logits of its router run on the previous layer's MoE input, at most MAX per layer and window; its own
     // lookup waits for those copies. LLAMA_MOE_PREFETCH=N (1..32) on with N (MAX = LLAMA_MOE_PREFETCH_MAX, default 0 = no cap), =0 off.
-    // Unset: on by default (N = 10, MAX = 1, LLAMA_MOE_PREFETCH_MAX still sets MAX) in windows of at least LLAMA_MOE_PREFETCH_MIN_TOKENS
-    // (6; 1 with an explicit LLAMA_MOE_PREFETCH) tokens: with the Studio MTP n2 drafter (windows of at most 5 rows at depth 4) the
-    // 48 GB passes were 1-5% longer with it on 5 of 6 8k prompts (tok/s geomean 0.90), DFlash2's 6 / 7-row windows gain most;
-    // where every device holding cache slots is a CUDA
+    // Unset: on by default (N = 10, MAX = 1, LLAMA_MOE_PREFETCH_MAX still sets MAX; LLAMA_MOE_PREFETCH_MIN_TOKENS: windows of fewer
+    // tokens do not prefetch, default 1) unless LLAMA_MOE_PREFETCH_AUTO=0, which common sets beside an MTP drafter (the Studio MTP n2
+    // shape at depth 4: 48 GB 8k passes 1-5% longer on 5 of 6 prompts, tok/s geomean 0.90; prefetching only 6+ row windows instead cost
+    // DFlash2 6.5% in chat and 3.5% in 8k, its EV-auto rule then picks wider windows), where every device holding cache slots is a CUDA
     // device of compute capability 12.0 and the cache holds at least LLAMA_MOE_PREFETCH_AUTO_MIN_FRAC (0.60) of the host experts'
     // bytes, or from LLAMA_MOE_PREFETCH_AUTO_LO_MIN_FRAC (0.10) to less than LLAMA_MOE_PREFETCH_AUTO_LO_FRAC (0.20) of them (N =
     // LLAMA_MOE_PREFETCH_AUTO_LO, default 0 = not in that band; 10 was measured); 8 GB (3.7% cached, single-token decode) lost 1-3.5%.
@@ -8664,6 +8664,15 @@ struct llama_moe_cache::impl {
         if (cache_frac < 0.0) {
             return c; // the slots are not sized yet: decided later
         }
+        if (const char * ea = getenv("LLAMA_MOE_PREFETCH_AUTO"); ea != nullptr && atoi(ea) == 0) {
+            if (!pf_quiet) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4pref: cross-layer prefetch off by default: LLAMA_MOE_PREFETCH_AUTO=0 (set beside an "
+                    "MTP drafter; LLAMA_MOE_PREFETCH=N on)\n", tag);
+            }
+            pf_cfg = c;
+            pf_resolved = true;
+            return c;
+        }
         int  cc_min = INT_MAX;
         int  cc_max = -1;
         bool any    = false;
@@ -8697,13 +8706,13 @@ struct llama_moe_cache::impl {
         }
         if (c.n > 0) {
             c.max_fill = em != nullptr ? std::max(0, atoi(em)) : 1;
-            c.min_tok  = et != nullptr ? std::max(1, atoi(et)) : 6;
+            c.min_tok  = et != nullptr ? std::max(1, atoi(et)) : 1;
         }
         if (!pf_quiet && any) {
             if (c.n > 0) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4pref: cross-layer prefetch on by default: compute capability 12.0, %.1f%% of the host "
-                    "experts cached: top %d predicted experts per token, at most %d per layer, verify windows of %d+ tokens "
-                    "(LLAMA_MOE_PREFETCH=0 off)\n", tag, 100.0*cache_frac, c.n, c.max_fill, c.min_tok);
+                    "experts cached: top %d predicted experts per token, at most %d per layer (LLAMA_MOE_PREFETCH=0 off)\n", tag,
+                    100.0*cache_frac, c.n, c.max_fill);
             } else {
                 LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4pref: cross-layer prefetch off by default: %s (compute capability %d, %.1f%% of the "
                     "host experts cached; LLAMA_MOE_PREFETCH=N on)\n", tag, why, cc_max, 100.0*cache_frac);

@@ -4500,6 +4500,13 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model 
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    // k19-g4pref: the MoE cache's default cross-layer prefetch stays off beside an MTP drafter (G4 Flash-Next Studio MTP n2 at depth 4,
+    // 48 GB: 8k tok/s geomean 0.90 over 6 prompts with it on); an explicit LLAMA_MOE_PREFETCH or LLAMA_MOE_PREFETCH_AUTO is kept
+    if (getenv("LLAMA_MOE_PREFETCH") == nullptr && getenv("LLAMA_MOE_PREFETCH_AUTO") == nullptr &&
+            std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) !=
+            params.speculative.types.end()) {
+        common_set_env("LLAMA_MOE_PREFETCH_AUTO", "0");
+    }
     common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();
