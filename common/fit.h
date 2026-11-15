@@ -65,6 +65,8 @@ int64_t common_fit_moe_margin_gain();
 // before a fit with a draft model or MTP heads, 0 = none) the fit keeps N x LLAMA_FIT_PREWARM_GRAPH_MIB (opt-in, default 0) more free
 // on every device beside such a cache, taken from the cache
 void    common_fit_set_prewarm_graphs(int n_graphs);
+// k19-l4gap2: rows of a speculative verify window (draft n_max + 1), for the disk-tier k19-placemid ubatch rule
+void    common_fit_set_verify_rows(int n_rows);
 
 // k13-small: the fit kept every layer on a small device with the reduced margin (LLAMA_FIT_SMALL_MARGIN_MIB); set once per process
 bool    common_fit_small_device();

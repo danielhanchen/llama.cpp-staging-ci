@@ -127,6 +127,13 @@ void common_fit_set_prewarm_graphs(int n_graphs) {
     g_prewarm_graphs = std::max(0, n_graphs);
 }
 
+// k19-l4gap2: the rows of a speculative verify window (draft n_max + 1; 1 without a drafter), set before the fit
+static int g_verify_rows = 1;
+
+void common_fit_set_verify_rows(int n_rows) {
+    g_verify_rows = std::max(1, n_rows);
+}
+
 static bool g_small_device = false;
 
 bool common_fit_small_device() {
@@ -1851,7 +1858,8 @@ static void common_params_fit_impl(
                 // serve there, so a short prompt's experts come from the device slots and the RAM tier instead of the CPU products of the
                 // mapping, and the decode keeps the larger cache. Colab L4 12 GB, same model, held-out texts, 3 interleaved launches
                 // (plans/k19_l4gap.md section 15d): chat TTFT -25%, chat decode +15%, a second chat TTFT -60%, a 1536-token thinking answer
-                // decode +2%; the skip above lost 9% on that answer
+                // decode +2%; the skip above lost 9% on that answer. Only where a speculative verify window has at most that many rows (MTP
+                // n2: 3), set by common_fit_set_verify_rows: a wider one would release and refill the banks in every pass
                 static const bool placemid_disk_skip = getenv("LLAMA_FIT_PLACEMID_DISK_SKIP") != nullptr && atoi(getenv("LLAMA_FIT_PLACEMID_DISK_SKIP")) != 0;
                 static const int  placemid_disk_ub   = getenv("LLAMA_FIT_PLACEMID_DISK_UB") != nullptr ? std::max(0, atoi(getenv("LLAMA_FIT_PLACEMID_DISK_UB"))) : 4;
                 bool     placemid_ram = true;
@@ -1870,6 +1878,10 @@ static void common_params_fit_impl(
                                 "available RAM and the cache of %zu MiB holds the experts of %.1f tokens (below %.1f): short prompts keep one ubatch that "
                                 "copies its experts from the RAM tier\n", __func__, exp_b/1048576.0, avail/1048576.0, cparams->moe_cache_size/MiB, tokens,
                                 placemid_disk_tokens);
+                        } else if (g_verify_rows > placemid_disk_ub) {
+                            // a verify window wider than the ubatch would run with the banks released every pass (DFlash2 n6: 7 rows)
+                            LOG_INF("%s: k19-l4gap2: k19-placemid stays at %u-token ubatches: verify windows of %d rows exceed %d tokens\n", __func__,
+                                common_fit_place8_ub(), g_verify_rows, placemid_disk_ub);
                         } else {
                             ub_disk = (uint32_t) placemid_disk_ub;
                             LOG_INF("%s: k19-l4gap2: k19-placemid at ubatches of %u tokens: %.0f MiB of host experts do not fit in %.0f MiB of available "
