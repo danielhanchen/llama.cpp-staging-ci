@@ -991,6 +991,9 @@ static struct moe_pf_report {
 
 // the prefetch arguments of a real lookup / assign of the group of state (all null without prefetches)
 static moe_pf_args moe_pf_real_args(const ggml_tensor * state) {
+    if (moe_pf_groups.empty()) {
+        return moe_pf_args{nullptr, nullptr, nullptr, 0, 0}; // no prefetch op ever ran (LLAMA_MOE_PREFETCH off)
+    }
     std::lock_guard<std::mutex> lock(moe_pf_mutex);
     const auto it = moe_pf_groups.find(state->data);
     if (it == moe_pf_groups.end()) {
