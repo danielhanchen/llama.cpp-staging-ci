@@ -2546,6 +2546,32 @@ static void ggml_compute_forward_kq_mask(const struct ggml_compute_params * para
     }
 }
 
+// k19-kvlong: GGML_OP_KQ_MASK mode 1 (ggml_sel_mask), the rows split over the threads: every cell kq_mask - INFINITY, then the selected
+// cells kq_mask + 0, each rounded as the f16 add of the chain it replaces
+static void ggml_compute_forward_sel_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * idx = dst->src[0];
+    const struct ggml_tensor * kq  = dst->src[1];
+    const int64_t n_kv   = dst->ne[0];
+    const int64_t n_rows = dst->ne[1]*dst->ne[2]*dst->ne[3];
+    const int64_t n_sel  = idx->ne[0];
+    const int64_t dr = (n_rows + params->nth - 1)/params->nth;
+    const int64_t r0 = dr*params->ith, r1 = MIN(r0 + dr, n_rows);
+    for (int64_t r = r0; r < r1; ++r) {
+        const ggml_fp16_t * k = (const ggml_fp16_t *) ((const char *) kq->data + r*kq->nb[1]);
+        ggml_fp16_t       * d = (ggml_fp16_t *) ((char *) dst->data + r*dst->nb[1]);
+        const int32_t     * c = (const int32_t *) ((const char *) idx->data + r*idx->nb[1]);
+        for (int64_t j = 0; j < n_kv; ++j) {
+            d[j] = GGML_CPU_FP32_TO_FP16(-INFINITY + GGML_CPU_FP16_TO_FP32(k[j]));
+        }
+        for (int64_t s = 0; s < n_sel; ++s) {
+            const int32_t j = c[s];
+            if (j >= 0 && j < n_kv) {
+                d[j] = GGML_CPU_FP32_TO_FP16(0.0f + GGML_CPU_FP16_TO_FP32(k[j]));
+            }
+        }
+    }
+}
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -2984,7 +3010,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             }
         case GGML_OP_KQ_MASK:
             {
-                ggml_compute_forward_kq_mask(params, tensor);
+                if (ggml_get_op_params_i32(tensor, 0) == 1) {
+                    ggml_compute_forward_sel_mask(params, tensor);
+                } else {
+                    ggml_compute_forward_kq_mask(params, tensor);
+                }
             } break;
         case GGML_OP_DFLASH2_CONV:
             {

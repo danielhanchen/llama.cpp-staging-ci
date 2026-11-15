@@ -1358,6 +1358,11 @@ struct llm_graph_context {
     // GPU copy of the cached rows `view` [n_embd_head, n_head_kv, n_kv, 1] with the rows `cur` written at `idxs`
     ggml_tensor * kv_host_stage(ggml_tensor * view, ggml_tensor * cur, ggml_tensor * idxs) const;
 
+    // k19-kvlong: the dense selection mask of a sparse attention (I32 [n_sel, n_tokens] selected cells, dead slots >= n_kv) as one
+    // ggml_sel_mask node, or nullptr where the layer's device does not run it or LLAMA_QSA_SEL_OP=0 (then the caller builds the
+    // fill / repeat / set_rows / add chain, whose values it equals)
+    ggml_tensor * build_sel_mask_op(ggml_tensor * sel_idx, ggml_tensor * kq_mask, ggml_backend_dev_t dev) const;
+
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_tokens]

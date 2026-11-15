@@ -1,4 +1,5 @@
 // Modifications by the Unsloth AI Inc. team are licensed under AGPL-3.0-only.
+#include "ggml-sel-mask.h"
 #include "llama-graph.h"
 
 #include <atomic>
@@ -3595,6 +3596,19 @@ static ggml_backend_t kv_host_gpu_backend(ggml_backend_sched_t sched) {
     // discrete GPUs only (k19-igpu): the staged / streamed host KV paths pair with the pinned host KV (llama_kv_cache), which an integrated
     // GPU does not get; there the host KV attention stays as upstream runs it (both modes are opt-in: LLAMA_KV_STAGE, LLAMA_KV_DECODE)
     return dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ? backend : nullptr;
+}
+
+ggml_tensor * llm_graph_context::build_sel_mask_op(ggml_tensor * sel_idx, ggml_tensor * kq_mask, ggml_backend_dev_t dev) const {
+    // LLAMA_QSA_SEL_OP=0: the chain, as before. The chain holds a [n_kv + n_sel, n_tokens] scatter buffer and the [n_kv, n_tokens] sum
+    // beside the causal mask; the node only its output (Qwen3.8-Flash-Next, ctx 262144, n_ubatch 2048: 1 GiB less compute buffer)
+    static const bool on = getenv("LLAMA_QSA_SEL_OP") == nullptr || atoi(getenv("LLAMA_QSA_SEL_OP")) != 0;
+    if (!on || dev == nullptr || kq_mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(kq_mask) || sel_idx->type != GGML_TYPE_I32 ||
+            sel_idx->nb[0] != sizeof(int32_t) || sel_idx->ne[1] != kq_mask->ne[1]*kq_mask->ne[2]*kq_mask->ne[3] ||
+            sel_idx->ne[2] != 1 || sel_idx->ne[3] != 1) {
+        return nullptr;
+    }
+    ggml_tensor * m = ggml_sel_mask(ctx0, sel_idx, kq_mask);
+    return ggml_backend_dev_supports_op(dev, m) ? m : nullptr;
 }
 
 kv_host_mode llm_graph_context::kv_host_attn_mode(const ggml_tensor * k, const ggml_tensor * v) const {

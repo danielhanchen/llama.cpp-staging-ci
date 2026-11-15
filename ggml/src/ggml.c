@@ -8,6 +8,7 @@
 #include "ggml-threading.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+#include "ggml-sel-mask.h"
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
@@ -3507,6 +3508,25 @@ struct ggml_tensor * ggml_kq_mask(
     result->op     = GGML_OP_KQ_MASK;
     result->src[0] = cells;
     result->src[1] = toks;
+
+    return result;
+}
+
+// k19-kvlong: see ggml-sel-mask.h
+struct ggml_tensor * ggml_sel_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * idx,
+        struct ggml_tensor  * kq_mask) {
+    GGML_ASSERT(idx->type == GGML_TYPE_I32 && kq_mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_is_contiguous(kq_mask) && idx->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(idx->ne[1] == kq_mask->ne[1]*kq_mask->ne[2]*kq_mask->ne[3] && idx->ne[2] == 1 && idx->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F16, GGML_MAX_DIMS, kq_mask->ne);
+
+    ggml_set_op_params_i32(result, 0, 1); // mode 1: the selection mask (mode 0: ggml_kq_mask)
+    result->op     = GGML_OP_KQ_MASK;
+    result->src[0] = idx;
+    result->src[1] = kq_mask;
 
     return result;
 }

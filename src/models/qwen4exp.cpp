@@ -995,7 +995,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel_mask(
     const int64_t n_kv  = inp_kpool->n_kv;
     GGML_ASSERT(sel_idx->ne[0] == n_sel && sel_idx->ne[1] == n_tokens);
 
-    // TODO: figure out to reduce the large copmute buffer that this creates
+    // k19-kvlong: one node where the layer's device runs it (no scatter buffer, see build_sel_mask_op)
+    if (ggml_tensor * m = build_sel_mask_op(sel_idx, kq_mask, model.dev_layer(il))) {
+        cb(m, "indexer_sel", il);
+        return m;
+    }
 
     // scatter zeros for the selected cells into an all -inf row, each dead slot into its own dump row n_kv + slot
     ggml_tensor * mask_all = ggml_new_tensor_4d(ctx0, kq_mask->type, n_kv + n_sel, 1, 1, 1);
