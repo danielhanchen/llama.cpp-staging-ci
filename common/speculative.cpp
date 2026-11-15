@@ -2203,6 +2203,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         int     rows = 1;            // the window drafted then
         int     drafted = 0;         // k19-tpp: the drafts made then (more than rows - 1: a wider window was drafted and not kept)
         bool    cal = true;          // k19-adraft: its drafts calibrate the hold rates (sampled rounds only)
+        bool    shared = false;      // k19-small1115: the round drafted then ran beside another active slot (dp.shared)
         std::vector<float> probs;    // its drafts' probabilities
         common_spec_mtp_cost::chain_state chain;
     };
@@ -2855,7 +2856,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     if (cs.t_us > 0) {
                         cost_pol.n_rounds[std::clamp(cs.rows, 1, common_spec_mtp_cost::MAX_T)] += 1.0;
                         // a round that drafted a wider window and kept the floor carries a draft step the floor window does not have
-                        if (cs.rows - 1 >= tpp_floor && cs.rows - 1 <= tpp_floor + 1 && cs.drafted == cs.rows - 1) {
+                        if (cs.rows - 1 >= tpp_floor && cs.rows - 1 <= tpp_floor + 1 && cs.drafted == cs.rows - 1 && !cs.shared) {
                             tpp_cost.observe(cs.rows - 1 - tpp_floor, (now - cs.t_us)/1000.0);
                         }
                     }
@@ -2865,9 +2866,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         cost_pol.observe(cs.rows, (now - cs.t_us)/1000.0);
                     }
                 }
-                cs.t_us  = now;
-                cs.rows  = 1;
-                cs.chain = {};
+                cs.t_us   = now;
+                cs.rows   = 1;
+                cs.chain  = {};
+                cs.shared = dp.shared;
                 cs.cal   = adraft_keep == 0 || sampled(dp);
                 cs.probs.clear();
             }
