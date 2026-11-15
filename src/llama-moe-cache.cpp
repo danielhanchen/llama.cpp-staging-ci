@@ -18,6 +18,10 @@
 // k19-q4xcache: see ggml.c (declared here so that ggml.h stays unchanged)
 extern "C" { GGML_API void ggml_moe_cache_assign_lookup_counts(struct ggml_tensor * op); }
 extern "C" { GGML_API void ggml_moe_cache_set_core(struct ggml_tensor * op, int32_t n_core); }
+// k19-g4pref: see ggml.c
+extern "C" { GGML_API struct ggml_tensor * ggml_moe_cache_prefetch(struct ggml_context * ctx, struct ggml_tensor * logits, struct ggml_tensor * map,
+        struct ggml_tensor * state, struct ggml_tensor ** banks, const void ** host, int n_banks, int il, int n_top, int max_fill,
+        int n_core, struct ggml_tensor * scores, struct ggml_tensor * dep); }
 
 #include <algorithm>
 #include <atomic>
@@ -8599,6 +8603,60 @@ struct llama_moe_cache::impl {
         return cm && cm_frozen && !cm_frozen_fetch;
     }
 
+    // k19-g4pref cross-layer prefetch. LLAMA_MOE_PREFETCH=N (1..32; unset / 0 = off): in decode / verify windows of at most
+    // LLAMA_MOE_PREFETCH_MAX_TOKENS (default 8) tokens, a cache layer whose previous MoE layer is a cache layer of the same group (both
+    // on the device lookup) admits, beside the graph, the N experts with the largest logits of its router run on the previous layer's
+    // MoE input, at most LLAMA_MOE_PREFETCH_MAX (default 0 = no cap) per layer and window; its own lookup waits for those copies
+    static int prefetch_n() {
+        static const int n = [] {
+            const char * e = getenv("LLAMA_MOE_PREFETCH");
+            return e != nullptr ? std::max(0, std::min(32, atoi(e))) : 0;
+        }();
+        return n;
+    }
+    mutable uint64_t n_prefetch_ops = 0; // engagement: prefetch ops built
+
+    bool prefetch_ok(int32_t il_prev, int32_t il, int64_t n_ubatch) const {
+        static const int64_t max_tok = getenv("LLAMA_MOE_PREFETCH_MAX_TOKENS") != nullptr ?
+            std::max<int64_t>(1, atoll(getenv("LLAMA_MOE_PREFETCH_MAX_TOKENS"))) : 8;
+        if (prefetch_n() <= 0 || force_large || n_ubatch < 1 || n_ubatch > max_tok || n_ubatch > n_small_max) {
+            return false;
+        }
+        if (il_prev < 0 || il <= il_prev || il >= (int32_t) layers.size() || layers[il].ig < 0 || layers[il_prev].ig != layers[il].ig) {
+            return false;
+        }
+        const group & g = groups[layers[il].ig];
+        if (!use_device(g, n_ubatch) || !slots_fit(g, n_ubatch) || layers[il].host_dev.size() != g.banks.size() ||
+                layers[il_prev].host_dev.size() != g.banks.size()) {
+            return false;
+        }
+        // frozen small batches admit nothing (k13), and the prefetch admits
+        if (cm && cm_frozen) {
+            return false;
+        }
+        return true;
+    }
+
+    ggml_tensor * prefetch(ggml_context * ctx, int32_t il, ggml_tensor * logits, ggml_tensor * dep, int64_t n_ubatch) const {
+        GGML_UNUSED(n_ubatch);
+        static const int max_fill = getenv("LLAMA_MOE_PREFETCH_MAX") != nullptr ? std::max(0, atoi(getenv("LLAMA_MOE_PREFETCH_MAX"))) : 0;
+        const int n_top = std::min<int>(prefetch_n(), (int) logits->ne[0]);
+        if (n_top <= 0 || n_top*logits->ne[1] > 256) {
+            return nullptr;
+        }
+        const layer & l = layers[il];
+        const group & g = groups[l.ig];
+        std::vector<ggml_tensor *> banks = op_banks(g);
+        std::vector<const void *>  host  = l.host_dev;
+        ggml_tensor * op = ggml_moe_cache_prefetch(ctx, logits, g.map, g.state, banks.data(), host.data(), (int) banks.size(), il, n_top,
+            max_fill, g.lru.n_core, g.scores, dep);
+        if (n_prefetch_ops++ == 0) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4pref: cross-layer prefetch of the top %d predicted experts per token (max %d per layer, "
+                "0 = no cap; LLAMA_MOE_PREFETCH=0 off)\n", tag, n_top, max_fill);
+        }
+        return op;
+    }
+
     ggml_tensor * hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res, bool ov) const {
         const layer & l = layers[il];
         const group & g = groups[l.ig];
@@ -13864,6 +13922,14 @@ ggml_tensor * llama_moe_cache::hybrid_assign(ggml_context * ctx, int32_t il, ggm
 
 ggml_tensor * llama_moe_cache::hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res, bool overlap) const {
     return pimpl->hybrid_fetch_experts(ctx, il, res, overlap);
+}
+
+bool llama_moe_cache::prefetch_ok(int32_t il_prev, int32_t il, int64_t n_ubatch) const {
+    return pimpl->prefetch_ok(il_prev, il, n_ubatch);
+}
+
+ggml_tensor * llama_moe_cache::prefetch(ggml_context * ctx, int32_t il, ggml_tensor * logits, ggml_tensor * dep, int64_t n_ubatch) const {
+    return pimpl->prefetch(ctx, il, logits, dep, n_ubatch);
 }
 
 bool llama_moe_cache::overlap(int64_t n_ubatch) const {

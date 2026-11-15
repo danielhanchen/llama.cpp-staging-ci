@@ -7,7 +7,11 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #define MOE_MAILBOX_OK 1 // single-graph host misses (ggml_moe_mailbox_publish)
@@ -88,13 +92,42 @@ static __device__ __forceinline__ void moe_cache_add_u64(int32_t * p, const unsi
     p[1] = (int32_t) (uint32_t) (x >> 32);
 }
 
+// k19-g4pref cross-layer prefetch (ggml_moe_cache_prefetch, op mode 8). A prefetch runs the assign below as a plain lookup of predicted
+// ids (is_pf): it admits them like a lookup but writes no use counters, scores or lookup statistics, at most max_fill experts (0: all).
+// The real lookups and assigns of a group with prefetches count what came of them. mark [n_slots]: MOE_PF_MAGIC while a slot holds an
+// expert a prefetch admitted that no lookup has hit since; ev [n_layer*n_expert]: MOE_PF_MAGIC while an expert a prefetch evicted has
+// not been missed since; stat: the counters MOE_PF_STAT_* (every counter has one writer kernel: the prefetch or the real lookup)
+#define MOE_PF_MAGIC 0x50465046
+enum {
+    MOE_PF_STAT_LAYERS = 0,  // prefetch calls
+    MOE_PF_STAT_CACHED,      // predicted experts that were cached already
+    MOE_PF_STAT_FILLS,       // experts admitted (copied) by prefetches
+    MOE_PF_STAT_CAPPED,      // predicted missing experts left out by the cap
+    MOE_PF_STAT_USEFUL,      // prefetched slots hit by a later lookup (before any eviction)
+    MOE_PF_STAT_WASTED_PF,   // prefetched slots evicted before any hit, by a prefetch
+    MOE_PF_STAT_WASTED_REAL, // the same, by a real lookup
+    MOE_PF_STAT_EVMISS,      // real misses of experts a prefetch evicted
+    MOE_PF_STAT_REAL,        // real lookups / assigns
+    MOE_PF_STAT_REAL_FILLS,  // experts they admitted
+    MOE_PF_STAT_SKIPPED,     // prefetch ops not run: the layer's own lookup came first (host side)
+    MOE_PF_STAT_N
+};
+struct moe_pf_args {
+    int32_t *            mark;
+    int32_t *            ev;
+    unsigned long long * stat;
+    int                  is_pf;
+    int                  max_fill;
+};
+
 static __global__ void moe_cache_assign(
         const int32_t * __restrict__ ids, int32_t * __restrict__ map, int32_t * __restrict__ state, int32_t * __restrict__ dst,
         const int n_ids, const int ne0, const int n_expert, const int il, const int n_slots,
         int32_t * __restrict__ counts, const int n_layer, const int fetch_q,
         int32_t * __restrict__ scores, const int grow, const int advance, const int n_scores, const int frozen = 0,
         const int tail_rank = 0, int32_t * __restrict__ skip_stat = nullptr, int ids_s1 = 0, const int defer = 0,
-        const int margin_q = 0, const int margin_add_q = 0, const int lookup_counts = 0, const int lo = 0) {
+        const int margin_q = 0, const int margin_add_q = 0, const int lookup_counts = 0, const int lo = 0,
+        const moe_pf_args pf = moe_pf_args{nullptr, nullptr, nullptr, 0, 0}) {
     if (ids_s1 <= 0) {
         ids_s1 = ne0;
     }
@@ -189,6 +222,9 @@ static __global__ void moe_cache_assign(
     // hits: set the reference bit and pin the slot for this lookup
     int n_hit = 0;
     int n_skp = 0;
+    int n_useful = 0; // k19-g4pref counters (pf.mark / pf.ev set)
+    int n_wasted = 0;
+    int n_evmiss = 0;
     for (int i = lane; i < n_ids; i += MOE_CACHE_LANES) {
         const int32_t s = row[moe_cache_id(ids, i, n_expert, ne0, ids_s1)];
         const bool skip = moe_cache_tail_skip(ids, i, s, n_ids, ne0, n_expert, tail_rank, ids_s1);
@@ -205,8 +241,12 @@ static __global__ void moe_cache_assign(
                 if (cnt_w != nullptr) {
                     cnt_w[e] += cnt_w[e] < 0x7fffffff;
                 }
-                if (sc != nullptr) {
+                if (sc != nullptr && !pf.is_pf) {
                     sc[e] = min(sc[e] + w, MOE_CACHE_SCORE_MAX);
+                }
+                if (pf.mark != nullptr && !pf.is_pf && pf.mark[s] == MOE_PF_MAGIC) {
+                    pf.mark[s] = 0;
+                    n_useful++;
                 }
             }
         }
@@ -238,8 +278,12 @@ static __global__ void moe_cache_assign(
             if (cnt_w != nullptr) {
                 cnt_w[e] += cnt_w[e] < 0x7fffffff;
             }
-            if (sc != nullptr) {
+            if (sc != nullptr && !pf.is_pf) {
                 sc[e] = min(sc[e] + w, MOE_CACHE_SCORE_MAX);
+            }
+            if (pf.ev != nullptr && !pf.is_pf && !skip && pf.ev[(int64_t) il*n_expert + e] == MOE_PF_MAGIC) {
+                pf.ev[(int64_t) il*n_expert + e] = 0;
+                n_evmiss++;
             }
         }
         n_miss += __popc(m);
@@ -292,6 +336,18 @@ static __global__ void moe_cache_assign(
             stat[0] = (int32_t) (uint32_t) n_host;
             stat[1] = (int32_t) (uint32_t) (n_host >> 32);
         }
+    }
+
+    // k19-g4pref: a prefetch admits at most max_fill of its missing experts (the first ones in the order of the ids: rank-major)
+    if (pf.is_pf && pf.max_fill > 0 && n_take > pf.max_fill) {
+        for (int j = pf.max_fill + lane; j < n_take; j += MOE_CACHE_LANES) {
+            row[take_e[j]] = -1;
+        }
+        if (lane == 0) {
+            pf.stat[MOE_PF_STAT_CAPPED] += (unsigned long long) (n_take - pf.max_fill);
+        }
+        n_take = pf.max_fill;
+        __syncthreads();
     }
 
     // victims: CLOCK sweep, 32 slots at a time, the slots used by this lookup are skipped
@@ -489,6 +545,16 @@ static __global__ void moe_cache_assign(
         } else {
             n_new++;
         }
+        if (pf.mark != nullptr) {
+            n_wasted += old >= 0 && pf.mark[s] == MOE_PF_MAGIC;
+            pf.mark[s] = pf.is_pf ? MOE_PF_MAGIC : 0;
+        }
+        if (pf.ev != nullptr) {
+            if (pf.is_pf && old >= 0) {
+                pf.ev[old] = MOE_PF_MAGIC;
+            }
+            pf.ev[(int64_t) il*n_expert + e] = 0;
+        }
         key_of[s] = il*n_expert + e;
         ref[s]    = 1;
         row[e]    = s;
@@ -519,6 +585,11 @@ static __global__ void moe_cache_assign(
         n_hit += __shfl_xor_sync(full, n_hit, off, MOE_CACHE_LANES);
         n_new += __shfl_xor_sync(full, n_new, off, MOE_CACHE_LANES);
         n_skp += __shfl_xor_sync(full, n_skp, off, MOE_CACHE_LANES);
+        if (pf.stat != nullptr) {
+            n_useful += __shfl_xor_sync(full, n_useful, off, MOE_CACHE_LANES);
+            n_wasted += __shfl_xor_sync(full, n_wasted, off, MOE_CACHE_LANES);
+            n_evmiss += __shfl_xor_sync(full, n_evmiss, off, MOE_CACHE_LANES);
+        }
     }
     if (lane == 0) {
         if (skip_stat != nullptr && n_skp > 0) {
@@ -527,8 +598,23 @@ static __global__ void moe_cache_assign(
         state[6] += n_new;
         state[0] = h;
         *n_fill  = n_take;
-        *(unsigned long long *) (state + 2) += (unsigned long long) n_hit;
-        *(unsigned long long *) (state + 4) += (unsigned long long) n_take;
+        if (pf.is_pf) {
+            // a prefetch is not a lookup: the hit / miss statistics of the cache stay those of the real lookups
+            pf.stat[MOE_PF_STAT_LAYERS]    += 1;
+            pf.stat[MOE_PF_STAT_CACHED]    += (unsigned long long) n_hit;
+            pf.stat[MOE_PF_STAT_FILLS]     += (unsigned long long) n_take;
+            pf.stat[MOE_PF_STAT_WASTED_PF] += (unsigned long long) n_wasted;
+        } else {
+            *(unsigned long long *) (state + 2) += (unsigned long long) n_hit;
+            *(unsigned long long *) (state + 4) += (unsigned long long) n_take;
+            if (pf.stat != nullptr) {
+                pf.stat[MOE_PF_STAT_USEFUL]      += (unsigned long long) n_useful;
+                pf.stat[MOE_PF_STAT_WASTED_REAL] += (unsigned long long) n_wasted;
+                pf.stat[MOE_PF_STAT_EVMISS]      += (unsigned long long) n_evmiss;
+                pf.stat[MOE_PF_STAT_REAL]        += 1;
+                pf.stat[MOE_PF_STAT_REAL_FILLS]  += (unsigned long long) n_take;
+            }
+        }
     }
 }
 
@@ -805,6 +891,212 @@ static __global__ void moe_cache_seed_fill(const int32_t * __restrict__ plan, co
     }
 }
 
+// k19-g4pref: the n_top experts with the largest logits of each token (ties: the lower expert id, NaN read as -inf), rank-major:
+// ids[r*n_tokens + t] is the expert of rank r of token t, so the assign meets every token's first choices before any second one
+#define MOE_PF_THREADS 256
+#define MOE_PF_MAX_IDS 256
+static __global__ void moe_pf_topn(const float * __restrict__ logits, const int n_expert, const int n_top, const int n_tokens,
+        int32_t * __restrict__ ids) {
+    extern __shared__ float pf_v[]; // [n_expert]
+    __shared__ float bv[MOE_PF_THREADS/32];
+    __shared__ int   bi[MOE_PF_THREADS/32];
+    const int t = blockIdx.x;
+    const float * x = logits + (int64_t) t*n_expert;
+    for (int i = threadIdx.x; i < n_expert; i += blockDim.x) {
+        const float v = x[i];
+        pf_v[i] = v == v ? v : -INFINITY;
+    }
+    __syncthreads();
+    const int lane = threadIdx.x % 32;
+    const int wid  = threadIdx.x / 32;
+    for (int r = 0; r < n_top; ++r) {
+        float best_v = -INFINITY;
+        int   best_i = INT_MAX;
+        for (int i = threadIdx.x; i < n_expert; i += blockDim.x) {
+            const float v = pf_v[i];
+            if (v > best_v || (v == best_v && i < best_i)) {
+                best_v = v;
+                best_i = i;
+            }
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            const float v2 = __shfl_xor_sync(0xffffffffu, best_v, o, 32);
+            const int   i2 = __shfl_xor_sync(0xffffffffu, best_i, o, 32);
+            if (v2 > best_v || (v2 == best_v && i2 < best_i)) {
+                best_v = v2;
+                best_i = i2;
+            }
+        }
+        if (lane == 0) {
+            bv[wid] = best_v;
+            bi[wid] = best_i;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float v = bv[0];
+            int   k = bi[0];
+            for (int w = 1; w < (int) (blockDim.x/32); ++w) {
+                if (bv[w] > v || (bv[w] == v && bi[w] < k)) {
+                    v = bv[w];
+                    k = bi[w];
+                }
+            }
+            k = k < n_expert ? k : 0; // (n_top <= n_expert: some expert is left)
+            ids[r*n_tokens + t] = k;
+            pf_v[k] = NAN; // taken: NaN compares false, so it is never picked again (input NaN was read as -inf)
+        }
+        __syncthreads();
+    }
+}
+
+// per backend context: the copy lists of each layer's prefetch and whether one is waiting for its join; per cache state (group): the
+// slot marks, the eviction stamps and the counters
+struct moe_pf_group {
+    int                  device = -1;
+    int32_t *            mark = nullptr;
+    int32_t *            ev   = nullptr;
+    unsigned long long * stat = nullptr;
+    int64_t              n_slots = 0;
+    unsigned long long   skipped = 0;
+};
+struct moe_pf_ctx {
+    int32_t * buf     = nullptr; // [n_layer][MOE_PF_STRIDE]: ids, then the lookup result of a prefetch
+    int       n_layer = 0;
+    bool      pending = false;   // the copies of a prefetch were recorded in moe_join and nothing waited for them yet
+    int       last_il = -1;      // the layer of the last real lookup / assign
+};
+#define MOE_PF_STRIDE 1024
+static std::mutex moe_pf_mutex;
+static std::unordered_map<const void *, moe_pf_group> moe_pf_groups; // key: the state's device pointer
+static std::unordered_map<const ggml_backend_cuda_context *, moe_pf_ctx> moe_pf_ctxs;
+
+static struct moe_pf_report {
+    ~moe_pf_report() {
+        for (auto & [key, g] : moe_pf_groups) {
+            unsigned long long c[MOE_PF_STAT_N] = {};
+            if (g.stat == nullptr || cudaSetDevice(g.device) != cudaSuccess ||
+                    cudaMemcpy(c, g.stat, sizeof(c), cudaMemcpyDeviceToHost) != cudaSuccess) {
+                continue;
+            }
+            c[MOE_PF_STAT_SKIPPED] = g.skipped;
+            fprintf(stderr, "ggml_cuda: k19-g4pref: device %d (%lld slots): %llu prefetch layers, %llu predicted cached, %llu prefetch fills "
+                "(%llu capped), %llu useful, %llu wasted (%llu by prefetches, %llu by lookups), %llu misses of prefetch-evicted experts, "
+                "%llu lookups with %llu fills, %llu prefetch ops skipped\n", g.device, (long long) g.n_slots,
+                c[MOE_PF_STAT_LAYERS], c[MOE_PF_STAT_CACHED], c[MOE_PF_STAT_FILLS], c[MOE_PF_STAT_CAPPED], c[MOE_PF_STAT_USEFUL],
+                c[MOE_PF_STAT_WASTED_PF] + c[MOE_PF_STAT_WASTED_REAL], c[MOE_PF_STAT_WASTED_PF], c[MOE_PF_STAT_WASTED_REAL],
+                c[MOE_PF_STAT_EVMISS], c[MOE_PF_STAT_REAL], c[MOE_PF_STAT_REAL_FILLS], c[MOE_PF_STAT_SKIPPED]);
+        }
+    }
+} moe_pf_report_at_exit;
+
+// the prefetch arguments of a real lookup / assign of the group of state (all null without prefetches)
+static moe_pf_args moe_pf_real_args(const ggml_tensor * state) {
+    std::lock_guard<std::mutex> lock(moe_pf_mutex);
+    const auto it = moe_pf_groups.find(state->data);
+    if (it == moe_pf_groups.end()) {
+        return moe_pf_args{nullptr, nullptr, nullptr, 0, 0};
+    }
+    return moe_pf_args{it->second.mark, it->second.ev, it->second.stat, 0, 0};
+}
+
+// before a cache op other than a prefetch: the main stream waits for the copies of a prefetch (the next layer's lookup reads its
+// slots as cached). moe_join_pending is cleared at the end of every graph, so a prefetch of another graph is never waited for here
+static void moe_pf_join(ggml_backend_cuda_context & ctx, const int il) {
+    if (moe_pf_ctxs.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(moe_pf_mutex);
+    const auto it = moe_pf_ctxs.find(&ctx);
+    if (it == moe_pf_ctxs.end()) {
+        return;
+    }
+    if (it->second.pending && ctx.moe_join_pending) {
+        CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), ctx.moe_join, 0));
+        ctx.moe_join_pending = false;
+    }
+    it->second.pending = false;
+    if (il >= 0) {
+        it->second.last_il = il;
+    }
+}
+
+static void moe_pf_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * logits = dst->src[0];
+    ggml_tensor       * map    = dst->src[1];
+    ggml_tensor       * state  = dst->src[2];
+    const int il       = ggml_get_op_params_i32(dst, 0);
+    const int n_banks  = ggml_get_op_params_i32(dst, 1);
+    const int n_top    = ggml_get_op_params_i32(dst, 11);
+    const int max_fill = ggml_get_op_params_i32(dst, 12);
+    const int n_core   = ggml_get_op_params_i32(dst, 13);
+    const ggml_tensor * scores = dst->src[4 + n_banks];
+    const int n_expert = (int) map->ne[0];
+    const int n_layer  = (int) map->ne[1];
+    const int n_tokens = (int) logits->ne[1];
+    const int n_slots  = (int) ((ggml_nelements(state) - MOE_CACHE_HDR)/3);
+    const int n_ids    = n_top*n_tokens;
+    if (n_tokens <= 0 || n_top > n_expert || n_ids > MOE_PF_MAX_IDS || 3*n_ids + n_tokens > MOE_PF_STRIDE - MOE_PF_MAX_IDS) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(moe_pf_mutex);
+    moe_pf_group & g = moe_pf_groups[state->data];
+    if (g.stat == nullptr) {
+        // first use (also inside a capture: the streams are non-blocking, the capture is relaxed)
+        g.device  = ctx.device;
+        g.n_slots = n_slots;
+        CUDA_CHECK(cudaMalloc(&g.mark, (size_t) n_slots*sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&g.ev, (size_t) ggml_nelements(map)*sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&g.stat, MOE_PF_STAT_N*sizeof(unsigned long long)));
+        CUDA_CHECK(cudaMemset(g.mark, 0, (size_t) n_slots*sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(g.ev, 0, (size_t) ggml_nelements(map)*sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(g.stat, 0, MOE_PF_STAT_N*sizeof(unsigned long long)));
+    }
+    moe_pf_ctx & p = moe_pf_ctxs[&ctx];
+    if (p.last_il >= il) {
+        // the layer's own lookup (or a later one) ran before this op in the graph: its slots may be read now, nothing is admitted
+        g.skipped++;
+        return;
+    }
+    if (p.buf == nullptr || p.n_layer < n_layer) {
+        if (p.buf != nullptr) {
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaFree(p.buf));
+        }
+        CUDA_CHECK(cudaMalloc(&p.buf, (size_t) n_layer*MOE_PF_STRIDE*sizeof(int32_t)));
+        p.n_layer = n_layer;
+    }
+    if (ctx.moe_fork == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.moe_fork, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.moe_join, cudaEventDisableTiming));
+    }
+    int32_t * ids = p.buf + (size_t) il*MOE_PF_STRIDE;
+    int32_t * res = ids + MOE_PF_MAX_IDS;
+
+    cudaStream_t stream = ctx.stream();
+    cudaStream_t side   = ctx.stream(ctx.device, GGML_CUDA_MAX_STREAMS - 1);
+    CUDA_CHECK(cudaEventRecord(ctx.moe_fork, stream));
+    CUDA_CHECK(cudaStreamWaitEvent(side, ctx.moe_fork, 0));
+    moe_pf_topn<<<n_tokens, MOE_PF_THREADS, (size_t) n_expert*sizeof(float), side>>>((const float *) logits->data, n_expert, n_top,
+        n_tokens, ids);
+    CUDA_CHECK(cudaGetLastError());
+    const moe_pf_args pa = { g.mark, g.ev, g.stat, 1, max_fill };
+    const int n_scores = scores != nullptr ? (int) ggml_nelements(scores) : 0;
+    moe_cache_assign<<<1, MOE_CACHE_LANES, (2*n_ids + (scores != nullptr ? 2*MOE_CACHE_WINDOW : 0))*sizeof(int32_t), side>>>(
+        ids, (int32_t *) map->data, (int32_t *) state->data, res, n_ids, n_tokens, n_expert, il, n_slots, nullptr, 0, 0,
+        scores != nullptr ? (int32_t *) scores->data : nullptr, 65536 + 1, 0, n_scores, 0, 0, nullptr, n_tokens, 0, 0, 0, 0, n_core, pa);
+    CUDA_CHECK(cudaGetLastError());
+    // GGML_CUDA_MOE_PREFETCH_Z: blocks per expert and bank of the copies (default: GGML_CUDA_MOE_FETCH_OVERLAP_Z's default, 2)
+    static const int max_z = [] {
+        const char * env = getenv("GGML_CUDA_MOE_PREFETCH_Z");
+        return env != nullptr ? std::max(0, atoi(env)) : 2;
+    }();
+    moe_cache_fetch_launch(side, dst, dst->src + 3, n_banks, res, n_ids, n_tokens, max_z, nullptr);
+    CUDA_CHECK(cudaEventRecord(ctx.moe_join, side));
+    ctx.moe_join_pending = true;
+    p.pending = true;
+}
+
 bool ggml_cuda_moe_cache_lookup_supported(const ggml_tensor * op) {
     const int mode    = ggml_get_op_params_i32(op, 10);
     const int n_banks = ggml_get_op_params_i32(op, 1);
@@ -817,6 +1109,12 @@ bool ggml_cuda_moe_cache_lookup_supported(const ggml_tensor * op) {
     }
     if (mode == 5) {
         return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->op == GGML_OP_MUL_MAT_ID;
+    }
+    if (mode == 8) {
+        const int n_expert = (int) op->src[1]->ne[0];
+        return n_banks >= 1 && n_banks <= 4 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I32 &&
+            op->src[2]->type == GGML_TYPE_I32 && op->src[0]->ne[0] == n_expert && (size_t) n_expert*sizeof(float) <= 48*1024 &&
+            ggml_get_op_params_i32(op, 11)*op->src[0]->ne[1] <= MOE_PF_MAX_IDS;
     }
     if (mode == 6 || mode == 7) {
 #if defined(MOE_MAILBOX_OK)
@@ -1107,6 +1405,14 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
     }
 #endif
 
+    if (mode == 8) {
+        moe_pf_run(ctx, dst); // k19-g4pref, see ggml_moe_cache_prefetch
+        return;
+    }
+    if (mode != 3) {
+        moe_pf_join(ctx, mode == 0 || mode == 1 ? ggml_get_op_params_i32(dst, 0) : -1);
+    }
+
     if (mode == 4) {
         // device seed plan, see ggml_moe_cache_seed_plan
         const ggml_tensor * ids    = dst->src[0];
@@ -1306,7 +1612,7 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
             scores != nullptr ? (int32_t *) scores->data : nullptr, grow, advance, n_scores, ggml_get_op_params_i32(dst, 15),
             tail_rank, tail_rank > 0 ? (int32_t *) counts->data + (int64_t) map->ne[1]*n_expert + 4 : nullptr, ids_s1,
             ggml_get_op_params_i32(dst, 9), n_expert >= 8 ? admit_margin_q : 0, admit_add_q, ggml_get_op_params_i32(dst, 8),
-            ggml_get_op_params_i32(dst, 7));
+            ggml_get_op_params_i32(dst, 7), moe_pf_real_args(state));
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -1319,7 +1625,8 @@ void ggml_cuda_op_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor 
         n_ids, ne0, n_expert, il, n_slots, nullptr, 0, 0,
         scores != nullptr ? (int32_t *) scores->data : nullptr, grow, advance, n_scores, 0,
         tail_rank, tail_rank > 0 && skip_counts != nullptr ? (int32_t *) skip_counts->data + (int64_t) map->ne[1]*n_expert + 4 : nullptr, ids_s1,
-        0, 0, 0, 0, n_banks <= 3 ? ggml_get_op_params_i32(dst, 9) : 0); // core: op param 9 (host pointers of a 4th bank otherwise)
+        0, 0, 0, 0, n_banks <= 3 ? ggml_get_op_params_i32(dst, 9) : 0, // core: op param 9 (host pointers of a 4th bank otherwise)
+        moe_pf_real_args(state));
     CUDA_CHECK(cudaGetLastError());
 
     moe_cache_fetch_launch(stream, dst, dst->src + 3, n_banks, (const int32_t *) dst->data, n_ids, ne0);
