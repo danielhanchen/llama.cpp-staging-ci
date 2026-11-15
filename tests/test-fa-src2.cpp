@@ -5,6 +5,7 @@
 //     dequantized K / V (the Q to q8_0 rounding of the dot products bounds the error).
 
 #include "ggml.h"
+#include "ggml-fa-src2.h"
 #include "ggml-cpu.h"
 
 #include <cmath>

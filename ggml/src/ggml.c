@@ -5,6 +5,7 @@
 #include "ggml-version.h"
 #include "ggml-backend.h"
 #include "ggml-impl.h"
+#include "ggml-fa-src2.h"
 #include "ggml-threading.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
