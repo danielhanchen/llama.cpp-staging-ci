@@ -5,6 +5,7 @@
 #include "llama.h"
 
 #include <functional>
+#include <string>
 #include <vector>
 
 enum common_params_fit_status {
@@ -17,6 +18,9 @@ enum common_params_fit_status {
 //   - whole layers: the first layers go to system memory with their KV cache, attention over that KV cache runs on the CPU
 //   - KV-resident: every layer keeps its attention and its KV cache (at the requested context) in device memory, the FFN tensors
 //     of the last layers go to system memory first
+// whether the model file lives on a memory file system (tmpfs / ramfs, Linux): its pages are in RAM whatever the available memory reads
+bool common_fit_file_in_ram_fs(const std::string & path);
+
 enum common_fit_kv_resident {
     COMMON_FIT_KV_RESIDENT_AUTO = 0, // KV-resident if the whole-layer placement would spill little KV cache per byte of weights (default)
     COMMON_FIT_KV_RESIDENT_ON   = 1, // KV-resident whenever the model does not fit
