@@ -2014,6 +2014,8 @@ private:
 
     bool sleeping = false;
     int32_t spec_active_cap = 0; // k19-small1115: drafts per window while another slot is active (0: no cut; load_model)
+    bool    spec_g4t_raised = false; // k19-g4tail: the rule raised the MTP windows to n_def drafts (load_model)
+    int32_t spec_g4t_cap    = 0;     // k19-g4tail2: drafts per window when the placed MoE cache is outside the band (0: no cut)
 
     int64_t t_last_load_progress_ms = 0;
 
@@ -2301,6 +2303,7 @@ private:
                 const double g4t_hi = getenv("LLAMA_MOE_G4TAIL_HI") != nullptr ? atof(getenv("LLAMA_MOE_G4TAIL_HI")) : 0.17;
                 const bool g4t = !def_on && g4tail_on && exp_b > 0 && short_b > 0 && resident && share >= g4t_lo && share < g4t_hi &&
                     n_gpu > 0 && cc_min == 1200 && cc_max == 1200;
+                spec_g4t_raised = g4t;
                 if (def_on || g4t) {
                     depth_cached = n_def;
                     // (a model on a memory file system: its experts are in RAM whatever MemAvailable reads)
@@ -2507,6 +2510,22 @@ private:
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
+
+        // k19-g4tail2: the rule's windows of n_def drafts stand only where the placed MoE cache took its prefetch band (the cache
+        // publishes LLAMA_MOE_G4TAIL_PLACED once placed). Its estimate before the fit leaves out the KV cache of n_ctx: at 262144 the
+        // placed cache is smaller than at the measured 32768, and 4-draft windows beside a cache below the band were never measured
+        // to pay. Outside the band: 2 drafts per window, as without the rule (LLAMA_MOE_G4TAIL_PLACED_GATE=0: keep the windows)
+        if (spec_g4t_raised && ctx_tgt != nullptr) {
+            const char * pg = getenv("LLAMA_MOE_G4TAIL_PLACED_GATE");
+            const char * pl = getenv("LLAMA_MOE_G4TAIL_PLACED");
+            if ((pg == nullptr || atoi(pg) != 0) && (pl == nullptr || atoi(pl) == 0)) {
+                spec_g4t_cap = 2;
+                SRV_INF("k19-g4tail2: the placed MoE cache is outside the prefetch band (%s): MTP windows of 2 drafts "
+                    "(LLAMA_MOE_G4TAIL_PLACED_GATE=0: keep the wider windows)\n", pl == nullptr ? "no verdict" : "verdict off");
+            } else if (pl != nullptr && atoi(pl) != 0) {
+                SRV_INF("%s", "k19-g4tail2: the placed MoE cache is in the prefetch band: the wider MTP windows stay\n");
+            }
+        }
 
         if (model_tgt == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
@@ -5528,6 +5547,9 @@ private:
                 int n_draft_max = slot.get_n_draft_max();
                 if (spec_floor_cap > 0) {
                     n_draft_max = std::min(n_draft_max, spec_floor_cap);
+                }
+                if (spec_g4t_cap > 0) {
+                    n_draft_max = std::min(n_draft_max, spec_g4t_cap);
                 }
 
                 slot.gov_step = 0;
