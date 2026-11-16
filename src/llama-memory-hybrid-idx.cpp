@@ -17,6 +17,7 @@
 #include <cassert>
 #include <cmath>
 #include <iterator>
+#include <cstring>
 #include <stdexcept>
 
 //
@@ -68,10 +69,24 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         hparams_idx.n_embd_head_k_mla_impl = model.hparams.indexer_head_size;
         hparams_idx.n_embd_head_v_mla_impl = model.hparams.indexer_head_size;
 
-        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
+        // k19-kvlong (LLAMA_KV_IDX_TYPE=<type name>, opt-in, diagnostic): the indexer key cache in its own type instead of -ctk's
+        // (it scores every cell of the context to select the attended rows, so a quantized K changes which rows the attention reads)
+        ggml_type type_k_idx = type_k;
+        ggml_type type_v_idx = type_v;
+        if (const char * e = getenv("LLAMA_KV_IDX_TYPE"); e != nullptr && *e != '\0') {
+            for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+                const char * n = ggml_type_name((ggml_type) t);
+                if (n != nullptr && strcmp(n, e) == 0) {
+                    type_k_idx = (ggml_type) t;
+                    type_v_idx = (ggml_type) t;
+                }
+            }
+        }
+
+        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells, K type %s\n", __func__, kv_size, ggml_type_name(type_k_idx));
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            model, hparams_idx, type_k_idx, type_v_idx, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
