@@ -126,6 +126,13 @@ int64_t common_fit_small_reserve_mib(int64_t cache_mib);
 
 // k17-small (lazy KV): the bytes a fit added to a MoE cache of this final size for the KV cells not backed at load (0: none)
 size_t  common_fit_kv_lazy_grant(size_t moe_cache_size);
+// k19-kvsel auto: whether a fit since the last reset placed K/V in host chunks (LLAMA_KV_SEL_HOST auto); common then grants them
+// (LLAMA_KV_SEL_GRANTED=1) unless a drafter is kept. Granting where a fit did not plan them only leaves device memory unused
+bool    common_fit_kv_sel_granted(bool reset);
+// k19-kvsel auto: whether the fits that follow may place K/V in host chunks (common: not for a launch that asks for a drafter)
+void    common_fit_kv_sel_allow(bool allow);
+// k19-kvsel auto: the K/V bytes the last granted fit placed in host chunks
+size_t  common_fit_kv_sel_host_bytes();
 
 // print estimated memory to stdout
 void common_fit_print(

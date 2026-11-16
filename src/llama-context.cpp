@@ -2725,6 +2725,13 @@ void llama_context::tiny_rel_leave() {
         }
     }
     TINY_TRACE("%s: trace: restore\n", __func__);
+    // k19-kvsel (LLAMA_MOE_SHORT_REFILL_CAP_MIB, set by common where host chunks were granted): the banks come back after a prompt ubatch
+    // with at most that many MiB of the experts they held before, the other slots empty (misses fill them). The refill sits on the
+    // prompt's path, and the cache the host chunks enlarged holds more: G4 12 GB / 262K Flash-Next, a 42-token chat prompt refilled
+    // 2562 experts in 114 ms (TTFT 0.37 -> 0.48 s)
+    if (const char * e_rc = getenv("LLAMA_MOE_SHORT_REFILL_CAP_MIB"); e_rc != nullptr && *e_rc != '\0' && atoll(e_rc) >= 0) {
+        moe_cache->set_refill_cap_once((size_t) atoll(e_rc)*1024*1024);
+    }
     moe_cache->restore();
     TINY_TRACE("%s: trace: restored\n", __func__);
     // k19-place8: banks that did not allocate stay released (set_restore_soft): the next ubatches run as while released and the next

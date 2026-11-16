@@ -82,6 +82,12 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 //
 
 // k19-kvsel: see llama_kv_cache_sel_arm
+static std::atomic<bool>     g_kv_sel_measure { false };
+
+void llama_kv_sel_measure(bool on) {
+    g_kv_sel_measure.store(on);
+}
+
 static thread_local bool     g_kv_sel_armed     = false;
 static thread_local uint32_t g_kv_sel_dev_cells = 0;
 
@@ -364,7 +370,12 @@ llama_kv_cache::llama_kv_cache(
 
     // k19-kvsel (LLAMA_KV_SEL_HOST=1): armed attention cache, flash attention layout (V not transposed), one stream, more cells than the
     // device budget LLAMA_KV_SEL_DEV_CELLS (32768; 0 = every cell in host chunks, a test setting)
-    static const bool sel_env = getenv("LLAMA_KV_SEL_HOST") != nullptr && atoi(getenv("LLAMA_KV_SEL_HOST")) != 0;
+    // (auto: a measurement where the fit asks for it, an allocation where common granted it; read at every construction)
+    const int  sel_mode = llama_kv_sel_mode();
+    const bool sel_env  = sel_mode == 1 || (sel_mode == 2 && (hparams.no_alloc ? g_kv_sel_measure.load() : [] {
+        const char * g = getenv("LLAMA_KV_SEL_GRANTED");
+        return g != nullptr && atoi(g) != 0;
+    }()));
     const uint32_t sel_r_want = sel_dev_fixed > 0 ? sel_dev_fixed :
         getenv("LLAMA_KV_SEL_DEV_CELLS") != nullptr ? (uint32_t) std::max(0, atoi(getenv("LLAMA_KV_SEL_DEV_CELLS"))) : 32768;
     const bool sel_on = sel_env && sel_armed && other == nullptr && sel_r_want < kv_size;
@@ -4375,6 +4386,14 @@ bool llama_kv_lazy_alloc_on() {
     }
     const char * g = getenv("LLAMA_KV_LAZY_GRANTED");
     return g != nullptr && atoi(g) != 0;
+}
+
+int llama_kv_sel_mode() {
+    const char * e = getenv("LLAMA_KV_SEL_HOST");
+    if (e == nullptr || *e == '\0' || strcmp(e, "auto") == 0) {
+        return 2;
+    }
+    return atoi(e) != 0 ? 1 : 0;
 }
 
 bool llama_kv_lazy_measure_on() {
