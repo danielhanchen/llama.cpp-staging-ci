@@ -5,6 +5,7 @@
 #include "ggml-version.h"
 #include "ggml-backend.h"
 #include "ggml-impl.h"
+#include "ggml-fa-src2.h"
 #include "ggml-threading.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -3512,6 +3513,29 @@ struct ggml_tensor * ggml_kq_mask(
     return result;
 }
 
+struct ggml_tensor * ggml_kq_mask_win(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cells,
+        struct ggml_tensor  * toks,
+        struct ggml_tensor  * flags,
+        enum ggml_type        type,
+        int32_t               mode,
+        int32_t               n_win,
+        int32_t               n_sinks) {
+    GGML_ASSERT(mode == 1 || mode == 2);
+    GGML_ASSERT((mode == 1) == (flags != NULL));
+    struct ggml_tensor * result = ggml_kq_mask(ctx, cells, toks, type);
+    if (flags != NULL) {
+        GGML_ASSERT(flags->type == GGML_TYPE_I32 && ggml_is_contiguous(flags));
+        GGML_ASSERT(flags->ne[0] == cells->ne[1] && flags->ne[1] == cells->ne[2] && flags->ne[2] == 1 && flags->ne[3] == 1);
+        result->src[2] = flags;
+    }
+    ggml_set_op_params_i32(result, GGML_KQ_MASK_KIND_SLOT, mode == 1 ? GGML_KQ_MASK_KIND_WIN_BODY : GGML_KQ_MASK_KIND_WIN_RING);
+    ggml_set_op_params_i32(result,  9, n_win);
+    ggml_set_op_params_i32(result, 10, MAX(0, n_sinks));
+    return result;
+}
+
 // k19-kvlong: see ggml-sel-mask.h
 struct ggml_tensor * ggml_sel_mask(
         struct ggml_context * ctx,
@@ -3523,7 +3547,7 @@ struct ggml_tensor * ggml_sel_mask(
 
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F16, GGML_MAX_DIMS, kq_mask->ne);
 
-    ggml_set_op_params_i32(result, 0, 1); // mode 1: the selection mask (mode 0: ggml_kq_mask)
+    ggml_set_op_params_i32(result, GGML_KQ_MASK_KIND_SLOT, GGML_KQ_MASK_KIND_SEL);
     result->op     = GGML_OP_KQ_MASK;
     result->src[0] = idx;
     result->src[1] = kq_mask;
@@ -6126,6 +6150,31 @@ void ggml_flash_attn_ext_kv_len_set_host(
         int32_t              n) {
     GGML_ASSERT(kv_len->type == GGML_TYPE_I32 && ggml_nelements(kv_len) == 1);
     ggml_set_op_params_i32(kv_len, 0, n);
+}
+
+void ggml_flash_attn_ext_set_src2(
+        struct ggml_tensor * a,
+        struct ggml_tensor * k2,
+        struct ggml_tensor * v2,
+        struct ggml_tensor * mask2) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    if (!k2) {
+        a->src[6] = a->src[7] = a->src[8] = NULL;
+        return;
+    }
+    const struct ggml_tensor * q = a->src[0];
+    const struct ggml_tensor * k = a->src[1];
+    const struct ggml_tensor * v = a->src[2];
+    const struct ggml_tensor * m = a->src[3];
+    GGML_ASSERT(v2 && mask2 && m);
+    GGML_ASSERT(k2->ne[0] == k->ne[0] && k2->ne[2] == k->ne[2] && k2->ne[3] == k->ne[3]);
+    GGML_ASSERT(v2->ne[0] == v->ne[0] && v2->ne[1] == k2->ne[1] && v2->ne[2] == v->ne[2] && v2->ne[3] == v->ne[3]);
+    GGML_ASSERT(mask2->type == GGML_TYPE_F16 && ggml_is_contiguous(mask2));
+    GGML_ASSERT(mask2->ne[0] == k2->ne[1] && mask2->ne[1] == m->ne[1] && mask2->ne[2] == m->ne[2] && mask2->ne[3] == m->ne[3]);
+    GGML_ASSERT(q->ne[3] == k2->ne[3]);
+    a->src[6] = k2;
+    a->src[7] = v2;
+    a->src[8] = mask2;
 }
 
 // ggml_flash_attn_back

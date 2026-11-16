@@ -8,6 +8,7 @@
 
 #include <functional>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -15,6 +16,29 @@ struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
+
+// k19-kvwin: the recent-window ring beside a (4-bit) KV cache, see llama_kv_cache::win_init
+struct llama_kv_win_params {
+    int32_t   n_win    = -1;              // last W positions of every sequence also in the ring (-1: off)
+    int32_t   n_sinks  = 0;               // first S positions of every sequence also in the ring
+    ggml_type type_k   = GGML_TYPE_Q8_0;  // ring K type
+    ggml_type type_v   = GGML_TYPE_Q8_0;  // ring V type (a V cache that is not quantized keeps its own type in the ring)
+    uint32_t  n_ubatch = 512;             // the largest ubatch (the ring holds W + S per sequence plus one ubatch)
+};
+
+// the window of a context: its params, then the environment (LLAMA_KV_WIN, LLAMA_KV_WIN_SINKS, LLAMA_KV_WIN_TYPE, LLAMA_KV_WIN_TYPE_K,
+// LLAMA_KV_WIN_TYPE_V) where set
+llama_kv_win_params llama_kv_win_params_from(const llama_context_params & params);
+
+// while a context in the window mode creates its memory (llama_kv_win_creating_scope): the window types, which the caches that are
+// windows themselves take (the SWA sub-cache of iSWA, the DSV4 raw window and indexer caches); nullptr otherwise
+const llama_kv_win_params * llama_kv_win_creating();
+struct llama_kv_win_creating_scope {
+    explicit llama_kv_win_creating_scope(const llama_kv_win_params * p);
+    ~llama_kv_win_creating_scope();
+};
+// t if the window mode is not creating, or t is not quantized; else the window type of K (is_k) or V
+ggml_type llama_kv_win_window_type(ggml_type t, bool is_k);
 
 //
 // llama_kv_cache
@@ -285,6 +309,32 @@ public:
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
 
+    // k19-kvwin: the recent-window ring (see llama_kv_win_params). win_init allocates it once after the construction (false: the
+    // cache cannot take one, it stays as it was); the graph then stores every token in the ring too (cpy_k_win / cpy_v_win, the
+    // ring row of each token in the win idxs input), and the attention reads the ring for the cells of a row's window (the win mask:
+    // set_input_win moves those cells out of the body mask), see the two-source ggml_flash_attn_ext_set_src2
+    bool          win_init(const llama_kv_win_params & p);
+    bool          win_on() const { return win.n_win >= 0; }
+    const llama_kv_win_params & win_params() const { return win; }
+    uint32_t      win_n_slots() const { return win_r; }
+    // the attention reads the ring in the same node (every attention device has the two-source flash attention), else the stopgap
+    bool          win_fused() const { return win_fused_; }
+    ggml_tensor * build_input_win_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_win_mask(ggml_context * ctx, int64_t n_tps, int64_t n_stream_ub) const;
+    void          set_input_win(ggml_tensor * idxs, ggml_tensor * mask, ggml_tensor * kq_mask, const llama_ubatch * ubatch, const slot_info & sinfo,
+                                ggml_tensor * cells = nullptr) const;
+    // device-built masks (ggml_kq_mask_win): the cells of the ring slots (I32 [5, R, n_stream], the KQ mask cell encoding) and the
+    // body flags (I32 [n_kv, n_stream], 1 = the cell has a live ring slot; all 0 when no attention reads the ring)
+    void          set_input_win_dev(ggml_tensor * rcells, ggml_tensor * flags, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch, bool used) const;
+    ggml_tensor * get_k_win(ggml_context * ctx, int32_t il, const slot_info & sinfo) const;
+    ggml_tensor * get_v_win(ggml_context * ctx, int32_t il, const slot_info & sinfo) const;
+    ggml_tensor * cpy_k_win(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * idxs, int32_t il) const;
+    ggml_tensor * cpy_v_win(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * idxs, int32_t il) const;
+    // the shift input of the ring rows (K-shift graph)
+    void          set_input_win_shift(ggml_tensor * dst) const;
+    // the live ring slots of a stream (debug / tests): (cell, slot) pairs
+    std::vector<std::pair<uint32_t, uint32_t>> win_slots(uint32_t strm) const;
+
     // for every token of the ubatch, the ids of the n tokens that precede it in its sequence
     // example for M-RoPE image case: tokens A B X X X C, where X is a 3-token image at pos 2 spanning positions 2..4:
     //   tok: A B X X X C
@@ -317,7 +367,42 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // k19-kvwin: the ring [n_embd, win_r + 1, n_stream] (the last row of each stream is a dump row), null when off
+        ggml_tensor * k_win = nullptr;
+        ggml_tensor * v_win = nullptr;
     };
+
+    // k19-kvwin: the ring of one stream: slot -> cell and cell -> slot. A slot is live iff both agree and the cell is not empty, so
+    // a cell emptied by seq_rm / seq_keep / clear needs no bookkeeping here (an empty cell is masked, and the ring mask is derived
+    // from the body mask). free_slots holds the slots known free (lowest first)
+    struct kv_ring {
+        std::vector<int32_t> slot_cell;
+        std::vector<int32_t> cell_slot;
+        std::set<int32_t>    free_slots;
+        void reset(uint32_t n_slots, uint32_t n_cells) {
+            slot_cell.assign(n_slots, -1);
+            cell_slot.assign(n_cells, -1);
+            free_slots.clear();
+            for (uint32_t j = 0; j < n_slots; ++j) {
+                free_slots.insert(free_slots.end(), (int32_t) j);
+            }
+        }
+    };
+
+    llama_kv_win_params win;
+    bool     win_fused_ = false;
+    uint32_t win_r = 0;            // ring slots per stream (the tensors hold win_r + 1 rows: the dump row)
+    bool     win_sim = false;      // prepare() simulates apply_ubatch: the ring is left alone
+    bool     win_no_assign = false; // state_read: the restored cells get slots from the blob, not from apply_ubatch
+    mutable std::vector<kv_ring> v_rings;
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> win_ctxs_bufs;
+
+    bool win_slot_live(uint32_t strm, int32_t j) const;
+    // assign ring slots to the cells of an applied ubatch
+    void win_assign(const slot_info & sinfo, const llama_ubatch & ubatch);
+    int32_t win_take(uint32_t strm, const llama_pos * lo);
+    void win_release_cell(uint32_t strm, uint32_t c);
 
     bool v_trans = true;  // the value tensor is transposed
 
@@ -443,7 +528,8 @@ private:
                     ggml_tensor * factors,
                           float   freq_base,
                           float   freq_scale,
-                       uint32_t   il) const;
+                       uint32_t   il,
+                           bool   dequant = false) const;
 
     ggml_cgraph * build_graph_shift(
                llm_graph_result * res,
@@ -463,6 +549,10 @@ private:
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 
     void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);
+
+    // k19-kvwin: the ring rows of the saved cells (llama-kv-cache-win.cpp)
+    void state_write_win(llama_io_write_i & io, const cell_ranges_t & cr) const;
+    bool state_read_win (llama_io_read_i  & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {
@@ -553,6 +643,19 @@ public:
 
     // see llama_kv_cache::exact_row_sees(), for the current ubatch
     bool exact_row_sees(const llama_ubatch & ubatch, uint32_t i, uint32_t c0, uint32_t c1) const;
+
+    // k19-kvwin: see llama_kv_cache::win_init etc., for the current ubatch
+    bool          win_on() const { return kv != nullptr && kv->win_on(); }
+    const llama_kv_cache * get_kv() const { return kv; }
+    ggml_tensor * build_input_win_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_win_mask(ggml_context * ctx, const llama_ubatch & ubatch, const llama_cparams & cparams) const;
+    void          set_input_win(ggml_tensor * idxs, ggml_tensor * mask, ggml_tensor * kq_mask, const llama_ubatch * ubatch,
+                                ggml_tensor * cells = nullptr) const;
+    void          set_input_win_dev(ggml_tensor * rcells, ggml_tensor * flags, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch, bool used) const;
+    ggml_tensor * get_k_win(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_win(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * cpy_k_win(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * idxs, int32_t il) const;
+    ggml_tensor * cpy_v_win(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * idxs, int32_t il) const;
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;

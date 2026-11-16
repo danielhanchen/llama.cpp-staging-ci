@@ -100,6 +100,10 @@ struct common_speculative_draft_params {
     // k19-sharednoise: set (on) when the target draws with shared noise (LLAMA_SHARED_NOISE=1): the drafter proposes
     // argmax(its logit / T + the target's noise) at each drafted position (common_shared_noise_draft_pick) and fills no result_q
     struct common_shared_noise_draft * sn = nullptr;
+
+    // k19-small1115: another slot of the server is active this round (the server caps n_max at the k19-tpp floor then); its round
+    // time is not a lone request's and is kept out of the k19-tpp window cost table
+    bool shared = false;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

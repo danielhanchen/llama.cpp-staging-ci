@@ -3487,6 +3487,12 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 static bool ggml_backend_cuda_fa_kv_len(void) {
     return true;
 }
+
+// k19-fattnq4 (proc "ggml_backend_fa_src2"): two-source flash attention (ggml_flash_attn_ext_set_src2) on the MMA kernel, NVIDIA Turing
+// and newer; supports_op answers per node (fattn.cu ggml_cuda_fattn_src2_supported)
+static bool ggml_backend_cuda_fa_src2(void) {
+    return true;
+}
 #endif
 
 // k15-fn: the host -> device uploads of n tensors (offset 0, whole size given) as one cudaMemcpyBatchAsync on the backend's stream, in
@@ -6152,11 +6158,11 @@ static void ggml_cuda_qsa_maskless_plan(ggml_backend_cuda_context * cuda_ctx, co
         if (fa->op != GGML_OP_FLASH_ATTN_EXT || (fa->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) || ggml_get_op_params_i32(fa, 4) <= 0) {
             continue;
         }
-        // k19-kvlong: the selection mask as one node (ggml_sel_mask, GGML_OP_KQ_MASK mode 1). A decode / verify window gathers from
+        // k19-kvlong: the selection mask as one node (ggml_sel_mask, GGML_OP_KQ_MASK kind GGML_KQ_MASK_KIND_SEL). A decode / verify window gathers from
         // its idx and kq as from the chain's (the node is not run); a prompt runs the node, which builds the dense mask in one pass as
         // the rebuild below does, so it is not planned
         const ggml_tensor * sm = fa->src[3];
-        if (sm != nullptr && sm->op == GGML_OP_KQ_MASK && ggml_get_op_params_i32(sm, 0) == 1) {
+        if (sm != nullptr && sm->op == GGML_OP_KQ_MASK && ggml_get_op_params_i32(sm, GGML_KQ_MASK_KIND_SLOT) == GGML_KQ_MASK_KIND_SEL) {
             const ggml_tensor * idx = sm->src[0];
             const ggml_tensor * kq  = sm->src[1];
             const int64_t n_tok = kq->ne[1]*kq->ne[3];
@@ -12328,7 +12334,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_MOE_CACHE_LOOKUP:
             return ggml_cuda_moe_cache_lookup_supported(op);
         case GGML_OP_KQ_MASK:
-            if (ggml_get_op_params_i32(op, 0) == 1) { // k19-kvlong: ggml_sel_mask
+            if (ggml_get_op_params_i32(op, GGML_KQ_MASK_KIND_SLOT) == GGML_KQ_MASK_KIND_SEL) { // k19-kvlong: ggml_sel_mask
                 return op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_F16 &&
                     ggml_is_contiguous(op->src[1]) && op->src[0]->nb[0] == sizeof(int32_t);
             }
@@ -13088,6 +13094,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     // k19-graph: flash attention reads its KV length (ggml_flash_attn_ext_set_kv_len) at the bits of the unpadded node (fattn.cu)
     if (strcmp(name, "ggml_backend_fa_kv_len") == 0) {
         return (void *)ggml_backend_cuda_fa_kv_len;
+    }
+    // k19-fattnq4: two-source flash attention (see ggml_backend_cuda_fa_src2)
+    if (strcmp(name, "ggml_backend_fa_src2") == 0) {
+        static const bool enabled = getenv("GGML_CUDA_FATTN_SRC2") == nullptr || atoi(getenv("GGML_CUDA_FATTN_SRC2")) != 0;
+        return enabled ? (void *)ggml_backend_cuda_fa_src2 : nullptr;
     }
 #endif
     if (strcmp(name, "ggml_backend_host_pin_range") == 0) {

@@ -427,6 +427,16 @@ static bool spec_replay_reverify() {
 
 // k19-sharednoise: drafts take the target's shared noise when the target draws with it (LLAMA_SHARED_NOISE=1);
 // LLAMA_SHARED_NOISE_DRAFT=0: they do not (the target's draws stay counter-based)
+// k19-small1115 (LLAMA_SPEC_TPP_ACTIVE, default on; 0 = off): the MTP window rules of a --parallel 1 server on a --parallel N one,
+// decided per round from the active slots (load_model, update_slots)
+static bool spec_tpp_active_on() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_SPEC_TPP_ACTIVE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 static bool spec_sn_draft_on() {
     static const bool v = [] {
         const char * e = getenv("LLAMA_SHARED_NOISE_DRAFT");
@@ -1799,6 +1809,7 @@ private:
         bool                               live    = false; // main thread: a worker is running
         bool                               hold    = false; // main thread: the next update_slots continues the slot's prompt beside it
         bool                               group   = false; // main thread: beside the next prompt batch of any size (the target holds)
+        bool                               free_hold = false; // main thread: the target's free-only hold is set (k19-q4x262)
         bool                               fail    = false; // main thread: a pass the target's hold joined failed (reported at the next join)
         int                                slot_id = -1;    // main thread: the slot whose prompt batch the pass computes (k19-studio-np4)
         std::atomic<bool>                  ok      { true };
@@ -1806,6 +1817,15 @@ private:
     } spec_bg;
 
     static constexpr int32_t spec_bg_tail_max = 64; // the next target decode it may run beside: at most this many tokens
+
+    // k19-q4x262 (LLAMA_MTP_PROMPT_BG_FREE_HOLD=0 off): a pass launched beside the tail decode (not group mode) sets the target's
+    // free-only hold (llama_set_nextn_hold_free). Without it, a tail decode that took the MoE cache banks back after a released prompt
+    // freed the drafter's compute buffers and graph results while the pass computed in them (G4 q4x 12 GB ctx 262144 MTP, 8192-token
+    // prompt: the server died silently at the first decode, base and head alike)
+    static bool spec_bg_free_hold_on() {
+        static const bool v = getenv("LLAMA_MTP_PROMPT_BG_FREE_HOLD") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_BG_FREE_HOLD")) != 0;
+        return v;
+    }
 
     // joins the worker (a no-op without one); false: its pass failed (the caller reports it, as the in-line pass's failure)
     bool spec_bg_join() {
@@ -1865,6 +1885,10 @@ private:
         }
         if (spec_bg.group) {
             llama_set_nextn_hold(ctx_tgt, nullptr, nullptr);
+        }
+        if (spec_bg.free_hold) {
+            llama_set_nextn_hold_free(ctx_tgt, nullptr, nullptr);
+            spec_bg.free_hold = false;
         }
         const int64_t t0 = ggml_time_us();
         {
@@ -1989,6 +2013,7 @@ private:
     std::set<std::string> model_tags;    // informational tags
 
     bool sleeping = false;
+    int32_t spec_active_cap = 0; // k19-small1115: drafts per window while another slot is active (0: no cut; load_model)
 
     int64_t t_last_load_progress_ms = 0;
 
@@ -2092,8 +2117,13 @@ private:
             // kernels of a 3-row one (mmvq keeps its 4 warps up to 4 columns, F32 weights stay on mmvf under the verify tag). Turing's
             // mmvq table halves the q6_K warps at 4 columns, so a T4 window's head rows sum in another order (Kaggle T4 q4x + MTP heads:
             // +3% decode, but chat text varied launch to launch); AMD and other GPUs report no capability. LLAMA_SPEC_TPP=1 forces it on
+            // k19-small1115 (LLAMA_SPEC_TPP_ACTIVE, default on; 0 = only with --parallel 1, as before): with --parallel N the windows
+            // are decided per round from the active slots: a lone request drafts as on a --parallel 1 server (the wider windows below),
+            // and while another slot is active every window is cut to the floor of 2 drafts (update_slots), the windows of a
+            // --parallel N server without them. Colab A100 40 GB Qwen3.6-35B-A3B UD-Q3_K_XL in-file MTP n2 (ks_a1): one request on
+            // --parallel 4 decoded 324.3 tok/s vs 342.6 on --parallel 1, the same text
             const bool mtp_shape = mtp_only && sp.draft.n_max == 2 && sp.draft.n_min == 0 && sp.draft.p_min <= 0.0f && !sp.draft.probabilistic &&
-                params.n_parallel == 1;
+                (params.n_parallel == 1 || spec_tpp_active_on());
             // the GPUs the fit will use (server-tpp.h: --device's list, else every GPU; with --split-mode none the main GPU only)
             std::vector<ggml_backend_dev_t> all_devs;
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -2328,6 +2358,13 @@ private:
             } else if (mtp_shape && e == nullptr) {
                 SRV_INF("k19-tpp: MTP stays at 2 drafts here (%d GPUs, lowest compute capability %d: not every GPU is NVIDIA Ampere or newer; "
                     "LLAMA_SPEC_TPP=1 forces the wider window)\n", n_gpu, n_gpu > 0 ? cc_min : -1);
+            }
+            // k19-small1115: the windows above were widened past Studio's 2 drafts on a --parallel N server: cut back to 2 in the
+            // rounds where another slot is active (update_slots)
+            spec_active_cap = params.n_parallel > 1 && mtp_shape && sp.draft.n_max > 2 ? 2 : 0;
+            if (spec_active_cap > 0) {
+                SRV_INF("k19-small1115: --parallel %d: a lone request drafts up to %d as with --parallel 1, %d while another slot is active "
+                    "(LLAMA_SPEC_TPP_ACTIVE=0: %d always)\n", params.n_parallel, sp.draft.n_max, spec_active_cap, spec_active_cap);
             }
         }
 
@@ -5429,6 +5466,19 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // k19-small1115: another slot active (prompt or generation): the windows of every slot are cut to the k19-tpp floor this round
+        // (the drafts of a --parallel N server without the wider windows); a lone request keeps them (see load_model)
+        int32_t spec_floor_cap = 0;
+        if (spec && spec_active_cap > 0) {
+            int n_active = 0;
+            for (const auto & s : slots) {
+                n_active += s.is_processing() ? 1 : 0;
+            }
+            if (n_active > 1) {
+                spec_floor_cap = spec_active_cap;
+            }
+        }
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -5451,6 +5501,9 @@ private:
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
                 int n_draft_max = slot.get_n_draft_max();
+                if (spec_floor_cap > 0) {
+                    n_draft_max = std::min(n_draft_max, spec_floor_cap);
+                }
 
                 slot.gov_step = 0;
                 // a partial draft to replay is verified whatever the governor says (it restores a state)
@@ -5516,6 +5569,7 @@ private:
                             /* .top_p    = */ slot.task->params.sampling.top_p,
                             /* .min_p    = */ slot.task->params.sampling.min_p,
                         };
+                        common_speculative_get_draft_params(spec.get(), slot.id).shared = spec_floor_cap > 0;
 
                         // k19-sharednoise: the target draws with shared noise (LLAMA_SHARED_NOISE=1): the drafter takes the same noise
                         // and the verify samples and matches (LLAMA_SHARED_NOISE_DRAFT=0: the drafter as before, for attribution)
@@ -6805,6 +6859,12 @@ private:
                 spec_bg.slot_id = bg_sl->id;
                 if (spec_bg.group) {
                     llama_set_nextn_hold(ctx_tgt, &server_context_impl::spec_bg_hold_cb, this);
+                } else if (spec_bg_free_hold_on()) {
+                    // k19-q4x262: the [<= spec_bg_tail_max] tail decode beside the pass writes no rows the pass reads (they are stashed),
+                    // but it may still free the drafter's compute buffers (MoE cache banks coming back after a released prompt):
+                    // the pass ends first there
+                    llama_set_nextn_hold_free(ctx_tgt, &server_context_impl::spec_bg_hold_cb, this);
+                    spec_bg.free_hold = true;
                 }
                 SRV_INF("mtp prompt pass on a worker: %d rows, %zu segments beside the next %d-token target decode%s (LLAMA_MTP_PROMPT_BG=0 off)\n",
                         batch.view.size(), seg_breaks.empty() ? (size_t) 1 : seg_breaks.size() + 1 - spec_seg_done, std::min<int32_t>(n_rest, n_batch),

@@ -887,6 +887,16 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
 
+    // k19-kvwin: the window mode's default layout is a q4_0 cache beside the 8-bit ring
+    if (params.kv_win >= 0) {
+        if (!params.cache_type_k_set) {
+            params.cache_type_k = GGML_TYPE_Q4_0;
+        }
+        if (!params.cache_type_v_set) {
+            params.cache_type_v = GGML_TYPE_Q4_0;
+        }
+    }
+
     postprocess_cpu_params(params.speculative.draft.cpuparams,       &params.cpuparams);
     postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch);
 
@@ -2497,6 +2507,43 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_type_v_set = true;
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--kv-window"}, "N",
+        "keep the last N positions of every sequence also in an 8-bit ring beside the KV cache (with its first --kv-sinks positions);\n"
+        "attention reads those cells from the ring. Without -ctk / -ctv the cache is then q4_0 / q4_0 (needs flash attention)\n"
+        "(default: -1 = off; 1024 is the mode's default window)",
+        [](common_params & params, int value) {
+            params.kv_win = value;
+        }
+    ).set_env("LLAMA_ARG_KV_WINDOW"));
+    add_opt(common_arg(
+        {"--kv-sinks"}, "N",
+        string_format("first N positions of every sequence kept in the KV window ring (default: %d)", params.kv_win_sinks),
+        [](common_params & params, int value) {
+            params.kv_win_sinks = std::max(0, value);
+        }
+    ).set_env("LLAMA_ARG_KV_SINKS"));
+    add_opt(common_arg(
+        {"--kv-window-type"}, "TYPE",
+        string_format("KV window ring data type for K and V (default: %s)", ggml_type_name(params.cache_type_k_win)),
+        [](common_params & params, const std::string & value) {
+            params.cache_type_k_win = params.cache_type_v_win = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_KV_WINDOW_TYPE"));
+    add_opt(common_arg(
+        {"-ctkw", "--kv-window-type-k"}, "TYPE",
+        string_format("KV window ring data type for K (default: %s)", ggml_type_name(params.cache_type_k_win)),
+        [](common_params & params, const std::string & value) {
+            params.cache_type_k_win = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_KV_WINDOW_TYPE_K"));
+    add_opt(common_arg(
+        {"-ctvw", "--kv-window-type-v"}, "TYPE",
+        string_format("KV window ring data type for V (default: %s)", ggml_type_name(params.cache_type_v_win)),
+        [](common_params & params, const std::string & value) {
+            params.cache_type_v_win = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_KV_WINDOW_TYPE_V"));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",

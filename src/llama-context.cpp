@@ -23,6 +23,7 @@
 #include "llama-autoprof.h"
 #include <filesystem>
 #include <limits>
+#include "llama-kv-cache.h"
 #include <cerrno>
 #include <mutex>
 #include <vector>
@@ -883,7 +884,47 @@ llama_context::llama_context(
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
 
-        memory.reset(model.create_memory(params_mem, cparams));
+        {
+            // k19-kvwin: the caches that are windows themselves take the window types
+            llama_kv_win_params wp = llama_kv_win_params_from(params);
+            if (!cparams.flash_attn) {
+                wp.n_win = -1;
+            }
+            llama_kv_win_creating_scope scope(&wp);
+            memory.reset(model.create_memory(params_mem, cparams));
+        }
+        // k19-kvwin: the recent-window ring of the attention cache (allocated beside it, before any graph is reserved)
+        if (memory) {
+            llama_kv_win_params wp = llama_kv_win_params_from(params);
+            wp.n_ubatch = cparams.n_ubatch;
+            if (wp.n_win >= 0 && !cparams.flash_attn) {
+                LLAMA_LOG_WARN("%s: k19-kvwin: the KV window ring needs flash attention: off\n", __func__);
+                wp.n_win = -1;
+            }
+            // drafters (MTP heads, DFlash): their caches are written by their own paths (KV injection, K / V-only passes), and their
+            // accuracy only moves the acceptance; the ring is for the target
+            if (wp.n_win >= 0 && (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || model.arch == LLM_ARCH_DFLASH)) {
+                LLAMA_LOG_INFO("%s: k19-kvwin: no KV window ring for a drafter context\n", __func__);
+                wp.n_win = -1;
+            }
+            if (wp.n_win >= 0) {
+                llama_kv_cache * kv = nullptr;
+                if (auto * m = dynamic_cast<llama_kv_cache *>(memory.get())) {
+                    kv = m;
+                } else if (auto * mi = dynamic_cast<llama_kv_cache_iswa *>(memory.get())) {
+                    kv = mi->get_base();
+                } else if (auto * mh = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+                    kv = mh->get_mem_attn();
+                } else if (auto * mhi = dynamic_cast<llama_memory_hybrid_iswa *>(memory.get())) {
+                    kv = mhi->get_mem_attn()->get_base();
+                }
+                if (kv == nullptr) {
+                    LLAMA_LOG_WARN("%s: k19-kvwin: this model's memory has no plain attention cache for the KV window ring: off\n", __func__);
+                } else {
+                    kv->win_init(wp);
+                }
+            }
+        }
         if (memory) {
             memory->wait_state_reads = [this]() { state_async_wait_reads(); };
             // k16-draft: the replay commit of the delta-net states runs on this context's backends
@@ -2523,7 +2564,7 @@ void llama_context::tiny_rel_leave() {
     if (!tiny_rel_held) {
         return;
     }
-    nextn_hold_wait(); // a drafter pass in flight beside this decode ends before its buffers go
+    nextn_hold_wait_free(); // a drafter pass in flight beside this decode ends before its buffers go
     const int64_t t0 = ggml_time_us();
     // the routing kept for a seed lives in the compute buffers freed here
     moe_cache_ids.clear();
@@ -2647,7 +2688,7 @@ void llama_context::ext_unpark() {
     }
     ext_grown = true; // also when nothing could be added: tried again after the next prompt
     const int64_t t0 = ggml_time_us();
-    nextn_hold_wait(); // a drafter pass in flight beside this decode ends before its buffers go
+    nextn_hold_wait_free(); // a drafter pass in flight beside this decode ends before its buffers go
     moe_cache_ids.clear();
     moe_cache_seq      = -1;
     moe_cache_pos_next = -1;
@@ -7359,7 +7400,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             }
             size_t freed = 0;
             if (!dfts.empty()) {
-                nextn_hold_wait(); // a drafter pass in flight beside this decode ends before its buffers go
+                nextn_hold_wait_free(); // a drafter pass in flight beside this decode ends before its buffers go
             }
             for (llama_context * c : dfts) {
                 freed += c->release_device_compute();
@@ -7501,7 +7542,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         // maps the weights back at the same addresses before the drafter's next pass (llama_mtp_draft_weights_restore). Below
         // LLAMA_MTP_DRAFT_LEND_FREE_MIB (6144) free only: where the deep arena fits anyway the restore would cost the request ~25 ms
         if (lm_released && lm_rel_depth > 0 && llama_mtp_draft_lend_on() && cparams.spec_draft && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP &&
-                nextn_hold_fn == nullptr) {
+                nextn_hold_fn == nullptr && nextn_hold_free_fn == nullptr) {
             static const size_t lend_free = (size_t) (getenv("LLAMA_MTP_DRAFT_LEND_FREE_MIB") ? std::max(0, atoi(getenv("LLAMA_MTP_DRAFT_LEND_FREE_MIB"))) : 6144) << 20;
             // k19-npkdp (LLAMA_MTP_DRAFT_LEND_ARENA=0 off): the staging arena the scheduler already holds on the device counts as free here,
             // since the deep arena of the group grows from it (ggml_backend_sched_prefetch: extra = staging - arena_size). Where the MoE cache
@@ -12598,6 +12639,10 @@ llama_context_params llama_context_default_params() {
         /*.n_mem_reserve               =*/ 0,
         /*.spec_draft                  =*/ false,
         /*.n_state_capture             =*/ -1,
+        /*.kv_win                      =*/ -1,
+        /*.kv_win_sinks                =*/ 0,
+        /*.type_k_win                  =*/ GGML_TYPE_Q8_0,
+        /*.type_v_win                  =*/ GGML_TYPE_Q8_0,
     };
 
     return result;
@@ -12643,6 +12688,15 @@ llama_context * llama_init_from_model(
     if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) && params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
         return nullptr;
+    }
+
+    // k19-kvwin: the recent-window ring is read by flash attention
+    {
+        const llama_kv_win_params wp = llama_kv_win_params_from(params);
+        if (wp.n_win >= 0 && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+            LLAMA_LOG_INFO("%s: enabling flash_attn since the KV window ring needs it\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
     }
 
     if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
@@ -13662,6 +13716,20 @@ int64_t llama_nextn_rows_wait(llama_context * ctx, int64_t n_rows) {
 
 void llama_set_nextn_hold(llama_context * ctx, void (*fn)(void *), void * user_data) {
     ctx->set_nextn_hold(fn, user_data);
+}
+
+void llama_set_nextn_hold_free(llama_context * ctx, void (*fn)(void *), void * user_data) {
+    ctx->set_nextn_hold_free(fn, user_data);
+}
+
+// k19-q4x262: the first few joins of a drafter pass by the free-only hold are logged (the engagement count of the fix)
+void llama_context::nextn_hold_free_log(double ms) {
+    static std::atomic<int64_t> n{0};
+    const int64_t k = ++n;
+    if (k <= 3) {
+        LLAMA_LOG_INFO("%s: k19-q4x262: the drafter's pass on a worker ended before its compute buffers were freed (%lld, waited %.2f ms; "
+            "LLAMA_MTP_PROMPT_BG_FREE_HOLD=0 off)\n", __func__, (long long) k, ms);
+    }
 }
 
 // k19-np12c (LLAMA_MTP_DRAFT_LEND_EAGER=0 off): the pinned host copy a drafter needs before its first lend (llama_context::mtp_lend_prepare)

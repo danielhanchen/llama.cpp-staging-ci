@@ -127,6 +127,13 @@ void common_fit_set_prewarm_graphs(int n_graphs) {
     g_prewarm_graphs = std::max(0, n_graphs);
 }
 
+// k19-l4gap2: the rows of a speculative verify window (draft n_max + 1; 1 without a drafter), set before the fit
+static int g_verify_rows = 1;
+
+void common_fit_set_verify_rows(int n_rows) {
+    g_verify_rows = std::max(1, n_rows);
+}
+
 static bool g_small_device = false;
 
 bool common_fit_small_device() {
@@ -1856,9 +1863,18 @@ static void common_params_fit_impl(
                 // experts, 51 GB of RAM) + MTP n2, 3 interleaved launches (plans/k19_l4gap.md): 42-token chat TTFT 28.1 -> 17.1 s, 8k TTFT
                 // 90.7 -> 85.4 s, but chat decode 5.94 -> 5.59 tok/s (the cache keeps 2256 instead of 4173 MiB): answers longer than ~1000
                 // tokens get slower, so it stays opt-in. Unset: k19-placemid as before (no extra work, no log line)
+                // k19-l4gap2 (default; LLAMA_FIT_PLACEMID_DISK_UB=0 off): on the same disk tier k19-placemid keeps its cache but reserves the
+                // graphs at, and splits short prompts into, ubatches of LLAMA_FIT_PLACEMID_DISK_UB (4) tokens: the tokens the device lookups
+                // serve there, so a short prompt's experts come from the device slots and the RAM tier instead of the CPU products of the
+                // mapping, and the decode keeps the larger cache. Colab L4 12 GB, same model, held-out texts, 3 interleaved launches
+                // (plans/k19_l4gap.md section 15d): chat TTFT -25%, chat decode +15%, a second chat TTFT -60%, a 1536-token thinking answer
+                // decode +2%; the skip above lost 9% on that answer. Only where a speculative verify window has at most that many rows (MTP
+                // n2: 3), set by common_fit_set_verify_rows: a wider one would release and refill the banks in every pass
                 static const bool placemid_disk_skip = getenv("LLAMA_FIT_PLACEMID_DISK_SKIP") != nullptr && atoi(getenv("LLAMA_FIT_PLACEMID_DISK_SKIP")) != 0;
-                bool placemid_ram = true;
-                if (placemid_disk_skip && placemid_on && cparams->moe_cache_size > 0) {
+                static const int  placemid_disk_ub   = getenv("LLAMA_FIT_PLACEMID_DISK_UB") != nullptr ? std::max(0, atoi(getenv("LLAMA_FIT_PLACEMID_DISK_UB"))) : 4;
+                bool     placemid_ram = true;
+                uint32_t ub_disk      = 0;
+                if ((placemid_disk_skip || placemid_disk_ub > 0) && placemid_on && cparams->moe_cache_size > 0) {
                     static const double placemid_disk_tokens = getenv("LLAMA_FIT_PLACEMID_DISK_MIN_TOKENS") != nullptr ?
                         std::max(0.0, atof(getenv("LLAMA_FIT_PLACEMID_DISK_MIN_TOKENS"))) : 4.0;
                     const uint64_t exp_b  = common_moe_expert_bytes(path_model);
@@ -1866,17 +1882,30 @@ static void common_params_fit_impl(
                     const double   tokens = common_moe_cache_tokens(path_model, cparams->moe_cache_size);
                     if (exp_b > 0 && avail > 0 && (double) exp_b > 0.8*(double) avail && tokens >= 0.0 && tokens < placemid_disk_tokens &&
                             !common_fit_file_in_ram_fs(path_model)) {
-                        placemid_ram = false;
-                        LOG_INF("%s: k19-l4gap: no k19-placemid (LLAMA_FIT_PLACEMID_DISK_SKIP=1): %.0f MiB of host experts do not fit in %.0f MiB of "
-                            "available RAM and the cache of %zu MiB holds the experts of %.1f tokens (below %.1f): short prompts keep one ubatch that "
-                            "copies its experts from the RAM tier\n", __func__, exp_b/1048576.0, avail/1048576.0, cparams->moe_cache_size/MiB, tokens,
-                            placemid_disk_tokens);
+                        if (placemid_disk_skip) {
+                            placemid_ram = false;
+                            LOG_INF("%s: k19-l4gap: no k19-placemid (LLAMA_FIT_PLACEMID_DISK_SKIP=1): %.0f MiB of host experts do not fit in %.0f MiB of "
+                                "available RAM and the cache of %zu MiB holds the experts of %.1f tokens (below %.1f): short prompts keep one ubatch that "
+                                "copies its experts from the RAM tier\n", __func__, exp_b/1048576.0, avail/1048576.0, cparams->moe_cache_size/MiB, tokens,
+                                placemid_disk_tokens);
+                        } else if (g_verify_rows > placemid_disk_ub) {
+                            // a verify window wider than the ubatch would run with the banks released every pass (DFlash2 n6: 7 rows)
+                            LOG_INF("%s: k19-l4gap2: k19-placemid stays at %u-token ubatches: verify windows of %d rows exceed %d tokens\n", __func__,
+                                common_fit_place8_ub(), g_verify_rows, placemid_disk_ub);
+                        } else {
+                            ub_disk = (uint32_t) placemid_disk_ub;
+                            LOG_INF("%s: k19-l4gap2: k19-placemid at ubatches of %u tokens: %.0f MiB of host experts do not fit in %.0f MiB of available "
+                                "RAM and the cache of %zu MiB holds the experts of %.1f tokens (below %.1f), so short prompts run in ubatches the device "
+                                "lookups serve (LLAMA_FIT_PLACEMID_DISK_UB=0: %u)\n", __func__, ub_disk, exp_b/1048576.0, avail/1048576.0,
+                                cparams->moe_cache_size/MiB, tokens, placemid_disk_tokens, common_fit_place8_ub());
+                        }
                     }
                 }
+                const uint32_t ub_mid = ub_disk > 0 ? std::min(ub_disk, common_fit_place8_ub()) : common_fit_place8_ub();
                 if (!g_small_device && nd == 1 && placemid_on && placemid_ram && common_fit_place8_on() && cparams->moe_cache_size > 0 &&
-                        cparams->n_ubatch > common_fit_place8_ub()) {
+                        cparams->n_ubatch > ub_mid) {
                     const uint32_t ub_full = cparams->n_ubatch;
-                    const uint32_t ub_rel  = common_fit_place8_ub();
+                    const uint32_t ub_rel  = ub_mid;
                     const size_t   size_ok = cparams->moe_cache_size;
                     const dmds_t   dmds_ok = dmds_cpu_moe;
                     bool           got     = false;

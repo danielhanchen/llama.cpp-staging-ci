@@ -17,6 +17,7 @@
 
 
 #include "ggml.h"
+#include "ggml-fa-src2.h"
 #include "ggml-sel-mask.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -10225,20 +10226,32 @@ struct test_kq_mask : public test_case {
     const ggml_type type;
     const int64_t n_kv, n_tps, n_stream;
     const int swa_type, n_swa, is_2d;
+    const int win_mode, n_win, n_sinks; // k19-kvwin: ggml_kq_mask_win (1 = body without the flagged window cells, 2 = ring)
 
     std::string vars() override {
+        if (win_mode != 0) {
+            return VARS_TO_STR10(type, n_kv, n_tps, n_stream, swa_type, n_swa, is_2d, win_mode, n_win, n_sinks);
+        }
         return VARS_TO_STR7(type, n_kv, n_tps, n_stream, swa_type, n_swa, is_2d);
     }
 
-    test_kq_mask(ggml_type type = GGML_TYPE_F16, int64_t n_kv = 1024, int64_t n_tps = 64, int64_t n_stream = 1, int swa_type = 0, int n_swa = 0, int is_2d = 0)
-        : type(type), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), swa_type(swa_type), n_swa(n_swa), is_2d(is_2d) {}
+    test_kq_mask(ggml_type type = GGML_TYPE_F16, int64_t n_kv = 1024, int64_t n_tps = 64, int64_t n_stream = 1, int swa_type = 0, int n_swa = 0, int is_2d = 0,
+            int win_mode = 0, int n_win = 0, int n_sinks = 0)
+        : type(type), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), swa_type(swa_type), n_swa(n_swa), is_2d(is_2d),
+          win_mode(win_mode), n_win(n_win), n_sinks(n_sinks) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * cells = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 5, n_kv, n_stream);
         ggml_set_name(cells, "cells");
         ggml_tensor * toks = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 8, n_tps, n_stream);
         ggml_set_name(toks, "toks");
-        ggml_tensor * out = ggml_kq_mask(ctx, cells, toks, type);
+        ggml_tensor * flags = nullptr;
+        if (win_mode == 1) {
+            flags = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_stream);
+            ggml_set_name(flags, "flags");
+        }
+        ggml_tensor * out = win_mode != 0 ? ggml_kq_mask_win(ctx, cells, toks, flags, type, win_mode, n_win, n_sinks)
+                                          : ggml_kq_mask(ctx, cells, toks, type);
         ggml_set_name(out, "out");
         return out;
     }
@@ -10269,6 +10282,12 @@ struct test_kq_mask : public test_case {
                     v[8*i + 5] = is_2d;
                     v[8*i + 6] = (int32_t) (rng() % 4);
                     v[8*i + 7] = (int32_t) (rng() % 4);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "flags") == 0) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (auto & x : v) {
+                    x = (int32_t) (rng() % 3 != 0);
                 }
                 ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
             } else {
@@ -10477,6 +10496,143 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     void initialize_tensors(ggml_context * ctx) override {
         test_flash_attn_ext::initialize_tensors(ctx);
         init_tensor_uniform(ggml_get_tensor(ctx, "q"), -(float) q_range, (float) q_range);
+    }
+};
+
+// k19-kvwin: two-source flash attention (ggml_flash_attn_ext_set_src2): a cache source (k, v, mask: views of a cache, kv cells) and a
+// ring source (k2, v2, mask2: views of a ring of kv2 slots with a dump row, like llama_kv_cache's window ring). The masks are disjoint
+// as the cache builds them: every visible cell is finite in exactly one of the two (disjoint = false: random masks for both)
+struct test_flash_attn_ext_src2 : public test_case {
+    const int64_t hsk;
+    const int64_t hsv;
+    const int64_t nh;
+    const std::array<int64_t, 2> nr23;
+    const int64_t kv;
+    const int64_t kv2;
+    const int64_t nb;
+    const bool sinks;
+    const float max_bias;
+    const ggml_type type_K;
+    const ggml_type type_V;
+    const ggml_type type_K2;
+    const ggml_type type_V2;
+    const bool v_is_view_of_k;
+    const bool disjoint;
+
+    std::string vars() override {
+        return VARS_TO_STR15(hsk, hsv, nh, nr23, kv, kv2, nb, sinks, max_bias, type_K, type_V, type_K2, type_V2, v_is_view_of_k, disjoint);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_src2(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 4, std::array<int64_t, 2> nr23 = {2, 1}, int64_t kv = 1024,
+            int64_t kv2 = 256, int64_t nb = 1, bool sinks = false, float max_bias = 0.0f,
+            ggml_type type_K = GGML_TYPE_Q4_0, ggml_type type_V = GGML_TYPE_Q4_0, ggml_type type_K2 = GGML_TYPE_Q8_0,
+            ggml_type type_V2 = GGML_TYPE_Q8_0, bool v_is_view_of_k = false, bool disjoint = true)
+        : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), kv2(kv2), nb(nb), sinks(sinks), max_bias(max_bias), type_K(type_K),
+          type_V(type_V), type_K2(type_K2), type_V2(type_V2), v_is_view_of_k(v_is_view_of_k), disjoint(disjoint) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nb, nh*nr23[0], nr23[1]);
+        ggml_set_name(q, "q");
+
+        // cache views [hs, n_cells, nh, ns]: the cache holds 2*kv cells; the ring kv2 + 1 rows (the dump row)
+        const auto view = [&](ggml_type t, int64_t hs, int64_t n, int64_t n_alloc, const char * name) {
+            ggml_tensor * t0 = ggml_new_tensor_4d(ctx, t, hs*nh, n_alloc, nr23[1], 1);
+            ggml_set_name(t0, name);
+            ggml_tensor * v = ggml_view_4d(ctx, t0, hs, nh, n, nr23[1], ggml_row_size(t, hs), t0->nb[1], t0->nb[2], 0);
+            return ggml_permute(ctx, v, 0, 2, 1, 3);
+        };
+        ggml_tensor * k  = view(type_K,  hsk, kv,  2*kv,    "k_cache");
+        ggml_tensor * k2 = view(type_K2, hsk, kv2, kv2 + 1, "k_ring");
+        ggml_tensor * v;
+        ggml_tensor * v2;
+        if (v_is_view_of_k) {
+            v  = ggml_view_4d(ctx, k,  hsv, k->ne[1],  k->ne[2],  k->ne[3],  k->nb[1],  k->nb[2],  k->nb[3],  0);
+            v2 = ggml_view_4d(ctx, k2, hsv, k2->ne[1], k2->ne[2], k2->ne[3], k2->nb[1], k2->nb[2], k2->nb[3], 0);
+        } else {
+            v  = view(type_V,  hsv, kv,  2*kv,    "v_cache");
+            v2 = view(type_V2, hsv, kv2, kv2 + 1, "v_ring");
+        }
+
+        ggml_tensor * m  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv,  nb, 1, nr23[1]);
+        ggml_set_name(m, "m");
+        ggml_tensor * m2 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv2, nb, 1, nr23[1]);
+        ggml_set_name(m2, "m2");
+
+        ggml_tensor * s = nullptr;
+        if (sinks) {
+            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, q->ne[2]);
+            ggml_set_name(s, "s");
+        }
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, 0.0f);
+        ggml_flash_attn_ext_add_sinks(out, s);
+        ggml_flash_attn_ext_set_src2(out, k2, v2, m2);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(1234 + kv + 7*kv2 + 13*nb);
+        ggml_tensor * m  = ggml_get_tensor(ctx, "m");
+        ggml_tensor * m2 = ggml_get_tensor(ctx, "m2");
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -10.0f, 10.0f);
+            } else if (t != m && t != m2) {
+                init_tensor_uniform(t);
+            }
+        }
+        if (!disjoint) {
+            init_tensor_kq_mask(m);
+            init_tensor_kq_mask(m2);
+            return;
+        }
+        // like the cache: per row, a causal prefix of the cells is visible; the last w visible cells (and the first 4) live in the ring
+        // (each in a slot of its own, in a shuffled slot order) and are masked in the cache source
+        std::vector<ggml_fp16_t> d (ggml_nelements(m));
+        std::vector<ggml_fp16_t> d2(ggml_nelements(m2));
+        const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+        std::fill(d2.begin(), d2.end(), ninf);
+        std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+        const int64_t w = std::max<int64_t>(1, kv2 - nb - 4);
+        for (int64_t i3 = 0; i3 < nr23[1]; ++i3) {
+            std::vector<int64_t> slot_of(kv, -1);
+            std::vector<int64_t> perm(kv2);
+            for (int64_t j = 0; j < kv2; ++j) {
+                perm[j] = j;
+            }
+            std::shuffle(perm.begin(), perm.end(), gen);
+            const int64_t n_used = kv - (int64_t) (gen() % (kv/4 + 1)); // cells in use
+            int64_t next = 0;
+            for (int64_t c = 0; c < n_used && next < kv2; ++c) {
+                if (c < 4 || c >= n_used - (w + nb)) {
+                    slot_of[c] = perm[next++];
+                }
+            }
+            for (int64_t r = 0; r < nb; ++r) {
+                const int64_t p = n_used - nb + r; // the row's position = cell
+                ggml_fp16_t * row  = d .data() + (i3*nb + r)*kv;
+                ggml_fp16_t * row2 = d2.data() + (i3*nb + r)*kv2;
+                for (int64_t c = 0; c < kv; ++c) {
+                    const bool vis = c <= p;
+                    const ggml_fp16_t val = vis ? ggml_fp32_to_fp16(max_bias > 0.0f ? -(float) (p - c) : dis(gen)*0.0f) : ninf;
+                    const bool in_win = slot_of[c] >= 0 && (c < 4 || c > p - w);
+                    if (vis && in_win) {
+                        row[c] = ninf;
+                        row2[slot_of[c]] = val;
+                    } else {
+                        row[c] = val;
+                    }
+                }
+            }
+        }
+        ggml_backend_tensor_set(m,  d.data(),  0, ggml_nbytes(m));
+        ggml_backend_tensor_set(m2, d2.data(), 0, ggml_nbytes(m2));
     }
 };
 
@@ -13888,6 +14044,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_kq_mask(t, 1024, 64, 1, 3, 100, 0));
         // more than 65535 tokens per stream (the CUDA grid.y limit), two streams
         test_cases.emplace_back(new test_kq_mask(t, 64, 65600, 2, 0, 0, 0));
+        // k19-kvwin: the window rule (body without the flagged window cells / the ring's window cells), sinks, two streams, 2D
+        for (int mode : { 1, 2 }) {
+            test_cases.emplace_back(new test_kq_mask(t, 1024, 64,  1, 0, 0, 0, mode, 100, 4));
+            test_cases.emplace_back(new test_kq_mask(t, 4096, 512, 1, 0, 0, 0, mode, 1024, 0));
+            test_cases.emplace_back(new test_kq_mask(t, 1024, 32,  2, 0, 0, 1, mode, 17, 1));
+            test_cases.emplace_back(new test_kq_mask(t, 1024, 64,  1, 0, 0, 0, mode, 1 << 30, 0));
+        }
     }
     test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, 1048576.0f, 1.0f));
     test_cases.emplace_back(new test_timestep_embedding());
@@ -14033,6 +14196,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // k19-fattnq4: q4_0 K / V and the mixed pairs (q4_0 / q8_0, q8_0 / q4_0) at the head sizes the CUDA MMA kernel reads in place
+    // (64 / 128 / 256), decode (nb 1: the vector kernel, mixed pairs in place too), verify windows and prompt batches (staged by default)
+    for (const auto & tp : { std::make_pair(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0), std::make_pair(GGML_TYPE_Q4_0, GGML_TYPE_Q8_0),
+                             std::make_pair(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0) }) {
+        for (int hs : { 64, 128, 256 }) {
+            for (int nr2 : { 1, 2, 6, 8 }) {
+                for (int kv : { 512, 1000, 1024 }) {
+                    for (int nb : { 1, 2, 3, 8, 16, 75 }) {
+                        for (bool sinks : { false, true }) {
+                            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {nr2, 1}, kv, nb, true, sinks, 0, 0, GGML_PREC_F32,
+                                tp.first, tp.second));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // q8_0 / q8_0 at head size 64 (in place since k19-fattnq4)
+    for (int nr2 : { 1, 2, 8 }) {
+        for (int nb : { 2, 3, 8, 16 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(64, 64, 2, {nr2, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+    }
+
     // k19-fattnq8: q8_0 K / V at the head sizes the CUDA MMA kernel reads in place (128 / 256), GQA 1 / 2 / 6 (Qwen3.8-27B) / 8
     // (Qwen3.6-35B-A3B), verify windows and prompt batches, KV lengths with and without the 256 padding, with and without sinks
     for (int hs : { 128, 256 }) {
@@ -14046,6 +14234,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+
+    // k19-kvwin: two-source flash attention (a q4_0 cache beside a q8_0 ring): decode (1-2 rows), MTP / DFlash verify windows
+    // (3-16 rows) and prompt batches; head sizes 64 / 128 / 256 and the MLA latent (576 K, V = its first 512); GQA 1 / 2 / 6 / 8; rings of
+    // 256 .. 4096 slots, sinks, ALiBi, random (overlapping) masks, mixed and equal types
+    for (int hs : { 64, 128, 256 }) {
+        for (int nr2 : { 1, 2, 6, 8 }) {
+            for (int nb : { 1, 2, 3, 8, 16, 75, 512 }) {
+                for (int64_t kv2 : { 256, 1792 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_src2(hs, hs, 2, {nr2, 1}, 2048, kv2, nb, nr2 == 2, 0.0f));
+                }
+            }
+        }
+    }
+    for (int nb : { 1, 3, 16, 512 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_src2(128, 128, 4, {2, 1}, 8192, 4096, nb, false, 0.0f));
+        test_cases.emplace_back(new test_flash_attn_ext_src2(256, 256, 4, {6, 1}, 1024, 512, nb, true, 0.0f, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
+            GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false, false));
+        test_cases.emplace_back(new test_flash_attn_ext_src2(128, 128, 4, {2, 1}, 1024, 256, nb, false, 8.0f));
+        test_cases.emplace_back(new test_flash_attn_ext_src2(128, 128, 4, {2, 2}, 1024, 256, nb, false, 0.0f));
+        test_cases.emplace_back(new test_flash_attn_ext_src2(576, 512, 1, {16, 1}, 1024, 512, nb, false, 0.0f, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
+            GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true));
+        for (ggml_type t2 : { GGML_TYPE_Q4_0, GGML_TYPE_F16 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_src2(128, 128, 4, {2, 1}, 1024, 256, nb, false, 0.0f, GGML_TYPE_Q4_0,
+                GGML_TYPE_Q4_0, t2, t2));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_src2(128, 128, 4, {2, 1}, 1024, 256, nb, false, 0.0f, GGML_TYPE_Q4_0, GGML_TYPE_F16,
+            GGML_TYPE_Q8_0, GGML_TYPE_F16));
     }
 
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned

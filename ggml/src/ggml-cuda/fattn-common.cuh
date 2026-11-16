@@ -30,6 +30,21 @@ struct ggml_cuda_fattn_dev_len {
     int max_blocks;
     int ntiles_dst_ref; // k19-tpp: the output tiles of the reference window (0: none)
     int stream_k;       // 0: one block per output tile
+    // k19-fattnq4: the second KV source of a two-source node (ggml_flash_attn_ext_set_src2; it rides in this argument so the kernel
+    // signature stays the one of every FA kernel). n_kv2 == 0: none. Its cells continue the first source's: KV tiles it1 ..
+    // it1 + n_kv2/nbatch_fa - 1 of the kernel's loop (it1 = the first source's tiles), K2 / V2 / mask2 with their own byte strides
+    // (V2 == K2 for a K-only cache whose V is a view of K). Read by the MMA kernel only (the others never get a two-source node)
+    const char * K2;
+    const char * V2;
+    const char * mask2;
+    int32_t n_kv2;
+    int32_t it1;
+    int32_t nb11_2, nb12_2;
+    int64_t nb13_2;
+    int32_t nb21_2, nb22_2;
+    int64_t nb23_2;
+    int32_t nb31_2;
+    int64_t nb33_2;
 };
 
 // the stream-k blocks of a launch over ntiles_KV KV tiles (launch_fattn); on the device for a length read there
@@ -1154,6 +1169,9 @@ void launch_fattn(
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
 
+    // k19-fattnq4: the f16 copies of a two-source node's second source, allocated before the buffers below (the pool frees in reverse order)
+    ggml_cuda_pool_alloc<half> K2_f16(pool);
+    ggml_cuda_pool_alloc<half> V2_f16(pool);
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
@@ -1232,6 +1250,54 @@ void launch_fattn(
         }
     }
 
+    // k19-fattnq4: the second source of a two-source node (ggml_flash_attn_ext_set_src2, MMA kernel only): read in place by the
+    // kernel when the K / V of the first are (need_f16_K false), else staged to f16 from the pool. Rides in dev_len (see there)
+    const ggml_tensor * K2 = dst->src[6];
+    const ggml_tensor * V2 = dst->src[7];
+    const ggml_tensor * M2 = dst->src[8];
+    ggml_cuda_fattn_dev_len src2 = {};
+    if (K2 != nullptr) {
+        GGML_ASSERT(V2 != nullptr && M2 != nullptr && M2->type == GGML_TYPE_F16 && !use_sparse);
+        GGML_ASSERT(K2->ne[1] % nbatch_fa == 0 && "two-source flash attention: the second source's cells must fill whole KV tiles");
+        GGML_ASSERT(M2->ne[0] == K2->ne[1] && M2->ne[2] == 1 && (!mask || (M2->ne[1] == mask->ne[1] && M2->ne[3] == mask->ne[3])));
+        const bool V2_is_K2_view = V2 == K2 || (V2->view_src && (V2->view_src == K2 || (V2->view_src == K2->view_src && V2->view_offs == K2->view_offs)));
+        const char * k2d = (const char *) K2->data;
+        const char * v2d = (const char *) V2->data;
+        size_t k2nb[3] = { K2->nb[1], K2->nb[2], K2->nb[3] };
+        size_t v2nb[3] = { V2->nb[1], V2->nb[2], V2->nb[3] };
+        const auto stage = [&](const ggml_tensor * t, ggml_cuda_pool_alloc<half> & buf, const char *& d, size_t * nb) {
+            if (t->type == GGML_TYPE_F16 || probe) {
+                return;
+            }
+            const size_t ts = ggml_type_size(t->type);
+            GGML_ASSERT(t->nb[0] == ts);
+            half * f = buf.alloc(ggml_nelements(t));
+            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(t->type);
+            to_fp16(d, f, t->ne[0], t->ne[1], t->ne[2], t->ne[3], t->nb[1] / ts, t->nb[2] / ts, t->nb[3] / ts, main_stream);
+            d     = (const char *) f;
+            nb[0] = t->ne[0] * sizeof(half);
+            nb[1] = t->ne[1] * nb[0];
+            nb[2] = t->ne[2] * nb[1];
+        };
+        if (need_f16_K) {
+            stage(K2, K2_f16, k2d, k2nb);
+            if (V2_is_K2_view) {
+                v2d = k2d;
+                v2nb[0] = k2nb[0]; v2nb[1] = k2nb[1]; v2nb[2] = k2nb[2];
+            } else {
+                stage(V2, V2_f16, v2d, v2nb);
+            }
+        }
+        src2.K2     = k2d;
+        src2.V2     = v2d;
+        src2.mask2  = (const char *) M2->data;
+        src2.n_kv2  = (int32_t) K2->ne[1];
+        src2.it1    = (int32_t) ((K->ne[1] + nbatch_fa - 1) / nbatch_fa);
+        src2.nb11_2 = (int32_t) k2nb[0]; src2.nb12_2 = (int32_t) k2nb[1]; src2.nb13_2 = (int64_t) k2nb[2];
+        src2.nb21_2 = (int32_t) v2nb[0]; src2.nb22_2 = (int32_t) v2nb[1]; src2.nb23_2 = (int64_t) v2nb[2];
+        src2.nb31_2 = (int32_t) M2->nb[1]; src2.nb33_2 = (int64_t) M2->nb[3];
+    }
+
     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
     const int gqa_ratio    = Q->ne[2] / K->ne[2];
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
@@ -1261,7 +1327,8 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+    // (k19-fattnq4: not for a two-source node, whose kernel loop bound covers both sources)
+    const bool scan_mask = !use_sparse && mask && K2 == nullptr && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
     if (scan_mask && !probe) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
@@ -1291,11 +1358,12 @@ void launch_fattn(
     int parallel_blocks = max_blocks_per_sm;
 
     const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1];
-    const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
+    // (k19-fattnq4: + the second source's tiles of a two-source node)
+    const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa + (K2 ? src2.n_kv2 / nbatch_fa : 0); // Max. number of parallel blocks limited by KV cache length.
 
     dim3 blocks_num;
     // k19-graph: see ggml_cuda_fattn_dev_len / ggml_cuda_fattn_probe
-    ggml_cuda_fattn_dev_len dev_len = { nullptr, 0, 0, 0, 0, 0 };
+    ggml_cuda_fattn_dev_len dev_len = {}; // all members zero (no device length, no second source)
     int  ntiles_dst_ref = 0;
     int  fixup_kind     = 0; // stream-k fixup: 0 none, 1 uniform, 2 general
     bool dev_ok         = false;
@@ -1339,7 +1407,7 @@ void launch_fattn(
         const int nblocks_live = blocks_num.x;
         fixup_kind = (nblocks_live % ntiles_dst == 0 && nblocks_live > ntiles_dst) ? 1 : (ntiles_dst % nblocks_live != 0 ? 2 : 0);
         // (k19-fattnq8: or K / V read in place by the kernel, need_f16_* false: no conversion that follows the length)
-        dev_ok = !use_sparse && !scan_mask && (K->type == GGML_TYPE_F16 || !need_f16_K) && (V->type == GGML_TYPE_F16 || !need_f16_V) &&
+        dev_ok = !use_sparse && !scan_mask && K2 == nullptr && (K->type == GGML_TYPE_F16 || !need_f16_K) && (V->type == GGML_TYPE_F16 || !need_f16_V) &&
             fixup_kind != 2;
         if (kvl && kvl->kv_len && !probe) {
             GGML_ASSERT(dev_ok && "a device KV length needs the launch choices the probe found");
@@ -1347,7 +1415,13 @@ void launch_fattn(
             const int ntiles_KV_pad = int((kvl->n_kv_pad + nbatch_fa - 1) / nbatch_fa);
             const int nblocks_pad   = use_stream_k ? ggml_cuda_fattn_stream_k_blocks(ntiles_KV_pad, ntiles_dst, max_blocks, ntiles_dst_ref) : ntiles_dst;
             blocks_num.x = std::max(nblocks_live, nblocks_pad);
-            dev_len      = { kvl->kv_len, nbatch_fa, ntiles_dst, max_blocks, ntiles_dst_ref, use_stream_k ? 1 : 0 };
+            dev_len                = {};
+            dev_len.kv_len         = kvl->kv_len;
+            dev_len.nbatch_fa      = nbatch_fa;
+            dev_len.ntiles_dst     = ntiles_dst;
+            dev_len.max_blocks     = max_blocks;
+            dev_len.ntiles_dst_ref = ntiles_dst_ref;
+            dev_len.stream_k       = use_stream_k ? 1 : 0;
         }
 
         if (!probe && (ntiles_dst % blocks_num.x != 0 || (dev_len.kv_len && fixup_kind == 1))) { // Fixup is only needed if the SMs work on fractional tiles.
@@ -1460,6 +1534,13 @@ void launch_fattn(
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
+
+    if (K2 != nullptr) {
+        GGML_ASSERT(dev_len.kv_len == nullptr);
+        src2.nbatch_fa = dev_len.nbatch_fa; src2.ntiles_dst = dev_len.ntiles_dst; src2.max_blocks = dev_len.max_blocks;
+        src2.ntiles_dst_ref = dev_len.ntiles_dst_ref; src2.stream_k = dev_len.stream_k;
+        dev_len = src2;
+    }
 
     ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
     ggml_cuda_kernel_launch(fattn_kernel, launch_params,

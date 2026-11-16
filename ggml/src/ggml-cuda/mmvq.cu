@@ -691,21 +691,26 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
 // product ran at ~104 GB/s against ~258 GB/s for IQ4_XS (k19-mmvqcols micro-bench), i.e. bound by these lookups. The table
 // values, the int arithmetic and the float expressions are those of vec_dot_iq3_s_q8_1 / vec_dot_iq3_xxs_q8_1 (vecdotq.cuh),
 // only the table the entries come from differs, so every output keeps its bytes. GGML_CUDA_MMVQ_GRID_SMEM=0: the global tables
-// (set per device in ggml_backend_cuda_init, ggml_cuda_mmvq_grid_init)
+// (set per device in ggml_backend_cuda_init, ggml_cuda_mmvq_grid_init).
+// k19-small1115: unset = per-arch default: the global tables on compute capability 8.0 (A100: the shared-memory copy measured
+// 0.5-1.4% slower there, q38s no-draft / MTP decode), shared memory on every other arch. GGML_CUDA_MMVQ_GRID_SMEM=1 = shared memory
+// on every arch (the previous default), =0 = global tables on every arch. Either table holds the same entries: bytes are unchanged.
 static __device__ int mmvq_grid_smem_off = 0;
 
 void ggml_cuda_mmvq_grid_init(int device);
 
 void ggml_cuda_mmvq_grid_init(int device) {
     const char * e = getenv("GGML_CUDA_MMVQ_GRID_SMEM");
-    if (e != nullptr && atoi(e) == 0) {
+    const bool arch_off = ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_AMPERE; // k19-small1115: sm_80 default
+    if (e != nullptr ? atoi(e) == 0 : arch_off) {
         const int off = 1;
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaMemcpyToSymbol(mmvq_grid_smem_off, &off, sizeof(off)));
         static bool logged = false;
         if (!logged) {
             logged = true;
-            GGML_LOG_INFO("%s: GGML_CUDA_MMVQ_GRID_SMEM=0: IQ3_S / IQ3_XXS mat-vec grid lookups from the global tables\n", __func__);
+            GGML_LOG_INFO("%s: %s: IQ3_S / IQ3_XXS mat-vec grid lookups from the global tables\n", __func__,
+                e != nullptr ? "GGML_CUDA_MMVQ_GRID_SMEM=0" : "compute capability 8.0 default (GGML_CUDA_MMVQ_GRID_SMEM=1: shared memory)");
         }
     }
 }

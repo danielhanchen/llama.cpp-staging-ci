@@ -3087,6 +3087,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // k19-int3fix2: the verify graphs a server prewarms beside a drafter (counted by the fits that carry a draft model or MTP heads): up
     // to 3 sampler chains (greedy, masked greedy, top-k) x the verify widths 1 .. n_max + 1 (see common_fit_set_prewarm_graphs)
     common_fit_set_prewarm_graphs(params.warmup ? 3*(std::max(1, common_speculative_n_max(&params.speculative)) + 1) : 0);
+    // k19-l4gap2: the verify window's rows for the disk-tier k19-placemid ubatch (common/fit.cpp)
+    common_fit_set_verify_rows(common_speculative_n_max(&params.speculative) + 1);
     // k19-uma: the parameters as given, for the launch again without a MoE cache (see below)
     const common_params params_given = params;
     bool uma_no_cache = false;
@@ -3295,7 +3297,8 @@ uma_restart:
             // default q8_0 is kept only for more context, more layers or every expert on the device. LLAMA_KV_AUTO_Q8_TRADE=1: also for the
             // MTP drafter that f16 drops and for a MoE cache larger by max(64 MiB, 1/8)
             const bool aq_trade = getenv("LLAMA_KV_AUTO_Q8_TRADE") != nullptr && atoi(getenv("LLAMA_KV_AUTO_Q8_TRADE")) != 0;
-            bool aq_on = aq_mode != 0 && !model_only && !params.cache_type_k_set && !params.cache_type_v_set &&
+            // (k19-kvwin: not beside the KV window ring, whose cache types are given)
+            bool aq_on = aq_mode != 0 && !model_only && !params.cache_type_k_set && !params.cache_type_v_set && params.kv_win < 0 &&
                 params.cache_type_k == GGML_TYPE_F16 && params.cache_type_v == GGML_TYPE_F16 &&
                 params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && !params.embedding &&
                 (params.n_ctx <= 0 || (int64_t) params.n_ctx > min_ctx);
@@ -5704,6 +5707,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
+
+    cparams.kv_win       = params.kv_win;
+    cparams.kv_win_sinks = params.kv_win_sinks;
+    cparams.type_k_win   = params.cache_type_k_win;
+    cparams.type_v_win   = params.cache_type_v_win;
 
     cparams.moe_cache_size = params.moe_cache_size;
     cparams.ple_prefetch   = params.ple_prefetch;

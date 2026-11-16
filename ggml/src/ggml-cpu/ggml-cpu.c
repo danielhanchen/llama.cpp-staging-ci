@@ -2516,6 +2516,10 @@ static void ggml_compute_forward_kq_mask(const struct ggml_compute_params * para
     const int64_t dr = (n_rows + params->nth - 1)/params->nth;
     const int64_t r0 = dr*params->ith, r1 = MIN(r0 + dr, n_rows);
     const ggml_fp16_t keep16 = GGML_CPU_FP32_TO_FP16(0.0f), drop16 = GGML_CPU_FP32_TO_FP16(-INFINITY);
+    // k19-kvwin (ggml_kq_mask_win): 1 = without the window cells that have a ring copy (flags), 2 = the ring's window cells only
+    const int32_t win_mode = ggml_get_op_params_i32(dst, 8), n_win = ggml_get_op_params_i32(dst, 9), n_sinks = ggml_get_op_params_i32(dst, 10);
+    const struct ggml_tensor * flags = win_mode == 1 ? dst->src[2] : NULL;
+    GGML_ASSERT(win_mode == GGML_KQ_MASK_KIND_PLAIN || win_mode == GGML_KQ_MASK_KIND_WIN_BODY || win_mode == GGML_KQ_MASK_KIND_WIN_RING);
     for (int64_t r = r0; r < r1; ++r) {
         const int64_t s = r / n_tps, i = r % n_tps;
         const int32_t * t = (const int32_t *) ((const char *) toks->data + s*toks->nb[2] + i*toks->nb[1]);
@@ -2537,6 +2541,14 @@ static void ggml_compute_forward_kq_mask(const struct ggml_compute_params * para
             if (keep && swa_type != 0 && ggml_kq_mask_swa_masked(swa_type, n_swa, p0, p1)) {
                 keep = false;
             }
+            if (keep && win_mode != 0) {
+                const bool in_win = (p0 <= p1 && (int64_t) p0 > (int64_t) p1 - n_win) || p0 < n_sinks;
+                if (win_mode == 1) {
+                    keep = !(in_win && ((const int32_t *) ((const char *) flags->data + s*flags->nb[1]))[j] != 0);
+                } else {
+                    keep = in_win;
+                }
+            }
             if (dst->type == GGML_TYPE_F16) {
                 ((ggml_fp16_t *) ((char *) dst->data + s*dst->nb[3] + i*dst->nb[1]))[j] = keep ? keep16 : drop16;
             } else {
@@ -2546,7 +2558,7 @@ static void ggml_compute_forward_kq_mask(const struct ggml_compute_params * para
     }
 }
 
-// k19-kvlong: GGML_OP_KQ_MASK mode 1 (ggml_sel_mask), the rows split over the threads: every cell kq_mask - INFINITY, then the selected
+// k19-kvlong: GGML_OP_KQ_MASK kind GGML_KQ_MASK_KIND_SEL (ggml_sel_mask), the rows split over the threads: every cell kq_mask - INFINITY, then the selected
 // cells kq_mask + 0, each rounded as the f16 add of the chain it replaces
 static void ggml_compute_forward_sel_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
     const struct ggml_tensor * idx = dst->src[0];
@@ -3010,7 +3022,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             }
         case GGML_OP_KQ_MASK:
             {
-                if (ggml_get_op_params_i32(tensor, 0) == 1) {
+                if (ggml_get_op_params_i32(tensor, GGML_KQ_MASK_KIND_SLOT) == GGML_KQ_MASK_KIND_SEL) {
                     ggml_compute_forward_sel_mask(params, tensor);
                 } else {
                     ggml_compute_forward_kq_mask(params, tensor);
@@ -3872,6 +3884,10 @@ struct ggml_cplan ggml_graph_plan(
                         size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
 
                         cur += MAX(prefill, decode);
+                        // k19-kvwin: the second converted Q of a two-source node (one per thread, the row loop's scratch)
+                        if (node->src[6] != NULL) {
+                            cur += sizeof(float)*n_tasks*(2*DK + 2*DV + CACHE_LINE_SIZE_F32);
+                        }
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {
