@@ -986,6 +986,12 @@ private:
     bool    tiny_rel_held    = false; // the banks are released by tiny_rel_enter
     bool    tiny_rel_routed  = false; // LLAMA_MOE_TINY_RELEASE_ROUTED=1: the slots come back with the experts the last large ubatch routed most
     bool place8_rel = false; // k19-place8: the release was set up by common's fit (LLAMA_MOE_PLACE8_UB), see tiny_rel_leave
+    // k19-mtpkeep (LLAMA_MOE_PLACE8_LEND, set by common's fit where it counted the MTP drafter's weights and compute buffers as lent):
+    // a prompt ubatch that runs with the banks released borrows them (place8_lend_now); the drafter's restore frees this context's
+    // compute buffers first (place8_free_compute)
+    bool   place8_lend = false;
+    void   place8_lend_now();
+    size_t place8_free_compute();
     size_t place8_grow = 0;   // k19-placemid: the compute buffer memory the fit gave the cache (LLAMA_MOE_PLACE8_MID, MiB), see decode_layer_major
     // k19-ttft4: the prompt calls of one sequence that follow each other (a prompt and the server's separate pass of its last 4 tokens)
     // count as one prompt for the MoE cache's short-prompt rule (see decode, LLAMA_MOE_PROMPT_RUN)

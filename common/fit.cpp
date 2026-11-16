@@ -649,7 +649,8 @@ static void common_params_fit_impl(
 
     // the extra model competes for the same memory as the main model, add it to every measurement
     // its memory is measured again whenever the context it follows changes (and, sharing the model, its placement or cache size)
-    auto add_extra_memory = [&](dmds_t & dmds, const llama_model_params * mp_cur = nullptr, const llama_context_params * cp_cur = nullptr) {
+    auto add_extra_memory = [&](dmds_t & dmds, const llama_model_params * mp_cur = nullptr, const llama_context_params * cp_cur = nullptr,
+            bool decode_sized = false) {
         if (extra == nullptr) {
             return;
         }
@@ -744,10 +745,12 @@ static void common_params_fit_impl(
             key_extra = key;
         }
 
+        // a lent extra model (common_fit_extra_model::lent) holds only its context while the main model's prompt ubatches run
+        const bool lent = extra->lent && !decode_sized;
         for (size_t id = 0; id < dmds.size(); id++) {
-            dmds[id].mb.model   += dmds_extra[id].mb.model;
+            dmds[id].mb.model   += lent ? 0 : dmds_extra[id].mb.model;
             dmds[id].mb.context += dmds_extra[id].mb.context;
-            dmds[id].mb.compute += dmds_extra[id].mb.compute;
+            dmds[id].mb.compute += lent ? 0 : dmds_extra[id].mb.compute;
         }
     };
 
@@ -1768,7 +1771,7 @@ static void common_params_fit_impl(
                             } catch (const std::runtime_error &) {
                                 return false;
                             }
-                            add_extra_memory(d);
+                            add_extra_memory(d, nullptr, nullptr, /*decode_sized =*/ true);
                             return true;
                         };
                         dmds_t d_s;

@@ -394,6 +394,8 @@ static std::atomic<int64_t> llama_ple_busy_us{0};
 // decode_layer_major)
 static std::mutex                   llama_mtp_ctx_mutex;
 static std::vector<llama_context *> llama_mtp_ctxs;
+// k19-mtpkeep: the targets whose released prompt ubatches borrow their MTP drafter's weights (llama_context::place8_lend)
+static std::vector<llama_context *> llama_place8_lend_tgts;
 
 // k19-tiny-ub debug (LLAMA_MOE_TINY_RELEASE_TRACE=1): step lines around the release / restore and a backtrace on a fatal signal
 static bool tiny_rel_trace() {
@@ -1284,6 +1286,11 @@ llama_context::llama_context(
             tiny_rel_res_ub = tiny_rel_ub;
             place8_rel      = true;
             moe_cache->set_restore_soft(true);
+            if (const char * el = getenv("LLAMA_MOE_PLACE8_LEND"); el != nullptr && atoi(el) != 0 && llama_mtp_draft_lend_on()) {
+                place8_lend = true;
+                std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
+                llama_place8_lend_tgts.push_back(this);
+            }
             tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") != nullptr && atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0;
             // k19-placemid (LLAMA_MOE_PLACE8_MID, set with it by the fit of a mid-size device): prompts keep their layer-major groups,
             // which release the banks for the merged graph; only a large ubatch outside a group takes the release above
@@ -2462,6 +2469,20 @@ bool llama_context::mtp_weights_restore() {
     if (!m.weights_evicted()) {
         return true;
     }
+    // k19-mtpkeep: a target that borrowed these weights for a released prompt ubatch still holds that ubatch's compute buffers in the
+    // memory they need (its fit counted them as lent): they go first, its next graph allocates them again
+    std::vector<llama_context *> tgts;
+    {
+        std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
+        for (llama_context * t : llama_place8_lend_tgts) {
+            if (mtp_drafts_for(t)) {
+                tgts.push_back(t);
+            }
+        }
+    }
+    for (llama_context * t : tgts) {
+        t->place8_free_compute();
+    }
     const int64_t t0 = ggml_time_us();
     const bool ok = m.weights_restore();
     static int64_t n_restore = 0;
@@ -2473,6 +2494,70 @@ bool llama_context::mtp_weights_restore() {
         LLAMA_LOG_INFO("%s: MTP drafter weights restored in %.2f ms (%" PRId64 " restores)\n", __func__, (ggml_time_us() - t0)/1000.0, n_restore);
     }
     return ok;
+}
+
+// k19-mtpkeep: before a prompt ubatch that runs with the banks released, the MTP drafters of this context's fit-credited lend give it
+// their device weights (evictable buffers, as for a layer-major group: decode_layer_major) and compute buffers; their next pass maps the
+// weights back after place8_free_compute (llama_mtp_draft_weights_restore)
+void llama_context::place8_lend_now() {
+    std::vector<llama_context *> dfts;
+    {
+        std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
+        for (llama_context * c : llama_mtp_ctxs) {
+            if (c->mtp_drafts_for(this) && !c->model.weights_evicted()) {
+                dfts.push_back(c);
+            }
+        }
+    }
+    if (dfts.empty()) {
+        return;
+    }
+    nextn_hold_wait_free(); // a drafter pass in flight beside this decode ends before its buffers go
+    const int64_t t0 = ggml_time_us();
+    size_t freed_w = 0, freed_c = 0;
+    for (llama_context * c : dfts) {
+        if (!c->mtp_lend_prepare()) {
+            continue;
+        }
+        c->synchronize();
+        freed_w += const_cast<llama_model &>(c->model).weights_evict();
+        freed_c += c->release_device_compute();
+    }
+    if (freed_w > 0) {
+        mtp_lend_active = true;
+    }
+    static int64_t n_lend = 0;
+    if (freed_w > 0 && n_lend++ < 4) {
+        LLAMA_LOG_INFO("%s: MTP drafter weights lent to a released prompt ubatch: %.2f MiB + %.2f MiB of its compute buffers, %.2f ms "
+            "(k19-mtpkeep; LLAMA_FIT_DRAFT_HOST_EXPS_LEND=0 off)\n", __func__, freed_w/1048576.0, freed_c/1048576.0, (ggml_time_us() - t0)/1000.0);
+    }
+}
+
+size_t llama_context::place8_free_compute() {
+    if (!place8_lend || !moe_cache || !moe_cache->released()) {
+        return 0;
+    }
+    nextn_hold_wait_free();
+    synchronize();
+    // the routing kept for a seed lives in the compute buffers freed here (as in tiny_rel_leave)
+    moe_cache_ids.clear();
+    moe_cache_seq      = -1;
+    moe_cache_pos_next = -1;
+    moe_cache->clear_seed_counts();
+    size_t freed = release_device_compute();
+    ggml_backend_sched_free_prefetch_arenas(sched.get());
+    const size_t trimmed = pool_mark_trim_dev(true);
+    // the CUDA graphs that used the pool memory given back are evicted with it (k19-df2pp, see tiny_rel_leave)
+    static const bool trim_evict = getenv("LLAMA_MOE_TRIM_EVICT") == nullptr || atoi(getenv("LLAMA_MOE_TRIM_EVICT")) != 0;
+    if (trim_evict && trimmed > 0) {
+        graph_evict_since_dev(tiny_rel_t_mark);
+    }
+    static int64_t n_log = 0;
+    if (n_log++ < 4) {
+        LLAMA_LOG_INFO("%s: compute buffers of the released prompt ubatch freed for the MTP drafter's weights: %.2f MiB, %.2f MiB of "
+            "CUDA pools given back (k19-mtpkeep)\n", __func__, freed/1048576.0, trimmed/1048576.0);
+    }
+    return freed + trimmed;
 }
 
 // k19-fullcost: see release_device_compute / graph_reserve
@@ -2769,6 +2854,10 @@ llama_context::~llama_context() {
     if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
         std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
         llama_mtp_ctxs.erase(std::remove(llama_mtp_ctxs.begin(), llama_mtp_ctxs.end(), this), llama_mtp_ctxs.end());
+    }
+    if (place8_lend) {
+        std::lock_guard<std::mutex> lock(llama_mtp_ctx_mutex);
+        llama_place8_lend_tgts.erase(std::remove(llama_place8_lend_tgts.begin(), llama_place8_lend_tgts.end(), this), llama_place8_lend_tgts.end());
     }
     if (!disk_ranges.empty()) {
         ggml_moe_prefetch_counters c = {};
@@ -6260,6 +6349,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if ((int64_t) ubatch.n_tokens > tiny_rel_ub) {
                 if (!moe_cache->released()) {
                     tiny_rel_enter("prompt");
+                }
+                if (place8_lend && moe_cache->released()) {
+                    place8_lend_now();
                 }
             } else if (tiny_rel_held) {
                 tiny_rel_leave();

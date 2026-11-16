@@ -602,7 +602,12 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // launch whose result depends on that product's shape alone, while the small catch-up batches use mat-vec kernels that fuse
     // adjacent products of one input (k15-mm2)
     static const int64_t kv_only_min = getenv("LLAMA_MTP_PROMPT_KV_ONLY_MIN") ? std::max(1, atoi(getenv("LLAMA_MTP_PROMPT_KV_ONLY_MIN"))) : 64;
-    kv_only = kv_only_env && n_outputs == 0 && n_tokens >= kv_only_min;
+    // k19-mtpkeep (LLAMA_MTP_PROMPT_KV_ONLY_UB=0 off): a drafter context whose n_ubatch is below that (the fit's host-expert MTP placement
+    // runs at 16 rows, so its graphs fit the in-place q8_0 flash attention and keep no f16 copy of the whole K / V) writes full prompt
+    // ubatches the same way, else every prompt ubatch would build the whole block with its experts on the host
+    static const bool kv_only_ub = getenv("LLAMA_MTP_PROMPT_KV_ONLY_UB") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_KV_ONLY_UB")) != 0;
+    const int64_t kv_min = kv_only_ub && (int64_t) cparams.n_ubatch < kv_only_min ? std::max<int64_t>(1, cparams.n_ubatch) : kv_only_min;
+    kv_only = kv_only_env && n_outputs == 0 && n_tokens >= kv_min;
     if (kv_only) {
         static std::atomic<int> n_log { 0 };
         if (n_log++ == 0) {
