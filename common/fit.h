@@ -35,6 +35,10 @@ struct common_fit_extra_model {
     llama_model_params * mparams;
     llama_context_params * cparams;
     bool shares_model;
+    // lent: the extra model's device weights and compute buffers are lent to the main model's prompt ubatches that run with the MoE cache
+    // banks released (an MTP drafter beside a k19-place8 target, LLAMA_MTP_DRAFT_LEND): every measurement leaves them out except the
+    // decode-sized one of k19-place8, so the fit is valid only where that placement is taken (common_fit_place8())
+    bool lent = false;
 };
 
 // fits mparams and cparams to free device memory (assumes system memory is unlimited)
