@@ -8282,7 +8282,21 @@ struct llama_moe_cache::impl {
 
     // while the hybrid path is off but may be used (probe, trials), the lookup fetches every missing expert (share 1, same results
     // as ggml_moe_cache_lookup) and keeps the use counters up to date
-    ggml_tensor * hybrid_assign(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch, bool & host) const {
+    // a prompt ubatch small enough for the hybrid lookup (the server's last few prompt tokens, which give the first generated token)
+    // fetches every missing expert: the host-computed misses moved the first token beyond the -fa off band against a whole-card
+    // reference (G4 Qwen3.8-Flash-Next UD-IQ4_XS 12 GB ctx 262144, fetch share 0.25: first-token KLD 0.0137 / top-1 0.938, band 0.0067 /
+    // 0.979; every miss fetched 0.0087 / 0.979), and such a ubatch runs once per prompt, so the copies cost little. Decode and verify
+    // windows keep the hybrid share. LLAMA_MOE_HYBRID_PROMPT_FETCH=0: off
+    static bool hybrid_prompt_fetch_on() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_MOE_HYBRID_PROMPT_FETCH");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        return on;
+    }
+    mutable uint64_t n_prompt_fetch = 0; // layer graphs of prompt ubatches built with every miss fetched (engagement)
+
+    ggml_tensor * hybrid_assign(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch, bool & host, bool prompt) const {
         host = false;
         bool plain = false;
         if (!hybrid_layer(il, n_ubatch, &plain) || ids->ne[1] > n_ubatch || ids->ne[0] > n_expert_used) {
@@ -8297,6 +8311,11 @@ struct llama_moe_cache::impl {
         } else {
             host  = hybrid_active();
             share = host ? hybrid_share : 1.0f;
+        }
+        if (prompt && host && hybrid_prompt_fetch_on()) {
+            share = 1.0f;
+            host  = false;
+            n_prompt_fetch++;
         }
         const group & g = groups[layers[il].ig];
         if (plain && !slots_fit(g, n_ubatch)) {
@@ -13948,6 +13967,10 @@ struct llama_moe_cache::impl {
                 const size_t n = st.hits + st.misses + n_host;
                 LLAMA_LOG_INFO("llama_moe_cache%s: hybrid: fetch share = %.3f, %llu missing experts computed on the host (not fetched), hit rate with them = %.2f%%\n", tag, hybrid_share, (unsigned long long) n_host, n > 0 ? 100.0*st.hits/n : 0.0);
             }
+            if (n_prompt_fetch > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: hybrid: %llu layer graphs of prompt ubatches fetched every missing expert (LLAMA_MOE_HYBRID_PROMPT_FETCH=0 off)\n",
+                    tag, (unsigned long long) n_prompt_fetch);
+            }
         }
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache%s: large batches: %zu experts copied from the cache, %.2f MiB\n", tag, stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
@@ -14133,8 +14156,8 @@ int llama_moe_cache::hybrid_mode() const {
     return pimpl->hybrid_mode();
 }
 
-ggml_tensor * llama_moe_cache::hybrid_assign(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch, bool & host) const {
-    return pimpl->hybrid_assign(ctx, il, ids, n_ubatch, host);
+ggml_tensor * llama_moe_cache::hybrid_assign(ggml_context * ctx, int32_t il, ggml_tensor * ids, int64_t n_ubatch, bool & host, bool prompt) const {
+    return pimpl->hybrid_assign(ctx, il, ids, n_ubatch, host, prompt);
 }
 
 ggml_tensor * llama_moe_cache::hybrid_fetch_experts(ggml_context * ctx, int32_t il, ggml_tensor * res, bool overlap) const {

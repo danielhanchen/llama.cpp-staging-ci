@@ -3244,7 +3244,7 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
             ids = ggml_cont(ctx0, ids);
         }
         bool use_host = false;
-        if (ggml_tensor * res = moe_cache->hybrid_assign(ctx0, il, ids, n_tokens, use_host)) {
+        if (ggml_tensor * res = moe_cache->hybrid_assign(ctx0, il, ids, n_tokens, use_host, n_outputs < n_tokens)) {
             if (tail_ok) {
                 moe_cache->tail_skip(res, il, n_tokens);
             }
