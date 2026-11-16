@@ -1753,6 +1753,16 @@ static void common_params_fit_impl(
                             LOG_INF("%s: small device: the MoE cache takes the memory of the prompt compute buffers (%" PRId64 " MiB): cache %zu -> "
                                 "%zu MiB; ubatches of more than %u tokens run with the cache banks released (k19-place8; LLAMA_FIT_PLACE8=0 off)\n",
                                 __func__, grow/MiB, size_ok/MiB, cparams->moe_cache_size/MiB, ub_rel);
+                            // k19-kvlong (LLAMA_FIT_PLACE8_LM=1, opt-in): prompts keep their layer-major groups beside this decode-sized cache, as
+                            // on a mid-size device (k19-placemid: a group releases the banks for its merged graph and grows into the memory the
+                            // cache took); the drafter decision stays the small device's (common_fit_place8_mid() is not set). Without groups
+                            // every prompt ubatch reads its experts from the host: G4 10 / 12 GB, Qwen3.8-Flash-Next ctx 262144, 8k prompt
+                            // 493 tok/s, 3669-4438 with the place8 placement off (decode -20..25%)
+                            static const bool place8_lm = getenv("LLAMA_FIT_PLACE8_LM") != nullptr && atoi(getenv("LLAMA_FIT_PLACE8_LM")) != 0;
+                            if (place8_lm) {
+                                common_set_env("LLAMA_MOE_PLACE8_MID", std::to_string(std::max<int64_t>(1, grow/MiB)));
+                                LOG_INF("%s: small device: layer-major prompt groups kept beside the decode-sized cache (LLAMA_FIT_PLACE8_LM)\n", __func__);
+                            }
                         } else {
                             common_fit_place8_env(0);
                             cparams->moe_cache_size = size_ok;
