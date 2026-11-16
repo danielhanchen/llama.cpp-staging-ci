@@ -13306,6 +13306,44 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, b, 50, 200, 64));
     }
 
+    // F16/BF16 MUL_MAT_ID batches too large for the vector and mmf kernels (grouped GEMM on CUDA):
+    // many experts, empty experts, row counts that are not a multiple of the row tile, broadcast and per-slot src1
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (bool b : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, b,  640,  600, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256,  8, b, 1280, 1024, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128,  8, b, 2048,  512, 4096));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512,  2, b,  136,  700,   64));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32,  16,  4, b,  200, 8192,  128));
+        }
+    }
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640,  512, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, 2048, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, 2048, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, 2048,  640));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512,  8, false,  640,   64, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256,  8, false, 1280,  512, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256,  8,  true, 1280,  512, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128,  8, false, 2048, 1024, 4096));
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16,  GGML_TYPE_F32, 128,  8, false,  640, 1024, 4096));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 128,  8,  true,  640, 2048, 2048));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 256,  8, false, 2048, 1024, 2048));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 128,  8, false, 1280, 4096, 4096));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 512, 10, false,  640, 8192, 2048));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 512, 10, false,  640, 8192, 2560));
+    // the same products with strided experts (m_v rows in memory) and skipped slots (id -1), on the single-warp expert sort
+    // (16 experts x 512 tokens) and on the counting sort (128 experts x 1024 tokens). No ids_offset: its ids rows hold expert 0
+    // twice, and repeated ids within a row are not supported by the CUDA backend [TAG_MUL_MAT_ID_DUPLICATE_ID]
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (bool b : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, b, 640, 1024, 2048, 1.0f, 768, false, false));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, b, 640, 1024, 2048, 1.0f,   0, false,  true));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32,  16, 4, b, 200,  512,  256, 1.0f, 264, false,  true));
+        }
+    }
+
     // For issue 27873
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 1, 1, false, 1, 8192, 4096));
 
@@ -15109,6 +15147,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+
+    // 16-bit MoE experts at prompt-processing batch sizes: 512 x 640 (10 used, gate/up with broadcast and per-slot src1,
+    // down) and 128 x 768 / 128 x 1280 (8 used)
+    for (int bs : {16, 32, 64, 128, 256, 512, 2048, 8192}) {
+        for (ggml_type type_a : {GGML_TYPE_BF16, GGML_TYPE_F16}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10,  true,  640, bs, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, bs, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, bs,  640));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128,  8, false,  768, bs, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128,  8, false, 1280, bs, 4096));
+        }
+    }
 
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {
