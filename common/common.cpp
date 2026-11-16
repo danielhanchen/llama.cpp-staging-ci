@@ -4182,17 +4182,6 @@ uma_restart:
                                 params.n_ubatch     = (int32_t) ub_t;
                                 params.n_ubatch_set = true;
                                 kept = true;
-                                // k19-g4verify: a layer-major prompt group holds at most LLAMA_MOE_LAYER_MAJOR_UB_MAX (16) ubatches, so the
-                                // halved ubatch also halved the group (n_batch 8192 -> 4096) and an 8k prompt read the host experts twice:
-                                // G4 12 GB / 262K Flash-Next + DFlash2, 8k prompt 3493 (no drafter, ub 512) -> 1452 tok/s. The group keeps
-                                // its token count instead (the members are smaller, the same total). LLAMA_FIT_DRAFT_TUB_KEEP_BATCH=0: off
-                                const char * e_kb = getenv("LLAMA_FIT_DRAFT_TUB_KEEP_BATCH");
-                                if ((e_kb == nullptr || atoi(e_kb) != 0) && getenv("LLAMA_MOE_LAYER_MAJOR_UB_MAX") == nullptr && ub_t > 0) {
-                                    const uint32_t ub_max = 16u*std::max(1u, cparams_in.n_ubatch/ub_t);
-                                    common_set_env("LLAMA_MOE_LAYER_MAJOR_UB_MAX", std::to_string(ub_max));
-                                    COM_INF("%s: --fit: k19-g4verify: layer-major prompt groups of up to %u ubatches of %u tokens (the group size of "
-                                        "n_ubatch %u; LLAMA_FIT_DRAFT_TUB_KEEP_BATCH=0 off)\n", __func__, ub_max, ub_t, cparams_in.n_ubatch);
-                                }
                             }
                         }
                     }
