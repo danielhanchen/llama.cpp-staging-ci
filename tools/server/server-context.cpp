@@ -2301,8 +2301,23 @@ private:
                 }();
                 const double g4t_lo = getenv("LLAMA_MOE_G4TAIL_LO") != nullptr ? atof(getenv("LLAMA_MOE_G4TAIL_LO")) : 0.07;
                 const double g4t_hi = getenv("LLAMA_MOE_G4TAIL_HI") != nullptr ? atof(getenv("LLAMA_MOE_G4TAIL_HI")) : 0.17;
-                const bool g4t = !def_on && g4tail_on && exp_b > 0 && short_b > 0 && resident && share >= g4t_lo && share < g4t_hi &&
+                // k19-g4tail2: not above LLAMA_FIT_LONGCTX_MIN_CTX (32768, where --fit's long-context ladder takes over; n_ctx 0 = the
+                // trained context counts as above): there the deeper windows changed the fit itself. G4 16 GB ctx 262144: priced at 4
+                // drafts the requantized drafter was left out, and the placement moved (49 layers, n_ubatch 2048, cache 6233 MiB against
+                // 50 layers, n_ubatch 512, 3915 MiB with the rule off): decode chat / 8k 87.4 / 82.3 tok/s against 133.0 / 125.2. Above the
+                // bound the rule sets nothing, as LLAMA_MOE_G4TAIL=0
+                const int64_t g4t_ctx_max = [] {
+                    const char * x = getenv("LLAMA_FIT_LONGCTX_MIN_CTX");
+                    return x != nullptr && x[0] != 0 ? (int64_t) atoll(x) : (int64_t) 32768;
+                }();
+                const bool g4t_ctx_ok = params.n_ctx > 0 && (int64_t) params.n_ctx <= g4t_ctx_max;
+                const bool g4t_band = !def_on && g4tail_on && exp_b > 0 && short_b > 0 && resident && share >= g4t_lo && share < g4t_hi &&
                     n_gpu > 0 && cc_min == 1200 && cc_max == 1200;
+                const bool g4t = g4t_band && g4t_ctx_ok;
+                if (g4t_band && !g4t_ctx_ok) {
+                    SRV_INF("k19-g4tail2: n_ctx %d is above LLAMA_FIT_LONGCTX_MIN_CTX (%lld): the g4tail rule stays off (MTP windows and "
+                        "the prefetch as with LLAMA_MOE_G4TAIL=0)\n", params.n_ctx, (long long) g4t_ctx_max);
+                }
                 spec_g4t_raised = g4t;
                 if (def_on || g4t) {
                     depth_cached = n_def;
