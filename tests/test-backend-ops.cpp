@@ -14274,6 +14274,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // k19-decmma: one-row decode over a q8_0 / q4_0 K and V cache at head size 128 / 256 with GQA 4 / 6 / 8 / 16 (the in-place MMA
+    // kernel on CUDA Turing+; the vector kernel with GGML_CUDA_FATTN_DEC_MMA=0 or an unpadded KV length), with and without sinks
+    for (const auto & tp : { std::make_pair(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0), std::make_pair(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0),
+                             std::make_pair(GGML_TYPE_Q4_0, GGML_TYPE_Q8_0), std::make_pair(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0) }) {
+        for (int hs : { 128, 256 }) {
+            for (int nr2 : { 4, 6, 8, 16 }) {
+                for (int kv : { 512, 1000, 4096 }) {
+                    for (bool sinks : { false, true }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {nr2, 1}, kv, 1, true, sinks, 0, 0, GGML_PREC_F32,
+                            tp.first, tp.second));
+                    }
+                }
+            }
+        }
+    }
+
     // k19-kvwin: two-source flash attention (a q4_0 cache beside a q8_0 ring): decode (1-2 rows), MTP / DFlash verify windows
     // (3-16 rows) and prompt batches; head sizes 64 / 128 / 256 and the MLA latent (576 K, V = its first 512); GQA 1 / 2 / 6 / 8; rings of
     // 256 .. 4096 slots, sinks, ALiBi, random (overlapping) masks, mixed and equal types

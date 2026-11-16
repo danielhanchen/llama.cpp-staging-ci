@@ -422,6 +422,58 @@ bool ggml_cuda_flash_attn_ext_mma_q8_inplace(const int device, const ggml_tensor
     return ggml_cuda_flash_attn_ext_mma_kvq_inplace(device, dst, true) != 0;
 }
 
+// k19-decmma: one-row decode over a q8_0 / q4_0 K and V cache with a GQA group of >= 4 query heads per KV head runs the in-place
+// MMA kernel (f16 Q*K^T, the GQA group packed into the tile columns, ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2) instead of the
+// vector kernel, which leaves most of the memory bandwidth unused at long context (q4x q8_0 K / V decode at 8k / 30k / 120k: T4
+// +7 / +31 / +107%, L4 +2 / +12 / +46%, A100 +1 / +15 / +62%, G4 (sm_120) -1 / +7 / +30%, the 8k cell inside the run spread).
+// Taken on NVIDIA Turing+ for nodes the in-place kernels read (ggml_cuda_flash_attn_ext_mma_kvq_inplace: types, alignment), head size
+// 128 / 256 (K = V), the GQA layout the MMA kernel packs (mask, no ALiBi, KV padded to 256), no softcap, not two-source, not batch
+// invariant (that one-query node stays on the vector kernel, the reference of its verify windows), at least
+// GGML_CUDA_FATTN_DEC_MMA_MIN_KV K rows (default 0). No f16 copy is reserved for these nodes (in place), as for the vector kernel.
+// GGML_CUDA_FATTN_DEC_MMA=0: off (the vector kernel, as before)
+static bool ggml_cuda_flash_attn_ext_dec_mma(const int device, const ggml_tensor * dst, const bool gqa_opt_applies) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(device, dst, gqa_opt_applies);
+    return false;
+#else
+    static const bool enabled = getenv("GGML_CUDA_FATTN_DEC_MMA") == nullptr || atoi(getenv("GGML_CUDA_FATTN_DEC_MMA")) != 0;
+    static const int64_t min_kv = getenv("GGML_CUDA_FATTN_DEC_MMA_MIN_KV") ? atoll(getenv("GGML_CUDA_FATTN_DEC_MMA_MIN_KV")) : 0;
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (!enabled || !gqa_opt_applies || Q->ne[1] != 1 || dst->src[6] != nullptr || (dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) ||
+            !ggml_is_quantized(K->type) || !ggml_is_quantized(V->type) || K->ne[1] % FATTN_KQ_STRIDE != 0 || K->ne[1] < min_kv) {
+        return false;
+    }
+    const int64_t D = K->ne[0];
+    if ((D != 128 && D != 256) || Q->ne[0] != D || V->ne[0] != D || Q->ne[2] / K->ne[2] < 4) {
+        return false;
+    }
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !turing_mma_available(cc)) {
+        return false;
+    }
+    // q8_0 / q4_0 K and V in any pairing (the kernels read every pair in place up to 16 rows); 0 = staged: keep the vector kernel
+    if (ggml_cuda_flash_attn_ext_mma_kvq_inplace(device, dst, false) == 0) {
+        return false;
+    }
+    static std::atomic<int> n_logged { 0 };
+    if (ggml_cuda_fattn_probe_cur == nullptr && n_logged++ == 0) {
+        GGML_LOG_INFO("%s: k19-decmma: one-row decode over the %s K / %s V cache runs the in-place MMA kernel (D %lld, GQA %lld, %lld "
+            "cells; GGML_CUDA_FATTN_DEC_MMA=0: the vector kernel)\n", __func__, ggml_type_name(K->type), ggml_type_name(V->type),
+            (long long) D, (long long) (Q->ne[2] / K->ne[2]), (long long) K->ne[1]);
+    }
+    return true;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
 // k19-fattnq4: a two-source node (ggml_flash_attn_ext_set_src2) is read in place when its body is (ggml_cuda_flash_attn_ext_mma_kvq_inplace:
 // q4_0 / q4_0 or q8_0 / q8_0, the row limits, alignment) and its ring is q8_0 / q8_0 with 4 byte aligned rows: the compiled
 // combinations (fattn-mma-f16.cuh). Returns code1 | code2 << 8 (type bits | 1), 0 = both staged to f16
@@ -966,6 +1018,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        // k19-decmma: one-row decode over a quantized K / V cache with GQA >= 4 on the in-place MMA kernel
+        if (ggml_cuda_flash_attn_ext_dec_mma(device, dst, gqa_opt_applies)) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 // the sparse gather exists only in the MMA kernel: (DKQ, DV, 1, 8) with GQA > 4
