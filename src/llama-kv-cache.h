@@ -473,6 +473,8 @@ public:
     // Policy (LLAMA_KV_SEL_POLICY): static = cells [0, R) on the device; window = cells [0, LLAMA_KV_SEL_SINKS) plus the most recent
     // cells, chunks moved between the device and the host between batches (sel_update)
     uint32_t sel_dev_cells() const { return sel_bufs.empty() ? 0 : sel_r; }
+    // the K/V bytes held in host chunks, per device buffer type (a measurement: the bytes the host chunks would take)
+    std::map<ggml_backend_buffer_type_t, size_t> sel_host() const;
 private:
     std::vector<ggml_backend_buffer_t> sel_bufs;
     std::vector<std::vector<uint8_t>>  sel_dev;      // per sel buffer: chunk on the device (1) or the host (0)

@@ -12443,6 +12443,9 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             for (const auto & [buft, size] : kv->lazy_unbacked()) {
                 ret[buft].kv_lazy += size;
             }
+            for (const auto & [buft, size] : kv->sel_host()) {
+                ret[buft].kv_sel += size;
+            }
         }
     }
     if (moe_cache) {

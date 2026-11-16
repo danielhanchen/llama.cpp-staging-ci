@@ -49,6 +49,8 @@ class common_params_fit_exception : public std::runtime_error {
 
 static bool    g_moe_margin_auto = true;
 static int64_t g_moe_margin_gain = 0;
+// k19-kvsel: measurements count the K/V bytes of host chunks (mb.kv_sel) on their device, as without LLAMA_KV_SEL_HOST (see common_fit_impl)
+static bool    g_fit_sel_as_dev  = false;
 
 // k19-fitfaoff: the last measured context ran attention without flash attention (-fa off, or auto resolved off)
 static bool    g_fit_fa_off      = false;
@@ -521,8 +523,14 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
                 ret[i].mb.compute += mb.compute;
                 ret[i].mb.lend_freed += mb.lend_freed;
                 ret[i].mb.kv_lazy    += mb.kv_lazy;
+                ret[i].mb.kv_sel     += mb.kv_sel;
                 break;
             }
+        }
+    }
+    if (g_fit_sel_as_dev) {
+        for (size_t i = 0; i < nd; i++) {
+            ret[i].mb.context += ret[i].mb.kv_sel;
         }
     }
 
@@ -1646,6 +1654,35 @@ static void common_params_fit_impl(
             // small-device placement below (smaller margin, the k19-place8 decode-sized cache) although it fits
             const size_t  size_fit_hb = cparams->moe_cache_size;
             const int64_t gain_fit_hb = g_moe_margin_gain;
+            // k19-kvsel: K/V cells in host chunks (LLAMA_KV_SEL_HOST=1) leave device memory free that the cache should get, but a device
+            // that fits only because of them would take the regular path at the default margin (G4 10 GB, Qwen3.8-Flash-Next ctx 131K
+            // q8_0: of 1200 MiB freed, k19-placemid gave the cache 560). The path is chosen as without host chunks: the cache is sized
+            // once more with their bytes counted on the device, and where that leaves no cache the small-device placement below runs on
+            // the real measurement, so the cache gets what the host chunks free. LLAMA_KV_SEL_FIT=0: the path of the real measurement
+            bool sel_small = false;
+            if (fits_per_device && nd == 1 && size_before > 0 && dmds_cpu_moe_req[0].mb.kv_sel > 0) {
+                static const bool sel_fit_on = getenv("LLAMA_KV_SEL_FIT") == nullptr || atoi(getenv("LLAMA_KV_SEL_FIT")) != 0;
+                if (sel_fit_on) {
+                    dmds_t d_dev = dmds_cpu_moe_req;
+                    for (size_t id = 0; id < nd; id++) {
+                        d_dev[id].mb.context += d_dev[id].mb.kv_sel;
+                    }
+                    cparams->moe_cache_size = size_before;
+                    g_fit_sel_as_dev = true;
+                    fit_moe_cache_size(d_dev, mparams, true);
+                    g_fit_sel_as_dev = false;
+                    bool fits_dev = cparams->moe_cache_size > 0;
+                    for (size_t id = 0; id < nd; id++) {
+                        fits_dev = fits_dev && int64_t(d_dev[id].free) - int64_t(d_dev[id].mb.total()) >= margins[id];
+                    }
+                    sel_small = !fits_dev;
+                    LOG_INF("%s: kv sel: %zu MiB of K/V in host chunks; counted on the device the cache would be %zu MiB (%s), so the %s "
+                        "placement runs (LLAMA_KV_SEL_FIT=0: the regular one)\n", __func__, dmds_cpu_moe_req[0].mb.kv_sel/MiB,
+                        cparams->moe_cache_size/MiB, fits_dev ? "fits" : "does not fit", sel_small ? "small-device" : "regular");
+                    cparams->moe_cache_size = size_fit_hb;
+                    g_moe_margin_gain       = gain_fit_hb;
+                }
+            }
             // not beside a draft model or MTP heads (as the k18 margin rule): their run-time pools were never measured at this margin
             const bool    hostbound   = fits_per_device && nd == 1 && size_before > 0 && !has_drafter &&
                 common_fit_hostbound_place(int64_t(dmds_cpu_moe[0].free), int64_t(size_fit_hb),
@@ -1657,7 +1694,7 @@ static void common_params_fit_impl(
             // LLAMA_FIT_SMALL_MARGIN_MIB (256) instead: every layer stays on the device beside a small cache, whose host misses the
             // single-graph path computes (no graph split). The placement is the one of -fitt 256; one GPU only, default margin only (an
             // explicit smaller -fitt is the user's), LLAMA_FIT_SMALL_MARGIN_MIB=0 keeps the k12 placement.
-            if ((!fits_per_device || hostbound) && nd == 1 && size_before > 0) {
+            if ((!fits_per_device || hostbound || sel_small) && nd == 1 && size_before > 0) {
                 const char * e_sm = getenv("LLAMA_FIT_SMALL_MARGIN_MIB");
                 const int64_t small_mib = e_sm != nullptr ? std::max<int64_t>(0, atoll(e_sm)) : 256;
                 constexpr int64_t m_default = 1024*MiB;
@@ -1898,12 +1935,12 @@ static void common_params_fit_impl(
                         fits_per_device = true;
                         g_small_device  = true;
                     } else {
-                        // k19-l4poly: a host-bound device that fitted keeps that placement
+                        // k19-l4poly: a host-bound device that fitted keeps that placement (k19-kvsel: as does one with host chunks)
                         common_fit_place8_env(0);
                         margins[0] = margin_saved;
                         dmds_cpu_moe = dmds_nc_saved;
-                        cparams->moe_cache_size = hostbound ? size_fit_hb : 0;
-                        g_moe_margin_gain = hostbound ? gain_fit_hb : 0;
+                        cparams->moe_cache_size = hostbound || sel_small ? size_fit_hb : 0;
+                        g_moe_margin_gain = hostbound || sel_small ? gain_fit_hb : 0;
                     }
                 }
             }

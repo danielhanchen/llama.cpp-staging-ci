@@ -1611,6 +1611,18 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::lazy_unbacked() con
     return ret;
 }
 
+std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::sel_host() const {
+    if (hparams.no_alloc) {
+        return sel_host_est;
+    }
+    std::map<ggml_backend_buffer_type_t, size_t> ret;
+    for (ggml_backend_buffer_t buf : sel_bufs) {
+        const size_t sz = ggml_backend_buffer_get_size(buf);
+        ret[ggml_backend_buffer_get_type(buf)] += sz - std::min(sz, sel_committed_fn(buf));
+    }
+    return ret;
+}
+
 std::vector<uint8_t> llama_kv_cache::sel_want(ggml_backend_buffer_t b, uint32_t sinks, uint32_t lo, uint32_t hi) const {
     const size_t n = (ggml_backend_buffer_get_size(b) + sel_gran - 1)/sel_gran;
     std::vector<uint8_t> want(n, 0);
