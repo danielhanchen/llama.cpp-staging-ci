@@ -4096,6 +4096,9 @@ uma_restart:
                     const char * e_ub  = getenv("LLAMA_FIT_DRAFT_LAYERS_FIRST_UB");
                     const uint32_t lub = e_ub != nullptr ? (uint32_t) std::max(0, atoi(e_ub)) : 0u;
                     bool kept = false;
+                    const char * e_lft = getenv("LLAMA_FIT_DRAFT_LAYERS_FIRST_TUB");
+                    const char * e_lfm = getenv("LLAMA_FIT_DRAFT_LAYERS_FIRST_TUB_MIN");
+                    const uint32_t lft_min = e_lfm != nullptr ? (uint32_t) std::max(32, atoi(e_lfm)) : 256u;
                     if (lub > 0 && spec_mtp && params.speculative.draft.n_ubatch <= 0 && cparams_dft.n_ubatch > lub) {
                         llama_context_params cp_dft_lf = cparams_dft;
                         cp_dft_lf.n_ubatch = lub;
@@ -4132,6 +4135,47 @@ uma_restart:
                             params.speculative.draft.n_ubatch = (int32_t) lub;
                             cparams_dft.n_ubatch = lub;
                             kept = true;
+                        }
+                    }
+                    // k19-kvlong (LLAMA_FIT_DRAFT_LAYERS_FIRST_TUB=1, opt-in): before the drafter goes, the target's n_ubatch is halved (down to
+                    // LLAMA_FIT_DRAFT_LAYERS_FIRST_TUB_MIN, 256) and the fit with the drafter runs again; it stays if that keeps as many layers
+                    // as the plain fit. On a small device the decode-sized cache must be positive beside the prompt compute buffers before the
+                    // k19-place8 step lends it their memory: G4 10 GB Qwen3.8-Flash-Next ctx 262144 + DFlash2 Q4_0 (495 MiB) went 335 -> -160 MiB
+                    // at ub 512, so the small-device placement was skipped and 8 layers spilled, while a smaller target ubatch frees that room
+                    if (!kept && (e_lft == nullptr ? false : atoi(e_lft) != 0)) {
+                        for (uint32_t ub_t = cparams_in.n_ubatch/2; !kept && ub_t >= lft_min; ub_t /= 2) {
+                            llama_model_params   mq = mparams_in;
+                            llama_context_params cq = cparams_in;
+                            std::vector<float>   tq = ts_in;
+                            std::vector<llama_model_tensor_buft_override> bq = tbo_in;
+                            std::vector<size_t>  gq = margins_in;
+                            mq.tensor_split = tq.data();
+                            if (mparams_in.tensor_buft_overrides == params.tensor_buft_overrides.data()) {
+                                mq.tensor_buft_overrides = bq.data();
+                            }
+                            cq.n_ubatch = ub_t;
+                            common_fit_set_moe_margin_auto(!params.fit_params_target_set);
+                            const common_params_fit_status st_q = common_fit_params(params.model.path.c_str(), &mq, &cq, tq.data(),
+                                bq.empty() ? nullptr : bq.data(), gq.data(), params.fit_params_min_ctx, &extra, fit_log_level, params.fit_kv_resident);
+                            if (st_q == COMMON_PARAMS_FIT_STATUS_SUCCESS && lay(mq) >= l_plain) {
+                                COM_WRN("%s: --fit: k19-kvlong: the draft model would move layers to the CPU (%" PRId64 " of %" PRId64 " layers on the "
+                                    "device with it, %" PRId64 " without it): it stays with the target's n_ubatch %u -> %u "
+                                    "(LLAMA_FIT_DRAFT_LAYERS_FIRST_TUB)\n", __func__, l_with, n_layer + 1, l_plain, cparams_in.n_ubatch, ub_t);
+                                std::copy(tq.begin(), tq.end(), params.tensor_split);
+                                std::copy(bq.begin(), bq.end(), params.tensor_buft_overrides.begin());
+                                params.fit_params_target = gq;
+                                const bool tbo_q = mq.tensor_buft_overrides != nullptr && mq.tensor_buft_overrides == bq.data();
+                                mparams = mq;
+                                cparams = cq;
+                                mparams.tensor_split = params.tensor_split;
+                                if (tbo_q) {
+                                    mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
+                                }
+                                fit_status = st_q;
+                                params.n_ubatch     = (int32_t) ub_t;
+                                params.n_ubatch_set = true;
+                                kept = true;
+                            }
                         }
                     }
                     if (!kept) {
