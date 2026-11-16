@@ -6543,7 +6543,7 @@ static bool ggml_cuda_try_conv_state_defer(ggml_backend_cuda_context * cuda_ctx,
             const ggml_tensor * w = n->src[1];
             const int64_t n_t = n->ne[1];
             if (w == nullptr || w->ne[0] != tail->ne[0] + 1 || n->ne[0] != input->ne[1] || n->ne[2] != input->ne[2] || n_t > 32 ||
-                input->nb[1] != input->ne[0] * (int64_t) sizeof(float) || input->ne[1] % 128 != 0) {
+                input->nb[1] != (size_t) input->ne[0] * sizeof(float) || input->ne[1] % 128 != 0) {
                 return ggml_cuda_conv_cat_refuse(cpy->name, 100 + 3);
             }
             // the LFM2 short conv * c fusion does not take the copies; the outputs the kernel may write must not overlap the input
