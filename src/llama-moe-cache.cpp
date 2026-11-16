@@ -8728,6 +8728,15 @@ struct llama_moe_cache::impl {
     }
     mutable uint64_t n_prefetch_ops = 0; // engagement: prefetch ops built
 
+    // k19-g4tail: this batch is a prompt's and the prefetch is on: no prefetch op (see prefetch_ok); also a graph key (hybrid_mode)
+    bool pf_prompt_off() const {
+        static const bool pf_prompt = [] {
+            const char * e = getenv("LLAMA_MOE_PREFETCH_PROMPT");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        return cm_prompt_now && !pf_prompt && pf_resolved && pf_cfg.n > 0;
+    }
+
     bool prefetch_ok(int32_t il_prev, int32_t il, int64_t n_ubatch) const {
         static const int64_t max_tok = getenv("LLAMA_MOE_PREFETCH_MAX_TOKENS") != nullptr ?
             std::max<int64_t>(1, atoll(getenv("LLAMA_MOE_PREFETCH_MAX_TOKENS"))) : 8;
@@ -8747,6 +8756,13 @@ struct llama_moe_cache::impl {
         }
         // frozen small batches admit nothing (k13), and the prefetch admits
         if (cm && cm_frozen) {
+            return false;
+        }
+        // k19-g4tail: generation and verify windows only (every token an output). A prompt's small tail batch took the prefetch and
+        // moved experts between the host and the device for the first generated token (G4 16 GB long48 first-token KLD outside the
+        // band, plans/k19_g4pref.md round 5). LLAMA_MOE_PREFETCH_PROMPT=1: prompt tails too (as before). A prompt tail graph has fewer
+        // outputs than tokens, so it is never reused for a verify window of the same size or the reverse
+        if (pf_prompt_off()) {
             return false;
         }
         return true;
@@ -9097,11 +9113,12 @@ struct llama_moe_cache::impl {
     int hybrid_mode() const {
         if (cm) {
             // the decisions of every batch size are in the graph: a new decision rebuilds the graphs
-            return 3 + (ov_live ? 4 : 0) + 8*(int) (cm_gen & 0xfffff) + (cm_prompt_off() ? (1 << 28) : 0) + (short_live() ? (1 << 29) : 0);
+            return 3 + (ov_live ? 4 : 0) + 8*(int) (cm_gen & 0xfffff) + (cm_prompt_off() ? (1 << 28) : 0) + (short_live() ? (1 << 29) : 0) +
+                (pf_prompt_off() ? (1 << 30) : 0);
         }
         // a single-graph failure (single_off) rebuilds the graphs without their mailboxes: a reused graph would keep merging from a
         // mailbox whose control block says failed (wrong rows in every later ubatch with a pinned fetch share, LLAMA_MOE_CACHE_FETCH)
-        return (!hybrid ? 0 : hybrid_active() ? 2 : 1) + (ov_live ? 4 : 0) + (single_off ? 8 : 0);
+        return (!hybrid ? 0 : hybrid_active() ? 2 : 1) + (ov_live ? 4 : 0) + (single_off ? 8 : 0) + (pf_prompt_off() ? 16 : 0);
     }
 
     // auto trial, called before the graph of every ubatch while a trial runs or waits, after the previous ubatch finished
