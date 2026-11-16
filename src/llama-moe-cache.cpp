@@ -7332,7 +7332,7 @@ struct llama_moe_cache::impl {
     // c (PCIe is full duplex; on one stream every copy back finished before the first upload began). The side stream starts where the
     // compute stream is (event), every upload into a slot waits for that slot's copy back, and the compute stream has waited for every
     // chunk before the RAM tier commits, so the bytes, slots and their order per slot are unchanged: exact by construction.
-    // LLAMA_MOE_D2H_STREAM=1: on (k19-d2h2: opt-in; unset / 0: on the compute stream as before); LLAMA_MOE_D2H_STREAM_CHUNKS=N (default 4, 2..16)
+    // On by default (k19-d2h3; LLAMA_MOE_D2H_STREAM=0: on the compute stream as before); LLAMA_MOE_D2H_STREAM_CHUNKS=N (default 4, 2..16)
     struct d2h_dev_t {
         bool tried = false;
         ggml_backend_t be = nullptr;
@@ -7340,10 +7340,12 @@ struct llama_moe_cache::impl {
         std::vector<ggml_backend_event_t> ev;
     };
     std::vector<d2h_dev_t> d2h_devs;
-    // (k19-d2h2: opt-in, LLAMA_MOE_D2H_STREAM=1; no gain on Kaggle 2x T4, being measured on the L4's full-duplex link)
+    // (k19-d2h3: Colab L4 full card, Qwen3.8-Flash-Next UD-IQ4_XS from the VM disk (exclusive RAM tier, ~150 GB copied back per run),
+    // 3 interleaved launches: chat 12.5 -> 13.9 tok/s, 8k 11.0 -> 12.5, held-out text 12.4 -> 14.4 / 12.8 -> 14.2, md5 unchanged in
+    // every cell; L4 12 GB (inclusive tier) unchanged. No gain on Kaggle 2x T4 (k19-d2hstream))
     bool d2h_on = [] {
         const char * e = getenv("LLAMA_MOE_D2H_STREAM");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
     int d2h_nchunk = [] {
         const char * e = getenv("LLAMA_MOE_D2H_STREAM_CHUNKS");
