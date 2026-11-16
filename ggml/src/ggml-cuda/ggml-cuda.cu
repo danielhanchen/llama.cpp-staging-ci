@@ -1081,7 +1081,11 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
         return GGML_STATUS_SUCCESS;
     }
 
-    if (ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+    // a lazy buffer (lazy KV) clears every chunk when it backs it (ggml_backend_cuda_buffer_commit / _commit_run), the padding
+    // included, and its tensors are placed before their tail is backed: writing the padding here faulted on the unbacked range
+    // (LLAMA_KV_LAZY=1 with a quantized K/V whose rows are not a multiple of MATRIX_ROW_PADDING)
+    if (ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+            !ctx->lazy) {
         // initialize padding to 0 to avoid possible NaN values
         const size_t original_size = ggml_nbytes(tensor);
         const size_t padded_size = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
