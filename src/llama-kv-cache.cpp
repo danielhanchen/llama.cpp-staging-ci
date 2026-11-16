@@ -455,10 +455,37 @@ llama_kv_cache::llama_kv_cache(
             if (sel_sz > 0) {
                 buf = sp.alloc_lazy(buft, sel_sz);
                 if (buf != nullptr) {
+                    // back the range before the tensors are placed (placing a quantized tensor clears its padding): the offsets as
+                    // ggml_tallocr gives them (each tensor's alloc size padded to the alignment, in order), checked after placing
+                    const size_t align = ggml_backend_buft_get_alignment(buft);
+                    const size_t base  = (size_t) ggml_backend_buffer_get_base(buf);
+                    std::vector<size_t> offs;
+                    bool ok = true;
+                    {
+                        size_t off = GGML_PAD(base, align) - base;
+                        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); ok && t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                            if (t->view_src != nullptr) {
+                                continue;
+                            }
+                            offs.push_back(off);
+                            ok = sp.commit(buf, off, std::min(ggml_nbytes(t), (size_t) sel_r_want*t->nb[1]));
+                            off += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
+                        }
+                    }
+                    ok = ok && sp.commit_host(buf, 0, ggml_backend_buffer_get_size(buf));
+                    if (!ok) {
+                        // every chunk not backed yet in device memory, so the tensors can be placed (a plain cache from here on)
+                        sp.commit(buf, 0, ggml_backend_buffer_get_size(buf));
+                    }
                     ggml_tallocr ta = ggml_tallocr_new(buf);
+                    size_t it_off = 0;
                     for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
-                        if (t->data == nullptr && t->view_src == nullptr && ggml_tallocr_alloc(&ta, t) != GGML_STATUS_SUCCESS) {
-                            throw std::runtime_error("failed to place a tensor of the kv sel buffer");
+                        if (t->data == nullptr && t->view_src == nullptr) {
+                            if (ggml_tallocr_alloc(&ta, t) != GGML_STATUS_SUCCESS) {
+                                throw std::runtime_error("failed to place a tensor of the kv sel buffer");
+                            }
+                            GGML_ASSERT(it_off < offs.size() && (size_t) t->data - base == offs[it_off] && "kv sel: placement differs from the plan");
+                            it_off++;
                         }
                     }
                     for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
@@ -466,19 +493,10 @@ llama_kv_cache::llama_kv_cache(
                             throw std::runtime_error("failed to set a view of the kv sel buffer");
                         }
                     }
-                    const size_t base = (size_t) ggml_backend_buffer_get_base(buf);
-                    bool ok = true;
-                    for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); ok && t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
-                        if (t->view_src == nullptr) {
-                            const size_t off = (size_t) t->data - base;
-                            ok = sp.commit(buf, off, std::min(ggml_nbytes(t), (size_t) sel_r_want*t->nb[1]));
-                        }
-                    }
-                    ok = ok && sp.commit_host(buf, 0, ggml_backend_buffer_get_size(buf));
                     if (!ok) {
                         // (the host chunks backed so far stay; the rest is device memory: a plain cache from here on)
                         LLAMA_LOG_WARN("%s: kv sel: host or device memory for the split K/V buffer failed, the rest is backed in device memory\n", __func__);
-                        if (!sp.commit(buf, 0, ggml_backend_buffer_get_size(buf))) {
+                        if (sel_committed_fn == nullptr && !sp.commit(buf, 0, ggml_backend_buffer_get_size(buf))) {
                             throw std::runtime_error("failed to back the kv sel buffer");
                         }
                     } else {
