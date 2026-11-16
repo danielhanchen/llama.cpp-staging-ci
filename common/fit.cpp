@@ -1661,6 +1661,46 @@ static void common_params_fit_impl(
                             m_ok = m_mib;
                         }
                     }
+                    // k19-kvwin6: beside a KV window ring (whose prompt ubatches need more compute than its decode), no cache may fit at
+                    // the full n_ubatch while every layer does with none: k19-place8 below is then tried from a zero cache. Its safety is
+                    // that of the placement it starts from: every layer and the full-n_ubatch compute buffers fit within the small margin,
+                    // so a released prompt ubatch has the memory it was measured with; the cache only takes the difference to the graphs
+                    // reserved at its small ubatches. Without the k19-place8 cache the placement of before stays.
+                    // LLAMA_FIT_PLACE8_WIN=0 off
+                    bool p8_zero = false;
+                    const char * e_kw = getenv("LLAMA_KV_WIN");
+                    const char * e_ks = getenv("LLAMA_KV_WIN_SINKS");
+                    const int    kw_n = e_kw != nullptr ? atoi(e_kw) : (e_ks != nullptr ? std::max(0, cparams->kv_win) : cparams->kv_win);
+                    const int    ks_n = e_ks != nullptr ? std::max(0, atoi(e_ks)) : cparams->kv_win_sinks;
+                    const bool kv_win_on = kw_n > 0 || (kw_n == 0 && ks_n > 0); // as llama_kv_win_params_from
+                    {
+                        static const bool p8w_on = getenv("LLAMA_FIT_PLACE8_WIN") == nullptr || atoi(getenv("LLAMA_FIT_PLACE8_WIN")) != 0;
+                        if (!ok && p8w_on && kv_win_on && small_mib > 0 && common_fit_place8_on() && cparams->n_ubatch > common_fit_place8_ub()) {
+                            margins[0] = margin_saved - m_default + small_mib*MiB;
+                            cparams->moe_cache_size = 0;
+                            dmds_t d0;
+                            bool   d0_ok = true;
+                            try {
+                                d0 = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                            } catch (const std::runtime_error &) {
+                                d0_ok = false;
+                            }
+                            if (d0_ok) {
+                                add_extra_memory(d0);
+                            }
+                            if (d0_ok && int64_t(d0[0].free) - int64_t(d0[0].mb.total()) >= margins[0]) {
+                                dmds_cpu_moe      = d0;
+                                g_moe_margin_gain = 0;
+                                m_ok              = small_mib;
+                                ok                = true;
+                                p8_zero           = true;
+                            } else {
+                                margins[0]              = margin_saved;
+                                dmds_cpu_moe            = dmds_nc_saved;
+                                cparams->moe_cache_size = size_before;
+                            }
+                        }
+                    }
                     if (ok && cap_mib > 0 && cparams->moe_cache_size > size_t(cap_mib)*MiB && cparams->moe_cache_size <= size_t(cap_below_mib)*MiB) {
                         const size_t  size_unc = cparams->moe_cache_size;
                         const dmds_t  dmds_unc = dmds_cpu_moe;
@@ -1678,7 +1718,7 @@ static void common_params_fit_impl(
                     // k19-tierfix-fit: the run-time reserve (common_fit_small_reserve_mib) is added to the reduced margin, taken from the
                     // cache down to its floor; the placement of before is kept where that one does not fit. Only at the first reduced
                     // margin: a placement that needed the second one (LLAMA_FIT_SMALL_MARGIN_MIN_MIB, the MTP margin) has no room for it
-                    if (ok && m_ok == small_mib) {
+                    if (ok && m_ok == small_mib && !p8_zero) {
                         const int64_t extra_mib = common_fit_small_reserve_mib(int64_t(cparams->moe_cache_size/MiB));
                         if (extra_mib > 0) {
                             const size_t  size_ok   = cparams->moe_cache_size;
@@ -1710,6 +1750,7 @@ static void common_params_fit_impl(
                     // measured on G4 8 GB only: devices with less free memory than LLAMA_FIT_PLACE8_MIN_FREE_MIB (6144) keep the old placement
                     static const int64_t place8_min_free = int64_t(getenv("LLAMA_FIT_PLACE8_MIN_FREE_MIB") != nullptr ?
                         std::max(0, atoi(getenv("LLAMA_FIT_PLACE8_MIN_FREE_MIB"))) : 6144)*MiB;
+                    bool p8_got = false;
                     if (ok && common_fit_place8_on() && cparams->n_ubatch > common_fit_place8_ub() &&
                             (int64_t(dmds_cpu_moe[0].free) >= place8_min_free || hostbound)) {
                         const uint32_t ub_full = cparams->n_ubatch;
@@ -1731,8 +1772,12 @@ static void common_params_fit_impl(
                             return true;
                         };
                         dmds_t d_s;
+                        // k19-kvwin6: context that grows with n_ubatch (the KV window ring holds n_ubatch slots beside its window) keeps the
+                        // size of the full n_ubatch at run time (only the graphs are reserved at ub_rel): not part of the growth, added back below
+                        int64_t ctx_ub = 0;
                         if (measure8(size_ok, d_s)) {
-                            grow = int64_t(dmds_ok[0].mb.total()) - int64_t(d_s[0].mb.total());
+                            ctx_ub = kv_win_on ? std::max<int64_t>(0, int64_t(dmds_ok[0].mb.context) - int64_t(d_s[0].mb.context)) : 0;
+                            grow   = int64_t(dmds_ok[0].mb.total()) - int64_t(d_s[0].mb.total()) - ctx_ub;
                         }
                         // k19-l4poly: a host-bound device takes even a smaller difference (LLAMA_FIT_HOSTBOUND_PLACE8_MIN_MIB, 256 as elsewhere)
                         static const int64_t hb_min = int64_t(getenv("LLAMA_FIT_HOSTBOUND_PLACE8_MIN_MIB") != nullptr ?
@@ -1744,10 +1789,11 @@ static void common_params_fit_impl(
                                 if (!measure8(size_t(req), d8)) {
                                     break;
                                 }
-                                const int64_t s8 = int64_t(d8[0].free) - int64_t(d8[0].mb.total()) - margins[0];
+                                const int64_t s8 = int64_t(d8[0].free) - int64_t(d8[0].mb.total()) - ctx_ub - margins[0];
                                 LOG_TRC("%s: k19-place8: ubatches of up to %u tokens beside a cache of %" PRId64 " MiB: compute %zu MiB, %" PRId64
                                     " MiB over the margin\n", __func__, ub_rel, req/MiB, d8[0].mb.compute/MiB, s8/MiB);
                                 if (s8 >= 0) {
+                                    d8[0].mb.context += size_t(ctx_ub);
                                     dmds_cpu_moe = d8;
                                     got = true;
                                     break;
@@ -1756,6 +1802,7 @@ static void common_params_fit_impl(
                             }
                         }
                         cparams->n_ubatch = ub_full;
+                        p8_got = got;
                         if (got) {
                             LOG_INF("%s: small device: the MoE cache takes the memory of the prompt compute buffers (%" PRId64 " MiB): cache %zu -> "
                                 "%zu MiB; ubatches of more than %u tokens run with the cache banks released (k19-place8; LLAMA_FIT_PLACE8=0 off)\n",
@@ -1783,6 +1830,12 @@ static void common_params_fit_impl(
                             LOG_INF("%s: small device: the MoE cache keeps its size (k19-place8: %" PRId64 " MiB of prompt compute buffers, no "
                                 "larger cache within the margin)\n", __func__, grow/MiB);
                         }
+                    }
+                    if (p8_zero && !p8_got) {
+                        ok = false; // the zero-cache start only stands with the k19-place8 cache: the placement of before (below)
+                    } else if (p8_zero) {
+                        LOG_INF("%s: small device beside the KV window ring: every layer fits at the full n_ubatch without a cache, the k19-place8 "
+                            "cache takes the prompt compute memory (LLAMA_FIT_PLACE8_WIN=0 off)\n", __func__);
                     }
                     if (ok && hostbound) {
                         LOG_INF("%s: small device, host-bound: every layer fits within the margin of %" PRId64 " MiB beside a MoE cache of %zu MiB "
