@@ -7332,7 +7332,9 @@ struct llama_moe_cache::impl {
     // c (PCIe is full duplex; on one stream every copy back finished before the first upload began). The side stream starts where the
     // compute stream is (event), every upload into a slot waits for that slot's copy back, and the compute stream has waited for every
     // chunk before the RAM tier commits, so the bytes, slots and their order per slot are unchanged: exact by construction.
-    // On by default (k19-d2h3; LLAMA_MOE_D2H_STREAM=0: on the compute stream as before); LLAMA_MOE_D2H_STREAM_CHUNKS=N (default 4, 2..16)
+    // On by default on CUDA devices (k19-d2h3; LLAMA_MOE_D2H_STREAM=0: on the compute stream as before; =1: on any device whose backend
+    // gives a second instance and events, e.g. ROCm / Vulkan / Metal / SYCL, which keep the compute stream unless asked: not measured
+    // there); LLAMA_MOE_D2H_STREAM_CHUNKS=N (default 4, 2..16)
     struct d2h_dev_t {
         bool tried = false;
         ggml_backend_t be = nullptr;
@@ -7346,6 +7348,10 @@ struct llama_moe_cache::impl {
     bool d2h_on = [] {
         const char * e = getenv("LLAMA_MOE_D2H_STREAM");
         return e == nullptr || atoi(e) != 0;
+    }();
+    bool d2h_forced = [] {
+        const char * e = getenv("LLAMA_MOE_D2H_STREAM");
+        return e != nullptr && atoi(e) != 0;
     }();
     int d2h_nchunk = [] {
         const char * e = getenv("LLAMA_MOE_D2H_STREAM_CHUNKS");
@@ -7363,6 +7369,11 @@ struct llama_moe_cache::impl {
         if (!d.tried) {
             d.tried = true;
             ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            const char * rname = reg != nullptr ? ggml_backend_reg_name(reg) : nullptr;
+            if (!d2h_forced && (rname == nullptr || strcmp(rname, "CUDA") != 0)) {
+                return nullptr; // (by default CUDA only: the copies back stay on the compute stream)
+            }
             d.be = dev != nullptr ? ggml_backend_dev_init(dev, nullptr) : nullptr;
             bool ok = d.be != nullptr;
             if (ok) {
