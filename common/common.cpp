@@ -3369,7 +3369,7 @@ uma_restart:
         //   attention layer: G4 10 GB, Flash-Next ctx 262144, n_ubatch 1024: every layer on the device and a 3 GB MoE cache, chat
         //   21.4 -> 31.4 tok/s and the 8k prompt 523 -> 918 tok/s, but decode after it 19.9 -> 18.8, and lower still as the context
         //   grows (a QSA layer reads only its selected cells: a gather of those would remove that cost).
-        // - (LLAMA_FIT_LONGCTX_KV4, default on; 0 off) when that still spills layers, or leaves no MoE cache beside host experts: a 4-bit
+        // - opt-in (LLAMA_FIT_LONGCTX_KV4=1) when that still spills layers, or leaves no MoE cache beside host experts: a 4-bit
         //   K/V (q4_0, LLAMA_FIT_LONGCTX_KV4_TYPE) with the same n_ubatch ladder, only without -ctk / -ctv / --kv-window (or LLAMA_KV_WIN)
         //   and for LLAMA_FIT_LONGCTX_KV4_ARCHS (qwen35moe,qwen4exp). k19-kvwin4: in KV window mode by default, the last
         //   LLAMA_FIT_LONGCTX_KV4_WIN (16384) positions and the first LLAMA_FIT_LONGCTX_KV4_SINKS (4) also in a q8_0 ring beside the q4_0
@@ -3416,7 +3416,7 @@ uma_restart:
                 params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && cparams.offload_kqv && !params.no_kv_offload &&
                 mparams.n_gpu_layers == llama_model_default_params().n_gpu_layers &&
                 params.n_ctx > 0 && (int64_t) params.n_ctx > lc_min &&
-                (lc_host != 0 || ub_may || env_i("LLAMA_FIT_LONGCTX_KV4", 1) != 0) &&
+                (lc_host != 0 || ub_may || env_i("LLAMA_FIT_LONGCTX_KV4", 0) != 0) &&
                 [] {
                     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                         if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
@@ -3497,8 +3497,8 @@ uma_restart:
                             best = *c;
                         }
                     }
-                    // the 4-bit K/V step: the same ladder with the K/V on the device (k19-kvwin4: default on, in KV window mode)
-                    const bool kv4_on = env_i("LLAMA_FIT_LONGCTX_KV4", 1) != 0 && !params.cache_type_k_set && !params.cache_type_v_set &&
+                    // the 4-bit K/V step (opt-in): the same ladder with the K/V on the device (k19-kvwin4: in KV window mode)
+                    const bool kv4_on = env_i("LLAMA_FIT_LONGCTX_KV4", 0) != 0 && !params.cache_type_k_set && !params.cache_type_v_set &&
                         params.kv_win < 0 && getenv("LLAMA_KV_WIN") == nullptr && getenv("LLAMA_KV_WIN_SINKS") == nullptr &&
                         (t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0);
                     if (kv4_on && best.ok && (best.layers < n_layer + 1 || (best.n_host > 0 && best.cache == 0))) {
