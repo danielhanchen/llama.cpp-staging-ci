@@ -1121,8 +1121,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         int64_t n_meas = 0, n_cut = 0, n_rows_cut = 0;
         int64_t picks[W] = {};
         int64_t cnt[W] = {}, last_meas[W] = {};      // k19-g4verify: measured passes by width, n_meas at a width's last measurement
-        int64_t n_probe = 0;                         // k19-g4verify: drafts cut to probe a width (see df2_meas)
-        double  k_prior = 4.0;                       // weight of the shape prior in eva_verify_ms, in passes
+        int64_t n_probe = 0;                         // k19-g4verify: windows switched to re-measure the other width (see df2_meas)
         bool    small   = false;                     // k19-g4verify: the rule runs beside a small MoE cache (df2_meas)
         std::vector<int64_t> t_end;                  // per seq: end of the last draft call (0 = nothing pending)
         std::vector<int32_t> w_last;                 // per seq: verify rows of that draft
@@ -1159,7 +1158,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         const double m_ref = eva.v_sum[wr] / eva.v_n[wr];
         const double prior = m_ref * (0.3 + 0.1 * w) / (0.3 + 0.1 * wr);
-        const double k     = eva.k_prior;
+        const double k     = 4.0;
         const double n     = w < eva_t::W ? eva.v_n[w] : 0.0;
         const double m     = n > 0.0 ? eva.v_sum[w] / n : prior;
         return (n * m + k * prior) / (n + k);
@@ -1725,10 +1724,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // fixed costs above underprice wide windows: a verify ubatch of more tokens than the slots hold
                 // (llama_moe_cache_tokens) leaves the device slots and the single-graph host path, so every row's experts run on the
                 // host in an eager split. G4 fn4 Flash-Next 10 GB / 131K and 12 GB / 262K (slots of 3-4 tokens): w3 25-28 ms, w4 31-35,
-                // w7 56-60 ms per pass, not the 32 ms priced, and 47% of chat passes verified 7 rows. There the window comes from this
-                // run's measured costs instead (the EV-auto rule below over every width, each width probed LLAMA_DFLASH_MEAS_PROBES (3)
-                // times before its cost is trusted and re-probed after LLAMA_DFLASH_MEAS_STALE (256) passes without a measurement), with
-                // one sequence and not under the exact verify contract (there the fixed rule keeps the window independent of timing).
+                // w7 56-60 ms per pass, not the 32 ms priced, and 47% of chat passes verified 7 rows; the 3-row short window also left
+                // out w4, about as cheap as w3 there. Its two widths are then the slots' rows (3..4) and the whole draft, priced by this
+                // run's measured passes (see the cut below), with one sequence and not under the exact verify contract (there the fixed
+                // rule keeps the window independent of timing). The measured window over every width (EV-auto) lost here: each width
+                // builds its own graphs, and a server's first requests end before every width is measured (G4 16 GB / 262K 8k -17%).
                 // LLAMA_DFLASH_CACHED_MEASURED=0: the fixed costs
                 static const bool df2_meas_on = [] {
                     const char * e = getenv("LLAMA_DFLASH_CACHED_MEASURED");
@@ -1760,10 +1760,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     eva_mode() == 1 || (n_seq == 1 && df2_cache_on && !df2_cached && df2_frac >= df2_mid_hi && !llama_exact_verify_enabled()));
                 if (use_eva) {
                     eva_init();
-                    if (df2_meas && !eva.small) {
-                        eva.small   = true;
-                        eva.k_prior = 1.0;  // the shape prior (fit to wider caches) is far off here: trust the probes
-                    }
+                    eva.small = eva.small || df2_meas;
                     static bool logged = false;
                     if (!logged) {
                         logged = true;
@@ -1771,7 +1768,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                                 "(MoE cache %s, %.1f%% of the host experts, slots of %d tokens%s; LLAMA_DFLASH_EV_AUTO=0 off)\n",
                                 df2_meas ? "k19-g4verify" : "k19-a100chat", df2_cache_on ? "on" : "off", df2_cache_on ? 100.0*df2_frac : 0.0,
                                 df2_cache_on ? (int) llama_moe_cache_tokens(params.ctx_tgt) : -1,
-                                df2_meas ? ", every width probed; LLAMA_DFLASH_CACHED_MEASURED=0: fixed costs" : "");
+                                df2_meas ? ", the slots' rows or the whole draft; LLAMA_DFLASH_CACHED_MEASURED=0: fixed costs" : "");
                     }
                 }
                 std::vector<float> step_p;
@@ -1918,30 +1915,42 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // the most used width is measured first; at least one draft token stays (an empty draft skips the verify and its timing)
                 if (use_eva && !result.empty()) {
                     static const int64_t warm = getenv("LLAMA_DFLASH_EV_AUTO_WARM") ? atoll(getenv("LLAMA_DFLASH_EV_AUTO_WARM")) : 8;
-                    static const int64_t probes = getenv("LLAMA_DFLASH_MEAS_PROBES") ? atoll(getenv("LLAMA_DFLASH_MEAS_PROBES")) : 3;
-                    static const int64_t stale  = getenv("LLAMA_DFLASH_MEAS_STALE")  ? atoll(getenv("LLAMA_DFLASH_MEAS_STALE"))  : 256;
-                    // k19-g4verify: a width of this draft that is measured fewer than `probes` times, else the one whose last measurement
-                    // is the oldest beyond `stale` passes, is verified as is (one pass); the widest such first
-                    int probe_w = 0;
+                    static const int64_t stale = getenv("LLAMA_DFLASH_MEAS_STALE") ? atoll(getenv("LLAMA_DFLASH_MEAS_STALE")) : 128;
                     if (df2_meas) {
-                        const int w_max = (int) std::min(result.size() + 1, (size_t) eva_t::W - 1);
-                        int64_t oldest = -1;
-                        for (int w = w_max; w >= 2; --w) {
-                            if (eva.cnt[w] < probes) {
-                                probe_w = w;
-                                break;
+                        // k19-g4verify: two widths, as the fixed rule, so few graphs are built and both costs are measured within a
+                        // request: the short window of as many rows as the slots hold (3..4: the single-graph host path batches up to 4
+                        // tokens) and the whole draft, each priced by its measured mean pass (the first pass of a width untimed), the fixed
+                        // costs until then, and the measured acceptance by selector probability. The width not verified for `stale`
+                        // passes is verified once, so a cost measured in a slow stretch is measured again
+                        const size_t w_lo = (size_t) std::max(3, std::min(4, (int) llama_moe_cache_tokens(params.ctx_tgt)));
+                        const size_t w_hi = result.size() + 1;
+                        if (w_lo < w_hi && w_hi < (size_t) eva_t::W) {
+                            const auto cost = [&](size_t w) {
+                                return eva.v_n[w] > 0.0 ? eva.v_sum[w] / eva.v_n[w] :
+                                    df2_cached_cost.first + df2_cached_cost.second * ((double) w - 3.0);
+                            };
+                            const double d_ms = eva.d_n > 0.0 ? eva.d_ms / eva.d_n : 0.0;
+                            double e_tok = 1.0, reach = 1.0, e_lo = 1.0;
+                            for (size_t k = 1; k < w_hi; ++k) {
+                                reach *= eva_f(step_p[k - 1]);
+                                e_tok += reach;
+                                if (k + 1 == w_lo) {
+                                    e_lo = e_tok;
+                                }
                             }
-                            const int64_t age = eva.n_meas - eva.last_meas[w];
-                            if (stale > 0 && age > stale && age > oldest) {
-                                oldest  = age;
-                                probe_w = w;
+                            bool lo = e_lo / (d_ms + cost(w_lo)) > e_tok / (d_ms + cost(w_hi));
+                            const size_t w_other = lo ? w_hi : w_lo;
+                            if (stale > 0 && eva.cnt[w_lo] > 0 && eva.cnt[w_hi] > 0 && eva.n_meas - eva.last_meas[w_other] > stale) {
+                                lo = !lo;
+                                eva.n_probe++;
+                            }
+                            if (lo) {
+                                eva.n_cut++;
+                                eva.n_rows_cut += (int64_t) (w_hi - w_lo);
+                                result.resize(w_lo - 1);
                             }
                         }
-                    }
-                    if (probe_w > 0) {
-                        eva.n_probe++;
-                        result.resize((size_t) probe_w - 1);
-                    } else if (df2_meas || eva.n_meas >= warm) {
+                    } else if (eva.n_meas >= warm) {
                         const double d_ms = eva.d_n > 0.0 ? eva.d_ms / eva.d_n : 0.0;
                         size_t best_k = result.size();
                         double best   = -1.0;
