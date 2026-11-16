@@ -1134,7 +1134,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         double  r_sum = 0.0, r_n = 0.0;              // decayed sums / counts of measured over priced ms
         int64_t n = 0;
         int64_t cnt[eva_t::W] = {};                  // passes by width (the first of a width also builds its graphs: not timed)
-        bool    off_logged = false;
+        int     latched = -1;                        // after 8 timed passes, once per context: 1 = cached costs from 4096, 0 = band
         std::vector<int64_t> t_end;                  // per seq: end of the last draft call (0 = nothing pending)
         std::vector<int32_t> w_last;                 // per seq: verify rows of that draft
         std::vector<double>  c_last;                 // per seq: the band's price of that width
@@ -1733,7 +1733,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }();
                 // k19-g4verify: from position 4096 on the band's costs are used only where its passes run near the price: once 8
                 // passes are timed, a mean of more than LLAMA_DFLASH_CACHED_LOW_LNG_RATIO (2.0) x the priced ms of their width falls
-                // back to the cached costs there. Those passes are host bound, so a further verify row costs a smaller share of a
+                // back to the cached costs there. The choice is made once per context and never revisited, so the windows (and the
+                // text) do not follow later timing; a negative value takes the cached costs from 4096 on without timing. Those passes are host bound, so a further verify row costs a smaller share of a
                 // pass than on G4: L4 12 GB / 131K (4.0%) 8k 586 ms per pass at mean length 2.31 in the band vs 656 ms at 2.93 with
                 // the cached costs (4.4 vs 3.9 tok/s), A100 40 GB @10 (3.4%) 113 vs 133 ms, 2.48 vs 2.88 (21.9 vs 21.5); G4 10 GB
                 // runs at 0.8-1.1 x (8k 26 ms per pass, +9%). Below 4096 the band stays (chat L4 +5%, A100 +9%, G4 +8%). 0 = off
@@ -1910,13 +1911,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     static const float df2_cal[20] = { 0.141f, 0.141f, 0.141f, 0.141f, 0.203f, 0.264f, 0.278f, 0.339f, 0.363f, 0.423f,
                                                        0.460f, 0.492f, 0.583f, 0.614f, 0.614f, 0.619f, 0.657f, 0.748f, 0.814f, 0.929f };
                     const bool   lng   = dp.pos0 >= 4096;
-                    const bool   low_lng_off = lng && df2_low_lng_ratio > 0.0 && lowg.n >= 8 && lowg.r_sum > df2_low_lng_ratio * lowg.r_n;
-                    if (low_lng_off && df2w_cached_costs && df2_low && !lowg.off_logged) {
-                        lowg.off_logged = true;
-                        LOG_INF("%s: k19-g4verify: DFlash2 band passes at %.2f x their priced ms over %lld passes: from position 4096 "
-                                "the cached costs (LLAMA_DFLASH_CACHED_LOW_LNG_RATIO=%.2f)\n", __func__, lowg.r_sum / lowg.r_n,
-                                (long long) lowg.n, df2_low_lng_ratio);
-                    }
+                    const bool   low_lng_off = lng && (df2_low_lng_ratio < 0.0 || (df2_low_lng_ratio > 0.0 && lowg.latched == 1));
                     const bool   low   = df2w_cached_costs && df2_low && !low_lng_off; // k19-g4verify: the small-share band (see df2_low_frac)
                     const size_t w_lo  = low ? (size_t) std::max(3, std::min(4, (int) llama_moe_cache_tokens(params.ctx_tgt))) :
                                          df2w_cached_costs ? 3 : lng ? 3 : 4;  // verify rows of the short window
@@ -2040,7 +2035,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     result.clear();
                 }
                 // k19-g4verify: in the small-share band each pass is timed until its accept, against the band's price of its width
-                if (use_df2w && df2w_cached_costs && df2_low && df2_low_lng_ratio > 0.0 && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+                if (use_df2w && df2w_cached_costs && df2_low && df2_low_lng_ratio > 0.0 && lowg.latched < 0 && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
                     if (lowg.t_end.size() != n_seq) {
                         lowg.t_end.assign(n_seq, 0);
                         lowg.w_last.assign(n_seq, 0);
@@ -2157,6 +2152,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 lowg.r_sum = 0.97 * lowg.r_sum + r;
                 lowg.r_n   = 0.97 * lowg.r_n   + 1.0;
                 lowg.n++;
+                if (lowg.n == 8 && lowg.latched < 0) {
+                    static const double thr = getenv("LLAMA_DFLASH_CACHED_LOW_LNG_RATIO") ? atof(getenv("LLAMA_DFLASH_CACHED_LOW_LNG_RATIO")) : 2.0;
+                    lowg.latched = lowg.r_sum > thr * lowg.r_n ? 1 : 0;
+                    LOG_INF("%s: k19-g4verify: DFlash2 band passes at %.2f x their priced ms (8 passes, LLAMA_DFLASH_CACHED_LOW_LNG_RATIO"
+                            "=%.2f): from position 4096 the %s costs, fixed for this context\n", __func__, lowg.r_sum / lowg.r_n, thr,
+                            lowg.latched ? "cached" : "band");
+                }
             }
         }
         // k19-a100chat: the measured pass cost of the draft's width and the acceptance of its steps (LLAMA_DFLASH_EV_AUTO)
