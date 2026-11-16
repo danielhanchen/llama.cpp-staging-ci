@@ -8668,6 +8668,41 @@ struct llama_moe_cache::impl {
         }
         // (k19-g4pref-optin: the rule only with LLAMA_MOE_PREFETCH_AUTO=1; srv_kld long48 put one position of the 48 GB DFlash2 cell above
         // the -fa off band's max in 2 of 3 runs, 0.135 / 0.159 vs 0.116, and the 512-token chat texts differ from it off after ~300 tokens)
+        // k19-g4tail: LLAMA_MOE_PREFETCH_AUTO=2 (set by the server beside an MTP drafter, see its k19-g4tail rule): only the band where
+        // the placed cache holds LLAMA_MOE_G4TAIL_FRAC_LO .. _HI (0.10 .. 0.20) of the host experts, on compute capability 12.0
+        // devices with device lookups: top 10 predicted experts, at most 1 copied per layer (generation and verify windows only)
+        const char * ea_g4t = getenv("LLAMA_MOE_PREFETCH_AUTO");
+        if (ea_g4t != nullptr && atoi(ea_g4t) == 2) {
+            const double flo = getenv("LLAMA_MOE_G4TAIL_FRAC_LO") ? atof(getenv("LLAMA_MOE_G4TAIL_FRAC_LO")) : 0.10;
+            const double fhi = getenv("LLAMA_MOE_G4TAIL_FRAC_HI") ? atof(getenv("LLAMA_MOE_G4TAIL_FRAC_HI")) : 0.20;
+            int  cmin = INT_MAX;
+            int  cmax = -1;
+            bool anyg = false;
+            for (const group & g : groups) {
+                if (g.n_slots == 0 || !g.dev_lookup) {
+                    continue;
+                }
+                const int cc = pf_backend_cc(devices[g.id].backend);
+                cmin = std::min(cmin, cc);
+                cmax = std::max(cmax, cc);
+                anyg = true;
+            }
+            const bool on = anyg && cmin == 1200 && cmax == 1200 && cache_frac >= flo && cache_frac < fhi;
+            if (on) {
+                c.n        = 10;
+                c.max_fill = em != nullptr ? std::max(0, atoi(em)) : 1;
+                c.min_tok  = et != nullptr ? std::max(1, atoi(et)) : 1;
+            }
+            if (!pf_quiet) {
+                LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4tail: cross-layer prefetch beside the MTP drafter %s: %.1f%% of the host experts "
+                    "cached (band %.2f .. %.2f), %s (top %d predicted experts, at most %d per layer, generation and verify windows only; "
+                    "LLAMA_MOE_G4TAIL=0 off)\n", tag, on ? "on" : "off", 100.0*cache_frac, flo, fhi, !anyg ? "no device lookups" :
+                    !(cmin == 1200 && cmax == 1200) ? "not a compute capability 12.0 device" : on ? "in the band" : "outside the band", c.n, c.max_fill);
+            }
+            pf_cfg = c;
+            pf_resolved = true;
+            return c;
+        }
         if (const char * ea = getenv("LLAMA_MOE_PREFETCH_AUTO"); ea == nullptr || atoi(ea) == 0) {
             if (!pf_quiet) {
                 LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4pref: cross-layer prefetch off by default: LLAMA_MOE_PREFETCH_AUTO=0 (set beside an "
@@ -8728,6 +8763,17 @@ struct llama_moe_cache::impl {
     }
     mutable uint64_t n_prefetch_ops = 0; // engagement: prefetch ops built
 
+    // k19-g4tail: this batch is a prompt's and the prefetch is on: no prefetch op (see prefetch_ok); also a graph key (hybrid_mode)
+    bool pf_prompt_off() const {
+        // (LLAMA_MOE_G4TAIL=0 too: the int3 behaviour of an explicit LLAMA_MOE_PREFETCH)
+        static const bool pf_prompt = [] {
+            const char * e = getenv("LLAMA_MOE_PREFETCH_PROMPT");
+            const char * k = getenv("LLAMA_MOE_G4TAIL");
+            return e != nullptr ? atoi(e) != 0 : k != nullptr && atoi(k) == 0;
+        }();
+        return cm_prompt_now && !pf_prompt && pf_resolved && pf_cfg.n > 0;
+    }
+
     bool prefetch_ok(int32_t il_prev, int32_t il, int64_t n_ubatch) const {
         static const int64_t max_tok = getenv("LLAMA_MOE_PREFETCH_MAX_TOKENS") != nullptr ?
             std::max<int64_t>(1, atoll(getenv("LLAMA_MOE_PREFETCH_MAX_TOKENS"))) : 8;
@@ -8747,6 +8793,13 @@ struct llama_moe_cache::impl {
         }
         // frozen small batches admit nothing (k13), and the prefetch admits
         if (cm && cm_frozen) {
+            return false;
+        }
+        // k19-g4tail: generation and verify windows only (every token an output). A prompt's small tail batch took the prefetch and
+        // moved experts between the host and the device for the first generated token (G4 16 GB long48 first-token KLD outside the
+        // band, plans/k19_g4pref.md round 5). LLAMA_MOE_PREFETCH_PROMPT=1: prompt tails too (as before). A prompt tail graph has fewer
+        // outputs than tokens, so it is never reused for a verify window of the same size or the reverse
+        if (pf_prompt_off()) {
             return false;
         }
         return true;
@@ -9097,11 +9150,12 @@ struct llama_moe_cache::impl {
     int hybrid_mode() const {
         if (cm) {
             // the decisions of every batch size are in the graph: a new decision rebuilds the graphs
-            return 3 + (ov_live ? 4 : 0) + 8*(int) (cm_gen & 0xfffff) + (cm_prompt_off() ? (1 << 28) : 0) + (short_live() ? (1 << 29) : 0);
+            return 3 + (ov_live ? 4 : 0) + 8*(int) (cm_gen & 0xfffff) + (cm_prompt_off() ? (1 << 28) : 0) + (short_live() ? (1 << 29) : 0) +
+                (pf_prompt_off() ? (1 << 30) : 0);
         }
         // a single-graph failure (single_off) rebuilds the graphs without their mailboxes: a reused graph would keep merging from a
         // mailbox whose control block says failed (wrong rows in every later ubatch with a pinned fetch share, LLAMA_MOE_CACHE_FETCH)
-        return (!hybrid ? 0 : hybrid_active() ? 2 : 1) + (ov_live ? 4 : 0) + (single_off ? 8 : 0);
+        return (!hybrid ? 0 : hybrid_active() ? 2 : 1) + (ov_live ? 4 : 0) + (single_off ? 8 : 0) + (pf_prompt_off() ? 16 : 0);
     }
 
     // auto trial, called before the graph of every ubatch while a trial runs or waits, after the previous ubatch finished
