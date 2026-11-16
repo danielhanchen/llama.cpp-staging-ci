@@ -34,6 +34,14 @@ struct rec {
     double ratio   = 0.0; // t_on / t_off measured by the launch that raced it (information: the margin)
 };
 
+// k19-calvpersist: the calibration file key of a pinned run (LLAMA_MOE_CPU_MISS_CAL_VALUES): the machine's key plus the pinned numbers,
+// so the pinned run has a file of its own (its trial verdicts persist) and a launch without the variable never reads pinned numbers
+inline std::string calv_key(const std::string & key, const double v[4]) {
+    char buf[160];
+    snprintf(buf, sizeof(buf), "|calv=%.17g %.17g %.17g %.17g", v[0], v[1], v[2], v[3]);
+    return key + buf;
+}
+
 inline std::string tag_of(long long n_slots, int n_layers, long long max_batch) {
     return "trials|slots=" + std::to_string(n_slots) + "|layers=" + std::to_string(n_layers) + "|max_batch=" + std::to_string(max_batch);
 }

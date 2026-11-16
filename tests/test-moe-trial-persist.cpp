@@ -171,6 +171,35 @@ int main() {
     // too few samples: off, as before
     CHECK(!tp::decide(10.0, 33.0, 2, 13, false, false, m, h), "fewer than 3 samples must be off");
 
+    // k19-calvpersist: a pinned run (LLAMA_MOE_CPU_MISS_CAL_VALUES) has its own file, keyed by calv_key; the library creates it (key +
+    // the pinned numbers, the form of cm_cal_write) before the first trial, so the verdicts persist and a second launch replays them
+    {
+        const double pv[4] = { 20.7, 11.19, 46.7, 41.0 };
+        const double pw[4] = { 20.7, 11.19, 46.7, 41.5 };
+        const std::string kp = tp::calv_key(key, pv);
+        CHECK(kp != key && kp.compare(0, key.size(), key) == 0, "the pinned key extends the machine key");
+        CHECK(kp == tp::calv_key(key, pv) && kp != tp::calv_key(key, pw), "the pinned key is stable and names the values");
+        const std::string pp = dir + "/test_moe_trial_persist_calv_" + std::to_string((long long) std::rand()) + ".txt";
+        std::remove(pp.c_str());
+        std::vector<tp::rec> r1(1);
+        r1[0].on = 0; r1[0].host_ok = 0; r1[0].gap = 64; r1[0].len = 13; r1[0].ratio = 1.78;
+        // before: no file under the pinned run, the verdict write fails (every pinned launch timed its trials again)
+        CHECK(!tp::write(pp, kp, tag12, r1, 1), "no file: nothing written");
+        char line2[160];
+        snprintf(line2, sizeof(line2), "%.17g %.17g %.17g %.17g\n", pv[0], pv[1], pv[2], pv[3]);
+        write_file(pp, kp + "\n" + line2);
+        // launch 1 records its verdict; launch 2 (same key and tag) replays it; the pinned numbers stay readable
+        CHECK(tp::write(pp, kp, tag12, r1, 2), "pinned file: verdict written");
+        std::vector<tp::rec> back;
+        CHECK(tp::read(pp, kp, tag12, back) && back.size() == 1 && back[0].on == 0 && back[0].host_ok == 0 && back[0].len == 13,
+            "launch 2 replays launch 1's verdict");
+        double cv[4];
+        CHECK(cal_read(pp, kp, cv) && cv[0] == pv[0] && cv[3] == pv[3], "the pinned numbers stay readable");
+        // a launch without the variable (machine key) does not read the pinned file
+        CHECK(!tp::read(pp, key, tag12, back) && !cal_read(pp, key, cv), "the machine key does not read the pinned file");
+        std::remove(pp.c_str());
+    }
+
     if (fails == 0) {
         printf("test-moe-trial-persist: OK\n");
     }
