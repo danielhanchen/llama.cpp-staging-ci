@@ -4,6 +4,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "kv-sel.cuh"
 
 #include <cstdint>
 
@@ -1298,6 +1299,10 @@ void launch_fattn(
     ggml_cuda_pool_alloc<half> V2_f16(pool);
     ggml_cuda_pool_alloc<int2> ring_range(pool);
     ggml_cuda_pool_alloc<int>    KV_max(pool);
+    // k19-kvsel: the compact staging of a sparse node whose K / V cells are partly in host memory (allocated right after KV_max)
+    ggml_cuda_pool_alloc<char>   sel_K(pool);
+    ggml_cuda_pool_alloc<char>   sel_V(pool);
+    ggml_cuda_pool_alloc<half>   sel_M(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
 
@@ -1476,6 +1481,23 @@ void launch_fattn(
             ggml_tensor mask_m = *mask; // the QSA maskless rebuild may live in a pool copy
             mask_m.data = const_cast<char *>(mask_data);
             ggml_cuda_flash_attn_ext_compact_mask(&mask_m, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        }
+        // k19-kvsel (LLAMA_KV_SEL_HOST=1): K / V read in place with cells in host memory: gather the listed cells (K, V, mask values) into
+        // device staging in list order and point the lists at it, so the kernel reads device memory and loads the same values in the
+        // same order (results unchanged). One stream, one mask plane, the tiles' lists fitting in the mask's columns
+        const bool v_view = V_data == K_data;
+        if (!probe && ggml_cuda_kv_sel_stage_on() && K_data == (const char *) K->data && (v_view || V_data == (const char *) V->data) &&
+                mask->ne[3] == 1 && K->ne[3] == 1 && Q->ne[3] == 1 && int64_t(n_lists)*n_kv_max <= mask->ne[0] &&
+                K->nb[1] % 4 == 0 && (v_view || V->nb[1] % 4 == 0) &&
+                (ggml_cuda_buffer_has_host_chunks(K->buffer) || (!v_view && ggml_cuda_buffer_has_host_chunks(V->buffer)))) {
+            char * kc = sel_K.alloc(size_t(n_lists)*n_kv_max*K->nb[1]);
+            char * vc = v_view ? kc : sel_V.alloc(size_t(n_lists)*n_kv_max*V->nb[1]);
+            half * mc = sel_M.alloc(ggml_nbytes(mask)/sizeof(half));
+            ggml_cuda_kv_sel_stage(K_data, K->nb[1], v_view ? nullptr : V_data, V->nb[1], (const half *) mask_data, mask->nb[1]/sizeof(half),
+                KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, (int) n_lists, ncols1, (int) mask->ne[1], n_kv_max, kc, vc, mc, main_stream);
+            K_data    = kc;
+            V_data    = vc;
+            mask_data = (const char *) mc;
         }
     }
 

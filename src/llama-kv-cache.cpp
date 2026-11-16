@@ -1710,11 +1710,11 @@ void llama_kv_cache::sel_stats_tick() {
     if (fn == nullptr) {
         return;
     }
-    uint64_t c[4] = {};
+    uint64_t c[5] = {};
     fn(c);
-    LLAMA_LOG_INFO("%s: kv sel stats: %" PRIu64 " batches, host reads of selected cells %.2f MiB (%.1f KiB per batch), staged host reads "
-        "%.2f MiB, attention nodes %" PRIu64 " (%" PRIu64 " with host chunks)\n", __func__, sel_batches, c[0]/1048576.0,
-        c[0]/1024.0/(double) sel_batches, c[1]/1048576.0, c[2], c[3]);
+    LLAMA_LOG_INFO("%s: kv sel stats: %" PRIu64 " batches, host reads of selected cells %.2f MiB (%.1f KiB per batch), whole-range host reads "
+        "%.2f MiB, attention nodes %" PRIu64 " (%" PRIu64 " with host chunks, %" PRIu64 " gathered to device staging)\n", __func__, sel_batches,
+        c[0]/1048576.0, c[0]/1024.0/(double) sel_batches, c[1]/1048576.0, c[2], c[3], c[4]);
 }
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, std::vector<purge_backup> * purged) {

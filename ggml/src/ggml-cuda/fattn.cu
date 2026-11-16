@@ -1323,6 +1323,7 @@ int64_t ggml_cuda_flash_attn_ext_kv_len_sig(ggml_backend_cuda_context & ctx, con
 static unsigned long long * ggml_cuda_kv_sel_ctr[GGML_CUDA_MAX_DEVICES] = {};
 static std::atomic<uint64_t> ggml_cuda_kv_sel_staged{0};
 static std::atomic<uint64_t> ggml_cuda_kv_sel_nodes_host{0};
+static std::atomic<uint64_t> ggml_cuda_kv_sel_nodes_staged{0};
 
 static __device__ __forceinline__ unsigned long long kv_sel_cell_host_bytes(const int32_t c, const char * K, const size_t nbk,
         const char * V, const size_t nbv, const char * base, const size_t gran, const uint8_t * map) {
@@ -1429,8 +1430,62 @@ static void ggml_cuda_kv_sel_count(ggml_backend_cuda_context & ctx, const ggml_t
     CUDA_CHECK(cudaGetLastError());
 }
 
+// k19-kvsel staging (see ggml_cuda_kv_sel_stage): one warp per listed cell copies its K row, its V row and the mask values of the
+// tile's query rows, then points the list entry at the staging row (lane 0, after every lane has read the cell)
+template <typename T>
+static __global__ void kv_sel_stage_kernel(const char * __restrict__ K, const size_t nbk, const char * __restrict__ V, const size_t nbv,
+        const half * __restrict__ mask, const int64_t s31, int32_t * __restrict__ indices, const int32_t * __restrict__ counts,
+        const int ncols1, const int n_rows, const int n_kv_max, char * __restrict__ K_c, char * __restrict__ V_c, half * __restrict__ M_c) {
+    const int l    = blockIdx.y;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int j    = blockIdx.x*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
+    if (j >= counts[l]) {
+        return;
+    }
+    int32_t * idx = indices + (size_t) l*n_kv_max;
+    const int32_t c   = idx[j];
+    const int64_t dst = (int64_t) l*n_kv_max + j;
+    {
+        const T * src = (const T *) (K + (size_t) c*nbk);
+        T * d = (T *) (K_c + (size_t) dst*nbk);
+        for (size_t i = lane; i < nbk/sizeof(T); i += WARP_SIZE) {
+            d[i] = src[i];
+        }
+    }
+    if (V != nullptr) {
+        const T * src = (const T *) (V + (size_t) c*nbv);
+        T * d = (T *) (V_c + (size_t) dst*nbv);
+        for (size_t i = lane; i < nbv/sizeof(T); i += WARP_SIZE) {
+            d[i] = src[i];
+        }
+    }
+    for (int r = l*ncols1 + lane; r < min(n_rows, (l + 1)*ncols1); r += WARP_SIZE) {
+        M_c[r*s31 + dst] = mask[r*s31 + c];
+    }
+    __syncwarp();
+    if (lane == 0) {
+        idx[j] = (int32_t) dst;
+    }
+}
+
+void ggml_cuda_kv_sel_stage(const char * K, size_t nbk, const char * V, size_t nbv, const half * mask, int64_t s31,
+        int32_t * indices, const int32_t * counts, int ntiles, int ncols1, int n_rows, int n_kv_max,
+        char * K_c, char * V_c, half * M_c, cudaStream_t stream) {
+    ggml_cuda_kv_sel_nodes_staged++;
+    constexpr int warps = 8;
+    const dim3 grid((n_kv_max + warps - 1)/warps, ntiles, 1);
+    const bool v16 = nbk % 16 == 0 && (V == nullptr || nbv % 16 == 0) && (uintptr_t) K % 16 == 0 && (uintptr_t) K_c % 16 == 0 &&
+        (V == nullptr || ((uintptr_t) V % 16 == 0 && (uintptr_t) V_c % 16 == 0));
+    if (v16) {
+        kv_sel_stage_kernel<int4><<<grid, warps*WARP_SIZE, 0, stream>>>(K, nbk, V, nbv, mask, s31, indices, counts, ncols1, n_rows, n_kv_max, K_c, V_c, M_c);
+    } else {
+        kv_sel_stage_kernel<int><<<grid, warps*WARP_SIZE, 0, stream>>>(K, nbk, V, nbv, mask, s31, indices, counts, ncols1, n_rows, n_kv_max, K_c, V_c, M_c);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_kv_sel_stats(uint64_t * out) {
-    out[0] = out[1] = out[2] = out[3] = 0;
+    out[0] = out[1] = out[2] = out[3] = out[4] = 0;
     for (int d = 0; d < ggml_backend_cuda_get_device_count() && d < GGML_CUDA_MAX_DEVICES; ++d) {
         if (ggml_cuda_kv_sel_ctr[d] == nullptr) {
             continue;
@@ -1444,6 +1499,7 @@ void ggml_cuda_kv_sel_stats(uint64_t * out) {
     }
     out[1] = ggml_cuda_kv_sel_staged.load();
     out[3] = ggml_cuda_kv_sel_nodes_host.load();
+    out[4] = ggml_cuda_kv_sel_nodes_staged.load();
 }
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

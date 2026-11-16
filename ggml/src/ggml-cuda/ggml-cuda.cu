@@ -965,6 +965,7 @@ struct ggml_backend_cuda_buffer_context {
     // chunk_host_dev: a device copy of chunk_host for the host read counter (LLAMA_KV_SEL_STATS), allocated once, refreshed on changes
     std::vector<uint8_t> chunk_host;
     uint8_t * chunk_host_dev = nullptr;
+    size_t n_host_chunks = 0;
 #endif
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
@@ -1460,6 +1461,7 @@ static size_t ggml_backend_cuda_buffer_decommit(ggml_backend_buffer_t buffer, si
             ctx->runs[j]   = 0;
             if (host) {
                 ctx->chunk_host[j] = 0;
+                ctx->n_host_chunks--;
             }
         }
         if (!host) {
@@ -1693,6 +1695,7 @@ static bool ggml_backend_cuda_buffer_commit_host(ggml_backend_buffer_t buffer, s
             ctx->chunks[i]     = h;
             ctx->runs[i]       = 1;
             ctx->chunk_host[i] = 1;
+            ctx->n_host_chunks++;
             CUDA_CHECK(cudaMemsetAsync((void *) at, 0, ctx->lazy_gran, cudaStreamPerThread));
         }
     }
@@ -1760,6 +1763,7 @@ static size_t ggml_backend_cuda_buffer_move(ggml_backend_buffer_t buffer, size_t
         CU_CHECK(cuMemSetAccess(at, ctx->lazy_gran, &access, 1));
         ctx->chunks[i]     = h;
         ctx->chunk_host[i] = to_host ? 1 : 0;
+        ctx->n_host_chunks = to_host ? ctx->n_host_chunks + 1 : ctx->n_host_chunks - 1;
         ggml_cuda_own_add(ctx->device, to_host ? -(int64_t) ctx->lazy_gran : (int64_t) ctx->lazy_gran);
         moved += ctx->lazy_gran;
     }
@@ -1773,6 +1777,19 @@ static size_t ggml_backend_cuda_buffer_move(ggml_backend_buffer_t buffer, size_t
     GGML_UNUSED(size);
     GGML_UNUSED(to_host);
     return SIZE_MAX;
+#endif
+}
+
+bool ggml_cuda_buffer_has_host_chunks(const ggml_backend_buffer * buf) {
+    if (buf == nullptr || !ggml_backend_buffer_is_cuda(const_cast<ggml_backend_buffer_t>(buf))) {
+        return false;
+    }
+    const ggml_backend_cuda_buffer_context * ctx = (const ggml_backend_cuda_buffer_context *) buf->context;
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    return ctx->lazy && ctx->n_host_chunks > 0;
+#else
+    GGML_UNUSED(ctx);
+    return false;
 #endif
 }
 
