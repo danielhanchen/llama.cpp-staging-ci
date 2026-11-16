@@ -204,6 +204,12 @@ bool llama_kv_cache::win_init(const llama_kv_win_params & p) {
     return true;
 }
 
+// LLAMA_KV_WIN_STATE_RUNS=0: the ring rows of a state blob are copied one row per call (as before the runs; same bytes)
+static bool kv_win_state_runs() {
+    static const bool on = getenv("LLAMA_KV_WIN_STATE_RUNS") == nullptr || atoi(getenv("LLAMA_KV_WIN_STATE_RUNS")) != 0;
+    return on;
+}
+
 bool llama_kv_cache::win_slot_live(uint32_t strm, int32_t j) const {
     const auto & rg = v_rings[strm];
     const int32_t c = rg.slot_cell[j];
@@ -714,8 +720,15 @@ void llama_kv_cache::state_write_win(llama_io_write_i & io, const cell_ranges_t 
             }
             const uint64_t row = w->nb[1];
             io.write(&row, sizeof(row));
-            for (const int32_t j : slots) {
-                io.write_tensor(w, ((size_t) strm*(win_r + 1) + j)*row, row);
+            // runs of consecutive slots in one copy each (a row per copy cost a device read per row: ~75k reads per server
+            // checkpoint of a 3328-slot ring); the bytes written are the same, row by row in the cells' order
+            for (size_t k = 0; k < slots.size(); ) {
+                size_t n = 1;
+                while (kv_win_state_runs() && k + n < slots.size() && slots[k + n] == slots[k] + (int32_t) n) {
+                    ++n;
+                }
+                io.write_tensor(w, ((size_t) strm*(win_r + 1) + slots[k])*row, n*row);
+                k += n;
             }
         }
     }
@@ -789,13 +802,20 @@ bool llama_kv_cache::state_read_win(llama_io_read_i & io, uint32_t strm, uint32_
                 LLAMA_LOG_ERROR("%s: k19-kvwin: mismatched ring row size (%zu != %zu)\n", __func__, (size_t) row, (size_t) w->nb[1]);
                 return false;
             }
-            for (const int32_t j : slots) {
+            // runs of consecutive target slots in one copy each (see state_write_win)
+            for (size_t k = 0; k < slots.size(); ) {
+                const int32_t j = slots[k];
+                size_t n = 1;
                 if (w != nullptr && j >= 0) {
-                    io.read_tensor(w, ((size_t) strm*(win_r + 1) + j)*row, row);
+                    while (kv_win_state_runs() && k + n < slots.size() && slots[k + n] == j + (int32_t) n) {
+                        ++n;
+                    }
+                    io.read_tensor(w, ((size_t) strm*(win_r + 1) + j)*row, n*row);
                 } else {
                     scratch.resize(row);
                     io.read(scratch.data(), row);
                 }
+                k += n;
             }
         }
     }
