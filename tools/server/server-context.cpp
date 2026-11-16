@@ -2014,6 +2014,8 @@ private:
 
     bool sleeping = false;
     int32_t spec_active_cap = 0; // k19-small1115: drafts per window while another slot is active (0: no cut; load_model)
+    bool    spec_g4t_raised = false; // k19-g4tail: the rule raised the MTP windows to n_def drafts (load_model)
+    int32_t spec_g4t_cap    = 0;     // k19-g4tail2: drafts per window when the placed MoE cache is outside the band (0: no cut)
 
     int64_t t_last_load_progress_ms = 0;
 
@@ -2299,8 +2301,24 @@ private:
                 }();
                 const double g4t_lo = getenv("LLAMA_MOE_G4TAIL_LO") != nullptr ? atof(getenv("LLAMA_MOE_G4TAIL_LO")) : 0.07;
                 const double g4t_hi = getenv("LLAMA_MOE_G4TAIL_HI") != nullptr ? atof(getenv("LLAMA_MOE_G4TAIL_HI")) : 0.17;
-                const bool g4t = !def_on && g4tail_on && exp_b > 0 && short_b > 0 && resident && share >= g4t_lo && share < g4t_hi &&
+                // k19-g4tail2: not above LLAMA_FIT_LONGCTX_MIN_CTX (32768, where --fit's long-context ladder takes over; n_ctx 0 = the
+                // trained context counts as above): there the deeper windows changed the fit itself. G4 16 GB ctx 262144: priced at 4
+                // drafts the requantized drafter was left out, and the placement moved (49 layers, n_ubatch 2048, cache 6233 MiB against
+                // 50 layers, n_ubatch 512, 3915 MiB with the rule off): decode chat / 8k 87.4 / 82.3 tok/s against 133.0 / 125.2. Above the
+                // bound the rule sets nothing, as LLAMA_MOE_G4TAIL=0
+                const int64_t g4t_ctx_max = [] {
+                    const char * x = getenv("LLAMA_FIT_LONGCTX_MIN_CTX");
+                    return x != nullptr && x[0] != 0 ? (int64_t) atoll(x) : (int64_t) 32768;
+                }();
+                const bool g4t_ctx_ok = params.n_ctx > 0 && (int64_t) params.n_ctx <= g4t_ctx_max;
+                const bool g4t_band = !def_on && g4tail_on && exp_b > 0 && short_b > 0 && resident && share >= g4t_lo && share < g4t_hi &&
                     n_gpu > 0 && cc_min == 1200 && cc_max == 1200;
+                const bool g4t = g4t_band && g4t_ctx_ok;
+                if (g4t_band && !g4t_ctx_ok) {
+                    SRV_INF("k19-g4tail2: n_ctx %d is above LLAMA_FIT_LONGCTX_MIN_CTX (%lld): the g4tail rule stays off (MTP windows and "
+                        "the prefetch as with LLAMA_MOE_G4TAIL=0)\n", params.n_ctx, (long long) g4t_ctx_max);
+                }
+                spec_g4t_raised = g4t;
                 if (def_on || g4t) {
                     depth_cached = n_def;
                     // (a model on a memory file system: its experts are in RAM whatever MemAvailable reads)
@@ -2330,6 +2348,15 @@ private:
                     expert_bytes/1048576.0, ram_avail/1048576.0);
             }
             if (deep_cached) {
+                // k19-g4tail2: under the g4tail rule --fit admits the drafter by the verify cost of the windows it had before the rule
+                // (fit_n_max). The windows of n_def drafts then stand only where the placed cache takes the prefetch band (after
+                // common_init_from_params below), else they are cut back to 2. G4 16 GB ctx 262144 (r1): priced at 4 drafts the
+                // requantized drafter needed a cache of 4 tokens per layer, left 3.2 and was left out, decode without drafts 87.8 / 81.7
+                // tok/s chat / 8k against 132.7 / 123.8 with the rule off (LLAMA_MOE_G4TAIL_PLACED_GATE=0: priced at n_def, as before)
+                const char * pg = getenv("LLAMA_MOE_G4TAIL_PLACED_GATE");
+                if (spec_g4t_raised && (pg == nullptr || atoi(pg) != 0)) {
+                    sp.draft.fit_n_max = sp.draft.n_max;
+                }
                 sp.draft.n_floor     = 2;
                 sp.draft.n_max       = std::min(depth_cached, 8);
                 sp.draft.deep_cached = true;
@@ -2507,6 +2534,22 @@ private:
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
+
+        // k19-g4tail2: the rule's windows of n_def drafts stand only where the placed MoE cache took its prefetch band (the cache
+        // publishes LLAMA_MOE_G4TAIL_PLACED once placed). Its estimate before the fit leaves out the KV cache of n_ctx: at 262144 the
+        // placed cache is smaller than at the measured 32768, and 4-draft windows beside a cache below the band were never measured
+        // to pay. Outside the band: 2 drafts per window, as without the rule (LLAMA_MOE_G4TAIL_PLACED_GATE=0: keep the windows)
+        if (spec_g4t_raised && ctx_tgt != nullptr) {
+            const char * pg = getenv("LLAMA_MOE_G4TAIL_PLACED_GATE");
+            const char * pl = getenv("LLAMA_MOE_G4TAIL_PLACED");
+            if ((pg == nullptr || atoi(pg) != 0) && (pl == nullptr || atoi(pl) == 0)) {
+                spec_g4t_cap = 2;
+                SRV_INF("k19-g4tail2: the placed MoE cache is outside the prefetch band (%s): MTP windows of 2 drafts "
+                    "(LLAMA_MOE_G4TAIL_PLACED_GATE=0: keep the wider windows)\n", pl == nullptr ? "no verdict" : "verdict off");
+            } else if (pl != nullptr && atoi(pl) != 0) {
+                SRV_INF("%s", "k19-g4tail2: the placed MoE cache is in the prefetch band: the wider MTP windows stay\n");
+            }
+        }
 
         if (model_tgt == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
@@ -5528,6 +5571,9 @@ private:
                 int n_draft_max = slot.get_n_draft_max();
                 if (spec_floor_cap > 0) {
                     n_draft_max = std::min(n_draft_max, spec_floor_cap);
+                }
+                if (spec_g4t_cap > 0) {
+                    n_draft_max = std::min(n_draft_max, spec_g4t_cap);
                 }
 
                 slot.gov_step = 0;

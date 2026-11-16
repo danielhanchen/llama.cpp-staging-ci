@@ -2740,7 +2740,10 @@ static bool common_fit_draft_on_cpu(
     double v_ratio = -1.0;
     if (common_moe_slot_bytes_of(params.model.path, sbt_v) && sbt_v.n_used > 0 && sbt_v.n_expert > sbt_v.n_used) {
         const double q = 1.0 - (double) sbt_v.n_used/(double) sbt_v.n_expert;
-        const int    n = std::max(1, common_speculative_n_max(&params.speculative)) + 1;
+        // (k19-g4tail2: the server's g4tail rule widens the windows only where its placed cache takes the prefetch band, else they
+        // stay at the drafts the drafter was admitted for, fit_n_max; a floor from the wider windows left the drafter out instead)
+        const int    n_fit = params.speculative.draft.fit_n_max > 0 ? params.speculative.draft.fit_n_max : common_speculative_n_max(&params.speculative);
+        const int    n = std::max(1, n_fit) + 1;
         v_ratio = (double) sbt_v.n_expert/(double) sbt_v.n_used*(1.0 - std::pow(q, n));
     }
     double v_max = 3.5;

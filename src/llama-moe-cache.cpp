@@ -8695,6 +8695,16 @@ struct llama_moe_cache::impl {
                 c.min_tok  = et != nullptr ? std::max(1, atoi(et)) : 1;
             }
             if (!pf_quiet) {
+                // k19-g4tail2: the server reads the placed verdict after the load and keeps 2 drafts per window where the placed cache
+                // is outside the band (its own rule only sees an estimate made before the fit, without the KV cache of n_ctx)
+                // (only "1" is written: another cache of the process, e.g. a drafter's, never clears the target's verdict)
+                if (on) {
+#if defined(_WIN32)
+                    _putenv_s("LLAMA_MOE_G4TAIL_PLACED", "1");
+#else
+                    setenv("LLAMA_MOE_G4TAIL_PLACED", "1", 1);
+#endif
+                }
                 LLAMA_LOG_INFO("llama_moe_cache%s: k19-g4tail: cross-layer prefetch beside the MTP drafter %s: %.1f%% of the host experts "
                     "cached (band %.2f .. %.2f), %s (top %d predicted experts, at most %d per layer, generation and verify windows only; "
                     "LLAMA_MOE_G4TAIL=0 off)\n", tag, on ? "on" : "off", 100.0*cache_frac, flo, fhi, !anyg ? "no device lookups" :
