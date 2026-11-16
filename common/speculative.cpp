@@ -1898,16 +1898,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const double c_lo  = low ? df2_low_cost.first  : df2w_cached_costs ? (df2_mid ? df2_mid_cost.first  : df2_cached_cost.first)  : lng ? 11.05 : 11.80; // ms per pass at w_lo
                     const double slope = low ? df2_low_cost.second : df2w_cached_costs ? (df2_mid ? df2_mid_cost.second : df2_cached_cost.second) : lng ? 1.125 : 0.933; // ms per further row
                     if (w_lo < w_hi) {
-                        double e_tok = 1.0, reach = 1.0, e_lo = 0.0;
+                        double e_tok = 1.0, reach = 1.0, e_lo = 0.0, e_3 = 0.0;
                         for (size_t k = 1; k < w_hi; ++k) {
                             reach *= df2_cal[std::min(19, std::max(0, (int) (step_p[k - 1] * 20)))];
                             e_tok += reach;
                             if (k + 1 == w_lo) {
                                 e_lo = e_tok;
                             }
+                            if (k + 1 == 3) {
+                                e_3 = e_tok;
+                            }
                         }
                         const double c_hi = c_lo + slope * (double) (w_hi - w_lo);
-                        if (e_lo / c_lo > e_tok / c_hi) {
+                        // k19-g4verify: in the small-share band 3 rows stay a third choice below the slots' rows (at 8k the steps past the
+                        // third are accepted less often: G4 10 GB 8k, the 4-row window alone 77.1 vs 82.0 tok/s for 3-or-4)
+                        const double c_3 = c_lo - slope * (double) (w_lo - 3);
+                        const bool   use3 = low && w_lo > 3 && c_3 > 0.0 && e_3 / c_3 > e_lo / c_lo && e_3 / c_3 > e_tok / c_hi;
+                        if (use3) {
+                            result.resize(2);
+                        } else if (e_lo / c_lo > e_tok / c_hi) {
                             result.resize(w_lo - 1);
                         }
                     }
