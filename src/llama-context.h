@@ -447,6 +447,7 @@ public:
     // staging memory of the pp graph per backend), returns false if it does not fit
     static std::atomic<bool> g_fit_seed_priced; // k16-fit: a memory probe priced the seed graph (sched_reserve)
     static bool fit_seed_price_on();             // LLAMA_FIT_SEED_PRICE (default on)
+    static int64_t seed_own_min();               // LLAMA_MOE_CACHE_SEED_OWN_MIN (default 1024): smallest prefetched ubatch that seeds from its own ids
     bool seed_price_wanted() const;              // k16-seed: the cache holds the experts of few tokens (LLAMA_FIT_SEED_PRICE_MAX_TOKENS)
     bool sched_reserve_seed(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const std::vector<size_t> & staging_pp);
 

@@ -3794,6 +3794,17 @@ void llama_context::moe_cache_devseed_fallback(bool host_seed_fits) {
 // k16-fit: set once a memory probe of this process priced a seed graph (sched_reserve): the fit then made room for it
 std::atomic<bool> llama_context::g_fit_seed_priced{false};
 
+// k19-df2reg: a prefetched ubatch without an earlier routing (a prompt of one large ubatch, e.g. a 640-token chat turn) seeds the
+// MoE cache from its own ids only from LLAMA_MOE_CACHE_SEED_OWN_MIN (1024) tokens on, as the device seed (moe_cache_devseed_fallback).
+// The seed of a chat-sized prompt replaced the cache and RAM-tier experts the decode after it reads: the seed graph fits beside
+// the DFlash2 drafter since the one-node QSA selection mask (200 MiB smaller), and there Colab L4 Flash-Next full card chat decode
+// read 55% more from the disk (8.2 vs 5.4 GB) and ran 14-19% slower with the same text. Smaller ubatches run as when the seed graph
+// does not fit (count_seed_skipped). LLAMA_MOE_CACHE_SEED_OWN_MIN=0: every such ubatch seeds, as before
+int64_t llama_context::seed_own_min() {
+    static const int64_t v = getenv("LLAMA_MOE_CACHE_SEED_OWN_MIN") != nullptr ? std::max<int64_t>(0, atoll(getenv("LLAMA_MOE_CACHE_SEED_OWN_MIN"))) : 1024;
+    return v;
+}
+
 bool llama_context::fit_seed_price_on() {
     static const bool on = getenv("LLAMA_FIT_SEED_PRICE") == nullptr || atoi(getenv("LLAMA_FIT_SEED_PRICE")) != 0;
     return on;
@@ -7665,7 +7676,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
         if (seed_k >= 1 && group[seed_k].n_outputs == 0) {
             src_k = seed_k - 1;
-        } else if (seed_k >= 1 && moe_cache_seed_fits && moe_cache_seed_sync) {
+        } else if (seed_k >= 1 && moe_cache_seed_fits && moe_cache_seed_sync && (int64_t) group[seed_k].ub->n_tokens >= seed_own_min()) {
             src_k = seed_k;
         } else if (seed_k >= 1) {
             moe_cache->count_seed_skipped();
@@ -10303,7 +10314,7 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
         } else if (moe_cache_seed_sync) {
             if (n_outputs_ub == 0 && moe_cache->has_seed_counts()) {
                 moe_cache_seed_prev = true;
-            } else if (moe_cache_seed_fits) {
+            } else if (moe_cache_seed_fits && (int64_t) ubatch.n_tokens >= seed_own_min()) {
                 moe_cache_seed = true;
             } else {
                 // the graph of this seed was not reserved (see sched_reserve_seed), the ubatch runs as with LLAMA_MOE_CACHE_SEED=1
