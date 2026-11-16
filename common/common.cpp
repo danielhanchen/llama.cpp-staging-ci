@@ -3701,6 +3701,7 @@ uma_restart:
 
         bool draft_cpu = false;
         bool draft_needs_target = false;
+        common_fit_draft_host_exps_set(false); // this fit's own placement (a model loaded again in the same process starts over)
         {
             const char * env_last = getenv("LLAMA_FIT_DRAFT_LAST");
             const bool   last     = has_draft && params.moe_cache_size > 0 && params.speculative.draft.n_gpu_layers == -1 &&
@@ -3725,7 +3726,7 @@ uma_restart:
                     params.speculative.draft.n_ubatch     = (int32_t) hx.n_ubatch;
                     params.speculative.draft.cache_type_k = hx.type_k;
                     params.speculative.draft.cache_type_v = hx.type_v;
-                    params.speculative.draft.fit_host_exps = true;
+                    common_fit_draft_host_exps_set(true);
                     cparams_dft.n_ubatch = hx.n_ubatch;
                     cparams_dft.type_k   = hx.type_k;
                     cparams_dft.type_v   = hx.type_v;
@@ -4290,7 +4291,7 @@ uma_restart:
                         }
                         // the host-expert placement the drafter already has (common_fit_draft_on_cpu set it, the fit with it gave l_with):
                         // the same fit again only with the lend below, which is what can change its outcome
-                        const bool hx_have = params.speculative.draft.fit_host_exps;
+                        const bool hx_have = common_fit_draft_host_exps_get();
                         // k19-mtpkeep (LLAMA_FIT_DRAFT_HOST_EXPS_LEND=0 off): the drafter's device weights and compute buffers are lent to
                         // the target's prompt ubatches that run with the cache banks released (layer-major groups: LLAMA_MTP_DRAFT_LEND;
                         // single released ubatches: LLAMA_MOE_PLACE8_LEND, which this sets), so this fit counts only its K / V beside
@@ -4376,7 +4377,7 @@ uma_restart:
                                 params.speculative.draft.n_ubatch     = (int32_t) cp_dft_hx.n_ubatch;
                                 params.speculative.draft.cache_type_k = cp_dft_hx.type_k;
                                 params.speculative.draft.cache_type_v = cp_dft_hx.type_v;
-                                params.speculative.draft.fit_host_exps = true;
+                                common_fit_draft_host_exps_set(true);
                                 cparams_dft.n_ubatch   = cp_dft_hx.n_ubatch;
                                 cparams_dft.type_k     = cp_dft_hx.type_k;
                                 cparams_dft.type_v     = cp_dft_hx.type_v;

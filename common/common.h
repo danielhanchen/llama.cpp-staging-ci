@@ -366,9 +366,6 @@ struct common_params_speculative_draft {
     bool fit_can_drop = false;
     bool fit_on_cpu   = false;
     bool fit_off      = false;
-    // k19-mtpkeep: the fit placed an MTP draft model's experts in host memory (common_fit_draft_hx); its context then runs without op
-    // offload (see common_base_params_to_speculative)
-    bool fit_host_exps = false;
     int32_t n_ubatch = 0; // physical batch size of the draft context (0 - use the target's n_ubatch)
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K

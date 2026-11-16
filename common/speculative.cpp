@@ -4491,6 +4491,16 @@ static bool common_mtp_borrow_io_ok(const std::string & path_tgt, const std::str
     return true;
 }
 
+static bool g_fit_draft_host_exps = false;
+
+void common_fit_draft_host_exps_set(bool on) {
+    g_fit_draft_host_exps = on;
+}
+
+bool common_fit_draft_host_exps_get() {
+    return g_fit_draft_host_exps;
+}
+
 common_params common_base_params_to_speculative(const common_params & params) {
     const bool has_draft = params.speculative.has_dft();
 
@@ -4547,7 +4557,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // k19-mtpkeep: a draft whose experts the fit placed in host memory runs without op offload: its prompt rows only write K / V and
     // its draft steps are a few rows, so the expert products stay on the CPU, and the graph reserve does not keep a device copy of an
     // expert tensor (850 MiB for the Q8_0 MTP layer of Qwen3.8-Flash-Next) that no batch would use. LLAMA_FIT_DRAFT_HOST_EXPS_NO_OFFLOAD=0 off
-    if (params_spec.fit_host_exps && common_fit_draft_host_exps_no_offload()) {
+    if (common_fit_draft_host_exps_get() && common_fit_draft_host_exps_no_offload()) {
         result.no_op_offload = true;
     }
     result.n_ubatch      = (int32_t) common_draft_n_ubatch(params, (uint32_t) params.n_ubatch);

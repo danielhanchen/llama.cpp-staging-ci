@@ -48,6 +48,12 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
 common_params common_base_params_to_speculative(const common_params & params);
 
 // k19-mtpkeep: LLAMA_FIT_DRAFT_HOST_EXPS_NO_OFFLOAD (default on): a draft with fit-placed host experts runs without op offload
+// k19-mtpkeep: the fit placed the MTP draft model's experts in host memory (common_fit_draft_hx); its context then runs without op
+// offload (see common_base_params_to_speculative). Process-wide, not a field of common_params: that struct keeps its layout, so a
+// binary built against the previous headers still runs with this library
+void common_fit_draft_host_exps_set(bool on);
+bool common_fit_draft_host_exps_get();
+
 inline bool common_fit_draft_host_exps_no_offload() {
     static const bool on = getenv("LLAMA_FIT_DRAFT_HOST_EXPS_NO_OFFLOAD") == nullptr || atoi(getenv("LLAMA_FIT_DRAFT_HOST_EXPS_NO_OFFLOAD")) != 0;
     return on;
