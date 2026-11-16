@@ -10483,6 +10483,23 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// k19-kvsel: test_flash_attn_ext with the sparse preference (op_params[5] = 1) that qwen4exp sets on attention whose K / V cells are partly
+// in host memory: the CUDA backend then gathers the selected cells for 1-2 row quantized decode too (instead of the vector kernel)
+struct test_flash_attn_ext_sparse_pref : public test_flash_attn_ext {
+    test_flash_attn_ext_sparse_pref(int64_t hs, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb, ggml_type type_kv, int64_t n_kv_max)
+        : test_flash_attn_ext(hs, hsv, nh, nr23, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_kv, type_kv, {0, 1, 2, 3}, true, false, n_kv_max) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",sparse_pref=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_flash_attn_ext::build_graph(ctx);
+        out->op_params[5] = 1;
+        return out;
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -14396,6 +14413,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
     // quantized cache, deep enough to take the sparse path
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2048));
+    // k19-kvsel: Flash-Next decode / verify rows over a quantized cache that ask for the selected-cell gather (op_params[5] = 1)
+    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_F16}) {
+        for (int nb : {1, 2, 5}) {
+            for (int64_t kv : {8192, 40960}) {
+                test_cases.emplace_back(new test_flash_attn_ext_sparse_pref(256, 256, 2, {12, 1}, kv, nb, t, 2051));
+            }
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
     // single head with quantized K (MMQ on Vulkan)
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 1, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));

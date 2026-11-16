@@ -1041,13 +1041,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     return BEST_FATTN_KERNEL_VEC;
                 }
             } else {
-                if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-                    if (Q->ne[1] <= 2) {
-                        return BEST_FATTN_KERNEL_VEC;
-                    }
-                } else {
-                    if (Q->ne[1] == 1) {
-                        return BEST_FATTN_KERNEL_VEC;
+                // k19-kvsel: a node that asks for the selected-cell gather (op_params[5] == 1: its K / V cells partly in host memory,
+                // see qwen4exp build_attn_qsa) takes the sparse MMA kernel where it applies; the vector kernel walks every cell
+                const bool sparse_pref = dst->op_params[5] == 1 && gqa_opt_applies && gqa_ratio > 4 &&
+                    ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(K->ne[0], V->ne[0], 1, 8) &&
+                    ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, 8);
+                if (!sparse_pref) {
+                    if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+                        if (Q->ne[1] <= 2) {
+                            return BEST_FATTN_KERNEL_VEC;
+                        }
+                    } else {
+                        if (Q->ne[1] == 1) {
+                            return BEST_FATTN_KERNEL_VEC;
+                        }
                     }
                 }
             }
