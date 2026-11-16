@@ -6289,11 +6289,14 @@ private:
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     // k11: under layer-major prompts the batch goes on past the far checkpoint, its ubatches end there
                                     // (only when the rest up to the near checkpoint fits this batch: else the batches, so the ubatches, would differ)
-                                    // k15-pp (LLAMA_LM_CKPT_MERGE_SPAN=0 off): only where the group spans the break; elsewhere the separate
+                                    // k15-pp (LLAMA_LM_CKPT_MERGE_SPAN, default on; =0 off): only where the group spans the break; elsewhere the separate
                                     // calls seed the cache between them and the merge only lost that (q4x 12 GB 640-token prompt: +14% uploads)
-                                    // off by default (LLAMA_LM_CKPT_MERGE_SPAN=1 on): G4 gemma-4 26B-A4B UD-Q3_K_M 8 GB chat TTFT 0.151 -> 0.185 s with
-                                    // it, for +3% / -2% q4x 12 GB chat / 2k decode and no q4x TTFT gain (plans/k15_rebench.md section 5d)
-                                    static const bool lm_span_env = getenv("LLAMA_LM_CKPT_MERGE_SPAN") != nullptr && atoi(getenv("LLAMA_LM_CKPT_MERGE_SPAN")) != 0;
+                                    // k19-mergespan: on by default again (LLAMA_LM_CKPT_MERGE_SPAN=0 = merge every eligible break). Without it the
+                                    // merge changed one first token of 48 on G4 Flash-Next 32 GB long48 (first-token top-1 0.979 vs a -fa off band of
+                                    // 1.000, p99 at the band edge) in two launches; with it long48 is byte-identical to the merge off and the 8k TTFT
+                                    // stays the merge's (1.553 vs 1.551 s, merge off 2.030 s). Cost: G4 gemma-4 26B-A4B UD-Q3_K_M 8 GB chat TTFT
+                                    // 0.151 -> 0.185 s (measured 10-25, the reason it had been off)
+                                    static const bool lm_span_env = getenv("LLAMA_LM_CKPT_MERGE_SPAN") == nullptr || atoi(getenv("LLAMA_LM_CKPT_MERGE_SPAN")) != 0;
                                     if (k == 0 && offset != 4 && batch.size() + (n_last - 4) <= n_batch && lm_ckpt_merge_ok(slot, n_tokens_prev, lm) &&
                                             (!lm_span_env || llama_layer_major_spans(ctx_tgt, (int32_t) batch.size(), n_last - 4))) {
                                         lm_breaks.push_back(batch.size());
