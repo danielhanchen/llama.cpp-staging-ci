@@ -767,6 +767,16 @@ llama_context::llama_context(
             prefetch_dense_min_batch = INT64_MAX;
         } else if (GGML_SCHED_PREFETCH_MIN_BATCH) {
             prefetch_min_batch = std::max(1, atoi(GGML_SCHED_PREFETCH_MIN_BATCH));
+        } else if (cparams.moe_cache_size > 0 && cparams.n_ubatch > 2*llama_moe_cache::n_small_max &&
+                   (int64_t) cparams.n_ubatch <= prefetch_min_batch + llama_moe_cache::n_small_max &&
+                   (getenv("LLAMA_LM_SHORT_MEMBER") == nullptr || atoi(getenv("LLAMA_LM_SHORT_MEMBER")) != 0)) {
+            // k19-g4verify: the server makes its far prompt checkpoint 4 + n_ubatch tokens before the end, which leaves a ubatch of
+            // n_ubatch - 4 tokens. At n_ubatch 256 that is below the 256 above, so the layer-major group broke there and that ubatch
+            // and the last one each read every host expert in a pass of their own (G4 Flash-Next 12 GB / 262K, 8k prompt at -ub 256:
+            // 201 GB copied, 1529 tok/s; with the member in the group 2177 tok/s). At an n_ubatch of at most 256 + 32 the limit is
+            // n_ubatch - 32, so such ubatches are prefetched like full ones. LLAMA_LM_SHORT_MEMBER=0 or GGML_SCHED_PREFETCH_MIN_BATCH
+            // set: as before
+            prefetch_min_batch = std::min<int64_t>(prefetch_min_batch, (int64_t) cparams.n_ubatch - llama_moe_cache::n_small_max);
         }
 
         // by default only if n_ubatch gets the staging arena anyway: the shorter ubatches of a prompt then reuse it, while with a smaller
