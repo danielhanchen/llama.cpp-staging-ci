@@ -3217,12 +3217,19 @@ uma_restart:
             uint32_t ub      = 0;     // n_ubatch after the fit
             uint32_t ub_req  = 0;     // n_ubatch asked for (0: as given)
             ggml_type type   = GGML_TYPE_COUNT; // K/V type
+            int32_t  win     = -1;    // k19-kvwin4: KV window ring positions (-1: none)
         };
+        // k19-kvwin4: the KV window ring (n_win, n_sinks) a probe fits with (-1: as given)
+        int32_t probe_win = -1, probe_win_sinks = 0;
         const auto probe = [&](ggml_type t, bool kvo, uint32_t ub) {
             kv_probe r;
             const auto one = [&](bool with_extra, kv_probe & o) {
                 llama_model_params   mp = mparams;
                 llama_context_params cp = cparams;
+                if (probe_win >= 0) {
+                    cp.kv_win       = probe_win;
+                    cp.kv_win_sinks = probe_win_sinks;
+                }
                 std::vector<float>   ts(params.tensor_split, params.tensor_split + 128);
                 std::vector<llama_model_tensor_buft_override> tbo = params.tensor_buft_overrides;
                 std::vector<size_t>  mg = params.fit_params_target;
@@ -3257,6 +3264,7 @@ uma_restart:
                 o.ub     = cp.n_ubatch;
                 o.ub_req = ub;
                 o.type   = t;
+                o.win    = probe_win;
                 o.n_ctx  = cp.n_ctx;
                 o.layers = mp.n_gpu_layers == llama_model_default_params().n_gpu_layers || mp.n_gpu_layers < 0 ? n_layer + 1 : mp.n_gpu_layers;
                 o.mtp    = with_extra && spec_mtp && !has_draft;
@@ -3361,10 +3369,13 @@ uma_restart:
         //   attention layer: G4 10 GB, Flash-Next ctx 262144, n_ubatch 1024: every layer on the device and a 3 GB MoE cache, chat
         //   21.4 -> 31.4 tok/s and the 8k prompt 523 -> 918 tok/s, but decode after it 19.9 -> 18.8, and lower still as the context
         //   grows (a QSA layer reads only its selected cells: a gather of those would remove that cost).
-        // - opt-in (LLAMA_FIT_LONGCTX_KV4=1): when that still spills layers, a 4-bit K/V (q4_0, LLAMA_FIT_LONGCTX_KV4_TYPE) with the same
-        //   n_ubatch ladder, only without -ctk / -ctv and for LLAMA_FIT_LONGCTX_KV4_ARCHS (qwen35moe,qwen4exp). Lossy beyond the f16 band.
-        //   G4 10 GB, Flash-Next ctx 262144: q4_0 at n_ubatch 512 keeps every layer and a 2 GB MoE cache on the device (compute buffer
-        //   583 MiB against 1841 MiB with q8_0): chat 21.4 -> 83.8 tok/s, decode after an 8k prompt 19.9 -> 78.5.
+        // - (LLAMA_FIT_LONGCTX_KV4, default on; 0 off) when that still spills layers, or leaves no MoE cache beside host experts: a 4-bit
+        //   K/V (q4_0, LLAMA_FIT_LONGCTX_KV4_TYPE) with the same n_ubatch ladder, only without -ctk / -ctv / --kv-window (or LLAMA_KV_WIN)
+        //   and for LLAMA_FIT_LONGCTX_KV4_ARCHS (qwen35moe,qwen4exp). k19-kvwin4: in KV window mode by default, the last
+        //   LLAMA_FIT_LONGCTX_KV4_WIN (1024) positions and the first LLAMA_FIT_LONGCTX_KV4_SINKS (4) also in a q8_0 ring beside the q4_0
+        //   cache (LLAMA_FIT_LONGCTX_KV4_WIN=0: the plain 4-bit cache). G4 10 GB, Flash-Next ctx 262144: q4_0 at n_ubatch 512 keeps every
+        //   layer and a 2 GB MoE cache on the device (compute buffer 583 MiB against 1841 MiB with q8_0): chat 21.4 -> 83.8 tok/s, decode
+        //   after an 8k prompt 19.9 -> 78.5; with the window decode KLD .0050 (q8_0 .0048, plain q4_0 .0123), the 8k prompt -2% vs plain.
         // A trade is kept only when it puts more layers on the device (then the larger MoE cache, then the MTP drafter); the K/V in host
         // memory is preferred over the smaller n_ubatch when both give the same layers (LLAMA_FIT_LONGCTX_PREFER=ub: the other way).
         // Only with flash attention not off, the K/V placement and -ngl not given, a MoE model and n_ctx above LLAMA_FIT_LONGCTX_MIN_CTX
@@ -3402,7 +3413,7 @@ uma_restart:
                 params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && cparams.offload_kqv && !params.no_kv_offload &&
                 mparams.n_gpu_layers == llama_model_default_params().n_gpu_layers &&
                 params.n_ctx > 0 && (int64_t) params.n_ctx > lc_min &&
-                (lc_host != 0 || ub_may || (getenv("LLAMA_FIT_LONGCTX_KV4") != nullptr && atoi(getenv("LLAMA_FIT_LONGCTX_KV4")) != 0)) &&
+                (lc_host != 0 || ub_may || env_i("LLAMA_FIT_LONGCTX_KV4", 1) != 0) &&
                 [] {
                     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                         if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
@@ -3483,11 +3494,11 @@ uma_restart:
                             best = *c;
                         }
                     }
-                    // the 4-bit K/V step (opt-in): the same ladder with the K/V on the device
-                    const char * kv4_env = getenv("LLAMA_FIT_LONGCTX_KV4");
-                    const bool   kv4_on  = kv4_env != nullptr && atoi(kv4_env) != 0 && !params.cache_type_k_set && !params.cache_type_v_set &&
+                    // the 4-bit K/V step: the same ladder with the K/V on the device (k19-kvwin4: default on, in KV window mode)
+                    const bool kv4_on = env_i("LLAMA_FIT_LONGCTX_KV4", 1) != 0 && !params.cache_type_k_set && !params.cache_type_v_set &&
+                        params.kv_win < 0 && getenv("LLAMA_KV_WIN") == nullptr && getenv("LLAMA_KV_WIN_SINKS") == nullptr &&
                         (t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0);
-                    if (kv4_on && best.ok && best.layers < n_layer + 1) {
+                    if (kv4_on && best.ok && (best.layers < n_layer + 1 || (best.n_host > 0 && best.cache == 0))) {
                         const char * e_t = getenv("LLAMA_FIT_LONGCTX_KV4_TYPE");
                         ggml_type t4 = GGML_TYPE_Q4_0;
                         if (e_t != nullptr && e_t[0] != 0) {
@@ -3502,6 +3513,9 @@ uma_restart:
                         const std::string arch = common_gguf_arch(params.model.path);
                         const std::string archs = std::string(",") + (e_ar != nullptr ? e_ar : "qwen35moe,qwen4exp") + ",";
                         if (!arch.empty() && archs.find("," + arch + ",") != std::string::npos) {
+                            const int64_t w4 = env_i("LLAMA_FIT_LONGCTX_KV4_WIN", 1024);
+                            probe_win       = w4 > 0 ? (int32_t) w4 : -1;
+                            probe_win_sinks = w4 > 0 ? (int32_t) std::max<int64_t>(0, env_i("LLAMA_FIT_LONGCTX_KV4_SINKS", 4)) : 0;
                             kv_probe best4;
                             for (uint32_t ub = cparams.n_ubatch; ub >= 1 && (ub == cparams.n_ubatch || ((int64_t) ub >= lc_ubmin && ub_may)); ub /= 2) {
                                 const kv_probe c = probe(t4, true, ub == cparams.n_ubatch ? 0 : ub);
@@ -3513,6 +3527,8 @@ uma_restart:
                                     break;
                                 }
                             }
+                            probe_win = -1;
+                            probe_win_sinks = 0;
                             if (better(best4, best)) {
                                 best = best4;
                             }
@@ -3520,11 +3536,19 @@ uma_restart:
                     }
                     std::string list;
                     for (const auto & c : tried) {
-                        list += string_format("%s%s %s ub %u: %s", list.empty() ? "" : "; ", ggml_type_name(c.type), c.kvo ? "K/V device" : "K/V host", c.ub,
+                        list += string_format("%s%s%s %s ub %u: %s", list.empty() ? "" : "; ", ggml_type_name(c.type),
+                            c.win >= 0 ? string_format(" + q8_0 window %d", c.win).c_str() : "", c.kvo ? "K/V device" : "K/V host", c.ub,
                             c.ok ? string_format("%" PRId64 " layers, MoE cache %" PRId64 " MiB", c.layers, c.cache/(1024*1024)).c_str() : "fit failed");
                     }
-                    const bool changed = best.ok && (best.kvo != a.kvo || best.ub_req != 0 || best.type != a.type);
+                    const bool changed = best.ok && (best.kvo != a.kvo || best.ub_req != 0 || best.type != a.type || best.win >= 0);
                     if (changed) {
+                        if (best.win >= 0) {
+                            // the KV window ring beside the 4-bit cache (as --kv-window / --kv-sinks)
+                            params.kv_win        = best.win;
+                            params.kv_win_sinks  = (int32_t) std::max<int64_t>(0, env_i("LLAMA_FIT_LONGCTX_KV4_SINKS", 4));
+                            cparams.kv_win       = params.kv_win;
+                            cparams.kv_win_sinks = params.kv_win_sinks;
+                        }
                         if (!best.kvo) {
                             params.no_kv_offload    = true;
                             cparams.offload_kqv     = false;
@@ -3546,7 +3570,9 @@ uma_restart:
                     COM_INF("%s: --fit: ctx %u: %s (as given: %" PRId64 " / %" PRId64 " layers, MoE cache %" PRId64 " MiB, n_ubatch %u; %s; "
                         "LLAMA_FIT_LONGCTX=0 keeps it)\n", __func__, a.n_ctx,
                         !changed ? "no long-context trade puts more on the device" :
-                        string_format("K/V %s %s, n_ubatch %u: %" PRId64 " layers, MoE cache %" PRId64 " MiB", ggml_type_name(best.type),
+                        string_format("K/V %s%s %s, n_ubatch %u: %" PRId64 " layers, MoE cache %" PRId64 " MiB", ggml_type_name(best.type),
+                            best.win >= 0 ? string_format(" + q8_0 window of the last %d and first %d positions", best.win,
+                                (int) std::max<int64_t>(0, env_i("LLAMA_FIT_LONGCTX_KV4_SINKS", 4))).c_str() : "",
                             best.kvo ? "on the device" : "in host memory", best.ub, best.layers, best.cache/(1024*1024)).c_str(),
                         a.layers, n_layer + 1, a.cache/(1024*1024), a.ub, list.c_str());
                 }
