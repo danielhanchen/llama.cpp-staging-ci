@@ -2333,6 +2333,15 @@ private:
                     expert_bytes/1048576.0, ram_avail/1048576.0);
             }
             if (deep_cached) {
+                // k19-g4tail2: under the g4tail rule --fit admits the drafter by the verify cost of the windows it had before the rule
+                // (fit_n_max). The windows of n_def drafts then stand only where the placed cache takes the prefetch band (after
+                // common_init_from_params below), else they are cut back to 2. G4 16 GB ctx 262144 (r1): priced at 4 drafts the
+                // requantized drafter needed a cache of 4 tokens per layer, left 3.2 and was left out, decode without drafts 87.8 / 81.7
+                // tok/s chat / 8k against 132.7 / 123.8 with the rule off (LLAMA_MOE_G4TAIL_PLACED_GATE=0: priced at n_def, as before)
+                const char * pg = getenv("LLAMA_MOE_G4TAIL_PLACED_GATE");
+                if (spec_g4t_raised && (pg == nullptr || atoi(pg) != 0)) {
+                    sp.draft.fit_n_max = sp.draft.n_max;
+                }
                 sp.draft.n_floor     = 2;
                 sp.draft.n_max       = std::min(depth_cached, 8);
                 sp.draft.deep_cached = true;
