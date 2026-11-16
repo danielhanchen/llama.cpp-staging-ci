@@ -1217,6 +1217,7 @@ struct llama_moe_cache::impl {
     std::vector<llama_moe_tp::rec> cmt_rec;   // replayed and appended verdicts, in trial order
     size_t   cmt_rec_file = 0;            // how many of them came from the file
     bool     cmt_rec_dirty = false;       // timed verdicts not in the file yet
+    bool     cmt_ps_warned = false;       // k19-calvpersist: a failed verdict write was logged
     std::string cmt_ps_path, cmt_ps_key, cmt_ps_tag;
     int      cmt_len_now = 0;             // counted small batches of the running trial (cmt_done before an early end)
     // k15-pred r22b, short prompts (LLAMA_MOE_CPU_MISS_PROMPT_AUTO=1, opt-in; 2 = every size a candidate, diagnostic): a prompt ubatch of max_batch + 1 .. cm_max
@@ -9354,6 +9355,21 @@ struct llama_moe_cache::impl {
     }
 
     // what the timings depend on: the device, the host threads and CPU count, the cache (main / MTP) and the expert form
+    // k19-calvpersist: the pinned calibration (LLAMA_MOE_CPU_MISS_CAL_VALUES="t1 dt tup split", tests / benchmarks), or nullptr. A pinned
+    // run keeps its own calibration file (the key names the values), so the trial verdicts it times persist and replay as on a user
+    // machine, and a later launch without the variable never reads the pinned numbers as a calibration of this machine
+    static const char * cm_cal_values(double v[4]) {
+        const char * fv = getenv("LLAMA_MOE_CPU_MISS_CAL_VALUES");
+        if (fv != nullptr && sscanf(fv, "%lf %lf %lf %lf", &v[0], &v[1], &v[2], &v[3]) == 4 && v[0] > 0.0 && v[2] > 0.0) {
+            return fv;
+        }
+        return nullptr;
+    }
+    std::string cm_cal_key_eff(const group & g, const layer & l) const {
+        double v[4];
+        const std::string k = cm_cal_key(g, l);
+        return cm_cal_values(v) != nullptr ? llama_moe_tp::calv_key(k, v) : k;
+    }
     std::string cm_cal_key(const group & g, const layer & l) const {
         // the format version and the build: an upgraded binary times the host again instead of reusing older numbers (a build without
         // git metadata reports commit "unknown": then the content of libllama and the CPU backend module stands in, llama-build-id.h)
@@ -9464,7 +9480,7 @@ struct llama_moe_cache::impl {
                     LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: no calibration directory (LLAMA_MOE_CPU_MISS_CAL_DIR / LLAMA_CACHE / HOME unset): timed in every launch\n", tag);
                     return;
                 }
-                const std::string key  = cm_cal_key(g, layers[g.layers[0]]);
+                const std::string key  = cm_cal_key_eff(g, layers[g.layers[0]]);
                 const std::string path = cm_cal_path(dir, key);
                 double v[4];
                 const bool have = cm_persist_mode() == 1 && cm_cal_read(path, key, v);
@@ -9532,12 +9548,27 @@ struct llama_moe_cache::impl {
         }
         // LLAMA_MOE_CPU_MISS_CAL_VALUES="t1 dt tup split" (us; tests): decide from these numbers, no timing, no file, no re-calibration
         if (!recal) {
-            const char * fv = getenv("LLAMA_MOE_CPU_MISS_CAL_VALUES");
             double v[4];
-            if (fv != nullptr && sscanf(fv, "%lf %lf %lf %lf", &v[0], &v[1], &v[2], &v[3]) == 4 && v[0] > 0.0 && v[2] > 0.0) {
+            const char * fv = cm_cal_values(v);
+            if (fv != nullptr) {
                 cm_t1 = v[0]; cm_dt = v[1]; cm_tup = v[2]; cm_split = v[3];
                 cm_from_file = true;
                 LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: calibration from LLAMA_MOE_CPU_MISS_CAL_VALUES (%s)\n", tag, fv);
+                // k19-calvpersist: the pinned run's calibration file (key + pinned values), so the trial verdicts can be recorded in it
+                // (k19-cmtpersist writes them only into an existing file); without it every pinned launch timed its trials again
+                const std::string dir = persist != 0 ? cm_cal_dir() : std::string();
+                if (!dir.empty()) {
+                    const std::string key  = cm_cal_key_eff(g, l);
+                    const std::string path = cm_cal_path(dir, key);
+                    double w[4];
+                    if (!cm_cal_read(path, key, w)) {
+                        std::copy(v, v + 4, w);
+                        if (!cm_cal_write(dir, path, key, w, false)) {
+                            LLAMA_LOG_WARN("llama_moe_cache%s: CPU misses: could not create the calibration file %s for the pinned values: trial "
+                                "verdicts are timed in every launch\n", tag, path.c_str());
+                        }
+                    }
+                }
                 cm_calibrate_finish(false, g, t_start);
                 return;
             }
@@ -10093,7 +10124,7 @@ struct llama_moe_cache::impl {
         for (const group & g : groups) {
             slots += g.n_slots;
         }
-        cmt_ps_key   = cm_cal_key(*gp, layers[gp->layers[0]]);
+        cmt_ps_key   = cm_cal_key_eff(*gp, layers[gp->layers[0]]);
         cmt_ps_path  = cm_cal_path(dir, cmt_ps_key);
         cmt_ps_tag   = llama_moe_tp::tag_of(slots, (int) layers.size(), (long long) max_batch);
         cmt_ps_state = 1;
@@ -10113,6 +10144,11 @@ struct llama_moe_cache::impl {
         if (llama_moe_tp::write(cmt_ps_path, cmt_ps_key, cmt_ps_tag, cmt_rec, (long long) ggml_time_us())) {
             cmt_rec_dirty = false;
             LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: %zu trial verdict(s) written to %s\n", tag, cmt_rec.size(), cmt_ps_path.c_str());
+        } else if (!cmt_ps_warned) {
+            // k19-calvpersist: the write needs the calibration file (its key on the first line); say so instead of failing silently
+            cmt_ps_warned = true;
+            LLAMA_LOG_WARN("llama_moe_cache%s: CPU misses: %zu trial verdict(s) not written to %s (no calibration file with this key, or "
+                "not writable): the next launch times its trials again\n", tag, cmt_rec.size(), cmt_ps_path.c_str());
         }
     }
 
