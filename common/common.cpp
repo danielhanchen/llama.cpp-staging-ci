@@ -4149,6 +4149,13 @@ uma_restart:
                         common_set_env("LLAMA_FIT_DRAFT_DROPPED", "1");
                         llama_context_params cp_plain = cparams;
                         common_fit_plain_launch(params, cp_plain);
+                        // the context runs as a launch without a drafter (cparams.spec_draft is off): its prompts keep their layer-major
+                        // groups only with this mark, which the MoE cache rules set for a launch without -md (they still see the drafter
+                        // here). Without it the G4 16 GB ctx 262144 8k prompt ran ubatch by ubatch, 1860 tok/s against 5743 without -md
+                        // (same placement, same text). LLAMA_MOE_LAYER_MAJOR_NODRAFT=0 keeps it off
+                        if (const char * e_nd = getenv("LLAMA_MOE_LAYER_MAJOR_NODRAFT"); e_nd == nullptr || atoi(e_nd) != 0) {
+                            common_set_env("LLAMA_MOE_LAYER_MAJOR_AUTO_NODRAFT", "1");
+                        }
                     }
                 }
             }
