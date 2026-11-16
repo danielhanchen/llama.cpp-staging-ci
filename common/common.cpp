@@ -2578,10 +2578,23 @@ bool common_fit_dflash_draft_bytes(const char * path_dft, const llama_context_pa
 // --fit with a separate draft model and a MoE cache: true if the draft model should run on the CPU (see common_init_result)
 // the main model is fitted alone with an unbounded cache (on copies of the parameters), which gives the memory left after its layers;
 // the draft model's device memory at that context size must fit in what the requested cache leaves, plus at most max_frac of the cache
+// k19-mtpkeep: an MTP draft model refused at its device size is weighed again with its expert matrices in host memory (computed on the
+// CPU for the drafter's few rows per step), a small n_ubatch (its prompt rows only write K / V, see LLAMA_MTP_PROMPT_KV_ONLY) and the
+// target's K / V types. G4 10 / 12 GB, Qwen3.8-Flash-Next UD-IQ4_XS ctx 131072 / 262144 + its Q8_0 MTP GGUF: 3519 / 4100 MiB of
+// device memory at its file's placement (2550 MiB of it the experts of its MoE layer, 2495 MiB of compute at n_ubatch 2048 on the
+// whole card), 2019 / 2600 MiB requantized, against a cache of 2524 / 2272 MiB: refused, so Studio's MTP never drafted there.
+// The caller applies the placement (the draft's tensor overrides, n_ubatch, cache types) to the draft params
+struct common_fit_draft_hx {
+    bool      on       = false;
+    uint32_t  n_ubatch = 0;
+    ggml_type type_k   = GGML_TYPE_F16;
+    ggml_type type_v   = GGML_TYPE_F16;
+};
+
 static bool common_fit_draft_on_cpu(
         const common_params & params, const llama_model_params & mparams, const llama_context_params & cparams,
         const llama_model_params & mparams_dft, llama_context_params cparams_dft, const std::string & path_dft, ggml_log_level log_level,
-        bool * needs_target = nullptr) {
+        bool * needs_target = nullptr, common_fit_draft_hx * hx = nullptr) {
     constexpr double MiB = 1024.0*1024.0;
     // default 0.25 (k15-pp: 0.60 admits more drafts, +13..55% decode, but the drafter's own prompt pass, about 29 us per prompt token
     // plus about 50 ms per request, then sits on every prompt: G4 TTFT +8..18%, +42% at Flash-Next UD-IQ1_S 16 GB 16k, where the smaller
@@ -2626,13 +2639,86 @@ static bool common_fit_draft_on_cpu(
     // k19-kvlong (LLAMA_FIT_PLACE8_DRAFT=1, opt-in, measurement): the draft model is weighed against that cache by the rules below
     // as on a mid-size device (what a small drafter buys against the cache it takes, G4 10 / 12 GB at long contexts)
     static const bool place8_draft = getenv("LLAMA_FIT_PLACE8_DRAFT") != nullptr && atoi(getenv("LLAMA_FIT_PLACE8_DRAFT")) != 0;
+    // k19-mtpkeep (LLAMA_FIT_DRAFT_HOST_EXPS, default on; 0 = off): only where the draft would be left out otherwise, for an MTP draft
+    // model whose experts are not already placed by the user (-cmoed / -otd)
+    static const bool hx_env = getenv("LLAMA_FIT_DRAFT_HOST_EXPS") == nullptr || atoi(getenv("LLAMA_FIT_DRAFT_HOST_EXPS")) != 0;
+    bool hx_user = false;
+    for (const llama_model_tensor_buft_override * p = mparams_dft.tensor_buft_overrides; p != nullptr && p->pattern != nullptr && !hx_user; ++p) {
+        hx_user = strstr(p->pattern, "exps") != nullptr;
+    }
+    const bool hx_ok = hx_env && hx != nullptr && cparams_dft.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !hx_user;
+    bool hx_only = false;
     if (common_fit_place8() && !common_fit_place8_mid() && !place8_draft) {
-        LOG_INF("%s: small device with the decode-sized MoE cache (k19-place8): the draft model is placed on the CPU\n", __func__);
-        return true;
+        if (!hx_ok) {
+            LOG_INF("%s: small device with the decode-sized MoE cache (k19-place8): the draft model is placed on the CPU\n", __func__);
+            return true;
+        }
+        hx_only = true;   // the small device keeps no draft at its file's placement: only the host-expert placement is weighed
     }
     const size_t pot   = cp.moe_cache_size;            // memory the cache gets once the layers are placed
     const size_t cache = std::min(requested, pot);     // what it would hold without the draft model
     const size_t free_ = pot - cache;                  // memory the cache leaves unused
+
+    // k19-mtpkeep: the host-expert placement, measured and weighed: it may take at most LLAMA_FIT_DRAFT_HOST_EXPS_MAX_CACHE_FRAC (0.5)
+    // of the cache and must leave the experts of at least LLAMA_FIT_DRAFT_HOST_EXPS_MIN_TOKENS (1.0) tokens per layer cached; the
+    // layers-first rule of the caller then still drops it where it would cost target layers
+    auto try_hx = [&]() -> bool {
+        if (!hx_ok) {
+            return false;
+        }
+        static const uint32_t hx_ub = getenv("LLAMA_FIT_DRAFT_HOST_EXPS_UB") ? (uint32_t) std::max(1, atoi(getenv("LLAMA_FIT_DRAFT_HOST_EXPS_UB"))) : 64u;
+        static const double hx_frac = getenv("LLAMA_FIT_DRAFT_HOST_EXPS_MAX_CACHE_FRAC") ? std::max(0.0, atof(getenv("LLAMA_FIT_DRAFT_HOST_EXPS_MAX_CACHE_FRAC"))) : 0.5;
+        static const double hx_tok  = getenv("LLAMA_FIT_DRAFT_HOST_EXPS_MIN_TOKENS") ? std::max(0.0, atof(getenv("LLAMA_FIT_DRAFT_HOST_EXPS_MIN_TOKENS"))) : 1.0;
+        std::vector<llama_model_tensor_buft_override> ov;
+        for (const llama_model_tensor_buft_override * p = mparams_dft.tensor_buft_overrides; p != nullptr && p->pattern != nullptr; ++p) {
+            ov.push_back(*p);
+        }
+        ov.push_back(llm_ffn_exps_cpu_override());
+        ov.push_back({ nullptr, nullptr });
+        llama_model_params mp_hx = mparams_dft;
+        mp_hx.tensor_buft_overrides = ov.data();
+        llama_context_params cp_hx = cparams_dft;
+        cp_hx.n_ubatch = std::min(cp_hx.n_ubatch, hx_ub);
+        cp_hx.type_k   = cparams.type_k;
+        cp_hx.type_v   = cparams.type_v;
+        double d = 0.0;
+        try {
+            common_draft_measure_env split_env;
+            std::vector<ggml_backend_dev_t> devs_hx;
+            uint32_t ngl_hx = 0, nct_hx = 0, nex_hx = 0;
+            const auto dmds = common_get_device_memory_data(path_dft.c_str(), &mp_hx, &cp_hx, devs_hx, ngl_hx, nct_hx, nex_hx, log_level);
+            for (size_t i = 0; i < devs_hx.size() && i < dmds.size(); i++) {
+                d += dmds[i].model + dmds[i].context + dmds[i].compute;
+            }
+        } catch (const std::exception & e) {
+            LOG_INF("%s: k19-mtpkeep: the draft with its experts in host memory could not be measured (%s)\n", __func__, e.what());
+            return false;
+        }
+        const double take_hx = std::max(0.0, d - (double) free_);
+        const double left_hx = std::max(0.0, (double) cache - take_hx);
+        const double host_hx = common_moe_host_expert_bytes(params.model.path, mp.tensor_buft_overrides, mp.n_gpu_layers);
+        double tok = -1.0;
+        common_moe_slot_bytes sbt;
+        if (host_hx > 0.0 && common_moe_slot_bytes_of(params.model.path, sbt) && sbt.sum > 0 && sbt.n_used > 0 && sbt.n_layer > 0) {
+            const double host_layers = std::min<double>((double) sbt.n_layer, host_hx/((double) sbt.sum*(double) std::max<int64_t>(sbt.n_expert, 1)) + 0.5);
+            tok = left_hx/((double) sbt.sum*(double) sbt.n_used*std::max(host_layers, 1.0));
+        }
+        const bool ok = d > 0.0 && take_hx <= hx_frac*(double) cache && (tok < 0.0 || tok >= hx_tok);
+        LOG_INF("%s: k19-mtpkeep: the MTP draft with its experts in host memory (n_ubatch %u, K / V %s / %s) needs %.0f MiB of device memory: "
+            "the cache %.0f -> %.0f MiB, the experts of %.1f tokens per layer -> %s (at most %.0f%% of the cache, at least %.2f tokens; "
+            "LLAMA_FIT_DRAFT_HOST_EXPS=0 off)\n", __func__, cp_hx.n_ubatch, ggml_type_name(cp_hx.type_k), ggml_type_name(cp_hx.type_v),
+            d/MiB, cache/MiB, left_hx/MiB, tok, ok ? "draft model on the GPU" : "refused", 100.0*hx_frac, hx_tok);
+        if (ok) {
+            hx->on       = true;
+            hx->n_ubatch = cp_hx.n_ubatch;
+            hx->type_k   = cp_hx.type_k;
+            hx->type_v   = cp_hx.type_v;
+        }
+        return ok;
+    };
+    if (hx_only) {
+        return !try_hx();
+    }
 
     cparams_dft.n_ctx = cp.n_ctx;
     std::vector<ggml_backend_dev_t> devs;
@@ -2836,6 +2922,9 @@ static bool common_fit_draft_on_cpu(
             v_ratio >= 0.0 && v_ratio <= v_max ? "at most" : "over", v_max);
     } else if (!gpu && rq_off) {
         LOG_INF("%s: draft refused at its file's types; requantization off (LLAMA_DRAFT_REQUANT=off)\n", __func__);
+    }
+    if (!gpu && !rq_set && (needs_target == nullptr || !*needs_target)) {
+        gpu = try_hx();
     }
     return !gpu;
 }
@@ -3591,8 +3680,27 @@ uma_restart:
                 (env_last == nullptr || atoi(env_last) != 0);
             if (last) {
                 const bool rq_before = getenv("LLAMA_DRAFT_REQUANT") != nullptr;
+                common_fit_draft_hx hx;
                 draft_cpu = common_fit_draft_on_cpu(params, mparams, cparams, mparams_dft, cparams_dft, params_dft.model.path, fit_log_level,
-                    &draft_needs_target);
+                    &draft_needs_target, &hx);
+                if (!draft_cpu && hx.on) {
+                    // k19-mtpkeep: the draft runs with its experts in host memory: the draft params (the context the server creates) and the
+                    // copies the rest of the fit measures it with (the extra model of the layers-first rule)
+                    for (auto * v : { &params.speculative.draft.tensor_buft_overrides, &params_dft.tensor_buft_overrides }) {
+                        if (!v->empty() && v->back().pattern == nullptr) {
+                            v->pop_back();
+                        }
+                        v->push_back(llm_ffn_exps_cpu_override());
+                        v->push_back({ nullptr, nullptr });
+                    }
+                    mparams_dft.tensor_buft_overrides     = params_dft.tensor_buft_overrides.data();
+                    params.speculative.draft.n_ubatch     = (int32_t) hx.n_ubatch;
+                    params.speculative.draft.cache_type_k = hx.type_k;
+                    params.speculative.draft.cache_type_v = hx.type_v;
+                    cparams_dft.n_ubatch = hx.n_ubatch;
+                    cparams_dft.type_k   = hx.type_k;
+                    cparams_dft.type_v   = hx.type_v;
+                }
                 if (!draft_cpu && !rq_before && getenv("LLAMA_DRAFT_REQUANT") != nullptr) {
                     // k18: the draft was admitted requantized: the rest of the fit (the extra model) measures it at those types, as it loads
                     // (the overrides are added in place: the extra model holds params_dft's path and &mparams_dft)
