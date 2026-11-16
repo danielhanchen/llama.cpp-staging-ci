@@ -1760,15 +1760,21 @@ static void common_params_fit_impl(
                             LOG_INF("%s: small device: the MoE cache takes the memory of the prompt compute buffers (%" PRId64 " MiB): cache %zu -> "
                                 "%zu MiB; ubatches of more than %u tokens run with the cache banks released (k19-place8; LLAMA_FIT_PLACE8=0 off)\n",
                                 __func__, grow/MiB, size_ok/MiB, cparams->moe_cache_size/MiB, ub_rel);
-                            // k19-kvlong (LLAMA_FIT_PLACE8_LM=1, opt-in): prompts keep their layer-major groups beside this decode-sized cache, as
-                            // on a mid-size device (k19-placemid: a group releases the banks for its merged graph and grows into the memory the
-                            // cache took); the drafter decision stays the small device's (common_fit_place8_mid() is not set). Without groups
-                            // every prompt ubatch reads its experts from the host: G4 10 / 12 GB, Qwen3.8-Flash-Next ctx 262144, 8k prompt
-                            // 493 tok/s, 3669-4438 with the place8 placement off (decode -20..25%)
-                            static const bool place8_lm = getenv("LLAMA_FIT_PLACE8_LM") != nullptr && atoi(getenv("LLAMA_FIT_PLACE8_LM")) != 0;
-                            if (place8_lm) {
-                                common_set_env("LLAMA_MOE_PLACE8_MID", std::to_string(std::max<int64_t>(1, grow/MiB)));
-                                LOG_INF("%s: small device: layer-major prompt groups kept beside the decode-sized cache (LLAMA_FIT_PLACE8_LM)\n", __func__);
+                            // k19-pgroups: prompts keep their layer-major groups beside the decode-sized cache, as k19-placemid does on a
+                            // mid-size device: a group releases the banks for its merged graph (one pass over each layer's experts for up to
+                            // LLAMA_MOE_LAYER_MAJOR_UB_MAX ubatches) instead of every prompt ubatch running alone with the banks released (G4 10 /
+                            // 12 GB, Flash-Next UD-IQ4_XS ctx 131K / 262K: 493 tok/s prompts vs 3669 with LLAMA_FIT_PLACE8=0, which loses 20-25%
+                            // decode with its 160 MiB cache). The cache, its size and the reserved graphs stay those of k19-place8; the draft rule of
+                            // the small device stays (no device drafter). Devices with at least LLAMA_FIT_PLACE8_GROUPS_MIN_FREE_MIB (9216) free
+                            // (8 GB cards keep k19-place8 as it was), not host-bound. LLAMA_FIT_PLACE8_GROUPS=0 off
+                            static const bool groups_on = getenv("LLAMA_FIT_PLACE8_GROUPS") == nullptr || atoi(getenv("LLAMA_FIT_PLACE8_GROUPS")) != 0;
+                            static const int64_t groups_min_free = int64_t(getenv("LLAMA_FIT_PLACE8_GROUPS_MIN_FREE_MIB") != nullptr ?
+                                std::max(0, atoi(getenv("LLAMA_FIT_PLACE8_GROUPS_MIN_FREE_MIB"))) : 9216)*MiB;
+                            if (groups_on && !hostbound && int64_t(dmds_cpu_moe[0].free) >= groups_min_free) {
+                                common_fit_place8_env(ub_rel, true, grow/MiB);
+                                g_place8_mid = false; // the small device's draft rule (common_fit_draft_on_cpu) stays
+                                LOG_INF("%s: small device: prompts keep their layer-major groups beside the decode-sized cache, each group releases "
+                                    "the banks for its merged graph (k19-pgroups; LLAMA_FIT_PLACE8_GROUPS=0 off)\n", __func__);
                             }
                         } else {
                             common_fit_place8_env(0);

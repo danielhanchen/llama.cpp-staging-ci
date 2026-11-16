@@ -12,6 +12,7 @@
 #include "../src/llama-arch.h"
 #include "../src/llama-ext.h"
 #include "../src/llama-model-saver.h"
+#include "test-rpc-inproc.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1516,21 +1517,6 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
 // CPU give the two devices (skipped without the RPC backend or on Windows); qwen35 with 4 layers (delta-net layers 0 and 2) split 1:2
 // puts a delta-net state on each. Verify windows of 2-4 tokens (the last one rejected) and a state size query after each (it commits the pending
 // window) alternate the commit keys A, B, A, ...; the logits after every window must match a single-device run of the same calls.
-#ifndef _WIN32
-static bool rs_port_open(int port) {
-    const int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        return false;
-    }
-    sockaddr_in a = {};
-    a.sin_family      = AF_INET;
-    a.sin_port        = htons((uint16_t) port);
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    const bool ok = connect(fd, (const sockaddr *) &a, sizeof(a)) == 0;
-    close(fd);
-    return ok;
-}
-#endif
 
 static int check_qwen35_replay_sched(const size_t seed, const float stdev) {
 #ifdef _WIN32
@@ -1543,9 +1529,8 @@ static int check_qwen35_replay_sched(const size_t seed, const float stdev) {
         printf("%s: RPC backend not built, skipped\n", __func__);
         return 0;
     }
-    typedef void (*start_server_t)(const char *, const char *, size_t, size_t, ggml_backend_dev_t *);
     typedef ggml_backend_reg_t (*add_server_t)(const char *);
-    auto start_server = (start_server_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_start_server");
+    auto start_server = (rpc_test_start_server_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_start_server");
     auto add_server   = (add_server_t)   ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (start_server == nullptr || add_server == nullptr || cpu_dev == nullptr) {
@@ -1553,26 +1538,12 @@ static int check_qwen35_replay_sched(const size_t seed, const float stdev) {
         return 1;
     }
     std::vector<ggml_backend_dev_t> rpc_devs;
-    int port = 21000 + (int) (getpid() % 30000);
     for (int k = 0; k < 2; ++k) {
-        for (int i = 0; i < 40 && rs_port_open(port); ++i) {
-            port++;
-        }
-        const std::string ep = "127.0.0.1:" + std::to_string(port);
-        port++;
-        // the servers never return; the process ends with them running
-        std::thread([start_server, ep, cpu_dev]() {
-            ggml_backend_dev_t sdevs[1] = { cpu_dev };
-            start_server(ep.c_str(), nullptr, 2, 1, sdevs);
-        }).detach();
-        bool up = false;
-        for (int i = 0; i < 200 && !up; ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            up = rs_port_open(port - 1);
-        }
-        ggml_backend_reg_t reg = up ? add_server(ep.c_str()) : nullptr;
+        // the servers never return: main ends this check with std::_Exit (test-rpc-inproc.h)
+        std::string ep;
+        ggml_backend_reg_t reg = rpc_test_start_server(start_server, cpu_dev, ep) ? add_server(ep.c_str()) : nullptr;
         if (reg == nullptr || ggml_backend_reg_dev_count(reg) == 0) {
-            fprintf(stderr, "%s: FAIL: could not connect to %s\n", __func__, ep.c_str());
+            fprintf(stderr, "%s: FAIL: could not start or connect to an in-process RPC server\n", __func__);
             return 1;
         }
         rpc_devs.push_back(ggml_backend_reg_dev_get(reg, 0));
@@ -1925,7 +1896,12 @@ int main(int argc, char ** argv) {
             return check_rs_decode_parity(arch_filter, seed, stdev);
         }
         if (rs_replay_sched) {
-            return check_qwen35_replay_sched(seed, stdev);
+            // its in-process RPC servers never stop: end without the static destructors they could still be using
+            const int rc = check_qwen35_replay_sched(seed, stdev);
+            common_log_flush(common_log_main());
+            fflush(stdout);
+            fflush(stderr);
+            std::_Exit(rc);
         }
         if (small_backends) {
             return check_small_graph_backends(seed, stdev);

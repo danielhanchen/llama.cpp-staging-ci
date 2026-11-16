@@ -371,6 +371,37 @@ static void test_model(const std::string & path, const std::string & name) {
         snprintf(buf, sizeof(buf), "max rel %.3g vs q4_0 (q4_0 ring), q8_0 vs q4_0 %.3g", e, max_rel(r_q8, r_q4));
         report(name.c_str(), "route", e < 2e-3, buf);
     }
+    // a prompt of many ubatches that wraps the ring (W 64, S 4: a ring of 256 slots for ub 32 / 128 against 1000 + 16 positions),
+    // ring type = cache type: every row must read each visible cell exactly once (ring or cache), so the result is plain q4_0 up to
+    // the summation order (a cell missing or counted twice is far larger than that)
+    {
+        std::mt19937 g3(11);
+        const auto pl = rand_toks(g3, 1000, nv);
+        const auto dl = rand_toks(g3, 16, nv);
+        for (uint32_t ub : { 32u, 128u }) {
+            cfg pq = q4; pq.n_ctx = 2048; pq.n_ubatch = ub;
+            cfg pr = pq; pr.win = 64; pr.sinks = 4; pr.wtype = GGML_TYPE_Q4_0;
+            cfg p8 = pq; p8.type = GGML_TYPE_Q8_0;
+            const auto a  = run_plain(model, pq, pl, dl);
+            const auto b  = run_plain(model, pr, pl, dl);
+            const auto c8 = run_plain(model, p8, pl, dl);
+            const double e = max_rel(b, a), gap = max_rel(c8, a);
+            snprintf(buf, sizeof(buf), "1000 + 16 positions, ub %u, W 64 S 4, q4_0 ring: max rel %.3g vs q4_0 (q8_0 vs q4_0 %.3g)", ub, e, gap);
+            report(name.c_str(), ub == 32 ? "wrap32" : "wrap128", e < std::max(2e-5, 0.02*gap), buf);
+            // the first token after the wrapped prompt (its last row) with the q8_0 ring against f16: no farther than plain q4_0
+            // (a ring that lost or doubled a cell would land far outside the q8_0 .. q4_0 range)
+            cfg pw = pr; pw.wtype = GGML_TYPE_Q8_0;
+            cfg pf = pq; pf.type = GGML_TYPE_F16;
+            const auto w  = run_plain(model, pw, pl, dl);
+            const auto f  = run_plain(model, pf, pl, dl);
+            auto first = [&](const std::vector<float> & v) {
+                return v.size() >= (size_t) nv ? std::vector<float>(v.begin(), v.begin() + nv) : std::vector<float>();
+            };
+            const double ew = max_rel(first(w), first(f)), e8 = max_rel(first(c8), first(f)), e4 = max_rel(first(a), first(f));
+            snprintf(buf, sizeof(buf), "first token vs f16, ub %u: window %.3g, q8_0 %.3g, q4_0 %.3g", ub, ew, e8, e4);
+            report(name.c_str(), ub == 32 ? "wfirst32" : "wfirst128", ew <= std::max(e4, e8) + 1e-7, buf);
+        }
+    }
     {
         const auto a = run_rollback(model, w32, prompt, dec, 11);
         const auto b = run_rollback(model, w32, prompt, dec, 99);
