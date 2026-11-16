@@ -784,35 +784,59 @@ static __global__ void flash_attn_src2_ring_bits(
 }
 
 // k19-fattnq4: the body tiles a query tile of a two-source node can see, [first, last + 1) of the KV tiles with a finite mask value
-// in a row of the tile, (0, 0) for none; scanned from both ends with an early exit (the body's visible cells of a prompt tile are a
-// prefix: the scan reads the masked tail of about W + ubatch cells, not the whole mask)
+// in a row of the tile, (0, 0) for none; scanned from both ends in steps of 8 tiles with an early exit (the body's visible cells of a
+// prompt tile are a prefix: the scan reads the masked tail of about W + ubatch cells, not the whole mask)
 __launch_bounds__(256, 1)
 static __global__ void flash_attn_src2_body_range(
         const half2 * __restrict__ mask, int2 * __restrict__ ranges, const int n_kv, const int ncols1, const int n_queries,
         const int nbatch_fa, const int64_t s31, const int64_t s33) {
+    constexpr int step = 8;
     ggml_cuda_pdl_sync();
+    __shared__ int flag_s[step];
     const int q0 = blockIdx.x*ncols1;
     const int nq = min(q0 + ncols1, n_queries) - q0;
     const half2 * m = mask + blockIdx.y*s33 + (int64_t) q0*s31;
     const int nt = (n_kv + nbatch_fa - 1) / nbatch_fa;
-    auto visible = [&](const int t) {
-        const int c0 = t*nbatch_fa/2;
-        const int nc = (min((t + 1)*nbatch_fa, n_kv) - t*nbatch_fa) / 2;
-        int f = 0;
+    // the flags of tiles t0 .. t0 + step - 1 (< nt) in flag_s
+    auto scan = [&](const int t0) {
+        if (threadIdx.x < step) {
+            flag_s[threadIdx.x] = 0;
+        }
+        __syncthreads();
+        const int c0 = t0*nbatch_fa;
+        const int nc = (min(c0 + step*nbatch_fa, n_kv) - c0) / 2;
         for (int i = threadIdx.x; i < nq*nc; i += blockDim.x) {
             const int q = i / nc;
-            const float2 v = __half22float2(m[q*s31 + c0 + (i - q*nc)]);
-            f |= !isinf(v.x) || !isinf(v.y);
+            const int c = i - q*nc;
+            const float2 v = __half22float2(m[q*s31 + c0/2 + c]);
+            if (!isinf(v.x) || !isinf(v.y)) {
+                flag_s[(2*c) / nbatch_fa] = 1;
+            }
         }
-        return __syncthreads_or(f) != 0;
+        __syncthreads();
     };
-    int lo = 0;
-    while (lo < nt && !visible(lo)) {
-        ++lo;
+    int lo = nt;
+    for (int t0 = 0; t0 < nt && lo == nt; t0 += step) {
+        scan(t0);
+        for (int t = 0; t < step && t0 + t < nt; ++t) {
+            if (flag_s[t]) {
+                lo = t0 + t;
+                break;
+            }
+        }
+        __syncthreads();
     }
-    int hi = nt;
-    while (hi > lo && !visible(hi - 1)) {
-        --hi;
+    int hi = lo;
+    for (int t1 = nt; t1 > lo && hi == lo; t1 -= step) {
+        const int t0 = max(t1 - step, lo);
+        scan(t0);
+        for (int t = t1 - 1; t >= t0; --t) {
+            if (flag_s[t - t0]) {
+                hi = t + 1;
+                break;
+            }
+        }
+        __syncthreads();
     }
     if (threadIdx.x == 0) {
         ranges[blockIdx.y*gridDim.x + blockIdx.x] = lo < hi ? make_int2(lo, hi) : make_int2(0, 0);
@@ -1401,7 +1425,10 @@ void launch_fattn(
         // GGML_CUDA_FATTN_SRC2_SKIP_MIN_ROWS query rows (default 17: prompt ubatches, where most of the ring is masked per tile)
         static const bool skip_on = getenv("GGML_CUDA_FATTN_SRC2_SKIP") == nullptr || atoi(getenv("GGML_CUDA_FATTN_SRC2_SKIP")) != 0;
         static const int64_t skip_min_rows = getenv("GGML_CUDA_FATTN_SRC2_SKIP_MIN_ROWS") ? atoll(getenv("GGML_CUDA_FATTN_SRC2_SKIP_MIN_ROWS")) : 17;
-        if (skip_on && Q->ne[1] >= skip_min_rows && !probe) {
+        // (the scans read cell pairs: even cell counts and row strides, else no skip)
+        const bool skip_ok = mask && M2 && nbatch_fa % 2 == 0 && K->ne[1] % 2 == 0 && M2->nb[1] % sizeof(half2) == 0 && mask->nb[1] % sizeof(half2) == 0 &&
+            M2->nb[3] % sizeof(half2) == 0 && mask->nb[3] % sizeof(half2) == 0;
+        if (skip_on && skip_ok && Q->ne[1] >= skip_min_rows && !probe) {
             // ring tiles from mask2, body tiles from mask (the window cells are masked in the body: its last ~W + ubatch cells are
             // fully masked for a query tile of a prompt)
             const int ntx = (int) ((Q->ne[1] + ncols1 - 1) / ncols1);
@@ -1409,7 +1436,6 @@ void launch_fattn(
             const int nt2 = (int) (K2->ne[1] / nbatch_fa);
             const int nw  = (nt2 + 31) / 32;
             const int tpb = 8; // ring tiles per block of the bits scan (divides 32)
-            GGML_ASSERT(nbatch_fa % 2 == 0 && M2->nb[1] % sizeof(half2) == 0 && mask->nb[1] % sizeof(half2) == 0);
             ring_range.alloc(nr + (nr*nw + 1)/2); // the body ranges, then the ring bits
             uint32_t * ring_bits = (uint32_t *) (ring_range.ptr + nr);
             CUDA_CHECK(cudaMemsetAsync(ring_bits, 0, nr*nw*sizeof(uint32_t), main_stream));
