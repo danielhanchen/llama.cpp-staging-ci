@@ -10706,6 +10706,33 @@ static const ggml_tensor * ggml_cuda_fused_match(const ggml_cgraph * cgraph, int
     ggml_tensor * n0 = cgraph->nodes[i];
     inputs.clear();
 
+    // a one-column F32 / F16 / BF16 product + its ADD (ADD_ID) in one mul_mat_vec_f launch (the "mul_mat + add" fusion of
+    // ggml_cuda_try_fuse, x_bias): blocks write output rows while other blocks still read the whole input vector, so the ADD output
+    // must not be placed over src1, the bias or the ids. Unfused, src1 is dead after the product and the allocator may put the ADD
+    // there (the residual ADD after an attention output projection): the decode of 16-bit models then varied from run to run.
+    // The condition is a superset of the fusion's (no device-dependent check), so any pair the fusion takes is covered.
+    // GGML_CUDA_MMVF_ADD_ALIAS=1 restores the previous placement
+    static const bool mmvf_add_alias = ggml_cuda_env_flag("GGML_CUDA_MMVF_ADD_ALIAS");
+    if (!mmvf_add_alias && (n0->op == GGML_OP_MUL_MAT || n0->op == GGML_OP_MUL_MAT_ID) && i + 1 < cgraph->n_nodes &&
+            n0->src[0] != nullptr && n0->src[1] != nullptr && n0->type == GGML_TYPE_F32 && n0->src[1]->type == GGML_TYPE_F32 &&
+            (n0->src[0]->type == GGML_TYPE_F32 || n0->src[0]->type == GGML_TYPE_F16 || n0->src[0]->type == GGML_TYPE_BF16) &&
+            (n0->op == GGML_OP_MUL_MAT ? n0->ne[1] == 1 : n0->ne[2] == 1)) {
+        ggml_tensor * add = cgraph->nodes[i + 1];
+        ggml_tensor * bias = nullptr;
+        if (n0->op == GGML_OP_MUL_MAT && add->op == GGML_OP_ADD) {
+            bias = add->src[0] == n0 ? add->src[1] : add->src[1] == n0 ? add->src[0] : nullptr;
+        } else if (n0->op == GGML_OP_MUL_MAT_ID && add->op == GGML_OP_ADD_ID && add->src[0] == n0) {
+            bias = add->src[1];
+        }
+        if (bias != nullptr) {
+            inputs = { n0->src[1], bias };
+            if (n0->op == GGML_OP_MUL_MAT_ID) {
+                inputs.push_back(n0->src[2]); // the ids, read by every block too
+            }
+            return add;
+        }
+    }
+
     // residual add + RMS norm + mul (+ q8_1), ggml_cuda_try_fuse_add_rms_norm (rms_norm_mul_q8_1_f32 with ra / rb): both add inputs.
     // Qwen3.6-35B-A3B MTP spilled (B200): the norm output landed on the previous layer's l_out, the text was not repeatable.
     // GGML_CUDA_ADD_RMS_ALIAS=1
