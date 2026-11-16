@@ -2589,6 +2589,30 @@ bool common_fit_dflash_draft_bytes(const char * path_dft, const llama_context_pa
 // k19-mtpkeep (LLAMA_FIT_DRAFT_HOST_EXPS_KV=q4_0 | q8_0 | f16, opt-in): the K / V type of that placement instead of the target's; q4_0
 // halves the drafter's K / V of q8_0 and is read in place up to 16 rows too (GGML_CUDA_FATTN_Q4_INPLACE_MAX_ROWS); it changes the drafts
 // only, never the target's output
+// k19-mtpkeep: the tokens per layer whose experts a MoE cache of `cache` bytes holds (n_expert_used slots per token, the expert layers
+// on the host counted at the largest slot as the fit does); -1 = unknown
+static double common_fit_cache_tokens(const std::string & path, const llama_model_tensor_buft_override * ov, int32_t ngl, double cache) {
+    const double host = common_moe_host_expert_bytes(path, ov, ngl);
+    common_moe_slot_bytes sbt;
+    if (host <= 0.0 || !common_moe_slot_bytes_of(path, sbt) || sbt.sum <= 0 || sbt.n_used <= 0 || sbt.n_layer <= 0) {
+        return -1.0;
+    }
+    const double host_layers = std::min<double>((double) sbt.n_layer, host/((double) sbt.sum*(double) std::max<int64_t>(sbt.n_expert, 1)) + 0.5);
+    return cache/((double) sbt.sum*(double) sbt.n_used*std::max(host_layers, 1.0));
+}
+
+// k19-mtpkeep: a host-expert MTP drafter is kept only where the MoE cache left beside it holds the experts of a whole verify window per
+// layer (the draft's n_max + 1 tokens): narrower, the verified rows leave the device slots and run the host path, and the drafter costs
+// more than it drafts. G4 Qwen3.8-Flash-Next UD-IQ4_XS + its Q8_0 MTP (n_max 2): 10 GB / 131K kept at 1.8 tokens (cache 2302 -> 1788 MiB)
+// decode chat 72.5 -> 73.1, 2k 71.1 -> 50.1, 8k 68.2 -> 65.3 tok/s, 8k prompt 2980 -> 2135 tok/s: dropped by this; 16 GB / 262K
+// (cache 5747 -> 4182 MiB, about 3.8 tokens) kept. LLAMA_FIT_DRAFT_HOST_EXPS_KEEP_TOKENS=N sets the tokens, 0 keeps without this check
+static double common_fit_draft_hx_keep_tokens(const common_params & params) {
+    if (const char * e = getenv("LLAMA_FIT_DRAFT_HOST_EXPS_KEEP_TOKENS")) {
+        return std::max(0.0, atof(e));
+    }
+    return (double) std::max(1, params.speculative.draft.n_max) + 1.0;
+}
+
 static ggml_type common_fit_draft_hx_kv(ggml_type t_target) {
     static const ggml_type t = [] {
         const char * e = getenv("LLAMA_FIT_DRAFT_HOST_EXPS_KV");
@@ -2730,12 +2754,14 @@ static bool common_fit_draft_on_cpu(
             const double host_layers = std::min<double>((double) sbt.n_layer, host_hx/((double) sbt.sum*(double) std::max<int64_t>(sbt.n_expert, 1)) + 0.5);
             tok = left_hx/((double) sbt.sum*(double) sbt.n_used*std::max(host_layers, 1.0));
         }
-        const bool ok = d > 0.0 && take_hx <= hx_frac*(double) cache && (tok < 0.0 || tok >= hx_tok);
+        const double keep_tok = common_fit_draft_hx_keep_tokens(params);
+        const bool ok = d > 0.0 && take_hx <= hx_frac*(double) cache && (tok < 0.0 || (tok >= hx_tok && tok >= keep_tok));
         LOG_INF("%s: k19-mtpkeep: the MTP draft with its experts in host memory (n_ubatch %u, K / V %s / %s, op offload %s) needs %.0f MiB of "
             "device memory (weights %.0f, context %.0f, compute %.0f): the cache %.0f -> %.0f MiB, the experts of %.1f tokens per layer -> %s "
-            "(at most %.0f%% of the cache, at least %.2f tokens; LLAMA_FIT_DRAFT_HOST_EXPS=0 off)\n", __func__, cp_hx.n_ubatch,
+            "(at most %.0f%% of the cache, at least %.2f tokens and a verify window of %.2f, LLAMA_FIT_DRAFT_HOST_EXPS_KEEP_TOKENS; "
+            "LLAMA_FIT_DRAFT_HOST_EXPS=0 off)\n", __func__, cp_hx.n_ubatch,
             ggml_type_name(cp_hx.type_k), ggml_type_name(cp_hx.type_v), cp_hx.op_offload ? "on" : "off", d/MiB, d_model/MiB, d_ctx/MiB,
-            d_comp/MiB, cache/MiB, left_hx/MiB, tok, ok ? "draft model on the GPU" : "refused", 100.0*hx_frac, hx_tok);
+            d_comp/MiB, cache/MiB, left_hx/MiB, tok, ok ? "draft model on the GPU" : "refused", 100.0*hx_frac, hx_tok, keep_tok);
         if (ok) {
             hx->on       = true;
             hx->n_ubatch = cp_hx.n_ubatch;
@@ -4339,9 +4365,16 @@ uma_restart:
                             common_fit_set_moe_margin_auto(!params.fit_params_target_set);
                             const common_params_fit_status st_q = common_fit_params(params.model.path.c_str(), &mq, &cq, tq.data(),
                                 bq.empty() ? nullptr : bq.data(), gq.data(), params.fit_params_min_ctx, &extra_hx, fit_log_level, params.fit_kv_resident);
-                            const bool hx_p8   = common_fit_place8();
+                            const bool   hx_p8   = common_fit_place8();
+                            const double hx_need = common_fit_draft_hx_keep_tokens(params);
+                            const double hx_tokl = st_q == COMMON_PARAMS_FIT_STATUS_SUCCESS ?
+                                common_fit_cache_tokens(params.model.path, mq.tensor_buft_overrides, mq.n_gpu_layers, (double) cq.moe_cache_size) : -1.0;
+                            const bool   hx_tok_ok = hx_need <= 0.0 || hx_tokl < 0.0 || hx_tokl >= hx_need;
                             const bool hx_keep = st_q == COMMON_PARAMS_FIT_STATUS_SUCCESS && lay(mq) >= l_plain && cq.n_ubatch == cp.n_ubatch &&
-                                (!hx_lend || hx_p8);
+                                (!hx_lend || hx_p8) && hx_tok_ok;
+                            COM_INF("%s: --fit: k19-mtpkeep: with the drafter the MoE cache is %.0f MiB, the experts of %.2f tokens per layer (a verify "
+                                "window needs %.2f, LLAMA_FIT_DRAFT_HOST_EXPS_KEEP_TOKENS; 0 keeps without this check) -> %s\n", __func__,
+                                (double) cq.moe_cache_size/(1024.0*1024.0), hx_tokl, hx_need, hx_tok_ok ? "enough" : "too few: not kept");
                             COM_INF("%s: --fit: k19-mtpkeep: the MTP draft with its experts in host memory (n_ubatch %u, K / V %s / %s%s): %" PRId64
                                 " of %" PRId64 " layers on the device with it, %" PRId64 " without it, target n_ubatch %u%s -> %s (LLAMA_FIT_DRAFT_HOST_EXPS_LF=0 off)\n",
                                 __func__, cp_dft_hx.n_ubatch, ggml_type_name(cp_dft_hx.type_k), ggml_type_name(cp_dft_hx.type_v),
