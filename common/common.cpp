@@ -4416,6 +4416,30 @@ uma_restart:
         } else if (moe_cache_auto) {
             COM_INF("%s: --moe-cache-mib auto: MoE cache %zu MiB\n", __func__, cparams.moe_cache_size/(1024*1024));
         }
+        // k19-mtpprice: a separate MTP drafter reads the prompt in ubatches of at most common_draft_ubatch_max() only beside a MoE cache
+        // (common_base_params_to_speculative), and the fit prices it that way while it plans one. Where the fit then ends without a cache
+        // but with experts in host memory (layers moved to the CPU), the drafter's context would be created at the target's n_ubatch, a
+        // compute buffer the fit never priced: G4 12 GB, Qwen3.8-Flash-Next ctx 131072 -ub 2048 + its requantized MTP GGUF, priced 2021
+        // MiB at n_ubatch 512, the context's 1443 MiB compute buffer at 2048 failed ("failed to create MTP context", drafting off). The
+        // drafter keeps the n_ubatch it was priced at. LLAMA_FIT_DRAFT_UB_PIN=0 off
+        {
+            const char * e_pin   = getenv("LLAMA_FIT_DRAFT_UB_PIN");
+            const bool   mtp_dft = params.speculative.has_dft() && std::find(params.speculative.types.begin(),
+                params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+            bool host_exps = false;
+            for (size_t i = 0; mparams.tensor_buft_overrides != nullptr && mparams.tensor_buft_overrides[i].pattern != nullptr && !host_exps; ++i) {
+                host_exps = mparams.tensor_buft_overrides[i].buft != nullptr && ggml_backend_buft_is_host(mparams.tensor_buft_overrides[i].buft);
+            }
+            const uint32_t cap  = common_draft_ubatch_max();
+            const uint32_t ub_d = common_draft_n_ubatch(params, cparams.n_ubatch);
+            if ((e_pin == nullptr || atoi(e_pin) != 0) && moe_cache_auto && cparams.moe_cache_size == 0 && host_exps && mtp_dft &&
+                    !params.speculative.draft.fit_off && !params.speculative.draft.fit_on_cpu && params.speculative.draft.n_ubatch <= 0 &&
+                    cap > 0 && ub_d > cap) {
+                params.speculative.draft.n_ubatch = (int32_t) cap;
+                COM_INF("%s: --fit: the MTP drafter keeps n_ubatch %u, as priced beside the planned MoE cache (no cache now, experts in host "
+                    "memory; LLAMA_FIT_DRAFT_UB_PIN=0 off)\n", __func__, cap);
+            }
+        }
         // k17-small (lazy KV): where the fit keeps a drafter (a draft model or the MTP heads) the KV cache is backed whole at load and the
         // MoE cache keeps its floor (common_fit does not give it the unbacked KV beside a drafter): G4 q4x 4 GB 16k + MTP ran out of memory
         // at the first request 3/3 with the bigger cache, q3m 16k + MTP was 5-17% slower. Without a drafter (none asked, or dropped by the
