@@ -146,21 +146,24 @@ static case_data make_data(const tcase & c, int seed) {
         quant(c.tr, f, rowv, c.n2, d.v2, d.vc, (size_t) rowv*c.n1);
     }
     // positions: body cell j holds position j; the ring holds the last W positions of the body's visible range (slot s -> position
-    // n1 - W + s), W = min(n2 - 3, 1024) (the slots after W empty, -inf for everyone), plus every 97th slot masked (a dead slot)
+    // n1 - W + s, or rotated, see rot), W = min(n2 - 3, 1024) (the slots after W empty, -inf for everyone), plus every 97th slot masked (a dead slot)
     const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY), zero = ggml_fp32_to_fp16(0.0f);
     d.m1.assign((size_t) c.n1*c.T, ninf);
     d.m2.assign((size_t) c.n2*c.T, ninf);
     const int W = std::min(c.n2 - 3, 1024); // slots W .. n2 - 1 empty (-inf for every row), like a ring with spare capacity
+    // half of the cases rotate the slots (slot s -> position n1 - W + (s + rot) % W): a ring that wrapped, so the visible slots of a
+    // query tile are two runs with masked tiles between them (the ring-tile skip walks the runs)
+    const int rot = (c.n1 + c.T) % 2 ? W/3 + 5 : 0;
     for (int t = 0; t < c.T; ++t) {
         const int p_max = c.n1 - 1 - (c.T - 1 - t); // causal: row t sees positions <= p_max
         for (int j = 0; j <= p_max && j < c.n1; ++j) {
-            const bool in_ring = j > p_max - W && j >= c.n1 - W && (j - (c.n1 - W)) % 97 != 1;
+            const bool in_ring = j > p_max - W && j >= c.n1 - W && (((j - (c.n1 - W) - rot) % W + W) % W) % 97 != 1;
             if (!in_ring) {
                 d.m1[(size_t) t*c.n1 + j] = (rng() % 7 == 0) ? ggml_fp32_to_fp16(-0.5f) : zero; // some ALiBi-like finite offsets
             }
         }
         for (int s = 0; s < W; ++s) {
-            const int pos = c.n1 - W + s;
+            const int pos = c.n1 - W + (s + rot) % W;
             if (pos >= 0 && pos <= p_max && pos > p_max - W && s % 97 != 1) {
                 d.m2[(size_t) t*c.n2 + s] = zero;
             }
