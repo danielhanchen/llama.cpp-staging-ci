@@ -10144,8 +10144,9 @@ struct llama_moe_cache::impl {
         if (llama_moe_tp::write(cmt_ps_path, cmt_ps_key, cmt_ps_tag, cmt_rec, (long long) ggml_time_us())) {
             cmt_rec_dirty = false;
             LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses: %zu trial verdict(s) written to %s\n", tag, cmt_rec.size(), cmt_ps_path.c_str());
-        } else if (!cmt_ps_warned) {
+        } else if (!cmt_ps_warned && !cm_persist_pending) {
             // k19-calvpersist: the write needs the calibration file (its key on the first line); say so instead of failing silently
+            // (not while the launch's own re-calibration is still to write that file: it flushes the verdicts then)
             cmt_ps_warned = true;
             LLAMA_LOG_WARN("llama_moe_cache%s: CPU misses: %zu trial verdict(s) not written to %s (no calibration file with this key, or "
                 "not writable): the next launch times its trials again\n", tag, cmt_rec.size(), cmt_ps_path.c_str());
