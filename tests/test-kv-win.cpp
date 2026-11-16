@@ -388,6 +388,18 @@ static void test_model(const std::string & path, const std::string & name) {
             const double e = max_rel(b, a), gap = max_rel(c8, a);
             snprintf(buf, sizeof(buf), "1000 + 16 positions, ub %u, W 64 S 4, q4_0 ring: max rel %.3g vs q4_0 (q8_0 vs q4_0 %.3g)", ub, e, gap);
             report(name.c_str(), ub == 32 ? "wrap32" : "wrap128", e < std::max(2e-5, 0.02*gap), buf);
+            // the first token after the wrapped prompt (its last row) with the q8_0 ring against f16: no farther than plain q4_0
+            // (a ring that lost or doubled a cell would land far outside the q8_0 .. q4_0 range)
+            cfg pw = pr; pw.wtype = GGML_TYPE_Q8_0;
+            cfg pf = pq; pf.type = GGML_TYPE_F16;
+            const auto w  = run_plain(model, pw, pl, dl);
+            const auto f  = run_plain(model, pf, pl, dl);
+            auto first = [&](const std::vector<float> & v) {
+                return v.size() >= (size_t) nv ? std::vector<float>(v.begin(), v.begin() + nv) : std::vector<float>();
+            };
+            const double ew = max_rel(first(w), first(f)), e8 = max_rel(first(c8), first(f)), e4 = max_rel(first(a), first(f));
+            snprintf(buf, sizeof(buf), "first token vs f16, ub %u: window %.3g, q8_0 %.3g, q4_0 %.3g", ub, ew, e8, e4);
+            report(name.c_str(), ub == 32 ? "wfirst32" : "wfirst128", ew <= std::max(e4, e8) + 1e-7, buf);
         }
     }
     {
