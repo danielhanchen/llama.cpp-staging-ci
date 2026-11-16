@@ -18,27 +18,7 @@
 #include <thread>
 #include <vector>
 
-#ifndef _WIN32
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
-// the RPC client aborts when it cannot connect: wait until the in-process server listens
-static bool port_open(int port) {
-    const int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        return false;
-    }
-    sockaddr_in a = {};
-    a.sin_family      = AF_INET;
-    a.sin_port        = htons((uint16_t) port);
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    const bool ok = connect(fd, (const sockaddr *) &a, sizeof(a)) == 0;
-    close(fd);
-    return ok;
-}
-#endif
+#include "test-rpc-inproc.h"
 
 static ggml_backend_meta_split_state mirrored(const ggml_tensor *, void *) {
     ggml_backend_meta_split_state s = {};
@@ -179,32 +159,19 @@ int main() {
         printf("RPC: backend not built (or Windows), skipped\n");
     } else {
 #ifndef _WIN32
-        typedef void (*start_server_t)(const char *, const char *, size_t, size_t, ggml_backend_dev_t *);
         typedef ggml_backend_reg_t (*add_server_t)(const char *);
-        auto start_server = (start_server_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_start_server");
+        auto start_server = (rpc_test_start_server_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_start_server");
         auto add_server   = (add_server_t)   ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
         if (start_server == nullptr || add_server == nullptr) {
             printf("RPC: FAIL: no server entry points\n");
             fails++;
         } else {
-            int port = 20000 + (int) (getpid() % 30000);
-            for (int i = 0; i < 20 && port_open(port); ++i) {
-                port++;
-            }
-            const std::string ep = "127.0.0.1:" + std::to_string(port);
             // the server never returns; the process ends with it running (std::_Exit below)
-            std::thread([start_server, ep, cpu_dev]() {
-                ggml_backend_dev_t sdevs[1] = { cpu_dev };
-                start_server(ep.c_str(), nullptr, 2, 1, sdevs);
-            }).detach();
-            bool up = false;
-            for (int i = 0; i < 200 && !up; ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                up = port_open(port);
-            }
+            std::string ep;
+            const bool up = rpc_test_start_server(start_server, cpu_dev, ep);
             ggml_backend_reg_t reg = up ? add_server(ep.c_str()) : nullptr;
             if (reg == nullptr || ggml_backend_reg_dev_count(reg) == 0) {
-                printf("RPC: FAIL: could not connect to %s\n", ep.c_str());
+                printf("RPC: FAIL: could not start or connect to an in-process RPC server\n");
                 fails++;
             } else {
                 ggml_backend_dev_t rdev = ggml_backend_reg_dev_get(reg, 0);
