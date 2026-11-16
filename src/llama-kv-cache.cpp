@@ -82,10 +82,12 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 //
 
 // k19-kvsel: see llama_kv_cache_sel_arm
-static thread_local bool g_kv_sel_armed = false;
+static thread_local bool     g_kv_sel_armed     = false;
+static thread_local uint32_t g_kv_sel_dev_cells = 0;
 
-void llama_kv_cache_sel_arm(bool on) {
-    g_kv_sel_armed = on;
+void llama_kv_cache_sel_arm(bool on, uint32_t dev_cells) {
+    g_kv_sel_armed     = on;
+    g_kv_sel_dev_cells = on ? dev_cells : 0;
 }
 
 // LLAMA_KV_SEL_HOST=1 and the backend procs of a buffer type that can map host memory into a lazy buffer (0 chunk size: no)
@@ -144,8 +146,10 @@ llama_kv_cache::llama_kv_cache(
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
     // k19-kvsel: armed for this cache (llama_kv_cache_sel_arm), consumed here so no other cache takes it
-    const bool sel_armed = g_kv_sel_armed;
-    g_kv_sel_armed = false;
+    const bool     sel_armed     = g_kv_sel_armed;
+    const uint32_t sel_dev_fixed = g_kv_sel_dev_cells;
+    g_kv_sel_armed     = false;
+    g_kv_sel_dev_cells = 0;
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
@@ -361,7 +365,8 @@ llama_kv_cache::llama_kv_cache(
     // k19-kvsel (LLAMA_KV_SEL_HOST=1): armed attention cache, flash attention layout (V not transposed), one stream, more cells than the
     // device budget LLAMA_KV_SEL_DEV_CELLS (32768; 0 = every cell in host chunks, a test setting)
     static const bool sel_env = getenv("LLAMA_KV_SEL_HOST") != nullptr && atoi(getenv("LLAMA_KV_SEL_HOST")) != 0;
-    const uint32_t sel_r_want = getenv("LLAMA_KV_SEL_DEV_CELLS") != nullptr ? (uint32_t) std::max(0, atoi(getenv("LLAMA_KV_SEL_DEV_CELLS"))) : 32768;
+    const uint32_t sel_r_want = sel_dev_fixed > 0 ? sel_dev_fixed :
+        getenv("LLAMA_KV_SEL_DEV_CELLS") != nullptr ? (uint32_t) std::max(0, atoi(getenv("LLAMA_KV_SEL_DEV_CELLS"))) : 32768;
     const bool sel_on = sel_env && sel_armed && other == nullptr && sel_r_want < kv_size;
     if (sel_env && sel_armed && !hparams.no_alloc) {
         LLAMA_LOG_INFO("%s: kv sel: %s (cells %u, device budget %u cells, streams %u, V %s)\n", __func__,
@@ -548,8 +553,9 @@ llama_kv_cache::llama_kv_cache(
     }
     if (!sel_bufs.empty()) {
         sel_r = sel_r_want;
+        sel_fixed = sel_dev_fixed > 0;
         const char * pol = getenv("LLAMA_KV_SEL_POLICY");
-        sel_window = pol != nullptr && strcmp(pol, "window") == 0;
+        sel_window = !sel_fixed && pol != nullptr && strcmp(pol, "window") == 0;
         sel_sinks  = getenv("LLAMA_KV_SEL_SINKS") != nullptr ? (uint32_t) std::max(0, atoi(getenv("LLAMA_KV_SEL_SINKS"))) : 4096;
         sel_sinks  = std::min(sel_sinks, sel_r);
         size_t dev_b = 0;
@@ -682,6 +688,9 @@ void llama_kv_cache::clear(bool data) {
 
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
+            ggml_backend_buffer_clear(buf.get(), 0);
+        }
+        for (auto & [_, buf] : aux_ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
     }
@@ -1004,7 +1013,7 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     // k19-kvwin: the ring buffers count with the cache (a fixed cost, never lazily backed)
-    for (const auto * bufs : { &ctxs_bufs, &win_ctxs_bufs }) for (const auto & [ctx, buf] : *bufs) {
+    for (const auto * bufs : { &ctxs_bufs, &win_ctxs_bufs, &aux_ctxs_bufs }) for (const auto & [ctx, buf] : *bufs) {
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
 
         // k19-kvsel: host chunks count as host memory
@@ -1623,6 +1632,54 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::sel_host() const {
     return ret;
 }
 
+void llama_kv_cache::aux_init(int64_t cols) {
+    GGML_ASSERT(aux_ctxs_bufs.empty() && cols > 0);
+    struct buft_cmp {
+        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
+            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+        }
+    };
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, buft_cmp> ctx_map;
+    for (auto & layer : layers) {
+        GGML_ASSERT(layer.k != nullptr && layer.k->buffer != nullptr);
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(layer.k->buffer);
+        auto it = ctx_map.find(buft);
+        if (it == ctx_map.end()) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ size_t(layers.size()*ggml_tensor_overhead()),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            it = ctx_map.emplace(buft, ggml_context_ptr(ggml_init(params))).first;
+        }
+        layer.k_aux = ggml_new_tensor_2d(it->second.get(), layer.k->type, cols, layer.k->ne[1]*layer.k->ne[2]);
+        ggml_format_name(layer.k_aux, "%s_aux", layer.k->name);
+    }
+    for (auto & [buft, ctx] : ctx_map) {
+        ggml_backend_buffer_t buf;
+        if (hparams.no_alloc) {
+            // a measurement: a dummy buffer (memory_breakdown counts the tensors), as the cache does
+            buf = ggml_backend_buft_alloc_buffer(buft, 0);
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                t->buffer = buf;
+            }
+        } else {
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+            if (buf == nullptr) {
+                throw std::runtime_error("failed to allocate the kv cache aux buffer");
+            }
+            ggml_backend_buffer_clear(buf, 0);
+            LLAMA_LOG_INFO("%s: %10s KV aux buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf),
+                ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        }
+        aux_ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+}
+
+ggml_tensor * llama_kv_cache::get_k_aux(int32_t il) const {
+    return layers[map_layer_ids.at(il)].k_aux;
+}
+
 std::vector<uint8_t> llama_kv_cache::sel_want(ggml_backend_buffer_t b, uint32_t sinks, uint32_t lo, uint32_t hi) const {
     const size_t n = (ggml_backend_buffer_get_size(b) + sel_gran - 1)/sel_gran;
     std::vector<uint8_t> want(n, 0);
@@ -1710,7 +1767,7 @@ bool llama_kv_cache::sel_update(uint32_t n_cells) {
 void llama_kv_cache::sel_stats_tick() {
     static const bool stats = getenv("LLAMA_KV_SEL_STATS") != nullptr && atoi(getenv("LLAMA_KV_SEL_STATS")) != 0;
     static const uint64_t every = getenv("LLAMA_KV_SEL_STATS_EVERY") != nullptr ? (uint64_t) std::max(1, atoi(getenv("LLAMA_KV_SEL_STATS_EVERY"))) : 32;
-    if (!stats || sel_bufs.empty()) {
+    if (!stats || sel_bufs.empty() || sel_fixed) {
         return;
     }
     if (++sel_batches % every != 0) {

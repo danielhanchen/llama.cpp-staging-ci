@@ -881,11 +881,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         pzero = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, idx_dim, n_tokens), 0.0f);
         qsa_c.pzero = pzero;
     }
-    ggml_tensor * packed = ggml_reshape_3d(ctx0, ggml_concat(ctx0, k_raw, pzero, 0), 2*idx_dim, 1, n_tokens);
-    ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, packed, inp_kpool->k_idxs, il));
-
     // the raw keys and the persistent pooled slots, see llama_memory_hybrid_idx::mem_idx_stale
     auto kpool_cache = mctx_hyb->get_kpool_access(ctx0, il, idx_dim);
+
+    if (kpool_cache.split()) {
+        // k19-kvsel: the raw key into the cache row, the zero pooled key into the pooled row of the same cell
+        ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, ggml_reshape_3d(ctx0, k_raw, idx_dim, 1, n_tokens), inp_kpool->k_idxs, il));
+        ggml_build_forward_expand(gf, kpool_cache.set_pooled_rows(pzero, inp_kpool->k_idxs));
+    } else {
+        ggml_tensor * packed = ggml_reshape_3d(ctx0, ggml_concat(ctx0, k_raw, pzero, 0), 2*idx_dim, 1, n_tokens);
+        ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, packed, inp_kpool->k_idxs, il));
+    }
 
     // pool only the blocks this ubatch completes or regroups
     ggml_tensor * rows = kpool_cache.gather_key_gate(inp_kpool->new_pool_flat);

@@ -12447,6 +12447,12 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
                 ret[buft].kv_sel += size;
             }
         }
+        // k19-kvsel: the split indexer cache's raw keys in host chunks
+        if (const auto * hi = dynamic_cast<const llama_memory_hybrid_idx *>(memory.get()); hi != nullptr && hi->get_mem_idx() != nullptr) {
+            for (const auto & [buft, size] : hi->get_mem_idx()->sel_host()) {
+                ret[buft].kv_sel += size;
+            }
+        }
     }
     if (moe_cache) {
         for (const auto & [buft, size] : moe_cache->memory_breakdown()) {

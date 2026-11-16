@@ -371,6 +371,9 @@ private:
         // k19-kvwin: the ring [n_embd, win_r + 1, n_stream] (the last row of each stream is a dump row), null when off
         ggml_tensor * k_win = nullptr;
         ggml_tensor * v_win = nullptr;
+
+        // k19-kvsel: a per-cell tensor [aux cols, kv_size] in its own device buffer (aux_init), null when off
+        ggml_tensor * k_aux = nullptr;
     };
 
     // k19-kvwin: the ring of one stream: slot -> cell and cell -> slot. A slot is live iff both agree and the cell is not empty, so
@@ -397,6 +400,8 @@ private:
     bool     win_no_assign = false; // state_read: the restored cells get slots from the blob, not from apply_ubatch
     mutable std::vector<kv_ring> v_rings;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> win_ctxs_bufs;
+    // k19-kvsel: the buffers of the per-cell aux tensors (aux_init)
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> aux_ctxs_bufs;
 
     bool win_slot_live(uint32_t strm, int32_t j) const;
     // assign ring slots to the cells of an applied ubatch
@@ -475,6 +480,12 @@ public:
     uint32_t sel_dev_cells() const { return sel_bufs.empty() ? 0 : sel_r; }
     // the K/V bytes held in host chunks, per device buffer type (a measurement: the bytes the host chunks would take)
     std::map<ggml_backend_buffer_type_t, size_t> sel_host() const;
+    // whether some K/V is (a measurement: would be) in host chunks
+    bool sel_engaged() const { return !sel_bufs.empty() || !sel_host_est.empty(); }
+    // k19-kvsel: give every layer a per-cell tensor of cols values of the K type, in a buffer of the layer's buffer type, cleared with
+    // the cache, counted in memory_breakdown and not part of the state (llama_memory_hybrid_idx: the pooled indexer keys)
+    void aux_init(int64_t cols);
+    ggml_tensor * get_k_aux(int32_t il) const;
 private:
     std::vector<ggml_backend_buffer_t> sel_bufs;
     std::vector<std::vector<uint8_t>>  sel_dev;      // per sel buffer: chunk on the device (1) or the host (0)
@@ -484,6 +495,7 @@ private:
     bool     sel_window = false;
     uint32_t sel_hi     = 0;    // window policy: the cell bound the device window was placed for
     uint64_t sel_batches = 0;   // LLAMA_KV_SEL_STATS: batches prepared
+    bool     sel_fixed   = false; // armed with its own device cells: static policy, no stats line
     size_t (*sel_move_fn)(ggml_backend_buffer_t, size_t, size_t, bool) = nullptr;
     size_t (*sel_committed_fn)(ggml_backend_buffer_t) = nullptr;
     std::map<ggml_backend_buffer_type_t, size_t> sel_host_est; // measurement: the bytes host chunks would take
@@ -730,5 +742,6 @@ private:
 };
 
 // k19-kvsel: the next llama_kv_cache constructed on this thread is an attention cache whose every layer reads only selected cells
-// (llama_memory_hybrid_idx, qwen4exp QSA); it then honours LLAMA_KV_SEL_HOST=1 (see llama_kv_cache::sel_dev_cells)
-void llama_kv_cache_sel_arm(bool on);
+// (llama_memory_hybrid_idx, qwen4exp QSA); it then honours LLAMA_KV_SEL_HOST=1 (see llama_kv_cache::sel_dev_cells). dev_cells > 0:
+// that many device cells per layer instead of LLAMA_KV_SEL_DEV_CELLS, static policy, no stats line (the split indexer key cache)
+void llama_kv_cache_sel_arm(bool on, uint32_t dev_cells = 0);
