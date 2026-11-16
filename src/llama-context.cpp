@@ -2523,7 +2523,7 @@ void llama_context::tiny_rel_leave() {
     if (!tiny_rel_held) {
         return;
     }
-    nextn_hold_wait(); // a drafter pass in flight beside this decode ends before its buffers go
+    nextn_hold_wait_free(); // a drafter pass in flight beside this decode ends before its buffers go
     const int64_t t0 = ggml_time_us();
     // the routing kept for a seed lives in the compute buffers freed here
     moe_cache_ids.clear();
@@ -2647,7 +2647,7 @@ void llama_context::ext_unpark() {
     }
     ext_grown = true; // also when nothing could be added: tried again after the next prompt
     const int64_t t0 = ggml_time_us();
-    nextn_hold_wait(); // a drafter pass in flight beside this decode ends before its buffers go
+    nextn_hold_wait_free(); // a drafter pass in flight beside this decode ends before its buffers go
     moe_cache_ids.clear();
     moe_cache_seq      = -1;
     moe_cache_pos_next = -1;
@@ -7359,7 +7359,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
             }
             size_t freed = 0;
             if (!dfts.empty()) {
-                nextn_hold_wait(); // a drafter pass in flight beside this decode ends before its buffers go
+                nextn_hold_wait_free(); // a drafter pass in flight beside this decode ends before its buffers go
             }
             for (llama_context * c : dfts) {
                 freed += c->release_device_compute();
@@ -7501,7 +7501,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         // maps the weights back at the same addresses before the drafter's next pass (llama_mtp_draft_weights_restore). Below
         // LLAMA_MTP_DRAFT_LEND_FREE_MIB (6144) free only: where the deep arena fits anyway the restore would cost the request ~25 ms
         if (lm_released && lm_rel_depth > 0 && llama_mtp_draft_lend_on() && cparams.spec_draft && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP &&
-                nextn_hold_fn == nullptr) {
+                nextn_hold_fn == nullptr && nextn_hold_free_fn == nullptr) {
             static const size_t lend_free = (size_t) (getenv("LLAMA_MTP_DRAFT_LEND_FREE_MIB") ? std::max(0, atoi(getenv("LLAMA_MTP_DRAFT_LEND_FREE_MIB"))) : 6144) << 20;
             // k19-npkdp (LLAMA_MTP_DRAFT_LEND_ARENA=0 off): the staging arena the scheduler already holds on the device counts as free here,
             // since the deep arena of the group grows from it (ggml_backend_sched_prefetch: extra = staging - arena_size). Where the MoE cache
@@ -13662,6 +13662,20 @@ int64_t llama_nextn_rows_wait(llama_context * ctx, int64_t n_rows) {
 
 void llama_set_nextn_hold(llama_context * ctx, void (*fn)(void *), void * user_data) {
     ctx->set_nextn_hold(fn, user_data);
+}
+
+void llama_set_nextn_hold_free(llama_context * ctx, void (*fn)(void *), void * user_data) {
+    ctx->set_nextn_hold_free(fn, user_data);
+}
+
+// k19-q4x262: the first few joins of a drafter pass by the free-only hold are logged (the engagement count of the fix)
+void llama_context::nextn_hold_free_log(double ms) {
+    static std::atomic<int64_t> n{0};
+    const int64_t k = ++n;
+    if (k <= 3) {
+        LLAMA_LOG_INFO("%s: k19-q4x262: the drafter's pass on a worker ended before its compute buffers were freed (%lld, waited %.2f ms; "
+            "LLAMA_MTP_PROMPT_BG_FREE_HOLD=0 off)\n", __func__, (long long) k, ms);
+    }
 }
 
 // k19-np12c (LLAMA_MTP_DRAFT_LEND_EAGER=0 off): the pinned host copy a drafter needs before its first lend (llama_context::mtp_lend_prepare)

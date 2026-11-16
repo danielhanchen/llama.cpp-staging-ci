@@ -1809,6 +1809,7 @@ private:
         bool                               live    = false; // main thread: a worker is running
         bool                               hold    = false; // main thread: the next update_slots continues the slot's prompt beside it
         bool                               group   = false; // main thread: beside the next prompt batch of any size (the target holds)
+        bool                               free_hold = false; // main thread: the target's free-only hold is set (k19-q4x262)
         bool                               fail    = false; // main thread: a pass the target's hold joined failed (reported at the next join)
         int                                slot_id = -1;    // main thread: the slot whose prompt batch the pass computes (k19-studio-np4)
         std::atomic<bool>                  ok      { true };
@@ -1816,6 +1817,15 @@ private:
     } spec_bg;
 
     static constexpr int32_t spec_bg_tail_max = 64; // the next target decode it may run beside: at most this many tokens
+
+    // k19-q4x262 (LLAMA_MTP_PROMPT_BG_FREE_HOLD=0 off): a pass launched beside the tail decode (not group mode) sets the target's
+    // free-only hold (llama_set_nextn_hold_free). Without it, a tail decode that took the MoE cache banks back after a released prompt
+    // freed the drafter's compute buffers and graph results while the pass computed in them (G4 q4x 12 GB ctx 262144 MTP, 8192-token
+    // prompt: the server died silently at the first decode, base and head alike)
+    static bool spec_bg_free_hold_on() {
+        static const bool v = getenv("LLAMA_MTP_PROMPT_BG_FREE_HOLD") == nullptr || atoi(getenv("LLAMA_MTP_PROMPT_BG_FREE_HOLD")) != 0;
+        return v;
+    }
 
     // joins the worker (a no-op without one); false: its pass failed (the caller reports it, as the in-line pass's failure)
     bool spec_bg_join() {
@@ -1875,6 +1885,10 @@ private:
         }
         if (spec_bg.group) {
             llama_set_nextn_hold(ctx_tgt, nullptr, nullptr);
+        }
+        if (spec_bg.free_hold) {
+            llama_set_nextn_hold_free(ctx_tgt, nullptr, nullptr);
+            spec_bg.free_hold = false;
         }
         const int64_t t0 = ggml_time_us();
         {
@@ -6845,6 +6859,12 @@ private:
                 spec_bg.slot_id = bg_sl->id;
                 if (spec_bg.group) {
                     llama_set_nextn_hold(ctx_tgt, &server_context_impl::spec_bg_hold_cb, this);
+                } else if (spec_bg_free_hold_on()) {
+                    // k19-q4x262: the [<= spec_bg_tail_max] tail decode beside the pass writes no rows the pass reads (they are stashed),
+                    // but it may still free the drafter's compute buffers (MoE cache banks coming back after a released prompt):
+                    // the pass ends first there
+                    llama_set_nextn_hold_free(ctx_tgt, &server_context_impl::spec_bg_hold_cb, this);
+                    spec_bg.free_hold = true;
                 }
                 SRV_INF("mtp prompt pass on a worker: %d rows, %zu segments beside the next %d-token target decode%s (LLAMA_MTP_PROMPT_BG=0 off)\n",
                         batch.view.size(), seg_breaks.empty() ? (size_t) 1 : seg_breaks.size() + 1 - spec_seg_done, std::min<int32_t>(n_rest, n_batch),
