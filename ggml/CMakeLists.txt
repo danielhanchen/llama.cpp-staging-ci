@@ -338,6 +338,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-opt.h
     include/ggml-metal.h
     include/ggml-moe-prefetch.h
+    include/ggml-sel-mask.h
     include/ggml-rpc.h
     include/ggml-virtgpu.h
     include/ggml-sycl.h

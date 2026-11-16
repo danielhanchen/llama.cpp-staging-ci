@@ -9,6 +9,7 @@
 #include "ggml-threading.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+#include "ggml-sel-mask.h"
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
@@ -3529,9 +3530,28 @@ struct ggml_tensor * ggml_kq_mask_win(
         GGML_ASSERT(flags->ne[0] == cells->ne[1] && flags->ne[1] == cells->ne[2] && flags->ne[2] == 1 && flags->ne[3] == 1);
         result->src[2] = flags;
     }
-    ggml_set_op_params_i32(result,  8, mode);
+    ggml_set_op_params_i32(result, GGML_KQ_MASK_KIND_SLOT, mode == 1 ? GGML_KQ_MASK_KIND_WIN_BODY : GGML_KQ_MASK_KIND_WIN_RING);
     ggml_set_op_params_i32(result,  9, n_win);
     ggml_set_op_params_i32(result, 10, MAX(0, n_sinks));
+    return result;
+}
+
+// k19-kvlong: see ggml-sel-mask.h
+struct ggml_tensor * ggml_sel_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * idx,
+        struct ggml_tensor  * kq_mask) {
+    GGML_ASSERT(idx->type == GGML_TYPE_I32 && kq_mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_is_contiguous(kq_mask) && idx->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(idx->ne[1] == kq_mask->ne[1]*kq_mask->ne[2]*kq_mask->ne[3] && idx->ne[2] == 1 && idx->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F16, GGML_MAX_DIMS, kq_mask->ne);
+
+    ggml_set_op_params_i32(result, GGML_KQ_MASK_KIND_SLOT, GGML_KQ_MASK_KIND_SEL);
+    result->op     = GGML_OP_KQ_MASK;
+    result->src[0] = idx;
+    result->src[1] = kq_mask;
+
     return result;
 }
 

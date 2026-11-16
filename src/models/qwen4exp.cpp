@@ -995,20 +995,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel_mask(
     const int64_t n_kv  = inp_kpool->n_kv;
     GGML_ASSERT(sel_idx->ne[0] == n_sel && sel_idx->ne[1] == n_tokens);
 
-    // TODO: figure out to reduce the large copmute buffer that this creates
-
-    // scatter zeros for the selected cells into an all -inf row, each dead slot into its own dump row n_kv + slot
-    ggml_tensor * mask_all = ggml_new_tensor_4d(ctx0, kq_mask->type, n_kv + n_sel, 1, 1, 1);
-    mask_all = ggml_fill(ctx0, mask_all, -INFINITY);
-    mask_all = ggml_repeat_4d(ctx0, mask_all, n_kv + n_sel, n_tokens, 1, 1);
-    mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_kv + n_sel, n_tokens);
-
-    // (per layer: the CUDA maskless attention matches this fill chain as private to the layer, see ggml_cuda_qsa_maskless_plan)
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, kq_mask->type, n_sel, 1, 1, 1);
-    zeros = ggml_fill(ctx0, zeros, 0.0f);
-    zeros = ggml_repeat_4d(ctx0, zeros, n_sel, n_tokens, 1, 1);
-    zeros = ggml_reshape_3d(ctx0, zeros, 1, n_sel, n_tokens);
-
     // k19-kvwin: the KV window ring reads the same selection at its slots: the selected cells mapped to their ring slots (a cell
     // without a live slot, and every dump row, to the ring's dump row n_slots) and scattered into an all -inf ring row, plus the ring
     // mask. Built before the dense selection below, so that the selection chain keeps a single reader and the CUDA maskless
@@ -1045,6 +1031,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel_mask(
         cb(qsa_c.win_mask, "kq_mask_qsa_win", il);
         ggml_build_forward_expand(gf, qsa_c.win_mask);
     }
+
+    // k19-kvlong: the dense selection as one node where the layer's device runs it (no [n_kv + n_sel, n_tokens] scatter buffer, see
+    // build_sel_mask_op); the window ring's mask above reads the selected cells, not the dense selection, so it is the same either way
+    if (ggml_tensor * m = build_sel_mask_op(sel_idx, kq_mask, model.dev_layer(il))) {
+        cb(m, "indexer_sel", il);
+        return m;
+    }
+
+    // scatter zeros for the selected cells into an all -inf row, each dead slot into its own dump row n_kv + slot
+    ggml_tensor * mask_all = ggml_new_tensor_4d(ctx0, kq_mask->type, n_kv + n_sel, 1, 1, 1);
+    mask_all = ggml_fill(ctx0, mask_all, -INFINITY);
+    mask_all = ggml_repeat_4d(ctx0, mask_all, n_kv + n_sel, n_tokens, 1, 1);
+    mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_kv + n_sel, n_tokens);
+
+    // (per layer: the CUDA maskless attention matches this fill chain as private to the layer, see ggml_cuda_qsa_maskless_plan)
+    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, kq_mask->type, n_sel, 1, 1, 1);
+    zeros = ggml_fill(ctx0, zeros, 0.0f);
+    zeros = ggml_repeat_4d(ctx0, zeros, n_sel, n_tokens, 1, 1);
+    zeros = ggml_reshape_3d(ctx0, zeros, 1, n_sel, n_tokens);
 
     ggml_tensor * sel = ggml_set_rows(ctx0, mask_all, zeros, sel_idx);
 

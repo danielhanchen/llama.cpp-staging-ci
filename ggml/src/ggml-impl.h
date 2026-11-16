@@ -29,6 +29,16 @@
 extern "C" {
 #endif
 
+// GGML_OP_KQ_MASK: the kind of mask a node builds, in op_params[GGML_KQ_MASK_KIND_SLOT] (op_params[0..5] stay free: llama keeps the
+// host inputs of a device-built mask there, see llm_graph build_attn_inp_kq_mask / llama_kv_cache::set_input_kq_mask)
+#define GGML_KQ_MASK_KIND_SLOT 8
+enum ggml_kq_mask_kind {
+    GGML_KQ_MASK_KIND_PLAIN    = 0, // ggml_kq_mask: src[0] cells I32 [5, n_kv, n_stream], src[1] tokens I32 [8, n_tps, n_stream]
+    GGML_KQ_MASK_KIND_WIN_BODY = 1, // ggml_kq_mask_win mode 1: as PLAIN without the window cells flagged in src[2] (n_win, n_sinks in 9, 10)
+    GGML_KQ_MASK_KIND_WIN_RING = 2, // ggml_kq_mask_win mode 2: as PLAIN over the ring slots, the window cells only (n_win, n_sinks in 9, 10)
+    GGML_KQ_MASK_KIND_SEL      = 3, // ggml_sel_mask: src[1] kq_mask F16 - INFINITY, the cells of src[0] idx I32 [n_sel, n_rows] kept
+};
+
 void ggml_print_backtrace(void);
 
 uint64_t ggml_graph_next_uid(void);

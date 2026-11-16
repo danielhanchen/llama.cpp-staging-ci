@@ -18,6 +18,7 @@
 
 #include "ggml.h"
 #include "ggml-fa-src2.h"
+#include "ggml-sel-mask.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
@@ -8946,9 +8947,10 @@ struct test_qsa_sel_fa : public test_case {
     const int64_t kv;
     const int64_t nb;  // tokens
     const int64_t n_sel;
+    const bool    op; // k19-kvlong: the mask as one ggml_sel_mask node instead of the chain
 
     std::string vars() override {
-        return VARS_TO_STR6(hs, nh, nr, kv, nb, n_sel);
+        return VARS_TO_STR7(hs, nh, nr, kv, nb, n_sel, op);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -8962,8 +8964,8 @@ struct test_qsa_sel_fa : public test_case {
         return 5e-4;
     }
 
-    test_qsa_sel_fa(int64_t hs, int64_t nh, int64_t nr, int64_t kv, int64_t nb, int64_t n_sel)
-        : hs(hs), nh(nh), nr(nr), kv(kv), nb(nb), n_sel(n_sel) {}
+    test_qsa_sel_fa(int64_t hs, int64_t nh, int64_t nr, int64_t kv, int64_t nb, int64_t n_sel, bool op = false)
+        : hs(hs), nh(nh), nr(nr), kv(kv), nb(nb), n_sel(n_sel), op(op) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*nr, 1);
@@ -8977,16 +8979,21 @@ struct test_qsa_sel_fa : public test_case {
         ggml_tensor * idx = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_sel, nb, 1);
         ggml_set_name(idx, "idx");
 
-        ggml_tensor * mask_all = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv + n_sel, 1, 1, 1), -INFINITY);
-        mask_all = ggml_repeat_4d(ctx, mask_all, kv + n_sel, nb, 1, 1);
-        mask_all = ggml_reshape_3d(ctx, mask_all, 1, kv + n_sel, nb);
-        ggml_tensor * zeros = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_sel, 1, 1, 1), 0.0f);
-        zeros = ggml_repeat_4d(ctx, zeros, n_sel, nb, 1, 1);
-        zeros = ggml_reshape_3d(ctx, zeros, 1, n_sel, nb);
-        ggml_tensor * sel = ggml_set_rows(ctx, mask_all, zeros, idx);
-        const size_t row = sel->nb[2];
-        sel = ggml_view_4d(ctx, sel, kv, nb, 1, 1, row, row*nb, row*nb, 0);
-        sel = ggml_add(ctx, sel, kq);
+        ggml_tensor * sel = nullptr;
+        if (op) {
+            sel = ggml_sel_mask(ctx, idx, kq);
+        } else {
+            ggml_tensor * mask_all = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv + n_sel, 1, 1, 1), -INFINITY);
+            mask_all = ggml_repeat_4d(ctx, mask_all, kv + n_sel, nb, 1, 1);
+            mask_all = ggml_reshape_3d(ctx, mask_all, 1, kv + n_sel, nb);
+            ggml_tensor * zeros = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_sel, 1, 1, 1), 0.0f);
+            zeros = ggml_repeat_4d(ctx, zeros, n_sel, nb, 1, 1);
+            zeros = ggml_reshape_3d(ctx, zeros, 1, n_sel, nb);
+            sel = ggml_set_rows(ctx, mask_all, zeros, idx);
+            const size_t row = sel->nb[2];
+            sel = ggml_view_4d(ctx, sel, kv, nb, 1, 1, row, row*nb, row*nb, 0);
+            sel = ggml_add(ctx, sel, kq);
+        }
 
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, sel, 1.0f/sqrtf(hs), 0.0f, 0.0f);
         ggml_flash_attn_ext_set_n_kv_max(out, n_sel);
@@ -9023,6 +9030,96 @@ struct test_qsa_sel_fa : public test_case {
                     }
                     ids[j*n_sel + 1] = ids[j*n_sel + 0];
                     ids[j*n_sel + 2] = int32_t(kv - 1);
+                }
+                ggml_backend_tensor_set(t, ids.data(), 0, ids.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// k19-kvlong: ggml_sel_mask (GGML_OP_KQ_MASK mode 1) alone. chain = 0: the node; chain = 1: the node minus the chain it replaces, as
+// exp(node) - exp(chain) (both 0 or 1 at every cell: exact equality gives all zeros on every backend)
+struct test_sel_mask : public test_case {
+    const int64_t kv, nb, n_sel;
+    const int     chain;
+
+    std::string vars() override {
+        return VARS_TO_STR4(kv, nb, n_sel, chain);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SEL_MASK";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 0.0;
+    }
+
+    // exact: the number of cells whose values differ (-inf equals -inf)
+    double err(const float * a, const float * b, size_t n) override {
+        size_t bad = 0;
+        for (size_t i = 0; i < n; i++) {
+            bad += !(a[i] == b[i]);
+        }
+        return (double) bad;
+    }
+
+    test_sel_mask(int64_t kv, int64_t nb, int64_t n_sel, int chain) : kv(kv), nb(nb), n_sel(n_sel), chain(chain) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * kq = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_set_name(kq, "kq");
+        ggml_tensor * idx = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_sel, nb, 1);
+        ggml_set_name(idx, "idx");
+        ggml_tensor * m = ggml_sel_mask(ctx, idx, kq);
+        if (chain == 0) {
+            ggml_set_name(m, "out");
+            return m;
+        }
+        ggml_tensor * mask_all = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv + n_sel, 1, 1, 1), -INFINITY);
+        mask_all = ggml_repeat_4d(ctx, mask_all, kv + n_sel, nb, 1, 1);
+        mask_all = ggml_reshape_3d(ctx, mask_all, 1, kv + n_sel, nb);
+        ggml_tensor * zeros = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_sel, 1, 1, 1), 0.0f);
+        zeros = ggml_repeat_4d(ctx, zeros, n_sel, nb, 1, 1);
+        zeros = ggml_reshape_3d(ctx, zeros, 1, n_sel, nb);
+        ggml_tensor * sel = ggml_set_rows(ctx, mask_all, zeros, idx);
+        const size_t row = sel->nb[2];
+        sel = ggml_view_4d(ctx, sel, kv, nb, 1, 1, row, row*nb, row*nb, 0);
+        sel = ggml_add(ctx, sel, kq);
+        ggml_tensor * out = ggml_sub(ctx, ggml_exp(ctx, ggml_cast(ctx, m, GGML_TYPE_F32)), ggml_exp(ctx, ggml_cast(ctx, sel, GGML_TYPE_F32)));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x5E1);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "kq") == 0) {
+                std::vector<ggml_fp16_t> m16(kv*nb);
+                for (int64_t j = 0; j < nb; ++j) {
+                    for (int64_t c = 0; c < kv; ++c) {
+                        m16[j*kv + c] = ggml_fp32_to_fp16(c <= kv - nb + j ? 0.0f : -INFINITY);
+                    }
+                }
+                ggml_backend_tensor_set(t, m16.data(), 0, m16.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "idx") == 0) {
+                // distinct live cells (some past the causal limit), a duplicate, every 7th slot dead (its dump row)
+                std::vector<int32_t> ids(n_sel*nb);
+                std::vector<int32_t> order(kv);
+                for (int64_t c = 0; c < kv; ++c) {
+                    order[c] = c;
+                }
+                for (int64_t j = 0; j < nb; ++j) {
+                    std::shuffle(order.begin(), order.end(), gen);
+                    for (int64_t s = 0; s < n_sel; ++s) {
+                        ids[j*n_sel + s] = s % 7 == 3 ? int32_t(kv + s) : order[s % kv];
+                    }
+                    ids[j*n_sel + 1] = ids[j*n_sel + 0];
                 }
                 ggml_backend_tensor_set(t, ids.data(), 0, ids.size()*sizeof(int32_t));
             } else {
@@ -14485,6 +14582,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (int64_t nb : { 512, 2048 }) {
         test_cases.emplace_back(new test_qsa_sel_fa(256, 2, 12, 8192, nb, 2051));
+    }
+    // k19-kvlong: the same with the mask as one ggml_sel_mask node (decode / verify gather, the dense 8-token case, prompts), and the
+    // node alone and against the chain
+    for (int64_t nb : { 1, 3, 8, 40 }) {
+        test_cases.emplace_back(new test_qsa_sel_fa(256, 2, 12, 16384, nb, 2051, true));
+    }
+    test_cases.emplace_back(new test_qsa_sel_fa(256, 2, 8, 65536, 2, 2051, true));
+    for (int64_t nb : { 512, 2048 }) {
+        test_cases.emplace_back(new test_qsa_sel_fa(256, 2, 12, 8192, nb, 2051, true));
+    }
+    for (int chain : { 0, 1 }) {
+        test_cases.emplace_back(new test_sel_mask(4608, 1, 2051, chain));
+        test_cases.emplace_back(new test_sel_mask(16384, 3, 2051, chain));
+        test_cases.emplace_back(new test_sel_mask(8192, 512, 2051, chain));
+        test_cases.emplace_back(new test_sel_mask(1000, 7, 37, chain));
     }
 
     for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q4_0 }) {

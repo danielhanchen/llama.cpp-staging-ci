@@ -1390,6 +1390,11 @@ struct llm_graph_context {
     // GPU copy of the cached rows `view` [n_embd_head, n_head_kv, n_kv, 1] with the rows `cur` written at `idxs`
     ggml_tensor * kv_host_stage(ggml_tensor * view, ggml_tensor * cur, ggml_tensor * idxs) const;
 
+    // k19-kvlong: the dense selection mask of a sparse attention (I32 [n_sel, n_tokens] selected cells, dead slots >= n_kv) as one
+    // ggml_sel_mask node, or nullptr where the layer's device does not run it or LLAMA_QSA_SEL_OP=0 (then the caller builds the
+    // fill / repeat / set_rows / add chain, whose values it equals)
+    ggml_tensor * build_sel_mask_op(ggml_tensor * sel_idx, ggml_tensor * kq_mask, ggml_backend_dev_t dev) const;
+
     // k19-kvwin: store this ubatch's K / V in the ring of a windowed cache and return the ring as the attention's second source (empty
     // without a ring); n_embd_v_view > 0: V is a view of K (MLA)
     llm_graph_attn_src2 build_kv_win_src(const llm_graph_kv_win & w, const llama_kv_cache_context * mctx, ggml_tensor * k_cur,

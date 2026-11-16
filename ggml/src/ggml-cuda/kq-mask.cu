@@ -50,7 +50,67 @@ static __global__ void kq_mask_kernel(const int32_t * __restrict__ cells, const 
     }
 }
 
+// k19-kvlong: GGML_OP_KQ_MASK kind GGML_KQ_MASK_KIND_SEL (ggml_sel_mask). Every cell kq - INFINITY, then the selected cells kq + 0 (one stream, in order),
+// each rounded as the f16 add of the chain add(view(set_rows(fill(-inf), fill(0), idx)), kq) it replaces
+static __global__ void sel_mask_fill_kernel(const half * __restrict__ kq, half * __restrict__ dst, const int64_t n_kv,
+        const size_t nb1_kq, const size_t nb1_dst) {
+    const int64_t j = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t r = blockIdx.y;
+    if (j >= n_kv) {
+        return;
+    }
+    const half k = ((const half *) ((const char *) kq + r*nb1_kq))[j];
+    ((half *) ((char *) dst + r*nb1_dst))[j] = __float2half(-INFINITY + __half2float(k));
+}
+
+static __global__ void sel_mask_scatter_kernel(const int32_t * __restrict__ idx, const half * __restrict__ kq, half * __restrict__ dst,
+        const int64_t n_kv, const int64_t n_sel, const size_t nb1_idx, const size_t nb1_kq, const size_t nb1_dst) {
+    const int64_t s = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t r = blockIdx.y;
+    if (s >= n_sel) {
+        return;
+    }
+    const int32_t j = ((const int32_t *) ((const char *) idx + r*nb1_idx))[s];
+    if (j < 0 || j >= n_kv) {
+        return; // a dead slot
+    }
+    const half k = ((const half *) ((const char *) kq + r*nb1_kq))[j];
+    ((half *) ((char *) dst + r*nb1_dst))[j] = __float2half(0.0f + __half2float(k));
+}
+
+static void ggml_cuda_op_sel_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * idx = dst->src[0];
+    const ggml_tensor * kq  = dst->src[1];
+    GGML_ASSERT(dst->type == GGML_TYPE_F16 && kq->type == GGML_TYPE_F16 && idx->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(kq) && idx->nb[0] == sizeof(int32_t));
+    const int64_t n_kv   = dst->ne[0];
+    const int64_t n_rows = dst->ne[1]*dst->ne[2]*dst->ne[3];
+    const int64_t n_sel  = idx->ne[0];
+    if (n_kv == 0 || n_rows == 0) {
+        return;
+    }
+    cudaStream_t stream = ctx.stream();
+    const dim3 block(256, 1, 1);
+    for (int64_t r0 = 0; r0 < n_rows; r0 += 65535) {
+        const int64_t nr = std::min<int64_t>(n_rows - r0, 65535);
+        const half * kq_r  = (const half *) ((const char *) kq->data + r0*kq->nb[1]);
+        half       * dst_r = (half *) ((char *) dst->data + r0*dst->nb[1]);
+        const dim3 grid_f((unsigned) ((n_kv + 255)/256), (unsigned) nr, 1);
+        sel_mask_fill_kernel<<<grid_f, block, 0, stream>>>(kq_r, dst_r, n_kv, kq->nb[1], dst->nb[1]);
+        if (n_sel > 0) {
+            const int32_t * idx_r = (const int32_t *) ((const char *) idx->data + r0*idx->nb[1]);
+            const dim3 grid_s((unsigned) ((n_sel + 255)/256), (unsigned) nr, 1);
+            sel_mask_scatter_kernel<<<grid_s, block, 0, stream>>>(idx_r, kq_r, dst_r, n_kv, n_sel, idx->nb[1], kq->nb[1], dst->nb[1]);
+        }
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_op_kq_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_get_op_params_i32(dst, GGML_KQ_MASK_KIND_SLOT) == GGML_KQ_MASK_KIND_SEL) {
+        ggml_cuda_op_sel_mask(ctx, dst);
+        return;
+    }
     const ggml_tensor * cells = dst->src[0];
     const ggml_tensor * toks  = dst->src[1];
     GGML_ASSERT(ggml_is_contiguous(cells) && ggml_is_contiguous(toks));
@@ -66,6 +126,7 @@ void ggml_cuda_op_kq_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int32_t n_win = ggml_get_op_params_i32(dst, 9), n_sinks = ggml_get_op_params_i32(dst, 10);
     const int32_t * flags = win_mode == 1 ? (const int32_t *) dst->src[2]->data : nullptr;
     GGML_ASSERT(win_mode != 1 || (dst->src[2] != nullptr && ggml_is_contiguous(dst->src[2])));
+    GGML_ASSERT(win_mode == GGML_KQ_MASK_KIND_PLAIN || win_mode == GGML_KQ_MASK_KIND_WIN_BODY || win_mode == GGML_KQ_MASK_KIND_WIN_RING);
     if (dst->type == GGML_TYPE_F16) {
         kq_mask_kernel<half><<<grid, block, 0, stream>>>((const int32_t *) cells->data, (const int32_t *) toks->data, (half *) dst->data,
             n_kv, n_tps, dst->nb[1], dst->nb[3], flags, win_mode, n_win, n_sinks);

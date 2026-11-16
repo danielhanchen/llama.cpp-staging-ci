@@ -6168,6 +6168,51 @@ static void ggml_cuda_qsa_maskless_plan(ggml_backend_cuda_context * cuda_ctx, co
         if (fa->op != GGML_OP_FLASH_ATTN_EXT || (fa->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) || ggml_get_op_params_i32(fa, 4) <= 0) {
             continue;
         }
+        // k19-kvlong: the selection mask as one node (ggml_sel_mask, GGML_OP_KQ_MASK kind GGML_KQ_MASK_KIND_SEL). A decode / verify window gathers from
+        // its idx and kq as from the chain's (the node is not run); a prompt runs the node, which builds the dense mask in one pass as
+        // the rebuild below does, so it is not planned
+        const ggml_tensor * sm = fa->src[3];
+        if (sm != nullptr && sm->op == GGML_OP_KQ_MASK && ggml_get_op_params_i32(sm, GGML_KQ_MASK_KIND_SLOT) == GGML_KQ_MASK_KIND_SEL) {
+            const ggml_tensor * idx = sm->src[0];
+            const ggml_tensor * kq  = sm->src[1];
+            const int64_t n_tok = kq->ne[1]*kq->ne[3];
+            if (!ggml_cuda_qsa_private(cgraph, sm) || n_tok > GGML_CUDA_QSA_MASKLESS_MAX_TOKENS || kq->ne[2] != 1 || kq->ne[3] != 1 ||
+                    kq->nb[0] != sizeof(half) || idx->type != GGML_TYPE_I32 || idx->nb[0] != sizeof(int32_t) || idx->ne[1] != n_tok) {
+                continue;
+            }
+            int i_sm = -1;
+            for (int j = i - 1; j >= 0 && i_sm < 0; --j) {
+                i_sm = cgraph->nodes[j] == sm ? j : -1;
+            }
+            if (i_sm < 0) {
+                continue;
+            }
+            const auto hits = [](const char * r0, const char * r1, const ggml_tensor * t) {
+                return r0 < (const char *) t->data + ggml_nbytes(t) && (const char *) t->data < r1;
+            };
+            const auto overlaps = [&](const ggml_tensor * a, const ggml_tensor * b) {
+                return hits((const char *) a->data, (const char *) a->data + ggml_nbytes(a), b);
+            };
+            // idx is read after its last graph reader (the node) and kq maybe after its last one: the nodes up to the attention must not
+            // have been given their memory, and the attention writes its F16 K / V copies behind its output before the list build reads idx
+            bool clobbered = false;
+            for (int j = i_sm + 1; j < i && !clobbered; ++j) {
+                const ggml_tensor * t = cgraph->nodes[j];
+                if (ggml_cuda_is_view_or_noop(t)) {
+                    continue;
+                }
+                clobbered = overlaps(t, idx) || overlaps(t, kq);
+            }
+            const char * fa0 = (const char *) fa->data;
+            const char * fa1 = fa0 + ggml_cuda_flash_attn_ext_get_alloc_size(cuda_ctx->device, fa);
+            const char * fo1 = fa0 + ggml_nbytes(fa);
+            if (clobbered || hits(fo1, fa1, idx) || hits(fa0, fa1, kq)) {
+                continue;
+            }
+            cuda_ctx->qsa_maskless[fa] = { idx, kq, overlaps(sm, idx) || overlaps(sm, kq), false };
+            cuda_ctx->qsa_skip.insert(sm);
+            continue;
+        }
         const ggml_tensor * add = fa->src[3];
         if (add == nullptr || add->op != GGML_OP_ADD || add->type != GGML_TYPE_F16 || !ggml_cuda_qsa_private(cgraph, add)) {
             continue;
@@ -12299,6 +12344,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_MOE_CACHE_LOOKUP:
             return ggml_cuda_moe_cache_lookup_supported(op);
         case GGML_OP_KQ_MASK:
+            if (ggml_get_op_params_i32(op, GGML_KQ_MASK_KIND_SLOT) == GGML_KQ_MASK_KIND_SEL) { // k19-kvlong: ggml_sel_mask
+                return op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_F16 &&
+                    ggml_is_contiguous(op->src[1]) && op->src[0]->nb[0] == sizeof(int32_t);
+            }
             return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
         case GGML_OP_DFLASH2_CONV:
             return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
