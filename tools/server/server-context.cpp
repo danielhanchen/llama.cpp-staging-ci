@@ -2142,7 +2142,7 @@ private:
                 },
                 [](ggml_backend_dev_t a, ggml_backend_dev_t b) { return ggml_backend_dev_backend_reg(a) == ggml_backend_dev_backend_reg(b); },
                 params.split_mode == LLAMA_SPLIT_MODE_NONE, params.main_gpu);
-            int n_gpu = 0, cc_min = INT_MAX;
+            int n_gpu = 0, cc_min = INT_MAX, cc_max = -1;
             for (ggml_backend_dev_t dev : gpus) {
                 if (!mtp_shape) {
                     break;
@@ -2152,6 +2152,7 @@ private:
                 const int cc = cc_fn != nullptr ? cc_fn(dev) : -1;
                 n_gpu++;
                 cc_min = std::min(cc_min, cc);
+                cc_max = std::max(cc_max, cc);
             }
             const bool dev_ok = n_gpu > 0 && cc_min >= 800;
             // no wider window where the experts will not all fit on the devices: there the fit runs an MoE cache, whose residency a
@@ -2284,15 +2285,39 @@ private:
                 // (short_b == 0: every routed expert is expected on the devices and the need only reads high from the drafter and margin,
                 // k19-bigverify's A100 80 GB full card, where 4 drafts measured 8k -18.6%: not this rule's tier)
                 const bool def_on    = exp_b > 0 && short_b > 0 && share >= share_min && resident;
-                if (def_on) {
+                // k19-g4tail (LLAMA_MOE_G4TAIL=0: off, the int3 rule above alone): a cache expected to hold LLAMA_MOE_G4TAIL_LO .. _HI (0.07 ..
+                // 0.17, the estimate; G4 16 GB reads 10.8% here, 14.4% once placed) of the routed experts, on compute capability 12.0 cards
+                // only, with the target in RAM: the windows draft n_def (4) too, and the MoE cache's cross-layer prefetch is on in its band
+                // (LLAMA_MOE_PREFETCH_AUTO=2 for llama_moe_cache: top 10 predicted experts, at most 1 copied per layer, generation and verify
+                // windows only, where the placed cache holds 10-20%). With the route tail skip off (int3 c5d7c3bc40d) every rank 7-9 miss is a
+                // host expert or a copy; the two together, Colab G4 Flash-Next UD-IQ4_XS MTP n2 16 GB, 3 launches on two VMs: chat +8.3 / +9.0%
+                // (held-out text +9.5%), 8k +8.0 / +10.8% (held-out -1.3%); long48 KLD inside the -fa off band on all 8 statistics
+                // (plans/k19_g4tail.md). An explicit LLAMA_SPEC_DEPTH_CACHED / LLAMA_MOE_PREFETCH / LLAMA_MOE_PREFETCH_AUTO keeps its value
+                const bool g4tail_on = [] {
+                    const char * x = getenv("LLAMA_MOE_G4TAIL");
+                    return x == nullptr || atoi(x) != 0;
+                }();
+                const double g4t_lo = getenv("LLAMA_MOE_G4TAIL_LO") != nullptr ? atof(getenv("LLAMA_MOE_G4TAIL_LO")) : 0.07;
+                const double g4t_hi = getenv("LLAMA_MOE_G4TAIL_HI") != nullptr ? atof(getenv("LLAMA_MOE_G4TAIL_HI")) : 0.17;
+                const bool g4t = !def_on && g4tail_on && exp_b > 0 && short_b > 0 && resident && share >= g4t_lo && share < g4t_hi &&
+                    n_gpu > 0 && cc_min == 1200 && cc_max == 1200;
+                if (def_on || g4t) {
                     depth_cached = n_def;
                     // (a model on a memory file system: its experts are in RAM whatever MemAvailable reads)
                     disk_ok = disk_ok || in_ram_fs;
                 }
+                if (g4t && getenv("LLAMA_MOE_PREFETCH") == nullptr && getenv("LLAMA_MOE_PREFETCH_AUTO") == nullptr) {
+                    common_set_env("LLAMA_MOE_PREFETCH_AUTO", "2");
+                }
+                if (g4t) {
+                    SRV_INF("k19-g4tail: MoE cache expected to hold %.1f%% of the routed experts (band %.2f .. %.2f, compute capability 12.0, target "
+                        "in RAM): MTP windows of %d drafts and the cache's cross-layer prefetch in its band (LLAMA_MOE_G4TAIL=0: off)\n", 100.0*share,
+                        g4t_lo, g4t_hi, n_def);
+                }
                 SRV_INF("k19-fnmtp2: MoE cache expected to hold %.1f%% of the routed experts (%.0f MiB short of %.0f MiB); target GGUF %.0f MiB %s "
                     "(%.0f MiB of RAM available): %s (LLAMA_SPEC_DEPTH_CACHED_SHARE=%.2f; LLAMA_SPEC_DEPTH_CACHED=0: 2 drafts)\n", 100.0*share,
                     short_b/1048576.0, exp_b/1048576.0, tgt_bytes/1048576.0, in_ram_fs ? "on a memory file system" : resident ? "fits in RAM" :
-                    "does not fit in RAM", ram_avail/1048576.0, def_on ? "deeper MTP windows by default" : "MTP windows of 2 drafts", share_min);
+                    "does not fit in RAM", ram_avail/1048576.0, def_on || g4t ? "deeper MTP windows by default" : "MTP windows of 2 drafts", share_min);
             }
             const uint64_t expert_bytes = mtp_shape && !on && cache_expected && depth_cached >= 3 ? common_moe_expert_bytes(params.model.path) : 0;
             const bool ram_fits = ram_avail == 0 || expert_bytes <= ram_avail;
