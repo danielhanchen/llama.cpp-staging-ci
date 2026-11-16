@@ -470,6 +470,14 @@ extern "C" {
         // state capture snapshots for layer-major prompts (-1: the default, LLAMA_STATE_CAPTURE_MAX or 2; 0: none, as
         // LLAMA_LM_CKPT_CAPTURE=0); --fit lowers it where the snapshots would cost device layers [EXPERIMENTAL]
         int32_t n_state_capture;
+
+        // k19-kvwin: recent-window ring beside a quantized KV cache [EXPERIMENTAL]: the last kv_win positions and the first kv_win_sinks
+        // positions of every sequence are also kept in type_k_win / type_v_win, and the attention reads them from there
+        // (-1: off; env LLAMA_KV_WIN / LLAMA_KV_WIN_SINKS / LLAMA_KV_WIN_TYPE(_K / _V) override). Needs flash attention
+        int32_t        kv_win;
+        int32_t        kv_win_sinks;
+        enum ggml_type type_k_win;
+        enum ggml_type type_v_win;
     };
 
     struct llama_model_tensor_override {

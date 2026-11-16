@@ -2774,6 +2774,8 @@ struct llama_model_qwen4exp : public llama_model_base {
         // weights, the tail liveness and the dump rows), built once per graph by the first QSA layer
         struct qsa_shared {
             ggml_tensor * pzero     = nullptr;
+            // k19-kvwin: the selection scattered into -inf rows ([1, n_kv + n_sel, n_tokens], before the causal mask), see build_attn_qsa
+            ggml_tensor * sel_raw   = nullptr;
             ggml_tensor * weights   = nullptr;
             ggml_tensor * live_tail = nullptr;
             ggml_tensor * dump      = nullptr;
