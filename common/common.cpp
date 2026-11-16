@@ -3372,10 +3372,13 @@ uma_restart:
         // - (LLAMA_FIT_LONGCTX_KV4, default on; 0 off) when that still spills layers, or leaves no MoE cache beside host experts: a 4-bit
         //   K/V (q4_0, LLAMA_FIT_LONGCTX_KV4_TYPE) with the same n_ubatch ladder, only without -ctk / -ctv / --kv-window (or LLAMA_KV_WIN)
         //   and for LLAMA_FIT_LONGCTX_KV4_ARCHS (qwen35moe,qwen4exp). k19-kvwin4: in KV window mode by default, the last
-        //   LLAMA_FIT_LONGCTX_KV4_WIN (1024) positions and the first LLAMA_FIT_LONGCTX_KV4_SINKS (4) also in a q8_0 ring beside the q4_0
+        //   LLAMA_FIT_LONGCTX_KV4_WIN (16384) positions and the first LLAMA_FIT_LONGCTX_KV4_SINKS (4) also in a q8_0 ring beside the q4_0
         //   cache (LLAMA_FIT_LONGCTX_KV4_WIN=0: the plain 4-bit cache). G4 10 GB, Flash-Next ctx 262144: q4_0 at n_ubatch 512 keeps every
         //   layer and a 2 GB MoE cache on the device (compute buffer 583 MiB against 1841 MiB with q8_0): chat 21.4 -> 83.8 tok/s, decode
-        //   after an 8k prompt 19.9 -> 78.5; with the window decode KLD .0050 (q8_0 .0048, plain q4_0 .0123), the 8k prompt -2% vs plain.
+        //   after an 8k prompt 19.9 -> 78.5. The window size is the smallest that kept every paired KLD CI against q8_0 at 0 (Flash-Next,
+        //   ctx 262144, whole card, long48 = 48 prompts of 2.1k / 8.2k and long20k = 16 of 20k tokens; first-token KLD and top-1, decode
+        //   KLD): 1024 failed the long48 first token (+.0174 [+.0053, +.0334]), 8192 the long20k decode (+.0026 [+.0003, +.0047]); 16384
+        //   passed all (ring 210 MiB at n_ubatch 512). Past the window the cache is 4-bit: longer prompts than these are not gated.
         // A trade is kept only when it puts more layers on the device (then the larger MoE cache, then the MTP drafter); the K/V in host
         // memory is preferred over the smaller n_ubatch when both give the same layers (LLAMA_FIT_LONGCTX_PREFER=ub: the other way).
         // Only with flash attention not off, the K/V placement and -ngl not given, a MoE model and n_ctx above LLAMA_FIT_LONGCTX_MIN_CTX
@@ -3513,7 +3516,7 @@ uma_restart:
                         const std::string arch = common_gguf_arch(params.model.path);
                         const std::string archs = std::string(",") + (e_ar != nullptr ? e_ar : "qwen35moe,qwen4exp") + ",";
                         if (!arch.empty() && archs.find("," + arch + ",") != std::string::npos) {
-                            const int64_t w4 = env_i("LLAMA_FIT_LONGCTX_KV4_WIN", 1024);
+                            const int64_t w4 = env_i("LLAMA_FIT_LONGCTX_KV4_WIN", 16384);
                             probe_win       = w4 > 0 ? (int32_t) w4 : -1;
                             probe_win_sinks = w4 > 0 ? (int32_t) std::max<int64_t>(0, env_i("LLAMA_FIT_LONGCTX_KV4_SINKS", 4)) : 0;
                             kv_probe best4;
