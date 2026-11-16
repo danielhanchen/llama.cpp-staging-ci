@@ -2776,6 +2776,9 @@ struct llama_model_qwen4exp : public llama_model_base {
             ggml_tensor * pzero     = nullptr;
             // k19-kvwin: the selection scattered into -inf rows ([1, n_kv + n_sel, n_tokens], before the causal mask), see build_attn_qsa
             ggml_tensor * sel_raw   = nullptr;
+            // k19-kvlong: set while a layer whose attention reads the window ring builds its selection: that ring gathers from sel_raw, so
+            // the selection is built as the scatter chain there, not as the one-node ggml_sel_mask (which has no such buffer)
+            bool          need_raw  = false;
             ggml_tensor * weights   = nullptr;
             ggml_tensor * live_tail = nullptr;
             ggml_tensor * dump      = nullptr;

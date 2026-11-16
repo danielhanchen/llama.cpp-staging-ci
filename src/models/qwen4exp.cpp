@@ -995,8 +995,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel_mask(
     const int64_t n_kv  = inp_kpool->n_kv;
     GGML_ASSERT(sel_idx->ne[0] == n_sel && sel_idx->ne[1] == n_tokens);
 
-    // k19-kvlong: one node where the layer's device runs it (no scatter buffer, see build_sel_mask_op)
-    if (ggml_tensor * m = build_sel_mask_op(sel_idx, kq_mask, model.dev_layer(il))) {
+    // k19-kvlong: one node where the layer's device runs it (no scatter buffer, see build_sel_mask_op); not where the window ring
+    // gathers from the scatter buffer (qsa_c.need_raw, k19-kvwin)
+    if (ggml_tensor * m = qsa_c.need_raw ? nullptr : build_sel_mask_op(sel_idx, kq_mask, model.dev_layer(il))) {
         cb(m, "indexer_sel", il);
         return m;
     }
@@ -1163,7 +1164,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
     const bool qsa = inp_kpool != nullptr && hparams.dsv4_compress_ratios[il] > 0;
 
+    qsa_c.need_raw = inp->win.idxs != nullptr; // k19-kvlong: a windowed cache: the ring reads sel_raw (build_qsa_sel_mask)
     ggml_tensor * sel = qsa ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
+    qsa_c.need_raw = false;
 
     // k19-pf: only the K / V rows (kv_only, see graph_mtp)
     if (kv_only) {
