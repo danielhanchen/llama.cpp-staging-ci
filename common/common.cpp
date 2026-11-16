@@ -2681,15 +2681,21 @@ static bool common_fit_draft_on_cpu(
         cp_hx.n_ubatch = std::min(cp_hx.n_ubatch, hx_ub);
         cp_hx.type_k   = cparams.type_k;
         cp_hx.type_v   = cparams.type_v;
-        double d = 0.0;
+        if (common_fit_draft_host_exps_no_offload()) {
+            cp_hx.op_offload = false;   // as the draft context runs (common_base_params_to_speculative)
+        }
+        double d = 0.0, d_model = 0.0, d_ctx = 0.0, d_comp = 0.0;
         try {
             common_draft_measure_env split_env;
             std::vector<ggml_backend_dev_t> devs_hx;
             uint32_t ngl_hx = 0, nct_hx = 0, nex_hx = 0;
             const auto dmds = common_get_device_memory_data(path_dft.c_str(), &mp_hx, &cp_hx, devs_hx, ngl_hx, nct_hx, nex_hx, log_level);
             for (size_t i = 0; i < devs_hx.size() && i < dmds.size(); i++) {
-                d += dmds[i].model + dmds[i].context + dmds[i].compute;
+                d_model += dmds[i].model;
+                d_ctx   += dmds[i].context;
+                d_comp  += dmds[i].compute;
             }
+            d = d_model + d_ctx + d_comp;
         } catch (const std::exception & e) {
             LOG_INF("%s: k19-mtpkeep: the draft with its experts in host memory could not be measured (%s)\n", __func__, e.what());
             return false;
@@ -2704,10 +2710,11 @@ static bool common_fit_draft_on_cpu(
             tok = left_hx/((double) sbt.sum*(double) sbt.n_used*std::max(host_layers, 1.0));
         }
         const bool ok = d > 0.0 && take_hx <= hx_frac*(double) cache && (tok < 0.0 || tok >= hx_tok);
-        LOG_INF("%s: k19-mtpkeep: the MTP draft with its experts in host memory (n_ubatch %u, K / V %s / %s) needs %.0f MiB of device memory: "
-            "the cache %.0f -> %.0f MiB, the experts of %.1f tokens per layer -> %s (at most %.0f%% of the cache, at least %.2f tokens; "
-            "LLAMA_FIT_DRAFT_HOST_EXPS=0 off)\n", __func__, cp_hx.n_ubatch, ggml_type_name(cp_hx.type_k), ggml_type_name(cp_hx.type_v),
-            d/MiB, cache/MiB, left_hx/MiB, tok, ok ? "draft model on the GPU" : "refused", 100.0*hx_frac, hx_tok);
+        LOG_INF("%s: k19-mtpkeep: the MTP draft with its experts in host memory (n_ubatch %u, K / V %s / %s, op offload %s) needs %.0f MiB of "
+            "device memory (weights %.0f, context %.0f, compute %.0f): the cache %.0f -> %.0f MiB, the experts of %.1f tokens per layer -> %s "
+            "(at most %.0f%% of the cache, at least %.2f tokens; LLAMA_FIT_DRAFT_HOST_EXPS=0 off)\n", __func__, cp_hx.n_ubatch,
+            ggml_type_name(cp_hx.type_k), ggml_type_name(cp_hx.type_v), cp_hx.op_offload ? "on" : "off", d/MiB, d_model/MiB, d_ctx/MiB,
+            d_comp/MiB, cache/MiB, left_hx/MiB, tok, ok ? "draft model on the GPU" : "refused", 100.0*hx_frac, hx_tok);
         if (ok) {
             hx->on       = true;
             hx->n_ubatch = cp_hx.n_ubatch;
@@ -3697,9 +3704,13 @@ uma_restart:
                     params.speculative.draft.n_ubatch     = (int32_t) hx.n_ubatch;
                     params.speculative.draft.cache_type_k = hx.type_k;
                     params.speculative.draft.cache_type_v = hx.type_v;
+                    params.speculative.draft.fit_host_exps = true;
                     cparams_dft.n_ubatch = hx.n_ubatch;
                     cparams_dft.type_k   = hx.type_k;
                     cparams_dft.type_v   = hx.type_v;
+                    if (common_fit_draft_host_exps_no_offload()) {
+                        cparams_dft.op_offload = false;
+                    }
                 }
                 if (!draft_cpu && !rq_before && getenv("LLAMA_DRAFT_REQUANT") != nullptr) {
                     // k18: the draft was admitted requantized: the rest of the fit (the extra model) measures it at those types, as it loads
@@ -4271,6 +4282,9 @@ uma_restart:
                             cp_dft_hx.n_ubatch = std::min(cp_dft_hx.n_ubatch, hx_ub);
                             cp_dft_hx.type_k   = cparams.type_k;
                             cp_dft_hx.type_v   = cparams.type_v;
+                            if (common_fit_draft_host_exps_no_offload()) {
+                                cp_dft_hx.op_offload = false;
+                            }
                             common_fit_extra_model extra_hx = extra;
                             extra_hx.mparams = &mp_dft_hx;
                             extra_hx.cparams = &cp_dft_hx;
@@ -4315,9 +4329,11 @@ uma_restart:
                                 params.speculative.draft.n_ubatch     = (int32_t) cp_dft_hx.n_ubatch;
                                 params.speculative.draft.cache_type_k = cp_dft_hx.type_k;
                                 params.speculative.draft.cache_type_v = cp_dft_hx.type_v;
-                                cparams_dft.n_ubatch = cp_dft_hx.n_ubatch;
-                                cparams_dft.type_k   = cp_dft_hx.type_k;
-                                cparams_dft.type_v   = cp_dft_hx.type_v;
+                                params.speculative.draft.fit_host_exps = true;
+                                cparams_dft.n_ubatch   = cp_dft_hx.n_ubatch;
+                                cparams_dft.type_k     = cp_dft_hx.type_k;
+                                cparams_dft.type_v     = cp_dft_hx.type_v;
+                                cparams_dft.op_offload = cp_dft_hx.op_offload;
                                 kept = true;
                             }
                         }

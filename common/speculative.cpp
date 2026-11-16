@@ -4544,6 +4544,12 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
+    // k19-mtpkeep: a draft whose experts the fit placed in host memory runs without op offload: its prompt rows only write K / V and
+    // its draft steps are a few rows, so the expert products stay on the CPU, and the graph reserve does not keep a device copy of an
+    // expert tensor (850 MiB for the Q8_0 MTP layer of Qwen3.8-Flash-Next) that no batch would use. LLAMA_FIT_DRAFT_HOST_EXPS_NO_OFFLOAD=0 off
+    if (params_spec.fit_host_exps && common_fit_draft_host_exps_no_offload()) {
+        result.no_op_offload = true;
+    }
     result.n_ubatch      = (int32_t) common_draft_n_ubatch(params, (uint32_t) params.n_ubatch);
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
