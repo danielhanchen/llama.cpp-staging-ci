@@ -4055,10 +4055,11 @@ uma_restart:
         // (common_fit_draft_on_cpu), but the fit that then measures it with its context can move target layers to the host. G4 capped at
         // 16 GB, Qwen3.8-Flash-Next UD-IQ4_XS ctx 262144 + its requantized Q8_0 MTP GGUF: 41 of 49 layers with it (every layer without it),
         // decode 37 tok/s, against 83 at 12 GB with every layer and no drafter. Where the fit with the drafter keeps fewer layers on the
-        // device than the fit without it, an MTP drafter is fitted again with its context reading the prompt in ubatches of
-        // LLAMA_FIT_DRAFT_LAYERS_FIRST_UB (256; 0: no such step) tokens and stays if that keeps as many layers as the plain fit; otherwise
-        // the drafter is left out (drafting off, the plain fit). Only beside a MoE cache, where -ngl and -ub of the drafter are not given.
-        // LLAMA_FIT_DRAFT_LAYERS_FIRST=0: off
+        // device than the fit without it, the drafter is left out (drafting off, the plain fit): 37.2 / 35.3 -> 89.7 / 81.8 tok/s chat / 8k
+        // there, prompt 1170 -> 5760. LLAMA_FIT_DRAFT_LAYERS_FIRST_UB=N (opt-in) first fits an MTP drafter again with its context
+        // reading the prompt in ubatches of N tokens and keeps it if that keeps as many layers: at N = 256 it stayed beside a 3.8 GB
+        // cache instead of 5.7 GB and decoded 74.2 / 65.2, slower than without it. Only beside a MoE cache, where -ngl and -ub of the
+        // drafter are not given. LLAMA_FIT_DRAFT_LAYERS_FIRST=0: off
         {
             const char * e_lf = getenv("LLAMA_FIT_DRAFT_LAYERS_FIRST");
             const auto   lay  = [&](const llama_model_params & m) {
@@ -4088,7 +4089,7 @@ uma_restart:
                 const int64_t l_plain = st_p == COMMON_PARAMS_FIT_STATUS_SUCCESS ? lay(mp) : -1;
                 if (l_plain > l_with) {
                     const char * e_ub  = getenv("LLAMA_FIT_DRAFT_LAYERS_FIRST_UB");
-                    const uint32_t lub = e_ub != nullptr ? (uint32_t) std::max(0, atoi(e_ub)) : 256u;
+                    const uint32_t lub = e_ub != nullptr ? (uint32_t) std::max(0, atoi(e_ub)) : 0u;
                     bool kept = false;
                     if (lub > 0 && spec_mtp && params.speculative.draft.n_ubatch <= 0 && cparams_dft.n_ubatch > lub) {
                         llama_context_params cp_dft_lf = cparams_dft;
