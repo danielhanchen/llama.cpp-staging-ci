@@ -8339,7 +8339,8 @@ struct llama_moe_cache::impl {
 
     // k16: route tail skip, Strata's STRATA_ROUTE_TAIL_SKIP (src/program/generate.cpp, src/core/expert_source.cpp at 4b9e05a2): a missing
     // expert that every token of a decode / verify window routes at rank >= 7 (of the router's top k, in routing order) is neither copied
-    // nor computed; its contribution is zero and the other experts keep their router weights. On by default (7) where Strata has it on by
+    // nor computed; its contribution is zero and the other experts keep their router weights. Off by default since k19-tailskip-off (see
+    // the end of tail_skip_init); LLAMA_MOE_ROUTE_TAIL_SKIP=N opts in. The previous default (rank 7) applied where Strata has it on by
     // default: CUDA (and HIP RDNA4, decided by the backend), unless every expert is on the device (no cache, nothing to skip), 90% or
     // more of the experts are on the device (resident layers + cache slots, LLAMA_MOE_ROUTE_TAIL_SKIP_MAX_CACHED=<percent>), or the
     // experts are NVFP4. The graph also leaves it off for windows of several sequences (Strata: off with --batch slots), prompt ubatches
@@ -8441,11 +8442,12 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("%s: route tail skip off by default: %.1f%% of the experts are on the device (at least %.0f%%, "
                 "LLAMA_MOE_ROUTE_TAIL_SKIP_MAX_CACHED; LLAMA_MOE_ROUTE_TAIL_SKIP=%d turns it on)\n", __func__, 100.0*frac, 100.0*max_frac, rank);
         } else {
-            tail_rank = rank;
-            tail_dflt = true;
-            LLAMA_LOG_INFO("%s: route tail skip: rank %d by default (%.1f%% of the experts on the device): a missing expert that every token "
-                "of a decode / verify window of at most %" PRId64 " tokens routes at rank %d or lower is neither fetched nor computed "
-                "(changes the output; LLAMA_MOE_ROUTE_TAIL_SKIP=0 off)\n", __func__, rank, 100.0*frac, tail_max_tokens, rank);
+            // k19-tailskip-off: off by default. The rule drops routed experts without renormalising, and its output error grows with
+            // context: fn1 1x T4 long48 decode KLD 0.0268 vs a 0.0182 band (top-1 -1 pt), G4 Flash-Next 12 GB ctx 262144 on the
+            // shipping q8_0 placement 0.0211 with it vs 0.0050 without (band 0.0043). It stays available as an explicit opt-in
+            // (LLAMA_MOE_ROUTE_TAIL_SKIP=N); the exact path is the default
+            LLAMA_LOG_INFO("%s: route tail skip off by default (%.1f%% of the experts on the device; approximate, changes the output: "
+                "LLAMA_MOE_ROUTE_TAIL_SKIP=%d turns it on)\n", __func__, 100.0*frac, rank);
         }
     }
 

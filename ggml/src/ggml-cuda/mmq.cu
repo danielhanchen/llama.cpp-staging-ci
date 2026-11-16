@@ -116,8 +116,8 @@ static ggml_prec ggml_cuda_mmq_get_prec_env() {
     return GGML_PREC_UNDEFINED;
 }
 
-// src1 is quantized to Q8_1 unless the FP4 types can use 4-bit activations, in which case they
-// default to the native W4A4 instructions on Blackwell.
+// src1 is quantized to Q8_1 unless 4-bit activations are requested for an FP4 type on Blackwell,
+// which then uses the native W4A4 instructions.
 static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggml_tensor * dst, const int cc) {
     static const ggml_prec prec_env = ggml_cuda_mmq_get_prec_env();
 
@@ -129,7 +129,8 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
     // Q4 only for the FP4 types on Blackwell
     GGML_ASSERT(prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_Q8 || prec == GGML_PREC_Q4);
     const bool can_use_q4 = (src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_MXFP4) && blackwell_mma_available(cc);
-    if (prec == GGML_PREC_Q8 || !can_use_q4) {
+    // k19-gfix-fp4act: an unset prec keeps Q8_1 activations; the native W4A4 path only on request (GGML_CUDA_MMQ_PREC=q4 or a graph Q4)
+    if (prec != GGML_PREC_Q4 || !can_use_q4) {
         return GGML_PREC_Q8;
     }
     return GGML_PREC_Q4;

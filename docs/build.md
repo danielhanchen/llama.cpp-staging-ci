@@ -311,6 +311,8 @@ Legal values: `auto`, `f16`, `fp16`, `bf16`, `f32`, `fp32`.
 Override the activation precision that the model requests for NVFP4 and MXFP4 matrix multiplications.
 Currently supported values: `auto`, `q8`, `q4`.
 
+By default (unset or `auto` without per-tensor prec metadata) NVFP4 and MXFP4 matrix multiplications use 8-bit (Q8_1) activations on every GPU; the native W4A4 path on Blackwell (compute capability 12.x) is opt-in with `q4`.
+
 NVFP4 and MXFP4 layers marked as W4A16 request 8-bit activations, so on Blackwell those layers run through the W4A8 path instead of the native W4A4 path. Set `q4` to keep the native W4A4 path for faster prompt processing at the cost of accuracy, or `q8` to use the W4A8 path for every layer, `auto` uses per-tensor prec metadata (this is the same behavior as when the environment variable is not set).
 
 ### Unified Memory
