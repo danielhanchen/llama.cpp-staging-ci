@@ -5,6 +5,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "kv-sel.cuh"
 
 #include <atomic>
 
@@ -1310,8 +1311,141 @@ int64_t ggml_cuda_flash_attn_ext_kv_len_sig(ggml_backend_cuda_context & ctx, con
     return ggml_cuda_fattn_kvl_get_plan(ctx, dst).sig;
 }
 
+// k19-kvsel host read counter (LLAMA_KV_SEL_STATS=1, a diagnostic: one extra kernel per attention node whose K / V buffer has host
+// chunks). Counters per device: [0] selected bytes on host chunks, [1] staged bytes on host chunks, [2] nodes, [3] nodes with host chunks
+static unsigned long long * ggml_cuda_kv_sel_ctr[GGML_CUDA_MAX_DEVICES] = {};
+static std::atomic<uint64_t> ggml_cuda_kv_sel_staged{0};
+static std::atomic<uint64_t> ggml_cuda_kv_sel_nodes_host{0};
+
+static __device__ __forceinline__ unsigned long long kv_sel_cell_host_bytes(const int32_t c, const char * K, const size_t nbk,
+        const char * V, const size_t nbv, const char * base, const size_t gran, const uint8_t * map) {
+    unsigned long long b = 0;
+    b += map[(size_t) (K + (size_t) c*nbk - base) / gran] ? nbk : 0;
+    if (V != nullptr) {
+        b += map[(size_t) (V + (size_t) c*nbv - base) / gran] ? nbv : 0;
+    }
+    return b;
+}
+
+// selected cells from the QSA selection (idx: I32 [n_sel, n_rows], dead slots >= n_kv) or from the mask (F16, finite = read)
+static __global__ void kv_sel_count_kernel(const int32_t * idx, const int64_t idx_s1, const int n_sel,
+        const half * mask, const int64_t mask_s1, const int n_rows, const int n_kv,
+        const char * K, const size_t nbk, const char * V, const size_t nbv, const char * base, const size_t gran, const uint8_t * map,
+        unsigned long long * ctr) {
+    const int r = blockIdx.y;
+    unsigned long long b = 0;
+    if (idx != nullptr) {
+        for (int j = blockIdx.x*blockDim.x + threadIdx.x; j < n_sel; j += gridDim.x*blockDim.x) {
+            const int32_t c = idx[r*idx_s1 + j];
+            if (c >= 0 && c < n_kv) {
+                b += kv_sel_cell_host_bytes(c, K, nbk, V, nbv, base, gran, map);
+            }
+        }
+    } else {
+        for (int c = blockIdx.x*blockDim.x + threadIdx.x; c < n_kv; c += gridDim.x*blockDim.x) {
+            if (__half2float(mask[r*mask_s1 + c]) > -INFINITY) {
+                b += kv_sel_cell_host_bytes(c, K, nbk, V, nbv, base, gran, map);
+            }
+        }
+    }
+    if (b > 0) {
+        atomicAdd(ctr, b);
+    }
+    if (r == 0 && blockIdx.x == 0 && threadIdx.x == 0) {
+        atomicAdd(ctr + 2, 1ull);
+    }
+}
+
+static void ggml_cuda_kv_sel_count(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const char * base = nullptr;
+    size_t gran = 0;
+    const uint8_t * map_dev  = nullptr;
+    const uint8_t * map_host = nullptr;
+    size_t n_map = 0;
+    if (K == nullptr || K->buffer == nullptr || !ggml_cuda_buffer_host_chunks(K->buffer, &base, &gran, &map_dev, &map_host, &n_map)) {
+        return;
+    }
+    const int64_t n_kv = K->ne[1];
+    const bool same_buf = V != nullptr && V->buffer == K->buffer && V->data != K->data;
+    // the chunks the node's K / V cells span
+    bool any_host = false;
+    uint64_t span_host = 0;
+    for (const ggml_tensor * t : { K, same_buf ? V : nullptr }) {
+        if (t == nullptr) {
+            continue;
+        }
+        const size_t o0 = (const char *) t->data - base;
+        const size_t o1 = o0 + (size_t) n_kv*t->nb[1];
+        for (size_t c = o0/gran; c < n_map && c*gran < o1; ++c) {
+            if (map_host[c]) {
+                any_host = true;
+                span_host += std::min(o1, (c + 1)*gran) - std::max(o0, c*gran);
+            }
+        }
+    }
+    if (!any_host) {
+        return;
+    }
+    ggml_cuda_kv_sel_nodes_host++;
+    const int dev = ctx.device;
+    if (ggml_cuda_kv_sel_ctr[dev] == nullptr) {
+        CUDA_CHECK(cudaMalloc((void **) &ggml_cuda_kv_sel_ctr[dev], 4*sizeof(unsigned long long)));
+        CUDA_CHECK(cudaMemset(ggml_cuda_kv_sel_ctr[dev], 0, 4*sizeof(unsigned long long)));
+    }
+    const int64_t n_rows = Q->ne[1];
+    if (n_rows > 16 || Q->ne[3] > 1) {
+        ggml_cuda_kv_sel_staged += span_host; // a prompt node stages every cell once
+        return;
+    }
+    const ggml_cuda_qsa_maskless * qsa = nullptr;
+    if (!ctx.qsa_maskless.empty()) {
+        const auto it = ctx.qsa_maskless.find(dst);
+        if (it != ctx.qsa_maskless.end()) {
+            qsa = &it->second;
+        }
+    }
+    const ggml_tensor * mask = dst->src[3];
+    const int32_t * idx = qsa ? (const int32_t *) qsa->idx->data : nullptr;
+    if (idx == nullptr && (mask == nullptr || mask->type != GGML_TYPE_F16)) {
+        ggml_cuda_kv_sel_staged += span_host; // no selection to read: every cell
+        return;
+    }
+    const int n_sel = qsa ? (int) qsa->idx->ne[0] : 0;
+    const dim3 grid(4, (unsigned) n_rows, 1);
+    kv_sel_count_kernel<<<grid, 256, 0, ctx.stream()>>>(idx, qsa ? qsa->idx->nb[1]/sizeof(int32_t) : 0, n_sel,
+        idx ? nullptr : (const half *) mask->data, idx ? 0 : mask->nb[1]/sizeof(half), (int) n_rows, (int) n_kv,
+        (const char *) K->data, K->nb[1], same_buf ? (const char *) V->data : nullptr, same_buf ? V->nb[1] : 0, base, gran, map_dev,
+        ggml_cuda_kv_sel_ctr[dev]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_kv_sel_stats(uint64_t * out) {
+    out[0] = out[1] = out[2] = out[3] = 0;
+    for (int d = 0; d < ggml_backend_cuda_get_device_count() && d < GGML_CUDA_MAX_DEVICES; ++d) {
+        if (ggml_cuda_kv_sel_ctr[d] == nullptr) {
+            continue;
+        }
+        ggml_cuda_set_device(d);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        unsigned long long h[4] = {};
+        CUDA_CHECK(cudaMemcpy(h, ggml_cuda_kv_sel_ctr[d], sizeof(h), cudaMemcpyDeviceToHost));
+        out[0] += h[0];
+        out[2] += h[2];
+    }
+    out[1] = ggml_cuda_kv_sel_staged.load();
+    out[3] = ggml_cuda_kv_sel_nodes_host.load();
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    // k19-kvsel: LLAMA_KV_SEL_STATS=1 counts the bytes this node reads from host chunks (a separate kernel, results unchanged)
+    static const bool kv_sel_stats = ggml_cuda_kv_sel_stats_on();
+    if (kv_sel_stats) {
+        ggml_cuda_kv_sel_count(ctx, dst);
+    }
 
     const ggml_cuda_fattn_kvl_plan plan = ggml_cuda_fattn_kvl_get_plan(ctx, dst);
     if (plan.mode == GGML_CUDA_FATTN_KVL_DEV || plan.mode == GGML_CUDA_FATTN_KVL_LIVE) {

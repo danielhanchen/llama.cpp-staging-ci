@@ -55,6 +55,23 @@ static ggml_type idx_cache_type(ggml_type t) {
     return r;
 }
 
+// k19-kvsel: arm the attention cache built next (by llama_memory_hybrid) for host chunks (LLAMA_KV_SEL_HOST=1) when every attention
+// layer reads only the cells the indexer selects (QSA with an indexer cache); a dense attention layer would read every cell each token
+static uint32_t kv_sel_arm(const llama_model & model, const llama_memory_i::layer_filter_cb & filter_attn,
+        const llama_memory_i::layer_filter_cb & filter_idx, uint32_t kv_size) {
+    const auto & hp = model.hparams;
+    bool all = filter_idx != nullptr && hp.indexer_kpool > 0 && hp.indexer_top_k > 0;
+    bool any = false;
+    for (uint32_t il = 0; all && il < hp.n_layer_all && il < LLAMA_MAX_LAYERS; ++il) {
+        if (filter_attn == nullptr || filter_attn(il)) {
+            any = true;
+            all = hp.dsv4_compress_ratios[il] > 0;
+        }
+    }
+    llama_kv_cache_sel_arm(all && any);
+    return kv_size;
+}
+
 llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const llama_model & model,
                             /* attn */
@@ -80,12 +97,13 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     const layer_filter_cb & filter_idx) :
     llama_memory_hybrid(
         model,
-        type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
+        type_k, type_v, v_trans, kv_sel_arm(model, filter_attn, filter_idx, kv_size), n_pad, n_swa, swa_type,
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, offload, unified,
         filter_attn, filter_recr),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
+        llama_kv_cache_sel_arm(false); // the indexer cache stays whole in device memory (its scoring reads every pooled key)
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
         // a k-pool indexer caches its per-token rows and the pooled key side by side

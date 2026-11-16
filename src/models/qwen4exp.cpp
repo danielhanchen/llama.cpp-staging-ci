@@ -1128,6 +1128,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, sel, nullptr, nullptr, n_sel, kq_scale, il, nullptr, src2.k ? &src2 : nullptr);
     cb(cur, "kqv_out", il);
 
+    // k19-kvsel: with K/V cells in host chunks (LLAMA_KV_SEL_HOST=1) and more cells than the device holds, a window of rows that the
+    // backend would attend densely (CUDA: below 2 x rows x n_sel cells) would read every host cell; ask for the selected-cell gather
+    // (op_params[5] = 1, the sparse preference). Off at n_kv <= the device cells, so the attention is then the default one.
+    // LLAMA_KV_SEL_SPARSE_GUARD=0: off
+    {
+        static const bool guard = getenv("LLAMA_KV_SEL_SPARSE_GUARD") == nullptr || atoi(getenv("LLAMA_KV_SEL_SPARSE_GUARD")) != 0;
+        const uint32_t r = mctx_cur->get_sel_dev_cells();
+        const int64_t n_kv_cur = sel->ne[0]; // the cells the mask spans (n_kv)
+        if (guard && r > 0 && n_tokens > 1 && n_tokens <= 16 && n_kv_cur > (int64_t) r && n_kv_cur < 2*16*n_sel && src2.k == nullptr) {
+            ggml_tensor * fa = cur;
+            while (fa && fa->op != GGML_OP_FLASH_ATTN_EXT) {
+                fa = fa->src[0];
+            }
+            if (fa) {
+                fa->op_params[5] = 1;
+            }
+        }
+    }
+
     // the rotation is its own inverse, so undo it on the value side of the output
     if (inp->self_v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);

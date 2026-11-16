@@ -5,6 +5,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/kq-mask.cuh"
+#include "ggml-cuda/kv-sel.cuh"
 #include "ggml-cuda/dflash2-conv.cuh"
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -959,6 +960,11 @@ struct ggml_backend_cuda_buffer_context {
     // k19-t4small: a physical allocation may back a run of chunks (ggml_backend_cuda_buffer_commit_run): runs[i] = the number of chunks
     // of the run that starts at chunk i (1 for a chunk backed alone), 0 inside a run or where nothing is backed; its chunks share a handle
     std::vector<uint32_t> runs;
+    // k19-kvsel: chunks backed by pinned host memory mapped into the same address range (ggml_backend_cuda_buffer_commit_host): kernels
+    // read them over the bus at the same addresses. They are not device memory (not counted in ggml_cuda_own_bytes, not in committed).
+    // chunk_host_dev: a device copy of chunk_host for the host read counter (LLAMA_KV_SEL_STATS), allocated once, refreshed on changes
+    std::vector<uint8_t> chunk_host;
+    uint8_t * chunk_host_dev = nullptr;
 #endif
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
@@ -994,11 +1000,16 @@ struct ggml_backend_cuda_buffer_context {
                 const size_t n = runs[i];
                 CU_CHECK(cuMemUnmap((CUdeviceptr) dev_ptr + i*lazy_gran, n*lazy_gran));
                 CU_CHECK(cuMemRelease(chunks[i]));
-                freed += (int64_t) (n*lazy_gran);
+                if (chunk_host.empty() || !chunk_host[i]) {
+                    freed += (int64_t) (n*lazy_gran);
+                }
                 i += n - 1;
             }
         }
         ggml_cuda_own_add(device, -freed);
+        if (chunk_host_dev != nullptr) {
+            CUDA_CHECK(cudaFree(chunk_host_dev));
+        }
         CU_CHECK(cuMemAddressFree((CUdeviceptr) dev_ptr, lazy_size));
 #endif
     }
@@ -1443,11 +1454,17 @@ static size_t ggml_backend_cuda_buffer_decommit(ggml_backend_buffer_t buffer, si
         const CUdeviceptr at = (CUdeviceptr) ctx->dev_ptr + i*ctx->lazy_gran;
         CU_CHECK(cuMemUnmap(at, n*ctx->lazy_gran));
         CU_CHECK(cuMemRelease(ctx->chunks[i]));
+        const bool host = !ctx->chunk_host.empty() && ctx->chunk_host[i];
         for (size_t j = i; j < i + n; ++j) {
             ctx->chunks[j] = 0;
             ctx->runs[j]   = 0;
+            if (host) {
+                ctx->chunk_host[j] = 0;
+            }
         }
-        freed += n*ctx->lazy_gran;
+        if (!host) {
+            freed += n*ctx->lazy_gran;
+        }
         i += n - 1;
     }
     if (freed > 0) {
@@ -1549,11 +1566,237 @@ static size_t ggml_backend_cuda_buffer_committed(ggml_backend_buffer_t buffer) {
     }
     size_t n = 0;
 #if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    for (auto h : ctx->chunks) {
-        n += h != 0 ? ctx->lazy_gran : 0;
+    for (size_t i = 0; i < ctx->chunks.size(); ++i) {
+        n += ctx->chunks[i] != 0 && (ctx->chunk_host.empty() || !ctx->chunk_host[i]) ? ctx->lazy_gran : 0;
     }
 #endif
     return n;
+}
+
+// k19-kvsel: pinned host memory mapped into a lazy buffer's address range (CU_MEM_LOCATION_TYPE_HOST_NUMA physical allocations). The
+// chunk granularity of a CUDA buffer type whose device can map host memory there, 0 if it cannot (no VMM, or a driver / device without
+// HOST_NUMA virtual memory management: CU_DEVICE_ATTRIBUTE_HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, 141)
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static int ggml_cuda_host_numa_id(int device) {
+    CUdevice cu_dev = 0;
+    int numa = -1;
+    if (cuDeviceGet(&cu_dev, ggml_cuda_get_physical_device(device)) != CUDA_SUCCESS ||
+            cuDeviceGetAttribute(&numa, (CUdevice_attribute) 134, cu_dev) != CUDA_SUCCESS) {
+        return 0;
+    }
+    return numa >= 0 ? numa : 0;
+}
+
+static void ggml_cuda_buffer_host_map_sync(ggml_backend_cuda_buffer_context * ctx) {
+    if (ctx->chunk_host_dev != nullptr) {
+        CUDA_CHECK(cudaMemcpy(ctx->chunk_host_dev, ctx->chunk_host.data(), ctx->chunk_host.size(), cudaMemcpyHostToDevice));
+    }
+}
+
+// one chunk at `at` backed by new physical memory of the device (host = false) or of the host (host = true), given device access
+static bool ggml_cuda_chunk_create_map(ggml_backend_cuda_buffer_context * ctx, CUdeviceptr at, bool host, CUmemGenericAllocationHandle * out) {
+    const int physical = ggml_cuda_get_physical_device(ctx->device);
+    CUmemAllocationProp prop = {};
+    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = host ? CU_MEM_LOCATION_TYPE_HOST_NUMA : CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id   = host ? ggml_cuda_host_numa_id(ctx->device) : physical;
+    CUmemGenericAllocationHandle h = 0;
+    if (cuMemCreate(&h, ctx->lazy_gran, &prop, 0) != CUDA_SUCCESS) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (cuMemMap(at, ctx->lazy_gran, 0, h, 0) != CUDA_SUCCESS) {
+        CU_CHECK(cuMemRelease(h));
+        return false;
+    }
+    CUmemAccessDesc access = {};
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access.location.id   = physical;
+    access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    if (cuMemSetAccess(at, ctx->lazy_gran, &access, 1) != CUDA_SUCCESS) {
+        CU_CHECK(cuMemUnmap(at, ctx->lazy_gran));
+        CU_CHECK(cuMemRelease(h));
+        return false;
+    }
+    *out = h;
+    return true;
+}
+#endif
+
+static size_t ggml_backend_cuda_buft_host_vmm_gran(ggml_backend_buffer_type_t buft) {
+    if (buft == nullptr || !ggml_backend_buft_is_cuda(buft)) {
+        return 0;
+    }
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const int device = ((ggml_backend_cuda_buffer_type_context *) buft->context)->device;
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count() || !ggml_cuda_info().devices[device].vmm) {
+        return 0;
+    }
+    CUdevice cu_dev = 0;
+    int ok = 0;
+    if (cuDeviceGet(&cu_dev, ggml_cuda_get_physical_device(device)) != CUDA_SUCCESS ||
+            cuDeviceGetAttribute(&ok, (CUdevice_attribute) 141, cu_dev) != CUDA_SUCCESS || ok == 0) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    // the host allocation granularity must divide the buffer's chunks
+    CUmemAllocationProp prop = {};
+    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+    prop.location.id   = ggml_cuda_host_numa_id(device);
+    size_t hg = 0;
+    const size_t gran = ggml_cuda_info().devices[device].vmm_granularity;
+    if (cuMemGetAllocationGranularity(&hg, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS || hg == 0 || gran % hg != 0) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    return gran;
+#else
+    return 0;
+#endif
+}
+
+// back the chunks of [offset, offset + size) of a lazy buffer that are not backed yet with pinned host memory (cleared to 0). false if
+// the buffer is not lazy or the host allocation fails (the chunks backed before the failure stay)
+static bool ggml_backend_cuda_buffer_commit_host(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
+        return false;
+    }
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (!ctx->lazy) {
+        return false;
+    }
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (size == 0) {
+        return true;
+    }
+    if (ctx->chunk_host.empty()) {
+        ctx->chunk_host.assign(ctx->chunks.size(), 0);
+        static const bool stats = ggml_cuda_kv_sel_stats_on();
+        if (stats) {
+            ggml_cuda_set_device(ctx->device);
+            CUDA_CHECK(cudaMalloc((void **) &ctx->chunk_host_dev, ctx->chunks.size()));
+        }
+    }
+    const size_t c0 = offset / ctx->lazy_gran;
+    const size_t c1 = std::min(ctx->chunks.size(), (offset + size + ctx->lazy_gran - 1) / ctx->lazy_gran);
+    ggml_cuda_set_device(ctx->device);
+    bool ok = true;
+    for (size_t i = c0; i < c1 && ok; ++i) {
+        if (ctx->chunks[i] != 0) {
+            continue;
+        }
+        const CUdeviceptr at = (CUdeviceptr) ctx->dev_ptr + i*ctx->lazy_gran;
+        CUmemGenericAllocationHandle h = 0;
+        ok = ggml_cuda_chunk_create_map(ctx, at, true, &h);
+        if (ok) {
+            ctx->chunks[i]     = h;
+            ctx->runs[i]       = 1;
+            ctx->chunk_host[i] = 1;
+            CUDA_CHECK(cudaMemsetAsync((void *) at, 0, ctx->lazy_gran, cudaStreamPerThread));
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_buffer_host_map_sync(ctx);
+    return ok;
+#else
+    GGML_UNUSED(offset);
+    GGML_UNUSED(size);
+    return false;
+#endif
+}
+
+// move the backed single chunks of [offset, offset + size) of a lazy buffer to host memory (to_host) or to device memory, keeping their
+// address and bytes (new physical memory mapped at a scratch address, copied, the old one unmapped and released, the new one mapped at the
+// chunk). The device is synchronized first: nothing may read or write the range meanwhile. Returns the bytes moved, or SIZE_MAX if new
+// memory could not be had (the chunks moved before stay moved)
+static size_t ggml_backend_cuda_buffer_move(ggml_backend_buffer_t buffer, size_t offset, size_t size, bool to_host) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
+        return SIZE_MAX;
+    }
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (!ctx->lazy) {
+        return SIZE_MAX;
+    }
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (size == 0) {
+        return 0;
+    }
+    if (ctx->chunk_host.empty()) {
+        ctx->chunk_host.assign(ctx->chunks.size(), 0);
+    }
+    const size_t c0 = offset / ctx->lazy_gran;
+    const size_t c1 = std::min(ctx->chunks.size(), (offset + size + ctx->lazy_gran - 1) / ctx->lazy_gran);
+    ggml_cuda_set_device(ctx->device);
+    size_t moved = 0;
+    bool synced = false;
+    CUdeviceptr tmp = 0;
+    for (size_t i = c0; i < c1; ++i) {
+        if (ctx->chunks[i] == 0 || ctx->runs[i] != 1 || (ctx->chunk_host[i] != 0) == to_host) {
+            continue;
+        }
+        if (!synced) {
+            CUDA_CHECK(cudaDeviceSynchronize());
+            if (cuMemAddressReserve(&tmp, ctx->lazy_gran, 0, 0, 0) != CUDA_SUCCESS) {
+                return SIZE_MAX;
+            }
+            synced = true;
+        }
+        const CUdeviceptr at = (CUdeviceptr) ctx->dev_ptr + i*ctx->lazy_gran;
+        CUmemGenericAllocationHandle h = 0;
+        if (!ggml_cuda_chunk_create_map(ctx, tmp, to_host, &h)) {
+            CU_CHECK(cuMemAddressFree(tmp, ctx->lazy_gran));
+            return SIZE_MAX;
+        }
+        CUDA_CHECK(cudaMemcpy((void *) tmp, (const void *) at, ctx->lazy_gran, cudaMemcpyDeviceToDevice));
+        CU_CHECK(cuMemUnmap(tmp, ctx->lazy_gran));
+        CU_CHECK(cuMemUnmap(at, ctx->lazy_gran));
+        CU_CHECK(cuMemRelease(ctx->chunks[i]));
+        CU_CHECK(cuMemMap(at, ctx->lazy_gran, 0, h, 0));
+        CUmemAccessDesc access = {};
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id   = ggml_cuda_get_physical_device(ctx->device);
+        access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        CU_CHECK(cuMemSetAccess(at, ctx->lazy_gran, &access, 1));
+        ctx->chunks[i]     = h;
+        ctx->chunk_host[i] = to_host ? 1 : 0;
+        ggml_cuda_own_add(ctx->device, to_host ? -(int64_t) ctx->lazy_gran : (int64_t) ctx->lazy_gran);
+        moved += ctx->lazy_gran;
+    }
+    if (synced) {
+        CU_CHECK(cuMemAddressFree(tmp, ctx->lazy_gran));
+        ggml_cuda_buffer_host_map_sync(ctx);
+    }
+    return moved;
+#else
+    GGML_UNUSED(offset);
+    GGML_UNUSED(size);
+    GGML_UNUSED(to_host);
+    return SIZE_MAX;
+#endif
+}
+
+// k19-kvsel host read counter (LLAMA_KV_SEL_STATS): the host chunk map of the buffer holding `data` (fattn.cu); false if none
+bool ggml_cuda_buffer_host_chunks(const ggml_backend_buffer * buf, const char ** base, size_t * gran, const uint8_t ** map_dev,
+        const uint8_t ** map_host, size_t * n) {
+    if (buf == nullptr || !ggml_backend_buffer_is_cuda(const_cast<ggml_backend_buffer_t>(buf))) {
+        return false;
+    }
+    const ggml_backend_cuda_buffer_context * ctx = (const ggml_backend_cuda_buffer_context *) buf->context;
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (!ctx->lazy || ctx->chunk_host.empty() || ctx->chunk_host_dev == nullptr) {
+        return false;
+    }
+    *base     = (const char *) ctx->dev_ptr;
+    *gran     = ctx->lazy_gran;
+    *map_dev  = ctx->chunk_host_dev;
+    *map_host = ctx->chunk_host.data();
+    *n        = ctx->chunk_host.size();
+    return true;
+#else
+    GGML_UNUSED_VARS(ctx, base, gran, map_dev, map_host, n);
+    return false;
+#endif
 }
 
 // Communication context for multi-GPU AllReduce during tensor parallelism.
@@ -13173,6 +13416,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_buffer_commit_run") == 0) {
         return (void *)ggml_backend_cuda_buffer_commit_run;
+    }
+    if (strcmp(name, "ggml_backend_buft_host_vmm_gran") == 0) {
+        return (void *)ggml_backend_cuda_buft_host_vmm_gran;
+    }
+    if (strcmp(name, "ggml_backend_buffer_commit_host") == 0) {
+        return (void *)ggml_backend_cuda_buffer_commit_host;
+    }
+    if (strcmp(name, "ggml_backend_buffer_move") == 0) {
+        return (void *)ggml_backend_cuda_buffer_move;
+    }
+    if (strcmp(name, "ggml_backend_kv_sel_stats") == 0) {
+        return (void *)ggml_cuda_kv_sel_stats;
     }
     if (strcmp(name, "ggml_backend_moe_fetch_overlap_default") == 0) {
         return (void *)ggml_backend_cuda_moe_fetch_overlap_default;
