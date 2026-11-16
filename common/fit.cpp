@@ -193,9 +193,12 @@ bool common_fit_place8_mid() {
 }
 
 // grow_mib (mid only): the compute buffer memory the cache took, which a released layer-major group may grow back into
-static void common_fit_place8_env(uint32_t ub, bool mid = false, int64_t grow_mib = 0) {
+// groups: the k19-pgroups small device (LLAMA_MOE_PLACE8_GROUPS, read by the context), which keeps the layer-major groups of a mid-size
+// device but not its short-prompt split or its routed refills (see llama_context, k19-pgroups2)
+static void common_fit_place8_env(uint32_t ub, bool mid = false, int64_t grow_mib = 0, bool groups = false) {
     common_set_env("LLAMA_MOE_PLACE8_UB", ub > 0 ? std::to_string(ub) : "");
     common_set_env("LLAMA_MOE_PLACE8_MID", ub > 0 && mid ? std::to_string(std::max<int64_t>(1, grow_mib)) : "");
+    common_set_env("LLAMA_MOE_PLACE8_GROUPS", ub > 0 && mid && groups ? "1" : "");
     g_place8     = ub > 0;
     g_place8_mid = ub > 0 && mid;
 }
@@ -1818,7 +1821,7 @@ static void common_params_fit_impl(
                             static const int64_t groups_min_free = int64_t(getenv("LLAMA_FIT_PLACE8_GROUPS_MIN_FREE_MIB") != nullptr ?
                                 std::max(0, atoi(getenv("LLAMA_FIT_PLACE8_GROUPS_MIN_FREE_MIB"))) : 9216)*MiB;
                             if (groups_on && !hostbound && int64_t(dmds_cpu_moe[0].free) >= groups_min_free) {
-                                common_fit_place8_env(ub_rel, true, grow/MiB);
+                                common_fit_place8_env(ub_rel, true, grow/MiB, true);
                                 g_place8_mid = false; // the small device's draft rule (common_fit_draft_on_cpu) stays
                                 LOG_INF("%s: small device: prompts keep their layer-major groups beside the decode-sized cache, each group releases "
                                     "the banks for its merged graph (k19-pgroups; LLAMA_FIT_PLACE8_GROUPS=0 off)\n", __func__);
