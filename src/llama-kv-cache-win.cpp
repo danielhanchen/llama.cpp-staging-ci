@@ -369,18 +369,19 @@ void llama_kv_cache::set_input_win(ggml_tensor * idxs, ggml_tensor * mask, ggml_
         }
     }
 
-    // the cell of every live slot, per token (a sparse attention gathers its selection at them)
+    // the ring slot of every cell (win_r: none; the rows past the cache cells too), a sparse attention maps its selected cells with it
     if (cells_in != nullptr && cells_in->buffer != nullptr) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(cells_in->buffer) && cells_in->ne[0] == (int64_t) win_r && cells_in->ne[1] == (int64_t) n_tokens);
+        GGML_ASSERT(ggml_backend_buffer_is_host(cells_in->buffer) && cells_in->ne[0] == 1);
         GGML_ASSERT(sinfo.n_stream() == 1);
         const uint32_t strm = sinfo.strm[0];
         const auto & rg = v_rings[strm];
+        const int64_t n_cells = cells_in->ne[1];
         int32_t * data = (int32_t *) cells_in->data;
+        std::fill(data, data + n_cells, (int32_t) win_r);
         for (uint32_t j = 0; j < win_r; ++j) {
-            data[j] = win_slot_live(strm, (int32_t) j) ? rg.slot_cell[j] : 0;
-        }
-        for (uint32_t i = 1; i < n_tokens; ++i) {
-            memcpy(data + (size_t) i*win_r, data, win_r*sizeof(int32_t));
+            if (win_slot_live(strm, (int32_t) j) && rg.slot_cell[j] < n_cells) {
+                data[rg.slot_cell[j]] = (int32_t) j;
+            }
         }
     }
 

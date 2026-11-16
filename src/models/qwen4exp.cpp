@@ -1009,8 +1009,44 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel_mask(
     zeros = ggml_repeat_4d(ctx0, zeros, n_sel, n_tokens, 1, 1);
     zeros = ggml_reshape_3d(ctx0, zeros, 1, n_sel, n_tokens);
 
+    // k19-kvwin: the KV window ring reads the same selection at its slots: the selected cells mapped to their ring slots (a cell
+    // without a live slot, and every dump row, to the ring's dump row n_slots) and scattered into an all -inf ring row, plus the ring
+    // mask. Built before the dense selection below, so that the selection chain keeps a single reader and the CUDA maskless
+    // attention still takes it (ggml_cuda_qsa_maskless_plan), and with per-ubatch inputs of n_kv + n_sel cells only
+    qsa_c.win_mask = nullptr;
+    if (qsa_c.win != nullptr && qsa_c.win->idxs != nullptr && qsa_c.win->mask != nullptr) {
+        llm_graph_kv_win & w = *qsa_c.win;
+        const int64_t n_slots = w.mask->ne[0];
+        GGML_ASSERT(w.mask->ne[1]*w.mask->ne[2]*w.mask->ne[3] == n_tokens);
+        if (w.cells == nullptr) {
+            w.cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_kv + n_sel);
+            ggml_set_input(w.cells);
+            ggml_set_name(w.cells, "attn_inp_win_cell_slot");
+        }
+        GGML_ASSERT(w.cells->ne[1] == n_kv + n_sel);
+        ggml_tensor * slot_idx = ggml_get_rows(ctx0, w.cells, ggml_reshape_1d(ctx0, sel_idx, n_sel*n_tokens)); // I32 [1, n_sel*n_tokens]
+        slot_idx = ggml_reshape_2d(ctx0, slot_idx, n_sel, n_tokens);
+
+        ggml_tensor * ring_all = ggml_new_tensor_4d(ctx0, kq_mask->type, n_slots + 1, 1, 1, 1);
+        ring_all = ggml_fill(ctx0, ring_all, -INFINITY);
+        ring_all = ggml_repeat_4d(ctx0, ring_all, n_slots + 1, n_tokens, 1, 1);
+        ring_all = ggml_reshape_3d(ctx0, ring_all, 1, n_slots + 1, n_tokens);
+
+        ggml_tensor * rzeros = ggml_new_tensor_4d(ctx0, kq_mask->type, n_sel, 1, 1, 1);
+        rzeros = ggml_fill(ctx0, rzeros, 0.0f);
+        rzeros = ggml_repeat_4d(ctx0, rzeros, n_sel, n_tokens, 1, 1);
+        rzeros = ggml_reshape_3d(ctx0, rzeros, 1, n_sel, n_tokens);
+
+        ggml_tensor * rsel = ggml_set_rows(ctx0, ring_all, rzeros, slot_idx); // [1, n_slots + 1, n_tokens]
+        const size_t rrow = rsel->nb[2];
+        rsel = ggml_view_4d(ctx0, rsel, n_slots, w.mask->ne[1], w.mask->ne[2], w.mask->ne[3],
+                rrow, rrow*w.mask->ne[1], rrow*w.mask->ne[1]*w.mask->ne[2], 0);
+        qsa_c.win_mask = ggml_add(ctx0, rsel, w.mask);
+        cb(qsa_c.win_mask, "kq_mask_qsa_win", il);
+        ggml_build_forward_expand(gf, qsa_c.win_mask);
+    }
+
     ggml_tensor * sel = ggml_set_rows(ctx0, mask_all, zeros, sel_idx);
-    qsa_c.sel_raw = sel; // k19-kvwin: the ring source takes the same selection (build_attn_qsa)
 
     GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[1]*kq_mask->ne[2]*kq_mask->ne[3] == n_tokens);
     const size_t row = sel->nb[2];
@@ -1074,18 +1110,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // body mask, which sel is built from) plus the selection gathered at each slot's cell
     llm_graph_attn_src2 src2 = build_kv_win_src(inp->win, mctx_cur, k_cur, v_cur, il, 0);
     if (src2.k != nullptr) {
-        GGML_ASSERT(qsa_c.sel_raw != nullptr && qsa_c.sel_raw->ne[2] == n_tokens);
-        const int64_t n_slots = src2.mask->ne[0];
-        if (inp->win.cells == nullptr) {
-            inp->win.cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_slots, n_tokens);
-            ggml_set_input(inp->win.cells);
-            ggml_set_name(inp->win.cells, "attn_inp_win_cells");
-        }
-        ggml_tensor * sel_w = ggml_get_rows(ctx0, qsa_c.sel_raw, inp->win.cells); // F32 [1, n_slots, n_tokens]
-        sel_w = ggml_add(ctx0, ggml_reshape_4d(ctx0, sel_w, n_slots, src2.mask->ne[1], src2.mask->ne[2], src2.mask->ne[3]),
-                ggml_cast(ctx0, src2.mask, GGML_TYPE_F32));
-        src2.mask = ggml_cast(ctx0, sel_w, GGML_TYPE_F16);
-        cb(src2.mask, "kq_mask_qsa_win", il);
+        // the ring mask of the selection, built with it (build_qsa_sel_mask)
+        GGML_ASSERT(qsa_c.win_mask != nullptr && ggml_are_same_shape(qsa_c.win_mask, src2.mask));
+        src2.mask = qsa_c.win_mask;
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, sel, nullptr, nullptr, n_sel, kq_scale, il, nullptr, src2.k ? &src2 : nullptr);
@@ -1159,6 +1186,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
     const bool qsa = inp_kpool != nullptr && hparams.dsv4_compress_ratios[il] > 0;
 
+    qsa_c.win = qsa ? &inp->win : nullptr; // k19-kvwin: the ring mask of the selection (build_qsa_sel_mask)
     ggml_tensor * sel = qsa ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
 
     // k19-pf: only the K / V rows (kv_only, see graph_mtp)
