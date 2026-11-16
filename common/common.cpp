@@ -3194,6 +3194,85 @@ uma_restart:
         // (fit_can_drop), it is left out and drafting is off unless LLAMA_FIT_DRAFT_CPU=1 (drafting on the CPU is slower than none)
         // the old order (the draft model first, the main model around it) with LLAMA_FIT_DRAFT_LAST=0, or when -ngld or -devd is set
 
+        // the fit of the main model on copies of the params at a K/V type, K/V placement (kvo: on the device) and n_ubatch (0: as given),
+        // with the MTP drop rule below applied (the KV auto rules: k16-parity, k19-kvlong)
+        std::vector<uint8_t> exps;
+        const int64_t n_layer = params.fit_params && !model_only ? common_model_n_layer(params.model.path, exps) : 0;
+        struct kv_probe {
+            bool     ok      = false;
+            uint32_t n_ctx   = 0;
+            int64_t  layers  = 0;
+            bool     mtp     = false;
+            int64_t  n_host  = 0; // tensor buffer overrides the fit added (experts in system memory)
+            int64_t  cache   = 0;
+            bool     kvo     = true; // K/V on the device (offload_kqv)
+            uint32_t ub      = 0;     // n_ubatch after the fit
+            uint32_t ub_req  = 0;     // n_ubatch asked for (0: as given)
+            ggml_type type   = GGML_TYPE_COUNT; // K/V type
+        };
+        const auto probe = [&](ggml_type t, bool kvo, uint32_t ub) {
+            kv_probe r;
+            const auto one = [&](bool with_extra, kv_probe & o) {
+                llama_model_params   mp = mparams;
+                llama_context_params cp = cparams;
+                std::vector<float>   ts(params.tensor_split, params.tensor_split + 128);
+                std::vector<llama_model_tensor_buft_override> tbo = params.tensor_buft_overrides;
+                std::vector<size_t>  mg = params.fit_params_target;
+                mp.tensor_split = ts.data();
+                if (mparams.tensor_buft_overrides != nullptr && mparams.tensor_buft_overrides == params.tensor_buft_overrides.data()) {
+                    mp.tensor_buft_overrides = tbo.data();
+                }
+                cp.type_k = t;
+                cp.type_v = t;
+                cp.offload_kqv = kvo;
+                if (ub > 0) {
+                    cp.n_ubatch = ub;
+                    cp.n_batch  = std::max(cp.n_batch, ub);
+                }
+                if (!with_extra) {
+                    mp.load_mtp = params.load_mtp;
+                    cp.n_rs_seq = 0;
+                }
+                int64_t n0 = 0;
+                for (const auto & o2 : tbo) {
+                    n0 += o2.pattern != nullptr;
+                }
+                llama_model_params   mp_dft = mparams_dft; // the fit may write the draft's params: copies
+                llama_context_params cp_dft = cparams_dft;
+                cp_dft.offload_kqv = kvo;
+                const common_fit_extra_model ex = { extra.path_model, &mp_dft, &cp_dft, extra.shares_model };
+                common_fit_set_moe_margin_auto(!params.fit_params_target_set);
+                const auto st = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(), tbo.empty() ? nullptr : tbo.data(),
+                    mg.data(), params.fit_params_min_ctx, with_extra ? &ex : nullptr, fit_log_level, params.fit_kv_resident);
+                o.ok     = st == COMMON_PARAMS_FIT_STATUS_SUCCESS;
+                o.kvo    = kvo;
+                o.ub     = cp.n_ubatch;
+                o.ub_req = ub;
+                o.type   = t;
+                o.n_ctx  = cp.n_ctx;
+                o.layers = mp.n_gpu_layers == llama_model_default_params().n_gpu_layers || mp.n_gpu_layers < 0 ? n_layer + 1 : mp.n_gpu_layers;
+                o.mtp    = with_extra && spec_mtp && !has_draft;
+                int64_t n1 = 0;
+                for (const auto & o2 : tbo) {
+                    n1 += o2.pattern != nullptr;
+                }
+                o.n_host = n1 - n0;
+                o.cache  = cp.moe_cache_size >= COMMON_MOE_CACHE_AUTO_BYTES ? 0 : (int64_t) cp.moe_cache_size + common_fit_moe_margin_gain();
+            };
+            // a separate draft model is placed after the main model and its cache (see common_fit_draft_on_cpu): only the main model here
+            one(spec_mtp && !has_draft, r);
+            const char * env_md = getenv("LLAMA_FIT_MTP_DROP");
+            if (r.ok && spec_mtp && !has_draft && params.speculative.draft.fit_can_drop && r.layers < n_layer + 1 &&
+                    mparams.n_gpu_layers == llama_model_default_params().n_gpu_layers && (env_md == nullptr || atoi(env_md) != 0)) {
+                kv_probe r2;
+                one(false, r2);
+                if (r2.ok && r2.layers >= n_layer + 1) {
+                    r = r2; // the MTP drop rule below would drop the drafter
+                }
+            }
+            return r;
+        };
+
         // k16-parity: q8_0 K/V above 8K context where it buys device residency (Strata's setup: fp16 K/V up to 8K context, int8 above,
         // 8-bit codes + an fp16 scale per 64 values; ours: q8_0, 8-bit codes + an fp16 scale per 32). Only without -ctk / -ctv (or their
         // LLAMA_ARG_ variables), with flash attention not off, and only when the f16 placement spills (layers on the CPU, the MTP drafter
@@ -3228,72 +3307,10 @@ uma_restart:
                 aq_on = !arch.empty() && list.find("," + arch + ",") != std::string::npos;
             }
             if (aq_on) {
-                struct kv_probe {
-                    bool     ok      = false;
-                    uint32_t n_ctx   = 0;
-                    int64_t  layers  = 0;
-                    bool     mtp     = false;
-                    int64_t  n_host  = 0; // tensor buffer overrides the fit added (experts in system memory)
-                    int64_t  cache   = 0;
-                };
-                std::vector<uint8_t> exps;
-                const int64_t n_layer = common_model_n_layer(params.model.path, exps);
-                const auto probe = [&](ggml_type t) {
-                    kv_probe r;
-                    const auto one = [&](bool with_extra, kv_probe & o) {
-                        llama_model_params   mp = mparams;
-                        llama_context_params cp = cparams;
-                        std::vector<float>   ts(params.tensor_split, params.tensor_split + 128);
-                        std::vector<llama_model_tensor_buft_override> tbo = params.tensor_buft_overrides;
-                        std::vector<size_t>  mg = params.fit_params_target;
-                        mp.tensor_split = ts.data();
-                        if (mparams.tensor_buft_overrides != nullptr && mparams.tensor_buft_overrides == params.tensor_buft_overrides.data()) {
-                            mp.tensor_buft_overrides = tbo.data();
-                        }
-                        cp.type_k = t;
-                        cp.type_v = t;
-                        if (!with_extra) {
-                            mp.load_mtp = params.load_mtp;
-                            cp.n_rs_seq = 0;
-                        }
-                        int64_t n0 = 0;
-                        for (const auto & o2 : tbo) {
-                            n0 += o2.pattern != nullptr;
-                        }
-                        llama_model_params   mp_dft = mparams_dft; // the fit may write the draft's params: copies
-                        llama_context_params cp_dft = cparams_dft;
-                        const common_fit_extra_model ex = { extra.path_model, &mp_dft, &cp_dft, extra.shares_model };
-                        common_fit_set_moe_margin_auto(!params.fit_params_target_set);
-                        const auto st = common_fit_params(params.model.path.c_str(), &mp, &cp, ts.data(), tbo.empty() ? nullptr : tbo.data(),
-                            mg.data(), params.fit_params_min_ctx, with_extra ? &ex : nullptr, fit_log_level, params.fit_kv_resident);
-                        o.ok     = st == COMMON_PARAMS_FIT_STATUS_SUCCESS;
-                        o.n_ctx  = cp.n_ctx;
-                        o.layers = mp.n_gpu_layers == llama_model_default_params().n_gpu_layers || mp.n_gpu_layers < 0 ? n_layer + 1 : mp.n_gpu_layers;
-                        o.mtp    = with_extra && spec_mtp && !has_draft;
-                        int64_t n1 = 0;
-                        for (const auto & o2 : tbo) {
-                            n1 += o2.pattern != nullptr;
-                        }
-                        o.n_host = n1 - n0;
-                        o.cache  = cp.moe_cache_size >= COMMON_MOE_CACHE_AUTO_BYTES ? 0 : (int64_t) cp.moe_cache_size + common_fit_moe_margin_gain();
-                    };
-                    // a separate draft model is placed after the main model and its cache (see common_fit_draft_on_cpu): only the main model here
-                    one(spec_mtp && !has_draft, r);
-                    const char * env_md = getenv("LLAMA_FIT_MTP_DROP");
-                    if (r.ok && spec_mtp && !has_draft && params.speculative.draft.fit_can_drop && r.layers < n_layer + 1 &&
-                            mparams.n_gpu_layers == llama_model_default_params().n_gpu_layers && (env_md == nullptr || atoi(env_md) != 0)) {
-                        kv_probe r2;
-                        one(false, r2);
-                        if (r2.ok && r2.layers >= n_layer + 1) {
-                            r = r2; // the MTP drop rule below would drop the drafter
-                        }
-                    }
-                    return r;
-                };
-                const kv_probe a = probe(GGML_TYPE_F16);
+                const kv_probe a = probe(GGML_TYPE_F16, cparams.offload_kqv, 0);
                 const bool spilled = a.ok && (a.layers < n_layer + 1 || (spec_mtp && !has_draft && !a.mtp) || a.n_host > 0);
                 if (a.ok && spilled && (int64_t) a.n_ctx > min_ctx && n_layer > 0) {
-                    const kv_probe b = probe(GGML_TYPE_Q8_0);
+                    const kv_probe b = probe(GGML_TYPE_Q8_0, cparams.offload_kqv, 0);
                     const int64_t mib = 1024*1024;
                     const char * why = nullptr;
                     if (b.ok) {
@@ -3320,6 +3337,204 @@ uma_restart:
                         "q8_0: %" PRId64 " layers, MTP %d, MoE cache %" PRId64 " MiB%s; LLAMA_KV_AUTO_Q8=0 keeps f16)\n", __func__,
                         why != nullptr ? "q8_0" : "f16", a.n_ctx, why != nullptr ? why : "q8_0 buys no device residency", a.layers, n_layer + 1,
                         (int) a.mtp, a.cache/mib, b.layers, (int) b.mtp, b.cache/mib, b.ok ? "" : ", fit failed");
+                }
+            }
+        }
+
+        // k19-kvlong: a long context on a small card. The K/V and the compute buffers grow with n_ctx (the flash attention mask and the QSA
+        // selection masks with n_ctx x n_ubatch), and the fit moves whole layers to the host to make room for them: Qwen3.8-Flash-Next at
+        // ctx 262144 on 10 GB (q8_0 K/V) kept 17 of 49 layers on the device, with dense weights 5597 MiB, the compute buffer 4127 MiB at
+        // n_ubatch 2048 and the K/V 4192 MiB. When the placement spills layers, two other trades are fitted first:
+        // - a smaller n_ubatch (halved down to LLAMA_FIT_LONGCTX_UB_MIN, 512): the prompt runs in more, smaller steps.
+        //   LLAMA_FIT_LONGCTX_UB: 1 (default) only without -ub, 2 also a given -ub, 0 never;
+        // - opt-in (LLAMA_FIT_LONGCTX_KV_HOST=1): the K/V in pinned host memory (-nkvo; the recurrent states stay on the device). The
+        //   attention still runs on the GPU from a copy of the cells in use, so each decode step copies the whole used K/V of every
+        //   attention layer: G4 10 GB, Flash-Next ctx 262144, n_ubatch 1024: every layer on the device and a 3 GB MoE cache, chat
+        //   21.4 -> 31.4 tok/s and the 8k prompt 523 -> 918 tok/s, but decode after it 19.9 -> 18.8, and lower still as the context
+        //   grows (a QSA layer reads only its selected cells: a gather of those would remove that cost).
+        // - opt-in (LLAMA_FIT_LONGCTX_KV4=1): when that still spills layers, a 4-bit K/V (q4_0, LLAMA_FIT_LONGCTX_KV4_TYPE) with the same
+        //   n_ubatch ladder, only without -ctk / -ctv and for LLAMA_FIT_LONGCTX_KV4_ARCHS (qwen35moe,qwen4exp). Lossy beyond the f16 band.
+        //   G4 10 GB, Flash-Next ctx 262144: q4_0 at n_ubatch 512 keeps every layer and a 2 GB MoE cache on the device (compute buffer
+        //   583 MiB against 1841 MiB with q8_0): chat 21.4 -> 83.8 tok/s, decode after an 8k prompt 19.9 -> 78.5.
+        // A trade is kept only when it puts more layers on the device (then the larger MoE cache, then the MTP drafter); the K/V in host
+        // memory is preferred over the smaller n_ubatch when both give the same layers (LLAMA_FIT_LONGCTX_PREFER=ub: the other way).
+        // Only with flash attention not off, the K/V placement and -ngl not given, a MoE model and n_ctx above LLAMA_FIT_LONGCTX_MIN_CTX
+        // (32768). Exact for the K/V placement; a smaller n_ubatch changes the prompt's batch shapes. LLAMA_FIT_LONGCTX=0: off.
+        {
+            const auto env_i = [](const char * name, int64_t def) {
+                const char * e = getenv(name);
+                return e != nullptr && e[0] != 0 ? (int64_t) atoll(e) : def;
+            };
+            const int64_t lc_mode  = env_i("LLAMA_FIT_LONGCTX", 1);
+            const int64_t lc_min   = env_i("LLAMA_FIT_LONGCTX_MIN_CTX", 32768);
+            const int64_t lc_host  = env_i("LLAMA_FIT_LONGCTX_KV_HOST", 0);
+            const int64_t lc_ub    = env_i("LLAMA_FIT_LONGCTX_UB", 1);
+            const int64_t lc_ubmin = std::max<int64_t>(64, env_i("LLAMA_FIT_LONGCTX_UB_MIN", 512));
+            const char *  lc_pref  = getenv("LLAMA_FIT_LONGCTX_PREFER");
+            const bool    pref_ub  = lc_pref != nullptr && strcmp(lc_pref, "ub") == 0;
+            bool has_exps = false;
+            for (const uint8_t e : exps) {
+                has_exps = has_exps || e != 0;
+            }
+            // not on the disk tier (the host experts do not fit in the available RAM and the model is not on a memory file system): there a
+            // prompt ubatch reads the experts it misses from the disk, so a smaller n_ubatch reads them more often. Colab L4 10 GB,
+            // Flash-Next from the VM disk (57.6 GB of experts, 51 GB of RAM), ctx 262144, n_ubatch 2048 -> 512: decode after an 8k prompt
+            // 1.3 -> 1.8 tok/s but the prompt 18 -> 8 tok/s. LLAMA_FIT_LONGCTX_DISK=1 lowers it there too
+            const bool disk_tier = [&] {
+                if (env_i("LLAMA_FIT_LONGCTX_DISK", 0) != 0) {
+                    return false;
+                }
+                const uint64_t exp_b = common_moe_expert_bytes(params.model.path);
+                const uint64_t avail = llama_available_memory();
+                return exp_b > 0 && avail > 0 && (double) exp_b > 0.8*(double) avail && !common_fit_file_in_ram_fs(params.model.path);
+            }();
+            const bool ub_may = !disk_tier && (lc_ub == 2 || (lc_ub == 1 && !params.n_ubatch_set));
+            const bool lc_on = lc_mode != 0 && !model_only && !params.embedding && n_layer > 0 && has_exps &&
+                params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && cparams.offload_kqv && !params.no_kv_offload &&
+                mparams.n_gpu_layers == llama_model_default_params().n_gpu_layers &&
+                params.n_ctx > 0 && (int64_t) params.n_ctx > lc_min &&
+                (lc_host != 0 || ub_may || (getenv("LLAMA_FIT_LONGCTX_KV4") != nullptr && atoi(getenv("LLAMA_FIT_LONGCTX_KV4")) != 0)) &&
+                [] {
+                    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }();
+            if (lc_on) {
+                const ggml_type t = cparams.type_k == cparams.type_v ? cparams.type_k : GGML_TYPE_COUNT;
+                const kv_probe a = t != GGML_TYPE_COUNT ? probe(t, true, 0) : kv_probe{};
+                if (a.ok && a.layers < n_layer + 1) {
+                    // better: more layers, then more MoE cache, then the MTP drafter
+                    const auto better = [](const kv_probe & x, const kv_probe & y) {
+                        if (!x.ok) {
+                            return false;
+                        }
+                        if (!y.ok) {
+                            return true;
+                        }
+                        if (x.n_ctx != y.n_ctx) {
+                            return x.n_ctx > y.n_ctx;
+                        }
+                        if (x.layers != y.layers) {
+                            return x.layers > y.layers;
+                        }
+                        if (x.mtp != y.mtp) {
+                            return x.mtp;
+                        }
+                        return x.cache > y.cache + std::max<int64_t>(64ll*1024*1024, y.cache/8);
+                    };
+                    std::vector<kv_probe> tried;
+                    kv_probe host;
+                    if (lc_host != 0) {
+                        host = probe(t, false, 0);
+                        tried.push_back(host);
+                    }
+                    kv_probe lowub;
+                    if (ub_may) {
+                        // halve n_ubatch until every layer is on the device (or the floor)
+                        for (uint32_t ub = cparams.n_ubatch/2; (int64_t) ub >= lc_ubmin; ub /= 2) {
+                            const kv_probe c = probe(t, true, ub);
+                            tried.push_back(c);
+                            if (better(c, lowub)) {
+                                lowub = c;
+                            }
+                            if (c.ok && c.layers >= n_layer + 1) {
+                                break;
+                            }
+                        }
+                    }
+                    kv_probe both;
+                    const bool host_full = host.ok && host.layers >= n_layer + 1;
+                    const bool ub_full   = lowub.ok && lowub.layers >= n_layer + 1;
+                    if (lc_host != 0 && ub_may && !host_full && !ub_full) {
+                        for (uint32_t ub = cparams.n_ubatch/2; (int64_t) ub >= lc_ubmin; ub /= 2) {
+                            const kv_probe c = probe(t, false, ub);
+                            tried.push_back(c);
+                            if (better(c, both)) {
+                                both = c;
+                            }
+                            if (c.ok && c.layers >= n_layer + 1) {
+                                break;
+                            }
+                        }
+                    }
+                    // the preferred trade first: the other one must be strictly better to win
+                    kv_probe best = a;
+                    const kv_probe & first  = pref_ub ? lowub : host;
+                    const kv_probe & second = pref_ub ? host  : lowub;
+                    for (const kv_probe * c : std::initializer_list<const kv_probe *>{ &first, &second, &both }) {
+                        if (better(*c, best)) {
+                            best = *c;
+                        }
+                    }
+                    // the 4-bit K/V step (opt-in): the same ladder with the K/V on the device
+                    const char * kv4_env = getenv("LLAMA_FIT_LONGCTX_KV4");
+                    const bool   kv4_on  = kv4_env != nullptr && atoi(kv4_env) != 0 && !params.cache_type_k_set && !params.cache_type_v_set &&
+                        (t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0);
+                    if (kv4_on && best.ok && best.layers < n_layer + 1) {
+                        const char * e_t = getenv("LLAMA_FIT_LONGCTX_KV4_TYPE");
+                        ggml_type t4 = GGML_TYPE_Q4_0;
+                        if (e_t != nullptr && e_t[0] != 0) {
+                            for (int i = 0; i < GGML_TYPE_COUNT; i++) {
+                                const char * n = ggml_type_name((ggml_type) i);
+                                if (n != nullptr && strcmp(n, e_t) == 0) {
+                                    t4 = (ggml_type) i;
+                                }
+                            }
+                        }
+                        const char * e_ar = getenv("LLAMA_FIT_LONGCTX_KV4_ARCHS");
+                        const std::string arch = common_gguf_arch(params.model.path);
+                        const std::string archs = std::string(",") + (e_ar != nullptr ? e_ar : "qwen35moe,qwen4exp") + ",";
+                        if (!arch.empty() && archs.find("," + arch + ",") != std::string::npos) {
+                            kv_probe best4;
+                            for (uint32_t ub = cparams.n_ubatch; ub >= 1 && (ub == cparams.n_ubatch || ((int64_t) ub >= lc_ubmin && ub_may)); ub /= 2) {
+                                const kv_probe c = probe(t4, true, ub == cparams.n_ubatch ? 0 : ub);
+                                tried.push_back(c);
+                                if (better(c, best4)) {
+                                    best4 = c;
+                                }
+                                if (c.ok && c.layers >= n_layer + 1) {
+                                    break;
+                                }
+                            }
+                            if (better(best4, best)) {
+                                best = best4;
+                            }
+                        }
+                    }
+                    std::string list;
+                    for (const auto & c : tried) {
+                        list += string_format("%s%s %s ub %u: %s", list.empty() ? "" : "; ", ggml_type_name(c.type), c.kvo ? "K/V device" : "K/V host", c.ub,
+                            c.ok ? string_format("%" PRId64 " layers, MoE cache %" PRId64 " MiB", c.layers, c.cache/(1024*1024)).c_str() : "fit failed");
+                    }
+                    const bool changed = best.ok && (best.kvo != a.kvo || best.ub_req != 0 || best.type != a.type);
+                    if (changed) {
+                        if (!best.kvo) {
+                            params.no_kv_offload    = true;
+                            cparams.offload_kqv     = false;
+                            cparams_dft.offload_kqv = false;
+                        }
+                        if (best.type != a.type) {
+                            params.cache_type_k = best.type;
+                            params.cache_type_v = best.type;
+                            cparams.type_k      = best.type;
+                            cparams.type_v      = best.type;
+                        }
+                        if (best.ub_req != 0) {
+                            // given from here on, so the MoE cache rules do not grow it back
+                            params.n_ubatch     = (int32_t) best.ub_req;
+                            params.n_ubatch_set = true;
+                            cparams.n_ubatch    = best.ub_req;
+                        }
+                    }
+                    COM_INF("%s: --fit: ctx %u: %s (as given: %" PRId64 " / %" PRId64 " layers, MoE cache %" PRId64 " MiB, n_ubatch %u; %s; "
+                        "LLAMA_FIT_LONGCTX=0 keeps it)\n", __func__, a.n_ctx,
+                        !changed ? "no long-context trade puts more on the device" :
+                        string_format("K/V %s %s, n_ubatch %u: %" PRId64 " layers, MoE cache %" PRId64 " MiB", ggml_type_name(best.type),
+                            best.kvo ? "on the device" : "in host memory", best.ub, best.layers, best.cache/(1024*1024)).c_str(),
+                        a.layers, n_layer + 1, a.cache/(1024*1024), a.ub, list.c_str());
                 }
             }
         }
