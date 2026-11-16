@@ -5753,7 +5753,7 @@ static void llama_phase(const char * what) {
     }
 }
 
-// k19-ttft4 (LLAMA_MOE_PROMPT_RUN=1 opts in; default 0 = each call on its own, as before): the tokens of the prompt run this call belongs to. The
+// k19-ttft4 (LLAMA_MOE_PROMPT_RUN, default 1; 0 = each call on its own, as before): the tokens of the prompt run this call belongs to. The
 // server runs a prompt's last 4 tokens as a call of their own after its context checkpoint; that call is a prompt batch of 4 tokens,
 // which the MoE cache's short-prompt rule (llama_moe_cache::set_prompt_batch, k17-ttft / k19-l4poly: a chat turn of at most
 // LLAMA_MOE_CPU_MISS_SHORT tokens computes its misses on the host where the cost model says so) did not count as part of the chat turn:
@@ -5762,9 +5762,10 @@ static void llama_phase(const char * what) {
 // of uploads. Counted as one run (same sequence, the next call starts where the last prompt call ended, no generation between them),
 // the 4-token call takes the short prompt's host path too. A call with an output for every token (generation, verify) ends a run
 int64_t llama_context::prompt_run_tokens(int64_t n_outputs_all, int64_t n_tokens_all) {
-    // k19-promptrun-off: off by default. With it on, the 4-token call computes its misses on the host as well, and srv_kld short192
-    // (Colab L4 LFM2.5 4 GB) put single positions above the -fa off band's max: first token 1.41 vs 1.11, decode 1.42 vs 1.33
-    static const bool on = getenv("LLAMA_MOE_PROMPT_RUN") != nullptr && atoi(getenv("LLAMA_MOE_PROMPT_RUN")) != 0;
+    // k19-defaults1116: on by default again. With it the 4-token call computes its misses on the host (q8_K activations) instead of
+    // uploading them: the same experts, rounded on another device (srv_kld short192 means and top-1 inside / better than the -fa off
+    // band, single-position maxima above it: first token 1.41 vs 1.11, decode 1.42 vs 1.33). L4 LFM2.5 4 GB chat TTFT 0.840 -> 0.680 s
+    static const bool on = getenv("LLAMA_MOE_PROMPT_RUN") == nullptr || atoi(getenv("LLAMA_MOE_PROMPT_RUN")) != 0;
     const llama_batch & b = balloc->get_batch();
     llama_seq_id seq = -1;
     bool one_seq = n_tokens_all > 0 && b.pos != nullptr && b.n_seq_id != nullptr && b.seq_id != nullptr;

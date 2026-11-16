@@ -3351,7 +3351,8 @@ uma_restart:
         // ctx 262144 on 10 GB (q8_0 K/V) kept 17 of 49 layers on the device, with dense weights 5597 MiB, the compute buffer 4127 MiB at
         // n_ubatch 2048 and the K/V 4192 MiB. When the placement spills layers, two other trades are fitted first:
         // - a smaller n_ubatch (halved down to LLAMA_FIT_LONGCTX_UB_MIN, 512): the prompt runs in more, smaller steps.
-        //   LLAMA_FIT_LONGCTX_UB: 1 (default) only without -ub, 2 also a given -ub, 0 never;
+        //   LLAMA_FIT_LONGCTX_UB: 2 (default since k19-defaults1116) also a given -ub (Studio passes -ub 2048: G4 Flash-Next 12 GB ctx
+        //   262144 kept 30 of 49 layers at 29 tok/s, 10 GB 17 of 49 at 23), 1 only without -ub, 0 never;
         // - opt-in (LLAMA_FIT_LONGCTX_KV_HOST=1): the K/V in pinned host memory (-nkvo; the recurrent states stay on the device). The
         //   attention still runs on the GPU from a copy of the cells in use, so each decode step copies the whole used K/V of every
         //   attention layer: G4 10 GB, Flash-Next ctx 262144, n_ubatch 1024: every layer on the device and a 3 GB MoE cache, chat
@@ -3373,7 +3374,7 @@ uma_restart:
             const int64_t lc_mode  = env_i("LLAMA_FIT_LONGCTX", 1);
             const int64_t lc_min   = env_i("LLAMA_FIT_LONGCTX_MIN_CTX", 32768);
             const int64_t lc_host  = env_i("LLAMA_FIT_LONGCTX_KV_HOST", 0);
-            const int64_t lc_ub    = env_i("LLAMA_FIT_LONGCTX_UB", 1);
+            const int64_t lc_ub    = env_i("LLAMA_FIT_LONGCTX_UB", 2);
             const int64_t lc_ubmin = std::max<int64_t>(64, env_i("LLAMA_FIT_LONGCTX_UB_MIN", 512));
             const char *  lc_pref  = getenv("LLAMA_FIT_LONGCTX_PREFER");
             const bool    pref_ub  = lc_pref != nullptr && strcmp(lc_pref, "ub") == 0;
