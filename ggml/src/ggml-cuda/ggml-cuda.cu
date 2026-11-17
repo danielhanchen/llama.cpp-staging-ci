@@ -4620,6 +4620,52 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
     return true;
 }
 
+// k19-fusealias: a leaf (op NONE) source of a fused group was skipped by the overlap check below as if it were a weight. Leaves in the
+// compute buffer (the scheduler's copies of another backend's tensors, graph inputs) end their life at their last planned reader, and the
+// allocator may then place the fused output over them at a shift: the fused kernel writes rows while other blocks still read the leaf
+// (the fused mmvf + add and the fused MoE weighted reduction both raced so). A leaf in another buffer than dst (weights, caches) cannot
+// overlap it; one in dst's buffer is checked like any other source, except an exact in-place alias (same address, type, shape and
+// strides: a row-wise kernel reads each element before it writes it). Returns true when the leaf must be checked.
+// GGML_CUDA_FUSE_ALIAS_STRICT=0: every leaf skipped (the previous rule)
+static bool ggml_cuda_fusion_alias_strict() {
+    static const bool strict = [] {
+        const char * e = getenv("GGML_CUDA_FUSE_ALIAS_STRICT");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return strict;
+}
+
+static bool ggml_cuda_fusion_leaf_may_alias(const ggml_tensor * dst, const ggml_tensor * src) {
+    if (!ggml_cuda_fusion_alias_strict() || src->buffer == nullptr || dst->buffer == nullptr || src->buffer != dst->buffer || src->data == nullptr) {
+        return false;
+    }
+    if (src->data == dst->data && src->type == dst->type && ggml_are_same_shape(src, dst) && ggml_are_same_stride(src, dst)) {
+        return false;
+    }
+    return true;
+}
+
+// k19-fusealias: logs the first fused group refused for an input overlap (GGML_CUDA_FUSE_ALIAS_LOG=1: every distinct dst op / input name)
+static void ggml_cuda_fusion_leaf_alias_log(const ggml_tensor * dst, const ggml_tensor * src) {
+    static const bool log_all = ggml_cuda_env_flag("GGML_CUDA_FUSE_ALIAS_LOG");
+    static std::mutex mtx;
+    static std::unordered_set<std::string> seen;
+    std::string key = std::string(ggml_op_desc(dst)) + " over " + src->name;
+    // per-layer names (blk.N / -N) collapse to one entry
+    for (char & c : key) {
+        if (c >= '0' && c <= '9') {
+            c = '#';
+        }
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    if ((!log_all && !seen.empty()) || !seen.insert(key).second) {
+        return;
+    }
+    GGML_LOG_INFO("%s: k19-fusealias: %s (%s) overlaps the input %s (%s, %s) its fused group reads: computed by the separate nodes "
+        "(GGML_CUDA_FUSE_ALIAS_STRICT=0: fused anyway)\n", __func__, dst->name, ggml_op_desc(dst), src->name, ggml_op_desc(src),
+        ggml_type_name(src->type));
+}
+
 // returns whether the write (out) nodes overwrite the read nodes in operation
 static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_idx,
@@ -4659,7 +4705,10 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                if (!src || src->op == GGML_OP_NONE || src == logits_may_alias) {
+                if (!src || src == logits_may_alias) {
+                    continue;
+                }
+                if (src->op == GGML_OP_NONE && !ggml_cuda_fusion_leaf_may_alias(dst, src)) {
                     continue;
                 }
 
@@ -4674,6 +4723,9 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                     }
 
                     if (!found) {
+                        if (src->op == GGML_OP_NONE) {
+                            ggml_cuda_fusion_leaf_alias_log(dst, src);
+                        }
                         is_ok = false;
                         break;
                     }
@@ -8653,6 +8705,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
 
         n_fuse++;
+
+        // k19-fusealias: the fused chain reads every input while it writes the last node's output, element by element; an output the
+        // allocator placed over an input at a shift (a dead input of an earlier node of the chain: the shared-expert product under the
+        // residual l_out of a MoE layer, q4x T4) is overwritten before other threads read it. Exact in-place (same address and layout)
+        // is fine. GGML_CUDA_FUSE_ALIAS_STRICT=0: fused anyway
+        if (n_fuse > 1 && ggml_cuda_fusion_alias_strict()) {
+            const ggml_tensor * last = cgraph->nodes[i + n_fuse - 1];
+            for (int j = 0; j < n_fuse && n_fuse > 1; ++j) {
+                const ggml_tensor * n_j = cgraph->nodes[i + j];
+                for (int k = j == 0 ? 0 : 1; k < 2; ++k) {
+                    const ggml_tensor * in = n_j->src[k];
+                    if (in != nullptr && in->data != nullptr && ggml_cuda_tensors_overlap(last, in) &&
+                            !(in->data == last->data && in->type == last->type && ggml_are_same_shape(in, last) && ggml_are_same_stride(in, last))) {
+                        ggml_cuda_fusion_leaf_alias_log(last, in);
+                        n_fuse = 1;
+                        break;
+                    }
+                }
+            }
+        }
 
         if (n_fuse > 1) {
             ggml_tensor fused_node;
