@@ -1121,27 +1121,27 @@ static void common_params_fit_impl(
         static const double hl_min_share = getenv("LLAMA_FIT_MOE_HEADLESS_MIN_SHARE") != nullptr ?
             std::max(0.0, atof(getenv("LLAMA_FIT_MOE_HEADLESS_MIN_SHARE"))) : 0.25;
         const double hl_experts = hl_min_share > 0.0 ? (double) common_moe_expert_bytes(path_model) : 0.0;
-        // LLAMA_FIT_MOE_HEADLESS_DRAFT (default 0): no headless step-down beside a DFlash draft model where the memory left for the cache
-        // (free minus everything else of this placement) holds at least the wide-graph share of the host experts
-        // (LLAMA_MOE_CACHE_WIDE_GRAPHS_FRAC 0.6, host experts of at least LLAMA_MOE_CACHE_WIDE_GRAPHS_MIN_MIB, as llama_moe_cache_wide_graphs).
-        // There the server prewarms the verify graphs of every width and sampler chain in that memory; with the 512 MiB step-down the
-        // prewarm's free-memory floor (LLAMA_SPEC_PREWARM_MIN_FREE_MIB) skipped every width, and the CPU-miss warm phase, its timing trial
-        // and the first capture of each width ran inside the first request. Colab G4, Qwen3.8-Flash-Next UD-IQ4_XS, 48 GB budget (70.6%
-        // cached), DFlash2 n6, 3 interleaved launches: chat 225.6 -> 261.5 tok/s (same text). Below that share (32 GB, 41%) the prewarm ran
-        // in full with the step-down and the smaller cache cost 3.1-3.5% in DFlash2 chat; beside the MTP drafter the larger margin cost
-        // 1.7-1.9% in 48 GB chat. =1: the step-down beside every draft model; =2: no step-down beside any separate draft model
-        static const int hl_draft_mode = getenv("LLAMA_FIT_MOE_HEADLESS_DRAFT") != nullptr ? atoi(getenv("LLAMA_FIT_MOE_HEADLESS_DRAFT")) : 0;
-        static const double wide_frac = getenv("LLAMA_MOE_CACHE_WIDE_GRAPHS_FRAC") != nullptr ? atof(getenv("LLAMA_MOE_CACHE_WIDE_GRAPHS_FRAC")) : 0.6;
-        static const double wide_min  = (getenv("LLAMA_MOE_CACHE_WIDE_GRAPHS_MIN_MIB") != nullptr ?
+        // No headless step-down beside a separate draft model (LLAMA_FIT_MOE_HEADLESS_DRAFT=1: the step-down beside every draft model).
+        // Colab G4, Qwen3.8-Flash-Next UD-IQ4_XS + its MTP drafter (n2), ctx 32768, 3 interleaved launches, chat / 8k decode with and without
+        // the step-down: 32 GB budget 240.2 / 206.5 -> 244.3 / 216.6 tok/s, 48 GB 234.2 / 209.2 -> 229.7 / 221.3.
+        // Beside a DFlash draft model the step-down stays off only where the memory left for the cache (free minus everything else of
+        // this placement) holds at least the wide-graph share of the host experts (LLAMA_MOE_CACHE_WIDE_GRAPHS_FRAC 0.6, host experts of
+        // at least LLAMA_MOE_CACHE_WIDE_GRAPHS_MIN_MIB, as llama_moe_cache_wide_graphs): there the server prewarms the verify graphs of
+        // every width and sampler chain in that memory, and with the 512 MiB step-down the prewarm's free-memory floor
+        // (LLAMA_SPEC_PREWARM_MIN_FREE_MIB) skipped every width, so the CPU-miss warm phase, its timing trial and the first capture of
+        // each width ran inside the first request (48 GB, 70.6% cached, DFlash2 n6 chat 225.6 -> 261.5 tok/s, same text). Below that
+        // share the prewarm runs in full with the step-down and the larger cache wins: 32 GB (41%) chat / 8k 254.3 / 186.1 -> 257.2 / 195.5
+        static const bool   hl_draft_ok  = getenv("LLAMA_FIT_MOE_HEADLESS_DRAFT") != nullptr && atoi(getenv("LLAMA_FIT_MOE_HEADLESS_DRAFT")) == 1;
+        static const double wide_frac    = getenv("LLAMA_MOE_CACHE_WIDE_GRAPHS_FRAC") != nullptr ? atof(getenv("LLAMA_MOE_CACHE_WIDE_GRAPHS_FRAC")) : 0.6;
+        static const double wide_min     = (getenv("LLAMA_MOE_CACHE_WIDE_GRAPHS_MIN_MIB") != nullptr ?
             std::max(0.0, atof(getenv("LLAMA_MOE_CACHE_WIDE_GRAPHS_MIN_MIB"))) : 32768.0)*1024.0*1024.0;
-        const bool   hl_sep_draft = extra != nullptr && !extra->shares_model;
-        const bool   hl_any_draft = hl_sep_draft && hl_draft_mode == 2;
-        const bool   hl_dflash    = hl_sep_draft && hl_draft_mode == 0 && use_margins && wide_frac > 0.0 && common_fit_is_dflash_draft(extra->path_model);
-        const double hl_wide_exp  = hl_dflash ? (double) common_moe_expert_bytes(path_model) : 0.0;
+        const bool   hl_sep_draft = use_margins && extra != nullptr && !extra->shares_model && !hl_draft_ok;
+        const bool   hl_dflash    = hl_sep_draft && common_fit_is_dflash_draft(extra->path_model);
+        const double hl_wide_exp  = hl_dflash && wide_frac > 0.0 ? (double) common_moe_expert_bytes(path_model) : 0.0;
         for (size_t id = 0; id < nd; id++) {
             if (use_margins && int64_t(dmds[id].mb.total()) > int64_t(dmds_nc[id].mb.total())) {
                 int hl = id < dev_headless.size() ? dev_headless[id] : -1;
-                if (hl_any_draft) {
+                if (hl_sep_draft && !hl_dflash) {
                     hl = -2; // the step-down stays off (separate draft model)
                 }
                 const double avail = (double) (int64_t(dmds[id].free) - int64_t(dmds_nc[id].mb.total()));
