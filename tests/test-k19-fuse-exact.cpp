@@ -560,6 +560,9 @@ int main(int argc, char ** argv) {
         const std::string path = std::string(argc > 1 ? argv[1] : ".") + "/k19_fuse_exact_" + std::to_string(mode) + ".bin";
         set_env("GGML_CUDA_DISABLE_CONV_CAT_PROMPT", mode ? "0" : "1");
         set_env("GGML_CUDA_DISABLE_QSA_PROMPT_MASK", mode ? "0" : "1");
+        // both modes on the f16 kernel (the INT8 Q*K^T route of f16 prompt nodes is not byte-equal)
+        set_env("GGML_CUDA_FATTN_I8", "0");
+        set_env("GGML_CUDA_FATTN_I8_F16", "0");
         set_env("GGML_CUDA_DISABLE_FUSE_HC_POST_CONV", mode ? "0" : "1");
         set_env("GGML_CUDA_DISABLE_FUSE_GATED_NORM_MMQ", mode ? "0" : "1");
         set_env("GGML_CUDA_DISABLE_FUSE_SWIGLU_MMID", mode ? "0" : "1");

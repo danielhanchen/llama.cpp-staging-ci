@@ -10516,6 +10516,31 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+// K with 4 outlier channels (x20) per row, as the K of many trained models has: an INT8 Q*K^T with one scale per row must rotate such rows
+// first (CUDA GGML_CUDA_FATTN_I8_F16 decides per KV head) to stay inside the tolerance
+struct test_flash_attn_ext_k_outliers : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",k_outliers=4x20";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        ggml_tensor * k = ggml_get_tensor(ctx, "k");
+        GGML_ASSERT(k->type == GGML_TYPE_F16 && ggml_is_contiguous(k));
+        std::vector<ggml_fp16_t> d(ggml_nelements(k));
+        ggml_backend_tensor_get(k, d.data(), 0, ggml_nbytes(k));
+        for (int64_t r = 0; r < ggml_nelements(k)/k->ne[0]; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                ggml_fp16_t & x = d[r*k->ne[0] + c];
+                x = ggml_fp32_to_fp16(20.0f*ggml_fp16_to_fp32(x));
+            }
+        }
+        ggml_backend_tensor_set(k, d.data(), 0, ggml_nbytes(k));
+    }
+};
+
 // k19-kvwin: two-source flash attention (ggml_flash_attn_ext_set_src2): a cache source (k, v, mask: views of a cache, kv cells) and a
 // ring source (k2, v2, mask2: views of a ring of kv2 slots with a dump row, like llama_kv_cache's window ring). The masks are disjoint
 // as the cache builds them: every visible cell is finite in exactly one of the two (disjoint = false: random masks for both)
@@ -14294,6 +14319,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // INT8 Q*K^T over an f16 K cache (CUDA GGML_CUDA_FATTN_I8_F16: Q and K staged as int8 rows with one scale each, rotated by
+    // default): prompt shapes past 16 rows, GQA 1 / 4 / 6 / 12, KV with and without the 256 padding, ALiBi, sinks, permuted layout
+    for (int hs : { 128, 256 }) {
+        for (int nr2 : { 1, 4, 6, 12 }) {
+            for (int kv : { 1000, 2048 }) {
+                for (int nb : { 17, 100 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {nr2, 1}, kv, nb, true, nr2 == 4, 0, 0, GGML_PREC_F32,
+                        GGML_TYPE_F16, GGML_TYPE_F16));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {1, 1}, 1024, 33, true, false, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {4, 1}, 2048, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
+    }
+
     // k19-fattnq8: q8_0 K / V at the head sizes the CUDA MMA kernel reads in place (128 / 256), GQA 1 / 2 / 6 (Qwen3.8-27B) / 8
     // (Qwen3.6-35B-A3B), verify windows and prompt batches, KV lengths with and without the 256 padding, with and without sinks
     for (int hs : { 128, 256 }) {
@@ -14512,6 +14552,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 10.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext_k_outliers(128, 128,  8, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext_k_outliers(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, false));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
