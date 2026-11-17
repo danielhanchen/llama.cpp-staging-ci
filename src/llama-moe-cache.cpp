@@ -3074,10 +3074,15 @@ struct llama_moe_cache::impl {
         if (team_env > 0) {
             return std::max(1, std::min(team_env, llama_moe_n_cpus() - 1));
         }
+        // k19-hostovl: on 8-11 usable CPUs (single_small) the team leaves 3 CPUs to the server, the drafter and other programs (a
+        // laptop with 4 cores / 8 threads and a browser): at most the CPUs - 3 (LLAMA_MOE_SINGLE_SMALL_HOST_FREE, default 3, sets it)
+        static const int small_free = getenv("LLAMA_MOE_SINGLE_SMALL_HOST_FREE") != nullptr ?
+            std::max(1, atoi(getenv("LLAMA_MOE_SINGLE_SMALL_HOST_FREE"))) : 3;
+        const int cap = single_small ? std::max(1, llama_moe_n_cpus() - small_free) : wmax;
         if (single_wait_blocking_here()) {
-            return std::min({ single_threads + std::max(1, 2*single_threads/3), llama_moe_n_cpus() - 2, wmax });
+            return std::min({ single_threads + std::max(1, 2*single_threads/3), llama_moe_n_cpus() - 2, wmax, cap });
         }
-        return std::min({ single_threads + std::max(1, single_threads/3), llama_moe_n_cpus() - 4, wmax });
+        return std::min({ single_threads + std::max(1, single_threads/3), llama_moe_n_cpus() - 4, wmax, cap });
     }
     // k19-l4poly (LLAMA_MOE_SINGLE_WAIT_BLOCKING, default 1; 0 = off): the CUDA backend's blocking device wait. With it the thread that waits
     // for the graph sleeps instead of spinning, so the host team takes the decode threads + two thirds (at most the CPUs - 2) instead
