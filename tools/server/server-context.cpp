@@ -2216,7 +2216,28 @@ private:
             const uint64_t share_short = need > dev_free ? need - dev_free : 0;
             const double share_est = share_exp > 0 ? 1.0 - (double) share_short/(double) share_exp : 0.0;
             const uint64_t share_ram = share_exp > 0 ? llama_available_memory() : 0;
-            const bool share_ok = share_exp > 0 && share_est >= share_min && (share_ram == 0 || share_exp <= share_ram);
+            const bool share_hi = share_exp > 0 && share_est >= share_min && (share_ram == 0 || share_exp <= share_ram);
+            // k19-q4cap (LLAMA_SPEC_TPP_CACHED_LOW=0 off): from LLAMA_SPEC_TPP_CACHED_SHARE_LOW (0.30) of the routed experts up to the
+            // share above, the 3rd draft only in the windows of the chat bucket (KV positions below 1536, LLAMA_SPEC_TPP_CTX_EXTRA
+            // "1,0,0,0,0" unless given): longer contexts keep 2 drafts. Qwen3.6-35B-A3B UD-Q4_K_XL + MTP (3 launches, priced
+            // windows at every position): chat G4 @16 (61%) +8.8%, L4 16 GB (61%) +6.3%, L4 12 GB (39%) +9.6%, L4 8 GB (17%) 0%; 8k
+            // 0..+2.2% (G4 @16 with the larger cache -2.7%), 30k -8.5% (L4 12 GB): so the priced 3rd draft stays off past the chat bucket.
+            // Qwen3.8 Flash-Next UD-IQ4_XS at a 9-14% share (where the blanket rule above was measured) stays below it. Same output class (MTP verify), KLD inside the -fa off band (L4 12 GB)
+            const char * lo_e = getenv("LLAMA_SPEC_TPP_CACHED_LOW");
+            const double share_lo = [] {
+                const char * s = getenv("LLAMA_SPEC_TPP_CACHED_SHARE_LOW");
+                return s != nullptr ? atof(s) : 0.30;
+            }();
+            const bool share_low = !share_hi && share_exp > 0 && (lo_e == nullptr || atoi(lo_e) != 0) && share_est >= share_lo &&
+                share_lo < share_min && (share_ram == 0 || share_exp <= share_ram);
+            const bool share_ok = share_hi || share_low;
+            if (share_low && getenv("LLAMA_SPEC_TPP_CTX_EXTRA") == nullptr) {
+                common_set_env("LLAMA_SPEC_TPP_CTX_EXTRA", "1,0,0,0,0");
+            }
+            if (share_low) {
+                SRV_INF("k19-q4cap: MoE cache expected to hold %.1f%% of the routed experts (from %.2f): the 3rd draft in the chat bucket only "
+                    "(below 1536 tokens; LLAMA_SPEC_TPP_CACHED_LOW=0: off)\n", 100.0*share_est, share_lo);
+            }
             if (share_try) {
                 SRV_INF("k19-sharegate: MoE cache expected to hold %.1f%% of the routed experts (%.0f MiB short of %.0f MiB, %.0f MiB of RAM): "
                     "priced 3-draft windows %s (LLAMA_SPEC_TPP_CACHED_SHARE=%.2f; LLAMA_SPEC_TPP_SHAREGATE=0: off)\n", 100.0*share_est,
