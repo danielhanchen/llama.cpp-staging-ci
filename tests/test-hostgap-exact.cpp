@@ -4,7 +4,7 @@
 // switches; the parent compares the outputs: generated tokens, every draft, and a hash of the target's and the drafter's sequence
 // state (llama_state_seq_get_data) after every pass.
 //   LLAMA_KV_SEQ_RM_USED=0 / 1: KV seq_rm over every cell / over the cells below the last used one
-// usage: test-hostgap-exact qwen35moe-mtp-model.gguf
+// usage: test-hostgap-exact qwen35moe-mtp-model.gguf   (not a .gguf file: SKIP, exit 0)
 #include "common.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -191,10 +191,14 @@ int main(int argc, char ** argv) {
         llama_backend_free();
         return r;
     }
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s qwen35moe-mtp-model.gguf\n", argv[0]);
-        return 1;
+    // not a .gguf file (a GPU stage that runs every test-*-exact with an output directory): SKIP, exit 0; ctest passes the generated model
+    const std::string model = argc > 1 ? argv[1] : "";
+    FILE * mf = model.size() > 5 && model.compare(model.size() - 5, 5, ".gguf") == 0 ? fopen(model.c_str(), "rb") : nullptr;
+    if (mf == nullptr) {
+        printf("SKIP: no qwen35moe-mtp .gguf model given (usage: %s qwen35moe-mtp-model.gguf)\n", argv[0]);
+        return 0;
     }
+    fclose(mf);
 #ifdef _WIN32
     printf("SKIP (POSIX only)\n");
     return 0;
