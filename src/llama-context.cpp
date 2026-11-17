@@ -3794,14 +3794,22 @@ void llama_context::moe_cache_devseed_fallback(bool host_seed_fits) {
 // k16-fit: set once a memory probe of this process priced a seed graph (sched_reserve): the fit then made room for it
 std::atomic<bool> llama_context::g_fit_seed_priced{false};
 
-// k19-df2reg: a prefetched ubatch without an earlier routing (a prompt of one large ubatch, e.g. a 640-token chat turn) seeds the
-// MoE cache from its own ids only from LLAMA_MOE_CACHE_SEED_OWN_MIN (1024) tokens on, as the device seed (moe_cache_devseed_fallback).
-// The seed of a chat-sized prompt replaced the cache and RAM-tier experts the decode after it reads: the seed graph fits beside
-// the DFlash2 drafter since the one-node QSA selection mask (200 MiB smaller), and there Colab L4 Flash-Next full card chat decode
-// read 55% more from the disk (8.2 vs 5.4 GB) and ran 14-19% slower with the same text. Smaller ubatches run as when the seed graph
-// does not fit (count_seed_skipped). LLAMA_MOE_CACHE_SEED_OWN_MIN=0: every such ubatch seeds, as before
+// k19-df2reg: beside a DFlash2 drafter (common sets LLAMA_MOE_CACHE_SEED_OWN_DFLASH=1 for a target launched with --spec-type
+// draft-dflash and a MoE cache), a prefetched ubatch without an earlier routing (a prompt of one large ubatch, e.g. a 640-token chat
+// turn) seeds the MoE cache from its own ids only from 1024 tokens on, as the device seed (moe_cache_devseed_fallback). The seed
+// graph fits beside the DFlash2 drafter's reserve since the one-node QSA selection mask (200 MiB smaller), and the seed of such a turn
+// replaced the cache and RAM-tier experts the decode after it reads: Colab L4 Flash-Next full card DFlash2 chat read 55% more from the
+// disk (8.2 vs 5.4 GB) and ran 14-19% slower with the same text. Smaller ubatches run as when the seed graph does not fit
+// (count_seed_skipped). Other contexts keep every such seed (Qwen3.6-35B-A3B MTP at L4 12 GB: the gate changed its 2k / 8k text).
+// LLAMA_MOE_CACHE_SEED_OWN_MIN=N: that minimum in every context (0: none); LLAMA_MOE_CACHE_SEED_OWN_DFLASH=0: no gate beside DFlash2
 int64_t llama_context::seed_own_min() {
-    static const int64_t v = getenv("LLAMA_MOE_CACHE_SEED_OWN_MIN") != nullptr ? std::max<int64_t>(0, atoll(getenv("LLAMA_MOE_CACHE_SEED_OWN_MIN"))) : 1024;
+    static const int64_t v = [] {
+        if (const char * e = getenv("LLAMA_MOE_CACHE_SEED_OWN_MIN")) {
+            return std::max<int64_t>(0, atoll(e));
+        }
+        const char * d = getenv("LLAMA_MOE_CACHE_SEED_OWN_DFLASH");
+        return d != nullptr && atoi(d) != 0 ? (int64_t) 1024 : (int64_t) 0;
+    }();
     return v;
 }
 
