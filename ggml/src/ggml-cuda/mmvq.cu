@@ -3360,6 +3360,7 @@ static int mul_mat_vec_q_exact_batched(
 template <ggml_type type>
 static int mul_mat_vec_q_batch_rpb(const int ncols_x, const int nrows_x, const int ncols_dst, const int cc, const int warp_size,
         const mmvq_parameter_table_id table_id) {
+    GGML_UNUSED(cc);
     static const bool small_k_on = [] { const char * e = getenv("GGML_CUDA_MMVQ_BATCH_SMALL_K"); return e == nullptr || atoi(e) != 0; }();
     static const bool rows1_on   = [] { const char * e = getenv("GGML_CUDA_MMVQ_BATCH_ROWS1");  return e == nullptr || atoi(e) != 0; }();
     if (ncols_dst < 2 || ncols_dst > 8 || !mul_mat_vec_q_multi_type(type) ||
