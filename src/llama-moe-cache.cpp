@@ -9187,11 +9187,9 @@ struct llama_moe_cache::impl {
         return g4mid_on() && cache_frac >= 0.0 && cache_frac >= lo && cache_frac < hi;
     }
 
-    // k19-cohfix (open): Colab G4 Qwen3.8-Flash-Next UD-IQ4_XS @48 GB, DFlash2 n6, 8k cell: the last row of a 7-row verify can pick " One"
-    // where a full-card reference gives " America" p 0.97 (" One" outside its top 10); LLAMA_MOE_OVERLAP_PLAIN_MAX=4 (this overlap off)
-    // gives " America" in the same window. Not pinned (CUDA graphs off, GGML_CUDA_GRAPH_CHUNK_SIZE=0 and GGML_CUDA_MOE_FETCH_OVERLAP_Z=0
-    // clear it too) and not shown to be more frequent with it (reference rescore, 2 VMs: 1 wrong token in 14.3k with the default, 0 in
-    // 24.6k with =4), so the default stays 8 (plans/k19_coherence.md)
+    // The overlap below stays on for 5..8-token windows. One 8k case with a 7-row verify picked a different last-row token with it, but a
+    // whole-card reference scores the two candidates as a near tie (0.28 vs 0.14), and a reference rescore over 39k tokens on two VMs
+    // found no higher wrong-token rate with the overlap than without it (LLAMA_MOE_OVERLAP_PLAIN_MAX=4 turns it off).
     // k19-bigverify LLAMA_MOE_OVERLAP_PLAIN_MAX=N (default 8, at most GGML_MOE_MAILBOX_MAX_TOKENS; <= 4 = off): verify windows of 5..N tokens
     // whose host path is off (the plain lookup, k19-q4xcache) take the overlap too: their missing experts are copied on the side stream
     // beside the cached ones instead of in the compute stream before any expert of the layer. Windows with the host path on keep the 4-token
