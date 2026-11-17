@@ -283,8 +283,48 @@ static int64_t common_fit_moe_margin_impl(int64_t m, int64_t free_dev, int64_t c
 // Kaggle 2x T4, DeepSeek-V4.1 fake dsf8, -fa off, --moe-cache-mib auto, ctx 16384: fit projected 1297 MiB free on CUDA1 at the 1024 MiB
 // margin, the cache then took +768 MiB per device (+1536 total), and the first 2100-token prompt aborted with CUDA out of memory in
 // the pool (cuMemCreate). The measured compute buffer itself matched the run (CUDA1 10768 MiB both)
-static int64_t common_fit_moe_margin(int64_t m, int64_t free_dev, int64_t cache_want, bool has_drafter) {
-    const int64_t r = common_fit_moe_margin_impl(m, free_dev, cache_want, has_drafter);
+// k19-q4cap (LLAMA_FIT_MOE_HEADLESS=0 off, =1 also on a card with a display): on a headless card (the CUDA backend's NVML display signal,
+// as k19-fitplain) with a device budget of at least LLAMA_FIT_MOE_HEADLESS_MIN_GIB (10), the default 1024 MiB margin beside a MoE cache
+// steps down to LLAMA_FIT_MOE_HEADLESS_MIB (512) where the rule above keeps it (beside a drafter or MTP heads, or a cache share over
+// its ratio). Nothing else allocates on such a card, and from 10 GiB the host weight prefetch staging of the main context lives in lent
+// cache memory (L4 12 GB: 354 MiB lent) instead of the margin; below that the staging (T4 8 GB: 386 MiB, depth 2) and the prompt
+// graphs of the released banks need the margin: Colab T4 8 GB, Qwen3.6-35B-A3B UD-Q4_K_XL + MTP, margin 512: the main context's
+// staging was not allocated (chat -5.7..-8%) and a 30k prompt aborted (3445 MiB compute buffer, cudaMalloc out of memory). Gains with
+// it (Qwen3.6-35B-A3B UD-Q4_K_XL + MTP, 3 launches, chat / 8k decode): G4 @16 +4.7 / +2.3%, L4 12 GB +1.3 / +6.0% (30k +10.7%), L4 16 GB 0 / +0.8%, T4 12 GB
+// +1.2 / +3.3%; KLD short192 / long48 inside the -fa off band (L4 12 GB, T4 8 GB). Cards with a display keep 1024 (other processes)
+static int64_t common_fit_moe_margin_headless(int64_t m, int64_t r, int64_t free_dev, int headless) {
+    constexpr int64_t MiB_ = 1024*1024;
+    constexpr int64_t m_default = 1024*MiB_;
+    const char * e = getenv("LLAMA_FIT_MOE_HEADLESS");
+    const int mode = e != nullptr ? atoi(e) : -1;
+    if (mode == 0 || r != m || !g_moe_margin_auto || m < m_default || getenv("LLAMA_MOE_FIT_MARGIN_MIB") != nullptr ||
+            (getenv("LLAMA_MOE_FIT_MARGIN") != nullptr && atoi(getenv("LLAMA_MOE_FIT_MARGIN")) == 0)) {
+        return r;
+    }
+    if (!(headless == 1 || mode == 1)) {
+        return r;
+    }
+    const char * eg = getenv("LLAMA_FIT_MOE_HEADLESS_MIN_GIB");
+    const int64_t min_free = (eg != nullptr ? std::max<int64_t>(0, atoll(eg)) : 10)*1024*MiB_;
+    if (free_dev < min_free) {
+        return r;
+    }
+    const char * em = getenv("LLAMA_FIT_MOE_HEADLESS_MIB");
+    const int64_t keep = std::min<int64_t>(m_default, (em != nullptr ? std::max<int64_t>(0, atoll(em)) : 512)*MiB_);
+    return m - m_default + keep;
+}
+
+static int64_t common_fit_moe_margin(int64_t m, int64_t free_dev, int64_t cache_want, bool has_drafter, int headless = -1) {
+    const int64_t r0 = common_fit_moe_margin_impl(m, free_dev, cache_want, has_drafter);
+    const int64_t r  = common_fit_moe_margin_headless(m, r0, free_dev, headless);
+    if (r != r0) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LOG_INF("%s: k19-q4cap: headless device: the margin beside the MoE cache steps down to %" PRId64 " MiB (LLAMA_FIT_MOE_HEADLESS=0: %" PRId64 " MiB)\n",
+                __func__, r/(1024*1024), r0/(1024*1024));
+        }
+    }
     const int64_t k = common_fit_moe_margin_fa_plan(m, r, !g_fit_fa_off, common_fit_faoff_keep());
     if (k != r) {
         static bool logged = false;
@@ -988,10 +1028,11 @@ static void common_params_fit_impl(
         }
         // k11: the part of the margin beside the cache it may take once every other decision is made (common_fit_moe_margin_gain)
         int64_t margin_gain = 0;
+        const std::vector<int> dev_headless = common_fit_devices_headless(devs); // k19-q4cap
         for (size_t id = 0; id < nd; id++) {
             if (use_margins && int64_t(dmds[id].mb.total()) > int64_t(dmds_nc[id].mb.total())) {
                 margin_gain += int64_t(margins[id]) - common_fit_moe_margin(int64_t(margins[id]), int64_t(dmds[id].free),
-                    int64_t(dmds[id].mb.total()) - int64_t(dmds_nc[id].mb.total()), has_drafter);
+                    int64_t(dmds[id].mb.total()) - int64_t(dmds_nc[id].mb.total()), has_drafter, id < dev_headless.size() ? dev_headless[id] : -1);
             }
         }
 
