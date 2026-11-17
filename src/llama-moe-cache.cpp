@@ -3074,10 +3074,12 @@ struct llama_moe_cache::impl {
         if (team_env > 0) {
             return std::max(1, std::min(team_env, llama_moe_n_cpus() - 1));
         }
-        // k19-hostovl: on 8-11 usable CPUs (single_small) the team leaves 3 CPUs to the server, the drafter and other programs (a
-        // laptop with 4 cores / 8 threads and a browser): at most the CPUs - 3 (LLAMA_MOE_SINGLE_SMALL_HOST_FREE, default 3, sets it)
+        // k19-hostovl LLAMA_MOE_SINGLE_SMALL_HOST_FREE (default 2 = the rule below, no cap): on 8-11 usable CPUs (single_small) the
+        // team leaves that many CPUs to the server, the drafter and other programs (a laptop of 4 cores / 8 threads with a browser).
+        // 3 frees one more CPU on 8 (team 5, 4.7 instead of 5.6 CPUs busy) at a cost: Colab T4 q4x 8 GB + MTP n2, same text, chat
+        // 63.7 vs 65.9 tok/s, 2k 53.5 vs 53.9, 8k 58.6 vs 59.3
         static const int small_free = getenv("LLAMA_MOE_SINGLE_SMALL_HOST_FREE") != nullptr ?
-            std::max(1, atoi(getenv("LLAMA_MOE_SINGLE_SMALL_HOST_FREE"))) : 3;
+            std::max(1, atoi(getenv("LLAMA_MOE_SINGLE_SMALL_HOST_FREE"))) : 2;
         const int cap = single_small ? std::max(1, llama_moe_n_cpus() - small_free) : wmax;
         if (single_wait_blocking_here()) {
             return std::min({ single_threads + std::max(1, 2*single_threads/3), llama_moe_n_cpus() - 2, wmax, cap });
@@ -3169,6 +3171,17 @@ struct llama_moe_cache::impl {
             // is set from the decode threads, so the text is the same (md5 equal in every launch).
             h.team_stop = (void (*)(void)) ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_host_team_stop");
             auto team_on = (bool (*)(void)) ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_host_team_on");
+            // k19-hostovl (LLAMA_MOE_SINGLE_SMALL_HOST_SPIN_US, default 500; GGML_MOE_HOST_TEAM_SPIN_US wins): on 8-11 usable CPUs the
+            // idle team workers sleep after 500 us instead of 2 ms, so between the batches they leave the CPUs to the other programs.
+            // Colab T4 q4x 8 GB + MTP n2, team of 6, same text: chat 65.0 vs 64.4 tok/s, 8k 58.5 vs 58.4, CPUs busy in the decode 5.2
+            // vs 5.6 (200 us: 4.3, but chat 63.2 and 8k 56.8)
+            if (single_small) {
+                const char * es = getenv("LLAMA_MOE_SINGLE_SMALL_HOST_SPIN_US");
+                auto set_spin = (void (*)(int64_t)) ggml_backend_reg_get_proc_address(creg, "ggml_cpu_moe_host_team_set_spin_us");
+                if (set_spin != nullptr) {
+                    set_spin(es != nullptr ? (int64_t) std::max(0, atoi(es)) : 500);
+                }
+            }
             const char * ew = getenv("LLAMA_MOE_SINGLE_THREADS_WIDE");
             const int wide_mode = ew != nullptr ? atoi(ew) : 1;
             if ((e == nullptr || atoi(e) <= 0) && wide_mode != 0 && (wide_mode == 2 || hybrid) && team_on != nullptr && team_on()) {
