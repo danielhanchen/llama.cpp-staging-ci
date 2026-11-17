@@ -425,11 +425,13 @@ bool ggml_cuda_flash_attn_ext_mma_q8_inplace(const int device, const ggml_tensor
 // k19-decmma: one-row decode over a q8_0 / q4_0 K and V cache with a GQA group of >= 4 query heads per KV head runs the in-place
 // MMA kernel (f16 Q*K^T, the GQA group packed into the tile columns, ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2) instead of the
 // vector kernel, which leaves most of the memory bandwidth unused at long context (q4x q8_0 K / V decode at 8k / 30k / 120k: T4
-// +7 / +31 / +107%, L4 +2 / +12 / +46%, A100 +1 / +15 / +62%, G4 (sm_120) -1 / +7 / +30%, the 8k cell inside the run spread).
+// +7 / +31 / +107%, L4 +2 / +12 / +46%, A100 +1 / +15 / +62%, G4 (sm_120) -1 / +7 / +30%).
 // Taken on NVIDIA Turing+ for nodes the in-place kernels read (ggml_cuda_flash_attn_ext_mma_kvq_inplace: types, alignment), head size
 // 128 / 256 (K = V), the GQA layout the MMA kernel packs (mask, no ALiBi, KV padded to 256), no softcap, not two-source, not batch
-// invariant (that one-query node stays on the vector kernel, the reference of its verify windows), at least
-// GGML_CUDA_FATTN_DEC_MMA_MIN_KV K rows (default 0). No f16 copy is reserved for these nodes (in place), as for the vector kernel.
+// invariant (that one-query node stays on the vector kernel, the reference of its verify windows), and a K length of at least
+// min_kv rows. min_kv: 12288 on compute capability 12.x, where the vector kernel still wins short contexts (G4 q8_0 K / V, 3 launches,
+// spread <= 0.2%: 2k -0.4%, 8k -0.7%, 16k +2.4%, 30k +7.1%; crossover near 10k), 0 elsewhere (T4 / L4 / A100 already gain at 8k);
+// GGML_CUDA_FATTN_DEC_MMA_MIN_KV=N: N on every arch. No f16 copy is reserved for these nodes (in place), as for the vector kernel.
 // GGML_CUDA_FATTN_DEC_MMA=0: off (the vector kernel, as before)
 static bool ggml_cuda_flash_attn_ext_dec_mma(const int device, const ggml_tensor * dst, const bool gqa_opt_applies) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
@@ -437,12 +439,12 @@ static bool ggml_cuda_flash_attn_ext_dec_mma(const int device, const ggml_tensor
     return false;
 #else
     static const bool enabled = getenv("GGML_CUDA_FATTN_DEC_MMA") == nullptr || atoi(getenv("GGML_CUDA_FATTN_DEC_MMA")) != 0;
-    static const int64_t min_kv = getenv("GGML_CUDA_FATTN_DEC_MMA_MIN_KV") ? atoll(getenv("GGML_CUDA_FATTN_DEC_MMA_MIN_KV")) : 0;
+    static const int64_t min_kv_env = getenv("GGML_CUDA_FATTN_DEC_MMA_MIN_KV") ? atoll(getenv("GGML_CUDA_FATTN_DEC_MMA_MIN_KV")) : -1;
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     if (!enabled || !gqa_opt_applies || Q->ne[1] != 1 || dst->src[6] != nullptr || (dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT) ||
-            !ggml_is_quantized(K->type) || !ggml_is_quantized(V->type) || K->ne[1] % FATTN_KQ_STRIDE != 0 || K->ne[1] < min_kv) {
+            !ggml_is_quantized(K->type) || !ggml_is_quantized(V->type) || K->ne[1] % FATTN_KQ_STRIDE != 0) {
         return false;
     }
     const int64_t D = K->ne[0];
@@ -460,12 +462,17 @@ static bool ggml_cuda_flash_attn_ext_dec_mma(const int device, const ggml_tensor
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !turing_mma_available(cc)) {
         return false;
     }
+    const int64_t min_kv = min_kv_env >= 0 ? min_kv_env : (cc >= GGML_CUDA_CC_BLACKWELL && cc < GGML_CUDA_CC_RUBIN ? 12288 : 0);
+    if (K->ne[1] < min_kv) {
+        return false;
+    }
     // q8_0 / q4_0 K and V in any pairing (the kernels read every pair in place up to 16 rows); 0 = staged: keep the vector kernel
     if (ggml_cuda_flash_attn_ext_mma_kvq_inplace(device, dst, false) == 0) {
         return false;
     }
+    // logged at the first launch (data set), not at a graph reservation (the parameter fit reserves with its log muted)
     static std::atomic<int> n_logged { 0 };
-    if (ggml_cuda_fattn_probe_cur == nullptr && n_logged++ == 0) {
+    if (ggml_cuda_fattn_probe_cur == nullptr && dst->data != nullptr && K->data != nullptr && n_logged++ == 0) {
         GGML_LOG_INFO("%s: k19-decmma: one-row decode over the %s K / %s V cache runs the in-place MMA kernel (D %lld, GQA %lld, %lld "
             "cells; GGML_CUDA_FATTN_DEC_MMA=0: the vector kernel)\n", __func__, ggml_type_name(K->type), ggml_type_name(V->type),
             (long long) D, (long long) (Q->ne[2] / K->ne[2]), (long long) K->ne[1]);
