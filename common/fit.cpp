@@ -354,7 +354,7 @@ static int64_t common_fit_moe_margin_headless(int64_t m, int64_t r, int64_t free
             (getenv("LLAMA_MOE_FIT_MARGIN") != nullptr && atoi(getenv("LLAMA_MOE_FIT_MARGIN")) == 0)) {
         return r;
     }
-    if (!(headless == 1 || mode == 1)) {
+    if (headless == -2 || !(headless == 1 || mode == 1)) {
         return r;
     }
     const char * eg = getenv("LLAMA_FIT_MOE_HEADLESS_MIN_GIB");
@@ -1088,10 +1088,33 @@ static void common_params_fit_impl(
         // k11: the part of the margin beside the cache it may take once every other decision is made (common_fit_moe_margin_gain)
         int64_t margin_gain = 0;
         const std::vector<int> dev_headless = common_fit_devices_headless(devs); // k19-q4cap
+        // k19-q4cap2 (LLAMA_FIT_MOE_HEADLESS_MIN_SHARE, default 0.25): the headless step-down only where the device memory left for the
+        // cache (free minus everything else of this placement) holds at least that share of the host experts. A cache holding a small
+        // share runs the deep MTP windows and the host-miss paths whose run-time buffers live in that margin: Colab G4 capped at 16 GB,
+        // Qwen3.8 Flash-Next UD-IQ4_XS + MTP drafter, ctx 32768 (14% share), 3 launches: 8k decode 159.7 -> 91.6 tok/s with the 512 MiB
+        // margin (cache 8265 -> 8777 MiB, 715 -> 203 MiB free after the prompt's bank refill). Qwen3.6-35B-A3B UD-Q4_K_XL + MTP holds
+        // 36-58% at L4 12 / 16 GB, T4 12 GB and G4 @16 and keeps the step-down
+        static const double hl_min_share = getenv("LLAMA_FIT_MOE_HEADLESS_MIN_SHARE") != nullptr ?
+            std::max(0.0, atof(getenv("LLAMA_FIT_MOE_HEADLESS_MIN_SHARE"))) : 0.25;
+        const double hl_experts = hl_min_share > 0.0 ? (double) common_moe_expert_bytes(path_model) : 0.0;
+        // k19-q4cap2 (LLAMA_FIT_MOE_HEADLESS_DRAFT=1 allows it): no headless step-down beside a separate draft model (a drafter with its
+        // own weights; MTP heads of the main model keep it). Colab G4 capped at 32 GB, Qwen3.8 Flash-Next UD-IQ4_XS + MTP drafter, ctx
+        // 32768 (38% share), 3 launches: chat / 8k decode 240.5 / 213.8 tok/s at 1024 MiB, 234.9 / 202.7 at 512 MiB (cache 23592 ->
+        // 24102 MiB; 8k draft acceptance 0.74 -> 0.64)
+        static const bool hl_draft_ok = getenv("LLAMA_FIT_MOE_HEADLESS_DRAFT") != nullptr && atoi(getenv("LLAMA_FIT_MOE_HEADLESS_DRAFT")) == 1;
+        const bool hl_sep_draft = extra != nullptr && !extra->shares_model && !hl_draft_ok;
         for (size_t id = 0; id < nd; id++) {
             if (use_margins && int64_t(dmds[id].mb.total()) > int64_t(dmds_nc[id].mb.total())) {
+                int hl = id < dev_headless.size() ? dev_headless[id] : -1;
+                if (hl_sep_draft) {
+                    hl = -2; // the step-down stays off (separate draft model)
+                }
+                const double avail = (double) (int64_t(dmds[id].free) - int64_t(dmds_nc[id].mb.total()));
+                if (hl_min_share > 0.0 && hl_experts > 0.0 && avail < hl_min_share*hl_experts) {
+                    hl = -2; // the step-down stays off (below the share)
+                }
                 margin_gain += int64_t(margins[id]) - common_fit_moe_margin(int64_t(margins[id]), int64_t(dmds[id].free),
-                    int64_t(dmds[id].mb.total()) - int64_t(dmds_nc[id].mb.total()), has_drafter, id < dev_headless.size() ? dev_headless[id] : -1);
+                    int64_t(dmds[id].mb.total()) - int64_t(dmds_nc[id].mb.total()), has_drafter, hl);
             }
         }
 
