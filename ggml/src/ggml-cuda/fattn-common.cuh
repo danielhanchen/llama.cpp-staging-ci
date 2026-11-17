@@ -1474,7 +1474,7 @@ void launch_fattn(
             ggml_cuda_qsa_maskless_compact(*qsa, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
         } else {
             ggml_tensor mask_m = *mask; // the QSA maskless rebuild may live in a pool copy
-            mask_m.data = (void *) mask_data;
+            mask_m.data = const_cast<char *>(mask_data);
             ggml_cuda_flash_attn_ext_compact_mask(&mask_m, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
         }
     }
