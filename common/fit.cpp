@@ -1067,9 +1067,18 @@ static void common_params_fit_impl(
         static const double hl_min_share = getenv("LLAMA_FIT_MOE_HEADLESS_MIN_SHARE") != nullptr ?
             std::max(0.0, atof(getenv("LLAMA_FIT_MOE_HEADLESS_MIN_SHARE"))) : 0.25;
         const double hl_experts = hl_min_share > 0.0 ? (double) common_moe_expert_bytes(path_model) : 0.0;
+        // k19-q4cap2 (LLAMA_FIT_MOE_HEADLESS_DRAFT=1 allows it): no headless step-down beside a separate draft model (a drafter with its
+        // own weights; MTP heads of the main model keep it). Colab G4 capped at 32 GB, Qwen3.8 Flash-Next UD-IQ4_XS + MTP drafter, ctx
+        // 32768 (38% share), 3 launches: chat / 8k decode 240.5 / 213.8 tok/s at 1024 MiB, 234.9 / 202.7 at 512 MiB (cache 23592 ->
+        // 24102 MiB; 8k draft acceptance 0.74 -> 0.64)
+        static const bool hl_draft_ok = getenv("LLAMA_FIT_MOE_HEADLESS_DRAFT") != nullptr && atoi(getenv("LLAMA_FIT_MOE_HEADLESS_DRAFT")) == 1;
+        const bool hl_sep_draft = extra != nullptr && !extra->shares_model && !hl_draft_ok;
         for (size_t id = 0; id < nd; id++) {
             if (use_margins && int64_t(dmds[id].mb.total()) > int64_t(dmds_nc[id].mb.total())) {
                 int hl = id < dev_headless.size() ? dev_headless[id] : -1;
+                if (hl_sep_draft) {
+                    hl = -2; // the step-down stays off (separate draft model)
+                }
                 const double avail = (double) (int64_t(dmds[id].free) - int64_t(dmds_nc[id].mb.total()));
                 if (hl_min_share > 0.0 && hl_experts > 0.0 && avail < hl_min_share*hl_experts) {
                     hl = -2; // the step-down stays off (below the share)
