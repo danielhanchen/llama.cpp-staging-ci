@@ -366,6 +366,15 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+// k19-g4cbuf: per device, the q8_0 in-place row limit common's fit asks for (0 = the default 16), see ggml_backend_cuda_set_fa_q8_inplace_rows
+static std::atomic<int> ggml_cuda_fattn_q8_inplace_rows[GGML_CUDA_MAX_DEVICES];
+
+void ggml_cuda_flash_attn_ext_set_q8_inplace_rows(const int device, const int rows) {
+    if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
+        ggml_cuda_fattn_q8_inplace_rows[device].store(std::max(0, std::min(rows, 32)), std::memory_order_relaxed);
+    }
+}
+
 // k19-fattnq8: q8_0 K and V of a head size with a q8_0 instance (ggml_cuda_flash_attn_ext_mma_q8_may_use), on NVIDIA with Turing
 // tensor cores, rows of whole blocks starting 4 byte aligned: the MMA kernel reads them in place. The same answer for the launch and for the
 // graph allocation (ggml_cuda_flash_attn_ext_get_alloc_size: no f16 copy behind the output). GGML_CUDA_FATTN_Q8_INPLACE=0: off
@@ -383,7 +392,7 @@ int ggml_cuda_flash_attn_ext_mma_kvq_inplace(const int device, const ggml_tensor
     // only for few query rows (decode, verify windows): every query tile converts the K / V it reads, so a prompt ubatch of 2048
     // rows converts the cache once per tile and loses to the one staged copy (A100, head size 256: 1.3-1.8x the staged time at
     // 512 / 2048 rows, 0.44-0.9x at 2..17 rows). GGML_CUDA_FATTN_Q8_INPLACE_MAX_ROWS: the row limit (default 16)
-    static const int64_t max_rows = getenv("GGML_CUDA_FATTN_Q8_INPLACE_MAX_ROWS") ? atoll(getenv("GGML_CUDA_FATTN_Q8_INPLACE_MAX_ROWS")) : 16;
+    static const int64_t max_rows_set = getenv("GGML_CUDA_FATTN_Q8_INPLACE_MAX_ROWS") ? atoll(getenv("GGML_CUDA_FATTN_Q8_INPLACE_MAX_ROWS")) : -1;
     static const bool enabled_q4 = getenv("GGML_CUDA_FATTN_Q4_INPLACE") == nullptr || atoi(getenv("GGML_CUDA_FATTN_Q4_INPLACE")) != 0;
     static const int64_t max_rows_q4 = getenv("GGML_CUDA_FATTN_Q4_INPLACE_MAX_ROWS") ? atoll(getenv("GGML_CUDA_FATTN_Q4_INPLACE_MAX_ROWS")) : 16;
     const ggml_tensor * K = dst->src[1];
@@ -394,6 +403,10 @@ int ggml_cuda_flash_attn_ext_mma_kvq_inplace(const int device, const ggml_tensor
     }
     const bool has_q4 = K->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q4_0;
     const int64_t rows = dst->src[0]->ne[1];
+    // k19-g4cbuf: without GGML_CUDA_FATTN_Q8_INPLACE_MAX_ROWS (read once) the limit is 16, or the device's fit rows where common's fit set
+    // them (ggml_backend_cuda_set_fa_q8_inplace_rows): a small device whose graphs are reserved at 31 tokens (k19-place8), so that
+    // reserve holds no f16 copy of the whole q8_0 K / V (G4 Qwen3.8-Flash-Next 12 GB / 262K: compute 561 -> 193 MiB, to the MoE cache)
+    const int64_t max_rows = max_rows_set >= 0 ? max_rows_set : std::max<int64_t>(16, ggml_cuda_fattn_q8_inplace_rows[device].load(std::memory_order_relaxed));
     if (has_q4 ? (!enabled_q4 || rows > (for_alloc ? std::min<int64_t>(max_rows_q4, 16) : max_rows_q4)) : (!enabled || rows > max_rows)) {
         return 0;
     }
