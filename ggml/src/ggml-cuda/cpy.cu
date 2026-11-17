@@ -543,7 +543,7 @@ bool ggml_cuda_cpy_multi_ok(const ggml_tensor * src0, const ggml_tensor * src1) 
     if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
         return false;
     }
-    const bool can_be_transposed = src0->nb[1] == (int64_t) ggml_element_size(src0) &&
+    const bool can_be_transposed = src0->nb[1] == ggml_element_size(src0) &&
         src0->ne[3] == 1 && (int64_t) src0->nb[2] == src0->ne[0] * src0->ne[1] * (int64_t) ggml_element_size(src0) &&
         ggml_is_contiguous(src1);
     return !can_be_transposed;

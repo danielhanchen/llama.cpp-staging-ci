@@ -299,7 +299,7 @@ void ggml_cuda_mul_mat_q(
         if (memo_q8_1 == nullptr) {
             src1_q8_1.alloc(nbytes_src1_q8_1);
         }
-        char * src1_q8_1_ptr = memo_q8_1 ? (char *) memo_q8_1 : src1_q8_1.get();
+        char * src1_q8_1_ptr = memo_q8_1 ? const_cast<char *>(memo_q8_1) : src1_q8_1.get();
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
             src1_scale.alloc(ne13*ne12*ne11);
