@@ -993,6 +993,8 @@ private:
     void   place8_lend_now();
     size_t place8_free_compute();
     size_t place8_grow = 0;   // k19-placemid: the compute buffer memory the fit gave the cache (LLAMA_MOE_PLACE8_MID, MiB), see decode_layer_major
+    bool   place8_lean       = false; // k19-pgroups2: the k19-pgroups small device (LLAMA_MOE_PLACE8_GROUPS): no short-prompt split, held-before refills of short prompts
+    bool   place8_lean_group = false; // k19-pgroups2, LLAMA_MOE_PLACE8_GROUPS_LEAN=2: also held-before refills after a layer-major group
     // k19-ttft4: the prompt calls of one sequence that follow each other (a prompt and the server's separate pass of its last 4 tokens)
     // count as one prompt for the MoE cache's short-prompt rule (see decode, LLAMA_MOE_PROMPT_RUN)
     int64_t      prompt_run_n   = 0;

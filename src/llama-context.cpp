@@ -1299,11 +1299,27 @@ llama_context::llama_context(
                 lm_enabled = false;
             } else {
                 place8_grow = (size_t) std::max(0, atoi(em)) << 20;
+                // k19-pgroups2: the small device of k19-pgroups (LLAMA_MOE_PLACE8_GROUPS, set by the fit with LLAMA_MOE_PLACE8_MID) keeps
+                // the groups but not the short-prompt split (place8_chunk_max) of a mid-size device, and a released short prompt's
+                // ubatch refills the banks with the experts they held before. Its cache holds ~5% of the host experts: a split chat
+                // prompt reads the banks ubatch by ubatch and fetches every miss. G4 fn4 ctx 131072, 3 launches (gfn1pg_g): chat TTFT
+                // 12 GB 0.494 -> 0.370 s, 10 GB + LLAMA_FIT_LONGCTX_KV4 0.498 -> 0.365 s (groups off 0.353). The refill after a group
+                // stays routed by default: held-before there (LLAMA_MOE_PLACE8_GROUPS_LEAN=2) gave 12 GB 2k / 8k decode 75.5 / 72.0 ->
+                // 76.7 / 74.5 tok/s but 10 GB 73.2 / 70.0 -> 71.8 / 68.9. LLAMA_MOE_PLACE8_GROUPS_LEAN=0: as k19-placemid
+                static const int groups_lean = getenv("LLAMA_MOE_PLACE8_GROUPS_LEAN") != nullptr ? atoi(getenv("LLAMA_MOE_PLACE8_GROUPS_LEAN")) : 1;
+                const char * eg = getenv("LLAMA_MOE_PLACE8_GROUPS");
+                place8_lean       = groups_lean > 0 && eg != nullptr && atoi(eg) != 0;
+                place8_lean_group = place8_lean && groups_lean >= 2;
                 // the refill after a released prompt ubatch takes the experts it routed most (LLAMA_MOE_TINY_RELEASE_ROUTED=0: the experts
                 // held before), as the layer-major groups below (see lm_release_routed): G4 12 / 16 GB fn4 + MTP, 2 launches each,
                 // decode chat / 8k / 30k held-before 129.5 / 107.4 / 105.1 -> 139.6 / 126.3 / 103.0 (12 GB), 147.7 / 151.3 / 107.8 ->
                 // 159.0 / 137.9 / 129.2 (16 GB); base 120.0 / 100.1 / 91.0 and 141.0 / 100.0 / 109.8 (k19pm_g3a / g3b)
-                tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") == nullptr || atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0;
+                tiny_rel_routed = getenv("LLAMA_MOE_TINY_RELEASE_ROUTED") != nullptr ? atoi(getenv("LLAMA_MOE_TINY_RELEASE_ROUTED")) != 0 : !place8_lean;
+                if (place8_lean) {
+                    LLAMA_LOG_INFO("%s: MoE cache: k19-pgroups2: short prompts run in one ubatch with the banks released, the banks come back "
+                        "with the experts they held before%s (LLAMA_MOE_PLACE8_GROUPS_LEAN=0: as k19-placemid)\n", __func__,
+                        place8_lean_group ? ", also after a layer-major group" : "");
+                }
                 LLAMA_LOG_INFO("%s: MoE cache: k19-placemid: graphs reserved at %lld tokens, layer-major prompt groups %s\n", __func__,
                     (long long) tiny_rel_ub, lm_enabled ? "kept (they release the banks for the merged graph)" : "off");
             }
@@ -6160,7 +6176,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // fn4 + MTP, the 42-token chat prompt (k19pm_g4a): 16 GB TTFT 514 -> 286 ms (base 352; the refill of 7.7 GB of banks took 145 ms),
     // 12 GB 391 -> 359 ms (base 361), decode unchanged or better (12 GB 137.2 -> 137.8, 16 GB 150.5 -> 162.6 tok/s, other texts)
     static const int64_t place8_chunk_env = getenv("LLAMA_MOE_PLACE8_CHUNK_MAX") ? std::max(0, atoi(getenv("LLAMA_MOE_PLACE8_CHUNK_MAX"))) : -1;
-    const int64_t place8_chunk_max = place8_chunk_env >= 0 ? place8_chunk_env : (place8_grow > 0 ? 64 : 0);
+    const int64_t place8_chunk_max = place8_chunk_env >= 0 ? place8_chunk_env : (place8_grow > 0 && !place8_lean ? 64 : 0);
     const uint32_t n_ubatch_split = place8_rel && place8_chunk_max > 0 && tiny_rel_ub > 0 && !cparams.verify && !embd_all &&
         (int64_t) n_tokens_all > tiny_rel_ub && (int64_t) n_tokens_all <= place8_chunk_max ? (uint32_t) tiny_rel_ub : cparams.n_ubatch;
 
@@ -8543,7 +8559,8 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         // experts the cache holds. LLAMA_MOE_LM_RELEASE_ROUTED=0 off, =1 on with a draft too
         static const char * lm_rr_env = getenv("LLAMA_MOE_LM_RELEASE_ROUTED");
         // k19-placemid: also with a draft where the graphs are reserved at the decode size (place8_grow, see the measurement there)
-        const bool lm_release_routed = lm_rr_env != nullptr ? atoi(lm_rr_env) != 0 : (!cparams.spec_draft || place8_grow > 0);
+        // (k19-pgroups2: not on the small device of k19-pgroups with LLAMA_MOE_PLACE8_GROUPS_LEAN=2, place8_lean_group)
+        const bool lm_release_routed = lm_rr_env != nullptr ? atoi(lm_rr_env) != 0 : (!place8_lean_group && (!cparams.spec_draft || place8_grow > 0));
         if (lm_release_routed && status == GGML_STATUS_SUCCESS) {
             moe_cache->set_refill_routed_once(true);
             moe_cache_ids = lm_record;
