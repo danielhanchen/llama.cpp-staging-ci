@@ -4874,6 +4874,32 @@ static int ggml_cuda_try_fuse_moe_red_add2(ggml_backend_cuda_context * cuda_ctx,
     if (!ggml_can_fuse_subgraph_ext(cgraph, idx.data(), n, ops.data(), outs, 1) || !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n, outs, 1)) {
         return 0;
     }
+    // k19-t4det: the kernel writes the token rows of dst while other blocks still read the expert rows of a and b (n_expert_used rows
+    // per token), so dst must not overlap any input, also not one that the range check above skips: an input copy of the scheduler is
+    // a leaf (op NONE) in the compute buffer, and the allocator may place dst over it once the ADD it fed was its last planned reader
+    // (the hybrid path's host experts, ffn_moe_down_host: dst over them at a shift, the bytes then depended on the block order and
+    // changed from launch to launch). Refused here, the separate nodes compute the same values.
+    // GGML_CUDA_MOE_RED_FUSE_ALIAS=1: the check off (as before, diagnostic)
+    static const bool alias_unchecked = ggml_cuda_env_flag("GGML_CUDA_MOE_RED_FUSE_ALIAS");
+    if (!alias_unchecked) {
+        auto overlaps = [dst](const ggml_tensor * t) {
+            if (t == nullptr) {
+                return false;
+            }
+            const char * d0 = (const char *) dst->data;
+            const char * t0 = (const char *) t->data;
+            return d0 < t0 + ggml_nbytes(t) && t0 < d0 + ggml_nbytes(dst);
+        };
+        if (overlaps(a) || overlaps(b) || overlaps(extra) || overlaps(match.weights) || overlaps(match.expert_scale)) {
+            static bool logged_alias = false;
+            if (!logged_alias) {
+                logged_alias = true;
+                GGML_LOG_INFO("%s: k19-t4det: %s overlaps an input of its fused weighted reduction: computed by the separate nodes "
+                    "(GGML_CUDA_MOE_RED_FUSE_ALIAS=1: fused anyway)\n", __func__, dst->name);
+            }
+            return 0;
+        }
+    }
     ggml_cuda_op_moe_weighted_reduction_add2(*cuda_ctx, a, b, match.expert_scale, match.weights, extra, dst);
     static bool logged = false;
     if (!logged) {
