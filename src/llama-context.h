@@ -946,6 +946,7 @@ private:
     std::array<bool, GF_SMALL_N>                 gf_res_small_built{};
     std::array<uint64_t, GF_SMALL_N>             gf_res_small_used{};
     std::array<uint64_t, GF_SMALL_N>             gf_res_small_nuse{}; // k15-fn: uses since the kept graph was built
+    std::array<std::map<llama_seq_id, llama_sampler *>, GF_SMALL_N> gf_res_small_smpl{}; // the sampler chains a kept graph was built with
     uint64_t gf_res_epoch = 1;
     // k19-fullcost: set by restore_pp_plan around its graph_reserve: the kept graphs stay valid when the reserve replaced no buffer
     bool reserve_keep_small = false;
