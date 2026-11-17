@@ -175,7 +175,8 @@ int main(int argc, char ** argv) {
         make_case(c, k.tu, k.td, k.n_embd, k.n_ff, k.n_exp, k.n_used, k.n_tokens, seed++, k.skip);
         const std::vector<float> ref = run_graph(c, 4);
         for (int team = 0; team < 2; ++team)
-        for (int nt : { 1, 2, 3, 5, 7, 11, 16 }) {
+        // k19-hostadapt: then fewer threads than the team has, and back (the idle workers skip those batches)
+        for (int nt : { 1, 2, 3, 5, 7, 11, 16, 6, 5, 4, 6, 5 }) {
             for (int rep = 0; rep < 3; ++rep) {
                 std::vector<float> out;
                 g_team = team == 1;

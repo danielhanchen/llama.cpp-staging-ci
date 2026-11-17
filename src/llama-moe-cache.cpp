@@ -2937,6 +2937,18 @@ struct llama_moe_cache::impl {
         size_t (*fused_wsize)(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, int, int, int) = nullptr;
         std::vector<uint8_t> fused_buf;
         uint64_t             fused_batches = 0;
+        // k19-hostadapt: the small-host team's size follows the CPU time of other processes (see single_adapt_threads); read and
+        // written by the host thread only
+        bool     adapt       = false;
+        int      adapt_level = 0;     // threads taken off the team
+        int      adapt_kmax  = 0;
+        double   adapt_slack = 0.0;   // usable CPUs - the full team
+        int64_t  adapt_t_us  = 0;     // the window's start (0: none yet)
+        uint64_t adapt_busy  = 0;     // /proc/stat busy ticks of every CPU at the window's start
+        uint64_t adapt_self  = 0;     // /proc/self/stat utime + stime at the window's start
+        uint64_t adapt_win[3] = { 0, 0, 0 };
+        uint64_t adapt_changes = 0;
+        double   adapt_f_sum = 0.0;
         std::atomic<int64_t> kick_us{0};
         std::mutex              mtx;
         std::condition_variable cv;
@@ -3140,6 +3152,109 @@ struct llama_moe_cache::impl {
         return single_req && !single_off && !single_no_alloc && n_tokens >= 1 && n_tokens <= single_max();
     }
 
+    // k19-hostadapt: CPU ticks of the machine (busy: user, nice, system, irq, softirq, steal) and of this process (utime + stime)
+    static bool single_adapt_ticks(uint64_t & busy, uint64_t & self) {
+#if !defined(__linux__)
+        GGML_UNUSED(busy);
+        GGML_UNUSED(self);
+        return false;
+#else
+        FILE * f = fopen("/proc/stat", "r");
+        if (f == nullptr) {
+            return false;
+        }
+        unsigned long long v[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        const int n = fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]);
+        fclose(f);
+        if (n < 8) {
+            return false;
+        }
+        busy = (uint64_t) (v[0] + v[1] + v[2] + v[5] + v[6] + v[7]);
+        f = fopen("/proc/self/stat", "r");
+        if (f == nullptr) {
+            return false;
+        }
+        char buf[1024];
+        const size_t m = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[m] = '\0';
+        const char * q = strrchr(buf, ')');
+        unsigned long long ut = 0, st = 0;
+        // after the name: state, then fields 4..13, then utime (14) and stime (15)
+        if (q == nullptr || sscanf(q + 1, " %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", &ut, &st) != 2) {
+            return false;
+        }
+        self = (uint64_t) (ut + st);
+        return true;
+#endif
+    }
+    static double single_adapt_hz() {
+#if defined(__linux__)
+        return (double) std::max(1L, sysconf(_SC_CLK_TCK));
+#else
+        return 100.0;
+#endif
+    }
+    static long single_adapt_online() {
+#if defined(__linux__)
+        return sysconf(_SC_NPROCESSORS_ONLN);
+#else
+        return -1;
+#endif
+    }
+
+    // k19-hostadapt: the threads of the next host batch. On a small host (8-11 usable CPUs, the team of single_register, no fixed
+    // LLAMA_MOE_SINGLE_SMALL_HOST_FREE) the team gives up one thread, or two, while other processes keep the CPUs it leaves busy, and
+    // takes them back when they go quiet. At most every LLAMA_MOE_SINGLE_SMALL_HOST_ADAPT_MS (500, at least 500) the host thread reads
+    // /proc/stat and /proc/self/stat: f = the CPUs other processes kept busy over the window (machine busy - this process). With s the
+    // CPUs the full team leaves (usable - team), the level k (threads off) rises to ceil(f - s + 0.25) and falls to ceil(f - s + 0.75):
+    // half a CPU of hysteresis, at most 2 and the team keeps 2. The size never changes a result (each row is computed once with the same
+    // kernel whichever thread takes it), so the text is the same whatever the other processes do
+    int single_adapt_threads(single_hub_t & h) const {
+        if (!h.adapt) {
+            return h.threads;
+        }
+        static const int64_t win_us = [] {
+            const char * e = getenv("LLAMA_MOE_SINGLE_SMALL_HOST_ADAPT_MS");
+            return 1000*(int64_t) std::max(500, e != nullptr ? atoi(e) : 500);
+        }();
+        const int64_t now = single_now_us();
+        if (h.adapt_t_us != 0 && now - h.adapt_t_us < win_us) {
+            return h.threads - h.adapt_level;
+        }
+        uint64_t busy = 0, self = 0;
+        if (!single_adapt_ticks(busy, self)) {
+            h.adapt = false;
+            h.adapt_level = 0;
+            return h.threads;
+        }
+        if (h.adapt_t_us != 0 && busy >= h.adapt_busy && self >= h.adapt_self) {
+            static const double hz = single_adapt_hz();
+            const double wall = (now - h.adapt_t_us)/1e6;
+            const double f = std::max(0.0, ((double) (busy - h.adapt_busy) - (double) (self - h.adapt_self))/hz/wall);
+            const int k_up   = std::min(h.adapt_kmax, std::max(0, (int) std::ceil(f - h.adapt_slack + 0.25)));
+            const int k_down = std::min(h.adapt_kmax, std::max(0, (int) std::ceil(f - h.adapt_slack + 0.75)));
+            const int old = h.adapt_level;
+            if (k_up > h.adapt_level) {
+                h.adapt_level = k_up;
+            } else if (k_down < h.adapt_level) {
+                h.adapt_level = k_down;
+            }
+            h.adapt_win[h.adapt_level]++;
+            h.adapt_f_sum += f;
+            if (h.adapt_level != old) {
+                if (h.adapt_changes++ < 16) {
+                    LLAMA_LOG_INFO("llama_moe_cache: adaptive host team: %d -> %d threads (other processes kept %.2f CPUs busy over %.2f s)\n",
+                        h.threads - old, h.threads - h.adapt_level, f, wall);
+                }
+            }
+        }
+        h.adapt_t_us = now;
+        h.adapt_busy = busy;
+        h.adapt_self = self;
+        return h.threads - h.adapt_level;
+    }
+
     bool single_register() {
         if (single_reg) {
             return true;
@@ -3216,6 +3331,22 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses off on %u usable CPUs: no host team for the batches, the split "
                 "computes them\n", tag, llama_sysmem::usable_cpus());
             return false;
+        }
+        // k19-hostadapt: the adaptive team (LLAMA_MOE_SINGLE_SMALL_HOST_ADAPT=0 off; a fixed LLAMA_MOE_SINGLE_SMALL_HOST_FREE wins), only
+        // where /proc/stat counts the CPUs this process may use (no affinity mask or CPU quota below the online CPUs)
+        if (single_small && h.team && !h.adapt && h.adapt_t_us == 0) {
+            const char * ea = getenv("LLAMA_MOE_SINGLE_SMALL_HOST_ADAPT");
+            const long online = single_adapt_online();
+            uint64_t b = 0, sf = 0;
+            if ((ea == nullptr || atoi(ea) != 0) && getenv("LLAMA_MOE_SINGLE_SMALL_HOST_FREE") == nullptr &&
+                    online == (long) llama_sysmem::usable_cpus() && single_adapt_ticks(b, sf)) {
+                h.adapt       = true;
+                h.adapt_slack = (double) llama_sysmem::usable_cpus() - h.threads;
+                h.adapt_kmax  = std::max(0, std::min(2, h.threads - 2));
+                LLAMA_LOG_INFO("llama_moe_cache%s: adaptive host team: %d threads, 1-%d fewer while other processes keep more than %.2f CPUs "
+                    "busy (checked every 0.5 s or more; LLAMA_MOE_SINGLE_SMALL_HOST_ADAPT=0 off, LLAMA_MOE_SINGLE_SMALL_HOST_FREE fixes it)\n",
+                    tag, h.threads, h.adapt_kmax, h.adapt_slack - 0.25);
+            }
         }
         h.owners.push_back(this);
         single_reg = true;
@@ -3439,14 +3570,15 @@ struct llama_moe_cache::impl {
                 single_debug_delay(true);
                 single_hub_t & hub = single_hub();
                 if (hub.fused != nullptr) {
-                    const size_t ws = hub.fused_wsize(mb.w_up, mb.w_gate, mb.w_down, mb.n_used, n_tokens, hub.threads);
+                    const int n_thr = single_adapt_threads(hub); // k19-hostadapt
+                    const size_t ws = hub.fused_wsize(mb.w_up, mb.w_gate, mb.w_down, mb.n_used, n_tokens, n_thr);
                     if (ws > 0 && hub.fused_buf.size() < ws) {
                         hub.fused_buf.resize(ws);
                     }
                     char * hb = (char *) mb.host;
                     ok = ws > 0 && hub.fused(mb.w_up, mb.w_gate, mb.w_down, (const float *) (hb + ggml_moe_mailbox_off_x(mb.n_used)),
                         (const int32_t *) (hb + ggml_moe_mailbox_off_ids()), (float *) (hb + ggml_moe_mailbox_off_out(mb.n_used, mb.n_embd)),
-                        mb.n_used, n_tokens, hub.threads, hub.fused_buf.data(), hub.fused_buf.size());
+                        mb.n_used, n_tokens, n_thr, hub.fused_buf.data(), hub.fused_buf.size());
                     hub.fused_batches += ok;
                 }
                 if (!ok) {
@@ -3619,6 +3751,15 @@ struct llama_moe_cache::impl {
                     single_rows > 0 ? (double) single_us/single_rows : 0.0, single_slow, single_max_us/1e3);
                 LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses: %" PRIu64 " of the process's host batches in one region "
                     "(LLAMA_MOE_SINGLE_FUSED)\n", tag, single_hub().fused_batches);
+                {
+                    const single_hub_t & hb = single_hub();
+                    const uint64_t nw = hb.adapt_win[0] + hb.adapt_win[1] + hb.adapt_win[2];
+                    if (nw > 0) {
+                        LLAMA_LOG_INFO("llama_moe_cache%s: adaptive host team: %" PRIu64 " windows at %d / %d / %d threads: %" PRIu64 " / %" PRIu64 " / %" PRIu64
+                            ", %" PRIu64 " changes, other processes %.2f CPUs busy on average\n", tag, nw, hb.threads, hb.threads - 1, hb.threads - 2,
+                            hb.adapt_win[0], hb.adapt_win[1], hb.adapt_win[2], hb.adapt_changes, hb.adapt_f_sum/nw);
+                    }
+                }
                 single_timing_report();
             }
         }
