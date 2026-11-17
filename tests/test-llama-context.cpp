@@ -547,6 +547,8 @@ int main(int argc, char ** argv) {
                 __func__, cases[i]->name(), n_pass[i], n_skip[i], n_fail[i], models.size());
     }
     LOG_INF("%s: models: %zu passed, %zu failed (of %zu)\n", __func__, models.size() - n_model_fail, n_model_fail, models.size());
+    // the summary goes through the asynchronous logger; drain it before returning so the lines are never lost at exit
+    common_log_flush(common_log_main());
 
     return n_model_fail == 0 ? 0 : 1;
 }
