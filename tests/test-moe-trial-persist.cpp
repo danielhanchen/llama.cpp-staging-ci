@@ -66,7 +66,7 @@ static bool same(const std::vector<tp::rec> & a, const std::vector<tp::rec> & b)
     }
     for (size_t i = 0; i < a.size(); ++i) {
         if (a[i].on != b[i].on || a[i].host_ok != b[i].host_ok || a[i].gap != b[i].gap || a[i].len != b[i].len ||
-                std::abs(a[i].ratio - b[i].ratio) > 1e-6) {
+                std::abs(a[i].ratio - b[i].ratio) > 1e-6 || a[i].firm != b[i].firm || a[i].tries != b[i].tries) {
             return false;
         }
     }
@@ -198,6 +198,72 @@ int main() {
         // a launch without the variable (machine key) does not read the pinned file
         CHECK(!tp::read(pp, key, tag12, back) && !cal_read(pp, key, cv), "the machine key does not read the pinned file");
         std::remove(pp.c_str());
+    }
+
+    // k19-calvmargin: a marginal "on" is not locked in. The A100 40 Flash-Next numbers (37.3 ms without, 35.7 with: -4.3%, first trial,
+    // switch point 0.97) are an "on" below the 10% gain a persisted "on" needs: off, open, timed again by the next launches, firm "off"
+    // after 3 timings without a clear one; a clear timing, or any "off", is firm at once; a line written before (no :firm:tries) reads
+    // as firm
+    {
+        const double thr1 = tp::threshold(false, false, m, h);
+        CHECK(std::abs(thr1 - 0.97) < 1e-12, "first trial switch point %.3f", thr1);
+        CHECK(std::abs(tp::threshold(true, true, m, h) - 1.0) < 1e-12 && std::abs(tp::threshold(true, false, m, h) - 0.94) < 1e-12 &&
+            std::abs(tp::threshold(true, true, m, 0.0) - 0.97) < 1e-12, "switch points with hysteresis");
+        for (int k = 0; k < 4; ++k) {
+            const bool hp = k >= 2, pv = k % 2 == 1;
+            for (double r = 0.80; r < 1.20; r += 0.001) {
+                const bool d = tp::decide(r*33.0, 33.0, 13, 13, hp, pv, m, h);
+                const double t = tp::threshold(hp, pv, m, h);
+                CHECK(d == (r < t) || std::abs(r - t) < 1e-9, "threshold disagrees with decide at %.3f (case %d)", r, k);
+            }
+        }
+        // k19-calvmargin: a persisted "on" needs a 10% gain
+        const double g = 0.10;
+        CHECK( tp::marginal_on(true, 35.7, 37.3, g), "the A100 -4.3%% on must be marginal");
+        CHECK( tp::marginal_on(true, 27.4, 29.4, g), "the A100 -6.8%% on (replayed 11%% slower later) must be marginal");
+        CHECK( tp::marginal_on(true, 26.9, 29.5, g), "the A100 -8.8%% on (0.912) must be marginal");
+        CHECK(!tp::marginal_on(true, 27.0, 30.0, g), "-10%% on must be clear");
+        CHECK(!tp::marginal_on(false, 35.7, 37.3, g), "an off is never marginal");
+        CHECK(!tp::marginal_on(true, 35.7, 37.3, 0.0), "min gain 0: never marginal (the k19-calvpersist rule)");
+        tp::rec a;
+        CHECK(!tp::settle(nullptr, true, true, 3, a) && a.on == 0 && a.firm == 0 && a.tries == 1, "marginal on: off and open");
+        tp::rec b;
+        CHECK(!tp::settle(&a, true, true, 3, b) && b.on == 0 && b.firm == 0 && b.tries == 2, "second marginal: still open");
+        tp::rec c;
+        CHECK(!tp::settle(&b, true, true, 3, c) && c.on == 0 && c.firm == 1 && c.tries == 3, "third marginal on: firm off");
+        tp::rec c2;
+        CHECK(!tp::settle(&a, false, true, 3, c2) && c2.on == 0 && c2.firm == 1 && c2.tries == 2, "a marginal off re-timing: firm off");
+        tp::rec c3;
+        CHECK(!tp::settle(nullptr, false, true, 3, c3) && c3.on == 0 && c3.firm == 1 && c3.tries == 1,
+            "a marginal off first timing (T4 12 GB: 0.992 against 1.000): firm off at once");
+        tp::rec d;
+        CHECK( tp::settle(&a, true, false, 3, d) && d.on == 1 && d.firm == 1 && d.tries == 2, "a clear re-timing: firm with its verdict");
+        tp::rec e;
+        CHECK( tp::settle(nullptr, true, false, 3, e) && e.on == 1 && e.firm == 1 && e.tries == 1, "a clear first timing: firm");
+
+        // round trip of an open record; a line in the old form reads as firm
+        std::vector<tp::rec> r(2);
+        r[0].on = 0; r[0].gap = 128; r[0].len = 40; r[0].ratio = 35.7/37.3; r[0].firm = 0; r[0].tries = 1;
+        r[1].on = 0; r[1].gap = 512; r[1].len = 26; r[1].ratio = 1.31;
+        std::vector<tp::rec> back;
+        CHECK(tp::parse_line(tp::format_line(tag12, r), tag12, back) && same(r, back) && back[0].firm == 0 && back[1].firm == 1,
+            "an open record must round-trip");
+        CHECK(tp::parse_line(tag12 + " 2 0:1:128:40:0.957105 1:1:256:29:0.961197", tag12, back) && back.size() == 2 &&
+            back[0].firm == 1 && back[0].tries == 1 && back[1].on == 1 && back[1].firm == 1, "an old line must read as firm");
+        CHECK(!tp::parse_line(tag12 + " 1 0:1:128:40:0.95:0:0", tag12, back), "tries 0 must not parse");
+
+        // launch 1 writes the open record; launch 2 reads it back open (to time it again), launch 3 reads the firm one
+        const std::string pm = dir + "/test_moe_trial_persist_marg_" + std::to_string((long long) std::rand()) + ".txt";
+        write_file(pm, key + "\n20.7 11.19 46.7 41.0\n");
+        std::vector<tp::rec> l(1);
+        tp::settle(nullptr, true, true, 3, l[0]); l[0].gap = 128; l[0].len = 40; l[0].ratio = 35.7/37.3;
+        CHECK(tp::write(pm, key, tag12, l, 1) && tp::read(pm, key, tag12, back) && back.size() == 1 && back[0].firm == 0,
+            "launch 2 must see the open record");
+        tp::rec n2; tp::settle(&back[0], false, false, 3, n2); n2.gap = back[0].gap; n2.len = back[0].len; n2.ratio = 1.36;
+        l[0] = n2;
+        CHECK(tp::write(pm, key, tag12, l, 2) && tp::read(pm, key, tag12, back) && back.size() == 1 && back[0].firm == 1 &&
+            back[0].on == 0 && back[0].tries == 2, "launch 3 must replay the firm verdict");
+        std::remove(pm.c_str());
     }
 
     if (fails == 0) {

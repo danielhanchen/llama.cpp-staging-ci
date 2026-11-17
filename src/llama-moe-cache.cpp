@@ -10257,6 +10257,23 @@ struct llama_moe_cache::impl {
         }();
         return on && cm_persist_mode() != 0;
     }
+    // k19-calvmargin: the least gain t_on / t_off of a timed "on" that is persisted as firm (default 0.10); a smaller "on" keeps the host
+    // path off and is timed again by the next launches (LLAMA_MOE_CPU_MISS_PERSIST_MIN=0: every timed verdict firm, k19-calvpersist)
+    static double cmt_ps_min_gain() {
+        static const double b = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_PERSIST_MIN");
+            return e != nullptr ? std::max(0.0, std::min(0.9, atof(e))) : 0.10;
+        }();
+        return b;
+    }
+    // k19-calvmargin: launches that time a marginal "on" before it is firm "off" (default 3)
+    static int cmt_ps_tries() {
+        static const int n = [] {
+            const char * e = getenv("LLAMA_MOE_CPU_MISS_PERSIST_TRIES");
+            return e != nullptr ? std::max(1, atoi(e)) : 3;
+        }();
+        return n;
+    }
     static double cmt_hyst() {
         static const double h = [] {
             const char * e = getenv("LLAMA_MOE_CPU_MISS_TRIAL_HYST");
@@ -10430,7 +10447,10 @@ struct llama_moe_cache::impl {
         };
         // k19-cmtpersist: a recorded trial runs its recorded length and takes its recorded verdict (no timing decides)
         cmt_ps_setup();
-        const bool replay = cmt_ps_state == 1 && (size_t) cmt_n < cmt_rec_file;
+        // k19-calvmargin: an open record (a marginal "on") is timed again, not replayed
+        const bool have_rec = cmt_ps_state == 1 && (size_t) cmt_n < cmt_rec_file;
+        const bool replay   = have_rec && cmt_rec[cmt_n].firm != 0;
+        const bool retime   = have_rec && !replay;
         const int  end_at = replay ? std::min(cmt_rec[cmt_n].len, 5*cmt_block) : 5*cmt_block;
         cmt_len_now = cmt_done;
         // the host path much slower than without it ends the trial early
@@ -10457,10 +10477,41 @@ struct llama_moe_cache::impl {
                 // the cache colder for a while (G4 Qwen3.6 UD-Q4_K_XL 12 GB, gpt-oss-20b 8 GB: -4..-8% decode with the path off but re-tried)
                 gap_next = std::min(on || t_on < 1.05*t_off ? 2*cmt_gap : std::max(4*cmt_gap, 512), cmt_gap_max);
                 if (cmt_ps_state == 1) {
+                    // k19-calvmargin: a marginal "on" is not locked in (llama_moe_tp::settle): the host path stays off, the record stays open
+                    // and the next launch times the trial again, until a clear timing or cmt_ps_tries() marginal ones make it firm
+                    const double thr  = llama_moe_tp::threshold(cmt_n > 0, cm_small_ok, cmt_margin, cmt_hyst());
+                    const bool   marg = llama_moe_tp::marginal_on(on, t_on, t_off, cmt_ps_min_gain());
+                    const bool   measured = on;
                     llama_moe_tp::rec r;
-                    r.on = on; r.host_ok = host_ok; r.gap = gap_next; r.len = cmt_len_now; r.ratio = t_off > 0.0 ? t_on/t_off : 0.0;
-                    cmt_rec.push_back(r);
+                    on = llama_moe_tp::settle(retime ? &cmt_rec[cmt_n] : nullptr, on, marg, cmt_ps_tries(), r);
+                    if (on != measured) {
+                        gap_next = std::min(t_on < 1.05*t_off ? 2*cmt_gap : std::max(4*cmt_gap, 512), cmt_gap_max);
+                    }
+                    r.host_ok = host_ok; r.gap = gap_next; r.len = cmt_len_now; r.ratio = t_off > 0.0 ? t_on/t_off : 0.0;
+                    if (retime) {
+                        const llama_moe_tp::rec & o = cmt_rec[cmt_n];
+                        if (r.on == o.on) {
+                            // the same verdict: the launches before ran this schedule, so the record keeps it and the trials after it stay valid
+                            host_ok = o.host_ok != 0; gap_next = std::max(1, o.gap);
+                            r.host_ok = o.host_ok; r.gap = o.gap; r.len = o.len;
+                            cmt_rec[cmt_n] = r;
+                        } else {
+                            // another verdict: the recorded trials after this one ran another schedule, they are timed again
+                            cmt_rec[cmt_n] = r;
+                            cmt_rec.resize(cmt_n + 1);
+                            cmt_rec_file = cmt_n + 1;
+                        }
+                    } else {
+                        cmt_rec.push_back(r);
+                    }
                     cmt_rec_dirty = true;
+                    if (marg || retime) {
+                        LLAMA_LOG_INFO("llama_moe_cache%s: CPU misses trial %d: t_on / t_off %.3f%s (switch point %.3f, persisted on needs <= %.3f): %s, "
+                            "try %d of %d%s (LLAMA_MOE_CPU_MISS_PERSIST_MIN, LLAMA_MOE_CPU_MISS_PERSIST_TRIES)\n", tag, cmt_n + 1, r.ratio,
+                            retime ? " (an open record, timed again)" : "", thr, 1.0 - cmt_ps_min_gain(),
+                            marg ? "on by less than the margin, host path kept off" : (measured ? "on" : "off"), r.tries, cmt_ps_tries(),
+                            r.firm ? ", recorded as firm" : ", the next launch times it again");
+                    }
                 }
             }
             cmt_n++;

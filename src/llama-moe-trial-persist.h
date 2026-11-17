@@ -17,6 +17,8 @@
 //
 // Header-only and free of ggml so tests/test-moe-trial-persist.cpp can test it on the CPU.
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -32,6 +34,8 @@ struct rec {
     int    gap     = 64;  // small batches until the next trial
     int    len     = 0;   // counted small batches the trial ran (it can end early)
     double ratio   = 0.0; // t_on / t_off measured by the launch that raced it (information: the margin)
+    int    firm    = 1;   // k19-calvmargin: replayed as recorded; 0 = a marginal timing, timed again by the next launch
+    int    tries   = 1;   // k19-calvmargin: launches that timed this trial
 };
 
 // k19-calvpersist: the calibration file key of a pinned run (LLAMA_MOE_CPU_MISS_CAL_VALUES): the machine's key plus the pinned numbers,
@@ -50,7 +54,7 @@ inline std::string format_line(const std::string & tag, const std::vector<rec> &
     std::string s = tag + " " + std::to_string(r.size());
     char buf[96];
     for (const rec & x : r) {
-        snprintf(buf, sizeof(buf), " %d:%d:%d:%d:%.6f", x.on ? 1 : 0, x.host_ok ? 1 : 0, x.gap, x.len, x.ratio);
+        snprintf(buf, sizeof(buf), " %d:%d:%d:%d:%.6f:%d:%d", x.on ? 1 : 0, x.host_ok ? 1 : 0, x.gap, x.len, x.ratio, x.firm ? 1 : 0, x.tries);
         s += buf;
     }
     return s;
@@ -77,6 +81,17 @@ inline bool parse_line(const std::string & line, const std::string & tag, std::v
             return false;
         }
         p += nc;
+        // k19-calvmargin: ":firm:tries" (a line without them, written before, is firm)
+        int nf = 0;
+        if (sscanf(p, ":%d:%d%n", &x.firm, &x.tries, &nf) == 2 && nf > 0) {
+            if (x.tries < 1) {
+                return false;
+            }
+            p += nf;
+        } else {
+            x.firm  = 1;
+            x.tries = 1;
+        }
         r.push_back(x);
     }
     out = std::move(r);
@@ -171,6 +186,39 @@ inline bool decide(double t_on, double t_off, size_t n_off, size_t n_on, bool ha
         return t_on < (1.0 - margin)*t_off;
     }
     return prev_on ? t_on < (1.0 - margin + hyst)*t_off : t_on < (1.0 - margin - hyst)*t_off;
+}
+
+// k19-calvmargin: the t_on / t_off ratio at which decide switches (the same cases as decide)
+inline double threshold(bool have_prev, bool prev_on, double margin, double hyst) {
+    if (!have_prev || hyst <= 0.0) {
+        return 1.0 - margin;
+    }
+    return prev_on ? 1.0 - margin + hyst : 1.0 - margin - hyst;
+}
+
+// k19-calvmargin: a timed "on" is clear only if the host path was at least min_gain faster (t_on <= (1 - min_gain) t_off; min_gain <= 0:
+// every "on" is clear, the k19-calvpersist rule). One noisy launch-1 trial decided "on" by 4% on an A100 40 (37.3 vs 35.7 ms), was
+// persisted, and every later launch replayed the host path at 70-77 ms per pass against 50-52 ms without it
+inline bool marginal_on(bool on, double t_on, double t_off, double min_gain) {
+    return on && min_gain > 0.0 && t_off > 0.0 && t_on > (1.0 - min_gain)*t_off;
+}
+
+// k19-calvmargin: what a timed trial keeps. A clear timing is firm (replayed as is from then on), and so is a marginal "off" (the timing and
+// the safe side agree). A marginal "on" keeps the host path off (the gain is inside the noise; the host path's loss when the timing was
+// wrong is not) and stays open: the next launch times it again, a clear timing then decides, and after max_tries timings without one it
+// is firm "off". So only a trial that timed "on" inside the band can change in a later launch, and only to a clear "on".
+// old = the open record this launch timed again (nullptr: a new trial). Returns the verdict this launch takes; out gets on / firm / tries
+// (the caller fills the rest)
+inline bool settle(const rec * old, bool on, bool is_marginal, int max_tries, rec & out) {
+    out.tries = (old != nullptr ? old->tries : 0) + 1;
+    if (!is_marginal || !on) {
+        out.on   = on ? 1 : 0;
+        out.firm = 1;
+        return on;
+    }
+    out.on   = 0;
+    out.firm = out.tries >= std::max(1, max_tries) ? 1 : 0;
+    return false;
 }
 
 } // namespace llama_moe_tp
