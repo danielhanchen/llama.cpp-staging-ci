@@ -492,6 +492,271 @@ bool ggml_cuda_flash_attn_ext_mma_i8(const int device, const ggml_tensor * dst) 
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
+// INT8 Q*K^T over an f16 K cache: per launch Q and K are staged as int8 rows with one f32 scale each (ggml_cuda_flash_attn_ext_i8_rows,
+// behind the output, reserved by ggml_cuda_flash_attn_ext_get_alloc_size), rotated first per KV head whose rows have outliers (the
+// per-row scale needs them spread; GGML_CUDA_FATTN_I8_ROT=0: never, =1: always), and the MMA kernel runs its INT8 tiles on them
+// (fattn_kvq_i8r).
+// GGML_CUDA_FATTN_I8_F16 unset: as GGML_CUDA_FATTN_I8 (unset: Ada and RTX Blackwell, head size 256; 0: never); 0: never; 1: also GA10x
+// and head size 128; 2: any NVIDIA Turing+, head size 128 / 256 (tests). Nodes: f16 K and V, head size 128 / 256 (K = V), more than 16 query rows (decode and verify batches never),
+// no logit softcap, not two-source, not batch invariant, K not partly in host memory, 16 byte aligned Q / K rows.
+// Returns 0 (no), else 1 + the rotation mode (0 never, 1 always, 2 per KV head)
+int ggml_cuda_flash_attn_ext_mma_i8_f16(const int device, const ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(device, dst);
+    return 0;
+#else
+    static const int mode = [] {
+        const char * e = getenv("GGML_CUDA_FATTN_I8_F16");
+        if (e != nullptr) {
+            return atoi(e);
+        }
+        const char * m = getenv("GGML_CUDA_FATTN_I8");
+        return m != nullptr && atoi(m) == 0 ? 0 : -1;
+    }();
+    static const int rot = getenv("GGML_CUDA_FATTN_I8_ROT") == nullptr ? 2 : std::min(std::max(atoi(getenv("GGML_CUDA_FATTN_I8_ROT")), 0), 2);
+    if (mode == 0) {
+        return 0;
+    }
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || Q->type != GGML_TYPE_F32 || dst->src[6] != nullptr || Q->ne[1] <= 16 ||
+            (dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT)) {
+        return 0;
+    }
+    const int64_t D = K->ne[0];
+    if ((D != 128 && D != 256) || Q->ne[0] != D || V->ne[0] != D) {
+        return 0;
+    }
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+    if (logit_softcap != 0.0f || V_is_K_view) {
+        return 0;
+    }
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !turing_mma_available(cc)) {
+        return 0;
+    }
+    if (mode != 2) {
+        const bool rtx_blackwell = cc >= GGML_CUDA_CC_BLACKWELL && cc < GGML_CUDA_CC_RUBIN;
+        const int  first         = mode == 1 ? GGML_CUDA_CC_AMPERE_GA10X : GGML_CUDA_CC_ADA_LOVELACE;
+        if (!rtx_blackwell && (cc < first || cc >= GGML_CUDA_CC_HOPPER)) {
+            return 0;
+        }
+    }
+    // by default head size 256 only: at 128 (dense Qwen3, outlier-heavy K) the rotated per-row INT8 scores measured outside the -fa off
+    // KLD band; =1 / =2 take 128 too
+    if (mode == -1 && D != 256) {
+        return 0;
+    }
+    if (K->buffer != nullptr && ggml_cuda_buffer_has_host_chunks(K->buffer)) {
+        return 0;
+    }
+    if (K->nb[0] != ggml_type_size(K->type) || Q->nb[0] != ggml_type_size(Q->type)) {
+        return 0;
+    }
+    for (int i = 1; i < 4; ++i) {
+        if (K->nb[i] % 16 != 0 || Q->nb[i] % 16 != 0) {
+            return 0;
+        }
+    }
+    const int64_t row = ggml_cuda_fattn_i8_row_bytes(D);
+    if (ggml_cuda_fattn_i8_k_rows(K->ne[1])*row > INT32_MAX || Q->ne[1]*row > INT32_MAX) {
+        return 0;
+    }
+    return 1 + rot;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
+// the E = D/32 consecutive values of lane threadIdx.x of a row (16 byte aligned rows: 8 or 16 byte loads)
+template <int D, typename T>
+static __device__ __forceinline__ void fattn_i8_load_row(const char * __restrict__ p, float * x) {
+    constexpr int E = D/WARP_SIZE;
+    __align__(16) T tmp[E];
+    constexpr int chunk = sizeof(tmp) % 16 == 0 ? 16 : 8;
+    p += threadIdx.x*int(sizeof(tmp));
+#pragma unroll
+    for (int c = 0; c < int(sizeof(tmp))/chunk; ++c) {
+        if constexpr (chunk == 16) {
+            ((int4 *) tmp)[c] = ((const int4 *) p)[c];
+        } else {
+            ((int2 *) tmp)[c] = ((const int2 *) p)[c];
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < E; ++i) {
+        x[i] = ggml_cuda_cast<float>(tmp[i]);
+    }
+}
+
+// the rotation decision per KV head: rows whose max |v| over their RMS is above this on average (fixed point, 1/1024) have outliers that
+// one scale per row cannot resolve, so their head is rotated (the transform spreads them; a Gaussian row of 128 / 256 values sits near
+// 2.7 / 2.9). Rows without outliers (bounded values: uniform data 1.7) are not, where the transform would raise the ratio to the Gaussian
+// one and cost precision
+static constexpr int fattn_i8_rot_thr = 3*1024;
+// K rows sampled for the decision: every 8th cell
+static constexpr int fattn_i8_rot_step = 8;
+
+// row statistics for the rotation decision: one warp per row (every step-th of ne1), max |v| / RMS in 1/1024 added to
+// stats[2*(i3/r3*ne2_kv + i2/r2) + slot] (integer sums: the decision does not depend on the order of the rows)
+template <int D, typename T>
+static __global__ void k_fattn_i8_stats(const char * __restrict__ src, int * __restrict__ stats, const int ne1, const int step,
+        const int64_t nb1, const int64_t nb2, const int64_t nb3, const int r2, const int r3, const int ne2_kv, const int slot) {
+    constexpr int E = D/WARP_SIZE;
+    const int r = (blockIdx.x*blockDim.y + threadIdx.y)*step;
+    if (r >= ne1) {
+        return;
+    }
+    float x[E];
+    fattn_i8_load_row<D, T>(src + blockIdx.z*nb3 + blockIdx.y*nb2 + int64_t(r)*nb1, x);
+    float amax = 0.0f;
+    float ss   = 0.0f;
+#pragma unroll
+    for (int i = 0; i < E; ++i) {
+        amax = fmaxf(amax, fabsf(x[i]));
+        ss  += x[i]*x[i];
+    }
+    amax = warp_reduce_max(amax);
+    ss   = warp_reduce_sum(ss);
+    if (threadIdx.x == 0) {
+        const float ratio = ss > 0.0f ? fminf(amax * rsqrtf(ss / D), 64.0f) : 0.0f;
+        atomicAdd(stats + 2*((blockIdx.z/r3)*ne2_kv + blockIdx.y/r2) + slot, int(ratio*1024.0f + 0.5f));
+    }
+}
+
+// one warp per row: E = D/32 consecutive values per lane, rotated (rot 1, or rot 2 where the statistics of the row's KV head ask for it):
+// the Walsh-Hadamard transform of the row (log2(E) butterfly stages in registers, 5 across the lanes, unnormalised: Q*K^T scales by D,
+// folded into Q's scale), then d = amax/127, q = round(v/d), the D quants and d*d_mul (f32, d_mul / D when rotated and is_q) behind them.
+// Rows ne1 .. ne1_pad - 1 are zeros
+template <int D, typename T>
+static __global__ void k_fattn_i8_rows(const char * __restrict__ src, char * __restrict__ dst, const int ne1, const int ne1_pad, const int ne2,
+        const int64_t nb1, const int64_t nb2, const int64_t nb3, const float d_mul, const bool is_q, const int rot,
+        const int * __restrict__ stats, const int r2, const int r3, const int ne2_kv, const int nK, const int nQ) {
+    constexpr int E = D/WARP_SIZE;
+    static_assert(E == 4 || E == 8, "bad head size");
+    const int r = blockIdx.x*blockDim.y + threadIdx.y;
+    if (r >= ne1_pad) {
+        return;
+    }
+    const int lane = threadIdx.x;
+    char * out = dst + ((int64_t(blockIdx.z)*ne2 + blockIdx.y)*ne1_pad + r)*ggml_cuda_fattn_i8_row_bytes(D);
+
+    bool rotate = rot == 1;
+    if (rot == 2) {
+        const int * st = stats + 2*((blockIdx.z/r3)*ne2_kv + blockIdx.y/r2);
+        rotate = int64_t(st[0]) > int64_t(fattn_i8_rot_thr)*nK || int64_t(st[1]) > int64_t(fattn_i8_rot_thr)*nQ;
+    }
+
+    float x[E];
+    if (r < ne1) {
+        fattn_i8_load_row<D, T>(src + blockIdx.z*nb3 + blockIdx.y*nb2 + int64_t(r)*nb1, x);
+    } else {
+#pragma unroll
+        for (int i = 0; i < E; ++i) {
+            x[i] = 0.0f;
+        }
+    }
+
+    if (rotate) {
+#pragma unroll
+        for (int h = 1; h < E; h <<= 1) {
+#pragma unroll
+            for (int i = 0; i < E; ++i) {
+                if ((i & h) == 0) {
+                    const float a = x[i];
+                    const float b = x[i + h];
+                    x[i]     = a + b;
+                    x[i + h] = a - b;
+                }
+            }
+        }
+#pragma unroll
+        for (int m = 1; m < WARP_SIZE; m <<= 1) {
+#pragma unroll
+            for (int i = 0; i < E; ++i) {
+                const float y = __shfl_xor_sync(0xFFFFFFFF, x[i], m, WARP_SIZE);
+                x[i] = (lane & m) ? y - x[i] : x[i] + y;
+            }
+        }
+    }
+
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < E; ++i) {
+        amax = fmaxf(amax, fabsf(x[i]));
+    }
+    amax = warp_reduce_max(amax);
+    const float d = amax / 127;
+
+    uint32_t q[E/4];
+#pragma unroll
+    for (int k = 0; k < E/4; ++k) {
+        q[k] = 0;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int v = d != 0.0f ? int(roundf(x[4*k + l] / d)) : 0;
+            q[k] |= (uint32_t(v) & 0xFFu) << (8*l);
+        }
+    }
+    if constexpr (E == 8) {
+        *(int2 *) (out + lane*E) = make_int2(q[0], q[1]);
+    } else {
+        *(int *) (out + lane*E) = q[0];
+    }
+    if (lane == 0) {
+        *(float *) (out + D) = d*(rotate && is_q ? d_mul / D : d_mul);
+    }
+}
+
+template <int D>
+static void ggml_cuda_flash_attn_ext_i8_rows_case(const ggml_tensor * Q, const ggml_tensor * K, const float q_scale, const int rot, char * Q8,
+        char * K8, int * S8, cudaStream_t stream) {
+    constexpr int rows_per_block = 4;
+    const dim3 block(WARP_SIZE, rows_per_block, 1);
+    const int k_rows = int(ggml_cuda_fattn_i8_k_rows(K->ne[1]));
+    const int ne2_kv = int(K->ne[2]);
+    const int r2     = int(Q->ne[2] / K->ne[2]);
+    const int r3     = int(Q->ne[3] / K->ne[3]);
+    const int nK     = int((K->ne[1] + fattn_i8_rot_step - 1) / fattn_i8_rot_step);
+    const int nQ     = int(Q->ne[1])*r2*r3;
+    if (rot == 2) {
+        CUDA_CHECK(cudaMemsetAsync(S8, 0, 2*K->ne[2]*K->ne[3]*sizeof(int), stream));
+        const dim3 grid_SK((nK + rows_per_block - 1)/rows_per_block, K->ne[2], K->ne[3]);
+        k_fattn_i8_stats<D, half><<<grid_SK, block, 0, stream>>>
+            ((const char *) K->data, S8, int(K->ne[1]), fattn_i8_rot_step, K->nb[1], K->nb[2], K->nb[3], 1, 1, ne2_kv, 0);
+        const dim3 grid_SQ((Q->ne[1] + rows_per_block - 1)/rows_per_block, Q->ne[2], Q->ne[3]);
+        k_fattn_i8_stats<D, float><<<grid_SQ, block, 0, stream>>>
+            ((const char *) Q->data, S8, int(Q->ne[1]), 1, Q->nb[1], Q->nb[2], Q->nb[3], r2, r3, ne2_kv, 1);
+    }
+    const dim3 grid_K((k_rows + rows_per_block - 1)/rows_per_block, K->ne[2], K->ne[3]);
+    k_fattn_i8_rows<D, half><<<grid_K, block, 0, stream>>>
+        ((const char *) K->data, K8, int(K->ne[1]), k_rows, int(K->ne[2]), K->nb[1], K->nb[2], K->nb[3], 1.0f, false, rot,
+         S8, 1, 1, ne2_kv, nK, nQ);
+    const dim3 grid_Q((Q->ne[1] + rows_per_block - 1)/rows_per_block, Q->ne[2], Q->ne[3]);
+    k_fattn_i8_rows<D, float><<<grid_Q, block, 0, stream>>>
+        ((const char *) Q->data, Q8, int(Q->ne[1]), int(Q->ne[1]), int(Q->ne[2]), Q->nb[1], Q->nb[2], Q->nb[3], q_scale, true, rot,
+         S8, r2, r3, ne2_kv, nK, nQ);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_flash_attn_ext_i8_rows(const ggml_tensor * Q, const ggml_tensor * K, const float q_scale, const int rot, char * Q8,
+        char * K8, int * S8, cudaStream_t stream) {
+    GGML_ASSERT(Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_F16);
+    GGML_ASSERT((uintptr_t) Q->data % 16 == 0 && (uintptr_t) K->data % 16 == 0);
+    GGML_ASSERT(Q->ne[2] % K->ne[2] == 0 && Q->ne[3] % K->ne[3] == 0);
+    switch (K->ne[0]) {
+        case 128:
+            ggml_cuda_flash_attn_ext_i8_rows_case<128>(Q, K, q_scale, rot, Q8, K8, S8, stream);
+            break;
+        case 256:
+            ggml_cuda_flash_attn_ext_i8_rows_case<256>(Q, K, q_scale, rot, Q8, K8, S8, stream);
+            break;
+        default:
+            GGML_ABORT("INT8 rows: head size %lld", (long long) K->ne[0]);
+    }
+}
+
 bool ggml_cuda_flash_attn_ext_mma_q8_inplace(const int device, const ggml_tensor * dst) {
     return ggml_cuda_flash_attn_ext_mma_kvq_inplace(device, dst, true) != 0;
 }
@@ -1207,6 +1472,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     bool need_f16_K = false;
     bool need_f16_V = false;
+    bool i8_f16     = false;
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
@@ -1218,6 +1484,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = dst->src[6] != nullptr ? ggml_cuda_flash_attn_ext_src2_codes(device, dst, true) == 0 :
                 ggml_cuda_flash_attn_ext_mma_kvq_inplace(device, dst, true) == 0;
             need_f16_V = need_f16_K;
+            // INT8 Q*K^T over an f16 K: the int8 rows of Q and K behind the output
+            i8_f16 = ggml_cuda_flash_attn_ext_mma_i8_f16(device, dst) != 0;
             break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
@@ -1229,7 +1497,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     }
 
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V, i8_f16);
 
     return f16_extra.end - (uintptr_t) dst->data;
 }

@@ -125,11 +125,26 @@ typedef float (*vec_dot_KQ_t)(
 struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t K;
     uintptr_t V;
+    uintptr_t Q8; // INT8 Q*K^T over an f16 K: Q and K as int8 rows (ggml_cuda_flash_attn_ext_i8_rows)
+    uintptr_t K8;
+    uintptr_t S8; // and the row statistics that decide the rotation per KV head
+
     uintptr_t end;
 };
 
+// rows of D int8 values and their f32 scale, 16 byte aligned (the int8 tile row of the MMA kernel)
+static constexpr __host__ __device__ int64_t ggml_cuda_fattn_i8_row_bytes(const int64_t D) { return D + 16; }
+// the staged K rows of each head: the cells padded to the KV stride with zero rows (the kernel reads whole KV tiles)
+static constexpr __host__ __device__ int64_t ggml_cuda_fattn_i8_k_rows(const int64_t n_kv) { return (n_kv + 255) / 256 * 256; }
+
+// stages Q (f32) and K (f16) as int8 rows with one scale per row (d = amax/127, q = round(v/d)), Q's scale times q_scale; rotated rows:
+// Q and K through the same Walsh-Hadamard transform first (Q*K^T unchanged up to the factor D, folded into Q's scale). rot: 0 never,
+// 1 always, 2 per KV head where the rows have outliers (row max over row RMS, see fattn.cu). fattn.cu
+void ggml_cuda_flash_attn_ext_i8_rows(const ggml_tensor * Q, const ggml_tensor * K, float q_scale, int rot, char * Q8, char * K8,
+        int * S8, cudaStream_t stream);
+
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
-        const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
+        const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V, const bool i8_f16 = false) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
     const ggml_tensor * K = dst->src[1];
@@ -157,6 +172,19 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
             data.V   = data.end;
             data.end += ggml_nelements(V)*ggml_type_size(GGML_TYPE_F16);
         }
+    }
+
+    if (i8_f16) {
+        const ggml_tensor * Q = dst->src[0];
+        data.end = GGML_PAD(data.end, 128);
+        data.Q8  = data.end;
+        data.end += Q->ne[1]*Q->ne[2]*Q->ne[3]*ggml_cuda_fattn_i8_row_bytes(Q->ne[0]);
+        data.end = GGML_PAD(data.end, 128);
+        data.K8  = data.end;
+        data.end += ggml_cuda_fattn_i8_k_rows(K->ne[1])*K->ne[2]*K->ne[3]*ggml_cuda_fattn_i8_row_bytes(K->ne[0]);
+        data.end = GGML_PAD(data.end, 128);
+        data.S8  = data.end;
+        data.end += 2*K->ne[2]*K->ne[3]*sizeof(int);
     }
 
     return data;
@@ -1230,7 +1258,9 @@ void launch_fattn(
     const bool vec_kv_cap = false,
     // k19-fattnq8: the occupancy (so the parallel / stream-k blocks) of this kernel at this shared memory instead of fattn_kernel's: a
     // kernel reading quantized K / V in place splits the KV as the f16 kernel of the staged launch does
-    fattn_kernel_t occ_kernel = nullptr, const size_t occ_nbytes_shared = 0
+    fattn_kernel_t occ_kernel = nullptr, const size_t occ_nbytes_shared = 0,
+    // INT8 Q*K^T over an f16 K (ggml_cuda_flash_attn_ext_mma_i8_f16, 1 + the rotation mode): Q and K staged as int8 rows behind the output
+    const int i8_f16 = 0
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1292,7 +1322,7 @@ void launch_fattn(
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V, i8_f16 != 0);
 
     // k19-fattnq4: the f16 copies of a two-source node's second source, allocated before the buffers below (the pool frees in reverse order)
     ggml_cuda_pool_alloc<half> K2_f16(pool);
@@ -1315,6 +1345,30 @@ void launch_fattn(
     size_t nb21 = V->nb[1];
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
+
+    const char * Q_data = (const char *) Q->data;
+    size_t nb01 = Q->nb[1];
+    size_t nb02 = Q->nb[2];
+    size_t nb03 = Q->nb[3];
+
+    if (i8_f16 != 0) {
+        GGML_ASSERT(K->type == GGML_TYPE_F16 && f16_extra.Q8 != 0 && f16_extra.K8 != 0 && f16_extra.S8 != 0);
+        if (!probe) {
+            float q_scale = 1.0f;
+            memcpy(&q_scale, (const float *) KQV->op_params + 0, sizeof(float));
+            ggml_cuda_flash_attn_ext_i8_rows(Q, K, q_scale, i8_f16 - 1, (char *) f16_extra.Q8, (char *) f16_extra.K8, (int *) f16_extra.S8,
+                main_stream);
+        }
+        const int64_t row = ggml_cuda_fattn_i8_row_bytes(K->ne[0]);
+        Q_data = (const char *) f16_extra.Q8;
+        nb01   = row;
+        nb02   = Q->ne[1]*nb01;
+        nb03   = Q->ne[2]*nb02;
+        K_data = (const char *) f16_extra.K8;
+        nb11   = row;
+        nb12   = ggml_cuda_fattn_i8_k_rows(K->ne[1])*nb11;
+        nb13   = K->ne[2]*nb12;
+    }
 
     if (need_f16_K && K->type != GGML_TYPE_F16 && !probe) {
         const size_t bs = ggml_blck_size(K->type);
@@ -1721,7 +1775,7 @@ void launch_fattn(
 
     ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
     ggml_cuda_kernel_launch(fattn_kernel, launch_params,
-        (const char *) Q->data,
+        Q_data,
         K_data,
         V_data,
         mask_data,
@@ -1729,7 +1783,7 @@ void launch_fattn(
         KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
-        Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
+        Q->ne[0], ne01,     Q->ne[2], Q->ne[3], nb01, nb02, nb03,
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,

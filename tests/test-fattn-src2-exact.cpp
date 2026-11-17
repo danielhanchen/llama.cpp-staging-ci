@@ -356,6 +356,9 @@ int main(int argc, char ** argv) {
         set_env("GGML_CUDA_FATTN_Q8_INPLACE", mode == 2 ? "0" : "1");
         set_env("GGML_CUDA_FATTN_Q4_INPLACE", mode == 2 ? "0" : "1");
         set_env("GGML_CUDA_FATTN_Q8_MODE", mode == 1 ? "1" : "0");
+        // the reference is a plain f16 node: keep it on the f16 kernel (the INT8 Q*K^T route of f16 prompt nodes is not byte-equal)
+        set_env("GGML_CUDA_FATTN_I8", "0");
+        set_env("GGML_CUDA_FATTN_I8_F16", "0");
         // the ring-tile skip (fully masked ring tiles of a query tile) on at every row count in modes 0 / 2, off in mode 1: the three
         // must agree, and mode 2 with the plain node over the concatenation (which never skips)
         set_env("GGML_CUDA_FATTN_SRC2_SKIP", mode == 1 ? "0" : "1");
