@@ -24,6 +24,52 @@
 #include <thread>
 #include <vector>
 
+#if defined(__linux__)
+#include <dlfcn.h>
+#include <pthread.h>
+
+// Models are loaded and decoded concurrently in this process. Model loading (common fit, MoE cache placement) writes process
+// environment variables while other workers read them during graph build, and glibc getenv is not safe against a concurrent setenv
+// (adding a new name can reallocate environ under the reader). Serialize the environment functions for this test binary only.
+static pthread_rwlock_t g_test_env_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+extern "C" {
+
+char * getenv(const char * name) noexcept {
+    static auto real = reinterpret_cast<char * (*)(const char *)>(dlsym(RTLD_NEXT, "getenv"));
+    pthread_rwlock_rdlock(&g_test_env_lock);
+    char * res = real(name);
+    pthread_rwlock_unlock(&g_test_env_lock);
+    return res;
+}
+
+int setenv(const char * name, const char * value, int overwrite) noexcept {
+    static auto real = reinterpret_cast<int (*)(const char *, const char *, int)>(dlsym(RTLD_NEXT, "setenv"));
+    pthread_rwlock_wrlock(&g_test_env_lock);
+    const int res = real(name, value, overwrite);
+    pthread_rwlock_unlock(&g_test_env_lock);
+    return res;
+}
+
+int unsetenv(const char * name) noexcept {
+    static auto real = reinterpret_cast<int (*)(const char *)>(dlsym(RTLD_NEXT, "unsetenv"));
+    pthread_rwlock_wrlock(&g_test_env_lock);
+    const int res = real(name);
+    pthread_rwlock_unlock(&g_test_env_lock);
+    return res;
+}
+
+int putenv(char * str) noexcept {
+    static auto real = reinterpret_cast<int (*)(char *)>(dlsym(RTLD_NEXT, "putenv"));
+    pthread_rwlock_wrlock(&g_test_env_lock);
+    const int res = real(str);
+    pthread_rwlock_unlock(&g_test_env_lock);
+    return res;
+}
+
+}
+#endif
+
 // the state file of a model, named after it so that models running in parallel do not collide
 static std::string test_state_path(const std::string & model_name) {
     return "dump_state." + model_name + ".bin";
@@ -547,6 +593,8 @@ int main(int argc, char ** argv) {
                 __func__, cases[i]->name(), n_pass[i], n_skip[i], n_fail[i], models.size());
     }
     LOG_INF("%s: models: %zu passed, %zu failed (of %zu)\n", __func__, models.size() - n_model_fail, n_model_fail, models.size());
+    // the summary goes through the asynchronous logger; drain it before returning so the lines are never lost at exit
+    common_log_flush(common_log_main());
 
     return n_model_fail == 0 ? 0 : 1;
 }
