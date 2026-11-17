@@ -307,6 +307,7 @@ int main(int argc, char ** argv) {
         set_env("GGML_CUDA_FATTN_Q8_INPLACE_MAX_ROWS", "1000000"); // every case in place (the default keeps prompt batches staged)
         set_env("GGML_CUDA_FATTN_Q4_INPLACE_MAX_ROWS", "1000000");
         set_env("GGML_CUDA_FATTN_Q8_MODE", mode == 1 ? "1" : "0");
+        set_env("GGML_CUDA_FATTN_I8", "0"); // the staged reference is the f16 kernel (the INT8 Q*K^T route of q8_0 K prompts is not byte-equal)
         fflush(stdout);
         const std::string cmd = "\"" + std::string(argv[0]) + "\" --child " + std::to_string(mode) + " \"" + path + "\"";
         const int rc = std::system(cmd.c_str());
