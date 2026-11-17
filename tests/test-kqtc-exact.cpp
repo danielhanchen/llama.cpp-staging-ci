@@ -3,7 +3,9 @@
 // MMQ launch it replaces (GGML_CUDA_MMQ_FEW=0) and an fp64 CPU reference (dequantized weights x f32 activations). It quantizes the
 // activations itself (x * (127 / amax)), so it cannot be bit-identical; the gates are:
 //  - accuracy: NMSE(lever, ref) <= 1.10 * NMSE(replaced launch, ref) + 1e-12 per case (the q8_1 activation rounding, ~1e-5, dominates;
-//    a wrong scale / nibble / layout gives >= 1e-4); a negative control (outputs x (1 + 2^-7)) must fail it;
+//    a wrong scale / nibble / layout gives >= 1e-4), the replaced launch's NMSE being the smaller of the case's and its verify-flag
+//    twin's (same data: where the device table sends the unflagged product to MMQ, the flagged one keeps mmvq); a negative control
+//    (outputs x (1 + 2^-7)) must fail it;
 //  - exact properties: 1-column products and products it does not take keep the bytes of the replaced launch; under the bit-exact
 //    verify (batch invariant + GGML_CUDA_VERIFY_REASSOC=0) every flagged product keeps them and the lever does not engage;
 //  - engagement (GGML_CUDA_MMQ_FEW_LOG=1 logs each launch): every type engages on Ampere and newer; the AUTO mode only on the devices
@@ -524,6 +526,25 @@ int main(int argc, char ** argv) {
     // bit-exact verify, or routed elsewhere by the device tables, e.g. MMQ) must keep the bytes of its base mode
     const size_t ncase = cases.size();
     const size_t body  = dumps[0].size() - ncase*sizeof(int32_t);
+    // the byte offset of every case in a dump, and its twin: the same type / shape / columns with the other verify flag. Both take the
+    // same weights and activations (get_host), so the twin's base output is a second launch of the product the lever replaces: on devices
+    // whose mmvq table sends a K-quant of 5..8 columns to MMQ (cc 12.0: Q4_K from 6, Q5_K from 7, Q6_K at 8) the unflagged base is MMQ
+    // and the flagged one keeps mmvq (k19-vrow3), so the accuracy gate is anchored to the better of the two
+    std::vector<size_t> case_off(cases.size());
+    std::vector<int>    twin(cases.size(), -1);
+    {
+        size_t o = 0;
+        for (size_t ci = 0; ci < cases.size(); ++ci) {
+            case_off[ci] = o;
+            o += shp_out(test_shapes[cases[ci].shape], cases[ci].T)*sizeof(float);
+            for (size_t cj = 0; cj < cases.size(); ++cj) {
+                if (cases[cj].type == cases[ci].type && cases[cj].shape == cases[ci].shape && cases[cj].T == cases[ci].T &&
+                        cases[cj].flagged != cases[ci].flagged) {
+                    twin[ci] = (int) cj;
+                }
+            }
+        }
+    }
     size_t off = 0;
     double worst_tc = 0.0, worst_ratio = 0.0;
     int n_tc_cases = 0, n_neg_fail = 0, n_neg = 0, n_few_cases = 0;
@@ -565,12 +586,15 @@ int main(int argc, char ** argv) {
             const double d_base = nmse(fi, fbi, n);
             const double e_tc   = nmse_ref(fi, ref.data(), n);
             const double e_bi   = nmse_ref(fbi, ref.data(), n);
+            // few-row gate anchor: the closer of this case's base launch and its twin's (see case_off / twin above)
+            const double e_tw   = twin[ci] >= 0 ? nmse_ref((const float *) (dumps[ib_i].data() + case_off[twin[ci]]), ref.data(), n) : e_bi;
+            const double e_anc  = std::min(e_bi, e_tw);
             // few-row MMQ: its own src1 quantization, and the product it replaces may be MMQ (the device table) with yet another one, so
             // only the distance to the fp64 reference is gated (G4: within 1.065x of mmvq at 2..3 columns, 4x closer than MMQ at 6..8)
-            const bool ok = is_few(i) ? e_tc <= 1.10*e_bi + 1e-12 : d_base <= 1e-10 && e_tc <= 1.02*e_bi + 1e-12;
+            const bool ok = is_few(i) ? e_tc <= 1.10*e_anc + 1e-12 : d_base <= 1e-10 && e_tc <= 1.02*e_bi + 1e-12;
             if (is_few(i)) {
                 worst_few       = std::max(worst_few, d_base);
-                worst_few_ratio = std::max(worst_few_ratio, e_bi > 0 ? e_tc/e_bi : 0.0);
+                worst_few_ratio = std::max(worst_few_ratio, e_anc > 0 ? e_tc/e_anc : 0.0);
                 n_few_cases++;
             } else {
                 worst_tc    = std::max(worst_tc, d_base);
@@ -578,8 +602,8 @@ int main(int argc, char ** argv) {
                 n_tc_cases++;
             }
             if (!ok) {
-                printf("FAIL %s %s K %d N %d T %d%s: nmse vs mmvq %.3g, vs ref %.3g (mmvq %.3g)\n", modes[i].name, ggml_type_name(c.type), s.K,
-                    s.N, c.T, c.flagged ? " flagged" : "", d_base, e_tc, e_bi);
+                printf("FAIL %s %s K %d N %d T %d%s: nmse vs base %.3g, vs ref %.3g (base %.3g, twin base %.3g)\n", modes[i].name,
+                    ggml_type_name(c.type), s.K, s.N, c.T, c.flagged ? " flagged" : "", d_base, e_tc, e_bi, e_tw);
                 n_fail++;
             }
             // negative control (mode few only): the outputs x (1 + 2^-7) must fail the accuracy gate
@@ -589,8 +613,14 @@ int main(int argc, char ** argv) {
                     v *= 1.0f + 1.0f/128.0f;
                 }
                 n_neg++;
-                if (nmse_ref(pert.data(), ref.data(), n) <= 1.10*e_bi + 1e-12) {
+                const double e_pert = nmse_ref(pert.data(), ref.data(), n);
+                if (e_pert <= 1.10*e_anc + 1e-12) {
                     n_neg_fail++;
+                }
+                // KQTC_DIAG=1: the per-case errors vs the fp64 reference where the two base launches differ by more than 10%
+                if (getenv("KQTC_DIAG") && (e_bi > 1.10*e_tw || e_tw > 1.10*e_bi || e_pert <= 1.10*e_anc + 1e-12)) {
+                    printf("DIAG %s K %d N %d T %d%s: few %.3g base %.3g twin base %.3g perturbed %.3g\n", ggml_type_name(c.type), s.K, s.N,
+                        c.T, c.flagged ? " flagged" : "", e_tc, e_bi, e_tw, e_pert);
                 }
             }
             pend.push_back({ i, (int) c.type, c.shape, c.T, c.flagged, off });
@@ -647,7 +677,9 @@ int main(int argc, char ** argv) {
     }
     n_fail += n_inv_fail;
 
-    printf("%s negative control: %d of %d perturbed cases passed the gate (must be 0)\n", n_neg_fail == 0 && n_neg > 0 ? "OK  " : "FAIL",
+    // (no lever on this device, e.g. Turing: nothing to perturb, SKIP)
+    printf("%s negative control: %d of %d perturbed cases passed the gate (must be 0)\n", !few_dev && n_neg == 0 ? "SKIP" :
+        n_neg_fail == 0 && n_neg > 0 ? "OK  " : "FAIL",
         n_neg_fail, n_neg);
     n_fail += n_neg_fail != 0 || (few_dev && n_neg == 0);
     printf("(own-kernel cases %d, worst %.3g / %.6f; invariance %d checked, %d failed: none since the own kernel was dropped)\n",
