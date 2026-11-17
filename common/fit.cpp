@@ -200,9 +200,39 @@ bool common_fit_place8_mid() {
 }
 
 // grow_mib (mid only): the compute buffer memory the cache took, which a released layer-major group may grow back into
+// k19-g4cbuf (LLAMA_FIT_PLACE8_FA_INPLACE=0 off): with the graphs of a device reserved at ub tokens, flash attention reads a q8_0 K / V
+// in place up to that many rows on that device (the CUDA backend's "ggml_backend_cuda_set_fa_q8_inplace_rows"; every other device and
+// context keeps 16), so the decode-sized reserve holds no f16 copy of the whole K / V. Set before the fit's decode-sized measurements,
+// so the cache gets that memory, and reset with the placement. G4 Qwen3.8-Flash-Next UD-IQ4_XS: 12 GB / 262K compute 561 -> 193 MiB,
+// decode chat 73.0 -> 74.5, 8k 67.7 -> 72.3 tok/s; 10 GB / 131K 285 -> 101 MiB, level; first-token KLD identical (paired), decode
+// KLD in the -fa off band
+static ggml_backend_dev_t g_place8_fa_dev = nullptr;
+
+static void common_fit_place8_fa_rows(ggml_backend_dev_t dev, uint32_t ub) {
+    static const bool fa_inplace = getenv("LLAMA_FIT_PLACE8_FA_INPLACE") == nullptr || atoi(getenv("LLAMA_FIT_PLACE8_FA_INPLACE")) != 0;
+    if (g_place8_fa_dev != nullptr && g_place8_fa_dev != dev) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(g_place8_fa_dev);
+        auto fn = reg ? (void (*)(ggml_backend_dev_t, int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_fa_q8_inplace_rows") : nullptr;
+        if (fn != nullptr) {
+            fn(g_place8_fa_dev, 0);
+        }
+        g_place8_fa_dev = nullptr;
+    }
+    if (dev == nullptr) {
+        return;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    auto fn = reg ? (void (*)(ggml_backend_dev_t, int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_fa_q8_inplace_rows") : nullptr;
+    if (fn != nullptr) {
+        fn(dev, ub > 16 && fa_inplace ? (int) std::min<uint32_t>(ub, 32) : 0);
+        g_place8_fa_dev = dev;
+    }
+}
+
 // groups: the k19-pgroups small device (LLAMA_MOE_PLACE8_GROUPS, read by the context), which keeps the layer-major groups of a mid-size
 // device but not its short-prompt split or its routed refills (see llama_context, k19-pgroups2)
-static void common_fit_place8_env(uint32_t ub, bool mid = false, int64_t grow_mib = 0, bool groups = false) {
+static void common_fit_place8_env(uint32_t ub, bool mid = false, int64_t grow_mib = 0, bool groups = false, ggml_backend_dev_t dev = nullptr) {
+    common_fit_place8_fa_rows(ub > 0 ? dev : nullptr, ub);
     common_set_env("LLAMA_MOE_PLACE8_UB", ub > 0 ? std::to_string(ub) : "");
     common_set_env("LLAMA_MOE_PLACE8_MID", ub > 0 && mid ? std::to_string(std::max<int64_t>(1, grow_mib)) : "");
     common_set_env("LLAMA_MOE_PLACE8_GROUPS", ub > 0 && mid && groups ? "1" : "");
@@ -1913,7 +1943,7 @@ static void common_params_fit_impl(
                         bool           got     = false;
                         int64_t        grow    = 0;
                         cparams->n_ubatch = ub_rel;
-                        common_fit_place8_env(ub_rel); // the cache of a measurement reads the gate of its small batches (place8_single)
+                        common_fit_place8_env(ub_rel, false, 0, false, devs[0]); // the cache of a measurement reads the gate of its small batches (place8_single)
                         auto measure8 = [&](size_t cache, dmds_t & d) {
                             cparams->moe_cache_size = cache;
                             try {
@@ -1971,7 +2001,7 @@ static void common_params_fit_impl(
                             static const int64_t groups_min_free = int64_t(getenv("LLAMA_FIT_PLACE8_GROUPS_MIN_FREE_MIB") != nullptr ?
                                 std::max(0, atoi(getenv("LLAMA_FIT_PLACE8_GROUPS_MIN_FREE_MIB"))) : 9216)*MiB;
                             if (groups_on && !hostbound && int64_t(dmds_cpu_moe[0].free) >= groups_min_free) {
-                                common_fit_place8_env(ub_rel, true, grow/MiB, true);
+                                common_fit_place8_env(ub_rel, true, grow/MiB, true, devs[0]);
                                 g_place8_mid = false; // the small device's draft rule (common_fit_draft_on_cpu) stays
                                 LOG_INF("%s: small device: prompts keep their layer-major groups beside the decode-sized cache, each group releases "
                                     "the banks for its merged graph (k19-pgroups; LLAMA_FIT_PLACE8_GROUPS=0 off)\n", __func__);
@@ -2123,7 +2153,7 @@ static void common_params_fit_impl(
                     bool           got     = false;
                     int64_t        grow    = 0;
                     cparams->n_ubatch = ub_rel;
-                    common_fit_place8_env(ub_rel, true);
+                    common_fit_place8_env(ub_rel, true, 0, false, devs[0]);
                     auto measure_mid = [&](size_t cache, dmds_t & d) {
                         cparams->moe_cache_size = cache;
                         try {
@@ -2158,7 +2188,7 @@ static void common_params_fit_impl(
                     }
                     cparams->n_ubatch = ub_full;
                     if (got) {
-                        common_fit_place8_env(ub_rel, true, grow/MiB);
+                        common_fit_place8_env(ub_rel, true, grow/MiB, false, devs[0]);
                         LOG_INF("%s: the MoE cache takes the memory of the prompt compute buffers (%" PRId64 " MiB): cache %zu -> %zu MiB; "
                             "ubatches of more than %u tokens run with the cache banks released, layer-major groups as before (k19-placemid; "
                             "LLAMA_FIT_PLACEMID=0 off)\n", __func__, grow/MiB, size_ok/MiB, cparams->moe_cache_size/MiB, ub_rel);

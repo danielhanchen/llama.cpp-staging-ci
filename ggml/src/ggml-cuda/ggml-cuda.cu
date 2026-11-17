@@ -13390,7 +13390,18 @@ static bool ggml_backend_cuda_mmq_few_takes(ggml_backend_dev_t dev, enum ggml_ty
     return ggml_cuda_should_use_mmq_few(&src0, &src1, ggml_cuda_info().devices[device].cc);
 }
 
+// k19-g4cbuf: flash attention reads a q8_0 K / V of this device in place up to `rows` query rows (at most 32; 0 = the default 16;
+// GGML_CUDA_FATTN_Q8_INPLACE_MAX_ROWS overrides): set by common's fit for a small device's decode-sized graphs. Exposed as the
+// "ggml_backend_cuda_set_fa_q8_inplace_rows" proc address
+static void ggml_backend_cuda_set_fa_q8_inplace_rows(ggml_backend_dev_t dev, int rows) {
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    ggml_cuda_flash_attn_ext_set_q8_inplace_rows(device, rows);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_cuda_set_fa_q8_inplace_rows") == 0) {
+        return (void *)ggml_backend_cuda_set_fa_q8_inplace_rows;
+    }
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_moe_fetch_overlap_min_bytes") == 0) {
         return (void *)ggml_backend_cuda_moe_fetch_overlap_min_bytes;
