@@ -3238,6 +3238,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // k19-uma: the parameters as given, for the launch again without a MoE cache (see below)
     const common_params params_given = params;
     bool uma_no_cache = false;
+    bool kv_sel_mtp_restart = false; // k19-g4ten: the launch is fitted again with K/V host chunks beside its MTP drafter (see below)
 uma_restart:
     // k15-up2: built-in MTP heads (no -md model) for the context's prefetch depth rule (llama_context::sched_new), before any fit probe
     common_set_env("LLAMA_SPEC_MTP_HEADS", !params.speculative.has_dft() && std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
@@ -4938,6 +4939,38 @@ uma_restart:
                 params.moe_cache_auto = false;
                 params.moe_cache_size = 0;
                 uma_no_cache = true;
+                goto uma_restart;
+            }
+        }
+
+        // k19-g4ten (LLAMA_KV_SEL_MTP=0 off): a launch with an MTP drafter that took the small-device placement (k19-place8) on one GPU and
+        // lost its drafter there, with the routed experts in RAM and more than LLAMA_KV_SEL_DEV_CELLS (32768) context cells: the whole fit
+        // runs again from the given parameters with the K/V cells past the device cells in host chunks (LLAMA_KV_SEL_HOST=1 for this
+        // process), so the memory they free goes to the MoE cache and the drafter is weighed beside that cache (the auto rule of k19-kvsel
+        // grants host chunks only without a drafter). G4 RTX PRO 6000, Qwen3.8-Flash-Next UD-IQ4_XS + its Q8_0 MTP drafter (n_max 2), 3
+        // launches per VM against the same launch without this rule (auto host chunks, no drafter): 10 GB / 131K cache 4004 -> 3269 MiB
+        // beside the drafter (3.2 tokens of experts per layer, kept), chat 82.1 -> 105.6, 8k 77.5 -> 93.4, 2k 79.3 -> 78.0 tok/s (another
+        // VM: 81.2 -> 106.3, 76.5 -> 90.6, 78.3 -> 79.1; a third, whose host computed an expert row 15% slower, 2k 78.1 -> 66.1); 12 GB /
+        // 262K chat 84.9 -> 113.5, 8k 81.1 -> 101.0, 2k 83.0 -> 80.8. Where the refit keeps no drafter the launch runs as
+        // LLAMA_KV_SEL_HOST=1
+        if (!kv_sel_mtp_restart && !uma_no_cache && !model_only && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && llama_kv_sel_mode() == 2 &&
+                spec_mtp && has_draft && common_fit_place8() && !kv_sel_draft_fit_off_in && params.speculative.draft.fit_off &&
+                (getenv("LLAMA_KV_SEL_MTP") == nullptr || atoi(getenv("LLAMA_KV_SEL_MTP")) != 0)) {
+            const char * e_dc = getenv("LLAMA_KV_SEL_DEV_CELLS");
+            const int64_t dev_cells = e_dc != nullptr ? std::max(0, atoi(e_dc)) : 32768;
+            size_t n_gpu = 0;
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                n_gpu += ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU ? 1 : 0;
+            }
+            const uint64_t exp_b = common_moe_expert_bytes(params.model.path);
+            const uint64_t avail = llama_available_memory();
+            const bool disk_tier = exp_b > 0 && avail > 0 && (double) exp_b > 0.8*(double) avail && !common_fit_file_in_ram_fs(params.model.path);
+            if (n_gpu == 1 && cparams.n_ctx > (uint32_t) dev_cells && !disk_tier) {
+                COM_INF("%s: --fit: k19-g4ten: the MTP drafter was dropped on the small-device placement: fitted again with the K/V cells past %" PRId64
+                    " in host chunks (LLAMA_KV_SEL_HOST=1; LLAMA_KV_SEL_MTP=0 keeps this fit)\n", __func__, dev_cells);
+                common_set_env("LLAMA_KV_SEL_HOST", "1");
+                params = params_given;
+                kv_sel_mtp_restart = true;
                 goto uma_restart;
             }
         }
