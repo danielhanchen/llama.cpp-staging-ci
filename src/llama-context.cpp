@@ -5139,10 +5139,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // keep two alternating parameter sets in two ways
         static const bool warm_verify = getenv("LLAMA_GRAPH_SMALL_WARM_VERIFY") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_WARM_VERIFY")) != 0;
         const uint64_t warm_min = warm_verify && cparams.verify ? 2 : 8;
+        // only a kept graph built with the sampler chains of this ubatch is rebuilt in place (LLAMA_GRAPH_SMALL_WARM_SAME_SMPL=0: any).
+        // The server's verify graph prewarm runs every width with each device sampler chain of the slot in turn (greedy, masked greedy,
+        // top-k); rebuilt in place, each chain's graphs replaced the previous chain's in the same way, so only the last chain's stayed
+        // kept and a request with another chain built and captured each width again in its first windows (Colab G4, Qwen3.8-Flash-Next
+        // UD-IQ4_XS + DFlash2 n6, 48 GB: 4 verify graph captures of ~7850 nodes in a 256-token chat request). Another chain now takes the
+        // least recently used way, so every chain keeps its graphs
+        static const bool warm_same_smpl = getenv("LLAMA_GRAPH_SMALL_WARM_SAME_SMPL") == nullptr || atoi(getenv("LLAMA_GRAPH_SMALL_WARM_SAME_SMPL")) != 0;
         if (way < 0 && warm_way) {
+            const std::map<llama_seq_id, llama_sampler *> smpl_cur = warm_same_smpl ? graph_samplers() : std::map<llama_seq_id, llama_sampler *>{};
             int mru = -1;
             for (uint32_t w = 0; w < GF_SMALL_WAYS; ++w) {
                 const uint32_t i = n_small*GF_SMALL_WAYS + w;
+                if (warm_same_smpl && !llm_graph_params::samplers_equal(gf_res_small_smpl[i], smpl_cur)) {
+                    continue;
+                }
                 if (gf_res_small[i] && gf_res_small_built[i] && (mru < 0 || gf_res_small_used[i] > gf_res_small_used[n_small*GF_SMALL_WAYS + mru])) {
                     mru = (int) w;
                 }
@@ -5411,6 +5422,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             gf_res_small_built[i_small] = true;
             gf_res_small_nuse[i_small]  = 0;
             gf_res_small_epoch[i_small] = gf_res_epoch;
+            gf_res_small_smpl[i_small]  = graph_samplers();
             if (size_cache) {
                 gf_res_small_plan[i_small] = ggml_backend_sched_plan_save(sched.get());
                 n_plan_saves += gf_res_small_plan[i_small] != nullptr;
