@@ -10328,7 +10328,7 @@ bool llama_context::sched_copy_experts_body(ggml_backend_t backend, const ggml_t
         static const bool tail_dbg_s = getenv("LLAMA_LM_TAIL_DEBUG") != nullptr;
         if (tail_dbg_s && lctx->lm_staged.count(src) > 0) {
             LLAMA_LOG_INFO("%s: tail debug: a second staged copy of %s (all %d, previous dst %p, this %p)\n", __func__, src->name, (int) st.all,
-                (void *) lctx->lm_staged[src].second, (void *) dst);
+                (const void *) lctx->lm_staged[src].second, (void *) dst);
         }
         lctx->lm_staged[src] = { backend, dst };
     }

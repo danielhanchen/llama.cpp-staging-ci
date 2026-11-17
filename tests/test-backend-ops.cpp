@@ -11793,14 +11793,14 @@ struct test_fa_bi_exact : public test_case {
         ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
         const float scale = 1.0f/sqrtf(hs);
         ggml_tensor * bi = ggml_flash_attn_ext(ctx, q, k, v, m, scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(bi, GGML_PREC_F32);
+        ggml_prec_set_acc(bi, GGML_PREC_F32);
         bi->flags |= GGML_TENSOR_FLAG_BATCH_INVARIANT;
         ggml_tensor * cat = nullptr;
         for (int64_t i = 0; i < nb; ++i) {
             ggml_tensor * qi = ggml_view_4d(ctx, q, hs, 1, nh*ngqa, 1, q->nb[1], q->nb[2], q->nb[3], i*q->nb[1]);
             ggml_tensor * mi = ggml_view_4d(ctx, m, kv, 1, 1, 1, m->nb[1], m->nb[2], m->nb[3], i*m->nb[1]);
             ggml_tensor * oi = ggml_flash_attn_ext(ctx, qi, k, v, mi, scale, 0.0f, 0.0f);
-            ggml_flash_attn_ext_set_prec(oi, GGML_PREC_F32);
+            ggml_prec_set_acc(oi, GGML_PREC_F32);
             cat = cat ? ggml_concat(ctx, cat, oi, 2) : oi;
         }
         ggml_tensor * out = ggml_sub(ctx, bi, cat);
