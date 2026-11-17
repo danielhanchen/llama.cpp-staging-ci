@@ -1452,11 +1452,19 @@ struct llama_moe_cache::impl {
         // and at least LLAMA_MOE_SINGLE_MIN_CPUS (12) usable CPUs: the host thread waits beside a team of the decode threads - 1, which
         // on a small VM computes slower than the split's full team (Colab T4, 8 vCPUs, 4 decode threads: -2..-5% decode against the
         // split, the same host experts; Colab L4, 12 vCPUs: +3..+5%)
+        // k19-hostovl (LLAMA_MOE_SINGLE_SMALL_HOST, default 1; 0 = the 12-CPU gate everywhere): a host of 8-11 usable CPUs keeps the
+        // default single-graph host misses where their batches run on the CPU backend's host team (the hybrid host path, see
+        // single_register: decode threads + two thirds while the device wait blocks), not on the old team of the decode threads - 1 that
+        // lost the -2..-5% above. Colab T4 (8 vCPUs, 4 decode threads, team of 6) q4x 8 GB + MTP n2: chat 60.0 -> 65.6 tok/s, 8k 55.2 ->
+        // 59.6 (the split cuts the CUDA graph and syncs at every MoE layer: the device idled 31-38% of each verify while the host
+        // computed). An explicit LLAMA_MOE_SINGLE_MIN_CPUS keeps its meaning
         if (single_auto && single_req) {
             const char * e = getenv("LLAMA_MOE_SINGLE_MIN_CPUS");
             const uint32_t min_cpus = e != nullptr ? (uint32_t) std::max(0, atoi(e)) : 12u;
-            if (llama_sysmem::usable_cpus() < min_cpus) {
-                single_req = false;
+            const uint32_t cpus     = llama_sysmem::usable_cpus();
+            if (cpus < min_cpus) {
+                single_small = e == nullptr && cpus >= 8u && single_small_host_on() && single_team_envs_ok();
+                single_req   = single_small;
             }
         }
         if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
@@ -2889,6 +2897,7 @@ struct llama_moe_cache::impl {
         return e != nullptr ? std::max(0.0, atof(e)) : 0.2;
     }();
     bool single_off     = false;  // a mailbox failed: back to the split for good
+    bool single_small   = false;  // k19-hostovl: on only because the host team serves it (8-11 usable CPUs, see the constructor)
     int  single_warned  = 0;      // slow host batches logged
     bool single_no_alloc = false; // a context that only measures memory: no mailboxes
     int  single_threads = 0;
@@ -3043,6 +3052,21 @@ struct llama_moe_cache::impl {
         const int wmax = em != nullptr && atoi(em) > 0 ? atoi(em) : 16;
         return single_team_size(wmax) > std::max(1, single_threads - 1);
     }
+    // k19-hostovl: the single-graph host misses on 8-11 usable CPUs (LLAMA_MOE_SINGLE_SMALL_HOST=0: off, the 12-CPU gate)
+    static bool single_small_host_on() {
+        static const bool v = [] {
+            const char * e = getenv("LLAMA_MOE_SINGLE_SMALL_HOST");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        return v;
+    }
+    // k19-hostovl: no setting keeps the batches off the host team (the conditions of single_register that do not depend on the cache)
+    static bool single_team_envs_ok() {
+        const char * e  = getenv("LLAMA_MOE_SINGLE_THREADS");
+        const char * ew = getenv("LLAMA_MOE_SINGLE_THREADS_WIDE");
+        const char * et = getenv("GGML_MOE_HOST_TEAM");
+        return !(e != nullptr && atoi(e) > 0) && !(ew != nullptr && atoi(ew) == 0) && !(et != nullptr && atoi(et) == 0);
+    }
     // the host team's size: the decode threads + a third, at most the CPUs - 4 and wmax; k19-l4poly LLAMA_MOE_SINGLE_THREADS_TEAM=N (test
     // knob): N threads, at most the CPUs - 1
     int single_team_size(int wmax) const {
@@ -3168,6 +3192,12 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+        // k19-hostovl: on 8-11 CPUs the mailbox only pays with the host team (the hub's team is set by its first cache)
+        if (single_small && (!h.team || h.fused == nullptr)) {
+            LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses off on %u usable CPUs: no host team for the batches, the split "
+                "computes them\n", tag, llama_sysmem::usable_cpus());
+            return false;
+        }
         h.owners.push_back(this);
         single_reg = true;
         if (!h.thr.joinable()) {
@@ -3175,11 +3205,12 @@ struct llama_moe_cache::impl {
             h.thr = std::thread(single_service);
         }
         LLAMA_LOG_INFO("llama_moe_cache%s: single-graph host misses on (LLAMA_MOE_SINGLE): batches of up to %d tokens, %d host threads "
-            "(one host thread for every cache of the process%s), slow-batch warning above %d ms (merges never time out), %s\n", tag, single_max(), h.threads,
+            "(one host thread for every cache of the process%s), slow-batch warning above %d ms (merges never time out), %s%s\n", tag, single_max(), h.threads,
             h.team ? (h.blocking ? "; the CPU backend's host team, the host experts are the critical path: LLAMA_MOE_SINGLE_THREADS_WIDE=0 off; "
                 "the device wait blocks (LLAMA_MOE_SINGLE_WAIT_BLOCKING=0 off)" :
                 "; the CPU backend's host team, the host experts are the critical path: LLAMA_MOE_SINGLE_THREADS_WIDE=0 off") : "",
-            single_timeout_ms, h.fused != nullptr ? "one-region host experts (LLAMA_MOE_SINGLE_FUSED=0: the graph)" : "host experts by graph");
+            single_timeout_ms, h.fused != nullptr ? "one-region host experts (LLAMA_MOE_SINGLE_FUSED=0: the graph)" : "host experts by graph",
+            single_small ? "; on fewer than 12 usable CPUs with the host team (LLAMA_MOE_SINGLE_SMALL_HOST=0: the split there)" : "");
         return true;
     }
 
