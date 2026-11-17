@@ -432,6 +432,66 @@ int ggml_cuda_flash_attn_ext_mma_kvq_inplace(const int device, const ggml_tensor
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
+// INT8 Q*K^T over a q8_0 K cache read in place by the MMA kernel (fattn-mma-f16.cuh, fattn_kvq_i8). GGML_CUDA_FATTN_I8 unset: on for
+// Ada (cc 8.9) and RTX Blackwell (cc 12.x), where long prompts measured faster (f16 x f16 -> f32 MMA runs at half the f16 accumulate
+// rate on GeForce cards, INT8 at full rate); off on Turing (INT8 -1..-2% prompt), Ampere, Hopper and datacenter Blackwell, where the
+// per-block scale epilogue loses. GGML_CUDA_FATTN_I8=0: never (the f16 kernel on a staged copy); =1: the default set plus GA10x
+// (cc 8.6 - 8.7); =2: any NVIDIA Turing+ (tests). Nodes: q8_0 K, head size 128 / 256 (K = V), more than 2 query rows, no logit
+// softcap, not two-source (dst->src[6]), not batch invariant, not read in place by the q8_0 / q4_0 kernels
+// (ggml_cuda_flash_attn_ext_mma_kvq_inplace: few rows), K not partly in host memory (every query tile would read those cells over the
+// bus; the staged copy reads them once), rows 4 byte aligned (pipelined loads: 16 byte at head size 256, 8 byte at 128). The graph
+// allocation is unchanged (the f16 copy of K stays reserved behind the output; unused by these launches)
+bool ggml_cuda_flash_attn_ext_mma_i8(const int device, const ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(device, dst);
+    return false;
+#else
+    static const int mode = getenv("GGML_CUDA_FATTN_I8") ? atoi(getenv("GGML_CUDA_FATTN_I8")) : -1;
+    if (mode == 0) {
+        return false;
+    }
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (K->type != GGML_TYPE_Q8_0 || dst->src[6] != nullptr || Q->ne[1] <= 2 || (dst->flags & GGML_TENSOR_FLAG_BATCH_INVARIANT)) {
+        return false;
+    }
+    const int64_t D = K->ne[0];
+    if ((D != 128 && D != 256) || Q->ne[0] != D || V->ne[0] != D) {
+        return false;
+    }
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+    if (logit_softcap != 0.0f || V_is_K_view) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !turing_mma_available(cc)) {
+        return false;
+    }
+    if (mode != 2) {
+        const bool rtx_blackwell = cc >= GGML_CUDA_CC_BLACKWELL && cc < GGML_CUDA_CC_RUBIN;
+        const int  first         = mode == 1 ? GGML_CUDA_CC_AMPERE_GA10X : GGML_CUDA_CC_ADA_LOVELACE;
+        if (!rtx_blackwell && (cc < first || cc >= GGML_CUDA_CC_HOPPER)) {
+            return false;
+        }
+    }
+    if (ggml_cuda_flash_attn_ext_mma_kvq_inplace(device, dst, false) != 0) {
+        return false;
+    }
+    if (ggml_cuda_buffer_has_host_chunks(K->buffer)) {
+        return false;
+    }
+    const size_t align = D == 256 ? 16 : 8;
+    if (K->nb[0] != ggml_type_size(K->type) || K->nb[1] % align != 0 || K->nb[2] % align != 0 || K->nb[3] % align != 0 ||
+            K->nb[1] > INT32_MAX || K->nb[2] > INT32_MAX) {
+        return false;
+    }
+    return true;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
 bool ggml_cuda_flash_attn_ext_mma_q8_inplace(const int device, const ggml_tensor * dst) {
     return ggml_cuda_flash_attn_ext_mma_kvq_inplace(device, dst, true) != 0;
 }

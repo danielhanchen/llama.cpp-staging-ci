@@ -14276,6 +14276,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // INT8 Q*K^T over a q8_0 K cache (CUDA GGML_CUDA_FATTN_I8): prompt shapes past the in-place row limit (17, 100 rows),
+    // q8_0 K with q8_0 or f16 V, GQA 1 / 4 / 6 / 12, KV with and without the 256 padding, ALiBi, sinks, permuted layout. The CPU
+    // reference quantises Q to q8_0 for a q8_0 K too, so the default tolerance holds
+    for (int hs : { 128, 256 }) {
+        for (ggml_type type_V : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+            for (int nr2 : { 1, 4, 6, 12 }) {
+                for (int kv : { 1000, 2048 }) {
+                    for (int nb : { 17, 100 }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {nr2, 1}, kv, nb, true, nr2 == 4, 0, 0, GGML_PREC_F32,
+                            GGML_TYPE_Q8_0, type_V));
+                    }
+                }
+            }
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {1, 1}, 1024, 33, true, false, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, type_V));
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {4, 1}, 2048, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, type_V, {0, 2, 1, 3}));
+        }
+    }
+
     // k19-fattnq8: q8_0 K / V at the head sizes the CUDA MMA kernel reads in place (128 / 256), GQA 1 / 2 / 6 (Qwen3.8-27B) / 8
     // (Qwen3.6-35B-A3B), verify windows and prompt batches, KV lengths with and without the 256 padding, with and without sinks
     for (int hs : { 128, 256 }) {
