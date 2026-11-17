@@ -5038,6 +5038,13 @@ uma_restart:
         moe_margin_gain = 0;
     }
 
+    // k19-df2reg: a target beside a DFlash2 drafter with a MoE cache seeds the cache from a prompt's own ids only for ubatches of 1024+
+    // tokens (see llama_context::seed_own_min); an explicit LLAMA_MOE_CACHE_SEED_OWN_DFLASH keeps its value
+    if (!model_only && cparams.moe_cache_size > 0 && getenv("LLAMA_MOE_CACHE_SEED_OWN_DFLASH") == nullptr &&
+            std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end()) {
+        common_set_env("LLAMA_MOE_CACHE_SEED_OWN_DFLASH", "1");
+    }
+
     // k19-df2cost: where the DFlash2 cached window band engages (a DFlash drafter, the cache holding LLAMA_DFLASH_CACHED_FRAC_MIN ..
     // LLAMA_DFLASH_CACHED_FRAC_MAX of the host experts, see common/speculative.cpp) the target keeps the verify graphs of two widths
     // (3 rows and the whole draft) and their CUDA graphs, which the fit did not price: G4 Qwen3.8-Flash-Next UD-IQ4_XS 32 GB, srv_kld long48

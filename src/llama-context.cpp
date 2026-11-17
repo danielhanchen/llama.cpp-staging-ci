@@ -3899,6 +3899,25 @@ void llama_context::moe_cache_devseed_fallback(bool host_seed_fits) {
 // k16-fit: set once a memory probe of this process priced a seed graph (sched_reserve): the fit then made room for it
 std::atomic<bool> llama_context::g_fit_seed_priced{false};
 
+// k19-df2reg: beside a DFlash2 drafter (common sets LLAMA_MOE_CACHE_SEED_OWN_DFLASH=1 for a target launched with --spec-type
+// draft-dflash and a MoE cache), a prefetched ubatch without an earlier routing (a prompt of one large ubatch, e.g. a 640-token chat
+// turn) seeds the MoE cache from its own ids only from 1024 tokens on, as the device seed (moe_cache_devseed_fallback). The seed
+// graph fits beside the DFlash2 drafter's reserve since the one-node QSA selection mask (200 MiB smaller), and the seed of such a turn
+// replaced the cache and RAM-tier experts the decode after it reads: Colab L4 Flash-Next full card DFlash2 chat read 55% more from the
+// disk (8.2 vs 5.4 GB) and ran 14-19% slower with the same text. Smaller ubatches run as when the seed graph does not fit
+// (count_seed_skipped). Other contexts keep every such seed (Qwen3.6-35B-A3B MTP at L4 12 GB: the gate changed its 2k / 8k text).
+// LLAMA_MOE_CACHE_SEED_OWN_MIN=N: that minimum in every context (0: none); LLAMA_MOE_CACHE_SEED_OWN_DFLASH=0: no gate beside DFlash2
+int64_t llama_context::seed_own_min() {
+    static const int64_t v = [] {
+        if (const char * e = getenv("LLAMA_MOE_CACHE_SEED_OWN_MIN")) {
+            return std::max<int64_t>(0, atoll(e));
+        }
+        const char * d = getenv("LLAMA_MOE_CACHE_SEED_OWN_DFLASH");
+        return d != nullptr && atoi(d) != 0 ? (int64_t) 1024 : (int64_t) 0;
+    }();
+    return v;
+}
+
 bool llama_context::fit_seed_price_on() {
     static const bool on = getenv("LLAMA_FIT_SEED_PRICE") == nullptr || atoi(getenv("LLAMA_FIT_SEED_PRICE")) != 0;
     return on;
@@ -7773,7 +7792,7 @@ int llama_context::decode_layer_major(llama_memory_context_i * mctx, int64_t n_o
         }
         if (seed_k >= 1 && group[seed_k].n_outputs == 0) {
             src_k = seed_k - 1;
-        } else if (seed_k >= 1 && moe_cache_seed_fits && moe_cache_seed_sync) {
+        } else if (seed_k >= 1 && moe_cache_seed_fits && moe_cache_seed_sync && (int64_t) group[seed_k].ub->n_tokens >= seed_own_min()) {
             src_k = seed_k;
         } else if (seed_k >= 1) {
             moe_cache->count_seed_skipped();
@@ -10412,7 +10431,7 @@ void llama_context::moe_cache_seed_begin(const llama_ubatch & ubatch, bool last_
         } else if (moe_cache_seed_sync) {
             if (n_outputs_ub == 0 && moe_cache->has_seed_counts()) {
                 moe_cache_seed_prev = true;
-            } else if (moe_cache_seed_fits) {
+            } else if (moe_cache_seed_fits && (int64_t) ubatch.n_tokens >= seed_own_min()) {
                 moe_cache_seed = true;
             } else {
                 // the graph of this seed was not reserved (see sched_reserve_seed), the ubatch runs as with LLAMA_MOE_CACHE_SEED=1
