@@ -93,6 +93,9 @@ extern "C" {
             const float * x, const int32_t * ids, float * out, int n_used, int n_tokens, int n_threads, void * wbuf, size_t wsize);
     GGML_BACKEND_API bool   ggml_cpu_moe_host_team_on(void);
     GGML_BACKEND_API void   ggml_cpu_moe_host_team_stop(void);
+    // k19-hostovl: how long an idle team worker spins before it sleeps when GGML_MOE_HOST_TEAM_SPIN_US is unset (default 2000 us);
+    // only before the first batch
+    GGML_BACKEND_API void   ggml_cpu_moe_host_team_set_spin_us(int64_t us);
 
     GGML_BACKEND_API int ggml_cpu_has_sse3       (void);
     GGML_BACKEND_API int ggml_cpu_has_ssse3      (void);

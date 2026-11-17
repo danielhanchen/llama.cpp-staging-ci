@@ -1828,13 +1828,22 @@ static int ggml_moe_host_team_mode(void) {
     return mode;
 }
 
+// k19-hostovl: the default without GGML_MOE_HOST_TEAM_SPIN_US, set by the caller before the first batch (ggml_cpu_moe_host_team_set_spin_us)
+static atomic_llong ggml_moe_host_team_spin_default = 2000;
+
 static int64_t ggml_moe_host_team_spin_us(void) {
     static int64_t us = -1;
     if (us < 0) {
         const char * e = getenv("GGML_MOE_HOST_TEAM_SPIN_US");
-        us = e != NULL && atoll(e) >= 0 ? atoll(e) : 2000;
+        us = e != NULL && atoll(e) >= 0 ? atoll(e) : (int64_t) atomic_load(&ggml_moe_host_team_spin_default);
     }
     return us;
+}
+
+void ggml_cpu_moe_host_team_set_spin_us(int64_t us) {
+    if (us >= 0) {
+        atomic_store(&ggml_moe_host_team_spin_default, (long long) us);
+    }
 }
 
 static int ggml_moe_host_team_tasks(void) {
